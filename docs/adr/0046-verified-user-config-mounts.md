@@ -12,6 +12,14 @@ issue carries, checked against the implementation that landed. It builds on
 **0.7.4**. The native enforcement rows now have a recorded pass; see
 [Verification](#verification).
 
+Two extensions have since landed and are part of the current contract, not
+deferrals: **named mount sets** (#397, [ADR-0048](0048-named-mount-sets-and-tier-local-tool-references.md))
+and **full user tool `mounts` lists inherited through the tier-local `tools`
+closure** (#396). Canonical guidance is
+[USAGE.md](../../USAGE.md#tool-specific-config-mounts). #396's own native rows are
+recorded separately below; the #394 native pass is not retroactive evidence for
+them, and Linux/amd64 native coverage remains outstanding.
+
 ## Context
 
 ADR-0040 made one user-tier field authoritative: `[network]`. A user asked for
@@ -54,9 +62,11 @@ strings. The project tier and the built-in catalog refuse the key **including
 `mounts = []`**: presence, not contents, is what asks for authority, and an
 empty list is the cheapest thing to plant.
 
-This release accepts direct path specifications only. Named mount sets and
-per-tool `mounts` fields are out of scope; the schema is one array, so adding
-selectors later is an additive field rather than a reinterpretation.
+**Historical (#394 scope, since superseded).** That release accepted direct path
+specifications only; named mount sets and per-tool `mounts` fields were out of
+scope. #397 then added names as an additive selector, and #396 added full **user**
+tool `mounts` lists resolved through the same shared closure. Both are
+implemented; neither reinterpreted an existing spelling.
 
 TOML assigns a key to the most recent `[table]` header, and that is a real
 hazard here, so the behaviour is characterized rather than left to be
@@ -66,7 +76,7 @@ discovered:
 |---|---|
 | `mounts = [...]` before any header | top-level, verified, selected |
 | `[network]` then `mounts = [...]` | lands in the network table; refused with `[network]: mounts is not a network setting; a top-level mounts list must be written before the first table header` (`[network]` presence has already asked for verification) |
-| `[[tools]]` … then `mounts = [...]` | strict tool schema: the fixed schema-repair paragraph (serde's own text is dropped, because a wrong-type message can echo a value), with the line and column and the "before the first table header" sentence |
+| `[[tools]]` … then `mounts = [...]` | that full **user** tool's own list: verified and parsed (#396). A project or built-in tool declaring one — empty, wrong type or not — is refused by presence; a full user definition that is otherwise malformed is still the fixed schema-repair paragraph |
 | `[tools.env]` with `mounts = "~/private:ro"` | **accepted**: an ordinary environment variable named `mounts`. It is not a mount list and does not ask for authority |
 | `[mounts]` (table form) | top-level and present, so verified, then `mounts: must be an array of strings` |
 
@@ -80,7 +90,13 @@ break a legitimate variable name.
 read: one `O_NOFOLLOW` open supplies both the bytes and the descriptor `fstat`
 facts, and a present authority field must show a regular file, reached directly,
 with one hard link, owned by the effective user, not group/other-writable, in an
-immediate directory owned by that user and not group/other-writable.
+immediate directory owned by that user and not group/other-writable. Since #396
+"a mount field" means **any** of them — the top-level `mounts` list, `[mount_sets]`,
+or any full tool's own `mounts` — aggregated by one OR kernel
+(`config_authority::mount_authority_present`) before any mount text is parsed. A
+refusal caused by a tool field and no top-level list is prefixed with that field's
+numeric site, e.g. `tools[0].mounts: mounts requires config.toml to be a regular
+file…`, so the reader can find the list they must review.
 
 The decision was extracted, not copied. `config_authority::verify` is the only
 producer of the `AuthorizedConfig` token, and every authority-bearing parser
@@ -89,7 +105,8 @@ contradicting the module. `authority_required` decides **whether the check runs
 at all**, from presence alone:
 
 ```text
-authority_required({network, mounts}) == (network || mounts)
+authority_required({network, mounts, mount_sets}) == (network || mounts || mount_sets)
+mounts == (top_level_mounts || tool_mounts)      # #396
 ```
 
 One gate per file, not one per field: a file declaring both `[network]` and
@@ -138,9 +155,12 @@ entry a different fork from the CLI entry it means to match.
 
 ## Decision 4: One selection seam, one claim rule, no override
 
-A launch has two declaration sources: the verified user config's `mounts`
-(file order), then argv `--mount` (argv order). `mount_selection::select` is the
-only place that decides which sources a launch asks for. It performs no I/O:
+A launch has three declaration sources, in this order: the verified user
+config's top-level `mounts` defaults, then the launched tool's own `mounts` plus
+those of every definition in its tier-local `tools` closure (#396, resolved into
+one facet by `config`), then argv `--mount`. `mount_selection::select` is the
+only place that decides which sources a launch asks for, and one
+`config_mounts_selected` call gates both automatic inputs. It performs no I/O:
 whether a selected source exists is a launch-time question, which is what lets an
 unselected declaration name a missing path without blocking a launch, `doctor`
 or `--help`.
@@ -160,16 +180,17 @@ so a repository cannot replace the user's declaration by declaring the same
 guest path. Guest spellings are normalized before the comparison
 (`/g//./x` is `/g/x`); host spellings are not, so `~/ref` and `~/ref/` at one
 guest path conflict exactly as two such `--mount` arguments do today. The seam is
-one function and a typed request list: nothing is pre-built for named mount sets
-or per-tool selections, and both can be added as further sources to the same
-claim.
+one function and a typed request list. Named sets and per-tool selections were
+added as further sources to that same claim rather than as second resolvers:
+`config_mounts::parse_selector` is still the only classifier, and a tool's list is
+parsed, normalized and set-expanded at load by the same code as the defaults list.
 
 ## Decision 5: `--no-config-mounts` suppresses selection only
 
 `--no-config-mounts` is a launch option, so it precedes the route
 (`agent-vm --no-config-mounts shell`); after the tool verb it is a forwarded
-tool argument. It disables automatic mount selection and preparation, and
-nothing else:
+tool argument. It disables **every** automatic mount selection and preparation —
+the defaults *and* the launched tool's own and inherited lists — and nothing else:
 
 - explicit `--mount` is still parsed, claimed and prepared;
 - credentials, `persist` paths, agent-vm's own project/state/home mounts,
@@ -179,7 +200,10 @@ nothing else:
   `config::load` error;
 - it is a usage error on a built-in verb, like every other launch option.
 
-Without a config `mounts` the flag is a no-op and prints nothing.
+Without any config mount selection the flag is a no-op and prints nothing. A
+file whose *only* automatic access is a tool's list is **not** a no-op: the notice
+reports the skipped count, because the reader has to be told that a launch which
+would have mounted host paths did not.
 
 ## Decision 6: Preflight boundaries
 
@@ -263,9 +287,11 @@ owner-mode refusals remain unit-level only.
 - **Canonicalize the host path.** Rejected: it changes `source_spelling`, which
   is fork identity, and would make a config entry and its equivalent `--mount`
   two different forks.
-- **Per-tool `mounts` or named sets now.** Deferred: the spec explicitly scopes
-  them out, and selection is a seam so they can be added without a second claim
-  rule.
+- **Per-tool `mounts` or named sets now.** Historical: this ADR scoped them out,
+  and selection was left a seam so they could be added without a second claim
+  rule. Both landed later — named sets in #397 and user tool-level `mounts` in
+  #396 — through that seam, [`ADR-0048`](0048-named-mount-sets-and-tier-local-tool-references.md)
+  keeping the one selector and one claim rule.
 - **A positional ban on `mounts` keys** (refuse the *file* if `mounts` appears
   under any table). Rejected: `[tools.env]` may legitimately declare a variable
   named `mounts`, and the table-scoped failures above are already diagnosed by
@@ -311,9 +337,11 @@ What is new, and recorded in ADR-0048 and USAGE rather than re-derived here:
   with a global leaf-visit budget that turns a pathological config into a
   value-free error (decision R1). Both are maintainer decisions recorded in
   ADR-0048.
-- `--no-config-mounts` withholds the defaults list only; an explicit
+- `--no-config-mounts` withholds the automatic defaults list; an explicit
   `--mount NAME` still selects its set, and every schema, reference, cycle and
-  authority check still runs.
+  authority check still runs. (#396 widened the suppressed half to *every*
+  automatic input — see the amendment below; an explicitly selected set is still
+  outside it.)
 
 Status: the named-selector half landed in #397 and is natively evidenced. The
 same run re-verified this ADR's ten #394 rows (CM-N1…N5 with their host oracles)
@@ -326,3 +354,36 @@ implemented: the verified read, the one claim rule, opt-out of selection only,
 and source existence deferred to launch. The rows measure bind semantics as
 observed in the guest, not general mount safety, and the owner-mode refusals stay
 unit-level.
+
+## Amendment: full user tool `mounts` in the same closure (#396)
+
+[#396](https://github.com/gregwebs/agent-vm/issues/396) adds `mounts` to a
+**full user** `[[tools]]` definition. Every rule above is inherited unchanged;
+what changes is which lists a launch selects and where the presence gate looks.
+
+| row | now |
+|---|---|
+| authority trigger | `(top_level \|\| tool_field)`, aggregated before any mount text is parsed; an empty list on an unused tool is enough |
+| where it is accepted | user tier only; project and built-in tool fields are refused by presence, by numeric pointer `tools[N].mounts`, and keep network → top-level mounts → `[mount_sets]` precedence before them |
+| selection sources | defaults, then the launched tool's own list plus its transitive same-file `tools` closure, then `--mount`. No source overrides another |
+| the closure | the *same* visited mask that supplies providers, requested credential names and `persist` paths; tool `env` and `network_requests` remain the launched tool's own |
+| shell | a declared `shell`'s omitted `tools` is the existing wildcard, so it inherits those mounts deliberately; `tools = []` suppresses inheritance only; the built-in fallback inherits nothing but still receives user-wide defaults |
+| opt-out | suppresses defaults **and** the whole tool facet; explicit paths and set names still apply; providers, credential requests, persistence and every check stay active |
+| identity | `MountOrigin::UserTool` is diagnostics only; the same expanded declaration reached by a tool list, a set, the defaults or `--mount` is one claim and one fork |
+| resource bound | one leaf-visit budget continues from verified parsing into catalog construction; retained lists hold shared leaf handles |
+
+Deliberately excluded: partial tool overrides, mounts-only attachments to shipped
+tools, automatic agent classification, project mount authority of any kind, new
+modes or a mode/guest/exclusion override on a set name, and inheritance of `env`,
+`network_requests` or required-provider facts.
+
+Canonical guidance, including the complete copyable catalog and the warning that
+`tools` now exposes those host paths through a declared shell, is
+[USAGE.md](../../USAGE.md#tool-specific-config-mounts). #396's native rows are
+CM-T1…T11; see [CONTRIBUTING](../../CONTRIBUTING.md#config-mounts-live-check).
+They now have their own recorded pass on macOS arm64 — 45/45 rows on candidate
+`0.7.15 (5778128b…)` against the digest-pinned local image, in a run separate from
+this ADR's #394 facts; the candidate, runtime, image and evidence-directory
+receipts are in
+[ADR-0048's native evidence](0048-named-mount-sets-and-tier-local-tool-references.md#396-tool-mount-rows-cmt1t11-a-separate-later-run).
+Linux/amd64 remains outstanding.

@@ -285,6 +285,35 @@ impl Harness {
         project: &Path,
         state: &Path,
     ) -> Output {
+        self.run_verb_opts_from_state("shell", mounts, root, set_home, project, state, &[])
+    }
+
+    /// `agent-vm [--root] [--mount …] <options…> --image <fixture> <verb>`: the
+    /// same launch shape as [`Self::run_shell`] with a selected verb and extra
+    /// launch options, for the #396 tool-mount rows.
+    fn run_verb(&self, verb: &str, mounts: &[&str], root: bool, options: &[&str]) -> Output {
+        self.run_verb_opts_from_state(
+            verb,
+            mounts,
+            root,
+            true,
+            self.project.path(),
+            &self.state.path().canonicalize().unwrap(),
+            options,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_verb_opts_from_state(
+        &self,
+        verb: &str,
+        mounts: &[&str],
+        root: bool,
+        set_home: bool,
+        project: &Path,
+        state: &Path,
+        options: &[&str],
+    ) -> Output {
         let mut cmd = Command::new(agent_vm_bin());
         cmd.env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
@@ -301,8 +330,61 @@ impl Harness {
         for m in mounts {
             cmd.arg("--mount").arg(m);
         }
-        cmd.arg("--image").arg(&self.image).arg("shell");
+        cmd.args(options);
+        cmd.arg("--image").arg(&self.image).arg(verb);
         run_with_timeout(cmd, Duration::from_secs(15))
+    }
+
+    /// Write `~/.config/agent-vm/config.toml` in the shape the verified-read
+    /// policy requires: a 0600 file in a 0700 directory. Only this file may
+    /// declare `mounts` (ADR-0046/ADR-0048).
+    fn write_user(&self, contents: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = self.home.path().join(".config/agent-vm/config.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(
+            path.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+    }
+
+    /// Every published fork directory, sorted. A refused or reusing launch must
+    /// not add one.
+    fn fork_dirs(&self) -> Vec<PathBuf> {
+        let mut forks: Vec<PathBuf> = std::fs::read_dir(self.state.path())
+            .map(|entries| {
+                entries
+                    .map(|entry| entry.unwrap().path())
+                    .filter(|path| {
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.ends_with(".mounts"))
+                    })
+                    .flat_map(|store| {
+                        std::fs::read_dir(store.join("forks"))
+                            .map(|forks| forks.map(|fork| fork.unwrap().path()).collect::<Vec<_>>())
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        forks.sort();
+        forks
+    }
+
+    /// Each fork's manifest bytes, keyed by fork directory name: the identity a
+    /// second selector must reproduce rather than reseed.
+    fn fork_identities(&self) -> Vec<(String, Vec<u8>)> {
+        self.fork_dirs()
+            .into_iter()
+            .map(|fork| {
+                let name = fork.file_name().unwrap().to_string_lossy().into_owned();
+                (name, std::fs::read(fork.join("manifest.json")).unwrap())
+            })
+            .collect()
     }
 }
 
@@ -1429,4 +1511,367 @@ fn a_project_path_cannot_forge_the_remap_notice() {
         !err.lines().any(|line| line.trim() == "j contains control characters that can't be carried into the guest; mounting at /workspace instead"),
         "the path forged a notice line:\n{err}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #396: forks selected by a user tool list keep the `--mount` contract
+// ---------------------------------------------------------------------------
+
+/// #396 AC-identity: a READY fork seeded through a tool list is reused — by the
+/// same tool, by an inherited (referenced) tool list, and by the equivalent
+/// `--mount` — after its synthetic source is gone. One committed copy, one
+/// manifest, no initialization notice.
+///
+/// The source is removed only after the seeding launch returned, which is the
+/// only point at which no VM that holds it can exist.
+#[test]
+fn tool_selected_ready_fork_reuses_data_without_source() {
+    let h = Harness::new();
+    let source = h.home.path().join("fork-source");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("marker"), "seed").unwrap();
+    let declaration = "mounts = [\"~/fork-source:/f:fork\"]\n";
+
+    // Seeded by the launched tool's own list.
+    h.write_user(&format!(
+        "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\ntools = []\n{declaration}"
+    ));
+    let seeded = h.run_verb("t", &[], false, &[]);
+    let seeded_stderr = stderr_of(&seeded);
+    assert!(
+        seeded_stderr.contains("Initialized fork"),
+        "{seeded_stderr}"
+    );
+    let seeded_binds = bind_mounts(&debug_config_json(&seeded_stderr));
+    let committed = seeded_binds
+        .iter()
+        .find(|(_, guest, _)| guest == "/f")
+        .map(|(host, _, readonly)| {
+            assert!(!readonly, "a fork is writable: {seeded_binds:?}");
+            PathBuf::from(host)
+        })
+        .unwrap_or_else(|| panic!("no fork bind: {seeded_binds:?}"));
+    assert!(
+        !committed.starts_with(&source),
+        "the guest must be bound to the committed copy, not the source"
+    );
+    // Guest-authored content, which only the committed copy can still produce.
+    std::fs::write(committed.join("marker"), "guest").unwrap();
+    let identities = h.fork_identities();
+    assert_eq!(identities.len(), 1, "exactly one fork was published");
+
+    std::fs::remove_file(source.join("marker")).unwrap();
+    std::fs::remove_dir(&source).unwrap();
+
+    // The inherited selector, then the equivalent explicit `--mount`.
+    let inherited = format!(
+        "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\ntools = [\"u\"]\nmounts = []\n\
+         [[tools]]\nname = \"u\"\ncommand = \"/bin/echo\"\ntools = []\n{declaration}"
+    );
+    for (label, body, flags, mounts) in [
+        ("inherited tool list", inherited.as_str(), vec![], vec![]),
+        (
+            "equivalent --mount",
+            "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\ntools = []\nmounts = []\n",
+            vec!["--no-config-mounts"],
+            vec![format!("{}:/f:fork", source.display())],
+        ),
+    ] {
+        h.write_user(body);
+        let mount_refs: Vec<&str> = mounts.iter().map(String::as_str).collect();
+        let reused = h.run_verb("t", &mount_refs, false, &flags);
+        let stderr = stderr_of(&reused);
+        assert!(
+            stderr.contains("[debug] sandbox config JSON:"),
+            "{label}: {stderr}"
+        );
+        assert!(stderr.contains("Reusing fork"), "{label}: {stderr}");
+        assert!(
+            !stderr.contains("Initialized fork"),
+            "{label}: a READY fork must not be reseeded: {stderr}"
+        );
+        let binds = bind_mounts(&debug_config_json(&stderr));
+        assert!(
+            binds
+                .iter()
+                .any(|(host, guest, readonly)| Path::new(host) == committed
+                    && guest == "/f"
+                    && !readonly),
+            "{label}: the same committed copy must be bound: {binds:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(committed.join("marker")).unwrap(),
+            "guest",
+            "{label}: the guest's own write must survive"
+        );
+        assert_eq!(
+            h.fork_identities(),
+            identities,
+            "{label}: one committed copy with one unchanged manifest"
+        );
+    }
+}
+
+/// #396 AC-identity/AC-guards: every mount mode, the read-only parent/child
+/// ordering and the follow-link discovery produce the *same* configuration when
+/// they are declared in a tool list (own or inherited) as when they are passed as
+/// `--mount`, in both guest modes.
+///
+/// The oracle is the CLI route's own observation: guest, read-only and
+/// `follow_root_symlinks` per declaration. Anything a tool route changed about the
+/// plan would show up as a differing triple.
+#[test]
+fn tool_mount_parent_child_and_follow_modes_match_cli() {
+    /// The user-visible part of each bind, in declaration order.
+    fn observed(config: &serde_json::Value, guests: &[&str]) -> Vec<(String, bool, bool)> {
+        let binds = bind_mounts(config);
+        guests
+            .iter()
+            .map(|guest| {
+                let (_, _, readonly) = binds
+                    .iter()
+                    .find(|(_, path, _)| path == guest)
+                    .unwrap_or_else(|| panic!("{guest} missing from {binds:?}"));
+                (
+                    (*guest).to_string(),
+                    *readonly,
+                    bind_follow_root(config, guest),
+                )
+            })
+            .collect()
+    }
+
+    fn matrix_config(declarations: &[&str], root: bool) -> Vec<(String, bool, bool)> {
+        let h = Harness::new();
+        let home = h.home_path();
+        std::fs::create_dir(home.join("mode-dir")).unwrap();
+        std::fs::write(home.join("mode-dir/marker"), "marker").unwrap();
+        // `:follow-links` discovers this target and binds it read-only at its own
+        // literal path, which is the same for all three routes.
+        std::fs::create_dir(home.join("mode-target")).unwrap();
+        std::fs::write(home.join("mode-target/marker"), "target").unwrap();
+        std::os::unix::fs::symlink(home.join("mode-target"), home.join("mode-dir/linked")).unwrap();
+        std::fs::create_dir(home.join("mode-fork-source")).unwrap();
+        std::fs::write(home.join("mode-fork-source/seed"), "seed").unwrap();
+        let discovered = home.join("mode-target").display().to_string();
+        let guests: Vec<&str> = vec![
+            "/guest/ro",
+            "/guest/rw",
+            "/guest/bare",
+            "/guest/fork",
+            "/guest/follow",
+            &discovered,
+        ];
+        // The matrix's declarations are identical in both spellings: `~` for the
+        // tool list, the absolute home path for `--mount`.
+        let cli: Vec<String> = declarations
+            .iter()
+            .map(|declaration| declaration.replace('~', &home.display().to_string()))
+            .collect();
+        let cli_refs: Vec<&str> = cli.iter().map(String::as_str).collect();
+
+        let tool_body = format!(
+            "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\ntools = [\"u\"]\nmounts = []\n\
+             [[tools]]\nname = \"u\"\ncommand = \"/bin/echo\"\ntools = []\nmounts = [{}]\n",
+            declarations
+                .iter()
+                .map(|declaration| format!("{declaration:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let own_body = format!(
+            "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\ntools = []\nmounts = [{}]\n",
+            declarations
+                .iter()
+                .map(|declaration| format!("{declaration:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let run = |verb: &str, mounts: &[&str], options: &[&str]| {
+            let out = h.run_verb(verb, mounts, root, options);
+            let stderr = stderr_of(&out);
+            assert!(
+                stderr.contains("[debug] sandbox config JSON:"),
+                "{declarations:?} root={root}: {stderr}"
+            );
+            debug_config_json(&stderr)
+        };
+
+        // The CLI route, then the same declarations through the inherited and the
+        // own tool list: all three must agree.
+        let expected = run("shell", &cli_refs, &[]);
+        let expected = observed(&expected, &guests);
+        h.write_user(&tool_body);
+        let inherited = run("t", &[], &[]);
+        assert_eq!(
+            observed(&inherited, &guests),
+            expected,
+            "an inherited tool list must plan the same modes and discovery"
+        );
+        h.write_user(&own_body);
+        let own = run("t", &[], &[]);
+        let own = observed(&own, &guests);
+        assert_eq!(own, expected, "an own tool list must plan the same modes");
+        own
+    }
+
+    let declarations = [
+        "~/mode-dir:/guest/ro:ro",
+        "~/mode-dir:/guest/rw:rw",
+        "~/mode-dir:/guest/bare",
+        "~/mode-fork-source:/guest/fork:fork",
+        "~/mode-dir:/guest/follow:ro:follow-links",
+    ];
+    for root in [false, true] {
+        let observed = matrix_config(&declarations, root);
+        // The CLI oracle is itself checked against the declared intent, so three
+        // routes agreeing on a wrong mode cannot pass.
+        assert_eq!(
+            observed[0],
+            ("/guest/ro".to_string(), true, true),
+            "root={root}"
+        );
+        assert_eq!(observed[1], ("/guest/rw".to_string(), false, true));
+        assert_eq!(observed[2], ("/guest/bare".to_string(), false, true));
+        assert_eq!(observed[3], ("/guest/fork".to_string(), false, true));
+        assert_eq!(observed[4], ("/guest/follow".to_string(), true, true));
+        // `:follow-links` appends the discovered directory read-only at the literal
+        // path the guest will `readlink` (mount_fork's own rows pin that spelling).
+        assert!(
+            observed[5].1,
+            "root={root}: the discovered target is read-only: {observed:?}"
+        );
+    }
+
+    // The read-only child under a writable parent, declared as one direct leaf per
+    // tool so neither order depends on how a single list is folded.
+    for child_first in [false, true] {
+        for root in [false, true] {
+            let h = Harness::new();
+            let parent = h.home_path().join("parent");
+            std::fs::create_dir_all(parent.join("child")).unwrap();
+            std::fs::write(parent.join("child/marker"), "child").unwrap();
+            std::fs::write(parent.join("marker"), "parent").unwrap();
+            let entries = if child_first {
+                [
+                    "mounts = [\"~/parent/child:/p/child:ro\"]\n",
+                    "mounts = [\"~/parent:/p\"]\n",
+                ]
+            } else {
+                [
+                    "mounts = [\"~/parent:/p\"]\n",
+                    "mounts = [\"~/parent/child:/p/child:ro\"]\n",
+                ]
+            };
+            // `t` carries one leaf and inherits the other from `u`.
+            h.write_user(&format!(
+                "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\ntools = [\"u\"]\n{}\
+                 [[tools]]\nname = \"u\"\ncommand = \"/bin/echo\"\ntools = []\n{}",
+                entries[0], entries[1]
+            ));
+            let out = h.run_verb("t", &[], root, &[]);
+            let stderr = stderr_of(&out);
+            assert!(stderr.contains("[debug] sandbox config JSON:"), "{stderr}");
+            let config = debug_config_json(&stderr);
+            let binds = bind_mounts(&config);
+            let mode = |guest: &str| {
+                binds
+                    .iter()
+                    .find(|(_, path, _)| path == guest)
+                    .map(|(_, _, readonly)| *readonly)
+                    .unwrap_or_else(|| panic!("{guest} missing: {binds:?}"))
+            };
+            assert!(!mode("/p"), "child_first={child_first}: {binds:?}");
+            assert!(mode("/p/child"), "child_first={child_first}: {binds:?}");
+        }
+    }
+
+    // A READY fork plus a nested, followed child bind: the committed anchor survives
+    // the source's deletion and the child keeps its `--mount` shape through a tool
+    // route, in either order and in both guest modes.
+    for child_follow_links in [false, true] {
+        for fork_first in [false, true] {
+            for root in [false, true] {
+                let h = Harness::new();
+                let source = h.home.path().join("fork-source");
+                let child = h.home.path().join("child-source");
+                std::fs::create_dir(&source).unwrap();
+                std::fs::create_dir(&child).unwrap();
+                std::fs::write(child.join("secret"), "host secret").unwrap();
+                if child_follow_links {
+                    std::fs::create_dir(child.join("linked")).unwrap();
+                    std::os::unix::fs::symlink("linked", child.join("alias")).unwrap();
+                }
+                std::os::unix::fs::symlink(&child, source.join("child")).unwrap();
+                // The fork and the child are declared on two different tools, and
+                // one of them is inherited.
+                let fork = "mounts = [\"~/fork-source:/fork:fork\"]\n".to_string();
+                let child_suffix = if child_follow_links {
+                    ":ro:follow-links"
+                } else {
+                    ":ro"
+                };
+                let child_body =
+                    format!("mounts = [\"~/child-source:/fork/child{child_suffix}\"]\n");
+                let (first, second) = if fork_first {
+                    (&fork, &child_body)
+                } else {
+                    (&child_body, &fork)
+                };
+                h.write_user(&format!(
+                    "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\ntools = [\"u\"]\n{first}\
+                     [[tools]]\nname = \"u\"\ncommand = \"/bin/echo\"\ntools = []\n{second}"
+                ));
+                let seeded = h.run_verb("t", &[], root, &[]);
+                let seeded_stderr = stderr_of(&seeded);
+                assert!(
+                    seeded_stderr.contains("Initialized fork"),
+                    "root={root} fork_first={fork_first}: {seeded_stderr}"
+                );
+                let committed = bind_mounts(&debug_config_json(&seeded_stderr))
+                    .iter()
+                    .find(|(_, guest, _)| guest == "/fork")
+                    .map(|(host, _, _)| PathBuf::from(host))
+                    .expect("the fork's committed copy");
+                std::fs::remove_file(source.join("child")).unwrap();
+                std::fs::remove_dir(&source).unwrap();
+
+                let reused = h.run_verb("t", &[], root, &[]);
+                let stderr = stderr_of(&reused);
+                assert!(
+                    stderr.contains("Reusing fork"),
+                    "root={root} fork_first={fork_first} follow={child_follow_links}: {stderr}"
+                );
+                let config = debug_config_json(&stderr);
+                let binds = bind_mounts(&config);
+                assert!(
+                    binds
+                        .iter()
+                        .any(|(host, guest, readonly)| Path::new(host) == committed
+                            && guest == "/fork"
+                            && !readonly),
+                    "{binds:?}"
+                );
+                assert!(
+                    binds
+                        .iter()
+                        .any(|(_, guest, readonly)| guest == "/fork/child" && *readonly),
+                    "{binds:?}"
+                );
+                if child_follow_links {
+                    // The discovered target is bound read-only at the literal path
+                    // the guest's own `readlink` names — the spelling the CLI rows
+                    // pin — not under the fork's guest path.
+                    let linked = child.join("linked").display().to_string();
+                    assert!(
+                        binds.iter().any(|(host, guest, readonly)| *host == linked
+                            && *guest == linked
+                            && *readonly),
+                        "the followed child target must keep its literal guest path: {binds:?}"
+                    );
+                }
+                assert_eq!(h.fork_dirs().len(), 1, "{binds:?}");
+            }
+        }
+    }
 }

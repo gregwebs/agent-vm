@@ -16,7 +16,11 @@ record in two steps. **Tier-local tool references are implemented (#395):** ever
 `tools` reference — explicit name or `"*"` — resolves inside the one
 configuration file that declares the tool, including definitions hidden from
 launch-verb selection, so the explicit cross-file opt-in described below is gone.
-**Tool mount inheritance through the same closure is still pending.**
+**Tool mount inheritance through the same closure is implemented (#396)**: a full
+user tool's `mounts` is a fourth facet of that closure, own plus inherited, and a
+direct `run`/`--` target has an empty mount facet. Tool `env` and
+`network_requests` were not folded and keep their own-only rule, and required
+providers are still the launched tool's own.
 
 ## Context
 
@@ -63,8 +67,9 @@ identical to the pre-#82 binary.
   credentials and persisted paths. A name the scope does not declare is a config
   error, never an opt-in to crossing files, and every definition's references
   are validated even when no launch verb reaches that definition. Resolution
-  happens *before* launch selection, so the three facets (providers, credential
-  names, `persist` paths) can never be folded from a lossy merge. This is the
+  happens *before* launch selection, so the facets (providers, credential
+  names, `persist` paths, and — since #396 — user config mounts) can never be
+  folded from a lossy merge. This is the
   user's binding amendment to the original specification, which said `"*"`
   meant every tool the catalog declares; the shipped default catalog's table is
   unchanged because every built-in tool shares `default-tools.toml`.

@@ -107,7 +107,7 @@
 //! module and [`crate::config_mounts`] only decide *what* a trusted file says.
 
 use crate::config_authority::{self, AuthorityTriggers};
-use crate::config_mounts::{self, UserMounts};
+use crate::config_mounts::{self, ResolvedMountList, UserMounts};
 use crate::user_network::{self, UserNetwork};
 
 use crate::network_requests::{NetworkRequests, RequestTier};
@@ -277,8 +277,40 @@ impl ConfigReport {
     /// Deliberately *not* folded into [`ResolvedTools`]: that type means "the
     /// merge result", and the fallback is not a declaration.
     pub(crate) fn into_launch_catalog(self) -> Result<LaunchCatalog> {
-        let ConfigReport { resolved, .. } = self;
-        catalog_from_tools(resolved)
+        self.catalog_with_work().0
+    }
+
+    /// [`Self::into_launch_catalog`], also reporting the leaf-visit budget the
+    /// build left the shared counter at — even when it refuses.
+    ///
+    /// Test-only: on the error path the counter is otherwise observable only as
+    /// the refusal, and the continuity contract is precisely how far it got.
+    #[cfg(test)]
+    pub(crate) fn into_launch_catalog_with_work(
+        self,
+    ) -> (Result<LaunchCatalog>, config_mounts::MountExpansionWork) {
+        self.catalog_with_work()
+    }
+
+    fn catalog_with_work(self) -> (Result<LaunchCatalog>, config_mounts::MountExpansionWork) {
+        let ConfigReport {
+            resolved,
+            user_mounts,
+            ..
+        } = self;
+        // The catalog fold continues the verified parse's leaf-visit budget
+        // rather than starting a fresh one: tool lists and an inherited closure
+        // amplify the same leaves the parse already admitted, so a per-launch or
+        // per-tier counter would be a second, unbounded budget for the same file.
+        // Built-in tools cannot carry mounts, so `fresh` is exact on the defaults
+        // path.
+        let mut work = user_mounts
+            .as_ref()
+            .map_or_else(config_mounts::MountExpansionWork::fresh, |mounts| {
+                mounts.continuing_work()
+            });
+        let catalog = catalog_from_tools(resolved, &mut work);
+        (catalog, work)
     }
 }
 
@@ -293,16 +325,23 @@ impl ConfigReport {
 /// scope holding only the one shipped `shell`: reusing the whole shipped catalog
 /// would restore the shipped agents' providers and `.dsh` persistence under a
 /// custom catalog, which declaring any tools must replace.
-fn catalog_from_tools(tools: ResolvedTools) -> Result<LaunchCatalog> {
+fn catalog_from_tools(
+    tools: ResolvedTools,
+    work: &mut config_mounts::MountExpansionWork,
+) -> Result<LaunchCatalog> {
     let shell_fallback_added = !tools
         .launch_tools()
         .any(|tool| tool.name() == SHELL_TOOL_NAME);
-    let mut entries = resolve_provisioning(tools)?;
+    let mut entries = resolve_provisioning(tools, work)?;
     let declared_len = entries.len();
     if shell_fallback_added {
-        entries.extend(resolve_provisioning(ResolvedTools::from_defaults(vec![
-            builtin_shell()?,
-        ]))?);
+        // The fallback scope holds only the shipped `shell`, which cannot carry
+        // mounts, so it contributes no candidate — but it shares the same
+        // continued budget rather than getting one of its own.
+        entries.extend(resolve_provisioning(
+            ResolvedTools::from_defaults(vec![builtin_shell()?]),
+            work,
+        )?);
     }
     Ok(LaunchCatalog {
         entries,
@@ -315,7 +354,10 @@ fn catalog_from_tools(tools: ResolvedTools) -> Result<LaunchCatalog> {
 /// user config is broken (a missing default entry is already a hard error, so
 /// this cannot itself fail on the shipped catalog), and by tests.
 pub(crate) fn default_launch_catalog() -> Result<LaunchCatalog> {
-    catalog_from_tools(ResolvedTools::from_defaults(default_tools()?))
+    catalog_from_tools(
+        ResolvedTools::from_defaults(default_tools()?),
+        &mut config_mounts::MountExpansionWork::fresh(),
+    )
 }
 
 /// The outcome of loading the tool config, as data. One value rather than a
@@ -373,6 +415,15 @@ pub(crate) struct CatalogEntry {
     /// provisioning closure, in catalog then declaration order. Deterministic
     /// because it folds over the catalog, not the closure's traversal order.
     persist: Vec<PersistPath>,
+    /// The union of this tool's own mount declarations and those of every
+    /// definition in its transitive same-file `tools` closure (#396), in arena
+    /// then list order, deduplicated by the shared claim.
+    ///
+    /// The fourth facet of the same closure [`Self::provisioned`],
+    /// [`Self::requested_names`] and [`Self::persist`] describe, and resolved over
+    /// the same one visited mask. Empty for a direct launch and for anything the
+    /// built-in catalog supplies.
+    mounts: ResolvedMountList,
 }
 
 impl CatalogEntry {
@@ -398,6 +449,13 @@ impl CatalogEntry {
     /// the one launch closure.
     pub(crate) fn persist(&self) -> &[PersistPath] {
         &self.persist
+    }
+
+    /// The config mount declarations a launch of this tool selects
+    /// automatically, own plus inherited. `--no-config-mounts` withholds them at
+    /// selection; it never changes what is resolved here.
+    pub(crate) fn mounts(&self) -> &ResolvedMountList {
+        &self.mounts
     }
 }
 
@@ -590,6 +648,16 @@ pub(crate) struct Tool {
     env: BTreeMap<String, String>,
     /// Declaration only: never authority and not folded over provisioning.
     network_requests: NetworkRequests,
+    /// This definition's **own** mount selection, already parsed, normalized,
+    /// set-expanded and deduplicated by [`crate::config_mounts`] (#396).
+    ///
+    /// A resolved facet, not raw selectors: reaching a launch must never have to
+    /// re-parse a string or re-expand a set, and a shared list handle keeps the
+    /// payloads single-instance across the tool, its entry and every clone of the
+    /// model. Omission and present-empty are both the empty list *here* — the
+    /// trust difference between them was decided from the raw field's presence
+    /// before this list existed, and must not be re-derived from its length.
+    mounts: ResolvedMountList,
     origin: ToolOrigin,
     /// The tool's position in its declaring file's `[[tools]]` list. Provenance
     /// like `origin`, not a config field: excluded from definition equality and
@@ -692,6 +760,14 @@ impl Tool {
         &self.network_requests
     }
 
+    /// This definition's own mount declarations, a **selection source** for a
+    /// launch of this tool (never for another tool's launch). Empty for a project
+    /// or built-in definition, which cannot declare one, and for the built-in
+    /// `shell` fallback, whose scope contains only itself.
+    pub(crate) fn mounts(&self) -> &ResolvedMountList {
+        &self.mounts
+    }
+
     pub(crate) fn origin(&self) -> &ToolOrigin {
         &self.origin
     }
@@ -709,6 +785,7 @@ impl Tool {
             && self.interactive_shell == other.interactive_shell
             && self.env == other.env
             && self.network_requests == other.network_requests
+            && self.mounts.same_declarations(&other.mounts)
     }
 
     /// The differing fields, in the fixed schema order the warning renders.
@@ -740,6 +817,13 @@ impl Tool {
         }
         if self.network_requests != other.network_requests {
             fields.push(ToolField::NetworkRequests);
+        }
+        // Appended after `network_requests` for the same reason as the two
+        // fields above: every existing differing-field sequence keeps its order.
+        // An empty-present list and an omitted one are the *same* list, so their
+        // difference never warns — presence is an authority fact, not access.
+        if !self.mounts.same_declarations(&other.mounts) {
+            fields.push(ToolField::Mounts);
         }
         fields
     }
@@ -883,6 +967,8 @@ pub(crate) enum ToolField {
     InteractiveShell,
     Env,
     NetworkRequests,
+    /// Appended last, like the three before it.
+    Mounts,
 }
 
 impl ToolField {
@@ -896,6 +982,7 @@ impl ToolField {
             ToolField::InteractiveShell => "interactive_shell",
             ToolField::Env => "env",
             ToolField::NetworkRequests => "network_requests",
+            ToolField::Mounts => "mounts",
         }
     }
 }
@@ -1067,17 +1154,50 @@ fn read_file_tier(source: TierSource<'_>) -> Result<(TierReport, TierContents)> 
         toml::from_str(text).map_err(|error| deserialize_error(path, text, &error))?;
     // Authority is decided by the *presence* of an authority-bearing field, from
     // the same verified read the bytes came from, before any of it is parsed.
-    // Presence, not contents: `mounts = []`, an empty `[network]` and an empty
-    // `[mount_sets]` grant nothing yet are exactly the bytes an attacker would
-    // plant.
+    // Presence, not contents: `mounts = []`, an empty `[network]`, an empty
+    // `[mount_sets]` and a tool's `mounts = []` grant nothing yet are exactly the
+    // bytes an attacker would plant.
+    //
+    // A tool list is measured from the raw configuration, *before* tool
+    // validation: a definition with a malformed or missing `command` cannot be an
+    // accepted or partially patched tool, so its mount field must not be able to
+    // skip the check by making the definition invalid somewhere else.
+    let first_tool_mounts = raw.tools.iter().position(|tool| tool.mounts.is_some());
+    let tool_mount_values: Vec<config_mounts::ToolMountValue<'_>> = raw
+        .tools
+        .iter()
+        .enumerate()
+        .filter_map(|(declaration, tool)| {
+            tool.mounts
+                .as_ref()
+                .map(|value| config_mounts::ToolMountValue { declaration, value })
+        })
+        .collect();
     let triggers = AuthorityTriggers {
         network: raw.network.is_some(),
-        mounts: raw.mounts.is_some(),
+        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {
+            top_level: raw.mounts.is_some(),
+            tool_field: first_tool_mounts.is_some(),
+        }),
         mount_sets: raw.mount_sets.is_some(),
     };
     let authorized = match kind {
-        FileTierKind::User => config_authority::verify(&read, triggers)
-            .map_err(|error| anyhow!("config: {}: {error}", crate::one_line::quoted_path(path)))?,
+        FileTierKind::User => config_authority::verify(&read, triggers).map_err(|error| {
+            // A refusal caused by a tool's own field names that field first: the
+            // reader has to find the list they must review, and a file with no
+            // top-level `mounts` has nothing else pointing at it. The numeric site
+            // is echoed, never the tool's name or the list's contents.
+            let pointer = match first_tool_mounts {
+                Some(declaration) if raw.mounts.is_none() => {
+                    format!("tools[{declaration}].mounts: ")
+                }
+                _ => String::new(),
+            };
+            anyhow!(
+                "config: {}: {pointer}{error}",
+                crate::one_line::quoted_path(path)
+            )
+        })?,
         FileTierKind::Project => {
             refuse_project_authority(&raw, path)?;
             None
@@ -1103,10 +1223,14 @@ fn read_file_tier(source: TierSource<'_>) -> Result<(TierReport, TierContents)> 
         }
         None => None,
     };
-    let mounts = if raw.mounts.is_some() || raw.mount_sets.is_some() {
-        // One parser for both fields: a sets-only file still needs the verified
-        // token, because a `--mount NAME` may select one of its sets and the
-        // definitions are authority-bearing whether or not anything selects them.
+    let mut mounts = if raw.mounts.is_some()
+        || raw.mount_sets.is_some()
+        || !tool_mount_values.is_empty()
+    {
+        // One parser for all three fields: a sets-only file still needs the
+        // verified token, because a `--mount NAME` may select one of its sets, and
+        // a file whose only mount field is inside a tool must still be parsed here
+        // or its declarations would reach `validate_tools` unparsed.
         let Some(authorized) = authorized.as_ref() else {
             return Err(anyhow!(
                 "config: {}: mounts: authority was not measured",
@@ -1119,6 +1243,7 @@ fn read_file_tier(source: TierSource<'_>) -> Result<(TierReport, TierContents)> 
                 config_mounts::MountValues {
                     defaults: raw.mounts.as_ref(),
                     sets: raw.mount_sets.as_ref(),
+                    tools: &tool_mount_values,
                 },
                 home,
             )
@@ -1130,7 +1255,14 @@ fn read_file_tier(source: TierSource<'_>) -> Result<(TierReport, TierContents)> 
         None
     };
     let image = validate_image(raw.image.as_deref(), path)?;
-    let tools = validate_tools(raw.tools, kind.origin(path))?;
+    // A project or built-in tier cannot carry tool mounts: its refusal already
+    // fired by presence, so it gets the empty map and there is no path by which
+    // this tier could be handed a user's list.
+    let tool_lists = match mounts.as_mut() {
+        Some(mounts) => mounts.take_tool_lists(),
+        None => config_mounts::ToolMountLists::empty(),
+    };
+    let tools = validate_tools(raw.tools, kind.origin(path), tool_lists)?;
 
     Ok((
         TierReport {
@@ -1149,16 +1281,30 @@ fn read_file_tier(source: TierSource<'_>) -> Result<(TierReport, TierContents)> 
 }
 
 /// A project file may not grant anything. Network is checked first so a file
-/// that declares both keeps today's `[network]` bytes.
+/// that declares both keeps today's `[network]` bytes, then the top-level mount
+/// fields, then the first tool's own list.
 fn refuse_project_authority(raw: &RawConfig, path: &Path) -> Result<()> {
+    refuse_non_user_authority(raw, path, RefusingTier::Project)
+}
+
+/// The one refusal order both non-user tiers share: network, top-level `mounts`,
+/// `[mount_sets]`, then the first tool's `mounts` in declaration order.
+///
+/// A tool field is refused by **presence alone** — empty, a table, a number, on a
+/// shadowed or otherwise unreachable definition: asking for a mount is what
+/// authority means, so there is no shape of request this tier may make.
+fn refuse_non_user_authority(raw: &RawConfig, path: &Path, tier: RefusingTier) -> Result<()> {
     if let Some(table) = raw.network.as_ref() {
-        return Err(network_refusal(table, path, RefusingTier::Project));
+        return Err(network_refusal(table, path, tier));
     }
     if raw.mounts.is_some() {
-        return Err(mounts_refusal(path, RefusingTier::Project));
+        return Err(mounts_refusal(path, tier));
     }
     if raw.mount_sets.is_some() {
-        return Err(mount_sets_refusal(path, RefusingTier::Project));
+        return Err(mount_sets_refusal(path, tier));
+    }
+    if let Some(declaration) = raw.tools.iter().position(|tool| tool.mounts.is_some()) {
+        return Err(tool_mounts_refusal(path, tier, declaration));
     }
     Ok(())
 }
@@ -1193,13 +1339,34 @@ fn network_refusal(table: &toml::Table, file: &Path, tier: RefusingTier) -> anyh
 /// The `mounts` twin of [`network_refusal`], for the two tiers that may not
 /// declare one.
 fn mounts_refusal(file: &Path, tier: RefusingTier) -> anyhow::Error {
-    let reason = match tier {
+    anyhow!(
+        "config: {}: {}; use --mount launch options, or mounts in the user config",
+        crate::one_line::quoted_path(file),
+        mounts_refusal_reason(tier)
+    )
+}
+
+/// The one sentence a non-user tier's mount refusal states, shared by the
+/// top-level field and a tool's own so the two cannot drift.
+fn mounts_refusal_reason(tier: RefusingTier) -> &'static str {
+    match tier {
         RefusingTier::Project => "mounts cannot be declared by the project config",
         RefusingTier::BuiltIn => "mounts cannot be declared by the built-in config",
-    };
+    }
+}
+
+/// A tool's own `mounts` field refused in a tier that may not declare mount
+/// authority.
+///
+/// The subject is the numeric file/field pointer, never the tool's name: this is
+/// decided before tool-name validation, so a malicious name cannot reach the
+/// terminal through it.
+fn tool_mounts_refusal(file: &Path, tier: RefusingTier, declaration: usize) -> anyhow::Error {
     anyhow!(
-        "config: {}: {reason}; use --mount launch options, or mounts in the user config",
-        crate::one_line::quoted_path(file)
+        "config: {}: tools[{declaration}].mounts: {}; use --mount launch options, or mounts in the \
+         user config",
+        crate::one_line::quoted_path(file),
+        mounts_refusal_reason(tier)
     )
 }
 
@@ -1247,16 +1414,12 @@ fn tools_from_builtin_text(text: &str) -> Result<Vec<Tool>> {
     let path = Path::new("default-tools.toml");
     let raw: RawConfig =
         toml::from_str(text).map_err(|error| deserialize_error(path, text, &error))?;
-    if let Some(table) = raw.network.as_ref() {
-        return Err(network_refusal(table, path, RefusingTier::BuiltIn));
-    }
-    if raw.mounts.is_some() {
-        return Err(mounts_refusal(path, RefusingTier::BuiltIn));
-    }
-    if raw.mount_sets.is_some() {
-        return Err(mount_sets_refusal(path, RefusingTier::BuiltIn));
-    }
-    validate_tools(raw.tools, ToolOrigin::BuiltIn)
+    refuse_non_user_authority(&raw, path, RefusingTier::BuiltIn)?;
+    validate_tools(
+        raw.tools,
+        ToolOrigin::BuiltIn,
+        config_mounts::ToolMountLists::empty(),
+    )
 }
 
 fn discover_home() -> Result<Option<PathBuf>> {
@@ -1576,6 +1739,19 @@ fn unresolved_reference(tool: &Tool, reference: &ToolName) -> anyhow::Error {
     )
 }
 
+/// One launch winner's resolved facets: the four things one visited mask supplies.
+///
+/// A named struct rather than a fourth positional tuple element: three of these
+/// are collections and two are ordered, so an opaque four-tuple is exactly where a
+/// caller transposes two facets without the compiler noticing. Pairing this with
+/// its winner happens in one place, by ordered filtering.
+struct ResolvedFacets {
+    provisioned: ProviderSet,
+    requested_names: BTreeSet<ServiceName>,
+    persist: Vec<PersistPath>,
+    mounts: ResolvedMountList,
+}
+
 /// Resolve every launch winner's provisioning set as the least fixed point of
 ///
 /// ```text
@@ -1585,8 +1761,10 @@ fn unresolved_reference(tool: &Tool, reference: &ToolName) -> anyhow::Error {
 /// where `tools(t)` names retained definitions in `t`'s **tool reference scope** —
 /// the one configuration file that declares `t` — and a `"*"` entry expands to
 /// every definition in that scope, hidden ones included. Providers, credential
-/// names and `persist` paths are folded over one visited mask, so the three facets
-/// cannot disagree about what a launch provisions.
+/// names, `persist` paths and mount declarations are four facets folded over *one*
+/// visited mask, so they cannot disagree about what a launch provisions. Tool
+/// environment and `network_requests` stay out of the fold on purpose: they are
+/// the launched tool's own, not its references'.
 ///
 /// Every retained definition's explicit references are checked first, *including*
 /// definitions no launch verb reaches: a dangling reference is an error in the
@@ -1594,7 +1772,17 @@ fn unresolved_reference(tool: &Tool, reference: &ToolName) -> anyhow::Error {
 /// neither satisfies it nor hides it. Each launch winner's closure is then
 /// checked for persist ownership *before* its paths escape, and the facets fold in
 /// arena order, so the result never depends on traversal order.
-fn resolve_provisioning(tools: ResolvedTools) -> Result<Vec<CatalogEntry>> {
+///
+/// `work` is the leaf-visit budget **continued** from the verified parse
+/// ([`ConfigReport::into_launch_catalog`]); the mount facet is the only thing that
+/// spends it here, because it is the only facet whose size can be amplified by a
+/// repeated inherited list. One visited mask exists at a time — the mask is
+/// dropped before the next launch is resolved — so retained memory does not grow
+/// with the square of the catalog.
+fn resolve_provisioning(
+    tools: ResolvedTools,
+    work: &mut config_mounts::MountExpansionWork,
+) -> Result<Vec<CatalogEntry>> {
     let ResolvedTools {
         definitions,
         launches,
@@ -1618,34 +1806,50 @@ fn resolve_provisioning(tools: ResolvedTools) -> Result<Vec<CatalogEntry>> {
         }
     }
 
-    let closures: Vec<Vec<bool>> = launches
-        .iter()
-        .map(|start| launch_closure(&definitions, &index, *start))
-        .collect::<Result<_>>()?;
-    drop(index);
-
-    // Ownership before any facet escapes: two definitions selected by the same
-    // launch may not claim one guest path or an ancestor/descendant pair, even
-    // when one of them lost its launch verb. Unguarded here, a hidden loser's
-    // paths would reach the guest-HOME link list unvalidated.
-    for visited in &closures {
-        validate_persist_ownership(closure_definitions(&definitions, visited))?;
-    }
-
-    let facets: Vec<(ProviderSet, BTreeSet<ServiceName>, Vec<PersistPath>)> = closures
-        .iter()
-        .map(|visited| {
-            let mut provisioned = ProviderSet::default();
-            let mut requested_names = BTreeSet::new();
-            let mut persist = Vec::new();
-            for tool in closure_definitions(&definitions, visited) {
-                provisioned = provisioned.union(tool.credential_providers());
-                requested_names.extend(tool.credential_names().iter().cloned());
-                persist.extend(tool.persist().iter().cloned());
+    let mut facets: Vec<ResolvedFacets> = Vec::with_capacity(launches.len());
+    for start in &launches {
+        let visited = launch_closure(&definitions, &index, *start)?;
+        // Ownership before any facet escapes: two definitions selected by the
+        // same launch may not claim one guest path or an ancestor/descendant
+        // pair, even when one of them lost its launch verb. Unguarded here, a
+        // hidden loser's paths would reach the guest-HOME link list unvalidated.
+        validate_persist_ownership(closure_definitions(&definitions, &visited))?;
+        let mut provisioned = ProviderSet::default();
+        let mut requested_names = BTreeSet::new();
+        let mut persist = Vec::new();
+        let mut lists: Vec<&ResolvedMountList> = Vec::new();
+        for tool in closure_definitions(&definitions, &visited) {
+            provisioned = provisioned.union(tool.credential_providers());
+            requested_names.extend(tool.credential_names().iter().cloned());
+            persist.extend(tool.persist().iter().cloned());
+            // Arena order, so the union is the deterministic fold the other three
+            // facets use. An empty list is skipped rather than folded: it can
+            // contribute nothing and must not spend a budget visit.
+            if !tool.mounts().is_empty() {
+                lists.push(tool.mounts());
             }
-            (provisioned, requested_names, persist)
-        })
-        .collect();
+        }
+        let mounts = config_mounts::merge_tool_mounts(lists, work).map_err(|error| {
+            // A closure conflict is a catalog error for *this* launch: the two
+            // lists agree with themselves and only disagree when one launch
+            // selects both. Naming the launching declaration is what makes that
+            // fixable, and the file comes from `tool_error`'s origin.
+            let launcher = &definitions[start.0];
+            tool_error(
+                &launcher.origin,
+                launcher.declaration_index,
+                &launcher.name,
+                error,
+            )
+        })?;
+        facets.push(ResolvedFacets {
+            provisioned,
+            requested_names,
+            persist,
+            mounts,
+        });
+    }
+    drop(index);
 
     // Retention ends here: only the launch winners survive. Their arena positions
     // are found by ordered filtering, never by index arithmetic, so the strictly
@@ -1655,14 +1859,13 @@ fn resolve_provisioning(tools: ResolvedTools) -> Result<Vec<CatalogEntry>> {
         .enumerate()
         .filter(|(position, _)| launches.binary_search(&DefinitionId(*position)).is_ok())
         .zip(facets)
-        .map(
-            |((_, tool), (provisioned, requested_names, persist))| CatalogEntry {
-                tool,
-                provisioned,
-                requested_names,
-                persist,
-            },
-        )
+        .map(|((_, tool), facets)| CatalogEntry {
+            tool,
+            provisioned: facets.provisioned,
+            requested_names: facets.requested_names,
+            persist: facets.persist,
+            mounts: facets.mounts,
+        })
         .collect())
 }
 
@@ -1793,13 +1996,30 @@ struct RawTool {
     env: BTreeMap<String, String>,
     #[serde(default)]
     network_requests: Vec<String>,
+    /// This definition's own mount selection (#396), user tier only.
+    ///
+    /// A `toml::Value`, not `Vec<String>`, for exactly the reason the top-level
+    /// field is one: presence is what makes the file authority-bearing, so
+    /// `[]`, a table and a number must all survive to the authority decision
+    /// before any schema complaint. Project and built-in tiers refuse the field by
+    /// presence alone.
+    ///
+    /// Deliberately **not** honoured for a built-in tool as a patch: a mount-only
+    /// setting never modifies a shipped definition. It is a field of a full
+    /// definition, so declaring one at all replaces the catalog.
+    #[serde(default)]
+    mounts: Option<toml::Value>,
 }
 
 /// Validate the raw `[[tools]]` entries into a catalog, rejecting duplicate
 /// names and reporting the exact field that failed. Sequentially applying
 /// focused validators keeps each diagnosis specific instead of collapsing the
 /// whole entry into one generic parse error.
-fn validate_tools(raw: Vec<RawTool>, origin: ToolOrigin) -> Result<Vec<Tool>> {
+fn validate_tools(
+    raw: Vec<RawTool>,
+    origin: ToolOrigin,
+    mounts: config_mounts::ToolMountLists,
+) -> Result<Vec<Tool>> {
     let mut tools = Vec::with_capacity(raw.len());
     let mut first_index: HashMap<String, usize> = HashMap::new();
     for (index, tool) in raw.into_iter().enumerate() {
@@ -1837,6 +2057,11 @@ fn validate_tools(raw: Vec<RawTool>, origin: ToolOrigin) -> Result<Vec<Tool>> {
             interactive_shell: tool.interactive_shell,
             env,
             network_requests,
+            // Already parsed and validated from the verified read, so this is a
+            // shared handle, not a second parse. Whole-definition merging needs no
+            // special case here: a user winner keeps all of its own fields, and a
+            // project definition's mount field was refused before this point.
+            mounts: mounts.get(index),
             origin: origin.clone(),
             declaration_index: index,
         });
@@ -2409,13 +2634,14 @@ fn deserialize_error(file: &Path, text: &str, error: &toml::de::Error) -> anyhow
     };
     anyhow!(
         "config: {}{location}: invalid TOML or tool schema; check syntax and field types. \
-         Required: a string `name` and `command`; `args`, `credentials`, `tools`, `persist` and `network_requests` are \
-         arrays of strings; `env` is a table of string values; the top-level `image` and each \
-         tool's `command` are strings. A top-level `mounts` is an array of mount declarations or \
-         mount-set names, `[mount_sets]` is a table of named arrays of the same, and both are \
-         accepted only at the top of the user file; TOML assigns keys to the most recent `[table]` \
-         header, so write `mounts` before the first one and put each set's entries in its own \
-         array. Nested tables are not mount sets.",
+         Required: a string `name` and `command`; `args`, `credentials`, `tools`, `persist`, \
+         `mounts` and `network_requests` are arrays of strings; `env` is a table of string values; \
+         the top-level `image` and each tool's `command` are strings. The top-level `mounts` and each \
+         full user `[[tools]]`'s `mounts` are arrays of mount declarations or mount-set names; \
+         `[mount_sets]` is a table of named arrays of the same and is accepted only at the top of the \
+         user file. TOML assigns keys to the most recent `[table]` header, so write the top-level \
+         `mounts` before the first header and give each tool or set its entries in its own array. \
+         Nested tables are not mount sets.",
         crate::one_line::quoted_path(file)
     )
 }
@@ -2767,7 +2993,7 @@ mod tests {
         let mounts = report.user_mounts().expect("present-empty is present");
         assert_eq!(mounts.len(), 0);
         assert_eq!(mounts.file(), f.user.as_path());
-        assert!(mounts.requests().is_empty());
+        assert!(mounts.defaults().is_none_or(ResolvedMountList::is_empty));
         // A mounts-only file declares no tools, so the shipped defaults stand.
         let report = f.user("mounts = [\"/a\"]\n").load().unwrap();
         assert!(report.uses_defaults());
@@ -2937,7 +3163,7 @@ mod tests {
         assert!(report.uses_defaults());
         let mounts = report.user_mounts().expect("a sets-only file is present");
         assert!(!mounts.has_defaults());
-        assert!(mounts.requests().is_empty());
+        assert!(mounts.defaults().is_none());
         let name = crate::config_mounts::MountSetName::parse("agent").unwrap();
         assert_eq!(mounts.requests_for_set(&name).map(|r| r.len()), Some(1));
         assert_eq!(
@@ -3069,8 +3295,9 @@ mod tests {
         let spellings: Vec<crate::mount::Spelling> = report
             .user_mounts()
             .unwrap()
+            .defaults()
+            .expect("the file declares defaults")
             .requests()
-            .iter()
             .map(|request| request.mount.source_spelling.clone())
             .collect();
         assert_eq!(spellings, ["/h//ref", "/abs/ref"]);
@@ -3221,31 +3448,165 @@ mod tests {
         );
     }
 
-    /// `[[tools]]` keeps `deny_unknown_fields`, so a per-tool `mounts` stays a
-    /// schema error — value-free, and pointing at TOML's scoping rule.
+    /// **#396 reversal.** A full user `[[tools]]` may declare `mounts`; that is the
+    /// feature, so the pre-#396 negative row is replaced by positive coverage plus
+    /// the project/built-in refusals that now carry the negative half.
+    ///
+    /// The row also pins the *ordering* the reversal must not disturb: a malformed
+    /// or mount-less tool still produces the fixed schema sentence, so a mount field
+    /// can neither be an accepted partial patch nor a way to skip the shape check.
     #[test]
-    fn a_tool_level_mounts_field_is_a_schema_error() {
-        for body in [
-            "[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = []\n",
-            "[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = [\"s3cr3t-SENTINEL-305\"]\n",
+    fn user_tool_mounts_are_accepted_and_still_require_a_full_definition() {
+        let f = Fixture::new();
+        let report = f
+            .user("[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = []\n")
+            .load()
+            .unwrap();
+        // Present-empty is present: the file is authority-bearing and parsed, but
+        // the tool selects nothing.
+        let mounts = report.user_mounts().expect("a tool list is a mount field");
+        assert!(!mounts.has_defaults());
+        assert!(first_launch(&report).mounts().is_empty());
+
+        let f = Fixture::new();
+        let report = f
+            .user("[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = [\"/a:/g:ro\"]\n")
+            .load()
+            .unwrap();
+        assert_eq!(first_launch(&report).mounts().len(), 1);
+
+        // One mount-only setting never patches a shipped definition: without a
+        // `command` the whole entry is still the fixed schema error, and the
+        // sentinel proves the value is never echoed.
+        const SENTINEL: &str = "s3cr3t-SENTINEL-396";
+        let refused = [
+            format!("[[tools]]\nname = \"t\"\nmounts = [\"{SENTINEL}\"]\n"),
+            format!("[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = \"{SENTINEL}\"\n"),
+            format!("[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = [{{ {SENTINEL} = 1 }}]\n"),
+            "[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = 7\n".to_string(),
+        ];
+        for body in refused {
+            let f = Fixture::new();
+            f.user(&body);
+            let error = f.load().unwrap_err().to_string();
+            assert!(!error.contains(SENTINEL), "{body}: value echoed: {error}");
+        }
+        // A present but wrongly typed tool list reaches the parser, not serde, so
+        // the sentence names the field rather than the fixed schema paragraph.
+        for (body, expected) in [
+            (
+                "[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = 7\n",
+                "tools[0].mounts: must be an array of strings",
+            ),
+            (
+                "[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = [7]\n",
+                "tools[0].mounts[0]: must be a string",
+            ),
         ] {
             let f = Fixture::new();
             f.user(body);
             let error = f.load().unwrap_err().to_string();
-            assert!(error.contains("invalid TOML or tool schema"), "{error}");
-            // The fixed repair paragraph still names TOML's scoping rule — now with
-            // `[mount_sets]` guidance, since the same rule decides whether a `mounts`
-            // key is the defaults list or a set named `mounts`.
-            assert!(
-                error.contains("so write `mounts` before the first one"),
-                "{error}"
-            );
-            assert!(
-                error.contains("Nested tables are not mount sets"),
-                "{error}"
-            );
-            assert!(!error.contains("s3cr3t-SENTINEL-305"), "{error}");
+            assert!(error.contains(expected), "{error}");
         }
+    }
+
+    /// A tool's own mount field is **user-only authority**, refused by presence in
+    /// both non-user tiers — empty, wrong type, or on a definition a user
+    /// declaration shadows.
+    ///
+    /// The subject is the numeric file/field pointer, so the refusal cannot echo a
+    /// tool name before tool-name validation runs.
+    #[test]
+    fn project_and_builtin_tool_mounts_are_refused_by_presence() {
+        for (body, expected) in [
+            (
+                "[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = []\n",
+                "tools[0].mounts: mounts cannot be declared by the project config; use --mount \
+                 launch options, or mounts in the user config",
+            ),
+            (
+                "[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = [\"/a:/g:ro\"]\n",
+                "tools[0].mounts: mounts cannot be declared by the project config; use --mount \
+                 launch options, or mounts in the user config",
+            ),
+            (
+                "[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = 7\n",
+                "tools[0].mounts: mounts cannot be declared by the project config; use --mount \
+                 launch options, or mounts in the user config",
+            ),
+            (
+                "[[tools]]\nname = \"a\"\ncommand = \"a\"\n\
+                 [[tools]]\nname = \"b\"\ncommand = \"b\"\nmounts = []\n",
+                "tools[1].mounts: mounts cannot be declared by the project config; use --mount \
+                 launch options, or mounts in the user config",
+            ),
+        ] {
+            let f = Fixture::new();
+            f.project(body);
+            let error = f.load().unwrap_err().to_string();
+            assert_eq!(
+                error,
+                format!("config: {:?}: {expected}", f.project),
+                "{body}"
+            );
+        }
+
+        // A hidden project definition — same name as a user tool, so it loses the
+        // verb — is refused all the same: the field is authority, not a launch
+        // request, so it cannot be "ignored because it is shadowed".
+        let f = Fixture::new();
+        f.user(&one_tool("t"))
+            .project("[[tools]]\nname = \"t\"\ncommand = \"t\"\npersist = [\"p\"]\nmounts = []\n");
+        assert!(
+            f.load()
+                .unwrap_err()
+                .to_string()
+                .contains("tools[0].mounts: mounts cannot be declared by the project config")
+        );
+        // The same file without the field loads: the refusal is about the field.
+        let f = Fixture::new();
+        f.user(&one_tool("t"))
+            .project("[[tools]]\nname = \"t\"\ncommand = \"t\"\npersist = [\"p\"]\n");
+        assert!(f.load().is_ok());
+
+        // Old authority fields keep their precedence and their bytes.
+        let f = Fixture::new();
+        f.project(
+            "[network]\nallow_lan = true\n[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = []\n",
+        );
+        let error = f.load().unwrap_err().to_string();
+        assert!(error.contains("network.allow_lan"), "{error}");
+        assert!(!error.contains("tools[0].mounts"), "{error}");
+        let f = Fixture::new();
+        f.project("mounts = []\n[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = []\n");
+        let error = f.load().unwrap_err().to_string();
+        assert_eq!(
+            error,
+            format!(
+                "config: {:?}: mounts cannot be declared by the project config; use --mount \
+                 launch options, or mounts in the user config",
+                f.project
+            )
+        );
+        let f = Fixture::new();
+        f.project("[mount_sets]\na = []\n[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = []\n");
+        assert!(
+            f.load()
+                .unwrap_err()
+                .to_string()
+                .contains("mount_sets cannot be declared by the project config")
+        );
+
+        // The built-in tier is refused by the same routine, naming its own file.
+        let error =
+            tools_from_builtin_text("[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = []\n")
+                .unwrap_err()
+                .to_string();
+        assert_eq!(
+            error,
+            "config: \"default-tools.toml\": tools[0].mounts: mounts cannot be declared by the \
+             built-in config; use --mount launch options, or mounts in the user config"
+        );
     }
 
     /// TOML assigns keys to the most recent table header, so *where* a `mounts`
@@ -3257,6 +3618,9 @@ mod tests {
             Mounts(usize),
             /// Loads with no user `mounts` at all.
             Absent,
+            /// Loads, the file declares no top-level list, and its full `[[tools]]`
+            /// definition owns the `mounts` field.
+            ToolMounts,
             /// Refused, with this text in the message.
             Refused(&'static str),
         }
@@ -3275,10 +3639,13 @@ mod tests {
                      written before the first table header",
                 ),
             ),
+            // #396 reversal: the same bytes are now a full user tool's own
+            // mount list, which is a supported construct rather than a scoping
+            // mistake. The row keeps distinguishing it from the top-level list.
             (
                 "after [[tools]]",
                 "[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = []\n",
-                Expected::Refused("invalid TOML or tool schema"),
+                Expected::ToolMounts,
             ),
             (
                 "[tools.env] array",
@@ -3305,6 +3672,14 @@ mod tests {
                         Some(len),
                         "{label}"
                     );
+                }
+                (Ok(report), Expected::ToolMounts) => {
+                    let mounts = report
+                        .user_mounts()
+                        .unwrap_or_else(|| panic!("{label}: a tool list is a mount field"));
+                    assert!(!mounts.has_defaults(), "{label}");
+                    let tool = first_launch(&report);
+                    assert!(tool.mounts().is_empty(), "{label}");
                 }
                 (Ok(report), Expected::Absent) => {
                     assert!(report.user_mounts().is_none(), "{label}");
@@ -3341,6 +3716,887 @@ mod tests {
                 .to_string()
                 .contains("mounts requires config.toml to be a regular file")
         );
+    }
+
+    // -- tool mounts as a closure facet (#396) ------------------------------
+
+    /// One launch entry's mount facet as `(declared spelling, guest, read-only,
+    /// fork)`, so a row asserts the access rather than only a count.
+    fn entry_mounts(
+        catalog: &LaunchCatalog,
+        name: &str,
+    ) -> Vec<(crate::mount::Spelling, String, bool, bool)> {
+        use crate::mount::MountPolicy;
+        entry_of(catalog, name)
+            .mounts()
+            .requests()
+            .map(|request| {
+                (
+                    request.mount.source_spelling.clone(),
+                    request.mount.guest.display().to_string(),
+                    matches!(request.mount.policy, MountPolicy::BindReadOnly { .. }),
+                    matches!(request.mount.policy, MountPolicy::Fork { .. }),
+                )
+            })
+            .collect()
+    }
+
+    /// A guest-path list only, for rows that do not care about the policy.
+    fn guest_mounts(catalog: &LaunchCatalog, name: &str) -> Vec<String> {
+        entry_mounts(catalog, name)
+            .into_iter()
+            .map(|(_, guest, _, _)| guest)
+            .collect()
+    }
+
+    /// A full user tool definition with one field appended.
+    fn tool(body: &str) -> String {
+        format!("[[tools]]\n{body}")
+    }
+
+    /// #396 AC-authority: a **tool's** `mounts` field is authority-bearing from its
+    /// presence alone, decided on the same verified read as the top-level list.
+    ///
+    /// The positive controls matter as much as the refusals: the same symlinked
+    /// file without the field still loads (ADR-0040's compatibility rule), and a
+    /// `[tools.env] mounts` entry is an ordinary environment variable that triggers
+    /// no mount policy at all.
+    #[test]
+    fn tool_mounts_presence_requires_verified_read_even_empty() {
+        // An empty list on a tool no launch verb necessarily reaches.
+        for body in [
+            tool("name = \"t\"\ncommand = \"t\"\nmounts = []\n"),
+            tool("name = \"unused\"\ncommand = \"unused\"\nmounts = [\"/a:/g:ro\"]\n")
+                + &tool("name = \"t\"\ncommand = \"t\"\n"),
+            // A wrong type is authority-bearing before the schema is decided.
+            tool("name = \"t\"\ncommand = \"t\"\nmounts = 7\n"),
+            tool("name = \"t\"\ncommand = \"t\"\nmounts = [1]\n"),
+        ] {
+            let f = Fixture::new();
+            f.symlinked_user(&body);
+            // No top-level mount field, so the refusal names the tool's own site
+            // first: the reader has to find the list they must review.
+            assert_eq!(
+                f.load().unwrap_err().to_string(),
+                format!(
+                    "config: {:?}: tools[0].mounts: mounts requires config.toml to be a regular \
+                     file, but it is reached through a symbolic link; its target may be writable \
+                     by a guest or project, so review the mounts list before trusting the file (a \
+                     symlinked config without mounts still works)",
+                    f.user
+                ),
+                "{body}"
+            );
+        }
+
+        // Compatibility anchor: the same symlink without a mount field loads, and
+        // reports no mount model at all.
+        let f = Fixture::new();
+        f.symlinked_user(&tool("name = \"t\"\ncommand = \"t\"\n"));
+        let report = f.load().unwrap();
+        assert!(report.user_mounts().is_none());
+        assert!(first_launch(&report).mounts().is_empty());
+
+        // `[tools.env] mounts` is an ordinary env value: no authority trigger.
+        let f = Fixture::new();
+        f.symlinked_user(&tool(
+            "name = \"t\"\ncommand = \"t\"\n[tools.env]\nmounts = \"~/private:ro\"\n",
+        ));
+        let report = f.load().unwrap();
+        assert!(report.user_mounts().is_none());
+        assert_eq!(
+            first_launch(&report)
+                .guest_env()
+                .get("mounts")
+                .map(String::as_str),
+            Some("~/private:ro")
+        );
+
+        // A combined subject still names the field composition after the pointer.
+        let f = Fixture::new();
+        f.symlinked_user(&format!(
+            "[network]\nallow_lan = true\n{}",
+            tool("name = \"t\"\ncommand = \"t\"\nmounts = []\n")
+        ));
+        let error = f.load().unwrap_err().to_string();
+        assert!(
+            error.contains("tools[0].mounts: [network] and mounts requires config.toml"),
+            "{error}"
+        );
+
+        // A file whose only authority field is the old top-level list keeps its
+        // pre-#396 bytes: no pointer is prefixed.
+        let f = Fixture::new();
+        f.symlinked_user("mounts = []\n");
+        assert_eq!(
+            f.load().unwrap_err().to_string(),
+            format!(
+                "config: {:?}: mounts requires config.toml to be a regular file, but it is \
+                 reached through a symbolic link; its target may be writable by a guest or \
+                 project, so review the mounts list before trusting the file (a symlinked \
+                 config without mounts still works)",
+                f.user
+            )
+        );
+
+        // The other verified-read facts apply identically to a tool-only file.
+        if crate::host_paths::current_euid() != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            let f = Fixture::new();
+            f.user(&tool("name = \"t\"\ncommand = \"t\"\nmounts = []\n"));
+            fs::set_permissions(&f.user, fs::Permissions::from_mode(0o664)).unwrap();
+            assert!(
+                f.load()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("tools[0].mounts: mounts refuses a group- or other-writable"),
+            );
+            fs::set_permissions(&f.user, fs::Permissions::from_mode(0o600)).unwrap();
+            let alias = f.user.with_file_name("alias");
+            fs::hard_link(&f.user, &alias).unwrap();
+            assert!(
+                f.load()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("tools[0].mounts: mounts refuses a config.toml with 2 hard links"),
+            );
+            fs::remove_file(&alias).unwrap();
+            fs::set_permissions(f.user.parent().unwrap(), fs::Permissions::from_mode(0o775))
+                .unwrap();
+            assert!(f.load().unwrap_err().to_string().contains(
+                "tools[0].mounts: mounts refuses a config.toml whose directory is \
+                               group- or other-writable"
+            ),);
+            fs::set_permissions(f.user.parent().unwrap(), fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+    }
+
+    /// #396 AC-full-definition: a mount-only setting never patches a shipped tool,
+    /// and a full custom definition still replaces the whole catalog.
+    #[test]
+    fn user_tool_mounts_are_not_partial_builtin_overrides() {
+        // A full custom `pi` replaces the shipped catalog, so its absent
+        // Claude/Codex edges are a dangling reference rather than a silent reuse of
+        // the shipped ones. That is the ordinary full-definition rule, unchanged by
+        // the mount field.
+        let f = Fixture::new();
+        f.user(&tool(
+            "name = \"pi\"\ncommand = \"pi\"\ntools = [\"claude\", \"codex\"]\nmounts = [\"/a:/g:ro\"]\n",
+        ));
+        let error = f
+            .load()
+            .unwrap()
+            .into_launch_catalog()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("tools[0]"), "{error}");
+        assert!(
+            error.contains("names no tool in this configuration file"),
+            "{error}"
+        );
+
+        // With the referenced definitions present it resolves, and no shipped tool
+        // leaks into the catalog: the mount field neither added nor preserved one.
+        let f = Fixture::new();
+        f.user(&format!(
+            "{}{}{}",
+            tool("name = \"pi\"\ncommand = \"pi\"\ntools = [\"claude\", \"codex\"]\nmounts = [\"/a:/g:ro\"]\n"),
+            tool("name = \"claude\"\ncommand = \"claude\"\n"),
+            tool("name = \"codex\"\ncommand = \"codex\"\nmounts = [\"/b:/g2:ro\"]\n")
+        ));
+        let catalog = f.load().unwrap().into_launch_catalog().unwrap();
+        let names: Vec<&str> = catalog
+            .as_slice()
+            .iter()
+            .map(|entry| entry.tool().name())
+            .collect();
+        assert_eq!(names, ["pi", "claude", "codex", "shell"]);
+        assert_eq!(guest_mounts(&catalog, "pi"), ["/g", "/g2"]);
+        // The isolated fallback shell sees no user tool.
+        assert!(guest_mounts(&catalog, "shell").is_empty());
+    }
+
+    /// #396 AC-one-closure: mounts join the same visited mask that supplies
+    /// providers, requested names and persist paths — while env and network
+    /// requests keep their own-only rule.
+    #[test]
+    fn tool_mounts_are_a_facet_of_the_same_tier_local_closure() {
+        let f = Fixture::new();
+        f.user(&format!(
+            "{}{}{}{}",
+            tool("name = \"root\"\ncommand = \"root\"\ntools = [\"left\", \"right\"]\nmounts = [\"/r:/r:ro\"]\ncredentials = [\"openai\"]\nenv = { R = \"1\" }\nnetwork_requests = [\"r.example\"]\n"),
+            tool("name = \"left\"\ncommand = \"left\"\ntools = [\"shared\"]\nmounts = [\"/l:/l:ro\"]\ncredentials = [\"anthropic\"]\npersist = [\"left\"]\nenv = { L = \"1\" }\nnetwork_requests = [\"l.example\"]\n"),
+            tool("name = \"right\"\ncommand = \"right\"\ntools = [\"shared\", \"root\"]\nmounts = [\"/g:/g:rw\"]\npersist = [\"right\"]\n"),
+            tool("name = \"shared\"\ncommand = \"shared\"\nmounts = [\"/s:/s:fork\"]\ncredentials = [\"copilot\"]\npersist = [\"shared\"]\n"),
+        ));
+        let catalog = f.load().unwrap().into_launch_catalog().unwrap();
+        let entry = entry_of(&catalog, "root");
+        // Arena (file) order, not traversal order: root, left, right, shared.
+        assert_eq!(guest_mounts(&catalog, "root"), ["/r", "/l", "/g", "/s"]);
+        // Providers and persist paths come from the same closure.
+        let provisioned: Vec<&str> = entry
+            .provisioned()
+            .iter()
+            .map(|provider| provider.config_name())
+            .collect();
+        assert_eq!(provisioned, ["anthropic", "openai", "copilot"]);
+        let persist: Vec<String> = entry
+            .persist()
+            .iter()
+            .map(|path| path.as_path().display().to_string())
+            .collect();
+        assert!(persist.contains(&"right".to_string()), "{persist:?}");
+        assert!(persist.contains(&"shared".to_string()), "{persist:?}");
+        // Environment and network requests are **not** folded: the launched
+        // tool's own only.
+        assert_eq!(entry.tool().guest_env().len(), 1);
+        assert_eq!(
+            entry.tool().guest_env().get("R").map(String::as_str),
+            Some("1")
+        );
+
+        // A tool reference cycle is a harmless fixed point: each declaration once.
+        let f = Fixture::new();
+        f.user(&format!(
+            "{}{}",
+            tool("name = \"a\"\ncommand = \"a\"\ntools = [\"b\"]\nmounts = [\"/a:/a:ro\"]\n"),
+            tool("name = \"b\"\ncommand = \"b\"\ntools = [\"a\"]\nmounts = [\"/b:/b:ro\"]\n")
+        ));
+        let catalog = f.load().unwrap().into_launch_catalog().unwrap();
+        assert_eq!(guest_mounts(&catalog, "a"), ["/a", "/b"]);
+        assert_eq!(guest_mounts(&catalog, "b"), ["/a", "/b"]);
+
+        // A diamond declares one leaf once, whichever path reached it, and a
+        // normalized duplicate merges rather than conflicting.
+        let f = Fixture::new();
+        f.user(&format!(
+            "{}{}{}{}",
+            tool("name = \"top\"\ncommand = \"top\"\ntools = [\"l\", \"r\"]\nmounts = [\"/t:/t:ro\"]\n"),
+            tool("name = \"l\"\ncommand = \"l\"\ntools = [\"leaf\"]\n"),
+            tool("name = \"r\"\ncommand = \"r\"\ntools = [\"leaf\"]\nmounts = [\"/t:/t//./:ro\"]\n"),
+            tool("name = \"leaf\"\ncommand = \"leaf\"\nmounts = [\"/x:/x:ro\"]\n"),
+        ));
+        let catalog = f.load().unwrap().into_launch_catalog().unwrap();
+        assert_eq!(guest_mounts(&catalog, "top"), ["/t", "/x"]);
+        // The kept declaration is the first in *file* order, which is `top`'s own
+        // list here — attribution follows file order, never the launch's edges.
+        let origin = entry_of(&catalog, "top")
+            .mounts()
+            .requests()
+            .next()
+            .map(|request| request.origin.to_string())
+            .unwrap();
+        assert!(origin.starts_with("tools[0].mounts[0]"), "{origin}");
+    }
+
+    /// #396 AC-tier: a project definition cannot reach a user's mount list by
+    /// naming a user tool, by a wildcard, or transitively.
+    #[test]
+    fn project_closures_cannot_reach_user_mounts() {
+        // The user's `pi` carries a fork. The project declares its own `pi` (a
+        // hidden loser of the launch verb), a `bridge` that names it, and a
+        // wildcard shell.
+        let f = Fixture::new();
+        f.user(&tool(
+            "name = \"pi\"\ncommand = \"pi\"\nmounts = [\"~/.pi:fork\"]\n",
+        ));
+        f.project(&format!(
+            "{}{}{}",
+            tool("name = \"pi\"\ncommand = \"pi\"\nmounts = []\n"),
+            tool("name = \"bridge\"\ncommand = \"bridge\"\ntools = [\"pi\"]\n"),
+            tool("name = \"shell\"\ncommand = \"bash\"\ninteractive_shell = true\n")
+        ));
+        // The project's mount field is itself a refusal, so this row is about the
+        // *edges* once that field is gone.
+        f.project(&format!(
+            "{}{}",
+            tool("name = \"pi\"\ncommand = \"pi\"\n"),
+            tool("name = \"bridge\"\ncommand = \"bridge\"\ntools = [\"pi\"]\n")
+        ));
+        let home = Path::new("/synthetic-home");
+        let catalog = f
+            .load_with_home(home)
+            .unwrap()
+            .into_launch_catalog()
+            .unwrap();
+        // The project `bridge` provisions the *project* `pi`, which declares no
+        // mount: nothing of the user's crosses the tier boundary.
+        assert!(guest_mounts(&catalog, "bridge").is_empty());
+        // Launching the user's `pi` verb still selects the user list.
+        assert_eq!(guest_mounts(&catalog, "pi"), ["/synthetic-home/.pi"]);
+
+        // A project reference to a name only the user declares is the exact
+        // cross-tier error, never a mount source.
+        let f = Fixture::new();
+        f.user(&tool(
+            "name = \"user-only\"\ncommand = \"u\"\nmounts = [\"/a:/a:ro\"]\n",
+        ));
+        f.project(&tool(
+            "name = \"p\"\ncommand = \"p\"\ntools = [\"user-only\"]\n",
+        ));
+        let error = f
+            .load()
+            .unwrap()
+            .into_launch_catalog()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("cross-tier tool references are not allowed"),
+            "{error}"
+        );
+    }
+
+    /// #396 AC-shell: a declared shell's omitted `tools` is the existing wildcard
+    /// (so it inherits same-tier mounts), `tools = []` suppresses only the
+    /// inheritance, and the built-in fallback is a scope of its own.
+    #[test]
+    fn shell_mount_closure_distinguishes_omitted_empty_and_fallback() {
+        let declared = |shell_tail: &str| {
+            format!(
+                "{}{}",
+                tool("name = \"agent\"\ncommand = \"agent\"\nmounts = [\"/a:/a:ro\"]\n"),
+                tool(&format!(
+                    "name = \"shell\"\ncommand = \"bash\"\ninteractive_shell = true\n\
+                     mounts = [\"/s:/s:ro\"]\n{shell_tail}"
+                ))
+            )
+        };
+        // Omitted: the wildcard over this file, so the agent's list is inherited.
+        let f = Fixture::new();
+        f.user(&declared(""));
+        let catalog = f.load().unwrap().into_launch_catalog().unwrap();
+        assert_eq!(guest_mounts(&catalog, "shell"), ["/a", "/s"]);
+        // The shell wildcard deliberately includes itself and every same-file
+        // definition — that is the pre-existing rule, unchanged.
+        assert!(!catalog.has_shell_fallback());
+
+        // `tools = []`: its own list only.
+        let f = Fixture::new();
+        f.user(&declared("tools = []\n"));
+        let catalog = f.load().unwrap().into_launch_catalog().unwrap();
+        assert_eq!(guest_mounts(&catalog, "shell"), ["/s"]);
+
+        // The fallback: a custom catalog with no declared `shell` gets the shipped
+        // one, whose scope is itself alone, so it inherits nothing from the user's
+        // tools — but it is still an entry that can receive user-wide defaults.
+        // A mounts-only file declares no tools, so the shipped catalog stands and
+        // `shell` is a declaration rather than the fallback.
+        let f = Fixture::new();
+        f.user("mounts = [\"/d:/d:ro\"]\n");
+        let catalog = f.load().unwrap().into_launch_catalog().unwrap();
+        assert!(!catalog.has_shell_fallback());
+        assert!(guest_mounts(&catalog, "shell").is_empty());
+        // A custom catalog that declares an agent but no shell: the synthesized
+        // fallback closes over itself alone, so it inherits nothing from the user's
+        // definitions — the proof the isolation is real and not an accident of the
+        // shipped catalog's contents.
+        let f = Fixture::new();
+        f.user(&tool(
+            "name = \"agent\"\ncommand = \"agent\"\nmounts = [\"/a:/a:ro\"]\n",
+        ));
+        let catalog = f.load().unwrap().into_launch_catalog().unwrap();
+        assert!(catalog.has_shell_fallback());
+        assert!(guest_mounts(&catalog, "shell").is_empty());
+
+        // A project shell's wildcard covers only project definitions, which cannot
+        // carry mounts.
+        let f = Fixture::new();
+        f.user(&tool(
+            "name = \"agent\"\ncommand = \"agent\"\nmounts = [\"/a:/a:ro\"]\n",
+        ));
+        f.project(&tool(
+            "name = \"shell\"\ncommand = \"bash\"\ninteractive_shell = true\n",
+        ));
+        let catalog = f.load().unwrap().into_launch_catalog().unwrap();
+        assert!(guest_mounts(&catalog, "shell").is_empty());
+    }
+
+    /// A closure conflict is a *catalog* error for the launch that selects both
+    /// lists: value-free, deterministic, and naming the launching declaration as
+    /// well as both leaf sites.
+    #[test]
+    fn tool_mount_closure_conflict_is_value_free_and_deterministic() {
+        const SENTINEL: &str = "s3cr3t-SENTINEL-396";
+        let f = Fixture::new();
+        f.user(&format!(
+            "{}{}",
+            tool(&format!(
+                "name = \"launch\"\ncommand = \"launch\"\ntools = [\"other\"]\nmounts = [\"/p:/g:ro\", \"/{SENTINEL}:/{SENTINEL}:ro\"]\n"
+            )),
+            tool("name = \"other\"\ncommand = \"other\"\nmounts = [\"/q:/g:rw\", \"/q2:/q2:ro\"]\n")
+        ));
+        let error = f.load().unwrap().into_launch_catalog().unwrap_err();
+        assert!(!format!("{error:#}").contains(SENTINEL), "{error:#}");
+        assert_eq!(
+            format!("{error:#}"),
+            format!(
+                "config: user config {:?} declaration [0] tool \"launch\": tools[1].mounts[0]: \
+                 claims the same guest path as tools[0].mounts[0] with a different declaration",
+                f.user
+            )
+        );
+        // The other tool launches alone, so the pair never shares a closure and the
+        // file still has a usable catalog: only the conflicting launch is refused.
+        let f = Fixture::new();
+        f.user(&format!(
+            "{}{}",
+            tool("name = \"launch\"\ncommand = \"launch\"\ntools = [\"other\"]\nmounts = [\"/p:/g:ro\"]\n"),
+            tool("name = \"other\"\ncommand = \"other\"\ntools = []\nmounts = [\"/q:/g:rw\"]\n")
+        ));
+        // Same file, but `other` now has `tools = []`, so it does not join
+        // `launch`'s closure through the reverse edge... `launch` still names it.
+        let error = f
+            .load()
+            .unwrap()
+            .into_launch_catalog()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("tools[1].mounts[0]"), "{error}");
+
+        // Two tools that never share a closure need not agree.
+        let f = Fixture::new();
+        f.user(&format!(
+            "{}{}",
+            tool("name = \"one\"\ncommand = \"one\"\nmounts = [\"/p:/g:ro\"]\n"),
+            tool("name = \"two\"\ncommand = \"two\"\nmounts = [\"/q:/g:rw\"]\n")
+        ));
+        let catalog = f.load().unwrap().into_launch_catalog().unwrap();
+        assert_eq!(guest_mounts(&catalog, "one"), ["/g"]);
+        assert_eq!(guest_mounts(&catalog, "two"), ["/g"]);
+        // A set leaf keeps its load-time site in the same sentence.
+        let f = Fixture::new();
+        f.user(&format!(
+            "mounts = [\"/d:/g:ro\"]\n[mount_sets]\ns = [\"/s:/g:rw\"]\n{}",
+            tool("name = \"t\"\ncommand = \"t\"\ntools = []\nmounts = [\"s\"]\n")
+        ));
+        let catalog = f.load().unwrap().into_launch_catalog().unwrap();
+        assert_eq!(guest_mounts(&catalog, "t"), ["/g"]);
+    }
+
+    /// The one budget continues from verified parsing into catalog construction:
+    /// a file may spend exactly the limit across both stages, and the next
+    /// candidate is refused by the tool-stage sentence — even under an opt-out
+    /// launch, because the catalog is built either way.
+    #[test]
+    fn tool_mount_work_continues_the_verified_parser_budget() {
+        const LIMIT: usize = crate::config_mounts::MAX_MOUNT_SET_EXPANSION_WORK;
+        let document = |count: usize| {
+            let entries = (0..count)
+                .map(|index| format!("\"/s:/g{index}:ro\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            tool(&format!(
+                "name = \"solo\"\ncommand = \"solo\"\ntools = []\nmounts = [{entries}]\n"
+            ))
+        };
+
+        // Exactly the limit: a tool list of B/2 entries is admitted by the parser
+        // and again by the catalog fold, with no reset in between.
+        let f = Fixture::new();
+        f.user(&document(LIMIT / 2));
+        let (catalog, work) = f.load().unwrap().into_launch_catalog_with_work();
+        let catalog = catalog.expect("exactly the limit is admitted");
+        assert_eq!(work.used(), LIMIT);
+        assert_eq!(guest_mounts(&catalog, "solo").len(), LIMIT / 2);
+
+        // One more candidate in either stage is refused, and the report says how
+        // far the shared counter got.
+        let f = Fixture::new();
+        f.user(&document(LIMIT / 2 + 1));
+        let (catalog, work) = f.load().unwrap().into_launch_catalog_with_work();
+        let error = format!("{:#}", catalog.unwrap_err());
+        assert!(
+            error.contains(&format!(
+                "mounts: expansion work exceeds limit of {LIMIT} leaf visits across mount sets \
+                 and tool mounts"
+            )),
+            "{error}"
+        );
+        assert!(error.contains("tool \"solo\""), "{error}");
+        assert_eq!(
+            work.used(),
+            LIMIT,
+            "the refusal happens after every admission"
+        );
+
+        // The refusal is not conditional on the launch's opt-out: building the
+        // catalog is a load-time step, and the budget is spent before the policy is
+        // read. (The policy is consumed at selection, downstream of this report.)
+        let f = Fixture::new();
+        f.user(&document(LIMIT / 2 + 1));
+        let (catalog, _) = f.load().unwrap().into_launch_catalog_with_work();
+        assert!(catalog.is_err());
+
+        // A cloned model's continuation starts where the parse stopped, and a
+        // second build from the same report cannot mint a fresh budget.
+        let f = Fixture::new();
+        f.user(&document(2));
+        let report = f.load().unwrap();
+        assert_eq!(report.user_mounts().unwrap().continuing_work().used(), 2);
+    }
+
+    /// #396's budget is charged **per launch winner**, not once per catalog: the
+    /// inherited list of a referenced tool is re-admitted for every entry whose
+    /// closure selects it, and the same counter continues from the parse.
+    ///
+    /// The oracle is the exact admission count through the real catalog build, not
+    /// a hand-folded boundary sample: an implementation that folded each distinct
+    /// list once ("once per catalog") would report 3 here, and one that minted a
+    /// fresh counter per entry would report the last entry's 2. Both are wrong for
+    /// the resource contract, which bounds the *whole* launch catalog's expansion
+    /// with the one parser budget.
+    #[test]
+    fn tool_mount_fold_admissions_are_charged_per_launch_winner() {
+        let f = Fixture::new();
+        f.user(&format!(
+            "mounts = [\"/d1:/d1:ro\", \"/d2:/d2:ro\"]\n{}{}{}",
+            // `a` inherits `b`'s two leaves on top of its own one.
+            tool("name = \"a\"\ncommand = \"a\"\ntools = [\"b\"]\nmounts = [\"/a1:/a1:ro\"]\n"),
+            tool("name = \"b\"\ncommand = \"b\"\ntools = []\nmounts = [\"/b1:/b1:ro\", \"/b2:/b2:ro\"]\n"),
+            // `c` selects only `b`'s list; it declares none of its own.
+            tool("name = \"c\"\ncommand = \"c\"\ntools = [\"b\"]\n"),
+        ));
+        let (catalog, work) = f.load().unwrap().into_launch_catalog_with_work();
+        let catalog = catalog.expect("the fixture is inside the budget");
+        // Parse: 1 (a) + 2 (b) + 0 (c) = 3; the defaults list is exempt by
+        // design, so it spends nothing. Catalog: a's closure {a,b} = 3, b's = 2,
+        // c's closure {c,b} = 2, and the appended fallback shell carries no list
+        // = 0. 3 + 7 = 10.
+        assert_eq!(
+            work.used(),
+            10,
+            "every launch winner's closure re-admits its lists on the one counter"
+        );
+        // The facets are still right, so the count is not reached by refusing: the
+        // inherited list is present on all three winners and absent from nothing.
+        assert_eq!(guest_mounts(&catalog, "a"), ["/a1", "/b1", "/b2"]);
+        assert_eq!(guest_mounts(&catalog, "b"), ["/b1", "/b2"]);
+        assert_eq!(guest_mounts(&catalog, "c"), ["/b1", "/b2"]);
+        assert!(guest_mounts(&catalog, "shell").is_empty());
+    }
+
+    /// #396's retention contract: many catalog entries inheriting one long leaf
+    /// and one long set name share the *payloads*, so the cost of an inherited
+    /// declaration is one handle per entry rather than one copy per entry.
+    ///
+    /// The oracle is the allocation itself — `Arc::ptr_eq` on the set name and on
+    /// the leaf — plus the count of distinct payloads against the count of handles
+    /// held across the namespace clone, the catalog entry and the launch grant.
+    /// This is a storage-shape assertion on purpose: retained sharing *is* the
+    /// memory contract, and behaviour tests cannot see it.
+    #[test]
+    fn tool_closures_share_leaf_payloads_across_catalog_entries() {
+        const TOOLS: usize = 40;
+        let set_name = "n".repeat(18_000);
+        type Leaf = std::sync::Arc<crate::config_mounts::ConfigMountLeaf>;
+        fn leaf_of(list: &ResolvedMountList) -> Leaf {
+            // The public accessor borrows; a handle is what sharing is measured on,
+            // so go through the origin-bearing request and re-find it by identity
+            // through the iterator's own `Arc` via `Arc::clone` of the list.
+            list.shared_leaves_for_test()
+                .first()
+                .expect("the list has a leaf")
+                .clone()
+        }
+        let mut body = format!(
+            "[mount_sets]\n{set_name} = [\"/srv/a-very-long-shared-source:/shared:ro\", \
+             \"/srv/other:/other:ro\"]\n"
+        );
+        for index in 0..TOOLS {
+            body.push_str(&format!(
+                "[[tools]]\nname = \"t{index:02}\"\ncommand = \"t\"\nmounts = [\"{set_name}\"]\n"
+            ));
+        }
+        assert!(
+            body.len() < 1 << 20,
+            "the fixture stays inside the file bound"
+        );
+        let f = Fixture::new();
+        f.user(&body);
+        let report = f.load().unwrap();
+        // The CLI clones the namespace for the launch; the clone must share.
+        let cloned = report.user_mounts().unwrap().clone();
+        let catalog = report.into_launch_catalog().unwrap();
+        let first = leaf_of(entry_of(&catalog, "t00").mounts());
+        for index in 0..TOOLS {
+            let handle = leaf_of(entry_of(&catalog, &format!("t{index:02}")).mounts());
+            assert!(
+                std::sync::Arc::ptr_eq(&first, &handle),
+                "t{index:02} must share t00's retained leaf handle"
+            );
+        }
+        // The set's long name is one allocation, shared by every leaf and both
+        // models.
+        let name_of = |list: &ResolvedMountList| match &leaf_of(list).request.origin {
+            crate::mount::MountOrigin::UserSet { set, .. } => std::sync::Arc::clone(set),
+            other => panic!("a set leaf must carry a set origin: {other:?}"),
+        };
+        let shared_name = name_of(entry_of(&catalog, "t00").mounts());
+        assert_eq!(shared_name.len(), set_name.len());
+        assert!(std::sync::Arc::ptr_eq(
+            &shared_name,
+            &name_of(entry_of(&catalog, "t39").mounts())
+        ));
+        let from_clone = cloned
+            .requests_for_set(&crate::config_mounts::MountSetName::parse(&set_name).unwrap())
+            .expect("the cloned namespace still resolves the set");
+        assert!(std::sync::Arc::ptr_eq(&shared_name, &name_of(&from_clone)));
+        // 40 entries hold 40 handles on 2 distinct leaves: the count is what
+        // proves the payloads are not copied per entry.
+        let handles: usize = (0..TOOLS)
+            .map(|index| entry_of(&catalog, &format!("t{index:02}")).mounts().len())
+            .sum();
+        assert_eq!(handles, TOOLS * 2);
+        assert_eq!(entry_of(&catalog, "t00").mounts().len(), 2);
+    }
+
+    /// #396 AC-authority, positive twin: a full user tool's list is parsed by the
+    /// same selector as the defaults list, so a set name, a `~/` spelling and a
+    /// direct path all behave identically in either position.
+    #[test]
+    fn tool_mounts_toml_sites_are_distinct_from_env_and_defaults() {
+        let f = Fixture::new();
+        f.user(&format!(
+            "[mount_sets]\nagent = [\"~/agents:/agents:rw\"]\n{}",
+            tool("name = \"t\"\ncommand = \"t\"\nmounts = [\"agent\", \"~/own:/own:ro\"]\n")
+        ));
+        let catalog = f
+            .load_with_home(Path::new("/synthetic-home"))
+            .unwrap()
+            .into_launch_catalog()
+            .unwrap();
+        assert_eq!(guest_mounts(&catalog, "t"), ["/agents", "/own"]);
+        // The entries keep the origin of the site that declared them.
+        let origins: Vec<String> = entry_of(&catalog, "t")
+            .mounts()
+            .requests()
+            .map(|request| request.origin.to_string())
+            .collect();
+        assert!(
+            origins[0].starts_with("mount_sets[\"agent\"][0]"),
+            "{origins:?}"
+        );
+        assert!(origins[1].starts_with("tools[0].mounts[1]"), "{origins:?}");
+
+        // Numeric, value-free diagnostics for the tool site.
+        const SENTINEL: &str = "s3cr3t-SENTINEL-396";
+        for (body, expected) in [
+            (
+                "mounts = [\"/a:/g:ro\", \"/a:/g:rw\"]\n".to_string(),
+                "mounts[1]: claims".to_string(),
+            ),
+            (
+                tool(&format!(
+                    "name = \"t\"\ncommand = \"t\"\nmounts = [\"./{SENTINEL}:/g\"]\n"
+                )),
+                "tools[0].mounts[0]: host path must be absolute".to_string(),
+            ),
+            (
+                tool(&format!(
+                    "name = \"t\"\ncommand = \"t\"\nmounts = [\"/a:/g:exclude={SENTINEL}\"]\n"
+                )),
+                "tools[0].mounts[0]: :exclude is only supported".to_string(),
+            ),
+            (
+                tool("name = \"t\"\ncommand = \"t\"\nmounts = [\"nope\"]\n"),
+                "tools[0].mounts[0]: unknown mount set name".to_string(),
+            ),
+            (
+                tool("name = \"t\"\ncommand = \"t\"\nmounts = [\"agent:ro\"]\n"),
+                "tools[0].mounts[0]: a mount-set reference is a bare name".to_string(),
+            ),
+        ] {
+            let f = Fixture::new();
+            f.user(&body);
+            let error = f.load().unwrap_err().to_string();
+            assert!(!error.contains(SENTINEL), "{body}: value echoed: {error}");
+            assert!(
+                error.contains(&expected),
+                "{body}: {expected} not in {error}"
+            );
+        }
+    }
+
+    /// Whole-definition merging is unchanged: a project definition never fills an
+    /// omitted user field, and the mount facet joins the differing-field warning
+    /// last.
+    #[test]
+    fn whole_definition_merge_never_fills_user_omissions() {
+        // The user tool declares a mount list; the project's same-name definition
+        // declares none. The winner keeps the user's, and the difference is
+        // reported with `mounts` appended after `network_requests`.
+        let f = Fixture::new();
+        f.user(&tool(
+            "name = \"t\"\ncommand = \"cmd\"\nmounts = [\"/a:/a:ro\"]\nnetwork_requests = [\"a.example\"]\n",
+        ));
+        f.project(&tool(
+            "name = \"t\"\ncommand = \"cmd\"\nnetwork_requests = [\"b.example\"]\n",
+        ));
+        let report = f.load().unwrap();
+        assert_eq!(report.conflicts().len(), 1);
+        assert_eq!(
+            report.conflicts()[0].fields(),
+            &[ToolField::NetworkRequests, ToolField::Mounts]
+        );
+        let catalog = report.into_launch_catalog().unwrap();
+        assert_eq!(guest_mounts(&catalog, "t"), ["/a"]);
+
+        // Omitting the user's mount list is *not* a difference: presence is an
+        // authority fact, not access.
+        let f = Fixture::new();
+        f.user(&tool("name = \"t\"\ncommand = \"cmd\"\n"));
+        f.project(&tool("name = \"t\"\ncommand = \"cmd\"\n"));
+        assert!(f.load().unwrap().conflicts().is_empty());
+
+        // A project cannot fill an omitted user `tools`/`env`/`persist` either.
+        let f = Fixture::new();
+        f.user(&tool("name = \"t\"\ncommand = \"cmd\"\n"));
+        // `tools = []` would be the same value as the user's omitted field (both
+        // are "no other tools"), so the wildcard is what makes the field differ.
+        f.project(&tool(
+            "name = \"t\"\ncommand = \"cmd\"\ntools = [\"*\"]\npersist = [\"p\"]\n[tools.env]\nA = \"1\"\n",
+        ));
+        let report = f.load().unwrap();
+        assert_eq!(
+            report.conflicts()[0].fields(),
+            &[ToolField::Tools, ToolField::Persist, ToolField::Env]
+        );
+        let winner = first_launch(&report);
+        assert_eq!(winner.persist_count(), 0);
+        assert_eq!(winner.env_count(), 0);
+        assert_eq!(
+            winner.declared_tools(),
+            &DeclaredTools::Named(Vec::new()),
+            "the user's omission is not filled by the project's wildcard"
+        );
+    }
+
+    /// The published guidance cannot drift from the shipped catalog.
+    ///
+    /// The block between the markers in `USAGE.md` is a **complete** replacement
+    /// catalog, so every non-mount field must still equal the compiled default for
+    /// that tool: dropping a credential, an argv flag, an env pair or the shell's
+    /// `interactive_shell` would let a reader paste a config that silently changes
+    /// what their agents do. The mounts are the only intended difference, and their
+    /// shape is asserted too.
+    ///
+    /// Deliberately loaded through the ordinary verified fixture path — never by
+    /// reading the documented paths on the host, which would make a doc test depend
+    /// on the operator's filesystem.
+    #[test]
+    fn documented_tool_mount_catalog_preserves_shipped_nonmount_fields() {
+        const USAGE: &str = include_str!("../../../USAGE.md");
+        const START: &str = "<!-- tool-mount-catalog -->";
+        const END: &str = "<!-- /tool-mount-catalog -->";
+        let start = USAGE.find(START).expect("the documented catalog marker") + START.len();
+        let end = start + USAGE[start..].find(END).expect("the closing marker");
+        let block = USAGE[start..end].trim();
+        // The markers wrap one fenced TOML block; strip the fence so the assertion
+        // below is about the catalog alone.
+        let block = block
+            .strip_prefix("```toml")
+            .expect("the documented catalog is a ```toml block")
+            .strip_suffix("```")
+            .expect("the fenced block is closed")
+            .trim();
+        let _: toml::Table = block
+            .parse()
+            .unwrap_or_else(|error| panic!("the documented catalog is not TOML: {error}"));
+
+        let f = Fixture::new();
+        f.user(block);
+        let home = Path::new("/synthetic-home");
+        let report = f
+            .load_with_home(home)
+            .expect("the documented catalog loads");
+        // Every non-mount semantic field equals the shipped definition.
+        let documented: Vec<&Tool> = report.resolved().launch_tools().collect();
+        let shipped = default_tools().unwrap();
+        assert_eq!(documented.len(), shipped.len(), "seven tools, in order");
+        for (documented, shipped) in documented.iter().zip(shipped.iter()) {
+            assert_eq!(documented.name(), shipped.name());
+            assert_eq!(documented.command, shipped.command, "{}", shipped.name());
+            assert_eq!(documented.argv, shipped.argv, "{}", shipped.name());
+            assert_eq!(
+                documented.credentials,
+                shipped.credentials,
+                "{}",
+                shipped.name()
+            );
+            assert_eq!(
+                documented.credential_names,
+                shipped.credential_names,
+                "{}",
+                shipped.name()
+            );
+            assert_eq!(documented.tools, shipped.tools, "{}", shipped.name());
+            assert_eq!(documented.persist, shipped.persist, "{}", shipped.name());
+            assert_eq!(
+                documented.interactive_shell,
+                shipped.interactive_shell,
+                "{}",
+                shipped.name()
+            );
+            assert_eq!(documented.env, shipped.env, "{}", shipped.name());
+            assert_eq!(
+                documented.network_requests,
+                shipped.network_requests,
+                "{}",
+                shipped.name()
+            );
+        }
+        // The mounts are the intended difference: the six agent tools select the
+        // `agent` set, Pi adds the fork, and the declared shell's wildcard inherits
+        // all of them.
+        let catalog = report.into_launch_catalog().unwrap();
+        let agent = |name: &str| guest_mounts(&catalog, name);
+        for name in ["dsh", "codex", "opencode", "claude", "copilot"] {
+            assert_eq!(
+                agent(name),
+                [
+                    "/synthetic-home/.agents",
+                    "/synthetic-home/.agents/skills",
+                    "/synthetic-home/.config/github-app"
+                ],
+                "{name}"
+            );
+        }
+        assert_eq!(
+            agent("pi"),
+            [
+                "/synthetic-home/.agents",
+                "/synthetic-home/.agents/skills",
+                "/synthetic-home/.config/github-app",
+                "/synthetic-home/.pi",
+            ]
+        );
+        // The declared shell's omitted `tools` is the wildcard, so it inherits the
+        // agent set and the Pi fork — the behaviour the warning above the block
+        // describes. It is a declaration here, not the fallback.
+        assert!(!catalog.has_shell_fallback());
+        let shell = agent("shell");
+        assert!(
+            shell.contains(&"/synthetic-home/.pi".to_string()),
+            "{shell:?}"
+        );
+        assert!(
+            shell.contains(&"/synthetic-home/.agents".to_string()),
+            "{shell:?}"
+        );
+        // Client-visible mounts only: the set's read-only leaf keeps its mode.
+        let read_only = entry_of(&catalog, "codex")
+            .mounts()
+            .requests()
+            .find(|request| request.mount.guest.ends_with("github-app"))
+            .map(|request| {
+                matches!(
+                    request.mount.policy,
+                    crate::mount::MountPolicy::BindReadOnly { .. }
+                )
+            })
+            .expect("the read-only leaf is selected");
+        assert!(read_only);
     }
 
     // -- fixture helpers ---------------------------------------------------
@@ -3391,6 +4647,16 @@ mod tests {
 
         fn load(&self) -> Result<ConfigReport> {
             load(&self.paths())
+        }
+
+        /// The same load with a captured `$HOME`, which is what a `~/` mount
+        /// spelling expands against (never the process environment).
+        fn load_with_home(&self, home: &Path) -> Result<ConfigReport> {
+            load(&ConfigPaths {
+                user: Some(self.user.clone()),
+                project: self.project.clone(),
+                home: Some(home.to_path_buf()),
+            })
         }
 
         /// The user config as a same-directory dotfile symlink — the shape a
@@ -4950,9 +6216,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            resolve_provisioning(ResolvedTools::from_defaults(tools))
-                .unwrap_err()
-                .to_string(),
+            resolve_provisioning(
+                ResolvedTools::from_defaults(tools),
+                &mut config_mounts::MountExpansionWork::fresh(),
+            )
+            .unwrap_err()
+            .to_string(),
             "config: built-in defaults \"default-tools.toml\" declaration [0] tool \"t\": tools[0]: \"nope\" names no tool in this configuration file; declare it in this file or remove the entry"
         );
     }
@@ -5642,6 +6911,11 @@ mod tests {
                     ToolField::InteractiveShell => "interactive_shell = false",
                     ToolField::Env => "env = { A = \"1\" }",
                     ToolField::NetworkRequests => "network_requests = [\"a.example\"]",
+                    // Unreachable in this table: a project tool may not declare
+                    // `mounts` at all, so its presence is a load error rather than
+                    // a differing-field warning. Named here so the match stays
+                    // exhaustive instead of gaining a catch-all.
+                    ToolField::Mounts => unreachable!("project mounts are refused"),
                 },
                 mutated,
             );

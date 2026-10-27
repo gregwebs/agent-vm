@@ -238,6 +238,21 @@ pub(crate) enum MountOrigin {
         set: std::sync::Arc<str>,
         index: usize,
     },
+    /// A direct declaration in one full `[[tools]]` definition's own `mounts`
+    /// list (#396): the file, the declaration's position in `[[tools]]` and the
+    /// entry's index within that list.
+    ///
+    /// Numeric, not the tool's name: the site is built before `validate_tools`
+    /// runs, and the origin is diagnostic provenance only — like the other config
+    /// origins, none of it reaches [`same_declaration`] or `fork_id`, so the same
+    /// declaration selected by a tool list, a default and `--mount` keeps one
+    /// fork. The declaring position is bounded by the config file, so it is a
+    /// `usize` rather than another shared string.
+    UserTool {
+        file: PathBuf,
+        declaration: usize,
+        index: usize,
+    },
 }
 
 /// The *name* of an origin, for text that has no rendering policy to choose.
@@ -265,6 +280,15 @@ impl fmt::Display for MountOrigin {
                 f,
                 "mount_sets[{}][{index}] in {}",
                 quoted_str(set.as_ref()),
+                crate::one_line::quoted_path(file)
+            ),
+            Self::UserTool {
+                file,
+                declaration,
+                index,
+            } => write!(
+                f,
+                "tools[{declaration}].mounts[{index}] in {}",
                 crate::one_line::quoted_path(file)
             ),
         }
@@ -373,6 +397,21 @@ pub(crate) enum Declaration<'a> {
         set: &'a str,
         index: usize,
     },
+    /// Entry `index` of declaration `declaration`'s own `mounts` list in `file`.
+    UserTool {
+        file: &'a Path,
+        declaration: usize,
+        index: usize,
+    },
+}
+
+impl Declaration<'_> {
+    /// True for every config-sourced rendering: the byte-escaping policy that
+    /// keeps config-chosen text to one line and makes two entries that differ
+    /// only outside ASCII print differently.
+    fn is_config(self) -> bool {
+        !matches!(self, Self::Argv)
+    }
 }
 
 impl Declaration<'_> {
@@ -386,6 +425,14 @@ impl Declaration<'_> {
             Self::UserSet { file, set, index } => format!(
                 "mount_sets[{}][{index}] in {}",
                 quoted_str(set),
+                crate::one_line::quoted_path(file)
+            ),
+            Self::UserTool {
+                file,
+                declaration,
+                index,
+            } => format!(
+                "tools[{declaration}].mounts[{index}] in {}",
                 crate::one_line::quoted_path(file)
             ),
         }
@@ -407,7 +454,10 @@ impl Declaration<'_> {
     fn spelling(self, spelling: &str) -> String {
         match self {
             Self::Argv => crate::one_line::text(spelling).to_string(),
-            Self::UserConfig { .. } | Self::UserSet { .. } => quoted_str(spelling),
+            config => {
+                debug_assert!(config.is_config());
+                quoted_str(spelling)
+            }
         }
     }
 
@@ -418,7 +468,10 @@ impl Declaration<'_> {
     fn spelling_quoted(self, spelling: &str) -> String {
         match self {
             Self::Argv => format!("{spelling:?}"),
-            Self::UserConfig { .. } | Self::UserSet { .. } => quoted_str(spelling),
+            config => {
+                debug_assert!(config.is_config());
+                quoted_str(spelling)
+            }
         }
     }
 
@@ -436,7 +489,10 @@ impl Declaration<'_> {
     fn host_path(self, path: &Path) -> String {
         match self {
             Self::Argv => crate::one_line::path(path).to_string(),
-            Self::UserConfig { .. } | Self::UserSet { .. } => quoted_path(path),
+            config => {
+                debug_assert!(config.is_config());
+                quoted_path(path)
+            }
         }
     }
 
@@ -454,8 +510,9 @@ impl Declaration<'_> {
     pub(crate) fn fork_root(self, path: &Path) -> String {
         match self {
             Self::Argv => crate::one_line::path(path).to_string(),
-            Self::UserConfig { .. } | Self::UserSet { .. } => {
-                format!("{} {}", self.subject(), quoted_path(path))
+            config => {
+                debug_assert!(config.is_config());
+                format!("{} {}", config.subject(), quoted_path(path))
             }
         }
     }
@@ -472,6 +529,15 @@ fn declaration_origin<'a>(mount: &ExtraMount, origins: &'a DeclaredOrigins) -> D
         Some(MountOrigin::UserSet { file, set, index }) => Declaration::UserSet {
             file,
             set: set.as_ref(),
+            index: *index,
+        },
+        Some(MountOrigin::UserTool {
+            file,
+            declaration,
+            index,
+        }) => Declaration::UserTool {
+            file,
+            declaration: *declaration,
             index: *index,
         },
         // A discovered bind is not a declaration, and `MountOrigin::Cli` is an
@@ -521,9 +587,9 @@ fn validating_source_context(declaration: Declaration<'_>, host: &Path) -> Strin
 fn fork_root_context(verb: &str, declaration: Declaration<'_>, source: &Path) -> String {
     match declaration {
         Declaration::Argv => format!("{verb} fork root {}", crate::one_line::path(source)),
-        Declaration::UserConfig { .. } | Declaration::UserSet { .. } => format!(
+        config => format!(
             "{verb} {} fork root {}",
-            declaration.subject(),
+            config.subject(),
             quoted_path(source)
         ),
     }
@@ -2911,6 +2977,289 @@ mod tests {
         }
     }
 
+    /// An independent vector oracle for `claim`'s local semantics.
+    ///
+    /// `claim` looks guest paths up in an index (#396); this oracle keeps them in
+    /// a growing vector and scans it with `position`, exactly the shape the
+    /// indexed lookup replaced. It therefore cannot hide a defect behind the
+    /// production index — but it *may* reuse the two pieces that were never
+    /// changed: `normalize_request` and the `same_declaration` equivalence kernel.
+    ///
+    /// It certifies ordering (the kept vector keeps first-seen order), first-kept
+    /// origin, and every refusal kind — nothing about cost. The later quadratic
+    /// phases in preparation are not visible here, which is why this is not
+    /// evidence for a preparation-time bound.
+    #[test]
+    fn indexed_claim_matches_independent_vector_oracle() {
+        /// The oracle. Deliberately structured as the pre-index body so a reader
+        /// can diff it against the production function.
+        fn vector_oracle(
+            entries: &[(&str, MountOrigin)],
+            core: &[PathBuf],
+        ) -> Result<Vec<MountRequest>, ClaimError> {
+            let mut normalized = Vec::new();
+            for (entry, origin) in entries {
+                let mount = match parse_mount_spec(entry, HostSyntax::AbsoluteOnly) {
+                    Ok(mount) => mount,
+                    Err(error) => {
+                        return Err(ClaimError::Guest {
+                            origin: origin.clone(),
+                            error: error.into_cli(),
+                        });
+                    }
+                };
+                normalized.push(normalize_request(MountRequest {
+                    origin: origin.clone(),
+                    mount,
+                })?);
+            }
+            let mut unique: Vec<MountRequest> = Vec::new();
+            for request in normalized {
+                if core.iter().any(|core| core == &request.mount.guest) {
+                    return Err(ClaimError::Core {
+                        origin: request.origin,
+                        guest: request.mount.guest,
+                    });
+                }
+                let Some(index) = unique
+                    .iter()
+                    .position(|earlier| earlier.mount.guest == request.mount.guest)
+                else {
+                    unique.push(request);
+                    continue;
+                };
+                match claim_decision(ClaimFacts {
+                    same_guest: true,
+                    equivalent: same_declaration(&unique[index].mount, &request.mount),
+                }) {
+                    ClaimDecision::Merge => continue,
+                    ClaimDecision::Conflict | ClaimDecision::Distinct => {
+                        return Err(ClaimError::Conflict {
+                            first: unique[index].origin.clone(),
+                            second: request.origin,
+                            guest: request.mount.guest,
+                        });
+                    }
+                }
+            }
+            Ok(unique)
+        }
+
+        /// The kept declarations and their origins, so order and first-kept
+        /// provenance are compared rather than assumed.
+        fn describe(
+            requests: &[MountRequest],
+        ) -> Vec<(MountOrigin, Spelling, PathBuf, MountPolicy)> {
+            requests
+                .iter()
+                .map(|request| {
+                    (
+                        request.origin.clone(),
+                        request.mount.source_spelling.clone(),
+                        request.mount.guest.clone(),
+                        request.mount.policy,
+                    )
+                })
+                .collect()
+        }
+
+        /// A refusal, reduced to the decision both routes must agree on. The two
+        /// render identical text today; comparing the payload keeps a future
+        /// rewording from masquerading as a semantic difference.
+        fn refusal(error: &ClaimError) -> ClaimError {
+            match error {
+                ClaimError::Guest { origin, .. } => ClaimError::Guest {
+                    origin: origin.clone(),
+                    error: anyhow::anyhow!("guest"),
+                },
+                ClaimError::Core { origin, guest } => ClaimError::Core {
+                    origin: origin.clone(),
+                    guest: guest.clone(),
+                },
+                ClaimError::Conflict {
+                    first,
+                    second,
+                    guest,
+                } => ClaimError::Conflict {
+                    first: first.clone(),
+                    second: second.clone(),
+                    guest: guest.clone(),
+                },
+            }
+        }
+
+        let other = MountOrigin::UserSet {
+            file: PathBuf::from("/home/u/.config/agent-vm/config.toml"),
+            set: std::sync::Arc::from("agent"),
+            index: 0,
+        };
+        let tool = MountOrigin::UserTool {
+            file: PathBuf::from("/home/u/.config/agent-vm/config.toml"),
+            declaration: 1,
+            index: 2,
+        };
+        let core = vec![PathBuf::from("/core"), PathBuf::from("/agent-vm-state")];
+        // Small generated lists over the shapes that decide the rule: a
+        // normalization alias, an equivalent duplicate, each differing field, mixed
+        // origins, a core duplicate, and — last in each list — an unusable guest,
+        // because `claim` normalizes *every* request before it adjudicates any, so a
+        // later guest error outranks both an earlier core collision and an earlier
+        // conflict.
+        let fixtures: &[&[(&str, MountOrigin)]] = &[
+            &[],
+            &[("/a:/g", MountOrigin::Cli)],
+            &[("/a:/g", MountOrigin::Cli), ("/a:/g", MountOrigin::Cli)],
+            &[("/a:/g", MountOrigin::Cli), ("/a/:/g", other.clone())],
+            &[
+                ("/a:/g//./x:ro", MountOrigin::Cli),
+                ("/a:/g/x:ro", other.clone()),
+            ],
+            &[("/a:/g:ro", MountOrigin::Cli), ("/a:/g:rw", other.clone())],
+            &[("/a:/g:fork", tool.clone()), ("/a:/g", MountOrigin::Cli)],
+            &[
+                ("/a:/g:fork:exclude=x", MountOrigin::Cli),
+                ("/a:/g:fork", tool.clone()),
+            ],
+            &[("/a:/g:ro", other.clone()), ("/b:/g:ro", MountOrigin::Cli)],
+            &[
+                ("/a:/a", MountOrigin::Cli),
+                ("/b:/b", other.clone()),
+                ("/c:/c:fork", tool.clone()),
+            ],
+            &[("/p:/p", MountOrigin::Cli), ("/p/c:/p/c", tool.clone())],
+            &[("/core:/core", MountOrigin::Cli)],
+            &[("/a:/g", MountOrigin::Cli), ("/core:/core", other.clone())],
+            &[
+                ("/a:/g", MountOrigin::Cli),
+                ("/b:/g", other.clone()),
+                ("/core:/core", tool.clone()),
+            ],
+            // A core path always wins over a later conflict, and a conflict
+            // always wins over a later core path: the core check is per
+            // declaration, in order.
+            &[
+                ("/core:/core", MountOrigin::Cli),
+                ("/a:/g:ro", other.clone()),
+                ("/a:/g:rw", tool.clone()),
+            ],
+            // Follow policy alone distinguishes two declarations at one guest
+            // path, so neither may merge and neither may silently win.
+            &[
+                ("/a:/g:follow-links", MountOrigin::Cli),
+                ("/a:/g", other.clone()),
+            ],
+            // Normalize-all-first, not adjudicate-as-you-go: a *later* unusable
+            // guest is refused even though an earlier core collision, and in the
+            // second list an earlier conflict, would decide the answer for an
+            // implementation that normalized lazily.
+            &[
+                ("/core:/core", MountOrigin::Cli),
+                ("/late:/:ro", other.clone()),
+            ],
+            &[
+                ("/a:/g:ro", MountOrigin::Cli),
+                ("/b:/g:ro", other.clone()),
+                ("/c:/g/../x", tool.clone()),
+            ],
+        ];
+        for fixture in fixtures {
+            let indexed = claim(
+                fixture
+                    .iter()
+                    .map(|(entry, origin)| request(origin.clone(), entry))
+                    .collect(),
+                &core,
+            );
+            let oracle = vector_oracle(fixture, &core);
+            match (indexed, oracle) {
+                (Ok(indexed), Ok(oracle)) => {
+                    assert_eq!(describe(&indexed), describe(&oracle), "{fixture:?}");
+                }
+                (Err(indexed), Err(oracle)) => {
+                    assert_eq!(
+                        std::mem::discriminant(&refusal(&indexed)),
+                        std::mem::discriminant(&refusal(&oracle)),
+                        "{fixture:?}"
+                    );
+                    assert_eq!(
+                        format!("{}", refusal(&indexed)),
+                        format!("{}", refusal(&oracle)),
+                        "{fixture:?}"
+                    );
+                }
+                (indexed, oracle) => panic!(
+                    "{fixture:?}: claim {} but the oracle {}",
+                    if indexed.is_ok() {
+                        "accepted"
+                    } else {
+                        "refused"
+                    },
+                    if oracle.is_ok() {
+                        "accepted"
+                    } else {
+                        "refused"
+                    }
+                ),
+            }
+        }
+        // The denied declarations' *expectations* are written here, not read back
+        // from either implementation: the origin must be the one the unusable guest
+        // was declared under, and the text must be the grammar's own sentence behind
+        // that origin's prefix.
+        for (entries, origin, sentence) in [
+            (
+                vec![
+                    ("/core:/core", MountOrigin::Cli),
+                    ("/late:/:ro", other.clone()),
+                ],
+                other.clone(),
+                "--mount guest path \"/\" is not mountable",
+            ),
+            (
+                vec![
+                    ("/a:/g:ro", MountOrigin::Cli),
+                    ("/b:/g:ro", other.clone()),
+                    ("/c:/g/../x", tool.clone()),
+                ],
+                tool.clone(),
+                "--mount guest path \"/g/../x\" must not contain `..`",
+            ),
+        ] {
+            let requests = entries
+                .into_iter()
+                .map(|(entry, origin)| request(origin, entry))
+                .collect();
+            let error = claim(requests, &core).expect_err(
+                "an unusable guest is refused even when an earlier request would decide \
+                 the answer under adjudicate-as-you-go",
+            );
+            let ClaimError::Guest {
+                origin: named,
+                error: diagnostic,
+            } = &error
+            else {
+                panic!("the guest's own refusal must win, not {error:?}");
+            };
+            assert_eq!(named, &origin);
+            assert_eq!(format!("{diagnostic}"), sentence);
+            // The whole rendered line, prefix included: the refusal must name the
+            // declaration the reader has to fix.
+            assert_eq!(format!("{error}"), format!("{origin}: {sentence}"));
+        }
+        // A tool-tagged duplicate merges into the first-seen origin, which is what
+        // keeps own and inherited declarations from reseeding a fork.
+        let merged = claim(
+            vec![
+                request(other.clone(), "/a:/g:ro"),
+                request(tool.clone(), "/a:/g//./:ro"),
+            ],
+            &core,
+        )
+        .expect("identical declarations merge");
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].origin, other);
+    }
+
     /// The claim rule across sources, in the launch order (config first, then
     /// argv): identical declarations merge into the first-seen origin, differing
     /// ones are refused naming both origins, and distinct guest paths keep their
@@ -3139,6 +3488,13 @@ impl fmt::Display for ClaimError {
                         "{origin}: guest path {guest} collides with an agent-vm core mount; \
                          remove it from that mount set"
                     ),
+                    // Own or inherited, the tool's list is automatic, so the same
+                    // opt-out that removes a defaults collision removes this one.
+                    MountOrigin::UserTool { .. } => write!(
+                        f,
+                        "{origin}: guest path {guest} collides with an agent-vm core mount; \
+                         pass --no-config-mounts to launch without it"
+                    ),
                 }
             }
             Self::Conflict {
@@ -3176,6 +3532,16 @@ impl std::error::Error for ClaimError {}
 /// request is what makes the *first-seen* origin the one a conflict names.
 /// Nothing here touches the filesystem, so config load can call it on its own
 /// `mounts` list to reject a self-contradictory file before any launch.
+///
+/// The guest-path *lookup* is an index (#396), so adjudicating a selected closure
+/// costs one map probe per declaration instead of a scan of the growing unique
+/// list. Only the lookup changed: the vector still holds the kept declarations in
+/// first-seen order and is the only thing iterated or rendered, the core check
+/// still precedes the merge test, and the equivalence decision is still the
+/// [`same_declaration`]/[`claim_decision`] pair. That keeps the local semantics
+/// certified by the independent vector oracle and the pinned-byte tests rather
+/// than by a timing measurement — the rest of preparation has its own quadratic
+/// phases, which #396 does not claim to fix.
 // The refusal *is* the payload: it carries the origins it names, so boxing it
 // would allocate on every conflict path to save a stack frame at the one call site
 // that reads it.
@@ -3190,6 +3556,7 @@ pub(crate) fn claim(
     }
 
     let mut unique: Vec<MountRequest> = Vec::with_capacity(normalized.len());
+    let mut claimed: BTreeMap<PathBuf, usize> = BTreeMap::new();
     for request in normalized {
         if core.iter().any(|core| core == &request.mount.guest) {
             return Err(ClaimError::Core {
@@ -3197,16 +3564,14 @@ pub(crate) fn claim(
                 guest: request.mount.guest,
             });
         }
-        let Some(index) = unique
-            .iter()
-            .position(|earlier| earlier.mount.guest == request.mount.guest)
-        else {
+        let Some(&index) = claimed.get(&request.mount.guest) else {
+            claimed.insert(request.mount.guest.clone(), unique.len());
             unique.push(request);
             continue;
         };
         let first = &unique[index];
-        // `same_guest` is true by construction — `position` just found the
-        // earlier claim — so the kernel's remaining choice is merge or refuse.
+        // `same_guest` is true by construction — the index just found the earlier
+        // claim — so the kernel's remaining choice is merge or refuse.
         let decision = claim_decision(ClaimFacts {
             same_guest: true,
             equivalent: same_declaration(&first.mount, &request.mount),
@@ -3588,6 +3953,9 @@ fn discovered_by(declarations: &[(Declaration<'_>, String)]) -> String {
                     Declaration::UserSet { file, .. } => {
                         format!("mount_sets in {}", crate::one_line::quoted_path(file))
                     }
+                    Declaration::UserTool { file, .. } => {
+                        format!("tool mounts in {}", crate::one_line::quoted_path(file))
+                    }
                 };
                 if !sources.contains(&source) {
                     sources.push(source);
@@ -3771,9 +4139,7 @@ fn node_kind(
             "{} must be a regular file or directory",
             match declaration {
                 Declaration::Argv => crate::one_line::path(path).to_string(),
-                Declaration::UserConfig { .. } | Declaration::UserSet { .. } => {
-                    format!("{} {}", declaration.subject(), quoted_path(path))
-                }
+                config => format!("{} {}", config.subject(), quoted_path(path)),
             }
         )
     }
@@ -5143,6 +5509,170 @@ mod prepare_tests {
              \"/home/u/.config/agent-vm/config.toml\"); identical declarations are merged and \
              different ones are refused"
         );
+    }
+
+    /// A declaration inside a full user tool's own `mounts` list renders exactly
+    /// like every other config entry: named by numeric file/field site, escaped by
+    /// the config text policy, and never by the argv policy or a unit tool name.
+    ///
+    /// The escaping half matters because the site is built *before* tool-name
+    /// validation, so a tool name may be hostile; the site prints numbers instead.
+    #[test]
+    fn user_tool_origin_uses_config_escaping_everywhere() {
+        let file = Path::new("/home/u/.config/agent-vm/config.toml");
+        let tool = Declaration::UserTool {
+            file,
+            declaration: 3,
+            index: 1,
+        };
+        assert_eq!(
+            tool.subject(),
+            "tools[3].mounts[1] in \"/home/u/.config/agent-vm/config.toml\""
+        );
+        assert_eq!(
+            canonicalizing_context(tool, &Spelling::new("/srv/café")),
+            "canonicalizing tools[3].mounts[1] in \"/home/u/.config/agent-vm/config.toml\" host \
+             \"/srv/caf\\xc3\\xa9\""
+        );
+        assert_eq!(
+            validating_source_context(tool, Path::new("/srv/a\nb")),
+            "validating tools[3].mounts[1] in \"/home/u/.config/agent-vm/config.toml\" source \
+             \"/srv/a\\x0ab\""
+        );
+        for verb in ["resolving", "validating"] {
+            assert_eq!(
+                fork_root_context(verb, tool, Path::new("/srv/a\nb")),
+                format!(
+                    "{verb} tools[3].mounts[1] in \"/home/u/.config/agent-vm/config.toml\" fork \
+                     root \"/srv/a\\x0ab\""
+                )
+            );
+        }
+        assert_eq!(Spelling::new("/srv/a\nb").render(tool), "\"/srv/a\\x0ab\"");
+        assert_eq!(
+            Spelling::new("/srv/a\nb").render_quoted(tool),
+            "\"/srv/a\\x0ab\""
+        );
+        assert_eq!(
+            tool.host_path(Path::new("/srv/café")),
+            "\"/srv/caf\\xc3\\xa9\""
+        );
+        // The origin's own `Display` is the same sentence.
+        assert_eq!(
+            MountOrigin::UserTool {
+                file: file.to_path_buf(),
+                declaration: 3,
+                index: 1,
+            }
+            .to_string(),
+            "tools[3].mounts[1] in \"/home/u/.config/agent-vm/config.toml\""
+        );
+        // A core collision names the entry and offers the opt-out that actually
+        // works: a tool list is automatic, so `--no-config-mounts` removes it.
+        let core = ClaimError::Core {
+            origin: MountOrigin::UserTool {
+                file: file.to_path_buf(),
+                declaration: 3,
+                index: 1,
+            },
+            guest: PathBuf::from("/core"),
+        }
+        .to_string();
+        assert_eq!(
+            core,
+            "tools[3].mounts[1] in \"/home/u/.config/agent-vm/config.toml\": guest path /core \
+             collides with an agent-vm core mount; pass --no-config-mounts to launch without it"
+        );
+        // A conflict names both sites, so an own-versus-inherited collision is
+        // fixable without guessing which tool declared each.
+        let root = tempfile::tempdir().unwrap();
+        let host = root.path().join("host");
+        fs::create_dir_all(&host).unwrap();
+        let origin = |declaration: usize, index: usize| MountOrigin::UserTool {
+            file: file.to_path_buf(),
+            declaration,
+            index,
+        };
+        let request = |origin: MountOrigin, mode: &str| MountRequest {
+            origin,
+            mount: parse_mount_spec(
+                &format!("{}:/g:{mode}", host.display()),
+                HostSyntax::AbsoluteOnly,
+            )
+            .unwrap(),
+        };
+        assert_eq!(
+            claim(
+                vec![request(origin(0, 0), "ro"), request(origin(4, 2), "rw")],
+                &[]
+            )
+            .unwrap_err()
+            .to_string(),
+            "guest path /g is claimed by different declarations (tools[0].mounts[0] in \
+             \"/home/u/.config/agent-vm/config.toml\" and tools[4].mounts[2] in \
+             \"/home/u/.config/agent-vm/config.toml\"); identical declarations are merged and \
+             different ones are refused"
+        );
+    }
+
+    /// A tool origin is provenance, never identity: the same declaration selected
+    /// by a tool list, a default, a set or `--mount` is one declaration, one
+    /// claim, and therefore one fork.
+    #[test]
+    fn user_tool_origin_does_not_change_equivalence_or_fork_id() {
+        let file = PathBuf::from("/home/u/.config/agent-vm/config.toml");
+        let host = Path::new("/srv/shared");
+        let mount = || {
+            parse_mount_spec(
+                &format!("{}:/g:ro", host.display()),
+                HostSyntax::AbsoluteOnly,
+            )
+            .unwrap()
+        };
+        let origins = [
+            MountOrigin::Cli,
+            MountOrigin::UserConfig {
+                file: file.clone(),
+                index: 0,
+            },
+            MountOrigin::UserSet {
+                file: file.clone(),
+                set: std::sync::Arc::from("agent"),
+                index: 0,
+            },
+            MountOrigin::UserTool {
+                file: file.clone(),
+                declaration: 2,
+                index: 0,
+            },
+        ];
+        // Every pair is the same declaration, so `claim` merges them all into one
+        // request that keeps the first-seen origin.
+        let merged = claim(
+            origins
+                .iter()
+                .map(|origin| MountRequest {
+                    origin: origin.clone(),
+                    mount: mount(),
+                })
+                .collect(),
+            &[],
+        )
+        .expect("one declaration however it was selected");
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].origin, MountOrigin::Cli);
+        // And the fork identity the request resolves to is the same one whichever
+        // origin carried it: origins are excluded from `same_declaration`.
+        for origin in origins {
+            let candidate = MountRequest {
+                origin,
+                mount: mount(),
+            };
+            assert!(
+                same_declaration(&merged[0].mount, &candidate.mount),
+                "provenance must not change declaration identity"
+            );
+        }
     }
 
     /// The argv sentences end to end: a non-ASCII source spelling reaches the

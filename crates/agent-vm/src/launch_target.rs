@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::config::{CatalogEntry, PersistPath};
+use crate::config_mounts::ResolvedMountList;
 use crate::credential_provider::ProviderSet;
 use crate::network_requests::{NetworkRequests, RequestTier};
 use crate::secret_store::ServiceName;
@@ -50,6 +51,9 @@ impl LaunchTarget {
                     provisioned: entry.provisioned(),
                     required: tool.credential_providers(),
                     persist: entry.persist().to_vec(),
+                    // The entry's own folded facet, borrowed as a shared handle:
+                    // lowering must not re-resolve, re-parse or copy declarations.
+                    mounts: entry.mounts().clone(),
                     guest_env: tool.guest_env().clone(),
                     requests: Some(DeclaredRequests {
                         requests: tool.network_requests().clone(),
@@ -78,6 +82,10 @@ pub(crate) struct CatalogGrant {
     provisioned: ProviderSet,
     required: ProviderSet,
     persist: Vec<PersistPath>,
+    /// The selected entry's config mount declarations, own plus inherited. Empty
+    /// for a direct launch, which still receives user-wide defaults and explicit
+    /// `--mount` selections from the shared pipeline.
+    mounts: ResolvedMountList,
     guest_env: BTreeMap<String, String>,
     requests: Option<DeclaredRequests>,
 }
@@ -88,6 +96,7 @@ impl CatalogGrant {
             provisioned: ProviderSet::default(),
             required: ProviderSet::default(),
             persist: Vec::new(),
+            mounts: ResolvedMountList::empty(),
             guest_env: BTreeMap::new(),
             requests: None,
         }
@@ -100,6 +109,9 @@ impl CatalogGrant {
     }
     pub(crate) fn persist(&self) -> &[PersistPath] {
         &self.persist
+    }
+    pub(crate) fn mounts(&self) -> &ResolvedMountList {
+        &self.mounts
     }
     pub(crate) fn guest_env(&self) -> &BTreeMap<String, String> {
         &self.guest_env
@@ -185,6 +197,7 @@ mod tests {
         assert_eq!(grant.provisioned().iter().count(), 0);
         assert_eq!(grant.required().iter().count(), 0);
         assert!(grant.persist().is_empty());
+        assert!(grant.mounts().is_empty());
         assert!(grant.guest_env().is_empty());
         assert!(grant.requests().is_none());
         assert_eq!(invocation.program(), "claude");
@@ -202,6 +215,60 @@ mod tests {
             ["--dangerously-skip-permissions", "x"]
         );
     }
+    /// A mount-bearing loaded config, built through the real verified read (the
+    /// directory and file modes are what the authority check measures) so lowering
+    /// is exercised on a facet the shipped catalog cannot supply.
+    fn loaded_catalog(body: &str) -> crate::config::LaunchCatalog {
+        use std::os::unix::fs::PermissionsExt;
+        let user_dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(user_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let user = user_dir.path().join("config.toml");
+        std::fs::write(&user, body).unwrap();
+        std::fs::set_permissions(&user, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let report = crate::config::load(&crate::config::ConfigPaths {
+            user: Some(user),
+            project: project_dir.path().join("config.toml"),
+            home: None,
+        })
+        .unwrap();
+        report.into_launch_catalog().unwrap()
+    }
+
+    /// The mount facet survives lowering as a shared handle, and a direct launch's
+    /// grant stays empty while still receiving the user-wide defaults and explicit
+    /// `--mount` selections from the shared pipeline.
+    #[test]
+    fn tool_lowering_carries_mount_facet_and_direct_is_empty() {
+        let mut catalog = loaded_catalog(
+            "[[tools]]\nname = \"t\"\ncommand = \"t\"\ntools = [\"u\"]\n\
+             mounts = [\"/a:/a:ro\"]\n\
+             [[tools]]\nname = \"u\"\ncommand = \"u\"\nmounts = [\"/b:/b:fork\"]\n",
+        );
+        let entry = catalog.take_entry("t").unwrap();
+        let expected = entry.mounts().clone();
+        assert!(!expected.is_empty());
+        let (grant, _) = LaunchTarget::Tool {
+            entry: Box::new(entry),
+            tool_args: Vec::new(),
+        }
+        .into_parts();
+        assert_eq!(grant.mounts(), &expected);
+        // Both the own and the inherited declaration are present, in arena order.
+        let guests: Vec<String> = grant
+            .mounts()
+            .requests()
+            .map(|request| request.mount.guest.display().to_string())
+            .collect();
+        assert_eq!(guests, ["/a", "/b"]);
+
+        // A direct launch has no catalog inputs of any kind; its defaults and
+        // `--mount`s arrive from selection, not from the grant.
+        let command = DirectCommand::from_os_args(vec!["t".into(), "x".into()]).expect("a program");
+        let (grant, _) = LaunchTarget::Direct(command).into_parts();
+        assert!(grant.mounts().is_empty());
+    }
+
     #[test]
     fn tool_lowering_preserves_catalog_inputs() {
         let mut catalog = crate::config::default_launch_catalog().unwrap();
@@ -216,6 +283,7 @@ mod tests {
             let provisioned = entry.provisioned();
             let required = tool.credential_providers();
             let persist = entry.persist().to_vec();
+            let mounts = entry.mounts().clone();
             let env = tool.guest_env().clone();
             let requests = tool.network_requests().clone();
             let tier = RequestTier::from(tool.origin());
@@ -231,6 +299,7 @@ mod tests {
             assert_eq!(grant.provisioned(), provisioned);
             assert_eq!(grant.required(), required);
             assert_eq!(grant.persist(), persist);
+            assert_eq!(grant.mounts(), &mounts);
             assert_eq!(grant.guest_env(), &env);
             assert_eq!(grant.requests().unwrap().requests, requests);
             assert_eq!(grant.requests().unwrap().tier, tier);

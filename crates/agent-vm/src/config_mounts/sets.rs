@@ -13,22 +13,26 @@
 //!   unused and under `--no-config-mounts` (decision A2). A set whose own closure
 //!   claims one guest path twice with differing declarations is a config error;
 //!   two separately valid sets may still disagree at one guest path until a
-//!   launch selects both.
+//!   launch selects both. The same holds for every tool's own list (#396): it is
+//!   parsed and checked at load, whether or not any launch reaches that tool.
 //! * **That work is bounded** (decision R1). Guest-path lookup during closure
-//!   compilation is an index, never `mount::claim`'s growing-vector scan, and one
-//!   global leaf-visit budget turns a pathological config into a value-free
+//!   compilation, tool-list parsing and the launch-time tool-closure fold is an
+//!   index, never `mount::claim`'s growing-vector scan, and **one** global
+//!   leaf-visit budget — continued across all three stages, never reset per set,
+//!   per tool or per launch — turns a pathological config into a value-free
 //!   config error instead of a hang. `mount::same_declaration` and
 //!   `mount::claim_decision` stay the authority for whether two claims at one
 //!   path agree; only the *lookup* is indexed.
 //!
-//! Nothing here opens, stats or canonicalizes a declared path. Closures and the
-//! defaults list hold guest-path *indexes* into one immutable request arena, so a
-//! shared child closure is iterated, never copied or re-expanded, and a diamond
-//! DAG cannot flatten exponentially.
+//! Nothing here opens, stats or canonicalizes a declared path. Every list holds
+//! shared [`ConfigMountLeaf`] handles, so a shared child closure is iterated,
+//! never copied or re-expanded, a diamond DAG cannot flatten exponentially, and
+//! many catalog entries inheriting one list cost one handle each rather than one
+//! payload each.
 
 use super::{
-    EntrySite, MountSelector, MountSetName, MountValues, SelectorError, UserMountsError,
-    parse_selector,
+    ConfigMountLeaf, EntrySite, MountSelector, MountSetName, MountValues, ResolvedMountList,
+    SelectorError, ToolMountLists, UserMountsError, parse_selector,
 };
 use crate::mount::{
     ClaimDecision, ClaimFacts, ExtraMount, HostSyntax, MountOrigin, MountRequest, claim_decision,
@@ -42,16 +46,17 @@ use std::{
 use vstd::prelude::*;
 
 verus! {
-/// How many leaf visits the whole user file may spend validating its declared
-/// closures (decision R1).
+/// How many leaf visits the whole user file may spend admitting mount candidates
+/// (decision R1, widened by #396).
 ///
-/// A *leaf visit* is one direct or cached-child candidate considered while
-/// compiling one set's closure, including a candidate later deduplicated: the
-/// counter is global, never reset per root, and counts repeated uses in different
-/// parent closures again. 65,536 admits hundreds of ordinary small sets (100 sets
-/// of 100 leaves costs 10,000) while bounding the worst admitted work to 65,536
-/// guest-index lookups, insertions, six-field equivalence checks and cached leaf
-/// IDs — so a crafted config cannot turn load into a hang.
+/// A *leaf visit* is one candidate considered while compiling a set's closure,
+/// while merging a tool's own list, or while folding one launch's tool closure —
+/// including a candidate later deduplicated, and including the same leaf reached
+/// through different parents. The counter is global, never reset per root, per
+/// tool, per list or per launch: 65,536 admits hundreds of ordinary small sets
+/// (100 sets of 100 leaves costs 10,000) while bounding the worst admitted work to
+/// 65,536 guest-index lookups, insertions and six-field equivalence checks — so a
+/// crafted config cannot turn load *or* catalog construction into a hang.
 pub const MAX_MOUNT_SET_EXPANSION_WORK: usize = 65_536;
 
 /// Exhaustion polarity. Checked *before* an increment, so the counter can reach
@@ -109,32 +114,72 @@ pub fn visit_decision(state: VisitState) -> (d: VisitDecision)
 }
 } // verus!
 
-/// The one leaf-visit counter for the entire user file.
+/// Where one admitted candidate sits in the shared budget, which decides the
+/// sentence an exhaustion prints.
+///
+/// Two stages, not one flag, because the two refusals are deliberately different
+/// text: the set stage's bytes predate #396 and are pinned, while a tool-list or
+/// tool-closure exhaustion names the wider scope it was caused by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExpansionStage {
+    /// Compiling one declared set's closure.
+    SetClosure,
+    /// Merging a tool's own list, or folding a launch's tool closure.
+    ToolMounts,
+}
+
+/// The one leaf-visit counter for the entire user file, continued into catalog
+/// construction.
 ///
 /// Plainly mutable and not a Verus value: the proved half is the exhaustion
 /// predicate above, and `admit` is the trusted adapter that applies it before the
 /// increment (so the counter can reach the limit and never overflow).
-#[derive(Clone, Copy, Debug)]
-struct ExpansionWork {
+///
+/// `Copy` on purpose: a launch takes one *continuation* from the verified parser
+/// ([`UserMounts::continuing_work`]) and spends it while building the catalog.
+/// There is no way to mint a fresh counter in production — `configured` is the
+/// only constructor outside tests — so a second, independent budget cannot appear
+/// by accident.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct MountExpansionWork {
     used: usize,
 }
 
-impl ExpansionWork {
-    fn fresh() -> Self {
-        Self { used: 0 }
+impl MountExpansionWork {
+    /// The counter a catalog build starts from when no user mount model exists
+    /// (the built-in defaults, which cannot carry tool mounts and therefore
+    /// consume nothing).
+    pub(crate) fn fresh() -> Self {
+        Self::default()
     }
 
-    /// Admit one candidate leaf, or refuse the file.
-    fn admit(&mut self) -> Result<(), UserMountsError> {
+    /// The continuation of a verified parse's counter.
+    pub(super) fn configured(used: usize) -> Self {
+        Self { used }
+    }
+
+    /// How many candidates this budget has admitted, whether the last one was
+    /// refused or not. A test-only reader: the resource rule is otherwise
+    /// observable only as the refusal.
+    #[cfg(test)]
+    pub(crate) fn used(&self) -> usize {
+        self.used
+    }
+
+    /// Admit one candidate leaf, or refuse the stage that spent it.
+    fn admit(&mut self, stage: ExpansionStage) -> Result<(), UserMountsError> {
         if !mount_set_expansion_work_allowed(self.used) {
-            return Err(UserMountsError::ExpansionWorkLimit);
+            return Err(match stage {
+                ExpansionStage::SetClosure => UserMountsError::ExpansionWorkLimit,
+                ExpansionStage::ToolMounts => UserMountsError::ToolExpansionWorkLimit,
+            });
         }
         self.used += 1;
         Ok(())
     }
 }
 
-/// Which child sets one closure or defaults list has already expanded.
+/// Which child sets one closure, defaults list or tool list has already expanded.
 ///
 /// Generation-stamped slots, not a growing `Vec` searched linearly: a list that
 /// references N distinct children must cost N admissions, while a scan of
@@ -143,12 +188,14 @@ impl ExpansionWork {
 /// no leaf.
 ///
 /// The cost property is structural: one indexed slot read per admission, with the
-/// generation stamp doing the "already seen" test in O(1) and no per-list reset.
-/// `admissions` is the only counter, and it exists to show that *both* traversals
-/// use this tracker (a revert of either to a growing `Vec` drops the count to
-/// zero); it cannot witness what `admit` itself does. Nothing in-process can: a
-/// counter the traversal increments itself is self-reported, so the linearity
-/// evidence for the tracker is instruction scaling, not a kernel.
+/// generation stamp doing the "already seen" test in O(1). One instance serves
+/// every list in the file — including every tool list (#396) — so a tool-scoped
+/// map does not cost an O(number-of-sets) clear per list. `admissions` is the only
+/// counter, and it exists to show that *every* traversal uses this tracker (a
+/// revert of one to a growing `Vec` drops the count); it cannot witness what
+/// `admit` itself does. Nothing in-process can: a counter the traversal increments
+/// itself is self-reported, so the linearity evidence for the tracker is
+/// instruction scaling, not a kernel.
 #[derive(Debug)]
 struct ChildTracker {
     /// One slot per declared set, stamped with the generation that last admitted
@@ -199,44 +246,143 @@ struct SetId(usize);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LeafId(usize);
 
-/// One entry of a definition or of the defaults list, after name binding.
+/// One entry of a definition, the defaults list or a tool's own list, after name
+/// binding.
 #[derive(Clone, Copy, Debug)]
 enum Entry {
     Direct(LeafId),
     Reference(SetId),
 }
 
+/// Which list an entry list came from, so one binder can serve all three and each
+/// still names its own site and its own schema sentence.
+#[derive(Clone, Copy, Debug)]
+enum ListSite {
+    Defaults,
+    Tool { declaration: usize },
+}
+
+impl ListSite {
+    fn entry(self, index: usize) -> EntrySite {
+        match self {
+            Self::Defaults => EntrySite::Defaults { index },
+            Self::Tool { declaration } => EntrySite::ToolEntry { declaration, index },
+        }
+    }
+
+    fn not_array(self) -> UserMountsError {
+        match self {
+            Self::Defaults => UserMountsError::NotArray,
+            Self::Tool { declaration } => UserMountsError::ToolListNotArray { declaration },
+        }
+    }
+
+    fn not_string(self, index: usize) -> UserMountsError {
+        match self {
+            Self::Defaults => UserMountsError::NotString { index },
+            Self::Tool { declaration } => UserMountsError::ToolListNotString { declaration, index },
+        }
+    }
+}
+
+/// Whether a list merge spends the shared leaf-visit budget.
+///
+/// An enum rather than `Option<&mut MountExpansionWork>`, because the defaults
+/// list's *exemption* is a documented decision (decision R1) and must not read as
+/// a missing argument: its direct entries are bounded by the config file size and
+/// every closure it can reference was already admitted when that closure was
+/// compiled, so charging it again would double-count the same work.
+enum Charge<'a> {
+    /// The one historical exemption: the top-level defaults merge.
+    Exempt,
+    /// A tool's own list, and the launch-time tool-closure fold.
+    ToolMounts(&'a mut MountExpansionWork),
+}
+
 struct SetDefinition {
     entries: Vec<Entry>,
 }
 
-/// One verified user file's mount configuration: the file, its optional defaults
-/// and its validated set namespace.
+/// One file's validated set namespace: exact names, and each declared set's
+/// compiled closure in the table the dependency-first compiler filled.
 ///
-/// [`Self::requests`] is the *automatic* selection (the defaults list) already
-/// normalized and deduplicated, so a later claim against `--mount` needs no second
-/// pass. [`Self::requests_for_set`] is the same for one named set. Neither mounts
-/// anything by being present.
+/// Staged as soon as that table exists and *before* the defaults list and the
+/// tool lists are bound, so all three selections call the same lookup
+/// ([`Self::requests_for_set`]) rather than the binder resolving a name against a
+/// raw name map. The set graph itself is compiled by
+/// [`validate_references_and_cycles`] and [`compile_closures`] before this type
+/// exists: a definition's reference cannot call the interface because the closure
+/// it would return is what that walk is computing.
+#[derive(Clone, Debug)]
+struct SetNamespace {
+    /// Name to definition, exact spelling, no folding.
+    index: BTreeMap<MountSetName, SetId>,
+    /// Per set, its unique leaves in first-seen order, as a shared list so a
+    /// lookup is an `Arc` bump rather than a payload clone.
+    closures: Vec<ResolvedMountList>,
+}
+
+/// One named set as a selection: the definition's position, which the per-list
+/// child tracker needs, and the shared compiled closure itself.
+///
+/// One value rather than two lookups, so a list that skips a repeated reference
+/// cannot disagree with the bytes it expands.
+struct SetSelection {
+    set: SetId,
+    list: ResolvedMountList,
+}
+
+impl SetNamespace {
+    /// The declarations one named set expands to, or `None` when this file
+    /// declares no such set.
+    ///
+    /// An exact lookup: no case folding, no trimming, no cwd path, no directory or
+    /// tool discovery, and no second parser. The closure was validated at load, so
+    /// this hands out the already-compiled shared list — it is never a second
+    /// validation pass — and it is the **only** name-to-selection interface: the
+    /// defaults list, every tool list and `--mount` all select through it.
+    fn requests_for_set(&self, name: &MountSetName) -> Option<SetSelection> {
+        let set = *self.index.get(name)?;
+        Some(SetSelection {
+            set,
+            list: self.closures[set.0].clone(),
+        })
+    }
+
+    /// The compiled closure at a position an earlier `requests_for_set` returned.
+    ///
+    /// A table read, not a selection: no name is involved, so a merge that already
+    /// resolved its references cannot reach a second lookup by using it.
+    fn list(&self, set: SetId) -> &ResolvedMountList {
+        &self.closures[set.0]
+    }
+}
+
+/// One verified user file's mount configuration: the file, its optional defaults,
+/// its validated set namespace and every tool's own list.
+///
+/// [`Self::defaults`] and [`Self::requests_for_set`] are *selection sources*
+/// already normalized and deduplicated, so a later claim against `--mount` needs
+/// no second pass. Neither mounts anything by being present, and neither does a
+/// tool's own list until a launch of that tool folds it.
 #[derive(Clone, Debug)]
 pub(crate) struct UserMounts {
     file: PathBuf,
     /// `Some` iff the file has a top-level `mounts` key, present-empty included.
-    defaults: Option<Vec<MountRequest>>,
-    /// Name to definition, exact spelling, no folding.
-    index: BTreeMap<MountSetName, SetId>,
-    /// Per set, its unique leaves in first-seen order.
-    closures: Vec<Vec<LeafId>>,
-    /// Every declaration this file contains, normalized once.
-    leaves: Vec<MountRequest>,
-    /// Leaf visits admitted while compiling the closures, and the raw graph entry
-    /// count. Retained rather than recomputed so a test can assert the *work* bound
+    defaults: Option<ResolvedMountList>,
+    /// The validated namespace the defaults list and every tool list selected
+    /// their sets from, kept for `--mount`.
+    sets: SetNamespace,
+    /// Each full `[[tools]]` definition's own list, indexed by declaration.
+    tool_lists: ToolMountLists,
+    /// Leaf visits admitted while parsing, and the raw graph entry count.
+    /// Retained rather than recomputed so a test can assert the *work* bound
     /// instead of a wall-clock time: the resource rule is about admitted
     /// comparisons, and only a counter can show its shape.
-    #[cfg_attr(not(test), allow(dead_code))]
     work: usize,
     #[cfg_attr(not(test), allow(dead_code))]
     entries: usize,
-    /// Reference admissions across both traversals, test-only for the same
+    /// Reference admissions across every traversal, test-only for the same
     /// reason: the linearity guarantee is about raw-edge work that spends no leaf
     /// visit, and the count is what shows each traversal uses the indexed tracker
     /// rather than a growing `Vec`.
@@ -249,15 +395,19 @@ impl UserMounts {
         &self.file
     }
 
-    /// The declarations this file selects automatically, after merging.
-    pub(crate) fn requests(&self) -> &[MountRequest] {
-        self.defaults.as_deref().unwrap_or_default()
+    /// The declarations this file selects automatically on every launch, after
+    /// merging. A file with no top-level list selects nothing here even when its
+    /// tools declare mounts: those are selected per tool.
+    pub(crate) fn defaults(&self) -> Option<&ResolvedMountList> {
+        self.defaults.as_ref()
     }
 
-    /// How many declarations the defaults list selects after merging — the number
-    /// a launch notice reports, not the number of `mounts` entries.
+    /// How many declarations the defaults list selects after merging. The launch
+    /// notice reports the *combined* automatic count instead, from
+    /// `mount_selection`; this is for tests that assert the defaults half alone.
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.requests().len()
+        self.defaults.as_ref().map_or(0, ResolvedMountList::len)
     }
 
     /// Whether the file declares a defaults list at all. Presence, not contents,
@@ -268,19 +418,34 @@ impl UserMounts {
     }
 
     /// The declarations one named set expands to, or `None` when this file
-    /// declares no such set.
+    /// declares no such set — the projection `--mount` uses of the one lookup,
+    /// [`SetNamespace::requests_for_set`], which the defaults list and every tool
+    /// list already called at load. A caller with no list to track needs only the
+    /// closure, not the position.
+    pub(crate) fn requests_for_set(&self, name: &MountSetName) -> Option<ResolvedMountList> {
+        self.sets
+            .requests_for_set(name)
+            .map(|selected| selected.list)
+    }
+
+    /// Take the tool lists out, so they can live on the validated tools and the
+    /// CLI's namespace clone need not retain a second declaration map.
     ///
-    /// An exact lookup: no case folding, no trimming, no cwd path, no directory or
-    /// tool discovery. The closure was validated at load, so this maps
-    /// already-claimed leaves and is never a second validation pass.
-    pub(crate) fn requests_for_set(&self, name: &MountSetName) -> Option<Vec<MountRequest>> {
-        let set = self.index.get(name)?;
-        Some(
-            self.closures[set.0]
-                .iter()
-                .map(|leaf| self.leaves[leaf.0].clone())
-                .collect(),
-        )
+    /// Takes `&mut self` and leaves the empty map behind, so calling it twice
+    /// cannot duplicate a tool's mounts.
+    pub(crate) fn take_tool_lists(&mut self) -> ToolMountLists {
+        std::mem::take(&mut self.tool_lists)
+    }
+
+    /// The continuation of this parse's leaf-visit budget, for the *single*
+    /// subsequent catalog build.
+    ///
+    /// Not a public way to mint leaves or authority: it can only start where the
+    /// verified parse stopped, so the tool-closure fold cannot get a second budget.
+    /// A fresh [`MountExpansionWork::fresh`] is what the compiled defaults use,
+    /// because built-in tools cannot carry mounts and therefore consume nothing.
+    pub(crate) fn continuing_work(&self) -> MountExpansionWork {
+        MountExpansionWork::configured(self.work)
     }
 
     /// Leaf visits this file's load admitted. Test-only: the resource bound is
@@ -297,7 +462,7 @@ impl UserMounts {
         self.entries
     }
 
-    /// Reference admissions across both traversals. One admission per reference
+    /// Reference admissions across every traversal. One admission per reference
     /// however wide the fan-out is, and zero for a traversal that scans a growing
     /// `Vec` instead of using the tracker — the wiring property this counter can
     /// actually witness. What each admission costs is O(1) by the indexed slot's
@@ -307,7 +472,7 @@ impl UserMounts {
         self.references
     }
 
-    /// Validate the file, both mount fields and the caller's host grammar.
+    /// Validate the file, every mount field and the caller's host grammar.
     ///
     /// `pub(super)` on purpose: [`crate::config_mounts::from_verified_value`] is the
     /// only caller, and it demands the `AuthorizedConfig` token. Keeping the raw
@@ -319,15 +484,15 @@ impl UserMounts {
     /// diagnostic a given file produces never depends on TOML key order: set names,
     /// set entries and their direct declarations, every reference (`UnknownSet`),
     /// the reference graph (`Cycle`), every declared closure (`Conflict`,
-    /// `ExpansionWorkLimit`), and only then the defaults list.
+    /// `ExpansionWorkLimit`), then the defaults list, then each tool's own list in
+    /// declaration order.
     pub(super) fn parse(
         file: PathBuf,
         values: MountValues<'_>,
         syntax: HostSyntax<'_>,
     ) -> Result<Self, UserMountsError> {
-        let mut work = ExpansionWork::fresh();
-        let mut references = 0;
-        Self::build(file, values, syntax, &mut work, &mut references)
+        let mut work = MountExpansionWork::fresh();
+        Self::build(file, values, syntax, &mut work)
     }
 
     /// [`Self::parse`], reporting the leaf visits it admitted even when it
@@ -339,23 +504,20 @@ impl UserMounts {
         values: MountValues<'_>,
         syntax: HostSyntax<'_>,
     ) -> (Result<Self, UserMountsError>, usize) {
-        let mut work = ExpansionWork::fresh();
-        let mut references = 0;
-        let parsed = Self::build(file, values, syntax, &mut work, &mut references);
-        (parsed, work.used)
+        let mut work = MountExpansionWork::fresh();
+        let parsed = Self::build(file, values, syntax, &mut work);
+        (parsed, work.used())
     }
 
     fn build(
         file: PathBuf,
         values: MountValues<'_>,
         syntax: HostSyntax<'_>,
-        work: &mut ExpansionWork,
-        references: &mut usize,
+        work: &mut MountExpansionWork,
     ) -> Result<Self, UserMountsError> {
         let mut builder = Builder {
             file,
             leaves: Vec::new(),
-            sites: Vec::new(),
             entries: 0,
         };
 
@@ -426,83 +588,80 @@ impl UserMounts {
         }
 
         let order = validate_references_and_cycles(&definitions)?;
-        let closures = compile_closures(
-            &definitions,
-            &builder.leaves,
-            &builder.sites,
-            &order,
-            work,
-            references,
-        )?;
+        // One tracker for every list in the file, so a tool-scoped map costs no
+        // per-list allocation or reset.
+        let mut tracker = ChildTracker::new(definitions.len());
+        let closures = compile_closures(&definitions, &builder.leaves, &order, work, &mut tracker)?;
 
-        // Defaults last. They are validated even when a launch suppresses them, but
-        // they are not charged to the per-set budget: their direct entries are
-        // bounded by the file size, and every closure they can reference was
-        // already admitted above.
-        let defaults = match values.defaults {
+        // Stage the validated namespace now, before either automatic selection is
+        // bound: from here on a set is selected by name only through
+        // `SetNamespace::requests_for_set`, the same call `--mount` makes.
+        let sets = SetNamespace { index, closures };
+
+        // Defaults next. They are validated even when a launch suppresses them,
+        // but they are not charged to the shared budget (decision R1, see
+        // `Charge::Exempt`).
+        let defaults = match bind_entries(
+            values.defaults,
+            ListSite::Defaults,
+            &sets,
+            syntax,
+            &mut builder,
+        )? {
             None => None,
-            Some(value) => {
-                let entries = value.as_array().ok_or(UserMountsError::NotArray)?;
-                let mut bound: Vec<Entry> = Vec::with_capacity(entries.len());
-                for (entry_index, entry) in entries.iter().enumerate() {
-                    let site = EntrySite::Defaults { index: entry_index };
-                    let text = entry
-                        .as_str()
-                        .ok_or(UserMountsError::NotString { index: entry_index })?;
-                    bound.push(match parse_selector(text, syntax) {
-                        Ok(MountSelector::Direct(mount)) => Entry::Direct(builder.push_leaf(
-                            MountOrigin::UserConfig {
-                                file: builder.file.clone(),
-                                index: entry_index,
-                            },
-                            site,
-                            mount,
-                        )?),
-                        Ok(MountSelector::Set(target)) => match index.get(&target) {
-                            Some(&target) => Entry::Reference(target),
-                            None => return Err(UserMountsError::UnknownSet { site }),
-                        },
-                        Err(SelectorError::Direct(error)) => {
-                            return Err(UserMountsError::Entry {
-                                site,
-                                kind: error.kind(),
-                            });
-                        }
-                        Err(SelectorError::SetModifier) => {
-                            return Err(UserMountsError::SetReferenceModified { site });
-                        }
-                    });
-                }
-                Some(merge_entries(
-                    &bound,
-                    &builder.leaves,
-                    &builder.sites,
-                    &closures,
-                    None,
-                    references,
-                )?)
-            }
+            Some(bound) => Some(merge_entries(
+                &bound,
+                &builder.leaves,
+                &sets,
+                Charge::Exempt,
+                &mut tracker,
+            )?),
         };
+
+        // Every tool's own list last, in declaration order, and charged: unlike
+        // the defaults merge this is a *new* list each time, so a file that
+        // repeats a large set across many tools must not escape the bound.
+        let mut tool_lists = ToolMountLists::empty();
+        let mut tools: Vec<&super::ToolMountValue<'_>> = values.tools.iter().collect();
+        tools.sort_by_key(|tool| tool.declaration);
+        for tool in tools {
+            let bound = bind_entries(
+                Some(tool.value),
+                ListSite::Tool {
+                    declaration: tool.declaration,
+                },
+                &sets,
+                syntax,
+                &mut builder,
+            )?
+            .expect("a present tool list binds to a present list");
+            let list = merge_entries(
+                &bound,
+                &builder.leaves,
+                &sets,
+                Charge::ToolMounts(work),
+                &mut tracker,
+            )?;
+            tool_lists.set(tool.declaration, list);
+        }
 
         Ok(Self {
             file: builder.file,
             defaults,
-            index,
-            closures,
-            leaves: builder.leaves,
+            sets,
+            tool_lists,
             work: work.used,
             entries: builder.entries,
-            references: *references,
+            references: tracker.admissions,
         })
     }
 }
 
-/// The arena under construction: every declaration this file contains, its
-/// diagnostic site, and the caller's host grammar.
+/// The arena under construction: every declaration this file contains and the
+/// caller's host grammar.
 struct Builder {
     file: PathBuf,
-    leaves: Vec<MountRequest>,
-    sites: Vec<EntrySite>,
+    leaves: Vec<Arc<ConfigMountLeaf>>,
     entries: usize,
 }
 
@@ -522,10 +681,68 @@ impl Builder {
     ) -> Result<LeafId, UserMountsError> {
         let request = normalize_request(MountRequest { origin, mount })
             .map_err(|error| UserMountsError::from_claim(error, &site))?;
-        self.leaves.push(request);
-        self.sites.push(site);
+        self.leaves
+            .push(Arc::new(ConfigMountLeaf { request, site }));
         Ok(LeafId(self.leaves.len() - 1))
     }
+}
+
+/// Bind one entry list's selectors, whether it is the defaults list or a tool's
+/// own. `None` means the field was absent.
+///
+/// One binder for all three list kinds: a list differs only in the site it names
+/// and the schema sentence it prints, so a second `split(':')`/selector match
+/// would be a second grammar. It receives the *validated namespace*, never a raw
+/// name map, so a set entry has exactly one way to become a selection — the same
+/// call `--mount` makes.
+fn bind_entries(
+    value: Option<&toml::Value>,
+    site: ListSite,
+    sets: &SetNamespace,
+    syntax: HostSyntax<'_>,
+    builder: &mut Builder,
+) -> Result<Option<Vec<Entry>>, UserMountsError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let entries = value.as_array().ok_or_else(|| site.not_array())?;
+    let mut bound: Vec<Entry> = Vec::with_capacity(entries.len());
+    for (entry_index, entry) in entries.iter().enumerate() {
+        let entry_site = site.entry(entry_index);
+        let text = entry.as_str().ok_or_else(|| site.not_string(entry_index))?;
+        builder.entries += 1;
+        bound.push(match parse_selector(text, syntax) {
+            Ok(MountSelector::Direct(mount)) => Entry::Direct(builder.push_leaf(
+                match site {
+                    ListSite::Defaults => MountOrigin::UserConfig {
+                        file: builder.file.clone(),
+                        index: entry_index,
+                    },
+                    ListSite::Tool { declaration } => MountOrigin::UserTool {
+                        file: builder.file.clone(),
+                        declaration,
+                        index: entry_index,
+                    },
+                },
+                entry_site,
+                mount,
+            )?),
+            Ok(MountSelector::Set(target)) => match sets.requests_for_set(&target) {
+                Some(selected) => Entry::Reference(selected.set),
+                None => return Err(UserMountsError::UnknownSet { site: entry_site }),
+            },
+            Err(SelectorError::Direct(error)) => {
+                return Err(UserMountsError::Entry {
+                    site: entry_site,
+                    kind: error.kind(),
+                });
+            }
+            Err(SelectorError::SetModifier) => {
+                return Err(UserMountsError::SetReferenceModified { site: entry_site });
+            }
+        });
+    }
+    Ok(Some(bound))
 }
 
 /// Bind every entry's references and reject every cycle, dependency-first.
@@ -590,24 +807,25 @@ fn validate_references_and_cycles(
 /// duplicate candidates — and a reference to an empty closure costs no leaf.
 fn compile_closures(
     definitions: &[SetDefinition],
-    leaves: &[MountRequest],
-    sites: &[EntrySite],
+    leaves: &[Arc<ConfigMountLeaf>],
     order: &[SetId],
-    work: &mut ExpansionWork,
-    references: &mut usize,
-) -> Result<Vec<Vec<LeafId>>, UserMountsError> {
-    let mut closures: Vec<Vec<LeafId>> = vec![Vec::new(); definitions.len()];
+    work: &mut MountExpansionWork,
+    tracker: &mut ChildTracker,
+) -> Result<Vec<ResolvedMountList>, UserMountsError> {
+    let mut closures: Vec<ResolvedMountList> = vec![ResolvedMountList::empty(); definitions.len()];
     let mut compiled = vec![false; definitions.len()];
-    let mut tracker = ChildTracker::new(definitions.len());
     for set in order {
         tracker.next_list();
-        let mut index: BTreeMap<&Path, LeafId> = BTreeMap::new();
-        let mut unique: Vec<LeafId> = Vec::new();
+        let mut index: BTreeMap<&Path, &Arc<ConfigMountLeaf>> = BTreeMap::new();
+        let mut unique: Vec<&Arc<ConfigMountLeaf>> = Vec::new();
         for entry in &definitions[set.0].entries {
             match entry {
-                Entry::Direct(leaf) => {
-                    admit_candidate(&mut index, &mut unique, leaves, sites, *leaf, Some(work))?
-                }
+                Entry::Direct(leaf) => admit_candidate(
+                    &mut index,
+                    &mut unique,
+                    &leaves[leaf.0],
+                    Some((work, ExpansionStage::SetClosure)),
+                )?,
                 Entry::Reference(child) => {
                     // A repeated reference to one child contributes nothing: the
                     // child's closure is already unique by guest path. Skipping it
@@ -621,90 +839,117 @@ fn compile_closures(
                         // dropping a child's declarations from validation.
                         return Err(UserMountsError::ReferenceOrder);
                     }
-                    for &leaf in &closures[child.0] {
-                        admit_candidate(&mut index, &mut unique, leaves, sites, leaf, Some(work))?;
+                    for leaf in closures[child.0].leaves() {
+                        admit_candidate(
+                            &mut index,
+                            &mut unique,
+                            leaf,
+                            Some((work, ExpansionStage::SetClosure)),
+                        )?;
                     }
                 }
             }
         }
-        closures[set.0] = unique;
+        closures[set.0] = share(&unique);
         compiled[set.0] = true;
     }
-    *references += tracker.admissions;
     Ok(closures)
 }
 
 /// Merge one ordered entry list into unique leaves, indexed by normalized guest
 /// path.
 ///
-/// `charge` is `Some` while validating a declared set's closure and `None` for the
-/// defaults list, whose direct entries are bounded by the file size and whose
-/// referenced closures were all admitted already.
+/// References are read out of the namespace the binder selected them from, by
+/// position: the same shared closure `requests_for_set` returned, never a second
+/// name lookup.
 fn merge_entries(
     entries: &[Entry],
-    leaves: &[MountRequest],
-    sites: &[EntrySite],
-    closures: &[Vec<LeafId>],
-    charge: Option<&mut ExpansionWork>,
-    references: &mut usize,
-) -> Result<Vec<MountRequest>, UserMountsError> {
-    let mut index: BTreeMap<&Path, LeafId> = BTreeMap::new();
-    let mut unique: Vec<LeafId> = Vec::new();
-    let mut tracker = ChildTracker::new(closures.len());
-    tracker.next_list();
+    leaves: &[Arc<ConfigMountLeaf>],
+    sets: &SetNamespace,
+    charge: Charge<'_>,
+    tracker: &mut ChildTracker,
+) -> Result<ResolvedMountList, UserMountsError> {
+    let mut index: BTreeMap<&Path, &Arc<ConfigMountLeaf>> = BTreeMap::new();
+    let mut unique: Vec<&Arc<ConfigMountLeaf>> = Vec::new();
     let mut charge = charge;
+    tracker.next_list();
     for entry in entries {
         match entry {
-            Entry::Direct(leaf) => admit_candidate(
-                &mut index,
-                &mut unique,
-                leaves,
-                sites,
-                *leaf,
-                charge.as_deref_mut(),
-            )?,
+            Entry::Direct(leaf) => {
+                admit_candidate(&mut index, &mut unique, &leaves[leaf.0], charge.borrow())?
+            }
             Entry::Reference(child) => {
                 if !tracker.admit(*child) {
                     continue;
                 }
-                for &leaf in &closures[child.0] {
-                    admit_candidate(
-                        &mut index,
-                        &mut unique,
-                        leaves,
-                        sites,
-                        leaf,
-                        charge.as_deref_mut(),
-                    )?;
+                for leaf in sets.list(*child).leaves() {
+                    admit_candidate(&mut index, &mut unique, leaf, charge.borrow())?;
                 }
             }
         }
     }
-    *references += tracker.admissions;
-    Ok(unique
-        .into_iter()
-        .map(|leaf| leaves[leaf.0].clone())
-        .collect())
+    Ok(share(&unique))
 }
 
-/// Adjudicate one candidate leaf against the closure being built.
+impl Charge<'_> {
+    /// Re-borrow for one candidate. `admit_candidate` charges before it looks the
+    /// guest path up, so the budget bounds comparisons rather than being checked
+    /// after them.
+    fn borrow(&mut self) -> Option<(&mut MountExpansionWork, ExpansionStage)> {
+        match self {
+            Self::Exempt => None,
+            Self::ToolMounts(work) => Some((work, ExpansionStage::ToolMounts)),
+        }
+    }
+}
+
+/// Fold one launch's own tool mount lists — already resolved, normalized and
+/// deduplicated at load — into the single union its entry carries.
+///
+/// Not a second expander: it never parses a selector or walks a set edge. It
+/// merges declarations that were individually valid in lists that can only
+/// conflict when one launch selects them both, and it spends the *continued*
+/// shared budget for every candidate, duplicates included, before the guest-index
+/// lookup and the shared equivalence kernel.
+pub(crate) fn merge_tool_mounts<'a>(
+    lists: impl IntoIterator<Item = &'a ResolvedMountList>,
+    work: &mut MountExpansionWork,
+) -> Result<ResolvedMountList, UserMountsError> {
+    let mut index: BTreeMap<&Path, &Arc<ConfigMountLeaf>> = BTreeMap::new();
+    let mut unique: Vec<&Arc<ConfigMountLeaf>> = Vec::new();
+    for list in lists {
+        for leaf in list.leaves() {
+            admit_candidate(
+                &mut index,
+                &mut unique,
+                leaf,
+                Some((work, ExpansionStage::ToolMounts)),
+            )?;
+        }
+    }
+    Ok(share(&unique))
+}
+
+fn share(unique: &[&Arc<ConfigMountLeaf>]) -> ResolvedMountList {
+    ResolvedMountList::from_leaves(unique.iter().map(|leaf| Arc::clone(leaf)).collect())
+}
+
+/// Adjudicate one candidate leaf against the list being built.
 ///
 /// The order is the contract: charge the budget, look the guest path up in the
 /// index, and only then reach the shared equivalence kernel. No candidate is
 /// copied, compared or normalized before its visit is admitted, which is what
 /// bounds a hostile file to the limit rather than to its size in comparisons.
 fn admit_candidate<'a>(
-    index: &mut BTreeMap<&'a Path, LeafId>,
-    unique: &mut Vec<LeafId>,
-    leaves: &'a [MountRequest],
-    sites: &[EntrySite],
-    candidate: LeafId,
-    charge: Option<&mut ExpansionWork>,
+    index: &mut BTreeMap<&'a Path, &'a Arc<ConfigMountLeaf>>,
+    unique: &mut Vec<&'a Arc<ConfigMountLeaf>>,
+    candidate: &'a Arc<ConfigMountLeaf>,
+    charge: Option<(&mut MountExpansionWork, ExpansionStage)>,
 ) -> Result<(), UserMountsError> {
-    if let Some(work) = charge {
-        work.admit()?;
+    if let Some((work, stage)) = charge {
+        work.admit(stage)?;
     }
-    let guest: &'a Path = leaves[candidate.0].mount.guest.as_path();
+    let guest: &'a Path = candidate.request.mount.guest.as_path();
     match index.get(guest) {
         None => {
             index.insert(guest, candidate);
@@ -713,12 +958,12 @@ fn admit_candidate<'a>(
         }
         Some(&first) => match claim_decision(ClaimFacts {
             same_guest: true,
-            equivalent: same_declaration(&leaves[first.0].mount, &leaves[candidate.0].mount),
+            equivalent: same_declaration(&first.request.mount, &candidate.request.mount),
         }) {
             ClaimDecision::Merge => Ok(()),
             ClaimDecision::Conflict | ClaimDecision::Distinct => Err(UserMountsError::Conflict {
-                site: sites[candidate.0].clone(),
-                other: sites[first.0].clone(),
+                site: candidate.site.clone(),
+                other: first.site.clone(),
             }),
         },
     }
@@ -753,15 +998,36 @@ mod tests {
         fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
         let read = read_bounded_regular_file_noting_symlink(&file, 1 << 20).unwrap();
         let table: toml::Table = body.parse().expect("test body is TOML");
+        let tool_values: Vec<super::super::ToolMountValue<'_>> = table
+            .get("tools")
+            .and_then(toml::Value::as_array)
+            .map(|tools| {
+                tools
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(declaration, tool)| {
+                        tool.as_table()
+                            .and_then(|table| table.get("mounts"))
+                            .map(|value| super::super::ToolMountValue { declaration, value })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let values = MountValues {
             defaults: table.get("mounts"),
             sets: table.get("mount_sets"),
+            tools: &tool_values,
         };
         let authorized = verify(
             &read,
             AuthorityTriggers {
                 network: false,
-                mounts: values.defaults.is_some(),
+                mounts: crate::config_authority::mount_authority_present(
+                    crate::config_authority::MountAuthorityFacts {
+                        top_level: values.defaults.is_some(),
+                        tool_field: !tool_values.is_empty(),
+                    },
+                ),
                 mount_sets: values.sets.is_some(),
             },
         )
@@ -811,7 +1077,7 @@ mod tests {
         mounts
             .requests_for_set(&set(name))
             .unwrap_or_else(|| panic!("set {name} is declared"))
-            .into_iter()
+            .requests()
             .map(|request| {
                 (
                     request.mount.source_spelling.clone(),
@@ -822,10 +1088,18 @@ mod tests {
             .collect()
     }
 
-    fn names(mounts: &UserMounts) -> Vec<(Spelling, String)> {
+    /// The defaults list's declarations, or nothing. A test fixture helper: a
+    /// launch also carries the tool facet, so production reads `defaults()`.
+    fn defaults_requests(mounts: &UserMounts) -> Vec<&MountRequest> {
         mounts
-            .requests()
-            .iter()
+            .defaults()
+            .map(|list| list.requests().collect())
+            .unwrap_or_default()
+    }
+
+    fn names(mounts: &UserMounts) -> Vec<(Spelling, String)> {
+        defaults_requests(mounts)
+            .into_iter()
             .map(|request| {
                 (
                     request.mount.source_spelling.clone(),
@@ -995,12 +1269,12 @@ mod tests {
             "empty = []\nouter = [\"empty\", \"empty\"]\n",
         ] {
             let mounts = sets(body).expect(body);
-            assert!(mounts.requests().is_empty(), "{body}");
+            assert!(mounts.defaults().is_none(), "{body}");
             assert!(!mounts.has_defaults(), "{body}");
         }
         let mounts = defaults_and_sets("[]", "empty = []\n").unwrap();
         assert!(mounts.has_defaults());
-        assert!(mounts.requests().is_empty());
+        assert!(mounts.defaults().is_some_and(|list| list.is_empty()));
         assert!(expansion(&mounts, "empty").is_empty());
     }
 
@@ -1032,7 +1306,7 @@ mod tests {
         // The origin names the declaring leaf's set, not the selected one.
         let requests = mounts.requests_for_set(&set("deep")).unwrap();
         assert_eq!(
-            requests[0].origin,
+            requests.requests().next().unwrap().origin,
             MountOrigin::UserSet {
                 file: mounts.file().to_path_buf(),
                 set: Arc::from("docs"),
@@ -1211,7 +1485,13 @@ mod tests {
             .expect("identical declarations merge");
         assert_eq!(merged.len(), 1);
         assert_eq!(
-            merged.requests()[0].origin,
+            merged
+                .defaults()
+                .expect("defaults exist")
+                .requests()
+                .next()
+                .unwrap()
+                .origin,
             MountOrigin::UserSet {
                 file: merged.file().to_path_buf(),
                 set: Arc::from("s"),
@@ -1266,7 +1546,7 @@ mod tests {
             defaults_and_sets("[\"a\"]", &format!("a = [\"{missing}:/g:fork\"]\n")).unwrap();
         assert_eq!(mounts.len(), 1);
         let mounts = sets(&format!("unused = [\"{missing}:/g:fork\"]\n")).unwrap();
-        assert!(mounts.requests().is_empty());
+        assert!(mounts.defaults().is_none());
     }
 
     /// Decision R1's boundary, over the real kernel and a real counter.
@@ -1279,18 +1559,18 @@ mod tests {
             assert!(!mount_set_expansion_work_allowed(used), "{used}");
         }
         // An exhausted counter refuses and does not advance.
-        let mut work = ExpansionWork {
+        let mut work = MountExpansionWork {
             used: MAX_MOUNT_SET_EXPANSION_WORK,
         };
-        assert!(work.admit().is_err());
+        assert!(work.admit(ExpansionStage::SetClosure).is_err());
         assert_eq!(work.used, MAX_MOUNT_SET_EXPANSION_WORK);
         // A counter one below the limit admits exactly one more visit.
-        let mut work = ExpansionWork {
+        let mut work = MountExpansionWork {
             used: MAX_MOUNT_SET_EXPANSION_WORK - 1,
         };
-        assert!(work.admit().is_ok());
+        assert!(work.admit(ExpansionStage::SetClosure).is_ok());
         assert_eq!(work.used, MAX_MOUNT_SET_EXPANSION_WORK);
-        assert!(work.admit().is_err());
+        assert!(work.admit(ExpansionStage::SetClosure).is_err());
         assert_eq!(work.used, MAX_MOUNT_SET_EXPANSION_WORK);
     }
 
@@ -1376,20 +1656,25 @@ mod tests {
     /// the model.
     ///
     /// The key's length is bounded only by the rest of the config file, and a set
-    /// may list that key's leaves thousands of times, so a per-leaf `String` copy
-    /// turns one 40 KB key into 80 MB of retained provenance — below both the file
-    /// limit and the leaf-visit budget. The oracle is the allocation itself:
-    /// `Arc::ptr_eq` across leaves and across a clone, and a strong count that only
-    /// one shared name can reach.
+    /// may hold thousands of leaves, so a per-leaf `String` copy turns one 40 KB key
+    /// into 80 MB of retained provenance — below both the file limit and the
+    /// leaf-visit budget. The oracle is the allocation itself: `Arc::ptr_eq` across
+    /// leaves and across a clone, and a strong count only one shared name can reach.
+    ///
+    /// The leaves are distinct guest paths (plus one exact duplicate, so the merge
+    /// is still exercised) because a retained model holds a handle per *surviving*
+    /// leaf: with identical declarations the merge would collapse them and the
+    /// strong count would measure the deduplication instead of the sharing.
     #[test]
     fn mount_set_key_is_stored_once_across_leaves_and_clones() {
         const LEAVES: usize = 2_000;
         let key = "a".repeat(40_000);
-        let mut entries: Vec<String> =
-            std::iter::repeat_n("\"/h:/g:ro\"".to_string(), LEAVES).collect();
-        // A second *distinct* leaf, so the expansion keeps two entries and both
-        // origins are observable through the selection.
-        entries.push("\"/h:/other:ro\"".to_string());
+        let mut entries: Vec<String> = (0..LEAVES)
+            .map(|index| format!("\"/h:/g{index:05}:ro\""))
+            .collect();
+        // One exact duplicate of the first leaf: the merge keeps the first and
+        // drops this one, so the count below is `LEAVES`, not `LEAVES + 1`.
+        entries.push("\"/h:/g00000:ro\"".to_string());
         let body = format!("[mount_sets]\n{key} = [{}]\n", entries.join(", "));
         assert!(
             body.len() < 1 << 20,
@@ -1398,14 +1683,15 @@ mod tests {
         let mounts = parse_document(&body).expect("a long key is valid");
         let name = MountSetName::parse(&key).unwrap();
         let selected = mounts.requests_for_set(&name).expect("the set exists");
-        assert_eq!(selected.len(), 2, "the repeated leaf deduplicates");
+        assert_eq!(selected.len(), LEAVES, "the exact duplicate merges away");
 
         let shared = |request: &MountRequest| match &request.origin {
             MountOrigin::UserSet { set, .. } => Arc::clone(set),
             other => panic!("a set leaf must carry a set origin: {other:?}"),
         };
-        let first = shared(&selected[0]);
-        let second = shared(&selected[1]);
+        let leaf = |index: usize| selected.requests().nth(index).expect("leaf exists");
+        let first = shared(leaf(0));
+        let second = shared(leaf(1));
         assert_eq!(first.len(), 40_000, "the name is kept in full");
         assert!(
             Arc::ptr_eq(&first, &second),
@@ -1421,17 +1707,22 @@ mod tests {
         );
 
         // A cloned model is what `cli`/`run` hand to a launch: it must share the
-        // same allocation rather than copy the key again.
+        // same allocations rather than copy the key — or even re-copy the leaf
+        // handles — again.
+        let before = Arc::strong_count(&first);
         let cloned = mounts.clone();
         let again = cloned.requests_for_set(&name).expect("the set exists");
         assert!(
-            Arc::ptr_eq(&first, &shared(&again[0])),
+            Arc::ptr_eq(
+                &first,
+                &shared(again.requests().next().expect("leaf exists"))
+            ),
             "a clone must share the name"
         );
-        assert!(
-            Arc::strong_count(&first) >= LEAVES * 2,
-            "both arenas must share one allocation, saw {}",
-            Arc::strong_count(&first)
+        assert_eq!(
+            Arc::strong_count(&first),
+            before,
+            "cloning the model must not duplicate the leaf handles at all"
         );
     }
 
@@ -1495,7 +1786,7 @@ mod tests {
             CHILDREN * 2,
             "the defaults merge must use the tracker too"
         );
-        assert!(mounts.requests().is_empty());
+        assert!(mounts.defaults().is_some_and(|list| list.is_empty()));
 
         // Repeated references to *one* child cost one admission each and never
         // grow a seen list.
@@ -1625,9 +1916,9 @@ mod tests {
         requests
             .iter()
             .map(|request| match &request.origin {
-                MountOrigin::UserConfig { index, .. } | MountOrigin::UserSet { index, .. } => {
-                    *index
-                }
+                MountOrigin::UserConfig { index, .. }
+                | MountOrigin::UserSet { index, .. }
+                | MountOrigin::UserTool { index, .. } => *index,
                 // Neither route in this test tags anything `Cli`; naming it keeps
                 // the match exhaustive rather than adding a catch-all.
                 MountOrigin::Cli => usize::MAX,
@@ -1645,6 +1936,17 @@ mod tests {
         Conflict { second: usize },
         /// A refusal this fixture family must not produce.
         Unexpected,
+    }
+
+    /// A fold refusal reduced to the fact both routes must agree on.
+    fn index_refusal(error: &UserMountsError) -> Refusal {
+        match error {
+            UserMountsError::Conflict {
+                site: EntrySite::ToolEntry { index, .. },
+                ..
+            } => Refusal::Conflict { second: *index },
+            _ => Refusal::Unexpected,
+        }
     }
 
     /// The existing growing-vector claim over one ordinary list, with the same
@@ -1686,6 +1988,9 @@ mod tests {
                 mounts
                     .requests_for_set(&set("s"))
                     .expect("the set is declared")
+                    .requests()
+                    .cloned()
+                    .collect()
             })
             .map_err(|error| match error {
                 UserMountsError::Conflict {
@@ -1719,6 +2024,269 @@ mod tests {
         assert_eq!(expansion(&mounts, "b").len(), 2);
         // shared (2) + a (2) + b (2): shared's closure is iterated, not re-expanded.
         assert_eq!(mounts.expansion_work(), 6);
+    }
+
+    /// Tool lists reuse the same selector, the same `~/` spelling rule and the
+    /// same compiled set closures as the defaults list, and an inherited set leaf
+    /// keeps the origin of the set that declared it.
+    #[test]
+    fn tool_lists_use_cached_set_closures_and_keep_leaf_origins() {
+        let document = "[mount_sets]\n\
+                        diamond = [\"nested\", \"nested\"]\n\
+                        nested = [\"/h/n:/n:ro\", \"/h/n2:/n2:ro\"]\n\
+                        empty = []\n\
+                        [[tools]]\nname = \"a\"\ncommand = \"a\"\n\
+                        mounts = [\"diamond\", \"/h/o:/o:rw\", \"~/home:/home:ro\"]\n";
+        let mounts = parse_document(document).unwrap();
+        // The set's compiled closure is what the tool list expands, so the two
+        // agree declaration for declaration — a second expansion path would show
+        // up as a difference here.
+        let compiled = mounts.requests_for_set(&set("diamond")).expect("declared");
+        let mut mounts = mounts;
+        let list = mounts.take_tool_lists().get(0);
+        assert_eq!(
+            list.requests()
+                .take(2)
+                .map(|request| request.mount.guest.display().to_string())
+                .collect::<Vec<_>>(),
+            ["/n", "/n2",]
+                .iter()
+                .map(|guest| guest.to_string())
+                .collect::<Vec<_>>()
+        );
+        for (from_tool, from_set) in list.requests().zip(compiled.requests()) {
+            assert!(
+                same_declaration(&from_tool.mount, &from_set.mount),
+                "the tool list must reuse the compiled closure"
+            );
+            assert_eq!(from_tool.origin, from_set.origin);
+        }
+        // The `~/` spelling expands against the captured home, exactly as in the
+        // defaults list and inside a set.
+        assert_eq!(
+            list.requests()
+                .map(|request| request.mount.source_spelling.clone())
+                .collect::<Vec<_>>(),
+            [
+                Spelling::new("/h/n"),
+                Spelling::new("/h/n2"),
+                Spelling::new("/h/o"),
+                Spelling::new("/home/graph/home"),
+            ]
+        );
+        // The direct leaves keep the tool site; the inherited ones the set's.
+        let origins: Vec<String> = list
+            .requests()
+            .map(|request| request.origin.to_string())
+            .collect();
+        assert!(
+            origins[0].starts_with("mount_sets[\"nested\"][0]"),
+            "{origins:?}"
+        );
+        assert!(
+            origins[1].starts_with("mount_sets[\"nested\"][1]"),
+            "{origins:?}"
+        );
+        assert!(origins[2].starts_with("tools[0].mounts[1]"), "{origins:?}");
+        assert!(origins[3].starts_with("tools[0].mounts[2]"), "{origins:?}");
+
+        // A direct tool list shares the defaults list's selector: a bare name is a
+        // set, and the same name with `:ro` is refused as a modifier.
+        assert_eq!(
+            rendered(parse_document(
+                "[[tools]]\nname = \"a\"\ncommand = \"a\"\nmounts = [\"empty:ro\"]\n"
+            )),
+            "tools[0].mounts[0]: a mount-set reference is a bare name; modes, a guest path and \
+             exclusions belong to the paths declared inside the set"
+        );
+        assert_eq!(
+            rendered(parse_document(
+                "[[tools]]\nname = \"a\"\ncommand = \"a\"\nmounts = [\"modified\"]\n"
+            )),
+            "tools[0].mounts[0]: unknown mount set name"
+        );
+        // An empty set costs no leaf and selects nothing.
+        let mut mounts = parse_document(
+            "[mount_sets]\nempty = []\n[[tools]]\nname = \"a\"\ncommand = \"a\"\n\
+             mounts = [\"empty\"]\n",
+        )
+        .unwrap();
+        assert!(mounts.take_tool_lists().get(0).is_empty());
+    }
+
+    /// The shared budget continues across set compilation, tool lists **and** the
+    /// launch-time fold, and never resets per list, per tool or per launch.
+    #[test]
+    fn mount_budget_is_shared_by_sets_tool_lists_and_launch_folds() {
+        // Sets first: one set with two leaves costs 2.
+        let document = "[mount_sets]\ns = [\"/h/a:/a:ro\", \"/h/b:/b:ro\"]\n\
+                        [[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = [\"s\", \"/h/c:/c:ro\"]\n";
+        let mounts = parse_document(document).unwrap();
+        // 2 for the set closure + 3 for the tool list (2 set leaves + 1 direct).
+        assert_eq!(mounts.expansion_work(), 5);
+        let mut mounts = mounts;
+        let lists = mounts.take_tool_lists();
+        let work = mounts.continuing_work();
+        // The fold re-admits the tool list's three leaves: 5 + 3 = 8.
+        let mut work = work;
+        let folded = merge_tool_mounts([&lists.get(0)], &mut work).unwrap();
+        assert_eq!(work.used(), 8);
+        assert_eq!(folded.len(), 3);
+
+        // Two launches of one entry each re-fold: the counter is continued, not
+        // cloned per launch.
+        let mut work = mounts.continuing_work();
+        merge_tool_mounts([&lists.get(0)], &mut work).unwrap();
+        merge_tool_mounts([&lists.get(0)], &mut work).unwrap();
+        assert_eq!(work.used(), 5 + 3 + 3);
+    }
+
+    /// Many tools selecting one large set are bounded by the shared budget: the
+    /// same leaf payloads are re-admitted per list rather than escaping the cap by
+    /// being cached once.
+    #[test]
+    fn many_tools_selecting_one_large_set_are_budgeted() {
+        const LEAVES: usize = 2_000;
+        let mut body = String::from("[mount_sets]\nbig = [\n");
+        for index in 0..LEAVES {
+            body.push_str(&format!("\"/h/{index:05}:/g{index:05}:ro\",\n"));
+        }
+        body.push_str("]\n");
+        // 40 tools each selecting the same set: 2,000 + 40*2,000 admissions, so
+        // the file is refused long before it finishes.
+        for index in 0..40 {
+            body.push_str(&format!(
+                "[[tools]]\nname = \"t{index:02}\"\ncommand = \"t\"\nmounts = [\"big\"]\n"
+            ));
+        }
+        assert!(
+            body.len() < 1 << 20,
+            "the fixture stays inside the file bound"
+        );
+        assert_eq!(
+            rendered(parse_document(&body)),
+            "mounts: expansion work exceeds limit of 65536 leaf visits across mount sets and \
+             tool mounts"
+        );
+        // The refusal is at the shared cap, not a per-list one: one tool alone is
+        // comfortably inside it.
+        let mut one = String::from("[mount_sets]\nbig = [\n");
+        for index in 0..LEAVES {
+            one.push_str(&format!("\"/h/{index:05}:/g{index:05}:ro\",\n"));
+        }
+        one.push_str("]\n[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = [\"big\"]\n");
+        assert!(parse_document(&one).is_ok());
+    }
+
+    /// Wide empty-child fan-out **inside tool lists** stays linear: one tracker for
+    /// every list in the file, so a tool-scoped map costs no per-list allocation and
+    /// no O(number-of-sets) reset.
+    #[test]
+    fn empty_set_fanout_across_tool_lists_uses_indexed_tracking() {
+        const CHILDREN: usize = 5_000;
+        let mut body = String::from("[mount_sets]\n");
+        for index in 0..CHILDREN {
+            body.push_str(&format!("c{index:05} = []\n"));
+        }
+        let references = |count: usize| {
+            (0..count)
+                .map(|index| format!("\"c{index:05}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        body.push_str(&format!("parent = [{}]\n", references(CHILDREN)));
+        // Two tool lists each naming the parent once: the parent's closure is
+        // empty, so no leaf visit is spent — the count is pure reference work.
+        body.push_str(
+            "[[tools]]\nname = \"a\"\ncommand = \"a\"\nmounts = [\"parent\"]\n\
+             [[tools]]\nname = \"b\"\ncommand = \"b\"\nmounts = [\"parent\"]\n",
+        );
+        let mounts = parse_document(&body).expect("the fan-out is valid");
+        // parent's own compile (CHILDREN) + one admission per tool list = +2.
+        assert_eq!(
+            mounts.reference_admissions(),
+            CHILDREN + 2,
+            "every traversal must reach the one indexed tracker"
+        );
+        assert_eq!(mounts.expansion_work(), 0, "empty children spend no leaf");
+        let mut mounts = mounts;
+        let lists = mounts.take_tool_lists();
+        assert!(lists.get(0).is_empty());
+        assert!(lists.get(1).is_empty());
+    }
+
+    /// The indexed tool-closure merge agrees with the existing `claim` over tool
+    /// lists: success, refusal, order and first-kept origin.
+    ///
+    /// A list that a single tool declares is validated at load, so it can only be
+    /// internally valid here; a genuine cross-list conflict needs two tools, which
+    /// is exactly the case the closure fold exists for.
+    #[test]
+    fn tool_mount_indexed_merge_matches_common_claim() {
+        let valid: [&[&str]; 5] = [
+            &["/a:/g"],
+            &["/a:/g", "/a:/g"],
+            &["/a:/g//./x:ro", "/a:/g/x:ro"],
+            &["~/a:/g:ro", "/home/graph/a:/g:ro"],
+            &["/a:/a", "/b:/b", "/c:/c:fork"],
+        ];
+        for list in valid {
+            let entries = list
+                .iter()
+                .map(|entry| format!("\"{entry}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let body = format!("[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = [{entries}]\n");
+            let mut mounts = parse_document(&body).expect("the tool list parses alone");
+            let tool = mounts.take_tool_lists().get(0);
+            let mut work = mounts.continuing_work();
+            let kept: Vec<MountRequest> = merge_tool_mounts([&tool], &mut work)
+                .expect("a valid list folds")
+                .requests()
+                .cloned()
+                .collect();
+            let claimed = ordinary_claim(list).expect("the same list claims");
+            assert_eq!(describe(&kept), describe(&claimed), "{list:?}");
+            assert_eq!(first_kept(&kept), first_kept(&claimed), "{list:?}");
+        }
+
+        // Cross-list conflicts: each declaration is valid in its own list, so only
+        // the launch that selects both can be refused — and both routes must agree
+        // on the decision and on which pair it was.
+        for (first, second) in [
+            ("/a:/g:ro", "/a:/g:rw"),
+            ("/a:/g:fork", "/a:/g"),
+            ("/a:/g:fork:exclude=x", "/a:/g:fork"),
+            ("/a:/g:ro", "/b:/g:ro"),
+        ] {
+            let body = format!(
+                "[[tools]]\nname = \"a\"\ncommand = \"a\"\nmounts = [\"{first}\"]\n\
+                 [[tools]]\nname = \"b\"\ncommand = \"b\"\nmounts = [\"{second}\"]\n"
+            );
+            let mut mounts = parse_document(&body).expect("each list parses alone");
+            let lists = mounts.take_tool_lists();
+            let mut work = mounts.continuing_work();
+            let folded = merge_tool_mounts([&lists.get(0), &lists.get(1)], &mut work);
+            let claimed = ordinary_claim(&[first, second]);
+            match (folded, claimed) {
+                (Ok(folded), Ok(claimed)) => {
+                    let kept: Vec<MountRequest> = folded.requests().cloned().collect();
+                    assert_eq!(describe(&kept), describe(&claimed), "{first} {second}");
+                }
+                (Err(folded), Err(_)) => {
+                    assert_eq!(
+                        index_refusal(&folded),
+                        Refusal::Conflict { second: 0 },
+                        "{first} {second}: the second list's first entry is refused"
+                    );
+                }
+                (folded, claimed) => panic!(
+                    "{first} {second}: fold {} but claim {}",
+                    folded.is_ok(),
+                    claimed.is_ok()
+                ),
+            }
+        }
     }
 
     /// An unknown name is never a directory, a tool or a relative path: a name

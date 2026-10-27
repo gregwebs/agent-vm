@@ -13,7 +13,10 @@
 //! being decided is whether the *file* is the user's own, so a caller that reads
 //! contents to decide would skip the check on exactly the cheapest file to
 //! plant. A file that declares `mount_sets` without `mounts` is therefore just as
-//! authority-bearing as one that declares `mounts`.
+//! authority-bearing as one that declares `mounts`, and so is one whose only
+//! mount list sits inside a full `[[tools]]` definition (#396):
+//! [`mount_authority_present`] is where those two mount sites are aggregated, so
+//! the rule stays "any mount list" rather than "the defaults list".
 //!
 //! The rules live in one place. [`verify`] is the only producer of
 //! [`AuthorizedConfig`] and every authority-bearing parser takes that token as
@@ -81,13 +84,37 @@ use crate::host_paths::{FinalComponent, VerifiedRead};
 use std::{fmt, os::unix::fs::MetadataExt, path::Path};
 
 verus! {
+/// The two places one user file can declare a mount selection: the top-level
+/// `mounts` array and any full `[[tools]]` definition's `mounts` field.
+///
+/// Named fields rather than adjacent booleans, so a call site cannot swap them
+/// — they are both "this file selects mounts" and a transposition would decide
+/// which one the diagnostic points at.
+#[derive(Clone, Copy, Debug)]
+pub struct MountAuthorityFacts { pub top_level: bool, pub tool_field: bool }
+
+/// #396: **any** mount list makes the file authority-bearing, wherever it is
+/// declared. Presence, not contents, stays the rule — an empty tool list and an
+/// empty top-level list are exactly the bytes an attacker would plant, so this
+/// is one OR, never a nonempty test.
+///
+/// This only widens *which* files are measured; [`authority_required`] keeps its
+/// three-trigger contract and [`AuthoritySubject`] keeps its wording, so a file
+/// whose only old authority field is `[network]` prints the same bytes as before.
+pub fn mount_authority_present(f: MountAuthorityFacts) -> (r: bool)
+    ensures r == (f.top_level || f.tool_field),
+{
+    if f.top_level { true } else { f.tool_field }
+}
+
 /// Which authority-bearing fields one user file declares. Named facts rather
 /// than adjacent booleans, so a call site cannot swap them.
 #[derive(Clone, Copy, Debug)]
 pub struct AuthorityTriggers { pub network: bool, pub mounts: bool, pub mount_sets: bool }
 
 /// ADR-0040/0046/0048: presence, not contents, makes a user file
-/// authority-bearing.
+/// authority-bearing. `t.mounts` is already the aggregate of the top-level
+/// `mounts` array and every tool's `mounts` field ([`mount_authority_present`]).
 pub fn authority_required(t: AuthorityTriggers) -> (r: bool)
     ensures r == (t.network || t.mounts || t.mount_sets),
 {
@@ -643,6 +670,35 @@ mod tests {
                         "network={network} mounts={mounts} mount_sets={mount_sets}"
                     );
                 }
+            }
+        }
+    }
+
+    /// The mount half of the presence rule, against an independent table.
+    ///
+    /// Four rows, and the oracle is an explicit `match` rather than the
+    /// disjunction the contract uses, so a body computing something else is
+    /// caught here as well as by the proof. `tool_field` alone is the row #396
+    /// added: a file whose only mount list is inside a full `[[tools]]`
+    /// definition is authority-bearing exactly like a defaults-only file.
+    #[test]
+    fn mount_authority_present_matches_four_rows() {
+        for top_level in [false, true] {
+            for tool_field in [false, true] {
+                let expected = match (top_level, tool_field) {
+                    (false, false) => false,
+                    (false, true) => true,
+                    (true, false) => true,
+                    (true, true) => true,
+                };
+                assert_eq!(
+                    mount_authority_present(MountAuthorityFacts {
+                        top_level,
+                        tool_field
+                    }),
+                    expected,
+                    "top_level={top_level} tool_field={tool_field}"
+                );
             }
         }
     }

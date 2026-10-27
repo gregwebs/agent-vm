@@ -1070,9 +1070,10 @@ recent `[table]` header, so write it **before the first one**:
 |---|---|
 | `mounts = ["~/ref:ro"]` before any header | top-level; verified and selected |
 | `[network]` then `mounts = [...]` | a network setting: refused with `[network]: mounts is not a network setting; a top-level mounts list must be written before the first table header` |
-| `[[tools]]` … then `mounts = [...]` | a tool field: the fixed schema-repair paragraph, with the line and column and the same "write it before the first table header" sentence |
+| `[[tools]]` … then `mounts = [...]` | that full tool's **own** mount list (a supported construct, not a scoping mistake); a project or built-in tool declaring one is refused |
 | `[mounts]` (table form) | top-level and present, so verified, then `mounts: must be an array of strings` |
 | `[tools.env]` with `mounts = "~/private:ro"` | a legitimate **environment variable** named `mounts`; no mount is selected and no authority is asked for |
+| `[[tools]]` with `mounts = 7` | a wrong type, still authority-bearing first, then `tools[0].mounts: must be an array of strings` |
 | `[mount_sets]` then `mounts = [...]` | a **set named `mounts`** with one declaration, not the defaults list: `mounts` is a valid set name and is not reserved. Only the position decides |
 | `[mount_sets.foo]` (nested table) | refused: a set's value must be an array of declarations or set names |
 | `mount_sets = []` or any non-table | `mount_sets: must be a table of named arrays of mount declarations` |
@@ -1090,13 +1091,14 @@ empty: there is nothing to report.
 
 > **Added in 0.7.4.** ADR-0046 records why the file-trust rule, the merge rule
 > and the preflight order are what they are. Named mount sets arrived in 0.7.13
-> (below); per-tool mount fields are still deliberately deferred.
+> (below); tool-specific mount lists arrived in 0.7.15
+> ([below](#tool-specific-config-mounts)).
 
 ### Named mount sets (user config)
 
 A **mount set** is a named list of mount declarations in the same user config.
-Declaring one mounts nothing — only the defaults list or an explicit `--mount`
-selects it — and a set may name other sets:
+Declaring one mounts nothing — only the defaults list, a tool's own `mounts`
+list, or an explicit `--mount` selects it — and a set may name other sets:
 
 ```toml
 # at the top of the file, before any [table] header
@@ -1150,12 +1152,19 @@ well; two separately valid sets may still disagree at one guest path, and that
 fails only when a launch selects both. `tools` reference cycles stay legal — they
 are a different graph reaching a fixed point.
 
-The closure walk is bounded so a crafted file cannot hang config load: it spends
-at most **65,536 leaf visits** across every declared set's closure. Past that the
-load fails with `mount_sets: expansion work exceeds limit of 65536 leaf visits`,
-under `--no-config-mounts` and in `doctor` too. Hundreds of ordinary small sets
-are far below it; the fix for the message is to compose fewer sets per closure,
-not to opt out, because load validation runs regardless.
+The expansion is bounded so a crafted file cannot hang config load: **65,536
+leaf visits** is one shared count for the whole load and catalog build, never a
+per-set allowance — it covers every declared set's closure and then every tool's
+own list plus the tool-closure fold, with no reset per set, per list or per
+launch. The top-level defaults add no charge of their own: the closures they
+name were already counted when those closures were compiled. Past the budget the
+refusal says which path spent it: a set path fails with `mount_sets: expansion
+work exceeds limit of 65536 leaf visits`, a tool path with `mounts: expansion
+work exceeds limit of 65536 leaf visits across mount sets and tool mounts`. Both
+reach you under `--no-config-mounts` and in `doctor` too. Hundreds of ordinary
+small sets are far below it; the fix for the message is to compose fewer sets
+and shorter tool lists per launch, not to opt out, because load validation runs
+regardless.
 
 **Declarations are inert; selection is what mounts.** A `[mount_sets]` table (an
 empty one included) and an empty set select nothing, and a sets-only file prints
@@ -1193,8 +1202,174 @@ tiers: a project cannot declare sets and cannot select a user name.
 
 > **Added in 0.7.13.** ADR-0048 is the accepted design for named sets,
 > [ADR-0046](docs/adr/0046-verified-user-config-mounts.md) the verified-file rule
-> they inherit. Tool-level `mounts` and tier-local tool mount inheritance remain
-> unimplemented.
+> they inherit. Tool-level `mounts` and tier-local tool mount inheritance arrived
+> in 0.7.15 — see [Tool-specific config mounts](#tool-specific-config-mounts).
+
+### Tool-specific config mounts
+
+A **full** user `[[tools]]` definition may declare `mounts`. That list is a
+*selection source* for a launch of **that tool**, and for the launch of every tool
+that transitively **references** it through `tools`: launching `pi`, which
+references `claude`, selects Pi's own list *and* Claude's. The direction decides
+which launches gain access — launching Claude does not select Pi's list. The
+result is a fourth facet of the same closure that already supplies providers,
+credential requests and persisted paths.
+
+```text
+defaults ──┐
+           ├─ one ordered union ─ mount::prepare ─ guest
+own list ──┤   (the tool facet: the launched tool's own declaration plus every
+referenced │    referenced definition's, folded together in file order)
+lists ─────┘
+explicit --mount
+```
+
+- **Nothing overrides anything.** Declarations are unioned in that order:
+  defaults, then the tool facet, then `--mount` in argv order. The tool facet is
+  one merged list, not a precedence: the launched tool's own declaration and
+  each referenced definition's declaration join in the order they appear in the
+  file, so a referenced definition declared earlier is folded in earlier. Two
+  different declarations at one guest path are refused, naming both sites.
+- **User config only.** A project or built-in tool that declares `mounts` — even
+  `mounts = []` — is a load error. A project tool cannot reach a user mount by
+  naming a user tool, by `*`, or transitively.
+- **Presence grants nothing by itself.** Declaring a list is not access; a launch
+  must select it. But presence *is* what makes the file authority-bearing, so
+  `mounts = []` still requires `config.toml` to be your own regular file.
+- **Sources must exist when selected.** Load never stats a declaration, so an
+  unused tool's missing path cannot block a launch; selecting it fails that
+  launch, naming `tools[N].mounts[I] in "<file>"`, unless an initialized `:fork`
+  copy is reusable.
+- **Full definitions only.** A `mounts` field never patches a shipped tool: with
+  no `command` the entry is the usual schema error, and declaring any tool
+  replaces the shipped catalog whole.
+- **`--no-config-mounts` removes every automatic input** — the defaults *and* the
+  launched tool's own and inherited lists — while `--mount`, providers,
+  credential requests, persistence and every config check keep working.
+- **One selector.** A tool list accepts exactly what the defaults list accepts:
+  `HOST[:GUEST][:MODE]…` and bare mount-set names.
+
+#### `tools` now inherits mounts, including the shell
+
+> ⚠️ **A declared `shell` whose `tools` is omitted keeps its existing wildcard
+> over every tool in the same file — which now includes those tools' mounts.**
+> That means `agent-vm shell` in a project can expose the host paths and the Pi
+> fork your agent tools select. This is deliberate: it revises the original
+> request to exclude ordinary shells, and the wildcard default is unchanged.
+> `tools = []` stops the *inheritance* (and the provider/persistence
+> inheritance) but keeps the shell's own `mounts` and the user-wide defaults. The
+> built-in `shell` fallback used when a custom catalog declares no `shell` has a
+> scope of its own and inherits nothing, though it still receives user-wide
+> defaults.
+
+#### Complete copyable catalog
+
+The block below is a **full replacement** catalog: it keeps every shipped tool,
+command, argv, credential, environment, persistence and shell setting, and adds
+one `[mount_sets]` entry plus the per-tool selections. Create the referenced
+paths (`~/.agents`, `~/.config/github-app`, `~/.pi`) or delete the leaves you do
+not want — do **not** copy real secrets into a fixture to make an example
+launch. A read-only mount of a credential directory is *disclosure* to the
+guest: selecting `agent` is neither credential shielding nor credential
+provisioning, and Pi's own `agent/auth.json` and `agent/models.json` are always
+omitted from a `~/.pi:fork`.
+
+<!-- tool-mount-catalog -->
+```toml
+# ~/.config/agent-vm/config.toml — full replacement tool catalog.
+# Optional every-launch defaults go here, BEFORE any header:
+# mounts = ["~/reference:ro"]
+
+[mount_sets]
+agent = ["~/.agents", "~/.agents/skills:ro", "~/.config/github-app:ro"]
+
+[[tools]]
+name = "dsh"
+command = "dsh"
+args = ["web"]
+persist = [".dsh"]
+mounts = ["agent"]
+
+[[tools]]
+name = "pi"
+network_requests = ["api.anthropic.com", "auth.openai.com", "chatgpt.com", "mcp-proxy.anthropic.com", "platform.claude.com"]
+command = "pi"
+args = []
+tools = ["claude", "codex"]
+persist = []
+mounts = ["agent", "~/.pi:fork"]
+
+[[tools]]
+name = "codex"
+network_requests = ["api.openai.com", "auth.openai.com", "chatgpt.com"]
+command = "codex"
+args = []
+credentials = ["openai"]
+persist = []
+env = { CODEX_HOME = "/agent-vm-state/codex" }
+mounts = ["agent"]
+
+[[tools]]
+name = "opencode"
+network_requests = ["api.openai.com", "auth.openai.com", "chatgpt.com", "models.opencode.ai"]
+command = "opencode"
+args = []
+credentials = ["openai", "opencode-static"]
+persist = []
+mounts = ["agent"]
+
+[[tools]]
+name = "claude"
+network_requests = ["api.anthropic.com", "mcp-proxy.anthropic.com", "platform.claude.com"]
+command = "claude"
+args = ["--dangerously-skip-permissions"]
+credentials = ["anthropic"]
+persist = []
+mounts = ["agent"]
+
+[[tools]]
+name = "copilot"
+command = "copilot"
+args = ["--allow-all-tools"]
+credentials = ["copilot"]
+persist = []
+mounts = ["agent"]
+
+[[tools]]
+name = "shell"
+command = "bash"
+args = ["-O", "histappend"]
+persist = []
+interactive_shell = true
+env = { CODEX_HOME = "/agent-vm-state/codex" }
+# tools omitted deliberately: wildcard, including agent mounts + the Pi fork.
+```
+<!-- /tool-mount-catalog -->
+
+Copyable launches against that file:
+
+```bash
+agent-vm pi                      # agent set + Pi fork + both tools' lists
+agent-vm claude                  # agent set only
+agent-vm shell                   # the wildcard, so all of the above too
+agent-vm --no-config-mounts pi   # nothing automatic; Pi still gets its own tools' facts
+agent-vm --no-config-mounts --mount agent pi   # only the explicit set
+```
+
+To stop the shell exposing them, add one field to the **full** shell definition
+above (the other six definitions stay exactly as they are — this is not a patch
+you can append on its own):
+
+```toml
+[[tools]]
+name = "shell"
+command = "bash"
+args = ["-O", "histappend"]
+persist = []
+interactive_shell = true
+env = { CODEX_HOME = "/agent-vm-state/codex" }
+tools = []
+```
 
 ### agent-vm's config directory is never writable from the guest
 

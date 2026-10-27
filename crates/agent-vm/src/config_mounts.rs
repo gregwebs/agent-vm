@@ -12,12 +12,16 @@
 //!
 //! Four rules shape everything here:
 //!
-//! * **Presence, not contents.** `mounts = []` and `[mount_sets]` (even an empty
-//!   table, even an empty set) still make the file authority-bearing; that is
-//!   `config_authority`'s trigger, decided before this module runs. An empty list
-//!   or table simply selects nothing.
+//! * **Presence, not contents.** `mounts = []`, a full `[[tools]]`'s
+//!   `mounts = []` and `[mount_sets]` (even an empty table, even an empty set)
+//!   still make the file authority-bearing; that is `config_authority`'s
+//!   trigger, decided before this module runs. An empty list or table simply
+//!   selects nothing.
 //! * **Declarations are inert.** A definition mounts nothing. Only the defaults
-//!   list, or an explicit `--mount NAME`, selects filesystem access.
+//!   list, a *selected* tool's own list (plus the lists its transitive
+//!   same-file `tools` closure declares) and an explicit `--mount NAME` select
+//!   filesystem access. A tool list is therefore a selection source only for a
+//!   launch of that tool; a `[mount_sets]` definition is never one.
 //! * **The whole graph is validated at load.** Every declared set's transitive
 //!   closure is resolved and checked — unknown names, set-reference cycles and a
 //!   closure that claims one guest path twice with differing declarations are
@@ -36,10 +40,13 @@
 //! value: a `mounts` entry or `mount_sets` key can carry attacker-chosen text,
 //! and the sentence is printed to a user deciding whether to trust the file.
 //! Set-entry sites are `mount_sets[DEFINITION][INDEX]` with both numbers, so even
-//! an invalid *key* is named without echoing it. A *launch-time* refusal is a
+//! an invalid *key* is named without echoing it, and a tool list is
+//! `tools[DECLARATION].mounts[INDEX]` — never the tool's name, which is not yet
+//! validated when presence is decided. A *launch-time* refusal is a
 //! different question — it has to name the host or guest path it could not
 //! prepare, or the user cannot fix it — so those sentences name the declaration
-//! as `mounts[N] in "<file>"` or `mount_sets["NAME"][I] in "<file>"` and render
+//! as `mounts[N] in "<file>"`, `tools[N].mounts[I] in "<file>"` or
+//! `mount_sets["NAME"][I] in "<file>"` and render
 //! the **declared host spelling** with `config`'s escaping
 //! (`quoted_str`/`quoted_path`), never raw. That is what keeps a refusal, a fork
 //! notice or an error context to one line when a spelling carries a newline: the
@@ -51,13 +58,18 @@
 
 mod sets;
 
-pub(crate) use sets::UserMounts;
+#[cfg(test)]
+pub(crate) use sets::MAX_MOUNT_SET_EXPANSION_WORK;
+pub(crate) use sets::{MountExpansionWork, UserMounts, merge_tool_mounts};
 
 use crate::{
     config_authority::AuthorizedConfig,
-    mount::{ExtraMount, HostSyntax, MountSpecError, MountSpecErrorKind, parse_mount_spec},
+    mount::{
+        ExtraMount, HostSyntax, MountRequest, MountSpecError, MountSpecErrorKind, parse_mount_spec,
+        same_declaration,
+    },
 };
-use std::{fmt, path::Path};
+use std::{fmt, path::Path, sync::Arc};
 use vstd::prelude::*;
 
 verus! {
@@ -179,14 +191,15 @@ impl fmt::Display for InvalidMountSetName {
     }
 }
 
-/// Where one defaults entry or one set entry sits in the file.
+/// Where one entry sits in the file.
 ///
-/// Two variants, not an index plus a flag, so a defaults site can never print a
-/// set's coordinates. Load-time sites are numeric on purpose: a `mount_sets` key
-/// is attacker-chosen text, so an invalid key is named by its sorted position and
-/// a valid one by the same number rather than by its own bytes. A *launch-time*
-/// refusal renders [`crate::mount::MountOrigin::UserSet`] instead, where the name
-/// is escaped.
+/// Three variants, not an index plus a flag, so a defaults site can never print a
+/// set's coordinates or a tool's. Load-time sites are numeric on purpose: a
+/// `mount_sets` key is attacker-chosen text, so an invalid key is named by its
+/// sorted position and a valid one by the same number rather than by its own
+/// bytes, and a tool's own name is not yet validated when presence decided
+/// authority. A *launch-time* refusal renders the equivalent [`crate::mount::MountOrigin`]
+/// instead, where the set name is escaped.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum EntrySite {
     /// Entry `index` of the top-level `mounts` array.
@@ -194,6 +207,10 @@ pub(crate) enum EntrySite {
     /// Entry `index` of the `definition`th `[mount_sets]` definition, ordered by
     /// name so the number does not depend on TOML's key order.
     SetEntry { definition: usize, index: usize },
+    /// Entry `index` of declaration `declaration`'s own `mounts` list. The tool
+    /// name is deliberately absent: this site is built before `validate_tools`
+    /// runs, and a numeric file/field pointer cannot echo a malicious name.
+    ToolEntry { declaration: usize, index: usize },
 }
 
 impl fmt::Display for EntrySite {
@@ -203,19 +220,158 @@ impl fmt::Display for EntrySite {
             Self::SetEntry { definition, index } => {
                 write!(f, "mount_sets[{definition}][{index}]")
             }
+            Self::ToolEntry { declaration, index } => {
+                write!(f, "tools[{declaration}].mounts[{index}]")
+            }
         }
     }
 }
 
-/// The set table and the defaults list from one already-verified read.
+/// One declaration once it is bound to the site that declared it.
 ///
-/// A named bundle rather than two positional arguments: both are untyped
+/// A shared handle, not a copied payload: a tool list may select a large set, and
+/// many catalog entries may inherit the same leaves, so every cached list, every
+/// entry's facet and every clone of the model share these allocations rather than
+/// multiplying the request bytes by their occurrence count. The site travels with
+/// the request so a conflict can name both declarations without a parallel
+/// provenance cache.
+#[derive(Debug)]
+pub(crate) struct ConfigMountLeaf {
+    pub(crate) request: MountRequest,
+    pub(crate) site: EntrySite,
+}
+
+/// An ordered, deduplicated list of declarations: one selected list, or the
+/// union folded over one launch's tool closure.
+///
+/// Cloning is an `Arc` bump, which is what makes a defaults list, a set closure,
+/// a tool list and a catalog facet safe to hand to four consumers. Semantic
+/// equality ([`Self::same_declarations`]) compares the six declaration fields in
+/// order and deliberately ignores the origin, exactly as [`same_declaration`]
+/// does — origin is diagnostics, never identity.
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedMountList(Arc<[Arc<ConfigMountLeaf>]>);
+
+impl ResolvedMountList {
+    pub(crate) fn empty() -> Self {
+        Self(Arc::from(Vec::new()))
+    }
+
+    pub(super) fn from_leaves(leaves: Vec<Arc<ConfigMountLeaf>>) -> Self {
+        Self(Arc::from(leaves))
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// The declarations in selection order, borrowed. A caller that needs owned
+    /// values (a launch handing them to `prepare`) clones at that boundary, once
+    /// per launch, never per cache occurrence.
+    pub(crate) fn requests(&self) -> impl ExactSizeIterator<Item = &MountRequest> + '_ {
+        self.0.iter().map(|leaf| &leaf.request)
+    }
+
+    pub(super) fn leaves(&self) -> &[Arc<ConfigMountLeaf>] {
+        &self.0
+    }
+
+    /// The shared leaf handles themselves, for the storage-shape tests that assert
+    /// payloads are shared rather than copied per cache occurrence.
+    #[cfg(test)]
+    pub(crate) fn shared_leaves_for_test(&self) -> &[Arc<ConfigMountLeaf>] {
+        &self.0
+    }
+
+    /// Declaration-list equality: same length, same six fields per position.
+    /// Provenance and the declaring site are excluded, so moving a declaration
+    /// between defaults, a set and a tool list does not make two tools' mount
+    /// facets differ.
+    pub(crate) fn same_declarations(&self, other: &ResolvedMountList) -> bool {
+        self.0.len() == other.0.len()
+            && self
+                .0
+                .iter()
+                .zip(other.0.iter())
+                .all(|(a, b)| same_declaration(&a.request.mount, &b.request.mount))
+    }
+}
+
+impl Default for ResolvedMountList {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+// Semantic equality, so a `Tool` and a `CatalogEntry` can derive it without
+// exposing the shared handle's address — the same rule as `same_declaration`.
+impl PartialEq for ResolvedMountList {
+    fn eq(&self, other: &Self) -> bool {
+        self.same_declarations(other)
+    }
+}
+
+impl Eq for ResolvedMountList {}
+
+/// Every full `[[tools]]` definition's own mount list, indexed by declaration
+/// position.
+///
+/// Taken out of [`UserMounts`] once, so the CLI's namespace clone does not retain
+/// a second declaration map, and so a project or built-in tier can be handed the
+/// empty map *after* its own refusal — a tier that cannot declare mounts cannot
+/// accidentally be given any.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ToolMountLists {
+    /// Sparse on purpose: only definitions that declare `mounts` appear, so a
+    /// tier handed the empty map and a file with a thousand mount-free tools cost
+    /// nothing.
+    lists: std::collections::BTreeMap<usize, ResolvedMountList>,
+}
+
+impl ToolMountLists {
+    /// The map a tier that may not carry tool mounts gets.
+    pub(crate) fn empty() -> Self {
+        Self::default()
+    }
+
+    pub(super) fn set(&mut self, declaration: usize, list: ResolvedMountList) {
+        self.lists.insert(declaration, list);
+    }
+
+    /// Declaration `declaration`'s own list; empty for an absent or out-of-range
+    /// position, so a tier with no tool mounts answers every lookup without a
+    /// second code path.
+    pub(crate) fn get(&self, declaration: usize) -> ResolvedMountList {
+        self.lists.get(&declaration).cloned().unwrap_or_default()
+    }
+}
+
+/// One full `[[tools]]` definition's raw `mounts` value and where it sits.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ToolMountValue<'a> {
+    pub(crate) declaration: usize,
+    pub(crate) value: &'a toml::Value,
+}
+
+/// The set table, the defaults list and every tool's own list from one
+/// already-verified read.
+///
+/// A named bundle rather than positional arguments: all three are untyped
 /// `toml::Value`s at this seam (presence has already decided authority, and the
 /// shape is decided here), so the callee cannot tell them apart by type.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MountValues<'a> {
     pub(crate) defaults: Option<&'a toml::Value>,
     pub(crate) sets: Option<&'a toml::Value>,
+    /// Every tool with a `mounts` field, in declaration order. Empty when no
+    /// tool declares one, which is also what a project or built-in tier passes
+    /// after its refusal.
+    pub(crate) tools: &'a [ToolMountValue<'a>],
 }
 
 /// One entry of a defaults list or a set definition, once its name is bound.
@@ -338,13 +494,19 @@ fn parse_direct(text: &str, syntax: HostSyntax<'_>) -> Result<MountSelector, Sel
         .map_err(SelectorError::Direct)
 }
 
-/// Parse both present mount fields of a file that has already been verified.
+/// Parse every present mount field of a file that has already been verified: the
+/// `[mount_sets]` namespace, the top-level defaults list and each full
+/// `[[tools]]` definition's own list.
 ///
 /// `home` is the `$HOME` the user path was discovered from
 /// ([`crate::config::ConfigPaths::home`]), never a fresh environment read: a
 /// launch must expand `~/` to the same directory whose `config.toml` it read.
 /// It is `None` when the host has no UTF-8 home, which only a `~/` entry cares
 /// about.
+///
+/// A tool list alone is enough to call this: the caller must not gate the call on
+/// the top-level fields, or a file whose only authority is a tool's `mounts`
+/// would reach `validate_tools` without ever being parsed here.
 pub(crate) fn from_verified_value(
     authorized: &AuthorizedConfig<'_>,
     values: MountValues<'_>,
@@ -385,6 +547,12 @@ pub(crate) enum UserMountsError {
     NotArray,
     /// One `mounts` entry was not a string.
     NotString { index: usize },
+    /// Declaration `declaration`'s own `mounts` field was not an array. A
+    /// separate variant rather than a site-carrying `NotArray` so every existing
+    /// top-level sentence keeps its bytes.
+    ToolListNotArray { declaration: usize },
+    /// One entry of declaration `declaration`'s own list was not a string.
+    ToolListNotString { declaration: usize, index: usize },
     /// One entry failed the shared `HOST[:GUEST][:MODE]...` grammar.
     Entry {
         site: EntrySite,
@@ -415,6 +583,11 @@ pub(crate) enum UserMountsError {
     /// The admitted leaf-visit budget for validating every declared closure is
     /// exhausted. A value-free resource refusal, not a conflict or source error.
     ExpansionWorkLimit,
+    /// The same shared budget, exhausted while admitting a tool list or folding a
+    /// launch's tool closure. Its own sentence because the stages differ: a set
+    /// stage refusal can only be fixed by shrinking set declarations, while this
+    /// one may be a tool list repeatedly selecting an already-compiled set.
+    ToolExpansionWorkLimit,
     /// Unreachable: a dependency's closure was not compiled before its
     /// dependent's. Refused rather than skipped, so a wrong traversal order can
     /// never silently drop a set from validation.
@@ -445,6 +618,13 @@ impl fmt::Display for UserMountsError {
         match self {
             Self::NotArray => f.write_str("mounts: must be an array of strings"),
             Self::NotString { index } => write!(f, "mounts[{index}]: must be a string"),
+            Self::ToolListNotArray { declaration } => write!(
+                f,
+                "tools[{declaration}].mounts: must be an array of strings"
+            ),
+            Self::ToolListNotString { declaration, index } => {
+                write!(f, "tools[{declaration}].mounts[{index}]: must be a string")
+            }
             Self::Entry { site, kind } => write!(f, "{site}: {kind}"),
             Self::GuestNotMountable { site } => write!(
                 f,
@@ -484,6 +664,12 @@ impl fmt::Display for UserMountsError {
             Self::ExpansionWorkLimit => write!(
                 f,
                 "mount_sets: expansion work exceeds limit of {} leaf visits",
+                sets::MAX_MOUNT_SET_EXPANSION_WORK
+            ),
+            Self::ToolExpansionWorkLimit => write!(
+                f,
+                "mounts: expansion work exceeds limit of {} leaf visits across mount sets and \
+                 tool mounts",
                 sets::MAX_MOUNT_SET_EXPANSION_WORK
             ),
             Self::ReferenceOrder => {
@@ -550,6 +736,7 @@ mod tests {
                 MountValues {
                     defaults: Some(&value(text)),
                     sets: None,
+                    tools: &[],
                 },
                 home,
             )
@@ -557,19 +744,26 @@ mod tests {
     }
 
     fn sources(mounts: &UserMounts) -> Vec<Spelling> {
-        mounts
-            .requests()
-            .iter()
+        defaults_requests(mounts)
+            .into_iter()
             .map(|request| request.mount.source_spelling.clone())
             .collect()
     }
 
     fn guests(mounts: &UserMounts) -> Vec<String> {
-        mounts
-            .requests()
-            .iter()
+        defaults_requests(mounts)
+            .into_iter()
             .map(|request| request.mount.guest.display().to_string())
             .collect()
+    }
+
+    /// The defaults list's declarations, or nothing. A test fixture helper: a
+    /// launch also carries the tool facet, so production reads `defaults()`.
+    fn defaults_requests(mounts: &UserMounts) -> Vec<&MountRequest> {
+        mounts
+            .defaults()
+            .map(|list| list.requests().collect())
+            .unwrap_or_default()
     }
 
     fn rendered(result: Result<UserMounts, UserMountsError>) -> String {
@@ -694,11 +888,11 @@ mod tests {
         let mounts = parse(r#"["/abs:/g//./x:ro"]"#, None).unwrap();
         assert_eq!(guests(&mounts), ["/g/x"]);
         assert!(matches!(
-            mounts.requests()[0].mount.policy,
+            defaults_requests(&mounts)[0].mount.policy,
             MountPolicy::BindReadOnly { .. }
         ));
         assert!(matches!(
-            parse(r#"["/abs:/g:rw"]"#, None).unwrap().requests()[0]
+            defaults_requests(&parse(r#"["/abs:/g:rw"]"#, None).unwrap())[0]
                 .mount
                 .policy,
             MountPolicy::BindReadWrite
@@ -796,6 +990,172 @@ mod tests {
         );
     }
 
+    /// The same declarations, whether they sit in a tool's own list or the
+    /// defaults list, produce the same parsed mount: one selector, one `~/` rule,
+    /// one normalization. A second parser would show up as a differing
+    /// `ExtraMount`.
+    #[test]
+    fn tool_lists_share_selector_grammar_and_home_spelling() {
+        let home = Some(Path::new("/h"));
+        let tool_value = |text: &str| -> toml::Value {
+            format!("mounts = {text}\n")
+                .parse::<toml::Table>()
+                .unwrap()
+                .remove("mounts")
+                .unwrap()
+        };
+        for text in [
+            r#"["/abs/ref"]"#,
+            r#"["/abs/ref:/g:ro"]"#,
+            r#"["/abs/ref:/g/fork:fork"]"#,
+            r#"["~/ref"]"#,
+            r#"["~/ref/:/g//./x:rw"]"#,
+            r#"["  ~/ref  "]"#,
+        ] {
+            let value = tool_value(text);
+            with_authorized(|authorized, _| {
+                let defaults = from_verified_value(
+                    authorized,
+                    MountValues {
+                        defaults: Some(&value),
+                        sets: None,
+                        tools: &[],
+                    },
+                    home,
+                )
+                .expect("the defaults list parses");
+                let tools = [ToolMountValue {
+                    declaration: 0,
+                    value: &value,
+                }];
+                let mut tool_only = from_verified_value(
+                    authorized,
+                    MountValues {
+                        defaults: None,
+                        sets: None,
+                        tools: &tools,
+                    },
+                    home,
+                )
+                .expect("the tool list parses");
+                let from_tool = tool_only.take_tool_lists().get(0);
+                let from_defaults = defaults.defaults().expect("the defaults list");
+                assert_eq!(from_tool.len(), from_defaults.len(), "{text}");
+                for (tool, default) in from_tool.requests().zip(from_defaults.requests()) {
+                    assert!(
+                        same_declaration(&tool.mount, &default.mount),
+                        "{text}: the two sites must parse identically"
+                    );
+                }
+            });
+        }
+        // A name with a `:` is refused identically from either site; only the
+        // site's coordinates differ.
+        let value = tool_value(r#"["agent:ro"]"#);
+        with_authorized(|authorized, _| {
+            assert_eq!(
+                from_verified_value(
+                    authorized,
+                    MountValues {
+                        defaults: Some(&value),
+                        sets: None,
+                        tools: &[],
+                    },
+                    home,
+                )
+                .unwrap_err()
+                .to_string(),
+                "mounts[0]: a mount-set reference is a bare name; modes, a guest path and \
+                 exclusions belong to the paths declared inside the set"
+            );
+            let tools = [ToolMountValue {
+                declaration: 2,
+                value: &value,
+            }];
+            assert_eq!(
+                from_verified_value(
+                    authorized,
+                    MountValues {
+                        defaults: None,
+                        sets: None,
+                        tools: &tools,
+                    },
+                    home,
+                )
+                .unwrap_err()
+                .to_string(),
+                "tools[2].mounts[0]: a mount-set reference is a bare name; modes, a guest path \
+                 and exclusions belong to the paths declared inside the set"
+            );
+        });
+    }
+
+    /// Every tool-list rejection names the numeric declaration and entry, and never
+    /// echoes a value or a key.
+    #[test]
+    fn tool_list_errors_name_numeric_sites_without_values() {
+        const SENTINEL: &str = "s3cr3t-SENTINEL-396";
+        let home = Some(Path::new("/h"));
+        let rows: Vec<(String, &str)> = vec![
+            (
+                "7".to_string(),
+                "tools[1].mounts: must be an array of strings",
+            ),
+            (
+                r#"["/a", 7]"#.to_string(),
+                "tools[1].mounts[1]: must be a string",
+            ),
+            (
+                format!("[\"./{SENTINEL}\"]"),
+                "tools[1].mounts[0]: host path must be absolute",
+            ),
+            (
+                format!("[\"/a:/g:{SENTINEL}\"]"),
+                "tools[1].mounts[0]: unknown mode keyword",
+            ),
+            (
+                format!("[\"/a:/g:exclude={SENTINEL}/../x\"]"),
+                "tools[1].mounts[0]: exclude must be a non-empty relative path of normal \
+                 components",
+            ),
+            // A sentinel that *is* a valid mount-set name reaches the set
+            // grammar, not the path grammar: one selector decides both sites.
+            (
+                format!("[\"/a\", \"{SENTINEL}\"]"),
+                "tools[1].mounts[1]: unknown mount set name",
+            ),
+        ];
+        let value = |text: &str| -> toml::Value {
+            format!("mounts = {text}\n")
+                .parse::<toml::Table>()
+                .unwrap()
+                .remove("mounts")
+                .unwrap()
+        };
+        for (text, expected) in rows {
+            let parsed = value(&text);
+            with_authorized(|authorized, _| {
+                let tools = [ToolMountValue {
+                    declaration: 1,
+                    value: &parsed,
+                }];
+                let error = from_verified_value(
+                    authorized,
+                    MountValues {
+                        defaults: None,
+                        sets: None,
+                        tools: &tools,
+                    },
+                    home,
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(!error.contains(SENTINEL), "{text}: value echoed: {error}");
+                assert!(error.starts_with(expected), "{text}: {error}");
+            });
+        }
+    }
+
     /// Load is pure: a source that does not exist still parses, because whether
     /// it exists is a launch-time question about *selected* mounts only.
     #[test]
@@ -824,13 +1184,14 @@ mod tests {
                 MountValues {
                     defaults: Some(&value(r#"["/a"]"#)),
                     sets: None,
+                    tools: &[],
                 },
                 None,
             )
             .unwrap();
             assert_eq!(mounts.file(), file);
             assert_eq!(
-                mounts.requests()[0].origin.to_string(),
+                defaults_requests(&mounts)[0].origin.to_string(),
                 format!("mounts[0] in {file:?}")
             );
         });
