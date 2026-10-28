@@ -163,6 +163,29 @@ Mounts & ports:
           omit `--auto-publish` and use `--publish` to expose only the specific ports you mean to
           share.
 
+Direct command terminal:
+  -t, --tty
+          Force a PTY for a direct command, even when stdout is redirected.
+
+          Launch options precede `run` or the top-level `--`; the same token after the command
+          boundary is the program's own argument. A direct command uses a PTY automatically only
+          when **both** stdin and stdout are terminals (stderr's status is irrelevant); `-t`
+          additionally requires terminal stdin, because a guest terminal session with no host input
+          could not be driven. Under a PTY the guest's stdout and stderr are one merged terminal
+          stream: merged into a redirect, or interleaved on the terminal.
+
+          Direct commands have no detach mode, so `Ctrl-]` is guest input, not an escape. `shell`
+          and catalog tools keep their own behavior and refuse these options rather than changing
+          it.
+
+  -T, --no-tty
+          Stream a direct command's I/O even from a terminal: separate guest stdout and stderr, and
+          stdin forwarded as a stream.
+
+          Launch options precede `run` or the top-level `--`. Under `--no-tty` the guest gets no
+          terminal, so programs that insist on one (editors, pagers, full-screen tools) will not
+          work; the launcher's own diagnostics stay on stderr and never contaminate guest stdout.
+
 Network egress:
       --allow-egress <[tcp://|udp://]IP|CIDR[:PORT] | [tcp://]HOST[:PORT]>
           Allow one IP/CIDR or TLS hostname, optionally transport/port-scoped (repeatable).
@@ -234,6 +257,8 @@ Examples:
   agent-vm <tool> --model opus --resume            forward args to the tool
   agent-vm run make test                           run a guest executable directly
   agent-vm -- make test                            same program, top-level `--` form
+  agent-vm -t run htop                             force a PTY for a direct command
+  agent-vm -T run build.sh >out.log                force streaming I/O for one
   agent-vm shell <command>                         run one command, then exit
   agent-vm --memory 8 --cpus 4 <tool>              a bigger sandbox
   agent-vm --mount ~/ref:ro <tool>                 read-only extra mount

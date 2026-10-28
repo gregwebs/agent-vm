@@ -236,3 +236,21 @@ Silicon VM host, Docker/buildx and the built runtime. Which rows have been run
 for a given revision, with their identities and logs, belongs in that revision's
 verification artifact; this ADR records what is verifiable and how, not a
 standing claim that every row was run.
+
+## Amendment (2026-02, #400)
+
+#400 widens **when** a direct launch streams; it does not change who owns the
+input. A launch now streams not only for non-terminal stdin but also when a
+redirected stdout or `--no-tty`/`-T` selects streaming despite a terminal stdin
+(`CONTEXT.md` → *Direct terminal policy*). The streamed path is the same reserved
+input described above, unchanged: one reader thread, one bounded queue, one pump,
+one EOF frame, and the same failure distinctions. The choices made here about
+ownership and backpressure remain as recorded, and a PTY launch does not use this
+module at all — the SDK's terminal bridge owns input there, with its own raw-mode
+guard and cancellation rules (see `ARCHITECTURE.md` → *Interactive attach*).
+
+The supervision seam #400 leaves for #401 is the owned attach future: a direct PTY
+session is `direct_terminal::supervise_attach(attach, runtime_wait)`, so signal
+handling can later cancel that future and escalate teardown without redesigning
+input ownership. #400 itself adds no signal forwarding, grace period or 128+N
+status.

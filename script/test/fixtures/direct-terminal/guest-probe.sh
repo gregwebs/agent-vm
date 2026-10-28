@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# Guest-side oracle for #400's direct terminal policy.
+#
+# Every mode prints a machine-checkable report on **guest stdout** and, where the
+# mode separates channels, a distinct marker on guest stderr. The driver parses
+# only these encoded lines: launcher notices, a host terminal's echo and a PTY's
+# CRLF mapping can all be told apart from them, while a plain human sentence
+# cannot. Handlers and state are installed *before* READY so a case never races
+# its own trap.
+#
+# Copied into an owned test project for a native run; nothing here is host-side.
+set -euo pipefail
+
+mode="${1:-}"
+case "$mode" in
+identity|argv|input|stream-input|resize|wait|status) ;;
+*)
+    echo "guest-probe: unknown mode '${mode}'" >&2
+    exit 64
+    ;;
+esac
+shift || true
+
+# ---------------------------------------------------------------- modes ---
+
+probe_identity() {
+    local tty0=0 tty1=0 tty2=0
+    [ -t 0 ] && tty0=1
+    [ -t 1 ] && tty1=1
+    [ -t 2 ] && tty2=1
+    echo "IDENTITY tty0=$tty0 tty1=$tty1 tty2=$tty2"
+    echo "UID=$(id -u) GID=$(id -g)"
+    echo "PWD=$(pwd -P)"
+    echo "PATH=$PATH"
+    echo "HOOK=${TERMINAL_HOOK:-absent}"
+    echo "OUT marker"
+    echo "ERR marker" >&2
+    echo "IDENTITY-DONE"
+}
+
+probe_argv() {
+    echo "ARGV n=$#"
+    local index=0 argument
+    for argument in "$@"; do
+        printf 'ARGV[%d]=%s\n' "$index" "$argument"
+        index=$((index + 1))
+    done
+    echo "ARGV-DONE"
+}
+
+probe_input() {
+    # Raw mode is this mode's own setup, so no terminal echo can satisfy the hex
+    # oracle: only the bytes the launcher forwarded can. A non-terminal stdin (the
+    # boot-free driver's pipe stand-in) has no attributes to change, and the hex
+    # oracle is unchanged.
+    if [ -t 0 ]; then
+        stty raw -echo
+    fi
+    echo "INPUT-READY"
+    local bytes
+    bytes="$(dd bs=1 count=3 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+    echo "bytes=$bytes"
+    echo "ERR input" >&2
+    echo "DONE"
+    exit 7
+}
+
+probe_stream_input() {
+    # Non-PTY guest stdin: no stty, no tty reads. The capture file and the trap
+    # exist before READY so a cleanup can never replace the exit status.
+    local capture
+    capture="$(mktemp "${TMPDIR:-/tmp}/stream-input.XXXXXX")"
+    trap 'rm -f "$capture"' EXIT
+    echo "STREAM-READY"
+    cat >"$capture"
+    local size checksum hex
+    size="$(wc -c <"$capture" | tr -d ' ')"
+    checksum="$(cksum <"$capture" | awk '{print $1}')"
+    hex="$(od -An -tx1 -v "$capture" | tr -d ' \n')"
+    echo "STREAM bytes=$size cksum=$checksum hex=$hex"
+    echo "STREAM-STDERR marker" >&2
+    echo "STREAM-DONE"
+    exit 23
+}
+
+probe_resize() {
+    local winch_seen=0
+    # The trap exists before the first size report: a resize that arrives early
+    # must still be recorded.
+    trap 'winch_seen=1' WINCH
+    echo "SIZE $(stty size)"
+    echo "RESIZE-READY"
+    local attempt=0
+    while [ "$attempt" -lt 10 ]; do
+        attempt=$((attempt + 1))
+        # `read` inside `if`: a timeout or a signal interruption is a failed
+        # read, not an errexit trip. The ack is discarded on purpose — the state
+        # it reports is read from the terminal and the trap instead.
+        if IFS= read -r -t 1 _ack; then :; fi
+        if [ "$winch_seen" = 1 ] && [ "$(stty size)" = "43 119" ]; then
+            echo "RESIZED $(stty size)"
+            echo "RESIZE-DONE"
+            exit 7
+        fi
+    done
+    echo "RESIZE-TIMEOUT winch=$winch_seen size=$(stty size)"
+    exit 90
+}
+
+probe_wait() {
+    echo "WAIT-READY"
+    # Block on input until the session is faulted out from under us.
+    cat >/dev/null
+    echo "WAIT-EOF"
+    exit 0
+}
+
+probe_status() {
+    local status="${1:-0}"
+    echo "STATUS-EXIT $status"
+    exit "$status"
+}
+
+case "$mode" in
+identity) probe_identity ;;
+argv) probe_argv "$@" ;;
+input) probe_input ;;
+stream-input) probe_stream_input ;;
+resize) probe_resize ;;
+wait) probe_wait ;;
+status) probe_status "$@" ;;
+esac

@@ -31,8 +31,21 @@
 # Custom-image selection (optional):
 #   AGENT_VM_E2E_ONLY_ROWS          space-separated exact run_check names to run;
 #                                   every other row is skipped without a result.
-#                                   Fixture builds/imports run only when a
-#                                   selected name starts with `custom-image-`.
+#                                   An unmatched name FAILS the run (it does not
+#                                   silently certify zero cases). Fixture
+#                                   builds/imports run only when a selected name
+#                                   starts with `custom-image-`.
+# Direct-terminal rows (required when any `custom-image-direct-terminal-*` row is
+# selected):
+#   AGENT_VM_E2E_TERMINAL_EVIDENCE  absolute, empty directory this run owns. The
+#                                   driver writes one JSON receipt plus raw
+#                                   captures per case into an exclusively created
+#                                   per-row/per-case child, outside $WORK, and
+#                                   the run validates the root's emptiness once.
+#                                   Invocation: this script may be started from an
+#                                   interactive terminal; it detaches each driver
+#                                   process itself (no controlling terminal), so
+#                                   no wrapper environment has to hide one.
 #
 # Custom-image runtime selection (**required for every launch of this group,**
 # including the boot-free "harness-negative" controls): the group runs the
@@ -436,10 +449,19 @@ assert_single_boot_ref() {
 PASSED=0
 FAILED=0
 SKIPPED=0
+# Every row name this script registers. `AGENT_VM_E2E_ONLY_ROWS` silently ignores
+# a name that matches nothing, so a filtered run that exits 0 proves nothing
+# unless every requested name is known: asserted at the end.
+KNOWN_ROWS=""
+
+register_row() {
+  KNOWN_ROWS="$KNOWN_ROWS $1"
+}
 
 run_check() {
   local name="$1"
   shift
+  register_row "$name"
   # `negative/*` rows are the harness self-test's deliberate failures; they
   # belong to whichever selected row invoked them, never to the filter.
   if [ -n "$E2E_ONLY_ROWS" ] && [[ "$name" != negative/* ]] && ! row_selected "$name"; then
@@ -466,6 +488,7 @@ run_check() {
 run_optional() {
   local name="$1" var="$2"
   shift 2
+  register_row "$name"
   if [ -n "$E2E_ONLY_ROWS" ] && ! row_selected "$name"; then
     return 0
   fi
@@ -2694,6 +2717,193 @@ evidence_line() {
   esac
 }
 
+# The terminal evidence root: an operator-provided, absolute, empty directory the
+# driver writes into directly, outside $WORK, so artifacts survive the row's own
+# cleanup. It is required whenever one of the direct-terminal rows is selected.
+#
+# The root is validated *once per run*: it must be empty before this run creates
+# anything, and every row afterwards only creates its own exclusive children.
+# Requiring the shared root to stay empty on every row made the second selected
+# row fail on the first row's receipts.
+terminal_evidence_root() {
+  local root="${AGENT_VM_E2E_TERMINAL_EVIDENCE:-}"
+  if [ -z "$root" ]; then
+    echo "    FAIL: set AGENT_VM_E2E_TERMINAL_EVIDENCE to an absolute empty directory"
+    return 1
+  fi
+  case "$root" in
+  /*) ;;
+  *)
+    echo "    FAIL: AGENT_VM_E2E_TERMINAL_EVIDENCE must be absolute (got $root)"
+    return 1
+    ;;
+  esac
+  [ -d "$root" ] || {
+    echo "    FAIL: $root is not a directory"
+    return 1
+  }
+  # Ownership is recorded in the root itself, so the "empty, and mine" check
+  # happens exactly once per run no matter how often this helper is called (it is
+  # called from command substitutions, whose assignments would not survive).
+  local marker="$root/.owning-run"
+  if [ -f "$marker" ]; then
+    if [ "$(cat "$marker" 2>/dev/null)" != "$RUN_ID" ]; then
+      echo "    FAIL: $root already holds another run's evidence (marker: $(cat "$marker" 2>/dev/null))"
+      return 1
+    fi
+    printf '%s' "$root"
+    return 0
+  fi
+  [ -z "$(ls -A "$root" 2>/dev/null)" ] || {
+    echo "    FAIL: $root must be empty so this run cannot overwrite earlier evidence"
+    return 1
+  }
+  if ! printf '%s' "$RUN_ID" >"$marker"; then
+    echo "    FAIL: could not record ownership of $root"
+    return 1
+  fi
+  printf '%s' "$root"
+}
+
+# One driver invocation, detached from any ambient controlling terminal.
+#
+# The driver refuses to run with one (a copied terminal would make its own PTY
+# observation meaningless), so the wrapper detaches it here instead of requiring
+# an undisclosed invocation environment. `start_new_session` gives the driver its
+# own session with no controlling terminal.
+terminal_driver() {
+  "${CUSTOM_ENV[@]}" PYTHONPATH= \
+    DIRECT_TERMINAL_CASE_DEADLINE="${DIRECT_TERMINAL_CASE_DEADLINE:-240}" \
+    DIRECT_TERMINAL_MARKER_DEADLINE="${DIRECT_TERMINAL_MARKER_DEADLINE:-60}" \
+    python3 "$REPO_ROOT/script/test/lib/detached-run.py" \
+    python3 "$REPO_ROOT/script/test/lib/direct-terminal.py" "$@"
+}
+
+# One driver invocation. `case`/`form` name the fixed inventory; the evidence
+# directory is per case, created exclusively here so no case can reuse or
+# overwrite another's.
+terminal_case() {
+  local row="$1" proj="$2" case="$3" form="$4" evidence="$5"
+  shift 5
+  local case_dir="$evidence/$row/$case-$form"
+  if ! mkdir "$evidence/$row" 2>/dev/null; then
+    [ -d "$evidence/$row" ] || { echo "    FAIL: could not create $evidence/$row"; return 1; }
+  fi
+  if ! mkdir "$case_dir" 2>/dev/null; then
+    echo "    FAIL: $case_dir already exists; this run's evidence was reused"
+    return 1
+  fi
+  # The launch state root is the same private root every other custom-image row
+  # uses, so the fixture cache, the state child and the catalog checks all name
+  # the same launch. (A per-row state root was inspected by nobody: the cleanup
+  # and the catalog checks resolve from $CUSTOM_STATE.)
+  if ! terminal_driver \
+    --bin "$AGENT_VM" \
+    --project "$proj" \
+    --image "$CUSTOM_MARKER" \
+    --runtime "$CUSTOM_MSB" \
+    --state-root "$CUSTOM_STATE" \
+    --case "$case" \
+    --form "$form" \
+    --evidence "$case_dir" \
+    --home "$CUSTOM_HOME" "$@"; then
+    echo "    FAIL: $row/$case/$form: the driver reported a failure (evidence: $case_dir)"
+    return 1
+  fi
+  if [ ! -s "$case_dir/$case-$form.json" ]; then
+    echo "    FAIL: $row/$case/$form: no evidence receipt was written"
+    return 1
+  fi
+  return 0
+}
+
+# A project hook that prepends a *directory containing a space* to PATH and
+# exports a marker. The bare-name executable in that directory can only be found
+# through the hook's exported PATH, so an identity case that passes here really
+# observed the post-hook effective PATH rather than the image's default one.
+terminal_hook_project() {
+  local proj="$1"
+  local bindir="$proj/bin dir"
+  mkdir -p "$bindir" || return 1
+  cat >"$bindir/hook-only-400" <<'PROG' || return 1
+#!/bin/sh
+printf 'hook-only-400 ran\n'
+PROG
+  chmod 0755 "$bindir/hook-only-400" || return 1
+  cat >"$proj/.agent-vm.runtime.sh" <<'HOOK' || return 1
+TERMINAL_HOOK=hook-exported-400
+export TERMINAL_HOOK
+PATH="$PWD/bin dir:$PATH"
+export PATH
+HOOK
+  printf '%s' "$bindir"
+}
+
+# Teardown proof for one direct-terminal row, written as a receipt before the
+# row's state is removed. Three separate observations, because a Ctrl-] hex dump
+# is not evidence that no VM survived:
+#   catalog  no sandbox record for the row's image remains
+#   sockets  no socket under the private MSB_HOME belongs to this run
+#   state    the row's own private state child is identified (and later removed)
+# A failed observation is a failed row, never an assumed absence.
+terminal_teardown_receipt() {
+  local row="$1" proj="$2" evidence="$3"
+  local receipt="$evidence/$row/teardown.txt"
+  local state sockets catalog=ok sockets_ok=ok status=0
+  state="$(direct_state_child "$proj")" || status=1
+  if ! assert_no_catalog_entry "$CUSTOM_MARKER" >/dev/null 2>&1; then
+    catalog="survivor"
+    status=1
+  fi
+  sockets="$(find "$CUSTOM_STATE/msb-home/run" -name '*.sock' -print 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "$sockets" != 0 ]; then
+    sockets_ok="survivor"
+    status=1
+  fi
+  {
+    printf 'row=%s\n' "$row"
+    printf 'state_child=%s\n' "$state"
+    printf 'catalog=%s\n' "$catalog"
+    printf 'sockets=%s\n' "$sockets_ok"
+    printf 'status=%s\n' "$status"
+  } >"$receipt" || status=1
+  echo "    teardown: row=$row state=$state catalog=$catalog sockets=$sockets_ok receipt=$receipt"
+  return "$status"
+}
+
+# The shared body: install the guest probe into a fresh owned project, run the
+# row's fixed case list in both command forms, keep the evidence, prove the row
+# left nothing behind, and clean up.
+direct_terminal_row() {
+  local row="$1" proj evidence result=0 case form hook_path="" extra=()
+  shift
+  # `--hook` marks the identity row: it installs the PATH/hook fixture and hands
+  # the driver the facts it must observe in the guest.
+  if [ "${1:-}" = "--hook" ]; then
+    shift
+  fi
+  proj="$(custom_project "$row")" || return 1
+  cp "$REPO_ROOT/script/test/fixtures/direct-terminal/guest-probe.sh" "$proj/guest-probe.sh" || return 1
+  hook_path="$(terminal_hook_project "$proj")" || return 1
+  extra=(--expect-hook hook-exported-400 --expect-hook-path "$hook_path")
+  evidence="$(terminal_evidence_root)" || return 1
+  for case in "$@"; do
+    for form in run separator; do
+      terminal_case "$row" "$proj" "$case" "$form" "$evidence" "${extra[@]}" || result=1
+    done
+  done
+  assert_no_host_calls || result=1
+  # The evidence lives outside $WORK and is retained on purpose. The teardown
+  # receipt is written before cleanup, so it survives even when the row failed and
+  # its state is kept for diagnosis.
+  terminal_teardown_receipt "$row" "$proj" "$evidence" || result=1
+  # Only the row's own state child and project are removed, and only when the
+  # route itself proves no sandbox survived.
+  direct_cleanup "$row" "$proj" "$CUSTOM_MARKER" "$result" || result=1
+  return "$result"
+}
+
+
 # --------------------------------------------------------- harness negative --
 
 # A controlled negative for the harness itself: a check whose guarded capture
@@ -4332,6 +4542,106 @@ LAUNCH
     "$stub_runtime" "160000 commit $stub_stamp"$'\t'"vendor/other" "$stub_stamp"
   control_report "h24 stdin-identity-receipts" "$ctl_before"
 
+
+  # (t1) #400 B1: the shared evidence root is validated once per run, then every
+  # row creates its own exclusive children. The old helper re-checked that the
+  # whole root was empty on every row, so the second selected row failed on the
+  # first row's receipts.
+  ctl_before="$result"
+  local ev_root="$probe_dir/terminal-evidence"
+  rm -rf "$ev_root" || result=$((result + 1))
+  mkdir -p "$ev_root" || result=$((result + 1))
+  if ! (
+    AGENT_VM_E2E_TERMINAL_EVIDENCE="$ev_root"
+    first="$(terminal_evidence_root)" || exit 1
+    mkdir "$first/row-one" || exit 2
+    second="$(terminal_evidence_root)" || exit 3
+    [ "$first" = "$second" ] || exit 4
+    # An existing case directory is refused, never reused: two rows cannot share
+    # one receipt path.
+    if mkdir "$second/row-one" 2>/dev/null; then exit 5; fi
+    exit 0
+  ); then
+    echo "    FAIL: terminal_evidence_root rejected a run root its own first row populated"
+    result=$((result + 1))
+  fi
+  control_report "t1 evidence-root-once" "$ctl_before"
+
+
+  # (t2) #400 B1: the wrapper detaches the driver itself. The control runs the
+  # production shim inside a *real* controlling terminal, so it proves the shim
+  # removes it rather than observing that this harness happened to have none.
+  ctl_before="$result"
+  if ! timeout 60 python3 - "$REPO_ROOT/script/test/lib/detached-run.py" <<'DETACH'; then
+import os, pty, select, subprocess, sys, time
+
+shim = sys.argv[1]
+probe = ["python3", "-c",
+         "import os\n"
+         "os.close(os.open('/dev/tty', os.O_RDWR | os.O_NOCTTY))\n"]
+pid, master = pty.fork()
+if pid == 0:
+    # This child is a session leader with `master` as its controlling terminal, so
+    # /dev/tty must be reachable here and unreachable in the shim's child.
+    attached = subprocess.run(probe, stdin=subprocess.DEVNULL).returncode == 0
+    detached = subprocess.run([sys.executable, shim, *probe]).returncode
+    os._exit(0 if attached and detached != 0 else 1)
+# Drain the terminal the child writes to: a control that never reads the master can
+# block its own child on a full terminal buffer (this hung a whole run once).
+os.close(0)
+deadline = time.monotonic() + 30
+while time.monotonic() < deadline:
+    ready, _, _ = select.select([master], [], [], 1)
+    if not ready:
+        continue
+    try:
+        chunk = os.read(master, 65536)
+    except OSError:
+        break
+    if not chunk:
+        break
+os.close(master)
+done, status = os.waitpid(pid, 0)
+sys.exit(os.waitstatus_to_exitcode(status))
+DETACH
+    echo "    FAIL: the wrapper's detached runner left a controlling terminal in place"
+    result=$((result + 1))
+  fi
+  control_report "t2 detached-invocation" "$ctl_before"
+
+
+  # (t3) #400 B1/B7: one launch, one owned state. The argv the wrapper builds names
+  # the shared private state root (so the fixture cache, `direct_state_child` and
+  # the catalog checks agree) and an evidence directory inside the run root; the
+  # row teardown receipt is bound to that same state child.
+  ctl_before="$result"
+  local built_argv="$probe_dir/terminal-argv.txt"
+  if ! (
+    AGENT_VM_E2E_TERMINAL_EVIDENCE="$ev_root"
+    AGENT_VM=/bin/true CUSTOM_MSB=/bin/true CUSTOM_MARKER=marker CUSTOM_HOME="$probe_dir"
+    # shellcheck disable=SC2317,SC2329  # stub invoked indirectly by terminal_case
+    custom_project() { printf '%s' "$probe_dir/proj"; }
+    # shellcheck disable=SC2317,SC2329  # stub invoked indirectly by terminal_case
+    terminal_driver() {
+      printf '%s\n' "$@" >"$built_argv"
+      # Stand in for the driver's own receipt so terminal_case's evidence check
+      # passes and the argv can be asserted.
+      while [ "$#" -gt 0 ]; do
+        if [ "$1" = "--evidence" ]; then printf '{}\n' >"$2/identity-auto-run.json"; fi
+        shift
+      done
+    }
+    mkdir -p "$probe_dir/proj" || exit 1
+    terminal_case "row-one" "$probe_dir/proj" identity-auto run "$ev_root" >/dev/null 2>&1 || exit 2
+    grep -qxF -- "$CUSTOM_STATE" <(sed -n '/^--state-root$/{n;p;}' "$built_argv") || exit 3
+    # The evidence directory is one exclusive child of the run root, never $WORK.
+    grep -qxF -- "$ev_root/row-one/identity-auto-run" <(sed -n '/^--evidence$/{n;p;}' "$built_argv") || exit 4
+    exit 0
+  ); then
+    echo "    FAIL: terminal_case did not launch against the shared private state root"
+    result=$((result + 1))
+  fi
+  control_report "t3 launch-root-and-evidence" "$ctl_before"
 
   local observed_pass="$PASSED" observed_fail="$FAILED"
   if [ "$observed_pass" -ne 0 ] || [ "$observed_fail" -ne 2 ]; then
@@ -8494,6 +8804,69 @@ custom_image_direct_stdin_shell_unchanged() {
   return "$result"
 }
 
+# ---------------------------------------------------------------- #400 rows ---
+
+# Both descriptors terminals, one redirected, one piped: the auto rule and the
+# irrelevance of stderr.
+custom_image_direct_terminal_auto() {
+  direct_terminal_row "direct-terminal-auto" \
+    identity-auto identity-redirected identity-stdin-pipe identity-stderr-file
+}
+
+# Both forced modes, the redirect combinations they must handle, forced streaming
+# from *both* terminals under each spelling (otherwise auto already streams and the
+# force-off option could be ignored), and streamed input from a terminal.
+custom_image_direct_terminal_overrides() {
+  direct_terminal_row "direct-terminal-overrides" \
+    identity-force-tty identity-force-stream identity-force-stream-both \
+    identity-no-tty-both stream-input-auto stream-input-no-tty
+}
+
+# Forced PTY with pipe and file stdin, plus the flag conflicts: refused before
+# boot (status 2, actionable text, no boot).
+custom_image_direct_terminal_reject() {
+  direct_terminal_row "direct-terminal-reject" \
+    reject-pipe-tty reject-file-tty reject-conflict
+}
+
+# Ctrl-] as guest input, with the merged terminal stream and a restored terminal.
+custom_image_direct_terminal_input() {
+  direct_terminal_row "direct-terminal-input" input
+}
+
+# Resize forwarding and the guest's own view of its geometry.
+custom_image_direct_terminal_resize() {
+  direct_terminal_row "direct-terminal-resize" resize
+}
+
+# Identity, cwd, PATH, uid:gid and the project hook under a PTY.
+custom_image_direct_terminal_identity() {
+  direct_terminal_row "direct-terminal-identity" identity-auto
+}
+
+# Statuses through a PTY: 0, 7, missing 127 and non-executable 126.
+custom_image_direct_terminal_statuses() {
+  direct_terminal_row "direct-terminal-statuses" \
+    status-exit0 status-exit7 status-missing status-nonexec
+}
+
+# Runtime loss while the command is pending: 125, restored, no survivor.
+custom_image_direct_terminal_disconnect() {
+  direct_terminal_row "direct-terminal-disconnect" wait
+}
+
+# The same tokens after the command boundary are guest argv.
+custom_image_direct_terminal_argv() {
+  direct_terminal_row "direct-terminal-argv" suffix-argv
+}
+
+# The legacy routes: a `shell` launch keeps the stdin-only PTY selection, its
+# merged output and its unchanged Ctrl-] detach, and the new controls never reach
+# it.
+custom_image_direct_terminal_legacy() {
+  direct_terminal_row "direct-terminal-legacy" legacy-shell-pty legacy-detach
+}
+
 run_check "explicit-build-archive-workflow" custom_explicit_build_workflow
 
 if rows_need_fixtures; then
@@ -8524,6 +8897,16 @@ run_check "custom-image-direct-stdin-concurrent-streams" custom_image_direct_std
 run_check "custom-image-direct-stdin-host-open" custom_image_direct_stdin_host_open
 run_check "custom-image-direct-stdin-eof-wait" custom_image_direct_stdin_eof_wait
 run_check "custom-image-direct-stdin-shell-unchanged" custom_image_direct_stdin_shell_unchanged
+run_check "custom-image-direct-terminal-auto" custom_image_direct_terminal_auto
+run_check "custom-image-direct-terminal-overrides" custom_image_direct_terminal_overrides
+run_check "custom-image-direct-terminal-reject" custom_image_direct_terminal_reject
+run_check "custom-image-direct-terminal-input" custom_image_direct_terminal_input
+run_check "custom-image-direct-terminal-resize" custom_image_direct_terminal_resize
+run_check "custom-image-direct-terminal-identity" custom_image_direct_terminal_identity
+run_check "custom-image-direct-terminal-statuses" custom_image_direct_terminal_statuses
+run_check "custom-image-direct-terminal-disconnect" custom_image_direct_terminal_disconnect
+run_check "custom-image-direct-terminal-argv" custom_image_direct_terminal_argv
+run_check "custom-image-direct-terminal-legacy" custom_image_direct_terminal_legacy
 run_check "custom-image-direct-host-decoy" custom_image_direct_host_decoy
 run_check "custom-image-direct-nonstandard" custom_image_direct_nonstandard
 run_check "custom-image-direct-zero-provisioning" custom_image_direct_zero_provisioning
@@ -8548,6 +8931,24 @@ run_check "custom-image-user-home-attach-nonroot" check_custom_user_home_attach 
 run_check "custom-image-user-home-attach-root" check_custom_user_home_attach root
 run_check "custom-image-nonstandard-attach" check_custom_nonstandard_attach
 run_check "custom-image-cache-isolated-final" check_custom_cache_isolation
+
+# A filtered run must fail when it names a row that does not exist: an exited 0
+# with an unmatched filter would otherwise certify zero cases.
+if [ -n "$E2E_ONLY_ROWS" ]; then
+  unknown=""
+  for requested in $E2E_ONLY_ROWS; do
+    case " $KNOWN_ROWS " in
+    *" $requested "*) ;;
+    *) unknown="$unknown $requested" ;;
+    esac
+  done
+  if [ -n "$unknown" ]; then
+    echo
+    echo "e2e: FAIL: unknown row name(s):$unknown" >&2
+    echo "e2e: known rows:$KNOWN_ROWS" >&2
+    FAILED=$((FAILED + 1))
+  fi
+fi
 
 echo
 echo "e2e: $PASSED passed, $FAILED failed, $SKIPPED skipped"

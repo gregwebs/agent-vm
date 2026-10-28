@@ -574,7 +574,7 @@ satisfies none of those.
                                      │
               ┌──────────────────────┴───────────────────────┐
               ▼                                              ▼
-   LaunchTarget::Tool { entry, tool_args }      LaunchTarget::Direct(DirectCommand)
+   LaunchTarget::Tool { entry, tool_args }   LaunchTarget::Direct { command, terminal }
    inner_argv + ImageContract guard             literal argv + Direct guard
               └──────────────────────┬───────────────────────┘
                                      ▼
@@ -591,9 +591,9 @@ declaration can be read for it. The credential resolver and network policy
 remain the authority; `Direct` simply requests an empty name set, which makes
 their decisions empty (ADR-0017). `GuestInvocation` carries the program, argv,
 display text and a `ProgramGuard`; `AgentShellLine` branches in
-`program_guard()` and in `GuestInput` (who owns non-terminal stdin, #399), and
-the `GuestInput::DiscardWhenNotTerminal` rendering is byte-identical for every
-existing tool, shell and direct-attach launch.
+`program_guard()` and in `GuestInput` (who owns streamed rather than reserved
+stdin, #399), and the `GuestInput::DiscardWhenNotTerminal` rendering is
+byte-identical for every existing tool, shell and direct-attach launch.
 
 Shared state is unchanged: image selection, cwd, identity, mounts, HOME links,
 default-deny network, GitHub policy, bootstrap and the project hook all still
@@ -603,13 +603,39 @@ launch too.
 
 ### Interactive attach vs. non-TTY streaming exec
 
-`Sandbox::attach()` needs a real controlling TTY — it puts stdin in raw mode and
-opens `/dev/tty` for its non-blocking input fd — and returns ENXIO when stdin is
-a pipe, a redirect, or CI. The launcher checks `stdin().is_terminal()`:
+`Sandbox::attach()` needs a real terminal on stdin and fails when stdin is a
+pipe, a redirect, or CI. Where the raw-mode snapshot comes from depends on the
+session: the **checked** session (direct launches) duplicates fd 0 and sets the
+attributes on that duplicate, never on `/dev/tty` and never on a global tty,
+while the **legacy** session (tool, `shell` and every pre-#400 caller) keeps the
+unchanged crossterm global raw-mode guard. Two launch kinds choose between attach
+and streaming, and the choice is **not** one predicate:
 
-- **TTY** → `attach(cmd, args)`, so the agent's TUI gets a full PTY.
-- **No TTY** → `exec_stream_with(...)`, which streams stdout/stderr as they are
-  produced and forwards the exit code.
+```
+launch target            decision                                  result
+─────────────────────────────────────────────────────────────────────────────────────
+tool / shell             stdin is a terminal (unchanged)            attach, legacy semantics
+direct                   HostTerminals{stdin,stdout} + -t/-T        attach or stream (#400)
+```
+
+- **Legacy attach** → `attach_with(cmd, args)` with no options: the agent's TUI
+  gets a full PTY, `Ctrl-]` detaches, output is best effort, and a session that
+  ends without a guest exit returns `Ok(-1)`.
+- **Direct attach** → the same call plus the SDK's opt-in
+  `.disable_detach_keys().checked_session()`, raced against `Sandbox::wait()`
+  inside `direct_terminal::supervise_attach`. A definite guest exit is required
+  to report a status; a closed channel, a malformed frame, output or send failure,
+  or a runtime that disappears is a failure (125) after the terminal is restored.
+- **No terminal** → `exec_stream_with(...)`, which streams stdout/stderr as they
+  are produced and forwards the exit code.
+
+A direct launch's mode is resolved once, in `cli::direct_dispatch`, from the
+parsed `-t`/`-T` and one `HostTerminals::detect()`, and travels
+`LaunchTarget::Direct.terminal → GuestInvocation::direct_io() → ExecIo →
+guest_input_for`. Nothing re-measures the host later: a bootstrap rendered for
+one mode must never be executed by the other. Auto is a PTY only when both stdin
+and stdout are terminals, so a redirected stdout streams with separate guest
+channels instead of merging them into a file.
 
 The streaming form matters: the SDK's buffer-until-exit `exec_with` makes a long
 non-interactive run look hung.
@@ -662,6 +688,28 @@ has exactly one release sequence for every outcome, including an input start-up
 failure: stop the pump, drop the wait future, drop the handle, then tear down —
 in that order, because the wait future may hold the child-handle mutex (#258) and
 a pending sink write must not outlive the handle it writes through.
+
+**Direct PTY supervision (#400).** A direct attach is one owned future, not a
+spawned task: `supervise_attach(attach, sandbox.wait())` selects on both and
+releases in a fixed order — the attach future first (the SDK restores the host
+terminal and drops its output writer), then the runtime wait (releasing the
+child-handle mutex before the existing stop/wait/remove path takes it). The
+select is biased towards the attach future so an exit already observed is never
+replaced by a later runtime observation, and a runtime exit without a guest exit
+is a failure rather than a fabricated status. #401 will cancel this same owned
+future from a signal-aware supervisor; #400 adds no signal handling, so a
+`Ctrl-C` at a host terminal is just another raw input byte forwarded once.
+
+Inside the SDK's checked session the host terminal's raw state is held by a
+guard that restores explicitly on both returns (and best-effort from `Drop` for
+cancellation), and guest output is written by a dedicated thread over a
+duplicated stdout descriptor with an 8 MiB outstanding-byte bound. That thread
+exists because a Tokio stdout write cannot be cancelled once dispatched and
+`Runtime::drop` waits for blocking tasks: a session that failed while its
+consumer stopped draining could otherwise never report its failure. A full queue
+waits for the consumer (stalling the session, as a native terminal write would);
+an unwritable descriptor or a lost runtime fails with 125 after restoration and
+teardown.
 
 `stream_exec_with_cleanup` owns that loop. It also owns the sink policy: a
 catalog tool or the fallback shell keeps the legacy **best-effort** sink (a

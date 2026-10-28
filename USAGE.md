@@ -830,6 +830,8 @@ Available launch options:
 | `--allow-internet-egress`, `--allow-lan`, `--allow-host`, `--allow-egress`, `--publish`, `--auto-publish` | see [Ports & egress](#ports--egress); egress is denied by default |
 | `--no-config-mounts` | skip this launch's automatic [config mounts](#config-mounts-user-config) (the user config's `mounts`); an explicit `--mount`, including `--mount NAME`, credentials, persisted paths and every config check still apply |
 | `--root` | run the guest as root (uid 0) instead of the default host user — see [Guest user](#guest-user----root) |
+| `-t`, `--tty` | force a PTY for a **direct** command, even with redirected stdout; requires terminal stdin — see [Direct commands](#direct-commands) |
+| `-T`, `--no-tty` | force streaming I/O for a **direct** command, even from a terminal |
 
 ### Direct commands
 
@@ -896,8 +898,9 @@ entry.
 > is refused with a rename diagnostic. Rename it (for example `run-tool`) and
 > launch it by the new name, or use `agent-vm run PROGRAM` for a direct launch.
 
-**Input.** When stdin is not a terminal — a pipe, a file, a heredoc — the launch
-streams, and the program owns that input exclusively:
+**Input.** When the launch streams — stdin is a pipe, a file or a heredoc, or
+`-T`/a redirected stdout selected streaming despite a terminal — the program owns
+the host's input exclusively:
 
 ```sh
 printf hello | agent-vm run cat          # prints hello, then exits at EOF
@@ -937,9 +940,43 @@ itself, so a guest that closes stdin early can leave substantially more than
 192 KiB consumed but never read. There is no end-to-end loss bound. Host read
 errors and stdin forwarding failures are launcher failures (125).
 
-> **Still open.** Terminal overrides (`-t`/`-T`) and signal forwarding are not
-> implemented yet; see issues #400–#401. A terminal stdin still attaches to a
-> PTY, and the PTY choice is still the host stdin's.
+**Terminal or streamed I/O.** A direct command uses a PTY automatically only when
+**both** stdin and stdout are terminals; stderr's terminal status is irrelevant.
+Everything else streams: a redirected or piped stdout keeps the guest's stdout and
+stderr separate, so a log file holds only guest stdout. Two launch options — before
+`run` or the top-level `--` — decide explicitly:
+
+| option | behavior |
+|---|---|
+| `-t`, `--tty` | force a PTY, even when stdout is redirected; refused (status 2) when stdin is a pipe or a file |
+| `-T`, `--no-tty` | force streaming, even from a terminal (separate guest channels, streamed input) |
+
+```sh
+agent-vm -t run htop                    # force a PTY
+agent-vm -T run build.sh >out.log       # force streaming; out.log is guest stdout only
+agent-vm run npm test >out.log          # auto: redirected stdout streams
+agent-vm run printf '%s\n' --tty -T     # after the program, both are guest argv
+```
+
+They are direct-only: `shell` and catalog tools refuse them (status 2) instead of
+changing their own behavior, and the same tokens after a tool verb are forwarded to
+that tool. Under a PTY the guest's stdout and stderr are one merged terminal stream
+(that is what a terminal is), input and resizes are forwarded from stdin's
+terminal, and the guest's cwd, uid:gid and effective `PATH` are the launch's
+ordinary ones. Direct commands have **no detach mode**: `Ctrl-]` reaches the guest
+like any other byte, and the session ends when the guest exits. `shell` keeps its
+detach escape.
+
+Output backpressure is not an error: if the consumer of a PTY session stops
+reading, the session stalls (bounded memory, nothing dropped) exactly as a native
+terminal write would. Genuinely unwritable output (a closed pipe) or loss of the
+runtime is a launcher failure: the host terminal is restored, the VM is torn down,
+and the status is 125 — a guest success is never reported over truncated output.
+The host terminal is restored after a normal exit, an error, and cancellation.
+
+> **Still open.** Signal forwarding and its grace period belong to #401. A `Ctrl-C`
+> typed at a host terminal is ordinary raw input and reaches the guest unchanged;
+> there is no host signal forwarding yet.
 
 ### Extra and forked mounts
 

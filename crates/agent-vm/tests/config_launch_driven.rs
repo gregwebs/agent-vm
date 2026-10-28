@@ -10300,6 +10300,178 @@ fn a_direct_launch_that_fails_before_exec_reads_no_host_stdin() {
     }
 }
 
+/// A forced PTY whose stdin is a pipe or a regular file is refused before boot
+/// (#400): status 2, an actionable diagnostic, no runtime invocation, no guest
+/// execution, and the caller's bytes left unread.
+///
+/// A bogus image is included deliberately: an image/acquisition failure later in
+/// the launch must not mask the user's own mistake, which is decided in dispatch
+/// before any configuration or runtime work.
+#[test]
+fn forced_pty_with_a_non_terminal_stdin_is_refused_before_boot() {
+    use std::io::{Read as _, Write as _};
+
+    for form in DIRECT_FORMS {
+        for option in ["-t", "--tty"] {
+            for source in ["pipe", "file"] {
+                let mut harness = Harness::warm();
+                harness.use_launch_runtime();
+                // The warm phase already invoked the fixture runtime, so the
+                // oracle is "no *new* invocation", not "an empty log".
+                let runtime_log_before = harness.msb_log();
+                let mut cmd = harness.base_command();
+                cmd.args([option, "--image", BOGUS_IMAGE]);
+                cmd.arg(match form {
+                    Form::Run => "run",
+                    Form::Separator => "--",
+                });
+                cmd.args(["cat"]);
+                // The refusal must not read the caller's input either. A pipe
+                // needs its writer dropped before EOF, so the two sources keep
+                // separate read-back steps.
+                let mut remaining = Vec::new();
+                match source {
+                    "pipe" => {
+                        let (reader, mut writer) = std::io::pipe().unwrap();
+                        writer.write_all(b"unread").unwrap();
+                        writer.flush().unwrap();
+                        let mut proof = reader.try_clone().unwrap();
+                        cmd.stdin(Stdio::from(reader));
+                        let out = run_with_timeout(cmd, Duration::from_secs(60));
+                        drop(writer);
+                        assert_refusal(
+                            &out,
+                            &harness,
+                            Refusal {
+                                label: &format!("{form:?} {option} {source}"),
+                                runtime_log_before: &runtime_log_before,
+                            },
+                        );
+                        proof.read_to_end(&mut remaining).unwrap();
+                    }
+                    _ => {
+                        let path = harness.project_root.join("stdin.txt");
+                        write(&path, "unread");
+                        let file = std::fs::File::open(&path).unwrap();
+                        let mut proof = file.try_clone().unwrap();
+                        cmd.stdin(Stdio::from(file));
+                        let out = run_with_timeout(cmd, Duration::from_secs(60));
+                        assert_refusal(
+                            &out,
+                            &harness,
+                            Refusal {
+                                label: &format!("{form:?} {option} {source}"),
+                                runtime_log_before: &runtime_log_before,
+                            },
+                        );
+                        proof.read_to_end(&mut remaining).unwrap();
+                    }
+                }
+                assert_eq!(remaining, b"unread", "{form:?} {option} {source}");
+            }
+        }
+    }
+}
+
+/// What one refusal attempt is: two unrelated `&str`s would be easy to swap, so
+/// they travel together and are named here.
+struct Refusal<'a> {
+    /// The attempt being asserted, for failure messages.
+    label: &'a str,
+    /// The fake runtime's invocation log before this launch.
+    runtime_log_before: &'a str,
+}
+
+/// The shared oracle for a pre-boot refusal: status 2, the actionable text, no
+/// new runtime invocation and no guest-looking output.
+fn assert_refusal(out: &Output, harness: &Harness, attempt: Refusal<'_>) {
+    let Refusal {
+        label,
+        runtime_log_before,
+    } = attempt;
+    let stderr = stderr_of(out);
+    assert_eq!(out.status.code(), Some(2), "{label}: {stderr}");
+    assert!(
+        stderr.contains("--tty (-t) requires terminal stdin"),
+        "{label}: {stderr}"
+    );
+    assert!(
+        stderr.contains("--no-tty (-T)"),
+        "{label}: the diagnostic must name the alternative: {stderr}"
+    );
+    assert_eq!(
+        harness.msb_log(),
+        runtime_log_before,
+        "{label}: the runtime was invoked for a refused launch"
+    );
+    assert!(
+        stdout_of(out).is_empty(),
+        "{label}: a refusal must not write guest-looking output"
+    );
+}
+
+/// Conflicting terminal flags are refused before boot on both direct routes.
+#[test]
+fn conflicting_terminal_flags_are_refused_before_boot() {
+    for form in DIRECT_FORMS {
+        for options in [vec!["--tty", "--no-tty"], vec!["-t", "-T"], vec!["-tT"]] {
+            let mut harness = Harness::warm();
+            harness.use_launch_runtime();
+            let runtime_log_before = harness.msb_log();
+            let mut cmd = harness.base_command();
+            cmd.args(&options).args(["--image", BOGUS_IMAGE]);
+            cmd.arg(match form {
+                Form::Run => "run",
+                Form::Separator => "--",
+            });
+            cmd.args(["cat"]);
+            cmd.stdin(Stdio::null());
+            let out = run_with_timeout(cmd, Duration::from_secs(60));
+            let stderr = stderr_of(&out);
+            assert_eq!(out.status.code(), Some(2), "{form:?} {options:?}: {stderr}");
+            assert!(
+                stderr.contains("cannot be used with"),
+                "{form:?} {options:?}: {stderr}"
+            );
+            assert_eq!(
+                harness.msb_log(),
+                runtime_log_before,
+                "{form:?} {options:?}: the runtime was invoked for a refused launch"
+            );
+        }
+    }
+}
+
+/// A prefix terminal control is refused for a catalog tool and for `shell`,
+/// before any runtime work: the flag cannot apply to a legacy launch.
+#[test]
+fn catalog_launches_refuse_a_prefix_terminal_control_before_boot() {
+    for (options, tool) in [
+        (vec!["-t"], "claude"),
+        (vec!["--no-tty"], "claude"),
+        (vec!["-T"], "shell"),
+    ] {
+        let mut harness = Harness::warm();
+        harness.use_launch_runtime();
+        let runtime_log_before = harness.msb_log();
+        let mut cmd = harness.base_command();
+        cmd.args(&options).arg(tool);
+        cmd.stdin(Stdio::null());
+        let out = run_with_timeout(cmd, Duration::from_secs(60));
+        let stderr = stderr_of(&out);
+        assert_eq!(out.status.code(), Some(2), "{options:?} {tool}: {stderr}");
+        assert!(
+            stderr.contains("applies only to direct commands"),
+            "{options:?} {tool}: {stderr}"
+        );
+        assert_eq!(
+            harness.msb_log(),
+            runtime_log_before,
+            "{options:?} {tool}: the runtime was invoked for a refused launch"
+        );
+    }
+}
+
 /// A custom catalog — and a hostile configured `shell` — grants a direct launch
 /// nothing: no command, default arguments, environment, provider, network
 /// request, transitive tool or persist declaration is inherited.

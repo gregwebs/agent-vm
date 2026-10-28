@@ -309,14 +309,22 @@ writes `build/msb`. Build release, then dev, before the first custom-image run:
 ./script/build/macos.sh --dev   # writes build/msb-dev and target/macos-dev/
 ```
 
+A native run that selects any `custom-image-direct-terminal-*` row also needs
+`AGENT_VM_E2E_TERMINAL_EVIDENCE=<absolute empty directory>`: the driver writes a
+JSON receipt plus raw captures per case into an exclusively created per-row child
+there, outside `$WORK`, and the run validates the root's emptiness once. Nothing
+about the invocation has to hide the caller's terminal — the script detaches each
+driver process itself.
+
 `AGENT_VM_BIN`/`AGENT_VM_DEV_BIN` name that debug launcher, which every ordinary
 row runs against the release-built runtime; `AGENT_VM_RELEASE_BIN` (default
 `target/macos/bin/agent-vm`) is the release launcher the retained-default,
 upgrade and host-pin rows run and refuse to skip. `AGENT_VM_E2E_ONLY_ROWS` takes
-exact `run_check` names, space separated, and silently ignores a name that
-matches nothing, so an exit 0 or `0 failed` does not prove the rows you meant
-ran: select `harness-negative` explicitly and compare the entered/PASS rows with
-the list.
+exact `run_check` names, space separated. An unmatched name now **fails the run**
+(the script lists every registered row and exits nonzero), so a filter can no
+longer certify zero cases — but a valid filter still does not prove a row was
+entered: compare the entered/PASS rows with the list, and select
+`harness-negative` explicitly to run the harness self-test.
 
 The release join runs the actual installed candidate with `env -i`, private
 state/cache, no image override/debug seam on first default acquisition, calibrated

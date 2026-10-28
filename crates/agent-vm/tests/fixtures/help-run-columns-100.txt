@@ -12,6 +12,8 @@ Examples:
   agent-vm -- make test                the top-level `--` spelling is equivalent
   agent-vm run printf '%s\n' '$HOME'   literal argv: prints $HOME, no expansion
   agent-vm run bash -c 'echo $HOME'    shell syntax needs an explicit shell
+  agent-vm -t run htop                 force a PTY (needs terminal stdin)
+  agent-vm -T run build.sh >out.log    force streaming: separate stdout/stderr
 
 Launch options go before `run` or the top-level `--`. Every argument after the
 program is literal: no expansion, splitting, globbing, deduplication, tool
@@ -24,6 +26,12 @@ when it is present but not executable (or is a directory named by path), 125 for
 an ordinary direct launcher failure, otherwise the program's own status. A bare
 name that resolves to a directory counts as not found (127).
 
-Piped or redirected stdin is forwarded to the program byte-for-byte, and host EOF
-closes its stdin; setup and the project hook see EOF. Terminal overrides and
-signal forwarding are not implemented yet; see USAGE.md (issues #400-#401).
+A PTY is used automatically when **both** stdin and stdout are terminals (stderr
+is irrelevant); otherwise the launch streams, keeping guest stdout and stderr
+separate and forwarding host stdin. `-t`/`--tty` forces a PTY and needs terminal
+stdin; `-T`/`--no-tty` forces streaming, even from a terminal. Both must come
+before `run` or the top-level `--`. Under a PTY the guest's output is one merged
+terminal stream and resizes are forwarded; direct commands have no detach mode, so
+`Ctrl-]` is guest input. Streamed or redirected stdin is forwarded byte-for-byte
+and host EOF closes it; setup and the project hook see EOF. Signal forwarding is
+not implemented yet; see USAGE.md (issue #401).
