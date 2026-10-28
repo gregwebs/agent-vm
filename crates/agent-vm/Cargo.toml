@@ -69,8 +69,10 @@ microsandbox-runtime = { path = "../../vendor/microsandbox/crates/runtime", defa
 # so this adds no new sea-orm compilation. See issue #30.
 sea-orm = { version = "1.1", default-features = false, features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
 # `process` gives image_build.rs the async `docker buildx build` child; the
-# other features predate it.
-tokio = { version = "1.42", features = ["macros", "process", "rt-multi-thread", "time"] }
+# other features predate it. `sync` is direct_input.rs's chunk channel (tokio's
+# unification already enabled it, so this names the dependency rather than
+# adding one).
+tokio = { version = "1.42", features = ["macros", "process", "rt-multi-thread", "sync", "time"] }
 # `wrap_help` makes clap detect the terminal width and wrap long help
 # text to it; without it the multi-paragraph `--help` prose renders as
 # unbroken one-line-per-paragraph walls.

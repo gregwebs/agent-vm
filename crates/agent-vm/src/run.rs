@@ -17,6 +17,7 @@ use crate::boot_image::{self, ImageArgs};
 use crate::config::{self, ConfiguredImages, Tool};
 use crate::credential_provider;
 use crate::credential_resolver::{CredentialPreflight, MissingCredentialPolicy};
+use crate::direct_input::{GuestInputStatus, InputFailure, InputPump, InputSource};
 use crate::image_contract;
 use crate::launch_target::{LaunchTarget, ProgramGuard};
 use crate::mount;
@@ -395,8 +396,9 @@ when it is present but not executable (or is a directory named by path), 125 for
 an ordinary direct launcher failure, otherwise the program's own status. A bare
 name that resolves to a directory counts as not found (127).
 
-Slice 1: no streamed stdin, terminal overrides or signal forwarding yet; see
-USAGE.md (issues #399-#401).";
+Piped or redirected stdin is forwarded to the program byte-for-byte, and host EOF
+closes its stdin; setup and the project hook see EOF. Terminal overrides and
+signal forwarding are not implemented yet; see USAGE.md (issues #400-#401).";
 
 /// Fixed text for a scrubbed parse error on a known-direct route: no supplied
 /// value can be among it, and the direct usage line replaces administrative
@@ -1572,14 +1574,17 @@ pub(crate) async fn launch(
     //    lines whose nameserver value contains a colon — IPv4 addresses
     //    never do, IPv6 addresses always do.
     //
-    // 2. Redirects stdin to /dev/null when not on a TTY. exec_with's
-    //    default `StdinMode::Null` was observed *not* to satisfy codex
-    //    0.133's `exec` subcommand: codex blocks indefinitely on what it
-    //    thinks is unbounded interactive input. Backgrounding codex (`&`)
-    //    fixed it (bash auto-redirects stdin to /dev/null for background
-    //    jobs) but we can't background the user's agent. An explicit
-    //    `exec < /dev/null` gives codex a real /dev/null fd and it
-    //    proceeds. `[ -t 0 ]` keeps interactive TTY launches unaffected.
+    // 2. Gives the guest a /dev/null stdin when it is not a terminal. The
+    //    exec request's default `StdinMode::Null` does **not** do that by
+    //    itself: agentd always hands a non-PTY child a pipe, and without a
+    //    writer it blocks a reader instead of ending it (evidence: codex
+    //    0.133's `exec` subcommand blocked indefinitely; backgrounding codex
+    //    (`&`) fixed it because bash then substitutes /dev/null). So the
+    //    bootstrap supplies the fd. A legacy tool/shell launch does it with
+    //    `[ -t 0 ] || exec < /dev/null` after the seed hooks; a direct
+    //    streaming launch instead requests `stdin_pipe()` and runs setup in a
+    //    `{ … } </dev/null` group, because the *program* owns that input
+    //    (#399, `GuestInput`).
     // Phase 9 adds a project-runtime hook (`.agent-vm.runtime.sh`):
     // if the file exists at the project root inside the guest, source
     // it before exec'ing the agent. Project owners use this for
@@ -1599,19 +1604,28 @@ pub(crate) async fn launch(
     // Assemble the in-guest `bash -c` line via [`AgentShellLine`], which is
     // unit-tested directly. The IPv6-nameserver strip is the
     // `STRIP_IPV6_NAMESERVERS` const (see its doc comment / PLAN.md B3).
+    // One input/output decision for the whole launch, taken before rendering so
+    // the bootstrap and the exec request cannot disagree about who owns stdin.
+    let exec_io = if std::io::stdin().is_terminal() {
+        ExecIo::Attach
+    } else {
+        ExecIo::Stream
+    };
+    let guest_input = guest_input_for(invocation.guard(), exec_io);
     let shell_line = AgentShellLine {
         guard: invocation.guard(),
         project_guest_path: &project_guest_path,
         image: &image,
         command: inner_cmd,
         args: inner_argv,
+        input: guest_input,
     }
     .render();
     let cmd = image_contract::LAUNCH_SHELL;
     let shell_argv: Vec<String> = vec!["-c".into(), shell_line];
 
     let t_run = Instant::now();
-    let exit = if std::io::stdin().is_terminal() {
+    let exit = if exec_io == ExecIo::Attach {
         notices.emit(format!("==> Attaching to {command_display}"))?;
         // Pin the agent's cwd to the real project path via the exec request
         // (vsock, byte-safe), NOT libkrun's `KRUN_WORKDIR` — which may be the
@@ -1658,15 +1672,24 @@ pub(crate) async fn launch(
         // commands (codex exec can take >30s for a single response) and
         // lets us inspect partial output when the user Ctrl-Cs or the
         // shell times out.
+        //
+        // A direct command also gets this process's stdin forwarded
+        // byte-for-byte (#399): it requests `stdin_pipe()` and the lifecycle
+        // pumps host stdin to the guest until EOF. Tool and shell launches do
+        // not request a pipe and keep relying on the bootstrap's own
+        // `/dev/null` redirect — their contract is unchanged.
         notices.emit(format!(
             "==> Running {command_display} in sandbox (no TTY; streaming output)"
         ))?;
+        let forward_input = guest_input == GuestInput::ReservedForProgram;
         let handle = match sandbox
             .exec_stream_with(cmd, |e| {
-                e.args(shell_argv)
+                let e = e
+                    .args(shell_argv)
                     .cwd(project_guest_path.clone())
                     .user(exec_user.clone())
-                    .env("PATH", exec_path.clone())
+                    .env("PATH", exec_path.clone());
+                if forward_input { e.stdin_pipe() } else { e }
             })
             .await
         {
@@ -1694,13 +1717,23 @@ pub(crate) async fn launch(
         // `sandbox.wait()` resolving first means the exec await can never hang on
         // a VMM that's already gone, no matter how the event stream behaves.
         let runtime_exit: RuntimeExit = Box::pin(sandbox.wait());
+        // Nothing is read or spawned here: `InputSource` only holds the reader
+        // until the lifecycle owns a handle to pump into (F12).
+        let input = if forward_input {
+            StreamInput::Forward(InputSource::new(std::io::stdin()))
+        } else {
+            StreamInput::NotForwarded
+        };
         stream_exec_with_cleanup(
             &sandbox,
             handle,
             runtime_exit,
-            &mut stdout,
-            &mut stderr,
-            output_policy,
+            input,
+            ExecOutput {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+                policy: output_policy,
+            },
             ExecContext {
                 image: &image,
                 log_dir: &sandbox_log_dir(&session.sandbox_name).display().to_string(),
@@ -1776,92 +1809,307 @@ async fn forward_stream_bytes(
     Ok(())
 }
 
+/// One streamed exec's guest output. The two streams stay separate (they are
+/// different destinations, and `forward_stream_bytes` names which one failed),
+/// and `policy` decides whether a sink failure is the launcher's problem.
+struct ExecOutput<'a, O: tokio::io::AsyncWrite + Unpin, E: tokio::io::AsyncWrite + Unpin> {
+    stdout: &'a mut O,
+    stderr: &'a mut E,
+    policy: OutputErrorPolicy,
+}
+
 /// The named launch context the exec lifecycle diagnostics are built from.
 struct ExecContext<'a> {
     image: &'a str,
     log_dir: &'a str,
 }
 
+/// What a streamed exec does with guest stdin (#399).
+enum StreamInput<R> {
+    /// Shell/tool launches (legacy contract): nothing is forwarded; the
+    /// bootstrap's own `[ -t 0 ] || exec < /dev/null` supplies EOF.
+    NotForwarded,
+    /// Direct streaming: forward this source until EOF.
+    Forward(InputSource<R>),
+}
+
 /// The exec lifecycle for a streamed (non-TTY) launch.
 ///
-/// It **owns** the event handle and the pinned runtime wait future, borrows the
-/// sinks, and returns the guest status or the primary failure. Both handles are
-/// dropped unconditionally before teardown: the wait future may hold the
-/// child-handle mutex, so a teardown that ran first would deadlock (#258).
-async fn stream_exec_with_cleanup<T: ExecTeardown>(
+/// It **owns** the event handle, the pinned runtime wait future and — for a
+/// direct command — the host-input pump; it borrows the output sinks and
+/// returns the guest status or the primary failure.
+///
+/// There is exactly **one** release sequence, and every exit uses it: input
+/// start-up failure, every loop break, and success all fall through to
+/// `pump.stop()` → drop the wait future → drop the handle → teardown. The wait
+/// future may hold the child-handle mutex, so a teardown that ran first would
+/// deadlock (#258); a pump still blocked in a guest write must be cancelled
+/// before the handle it writes through is released (#399). Nothing between
+/// taking ownership and that epilogue may `?`, `return` or tear down.
+async fn stream_exec_with_cleanup<
+    T: ExecTeardown,
+    H: ExecEventSource,
+    R: std::io::Read + Send + 'static,
+    O: tokio::io::AsyncWrite + Unpin,
+    E: tokio::io::AsyncWrite + Unpin,
+>(
     teardown: &T,
-    mut handle: impl ExecEventSource,
+    mut handle: H,
     mut runtime_exit: RuntimeExit<'_>,
-    stdout: &mut (impl tokio::io::AsyncWrite + Unpin),
-    stderr: &mut (impl tokio::io::AsyncWrite + Unpin),
-    policy: OutputErrorPolicy,
+    input: StreamInput<R>,
+    output: ExecOutput<'_, O, E>,
     context: ExecContext<'_>,
 ) -> Result<i32> {
     use microsandbox::sandbox::exec::ExecEvent;
-    let stream_result: Result<i32> = loop {
-        match next_exec_step(
-            &mut handle,
-            &mut runtime_exit,
-            STREAM_END_RUNTIME_EXIT_GRACE,
-        )
-        .await
-        {
-            ExecStep::Event(ExecEvent::Stdout(bytes)) => {
-                // Break through the loop result, never `?` out: the wait future
-                // and handle must be dropped by this function before teardown.
-                if let Err(primary) =
-                    forward_stream_bytes(stdout, &bytes, GuestStream::Stdout, policy).await
+    let ExecOutput {
+        stdout,
+        stderr,
+        policy,
+    } = output;
+    let mut pump: Option<InputPump> = None;
+    let stream_result: Result<i32> = match start_stream_input(&mut handle, input) {
+        // F8/F9: nothing is running and the sink (if any) is already dropped.
+        // The error joins the same epilogue as every other outcome; a start-up
+        // failure must not have a release order of its own.
+        Err(primary) => Err(primary),
+        Ok(started) => {
+            pump = started;
+            let mut pending_input_failure: Option<PendingInputFailure> = None;
+            loop {
+                // Every arm either continues or `break`s a value: never `?` out,
+                // because the wait future and handle must be dropped here.
+                match next_loop_step(
+                    &mut pump,
+                    &mut pending_input_failure,
+                    &mut handle,
+                    &mut runtime_exit,
+                )
+                .await
                 {
-                    break Err(primary);
+                    LoopStep::Exec(ExecStep::Event(ExecEvent::Stdout(bytes))) => {
+                        if let Err(primary) =
+                            forward_stream_bytes(stdout, &bytes, GuestStream::Stdout, policy).await
+                        {
+                            break Err(primary);
+                        }
+                    }
+                    LoopStep::Exec(ExecStep::Event(ExecEvent::Stderr(bytes))) => {
+                        if let Err(primary) =
+                            forward_stream_bytes(stderr, &bytes, GuestStream::Stderr, policy).await
+                        {
+                            break Err(primary);
+                        }
+                    }
+                    LoopStep::Exec(ExecStep::Event(ExecEvent::Exited { code })) => {
+                        // A failure that has already happened outranks the
+                        // guest's status: it ran on truncated input, so stream
+                        // loss is never a success. A failure that has not
+                        // happened by now does not exist and is not waited for.
+                        break match pending_input_failure.take() {
+                            Some(pending) => Err(pending.failure.into_error()),
+                            None => Ok(code),
+                        };
+                    }
+                    LoopStep::Exec(ExecStep::Event(ExecEvent::Failed(payload))) => {
+                        // A contract breach (missing/unrunnable `bash`) becomes
+                        // the image diagnostic; anything else keeps an escaped
+                        // message rather than the Rust `Debug` dump (#258).
+                        break Err(exec_failure_primary(
+                            image_contract::launch_shell_spawn_diagnostic(context.image, &payload),
+                            anyhow::anyhow!(
+                                "exec session failed: {}",
+                                config::escape_str(&payload.message)
+                            ),
+                        ));
+                    }
+                    LoopStep::Exec(ExecStep::Event(ExecEvent::Started { .. })) => {}
+                    LoopStep::Exec(ExecStep::Event(ExecEvent::StdinError(error))) => {
+                        // Legacy launches never requested a stdin pipe, so the
+                        // runtime's write failures stay ignored exactly as
+                        // before #399 (their contract is unchanged).
+                        if pump.is_none() {
+                            continue;
+                        }
+                        match crate::direct_input::classify_stdin_error(&error) {
+                            // The guest stopped reading (`head`, an early exit).
+                            // Expected: stop feeding it and let its own status
+                            // stand — no broken-pipe warning, no 125.
+                            GuestInputStatus::GuestClosedInput => {
+                                if let Some(pump) = pump.as_mut() {
+                                    pump.stop().await;
+                                }
+                            }
+                            GuestInputStatus::Failed(detail) => {
+                                break Err(anyhow::anyhow!(
+                                    "forwarding stdin to the guest failed: {detail}"
+                                ));
+                            }
+                        }
+                    }
+                    // Every host byte reached the runtime and guest stdin was
+                    // closed. That is the end of *forwarding*, not proof the
+                    // program read it: a guest that exits early can leave
+                    // runtime-buffered input unread (no loss bound end to end).
+                    // Keep looping for its own exit status.
+                    LoopStep::Input(Ok(_end)) => {}
+                    LoopStep::Input(Err(failure)) => {
+                        if !failure.awaits_session_end() {
+                            // The guest is (or will be) waiting for an EOF that
+                            // is never coming: waiting for it would hang.
+                            break Err(failure.into_error());
+                        }
+                        // A transport failure may have taken the session with
+                        // it; give the runtime's own terminal event a bounded
+                        // chance to arrive so `RuntimeExited` keeps its
+                        // msb-exit.log diagnostic.
+                        pending_input_failure = Some(PendingInputFailure {
+                            failure,
+                            deadline: Box::pin(tokio::time::sleep(STREAM_END_RUNTIME_EXIT_GRACE)),
+                        });
+                    }
+                    LoopStep::InputGraceExpired(failure) => break Err(failure),
+                    LoopStep::Exec(ExecStep::StreamEnded) => {
+                        break Err(anyhow::anyhow!(
+                            "exec session event stream ended without Exited (agentd disconnect or \
+                             microsandbox bug; partial output above; full logs: {}){}",
+                            context.log_dir,
+                            forwarding_also_failed(pending_input_failure.take())
+                        ));
+                    }
+                    LoopStep::Exec(ExecStep::RuntimeExited(detail)) => {
+                        break Err(anyhow::anyhow!(
+                            "sandbox process exited unexpectedly while the exec stream was still \
+                             open ({detail}); partial output above; see msb-exit.log under {} for \
+                             the VMM's post-mortem record{}",
+                            context.log_dir,
+                            forwarding_also_failed(pending_input_failure.take())
+                        ));
+                    }
                 }
-            }
-            ExecStep::Event(ExecEvent::Stderr(bytes)) => {
-                // Break through the loop result, never `?` out: the wait future
-                // and handle must be dropped by this function before teardown.
-                if let Err(primary) =
-                    forward_stream_bytes(stderr, &bytes, GuestStream::Stderr, policy).await
-                {
-                    break Err(primary);
-                }
-            }
-            ExecStep::Event(ExecEvent::Exited { code }) => break Ok(code),
-            ExecStep::Event(ExecEvent::Failed(payload)) => {
-                // A contract breach (missing/unrunnable `bash`) becomes the
-                // image diagnostic; anything else keeps an escaped message
-                // rather than the Rust `Debug` dump of the payload (#258).
-                break Err(exec_failure_primary(
-                    image_contract::launch_shell_spawn_diagnostic(context.image, &payload),
-                    anyhow::anyhow!(
-                        "exec session failed: {}",
-                        config::escape_str(&payload.message)
-                    ),
-                ));
-            }
-            ExecStep::Event(ExecEvent::Started { .. } | ExecEvent::StdinError(_)) => {}
-            ExecStep::StreamEnded => {
-                break Err(anyhow::anyhow!(
-                    "exec session event stream ended without Exited (agentd disconnect or \
-                     microsandbox bug; partial output above; full logs: {})",
-                    context.log_dir
-                ));
-            }
-            ExecStep::RuntimeExited(detail) => {
-                break Err(anyhow::anyhow!(
-                    "sandbox process exited unexpectedly while the exec stream was still \
-                     open ({detail}); partial output above; see msb-exit.log under {} for \
-                     the VMM's post-mortem record",
-                    context.log_dir
-                ));
             }
         }
     };
-    // Cancels futures that may hold the child-handle mutex. Unconditional, and
-    // before every streaming teardown path.
+    // The one release sequence: the pump (and through it the sink), then the
+    // wait future, then the handle. Unconditional, and before every teardown
+    // path including a start-up failure.
+    if let Some(pump) = pump.as_mut() {
+        pump.stop().await;
+    }
+    drop(pump);
     drop(runtime_exit);
     drop(handle);
     match stream_result {
         Ok(code) => Ok(code),
         Err(primary) => Err(finish_failed_exec(teardown, primary, context.log_dir).await),
+    }
+}
+
+/// The suffix that keeps a recorded transport failure visible when the
+/// session's own terminal event wins the race.
+fn forwarding_also_failed(pending: Option<PendingInputFailure>) -> String {
+    match pending {
+        Some(pending) => format!(
+            "; forwarding stdin also failed: {}",
+            pending.failure.into_error()
+        ),
+        None => String::new(),
+    }
+}
+
+/// Take the sink out of the handle the lifecycle owns and start forwarding.
+/// `Ok(None)` for a legacy launch. On error nothing is running and the sink is
+/// already dropped, so the caller's epilogue has nothing extra to release.
+fn start_stream_input<H: ExecEventSource, R: std::io::Read + Send + 'static>(
+    handle: &mut H,
+    input: StreamInput<R>,
+) -> Result<Option<InputPump>> {
+    let StreamInput::Forward(source) = input else {
+        return Ok(None);
+    };
+    // F8. `stdin_pipe()` was requested for this exec, so a missing sink is a
+    // runtime contract breach, not an ordinary "no stdin".
+    let sink = handle.take_stdin().ok_or_else(|| {
+        anyhow::anyhow!("the runtime did not provide a stdin pipe for the direct command")
+    })?;
+    // F9.
+    Ok(Some(source.start(sink).map_err(anyhow::Error::new)?))
+}
+
+/// One step of the streaming loop. [`next_loop_step`] produces it; the loop
+/// acts on it. Named so precedence can be tested directly (L6a).
+enum LoopStep {
+    Exec(ExecStep),
+    Input(Result<crate::direct_input::InputEnd, InputFailure>),
+    /// The recorded transport failure's grace expired; carries the launcher
+    /// error it reports.
+    InputGraceExpired(anyhow::Error),
+}
+
+/// A transport failure waiting, bounded, for the session's own terminal event.
+/// One struct, so "a deadline without a failure" cannot be represented.
+struct PendingInputFailure {
+    failure: InputFailure,
+    deadline: std::pin::Pin<Box<tokio::time::Sleep>>,
+}
+
+/// Race the input pump, an expired input-failure grace and the exec event
+/// stream, in that order.
+///
+/// The order **is** the precedence, and `biased;` makes it deterministic:
+///
+/// 1. the pump ends at most once, so it cannot starve anything, and an input
+///    failure that already happened must beat a ready `Exited` — stream loss is
+///    never a guest success;
+/// 2. an expired grace for a recorded transport failure is deliberately ahead
+///    of ordinary event consumption: a continuously ready stdout stream must
+///    not be able to hold the bounded failure return open forever (L7b). Before
+///    expiry this arm is `Pending`, so it costs nothing — do not "optimise" it
+///    back below the exec arm;
+/// 3. ordinary exec events last.
+///
+/// `next_exec_step` is cancel-safe enough to re-poll: `recv()` on the event
+/// channel is, `runtime_exit` is polled by reference, and a stream-end grace
+/// that gets interrupted simply restarts on the next turn (`recv()` keeps
+/// returning `None`).
+async fn next_loop_step(
+    pump: &mut Option<InputPump>,
+    pending: &mut Option<PendingInputFailure>,
+    handle: &mut impl ExecEventSource,
+    runtime_exit: &mut RuntimeExit<'_>,
+) -> LoopStep {
+    let pump_running = pump.as_ref().is_some_and(InputPump::is_running);
+    tokio::select! {
+        biased;
+        end = pump_finished(pump), if pump_running => LoopStep::Input(end),
+        failure = input_grace_expired(pending), if pending.is_some() => {
+            LoopStep::InputGraceExpired(failure)
+        }
+        step = next_exec_step(handle, runtime_exit, STREAM_END_RUNTIME_EXIT_GRACE) => {
+            LoopStep::Exec(step)
+        }
+    }
+}
+
+/// [`InputPump::finished`] over the optional pump; pending when there is none,
+/// so the select arm needs no `unwrap`/`unreachable!`.
+async fn pump_finished(
+    pump: &mut Option<InputPump>,
+) -> Result<crate::direct_input::InputEnd, InputFailure> {
+    match pump.as_mut() {
+        Some(pump) => pump.finished().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The pending input-failure grace once it expires; pending while there is
+/// none. The error is rendered at expiry so the record stays in place.
+async fn input_grace_expired(pending: &mut Option<PendingInputFailure>) -> anyhow::Error {
+    match pending.as_mut() {
+        Some(pending) => {
+            (&mut pending.deadline).await;
+            pending.failure.error()
+        }
+        None => std::future::pending().await,
     }
 }
 
@@ -2070,13 +2318,29 @@ enum ExecStep {
 /// requires a booted sandbox). Implemented for `ExecHandle` by delegating
 /// to its inherent `recv` — the trait method is named the same so callers
 /// don't need to think about which one they're using.
+///
+/// It also hands out the guest stdin sink, so [`stream_exec_with_cleanup`]
+/// takes stdin out of the handle **it** owns: a start failure cannot escape
+/// the one release sequence, and the sink cannot outlive the handle (#399).
 trait ExecEventSource {
+    /// The guest stdin sink: `ExecSink` in production.
+    type Stdin: crate::direct_input::GuestStdin;
+
     async fn recv(&mut self) -> Option<microsandbox::sandbox::exec::ExecEvent>;
+
+    /// The sink, when the exec was started with `stdin_pipe()`. At most once.
+    fn take_stdin(&mut self) -> Option<Self::Stdin>;
 }
 
 impl ExecEventSource for microsandbox::sandbox::exec::ExecHandle {
+    type Stdin = microsandbox::sandbox::exec::ExecSink;
+
     async fn recv(&mut self) -> Option<microsandbox::sandbox::exec::ExecEvent> {
         microsandbox::sandbox::exec::ExecHandle::recv(self).await
+    }
+
+    fn take_stdin(&mut self) -> Option<Self::Stdin> {
+        microsandbox::sandbox::exec::ExecHandle::take_stdin(self)
     }
 }
 
@@ -2576,6 +2840,40 @@ pub(crate) fn inner_argv(tool: &Tool, tool_args: Vec<String>) -> Vec<String> {
     inner_args
 }
 
+/// How the guest command is connected to this process (#399's input half;
+/// #400 owns the policy that selects it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExecIo {
+    /// A PTY: terminal input stays terminal input.
+    Attach,
+    /// stdout/stderr streamed, guest stdin fed from this process.
+    Stream,
+}
+
+/// Who owns non-terminal guest stdin during the bootstrap (ADR-0052).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuestInput {
+    /// Legacy and attach: setup runs first, then `[ -t 0 ] || exec < /dev/null`.
+    /// Byte-identical to every pre-#399 launch.
+    DiscardWhenNotTerminal,
+    /// Direct streaming (#399): all setup, the hook and the guard run in one
+    /// `{ }` group whose stdin is `/dev/null`; bash restores the real stdin for
+    /// the program's `exec` only.
+    ReservedForProgram,
+}
+
+/// The one route table from launch shape to input ownership.
+///
+/// #400 replaces the `ExecIo` selection; this mapping is the part #399 pins,
+/// because it is what makes "a direct streamed command owns its input" true
+/// while shell, tool and direct **attach** launches keep the legacy line.
+fn guest_input_for(guard: ProgramGuard, io: ExecIo) -> GuestInput {
+    match (guard, io) {
+        (ProgramGuard::Direct, ExecIo::Stream) => GuestInput::ReservedForProgram,
+        _ => GuestInput::DiscardWhenNotTerminal,
+    }
+}
+
 /// The in-guest `bash -c` line: the prelude (IPv6-nameserver strip, seed
 /// entry points, stdin redirect, project runtime hook), then the selected
 /// program's presence guard, then `exec` of that program with its args. Pure
@@ -2591,27 +2889,53 @@ struct AgentShellLine<'a> {
     command: &'a str,
     args: &'a [String],
     guard: ProgramGuard,
+    input: GuestInput,
 }
 
 impl AgentShellLine<'_> {
-    /// Prelude, guard, then `exec` with the configured argv.
+    /// Setup, the hook, the guard, then `exec` with the configured argv.
     fn render(&self) -> String {
+        self.render_with_setup(&format!("{STRIP_IPV6_NAMESERVERS}\n{RUN_IMAGE_SEED_HOOKS}"))
+    }
+
+    /// [`Self::render`] with the setup text substituted. The production setup
+    /// edits `/etc/resolv.conf`, so a host test (and [`direct_tail`]-style
+    /// helpers) pass host-safe text instead (#258).
+    fn render_with_setup(&self, setup: &str) -> String {
+        let hook = self.project_hook();
+        let guard = self.program_guard();
+        let exec = self.exec_line();
+        match self.input {
+            // Byte-identical to every pre-#399 launch: setup, then the
+            // redirect that supplies /dev/null, then the hook, the guard and
+            // the program's own `exec`.
+            GuestInput::DiscardWhenNotTerminal => {
+                format!("{setup}\n[ -t 0 ] || exec < /dev/null\n{hook}\n{guard}{exec}")
+            }
+            // A **group, not a subshell**: a hook's exports, `cd` and `exit`
+            // keep their meaning. Bash saves fd 0 for the group, restores it
+            // before `exec`, and closes its saved copy first — on bash 3.2
+            // too, unlike a reserved descriptor (ADR-0052). So no setup child
+            // inherits a copy of the command's input, and the program's `exec`
+            // is the only command that runs with it on fd 0.
+            GuestInput::ReservedForProgram => {
+                format!("{{\n{setup}\n{hook}\n{guard}\n}} </dev/null{exec}")
+            }
+        }
+    }
+
+    /// The project-runtime hook, unchanged from #258/#398: sourced after the
+    /// image seed hooks so its `PATH` export counts for the guard, and a
+    /// non-zero status aborts the launch with that status.
+    fn project_hook(&self) -> String {
         let path = guest_script_word(self.project_guest_path);
-        let prelude = format!(
-            "{STRIP_IPV6_NAMESERVERS}\n\
-             {RUN_IMAGE_SEED_HOOKS}\n\
-             [ -t 0 ] || exec < /dev/null\n\
-             _hook={path}/.agent-vm.runtime.sh\n\
+        format!(
+            "_hook={path}/.agent-vm.runtime.sh\n\
              if [ -f \"$_hook\" ]; then\n\
              \techo \"==> sourcing $_hook\" >&2\n\
              \tcd {path} && . \"$_hook\" || {{ rc=$?; echo \"==> .agent-vm.runtime.sh failed (exit $rc)\" >&2; exit $rc; }}\n\
              fi",
-        );
-        let mut shell_line = prelude;
-        shell_line.push('\n');
-        shell_line.push_str(&self.program_guard());
-        shell_line.push_str(&self.exec_line());
-        shell_line
+        )
     }
 
     /// The final `exec` of the configured command and argv. Split from
@@ -2747,6 +3071,9 @@ fn launch_mount_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::direct_input::test_support::{
+        GatedGuestStdin, GatedReader, ReaderStep, Receipt, Receipts, SinkStep,
+    };
     use crate::test_fixtures::write_executable;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -3239,8 +3566,14 @@ mod tests {
     struct StubEvents(tokio::sync::mpsc::Receiver<microsandbox::sandbox::exec::ExecEvent>);
 
     impl ExecEventSource for StubEvents {
+        type Stdin = crate::direct_input::test_support::GatedGuestStdin;
+
         async fn recv(&mut self) -> Option<microsandbox::sandbox::exec::ExecEvent> {
             self.0.recv().await
+        }
+
+        fn take_stdin(&mut self) -> Option<Self::Stdin> {
+            None
         }
     }
 
@@ -3704,9 +4037,18 @@ mod tests {
         args: &'a [String],
         before: &'a str,
         path: &'a str,
+        input: GuestInput,
     }
 
-    // Execute precisely the composed production tail, never the host-mutating prelude.
+    /// Execute precisely the composed production line, never the host-mutating
+    /// prelude: `render_with_setup` with `true` in place of the `/etc/resolv.conf`
+    /// strip and the caller's prefix in place of the hook body.
+    ///
+    /// Both input shapes run, because #398's guard is shared by the legacy tail
+    /// and the #399 reserved group: the caller names the primary shape and the
+    /// other one must produce the same status and the same program stdout. Only
+    /// status and stdout are compared — a prefix that mutates the filesystem is
+    /// not idempotent, so its stderr may legitimately differ on the second run.
     fn direct_tail(tail: DirectTail<'_>) -> std::process::Output {
         let DirectTail {
             bash,
@@ -3714,22 +4056,55 @@ mod tests {
             args,
             before,
             path,
+            input,
         } = tail;
-        let line = AgentShellLine {
-            guard: ProgramGuard::Direct,
-            project_guest_path: "/work",
-            image: "unused",
-            command: program,
-            args,
+        let run = |input| {
+            let line = AgentShellLine {
+                guard: ProgramGuard::Direct,
+                // A path the host cannot have: the hook is never sourced here,
+                // and the caller's `before` stands in for it.
+                project_guest_path: "/nonexistent-agent-vm-test-project",
+                image: "unused",
+                command: program,
+                args,
+                input,
+            };
+            let script = line.render_with_setup(&format!("true\n{before}"));
+            // The shape is the rendered one, never a hand-assembled tail: a
+            // helper that ignored `input` would make these tests advertise
+            // coverage they do not have (#399 review non-blocking 1).
+            assert!(
+                script.contains(match input {
+                    GuestInput::ReservedForProgram => "} </dev/null; exec -- ",
+                    GuestInput::DiscardWhenNotTerminal => "[ -t 0 ] || exec < /dev/null",
+                }),
+                "{input:?} shape not rendered: {script}"
+            );
+            std::process::Command::new(bash)
+                .clean_descriptors()
+                .args(["-c", &script])
+                .env("PATH", path)
+                .output()
+                .unwrap()
         };
-        std::process::Command::new(bash)
-            .args([
-                "-c",
-                &format!("{before}\n{}{}", line.program_guard(), line.exec_line()),
-            ])
-            .env("PATH", path)
-            .output()
-            .unwrap()
+        let primary = run(input);
+        let crossed = run(match input {
+            GuestInput::ReservedForProgram => GuestInput::DiscardWhenNotTerminal,
+            GuestInput::DiscardWhenNotTerminal => GuestInput::ReservedForProgram,
+        });
+        assert_eq!(
+            crossed.status.code(),
+            primary.status.code(),
+            "{bash} {program:?}: the input shape changed the status\n\
+             primary stderr: {primary_stderr}\nother stderr: {crossed_stderr}",
+            primary_stderr = String::from_utf8_lossy(&primary.stderr),
+            crossed_stderr = String::from_utf8_lossy(&crossed.stderr),
+        );
+        assert_eq!(
+            crossed.stdout, primary.stdout,
+            "{bash} {program:?}: the input shape changed the program's stdout"
+        );
+        primary
     }
 
     fn host_bashes() -> Vec<&'static str> {
@@ -3738,6 +4113,58 @@ mod tests {
             bashes.push("/opt/homebrew/bin/bash");
         }
         bashes
+    }
+
+    /// Run `bash` with no descriptor above stderr inherited from this process.
+    ///
+    /// The bootstrap tests pin what the *bootstrap* leaves open, but `cargo test`
+    /// runs cases in parallel inside one process: a pipe or fifo another case
+    /// holds at that moment is inherited by every child it spawns, and the fd
+    /// probes below then report it as the bootstrap's (CI #454: `b6`, `p0` and
+    /// friends saw two unrelated fifos). Closing 3.. after `fork` and before
+    /// `exec` makes the observation about the bootstrap alone, whatever else the
+    /// suite is doing.
+    trait CleanDescriptors {
+        fn clean_descriptors(&mut self) -> &mut Self;
+    }
+
+    impl CleanDescriptors for std::process::Command {
+        fn clean_descriptors(&mut self) -> &mut Self {
+            use std::os::unix::process::CommandExt as _;
+            // SAFETY: the closure runs in the child between `fork` and `exec`,
+            // where only async-signal-safe work is allowed; `close(2)` on this
+            // process's own descriptors is exactly that. It cannot panic, and a
+            // descriptor that is already closed or was never open is ignored.
+            unsafe {
+                self.pre_exec(|| {
+                    for fd in 3..1024 {
+                        libc::close(fd);
+                    }
+                    Ok(())
+                })
+            }
+        }
+    }
+
+    /// The error `bash -n` reports for `script`, or `None` when bash parses it.
+    ///
+    /// A bootstrap is one `bash -c` line whose brace group only parses as a
+    /// whole, so a test that executes a tail sliced out of it can run a script
+    /// the launcher could never run (#399 review).
+    fn bash_syntax_error(bash: &str, script: &str) -> Option<String> {
+        let output = std::process::Command::new(bash)
+            .clean_descriptors()
+            .args(["-n", "-c", script])
+            .output()
+            .unwrap();
+        (!output.status.success())
+            .then(|| format!("{bash}: {}", String::from_utf8_lossy(&output.stderr)))
+    }
+
+    fn assert_bash_syntax(bash: &str, script: &str) {
+        if let Some(error) = bash_syntax_error(bash, script) {
+            panic!("the rendered bootstrap does not parse\n{error}\nscript:\n{script}");
+        }
     }
 
     #[test]
@@ -3774,6 +4201,7 @@ mod tests {
                 args: &vector,
                 before: "",
                 path: "/usr/bin:/bin",
+                input: GuestInput::ReservedForProgram,
             });
             assert_eq!(output.status.code(), Some(23), "{bash}: {output:?}");
             assert_eq!(output.stdout, expected);
@@ -3784,6 +4212,7 @@ mod tests {
                 args: &direct_args(&["%s\\n", "$HOME"]),
                 before: "",
                 path: "/usr/bin:/bin",
+                input: GuestInput::ReservedForProgram,
             });
             assert!(output.status.success());
             assert_eq!(output.stdout, b"$HOME\n");
@@ -3809,6 +4238,7 @@ mod tests {
                             args: &[],
                             before: "set -e",
                             path: bin.to_str().unwrap(),
+                            input: GuestInput::ReservedForProgram,
                         });
                         assert_eq!(
                             output.status.code(),
@@ -3842,6 +4272,7 @@ mod tests {
                         args: &[],
                         before: "set -e",
                         path: bin.to_str().unwrap(),
+                        input: GuestInput::ReservedForProgram,
                     });
                     assert_eq!(
                         output.status.code(),
@@ -3887,6 +4318,7 @@ mod tests {
                 args: &[],
                 before: &before,
                 path: "/usr/bin:/bin",
+                input: GuestInput::ReservedForProgram,
             });
             assert!(output.status.success(), "{bash}: {output:?}");
             assert_eq!(output.stdout, b"external");
@@ -3903,6 +4335,7 @@ mod tests {
                 args: &[],
                 before: "absent() { exit 99; }; alias absent='exit 98'",
                 path: bin,
+                input: GuestInput::ReservedForProgram,
             });
             assert_eq!(output.status.code(), Some(127), "{bash}: {output:?}");
             assert!(output.stdout.is_empty());
@@ -3960,6 +4393,7 @@ mod tests {
                         args: &[],
                         before: &before,
                         path: "/usr/bin:/bin",
+                        input: GuestInput::ReservedForProgram,
                     });
                     match later {
                         Some(body) => {
@@ -3994,6 +4428,7 @@ mod tests {
                 args: &[],
                 before: "set -e\nset +h",
                 path: bin,
+                input: GuestInput::ReservedForProgram,
             });
             assert!(output.status.success(), "{bash}: {output:?}");
             assert_eq!(output.stdout, b"external");
@@ -4005,6 +4440,7 @@ mod tests {
                     args: &[],
                     before: "set -e\nset +h",
                     path: bin,
+                    input: GuestInput::ReservedForProgram,
                 });
                 assert_eq!(
                     output.status.code(),
@@ -4027,6 +4463,7 @@ mod tests {
             image: "unused",
             command: "probe --help",
             args: &[],
+            input: GuestInput::DiscardWhenNotTerminal,
         }
         .program_guard();
         assert_eq!(guard.matches("hash -r").count(), 1, "{guard}");
@@ -4044,6 +4481,16 @@ mod tests {
         );
     }
 
+    /// The guard sits between the project hook and the `exec`, and a failing
+    /// hook aborts the launch with its own status instead of falling through to
+    /// the program.
+    ///
+    /// Every script here is the **whole** rendered bootstrap run through
+    /// `bash -n` first. The reserved shape cut at `_hook=` keeps the group's
+    /// stray `}`, and the failing hook exits before bash ever reaches it, so the
+    /// sliced form could pass while the launcher's real line was unparseable
+    /// (#399 review). The successful hook below keeps the same run from reading a
+    /// syntax error as an expected failure.
     #[test]
     fn direct_guard_follows_hook_and_hook_failure_prevents_exec() {
         let line = AgentShellLine {
@@ -4052,6 +4499,7 @@ mod tests {
             image: "unused",
             command: "printf",
             args: &[],
+            input: GuestInput::DiscardWhenNotTerminal,
         }
         .render();
         assert!(
@@ -4060,29 +4508,82 @@ mod tests {
         assert!(line.find("[ -t 0 ] || exec < /dev/null").unwrap() < line.find("_hook=").unwrap());
         assert!(line.find(". \"$_hook\"").unwrap() < line.find("_avm_command=").unwrap());
         assert!(line.find("_avm_command=").unwrap() < line.find("; exec --").unwrap());
-        let temp = tempfile::tempdir().unwrap();
-        let hook = temp.path().join(".agent-vm.runtime.sh");
-        for body in ["return 9", "exit 9"] {
-            std::fs::write(&hook, body).unwrap();
-            let line = AgentShellLine {
-                guard: ProgramGuard::Direct,
-                project_guest_path: temp.path().to_str().unwrap(),
-                image: "unused",
-                command: "printf",
-                args: &["EXECUTED".into()],
-            }
-            .render();
-            let safe_tail = &line[line.find("_hook=").unwrap()..];
-            for bash in host_bashes() {
-                let output = std::process::Command::new(bash)
-                    .args(["-c", safe_tail])
-                    .output()
-                    .unwrap();
-                assert_eq!(output.status.code(), Some(9));
-                assert!(output.stdout.is_empty());
-                if body == "return 9" {
-                    assert!(String::from_utf8_lossy(&output.stderr).contains("failed (exit 9)"));
+
+        let bootstrap = Bootstrap::new();
+        let sentinel = bootstrap.path().join("program-ran");
+        let program = bootstrap.write_executable(
+            "sentinel",
+            &format!(
+                "#!/bin/sh\ntouch '{}'\nprintf 'hook-v=%s\\n' \"$HOOK_V\"\ncat\n",
+                sentinel.display()
+            ),
+        );
+        let program = program.to_str().unwrap();
+        for bash in host_bashes() {
+            for input in [
+                GuestInput::ReservedForProgram,
+                GuestInput::DiscardWhenNotTerminal,
+            ] {
+                let whole = bootstrap_line(&bootstrap, ProgramGuard::Direct, input, program, &[]);
+                let sliced = &whole[whole.find("_hook=").expect("the hook in the line")..];
+                // Only the reserved shape has a group to lose; the legacy tail
+                // is a plain sequence. This is the exact slice the pre-G3 test
+                // ran, and its stray `}` never executed.
+                if input == GuestInput::ReservedForProgram {
+                    assert!(
+                        bash_syntax_error(bash, sliced).is_some(),
+                        "{bash} {input:?}: the brace-less slice from the pre-G3 test parses, \
+                         so the syntax check below proves nothing"
+                    );
+                } else {
+                    assert_bash_syntax(bash, sliced);
                 }
+
+                for body in ["return 9", "exit 9"] {
+                    bootstrap.project_hook(body);
+                    let script =
+                        bootstrap_line(&bootstrap, ProgramGuard::Direct, input, program, &[]);
+                    assert_bash_syntax(bash, &script);
+                    let output = run_bootstrap_line(bash, &script, b"", &bootstrap.search_path());
+                    assert_eq!(
+                        output.status.code(),
+                        Some(9),
+                        "{bash} {input:?} {body}: {output:?}"
+                    );
+                    assert!(
+                        !sentinel.exists(),
+                        "{bash} {input:?} {body}: the program ran despite the hook failure"
+                    );
+                    assert!(
+                        output.stdout.is_empty(),
+                        "{bash} {input:?} {body}: {output:?}"
+                    );
+                    if body == "return 9" {
+                        assert!(
+                            String::from_utf8_lossy(&output.stderr).contains("failed (exit 9)"),
+                            "{bash} {input:?} {body}: {output:?}"
+                        );
+                    }
+                }
+
+                bootstrap.project_hook("export HOOK_V=hook-value");
+                let script = bootstrap_line(&bootstrap, ProgramGuard::Direct, input, program, &[]);
+                assert_bash_syntax(bash, &script);
+                let output = run_bootstrap_line(bash, &script, b"", &bootstrap.search_path());
+                assert_eq!(
+                    output.status.code(),
+                    Some(0),
+                    "{bash} {input:?}: {output:?}"
+                );
+                assert_eq!(
+                    output.stdout, b"hook-v=hook-value\n",
+                    "{bash} {input:?}: the program did not run with the hook's export: {output:?}"
+                );
+                assert!(
+                    sentinel.exists(),
+                    "{bash} {input:?}: the program never ran under a successful hook"
+                );
+                std::fs::remove_file(&sentinel).unwrap();
             }
         }
     }
@@ -4093,6 +4594,7 @@ mod tests {
             image,
             command,
             args,
+            input: GuestInput::DiscardWhenNotTerminal,
         }
         .render()
     }
@@ -4173,6 +4675,7 @@ mod tests {
             image: "e2e-258/img with spaces",
             command,
             args,
+            input: GuestInput::DiscardWhenNotTerminal,
         };
         // Mirror `render` exactly: the guard and the `exec` line are concatenated
         // with no separator (`exec_line` opens with `; `), so a newline here would
@@ -4972,15 +5475,27 @@ options ndots:2 timeout:1";
     // ── The production stream/failed-exec lifecycle, with injected failures ──
 
     /// Exec events plus a drop receipt: teardown must not run while this is
-    /// alive, because dropping it releases the child-handle mutex.
+    /// alive, because dropping it releases the child-handle mutex. It also owns
+    /// the guest stdin sink, so the lifecycle (not the test) is what takes it.
     struct TrackingEvents {
         events: tokio::sync::mpsc::Receiver<microsandbox::sandbox::exec::ExecEvent>,
+        stdin: Option<crate::direct_input::test_support::GatedGuestStdin>,
+        stdin_takes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        drop_log: crate::direct_input::test_support::DropLog,
     }
 
     impl ExecEventSource for TrackingEvents {
+        type Stdin = crate::direct_input::test_support::GatedGuestStdin;
+
         async fn recv(&mut self) -> Option<microsandbox::sandbox::exec::ExecEvent> {
             self.events.recv().await
+        }
+
+        fn take_stdin(&mut self) -> Option<Self::Stdin> {
+            self.stdin_takes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.stdin.take()
         }
     }
 
@@ -4988,6 +5503,7 @@ options ndots:2 timeout:1";
         fn drop(&mut self) {
             self.dropped
                 .store(true, std::sync::atomic::Ordering::SeqCst);
+            crate::direct_input::test_support::log_drop(&self.drop_log, "handle");
         }
     }
 
@@ -5063,6 +5579,10 @@ options ndots:2 timeout:1";
         pending: Vec<&'static str>,
         handle_dropped: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
         runtime_dropped: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        sink_dropped: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        /// One ordered sequence of drops and teardown stages, shared with the
+        /// run's stubs, so a test asserts the release order itself.
+        drop_log: crate::direct_input::test_support::DropLog,
     }
 
     impl StubTeardown {
@@ -5073,7 +5593,28 @@ options ndots:2 timeout:1";
                 pending: Vec::new(),
                 handle_dropped: None,
                 runtime_dropped: None,
+                sink_dropped: None,
+                drop_log: crate::direct_input::test_support::drop_log(),
             }
+        }
+
+        fn drop_log(&self) -> crate::direct_input::test_support::DropLog {
+            std::sync::Arc::clone(&self.drop_log)
+        }
+
+        /// Require the guest stdin sink to be released before the first teardown
+        /// stage. Only runs that created a sink may ask for this.
+        fn tracking_sink(
+            mut self,
+            sink_dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ) -> Self {
+            self.sink_dropped = Some(sink_dropped);
+            self
+        }
+
+        /// The drop/stage sequence observed so far.
+        fn drops(&self) -> Vec<&'static str> {
+            self.drop_log.lock().unwrap().clone()
         }
 
         /// Hold `stage` pending until its outer deadline cancels it.
@@ -5137,7 +5678,14 @@ options ndots:2 timeout:1";
                     "{stage} ran before the polled runtime wait future was dropped"
                 );
             }
+            if let Some(dropped) = &self.sink_dropped {
+                assert!(
+                    dropped.load(std::sync::atomic::Ordering::SeqCst),
+                    "{stage} ran before the guest stdin sink was dropped"
+                );
+            }
             self.log.lock().unwrap().push(stage.to_string());
+            crate::direct_input::test_support::log_drop(&self.drop_log, stage);
             match self.failures.iter().find(|(name, _)| *name == stage) {
                 Some((_, detail)) => Err(anyhow::anyhow!("{detail}")),
                 None => Ok(()),
@@ -5201,9 +5749,9 @@ options ndots:2 timeout:1";
     }
 
     /// The two guest sinks of one stream run, named so they cannot be swapped.
-    struct StreamSinks<'a> {
-        stdout: &'a mut StubSink,
-        stderr: &'a mut StubSink,
+    struct StreamSinks<'a, O = StubSink, E = StubSink> {
+        stdout: &'a mut O,
+        stderr: &'a mut E,
     }
 
     /// The caller-owned drop receipts a teardown asserts against.
@@ -5248,9 +5796,12 @@ options ndots:2 timeout:1";
         drop(sender);
         let handle = TrackingEvents {
             events: receiver,
+            stdin: None,
+            stdin_takes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             dropped: receipts
                 .handle
                 .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))),
+            drop_log: teardown.drop_log(),
         };
         let runtime_exit: RuntimeExit<'_> = match receipts.runtime {
             Some(dropped) => Box::pin(PendingRuntimeExit { dropped }),
@@ -5261,12 +5812,277 @@ options ndots:2 timeout:1";
             teardown,
             handle,
             runtime_exit,
-            stdout,
-            stderr,
-            policy,
+            StreamInput::<std::io::Empty>::NotForwarded,
+            ExecOutput {
+                stdout,
+                stderr,
+                policy,
+            },
             stub_context(),
         )
         .await
+    }
+
+    /// A real `ExitStatus` for a fake runtime exit; the SDK type has no public
+    /// constructor.
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("exit {code}"))
+            .status()
+            .expect("spawn stub exit process")
+    }
+
+    /// A `RuntimeExit` the test releases through a channel, and that records
+    /// every poll and its own drop — so a test proves the *polled* wait future
+    /// was cancelled, not merely that the handle was.
+    struct ControlledRuntimeExit {
+        receiver: Option<
+            tokio::sync::oneshot::Receiver<
+                microsandbox::MicrosandboxResult<std::process::ExitStatus>,
+            >,
+        >,
+        polled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        drop_log: crate::direct_input::test_support::DropLog,
+    }
+
+    impl std::future::Future for ControlledRuntimeExit {
+        type Output = microsandbox::MicrosandboxResult<std::process::ExitStatus>;
+
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            self.polled.store(true, std::sync::atomic::Ordering::SeqCst);
+            let Some(receiver) = self.receiver.as_mut() else {
+                return std::task::Poll::Pending;
+            };
+            match std::pin::Pin::new(receiver).poll(context) {
+                std::task::Poll::Ready(Ok(status)) => std::task::Poll::Ready(status),
+                // The test dropped the sender: the sandbox never exits.
+                std::task::Poll::Ready(Err(_)) => {
+                    self.receiver = None;
+                    std::task::Poll::Pending
+                }
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            }
+        }
+    }
+
+    impl Drop for ControlledRuntimeExit {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            crate::direct_input::test_support::log_drop(&self.drop_log, "runtime");
+        }
+    }
+
+    /// An output sink that records bytes and announces every flush, so a test
+    /// can require that guest output reached the host *before* it released the
+    /// next event — the temporal oracle a buffer-until-exit implementation
+    /// cannot pass.
+    struct ReceiptSink {
+        stream: GuestStream,
+        bytes: Vec<u8>,
+        fail_write: Option<std::io::ErrorKind>,
+        receipts: tokio::sync::mpsc::UnboundedSender<crate::direct_input::test_support::Receipt>,
+    }
+
+    impl ReceiptSink {
+        fn new(
+            stream: GuestStream,
+            receipts: tokio::sync::mpsc::UnboundedSender<
+                crate::direct_input::test_support::Receipt,
+            >,
+        ) -> Self {
+            Self {
+                stream,
+                bytes: Vec::new(),
+                fail_write: None,
+                receipts,
+            }
+        }
+
+        fn failing_write(
+            stream: GuestStream,
+            kind: std::io::ErrorKind,
+            receipts: tokio::sync::mpsc::UnboundedSender<
+                crate::direct_input::test_support::Receipt,
+            >,
+        ) -> Self {
+            Self {
+                fail_write: Some(kind),
+                ..Self::new(stream, receipts)
+            }
+        }
+
+        fn bytes(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    impl tokio::io::AsyncWrite for ReceiptSink {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+            buffer: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if let Some(kind) = self.fail_write {
+                return std::task::Poll::Ready(Err(std::io::Error::new(kind, "stub write")));
+            }
+            self.bytes.extend_from_slice(buffer);
+            std::task::Poll::Ready(Ok(buffer.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let _ = self
+                .receipts
+                .send(crate::direct_input::test_support::Receipt::Flushed {
+                    stream: self.stream.name(),
+                    total: self.bytes.len(),
+                });
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// The test's handle on a live stream run: every resource it releases and
+    /// every receipt it waits for.
+    struct LiveControls {
+        events: tokio::sync::mpsc::Sender<microsandbox::sandbox::exec::ExecEvent>,
+        runtime: Option<
+            tokio::sync::oneshot::Sender<
+                microsandbox::MicrosandboxResult<std::process::ExitStatus>,
+            >,
+        >,
+        steps:
+            Option<tokio::sync::mpsc::UnboundedSender<crate::direct_input::test_support::SinkStep>>,
+        receipts: crate::direct_input::test_support::Receipts,
+        stdin_takes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        runtime_polled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl LiveControls {
+        /// Queue one exec event, waiting for room.
+        async fn send(&mut self, event: microsandbox::sandbox::exec::ExecEvent) {
+            self.events
+                .send(event)
+                .await
+                .expect("the lifecycle is alive");
+        }
+
+        /// Release the guest's exit, only when the test has already seen the
+        /// receipt proving the state it claims to exercise.
+        async fn exit(&mut self, code: i32) {
+            self.send(microsandbox::sandbox::exec::ExecEvent::Exited { code })
+                .await
+        }
+
+        /// Resolve the runtime wait future.
+        fn runtime_exit(&mut self, code: i32) {
+            self.runtime
+                .take()
+                .expect("the runtime exit is released once")
+                .send(Ok(exit_status(code)))
+                .expect("the lifecycle is alive");
+        }
+
+        fn release(&self, step: crate::direct_input::test_support::SinkStep) {
+            self.steps
+                .as_ref()
+                .expect("this run has a guest stdin sink")
+                .send(step)
+                .expect("the sink outlives its steps");
+        }
+
+        async fn expect(
+            &mut self,
+            label: &str,
+            matches: impl Fn(&crate::direct_input::test_support::Receipt) -> bool,
+        ) {
+            self.receipts.expect(label, matches).await;
+        }
+
+        fn history(&mut self) -> &[crate::direct_input::test_support::Receipt] {
+            self.receipts.history()
+        }
+    }
+
+    /// Start a live stream run: the lifecycle future plus the controls that
+    /// release exec events, the runtime exit and the sink's steps.
+    ///
+    /// Nothing is prequeued: an event (including `Exited`) may only be released
+    /// after the test has received proof that the state it exercises exists.
+    fn live_stream<'a, R, O, E>(
+        teardown: &'a StubTeardown,
+        sinks: StreamSinks<'a, O, E>,
+        policy: OutputErrorPolicy,
+        input: StreamInput<R>,
+        stdin: Option<crate::direct_input::test_support::GatedGuestStdin>,
+        receipts: crate::direct_input::test_support::Receipts,
+    ) -> (
+        LiveControls,
+        impl std::future::Future<Output = Result<i32>> + 'a,
+    )
+    where
+        R: std::io::Read + Send + 'static,
+        O: tokio::io::AsyncWrite + Unpin,
+        E: tokio::io::AsyncWrite + Unpin,
+    {
+        let (events, events_receiver) = tokio::sync::mpsc::channel(8);
+        let (runtime, runtime_receiver) = tokio::sync::oneshot::channel();
+        let stdin = stdin.map(|sink| sink.logging_drops(teardown.drop_log()));
+        let steps = stdin
+            .as_ref()
+            .map(crate::direct_input::test_support::GatedGuestStdin::steps);
+        let stdin_takes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runtime_polled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = TrackingEvents {
+            events: events_receiver,
+            stdin,
+            stdin_takes: std::sync::Arc::clone(&stdin_takes),
+            dropped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            drop_log: teardown.drop_log(),
+        };
+        let runtime_exit: RuntimeExit<'_> = Box::pin(ControlledRuntimeExit {
+            receiver: Some(runtime_receiver),
+            polled: std::sync::Arc::clone(&runtime_polled),
+            dropped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            drop_log: teardown.drop_log(),
+        });
+        let StreamSinks { stdout, stderr } = sinks;
+        let output = ExecOutput {
+            stdout,
+            stderr,
+            policy,
+        };
+        let controls = LiveControls {
+            events,
+            runtime: Some(runtime),
+            steps,
+            receipts,
+            stdin_takes,
+            runtime_polled,
+        };
+        let lifecycle = stream_exec_with_cleanup(
+            teardown,
+            handle,
+            runtime_exit,
+            input,
+            output,
+            stub_context(),
+        );
+        (controls, lifecycle)
     }
 
     #[tokio::test]
@@ -5585,5 +6401,2365 @@ options ndots:2 timeout:1";
         // read here keeps the requirement visible in this test too.
         assert!(handle_dropped.load(std::sync::atomic::Ordering::SeqCst));
         assert!(runtime_dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+    // ── Direct streamed input: the lifecycle owns the pump (#399) ──────────
+    //
+    // Every test releases exec events, the runtime exit and the sink's steps
+    // only after it has received the receipt proving the state it exercises.
+    // Nothing is prequeued, and no test synchronises with a sleep.
+
+    /// How long one lifecycle may take before its join counts as a teardown
+    /// hang. Every release in these tests is receipt-driven, so nothing here is
+    /// "slow work": without the deadline one wedged run stalls the suite.
+    const LIFECYCLE_DEADLINE: Duration = Duration::from_secs(30);
+
+    /// [`tokio::join`] the lifecycle with its driver under an outer deadline,
+    /// so a teardown that never returns fails the test instead of hanging it.
+    async fn join_bounded<L, D>(label: &str, lifecycle: L, driver: D) -> (Result<i32>, D::Output)
+    where
+        L: std::future::Future<Output = Result<i32>>,
+        D: std::future::Future,
+    {
+        match tokio::time::timeout(LIFECYCLE_DEADLINE, async move {
+            tokio::join!(lifecycle, driver)
+        })
+        .await
+        {
+            Ok(joined) => joined,
+            Err(_) => panic!(
+                "{label}: the lifecycle and its driver did not finish within \
+                 {LIFECYCLE_DEADLINE:?} (teardown hang)"
+            ),
+        }
+    }
+
+    /// Release a test's reader thread and observe it exit, bounded. Every
+    /// helper thread a test starts is released *and* observed (plan §6), so a
+    /// reader that never exits fails here instead of leaking past the test.
+    async fn release_reader(
+        receipts: &mut crate::direct_input::test_support::Receipts,
+        steps: std::sync::mpsc::Sender<ReaderStep>,
+    ) {
+        drop(steps);
+        receipts
+            .expect("the reader thread to exit", |receipt| {
+                *receipt == Receipt::ReaderDropped
+            })
+            .await;
+    }
+
+    /// Wait for a flag a stub sets, bounded; never a sleep.
+    async fn await_flag(flag: &std::sync::Arc<std::sync::atomic::AtomicBool>, label: &str) {
+        let deadline =
+            tokio::time::Instant::now() + crate::direct_input::test_support::RECEIPT_DEADLINE;
+        while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{label}: flag never set"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn stdin_error(
+        errno: Option<i32>,
+        name: Option<&str>,
+        message: &str,
+    ) -> microsandbox::sandbox::exec::ExecEvent {
+        microsandbox::sandbox::exec::ExecEvent::StdinError(
+            microsandbox::protocol::exec::ExecStdinError {
+                errno,
+                errno_name: name.map(str::to_string),
+                message: message.to_string(),
+            },
+        )
+    }
+
+    /// One chunk read by the gated reader, as a step the test releases.
+    fn one_chunk() -> ReaderStep {
+        ReaderStep::Bytes(b"abc".to_vec())
+    }
+
+    #[tokio::test]
+    async fn l1_exited_while_a_guest_write_is_pending_is_the_guest_status() {
+        let (send, receipts) = Receipts::channel();
+        let mut stdout = ReceiptSink::new(GuestStream::Stdout, send.clone());
+        let mut stderr = ReceiptSink::new(GuestStream::Stderr, send.clone());
+        let (reader, reader_steps) = GatedReader::new(send.clone());
+        let (sink, _) = GatedGuestStdin::new(send);
+        let teardown = StubTeardown::new().tracking_sink(sink.dropped_flag());
+        let (mut live, lifecycle) = live_stream(
+            &teardown,
+            StreamSinks {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+            },
+            OutputErrorPolicy::DirectChecked,
+            StreamInput::Forward(InputSource::new(reader)),
+            Some(sink),
+            receipts,
+        );
+        let driver = async {
+            reader_steps.send(one_chunk()).unwrap();
+            live.expect("a pending guest write", |receipt| {
+                matches!(receipt, Receipt::WriteEntered { .. })
+            })
+            .await;
+            // The guest exits while its stdin write is still pending, and no
+            // input failure has happened: that is the guest's status.
+            live.exit(0).await;
+        };
+        let (outcome, ()) = join_bounded("L1", lifecycle, driver).await;
+
+        assert_eq!(outcome.expect("the guest status"), 0);
+        assert_eq!(teardown.drops(), ["sink", "runtime", "handle"]);
+        assert!(
+            live.runtime_polled
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert!(
+            !live.history().contains(&Receipt::CloseEntered),
+            "an unfinished input must not be reported as EOF"
+        );
+        release_reader(&mut live.receipts, reader_steps).await;
+    }
+
+    #[tokio::test]
+    async fn l2_exited_while_the_host_read_is_blocked_is_the_guest_status() {
+        let (send, receipts) = Receipts::channel();
+        let mut stdout = ReceiptSink::new(GuestStream::Stdout, send.clone());
+        let mut stderr = ReceiptSink::new(GuestStream::Stderr, send.clone());
+        let (reader, reader_steps) = GatedReader::new(send.clone());
+        let (sink, _) = GatedGuestStdin::new(send);
+        let teardown = StubTeardown::new().tracking_sink(sink.dropped_flag());
+        let (mut live, lifecycle) = live_stream(
+            &teardown,
+            StreamSinks {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+            },
+            OutputErrorPolicy::DirectChecked,
+            StreamInput::Forward(InputSource::new(reader)),
+            Some(sink),
+            receipts,
+        );
+        let driver = async {
+            live.expect("a host read in progress", |receipt| {
+                matches!(receipt, Receipt::ReaderEntered { call: 1 })
+            })
+            .await;
+            live.exit(7).await;
+        };
+        let (outcome, ()) = join_bounded("L2", lifecycle, driver).await;
+
+        assert_eq!(outcome.expect("the guest status"), 7);
+        assert_eq!(teardown.drops(), ["sink", "runtime", "handle"]);
+        assert!(
+            !live
+                .receipts
+                .saw(|receipt| *receipt == Receipt::ReaderDropped),
+            "the parked reader is not joined by the launcher"
+        );
+        release_reader(&mut live.receipts, reader_steps).await;
+    }
+
+    #[tokio::test]
+    async fn l3_a_guest_that_closes_stdin_keeps_its_status_and_gets_no_warning() {
+        let (send, receipts) = Receipts::channel();
+        let mut stdout = ReceiptSink::new(GuestStream::Stdout, send.clone());
+        let mut stderr = ReceiptSink::new(GuestStream::Stderr, send.clone());
+        let (reader, reader_steps) = GatedReader::new(send.clone());
+        let (sink, _) = GatedGuestStdin::new(send);
+        let teardown = StubTeardown::new().tracking_sink(sink.dropped_flag());
+        let (mut live, lifecycle) = live_stream(
+            &teardown,
+            StreamSinks {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+            },
+            OutputErrorPolicy::DirectChecked,
+            StreamInput::Forward(InputSource::new(reader)),
+            Some(sink),
+            receipts,
+        );
+        let driver = async {
+            reader_steps.send(one_chunk()).unwrap();
+            live.expect("a pending guest write", |receipt| {
+                matches!(receipt, Receipt::WriteEntered { .. })
+            })
+            .await;
+            live.send(stdin_error(Some(32), Some("EPIPE"), "broken pipe"))
+                .await;
+            // The loop stopped the pump: that is the proof the EPIPE was
+            // classified as the guest closing its read end.
+            live.expect("the pump to stop", |receipt| {
+                *receipt == Receipt::SinkDropped
+            })
+            .await;
+            live.send(microsandbox::sandbox::exec::ExecEvent::Stdout(
+                b"x".to_vec().into(),
+            ))
+            .await;
+            live.expect("flushed stdout", |receipt| {
+                matches!(
+                    receipt,
+                    Receipt::Flushed {
+                        stream: "stdout",
+                        total: 1
+                    }
+                )
+            })
+            .await;
+            live.exit(0).await;
+        };
+        let (outcome, ()) = join_bounded("L3", lifecycle, driver).await;
+
+        assert_eq!(outcome.expect("a closed stdin is not a failure"), 0);
+        assert_eq!(stdout.bytes(), b"x");
+        assert!(stderr.bytes().is_empty(), "no broken-pipe warning");
+        assert_eq!(teardown.drops(), ["sink", "runtime", "handle"]);
+        release_reader(&mut live.receipts, reader_steps).await;
+    }
+
+    #[tokio::test]
+    async fn l4_a_genuine_guest_write_failure_is_a_launcher_failure() {
+        let (send, receipts) = Receipts::channel();
+        let mut stdout = ReceiptSink::new(GuestStream::Stdout, send.clone());
+        let mut stderr = ReceiptSink::new(GuestStream::Stderr, send.clone());
+        let (reader, reader_steps) = GatedReader::new(send.clone());
+        let (sink, _) = GatedGuestStdin::new(send);
+        let teardown = StubTeardown::new().tracking_sink(sink.dropped_flag());
+        let (mut live, lifecycle) = live_stream(
+            &teardown,
+            StreamSinks {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+            },
+            OutputErrorPolicy::DirectChecked,
+            StreamInput::Forward(InputSource::new(reader)),
+            Some(sink),
+            receipts,
+        );
+        let driver = async {
+            reader_steps.send(one_chunk()).unwrap();
+            live.expect("a pending guest write", |receipt| {
+                matches!(receipt, Receipt::WriteEntered { .. })
+            })
+            .await;
+            live.send(stdin_error(Some(5), Some("EIO"), "input/output error"))
+                .await;
+            live.exit(0).await;
+        };
+        let (outcome, ()) = join_bounded("L4", lifecycle, driver).await;
+
+        let message = format!("{:#}", outcome.expect_err("EIO is a forwarding failure"));
+        assert!(
+            message.contains("forwarding stdin to the guest failed: EIO"),
+            "{message}"
+        );
+        assert_eq!(
+            teardown.drops(),
+            ["sink", "runtime", "handle", "stop", "remove"]
+        );
+        release_reader(&mut live.receipts, reader_steps).await;
+    }
+
+    #[tokio::test]
+    async fn l5_a_host_read_error_is_reported_without_waiting_for_the_guest() {
+        let (send, receipts) = Receipts::channel();
+        let mut stdout = ReceiptSink::new(GuestStream::Stdout, send.clone());
+        let mut stderr = ReceiptSink::new(GuestStream::Stderr, send.clone());
+        let (reader, reader_steps) = GatedReader::new(send.clone());
+        let (sink, _) = GatedGuestStdin::new(send);
+        let teardown = StubTeardown::new().tracking_sink(sink.dropped_flag());
+        let (mut live, lifecycle) = live_stream(
+            &teardown,
+            StreamSinks {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+            },
+            OutputErrorPolicy::DirectChecked,
+            StreamInput::Forward(InputSource::new(reader)),
+            Some(sink),
+            receipts,
+        );
+        let driver = async {
+            live.expect("a host read in progress", |receipt| {
+                matches!(receipt, Receipt::ReaderEntered { call: 1 })
+            })
+            .await;
+            // The events and the runtime exit stay silent, so the runtime wait
+            // future must have been polled before the failure is reported.
+            await_flag(&live.runtime_polled, "the runtime wait future").await;
+            reader_steps
+                .send(ReaderStep::Error(std::io::ErrorKind::Other))
+                .unwrap();
+        };
+        let (outcome, ()) = join_bounded("L5", lifecycle, driver).await;
+
+        let message = format!("{:#}", outcome.expect_err("a host read error is fatal"));
+        assert!(message.contains("reading host stdin failed"), "{message}");
+        assert_eq!(
+            teardown.drops(),
+            ["sink", "runtime", "handle", "stop", "remove"]
+        );
+        release_reader(&mut live.receipts, reader_steps).await;
+    }
+
+    #[tokio::test]
+    async fn l6_a_transport_failure_that_already_happened_beats_the_guest_status() {
+        let (send, receipts) = Receipts::channel();
+        let mut stdout = ReceiptSink::new(GuestStream::Stdout, send.clone());
+        let mut stderr = ReceiptSink::new(GuestStream::Stderr, send.clone());
+        let (reader, reader_steps) = GatedReader::new(send.clone());
+        let (sink, _) = GatedGuestStdin::new(send);
+        let teardown = StubTeardown::new().tracking_sink(sink.dropped_flag());
+        let (mut live, lifecycle) = live_stream(
+            &teardown,
+            StreamSinks {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+            },
+            OutputErrorPolicy::DirectChecked,
+            StreamInput::Forward(InputSource::new(reader)),
+            Some(sink),
+            receipts,
+        );
+        let driver = async {
+            reader_steps.send(one_chunk()).unwrap();
+            live.expect("a pending guest write", |receipt| {
+                matches!(receipt, Receipt::WriteEntered { .. })
+            })
+            .await;
+            live.release(SinkStep::Fail("transport down"));
+            live.expect("the failed write", |receipt| {
+                matches!(receipt, Receipt::WriteReturned { ok: false })
+            })
+            .await;
+            live.expect("the pump to finish", |receipt| {
+                *receipt == Receipt::SinkDropped
+            })
+            .await;
+            // Both outcomes are now certain: the pump failed, and the guest
+            // exits successfully. Stream loss is not a success.
+            live.exit(0).await;
+        };
+        let (outcome, ()) = join_bounded("L6", lifecycle, driver).await;
+
+        let message = format!("{:#}", outcome.expect_err("stream loss is not a success"));
+        assert!(
+            message.contains("forwarding stdin to the guest failed"),
+            "{message}"
+        );
+        release_reader(&mut live.receipts, reader_steps).await;
+    }
+
+    /// The `biased;` order is a correctness property, not style: a pump outcome
+    /// that is already ready must beat an `Exited` that is also ready, so a
+    /// failure is never hidden behind the guest's status.
+    ///
+    /// Mutation recorded: moving the pump arm below the exec arm makes this
+    /// fail deterministically (verified once locally).
+    #[tokio::test]
+    async fn l6a_both_ready_precedence_takes_the_input_outcome_first() {
+        let (send, mut receipts) = Receipts::channel();
+        let (reader, reader_steps) = GatedReader::new(send.clone());
+        let (sink, sink_steps) = GatedGuestStdin::new(send);
+        let pump = InputSource::new(reader)
+            .start(sink)
+            .expect("the reader starts");
+        reader_steps.send(one_chunk()).unwrap();
+        sink_steps.send(SinkStep::Fail("transport down")).unwrap();
+
+        let deadline =
+            tokio::time::Instant::now() + crate::direct_input::test_support::RECEIPT_DEADLINE;
+        while !pump.has_completed() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the pump never finished"
+            );
+            tokio::task::yield_now().await;
+        }
+        let (events, events_rx) = tokio::sync::mpsc::channel(4);
+        events
+            .try_send(microsandbox::sandbox::exec::ExecEvent::Exited { code: 0 })
+            .expect("the event is ready too");
+        let mut events = StubEvents(events_rx);
+        let mut runtime_exit = runtime_never_exits();
+        let mut pump = Some(pump);
+        let mut pending = None;
+
+        let first = next_loop_step(&mut pump, &mut pending, &mut events, &mut runtime_exit).await;
+        match first {
+            LoopStep::Input(Err(InputFailure::Transport(_))) => {}
+            other => panic!(
+                "the input outcome must win: {other:?}",
+                other = match other {
+                    LoopStep::Exec(step) => format!("Exec({step:?})"),
+                    LoopStep::Input(_) => "Input(non-transport)".to_string(),
+                    LoopStep::InputGraceExpired(_) => "InputGraceExpired".to_string(),
+                }
+            ),
+        }
+        // The event was still there, which is what makes the precedence real.
+        let second = next_loop_step(&mut pump, &mut pending, &mut events, &mut runtime_exit).await;
+        assert!(matches!(
+            second,
+            LoopStep::Exec(ExecStep::Event(
+                microsandbox::sandbox::exec::ExecEvent::Exited { code: 0 }
+            ))
+        ));
+        release_reader(&mut receipts, reader_steps).await;
+    }
+
+    #[tokio::test]
+    async fn l7_a_transport_failure_returns_within_the_grace_when_the_session_stays_silent() {
+        let (send, receipts) = Receipts::channel();
+        let mut stdout = ReceiptSink::new(GuestStream::Stdout, send.clone());
+        let mut stderr = ReceiptSink::new(GuestStream::Stderr, send.clone());
+        let (reader, reader_steps) = GatedReader::new(send.clone());
+        let (sink, _) = GatedGuestStdin::new(send);
+        let teardown = StubTeardown::new().tracking_sink(sink.dropped_flag());
+        let (mut live, lifecycle) = live_stream(
+            &teardown,
+            StreamSinks {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+            },
+            OutputErrorPolicy::DirectChecked,
+            StreamInput::Forward(InputSource::new(reader)),
+            Some(sink),
+            receipts,
+        );
+        let driver = async {
+            reader_steps.send(one_chunk()).unwrap();
+            live.expect("a pending guest write", |receipt| {
+                matches!(receipt, Receipt::WriteEntered { .. })
+            })
+            .await;
+            live.release(SinkStep::Fail("transport down"));
+            // No std-thread receipt is awaited after this point: the virtual
+            // clock takes over.
+            live.expect("the pump to finish", |receipt| {
+                *receipt == Receipt::SinkDropped
+            })
+            .await;
+            tokio::time::pause();
+            let started = tokio::time::Instant::now();
+            (started, ())
+        };
+        let (outcome, (started, ())) = join_bounded("L7", lifecycle, driver).await;
+
+        let elapsed = tokio::time::Instant::now() - started;
+        assert!(
+            elapsed >= STREAM_END_RUNTIME_EXIT_GRACE,
+            "the bounded wait must last the grace, was {elapsed:?}"
+        );
+        let message = format!(
+            "{:#}",
+            outcome.expect_err("the grace expires into a failure")
+        );
+        assert!(
+            message.contains("forwarding stdin to the guest failed"),
+            "{message}"
+        );
+        // The driver paused the clock; a paused clock fires every tokio deadline
+        // as soon as the runtime idles, so the helper thread is observed in
+        // real time.
+        tokio::time::resume();
+        release_reader(&mut live.receipts, reader_steps).await;
+    }
+
+    /// A source whose `recv` is **always** ready: with an mpsc channel a stream
+    /// goes Pending on every drain, which lets a wrongly ordered arm still see
+    /// the grace. Only a source that never idles can starve another arm.
+    struct AlwaysReadyEvents {
+        remaining: usize,
+    }
+
+    impl ExecEventSource for AlwaysReadyEvents {
+        type Stdin = GatedGuestStdin;
+
+        async fn recv(&mut self) -> Option<microsandbox::sandbox::exec::ExecEvent> {
+            assert!(self.remaining > 0, "the test's event budget is exhausted");
+            self.remaining -= 1;
+            Some(microsandbox::sandbox::exec::ExecEvent::Stdout(
+                vec![b'x'; 8].into(),
+            ))
+        }
+
+        fn take_stdin(&mut self) -> Option<Self::Stdin> {
+            None
+        }
+    }
+
+    /// The regression for the arm order (review R2-B2): once the transport
+    /// failure's grace has expired, the very next step must be that failure —
+    /// even while the exec stream never stops being ready. A ready stdout
+    /// stream must not be able to hold the bounded failure return open.
+    ///
+    /// Mutation recorded: moving the grace arm **below** `next_exec_step` makes
+    /// this fail with "drained a ready exec event", because `biased;` then
+    /// always prefers the ready event.
+    #[tokio::test]
+    async fn l7b_an_expired_grace_is_not_starved_by_an_always_ready_event_stream() {
+        let (send, mut receipts) = Receipts::channel();
+        let (reader, reader_steps) = GatedReader::new(send.clone());
+        let (sink, sink_steps) = GatedGuestStdin::new(send);
+        let pump = InputSource::new(reader)
+            .start(sink)
+            .expect("the reader starts");
+        reader_steps.send(one_chunk()).unwrap();
+        sink_steps.send(SinkStep::Fail("transport down")).unwrap();
+        let deadline =
+            tokio::time::Instant::now() + crate::direct_input::test_support::RECEIPT_DEADLINE;
+        while !pump.has_completed() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the pump never finished"
+            );
+            tokio::task::yield_now().await;
+        }
+        let mut pump = Some(pump);
+        let mut pending = None;
+        let mut events = AlwaysReadyEvents { remaining: 10_000 };
+        let mut runtime_exit = runtime_never_exits();
+
+        let failure =
+            match next_loop_step(&mut pump, &mut pending, &mut events, &mut runtime_exit).await {
+                LoopStep::Input(Err(failure)) => failure,
+                _ => panic!("the pump outcome must win over a ready event"),
+            };
+        assert!(failure.awaits_session_end(), "a transport failure waits");
+        // The loop's own arm, mirrored here: a transport failure arms the
+        // bounded grace and keeps looping.
+        pending = Some(PendingInputFailure {
+            failure,
+            deadline: Box::pin(tokio::time::sleep(STREAM_END_RUNTIME_EXIT_GRACE)),
+        });
+
+        tokio::time::pause();
+        tokio::time::advance(STREAM_END_RUNTIME_EXIT_GRACE * 2).await;
+        let remaining_before = events.remaining;
+        let step = next_loop_step(&mut pump, &mut pending, &mut events, &mut runtime_exit).await;
+        let consumed = remaining_before - events.remaining;
+        match step {
+            LoopStep::InputGraceExpired(error) => {
+                assert!(
+                    format!("{error:#}").contains("forwarding stdin to the guest failed"),
+                    "{error:#}"
+                );
+            }
+            LoopStep::Exec(_) => {
+                panic!("drained a ready exec event instead of returning at the expired grace")
+            }
+            LoopStep::Input(_) => panic!("the pump already reported its outcome"),
+        }
+        assert_eq!(consumed, 0, "no exec event may be consumed after expiry");
+        // Real time again for the helper thread: a paused clock makes the
+        // receipt deadline expire as soon as the runtime idles.
+        tokio::time::resume();
+        release_reader(&mut receipts, reader_steps).await;
+    }
+
+    #[tokio::test]
+    async fn l8_a_runtime_exit_after_a_transport_failure_keeps_both_facts() {
+        let (send, receipts) = Receipts::channel();
+        let mut stdout = ReceiptSink::new(GuestStream::Stdout, send.clone());
+        let mut stderr = ReceiptSink::new(GuestStream::Stderr, send.clone());
+        let (reader, reader_steps) = GatedReader::new(send.clone());
+        let (sink, _) = GatedGuestStdin::new(send);
+        let teardown = StubTeardown::new().tracking_sink(sink.dropped_flag());
+        let (mut live, lifecycle) = live_stream(
+            &teardown,
+            StreamSinks {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+            },
+            OutputErrorPolicy::DirectChecked,
+            StreamInput::Forward(InputSource::new(reader)),
+            Some(sink),
+            receipts,
+        );
+        let driver = async {
+            reader_steps.send(one_chunk()).unwrap();
+            live.expect("a pending guest write", |receipt| {
+                matches!(receipt, Receipt::WriteEntered { .. })
+            })
+            .await;
+            live.release(SinkStep::Fail("transport down"));
+            live.expect("the pump to finish", |receipt| {
+                *receipt == Receipt::SinkDropped
+            })
+            .await;
+            live.runtime_exit(3);
+        };
+        let (outcome, ()) = join_bounded("L8", lifecycle, driver).await;
+
+        let message = format!("{:#}", outcome.expect_err("a dead VMM is not a success"));
+        assert!(
+            message.contains("sandbox process exited unexpectedly"),
+            "{message}"
+        );
+        assert!(
+            message.contains("forwarding stdin also failed"),
+            "the transport failure must survive the race: {message}"
+        );
+        release_reader(&mut live.receipts, reader_steps).await;
+    }
+
+    #[tokio::test]
+    async fn l9_a_legacy_launch_never_takes_a_stdin_pipe_and_ignores_stdin_errors() {
+        let (send, receipts) = Receipts::channel();
+        let mut stdout = ReceiptSink::new(GuestStream::Stdout, send.clone());
+        let mut stderr = ReceiptSink::new(GuestStream::Stderr, send.clone());
+        let (sink, _) = GatedGuestStdin::new(send);
+        // A sink exists on the handle, but the legacy route must not ask for it.
+        let teardown = StubTeardown::new().tracking_sink(sink.dropped_flag());
+        let (mut live, lifecycle) = live_stream(
+            &teardown,
+            StreamSinks {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+            },
+            OutputErrorPolicy::LegacyBestEffort,
+            StreamInput::<std::io::Empty>::NotForwarded,
+            Some(sink),
+            receipts,
+        );
+        let driver = async {
+            live.send(stdin_error(Some(5), Some("EIO"), "input/output error"))
+                .await;
+            live.exit(3).await;
+        };
+        let (outcome, ()) = join_bounded("L9", lifecycle, driver).await;
+
+        assert_eq!(outcome.expect("the legacy contract is unchanged"), 3);
+        assert_eq!(
+            live.stdin_takes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a legacy launch must not take the sink"
+        );
+        assert!(
+            !live
+                .history()
+                .iter()
+                .any(|receipt| matches!(receipt, Receipt::WriteEntered { .. })),
+            "nothing may be forwarded on a legacy launch"
+        );
+    }
+
+    #[tokio::test]
+    async fn l10_output_streams_stay_separate_while_input_is_pending() {
+        let (send, receipts) = Receipts::channel();
+        let mut stdout = ReceiptSink::new(GuestStream::Stdout, send.clone());
+        let mut stderr = ReceiptSink::new(GuestStream::Stderr, send.clone());
+        let (reader, reader_steps) = GatedReader::new(send.clone());
+        let (sink, _) = GatedGuestStdin::new(send);
+        let teardown = StubTeardown::new().tracking_sink(sink.dropped_flag());
+        let (mut live, lifecycle) = live_stream(
+            &teardown,
+            StreamSinks {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+            },
+            OutputErrorPolicy::DirectChecked,
+            StreamInput::Forward(InputSource::new(reader)),
+            Some(sink),
+            receipts,
+        );
+        let driver = async {
+            reader_steps.send(one_chunk()).unwrap();
+            live.expect("a pending guest write", |receipt| {
+                matches!(receipt, Receipt::WriteEntered { .. })
+            })
+            .await;
+            live.send(microsandbox::sandbox::exec::ExecEvent::Stdout(
+                b"o".to_vec().into(),
+            ))
+            .await;
+            live.expect("flushed stdout", |receipt| {
+                matches!(
+                    receipt,
+                    Receipt::Flushed {
+                        stream: "stdout",
+                        total: 1
+                    }
+                )
+            })
+            .await;
+            live.send(microsandbox::sandbox::exec::ExecEvent::Stderr(
+                b"e".to_vec().into(),
+            ))
+            .await;
+            live.expect("flushed stderr", |receipt| {
+                matches!(
+                    receipt,
+                    Receipt::Flushed {
+                        stream: "stderr",
+                        total: 1
+                    }
+                )
+            })
+            .await;
+            live.exit(0).await;
+        };
+        let (outcome, ()) = join_bounded("L10", lifecycle, driver).await;
+
+        assert_eq!(outcome.expect("the guest status"), 0);
+        assert_eq!(stdout.bytes(), b"o");
+        assert_eq!(stderr.bytes(), b"e");
+        release_reader(&mut live.receipts, reader_steps).await;
+    }
+
+    #[tokio::test]
+    async fn l11_host_eof_closes_guest_stdin_exactly_once() {
+        let (send, receipts) = Receipts::channel();
+        let mut stdout = ReceiptSink::new(GuestStream::Stdout, send.clone());
+        let mut stderr = ReceiptSink::new(GuestStream::Stderr, send.clone());
+        let (reader, reader_steps) = GatedReader::new(send.clone());
+        let sink = GatedGuestStdin::auto_accept(send);
+        let accepted = sink.accepted();
+        let teardown = StubTeardown::new().tracking_sink(sink.dropped_flag());
+        let (mut live, lifecycle) = live_stream(
+            &teardown,
+            StreamSinks {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+            },
+            OutputErrorPolicy::DirectChecked,
+            StreamInput::Forward(InputSource::new(reader)),
+            Some(sink),
+            receipts,
+        );
+        let driver = async {
+            reader_steps
+                .send(ReaderStep::Bytes(b"hello".to_vec()))
+                .unwrap();
+            reader_steps.send(ReaderStep::Eof).unwrap();
+            live.expect("a close", |receipt| *receipt == Receipt::CloseEntered)
+                .await;
+            live.exit(0).await;
+        };
+        let (outcome, ()) = join_bounded("L11", lifecycle, driver).await;
+
+        assert_eq!(outcome.expect("the guest status"), 0);
+        assert_eq!(accepted.lock().unwrap().as_slice(), b"hello");
+        assert_eq!(
+            live.history()
+                .iter()
+                .filter(|receipt| **receipt == Receipt::CloseEntered)
+                .count(),
+            1
+        );
+        // EOF makes termination likely, but this observes it: a reader that
+        // exited is proven, not assumed (#399 NB5).
+        release_reader(&mut live.receipts, reader_steps).await;
+    }
+
+    #[tokio::test]
+    async fn l12_a_checked_output_failure_stops_the_pump_before_teardown() {
+        let (send, receipts) = Receipts::channel();
+        let mut stdout = ReceiptSink::failing_write(
+            GuestStream::Stdout,
+            std::io::ErrorKind::BrokenPipe,
+            send.clone(),
+        );
+        let mut stderr = ReceiptSink::new(GuestStream::Stderr, send.clone());
+        let (reader, reader_steps) = GatedReader::new(send.clone());
+        let (sink, _) = GatedGuestStdin::new(send);
+        let teardown = StubTeardown::new().tracking_sink(sink.dropped_flag());
+        let (mut live, lifecycle) = live_stream(
+            &teardown,
+            StreamSinks {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+            },
+            OutputErrorPolicy::DirectChecked,
+            StreamInput::Forward(InputSource::new(reader)),
+            Some(sink),
+            receipts,
+        );
+        let driver = async {
+            reader_steps.send(one_chunk()).unwrap();
+            live.expect("a pending guest write", |receipt| {
+                matches!(receipt, Receipt::WriteEntered { .. })
+            })
+            .await;
+            live.send(microsandbox::sandbox::exec::ExecEvent::Stdout(
+                b"o".to_vec().into(),
+            ))
+            .await;
+        };
+        let (outcome, ()) = join_bounded("L12", lifecycle, driver).await;
+
+        let message = format!("{:#}", outcome.expect_err("a lost stdout is a failure"));
+        assert!(message.contains("writing guest stdout failed"), "{message}");
+        assert_eq!(
+            teardown.drops(),
+            ["sink", "runtime", "handle", "stop", "remove"]
+        );
+        release_reader(&mut live.receipts, reader_steps).await;
+    }
+
+    #[tokio::test]
+    async fn l13_a_missing_stdin_pipe_is_a_start_failure_with_the_full_release_order() {
+        let (send, receipts) = Receipts::channel();
+        let mut stdout = ReceiptSink::new(GuestStream::Stdout, send.clone());
+        let mut stderr = ReceiptSink::new(GuestStream::Stderr, send.clone());
+        let (reader, reader_steps) = GatedReader::new(send);
+        let teardown = StubTeardown::new();
+        let (mut live, lifecycle) = live_stream(
+            &teardown,
+            StreamSinks {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+            },
+            OutputErrorPolicy::DirectChecked,
+            StreamInput::Forward(InputSource::new(reader)),
+            // The runtime did not hand out a sink despite `stdin_pipe()`.
+            None,
+            receipts,
+        );
+        let driver = async {
+            let _ = &mut live;
+        };
+        let (outcome, ()) = join_bounded("L13", lifecycle, driver).await;
+
+        let message = format!("{:#}", outcome.expect_err("F8 is a launcher failure"));
+        assert!(
+            message.contains("did not provide a stdin pipe"),
+            "{message}"
+        );
+        // No sink existed; the handle is released before the first stage.
+        assert_eq!(teardown.drops(), ["runtime", "handle", "stop", "remove"]);
+        assert!(
+            !live
+                .receipts
+                .saw(|receipt| matches!(receipt, Receipt::ReaderEntered { .. })),
+            "a start failure must not read host stdin"
+        );
+        live.receipts
+            .expect("the source to be dropped", |receipt| {
+                *receipt == Receipt::ReaderDropped
+            })
+            .await;
+        release_reader(&mut live.receipts, reader_steps).await;
+    }
+
+    #[tokio::test]
+    async fn l14_a_reader_spawn_failure_is_a_start_failure_with_the_full_release_order() {
+        let (send, receipts) = Receipts::channel();
+        let mut stdout = ReceiptSink::new(GuestStream::Stdout, send.clone());
+        let mut stderr = ReceiptSink::new(GuestStream::Stderr, send.clone());
+        let (reader, reader_steps) = GatedReader::new(send.clone());
+        let (sink, _) = GatedGuestStdin::new(send);
+        let teardown = StubTeardown::new().tracking_sink(sink.dropped_flag());
+        let (mut live, lifecycle) = live_stream(
+            &teardown,
+            StreamSinks {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+            },
+            OutputErrorPolicy::DirectChecked,
+            StreamInput::Forward(InputSource::with_spawner(
+                reader,
+                crate::direct_input::test_support::failing_spawner,
+            )),
+            Some(sink),
+            receipts,
+        );
+        let driver = async {
+            let _ = &mut live;
+        };
+        let (outcome, ()) = join_bounded("L14", lifecycle, driver).await;
+
+        let message = format!("{:#}", outcome.expect_err("F9 is a launcher failure"));
+        assert!(
+            message.contains("starting the host stdin reader failed: injected"),
+            "{message}"
+        );
+        assert_eq!(
+            teardown.drops(),
+            ["sink", "runtime", "handle", "stop", "remove"]
+        );
+        assert!(
+            !live
+                .receipts
+                .saw(|receipt| matches!(receipt, Receipt::ReaderEntered { .. })),
+            "a failed spawn must not read host stdin"
+        );
+        release_reader(&mut live.receipts, reader_steps).await;
+    }
+
+    /// Negative control for L13/L14 (review B2): "a start failure must not read
+    /// host stdin" is only meaningful if that observation can see a read. A
+    /// spawner that runs the reader body and *then* reports failure is the
+    /// shape production never produces; the receipt shows the assertion would
+    /// catch it instead of passing on an empty history.
+    #[tokio::test]
+    async fn l14_negative_control_a_read_before_a_start_failure_is_visible() {
+        let (send, receipts) = Receipts::channel();
+        let mut stdout = ReceiptSink::new(GuestStream::Stdout, send.clone());
+        let mut stderr = ReceiptSink::new(GuestStream::Stderr, send.clone());
+        let (reader, reader_steps) = GatedReader::new(send.clone());
+        // The body runs on this thread, so its read must not block.
+        reader_steps.send(ReaderStep::Eof).unwrap();
+        let (sink, _) = GatedGuestStdin::new(send);
+        let teardown = StubTeardown::new().tracking_sink(sink.dropped_flag());
+        let (mut live, lifecycle) = live_stream(
+            &teardown,
+            StreamSinks {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+            },
+            OutputErrorPolicy::DirectChecked,
+            StreamInput::Forward(InputSource::with_spawner(
+                reader,
+                crate::direct_input::test_support::reading_then_failing_spawner,
+            )),
+            Some(sink),
+            receipts,
+        );
+        let outcome = tokio::time::timeout(LIFECYCLE_DEADLINE, lifecycle)
+            .await
+            .expect("the L14 negative-control lifecycle did not finish (teardown hang)");
+        let message = format!("{:#}", outcome.expect_err("the injected spawn failure"));
+        assert!(
+            message.contains("starting the host stdin reader failed: injected"),
+            "{message}"
+        );
+        assert!(
+            live.receipts
+                .saw(|receipt| matches!(receipt, Receipt::ReaderEntered { .. })),
+            "L13/L14's no-read oracle cannot see a read, so it would pass vacuously"
+        );
+        release_reader(&mut live.receipts, reader_steps).await;
+    }
+
+    /// Start-up failures share `finish_failed_exec`: the primary error stays
+    /// first and the teardown failure is appended, exactly as for a loop
+    /// failure.
+    #[tokio::test]
+    async fn l14b_start_failures_share_the_cleanup_reporting() {
+        for missing_pipe in [true, false] {
+            let (send, receipts) = Receipts::channel();
+            let mut stdout = ReceiptSink::new(GuestStream::Stdout, send.clone());
+            let mut stderr = ReceiptSink::new(GuestStream::Stderr, send.clone());
+            let (reader, reader_steps) = GatedReader::new(send.clone());
+            let (sink, _) = GatedGuestStdin::new(send);
+            let teardown = if missing_pipe {
+                StubTeardown::new().failing_at("stop", "stop failed")
+            } else {
+                StubTeardown::new()
+                    .tracking_sink(sink.dropped_flag())
+                    .failing_at("stop", "stop failed")
+            };
+            let (source, sink) = if missing_pipe {
+                (InputSource::new(reader), None)
+            } else {
+                (
+                    InputSource::with_spawner(
+                        reader,
+                        crate::direct_input::test_support::failing_spawner,
+                    ),
+                    Some(sink),
+                )
+            };
+            let (mut live, lifecycle) = live_stream(
+                &teardown,
+                StreamSinks {
+                    stdout: &mut stdout,
+                    stderr: &mut stderr,
+                },
+                OutputErrorPolicy::DirectChecked,
+                StreamInput::Forward(source),
+                sink,
+                receipts,
+            );
+            let lifecycle = tokio::time::timeout(LIFECYCLE_DEADLINE, lifecycle);
+            let message = match lifecycle
+                .await
+                .expect("the L14b lifecycle did not finish (teardown hang)")
+            {
+                Ok(code) => panic!("a start failure cannot be a guest status {code}"),
+                Err(error) => format!("{error:#}"),
+            };
+            let primary = if missing_pipe {
+                "the runtime did not provide a stdin pipe"
+            } else {
+                "starting the host stdin reader failed"
+            };
+            assert!(message.starts_with(primary), "{message}");
+            assert!(
+                message.contains("cleanup failed: stop: stop failed"),
+                "{message}"
+            );
+            release_reader(&mut live.receipts, reader_steps).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn l15_output_is_flushed_while_input_is_still_open() {
+        for pending_write in [false, true] {
+            let (send, receipts) = Receipts::channel();
+            let mut stdout = ReceiptSink::new(GuestStream::Stdout, send.clone());
+            let mut stderr = ReceiptSink::new(GuestStream::Stderr, send.clone());
+            let (reader, reader_steps) = GatedReader::new(send.clone());
+            let (sink, _) = GatedGuestStdin::new(send);
+            let teardown = StubTeardown::new().tracking_sink(sink.dropped_flag());
+            let (mut live, lifecycle) = live_stream(
+                &teardown,
+                StreamSinks {
+                    stdout: &mut stdout,
+                    stderr: &mut stderr,
+                },
+                OutputErrorPolicy::DirectChecked,
+                StreamInput::Forward(InputSource::new(reader)),
+                Some(sink),
+                receipts,
+            );
+            let driver = async {
+                if pending_write {
+                    reader_steps.send(one_chunk()).unwrap();
+                    live.expect("a pending guest write", |receipt| {
+                        matches!(receipt, Receipt::WriteEntered { .. })
+                    })
+                    .await;
+                } else {
+                    // A host read is genuinely in progress: input is open.
+                    live.expect("a host read in progress", |receipt| {
+                        matches!(receipt, Receipt::ReaderEntered { call: 1 })
+                    })
+                    .await;
+                }
+                live.send(microsandbox::sandbox::exec::ExecEvent::Stdout(
+                    b"o1".to_vec().into(),
+                ))
+                .await;
+                live.expect("flushed stdout before Exited", |receipt| {
+                    matches!(
+                        receipt,
+                        Receipt::Flushed {
+                            stream: "stdout",
+                            total: 2
+                        }
+                    )
+                })
+                .await;
+                live.send(microsandbox::sandbox::exec::ExecEvent::Stderr(
+                    b"e1".to_vec().into(),
+                ))
+                .await;
+                live.expect("flushed stderr before Exited", |receipt| {
+                    matches!(
+                        receipt,
+                        Receipt::Flushed {
+                            stream: "stderr",
+                            total: 2
+                        }
+                    )
+                })
+                .await;
+                live.exit(0).await;
+            };
+            let (outcome, ()) = join_bounded("L15", lifecycle, driver).await;
+
+            assert_eq!(
+                outcome.expect("the guest status"),
+                0,
+                "pending_write={pending_write}"
+            );
+            assert_eq!(stdout.bytes(), b"o1");
+            assert_eq!(stderr.bytes(), b"e1");
+            release_reader(&mut live.receipts, reader_steps).await;
+        }
+    }
+
+    /// The route table, pinned: only a direct **streamed** launch reserves the
+    /// command's input (#400 will replace the `ExecIo` selection).
+    #[test]
+    fn r1_exec_route_selection_table() {
+        assert_eq!(
+            guest_input_for(ProgramGuard::Direct, ExecIo::Stream),
+            GuestInput::ReservedForProgram
+        );
+        for (guard, io) in [
+            (ProgramGuard::ImageContract, ExecIo::Stream),
+            (ProgramGuard::ImageContract, ExecIo::Attach),
+            (ProgramGuard::Direct, ExecIo::Attach),
+        ] {
+            assert_eq!(
+                guest_input_for(guard, io),
+                GuestInput::DiscardWhenNotTerminal,
+                "{guard:?}/{io:?}"
+            );
+        }
+    }
+    // ── The bootstrap's input ownership, against real bash (#399 §6.3) ─────
+    //
+    // These tests run the *production* rendering with the resolv.conf strip
+    // replaced by `true` (never edit the host's /etc/resolv.conf) and the seed
+    // text re-rooted at a temp directory. Every descriptor question is answered
+    // by an independent probe process, never by a bash builtin that creates the
+    // descriptors it reports.
+
+    /// The calibrated descriptor probe (#399 review B2).
+    ///
+    /// Walk fds 3..1024 with `fcntl(F_GETFD)`/`fstat` **before** opening
+    /// anything, so the report describes only inherited descriptors. A builtin
+    /// probe cannot do this: rev 1 reported fd 10/11 that bash itself had
+    /// created for the redirection, which is why the negative controls in
+    /// `p0_fd_probe_is_calibrated` and `b7_negative_controls_the_probe_sees_a_leak`
+    /// exist.
+    #[test]
+    fn fd_probe_child() {
+        use std::io::Write as _;
+        let Ok(label) = std::env::var("AGENT_VM_399_FD_PROBE_LABEL") else {
+            return;
+        };
+        let report = std::env::var("AGENT_VM_399_FD_PROBE_REPORT").expect("a report path");
+        let consume = std::env::var("AGENT_VM_399_FD_PROBE_CONSUME").as_deref() == Ok("1");
+        let hold: u64 = std::env::var("AGENT_VM_399_FD_PROBE_HOLD_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+
+        let mut open: Vec<String> = Vec::new();
+        let mut consumed: Vec<String> = Vec::new();
+        for fd in 3..1024i32 {
+            // SAFETY: plain libc descriptor queries, no memory is handed out.
+            if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+                continue;
+            }
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: `stat` is a valid, zeroed `libc::stat`.
+            let described = unsafe { libc::fstat(fd, &mut stat) } == 0;
+            let kind = if !described {
+                "unknown"
+            } else {
+                match stat.st_mode & libc::S_IFMT {
+                    libc::S_IFIFO => "fifo",
+                    libc::S_IFREG => "reg",
+                    libc::S_IFCHR => "chr",
+                    libc::S_IFSOCK => "sock",
+                    libc::S_IFDIR => "dir",
+                    _ => "other",
+                }
+            };
+            open.push(format!(
+                "{fd}:{kind}:{}",
+                if described { stat.st_ino } else { 0 }
+            ));
+            if !consume {
+                continue;
+            }
+            let mut descriptor = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one descriptor, zero timeout.
+            if unsafe { libc::poll(&mut descriptor, 1, 0) } <= 0
+                || descriptor.revents & libc::POLLIN == 0
+            {
+                continue;
+            }
+            let mut buffer = [0u8; 5];
+            // SAFETY: the buffer is five bytes and the descriptor is readable.
+            let read = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+            if read > 0 {
+                let hex: String = buffer[..read as usize]
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect();
+                consumed.push(format!("{fd}:{hex}"));
+            }
+        }
+        let line = format!("{label} open=[{}] consumed=[]\n", open.join(","));
+        let line = line.replace("consumed=[]", &format!("consumed=[{}]", consumed.join(",")));
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&report)
+            .expect("the report file");
+        file.write_all(line.as_bytes()).expect("write the report");
+        if hold > 0 {
+            std::thread::sleep(Duration::from_secs(hold));
+        }
+        println!("PROBE_DONE {label}");
+    }
+
+    /// Everything the boot-free bootstrap tests need, in one temp directory.
+    struct Bootstrap {
+        dir: tempfile::TempDir,
+        executable: std::path::PathBuf,
+    }
+
+    impl Bootstrap {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join("seed.d")).unwrap();
+            std::fs::create_dir_all(dir.path().join("bin")).unwrap();
+            let executable = std::env::current_exe().unwrap();
+            Self { dir, executable }
+        }
+
+        fn path(&self) -> &Path {
+            self.dir.path()
+        }
+
+        /// A PATH the program and the hook's helper programs can both use.
+        fn search_path(&self) -> String {
+            format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", self.path().display())
+        }
+
+        fn text(&self) -> &str {
+            self.path().to_str().expect("an ASCII temp path")
+        }
+
+        fn report(&self) -> std::path::PathBuf {
+            self.path().join("fd-report")
+        }
+
+        fn lock(&self) -> std::path::PathBuf {
+            self.path().join("hook.lock")
+        }
+
+        /// The production seed text, re-rooted here: the same loop and the same
+        /// named entry point, so the tested text is the shipped text.
+        fn seed_text(&self) -> String {
+            RUN_IMAGE_SEED_HOOKS.replace("/opt/agent-vm", self.text())
+        }
+
+        /// The setup text handed to `render_with_setup`: the strip would edit
+        /// the host's /etc/resolv.conf, so it becomes `true`.
+        fn setup(&self) -> String {
+            format!("true\n{}", self.seed_text())
+        }
+
+        fn write_executable(&self, name: &str, body: &str) -> std::path::PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let path = self.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        }
+
+        fn seed_hook(&self, name: &str, body: &str) -> std::path::PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let path = self.path().join("seed.d").join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        }
+
+        /// A `#!/bin/sh` wrapper that `exec`s the test binary as the probe. The
+        /// permanent `exec … >/dev/null 2>&1` redirect saves nothing, which is
+        /// what keeps the probe's report clean.
+        fn probe(&self, label: &str, consume: bool, hold_secs: u64) -> std::path::PathBuf {
+            let mut body = format!(
+                "#!/bin/sh\nexport AGENT_VM_399_FD_PROBE_LABEL={label}\n\
+                 export AGENT_VM_399_FD_PROBE_REPORT={report}\n",
+                report = self.report().display(),
+            );
+            if consume {
+                body.push_str("export AGENT_VM_399_FD_PROBE_CONSUME=1\n");
+            }
+            if hold_secs > 0 {
+                body.push_str(&format!(
+                    "export AGENT_VM_399_FD_PROBE_HOLD_SECS={hold_secs}\n"
+                ));
+            }
+            body.push_str(&format!(
+                "exec {} --exact run::tests::fd_probe_child --nocapture --test-threads=1 -q \
+                 >/dev/null 2>&1\n",
+                self.executable.display()
+            ));
+            self.write_executable(&format!("probe-{label}"), &body)
+        }
+
+        fn report_lines(&self) -> Vec<String> {
+            std::fs::read_to_string(self.report())
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+
+        /// The last report line for `label` (the probe may have run twice
+        /// through the seed loop).
+        fn probe_report(&self, label: &str) -> String {
+            self.report_lines()
+                .into_iter()
+                .rfind(|line| line.starts_with(&format!("{label} ")))
+                .unwrap_or_else(|| panic!("no report line for {label}"))
+        }
+
+        /// The descriptors a probe report saw, as `(fd, kind)` pairs. Inodes are
+        /// per-run, so the descriptor **set** is the property a test pins — not
+        /// a substring that a superset would also satisfy (#399 review
+        /// non-blocking 4).
+        fn probe_open(&self, label: &str) -> Vec<(u32, String)> {
+            probe_open(&self.probe_report(label))
+        }
+
+        /// The bytes a consuming probe read from each descriptor.
+        fn probe_consumed(&self, label: &str) -> Vec<(u32, String)> {
+            let report = self.probe_report(label);
+            let list = report
+                .split_once("consumed=[")
+                .and_then(|(_, rest)| rest.split_once(']'))
+                .map(|(list, _)| list)
+                .unwrap_or_else(|| panic!("no consumed=[] list in {report}"));
+            if list.is_empty() {
+                return Vec::new();
+            }
+            list.split(',').map(split_descriptor).collect()
+        }
+
+        /// A `cat` program that also reports a hook export, so "the hook's
+        /// exports still apply" is observed from the command, not from the hook.
+        fn recording_cat(&self) -> std::path::PathBuf {
+            self.write_executable(
+                "record-cat",
+                "#!/bin/sh\ncat\nprintf 'v=%s' \"$HOOK_V\" >&2\n",
+            )
+        }
+
+        fn plain_cat(&self) -> std::path::PathBuf {
+            self.write_executable("plain-cat", "#!/bin/sh\ncat\n")
+        }
+
+        fn project_hook(&self, body: &str) -> std::path::PathBuf {
+            let path = self.path().join(".agent-vm.runtime.sh");
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            path
+        }
+    }
+
+    /// Every byte value plus NUL runs: the "byte-for-byte, NUL included" input.
+    fn binary_input() -> Vec<u8> {
+        let mut input: Vec<u8> = (0..=255u8).collect();
+        input.extend([0u8; 64]);
+        input.extend(b"tail");
+        input
+    }
+
+    /// One `fd:rest` entry of a probe report as `(fd, rest)`.
+    fn split_descriptor(entry: &str) -> (u32, String) {
+        let (fd, rest) = entry
+            .split_once(':')
+            .unwrap_or_else(|| panic!("not an fd entry: {entry}"));
+        (
+            fd.parse()
+                .unwrap_or_else(|_| panic!("not an fd number: {entry}")),
+            rest.to_string(),
+        )
+    }
+
+    /// The `(fd, kind)` pairs of one report's `open=[…]` list.
+    fn probe_open(report: &str) -> Vec<(u32, String)> {
+        let list = report
+            .split_once("open=[")
+            .and_then(|(_, rest)| rest.split_once(']'))
+            .map(|(list, _)| list)
+            .unwrap_or_else(|| panic!("no open=[] list in {report}"));
+        if list.is_empty() {
+            return Vec::new();
+        }
+        list.split(',')
+            .map(|entry| {
+                let (fd, rest) = split_descriptor(entry);
+                let kind = rest
+                    .split_once(':')
+                    .map(|(kind, _ino)| kind.to_string())
+                    .unwrap_or(rest);
+                (fd, kind)
+            })
+            .collect()
+    }
+
+    fn run_bootstrap_line(
+        bash: &str,
+        line: &str,
+        input: &[u8],
+        path: &str,
+    ) -> std::process::Output {
+        run_bootstrap_line_within(bash, line, input, path, BOOTSTRAP_LAUNCH_DEADLINE)
+    }
+
+    /// A bootstrap launch that does not exit within `deadline` is killed, reaped
+    /// and reported: a post-hoc elapsed assertion is not a wait deadline (#399
+    /// review non-blocking 2).
+    fn run_bootstrap_line_within(
+        bash: &str,
+        line: &str,
+        input: &[u8],
+        path: &str,
+        deadline: std::time::Duration,
+    ) -> std::process::Output {
+        use std::io::Write as _;
+        let mut child = std::process::Command::new(bash)
+            .clean_descriptors()
+            .arg("-c")
+            .arg(line)
+            .env("PATH", path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input)
+            .expect("write the piped input");
+        wait_bounded(child, deadline)
+    }
+
+    /// How long a bootstrap launch may run before it is a failure. Every one of
+    /// these rows finishes in milliseconds; the deadline exists so a wedged
+    /// launch fails instead of hanging the suite.
+    const BOOTSTRAP_LAUNCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// How long a capture thread may take to reach EOF after the launch it was
+    /// draining has been reaped. A **descendant** that retained the pipe would
+    /// otherwise defeat the launch deadline by keeping `join` blocked forever
+    /// (#399 NB2).
+    const CAPTURE_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Join a capture thread under a deadline. The thread is left detached (and
+    /// the test fails) rather than joined unbounded when a descendant still
+    /// holds the pipe: a leaked drain must not turn a failed assertion into a
+    /// hang.
+    fn join_capture_bounded<T: Send + 'static>(
+        handle: std::thread::JoinHandle<T>,
+        what: &str,
+    ) -> T {
+        let started = std::time::Instant::now();
+        while !handle.is_finished() {
+            assert!(
+                started.elapsed() <= CAPTURE_DRAIN_DEADLINE,
+                "{what} was still open {CAPTURE_DRAIN_DEADLINE:?} after the launch was reaped; \
+                 a descendant is holding the pipe"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Resumed rather than re-worded: the reader's own message (a read
+        // failure on the child's pipe) is the diagnostic.
+        handle
+            .join()
+            .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+    }
+
+    /// `Child::wait_with_output` with a real deadline: the pipes are drained on
+    /// helper threads (so a full pipe cannot deadlock the wait), and a child
+    /// that outlives the deadline is killed, reaped and reported. Both the
+    /// success and the timeout path join the capture threads under their own
+    /// bound, so an inherited pipe cannot defeat either deadline.
+    fn wait_bounded(
+        mut child: std::process::Child,
+        deadline: std::time::Duration,
+    ) -> std::process::Output {
+        use std::io::Read as _;
+        let mut stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        // A failed read is a test failure, never a short capture that a later
+        // assertion reads as the guest's real output.
+        let stdout_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stdout
+                .read_to_end(&mut bytes)
+                .unwrap_or_else(|error| panic!("reading the launch's stdout failed: {error}"));
+            bytes
+        });
+        let stderr_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stderr
+                .read_to_end(&mut bytes)
+                .unwrap_or_else(|error| panic!("reading the launch's stderr failed: {error}"));
+            bytes
+        });
+        let started = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                break status;
+            }
+            if started.elapsed() > deadline {
+                let _ = child.kill();
+                let status = child.wait().expect("reap the killed launch");
+                let stderr =
+                    String::from_utf8_lossy(&join_capture_bounded(stderr_reader, "stderr"))
+                        .into_owned();
+                let stdout =
+                    String::from_utf8_lossy(&join_capture_bounded(stdout_reader, "stdout"))
+                        .into_owned();
+                panic!(
+                    "the launch did not exit within {deadline:?}; killed and reaped with \
+                     {status}\nstdout: {stdout}\nstderr: {stderr}"
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        std::process::Output {
+            status,
+            stdout: join_capture_bounded(stdout_reader, "stdout"),
+            stderr: join_capture_bounded(stderr_reader, "stderr"),
+        }
+    }
+
+    /// Run a bootstrap line while establishing ownership of a background child
+    /// the hook announces in `pidfile`, **before** waiting for the launch. A
+    /// timeout or a failed status assertion after this point cannot leak that
+    /// child (#399 NB2).
+    fn run_bootstrap_line_observing_child(
+        bash: &str,
+        line: &str,
+        input: &[u8],
+        path: &str,
+        deadline: std::time::Duration,
+        pidfile: &Path,
+    ) -> (std::process::Output, BackgroundChild) {
+        use std::io::Write as _;
+        let _ = std::fs::remove_file(pidfile);
+        let mut child = std::process::Command::new(bash)
+            .clean_descriptors()
+            .arg("-c")
+            .arg(line)
+            .env("PATH", path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // A write failure is reported after ownership exists. Panicking here
+        // would skip the pid-file poll below and could leak a background child
+        // the hook already started (#399 NB2 error path).
+        let write_error = child.stdin.take().unwrap().write_all(input).err();
+        let started = std::time::Instant::now();
+        let guard = loop {
+            if let Ok(text) = std::fs::read_to_string(pidfile)
+                && let Ok(pid) = text.trim().parse::<i32>()
+            {
+                break BackgroundChild { pid, reaped: false };
+            }
+            if started.elapsed() > deadline {
+                let _ = child.kill();
+                let output = wait_bounded(child, CAPTURE_DRAIN_DEADLINE);
+                panic!("the hook recorded no background pid within {deadline:?}: {output:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let remaining = deadline.saturating_sub(started.elapsed());
+        let output = wait_bounded(child, remaining);
+        if let Some(error) = write_error {
+            panic!("writing the piped input failed: {error}\noutput: {output:?}");
+        }
+        (output, guard)
+    }
+
+    fn run_bootstrap_file(
+        bash: &str,
+        line: &str,
+        input: &Path,
+        path: &str,
+    ) -> std::process::Output {
+        let child = std::process::Command::new(bash)
+            .clean_descriptors()
+            .arg("-c")
+            .arg(line)
+            .env("PATH", path)
+            .stdin(std::fs::File::open(input).unwrap())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        wait_bounded(child, BOOTSTRAP_LAUNCH_DEADLINE)
+    }
+
+    fn bootstrap_line(
+        bootstrap: &Bootstrap,
+        guard: ProgramGuard,
+        input: GuestInput,
+        command: &str,
+        args: &[String],
+    ) -> String {
+        AgentShellLine {
+            guard,
+            project_guest_path: bootstrap.text(),
+            image: "stub-image",
+            command,
+            args,
+            input,
+        }
+        .render_with_setup(&bootstrap.setup())
+    }
+
+    fn bash_major(bash: &str) -> u32 {
+        let output = std::process::Command::new(bash)
+            .clean_descriptors()
+            .args(["-c", "printf '%s' \"${BASH_VERSINFO[0]}\""])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).parse().unwrap_or(0)
+    }
+
+    /// P0: the probe must be calibrated on this bash before any test trusts it.
+    /// A clean baseline, two deliberate descriptors, a consumption, and the
+    /// seed-loop path.
+    #[test]
+    fn p0_fd_probe_is_calibrated() {
+        let bootstrap = Bootstrap::new();
+        let clean = bootstrap.probe("p0-clean", false, 0);
+        let consume = bootstrap.probe("p0-consume", true, 0);
+        for bash in host_bashes() {
+            let output = std::process::Command::new(bash)
+                .clean_descriptors()
+                .args(["-c", &format!("exec '{}'", clean.display())])
+                .env("PATH", bootstrap.search_path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{bash}: {output:?}");
+            assert!(
+                bootstrap
+                    .probe_report("p0-clean")
+                    .ends_with("open=[] consumed=[]"),
+                "fd probe not calibrated on {bash} (baseline not clean): {}",
+                bootstrap.probe_report("p0-clean")
+            );
+            let output = std::process::Command::new(bash)
+                .clean_descriptors()
+                .args([
+                    "-c",
+                    &format!(
+                        "exec 9</dev/null; exec 200</dev/null; exec '{}'",
+                        clean.display()
+                    ),
+                ])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{bash}: {output:?}");
+            let report = bootstrap.probe_report("p0-clean");
+            assert!(report.contains("9:chr:"), "{bash}: {report}");
+            assert!(report.contains("200:chr:"), "{bash}: {report}");
+            let output = std::process::Command::new(bash)
+                .clean_descriptors()
+                .args(["-c", &format!("exec 9<&0; exec '{}'", consume.display())])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map(|mut child| {
+                    use std::io::Write as _;
+                    child
+                        .stdin
+                        .take()
+                        .unwrap()
+                        .write_all(b"hello")
+                        .expect("write the calibration pipe");
+                    child.wait_with_output().unwrap()
+                })
+                .unwrap();
+            assert!(output.status.success(), "{bash}: {output:?}");
+            assert!(
+                bootstrap
+                    .probe_report("p0-consume")
+                    .contains("consumed=[9:68656c6c6f]"),
+                "fd probe did not consume from a duplicated pipe on {bash}: {}",
+                bootstrap.probe_report("p0-consume")
+            );
+            // The wrapper-through-`/bin/sh` path the seed loop uses.
+            bootstrap.seed_hook(
+                "00-probe",
+                &format!("#!/bin/sh\nexec '{}'\n", clean.display()),
+            );
+            let output = std::process::Command::new(bash)
+                .clean_descriptors()
+                .args(["-c", &bootstrap.seed_text()])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{bash}: {output:?}");
+            assert!(
+                bootstrap
+                    .probe_report("p0-clean")
+                    .ends_with("open=[] consumed=[]"),
+                "fd probe sees descriptors through the seed loop on {bash}: {}",
+                bootstrap.probe_report("p0-clean")
+            );
+            std::fs::remove_file(bootstrap.path().join("seed.d/00-probe")).unwrap();
+        }
+    }
+
+    /// B1: the legacy bootstrap is byte-identical to `main`, measured as the
+    /// **whole** rendered line rather than a prefix: the point of the oracle is
+    /// that no byte of an existing shell, tool or direct-attach launch moved
+    /// (#399 review non-blocking 4).
+    ///
+    /// Provenance: these two literals are `AgentShellLine::render()`'s output at
+    /// base `78b8536` (`git show 78b8536:crates/agent-vm/src/run.rs`), which is
+    /// exactly the shipped line for `ImageContract` and for direct attach
+    /// (`Direct` + `DiscardWhenNotTerminal`). `#399` changed neither the strip,
+    /// the seed text, the redirect, the hook, the guard nor the `exec` for
+    /// those shapes; `git diff 78b8536 -- crates/agent-vm/src/run.rs` shows only
+    /// additive `GuestInput` plumbing outside them. The literals were also
+    /// compared byte-for-byte against main `8b00b54`'s rendering, so they
+    /// certify the line this branch actually replaces, not only the original
+    /// base.
+    const LEGACY_IMAGE_CONTRACT: &str = r#"sed -i '/^nameserver .*:/d' /etc/resolv.conf 2>/dev/null || true
+for _h in /opt/agent-vm/seed.d/*; do [ -x "$_h" ] && "$_h"; done
+[ -x /opt/agent-vm/seed-claude-plugins.sh ] && /opt/agent-vm/seed-claude-plugins.sh; true
+[ -t 0 ] || exec < /dev/null
+_hook='/work/proj'/.agent-vm.runtime.sh
+if [ -f "$_hook" ]; then
+	echo "==> sourcing $_hook" >&2
+	cd '/work/proj' && . "$_hook" || { rc=$?; echo "==> .agent-vm.runtime.sh failed (exit $rc)" >&2; exit $rc; }
+fi
+_avm_command='cat'
+_avm_external=
+case "$_avm_command" in
+	*/*) _avm_external=$_avm_command ;;
+	*) _avm_external=$(builtin type -P -- "$_avm_command") || _avm_external= ;;
+esac
+if [ -z "$_avm_external" ] || [ ! -f "$_avm_external" ] || [ ! -x "$_avm_external" ]; then
+	printf '%s\n' 'agent-vm: boot image stub-image has no runnable external program `cat` on the guest PATH or at the configured path. agent-vm does not install software: add it to the image or select an image that provides it (USAGE.md#boot-image-contract).' >&2
+	exit 127
+fi
+builtin hash -r
+unset _avm_command _avm_external; exec -- 'cat'"#;
+    const LEGACY_DIRECT_ATTACH: &str = r#"sed -i '/^nameserver .*:/d' /etc/resolv.conf 2>/dev/null || true
+for _h in /opt/agent-vm/seed.d/*; do [ -x "$_h" ] && "$_h"; done
+[ -x /opt/agent-vm/seed-claude-plugins.sh ] && /opt/agent-vm/seed-claude-plugins.sh; true
+[ -t 0 ] || exec < /dev/null
+_hook='/work/proj'/.agent-vm.runtime.sh
+if [ -f "$_hook" ]; then
+	echo "==> sourcing $_hook" >&2
+	cd '/work/proj' && . "$_hook" || { rc=$?; echo "==> .agent-vm.runtime.sh failed (exit $rc)" >&2; exit $rc; }
+fi
+builtin hash -r 2>/dev/null || builtin :
+_avm_command='cat'
+_avm_external=
+_avm_lookup_status=0
+case "$_avm_command" in
+	*/*) _avm_external=$_avm_command ;;
+	*)
+		if _avm_external=$(
+			builtin type -P -- "$_avm_command"
+			_avm_status=$?
+			builtin printf '.'
+			exit "$_avm_status"
+		); then _avm_lookup_status=0; else _avm_lookup_status=$?; fi
+		_avm_external=${_avm_external%.}
+		_avm_external=${_avm_external%$'\n'}
+		;;
+esac
+if [ "$_avm_lookup_status" -ne 0 ] || [ -z "$_avm_external" ] || [ ! -e "$_avm_external" ]; then
+	builtin printf '%s\n' 'agent-vm: executable not found: cat' >&2
+	exit 127
+fi
+if [ -d "$_avm_external" ] || [ ! -x "$_avm_external" ]; then
+	builtin printf '%s\n' 'agent-vm: not executable: cat' >&2
+	exit 126
+fi
+unset _avm_command _avm_external _avm_lookup_status; exec -- 'cat'"#;
+
+    #[test]
+    fn b1_legacy_and_direct_attach_bootstrap_is_byte_identical() {
+        for (guard, input, expected) in [
+            (
+                ProgramGuard::ImageContract,
+                GuestInput::DiscardWhenNotTerminal,
+                LEGACY_IMAGE_CONTRACT,
+            ),
+            (
+                ProgramGuard::Direct,
+                GuestInput::DiscardWhenNotTerminal,
+                LEGACY_DIRECT_ATTACH,
+            ),
+        ] {
+            let line = AgentShellLine {
+                guard,
+                project_guest_path: "/work/proj",
+                image: "stub-image",
+                command: "cat",
+                args: &[],
+                input,
+            }
+            .render();
+            if let Some(at) = line
+                .bytes()
+                .zip(expected.bytes())
+                .position(|(actual, frozen)| actual != frozen)
+            {
+                panic!(
+                    "{guard:?}: the legacy line changed at byte {at}:\n  now: {:?}\n  base: {:?}",
+                    &line[at.saturating_sub(40)..(at + 40).min(line.len())],
+                    &expected[at.saturating_sub(40)..(at + 40).min(expected.len())],
+                );
+            }
+            assert_eq!(line.len(), expected.len(), "{guard:?}: {line}");
+            assert_eq!(line.matches("[ -t 0 ] || exec < /dev/null").count(), 1);
+        }
+    }
+
+    /// B2: the reserved shape is one group whose stdin is /dev/null, and the
+    /// only command that runs with the input on fd 0 is the program's `exec`.
+    #[test]
+    fn b2_reserved_input_bootstrap_groups_all_setup_before_the_exec() {
+        let bootstrap = Bootstrap::new();
+        let line = AgentShellLine {
+            guard: ProgramGuard::Direct,
+            project_guest_path: bootstrap.text(),
+            image: "stub-image",
+            command: "cat",
+            args: &[],
+            input: GuestInput::ReservedForProgram,
+        }
+        .render();
+        let lines: Vec<&str> = line.lines().collect();
+        assert_eq!(lines.first(), Some(&"{"), "{line}");
+        assert_eq!(lines.last(), Some(&"} </dev/null; exec -- 'cat'"), "{line}");
+        for needle in [
+            STRIP_IPV6_NAMESERVERS,
+            "for _h in",
+            "_hook=",
+            "_avm_command=",
+        ] {
+            let at = line
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle}\n{line}"));
+            assert!(
+                at > line.find("{\n").unwrap() && at < line.rfind("} </dev/null").unwrap(),
+                "{needle} must be inside the group: {line}"
+            );
+        }
+        for forbidden in ["[ -t 0 ]", "9<", "exec 0<"] {
+            assert!(!line.contains(forbidden), "{forbidden} in {line}");
+        }
+        assert_eq!(line.matches("exec --").count(), 1, "{line}");
+    }
+
+    /// B3: setup and the project hook see EOF, the hook's exports still apply,
+    /// and the program receives every byte — as a pipe and as a regular file.
+    #[test]
+    fn b3_setup_and_hook_see_eof_and_the_program_gets_every_byte() {
+        let bootstrap = Bootstrap::new();
+        let record = bootstrap.path().join("reads");
+        let record_text = record.display().to_string();
+        bootstrap.seed_hook(
+            "10-reader",
+            &format!(
+                "#!/bin/sh\nif IFS= read -r _line; then echo seed-read=GOT >> '{record_text}'; \
+                 else echo seed-read=EOF >> '{record_text}'; fi\n"
+            ),
+        );
+        bootstrap.project_hook(&format!(
+            "if IFS= read -r _line; then echo hook-read=GOT >> '{record_text}'; \
+             else echo hook-read=EOF >> '{record_text}'; fi\nexport HOOK_V=hook-value\n\
+             PATH={}:$PATH; export PATH",
+            bootstrap.path().display()
+        ));
+        let program = bootstrap.recording_cat();
+        let input = binary_input();
+        let input_file = bootstrap.path().join("input.bin");
+        std::fs::write(&input_file, &input).unwrap();
+        for bash in host_bashes() {
+            let line = bootstrap_line(
+                &bootstrap,
+                ProgramGuard::Direct,
+                GuestInput::ReservedForProgram,
+                program.to_str().unwrap(),
+                &[],
+            );
+            let check = |kind: &str, output: std::process::Output| {
+                assert_eq!(output.status.code(), Some(0), "{bash} {kind}: {output:?}");
+                assert_eq!(output.stdout, input, "{bash} {kind}: input bytes changed");
+                assert_eq!(
+                    std::fs::read_to_string(&record).unwrap(),
+                    "seed-read=EOF\nhook-read=EOF\n",
+                    "{bash} {kind}: setup or hook consumed the command's input"
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("v=hook-value"),
+                    "{bash} {kind}: the hook's export was lost: {output:?}"
+                );
+                std::fs::remove_file(&record).unwrap();
+            };
+            check(
+                "pipe",
+                run_bootstrap_line(bash, &line, &input, &bootstrap.search_path()),
+            );
+            check(
+                "file",
+                run_bootstrap_file(bash, &line, &input_file, &bootstrap.search_path()),
+            );
+            // `bash_major` is logged in every failure message above via `bash`.
+            let _ = bash_major(bash);
+        }
+    }
+
+    /// B4: a hook that plays with descriptors cannot steal or lose the
+    /// command's input. The fd-10 case is the documented save-slot collision:
+    /// the descriptor is closed at group end, and the input is still exact.
+    #[test]
+    fn b4_hook_descriptor_games_do_not_steal_or_lose_command_input() {
+        let bootstrap = Bootstrap::new();
+        let program = bootstrap.plain_cat();
+        let input = binary_input();
+        let lock = bootstrap.lock().display().to_string();
+        let bodies = [
+            "exec </etc/hosts".to_string(),
+            "exec 0<&-".to_string(),
+            format!("exec 9>'{lock}'"),
+            "set -e".to_string(),
+            format!("exec 10>'{lock}'"),
+        ];
+        for body in bodies {
+            bootstrap.project_hook(&body);
+            for bash in host_bashes() {
+                let line = bootstrap_line(
+                    &bootstrap,
+                    ProgramGuard::Direct,
+                    GuestInput::ReservedForProgram,
+                    program.to_str().unwrap(),
+                    &[],
+                );
+                let output = run_bootstrap_line(bash, &line, &input, &bootstrap.search_path());
+                assert_eq!(output.status.code(), Some(0), "{bash} {body}: {output:?}");
+                assert_eq!(output.stdout, input, "{bash} {body}: input bytes changed");
+            }
+        }
+        // `cat <&9` is denied: fd 9 is not inherited into the group.
+        bootstrap.project_hook(
+            "if cat <&9 >/dev/null 2>&1; then echo hook-fd9=READABLE >&2; \
+             else echo hook-fd9=DENIED >&2; fi",
+        );
+        for bash in host_bashes() {
+            let line = bootstrap_line(
+                &bootstrap,
+                ProgramGuard::Direct,
+                GuestInput::ReservedForProgram,
+                program.to_str().unwrap(),
+                &[],
+            );
+            let output = run_bootstrap_line(bash, &line, &input, &bootstrap.search_path());
+            assert_eq!(output.status.code(), Some(0), "{bash}: {output:?}");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("hook-fd9=DENIED"), "{bash}: {stderr}");
+            assert!(!stderr.contains("hook-fd9=READABLE"), "{bash}: {stderr}");
+            assert_eq!(output.stdout, input, "{bash}: input bytes changed");
+        }
+    }
+
+    /// A background child a hook started, cleaned up on **every** exit path of
+    /// the row: `Drop` sends SIGKILL, so a failed assertion cannot leave a 30 s
+    /// sleeper behind (#399 review non-blocking 2).
+    struct BackgroundChild {
+        pid: i32,
+        reaped: bool,
+    }
+
+    impl BackgroundChild {
+        /// SIGKILL, then poll until `kill(pid, 0)` reports **ESRCH** — the only
+        /// status that proves the pid is gone. Any other errno (EPERM) means the
+        /// process still exists and must not be reported as reaped.
+        ///
+        /// Idempotent: an explicit `reap()` followed by `Drop` must not signal a
+        /// pid the OS may already have recycled.
+        fn reap(&mut self) -> Result<(), String> {
+            if self.reaped {
+                return Ok(());
+            }
+            // SAFETY: a plain signal to a pid this test observed.
+            unsafe { libc::kill(self.pid, libc::SIGKILL) };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                // SAFETY: signal 0 only probes the pid.
+                if unsafe { libc::kill(self.pid, 0) } != 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::ESRCH) {
+                        self.reaped = true;
+                        return Ok(());
+                    }
+                    return Err(format!(
+                        "bg pid {} still exists: signal 0 failed with {error} (not ESRCH)",
+                        self.pid
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(format!(
+                "bg pid {} was still visible 5 s after SIGKILL; if it is only a zombie, \
+                 host init does not reap reparented children",
+                self.pid
+            ))
+        }
+    }
+
+    impl Drop for BackgroundChild {
+        fn drop(&mut self) {
+            let _ = self.reap();
+        }
+    }
+
+    /// B4 (second half): a background child a hook starts holds no copy of the
+    /// command's input, does not keep the launch alive, and is cleaned up.
+    ///
+    /// Assumption stated and enforced: the host's init/launchd reaps a
+    /// reparented child, so the post-kill poll observes ESRCH.
+    #[test]
+    fn b4_a_hook_background_child_holds_no_input_and_does_not_block_the_launch() {
+        let bootstrap = Bootstrap::new();
+        let background = bootstrap.probe("bg", false, 30);
+        // The hook records the background pid in a file the moment it starts,
+        // so the test can own (guard) that child *before* it waits for the
+        // launch. Deriving the pid from the completed stderr only would leave a
+        // timed-out launch's child unguarded (#399 NB2).
+        let pidfile = background.with_extension("pid");
+        bootstrap.project_hook(&format!(
+            "'{bg}' &\nprintf '%s' \"$!\" > '{pidfile}'\necho \"bg-pid=$!\" >&2",
+            bg = background.display(),
+            pidfile = pidfile.display()
+        ));
+        let program = bootstrap.plain_cat();
+        let input = binary_input();
+        for bash in host_bashes() {
+            let line = bootstrap_line(
+                &bootstrap,
+                ProgramGuard::Direct,
+                GuestInput::ReservedForProgram,
+                program.to_str().unwrap(),
+                &[],
+            );
+            // The launch must exit on its own within 5 s: a *deadline*, not an
+            // assertion made after an unbounded wait. Ownership of the hook's
+            // child exists before this call returns or panics.
+            let (output, mut child) = run_bootstrap_line_observing_child(
+                bash,
+                &line,
+                &input,
+                &bootstrap.search_path(),
+                std::time::Duration::from_secs(5),
+                &pidfile,
+            );
+            assert_eq!(output.status.code(), Some(0), "{bash}: {output:?}");
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            assert!(
+                stderr.contains("bg-pid="),
+                "{bash}: no bg-pid receipt: {stderr}"
+            );
+            // Every assertion below can panic; the guard still kills the child.
+            let mut observed = false;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                if bootstrap
+                    .report_lines()
+                    .iter()
+                    .any(|line| line.starts_with("bg ") && line.ends_with("open=[] consumed=[]"))
+                {
+                    observed = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let report = bootstrap.report_lines();
+            child
+                .reap()
+                .unwrap_or_else(|error| panic!("{bash}: {error}"));
+            assert!(
+                observed,
+                "{bash}: the background child inherited descriptors: {report:?}"
+            );
+            std::fs::remove_file(bootstrap.report()).unwrap();
+        }
+    }
+
+    /// B5: a failing project hook keeps its status and the program never runs.
+    #[test]
+    fn b5_reserved_hook_failure_passes_status_and_skips_the_program() {
+        let bootstrap = Bootstrap::new();
+        let sentinel = bootstrap.path().join("program-ran");
+        let program = bootstrap.write_executable(
+            "sentinel",
+            &format!("#!/bin/sh\ntouch '{}'\ncat\n", sentinel.display()),
+        );
+        for body in ["return 9", "exit 9"] {
+            bootstrap.project_hook(body);
+            for bash in host_bashes() {
+                let line = bootstrap_line(
+                    &bootstrap,
+                    ProgramGuard::Direct,
+                    GuestInput::ReservedForProgram,
+                    program.to_str().unwrap(),
+                    &[],
+                );
+                let output = run_bootstrap_line(bash, &line, b"input", &bootstrap.search_path());
+                assert_eq!(output.status.code(), Some(9), "{bash} {body}: {output:?}");
+                assert!(
+                    !sentinel.exists(),
+                    "{bash} {body}: the program ran despite the hook failure"
+                );
+                assert!(output.stdout.is_empty(), "{bash} {body}: {output:?}");
+            }
+        }
+    }
+
+    /// B6: the program inherits no extra descriptor — on every host bash — and
+    /// a hook's own fd 9 lock keeps its legacy lifetime.
+    #[test]
+    fn b6_the_program_inherits_no_extra_descriptor() {
+        let bootstrap = Bootstrap::new();
+        let final_probe = bootstrap.probe("final", false, 0);
+        for bash in host_bashes() {
+            for input in [
+                GuestInput::ReservedForProgram,
+                GuestInput::DiscardWhenNotTerminal,
+            ] {
+                let line = bootstrap_line(
+                    &bootstrap,
+                    ProgramGuard::Direct,
+                    input,
+                    final_probe.to_str().unwrap(),
+                    &[],
+                );
+                let output = run_bootstrap_line(bash, &line, b"", &bootstrap.search_path());
+                assert!(output.status.success(), "{bash} {input:?}: {output:?}");
+                let report = bootstrap.probe_report("final");
+                let open = bootstrap.probe_open("final");
+                assert!(
+                    open.is_empty() && bootstrap.probe_consumed("final").is_empty(),
+                    "{bash} {input:?}: the program inherited exactly no descriptor, \
+                     got {open:?} from {report}"
+                );
+                std::fs::remove_file(bootstrap.report()).unwrap();
+            }
+            // A hook's descriptor keeps the lifetime it has on every other
+            // launch: it outlives the hook and the program inherits it.
+            bootstrap.project_hook(&format!(
+                "exec 9>'{lock}'",
+                lock = bootstrap.lock().display()
+            ));
+            let line = bootstrap_line(
+                &bootstrap,
+                ProgramGuard::Direct,
+                GuestInput::ReservedForProgram,
+                final_probe.to_str().unwrap(),
+                &[],
+            );
+            let output = run_bootstrap_line(bash, &line, b"", &bootstrap.search_path());
+            assert!(output.status.success(), "{bash}: {output:?}");
+            let open = bootstrap.probe_open("final");
+            assert_eq!(
+                open,
+                vec![(9u32, "reg".to_string())],
+                "{bash}: the hook's fd 9 lock must keep its legacy lifetime, and only it: \
+                 {}",
+                bootstrap.probe_report("final")
+            );
+            std::fs::remove_file(bootstrap.report()).unwrap();
+            std::fs::remove_file(bootstrap.path().join(".agent-vm.runtime.sh")).unwrap();
+        }
+    }
+
+    /// B7: setup children inherit nothing and consume nothing, on every host
+    /// bash — plus the negative controls that keep the probe honest.
+    #[test]
+    fn b7_setup_children_inherit_and_consume_nothing() {
+        let bootstrap = Bootstrap::new();
+        let seed_probe = bootstrap.probe("seed", true, 0);
+        let hook_probe = bootstrap.probe("hook", true, 0);
+        bootstrap.seed_hook(
+            "10-probe",
+            &format!("#!/bin/sh\nexec '{}'\n", seed_probe.display()),
+        );
+        bootstrap.project_hook(&format!("'{}'", hook_probe.display()));
+        let program = bootstrap.plain_cat();
+        let input = binary_input();
+        for bash in host_bashes() {
+            let line = bootstrap_line(
+                &bootstrap,
+                ProgramGuard::Direct,
+                GuestInput::ReservedForProgram,
+                program.to_str().unwrap(),
+                &[],
+            );
+            let output = run_bootstrap_line(bash, &line, &input, &bootstrap.search_path());
+            assert_eq!(output.status.code(), Some(0), "{bash}: {output:?}");
+            for label in ["seed", "hook"] {
+                let report = bootstrap.probe_report(label);
+                assert!(
+                    report.ends_with("open=[] consumed=[]"),
+                    "{bash}: {label} inherited or consumed: {report}"
+                );
+            }
+            assert_eq!(output.stdout, input, "{bash}: input bytes changed");
+            std::fs::remove_file(bootstrap.report()).unwrap();
+        }
+    }
+
+    /// B7 negative controls: the probe tells a leak from a clean run.
+    ///
+    /// The rev-0 shape keeps a reserved fd open for setup; on bash 3.2 the
+    /// rev-1 shape's saved copy (fd 10) leaks through the group's `9<&-`.
+    #[test]
+    fn b7_negative_controls_the_probe_sees_a_leak() {
+        let bootstrap = Bootstrap::new();
+        let seed_probe = bootstrap.probe("leak", true, 0);
+        let program = bootstrap.plain_cat();
+        let input = binary_input();
+        // (a) fd 9 reserved and never closed for the consuming children.
+        let leak = format!(
+            "exec 9<&0 </dev/null\n'{seed}' >/dev/null 2>&1\n'{prog}'",
+            seed = seed_probe.display(),
+            prog = program.display(),
+        );
+        // (b) the rev-1 group on bash 3.x: bash saves fd 9 at fd 10, which 3.2
+        // does not mark close-on-exec, so the child inherits it.
+        let rev1 = format!(
+            "exec 9<&0 </dev/null\n{{ '{seed}' >/dev/null 2>&1; }} 9<&-\nexec 0<&9 9<&-\n'{prog}'",
+            seed = seed_probe.display(),
+            prog = program.display(),
+        );
+        // The consumed hex is the first five bytes of the input, so "consumed
+        // something" cannot stand in for "consumed the command's input".
+        let first_five: String = input[..5]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        for bash in host_bashes() {
+            let output = run_bootstrap_line(bash, &leak, &input, &bootstrap.search_path());
+            let report = bootstrap.probe_report("leak");
+            assert!(
+                bootstrap.probe_open("leak").iter().any(|(fd, _)| *fd == 9),
+                "{bash}: the probe missed the reserved fd 9: {report}"
+            );
+            assert_eq!(
+                bootstrap.probe_consumed("leak"),
+                vec![(9u32, first_five.clone())],
+                "{bash}: the reserved-fd leak must be seen consuming fd 9: {report}"
+            );
+            assert_ne!(
+                output.stdout, input,
+                "{bash}: the leaky shape must lose input"
+            );
+            std::fs::remove_file(bootstrap.report()).unwrap();
+
+            let output = run_bootstrap_line(bash, &rev1, &input, &bootstrap.search_path());
+            let report = bootstrap.probe_report("leak");
+            if bash_major(bash) < 4 {
+                // Both halves are required: a saved copy at fd 10 that is
+                // *visible*, and consumption through it. The old `||` let an
+                // `open=[10:` alternative satisfy the control on its own.
+                assert!(
+                    bootstrap.probe_open("leak").iter().any(|(fd, _)| *fd == 10),
+                    "{bash}: the rev-1 shape must leak a visible fd 10 on bash 3: {report}"
+                );
+                assert_eq!(
+                    bootstrap.probe_consumed("leak"),
+                    vec![(10u32, first_five.clone())],
+                    "{bash}: the rev-1 shape must consume the input through fd 10 on bash 3: \
+                     {report}"
+                );
+                assert_ne!(output.stdout, input, "{bash}: rev-1 must lose input");
+            }
+            std::fs::remove_file(bootstrap.report()).unwrap();
+        }
+    }
+
+    /// B7(c): the documented limit. A hook that deliberately names bash's saved
+    /// descriptor can read the command's input; the guarantee covers ordinary
+    /// reads and inherited descriptors, not bash internals. Pinned so the limit
+    /// cannot later be mistaken for isolation.
+    #[test]
+    fn b7_a_hook_that_names_the_save_descriptor_can_steal_input() {
+        let bootstrap = Bootstrap::new();
+        // The hook writes what it stole to its own file. Silence on stdout
+        // alone is not proof: a failed launch is also silent (#399 review
+        // non-blocking 3).
+        let stolen = bootstrap.path().join("stolen.bin");
+        bootstrap.project_hook(&format!(
+            "cat <&10 >'{stolen}' 2>/dev/null || true",
+            stolen = stolen.display()
+        ));
+        let program = bootstrap.plain_cat();
+        let input = binary_input();
+        for bash in host_bashes() {
+            let line = bootstrap_line(
+                &bootstrap,
+                ProgramGuard::Direct,
+                GuestInput::ReservedForProgram,
+                program.to_str().unwrap(),
+                &[],
+            );
+            let output = run_bootstrap_line(bash, &line, &input, &bootstrap.search_path());
+            assert_eq!(output.status.code(), Some(0), "{bash}: {output:?}");
+            assert_eq!(
+                std::fs::read(&stolen).unwrap_or_default(),
+                input,
+                "{bash}: the documented limit changed — a hook reading bash's save \
+                 descriptor should steal the whole input; if this now holds, the \
+                 contract needs updating rather than the test"
+            );
+            assert!(
+                output.stdout.is_empty(),
+                "{bash}: the stealing hook took the whole stream, so the program must \
+                 read nothing"
+            );
+            std::fs::remove_file(&stolen).unwrap();
+        }
+    }
+
+    /// B8: empty input reaches the program as EOF.
+    #[test]
+    fn b8_empty_input_reaches_the_program_as_eof() {
+        let bootstrap = Bootstrap::new();
+        for bash in host_bashes() {
+            let line = bootstrap_line(
+                &bootstrap,
+                ProgramGuard::Direct,
+                GuestInput::ReservedForProgram,
+                "wc",
+                &direct_args(&["-c"]),
+            );
+            let output = run_bootstrap_line(bash, &line, b"", &bootstrap.search_path());
+            assert_eq!(output.status.code(), Some(0), "{bash}: {output:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).trim(),
+                "0",
+                "{bash}"
+            );
+        }
+    }
+
+    /// B10: the legacy behaviour, measured. Bytes are waiting on stdin, and the
+    /// program still sees `/dev/null`: the shell/tool/attach contract pinned
+    /// beside B1's literal.
+    #[test]
+    fn b10_legacy_bootstrap_gives_the_program_dev_null_even_with_bytes_waiting() {
+        let bootstrap = Bootstrap::new();
+        let program = bootstrap.write_executable("legacy-probe", "#!/bin/sh\ncat\nprintf end\n");
+        for bash in host_bashes() {
+            for guard in [ProgramGuard::ImageContract, ProgramGuard::Direct] {
+                let line = bootstrap_line(
+                    &bootstrap,
+                    guard,
+                    GuestInput::DiscardWhenNotTerminal,
+                    program.to_str().unwrap(),
+                    &[],
+                );
+                let output = run_bootstrap_line(bash, &line, b"hello", &bootstrap.search_path());
+                assert_eq!(
+                    output.status.code(),
+                    Some(0),
+                    "{bash} {guard:?}: {output:?}"
+                );
+                assert_eq!(
+                    String::from_utf8_lossy(&output.stdout),
+                    "end",
+                    "{bash} {guard:?}: the legacy launch must not forward stdin"
+                );
+            }
+        }
     }
 }

@@ -51,6 +51,15 @@ which a direct command neither selects nor inherits. Direct statuses: 127 for an
 absent executable, 126 for a non-executable one, 125 for the launcher's own
 ordinary failure.
 
+## Reserved input
+
+A direct command's exclusive ownership of non-terminal stdin: the guest
+bootstrap's setup and hooks see EOF, and the program receives the stream and its
+EOF. Applies only to a streamed direct launch; a tool, shell or direct-attach
+launch keeps the legacy `/dev/null` behaviour, where a `shell` launch's seed
+hooks run before the redirect and a hook that reads stdin can block there.
+_Avoid_: "stdin passthrough", which suggests setup shares the stream.
+
 ## Program guard
 
 The rendered in-guest check immediately before `exec`: `ImageContract` (the

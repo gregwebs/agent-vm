@@ -1,0 +1,10 @@
+#!/bin/sh
+# #399 stdin-ownership probe: a seed hook that reports whether *setup's* stdin
+# is at EOF. It writes to stderr only, because the direct-launch rows compare
+# guest stdout byte for byte. No state, no writes: running it twice is the same
+# as running it once.
+if IFS= read -r _avm_stdin_probe; then
+  echo "seed-read=GOT" >&2
+else
+  echo "seed-read=EOF" >&2
+fi

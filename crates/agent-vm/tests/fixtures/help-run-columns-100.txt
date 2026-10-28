@@ -24,5 +24,6 @@ when it is present but not executable (or is a directory named by path), 125 for
 an ordinary direct launcher failure, otherwise the program's own status. A bare
 name that resolves to a directory counts as not found (127).
 
-Slice 1: no streamed stdin, terminal overrides or signal forwarding yet; see
-USAGE.md (issues #399-#401).
+Piped or redirected stdin is forwarded to the program byte-for-byte, and host EOF
+closes its stdin; setup and the project hook see EOF. Terminal overrides and
+signal forwarding are not implemented yet; see USAGE.md (issues #400-#401).

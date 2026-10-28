@@ -45,6 +45,11 @@ FROM wrapper-provided AS with-integrations
 RUN mkdir -p /etc/agent-vm-capabilities && : > /etc/agent-vm-capabilities/chrome-devtools-mcp
 COPY --chmod=0755 seed-258 /opt/agent-vm/seed.d/50-e2e-258
 
+# #399: a real seed.d hook that reports whether setup's stdin is at EOF. It is
+# a separate target so no other row's seed set changes.
+FROM marker-free AS stdin-seed-399
+COPY --chmod=0755 seed-stdin-399 /opt/agent-vm/seed.d/50-stdin-399
+
 # Supplies only the named seed entry point (no seed.d), so success cannot be
 # masked by the other clause.
 FROM marker-free AS script-provided

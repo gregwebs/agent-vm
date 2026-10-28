@@ -10249,6 +10249,57 @@ fn only_the_direct_route_maps_a_failed_runtime_to_125() {
     assert_eq!(tool.status.code(), Some(1), "{}", stderr_of(&tool));
 }
 
+/// A launch that fails before the guest exec must not consume host stdin
+/// (#399, I1). The reader is only started once the lifecycle owns an exec
+/// handle, so a failed image/acquisition path leaves the caller's bytes — and
+/// its still-open writer — untouched.
+#[test]
+fn a_direct_launch_that_fails_before_exec_reads_no_host_stdin() {
+    use std::io::{Read as _, Write as _};
+    for (vector, expected_status) in [(vec!["cat"], 125), (vec![""], 2)] {
+        for form in DIRECT_FORMS {
+            let mut harness = Harness::warm();
+            // The fixture runtime fails every actual launch.
+            harness.use_launch_runtime();
+            let (reader, mut writer) = std::io::pipe().unwrap();
+            writer.write_all(b"hello").unwrap();
+            writer.flush().unwrap();
+            // The test keeps its own copy of the read end, so it can prove
+            // nothing was consumed even after the launcher exits.
+            let mut proof = reader.try_clone().unwrap();
+            let mut cmd = harness.base_command();
+            cmd.args(["--image", BOGUS_IMAGE, "--no-git"]);
+            cmd.arg(match form {
+                Form::Run => "run",
+                Form::Separator => "--",
+            });
+            cmd.args(&vector);
+            cmd.stdin(std::process::Stdio::from(reader));
+            let out = run_with_timeout(cmd, Duration::from_secs(60));
+            assert_eq!(
+                out.status.code(),
+                Some(expected_status),
+                "{form:?} {vector:?}: {}",
+                stderr_of(&out)
+            );
+            // Close the writer **now**, after the bounded exit observation, and
+            // read to EOF. Reading five bytes while the writer is still open
+            // would block forever exactly when the regression consumed one of
+            // them, which is the only case this oracle exists for.
+            drop(writer);
+            let mut remaining = Vec::new();
+            proof
+                .read_to_end(&mut remaining)
+                .expect("the launcher consumed host stdin before the guest exec");
+            assert_eq!(
+                remaining, b"hello",
+                "{form:?} {vector:?}: the launcher consumed host stdin before the \
+                 guest exec"
+            );
+        }
+    }
+}
+
 /// A custom catalog — and a hostile configured `shell` — grants a direct launch
 /// nothing: no command, default arguments, environment, provider, network
 /// request, transitive tool or persist declaration is inherited.
