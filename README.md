@@ -88,13 +88,18 @@ agent-vm --allow-internet-egress claude
 
 Run a guest executable directly — no catalog entry, defaults, environment or
 credential provisioning. Piped stdin is forwarded to the program and host EOF
-closes it; terminal overrides and signal forwarding are tracked in #400–#401:
+closes it; `-t`/`-T` choose a PTY or streaming I/O explicitly (signal forwarding
+is still tracked in #401):
 
 ```sh
 agent-vm run make test
 agent-vm -- make test        # the same, with the top-level separator
 printf hello | agent-vm run cat   # streams stdin; prints hello
+agent-vm -T run build.sh >out.log # streaming even from a terminal
 ```
+
+Selection rules, forced-PTY constraints, merged PTY output and the absence of a
+detach mode are in **[USAGE.md](USAGE.md#direct-commands)**.
 
 Full flag, subcommand, networking, and troubleshooting reference:
 **[USAGE.md](USAGE.md)** — direct commands are in

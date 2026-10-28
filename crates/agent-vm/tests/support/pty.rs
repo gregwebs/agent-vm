@@ -36,6 +36,28 @@ pub enum Action<'a> {
     Signal(libc::c_int),
 }
 
+/// Where one of the child's output descriptors goes.
+///
+/// `Terminal` is the pty (what `Pty::spawn` has always done), `Piped` is an
+/// owned pipe the *test* must drain, and `File` is a test-owned file. A caller
+/// that pipes an output is responsible for reading it concurrently: the driver's
+/// waits only poll the terminal, so a child blocked on a full pipe would stall
+/// them. Every current caller takes the handle immediately and drains it in a
+/// thread, which is the property these variants exist to exercise.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PtyOutput {
+    Terminal,
+    Piped,
+    File(std::path::PathBuf),
+}
+
+/// The child's stdout/stderr assignment for [`Pty::spawn_with_stdio`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PtyStdio {
+    pub stdout: PtyOutput,
+    pub stderr: PtyOutput,
+}
+
 fn open_pty() -> io::Result<(RawFd, RawFd)> {
     let mut master: RawFd = -1;
     let mut slave: RawFd = -1;
@@ -100,6 +122,31 @@ fn write_some(fd: RawFd, payload: &[u8]) -> io::Result<usize> {
     }
 }
 
+/// A terminal's geometry, named so `rows` and `cols` cannot be swapped.
+///
+/// The two values are adjacent `u16`s at every layer, and an earlier version of
+/// this helper even reversed them between layers; naming them makes the
+/// transposition a compile error instead of a silently wrong window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Geometry {
+    pub rows: u16,
+    pub cols: u16,
+}
+
+fn set_winsize(fd: RawFd, geometry: Geometry) -> io::Result<()> {
+    let size = libc::winsize {
+        ws_row: geometry.rows,
+        ws_col: geometry.cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let rc = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &size) };
+    if rc == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn terminal_user_flags(fd: RawFd) -> libc::tcflag_t {
     let mut attrs = std::mem::MaybeUninit::<libc::termios>::uninit();
     let rc = unsafe { libc::tcgetattr(fd, attrs.as_mut_ptr()) };
@@ -122,6 +169,11 @@ pub struct Pty {
     status: Option<ExitStatus>,
     baseline_flags: libc::tcflag_t,
     prompt: Vec<u8>,
+    /// Piped outputs, handed to the test exactly once so it can drain them.
+    stdout: Option<std::process::ChildStdout>,
+    stderr: Option<std::process::ChildStderr>,
+    /// The geometry this driver set, so a test can state what it expects.
+    winsize: Geometry,
 }
 
 impl Drop for Pty {
@@ -137,26 +189,98 @@ impl Pty {
     /// Spawn `command` with a fresh pty on stdin/stdout/stderr and wait for
     /// `prompt` on the master. `prompt` is the caller's expectation; the helper
     /// carries no program-specific text.
+    ///
+    /// Every terminal, which is what every pre-#400 caller means; use
+    /// [`spawn_with_stdio`](Self::spawn_with_stdio) to redirect an output.
     pub fn spawn(command: &mut Command, prompt: &[u8]) -> io::Result<Self> {
+        Self::spawn_with_stdio(
+            command,
+            prompt,
+            PtyStdio {
+                stdout: PtyOutput::Terminal,
+                stderr: PtyOutput::Terminal,
+            },
+        )
+    }
+
+    /// Spawn `command` with a fresh pty on stdin and the caller's choice for
+    /// stdout/stderr.
+    ///
+    /// The slave stays open in this process for the child's whole life: on macOS
+    /// a session-leader death revokes the terminal, so a retained slave is what
+    /// makes a post-exit attribute comparison mean anything.
+    pub fn spawn_with_stdio(
+        command: &mut Command,
+        prompt: &[u8],
+        stdio: PtyStdio,
+    ) -> io::Result<Self> {
         let (master, slave) = open_pty()?;
         let baseline_flags = terminal_user_flags(slave);
+        set_winsize(slave, Geometry { rows: 24, cols: 80 })?;
         let dup = |fd: RawFd| unsafe { libc::dup(fd) };
+        let output = |kind: &PtyOutput, slave: RawFd| -> io::Result<Stdio> {
+            Ok(match kind {
+                PtyOutput::Terminal => unsafe { Stdio::from_raw_fd(dup(slave)) },
+                PtyOutput::Piped => Stdio::piped(),
+                PtyOutput::File(path) => Stdio::from(
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .open(path)?,
+                ),
+            })
+        };
         command
             .stdin(unsafe { Stdio::from_raw_fd(dup(slave)) })
-            .stdout(unsafe { Stdio::from_raw_fd(dup(slave)) })
-            .stderr(unsafe { Stdio::from_raw_fd(dup(slave)) });
-        let child = command.spawn()?;
+            .stdout(output(&stdio.stdout, slave)?)
+            .stderr(output(&stdio.stderr, slave)?);
+        let mut child = command.spawn()?;
         let master = unsafe { OwnedFd::from_raw_fd(master) };
         let slave = unsafe { OwnedFd::from_raw_fd(slave) };
         set_nonblocking(master.as_raw_fd())?;
         Ok(Self {
             master,
             slave,
+            stdout: child.stdout.take(),
+            stderr: child.stderr.take(),
             child: Some(child),
             status: None,
             baseline_flags,
             prompt: prompt.to_vec(),
+            winsize: Geometry { rows: 24, cols: 80 },
         })
+    }
+
+    /// Take the child's piped stdout, if it was spawned with `PtyOutput::Piped`.
+    pub fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.stdout.take()
+    }
+
+    /// Take the child's piped stderr, if it was spawned with `PtyOutput::Piped`.
+    pub fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        self.stderr.take()
+    }
+
+    /// Resize the retained terminal and tell the child, without touching any
+    /// controlling-tty or process-group assumption: the signal goes to the
+    /// exact owned child.
+    pub fn resize(&mut self, geometry: Geometry) -> io::Result<()> {
+        set_winsize(self.slave.as_raw_fd(), geometry)?;
+        self.winsize = geometry;
+        let Some(child) = self.child.as_ref() else {
+            return Err(io::Error::other("the pty child has already exited"));
+        };
+        let rc = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGWINCH) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// The terminal geometry this driver last set.
+    pub fn winsize(&self) -> Geometry {
+        self.winsize
     }
 
     pub fn id(&self) -> Option<u32> {

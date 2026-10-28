@@ -59,6 +59,12 @@ if [[ "$guard_only" == false ]]; then
     bash "$REPO_ROOT/script/test/no-image-source-dependency-test.sh"
     bash "$REPO_ROOT/script/test/chrome-example-contract.sh"
     bash "$REPO_ROOT/script/test/chrome-example-contract-test.sh"
+    # #400's native driver and guest probe: the boot-free controls prove the
+    # exact-byte, resize and restoration oracles reject a broken stand-in, so a
+    # later native run's evidence means something. Detached, like the other PTY
+    # controls, so no ambient terminal can help a case pass.
+    python3 "$REPO_ROOT/script/test/lib/detached-run.py" \
+      python3 "$REPO_ROOT/script/test/lib/direct-terminal-contract.py"
     bash "$REPO_ROOT/script/test/e2e-release-contract.sh"
     bash "$REPO_ROOT/script/test/egress-default-deny-contract.sh"
     bash "$REPO_ROOT/script/test/config-dir-guard-contract.sh"
@@ -121,6 +127,7 @@ syntax_check=(
     script/test/egress-default-deny.sh
     script/test/egress-default-deny-contract.sh
     script/test/fixtures/egress-probe.sh
+    script/test/fixtures/direct-terminal/guest-probe.sh
     script/test/e2e-released-image.sh
     script/test/e2e.sh
     script/test/lib/released-image-checks.sh
@@ -171,6 +178,7 @@ shellcheck_files=(
     script/test/egress-default-deny.sh
     script/test/egress-default-deny-contract.sh
     script/test/fixtures/egress-probe.sh
+    script/test/fixtures/direct-terminal/guest-probe.sh
     script/test/e2e-released-image.sh
     script/test/e2e.sh
     script/test/lib/released-image-checks.sh
@@ -202,6 +210,8 @@ assert_listed 'bash -n' 'script/test/lib/persisted-network.sh' "${syntax_check[@
 assert_listed 'shellcheck' 'script/test/lib/persisted-network.sh' "${shellcheck_files[@]}"
 assert_listed 'bash -n' 'script/test/fixtures/persisted-network/guest-pn4-write.sh' "${syntax_check[@]}"
 assert_listed 'shellcheck' 'script/test/fixtures/persisted-network/guest-pn4-write.sh' "${shellcheck_files[@]}"
+assert_listed 'bash -n' 'script/test/fixtures/direct-terminal/guest-probe.sh' "${syntax_check[@]}"
+assert_listed 'shellcheck' 'script/test/fixtures/direct-terminal/guest-probe.sh' "${shellcheck_files[@]}"
 assert_listed 'bash -n' 'script/test/fixtures/persisted-network/guest-pn-probe.sh' "${syntax_check[@]}"
 assert_listed 'shellcheck' 'script/test/fixtures/persisted-network/guest-pn-probe.sh' "${shellcheck_files[@]}"
 

@@ -1,9 +1,28 @@
 use std::{
+    cell::Cell,
     ffi::{OsStr, OsString},
     sync::{Mutex, MutexGuard, OnceLock},
 };
 
 static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+
+thread_local! {
+    /// Guards held by the current thread. `EnvGuard` holds a `MutexGuard`, so it
+    /// cannot leave the thread that made it; a thread-local count answers "does
+    /// this thread hold the guard?" without touching the lock.
+    static HELD: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Whether the calling thread holds an [`EnvGuard`].
+///
+/// The process environment is global, but the guard only serialises tests that
+/// take it. A test that parses argv without holding it can observe a sibling's
+/// malformed launch environment, and clap's binding then rejects the value; on a
+/// non-direct route that error reaches `error.exit()` and takes down the whole
+/// test binary instead of failing one test. Asserted where parsing happens.
+pub(crate) fn guard_held() -> bool {
+    HELD.with(|held| held.get() > 0)
+}
 
 pub(crate) struct EnvGuard {
     _lock: MutexGuard<'static, ()>,
@@ -15,6 +34,7 @@ pub(crate) fn guard() -> EnvGuard {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
+    HELD.with(|held| held.set(held.get() + 1));
     EnvGuard {
         _lock: lock,
         previous: Vec::new(),
@@ -52,6 +72,7 @@ impl Drop for EnvGuard {
                 }
             }
         }
+        HELD.with(|held| held.set(held.get().saturating_sub(1)));
     }
 }
 

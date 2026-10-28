@@ -2,11 +2,13 @@
 
 Status: partially implemented. #398 (`run` / top-level `--`, literal Unicode
 argv without catalog selection or provisioning, and the 127/126/125 status
-distinctions) landed in 0.7.3. The streamed-input implementation for #399
-(stdin and EOF for a non-terminal launch) is included here; accepting it
-requires the native checks below. Terminal policy (#400) and signals (#401)
-remain separate and pending, so the sections below describe the whole
-four-slice feature and are not all delivered yet.
+distinctions) landed in 0.7.3; #399 (streamed stdin and EOF) landed in 0.7.16.
+Terminal policy (#400: both-descriptor auto selection, `-t`/`-T`, forced-PTY
+refusal, resize forwarding, `Ctrl-]` passthrough, terminal restoration and the
+direct failure status) is included in this change/0.7.17, subject to the named
+native checks below. Signals (#401: host signal forwarding, the grace period and
+128+N statuses) remain **pending** — the sections below describe the whole
+four-slice feature, so read "signal" requirements as not yet delivered.
 
 ## Purpose
 

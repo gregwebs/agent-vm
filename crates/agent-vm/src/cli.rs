@@ -350,6 +350,17 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
+    // A test must hold the environment guard before parsing: clap reads and
+    // validates the launch bindings (`AGENT_VM_MEMORY_GIB`, …) from the process
+    // environment, so a sibling test's deliberately malformed value would turn
+    // into a clap error here. On a non-direct route that error reaches
+    // `error.exit()`, which ends the whole test binary with status 2 rather than
+    // failing one test. Cheap to check, and invisible until it is not.
+    #[cfg(test)]
+    debug_assert!(
+        crate::test_env::guard_held(),
+        "parsing argv in a test requires holding the environment guard"
+    );
     let (catalog, images, user_network, user_mounts) = match config {
         // A dangling `tools` reference is *user* input, so it must degrade to
         // the deferred-error path (ADR-0015) rather than `?`-propagate and take
@@ -500,6 +511,7 @@ where
                 Some(entry) => {
                     let mut args = run::Args::from_arg_matches(&matches)?;
                     args.image.reconcile(&matches);
+                    reject_direct_terminal_options(&mut command, &matches, &args)?;
                     Ok(Dispatch::Launch {
                         images,
                         user_network,
@@ -583,12 +595,35 @@ fn direct_dispatch(
         .map_err(|error| anyhow::Error::new(direct_program_error(&error)))?;
     let mut args = run::Args::from_arg_matches(matches)?;
     args.image.reconcile(matches);
+    // The terminal mode is resolved exactly once, here, and frozen into the
+    // target: missing/empty program and conflicting flags are usage errors (2)
+    // before any further validation, and a forced PTY with non-terminal stdin is
+    // still a usage error even when the configuration is broken — the user's
+    // mistake is theirs, not the config's. Everything below this point can create
+    // state, so nothing below re-measures the host terminal.
+    let policy = args.direct_terminal_policy().map_err(|error| {
+        anyhow::Error::new(direct_usage_error(
+            clap::error::ErrorKind::ArgumentConflict,
+            error,
+        ))
+    })?;
+    let terminal = policy
+        .select(crate::direct_terminal::HostTerminals::detect())
+        .map_err(|error| {
+            anyhow::Error::new(direct_usage_error(
+                clap::error::ErrorKind::ArgumentConflict,
+                error,
+            ))
+        })?;
     match catalog {
         Catalog::Broken(config_error) => Err(anyhow::Error::new(
             crate::launch_target::DirectLaunchFailure(config_error),
         )),
         Catalog::Ready(_) => Ok(Dispatch::Launch {
-            target: LaunchTarget::Direct(direct),
+            target: LaunchTarget::Direct {
+                command: direct,
+                terminal,
+            },
             images,
             user_network,
             user_mounts,
@@ -1138,6 +1173,39 @@ fn reject_launch_options(
             )))
         }
     }
+}
+
+/// The terminal controls are direct-only: a catalog or `shell` launch keeps its
+/// own behavior instead of silently accepting a flag that cannot apply to it.
+///
+/// This is a new error for a formerly unknown flag, never a change to a valid
+/// legacy launch: nothing that worked before stops working, and the message
+/// names both direct forms instead of pretending the flag was forwarded.
+fn reject_direct_terminal_options(
+    command: &mut clap::Command,
+    matches: &clap::ArgMatches,
+    args: &run::Args,
+) -> Result<()> {
+    if !args.has_direct_terminal_override() {
+        return Ok(());
+    }
+    // Name the option the user actually typed, first in argv when both are
+    // present (clap rejects that combination before dispatch).
+    let first = ["tty", "no_tty"]
+        .into_iter()
+        .filter(|id| matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine))
+        .min_by_key(|id| matches.index_of(id));
+    let spelling = match first {
+        Some("tty") => "--tty (-t)",
+        _ => "--no-tty (-T)",
+    };
+    Err(anyhow::Error::new(command.error(
+        clap::error::ErrorKind::ArgumentConflict,
+        format!(
+            "{spelling} applies only to direct commands; use \
+             agent-vm [launch options] run PROGRAM or agent-vm [launch options] -- PROGRAM"
+        ),
+    )))
 }
 
 /// Levenshtein distance. Small inputs (subcommand names) so the simple
@@ -2302,6 +2370,220 @@ mod tests {
                 .to_string()
                 .contains("the launch option '--no-config-mounts' cannot be used with 'doctor'"),
             "{error}"
+        );
+    }
+
+    // -- Direct terminal options (issue #400) ----------------------------
+
+    /// The launch options (not the target) of a dispatch, so a test can assert
+    /// what the user asked for before the host's descriptors decide the mode.
+    fn launch_args_of(dispatch: Dispatch) -> Box<run::Args> {
+        match dispatch {
+            Dispatch::Launch { args, .. } => args,
+            Dispatch::Builtin { .. } => panic!("expected a launch"),
+        }
+    }
+
+    fn terminal_policy_of(tokens: &[&str]) -> crate::direct_terminal::TerminalPolicy {
+        launch_args_of(parse_from(argv_of(tokens), Ok(report_from(MYTOOL))).unwrap())
+            .direct_terminal_policy()
+            .expect("no flag conflict")
+    }
+
+    #[test]
+    fn every_terminal_alias_selects_its_policy_before_the_route() {
+        let _env = clear_launch_env();
+        use crate::direct_terminal::TerminalPolicy;
+        // The policy the flags express, read from `Args` (this process has no
+        // terminal, so a forced PTY would itself be refused here — that rule is
+        // asserted separately). Both routes and both spellings per policy.
+        for (tokens, expected) in [
+            (vec!["agent-vm", "run", "p"], TerminalPolicy::Auto),
+            (vec!["agent-vm", "--", "p"], TerminalPolicy::Auto),
+            (
+                vec!["agent-vm", "-T", "run", "p"],
+                TerminalPolicy::ForceStream,
+            ),
+            (
+                vec!["agent-vm", "--no-tty", "--", "p"],
+                TerminalPolicy::ForceStream,
+            ),
+        ] {
+            assert_eq!(terminal_policy_of(&tokens), expected, "{tokens:?}");
+        }
+        // Both force-PTY spellings parse onto the same field: with this
+        // process's non-terminal stdin each one reaches the same typed refusal
+        // (dispatch resolves policy before anything else), on both routes.
+        for tokens in [
+            vec!["agent-vm", "-t", "run", "p"],
+            vec!["agent-vm", "--tty", "run", "p"],
+            vec!["agent-vm", "-t", "--", "p"],
+        ] {
+            let error = usage_error(parse_from(argv_of(&tokens), Ok(report_from(MYTOOL))));
+            assert_eq!(error.exit_code(), 2, "{tokens:?}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("--tty (-t) requires terminal stdin"),
+                "{tokens:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn conflicting_terminal_flags_are_a_usage_error_in_every_spelling() {
+        let _env = clear_launch_env();
+        for tokens in [
+            vec!["agent-vm", "-t", "-T", "run", "p"],
+            vec!["agent-vm", "-tT", "run", "p"],
+            vec!["agent-vm", "--tty", "--no-tty", "run", "p"],
+            vec!["agent-vm", "--tty", "-T", "--", "p"],
+            vec!["agent-vm", "-t", "--no-tty", "run", "p"],
+        ] {
+            let error = usage_error(parse_from(argv_of(&tokens), Ok(report_from(MYTOOL))));
+            assert_eq!(error.exit_code(), 2, "{tokens:?}");
+            assert!(
+                error.kind() == clap::error::ErrorKind::ArgumentConflict,
+                "{tokens:?}"
+            );
+            // The direct usage form, not the legacy launch-option text.
+            assert!(error.to_string().contains("agent-vm"), "{tokens:?}");
+        }
+    }
+
+    #[test]
+    fn a_suffix_terminal_token_stays_guest_argv() {
+        let _env = clear_launch_env();
+        for (tokens, program, argv) in [
+            (
+                vec!["agent-vm", "run", "printf", "%s", "--tty", "-T"],
+                "printf",
+                vec!["%s", "--tty", "-T"],
+            ),
+            (
+                vec!["agent-vm", "--", "printf", "-t", "--no-tty"],
+                "printf",
+                vec!["-t", "--no-tty"],
+            ),
+            // The runner's own name and its separator stay literal too.
+            (vec!["agent-vm", "run", "--tty"], "--tty", vec![]),
+            (vec!["agent-vm", "run", "--", "-t"], "--", vec!["-t"]),
+        ] {
+            let (invocation, lowered) =
+                direct_of(parse_from(argv_of(&tokens), Ok(report_from(MYTOOL))).unwrap());
+            assert_eq!(invocation.program(), program, "{tokens:?}");
+            assert_eq!(lowered, argv, "{tokens:?}");
+            // A literal suffix token never becomes a launch option: no flag, so
+            // the mode is whatever the host's descriptors select.
+            assert!(
+                !launch_args_of(parse_from(argv_of(&tokens), Ok(report_from(MYTOOL))).unwrap())
+                    .has_direct_terminal_override(),
+                "{tokens:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_and_shell_launches_refuse_the_terminal_options() {
+        let _env = clear_launch_env();
+        // Both spellings, both flag forms, and both a catalog tool and the
+        // fallback `shell` verb: a prefix terminal control cannot apply to a
+        // legacy launch, so it is refused instead of silently ignored.
+        for tokens in [
+            vec!["agent-vm", "--tty", "mytool"],
+            vec!["agent-vm", "-T", "mytool"],
+            vec!["agent-vm", "--no-tty", "shell"],
+            vec!["agent-vm", "-t", "shell", "echo", "hi"],
+        ] {
+            let error = usage_error(parse_from(argv_of(&tokens), Ok(report_from(MYTOOL))));
+            assert_eq!(error.exit_code(), 2, "{tokens:?}");
+            let text = error.to_string();
+            assert!(
+                text.contains("applies only to direct commands"),
+                "{tokens:?}: {text}"
+            );
+            assert!(
+                text.contains("agent-vm [launch options] run PROGRAM"),
+                "{tokens:?}: {text}"
+            );
+            assert!(text.contains("-- PROGRAM"), "{tokens:?}: {text}");
+        }
+        // Naming the option the user typed, and nothing else.
+        let error = usage_error(parse_from(
+            ["agent-vm", "--no-tty", "mytool"],
+            Ok(report_from(MYTOOL)),
+        ));
+        assert!(error.to_string().contains("--no-tty (-T)"), "{error}");
+    }
+
+    #[test]
+    fn a_prefix_terminal_option_after_a_tool_verb_is_the_tool_s_argument() {
+        let _env = clear_launch_env();
+        let (args, tool_args) = launch_of(
+            parse_from(
+                ["agent-vm", "mytool", "--tty", "-T"],
+                Ok(report_from(MYTOOL)),
+            )
+            .unwrap(),
+        );
+        assert_eq!(tool_args, ["--tty", "-T"]);
+        assert!(!args.has_direct_terminal_override());
+    }
+
+    #[test]
+    fn builtin_verbs_keep_their_own_launch_option_rejection() {
+        let _env = clear_launch_env();
+        let error = usage_error(parse_from(
+            ["agent-vm", "-t", "doctor"],
+            Ok(report_from(MYTOOL)),
+        ));
+        assert_eq!(error.exit_code(), 2);
+        assert!(
+            error
+                .to_string()
+                .contains("the launch option '--tty' cannot be used with 'doctor'"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn forced_pty_without_terminal_stdin_wins_over_a_broken_catalog() {
+        let _env = clear_launch_env();
+        // The user's own mistake is reported as theirs (status 2), before the
+        // deferred configuration failure and before anything could boot. The
+        // test process's stdin is not a terminal, so this refusal is real.
+        let error = usage_error(parse_from(
+            ["agent-vm", "-t", "run", "p"],
+            Err(anyhow!("broken catalog")),
+        ));
+        assert_eq!(error.exit_code(), 2);
+        let text = error.to_string();
+        assert!(
+            text.contains("--tty (-t) requires terminal stdin"),
+            "{text}"
+        );
+        assert!(text.contains("--no-tty (-T)"), "{text}");
+        assert!(!text.contains("broken catalog"), "{text}");
+    }
+
+    #[test]
+    fn auto_from_this_process_streams_and_keeps_the_program() {
+        let _env = clear_launch_env();
+        // `cargo test` gives a non-terminal stdin and stdout, so Auto resolves
+        // to streaming here; the program and its argv are untouched.
+        let (invocation, argv) =
+            direct_of(parse_from(["agent-vm", "run", "p", "x"], Ok(report_from(MYTOOL))).unwrap());
+        assert_eq!(
+            invocation.direct_io(),
+            Some(crate::direct_terminal::DirectIo::Stream)
+        );
+        assert_eq!(argv, ["x"]);
+        // And the explicit stream override agrees with it.
+        let (invocation, _) =
+            direct_of(parse_from(["agent-vm", "-T", "run", "p"], Ok(report_from(MYTOOL))).unwrap());
+        assert_eq!(
+            invocation.direct_io(),
+            Some(crate::direct_terminal::DirectIo::Stream)
         );
     }
 
@@ -3613,7 +3895,7 @@ mod tests {
         assert!(matches!(
             parse_from(argv, Ok(report_from(MYTOOL))).unwrap(),
             Dispatch::Launch {
-                target: LaunchTarget::Direct(_),
+                target: LaunchTarget::Direct { .. },
                 ..
             }
         ));
@@ -3778,6 +4060,10 @@ mod tests {
                 ),
                 ("mount".to_string(), None, OptionShape::RequiredValue),
                 ("no-config-mounts".to_string(), None, OptionShape::Flag),
+                // The direct terminal controls are ordinary flags derived by the
+                // same walker: no value, no second parser (issue #400).
+                ("tty".to_string(), Some('t'), OptionShape::Flag),
+                ("no-tty".to_string(), Some('T'), OptionShape::Flag),
                 ("publish".to_string(), Some('p'), OptionShape::RequiredValue),
                 ("auto-publish".to_string(), None, OptionShape::Flag),
                 ("allow-egress".to_string(), None, OptionShape::RequiredValue),
@@ -3920,7 +4206,7 @@ mod tests {
         ] {
             match parse_from(argv_of(&tokens), Ok(report_from(MYTOOL))).unwrap() {
                 Dispatch::Launch {
-                    target: LaunchTarget::Direct(command),
+                    target: LaunchTarget::Direct { command, .. },
                     ..
                 } => assert_eq!(command.program(), program, "{tokens:?}"),
                 _ => panic!("{tokens:?} should be a direct launch"),

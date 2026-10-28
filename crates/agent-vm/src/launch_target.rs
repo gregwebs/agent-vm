@@ -11,7 +11,14 @@ use crate::network_requests::{NetworkRequests, RequestTier};
 use crate::secret_store::ServiceName;
 
 pub(crate) enum LaunchTarget {
-    Direct(DirectCommand),
+    /// A direct command with the I/O mode dispatch already resolved for it.
+    ///
+    /// The mode is a facet of *this* target, never of the grant: a direct launch
+    /// has no catalog authority, and a tool launch has no terminal policy.
+    Direct {
+        command: DirectCommand,
+        terminal: crate::direct_terminal::DirectIo,
+    },
     Tool {
         entry: Box<CatalogEntry>,
         tool_args: Vec<String>,
@@ -22,7 +29,7 @@ impl LaunchTarget {
     pub(crate) fn requested_names(&self) -> &BTreeSet<ServiceName> {
         match self {
             Self::Tool { entry, .. } => entry.requested_names(),
-            Self::Direct(_) => {
+            Self::Direct { .. } => {
                 static EMPTY: std::sync::LazyLock<BTreeSet<ServiceName>> =
                     std::sync::LazyLock::new(BTreeSet::new);
                 &EMPTY
@@ -31,17 +38,18 @@ impl LaunchTarget {
     }
 
     pub(crate) fn is_direct(&self) -> bool {
-        matches!(self, Self::Direct(_))
+        matches!(self, Self::Direct { .. })
     }
 
     pub(crate) fn into_parts(self) -> (CatalogGrant, GuestInvocation) {
         match self {
-            Self::Direct(command) => {
+            Self::Direct { command, terminal } => {
                 let invocation = GuestInvocation {
                     display: crate::config::escape_str(command.program()),
                     program: command.program,
                     argv: command.args,
                     guard: ProgramGuard::Direct,
+                    direct_io: Some(terminal),
                 };
                 (CatalogGrant::none(), invocation)
             }
@@ -65,6 +73,9 @@ impl LaunchTarget {
                     display: tool.command().to_owned(),
                     argv: crate::run::inner_argv(tool, tool_args),
                     guard: ProgramGuard::ImageContract,
+                    // A tool launch keeps the legacy stdin-only predicate; only a
+                    // direct command carries a resolved terminal mode.
+                    direct_io: None,
                 };
                 (grant, invocation)
             }
@@ -132,6 +143,9 @@ pub(crate) struct GuestInvocation {
     display: String,
     argv: Vec<String>,
     guard: ProgramGuard,
+    /// `Some` only for a direct launch, whose I/O mode was resolved before any
+    /// runtime setup. `None` means "keep the legacy selection".
+    direct_io: Option<crate::direct_terminal::DirectIo>,
 }
 
 impl GuestInvocation {
@@ -146,6 +160,9 @@ impl GuestInvocation {
     }
     pub(crate) fn guard(&self) -> ProgramGuard {
         self.guard
+    }
+    pub(crate) fn direct_io(&self) -> Option<crate::direct_terminal::DirectIo> {
+        self.direct_io
     }
 }
 
@@ -190,7 +207,10 @@ mod tests {
         let command =
             DirectCommand::from_os_args(vec!["claude".into(), "x".into(), "x".into(), "".into()])
                 .unwrap();
-        let target = LaunchTarget::Direct(command);
+        let target = LaunchTarget::Direct {
+            command,
+            terminal: crate::direct_terminal::DirectIo::Pty,
+        };
         assert!(target.requested_names().is_empty());
         assert!(target.is_direct());
         let (grant, invocation) = target.into_parts();
@@ -265,8 +285,52 @@ mod tests {
         // A direct launch has no catalog inputs of any kind; its defaults and
         // `--mount`s arrive from selection, not from the grant.
         let command = DirectCommand::from_os_args(vec!["t".into(), "x".into()]).expect("a program");
-        let (grant, _) = LaunchTarget::Direct(command).into_parts();
+        let (grant, invocation) = LaunchTarget::Direct {
+            command,
+            terminal: crate::direct_terminal::DirectIo::Stream,
+        }
+        .into_parts();
         assert!(grant.mounts().is_empty());
+        assert_eq!(
+            invocation.direct_io(),
+            Some(crate::direct_terminal::DirectIo::Stream),
+            "lowering must carry the resolved mode, not default it"
+        );
+    }
+
+    /// Both resolved direct modes survive lowering exactly, with no catalog
+    /// authority attached, and neither is reconstructed from the program guard.
+    #[test]
+    fn both_direct_modes_survive_lowering() {
+        use crate::direct_terminal::DirectIo;
+        for (mode, argv) in [
+            (DirectIo::Pty, vec!["x", ""]),
+            (DirectIo::Stream, vec!["--tty", "-T"]),
+        ] {
+            let command = DirectCommand::from_os_args(
+                std::iter::once("日本語".to_string())
+                    .chain(argv.iter().map(|value| value.to_string()))
+                    .map(Into::into)
+                    .collect(),
+            )
+            .unwrap();
+            let (grant, invocation) = LaunchTarget::Direct {
+                command,
+                terminal: mode,
+            }
+            .into_parts();
+            assert_eq!(invocation.direct_io(), Some(mode));
+            assert_eq!(invocation.guard(), ProgramGuard::Direct);
+            assert_eq!(invocation.program(), "日本語");
+            assert_eq!(
+                invocation.argv(),
+                argv.iter().map(|v| v.to_string()).collect::<Vec<_>>(),
+                "argv stays literal: a suffix terminal flag is the guest's argument"
+            );
+            assert_eq!(grant.provisioned().iter().count(), 0);
+            assert!(grant.requests().is_none());
+            assert!(grant.guest_env().is_empty());
+        }
     }
 
     #[test]
@@ -306,6 +370,11 @@ mod tests {
             assert_eq!(invocation.program(), command);
             assert_eq!(invocation.argv(), argv);
             assert_eq!(invocation.guard(), ProgramGuard::ImageContract);
+            assert_eq!(
+                invocation.direct_io(),
+                None,
+                "a catalog launch carries no terminal mode; its selection stays legacy"
+            );
         }
     }
 }

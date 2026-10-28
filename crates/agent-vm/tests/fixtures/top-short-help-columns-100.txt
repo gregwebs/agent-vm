@@ -45,6 +45,11 @@ Mounts & ports:
       --auto-publish
           Auto-forward every guest listener onto the host (Lima-style)
 
+Direct command terminal:
+  -t, --tty     Force a PTY for a direct command, even when stdout is redirected
+  -T, --no-tty  Stream a direct command's I/O even from a terminal: separate guest stdout and
+                stderr, and stdin forwarded as a stream
+
 Network egress:
       --allow-egress <[tcp://|udp://]IP|CIDR[:PORT] | [tcp://]HOST[:PORT]>
           Allow one IP/CIDR or TLS hostname, optionally transport/port-scoped (repeatable)

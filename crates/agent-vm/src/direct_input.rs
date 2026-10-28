@@ -1,10 +1,14 @@
 //! Forward host stdin to a direct command's guest stdin (#399, ADR-0052).
 //!
 //! A direct launch (`agent-vm run PROGRAM`, `agent-vm -- PROGRAM`) streams when
-//! host stdin is not a terminal, and the command has exclusive ownership of
-//! that non-terminal input: the guest bootstrap puts all setup behind
+//! the launch is not a PTY — which since #400 includes a *terminal* host stdin
+//! chosen into streaming by a redirected stdout or `--no-tty` (#400). Streamed
+//! input is therefore not necessarily non-terminal, though it is always
+//! line-disciplined input the launcher has not put into raw mode. The command has
+//! exclusive ownership of it: the guest bootstrap puts all setup behind
 //! `/dev/null` so the program is the only reader (see `run::GuestInput`). This
-//! module is the host half of that promise.
+//! module is the host half of that promise, and it is not used for a PTY, where
+//! the SDK's terminal bridge owns input.
 //!
 //! The shape is three resources with different lifetimes, and the differences
 //! are the design:

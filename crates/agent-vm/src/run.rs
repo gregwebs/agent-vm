@@ -384,6 +384,8 @@ Examples:
   agent-vm -- make test                the top-level `--` spelling is equivalent
   agent-vm run printf '%s\\n' '$HOME'   literal argv: prints $HOME, no expansion
   agent-vm run bash -c 'echo $HOME'    shell syntax needs an explicit shell
+  agent-vm -t run htop                 force a PTY (needs terminal stdin)
+  agent-vm -T run build.sh >out.log    force streaming: separate stdout/stderr
 
 Launch options go before `run` or the top-level `--`. Every argument after the
 program is literal: no expansion, splitting, globbing, deduplication, tool
@@ -396,9 +398,15 @@ when it is present but not executable (or is a directory named by path), 125 for
 an ordinary direct launcher failure, otherwise the program's own status. A bare
 name that resolves to a directory counts as not found (127).
 
-Piped or redirected stdin is forwarded to the program byte-for-byte, and host EOF
-closes its stdin; setup and the project hook see EOF. Terminal overrides and
-signal forwarding are not implemented yet; see USAGE.md (issues #400-#401).";
+A PTY is used automatically when **both** stdin and stdout are terminals (stderr
+is irrelevant); otherwise the launch streams, keeping guest stdout and stderr
+separate and forwarding host stdin. `-t`/`--tty` forces a PTY and needs terminal
+stdin; `-T`/`--no-tty` forces streaming, even from a terminal. Both must come
+before `run` or the top-level `--`. Under a PTY the guest's output is one merged
+terminal stream and resizes are forwarded; direct commands have no detach mode, so
+`Ctrl-]` is guest input. Streamed or redirected stdin is forwarded byte-for-byte
+and host EOF closes it; setup and the project hook see EOF. Signal forwarding is
+not implemented yet; see USAGE.md (issue #401).";
 
 /// Fixed text for a scrubbed parse error on a known-direct route: no supplied
 /// value can be among it, and the direct usage line replaces administrative
@@ -438,6 +446,8 @@ Examples:
   agent-vm <tool> --model opus --resume            forward args to the tool
   agent-vm run make test                           run a guest executable directly
   agent-vm -- make test                            same program, top-level `--` form
+  agent-vm -t run htop                             force a PTY for a direct command
+  agent-vm -T run build.sh >out.log                force streaming I/O for one
   agent-vm shell <command>                         run one command, then exit
   agent-vm --memory 8 --cpus 4 <tool>              a bigger sandbox
   agent-vm --mount ~/ref:ro <tool>                 read-only extra mount
@@ -650,6 +660,42 @@ pub struct Args {
     )]
     no_config_mounts: bool,
 
+    /// Force a PTY for a direct command, even when stdout is redirected.
+    ///
+    /// Launch options precede `run` or the top-level `--`; the same token after
+    /// the command boundary is the program's own argument. A direct command uses
+    /// a PTY automatically only when **both** stdin and stdout are terminals
+    /// (stderr's status is irrelevant); `-t` additionally requires terminal
+    /// stdin, because a guest terminal session with no host input could not be
+    /// driven. Under a PTY the guest's stdout and stderr are one merged terminal
+    /// stream: merged into a redirect, or interleaved on the terminal.
+    ///
+    /// Direct commands have no detach mode, so `Ctrl-]` is guest input, not an
+    /// escape. `shell` and catalog tools keep their own behavior and refuse
+    /// these options rather than changing it.
+    #[arg(
+        long = "tty",
+        short = 't',
+        conflicts_with = "no_tty",
+        help_heading = "Direct command terminal"
+    )]
+    tty: bool,
+
+    /// Stream a direct command's I/O even from a terminal: separate guest
+    /// stdout and stderr, and stdin forwarded as a stream.
+    ///
+    /// Launch options precede `run` or the top-level `--`. Under `--no-tty` the
+    /// guest gets no terminal, so programs that insist on one (editors, pagers,
+    /// full-screen tools) will not work; the launcher's own diagnostics stay on
+    /// stderr and never contaminate guest stdout.
+    #[arg(
+        long = "no-tty",
+        short = 'T',
+        conflicts_with = "tty",
+        help_heading = "Direct command terminal"
+    )]
+    no_tty: bool,
+
     #[command(flatten)]
     network: crate::network::Args,
 
@@ -683,6 +729,31 @@ impl Args {
             crate::mount_selection::ConfigMountPolicy::Apply
         }
     }
+
+    /// The terminal preference these flags express.
+    ///
+    /// Both set is a typed conflict even though clap rejects that argv: an
+    /// `Args` assembled in code must not silently pick a winner.
+    pub(crate) fn direct_terminal_policy(
+        &self,
+    ) -> Result<crate::direct_terminal::TerminalPolicy, crate::direct_terminal::TerminalFlagConflict>
+    {
+        match (self.tty, self.no_tty) {
+            (true, false) => Ok(crate::direct_terminal::TerminalPolicy::ForcePty),
+            (false, true) => Ok(crate::direct_terminal::TerminalPolicy::ForceStream),
+            (false, false) => Ok(crate::direct_terminal::TerminalPolicy::Auto),
+            (true, true) => Err(crate::direct_terminal::TerminalFlagConflict),
+        }
+    }
+
+    /// Whether the user asked for a terminal mode at all.
+    ///
+    /// Only the command line counts here: `Args` was already parsed, so a default
+    /// (no flag) is `false` and a launch that never mentions terminals keeps the
+    /// legacy route.
+    pub(crate) fn has_direct_terminal_override(&self) -> bool {
+        self.tty || self.no_tty
+    }
 }
 
 /// Lower the selected target once, then retain the shared setup and exec path.
@@ -703,6 +774,11 @@ pub(crate) async fn launch(
         ProgramGuard::Direct => OutputErrorPolicy::DirectChecked,
         ProgramGuard::ImageContract => OutputErrorPolicy::LegacyBestEffort,
     };
+    // A direct launch owns its exit status, its terminal and its teardown
+    // contract (issues #398-#400). A tool/shell launch keeps its own
+    // conventions byte for byte, which is why every use site below branches
+    // instead of sharing a stricter rule.
+    let direct_launch = invocation.guard() == ProgramGuard::Direct;
     let provisioned = grant.provisioned();
     // The one image selection for this session — a property of the session,
     // not of the launched tool. Resolved first, before any side effect:
@@ -1508,8 +1584,17 @@ pub(crate) async fn launch(
             return Err(label.redact_error("booting a sandbox from", error));
         }
     };
+    // One log location for every failure report below; `finish_failed_exec` is
+    // the single owner of the `(full logs: …)` suffix.
+    let log_dir = sandbox_log_dir(&session.sandbox_name).display().to_string();
     if profile {
-        notices.emit(format!("[profile] create: {:?}", t_create.elapsed()))?;
+        live_launch_result(
+            notices.emit(format!("[profile] create: {:?}", t_create.elapsed())),
+            direct_launch,
+            &sandbox,
+            &log_dir,
+        )
+        .await?;
     }
     // When the project path isn't cmdline-safe we handed libkrun the `/`
     // workdir placeholder, so create-time validation only confirmed that
@@ -1525,12 +1610,20 @@ pub(crate) async fn launch(
             .await
             .unwrap_or(false)
     {
+        let missing = || {
+            anyhow::anyhow!(
+                "project path {project_guest_path} did not appear inside the guest \
+                 (the bind mount failed to materialize)"
+            )
+        };
+        if direct_launch {
+            // Same teardown as any other direct infrastructure failure.
+            return Err(finish_failed_exec(&sandbox, missing(), &log_dir).await);
+        }
+        // The legacy route keeps its own stop-and-report behavior and its exact
+        // wording, including the log suffix it appends itself.
         let _ = sandbox.stop().await;
-        anyhow::bail!(
-            "project path {project_guest_path} did not appear inside the guest \
-             (the bind mount failed to materialize); full logs: {}",
-            sandbox_log_dir(&session.sandbox_name).display()
-        );
+        return Err(anyhow::anyhow!("{:#}; full logs: {log_dir}", missing()));
     }
 
     // The effective exec `PATH` now comes from the created sandbox's resolved
@@ -1550,12 +1643,24 @@ pub(crate) async fn launch(
         env::var_os("AGENT_VM_NO_CHROME_MCP").is_some(),
     )
     .await;
-    crate::secrets::sync_chrome_mcp(&session.state_dir, chrome_mcp_enabled)
-        .context("synchronizing Chrome MCP configuration")?;
+    live_launch_result(
+        crate::secrets::sync_chrome_mcp(&session.state_dir, chrome_mcp_enabled)
+            .context("synchronizing Chrome MCP configuration"),
+        direct_launch,
+        &sandbox,
+        &log_dir,
+    )
+    .await?;
 
-    network_plan
-        .start_event_reporting(&sandbox)
-        .context("starting auto-publish event reporting")?;
+    live_launch_result(
+        network_plan
+            .start_event_reporting(&sandbox)
+            .context("starting auto-publish event reporting"),
+        direct_launch,
+        &sandbox,
+        &log_dir,
+    )
+    .await?;
 
     // Wrap the agent invocation in a tiny bash prelude that:
     //
@@ -1606,10 +1711,15 @@ pub(crate) async fn launch(
     // `STRIP_IPV6_NAMESERVERS` const (see its doc comment / PLAN.md B3).
     // One input/output decision for the whole launch, taken before rendering so
     // the bootstrap and the exec request cannot disagree about who owns stdin.
-    let exec_io = if std::io::stdin().is_terminal() {
-        ExecIo::Attach
-    } else {
-        ExecIo::Stream
+    // A direct launch uses the mode dispatch resolved from its launch options and
+    // the host's *stdin and stdout* (issue #400); a legacy launch keeps the
+    // pre-existing stdin-only predicate exactly, including not measuring stdout.
+    let direct_terminal = invocation.direct_io();
+    let exec_io = match direct_terminal {
+        Some(crate::direct_terminal::DirectIo::Pty) => ExecIo::Attach,
+        Some(crate::direct_terminal::DirectIo::Stream) => ExecIo::Stream,
+        None if std::io::stdin().is_terminal() => ExecIo::Attach,
+        None => ExecIo::Stream,
     };
     let guest_input = guest_input_for(invocation.guard(), exec_io);
     let shell_line = AgentShellLine {
@@ -1626,7 +1736,13 @@ pub(crate) async fn launch(
 
     let t_run = Instant::now();
     let exit = if exec_io == ExecIo::Attach {
-        notices.emit(format!("==> Attaching to {command_display}"))?;
+        live_launch_result(
+            notices.emit(format!("==> Attaching to {command_display}")),
+            direct_launch,
+            &sandbox,
+            &log_dir,
+        )
+        .await?;
         // Pin the agent's cwd to the real project path via the exec request
         // (vsock, byte-safe), NOT libkrun's `KRUN_WORKDIR` — which may be the
         // ASCII `/` placeholder for a non-ASCII project. `attach()` alone
@@ -1640,18 +1756,34 @@ pub(crate) async fn launch(
         // bind-mounted file owner bits) — both calls are load-bearing, for
         // different reasons; neither is a substitute for the other. The PATH
         // override is the acquired image's resolved config value (#258).
-        match sandbox
-            .attach_with(cmd, |a| {
-                a.args(shell_argv)
-                    .cwd(project_guest_path.clone())
-                    .user(exec_user.clone())
-                    .env("PATH", exec_path.clone())
-            })
-            .await
-        {
+        // A direct launch owns its exit status, so it needs the SDK's checked
+        // session: without it a lost session is indistinguishable from a guest
+        // status, output errors are swallowed, and `Ctrl-]` would detach. A
+        // legacy launch passes no options at all, so its detach semantics,
+        // best-effort output and `Ok(-1)` convention are untouched.
+        let attach = sandbox.attach_with(cmd, |a| {
+            let a = a
+                .args(shell_argv)
+                .cwd(project_guest_path.clone())
+                .user(exec_user.clone())
+                .env("PATH", exec_path.clone());
+            if direct_launch {
+                a.disable_detach_keys().checked_session()
+            } else {
+                a
+            }
+        });
+        // The direct session is raced against the sandbox's own lifetime: a
+        // runtime that disappears must restore the terminal and fail, never
+        // fabricate a guest status (#400). Legacy keeps its single await.
+        let result = if direct_launch {
+            crate::direct_terminal::supervise_attach(attach, sandbox.wait()).await
+        } else {
+            attach.await.map_err(anyhow::Error::new)
+        };
+        match result {
             Ok(code) => code,
             Err(error) => {
-                let error = anyhow::Error::new(error);
                 let primary = exec_failure_primary(
                     contract_spawn_diagnostic(&image, &error),
                     error.context(format!("attaching to {command_display}")),
@@ -1678,9 +1810,20 @@ pub(crate) async fn launch(
         // pumps host stdin to the guest until EOF. Tool and shell launches do
         // not request a pipe and keep relying on the bootstrap's own
         // `/dev/null` redirect — their contract is unchanged.
-        notices.emit(format!(
-            "==> Running {command_display} in sandbox (no TTY; streaming output)"
-        ))?;
+        // `-T` can stream from a terminal, so the direct wording names the I/O
+        // mode rather than claiming there is no TTY. Legacy text is unchanged.
+        let running_notice = if direct_launch {
+            format!("==> Running {command_display} in sandbox (streaming I/O)")
+        } else {
+            format!("==> Running {command_display} in sandbox (no TTY; streaming output)")
+        };
+        live_launch_result(
+            notices.emit(running_notice),
+            direct_launch,
+            &sandbox,
+            &log_dir,
+        )
+        .await?;
         let forward_input = guest_input == GuestInput::ReservedForProgram;
         let handle = match sandbox
             .exec_stream_with(cmd, |e| {
@@ -1743,10 +1886,22 @@ pub(crate) async fn launch(
     };
 
     if profile {
-        notices.emit(format!("[profile] run:    {:?}", t_run.elapsed()))?;
+        live_launch_result(
+            notices.emit(format!("[profile] run:    {:?}", t_run.elapsed())),
+            direct_launch,
+            &sandbox,
+            &log_dir,
+        )
+        .await?;
     }
 
-    notices.emit("==> Stopping sandbox")?;
+    live_launch_result(
+        notices.emit("==> Stopping sandbox"),
+        direct_launch,
+        &sandbox,
+        &log_dir,
+    )
+    .await?;
     let t_stop = Instant::now();
     let cleanup = cleanup_exec_sandbox(&sandbox).await;
     if profile {
@@ -2120,7 +2275,7 @@ async fn input_grace_expired(pending: &mut Option<PendingInputFailure>) -> anyho
 /// failure schedule (stop/kill/reap/remove errors and timeouts) without a booted
 /// VM or a fake `msb`. Bounded timeouts stay in
 /// [`cleanup_exec_sandbox_failures`], the one owner of the order.
-trait ExecTeardown: Sync {
+pub(crate) trait ExecTeardown: Sync {
     async fn stop_and_wait(&self) -> Result<()>;
     async fn kill_with_timeout(&self, timeout: Duration) -> Result<()>;
     async fn wait(&self) -> Result<()>;
@@ -2274,7 +2429,7 @@ fn failed_exec_message(primary: &str, cleanup_failures: &[String], log_dir: &str
 /// Finish a failed exec by tearing the sandbox down and returning the primary
 /// failure with any teardown failures **appended**: the contract breach stays
 /// visible even when cleanup also fails (#258).
-async fn finish_failed_exec(
+pub(crate) async fn finish_failed_exec(
     teardown: &impl ExecTeardown,
     primary: anyhow::Error,
     log_dir: &str,
@@ -2284,6 +2439,32 @@ async fn finish_failed_exec(
         "{}",
         failed_exec_message(&format!("{primary:#}"), &failures, log_dir)
     )
+}
+
+/// Run one post-boot step, sending a direct launch's failure through the same
+/// teardown a failed exec gets.
+///
+/// A direct launch's contract is that an infrastructure failure is 125 with the
+/// VM torn down (#398/#400), and the steps between "a sandbox exists" and "the
+/// existing exec error path" — a profile notice, Chrome MCP sync, event
+/// reporting, a pre-exec notice, the stopping notice — would otherwise escape
+/// through `?` and leave the VM behind. A legacy launch keeps returning those
+/// failures unchanged, because its status and cleanup conventions must not move.
+///
+/// Only for failures that have *not* been cleaned up already: exec/attach
+/// failures and post-cleanup failures keep their own paths, so no VM is removed
+/// twice.
+async fn live_launch_result<T>(
+    result: anyhow::Result<T>,
+    direct: bool,
+    teardown: &impl ExecTeardown,
+    log_dir: &str,
+) -> anyhow::Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) if direct => Err(finish_failed_exec(teardown, error, log_dir).await),
+        Err(error) => Err(error),
+    }
 }
 
 /// A pending [`Sandbox::wait`] call, boxed so `launch`'s streaming-exec
@@ -6203,6 +6384,76 @@ options ndots:2 timeout:1";
         );
         assert!(message.contains("/logs/stub-sandbox"), "{message}");
         assert_eq!(teardown.log(), ["stop", "remove"]);
+    }
+
+    /// A post-boot failure between "a sandbox exists" and the exec error path
+    /// must not escape with the VM still running: a direct launch tears it down
+    /// and reports the failure, a legacy launch returns it unchanged.
+    #[tokio::test]
+    async fn a_post_boot_failure_tears_a_direct_launch_down_and_never_a_legacy_one() {
+        // Direct: a failed notice runs the existing teardown and reports the
+        // notice's own failure first.
+        let teardown = StubTeardown::new();
+        let error = live_launch_result::<()>(
+            Err(anyhow::anyhow!("writing the launch notice")),
+            true,
+            &teardown,
+            "/logs/stub-sandbox",
+        )
+        .await
+        .expect_err("a failed notice is a failure");
+        let text = format!("{error:#}");
+        assert!(text.starts_with("writing the launch notice"), "{text}");
+        assert!(text.contains("/logs/stub-sandbox"), "{text}");
+        assert_eq!(
+            teardown.log(),
+            ["stop", "remove"],
+            "a direct failure runs the one existing teardown"
+        );
+
+        // Direct: a teardown that also fails keeps the notice first and appends
+        // the cleanup failure, exactly as a failed exec does.
+        let teardown = StubTeardown::new().failing_at("stop", "stop refused");
+        let error = live_launch_result::<()>(
+            Err(anyhow::anyhow!("writing the launch notice")),
+            true,
+            &teardown,
+            "/logs/stub-sandbox",
+        )
+        .await
+        .expect_err("a failed notice is a failure");
+        let text = format!("{error:#}");
+        assert!(text.starts_with("writing the launch notice"), "{text}");
+        assert!(
+            text.contains("cleanup failed: stop: stop refused"),
+            "{text}"
+        );
+
+        // Legacy: untouched — no teardown here, because its cleanup belongs to
+        // its own (unchanged) paths.
+        let teardown = StubTeardown::new();
+        let error = live_launch_result::<()>(
+            Err(anyhow::anyhow!("writing the launch notice")),
+            false,
+            &teardown,
+            "/logs/stub-sandbox",
+        )
+        .await
+        .expect_err("a failed notice is a failure");
+        assert_eq!(format!("{error:#}"), "writing the launch notice");
+        assert!(teardown.log().is_empty(), "{:?}", teardown.log());
+
+        // Successes pass through unchanged for both routes.
+        for direct in [true, false] {
+            let teardown = StubTeardown::new();
+            assert_eq!(
+                live_launch_result(Ok(7), direct, &teardown, "/logs/stub-sandbox")
+                    .await
+                    .unwrap(),
+                7
+            );
+            assert!(teardown.log().is_empty());
+        }
     }
 
     #[tokio::test]

@@ -51,13 +51,30 @@ which a direct command neither selects nor inherits. Direct statuses: 127 for an
 absent executable, 126 for a non-executable one, 125 for the launcher's own
 ordinary failure.
 
+## Direct terminal policy
+
+Which I/O mode a direct command runs with, decided before boot: `Pty` (a guest
+terminal — merged output, forwarded input and resizes, no detach mode, so
+`Ctrl-]` is guest input) or `Stream` (separate guest stdout/stderr with
+[reserved input](#reserved-input)). Auto selects a PTY only when **both** host
+stdin and stdout are terminals; `--tty`/`-t` forces a PTY and requires terminal
+stdin, `--no-tty`/`-T` forces streaming. Resolved once in dispatch and carried by
+the launch target, because a bootstrap rendered for one mode must never be
+executed by the other. Distinct from a *shell launch*, whose PTY choice, detach
+escape and merged output are its own unchanged behavior.
+_Avoid_: calling the policy a heuristic — it reads descriptors, never the command
+name, `$TERM` or `/dev/tty`.
+
 ## Reserved input
 
-A direct command's exclusive ownership of non-terminal stdin: the guest
+A direct command's exclusive ownership of *streamed* input: the guest
 bootstrap's setup and hooks see EOF, and the program receives the stream and its
-EOF. Applies only to a streamed direct launch; a tool, shell or direct-attach
-launch keeps the legacy `/dev/null` behaviour, where a `shell` launch's seed
-hooks run before the redirect and a hook that reads stdin can block there.
+EOF. Applies only to a streamed direct launch — which includes a terminal host
+stdin that a redirected stdout or `--no-tty` selected into streaming, not just a
+non-terminal one. A tool, shell or direct-PTY launch keeps the legacy `/dev/null`
+behaviour, where a `shell` launch's seed hooks run before the redirect and a hook
+that reads stdin can block there; under a PTY the SDK's terminal bridge owns input
+instead of the pump.
 _Avoid_: "stdin passthrough", which suggests setup shares the stream.
 
 ## Program guard
