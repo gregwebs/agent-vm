@@ -34,7 +34,7 @@
 //! end of the event stream **at every point it waits**, including while a full
 //! queue holds it. Every send that a peer can stall is therefore a held
 //! `select!` *branch* rather than work awaited inside an arm body, which is the
-//! one structural rule in this module: see [`Pending`].
+//! one structural rule in this module: see [`PendingSend`].
 //!
 //! What `attach` does that this module must do itself, in one place:
 //!
@@ -46,9 +46,12 @@
 //! | a nonblocking tty opened by path | blocking `poll(2)` in a thread, so no `O_NONBLOCK` reaches a shared description |
 //! | output failures ignored, `Ok(-1)` when the stream ends | an output failure is an error, and a stream that ends without an exit event is an error rather than a fabricated status |
 //!
-//! #401 (host signals, grace period, 128+N) is not here. A terminal's Ctrl-C is
-//! an ordinary raw input byte forwarded to the guest PTY; there is no second
-//! forwarding path that could deliver it twice.
+//! A terminal's Ctrl-C is **not** a host signal here: `cfmakeraw` clears `ISIG`,
+//! so it arrives as the byte `0x03` and is forwarded to the guest as ordinary
+//! input. #401's `SIGINT`/`SIGTERM` forwarding (an external `kill`, or a Ctrl-C
+//! on a *cooked* terminal — the streaming path) is a separate, explicitly
+//! signalled path ([`crate::host_signals`]), so one interrupt is never delivered
+//! twice.
 
 use std::future::Future;
 use std::io::IsTerminal as _;
@@ -62,6 +65,9 @@ use microsandbox::MicrosandboxError;
 use microsandbox::sandbox::exec::{ExecControl, ExecEvent, ExecHandle, ExecSink};
 
 use crate::direct_input::{GuestInputStatus, classify_stdin_error};
+use crate::host_signals::{
+    PendingSend, SessionEnd, Supervision, SupervisionStep, signal_send, supervision_lost,
+};
 
 /// The most output the writer may hold, **including the frame it is writing**.
 ///
@@ -102,7 +108,16 @@ const FALLBACK_COLS: u16 = 80;
 /// user and `PATH` stay exactly where they were) and keeps its existing failure
 /// reporting: an `Err` here is reported through `contract_spawn_diagnostic` and
 /// the usual teardown, and never becomes an exit code.
-pub(crate) async fn run<R>(mut handle: ExecHandle, runtime_exit: R) -> anyhow::Result<i32>
+///
+/// `supervision` is the launch's host-signal supervision (#401). It is inert for
+/// a launch that installed no handlers, and it decides the session's **end**
+/// rather than its status: a forced shutdown comes back as
+/// [`SessionEnd::Forced`] so the caller can tear the sandbox down the forced way.
+pub(crate) async fn run<R>(
+    mut handle: ExecHandle,
+    runtime_exit: R,
+    supervision: &mut Supervision,
+) -> anyhow::Result<SessionEnd>
 where
     R: Future<Output = microsandbox::MicrosandboxResult<std::process::ExitStatus>>,
 {
@@ -122,23 +137,39 @@ where
     // arriving at any point after the host geometry is known cannot be missed.
     let window = window_changes()?;
     // The guest PTY already exists at the SDK's fixed 24x80 by the time this
-    // returns, so the host's real geometry is sent before anything else. This
+    // returns, so the host's real geometry is the session loop's first send. It
     // cannot undo what a guest has already rendered; it bounds the gap to one
     // round trip.
+    //
+    // That send is *not* awaited here. It used to be, outside every `select!`,
+    // which made the window between "the guest exists" and "the loop runs"
+    // unsupervised: an interrupt there was queued but nothing polled it, so the
+    // launcher could sit in a send a stalled relay never took while the
+    // operator's terminal stayed raw. It is a held branch in the loop instead,
+    // which gives it every property the other sends have.
     let size = terminal.size()?;
-    control
-        .resize(size.rows, size.cols)
-        .await
-        .map_err(anyhow::Error::new)
-        .context("setting the guest terminal size")?;
 
     let mut host = Host::start(terminal, sink, window)?;
-    let outcome = session_loop(&mut handle, &control, &mut host, &mut runtime_exit).await;
+    let outcome = session_loop(
+        &mut handle,
+        &control,
+        &mut host,
+        &mut runtime_exit,
+        supervision,
+        size,
+    )
+    .await;
 
     // One epilogue for every outcome: restore the terminal, abort the writer
     // (never joining a write already dispatched), stop the reader, then release
     // the runtime wait so the caller's stop/wait/remove can take the child
     // handle.
+    //
+    // A forced shutdown takes this same path: the queued output is *aborted*
+    // rather than drained (an interrupted operator does not want the rest of a
+    // stalled guest's escape sequences printed over their shell), and the
+    // in-flight sends were dropped when the loop returned, which is the
+    // cancellation order the caller's teardown needs.
     let restored = host.raw.restore();
     host.output.abort();
     host.input.stop();
@@ -181,7 +212,7 @@ impl Host {
 
 /// A failed restore must never turn into a silvert raw terminal: it is appended
 /// to whatever the session reported.
-fn with_restore(primary: anyhow::Result<i32>, restored: anyhow::Result<()>) -> anyhow::Result<i32> {
+fn with_restore<T>(primary: anyhow::Result<T>, restored: anyhow::Result<()>) -> anyhow::Result<T> {
     match (primary, restored) {
         (Ok(code), Ok(())) => Ok(code),
         (Ok(_), Err(error)) => Err(error),
@@ -190,20 +221,17 @@ fn with_restore(primary: anyhow::Result<i32>, restored: anyhow::Result<()>) -> a
     }
 }
 
-/// A send the session has accepted but a peer has not yet taken.
-///
-/// Guest output to the writer, host input to the guest and a resize all end in a
-/// channel that can stay full for as long as its peer stops reading. None of
-/// them may be awaited inside a `select!` arm **body**: a pending body stops the
-/// macro polling its other branches, so a lost runtime, a writer failure or the
-/// end of the event stream would go unobserved and the launcher would hang with
-/// the operator's terminal still raw instead of restoring it and exiting 125
-/// (#400 review B1).
-type Pending = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>;
-
 /// Poll a held send. The branch it backs is gated on the slot being occupied, so
-/// an empty slot parks the branch instead of producing an `unreachable!`.
-async fn poll_pending(pending: &mut Option<Pending>) -> anyhow::Result<()> {
+/// an empty slot parks the branch instead of producing an `unreachable!`. This is
+/// the module's one structural rule: guest output to the writer, host input to the
+/// guest, a resize and a forwarded signal all end in a channel whose peer can stop
+/// reading, and none of them may be awaited inside a `select!` arm **body** — a
+/// pending body stops the macro polling its other branches, so a lost runtime, a
+/// writer failure or the end of the event stream would go unobserved and the
+/// launcher would hang with the operator's terminal still raw instead of restoring
+/// it and exiting 125 (#400). [`crate::host_signals::signal_send`] builds the
+/// signal one, so both sessions send an arrival through the same code.
+async fn poll_pending(pending: &mut Option<PendingSend>) -> anyhow::Result<()> {
     match pending {
         Some(sending) => sending.as_mut().await,
         None => std::future::pending().await,
@@ -217,7 +245,9 @@ async fn session_loop<R>(
     control: &ExecControl,
     host: &mut Host,
     runtime_exit: &mut Pin<Box<R>>,
-) -> anyhow::Result<i32>
+    supervision: &mut Supervision,
+    initial_size: Size,
+) -> anyhow::Result<SessionEnd>
 where
     R: Future<Output = microsandbox::MicrosandboxResult<std::process::ExitStatus>>,
 {
@@ -225,10 +255,18 @@ where
     let mut failure = host.output.take_failure();
     // At most one of each kind is in flight. The peer's own queue is the buffer;
     // holding more here would absorb the backpressure the guest must feel.
-    let mut sending_output: Option<Pending> = None;
-    let mut sending_input: Option<Pending> = None;
-    let mut resizing: Option<Pending> = None;
-    let code = loop {
+    let mut sending_output: Option<PendingSend> = None;
+    let mut sending_input: Option<PendingSend> = None;
+    // The session's first resize, seeded exactly like a later `SIGWINCH`: it is
+    // a send a peer can stall, so it is held as a branch rather than awaited
+    // before the loop (see `run`).
+    let mut resizing: Option<PendingSend> = Some(resize_send(
+        control.clone(),
+        initial_size,
+        "setting the guest terminal size",
+    ));
+    let mut signalling: Option<PendingSend> = None;
+    let end = loop {
         tokio::select! {
             biased;
             // Work already accepted first, so a full peer delays the branches
@@ -247,6 +285,28 @@ where
                 resizing = None;
                 sent?;
             }
+            sent = poll_pending(&mut signalling), if signalling.is_some() => {
+                signalling = None;
+                sent?;
+            }
+            // Supervision, ahead of every branch that can stay ready forever.
+            // A guest that never stops producing output (or a peer that never
+            // stops accepting it) must not be able to starve an interrupt: that
+            // is why this arm comes before `handle.recv()` even though an
+            // arrival is the rarer event. `Supervision::next` holds both the
+            // arrival queue and the pinned grace deadline, so the grace is
+            // supervised here too.
+            step = supervision.next() => match step {
+                SupervisionStep::Forward(signal) => {
+                    signalling = Some(signal_send(control.clone(), signal));
+                }
+                // The second interrupt (or an expired grace): no drain, no
+                // further forwarding. The loop returns and the epilogue cancels
+                // what is in flight, restores the terminal and hands a forced
+                // end to the caller.
+                SupervisionStep::Force(forced) => break SessionEnd::Forced(forced),
+                SupervisionStep::ReaderStopped => return Err(supervision_lost()),
+            },
             // One event at a time, and none while a frame is still being
             // queued: that is what makes a stalled consumer stall the guest.
             event = handle.recv(), if sending_output.is_none() => {
@@ -258,7 +318,10 @@ where
                     Some(ExecEvent::Stdout(bytes)) | Some(ExecEvent::Stderr(bytes)) => {
                         sending_output = Some(Box::pin(host.output.frame(bytes.to_vec())?.deliver()));
                     }
-                    Some(ExecEvent::Exited { code }) => break code,
+                    // A status the guest produced is reported as it is, even an
+                    // unknown `-1`: a signal we forwarded says nothing about how
+                    // the guest died (#467 carries that).
+                    Some(ExecEvent::Exited { code }) => break SessionEnd::Guest(code),
                     Some(ExecEvent::Failed(failure)) => {
                         return Err(anyhow::Error::new(MicrosandboxError::ExecFailed(failure)));
                     }
@@ -300,16 +363,15 @@ where
                     HostInput::Failed(error) => return Err(error),
                 }
             }
+            // A host resize is accepted the same way the session's first one is:
+            // as a held send, never as work awaited in an arm body.
             _ = host.window.recv(), if resizing.is_none() => {
                 let size = host.terminal.size()?;
-                let control = control.clone();
-                resizing = Some(Box::pin(async move {
-                    control
-                        .resize(size.rows, size.cols)
-                        .await
-                        .map_err(anyhow::Error::new)
-                        .context("resizing the guest terminal")
-                }));
+                resizing = Some(resize_send(
+                    control.clone(),
+                    size,
+                    "resizing the guest terminal",
+                ));
             }
             error = &mut failure => {
                 return Err(match error {
@@ -328,15 +390,26 @@ where
             }
         }
     };
+    // Only a guest exit reaches the drain: a forced end returns here without
+    // waiting for output the operator has asked to abandon.
+    let SessionEnd::Guest(end_code) = end else {
+        return Ok(end);
+    };
+
     // A definitive exit is necessary but not sufficient: every byte already
     // accepted from the guest must reach the host descriptor before the caller
     // reports the status. The barrier stays cancellable by runtime loss, so a
     // consumer that never drains fails instead of hanging the launcher. Both of
     // its waits are branches, so this select already had the property the loop
     // above was missing.
+    //
+    // The flush is held in one pinned future and re-polled. `finish` takes the
+    // session's last sender on its first poll, so re-creating it after a
+    // cancelled poll would report a drain that never happened.
+    let mut finishing = Box::pin(host.output.finish());
     tokio::select! {
         biased;
-        finished = host.output.finish() => {
+        finished = &mut finishing => {
             // A failed write is a *different* fact from a runtime that died: the
             // host refused bytes the guest did produce. It is a session failure
             // here for the same reason it is one in the loop.
@@ -344,6 +417,24 @@ where
                 return Err(writer_error(&mut failure, symptom));
             }
         }
+        // The guest has already reported its status, so an interrupt here has
+        // nothing left to forward: what it may do is stop the drain. A first
+        // interrupt and a decided shutdown both therefore return the **known**
+        // status, never a signal status. Turning a status the guest did report into
+        // `128 + N` is exactly the inference this feature forbids, and truncation is
+        // not reported separately for the same reason runtime loss during the drain
+        // is not (see the arm below).
+        step = supervision.next() => match step {
+            SupervisionStep::Forward(_) | SupervisionStep::Force(_) => {
+                return Ok(SessionEnd::Guest(end_code));
+            }
+            // Supervision ending is not an instruction about a signal: the
+            // launcher can no longer observe the interrupts it promised to honour.
+            // The loop treats this as a failure, and so does the drain — silently
+            // truncating the drain and reporting success would hide it, which is
+            // the one thing a lost reader must never do.
+            SupervisionStep::ReaderStopped => return Err(supervision_lost()),
+        },
         result = runtime_exit.as_mut() => {
             // The loop breaks only on a definitive guest exit, so the status is
             // **already known**: the guest returned it, and a runtime that dies
@@ -364,10 +455,22 @@ where
             // separately — the terminal was restored and the guest's own status
             // is what the caller sees, which is also all `attach` ever promised.
             let _ = result;
-            return Ok(code);
+            return Ok(SessionEnd::Guest(end_code));
         }
     }
-    Ok(code)
+    Ok(SessionEnd::Guest(end_code))
+}
+
+/// One held resize send, cloned control included so a peer that stops reading
+/// delays the session without borrowing the session's own control handle.
+fn resize_send(control: ExecControl, size: Size, context: &'static str) -> PendingSend {
+    Box::pin(async move {
+        control
+            .resize(size.rows, size.cols)
+            .await
+            .map_err(anyhow::Error::new)
+            .context(context)
+    })
 }
 
 /// The writer's own error, when the queue closed because the writer failed.
@@ -1094,7 +1197,7 @@ mod tests {
         let text = format!("{:#}", success.unwrap_err());
         assert!(text.contains("restore failed"), "{text}");
 
-        let primary = with_restore(
+        let primary = with_restore::<i32>(
             Err(anyhow::anyhow!("session failed")),
             Err(anyhow::anyhow!("restore failed")),
         );

@@ -28,7 +28,10 @@ in [open issues](https://github.com/gregwebs/agent-vm/issues?q=is%3Aissue%20is%3
 crates/agent-vm/src/
 ├── main.rs                 # clap entry; pins MSB_PATH/MSB_HOME before the runtime
 ├── run.rs                  # launch(): build the sandbox, attach or stream-exec
+├── teardown.rs             # exec teardown: one stop/kill/reap/remove order, ordinary or forced
+├── launch_notice.rs        # launch notices: checked `emit`, detached notice for a forced end
 ├── direct_input.rs         # host stdin → direct-command stdin: detached reader, bounded pump
+├── host_signals.rs         # SIGINT/SIGTERM supervision: handlers, arrival queue, grace rules (#401)
 ├── launch_target.rs        # lower a selected target once: catalog Tool or Direct command
 ├── session.rs              # project hash, state dirs, sandbox name, guest home
 ├── secrets.rs              # capture host credentials; write guest placeholders
@@ -679,16 +682,26 @@ one `{ … } </dev/null` group and lets bash restore the real stdin for the
 program's `exec`. That group is why setup children inherit no copy of the input,
 and why a direct command's input is exclusive (`GuestInput`, ADR-0052).
 
-The loop is a `biased;` select whose order is a correctness property: the pump
-outcome, then an expired transport-failure grace, then exec events. The pump
-ends at most once, so it cannot starve anything, and an input failure that has
-already happened must beat a ready `Exited` — stream loss is never a guest
-success. The grace sits ahead of the event stream so a continuously ready stdout
-stream cannot hold the bounded failure return open. `stream_exec_with_cleanup`
-has exactly one release sequence for every outcome, including an input start-up
-failure: stop the pump, drop the wait future, drop the handle, then tear down —
-in that order, because the wait future may hold the child-handle mutex (#258) and
-a pending sink write must not outlive the handle it writes through.
+The loop is a `biased;` select whose order is a correctness property: work a
+previous step accepted (a frame on its way to the sink, a signal on its way to
+the guest), then the pump outcome, then an expired transport-failure grace, then
+host-signal supervision, then exec events. The pump ends at most once, so it
+cannot starve anything, and an input failure that has already happened must beat
+a ready `Exited` — stream loss is never a guest success. The grace and the
+supervision arms sit ahead of the event stream so a continuously ready stdout
+stream cannot hold either open. A guest frame is a **held branch**, not an await
+in the loop body: the body would suspend the whole loop, so a host that stopped
+reading its stdout used to hide interrupts, the grace and a lost runtime for as
+long as the consumer stayed away (#401). The frame carries its own
+bytes, offset and write outcome, and borrows the sink only while it is polled,
+because a future that borrowed the sink cannot be stored in a slot every
+iteration reuses. While a frame is in flight the event arm is gated — two frames
+must not interleave on one sink — but the runtime arm is not: a stalled consumer
+must never hide a dead VMM. `stream_exec_with_cleanup` has exactly one release
+sequence for every outcome, including an input start-up failure: stop the pump,
+drop the wait future, drop the handle, then tear down — in that order, because
+the wait future may hold the child-handle mutex (#258) and a pending sink write
+must not outlive the handle it writes through.
 
 **Direct PTY session (#400).** `direct_pty::run(handle, sandbox.wait())` is one
 owned future, not a spawned task, and it owns the whole host side of the session:
@@ -713,9 +726,10 @@ must), so the only difference from a native terminal is that the fault paths sta
 observable. Every outcome leaves through one epilogue: restore the terminal,
 abort the writer, stop the reader (a self-pipe wakes it), then drop the runtime
 wait (releasing the child-handle mutex before the existing stop/wait/remove path
-takes it). #401 will cancel this same owned future from a signal-aware
-supervisor; #400 adds no signal handling, so a `Ctrl-C` at a host terminal is
-just another raw input byte forwarded once.
+takes it). A `Ctrl-C` at a host terminal is never a signal here: `cfmakeraw`
+clears `ISIG`, so it arrives as byte `0x03` and is forwarded to the guest as
+input, exactly once. Host `SIGINT`/`SIGTERM` supervision (#401) is a separate,
+explicitly signalled path — see [Host signal supervision](#host-signal-supervision-401).
 
 Two properties come from choices `attach()` does not make. The raw guard saves
 the **exact** attributes and restores that snapshot explicitly on both returns
@@ -753,6 +767,86 @@ deliberate — making the legacy path strict would change existing shell/tool
 statuses. Teardown itself is generic over a private `ExecTeardown` adapter
 implemented by `Sandbox`, so failure schedules are unit-testable without a
 booted VM.
+
+### Host signal supervision (#401)
+
+A direct launch runs a command the operator can interrupt, so while it runs the
+launcher must not die on the first interrupt: it forwards the signal to the
+guest, keeps watching the guest for a **fixed five seconds**, and tears the
+sandbox down itself — including when the interrupt is repeated, when the guest
+ignores it, and when the guest's output has stopped being consumed. `host_signals`
+owns all of that so the PTY session and the streaming session cannot drift apart.
+
+```
+SIGINT/SIGTERM ─► raw handler ─► 1 byte per arrival ─► self-pipe ─► std thread ─► unbounded queue
+                                                                                      │
+        first arrival: forward + start ONE deadline        second arrival or expiry: force
+                                                                                      │
+                          guest exit in the grace ──► its status        forced ──► 128 + N
+```
+
+| Outcome | Launcher exit |
+|---|---|
+| Guest reports a code (0, 126, 127, an unknown `-1`) | that code, so an unknown `-1` leaves the process as 255 |
+| Guest status absent (the stream ended without one), no forced shutdown | today's failure (125) |
+| **Forced shutdown** (grace expiry or second interrupt) with the guest still running | `128 + interrupted signal` |
+| Transport loss, no definitive exit, no forced shutdown | 125 |
+| Genuine cleanup failure during teardown | 125, overriding the above |
+
+**The cause is never inferred.** Until #467 carries the guest's own signal
+identity, `128 + N` exists only for a shutdown the launcher decided on: the grace
+expired, or a second interrupt arrived. It is not derived from a `-1` status,
+from a missing exit event, or from the last signal that was forwarded — a guest
+that died of `SIGKILL` inside the VM, or a session whose transport died, would
+then be reported as `143` because we once sent `SIGTERM`, which states a cause
+nobody observed. Telling a guest's *own* signal death from its exit status needs
+the runtime to carry `WIFSIGNALED`/`WTERMSIG`, which is #467 and not this change.
+When both signals exist, the invariant is that the first one only starts the grace
+and the one that *interrupts* is the one reported: `SIGINT` then `SIGTERM` exits
+143, while a grace expiry after a single `SIGINT` exits 130. The interrupting
+signal is not forwarded — it ends the session.
+
+Three mechanism choices carry the rest:
+
+- **Signal identity is a byte, not a flag.** `secret.rs`'s guard records an
+  arrival in a per-signal `AtomicBool`, which answers "did it arrive". Supervision
+  needs "how many times, in what order", because the first interrupt starts the
+  grace and the second ends it. Each handler writes its own signal number to a
+  non-blocking self-pipe, and a dedicated blocking thread turns bytes into
+  arrivals on an **unbounded queue that exists before the first poll**, so an
+  arrival during installation or before the session loop runs is neither lost nor
+  coalesced.
+- **Not `tokio::signal`.** Its registration is permanent: the process would keep
+  swallowing `SIGINT`/`SIGTERM` for the rest of its life. The disposition is
+  saved and restored instead, and the guard outlives the **teardown** as well as
+  the session — a default disposition restored mid-cleanup would kill the
+  launcher with the VM still running, which is the orphan-VM failure the teardown
+  exists to prevent. A signal that arrives during teardown is therefore absorbed,
+  bounded by the teardown's own timeouts. `SIGWINCH` keeps using `tokio::signal`;
+  restoring `SIGINT`/`SIGTERM` does not disturb that separate registration.
+  `SIGHUP`/`SIGQUIT` are not supervised: they keep their ordinary disposition,
+  which a default-disposition termination does not let `Drop` restore the
+  terminal for (unchanged from #400).
+- **One pinned deadline.** It is created with the first forwarded signal and
+  polled as a branch, never recreated per poll and never reset by a second
+  arrival or by output activity, so a guest that keeps writing cannot extend the
+  grace.
+
+A forced end is reported as such to the caller, which tears down with
+`cleanup_exec_sandbox_failures`'s explicit **forced** mode: no graceful stop (a
+guest we have decided to kill must not get `EXEC_STOP_TIMEOUT` worth of asking,
+and that skipped stop must not be recorded as a cleanup failure the shutdown
+caused itself), then the same bounded kill → reap → remove. The ordinary mode is
+unchanged and still records a failed stop that a later successful kill cannot
+erase.
+
+The launch installs the handlers before the session exists; the PTY session's
+first resize is a held branch rather than an unsupervised await before the loop,
+and its drain barrier races supervision as well, so an interrupt during a blocked
+flush stops the drain **and keeps the status the guest did report** — the guest is
+no longer running there, so `128 + N` would be a guess. The grace is a fixed
+constant with no option and no environment override; the subprocess cases inject
+a shorter duration so they assert the rule rather than waiting out the number.
 
 ### Guest `PATH`
 

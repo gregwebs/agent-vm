@@ -14,6 +14,7 @@ set -euo pipefail
 mode="${1:-}"
 case "$mode" in
 identity|argv|input|stream-input|resize|wait|status) ;;
+signal-handle|signal-ignore|signal-unhandled) ;;
 *)
     echo "guest-probe: unknown mode '${mode}'" >&2
     exit 64
@@ -121,6 +122,53 @@ probe_status() {
     exit "$status"
 }
 
+# -------------------------------------------------- host signal supervision --
+#
+# The three guest behaviours a signal row needs. Each one reports SIGNAL-READY
+# only after its traps are installed, so the driver never races the guest's own
+# setup, and each trap names the signal it received: the launcher's status alone
+# cannot tell a delivered signal from one that never arrived.
+
+# The guest handles the signal and exits with its **own** status inside the
+# grace. 42 is the witness: a launcher that lost the guest's status would report
+# 128 + N (130/143) instead.
+probe_signal_handle() {
+    # One global rather than a local: a trap body is expanded when it *runs*, and
+    # naming a global keeps that unambiguous.
+    SIGNAL_EXIT="${1:-42}"
+    trap 'echo "SIGNAL-TRAPPED INT"; exit "$SIGNAL_EXIT"' INT
+    trap 'echo "SIGNAL-TRAPPED TERM"; exit "$SIGNAL_EXIT"' TERM
+    echo "SIGNAL-READY"
+    # A blocking builtin is not interruptible on every shell, so wait in short
+    # bounded steps: the trap runs as soon as one of them returns, which keeps a
+    # handled signal well inside the five-second grace. A step killed by the
+    # forwarded signal must not trip `set -e`.
+    while :; do
+        sleep 1 || :
+    done
+}
+
+# The guest records the signal and keeps running, so only the launcher's fixed
+# grace (or a second interrupt) can end the session.
+probe_signal_ignore() {
+    trap "echo 'SIGNAL-IGNORED INT'" INT
+    trap "echo 'SIGNAL-IGNORED TERM'" TERM
+    echo "SIGNAL-READY"
+    while :; do
+        sleep 1 || :
+    done
+}
+
+# No trap at all: the forwarded signal is meant to kill this shell. The marker
+# after the wait is the discriminator — if the guest survives, it is printed and
+# the row fails instead of trusting a status alone.
+probe_signal_unhandled() {
+    echo "SIGNAL-READY"
+    sleep 300 || :
+    echo "SIGNAL-SURVIVED"
+    exit 0
+}
+
 case "$mode" in
 identity) probe_identity ;;
 argv) probe_argv "$@" ;;
@@ -129,4 +177,7 @@ stream-input) probe_stream_input ;;
 resize) probe_resize ;;
 wait) probe_wait ;;
 status) probe_status "$@" ;;
+signal-handle) probe_signal_handle "$@" ;;
+signal-ignore) probe_signal_ignore ;;
+signal-unhandled) probe_signal_unhandled ;;
 esac

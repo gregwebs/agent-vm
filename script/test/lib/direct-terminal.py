@@ -7,6 +7,16 @@ caller's evidence directory. The case inventory is fixed: there is no arbitrary
 ``eval``, shell command text or user-supplied program, so the driver can be
 reviewed once and re-run for every candidate.
 
+The ``signal-*`` cases extend the same inventory to host `SIGINT`/`SIGTERM`
+supervision: they signal the launcher process itself and prove the launcher's
+exact status, the restored terminal and the absent runtime/catalog/socket
+identities before any rescue cleanup of the harness's own runs. Their
+``unhandled`` pair is split by what can be observed today: ``unhandled`` is the
+acceptance row for issue #467 (the runtime must carry the guest's signal
+identity) and the harness runs it only on demand, while ``unhandled-slice1``
+asserts what this branch can prove -- the unknown guest status passed through,
+and that it is *not* the signal convention.
+
 Two oracles are kept strictly apart:
 
 * the **driver's** own verdict (did the observations I expect hold?), and
@@ -541,6 +551,23 @@ def require(condition: bool, message: str) -> None:
         raise CaseError(message)
 
 
+def require_terminal_restored(session: "Session", receipt: dict, label: str) -> None:
+    """The host terminal is back to the state it had before the launch.
+
+    Recorded in the receipt as well as judged, so the restoration evidence survives
+    a row that fails later for another reason.
+    """
+
+    receipt["terminal"] = {
+        "baseline": session.baseline_state(),
+        "final": session.final_state(),
+    }
+    require(
+        session.baseline_state() == session.final_state(),
+        f"{label}: the host terminal was not restored: {receipt['terminal']}",
+    )
+
+
 def cksum_of(payload: bytes) -> str:
     """The POSIX `cksum` of these bytes, computed on the host."""
 
@@ -718,6 +745,159 @@ PROGRAM_CASES = {
     "status-missing": {"program": ["no-such-program-400"], "expect": 127},
     "status-nonexec": {"program": ["./not-executable"], "expect": 126},
 }
+
+# ------------------------------------------- host signal supervision: cases ---
+
+# The grace a direct launch gives its guest between a forwarded signal and the
+# launcher's own forced teardown. It is fixed by the contract and has no option
+# or environment override, so a native row asserts the real five seconds: a
+# shorter injected grace would only prove the rule, not the number that ships.
+SIGNAL_GRACE = 5.0
+
+# Each signal the rows drive, by the name the guest and the receipt use.
+SIGNAL_NAMES = {signal.SIGINT: "INT", signal.SIGTERM: "TERM"}
+# The guest's own report that a signal arrived and was deliberately not acted on.
+# Identity matters: a row that only saw "some signal" could not tell a forwarded
+# SIGINT from a forwarded SIGTERM.
+SIGNAL_IGNORED = {signal.SIGINT: "SIGNAL-IGNORED INT", signal.SIGTERM: "SIGNAL-IGNORED TERM"}
+
+# A guest killed by the signal it was sent has no exit status of its own, and the
+# runtime reports that end as the bare number -1. Slice 1 passes an unknown guest
+# status through unchanged rather than inferring 128 + N from the host signal it
+# forwarded, so such a guest surfaces as `exit(-1)`, seen on the host as 255.
+# Carrying the real identity needs WIFSIGNALED/WTERMSIG across the runtime
+# boundary, which is issue #467.
+UNKNOWN_GUEST_STATUS = -1
+PASSED_THROUGH_EXIT = UNKNOWN_GUEST_STATUS % 256
+# Why the signal identity is missing from a status that names an unknown guest
+# end. Recorded in the receipt of every `unhandled-slice1` case, so the gap is
+# named where the evidence is read rather than only in a commit message.
+SIGNAL_IDENTITY_ISSUE = (
+    "issue #467: the runtime collapses WIFSIGNALED to -1 and carries no WTERMSIG, "
+    "so a guest's own signal death never reaches the launcher"
+)
+
+# The two direct modes, named by what selects them: a PTY owns the host terminal
+# (raw mode), streaming leaves it canonical.
+SIGNAL_MODES = {
+    "pty": {
+        "options": ["-t"],
+        "assignment": {"stdin": "tty", "stdout": "tty", "stderr": "tty"},
+    },
+    "stream": {
+        "options": ["-T"],
+        "assignment": {"stdin": "tty", "stdout": "file", "stderr": "file"},
+    },
+}
+
+
+def signal_case_specs() -> dict:
+    """Both modes x both signals x the four outcomes issue #401 names.
+
+    The expected status of every row comes from the published status table, not
+    from what the launcher happens to print:
+
+    * ``handled`` -- the guest acts on the forwarded signal and exits with its own
+      status (42), so ``128 + N`` must **not** appear.
+    * ``unhandled`` -- the guest dies of the forwarded signal, which the shell
+      convention reports as ``128 + N``. This is issue #467's acceptance row: it
+      keeps the contract's number and the harness runs it only on demand.
+    * ``unhandled-slice1`` -- the same guest behaviour, asserted against what this
+      branch actually does with an unknown guest status: the pass-through status,
+      and explicitly not ``128 + N``, which is the inference the feature forbids.
+    * ``ignored`` -- the guest records the signal and keeps running, so the fixed
+      grace expires and the launcher's forced teardown reports ``128 + N``.
+    * ``second`` -- a second signal forces immediately and reports **its own**
+      number: INT then TERM is 143, not 130.
+
+    ``markers`` are facts the guest itself must report. Only a *forwarded* signal
+    can appear there: an interrupting second signal ends the session instead of
+    reaching the guest, so the row's evidence for it is the launcher's status and
+    the forced-teardown notice, both asserted separately. ``forbidden`` lists the
+    markers that would contradict the behaviour under test.
+    """
+
+    specs = {}
+    for mode, selection in SIGNAL_MODES.items():
+        for first in (signal.SIGINT, signal.SIGTERM):
+            other = signal.SIGTERM if first == signal.SIGINT else signal.SIGINT
+            prefix = f"signal-{mode}-{SIGNAL_NAMES[first].lower()}"
+            common = {
+                "mode": mode,
+                "options": selection["options"],
+                "assignment": selection["assignment"],
+                "first": first,
+            }
+            specs[f"{prefix}-handled"] = {
+                **common,
+                "probe": ["signal-handle", "42"],
+                "signals": [first],
+                "behaviour": "handled",
+                "expect": 42,
+                "markers": ["SIGNAL-READY", f"SIGNAL-TRAPPED {SIGNAL_NAMES[first]}"],
+                "forbidden": ["SIGNAL-SURVIVED", "SIGNAL-IGNORED"],
+            }
+            specs[f"{prefix}-unhandled"] = {
+                **common,
+                "probe": ["signal-unhandled"],
+                "signals": [first],
+                "behaviour": "unhandled",
+                # The shell convention for a command killed by signal N.
+                "expect": 128 + int(first),
+                "markers": ["SIGNAL-READY"],
+                "forbidden": ["SIGNAL-SURVIVED", "SIGNAL-TRAPPED", "SIGNAL-IGNORED"],
+            }
+            # The same guest, judged against slice 1's honest claim instead of the
+            # convention: the runtime's unknown status arrives unchanged, and it
+            # is not the number a launcher inferring from the signal would report.
+            specs[f"{prefix}-unhandled-slice1"] = {
+                **common,
+                "probe": ["signal-unhandled"],
+                "signals": [first],
+                "behaviour": "unknown-guest-status",
+                "expect": PASSED_THROUGH_EXIT,
+                # The convention this row rules out, recorded in the receipt rather
+                # than asserted: ``expect`` is the number that excludes it, so a
+                # comparison against this one could never fire.
+                "signal_convention": 128 + int(first),
+                "markers": ["SIGNAL-READY"],
+                "forbidden": ["SIGNAL-SURVIVED", "SIGNAL-TRAPPED", "SIGNAL-IGNORED"],
+            }
+            specs[f"{prefix}-ignored"] = {
+                **common,
+                "probe": ["signal-ignore"],
+                "signals": [first],
+                "behaviour": "grace-expiry",
+                "expect": 128 + int(first),
+                "markers": ["SIGNAL-READY", SIGNAL_IGNORED[first]],
+                "forbidden": ["SIGNAL-SURVIVED", "SIGNAL-TRAPPED"],
+                # The launcher's own statement that it decided this end, which is
+                # what tells a forced status from a guest that exited with the
+                # same number on its own.
+                "forced_notice": f"Interrupted by signal {int(first)}",
+            }
+            specs[f"{prefix}-second"] = {
+                **common,
+                "probe": ["signal-ignore"],
+                "signals": [first, other],
+                "behaviour": "second-interrupt",
+                # 128 + the *interrupting* signal, never the first one.
+                "expect": 128 + int(other),
+                "markers": ["SIGNAL-READY", SIGNAL_IGNORED[first]],
+                "forbidden": ["SIGNAL-SURVIVED", "SIGNAL-TRAPPED"],
+                "forced_notice": f"Interrupted by signal {int(other)}",
+            }
+    return specs
+
+
+SIGNAL_CASES = signal_case_specs()
+
+# The signal rows are ordinary inventory entries too: they launch through the same
+# boundary, in both command forms, with a fixed probe mode per row.
+for _signal_case, _spec in SIGNAL_CASES.items():
+    CASES[_signal_case] = Case(
+        _signal_case, _spec["options"], _spec["probe"], _spec["assignment"]
+    )
 
 
 # ------------------------------------------------------------- the runner ---
@@ -1003,6 +1183,9 @@ def observe(case: Case, form: str, session: Session, receipt: dict, ctx: "Contex
     if name == "wait":
         return observe_disconnect(session, receipt, form, ctx)
 
+    if name.startswith("signal-"):
+        return observe_signal(case, SIGNAL_CASES[name], session, receipt, ctx, form)
+
     raise CaseError(f"unknown case {name}")
 
 
@@ -1021,6 +1204,294 @@ def observe_disconnect(session: Session, receipt: dict, form: str, ctx: "Context
     receipt["launcher_status"] = status
     require(status == 125, f"wait/{form}: runtime loss reported {status}, not 125")
     require("WAIT-EOF" not in session.launcher_output(), "wait: a false guest exit was reported")
+    return status
+
+
+# -------------------------------------- host signal supervision: observations ---
+
+# How long a signal row may wait for the launcher after its last signal. The
+# grace is five seconds and the forced teardown is bounded, so anything near this
+# bound is a hang, not a slow machine.
+SIGNAL_WAIT = 120.0
+
+
+def host_processes_matching(patterns: list[str]) -> list[dict]:
+    """Host processes whose command line names any of `patterns`.
+
+    A guest's own descendants live inside the microVM, so the only host-visible
+    thing that can still be running on their behalf is the process that hosts
+    them. An empty result therefore means "this launch is not running any more",
+    and any result at all is a survivor the row must not accept.
+    """
+
+    wanted = [pattern for pattern in patterns if pattern]
+    if not wanted:
+        return []
+    done = subprocess.run(
+        ["ps", "-axo", "pid=,ppid=,command="], capture_output=True, check=True, timeout=60
+    )
+    found = []
+    for line in done.stdout.decode("utf-8", "replace").splitlines():
+        fields = line.split(None, 2)
+        if len(fields) != 3:
+            continue
+        pid, ppid, command = fields
+        pattern = next((candidate for candidate in wanted if candidate in command), None)
+        if pattern is None:
+            continue
+        found.append(
+            {"pid": int(pid), "ppid": int(ppid), "pattern": pattern, "command": command[:240]}
+        )
+    return found
+
+
+def owned_sockets(ctx: "Context", names: list[str]) -> list[str]:
+    """Socket paths of these sandboxes that still exist on disk."""
+
+    root = Path(ctx.args.state_root) / "msb-home"
+    return [
+        str(path)
+        for name in dict.fromkeys(names)
+        for path in runtime_helpers.socket_paths(root, name)
+        if path.exists()
+    ]
+
+
+def owned_while_running(ctx: "Context", launcher_pid: int, label: str) -> dict:
+    """What a healthy launch owns: the VM process, its catalog row, its sockets.
+
+    Recorded *before* any signal, so the later absence is a comparison with a real
+    observation instead of an assumption that nothing was ever there.
+    """
+
+    runtime = owned_runtime_identity(launcher_pid, ctx, label)
+    names = [str(row.get("name", "")) for row in owned_catalog_rows(ctx, launcher_pid)]
+    require(names, f"{label}: no catalog row names this launcher's sandbox")
+    live = host_processes_matching(names)
+    # Without this the later "no process names the sandbox" would be vacuous: a
+    # scan that never matched anything proves nothing when it matches nothing.
+    require(
+        live,
+        f"{label}: the sandbox {names} is not named by any running process, so its "
+        f"absence after the session could not be observed either",
+    )
+    return {
+        "runtime": runtime,
+        "sandbox_names": names,
+        "sockets": owned_sockets(ctx, names),
+        "host_processes": live,
+    }
+
+
+def observe_absence(ctx: "Context", session: "Session", before: dict) -> dict:
+    """What this launch still owned once the launcher had exited.
+
+    Strictly an observation made **before** any rescue cleanup: `teardown_receipt`
+    stops whatever it finds, so an absence proved after it has run would only
+    prove that the rescue worked, not that the launch cleaned up after itself.
+    """
+
+    launcher_pid = session.process.pid
+    rows = owned_catalog_rows(ctx, launcher_pid)
+    names = [str(row.get("name", "")) for row in rows]
+    runtime = before["runtime"]
+    current = runtime_helpers.process_identity(runtime["pid"])
+    return {
+        "observed_after_launcher_exit": session.process.poll() is not None,
+        "launcher_pid": launcher_pid,
+        "catalog_rows": len(rows),
+        "catalog_names": names,
+        "sockets": owned_sockets(ctx, [*names, *before["sandbox_names"]]),
+        "runtime_pid": runtime["pid"],
+        # Absence, not "a different process": a reused PID is not this launch's VM.
+        "runtime_gone": current is None or current != runtime["start"],
+        # Nothing on the host may still name this launch's sandbox, which is the
+        # only way a guest descendant could still be running.
+        "host_processes": host_processes_matching([*names, *before["sandbox_names"]]),
+    }
+
+
+def unhandled_hint(spec: dict, status: int) -> str:
+    """Why a signal-death status can differ from ``128 + N``, said in the failure.
+
+    A guest killed by a signal has no exit status of its own, and the runtime
+    reports only a number: it arrives as ``-1``, which the launcher passes through
+    as an unknown guest status (``exit(-1)``, seen here as 255). ``128 + N`` for a
+    guest's *own* signal death therefore needs the runtime to carry
+    ``WIFSIGNALED``/``WTERMSIG`` (issue #467). Naming that here keeps a red row
+    diagnosable instead of looking like a forgotten expectation.
+    """
+
+    if spec["behaviour"] != "unhandled" or status < 128:
+        return ""
+    return (
+        "; the guest was killed by the signal it was sent, and the runtime has no "
+        "way to say so, so the status it reported -- and this launcher passed "
+        "through -- was its unknown value -1 (255 here). Delivering this row needs "
+        "the runtime to carry the guest's signal identity (issue #467)"
+    )
+
+
+def observe_signal(
+    case: Case, spec: dict, session: Session, receipt: dict, ctx: "Context", form: str
+) -> int:
+    """One host-signal row: deliver real signals, then prove status, terminal, absence.
+
+    Nothing about the guest is inferred from the launcher's notices: the guest
+    reports the signals it received itself, the launcher's status is compared with
+    the exact number the published status table requires, and the ownership facts
+    are observed before the harness's own rescue cleanup could hide a survivor.
+    """
+
+    label = f"{case.name}/{form}"
+    expected_name = " + ".join(SIGNAL_NAMES[int(number)] for number in spec["signals"])
+    receipt["signal"] = {
+        "mode": spec["mode"],
+        "behaviour": spec["behaviour"],
+        "plan": expected_name,
+        "grace_seconds": SIGNAL_GRACE,
+        "expected_status": spec["expect"],
+    }
+    session.pump(
+        lambda out: "SIGNAL-READY" in out,
+        "the guest's signal readiness",
+        wait_for=lambda s: s.merged_text(),
+    )
+    # The mode is an observation, not an assumption: a PTY launch owns the host
+    # terminal in raw mode, streaming never touches it. A signal must not change
+    # either, and the snapshot comparison below is what proves it did not.
+    raw = session.raw_observed()
+    receipt["signal"]["host_terminal"] = "raw" if raw else "canonical"
+    require(
+        raw == (spec["mode"] == "pty"),
+        f"{label}: the host terminal is {'raw' if raw else 'canonical'} under a "
+        f"{spec['mode']} launch",
+    )
+    before = owned_while_running(ctx, session.process.pid, label)
+    receipt["owned_before_signal"] = before
+    ready_at = time.monotonic()
+    sent = []
+    sent_at = []
+    for index, number in enumerate(spec["signals"]):
+        if index:
+            # The guest's own report of the first signal is what makes the second
+            # one a *second interrupt* rather than a race with delivery.
+            session.pump(
+                lambda out, marker=SIGNAL_IGNORED[spec["signals"][0]]: marker in out,
+                "the guest's report of the first signal",
+                wait_for=lambda s: s.merged_text(),
+            )
+        require(
+            session.process.poll() is None,
+            f"{label}: the launcher had already exited before signal {index + 1} "
+            f"({SIGNAL_NAMES[int(number)]})",
+        )
+        os.kill(session.process.pid, int(number))
+        sent_at.append(time.monotonic())
+        sent.append(
+            {
+                "number": int(number),
+                "name": SIGNAL_NAMES[int(number)],
+                "sent_after_ready": round(sent_at[-1] - ready_at, 3),
+            }
+        )
+    status = session.wait(SIGNAL_WAIT)
+    exited_at = time.monotonic()
+    receipt["launcher_status"] = status
+    receipt["signal"]["sent"] = sent
+    timing = {
+        "first_signal_to_exit": round(exited_at - sent_at[0], 3),
+        "last_signal_to_exit": round(exited_at - sent_at[-1], 3),
+    }
+    receipt["signal"]["timing"] = timing
+    # Every channel, because a signal row's report may be on the terminal (PTY) or
+    # in a redirected file (streaming): the launcher's own notice goes wherever its
+    # stderr went, and the guest's report wherever its stdout went.
+    text = session.merged_text()
+    receipt["signal"]["launcher_path"] = (
+        "forced teardown" if "Interrupted by signal" in text else "ordinary teardown"
+    )
+    for marker in spec["markers"]:
+        require(
+            marker in text,
+            f"{label}: the guest never reported {marker!r}, so the signal's arrival "
+            f"was not observed: {text[-2000:]!r}",
+        )
+    for marker in spec["forbidden"]:
+        require(
+            marker not in text,
+            f"{label}: the guest reported {marker!r}, which contradicts the "
+            f"{spec['behaviour']} behaviour under test: {text[-2000:]!r}",
+        )
+    # Restoration and absence are recorded and judged *before* the status, so a row
+    # that is red for its status still carries the two observations it exists to
+    # prove - and still fails if either of them is wrong.
+    require_terminal_restored(session, receipt, label)
+    absence = observe_absence(ctx, session, before)
+    receipt["absence_before_rescue"] = absence
+    require(
+        absence["catalog_rows"] == 0,
+        f"{label}: the launch left {absence['catalog_rows']} catalog row(s) behind: "
+        f"{absence['catalog_names']}",
+    )
+    require(not absence["sockets"], f"{label}: the launch left owned sockets behind: {absence['sockets']}")
+    require(
+        absence["runtime_gone"],
+        f"{label}: the runtime that hosted the guest is still executing: {absence['runtime_pid']}",
+    )
+    require(
+        not absence["host_processes"],
+        f"{label}: a process still names this launch's sandbox: {absence['host_processes']}",
+    )
+    require(
+        status == spec["expect"],
+        f"{label}: launcher status {status}, but the status table requires "
+        f"{spec['expect']} after {expected_name}, with a guest whose behaviour is "
+        f"{spec['behaviour']}"
+        f"{unhandled_hint(spec, status)}; output {text[-2000:]!r}",
+    )
+    if "signal_convention" in spec:
+        # Documentation, not a second check: the ``status == spec["expect"]``
+        # comparison above is what excludes the shell convention (the two numbers
+        # differ, so 255 cannot also be 128 + N). This records the fact a reader of
+        # the receipt has to be able to check - that the launcher did not infer a
+        # guest signal death from the host signal it forwarded, and that only
+        # runtime-supplied identity could justify the convention.
+        receipt["signal"]["guest_status"] = {
+            "passed_through": UNKNOWN_GUEST_STATUS,
+            "unknown_status_exit": PASSED_THROUGH_EXIT,
+            "launcher_status_equals_pass_through": status == PASSED_THROUGH_EXIT,
+            "signal_convention": spec["signal_convention"],
+            "is_signal_convention": status == spec["signal_convention"],
+            "identity_missing_because": SIGNAL_IDENTITY_ISSUE,
+        }
+    if spec["behaviour"] == "grace-expiry":
+        require(
+            timing["first_signal_to_exit"] >= SIGNAL_GRACE,
+            f"{label}: the launcher ended {timing['first_signal_to_exit']}s after the "
+            f"forwarded signal, before its fixed {SIGNAL_GRACE}s grace: a guest that "
+            f"ignores the signal is still owed that grace",
+        )
+    if spec["behaviour"] == "second-interrupt":
+        # Measured from the *first* signal: an interval taken from the last one
+        # cannot see a grace that expired before the second arrived, which is
+        # exactly the failure this check is for (the launcher would then have exited
+        # at first + grace and reported the first signal's number).
+        require(
+            timing["first_signal_to_exit"] < SIGNAL_GRACE,
+            f"{label}: the launcher ended {timing['first_signal_to_exit']}s after the "
+            f"first signal, which is at or past the {SIGNAL_GRACE}s grace, so the "
+            f"expiry decided the end and the status may be the first signal's",
+        )
+    if "forced_notice" in spec:
+        # The status alone cannot tell a forced shutdown from a guest that exited
+        # with the same number itself; the launcher's own account of the end can.
+        require(
+            spec["forced_notice"] in text,
+            f"{label}: the launcher never reported a forced teardown after "
+            f"{spec['forced_notice']!r}: {text[-2000:]!r}",
+        )
+        receipt["signal"]["forced_notice"] = spec["forced_notice"]
     return status
 
 
@@ -1121,7 +1592,7 @@ def own_teardown(ctx: "Context", receipt: dict, label: str) -> None:
     )
 
 
-def owned_runtime_identity(launcher_pid: int, ctx: "Context") -> dict:
+def owned_runtime_identity(launcher_pid: int, ctx: "Context", label: str = "wait") -> dict:
     """The one running runtime process that belongs to this case.
 
     Identity comes from the private catalog (the row names this case's sandbox),
@@ -1144,11 +1615,11 @@ def owned_runtime_identity(launcher_pid: int, ctx: "Context") -> dict:
         and (row.get("run_status") is None or str(row.get("run_status")).lower() == "running")
     ]
     owned = [row for row in candidates if launcher_pid and str(launcher_pid) in str(row.get("name", ""))]
-    require(owned, f"wait: no catalog row names this launcher's sandbox (rows={rows})")
-    require(len(owned) == 1, f"wait: {len(owned)} candidate runtimes; refusing to signal")
+    require(owned, f"{label}: no catalog row names this launcher's sandbox (rows={rows})")
+    require(len(owned) == 1, f"{label}: {len(owned)} candidate runtimes; refusing to signal")
     pid = int(owned[0]["pid"])
     identity = runtime_helpers.process_identity(pid)
-    require(identity is not None, "wait: the catalog runtime is not executing")
+    require(identity is not None, f"{label}: the catalog runtime is not executing")
     return {"pid": pid, "start": identity}
 
 
