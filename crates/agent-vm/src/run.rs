@@ -1735,7 +1735,7 @@ pub(crate) async fn launch(
     let shell_argv: Vec<String> = vec!["-c".into(), shell_line];
 
     let t_run = Instant::now();
-    let exit = if exec_io == ExecIo::Attach {
+    let exit = if direct_terminal == Some(crate::direct_terminal::DirectIo::Pty) {
         live_launch_result(
             notices.emit(format!("==> Attaching to {command_display}")),
             direct_launch,
@@ -1743,6 +1743,15 @@ pub(crate) async fn launch(
             &log_dir,
         )
         .await?;
+        // A direct PTY launch drives its own session (`direct_pty`) over the
+        // stock SDK's public `exec_stream_with(... tty(true).stdin_pipe())`,
+        // because that session owns the exit status: `attach()` intercepts
+        // `Ctrl-]` inside its own input loop, ignores output and resize
+        // failures, and returns `Ok(-1)` when the stream ends without a guest
+        // exit. Legacy `shell` and catalog launches keep `attach()` with no
+        // options below, so their detach semantics, best-effort output and
+        // `Ok(-1)` convention are untouched — byte for byte.
+        //
         // Pin the agent's cwd to the real project path via the exec request
         // (vsock, byte-safe), NOT libkrun's `KRUN_WORKDIR` — which may be the
         // ASCII `/` placeholder for a non-ASCII project. `attach()` alone
@@ -1756,44 +1765,64 @@ pub(crate) async fn launch(
         // bind-mounted file owner bits) — both calls are load-bearing, for
         // different reasons; neither is a substitute for the other. The PATH
         // override is the acquired image's resolved config value (#258).
-        // A direct launch owns its exit status, so it needs the SDK's checked
-        // session: without it a lost session is indistinguishable from a guest
-        // status, output errors are swallowed, and `Ctrl-]` would detach. A
-        // legacy launch passes no options at all, so its detach semantics,
-        // best-effort output and `Ok(-1)` convention are untouched.
-        let attach = sandbox.attach_with(cmd, |a| {
-            let a = a
-                .args(shell_argv)
-                .cwd(project_guest_path.clone())
-                .user(exec_user.clone())
-                .env("PATH", exec_path.clone());
-            if direct_launch {
-                a.disable_detach_keys().checked_session()
-            } else {
-                a
+        let handle = match sandbox
+            .exec_stream_with(cmd, |e| {
+                e.args(shell_argv)
+                    .cwd(project_guest_path.clone())
+                    .user(exec_user.clone())
+                    .env("PATH", exec_path.clone())
+                    .stdin_pipe()
+                    .tty(true)
+            })
+            .await
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                let error = anyhow::Error::new(error);
+                let primary = exec_failure_primary(
+                    contract_spawn_diagnostic(&image, &error),
+                    error.context(format!("attaching to {command_display}")),
+                );
+                return Err(finish_failed_exec(&sandbox, primary, &log_dir).await);
             }
-        });
-        // The direct session is raced against the sandbox's own lifetime: a
-        // runtime that disappears must restore the terminal and fail, never
-        // fabricate a guest status (#400). Legacy keeps its single await.
-        let result = if direct_launch {
-            crate::direct_terminal::supervise_attach(attach, sandbox.wait()).await
-        } else {
-            attach.await.map_err(anyhow::Error::new)
         };
-        match result {
+        // The session is raced against the sandbox's own lifetime: a runtime
+        // that disappears restores the terminal and fails, never fabricating a
+        // guest status (#400).
+        match crate::direct_pty::run(handle, sandbox.wait()).await {
             Ok(code) => code,
             Err(error) => {
                 let primary = exec_failure_primary(
                     contract_spawn_diagnostic(&image, &error),
                     error.context(format!("attaching to {command_display}")),
                 );
-                return Err(finish_failed_exec(
-                    &sandbox,
-                    primary,
-                    &sandbox_log_dir(&session.sandbox_name).display().to_string(),
-                )
-                .await);
+                return Err(finish_failed_exec(&sandbox, primary, &log_dir).await);
+            }
+        }
+    } else if exec_io == ExecIo::Attach {
+        // Legacy: a `shell` or catalog launch with terminal stdin. This is the
+        // one remaining caller of `attach()`, and it passes no options at all.
+        live_launch_result(
+            notices.emit(format!("==> Attaching to {command_display}")),
+            direct_launch,
+            &sandbox,
+            &log_dir,
+        )
+        .await?;
+        let attach = sandbox.attach_with(cmd, |a| {
+            a.args(shell_argv)
+                .cwd(project_guest_path.clone())
+                .user(exec_user.clone())
+                .env("PATH", exec_path.clone())
+        });
+        match attach.await.map_err(anyhow::Error::new) {
+            Ok(code) => code,
+            Err(error) => {
+                let primary = exec_failure_primary(
+                    contract_spawn_diagnostic(&image, &error),
+                    error.context(format!("attaching to {command_display}")),
+                );
+                return Err(finish_failed_exec(&sandbox, primary, &log_dir).await);
             }
         }
     } else {
@@ -1843,12 +1872,7 @@ pub(crate) async fn launch(
                     contract_spawn_diagnostic(&image, &error),
                     error.context(format!("running {command_display} in sandbox")),
                 );
-                return Err(finish_failed_exec(
-                    &sandbox,
-                    primary,
-                    &sandbox_log_dir(&session.sandbox_name).display().to_string(),
-                )
-                .await);
+                return Err(finish_failed_exec(&sandbox, primary, &log_dir).await);
             }
         };
         let mut stdout = tokio::io::stdout();
@@ -1879,7 +1903,7 @@ pub(crate) async fn launch(
             },
             ExecContext {
                 image: &image,
-                log_dir: &sandbox_log_dir(&session.sandbox_name).display().to_string(),
+                log_dir: &log_dir,
             },
         )
         .await?

@@ -242,15 +242,34 @@ standing claim that every row was run.
 #400 widens **when** a direct launch streams; it does not change who owns the
 input. A launch now streams not only for non-terminal stdin but also when a
 redirected stdout or `--no-tty`/`-T` selects streaming despite a terminal stdin
-(`CONTEXT.md` → *Direct terminal policy*). The streamed path is the same reserved
-input described above, unchanged: one reader thread, one bounded queue, one pump,
-one EOF frame, and the same failure distinctions. The choices made here about
-ownership and backpressure remain as recorded, and a PTY launch does not use this
-module at all — the SDK's terminal bridge owns input there, with its own raw-mode
-guard and cancellation rules (see `ARCHITECTURE.md` → *Interactive attach*).
+(`CONTEXT.md` → *Direct terminal policy*). The streamed path is unchanged: one
+reader thread, one bounded queue, one pump, one EOF frame, and the same failure
+distinctions.
 
-The supervision seam #400 leaves for #401 is the owned attach future: a direct PTY
-session is `direct_terminal::supervise_attach(attach, runtime_wait)`, so signal
-handling can later cancel that future and escalate teardown without redesigning
-input ownership. #400 itself adds no signal forwarding, grace period or 128+N
-status.
+The **PTY** half of that ownership is the launcher's too, in `direct_pty`. A
+direct PTY launch drives the stock SDK's
+`exec_stream_with(... tty(true).stdin_pipe())` and owns the host terminal, the
+input reader, the output writer and the guest's status itself, so the vendored
+runtime carries no patch. The choices recorded above are reproduced there rather
+than replaced: a detached std thread for the blocking read (a `poll(2)` on the
+terminal with a self-pipe wake, so it stops reading the operator's keyboard when
+the session ends), one bounded output queue with blocking backpressure rather
+than failure, and the same EPIPE-versus-failure rule — the one
+`direct_input::classify_stdin_error` implements, called rather than copied.
+
+Terminal policy only selects a PTY when stdin is a terminal, so `direct_pty`
+never falls back to `/dev/tty`: a forced PTY with a redirected stdin is refused
+before boot instead of silently attaching to the operator's keyboard. A session
+whose peer stops reading for long enough to fill a queue still polls the
+runtime's own end and the output writer's failure, so a lost runtime restores the
+terminal instead of leaving the launcher hung. Whether it is also a *failure*
+depends on when it happens: before the guest reports an exit the status is
+unknown and the session exits 125, while after it the status is known, so a
+runtime lost with the last output still queued only truncates that output and the
+session reports the guest's own status (`ARCHITECTURE.md` → *Direct PTY session
+(#400)*).
+
+The supervision seam #400 leaves for #401 is the owned session future: a direct
+PTY session is `direct_pty::run(handle, runtime_wait)`, so signal handling can
+later cancel that future and escalate teardown without redesigning input
+ownership. #400 itself adds no signal forwarding, grace period or 128+N status.

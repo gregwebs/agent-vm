@@ -604,28 +604,29 @@ launch too.
 ### Interactive attach vs. non-TTY streaming exec
 
 `Sandbox::attach()` needs a real terminal on stdin and fails when stdin is a
-pipe, a redirect, or CI. Where the raw-mode snapshot comes from depends on the
-session: the **checked** session (direct launches) duplicates fd 0 and sets the
-attributes on that duplicate, never on `/dev/tty` and never on a global tty,
-while the **legacy** session (tool, `shell` and every pre-#400 caller) keeps the
-unchanged crossterm global raw-mode guard. Two launch kinds choose between attach
-and streaming, and the choice is **not** one predicate:
+pipe, a redirect, or CI. The raw-mode snapshot differs by session: the **direct
+PTY** session (`direct_pty`, #400) owns its own guard over a duplicated terminal
+descriptor and never touches fd 0 or a global tty, while the **legacy** session
+(tool, `shell` and every pre-#400 caller) keeps the unchanged crossterm global
+raw-mode guard inside `attach()`. Two launch kinds choose between a terminal and
+streaming, and the choice is **not** one predicate:
 
 ```
 launch target            decision                                  result
 ─────────────────────────────────────────────────────────────────────────────────────
 tool / shell             stdin is a terminal (unchanged)            attach, legacy semantics
-direct                   HostTerminals{stdin,stdout} + -t/-T        attach or stream (#400)
+direct                   HostTerminals{stdin,stdout} + -t/-T        direct PTY session or stream (#400)
 ```
 
 - **Legacy attach** → `attach_with(cmd, args)` with no options: the agent's TUI
   gets a full PTY, `Ctrl-]` detaches, output is best effort, and a session that
-  ends without a guest exit returns `Ok(-1)`.
-- **Direct attach** → the same call plus the SDK's opt-in
-  `.disable_detach_keys().checked_session()`, raced against `Sandbox::wait()`
-  inside `direct_terminal::supervise_attach`. A definite guest exit is required
-  to report a status; a closed channel, a malformed frame, output or send failure,
-  or a runtime that disappears is a failure (125) after the terminal is restored.
+  ends without a guest exit returns `Ok(-1)`. This is the *only* remaining
+  `attach()` caller.
+- **Direct PTY** → `exec_stream_with(... tty(true).stdin_pipe())` driven by
+  `direct_pty` (below), so the fork needs no SDK patch. A definite guest exit is
+  required to report a status; before one arrives, a closed channel, an output or
+  send failure, or a runtime that disappears is a failure (125) after the
+  terminal is restored.
 - **No terminal** → `exec_stream_with(...)`, which streams stdout/stderr as they
   are produced and forwards the exit code.
 
@@ -689,27 +690,59 @@ failure: stop the pump, drop the wait future, drop the handle, then tear down �
 in that order, because the wait future may hold the child-handle mutex (#258) and
 a pending sink write must not outlive the handle it writes through.
 
-**Direct PTY supervision (#400).** A direct attach is one owned future, not a
-spawned task: `supervise_attach(attach, sandbox.wait())` selects on both and
-releases in a fixed order — the attach future first (the SDK restores the host
-terminal and drops its output writer), then the runtime wait (releasing the
-child-handle mutex before the existing stop/wait/remove path takes it). The
-select is biased towards the attach future so an exit already observed is never
-replaced by a later runtime observation, and a runtime exit without a guest exit
-is a failure rather than a fabricated status. #401 will cancel this same owned
-future from a signal-aware supervisor; #400 adds no signal handling, so a
-`Ctrl-C` at a host terminal is just another raw input byte forwarded once.
+**Direct PTY session (#400).** `direct_pty::run(handle, sandbox.wait())` is one
+owned future, not a spawned task, and it owns the whole host side of the session:
 
-Inside the SDK's checked session the host terminal's raw state is held by a
-guard that restores explicitly on both returns (and best-effort from `Drop` for
-cancellation), and guest output is written by a dedicated thread over a
-duplicated stdout descriptor with an 8 MiB outstanding-byte bound. That thread
-exists because a Tokio stdout write cannot be cancelled once dispatched and
-`Runtime::drop` waits for blocking tasks: a session that failed while its
-consumer stopped draining could otherwise never report its failure. A full queue
-waits for the consumer (stalling the session, as a native terminal write would);
-an unwritable descriptor or a lost runtime fails with 125 after restoration and
-teardown.
+```
+fd 0 (a terminal, no fallback) ─► duplicate ─► RawTerminal (exact snapshot)
+                               └─► thread "agent-vm-pty-input" ─► 1-chunk queue ─► ExecSink
+TIOCGWINSZ ─► handle.resize(rows, cols) at start, again per SIGWINCH
+ExecHandle events ─► output (merged) ─► thread "agent-vm-pty-output" ─► duplicated fd 1
+Sandbox::wait() ─► raced: a runtime exit without a guest exit is a failure
+```
+
+It selects on the handle's events, host input, `SIGWINCH`, its own pending
+writes and the runtime wait, biased towards work already accepted so an exit
+already observed never waits behind output backpressure. Each send that a peer
+can stall — one guest frame to the output writer, one input chunk to the guest,
+one resize to the agent — is held as a `select!` **branch**, never awaited in an
+arm body: a pending body stops the macro polling its siblings, which would hide a
+runtime exit, a writer failure or the end of the event stream for as long as a
+stalled consumer kept the send waiting. A full queue still stalls the session (it
+must), so the only difference from a native terminal is that the fault paths stay
+observable. Every outcome leaves through one epilogue: restore the terminal,
+abort the writer, stop the reader (a self-pipe wakes it), then drop the runtime
+wait (releasing the child-handle mutex before the existing stop/wait/remove path
+takes it). #401 will cancel this same owned future from a signal-aware
+supervisor; #400 adds no signal handling, so a `Ctrl-C` at a host terminal is
+just another raw input byte forwarded once.
+
+Two properties come from choices `attach()` does not make. The raw guard saves
+the **exact** attributes and restores that snapshot explicitly on both returns
+(and best-effort from `Drop` for cancellation), reporting a restore failure
+rather than swallowing it. And guest output is written by a dedicated thread
+over a duplicated stdout descriptor with an 8 MiB outstanding-byte bound, because
+a Tokio stdout write cannot be cancelled once dispatched and `Runtime::drop`
+waits for blocking tasks: a session that failed while its consumer stopped
+draining could otherwise never report its failure. A full queue waits for the
+consumer (stalling the session, as a native terminal write would) and a frame
+larger than one queue slot is split into ordered chunks, so the bound is bytes
+rather than frames. An unwritable descriptor is always a session failure (125
+after restoration and teardown), and so is a runtime lost **before** the guest
+reports an exit — there the status is still unknown. Once the exit has been
+observed the status *is* known, so the final flush is all that is left to lose:
+the barrier still races that flush against the runtime wait (a consumer that
+never drains must not be able to hang the launcher), but a runtime lost there
+ends the drain and the session reports the guest's own status, truncating
+whatever output was still queued. `abort` stops the writer instead of letting it
+drain what a failed session had already queued, so nothing is written to the
+operator's terminal after the terminal was restored.
+
+One difference is an SDK limitation rather than a design choice: `exec_stream`
+creates the guest PTY at a fixed 24x80 (`exec_stream_with_pty_size` is
+`pub(crate)`), so the session's first frame after the handle exists is a
+`resize` to the host's real `TIOCGWINSZ` size. `attach()` puts the real size in
+the exec request itself.
 
 `stream_exec_with_cleanup` owns that loop. It also owns the sink policy: a
 catalog tool or the fallback shell keeps the legacy **best-effort** sink (a
