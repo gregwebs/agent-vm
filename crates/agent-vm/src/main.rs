@@ -27,6 +27,7 @@ mod github_graphql;
 mod guest_home;
 mod guest_paths;
 mod host_paths;
+mod host_signals;
 mod image_acquire;
 mod image_build;
 mod image_capabilities;
@@ -38,6 +39,7 @@ mod image_miss;
 mod image_pin;
 mod image_publish;
 mod intercept_hook;
+mod launch_notice;
 mod launch_target;
 mod mount;
 mod mount_selection;
@@ -60,6 +62,9 @@ mod secrets;
 mod session;
 mod setup;
 mod shell;
+#[cfg(test)]
+mod signal_cases;
+mod teardown;
 #[cfg(test)]
 mod test_env;
 #[cfg(test)]
@@ -425,7 +430,7 @@ mod tests {
     /// previous commit is what checks the race was won: a build that observed the
     /// runtime while *not* parked would pass there too, and one that cannot see it
     /// while parked hangs.
-    const OVER_BOUND_SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
+    pub(super) const OVER_BOUND_SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
 
     /// How long the `exit-wins` case waits between delivering the guest's exit
     /// and releasing the runtime's own end.
@@ -518,7 +523,7 @@ mod tests {
         dir.join("child.receipt")
     }
 
-    fn append_receipt(path: &std::path::Path, lines: &[String]) {
+    pub(super) fn append_receipt(path: &std::path::Path, lines: &[String]) {
         use std::io::Write as _;
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -539,9 +544,12 @@ mod tests {
     /// The failure teardown for this fixture: a real adapter for the production
     /// `ExecTeardown` seam, so `finish_failed_exec` still owns the stage order and
     /// the primary-first message while the "VM" is an owned test process.
-    struct RelayTeardown {
-        receipt: std::path::PathBuf,
-        runtime: std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>,
+    pub(super) struct RelayTeardown {
+        pub(super) receipt: std::path::PathBuf,
+        pub(super) runtime: std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>,
+        /// One stage this teardown refuses, so a genuine cleanup failure can be
+        /// driven through the production path (#401).
+        pub(super) fail_at: Option<&'static str>,
     }
 
     impl RelayTeardown {
@@ -552,11 +560,14 @@ mod tests {
                 let _ = child.kill();
                 let _ = child.wait();
             }
+            if self.fail_at == Some(stage) {
+                anyhow::bail!("the fake runtime refused to {stage}");
+            }
             Ok(())
         }
     }
 
-    impl crate::run::ExecTeardown for RelayTeardown {
+    impl crate::teardown::ExecTeardown for RelayTeardown {
         async fn stop_and_wait(&self) -> anyhow::Result<()> {
             self.stage("stop")
         }
@@ -574,9 +585,9 @@ mod tests {
     /// A backend that routes everything to the process default and only replaces
     /// agent connectivity, so `SandboxBackend::attach`'s **default** implementation
     /// runs unmodified against an owned fake relay.
-    struct RelayBackend {
-        inner: std::sync::Arc<dyn microsandbox::backend::Backend>,
-        client: std::sync::Mutex<Option<microsandbox::agent::AgentClient>>,
+    pub(super) struct RelayBackend {
+        pub(super) inner: std::sync::Arc<dyn microsandbox::backend::Backend>,
+        pub(super) client: std::sync::Mutex<Option<microsandbox::agent::AgentClient>>,
     }
 
     impl microsandbox::backend::Backend for RelayBackend {
@@ -624,20 +635,28 @@ mod tests {
 
     /// The owned fake runtime: a real process, so "torn down" means a real
     /// process state and not a recorded flag.
-    struct FakeRuntime {
-        child: std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>,
-        pid: u32,
+    pub(super) struct FakeRuntime {
+        pub(super) child: std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>,
+        pub(super) pid: u32,
     }
 
     impl FakeRuntime {
         fn spawn() -> Self {
-            let child = std::process::Command::new("/bin/sleep")
+            Self::spawn_with(false)
+        }
+
+        pub(super) fn spawn_with(detached: bool) -> Self {
+            use std::os::unix::process::CommandExt as _;
+            let mut command = std::process::Command::new("/bin/sleep");
+            command
                 .arg("300")
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .expect("spawn the owned fake runtime");
+                .stderr(std::process::Stdio::null());
+            if detached {
+                command.process_group(0);
+            }
+            let child = command.spawn().expect("spawn the owned fake runtime");
             let pid = child.id();
             Self {
                 child: std::sync::Arc::new(std::sync::Mutex::new(Some(child))),
@@ -658,7 +677,7 @@ mod tests {
 
         /// The runtime-wait future production shape: resolves when the owned
         /// runtime process ends, reaping it.
-        async fn wait_future(
+        pub(super) async fn wait_future(
             child: std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>,
         ) -> microsandbox::MicrosandboxResult<std::process::ExitStatus> {
             {
@@ -982,7 +1001,7 @@ mod tests {
         .expect("relay write");
     }
 
-    async fn wait_for_file(dir: &std::path::Path, name: &str) {
+    pub(super) async fn wait_for_file(dir: &std::path::Path, name: &str) {
         let deadline = std::time::Instant::now() + full_pipe_deadline();
         while !dir.join(name).exists() {
             assert!(
@@ -1121,6 +1140,7 @@ mod tests {
         let teardown = RelayTeardown {
             receipt: receipt.clone(),
             runtime: std::sync::Arc::clone(&runtime_process.child),
+            fail_at: None,
         };
 
         // Everything the session and the failure path do happens inside this one
@@ -1136,8 +1156,13 @@ mod tests {
             match handle {
                 Err(error) => Err(anyhow::Error::new(error)),
                 Ok(handle) => runtime.block_on(async move {
-                    match crate::direct_pty::run(handle, runtime_wait).await {
-                        Ok(code) => Ok(code),
+                    // This control owns no signal handlers: what it asserts is the
+                    // output/runtime ordering, and installing a handler here would
+                    // put the case's own process in the way of the terminal it is
+                    // observing.
+                    let mut supervision = crate::host_signals::Supervision::legacy();
+                    match crate::direct_pty::run(handle, runtime_wait, &mut supervision).await {
+                        Ok(end) => Ok(end.exit_status()),
                         Err(error) => {
                             Err(
                                 crate::run::finish_failed_exec(&teardown, error, "/logs/probe")
@@ -1171,6 +1196,54 @@ mod tests {
         }
     }
 
+    /// A fresh PTY pair with `rows`x`cols` on the slave.
+    ///
+    /// Neither end is `FD_CLOEXEC` (`openpty` does not set it), so a spawned child
+    /// inherits both; the caller still hands the slave over explicitly as its
+    /// stdin, and reads termios through whichever end it keeps.
+    pub(super) fn open_pty(rows: u16, cols: u16) -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+        use std::os::fd::FromRawFd as _;
+        let mut master: libc::c_int = -1;
+        let mut slave: libc::c_int = -1;
+        // SAFETY: `openpty` writes two descriptors into the live locals and takes
+        // no other pointers; both are taken into `OwnedFd` immediately.
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
+        // SAFETY: `openpty` succeeded, so each of these is an open descriptor that
+        // nothing else owns.
+        let master = unsafe { std::os::fd::OwnedFd::from_raw_fd(master) };
+        // SAFETY: as above for the slave side.
+        let slave = unsafe { std::os::fd::OwnedFd::from_raw_fd(slave) };
+        let size = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: the slave is an open terminal and `TIOCSWINSZ` only reads the
+        // `winsize` behind the pointer.
+        assert_ne!(
+            unsafe {
+                libc::ioctl(
+                    std::os::fd::AsRawFd::as_raw_fd(&slave),
+                    libc::TIOCSWINSZ,
+                    &size,
+                )
+            },
+            -1,
+            "set the terminal size"
+        );
+        (master, slave)
+    }
+
     /// A fresh PTY pair, the parent's own terminal observation.
     struct ParentTerminal {
         master: std::os::fd::OwnedFd,
@@ -1184,34 +1257,12 @@ mod tests {
         }
 
         fn open_with_size(rows: u16, cols: u16) -> Self {
-            use std::os::fd::{AsRawFd as _, FromRawFd as _};
-            let mut master: libc::c_int = -1;
-            let mut slave: libc::c_int = -1;
-            let rc = unsafe {
-                libc::openpty(
-                    &mut master,
-                    &mut slave,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                )
-            };
-            assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
-            let size = libc::winsize {
-                ws_row: rows,
-                ws_col: cols,
-                ws_xpixel: 0,
-                ws_ypixel: 0,
-            };
-            assert_ne!(
-                unsafe { libc::ioctl(slave, libc::TIOCSWINSZ, &size) },
-                -1,
-                "set the terminal size"
-            );
-            let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+            use std::os::fd::AsRawFd as _;
+            let (master, slave) = open_pty(rows, cols);
             let baseline = terminal_state(slave.as_raw_fd());
+            let slave = std::fs::File::from(slave);
             Self {
-                master: unsafe { std::os::fd::OwnedFd::from_raw_fd(master) },
+                master,
                 slave,
                 baseline,
             }
@@ -1247,7 +1298,7 @@ mod tests {
         }
     }
 
-    fn terminal_is_raw(fd: std::os::fd::RawFd) -> bool {
+    pub(super) fn terminal_is_raw(fd: std::os::fd::RawFd) -> bool {
         let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
         let rc = unsafe { libc::tcgetattr(fd, &mut attributes) };
         assert_eq!(rc, 0, "read the terminal");
@@ -1258,7 +1309,7 @@ mod tests {
     /// generation, extended processing, the translations, the read protocol and
     /// the port parameters. macOS `PENDIN` is kernel bookkeeping about unread
     /// input, not something this interface sets.
-    fn terminal_state(fd: std::os::fd::RawFd) -> String {
+    pub(super) fn terminal_state(fd: std::os::fd::RawFd) -> String {
         let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
         let rc = unsafe { libc::tcgetattr(fd, &mut attributes) };
         assert_eq!(
@@ -1299,7 +1350,11 @@ mod tests {
         ready > 0 && poll.revents & libc::POLLOUT != 0
     }
 
-    fn wait_until(what: &str, deadline: std::time::Duration, mut ready: impl FnMut() -> bool) {
+    pub(super) fn wait_until(
+        what: &str,
+        deadline: std::time::Duration,
+        mut ready: impl FnMut() -> bool,
+    ) {
         let start = std::time::Instant::now();
         while start.elapsed() < deadline {
             if ready() {
@@ -1314,12 +1369,12 @@ mod tests {
         std::fs::read_to_string(full_pipe_receipt(dir)).unwrap_or_default()
     }
 
-    fn receipt_line_of(text: &str, key: &str) -> Option<String> {
+    pub(super) fn receipt_line_of(text: &str, key: &str) -> Option<String> {
         receipt_lines_of(text, key).into_iter().next()
     }
 
     /// Every value recorded for `key`, in receipt order.
-    fn receipt_lines_of(text: &str, key: &str) -> Vec<String> {
+    pub(super) fn receipt_lines_of(text: &str, key: &str) -> Vec<String> {
         let prefix = format!("{key}=");
         text.lines()
             .filter_map(|line| line.strip_prefix(&prefix).map(str::to_owned))
@@ -1333,16 +1388,16 @@ mod tests {
     /// hanging; but an assertion that panics before the child exits would
     /// otherwise leave the child (and its fake runtime) behind for the rest of the
     /// suite.
-    struct ChildGuard {
+    pub(super) struct ChildGuard {
         child: Option<std::process::Child>,
     }
 
     impl ChildGuard {
-        fn new(child: std::process::Child) -> Self {
+        pub(super) fn new(child: std::process::Child) -> Self {
             Self { child: Some(child) }
         }
 
-        fn get(&mut self) -> &mut std::process::Child {
+        pub(super) fn get(&mut self) -> &mut std::process::Child {
             self.child.as_mut().expect("the child is still owned")
         }
 
@@ -1372,7 +1427,7 @@ mod tests {
         }
     }
 
-    fn process_is_gone(pid: u32) -> bool {
+    pub(super) fn process_is_gone(pid: u32) -> bool {
         let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
         if rc == 0 {
             return false;

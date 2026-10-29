@@ -869,13 +869,27 @@ reserved-looking one. The direct route adds only its own failures:
 |---|---|
 | 127 | the executable is absent from the effective guest `PATH` (also: a bare name that resolves to a *directory*, which `type -P` does not treat as an executable) |
 | 126 | the path exists but is not executable, or a directory named by path |
+| 128 + N | the launcher forced the shutdown after a host `SIGINT`/`SIGTERM` (see below) |
 | 125 | the launcher itself failed: configuration, guest setup, stdin forwarding, transport/output or cleanup |
+| 255 | the guest's own status is unknown: a command killed *inside* the VM by a signal the launcher did not forward, until issue #467 can name that signal |
 | 2 | a pre-boot usage error (absent/empty PROGRAM, invalid UTF-8, malformed launch options) |
 
 125 does not cover panics, aborts or signals. Sink failures count as 125: a
 direct launch whose stdout/stderr cannot be written fails instead of reporting a
 guest success. Shell and catalog-tool launches keep their existing best-effort
 output and their existing statuses.
+
+**Interrupting a direct command.** While it runs, a host `SIGINT` or `SIGTERM` is
+forwarded to the guest instead of ending the launcher, and the guest gets five
+seconds to exit; its own status is then reported, including 0. A second
+interrupt, or the five seconds running out, tears the sandbox down and reports
+`128 + N` for the signal that ended it. A guest that ignores the signal is
+therefore still stopped, and the VM is always torn down. `128 + N` is the summary
+of a launcher decision, never a guess at how the guest died: a session whose
+transport died is 125, and a guest killed inside the VM by a signal the launcher
+did not send has no status the launcher can read yet — its `-1` is passed through
+and the process exits **255**, as the table above says. Naming that signal
+arrives with issue #467.
 
 **What is retained.** Image selection, the project cwd, guest identity
 (`--root` or the host user), mounts, the persistent HOME/state, default-deny
@@ -974,9 +988,11 @@ runtime is a launcher failure: the host terminal is restored, the VM is torn dow
 and the status is 125 — a guest success is never reported over truncated output.
 The host terminal is restored after a normal exit, an error, and cancellation.
 
-> **Still open.** Signal forwarding and its grace period belong to #401. A `Ctrl-C`
-> typed at a host terminal is ordinary raw input and reaches the guest unchanged;
-> there is no host signal forwarding yet.
+`Ctrl-C` means two different things here, and is never forwarded twice. Under a
+PTY the terminal is in raw mode, so `Ctrl-C` is the byte `0x03` delivered to the
+guest as ordinary input; the host raises no signal. With streaming I/O the
+terminal stays cooked, so `Ctrl-C` *is* a host `SIGINT` and is forwarded as one,
+with the grace and the `128 + N` convention above.
 
 ### Extra and forked mounts
 

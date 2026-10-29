@@ -6,7 +6,7 @@ use std::{
     env,
     io::IsTerminal as _,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use anyhow::{Context, Result};
@@ -18,13 +18,21 @@ use crate::config::{self, ConfiguredImages, Tool};
 use crate::credential_provider;
 use crate::credential_resolver::{CredentialPreflight, MissingCredentialPolicy};
 use crate::direct_input::{GuestInputStatus, InputFailure, InputPump, InputSource};
+use crate::host_signals::{
+    ForcedShutdown, PendingSend, SessionEnd, Supervision, SupervisionStep, signal_send,
+    supervision_lost,
+};
 use crate::image_contract;
+use crate::launch_notice::{LaunchNotices, NoticeSink};
 use crate::launch_target::{LaunchTarget, ProgramGuard};
 use crate::mount;
 use crate::one_line;
 use crate::protected_host_files::CoreHostSource;
 use crate::session::ProjectSession;
 use crate::shell::guest_script_word;
+use crate::teardown::{
+    ExecTeardown, TeardownMode, cleanup_exec_sandbox, cleanup_exec_sandbox_failures,
+};
 use crate::user;
 
 /// Environment variables agent-vm injects into *every* guest, regardless of
@@ -138,53 +146,6 @@ fn translate_create_error(error: anyhow::Error) -> anyhow::Error {
     match hint {
         Some(hint) => anyhow::anyhow!("{hint}"),
         None => error,
-    }
-}
-
-/// stderr sink for `launch()`'s `==> …` progress notices.
-///
-/// Exists because `eprintln` panics from inside `std::io::_eprint`
-/// ("failed printing to stderr") when the write fails — a real outcome for
-/// `agent-vm … 2>&1 | head` (EPIPE) or a full disk — aborting the launcher
-/// with exit 101 and no context instead of reaching the error boundary in
-/// `main()` (issue #70). Generic over the sink so the failure path is
-/// testable without a broken pipe, following `network.rs`'s
-/// `emit_launch_notices_to` precedent.
-struct LaunchNotices<W> {
-    sink: W,
-}
-
-impl LaunchNotices<std::io::Stderr> {
-    /// The production sink is the `Stderr` *handle*, not a `.lock()` guard:
-    /// `StderrLock<'a>` borrows for `'a` and is `!Send`, so it can neither
-    /// be a long-lived field here nor cross into the spawned update-banner
-    /// task. (Deadlock is not the concern — std's stderr lock is
-    /// reentrant-per-thread.) Each `emit` is a single `write_all`, which
-    /// takes the lock once, so nothing is lost by not holding it.
-    fn to_stderr() -> Self {
-        Self::new(std::io::stderr())
-    }
-}
-
-impl<W: std::io::Write> LaunchNotices<W> {
-    fn new(sink: W) -> Self {
-        Self { sink }
-    }
-
-    /// Deliver one notice line.
-    ///
-    /// One `write_all` of the fully rendered line rather than `writeln!`,
-    /// which writes once per format-string fragment and could deliver half a
-    /// notice before failing. No flush: std's `Stderr` is unbuffered, so
-    /// there is nothing to flush and neither `eprintln` nor
-    /// `emit_launch_notices_to` does — adding one would change
-    /// success-path behavior.
-    fn emit(&mut self, message: impl std::fmt::Display) -> Result<()> {
-        let mut line = message.to_string();
-        line.push('\n');
-        self.sink
-            .write_all(line.as_bytes())
-            .with_context(|| format!("writing the launch notice {:?}", line.trim_end()))
     }
 }
 
@@ -769,7 +730,7 @@ pub(crate) async fn launch(
     // The output policy belongs to the target, not to the sink: a direct launch
     // answers a broken stdout/stderr pipe as its own failure (#398), while a
     // tool/shell launch keeps the legacy best-effort sink so its status cannot
-    // change (see `forward_stream_bytes`).
+    // change (see `forward_pending`).
     let output_policy = match invocation.guard() {
         ProgramGuard::Direct => OutputErrorPolicy::DirectChecked,
         ProgramGuard::ImageContract => OutputErrorPolicy::LegacyBestEffort,
@@ -1734,8 +1695,26 @@ pub(crate) async fn launch(
     let cmd = image_contract::LAUNCH_SHELL;
     let shell_argv: Vec<String> = vec!["-c".into(), shell_line];
 
+    // #401: host-signal supervision belongs to the whole direct launch, not to
+    // the session, because the guard must outlive the **teardown**: a disposition
+    // restored mid-cleanup would let the next interrupt kill the launcher with the
+    // sandbox still running. The binding is named rather than `_` on purpose —
+    // `_` would drop it immediately. A legacy launch installs nothing and every
+    // supervision branch then parks, so supervision adds nothing to it. Only
+    // supervision is unchanged: the output path is shared (#401's held frame), and
+    // there a stalled sink no longer hides a dead runtime, which is the one
+    // behaviour a legacy launch borrows from this ticket.
+    let (_host_signal_guard, mut supervision) = if direct_launch {
+        match crate::host_signals::install(crate::host_signals::GRACE) {
+            Ok((guard, supervision)) => (Some(guard), supervision),
+            Err(error) => return Err(finish_failed_exec(&sandbox, error, &log_dir).await),
+        }
+    } else {
+        (None, Supervision::legacy())
+    };
+
     let t_run = Instant::now();
-    let exit = if direct_terminal == Some(crate::direct_terminal::DirectIo::Pty) {
+    let ended: SessionEnd = if direct_terminal == Some(crate::direct_terminal::DirectIo::Pty) {
         live_launch_result(
             notices.emit(format!("==> Attaching to {command_display}")),
             direct_launch,
@@ -1789,8 +1768,8 @@ pub(crate) async fn launch(
         // The session is raced against the sandbox's own lifetime: a runtime
         // that disappears restores the terminal and fails, never fabricating a
         // guest status (#400).
-        match crate::direct_pty::run(handle, sandbox.wait()).await {
-            Ok(code) => code,
+        match crate::direct_pty::run(handle, sandbox.wait(), &mut supervision).await {
+            Ok(end) => end,
             Err(error) => {
                 let primary = exec_failure_primary(
                     contract_spawn_diagnostic(&image, &error),
@@ -1816,7 +1795,7 @@ pub(crate) async fn launch(
                 .env("PATH", exec_path.clone())
         });
         match attach.await.map_err(anyhow::Error::new) {
-            Ok(code) => code,
+            Ok(code) => SessionEnd::Guest(code),
             Err(error) => {
                 let primary = exec_failure_primary(
                     contract_spawn_diagnostic(&image, &error),
@@ -1905,6 +1884,7 @@ pub(crate) async fn launch(
                 image: &image,
                 log_dir: &log_dir,
             },
+            &mut supervision,
         )
         .await?
     };
@@ -1919,24 +1899,90 @@ pub(crate) async fn launch(
         .await?;
     }
 
-    live_launch_result(
-        notices.emit("==> Stopping sandbox"),
-        direct_launch,
+    let exit = finish_launch(
+        &mut notices,
         &sandbox,
+        ended,
+        direct_launch,
+        inner_cmd,
         &log_dir,
+        profile,
     )
     .await?;
-    let t_stop = Instant::now();
-    let cleanup = cleanup_exec_sandbox(&sandbox).await;
-    if profile {
-        notices.emit(format!("[profile] stop+remove: {:?}", t_stop.elapsed()))?;
-    }
-    cleanup_after_exit(inner_cmd, exit, cleanup)?;
 
     // Phase 5 safety net (host-cred mutation check) runs via the
     // SnapshotGuard above, which drops at end of scope including
     // any `?`-propagated error path.
 
+    Ok(exit)
+}
+
+/// How a launch ends: the notice that names the end, the teardown, and the status.
+///
+/// One owner, so the **order** of the notice and the teardown cannot differ between
+/// the two ends — and that order is the point on the forced path. A notice is a
+/// blocking write to this process's stderr, which for a streaming direct launch is
+/// the guest's own channel: `2>&1 | paused-reader`, or a tty an operator has stopped
+/// with Ctrl-S, never accepts the write. Written first and synchronously, as the
+/// ordinary path does, it would leave the sandbox running with the signal handlers
+/// still installed, so every later interrupt would be swallowed and only `SIGKILL`
+/// would end the launcher — the one outcome #401 forbids. So a forced end sends its
+/// notice from a detached thread, tears down regardless, and waits for the notice
+/// only afterwards, bounded (`NOTICE_SETTLE` in [`crate::launch_notice`]).
+///
+/// The ordinary path stays exactly as it was: the guest produced a status, so there
+/// is nothing to protect a teardown from, and a failed notice is still a direct
+/// launch's failure (125, VM down) rather than a swallowed line.
+///
+/// `profile` adds the teardown's own timing line through the same sink, under the
+/// same rule, because it is written after the teardown and a stalled stderr would
+/// otherwise hang the launcher at its very last step.
+async fn finish_launch<T, W>(
+    notices: &mut LaunchNotices<W>,
+    teardown: &T,
+    ended: SessionEnd,
+    direct: bool,
+    command: &str,
+    log_dir: &str,
+    profile: bool,
+) -> Result<i32>
+where
+    T: ExecTeardown,
+    W: NoticeSink,
+{
+    let t_stop = Instant::now();
+    let exit = match ended {
+        SessionEnd::Guest(_) => {
+            live_launch_result(
+                notices.emit("==> Stopping sandbox"),
+                direct,
+                teardown,
+                log_dir,
+            )
+            .await?;
+            after_session(teardown, ended, command).await?
+        }
+        SessionEnd::Forced(forced) => {
+            let delivery = notices.emit_detached(format!(
+                "==> Interrupted by signal {}; tearing down the sandbox (exit {})",
+                forced.signal().number(),
+                // The status the operator will see, from the table rather than from
+                // a second expression of it: only a forced end reaches `128 + N`, and
+                // a teardown failure below still outranks it.
+                ended.exit_status()
+            ));
+            let exit = after_session(teardown, ended, command).await;
+            delivery.settle();
+            exit?
+        }
+    };
+    if profile {
+        let line = format!("[profile] stop+remove: {:?}", t_stop.elapsed());
+        match ended {
+            SessionEnd::Guest(_) => notices.emit(line)?,
+            SessionEnd::Forced(_) => notices.emit_detached(line).settle(),
+        }
+    }
     Ok(exit)
 }
 
@@ -1968,29 +2014,9 @@ impl GuestStream {
     }
 }
 
-/// Write then flush one event's bytes, in exactly the legacy order (both are
-/// attempted even when the write fails). Never includes payload bytes in an
-/// error: the guest decides what the stream contains.
-async fn forward_stream_bytes(
-    sink: &mut (impl tokio::io::AsyncWrite + Unpin),
-    bytes: &[u8],
-    stream: GuestStream,
-    policy: OutputErrorPolicy,
-) -> Result<()> {
-    use tokio::io::AsyncWriteExt as _;
-    let written = sink.write_all(bytes).await;
-    let flushed = sink.flush().await;
-    if policy == OutputErrorPolicy::LegacyBestEffort {
-        return Ok(());
-    }
-    written.map_err(|error| anyhow::anyhow!("writing guest {} failed: {error}", stream.name()))?;
-    flushed.map_err(|error| anyhow::anyhow!("flushing guest {} failed: {error}", stream.name()))?;
-    Ok(())
-}
-
 /// One streamed exec's guest output. The two streams stay separate (they are
-/// different destinations, and `forward_stream_bytes` names which one failed),
-/// and `policy` decides whether a sink failure is the launcher's problem.
+/// different destinations, and `forward_pending` names which one failed), and
+/// `policy` decides whether a sink failure is the launcher's problem.
 struct ExecOutput<'a, O: tokio::io::AsyncWrite + Unpin, E: tokio::io::AsyncWrite + Unpin> {
     stdout: &'a mut O,
     stderr: &'a mut E,
@@ -2016,7 +2042,7 @@ enum StreamInput<R> {
 ///
 /// It **owns** the event handle, the pinned runtime wait future and — for a
 /// direct command — the host-input pump; it borrows the output sinks and
-/// returns the guest status or the primary failure.
+/// returns how the session ended ([`SessionEnd`]) or the primary failure.
 ///
 /// There is exactly **one** release sequence, and every exit uses it: input
 /// start-up failure, every loop break, and success all fall through to
@@ -2025,6 +2051,11 @@ enum StreamInput<R> {
 /// deadlock (#258); a pump still blocked in a guest write must be cancelled
 /// before the handle it writes through is released (#399). Nothing between
 /// taking ownership and that epilogue may `?`, `return` or tear down.
+///
+/// A **forced** end ([`SessionEnd::Forced`]) is `Ok`: the sandbox is torn down by
+/// the caller with the forced mode, next to the ordinary after-exit teardown, so
+/// the two paths cannot disagree about what "torn down" means. A failure here
+/// still owns its own teardown, exactly as before.
 async fn stream_exec_with_cleanup<
     T: ExecTeardown,
     H: ExecEventSource,
@@ -2038,15 +2069,17 @@ async fn stream_exec_with_cleanup<
     input: StreamInput<R>,
     output: ExecOutput<'_, O, E>,
     context: ExecContext<'_>,
-) -> Result<i32> {
+    supervision: &mut Supervision,
+) -> Result<SessionEnd> {
     use microsandbox::sandbox::exec::ExecEvent;
-    let ExecOutput {
-        stdout,
-        stderr,
-        policy,
-    } = output;
+    // Kept as one value: the loop's forwarding branch and the frame it advances
+    // both need the two sinks together with their policy.
+    let mut output = output;
+    // Taken once, before anything can forward: a cloneable control is what
+    // makes a signal send a held branch instead of a borrow of the session.
+    let control = handle.control();
     let mut pump: Option<InputPump> = None;
-    let stream_result: Result<i32> = match start_stream_input(&mut handle, input) {
+    let stream_result: Result<SessionEnd> = match start_stream_input(&mut handle, input) {
         // F8/F9: nothing is running and the sink (if any) is already dropped.
         // The error joins the same epilogue as every other outcome; a start-up
         // failure must not have a release order of its own.
@@ -2054,6 +2087,10 @@ async fn stream_exec_with_cleanup<
         Ok(started) => {
             pump = started;
             let mut pending_input_failure: Option<PendingInputFailure> = None;
+            // Held work, never awaited in the arm that accepted it. See
+            // [`InFlight`]: a write awaited in the loop body is what let a
+            // stopped consumer hide an interrupt and a lost runtime.
+            let mut in_flight = InFlight::default();
             loop {
                 // Every arm either continues or `break`s a value: never `?` out,
                 // because the wait future and handle must be dropped here.
@@ -2062,22 +2099,49 @@ async fn stream_exec_with_cleanup<
                     &mut pending_input_failure,
                     &mut handle,
                     &mut runtime_exit,
+                    supervision,
+                    &mut in_flight,
+                    &mut output,
                 )
                 .await
                 {
-                    LoopStep::Exec(ExecStep::Event(ExecEvent::Stdout(bytes))) => {
-                        if let Err(primary) =
-                            forward_stream_bytes(stdout, &bytes, GuestStream::Stdout, policy).await
-                        {
+                    // The sink took (or refused) the frame a previous step
+                    // accepted. The slot is cleared here rather than inside the
+                    // branch, so a cancelled poll keeps the same future instead
+                    // of losing the bytes it had already written.
+                    LoopStep::Forwarded(result) => {
+                        in_flight.frame = None;
+                        if let Err(primary) = result {
                             break Err(primary);
                         }
                     }
-                    LoopStep::Exec(ExecStep::Event(ExecEvent::Stderr(bytes))) => {
-                        if let Err(primary) =
-                            forward_stream_bytes(stderr, &bytes, GuestStream::Stderr, policy).await
-                        {
+                    LoopStep::Signalled(result) => {
+                        in_flight.signalling = None;
+                        if let Err(primary) = result {
                             break Err(primary);
                         }
+                    }
+                    LoopStep::Supervision(step) => match step {
+                        SupervisionStep::Forward(signal) => {
+                            in_flight.signalling = Some(signal_send(control.clone(), signal));
+                        }
+                        // No drain and no further forwarding: the loop ends and
+                        // the release sequence below cancels what is in flight.
+                        SupervisionStep::Force(forced) => {
+                            break Ok(SessionEnd::Forced(forced));
+                        }
+                        SupervisionStep::ReaderStopped => break Err(supervision_lost()),
+                    },
+                    // Accepted, not written: the write is the loop's first
+                    // branch, so the next steps keep observing everything while
+                    // the sink is slow.
+                    LoopStep::Exec(ExecStep::Event(ExecEvent::Stdout(bytes))) => {
+                        in_flight.frame =
+                            Some(PendingFrame::new(bytes.to_vec(), GuestStream::Stdout));
+                    }
+                    LoopStep::Exec(ExecStep::Event(ExecEvent::Stderr(bytes))) => {
+                        in_flight.frame =
+                            Some(PendingFrame::new(bytes.to_vec(), GuestStream::Stderr));
                     }
                     LoopStep::Exec(ExecStep::Event(ExecEvent::Exited { code })) => {
                         // A failure that has already happened outranks the
@@ -2086,7 +2150,7 @@ async fn stream_exec_with_cleanup<
                         // happened by now does not exist and is not waited for.
                         break match pending_input_failure.take() {
                             Some(pending) => Err(pending.failure.into_error()),
-                            None => Ok(code),
+                            None => Ok(SessionEnd::Guest(code)),
                         };
                     }
                     LoopStep::Exec(ExecStep::Event(ExecEvent::Failed(payload))) => {
@@ -2178,7 +2242,7 @@ async fn stream_exec_with_cleanup<
     drop(runtime_exit);
     drop(handle);
     match stream_result {
-        Ok(code) => Ok(code),
+        Ok(end) => Ok(end),
         Err(primary) => Err(finish_failed_exec(teardown, primary, context.log_dir).await),
     }
 }
@@ -2214,6 +2278,66 @@ fn start_stream_input<H: ExecEventSource, R: std::io::Read + Send + 'static>(
     Ok(Some(source.start(sink).map_err(anyhow::Error::new)?))
 }
 
+/// One guest-output frame on its way to the host sink.
+///
+/// The frame owns its bytes and its progress; the sink is borrowed only while the
+/// frame is polled. That is what lets the write be a `select!` branch: a future
+/// that *borrowed* the sink cannot be stored in a slot the loop keeps using — the
+/// borrow would have to cover the whole loop and would conflict with the next
+/// frame — and a write awaited in the loop body is exactly what hid interrupts,
+/// the grace deadline and a lost runtime behind a stopped consumer.
+struct PendingFrame {
+    bytes: Vec<u8>,
+    stream: GuestStream,
+    /// How much of `bytes` the sink has taken, so an interrupted poll resumes
+    /// instead of rewriting what was already written.
+    offset: usize,
+    /// What the sink has been asked to do, and with what result.
+    state: FrameState,
+}
+
+/// A frame's own progress through the sink.
+///
+/// One value rather than "a write result and a flush result", so a frame cannot be
+/// flushed without having been written and neither outcome has to be invented when
+/// it is missing: the pair is produced together, replayed together, and each is
+/// reported after both were attempted — which is what the legacy contract requires,
+/// because it reports the write's error only once the flush has also been tried.
+enum FrameState {
+    /// Neither the write nor the flush has been attempted.
+    Writing,
+    /// Both were attempted; their outcomes are kept so an interrupted poll replays
+    /// them instead of writing again.
+    Done {
+        written: std::io::Result<()>,
+        flushed: std::io::Result<()>,
+    },
+}
+
+impl PendingFrame {
+    fn new(bytes: Vec<u8>, stream: GuestStream) -> Self {
+        Self {
+            bytes,
+            stream,
+            offset: 0,
+            state: FrameState::Writing,
+        }
+    }
+}
+
+/// The sends a step accepted and a peer has not taken yet.
+///
+/// Both are polled as `select!` branches, never awaited in a branch body or in the
+/// loop body: a write awaited in the body suspends the whole loop. The pair is one
+/// value so the two slots cannot drift apart from the arms that poll them.
+#[derive(Default)]
+struct InFlight {
+    /// Guest output on its way to the host's stdout or stderr.
+    frame: Option<PendingFrame>,
+    /// A host signal on its way to the guest's process.
+    signalling: Option<PendingSend>,
+}
+
 /// One step of the streaming loop. [`next_loop_step`] produces it; the loop
 /// acts on it. Named so precedence can be tested directly (L6a).
 enum LoopStep {
@@ -2222,6 +2346,12 @@ enum LoopStep {
     /// The recorded transport failure's grace expired; carries the launcher
     /// error it reports.
     InputGraceExpired(anyhow::Error),
+    /// Guest output accepted earlier has been written and flushed.
+    Forwarded(Result<()>),
+    /// A forwarded host signal has been sent (or failed to be).
+    Signalled(Result<()>),
+    /// A host signal arrived, or the grace expired, with the decision taken.
+    Supervision(SupervisionStep),
 }
 
 /// A transport failure waiting, bounded, for the session's own terminal event.
@@ -2231,41 +2361,152 @@ struct PendingInputFailure {
     deadline: std::pin::Pin<Box<tokio::time::Sleep>>,
 }
 
-/// Race the input pump, an expired input-failure grace and the exec event
-/// stream, in that order.
+/// Race the work already in flight, the input pump, an expired input-failure
+/// grace, host-signal supervision and the exec event stream, in that order.
 ///
 /// The order **is** the precedence, and `biased;` makes it deterministic:
 ///
-/// 1. the pump ends at most once, so it cannot starve anything, and an input
+/// 1. work a previous step accepted comes first. A full or stalled peer delays
+///    these arms (they stay `Pending`) and never hides the ones below, which is
+///    the whole point of holding them: a write awaited in the loop body used to
+///    hide everything after it;
+/// 2. the pump ends at most once, so it cannot starve anything, and an input
 ///    failure that already happened must beat a ready `Exited` — stream loss is
 ///    never a guest success;
-/// 2. an expired grace for a recorded transport failure is deliberately ahead
+/// 3. an expired grace for a recorded transport failure is deliberately ahead
 ///    of ordinary event consumption: a continuously ready stdout stream must
 ///    not be able to hold the bounded failure return open forever (L7b). Before
 ///    expiry this arm is `Pending`, so it costs nothing — do not "optimise" it
 ///    back below the exec arm;
-/// 3. ordinary exec events last.
+/// 4. supervision, ahead of ordinary events for the same reason: a guest that
+///    never stops writing must not be able to starve an interrupt (#401);
+/// 5. ordinary exec events last.
 ///
 /// `next_exec_step` is cancel-safe enough to re-poll: `recv()` on the event
 /// channel is, `runtime_exit` is polled by reference, and a stream-end grace
 /// that gets interrupted simply restarts on the next turn (`recv()` keeps
 /// returning `None`).
-async fn next_loop_step(
+async fn next_loop_step<O, E>(
     pump: &mut Option<InputPump>,
     pending: &mut Option<PendingInputFailure>,
     handle: &mut impl ExecEventSource,
     runtime_exit: &mut RuntimeExit<'_>,
-) -> LoopStep {
+    supervision: &mut Supervision,
+    in_flight: &mut InFlight,
+    output: &mut ExecOutput<'_, O, E>,
+) -> LoopStep
+where
+    O: tokio::io::AsyncWrite + Unpin,
+    E: tokio::io::AsyncWrite + Unpin,
+{
     let pump_running = pump.as_ref().is_some_and(InputPump::is_running);
+    // The event stream is only drained while no output frame is in flight:
+    // accepting a second frame then would interleave two writes on one sink.
+    let accepting_events = in_flight.frame.is_none();
     tokio::select! {
         biased;
+        result = forward_pending(&mut in_flight.frame, output) => LoopStep::Forwarded(result),
+        result = awaiting_signal(&mut in_flight.signalling) => LoopStep::Signalled(result),
         end = pump_finished(pump), if pump_running => LoopStep::Input(end),
         failure = input_grace_expired(pending), if pending.is_some() => {
             LoopStep::InputGraceExpired(failure)
         }
-        step = next_exec_step(handle, runtime_exit, STREAM_END_RUNTIME_EXIT_GRACE) => {
+        step = supervision.next() => LoopStep::Supervision(step),
+        step = next_exec_step(
+            handle,
+            runtime_exit,
+            STREAM_END_RUNTIME_EXIT_GRACE,
+            accepting_events,
+        ) => {
             LoopStep::Exec(step)
         }
+    }
+}
+
+/// Advance the frame a previous step accepted. Pending when there is none, so the
+/// branch needs no gate and no `unreachable!`.
+///
+/// Cancel-safe by construction: the progress lives in the frame, not in this
+/// future, so an interrupted poll resumes at the same offset and re-attempts only
+/// the flush when the write was already complete. The residual is the sink's own:
+/// dropping a Tokio blocking-pool write cannot cancel the syscall it dispatched
+/// (documented in `main.rs`'s full-pipe control), so bytes the kernel has already
+/// taken are reported by the sink on the next poll rather than lost or duplicated.
+async fn forward_pending<O, E>(
+    frame: &mut Option<PendingFrame>,
+    output: &mut ExecOutput<'_, O, E>,
+) -> Result<()>
+where
+    O: tokio::io::AsyncWrite + Unpin,
+    E: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt as _;
+    let Some(pending) = frame.as_mut() else {
+        return std::future::pending().await;
+    };
+    let stream = pending.stream;
+    if let FrameState::Done { written, flushed } = &pending.state {
+        return report_frame(stream, output.policy, written, flushed);
+    }
+    let sink: &mut (dyn tokio::io::AsyncWrite + Unpin) = match stream {
+        GuestStream::Stdout => &mut *output.stdout,
+        GuestStream::Stderr => &mut *output.stderr,
+    };
+    let written = write_frame(pending, sink).await;
+    // Attempted whatever the write did, before either outcome is reported: the
+    // legacy contract reports the write's error only after trying both, and a
+    // direct launch's 125 must name the same failure it always did.
+    let flushed = sink.flush().await;
+    let reported = report_frame(stream, output.policy, &written, &flushed);
+    pending.state = FrameState::Done { written, flushed };
+    reported
+}
+
+/// The loop's result for a frame both the write and the flush were attempted for.
+///
+/// The legacy sink swallows both outcomes (a tool or shell launch keeps reporting the
+/// guest's own status); a direct launch checks both, because a lost stdout is a
+/// launcher failure there.
+fn report_frame(
+    stream: GuestStream,
+    policy: OutputErrorPolicy,
+    written: &std::io::Result<()>,
+    flushed: &std::io::Result<()>,
+) -> Result<()> {
+    if policy == OutputErrorPolicy::LegacyBestEffort {
+        return Ok(());
+    }
+    written
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!("writing guest {} failed: {error}", stream.name()))?;
+    flushed
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!("flushing guest {} failed: {error}", stream.name()))?;
+    Ok(())
+}
+
+/// Take everything the sink accepts, advancing the frame's offset after each
+/// reported count. `Ok(0)` is `WriteZero`, exactly as `write_all` treats it.
+async fn write_frame(
+    pending: &mut PendingFrame,
+    sink: &mut (dyn tokio::io::AsyncWrite + Unpin),
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+    while pending.offset < pending.bytes.len() {
+        match sink.write(&pending.bytes[pending.offset..]).await {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(count) => pending.offset += count,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// Poll the held signal send. Pending when the slot is empty.
+async fn awaiting_signal(signalling: &mut Option<PendingSend>) -> Result<()> {
+    match signalling {
+        Some(send) => send.as_mut().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -2292,53 +2533,6 @@ async fn input_grace_expired(pending: &mut Option<PendingInputFailure>) -> anyho
     }
 }
 
-/// The teardown operations the exec lifecycle performs.
-///
-/// A seam, not a new lifecycle: [`Sandbox`]'s adapter delegates to the current
-/// SDK calls and keeps their error display, so a test can drive the *production*
-/// failure schedule (stop/kill/reap/remove errors and timeouts) without a booted
-/// VM or a fake `msb`. Bounded timeouts stay in
-/// [`cleanup_exec_sandbox_failures`], the one owner of the order.
-pub(crate) trait ExecTeardown: Sync {
-    async fn stop_and_wait(&self) -> Result<()>;
-    async fn kill_with_timeout(&self, timeout: Duration) -> Result<()>;
-    async fn wait(&self) -> Result<()>;
-    async fn remove(&self) -> Result<()>;
-}
-
-impl ExecTeardown for Sandbox {
-    async fn stop_and_wait(&self) -> Result<()> {
-        Sandbox::stop_and_wait(self)
-            .await
-            .map(|_| ())
-            .map_err(anyhow::Error::new)
-    }
-    async fn kill_with_timeout(&self, timeout: Duration) -> Result<()> {
-        Sandbox::kill_with_timeout(self, timeout)
-            .await
-            .map_err(anyhow::Error::new)
-    }
-    async fn wait(&self) -> Result<()> {
-        Sandbox::wait(self)
-            .await
-            .map(|_| ())
-            .map_err(anyhow::Error::new)
-    }
-    async fn remove(&self) -> Result<()> {
-        Sandbox::remove(self.name())
-            .await
-            .map_err(anyhow::Error::new)
-    }
-}
-
-/// Bounded teardown deadlines for the exec lifecycle. Named and local: a wedged
-/// VMM must not hang the launcher, and a failed graceful stop must still reap
-/// and remove rather than leaking a hidden VM (#258).
-const EXEC_STOP_TIMEOUT: Duration = Duration::from_secs(10);
-const EXEC_KILL_TIMEOUT: Duration = Duration::from_secs(5);
-const EXEC_REAP_TIMEOUT: Duration = Duration::from_secs(5);
-const EXEC_REMOVE_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// The image-contract diagnostic for an SDK exec error whose cause is a failed
 /// spawn of the launch shell, or `None` when the failure is not the image's and
 /// the caller's contextual error applies (#258).
@@ -2362,66 +2556,6 @@ fn exec_failure_primary(contract: Option<String>, fallback: anyhow::Error) -> an
     }
 }
 
-/// Attempt every teardown step, collecting failures instead of swallowing them
-/// (CODING_STANDARDS: errors are returned, not logged and ignored). The
-/// graceful stop is tried first; only its failure escalates to a bounded
-/// kill+reap. The sandbox is removed either way, so a failed launch never
-/// leaves a hidden VM behind (#258).
-async fn cleanup_exec_sandbox_failures(teardown: &impl ExecTeardown) -> Vec<String> {
-    let mut failures: Vec<String> = Vec::new();
-    let stopped = match tokio::time::timeout(EXEC_STOP_TIMEOUT, teardown.stop_and_wait()).await {
-        Ok(Ok(_)) => true,
-        Ok(Err(error)) => {
-            failures.push(format!("stop: {error}"));
-            false
-        }
-        Err(_) => {
-            failures.push(format!("stop: timed out after {EXEC_STOP_TIMEOUT:?}"));
-            false
-        }
-    };
-    if !stopped {
-        // Cancelling the timed-out stop future released the child-handle lock
-        // before this kill/reap runs: the outer timeout on `kill_with_timeout`
-        // bounds the dispatch itself, not just the kill it performs.
-        match tokio::time::timeout(
-            EXEC_KILL_TIMEOUT,
-            teardown.kill_with_timeout(EXEC_KILL_TIMEOUT),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => failures.push(format!("kill: {error}")),
-            Err(_) => failures.push(format!("kill: timed out after {EXEC_KILL_TIMEOUT:?}")),
-        }
-        // Reap even if the kill failed, so no wedged process is left owned.
-        match tokio::time::timeout(EXEC_REAP_TIMEOUT, teardown.wait()).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => failures.push(format!("reap: {error}")),
-            Err(_) => failures.push(format!("reap: timed out after {EXEC_REAP_TIMEOUT:?}")),
-        }
-    }
-    match tokio::time::timeout(EXEC_REMOVE_TIMEOUT, teardown.remove()).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => failures.push(format!("remove: {error}")),
-        Err(_) => failures.push(format!("remove: timed out after {EXEC_REMOVE_TIMEOUT:?}")),
-    }
-    failures
-}
-
-/// [`cleanup_exec_sandbox_failures`] as a `Result`: `Ok` only when every
-/// teardown step succeeded, otherwise one error listing the failures in
-/// operation order. A successful forced cleanup never hides a failed graceful
-/// stop.
-async fn cleanup_exec_sandbox(teardown: &impl ExecTeardown) -> anyhow::Result<()> {
-    let failures = cleanup_exec_sandbox_failures(teardown).await;
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("{}", failures.join("; ")))
-    }
-}
-
 /// Apply the shared cleanup path after a **known** guest status: a teardown
 /// failure is still an error (never a silent success), and it names the command
 /// and the status the guest had already produced. Extracted so the cleanup
@@ -2433,6 +2567,49 @@ fn cleanup_after_exit(command: &str, exit: i32, cleanup: anyhow::Result<()>) -> 
             config::escape_str(command)
         ))
     })
+}
+
+/// Tear a session's sandbox down and report its status: the one owner of "after
+/// the session", so a launch and the subprocess cases that assert #401 run the
+/// same code rather than two descriptions of it.
+pub(crate) async fn after_session(
+    teardown: &impl ExecTeardown,
+    ended: SessionEnd,
+    command: &str,
+) -> Result<i32> {
+    match ended {
+        SessionEnd::Guest(exit) => {
+            let cleanup = cleanup_exec_sandbox(teardown).await;
+            cleanup_after_exit(command, exit, cleanup)?;
+            Ok(exit)
+        }
+        SessionEnd::Forced(forced) => forced_after_session(teardown, forced, command).await,
+    }
+}
+
+/// Tear a direct launch down after a **forced** shutdown, and report the status
+/// the shutdown earns.
+///
+/// `Ok(128 + N)` when every teardown step worked; an `Err` (reported as 125)
+/// when one genuinely failed, because a cleanup failure outranks the signal
+/// convention — and expected escalation is not itself a failure, which is what
+/// the forced mode's skipped stop is about.
+pub(crate) async fn forced_after_session(
+    teardown: &impl ExecTeardown,
+    forced: ForcedShutdown,
+    command: &str,
+) -> anyhow::Result<i32> {
+    let failures = cleanup_exec_sandbox_failures(teardown, TeardownMode::Forced).await;
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "the guest command `{}` was interrupted by signal {} (exit {}), but the sandbox could not be torn down: {}",
+            config::escape_str(command),
+            forced.signal().number(),
+            forced.exit_status(),
+            failures.join("; ")
+        );
+    }
+    Ok(forced.exit_status())
 }
 
 /// Render a failed launch's teardown outcome. The primary contract diagnostic
@@ -2458,7 +2635,7 @@ pub(crate) async fn finish_failed_exec(
     primary: anyhow::Error,
     log_dir: &str,
 ) -> anyhow::Error {
-    let failures = cleanup_exec_sandbox_failures(teardown).await;
+    let failures = cleanup_exec_sandbox_failures(teardown, TeardownMode::Ordinary).await;
     anyhow::anyhow!(
         "{}",
         failed_exec_message(&format!("{primary:#}"), &failures, log_dir)
@@ -2531,14 +2708,24 @@ trait ExecEventSource {
     /// The guest stdin sink: `ExecSink` in production.
     type Stdin: crate::direct_input::GuestStdin;
 
+    /// The channel a forwarded host signal is sent through. Production is
+    /// [`microsandbox::sandbox::exec::ExecControl`]; a stub provides its own, so
+    /// signal forwarding is a path a test can drive rather than one only a booted
+    /// sandbox reaches.
+    type Control: crate::host_signals::GuestControl;
+
     async fn recv(&mut self) -> Option<microsandbox::sandbox::exec::ExecEvent>;
 
     /// The sink, when the exec was started with `stdin_pipe()`. At most once.
     fn take_stdin(&mut self) -> Option<Self::Stdin>;
+
+    /// The control handle a forwarded host signal is sent on (#401).
+    fn control(&self) -> Self::Control;
 }
 
 impl ExecEventSource for microsandbox::sandbox::exec::ExecHandle {
     type Stdin = microsandbox::sandbox::exec::ExecSink;
+    type Control = microsandbox::sandbox::exec::ExecControl;
 
     async fn recv(&mut self) -> Option<microsandbox::sandbox::exec::ExecEvent> {
         microsandbox::sandbox::exec::ExecHandle::recv(self).await
@@ -2546,6 +2733,10 @@ impl ExecEventSource for microsandbox::sandbox::exec::ExecHandle {
 
     fn take_stdin(&mut self) -> Option<Self::Stdin> {
         microsandbox::sandbox::exec::ExecHandle::take_stdin(self)
+    }
+
+    fn control(&self) -> Self::Control {
+        microsandbox::sandbox::exec::ExecHandle::control(self)
     }
 }
 
@@ -2608,9 +2799,14 @@ async fn next_exec_step(
     events: &mut impl ExecEventSource,
     runtime_exit: &mut RuntimeExit<'_>,
     stream_end_grace: std::time::Duration,
+    accepting_events: bool,
 ) -> ExecStep {
     tokio::select! {
-        event = events.recv() => match event {
+        // Gated, not removed: while a guest frame is still on its way to the
+        // host, a second frame must not be accepted, but the runtime's own end
+        // stays observable — otherwise a stalled consumer would hide a dead VMM
+        // behind a write that can never finish.
+        event = events.recv(), if accepting_events => match event {
             Some(event) => ExecStep::Event(event),
             None => match tokio::time::timeout(stream_end_grace, &mut *runtime_exit).await {
                 Ok(result) => ExecStep::RuntimeExited(describe_runtime_exit(result)),
@@ -3273,15 +3469,78 @@ fn launch_mount_context(
     })
 }
 
+/// The production streaming lifecycle, opened for the subprocess cases in
+/// `main.rs`'s harness.
+///
+/// Those cases need a real signal, a real terminal and a real process boundary, so
+/// they cannot live in `run.rs`'s unit tests (an in-process handler collides with
+/// the test harness). This is the whole of the extra surface they need: the same
+/// wrapper, the real sinks, and a caller-supplied teardown and supervision.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// The end-of-launch composition `launch()` itself runs, with a caller-owned
+    /// notice sink.
+    ///
+    /// `launch()` cannot be driven from a subprocess case — it boots a VM — so the
+    /// cases drive this instead: it is the same call `launch()` makes between the
+    /// session and its status, including the order of a forced notice and its
+    /// teardown, which is what a stalled stderr makes observable.
+    pub(crate) async fn finish_launch_with<T: ExecTeardown, W: NoticeSink>(
+        sink: W,
+        teardown: &T,
+        ended: SessionEnd,
+        command: &str,
+        log_dir: &str,
+    ) -> Result<i32> {
+        let mut notices = LaunchNotices::new(sink);
+        finish_launch(&mut notices, teardown, ended, true, command, log_dir, false).await
+    }
+
+    /// Drive one streaming session to its end with the given supervision.
+    ///
+    /// stdin is forwarded, as a streaming direct launch forwards it: a case that
+    /// asserts a key never reached the guest as input needs the channel that could
+    /// have carried it.
+    pub(crate) async fn stream_session<T: ExecTeardown>(
+        teardown: &T,
+        handle: microsandbox::sandbox::exec::ExecHandle,
+        runtime_exit: RuntimeExit<'_>,
+        image: &str,
+        log_dir: &str,
+        supervision: &mut Supervision,
+    ) -> Result<SessionEnd> {
+        let mut stdout = tokio::io::stdout();
+        let mut stderr = tokio::io::stderr();
+        stream_exec_with_cleanup(
+            teardown,
+            handle,
+            runtime_exit,
+            StreamInput::Forward(InputSource::new(std::io::stdin())),
+            ExecOutput {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+                policy: OutputErrorPolicy::DirectChecked,
+            },
+            ExecContext { image, log_dir },
+            supervision,
+        )
+        .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::direct_input::test_support::{
         GatedGuestStdin, GatedReader, ReaderStep, Receipt, Receipts, SinkStep,
     };
+    use crate::teardown::EXEC_STOP_TIMEOUT;
     use crate::test_fixtures::write_executable;
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::time::Duration;
 
     #[test]
     fn raw_authority_home_selected() {
@@ -3704,35 +3963,55 @@ mod tests {
     /// code review finding F1).
     ///
     /// This split point is positional, not structural: if a future test
-    /// literal inside `mod tests` ever introduces its own column-0 `}`, the
+    /// literal inside a test block ever introduces its own column-0 `}`, the
     /// `\n}\n` search below would match that line instead, shrinking the
-    /// test module's computed span and leaving an in-test `eprintln!` in
-    /// the scanned "production" text. That fails *loudly* (the guard then
-    /// trips on the in-test call), not silently, so this fragility is safe
-    /// to leave undefended.
+    /// block's computed span and leaving an in-test `eprintln!` in the scanned
+    /// "production" text. That fails *loudly* (the guard then trips on the
+    /// in-test call), not silently, so this fragility is safe to leave
+    /// undefended.
+    ///
+    /// Every block is skipped, not just one. run.rs has two: `mod tests` and the
+    /// `test_support` module that opens the streaming lifecycle to the subprocess
+    /// harness in `main.rs` — a single assumed module stopped describing the file
+    /// (#401).
     #[test]
     fn notice_production_launch_path_uses_no_panicking_print_macros() {
-        let src = include_str!("run.rs");
-        let cfg_test_offset = src.find("#[cfg(test)]").expect("run.rs has a test module");
-        let after_cfg_test = &src[cfg_test_offset..];
-        let close_offset_in_after = after_cfg_test.find("\n}\n").expect("test module is closed");
-        // Byte offset of the `}` that closes `mod tests` (skip the leading
-        // '\n' of the "\n}\n" match).
-        let test_module_close_brace_offset = cfg_test_offset + close_offset_in_after + 1;
-        let tail_start_offset = cfg_test_offset + close_offset_in_after + "\n}\n".len();
-        let tail = &src[tail_start_offset..];
-        assert!(
-            !tail.contains("#[cfg(test)]"),
-            "this guard assumes a single test module in run.rs"
+        // The notice machinery lives in `launch_notice.rs`, so scanning only
+        // `run.rs` would keep checking the callers and silently stop covering
+        // the `emit` implementation itself (#401).
+        scan_production_source_for_print_macros("run.rs", include_str!("run.rs"), true);
+        scan_production_source_for_print_macros(
+            "launch_notice.rs",
+            include_str!("launch_notice.rs"),
+            false,
         );
+    }
 
+    /// Scan one production source for panicking print macros, skipping its
+    /// `#[cfg(test)]` blocks. `has_test_blocks` records whether the file is
+    /// expected to carry any, so a file that loses them cannot pass unnoticed.
+    fn scan_production_source_for_print_macros(file: &str, src: &str, has_test_blocks: bool) {
         fn line_number_at(src: &str, byte_offset: usize) -> usize {
             src[..byte_offset].matches('\n').count() + 1
         }
-        // The test module's span, in real 1-based line numbers: from
-        // `#[cfg(test)]` through the `}` that closes `mod tests`, inclusive.
-        let test_module_start_line = line_number_at(src, cfg_test_offset);
-        let test_module_end_line = line_number_at(src, test_module_close_brace_offset);
+        // Each test block's span, in real 1-based line numbers: from its
+        // `#[cfg(test)]` through the column-0 `}` that closes it, inclusive.
+        let mut skipped: Vec<(usize, usize)> = Vec::new();
+        let mut search = 0usize;
+        while let Some(offset) = src[search..].find("#[cfg(test)]") {
+            let start = search + offset;
+            let close = src[start..]
+                .find("\n}\n")
+                .expect("every test block is closed by a column-0 brace");
+            skipped.push((
+                line_number_at(src, start),
+                line_number_at(src, start + close + 1),
+            ));
+            search = start + close + "\n}\n".len();
+        }
+        if has_test_blocks {
+            assert!(!skipped.is_empty(), "{file} has test blocks");
+        }
 
         // "eprintln!(" contains "println!(" and "eprint!(" contains
         // "print!(" (but "eprintln!(" does not contain "print!("), so all
@@ -3740,7 +4019,10 @@ mod tests {
         // line matches more than one.
         for (idx, line) in src.lines().enumerate() {
             let line_no = idx + 1;
-            if line_no >= test_module_start_line && line_no <= test_module_end_line {
+            if skipped
+                .iter()
+                .any(|(start, end)| line_no >= *start && line_no <= *end)
+            {
                 continue;
             }
             let hit = if line.contains("eprintln!(") {
@@ -3756,7 +4038,7 @@ mod tests {
             };
             assert!(
                 hit.is_none(),
-                "production run.rs:{} uses {} — route it through LaunchNotices \
+                "production {file}:{} uses {} — route it through LaunchNotices \
                  instead (issue #70). line: {line:?}",
                 line_no,
                 hit.unwrap_or_default(),
@@ -3772,6 +4054,7 @@ mod tests {
 
     impl ExecEventSource for StubEvents {
         type Stdin = crate::direct_input::test_support::GatedGuestStdin;
+        type Control = RecordingControl;
 
         async fn recv(&mut self) -> Option<microsandbox::sandbox::exec::ExecEvent> {
             self.0.recv().await
@@ -3779,6 +4062,10 @@ mod tests {
 
         fn take_stdin(&mut self) -> Option<Self::Stdin> {
             None
+        }
+
+        fn control(&self) -> Self::Control {
+            RecordingControl::default()
         }
     }
 
@@ -3816,6 +4103,7 @@ mod tests {
             &mut events,
             &mut runtime_exit,
             std::time::Duration::from_millis(50),
+            true,
         )
         .await;
 
@@ -3843,6 +4131,7 @@ mod tests {
                 &mut events,
                 &mut runtime_exit,
                 std::time::Duration::from_millis(50),
+                true,
             ),
         )
         .await
@@ -3890,6 +4179,7 @@ mod tests {
                 &mut events,
                 &mut runtime_exit,
                 std::time::Duration::from_millis(500),
+                true,
             ),
         )
         .await
@@ -3925,6 +4215,7 @@ mod tests {
                 &mut events,
                 &mut runtime_exit,
                 std::time::Duration::from_millis(500),
+                true,
             ),
         )
         .await
@@ -3975,6 +4266,7 @@ mod tests {
                 &mut events,
                 &mut runtime_exit,
                 std::time::Duration::from_millis(10),
+                true,
             ),
         )
         .await;
@@ -3993,6 +4285,7 @@ mod tests {
             &mut events,
             &mut runtime_exit,
             std::time::Duration::from_millis(50),
+            true,
         )
         .await;
         assert!(matches!(step, ExecStep::Event(ExecEvent::Failed(_))));
@@ -5679,6 +5972,31 @@ options ndots:2 timeout:1";
 
     // ── The production stream/failed-exec lifecycle, with injected failures ──
 
+    /// The guest's signal transport, recorded. A stub source hands this out as its
+    /// [`ExecEventSource::Control`], so a test can drive a forwarded signal through
+    /// the production loop and observe what the guest was told. Ownership is shared
+    /// because the session takes the control by value, exactly as the SDK's
+    /// `ExecControl` is cloneable.
+    #[derive(Clone, Default)]
+    struct RecordingControl(std::sync::Arc<std::sync::Mutex<Vec<i32>>>);
+
+    impl RecordingControl {
+        /// What the guest has been sent, in order.
+        fn signals(&self) -> Vec<i32> {
+            self.0.lock().expect("the signal record").clone()
+        }
+    }
+
+    impl crate::host_signals::GuestControl for RecordingControl {
+        async fn forward(&self, signal: crate::host_signals::HostSignal) -> Result<()> {
+            self.0
+                .lock()
+                .expect("the signal record")
+                .push(signal.number());
+            Ok(())
+        }
+    }
+
     /// Exec events plus a drop receipt: teardown must not run while this is
     /// alive, because dropping it releases the child-handle mutex. It also owns
     /// the guest stdin sink, so the lifecycle (not the test) is what takes it.
@@ -5688,10 +6006,13 @@ options ndots:2 timeout:1";
         stdin_takes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
         drop_log: crate::direct_input::test_support::DropLog,
+        /// The transport a forwarded host signal is sent on.
+        signalled: RecordingControl,
     }
 
     impl ExecEventSource for TrackingEvents {
         type Stdin = crate::direct_input::test_support::GatedGuestStdin;
+        type Control = RecordingControl;
 
         async fn recv(&mut self) -> Option<microsandbox::sandbox::exec::ExecEvent> {
             self.events.recv().await
@@ -5701,6 +6022,10 @@ options ndots:2 timeout:1";
             self.stdin_takes
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.stdin.take()
+        }
+
+        fn control(&self) -> Self::Control {
+            self.signalled.clone()
         }
     }
 
@@ -5722,6 +6047,9 @@ options ndots:2 timeout:1";
         flushes: usize,
         write_steps: Vec<Result<usize, std::io::ErrorKind>>,
         flush_error: Option<std::io::ErrorKind>,
+        /// The consumer has stopped reading: every write stays pending, the way a
+        /// full pipe with nobody draining it does.
+        blocked: bool,
     }
 
     impl StubSink {
@@ -5741,6 +6069,9 @@ options ndots:2 timeout:1";
             _context: &mut std::task::Context<'_>,
             buffer: &[u8],
         ) -> std::task::Poll<std::io::Result<usize>> {
+            if self.blocked {
+                return std::task::Poll::Pending;
+            }
             let step = if self.write_steps.is_empty() {
                 Ok(buffer.len())
             } else {
@@ -5981,7 +6312,17 @@ options ndots:2 timeout:1";
         sinks: StreamSinks<'_>,
         policy: OutputErrorPolicy,
     ) -> Result<i32> {
-        run_stream_with_receipt(teardown, events, sinks, policy, StreamReceipts::none()).await
+        let mut supervision = Supervision::legacy();
+        run_stream_full(
+            teardown,
+            events,
+            sinks,
+            policy,
+            StreamReceipts::none(),
+            &mut supervision,
+            RecordingControl::default(),
+        )
+        .await
     }
 
     /// [`run_stream`] with caller-owned drop receipts for the event handle and
@@ -5993,6 +6334,30 @@ options ndots:2 timeout:1";
         sinks: StreamSinks<'_>,
         policy: OutputErrorPolicy,
         receipts: StreamReceipts,
+    ) -> Result<i32> {
+        let mut supervision = Supervision::legacy();
+        run_stream_full(
+            teardown,
+            events,
+            sinks,
+            policy,
+            receipts,
+            &mut supervision,
+            RecordingControl::default(),
+        )
+        .await
+    }
+
+    /// The whole production wrapper with every seam a test drives: the event
+    /// handle's control transport and the session's supervision.
+    async fn run_stream_full(
+        teardown: &StubTeardown,
+        events: Vec<microsandbox::sandbox::exec::ExecEvent>,
+        sinks: StreamSinks<'_>,
+        policy: OutputErrorPolicy,
+        receipts: StreamReceipts,
+        supervision: &mut Supervision,
+        signalled: RecordingControl,
     ) -> Result<i32> {
         let (sender, receiver) = tokio::sync::mpsc::channel(events.len().max(1) + 1);
         for event in events {
@@ -6007,12 +6372,16 @@ options ndots:2 timeout:1";
                 .handle
                 .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))),
             drop_log: teardown.drop_log(),
+            signalled,
         };
         let runtime_exit: RuntimeExit<'_> = match receipts.runtime {
             Some(dropped) => Box::pin(PendingRuntimeExit { dropped }),
             None => runtime_never_exits(),
         };
         let StreamSinks { stdout, stderr } = sinks;
+        // These tests assert the *status* a session reports. A forced end
+        // reports `128 + N` through the same accessor, and the subprocess
+        // harness in `main.rs` is what asserts the forced end itself.
         stream_exec_with_cleanup(
             teardown,
             handle,
@@ -6024,8 +6393,10 @@ options ndots:2 timeout:1";
                 policy,
             },
             stub_context(),
+            supervision,
         )
         .await
+        .map(SessionEnd::exit_status)
     }
 
     /// A real `ExitStatus` for a fake runtime exit; the SDK type has no public
@@ -6258,6 +6629,7 @@ options ndots:2 timeout:1";
             stdin_takes: std::sync::Arc::clone(&stdin_takes),
             dropped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             drop_log: teardown.drop_log(),
+            signalled: RecordingControl::default(),
         };
         let runtime_exit: RuntimeExit<'_> = Box::pin(ControlledRuntimeExit {
             receiver: Some(runtime_receiver),
@@ -6279,14 +6651,22 @@ options ndots:2 timeout:1";
             stdin_takes,
             runtime_polled,
         };
-        let lifecycle = stream_exec_with_cleanup(
-            teardown,
-            handle,
-            runtime_exit,
-            input,
-            output,
-            stub_context(),
-        );
+        // No handlers and no arrivals: these tests drive the loop through its
+        // events, input and sink steps. Supervision arrives in its own harness.
+        let lifecycle = async move {
+            let mut supervision = Supervision::legacy();
+            stream_exec_with_cleanup(
+                teardown,
+                handle,
+                runtime_exit,
+                input,
+                output,
+                stub_context(),
+                &mut supervision,
+            )
+            .await
+            .map(SessionEnd::exit_status)
+        };
         (controls, lifecycle)
     }
 
@@ -6527,6 +6907,97 @@ options ndots:2 timeout:1";
         assert!(error.contains("guest command `probe` exited 0"), "{error}");
         assert!(error.contains("stop: stop went wrong"), "{error}");
         assert_eq!(failing.log(), ["stop", "kill", "reap", "remove"]);
+    }
+
+    /// The forced mode is the same owner with the graceful stop skipped: a
+    /// guest the launcher has already decided to kill must not get
+    /// `EXEC_STOP_TIMEOUT` worth of asking, and that skipped stop must not be
+    /// recorded as a cleanup failure the shutdown caused itself.
+    #[tokio::test]
+    async fn a_forced_teardown_kills_reaps_and_removes_without_a_graceful_stop() {
+        let teardown = StubTeardown::new();
+        let failures = cleanup_exec_sandbox_failures(&teardown, TeardownMode::Forced).await;
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(teardown.log(), ["kill", "reap", "remove"]);
+
+        // The ordinary path is unchanged, and its failed stop is still recorded:
+        // that is a genuine failure a later successful kill must not erase.
+        let ordinary = StubTeardown::failing("stop", "stop went wrong");
+        let failures = cleanup_exec_sandbox_failures(&ordinary, TeardownMode::Ordinary).await;
+        assert_eq!(failures, ["stop: stop went wrong".to_string()]);
+        assert_eq!(ordinary.log(), ["stop", "kill", "reap", "remove"]);
+    }
+
+    fn forced(signal: i32) -> crate::host_signals::ForcedShutdown {
+        crate::host_signals::ForcedShutdown::for_test(crate::host_signals::HostSignal::for_test(
+            signal,
+        ))
+    }
+
+    /// A forwarded host signal reaches the guest through the **production** loop,
+    /// driven by a stub control rather than by a booted sandbox.
+    ///
+    /// The stub is the point: the transport used to be an `Option` whose only `None`
+    /// was a test stub, so forwarding through the streaming loop was a path no test
+    /// could take. The guest still ends with its own status, which is the row the
+    /// status table keeps for a handled signal.
+    #[tokio::test]
+    async fn a_forwarded_host_signal_reaches_the_guest_through_the_streaming_loop() {
+        use microsandbox::sandbox::exec::ExecEvent;
+        let teardown = StubTeardown::new();
+        let mut stdout = StubSink::default();
+        let mut stderr = StubSink::default();
+        let signalled = RecordingControl::default();
+        let (arrivals, arrival_queue) = tokio::sync::mpsc::unbounded_channel();
+        arrivals
+            .send(crate::host_signals::HostSignal::for_test(libc::SIGINT))
+            .expect("queue the arrival");
+        let mut supervision =
+            Supervision::for_test(arrival_queue, std::time::Duration::from_secs(30));
+        let exit = run_stream_full(
+            &teardown,
+            vec![ExecEvent::Exited { code: 42 }],
+            StreamSinks {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+            },
+            OutputErrorPolicy::DirectChecked,
+            StreamReceipts::none(),
+            &mut supervision,
+            signalled.clone(),
+        )
+        .await
+        .expect("a handled signal leaves the guest's own status");
+        assert_eq!(exit, 42, "the guest's own status is reported, not 130");
+        assert_eq!(
+            signalled.signals(),
+            [libc::SIGINT],
+            "the guest must have been told, once, with the signal's own number"
+        );
+    }
+
+    /// `128 + N` when the teardown worked, `125` (an `Err`) when it genuinely
+    /// failed — a cleanup failure outranks the signal convention, and an
+    /// *expected* escalation never counts as one.
+    #[tokio::test]
+    async fn a_forced_shutdown_reports_its_signal_unless_the_teardown_failed() {
+        let teardown = StubTeardown::new();
+        let exit = forced_after_session(&teardown, forced(libc::SIGTERM), "probe")
+            .await
+            .expect("a clean forced teardown is a status, not a failure");
+        assert_eq!(exit, 143);
+        assert_eq!(teardown.log(), ["kill", "reap", "remove"]);
+
+        let failing = StubTeardown::failing("kill", "kill failed");
+        let error = forced_after_session(&failing, forced(libc::SIGINT), "probe")
+            .await
+            .expect_err("a genuine teardown failure is 125");
+        let text = format!("{error:#}");
+        assert!(text.contains("interrupted by signal 2"), "{text}");
+        assert!(text.contains("exit 130"), "{text}");
+        assert!(text.contains("kill: kill failed"), "{text}");
+        // The failure names what failed and still removed the sandbox.
+        assert_eq!(failing.log(), ["kill", "reap", "remove"]);
     }
 
     #[tokio::test]
@@ -7064,7 +7535,7 @@ options ndots:2 timeout:1";
         let mut pump = Some(pump);
         let mut pending = None;
 
-        let first = next_loop_step(&mut pump, &mut pending, &mut events, &mut runtime_exit).await;
+        let first = test_step(&mut pump, &mut pending, &mut events, &mut runtime_exit).await;
         match first {
             LoopStep::Input(Err(InputFailure::Transport(_))) => {}
             other => panic!(
@@ -7073,11 +7544,14 @@ options ndots:2 timeout:1";
                     LoopStep::Exec(step) => format!("Exec({step:?})"),
                     LoopStep::Input(_) => "Input(non-transport)".to_string(),
                     LoopStep::InputGraceExpired(_) => "InputGraceExpired".to_string(),
+                    LoopStep::Forwarded(_) => "Forwarded".to_string(),
+                    LoopStep::Signalled(_) => "Signalled".to_string(),
+                    LoopStep::Supervision(_) => "Supervision".to_string(),
                 }
             ),
         }
         // The event was still there, which is what makes the precedence real.
-        let second = next_loop_step(&mut pump, &mut pending, &mut events, &mut runtime_exit).await;
+        let second = test_step(&mut pump, &mut pending, &mut events, &mut runtime_exit).await;
         assert!(matches!(
             second,
             LoopStep::Exec(ExecStep::Event(
@@ -7085,6 +7559,53 @@ options ndots:2 timeout:1";
             ))
         ));
         release_reader(&mut receipts, reader_steps).await;
+    }
+
+    /// Review B3's regression, at the loop's own seam: while the host has stopped
+    /// reading guest output, the write used to be awaited in the loop body, which
+    /// suspended everything else — the runtime's own end included. The frame is a
+    /// held branch now, so a stalled consumer costs the session nothing but the
+    /// output it cannot deliver.
+    ///
+    /// A write awaited in the loop body instead of polled as a branch suspends
+    /// the session here until the harness deadline: that is the defect this case
+    /// exists for, and the reason the frame is a branch.
+    #[tokio::test]
+    async fn a_blocked_host_sink_cannot_hide_a_lost_runtime() {
+        use microsandbox::sandbox::exec::ExecEvent;
+        let teardown = StubTeardown::new();
+        let mut stdout = StubSink {
+            blocked: true,
+            ..StubSink::default()
+        };
+        let mut stderr = StubSink::default();
+        let (_receipts_sender, receipts) = crate::direct_input::test_support::Receipts::channel();
+        let (mut live, lifecycle) = live_stream(
+            &teardown,
+            StreamSinks {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+            },
+            OutputErrorPolicy::DirectChecked,
+            StreamInput::<std::io::Empty>::NotForwarded,
+            None,
+            receipts,
+        );
+        let driver = async {
+            live.send(ExecEvent::Stdout(b"stuck".to_vec().into())).await;
+            // The sink never accepts a byte, so the frame is still in flight.
+            live.runtime_exit(9);
+        };
+        let (outcome, ()) = join_bounded("blocked-sink", lifecycle, driver).await;
+        let message = format!("{:#}", outcome.unwrap_err());
+        assert!(
+            message.contains("sandbox process exited unexpectedly"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("writing guest stdout failed"),
+            "a blocked sink is not a sink failure: {message}"
+        );
     }
 
     #[tokio::test]
@@ -7154,6 +7675,7 @@ options ndots:2 timeout:1";
 
     impl ExecEventSource for AlwaysReadyEvents {
         type Stdin = GatedGuestStdin;
+        type Control = RecordingControl;
 
         async fn recv(&mut self) -> Option<microsandbox::sandbox::exec::ExecEvent> {
             assert!(self.remaining > 0, "the test's event budget is exhausted");
@@ -7166,6 +7688,41 @@ options ndots:2 timeout:1";
         fn take_stdin(&mut self) -> Option<Self::Stdin> {
             None
         }
+
+        fn control(&self) -> Self::Control {
+            RecordingControl::default()
+        }
+    }
+
+    /// One `next_loop_step` with an idle session's supervision and output state:
+    /// no handlers installed, no frame in flight. What these ordering tests
+    /// assert is the arm order between the pump, the input grace and the event
+    /// stream, and an idle session is exactly the state they describe.
+    async fn test_step(
+        pump: &mut Option<InputPump>,
+        pending: &mut Option<PendingInputFailure>,
+        handle: &mut impl ExecEventSource,
+        runtime_exit: &mut RuntimeExit<'_>,
+    ) -> LoopStep {
+        let mut supervision = Supervision::legacy();
+        let mut in_flight = InFlight::default();
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut output = ExecOutput {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+            policy: OutputErrorPolicy::LegacyBestEffort,
+        };
+        next_loop_step(
+            pump,
+            pending,
+            handle,
+            runtime_exit,
+            &mut supervision,
+            &mut in_flight,
+            &mut output,
+        )
+        .await
     }
 
     /// The regression for the arm order (review R2-B2): once the transport
@@ -7200,11 +7757,11 @@ options ndots:2 timeout:1";
         let mut events = AlwaysReadyEvents { remaining: 10_000 };
         let mut runtime_exit = runtime_never_exits();
 
-        let failure =
-            match next_loop_step(&mut pump, &mut pending, &mut events, &mut runtime_exit).await {
-                LoopStep::Input(Err(failure)) => failure,
-                _ => panic!("the pump outcome must win over a ready event"),
-            };
+        let failure = match test_step(&mut pump, &mut pending, &mut events, &mut runtime_exit).await
+        {
+            LoopStep::Input(Err(failure)) => failure,
+            _ => panic!("the pump outcome must win over a ready event"),
+        };
         assert!(failure.awaits_session_end(), "a transport failure waits");
         // The loop's own arm, mirrored here: a transport failure arms the
         // bounded grace and keeps looping.
@@ -7216,7 +7773,7 @@ options ndots:2 timeout:1";
         tokio::time::pause();
         tokio::time::advance(STREAM_END_RUNTIME_EXIT_GRACE * 2).await;
         let remaining_before = events.remaining;
-        let step = next_loop_step(&mut pump, &mut pending, &mut events, &mut runtime_exit).await;
+        let step = test_step(&mut pump, &mut pending, &mut events, &mut runtime_exit).await;
         let consumed = remaining_before - events.remaining;
         match step {
             LoopStep::InputGraceExpired(error) => {
@@ -7229,6 +7786,9 @@ options ndots:2 timeout:1";
                 panic!("drained a ready exec event instead of returning at the expired grace")
             }
             LoopStep::Input(_) => panic!("the pump already reported its outcome"),
+            LoopStep::Forwarded(_) | LoopStep::Signalled(_) | LoopStep::Supervision(_) => {
+                panic!("nothing is in flight and no signal is installed")
+            }
         }
         assert_eq!(consumed, 0, "no exec event may be consumed after expiry");
         // Real time again for the helper thread: a paused clock makes the

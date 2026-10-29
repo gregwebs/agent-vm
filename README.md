@@ -88,8 +88,9 @@ agent-vm --allow-internet-egress claude
 
 Run a guest executable directly — no catalog entry, defaults, environment or
 credential provisioning. Piped stdin is forwarded to the program and host EOF
-closes it; `-t`/`-T` choose a PTY or streaming I/O explicitly (signal forwarding
-is still tracked in #401):
+closes it; `-t`/`-T` choose a PTY or streaming I/O explicitly, and a host
+`SIGINT`/`SIGTERM` is forwarded with a five-second grace before the launcher
+stops waiting:
 
 ```sh
 agent-vm run make test

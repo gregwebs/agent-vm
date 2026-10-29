@@ -19,6 +19,7 @@ success, and every invocation is bounded.
 from __future__ import annotations
 
 import errno
+import fnmatch
 import json
 import os
 import subprocess
@@ -267,6 +268,58 @@ def inventory_controls(results: list) -> None:
         "inventory/both command boundaries stay distinct",
         boundaries == {"run": "run", "separator": "--"},
         f"boundaries={boundaries}",
+    )
+
+    # The #467 split. Every signal-death case has two twins over the *same* guest
+    # run: the pending acceptance row that keeps 128 + N, and the slice-1 row that
+    # proves the runtime's unknown status is passed through and is not 128 + N.
+    # Relaxing either one - the pending row to 255, or `signal_convention` to equal
+    # `expect` - leaves a native row that looks green and proves nothing, so the
+    # weakening is refused here, boot-free.
+    unhandled = {
+        name: spec
+        for name, spec in driver.SIGNAL_CASES.items()
+        if name.endswith("-unhandled")
+    }
+    check(
+        "inventory/the signal-death split covers every mode and signal",
+        len(unhandled) == len(driver.SIGNAL_MODES) * len(driver.SIGNAL_NAMES),
+        f"unhandled cases={sorted(unhandled)}",
+    )
+    for name, spec in sorted(unhandled.items()):
+        convention = 128 + int(spec["first"])
+        slice1 = driver.SIGNAL_CASES.get(f"{name}-slice1", {})
+        ok = (
+            spec["expect"] == convention
+            and slice1.get("expect") == driver.PASSED_THROUGH_EXIT
+            and slice1.get("signal_convention") == convention
+            and slice1.get("signal_convention") != slice1.get("expect")
+            and slice1.get("signals") == spec["signals"]
+            and slice1.get("probe") == spec["probe"]
+            and slice1.get("options") == spec["options"]
+            and slice1.get("assignment") == spec["assignment"]
+        )
+        check(
+            f"inventory/{name} keeps {convention} while its slice-1 twin excludes it",
+            ok,
+            f"unhandled={spec} slice1={slice1}",
+        )
+
+    # Which cases the harness skips as pending is one bash glob in e2e.sh over
+    # this inventory. A name that stopped matching it would run a red row in CI;
+    # one that started matching it would hide a case that can pass today, so the
+    # boundary itself is pinned rather than either file alone.
+    pending_arm = "  signal-*-unhandled)"
+    pending_pattern = "signal-*-unhandled"
+    mismatched = [
+        name
+        for name in driver.SIGNAL_CASES
+        if fnmatch.fnmatchcase(name, pending_pattern) != name.endswith("-unhandled")
+    ]
+    check(
+        "inventory/the harness's pending glob selects exactly the signal-death rows",
+        pending_arm in (HERE.parent / "e2e.sh").read_text() and not mismatched,
+        f"mismatched={mismatched}",
     )
 
 
