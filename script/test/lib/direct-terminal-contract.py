@@ -284,7 +284,9 @@ def main() -> int:
             case="identity-auto", standin_mode="ok")
     control(results, "accept/raw input A 1d B reaches the guest, code 7", True,
             case="input", standin_mode="ok")
-    control(results, "accept/resize 24x80 then 43x119, code 7", True,
+    # The stand-in's guest inherits the driver's own terminal, so the sizes here
+    # are the driver's shared geometry rather than a launcher constant.
+    control(results, "accept/resize the host geometry then 43x119, code 7", True,
             case="resize", standin_mode="ok")
     control(results, "accept/streamed terminal stdin, exact bytes and code 23", True,
             case="stream-input-no-tty", standin_mode="ok")

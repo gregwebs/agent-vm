@@ -14,6 +14,7 @@ mod credential_yaml;
 mod debug_config;
 mod defaults;
 mod direct_input;
+mod direct_pty;
 mod direct_terminal;
 mod dns_name;
 mod doctor;
@@ -385,7 +386,7 @@ mod tests {
     /// Turns this test binary into a one-shot case child (see `full_pipe_parent`).
     const FULL_PIPE_DIR: &str = "AGENT_VM_FULL_PIPE_DIR";
     const FULL_PIPE_CASE: &str = "AGENT_VM_FULL_PIPE_CASE";
-    const FULL_PIPE_CHILD: &str = "tests::checked_output_full_pipe_child";
+    const FULL_PIPE_CHILD: &str = "tests::direct_pty_session_child";
 
     /// The child's deadline for the parent's own barrier, and the parent's
     /// deadline after injecting the fault. Both are fixed so a hang fails.
@@ -406,14 +407,69 @@ mod tests {
     /// session must wait for capacity repeatedly and lose nothing.
     const SLOW_CONSUMER_BYTES: usize = 9 * 1024 * 1024;
 
+    /// The over-bound fault's output. One protocol frame is capped at 4 MiB, so a
+    /// *stream* is the only way to exceed the session's 8 MiB pending bound; this
+    /// is twice the bound, which leaves room for the pipe, the relay's own duplex
+    /// and the frame in flight and still parks the session on capacity.
+    const OVER_BOUND_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+
+    /// How long the over-bound fault waits after the whole stream is in the
+    /// launcher before injecting it.
+    ///
+    /// Nothing outside the session can observe its own queue fill: the SDK's
+    /// event mapper forwards into an unbounded channel, so the relay's writes
+    /// complete however far behind the session is. What is provable is that the
+    /// guest produced twice the bound and that the pipe is blocked; the session
+    /// then needs only to copy a few MiB into its queue, which is orders of
+    /// magnitude faster than this window. Re-running this case against the
+    /// previous commit is what checks the race was won: a build that observed the
+    /// runtime while *not* parked would pass there too, and one that cannot see it
+    /// while parked hangs.
+    const OVER_BOUND_SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// How long the `exit-wins` case waits between delivering the guest's exit
+    /// and releasing the runtime's own end.
+    ///
+    /// Both orderings are post-exit — the runtime is ready either as the barrier
+    /// begins or while it is parked on a flush that can never finish — but the
+    /// reverse order is not: the session polls its runtime arm on a timer, so a
+    /// runtime released in the same instant as the exit could be observed first
+    /// and end the loop legitimately as a pre-exit runtime loss (125). A bounded
+    /// settle makes the case the one it names on every platform, at the cost of a
+    /// quarter second.
+    const EXIT_WINS_SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum FullPipeCase {
         /// The relay disappears without an exit event; the runtime stays alive.
         RelayLoss,
-        /// The owned fake runtime is killed while the relay stays open.
+        /// The owned fake runtime is killed while the relay stays open, with the
+        /// guest's output under the pending bound.
         RuntimeLoss,
+        /// The same, but with the guest's output **over** the pending bound: the
+        /// session is parked on writer capacity, not merely waiting for the next
+        /// event, so this is the case that can hide a lost runtime.
+        RuntimeLossOverBound,
         /// A slow consumer: output well past the bound, then a definitive exit.
         HealthySlowConsumer,
+        /// The geometry path: what the exec request asks for, then what the
+        /// session sends from `TIOCGWINSZ`, then a `SIGWINCH` resize.
+        Resize,
+        /// A definitive guest exit arrives while a runtime observation is ready or
+        /// about to be: the exit must win, and the status must survive a final
+        /// flush that can never complete.
+        ExitWins,
+        /// The runtime wait itself returns an error.
+        RuntimeWaitError,
+        /// The guest never started.
+        ExecFailed,
+        /// The guest closed its stdin, reported as `EPIPE` by name only.
+        StdinErrorGuestClosed,
+        /// A genuine stdin forwarding failure.
+        StdinErrorOther,
+        /// The host stops accepting guest output: the writer's own `io::Error`
+        /// has to surface, not a generic "stopped accepting output".
+        OutputFailure,
     }
 
     impl FullPipeCase {
@@ -421,7 +477,15 @@ mod tests {
             match self {
                 Self::RelayLoss => "relay-loss",
                 Self::RuntimeLoss => "runtime-loss",
+                Self::RuntimeLossOverBound => "runtime-loss-over-bound",
                 Self::HealthySlowConsumer => "healthy",
+                Self::Resize => "resize",
+                Self::ExitWins => "exit-wins",
+                Self::RuntimeWaitError => "runtime-wait-error",
+                Self::ExecFailed => "exec-failed",
+                Self::StdinErrorGuestClosed => "stdin-epipe",
+                Self::StdinErrorOther => "stdin-error",
+                Self::OutputFailure => "output-failure",
             }
         }
 
@@ -429,13 +493,26 @@ mod tests {
             [
                 Self::RelayLoss,
                 Self::RuntimeLoss,
+                Self::RuntimeLossOverBound,
                 Self::HealthySlowConsumer,
+                Self::Resize,
+                Self::ExitWins,
+                Self::RuntimeWaitError,
+                Self::ExecFailed,
+                Self::StdinErrorGuestClosed,
+                Self::StdinErrorOther,
+                Self::OutputFailure,
             ]
             .into_iter()
             .find(|case| case.name() == name)
             .unwrap_or_else(|| panic!("unknown full-pipe case {name}"))
         }
     }
+
+    /// The geometry this fixture gives its terminal: deliberately **not** the
+    /// SDK's 24x80, so a session that forwards a constant cannot pass.
+    const FIXTURE_INITIAL_SIZE: (u16, u16) = (37, 111);
+    const FIXTURE_RESIZED_SIZE: (u16, u16) = (52, 143);
 
     fn full_pipe_receipt(dir: &std::path::Path) -> std::path::PathBuf {
         dir.join("child.receipt")
@@ -648,10 +725,23 @@ mod tests {
         let frame = Message::with_payload(MessageType::Ready, 0, &ready).unwrap();
         codec::write_message(&mut io, &frame).await.unwrap();
 
-        let request = codec::read_raw_frame(&mut io)
+        let request = codec::read_message(&mut io)
             .await
             .expect("the exec request");
         let id = request.id;
+        if case == FullPipeCase::Resize {
+            // What the SDK asked for, recorded before the session compensates:
+            // `exec_stream` always creates the PTY at 24x80.
+            let geometry = request
+                .payload::<microsandbox::protocol::exec::ExecRequest>()
+                .expect("the exec request payload");
+            append_receipt(
+                &full_pipe_receipt(&dir),
+                &[format!("request={}x{}", geometry.rows, geometry.cols)],
+            );
+            relay_resizes(&mut io, &dir, id).await;
+            return;
+        }
 
         // The parent proves raw mode before releasing the payload.
         wait_for_file(&dir, "go").await;
@@ -671,6 +761,160 @@ mod tests {
                     .expect("relay write");
                     offset += len;
                 }
+                codec::write_message(
+                    &mut io,
+                    &Message::with_payload(MessageType::ExecExited, id, &ExecExited { code: 7 })
+                        .unwrap(),
+                )
+                .await
+                .expect("relay write");
+            }
+            FullPipeCase::Resize => unreachable!("handled above"),
+            // Guest output over the session's pending bound: the only way to
+            // reach the capacity wait that once hid a lost runtime. The relay
+            // cannot observe that wait itself — the SDK's event mapper forwards
+            // into an **unbounded** channel, so the relay's writes keep completing
+            // however far behind the session's own bounded queue falls. What the
+            // receipt proves is that the whole stream is in the launcher, which
+            // together with the stalled pipe leaves the session with nothing to
+            // do but wait for capacity.
+            FullPipeCase::RuntimeLossOverBound => {
+                let payload: Vec<u8> = (0..FULL_PIPE_FRAME_BYTES).map(pattern_at).collect();
+                let mut written = 0usize;
+                while written < OVER_BOUND_OUTPUT_BYTES {
+                    codec::write_message(
+                        &mut io,
+                        &Message::with_payload(
+                            MessageType::ExecStdout,
+                            id,
+                            &ExecStdout {
+                                data: payload.clone(),
+                            },
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .expect("relay write");
+                    written += FULL_PIPE_FRAME_BYTES;
+                }
+                append_receipt(&full_pipe_receipt(&dir), &["relay=stream-sent".to_string()]);
+                // Stay open: the runtime's own death is the fault under test.
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+            // The guest's exit is delivered *before* the runtime wait can resolve,
+            // so a definitive exit beats a ready runtime observation. The output
+            // is queued first, behind a consumer that never reads (the parent
+            // proves the pipe is full before it releases the exit), so the final
+            // flush cannot complete on any platform: the arrival order of the exit
+            // and the runtime's end stays a race, the *outcome* does not.
+            FullPipeCase::ExitWins => {
+                let payload: Vec<u8> = (0..FULL_PIPE_FRAME_BYTES).map(pattern_at).collect();
+                codec::write_message(
+                    &mut io,
+                    &Message::with_payload(
+                        MessageType::ExecStdout,
+                        id,
+                        &ExecStdout { data: payload },
+                    )
+                    .unwrap(),
+                )
+                .await
+                .expect("relay write");
+                // The exit exists only once the writer is provably parked.
+                wait_for_file(&dir, "fault").await;
+                codec::write_message(
+                    &mut io,
+                    &Message::with_payload(MessageType::ExecExited, id, &ExecExited { code: 7 })
+                        .unwrap(),
+                )
+                .await
+                .expect("relay write");
+                // Only now may the runtime's own end become observable, and only
+                // after a settle: the session polls its runtime arm on a timer, so
+                // releasing it in the same instant as the exit could be seen
+                // *before* the exit arrives, which is the legitimate pre-exit
+                // runtime loss (125) rather than the case under test.
+                tokio::time::sleep(EXIT_WINS_SETTLE).await;
+                std::fs::write(dir.join("runtime-gone"), b"gone")
+                    .expect("release the runtime wait");
+                // Hold the connection open: the session must complete on the
+                // exit, not on the relay going away.
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+            FullPipeCase::OutputFailure => {
+                use microsandbox::protocol::exec::ExecStdout;
+                // Released only after the parent closed its end of the child's
+                // stdout: from here every write to fd 1 is an `EPIPE`, which the
+                // session must report as the writer's own error.
+                wait_for_file(&dir, "fault").await;
+                codec::write_message(
+                    &mut io,
+                    &Message::with_payload(
+                        MessageType::ExecStdout,
+                        id,
+                        &ExecStdout {
+                            data: b"guest output nobody will read".to_vec(),
+                        },
+                    )
+                    .unwrap(),
+                )
+                .await
+                .expect("relay write");
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+            FullPipeCase::RuntimeWaitError => {
+                // The fault is in the session's own runtime wait; keeping the
+                // connection open is what proves the session ended on the fault
+                // rather than on relay loss.
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+            FullPipeCase::StdinErrorOther => {
+                use microsandbox::protocol::exec::ExecStdinError;
+                let failed = ExecStdinError {
+                    errno: Some(5),
+                    errno_name: Some("EIO".to_string()),
+                    message: "input/output error".to_string(),
+                };
+                codec::write_message(
+                    &mut io,
+                    &Message::with_payload(MessageType::ExecStdinError, id, &failed).unwrap(),
+                )
+                .await
+                .expect("relay write");
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+            FullPipeCase::ExecFailed => {
+                use microsandbox::protocol::exec::{ExecFailed, ExecFailureKind};
+                let failure = ExecFailed {
+                    kind: ExecFailureKind::NotFound,
+                    errno: Some(2),
+                    errno_name: Some("ENOENT".to_string()),
+                    message: "no such binary".to_string(),
+                    stage: Some("execvp".to_string()),
+                };
+                codec::write_message(
+                    &mut io,
+                    &Message::with_payload(MessageType::ExecFailed, id, &failure).unwrap(),
+                )
+                .await
+                .expect("relay write");
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+            FullPipeCase::StdinErrorGuestClosed => {
+                use microsandbox::protocol::exec::ExecStdinError;
+                // `EPIPE` by name with no number: the streamed path's rule reads
+                // the name first, so this is a guest close and not a failure.
+                let closed = ExecStdinError {
+                    errno: None,
+                    errno_name: Some("EPIPE".to_string()),
+                    message: "the guest closed its stdin".to_string(),
+                };
+                codec::write_message(
+                    &mut io,
+                    &Message::with_payload(MessageType::ExecStdinError, id, &closed).unwrap(),
+                )
+                .await
+                .expect("relay write");
                 codec::write_message(
                     &mut io,
                     &Message::with_payload(MessageType::ExecExited, id, &ExecExited { code: 7 })
@@ -702,6 +946,42 @@ mod tests {
         }
     }
 
+    /// Record the two resizes the geometry case expects, then let the session
+    /// complete with a definite exit.
+    ///
+    /// The session sends its first resize immediately after the handle exists
+    /// (the host's real geometry, in place of the SDK's 24x80) and one more per
+    /// `SIGWINCH`. The parent changed the terminal's size and signalled before it
+    /// wrote `finish`, so the second frame must carry the new geometry.
+    async fn relay_resizes(io: &mut tokio::io::DuplexStream, dir: &std::path::Path, id: u32) {
+        use microsandbox::protocol::codec;
+        use microsandbox::protocol::exec::{ExecExited, ExecResize};
+        use microsandbox::protocol::message::{Message, MessageType};
+
+        let mut recorded = 0usize;
+        while recorded < 2 {
+            let frame = codec::read_message(io).await.expect("a session frame");
+            if frame.t != MessageType::ExecResize {
+                continue;
+            }
+            let resize = frame
+                .payload::<ExecResize>()
+                .expect("an ExecResize payload");
+            append_receipt(
+                &full_pipe_receipt(dir),
+                &[format!("resize={}x{}", resize.rows, resize.cols)],
+            );
+            recorded += 1;
+        }
+        wait_for_file(dir, "finish").await;
+        codec::write_message(
+            io,
+            &Message::with_payload(MessageType::ExecExited, id, &ExecExited { code: 0 }).unwrap(),
+        )
+        .await
+        .expect("relay write");
+    }
+
     async fn wait_for_file(dir: &std::path::Path, name: &str) {
         let deadline = std::time::Instant::now() + full_pipe_deadline();
         while !dir.join(name).exists() {
@@ -713,12 +993,53 @@ mod tests {
         }
     }
 
-    /// The failing child: the real checked bridge, the real supervision, the real
+    /// The runtime wait, with a receipt taken at the instant it is dropped.
+    ///
+    /// ARCHITECTURE's release order says the terminal is restored, the writer
+    /// aborted and the reader stopped *before* the runtime wait is released,
+    /// because that wait may hold the child-handle mutex the caller's teardown
+    /// needs. After the fact both events have happened in either order, so the
+    /// only observation that can separate them is one taken inside `drop`.
+    struct WaitedRuntime {
+        inner: std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = microsandbox::MicrosandboxResult<std::process::ExitStatus>,
+                    > + Send,
+            >,
+        >,
+        receipt: std::path::PathBuf,
+    }
+
+    impl std::future::Future for WaitedRuntime {
+        type Output = microsandbox::MicrosandboxResult<std::process::ExitStatus>;
+
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            self.inner.as_mut().poll(context)
+        }
+    }
+
+    impl Drop for WaitedRuntime {
+        fn drop(&mut self) {
+            append_receipt(
+                &self.receipt,
+                &[format!(
+                    "runtime-wait-dropped raw={}",
+                    u8::from(terminal_is_raw(libc::STDIN_FILENO))
+                )],
+            );
+        }
+    }
+
+    /// The child: the real direct PTY session over a fake relay, the real
     /// failure teardown and the real 125 exit policy.
     ///
     /// Without the env token this is an ordinary passing test.
     #[test]
-    fn checked_output_full_pipe_child() {
+    fn direct_pty_session_child() {
         let Ok(dir) = std::env::var(FULL_PIPE_DIR) else {
             return;
         };
@@ -757,37 +1078,75 @@ mod tests {
                 client: std::sync::Mutex::new(Some(client)),
             });
         let config = microsandbox::SandboxConfig::default();
-        let options = microsandbox::sandbox::AttachOptionsBuilder::default()
-            .args(["-c", "probe"])
-            .cwd("/workspace/project")
-            .disable_detach_keys()
-            .checked_session();
+        // The production request shape for a direct PTY launch: a merged PTY
+        // session that also owns guest stdin.
+        let options = microsandbox::sandbox::exec::ExecOptions {
+            args: vec!["-c".to_string(), "probe".to_string()],
+            cwd: Some("/workspace/project".to_string()),
+            tty: true,
+            stdin: microsandbox::sandbox::exec::StdinMode::Pipe,
+            ..Default::default()
+        };
 
-        let runtime_wait = FakeRuntime::wait_future(std::sync::Arc::clone(&runtime_process.child));
+        let runtime_wait = WaitedRuntime {
+            inner: match case {
+                // A runtime that cannot even be observed is a session failure, not
+                // a guest status. It fails only after the parent released the
+                // payload, so the terminal was provably raw first.
+                FullPipeCase::RuntimeWaitError => {
+                    let dir = dir.clone();
+                    Box::pin(async move {
+                        wait_for_file(&dir, "go").await;
+                        Err(microsandbox::MicrosandboxError::Runtime(
+                            "the fake VMM died".to_string(),
+                        ))
+                    })
+                }
+                // A runtime that has genuinely ended, made ready only after the
+                // guest's exit was delivered: the both-ready case, without a
+                // signal race.
+                FullPipeCase::ExitWins => {
+                    let dir = dir.clone();
+                    Box::pin(async move {
+                        wait_for_file(&dir, "runtime-gone").await;
+                        Ok(exit_status_of(3))
+                    })
+                }
+                _ => Box::pin(FakeRuntime::wait_future(std::sync::Arc::clone(
+                    &runtime_process.child,
+                ))),
+            },
+            receipt: receipt.clone(),
+        };
         let teardown = RelayTeardown {
             receipt: receipt.clone(),
             runtime: std::sync::Arc::clone(&runtime_process.child),
         };
 
-        // Everything the bridge and the failure path do happens inside this one
+        // Everything the session and the failure path do happens inside this one
         // runtime scope, so the `drop` below is the thing under test.
         let outcome: anyhow::Result<i32> = {
-            let sandboxes = backend.as_ref().sandboxes();
-            let attach = sandboxes.attach(
+            let handle = runtime.block_on(backend.as_ref().sandboxes().exec_stream(
                 std::sync::Arc::clone(&backend),
                 "probe",
                 &config,
                 "bash".to_string(),
                 options,
-            );
-            runtime.block_on(async move {
-                match crate::direct_terminal::supervise_attach(attach, runtime_wait).await {
-                    Ok(code) => Ok(code),
-                    Err(error) => {
-                        Err(crate::run::finish_failed_exec(&teardown, error, "/logs/probe").await)
+            ));
+            match handle {
+                Err(error) => Err(anyhow::Error::new(error)),
+                Ok(handle) => runtime.block_on(async move {
+                    match crate::direct_pty::run(handle, runtime_wait).await {
+                        Ok(code) => Ok(code),
+                        Err(error) => {
+                            Err(
+                                crate::run::finish_failed_exec(&teardown, error, "/logs/probe")
+                                    .await,
+                            )
+                        }
                     }
-                }
-            })
+                }),
+            }
         };
 
         match outcome {
@@ -821,6 +1180,10 @@ mod tests {
 
     impl ParentTerminal {
         fn open() -> Self {
+            Self::open_with_size(24, 80)
+        }
+
+        fn open_with_size(rows: u16, cols: u16) -> Self {
             use std::os::fd::{AsRawFd as _, FromRawFd as _};
             let mut master: libc::c_int = -1;
             let mut slave: libc::c_int = -1;
@@ -835,8 +1198,8 @@ mod tests {
             };
             assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
             let size = libc::winsize {
-                ws_row: 24,
-                ws_col: 80,
+                ws_row: rows,
+                ws_col: cols,
                 ws_xpixel: 0,
                 ws_ypixel: 0,
             };
@@ -864,12 +1227,31 @@ mod tests {
             self.master.as_raw_fd()
         }
 
-        fn is_raw(&self) -> bool {
-            let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
-            let rc = unsafe { libc::tcgetattr(self.slave_fd(), &mut attributes) };
-            assert_eq!(rc, 0, "read the terminal");
-            attributes.c_lflag & libc::ICANON == 0
+        /// Give the terminal a new geometry, the way a window manager does.
+        fn resize(&self, rows: u16, cols: u16) {
+            let size = libc::winsize {
+                ws_row: rows,
+                ws_col: cols,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            assert_ne!(
+                unsafe { libc::ioctl(self.master_fd(), libc::TIOCSWINSZ, &size) },
+                -1,
+                "resize the terminal"
+            );
         }
+
+        fn is_raw(&self) -> bool {
+            terminal_is_raw(self.slave_fd())
+        }
+    }
+
+    fn terminal_is_raw(fd: std::os::fd::RawFd) -> bool {
+        let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::tcgetattr(fd, &mut attributes) };
+        assert_eq!(rc, 0, "read the terminal");
+        attributes.c_lflag & libc::ICANON == 0
     }
 
     /// The facts a raw-mode session must restore: canonical input, echo, signal
@@ -933,9 +1315,15 @@ mod tests {
     }
 
     fn receipt_line_of(text: &str, key: &str) -> Option<String> {
+        receipt_lines_of(text, key).into_iter().next()
+    }
+
+    /// Every value recorded for `key`, in receipt order.
+    fn receipt_lines_of(text: &str, key: &str) -> Vec<String> {
         let prefix = format!("{key}=");
         text.lines()
-            .find_map(|line| line.strip_prefix(&prefix).map(str::to_owned))
+            .filter_map(|line| line.strip_prefix(&prefix).map(str::to_owned))
+            .collect()
     }
 
     /// Whether the owned fake runtime process is gone (killed and reaped).
@@ -1009,12 +1397,84 @@ mod tests {
         run_full_pipe_case(FullPipeCase::HealthySlowConsumer);
     }
 
+    /// A lost runtime must be observed **while the session is waiting for output
+    /// capacity**, not only while it is idle between events.
+    ///
+    /// The two cases above cannot show that: their single 2 MiB frame blocks the
+    /// writer but leaves the session idle in `select!`. Here the guest's output is
+    /// over the 8 MiB pending bound, so the session is suspended in its own frame
+    /// delivery, and a runtime death that is only polled between events would
+    /// never be seen — the launcher would hang with the operator's terminal raw
+    /// instead of restoring it and exiting 125.
+    #[test]
+    fn a_runtime_loss_is_observed_while_output_waits_for_a_stalled_consumer() {
+        run_full_pipe_case(FullPipeCase::RuntimeLossOverBound);
+    }
+
+    /// A definitive guest exit beats a runtime observation that is already ready,
+    /// even when its output can never be flushed.
+    ///
+    /// The reviewer who asked for this case back flagged the race it exposes: the
+    /// drain barrier used to treat a runtime that died *after* the guest's exit as
+    /// 125. It reproduces whenever the runtime's end is observable as the barrier
+    /// begins — the CI failure on Linux — so the fixture makes the barrier's other
+    /// branch useless instead of racing it: the guest's output is larger than the
+    /// pipe, the consumer never reads, and `finish()` can never be acked.
+    #[test]
+    fn a_definitive_exit_wins_when_both_are_ready() {
+        run_full_pipe_case(FullPipeCase::ExitWins);
+    }
+
+    /// The runtime wait failing is a session failure, not a fabricated status.
+    #[test]
+    fn a_failed_runtime_wait_is_a_session_failure() {
+        run_full_pipe_case(FullPipeCase::RuntimeWaitError);
+    }
+
+    /// A guest that never started ends the session with its own reason.
+    #[test]
+    fn a_guest_that_failed_to_start_ends_the_session() {
+        run_full_pipe_case(FullPipeCase::ExecFailed);
+    }
+
+    /// A guest that closed its stdin keeps its own status: closure is not a
+    /// failure even when it is reported by errno *name* alone.
+    #[test]
+    fn a_guest_that_closed_stdin_keeps_its_own_status() {
+        run_full_pipe_case(FullPipeCase::StdinErrorGuestClosed);
+    }
+
+    /// Any other stdin failure is the launcher's: 125 with the errno named.
+    #[test]
+    fn a_stdin_forwarding_failure_ends_the_session() {
+        run_full_pipe_case(FullPipeCase::StdinErrorOther);
+    }
+
+    /// A host that stops accepting output fails the session, and the report names
+    /// the writer's own error rather than the queue's symptom.
+    #[test]
+    fn an_unwritable_host_stdout_ends_the_session_with_the_writers_error() {
+        run_full_pipe_case(FullPipeCase::OutputFailure);
+    }
+
+    /// The geometry gap, measured rather than assumed: the stock `exec_stream`
+    /// creates the guest PTY at 24x80, so the session must send the host's real
+    /// size itself and must follow a later `SIGWINCH`.
+    #[test]
+    fn the_session_reports_the_host_geometry_and_follows_a_resize() {
+        run_full_pipe_case(FullPipeCase::Resize);
+    }
+
     fn run_full_pipe_case(case: FullPipeCase) {
         use std::io::Read as _;
         use std::os::fd::AsRawFd as _;
 
         let dir = tempfile::tempdir().expect("a case directory");
-        let terminal = ParentTerminal::open();
+        let terminal = if case == FullPipeCase::Resize {
+            ParentTerminal::open_with_size(FIXTURE_INITIAL_SIZE.0, FIXTURE_INITIAL_SIZE.1)
+        } else {
+            ParentTerminal::open()
+        };
         let (mut read_end, write_end) = std::io::pipe().expect("a stdout pipe");
 
         // Preflight the pipe's capacity on a description no child shares yet,
@@ -1077,12 +1537,14 @@ mod tests {
             .stdin(std::process::Stdio::from(child_slave))
             .stdout(std::process::Stdio::from(write_end))
             .stderr(std::process::Stdio::piped());
-        let mut child = command.spawn().expect("spawn the case child");
+        // Owned from here on: a failing assertion in any arm must not leave the
+        // child (and its fake runtime) running for the rest of the suite.
+        let mut child = ChildGuard::new(command.spawn().expect("spawn the case child"));
         // `Command` still owns the `Stdio` values it was given, so dropping it is
         // what releases the parent's copy of the pipe's write end: without this
         // the parent's own read never reaches EOF and the control hangs.
         drop(command);
-        let mut child_stderr = child.stderr.take().expect("child stderr");
+        let mut child_stderr = child.get().stderr.take().expect("child stderr");
         let stderr_reader = std::thread::spawn(move || {
             let mut sink = Vec::new();
             let _ = child_stderr.read_to_end(&mut sink);
@@ -1097,18 +1559,82 @@ mod tests {
         // deadline; the fault arms never read it.
         let capture: Vec<u8>;
         match case {
-            FullPipeCase::RelayLoss | FullPipeCase::RuntimeLoss => {
+            FullPipeCase::Resize => {
+                // What the SDK asked for: the gap this session has to close.
+                wait_until("the exec request geometry", full_pipe_deadline(), || {
+                    receipt_line_of(&receipt_text(dir.path()), "request").is_some()
+                });
+                assert_eq!(
+                    receipt_line_of(&receipt_text(dir.path()), "request").as_deref(),
+                    Some("24x80"),
+                    "the stock exec_stream creates the PTY at 24x80"
+                );
+                // The session's first frame carries the host's real geometry, so
+                // a forwarded constant cannot pass: the fixture's size is not
+                // 24x80.
+                wait_until("the host geometry", full_pipe_deadline(), || {
+                    !receipt_lines_of(&receipt_text(dir.path()), "resize").is_empty()
+                });
+                assert_eq!(
+                    receipt_lines_of(&receipt_text(dir.path()), "resize")[0],
+                    format!("{}x{}", FIXTURE_INITIAL_SIZE.0, FIXTURE_INITIAL_SIZE.1),
+                );
+                // A host resize is a SIGWINCH and the new geometry, never a
+                // launcher constant.
+                terminal.resize(FIXTURE_RESIZED_SIZE.0, FIXTURE_RESIZED_SIZE.1);
+                let child_pid = child.get().id();
+                assert!(child_pid > 1, "the child must still be running");
+                assert_eq!(
+                    unsafe { libc::kill(child_pid as libc::pid_t, libc::SIGWINCH) },
+                    0,
+                    "signal the resize: {}",
+                    std::io::Error::last_os_error()
+                );
+                wait_until("the resized geometry", full_pipe_deadline(), || {
+                    receipt_lines_of(&receipt_text(dir.path()), "resize").len() >= 2
+                });
+                let resizes = receipt_lines_of(&receipt_text(dir.path()), "resize");
+                assert_eq!(
+                    resizes[1],
+                    format!("{}x{}", FIXTURE_RESIZED_SIZE.0, FIXTURE_RESIZED_SIZE.1),
+                    "every resize recorded, in order: {resizes:?}"
+                );
+                // Only now may the guest report its definitive exit.
+                std::fs::write(dir.path().join("finish"), b"finish").expect("finish the session");
+                let status = child.wait_within(full_pipe_deadline());
+                let stderr = String::from_utf8_lossy(&stderr_reader.join().unwrap()).into_owned();
+                assert_eq!(status.code(), Some(0), "{stderr}");
+                assert_eq!(
+                    receipt_line_of(&receipt_text(dir.path()), "status").as_deref(),
+                    Some("ok:0"),
+                    "{stderr}"
+                );
+            }
+            FullPipeCase::RelayLoss
+            | FullPipeCase::RuntimeLoss
+            | FullPipeCase::RuntimeLossOverBound => {
                 // The guest output itself fills the pipe: positive unread bytes,
-                // less than the frame that was sent, with no writable capacity.
+                // less than one frame, with no writable capacity.
                 wait_until("the pipe to fill", full_pipe_deadline(), || {
                     let unread = unread_pipe_bytes(read_end.as_raw_fd());
                     unread > 0
                         && (unread as usize) < FULL_PIPE_FRAME_BYTES
                         && !pipe_is_writable(poll_write.as_raw_fd())
                 });
+                if case == FullPipeCase::RuntimeLossOverBound {
+                    // Over the bound, a blocked writer is not enough on its own:
+                    // the guest's whole stream has to be in the launcher, and the
+                    // session then parks on capacity. Both are established before
+                    // the fault, so it lands in the wait rather than before it
+                    // started.
+                    wait_until("the guest's whole stream", full_pipe_deadline(), || {
+                        receipt_text(dir.path()).contains("relay=stream-sent")
+                    });
+                    std::thread::sleep(OVER_BOUND_SETTLE);
+                }
                 // Only now is the writer provably blocked, so a fault is a fault
                 // in the checked writer rather than in a not-yet-started send.
-                if case == FullPipeCase::RuntimeLoss {
+                if case != FullPipeCase::RelayLoss {
                     // Kill the *owned* fake runtime: the session must be
                     // cancelled by the runtime wait, not by the relay.
                     let pid: u32 = receipt_line_of(&receipt_text(dir.path()), "runtime_pid")
@@ -1120,7 +1646,11 @@ mod tests {
                         "kill the owned fake runtime"
                     );
                 }
-                std::fs::write(dir.path().join("fault"), b"fault").expect("inject the fault");
+                if case != FullPipeCase::RuntimeLossOverBound {
+                    // The over-bound relay is already done writing, so it never
+                    // reads this; the other two release their payload on it.
+                    std::fs::write(dir.path().join("fault"), b"fault").expect("inject the fault");
+                }
 
                 // The runtime must already be gone before the report: this
                 // receipt is the discriminator against a Tokio blocking write
@@ -1148,10 +1678,7 @@ mod tests {
                 wait_until("the fake runtime to be gone", fault_deadline(), || {
                     process_is_gone(pid)
                 });
-                wait_until("the child to exit", fault_deadline(), || {
-                    child.try_wait().expect("try_wait").is_some()
-                });
-                let status = child.wait().expect("reap the child");
+                let status = child.wait_within(fault_deadline());
                 let stderr = String::from_utf8_lossy(&stderr_reader.join().unwrap()).into_owned();
                 assert_eq!(
                     status.code(),
@@ -1162,6 +1689,146 @@ mod tests {
                 assert!(
                     stderr.contains("Error:"),
                     "{case:?}: the production report must name the failure: {stderr}"
+                );
+            }
+            // Both cases end with the guest's own status and no fault injected
+            // into the session itself.
+            FullPipeCase::ExitWins | FullPipeCase::StdinErrorGuestClosed => {
+                if case == FullPipeCase::ExitWins {
+                    // The relay delivers the guest's exit and then lets the
+                    // runtime's own end become observable, so the session holds a
+                    // definitive exit while a runtime observation is (or is about
+                    // to be) ready. Forcing the second half of that shape is what
+                    // makes the old 125 reproduce on every platform: the guest's
+                    // output is larger than the pipe and this parent never reads
+                    // it, so the writer is parked in `write(2)` and the barrier's
+                    // `finish()` can never be acked. Nothing but the runtime arm
+                    // can end the barrier while the status is already known.
+                    assert!(
+                        receipt_line_of(&receipt_text(dir.path()), "runtime_pid").is_some(),
+                        "the case must own a runtime whose end can be observed"
+                    );
+                    wait_until("the pipe to fill", full_pipe_deadline(), || {
+                        unread_pipe_bytes(read_end.as_raw_fd()) > 0
+                            && !pipe_is_writable(poll_write.as_raw_fd())
+                    });
+                    std::fs::write(dir.path().join("fault"), b"fault")
+                        .expect("release the guest exit");
+                    // The session's outcome is decided while the queued output is
+                    // still unread, which is the whole point of the case: the
+                    // status came from the exit, not from a completed flush.
+                    wait_until("the session's outcome", full_pipe_deadline(), || {
+                        let receipt = receipt_text(dir.path());
+                        receipt.contains("status=ok:") || receipt.contains("error=")
+                    });
+                    if receipt_text(dir.path()).contains("status=ok:") {
+                        assert!(
+                            unread_pipe_bytes(read_end.as_raw_fd()) > 0,
+                            "the guest's output must still be unread, so the final flush could not have completed"
+                        );
+                    }
+                    // The test harness hosting the case child writes its own
+                    // report to this same descriptor, and the session's writer is
+                    // already aborted, so draining here releases nothing the
+                    // status depended on — without it the harness's first write
+                    // after the session would block on the full pipe forever.
+                    drop(poll_write);
+                    let (drained, wait_for_drain) = std::sync::mpsc::channel();
+                    let drainer = std::thread::spawn(move || {
+                        let mut sink = Vec::new();
+                        let _ = read_end.read_to_end(&mut sink);
+                        let _ = drained.send(());
+                    });
+                    wait_for_drain
+                        .recv_timeout(fault_deadline())
+                        .unwrap_or_else(|_| {
+                            panic!("the case child never closed its stdout after the session ended")
+                        });
+                    drainer.join().expect("the drain thread");
+                }
+                let status = child.wait_within(fault_deadline());
+                let receipt = receipt_text(dir.path());
+                let stderr = String::from_utf8_lossy(&stderr_reader.join().unwrap()).into_owned();
+                assert_eq!(
+                    status.code(),
+                    Some(0),
+                    "{case:?}: a definitive guest exit is a status, not a failure: {stderr}
+{receipt}"
+                );
+                assert_eq!(
+                    receipt_line_of(&receipt, "status").as_deref(),
+                    Some("ok:7"),
+                    "{case:?}: {receipt}"
+                );
+                assert!(
+                    !stderr.contains("Error:"),
+                    "{case:?}: the session reported a failure instead of the guest's status: {stderr}"
+                );
+            }
+            FullPipeCase::OutputFailure => {
+                // Close the only read end of the child's stdout, so the guest
+                // output that follows cannot be written anywhere. Rust ignores
+                // SIGPIPE, so the writer sees `EPIPE` and must report it.
+                drop(read_end);
+                let pid: u32 = receipt_line_of(&receipt_text(dir.path()), "runtime_pid")
+                    .expect("the child's owned runtime pid")
+                    .parse()
+                    .expect("a pid");
+                std::fs::write(dir.path().join("fault"), b"fault")
+                    .expect("release the guest's output");
+                let status = child.wait_within(fault_deadline());
+                let receipt = receipt_text(dir.path());
+                let stderr = String::from_utf8_lossy(&stderr_reader.join().unwrap()).into_owned();
+                assert_eq!(
+                    status.code(),
+                    Some(crate::launch_target::DIRECT_LAUNCHER_FAILURE_EXIT),
+                    "{receipt}
+{stderr}"
+                );
+                assert!(
+                    stderr.contains("writing guest terminal output"),
+                    "the report must name the failing writer: {stderr}"
+                );
+                assert!(
+                    stderr.to_lowercase().contains("pipe"),
+                    "the writer's own errno must survive: {stderr}"
+                );
+                assert!(
+                    !stderr.contains("stopped accepting output"),
+                    "the symptom must not replace the cause: {stderr}"
+                );
+                wait_until("the fake runtime to be gone", fault_deadline(), || {
+                    process_is_gone(pid)
+                });
+            }
+            // A fault inside the session that the relay reports or that the
+            // runtime wait raises: 125 with the reason named.
+            FullPipeCase::RuntimeWaitError
+            | FullPipeCase::ExecFailed
+            | FullPipeCase::StdinErrorOther => {
+                let expected = match case {
+                    FullPipeCase::RuntimeWaitError => {
+                        "the sandbox runtime ended before the terminal command reported its exit"
+                    }
+                    FullPipeCase::ExecFailed => "exec failed: no such binary",
+                    _ => "forwarding host input to the guest failed: EIO",
+                };
+                let status = child.wait_within(fault_deadline());
+                let receipt = receipt_text(dir.path());
+                let stderr = String::from_utf8_lossy(&stderr_reader.join().unwrap()).into_owned();
+                assert_eq!(
+                    status.code(),
+                    Some(crate::launch_target::DIRECT_LAUNCHER_FAILURE_EXIT),
+                    "{case:?}: {stderr}
+{receipt}"
+                );
+                assert!(
+                    stderr.contains(expected),
+                    "{case:?}: the report must name the cause ({expected}): {stderr}"
+                );
+                assert!(
+                    !receipt.contains("status=ok"),
+                    "{case:?}: a failure must not report a guest status: {receipt}"
                 );
             }
             FullPipeCase::HealthySlowConsumer => {
@@ -1180,7 +1847,7 @@ mod tests {
                 // the *start* of draining used to be bounded, so a session that
                 // stopped progressing after its first bytes hung the suite instead
                 // of failing it.
-                let mut guard = ChildGuard::new(child);
+
                 let (finished, wait_for_finish) = std::sync::mpsc::channel();
                 let drainer = std::thread::spawn(move || {
                     let mut sink = Vec::new();
@@ -1200,7 +1867,7 @@ mod tests {
                 let (drained, read) = drainer.join().expect("the drain thread");
                 read.expect("drain the healthy session");
                 capture = drained;
-                let status = guard.wait_within(fault_deadline());
+                let status = child.wait_within(fault_deadline());
                 let receipt = receipt_text(dir.path());
                 let stderr = String::from_utf8_lossy(&stderr_reader.join().unwrap()).into_owned();
                 assert_eq!(
@@ -1236,6 +1903,14 @@ mod tests {
             terminal_state(terminal.master_fd()),
             terminal.baseline,
             "{case:?}: the terminal must be restored"
+        );
+        // The release order, observed rather than assumed: at the instant the
+        // runtime wait was dropped the terminal was already restored.
+        let receipt = receipt_text(dir.path());
+        assert!(
+            receipt.contains("runtime-wait-dropped raw=0"),
+            "{case:?}: the runtime wait was released before the terminal was restored:
+{receipt}"
         );
     }
 

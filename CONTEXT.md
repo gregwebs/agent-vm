@@ -73,8 +73,8 @@ EOF. Applies only to a streamed direct launch — which includes a terminal host
 stdin that a redirected stdout or `--no-tty` selected into streaming, not just a
 non-terminal one. A tool, shell or direct-PTY launch keeps the legacy `/dev/null`
 behaviour, where a `shell` launch's seed hooks run before the redirect and a hook
-that reads stdin can block there; under a PTY the SDK's terminal bridge owns input
-instead of the pump.
+that reads stdin can block there; under a direct PTY the launcher's own session
+owns input instead of the pump.
 _Avoid_: "stdin passthrough", which suggests setup shares the stream.
 
 ## Program guard

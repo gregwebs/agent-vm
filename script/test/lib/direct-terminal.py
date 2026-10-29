@@ -49,7 +49,12 @@ CASE_DEADLINE = float(os.environ.get("DIRECT_TERMINAL_CASE_DEADLINE", "240"))
 # The boot-free contract shortens it so a "never delivers EOF" control fails fast.
 MARKER_DEADLINE = float(os.environ.get("DIRECT_TERMINAL_MARKER_DEADLINE", "60"))
 # Fixed geometry the driver assigns, and the geometry the resize case asks for.
-INITIAL_SIZE = (24, 80)
+#
+# INITIAL_SIZE is deliberately **not** 24x80: the stock SDK's `exec_stream`
+# creates the guest PTY at 24x80 every time, so a launcher that failed to send
+# the host's own size would still pass a 24x80 fixture. The guest reports its
+# first size with `stty size`, which is the oracle.
+INITIAL_SIZE = (37, 111)
 RESIZED_SIZE = (43, 119)
 # The canonical host input for the stream-input cases, as literal bytes.
 STREAM_INPUT_CHUNKS = (b"stream-A\n", b"stream-B", b"\n")
@@ -980,6 +985,14 @@ def observe(case: Case, form: str, session: Session, receipt: dict, ctx: "Contex
         require(
             "WAIT-EOF" not in text,
             f"{name}/{form}: the detach key reached the guest instead of detaching: {text!r}",
+        )
+        # The legacy status is not a guest status: the SDK's attach returns its
+        # own sentinel-derived 255 when Ctrl-] detaches. Recording the status is
+        # not observing it, so a legacy launch that quietly started reporting the
+        # guest's status (or 0) has to fail here.
+        require(
+            status == 255,
+            f"{name}/{form}: a detached legacy session reported {status}, not its 255",
         )
         require(
             session.baseline_state() == session.final_state(),

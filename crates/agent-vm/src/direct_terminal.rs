@@ -1,22 +1,15 @@
 //! Terminal policy for a direct command launch (issue #400).
 //!
-//! Two independent operations live here, because they share one domain and one
-//! test vocabulary but never call each other:
+//! It is a **pure mapping** from a typed preference and the host's terminal
+//! facts to the resolved [`DirectIo`] the launch will use. It is decided once, in
+//! CLI dispatch, before any runtime setup, and travels with the launch target so
+//! the guest bootstrap and the exec request cannot disagree.
 //!
-//! * **Policy** — a pure mapping from a typed preference and the host's terminal
-//!   facts to the resolved [`DirectIo`] the launch will use. It is decided once,
-//!   in CLI dispatch, before any runtime setup, and travels with the launch
-//!   target so the guest bootstrap and the exec request cannot disagree.
-//! * **Supervision** — one owned attach future raced against the sandbox's own
-//!   exit, with the release order that restores the host terminal before the
-//!   caller's existing stop/wait/remove path runs. #401 will extend this with
-//!   signal supervision; nothing here sends, forwards or interprets a signal.
-//!
-//! Neither belongs in `run.rs`: policy is a mapping that must stay measurable
-//! without a launch, and supervision hides a race and a release order that would
-//! otherwise be one more terminal state machine inside an already large module.
-
-use std::future::Future;
+//! Nothing here measures a host descriptor except [`HostTerminals::detect`], and
+//! nothing here starts a session: the PTY session a `Pty` selection ends in lives
+//! in [`crate::direct_pty`], and the streaming one in `run`'s exec lifecycle.
+//! Keeping the mapping separate is what makes every combination testable without
+//! a launch.
 
 /// What the user asked for on the command line.
 ///
@@ -114,55 +107,6 @@ impl TerminalPolicy {
     }
 }
 
-/// Supervise one owned direct-command attach future.
-///
-/// The attach future owns the host terminal's raw state and the guest's PTY
-/// session; the runtime future owns the sandbox's own lifetime. Whichever
-/// resolves first, this returns through one release order:
-///
-/// 1. the attach future is **dropped first**, so the SDK restores the terminal
-///    and drops its output writer before anything else touches the session (a
-///    standalone output write already in progress may finish or be abandoned;
-///    the SDK never waits for it, and no Tokio blocking task is left for the
-///    runtime to wait for);
-/// 2. the runtime future is dropped, releasing the runtime's child handle *before*
-///    the caller's existing bounded stop/wait/remove path takes it.
-///
-/// A definitive guest exit wins when both are ready: `tokio::select!` is biased
-/// towards the attach future, so an exit already observed is never replaced by a
-/// later runtime observation. A runtime exit without a guest exit is a failure,
-/// never a fabricated status — the guest never reported one.
-///
-/// #401 will cancel this owned future from a signal-aware supervisor. Nothing
-/// here handles signals: a Ctrl-C at a host terminal is an ordinary raw input
-/// byte that this session forwards, and there is no second forwarding path that
-/// could deliver it twice.
-pub(crate) async fn supervise_attach<A, R>(attach: A, runtime_exit: R) -> anyhow::Result<i32>
-where
-    A: Future<Output = microsandbox::MicrosandboxResult<i32>>,
-    R: Future<Output = microsandbox::MicrosandboxResult<std::process::ExitStatus>>,
-{
-    let mut attach = Box::pin(attach);
-    let mut runtime_exit = Box::pin(runtime_exit);
-    let outcome = tokio::select! {
-        biased;
-        result = &mut attach => result.map_err(anyhow::Error::new),
-        result = &mut runtime_exit => Err(match result {
-            Ok(status) => anyhow::anyhow!(
-                "the sandbox process ended ({status}) before the terminal command reported its exit"
-            ),
-            Err(error) => anyhow::Error::new(error)
-                .context("the sandbox runtime ended before the terminal command reported its exit"),
-        }),
-    };
-    // Releasing the bridge first restores the host terminal and drops the SDK's
-    // output writer; releasing the runtime wait second frees the child handle for
-    // the cleanup below.
-    drop(attach);
-    drop(runtime_exit);
-    outcome
-}
-
 #[cfg(test)]
 mod tests {
     use std::os::fd::FromRawFd as _;
@@ -247,182 +191,6 @@ mod tests {
             stdout: true,
         };
         assert_eq!(TerminalPolicy::Auto.select(both), Ok(DirectIo::Pty));
-    }
-
-    /// One ordered sequence of releases, so a test asserts the release order
-    /// itself rather than independent booleans.
-    type DropLog = std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>;
-
-    fn drop_log() -> DropLog {
-        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()))
-    }
-
-    fn releases(log: &DropLog) -> Vec<&'static str> {
-        log.lock().unwrap().clone()
-    }
-
-    /// Every path releases the bridge, and always before the runtime wait.
-    fn assert_release_order(log: &DropLog) {
-        assert_eq!(releases(log), ["attach", "runtime"]);
-    }
-
-    /// A future whose release receipt is kept until the future itself is
-    /// dropped — not until its body finishes.
-    ///
-    /// That distinction is the whole point: a value an `async` block returns is
-    /// released as the block completes, so only a struct field can show which
-    /// future the supervisor held and in which order it let go.
-    struct Watched<T> {
-        value: Option<T>,
-        log: DropLog,
-        name: &'static str,
-    }
-
-    impl<T> Watched<T> {
-        fn ready(value: T, log: DropLog, name: &'static str) -> Self {
-            Self {
-                value: Some(value),
-                log,
-                name,
-            }
-        }
-        fn pending(log: DropLog, name: &'static str) -> Self {
-            Self {
-                value: None,
-                log,
-                name,
-            }
-        }
-    }
-
-    impl<T: Unpin> std::future::Future for Watched<T> {
-        type Output = T;
-
-        fn poll(
-            mut self: std::pin::Pin<&mut Self>,
-            _context: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<T> {
-            match self.value.take() {
-                Some(value) => std::task::Poll::Ready(value),
-                None => std::task::Poll::Pending,
-            }
-        }
-    }
-
-    impl<T> Drop for Watched<T> {
-        fn drop(&mut self) {
-            self.log.lock().unwrap().push(self.name);
-        }
-    }
-
-    fn attach_now(
-        result: microsandbox::MicrosandboxResult<i32>,
-        log: DropLog,
-    ) -> Watched<microsandbox::MicrosandboxResult<i32>> {
-        Watched::ready(result, log, "attach")
-    }
-
-    fn attach_pending(log: DropLog) -> Watched<microsandbox::MicrosandboxResult<i32>> {
-        Watched::pending(log, "attach")
-    }
-
-    fn runtime_now(
-        result: microsandbox::MicrosandboxResult<std::process::ExitStatus>,
-        log: DropLog,
-    ) -> Watched<microsandbox::MicrosandboxResult<std::process::ExitStatus>> {
-        Watched::ready(result, log, "runtime")
-    }
-
-    fn runtime_pending(
-        log: DropLog,
-    ) -> Watched<microsandbox::MicrosandboxResult<std::process::ExitStatus>> {
-        Watched::pending(log, "runtime")
-    }
-
-    fn exit_status(code: i32) -> std::process::ExitStatus {
-        use std::os::unix::process::ExitStatusExt;
-        std::process::ExitStatus::from_raw(code << 8)
-    }
-
-    #[tokio::test]
-    async fn a_guest_status_is_preserved_including_nonzero() {
-        for code in [0, 7, 126, 127, -1] {
-            let log = drop_log();
-            let outcome = supervise_attach(
-                attach_now(Ok(code), log.clone()),
-                runtime_pending(log.clone()),
-            )
-            .await;
-            assert_eq!(outcome.unwrap(), code);
-            assert_release_order(&log);
-        }
-    }
-
-    #[tokio::test]
-    async fn an_attach_failure_stays_an_error_and_never_becomes_a_status() {
-        let log = drop_log();
-        let outcome = supervise_attach(
-            attach_now(
-                Err(microsandbox::MicrosandboxError::Terminal("lost".into())),
-                log.clone(),
-            ),
-            runtime_pending(log.clone()),
-        )
-        .await;
-        let error = outcome.expect_err("a session failure is not a status");
-        assert!(format!("{error:#}").contains("lost"), "{error:#}");
-        assert_release_order(&log);
-    }
-
-    #[tokio::test]
-    async fn a_runtime_loss_without_a_guest_exit_is_a_failure() {
-        // The runtime ends while the attach is still live: the session never
-        // reported an exit, so there is no status to preserve.
-        let log = drop_log();
-        let outcome = supervise_attach(
-            attach_pending(log.clone()),
-            runtime_now(Ok(exit_status(3)), log.clone()),
-        )
-        .await;
-        let error = outcome.expect_err("runtime loss is not a guest status");
-        let text = format!("{error:#}");
-        assert!(
-            text.contains("before the terminal command reported"),
-            "{text}"
-        );
-        assert!(text.contains("exit status: 3"), "{text}");
-        assert_release_order(&log);
-
-        // A runtime wait that fails is equally not a success.
-        let log = drop_log();
-        let outcome = supervise_attach(
-            attach_pending(log.clone()),
-            runtime_now(
-                Err(microsandbox::MicrosandboxError::Runtime("vmm died".into())),
-                log.clone(),
-            ),
-        )
-        .await;
-        let text = format!("{:#}", outcome.expect_err("no status"));
-        assert!(
-            text.contains("before the terminal command reported"),
-            "{text}"
-        );
-        assert_release_order(&log);
-    }
-
-    #[tokio::test]
-    async fn a_definitive_exit_wins_when_both_are_ready() {
-        // Both resolve on the first poll: an exit already observed must not be
-        // replaced by the runtime observation.
-        let log = drop_log();
-        let outcome = supervise_attach(
-            attach_now(Ok(7), log.clone()),
-            runtime_now(Ok(exit_status(0)), log.clone()),
-        )
-        .await;
-        assert_eq!(outcome.unwrap(), 7);
-        assert_release_order(&log);
     }
 
     /// Env token that turns this test binary into a one-shot measurement child.
