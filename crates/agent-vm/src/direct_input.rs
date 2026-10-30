@@ -33,8 +33,9 @@ use std::io::Read;
 
 use microsandbox::protocol::exec::ExecStdinError;
 
-/// Read size per host `read(2)`. Well under the runtime's 4 MiB agent-frame
-/// limit, so one chunk is one `ExecStdin` frame.
+/// Host read/backlog unit, not a wire-frame size. The SDK subframes writes to
+/// `stdin_chunk_size` (16 KiB by default) within a 64 KiB per-exec window;
+/// `ExecStdinAck` replenishes credit after delivery into the guest stdin pipe.
 const HOST_READ_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Chunks in flight between the reader thread and the pump. One, so a stalled
@@ -47,6 +48,9 @@ const HOST_READ_QUEUE_CHUNKS: usize = 1;
 /// The Linux guest's `EPIPE`. Not the host's `libc::EPIPE`: the number is
 /// reported by agentd from inside the guest.
 const GUEST_EPIPE: i32 = 32;
+
+/// Pinned SDK sentinel; the vendor-source guard below requires bump-time review.
+const STDIN_CLOSED_SENTINEL: &str = "execution stdin closed";
 
 /// Bytes read from host stdin. Never empty, because an empty `ExecStdin` frame
 /// *is* EOF — a zero-length chunk would close the guest's stdin early.
@@ -240,6 +244,10 @@ impl InputFailure {
         matches!(self, Self::Transport(_))
     }
 
+    pub(crate) fn is_stdin_closed(&self) -> bool {
+        matches!(self, Self::Transport(error) if is_stdin_closed(error))
+    }
+
     /// Never includes input bytes: they are the user's data.
     pub(crate) fn into_error(self) -> anyhow::Error {
         self.error()
@@ -262,6 +270,17 @@ impl InputFailure {
             }
         }
     }
+}
+
+/// The SDK closes its credit window before enqueueing EPIPE or Exited. Only
+/// this exact typed error can be reconciled with those events; transport/EIO
+/// failures must remain failures even if the guest subsequently exits.
+pub(crate) fn is_stdin_closed(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<microsandbox::MicrosandboxError>(),
+        Some(microsandbox::MicrosandboxError::Runtime(detail))
+            if detail == STDIN_CLOSED_SENTINEL
+    )
 }
 
 /// The forwarding of host input to one direct command.
@@ -589,6 +608,7 @@ pub(crate) mod test_support {
     pub(crate) enum SinkStep {
         Accept,
         Fail(&'static str),
+        StdinClosed,
     }
 
     /// A [`GuestStdin`] whose writes and closes block until the test releases
@@ -689,6 +709,9 @@ pub(crate) mod test_support {
                     let _ = self.receipts.send(Receipt::WriteReturned { ok: false });
                     Err(anyhow::anyhow!("{}", detail))
                 }
+                SinkStep::StdinClosed => Err(anyhow::Error::new(
+                    microsandbox::MicrosandboxError::Runtime("execution stdin closed".into()),
+                )),
             }
         }
 
@@ -703,6 +726,9 @@ pub(crate) mod test_support {
                     let _ = self.receipts.send(Receipt::WriteReturned { ok: false });
                     Err(anyhow::anyhow!("{}", detail))
                 }
+                SinkStep::StdinClosed => Err(anyhow::Error::new(
+                    microsandbox::MicrosandboxError::Runtime("execution stdin closed".into()),
+                )),
             }
         }
     }
@@ -749,6 +775,18 @@ mod tests {
     };
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn stdin_closed_sentinel_matches_the_bundled_sdk() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../vendor/microsandbox/sdk/rust/lib/sandbox/exec/io.rs");
+        let source =
+            std::fs::read_to_string(path).expect("read the pinned SDK stdin implementation");
+        assert!(
+            source.contains(&format!("\"{STDIN_CLOSED_SENTINEL}\"")),
+            "SDK stdin-closure sentinel changed; review is_stdin_closed before bumping the vendor"
+        );
+    }
 
     /// Five distinguishable 64 KiB chunks (320 KiB), every chunk with its own
     /// marker, every byte value (offset by the chunk number, so a substituted

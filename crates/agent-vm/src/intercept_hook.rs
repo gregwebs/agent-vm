@@ -1326,6 +1326,9 @@ mod tests {
                 ],
                 substitution: SecretSubstitution {
                     headers: true,
+                    // Empty = substitute in every header field, which is the
+                    // behaviour this fixture was written against.
+                    header_fields: Vec::new(),
                     query: false,
                     body: false,
                 },

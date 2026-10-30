@@ -37,7 +37,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// `msb_install::expected_msb_version()`: these are black-box tests that spawn
 /// the compiled binary and do not link the crate. If it drifts, every harness
 /// fails at `point_at_msb`.
-pub const VERSION_LINE: &str = "msb 0.7.4";
+pub const VERSION_LINE: &str = "msb 0.7.11";
+
+/// Launch capabilities of the packaged runtime with `net` enabled. Both fakes
+/// share this source; the contract test compares it to the bundled CLI handler.
+const PROTOCOL_JSON: &str = r#"{"protocols":[2,1],"required_restore_backing":true,"header_credentials":true,"tcp_accept_queue_size":true,"max_inbound_tcp_connections":true,"http_deny_message":true,"http_deny_json":true,"http_connect_proxy":true,"http_connect_proxy_auth":true,"proxy_from_env":true,"guest_clock":true,"fs_state_limit":true,"exec_limits":true}"#;
 
 /// How the fake runtime answers an invocation other than `--version`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,7 +142,7 @@ pub fn install_pair_with_logs(
              env >> '{environ}'\n\
              if [ \"$1\" = \"--version\" ]; then echo '{VERSION_LINE}'; exit 0; fi\n\
              if [ \"$1\" = \"__launch-protocol\" ]; then\n\
-             \x20 echo '{{\"protocols\":[1,2],\"required_restore_backing\":true,\"header_credentials\":true}}'\n\
+             \x20 echo '{PROTOCOL_JSON}'\n\
              \x20 exit 0\n\
              fi\n\
              exit 93\n",
@@ -189,7 +193,7 @@ pub fn install_launch_binary(dir: &Path, invocations: &Path, environ: &Path) -> 
 #[cfg_attr(any(target_os = "linux", target_os = "windows"), unsafe(link_section = ".msbver"))]
 static MSB_VERSION: [u8; {version_len}] = {version_bytes:?};
 
-const PROTOCOL_JSON: &str = r#"{{"protocols":[1,2],"required_restore_backing":true,"header_credentials":true}}"#;
+const PROTOCOL_JSON: &str = {protocol_json:?};
 
 fn main() {{
     // Keep the embedded section reachable through linker garbage collection.
@@ -227,6 +231,7 @@ fn main() {{
     std::process::exit(93);
 }}
 "##,
+        protocol_json = PROTOCOL_JSON,
         version_len = runtime_version.len(),
         version_bytes = runtime_version.as_bytes(),
         invocations = literal(invocations),
@@ -357,6 +362,59 @@ mod tests {
     }
 
     #[test]
+    fn launch_capabilities_match_the_bundled_net_runtime_handler() {
+        let source = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../vendor/microsandbox/crates/cli/bin/main.rs"),
+        )
+        .unwrap();
+        let handler = source
+            .split_once("Commands::LaunchProtocol => {")
+            .unwrap()
+            .1;
+        let fields = handler
+            .split_once("LaunchCapabilities {")
+            .unwrap()
+            .1
+            .split_once("})")
+            .unwrap()
+            .0;
+        let mut actual = serde_json::Map::new();
+        let mut net_gated = 0;
+        for line in fields
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            let (name, value) = line.trim_end_matches(',').split_once(':').unwrap();
+            let value = value.trim();
+            let parsed = if value == "cfg!(feature = \"net\")" {
+                // The fixture models the packaged net-enabled binary, not a
+                // minimal no-net build. Never silently accept other cfgs.
+                net_gated += 1;
+                serde_json::Value::Bool(true)
+            } else if let Some(array) = value.strip_prefix("vec!") {
+                serde_json::from_str(array).expect("literal protocol array")
+            } else {
+                assert!(
+                    matches!(value, "true" | "false"),
+                    "unknown capability expression: {line}"
+                );
+                serde_json::from_str(value).unwrap()
+            };
+            assert!(actual.insert(name.trim().to_owned(), parsed).is_none());
+        }
+        assert_eq!(
+            net_gated, 6,
+            "review feature-gating changes at a vendor bump"
+        );
+        assert_eq!(
+            serde_json::Value::Object(actual),
+            serde_json::from_str::<serde_json::Value>(PROTOCOL_JSON).unwrap()
+        );
+    }
+
+    #[test]
     fn launch_seam_answers_the_protocol_and_never_fakes_a_vm() {
         let dir = tempfile::tempdir().unwrap();
         let fixture = install_pair(dir.path(), Mode::LaunchSeam);
@@ -366,9 +424,11 @@ mod tests {
             command
         });
         assert!(protocol.status.success());
-        let body = String::from_utf8_lossy(&protocol.stdout);
-        assert!(body.contains("\"protocols\":[1,2]"), "{body}");
-        assert!(body.contains("\"header_credentials\":true"), "{body}");
+        let body: serde_json::Value = serde_json::from_slice(&protocol.stdout).unwrap();
+        assert_eq!(
+            body,
+            serde_json::from_str::<serde_json::Value>(PROTOCOL_JSON).unwrap()
+        );
         let launch = output_retrying_busy({
             let mut command = std::process::Command::new(&fixture.path);
             command.arg("__run");

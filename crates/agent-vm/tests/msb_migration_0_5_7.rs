@@ -388,8 +388,8 @@ async fn fresh_0_5_7_db_forward_migrates_once_to_bundled_head() {
         applied_versions(&conn).await.into_iter().collect();
     assert_eq!(
         applied.len(),
-        28,
-        "AC-1: exactly the bundled 28 migrations must be applied after one upgrade"
+        30,
+        "AC-1: exactly the bundled 30 migrations must be applied after one upgrade"
     );
     assert_eq!(
         applied,
@@ -408,7 +408,7 @@ async fn repeated_restarts_are_noops() {
     let (conn, _fixture) = upgraded_seeded_db(&dir.path().join("msb.db")).await;
 
     let after_first_upgrade = applied_versions(&conn).await;
-    assert_eq!(after_first_upgrade.len(), 28);
+    assert_eq!(after_first_upgrade.len(), 30);
     let sandboxes_after_first_upgrade = read_all_sandbox_configs(&conn).await;
 
     for restart in 2..=3 {
@@ -419,7 +419,7 @@ async fn repeated_restarts_are_noops() {
         let applied_now = applied_versions(&conn).await;
         assert_eq!(
             applied_now.len(),
-            28,
+            30,
             "restart {restart}: AC-2 -- no destructive or duplicate migration"
         );
         assert_eq!(

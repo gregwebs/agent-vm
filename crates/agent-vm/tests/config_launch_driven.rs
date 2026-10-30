@@ -924,17 +924,23 @@ fn dense_default_network() -> serde_json::Value {
 /// engine's dense defaults with only the launcher's default-deny policy. Pins
 /// the empty authorization sets and disabled TLS from the engine's source
 /// values, not from observed output.
-fn assert_default_deny_zero_provision_network(network: &serde_json::Value, context: &str) {
+fn assert_default_deny_zero_provision_network(
+    network: &serde_json::Value,
+    context: &str,
+    proxy_from_env: bool,
+) {
     assert_eq!(
         network["policy"],
         default_deny_policy(),
         "{context}: policy"
     );
-    assert_eq!(
-        *network,
-        dense_default_network(),
-        "{context}: non-policy network mutated"
-    );
+    let mut expected = dense_default_network();
+    if proxy_from_env {
+        // A usable `HTTPS_PROXY` makes the launch opt into the runtime's own
+        // ambient-proxy discovery; that is the only other field a launch sets.
+        expected["proxy_from_env"] = serde_json::json!(true);
+    }
+    assert_eq!(*network, expected, "{context}: non-policy network mutated");
     assert_eq!(
         network["tls"]["enabled"],
         serde_json::json!(false),
@@ -1023,7 +1029,7 @@ fn assert_tool_dependent_content(tool: &str, config: &serde_json::Value) {
     // object (never a missing one). Require a real array: a structurally
     // missing or malformed object must fail rather than default to empty.
     if matches!(tool, "dsh") {
-        assert_default_deny_zero_provision_network(&config["network"], "dsh");
+        assert_default_deny_zero_provision_network(&config["network"], "dsh", false);
     }
     assert!(
         config["network"]["secrets"]["secrets"].is_array(),
@@ -3576,7 +3582,11 @@ fn a_zero_provisioning_launch_boots_with_no_tls_overlay() {
     // disabled and the credential sets stay empty. Compare the whole dense
     // network to the independent engine-derived baseline (G1's helper), never
     // to anything the launch printed.
-    assert_default_deny_zero_provision_network(&config["network"], "zero-provisioning shell");
+    assert_default_deny_zero_provision_network(
+        &config["network"],
+        "zero-provisioning shell",
+        false,
+    );
 
     // The launcher policy is deliberately **not** the SDK default. Pin both
     // sides so a change to either the launcher's decision or the dependency
@@ -3622,7 +3632,7 @@ fn a_fallback_shell_under_a_custom_catalog_provisions_nothing() {
     // A custom-catalog fallback shell also requests no egress, so it too gets
     // the dense default-deny network — pin it here so this shape is covered
     // without a golden.
-    assert_default_deny_zero_provision_network(&config["network"], "fallback shell");
+    assert_default_deny_zero_provision_network(&config["network"], "fallback shell", false);
 }
 
 /// **The other half of "a guest cannot spend a credential its verb did not
@@ -7035,7 +7045,7 @@ fn harness_probe_tool_launches_with_its_tool_arguments() {
         "the tool arguments must reach the guest command verbatim"
     );
     let config = debug_config_json(&stderr);
-    assert_default_deny_zero_provision_network(&config["network"], "egressprobe");
+    assert_default_deny_zero_provision_network(&config["network"], "egressprobe", false);
 }
 
 #[test]
@@ -7192,6 +7202,7 @@ fn requests_unmet_launch_continues_and_proxy_order() {
         assert_default_deny_zero_provision_network(
             &debug_config_json(&stderr)["network"],
             "requests",
+            proxy,
         );
         assert_eq!(
             stderr
@@ -10130,7 +10141,7 @@ fn assert_direct_zero_provision(out: &Output, context: &str) {
     let config = debug_config_json(&stderr);
 
     // 2. Exact default-deny authority, unchanged by any declared request.
-    assert_default_deny_zero_provision_network(&config["network"], context);
+    assert_default_deny_zero_provision_network(&config["network"], context, false);
     assert!(
         registered_secret_env_vars(&config).is_empty(),
         "{context}: no provider is provisioned"
@@ -10663,6 +10674,7 @@ fn a_direct_launch_keeps_independent_github_handling() {
     assert_default_deny_zero_provision_network(
         &debug_config_json(&stderr)["network"],
         "direct --repo",
+        false,
     );
 }
 

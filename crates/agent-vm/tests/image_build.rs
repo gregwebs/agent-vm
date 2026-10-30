@@ -389,11 +389,11 @@ fn layer_materialized(cache_dir: &Path, diff_id: &str) -> bool {
 /// "unchanged on failure" assertions.
 fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     let mut out = BTreeMap::new();
-    walk(root, &mut out);
+    walk(root, root, &mut out);
     out
 }
 
-fn walk(dir: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
+fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
@@ -402,8 +402,18 @@ fn walk(dir: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
     for entry in entries {
         let path = entry.expect("snapshot entry").path();
         let meta = fs::symlink_metadata(&path).expect("snapshot metadata");
+        // `cache/manifests/.msb-leases/*.lock` is runtime bookkeeping the
+        // vendored runtime creates beside the published metadata, not part of
+        // it: a launch takes a lease per content dir. Snapshotting it would
+        // make these counts depend on how many sandboxes exist.
         if meta.is_dir() {
-            walk(&path, out);
+            if dir == root
+                && root.ends_with("cache/manifests")
+                && path.file_name().is_some_and(|name| name == ".msb-leases")
+            {
+                continue;
+            }
+            walk(root, &path, out);
         } else {
             assert!(
                 meta.is_file(),
@@ -413,6 +423,23 @@ fn walk(dir: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
             out.insert(path.clone(), fs::read(path).expect("snapshot bytes"));
         }
     }
+}
+
+#[test]
+fn snapshots_skip_only_the_manifest_roots_lease_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifests = dir.path().join("cache/manifests");
+    let leases = manifests.join(".msb-leases");
+    let nested = manifests.join("image/.msb-leases");
+    let config = dir.path().join(".config/.msb-leases");
+    for path in [&leases, &nested, &config] {
+        fs::create_dir_all(path).unwrap();
+        fs::write(path.join("record"), b"kept except root lease").unwrap();
+    }
+    let files = snapshot(&manifests);
+    assert!(!files.contains_key(&leases.join("record")));
+    assert!(files.contains_key(&nested.join("record")));
+    assert!(snapshot(&dir.path().join(".config")).contains_key(&config.join("record")));
 }
 
 /// A valid fixture seeded at `raw` via a real build, returning its derived
@@ -2115,6 +2142,8 @@ fn multi_image_archive_publishes_every_named_image() {
 }
 #[test]
 fn late_alias_failure_restores_the_requested_tag() {
+    use std::os::unix::fs::MetadataExt as _;
+
     for build in [false, true] {
         let mut harness = Harness::new();
         let a = image_archive::write_docker_save(
@@ -2130,6 +2159,9 @@ fn late_alias_failure_restores_the_requested_tag() {
         );
         let target = cache(&harness.cache_dir()).image_metadata_path(&reference("a-target:dev"));
         let before = fs::read(&target).unwrap();
+        // Keep the old inode alive: a replacement cannot reuse its number.
+        let original = fs::File::open(&target).unwrap();
+        let original_inode = original.metadata().unwrap().ino();
         let blocked = cache(&harness.cache_dir())
             .image_metadata_path(&reference("z-source:dev"))
             .with_extension("json.part");
@@ -2153,9 +2185,20 @@ fn late_alias_failure_restores_the_requested_tag() {
         } else {
             "importing image"
         }));
-        assert!(stderr_of(&out).contains(".json.part"));
+        // A pre-publication failure leaves the requested metadata untouched:
+        // restore_reference is a no-op when its bytes still equal the prior
+        // bytes. A different inode with the original bytes therefore proves
+        // that publication replaced A before rollback atomically restored A.
+        // Keeping `original` open rules out inode reuse as a false negative.
+        assert_ne!(fs::metadata(&target).unwrap().ino(), original_inode);
         assert_eq!(fs::read(target).unwrap(), before);
         assert_imported(&harness.cache_dir(), "a-target:dev", &a[0]);
+        assert_ne!(a[0].config_digest, b[0].config_digest);
+        assert_ne!(
+            metadata(&harness.cache_dir(), "a-target:dev").config_digest,
+            b[0].config_digest,
+            "the failed second alias must not leave the requested tag on B"
+        );
     }
 }
 #[test]

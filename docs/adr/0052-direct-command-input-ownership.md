@@ -58,14 +58,15 @@ run which stops early may have read ahead — at most about three chunks (192 Ki
 one in the reader's hand, one queued, one in a pending write) — and those bytes
 are lost to any later reader of the same stdin file description.
 
-That 192 KiB is a **launcher-side** bound, and it is the only one. A completed
-`ExecSink::write` means the runtime accepted the frame, not that the program read
-it; agentd queues accepted stdin on its own, with an initial credit of 8 MiB, so
-a guest that closes stdin early can leave substantially more than 192 KiB
-consumed and discarded downstream of the launcher. There is no end-to-end loss
-bound without guest-consumption acknowledgements, and the runtime has none. The
-unit bound is therefore the launcher's memory; the native `large` row is the
-empirical check on the end-to-end transfer, not a loss bound.
+That 192 KiB is a **launcher-side** bound, not an end-to-end loss bound. The
+host's 64 KiB chunk is a read/backlog unit: the bundled SDK subframes each write
+at `stdin_chunk_size` (16 KiB by default), with a 64 KiB per-exec credit window.
+`ExecStdinAck` replenishes credit after delivery into the guest stdin pipe, not
+consumption by the program. A completed `ExecSink::write` means the frames were
+accepted, not that the program read them; an early-closing guest can still leave
+input unread in the pipe or downstream of the launcher. The unit bound remains
+the launcher's memory; the native `large` row checks the end-to-end transfer,
+not a loss bound.
 
 ### 2. EOF is an empty frame, and only `close()` may send one
 

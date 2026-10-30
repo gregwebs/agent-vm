@@ -35,9 +35,9 @@ cp Cargo.lock "$tmp/root.lock"
 python3 - "$tmp/root.lock" <<'PY'
 import pathlib, sys
 p = pathlib.Path(sys.argv[1]); s = p.read_text(); start = s.index('name = "msb_krun"'); end = s.index('[[package]]', start + 1)
-p.write_text(s[:start] + s[start:end].replace('version = "0.1.39"', 'version = "0.1.38"', 1) + s[end:])
+p.write_text(s[:start] + s[start:end].replace('version = "0.1.41"', 'version = "0.1.40"', 1) + s[end:])
 PY
-expect_failure 'msb_krun is 0.1.38' --root-lock "$tmp/root.lock"
+expect_failure 'msb_krun is 0.1.40' --root-lock "$tmp/root.lock"
 
 cp Cargo.lock "$tmp/source.lock"
 python3 - "$tmp/source.lock" <<'PY'
@@ -60,7 +60,7 @@ PY
 expect_failure 'locks disagree' --root-lock "$tmp/checksum.lock"
 
 cp Cargo.toml "$tmp/patch.toml"
-printf '\n[patch.crates-io]\nmsb_krun = "0.1.39"\n' >>"$tmp/patch.toml"
+printf '\n[patch.crates-io]\nmsb_krun = "0.1.41"\n' >>"$tmp/patch.toml"
 expect_failure 'overrides cohort crate' --root-manifest "$tmp/patch.toml"
 expect_failure 'firmware gitlink mode is' --gitlink-mode 100644
 expect_failure 'expected gitlink deadbeef' --gitlink deadbeef

@@ -209,6 +209,16 @@ def matrix():
     # Inject into the applied object, never expected defaults or launch goldens.
     # The shared G1/G2 helper is faulted through both actual launch callers.
     zero = rust("a_zero_provisioning_launch_boots_with_no_tls_overlay", LAUNCH)
+    # The helper's signature is the anchor, so it has to name the exact parameter
+    # list the test file compiles today (it gained `proxy_from_env` when the
+    # launcher began opting into ambient proxy discovery).
+    zero_helper = (
+        'fn assert_default_deny_zero_provision_network(\n'
+        '    network: &serde_json::Value,\n'
+        '    context: &str,\n'
+        '    proxy_from_env: bool,\n'
+        ') {'
+    )
     for name, injection in (
         ("secret", 'network["secrets"]["secrets"] = serde_json::json!([{ "env_var": "MSB_MUTANT" }]);'),
         ("header", 'network["secrets"]["header_credentials"] = serde_json::json!([{ "id": "mutant" }]);'),
@@ -222,8 +232,8 @@ def matrix():
     ):
         for prefix, command in (("zero-", zero), ("g1-", rust("default_tools_launch_with_their_declared_provisioning", LAUNCH))):
             add(prefix + name, TEST,
-                'fn assert_default_deny_zero_provision_network(network: &serde_json::Value, context: &str) {',
-                'fn assert_default_deny_zero_provision_network(network: &serde_json::Value, context: &str) {\n    let mut changed = network.clone();\n    let network = &mut changed;\n    ' + injection, command)
+                zero_helper,
+                zero_helper + '\n    let mut changed = network.clone();\n    let network = &mut changed;\n    ' + injection, command)
     add("overlay-equal-length", SRC + "credential_injection.rs",
         "let base_ports = intercepted_ports_of(&network)?;",
         'let base_ports = intercepted_ports_of(&network)?;\n        network = network.policy(serde_json::from_value(serde_json::json!({"default_egress":"deny","default_ingress":"allow","rules": [\n' +
