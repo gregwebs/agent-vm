@@ -70,6 +70,11 @@ if [[ "$guard_only" == false ]]; then
     # (its reentrant-sigterm teardown), and then a plain run of this script never
     # reaches it. CI runs the whole list either way.
     bash "$REPO_ROOT/script/test/e2e-image-cleanup-contract.sh"
+    # #473: reclaiming the build cache is an operator step, so what CI guards is
+    # that reporting prunes nothing, that `--prune` is one prune between two
+    # reads, and that a failed observation never reads as an empty cache. Cheap
+    # and boot-free, so it sits with #455's contract above.
+    bash "$REPO_ROOT/script/test/reclaim-docker-cache-contract.sh"
     bash "$REPO_ROOT/script/test/e2e-release-contract.sh"
     bash "$REPO_ROOT/script/test/egress-default-deny-contract.sh"
     bash "$REPO_ROOT/script/test/config-dir-guard-contract.sh"
@@ -112,6 +117,8 @@ syntax_check=(
     script/test/chrome-example-contract-test.sh
     script/test/e2e-release-contract.sh
     script/test/e2e-image-cleanup-contract.sh
+    script/test/reclaim-docker-cache.sh
+    script/test/reclaim-docker-cache-contract.sh
     script/test/persisted-network-live.sh
     script/test/persisted-network-contract.sh
     script/test/build-provenance-contract.sh
@@ -165,6 +172,8 @@ shellcheck_files=(
     script/test/chrome-example-contract-test.sh
     script/test/e2e-release-contract.sh
     script/test/e2e-image-cleanup-contract.sh
+    script/test/reclaim-docker-cache.sh
+    script/test/reclaim-docker-cache-contract.sh
     script/test/persisted-network-live.sh
     script/test/persisted-network-contract.sh
     script/test/build-provenance-contract.sh
@@ -263,6 +272,12 @@ assert_listed 'bash -n' 'script/test/lib/e2e-image-cleanup.sh' "${syntax_check[@
 assert_listed 'shellcheck' 'script/test/lib/e2e-image-cleanup.sh' "${shellcheck_files[@]}"
 assert_listed 'bash -n' 'script/test/e2e-image-cleanup-contract.sh' "${syntax_check[@]}"
 assert_listed 'shellcheck' 'script/test/e2e-image-cleanup-contract.sh' "${shellcheck_files[@]}"
+# #473's operator reclaim tool is executed by its own contract, so both the tool
+# and the contract are guard inputs.
+assert_listed 'bash -n' 'script/test/reclaim-docker-cache.sh' "${syntax_check[@]}"
+assert_listed 'shellcheck' 'script/test/reclaim-docker-cache.sh' "${shellcheck_files[@]}"
+assert_listed 'bash -n' 'script/test/reclaim-docker-cache-contract.sh' "${syntax_check[@]}"
+assert_listed 'shellcheck' 'script/test/reclaim-docker-cache-contract.sh' "${shellcheck_files[@]}"
 
 is_vendored() {
     [[ "$1" == vendor/microsandbox/* ]]

@@ -419,8 +419,26 @@ dedicated serial native host with no concurrent launches so process/catalog
 absence is meaningful. It removes the Docker refs it creates when it exits — the
 fixture tags it builds and the `localhost:<port>` refs its rows publish, matched
 by the run id each ref carries; a failed run keeps them for diagnosis, per the
-scratch policy at "Persisted network live check". The custom group always runs
-against a fresh private cache under the default msb config sources: it
+scratch policy at "Persisted network live check". It does not touch the Docker
+**build cache**, and must not (#473): the fixture build carries the run id only in
+the tag it is given, never in a layer, build arg or label, so the build itself is
+content-addressed and a repeat run *reuses* cache instead of adding to it —
+measured, a full `custom-image` run (nine fixture builds) created no cache record
+at all. A cold builder does pay for that build once and keeps what it deposits;
+the invariant is that a *repeat* run adds nothing, not that a run's footprint is
+zero. What does accumulate is the cache of builds whose content changes: the Rust
+agent image, base images, an operator's own `agent-vm image build`. That cache is
+the operator's, no run id can own it, and no trap may prune it. So #473's
+"prove the cache teardown is wired" criterion is finalized the other way: there
+is no cache teardown to prove, and the contract below pins the tool that does the
+reclaiming instead. Reclaiming is explicit: `bash
+script/test/reclaim-docker-cache.sh` prints the builder's own totals and what a
+prune would free, and `--prune` runs one `docker buildx prune --force` on the
+buildx *builder* the client has selected (`--builder NAME` for another; check
+`docker buildx ls`, since the selected builder need not be the docker-context
+daemon). BuildKit will not prune cache a build is using, but on a shared host
+`--prune` still deletes cache other local builds would reuse, so run it on the
+dedicated serial host. The custom group always runs against a fresh private cache under the default msb config sources: it
 neutralizes an inherited `AGENT_VM_SHARE_MSB_CACHE`, `AGENT_VM_MSB_CACHE_DIR` and
 `MSB_CONFIG_PATH`, while #260 uses a separate fresh shared cache. It makes no
 released-default or lineage claim.
@@ -942,6 +960,7 @@ while ordinary `setup` intentionally creates a verification guest.
 | `script/test/persisted-network-live.sh` | **no** | dedicated macOS arm64 PN rows; required evidence or written waiver |
 | `script/test/config-mounts-contract.sh` | yes (`ci-contracts.sh`) | host-only probe/preflight controls; no native evidence |
 | `script/test/e2e-image-cleanup-contract.sh` | yes (`ci-contracts.sh`) | decoy-`docker` sweep controls C1–C8, the production `cleanup_work` in a child (C9, C9b) and the guard-membership mutation (C10); no daemon, no native evidence |
+| `script/test/reclaim-docker-cache-contract.sh` | yes (`ci-contracts.sh`) | decoy-`docker` controls D1–D11 for the #473 reclaim tool: a report (with or without `--builder`) prunes nothing, `--prune` is one prune between two reads, and an unreachable builder, an unknown or partial `du` summary, an unreadable size, or an empty `--builder` value fails instead of reading as an empty cache; no daemon, no native evidence |
 | `script/test/config-mounts-live.sh` | **no** | dedicated macOS arm64 CM rows: candidate + runtime (`msb`, `libkrunfw`) identity, host/platform, digest, expected vs actual; required evidence or a `BLOCKED:` line |
 | `script/test/verus-verification.sh` | yes | machine-checked boundary contracts |
 | Image source/build/installer/runtime/egress audits | independent image repo CI | migrated; equivalence not verified by launcher CI |
