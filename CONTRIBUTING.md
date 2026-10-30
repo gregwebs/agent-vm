@@ -416,10 +416,14 @@ the record lock belongs) to prove the guest command does not run and the
 sandbox is torn down. These checks are always-run in the custom group, not
 opt-in: a missing prerequisite is a failure, not a skip. The suite must run on a
 dedicated serial native host with no concurrent launches so process/catalog
-absence is meaningful. The custom group always runs against a fresh private
-cache under the default msb config sources: it neutralizes an inherited
-`AGENT_VM_SHARE_MSB_CACHE`, `AGENT_VM_MSB_CACHE_DIR` and `MSB_CONFIG_PATH`, while #260 uses a separate fresh shared cache. It makes no released-default or lineage
-claim.
+absence is meaningful. It removes the Docker refs it creates when it exits — the
+fixture tags it builds and the `localhost:<port>` refs its rows publish, matched
+by the run id each ref carries; a failed run keeps them for diagnosis, per the
+scratch policy at "Persisted network live check". The custom group always runs
+against a fresh private cache under the default msb config sources: it
+neutralizes an inherited `AGENT_VM_SHARE_MSB_CACHE`, `AGENT_VM_MSB_CACHE_DIR` and
+`MSB_CONFIG_PATH`, while #260 uses a separate fresh shared cache. It makes no
+released-default or lineage claim.
 
 The custom group also runs `custom-image-host-pins` (#390, always-run): launch
 and pin registry content A before the SDK create, then observe exactly one
@@ -937,6 +941,7 @@ while ordinary `setup` intentionally creates a verification guest.
 | `script/test/build-provenance-contract.sh` | yes (`ci-contracts.sh`) | real Cargo/Git build-identity controls B1–B19; no native evidence |
 | `script/test/persisted-network-live.sh` | **no** | dedicated macOS arm64 PN rows; required evidence or written waiver |
 | `script/test/config-mounts-contract.sh` | yes (`ci-contracts.sh`) | host-only probe/preflight controls; no native evidence |
+| `script/test/e2e-image-cleanup-contract.sh` | yes (`ci-contracts.sh`) | decoy-`docker` sweep controls C1–C8, the production `cleanup_work` in a child (C9, C9b) and the guard-membership mutation (C10); no daemon, no native evidence |
 | `script/test/config-mounts-live.sh` | **no** | dedicated macOS arm64 CM rows: candidate + runtime (`msb`, `libkrunfw`) identity, host/platform, digest, expected vs actual; required evidence or a `BLOCKED:` line |
 | `script/test/verus-verification.sh` | yes | machine-checked boundary contracts |
 | Image source/build/installer/runtime/egress audits | independent image repo CI | migrated; equivalence not verified by launcher CI |

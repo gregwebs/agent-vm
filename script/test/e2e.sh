@@ -71,6 +71,17 @@
 # prerequisite here is deliberate — the identity receipts are worthless if the
 # pinned runtime silently came from somewhere else.
 #
+# Custom-image cleanup: the group removes the Docker refs it created when it
+# exits — the nine `agent-vm-e2e-258-<run id>:<target>` fixtures and every
+# `localhost:<port>/e2e-<issue>-<run id>:<tag>` ref the rows publish (the row's
+# issue number, not a range). Ownership is the run id embedded in each ref
+# (`-$RUN_ID` before the tag), so nothing is registered and a ref a row created
+# without that marker is not collected. A *failed* run keeps its refs and prints
+# them, with a copy-pasteable removal line, whenever the daemon can be listed
+# (when it cannot, the run log is the record), per CONTRIBUTING.md's "Persisted
+# network live check": "Scratch is removed only after successful cleanup;
+# failure retains it for diagnosis".
+#
 # All launches use owned private HOME/state/cache. Real native joins remain
 # manual; see CONTRIBUTING.md. No debug recommendation seam in released-image.
 
@@ -82,6 +93,12 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
 FIXTURE_DIR="$REPO_ROOT/script/test/fixtures/marker-free-image"
+
+# The run's own Docker refs and their removal live in a lib so the boot-free
+# contract (script/test/e2e-image-cleanup-contract.sh) exercises the same code
+# the EXIT trap runs; the native harness cannot run in CI (#455).
+# shellcheck source=script/test/lib/e2e-image-cleanup.sh
+. "$REPO_ROOT/script/test/lib/e2e-image-cleanup.sh"
 
 usage() {
   # Print the header comment (lines after the shebang) as the help text.
@@ -204,6 +221,17 @@ cleanup_work() {
   # RSS sampler behind: any of them can keep a pipe open and turn a failure
   # into an unbounded wait (#399 F2). A helper that fails is itself a failure.
   if ! cleanup_row_helpers; then
+    [ "$status" -ne 0 ] || status=1
+  fi
+  # #455: the run's own Docker refs are the one piece of its scratch the daemon
+  # keeps. Removed before the builder, whose teardown is the step most likely to
+  # fail for unrelated reasons and must not be able to strand them. A failed run
+  # keeps them: scratch is removed only after successful cleanup and a failure
+  # retains it for diagnosis (CONTRIBUTING.md's "Persisted network live check"),
+  # and a ref is that scratch — the fixtures `apk add` from live mirrors, the
+  # published registry refs cannot be rebuilt at all, and this same path deletes
+  # $OWNED_BUILDER with its cache.
+  if ! owned_images_cleanup "$status"; then
     [ "$status" -ne 0 ] || status=1
   fi
   if [ -n "$OWNED_BUILDER" ]; then
@@ -3881,15 +3909,19 @@ check_harness_negative() {
   # shell installs the production `cleanup_work`, leaves a held FIFO writer and a
   # running RSS sampler behind, and exits 7. The trap must reap both helpers and
   # keep the failure status. (The earlier control called cleanup_row_helpers
-  # directly, so deleting the call from the trap left it green.)
+  # directly, so deleting the call from the trap left it green.) #455 adds the
+  # Docker sweep to the same trap: its `declare -f` consumer contract is that a
+  # child must define `RUN_ID` and a `docker` function, so this child defines a
+  # decoy whose empty listing proves the sweep ran and, on a failed run, removed
+  # nothing.
   ctl_before="$result"
   local f5_status=0 trap_work="$WORK/probe-trap-work" trap_defs helper helper_pid sleeper_pid
-  local sleeper_waited=0
+  local sleeper_waited=0 trap_ls_count trap_rm_count
   rm -rf "$trap_work" || result=$((result + 1))
   mkdir -p "$trap_work" || result=$((result + 1))
-  trap_defs="$(declare -f cleanup_work cleanup_row_helpers stdin_writer_stop \
-    stdin_producer_stop stdin_capture_stop rss_sampler_stop stdin_writer_start \
-    rss_sample_until_exit)"
+  trap_defs="$(declare -f cleanup_work cleanup_row_helpers owned_images_cleanup \
+    stdin_writer_stop stdin_producer_stop stdin_capture_stop rss_sampler_stop \
+    stdin_writer_start rss_sample_until_exit)"
   {
     printf '%s\n' "$trap_defs"
     cat <<'CHILD'
@@ -3899,6 +3931,15 @@ set -u
 STDIN_CAPTURE_PID=""
 STDIN_PRODUCER_PID=""
 STDIN_RSS_PID=""
+# A synthetic run id: no real ref can carry it, so this decoy can never name one.
+RUN_ID="h16probe"
+# The sweep's seam is the `docker` command. Without this decoy the child would
+# reach the operator's real daemon through PATH; the empty listing is what makes
+# "a failed run removed nothing" an observation rather than an assumption.
+docker() {
+  printf '%s\n' "$*" >>"$WORK/docker.log"
+  return 0
+}
 trap cleanup_work EXIT
 fifo="$WORK/w.fifo"
 mkfifo "$fifo" || exit 90
@@ -3930,6 +3971,16 @@ CHILD
   if ! grep -q 'preserving .*probe-trap-work' "$WORK/probe-trap.out" 2>/dev/null; then
     echo "    FAIL: EXIT-trap control: cleanup_work did not report its own run"
     sed -n '1,20p' "$WORK/probe-trap.out" || true
+    result=$((result + 1))
+  fi
+  # The decoy saw the sweep's one listing and, because this child failed, no
+  # `image rm` at all: a keep-on-failure branch that removed refs would log one,
+  # and a sweep missing from the trap would log no listing.
+  trap_ls_count="$(grep -c '^image ls ' "$trap_work/docker.log" 2>/dev/null)" || trap_ls_count=0
+  trap_rm_count="$(grep -c '^image rm ' "$trap_work/docker.log" 2>/dev/null)" || trap_rm_count=0
+  if [ "$trap_ls_count" -ne 1 ] || [ "$trap_rm_count" -ne 0 ]; then
+    echo "    FAIL: EXIT-trap control: the Docker sweep saw $trap_ls_count listing(s) and $trap_rm_count removal(s), expected 1 and 0"
+    cat "$trap_work/docker.log" 2>/dev/null || true
     result=$((result + 1))
   fi
   for helper in writer sampler; do
@@ -4605,6 +4656,223 @@ LAUNCH
   stdin_identity_must_reject "a firmware gitlink for another path" \
     "$stub_runtime" "160000 commit $stub_stamp"$'\t'"vendor/other" "$stub_stamp"
   control_report "h24 stdin-identity-receipts" "$ctl_before"
+
+
+  # (h25)-(h29) #455: the EXIT trap's Docker sweep, against the real daemon.
+  # A planted ref comes from `docker import` of an empty (or one-file) tar: no
+  # network, no VM, and it carries *this* run's marker, so "the sweep removed its
+  # own ref and nothing else" is an observation of the daemon rather than of a
+  # stub. Every control removes its own containers and refs unconditionally after
+  # its assertions, so a killed row cannot leak out of this check either.
+  #
+  # Each child runs the production `cleanup_work` -- dumped with `declare -f` in
+  # the h16-trap pattern -- with this run's RUN_ID, no owned builder, its own
+  # $WORK, and the exit status under test; extra arguments are forwarded to `env`
+  # so a control can hand the child a `PATH` or an unreachable daemon.
+  # `cleanup_work`'s success path `rm -rf`s that work dir, so the child's log is
+  # written outside it.
+  run_cleanup_trap_child() {
+    local tag="$1" status="$2" child_work script defs
+    shift 2
+    child_work="$probe_dir/$tag-work"
+    script="$probe_dir/$tag-child.sh"
+    defs="$(declare -f cleanup_work cleanup_row_helpers owned_images_cleanup)" || return 1
+    rm -rf "$child_work" || return 1
+    mkdir -p "$child_work" || return 1
+    {
+      printf '%s\n' "$defs"
+      printf 'set -u\ntrap cleanup_work EXIT\nexit %s\n' "$status"
+    } >"$script" || return 1
+    env "$@" WORK="$child_work" RUN_ID="$RUN_ID" OWNED_BUILDER="" \
+      bash "$script" >"$probe_dir/$tag.out" 2>&1
+  }
+  # A ref from a killed row would turn an exact receipt assertion into a count of
+  # two, so a plant always starts from an absent ref.
+  plant_empty_image() {
+    docker image rm -f "$1" >/dev/null 2>&1 || true
+    tar -czf - -T /dev/null | docker import - "$1" >/dev/null 2>&1
+  }
+
+  # (h25) A green run removes the ref it owns: one listing, one batch `image rm`,
+  # one re-listing, and exactly one candidate in the receipt. A sweep that named
+  # foreign refs or a `<none>` line would report more than one.
+  ctl_before="$result"
+  local h25_ref="agent-vm-e2e-258-$RUN_ID:cleanup-probe-455" h25_status=0
+  if ! plant_empty_image "$h25_ref"; then
+    echo "    FAIL: cleanup control: could not plant $h25_ref"
+    result=$((result + 1))
+  fi
+  if run_cleanup_trap_child h25 0; then h25_status=0; else h25_status=$?; fi
+  if [ "$h25_status" -ne 0 ]; then
+    echo "    FAIL: cleanup control: a green run's cleanup exited $h25_status"
+    cat "$probe_dir/h25.out" || true
+    result=$((result + 1))
+  fi
+  if docker image inspect "$h25_ref" >/dev/null 2>&1; then
+    echo "    FAIL: cleanup control: $h25_ref is still listed after a green run's cleanup"
+    result=$((result + 1))
+  fi
+  if ! grep -qE '^ *owned images: 1 removed, 0 still present$' "$probe_dir/h25.out"; then
+    echo "    FAIL: cleanup control: the receipt did not report exactly this run's one ref"
+    cat "$probe_dir/h25.out" || true
+    result=$((result + 1))
+  fi
+  docker image rm -f "$h25_ref" >/dev/null 2>&1 || true
+  control_report "h25 cleanup-removes-owned-image" "$ctl_before"
+
+
+  # (h26) A ref the run would own but the daemon does not list is not a failure,
+  # and no removal is attempted for it. The `docker` shim logs argv and forwards
+  # to the real binary: the empty candidate set is therefore the daemon's answer,
+  # not a stub's, while "no `image rm`" stays an observation.
+  ctl_before="$result"
+  local h26_bin="$probe_dir/h26-bin" h26_log="$probe_dir/h26-docker.log"
+  local h26_status=0 h26_ls=0 h26_receipts=0
+  rm -rf "$h26_bin" || result=$((result + 1))
+  mkdir -p "$h26_bin" || result=$((result + 1))
+  {
+    echo '#!/bin/bash'
+    printf 'printf "%%s\\n" "$*" >>"%s"\n' "$h26_log"
+    printf 'exec "%s" "$@"\n' "$REAL_DOCKER"
+  } >"$h26_bin/docker" || result=$((result + 1))
+  chmod 755 "$h26_bin/docker" || result=$((result + 1))
+  : >"$h26_log" || result=$((result + 1))
+  if run_cleanup_trap_child h26 0 PATH="$h26_bin:$PATH"; then h26_status=0; else h26_status=$?; fi
+  if [ "$h26_status" -ne 0 ]; then
+    echo "    FAIL: cleanup control: cleanup failed with no owned ref listed (exit $h26_status)"
+    cat "$probe_dir/h26.out" || true
+    result=$((result + 1))
+  fi
+  h26_receipts="$(grep -c 'owned images:' "$probe_dir/h26.out" 2>/dev/null || true)"
+  if [ "$h26_receipts" -ne 0 ]; then
+    echo "    FAIL: cleanup control: cleanup reported removals it never attempted"
+    cat "$probe_dir/h26.out" || true
+    result=$((result + 1))
+  fi
+  h26_ls="$(grep -c '^image ls ' "$h26_log" 2>/dev/null || true)"
+  if [ "$h26_ls" -ne 1 ] || grep -q '^image rm ' "$h26_log"; then
+    echo "    FAIL: cleanup control: with no owned ref listed the sweep made $h26_ls listing(s) and $(grep -c '^image rm ' "$h26_log" 2>/dev/null || true) removal(s), expected 1 and 0"
+    cat "$h26_log" || true
+    result=$((result + 1))
+  fi
+  rm -rf "$h26_bin" || result=$((result + 1))
+  control_report "h26 missing-owned-image-is-not-a-failure" "$ctl_before"
+
+
+  # (h27) A candidate still listed after the batch fails cleanup and is named,
+  # whatever the batch's own status said. The container holds one ref, so the
+  # measured batch exits 1 *while removing the other*: only the re-listing can
+  # tell the two apart, and a clean run must not exit 0 over a real survivor.
+  ctl_before="$result"
+  local h27_held="agent-vm-e2e-258-$RUN_ID:cleanup-held"
+  local h27_free="agent-vm-e2e-258-$RUN_ID:cleanup-free"
+  local h27_name="e2e-455-$RUN_ID" h27_src="$probe_dir/h27-src" h27_status=0
+  docker rm -f "$h27_name" >/dev/null 2>&1 || true
+  docker image rm -f "$h27_held" "$h27_free" >/dev/null 2>&1 || true
+  rm -rf "$h27_src" || result=$((result + 1))
+  mkdir -p "$h27_src" || result=$((result + 1))
+  : >"$h27_src/held" || result=$((result + 1))
+  # Two distinct images on purpose: identical content would make the batch name
+  # two tags of one image, and the held container would untag both.
+  if ! plant_empty_image "$h27_free"; then
+    echo "    FAIL: cleanup control: could not plant $h27_free"
+    result=$((result + 1))
+  fi
+  if ! tar -czf - -C "$h27_src" held | docker import - "$h27_held" >/dev/null 2>&1; then
+    echo "    FAIL: cleanup control: could not plant $h27_held"
+    result=$((result + 1))
+  fi
+  if ! docker create --name "$h27_name" "$h27_held" /nonexistent >/dev/null 2>&1; then
+    echo "    FAIL: cleanup control: could not hold $h27_held with a container"
+    result=$((result + 1))
+  fi
+  if run_cleanup_trap_child h27 0; then h27_status=0; else h27_status=$?; fi
+  if [ "$h27_status" -ne 1 ]; then
+    echo "    FAIL: cleanup control: cleanup exited $h27_status, not 1, while a container held an owned ref"
+    cat "$probe_dir/h27.out" || true
+    result=$((result + 1))
+  fi
+  # The lib echoes `docker image rm`'s own stderr, and Docker's conflict line
+  # names the ref it refused, so grepping the child's whole output for the ref
+  # would pass on the daemon's prose alone. These are the verdict's own lines: the
+  # count, the named survivor, and the receipt.
+  if ! grep -qF "    FAIL: 1 of this run's own refs survived removal:" "$probe_dir/h27.out"; then
+    echo "    FAIL: cleanup control: the survivor was not reported as a failed removal"
+    cat "$probe_dir/h27.out" || true
+    result=$((result + 1))
+  fi
+  if ! grep -qE '^        agent-vm-e2e-258-'"$RUN_ID"':cleanup-held$' "$probe_dir/h27.out"; then
+    echo "    FAIL: cleanup control: the verdict did not name the surviving ref"
+    cat "$probe_dir/h27.out" || true
+    result=$((result + 1))
+  fi
+  if ! grep -qE '^ *owned images: 1 removed, 1 still present$' "$probe_dir/h27.out"; then
+    echo "    FAIL: cleanup control: the receipt did not report one removed and one survivor"
+    cat "$probe_dir/h27.out" || true
+    result=$((result + 1))
+  fi
+  if docker image inspect "$h27_free" >/dev/null 2>&1; then
+    echo "    FAIL: cleanup control: the ref no container held survived the batch"
+    result=$((result + 1))
+  fi
+  docker rm -f "$h27_name" >/dev/null 2>&1 || true
+  docker image rm -f "$h27_held" "$h27_free" >/dev/null 2>&1 || true
+  control_report "h27 owned-image-removal-failure-fails" "$ctl_before"
+
+
+  # (h28) A failed run keeps its refs: nothing is removed, the status survives
+  # the trap, and the operator gets the refs plus one copy-pasteable removal line
+  # (CONTRIBUTING.md's scratch policy, which the trap comment cites).
+  ctl_before="$result"
+  local h28_ref="agent-vm-e2e-258-$RUN_ID:cleanup-kept" h28_status=0
+  if ! plant_empty_image "$h28_ref"; then
+    echo "    FAIL: cleanup control: could not plant $h28_ref"
+    result=$((result + 1))
+  fi
+  if run_cleanup_trap_child h28 7; then h28_status=0; else h28_status=$?; fi
+  if [ "$h28_status" -ne 7 ]; then
+    echo "    FAIL: cleanup control: the failed run's cleanup changed the status to $h28_status"
+    cat "$probe_dir/h28.out" || true
+    result=$((result + 1))
+  fi
+  if ! grep -qF "preserving this run's Docker refs" "$probe_dir/h28.out"; then
+    echo "    FAIL: cleanup control: the failed run did not report the refs it kept"
+    cat "$probe_dir/h28.out" || true
+    result=$((result + 1))
+  fi
+  if ! grep -qF "remove them with: docker image rm $h28_ref" "$probe_dir/h28.out"; then
+    echo "    FAIL: cleanup control: the failed run printed no copy-pasteable removal line"
+    cat "$probe_dir/h28.out" || true
+    result=$((result + 1))
+  fi
+  if ! docker image inspect "$h28_ref" >/dev/null 2>&1; then
+    echo "    FAIL: cleanup control: the failed run did not keep $h28_ref"
+    result=$((result + 1))
+  fi
+  docker image rm -f "$h28_ref" >/dev/null 2>&1 || true
+  control_report "h28 failed-run-keeps-owned-images" "$ctl_before"
+
+
+  # (h29) A daemon that cannot be asked is not "nothing to remove": the listing
+  # failure fails a green run's cleanup and issues no removal.
+  ctl_before="$result"
+  local h29_status=0
+  if run_cleanup_trap_child h29 0 -u DOCKER_CONTEXT DOCKER_HOST=tcp://127.0.0.1:1; then
+    h29_status=0
+  else
+    h29_status=$?
+  fi
+  if [ "$h29_status" -ne 1 ]; then
+    echo "    FAIL: cleanup control: an unreachable daemon left the run's status at $h29_status"
+    cat "$probe_dir/h29.out" || true
+    result=$((result + 1))
+  fi
+  if ! grep -qE '^ *FAIL: could not list local images' "$probe_dir/h29.out"; then
+    echo "    FAIL: cleanup control: an unreachable daemon was not reported as a listing failure"
+    cat "$probe_dir/h29.out" || true
+    result=$((result + 1))
+  fi
+  control_report "h29 owned-image-listing-failure-is-not-absence" "$ctl_before"
 
 
   # (t1) #400 B1: the shared evidence root is validated once per run, then every
@@ -6558,7 +6826,19 @@ custom_image_default_upgrade() {
   AGENT_VM_RETAINED_BIN="$AGENT_VM_DEV_BIN"
   mkdir -p "$RETAINED_HOME/docker" "$RETAINED_STATE/msb-home" || return 1
   printf '{"auths":{}}\n' > "$RETAINED_HOME/docker/config.json"
-  UPGRADE_DOCKER_HOST="${DOCKER_HOST:-$(docker context inspect --format '{{.Endpoints.docker.Host}}')}" || return 1
+  # The publication client must address the same daemon the `docker` wrapper
+  # does, or the refs it tags are not in the store cleanup lists (#455 D6). The
+  # CLI lets DOCKER_CONTEXT override DOCKER_HOST, so mirror that precedence
+  # rather than preferring DOCKER_HOST. `custom_image_host_pins` derives its own
+  # `docker_host` from DOCKER_HOST alone and keeps it, but its only client
+  # (`pins_avm image import --docker`) reads the daemon, so a mismatch there
+  # cannot strand a ref: this site is the one that publishes into the store the
+  # sweep removes from.
+  if [ -n "${DOCKER_CONTEXT:-}" ]; then
+    UPGRADE_DOCKER_HOST="$(docker context inspect "$DOCKER_CONTEXT" --format '{{.Endpoints.docker.Host}}')" || return 1
+  else
+    UPGRADE_DOCKER_HOST="${DOCKER_HOST:-$(docker context inspect --format '{{.Endpoints.docker.Host}}')}" || return 1
+  fi
   case "$UPGRADE_DOCKER_HOST" in
     unix://*) ;;
     *) echo '    BLOCKER: #262 fixtures require a local Unix Docker endpoint for credential-isolated publication'; return 1 ;;
