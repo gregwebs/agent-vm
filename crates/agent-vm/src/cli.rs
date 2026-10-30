@@ -1730,7 +1730,7 @@ mod tests {
     /// **#395 / C1's CLI half.** The entry `parse_from` hands to dispatch is the
     /// project helper carrying the *hidden project* `pi`'s facets, never the
     /// user's. `doctor` renders the same facts (`credentials=none;
-    /// provisions=anthropic; persist=1`) from the same `into_launch_catalog`
+    /// provisions=anthropic; persist=3 (own 1)`) from the same `into_launch_catalog`
     /// seam, which `tests/config_doctor.rs` asserts through the real binary; this
     /// pins the entry the launch actually receives.
     #[test]

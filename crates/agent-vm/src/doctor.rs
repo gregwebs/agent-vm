@@ -113,8 +113,8 @@ use clap::Args as ClapArgs;
 
 use crate::boot_image;
 use crate::config::{
-    ConfigConflict, ConfigReport, ConfiguredImage, ConfiguredImages, LaunchCatalog, TierReport,
-    TierStatus, Tool, ToolOrigin,
+    CatalogEntry, ConfigConflict, ConfigReport, ConfiguredImage, ConfiguredImages, LaunchCatalog,
+    TierReport, TierStatus, ToolOrigin,
 };
 use crate::credential_provider::{CredentialProvider, ProviderSet};
 use crate::credential_resolver;
@@ -837,11 +837,7 @@ fn describe_config(report: ConfigReport) -> (String, Option<anyhow::Error>, Opti
     let (failure, catalog) = match report.into_launch_catalog() {
         Ok(catalog) => {
             for (index, entry) in catalog.as_slice().iter().enumerate() {
-                out.push_str(&format!(
-                    "  {}. {}\n",
-                    index + 1,
-                    describe_tool(entry.tool(), entry.provisioned())
-                ));
+                out.push_str(&format!("  {}. {}\n", index + 1, describe_tool(entry)));
             }
             if catalog.has_shell_fallback() {
                 out.push_str(
@@ -1026,23 +1022,44 @@ fn describe_configured_image(image: Option<&ConfiguredImage>) -> String {
     }
 }
 
-fn describe_tool(tool: &Tool, provisioned: ProviderSet) -> String {
-    // Both columns render through the same helper, in `CredentialProvider::ALL`
-    // order. `credentials` is stored in *declaration* order
-    // (`validate_credentials` — a plain map/collect), so rendering it directly
-    // beside an `ALL`-ordered `provisions=` would show the same set in two
-    // orders for a tool declaring `["copilot","anthropic"]`, which reads as a
-    // bug. Canonicalize both to `ALL` order; the shipped rows are already in
+/// One `N. <name> -> ...` verb row.
+///
+/// The two closure columns report what a launch of this verb resolves, matching
+/// the launch itself: `provisions=` is [`CatalogEntry::provisioned`] and
+/// `persist=` is [`CatalogEntry::persist`], each folded over the same `tools`
+/// closure — never the tool's own declaration (#429). `credentials=` stays the
+/// tool's own declared **built-in** providers, the set the launch's provider
+/// check reads; a custom `credentials.yaml` service is resolved from its
+/// authorization at launch and appears in no column here. A closure can add
+/// paths the row's own tool does not declare, so the resolved persist count
+/// names the own count in parentheses when the two differ (`persist=3 (own
+/// 1)`); equal counts render as a bare number.
+fn describe_tool(entry: &CatalogEntry) -> String {
+    let tool = entry.tool();
+    // Both provider columns render through the same helper, in
+    // `CredentialProvider::ALL` order. `credentials` is stored in *declaration*
+    // order (`validate_credentials` — a plain map/collect), so rendering it
+    // directly beside an `ALL`-ordered `provisions=` would show the same set in
+    // two orders for a tool declaring `["copilot","anthropic"]`, which reads as
+    // a bug. Canonicalize both to `ALL` order; the shipped rows are already in
     // that order, so no existing expectation changes.
     let credentials = provider_names(ProviderSet::new(tool.credentials().iter().copied()).iter());
-    let provisions = provider_names(provisioned.iter());
+    let provisions = provider_names(entry.provisioned().iter());
+    let own_persist = tool.persist_count();
+    let resolved_persist = entry.persist().len();
+    let persist = if resolved_persist == own_persist {
+        resolved_persist.to_string()
+    } else {
+        format!("{resolved_persist} (own {own_persist})")
+    };
     let source = match tool.origin() {
         ToolOrigin::BuiltIn => "built-in".to_string(),
         ToolOrigin::User(file) => format!("user:{}", crate::one_line::path(file)),
         ToolOrigin::Project(file) => format!("project:{}", crate::one_line::path(file)),
     };
-    // Only surfaced when true, so the default-config rows for the six agents
-    // are byte-identical to before (`interactive_shell` is `shell`-only).
+    // Only surfaced when true, so this field leaves the default-config rows for
+    // the six agents exactly as they were (`interactive_shell` is
+    // `shell`-only; #429 changed the shell row's `persist=`, not this suffix).
     let interactive_shell = if tool.is_interactive_shell() {
         "; interactive_shell=true"
     } else {
@@ -1064,11 +1081,10 @@ fn describe_tool(tool: &Tool, provisioned: ProviderSet) -> String {
     };
     format!(
         "{} -> \"{}\"; args={}; credentials={credentials}; \
-         provisions={provisions}; persist={}; source={source}{interactive_shell}{env}{requests}",
+         provisions={provisions}; persist={persist}; source={source}{interactive_shell}{env}{requests}",
         crate::config::escape_str(tool.name()),
         crate::config::escape_str(tool.command()),
         tool.arg_count(),
-        tool.persist_count(),
     )
 }
 
@@ -1573,7 +1589,7 @@ resolved: built-in defaults; launch-verb order
   4. opencode -> "opencode"; args=0; credentials=openai,opencode-static; provisions=openai,opencode-static; persist=0; source=built-in; network_requests=api.openai.com,auth.openai.com,chatgpt.com,models.opencode.ai
   5. claude -> "claude"; args=1; credentials=anthropic; provisions=anthropic; persist=0; source=built-in; network_requests=api.anthropic.com,mcp-proxy.anthropic.com,platform.claude.com
   6. copilot -> "copilot"; args=1; credentials=copilot; provisions=copilot; persist=0; source=built-in
-  7. shell -> "bash"; args=2; credentials=none; provisions=anthropic,openai,opencode-static,copilot; persist=0; source=built-in; interactive_shell=true; env=1
+  7. shell -> "bash"; args=2; credentials=none; provisions=anthropic,openai,opencode-static,copilot; persist=1 (own 0); source=built-in; interactive_shell=true; env=1
 
 ==> credentials.yaml (launch credentials)
 anthropic  authorized for this launch (replaces the host built-in)
@@ -2469,7 +2485,7 @@ A fresh database will be created on the next `agent-vm shell`/`run`.
 
         assert!(
             text.contains(
-                "shell -> \"bash\"; args=2; credentials=none; provisions=anthropic,openai,opencode-static,copilot; persist=0; source=built-in; interactive_shell=true; env=1"
+                "shell -> \"bash\"; args=2; credentials=none; provisions=anthropic,openai,opencode-static,copilot; persist=1 (own 0); source=built-in; interactive_shell=true; env=1"
             ),
             "{text}"
         );
@@ -2886,7 +2902,7 @@ credentials:
             "opencode -> \"opencode\"; args=0; credentials=openai,opencode-static; provisions=openai,opencode-static; persist=0; source=built-in",
             "claude -> \"claude\"; args=1; credentials=anthropic; provisions=anthropic; persist=0; source=built-in",
             "copilot -> \"copilot\"; args=1; credentials=copilot; provisions=copilot; persist=0; source=built-in",
-            "shell -> \"bash\"; args=2; credentials=none; provisions=anthropic,openai,opencode-static,copilot; persist=0; source=built-in; interactive_shell=true; env=1",
+            "shell -> \"bash\"; args=2; credentials=none; provisions=anthropic,openai,opencode-static,copilot; persist=1 (own 0); source=built-in; interactive_shell=true; env=1",
         ];
         for (i, (name, names)) in expected.into_iter().enumerate() {
             let row = text
@@ -2923,28 +2939,25 @@ credentials:
             format!("{base}network_requests = [\"b.example:8443\",\"a.example\"]\n"),
         )
         .unwrap();
-        let report = config_report(Some(&user), &project);
-        // `resolved()` is the retained arena; every assertion here is about the
-        // launch winner, so it names the first one rather than an arena position.
-        let describe = |report: &crate::config::ConfigReport| {
-            describe_tool(
-                report
-                    .resolved()
-                    .launch_tools()
-                    .next()
-                    .expect("one launch winner"),
-                ProviderSet::new([]),
-            )
+        // The rendered row is the catalog's: `describe_tool` takes the resolved
+        // entry, so every assertion here reads the launch verb the user sees.
+        let describe = |user: &std::path::Path, project: &std::path::Path| {
+            let mut catalog = config_report(Some(user), project)
+                .into_launch_catalog()
+                .expect("one launch winner");
+            describe_tool(&catalog.take_entry("t").expect("`t` is a verb"))
         };
-        assert!(describe(&report).ends_with("; network_requests=a.example,tcp://b.example:8443"));
+        assert!(
+            describe(&user, &project)
+                .ends_with("; network_requests=a.example,tcp://b.example:8443")
+        );
         let names: Vec<_> = (0..9).map(|i| format!("\"n{i}.example\"")).collect();
         std::fs::write(
             &user,
             format!("{base}network_requests = [{}]\n", names.join(",")),
         )
         .unwrap();
-        let report = config_report(Some(&user), &project);
-        assert!(describe(&report).ends_with("; network_requests=n0.example,n1.example,n2.example,n3.example,n4.example,n5.example,n6.example,n7.example,+1 more"));
+        assert!(describe(&user, &project).ends_with("; network_requests=n0.example,n1.example,n2.example,n3.example,n4.example,n5.example,n6.example,n7.example,+1 more"));
         std::fs::write(&project, base).unwrap();
         assert!(
             describe_config(config_report(Some(&user), &project))
@@ -2956,8 +2969,7 @@ credentials:
             format!("{base}network_requests = [\"sk-test-sensitivevalue\"]\n"),
         )
         .unwrap();
-        let report = config_report(Some(&user), &project);
-        let row = describe(&report);
+        let row = describe(&user, &project);
         assert!(row.ends_with("; network_requests=sk-test-sensitivevalue"));
         assert_eq!(row.matches("sk-test-sensitivevalue").count(), 1);
     }

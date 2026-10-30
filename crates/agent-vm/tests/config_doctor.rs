@@ -1892,17 +1892,21 @@ fn a_hidden_definition_is_not_a_verb_but_still_provisions_its_tier() {
         )),
         "{stdout}"
     );
-    // The helper's row is its own requirement set and the project closure.
+    // The helper's row is its own requirement set and the project closure: the
+    // persist count is the three paths that launch links (hidden project `pi`,
+    // `bridge`, `helper`), with its own single declaration named beside it
+    // (#429).
     assert!(
         rows.iter().any(|row| row.starts_with(
-            "helper -> \"helper\"; args=0; credentials=none; provisions=anthropic; persist=1"
+            "helper -> \"helper\"; args=0; credentials=none; provisions=anthropic; persist=3 (own 1); source=project:"
         )),
         "{rows:?}"
     );
-    // The user's verb provisions only its own facets.
+    // The user's verb provisions only its own facets, so its counts agree and no
+    // own-count suffix appears.
     assert!(
         rows.iter().any(|row| row.starts_with(
-            "pi -> \"user-pi\"; args=0; credentials=openai; provisions=openai; persist=1"
+            "pi -> \"user-pi\"; args=0; credentials=openai; provisions=openai; persist=1; source=user:"
         )),
         "{rows:?}"
     );
@@ -2044,20 +2048,28 @@ fn shell_rows_report_the_tier_local_provisioning_set() {
     let omitted = Harness::new();
     omitted.write_user(
         "[[tools]]\nname = \"shell\"\ncommand = \"bash\"\n\
-         [[tools]]\nname = \"sib\"\ncommand = \"sib\"\ncredentials = [\"copilot\"]\n",
+         [[tools]]\nname = \"sib\"\ncommand = \"sib\"\ncredentials = [\"copilot\"]\npersist = [\".sib\"]\n",
     );
     omitted.write_project(
-        "[[tools]]\nname = \"proj\"\ncommand = \"proj\"\ncredentials = [\"anthropic\"]\n",
+        "[[tools]]\nname = \"proj\"\ncommand = \"proj\"\ncredentials = [\"anthropic\"]\npersist = [\".proj\"]\n",
     );
     let out = omitted.run_doctor();
     assert_success(&out);
     let stdout = stdout_of(&out);
+    // The omitted `tools` is the wildcard, so the row reports the resolved
+    // provisioning set *and* the resolved persist set: the same-file sibling's
+    // `.sib` is linked by a shell launch (#429). The project's `.proj` is a
+    // different tier, so the wildcard never reaches it.
     assert!(
-        stdout.contains("shell -> \"bash\"; args=0; credentials=none; provisions=copilot"),
+        stdout.contains(
+            "shell -> \"bash\"; args=0; credentials=none; provisions=copilot; persist=1 (own 0); source=user:"
+        ),
         "{stdout}"
     );
     assert!(
-        stdout.contains("proj -> \"proj\"; args=0; credentials=anthropic; provisions=anthropic"),
+        stdout.contains(
+            "proj -> \"proj\"; args=0; credentials=anthropic; provisions=anthropic; persist=1"
+        ),
         "{stdout}"
     );
     assert!(!stdout.contains("`shell` was not declared"), "{stdout}");
