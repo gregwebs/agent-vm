@@ -729,8 +729,9 @@ impl Tool {
     }
 
     /// The tool's own declared paths, in declaration order. `persist_count`
-    /// stays for `doctor`, which must not grow a second way to read the same
-    /// field.
+    /// stays for `doctor`, which reports this count *beside* the resolved one
+    /// ([`CatalogEntry::persist`]) rather than deriving both from this slice
+    /// (#429).
     pub(crate) fn persist(&self) -> &[PersistPath] {
         &self.persist
     }

@@ -1663,7 +1663,17 @@ inside keyring; no secret bytes cross the adapter. Neither a no-prompt guarantee
 nor a universal absent-account NoEntry guarantee is made.
 
 It also prints the resolved [tool configuration](#tool-configuration) — the same
-verb list `agent-vm --help` shows.
+verb list `agent-vm --help` shows. Each verb row reports what that launch
+resolves: `credentials=` is the tool's own declared built-in providers, while
+`provisions=` and `persist=` are folded over its `tools` closure — the same
+closure the launch links. Because a closure can add paths the row's own tool
+does not declare, the `persist=` count names the own count in parentheses
+whenever the two differ, e.g. `persist=3 (own 1)`.
+
+Neither provider column shows a custom `credentials.yaml` service:
+`credentials=` lists the four built-in names only, and a custom service is
+resolved from its authorization at launch. A `required: true` authorization
+whose value is missing still refuses that launch, and no row here reports it.
 
 **Launch-aware credentials.** A `credentials.yaml` entry named after a built-in
 provider replaces that provider's credential handling for every launch that
