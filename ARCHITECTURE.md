@@ -534,7 +534,7 @@ default/strict invalidation policy and its accepted blind spots.
 
 `./script/check-runtime-provenance.sh` checks both independent Cargo roots (the
 outer workspace and `vendor/microsandbox`) for the identical official crates.io
-`msb_krun*` 0.1.39 cohort and checksum map, plus the pinned `vendor/libkrunfw`
+`msb_krun*` 0.1.41 cohort and checksum map, plus the pinned `vendor/libkrunfw`
 gitlink, firmware version/ABI, and the x86 source-configuration contract. This
 establishes **source identity**, not an attestation that a given executable came
 from that source; release provenance is separate, unfinished work.
