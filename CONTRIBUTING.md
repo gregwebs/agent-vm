@@ -326,17 +326,19 @@ longer certify zero cases — but a valid filter still does not prove a row was
 entered: compare the entered/PASS rows with the list, and select
 `harness-negative` explicitly to run the harness self-test.
 
-A case whose published expectation the branch cannot meet yet stays in its row as
-an acceptance row and is **pending**: the default selection skips it, printing a
-`SKIP: <row>/<case> pending ...` line that names the issue and counting it as
-skipped (never as passed), and records the same line in
-`<evidence>/pending-skips.txt`. `AGENT_VM_E2E_INCLUDE_PENDING=1` runs it instead,
-announcing that it is on demand. Today the pending cases are the
-`signal-*-unhandled` ones: the shell convention `128 + N` for a guest killed by
-the forwarded signal needs the runtime to carry `WIFSIGNALED`/`WTERMSIG`, which is
-issue #467. The sibling `-unhandled-slice1` cases are what the same guest proves
-today: the launcher's `255` (the runtime's unknown `-1`, passed through) and that
-it is not `128 + N`.
+Every signal row is required evidence; there is no opt-in and no pending gate.
+Each `signal-*-unhandled` row asserts the shell convention `128 + N` for a guest
+killed by the forwarded signal, which is the guest's *own* reported identity
+(`WIFSIGNALED`/`WTERMSIG`, ADR-0053), and `signal-{pty,stream}-self-term` asserts
+the same number for a guest that signals itself with no host signal involved. A
+row that lives only in a fake relay cannot prove the fork's `waitpid` decoding or
+guest frame construction: the Linux agentd tests and the rebuilt-runtime VM rows
+are what do, and a new-SDK/old-runtime pair honestly reports 255.
+
+The legacy-runtime compatibility case is exercised at the relay seam instead of by
+a VM row: a runtime that omits `signal` (an absent field, not `signal: null`)
+reports the code unchanged, which the fork's protocol and SDK tests cover, along
+with old-format CBOR fixtures pinned as literal bytes.
 
 The release join runs the actual installed candidate with `env -i`, private
 state/cache, no image override/debug seam on first default acquisition, calibrated

@@ -869,9 +869,9 @@ reserved-looking one. The direct route adds only its own failures:
 |---|---|
 | 127 | the executable is absent from the effective guest `PATH` (also: a bare name that resolves to a *directory*, which `type -P` does not treat as an executable) |
 | 126 | the path exists but is not executable, or a directory named by path |
-| 128 + N | the launcher forced the shutdown after a host `SIGINT`/`SIGTERM` (see below) |
+| 128 + N | the guest reported that signal N killed it, **or** the launcher forced the shutdown after a host `SIGINT`/`SIGTERM` (see below) |
 | 125 | the launcher itself failed: configuration, guest setup, stdin forwarding, transport/output or cleanup |
-| 255 | the guest's own status is unknown: a command killed *inside* the VM by a signal the launcher did not forward, until issue #467 can name that signal |
+| 255 | the guest's own status is unknown and nothing reported a signal: a runtime too old to carry the guest's signal identity, or agentd losing its notification of the child's exit |
 | 2 | a pre-boot usage error (absent/empty PROGRAM, invalid UTF-8, malformed launch options) |
 
 125 does not cover panics, aborts or signals. Sink failures count as 125: a
@@ -884,12 +884,21 @@ forwarded to the guest instead of ending the launcher, and the guest gets five
 seconds to exit; its own status is then reported, including 0. A second
 interrupt, or the five seconds running out, tears the sandbox down and reports
 `128 + N` for the signal that ended it. A guest that ignores the signal is
-therefore still stopped, and the VM is always torn down. `128 + N` is the summary
-of a launcher decision, never a guess at how the guest died: a session whose
-transport died is 125, and a guest killed inside the VM by a signal the launcher
-did not send has no status the launcher can read yet — its `-1` is passed through
-and the process exits **255**, as the table above says. Naming that signal
-arrives with issue #467.
+therefore still stopped, and the VM is always torn down.
+
+`128 + N` is never a guess at how the guest died. The guest reports its own
+terminating signal (`WTERMSIG`, through agentd, the runtime and the SDK), so a
+command that kills itself — `kill -TERM $$` with no host signal involved at all —
+reports **143**, and a guest that dies of `SIGTERM` after receiving a forwarded
+`SIGINT` reports **143**, not 130: the guest's identity outranks the host's. A
+command that exits `143` on its own still reports `143` without claiming signal
+death, and a session whose transport died before the guest reported is 125. The
+launcher's *own* decision explains `128 + N` in exactly two cases, both of which it
+states in an `Interrupted by signal N` notice: the fixed five-second grace expired
+with the guest still running, or a second interrupt arrived (which reports the
+interrupting signal's own number, so `INT` then `TERM` is 143, not 130). A runtime
+too old to report identity keeps the previous behaviour: its `-1` is passed
+through and the process exits **255**, as the table above says.
 
 **What is retained.** Image selection, the project cwd, guest identity
 (`--root` or the host user), mounts, the persistent HOME/state, default-deny
@@ -983,10 +992,15 @@ detach escape.
 
 Output backpressure is not an error: if the consumer of a PTY session stops
 reading, the session stalls (bounded memory, nothing dropped) exactly as a native
-terminal write would. Genuinely unwritable output (a closed pipe) or loss of the
-runtime is a launcher failure: the host terminal is restored, the VM is torn down,
-and the status is 125 — a guest success is never reported over truncated output.
-The host terminal is restored after a normal exit, an error, and cancellation.
+terminal write would. Genuinely unwritable output (a closed pipe) is a launcher
+failure: the host terminal is restored, the VM is torn down, and the status is
+125 — a guest success is never reported over truncated output. The runtime
+disappearing is a failure only *before* the guest has reported its exit, because
+only then is the status unknown; once the guest has reported, a runtime that ends
+or can no longer be observed can truncate what is left of its output but cannot
+change the status, so the guest's own number stands and the truncation is not
+reported separately. The host terminal is restored after a normal exit, an error,
+and cancellation.
 
 `Ctrl-C` means two different things here, and is never forwarded twice. Under a
 PTY the terminal is in raw mode, so `Ctrl-C` is the byte `0x03` delivered to the

@@ -782,8 +782,15 @@ mod tests {
                 }
                 codec::write_message(
                     &mut io,
-                    &Message::with_payload(MessageType::ExecExited, id, &ExecExited { code: 7 })
-                        .unwrap(),
+                    &Message::with_payload(
+                        MessageType::ExecExited,
+                        id,
+                        &ExecExited {
+                            code: 7,
+                            signal: None,
+                        },
+                    )
+                    .unwrap(),
                 )
                 .await
                 .expect("relay write");
@@ -843,8 +850,15 @@ mod tests {
                 wait_for_file(&dir, "fault").await;
                 codec::write_message(
                     &mut io,
-                    &Message::with_payload(MessageType::ExecExited, id, &ExecExited { code: 7 })
-                        .unwrap(),
+                    &Message::with_payload(
+                        MessageType::ExecExited,
+                        id,
+                        &ExecExited {
+                            code: 7,
+                            signal: None,
+                        },
+                    )
+                    .unwrap(),
                 )
                 .await
                 .expect("relay write");
@@ -936,8 +950,15 @@ mod tests {
                 .expect("relay write");
                 codec::write_message(
                     &mut io,
-                    &Message::with_payload(MessageType::ExecExited, id, &ExecExited { code: 7 })
-                        .unwrap(),
+                    &Message::with_payload(
+                        MessageType::ExecExited,
+                        id,
+                        &ExecExited {
+                            code: 7,
+                            signal: None,
+                        },
+                    )
+                    .unwrap(),
                 )
                 .await
                 .expect("relay write");
@@ -995,7 +1016,15 @@ mod tests {
         wait_for_file(dir, "finish").await;
         codec::write_message(
             io,
-            &Message::with_payload(MessageType::ExecExited, id, &ExecExited { code: 0 }).unwrap(),
+            &Message::with_payload(
+                MessageType::ExecExited,
+                id,
+                &ExecExited {
+                    code: 0,
+                    signal: None,
+                },
+            )
+            .unwrap(),
         )
         .await
         .expect("relay write");

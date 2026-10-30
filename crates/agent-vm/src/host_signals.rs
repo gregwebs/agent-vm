@@ -39,18 +39,20 @@
 //!
 //! # The status table, and what is never inferred
 //!
-//! `128 + N` is produced **only** for a shutdown this launcher decided on: the
-//! grace expired, or a second interrupt arrived. It is never derived from a guest
-//! status of `-1`, from a missing exit event, or from the last signal we happened
-//! to forward — a guest that died of `SIGKILL` inside the VM, or a session whose
-//! transport died, would then be reported as `143` because we once sent
-//! `SIGTERM`, which states a cause nobody observed. Telling a guest's *own*
-//! signal death from its exit status needs the runtime to carry the fact (#467,
-//! `WIFSIGNALED`/`WTERMSIG`), and until it does this module reports what it saw.
+//! `128 + N` has exactly two proven sources: the guest's own terminating signal as
+//! its kernel reported it (`WIFSIGNALED`/`WTERMSIG`, carried through agentd, the
+//! protocol and the SDK), and a shutdown this launcher decided on — the grace
+//! expired, or a second interrupt arrived. Neither is derived from the last signal
+//! we happened to forward: a guest that died of `SIGKILL` inside the VM would then
+//! be reported as `143` because we once sent `SIGTERM`, which states a cause nobody
+//! observed. A guest code is never reinterpreted as signal death either: a shell
+//! `exit 143` stays `143` without claiming a signal.
 //!
 //! | Outcome | [`SessionEnd`] |
 //! |---|---|
-//! | Guest reported a code (0, 126, 127, an unknown `-1`, …) | `Guest(code)`, passed through — so an unknown `-1` leaves the process as 255 |
+//! | Guest reported a code, no signal (0, 126, 127, an unknown `-1`, …) | `Guest { code, signal: None }`, passed through — so an unknown `-1` leaves the process as 255 |
+//! | Guest reported its terminating signal | `Guest { signal: Some(n), .. }` → `128 + n` |
+//! | Runtime too old to report identity | `Guest { code, signal: None }` — the slice-1 numbers |
 //! | Forced shutdown with the guest still running | `Forced(signal)` → `128 + N` |
 //! | The stream ended without any status | an `Err` in the caller (125) |
 //! | Transport loss, no definitive exit | an `Err` in the caller (125) |
@@ -73,6 +75,7 @@
 
 use std::future::Future;
 use std::io::{PipeReader, PipeWriter};
+use std::num::NonZeroU8;
 use std::os::fd::{AsRawFd as _, RawFd};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -135,6 +138,38 @@ impl HostSignal {
     }
 }
 
+/// The terminating signal a guest reported for itself, parsed at the boundary.
+///
+/// The number arrives from the guest: agentd decodes `WTERMSIG` and the value
+/// travels through the protocol and the SDK as a plain `i32` the guest chose.
+/// `128 + signal` is arithmetic on an exit status, so it is only ever applied to a
+/// value parsed here — `1..=127`, the range where `128 + N` still fits the one-byte
+/// status a shell reports. That is a representability bound, not a check that Linux
+/// defines the signal: `127` is deliberately accepted although Linux has no such
+/// signal number. A guest that reports `0`, a negative number or anything above 127
+/// gets `None`, which the status table already reads as "no identity": the raw code
+/// is passed through and no arithmetic happens at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GuestSignal(NonZeroU8);
+
+impl GuestSignal {
+    /// Parse the identity a runtime reported for this guest, once.
+    ///
+    /// This is the single place an SDK-reported signal becomes a number this
+    /// launcher will do arithmetic on, so the range check cannot be forgotten at
+    /// one call site and remembered at another.
+    pub(crate) fn reported(reported: Option<i32>) -> Option<Self> {
+        let reported = u8::try_from(reported?).ok()?;
+        let bounded = NonZeroU8::new(reported).filter(|number| number.get() <= 127)?;
+        Some(Self(bounded))
+    }
+
+    /// The signal number to map through the shell convention.
+    pub(crate) fn number(self) -> i32 {
+        i32::from(self.0.get())
+    }
+}
+
 /// A shutdown this launcher decided on: the guest is still running and will not
 /// be asked again.
 ///
@@ -175,13 +210,19 @@ pub(crate) enum SignalDecision {
 
 /// How a direct session ended, which is also how it must be torn down.
 ///
-/// The two variants are the status table's two halves: a guest status, reported
-/// as the guest gave it, and an explicit forced shutdown, the only source of
-/// `128 + N`.
+/// The two variants are the status table's two halves: a guest exit as the guest
+/// kernel reported it, and an explicit forced shutdown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SessionEnd {
-    /// The guest reported this status itself.
-    Guest(i32),
+    /// The guest reported this exit itself.
+    Guest {
+        /// Legacy exit code, `-1` when the guest did not exit normally.
+        code: i32,
+        /// The signal that terminated the guest process, when its kernel reported
+        /// one a launcher can report ([`GuestSignal`]). Never inferred from a host
+        /// signal, and never carried unparsed.
+        signal: Option<GuestSignal>,
+    },
     /// The launcher stopped waiting and will kill the sandbox's guest.
     Forced(ForcedShutdown),
 }
@@ -189,11 +230,18 @@ pub(crate) enum SessionEnd {
 impl SessionEnd {
     /// The launcher exit status for this end.
     ///
-    /// A guest status is passed through unchanged, `-1` and all: turning an
-    /// unknown status into a signal status is the inference this feature forbids.
+    /// A reported guest signal maps to the shell convention `128 + N`; that is the
+    /// guest's own identity, not an inference. A guest code is passed through
+    /// unchanged, `-1` and all, so an older runtime that cannot report identity —
+    /// or reports one outside [`GuestSignal`]'s range — keeps the previous numbers
+    /// (an unknown `-1` leaves the process as 255).
     pub(crate) fn exit_status(self) -> i32 {
         match self {
-            Self::Guest(code) => code,
+            Self::Guest {
+                signal: Some(signal),
+                ..
+            } => 128 + signal.number(),
+            Self::Guest { code, signal: None } => code,
             Self::Forced(forced) => forced.exit_status(),
         }
     }
@@ -823,13 +871,73 @@ mod tests {
     }
 
     #[test]
-    fn a_guest_status_is_passed_through_and_never_turned_into_a_signal_status() {
-        // The table's second row: an unknown or absent status is not evidence of
-        // a signal death, so `-1` leaves as `-1` (the legacy value) rather than
-        // as `128 + N`.
-        for code in [0, 1, 7, 126, 127, -1] {
-            assert_eq!(SessionEnd::Guest(code).exit_status(), code);
+    fn a_guest_code_is_passed_through_and_never_turned_into_a_signal_status() {
+        // A code alone is not evidence of signal death, so `-1` leaves as `-1`
+        // (the legacy value, 255 as a process status) rather than as `128 + N`.
+        for code in [0, 1, 7, 126, 127, 143, -1] {
+            assert_eq!(SessionEnd::Guest { code, signal: None }.exit_status(), code);
         }
+    }
+
+    #[test]
+    fn a_reported_guest_signal_maps_to_the_shell_convention() {
+        for (reported, expected) in [(15, 143), (9, 137), (2, 130), (1, 129)] {
+            let signal = GuestSignal::reported(Some(reported));
+            assert_eq!(signal.map(GuestSignal::number), Some(reported));
+            assert_eq!(
+                SessionEnd::Guest { code: -1, signal }.exit_status(),
+                expected,
+                "128 + the guest's own signal, and nothing else"
+            );
+            // A hostile frame that also carries a code: the identity outranks it,
+            // so no producer can make a code win by sending both. A real kernel
+            // reports one or the other, which is why `code: 7` with a signal is a
+            // deliberately inconsistent input rather than a modelled outcome.
+            assert_eq!(
+                SessionEnd::Guest { code: 7, signal }.exit_status(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn a_reported_signal_outside_the_shell_convention_is_no_identity() {
+        // Every one of these is a value a guest can put on the wire, and the
+        // status table must not do arithmetic on any of them: `0` is the SDK's
+        // "no identity" placeholder, a negative number and anything above 127
+        // could not be a process status, and `i32::MAX` used to panic in debug and
+        // wrap in release.
+        for reported in [0, -1, -128, 128, 200, i32::MAX, i32::MIN] {
+            assert_eq!(
+                GuestSignal::reported(Some(reported)),
+                None,
+                "{reported} is not a signal a launcher can report"
+            );
+            // Out-of-range metadata is treated as absent, so the raw code —
+            // including an unknown `-1` — still passes through untouched.
+            for code in [0, 7, -1] {
+                assert_eq!(
+                    SessionEnd::Guest {
+                        code,
+                        signal: GuestSignal::reported(Some(reported))
+                    }
+                    .exit_status(),
+                    code,
+                    "a guest reporting {reported} must keep its own code"
+                );
+            }
+        }
+        assert_eq!(GuestSignal::reported(None), None);
+        // The boundary itself is a valid identity; one past it is not.
+        assert_eq!(
+            GuestSignal::reported(Some(127)).map(GuestSignal::number),
+            Some(127)
+        );
+        assert_eq!(GuestSignal::reported(Some(128)), None);
+    }
+
+    #[test]
+    fn only_a_forced_end_uses_a_host_signal() {
         assert_eq!(
             SessionEnd::Forced(ForcedShutdown { signal: sigint() }).exit_status(),
             130

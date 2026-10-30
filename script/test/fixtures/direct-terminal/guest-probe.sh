@@ -14,7 +14,7 @@ set -euo pipefail
 mode="${1:-}"
 case "$mode" in
 identity|argv|input|stream-input|resize|wait|status) ;;
-signal-handle|signal-ignore|signal-unhandled) ;;
+signal-handle|signal-ignore|signal-unhandled|signal-self-term) ;;
 *)
     echo "guest-probe: unknown mode '${mode}'" >&2
     exit 64
@@ -124,7 +124,7 @@ probe_status() {
 
 # -------------------------------------------------- host signal supervision --
 #
-# The three guest behaviours a signal row needs. Each one reports SIGNAL-READY
+# The guest behaviours a signal row needs. Each one reports SIGNAL-READY
 # only after its traps are installed, so the driver never races the guest's own
 # setup, and each trap names the signal it received: the launcher's status alone
 # cannot tell a delivered signal from one that never arrived.
@@ -169,6 +169,40 @@ probe_signal_unhandled() {
     exit 0
 }
 
+# The guest kills **itself** with SIGTERM, and no host signal is involved.
+#
+# `kill -TERM "$$"` must run in this tracked top-level shell, never in a subshell,
+# a background job or a pipeline: agentd's watcher owns the exit of the process it
+# spawned, and a child shell's death would report that child instead. The host
+# releases the kill by writing an unguessable token into a project-relative file
+# it owns, which the guest sees through the project bind — so the death is
+# deliberate, observed and ordered, not a race. The bounds are explicit: a
+# readiness bound on the release file and a survival check after the kill.
+probe_signal_self_term() {
+    local release_name="${1:-}" token="${2:-}" deadline
+    if [ -z "$release_name" ] || [ -z "$token" ]; then
+        echo "SIGNAL-SELF-ARGV" >&2
+        exit 64
+    fi
+    # A forwarded signal must not decide this row: the guest's own TERM is the
+    # only identity it can report.
+    trap - TERM
+    echo "SIGNAL-READY"
+    deadline=$((SECONDS + 120))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        if [ -f "$release_name" ] && [ "$(cat "$release_name")" = "$token" ]; then
+            # $$ is this shell. agentd's watcher owns its exit status.
+            kill -TERM "$$"
+            # Reaching this line means the signal was ignored or mishandled.
+            echo "SIGNAL-SURVIVED"
+            exit 0
+        fi
+        sleep 0.2 || :
+    done
+    echo "SIGNAL-RELEASE-TIMEOUT"
+    exit 65
+}
+
 case "$mode" in
 identity) probe_identity ;;
 argv) probe_argv "$@" ;;
@@ -180,4 +214,5 @@ status) probe_status "$@" ;;
 signal-handle) probe_signal_handle "$@" ;;
 signal-ignore) probe_signal_ignore ;;
 signal-unhandled) probe_signal_unhandled ;;
+signal-self-term) probe_signal_self_term "$@" ;;
 esac

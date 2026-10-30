@@ -19,8 +19,8 @@ use crate::credential_provider;
 use crate::credential_resolver::{CredentialPreflight, MissingCredentialPolicy};
 use crate::direct_input::{GuestInputStatus, InputFailure, InputPump, InputSource};
 use crate::host_signals::{
-    ForcedShutdown, PendingSend, SessionEnd, Supervision, SupervisionStep, signal_send,
-    supervision_lost,
+    ForcedShutdown, GuestSignal, PendingSend, SessionEnd, Supervision, SupervisionStep,
+    signal_send, supervision_lost,
 };
 use crate::image_contract;
 use crate::launch_notice::{LaunchNotices, NoticeSink};
@@ -1795,7 +1795,9 @@ pub(crate) async fn launch(
                 .env("PATH", exec_path.clone())
         });
         match attach.await.map_err(anyhow::Error::new) {
-            Ok(code) => SessionEnd::Guest(code),
+            // `attach()` reports a bare code and carries no guest identity, so a
+            // legacy shell/catalog launch keeps its code-only status.
+            Ok(code) => SessionEnd::Guest { code, signal: None },
             Err(error) => {
                 let primary = exec_failure_primary(
                     contract_spawn_diagnostic(&image, &error),
@@ -1883,6 +1885,7 @@ pub(crate) async fn launch(
             ExecContext {
                 image: &image,
                 log_dir: &log_dir,
+                direct: direct_launch,
             },
             &mut supervision,
         )
@@ -1952,7 +1955,7 @@ where
 {
     let t_stop = Instant::now();
     let exit = match ended {
-        SessionEnd::Guest(_) => {
+        SessionEnd::Guest { .. } => {
             live_launch_result(
                 notices.emit("==> Stopping sandbox"),
                 direct,
@@ -1967,8 +1970,8 @@ where
                 "==> Interrupted by signal {}; tearing down the sandbox (exit {})",
                 forced.signal().number(),
                 // The status the operator will see, from the table rather than from
-                // a second expression of it: only a forced end reaches `128 + N`, and
-                // a teardown failure below still outranks it.
+                // a second expression of it: a teardown failure below still
+                // outranks it.
                 ended.exit_status()
             ));
             let exit = after_session(teardown, ended, command).await;
@@ -1979,7 +1982,7 @@ where
     if profile {
         let line = format!("[profile] stop+remove: {:?}", t_stop.elapsed());
         match ended {
-            SessionEnd::Guest(_) => notices.emit(line)?,
+            SessionEnd::Guest { .. } => notices.emit(line)?,
             SessionEnd::Forced(_) => notices.emit_detached(line).settle(),
         }
     }
@@ -2027,6 +2030,12 @@ struct ExecOutput<'a, O: tokio::io::AsyncWrite + Unpin, E: tokio::io::AsyncWrite
 struct ExecContext<'a> {
     image: &'a str,
     log_dir: &'a str,
+    /// Whether this is a direct command launch.
+    ///
+    /// Only direct launches report a guest signal as a shell status; the legacy
+    /// catalog stream keeps its code-only contract, so this flag is what stops a
+    /// shared lifecycle change from altering those exits.
+    direct: bool,
 }
 
 /// What a streamed exec does with guest stdin (#399).
@@ -2144,6 +2153,15 @@ async fn stream_exec_with_cleanup<
                             Some(PendingFrame::new(bytes.to_vec(), GuestStream::Stderr));
                     }
                     LoopStep::Exec(ExecStep::Event(ExecEvent::Exited { code })) => {
+                        // Read the identity the SDK published before this event,
+                        // once, before any drain or handle release, and parse it
+                        // here: this is where an SDK value becomes a number the
+                        // status table will do arithmetic on.
+                        let signal = if context.direct {
+                            GuestSignal::reported(handle.termination_signal())
+                        } else {
+                            None
+                        };
                         // Genuine stream loss outranks the guest's status.
                         // The SDK's local credit-window closure is different:
                         // reconcile it with this terminal event.
@@ -2153,7 +2171,7 @@ async fn stream_exec_with_cleanup<
                             }
                             // Closing the SDK credit window precedes Exited;
                             // it is not evidence of transport loss.
-                            _ => Ok(SessionEnd::Guest(code)),
+                            _ => Ok(SessionEnd::Guest { code, signal }),
                         };
                     }
                     LoopStep::Exec(ExecStep::Event(ExecEvent::Failed(payload))) => {
@@ -2587,7 +2605,11 @@ pub(crate) async fn after_session(
     command: &str,
 ) -> Result<i32> {
     match ended {
-        SessionEnd::Guest(exit) => {
+        SessionEnd::Guest { .. } => {
+            // The status the table assigns this guest end, reported once for both
+            // the cleanup diagnostic and the launcher exit code: a reported guest
+            // signal is `128 + N` here just as it is in the returned status.
+            let exit = ended.exit_status();
             let cleanup = cleanup_exec_sandbox(teardown).await;
             cleanup_after_exit(command, exit, cleanup)?;
             Ok(exit)
@@ -2730,6 +2752,13 @@ trait ExecEventSource {
 
     /// The control handle a forwarded host signal is sent on (#401).
     fn control(&self) -> Self::Control;
+
+    /// The guest-reported terminating signal, if the SDK published one before the
+    /// `Exited` event this source delivered (#467).
+    ///
+    /// Required, not defaulted: a stub that forgot it would silently report "no
+    /// reported signal" for a production result that carries one.
+    fn termination_signal(&self) -> Option<i32>;
 }
 
 impl ExecEventSource for microsandbox::sandbox::exec::ExecHandle {
@@ -2746,6 +2775,10 @@ impl ExecEventSource for microsandbox::sandbox::exec::ExecHandle {
 
     fn control(&self) -> Self::Control {
         microsandbox::sandbox::exec::ExecHandle::control(self)
+    }
+
+    fn termination_signal(&self) -> Option<i32> {
+        microsandbox::sandbox::exec::ExecHandle::termination_signal(self)
     }
 }
 
@@ -3535,7 +3568,12 @@ pub(crate) mod test_support {
                 stderr: &mut stderr,
                 policy: OutputErrorPolicy::DirectChecked,
             },
-            ExecContext { image, log_dir },
+            ExecContext {
+                image,
+                log_dir,
+                // The subprocess cases drive a direct streaming launch.
+                direct: true,
+            },
             supervision,
         )
         .await
@@ -4062,7 +4100,22 @@ mod tests {
     /// event, holding the paired `Sender` alive keeps `recv()` pending
     /// (simulates an exec stream that's still open), and dropping it makes
     /// `recv()` return `None` (simulates the stream ending).
-    struct StubEvents(tokio::sync::mpsc::Receiver<microsandbox::sandbox::exec::ExecEvent>);
+    struct StubEvents(
+        tokio::sync::mpsc::Receiver<microsandbox::sandbox::exec::ExecEvent>,
+        /// What the SDK's accessor reports for this source. `None` models a
+        /// legacy runtime or an ordinary exit; a case that asserts guest signal
+        /// identity supplies it here rather than inventing an event field.
+        Option<i32>,
+    );
+
+    impl StubEvents {
+        /// A source that never reports a guest signal.
+        fn without_signal(
+            events: tokio::sync::mpsc::Receiver<microsandbox::sandbox::exec::ExecEvent>,
+        ) -> Self {
+            Self(events, None)
+        }
+    }
 
     impl ExecEventSource for StubEvents {
         type Stdin = crate::direct_input::test_support::GatedGuestStdin;
@@ -4078,6 +4131,10 @@ mod tests {
 
         fn control(&self) -> Self::Control {
             RecordingControl::default()
+        }
+
+        fn termination_signal(&self) -> Option<i32> {
+            self.1
         }
     }
 
@@ -4108,7 +4165,7 @@ mod tests {
         tx.send(microsandbox::sandbox::exec::ExecEvent::Exited { code: 0 })
             .await
             .unwrap();
-        let mut events = StubEvents(rx);
+        let mut events = StubEvents::without_signal(rx);
         let mut runtime_exit = runtime_never_exits();
 
         let step = next_exec_step(
@@ -4134,7 +4191,7 @@ mod tests {
     async fn next_exec_step_reports_stream_ended_when_the_channel_closes() {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(tx);
-        let mut events = StubEvents(rx);
+        let mut events = StubEvents::without_signal(rx);
         let mut runtime_exit = runtime_never_exits();
 
         let step = tokio::time::timeout(
@@ -4170,7 +4227,7 @@ mod tests {
         // The stream is already closed by the time next_exec_step is
         // called — models the relay EOF having already been observed.
         drop(tx);
-        let mut events = StubEvents(rx);
+        let mut events = StubEvents::without_signal(rx);
         // `runtime_exit` is still in flight and resolves a little *after*
         // the stream close is observed — models `sandbox.wait()` completing
         // its reap/classification slightly behind the relay EOF, which is
@@ -4218,7 +4275,7 @@ mod tests {
     #[tokio::test]
     async fn next_exec_step_surfaces_runtime_exit_instead_of_hanging_on_a_silent_stream() {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
-        let mut events = StubEvents(rx);
+        let mut events = StubEvents::without_signal(rx);
         let mut runtime_exit = runtime_exited_now(17);
 
         let step = tokio::time::timeout(
@@ -4258,7 +4315,7 @@ mod tests {
         use microsandbox::sandbox::exec::ExecEvent;
 
         let (tx, rx) = tokio::sync::mpsc::channel(1);
-        let mut events = StubEvents(rx);
+        let mut events = StubEvents::without_signal(rx);
 
         let handle_lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
         let lock_for_future = handle_lock.clone();
@@ -6020,6 +6077,9 @@ options ndots:2 timeout:1";
         drop_log: crate::direct_input::test_support::DropLog,
         /// The transport a forwarded host signal is sent on.
         signalled: RecordingControl,
+        /// What the SDK's accessor reports once this source delivered `Exited`.
+        /// `None` models an ordinary exit or a legacy runtime.
+        termination_signal: Option<i32>,
     }
 
     impl ExecEventSource for TrackingEvents {
@@ -6038,6 +6098,10 @@ options ndots:2 timeout:1";
 
         fn control(&self) -> Self::Control {
             self.signalled.clone()
+        }
+
+        fn termination_signal(&self) -> Option<i32> {
+            self.termination_signal
         }
     }
 
@@ -6290,9 +6354,12 @@ options ndots:2 timeout:1";
     }
 
     fn stub_context() -> ExecContext<'static> {
+        // Legacy: these cases assert the shared lifecycle, which must not start
+        // reporting guest signal identity for a catalog launch.
         ExecContext {
             image: "stub-image",
             log_dir: "/logs/stub-sandbox",
+            direct: false,
         }
     }
 
@@ -6317,6 +6384,40 @@ options ndots:2 timeout:1";
         }
     }
 
+    /// How a stubbed exec was launched, and what the SDK reports for it.
+    ///
+    /// One named value rather than a trailing `bool, Option<i32>` pair: the two
+    /// facts are read together by every assertion (`a direct launch reports its
+    /// identity, a catalog launch does not`), so a call site names what it means
+    /// instead of leaving a reader to decode two adjacent arguments. Rust's distinct
+    /// types already reject swapping the pair; the gain here is readability.
+    #[derive(Clone, Copy)]
+    struct StreamLaunch {
+        /// A direct command launch, the only class that reports guest identity.
+        direct: bool,
+        /// What the SDK publishes for this exec, exactly as the accessor returns
+        /// it, so a hostile number can be driven through the same path.
+        termination_signal: Option<i32>,
+    }
+
+    impl StreamLaunch {
+        /// A catalog/legacy launch: never a reported identity.
+        fn catalog() -> Self {
+            Self {
+                direct: false,
+                termination_signal: None,
+            }
+        }
+
+        /// A direct launch with the guest report the SDK accessor returns.
+        fn direct(termination_signal: Option<i32>) -> Self {
+            Self {
+                direct: true,
+                termination_signal,
+            }
+        }
+    }
+
     /// Drive the production wrapper with a queued event list.
     async fn run_stream(
         teardown: &StubTeardown,
@@ -6333,6 +6434,7 @@ options ndots:2 timeout:1";
             StreamReceipts::none(),
             &mut supervision,
             RecordingControl::default(),
+            StreamLaunch::catalog(),
         )
         .await
     }
@@ -6356,12 +6458,19 @@ options ndots:2 timeout:1";
             receipts,
             &mut supervision,
             RecordingControl::default(),
+            StreamLaunch::catalog(),
         )
         .await
     }
 
     /// The whole production wrapper with every seam a test drives: the event
     /// handle's control transport and the session's supervision.
+    ///
+    /// Every argument is a separate seam (teardown, events, sinks, output policy,
+    /// drop receipts, supervision, signal transport, launch identity), so the count
+    /// is the coverage. The pair that used to be ambiguous — a bare `bool` beside an
+    /// `Option<i32>` — is now [`StreamLaunch`].
+    #[allow(clippy::too_many_arguments)]
     async fn run_stream_full(
         teardown: &StubTeardown,
         events: Vec<microsandbox::sandbox::exec::ExecEvent>,
@@ -6370,7 +6479,12 @@ options ndots:2 timeout:1";
         receipts: StreamReceipts,
         supervision: &mut Supervision,
         signalled: RecordingControl,
+        launch: StreamLaunch,
     ) -> Result<i32> {
+        let StreamLaunch {
+            direct,
+            termination_signal,
+        } = launch;
         let (sender, receiver) = tokio::sync::mpsc::channel(events.len().max(1) + 1);
         for event in events {
             sender.send(event).await.unwrap();
@@ -6385,15 +6499,17 @@ options ndots:2 timeout:1";
                 .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))),
             drop_log: teardown.drop_log(),
             signalled,
+            termination_signal,
         };
         let runtime_exit: RuntimeExit<'_> = match receipts.runtime {
             Some(dropped) => Box::pin(PendingRuntimeExit { dropped }),
             None => runtime_never_exits(),
         };
         let StreamSinks { stdout, stderr } = sinks;
-        // These tests assert the *status* a session reports. A forced end
-        // reports `128 + N` through the same accessor, and the subprocess
-        // harness in `main.rs` is what asserts the forced end itself.
+        // These tests assert the *status* a session reports, so they need only the
+        // guest-end half of the table. A forced end never reaches the SDK accessor
+        // at all: it is `SessionEnd::Forced`, built from the supervision decision,
+        // and the subprocess harness in `main.rs` is what asserts that end.
         stream_exec_with_cleanup(
             teardown,
             handle,
@@ -6404,7 +6520,10 @@ options ndots:2 timeout:1";
                 stderr,
                 policy,
             },
-            stub_context(),
+            ExecContext {
+                direct,
+                ..stub_context()
+            },
             supervision,
         )
         .await
@@ -6642,6 +6761,7 @@ options ndots:2 timeout:1";
             dropped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             drop_log: teardown.drop_log(),
             signalled: RecordingControl::default(),
+            termination_signal: None,
         };
         let runtime_exit: RuntimeExit<'_> = Box::pin(ControlledRuntimeExit {
             receiver: Some(runtime_receiver),
@@ -6977,6 +7097,7 @@ options ndots:2 timeout:1";
             StreamReceipts::none(),
             &mut supervision,
             signalled.clone(),
+            StreamLaunch::catalog(),
         )
         .await
         .expect("a handled signal leaves the guest's own status");
@@ -6985,6 +7106,163 @@ options ndots:2 timeout:1";
             signalled.signals(),
             [libc::SIGINT],
             "the guest must have been told, once, with the signal's own number"
+        );
+    }
+
+    /// The shared streaming lifecycle must not change a catalog launch.
+    ///
+    /// The same guest report — raw code `-1`, signal `15` — is delivered twice:
+    /// a direct launch reports the guest's own `128 + 15`, a legacy one keeps the
+    /// raw code, so `-1` stays `-1` (`exit(-1)`, status 255).
+    #[tokio::test]
+    async fn only_a_direct_streaming_launch_reports_a_guest_signal() {
+        use microsandbox::sandbox::exec::ExecEvent;
+
+        let teardown = StubTeardown::new();
+        let mut stdout = StubSink::default();
+        let mut stderr = StubSink::default();
+        let direct = run_stream_full(
+            &teardown,
+            vec![ExecEvent::Exited { code: -1 }],
+            StreamSinks {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+            },
+            OutputErrorPolicy::LegacyBestEffort,
+            StreamReceipts::none(),
+            &mut Supervision::legacy(),
+            RecordingControl::default(),
+            StreamLaunch::direct(Some(libc::SIGTERM)),
+        )
+        .await
+        .expect("a guest-reported signal is an ordinary guest end");
+        assert_eq!(direct, 143, "a direct launch reports 128 + guest signal");
+
+        let teardown = StubTeardown::new();
+        let mut stdout = StubSink::default();
+        let mut stderr = StubSink::default();
+        let legacy = run_stream_full(
+            &teardown,
+            vec![ExecEvent::Exited { code: -1 }],
+            StreamSinks {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+            },
+            OutputErrorPolicy::LegacyBestEffort,
+            StreamReceipts::none(),
+            &mut Supervision::legacy(),
+            RecordingControl::default(),
+            StreamLaunch {
+                direct: false,
+                termination_signal: Some(libc::SIGTERM),
+            },
+        )
+        .await
+        .expect("a legacy launch reports the code it always did");
+        assert_eq!(
+            legacy, -1,
+            "a catalog launch keeps the raw code even when the runtime reports identity"
+        );
+    }
+
+    /// A guest-supplied signal number is validated where it enters the launcher.
+    ///
+    /// The number crosses the runtime boundary as an `i32` the guest controls, and
+    /// `128 + N` used to be arithmetic on it directly: `-128` reported success and
+    /// `i32::MAX` panicked in a debug build. Every out-of-range value must be read
+    /// as "no identity" so the raw code still passes through.
+    #[tokio::test]
+    async fn only_a_valid_reported_signal_becomes_a_status_on_a_direct_stream() {
+        use microsandbox::sandbox::exec::ExecEvent;
+
+        for reported in [0, -1, -128, 128, 200, i32::MAX, i32::MIN] {
+            let teardown = StubTeardown::new();
+            let mut stdout = StubSink::default();
+            let mut stderr = StubSink::default();
+            let status = run_stream_full(
+                &teardown,
+                vec![ExecEvent::Exited { code: -1 }],
+                StreamSinks {
+                    stdout: &mut stdout,
+                    stderr: &mut stderr,
+                },
+                OutputErrorPolicy::LegacyBestEffort,
+                StreamReceipts::none(),
+                &mut Supervision::legacy(),
+                RecordingControl::default(),
+                StreamLaunch::direct(Some(reported)),
+            )
+            .await
+            .expect("a guest end is a status, whatever the metadata says");
+            assert_eq!(
+                status, -1,
+                "a reported signal of {reported} is not an identity: the guest's own \
+                 code must pass through, not `128 + N`"
+            );
+        }
+
+        // The valid control: the same path does report a real signal.
+        let teardown = StubTeardown::new();
+        let mut stdout = StubSink::default();
+        let mut stderr = StubSink::default();
+        let status = run_stream_full(
+            &teardown,
+            vec![ExecEvent::Exited { code: -1 }],
+            StreamSinks {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+            },
+            OutputErrorPolicy::LegacyBestEffort,
+            StreamReceipts::none(),
+            &mut Supervision::legacy(),
+            RecordingControl::default(),
+            StreamLaunch::direct(Some(libc::SIGTERM)),
+        )
+        .await
+        .expect("a valid reported signal is an ordinary guest end");
+        assert_eq!(status, 143, "128 + the guest's own SIGTERM");
+    }
+
+    /// A signalled guest whose teardown fails is still a failure (125): the
+    /// cleanup failure outranks the `128 + N` the status would otherwise earn.
+    #[tokio::test]
+    async fn a_signalled_guest_with_a_failed_cleanup_is_a_failure() {
+        let failing = StubTeardown::failing("remove", "remove failed");
+        let error = after_session(
+            &failing,
+            SessionEnd::Guest {
+                code: -1,
+                signal: GuestSignal::reported(Some(libc::SIGTERM)),
+            },
+            "probe",
+        )
+        .await
+        .expect_err("a cleanup failure is not a status");
+        assert!(
+            error.to_string().contains("exited 143"),
+            "the diagnostic names the status the table assigns: {error:#}"
+        );
+        assert!(
+            error.to_string().contains("could not be cleaned up"),
+            "the cleanup failure must be the reported cause: {error:#}"
+        );
+
+        let teardown = StubTeardown::new();
+        let exit = after_session(
+            &teardown,
+            SessionEnd::Guest {
+                code: -1,
+                signal: GuestSignal::reported(Some(libc::SIGTERM)),
+            },
+            "probe",
+        )
+        .await
+        .expect("a clean teardown is a status");
+        assert_eq!(exit, 143);
+        assert_eq!(
+            teardown.log(),
+            ["stop", "remove"],
+            "a signalled guest is an ordinary guest end, not a forced one"
         );
     }
 
@@ -7597,7 +7875,7 @@ options ndots:2 timeout:1";
         events
             .try_send(microsandbox::sandbox::exec::ExecEvent::Exited { code: 0 })
             .expect("the event is ready too");
-        let mut events = StubEvents(events_rx);
+        let mut events = StubEvents::without_signal(events_rx);
         let mut runtime_exit = runtime_never_exits();
         let mut pump = Some(pump);
         let mut pending = None;
@@ -7758,6 +8036,11 @@ options ndots:2 timeout:1";
 
         fn control(&self) -> Self::Control {
             RecordingControl::default()
+        }
+
+        fn termination_signal(&self) -> Option<i32> {
+            // This source only ever yields output, never a terminal exit.
+            None
         }
     }
 
