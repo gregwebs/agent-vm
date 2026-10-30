@@ -230,7 +230,11 @@ cleanup_work() {
   # retains it for diagnosis (CONTRIBUTING.md's "Persisted network live check"),
   # and a ref is that scratch — the fixtures `apk add` from live mirrors, the
   # published registry refs cannot be rebuilt at all, and this same path deletes
-  # $OWNED_BUILDER with its cache.
+  # $OWNED_BUILDER with its cache. The *daemon's* build cache is deliberately not
+  # swept (#473): it is shared, content-addressed scratch whose owner is the
+  # operator, not a run — the fixture build puts the run id only in the tag, so a
+  # repeat run reuses that cache instead of extending it. Reclaiming it is the
+  # explicit operator step `script/test/reclaim-docker-cache.sh --prune`.
   if ! owned_images_cleanup "$status"; then
     [ "$status" -ne 0 ] || status=1
   fi
@@ -657,6 +661,13 @@ SHIM
 build_custom_fixtures() {
   local tag="$1" target="$2" platform
   echo "==> Building fixture target $target as $tag"
+  # The run id reaches Docker only as this tag, never as a build arg, label or
+  # layer input, so every run of a given fixture is the same cache key: a repeat
+  # run is a cache hit, not a deposit (#473). A cold builder pays for that build
+  # once and keeps it, so what this rules out is a *per-run* deposit — which is
+  # exactly why the trap must not prune the shared build cache: it is not this
+  # run's to remove. Keep the build free of run-derived inputs;
+  # `script/test/reclaim-docker-cache.sh` is the operator's explicit reclaim path.
   docker buildx build --platform linux/arm64 --load \
     --build-arg "ALPINE=alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8" \
     -t "$tag" --target "$target" "$FIXTURE_DIR" >/dev/null || return 1
