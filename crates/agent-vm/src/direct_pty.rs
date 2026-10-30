@@ -238,6 +238,34 @@ async fn poll_pending(pending: &mut Option<PendingSend>) -> anyhow::Result<()> {
     }
 }
 
+/// A local credit-window closure awaiting the SDK's EPIPE/terminal event.
+/// Bounded so an SDK contract breach cannot leave the terminal raw forever.
+struct PendingStdinClosure {
+    error: anyhow::Error,
+    deadline: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl PendingStdinClosure {
+    fn from_error(error: anyhow::Error) -> anyhow::Result<Self> {
+        if !crate::direct_input::is_stdin_closed(&error) {
+            return Err(error);
+        }
+        Ok(Self {
+            error,
+            deadline: Box::pin(tokio::time::sleep(
+                crate::run::STREAM_END_RUNTIME_EXIT_GRACE,
+            )),
+        })
+    }
+}
+
+async fn closure_expired(pending: &mut Option<PendingStdinClosure>) {
+    match pending {
+        Some(pending) => pending.deadline.as_mut().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// The session proper. Every exit path returns through here, so [`run`]'s
 /// epilogue is unconditional.
 async fn session_loop<R>(
@@ -257,6 +285,7 @@ where
     // holding more here would absorb the backpressure the guest must feel.
     let mut sending_output: Option<PendingSend> = None;
     let mut sending_input: Option<PendingSend> = None;
+    let mut pending_stdin_closure: Option<PendingStdinClosure> = None;
     // The session's first resize, seeded exactly like a later `SIGWINCH`: it is
     // a send a peer can stall, so it is held as a branch rather than awaited
     // before the loop (see `run`).
@@ -279,7 +308,11 @@ where
             }
             sent = poll_pending(&mut sending_input), if sending_input.is_some() => {
                 sending_input = None;
-                sent?;
+                if let Err(error) = sent {
+                    pending_stdin_closure = Some(PendingStdinClosure::from_error(error)?);
+                    forwarding = false;
+                    host.input.stop();
+                }
             }
             sent = poll_pending(&mut resizing), if resizing.is_some() => {
                 resizing = None;
@@ -310,6 +343,16 @@ where
             // One event at a time, and none while a frame is still being
             // queued: that is what makes a stalled consumer stall the guest.
             event = handle.recv(), if sending_output.is_none() => {
+                // Terminal events win even at expiry, but a continuously ready
+                // output stream must not extend the closure grace indefinitely.
+                if matches!(&event, Some(ExecEvent::Started { .. } | ExecEvent::Stdout(_) | ExecEvent::Stderr(_)))
+                    && pending_stdin_closure.as_ref().is_some_and(|pending| {
+                        tokio::time::Instant::now() >= pending.deadline.deadline()
+                    })
+                    && let Some(pending) = pending_stdin_closure.take()
+                {
+                    return Err(pending.error);
+                }
                 match event {
                     Some(ExecEvent::Started { .. }) => {}
                     // A PTY merges both guest channels into one stream, so a
@@ -330,7 +373,14 @@ where
                         // path: `errno_name` decides first, so a payload that
                         // names EPIPE without a number is still a guest close.
                         match classify_stdin_error(&payload) {
-                            GuestInputStatus::GuestClosedInput => forwarding = false,
+                            GuestInputStatus::GuestClosedInput => {
+                                forwarding = false;
+                                // Drop a write still waiting on SDK credit;
+                                // EPIPE confirms any local window-close error.
+                                sending_input = None;
+                                pending_stdin_closure = None;
+                                host.input.stop();
+                            },
                             GuestInputStatus::Failed(text) => {
                                 return Err(anyhow::anyhow!(
                                     "forwarding host input to the guest failed: {text}"
@@ -343,6 +393,13 @@ where
                             "the guest terminal session ended without reporting an exit status"
                         ));
                     }
+                }
+            }
+            // A ready guest exit/EPIPE or interrupt outranks the local closure
+            // deadline, including on the poll in which the deadline expires.
+            _ = closure_expired(&mut pending_stdin_closure), if pending_stdin_closure.is_some() => {
+                if let Some(pending) = pending_stdin_closure.take() {
+                    return Err(pending.error);
                 }
             }
             chunk = host.input.recv(), if forwarding && sending_input.is_none() => {
@@ -1087,6 +1144,32 @@ mod tests {
                 0
             );
             attributes
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stdin_credit_closure_waits_boundedly_but_transport_errors_do_not() {
+        let closed =
+            anyhow::Error::new(MicrosandboxError::Runtime("execution stdin closed".into()))
+                .context("forwarding host input to the guest");
+        let mut pending = Some(PendingStdinClosure::from_error(closed).unwrap());
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                closure_expired(&mut pending),
+            )
+            .await
+            .is_err()
+        );
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        closure_expired(&mut pending).await;
+        assert!(pending.is_some(), "expiry retains the original diagnostic");
+        for error in [
+            anyhow::anyhow!("execution stdin closed"),
+            anyhow::Error::new(MicrosandboxError::Runtime("transport EIO".into())),
+            anyhow::Error::new(std::io::Error::from_raw_os_error(libc::EIO)),
+        ] {
+            assert!(PendingStdinClosure::from_error(error).is_err());
         }
     }
 

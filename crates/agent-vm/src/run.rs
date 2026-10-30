@@ -2144,13 +2144,16 @@ async fn stream_exec_with_cleanup<
                             Some(PendingFrame::new(bytes.to_vec(), GuestStream::Stderr));
                     }
                     LoopStep::Exec(ExecStep::Event(ExecEvent::Exited { code })) => {
-                        // A failure that has already happened outranks the
-                        // guest's status: it ran on truncated input, so stream
-                        // loss is never a success. A failure that has not
-                        // happened by now does not exist and is not waited for.
+                        // Genuine stream loss outranks the guest's status.
+                        // The SDK's local credit-window closure is different:
+                        // reconcile it with this terminal event.
                         break match pending_input_failure.take() {
-                            Some(pending) => Err(pending.failure.into_error()),
-                            None => Ok(SessionEnd::Guest(code)),
+                            Some(pending) if !pending.failure.is_stdin_closed() => {
+                                Err(pending.failure.into_error())
+                            }
+                            // Closing the SDK credit window precedes Exited;
+                            // it is not evidence of transport loss.
+                            _ => Ok(SessionEnd::Guest(code)),
                         };
                     }
                     LoopStep::Exec(ExecStep::Event(ExecEvent::Failed(payload))) => {
@@ -2178,6 +2181,12 @@ async fn stream_exec_with_cleanup<
                             // Expected: stop feeding it and let its own status
                             // stand — no broken-pipe warning, no 125.
                             GuestInputStatus::GuestClosedInput => {
+                                if pending_input_failure
+                                    .as_ref()
+                                    .is_some_and(|pending| pending.failure.is_stdin_closed())
+                                {
+                                    pending_input_failure = None;
+                                }
                                 if let Some(pump) = pump.as_mut() {
                                     pump.stop().await;
                                 }
@@ -2754,7 +2763,10 @@ impl ExecEventSource for microsandbox::sandbox::exec::ExecHandle {
 /// human at a CLI would call a hang. If the stream closed for some other
 /// reason and the sandbox process is genuinely still alive, this bound is
 /// what keeps `next_exec_step` from hanging on it.
-const STREAM_END_RUNTIME_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+/// Also bounds stdin-credit closure reconciliation in streamed and PTY sessions:
+/// the SDK may close credit before delivering the guest's terminal event.
+pub(crate) const STREAM_END_RUNTIME_EXIT_GRACE: std::time::Duration =
+    std::time::Duration::from_secs(3);
 
 /// Format a resolved `runtime_exit` result into the short diagnostic detail
 /// carried by [`ExecStep::RuntimeExited`].
@@ -7450,6 +7462,61 @@ options ndots:2 timeout:1";
             ["sink", "runtime", "handle", "stop", "remove"]
         );
         release_reader(&mut live.receipts, reader_steps).await;
+    }
+
+    #[tokio::test]
+    async fn stdin_credit_closure_is_reconciled_with_epipe_exit_or_eio() {
+        for terminal in ["EPIPE", "Exited", "EIO"] {
+            let (send, receipts) = Receipts::channel();
+            let mut stdout = ReceiptSink::new(GuestStream::Stdout, send.clone());
+            let mut stderr = ReceiptSink::new(GuestStream::Stderr, send.clone());
+            let (reader, reader_steps) = GatedReader::new(send.clone());
+            let (sink, _) = GatedGuestStdin::new(send);
+            let teardown = StubTeardown::new().tracking_sink(sink.dropped_flag());
+            let (mut live, lifecycle) = live_stream(
+                &teardown,
+                StreamSinks {
+                    stdout: &mut stdout,
+                    stderr: &mut stderr,
+                },
+                OutputErrorPolicy::DirectChecked,
+                StreamInput::Forward(InputSource::new(reader)),
+                Some(sink),
+                receipts,
+            );
+            let driver = async {
+                reader_steps.send(one_chunk()).unwrap();
+                live.expect("a write blocked on credit", |receipt| {
+                    matches!(receipt, Receipt::WriteEntered { .. })
+                })
+                .await;
+                live.release(SinkStep::StdinClosed);
+                live.expect("the SDK window-close failure before its event", |receipt| {
+                    *receipt == Receipt::SinkDropped
+                })
+                .await;
+                if terminal == "EPIPE" {
+                    live.send(stdin_error(Some(32), Some("EPIPE"), "broken pipe"))
+                        .await;
+                    // EPIPE confirms closure even if Exited arrives after the
+                    // local-failure grace. No credit is returned to the write.
+                    tokio::time::sleep(STREAM_END_RUNTIME_EXIT_GRACE * 2).await;
+                } else if terminal == "EIO" {
+                    live.send(stdin_error(Some(5), Some("EIO"), "input/output error"))
+                        .await;
+                }
+                live.exit(7).await;
+            };
+            let (outcome, ()) = join_bounded("stdin credit closure", lifecycle, driver).await;
+            if terminal == "EIO" {
+                let error = format!("{:#}", outcome.expect_err("EIO stays fatal"));
+                assert!(error.contains("EIO"), "{error}");
+            } else {
+                assert_eq!(outcome.expect("guest status survives local closure"), 7);
+                assert!(stderr.bytes().is_empty());
+            }
+            release_reader(&mut live.receipts, reader_steps).await;
+        }
     }
 
     #[tokio::test]
