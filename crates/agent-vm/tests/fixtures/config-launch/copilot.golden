@@ -180,7 +180,14 @@
       "max_request_bytes": 65536
     },
     "max_connections": null,
-    "trust_host_cas": false
+    "nat64_prefixes": [
+      "64:ff9b::/96"
+    ],
+    "trust_host_cas": false,
+    "http": {
+      "deny_response": true,
+      "deny_response_format": "json"
+    }
   },
   "init": null,
   "pull_policy": "IfMissing",

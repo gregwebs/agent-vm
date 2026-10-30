@@ -88,6 +88,14 @@ pub(crate) struct Plan {
     publish_ports: Vec<PublishPort>,
     egress: crate::egress_policy::EgressAuthority,
     auto_publish: bool,
+    /// Enable the runtime's own ambient-proxy discovery for this sandbox.
+    ///
+    /// The fork this build used to vendor applied `HTTPS_PROXY`/`HTTP_PROXY`/
+    /// `ALL_PROXY` automatically. The merged runtime made that opt-in
+    /// (`NetworkSpec::proxy_from_env`, upstream #1952), so the launch has to
+    /// ask for it explicitly to keep the notice above truthful.
+    proxy_from_env: bool,
+    proxy_not_applied_reason: &'static str,
     proxy_notice: Option<ProxyNotice>,
 }
 
@@ -221,6 +229,12 @@ impl Plan {
             },
             user.map(crate::user_network::UserNetwork::egress),
         )?;
+        let disabled = lookup("AGENT_VM_PROXY_FROM_ENV").is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off"
+            )
+        });
         let observation = observe_host_proxy(lookup);
         if egress.has_hostnames() && observation.connector_used {
             use crate::egress_policy::HostnameAuthority;
@@ -236,11 +250,21 @@ impl Plan {
                 _ => anyhow::bail!(HOSTNAME_PROXY_REFUSAL),
             }
         }
+        let proxy_from_env = observation.connector_used && !disabled;
+        let proxy_not_applied_reason = if disabled {
+            "AGENT_VM_PROXY_FROM_ENV is off"
+        } else if observation.no_proxy_wildcard {
+            "NO_PROXY is a wildcard"
+        } else {
+            "not a usable http:// proxy"
+        };
         let proxy_notice = observation.notice;
         Ok(Self {
             publish_ports,
             egress,
             auto_publish: args.auto_publish,
+            proxy_from_env,
+            proxy_not_applied_reason,
             proxy_notice,
         })
     }
@@ -262,11 +286,19 @@ impl Plan {
         }
         self.egress.write_notices(output)?;
         if let Some(proxy) = &self.proxy_notice {
-            writeln!(
-                output,
-                "==> Guest egress proxy: {}={} (used when it parses as an http:// proxy; NO_PROXY honored, otherwise egress goes direct)",
-                proxy.variable, proxy.value
-            )?;
+            if self.proxy_from_env {
+                writeln!(
+                    output,
+                    "==> Guest egress proxy: {}={} (applied; CONNECT names the destination IP address rather than the hostname; non-DNS UDP is dropped while the proxy is selected; NO_PROXY honored)",
+                    proxy.variable, proxy.value
+                )?;
+            } else {
+                writeln!(
+                    output,
+                    "==> Guest egress proxy: {}={} (found but not applied to this sandbox: {})",
+                    proxy.variable, proxy.value, self.proxy_not_applied_reason
+                )?;
+            }
         }
         Ok(())
     }
@@ -286,9 +318,10 @@ impl Plan {
         let policy = self.egress.policy();
         let publish_ports = self.publish_ports.clone();
         let auto_publish = self.auto_publish;
+        let proxy_from_env = self.proxy_from_env;
         let hostname_ports = self.egress.intercepted_ports().map(|ports| ports.to_vec());
         let enable_tls = !publish_ports.is_empty() || hostname_ports.is_some();
-        builder.network(move |mut network| {
+        let builder = builder.network(move |mut network| {
             network = network.policy(policy);
             if enable_tls {
                 // The hostname set includes 443, so replacing the default loses nothing.
@@ -312,7 +345,11 @@ impl Plan {
                 network = network.auto_publish();
             }
             network
-        })
+        });
+        // Keep discovery aligned with the applied/not-applied launch notice.
+        // An explicit `.proxy()` still wins, and `NO_PROXY` is read at network
+        // startup by the runtime, exactly as the notice says.
+        builder.proxy_from_env(proxy_from_env)
     }
 
     pub(crate) fn start_event_reporting(&self, sandbox: &Sandbox) -> std::io::Result<()> {
@@ -523,6 +560,7 @@ const HOSTNAME_PROXY_REFUSAL: &str = "hostname allowances cannot be enforced thr
 struct HostProxyObservation {
     notice: Option<ProxyNotice>,
     connector_used: bool,
+    no_proxy_wildcard: bool,
 }
 /// Pure proxy lookup, taking a function instead of reading the real process
 /// environment so tests don't need unsafe
@@ -568,6 +606,7 @@ fn observe_host_proxy(lookup: impl Fn(&str) -> Option<String>) -> HostProxyObser
     HostProxyObservation {
         notice,
         connector_used: usable && !wildcard,
+        no_proxy_wildcard: wildcard,
     }
 }
 fn connector_would_select(value: &str) -> bool {
@@ -647,6 +686,90 @@ mod tests {
                 {"direction":"egress","destination":{"cidr":"10.0.0.5/32"},"protocols":[],"ports":[],"action":"allow"},
                 {"direction":"egress","destination":{"group":"private"},"protocols":[],"ports":[],"action":"allow"}
             ])
+        );
+    }
+
+    #[test]
+    fn a_usable_host_proxy_opts_into_runtime_discovery() {
+        // Discovery stays on by default; only explicit false-like values opt out.
+        for opt_out in [
+            None,
+            Some("1"),
+            Some("true"),
+            Some(""),
+            Some("other"),
+            Some("0"),
+            Some(" FaLsE "),
+            Some(" OFF "),
+        ] {
+            let plan = Plan::from_args_with_proxy_lookup(args(), None, |v| match v {
+                "HTTPS_PROXY" => Some("http://127.0.0.1:9".into()),
+                "AGENT_VM_PROXY_FROM_ENV" => opt_out.map(str::to_owned),
+                _ => None,
+            })
+            .unwrap();
+            let disabled = matches!(opt_out, Some("0" | " FaLsE " | " OFF "));
+            assert_eq!(plan.proxy_from_env, !disabled, "{opt_out:?}");
+            let mut output = Vec::new();
+            plan.emit_launch_notices_to(&mut output).unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert_eq!(
+                output
+                    .lines()
+                    .filter(|line| line.starts_with("==> Guest egress proxy:"))
+                    .count(),
+                1
+            );
+            if disabled {
+                assert!(output.contains(
+                    "found but not applied to this sandbox: AGENT_VM_PROXY_FROM_ENV is off"
+                ));
+                let mut input = args();
+                input.allow_egress.push("api.example.com".into());
+                let error = Plan::from_args_with_proxy_lookup(input, None, |v| match v {
+                    "HTTPS_PROXY" => Some("http://127.0.0.1:9".into()),
+                    "AGENT_VM_PROXY_FROM_ENV" => opt_out.map(str::to_owned),
+                    _ => None,
+                })
+                .unwrap_err();
+                assert_eq!(error.to_string(), HOSTNAME_PROXY_REFUSAL);
+            } else {
+                assert!(output.contains(
+                    "applied; CONNECT names the destination IP address rather than the hostname"
+                ));
+                assert!(output.contains("non-DNS UDP is dropped while the proxy is selected"));
+                assert!(output.contains("NO_PROXY honored"));
+            }
+        }
+
+        // A wildcard NO_PROXY disables the connector.
+        let plan = Plan::from_args_with_proxy_lookup(args(), None, |v| match v {
+            "HTTPS_PROXY" => Some("http://127.0.0.1:9".into()),
+            "NO_PROXY" => Some("*".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert!(!plan.proxy_from_env);
+        let mut output = Vec::new();
+        plan.emit_launch_notices_to(&mut output).unwrap();
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("found but not applied to this sandbox: NO_PROXY is a wildcard")
+        );
+
+        // An unsupported scheme is never selected by the connector either.
+        let plan = Plan::from_args_with_proxy_lookup(args(), None, |v| {
+            (v == "HTTPS_PROXY").then(|| "socks5://127.0.0.1:1080".into())
+        })
+        .unwrap();
+        assert!(!plan.proxy_from_env);
+        let mut output = Vec::new();
+        plan.emit_launch_notices_to(&mut output).unwrap();
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("found but not applied to this sandbox: not a usable http:// proxy")
         );
     }
 
@@ -1137,7 +1260,7 @@ mod tests {
 ==> Egress policy: --allow-lan enabled (Private RFC1918 + 100.64/10 + fc00::/7 reachable; does not itself enable DNS)\n\
 ==> Egress policy: --allow-host enabled (host.microsandbox.internal → host 127.0.0.1 reachable; includes the host DNS resolver)\n\
 ==> Egress DNS: arbitrary-name DNS queries authorized via --allow-host (resolver/rebind/platform constraints still apply)\n\
-==> Guest egress proxy: https_proxy=http://proxy.example:3128/path@kept (used when it parses as an http:// proxy; NO_PROXY honored, otherwise egress goes direct)\n"
+==> Guest egress proxy: https_proxy=http://proxy.example:3128/path@kept (applied; CONNECT names the destination IP address rather than the hostname; non-DNS UDP is dropped while the proxy is selected; NO_PROXY honored)\n"
         );
         assert!(!output.contains("alice"));
         assert!(!output.contains("hunter2"));
@@ -1228,7 +1351,11 @@ mod tests {
             } else {
                 assert!(output.contains(case.selected), "{}: {output}", case.name);
                 assert!(
-                    output.contains("used when it parses as an http:// proxy"),
+                    output.contains(if case.name == "all lowercase wins" {
+                        "found but not applied to this sandbox: not a usable http:// proxy"
+                    } else {
+                        "applied; CONNECT names the destination IP address"
+                    }),
                     "{}",
                     case.name
                 );
@@ -1253,7 +1380,7 @@ mod tests {
             output,
             "==> Egress policy: all guest egress denied (opt in with --allow-internet-egress, --allow-egress, --allow-lan or --allow-host)\n\
 ==> Egress DNS: queries denied (NXDOMAIN when forwarder is available; use IP or hostname allowances)\n\
-==> Guest egress proxy: http_proxy=http://lower-http.example:3128 (used when it parses as an http:// proxy; NO_PROXY honored, otherwise egress goes direct)\n"
+==> Guest egress proxy: http_proxy=http://lower-http.example:3128 (applied; CONNECT names the destination IP address rather than the hostname; non-DNS UDP is dropped while the proxy is selected; NO_PROXY honored)\n"
         );
         for ignored in [
             "upper-http.example",
@@ -1438,7 +1565,7 @@ mod tests {
         };
         let canonical = run_dir.join("sandboxes").join(hex(12));
         let legacy = run_dir.join("agent").join(format!("{}.sock", hex(16)));
-        let paths = microsandbox_runtime::ipc::sandbox_socket_paths(run_dir, name);
+        let paths = microsandbox_runtime::ipc::RuntimeSocketPaths::new(run_dir, name);
         assert_eq!(paths.canonical_dir, canonical);
         assert_eq!(paths.agent, canonical.join("agent.sock"));
         assert_eq!(paths.control, canonical.join("control.sock"));

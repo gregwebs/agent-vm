@@ -489,7 +489,7 @@ const SHORT_MACOS_MSB_HOME_DIRNAME: &str = ".agent-vm-msb";
 ///
 /// Why: the vendored runtime's per-sandbox agent/control sockets live at
 /// `<MSB_HOME>/run/sandboxes/<24-hex-char-id>/{agent,control}.sock`
-/// (`vendor/microsandbox/crates/runtime/lib/client/ipc.rs::sandbox_socket_paths`).
+/// (`vendor/microsandbox/crates/runtime/lib/client/ipc.rs::RuntimeSocketPaths::new`).
 /// The sandbox *name* itself is SHA-256-hashed to that fixed-length id
 /// before it ever reaches a socket path, so — unlike in the pre-#40 fork
 /// vintage this AC's wording was written against — the long, unbounded
@@ -587,7 +587,7 @@ fn socket_path_fits(len: usize) -> (ok: bool)
 /// paths under `msb_home_dir()` would overflow this platform's
 /// `sockaddr_un.sun_path` (AC#6, agent-vm issue #40).
 ///
-/// Reuses the runtime's own [`microsandbox_runtime::ipc::sandbox_socket_paths`]
+/// Reuses the runtime's own [`microsandbox_runtime::ipc::RuntimeSocketPaths`]
 /// derivation rather than re-implementing the hash/path template, so this
 /// check can't silently drift out of sync with the path the boot actually
 /// binds. The macOS default root ([`msb_home_dir`]) already gives real
@@ -603,7 +603,7 @@ pub fn ensure_socket_paths_fit(sandbox_name: &str) -> Result<()> {
     // (vendor/microsandbox/sdk/rust/lib/config/mod.rs) — not worth an extra
     // direct dependency on microsandbox-utils just for this one literal.
     let run_dir = msb_home_dir()?.join("run");
-    let paths = microsandbox_runtime::ipc::sandbox_socket_paths(&run_dir, sandbox_name);
+    let paths = microsandbox_runtime::ipc::RuntimeSocketPaths::new(&run_dir, sandbox_name);
     // Checking the canonical `control.sock` alone covers every path whose
     // overflow would fail boot. It is the longer canonical socket ("control"
     // > "agent"), and it is longer than the legacy `agent/<32-hex>.sock`
@@ -1076,7 +1076,7 @@ mod tests {
         // bump that the vendored Cargo.toml's version didn't actually track,
         // which `include_str!` alone can't catch (it'd just read the new
         // value). Bump this literal by hand alongside the gitlink.
-        assert_eq!(expected_msb_version(), "0.7.4");
+        assert_eq!(expected_msb_version(), "0.7.11");
     }
 
     #[test]
@@ -1222,7 +1222,7 @@ mod tests {
     #[test]
     fn canonical_control_socket_bounds_every_boot_fatal_socket_path() {
         let run_dir = Path::new("/r/run");
-        let paths = microsandbox_runtime::ipc::sandbox_socket_paths(run_dir, "agent-vm-x");
+        let paths = microsandbox_runtime::ipc::RuntimeSocketPaths::new(run_dir, "agent-vm-x");
         let checked = paths.control.as_os_str().len();
         for fatal in [&paths.agent, &paths.legacy_agent] {
             assert!(
@@ -1253,8 +1253,8 @@ mod tests {
         let short_root = Path::new("/Users/j.van-der-berg/.agent-vm-msb/run");
         let name = "agent-vm-abcd1234efgh5678-99999";
 
-        let old_paths = microsandbox_runtime::ipc::sandbox_socket_paths(old_default, name);
-        let short_paths = microsandbox_runtime::ipc::sandbox_socket_paths(short_root, name);
+        let old_paths = microsandbox_runtime::ipc::RuntimeSocketPaths::new(old_default, name);
+        let short_paths = microsandbox_runtime::ipc::RuntimeSocketPaths::new(short_root, name);
 
         assert!(
             old_paths.control.as_os_str().len() > SUN_PATH_USABLE_LEN,
