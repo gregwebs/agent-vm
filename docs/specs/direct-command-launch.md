@@ -1,17 +1,16 @@
 # Direct command launches
 
-Status: implemented, with one deferred row. #398 (`run` / top-level `--`,
-literal Unicode argv without catalog selection or provisioning, and the
-127/126/125 status distinctions) landed in 0.7.3; #399 (streamed stdin and EOF)
-landed in 0.7.16. Terminal policy (#400: both-descriptor auto selection,
-`-t`/`-T`, forced-PTY refusal, resize forwarding, `Ctrl-]` passthrough, terminal
-restoration and the direct failure status) landed in 0.7.17. Host signal
-supervision (#401: `SIGINT`/`SIGTERM` forwarding, the fixed grace, the forced
-teardown and `128 + N` for a forced shutdown) decided not to touch the runtime,
-so it is launcher-only: a guest that is signalled has no way to report *which*
-signal ended it, which is why the "signal termination" row below is met only for
-shutdowns this launcher forces. Guest signal identity (`WIFSIGNALED`/`WTERMSIG`
-through agentd, the protocol and the SDK) arrives with #467.
+Status: implemented. #398 (`run` / top-level `--`, literal Unicode argv without
+catalog selection or provisioning, and the 127/126/125 status distinctions)
+landed in 0.7.3; #399 (streamed stdin and EOF) landed in 0.7.16. Terminal policy
+(#400: both-descriptor auto selection, `-t`/`-T`, forced-PTY refusal, resize
+forwarding, `Ctrl-]` passthrough, terminal restoration and the direct failure
+status) landed in 0.7.17. Host signal supervision (#401: `SIGINT`/`SIGTERM`
+forwarding, the fixed grace and the forced teardown) is launcher-only; #467 added
+the guest's own signal identity (`WIFSIGNALED`/`WTERMSIG` through agentd, the
+protocol and the SDK), so a signalled guest — including one that signals itself —
+reports `128 + N` from what the guest kernel observed, not from a signal the host
+sent. See [ADR 0053](../adr/0053-guest-exit-signal-identity.md).
 
 ## Purpose
 
@@ -111,7 +110,8 @@ forced. The grace period is fixed in this feature.
 | Guest exits normally | Guest status, including nonzero statuses. |
 | Executable missing | 127 |
 | Executable exists but is not executable | 126 |
-| Signal termination or forced shutdown following a signal | 128 + signal number |
+| Guest's own signal termination | 128 + the guest's signal number |
+| Forced shutdown after a signal, guest reported nothing | 128 + the host signal number |
 | Launcher, transport or cleanup failure | 125 |
 
 If a forwarded signal is handled and the guest exits normally within the grace
@@ -120,19 +120,27 @@ otherwise available guest status. Do not treat stream loss as successful
 command completion. These conventions apply to direct launches; leave existing
 `shell` status behavior unchanged.
 
-`128 + N` is produced for a shutdown the launcher decided on: the grace expired,
-or a second interrupt arrived. It is never inferred from an
-unknown status (`-1`), a missing exit event or the last signal that was
-forwarded — a guest killed inside the VM by `SIGKILL`, or a session whose
-transport died, is not evidence of the signal the launcher sent. When both
-interrupts exist, the first one starts the grace and the one that *interrupts*
-is the one reported.
+`128 + N` has two proven sources, and neither is an inference. The first is the
+guest's own terminating signal, carried from the guest kernel's `WIFSIGNALED`/
+`WTERMSIG` through agentd, the protocol and the SDK: a guest killed by `SIGTERM`
+reports `143` whether the host forwarded the signal, sent nothing, or forwarded a
+different one — the guest's identity outranks the host's. The second is a shutdown
+this launcher decided on, when the grace expired or a second interrupt arrived
+before the guest reported anything.
 
-Until #467 supplies the guest's signal identity, the table's "signal
-termination" row is met only for a shutdown this launcher forces: a guest killed
-by a signal the launcher did not send reports the runtime's unknown status, which
-is passed through as an unknown status (the process exits 255). That half of the
-row is what #467 completes; the launcher half is not amended when it lands.
+It is never derived from an unknown status (`-1`), a missing exit event or the
+last signal that was forwarded — a guest killed inside the VM by `SIGKILL`, or a
+session whose transport died, is not evidence of the signal the launcher sent. A
+guest *code* is never reinterpreted either: a command that exits `143` on its own
+reports `143` without claiming signal death. When both interrupts exist, the first
+one starts the grace and the one that *interrupts* is the one reported.
+
+A runtime that predates the identity field omits it, so every row above keeps its
+previous number: the unknown status is passed through unchanged (the process
+exits 255) and a forced shutdown still reports the host signal. The reported
+number is guest input, so it is parsed once where it enters the launcher: only
+`1..=127` is an identity, and a reported `0`, negative number or anything above
+127 is read as "no identity" so the raw code is passed through instead.
 
 Ctrl-C is not the same event in the two terminal modes, and neither is
 double-forwarded: in a direct PTY session `cfmakeraw` clears `ISIG`, so Ctrl-C

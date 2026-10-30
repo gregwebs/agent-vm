@@ -35,18 +35,6 @@
 #                                   silently certify zero cases). Fixture
 #                                   builds/imports run only when a selected name
 #                                   starts with `custom-image-`.
-#   AGENT_VM_E2E_INCLUDE_PENDING    `1` also runs the pending cases: the rows that
-#                                   assert a contract this branch cannot meet yet.
-#                                   Each pending case names its issue (#467) on its
-#                                   SKIP line and in the run's evidence. A skipped
-#                                   pending case is counted in its own PENDING total
-#                                   and named on its row's line (`PASS: <row> (N
-#                                   pending)`), never mixed into the row-level
-#                                   SKIPPED total, so a green run always says how
-#                                   much of its evidence did not run. A row whose
-#                                   every case is pending FAILS rather than passing
-#                                   with no evidence.
-#                                   Unset (the default) skips them.
 # Direct-terminal rows (required when any `custom-image-direct-terminal-*` row is
 # selected):
 #   AGENT_VM_E2E_TERMINAL_EVIDENCE  absolute, empty directory this run owns. The
@@ -493,11 +481,6 @@ assert_single_boot_ref() {
 PASSED=0
 FAILED=0
 SKIPPED=0
-# Pending cases are counted separately from skipped rows: SKIPPED counts *rows*
-# that did not run (an unset variable, a filter), PENDING counts *cases* whose
-# contract this branch cannot meet yet. Adding them would have made a row of six
-# cases print the same plain PASS as a row that ran all six.
-PENDING=0
 # Every row name this script registers. `AGENT_VM_E2E_ONLY_ROWS` silently ignores
 # a name that matches nothing, so a filtered run that exits 0 proves nothing
 # unless every requested name is known: asserted at the end.
@@ -508,7 +491,7 @@ register_row() {
 }
 
 run_check() {
-  local name="$1" pending_before="$PENDING"
+  local name="$1"
   shift
   register_row "$name"
   # `negative/*` rows are the harness self-test's deliberate failures; they
@@ -526,12 +509,7 @@ run_check() {
     return 1
   fi
   if "$@"; then
-    local pending_here=$((PENDING - pending_before))
-    if [ "$pending_here" -gt 0 ]; then
-      echo "    PASS: $name ($pending_here pending)"
-    else
-      echo "    PASS: $name"
-    fi
+    echo "    PASS: $name"
     PASSED=$((PASSED + 1))
   else
     echo "    FAIL: $name"
@@ -2932,32 +2910,12 @@ terminal_teardown_receipt() {
   return "$status"
 }
 
-# ----------------------------------------------------------- pending rows ---
-
-# Cases whose published expectation this branch cannot meet yet, and why. They
-# stay in the inventory as the acceptance rows for the missing piece; what changes
-# is *when* they run. The rule is the case name, not a second list of names, so a
-# new mode's `-unhandled` case is pending the moment its row names it.
-#
-# `unhandled` expects the shell convention (128 + N) for a guest killed by the
-# forwarded signal. The runtime reports that end as -1, which slice 1 passes
-# through as an unknown guest status, so the convention needs WIFSIGNALED/
-# WTERMSIG to cross the runtime boundary: issue #467.
-pending_case_reason() {
-  case "$1" in
-  signal-*-unhandled)
-    printf '%s' "#467: 128 + N for a guest killed by the forwarded signal needs the runtime to carry WIFSIGNALED/WTERMSIG, which it reports only as -1"
-    ;;
-  *) return 1 ;;
-  esac
-}
-
 # The shared body: install the guest probe into a fresh owned project, run the
 # row's fixed case list in both command forms, keep the evidence, prove the row
 # left nothing behind, and clean up.
 direct_terminal_row() {
   local row="$1" proj evidence result=0 case form hook_path="" extra=()
-  local reason ran=0
+  local ran=0
   shift
   # `--hook` marks the identity row: it installs the PATH/hook fixture and hands
   # the driver the facts it must observe in the guest.
@@ -2970,29 +2928,14 @@ direct_terminal_row() {
   extra=(--expect-hook hook-exported-400 --expect-hook-path "$hook_path")
   evidence="$(terminal_evidence_root)" || return 1
   for case in "$@"; do
-    if reason="$(pending_case_reason "$case")"; then
-      if [ "${AGENT_VM_E2E_INCLUDE_PENDING:-0}" != 1 ]; then
-        # Never a pass and never silent: the skip line, the run's skip count and
-        # this row of the evidence file all name the issue that has to land.
-        echo "    SKIP: $row/$case pending $reason"
-        echo "    SKIP: set AGENT_VM_E2E_INCLUDE_PENDING=1 to run it on demand"
-        printf 'row=%s case=%s pending=%s\n' "$row" "$case" "$reason" \
-          >>"$evidence/pending-skips.txt" || result=1
-        PENDING=$((PENDING + 1))
-        continue
-      fi
-      echo "    PENDING: $row/$case is running on demand: $reason"
-    fi
     ran=$((ran + 1))
     for form in run separator; do
       terminal_case "$row" "$proj" "$case" "$form" "$evidence" "${extra[@]}" || result=1
     done
   done
-  # A row whose every case was skipped would otherwise pass with no evidence at
-  # all, which is exactly the green a pending gate must never produce. The pending
-  # cases it did skip are counted in $PENDING, which the row's own PASS line names.
+  # A row that names nothing would otherwise pass with no evidence at all.
   if [ "$ran" -eq 0 ]; then
-    echo "    FAIL: $row ran no case (every case in it is pending)"
+    echo "    FAIL: $row named no case to run"
     result=1
   fi
   assert_no_host_calls || result=1
@@ -4986,76 +4929,56 @@ DETACH
   fi
   control_report "t3 launch-root-and-evidence" "$ctl_before"
 
-  # (t4) #401: the pending gate. A case the contract cannot meet yet must be
-  # skipped loudly, counted in the pending total (never as a row pass and never as
-  # a skipped *row*), recorded in the evidence root, and never reach the driver
-  # unless AGENT_VM_E2E_INCLUDE_PENDING=1 asks for it - and a row made only of such
-  # cases must fail, not pass with no evidence.
+  # (t4) #401: the signal rows run by default. Every case a signal row names is
+  # required evidence now that the guest's own identity crosses the runtime
+  # boundary, so the row launcher must reach the driver for each one without any
+  # opt-in, in both command forms, and a row that names nothing is a FAIL rather
+  # than a silent pass.
   ctl_before="$result"
-  local pending_root="$probe_dir/pending-evidence" pending_calls="$probe_dir/pending-calls.txt"
-  local pending_out="$probe_dir/pending-rows.txt" pending_count pending_before
-  rm -rf "$pending_root" || result=$((result + 1))
-  mkdir -p "$pending_root" "$probe_dir/pending-proj" || result=$((result + 1))
-  : >"$pending_calls" || result=$((result + 1))
-  : >"$pending_out" || result=$((result + 1))
+  local rows_root="$probe_dir/signal-rows-evidence"
+  local rows_calls="$probe_dir/signal-rows-calls.txt" rows_out="$probe_dir/signal-rows.txt"
+  local rows_count
+  rm -rf "$rows_root" || result=$((result + 1))
+  mkdir -p "$rows_root" "$probe_dir/signal-rows-proj" || result=$((result + 1))
+  : >"$rows_calls" || result=$((result + 1))
+  : >"$rows_out" || result=$((result + 1))
   if ! (
-    AGENT_VM_E2E_TERMINAL_EVIDENCE="$pending_root"
-    PENDING=0
+    AGENT_VM_E2E_TERMINAL_EVIDENCE="$rows_root"
     # Not named `proj`: direct_terminal_row declares that name local, and a stub
     # reading it from a command substitution would see the unset local.
-    pending_proj="$probe_dir/pending-proj"
+    rows_proj="$probe_dir/signal-rows-proj"
     # shellcheck disable=SC2317,SC2329  # stubs invoked indirectly by direct_terminal_row
-    custom_project() { printf '%s' "$pending_proj"; }
-    # shellcheck disable=SC2317,SC2329  # stub invoked indirectly by direct_terminal_row
-    terminal_case() { printf '%s/%s\n' "$3" "$4" >>"$pending_calls"; }
-    # shellcheck disable=SC2317,SC2329  # stub invoked indirectly by direct_terminal_row
+    custom_project() { printf '%s' "$rows_proj"; }
+    # shellcheck disable=SC2317,SC2329  # stubs invoked indirectly by direct_terminal_row
+    terminal_case() { printf '%s/%s\n' "$3" "$4" >>"$rows_calls"; }
+    # shellcheck disable=SC2317,SC2329  # stubs invoked indirectly by direct_terminal_row
     assert_no_host_calls() { return 0; }
-    # shellcheck disable=SC2317,SC2329  # stub invoked indirectly by direct_terminal_row
+    # shellcheck disable=SC2317,SC2329  # stubs invoked indirectly by direct_terminal_row
     terminal_teardown_receipt() { return 0; }
-    # shellcheck disable=SC2317,SC2329  # stub invoked indirectly by direct_terminal_row
+    # shellcheck disable=SC2317,SC2329  # stubs invoked indirectly by direct_terminal_row
     direct_cleanup() { return 0; }
-    # The run is kept in this shell, never in a command substitution: a counter
-    # incremented in a subshell would hide exactly the accounting under test.
-    direct_terminal_row pending-row identity-auto signal-pty-int-unhandled >>"$pending_out" 2>&1 || exit 1
-    grep -qF 'SKIP: pending-row/signal-pty-int-unhandled pending #467' "$pending_out" || exit 2
-    [ "$PENDING" -eq 1 ] || exit 3
-    pending_count="$(wc -l <"$pending_calls" | tr -d ' ')"
-    [ "$pending_count" -eq 2 ] || exit 4
-    grep -qxF 'identity-auto/run' "$pending_calls" || exit 5
-    grep -qF 'case=signal-pty-int-unhandled' "$pending_root/pending-skips.txt" || exit 6
-    # Only pending cases: nothing runs, so the row must fail instead of passing silent.
-    if direct_terminal_row all-pending-row signal-pty-int-unhandled >>"$pending_out" 2>&1; then exit 7; fi
-    pending_count="$(wc -l <"$pending_calls" | tr -d ' ')"
-    [ "$pending_count" -eq 2 ] || exit 8
-    # On demand the same case runs, and says so before it does.
-    AGENT_VM_E2E_INCLUDE_PENDING=1
-    export AGENT_VM_E2E_INCLUDE_PENDING
-    direct_terminal_row gated-row signal-pty-int-unhandled >>"$pending_out" 2>&1 || exit 9
-    grep -qF 'PENDING: gated-row/signal-pty-int-unhandled is running on demand' "$pending_out" || exit 10
-    pending_count="$(wc -l <"$pending_calls" | tr -d ' ')"
-    [ "$pending_count" -eq 4 ] || exit 11
-    [ "$PENDING" -eq 2 ] || exit 12
-    # The row's line names the pending cases it skipped. Two rows would otherwise
-    # print identically: one that ran every case and one that ran five of six.
-    PENDING=0
-    # The probe row is not in the caller's filter, and the pending case must be
-    # skipped rather than run, so this subshell asks for exactly one thing.
-    E2E_ONLY_ROWS=""
-    export AGENT_VM_E2E_INCLUDE_PENDING=0
-    # shellcheck disable=SC2317,SC2329  # stub invoked indirectly by run_check
-    suffix_row() {
-      direct_terminal_row suffix-row identity-auto signal-pty-int-unhandled || return 1
-    }
-    run_check "suffix-row" suffix_row >>"$pending_out" 2>&1 || exit 13
-    grep -qF 'PASS: suffix-row (1 pending)' "$pending_out" || exit 14
-    [ "$PENDING" -eq 1 ] || exit 15
+    direct_terminal_row rows signal-pty-int-handled signal-pty-int-unhandled \
+      signal-pty-self-term >>"$rows_out" 2>&1 || exit 1
+    # Three cases x two forms: every one of them reached the driver, with no
+    # pending skip anywhere in the output or the evidence root.
+    rows_count="$(wc -l <"$rows_calls" | tr -d ' ')"
+    [ "$rows_count" -eq 6 ] || exit 2
+    grep -qxF 'signal-pty-int-unhandled/run' "$rows_calls" || exit 3
+    grep -qxF 'signal-pty-int-unhandled/separator' "$rows_calls" || exit 4
+    grep -qxF 'signal-pty-self-term/run' "$rows_calls" || exit 5
+    grep -qxF 'signal-pty-self-term/separator' "$rows_calls" || exit 6
+    if grep -qE '(^|[[:space:]])(SKIP|PENDING):' "$rows_out"; then exit 7; fi
+    [ ! -e "$rows_root/pending-skips.txt" ] || exit 8
+    # A row that names no case must fail: no evidence can never be a pass.
+    if direct_terminal_row empty-row >>"$rows_out" 2>&1; then exit 9; fi
+    grep -qF 'FAIL: empty-row named no case to run' "$rows_out" || exit 10
     exit 0
   ); then
-    echo "    FAIL: the pending gate hid a skip, counted it as a row pass, or ran a pending case by default"
-    cat "$pending_out"
+    echo "    FAIL: a required signal row was skipped, counted as a pass without evidence, or named nothing"
+    cat "$rows_out"
     result=$((result + 1))
   fi
-  control_report "t4 pending-gate" "$ctl_before"
+  control_report "t4 signal-rows-run-by-default" "$ctl_before"
 
   local observed_pass="$PASSED" observed_fail="$FAILED"
   if [ "$observed_pass" -ne 0 ] || [ "$observed_fail" -ne 2 ]; then
@@ -9299,42 +9222,46 @@ custom_image_direct_terminal_legacy() {
 # the outcomes the issue names - the guest handles the signal and exits with its
 # own status, the guest dies of it, the guest ignores it so the fixed grace
 # expires, and a second interrupt - and the driver proves the launcher's exact
-# status, the restored terminal and the absent runtime/catalog/socket identities
-# and processes before this file's own rescue cleanup could hide a survivor.
+# status, the restored terminal, the ordinary (never forced) teardown of a guest
+# end, and the absent runtime/catalog/socket identities and processes before this
+# file's own rescue cleanup could hide a survivor.
 #
-# The signal-death outcome appears twice, because the two cases prove different
-# things. `-unhandled` is issue #467's acceptance row: the shell convention
-# (128 + N) for a guest killed by the forwarded signal, which needs the runtime to
-# carry WIFSIGNALED/WTERMSIG, so it is pending and the default row selection skips
-# it with that reason on the output (`AGENT_VM_E2E_INCLUDE_PENDING=1` runs it).
-# `-unhandled-slice1` proves what this branch does instead: the runtime's unknown
-# guest status (-1) is passed through as 255, and it is explicitly not 128 + N.
-#
-# The signals are sent to the launcher process, never typed at the terminal: a
-# PTY launch is in raw mode, where Ctrl-C is a guest byte and raises no host
-# signal at all, so a typed key could not distinguish the two modes.
+# `-unhandled` is the guest's own signal death: the shell convention (128 + N)
+# comes from the identity the guest kernel reports, so it is a required row. The
+# signals are sent to the launcher process, never typed at the terminal: a PTY
+# launch is in raw mode, where Ctrl-C is a guest byte and raises no host signal at
+# all, so a typed key could not distinguish the two modes.
 custom_image_direct_terminal_signal_pty_int() {
   direct_terminal_row "direct-terminal-signal-pty-int" \
-    signal-pty-int-handled signal-pty-int-unhandled signal-pty-int-unhandled-slice1 \
+    signal-pty-int-handled signal-pty-int-unhandled \
     signal-pty-int-ignored signal-pty-int-second
 }
 
 custom_image_direct_terminal_signal_pty_term() {
   direct_terminal_row "direct-terminal-signal-pty-term" \
-    signal-pty-term-handled signal-pty-term-unhandled signal-pty-term-unhandled-slice1 \
+    signal-pty-term-handled signal-pty-term-unhandled \
     signal-pty-term-ignored signal-pty-term-second
 }
 
 custom_image_direct_terminal_signal_stream_int() {
   direct_terminal_row "direct-terminal-signal-stream-int" \
-    signal-stream-int-handled signal-stream-int-unhandled signal-stream-int-unhandled-slice1 \
+    signal-stream-int-handled signal-stream-int-unhandled \
     signal-stream-int-ignored signal-stream-int-second
 }
 
 custom_image_direct_terminal_signal_stream_term() {
   direct_terminal_row "direct-terminal-signal-stream-term" \
-    signal-stream-term-handled signal-stream-term-unhandled signal-stream-term-unhandled-slice1 \
+    signal-stream-term-handled signal-stream-term-unhandled \
     signal-stream-term-ignored signal-stream-term-second
+}
+
+# A guest that kills itself: no host signal is involved, so only identity the
+# guest kernel reported can produce 143. The driver proves a live ownership
+# baseline before releasing the guest, sends no signal at all, and requires the
+# ordinary teardown notice with no forced one.
+custom_image_direct_terminal_signal_self() {
+  direct_terminal_row "direct-terminal-signal-self" \
+    signal-pty-self-term signal-stream-self-term
 }
 
 run_check "explicit-build-archive-workflow" custom_explicit_build_workflow
@@ -9381,6 +9308,7 @@ run_check "custom-image-direct-terminal-signal-pty-int" custom_image_direct_term
 run_check "custom-image-direct-terminal-signal-pty-term" custom_image_direct_terminal_signal_pty_term
 run_check "custom-image-direct-terminal-signal-stream-int" custom_image_direct_terminal_signal_stream_int
 run_check "custom-image-direct-terminal-signal-stream-term" custom_image_direct_terminal_signal_stream_term
+run_check "custom-image-direct-terminal-signal-self" custom_image_direct_terminal_signal_self
 run_check "custom-image-direct-host-decoy" custom_image_direct_host_decoy
 run_check "custom-image-direct-nonstandard" custom_image_direct_nonstandard
 run_check "custom-image-direct-zero-provisioning" custom_image_direct_zero_provisioning
@@ -9425,5 +9353,5 @@ if [ -n "$E2E_ONLY_ROWS" ]; then
 fi
 
 echo
-echo "e2e: $PASSED passed, $FAILED failed, $SKIPPED skipped, $PENDING pending"
+echo "e2e: $PASSED passed, $FAILED failed, $SKIPPED skipped"
 [[ "$FAILED" -eq 0 ]]

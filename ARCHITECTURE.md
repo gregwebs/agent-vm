@@ -785,26 +785,42 @@ SIGINT/SIGTERM ─► raw handler ─► 1 byte per arrival ─► self-pipe ─
                           guest exit in the grace ──► its status        forced ──► 128 + N
 ```
 
+The guest's own exit identity arrives through a second, independent path —
+`waitpid` → agentd → protocol → SDK accessor — and only the launcher's status
+table joins the two:
+
+```
+guest waitpid ─► ProcessExit { code, signal } ─► SessionOutput::Exited ─► ExecExited.signal
+     ─► ExecEvent::Exited { code } + ExecHandle::termination_signal() ─► SessionEnd::Guest { code, signal }
+     ─► 128 + guest N   (direct launches only; catalog/shell stays code-only)
+```
+
 | Outcome | Launcher exit |
 |---|---|
-| Guest reports a code (0, 126, 127, an unknown `-1`) | that code, so an unknown `-1` leaves the process as 255 |
+| Guest reports an ordinary exit, no signal (0, 126, 127, an unknown `-1`, a shell `exit 143`) | that code, so an unknown `-1` leaves the process as 255 |
+| Guest reports its terminating signal | `128 + guest signal` |
+| Runtime too old to report identity, or reports a value that is not a signal (`0`, negative, above 127) | the code, unchanged — the pre-#467 numbers; out-of-range metadata is read as "no identity" |
 | Guest status absent (the stream ended without one), no forced shutdown | today's failure (125) |
 | **Forced shutdown** (grace expiry or second interrupt) with the guest still running | `128 + interrupted signal` |
 | Transport loss, no definitive exit, no forced shutdown | 125 |
 | Genuine cleanup failure during teardown | 125, overriding the above |
 
-**The cause is never inferred.** Until #467 carries the guest's own signal
-identity, `128 + N` exists only for a shutdown the launcher decided on: the grace
-expired, or a second interrupt arrived. It is not derived from a `-1` status,
-from a missing exit event, or from the last signal that was forwarded — a guest
-that died of `SIGKILL` inside the VM, or a session whose transport died, would
-then be reported as `143` because we once sent `SIGTERM`, which states a cause
-nobody observed. Telling a guest's *own* signal death from its exit status needs
-the runtime to carry `WIFSIGNALED`/`WTERMSIG`, which is #467 and not this change.
-When both signals exist, the invariant is that the first one only starts the grace
-and the one that *interrupts* is the one reported: `SIGINT` then `SIGTERM` exits
-143, while a grace expiry after a single `SIGINT` exits 130. The interrupting
-signal is not forwarded — it ends the session.
+**The cause is never inferred.** `128 + N` has exactly two proven sources: the
+guest's own terminating signal as its kernel reported it (`WIFSIGNALED`/
+`WTERMSIG`, decoded once next to `waitpid` in agentd and carried through the
+protocol's optional `ExecExited.signal` and the SDK's
+`ExecHandle::termination_signal()`), and a shutdown the launcher decided on. It is
+never derived from a `-1` status, from a missing exit event, or from the last
+signal that was forwarded — a guest that died of `SIGKILL` inside the VM would
+otherwise be reported as `143` because we once sent `SIGTERM`, which states a
+cause nobody observed. Nor is a guest *code* reinterpreted: a shell `exit 143` is
+not evidence of `SIGTERM`, and an old runtime's missing field keeps the previous
+behaviour. When both signals exist, the invariant is that the first one only
+starts the grace and the one that *interrupts* is the one reported: `SIGINT` then
+`SIGTERM` exits 143, while a grace expiry after a single `SIGINT` exits 130. The
+interrupting signal is not forwarded — it ends the session. A guest-reported
+signal outranks the host's: a guest that dies of `SIGTERM` after a forwarded
+`SIGINT` reports 143, not 130.
 
 Three mechanism choices carry the rest:
 
@@ -843,8 +859,9 @@ erase.
 The launch installs the handlers before the session exists; the PTY session's
 first resize is a held branch rather than an unsupervised await before the loop,
 and its drain barrier races supervision as well, so an interrupt during a blocked
-flush stops the drain **and keeps the status the guest did report** — the guest is
-no longer running there, so `128 + N` would be a guess. The grace is a fixed
+flush stops the drain **and keeps the status the guest did report**, terminating
+signal included — the guest is no longer running there, so the launcher's own
+signal is not evidence about how it died. The grace is a fixed
 constant with no option and no environment override; the subprocess cases inject
 a shorter duration so they assert the rule rather than waiting out the number.
 
@@ -1889,6 +1906,7 @@ directories the user never asked for. The state-root precedence is in
 | One rule for a relative state root (#437) | [ADR-0050](docs/adr/0050-one-rule-for-a-relative-state-root.md) |
 | The reset undo refuses a recreated db (#432) | [ADR-0051](docs/adr/0051-the-reset-undo-refuses-a-recreated-db.md) |
 | Direct-command input ownership and the detached stdin reader (#399) | [ADR-0052](docs/adr/0052-direct-command-input-ownership.md) |
+| Guest exit-signal identity through agentd, the protocol and the SDK accessor (#467) | [ADR-0053](docs/adr/0053-guest-exit-signal-identity.md) |
 
 ## Deliberate non-goals
 

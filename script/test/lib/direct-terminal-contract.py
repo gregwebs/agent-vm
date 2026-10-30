@@ -19,9 +19,10 @@ success, and every invocation is bounded.
 from __future__ import annotations
 
 import errno
-import fnmatch
 import json
 import os
+import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -270,56 +271,143 @@ def inventory_controls(results: list) -> None:
         f"boundaries={boundaries}",
     )
 
-    # The #467 split. Every signal-death case has two twins over the *same* guest
-    # run: the pending acceptance row that keeps 128 + N, and the slice-1 row that
-    # proves the runtime's unknown status is passed through and is not 128 + N.
-    # Relaxing either one - the pending row to 255, or `signal_convention` to equal
-    # `expect` - leaves a native row that looks green and proves nothing, so the
-    # weakening is refused here, boot-free.
+    # Every row function this suite defines must actually be dispatched. A
+    # function nobody registers is dead code in the worst way: a full run skips it
+    # and a filtered run fails on an unknown row, so the row can never report
+    # anything. `custom_image_direct_terminal_signal_self` spent a whole review
+    # cycle in exactly that state, which is why this reads the registrations
+    # rather than searching for a name.
+    e2e_path = HERE.parent / "e2e.sh"
+    e2e_text = e2e_path.read_text()
+    defined = set(re.findall(r"^([A-Za-z_][A-Za-z0-9_]*)\(\) *\{", e2e_text, re.M))
+    registered = re.findall(r'^run_check "([^"]+)" ([A-Za-z_][A-Za-z0-9_]*)', e2e_text, re.M)
+    dispatched = {function for _, function in registered}
+    unregistered = sorted(
+        function
+        for function in defined
+        if function.startswith("custom_image_direct_terminal_") and function not in dispatched
+    )
+    check(
+        "inventory/every direct-terminal row function has a run_check",
+        not unregistered,
+        f"defined but never dispatched, so they can never run: {unregistered}",
+    )
+    unknown = sorted(
+        {function for _, function in registered if function not in defined}
+    )
+    check(
+        "inventory/every run_check names a function this file defines",
+        not unknown,
+        f"dispatched but not defined: {unknown}",
+    )
+
+    # The guest-signal identity rows, and the forced-shutdown oracle that keeps
+    # them honest. A native row proves only what its cases can distinguish: a
+    # forced teardown that reported the same 130/143 with the terminal restored
+    # would look identical to a guest end, so the *shared* oracle is exercised
+    # here against a fabricated forced record and must reject it. These are
+    # harness controls, never native evidence.
     unhandled = {
-        name: spec
-        for name, spec in driver.SIGNAL_CASES.items()
-        if name.endswith("-unhandled")
+        name: spec for name, spec in driver.SIGNAL_CASES.items() if name.endswith("-unhandled")
     }
     check(
-        "inventory/the signal-death split covers every mode and signal",
-        len(unhandled) == len(driver.SIGNAL_MODES) * len(driver.SIGNAL_NAMES),
+        "inventory/the guest-signal rows cover every mode and signal",
+        len(unhandled) == len(driver.SIGNAL_MODES) * len(driver.SIGNAL_NAMES)
+        and all(
+            spec["expect"] == 128 + int(spec["first"])
+            and spec.get("teardown") == "ordinary"
+            for spec in unhandled.values()
+        )
+        # The slice-1 twins are gone; any suffixed survivor would be a second row
+        # whose name suggests it is the same case.
+        and not any(name.endswith("-unhandled-slice1") for name in driver.SIGNAL_CASES),
         f"unhandled cases={sorted(unhandled)}",
     )
-    for name, spec in sorted(unhandled.items()):
-        convention = 128 + int(spec["first"])
-        slice1 = driver.SIGNAL_CASES.get(f"{name}-slice1", {})
-        ok = (
-            spec["expect"] == convention
-            and slice1.get("expect") == driver.PASSED_THROUGH_EXIT
-            and slice1.get("signal_convention") == convention
-            and slice1.get("signal_convention") != slice1.get("expect")
-            and slice1.get("signals") == spec["signals"]
-            and slice1.get("probe") == spec["probe"]
-            and slice1.get("options") == spec["options"]
-            and slice1.get("assignment") == spec["assignment"]
-        )
-        check(
-            f"inventory/{name} keeps {convention} while its slice-1 twin excludes it",
-            ok,
-            f"unhandled={spec} slice1={slice1}",
-        )
 
-    # Which cases the harness skips as pending is one bash glob in e2e.sh over
-    # this inventory. A name that stopped matching it would run a red row in CI;
-    # one that started matching it would hide a case that can pass today, so the
-    # boundary itself is pinned rather than either file alone.
-    pending_arm = "  signal-*-unhandled)"
-    pending_pattern = "signal-*-unhandled"
-    mismatched = [
-        name
-        for name in driver.SIGNAL_CASES
-        if fnmatch.fnmatchcase(name, pending_pattern) != name.endswith("-unhandled")
-    ]
+    self_signal = {
+        name: spec
+        for name, spec in driver.SIGNAL_CASES.items()
+        if spec["behaviour"] == "self-signal"
+    }
     check(
-        "inventory/the harness's pending glob selects exactly the signal-death rows",
-        pending_arm in (HERE.parent / "e2e.sh").read_text() and not mismatched,
-        f"mismatched={mismatched}",
+        "inventory/a self-signalled guest exists in both modes and sends no host signal",
+        len(self_signal) == len(driver.SIGNAL_MODES)
+        and all(
+            spec["signals"] == []
+            and spec["expect"] == 128 + signal.SIGTERM
+            and spec.get("teardown") == "ordinary"
+            for spec in self_signal.values()
+        ),
+        f"self-signal cases={sorted(self_signal)}",
+    )
+
+    # The oracle is the production one, not a copy: both the driver and these
+    # controls call `guest_end_problems`.
+    oracle = driver.guest_end_problems
+    ordinary_text = "==> Stopping sandbox\n[SIGNAL-READY]"
+    forced_text = "==> Interrupted by signal 2; tearing down the sandbox (exit 130)"
+    # Both controls are *guest* ends: the forwarded `INT` the guest itself died of
+    # (130) and a self-signalled `TERM` (143). The numbers are the same ones a
+    # forced shutdown can produce, which is the whole point.
+    guest_int = unhandled["signal-pty-int-unhandled"]
+    guest_term = self_signal["signal-pty-self-term"]
+
+    check(
+        "accept/an ordinary guest end is accepted by the shared oracle",
+        oracle(guest_int, 130, "ordinary teardown", ordinary_text, "INT") == [],
+        f"problems={oracle(guest_int, 130, 'ordinary teardown', ordinary_text, 'INT')}",
+    )
+    # The negative controls: right status, right path string in the receipt, but
+    # the launcher's own notice says it forced the end. They share the forced
+    # notice with the row's own check, so what they prove is that the *notice*
+    # alone overturns an otherwise perfect record - not two independent oracles.
+    for name, spec, status, expected in (
+        ("reject/a forced 130 is not the guest's own 130", guest_int, 130, "never report a forced"),
+        ("reject/a forced 143 is not the guest's own 143", guest_term, 143, "never report a forced"),
+    ):
+        problems = oracle(spec, status, "ordinary teardown", forced_text, "INT")
+        check(
+            name,
+            any(expected in problem for problem in problems),
+            f"problems={problems}",
+        )
+    # And the receipt's own path must agree: a forced path is rejected even when
+    # the output carries no forced notice at all.
+    check(
+        "reject/a forced launcher path is not a guest-signal end",
+        any(
+            "not the ordinary teardown" in problem
+            for problem in oracle(guest_int, 130, "forced teardown", ordinary_text, "INT")
+        ),
+        "a forced launcher path was accepted",
+    )
+    # The diagnostic hint may only name the 255 reading where the number is
+    # actually 255: a 137 or a 130 says nothing about a runtime that dropped
+    # identity, and the failure text must not assign a layer nobody observed.
+    check(
+        "reject/a non-255 status never claims the runtime lost identity",
+        all(
+            driver.unhandled_hint(guest_int, status) == ""
+            for status in (130, 137, 143, 254)
+        ),
+        f"hints={[driver.unhandled_hint(guest_int, s) for s in (130, 137, 143, 254)]}",
+    )
+    check(
+        "accept/a 255 status still names the unknown-code reading",
+        "255" in driver.unhandled_hint(guest_int, 255)
+        and "unknown code -1" in driver.unhandled_hint(guest_int, 255),
+        f"hint={driver.unhandled_hint(guest_int, 255)!r}",
+    )
+
+    # The harness must run every signal row by default: the #467 pending gate is
+    # gone, and a gate that came back would silently certify unwitnessed rows.
+    e2e = (HERE.parent / "e2e.sh").read_text()
+    check(
+        "inventory/the harness has no pending gate over the signal rows",
+        "pending_case_reason" not in e2e
+        and "AGENT_VM_E2E_INCLUDE_PENDING" not in e2e
+        and "signal-pty-self-term signal-stream-self-term" in e2e,
+        "e2e.sh still gates or omits a signal row",
     )
 
 

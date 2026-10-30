@@ -47,9 +47,16 @@ expansion, splitting, deduplication or catalog defaults. A direct command has
 **no target entry**, so no catalog-declared command, environment, credential
 request, network request or persist link applies. Distinct from a *shell
 launch*: the `shell` fallback is a catalog entry with its own command and argv,
-which a direct command neither selects nor inherits. Direct statuses: 127 for an
-absent executable, 126 for a non-executable one, 125 for the launcher's own
-ordinary failure.
+which a direct command neither selects nor inherits.
+
+Direct statuses: 127 for an absent executable, 126 for a non-executable one, 125
+for the launcher's own ordinary failure, and `128 + N` when either the guest
+reported that signal N terminated it or the launcher forced the shutdown after a
+host signal. A *guest code* is passed through unchanged, so a command that exits
+143 on its own reports 143 without claiming signal death, and a runtime too old to
+report identity keeps the previous number (an unknown status leaves the process as
+255). [The direct-command spec](docs/specs/direct-command-launch.md) is the
+canonical policy.
 
 ## Direct terminal policy
 
@@ -62,6 +69,10 @@ stdin, `--no-tty`/`-T` forces streaming. Resolved once in dispatch and carried b
 the launch target, because a bootstrap rendered for one mode must never be
 executed by the other. Distinct from a *shell launch*, whose PTY choice, detach
 escape and merged output are its own unchanged behavior.
+Both direct modes carry the guest's own exit identity (`WIFSIGNALED`/`WTERMSIG`
+from the guest kernel, never inferred from a host signal), so a signalled guest
+reports `128 + N` under either one. A shell launch's PTY choice, detach escape,
+merged output and code-only status are unchanged.
 _Avoid_: calling the policy a heuristic — it reads descriptors, never the command
 name, `$TERM` or `/dev/tty`.
 

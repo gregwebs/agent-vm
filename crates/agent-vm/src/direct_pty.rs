@@ -66,7 +66,8 @@ use microsandbox::sandbox::exec::{ExecControl, ExecEvent, ExecHandle, ExecSink};
 
 use crate::direct_input::{GuestInputStatus, classify_stdin_error};
 use crate::host_signals::{
-    PendingSend, SessionEnd, Supervision, SupervisionStep, signal_send, supervision_lost,
+    GuestSignal, PendingSend, SessionEnd, Supervision, SupervisionStep, signal_send,
+    supervision_lost,
 };
 
 /// The most output the writer may hold, **including the frame it is writing**.
@@ -361,10 +362,15 @@ where
                     Some(ExecEvent::Stdout(bytes)) | Some(ExecEvent::Stderr(bytes)) => {
                         sending_output = Some(Box::pin(host.output.frame(bytes.to_vec())?.deliver()));
                     }
-                    // A status the guest produced is reported as it is, even an
-                    // unknown `-1`: a signal we forwarded says nothing about how
-                    // the guest died (#467 carries that).
-                    Some(ExecEvent::Exited { code }) => break SessionEnd::Guest(code),
+                    // The guest's own exit, reported as it is, even an unknown
+                    // `-1`. Identity comes from the accessor the SDK publishes
+                    // before this event, never from a signal we forwarded.
+                    Some(ExecEvent::Exited { code }) => {
+                        break SessionEnd::Guest {
+                            code,
+                            signal: GuestSignal::reported(handle.termination_signal()),
+                        };
+                    }
                     Some(ExecEvent::Failed(failure)) => {
                         return Err(anyhow::Error::new(MicrosandboxError::ExecFailed(failure)));
                     }
@@ -448,42 +454,63 @@ where
         }
     };
     // Only a guest exit reaches the drain: a forced end returns here without
-    // waiting for output the operator has asked to abandon.
-    let SessionEnd::Guest(end_code) = end else {
+    // waiting for output the operator has asked to abandon. The reported guest
+    // identity is carried through every return below, so the drain cannot turn a
+    // signalled guest into a bare code.
+    let SessionEnd::Guest { .. } = end else {
         return Ok(end);
     };
+    // The flush is held in one pinned future and re-polled. `finish` takes the
+    // session's last sender on its first poll, so re-creating it after a
+    // cancelled poll would report a drain that never happened.
+    let mut finishing = Box::pin(host.output.finish());
+    drain_guest_output(end, &mut finishing, &mut failure, supervision, runtime_exit).await
+}
 
+/// The output drain that follows a definitive guest exit.
+///
+/// Factored out of [`session_loop`] for one reason: the two branches that cut the
+/// drain short — an interrupt with nothing left to forward, and runtime loss —
+/// must return the **guest's own** `end` rather than a reconstruction of it, and
+/// as inline arms of a `select!` over a live SDK handle no test could reach
+/// them. Their inputs here are the three things they actually observe.
+async fn drain_guest_output<F, R>(
+    end: SessionEnd,
+    finishing: &mut Pin<Box<F>>,
+    failure: &mut tokio::sync::oneshot::Receiver<std::io::Error>,
+    supervision: &mut Supervision,
+    runtime_exit: &mut Pin<Box<R>>,
+) -> anyhow::Result<SessionEnd>
+where
+    F: Future<Output = anyhow::Result<()>>,
+    R: Future<Output = microsandbox::MicrosandboxResult<std::process::ExitStatus>>,
+{
     // A definitive exit is necessary but not sufficient: every byte already
     // accepted from the guest must reach the host descriptor before the caller
     // reports the status. The barrier stays cancellable by runtime loss, so a
     // consumer that never drains fails instead of hanging the launcher. Both of
     // its waits are branches, so this select already had the property the loop
     // above was missing.
-    //
-    // The flush is held in one pinned future and re-polled. `finish` takes the
-    // session's last sender on its first poll, so re-creating it after a
-    // cancelled poll would report a drain that never happened.
-    let mut finishing = Box::pin(host.output.finish());
     tokio::select! {
         biased;
-        finished = &mut finishing => {
+        finished = &mut *finishing => {
             // A failed write is a *different* fact from a runtime that died: the
             // host refused bytes the guest did produce. It is a session failure
             // here for the same reason it is one in the loop.
             if let Err(symptom) = finished {
-                return Err(writer_error(&mut failure, symptom));
+                return Err(writer_error(failure, symptom));
             }
         }
         // The guest has already reported its status, so an interrupt here has
         // nothing left to forward: what it may do is stop the drain. A first
         // interrupt and a decided shutdown both therefore return the **known**
-        // status, never a signal status. Turning a status the guest did report into
-        // `128 + N` is exactly the inference this feature forbids, and truncation is
-        // not reported separately for the same reason runtime loss during the drain
-        // is not (see the arm below).
+        // status — including a signal the guest itself reported before the drain
+        // began, which is an observation, not an inference from this interrupt.
+        // Truncation is not reported separately for the same reason runtime loss
+        // during the drain is not (see the arm below).
         step = supervision.next() => match step {
             SupervisionStep::Forward(_) | SupervisionStep::Force(_) => {
-                return Ok(SessionEnd::Guest(end_code));
+                return Ok(end);
             }
             // Supervision ending is not an instruction about a signal: the
             // launcher can no longer observe the interrupts it promised to honour.
@@ -512,10 +539,10 @@ where
             // separately — the terminal was restored and the guest's own status
             // is what the caller sees, which is also all `attach` ever promised.
             let _ = result;
-            return Ok(SessionEnd::Guest(end_code));
+            return Ok(end);
         }
     }
-    Ok(SessionEnd::Guest(end_code))
+    Ok(end)
 }
 
 /// One held resize send, cloned control included so a peer that stops reading
@@ -1089,6 +1116,7 @@ fn write_all(fd: RawFd, mut bytes: &[u8], cancelled: &AtomicBool) -> std::io::Re
 mod tests {
     use super::*;
     use std::os::fd::FromRawFd as _;
+    use std::time::Duration;
 
     /// A real terminal pair, so raw mode and sizing are exercised against a
     /// kernel rather than a description of one.
@@ -1635,5 +1663,178 @@ mod tests {
         let (_sender, mut silent) = tokio::sync::oneshot::channel::<std::io::Error>();
         let symptom = writer_error(&mut silent, anyhow::anyhow!("the writer was lost"));
         assert_eq!(format!("{symptom}"), "the writer was lost");
+    }
+
+    // ------------------------------------------------- the drain's own arms ---
+
+    use crate::host_signals::HostSignal;
+
+    /// A guest end whose identity is the one thing the drain must never lose.
+    fn signalled_end() -> SessionEnd {
+        SessionEnd::Guest {
+            code: -1,
+            signal: GuestSignal::reported(Some(libc::SIGTERM)),
+        }
+    }
+
+    /// A drain that can never complete, so only the arm under test can decide.
+    fn stalled_drain() -> Pin<Box<impl Future<Output = anyhow::Result<()>>>> {
+        Box::pin(std::future::pending())
+    }
+
+    fn parked_runtime()
+    -> Pin<Box<impl Future<Output = microsandbox::MicrosandboxResult<std::process::ExitStatus>>>>
+    {
+        Box::pin(std::future::pending())
+    }
+
+    /// The reported identity and the code, as the caller would report them.
+    fn assert_signalled_end(result: anyhow::Result<SessionEnd>, why: &str) {
+        let end = result.unwrap_or_else(|error| panic!("{why}: {error:#}"));
+        assert_eq!(end, signalled_end(), "{why}");
+        assert_eq!(end.exit_status(), 143, "{why}");
+    }
+
+    #[test]
+    fn a_drain_cut_short_by_an_interrupt_keeps_the_guests_own_signal() {
+        // Deterministic, not raced: the arrival is queued before the drain starts,
+        // so its branch is ready on the first poll and the other two are pending.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("a runtime")
+            .block_on(async {
+                for arriving in [libc::SIGINT, libc::SIGTERM] {
+                    let (arrivals, queue) = tokio::sync::mpsc::unbounded_channel();
+                    let mut supervision = Supervision::for_test(queue, Duration::from_secs(5));
+                    arrivals
+                        .send(HostSignal::for_test(arriving))
+                        .expect("the queue is open");
+                    let mut finishing = stalled_drain();
+                    let (_sender, mut failure) = tokio::sync::oneshot::channel();
+                    let mut runtime_exit = parked_runtime();
+                    assert_signalled_end(
+                        drain_guest_output(
+                            signalled_end(),
+                            &mut finishing,
+                            &mut failure,
+                            &mut supervision,
+                            &mut runtime_exit,
+                        )
+                        .await,
+                        "an interrupt during the drain",
+                    );
+                }
+            });
+    }
+
+    #[test]
+    fn a_drain_cut_short_by_a_forced_end_keeps_the_guests_own_signal() {
+        // The grace expiring during the drain takes the same arm as a repeated
+        // interrupt: nothing is left to forward, so the drain stops. A one-step
+        // zero grace is what makes that arm reachable on a single poll — the
+        // arrival is consumed first (arming the deadline), and the drain's own
+        // `next()` is then the expiry.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("a runtime")
+            .block_on(async {
+                let (arrivals, queue) = tokio::sync::mpsc::unbounded_channel();
+                let mut supervision = Supervision::for_test(queue, Duration::ZERO);
+                arrivals
+                    .send(HostSignal::for_test(libc::SIGINT))
+                    .expect("the queue is open");
+                assert!(matches!(
+                    supervision.next().await,
+                    SupervisionStep::Forward(_)
+                ));
+                let mut finishing = stalled_drain();
+                let (_sender, mut failure) = tokio::sync::oneshot::channel();
+                let mut runtime_exit = parked_runtime();
+                assert_signalled_end(
+                    drain_guest_output(
+                        signalled_end(),
+                        &mut finishing,
+                        &mut failure,
+                        &mut supervision,
+                        &mut runtime_exit,
+                    )
+                    .await,
+                    "an expired grace during the drain",
+                );
+            });
+    }
+
+    #[test]
+    fn a_drain_cut_short_by_runtime_loss_keeps_the_guests_own_signal() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("a runtime")
+            .block_on(async {
+                // A runtime that ended cleanly and one that can no longer be
+                // observed are the same fact after the guest reported: only output
+                // is left to lose.
+                let ended = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg("exit 0")
+                    .status()
+                    .expect("a stub exit");
+                let outcomes: Vec<microsandbox::MicrosandboxResult<std::process::ExitStatus>> = vec![
+                    Ok(ended),
+                    Err(microsandbox::MicrosandboxError::Runtime(
+                        "the runtime is gone".into(),
+                    )),
+                ];
+                for outcome in outcomes {
+                    let mut supervision = Supervision::legacy();
+                    let mut finishing = stalled_drain();
+                    let (_sender, mut failure) = tokio::sync::oneshot::channel();
+                    let mut runtime_exit = Box::pin(std::future::ready(outcome));
+                    assert_signalled_end(
+                        drain_guest_output(
+                            signalled_end(),
+                            &mut finishing,
+                            &mut failure,
+                            &mut supervision,
+                            &mut runtime_exit,
+                        )
+                        .await,
+                        "runtime loss during the drain",
+                    );
+                }
+            });
+    }
+
+    #[test]
+    fn a_lost_reader_still_fails_the_drain_instead_of_reporting_a_status() {
+        // The other direction: supervision ending is not an instruction about a
+        // signal, so a truncating drain must not turn into a successful report.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("a runtime")
+            .block_on(async {
+                let (arrivals, queue) = tokio::sync::mpsc::unbounded_channel();
+                drop(arrivals);
+                let mut supervision = Supervision::for_test(queue, Duration::from_secs(5));
+                let mut finishing = stalled_drain();
+                let (_sender, mut failure) = tokio::sync::oneshot::channel();
+                let mut runtime_exit = parked_runtime();
+                let error = drain_guest_output(
+                    signalled_end(),
+                    &mut finishing,
+                    &mut failure,
+                    &mut supervision,
+                    &mut runtime_exit,
+                )
+                .await
+                .expect_err("a lost reader is a session failure");
+                assert!(
+                    format!("{error:#}").to_lowercase().contains("signal"),
+                    "the failure must name supervision: {error:#}"
+                );
+            });
     }
 }

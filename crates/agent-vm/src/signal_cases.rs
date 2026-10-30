@@ -69,10 +69,53 @@ enum SignalCase {
     /// The guest's own exit status is unknown (`-1`) *after* a forwarded
     /// signal: reported as the guest gave it, never as `128 + N`.
     UnknownStatus,
+    /// The guest signals itself, terminal session: a genuine self-`SIGTERM`
+    /// that no host signal explains.
+    PtySelfSigterm,
+    /// The same self-`SIGTERM` over the streaming lifecycle.
+    StreamSelfSigterm,
+    /// A forwarded `SIGINT` the guest does not handle: its own signal death is
+    /// what the launcher reports.
+    PtyForwardedUnhandled,
+    /// The same unhandled forwarded `SIGINT`, streaming.
+    StreamForwardedUnhandled,
+    /// A guest that dies of `SIGTERM` after we forwarded `SIGINT`: the guest's
+    /// identity outranks the host's.
+    PtyGuestSignalWins,
+    /// The same guest-signal-wins row, streaming.
+    StreamGuestSignalWins,
+    /// A pre-signal runtime reports an unknown `-1` with no host signal: the
+    /// slice-1 number, never a signal status.
+    PtyLegacySelfUnknown,
+    /// The same legacy self-unknown row, streaming.
+    StreamLegacySelfUnknown,
+    /// A pre-signal runtime reports `-1` after a forwarded `SIGINT`: still 255,
+    /// with exactly the one signal we forwarded.
+    StreamLegacyUnknownAfterSignal,
 }
 
+/// What the fake relay reports back to the launcher for one case.
+///
+/// The wire shape is part of the case: a pre-signal runtime sends no `signal`
+/// key at all, which is what a legacy-runtime row must exercise instead of
+/// sending `signal: null`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RelayReport {
+    /// Nothing is reported: only the launcher's grace can end the session.
+    Silent,
+    /// A current-format terminal frame carrying the guest's exit identity.
+    Current { code: i32, signal: Option<i32> },
+    /// A pre-signal runtime's frame: this code and no `signal` key.
+    Legacy { code: i32 },
+}
+
+/// `{"code": -1}` exactly as a pre-signal runtime encoded it, pinned as bytes:
+/// the point of a legacy row is that the `signal` key is absent, so the fixture
+/// must not be able to grow one with the struct under test.
+const LEGACY_UNKNOWN_BODY: [u8; 7] = [0xA1, 0x64, b'c', b'o', b'd', b'e', 0x20];
+
 impl SignalCase {
-    const ALL: [SignalCase; 11] = [
+    const ALL: [SignalCase; 20] = [
         SignalCase::BeforeFirstPoll,
         SignalCase::CtrlCIsAByte,
         SignalCase::GuestExitsInGrace,
@@ -84,6 +127,15 @@ impl SignalCase {
         SignalCase::StreamBlockedOutput,
         SignalCase::UnknownStatus,
         SignalCase::ForcedNoticeStalled,
+        SignalCase::PtySelfSigterm,
+        SignalCase::StreamSelfSigterm,
+        SignalCase::PtyForwardedUnhandled,
+        SignalCase::StreamForwardedUnhandled,
+        SignalCase::PtyGuestSignalWins,
+        SignalCase::StreamGuestSignalWins,
+        SignalCase::PtyLegacySelfUnknown,
+        SignalCase::StreamLegacySelfUnknown,
+        SignalCase::StreamLegacyUnknownAfterSignal,
     ];
 
     fn name(self) -> &'static str {
@@ -99,6 +151,15 @@ impl SignalCase {
             Self::StreamBlockedOutput => "stream-blocked-output",
             Self::UnknownStatus => "unknown-status",
             Self::ForcedNoticeStalled => "forced-notice-stalled",
+            Self::PtySelfSigterm => "pty-self-sigterm",
+            Self::StreamSelfSigterm => "stream-self-sigterm",
+            Self::PtyForwardedUnhandled => "pty-forwarded-unhandled",
+            Self::StreamForwardedUnhandled => "stream-forwarded-unhandled",
+            Self::PtyGuestSignalWins => "pty-guest-signal-wins",
+            Self::StreamGuestSignalWins => "stream-guest-signal-wins",
+            Self::PtyLegacySelfUnknown => "pty-legacy-self-unknown",
+            Self::StreamLegacySelfUnknown => "stream-legacy-self-unknown",
+            Self::StreamLegacyUnknownAfterSignal => "stream-legacy-unknown-after-signal",
         }
     }
 
@@ -115,20 +176,76 @@ impl SignalCase {
     fn is_streaming(self) -> bool {
         matches!(
             self,
-            Self::StreamCookedCtrlC | Self::StreamBlockedOutput | Self::ForcedNoticeStalled
+            Self::StreamCookedCtrlC
+                | Self::StreamBlockedOutput
+                | Self::ForcedNoticeStalled
+                | Self::StreamSelfSigterm
+                | Self::StreamForwardedUnhandled
+                | Self::StreamGuestSignalWins
+                | Self::StreamLegacySelfUnknown
+                | Self::StreamLegacyUnknownAfterSignal
         )
     }
 
-    /// What the guest does when the forwarded signal reaches it. `None` means
-    /// it ignores the signal, so only the launcher's grace can end the case.
-    fn guest_exit_after_signal(self) -> Option<i32> {
+    /// What the guest reports when the forwarded signal reaches it.
+    ///
+    /// `Silent` means it ignores the signal, so only the launcher's grace can
+    /// end the case.
+    fn report_after_signal(self) -> RelayReport {
         match self {
-            Self::BeforeFirstPoll => Some(0),
-            Self::GuestExitsInGrace => Some(7),
-            Self::StreamCookedCtrlC => Some(5),
-            Self::UnknownStatus => Some(-1),
-            _ => None,
+            Self::BeforeFirstPoll => RelayReport::Current {
+                code: 0,
+                signal: None,
+            },
+            Self::GuestExitsInGrace => RelayReport::Current {
+                code: 7,
+                signal: None,
+            },
+            Self::StreamCookedCtrlC => RelayReport::Current {
+                code: 5,
+                signal: None,
+            },
+            // A pre-signal runtime has no identity to report, not even `null`.
+            Self::UnknownStatus | Self::StreamLegacyUnknownAfterSignal => {
+                RelayReport::Legacy { code: -1 }
+            }
+            // The guest died of the signal we forwarded, and says so.
+            Self::PtyForwardedUnhandled | Self::StreamForwardedUnhandled => RelayReport::Current {
+                code: -1,
+                signal: Some(libc::SIGINT),
+            },
+            // The guest died of a *different* signal than the one we forwarded.
+            Self::PtyGuestSignalWins | Self::StreamGuestSignalWins => RelayReport::Current {
+                code: -1,
+                signal: Some(libc::SIGTERM),
+            },
+            _ => RelayReport::Silent,
         }
+    }
+
+    /// What the guest reports with **no** host signal involved.
+    ///
+    /// This is the row slice 1 could not serve: nothing the host did explains
+    /// the guest's death, so only guest-reported identity can produce it.
+    fn report_without_signal(self) -> RelayReport {
+        match self {
+            Self::PtySelfSigterm | Self::StreamSelfSigterm => RelayReport::Current {
+                code: -1,
+                // Replaced by the signal the owned helper really died of, so the
+                // number cannot be a constant the host merely echoed.
+                signal: Some(libc::SIGTERM),
+            },
+            Self::PtyLegacySelfUnknown | Self::StreamLegacySelfUnknown => {
+                RelayReport::Legacy { code: -1 }
+            }
+            _ => RelayReport::Silent,
+        }
+    }
+
+    /// Whether the case's guest dies of a signal the host itself observed, so a
+    /// real process must actually die of it first.
+    fn needs_real_self_signal(self) -> bool {
+        matches!(self, Self::PtySelfSigterm | Self::StreamSelfSigterm)
     }
 
     /// The status the launcher reports and the teardown stages that must have
@@ -156,7 +273,21 @@ impl SignalCase {
             // An unknown status is passed through, so the *process* status is
             // `exit(-1)`: 255. The receipt keeps the `-1` itself, which is what
             // proves it was not converted into `128 + N`.
-            Self::UnknownStatus => (255, &["stop", "remove"]),
+            Self::UnknownStatus
+            | Self::PtyLegacySelfUnknown
+            | Self::StreamLegacySelfUnknown
+            | Self::StreamLegacyUnknownAfterSignal => (255, &["stop", "remove"]),
+            // A guest-reported signal is `128 + N`, whether or not a host signal
+            // was forwarded. 130 here is the *guest's* `SIGINT`, not the
+            // launcher's forced value — the ordinary teardown stages are what
+            // separate the two rows.
+            Self::PtyForwardedUnhandled | Self::StreamForwardedUnhandled => {
+                (130, &["stop", "remove"])
+            }
+            Self::PtySelfSigterm | Self::StreamSelfSigterm => (143, &["stop", "remove"]),
+            // 143 rather than the 130 that reporting the forwarded host signal
+            // would give: the guest's own `SIGTERM` outranks it.
+            Self::PtyGuestSignalWins | Self::StreamGuestSignalWins => (143, &["stop", "remove"]),
         }
     }
 }
@@ -249,20 +380,31 @@ async fn signal_relay(mut io: tokio::io::DuplexStream, dir: std::path::PathBuf, 
         append_receipt(&receipt, &["output=sent".to_string()]);
     }
 
+    // A self-signalled guest needs no host signal at all: it dies first, and the
+    // frame reports what its own kernel observed.
+    let spontaneous = case.report_without_signal();
+    if spontaneous != RelayReport::Silent {
+        let spontaneous = if case.needs_real_self_signal() {
+            // A real `/bin/sh` really dies of this signal before the frame is
+            // sent, so the reported number is an observed `WTERMSIG` rather than
+            // a constant the harness wrote down.
+            let observed = self_signal_stimulus(&receipt);
+            RelayReport::Current {
+                code: -1,
+                signal: Some(observed),
+            }
+        } else {
+            spontaneous
+        };
+        send_report(&mut io, id, spontaneous, &receipt).await;
+    }
+
     while let Ok(message) = codec::read_message(&mut io).await {
         match message.t {
             MessageType::ExecSignal => {
                 let signal = message.payload::<ExecSignal>().expect("a signal payload");
                 append_receipt(&receipt, &[format!("signal={}", signal.signal)]);
-                if let Some(code) = case.guest_exit_after_signal() {
-                    codec::write_message(
-                        &mut io,
-                        &Message::with_payload(MessageType::ExecExited, id, &ExecExited { code })
-                            .unwrap(),
-                    )
-                    .await
-                    .expect("relay write");
-                }
+                send_report(&mut io, id, case.report_after_signal(), &receipt).await;
             }
             MessageType::ExecStdin => {
                 let stdin = message.payload::<ExecStdin>().expect("a stdin payload");
@@ -274,7 +416,10 @@ async fn signal_relay(mut io: tokio::io::DuplexStream, dir: std::path::PathBuf, 
                         &Message::with_payload(
                             MessageType::ExecExited,
                             id,
-                            &ExecExited { code: 0 },
+                            &ExecExited {
+                                code: 0,
+                                signal: None,
+                            },
                         )
                         .unwrap(),
                     )
@@ -284,6 +429,112 @@ async fn signal_relay(mut io: tokio::io::DuplexStream, dir: std::path::PathBuf, 
             }
             _ => {}
         }
+    }
+}
+
+/// Send one terminal frame in the wire shape the case names.
+///
+/// The shape is asserted in the receipt so a failure distinguishes a producer
+/// that omitted identity from a launcher that dropped it.
+async fn send_report(
+    io: &mut tokio::io::DuplexStream,
+    id: u32,
+    report: RelayReport,
+    receipt: &std::path::Path,
+) {
+    use microsandbox::protocol::codec;
+    use microsandbox::protocol::exec::ExecExited;
+    use microsandbox::protocol::message::{Message, MessageType};
+
+    match report {
+        RelayReport::Silent => {}
+        RelayReport::Current { code, signal } => {
+            append_receipt(
+                receipt,
+                &[format!(
+                    "report=current:code={code},signal={}",
+                    signal.map_or_else(|| "none".to_string(), |signal| signal.to_string())
+                )],
+            );
+            codec::write_message(
+                io,
+                &Message::with_payload(MessageType::ExecExited, id, &ExecExited { code, signal })
+                    .unwrap(),
+            )
+            .await
+            .expect("relay write");
+        }
+        RelayReport::Legacy { code } => {
+            // Only the unknown-code row uses a legacy frame; the bytes are the
+            // fixture, so any other code would silently test the wrong thing.
+            assert_eq!(
+                code, -1,
+                "the pinned legacy fixture encodes an unknown `-1` only"
+            );
+            append_receipt(
+                receipt,
+                &[format!("report=legacy:code={code},signal=absent")],
+            );
+            codec::write_message(
+                io,
+                &Message::new(MessageType::ExecExited, id, LEGACY_UNKNOWN_BODY.to_vec()),
+            )
+            .await
+            .expect("relay write");
+        }
+    }
+}
+
+/// Kill a real `/bin/sh` with `SIGTERM` and return the signal the host observed.
+///
+/// This is the stimulus for a self-signalled guest: the harness cannot observe
+/// the guest kernel, so it proves that the number the relay reports is a signal
+/// a real process really died of. It is not evidence about the guest's own
+/// `waitpid` decoding — that is the agentd tests' job.
+fn self_signal_stimulus(receipt: &std::path::Path) -> i32 {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let mut helper = std::process::Command::new("/bin/sh")
+        .args(["-c", "trap - TERM; kill -TERM $$"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the owned self-signal helper");
+    let deadline = std::time::Instant::now() + SIGNAL_DEADLINE;
+    let status = loop {
+        if let Some(status) = helper.try_wait().expect("reap the self-signal helper") {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the self-signal helper never exited"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    };
+    let signal = status
+        .signal()
+        .unwrap_or_else(|| panic!("the helper was not killed by a signal: {status:?}"));
+    assert_eq!(
+        signal,
+        libc::SIGTERM,
+        "the helper must die of the signal the frame reports"
+    );
+    append_receipt(receipt, &[format!("helper_signal={signal}")]);
+    signal
+}
+
+/// A guest end must never have taken the forced path.
+///
+/// The status alone cannot tell `130`/`143` from a forced shutdown that produced
+/// the same number, so every promoted row asserts the teardown it used.
+fn assert_no_forced_teardown(text: &str, why: &str) {
+    for stage in ["stage=kill", "stage=reap"] {
+        assert!(
+            !text.contains(stage),
+            "{why}: `{stage}` means the launcher forced the teardown:
+{text}"
+        );
     }
 }
 
@@ -624,6 +875,51 @@ fn a_forced_shutdown_tears_down_before_a_blocked_notice_can_hold_it() {
     run_signal_case(SignalCase::ForcedNoticeStalled);
 }
 
+#[test]
+fn a_guest_that_signals_itself_reports_its_own_signal_in_terminal_mode() {
+    run_signal_case(SignalCase::PtySelfSigterm);
+}
+
+#[test]
+fn a_guest_that_signals_itself_reports_its_own_signal_when_streaming() {
+    run_signal_case(SignalCase::StreamSelfSigterm);
+}
+
+#[test]
+fn an_unhandled_forwarded_interrupt_is_the_guests_own_signal_death_in_terminal_mode() {
+    run_signal_case(SignalCase::PtyForwardedUnhandled);
+}
+
+#[test]
+fn an_unhandled_forwarded_interrupt_is_the_guests_own_signal_death_when_streaming() {
+    run_signal_case(SignalCase::StreamForwardedUnhandled);
+}
+
+#[test]
+fn a_guest_signal_outranks_the_forwarded_interrupt_in_terminal_mode() {
+    run_signal_case(SignalCase::PtyGuestSignalWins);
+}
+
+#[test]
+fn a_guest_signal_outranks_the_forwarded_interrupt_when_streaming() {
+    run_signal_case(SignalCase::StreamGuestSignalWins);
+}
+
+#[test]
+fn a_legacy_runtime_that_reports_unknown_after_a_self_exit_stays_255_in_terminal_mode() {
+    run_signal_case(SignalCase::PtyLegacySelfUnknown);
+}
+
+#[test]
+fn a_legacy_runtime_that_reports_unknown_after_a_self_exit_stays_255_when_streaming() {
+    run_signal_case(SignalCase::StreamLegacySelfUnknown);
+}
+
+#[test]
+fn a_legacy_runtime_unknown_status_after_a_forwarded_interrupt_is_never_a_signal_status() {
+    run_signal_case(SignalCase::StreamLegacyUnknownAfterSignal);
+}
+
 /// Deliver one signal to the case child, as the operator's terminal or an
 /// external `kill` would.
 fn signal(pid: libc::pid_t, signal: libc::c_int) {
@@ -769,6 +1065,25 @@ fn run_signal_case(case: SignalCase) {
             // which is why streaming must forward it.
             terminal.type_bytes(&[0x03]);
         }
+        // A guest that dies of a signal we forwarded: the host half is a real
+        // `SIGINT`, and the guest's own identity is what the status reports.
+        SignalCase::PtyForwardedUnhandled
+        | SignalCase::StreamForwardedUnhandled
+        | SignalCase::PtyGuestSignalWins
+        | SignalCase::StreamGuestSignalWins
+        | SignalCase::StreamLegacyUnknownAfterSignal => {
+            signal(child_pid, libc::SIGINT);
+            wait_until("the forwarded signal", SIGNAL_DEADLINE, || {
+                receipt("signal").as_deref() == Some("2")
+            });
+        }
+        // Self-signal rows: **no host signal at all**. Listed explicitly so they
+        // cannot fall through to an arm that signals the child, which would make
+        // the rows prove host identity instead of guest identity.
+        SignalCase::PtySelfSigterm
+        | SignalCase::StreamSelfSigterm
+        | SignalCase::PtyLegacySelfUnknown
+        | SignalCase::StreamLegacySelfUnknown => {}
         SignalCase::GraceExpiry
         | SignalCase::GuestExitsInGrace
         | SignalCase::UnknownStatus
@@ -886,6 +1201,77 @@ fn run_signal_case(case: SignalCase) {
                 Some("delivered"),
                 "the forced notice must still reach stderr once it accepts: {text}"
             );
+        }
+        SignalCase::PtySelfSigterm | SignalCase::StreamSelfSigterm => {
+            // The row slice 1 could not serve. The launcher received no signal,
+            // so the status can only come from the guest's reported identity.
+            assert!(
+                receipt_lines_of(&text, "signal").is_empty(),
+                "a self-signalled guest must involve no host signal: {text}"
+            );
+            assert_eq!(
+                receipt("helper_signal").as_deref(),
+                Some("15"),
+                "the reported identity must be a signal a real process died of: {text}"
+            );
+            assert!(
+                text.contains("report=current:code=-1,signal=15"),
+                "the relay must emit current-format identity: {text}"
+            );
+            assert_no_forced_teardown(&text, "a self-signalled guest is an ordinary guest end");
+        }
+        SignalCase::PtyForwardedUnhandled | SignalCase::StreamForwardedUnhandled => {
+            // 128 + the *guest's* signal, which here happens to equal the
+            // launcher's forced value — the ordinary teardown stages and the
+            // report are what tell the two apart.
+            assert_eq!(
+                receipt("signal").as_deref(),
+                Some("2"),
+                "the forwarded interrupt must reach the guest: {text}"
+            );
+            assert!(
+                text.contains("report=current:code=-1,signal=2"),
+                "the guest's own signal death must be reported: {text}"
+            );
+            assert_no_forced_teardown(&text, "an unhandled forwarded signal is still a guest end");
+        }
+        SignalCase::PtyGuestSignalWins | SignalCase::StreamGuestSignalWins => {
+            // The forwarded signal was `SIGINT`; the guest died of `SIGTERM`.
+            // 143 (128 + guest 15) rather than 130 (128 + forwarded 2) is the
+            // whole assertion.
+            assert_eq!(receipt("signal").as_deref(), Some("2"), "{text}");
+            assert!(
+                text.contains("report=current:code=-1,signal=15"),
+                "the guest's terminating signal must be reported: {text}"
+            );
+            assert_no_forced_teardown(&text, "the guest's own death ends the session");
+        }
+        SignalCase::PtyLegacySelfUnknown
+        | SignalCase::StreamLegacySelfUnknown
+        | SignalCase::StreamLegacyUnknownAfterSignal => {
+            // A pre-signal runtime: the payload has no `signal` key, so the
+            // slice-1 numbers stand — `-1` as a process status is 255.
+            assert_eq!(
+                receipt("status").as_deref(),
+                Some("ok:-1"),
+                "an older runtime's unknown status is passed through: {text}"
+            );
+            assert!(
+                text.contains("report=legacy:code=-1,signal=absent"),
+                "the legacy row must exercise an absent field, not `signal: null`: {text}"
+            );
+            match case {
+                SignalCase::StreamLegacyUnknownAfterSignal => {
+                    // Exactly the one signal we forwarded: the legacy frame is
+                    // still a guest end, never a forced one.
+                    assert_eq!(receipt_lines_of(&text, "signal"), ["2"], "{text}");
+                }
+                _ => assert!(
+                    receipt_lines_of(&text, "signal").is_empty(),
+                    "no host signal is involved in this row: {text}"
+                ),
+            }
+            assert_no_forced_teardown(&text, "a legacy guest report is an ordinary guest end");
         }
         SignalCase::UnknownStatus => {
             // The row this case exists for: a signal was forwarded and the
