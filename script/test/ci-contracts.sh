@@ -65,6 +65,11 @@ if [[ "$guard_only" == false ]]; then
     # controls, so no ambient terminal can help a case pass.
     python3 "$REPO_ROOT/script/test/lib/detached-run.py" \
       python3 "$REPO_ROOT/script/test/lib/direct-terminal-contract.py"
+    # #455's sweep contract is boot-free and cheap, so it goes first: the
+    # released-image control below can hang on a host for a pre-existing reason
+    # (its reentrant-sigterm teardown), and then a plain run of this script never
+    # reaches it. CI runs the whole list either way.
+    bash "$REPO_ROOT/script/test/e2e-image-cleanup-contract.sh"
     bash "$REPO_ROOT/script/test/e2e-release-contract.sh"
     bash "$REPO_ROOT/script/test/egress-default-deny-contract.sh"
     bash "$REPO_ROOT/script/test/config-dir-guard-contract.sh"
@@ -106,6 +111,7 @@ syntax_check=(
     script/test/chrome-example-contract.sh
     script/test/chrome-example-contract-test.sh
     script/test/e2e-release-contract.sh
+    script/test/e2e-image-cleanup-contract.sh
     script/test/persisted-network-live.sh
     script/test/persisted-network-contract.sh
     script/test/build-provenance-contract.sh
@@ -131,6 +137,7 @@ syntax_check=(
     script/test/e2e-released-image.sh
     script/test/e2e.sh
     script/test/lib/released-image-checks.sh
+    script/test/lib/e2e-image-cleanup.sh
     "$self_relative"
 )
 
@@ -157,6 +164,7 @@ shellcheck_files=(
     script/test/chrome-example-contract.sh
     script/test/chrome-example-contract-test.sh
     script/test/e2e-release-contract.sh
+    script/test/e2e-image-cleanup-contract.sh
     script/test/persisted-network-live.sh
     script/test/persisted-network-contract.sh
     script/test/build-provenance-contract.sh
@@ -182,6 +190,7 @@ shellcheck_files=(
     script/test/e2e-released-image.sh
     script/test/e2e.sh
     script/test/lib/released-image-checks.sh
+    script/test/lib/e2e-image-cleanup.sh
     "$self_relative"
 )
 
@@ -247,6 +256,13 @@ assert_listed 'bash -n' 'script/test/fixtures/config-mounts/guest-cm-probe.sh' "
 assert_listed 'shellcheck' 'script/test/config-mounts-live.sh' "${shellcheck_files[@]}"
 assert_listed 'shellcheck' 'script/test/config-mounts-contract.sh' "${shellcheck_files[@]}"
 assert_listed 'shellcheck' 'script/test/fixtures/config-mounts/guest-cm-probe.sh' "${shellcheck_files[@]}"
+# #455's sweep lib is sourced by e2e.sh, so both guards need it as an input:
+# the linter resolves a sourced file only when it is one of the inputs. Nothing
+# scans script/test/, so the new contract needs its own pair as well.
+assert_listed 'bash -n' 'script/test/lib/e2e-image-cleanup.sh' "${syntax_check[@]}"
+assert_listed 'shellcheck' 'script/test/lib/e2e-image-cleanup.sh' "${shellcheck_files[@]}"
+assert_listed 'bash -n' 'script/test/e2e-image-cleanup-contract.sh' "${syntax_check[@]}"
+assert_listed 'shellcheck' 'script/test/e2e-image-cleanup-contract.sh' "${shellcheck_files[@]}"
 
 is_vendored() {
     [[ "$1" == vendor/microsandbox/* ]]
