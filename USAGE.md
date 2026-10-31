@@ -1184,7 +1184,7 @@ recent `[table]` header, so write it **before the first one**:
 | `[mounts]` (table form) | top-level and present, so verified, then `mounts: must be an array of strings` |
 | `[tools.env]` with `mounts = "~/private:ro"` | a legitimate **environment variable** named `mounts`; no mount is selected and no authority is asked for |
 | `[[tools]]` with `mounts = 7` | a wrong type, still authority-bearing first, then `tools[0].mounts: must be an array of strings` |
-| `[mount_sets]` then `mounts = [...]` | a **set named `mounts`** with one declaration, not the defaults list: `mounts` is a valid set name and is not reserved. Only the position decides |
+| `[mount_sets]` then `mounts = [...]`, `image = "…"`, `tools = [...]`, `network = {}` or `mount_sets = {}` | refused: those five are the config's own top-level field names, so they can never be set names. The sentence names the key and the fix: `mount_sets[0]: image is not a mount set; a top-level image must be written before the first table header (keys after [mount_sets] belong to it)` |
 | `[mount_sets.foo]` (nested table) | refused: a set's value must be an array of declarations or set names |
 | `mount_sets = []` or any non-table | `mount_sets: must be a table of named arrays of mount declarations` |
 
@@ -1240,8 +1240,13 @@ persisted paths.
 `A` differs from `a`. `agent:ro`, `-agent`, `--mount`, `../x`, `./x`, `~x`,
 `a/b`, `a b` and any non-ASCII spelling are not. Tool, route and command words are
 not reserved: a set may be called `pi` or `shell`, and `--mount pi` selects the
-set and never a tool. There is no implicit `agent` set and no inference from tool
-names.
+set and never a tool. The config's own top-level field names are reserved —
+`mounts`, `mount_sets`, `network`, `image` and `tools` — because TOML assigns a
+key to the most recent `[table]` header, so a top-level key written after
+`[mount_sets]` lands in that table. Refusing those names turns the scoping
+mistake into one sentence that names it, instead of `mounts = [...]` quietly
+becoming a set named `mounts` that selects nothing. There is no implicit `agent`
+set and no inference from tool names.
 
 **`--mount` and config entries share one classification.** A host segment
 starting with `/` or `~/` is a path and keeps the whole `HOST[:GUEST][:MODE]...`

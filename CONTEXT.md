@@ -690,7 +690,10 @@ user tool's own `mounts` list, or from `--mount NAME`. A set is a selector, neve
 tool or store: **declaring one mounts nothing**, and only a launch that selects
 it grants filesystem access. Names are case-sensitive ASCII
 (`[A-Za-z0-9_]` first, then `[A-Za-z0-9_.-]`), so a name can never look like a
-flag, a path or a modifier, and tool/route words are not reserved. Sets compose:
+flag, a path or a modifier, and tool/route words are not reserved; the config's own
+top-level field names (`mounts`, `mount_sets`, `network`, `image`, `tools`) are,
+so a key a `[mount_sets]` header scopes into that table is reported as the scoping
+mistake instead of loading as a set. Sets compose:
 a set's entries are direct declarations or other set names, forward references
 resolve, and a set-reference **cycle** is invalid (a `tools` cycle is not). Each
 declared set's transitive **closure** is validated at load — unknown names,

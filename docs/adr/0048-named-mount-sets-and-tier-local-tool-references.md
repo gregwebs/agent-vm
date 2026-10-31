@@ -90,6 +90,17 @@ existing initialized-fork reuse; unused sets do not require their sources to exi
 A set reference is a bare name: `agent:ro` and other set-level mode modifiers
 are refused. Modes belong to the individual path declarations.
 
+_Amended by [#482](https://github.com/gregwebs/agent-vm/issues/482) (2026-10)._ The
+user config's own top-level field names — `mounts`, `mount_sets`, `network`,
+`image`, `tools` — are **reserved** as set names. TOML assigns a key to the most
+recent `[table]` header, so a top-level key written after `[mount_sets]` becomes a
+definition there, and only some of those values have a shape that betrays the
+mistake: `image = "ref"` was an unexplained `mount_sets[N]` type error, while
+`mounts = [...]` was a well-shaped set that selected nothing. Refusing those names
+reports the scoping mistake and the fix in one sentence, mirroring the existing
+`mounts`-in-`[network]` refusal. Tool, route and subcommand words stay unreserved:
+a set may still be called `pi` or `shell`.
+
 `--no-config-mounts` skips configuration-selected mount preparation, not schema,
 reference, cycle, or authority validation. Explicit CLI paths and named sets still
 apply. Unknown set names never fall back to relative host paths. `~/` expansion

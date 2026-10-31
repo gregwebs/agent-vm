@@ -1948,6 +1948,36 @@ fn launch_closure(
 // Raw schema and validation
 // ---------------------------------------------------------------------------
 
+/// The user config's top-level field names, which are therefore the **reserved**
+/// mount-set names.
+///
+/// TOML assigns a bare key to the most recent `[table]` header, so a top-level key
+/// written after `[mount_sets]` becomes a set definition — and not every such value
+/// has a shape that betrays it: `image = "ref"` is refused only as an unexplained
+/// `mount_sets[N]` type error, while `mounts = [...]` is a well-shaped set named
+/// `mounts` that selects nothing, the defaults silently gone. Reserving these five
+/// names turns both into one sentence that names the key and the fix. Tool, route
+/// and subcommand words stay unreserved (`pi`, `shell`), because none of them can
+/// be a top-level key.
+///
+/// Held here rather than in `config_mounts` because this module owns the schema the
+/// names come from: the test beside `RawConfig` proves each one is still accepted at
+/// the top level, so a renamed field cannot leave a stale reservation behind.
+pub(crate) const TOP_LEVEL_FIELDS: [&str; 5] =
+    ["image", "mounts", "mount_sets", "network", "tools"];
+
+/// The canonical spelling of `name` when it is a top-level field name.
+///
+/// `Option<&'static str>` rather than a `bool`: the diagnostic prints the spelling
+/// returned here, so a mount-set sentence can only ever contain one of these five
+/// words and never bytes read from the file.
+pub(crate) fn top_level_field(name: &str) -> Option<&'static str> {
+    TOP_LEVEL_FIELDS
+        .iter()
+        .copied()
+        .find(|field| *field == name)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
@@ -3175,20 +3205,60 @@ mod tests {
         );
     }
 
-    /// `mounts` is not a reserved word: written *after* a `[mount_sets]` header it
-    /// is a set named `mounts`, not the defaults list. The position, not the name,
-    /// decides which construct the key reached.
+    /// A top-level key written after a `[mount_sets]` header is scoped into that
+    /// table, so the reserved fields are refused by name. `mounts` is the one that
+    /// used to load — a well-shaped set named `mounts` that selected nothing — and
+    /// `image` the one that failed as an unexplained `mount_sets[1]` type error.
     #[test]
-    fn mount_sets_can_contain_a_key_named_mounts() {
-        let f = Fixture::new();
-        let report = f
-            .user("[mount_sets]\nmounts = [\"/a:/g:ro\"]\n")
-            .load()
-            .unwrap();
-        let mounts = report.user_mounts().expect("the table is present");
-        assert!(!mounts.has_defaults());
-        let name = crate::config_mounts::MountSetName::parse("mounts").unwrap();
-        assert_eq!(mounts.requests_for_set(&name).map(|r| r.len()), Some(1));
+    fn mount_sets_refuse_the_top_level_field_names() {
+        for (name, value) in [
+            ("image", "\"agent-vm-standard:local\""),
+            ("mounts", "[\"/a:/g:ro\"]"),
+            ("mount_sets", "{}"),
+            ("network", "{}"),
+            ("tools", "[]"),
+        ] {
+            let f = Fixture::new();
+            let error = f
+                .user(&format!("[mount_sets]\n{name} = {value}\n"))
+                .load()
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error,
+                format!(
+                    "config: {:?}: mount_sets[0]: {name} is not a mount set; a top-level {name} \
+                     must be written before the first table header (keys after [mount_sets] \
+                     belong to it)",
+                    f.user
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    /// The reserved set names are the top-level field names. Each one still loads as
+    /// a top-level key — `deny_unknown_fields` refuses anything else, so acceptance
+    /// is membership — and the fixture list is the struct's own field list, so a
+    /// field removed from `RawConfig` cannot leave a stale reservation behind. (A
+    /// *new* field needs a matching reservation in `TOP_LEVEL_FIELDS`; nothing here
+    /// can see that omission, which is why reserving is a documented review step.)
+    #[test]
+    fn reserved_set_names_are_the_top_level_fields() {
+        let fields = [
+            ("image", "\"agent-vm-standard:local\""),
+            ("mounts", "[]"),
+            ("mount_sets", "{}"),
+            ("network", "{}"),
+            ("tools", "[]"),
+        ];
+        assert_eq!(fields.map(|(name, _)| name), TOP_LEVEL_FIELDS);
+        for (name, value) in fields {
+            let f = Fixture::new();
+            f.user(&format!("{name} = {value}\n"))
+                .load()
+                .unwrap_or_else(|error| panic!("{name} must be a top-level field: {error:#}"));
+        }
     }
 
     /// A project or built-in `[mount_sets]` is refused by presence alone — empty
