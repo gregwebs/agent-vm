@@ -648,10 +648,12 @@ all inputs.
 A writable, project-scoped persistent mount initialized once from a host
 **directory**. After initialization, the fork and source are independent; a
 fork can omit entries while seeding (`:fork:exclude=REL`), never copies a
-**Protected host file**, and files are never forked (a regular file is a
-read-only bind). See
-[ADR-0013](docs/adr/0013-add-forked-mounts.md) and
-[ADR-0014](docs/adr/0014-narrow-fork-mounts-to-directories.md).
+**Protected host file**, omits a node no snapshot can carry (a socket, FIFO or
+device node) with a notice rather than refusing the seed, and files are never
+forked (a regular file is a read-only bind). See
+[ADR-0013](docs/adr/0013-add-forked-mounts.md),
+[ADR-0014](docs/adr/0014-narrow-fork-mounts-to-directories.md) and
+[ADR-0054](docs/adr/0054-omit-nodes-a-fork-seed-cannot-carry.md).
 
 _Avoid_: "bind mount", which remains connected to the host path; "copy-on-write
 mount", which implies lazy shared backing storage.

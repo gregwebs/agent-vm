@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted. Implementation decision for [agent-vm #113](https://github.com/gregwebs/agent-vm/issues/113). Narrows [ADR-0013](0013-add-forked-mounts.md): the identity, store, locking, publication, and fail-closed recovery decisions there remain applicable; only its file-root fork and live-exclusion masks are superseded. The descriptor-pinned symlink/ACL hardening is deferred to [agent-vm #114](https://github.com/gregwebs/agent-vm/issues/114).
+Accepted. Implementation decision for [agent-vm #113](https://github.com/gregwebs/agent-vm/issues/113). Narrows [ADR-0013](0013-add-forked-mounts.md): the identity, store, locking, publication, and fail-closed recovery decisions there remain applicable; only its file-root fork and live-exclusion masks are superseded. The descriptor-pinned symlink/ACL hardening is deferred to [agent-vm #114](https://github.com/gregwebs/agent-vm/issues/114). Amended by [ADR-0054](0054-omit-nodes-a-fork-seed-cannot-carry.md): a nested socket, FIFO or device node is omitted during seeding rather than refused. Links keep this ADR's rule — copied as links, or followed under `:fork:follow-links` — and an unrecognized node type still fails closed.
 
 ## Context
 

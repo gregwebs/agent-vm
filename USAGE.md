@@ -1040,6 +1040,18 @@ bind that stored copy, never synchronize with `HOST`, and print the exact reset
 directory. `:fork:follow-links` materializes link targets into that copy;
 without it nested link text is preserved. `fork` conflicts with `ro` and `rw`.
 
+A seed copies regular files and directories. A **socket, FIFO or device node**
+in the source is omitted, not copied and not a failure, with a notice like
+`==> Omitted socket dashboard/gateway-9999.sock from the fork of <source>`: a
+copied socket is a dead path the guest's own process cannot bind, and a copied
+device node needs privileges the copier does not have. This is why a running
+Pi's `~/.pi` — which keeps live sockets under `dashboard/` and `remote/locks/`
+— seeds. The decision is the node's type, never its contents: a node standing in
+the source is never opened, so its own permissions cannot block the seed. What the
+copy does have to open and cannot — an unreadable regular file or directory — is
+still a refusal. The fork **root** is still directory-only, and `:exclude=REL`
+stays silent because an excluded node is never inspected at all.
+
 Repeat `:exclude=REL`, for example
 `--mount /host:/guest:fork:exclude=credentials.json:exclude=cache`. `REL` is a
 nonempty normal relative path: it cannot contain `:`, control characters, `.`,

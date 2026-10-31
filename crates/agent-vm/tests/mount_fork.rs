@@ -1151,6 +1151,45 @@ fn fork_seed_omission_does_not_block_later_explicit_child_mount() {
     }
 }
 
+/// A live host keeps UNIX sockets in the trees people fork — `~/.pi` keeps
+/// `dashboard/gateway-*.sock` and `remote/locks/*.sock` — and `open(2)` on one
+/// fails (EOPNOTSUPP on Darwin, ENXIO on Linux). Issue #483 was a seed dying at
+/// that open, naming neither the file nor a way out; it now seeds, names the
+/// socket, and reaches the runtime.
+#[test]
+fn a_fork_seed_omits_a_nested_socket_and_still_launches() {
+    let h = Harness::new();
+    let source = h.home_path().join("fork-source");
+    std::fs::create_dir_all(source.join("dashboard")).unwrap();
+    std::fs::write(source.join("kept"), "seed").unwrap();
+    std::os::unix::net::UnixListener::bind(source.join("dashboard/gateway-9999.sock")).unwrap();
+    let mount = format!("{}:/fork:fork", source.display());
+
+    let seeded = h.run_shell(&[&mount]);
+    let stderr = stderr_of(&seeded);
+    assert!(
+        stderr.contains("==> Omitted socket dashboard/gateway-9999.sock from the fork of"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("[debug] sandbox config JSON:"),
+        "the seed must still reach the runtime: {stderr}"
+    );
+    let binds = bind_mounts(&debug_config_json(&stderr));
+    let committed = binds
+        .iter()
+        .find(|(_, guest, _)| guest == "/fork")
+        .map(|(host, _, _)| PathBuf::from(host))
+        .expect("seeded fork bind");
+    assert!(committed.join("kept").is_file());
+    assert!(committed.join("dashboard").is_dir());
+    // Absent as a node: `!exists()` would also pass for a dangling link.
+    assert!(matches!(
+        std::fs::symlink_metadata(committed.join("dashboard/gateway-9999.sock")),
+        Err(ref error) if error.kind() == std::io::ErrorKind::NotFound
+    ));
+}
+
 #[test]
 fn fork_debug_config_uses_committed_data_not_source_and_reuses_it() {
     let h = Harness::new();
