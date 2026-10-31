@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 #[cfg(test)]
 use microsandbox::sandbox::MountBuilder;
+use rustix::fs::FileType;
 
 use crate::config::{quoted_path, quoted_str};
 use crate::host_paths::flock_exclusive;
@@ -4495,10 +4496,10 @@ pub(crate) fn prepare_forks(
                     mount.source_spelling.render(declaration)
                 )
             })?;
-        for (relative, file) in &report.omitted {
+        for (relative, omitted) in &report.omitted {
             notices.push(format!(
                 "==> Omitted {} {} from the fork of {}",
-                file.description(),
+                omitted.description(),
                 crate::one_line::path(relative),
                 mount.source_spelling.render(declaration)
             ));
@@ -4899,10 +4900,117 @@ impl NodePolicy<'_> {
     }
 }
 
-/// What the copier refused to copy, for notices.
+/// What the copier left out of a fork, for notices.
 #[derive(Default)]
 struct CopyReport {
-    omitted: Vec<(PathBuf, ProtectedFile)>,
+    omitted: Vec<(PathBuf, OmittedNode)>,
+}
+
+/// A node the seed deliberately does not copy. Two unrelated reasons wear one
+/// name: the guest must not reach these bytes, or the bytes are not data.
+#[derive(Clone, Copy)]
+enum OmittedNode {
+    /// A host file whose bytes must never reach a guest (ADR-0020).
+    Protected(ProtectedFile),
+    /// A node no data snapshot can carry (ADR-0054).
+    Special(SpecialFile),
+}
+
+impl OmittedNode {
+    fn description(self) -> &'static str {
+        match self {
+            Self::Protected(file) => file.description(),
+            Self::Special(file) => file.description(),
+        }
+    }
+}
+
+/// The four node kinds a data snapshot cannot carry. A seed omits one instead of
+/// refusing it: a copied socket is a dead path that stops the guest's own
+/// listener from binding, and a copied FIFO or device node is equally not data
+/// (a device node would also need privilege the copier does not have) — so none
+/// of them is worth failing a launch over (ADR-0054).
+///
+/// Links are not in this set: a `statat` that reports `Symlink` did not follow
+/// it, and the default policy copies such a node as a link while
+/// `:fork:follow-links` classifies the target instead. `Unknown` is not in it
+/// either, because a type this build does not recognize has no known snapshot
+/// and stays a refusal.
+#[derive(Clone, Copy)]
+enum SpecialFile {
+    Socket,
+    Fifo,
+    CharacterDevice,
+    BlockDevice,
+}
+
+impl SpecialFile {
+    fn of(ty: FileType) -> Option<Self> {
+        match ty {
+            FileType::Socket => Some(Self::Socket),
+            FileType::Fifo => Some(Self::Fifo),
+            FileType::CharacterDevice => Some(Self::CharacterDevice),
+            FileType::BlockDevice => Some(Self::BlockDevice),
+            FileType::RegularFile | FileType::Directory | FileType::Symlink | FileType::Unknown => {
+                None
+            }
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Socket => "socket",
+            Self::Fifo => "FIFO",
+            Self::CharacterDevice => "character device",
+            Self::BlockDevice => "block device",
+        }
+    }
+
+    /// Whether this kind's own `open` fails because of what the node *is*,
+    /// which is the only failure [`omitted_after_failed_open`] recovers from.
+    ///
+    /// One kind and two errors: a socket cannot be opened on any platform
+    /// (`EOPNOTSUPP` on Darwin, `ENXIO` on Linux). A device node can answer
+    /// `NXIO` as well, so this is not a proof of what the node became — it is
+    /// the narrow gate that keeps every ambiguous failure (`EACCES`/`EPERM`,
+    /// `EMFILE`, `EIO`, `ELOOP`, `ENOENT`) a refusal. Nothing here is a
+    /// statement about permissions: a special node the walk *classifies* is
+    /// never opened, so its own mode cannot stop a seed.
+    fn explains_open_error(self, error: rustix::io::Errno) -> bool {
+        matches!(self, Self::Socket)
+            && matches!(
+                error,
+                rustix::io::Errno::OPNOTSUPP | rustix::io::Errno::NXIO
+            )
+    }
+}
+
+/// What a child became between the `statat` that classified it and the `openat`
+/// that should have carried it into the copy. A live source can grow a socket
+/// mid-seed, and that open then fails with exactly the error that made a nested
+/// socket fatal before ADR-0054, so the type is read once more rather than
+/// reported as a failure of the copy.
+///
+/// Two gates, both required: the node must be a socket *now*, and `error` must
+/// be one a socket's open answers with (see [`SpecialFile::explains_open_error`]).
+/// Everything else — `EMFILE`, `EIO`, `ENOENT`, and every permission or device
+/// failure — is about the open rather than about a kind that has no snapshot, and
+/// keeps its own error. There is no retry: a node that changes again before this
+/// `statat` is that error's business.
+fn omitted_after_failed_open(
+    dir: &rustix::fd::OwnedFd,
+    name: &std::ffi::OsStr,
+    follow: bool,
+    error: rustix::io::Errno,
+) -> Option<SpecialFile> {
+    let flags = if follow {
+        rustix::fs::AtFlags::empty()
+    } else {
+        rustix::fs::AtFlags::SYMLINK_NOFOLLOW
+    };
+    let stat = rustix::fs::statat(dir, name, flags).ok()?;
+    let special = SpecialFile::of(FileType::from_raw_mode(stat.st_mode))?;
+    special.explains_open_error(error).then_some(special)
 }
 
 /// A node the copier either published or deliberately did not. The enum forces
@@ -5007,7 +5115,9 @@ fn copy_opened(
     // all — no empty file, no placeholder (an overlay would be a mask, and
     // ADR-0014 removed mask machinery).
     if let Some(file) = policy.omits(stat.st_dev as u64, stat.st_ino as u64, relative) {
-        report.omitted.push((relative.to_path_buf(), file));
+        report
+            .omitted
+            .push((relative.to_path_buf(), OmittedNode::Protected(file)));
         return Ok(CopiedNode::Omitted);
     }
     let ty = FileType::from_raw_mode(stat.st_mode);
@@ -5023,7 +5133,23 @@ fn copy_opened(
         ))?;
         return Ok(CopiedNode::Copied(PreparedNodeKind::File));
     }
+    if let Some(special) = SpecialFile::of(ty) {
+        // The interval again, for the kinds whose own open succeeds: a node
+        // swapped for a FIFO the copier may read (or an attached device) opens,
+        // so it reaches this descriptor and is omitted here. A socket cannot
+        // arrive this way — its open fails before there is a descriptor, which
+        // is `omitted_after_failed_open`'s case — and anything else that fails
+        // its open never reaches here at all.
+        report
+            .omitted
+            .push((relative.to_path_buf(), OmittedNode::Special(special)));
+        return Ok(CopiedNode::Omitted);
+    }
     if ty != FileType::Directory {
+        // Only `Unknown` reaches here: every kind above is answered, and a
+        // descriptor never reports `Symlink`. An object type this build does not
+        // recognize has no known snapshot either, but naming it as an omission
+        // would claim a decision this copier has not made, so it stays closed.
         anyhow::bail!(
             "{} is not a regular file or directory",
             crate::one_line::path(relative)
@@ -5073,13 +5199,42 @@ fn copy_opened(
                 // inside the directory that contained their raw text. Without
                 // `NOFOLLOW`, a followed target is classified by its own
                 // `fstat`, so an omitted protected file is not materialized.
-                let target = rfs::openat(
+                let target_ty = FileType::from_raw_mode(
+                    rfs::statat(fd, name, rustix::fs::AtFlags::empty())
+                        .with_context(|| {
+                            format!("following {}", crate::one_line::path(&child_relative))
+                        })?
+                        .st_mode,
+                );
+                if let Some(special) = SpecialFile::of(target_ty) {
+                    // Stat, not open, first: the `openat` that materializes
+                    // this target fails on a socket exactly as the walk's own
+                    // `openat` does, so a followed target with no snapshot is
+                    // omitted before the syscall that cannot succeed.
+                    report
+                        .omitted
+                        .push((child_relative.clone(), OmittedNode::Special(special)));
+                    continue;
+                }
+                let target = match rfs::openat(
                     fd,
                     name,
                     OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
                     Mode::empty(),
-                )
-                .with_context(|| format!("following {}", crate::one_line::path(&child_relative)))?;
+                ) {
+                    Ok(target) => target,
+                    Err(error) => {
+                        if let Some(special) = omitted_after_failed_open(fd, name, true, error) {
+                            report
+                                .omitted
+                                .push((child_relative.clone(), OmittedNode::Special(special)));
+                            continue;
+                        }
+                        return Err(error).with_context(|| {
+                            format!("following {}", crate::one_line::path(&child_relative))
+                        });
+                    }
+                };
                 copy_opened(
                     &target,
                     &child_dst,
@@ -5090,13 +5245,33 @@ fn copy_opened(
                     report,
                 )?;
             }
+        } else if let Some(special) = SpecialFile::of(child_ty) {
+            // `statat` already answered what this child is. Opening it to ask
+            // the same question again is what made a nested socket fail with
+            // `EOPNOTSUPP` on Darwin, before either answer could be reported.
+            report
+                .omitted
+                .push((child_relative.clone(), OmittedNode::Special(special)));
         } else {
-            let child = rfs::openat(
+            let child = match rfs::openat(
                 fd,
                 name,
                 OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
                 Mode::empty(),
-            )?;
+            ) {
+                Ok(child) => child,
+                Err(error) => {
+                    if let Some(special) = omitted_after_failed_open(fd, name, false, error) {
+                        report
+                            .omitted
+                            .push((child_relative.clone(), OmittedNode::Special(special)));
+                        continue;
+                    }
+                    return Err(error).with_context(|| {
+                        format!("opening {}", crate::one_line::path(&child_relative))
+                    });
+                }
+            };
             copy_opened(
                 &child,
                 &child_dst,
@@ -7282,39 +7457,47 @@ mod prepare_tests {
     /// The copier reports the name it *measured*, which no declaration check has
     /// seen: a fork source is a directory, so anything inside it — including a
     /// FIFO whose name carries a newline — is named by the walk itself. It is
-    /// escaped for the same reason declared spellings are, or the refusal ends
+    /// escaped for the same reason declared spellings are, or the notice ends
     /// and everything after the newline starts at column 0.
     #[test]
-    fn a_fork_copy_refusal_escapes_the_measured_name() {
+    fn a_fork_copy_omission_escapes_the_measured_name() {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().canonicalize().unwrap();
         let store = tempfile::tempdir().unwrap();
         let source = home.join("tree");
         fs::create_dir(&source).unwrap();
         fs::write(source.join("kept"), "seed").unwrap();
-        // A FIFO rather than a socket or device: cheap, and a non-directory
-        // non-regular node is exactly what the walk refuses. The copier opens
-        // with NONBLOCK, so a reader that never arrives cannot hang it.
+        // A FIFO rather than a socket or device: cheap to make unprivileged,
+        // and one of the node kinds a seed now omits rather than refuses.
         let fifo = source.join("p\nFORGED5");
         let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
 
-        let error = prepare(
+        let plan = prepare(
             parse_extra_mounts(&[format!("{}:/g:fork", source.display())]).unwrap(),
             &context_with_home(store.path(), home.clone()),
         )
-        .unwrap_err();
+        .unwrap();
 
-        let rendered = format!("{error:#}");
+        assert_absent(&fork_data(&plan).join("p\nFORGED5"));
+        let notice = plan
+            .notices
+            .iter()
+            .find(|notice| notice.contains("Omitted"))
+            .expect("the FIFO is reported");
         assert_eq!(
-            rendered.lines().count(),
+            notice.lines().count(),
             1,
-            "one line, never a forged second: {rendered}"
+            "one line, never a forged second: {notice}"
         );
-        assert!(rendered.contains("p\\x0aFORGED5"), "{rendered}");
+        assert!(notice.contains("p\\x0aFORGED5"), "{notice}");
         assert!(
-            !rendered.lines().any(|line| line.trim() == "FORGED5"),
-            "the measured name is escaped, not printed as a line: {rendered}"
+            !plan
+                .notices
+                .iter()
+                .any(|notice| notice.lines().any(|line| line.trim() == "FORGED5")),
+            "the measured name is escaped, not printed as a line: {}",
+            plan.notices.join("\n")
         );
     }
 
@@ -9032,6 +9215,488 @@ mod prepare_tests {
             "{error}"
         );
         assert!(store_tree(store.path()).is_empty(), "{error}");
+    }
+
+    // ── nodes a fork seed cannot snapshot (issue #483) ───────────────
+
+    /// A real UNIX socket at `path`. This is the node that broke a `~/.pi`
+    /// seed: `open(2)` on one returns `EOPNOTSUPP` on Darwin and `ENXIO` on
+    /// Linux, so a walk that opened before classifying died here. Dropping the
+    /// listener leaves the socket file, which is all the walk sees.
+    fn bind_socket(path: &Path) {
+        std::os::unix::net::UnixListener::bind(path).expect("bind a unix socket");
+    }
+
+    /// Absent as a node, not merely unresolvable: `!exists()` also passes for a
+    /// dangling link, which would be a placeholder the seed must never write.
+    fn assert_absent(path: &Path) {
+        assert!(
+            matches!(
+                fs::symlink_metadata(path),
+                Err(ref error) if error.kind() == std::io::ErrorKind::NotFound
+            ),
+            "{} must not exist",
+            path.display()
+        );
+    }
+
+    /// The kind mapping itself. It always runs, where the device-node row below
+    /// can only run where `mknod` is permitted, so every `FileType` is pinned to
+    /// the words its notice uses. An unfollowed `Symlink` and an `Unknown` are
+    /// deliberately not omissions: the walk copies a link as a link (or follows
+    /// it when asked to) and an unrecognized object type keeps failing closed.
+    #[test]
+    fn special_file_kinds_and_descriptions_match_their_notices() {
+        use rustix::fs::FileType;
+
+        let described = [
+            (FileType::Socket, "socket"),
+            (FileType::Fifo, "FIFO"),
+            (FileType::CharacterDevice, "character device"),
+            (FileType::BlockDevice, "block device"),
+        ];
+        for (ty, expected) in described {
+            assert_eq!(SpecialFile::of(ty).unwrap().description(), expected);
+        }
+        for ty in [
+            FileType::RegularFile,
+            FileType::Directory,
+            FileType::Symlink,
+            FileType::Unknown,
+        ] {
+            assert!(SpecialFile::of(ty).is_none(), "{ty:?} is not special");
+        }
+    }
+
+    #[test]
+    fn a_nested_socket_is_omitted_instead_of_failing_the_seed() {
+        // The socket is classified from `statat` in both policies: `follow`
+        // changes what the walk does with a link, and this child is not one.
+        for follow in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().canonicalize().unwrap();
+            let source = home.join("tree");
+            fs::create_dir_all(source.join("nested")).unwrap();
+            fs::write(source.join("kept"), "seed").unwrap();
+            bind_socket(&source.join("nested/gateway.sock"));
+            let store = tempfile::tempdir().unwrap();
+
+            let plan = prepare(
+                parse_extra_mounts(&[format!(
+                    "{}:/guest:fork{}",
+                    source.display(),
+                    if follow { ":follow-links" } else { "" }
+                )])
+                .unwrap(),
+                &context_with_home(store.path(), home.clone()),
+            )
+            .unwrap();
+            let data = fork_data(&plan);
+
+            assert!(data.join("kept").is_file());
+            assert!(data.join("nested").is_dir());
+            assert_absent(&data.join("nested/gateway.sock"));
+            assert_eq!(
+                plan.notices
+                    .iter()
+                    .filter(|notice| notice.contains("gateway.sock"))
+                    .cloned()
+                    .collect::<Vec<String>>(),
+                [format!(
+                    "==> Omitted socket nested/gateway.sock from the fork of {}",
+                    source.display()
+                )],
+                "follow={follow}"
+            );
+        }
+    }
+
+    #[test]
+    fn follow_links_omits_a_socket_target_instead_of_opening_it() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap();
+        let source = home.join("tree");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("kept"), "seed").unwrap();
+        // Outside the root, so the link is the only way this socket could reach
+        // the copy and a notice here is the follow path's own.
+        let outside = home.join("outside.sock");
+        bind_socket(&outside);
+        symlink(&outside, source.join("link.sock")).unwrap();
+        let store = tempfile::tempdir().unwrap();
+
+        let plan = prepare(
+            parse_extra_mounts(&[format!("{}:/guest:fork:follow-links", source.display())])
+                .unwrap(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap();
+        let data = fork_data(&plan);
+
+        assert!(data.join("kept").is_file());
+        assert_absent(&data.join("link.sock"));
+        assert!(
+            plan.notices.iter().any(|notice| notice
+                == &format!(
+                    "==> Omitted socket link.sock from the fork of {}",
+                    source.display()
+                )),
+            "{:?}",
+            plan.notices
+        );
+    }
+
+    /// The unprivileged device row: `/dev/null` is a real character device on
+    /// every host this runs on, and a link to it makes the follow path classify
+    /// a device without needing `mknod`.
+    #[test]
+    fn a_followed_device_node_is_omitted() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap();
+        let source = home.join("tree");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("kept"), "seed").unwrap();
+        symlink("/dev/null", source.join("console")).unwrap();
+        let store = tempfile::tempdir().unwrap();
+
+        let plan = prepare(
+            parse_extra_mounts(&[format!("{}:/guest:fork:follow-links", source.display())])
+                .unwrap(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap();
+        let data = fork_data(&plan);
+
+        assert!(data.join("kept").is_file());
+        assert_absent(&data.join("console"));
+        assert!(
+            plan.notices
+                .iter()
+                .any(|notice| notice.contains("Omitted character device console")),
+            "{:?}",
+            plan.notices
+        );
+    }
+
+    /// A device node *inside* the tree rather than behind a link. This needs
+    /// `mknod` privilege, so a refusal is a skip — but only the refusal to
+    /// create one: any other `mknod` error fails the test.
+    #[test]
+    fn a_device_node_is_omitted_instead_of_failing_the_seed() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap();
+        let source = home.join("tree");
+        fs::create_dir_all(source.join("dev")).unwrap();
+        fs::write(source.join("kept"), "seed").unwrap();
+        let device = source.join("dev/console");
+        let c_path = std::ffi::CString::new(device.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a NUL-terminated path inside a directory this
+        // test owns, and `mknod` takes an owned-private path with no aliasing.
+        if unsafe { libc::mknod(c_path.as_ptr(), libc::S_IFCHR | 0o600, 0) } != 0 {
+            let error = std::io::Error::last_os_error();
+            assert!(
+                matches!(error.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES)),
+                "mknod failed for an unexpected reason: {error}"
+            );
+            eprintln!("SKIPPED device node: mknod is not permitted in this environment");
+            return;
+        }
+        let store = tempfile::tempdir().unwrap();
+
+        let plan = prepare(
+            parse_extra_mounts(&[format!("{}:/guest:fork", source.display())]).unwrap(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap();
+        let data = fork_data(&plan);
+
+        assert!(data.join("kept").is_file());
+        assert!(data.join("dev").is_dir());
+        assert_absent(&data.join("dev/console"));
+        assert!(
+            plan.notices
+                .iter()
+                .any(|notice| notice.contains("Omitted character device dev/console")),
+            "{:?}",
+            plan.notices
+        );
+    }
+
+    /// The interval `omitted_after_failed_open` exists for. `copy_checkpoint`
+    /// fires after the walk classified `node` and before it opens it, so the
+    /// swap here is the one that used to end the seed with `EOPNOTSUPP`.
+    #[test]
+    fn a_child_swapped_for_a_socket_after_classification_is_omitted() {
+        let _checkpoint_guard = COPY_CHECKPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap();
+        let source = home.join("tree");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("kept"), "seed").unwrap();
+        let victim = source.join("node");
+        fs::write(&victim, "was a regular file").unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let swapped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_swap = std::sync::Arc::clone(&swapped);
+        let (armed, victim_for_hook) = (victim.clone(), victim.clone());
+        let _hook = CopyCheckpointGuard::arm(
+            &source,
+            Box::new(move |path| {
+                if path.ends_with("node")
+                    && !hook_swap.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    fs::remove_file(&armed).unwrap();
+                    std::os::unix::net::UnixListener::bind(&armed).unwrap();
+                }
+            }),
+        );
+
+        let plan = prepare(
+            parse_extra_mounts(&[format!("{}:/guest:fork", source.display())]).unwrap(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap();
+        let data = fork_data(&plan);
+
+        assert!(swapped.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(data.join("kept").is_file());
+        assert_absent(&data.join("node"));
+        assert!(
+            plan.notices
+                .iter()
+                .any(|notice| notice.contains("Omitted socket node")),
+            "{:?}",
+            plan.notices
+        );
+        // The source itself is untouched: a seed reads, it never repairs.
+        use std::os::unix::fs::FileTypeExt as _;
+        assert!(
+            fs::symlink_metadata(&victim_for_hook)
+                .unwrap()
+                .file_type()
+                .is_socket()
+        );
+    }
+
+    /// The other half of the interval: this FIFO is created readable, so its
+    /// `O_NONBLOCK` open succeeds and the child swapped for it reaches
+    /// `copy_opened`'s own classification instead of an open failure.
+    #[test]
+    fn a_child_swapped_for_a_fifo_after_classification_is_omitted_at_its_descriptor() {
+        let _checkpoint_guard = COPY_CHECKPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap();
+        let source = home.join("tree");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("kept"), "seed").unwrap();
+        let victim = source.join("node");
+        fs::write(&victim, "was a regular file").unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let swapped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_swap = std::sync::Arc::clone(&swapped);
+        let armed = victim.clone();
+        let _hook = CopyCheckpointGuard::arm(
+            &source,
+            Box::new(move |path| {
+                if path.ends_with("node")
+                    && !hook_swap.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    fs::remove_file(&armed).unwrap();
+                    let fifo = std::ffi::CString::new(armed.as_os_str().as_bytes()).unwrap();
+                    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+                }
+            }),
+        );
+
+        let plan = prepare(
+            parse_extra_mounts(&[format!("{}:/guest:fork", source.display())]).unwrap(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap();
+        let data = fork_data(&plan);
+
+        assert!(swapped.load(std::sync::atomic::Ordering::SeqCst));
+        assert_absent(&data.join("node"));
+        assert!(
+            plan.notices
+                .iter()
+                .any(|notice| notice.contains("Omitted FIFO node")),
+            "{:?}",
+            plan.notices
+        );
+    }
+
+    /// `omitted_after_failed_open`'s gates: a socket behind a link is `Socket`
+    /// only when the re-read follows the link, and only a socket's own open
+    /// errors recover. Everything else keeps the refusal it came with — in
+    /// particular a permission error, which is also how an unreadable regular
+    /// file answers.
+    #[test]
+    fn the_failed_open_re_read_answers_only_a_socket_with_its_own_errors() {
+        use std::os::unix::fs::{FileTypeExt as _, symlink};
+
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("target.sock");
+        bind_socket(&socket);
+        symlink(&socket, root.path().join("link")).unwrap();
+        let device = root.path().join("device");
+        let c_path = std::ffi::CString::new(device.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a NUL-terminated path inside a directory this
+        // test owns, and `mknod` takes an owned-private path with no aliasing.
+        let made_device = unsafe { libc::mknod(c_path.as_ptr(), libc::S_IFCHR | 0o600, 0) } == 0;
+        let fifo = root.path().join("fifo");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let dir = rustix::fs::open(
+            root.path(),
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap();
+        assert!(
+            fs::symlink_metadata(&socket)
+                .unwrap()
+                .file_type()
+                .is_socket(),
+            "the fixture must really be a socket"
+        );
+        let name = std::ffi::OsStr::new;
+        let answers = |node: &std::ffi::OsStr, follow, error| {
+            omitted_after_failed_open(&dir, node, follow, error)
+        };
+
+        // The socket itself answers a socket's two errors under either policy.
+        for follow in [false, true] {
+            for error in [rustix::io::Errno::OPNOTSUPP, rustix::io::Errno::NXIO] {
+                assert!(matches!(
+                    answers(name("target.sock"), follow, error),
+                    Some(SpecialFile::Socket)
+                ));
+            }
+        }
+        // The link is a socket only when the re-read follows it.
+        assert!(answers(name("link"), false, rustix::io::Errno::NXIO).is_none());
+        assert!(matches!(
+            answers(name("link"), true, rustix::io::Errno::NXIO),
+            Some(SpecialFile::Socket)
+        ));
+        // A socket answers nothing else: these are the open's own failures, and
+        // `EACCES` is also an unreadable regular file's answer.
+        for error in [
+            rustix::io::Errno::MFILE,
+            rustix::io::Errno::IO,
+            rustix::io::Errno::ACCESS,
+            rustix::io::Errno::PERM,
+        ] {
+            assert!(answers(name("target.sock"), true, error).is_none());
+        }
+        // The kind gate, not just the error gate: a FIFO is always here, so the
+        // socket's own two errors must recover for it *not at all*.
+        for error in [
+            rustix::io::Errno::OPNOTSUPP,
+            rustix::io::Errno::NXIO,
+            rustix::io::Errno::ACCESS,
+        ] {
+            assert!(answers(name("fifo"), false, error).is_none(), "{error:?}");
+            assert!(answers(name("fifo"), true, error).is_none(), "{error:?}");
+        }
+        if made_device {
+            for error in [
+                rustix::io::Errno::OPNOTSUPP,
+                rustix::io::Errno::ACCESS,
+                rustix::io::Errno::NODEV,
+                rustix::io::Errno::NXIO,
+            ] {
+                assert!(answers(name("device"), false, error).is_none(), "{error:?}");
+            }
+        }
+    }
+
+    /// The refusal an unreadable regular file keeps: the recovery must not turn
+    /// a permission failure into an omission, and the error must name the entry.
+    #[test]
+    fn an_unreadable_nested_file_is_still_a_refusal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("SKIPPED unreadable file: mode 0 is not restrictive for root");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap();
+        let source = home.join("tree");
+        fs::create_dir(&source).unwrap();
+        let sealed = source.join("sealed");
+        fs::write(&sealed, "secret").unwrap();
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o000)).unwrap();
+        let store = tempfile::tempdir().unwrap();
+
+        let error = prepare(
+            parse_extra_mounts(&[format!("{}:/guest:fork", source.display())]).unwrap(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap_err();
+        let rendered = format!("{error:#}");
+
+        assert!(
+            rendered.contains("Permission denied") || rendered.contains("os error 13"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("Omitted"),
+            "a permission failure must not read as an omission: {rendered}"
+        );
+        // The refusal names the node, which is what issue #483 also asked for.
+        assert!(rendered.contains("sealed"), "{rendered}");
+        assert_eq!(
+            fs::read_dir(store.path().join("forks")).unwrap().count(),
+            0,
+            "no fork is published: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_socket_under_an_excluded_directory_stays_silent() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap();
+        let source = home.join("tree");
+        fs::create_dir_all(source.join("dashboard")).unwrap();
+        fs::write(source.join("kept"), "seed").unwrap();
+        bind_socket(&source.join("dashboard/gateway.sock"));
+        let store = tempfile::tempdir().unwrap();
+
+        let plan = prepare(
+            parse_extra_mounts(&[format!(
+                "{}:/guest:fork:exclude=dashboard",
+                source.display()
+            )])
+            .unwrap(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap();
+        let data = fork_data(&plan);
+
+        assert!(data.join("kept").is_file());
+        assert_absent(&data.join("dashboard"));
+        assert!(
+            !plan
+                .notices
+                .iter()
+                .any(|notice| notice.contains("gateway.sock")),
+            "{:?}",
+            plan.notices
+        );
     }
 }
 
