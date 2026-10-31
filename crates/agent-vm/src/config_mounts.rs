@@ -42,7 +42,11 @@
 //! Set-entry sites are `mount_sets[DEFINITION][INDEX]` with both numbers, so even
 //! an invalid *key* is named without echoing it, and a tool list is
 //! `tools[DECLARATION].mounts[INDEX]` — never the tool's name, which is not yet
-//! validated when presence is decided. A *launch-time* refusal is a
+//! validated when presence is decided. The one word a sentence may name is a
+//! *fixed vocabulary*, never the file: a `[mount_sets]` key equal to one of the
+//! config's top-level field names is refused by that name, because it is a
+//! TOML-scoping mistake rather than a set, and [`crate::config::top_level_field`]
+//! can only ever return those five spellings. A *launch-time* refusal is a
 //! different question — it has to name the host or guest path it could not
 //! prepare, or the user cannot fix it — so those sentences name the declaration
 //! as `mounts[N] in "<file>"`, `tools[N].mounts[I] in "<file>"` or
@@ -568,6 +572,15 @@ pub(crate) enum UserMountsError {
     Conflict { site: EntrySite, other: EntrySite },
     /// `mount_sets` was present but not a table.
     SetsNotTable,
+    /// The `definition`th `[mount_sets]` key is one of the user config's own
+    /// top-level field names, so a top-level key was written after the `[mount_sets]`
+    /// header and TOML scoped it into this table. `key` is a `'static` member of that
+    /// fixed vocabulary — [`crate::config::top_level_field`] is how it is produced —
+    /// so the sentence names the mistake without echoing the file.
+    TopLevelKey {
+        definition: usize,
+        key: &'static str,
+    },
     /// The `definition`th `[mount_sets]` key is not a valid name.
     SetName { definition: usize },
     /// The `definition`th set's value is not an array of strings.
@@ -646,6 +659,11 @@ impl fmt::Display for UserMountsError {
             Self::SetName { definition } => write!(
                 f,
                 "mount_sets: definition {definition} has an invalid name; {InvalidMountSetName}"
+            ),
+            Self::TopLevelKey { definition, key } => write!(
+                f,
+                "mount_sets[{definition}]: {key} is not a mount set; a top-level {key} must be \
+                 written before the first table header (keys after [mount_sets] belong to it)"
             ),
             Self::SetNotArray { definition } => write!(
                 f,

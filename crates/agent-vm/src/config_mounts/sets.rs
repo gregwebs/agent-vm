@@ -532,6 +532,17 @@ impl UserMounts {
             pairs.sort_by(|a, b| a.0.cmp(b.0));
         }
         for (definition, (key, _)) in pairs.iter().enumerate() {
+            // Reserved on the *name*, before the shape check, because shape is what
+            // hides two of these: `mounts = [...]` is a valid set definition that
+            // would select nothing. A top-level key written after the `[mount_sets]`
+            // header lands here (TOML scoping), so the sentence names that instead of
+            // only this position.
+            if let Some(top_level) = crate::config::top_level_field(key) {
+                return Err(UserMountsError::TopLevelKey {
+                    definition,
+                    key: top_level,
+                });
+            }
             let name =
                 MountSetName::parse(key).map_err(|_| UserMountsError::SetName { definition })?;
             index.insert(name.clone(), SetId(definition));
@@ -1400,6 +1411,43 @@ mod tests {
             rendered(parse_document("mount_sets = 7\n")),
             "mount_sets: must be a table of named arrays of mount declarations"
         );
+    }
+
+    /// A top-level key written after the `[mount_sets]` header is TOML-scoped into
+    /// this table. The refusal names that key — a `'static` member of the config's own
+    /// field vocabulary, never the file's bytes — and the fix, at the sorted position
+    /// every other load-time site uses. `mounts` is the spelling that used to *load*:
+    /// a well-shaped set that selected nothing.
+    #[test]
+    fn top_level_keys_are_reserved_set_names() {
+        for (key, value) in [
+            ("image", "\"agent-vm-standard:local\""),
+            ("mounts", "[\"/h/x:/g:ro\"]"),
+            ("mount_sets", "{}"),
+            ("network", "{}"),
+            ("tools", "[]"),
+        ] {
+            assert_eq!(
+                rendered(sets(&format!("{key} = {value}\n"))),
+                format!(
+                    "mount_sets[0]: {key} is not a mount set; a top-level {key} must be written \
+                     before the first table header (keys after [mount_sets] belong to it)"
+                ),
+                "{key}"
+            );
+        }
+        // Sorted, so a reservation follows the definitions before it.
+        assert_eq!(
+            rendered(sets("aaa = []\nimage = 7\n")),
+            "mount_sets[1]: image is not a mount set; a top-level image must be written before the \
+             first table header (keys after [mount_sets] belong to it)"
+        );
+        // The values are never read, let alone echoed.
+        const SENTINEL: &str = "sk-live-SENTINEL";
+        let error = rendered(sets(&format!("tools = [\"{SENTINEL}\"]\n")));
+        assert!(!error.contains(SENTINEL), "{error}");
+        // Tool and route words stay unreserved: only top-level *fields* are.
+        assert!(sets("pi = [\"/h/pi:/pi:ro\"]\nshell = [\"/h/sh:/sh:ro\"]\n").is_ok());
     }
 
     /// An invalid definition *key* is named by its sorted position and never
