@@ -6,6 +6,7 @@ notifications. Wording and grouping live here so both platforms share them.
 
   python3 proto.py single|flood|kinds|mixed|two-sessions|repl [--backend mac|linux|console]
       [--interval SECONDS] [--updates passive|active] [--linger SECONDS]
+      [--terminal terminal|ghostty|wezterm|alacritty|linux]
 
 Events are fake stand-ins: no structured block feed exists yet. State is written
 to /tmp/PROTOTYPE-agent-vm-blocks (wipe me) only so blocks.py can show it.
@@ -225,9 +226,13 @@ def main():
     ap.add_argument("--interval", type=float, default=3.0)
     ap.add_argument("--updates", default="passive", choices=["passive", "active"])
     ap.add_argument("--linger", type=float, default=90.0, help="seconds to stay up for clicks")
+    ap.add_argument("--terminal", default="terminal", choices=["terminal", "ghostty", "wezterm", "alacritty", "linux"],
+                    help="what a click opens")
     a = ap.parse_args()
     shutil.rmtree(PROTO, ignore_errors=True)
     os.makedirs(PROTO, mode=0o700)
+    with open(f"{PROTO}/terminal", "w") as f:
+        f.write(a.terminal)
     backend = {"mac": MacBackend, "linux": LinuxBackend, "console": ConsoleBackend}[a.backend]()
     c = Coalescer(backend, a.interval, a.updates)
     try:

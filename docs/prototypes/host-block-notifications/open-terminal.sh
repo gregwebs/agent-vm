@@ -1,7 +1,7 @@
 #!/bin/sh
 # PROTOTYPE: open a new host terminal showing one session's blocks.
 # Navigation only; nothing here approves anything.
-# Pick the terminal with: echo ghostty > /tmp/PROTOTYPE-agent-vm-blocks/terminal
+# proto.py --terminal writes the choice to /tmp/PROTOTYPE-agent-vm-blocks/terminal.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 dir=/tmp/PROTOTYPE-agent-vm-blocks
