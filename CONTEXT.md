@@ -198,7 +198,10 @@ environment variable or a system keychain item. Its identity is distinct from
 the secret value, which can rotate without changing the source. Each YAML
 entry selects exactly one source: omitted `source` selects the secret-store item
 named by `service`; `source: env` selects the host variable named by `apiKey.name`,
-captured and removed before a launch spawns any child process.
+captured and removed before a launch spawns any child process;
+`source: secretspec` selects the secret named in the entry's `secretspec:` table,
+read through `secretspec serve --read-only` with the manifest, profile and scope
+the user pinned.
 
 ## Credential authorization
 

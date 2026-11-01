@@ -1077,20 +1077,39 @@ fn source_env_selects_the_environment_and_omission_the_keychain() {
 #[test]
 fn an_unknown_or_mistyped_source_is_refused_without_echo() {
     let home = Home::new();
+    // `keychain` is no longer here: it is a valid spelling since #202. The
+    // remaining list keeps a case-sensitive near-miss, the near-miss with a
+    // hyphen, an empty string, two non-strings and a credential-shaped
+    // canary, so a widening of the accepted set is caught by more than one
+    // spelling.
     for source in [
-        "keychain",
         "ENV",
+        "SecretSpec",
+        "secret-spec",
+        "vault",
         "\"\"",
-        "1",
-        "null",
-        "[env]",
-        "sk-CANARY-163-source",
+        "\"sk-CANARY-202-source\"",
+        "sk-CANARY-202-source",
     ] {
         let error = home.refuses(
             &minimal("alpha").replace("    apiKey:", &format!("    source: {source}\n    apiKey:")),
         );
         assert!(error.contains(".source"));
-        assert!(!error.contains("sk-CANARY-163-source"));
+        assert!(!error.contains("sk-CANARY-202-source"));
+        // The refusal lists every accepted spelling, so the user does not have
+        // to read USAGE.md to learn that `keychain` is the default.
+        for accepted in ["`keychain`", "`env`", "`secretspec`"] {
+            assert!(error.contains(accepted), "{error}");
+        }
+    }
+    // A non-string `source` is a different refusal: the value's type is wrong,
+    // so the accepted-spelling list would not help.
+    for source in ["1", "null", "[env]", "{env: 1}"] {
+        let error = home.refuses(
+            &minimal("alpha").replace("    apiKey:", &format!("    source: {source}\n    apiKey:")),
+        );
+        assert!(error.contains("credentials[0].source"), "{error}");
+        assert!(error.contains("must be a string"), "{source}: {error}");
     }
 }
 
@@ -1188,5 +1207,548 @@ fn a_detail_that_forges_a_line_is_escaped_with_the_path() {
     assert_eq!(
         format!("{error}"),
         "/home/u/.config/agent-vm/credentials.yaml: reading detail\\x0aFORGED"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `source: secretspec` (#202)
+// ---------------------------------------------------------------------------
+
+/// The `secretspec:` table lines, indented as a member of one entry.
+fn table(fields: &[&str]) -> String {
+    fields
+        .iter()
+        .map(|line| format!("      {line}\n"))
+        .collect()
+}
+
+/// A valid table: the three required keys and nothing else.
+fn minimal_table() -> String {
+    table(&[
+        "executable: /opt/secretspec",
+        "manifest: /home/u/secretspec.toml",
+        "profile: default",
+    ])
+}
+
+fn secretspec_file(service: &str, table: &str) -> String {
+    let entry = entry(service).replace(
+        "    apiKey:",
+        &format!("    source: secretspec\n    secretspec:\n{table}    apiKey:"),
+    );
+    format!("credentials:\n{entry}")
+}
+
+fn selection_of<'a>(
+    set: &'a AuthorizationSet,
+    service: &str,
+) -> &'a crate::credential_secretspec::config::SecretspecSelection {
+    let credential = set
+        .get(&ServiceName::parse(service).unwrap())
+        .expect("authorized");
+    match credential.selection() {
+        SourceSelection::Secretspec(selection) => selection,
+        other => panic!("expected a SecretSpec selection, got {other:?}"),
+    }
+}
+
+#[test]
+fn source_selects_keychain_env_and_secretspec_and_omission_the_keychain() {
+    let home = Home::new();
+    let cases = [
+        ("", SourceKind::Keychain),
+        ("    source: keychain\n", SourceKind::Keychain),
+        ("    source: env\n", SourceKind::Environment),
+    ];
+    for (extra, expected) in cases {
+        let set =
+            home.accepts(&minimal("alpha").replace("    apiKey:", &format!("{extra}    apiKey:")));
+        assert_eq!(
+            set.get(&ServiceName::parse("alpha").unwrap())
+                .unwrap()
+                .source(),
+            expected
+        );
+    }
+    let set = home.accepts(&secretspec_file("alpha", &minimal_table()));
+    let credential = set.get(&ServiceName::parse("alpha").unwrap()).unwrap();
+    assert_eq!(credential.source(), SourceKind::Secretspec);
+    // The payload travels with the tag, so the table cannot go missing later.
+    assert!(matches!(
+        credential.selection(),
+        SourceSelection::Secretspec(_)
+    ));
+}
+
+#[test]
+fn a_secretspec_source_requires_its_table_and_the_table_requires_the_source() {
+    let home = Home::new();
+    // `source: secretspec` without a table.
+    let error = home
+        .refuses(&minimal("alpha").replace("    apiKey:", "    source: secretspec\n    apiKey:"));
+    assert!(error.contains("credentials[0]"), "{error}");
+    assert!(error.contains("`secretspec:` table"), "{error}");
+    // A table under any other source, explicit or omitted.
+    for extra in ["", "    source: keychain\n", "    source: env\n"] {
+        let body =
+            secretspec_file("alpha", &minimal_table()).replace("    source: secretspec\n", extra);
+        let error = home.refuses(&body);
+        assert!(error.contains("credentials[0].secretspec"), "{error}");
+        assert!(
+            error.contains("only valid with `source: secretspec`"),
+            "{error}"
+        );
+    }
+    // A table that is not a mapping.
+    let error = home.refuses(&minimal("alpha").replace(
+        "    apiKey:",
+        "    source: secretspec\n    secretspec: [1]\n    apiKey:",
+    ));
+    assert!(error.contains("credentials[0].secretspec"), "{error}");
+    assert!(error.contains("must be a mapping"), "{error}");
+    // Every required key is required, and the refusal names the key it wants.
+    for (missing, named) in [
+        ("executable: /opt/secretspec\n", "executable"),
+        ("manifest: /home/u/secretspec.toml\n", "manifest"),
+        ("profile: default\n", "profile"),
+    ] {
+        let others: Vec<&str> = [
+            "executable: /opt/secretspec",
+            "manifest: /home/u/secretspec.toml",
+            "profile: default",
+        ]
+        .into_iter()
+        .filter(|line| !missing.starts_with(&format!("{}:", line.split(':').next().unwrap())))
+        .collect();
+        let error = home.refuses(&secretspec_file("alpha", &table(&others)));
+        assert!(
+            error.contains(&format!("credentials[0].secretspec.{named}")),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn secretspec_paths_must_be_absolute_and_normal() {
+    let home = Home::new();
+    let refused = [
+        "x", "./x", "~/x", "/a/../b", "/a/./b", "//x", "/a/", "/", "",
+    ];
+    for raw in refused {
+        let error = home.refuses(&secretspec_file(
+            "alpha",
+            &table(&[
+                &format!("executable: {raw:?}"),
+                "manifest: /home/u/secretspec.toml",
+                "profile: default",
+            ]),
+        ));
+        assert!(
+            error.contains("credentials[0].secretspec.executable"),
+            "{raw:?}: {error}"
+        );
+        // The same rule bounds `manifest`.
+        let error = home.refuses(&secretspec_file(
+            "alpha",
+            &table(&[
+                "executable: /opt/secretspec",
+                &format!("manifest: {raw:?}"),
+                "profile: default",
+            ]),
+        ));
+        assert!(
+            error.contains("credentials[0].secretspec.manifest"),
+            "{raw:?}: {error}"
+        );
+    }
+    // A NUL byte, a non-string and an over-long path each refuse.
+    for (executable, fragment) in [
+        ("\"/a\\u0000b\"".to_owned(), "NUL"),
+        ("1".to_owned(), "must be a string"),
+        (format!("\"/{}\"", "a".repeat(1024)), "at most 1024 bytes"),
+    ] {
+        let error = home.refuses(&secretspec_file(
+            "alpha",
+            &table(&[
+                &format!("executable: {executable}"),
+                "manifest: /home/u/secretspec.toml",
+                "profile: default",
+            ]),
+        ));
+        assert!(
+            error.contains("credentials[0].secretspec.executable"),
+            "{error}"
+        );
+        assert!(error.contains(fragment), "{executable}: {error}");
+    }
+    // A path that is exactly at the limit is accepted, and leading dots are
+    // refused only as whole components.
+    let accepted = format!("/{}", "a".repeat(1023));
+    assert_eq!(accepted.len(), 1024);
+    let set = home.accepts(&secretspec_file(
+        "alpha",
+        &table(&[
+            &format!("executable: {accepted}"),
+            "manifest: /home/u/.secretspec.toml",
+            "profile: default",
+        ]),
+    ));
+    assert_eq!(
+        selection_of(&set, "alpha").executable(),
+        std::path::Path::new(&accepted)
+    );
+}
+
+proptest::proptest! {
+    /// The path rule against an independent oracle: split on `/`, require a
+    /// leading slash and every component non-empty and not a dot component,
+    /// plus the NUL and length rules. Two formulations of one rule, so a
+    /// change to either is visible.
+    #[test]
+    fn pinned_paths_agree_with_an_independent_oracle(raw in ".*") {
+        use proptest::prop_assert_eq;
+        let expected = raw.starts_with('/')
+            && !raw.contains('\0')
+            && raw.len() <= crate::credential_secretspec::config::MAX_PINNED_PATH_BYTES
+            && raw.split('/').collect::<Vec<_>>()[1..]
+                .iter()
+                .all(|component| !component.is_empty() && *component != "." && *component != "..");
+        let actual = crate::credential_secretspec::config::PinnedPath::parse(&raw).is_ok();
+        prop_assert_eq!(actual, expected, "path {:?}", raw);
+    }
+}
+
+#[test]
+fn secretspec_name_defaults_to_api_key_name_and_is_bounded_upstream_compatibly() {
+    let home = Home::new();
+    // Default: `apiKey.name`.
+    let set = home.accepts(&secretspec_file("alpha", &minimal_table()));
+    assert_eq!(selection_of(&set, "alpha").name().as_str(), "ALPHA_KEY");
+
+    // `MSB_X` is a fine SecretSpec name even though it could not be a guest
+    // variable; `HOME` likewise (nothing here is a guest environment name).
+    for name in ["MSB_X", "HOME", "a/b", &"n".repeat(129)] {
+        let set = home.accepts(&secretspec_file(
+            "alpha",
+            &table(&[
+                "executable: /opt/secretspec",
+                "manifest: /home/u/secretspec.toml",
+                "profile: default",
+                &format!("name: {name:?}"),
+            ]),
+        ));
+        assert_eq!(selection_of(&set, "alpha").name().as_str(), name);
+    }
+
+    // Refusals: an empty name, a control character, over 4096 characters and
+    // over 4096 bytes. The two length cases differ only in the encoding width,
+    // which is exactly the distinction the byte cap exists for.
+    for (name, fragment) in [
+        ("\"\"".to_owned(), "non-empty"),
+        ("\"a\\tb\"".to_owned(), "control character"),
+        (
+            format!("\"{}\"", "\u{00e9}".repeat(4097)),
+            "at most 4096 characters",
+        ),
+        (
+            format!("\"{}\"", "\u{4e00}".repeat(1366)),
+            "also caps it at 4096 bytes",
+        ),
+    ] {
+        let error = home.refuses(&secretspec_file(
+            "alpha",
+            &table(&[
+                "executable: /opt/secretspec",
+                "manifest: /home/u/secretspec.toml",
+                "profile: default",
+                &format!("name: {name}"),
+            ]),
+        ));
+        assert!(error.contains("credentials[0].secretspec.name"), "{error}");
+        assert!(error.contains(fragment), "{fragment}: {error}");
+    }
+    // A `null` name means "use the default", not "no name".
+    let set = home.accepts(&secretspec_file(
+        "alpha",
+        &table(&[
+            "executable: /opt/secretspec",
+            "manifest: /home/u/secretspec.toml",
+            "profile: default",
+            "name: null",
+        ]),
+    ));
+    assert_eq!(selection_of(&set, "alpha").name().as_str(), "ALPHA_KEY");
+}
+
+#[test]
+fn secretspec_profile_scope_and_reason_bounds() {
+    let home = Home::new();
+    let base = [
+        "executable: /opt/secretspec",
+        "manifest: /home/u/secretspec.toml",
+    ];
+    // A profile and a scope may contain `/` (upstream has no pattern), and both
+    // optional keys accept `null` as absent.
+    let set = home.accepts(&secretspec_file(
+        "alpha",
+        &table(&[
+            base[0],
+            base[1],
+            "profile: work/team",
+            "scope: agent-vm",
+            "reason: agent-vm launch",
+        ]),
+    ));
+    let selection = selection_of(&set, "alpha");
+    assert_eq!(selection.profile().as_str(), "work/team");
+    assert_eq!(selection.scope().map(|s| s.as_str()), Some("agent-vm"));
+    let set = home.accepts(&secretspec_file(
+        "alpha",
+        &table(&[
+            base[0],
+            base[1],
+            "profile: default",
+            "scope: null",
+            "reason: null",
+        ]),
+    ));
+    assert_eq!(selection_of(&set, "alpha").scope(), None);
+
+    // A `reason` is exactly 256 printable ASCII bytes, and one more is refused.
+    let longest = "r".repeat(256);
+    home.accepts(&secretspec_file(
+        "alpha",
+        &table(&[
+            base[0],
+            base[1],
+            "profile: default",
+            &format!("reason: {longest:?}"),
+        ]),
+    ));
+    for (reason, fragment) in [
+        (format!("\"{}\"", "r".repeat(257)), "1 to 256"),
+        ("\"caf\\u00e9\"".to_owned(), "printable ASCII"),
+        ("\"\"".to_owned(), "1 to 256"),
+    ] {
+        let error = home.refuses(&secretspec_file(
+            "alpha",
+            &table(&[
+                base[0],
+                base[1],
+                "profile: default",
+                &format!("reason: {reason}"),
+            ]),
+        ));
+        assert!(
+            error.contains("credentials[0].secretspec.reason"),
+            "{error}"
+        );
+        assert!(error.contains(fragment), "{error}");
+        // The rule is labelled as agent-vm's own, not as an upstream fact.
+        assert!(error.contains("not a SecretSpec requirement"), "{error}");
+    }
+
+    // A profile above 4096 bytes is refused; 4094 ASCII bytes plus the
+    // `/`-free alphabet is accepted at the boundary.
+    // Both caps are exclusive-upper bounds: 4096 ASCII bytes is accepted, 4097
+    // is refused. A multibyte string is how the byte cap alone is reached
+    // (2049 `é` is 4098 bytes but only 2049 characters).
+    let at_both_caps = "p".repeat(4096);
+    let set = home.accepts(&secretspec_file(
+        "alpha",
+        &table(&[base[0], base[1], &format!("profile: {at_both_caps:?}")]),
+    ));
+    assert_eq!(selection_of(&set, "alpha").profile().as_str().len(), 4096);
+    let over_byte_cap = format!("\"{}\"", "\u{00e9}".repeat(2049));
+    for (field, lines) in [
+        (
+            "profile",
+            vec![base[0], base[1], &format!("profile: {}", "p".repeat(4097))],
+        ),
+        (
+            "profile",
+            vec![base[0], base[1], &format!("profile: {over_byte_cap}")],
+        ),
+        ("profile", vec![base[0], base[1], "profile: \"\""]),
+        (
+            "scope",
+            vec![
+                base[0],
+                base[1],
+                "profile: default",
+                &format!("scope: {over_byte_cap}"),
+            ],
+        ),
+        (
+            "scope",
+            vec![base[0], base[1], "profile: default", "scope: \"a\\nb\""],
+        ),
+    ] {
+        let error = home.refuses(&secretspec_file("alpha", &table(&lines)));
+        assert!(
+            error.contains(&format!("credentials[0].secretspec.{field}")),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn unsupported_secretspec_keys_are_refused_by_name() {
+    let home = Home::new();
+    let base = [
+        "executable: /opt/secretspec",
+        "manifest: /home/u/secretspec.toml",
+    ];
+    // Each key carries its own remedy, so a user who knows SecretSpec's
+    // configuration is told what to do instead of that the field is unknown.
+    for (key, value, fragment) in [
+        ("provider", "\"env\"", "manifest-level `providers = [...]`"),
+        ("as_path", "true", "agent-vm needs the value itself"),
+        ("asPath", "true", "agent-vm needs the value itself"),
+        (
+            "representation",
+            "\"path\"",
+            "always reads the value representation",
+        ),
+        ("generate", "true", "only reads SecretSpec values"),
+        (
+            "default",
+            "\"x\"",
+            "declare defaults in the SecretSpec manifest",
+        ),
+        ("value", "\"x\"", "comes from SecretSpec at launch time"),
+        ("prompt", "true", "never prompts"),
+    ] {
+        let error = home.refuses(&secretspec_file(
+            "alpha",
+            &table(&[
+                base[0],
+                base[1],
+                "profile: default",
+                &format!("{key}: {value}"),
+            ]),
+        ));
+        assert!(error.contains("credentials[0].secretspec"), "{error}");
+        assert!(error.contains(fragment), "{key}: {error}");
+    }
+    // An unrecognized key names the accepted set instead.
+    let error = home.refuses(&secretspec_file(
+        "alpha",
+        &table(&[base[0], base[1], "profile: default", "secrets: [x]"]),
+    ));
+    assert!(error.contains("accepted keys here"), "{error}");
+    assert!(
+        error.contains("executable, manifest, name, profile, reason, scope"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_service_name_is_valid_for_every_source() {
+    let home = Home::new();
+    // One name, four spellings of the same YAML: the source decides where the
+    // value comes from and nothing about whether the name is a name.
+    for body in [
+        minimal("team.service-1"),
+        minimal("team.service-1").replace("    apiKey:", "    source: keychain\n    apiKey:"),
+        minimal("team.service-1").replace("    apiKey:", "    source: env\n    apiKey:"),
+        secretspec_file("team.service-1", &minimal_table()),
+    ] {
+        let set = home.accepts(&body);
+        assert!(
+            set.get(&ServiceName::parse("Team.Service-1").unwrap())
+                .is_some(),
+            "the name is folded and authorized whatever the source"
+        );
+    }
+}
+
+#[test]
+fn secretspec_refusals_never_echo_input() {
+    let home = Home::new();
+    let canary = "sk-CANARY-202-refusal-echo";
+    let base = [
+        "executable: /opt/secretspec",
+        "manifest: /home/u/secretspec.toml",
+    ];
+    // The canary is placed where it is *the* reason for a refusal in that
+    // position: a relative path, a label or name with a control character, a
+    // reason with a non-ASCII byte, and two keys whose message never quotes a
+    // value at all.
+    let cases = [
+        table(&[
+            &format!("executable: {canary}"),
+            base[1],
+            "profile: default",
+        ]),
+        table(&[base[0], base[1], &format!("profile: \"{canary}\\u0001\"")]),
+        table(&[
+            base[0],
+            base[1],
+            "profile: default",
+            &format!("scope: \"{canary}\\u0001\""),
+        ]),
+        table(&[
+            base[0],
+            base[1],
+            "profile: default",
+            &format!("name: \"{canary}\\u0001\""),
+        ]),
+        table(&[
+            base[0],
+            base[1],
+            "profile: default",
+            &format!("reason: \"{canary}\u{00e9}\""),
+        ]),
+        table(&[
+            base[0],
+            base[1],
+            "profile: default",
+            &format!("unknown: {canary}"),
+        ]),
+        table(&[
+            base[0],
+            base[1],
+            "profile: default",
+            &format!("prompt: {canary}"),
+        ]),
+        table(&[base[0], "manifest: 3", "profile: default"]),
+    ];
+    for table in cases {
+        let error = home.refuses(&secretspec_file("alpha", &table));
+        assert!(!error.contains(canary), "{error}");
+        assert!(!error.contains("sk-CANARY"), "{error}");
+    }
+}
+
+/// The supported provider mechanism is SecretSpec's own manifest-level
+/// `providers = [...]`: agent-vm configuration has no `provider` key at all
+/// (`provider: null` goes on the wire), so the documented mechanism is the only
+/// one. The wire side of this claim is asserted against the real binary in the
+/// opt-in test; here the configuration side is pinned.
+#[test]
+fn a_manifest_level_providers_list_is_the_supported_provider_mechanism() {
+    let home = Home::new();
+    let base = [
+        "executable: /opt/secretspec",
+        "manifest: /home/u/secretspec.toml",
+    ];
+    let error = home.refuses(&secretspec_file(
+        "alpha",
+        &table(&[base[0], base[1], "profile: default", "provider: env"]),
+    ));
+    assert!(
+        error.contains("`secretspec.provider` is not supported"),
+        "{error}"
+    );
+    assert!(error.contains("providers = [...]"), "{error}");
+    // No accepted spelling of a provider exists in the table: the accepted set
+    // is exactly the six keys, and none of them selects a provider.
+    for field in crate::credential_secretspec::config::SECRETSPEC_KEYS {
+        assert!(!field.contains("provider"), "{field}");
+    }
+    assert_eq!(
+        crate::credential_secretspec::config::SECRETSPEC_KEYS.len(),
+        6
     );
 }

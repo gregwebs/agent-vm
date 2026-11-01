@@ -2287,3 +2287,77 @@ fn doctor_reports_tool_mount_errors_with_exact_file_and_field() {
         assert_success(&h.base_command().arg("--help").output().unwrap());
     }
 }
+
+/// #202 D3: a `source: secretspec` authorization is labelled, and `doctor` never
+/// runs the configured executable — with or without the fake endpoint's
+/// environment, byte for byte.
+#[test]
+fn a_secretspec_sourced_authorization_is_labelled_and_never_spawned() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let h = Harness::new();
+    h.write_user("[[tools]]\nname = \"t\"\ncommand = \"t\"\ncredentials = [\"my-service\"]\n");
+    let marker = h.project_root.join("executable-ran");
+    let executable = h.project_root.join("secretspec-fixture");
+    write(
+        &executable,
+        &format!("#!/bin/sh\ntouch {}\nexit 0\n", marker.display()),
+    );
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let manifest = h.project_root.join("secretspec.toml");
+    write(&manifest, "[project]\nname = \"x\"\n");
+    h.write_credentials(&format!(
+        "credentials:\n  - service: my-service\n    source: secretspec\n    apiKey:\n      name: \
+         MY_SERVICE_KEY\n      inject: [{{domain: api.my-service.example, scheme: bearer}}]\n    \
+         secretspec:\n      executable: {}\n      manifest: {}\n      profile: work/team\n      \
+         scope: agent-vm\n",
+        executable.display(),
+        manifest.display()
+    ));
+
+    let plain = h.run_doctor();
+    assert_success(&plain);
+    let text = String::from_utf8_lossy(&plain.stdout).into_owned();
+    assert!(
+        text.contains(&format!(
+            "authorized for this launch from SecretSpec (`MY_SERVICE_KEY`, profile `work/team`, \
+             scope `agent-vm`, manifest {}, executable {})",
+            manifest.display(),
+            executable.display()
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "note: SecretSpec values are resolved by the launch (`secretspec serve --read-only`), \
+             not by doctor."
+        ),
+        "{text}"
+    );
+    // The executable was never run, and nothing stat-ed it into a decision.
+    assert!(
+        !marker.exists(),
+        "doctor executed the configured executable"
+    );
+
+    // Byte-identical with a fake scenario in the environment.
+    let scenario = tempfile::tempdir().unwrap();
+    let scenario_path = scenario.path().join("scenario.json");
+    std::fs::write(
+        &scenario_path,
+        serde_json::json!({"secrets": {"MY_SERVICE_KEY": {"value": "sk-CANARY-202-d3"}}})
+            .to_string(),
+    )
+    .unwrap();
+    let with_fake = h
+        .base_command()
+        .arg("doctor")
+        .env("AGENT_VM_TEST_SECRETSPEC_FAKE", &scenario_path)
+        .output()
+        .expect("doctor with the fake environment");
+    assert_eq!(
+        with_fake.stdout, plain.stdout,
+        "doctor's output must not move"
+    );
+    assert!(!String::from_utf8_lossy(&with_fake.stdout).contains("sk-CANARY-202-d3"));
+    assert!(!marker.exists());
+}

@@ -857,9 +857,26 @@ There is no `--lib` target, so `--bin agent-vm` is required.
 Several debug-only seams are compiled out of release builds: `AGENT_VM_TEST_CREDENTIAL`
 (credential provisioning), `AGENT_VM_TEST_DEFAULT_IMAGE` (the boot-image
 default slot, so a boot-free CLI test that falls through to the default does not
-start a real multi-GB pull), and the two coordination gates below
+start a real multi-GB pull), `AGENT_VM_TEST_SECRETSPEC_FAKE` (a fake
+`secretspec serve --read-only` endpoint: it activates only when the variable names
+a scenario **and** argv is exactly `serve --read-only`, it speaks real
+`secretspec.resolver/1` frames over stdin/stdout, and it
+serves only values from a test-supplied scenario file, never a real store — so a
+boot-free `config_launch_driven` test can drive the whole credential path), and
+the two coordination gates below
 (`AGENT_VM_TEST_ACQUIRE_GATE`, `AGENT_VM_TEST_PIN_GATE`). None is read by a
 release build; tests pin each release exclusion.
+
+The SecretSpec fake is also a **contract oracle** for agent-vm's own frames. It
+rejects, with the error kinds `secretspec` 0.21.1 was measured to answer
+(`adversarial/wire-results.jsonl`), a `resolver.get` before `rpc.initialize`, a
+second `rpc.initialize`, any frame whose `jsonrpc` is not `"2.0"`, an initialize
+whose `params` carry a key the schema forbids, a get whose
+`_meta.deadline_unix_ms` has already passed, and a get with an empty `name`; it
+also pins the exact initialize and get shapes. It does **not** enforce anything
+about providers, manifests or scopes: nothing is really resolved, so a value's
+provenance is never checked, and `AGENT_VM_E2E_SECRETSPEC` (below) is the only
+evidence about a real server.
 
 `AGENT_VM_TEST_DEFAULT_IMAGE` is an **initial recommendation**, not an override:
 it is parsed with the same immutable-reference rule as production (an
@@ -953,6 +970,7 @@ while ordinary `setup` intentionally creates a verification guest.
 | `script/test/e2e.sh` | **no** | native installed registry/archive joins; custom/all additionally require Apple Silicon and Docker; `custom-image` includes the always-run host-pin A/B rows |
 | `cargo test --test image_pin_approval` | yes (`cargo test -p agent-vm`) | boot-free compiled-CLI approval matrix: PTY yes/no/empty/EOF/interruption, `--yes`, nonterminal refusal, frozen candidate, CAS/stale revision, journal recovery, cache-loss digest reacquisition. No VM evidence |
 | `cargo test … -- --ignored` | **no** | keychain round-trip; operator opt-in, never ordinary CI |
+| `AGENT_VM_E2E_SECRETSPEC=/opt/homebrew/bin/secretspec cargo test -p agent-vm --test config_launch_driven a_real_secretspec_serve_round_trip -- --ignored --exact` | **no** | the real `secretspec` binary as-is (no chmod/chown/copy/reinstall); isolated `HOME`, a manifest inside the test harness's own `TempDir`, and — for every command the test runs itself — a cleared environment repopulated with only `HOME`, `PATH=/usr/bin:/bin` and `XDG_{CONFIG,DATA,STATE,CACHE}_HOME` under that `HOME`, so a developer's `SECRETSPEC_*`, `XDG_*` and real audit store are never consulted; absent the variable the test refuses to run rather than auto-detecting an install |
 | `script/test/single-binary-contract.sh` | yes (`ci.yml`) | fake payload; lone copy, reuse, concurrency, tamper, unwritable, rejected-launch state, and `image show` unpacking nothing (C12); the only `embedded-runtime` clippy pass, which is what lints the payload build module |
 | `cargo test --test image_show` | yes (`cargo test -p agent-vm`) | boot-free black-box `image show` matrix: precedence, provenance, damaged/unused fallback, escaping, help/argument surface, and no runtime/cache/state/network observation. No VM evidence |
 | `script/test/build-workflow.sh` | yes (macOS) | fake-plutil bundle seam, no VM/image sources |

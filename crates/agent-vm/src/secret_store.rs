@@ -103,7 +103,7 @@
 //! is typing a password from a call that is wedged. So the bound lives here, at
 //! the one boundary that knows it is calling a platform store:
 //! [`BoundedKeychainReads`] abandons a read that outlives
-//! [`keychain_read_bound`] and reports it as [`KeychainFailure::Unresponsive`],
+//! [`host_read_bound`] and reports it as [`KeychainFailure::Unresponsive`],
 //! which every caller already renders as a locked/unavailable keychain rather
 //! than as a missing value.
 //!
@@ -662,7 +662,7 @@ pub(crate) enum KeychainFailure {
     Unavailable,
     Ambiguous,
     Rejected,
-    /// The platform read outlived [`keychain_read_bound`] and was abandoned
+    /// The platform read outlived [`host_read_bound`] and was abandoned
     /// (#251). Distinct from [`Self::Ambiguous`] and [`Self::Rejected`] because
     /// the store never observed a result at all, and distinct from
     /// [`Self::Unavailable`] because the credential store may be perfectly
@@ -811,6 +811,10 @@ pub(crate) enum Resolved {
     Value(SecretValue),
     Missing,
     Unavailable(KeychainFailure),
+    /// A SecretSpec read could not run or was refused (#202). Its own closed
+    /// class because [`KeychainFailure`]'s messages describe the system
+    /// keychain; the availability policy treats it exactly like `Unavailable`.
+    SecretspecUnavailable(crate::credential_secretspec::SecretspecFailure),
     /// A value *is* stored but its bytes fail the accepted-value predicate.
     /// Never `Missing`: silently treating a corrupt entry as absent would boot
     /// an uncredentialed sandbox that looks configured.
@@ -946,7 +950,7 @@ const KEYCHAIN_READ_BOUND_UNATTENDED: Duration = Duration::from_secs(5);
 /// Short enough to arrive while a user is still watching the terminal, long
 /// enough not to narrate a merely slow read. Every bound is above it, so a
 /// launch that is only briefly slow stays quiet.
-const READ_NOTICE_AFTER: Duration = Duration::from_secs(2);
+pub(crate) const READ_NOTICE_AFTER: Duration = Duration::from_secs(2);
 
 /// The one line a read that is still unanswered past [`READ_NOTICE_AFTER`]
 /// prints. Names the service (already user-visible metadata) and the bound, so
@@ -985,7 +989,7 @@ fn slow_inventory_lock_notice(path: &Path, wait: Duration) -> String {
 /// must not abort the process because stderr went away — its own outcome is
 /// what decides the launch. One `write_all` of the fully rendered line, so a
 /// partial notice cannot be delivered before a failure.
-fn emit_notice_line(line: &str) {
+pub(crate) fn emit_notice_line(line: &str) {
     let mut rendered = String::with_capacity(line.len() + 1);
     rendered.push_str(line);
     rendered.push('\n');
@@ -993,7 +997,12 @@ fn emit_notice_line(line: &str) {
 }
 
 /// The read bound for this process, chosen once at store construction.
-fn keychain_read_bound() -> Duration {
+///
+/// Shared with the SecretSpec client (#202): a provider waiting on an unlock
+/// prompt is the same situation as a locked keychain, and the user's ability to
+/// answer a prompt is the same question, so the two bounds are one decision
+/// rather than two constants that can drift.
+pub(crate) fn host_read_bound() -> Duration {
     if std::io::stdin().is_terminal() {
         KEYCHAIN_READ_BOUND_ATTENDED
     } else {
@@ -1005,11 +1014,11 @@ fn keychain_read_bound() -> Duration {
 ///
 /// The read bound, by design and not by coincidence: the holder this wait is
 /// for may be parked on the same unlock prompt a read would be, and whether this
-/// process's user can answer it is the question [`keychain_read_bound`] already
+/// process's user can answer it is the question [`host_read_bound`] already
 /// answers. Not longer: a longer wait would always outlast a holder's abandoned
 /// read and then start a second one. See ADR-0024's #291 amendment.
 fn inventory_lock_wait() -> Duration {
-    keychain_read_bound()
+    host_read_bound()
 }
 
 /// The lock wait for tests that do not exercise contention: long enough that
@@ -1542,7 +1551,7 @@ impl<B: KeychainBackend> SecretStore<B> {
 /// relative or empty location.
 pub(crate) fn system_store() -> Result<SecretStore<BoundedKeychainReads<SystemKeychain>>> {
     Ok(SecretStore::new(
-        BoundedKeychainReads::new(SystemKeychain, keychain_read_bound()),
+        BoundedKeychainReads::new(SystemKeychain, host_read_bound()),
         inventory_paths()?,
         inventory_lock_wait(),
     ))

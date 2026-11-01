@@ -49,7 +49,7 @@ user credentials.yaml ── source + authorization ─┐
                                                ├─ host resolver/proxy
 project/user tool TOML ── credential requests ──┘       │
                                                       ├─ placeholder → guest
-host keychain or environment ── real value ─────────────┘
+host keychain, environment or SecretSpec ── real value ──┘
                                                       │
                               approved HTTPS header ←─┘
 ```
@@ -109,6 +109,41 @@ Remove existing automatic raw forwarding of `ANTHROPIC_API_KEY` and
 `OPENAI_API_KEY`; supported use of these variables goes through shielding.
 Their presence alone never authorizes use or justifies raw forwarding.
 
+### SecretSpec source (agent-vm extension)
+
+```yaml
+credentials:
+  - service: deepseek
+    source: secretspec
+    secretspec:
+      executable: /opt/homebrew/bin/secretspec
+      manifest: /Users/me/.config/agent-vm/secretspec.toml
+      profile: default
+      scope: agent-vm          # optional
+      name: DEEPSEEK_API_KEY   # optional, default = apiKey.name
+    required: true
+    apiKey:
+      name: DEEPSEEK_API_KEY
+      sentinelEnv: true
+      inject:
+        - domain: api.deepseek.com
+          scheme: bearer
+```
+
+`source: secretspec` selects the secret named in the entry's `secretspec:` table,
+read on the host through `secretspec serve --read-only` with the manifest,
+profile and scope the user pinned. SecretSpec is one source behind the existing
+credential seam — it is not the shielding layer and not the authorization layer:
+`credentials.yaml` still authorizes, the two phases and the sentinel still work as
+described above, and the project config still cannot select a source. agent-vm is
+only a **reader**: it never sets, generates or prompts for a value.
+
+The pinned table's rules, the process and protocol contract, the lifecycle across
+the two phases and the outcome mapping are
+[ADR-0055](../adr/0055-secretspec-serve-credential-source.md), the single
+contract for this source; the user-facing walkthrough is
+[USAGE.md](../../USAGE.md#reading-the-value-from-secretspec-source-secretspec).
+
 ### Placeholder shape
 
 A placeholder is a **non-secret** value, and it must be **acceptable to the
@@ -136,8 +171,8 @@ relay sent bytes`).
 ## Docker YAML compatibility boundary
 
 Target reusable Docker **v2 API-key credential entries**, not all Docker kit
-features or identical Docker runtime behavior. `source: env` is an agent-vm
-extension. The public v2 schema is specified in prose and Go types; an official
+features or identical Docker runtime behavior. `source: env` and
+`source: secretspec` are agent-vm extensions. The public v2 schema is specified in prose and Go types; an official
 JSON Schema and a public v3 credential schema were not verified in this research.
 
 Supported credential concepts:

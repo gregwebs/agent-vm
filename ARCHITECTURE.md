@@ -1443,7 +1443,7 @@ holds a non-secret placeholder (`sentinelEnv: true`) or nothing.
                                                                          ▼
                       launch resolution (phase 1: availability, value dropped)
                                                                          │
-  host keychain or captured host env (`source: env`)
+  host keychain, captured host env (`source: env`) or SecretSpec (`source: secretspec`)
                 └──▶ per-launch resolver (phase 2, at fork) ──▶ private fd ──▶ HTTPS header
                                                                          │
                               guest: placeholder or unset ◀──────────────┘
@@ -1451,7 +1451,10 @@ holds a non-secret placeholder (`sentinelEnv: true`) or nothing.
 
 For a launch, environment sources are captured and removed in `main` before that
 launch's children and Tokio workers exist; keychain sources retain their
-two-phase reads.
+two-phase reads. SecretSpec sources read through one `secretspec serve
+--read-only` child per pinned session key, started by phase 1, ended when
+`create` returns, torn down by process group
+([ADR-0055](docs/adr/0055-secretspec-serve-credential-source.md)).
 
 The load path, the grammar, the guest-variable ownership rules and the exact
 guarantee (application-level only; OS swap and same-uid inspection are out of
@@ -1907,6 +1910,7 @@ directories the user never asked for. The state-root precedence is in
 | The reset undo refuses a recreated db (#432) | [ADR-0051](docs/adr/0051-the-reset-undo-refuses-a-recreated-db.md) |
 | Direct-command input ownership and the detached stdin reader (#399) | [ADR-0052](docs/adr/0052-direct-command-input-ownership.md) |
 | Guest exit-signal identity through agentd, the protocol and the SDK accessor (#467) | [ADR-0053](docs/adr/0053-guest-exit-signal-identity.md) |
+| SecretSpec as a read-only credential source (#202) | [ADR-0055](docs/adr/0055-secretspec-serve-credential-source.md) |
 
 ## Deliberate non-goals
 
