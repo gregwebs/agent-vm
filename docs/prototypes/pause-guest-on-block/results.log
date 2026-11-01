@@ -1,0 +1,152 @@
+# PROTOTYPE results (raw), host macOS 27, guest 6.12.113, msb frozen with SIGSTOP
+##### held 30
+host freeze msb=82332 for 30s at wall=1793560303.595981000
+host resume at wall=1793560333.610574000
+before wall=1793560303.541413916 up=0.25
+curl http=200 dns=30.043424 tcp=30.048220 tls=30.066888 total=32.296120
+curl exit=0
+after wall=1793560335.875374473 up=32.58
+##### stream 30
+host freeze msb=86260 for 30s at wall=1793560342.295835000
+before wall=1793560337.243811166 up=0.38
+curl http=400 bytes=113 total=0.187706
+curl exit=0
+after wall=1793560337.467368416 up=0.60
+Error: guest command `env` exited 0, but the sandbox could not be cleaned up: stop: timed out after 10s
+./pause.sh: line 15: kill: (86260) - No such process
+##### held 30 MAXTIME=20
+host freeze msb=88340 for 30s at wall=1793560373.317488000
+host resume at wall=1793560403.335464000
+before wall=1793560373.269042666 up=0.25
+curl: (28) Connection timed out after 30037 milliseconds
+curl http=000 dns=0.020429 tcp=0.000000 tls=0.000000 total=30.037443
+curl exit=28
+after wall=1793560403.335911056 up=30.31
+##### held 60
+host freeze msb=90194 for 60s at wall=1793560405.279375000
+host resume at wall=1793560465.294365000
+before wall=1793560405.214463875 up=0.58
+curl: (56) OpenSSL SSL_read: OpenSSL/3.5.7: error:0A000126:SSL routines::unexpected eof while reading, errno 0
+curl http=000 dns=0.022538 tcp=0.023417 tls=60.050069 total=60.050418
+curl exit=56
+after wall=1793560465.309603112 up=60.67
+[   60.652948] rcu: 	Unless rcu_sched kthread gets sufficient CPU time, OOM is now expected behavior.
+[   60.652949] rcu: RCU grace-period kthread stack dump:
+[   60.652949] task:rcu_sched       state:I stack:0     pid:16    tgid:16    ppid:2      flags:0x00000008
+[   60.652992]  rcu_gp_fqs_loop+0xc4/0x480
+[   60.652998]  rcu_gp_kthread+0x104/0x14c
+##### stream 60
+host freeze msb=93473 for 60s at wall=1793560471.989703000
+before wall=1793560466.992266666 up=0.53
+curl http=400 bytes=113 total=0.209946
+curl exit=0
+after wall=1793560467.262857375 up=0.80
+Error: guest command `env` exited 0, but the sandbox could not be cleaned up: stop: timed out after 10s
+./pause.sh: line 15: kill: (93473) - No such process
+##### held 60 MAXTIME=20
+host freeze msb=94702 for 60s at wall=1793560533.056829000
+host resume at wall=1793560593.067141000
+before wall=1793560533.009477458 up=0.26
+curl: (28) Resolving timed out after 60024 milliseconds
+curl http=000 dns=0.000000 tcp=0.000000 tls=0.000000 total=60.024432
+curl exit=28
+after wall=1793560593.068942570 up=60.32
+[   60.320373] rcu: RCU grace-period kthread stack dump:
+[   60.320373] task:rcu_sched       state:I stack:0     pid:16    tgid:16    ppid:2      flags:0x00000008
+[   60.320395]  rcu_gp_fqs_loop+0xc4/0x480
+[   60.320400]  rcu_gp_kthread+0x104/0x14c
+[   60.320406] rcu: Stack dump where RCU GP kthread last ran:
+##### held 120
+host freeze msb=96790 for 120s at wall=1793560594.765321000
+host resume at wall=1793560714.784274000
+before wall=1793560594.695301250 up=0.43
+curl http=200 dns=120.088509 tcp=120.089384 tls=120.106075 total=122.283468
+curl exit=0
+after wall=1793560717.030166391 up=122.76
+[  120.515503] rcu: RCU grace-period kthread stack dump:
+[  120.515504] task:rcu_sched       state:I stack:0     pid:16    tgid:16    ppid:2      flags:0x00000008
+[  120.515544]  rcu_gp_fqs_loop+0xc4/0x480
+[  120.515552]  rcu_gp_kthread+0x104/0x14c
+[  120.515564] rcu: Stack dump where RCU GP kthread last ran:
+##### stream 120
+host freeze msb=13660 for 120s at wall=1793560724.106074000
+before wall=1793560719.024363541 up=0.78
+curl http=400 bytes=113 total=0.255623
+curl exit=0
+after wall=1793560719.363208667 up=1.11
+Error: guest command `env` exited 0, but the sandbox could not be cleaned up: stop: timed out after 10s
+./pause.sh: line 15: kill: (13660) - No such process
+##### held 120 MAXTIME=20
+host freeze msb=29999 for 120s at wall=1793560845.240843000
+host resume at wall=1793560965.260592000
+before wall=1793560845.185634166 up=0.25
+curl: (28) Resolving timed out after 120039 milliseconds
+curl http=000 dns=0.000000 tcp=0.000000 tls=0.000000 total=120.040063
+curl exit=28
+after wall=1793560965.263690807 up=120.33
+[  120.322965] rcu: 	Unless rcu_sched kthread gets sufficient CPU time, OOM is now expected behavior.
+[  120.322965] rcu: RCU grace-period kthread stack dump:
+[  120.322966] task:rcu_sched       state:I stack:0     pid:16    tgid:16    ppid:2      flags:0x00000008
+[  120.323014]  rcu_gp_fqs_loop+0xc4/0x480
+[  120.323028]  rcu_gp_kthread+0x104/0x14c
+##### pending 10
+host freeze msb=38846 for 10s at wall=1793561017.372972000
+host resume at wall=1793561027.383605000
+before wall=1793561014.310188875 up=0.30
+curl http=200 dns=0.023523 tcp=0.024358 tls=0.034288 first-byte=13.042796 total=13.042849
+curl exit=0
+after wall=1793561027.384310881 up=13.37
+##### stream 10
+host freeze msb=39366 for 10s at wall=1793561031.619517000
+host resume at wall=1793561041.629815000
+before wall=1793561028.572713250 up=0.30
+curl http=200 bytes=1000000 total=21.463624
+curl exit=0
+after wall=1793561050.069513968 up=21.79
+##### pending 30
+host freeze msb=41209 for 30s at wall=1793561054.765976000
+host resume at wall=1793561084.780663000
+before wall=1793561051.691409500 up=0.43
+curl http=200 dns=0.027865 tcp=0.028934 tls=0.041895 first-byte=33.047825 total=33.047926
+curl exit=0
+after wall=1793561084.785320349 up=33.52
+##### stream 30
+host freeze msb=42406 for 30s at wall=1793561089.611727000
+host resume at wall=1793561119.626349000
+before wall=1793561086.533052583 up=0.40
+curl http=200 bytes=1000000 total=33.565399
+curl exit=0
+after wall=1793561120.169993099 up=34.03
+##### pending 60
+host freeze msb=43293 for 60s at wall=1793561124.894428000
+host resume at wall=1793561184.908077000
+before wall=1793561121.857522750 up=0.42
+curl http=200 dns=0.023381 tcp=0.024511 tls=0.041476 first-byte=63.044590 total=63.044679
+curl exit=0
+after wall=1793561184.951941946 up=63.51
+[   63.507015]  rcu_gp_fqs_loop+0xc4/0x480
+[   63.507020]  rcu_gp_kthread+0x104/0x14c
+##### stream 60
+host freeze msb=44330 for 60s at wall=1793561189.822967000
+host resume at wall=1793561249.843937000
+before wall=1793561186.741398166 up=0.44
+curl http=200 bytes=1000000 total=63.898847
+curl exit=0
+after wall=1793561250.693932363 up=64.39
+##### pending 120
+host freeze msb=45514 for 120s at wall=1793561256.099263000
+host resume at wall=1793561376.122164000
+before wall=1793561253.065674708 up=0.69
+curl http=200 dns=0.023555 tcp=0.025428 tls=0.043902 first-byte=123.047108 total=123.047240
+curl exit=0
+after wall=1793561376.188547725 up=123.82
+[  123.780543]  rcu_gp_fqs_loop+0xc4/0x480
+[  123.780556]  rcu_gp_kthread+0x104/0x14c
+##### stream 120
+host freeze msb=52555 for 120s at wall=1793561382.309808000
+host resume at wall=1793561502.326804000
+before wall=1793561379.146939208 up=1.04
+curl: (56) OpenSSL SSL_read: OpenSSL/3.5.7: error:0A000126:SSL routines::unexpected eof while reading, errno 0
+curl http=200 bytes=373826 total=123.379865
+curl exit=56
+after wall=1793561502.660361017 up=124.54
