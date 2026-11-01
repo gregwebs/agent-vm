@@ -161,6 +161,20 @@ impl std::ops::DerefMut for Scripted {
     }
 }
 
+/// Which arm of [`Resolved`] an outcome landed in, without its payload.
+///
+/// A test failure message is the one place a resolved value must not reach, and
+/// `Resolved`'s derived `Debug` is capable of rendering whatever an arm holds.
+fn outcome_class(outcome: &Resolved) -> &'static str {
+    match outcome {
+        Resolved::Value(_) => "a value",
+        Resolved::Missing => "missing",
+        Resolved::SecretspecUnavailable(_) => "unavailable",
+        Resolved::Unavailable(_) => "keychain unavailable",
+        Resolved::InvalidValue(_) => "invalid",
+    }
+}
+
 fn scripted(chunks: Vec<Vec<u8>>) -> Scripted {
     let (server_input, client_output) = std::io::pipe().expect("pipe");
     let (client_input, mut server_output) = std::io::pipe().expect("pipe");
@@ -666,12 +680,16 @@ fn the_outcome_table_maps_every_status_and_error_kind() {
             (Expected::Unavailable(failure), Resolved::SecretspecUnavailable(actual)) => {
                 assert_eq!(actual, failure, "{kind:?}")
             }
+            // The outcome, never the outcome's payload: `Resolved` is Debug only
+            // to keep it printable at all, and a failure message is the one place
+            // a value must not reach (CodeQL `rust/cleartext-logging`).
             (expected, actual) => panic!(
-                "{kind:?}: expected {:?}, got {actual:?}",
+                "{kind:?}: expected {}, got {}",
                 match expected {
-                    Expected::Invalid(rule) => format!("invalid({rule:?})"),
-                    Expected::Unavailable(failure) => format!("unavailable({failure:?})"),
-                }
+                    Expected::Invalid(_) => "invalid",
+                    Expected::Unavailable(_) => "unavailable",
+                },
+                outcome_class(&actual),
             ),
         }
     }
@@ -2151,7 +2169,9 @@ fn values_are_not_cached_between_reads() {
                 value.expose_for_test() == expected,
                 "a read saw a different value than the fake served"
             ),
-            other => panic!("expected a value, got {other:?}"),
+            // The class, not the payload: `Resolved` carries a value in one arm
+            // and a failure message must never render it.
+            other => panic!("expected a served value, got {}", outcome_class(&other)),
         }
     }
     assert_eq!(log.starts(), 1);
