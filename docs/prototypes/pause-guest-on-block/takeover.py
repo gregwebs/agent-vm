@@ -18,7 +18,8 @@ import fcntl, json, os, pty, select, signal, struct, subprocess, sys, termios, t
 
 LOG, PIDFILE = (f"/tmp/PROTOTYPE-494-takeover-{os.getuid()}.{x}" for x in ("log", "pid"))
 FAKE = ["registry.npmjs.org:443", "pypi.org:443", "telemetry.example.com:443"]
-GUARD_S = 0.7            # keys arriving this soon after the prompt are discarded
+QUIET_S = 0.7            # keys count only after this long with no typing
+NOTIFY_S, TIMEOUT_S = 5, 60   # unanswered: notify, then deny
 # guest-set DEC private modes we change while prompting and must put back
 RESTORE = ["1000", "1002", "1003", "1006", "1015", "2004", "1004"]
 
@@ -134,15 +135,25 @@ def main():
             f"    session      {pid}{'   VM paused' if frozen else '   guest output held'}\r\n\r\n"
             "    [s] allow for this session   [p] allow for this project\r\n"
             "    [d] deny (Enter, Esc)        [n] deny, don't ask again this session\r\n\r\n"
-            "    The request has already failed; retry it after allowing.\r\n")
+            "    The request has already failed; retry it after allowing.\r\n\r\n")
         termios.tcflush(0, termios.TCIFLUSH)
-        answer = None
+        answer, last_key, ready, notified = None, t0, None, False
         while answer is None:
-            r, _, _ = select.select([0], [], [], 0.2)
+            now = time.monotonic()
+            if (now - last_key >= QUIET_S) != ready:
+                ready = now - last_key >= QUIET_S
+                out("\r\x1b[2K    " + ("\x1b[32mready for your answer\x1b[0m" if ready
+                                         else "\x1b[33mstop typing to answer...\x1b[0m"))
+            if not notified and now - t0 >= NOTIFY_S:
+                notified = True  # PROTOTYPE: the real launcher posts the host notification here
+                out("\x1b[s\x1b[1;60H(notification sent)\x1b[u")
+            if now - t0 >= TIMEOUT_S:
+                answer = "deny-timeout"; break
+            r, _, _ = select.select([0], [], [], 0.1)
             if not r: continue
             chunk = os.read(0, 1024)
-            if time.monotonic() - t0 < GUARD_S or len(chunk) != 1:
-                continue  # typed-ahead or pasted: never an answer
+            if not ready or len(chunk) != 1:
+                last_key = time.monotonic(); continue  # still typing, or pasted: never an answer
             answer = {b"s": "session", b"p": "project", b"d": "deny", b"\r": "deny",
                       b"\x1b": "deny", b"n": "deny-and-stop-asking"}.get(chunk)
         if answer == "deny-and-stop-asking": asked.add(dest)
@@ -152,7 +163,7 @@ def main():
             + ("\x1b[?25l" if vt.modes.get("25") is False else ""))
         for m in frozen: os.kill(m, signal.SIGCONT)
         with open(LOG, "a") as f:
-            f.write(json.dumps({"dest": dest, "answer": answer, "seconds": round(time.monotonic() - t0, 1),
+            f.write(json.dumps({"dest": dest, "answer": answer, "notified": notified, "seconds": round(time.monotonic() - t0, 1),
                                 "guest_alt_screen": was_alt, "vm_paused": bool(frozen)}) + "\n")
         if was_alt:  # we drew over the guest's screen: make it repaint
             r_, c_ = winsize(0)[:2]
