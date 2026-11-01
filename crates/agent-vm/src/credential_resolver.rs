@@ -44,6 +44,10 @@
 //! keychain fails *before* a sandbox is created, rather than producing a
 //! booted-but-uncredentialed sandbox.
 //!
+//! A SecretSpec source reads through a `secretspec serve --read-only` session
+//! started by the first phase-1 read and reused by phase 2; `CredentialSessions`
+//! ends it when `create` returns (#202).
+//!
 //! A keychain source reads once per requested authorized service in phase 1,
 //! then once per durable reference occurrence in phase 2 (several per service
 //! when it has several rules). `LaunchSource` routes env sources to immutable
@@ -92,7 +96,7 @@ use zeroize::Zeroizing;
 use crate::config::USER_CONFIG_DIR_RELATIVE;
 use crate::credential_env::EnvCapture;
 use crate::credential_provider::{CredentialProvider, ProviderSet};
-use crate::credential_yaml::{self, AuthorizationSet, GuestEnvName, SourceKind};
+use crate::credential_yaml::{self, AuthorizationSet, GuestEnvName, SourceKind, SourceSelection};
 use crate::secret_store::{
     BoundedKeychainReads, KeychainFailure, Resolved, SecretStore, ServiceName, SystemKeychain,
     system_store,
@@ -203,6 +207,35 @@ impl CredentialSource for KeychainCredentialSource {
 pub(crate) struct LaunchSource {
     keychain: Option<Arc<dyn CredentialSource>>,
     environment: EnvCapture,
+    /// `None` when no requested authorization selects SecretSpec, so a launch
+    /// without one builds no session pool and spawns nothing.
+    secretspec: Option<Arc<crate::credential_secretspec::SecretspecSource>>,
+}
+
+impl LaunchSource {
+    /// Test-only: build the router from its three parts, for the cross-source
+    /// routing test (#202 R1), which must see one backend per service.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        keychain: Option<Arc<dyn CredentialSource>>,
+        environment: EnvCapture,
+        secretspec: Option<Arc<crate::credential_secretspec::SecretspecSource>>,
+    ) -> Self {
+        Self {
+            keychain,
+            environment,
+            secretspec,
+        }
+    }
+
+    /// Test-only: whether the SecretSpec source owns this service. The routing
+    /// test asserts one backend per service without reaching into the pool.
+    #[cfg(test)]
+    pub(crate) fn secretspec_selects(&self, service: &ServiceName) -> bool {
+        self.secretspec
+            .as_ref()
+            .is_some_and(|secretspec| secretspec.selects(service))
+    }
 }
 
 impl CredentialSource for LaunchSource {
@@ -210,9 +243,60 @@ impl CredentialSource for LaunchSource {
         if self.environment.selects(service) {
             return self.environment.resolve(service);
         }
+        if let Some(secretspec) = &self.secretspec
+            && secretspec.selects(service)
+        {
+            return secretspec.resolve(service);
+        }
         match &self.keychain {
             Some(keychain) => keychain.resolve(service),
             None => Resolved::Missing,
+        }
+    }
+}
+
+/// Phase 1's three products: the resolved credentials, the source phase 2 reads
+/// through, and the guard that ends this launch's host-side sessions.
+pub(crate) type ResolvedLaunch = (
+    LaunchCredentials,
+    Option<Arc<dyn CredentialSource>>,
+    CredentialSessions,
+);
+
+/// Ends the host-side credential sessions this launch opened (today: one
+/// `secretspec serve` per pinned session key).
+///
+/// `run::launch` closes it the moment `create` returns, and dropping it closes
+/// too, so every early return ends them as well. Closing makes later reads fail
+/// without spawning, so a resolver `Arc` the SDK holds longer cannot revive a
+/// session. It proves only that **no later read spawns or reads**: dropping a
+/// `JoinHandle` detaches its task, so this cannot withdraw a value the create
+/// task already acquired (ADR-0055).
+#[must_use]
+pub(crate) struct CredentialSessions(Option<Arc<crate::credential_secretspec::SecretspecSource>>);
+
+impl CredentialSessions {
+    pub(crate) fn none() -> Self {
+        Self(None)
+    }
+
+    /// Explicit close, at the one point the launch knows phase 2 has ended.
+    pub(crate) fn close(self) {}
+
+    /// Test-only: a guard over an already-built source, so the close path is
+    /// exercised through the type the launch actually holds.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        source: Option<Arc<crate::credential_secretspec::SecretspecSource>>,
+    ) -> Self {
+        Self(source)
+    }
+}
+
+impl Drop for CredentialSessions {
+    fn drop(&mut self) {
+        if let Some(source) = self.0.take() {
+            source.close();
         }
     }
 }
@@ -227,6 +311,25 @@ pub(crate) struct CredentialPreflight {
     requested: BTreeSet<ServiceName>,
     authorizations: Result<AuthorizationSet>,
     environment: EnvCapture,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many keychain backends **this thread** has constructed.
+    ///
+    /// R2 constrains construction, and construction has no other observable: a
+    /// keychain built and never read looks exactly like one never built, which
+    /// is why the routing test alone cannot prove R2. A thread-local (not a
+    /// global) so parallel tests cannot see each other's counts; `resolve` is
+    /// synchronous, so a launch's construction always lands on its own test's
+    /// thread.
+    static KEYCHAIN_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many keychain backends this thread has constructed so far.
+#[cfg(test)]
+fn keychain_built() -> usize {
+    KEYCHAIN_BUILT.with(std::cell::Cell::get)
 }
 
 impl CredentialPreflight {
@@ -268,14 +371,20 @@ impl CredentialPreflight {
         }
     }
 
-    /// Phase 1, plus the source phase 2 will use. `None` source when nothing was
-    /// requested (the create path then takes the resolver-free branch).
-    pub(crate) fn resolve(
-        self,
-        policy: MissingCredentialPolicy,
-    ) -> Result<(LaunchCredentials, Option<Arc<dyn CredentialSource>>)> {
+    /// Phase 1, plus the source phase 2 will use and the guard that ends this
+    /// launch's host-side sessions. `None` source when nothing was requested
+    /// (the create path then takes the resolver-free branch).
+    ///
+    /// A keychain backend is built only when some requested authorization is
+    /// keychain-sourced, and a SecretSpec pool only when one selects
+    /// `source: secretspec`, so a launch that names neither constructs neither.
+    pub(crate) fn resolve(self, policy: MissingCredentialPolicy) -> Result<ResolvedLaunch> {
         if self.requested.is_empty() {
-            return Ok((LaunchCredentials::default(), None));
+            return Ok((
+                LaunchCredentials::default(),
+                None,
+                CredentialSessions::none(),
+            ));
         }
         let authorizations = self.authorizations?;
         let needs_keychain = self.requested.iter().any(|name| {
@@ -284,16 +393,27 @@ impl CredentialPreflight {
                 .is_some_and(|credential| credential.source() == SourceKind::Keychain)
         });
         let keychain = if needs_keychain {
+            #[cfg(test)]
+            KEYCHAIN_BUILT.with(|count| count.set(count.get() + 1));
             Some(KeychainCredentialSource::system()?)
         } else {
             None
         };
+        let secretspec = crate::credential_secretspec::SecretspecSource::select(
+            &self.requested,
+            &authorizations,
+        )
+        .map(Arc::new);
+        // Cloned before phase 1 runs, so a `?` below drops the guard and closes
+        // whatever phase 1 already started.
+        let sessions = CredentialSessions(secretspec.clone());
         let source: Arc<dyn CredentialSource> = Arc::new(LaunchSource {
             keychain,
             environment: self.environment,
+            secretspec,
         });
         let launch = resolve_launch(&self.requested, &authorizations, source.as_ref(), policy)?;
-        Ok((launch, Some(source)))
+        Ok((launch, Some(source), sessions))
     }
 }
 
@@ -330,9 +450,9 @@ impl microsandbox::CredentialResolver for LaunchCredentialResolver {
             // acceptable value" are one closed kind here: the SDK's own error
             // is index-and-label only, and a richer category would have to
             // carry text that could contain secret material.
-            Resolved::Unavailable(_) | Resolved::InvalidValue(_) => {
-                Err(microsandbox::CredentialResolveError::failed())
-            }
+            Resolved::Unavailable(_)
+            | Resolved::SecretspecUnavailable(_)
+            | Resolved::InvalidValue(_) => Err(microsandbox::CredentialResolveError::failed()),
         }
     }
 }
@@ -442,6 +562,13 @@ enum WithheldCause {
     Missing,
     EnvironmentUnset(GuestEnvName),
     Unavailable(KeychainFailure),
+    /// SecretSpec answered `missing` **or** `undeclared` for this secret
+    /// (#202). One cause for both, because the issue maps both to
+    /// `Resolved::Missing`; the reason covers both readings plus the
+    /// out-of-scope case, so the remedy stays actionable without inventing an
+    /// outcome class.
+    SecretspecMissing(crate::credential_secretspec::config::SecretspecName),
+    SecretspecUnavailable(crate::credential_secretspec::SecretspecFailure),
     /// The launch requested a name that is neither a built-in provider nor
     /// authorized. Only reachable under `MissingCredentialPolicy::Warn`;
     /// under `Fail` this is the hard error it has always been.
@@ -490,6 +617,19 @@ impl Withheld {
             WithheldCause::EnvironmentUnset(name) => format!(
                 "the host environment variable `{name}` selected by `{}` (`source: env`) was unset or empty when agent-vm started; export it before launching",
                 self.service
+            ),
+            WithheldCause::SecretspecMissing(name) => format!(
+                "SecretSpec has no value for `{name}`, which `{}` reads (`source: secretspec`): it \
+                 is either not declared in the manifest for this profile/scope (a name outside \
+                 the session scope answers the same way) or declared but unset. Declare it and \
+                 set it with SecretSpec - agent-vm only reads SecretSpec-managed values; \
+                 `agent-vm doctor` shows the configured manifest, profile and scope",
+                self.service
+            ),
+            WithheldCause::SecretspecUnavailable(failure) => format!(
+                "SecretSpec could not resolve `{}` (`source: secretspec`): {}",
+                self.service,
+                failure.message()
             ),
             WithheldCause::NotAuthorized => format!(
                 "`{}` is neither a built-in credential provider nor authorized in {}/{}",
@@ -816,11 +956,23 @@ fn resolve_authorized(
                 inject: credential.inject().to_vec(),
             });
         }
-        Resolved::Missing | Resolved::Unavailable(_) => {
-            let cause = match (&resolved, credential.source()) {
+        Resolved::Missing | Resolved::Unavailable(_) | Resolved::SecretspecUnavailable(_) => {
+            // The cause is chosen from the outcome *and* the selection: a
+            // `Missing` from a SecretSpec-sourced entry is not a missing
+            // keychain item, and saying so would send the user to
+            // `agent-vm secret set` for a value only SecretSpec can supply.
+            let cause = match (&resolved, credential.selection()) {
                 (Resolved::Unavailable(failure), _) => WithheldCause::Unavailable(*failure),
-                (_, SourceKind::Environment) => WithheldCause::EnvironmentUnset(env_name.clone()),
-                _ => WithheldCause::Missing,
+                (Resolved::SecretspecUnavailable(failure), _) => {
+                    WithheldCause::SecretspecUnavailable(*failure)
+                }
+                (_, SourceSelection::Environment) => {
+                    WithheldCause::EnvironmentUnset(env_name.clone())
+                }
+                (_, SourceSelection::Secretspec(selection)) => {
+                    WithheldCause::SecretspecMissing(selection.name().clone())
+                }
+                (_, SourceSelection::Keychain) => WithheldCause::Missing,
             };
             // A `required: true` value that cannot be read is the one
             // availability failure the host may override. `InvalidValue` below
@@ -851,36 +1003,53 @@ fn resolve_authorized(
             launch.withheld.push(withheld);
         }
         Resolved::InvalidValue(rejection) => {
-            if credential.source() == SourceKind::Environment {
-                // Storage-specific advice ("it was not stored") is wrong for
-                // env bytes. Keep only the value-free rule for those variants.
-                let rule = match rejection {
-                    crate::secret_store::ValueRejection::Empty
-                    | crate::secret_store::ValueRejection::TooLong => rejection.message(),
-                    crate::secret_store::ValueRejection::EdgeSpace => {
-                        "a leading or trailing space".to_owned()
-                    }
-                    crate::secret_store::ValueRejection::NonPrintable => {
-                        "characters that are not printable ASCII".to_owned()
-                    }
-                };
-                return Err(anyhow!(
-                    "the host environment variable `{env_name}` selected by `{service}` cannot be used: {rule}. Fix or unset it on the host"
-                ));
+            match credential.selection() {
+                SourceSelection::Environment => {
+                    return Err(anyhow!(
+                        "the host environment variable `{env_name}` selected by `{service}` cannot be used: {}. Fix or unset it on the host",
+                        host_value_rule(*rejection)
+                    ));
+                }
+                SourceSelection::Secretspec(selection) => {
+                    return Err(anyhow!(
+                        "the value SecretSpec resolved for `{service}` (secret `{}`) cannot be used: {}. Fix it in SecretSpec",
+                        selection.name(),
+                        host_value_rule(*rejection)
+                    ));
+                }
+                // A hard error regardless of `required` and regardless of the
+                // policy: the stored bytes are not a value this release will
+                // inject, and treating that as merely withheld would hide a
+                // real problem behind a warning.
+                SourceSelection::Keychain => {
+                    return Err(anyhow!(
+                        "the stored value for `{service}` cannot be used: {}. Remove and \
+                         re-store it with `{}`",
+                        rejection.message(),
+                        secret_set_command(service)
+                    ));
+                }
             }
-            // A hard error regardless of `required` and regardless of the
-            // policy: the stored bytes are not a value this release will
-            // inject, and treating that as merely withheld would hide a real
-            // problem behind a warning.
-            return Err(anyhow!(
-                "the stored value for `{service}` cannot be used: {}. Remove and \
-                 re-store it with `{}`",
-                rejection.message(),
-                secret_set_command(service)
-            ));
         }
     }
     Ok(())
+}
+
+/// The value-free rule that rejected a *host* value, shared by the two host
+/// sources (`source: env`, `source: secretspec`).
+///
+/// Storage-specific advice ("it was not stored", "re-store it") is wrong for a
+/// value this process just read, so only the rule itself is reused and each
+/// source adds its own remedy.
+fn host_value_rule(rejection: crate::secret_store::ValueRejection) -> String {
+    match rejection {
+        crate::secret_store::ValueRejection::Empty
+        | crate::secret_store::ValueRejection::TooLong => rejection.message(),
+        crate::secret_store::ValueRejection::EdgeSpace => "a leading or trailing space".to_owned(),
+        crate::secret_store::ValueRejection::NonPrintable => {
+            "characters that are not printable ASCII".to_owned()
+        }
+    }
 }
 
 /// The authorization file's name, for messages that name the location.
@@ -952,7 +1121,13 @@ mod tests {
         Value(String),
         Missing,
         Unavailable(KeychainFailure),
+        SecretspecUnavailable(crate::credential_secretspec::SecretspecFailure),
         Invalid,
+        /// A value on the first read, `Missing` afterwards: the phase-1 → phase-2
+        /// transition a live SecretSpec store can have.
+        ValueThenMissing(String),
+        /// A value on the first read, a SecretSpec failure afterwards.
+        ValueThenSecretspecUnavailable(String, crate::credential_secretspec::SecretspecFailure),
     }
 
     /// A plain `Send + Sync` source: a pre-seeded map behind a `Mutex`. The
@@ -961,6 +1136,9 @@ mod tests {
     struct TestSource {
         scripted: Mutex<BTreeMap<String, Scripted>>,
         lookups: Mutex<Vec<String>>,
+        /// Per-source read counts, for [`Scripted::ValueThenMissing`]: the
+        /// phase-1 → phase-2 transition, which is a property of one launch.
+        counts: Mutex<BTreeMap<String, usize>>,
     }
 
     impl TestSource {
@@ -968,6 +1146,7 @@ mod tests {
             Arc::new(Self {
                 scripted: Mutex::new(BTreeMap::new()),
                 lookups: Mutex::new(Vec::new()),
+                counts: Mutex::new(BTreeMap::new()),
             })
         }
 
@@ -996,11 +1175,34 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(service.as_str().to_owned());
+            let seen = {
+                let mut counts = self.counts.lock().unwrap();
+                let count = counts.entry(service.as_str().to_owned()).or_insert(0);
+                *count += 1;
+                *count
+            };
             match self.scripted.lock().unwrap().get(service.as_str()).cloned() {
+                Some(Scripted::ValueThenSecretspecUnavailable(raw, failure)) => {
+                    if seen == 1 {
+                        Resolved::Value(SecretValue::parse(raw.into_bytes()).expect("acceptable"))
+                    } else {
+                        Resolved::SecretspecUnavailable(failure)
+                    }
+                }
+                Some(Scripted::ValueThenMissing(raw)) => {
+                    if seen == 1 {
+                        Resolved::Value(SecretValue::parse(raw.into_bytes()).expect("acceptable"))
+                    } else {
+                        Resolved::Missing
+                    }
+                }
                 Some(Scripted::Value(raw)) => {
                     Resolved::Value(SecretValue::parse(raw.into_bytes()).expect("acceptable"))
                 }
                 Some(Scripted::Unavailable(failure)) => Resolved::Unavailable(failure),
+                Some(Scripted::SecretspecUnavailable(failure)) => {
+                    Resolved::SecretspecUnavailable(failure)
+                }
                 Some(Scripted::Invalid) => Resolved::InvalidValue(ValueRejection::NonPrintable),
                 Some(Scripted::Missing) | None => Resolved::Missing,
             }
@@ -2009,6 +2211,287 @@ credentials:
         );
         drop(home);
     }
+    /// A `source: secretspec` entry whose table is valid; the executable is an
+    /// absent path so a real read fails fast and for a named reason.
+    fn secretspec_authorizations(required: bool) -> (tempfile::TempDir, AuthorizationSet) {
+        authorizations(&format!(
+            "credentials:\n  - service: alpha\n    source: secretspec\n    required: {required}\n    \
+             apiKey:\n      name: ALPHA_KEY\n      sentinelEnv: true\n      inject: [{{domain: \
+             api.alpha.example, scheme: bearer}}]\n    secretspec:\n      executable: \
+             /nonexistent/secretspec\n      manifest: /tmp/secretspec.toml\n      profile: default\n"
+        ))
+    }
+
+    /// A source that answers for exactly the SecretSpec-sourced services, so the
+    /// resolver's message families can be exercised without a child.
+    fn secretspec_source(outcome: Scripted) -> Arc<TestSource> {
+        TestSource::new().script("alpha", outcome)
+    }
+
+    /// R2: a missing SecretSpec value names the secret and the SecretSpec remedy,
+    /// and never suggests the keychain (`agent-vm secret set`).
+    #[test]
+    fn a_missing_secretspec_value_names_the_secret_and_not_the_keychain() {
+        let (_home, set) = secretspec_authorizations(false);
+        let source = TestSource::new();
+        let launch = resolve_launch(
+            &names(&["alpha"]),
+            &set,
+            &*source,
+            MissingCredentialPolicy::Fail,
+        )
+        .expect("optional");
+        let notice = launch.withheld()[0].notice();
+        assert!(
+            notice.contains("SecretSpec has no value for `ALPHA_KEY`"),
+            "{notice}"
+        );
+        assert!(notice.contains("not declared in the manifest"), "{notice}");
+        assert!(notice.contains("outside the session scope"), "{notice}");
+        assert!(!notice.contains("agent-vm secret set"), "{notice}");
+        assert!(!notice.contains("keychain"), "{notice}");
+    }
+
+    /// R3: the availability matrix is the keychain's, unchanged, for a SecretSpec
+    /// failure too.
+    #[test]
+    fn secretspec_unavailability_follows_the_availability_matrix() {
+        use crate::credential_secretspec::SecretspecFailure as F;
+        for (required, policy) in [
+            (true, MissingCredentialPolicy::Fail),
+            (true, MissingCredentialPolicy::Warn),
+            (false, MissingCredentialPolicy::Fail),
+            (false, MissingCredentialPolicy::Warn),
+        ] {
+            let (_home, set) = secretspec_authorizations(required);
+            let source = secretspec_source(Scripted::SecretspecUnavailable(F::ProviderFailed));
+            let result = resolve_launch(&names(&["alpha"]), &set, &*source, policy);
+            let rendered = match result {
+                Err(error) => error.to_string(),
+                Ok(launch) => {
+                    assert!(launch.ready().is_empty());
+                    launch.withheld()[0].notice()
+                }
+            };
+            assert!(
+                rendered.contains("SecretSpec could not resolve `alpha`"),
+                "{rendered}"
+            );
+            assert!(rendered.contains("`source: secretspec`"), "{rendered}");
+            let fatal = required && policy == MissingCredentialPolicy::Fail;
+            let rescued = required && policy == MissingCredentialPolicy::Warn;
+            assert_eq!(
+                rendered.contains("continuing without it"),
+                !fatal,
+                "{rendered}"
+            );
+            assert_eq!(
+                rendered.contains("because --allow-missing-credentials was passed"),
+                rescued,
+                "{rendered}"
+            );
+        }
+    }
+
+    /// R4: a rejected SecretSpec value is a hard error under both policies and
+    /// both `required` values — the bytes are present and unusable, which is a
+    /// configuration error, not an unavailable source.
+    #[test]
+    fn an_invalid_secretspec_value_is_a_hard_error_under_both_policies() {
+        for required in [false, true] {
+            for policy in [MissingCredentialPolicy::Fail, MissingCredentialPolicy::Warn] {
+                let (_home, set) = secretspec_authorizations(required);
+                let source = secretspec_source(Scripted::Invalid);
+                let error = resolve_launch(&names(&["alpha"]), &set, &*source, policy)
+                    .expect_err("a rejected value is fatal")
+                    .to_string();
+                assert!(error.contains("SecretSpec resolved for `alpha`"), "{error}");
+                assert!(error.contains("secret `ALPHA_KEY`"), "{error}");
+                assert!(error.contains("Fix it in SecretSpec"), "{error}");
+                assert!(!error.contains("sk-CANARY"), "{error}");
+            }
+        }
+    }
+
+    /// R5: #162's replacement is unchanged — a same-named built-in is replaced,
+    /// and an unavailable SecretSpec value does not fall back to it.
+    #[test]
+    fn a_secretspec_sourced_same_named_authorization_replaces_without_fallback() {
+        use crate::credential_provider::CredentialProvider;
+        let (_home, set) = authorizations(
+            "credentials:\n  - service: anthropic\n    source: secretspec\n    apiKey:\n      name: \
+             ANTHROPIC_API_KEY\n      inject: [{domain: api.anthropic.com, scheme: bearer}]\n    \
+             secretspec:\n      executable: /nonexistent/secretspec\n      manifest: \
+             /tmp/secretspec.toml\n      profile: default\n",
+        );
+        let source = TestSource::new().script(
+            "anthropic",
+            Scripted::SecretspecUnavailable(
+                crate::credential_secretspec::SecretspecFailure::ProviderFailed,
+            ),
+        );
+        let launch = resolve_launch(
+            &names(&["anthropic"]),
+            &set,
+            &*source,
+            MissingCredentialPolicy::Fail,
+        )
+        .expect("optional by default");
+        assert!(launch.ready().is_empty());
+        assert!(
+            launch.replaced().contains(CredentialProvider::Anthropic),
+            "the built-in stays replaced even while the value is unavailable"
+        );
+        assert_eq!(source.lookups(), ["anthropic"]);
+    }
+
+    /// R6: phase 2 maps `missing` — and therefore `undeclared`, which is the same
+    /// outcome — to `not_found`, and every failure to `failed`.
+    #[test]
+    fn phase_two_maps_undeclared_and_missing_to_not_found() {
+        use crate::credential_secretspec::SecretspecFailure as F;
+        // Phase 1 sees a value; phase 2 sees `Missing`, which is what
+        // `undeclared` also is. The runtime must read that as `not_found`, not
+        // as an authorization or a runtime failure.
+        let (_home, set) = secretspec_authorizations(true);
+        let source =
+            TestSource::new().script("alpha", Scripted::ValueThenMissing("sk-once".into()));
+        let launch = resolve_launch(
+            &names(&["alpha"]),
+            &set,
+            &*source,
+            MissingCredentialPolicy::Fail,
+        )
+        .expect("phase 1 saw a value");
+        let resolver = launch.resolver(dyn_source(&source));
+        assert_eq!(
+            resolver.resolve("alpha").unwrap_err(),
+            microsandbox::CredentialResolveError::NotFound
+        );
+        for failure in [F::ProviderFailed, F::ProtocolViolation, F::SessionLost] {
+            let (_home, set) = secretspec_authorizations(true);
+            let source = TestSource::new().script(
+                "alpha",
+                Scripted::ValueThenSecretspecUnavailable("sk-once".into(), failure),
+            );
+            let launch = resolve_launch(
+                &names(&["alpha"]),
+                &set,
+                &*source,
+                MissingCredentialPolicy::Fail,
+            )
+            .expect("phase 1 saw a value");
+            let resolver = launch.resolver(dyn_source(&source));
+            assert_eq!(
+                resolver.resolve("alpha").unwrap_err(),
+                microsandbox::CredentialResolveError::Failed,
+                "{failure:?}"
+            );
+        }
+    }
+
+    /// R2's routing half: a secretspec-only launch reports the *SecretSpec*
+    /// cause, and a keychain-sourced launch with the same file shape reports a
+    /// keychain cause, so the two are distinguishable.
+    ///
+    /// This proves **routing**, not construction: it says which backend answers,
+    /// not whether a keychain object was built. A keychain constructed and never
+    /// read would pass it.
+    /// `the_keychain_is_constructed_only_when_a_keychain_source_is_requested`
+    /// observes the construction itself.
+    #[test]
+    fn a_secretspec_only_launch_needs_no_keychain() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(USER_CONFIG_DIR_RELATIVE);
+        fs::create_dir_all(&dir).unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.join(credential_yaml::CREDENTIALS_FILE_NAME);
+        fs::write(
+            &path,
+            "credentials:\n  - service: alpha\n    source: secretspec\n    apiKey:\n      name: \
+             ALPHA_KEY\n      inject: [{domain: api.alpha.example, scheme: bearer}]\n    \
+             secretspec:\n      executable: /nonexistent/secretspec\n      manifest: \
+             /tmp/secretspec.toml\n      profile: default\n",
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut guard = crate::test_env::guard();
+        guard.set_var("HOME", home.path());
+        guard.remove_var("AGENT_VM_TEST_CREDENTIAL");
+        let preflight = CredentialPreflight::capture(&names(&["alpha"]));
+        let (launch, source, sessions) = preflight
+            .resolve(MissingCredentialPolicy::Fail)
+            .expect("an optional secretspec entry does not fail the launch");
+        assert!(source.is_some());
+        drop(sessions);
+        assert!(launch.ready().is_empty());
+        let notice = launch.withheld()[0].notice();
+        assert!(
+            notice.contains("`secretspec.executable` does not exist"),
+            "the routing chose SecretSpec, not the keychain: {notice}"
+        );
+    }
+
+    /// R2's construction half, which has no other observable: a keychain built
+    /// and never read looks exactly like one never built.
+    ///
+    /// The count is incremented in the branch that builds it. The plan forbids
+    /// extracting a `needs_keychain` helper, so construction is observed where
+    /// it happens rather than through a new predicate.
+    #[test]
+    fn the_keychain_is_constructed_only_when_a_keychain_source_is_requested() {
+        let secretspec_entry = "  - service: alpha\n    source: secretspec\n    apiKey:\n      \
+                               name: ALPHA_KEY\n      inject: [{domain: api.alpha.example, \
+                               scheme: bearer}]\n    secretspec:\n      executable: \
+                               /nonexistent/secretspec\n      manifest: /tmp/secretspec.toml\n      \
+                               profile: default\n";
+        let env_entry = "  - service: alpha\n    source: env\n    apiKey:\n      name: \
+                        ALPHA_KEY\n      inject: [{domain: api.alpha.example, scheme: bearer}]\n";
+        let keychain_entry = "  - service: beta\n    apiKey:\n      name: BETA_KEY\n      \
+                             inject: [{domain: api.beta.example, scheme: bearer}]\n";
+        // The `HOME` a launch reads, and the delta the counter moved by.
+        let constructions = |body: &str, services: &[&str]| -> usize {
+            let home = tempfile::tempdir().unwrap();
+            let dir = home.path().join(USER_CONFIG_DIR_RELATIVE);
+            fs::create_dir_all(&dir).unwrap();
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+            let path = dir.join(credential_yaml::CREDENTIALS_FILE_NAME);
+            fs::write(&path, body).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            let mut guard = crate::test_env::guard();
+            guard.set_var("HOME", home.path());
+            guard.remove_var("AGENT_VM_TEST_CREDENTIAL");
+            let before = keychain_built();
+            // Either outcome is acceptable for the keychain case: what is under
+            // test is whether a keychain was built, not whether this host has
+            // one, and the counter moves before `system()` can fail.
+            let _ = CredentialPreflight::capture(&names(services))
+                .resolve(MissingCredentialPolicy::Fail);
+            keychain_built() - before
+        };
+        let credentials = |entries: &[&str]| format!("credentials:\n{}\n", entries.concat());
+        assert_eq!(
+            constructions(&credentials(&[secretspec_entry]), &["alpha"]),
+            0,
+            "a secretspec-only launch must build no keychain"
+        );
+        assert_eq!(
+            constructions(&credentials(&[env_entry]), &["alpha"]),
+            0,
+            "an env-only launch must build no keychain"
+        );
+        assert_eq!(
+            constructions(
+                &credentials(&[keychain_entry, secretspec_entry]),
+                &["alpha", "beta"]
+            ),
+            1,
+            "a keychain-sourced authorization must build exactly one keychain"
+        );
+    }
+
     fn env_authorizations(required: bool, sentinel: bool) -> (tempfile::TempDir, AuthorizationSet) {
         authorizations(&format!(
             "credentials:\n  - service: alpha\n    source: env\n    required: {required}\n    apiKey:\n      name: ALPHA_KEY\n      sentinelEnv: {sentinel}\n      inject: [{{domain: api.alpha.example, scheme: bearer}}]\n"
@@ -2028,6 +2511,7 @@ credentials:
             let source = LaunchSource {
                 keychain: Some(dyn_source(&keychain)),
                 environment: EnvCapture::take_with(&names(&["alpha"]), &set, |_| None),
+                secretspec: None,
             };
             let result = resolve_launch(&names(&["alpha"]), &set, &source, policy);
             let text = if required && policy == MissingCredentialPolicy::Fail {
@@ -2061,6 +2545,7 @@ credentials:
         let source = LaunchSource {
             keychain: Some(dyn_source(&keychain)),
             environment,
+            secretspec: None,
         };
         let launch = resolve_launch(
             &names(&["alpha", "beta"]),
@@ -2082,6 +2567,7 @@ credentials:
             environment: EnvCapture::take_with(&names(&["alpha"]), &set, |_| {
                 Some("sk-phase-two".into())
             }),
+            secretspec: None,
         });
         let launch = resolve_launch(
             &names(&["alpha"]),
@@ -2162,6 +2648,7 @@ credentials:
                 environment: EnvCapture::take_with(&names(&["alpha"]), &set, |_| {
                     Some(canary.into())
                 }),
+                secretspec: None,
             });
             let launch = resolve_launch(
                 &names(&["alpha"]),

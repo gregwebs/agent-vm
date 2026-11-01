@@ -825,7 +825,7 @@ Available launch options:
 | `--image REF` | boot this image instead of the configured one (env `AGENT_VM_IMAGE_TAG`); see [Selecting the boot image](#selecting-the-boot-image) |
 | `--no-git` | skip gh/git auth injection (still respects `--repo`) |
 | `--repo OWNER/NAME` | add to the GitHub allow-list (repeatable) |
-| `--allow-missing-credentials` | warn and launch when a requested YAML credential is missing or unreadable, instead of refusing — see [Authorizing a stored value for injection](#authorizing-a-stored-value-for-injection). Never covers a built-in provider's own missing host credential |
+| `--allow-missing-credentials` | warn and launch when a requested YAML credential is missing or unreadable (including a SecretSpec read that is unavailable or missing), instead of refusing — see [Authorizing a stored value for injection](#authorizing-a-stored-value-for-injection). Never covers a built-in provider's own missing host credential, or a SecretSpec value agent-vm rejects |
 | `--mount SET\|HOST[:GUEST][:MODE]...` | a bare `SET` name selects that user-defined [mount set](#named-mount-sets-user-config), exactly and case-sensitively, and never a relative path, a directory or a tool; otherwise an extra live bind or project-scoped `:fork`. Directory binds default to writable; a regular file needs an explicit `:ro`. Modes: `:ro`, `:rw`, `:fork`, `:follow-links`, and fork-only repeatable `:exclude=REL`; see [Extra and forked mounts](#extra-and-forked-mounts). A live bind that would expose a host Pi credential file is refused — see [Host Pi credential files are never mounted](#host-pi-credential-files-are-never-mounted). Capacity is host-specific. |
 | `--allow-internet-egress`, `--allow-lan`, `--allow-host`, `--allow-egress`, `--publish`, `--auto-publish` | see [Ports & egress](#ports--egress); egress is denied by default |
 | `--no-config-mounts` | skip this launch's automatic [config mounts](#config-mounts-user-config) (the user config's `mounts`); an explicit `--mount`, including `--mount NAME`, credentials, persisted paths and every config check still apply |
@@ -1715,7 +1715,13 @@ than leaving a green/absent row to be misread, and a provider no configured
 launch requests reads `not requested by any configured launch`. When a
 configured launch requests an authorized service, `doctor` also prints a
 `==> credentials.yaml (launch credentials)` section naming it as `authorized for
-this launch`. This launch-authorization view reads the authorization file only —
+this launch` — or, for a `source: secretspec` entry, `authorized for this launch
+from SecretSpec (<name>, profile <profile>, manifest <path>, executable <path>)`
+with the note that the launch resolves the value through `secretspec serve
+--read-only`, not `doctor`. `doctor` never runs the configured SecretSpec
+executable and never asks SecretSpec for a value, so its output is identical
+whether or not one could be served. This launch-authorization view reads the
+authorization file only —
 **not** the credential store — so that view never prompts and never writes; whether
 a value is actually stored
 is [`agent-vm secret ls`](#storing-your-own-secret-values)'s answer, and the
@@ -2573,8 +2579,103 @@ credentials:
 A same-named entry replaces the built-in's credential handling; see the
 replacement table below. Egress must still allow the origin.
 
+#### Reading the value from SecretSpec (`source: secretspec`)
+
+[SecretSpec](https://secretspec.dev) is a declaration and resolution layer over
+many provider backends. If you already keep the key there, authorize it as a
+source instead of copying it into agent-vm's keychain:
+
+```yaml
+credentials:
+  - service: deepseek
+    source: secretspec
+    secretspec:
+      executable: /opt/homebrew/bin/secretspec       # required, absolute
+      manifest: /Users/me/.config/agent-vm/secretspec.toml  # required, absolute
+      profile: default                               # required
+      scope: agent-vm                                # optional
+      name: DEEPSEEK_API_KEY                         # optional, default apiKey.name
+      reason: agent-vm launch                        # optional SecretSpec audit reason
+    required: true
+    apiKey:
+      name: DEEPSEEK_API_KEY
+      sentinelEnv: true
+      inject: [{domain: api.deepseek.com, scheme: bearer}]
+```
+
+`service` still names the authorization and `secretspec.name` names the secret
+in your SecretSpec manifest (default: `apiKey.name`). Everything else about the
+entry — `required`, `apiKey`, `inject`, the origin/header/format rules, the
+ownership rules for `apiKey.name` and replacement of a same-named built-in —
+works exactly as for the other two sources. `source: keychain` may now be written
+literally; it is still the default.
+
+The `secretspec:` table is allowed only with `source: secretspec`, and only in
+user configuration: no project file can select this source. `executable` and
+`manifest` must be absolute and normal paths (no `.`, `..`, `//` or trailing
+`/`). There is deliberately **no** `provider` key — the provider comes from your
+SecretSpec manifest, with `providers = [...]` on a secret or profile. Unsupported
+declarations are refused by name rather than approximated: `provider`, `as_path`,
+`representation`, `generate`, `default`, `value`, `prompt`, and any unknown key.
+
+agent-vm requires **SecretSpec 0.21 or newer** and runs exactly
+`<executable> serve --read-only` with the working directory `/` — never a shell,
+never a `PATH` lookup, never your project directory. Install it through
+Nix/devenv, or take a version-pinned release and verify it against the published
+checksum before you run it; then set `executable` to the absolute path. Do not
+pipe an install script into a shell: it decides for itself which bytes to run, and
+`executable` then names whatever it left behind — the same reason `agent-vm`
+pins this path rather than searching `PATH`. `agent-vm doctor` prints the path it
+will run.
+
+**agent-vm only reads.** It never sets, generates or prompts for a value: no
+`resolver.set`, no `resolver.delete`, no `resolver.release`, no `client.prompt`
+(the server's prompt request is answered "method not found" and the read
+continues). A secret that would have to be generated or prompted for is a
+failure, not a write. Keep one writer per SecretSpec entry, and do not also
+`agent-vm secret set` the same service. Rotation is launch-scoped: a value
+changed in SecretSpec applies to the next launch, not to a running sandbox.
+
+What to expect when it fails (each message names the service and what to fix,
+never a value):
+
+- `secretspec.executable` missing or not executable → install SecretSpec 0.21+
+  and point `executable` at it.
+- `serve --read-only` exits before the handshake, or speaks another protocol
+  version, or does not offer `resolver.get` **and** `resolver.release` → install
+  a 0.21-or-newer SecretSpec; agent-vm tells you which of these it saw.
+- The session offers `resolver.set`/`resolver.delete`, or answers unusable
+  `limits` → agent-vm refuses the session and sends no read.
+- SecretSpec refuses the manifest, profile or scope → check with
+  `secretspec check --no-prompt --file <manifest> --profile <profile>`.
+- The provider denies access, needs an unlock or sign-in, or returns something
+  that is not a plain value (binary, or an `as_path` declaration) → unlock it, or
+  fix the declaration. An `as_path` declaration is refused, never resolved to a
+  path.
+- The secret is `missing` or `undeclared` → set it in SecretSpec, or check that
+  the service's scope covers it; `agent-vm doctor` shows the configured
+  manifest, profile and scope.
+- The read outlived its bound (a provider waiting on an unlock) → unlock and
+  retry. A still-unanswered read prints one `warning:` line first.
+
+The exact mapping from every SecretSpec outcome to one of these is
+[ADR-0055](docs/adr/0055-secretspec-serve-credential-source.md), the single
+contract for this source.
+
+`SECRETSPEC_*` variables are **not** passed to the child, so a host
+`SECRETSPEC_FILE`/`SECRETSPEC_PROVIDER` cannot redirect the manifest or the
+provider. Everything else in agent-vm's environment is inherited, because
+provider CLIs need their own variables (`OP_*`, `VAULT_*`, `AWS_*`) and an `env`
+provider's input *is* a variable. That is **trusted input**, stated rather than
+hidden: a provider that reads `OP_*`/`VAULT_*`/`AWS_*` — or its own `env`
+variable — uses them exactly as a hand-run `secretspec` would, and agent-vm
+neither scrubs nor emits a value there. One credential cannot reach another: a
+host variable captured by a `source: env` entry is removed from agent-vm's
+environment before any child of that launch is spawned, so SecretSpec's own
+`env` provider cannot read it.
+
 For the keychain example above, request `my-service` in a user or project
-`config.toml` (an env source is requested the same way, by service name):
+`config.toml` (any source is requested the same way, by service name):
 
 ```toml
 [[tools]]
@@ -2602,8 +2703,9 @@ What to expect:
 - **Authorization does not grant egress.** Egress is denied by default; an
   authorized origin also needs `--allow-internet-egress` (or a numeric allowance).
   A denied destination never reaches injection.
-- **Rotation is launch-scoped.** A value rotated with `agent-vm secret set`
-  while a sandbox runs is *not* picked up; the next launch uses the new value.
+- **Rotation is launch-scoped.** A value rotated with `agent-vm secret set` —
+  or changed in SecretSpec for a `source: secretspec` entry — while a sandbox
+  runs is *not* picked up; the next launch uses the new value.
 - **Malformed authorization fails closed.** An unreadable, foreign-owned,
   group/other-writable, symlinked or malformed `credentials.yaml` refuses a
   launch that requests a credential, with a message naming the file but never
@@ -2653,10 +2755,14 @@ What to expect:
 - **`--allow-missing-credentials` (host-only).** A per-launch flag that warns
   and continues instead of refusing when a requested `credentials = [...]` name
   has no authorization, and when an authorized `required: true` credential's
-  value cannot be read, or its `source: env` variable is unset or empty. The
+  value cannot be read — its `source: env` variable is unset or empty, or its
+  SecretSpec read is unavailable or missing. The
   guest gets neither the credential nor a fallback, so the in-guest tool may still fail its own sign-in. It cannot bypass a malformed,
   unsupported or rejected `credentials.yaml`, an integrity refusal (foreign owner
-  or group/other write), a stored value the store rejects, a `sentinelEnv: false`
+  or group/other write), a stored value the store rejects, a SecretSpec value
+  agent-vm rejects (empty, edge space, non-printable or over 4096 bytes —
+  *present but invalid* is a configuration error, not an unavailable source), a
+  `sentinelEnv: false`
   name the boot image defines (or unreadable image metadata), a tool-`env` name
   conflict, or **a built-in provider's own missing host credential** — that last
   one still refuses the launch. There is deliberately no environment variable: it
@@ -2667,13 +2773,19 @@ What to expect:
   replaces reads `replaced by credentials.yaml for <verbs> (host file not
   read)`, and a provider no configured launch requests reads `not requested by
   any configured launch` — and names each requested authorization as
-  `authorized for this launch`. It reads the authorization file, never the
+  `authorized for this launch`, or for a SecretSpec source as
+  `authorized for this launch from SecretSpec (<name>, profile <profile>[, scope
+  <scope>], manifest <path>, executable <path>)` with the note that the launch
+  resolves the value, not `doctor`. It reads the authorization file, never the
   credential store, so it neither prompts nor writes; `agent-vm secret ls`
   reports whether a keychain value is stored. Env rows name the host variable;
-  doctor never reads its value or presence. See
+  doctor never reads its value or presence. Doctor also never runs the
+  configured SecretSpec executable, so its output is identical whether or not a
+  value could be served. See
   [Checking what agent-vm can see](#checking-what-agent-vm-can-see).
 - **Unsupported, by name, never silently ignored.** `source` values other than
-  `env`, `apiKey.env`, `permissions`/`permissions.network`, `oauth`, `basic`,
+  `keychain`, `env` and `secretspec` — and declaration families other than
+  `apiKey.env`, `permissions`/`permissions.network`, `oauth`, `basic`,
   `username`, request signing, query/body injection, kit/hooks/images/mounts/
   ports/composition, and wildcard, path, cleartext, userinfo, IP-literal or
   non-ASCII destinations are all refused with the reason.

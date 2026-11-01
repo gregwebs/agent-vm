@@ -10,6 +10,7 @@ mod credential_env;
 mod credential_injection;
 mod credential_provider;
 mod credential_resolver;
+mod credential_secretspec;
 mod credential_yaml;
 mod debug_config;
 mod defaults;
@@ -77,6 +78,13 @@ use anyhow::{Context, Result};
 use cli::{Cmd, Dispatch};
 
 fn main() -> Result<()> {
+    // Debug builds only: act as the fake `secretspec serve --read-only` endpoint
+    // for the boot-free tests (#202). First, so the fake reads no configuration
+    // and starts no runtime before answering frames.
+    #[cfg(debug_assertions)]
+    if let Some(code) = credential_secretspec::fake::serve_if_requested() {
+        std::process::exit(code);
+    }
     init_tracing();
     // Config is discovered and loaded *before* parsing, because the resolved
     // tool catalog determines which subcommands exist. The result is carried

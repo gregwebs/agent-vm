@@ -1,7 +1,10 @@
 //! # Sources
 //! Omitted `source` selects the keychain item named by `service`; `source: env`
-//! selects the host variable named by `apiKey.name`. Each entry has one source,
-//! without fallback. Pre-child capture belongs to `credential_env`.
+//! selects the host variable named by `apiKey.name`; `source: secretspec`
+//! selects the secret named by the entry's `secretspec:` table, read from the
+//! user's SecretSpec configuration (#202, `crate::credential_secretspec`). Each
+//! entry has one source, without fallback. Pre-child capture belongs to
+//! `credential_env`.
 //!
 //! `~/.config/agent-vm/credentials.yaml`: the user's credential
 //! **authorization**, agent-vm #161.
@@ -155,7 +158,8 @@ const UNSUPPORTED_API_KEY_FIELDS: &[(&str, &str)] = &[
     ),
     (
         "source",
-        "`apiKey.source` is not supported; `source` belongs on the entry beside `service` (`source: env`)",
+        "`apiKey.source` is not supported; `source` belongs on the entry beside `service` \
+         (`source: env` or `source: secretspec`)",
     ),
     (
         "env",
@@ -238,14 +242,39 @@ impl AuthorizationSet {
     }
 }
 
-/// Where an authorization obtains its value. Exactly one source, with no fallback.
+/// Where an authorization obtains its value: the cheap, `Copy` tag every caller
+/// compares. The payload a source needs lives beside it in [`SourceSelection`],
+/// so "SecretSpec without its table" is unrepresentable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SourceKind {
     Keychain,
     Environment,
+    Secretspec,
 }
 
-const SOURCE_UNKNOWN: &str = "`source` must be `env` (the host environment variable named by `apiKey.name`), or omitted for the agent-vm keychain item named by `service`";
+/// Where one authorization's value comes from, with the payload that source
+/// needs. One interface for the whole question; there is deliberately no second
+/// private `Source` enum and no `secretspec()` accessor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SourceSelection {
+    Keychain,
+    Environment,
+    Secretspec(crate::credential_secretspec::config::SecretspecSelection),
+}
+
+impl SourceSelection {
+    pub(crate) fn kind(&self) -> SourceKind {
+        match self {
+            Self::Keychain => SourceKind::Keychain,
+            Self::Environment => SourceKind::Environment,
+            Self::Secretspec(_) => SourceKind::Secretspec,
+        }
+    }
+}
+
+const SOURCE_UNKNOWN: &str = "`source` must be `keychain` (the default: the agent-vm keychain item named by `service`), `env` (the host environment variable named by `apiKey.name`) or `secretspec` (the `secretspec:` table on this entry)";
+const SECRETSPEC_TABLE_REQUIRED: &str = "`source: secretspec` requires a `secretspec:` table naming `executable`, `manifest` and `profile`";
+const SECRETSPEC_TABLE_UNEXPECTED: &str = "`secretspec` is only valid with `source: secretspec`";
 const ENV_SOURCE_LAUNCHER_NAME: &str = concat!(
     "with `source: env`, `apiKey.name` must not name a host variable agent-vm reads as its own ",
     "configuration (`AGENT_VM_*`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`): a launch removes an ",
@@ -264,7 +293,7 @@ pub(crate) struct AuthorizedCredential {
     #[allow(dead_code)]
     description: Option<String>,
     required: bool,
-    source: SourceKind,
+    source: SourceSelection,
     env_name: GuestEnvName,
     sentinel_env: bool,
     inject: Vec<InjectionRule>,
@@ -272,7 +301,13 @@ pub(crate) struct AuthorizedCredential {
 
 impl AuthorizedCredential {
     pub(crate) fn source(&self) -> SourceKind {
-        self.source
+        self.source.kind()
+    }
+
+    /// Where the value comes from, with the payload that source needs. The
+    /// detailed form of [`Self::source`]; `source()` stays the cheap tag.
+    pub(crate) fn selection(&self) -> &SourceSelection {
+        &self.source
     }
 
     /// Whether a failed or unavailable source is a hard error before boot.
@@ -1143,7 +1178,14 @@ fn convert_entry(
     let index_path = format!("credentials[{index}]");
     let object = expect_mapping(path, &index_path, entry)?;
     let api_key = entry_field(object, "apiKey");
-    let mut known = vec!["service", "description", "required", "source", "apiKey"];
+    let mut known = vec![
+        "service",
+        "description",
+        "required",
+        "source",
+        "secretspec",
+        "apiKey",
+    ];
     reject_unknown_fields(
         path,
         &index_path,
@@ -1195,10 +1237,14 @@ fn convert_entry(
 
     let source = match object.get("source") {
         None => SourceKind::Keychain,
-        Some(serde_json::Value::String(text)) if text == "env" => SourceKind::Environment,
-        Some(serde_json::Value::String(_)) => {
-            return Err(at(path, &format!("{index_path}.source"), SOURCE_UNKNOWN));
-        }
+        Some(serde_json::Value::String(text)) => match text.as_str() {
+            "keychain" => SourceKind::Keychain,
+            "env" => SourceKind::Environment,
+            "secretspec" => SourceKind::Secretspec,
+            _ => {
+                return Err(at(path, &format!("{index_path}.source"), SOURCE_UNKNOWN));
+            }
+        },
         Some(_) => {
             return Err(at(
                 path,
@@ -1252,6 +1298,35 @@ fn convert_entry(
             ENV_SOURCE_LAUNCHER_NAME,
         ));
     }
+
+    let source = match (source, object.get("secretspec")) {
+        (SourceKind::Secretspec, Some(table)) => {
+            let table_path = format!("{index_path}.secretspec");
+            let table = expect_mapping(path, &table_path, table)?;
+            reject_unknown_fields(
+                path,
+                &table_path,
+                table,
+                &mut crate::credential_secretspec::config::SECRETSPEC_KEYS.to_vec(),
+                crate::credential_secretspec::config::UNSUPPORTED_SECRETSPEC_FIELDS,
+            )?;
+            let selection = crate::credential_secretspec::config::parse_table(table, &env_name)
+                .map_err(|error| at(path, &format!("{table_path}.{}", error.key), error.rule))?;
+            SourceSelection::Secretspec(selection)
+        }
+        (SourceKind::Secretspec, None) => {
+            return Err(at(path, &index_path, SECRETSPEC_TABLE_REQUIRED));
+        }
+        (_, Some(_)) => {
+            return Err(at(
+                path,
+                &format!("{index_path}.secretspec"),
+                SECRETSPEC_TABLE_UNEXPECTED,
+            ));
+        }
+        (SourceKind::Keychain, None) => SourceSelection::Keychain,
+        (SourceKind::Environment, None) => SourceSelection::Environment,
+    };
 
     let sentinel = strict_bool_field(path, &api_path, api_key, "sentinelEnv")?;
     let proxy = strict_bool_field(path, &api_path, api_key, "proxyManaged")?;

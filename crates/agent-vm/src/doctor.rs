@@ -118,7 +118,7 @@ use crate::config::{
 };
 use crate::credential_provider::{CredentialProvider, ProviderSet};
 use crate::credential_resolver;
-use crate::credential_yaml::{AuthorizationSet, GuestEnvName, SourceKind};
+use crate::credential_yaml::{AuthorizationSet, GuestEnvName, SourceKind, SourceSelection};
 use crate::pi_credential_inspection::{PiCredentialReport, inspect_project};
 use crate::secret_store::{Availability, ServiceName};
 
@@ -644,7 +644,10 @@ struct YamlRow {
     /// uses the authorization *instead of* the host file rather than as a
     /// standalone credential.
     replaces_builtin: bool,
-    source: SourceKind,
+    /// The whole selection, not just its tag: the SecretSpec row prints the
+    /// pinned manifest/profile/scope/executable from it, and printing them is
+    /// all `doctor` does with them (it spawns and stats nothing).
+    source: SourceSelection,
     env_name: GuestEnvName,
 }
 
@@ -738,7 +741,7 @@ fn gather_launch_view(catalog: Option<&LaunchCatalog>) -> LaunchView {
             Some(YamlRow {
                 service: service.as_str().to_owned(),
                 replaces_builtin: CredentialProvider::from_config_name(service.as_str()).is_some(),
-                source: credential.source(),
+                source: credential.selection().clone(),
                 env_name: credential.env_name().clone(),
             })
         })
@@ -773,12 +776,31 @@ fn describe_launch_view(view: &LaunchView) -> String {
         .max()
         .unwrap_or(0);
     for row in &view.yaml {
-        let mut what = match row.source {
-            SourceKind::Keychain => "authorized for this launch".to_owned(),
-            SourceKind::Environment => format!(
+        let mut what = match &row.source {
+            SourceSelection::Keychain => "authorized for this launch".to_owned(),
+            SourceSelection::Environment => format!(
                 "authorized for this launch from the host environment (`{}`)",
                 row.env_name
             ),
+            // The labels are upstream-bounded and control-character-free, and
+            // the paths are escaped, so a `work/team` profile or a directory
+            // name with a newline still renders as one line. `reason` is
+            // deliberately absent: it is the one free-form field, and doctor
+            // has no use for it.
+            SourceSelection::Secretspec(selection) => {
+                let scope = selection
+                    .scope()
+                    .map(|scope| format!(", scope `{scope}`"))
+                    .unwrap_or_default();
+                format!(
+                    "authorized for this launch from SecretSpec (`{}`, profile `{}`{scope}, \
+                     manifest {}, executable {})",
+                    selection.name(),
+                    selection.profile(),
+                    crate::one_line::path(selection.manifest()),
+                    crate::one_line::path(selection.executable()),
+                )
+            }
         };
         if row.replaces_builtin {
             what.push_str(" (replaces the host built-in)");
@@ -788,16 +810,26 @@ fn describe_launch_view(view: &LaunchView) -> String {
     if view
         .yaml
         .iter()
-        .any(|row| row.source == SourceKind::Keychain)
+        .any(|row| row.source.kind() == SourceKind::Keychain)
     {
         out.push_str("note: values are not read here; `agent-vm secret ls` reports whether a value is stored.\n");
     }
     if view
         .yaml
         .iter()
-        .any(|row| row.source == SourceKind::Environment)
+        .any(|row| row.source.kind() == SourceKind::Environment)
     {
         out.push_str("note: environment values are read by the launch, not by doctor.\n");
+    }
+    if view
+        .yaml
+        .iter()
+        .any(|row| row.source.kind() == SourceKind::Secretspec)
+    {
+        out.push_str(
+            "note: SecretSpec values are resolved by the launch (`secretspec serve --read-only`), \
+             not by doctor.\n",
+        );
     }
     out.truncate(out.trim_end_matches('\n').len());
     out
@@ -2760,6 +2792,29 @@ credentials:
         assert_eq!(selection.unrequested, vec!["codex", "opencode", "copilot"]);
     }
 
+    /// A validated `secretspec:` selection, built through the real parser so a
+    /// doctor test cannot assert a row for a table the loader would refuse.
+    fn secretspec_selection(
+        manifest: &str,
+        scope: Option<&str>,
+    ) -> crate::credential_yaml::SourceSelection {
+        let mut table = serde_json::Map::new();
+        table.insert("executable".into(), "/opt/secretspec".into());
+        table.insert("manifest".into(), manifest.into());
+        table.insert("profile".into(), "work/team".into());
+        if let Some(scope) = scope {
+            table.insert("scope".into(), scope.into());
+        }
+        table.insert("name".into(), "DEEPSEEK_API_KEY".into());
+        crate::credential_yaml::SourceSelection::Secretspec(
+            crate::credential_secretspec::config::parse_table(
+                &table,
+                &GuestEnvName::parse("DEFAULT_KEY").unwrap(),
+            )
+            .expect("the fixture table validates"),
+        )
+    }
+
     #[test]
     fn describe_launch_view_names_each_requested_authorization_and_never_a_value() {
         let view = LaunchView {
@@ -2767,20 +2822,32 @@ credentials:
                 YamlRow {
                     service: "alpha".into(),
                     replaces_builtin: false,
-                    source: SourceKind::Keychain,
+                    source: SourceSelection::Keychain,
                     env_name: GuestEnvName::parse("ALPHA_KEY").unwrap(),
                 },
                 YamlRow {
                     service: "anthropic".into(),
                     replaces_builtin: true,
-                    source: SourceKind::Keychain,
+                    source: SourceSelection::Keychain,
                     env_name: GuestEnvName::parse("ANTHROPIC_API_KEY").unwrap(),
                 },
                 YamlRow {
                     service: "env".into(),
                     replaces_builtin: false,
-                    source: SourceKind::Environment,
+                    source: SourceSelection::Environment,
                     env_name: GuestEnvName::parse("MY_KEY").unwrap(),
+                },
+                YamlRow {
+                    service: "spec-scoped".into(),
+                    replaces_builtin: false,
+                    source: secretspec_selection("/home/u/secretspec.toml", Some("agent-vm")),
+                    env_name: GuestEnvName::parse("DEEPSEEK_API_KEY").unwrap(),
+                },
+                YamlRow {
+                    service: "spec".into(),
+                    replaces_builtin: false,
+                    source: secretspec_selection("/home/u/other.toml", None),
+                    env_name: GuestEnvName::parse("OTHER_KEY").unwrap(),
                 },
             ],
             ..LaunchView::default()
@@ -2788,32 +2855,98 @@ credentials:
 
         let text = describe_launch_view(&view);
 
+        // Rows are compared by their *text*, not their padding: the column
+        // width follows the longest service name, which is not the assertion.
+        let what = |service: &str| -> String {
+            text.lines()
+                .find(|line| {
+                    // Exact service prefix, so `spec` does not match `spec-scoped`.
+                    line.starts_with(service) && line[service.len()..].starts_with(' ')
+                })
+                .unwrap_or_else(|| panic!("no row for {service}: {text}"))
+                .trim_start_matches(service)
+                .trim_start()
+                .to_owned()
+        };
+
         assert!(
             text.starts_with("==> credentials.yaml (launch credentials)\n"),
             "{text}"
         );
-        assert!(
-            text.contains("alpha      authorized for this launch\n"),
-            "{text}"
+        assert_eq!(what("alpha"), "authorized for this launch");
+        assert_eq!(
+            what("anthropic"),
+            "authorized for this launch (replaces the host built-in)"
         );
-        assert!(
-            text.contains("anthropic  authorized for this launch (replaces the host built-in)"),
-            "{text}"
+        assert_eq!(
+            what("env"),
+            "authorized for this launch from the host environment (`MY_KEY`)"
+        );
+        // The scope form and the scope-free form, verbatim. `reason` is never
+        // printed: it is the one free-form field and doctor has no use for it.
+        assert_eq!(
+            what("spec-scoped"),
+            "authorized for this launch from SecretSpec (`DEEPSEEK_API_KEY`, profile \
+             `work/team`, scope `agent-vm`, manifest /home/u/secretspec.toml, executable \
+             /opt/secretspec)"
+        );
+        assert_eq!(
+            what("spec"),
+            "authorized for this launch from SecretSpec (`DEEPSEEK_API_KEY`, profile \
+             `work/team`, manifest /home/u/other.toml, executable /opt/secretspec)"
         );
         assert!(
             text.contains("`agent-vm secret ls` reports whether a value is stored"),
             "{text}"
         );
         assert!(
-            text.contains(
-                "env        authorized for this launch from the host environment (`MY_KEY`)"
-            ),
-            "{text}"
-        );
-        assert!(
             text.contains("environment values are read by the launch, not by doctor"),
             "{text}"
         );
+        assert!(
+            text.contains(
+                "note: SecretSpec values are resolved by the launch (`secretspec serve \
+                 --read-only`), not by doctor."
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("sk-CANARY"));
+        // One row per authorization, and one note per source kind present.
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("note: "))
+                .count(),
+            3
+        );
+    }
+
+    /// A `$HOME`-derived path and a user-typed scope both land in one line: the
+    /// manifest is escaped by `one_line::path`, the labels are refused at load
+    /// time if they contain a control character.
+    #[test]
+    fn a_secretspec_manifest_path_is_escaped_in_doctor() {
+        let view = LaunchView {
+            yaml: vec![YamlRow {
+                service: "spec".into(),
+                replaces_builtin: false,
+                source: secretspec_selection("/home/u/odd\nname/secretspec.toml", None),
+                env_name: GuestEnvName::parse("DEFAULT_KEY").unwrap(),
+            }],
+            ..LaunchView::default()
+        };
+        let text = describe_launch_view(&view);
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("spec "))
+                .count(),
+            1,
+            "the row must stay one line: {text}"
+        );
+        assert!(
+            text.contains("/home/u/odd\\x0aname/secretspec.toml"),
+            "{text}"
+        );
+        assert!(!text.contains("odd\nname"), "{text}");
     }
 
     #[test]

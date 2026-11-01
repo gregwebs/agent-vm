@@ -1058,7 +1058,7 @@ pub(crate) async fn launch(
     // `==> host credentials` notice, and nothing else - the tooling-layer build
     // and the session/guest-home provisioning already ran earlier.
     // The file was loaded and env values captured in main before children (#163).
-    let (launch_credentials, credential_source) =
+    let (launch_credentials, credential_source, credential_sessions) =
         credential_preflight.resolve(missing_credential_policy)?;
 
     // `provisioned` is the launch catalog's resolved closure (parameter).
@@ -1514,7 +1514,12 @@ pub(crate) async fn launch(
                 launch_credentials.resolver(source),
             )
         }
-        _ => Sandbox::create_with_pull_progress(config),
+        // Bound (not `_`) so an unused source is dropped here rather than held
+        // to the end of the session.
+        unused => {
+            drop(unused);
+            Sandbox::create_with_pull_progress(config)
+        }
     };
     let reference_label = label.is_redacted().then(|| label.text().to_string());
     let render_task = tokio::spawn(crate::pull_progress::render(progress, reference_label));
@@ -1525,6 +1530,17 @@ pub(crate) async fn launch(
         .await
         .context("create-with-pull-progress join")
         .and_then(|inner| inner.context("creating sandbox"));
+    // #202: phase 2 ended with `create`, so no SecretSpec session may outlive it
+    // (ADR-0055). Every `?` above drops the same guard, which closes them too.
+    //
+    // Untested in the boot-free harness, deliberately: there is no seam between
+    // this line and launch exit that a test could observe, so "closed when
+    // `create` returns" and "closed when the launch exits" are indistinguishable
+    // here. What the tests do assert is the narrower, observable claim — no
+    // session survives `create`'s own return path, and a read after close spawns
+    // nothing (`dropping_credential_sessions_closes_them`,
+    // `a_read_after_close_fails_without_spawning_and_close_is_idempotent`).
+    credential_sessions.close();
     crate::pull_progress::await_render(render_task).await;
     // The SDK has finished consuming the image cache. Release the barrier
     // before guest hooks, commands and the session: a long-running guest must

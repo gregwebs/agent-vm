@@ -70,7 +70,7 @@
 
 use std::{
     collections::BTreeMap,
-    io::Read,
+    io::{Read, Write as _},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     time::{Duration, Instant},
@@ -119,6 +119,8 @@ fn agent_vm_bin() -> PathBuf {
 mod acquisition_gate;
 #[path = "support/fake_msb.rs"]
 mod fake_msb;
+#[path = "support/fake_secretspec.rs"]
+mod fake_secretspec;
 #[path = "support/image_archive.rs"]
 mod image_archive;
 #[path = "support/oci_registry.rs"]
@@ -138,9 +140,25 @@ fn write_fake_msb(dir: &Path) -> PathBuf {
     fake_msb::install_pair(dir, fake_msb::Mode::LaunchSeam).path
 }
 
-fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Output {
+fn run_with_timeout(cmd: Command, timeout: Duration) -> Output {
+    run_with_input(cmd, None, timeout)
+}
+
+/// [`run_with_timeout`], plus optional bytes written to the child's stdin, which
+/// is then closed. One implementation, so the hang bound is the same whether or
+/// not a test speaks to its child; a caller that set its own stdin keeps it.
+fn run_with_input(mut cmd: Command, input: Option<&str>, timeout: Duration) -> Output {
+    if input.is_some() {
+        cmd.stdin(Stdio::piped());
+    }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("failed to spawn agent-vm");
+    if let Some(text) = input {
+        // Dropping the pipe closes the child's stdin, so an endpoint that reads
+        // to EOF terminates instead of waiting for a second frame.
+        let mut pipe = child.stdin.take().expect("piped stdin");
+        pipe.write_all(text.as_bytes()).expect("write the frame");
+    }
     let mut stdout_pipe = child.stdout.take().unwrap();
     let mut stderr_pipe = child.stderr.take().unwrap();
     let stdout_handle = std::thread::spawn(move || {
@@ -8342,6 +8360,23 @@ fn rendered_output(out: &Output) -> String {
     format!("{}{}", stdout_of(out), stderr_of(out))
 }
 
+/// The runtime's own disk images, skipped by **exact file name**.
+///
+/// A launch that reaches `create` leaves the sandbox's writable layer as a
+/// sparse ext4 image under `$AGENT_VM_STATE_DIR/msb-home/sandboxes/…` —
+/// measured here: `upper.ext4`, apparent size 17 GiB, seconds to read, and it is
+/// a hole in a fresh sandbox. agent-vm's credential path never writes to it: a
+/// value is at most 4096 bytes and travels to the proxy through a pipe, not a
+/// file. `rootfs.raw` and `disk.raw` are the SDK's flat-rootfs and
+/// disk-image-rootfs names.
+const RUNTIME_DISK_IMAGES: &[&str] = &["upper.ext4", "rootfs.raw", "disk.raw"];
+
+/// No file under `path` holds `canary`.
+///
+/// Only [`RUNTIME_DISK_IMAGES`] is skipped, and only by name: a size cap would
+/// silently skip exactly the file a bug would have to write, and the sweep is
+/// called at ten sites including pre-#202 ones, so weakening it weakens evidence
+/// this branch did not write.
 fn assert_no_canary_files(path: &Path, canary: &str) {
     if !path.exists() {
         return;
@@ -8351,6 +8386,12 @@ fn assert_no_canary_files(path: &Path, canary: &str) {
         if entry.file_type().unwrap().is_dir() {
             assert_no_canary_files(&entry.path(), canary);
         } else if entry.file_type().unwrap().is_file() {
+            if RUNTIME_DISK_IMAGES
+                .iter()
+                .any(|image| entry.file_name() == *image)
+            {
+                continue;
+            }
             assert!(
                 !std::fs::read(entry.path())
                     .unwrap()
@@ -8360,6 +8401,32 @@ fn assert_no_canary_files(path: &Path, canary: &str) {
             );
         }
     }
+}
+
+/// The sweep's control: a file far larger than the old 8 MiB cap, and not a disk
+/// image, must still be searched. The cap made the sweep skip it.
+#[test]
+#[should_panic(expected = "canary in durable file")]
+fn the_canary_sweep_reads_files_larger_than_any_size_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let canary = "sk-CANARY-202-sweep-control";
+    let mut bytes = vec![b'x'; 9 * 1024 * 1024];
+    bytes.extend_from_slice(canary.as_bytes());
+    std::fs::write(dir.path().join("not-a-disk-image.bin"), &bytes).unwrap();
+    assert_no_canary_files(dir.path(), canary);
+}
+
+/// And the opposite control: the one skip is the runtime's own image, by name.
+#[test]
+fn the_canary_sweep_skips_only_the_runtimes_own_images() {
+    let dir = tempfile::tempdir().unwrap();
+    let canary = "sk-CANARY-202-sweep-image";
+    for image in RUNTIME_DISK_IMAGES {
+        let mut bytes = vec![0u8; 9 * 1024 * 1024];
+        bytes.extend_from_slice(canary.as_bytes());
+        std::fs::write(dir.path().join(image), &bytes).unwrap();
+    }
+    assert_no_canary_files(dir.path(), canary);
 }
 
 #[test]
@@ -8652,11 +8719,13 @@ fn a_requested_keychain_authorization_does_not_capture_its_host_variable() {
 #[test]
 fn the_override_does_not_bypass_an_unknown_source() {
     let h = env_harness(false, true);
+    // `keychain` became a valid spelling in #202, so the unknown source has to be
+    // one that is not accepted in any form; the message now lists all three.
     write_credentials(
         &h.home_root,
-        &env_yaml(false, true).replace("source: env", "source: keychain"),
+        &env_yaml(false, true).replace("source: env", "source: vault"),
     );
-    assert_the_override_does_not_bypass(&h, "t", &[], "`source` must be `env`");
+    assert_the_override_does_not_bypass(&h, "t", &[], "`source` must be `keychain`");
 }
 
 #[test]
@@ -12130,4 +12199,1097 @@ fn top_level_state(harness: &Harness) -> Vec<std::ffi::OsString> {
         .unwrap_or_default();
     names.sort();
     names
+}
+
+// ---------------------------------------------------------------------------
+// #202: `source: secretspec`, end to end through the compiled CLI
+// ---------------------------------------------------------------------------
+//
+// Every test here runs the real binary against the debug-only fake endpoint
+// (`fake::serve_if_requested`), which speaks real `secretspec.resolver/1` frames
+// and returns only bytes the test wrote into its scenario. Phase 2 is reached
+// through `Harness::use_launch_runtime()`: the SDK's launch-contract probe runs
+// *before* the credential resolver, so a shell fixture would fail contract
+// discovery and never read a second time.
+
+const SECRETSPEC_TOOL: &str =
+    "[[tools]]\nname = \"t\"\ncommand = \"t\"\ncredentials = [\"my-service\"]\n";
+
+/// A warmed harness with a `source: secretspec` authorization for `my-service`,
+/// the fake endpoint as its executable, and a real launch runtime.
+fn secretspec_harness(extra: &[&str]) -> Harness {
+    let mut h = Harness::warm();
+    h.write_user(SECRETSPEC_TOOL);
+    let manifest = h.project_root.join("secretspec.toml");
+    write(
+        &manifest,
+        &fake_secretspec::manifest_with_env_provider("MY_SERVICE_KEY"),
+    );
+    write_credentials(
+        &h.home_root,
+        &fake_secretspec::secretspec_yaml(
+            "my-service",
+            "MY_SERVICE_KEY",
+            &agent_vm_bin(),
+            &manifest,
+            extra,
+        ),
+    );
+    h.use_launch_runtime();
+    h
+}
+
+/// The scenario's directory: the harness home, so a test's transcript sits beside
+/// the state it is swept for canaries.
+fn scenario_in(
+    home_root: &Path,
+    name: &str,
+    scenario: serde_json::Value,
+) -> fake_secretspec::Scenario {
+    fake_secretspec::write_scenario(home_root, name, scenario)
+}
+
+#[test]
+fn a_secretspec_sourced_credential_is_registered_and_its_value_reaches_no_guest_file_output_or_child()
+ {
+    let h = secretspec_harness(&[]);
+    let canary = "sk-CANARY-202-e1";
+    // The canary exists only in the fake's scenario: never in the launch
+    // environment, so the sweep below is unconditional.
+    let scenario = scenario_in(
+        &h.home_root,
+        "e1",
+        serde_json::json!({"secrets": {"MY_SERVICE_KEY": {"value": canary}}}),
+    );
+    let out = h.launch_with_env(
+        "t",
+        &["--root"],
+        &[(fake_secretspec::FAKE_ENV, scenario.path.to_str().unwrap())],
+    );
+    let rendered = rendered_output(&out);
+    // The fixture runtime intentionally fails (93), which is evidence the launch
+    // reached it rather than an invitation to assert success.
+    assert!(!out.status.success(), "{rendered}");
+    assert!(
+        h.msb_log().lines().any(|line| line.starts_with("machine")),
+        "the launch never reached the runtime: {rendered}"
+    );
+    let config = debug_config_json(&stderr_of(&out));
+    let def = &config["network"]["secrets"]["header_credentials"][0];
+    assert_eq!(def["reference"], "my-service");
+    assert_eq!(def["origin"]["host"], "api.my-service.example");
+    assert_eq!(def["header"], "authorization");
+    assert!(env_pairs(&config).contains(&("MY_SERVICE_KEY", "proxy-managed")));
+    // AC1's sweep: no canary in any output, durable file, or child argv/env.
+    assert!(
+        !rendered.contains(canary),
+        "a value reached agent-vm's own output"
+    );
+    assert_no_canary_files(&h.state_root, canary);
+    let state = state_dir(&stderr_of(&out));
+    assert_no_canary_files(
+        &PathBuf::from(format!("{}.secrets", state.display())),
+        canary,
+    );
+    assert!(!h.msb_log().contains(canary));
+    assert!(!h.msb_environ().contains(canary));
+    // The transcript is value-free by construction and the fake never recorded a
+    // frame that breaks the protocol.
+    assert!(fake_secretspec::violations(&scenario).is_empty());
+    assert!(
+        !std::fs::read_to_string(&scenario.transcript)
+            .unwrap_or_default()
+            .contains(canary)
+    );
+}
+
+/// The authorization file for the harness's project, with the fake endpoint as
+/// the executable. `required` adds the entry-level policy.
+fn write_secretspec_credentials(
+    h: &Harness,
+    executable: &Path,
+    table_extra: &[&str],
+    required: bool,
+) {
+    let manifest = h.project_root.join("secretspec.toml");
+    write(
+        &manifest,
+        &fake_secretspec::manifest_with_env_provider("MY_SERVICE_KEY"),
+    );
+    let body = fake_secretspec::secretspec_yaml(
+        "my-service",
+        "MY_SERVICE_KEY",
+        executable,
+        &manifest,
+        table_extra,
+    );
+    let body = if required {
+        body.replace(
+            "    source: secretspec\n",
+            "    source: secretspec\n    required: true\n",
+        )
+    } else {
+        body
+    };
+    write_credentials(&h.home_root, &body);
+}
+
+fn fake_env(scenario: &fake_secretspec::Scenario) -> Vec<(&str, &str)> {
+    vec![(
+        fake_secretspec::FAKE_ENV,
+        scenario.path.to_str().expect("a UTF-8 scenario path"),
+    )]
+}
+
+/// The launch reached the runtime: the fixture exits 93 on a real `machine`
+/// invocation, so "failed" plus a `machine ` line is success here.
+fn assert_reached_runtime(h: &Harness, out: &Output) {
+    let rendered = rendered_output(out);
+    assert!(!out.status.success(), "{rendered}");
+    assert!(
+        h.msb_log().lines().any(|line| line.starts_with("machine")),
+        "the launch never reached the runtime: {rendered}"
+    );
+}
+
+#[test]
+fn one_service_with_one_rule_reads_exactly_twice_and_n_rules_reads_one_plus_n() {
+    // One service, one rule: phase 1 plus one rule is two reads, and the
+    // transcript ends with `rpc.shutdown` even though `create` failed (93),
+    // because the launch closes its sessions after `task.await` on both
+    // outcomes.
+    let h = secretspec_harness(&[]);
+    let scenario = scenario_in(
+        &h.home_root,
+        "e1b-one",
+        serde_json::json!({"secrets": {"MY_SERVICE_KEY": {"value": "sk-value"}}}),
+    );
+    let out = h.launch_with_env("t", &["--root"], &fake_env(&scenario));
+    assert_reached_runtime(&h, &out);
+    assert_eq!(
+        fake_secretspec::requests(&scenario, "rpc.initialize").len(),
+        1
+    );
+    assert_eq!(
+        fake_secretspec::requests(&scenario, "resolver.get").len(),
+        2
+    );
+    // The close is asserted from the *request* events, not from the transcript's
+    // final line: the fake's own `exit` record is written after agent-vm has
+    // already returned, so reading it here raced the child (the race was lost
+    // under a loaded host, while every fact this test is about was already on
+    // disk). "One shutdown, after the last read" is the claim: a launch that
+    // skipped close on the failure path would still show two gets and no
+    // shutdown.
+    let events = fake_secretspec::transcript(&scenario);
+    let shutdowns: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event["event"] == "request" && event["method"] == "rpc.shutdown")
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(shutdowns.len(), 1, "{events:?}");
+    let last_get = events
+        .iter()
+        .rposition(|event| event["event"] == "request" && event["method"] == "resolver.get")
+        .expect("the two gets above");
+    assert!(
+        shutdowns[0] > last_get,
+        "`rpc.shutdown` must follow the last read: {events:?}"
+    );
+
+    // One service with three rules: one phase-1 read plus three phase-2 reads.
+    let h = secretspec_harness_with_rules(3);
+    let scenario = scenario_in(
+        &h.home_root,
+        "e1b-three",
+        serde_json::json!({"secrets": {"MY_SERVICE_KEY": {"value": "sk-value"}}}),
+    );
+    let out = h.launch_with_env("t", &["--root"], &fake_env(&scenario));
+    assert_reached_runtime(&h, &out);
+    assert_eq!(
+        fake_secretspec::requests(&scenario, "resolver.get").len(),
+        4
+    );
+    assert_eq!(
+        fake_secretspec::requests(&scenario, "rpc.initialize").len(),
+        1
+    );
+    assert_eq!(
+        fake_secretspec::requests(&scenario, "rpc.shutdown").len(),
+        1
+    );
+}
+
+/// The same harness with `rules` injection rules on the one credential.
+fn secretspec_harness_with_rules(rules: usize) -> Harness {
+    let mut h = Harness::warm();
+    h.write_user(SECRETSPEC_TOOL);
+    let manifest = h.project_root.join("secretspec.toml");
+    write(
+        &manifest,
+        &fake_secretspec::manifest_with_env_provider("MY_SERVICE_KEY"),
+    );
+    let inject: Vec<String> = (0..rules)
+        .map(|index| format!("{{domain: api{index}.my-service.example, scheme: bearer}}"))
+        .collect();
+    write_credentials(
+        &h.home_root,
+        &format!(
+            "credentials:\n  - service: my-service\n    source: secretspec\n    apiKey:\n      \
+             name: MY_SERVICE_KEY\n      sentinelEnv: true\n      inject: [{}]\n    secretspec:\n      \
+             executable: {}\n      manifest: {}\n      profile: default\n",
+            inject.join(", "),
+            agent_vm_bin().display(),
+            manifest.display()
+        ),
+    );
+    h.use_launch_runtime();
+    h
+}
+
+#[test]
+fn an_unavailable_required_secretspec_source_fails_before_the_image_stage() {
+    let h = secretspec_harness(&[]);
+    write_secretspec_credentials(&h, &agent_vm_bin(), &[], true);
+    let scenario = scenario_in(
+        &h.home_root,
+        "e2",
+        serde_json::json!({"secrets": {"MY_SERVICE_KEY": "missing"}}),
+    );
+    let mut envs = fake_env(&scenario);
+    // The keychain seam must not rescue a SecretSpec read: this is the same
+    // service name.
+    let canary = "sk-CANARY-202-e2-keychain";
+    let credential = format!("my-service={canary}");
+    envs.push(("AGENT_VM_TEST_CREDENTIAL", credential.as_str()));
+    let out = h.launch_with_env("t", &[], &envs);
+    let rendered = rendered_output(&out);
+    assert!(!out.status.success(), "{rendered}");
+    assert!(
+        rendered.contains("SecretSpec has no value for `MY_SERVICE_KEY`"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("my-service"), "{rendered}");
+    assert!(!rendered.contains(canary), "{rendered}");
+    // Before the image stage: no runtime and no config dump.
+    assert!(!rendered.contains(CONFIG_MARKER), "{rendered}");
+    assert!(!h.saw_capability_probe(), "{rendered}");
+    assert!(h.msb_log().lines().all(|line| line == "--version"));
+}
+
+/// AC3's second `required: true` case. `undeclared` maps to `Missing` (§1.4), so
+/// a required service must fail before the image stage exactly as `missing`
+/// does, naming the service and SecretSpec.
+#[test]
+fn a_required_undeclared_secretspec_source_fails_before_the_image_stage() {
+    let h = secretspec_harness(&[]);
+    write_secretspec_credentials(&h, &agent_vm_bin(), &[], true);
+    let scenario = scenario_in(
+        &h.home_root,
+        "e2b",
+        serde_json::json!({"secrets": {"MY_SERVICE_KEY": "undeclared"}}),
+    );
+    let out = h.launch_with_env("t", &[], &fake_env(&scenario));
+    let rendered = rendered_output(&out);
+    assert!(!out.status.success(), "{rendered}");
+    assert!(
+        rendered.contains("SecretSpec has no value for `MY_SERVICE_KEY`"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("my-service"), "{rendered}");
+    // Before the image stage: no runtime and no config dump.
+    assert!(!rendered.contains(CONFIG_MARKER), "{rendered}");
+    assert!(!h.saw_capability_probe(), "{rendered}");
+    assert!(h.msb_log().lines().all(|line| line == "--version"));
+}
+
+#[test]
+fn an_unavailable_optional_secretspec_source_warns_and_proceeds() {
+    let h = secretspec_harness(&[]);
+    let scenario = scenario_in(
+        &h.home_root,
+        "e3",
+        serde_json::json!({"secrets": {"MY_SERVICE_KEY": "undeclared"}}),
+    );
+    let out = h.launch_with_env("t", &["--root"], &fake_env(&scenario));
+    let rendered = rendered_output(&out);
+    assert!(
+        rendered.contains("SecretSpec has no value for `MY_SERVICE_KEY`"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("; continuing without it"), "{rendered}");
+    assert_reached_runtime(&h, &out);
+}
+
+#[test]
+fn a_failed_prompt_refusal_is_one_start_and_one_read() {
+    // The wired half of the retry defect: the fake sends `client.prompt` and then
+    // closes, so the client's *refusal* of it is the write that fails. That is a
+    // session lost mid-request, so the resolve is not re-sent — one child, one
+    // `resolver.get` — and the launch continues without the optional credential.
+    let h = secretspec_harness(&[]);
+    let scenario = scenario_in(
+        &h.home_root,
+        "e3b-prompt",
+        serde_json::json!({"secrets": {"MY_SERVICE_KEY": "prompt_then_close_input"}}),
+    );
+    let out = h.launch_with_env("t", &["--root"], &fake_env(&scenario));
+    let rendered = rendered_output(&out);
+    assert!(rendered.contains("; continuing without it"), "{rendered}");
+    assert_eq!(
+        fake_secretspec::events(&scenario, "start").len(),
+        1,
+        "a request that was accepted must not be re-sent"
+    );
+    assert_eq!(
+        fake_secretspec::requests(&scenario, "resolver.get").len(),
+        1
+    );
+    assert_reached_runtime(&h, &out);
+}
+
+#[test]
+fn the_override_rescues_a_required_secretspec_source() {
+    let h = secretspec_harness(&[]);
+    write_secretspec_credentials(&h, &agent_vm_bin(), &[], true);
+    let scenario = scenario_in(
+        &h.home_root,
+        "e4",
+        serde_json::json!({"secrets": {"MY_SERVICE_KEY": "missing"}}),
+    );
+    let out = h.launch_with_env(
+        "t",
+        &["--root", "--allow-missing-credentials"],
+        &fake_env(&scenario),
+    );
+    let rendered = rendered_output(&out);
+    assert!(
+        rendered.contains("; continuing without it because --allow-missing-credentials was passed"),
+        "{rendered}"
+    );
+    assert_reached_runtime(&h, &out);
+}
+
+#[test]
+fn secretspec_startup_failures_name_the_fix() {
+    // The executable is absent: no child, no transcript.
+    let h = secretspec_harness(&[]);
+    write_secretspec_credentials(&h, Path::new("/nonexistent/secretspec"), &[], false);
+    let scenario = scenario_in(&h.home_root, "e5-absent", serde_json::json!({}));
+    let out = h.launch_with_env("t", &[], &fake_env(&scenario));
+    let rendered = rendered_output(&out);
+    assert!(
+        rendered.contains("`secretspec.executable` does not exist or is not an executable file"),
+        "{rendered}"
+    );
+    assert!(fake_secretspec::transcript(&scenario).is_empty());
+
+    // Each handshake failure names its own fix and, for the gate failures, sends
+    // no `resolver.get` at all. The last field is "the child had already exited,
+    // so its transcript cannot record a get" — every other case asserts the
+    // refusal happened **before** the first read.
+    let cases: [(&str, serde_json::Value, &str, bool); 8] = [
+        (
+            "e5-hang",
+            serde_json::json!({"handshake": "hang"}),
+            "did not complete its handshake within 5 seconds",
+            false,
+        ),
+        (
+            "e5-exit",
+            serde_json::json!({"handshake": {"exit": {"code": 2}}}),
+            "needs SecretSpec 0.21 or newer",
+            true,
+        ),
+        (
+            "e5-version",
+            serde_json::json!({"handshake": {"error": {"kind": "unsupported_version"}}}),
+            "does not speak `secretspec.resolver` version 1",
+            false,
+        ),
+        (
+            "e5-v2",
+            serde_json::json!({"handshake": {"version": {"protocol": "secretspec.resolver", "version": 2}}}),
+            "does not speak `secretspec.resolver` version 1",
+            false,
+        ),
+        (
+            "e5-norelease",
+            serde_json::json!({"handshake": "no_release"}),
+            "mandatory `resolver.get` and `resolver.release`",
+            false,
+        ),
+        (
+            "e5-limits",
+            serde_json::json!({"handshake": {"limits": {"max_frame_bytes": 4095, "max_in_flight": 1}}}),
+            "sent a frame that does not follow `secretspec.resolver/1`",
+            false,
+        ),
+        (
+            "e5-nolimits",
+            serde_json::json!({"handshake": "no_limits"}),
+            "sent a frame that does not follow `secretspec.resolver/1`",
+            false,
+        ),
+        (
+            "e5-writable",
+            serde_json::json!({"handshake": "writable"}),
+            "offered write methods",
+            false,
+        ),
+    ];
+    for (name, scenario_value, fragment, may_have_reached_child) in cases {
+        let h = secretspec_harness(&[]);
+        let scenario = scenario_in(&h.home_root, name, scenario_value);
+        let out = h.launch_with_env("t", &[], &fake_env(&scenario));
+        let rendered = rendered_output(&out);
+        assert!(!out.status.success(), "{name}: {rendered}");
+        assert!(rendered.contains(fragment), "{name}: {rendered}");
+        if !may_have_reached_child {
+            assert!(
+                fake_secretspec::requests(&scenario, "resolver.get").is_empty(),
+                "{name}: a get was sent after a refused gate"
+            );
+        }
+    }
+}
+
+#[test]
+fn unsupported_secretspec_features_are_refused_not_approximated() {
+    for (name, answer, fragment) in [
+        (
+            "e6-aspth",
+            serde_json::json!({"secrets": {"MY_SERVICE_KEY": "as_path"}}),
+            "uses `as_path`",
+        ),
+        (
+            "e6-prompt",
+            serde_json::json!({"secrets": {"MY_SERVICE_KEY": "prompt"}}),
+            "would have to be generated or prompted for",
+        ),
+        (
+            "e6-generated",
+            serde_json::json!({"secrets": {"MY_SERVICE_KEY": "generated"}}),
+            "does not follow `secretspec.resolver/1`",
+        ),
+        (
+            "e6-failed",
+            serde_json::json!({"secrets": {"MY_SERVICE_KEY": {"error": {"kind": "operation_failed"}}}}),
+            "provider could not resolve the secret",
+        ),
+        (
+            "e6-binary",
+            serde_json::json!({"secrets": {"MY_SERVICE_KEY": "binary"}}),
+            "provider could not resolve the secret",
+        ),
+    ] {
+        let h = secretspec_harness(&[]);
+        let scenario = scenario_in(&h.home_root, name, answer);
+        let out = h.launch_with_env("t", &[], &fake_env(&scenario));
+        let rendered = rendered_output(&out);
+        // Every one of these is an *availability* outcome per the issue's
+        // mapping, so an optional credential warns and the launch proceeds; what
+        // must never happen is the launch pretending the value exists.
+        assert!(rendered.contains(fragment), "{name}: {rendered}");
+        assert!(
+            rendered.contains("; continuing without it"),
+            "{name}: {rendered}"
+        );
+        assert!(
+            !rendered.contains("sk-CANARY-202-e6"),
+            "{name}: a value surfaced"
+        );
+        assert!(
+            rendered.contains(CONFIG_MARKER),
+            "{name}: the launch must proceed"
+        );
+    }
+}
+
+#[test]
+fn a_rejected_secretspec_value_is_a_hard_error_even_with_the_override() {
+    let canary = " sk-CANARY-202-e7";
+    for extra in [&[][..], &["--allow-missing-credentials"][..]] {
+        let h = secretspec_harness(&[]);
+        let scenario = scenario_in(
+            &h.home_root,
+            "e7",
+            serde_json::json!({"secrets": {"MY_SERVICE_KEY": {"value": canary}}}),
+        );
+        let out = h.launch_with_env("t", extra, &fake_env(&scenario));
+        let rendered = rendered_output(&out);
+        assert!(!out.status.success(), "{rendered}");
+        assert!(
+            rendered.contains("cannot be used: a leading or trailing space"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Fix it in SecretSpec"), "{rendered}");
+        assert!(
+            !rendered.contains("sk-CANARY-202-e7"),
+            "a value reached agent-vm's own output"
+        );
+        assert!(!rendered.contains(CONFIG_MARKER), "{rendered}");
+    }
+}
+
+#[test]
+fn an_unrequested_secretspec_authorization_spawns_nothing() {
+    let h = secretspec_harness(&[]);
+    // The tool requests a *different* service, which is unauthorized: the launch
+    // fails on that (not on SecretSpec) and the SecretSpec entry stays inert.
+    h.write_user("[[tools]]\nname = \"t\"\ncommand = \"t\"\ncredentials = [\"other-service\"]\n");
+    let scenario = scenario_in(
+        &h.home_root,
+        "e8",
+        serde_json::json!({"secrets": {"MY_SERVICE_KEY": {"value": "sk-value"}}}),
+    );
+    let out = h.launch_with_env("t", &[], &fake_env(&scenario));
+    let rendered = rendered_output(&out);
+    assert!(!out.status.success(), "{rendered}");
+    assert!(rendered.contains("other-service"), "{rendered}");
+    assert!(
+        !scenario.transcript.exists(),
+        "an unrequested authorization must not spawn a child"
+    );
+}
+
+#[test]
+fn a_project_cannot_redirect_the_secretspec_source() {
+    let h = secretspec_harness(&[]);
+    // The configured manifest lives **outside** the project, so the project-dir
+    // `secretspec.toml` below is a distinguishable decoy rather than the very
+    // file that was configured: an assertion on a path both spellings share
+    // would pass whichever one the child was handed.
+    let configured = h.home_root.join("agent-vm-secretspec.toml");
+    write(
+        &configured,
+        &fake_secretspec::manifest_with_env_provider("MY_SERVICE_KEY"),
+    );
+    write_credentials(
+        &h.home_root,
+        &fake_secretspec::secretspec_yaml(
+            "my-service",
+            "MY_SERVICE_KEY",
+            &agent_vm_bin(),
+            &configured,
+            &[],
+        ),
+    );
+    // A project config that tries to select the credential, a project-dir
+    // manifest, a decoy executable first on PATH and in the project dir, and
+    // SecretSpec's own navigation variables in the host environment.
+    h.write_project("[[tools]]\nname = \"t\"\ncommand = \"t\"\ncredentials = [\"my-service\"]\n");
+    let decoy = h.project_root.join("secretspec");
+    write(&decoy, "#!/bin/sh\ntouch \"$0.decoy-ran\"\nexit 0\n");
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write(
+        &h.project_root.join("secretspec.toml"),
+        "[project]\nname = \"decoy\"\n",
+    );
+    let scenario = scenario_in(
+        &h.home_root,
+        "e9",
+        serde_json::json!({"secrets": {"MY_SERVICE_KEY": {"value": "sk-value"}}}),
+    );
+    let mut envs = fake_env(&scenario);
+    envs.push(("SECRETSPEC_FILE", "/tmp/decoy.toml"));
+    envs.push(("SECRETSPEC_PROVIDER", "env"));
+    // The decoy really is first on `PATH`: without this, the assertion below
+    // ("the decoy never ran") would pass on a launch whose `PATH` never
+    // contained it, and story 13's claim would rest on nothing.
+    let decoys = decoys_path(&h.project_root);
+    envs.push(("PATH", decoys.as_str()));
+    let out = h.launch_with_env("t", &["--root"], &envs);
+    assert_reached_runtime(&h, &out);
+    let starts = fake_secretspec::events(&scenario, "start");
+    assert_eq!(starts.len(), 1, "one child, the configured one");
+    // The argv/cwd/environment the child actually got.
+    assert_eq!(
+        starts[0]["argv"],
+        serde_json::json!(["serve", "--read-only"])
+    );
+    assert_eq!(
+        starts[0]["secretspec_env"],
+        serde_json::json!([]),
+        "SECRETSPEC_* is stripped from the child"
+    );
+    // The configured manifest (the user's own path), never the project's
+    // `secretspec.toml`, and the pinned profile and provider.
+    let initialize = fake_secretspec::requests(&scenario, "rpc.initialize");
+    assert_eq!(initialize.len(), 1, "one initialize per session");
+    assert_eq!(
+        initialize[0]["params"]["application"]["manifest"]["path"],
+        serde_json::json!(configured.display().to_string()),
+        "the child must be handed the configured manifest, not the project's"
+    );
+    assert_eq!(
+        initialize[0]["params"]["application"]["profile"],
+        serde_json::json!("default")
+    );
+    assert_eq!(
+        initialize[0]["params"]["application"]["provider"],
+        serde_json::Value::Null
+    );
+    assert!(!decoy.with_extension("decoy-ran").exists());
+    assert!(!h.project_root.join("secretspec.decoy-ran").exists());
+}
+
+#[test]
+fn a_secretspec_leader_that_exits_between_phases_is_restarted_for_phase_two() {
+    let h = secretspec_harness(&[]);
+    let gate = h.home_root.join("e10-gate");
+    let scenario = scenario_in(
+        &h.home_root,
+        "e10",
+        serde_json::json!({
+            "secrets": {"MY_SERVICE_KEY": {"value": "sk-value"}},
+            // The leader exits after phase 1's read, leaving phase 2 to restart.
+            "exit_after_gets": 1,
+            "gate": gate,
+        }),
+    );
+    let mut cmd = h.base_command();
+    for (key, value) in fake_env(&scenario) {
+        cmd.env(key, value);
+    }
+    // `--image BOGUS_IMAGE`, the override `launch_with_env` adds: without it the
+    // launch falls through to the default tier and spends ~57 s of its 60 s bugdet
+    // in `pull_policy: always` acquisition — real network acquisition, nothing to
+    // do with SecretSpec, and the reason this test was the slowest one here.
+    cmd.args(["--image", BOGUS_IMAGE]);
+    cmd.args(["--root"]).arg("t");
+    // A real barrier: the first get is held until this file exists, so "phase 1
+    // is done" is observed rather than guessed. The opener runs on its own thread
+    // so the launch itself stays inside one bound.
+    let transcript = scenario.transcript.clone();
+    let gate_path = gate.clone();
+    let opener = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !std::fs::read_to_string(&transcript)
+            .unwrap_or_default()
+            .contains("\"resolver.get\"")
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        write(&gate_path, "go");
+    });
+    let out = run_with_timeout(cmd, Duration::from_secs(30));
+    opener.join().expect("the gate opener finished");
+    assert!(!out.status.success(), "the fixture runtime fails by design");
+    // AC8: two children, and the launch reached the runtime through the second.
+    assert_eq!(
+        fake_secretspec::requests(&scenario, "rpc.initialize").len(),
+        2,
+        "{:?}",
+        fake_secretspec::transcript(&scenario)
+    );
+    assert_eq!(fake_secretspec::events(&scenario, "start").len(), 2);
+    assert!(
+        h.msb_log().lines().any(|line| line.starts_with("machine")),
+        "phase 2 never reached the runtime"
+    );
+}
+
+#[test]
+fn a_duplicate_source_or_secretspec_key_is_refused_by_the_black_box() {
+    let h = secretspec_harness(&[]);
+    let manifest = h.project_root.join("secretspec.toml");
+    write(
+        &manifest,
+        &fake_secretspec::manifest_with_env_provider("MY_SERVICE_KEY"),
+    );
+    let base = fake_secretspec::secretspec_yaml(
+        "my-service",
+        "MY_SERVICE_KEY",
+        &agent_vm_bin(),
+        &manifest,
+        &[],
+    );
+    let duplicates = [
+        base.replace(
+            "    source: secretspec\n",
+            "    source: secretspec\n    source: env\n",
+        ),
+        base.replace(
+            "      profile: default\n",
+            "      profile: default\n      profile: other\n",
+        ),
+    ];
+    let scenario = scenario_in(&h.home_root, "e14", serde_json::json!({}));
+    for body in duplicates {
+        write_credentials(&h.home_root, &body);
+        for extra in [&[][..], &["--allow-missing-credentials"][..]] {
+            let out = h.launch_with_env("t", extra, &fake_env(&scenario));
+            let rendered = rendered_output(&out);
+            assert!(!out.status.success(), "{rendered}");
+            assert!(
+                rendered.contains("not valid YAML for this schema"),
+                "{rendered}"
+            );
+            assert!(!rendered.contains(CONFIG_MARKER), "{rendered}");
+        }
+    }
+}
+
+#[test]
+fn an_env_provider_value_from_the_launch_environment_is_ambient_input() {
+    // The provider's own input variable is set in the *launch* environment. The
+    // resolved value must reach no guest file, config dump, argv or agent-vm
+    // output — while the variable itself is legitimately inherited by every
+    // child of the launch, because it is that provider's input. This test exists
+    // to keep E1's unconditional sweep honest about which half is guaranteed:
+    // agent-vm never *newly assigns* a value to a child's environment, and it
+    // does not scrub ambient host variables it was itself started with
+    // (ADR-0055, USAGE "trusted input").
+    let h = secretspec_harness(&[]);
+    let canary = "sk-CANARY-202-e15-provider";
+    let scenario = scenario_in(
+        &h.home_root,
+        "e15",
+        serde_json::json!({"secrets": {"MY_SERVICE_KEY": {"value": canary}}}),
+    );
+    let mut envs = fake_env(&scenario);
+    envs.push(("MY_SERVICE_KEY_PROVIDER_INPUT", canary));
+    let out = h.launch_with_env("t", &["--root"], &envs);
+    let rendered = rendered_output(&out);
+    assert_reached_runtime(&h, &out);
+    assert!(
+        !rendered.contains(canary),
+        "a value reached agent-vm's own output"
+    );
+    assert!(!h.msb_log().contains(canary), "a value reached an argv");
+    assert_no_canary_files(&h.state_root, canary);
+    // The deliberate positive half: an ambient host variable is passed through to
+    // the launch's children, exactly as a hand-run `secretspec` would see it. It
+    // is asserted, not tolerated, so nobody can read this test as "agent-vm
+    // scrubs it" — the guarantee is about values it *emits*, and about the
+    // authorization, not about the operator's own environment.
+    let provider_input_inherited = h
+        .msb_environ()
+        .lines()
+        .any(|line| line == format!("MY_SERVICE_KEY_PROVIDER_INPUT={canary}"));
+    assert!(
+        provider_input_inherited,
+        "the provider's named input variable must be inherited by the launch's children"
+    );
+}
+
+/// E13, in three arms, because a plain CLI verb does not discriminate: the fake
+/// activates only for exactly `serve --read-only`, so a *release* binary with a
+/// hook still compiled in would pass a `doctor` check.
+///
+/// The arms are mutually exclusive by profile, because the evidence each can
+/// produce depends on which binary `CARGO_BIN_EXE_agent-vm` points at: a debug
+/// run can only show that the seam *does* activate (arm c), and a release run can
+/// only show that it does *not* (arms a and b). Neither arm is skipped silently —
+/// whichever profile runs, this test asserts the seam's behaviour for it, and the
+/// `--release` run (§5.3) is the one that is release evidence. `cargo check
+/// --release` neither run nor evidence.
+#[test]
+fn a_release_binary_ignores_the_fake_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    let scenario = fake_secretspec::write_scenario(
+        dir.path(),
+        "e13",
+        serde_json::json!({"secrets": {"MY_SERVICE_KEY": {"value": "sk-CANARY-202-e13"}}}),
+    );
+    let binary = agent_vm_bin();
+    // `env_clear` first: it clears explicitly added variables too, so setting the
+    // fake's variable before it would silently unset it and make the negative
+    // control vacuous (the arm would pass because the fixture never activates,
+    // not because a release build ignores it).
+    let activation = |binary: &Path| {
+        let mut cmd = std::process::Command::new(binary);
+        cmd.args(["serve", "--read-only"])
+            .env_clear()
+            .env(fake_secretspec::FAKE_ENV, &scenario.path)
+            .stdin(std::process::Stdio::null());
+        run_with_timeout(cmd, Duration::from_secs(20))
+    };
+
+    if !cfg!(debug_assertions) {
+        // (a) The release binary must treat `serve --read-only` as the real CLI
+        // does: rejected by clap, no transcript, no NDJSON on stdout.
+        let release = activation(&binary);
+        let stdout = stdout_of(&release);
+        assert!(
+            !stdout.starts_with("{\"jsonrpc\""),
+            "a release binary answered a protocol frame: {stdout}"
+        );
+        assert!(
+            !scenario.transcript.exists(),
+            "a release binary activated the fake endpoint"
+        );
+        assert!(
+            !release.status.success(),
+            "a release binary accepted `serve --read-only` as a verb"
+        );
+        assert!(
+            stderr_of(&release).contains("unrecognized subcommand"),
+            "the real CLI must reject the argv, not fail for another reason: {}",
+            stderr_of(&release)
+        );
+        assert!(!stdout.contains("sk-CANARY-202-e13"));
+
+        // (b) A healthy-binary control: `doctor` runs normally with the fake env
+        // set, and does not activate the fake either — it never runs
+        // `secretspec`.
+        let control = {
+            let h = Harness::new();
+            h.builtin(
+                &["doctor"],
+                &[(fake_secretspec::FAKE_ENV, scenario.path.to_str().unwrap())],
+            )
+        };
+        let rendered = rendered_output(&control);
+        assert!(
+            control.status.success(),
+            "doctor must run normally: {rendered}"
+        );
+        assert!(
+            rendered.contains("==> this project"),
+            "doctor must print its sections: {rendered}"
+        );
+        assert!(
+            !scenario.transcript.exists(),
+            "doctor must not activate the fake endpoint"
+        );
+    }
+
+    // (c) The debug positive control: the same activation-shaped argv *does*
+    // answer, so (a) cannot pass because the fake never activates at all.
+    //
+    // One `rpc.initialize` is framed here exactly as `protocol::initialize_frame`
+    // frames it (P1 pins the client's own frames against this same fake), so the
+    // control proves the endpoint *answers* rather than merely starting, and an
+    // endpoint that hung or refused everything could not satisfy it.
+    if cfg!(debug_assertions) {
+        let initialize = format!(
+            "{}\n",
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "rpc.initialize",
+                "_meta": { "deadline_unix_ms": 4_000_000_000_000u64 },
+                "params": {
+                    "protocol": "secretspec.resolver",
+                    "versions": [1],
+                    "client": { "name": "agent-vm", "version": env!("CARGO_PKG_VERSION") },
+                    "limits": { "max_frame_bytes": 16 * 1024, "max_in_flight": 1 },
+                    "application": {
+                        "manifest": { "kind": "path", "path": "/tmp/e13/secretspec.toml" },
+                        "provider": null,
+                        "profile": "default",
+                        "scope": null,
+                        "reason": null,
+                    }
+                }
+            })
+        );
+        let mut cmd = std::process::Command::new(&binary);
+        cmd.args(["serve", "--read-only"])
+            .env_clear()
+            .env(fake_secretspec::FAKE_ENV, &scenario.path);
+        let answer = run_with_input(cmd, Some(&initialize), Duration::from_secs(20));
+        let stdout = stdout_of(&answer);
+        assert!(
+            stdout.starts_with("{\"jsonrpc\""),
+            "the debug binary must answer the fake's argv: {stdout}"
+        );
+        assert!(
+            stdout.contains("\"protocol\":\"secretspec.resolver\""),
+            "the answer must be the initialize result: {stdout}"
+        );
+        assert!(scenario.transcript.exists());
+    }
+}
+
+/// E12 / M1 — the **real** SecretSpec binary, opt-in.
+///
+/// `#[ignore]` plus an environment gate, so neither a default run nor a stray
+/// `--ignored` can point this at a developer's real store:
+///
+/// ```text
+/// AGENT_VM_E2E_SECRETSPEC=/opt/homebrew/bin/secretspec cargo test -p agent-vm \
+///   --test config_launch_driven a_real_secretspec_serve_round_trip -- --ignored --exact
+/// ```
+///
+/// The configured executable is the operator's Homebrew symlink **as it is** — no
+/// `chmod`, `chown`, copy or reinstall — and every input is isolated: a fresh
+/// `HOME`, a manifest inside this harness's own `TempDir`, a generated canary.
+/// The launch is isolated by `Harness::base_command`'s `env_clear`, so
+/// agent-vm's `SECRETSPEC_*`, `XDG_*` and everything else from the developer's
+/// shell is absent and the `secretspec serve` child writes its audit log under
+/// the harness `HOME` by default. The audit command below reproduces **that**
+/// environment exactly — `env_clear`, `HOME`, `PATH` — because it must read the
+/// store the child wrote (pinning `XDG_STATE_HOME` somewhere else is how an
+/// earlier version of this test reported "No audit log found").
+#[test]
+#[ignore = "opt-in: needs a real secretspec 0.21+ binary (AGENT_VM_E2E_SECRETSPEC)"]
+fn a_real_secretspec_serve_round_trip() {
+    let Ok(executable) = std::env::var("AGENT_VM_E2E_SECRETSPEC") else {
+        panic!("set AGENT_VM_E2E_SECRETSPEC to a real secretspec 0.21+ binary");
+    };
+    let executable = PathBuf::from(executable);
+    let canary = format!("sk-CANARY-202-e12-{}", std::process::id());
+    let mut h = Harness::warm();
+    h.write_user(SECRETSPEC_TOOL);
+    // The documented provider mechanism: a manifest-level `providers = [...]`,
+    // with no SecretSpec user configuration and no SECRETSPEC_PROVIDER.
+    // Isolated test data: a fresh `HOME`, a manifest inside this harness's own
+    // `TempDir` (private, and removed with it, so no predictable shared `/tmp`
+    // path is ever written — a pre-planted symlink would otherwise redirect the
+    // write), and a generated canary.
+    let manifest = h.home_root.join("e12-secretspec.toml");
+    write(
+        &manifest,
+        &format!(
+            "[project]\nname = \"agent-vm-e12\"\nrevision = \"1.0\"\n\n[profiles.default]\n\
+             MY_SERVICE_KEY = {{ description = \"agent-vm e12\", providers = [\"env\"], required = \
+             false, default = \"{canary}\" }}\n\
+             BINARY_KEY = {{ description = \"agent-vm e12 binary\", required = false, encoding = \
+             \"base64\", default = \"//79\" }}\n"
+        ),
+    );
+    write_credentials(
+        &h.home_root,
+        &format!(
+            "credentials:\n  - service: my-service\n    source: secretspec\n    apiKey:\n      \
+             name: MY_SERVICE_KEY\n      sentinelEnv: true\n      inject: [{{domain: \
+             api.my-service.example, scheme: bearer}}]\n    secretspec:\n      executable: \
+             {}\n      manifest: {}\n      profile: default\n",
+            executable.display(),
+            manifest.display()
+        ),
+    );
+    // Shadowing decoys: the absolute path must win.
+    let decoy = h.project_root.join("secretspec");
+    write(&decoy, "#!/bin/sh\ntouch \"$0.decoy-ran\"\nexit 0\n");
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o755)).unwrap();
+    h.use_launch_runtime();
+
+    h.write_user(
+        "[[tools]]\nname = \"t\"\ncommand = \"t\"\ncredentials = [\"my-service\", \"binary-key\"]\n",
+    );
+    let credentials =
+        std::fs::read_to_string(h.home_root.join(".config/agent-vm/credentials.yaml")).unwrap();
+    write_credentials(
+        &h.home_root,
+        &format!(
+            "{credentials}  - service: binary-key\n    source: secretspec\n    apiKey:\n      \
+             name: BINARY_KEY\n      sentinelEnv: true\n      inject: [{{domain: \
+             api.binary-key.example, scheme: bearer}}]\n    secretspec:\n      executable: \
+             {}\n      manifest: {}\n      profile: default\n      name: BINARY_KEY\n",
+            executable.display(),
+            manifest.display()
+        ),
+    );
+    let out = h.launch_with_env(
+        "t",
+        &["--root"],
+        &[(
+            "PATH",
+            &format!(
+                "{}:{}",
+                h.project_root.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )],
+    );
+    let rendered = rendered_output(&out);
+    assert_reached_runtime(&h, &out);
+    // The canary exists only in the isolated manifest and, transiently, in the
+    // server's own answer.
+    assert!(
+        !rendered.contains(&canary),
+        "a value reached agent-vm's own output"
+    );
+    assert!(!h.msb_log().contains(&canary));
+    assert!(!h.msb_environ().contains(&canary));
+    assert_no_canary_files(&h.state_root, &canary);
+    assert!(!h.project_root.join("secretspec.decoy-ran").exists());
+    // A real server failure reaches no value and one documented remedy. X12's
+    // stated cause ("the real server refuses a base64 value that does not decode
+    // to UTF-8") does **not** reproduce against 0.21.1: with `providers =
+    // ["env"]` the server answers that declaration's value with the base64 text
+    // itself, and it is the missing provider backend, not the encoding, that
+    // produces `operation_failed` here. The audit assertion below pins the real
+    // cause so this arm cannot pass for a different reason than it names.
+    assert!(
+        rendered.contains("provider could not resolve the secret"),
+        "a real provider failure must be reported with its fixed remedy: {rendered}"
+    );
+
+    // Provenance is `purpose.consumer`, which is what `serve` records. The
+    // environment is emptied first: `secretspec audit` would otherwise read the
+    // operator's `SECRETSPEC_*` and `XDG_*` and report *their* audit store.
+    let audit = std::process::Command::new(&executable)
+        .args(["audit", "--json", "-n", "8"])
+        .env_clear()
+        .env("HOME", &h.home_root)
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .expect("secretspec audit");
+    let audit_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&audit.stdout),
+        String::from_utf8_lossy(&audit.stderr)
+    );
+    assert!(
+        !audit_text.contains("No audit log found"),
+        "the audit command must read the store the launch's child wrote"
+    );
+    // Two `get` entries, both attributed to agent-vm, in the project, profile and
+    // key the user's authorization pinned — story 12's wire half: the server saw
+    // the configured manifest (its `[project]` name), profile and name.
+    // The success slice is read separately from the binary failure's own entry,
+    // so that entry's outcome cannot contaminate the provenance assertion.
+    let success_slice: Vec<&str> = audit_text
+        .lines()
+        .filter(|line| {
+            line.contains("\"key\":\"MY_SERVICE_KEY\"")
+                && line.contains("\"consumer\":\"agent-vm\"")
+        })
+        .collect();
+    assert_eq!(
+        success_slice.len(),
+        2,
+        "expected exactly two agent-vm `get` entries for MY_SERVICE_KEY: {audit_text}"
+    );
+    for entry in &success_slice {
+        assert!(
+            entry.contains("\"project\":\"agent-vm-e12\"")
+                && entry.contains("\"profile\":\"default\"")
+                && entry.contains("\"operation\":\"launch\""),
+            "the entry must pin the configured manifest, profile and operation"
+        );
+        assert!(
+            !entry.contains("\"outcome\":\"error\""),
+            "the success reads must not have failed"
+        );
+    }
+    let binary_slice: Vec<&str> = audit_text
+        .lines()
+        .filter(|line| line.contains("\"key\":\"BINARY_KEY\""))
+        .collect();
+    assert_eq!(
+        binary_slice.len(),
+        1,
+        "expected one agent-vm `get` entry for BINARY_KEY: {audit_text}"
+    );
+    assert!(
+        binary_slice[0].contains("\"outcome\":\"error\"")
+            && binary_slice[0].contains("\"error_kind\":\"no_provider_configured\""),
+        "the measured cause of the real failure is a missing provider backend"
+    );
+    let gets = audit_text.matches("\"consumer\":\"agent-vm\"").count();
+    assert!(gets >= 2, "expected at least two agent-vm `get` entries");
+    assert!(
+        !audit_text.contains(&canary),
+        "a value reached the audit log"
+    );
 }

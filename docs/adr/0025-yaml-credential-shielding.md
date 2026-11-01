@@ -1,6 +1,6 @@
 # 0025. YAML credential shielding
 
-Status: Accepted (agent-vm #161; extended by #162 and #163).
+Status: Accepted (agent-vm #161; extended by #162, #163 and #202).
 
 ## Context
 
@@ -89,7 +89,10 @@ to any durable artifact by agent-vm, and no diagnostic can render one. This is
 nobody mistakes this for erasure: agent-vm's process memory during both phases,
 the serialized launch-config buffer, the memory-backed descriptor pages until
 the child reads them, the runtime's parsed config, per-connection rendered
-header buffers and TLS write buffers. `Zeroizing` wipes owned copies only. OS
+header buffers and TLS write buffers. A `source: secretspec` launch adds the SecretSpec child's own
+process memory, the pipe's kernel buffer, `serde_json`'s scratch buffer and the zeroized frame
+buffer, plus one idle child across the phase-1 → phase-2 window
+([ADR-0055](0055-secretspec-serve-credential-source.md)). `Zeroizing` wipes owned copies only. OS
 swap, core dumps, hibernation and same-uid `ptrace`/descriptor inspection are
 explicitly **not** covered; stronger platform controls would be a separate
 proposal. (The inherited PENDING OWNER item on swap/dump policy is answered this
@@ -295,6 +298,14 @@ Surviving copies additionally include the captured zeroizing bytes for the
 whole launch. Removal cannot unset the parent shell or erase the original
 strings: Linux `/proc/<pid>/environ` can retain the initial environment block.
 Same-uid host inspection remains outside the application-level guarantee.
+
+### SecretSpec source (#202)
+
+`source: secretspec` reads the value through a `secretspec serve --read-only` session pinned in the
+user's `secretspec:` table; the authorization, the two phases and every guarantee above are
+unchanged. The protocol client, its lifecycle across the two phases and the outcome mapping are
+[ADR-0055](0055-secretspec-serve-credential-source.md), which is the single contract for that source
+— this record does not repeat it.
 
 ### Doctor resolves the launch context (#178)
 
