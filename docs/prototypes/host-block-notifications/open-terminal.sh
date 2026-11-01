@@ -15,7 +15,9 @@ case $term in
     f=$dir/show-$session.command
     printf '#!/bin/sh\n%s\n' "$cmd" > "$f"; chmod +x "$f"
     open -a Terminal "$f" ;;
-  ghostty)    open -na Ghostty --args -e /bin/sh -c "$cmd" ;;
+  ghostty)    # a second instance; stop it restoring saved windows and lingering after close
+    open -na Ghostty --args --window-save-state=never --quit-after-last-window-closed=true \
+      -e /bin/sh -c "$cmd" ;;
   wezterm)    open -na WezTerm --args start --always-new-process -- /bin/sh -c "$cmd" ;;
   alacritty)  open -na Alacritty --args -e /bin/sh -c "$cmd" ;;
   linux)      # untested: proposed standard first, then Debian's alternative, then GNOME
