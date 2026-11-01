@@ -153,6 +153,39 @@ fn resolve_guest_username(uid: u32) -> Result<PasswdName> {
     ))
 }
 
+/// The account name Claude Code itself passes to `security -a` when it reads
+/// or writes its keychain item (#492).
+///
+/// Mirrors Claude Code's `bI()` rather than reusing
+/// [`resolve_guest_username`]: that one consults `$LOGNAME` and sanitizes into
+/// a `/etc/passwd`-safe charset, so it can name an item Claude Code never
+/// wrote. A name that differs by one character reads no credential at all.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn host_account_name() -> String {
+    choose_host_account_name(
+        env::var("USER").ok(),
+        // SAFETY: getuid() is an argument-free libc call with no
+        // preconditions, as at `resolve_guest_identity`.
+        passwd_name_for_uid(unsafe { libc::getuid() }),
+    )
+}
+
+/// Pure core of [`host_account_name`], split out so Claude Code's precedence,
+/// charset rule and literal fallback are testable without mutating process env.
+/// `$USER` empty counts as unset (Claude Code tests truthiness), `$LOGNAME` is
+/// never consulted, and a name failing the charset is *replaced* rather than
+/// truncated.
+#[cfg(any(target_os = "macos", test))]
+fn choose_host_account_name(user_env: Option<String>, passwd_name: Option<String>) -> String {
+    let candidate = user_env.filter(|name| !name.is_empty()).or(passwd_name);
+    candidate
+        .filter(|name| {
+            name.bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        })
+        .unwrap_or_else(|| "claude-code-user".to_string())
+}
+
 /// A host `$HOME` validated for mirroring into the guest and rendering
 /// into `/etc/passwd`. Invariants: non-empty, absolute, and
 /// [`is_passwd_field_safe`]. The inner `String` is module-private and
@@ -608,6 +641,28 @@ mod tests {
             502,
         );
         assert_eq!(chosen, "502");
+    }
+
+    /// Claude Code's `-a` rule, not ours: `$USER` (empty = unset) then the
+    /// passwd name, its own very small charset, and its own literal fallback.
+    /// The dotted/hyphenated/underscored names `$USER` actually carries on
+    /// macOS must survive, or the keychain item is never found.
+    #[test]
+    fn choose_host_account_name_mirrors_claude_code() {
+        let name = |user: Option<&str>, passwd: Option<&str>| {
+            choose_host_account_name(user.map(str::to_string), passwd.map(str::to_string))
+        };
+        assert_eq!(name(Some("claude"), Some("other")), "claude");
+        assert_eq!(name(Some(""), Some("passwd_user")), "passwd_user");
+        assert_eq!(name(None, Some("passwd_user")), "passwd_user");
+        assert_eq!(name(Some("a.b_c-d"), None), "a.b_c-d");
+        // A name outside the charset is replaced wholesale, never truncated.
+        assert_eq!(name(Some("bad user"), None), "claude-code-user");
+        assert_eq!(
+            name(Some("bad:user"), Some("passwd_user")),
+            "claude-code-user"
+        );
+        assert_eq!(name(None, None), "claude-code-user");
     }
 
     #[test]

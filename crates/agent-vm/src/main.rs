@@ -27,6 +27,8 @@ mod env_flag;
 mod github_graphql;
 mod guest_home;
 mod guest_paths;
+mod host_cli;
+mod host_credential;
 mod host_paths;
 mod host_signals;
 mod image_acquire;

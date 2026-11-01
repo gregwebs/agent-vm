@@ -2102,6 +2102,64 @@ bridge needs it). Set `AGENT_VM_PI_NO_BRIDGE=1` (any non-empty value) to take th
 bridge out of the picture entirely — the recovery hatch if it ever throws, or if
 you installed your own copy.
 
+The login it forwards is your **host** one, which on macOS may live in the
+keychain item Claude Code maintains rather than in
+`~/.claude/.credentials.json`; agent-vm reads both and uses the one that expires
+later, and `agent-vm doctor` says which it used
+([ADR-0056](docs/adr/0056-macos-keychain-as-a-host-credential-location.md)).
+
+**Copying the item into the file is optional, and yours to run.** agent-vm never
+writes, syncs or repairs the vendor's file or item. You may still want the file
+itself current for a tool that reads only the file. The item's value is a secret,
+so copy it through a private temporary file and only replace the destination once
+the read succeeded — a plain `> ~/.claude/.credentials.json` truncates your
+existing login *before* `security` runs, and a denied, missing or timed-out read
+then destroys it:
+
+```sh
+# Run with ~/.claude present. Nothing here prints the token. The whole body is
+# in a subshell on purpose: the `exit 1` then ends the copy, not the shell you
+# pasted it into.
+# `svc` must be the item's real name: the default is below, and a Claude Code
+# with a custom CLAUDE_CONFIG_DIR (or a staging/custom environment) writes a
+# differently-named item — see the note after this block.
+(
+    svc="Claude Code-credentials"
+    dest="$HOME/.claude/.credentials.json"
+    tmp="$(mktemp "$(dirname "$dest")/.credentials.XXXXXX")" || exit 1
+    # Three conditions, and the last one is not paranoia: `security -w` prints
+    # the item as hex when its data is not printable ASCII, so a non-empty
+    # check alone would install a hex dump over a working login.
+    if security find-generic-password -s "$svc" -w >"$tmp" && [ -s "$tmp" ] &&
+        [ "$(head -c1 "$tmp")" = "{" ]; then
+        chmod 600 "$tmp"
+        mv -f "$tmp" "$dest" # same directory, so the replacement is atomic
+        printf 'installed %s from the keychain item\n' "$dest"
+    else
+        rm -f "$tmp"
+        printf 'no JSON item read for %s; %s left untouched\n' "$svc" "$dest" >&2
+        exit 1
+    fi
+)
+```
+
+A failure leaves the destination's bytes and mode exactly as they were, and a
+success installs a `0600` file in one rename; no temporary copy is left behind
+either way. The read counts only if it produced a JSON document (the leading `{`
+check), so a hex dump from `-w` is refused rather than installed. The trailing
+newline `security -w` adds is harmless — it is JSON whitespace after the
+document.
+
+**Custom config directories.** A Claude Code with a custom `CLAUDE_CONFIG_DIR`
+(or a staging/custom environment) appends a hash and an environment suffix to the
+service name, so it writes something like `Claude Code-credentials-1a2b3c4d`
+rather than the default item. agent-vm reads only the default item — the same
+limitation its hard-coded `~/.claude/.credentials.json` path already has — so the
+query above does **not** find that login. If you are in that situation, put that
+item's exact name in `svc` (Keychain Access lists the names without revealing the
+values), and treat the copy as a fallback for file-only tools: it is not the item
+Claude Code updates, so it re-stales on its own schedule.
+
 **The `agent-vm-codex` provider — pending image delivery.** PR B changes the
 launcher, not the image: the pinned v0.1.3 standard image lacks this provider,
 its wrapper activation and the registry-gated host-import warning clause.
@@ -2311,7 +2369,9 @@ neither exists for a provider the verb did not provision.
 
 Reads from the host:
 
-- `~/.claude/.credentials.json` (Claude)
+- `~/.claude/.credentials.json`, or on macOS the keychain item
+  `Claude Code-credentials`, whichever expires later (Claude;
+  [ADR-0056](docs/adr/0056-macos-keychain-as-a-host-credential-location.md))
 - `~/.codex/auth.json` (Codex, OpenCode OAuth)
 - `~/.local/share/opencode/auth.json` (OpenCode static API providers)
 - `gh auth token` (git/gh)
@@ -2729,7 +2789,7 @@ What to expect:
 
 | provider | credential handling the entry replaces | configuration/persistence kept |
 |---|---|---|
-| `anthropic` | host `~/.claude/.credentials.json` capture, the guest `claude/.credentials.json` placeholder, the proxy secret and its OAuth refresh route, the built-in's required-credential bail | `claude/settings.json` and `claude.json` onboarding bypasses, the `.claude` guest-HOME link, the state dir |
+| `anthropic` | host `~/.claude/.credentials.json` (or the macOS keychain item) capture, the guest `claude/.credentials.json` placeholder, the proxy secret and its OAuth refresh route, the built-in's required-credential bail | `claude/settings.json` and `claude.json` onboarding bypasses, the `.claude` guest-HOME link, the state dir |
 | `openai` | host `~/.codex/auth.json` capture, the guest `codex/auth.json` placeholder, the proxy secret and its OAuth refresh route, OpenCode's synthetic `openai` row | `codex/config.toml`, the `.codex`/`CODEX_HOME` wiring |
 | `opencode-static` | every BYO API-provider row read from the host `~/.local/share/opencode/auth.json` and its host token file, OpenCode's synthetic guest rows, agent-vm's `model` pin | `opencode-config/opencode.json` (`$schema`, `autoupdate`), user-authored guest `auth.json` rows |
 | `copilot` | host device-flow capture, the `copilot/config.json` `github_token` placeholder, `COPILOT_GITHUB_TOKEN`, the proxy secret | `copilot/config.json` `trusted_folders` (so a fresh state dir does not prompt "do you trust this folder?") |

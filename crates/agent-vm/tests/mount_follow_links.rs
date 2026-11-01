@@ -36,6 +36,8 @@ fn agent_vm_bin() -> PathBuf {
 mod fake_msb;
 #[path = "support/image_archive.rs"]
 mod image_archive;
+#[path = "support/mod.rs"]
+mod support;
 
 /// Run `child` to completion, killing it if it doesn't exit within
 /// `timeout`. Reads stdout/stderr on separate threads so a full pipe can't
@@ -170,9 +172,12 @@ impl Harness {
     /// `--root` is the only reachable path that exercises `launch()`'s own
     /// `mount_home` wiring rather than silently no-op'ing under `--root`.
     fn run_shell_opts(&self, mounts: &[&str], root: bool, set_home: bool) -> Output {
+        // `set_home == false` runs agent-vm with no `$HOME`, where macOS would
+        // resolve the *real* login keychain, so `security` must find nothing.
+        let (_stub, path) = support::path_without_host_keychain();
         let mut cmd = Command::new(agent_vm_bin());
         cmd.env_clear()
-            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("PATH", path)
             .env(
                 "AGENT_VM_STATE_DIR",
                 self.state.path().canonicalize().unwrap(),

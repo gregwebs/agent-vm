@@ -915,6 +915,33 @@ create the directory and lock. A changed pin needs `--yes` or both stdin and
 stderr on a real PTY. Native cache/receipt bytes are never approval, and a
 test must not delete approvals to work around a cache problem.
 
+The macOS keychain item Claude Code keeps its login in (#492) is a fourth seam. A
+fake `security` earlier on `PATH` is how a test controls it, exactly as a fake
+`claude` or `codex` stands in for those CLIs. Two rules keep a developer's *real*
+login item out of the suite:
+
+- **Unit (`cfg(test)`) builds cannot spawn `security` at all.** The program name
+  comes from `AGENT_VM_TEST_SECURITY` and there is no candidate when that variable
+  is unset, so a developer Mac's real item is unreachable by construction rather
+  than by a `PATH` comparison.
+- **A harness with a temp `$HOME` is already isolated** — `security` resolves
+  `$HOME/Library/Keychains/login.keychain-db` and answers "item not found" (exit
+  44). A harness that runs agent-vm with **no `$HOME`** is *not*: `security` falls
+  back to the passwd home and reads the real item, which can also change the
+  launch path the test asserts. Such a harness must use
+  `support::path_without_host_keychain()`.
+
+Check it on a Mac that holds a real item by shadowing `security` for the whole
+suite and looking for any invocation that had no `$HOME`:
+
+```sh
+trip=$(mktemp -d); log="$trip/log"
+printf '#!/bin/sh\nprintf "%%s\\n" "$HOME" >> %s\nexit 44\n' "$log" > "$trip/security"
+chmod 755 "$trip/security"
+PATH="$trip:$PATH" cargo test -p agent-vm          # expect no failures
+grep -c '^$' "$log"                               # expect 0: no harness ran without HOME
+```
+
 #### Acquisition and publication test fixtures
 
 Image lifecycle tests drive the compiled CLI against a deterministic loopback

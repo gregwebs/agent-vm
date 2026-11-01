@@ -119,6 +119,7 @@ use crate::config::{
 use crate::credential_provider::{CredentialProvider, ProviderSet};
 use crate::credential_resolver;
 use crate::credential_yaml::{AuthorizationSet, GuestEnvName, SourceKind, SourceSelection};
+use crate::host_credential::{AnthropicHostRead, ReadBudget, Unusable, read_anthropic};
 use crate::pi_credential_inspection::{PiCredentialReport, inspect_project};
 use crate::secret_store::{Availability, ServiceName};
 
@@ -365,6 +366,24 @@ enum HostCred {
     Present { expires_at_ms: Option<i64> },
 }
 
+/// Anthropic's second host credential location, present only when a keychain
+/// item exists (#492). `None` keeps the row byte-identical, and every variant
+/// is data rather than a rendered string so the renderer stays pure.
+#[derive(Debug, PartialEq, Eq)]
+enum KeychainView {
+    /// The keychain won, so the row's subject is the keychain and the file is
+    /// the subordinate clause.
+    Won {
+        expires_at_ms: Option<i64>,
+    },
+    Lost {
+        expires_at_ms: Option<i64>,
+    },
+    Unusable {
+        why: String,
+    },
+}
+
 /// One rendered row plus the per-project follow-through. Kept as data so
 /// [`describe_credentials`] is pure and unit-testable without a real
 /// `$HOME` or state dir, matching [`describe_home`]'s pattern.
@@ -379,6 +398,9 @@ struct CredReport {
     project: Option<ProjectCreds>,
     /// `now` in epoch ms, for rendering "expires in ...".
     now_ms: i64,
+    /// The Anthropic row's macOS keychain clause. Additive on purpose: every
+    /// other field keeps its shape, so no existing test literal churns.
+    anthropic_keychain: Option<KeychainView>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -406,21 +428,33 @@ fn gather_credentials() -> CredReport {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
 
+    // Anthropic is read once for the whole report: its row and its keychain
+    // clause must describe the same credential, or a rotation between two reads
+    // could make the row name a winner it also calls older.
+    let anthropic = read_anthropic(ReadBudget::Launch);
+
     // The host credential table is the provider table: `doctor_label`
-    // (`claude`/`codex`/`opencode`/`copilot`) and `doctor_parses_expiry` are
-    // retained verbatim so this output stays byte-identical, and `ALL` order
-    // is the historical claude, codex, opencode, copilot order.
+    // (`claude`/`codex`/`opencode`/`copilot`) is retained verbatim so this output
+    // stays byte-identical, and `ALL` order is the historical claude, codex,
+    // opencode, copilot order.
     let hosts = crate::credential_provider::CredentialProvider::ALL
         .into_iter()
         .map(|provider| {
             let label = provider.doctor_label();
-            let want_expiry = provider.doctor_parses_expiry();
             let path = provider.host_credential_path();
-            let state = match &path {
-                None => HostCred::Unreadable {
-                    why: "no $HOME".into(),
-                },
-                Some(p) => inspect_host_cred(p, want_expiry),
+            // The provider that owns a second location is inspected through the
+            // two-location read, so its row agrees with the keychain clause
+            // beside it and the credential is not read a second time to get
+            // there.
+            let state = if has_second_location(provider) {
+                anthropic_host_cred(&anthropic)
+            } else {
+                match &path {
+                    None => HostCred::Unreadable {
+                        why: "no $HOME".into(),
+                    },
+                    Some(p) => inspect_host_cred(p),
+                }
             };
             (label, path, state)
         })
@@ -430,52 +464,89 @@ fn gather_credentials() -> CredReport {
         hosts,
         project: gather_project_creds(),
         now_ms,
+        anthropic_keychain: keychain_view(&anthropic),
     }
 }
 
-fn inspect_host_cred(path: &Path, want_expiry: bool) -> HostCred {
-    if std::fs::symlink_metadata(path).is_err() {
-        return HostCred::Missing;
+/// Which row is inspected through the two-location read (#492, F02).
+///
+/// The criterion is the provider table's own **acquisition** fact — this provider
+/// keeps a host login somewhere other than the file — and nothing else. The rule
+/// exists because the opposite happened once: a `ProviderSpec.doctor_parses_expiry`
+/// display setting decided this branch, so turning expiry display on for another
+/// provider would have handed that row Anthropic's cached read. That field is
+/// gone (it had no production reader left), and what replaces it is the rule: a
+/// *display* concern must never select a *reader*.
+///
+/// It is also not a credential-*format* guarantee. `read_anthropic` hardcodes the
+/// Anthropic shape and this row's `KeychainView` is Anthropic's; a provider that
+/// ever names a keychain service still has to ship its own reader, parser and
+/// clause. The table invariant (only Anthropic names one) is pinned in
+/// `credential_provider`, so this stays a one-provider seam for now.
+fn has_second_location(provider: CredentialProvider) -> bool {
+    provider.host_keychain_service().is_some()
+}
+
+/// The Anthropic row: the *file* location's own outcome, whichever location won,
+/// read by the same parser capture and the hook use. That is what keeps "file
+/// exists but agent-vm can't use it" from rendering as a healthy row — an empty
+/// `accessToken` reads `UNUSABLE` here rather than `ok`, which is what capture
+/// wrote and the hook refused.
+fn anthropic_host_cred(read: &AnthropicHostRead) -> HostCred {
+    match read.file_outcome() {
+        Ok(expires_at_ms) => HostCred::Present {
+            expires_at_ms: *expires_at_ms,
+        },
+        Err(unusable) => HostCred::from(unusable),
     }
-    let bytes = match crate::host_paths::read_bounded_regular_file(
-        path,
-        crate::host_paths::MAX_HOST_CREDENTIAL_FILE_BYTES,
-    ) {
+}
+
+/// `Some` exactly when a keychain item exists, which is the whole trigger for
+/// appending a source clause to the Anthropic row.
+fn keychain_view(read: &AnthropicHostRead) -> Option<KeychainView> {
+    let (_, other) = read.loser()?;
+    Some(match (read.chosen(), other) {
+        (Ok(chosen), _) if !chosen.location.is_file() => KeychainView::Won {
+            expires_at_ms: chosen.expires_at_ms,
+        },
+        (_, Ok(expires_at_ms)) => KeychainView::Lost {
+            expires_at_ms: *expires_at_ms,
+        },
+        (_, Err(unusable)) => KeychainView::Unusable {
+            why: unusable.to_string(),
+        },
+    })
+}
+
+/// The three providers with one file location and no expiry to parse — the only
+/// ones that reach here. Anthropic's row comes from [`anthropic_host_cred`] instead,
+/// because its credential is the *fresher of two locations* rather than this
+/// file (#492).
+fn inspect_host_cred(path: &Path) -> HostCred {
+    let bytes = match crate::host_credential::read_file(path) {
         Ok(bytes) => bytes,
-        Err(error) => {
-            return HostCred::Unreadable {
-                why: format!("{error:#}"),
-            };
-        }
+        Err(unusable) => return HostCred::from(&unusable),
     };
-    let json: serde_json::Value = match serde_json::from_slice(&bytes) {
-        Ok(json) => json,
-        Err(error) => {
-            return HostCred::Unreadable {
-                why: format!("not valid JSON: {error}"),
-            };
-        }
-    };
-    if !want_expiry {
-        return HostCred::Present {
+    // Doctor never claimed to understand these providers' shapes — only whether
+    // their file is readable JSON.
+    match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(_) => HostCred::Present {
             expires_at_ms: None,
-        };
+        },
+        Err(error) => HostCred::Unreadable {
+            why: format!("not valid JSON: {error}"),
+        },
     }
-    // Same shape `secrets::refresh_anthropic` requires; report the
-    // *absence* of it as unreadable so "file exists but agent-vm can't
-    // use it" never renders as a healthy row.
-    let Some(oauth) = json.get("claudeAiOauth") else {
-        return HostCred::Unreadable {
-            why: "missing claudeAiOauth (API-key-only login?)".into(),
-        };
-    };
-    if oauth.get("accessToken").and_then(|v| v.as_str()).is_none() {
-        return HostCred::Unreadable {
-            why: "claudeAiOauth has no accessToken".into(),
-        };
-    }
-    HostCred::Present {
-        expires_at_ms: oauth.get("expiresAt").and_then(serde_json::Value::as_i64),
+}
+
+impl From<&Unusable> for HostCred {
+    fn from(unusable: &Unusable) -> Self {
+        match unusable {
+            Unusable::Absent => HostCred::Missing,
+            other => HostCred::Unreadable {
+                why: other.to_string(),
+            },
+        }
     }
 }
 
@@ -509,6 +580,90 @@ fn gather_project_creds() -> Option<ProjectCreds> {
     })
 }
 
+/// One row's detail with no second location to name: byte-for-byte what this
+/// table printed before #492, and still everything a host with no keychain item
+/// prints.
+fn plain_detail(state: &HostCred, now_ms: i64) -> String {
+    match state {
+        HostCred::Missing => "absent".to_string(),
+        // `why` is an error chain from `host_paths`, whose messages interpolate
+        // the measured path (`… is not a regular file`, `opening …`). It is
+        // escaped here, at the print site, like the path above it.
+        HostCred::Unreadable { why } => format!("UNUSABLE - {}", crate::one_line::text(why)),
+        HostCred::Present {
+            expires_at_ms: None,
+        } => "ok".to_string(),
+        HostCred::Present {
+            expires_at_ms: Some(exp),
+        } => format!("ok ({})", describe_expiry(*exp, now_ms)),
+    }
+}
+
+/// An expiry, or `ok` when the location has none — the form used inside a
+/// clause, where the row's own `ok (` has already been printed.
+fn expiry_phrase(expires_at_ms: Option<i64>, now_ms: i64) -> String {
+    match expires_at_ms {
+        Some(exp) => describe_expiry(exp, now_ms),
+        None => "ok".to_string(),
+    }
+}
+
+/// `expires in 4h42m ` / empty, ready to follow an opening `ok (`.
+fn leading_expiry(expires_at_ms: Option<i64>, now_ms: i64) -> String {
+    match expires_at_ms {
+        Some(exp) => format!("{} ", describe_expiry(exp, now_ms)),
+        None => String::new(),
+    }
+}
+
+/// A location that is the row's subordinate clause: its expiry, `ok`, `absent`
+/// or `UNUSABLE - …`, never a second `ok (`.
+fn location_phrase(state: &HostCred, now_ms: i64) -> String {
+    match state {
+        HostCred::Present { expires_at_ms } => expiry_phrase(*expires_at_ms, now_ms),
+        other => plain_detail(other, now_ms),
+    }
+}
+
+/// The Anthropic row when a keychain item exists. The row's *subject* is
+/// whichever location won, so the row stays `ok (…)` exactly when the
+/// credential in use is usable, and the other location is one clause after it.
+fn detail_with_keychain(state: &HostCred, view: &KeychainView, now_ms: i64) -> String {
+    match view {
+        // When the keychain won it is the row's subject, so the row stays
+        // `ok (…)` and the file becomes the clause.
+        KeychainView::Won { expires_at_ms } => format!(
+            "ok ({}via macOS keychain; file {})",
+            leading_expiry(*expires_at_ms, now_ms),
+            location_phrase(state, now_ms)
+        ),
+        KeychainView::Lost { expires_at_ms } => file_row_with_keychain(
+            state,
+            format!("macOS keychain {}", expiry_phrase(*expires_at_ms, now_ms)),
+            now_ms,
+        ),
+        // `why` is the keychain reader's own wording, which never holds child
+        // output; escaping it here keeps a hostile item from splitting the row.
+        KeychainView::Unusable { why } => file_row_with_keychain(
+            state,
+            format!("macOS keychain UNUSABLE - {}", crate::one_line::text(why)),
+            now_ms,
+        ),
+    }
+}
+
+/// The row when the file is still its subject: `ok (…)` with the keychain as the
+/// clause when the file is usable, and the file's own verdict leading otherwise.
+fn file_row_with_keychain(state: &HostCred, keychain: String, now_ms: i64) -> String {
+    match state {
+        HostCred::Present { expires_at_ms } => format!(
+            "ok ({}via file; {keychain})",
+            leading_expiry(*expires_at_ms, now_ms)
+        ),
+        other => format!("{}; {keychain}", plain_detail(other, now_ms)),
+    }
+}
+
 /// Render the credential report. Pure over its input so the wording is
 /// unit-tested without touching `$HOME` or the filesystem.
 ///
@@ -524,20 +679,12 @@ fn describe_credentials(report: &CredReport, launch: &LaunchView) -> String {
         .max()
         .unwrap_or(0);
     for (label, path, state) in &report.hosts {
-        let detail = match state {
-            HostCred::Missing => "absent".to_string(),
-            // `why` is an error chain from `host_paths`, whose messages interpolate
-            // the measured path (`… is not a regular file`, `opening …`). It is
-            // escaped here, at the print site, like the path above it.
-            HostCred::Unreadable { why } => {
-                format!("UNUSABLE - {}", crate::one_line::text(why))
-            }
-            HostCred::Present {
-                expires_at_ms: None,
-            } => "ok".to_string(),
-            HostCred::Present {
-                expires_at_ms: Some(exp),
-            } => format!("ok ({})", describe_expiry(*exp, report.now_ms)),
+        let detail = match (
+            &report.anthropic_keychain,
+            label == &CredentialProvider::Anthropic.doctor_label(),
+        ) {
+            (Some(view), true) => detail_with_keychain(state, view, report.now_ms),
+            _ => plain_detail(state, report.now_ms),
         };
         let disposition = launch.host_row_note(label);
         let shown = path.as_deref().map_or_else(
@@ -2340,17 +2487,114 @@ A fresh database will be created on the next `agent-vm shell`/`run`.
 
     const HOUR_MS: i64 = 3_600_000;
 
+    /// The report's own Anthropic read for a `$HOME`: no keychain candidate
+    /// exists here, because a `cfg(test)` build spawns no `security` unless a
+    /// test names one (#492, R12).
+    fn claude_read(home: &Path) -> AnthropicHostRead {
+        let mut env = crate::test_env::guard();
+        env.set_var("HOME", home);
+        env.remove_var("AGENT_VM_TEST_SECURITY");
+        read_anthropic(ReadBudget::Launch)
+    }
+
+    /// The `claude` row for a `$HOME`, through that read.
+    fn claude_row(home: &Path) -> HostCred {
+        anthropic_host_cred(&claude_read(home))
+    }
+
+    /// F02: the row that is read through the two-location path is chosen by the
+    /// provider table's *location* fact, for every provider and with no other
+    /// input. The companion test
+    /// [`each_row_reports_its_own_file_and_anthropic_is_the_two_location_one`]
+    /// pins the same dispatch as a whole report over distinct real fixtures.
+    #[test]
+    fn only_the_provider_with_a_second_location_uses_the_two_location_row() {
+        for provider in CredentialProvider::ALL {
+            assert_eq!(
+                has_second_location(provider),
+                provider.host_keychain_service().is_some(),
+                "{provider:?}"
+            );
+        }
+        assert!(has_second_location(CredentialProvider::Anthropic));
+        assert!(
+            CredentialProvider::ALL
+                .into_iter()
+                .filter(|provider| has_second_location(*provider))
+                .count()
+                == 1,
+            "exactly one provider has a second location today"
+        );
+    }
+
+    /// F02: every row's detail comes from *its own* file, and the Anthropic row
+    /// is the file location's outcome from the one shared read. A codex file that
+    /// carries an `expiresAt` must still render `ok` (no expiry): that is what
+    /// proves its row went through `inspect_host_cred` rather than Anthropic's
+    /// cached, expiry-parsing read.
+    #[test]
+    fn each_row_reports_its_own_file_and_anthropic_is_the_two_location_one() {
+        let mut env = crate::test_env::guard();
+        let home = tempfile::tempdir().unwrap();
+        env.set_var("HOME", home.path());
+        env.remove_var("AGENT_VM_TEST_SECURITY");
+        write_file(
+            &home.path().join(".claude/.credentials.json"),
+            br#"{"claudeAiOauth":{"accessToken":"CLAUDE","expiresAt":42}}"#,
+        );
+        // Valid JSON with an expiry of its own: still not expiry-parsed.
+        write_file(
+            &home.path().join(".codex/auth.json"),
+            br#"{"tokens":{"access_token":"CODEX"},"expiresAt":99}"#,
+        );
+        // Unreadable, and a distinct reason from the others.
+        write_file(
+            &home.path().join(".local/share/opencode/auth.json"),
+            b"not valid json {{{",
+        );
+        // Absent: the fourth one has no file at all.
+
+        let report = gather_credentials();
+        let text = describe_credentials(&report, &LaunchView::default());
+        let detail = |label: &str| {
+            let mut lines = text.lines();
+            while let Some(line) = lines.next() {
+                if line.starts_with(&format!("{label} ")) {
+                    return lines
+                        .next()
+                        .expect("a detail line follows every row")
+                        .trim()
+                        .to_string();
+                }
+            }
+            panic!("no {label} row in {text}");
+        };
+        // One fixed clock for the whole comparison: `gather_credentials` uses the
+        // wall clock, so only the shapes are asserted here.
+        assert!(detail("claude").starts_with("ok ("), "{text}");
+        assert_eq!(detail("codex"), "ok", "{text}");
+        assert!(
+            detail("opencode").starts_with("UNUSABLE - not valid JSON: "),
+            "{text}"
+        );
+        assert_eq!(detail("copilot"), "absent", "{text}");
+        // No keychain item is reachable from a `cfg(test)` build, so the clause
+        // that would prove the source is absent — and the row is byte-identical.
+        assert!(!text.contains("macOS keychain"), "{text}");
+    }
+
     #[test]
     fn a_claude_file_without_claudeaioauth_reads_as_unusable_not_ok() {
-        // The exact shape `secrets::refresh_anthropic` rejects. Rendering
-        // this as "ok" would send the user hunting anywhere but the file
-        // that is actually the problem.
+        // The exact shape capture rejects. Rendering this as "ok" would send
+        // the user hunting anywhere but the file that is actually the problem.
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(".credentials.json");
-        write_file(&path, br#"{"someOtherLogin":{"accessToken":"x"}}"#);
+        write_file(
+            &dir.path().join(".claude/.credentials.json"),
+            br#"{"someOtherLogin":{"accessToken":"x"}}"#,
+        );
 
         assert_eq!(
-            inspect_host_cred(&path, true),
+            claude_row(dir.path()),
             HostCred::Unreadable {
                 why: "missing claudeAiOauth (API-key-only login?)".into()
             }
@@ -2360,22 +2604,20 @@ A fresh database will be created on the next `agent-vm shell`/`run`.
     #[test]
     fn a_well_formed_claude_file_reports_its_expiry_and_absent_stays_absent() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(".credentials.json");
         write_file(
-            &path,
+            &dir.path().join(".claude/.credentials.json"),
             br#"{"claudeAiOauth":{"accessToken":"tok","expiresAt":42}}"#,
         );
-
         assert_eq!(
-            inspect_host_cred(&path, true),
+            claude_row(dir.path()),
             HostCred::Present {
                 expires_at_ms: Some(42)
             }
         );
-        assert_eq!(
-            inspect_host_cred(&dir.path().join("nope.json"), true),
-            HostCred::Missing
-        );
+
+        // No file at all: `absent`, not `unusable`.
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(claude_row(empty.path()), HostCred::Missing);
     }
 
     #[test]
@@ -2400,6 +2642,7 @@ A fresh database will be created on the next `agent-vm shell`/`run`.
                 pi_credentials: PiCredentialReport::uninspected(),
             }),
             now_ms: 0,
+            anthropic_keychain: None,
         }
     }
 
@@ -2431,6 +2674,371 @@ A fresh database will be created on the next `agent-vm shell`/`run`.
         assert!(
             text.contains("cannot work and fails with an OAuth 400"),
             "{text}"
+        );
+    }
+
+    /// A report whose `claude` row is `state` and whose keychain clause is
+    /// `keychain`. `now_ms` is the report's own clock, so the rendered spans are
+    /// fixed rather than measured.
+    fn anthropic_report(
+        state: HostCred,
+        keychain: Option<KeychainView>,
+        now_ms: i64,
+    ) -> CredReport {
+        let mut report = report(vec![
+            (
+                "claude",
+                Some(PathBuf::from("/h/.claude/.credentials.json")),
+                state,
+            ),
+            (
+                "codex",
+                Some(PathBuf::from("/h/.codex/auth.json")),
+                HostCred::Missing,
+            ),
+        ]);
+        report.now_ms = now_ms;
+        report.anthropic_keychain = keychain;
+        report
+    }
+
+    /// The `claude` row's detail cell, trimmed of its label padding.
+    fn claude_detail(report: &CredReport) -> String {
+        let text = describe_credentials(report, &LaunchView::default());
+        let mut lines = text.lines();
+        while let Some(line) = lines.next() {
+            if line.starts_with("claude ") {
+                return lines
+                    .next()
+                    .expect("every row is followed by its detail line")
+                    .trim()
+                    .to_string();
+            }
+        }
+        panic!("no claude row in {text}");
+    }
+
+    /// Story 5: the row names the location in use and shows what the other one
+    /// holds, so the next 401 is diagnosable in one command.
+    #[test]
+    fn keychain_win_names_the_source_and_the_stale_file() {
+        let now_ms = 61 * HOUR_MS + 31 * 60_000;
+        let report = anthropic_report(
+            HostCred::Present {
+                expires_at_ms: Some(0),
+            },
+            Some(KeychainView::Won {
+                expires_at_ms: Some(now_ms + 4 * HOUR_MS + 42 * 60_000),
+            }),
+            now_ms,
+        );
+        assert_eq!(
+            claude_detail(&report),
+            "ok (expires in 4h42m via macOS keychain; file EXPIRED 61h31m ago)"
+        );
+
+        // No credential file at all still names the keychain as the source.
+        let report = anthropic_report(
+            HostCred::Missing,
+            Some(KeychainView::Won {
+                expires_at_ms: Some(now_ms + 4 * HOUR_MS),
+            }),
+            now_ms,
+        );
+        assert_eq!(
+            claude_detail(&report),
+            "ok (expires in 4h00m via macOS keychain; file absent)"
+        );
+
+        // A keychain with no expiry at all.
+        let report = anthropic_report(
+            HostCred::Present {
+                expires_at_ms: Some(now_ms + HOUR_MS),
+            },
+            Some(KeychainView::Won {
+                expires_at_ms: None,
+            }),
+            now_ms,
+        );
+        assert_eq!(
+            claude_detail(&report),
+            "ok (via macOS keychain; file expires in 1h00m)"
+        );
+    }
+
+    /// Story 11: the later expiry wins regardless of which location it is, and
+    /// the row says so.
+    #[test]
+    fn file_win_names_the_older_keychain() {
+        let now_ms = 2 * HOUR_MS;
+        let report = anthropic_report(
+            HostCred::Present {
+                expires_at_ms: Some(now_ms + 3 * HOUR_MS),
+            },
+            Some(KeychainView::Lost {
+                expires_at_ms: Some(0),
+            }),
+            now_ms,
+        );
+        assert_eq!(
+            claude_detail(&report),
+            "ok (expires in 3h00m via file; macOS keychain EXPIRED 2h00m ago)"
+        );
+    }
+
+    /// Stories 7/8: a locked or failing keychain is reported, not hidden, and
+    /// the file that is still in use stays the row's answer.
+    #[test]
+    fn an_unusable_keychain_is_an_explicit_clause() {
+        let now_ms = HOUR_MS;
+        let present = HostCred::Present {
+            expires_at_ms: Some(now_ms + 3 * HOUR_MS),
+        };
+        let report = anthropic_report(
+            present,
+            Some(KeychainView::Unusable {
+                why: "timed out after 5s (is the login keychain locked?)".into(),
+            }),
+            now_ms,
+        );
+        assert_eq!(
+            claude_detail(&report),
+            "ok (expires in 3h00m via file; macOS keychain UNUSABLE - timed out after 5s (is the login keychain locked?))"
+        );
+
+        // Nothing usable at all: the file's own reason leads, the keychain's
+        // follows.
+        let report = anthropic_report(
+            HostCred::Missing,
+            Some(KeychainView::Unusable {
+                why: "`security` exited with status 36".into(),
+            }),
+            now_ms,
+        );
+        assert_eq!(
+            claude_detail(&report),
+            "absent; macOS keychain UNUSABLE - `security` exited with status 36"
+        );
+    }
+
+    /// The keychain clause carries text from an outside process, so it must not
+    /// be able to start a line — the same rule the row's path obeys.
+    #[test]
+    fn keychain_clause_cannot_forge_a_line() {
+        let report = anthropic_report(
+            HostCred::Missing,
+            Some(KeychainView::Unusable {
+                why: "garbage\nFORGED-ROW".into(),
+            }),
+            0,
+        );
+        let text = describe_credentials(&report, &LaunchView::default());
+        assert!(!text.contains("\nFORGED"), "{text}");
+        assert!(
+            !text.lines().any(|line| line.starts_with("FORGED")),
+            "{text}"
+        );
+    }
+
+    /// F08: the headline promise — a host with no keychain item gets the row it
+    /// always got — compared against **goldens re-recorded from base `e6cfa85`**,
+    /// through the real acquisition path over real files.
+    ///
+    /// Provenance (F08/N4 of the follow-up review): the six details and the
+    /// section tail below are the verbatim stdout of *base's own*
+    /// `describe_credentials(&report, &LaunchView::default())` over base's
+    /// `inspect_host_cred(path, true)`, with `now_ms = 1_700_000_000_000` and
+    /// base's `report()` project fixture, printed by a throwaway test in a `git
+    /// worktree` of `e6cfa85` (never committed; the worktree was removed after
+    /// recording). They were regenerated, not transcribed: the previous round's
+    /// goldens used `now_ms = 0`, under which the "expired" fixture rendered
+    /// `expires in 0m` and so never exercised the EXPIRED rendering.
+    ///
+    /// One input is substituted rather than fixed: the fixture directory is a
+    /// per-run `tempfile::tempdir()`, because a fixed `/tmp` path is shared
+    /// mutable state that two concurrent test processes can delete under each
+    /// other. `GOLDEN_HOME` is the literal the recording used, and it appears in
+    /// exactly two places (the row's path and the not-a-regular-file reason);
+    /// both are replaced with the real directory and everything else — wording,
+    /// labels, indentation, whitespace, the clock — is compared byte for byte.
+    ///
+    /// This is what the hand-built `HostCred` table in
+    /// [`no_keychain_item_is_byte_identical`] cannot catch: file reading,
+    /// parsing, labels, paths, row spacing, the source clause's absence and the
+    /// whole-section formatting all go through the production path here.
+    #[test]
+    fn the_no_keychain_row_is_byte_identical_to_the_base_commit() {
+        const GOLDEN_HOME: &str = "/tmp/agent-vm-492-doctor-golden-home";
+        /// The clock both sides were recorded and rendered at: a real instant, so
+        /// `expiresAt` on either side of it is a future and an *expired* expiry
+        /// rather than two flavours of "0m".
+        const NOW_MS: i64 = 1_700_000_000_000;
+        /// The tail from the first `==> this project` onward: identical for all
+        /// six shapes in the recording, so it is compared once per shape.
+        const GOLDEN_TAIL: &str = r#"==> this project
+dir:      /p
+state:    /s/abc
+captured: claude
+guest Claude cred file: placeholder present
+
+==> guest-managed Pi credentials
+Structural inspection of guest-managed Pi state only; agent-vm never resolves, imports, refreshes or removes it.
+auth.json: not present
+models.json: not present
+Only auth.json and models.json are inspected (settings, sessions and installed packages are not).
+
+For the host-captured Claude/Codex/GitHub credentials above, the guest never
+receives a real token: it gets a placeholder that the TLS proxy swaps for the
+host token on the way out. So sign in ON THE HOST (`claude login`,
+`codex login`, `gh auth login`): running `/login` inside the VM cannot work and fails with an OAuth 400.
+Pi guest-managed state is different: a credential created inside the guest
+lives in the project's persistent Pi home and is reported above, not
+substituted."#;
+
+        let home = tempfile::tempdir().unwrap();
+        let credentials = home.path().join(".claude/.credentials.json");
+        let home_text = home.path().display().to_string();
+
+        let shapes: [(&str, Option<&[u8]>, &str); 6] = [
+            (
+                "a future integer expiry",
+                Some(br#"{"claudeAiOauth":{"accessToken":"tok","expiresAt":1700003600000}}"#),
+                "ok (expires in 1h00m)",
+            ),
+            (
+                "an expired integer expiry",
+                Some(br#"{"claudeAiOauth":{"accessToken":"tok","expiresAt":1699996400000}}"#),
+                "ok (EXPIRED 1h00m ago)",
+            ),
+            (
+                "no expiry at all",
+                Some(br#"{"claudeAiOauth":{"accessToken":"tok"}}"#),
+                "ok",
+            ),
+            ("no credential file", None, "absent"),
+            // Not JSON: the reason text is serde's, which is why the golden
+            // pins it rather than a paraphrase.
+            (
+                "unusable JSON",
+                Some(b"not valid json {{{" as &[u8]),
+                "UNUSABLE - not valid JSON: expected ident at line 1 column 2",
+            ),
+            // A directory where the file should be: "present but unreadable" is
+            // a different row from `absent`, and the path appears in the reason.
+            (
+                "a path that is not a regular file",
+                Some(&[] as &[u8]),
+                "UNUSABLE - /tmp/agent-vm-492-doctor-golden-home/.claude/.credentials.json is not a regular file",
+            ),
+        ];
+
+        for (name, contents, detail) in shapes {
+            match contents {
+                None => {}
+                // The "not a regular file" fixture is a directory; the empty
+                // slice is its marker.
+                Some([]) => std::fs::create_dir_all(&credentials).unwrap(),
+                Some(bytes) => write_file(&credentials, bytes),
+            }
+            // The real acquisition path, read exactly once: `read_anthropic` is
+            // the report's own read (file location, plus the `cfg(test)` guard
+            // that only spawns `security` when a test names one), so a change to
+            // reading or parsing shows up here, and the keychain clause beside
+            // the row is derived from the same read rather than assumed absent —
+            // otherwise `!contains("macOS keychain")` below could never fail.
+            let read = claude_read(home.path());
+            let row = anthropic_host_cred(&read);
+            let mut report = report(vec![("claude", Some(credentials.clone()), row)]);
+            report.now_ms = NOW_MS;
+            report.anthropic_keychain = keychain_view(&read);
+            let rendered = describe_credentials(&report, &LaunchView::default());
+
+            let expected = format!(
+                "==> host agent credentials\nclaude  {GOLDEN_HOME}/.claude/.credentials.json\n        {detail}\n\n{GOLDEN_TAIL}"
+            );
+            let expected = expected.replace(GOLDEN_HOME, &home_text);
+            assert_eq!(rendered, expected, "case: {name}");
+            // The source clause is Anthropic's second location and must never
+            // appear without an item.
+            assert!(!rendered.contains("macOS keychain"), "case: {name}");
+            // Reset for the next shape. `remove_dir_all` refuses a regular file
+            // (ENOTDIR) and `remove_file` refuses the directory fixture, so each
+            // shape is cleared by the form that fits it — silently: a leftover
+            // here would surface as the next case's wrong row, not as an error.
+            let _ = std::fs::remove_file(&credentials)
+                .or_else(|_| std::fs::remove_dir_all(&credentials));
+        }
+    }
+
+    /// Story 6 at the *renderer*, narrowed by the operator's supersedance: these
+    /// four `HostCred` shapes render as they always did. This pins wording only —
+    /// the whole-section, real-file comparison against the base commit is
+    /// [`the_no_keychain_row_is_byte_identical_to_the_base_commit`].
+    #[test]
+    fn no_keychain_item_is_byte_identical() {
+        let cases = [
+            (HostCred::Missing, "absent"),
+            (
+                HostCred::Present {
+                    expires_at_ms: Some(HOUR_MS),
+                },
+                "ok (expires in 1h00m)",
+            ),
+            (
+                HostCred::Present {
+                    expires_at_ms: None,
+                },
+                "ok",
+            ),
+            (
+                HostCred::Unreadable {
+                    why: "not valid JSON: x".into(),
+                },
+                "UNUSABLE - not valid JSON: x",
+            ),
+        ];
+        for (state, expected) in cases {
+            let report = anthropic_report(state, None, 0);
+            assert_eq!(claude_detail(&report), expected);
+        }
+    }
+
+    /// The one parser changes three renderings on a host with no keychain item,
+    /// all of them malformed credentials. Pinned here through the *real reader*
+    /// (`claude_row`), not a file-only seam, and excluded from the byte-identity
+    /// goldens in
+    /// [`the_no_keychain_row_is_byte_identical_to_the_base_commit`], so a revert
+    /// of the supersedance is a visible test failure rather than a silent one.
+    #[test]
+    fn the_shared_parser_pins_three_changed_renderings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude/.credentials.json");
+        let check = |contents: &str| {
+            write_file(&path, contents.as_bytes());
+            claude_row(dir.path())
+        };
+
+        // (a) An empty `accessToken` used to render `ok` while capture wrote it
+        // and the hook refused it.
+        assert_eq!(
+            check(r#"{"claudeAiOauth":{"accessToken":"","expiresAt":9999999999000}}"#),
+            HostCred::Unreadable {
+                why: "claudeAiOauth has no accessToken".into()
+            }
+        );
+        // (b) `expiresAt <= 0` is no expiry, which is the hook's reading.
+        assert_eq!(
+            check(r#"{"claudeAiOauth":{"accessToken":"t","expiresAt":0}}"#),
+            HostCred::Present {
+                expires_at_ms: None
+            }
+        );
+        // (c) A float `expiresAt` renders its expiry instead of `ok`.
+        assert_eq!(
+            check(r#"{"claudeAiOauth":{"accessToken":"t","expiresAt":9999999999000.7}}"#),
+            HostCred::Present {
+                expires_at_ms: Some(9_999_999_999_000)
+            }
         );
     }
 
