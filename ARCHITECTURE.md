@@ -35,6 +35,10 @@ crates/agent-vm/src/
 ├── launch_target.rs        # lower a selected target once: catalog Tool or Direct command
 ├── session.rs              # project hash, state dirs, sandbox name, guest home
 ├── secrets.rs              # capture host credentials; write guest placeholders
+├── host_credential.rs      # Anthropic host credential locations; freshest wins (#492)
+│   └── host_credential/
+│       └── mac_keychain.rs #   Claude Code's keychain item, read through `security`
+├── host_cli.rs             # bounded host CLI children: env allow-list, group kill
 ├── credential_injection.rs # overlay host mappings + file-backed sources on the network plan
 ├── intercept_hook.rs       # hidden `_intercept-hook` subcommand: OAuth + GitHub policy
 │   └── intercept_hook/
@@ -1556,9 +1560,12 @@ provisioning set — the tools the launched tool declares, transitively; see
 verb whose provisioning set is wider than its requirement set, through the
 `pi -> claude` and `pi -> codex` edges):
 
-1. **Host side.** agent-vm reads the host credential file
-   (`~/.claude/.credentials.json`, `~/.codex/auth.json`,
-   `~/.local/share/opencode/auth.json`, `gh auth token`), and writes the real
+1. **Host side.** agent-vm reads the host credential location
+   (`~/.claude/.credentials.json` — or, on macOS, Claude Code's keychain item
+   `Claude Code-credentials`, whichever expires later
+   ([ADR-0056](docs/adr/0056-macos-keychain-as-a-host-credential-location.md)) —
+   `~/.codex/auth.json`, `~/.local/share/opencode/auth.json`, `gh auth token`),
+   and writes the real
    bearer to a host-only file with 0600 perms via atomic-write-then-rename.
    Placeholder *constants* live in `secrets.rs`
    (`ANTHROPIC_ACCESS_PLACEHOLDER` and friends) — always prefer the constant
@@ -1911,6 +1918,7 @@ directories the user never asked for. The state-root precedence is in
 | Direct-command input ownership and the detached stdin reader (#399) | [ADR-0052](docs/adr/0052-direct-command-input-ownership.md) |
 | Guest exit-signal identity through agentd, the protocol and the SDK accessor (#467) | [ADR-0053](docs/adr/0053-guest-exit-signal-identity.md) |
 | SecretSpec as a read-only credential source (#202) | [ADR-0055](docs/adr/0055-secretspec-serve-credential-source.md) |
+| macOS keychain item as a second Anthropic host credential location (#492) | [ADR-0056](docs/adr/0056-macos-keychain-as-a-host-credential-location.md) |
 
 ## Deliberate non-goals
 
@@ -1919,10 +1927,21 @@ are settled design positions, not the outstanding work tracked in
 [open issues](https://github.com/gregwebs/agent-vm/issues?q=is%3Aissue%20is%3Aopen).
 
 - **No proactive token-expiry timer.** The guest's own refresh attempt at
-  401-time triggers the hook, which triggers the host-side refresh. If the user
-  ran `claude` on the host between sessions, the file is already fresh and the
-  per-connection re-read picks it up with no hook at all. A timer is
-  belt-and-suspenders.
+  401-time triggers the hook, which triggers the host-side refresh. Three
+  different reads are involved and only the last one is the proxy's:
+  1. a **new launch** captures the freshest vendor credential (on macOS the later
+     of the file and the keychain item, [ADR-0056](docs/adr/0056-macos-keychain-as-a-host-credential-location.md))
+     into the host-only token file, so an already-refreshed host login needs no
+     hook at all;
+  2. a **running session's** refresh hook re-reads the vendor locations and
+     installs the chosen bearer into that same host-only token file — this is
+     what lets a mid-session rotation land without a relaunch;
+  3. only **then** does the proxy's per-connection re-read of the host-only token
+     file pick the value up.
+
+  So the proxy never observes a vendor store directly: changing the keychain item
+  alone does not update a running guest's installed bearer until the hook (or the
+  next launch) installs it. A timer is belt-and-suspenders.
 - **No replacing `~/.microsandbox/bin/msb`.** The `MSB_PATH` override is
   per-invocation, so other microsandbox SDK consumers on the same host keep
   using their own prebuilt.

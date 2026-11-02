@@ -203,6 +203,29 @@ captured and removed before a launch spawns any child process;
 read through `secretspec serve --read-only` with the manifest, profile and scope
 the user pinned.
 
+## Host credential location
+
+Where a vendor CLI keeps its login **on the host**, as distinct from the value it
+holds. `Anthropic` has two: its **host credential file**
+`~/.claude/.credentials.json`, and — on macOS only — Claude Code's **host keychain
+item**, the generic-password item under the service name
+`Claude Code-credentials`. Both are read, the later `expiresAt` wins, and a tie
+keeps the file, so a host whose CLI writes only the file sees no change
+([ADR-0056](docs/adr/0056-macos-keychain-as-a-host-credential-location.md)). The
+other three providers have one location each. agent-vm never writes either kind:
+the login path belongs to the CLI that maintains it.
+
+_Not the same as_ a **credential source**: that is a `credentials.yaml` concept —
+a place a *user-authorized* value comes from. A host credential location is
+built-in provider capture, needs no authorization, and never appears in that file.
+
+_Not the same as_ the **secret store**: agent-vm's own
+`dev.agent-vm.credentials` namespace ([ADR-0024](docs/adr/0024-host-secret-inventory.md)).
+A vendor's item is foreign and is never addressed through it.
+
+_Avoid_: "keychain" unqualified — it names agent-vm's own store on every platform
+and Claude Code's item only on macOS.
+
 ## Credential authorization
 
 A user's permission to use a credential source at specified HTTPS destinations
@@ -297,7 +320,7 @@ permission.
 A **compiled-in credential subsystem** a launched tool can depend on. The four
 variants are `Anthropic`, `OpenAi`, `OpencodeStatic`, and `Copilot`
 (`crates/agent-vm/src/credential_provider.rs`). A provider owns everything
-needed to be signed in: its host credential file, placeholders, eager state
+needed to be signed in: its host credential location, placeholders, eager state
 dir, guest-HOME links, first-run bypass config, guest env, proxy
 secret/routes, and — for `Anthropic`/`OpenAi` — the OAuth-rotation facts the
 interception hook reads.

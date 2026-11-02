@@ -25,6 +25,8 @@ fn agent_vm_bin() -> PathBuf {
 
 #[path = "support/fake_msb.rs"]
 mod fake_msb;
+#[path = "support/mod.rs"]
+mod support;
 
 /// Run `child` to completion, killing it if it doesn't exit in time. Reads
 /// both pipes on threads so a full pipe can't deadlock. Duplicated from
@@ -682,9 +684,13 @@ fn a_malformed_config_does_not_block_db_reset() {
 #[test]
 fn a_missing_home_reports_an_unavailable_user_tier() {
     let h = Harness::new();
+    // With no `$HOME`, macOS resolves the *real* login keychain, so `security`
+    // must find nothing here (#492, R12).
+    let (_stub, path) = support::path_without_host_keychain();
     let out = h
         .base_command()
         .env_remove("HOME")
+        .env("PATH", path)
         .arg("doctor")
         .output()
         .expect("failed to run agent-vm doctor without HOME");
@@ -2360,4 +2366,64 @@ fn a_secretspec_sourced_authorization_is_labelled_and_never_spawned() {
     );
     assert!(!String::from_utf8_lossy(&with_fake.stdout).contains("sk-CANARY-202-d3"));
     assert!(!marker.exists());
+}
+
+/// #492 / story 5. The real `doctor` names the location the Anthropic
+/// credential came from and what the other one holds. The fake `security`
+/// shadows `/usr/bin/security`, so this never reads a developer's own login item
+/// even though the harness's `$HOME` is a temp dir; and the *no-keychain* rows
+/// are pinned byte-identically by the rest of this file, which passes unchanged.
+#[cfg(target_os = "macos")]
+#[test]
+fn doctor_names_the_keychain_when_it_wins() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let h = Harness::new();
+    let claude = h.home_root.join(".claude");
+    std::fs::create_dir_all(&claude).unwrap();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let file_token = "DOCTOR_FILE_CANARY";
+    std::fs::write(
+        claude.join(".credentials.json"),
+        format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"{file_token}","expiresAt":{}}}}}"#,
+            now_ms - 61 * 3_600_000
+        ),
+    )
+    .unwrap();
+
+    let bin = h.home_root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let keychain_token = "DOCTOR_KEYCHAIN_CANARY";
+    let security = bin.join("security");
+    std::fs::write(
+        &security,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' '{{\"claudeAiOauth\":{{\"accessToken\":\"{keychain_token}\",\"expiresAt\":{}}}}}'\n",
+            now_ms + 4 * 3_600_000
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let host_path = std::env::var("PATH").unwrap_or_default();
+    let out = h
+        .base_command()
+        .env("PATH", format!("{}:{host_path}", bin.display()))
+        .arg("doctor")
+        .output()
+        .expect("failed to run agent-vm doctor");
+    assert_success(&out);
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.contains("via macOS keychain; file EXPIRED"),
+        "the claude row must name the winning location and the stale file:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains(keychain_token) && !stdout.contains(file_token),
+        "doctor must never print a bearer:\n{stdout}"
+    );
 }

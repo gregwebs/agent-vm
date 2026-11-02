@@ -314,9 +314,12 @@ impl Harness {
         state: &Path,
         options: &[&str],
     ) -> Output {
+        // `set_home == false` runs agent-vm with no `$HOME`, where macOS would
+        // resolve the *real* login keychain, so `security` must find nothing.
+        let (_stub, path) = support::path_without_host_keychain();
         let mut cmd = Command::new(agent_vm_bin());
         cmd.env_clear()
-            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("PATH", path)
             .env("AGENT_VM_STATE_DIR", state)
             .env("MSB_PATH", &self.fake_msb)
             .env("AGENT_VM_DEBUG_CONFIG", "1")

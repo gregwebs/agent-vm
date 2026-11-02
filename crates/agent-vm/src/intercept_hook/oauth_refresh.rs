@@ -1,7 +1,5 @@
 use std::{
     path::Path,
-    process::{Command, Stdio},
-    sync::mpsc,
     time::{Duration, Instant},
 };
 
@@ -14,6 +12,8 @@ use serde::{
 use super::http;
 use crate::{
     credential_provider::{self, CredentialProvider, OAuthRotation},
+    host_cli::{self, POLL_OVERSHOOT},
+    host_credential::{self, AnthropicHostRead, ReadBudget, Unusable, expires_at_ms},
     host_paths::{MAX_HOST_CREDENTIAL_FILE_BYTES, read_bounded_regular_file},
     secrets,
 };
@@ -469,9 +469,6 @@ const OPENAI_UNKNOWN_EXPIRY_SECS: i64 = 3600;
 const LOCK_CEILING: Duration = Duration::from_secs(20);
 const ANTHROPIC_CLI_TIMEOUT: Duration = Duration::from_secs(45);
 const OPENAI_CLI_TIMEOUT: Duration = Duration::from_secs(60);
-const POLL_OVERSHOOT: Duration = Duration::from_millis(50);
-const REAP_CEILING: Duration = Duration::from_secs(2);
-const STDERR_GRACE: Duration = Duration::from_millis(100);
 const ATTEMPT_STAMP_SECS: Duration = Duration::from_secs(30);
 
 fn refresh(state_dir: &Path, validated: ValidatedRefresh) -> PublicReply {
@@ -512,61 +509,41 @@ enum AnthropicInspection {
     Rotate,
     Unavailable(UnusableReason),
 }
-fn inspect_anthropic(path: Option<&Path>, now: i64, floor: i64) -> AnthropicInspection {
-    let Some(path) = path else {
-        return AnthropicInspection::Unavailable(UnusableReason::HostPathUnavailable);
-    };
-    let raw = match read_bounded_regular_file(path, MAX_HOST_CREDENTIAL_FILE_BYTES) {
-        Ok(raw) => raw,
-        Err(_) => {
-            return AnthropicInspection::Unavailable(UnusableReason::HostCredentialUnreadable);
+impl From<Unusable> for UnusableReason {
+    fn from(unusable: Unusable) -> Self {
+        match unusable {
+            Unusable::HostPathUnavailable => UnusableReason::HostPathUnavailable,
+            // A keychain failure reaches here only when no location was usable
+            // at all, and `select` reports the file's reason then. Mapped rather
+            // than panicked: a panic path in the hook is worse than a slightly
+            // less specific reason.
+            Unusable::Absent | Unusable::HostCredentialUnreadable { .. } => {
+                UnusableReason::HostCredentialUnreadable
+            }
+            #[cfg(any(target_os = "macos", test))]
+            Unusable::KeychainUnreadable(_) => UnusableReason::HostCredentialUnreadable,
+            Unusable::HostCredentialMalformed { .. } => UnusableReason::HostCredentialMalformed,
+            Unusable::MissingBearer => UnusableReason::MissingBearer,
         }
+    }
+}
+
+fn inspect_anthropic(read: AnthropicHostRead, now: i64, floor: i64) -> AnthropicInspection {
+    let credential = match read.into_chosen() {
+        Ok(credential) => credential,
+        Err(unusable) => return AnthropicInspection::Unavailable(UnusableReason::from(unusable)),
     };
-    let value: serde_json::Value = match serde_json::from_slice(&raw) {
-        Ok(value) => value,
-        Err(_) => return AnthropicInspection::Unavailable(UnusableReason::HostCredentialMalformed),
-    };
-    let Some(oauth) = value.get("claudeAiOauth") else {
-        return AnthropicInspection::Unavailable(UnusableReason::HostCredentialMalformed);
-    };
-    let Some(access) = oauth
-        .get("accessToken")
-        .and_then(serde_json::Value::as_str)
-        .filter(|v| !v.is_empty())
-    else {
-        return AnthropicInspection::Unavailable(UnusableReason::MissingBearer);
-    };
-    let Some(expiry) = expires_at_ms(oauth.get("expiresAt")) else {
+    let Some(expiry) = credential.expires_at_ms else {
         return AnthropicInspection::Rotate;
     };
     let Some(expires_in) = ExpiresIn::from_expiry_ms(expiry, now, floor) else {
         return AnthropicInspection::Rotate;
     };
     AnthropicInspection::Serve {
-        bearer: Bearer(access.into()),
+        bearer: Bearer(credential.access_token),
         expires_in,
-        scope: OAuthScope::from_host(oauth.get("scopes")),
+        scope: OAuthScope::from_host(credential.oauth.get("scopes")),
         above_margin: expiry.saturating_sub(now) / 1000 > ROTATION_MARGIN_SECS,
-    }
-}
-fn expires_at_ms(value: Option<&serde_json::Value>) -> Option<i64> {
-    match value? {
-        serde_json::Value::Number(value) => value
-            .as_i64()
-            .filter(|n| *n > 0)
-            .or_else(|| {
-                value
-                    .as_u64()
-                    .and_then(|n| i64::try_from(n).ok())
-                    .filter(|n| *n > 0)
-            })
-            .or_else(|| {
-                value
-                    .as_f64()
-                    .filter(|n| n.is_finite() && *n > 0.0 && *n <= i64::MAX as f64)
-                    .map(|n| n as i64)
-            }),
-        _ => None,
     }
 }
 fn anth_reply(state_dir: &Path, state: AnthropicInspection) -> PublicReply {
@@ -593,10 +570,7 @@ fn anthropic_refresh<F>(state_dir: &Path, now: i64, runner: F) -> PublicReply
 where
     F: Fn(&str, &[&str], &Path, Duration) -> Result<()>,
 {
-    let path = RotatableProvider::Anthropic
-        .credential()
-        .host_credential_path();
-    let initial = inspect_anthropic(path.as_deref(), now, SERVING_FLOOR_SECS);
+    let initial = inspect_anthropic(anthropic_host_read(), now, SERVING_FLOOR_SECS);
     if matches!(
         &initial,
         AnthropicInspection::Serve {
@@ -616,7 +590,7 @@ where
             let Ok(now) = now_ms() else {
                 return unavailable(RotatableProvider::Anthropic, UnusableReason::InvalidExpiry);
             };
-            return match inspect_anthropic(path.as_deref(), now, SERVING_FLOOR_SECS) {
+            return match inspect_anthropic(anthropic_host_read(), now, SERVING_FLOOR_SECS) {
                 ready @ AnthropicInspection::Serve { .. } => anth_reply(state_dir, ready),
                 _ => unavailable(
                     RotatableProvider::Anthropic,
@@ -628,7 +602,7 @@ where
     let Ok(now) = now_ms() else {
         return unavailable(RotatableProvider::Anthropic, UnusableReason::InvalidExpiry);
     };
-    let reread = inspect_anthropic(path.as_deref(), now, SERVING_FLOOR_SECS);
+    let reread = inspect_anthropic(anthropic_host_read(), now, SERVING_FLOOR_SECS);
     if matches!(
         &reread,
         AnthropicInspection::Serve {
@@ -668,10 +642,19 @@ where
     // Keep the provider lock through installation so a launcher cannot
     // overwrite a just-rotated credential with an older host snapshot.
     let _lock = lock;
+    // Both locations are re-read here, which is the whole fix: when the host CLI
+    // refreshed the keychain item rather than the file, this is the only read
+    // that can see it.
     anth_reply(
         state_dir,
-        inspect_anthropic(path.as_deref(), now, SERVING_FLOOR_SECS),
+        inspect_anthropic(anthropic_host_read(), now, SERVING_FLOOR_SECS),
     )
+}
+
+/// Both Anthropic host credential locations, under the one budget a proxied
+/// request can afford.
+fn anthropic_host_read() -> AnthropicHostRead {
+    host_credential::read_anthropic(ReadBudget::Hook)
 }
 
 enum AccessTokenKind {
@@ -934,93 +917,17 @@ fn isolated_work_dir(state_dir: &Path) -> Result<tempfile::TempDir> {
         .context("creating isolated OAuth work directory")
 }
 fn run_host_cli(cmd: &str, args: &[&str], cwd: &Path, timeout: Duration) -> Result<()> {
-    let mut command = Command::new(cmd);
-    command
-        .args(args)
-        .current_dir(cwd)
-        .env_clear()
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    for name in [
-        "HOME",
-        "PATH",
-        "USER",
-        "LOGNAME",
-        "TMPDIR",
-        "LANG",
-        "LC_ALL",
-        "SSL_CERT_FILE",
-        "SSL_CERT_DIR",
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "ALL_PROXY",
-        "NO_PROXY",
-        "http_proxy",
-        "https_proxy",
-        "all_proxy",
-        "no_proxy",
-    ] {
-        if let Some(value) = std::env::var_os(name) {
-            command.env(name, value);
-        }
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) == 0 {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::last_os_error())
-                }
-            });
-        }
-    }
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("spawning host {cmd}"))?;
-    let pid = child.id() as libc::pid_t;
-    let stderr = child.stderr.take().expect("piped");
-    let (sent, received) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let _ = std::io::copy(&mut std::io::BufReader::new(stderr), &mut std::io::sink());
-        let _ = sent.send(());
-    });
-    let start = Instant::now();
-    loop {
-        match child.try_wait()? {
-            Some(status) => {
-                let _ = received.recv_timeout(STDERR_GRACE);
-                if status.success() {
-                    return Ok(());
-                }
-                anyhow::bail!("host {cmd} failed")
-            }
-            None if start.elapsed() >= timeout => {
-                unsafe {
-                    if libc::kill(-pid, libc::SIGKILL) == -1
-                        && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-                    {
-                        let _ = child.kill();
-                    }
-                }
-                let reap_start = Instant::now();
-                while child.try_wait()?.is_none() && reap_start.elapsed() < REAP_CEILING {
-                    std::thread::sleep(POLL_OVERSHOOT);
-                }
-                let _ = received.recv_timeout(STDERR_GRACE);
-                anyhow::bail!("host {cmd} timed out")
-            }
-            None => std::thread::sleep(POLL_OVERSHOOT),
-        }
-    }
+    host_cli::run_discarding_stdout(cmd, args, cwd, timeout).map_err(|failure| match failure {
+        host_cli::Failure::TimedOut => anyhow::anyhow!("host {cmd} timed out"),
+        host_cli::Failure::Spawn(kind) => anyhow::anyhow!("spawning host {cmd}: {kind}"),
+        _ => anyhow::anyhow!("host {cmd} failed"),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host_cli::{REAP_CEILING, STDERR_GRACE};
 
     /// V8: the rotatable set is exactly the providers carrying OAuth-rotation
     /// facts, `from_sni` round-trips each SNI (case-insensitively), and an
@@ -1360,6 +1267,30 @@ mod tests {
                 + POLL_OVERSHOOT
                 + REAP_CEILING
                 + STDERR_GRACE
+                + Duration::from_secs(5)
+                < Duration::from_secs(90)
+        );
+    }
+
+    /// Anthropic consults the keychain at most three times on one path: the
+    /// initial read, the read under the lock, and the read after the CLI. (The
+    /// lock-failed path reads twice.)
+    ///
+    /// This asserts a **polling/wait budget**, not an absolute deadline: each
+    /// read spends its share of the deadline plus the bounded kill/reap and
+    /// collector grace that follow every exit path (F01). Process spawn and OS
+    /// scheduling are outside the arithmetic, and the runner keeps a late-but-
+    /// successful answer, so this proves the handler budget has headroom under
+    /// stated assumptions rather than a hard real-time bound.
+    #[test]
+    fn anthropic_hook_budget_covers_three_keychain_reads() {
+        assert!(
+            LOCK_CEILING
+                + ANTHROPIC_CLI_TIMEOUT
+                + POLL_OVERSHOOT
+                + REAP_CEILING
+                + STDERR_GRACE
+                + crate::host_credential::HOOK_KEYCHAIN_NOMINAL_COST * 3
                 + Duration::from_secs(5)
                 < Duration::from_secs(90)
         );

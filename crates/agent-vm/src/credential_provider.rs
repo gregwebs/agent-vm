@@ -119,19 +119,25 @@ impl CredentialProvider {
     /// `$HOME`-anchored file this provider captures from. `None` only when
     /// `$HOME` is unset (preserved legacy behaviour: capture is skipped, not
     /// a hard error).
+    ///
+    /// Still the *file* location, not the credential location as a whole: this
+    /// is what `doctor` prints and what `snapshot_host_creds` hashes, and a
+    /// keychain item has no path to print or hash.
     pub fn host_credential_path(self) -> Option<PathBuf> {
         let home = std::env::var_os("HOME")?;
-        Some(PathBuf::from(home).join(self.spec().host_credential_home_relative))
+        Some(PathBuf::from(home).join(self.spec().host_credential.file))
+    }
+
+    /// The generic-password service this provider's CLI keeps its macOS login
+    /// under, when it keeps one there at all. Only Anthropic does (#492).
+    pub(crate) fn host_keychain_service(self) -> Option<&'static str> {
+        self.spec().host_credential.mac_keychain
     }
 
     /// Retained verbatim so `agent-vm doctor`'s output is byte-identical; it
     /// names the *CLI that owns the host file*, not the provider.
     pub(crate) fn doctor_label(self) -> &'static str {
         self.spec().doctor_label
-    }
-
-    pub(crate) fn doctor_parses_expiry(self) -> bool {
-        self.spec().doctor_parses_expiry
     }
 
     fn oauth_rotation(self) -> Option<&'static OAuthRotation> {
@@ -502,14 +508,23 @@ pub(crate) struct OAuthRotation {
     pub(crate) host_login_hint: &'static str,
 }
 
+/// Where a provider's host login lives (#492, ADR-0056).
+struct HostCredentialSpec {
+    /// `$HOME`-relative file: what `doctor` prints and
+    /// `snapshot_host_creds` hashes.
+    file: &'static str,
+    /// The generic-password service a macOS CLI keeps its login under, when it
+    /// keeps one there at all.
+    mac_keychain: Option<&'static str>,
+}
+
 /// One row of the knowledge table: every fact about one provider in one place
 /// to read. Private; the public surface is the accessor functions above.
 struct ProviderSpec {
     config_name: &'static str,
     /// Retained verbatim so `agent-vm doctor`'s output is byte-identical.
     doctor_label: &'static str,
-    doctor_parses_expiry: bool,
-    host_credential_home_relative: &'static str,
+    host_credential: HostCredentialSpec,
     /// Created by `ProjectSession::ensure_dirs` before boot.
     eager_state_dirs: &'static [&'static str],
     home_links: &'static [HomeLink],
@@ -519,11 +534,23 @@ struct ProviderSpec {
     oauth_rotation: Option<OAuthRotation>,
 }
 
+#[cfg(not(target_os = "macos"))]
 const ANTHROPIC_MISSING: &str = "no usable Claude credential found on the host at \
 ~/.claude/.credentials.json. Sign in *on the host* with \
 `claude login`, then retry — you cannot `/login` from inside \
 the VM, which only ever sees placeholder tokens. Run \
 `agent-vm doctor` to see what was found.";
+
+/// macOS reads a second host credential location, so its bail has to name it:
+/// an operator whose login lives only in the keychain would otherwise be told
+/// to check a file that was never the problem. The first clause is shared with
+/// the other platforms' text because integration tests pin it.
+#[cfg(target_os = "macos")]
+const ANTHROPIC_MISSING: &str = "no usable Claude credential found on the host at \
+~/.claude/.credentials.json or in the macOS keychain item `Claude Code-credentials`. \
+Sign in *on the host* with `claude login`, then retry — you cannot `/login` from inside \
+the VM, which only ever sees placeholder tokens. Run `agent-vm doctor` to see what \
+was found.";
 
 const COPILOT_MISSING: &str = "no GitHub Copilot token found on the host. Sign in on the host \
 (e.g. `gh auth login` with a Copilot seat, or run the Copilot \
@@ -535,8 +562,10 @@ const SPECS: [ProviderSpec; 4] = [
     ProviderSpec {
         config_name: "anthropic",
         doctor_label: "claude",
-        doctor_parses_expiry: true,
-        host_credential_home_relative: ".claude/.credentials.json",
+        host_credential: HostCredentialSpec {
+            file: ".claude/.credentials.json",
+            mac_keychain: Some(crate::host_credential::CLAUDE_KEYCHAIN_SERVICE),
+        },
         eager_state_dirs: &["claude"],
         home_links: &[
             HomeLink {
@@ -577,8 +606,10 @@ const SPECS: [ProviderSpec; 4] = [
     ProviderSpec {
         config_name: "openai",
         doctor_label: "codex",
-        doctor_parses_expiry: false,
-        host_credential_home_relative: ".codex/auth.json",
+        host_credential: HostCredentialSpec {
+            file: ".codex/auth.json",
+            mac_keychain: None,
+        },
         eager_state_dirs: &["codex"],
         // Codex is deliberately absent from the dotfile links: it locates its
         // config via the `CODEX_HOME` env var, which the *codex tool* declares
@@ -610,8 +641,10 @@ const SPECS: [ProviderSpec; 4] = [
     ProviderSpec {
         config_name: "opencode-static",
         doctor_label: "opencode",
-        doctor_parses_expiry: false,
-        host_credential_home_relative: ".local/share/opencode/auth.json",
+        host_credential: HostCredentialSpec {
+            file: ".local/share/opencode/auth.json",
+            mac_keychain: None,
+        },
         eager_state_dirs: &["opencode"],
         home_links: &[
             HomeLink {
@@ -640,8 +673,10 @@ const SPECS: [ProviderSpec; 4] = [
     ProviderSpec {
         config_name: "copilot",
         doctor_label: "copilot",
-        doctor_parses_expiry: false,
-        host_credential_home_relative: ".cache/claude-vm/copilot-token.json",
+        host_credential: HostCredentialSpec {
+            file: ".cache/claude-vm/copilot-token.json",
+            mac_keychain: None,
+        },
         // Deliberately empty even though the provider owns `copilot/`:
         // `ensure_dirs` does not create it today, and an empty `<state>/copilot`
         // would turn a dangling `.copilot` symlink into a real empty directory
@@ -851,13 +886,31 @@ mod tests {
         assert_eq!(CredentialProvider::Anthropic.host_credential_path(), None);
     }
 
+    /// #492: exactly one provider has a second host credential location. A
+    /// keychain service on another row would silently change that provider's
+    /// behaviour on macOS, which the ticket rules out.
+    #[test]
+    fn only_anthropic_names_a_keychain_service() {
+        let with_service: Vec<&str> = CredentialProvider::ALL
+            .into_iter()
+            .filter(|provider| provider.host_keychain_service().is_some())
+            .map(CredentialProvider::config_name)
+            .collect();
+        assert_eq!(with_service, vec!["anthropic"]);
+        assert_eq!(
+            CredentialProvider::Anthropic.host_keychain_service(),
+            Some("Claude Code-credentials")
+        );
+    }
+
     /// The `CredentialProvider::ALL` order is load-bearing: `doctor.rs` maps
     /// over it to build the host-credential table, and the ticket's AC is that
     /// `agent-vm doctor`'s output stays byte-identical. `ALL` must therefore be
     /// claude, codex, opencode, copilot (transcribed from
     /// `a8fa246:crates/agent-vm/src/doctor.rs:145-161`), and only claude's row
-    /// parses an expiry. `provider_table_is_internally_consistent` only checks
-    /// *uniqueness*, so a reorder would slip past it; this pins the order.
+    /// is read through the two-location path. `provider_table_is_internally_consistent`
+    /// only checks *uniqueness*, so a reorder would slip past it; this pins the
+    /// order.
     #[test]
     fn all_order_and_doctor_labels_match_historical_output() {
         assert_eq!(
@@ -865,10 +918,14 @@ mod tests {
             ["claude", "codex", "opencode", "copilot"],
             "doctor host-credential table order changed"
         );
+        // #492/F02: the second *location* is what makes the claude row the
+        // two-location one. It used to be pinned through `doctor_parses_expiry`
+        // — display metadata that doctor no longer consults for acquisition — so
+        // the same fact is pinned on the field that now decides it.
         assert_eq!(
-            CredentialProvider::ALL.map(|p| p.doctor_parses_expiry()),
+            CredentialProvider::ALL.map(|p| p.host_keychain_service().is_some()),
             [true, false, false, false],
-            "which doctor rows parse an expiry changed"
+            "which doctor rows have a second host credential location changed"
         );
         assert_eq!(
             CredentialProvider::ALL.map(|p| p.config_name()),
@@ -1225,8 +1282,8 @@ mod tests {
         for provider in CredentialProvider::ALL {
             assert!(!provider.config_name().is_empty());
             assert!(!provider.doctor_label().is_empty());
-            let _ = provider.doctor_parses_expiry();
             let _ = provider.host_credential_path();
+            let _ = provider.host_keychain_service();
             let _ = oauth_rotation(provider);
             if let Some(secret) = proxy_secret(provider) {
                 assert!(!secret.env_var.is_empty());
@@ -1250,6 +1307,9 @@ mod tests {
     /// blocks around lines 1245-1271) rather than compared against the table's
     /// own consts, so a future edit to `ANTHROPIC_MISSING`/`COPILOT_MISSING`
     /// actually fails this test.
+    ///
+    /// macOS carries a different Anthropic literal (#492) because it must name
+    /// the keychain item too; the Copilot literal is shared by every platform.
     #[test]
     fn missing_credential_errors_are_exactly_the_two_legacy_bails() {
         // `\`-newline continuation strips the newline and the next line's
@@ -1258,14 +1318,27 @@ mod tests {
              (e.g. `gh auth login` with a Copilot seat, or run the Copilot \
              device-flow login that writes ~/.cache/claude-vm/copilot-token.json) \
              and retry, or pick another agent.";
-        let legacy_anthropic = "no usable Claude credential found on the host at \
+        #[cfg(not(target_os = "macos"))]
+        let expected_anthropic = "no usable Claude credential found on the host at \
              ~/.claude/.credentials.json. Sign in *on the host* with \
              `claude login`, then retry — you cannot `/login` from inside \
              the VM, which only ever sees placeholder tokens. Run \
              `agent-vm doctor` to see what was found.";
+        #[cfg(target_os = "macos")]
+        let expected_anthropic = "no usable Claude credential found on the host at \
+             ~/.claude/.credentials.json or in the macOS keychain item `Claude Code-credentials`. \
+             Sign in *on the host* with `claude login`, then retry — you cannot `/login` from inside \
+             the VM, which only ever sees placeholder tokens. Run `agent-vm doctor` to see what \
+             was found.";
         assert_eq!(
             missing_credential_error(CredentialProvider::Anthropic),
-            Some(legacy_anthropic)
+            Some(expected_anthropic)
+        );
+        // The prefix every integration test asserts, on every platform.
+        assert!(
+            missing_credential_error(CredentialProvider::Anthropic)
+                .unwrap()
+                .starts_with("no usable Claude credential found on the host")
         );
         assert_eq!(
             missing_credential_error(CredentialProvider::Copilot),

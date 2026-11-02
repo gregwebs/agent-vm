@@ -22,6 +22,7 @@ use vstd::prelude::*;
 
 use crate::credential_provider::{self, CredentialProvider, ProviderSet};
 use crate::defaults::CHROME_MCP_WRAPPER_PATH;
+use crate::host_credential;
 use crate::host_paths::{
     GuestStateDir, MAX_HOST_CREDENTIAL_FILE_BYTES, atomic_write, read_bounded_regular_file,
 };
@@ -1354,27 +1355,21 @@ fn clear_unwired_placeholders(guest: &GuestStateDir, wired: ProviderSet) {
 }
 
 fn refresh_anthropic(state_dir: &Path, guest: &GuestStateDir) -> Result<Option<PathBuf>> {
-    let Some(host_path) = CredentialProvider::Anthropic.host_credential_path() else {
-        return Ok(None);
-    };
-    let raw = String::from_utf8(read_bounded_regular_file(
-        &host_path,
-        MAX_HOST_CREDENTIAL_FILE_BYTES,
-    )?)
-    .with_context(|| format!("reading {}", host_path.display()))?;
-    let json: Value =
-        serde_json::from_str(&raw).with_context(|| format!("parsing {}", host_path.display()))?;
-
-    let oauth = json
-        .get("claudeAiOauth")
-        .context("host .credentials.json missing claudeAiOauth")?;
-    let access_token = oauth
-        .get("accessToken")
-        .and_then(|v| v.as_str())
-        .context("host claudeAiOauth missing accessToken")?;
+    // Both host credential locations, freshest wins (#492): a macOS login that
+    // Claude Code keeps in the keychain would otherwise lose to the stale file
+    // it never rewrites.
+    let credential =
+        match host_credential::read_anthropic(host_credential::ReadBudget::Launch).into_chosen() {
+            Ok(credential) => credential,
+            // `$HOME` unset: no file location exists. Preserved as "capture
+            // skipped", not an error, exactly as before.
+            Err(host_credential::Unusable::HostPathUnavailable) => return Ok(None),
+            Err(unusable) => return Err(unusable).context("reading the Anthropic host credential"),
+        };
+    let oauth = &credential.oauth;
 
     let token_file = anthropic_token_path(state_dir);
-    atomic_write(&token_file, access_token.as_bytes(), 0o600)?;
+    atomic_write(&token_file, credential.access_token.as_bytes(), 0o600)?;
 
     let placeholder = serde_json::json!({
         "claudeAiOauth": {
@@ -2168,6 +2163,128 @@ mod tests {
             sd.display(),
         );
         assert_eq!(cp.parent().unwrap().parent(), sd.parent());
+    }
+
+    /// #492 case 6. Capture uses the fresher host credential location: the
+    /// keychain bearer lands in the 0600 host-only token file and the keychain
+    /// `expiresAt` in the guest placeholder, while the host file — the location
+    /// Claude Code never rewrote — stays byte-identical, because agent-vm writes
+    /// neither location.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn capture_takes_the_fresher_keychain_credential() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut env = crate::test_env::guard();
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let host_file = claude.join(".credentials.json");
+        let stale = format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"FILE_STALE","expiresAt":{}}}}}"#,
+            1_000
+        );
+        std::fs::write(&host_file, &stale).unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let security = bin.path().join("security");
+        let keychain_expiry = 9_999_999_999_000i64;
+        std::fs::write(
+            &security,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' '{{\"claudeAiOauth\":{{\"accessToken\":\"KEYCHAIN_FRESH\",\"expiresAt\":{keychain_expiry},\"scopes\":[\"user:inference\"],\"subscriptionType\":\"pro\"}}}}'\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o755)).unwrap();
+        env.set_var("HOME", home.path());
+        env.set_var("AGENT_VM_TEST_SECURITY", &security);
+        env.set_var("USER", "agentvm-test-user");
+        let state = tempfile::tempdir().unwrap();
+
+        let creds = super::refresh(
+            state.path(),
+            "/workspace/p",
+            &provisioning(ProviderSet::new([CredentialProvider::Anthropic]), false),
+        )
+        .unwrap();
+
+        let token = anthropic_token_path(state.path());
+        assert_eq!(creds.anthropic_token_file.as_deref(), Some(token.as_path()));
+        assert_eq!(std::fs::read_to_string(&token).unwrap(), "KEYCHAIN_FRESH");
+        assert_eq!(
+            std::fs::metadata(&token).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(
+            !token.starts_with(state.path()),
+            "the real token must stay outside the guest-visible state dir"
+        );
+
+        let placeholder: Value = serde_json::from_slice(
+            &std::fs::read(state.path().join("claude/.credentials.json")).unwrap(),
+        )
+        .unwrap();
+        let oauth = &placeholder["claudeAiOauth"];
+        assert_eq!(oauth["accessToken"], ANTHROPIC_ACCESS_PLACEHOLDER);
+        assert_eq!(oauth["expiresAt"], keychain_expiry);
+        assert_eq!(oauth["subscriptionType"], "pro");
+        assert_eq!(
+            std::fs::read_to_string(&host_file).unwrap(),
+            stale,
+            "agent-vm must never write the host credential file"
+        );
+    }
+
+    /// The mirror of the case above: a file that is fresher still wins, and its
+    /// `expiresAt` is the one the guest placeholder carries. Without this, an
+    /// accidental "the keychain always wins" would pass the test above.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn capture_keeps_a_fresher_file_over_the_keychain() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut env = crate::test_env::guard();
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let file_expiry = 9_999_999_999_000i64;
+        std::fs::write(
+            claude.join(".credentials.json"),
+            format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"FILE_FRESH","expiresAt":{file_expiry}}}}}"#
+            ),
+        )
+        .unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let security = bin.path().join("security");
+        std::fs::write(
+            &security,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' '{{\"claudeAiOauth\":{{\"accessToken\":\"KEYCHAIN_STALE\",\"expiresAt\":{}}}}}'\n",
+                2_000
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o755)).unwrap();
+        env.set_var("HOME", home.path());
+        env.set_var("AGENT_VM_TEST_SECURITY", &security);
+        env.set_var("USER", "agentvm-test-user");
+        let state = tempfile::tempdir().unwrap();
+
+        super::refresh(
+            state.path(),
+            "/workspace/p",
+            &provisioning(ProviderSet::new([CredentialProvider::Anthropic]), false),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(anthropic_token_path(state.path())).unwrap(),
+            "FILE_FRESH"
+        );
+        let placeholder: Value = serde_json::from_slice(
+            &std::fs::read(state.path().join("claude/.credentials.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(placeholder["claudeAiOauth"]["expiresAt"], file_expiry);
     }
 
     /// **S4.** `github_egress` no longer feeds Copilot capture, and nothing

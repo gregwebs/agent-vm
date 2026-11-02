@@ -3,6 +3,10 @@
 //! Rust compiles each file in `tests/` as its own crate, so this module is
 //! rebuilt per test binary. It exists to keep a cross-harness precondition in
 //! one place rather than copied into every harness that needs it.
+//!
+//! Each harness uses a different subset of it, so unused items here are
+//! expected — the same allowance `support/fake_msb.rs` and friends take.
+#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 
@@ -39,6 +43,37 @@ pub fn project_tempdir() -> tempfile::TempDir {
         .expect("canonicalize project temp dir");
     assert_off_tmpfs(&canonical);
     dir
+}
+
+/// A `PATH` whose `security` finds nothing, plus the handle that keeps the stub
+/// alive for the child's lifetime.
+///
+/// For a harness that runs agent-vm with **no `$HOME`**: macOS resolves the
+/// login keychain from the passwd entry rather than from `$HOME` there, so a
+/// developer's real Claude Code login item would otherwise be read — and a
+/// usable one would change the launch path the test is asserting (#492, R12).
+/// A harness with a temp `$HOME` does not need this: `security` resolves
+/// `$HOME/Library/Keychains/login.keychain-db` and misses.
+///
+/// Inert off macOS, where nothing reads a keychain.
+pub fn path_without_host_keychain() -> (tempfile::TempDir, String) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tempfile::tempdir_in(workspace_tmpdir()).expect("create no-keychain stub dir");
+    let bin = root.path().join("no-keychain-bin");
+    std::fs::create_dir(&bin).expect("create no-keychain bin");
+    let stub = bin.join("security");
+    // 44 is `errSecItemNotFound`, which the reader treats as "no item" rather
+    // than as a failure.
+    std::fs::write(&stub, "#!/bin/sh\nexit 44\n").expect("write no-keychain stub");
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+        .expect("make the no-keychain stub executable");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    (root, path)
 }
 
 /// Panic if `path` is under a guest tmpfs prefix, so the caller gets an
