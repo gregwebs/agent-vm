@@ -8122,6 +8122,7 @@ const SHIPPED_REQUESTS: [(&str, &[&str]); 7] = [
             "auth.openai.com",
             "chatgpt.com",
             "mcp-proxy.anthropic.com",
+            "pi.dev",
             "platform.claude.com",
         ],
     ),

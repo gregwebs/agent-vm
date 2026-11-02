@@ -2,7 +2,9 @@
 
 Reviewed 2026-10-12 for [#328](https://github.com/gregwebs/agent-vm/issues/328);
 source key F and the second Pi row added for
-[#360](https://github.com/gregwebs/agent-vm/issues/360).
+[#360](https://github.com/gregwebs/agent-vm/issues/360); source key G and Pi's
+`pi.dev` catalog row added for
+[#498](https://github.com/gregwebs/agent-vm/issues/498).
 The executable source is [default-tools.toml](../crates/agent-vm/src/default-tools.toml).
 This completes five provider rows (the four from #328 plus Pi's
 `agent-vm-codex` extension), **not all shipped tools**: Copilot's inventory is
@@ -72,6 +74,7 @@ implementations or maintained primary documentation below.
 | OpenCode 1.18.34 | `chatgpt.com` | OpenAI subscription inference | D |
 | OpenCode 1.18.34 | `models.opencode.ai` | Credential-free provider-catalog refresh | D |
 | Pi 0.87.1 + bridge 0.8.0 | `api.anthropic.com`, `mcp-proxy.anthropic.com`, `platform.claude.com` | Explicit shipped Claude bridge baseline under the same provisioned auth conditions, not all Pi adapters or a provisioning union | A, A1, E |
+| Pi 1.4.0 (host) / 1.3.0 (image) | `pi.dev` | Provider-catalog refresh for `/model`: one JSON GET per provider per 4 h, cached catalog kept on failure; credential-free and not inference | G |
 | Pi 0.87.1 + `agent-vm-codex` (PR A contract; pending) | `chatgpt.com` | ChatGPT subscription inference (`/backend-api/codex/responses`) carrying the provisioned placeholder | F |
 | Pi 0.87.1 + `agent-vm-codex` (PR A contract; pending) | `auth.openai.com` | Placeholder OAuth refresh on a 401, answered host-side by `_intercept_hook`; already-provisioned baseline | F |
 | Copilot 1.0.90 | omitted | **Incomplete evidence**, not absence of provider traffic; #340 | C |
@@ -227,6 +230,40 @@ change had not merged when this row was written, so `E`'s `087f8ba` pin —
 v0.1.3 — is the pin for the **bridge** row only and predates this one. Fill in
 the merge commit and the image version that ships it before the release
 reviewer signs off.
+
+### G — Pi provider-catalog refresh
+
+Two pins, because this row must hold for the image and for a newer host Pi: the
+host `@earendil-works/pi-coding-agent` **1.4.0**, and the image's **1.3.0**
+(`/opt/agent-vm/pi/node_modules/@earendil-works/pi-coding-agent` in
+`agent-vm-standard:local`). Both carry the same constant in
+`dist/core/remote-catalog-provider.js`:
+
+```text
+5:  const DEFAULT_CATALOG_BASE_URL = "https://pi.dev";
+6:  const REMOTE_CATALOG_ATTEMPT_TIMEOUT_MS = 4_000;
+7:  export const REMOTE_CATALOG_REFRESH_INTERVAL_MS = 4 * 60 * 60 * 1000;
+57:  const url = new URL(`/api/models/providers/${encodeURIComponent(providerId)}`, catalogBaseUrl);
+```
+
+`withRemoteCatalog` wraps every built-in provider except OpenRouter — which is
+personalized — at `dist/core/model-runtime.js:95`, and the check in that same
+`remote-catalog-provider.js` at lines 87–93 skips the request when a provider was
+checked less than four hours ago. So a refresh touches only the providers that
+aged out, and a failure leaves the shipped or cached catalog in use: without the
+declaration the guest reports `Could not refresh <provider>; showing cached
+models` for whichever providers went stale, intermittently and one at a time.
+
+Measured in the guest on 2026-11-01 with `curl`: `pi.dev/api/models/providers/deepseek`
+returned `000` (`Could not resolve host: pi.dev`) while an allowlisted name in
+the same run answered (`api.deepseek.com/models` → `401`, i.e. reachable and
+unauthenticated).
+
+Scope: a read-only JSON catalog under `/api/models/`, not inference, and
+credential-free — it authorizes no provider API, and the `openai`/`anthropic`
+baselines are unaffected. `PI_OFFLINE` is Pi's own switch to suppress these
+requests and agent-vm does not set it, so `/model` reports the truth instead of
+staying silent.
 
 ## Maintenance and acceptance
 
