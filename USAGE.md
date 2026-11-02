@@ -1419,7 +1419,7 @@ mounts = ["agent"]
 
 [[tools]]
 name = "pi"
-network_requests = ["api.anthropic.com", "auth.openai.com", "chatgpt.com", "mcp-proxy.anthropic.com", "platform.claude.com"]
+network_requests = ["api.anthropic.com", "auth.openai.com", "chatgpt.com", "mcp-proxy.anthropic.com", "pi.dev", "platform.claude.com"]
 command = "pi"
 args = []
 tools = ["claude", "codex"]

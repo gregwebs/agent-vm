@@ -1763,7 +1763,7 @@ user:    <fixture>/home/.config/agent-vm/config.toml (absent)
 project: <fixture>/project/.agent-vm/config.toml (absent)
 resolved: built-in defaults; launch-verb order
   1. dsh -> "dsh"; args=1; credentials=none; provisions=none; persist=1; source=built-in
-  2. pi -> "pi"; args=0; credentials=none; provisions=anthropic,openai; persist=0; source=built-in; network_requests=api.anthropic.com,auth.openai.com,chatgpt.com,mcp-proxy.anthropic.com,platform.claude.com
+  2. pi -> "pi"; args=0; credentials=none; provisions=anthropic,openai; persist=0; source=built-in; network_requests=api.anthropic.com,auth.openai.com,chatgpt.com,mcp-proxy.anthropic.com,pi.dev,platform.claude.com
   3. codex -> "codex"; args=0; credentials=openai; provisions=openai; persist=0; source=built-in; env=1; network_requests=api.openai.com,auth.openai.com,chatgpt.com
   4. opencode -> "opencode"; args=0; credentials=openai,opencode-static; provisions=openai,opencode-static; persist=0; source=built-in; network_requests=api.openai.com,auth.openai.com,chatgpt.com,models.opencode.ai
   5. claude -> "claude"; args=1; credentials=anthropic; provisions=anthropic; persist=0; source=built-in; network_requests=api.anthropic.com,mcp-proxy.anthropic.com,platform.claude.com
@@ -3622,7 +3622,7 @@ credentials:
             ("dsh", ""),
             (
                 "pi",
-                "api.anthropic.com,auth.openai.com,chatgpt.com,mcp-proxy.anthropic.com,platform.claude.com",
+                "api.anthropic.com,auth.openai.com,chatgpt.com,mcp-proxy.anthropic.com,pi.dev,platform.claude.com",
             ),
             ("codex", "api.openai.com,auth.openai.com,chatgpt.com"),
             (

@@ -4902,6 +4902,7 @@ mod tests {
                     "auth.openai.com",
                     "chatgpt.com",
                     "mcp-proxy.anthropic.com",
+                    "pi.dev",
                     "platform.claude.com",
                 ],
             ),

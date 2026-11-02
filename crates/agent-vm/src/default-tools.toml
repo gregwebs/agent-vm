@@ -118,11 +118,18 @@ persist = [".dsh"]
 # and telemetry are forwarded -- see ADR-0021.
 [[tools]]
 name = "pi"
-# Explicit shipped baseline: the bridge's three names plus the two the
-# image-owned agent-vm-codex extension dials. Not inherited from `tools`, and
-# deliberately without api.openai.com: only Pi's built-in `openai` provider
-# reaches it, and only with a user-configured key (ADR-0039).
-network_requests = ["api.anthropic.com", "auth.openai.com", "chatgpt.com", "mcp-proxy.anthropic.com", "platform.claude.com"]
+# Explicit shipped baseline: the bridge's three names, the two the image-owned
+# agent-vm-codex extension dials, and Pi's own model catalog. Not inherited from
+# `tools`, and deliberately without api.openai.com: only Pi's built-in `openai`
+# provider reaches it, and only with a user-configured key (ADR-0039).
+#
+# `pi.dev` is provider-catalog refresh, not inference: `/model` fetches
+# `/api/models/providers/<id>` per provider, at most once per 4 h per provider,
+# and falls back to the cached catalog when it fails. Without it every refresh
+# fails and `/model` reports "Could not refresh <provider>; showing cached
+# models" for whichever providers aged out — the catalog silently stays at the
+# version shipped with the image.
+network_requests = ["api.anthropic.com", "auth.openai.com", "chatgpt.com", "mcp-proxy.anthropic.com", "pi.dev", "platform.claude.com"]
 command = "pi"
 args = []
 tools = ["claude", "codex"]
