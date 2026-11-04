@@ -1419,10 +1419,11 @@ mounts = ["agent"]
 
 [[tools]]
 name = "pi"
-network_requests = ["api.anthropic.com", "auth.openai.com", "chatgpt.com", "mcp-proxy.anthropic.com", "pi.dev", "platform.claude.com"]
+network_requests = ["api.anthropic.com", "auth.openai.com", "chatgpt.com", "cloudcode-pa.googleapis.com", "daily-cloudcode-pa.googleapis.com", "daily-cloudcode-pa.sandbox.googleapis.com", "mcp-proxy.anthropic.com", "oauth2.googleapis.com", "pi.dev", "platform.claude.com"]
 command = "pi"
 args = []
 tools = ["claude", "codex"]
+credentials = ["antigravity"]
 persist = []
 mounts = ["agent", "~/.pi:fork"]
 
@@ -1545,9 +1546,10 @@ onto bytes written *after* boot, and `pi auth login` on the host can create
 refusal prints the exposed file's canonical path and the mount root's, so a
 `/tmp/…` spelling does not read as a different directory.
 - `:fork` is different in kind — a one-time copy made host-side — so it is
-allowed: the two files are **omitted** from the copy, with a notice, and
-everything else is copied. Their containing directory stays, and the host files
-are untouched.
+allowed: the protected files (`auth.json`, `models.json`, and
+`antigravity-accounts.json`, which holds `pi-antigravity`'s account tokens) are
+**omitted** from the copy, with a notice, and everything else is copied. Their
+containing directory stays, and the host files are untouched.
 - The **remedy in a refusal depends on what was mounted**, because `:fork` is
 not always one. A root at or inside `~/.pi` gets the `:fork` recommendation; a
 regular file (the credential itself) cannot be mounted at all and no `:fork` is
@@ -1842,9 +1844,12 @@ network_requests = ["api.example.com"] # optional; destinations the tool expects
   echoed. Args are not shell-split or expanded.
 - `credentials` — optional; provider **config names**, which differ from
   the `agent-vm doctor` row labels. Valid: `anthropic`, `openai`,
-  `opencode-static`, `copilot`. Note `opencode` (the doctor label) is **not**
-  a valid name — use `opencode-static`. This is the **requirement** set: a
-  launch hard-fails before boot when one of them yielded no usable host login.
+  `opencode-static`, `copilot`, `antigravity`. Note `opencode` (the doctor
+  label) is **not** a valid name — use `opencode-static`. This is the
+  **requirement** set: a launch hard-fails before boot when one of them yielded
+  no usable host login. `antigravity` never hard-fails: a host with no Google
+  login simply has no `antigravity/*` models, because that provider is Pi's own
+  (the image-owned `pi-antigravity` extension).
 - `tools` — optional; the names of **other tools whose credentials this tool's
   guest should have**. Not provider names. Named tools are *provisioned*, never
   *required*, so naming a tool you have no host login for degrades silently

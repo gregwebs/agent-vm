@@ -200,6 +200,7 @@ fn creds_notice(creds: &crate::secrets::CredsState) -> String {
         ),
         (creds.gh_token_file.is_some(), "gh"),
         (creds.copilot_token_file.is_some(), "copilot"),
+        (creds.antigravity_token_file.is_some(), "antigravity"),
     ] {
         if present {
             found.push(label.to_string());
@@ -315,6 +316,28 @@ fn resolve_project_guest_path(
 /// The leaf is included because microsandbox validates `workdir` against the
 /// rootfs at create time, *before* the bind mount is materialized — without
 /// the empty mount point dir it errors with "workdir does not exist in
+/// The host directory the guest reads as its Pi home, when a writable mount
+/// redefines `~/.pi` — in practice a `:fork` of the host's Pi home, whose data
+/// directory replaces the state-dir home the guest would otherwise read.
+///
+/// `None` means "the ordinary `<state>/pi` home": no mount at that guest path,
+/// or a read-only one. A mount that is writable *is* the guest's Pi home, so
+/// the caller writes the credential placeholder there; `protected_host_files`
+/// has already refused any live bind that would expose the host's real
+/// credential files.
+fn pi_home_host_root<'a>(
+    plan: &'a mount::PreparedMountPlan,
+    pi_home_guest: &Path,
+) -> Option<&'a Path> {
+    plan.volumes
+        .iter()
+        .find(|volume| volume.guest == pi_home_guest)
+        .and_then(|volume| match &volume.source {
+            mount::PreparedVolumeSource::WritableBind(host) => Some(host.as_path()),
+            mount::PreparedVolumeSource::ReadOnlyBind(_) => None,
+        })
+}
+
 /// guest". The bind mount then overlays this empty dir with the host's
 /// project contents at boot.
 fn mkdir_chain(project: &Path) -> Vec<String> {
@@ -786,6 +809,8 @@ pub(crate) async fn launch(
         .as_ref()
         .map(|identity| PathBuf::from(identity.host_home()))
         .unwrap_or_else(|| PathBuf::from("/root"));
+    // The guest path a `:fork` of the host's `~/.pi` is mounted at, when one is.
+    let pi_home_guest = guest_home_path.join(".pi");
     // Independent of `guest_identity` (which is `None` under `--root`) so
     // the `--mount …:follow-links` $HOME guardrail is still enforced in
     // root mode instead of silently no-op'ing. See `mount::expand_follow_links`.
@@ -1073,6 +1098,10 @@ pub(crate) async fn launch(
             replaced: launch_credentials.replaced(),
             github_egress: use_github,
         },
+        // A `:fork` of the host's `~/.pi` moves the guest's Pi home out of
+        // `<state>/pi`, so a placeholder written there would be shadowed. The
+        // fork's data directory is the root the guest actually reads.
+        pi_home_host_root(&mount_plan, &pi_home_guest),
     )
     .context("snapshotting host credentials")?;
 
@@ -3765,23 +3794,31 @@ mod tests {
         );
     }
 
-    /// V7 (#96): `pi` declares neither default `args` nor `credentials`, so a
-    /// user subcommand stays at argv[1] and the launch cannot hard-bail on a
-    /// missing credential. Adding `args = ["--approve"]` here would displace
-    /// `list` and run an agent turn instead (ADR-0012, ADR-0021); this test
-    /// exists so that regression cannot slip back in.
+    /// V7 (#96): `pi` declares no default `args`, so a user subcommand stays at
+    /// argv[1]. Adding `args = ["--approve"]` here would displace `list` and run
+    /// an agent turn instead (ADR-0012, ADR-0021); this test exists so that
+    /// regression cannot slip back in.
+    ///
+    /// It declares exactly one credential — `antigravity`, the image-owned
+    /// provider extension's own login (#507) — which must stay *graceful*: a
+    /// host with no Google login loses the models, never the launch.
     #[test]
-    fn pi_declares_no_args_and_no_credentials() {
+    fn pi_declares_no_args_and_only_graceful_credentials() {
         let catalog = default_catalog();
         let pi = tool(&catalog, "pi");
         assert!(pi.argv().is_empty(), "pi must declare no default args");
-        assert!(
-            pi.credentials().is_empty(),
-            "pi must declare no credentials"
-        );
         assert_eq!(
             pi.credential_providers(),
-            crate::credential_provider::ProviderSet::new(std::iter::empty())
+            crate::credential_provider::ProviderSet::new([
+                crate::credential_provider::CredentialProvider::Antigravity,
+            ])
+        );
+        assert!(
+            crate::credential_provider::missing_credential_error(
+                crate::credential_provider::CredentialProvider::Antigravity,
+            )
+            .is_none(),
+            "pi's own credential must never hard-bail the launch"
         );
         assert_eq!(
             inner_argv(pi, vec!["list".into()]),
@@ -5885,6 +5922,58 @@ options ndots:2 timeout:1";
                 .any(|s| s.eq_ignore_ascii_case("gregwebs/microsandbox")),
             "expected gregwebs/microsandbox in scope, got {slugs:?}"
         );
+    }
+
+    /// #507: the guest's Pi home is a `:fork`'s `data` directory when the host's
+    /// `~/.pi` is forked there, so that — not `<state>/pi` — is where a
+    /// placeholder has to be written. A writable non-fork bind at the same guest
+    /// path is `None`: the caller then uses the state dir, and `prepare` never
+    /// lets a live bind of the Pi home reach here anyway.
+    #[test]
+    fn pi_home_host_root_resolves_the_fork_data_directory() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("settings.json"), "{}").unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let context = mount::MountContext {
+            mount_store: store.path().to_path_buf(),
+            authority_home: Some(test_home()),
+            account_home: None,
+            host_home: Some(test_home()),
+            core_guest_mounts: Vec::new(),
+            core_host_sources: Vec::new(),
+            persisted_home: crate::guest_home::PersistedHome::none(),
+        };
+        let guest = PathBuf::from("/home/guest/.pi");
+
+        let raw = format!("{}:{}:fork", source.path().display(), guest.display());
+        let plan = mount::prepare(mount::parse_extra_mounts(&[raw]).unwrap(), &context).unwrap();
+        let resolved = pi_home_host_root(&plan, &guest).expect("a fork of the Pi home");
+        assert!(resolved.ends_with("data"), "{}", resolved.display());
+        assert!(
+            resolved.join("settings.json").is_file(),
+            "the fork's copied content is what the guest reads"
+        );
+
+        // A mount elsewhere is not the Pi home.
+        let other = format!("{}:/home/guest/other:fork", source.path().display());
+        let elsewhere =
+            mount::prepare(mount::parse_extra_mounts(&[other]).unwrap(), &context).unwrap();
+        assert!(pi_home_host_root(&elsewhere, &guest).is_none());
+
+        // A plain writable directory at the guest Pi home is the guest's Pi
+        // home too, so it is a valid root: whatever the guest reads must hold
+        // the placeholder. Read-only is not: the provider writes refreshed
+        // credentials back.
+        let plain = format!("{}:{}", source.path().display(), guest.display());
+        let directory =
+            mount::prepare(mount::parse_extra_mounts(&[plain]).unwrap(), &context).unwrap();
+        assert_eq!(
+            pi_home_host_root(&directory, &guest),
+            Some(source.path().canonicalize().unwrap().as_path())
+        );
+        let readonly = format!("{}:{}:ro", source.path().display(), guest.display());
+        let ro = mount::prepare(mount::parse_extra_mounts(&[readonly]).unwrap(), &context).unwrap();
+        assert!(pi_home_host_root(&ro, &guest).is_none());
     }
 
     #[test]

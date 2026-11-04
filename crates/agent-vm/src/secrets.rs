@@ -102,6 +102,15 @@ pub const GH_TOKEN_PLACEHOLDER: &str = "msb-gh-placeholder-v2";
 /// agent-vm's `placeholder-copilot-token-injected-by-proxy`.
 pub const COPILOT_TOKEN_PLACEHOLDER: &str = "msb-copilot-placeholder-v2";
 
+/// Antigravity (Google Cloud Code Assist) placeholders. The image-owned
+/// `pi-antigravity` provider extension reads both values back out of
+/// `~/.pi/agent/auth.json` and posts the access one as a bearer, so they are
+/// shaped like the Google tokens they stand in for (`ya29.…`-style opaque
+/// strings) and kept distinct from every other provider's, exactly as the
+/// substitution entries require.
+pub const ANTIGRAVITY_ACCESS_PLACEHOLDER: &str = "msb-antigravity-placeholder-a-v1";
+pub const ANTIGRAVITY_REFRESH_PLACEHOLDER: &str = "msb-antigravity-placeholder-r-v1";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpencodeApiProvider {
     pub id: &'static str,
@@ -166,6 +175,8 @@ pub const ALL_PLACEHOLDERS: &[&str] = &[
     OPENCODE_OPENAI_REFRESH_PLACEHOLDER,
     GH_TOKEN_PLACEHOLDER,
     COPILOT_TOKEN_PLACEHOLDER,
+    ANTIGRAVITY_ACCESS_PLACEHOLDER,
+    ANTIGRAVITY_REFRESH_PLACEHOLDER,
     // The #161 credential sentinel: a guest tool that saves what agent-vm put
     // in its owned variable must not be reported as an unshielded credential.
     // Reused from its one definition rather than re-spelled.
@@ -278,6 +289,18 @@ pub const OPENAI_API_HOST: &str = "api.openai.com";
 pub const OPENAI_CHATGPT_HOST: &str = "chatgpt.com";
 pub const OPENAI_OAUTH_HOST: &str = "auth.openai.com";
 
+/// Antigravity reaches Google Cloud Code Assist. The provider prefers
+/// `daily-cloudcode-pa` and falls back to these, so every candidate is a
+/// substitution host: a placeholder bearer arriving on an unlisted one is a
+/// violation, and the guest's own `ANTIGRAVITY_BASE_URL` may name any of them.
+pub const ANTIGRAVITY_API_HOST: &str = "cloudcode-pa.googleapis.com";
+pub const ANTIGRAVITY_DAILY_API_HOST: &str = "daily-cloudcode-pa.googleapis.com";
+pub const ANTIGRAVITY_SANDBOX_API_HOST: &str = "daily-cloudcode-pa.sandbox.googleapis.com";
+/// Google's token endpoint: the guest's refresh request lands here and
+/// `intercept_hook::oauth_refresh` answers it with placeholders after rotating
+/// the host credential.
+pub const ANTIGRAVITY_OAUTH_HOST: &str = "oauth2.googleapis.com";
+
 pub const GITHUB_API_HOST: &str = "api.github.com";
 pub const GITHUB_HOST: &str = "github.com";
 pub const GITHUB_CODELOAD_HOST: &str = "codeload.github.com";
@@ -294,6 +317,9 @@ pub const GITHUB_OBJECTS_HOST: &str = "objects.githubusercontent.com";
 pub const COPILOT_API_HOST: &str = "api.githubcopilot.com";
 #[allow(dead_code)] // see the Phase 6 note above ANTHROPIC_API_HOST
 pub const COPILOT_API_INDIVIDUAL_HOST: &str = "api.individual.githubcopilot.com";
+
+#[allow(dead_code)] // see the Phase 6 note above ANTHROPIC_API_HOST
+pub const ANTIGRAVITY_OAUTH_TOKEN_PATH: &str = "/token";
 
 #[allow(dead_code)] // see the Phase 6 note above ANTHROPIC_API_HOST
 pub const ANTHROPIC_OAUTH_TOKEN_PATH: &str = "/v1/oauth/token";
@@ -346,6 +372,13 @@ pub struct CredsState {
     /// host. gh user tokens are typically long-lived, so the practical
     /// impact is low; re-launch to recover.
     pub copilot_token_file: Option<PathBuf>,
+    /// File holding the host's Antigravity (Google Cloud Code Assist) access
+    /// token. The proxy substitutes [`ANTIGRAVITY_ACCESS_PLACEHOLDER`] for this
+    /// on outbound traffic to the cloudcode hosts. `Some` whenever this launch
+    /// captured it (provisioned, not replaced, and the host Pi is signed in to
+    /// Antigravity); absence is not an error — a user with no Google login
+    /// simply has no Antigravity models.
+    pub antigravity_token_file: Option<PathBuf>,
     pub snapshot: Option<HostCredsSnapshot>,
 }
 
@@ -368,6 +401,7 @@ impl CredsState {
             CredentialProvider::OpenAi => self.openai_token_file.as_deref(),
             CredentialProvider::OpencodeStatic => self.opencode_openai_access_token_file.as_deref(),
             CredentialProvider::Copilot => self.copilot_token_file.as_deref(),
+            CredentialProvider::Antigravity => self.antigravity_token_file.as_deref(),
         }
     }
 
@@ -446,6 +480,10 @@ pub fn openai_token_path(state_dir: &Path) -> PathBuf {
     host_secret_dir_path(state_dir).join("openai")
 }
 
+pub fn antigravity_token_path(state_dir: &Path) -> PathBuf {
+    host_secret_dir_path(state_dir).join("antigravity")
+}
+
 pub fn gh_token_path(state_dir: &Path) -> PathBuf {
     host_secret_dir_path(state_dir).join("gh")
 }
@@ -479,6 +517,8 @@ pub fn refresh_lock_path_for(state_dir: &Path, name: &str) -> PathBuf {
 pub const REFRESH_LOCK_ANTHROPIC: &str = ".refresh.anthropic.lock";
 /// Lock basename for the OpenAI in-guest refresh single-flight.
 pub const REFRESH_LOCK_OPENAI: &str = ".refresh.openai.lock";
+/// Lock basename for the Antigravity in-guest refresh single-flight.
+pub const REFRESH_LOCK_ANTIGRAVITY: &str = ".refresh.antigravity.lock";
 /// Lock basename for the launcher's per-project guest-state read-modify-write
 /// transactions (see [`refresh`]).
 pub(crate) const REFRESH_LOCK_PROJECT: &str = ".refresh.project.lock";
@@ -566,18 +606,19 @@ impl CredentialProvisioning {
 }
 
 /// Read host credentials, write the token file (atomically, 0600) and
-/// the guest-side placeholder credentials.json. Returns the paths to
+/// the guest-side placeholder credentials document. Returns the paths to
 /// the written token files so the launcher can plumb them into
 /// microsandbox's SecretSource::File config.
 ///
-/// Serialized across concurrent launchers by a sibling host-only project
-/// lock. Guest state is writable by the VM, so the lock must never live below
-/// `state_dir`; provider locks additionally serialize launch capture with OAuth
-/// installation for that provider.
+/// `pi_home` is `Some` only when the launch mounts the host's `~/.pi` as a
+/// `:fork`; then the guest's Pi home is that fork's data directory, not
+/// `<state>/pi`, and a placeholder written to `<state>/pi` would be shadowed by
+/// the mount. `None` means the ordinary state-dir home.
 pub fn refresh(
     state_dir: &Path,
     project_guest_path: &str,
     provisioning: &CredentialProvisioning,
+    pi_home: Option<&Path>,
 ) -> Result<CredsState> {
     let _lock = ProjectLock::acquire(state_dir, REFRESH_LOCK_PROJECT)
         .context("acquiring per-project refresh lock")?;
@@ -697,6 +738,22 @@ pub fn refresh(
         credential_provider::write_copilot_guest_token(&guest)?;
     }
 
+    // The Pi home this launch's guest reads `auth.json` from: `<state>/pi` as a
+    // rule, or the `:fork` data directory when the host's `~/.pi` is mounted.
+    let default_pi_home = state_dir.join("pi");
+    let pi_home = pi_home.unwrap_or(&default_pi_home);
+    let antigravity_token_file = if provisioning.captures(CredentialProvider::Antigravity) {
+        with_provider_lock(state_dir, REFRESH_LOCK_ANTIGRAVITY, || {
+            refresh_antigravity(state_dir, pi_home)
+        })
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "antigravity credential refresh failed; skipping");
+            None
+        })
+    } else {
+        None
+    };
+
     // SHA-256 snapshot of host credential files for post-run mutation
     // detection. Phase 4's refresh hook *legitimately* rewrites these;
     // anything else doing so is a bug to investigate. See
@@ -752,10 +809,23 @@ pub fn refresh(
         opencode_api_token_files,
         gh_token_file,
         copilot_token_file,
+        antigravity_token_file,
         snapshot,
     };
-    clear_unwired_placeholders(&guest, creds.wired());
+    clear_unwired_placeholders(&guest, creds.wired(), pi_home);
     Ok(creds)
+}
+
+/// Test-only convenience: the ordinary `<state>/pi` Pi home, i.e. no `:fork`
+/// mount. Production's one caller always passes the resolved root, because a
+/// `:fork` of `~/.pi` would otherwise shadow the placeholder.
+#[cfg(test)]
+fn refresh_default_home(
+    state_dir: &Path,
+    project_guest_path: &str,
+    provisioning: &CredentialProvisioning,
+) -> Result<CredsState> {
+    refresh(state_dir, project_guest_path, provisioning, None)
 }
 
 /// Author identity to bake into the guest's `~/.gitconfig` so commits
@@ -1336,7 +1406,7 @@ fn clear_stale_openai_placeholder(guest: &GuestStateDir) -> Result<()> {
 /// Best-effort: a removal failure is logged, not fatal — a launch that needs
 /// the provider is about to bail anyway, and a launch that does not must not
 /// be blocked by a stray file.
-fn clear_unwired_placeholders(guest: &GuestStateDir, wired: ProviderSet) {
+fn clear_unwired_placeholders(guest: &GuestStateDir, wired: ProviderSet, pi_home: &Path) {
     for provider in CredentialProvider::ALL {
         if wired.contains(provider) {
             continue;
@@ -1347,6 +1417,7 @@ fn clear_unwired_placeholders(guest: &GuestStateDir, wired: ProviderSet) {
             // OpenCode's merged `auth.json` is handled by its own capture path.
             CredentialProvider::OpencodeStatic => Ok(()),
             CredentialProvider::Copilot => clear_copilot_guest_token(guest),
+            CredentialProvider::Antigravity => clear_stale_antigravity_placeholder(pi_home),
         };
         if let Err(error) = result {
             tracing::warn!(provider = ?provider, error = %error, "leaving stale guest placeholder");
@@ -1696,6 +1767,142 @@ fn refresh_openai(state_dir: &Path, guest: &GuestStateDir) -> Result<Option<Path
     }
 
     Ok(Some(token_file))
+}
+
+/// Path of the guest-visible Pi credential document inside `pi_home`.
+fn antigravity_guest_auth_path(pi_home: &Path) -> PathBuf {
+    pi_home.join("agent/auth.json")
+}
+
+/// Read a JSON object from `path`, treating absent/unreadable/non-object
+/// content as empty. Mirrors [`read_guest_json_object`] for the one target that
+/// is not necessarily under the state dir (a `:fork` of the host's `~/.pi`).
+fn read_json_object_at(path: &Path) -> serde_json::Map<String, Value> {
+    let Ok(raw) = std::fs::read(path) else {
+        return serde_json::Map::new();
+    };
+    match serde_json::from_slice::<Value>(&raw) {
+        Ok(Value::Object(object)) => object,
+        _ => serde_json::Map::new(),
+    }
+}
+
+fn write_json_object_at(path: &Path, object: &serde_json::Map<String, Value>) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", crate::one_line::path(parent)))?;
+    }
+    atomic_write(
+        path,
+        &serde_json::to_vec(&Value::Object(object.clone()))?,
+        0o600,
+    )
+}
+
+/// Capture the host's Antigravity (Google Cloud Code Assist) login and give the
+/// guest a placeholder entry in Pi's `auth.json`.
+///
+/// The image-owned `pi-antigravity` provider reads
+/// `{type, email, access, refresh, expires, projectId}` from
+/// `<agent dir>/auth.json`; that file is a [`ProtectedFile`] here, so the `:fork`
+/// seed omits it and the guest starts signed out. This writes the *placeholder*
+/// version — `access`/`refresh` are ours, `projectId`/`email` are not secrets,
+/// and `expires` is the host's own expiry so the provider's refresh becomes the
+/// rotation signal (see `intercept_hook::oauth_refresh`).
+///
+/// `pi_home` is the host directory the guest sees as its Pi home. Merge-on-
+/// existing so a user's other provider entries survive.
+///
+/// Absence of a host login is **not** an error: many users have no Google
+/// account configured, and Antigravity carries no `missing_credential_error`.
+fn refresh_antigravity(state_dir: &Path, pi_home: &Path) -> Result<Option<PathBuf>> {
+    let Some(host_path) = CredentialProvider::Antigravity.host_credential_path() else {
+        return Ok(None);
+    };
+    let raw = match read_bounded_regular_file(&host_path, MAX_HOST_CREDENTIAL_FILE_BYTES) {
+        Ok(raw) => raw,
+        Err(_) => {
+            tracing::debug!("no host Antigravity credential");
+            return Ok(None);
+        }
+    };
+    let json: Value = serde_json::from_slice(&raw)
+        .with_context(|| format!("parsing {}", crate::one_line::path(&host_path)))?;
+    let Some(entry) = json.get("antigravity").and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    let Some(access) = entry
+        .get("access")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        tracing::debug!("host Antigravity entry has no access token");
+        return Ok(None);
+    };
+
+    let token_file = antigravity_token_path(state_dir);
+    atomic_write(&token_file, access.as_bytes(), 0o600)?;
+
+    let mut placeholder = serde_json::Map::new();
+    placeholder.insert("type".into(), Value::String("oauth".into()));
+    placeholder.insert(
+        "access".into(),
+        Value::String(ANTIGRAVITY_ACCESS_PLACEHOLDER.into()),
+    );
+    placeholder.insert(
+        "refresh".into(),
+        Value::String(ANTIGRAVITY_REFRESH_PLACEHOLDER.into()),
+    );
+    // `expires` (epoch millis) and `projectId`/`email` are the host's: the first
+    // is what makes the provider ask for a refresh at the right moment, and the
+    // others are not credential material (a project id and an account label).
+    for key in ["expires", "projectId", "email"] {
+        if let Some(value) = entry.get(key).filter(|value| !value.is_null()) {
+            placeholder.insert(key.into(), value.clone());
+        }
+    }
+
+    let path = antigravity_guest_auth_path(pi_home);
+    let mut document = read_json_object_at(&path);
+    document.insert("antigravity".into(), Value::Object(placeholder));
+    if let Err(error) = write_json_object_at(&path, &document) {
+        let _ = std::fs::remove_file(&token_file);
+        return Err(error).context("writing the Antigravity guest placeholder");
+    }
+
+    Ok(Some(token_file))
+}
+
+/// Remove the `antigravity` entry from the guest's Pi `auth.json` when (and
+/// only when) it holds *our* placeholder.
+///
+/// Same hazard and same rule as [`clear_stale_anthropic_placeholder`]: the Pi
+/// home persists across launches, and an in-guest `/login antigravity` (or any
+/// guest-authored document) must survive a launch that wires no Antigravity.
+/// The entry is removed rather than the file, because the file is a merged
+/// document owned by Pi.
+fn clear_stale_antigravity_placeholder(pi_home: &Path) -> Result<()> {
+    let path = antigravity_guest_auth_path(pi_home);
+    let mut document = read_json_object_at(&path);
+    let ours = document
+        .get("antigravity")
+        .and_then(|entry| entry.get("access"))
+        .and_then(Value::as_str)
+        == Some(ANTIGRAVITY_ACCESS_PLACEHOLDER);
+    if !ours {
+        return Ok(());
+    }
+    document.remove("antigravity");
+    if document.is_empty() {
+        std::fs::remove_file(&path)
+            .or_else(|error| match error.kind() {
+                std::io::ErrorKind::NotFound => Ok(()),
+                _ => Err(error),
+            })
+            .with_context(|| format!("removing {}", crate::one_line::path(&path)))?;
+        return Ok(());
+    }
+    write_json_object_at(&path, &document)
 }
 
 /// Synchronize the launcher-owned Chrome MCP entry without changing user MCPs.
@@ -2143,7 +2350,7 @@ mod tests {
     fn copilot_token_not_captured_without_use_github_or_want_copilot() {
         let dir = tempfile::tempdir().unwrap();
         let sd = dir.path();
-        let creds = super::refresh(
+        let creds = super::refresh_default_home(
             sd,
             "/workspace/p",
             &provisioning(ProviderSet::default(), false),
@@ -2200,7 +2407,7 @@ mod tests {
         env.set_var("USER", "agentvm-test-user");
         let state = tempfile::tempdir().unwrap();
 
-        let creds = super::refresh(
+        let creds = super::refresh_default_home(
             state.path(),
             "/workspace/p",
             &provisioning(ProviderSet::new([CredentialProvider::Anthropic]), false),
@@ -2269,7 +2476,7 @@ mod tests {
         env.set_var("USER", "agentvm-test-user");
         let state = tempfile::tempdir().unwrap();
 
-        super::refresh(
+        super::refresh_default_home(
             state.path(),
             "/workspace/p",
             &provisioning(ProviderSet::new([CredentialProvider::Anthropic]), false),
@@ -2321,7 +2528,7 @@ mod tests {
         env.set_var("PATH", path);
         let state = tempfile::tempdir().unwrap();
 
-        let creds = super::refresh(
+        let creds = super::refresh_default_home(
             state.path(),
             "/workspace/p",
             &provisioning(ProviderSet::new([CredentialProvider::OpenAi]), true),
@@ -2580,8 +2787,20 @@ mod tests {
                 0o600,
             )
             .unwrap();
+        // Pi's merged provider document: our own entry, plus a row the user
+        // authored in the guest — only ours may be removed.
+        guest
+            .atomic_write(
+                Path::new("pi/agent/auth.json"),
+                format!(
+                    r#"{{"antigravity":{{"type":"oauth","access":"{ANTIGRAVITY_ACCESS_PLACEHOLDER}"}},"deepseek":{{"type":"api","key":"user"}}}}"#
+                )
+                .as_bytes(),
+                0o600,
+            )
+            .unwrap();
 
-        let creds = super::refresh(
+        let creds = super::refresh_default_home(
             state.path(),
             "/workspace/p",
             &provisioning(ProviderSet::default(), false),
@@ -2621,6 +2840,22 @@ mod tests {
             serde_json::json!({"type": "api", "key": "user"}),
             "a user-authored OpenCode row must be preserved"
         );
+        let pi_auth: Value = serde_json::from_slice(
+            &guest
+                .read(Path::new("pi/agent/auth.json"))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            pi_auth.get("antigravity").is_none(),
+            "our Antigravity entry survived: {pi_auth}"
+        );
+        assert_eq!(
+            pi_auth["deepseek"],
+            serde_json::json!({"type": "api", "key": "user"}),
+            "a user-authored Pi provider row must be preserved"
+        );
         assert_placeholder_invariant(state.path(), &creds);
     }
 
@@ -2651,7 +2886,7 @@ mod tests {
             )
             .unwrap();
 
-        let creds = super::refresh(
+        let creds = super::refresh_default_home(
             state.path(),
             "/workspace/p",
             &provisioning(ProviderSet::default(), false),
@@ -2695,7 +2930,8 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let all = ProviderSet::new(CredentialProvider::ALL);
         let creds =
-            super::refresh(state.path(), "/workspace/p", &provisioning(all, false)).unwrap();
+            super::refresh_default_home(state.path(), "/workspace/p", &provisioning(all, false))
+                .unwrap();
         assert!(creds.copilot_token_file.is_none());
         let guest = GuestStateDir::open(state.path()).unwrap();
         let copilot = guest.read(Path::new("copilot/config.json")).unwrap();
@@ -2736,7 +2972,7 @@ mod tests {
         )
         .unwrap();
         let opencode_only = ProviderSet::new([CredentialProvider::OpencodeStatic]);
-        let creds = super::refresh(
+        let creds = super::refresh_default_home(
             state.path(),
             "/workspace/p",
             &provisioning(opencode_only, false),
@@ -2803,6 +3039,9 @@ mod tests {
                     assert!(!plain.creds.opencode_api_token_files.is_empty())
                 }
                 CredentialProvider::Copilot => assert!(plain.creds.copilot_token_file.is_some()),
+                CredentialProvider::Antigravity => {
+                    assert!(plain.creds.antigravity_token_file.is_some())
+                }
             }
             // AC2: every file `configuration_files` compares is byte-identical.
             assert_eq!(
@@ -2855,7 +3094,7 @@ mod tests {
                 0o600,
             )
             .unwrap();
-        let creds = super::refresh(
+        let creds = super::refresh_default_home(
             state.path(),
             "/workspace/p",
             &provisioning_with_replaced(copilot, copilot, false),
@@ -3030,6 +3269,10 @@ mod tests {
                 ".local/share/opencode/auth.json",
                 &br#"{"zai":{"type":"api","key":"user-key"}}"#[..],
             ),
+            (
+                ".pi/agent/auth.json",
+                &br#"{"antigravity":{"type":"oauth","access":"fake","refresh":"fake-refresh","expires":4102444800000,"projectId":"fake-project"}}"#[..],
+            ),
         ] {
             let path = home.join(relative);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -3047,7 +3290,7 @@ mod tests {
 
     fn refresh_into_fresh_state(provisioned: ProviderSet, replaced: ProviderSet) -> Refreshed {
         let state = tempfile::tempdir().unwrap();
-        let creds = super::refresh(
+        let creds = super::refresh_default_home(
             state.path(),
             "/workspace/p",
             &provisioning_with_replaced(provisioned, replaced, false),
@@ -3107,7 +3350,7 @@ mod tests {
         env.set_var("HOME", home.path());
         let state = tempfile::tempdir().unwrap();
         for _ in 0..2 {
-            let _ = super::refresh(
+            let _ = super::refresh_default_home(
                 state.path(),
                 "/workspace/p",
                 &provisioning(ProviderSet::default(), false),
@@ -3144,7 +3387,7 @@ mod tests {
         .unwrap();
         env.set_var("HOME", home.path());
         let state = tempfile::tempdir().unwrap();
-        let creds = super::refresh(
+        let creds = super::refresh_default_home(
             state.path(),
             "/workspace/p",
             &provisioning(ProviderSet::default(), false),
@@ -3192,7 +3435,8 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let all = ProviderSet::new(CredentialProvider::ALL);
         let creds =
-            super::refresh(state.path(), "/workspace/p", &provisioning(all, false)).unwrap();
+            super::refresh_default_home(state.path(), "/workspace/p", &provisioning(all, false))
+                .unwrap();
 
         for relative in [
             "claude/.credentials.json",
@@ -3685,5 +3929,73 @@ mod tests {
         assert!(!is_valid_gh_login("has:colon"));
         assert!(!is_valid_gh_login("has/slash"));
         assert!(!is_valid_gh_login("has\nnewline"));
+    }
+
+    /// #507: capture writes the placeholder document into the Pi home the guest
+    /// actually reads — the `:fork` data directory when one is mounted — and the
+    /// real access token only into the host-only secret dir. The host's `expires`
+    /// is copied so the provider's own refresh is the rotation signal.
+    #[test]
+    fn antigravity_capture_writes_into_the_given_pi_home() {
+        let mut env = crate::test_env::guard();
+        let home = tempfile::tempdir().unwrap();
+        seed_host_credentials(home.path());
+        env.set_var("HOME", home.path());
+
+        let state = tempfile::tempdir().unwrap();
+        let fork = tempfile::tempdir().unwrap();
+        // A pre-existing document the user owns: it must survive the merge.
+        std::fs::create_dir_all(fork.path().join("agent")).unwrap();
+        std::fs::write(
+            fork.path().join("agent/auth.json"),
+            br#"{"deepseek":{"type":"api","key":"user"}}"#,
+        )
+        .unwrap();
+
+        let creds = super::refresh(
+            state.path(),
+            "/workspace/p",
+            &provisioning(ProviderSet::new([CredentialProvider::Antigravity]), false),
+            Some(fork.path()),
+        )
+        .unwrap();
+
+        let token_file = creds
+            .antigravity_token_file
+            .as_ref()
+            .expect("capture wrote a token file");
+        assert_eq!(
+            std::fs::read_to_string(token_file).unwrap(),
+            "fake",
+            "the host-only file holds the real access token"
+        );
+        assert!(
+            token_file.starts_with(host_secret_dir_path(state.path())),
+            "the real token must never live under the guest-visible state dir"
+        );
+
+        let written: Value =
+            serde_json::from_slice(&std::fs::read(fork.path().join("agent/auth.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            written["antigravity"]["access"], ANTIGRAVITY_ACCESS_PLACEHOLDER,
+            "{written}"
+        );
+        assert_eq!(
+            written["antigravity"]["refresh"], ANTIGRAVITY_REFRESH_PLACEHOLDER,
+            "{written}"
+        );
+        assert_eq!(written["antigravity"]["expires"], 4102444800000i64);
+        assert_eq!(written["antigravity"]["projectId"], "fake-project");
+        assert_eq!(written["antigravity"]["type"], "oauth");
+        assert_eq!(
+            written["deepseek"],
+            serde_json::json!({"type": "api", "key": "user"}),
+            "the user's own provider row must survive"
+        );
+        // The state-dir Pi home is shadowed by the fork, so nothing may be
+        // written there.
+        assert!(!state.path().join("pi/agent/auth.json").exists());
+        assert_placeholder_invariant(state.path(), &creds);
     }
 }

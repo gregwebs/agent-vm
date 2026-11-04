@@ -129,10 +129,17 @@ name = "pi"
 # fails and `/model` reports "Could not refresh <provider>; showing cached
 # models" for whichever providers aged out — the catalog silently stays at the
 # version shipped with the image.
-network_requests = ["api.anthropic.com", "auth.openai.com", "chatgpt.com", "mcp-proxy.anthropic.com", "pi.dev", "platform.claude.com"]
+#
+# The cloudcode hosts are the image-owned `pi-antigravity` provider's inference
+# and quota paths; `oauth2.googleapis.com` is its token refresh, answered by
+# `intercept_hook` with placeholders after rotating the host credential.
+network_requests = ["api.anthropic.com", "auth.openai.com", "chatgpt.com", "cloudcode-pa.googleapis.com", "daily-cloudcode-pa.googleapis.com", "daily-cloudcode-pa.sandbox.googleapis.com", "mcp-proxy.anthropic.com", "oauth2.googleapis.com", "pi.dev", "platform.claude.com"]
 command = "pi"
 args = []
 tools = ["claude", "codex"]
+# Antigravity is provisioned for Pi itself, not for a child tool: the
+# `pi-antigravity` provider extension registers `antigravity/*` models inside Pi.
+credentials = ["antigravity"]
 persist = []
 
 [[tools]]

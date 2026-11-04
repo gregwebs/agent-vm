@@ -1737,6 +1737,8 @@ opencode  <fixture>/home/.local/share/opencode/auth.json
           absent
 copilot   <fixture>/home/.cache/claude-vm/copilot-token.json
           absent
+pi        <fixture>/home/.pi/agent/auth.json
+          absent
 
 ==> this project
 dir:      <fixture>/project
@@ -1763,12 +1765,12 @@ user:    <fixture>/home/.config/agent-vm/config.toml (absent)
 project: <fixture>/project/.agent-vm/config.toml (absent)
 resolved: built-in defaults; launch-verb order
   1. dsh -> "dsh"; args=1; credentials=none; provisions=none; persist=1; source=built-in
-  2. pi -> "pi"; args=0; credentials=none; provisions=anthropic,openai; persist=0; source=built-in; network_requests=api.anthropic.com,auth.openai.com,chatgpt.com,mcp-proxy.anthropic.com,pi.dev,platform.claude.com
+  2. pi -> "pi"; args=0; credentials=antigravity; provisions=anthropic,openai,antigravity; persist=0; source=built-in; network_requests=api.anthropic.com,auth.openai.com,chatgpt.com,cloudcode-pa.googleapis.com,daily-cloudcode-pa.googleapis.com,daily-cloudcode-pa.sandbox.googleapis.com,mcp-proxy.anthropic.com,oauth2.googleapis.com,+2 more
   3. codex -> "codex"; args=0; credentials=openai; provisions=openai; persist=0; source=built-in; env=1; network_requests=api.openai.com,auth.openai.com,chatgpt.com
   4. opencode -> "opencode"; args=0; credentials=openai,opencode-static; provisions=openai,opencode-static; persist=0; source=built-in; network_requests=api.openai.com,auth.openai.com,chatgpt.com,models.opencode.ai
   5. claude -> "claude"; args=1; credentials=anthropic; provisions=anthropic; persist=0; source=built-in; network_requests=api.anthropic.com,mcp-proxy.anthropic.com,platform.claude.com
   6. copilot -> "copilot"; args=1; credentials=copilot; provisions=copilot; persist=0; source=built-in
-  7. shell -> "bash"; args=2; credentials=none; provisions=anthropic,openai,opencode-static,copilot; persist=1 (own 0); source=built-in; interactive_shell=true; env=1
+  7. shell -> "bash"; args=2; credentials=none; provisions=anthropic,openai,opencode-static,copilot,antigravity; persist=1 (own 0); source=built-in; interactive_shell=true; env=1
 
 ==> credentials.yaml (launch credentials)
 anthropic  authorized for this launch (replaces the host built-in)
@@ -3118,14 +3120,14 @@ substituted."#;
         // (ADR-0017's `provisions=` column).
         assert!(
             text.contains(
-                "pi -> \"pi\"; args=0; credentials=none; provisions=anthropic,openai; persist=0; source=built-in"
+                "pi -> \"pi\"; args=0; credentials=antigravity; provisions=anthropic,openai,antigravity; persist=0; source=built-in"
             ),
             "{text}"
         );
 
         assert!(
             text.contains(
-                "shell -> \"bash\"; args=2; credentials=none; provisions=anthropic,openai,opencode-static,copilot; persist=1 (own 0); source=built-in; interactive_shell=true; env=1"
+                "shell -> \"bash\"; args=2; credentials=none; provisions=anthropic,openai,opencode-static,copilot,antigravity; persist=1 (own 0); source=built-in; interactive_shell=true; env=1"
             ),
             "{text}"
         );
@@ -3352,7 +3354,7 @@ credentials:
         assert!(selection.requested.is_empty(), "{selection:?}");
         assert_eq!(
             selection.unrequested,
-            vec!["claude", "codex", "opencode", "copilot"]
+            vec!["claude", "codex", "opencode", "copilot", "pi"]
         );
     }
 
@@ -3397,7 +3399,10 @@ credentials:
         );
         // `t` requests every provider the default catalog does not; the other
         // three are unrequested.
-        assert_eq!(selection.unrequested, vec!["codex", "opencode", "copilot"]);
+        assert_eq!(
+            selection.unrequested,
+            vec!["codex", "opencode", "copilot", "pi"]
+        );
     }
 
     /// A validated `secretspec:` selection, built through the real parser so a
@@ -3622,7 +3627,7 @@ credentials:
             ("dsh", ""),
             (
                 "pi",
-                "api.anthropic.com,auth.openai.com,chatgpt.com,mcp-proxy.anthropic.com,pi.dev,platform.claude.com",
+                "api.anthropic.com,auth.openai.com,chatgpt.com,cloudcode-pa.googleapis.com,daily-cloudcode-pa.googleapis.com,daily-cloudcode-pa.sandbox.googleapis.com,mcp-proxy.anthropic.com,oauth2.googleapis.com,+2 more",
             ),
             ("codex", "api.openai.com,auth.openai.com,chatgpt.com"),
             (
@@ -3638,12 +3643,12 @@ credentials:
         ];
         let baseline_rows = [
             "dsh -> \"dsh\"; args=1; credentials=none; provisions=none; persist=1; source=built-in",
-            "pi -> \"pi\"; args=0; credentials=none; provisions=anthropic,openai; persist=0; source=built-in",
+            "pi -> \"pi\"; args=0; credentials=antigravity; provisions=anthropic,openai,antigravity; persist=0; source=built-in",
             "codex -> \"codex\"; args=0; credentials=openai; provisions=openai; persist=0; source=built-in; env=1",
             "opencode -> \"opencode\"; args=0; credentials=openai,opencode-static; provisions=openai,opencode-static; persist=0; source=built-in",
             "claude -> \"claude\"; args=1; credentials=anthropic; provisions=anthropic; persist=0; source=built-in",
             "copilot -> \"copilot\"; args=1; credentials=copilot; provisions=copilot; persist=0; source=built-in",
-            "shell -> \"bash\"; args=2; credentials=none; provisions=anthropic,openai,opencode-static,copilot; persist=1 (own 0); source=built-in; interactive_shell=true; env=1",
+            "shell -> \"bash\"; args=2; credentials=none; provisions=anthropic,openai,opencode-static,copilot,antigravity; persist=1 (own 0); source=built-in; interactive_shell=true; env=1",
         ];
         for (i, (name, names)) in expected.into_iter().enumerate() {
             let row = text

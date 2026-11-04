@@ -35,16 +35,27 @@ use crate::one_line::path as one_line_path;
 const PI_HOME_NAME: &str = ".pi";
 
 /// A host file whose bytes must never be reachable from a guest.
+///
+/// Every protected file today belongs to Pi, so each variant carries a `Pi`
+/// prefix that names the owner rather than the file: it is what a second
+/// host's table entry would replace with its own.
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProtectedFile {
     /// `~/.pi/agent/auth.json` — the provider credential material.
     PiAuth,
     /// `~/.pi/agent/models.json` — the provider/endpoint configuration.
     PiModels,
+    /// `~/.pi/agent/antigravity-accounts.json` — `pi-antigravity`'s multi-account
+    /// store: a live access token and a long-lived refresh token per account.
+    /// Not a provider *configuration* file: every value in `accounts` is
+    /// credential material (#508).
+    PiAntigravityAccounts,
 }
 
 impl ProtectedFile {
-    pub(crate) const ALL: [ProtectedFile; 2] = [Self::PiAuth, Self::PiModels];
+    pub(crate) const ALL: [ProtectedFile; 3] =
+        [Self::PiAuth, Self::PiModels, Self::PiAntigravityAccounts];
 
     /// The single source of truth for these paths. The guest-side Pi scanner
     /// (`#93`) derives `pi/<relative>` from them; a future host-Pi resolver
@@ -53,6 +64,7 @@ impl ProtectedFile {
         match self {
             Self::PiAuth => ".pi/agent/auth.json",
             Self::PiModels => ".pi/agent/models.json",
+            Self::PiAntigravityAccounts => ".pi/agent/antigravity-accounts.json",
         }
     }
 
@@ -73,6 +85,7 @@ impl ProtectedFile {
         match self {
             Self::PiAuth => "host Pi credential file",
             Self::PiModels => "host Pi provider-configuration file",
+            Self::PiAntigravityAccounts => "host Pi Antigravity account store",
         }
     }
 }
@@ -85,8 +98,8 @@ impl ProtectedFile {
 /// route only advises.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Severity {
-    /// `$HOME/.pi` exists: refuse the launch, whatever the two files' own
-    /// existence. A live bind is a window onto bytes written *after* boot, and
+    /// `$HOME/.pi` exists: refuse the launch, whatever the protected files'
+    /// own existence. A live bind is a window onto bytes written *after* boot, and
     /// `pi auth login` on the host can create `auth.json` inside it.
     Refuse,
     /// `$HOME/.pi` is absent: a named, narrow residual risk, not a leak.

@@ -156,13 +156,18 @@ impl Harness {
         self.home.path().canonicalize().unwrap()
     }
 
-    /// Create the host Pi home (and both protected files) under this harness's
+    /// Create the host Pi home (and every protected file) under this harness's
     /// `$HOME`.
     fn seed_pi_home(&self) -> PathBuf {
         let pi_home = self.home_path().join(".pi");
         std::fs::create_dir_all(pi_home.join("agent")).unwrap();
         std::fs::write(pi_home.join("agent/auth.json"), "{\"token\":\"host\"}").unwrap();
         std::fs::write(pi_home.join("agent/models.json"), "{}").unwrap();
+        std::fs::write(
+            pi_home.join("agent/antigravity-accounts.json"),
+            "{\"accounts\":{\"a\":{\"refresh\":\"host-refresh\"}}}",
+        )
+        .unwrap();
         std::fs::write(pi_home.join("settings.json"), "{}").unwrap();
         std::fs::create_dir_all(pi_home.join("extensions")).unwrap();
         std::fs::write(pi_home.join("extensions/x.js"), "x").unwrap();
@@ -456,6 +461,13 @@ fn fork_of_the_host_pi_home_boots_with_credentials_omitted() {
         stderr.contains("Omitted host Pi provider-configuration file agent/models.json"),
         "{stderr}"
     );
+    // #508: `pi-antigravity`'s account store is credential material, not
+    // configuration, and must never reach the guest either.
+    assert!(
+        stderr
+            .contains("Omitted host Pi Antigravity account store agent/antigravity-accounts.json"),
+        "{stderr}"
+    );
     assert!(
         stderr.contains("may not run in the Linux guest"),
         "{stderr}"
@@ -466,6 +478,7 @@ fn fork_of_the_host_pi_home_boots_with_credentials_omitted() {
     assert!(data.join("extensions/x.js").is_file());
     assert!(!data.join("agent/auth.json").exists());
     assert!(!data.join("agent/models.json").exists());
+    assert!(!data.join("agent/antigravity-accounts.json").exists());
     // The host copy is untouched: only the fork's copy omits the files.
     assert!(pi_home.join("agent/auth.json").is_file());
 
@@ -617,7 +630,11 @@ fn tool_declared_pi_fork_omits_auth_and_models() {
             .fork_data()
             .unwrap_or_else(|| panic!("inherited={inherited}: the fork must be published"));
         // Protected files are absent from the committed copy.
-        for protected in ["agent/auth.json", "agent/models.json"] {
+        for protected in [
+            "agent/auth.json",
+            "agent/models.json",
+            "agent/antigravity-accounts.json",
+        ] {
             assert!(
                 !data.join(protected).exists(),
                 "inherited={inherited}: {protected} must be omitted from a tool-declared fork"
