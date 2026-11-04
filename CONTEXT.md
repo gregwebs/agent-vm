@@ -808,7 +808,18 @@ authorize DNS.
 
 **Network request**: a tool declaration's non-authoritative statement of a TLS
 destination (exact name + port) it expects to contact; reported when unmet,
-never a grant.
+never a grant. It becomes authority only when an **Egress reference** selects
+a **user** tool's requests.
+
+**Egress reference**: an `allow_egress` entry (persisted or `--allow-egress`)
+that stands for other allowances: `tool:NAME` is that **user**-tier tool's own
+network requests as exact `tcp://HOST:PORT` hostname allowances, and `set:NAME`
+is an **Egress set**. Built-in and project tools are never resolved. Designed in
+#506, not implemented.
+
+**Egress set**: a named list of allowances and egress references in the
+**user** `[egress_sets]` table. Declaring one grants nothing; only a selecting
+`set:NAME` reference does. Designed in #506, not implemented.
 
 **Persisted grant**: user-authored host authority in a user-tier `[network]`
 setting, read only from a verified file and merged per launch. CLI flags override
@@ -820,8 +831,8 @@ See [ADR-0036](docs/adr/0036-default-deny-launch-egress.md) for DNS limitations 
 [ADR-0039](docs/adr/0039-non-authoritative-tool-network-requests.md) for requests.
 
 _Avoid_: "saved policy" / "profile" for a persisted grant;
-"requested allowance" and "tool allowance" for a network request
-(a request is not an allowance); "domain allowance", "wildcard host" and
+"requested allowance" and "tool allowance" for a network request or an
+egress reference (a request is not an allowance; a reference selects allowances); "domain allowance", "wildcard host" and
 "host allowance" for a hostname grant — the unit is an exact name, not a suffix or a host; "allow list" for the
 whole policy; "network profile" (the runtime's `from_profiles` abstraction,
 deliberately not used for tool launches).
