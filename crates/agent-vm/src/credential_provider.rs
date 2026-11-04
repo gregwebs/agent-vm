@@ -45,13 +45,18 @@
 //! `trusted_folders` — and loses only the captured token, the guest
 //! placeholder, the proxy substitution entry and the OAuth route.
 //!
-//! | Facet | Anthropic | OpenAI | OpenCode-static | Copilot |
-//! |---|---|---|---|---|
-//! | guest home symlinks | always | n/a (the codex tool's `env`) | always | always |
-//! | eager state dir (`ensure_dirs`) | `claude` | `codex` | `opencode` | — |
-//! | guest env | — | — | — | `COPILOT_GITHUB_TOKEN` when provisioned **and** wired |
-//! | proxy secret registered | when token present | when token present | when token present | when token present **and** provisioned |
-//! | missing-credential hard bail | yes | no | no | yes |
+//! | Facet | Anthropic | OpenAI | OpenCode-static | Copilot | Antigravity |
+//! |---|---|---|---|---|---|
+//! | guest home symlinks | always | n/a (the codex tool's `env`) | always | always | n/a (the generic `.pi` link) |
+//! | eager state dir (`ensure_dirs`) | `claude` | `codex` | `opencode` | — | — |
+//! | guest env | — | — | — | `COPILOT_GITHUB_TOKEN` when provisioned **and** wired | — |
+//! | proxy secret registered | when token present | when token present | when token present | when token present **and** provisioned | when token present |
+//! | missing-credential hard bail | yes | no | no | yes | no |
+//!
+//! Antigravity is the one provider whose placeholder does **not** live under the
+//! per-project state dir: Pi's `auth.json` is in the Pi home, which a `:fork`
+//! mount of `~/.pi` moves. [`crate::secrets::refresh_with_pi_home`] takes that
+//! root as an argument for exactly this reason.
 //!
 //! The remaining `always` rows (guest home links, eager state dirs) are
 //! **furniture, not capability** — the whole state dir is already bind-mounted
@@ -59,7 +64,8 @@
 //!
 //! # Names
 //!
-//! `config_name` (`anthropic` / `openai` / `opencode-static` / `copilot`) is
+//! `config_name` (`anthropic` / `openai` / `opencode-static` / `copilot` /
+//! `antigravity`) is
 //! **not** the `doctor_label` (`claude` / `codex` / `opencode` / `copilot`).
 //! The doctor label names the host *CLI that owns the file*, retained
 //! verbatim so `agent-vm doctor` output stays byte-identical. A user who reads
@@ -83,18 +89,20 @@ pub enum CredentialProvider {
     OpenAi,
     OpencodeStatic,
     Copilot,
+    Antigravity,
 }
 
-// `ProviderSet` is a `u8` bitset; a fifth compiled-in provider is a deliberate
+// `ProviderSet` is a `u8` bitset; a sixth compiled-in provider is a deliberate
 // change, not an accident.
 const _: () = assert!(CredentialProvider::ALL.len() <= 8);
 
 impl CredentialProvider {
-    pub const ALL: [CredentialProvider; 4] = [
+    pub const ALL: [CredentialProvider; 5] = [
         CredentialProvider::Anthropic,
         CredentialProvider::OpenAi,
         CredentialProvider::OpencodeStatic,
         CredentialProvider::Copilot,
+        CredentialProvider::Antigravity,
     ];
 
     /// The single-row-per-provider knowledge table. Kept private: callers get
@@ -343,6 +351,10 @@ pub(crate) fn write_bypass_configs(
             CredentialProvider::OpenAi => write_openai_bypass(guest)?,
             CredentialProvider::OpencodeStatic => write_opencode_bypass(guest)?,
             CredentialProvider::Copilot => {}
+            // Antigravity has no first-run bypass: the `pi-antigravity` provider
+            // registers its catalog offline and only needs the credential, which
+            // is written post-capture (see the module doc table).
+            CredentialProvider::Antigravity => {}
         }
     }
     // Generic: pairs with the `.bash_history` link in `GENERIC_HOME_LINKS`.
@@ -557,7 +569,7 @@ const COPILOT_MISSING: &str = "no GitHub Copilot token found on the host. Sign i
 device-flow login that writes ~/.cache/claude-vm/copilot-token.json) \
 and retry, or pick another agent.";
 
-const SPECS: [ProviderSpec; 4] = [
+const SPECS: [ProviderSpec; 5] = [
     // Anthropic
     ProviderSpec {
         config_name: "anthropic",
@@ -708,6 +720,51 @@ const SPECS: [ProviderSpec; 4] = [
         }),
         missing_credential_error: Some(COPILOT_MISSING),
         oauth_rotation: None,
+    },
+    // Antigravity (Google Cloud Code Assist, through the image-owned
+    // `pi-antigravity` Pi provider extension)
+    ProviderSpec {
+        config_name: "antigravity",
+        // The host CLI that owns the file is Pi itself, so the label names Pi.
+        doctor_label: "pi",
+        host_credential: HostCredentialSpec {
+            // Pi's provider credential document. Capture reads only the
+            // `antigravity` entry out of it (see `secrets::refresh_antigravity`).
+            file: ".pi/agent/auth.json",
+            mac_keychain: None,
+        },
+        // The generic `pi` eager dir and the generic `.pi` home link already
+        // cover the state-dir Pi home; this provider adds no furniture of its
+        // own. Its placeholder lives in `auth.json`, not in a link target.
+        eager_state_dirs: &[],
+        home_links: &[],
+        guest_env: &[],
+        proxy: Some(ProxySecret {
+            env_var: "MSB_AGENT_VM_ANTIGRAVITY_UNUSED",
+            placeholder: secrets::ANTIGRAVITY_ACCESS_PLACEHOLDER,
+            hosts: &[
+                secrets::ANTIGRAVITY_API_HOST,
+                secrets::ANTIGRAVITY_DAILY_API_HOST,
+                secrets::ANTIGRAVITY_SANDBOX_API_HOST,
+                secrets::ANTIGRAVITY_OAUTH_HOST,
+            ],
+            oauth_token_route: Some((
+                secrets::ANTIGRAVITY_OAUTH_HOST,
+                secrets::ANTIGRAVITY_OAUTH_TOKEN_PATH,
+            )),
+        }),
+        // No Google login is a normal state (not every user has one), and the
+        // tool degrades to "no Antigravity models" rather than a signed-out
+        // provider holding an unsubstituted placeholder.
+        missing_credential_error: None,
+        oauth_rotation: Some(OAuthRotation {
+            sni_host: secrets::ANTIGRAVITY_OAUTH_HOST,
+            token_path: secrets::ANTIGRAVITY_OAUTH_TOKEN_PATH,
+            accepted_refresh_placeholders: &[secrets::ANTIGRAVITY_REFRESH_PLACEHOLDER],
+            // There is no Antigravity CLI: the host rotation re-runs Pi itself,
+            // the same one-shot the interception hook runs.
+            host_login_hint: "pi -p hi --model antigravity/gemini-3.8-flash",
+        }),
     },
 ];
 
@@ -881,6 +938,10 @@ mod tests {
                 "/home/legacy/.cache/claude-vm/copilot-token.json"
             ))
         );
+        assert_eq!(
+            CredentialProvider::Antigravity.host_credential_path(),
+            Some(PathBuf::from("/home/legacy/.pi/agent/auth.json"))
+        );
         // `$HOME` unset ⇒ `None` (capture skipped, not a hard error).
         env.remove_var("HOME");
         assert_eq!(CredentialProvider::Anthropic.host_credential_path(), None);
@@ -915,7 +976,7 @@ mod tests {
     fn all_order_and_doctor_labels_match_historical_output() {
         assert_eq!(
             CredentialProvider::ALL.map(|p| p.doctor_label()),
-            ["claude", "codex", "opencode", "copilot"],
+            ["claude", "codex", "opencode", "copilot", "pi"],
             "doctor host-credential table order changed"
         );
         // #492/F02: the second *location* is what makes the claude row the
@@ -924,12 +985,18 @@ mod tests {
         // the same fact is pinned on the field that now decides it.
         assert_eq!(
             CredentialProvider::ALL.map(|p| p.host_keychain_service().is_some()),
-            [true, false, false, false],
+            [true, false, false, false, false],
             "which doctor rows have a second host credential location changed"
         );
         assert_eq!(
             CredentialProvider::ALL.map(|p| p.config_name()),
-            ["anthropic", "openai", "opencode-static", "copilot"],
+            [
+                "anthropic",
+                "openai",
+                "opencode-static",
+                "copilot",
+                "antigravity"
+            ],
             "config names or their order changed"
         );
     }

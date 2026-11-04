@@ -38,12 +38,15 @@ enum WireSlot {
     GithubEgress,
 }
 
-const WIRE_ORDER: [WireSlot; 5] = [
+const WIRE_ORDER: [WireSlot; 6] = [
     WireSlot::Provider(CredentialProvider::Anthropic),
     WireSlot::Provider(CredentialProvider::OpenAi),
     WireSlot::Provider(CredentialProvider::OpencodeStatic),
     WireSlot::GithubEgress,
     WireSlot::Provider(CredentialProvider::Copilot),
+    // Appended, never interleaved: every existing entry keeps its position, so
+    // the wire order the prefactor pinned stays byte-identical.
+    WireSlot::Provider(CredentialProvider::Antigravity),
 ];
 
 pub(crate) struct Plan {

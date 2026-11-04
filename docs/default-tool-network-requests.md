@@ -77,6 +77,8 @@ implementations or maintained primary documentation below.
 | Pi 1.4.0 (host) / 1.3.0 (image) | `pi.dev` | Provider-catalog refresh for `/model`: one JSON GET per provider per 4 h, cached catalog kept on failure; credential-free and not inference | G |
 | Pi 0.87.1 + `agent-vm-codex` (PR A contract; pending) | `chatgpt.com` | ChatGPT subscription inference (`/backend-api/codex/responses`) carrying the provisioned placeholder | F |
 | Pi 0.87.1 + `agent-vm-codex` (PR A contract; pending) | `auth.openai.com` | Placeholder OAuth refresh on a 401, answered host-side by `_intercept_hook`; already-provisioned baseline | F |
+| Pi 1.4.0 + `pi-antigravity` 0.11.0 (image-owned, ADR-0016 there) | `cloudcode-pa.googleapis.com`, `daily-cloudcode-pa.googleapis.com`, `daily-cloudcode-pa.sandbox.googleapis.com` | Antigravity inference and quota; the default endpoint plus its two fallbacks, carrying the provisioned placeholder bearer | H |
+| Pi 1.4.0 + `pi-antigravity` 0.11.0 (image-owned, ADR-0016 there) | `oauth2.googleapis.com` | Google token refresh when the provisioned credential's `expires` is within five minutes; answered host-side by `_intercept_hook` with placeholders after rotating the host login | H |
 | Copilot 1.0.90 | omitted | **Incomplete evidence**, not absence of provider traffic; #340 | C |
 | dsh | omitted | Dormant multi-provider adapter, no configured/required provider, no universal inference name; browser UI ingress is not egress | Embedded catalog |
 | shell | omitted | General command shell, no universal provider destination despite wildcard provisioning | Embedded catalog |
@@ -230,6 +232,31 @@ change had not merged when this row was written, so `E`'s `087f8ba` pin —
 v0.1.3 — is the pin for the **bridge** row only and predates this one. Fill in
 the merge commit and the image version that ships it before the release
 reviewer signs off.
+
+### H — `pi-antigravity` Pi provider extension
+
+Pinned at `pi-antigravity` **0.11.0** in the image's reviewed workspace
+(agent-vm-images `images/tools/pi/antigravity/`); the sources below are the
+published package as installed in `agent-vm-standard:local`:
+
+```text
+src/client/client.ts:18  export const DEFAULT_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com";
+src/client/client.ts:20  export const ENDPOINT_FALLBACKS = [
+src/client/client.ts:21    DEFAULT_ENDPOINT,
+src/client/client.ts:22    "https://daily-cloudcode-pa.sandbox.googleapis.com",
+src/client/client.ts:23    "https://cloudcode-pa.googleapis.com",
+src/client/client.ts:76      Authorization: `Bearer ${token}`,
+src/auth/oauth.ts:12     export const TOKEN_URL = "https://oauth2.googleapis.com/token";
+```
+
+`ANTIGRAVITY_BASE_URL` replaces the candidate list, so a launch that grants only
+`cloudcode-pa.googleapis.com` can still reach the provider by naming that
+endpoint; the declaration keeps all three because the default is the `daily-`
+host. `accounts.google.com` is the interactive login only — a guest never
+performs it, since the host owns the login and the guest holds a placeholder.
+The quota rails in `pi-quota-dispatcher` reach
+`https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary` with
+the same placeholder, so they are covered by the first row.
 
 ### G — Pi provider-catalog refresh
 

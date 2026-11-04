@@ -4805,7 +4805,7 @@ mod tests {
 
         let expected = [
             ("dsh", "dsh", 1, vec![], 1),
-            ("pi", "pi", 0, vec![], 0),
+            ("pi", "pi", 0, vec!["antigravity"], 0),
             ("codex", "codex", 0, vec!["openai"], 0),
             (
                 "opencode",
@@ -4901,7 +4901,11 @@ mod tests {
                     "api.anthropic.com",
                     "auth.openai.com",
                     "chatgpt.com",
+                    "cloudcode-pa.googleapis.com",
+                    "daily-cloudcode-pa.googleapis.com",
+                    "daily-cloudcode-pa.sandbox.googleapis.com",
                     "mcp-proxy.anthropic.com",
+                    "oauth2.googleapis.com",
                     "pi.dev",
                     "platform.claude.com",
                 ],
@@ -4974,7 +4978,7 @@ mod tests {
         let tools = default_tools().unwrap();
         let cases: [Case; 7] = [
             ("dsh", "dsh", &["web"], &[], false),
-            ("pi", "pi", &[], &[], false),
+            ("pi", "pi", &[], &[Antigravity], false),
             ("codex", "codex", &[], &[OpenAi], false),
             (
                 "opencode",
@@ -5039,7 +5043,7 @@ mod tests {
         let expected: [(&str, &[CredentialProvider], &[CredentialProvider]); 7] = [
             //  verb        credentials (required)     provisioned
             ("dsh", &[], &[]),
-            ("pi", &[], &[Anthropic, OpenAi]),
+            ("pi", &[Antigravity], &[Anthropic, OpenAi, Antigravity]),
             ("codex", &[OpenAi], &[OpenAi]),
             (
                 "opencode",
@@ -5048,7 +5052,11 @@ mod tests {
             ),
             ("claude", &[Anthropic], &[Anthropic]),
             ("copilot", &[Copilot], &[Copilot]),
-            ("shell", &[], &[Anthropic, OpenAi, OpencodeStatic, Copilot]),
+            (
+                "shell",
+                &[],
+                &[Anthropic, OpenAi, OpencodeStatic, Copilot, Antigravity],
+            ),
         ];
         assert_eq!(catalog.as_slice().len(), expected.len());
         for (name, credentials, provisioned) in expected {
@@ -5847,14 +5855,20 @@ mod tests {
             .unwrap()
             .into_launch_catalog()
             .unwrap();
-        assert_eq!(provisioned_of(&defaults, "pi"), vec![Anthropic, OpenAi]);
-        assert!(
+        assert_eq!(
+            provisioned_of(&defaults, "pi"),
+            vec![Anthropic, OpenAi, Antigravity]
+        );
+        // Pi requires Antigravity (it is the provider extension's own login) but
+        // inherits Anthropic/OpenAI from its `tools` edges without requiring
+        // them.
+        assert_eq!(
             entry_of(&defaults, "pi")
                 .tool()
                 .credential_providers()
                 .iter()
-                .next()
-                .is_none()
+                .collect::<Vec<_>>(),
+            vec![Antigravity]
         );
     }
 
@@ -6150,7 +6164,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             provisioned_of(&catalog, "shell"),
-            vec![Anthropic, OpenAi, OpencodeStatic, Copilot]
+            vec![Anthropic, OpenAi, OpencodeStatic, Copilot, Antigravity]
         );
     }
 
@@ -7298,12 +7312,15 @@ mod tests {
             observed,
             vec![
                 ("dsh", vec![]),
-                ("pi", vec![Anthropic, OpenAi]),
+                ("pi", vec![Anthropic, OpenAi, Antigravity]),
                 ("codex", vec![OpenAi]),
                 ("opencode", vec![OpenAi, OpencodeStatic]),
                 ("claude", vec![Anthropic]),
                 ("copilot", vec![Copilot]),
-                ("shell", vec![Anthropic, OpenAi, OpencodeStatic, Copilot]),
+                (
+                    "shell",
+                    vec![Anthropic, OpenAi, OpencodeStatic, Copilot, Antigravity]
+                ),
             ]
         );
     }

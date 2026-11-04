@@ -8121,7 +8121,11 @@ const SHIPPED_REQUESTS: [(&str, &[&str]); 7] = [
             "api.anthropic.com",
             "auth.openai.com",
             "chatgpt.com",
+            "cloudcode-pa.googleapis.com",
+            "daily-cloudcode-pa.googleapis.com",
+            "daily-cloudcode-pa.sandbox.googleapis.com",
             "mcp-proxy.anthropic.com",
+            "oauth2.googleapis.com",
             "pi.dev",
             "platform.claude.com",
         ],
@@ -8165,7 +8169,20 @@ fn shipped_request_block(tier: &str, total: usize, unmet: &[&str]) -> Vec<String
         "==> Tool network requests ({tier}): {} of {total} not covered by this launch's {REQUEST_SCOPE}; requests never grant access and the launch continues",
         unmet.len()
     )];
-    lines.extend(unmet.iter().map(|name| format!("==>   unmet: {name}")));
+    // The report shows at most eight names, then a count (`network_requests`'s
+    // `reported`), so the oracle models the cap rather than assuming it.
+    let shown = unmet.len().min(8);
+    lines.extend(
+        unmet[..shown]
+            .iter()
+            .map(|name| format!("==>   unmet: {name}")),
+    );
+    if unmet.len() > shown {
+        lines.push(format!(
+            "==>   … and {} more not shown",
+            unmet.len() - shown
+        ));
+    }
     lines.push(REQUEST_HINT.into());
     lines
 }

@@ -62,6 +62,16 @@ fn response(reply: PublicReply) -> Result<http::Response> {
                 "expires_in": expires_in.0, "token_type": "Bearer",
             }),
         ),
+        PublicReply::AntigravitySuccess { expires_in } => http::Response::json(
+            200,
+            "OK",
+            &serde_json::json!({
+                "access_token": secrets::ANTIGRAVITY_ACCESS_PLACEHOLDER,
+                "expires_in": expires_in.0,
+                "scope": "https://www.googleapis.com/auth/cloud-platform",
+                "token_type": "Bearer",
+            }),
+        ),
         PublicReply::TemporarilyUnavailable { provider, reason } => {
             tracing::debug!(provider = ?provider, reason = ?reason, "OAuth refresh temporarily unavailable");
             let command = provider.rotation().host_login_hint;
@@ -91,6 +101,7 @@ fn response(reply: PublicReply) -> Result<http::Response> {
 enum RotatableProvider {
     Anthropic,
     OpenAi,
+    Antigravity,
 }
 
 impl RotatableProvider {
@@ -98,6 +109,7 @@ impl RotatableProvider {
         match self {
             RotatableProvider::Anthropic => CredentialProvider::Anthropic,
             RotatableProvider::OpenAi => CredentialProvider::OpenAi,
+            RotatableProvider::Antigravity => CredentialProvider::Antigravity,
         }
     }
 
@@ -111,9 +123,13 @@ impl RotatableProvider {
     /// Match the request's SNI/Host against the shared table, case-insensitively
     /// (matching the hook's historical behaviour).
     fn from_sni(sni: &str) -> Option<Self> {
-        [RotatableProvider::Anthropic, RotatableProvider::OpenAi]
-            .into_iter()
-            .find(|provider| sni.eq_ignore_ascii_case(provider.rotation().sni_host))
+        [
+            RotatableProvider::Anthropic,
+            RotatableProvider::OpenAi,
+            RotatableProvider::Antigravity,
+        ]
+        .into_iter()
+        .find(|provider| sni.eq_ignore_ascii_case(provider.rotation().sni_host))
     }
 }
 
@@ -197,6 +213,9 @@ enum PublicReply {
         scope: OAuthScope,
     },
     OpenAiSuccess {
+        expires_in: ExpiresIn,
+    },
+    AntigravitySuccess {
         expires_in: ExpiresIn,
     },
     TemporarilyUnavailable {
@@ -469,6 +488,8 @@ const OPENAI_UNKNOWN_EXPIRY_SECS: i64 = 3600;
 const LOCK_CEILING: Duration = Duration::from_secs(20);
 const ANTHROPIC_CLI_TIMEOUT: Duration = Duration::from_secs(45);
 const OPENAI_CLI_TIMEOUT: Duration = Duration::from_secs(60);
+/// A host Pi start-up is slower than either vendor CLI's one-shot.
+const ANTIGRAVITY_CLI_TIMEOUT: Duration = Duration::from_secs(90);
 const ATTEMPT_STAMP_SECS: Duration = Duration::from_secs(30);
 
 fn refresh(state_dir: &Path, validated: ValidatedRefresh) -> PublicReply {
@@ -485,6 +506,11 @@ fn refresh(state_dir: &Path, validated: ValidatedRefresh) -> PublicReply {
         RotatableProvider::OpenAi => openai_refresh(state_dir, now, |cmd, args, cwd, timeout| {
             run_host_cli(cmd, args, cwd, timeout)
         }),
+        RotatableProvider::Antigravity => {
+            antigravity_refresh(state_dir, now, |cmd, args, cwd, timeout| {
+                run_host_cli(cmd, args, cwd, timeout)
+            })
+        }
     }
 }
 fn unavailable(provider: RotatableProvider, reason: UnusableReason) -> PublicReply {
@@ -856,6 +882,180 @@ where
 }
 
 struct RefreshLock(std::fs::File);
+
+enum AntigravityInspection {
+    Serve {
+        bearer: Bearer,
+        expires_in: ExpiresIn,
+        above_margin: bool,
+    },
+    Rotate,
+    Unavailable(UnusableReason),
+}
+
+/// Read the host's Antigravity login out of Pi's provider credential document:
+/// `antigravity.access` plus `antigravity.expires` (epoch millis). The provider
+/// extension refreshes at the same expiry, so the guest's refresh request is
+/// exactly the moment the host credential needs rotating.
+fn inspect_antigravity(path: Option<&Path>, now: i64) -> AntigravityInspection {
+    let Some(path) = path else {
+        return AntigravityInspection::Unavailable(UnusableReason::HostPathUnavailable);
+    };
+    let raw = match read_bounded_regular_file(path, MAX_HOST_CREDENTIAL_FILE_BYTES) {
+        Ok(raw) => raw,
+        Err(_) => {
+            return AntigravityInspection::Unavailable(UnusableReason::HostCredentialUnreadable);
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_slice(&raw) {
+        Ok(value) => value,
+        Err(_) => {
+            return AntigravityInspection::Unavailable(UnusableReason::HostCredentialMalformed);
+        }
+    };
+    let entry = value.get("antigravity");
+    let token = entry
+        .and_then(|entry| entry.get("access"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty());
+    let expiry = entry
+        .and_then(|entry| entry.get("expires"))
+        .and_then(serde_json::Value::as_i64);
+    let Some(token) = token else {
+        return AntigravityInspection::Unavailable(UnusableReason::MissingBearer);
+    };
+    let Some(expiry) = expiry else {
+        // No expiry recorded: serve it and let the vendor answer 401 if it is
+        // stale, rather than rotating on every single refresh request.
+        return AntigravityInspection::Serve {
+            bearer: Bearer(token.into()),
+            expires_in: ExpiresIn::openai_unknown(),
+            above_margin: true,
+        };
+    };
+    match ExpiresIn::from_expiry_ms(expiry, now, SERVING_FLOOR_SECS) {
+        Some(expires_in) => AntigravityInspection::Serve {
+            above_margin: expiry.saturating_sub(now) / 1000 > ROTATION_MARGIN_SECS,
+            bearer: Bearer(token.into()),
+            expires_in,
+        },
+        None => AntigravityInspection::Rotate,
+    }
+}
+
+fn antigravity_reply(state_dir: &Path, state: AntigravityInspection) -> PublicReply {
+    match state {
+        AntigravityInspection::Serve {
+            bearer, expires_in, ..
+        } => match bearer.install(&secrets::antigravity_token_path(state_dir)) {
+            Ok(()) => PublicReply::AntigravitySuccess { expires_in },
+            Err(reason) => unavailable(RotatableProvider::Antigravity, reason),
+        },
+        AntigravityInspection::Unavailable(reason) => {
+            unavailable(RotatableProvider::Antigravity, reason)
+        }
+        AntigravityInspection::Rotate => unavailable(
+            RotatableProvider::Antigravity,
+            UnusableReason::RotationDidNotProduceUsableCredential,
+        ),
+    }
+}
+
+/// Rotate the host's Google credential by re-running the host CLI that owns it.
+///
+/// There is no Antigravity CLI: the host owner of the credential is Pi itself,
+/// so the one-shot is a host Pi prompt against a cheap Antigravity model, which
+/// makes `pi-antigravity` refresh the token it stores in `~/.pi/agent/auth.json`.
+/// Same shape as the Anthropic and OpenAI siblings: single-flight per provider,
+/// a 30 s attempt stamp, then a re-read.
+fn antigravity_refresh<F>(state_dir: &Path, now: i64, runner: F) -> PublicReply
+where
+    F: Fn(&str, &[&str], &Path, Duration) -> Result<()>,
+{
+    let path = RotatableProvider::Antigravity
+        .credential()
+        .host_credential_path();
+    let initial = inspect_antigravity(path.as_deref(), now);
+    if matches!(
+        &initial,
+        AntigravityInspection::Serve {
+            above_margin: true,
+            ..
+        }
+    ) || matches!(&initial, AntigravityInspection::Unavailable(_))
+    {
+        return antigravity_reply(state_dir, initial);
+    }
+    let lock =
+        match RefreshLock::acquire(state_dir, secrets::REFRESH_LOCK_ANTIGRAVITY, LOCK_CEILING) {
+            Ok(lock) => lock,
+            Err(_) => {
+                let Ok(now) = now_ms() else {
+                    return unavailable(
+                        RotatableProvider::Antigravity,
+                        UnusableReason::InvalidExpiry,
+                    );
+                };
+                return match inspect_antigravity(path.as_deref(), now) {
+                    ready @ AntigravityInspection::Serve { .. } => {
+                        antigravity_reply(state_dir, ready)
+                    }
+                    _ => unavailable(
+                        RotatableProvider::Antigravity,
+                        UnusableReason::RefreshLockUnavailable,
+                    ),
+                };
+            }
+        };
+    let Ok(now) = now_ms() else {
+        return unavailable(
+            RotatableProvider::Antigravity,
+            UnusableReason::InvalidExpiry,
+        );
+    };
+    let reread = inspect_antigravity(path.as_deref(), now);
+    if matches!(
+        &reread,
+        AntigravityInspection::Serve {
+            above_margin: true,
+            ..
+        }
+    ) || matches!(&reread, AntigravityInspection::Unavailable(_))
+    {
+        return antigravity_reply(state_dir, reread);
+    }
+    if !stamp_is_fresh(
+        &secrets::attempt_stamp_path_for(state_dir, "antigravity"),
+        now,
+    ) {
+        let _ = write_stamp(state_dir, "antigravity", now);
+        let cwd = match isolated_work_dir(state_dir) {
+            Ok(dir) => dir,
+            Err(_) => {
+                return unavailable(
+                    RotatableProvider::Antigravity,
+                    UnusableReason::TokenInstallFailed,
+                );
+            }
+        };
+        let _ = runner(
+            "pi",
+            &["-p", "hi", "--model", "antigravity/gemini-3.8-flash"],
+            cwd.path(),
+            ANTIGRAVITY_CLI_TIMEOUT,
+        );
+    }
+    let Ok(now) = now_ms() else {
+        return unavailable(
+            RotatableProvider::Antigravity,
+            UnusableReason::InvalidExpiry,
+        );
+    };
+    // Hold the provider lock until the re-read credential is installed.
+    let _lock = lock;
+    antigravity_reply(state_dir, inspect_antigravity(path.as_deref(), now))
+}
+
 impl RefreshLock {
     fn acquire(state_dir: &Path, name: &str, ceiling: Duration) -> Result<Self> {
         let path = secrets::refresh_lock_path_for(state_dir, name);
@@ -940,9 +1140,17 @@ mod tests {
             .collect();
         assert_eq!(
             rotatable,
-            vec![CredentialProvider::Anthropic, CredentialProvider::OpenAi]
+            vec![
+                CredentialProvider::Anthropic,
+                CredentialProvider::OpenAi,
+                CredentialProvider::Antigravity
+            ]
         );
-        for provider in [RotatableProvider::Anthropic, RotatableProvider::OpenAi] {
+        for provider in [
+            RotatableProvider::Anthropic,
+            RotatableProvider::OpenAi,
+            RotatableProvider::Antigravity,
+        ] {
             let sni = provider.rotation().sni_host;
             assert_eq!(RotatableProvider::from_sni(sni), Some(provider));
             assert_eq!(
@@ -986,6 +1194,78 @@ mod tests {
             anthropic,
             secrets::OPENAI_REFRESH_PLACEHOLDER
         ));
+    }
+
+    /// #507: the Antigravity arm accepts its own refresh placeholder on
+    /// Google's token endpoint and nothing else, and a validated refresh is
+    /// framed with the placeholder access token, never the host's.
+    #[test]
+    fn antigravity_refresh_is_served_with_a_placeholder() {
+        let provider = RotatableProvider::Antigravity;
+        assert_eq!(
+            provider.rotation().sni_host,
+            secrets::ANTIGRAVITY_OAUTH_HOST
+        );
+        assert_eq!(
+            provider.rotation().token_path,
+            secrets::ANTIGRAVITY_OAUTH_TOKEN_PATH
+        );
+        assert!(refresh_placeholder_matches(
+            provider,
+            secrets::ANTIGRAVITY_REFRESH_PLACEHOLDER
+        ));
+        for other in [
+            secrets::ANTHROPIC_REFRESH_PLACEHOLDER,
+            secrets::OPENAI_REFRESH_PLACEHOLDER,
+            secrets::OPENCODE_OPENAI_REFRESH_PLACEHOLDER,
+        ] {
+            assert!(!refresh_placeholder_matches(provider, other));
+        }
+
+        let body = format!(
+            "grant_type=refresh_token&refresh_token={}",
+            secrets::ANTIGRAVITY_REFRESH_PLACEHOLDER
+        );
+        let valid = request(
+            secrets::ANTIGRAVITY_OAUTH_HOST,
+            secrets::ANTIGRAVITY_OAUTH_TOKEN_PATH,
+            "application/x-www-form-urlencoded",
+            &body,
+        );
+        let response = handle_with(&valid, secrets::ANTIGRAVITY_OAUTH_HOST, |_| {
+            PublicReply::AntigravitySuccess {
+                expires_in: ExpiresIn::openai_unknown(),
+            }
+        })
+        .unwrap();
+        let text = std::str::from_utf8(response.as_bytes()).unwrap();
+        assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+        assert!(
+            text.contains(secrets::ANTIGRAVITY_ACCESS_PLACEHOLDER),
+            "{text}"
+        );
+
+        // The OpenAI placeholder on the Google endpoint is refused outright.
+        let wrong = format!(
+            "grant_type=refresh_token&refresh_token={}",
+            secrets::OPENAI_REFRESH_PLACEHOLDER
+        );
+        let refused = handle_with(
+            &request(
+                secrets::ANTIGRAVITY_OAUTH_HOST,
+                secrets::ANTIGRAVITY_OAUTH_TOKEN_PATH,
+                "application/x-www-form-urlencoded",
+                &wrong,
+            ),
+            secrets::ANTIGRAVITY_OAUTH_HOST,
+            |_| panic!("a foreign placeholder must not reach the action"),
+        )
+        .unwrap();
+        assert!(
+            std::str::from_utf8(refused.as_bytes())
+                .unwrap()
+                .starts_with("HTTP/1.1 403")
+        );
     }
 
     fn request(sni: &str, path: &str, ct: &str, body: &str) -> Vec<u8> {
