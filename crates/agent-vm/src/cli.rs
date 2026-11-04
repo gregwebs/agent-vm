@@ -3,13 +3,13 @@
 //! Everything clap-shaped lives behind this module. The set of **launch
 //! verbs** is a *runtime* fact — read from the resolved tool catalog — while
 //! the fixed built-ins (`setup`, `secret`, `image`, `msb`, `clipboard`, `doctor`,
-//! `_intercept-hook`) are static. [`parse_from`] is the seam: argv plus the
-//! *result* of `config::load` yields a [`Dispatch`] decision.
+//! `tools`, `_intercept-hook`) are static. [`parse_from`] is the seam: argv plus
+//! the *result* of `config::load` yields a [`Dispatch`] decision.
 //!
 //! The deferred config failure is consumed differently per verb: diagnoses
 //! where it is diagnostic (`doctor`, `setup`), ignored where it is irrelevant
-//! (`clipboard`, `_intercept-hook`, `image build`/`import`), and fatal for
-//! `image show`, which reports a selection and so cannot use a fallback
+//! (`clipboard`, `_intercept-hook`, `image build`/`import`, `tools print`), and
+//! fatal for `image show`, which reports a selection and so cannot use a fallback
 //! configuration.
 //!
 //! `parse_from` takes `argv` explicitly and returns `Result`; it never calls
@@ -27,12 +27,13 @@
 //!
 //! `config::load` runs before parsing, because the catalog decides which
 //! subcommands exist. But its *failure* is carried as data: `doctor`,
-//! `clipboard` and `_intercept-hook` must keep working (the latter two run
-//! inside the guest, where a project config is present), and any unknown verb
-//! must be able to surface the config error rather than clap's "unrecognized
-//! subcommand", which would send the user hunting for a typo in the verb
-//! instead of in their TOML. On the broken path we therefore register no tool
-//! subcommands and enable `allow_external_subcommands`.
+//! `clipboard`, `_intercept-hook` and `tools print` must keep working
+//! (`clipboard`/`_intercept-hook` run inside the guest, where a project config is
+//! present; `tools print` reports the binary's own catalog, which no file can
+//! change), and any unknown verb must be able to surface the config error rather
+//! than clap's "unrecognized subcommand", which would send the user hunting for a
+//! typo in the verb instead of in their TOML. On the broken path we therefore
+//! register no tool subcommands and enable `allow_external_subcommands`.
 //!
 //! # Security
 //!
@@ -240,6 +241,9 @@ pub(crate) enum Cmd {
     /// Only `show` is offline; only build/import may invoke Docker.
     Image(crate::image_cmd::Args),
 
+    /// Print the built-in tool definitions as user-config TOML.
+    Tools(crate::tools_cmd::Args),
+
     /// Internal: invoked by msb's interceptor hook for matched OAuth
     /// and scoped GitHub requests. Reads stdin and writes the protocol
     /// response on stdout. Not meant for direct use.
@@ -255,7 +259,8 @@ pub(crate) enum Cmd {
 ///
 /// `catalog` keeps the *deferred* config failure, and the policy over it is
 /// deliberately asymmetric: `doctor` diagnoses it, `clipboard`/`_intercept-hook`
-/// ignore it (they run inside the guest), `image build`/`import` ignore it, and
+/// ignore it (they run inside the guest), `image build`/`import` ignore it,
+/// `tools print` ignores it (its output is the *binary's* catalog), and
 /// `image show` treats it as fatal — a report about a selection cannot be
 /// trusted when the configuration that would have produced it is broken.
 pub(crate) enum Dispatch {
@@ -309,6 +314,7 @@ pub(crate) const BUILTIN_SUBCOMMANDS: &[&str] = &[
     "doctor",
     "secret",
     "image",
+    "tools",
     "_intercept-hook",
     // The direct runner (issue #398) is a fixed launch route, so it is a
     // built-in *name* even though its target is user-supplied argv.
@@ -653,6 +659,7 @@ fn reconcile_image_args(sub: &clap::ArgMatches, cmd: &mut Cmd) {
         | Cmd::Clipboard(_)
         | Cmd::Doctor(_)
         | Cmd::Secret(_)
+        | Cmd::Tools(_)
         | Cmd::InterceptHook(_) => {}
     }
 }
@@ -1297,6 +1304,7 @@ fn validate_builtin_args(command: &clap::Command, cmd: &Cmd) -> Result<()> {
         | Cmd::Clipboard(_)
         | Cmd::Doctor(_)
         | Cmd::Secret(_)
+        | Cmd::Tools(_)
         | Cmd::InterceptHook(_) => Ok(()),
     };
     validated.map_err(|error| {
@@ -1435,6 +1443,11 @@ mod tests {
                     "--mount",
                     "secret",
                 ),
+                (
+                    vec!["agent-vm", "--root", "tools", "print"],
+                    "--root",
+                    "tools",
+                ),
             ] {
                 let config = if broken {
                     Err(anyhow::anyhow!("broken"))
@@ -1482,7 +1495,11 @@ mod tests {
         env.set_var("AGENT_VM_MEMORY_GIB", "abc");
         env.remove_var("AGENT_VM_CPUS");
         env.remove_var("AGENT_VM_IMAGE_TAG");
-        for argv in [vec!["agent-vm", "doctor"], vec!["agent-vm", "secret", "ls"]] {
+        for argv in [
+            vec!["agent-vm", "doctor"],
+            vec!["agent-vm", "secret", "ls"],
+            vec!["agent-vm", "tools", "print"],
+        ] {
             assert!(matches!(
                 parse_from(argv, Ok(report_from(SHELL_ONLY))).unwrap(),
                 Dispatch::Builtin { .. }
@@ -2684,6 +2701,56 @@ mod tests {
         assert!(!text.contains("unrecognized subcommand"), "{text}");
     }
 
+    // -- #510: `tools print` is a built-in for every catalog state ---------
+
+    /// The printed catalog is the *binary's*, so the carried configuration must
+    /// never gate the verb: a ready catalog of other tools, one that already
+    /// declares `shell`, and a broken one all dispatch it, and the requested
+    /// order survives parsing.
+    #[test]
+    fn tools_print_is_a_builtin_for_every_catalog_state() {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
+        let printed = |dispatch: Dispatch| match dispatch {
+            Dispatch::Builtin {
+                cmd:
+                    Cmd::Tools(crate::tools_cmd::Args {
+                        cmd: crate::tools_cmd::ToolsCmd::Print(print),
+                    }),
+                ..
+            } => print.names,
+            _ => panic!("tools print must dispatch as a built-in"),
+        };
+        for config in [
+            Ok(report_from(MYTOOL)),
+            Ok(report_from(SHELL_ONLY)),
+            Err(anyhow!("broken on purpose")),
+        ] {
+            let names =
+                printed(parse_from(["agent-vm", "tools", "print", "codex", "pi"], config).unwrap());
+            assert_eq!(names, ["codex", "pi"]);
+        }
+        assert!(
+            printed(parse_from(["agent-vm", "tools", "print"], Ok(report_from(MYTOOL))).unwrap())
+                .is_empty()
+        );
+
+        // `tools` is a group like `image`: with no subcommand clap answers with
+        // its own usage error and status 2, so a bare form never means "print
+        // everything".
+        let catalog = Catalog::Ready(report_from(MYTOOL).into_launch_catalog().unwrap());
+        let error = build_command(&catalog)
+            .try_get_matches_from(["agent-vm", "tools"])
+            .expect_err("a bare group is a usage error");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
+        assert_eq!(error.exit_code(), 2);
+    }
+
     // -- T11: the near-builtin predicate ----------------------------------
 
     #[test]
@@ -2750,6 +2817,7 @@ mod tests {
                 "doctor",
                 "secret",
                 "image",
+                "tools",
                 "_intercept-hook",
                 "run",
                 "shell",
@@ -2894,7 +2962,15 @@ mod tests {
             .write_long_help(&mut help)
             .expect("the broken-config help renders");
         let help = String::from_utf8(help).unwrap();
-        for builtin in ["setup", "msb", "clipboard", "doctor", "secret", "image"] {
+        for builtin in [
+            "setup",
+            "msb",
+            "clipboard",
+            "doctor",
+            "secret",
+            "image",
+            "tools",
+        ] {
             assert!(help.contains(builtin), "missing builtin {builtin}: {help}");
         }
         assert!(help.contains("could not be read"), "{help}");

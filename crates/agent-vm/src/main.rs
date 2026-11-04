@@ -72,6 +72,7 @@ mod teardown;
 mod test_env;
 #[cfg(test)]
 mod test_fixtures;
+mod tools_cmd;
 mod user;
 mod user_network;
 
@@ -188,6 +189,18 @@ fn run_dispatch(dispatch: Dispatch) -> Result<()> {
     } = dispatch
     {
         return exit_with(secret::run(args)?);
+    }
+
+    // `tools print` prints the definitions compiled into this binary (#510), so the
+    // discovered config's result cannot matter: it returns before credential
+    // preflight, the MSB prologue, state creation and the runtime. The carried
+    // catalog, ready or broken, is ignored.
+    if let Dispatch::Builtin {
+        cmd: Cmd::Tools(args),
+        ..
+    } = dispatch
+    {
+        return tools_cmd::run(args);
     }
 
     // `image show` reports the selection a launch *here* would make (#373). It
@@ -340,6 +353,11 @@ fn run_dispatch(dispatch: Dispatch) -> Result<()> {
                 ..
             } => {
                 unreachable!("Cmd::Secret is dispatched pre-runtime, see above")
+            }
+            Dispatch::Builtin {
+                cmd: Cmd::Tools(_), ..
+            } => {
+                unreachable!("Cmd::Tools is dispatched pre-runtime, see above")
             }
         }
     })

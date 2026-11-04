@@ -127,6 +127,9 @@ use crate::boot_image::ImageRef;
 use crate::credential_provider::{CredentialProvider, ProviderSet};
 use crate::secret_store::ServiceName;
 
+mod builtin_print;
+pub(crate) use builtin_print::builtin_tools_toml;
+
 /// Ceiling on a config file read. A project config is possibly untrusted
 /// input, so a huge or special file must not be able to hang or exhaust
 /// `doctor`. Deliberately a *config* policy constant, not the credential
@@ -157,6 +160,9 @@ pub(crate) const RESERVED_TOOL_NAMES: &[&str] = &[
     "doctor",
     "secret",
     "image",
+    // `tools print` (#510) re-emits the built-in catalog, so the word belongs to
+    // the CLI even though no shipped tool is named it.
+    "tools",
     "_intercept-hook",
     // The direct runner (issue #398). Reserved in every config tier, like a
     // built-in: a tool by that name could not be reached, and the runner is
@@ -1412,15 +1418,26 @@ fn default_tools() -> Result<Vec<Tool>> {
 }
 
 fn tools_from_builtin_text(text: &str) -> Result<Vec<Tool>> {
-    let path = Path::new("default-tools.toml");
-    let raw: RawConfig =
-        toml::from_str(text).map_err(|error| deserialize_error(path, text, &error))?;
-    refuse_non_user_authority(&raw, path, RefusingTier::BuiltIn)?;
+    let raw = builtin_raw_config(text)?;
     validate_tools(
         raw.tools,
         ToolOrigin::BuiltIn,
         config_mounts::ToolMountLists::empty(),
     )
+}
+
+/// The built-in text as raw declarations, through the deserialization and tier
+/// refusal every built-in read applies. [`builtin_print`] starts here so the
+/// printed declarations come through the same read, minus `validate_tools`:
+/// printing re-emits raw declarations rather than re-deriving the validated
+/// model, and a semantically invalid shipped declaration is a programming error
+/// the launch and printer round-trip tests catch.
+fn builtin_raw_config(text: &str) -> Result<RawConfig> {
+    let path = Path::new("default-tools.toml");
+    let raw: RawConfig =
+        toml::from_str(text).map_err(|error| deserialize_error(path, text, &error))?;
+    refuse_non_user_authority(&raw, path, RefusingTier::BuiltIn)?;
+    Ok(raw)
 }
 
 fn discover_home() -> Result<Option<PathBuf>> {
