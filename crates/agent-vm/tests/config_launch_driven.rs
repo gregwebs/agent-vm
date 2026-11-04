@@ -5167,13 +5167,14 @@ fn doctor_tool_order(text: &str) -> Vec<String> {
 fn help_tool_order(text: &str) -> Vec<String> {
     // Fixed built-ins, including the direct runner (`run`, #398): the point of
     // this helper is the *catalog* launch verbs and their order.
-    const BUILTINS: [&str; 8] = [
+    const BUILTINS: [&str; 9] = [
         "setup",
         "msb",
         "clipboard",
         "doctor",
         "secret",
         "image",
+        "tools",
         "run",
         "help",
     ];

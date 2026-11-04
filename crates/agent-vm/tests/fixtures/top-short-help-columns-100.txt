@@ -14,6 +14,7 @@ Commands:
   image      Inspect the selected boot image, acquire it into the image cache, explicitly retain a
              default, or build/import a finished image. Only `show` is offline; only build/import
              may invoke Docker
+  tools      Print the built-in tool definitions as user-config TOML
   run        Run a guest executable directly; every argument after it is literal
   shell      Launch shell in a per-project sandbox; tool arguments are forwarded verbatim
   help       Print this message or the help of the given subcommand(s)

@@ -31,6 +31,7 @@ const BUILTIN_SUBCOMMANDS: &[&str] = &[
     "clipboard",
     "doctor",
     "secret",
+    "tools",
     "_intercept-hook",
     // The direct runner (#398) is a fixed built-in name whose target is
     // user-supplied argv; `every_launch_verb_refuses_the_same_mount` runs each

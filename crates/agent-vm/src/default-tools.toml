@@ -3,10 +3,10 @@
 #
 # This is the single shipped source of the launch-verb catalog: it is embedded
 # at compile time with `include_str!` and parsed through exactly the same
-# raw-to-validated path as a user's file. `agent-vm doctor` never writes it
-# out; there is no starter-config writer (#80's non-goals). The built-in
-# `shell` fallback (when a config omits the name) is this file's `shell` entry,
-# re-parsed — there is no second definition.
+# raw-to-validated path as a user's file. `agent-vm tools print` prints these
+# definitions (without these comments) as user-config TOML (#510); nothing writes
+# them to disk. The built-in `shell` fallback (when a config omits the name) is
+# this file's `shell` entry, re-parsed — there is no second definition.
 #
 # Order matters only for presentation: the declaration order below is the order
 # `agent-vm --help` and `agent-vm doctor` show the verbs. The image is selected

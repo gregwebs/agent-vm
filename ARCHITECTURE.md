@@ -70,11 +70,13 @@ crates/agent-vm/src/
 ├── image_import.rs         # daemon/archive import
 ├── image_publish.rs        # staging, native publication, requested-reference rollback
 ├── image_miss.rs           # registry-failure import hint
+├── tools_cmd.rs            # tools verb group: `print` the built-in definitions as user TOML
 ├── msb_install.rs          # locate + version-verify the bundled msb; MSB_HOME
 ├── msb_preflight.rs        # fail fast on a forward-migrated msb.db
 ├── doctor.rs               # operator diagnostics and db recovery
 ├── pi_credential_inspection.rs # read-only structural report of guest Pi state (#93)
 ├── config.rs               # read-only tool config parse/merge/validate (doctor preview)
+│   └── builtin_print.rs    #   built-in declarations re-emitted as user-config TOML (#510)
 └── …                       # clipboard, setup, user, env_flag, …
 
 vendor/agent-vm-images/      # contributor-only pinned independent image sources

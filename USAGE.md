@@ -77,6 +77,8 @@ image refresh [--image REF] [--yes]
                                     retained default
 image set-default --image REF [--yes]
                                     approve and retain a new digest-pinned default
+tools print [NAME...]               print the built-in tool definitions (all, or
+                                    just NAMEs) as user-config TOML
 setup                               acquire the selected image + verify boot
 doctor                              report host credentials + microsandbox state
                                     + the resolved tool configuration
@@ -1401,6 +1403,10 @@ guest: selecting `agent` is neither credential shielding nor credential
 provisioning, and Pi's own `agent/auth.json` and `agent/models.json` are always
 omitted from a `~/.pi:fork`.
 
+To start from exactly your installed release's definitions instead, run
+`agent-vm tools print` and add the `mounts` lines and `[mount_sets]` table to
+the printed blocks.
+
 <!-- tool-mount-catalog -->
 ```toml
 # ~/.config/agent-vm/config.toml — full replacement tool catalog.
@@ -1832,10 +1838,11 @@ network_requests = ["api.example.com"] # optional; destinations the tool expects
 - `name` — required; a single command-name token: nonempty, no
   whitespace/control characters, no `/` (a name is not a path), not an
   all-dots spelling (`.`/`..`), no leading `-`, and not one of the reserved
-  subcommands `image`, `setup`, `msb`, `clipboard`, `doctor`, `secret`,
+  subcommands `image`, `setup`, `msb`, `clipboard`, `doctor`, `secret`, `tools`,
   `_intercept-hook`, `run`, `help`. Names are case-sensitive. Naming a tool `claude`
   is normal — that is the point. `pull` and `upgrade` are no longer reserved
   (they were removed as built-ins in 0.7.0), so a configured tool may use them.
+  `tools` is reserved since 0.7.30 (`agent-vm tools print`, #510).
 - `command` — required, nonempty, NUL-free. The guest command name; it is
   never executed by `doctor`.
 - `args` — optional, the default argv prepended to the user's own args unless
@@ -2058,9 +2065,10 @@ Only when **both** files declare zero tools (missing, empty, or `tools = []`)
 does the compiled-in defaults list apply: `dsh`, `pi`, `codex`, `opencode`,
 `claude`, `copilot`, `shell`, in that order. They are defined once in
 [`crates/agent-vm/src/default-tools.toml`](crates/agent-vm/src/default-tools.toml),
-embedded into the binary (never written to disk). **`codex` and `opencode`
-have empty `args` on purpose** — their non-interactive configuration is
-persisted as files, not a flag; do not add one.
+embedded into the binary and never written to disk; `agent-vm tools print`
+prints them (see [Printing the built-in tools](#printing-the-built-in-tools)).
+**`codex` and `opencode` have empty `args` on purpose** — their non-interactive
+configuration is persisted as files, not a flag; do not add one.
 
 `codex` and `shell` are the only shipped tools that declare `env`: both set
 `CODEX_HOME=/agent-vm-state/codex`. Codex is the one agent with no
@@ -2233,6 +2241,54 @@ If you declare your own `codex` or `shell` tool in
 wins wholesale and does **not** inherit the shipped `env` — add
 `env = { CODEX_HOME = "/agent-vm-state/codex" }` to it, or codex will start in
 the guest as signed out.
+
+### Printing the built-in tools
+
+`agent-vm tools print` writes this release's built-in tool definitions to
+stdout as user-config TOML; `agent-vm tools print NAME...` writes only those
+tools, in the order given. The output comes from the binary, never from a
+config file, so it works with a broken or absent config and always matches the
+installed release.
+
+The output is a **complete `tools` section**, not an increment: it goes where
+your `tools` declarations go, and the rest of your file stays as it is.
+
+For a new config file, this is the whole file:
+
+```bash
+mkdir -p ~/.config/agent-vm
+agent-vm tools print > ~/.config/agent-vm/config.toml
+```
+
+For an existing file that holds other settings and declares no tools:
+
+```bash
+agent-vm tools print >> ~/.config/agent-vm/config.toml
+```
+
+Use one, not both: `>` writes the whole file, `>>` appends to one already there.
+What an existing `tools` declaration needs first depends on its TOML form. A
+top-level **assignment** (`tools = []`, or an inline `tools = [{ … }]`) makes
+`tools` a value, which `[[tools]]` blocks cannot extend: TOML rejects the whole
+document, so delete the assignment and put the printed blocks where it was.
+Existing `[[tools]]` **blocks** are an array of tables, so blocks for names the
+file does not already declare can follow them; a name declared twice is a config
+error, not a TOML one.
+
+- Declaring any tool replaces the whole built-in catalog, so the no-argument
+  form is the one-paste starting point for a file with no tools of its own. A
+  file that already declares some gets only the names it lacks: one file cannot
+  declare a name twice.
+- A `tools` list resolves only within its own file (see [Tool references are
+  local to their file](#tool-references-are-local-to-their-file)): `pi` names
+  `claude` and `codex`, so a file holding `pi` alone loads but fails catalog
+  resolution until both are declared too.
+- The definitions print without `default-tools.toml`'s comments, in a fixed
+  key order with empty defaults omitted; a header names the build that printed
+  them.
+- An unknown or repeated name fails with nothing on stdout. Unknown-name
+  errors list the built-in names; repeated-name errors identify the repeated
+  name.
 
 ### Errors and recovery
 
