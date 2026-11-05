@@ -101,6 +101,12 @@ reports the scoping mistake and the fix in one sentence, mirroring the existing
 `mounts`-in-`[network]` refusal. Tool, route and subcommand words stay unreserved:
 a set may still be called `pi` or `shell`.
 
+_Amended again by [#511](https://github.com/gregwebs/agent-vm/issues/511)._ The
+sixth top-level field, `egress_sets`, is reserved too — the reservation belongs to
+the schema, not to one table, so a `[mount_sets]` key named `egress_sets` is
+refused by the same sentence. Egress sets copy this rule from mount sets rather
+than inventing a second one.
+
 `--no-config-mounts` skips configuration-selected mount preparation, not schema,
 reference, cycle, or authority validation. Explicit CLI paths and named sets still
 apply. Unknown set names never fall back to relative host paths. `~/` expansion

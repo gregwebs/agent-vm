@@ -1,8 +1,9 @@
 //! Non-authoritative tool metadata: parsing and bounded reporting only (ADR-0039).
 //! Requests never flow into policy or provisioning **from here**. The one route
 //! by which a request becomes authority is a user-tier `tool:NAME` egress
-//! reference, which reads the already-parsed set through `egress_reference`
-//! (ADR-0059); this module's data-flow invariant is unchanged.
+//! reference — or, from 0.7.32, a `set:NAME` whose set names that tool — which
+//! reads the already-parsed set through `egress_reference` (ADR-0059, #511);
+//! this module's data-flow invariant is unchanged.
 use crate::egress_grammar::AllowanceError;
 use crate::egress_hostname::{CanonicalHostname, HostnameScope, PortNot53Or853};
 use crate::egress_policy::Allowance;
@@ -298,15 +299,18 @@ mod tests {
         ] {
             rows.push((input, BAD_NAME));
         }
-        // ADR-0059 R24: `tool:` in `network_requests` is *not* a reference. The
-        // request grammar is `Allowance::parse`, so it reads `tool` as a host and
-        // the remainder as a port — the pre-#506 error, byte for byte.
+        // ADR-0059 R24 and #511 R30: `tool:` and `set:` in `network_requests` are
+        // *not* references. The request grammar is `Allowance::parse`, so it reads
+        // the word as a host and the remainder as a port — the pre-#506 and
+        // pre-#511 errors, byte for byte.
         for input in [
             "h.example:0",
             "h.example:65536",
             "h.example:0443",
             "tool:codex",
             "TOOL:codex",
+            "set:corp",
+            "SET:corp",
         ] {
             rows.push((input, "port must be a decimal number 1-65535"));
         }

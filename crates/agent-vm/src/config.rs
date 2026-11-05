@@ -108,7 +108,7 @@
 
 use crate::config_authority::{self, AuthorityTriggers};
 use crate::config_mounts::{self, ResolvedMountList, UserMounts};
-use crate::egress_reference::UserToolRequests;
+use crate::egress_reference::{self, UserToolRequests};
 use crate::user_network::{self, UserNetwork};
 
 use crate::network_requests::{NetworkRequests, RequestTier};
@@ -1181,8 +1181,8 @@ fn read_file_tier(source: TierSource<'_>) -> Result<(TierReport, TierContents)> 
     // Authority is decided by the *presence* of an authority-bearing field, from
     // the same verified read the bytes came from, before any of it is parsed.
     // Presence, not contents: `mounts = []`, an empty `[network]`, an empty
-    // `[mount_sets]` and a tool's `mounts = []` grant nothing yet are exactly the
-    // bytes an attacker would plant.
+    // `[mount_sets]`, an empty `[egress_sets]` and a tool's `mounts = []` grant
+    // nothing yet are exactly the bytes an attacker would plant.
     //
     // A tool list is measured from the raw configuration, *before* tool
     // validation: a definition with a malformed or missing `command` cannot be an
@@ -1206,6 +1206,7 @@ fn read_file_tier(source: TierSource<'_>) -> Result<(TierReport, TierContents)> 
             tool_field: first_tool_mounts.is_some(),
         }),
         mount_sets: raw.mount_sets.is_some(),
+        egress_sets: raw.egress_sets.is_some(),
     };
     let authorized: Option<config_authority::AuthorizedConfig<'_>>;
     let reference_trust: Option<crate::config_authority::ReferenceTrust>;
@@ -1258,6 +1259,26 @@ fn read_file_tier(source: TierSource<'_>) -> Result<(TierReport, TierContents)> 
         }
         None => None,
     };
+    let parsed_sets = match raw.egress_sets.as_ref() {
+        Some(value) => {
+            // As for `[network]` and `mounts`: presence *is* the trigger, so a
+            // present field always produced a token. Refusing rather than skipping
+            // keeps that invariant load-bearing — dropping definitions a file
+            // declares must never be the quiet outcome.
+            let Some(authorized) = authorized.as_ref() else {
+                return Err(anyhow!(
+                    "config: {}: [egress_sets]: authority was not measured",
+                    crate::one_line::quoted_path(path)
+                ));
+            };
+            Some(
+                egress_reference::parse_sets(authorized, value).map_err(|error| {
+                    anyhow!("config: {}: {error}", crate::one_line::quoted_path(path))
+                })?,
+            )
+        }
+        None => None,
+    };
     let mut mounts = if raw.mounts.is_some()
         || raw.mount_sets.is_some()
         || !tool_mount_values.is_empty()
@@ -1301,7 +1322,15 @@ fn read_file_tier(source: TierSource<'_>) -> Result<(TierReport, TierContents)> 
     // This tier's own validated tools, before `merge` and from the same read as
     // the verdict: the only namespace an egress reference may resolve against
     // (ADR-0059). The project tier gets `None`, so it can never be one.
-    let reference_tools = reference_trust.map(|trust| UserToolRequests::new(trust, &tools));
+    let reference_tools = match reference_trust {
+        Some(trust) => {
+            let namespace = UserToolRequests::new(trust, &tools, parsed_sets).map_err(|error| {
+                anyhow!("config: {}: {error}", crate::one_line::quoted_path(path))
+            })?;
+            Some(namespace)
+        }
+        None => None,
+    };
     let network = match parsed_network {
         Some(parsed) => {
             // A `[network]` table is authority-bearing, so the user arm always
@@ -1345,7 +1374,8 @@ fn refuse_project_authority(raw: &RawConfig, path: &Path) -> Result<()> {
 }
 
 /// The one refusal order both non-user tiers share: network, top-level `mounts`,
-/// `[mount_sets]`, then the first tool's `mounts` in declaration order.
+/// `[mount_sets]`, `[egress_sets]`, then the first tool's `mounts` in declaration
+/// order.
 ///
 /// A tool field is refused by **presence alone** — empty, a table, a number, on a
 /// shadowed or otherwise unreachable definition: asking for a mount is what
@@ -1359,6 +1389,9 @@ fn refuse_non_user_authority(raw: &RawConfig, path: &Path, tier: RefusingTier) -
     }
     if raw.mount_sets.is_some() {
         return Err(mount_sets_refusal(path, tier));
+    }
+    if raw.egress_sets.is_some() {
+        return Err(egress_sets_refusal(path, tier));
     }
     if let Some(declaration) = raw.tools.iter().position(|tool| tool.mounts.is_some()) {
         return Err(tool_mounts_refusal(path, tier, declaration));
@@ -1439,6 +1472,22 @@ fn mount_sets_refusal(file: &Path, tier: RefusingTier) -> anyhow::Error {
     anyhow!(
         "config: {}: {reason}; declare mount sets in the user config and select them with \
          --mount NAME",
+        crate::one_line::quoted_path(file)
+    )
+}
+
+/// `[egress_sets]` is user-only for the same reason `[mount_sets]` is: a project
+/// table of definitions could otherwise tempt a launch into resolving a project
+/// name against the user namespace. There is deliberately no such shadowing — the
+/// field is refused by its presence alone, empty table included.
+fn egress_sets_refusal(file: &Path, tier: RefusingTier) -> anyhow::Error {
+    let reason = match tier {
+        RefusingTier::Project => "egress_sets cannot be declared by the project config",
+        RefusingTier::BuiltIn => "egress_sets cannot be declared by the built-in config",
+    };
+    anyhow!(
+        "config: {}: {reason}; declare egress sets in the user config and select them with \
+         set:NAME",
         crate::one_line::quoted_path(file)
     )
 }
@@ -2027,17 +2076,27 @@ fn launch_closure(
 /// and subcommand words stay unreserved (`pi`, `shell`), because none of them can
 /// be a top-level key.
 ///
+/// `egress_sets` is the sixth (#511) and is reserved for the same reason: a
+/// `[network]` table written after `[egress_sets]` would become a set named
+/// `network` that grants nothing.
+///
 /// Held here rather than in `config_mounts` because this module owns the schema the
 /// names come from: the test beside `RawConfig` proves each one is still accepted at
 /// the top level, so a renamed field cannot leave a stale reservation behind.
-pub(crate) const TOP_LEVEL_FIELDS: [&str; 5] =
-    ["image", "mounts", "mount_sets", "network", "tools"];
+pub(crate) const TOP_LEVEL_FIELDS: [&str; 6] = [
+    "egress_sets",
+    "image",
+    "mounts",
+    "mount_sets",
+    "network",
+    "tools",
+];
 
 /// The canonical spelling of `name` when it is a top-level field name.
 ///
 /// `Option<&'static str>` rather than a `bool`: the diagnostic prints the spelling
-/// returned here, so a mount-set sentence can only ever contain one of these five
-/// words and never bytes read from the file.
+/// returned here, so a mount-set or egress-set sentence can only ever contain one
+/// of these six words and never bytes read from the file.
 pub(crate) fn top_level_field(name: &str) -> Option<&'static str> {
     TOP_LEVEL_FIELDS
         .iter()
@@ -2063,6 +2122,12 @@ struct RawConfig {
     // complains, because presence is what makes the file authority-bearing.
     #[serde(default)]
     mount_sets: Option<toml::Value>,
+    // User tier only (#511): the named **egress sets**. Untyped at this narrow
+    // seam for the same reason as `mount_sets` — an empty table, a number and a
+    // wrongly shaped definition must all reach the authority decision before the
+    // schema complains, because presence is what makes the file authority-bearing.
+    #[serde(default)]
+    egress_sets: Option<toml::Value>,
     /// The session's **boot image**, an OCI reference (D4). Optional: an
     /// image-only file declares no tools and keeps the shipped defaults.
     #[serde(default)]
@@ -2758,10 +2823,12 @@ fn deserialize_error(file: &Path, text: &str, error: &toml::de::Error) -> anyhow
          `mounts` and `network_requests` are arrays of strings; `env` is a table of string values; \
          the top-level `image` and each tool's `command` are strings. The top-level `mounts` and each \
          full user `[[tools]]`'s `mounts` are arrays of mount declarations or mount-set names; \
-         `[mount_sets]` is a table of named arrays of the same and is accepted only at the top of the \
-         user file. TOML assigns keys to the most recent `[table]` header, so write the top-level \
-         `mounts` before the first header and give each tool or set its entries in its own array. \
-         Nested tables are not mount sets.",
+         `[mount_sets]` is a table of named arrays of those mount declarations or mount-set names, \
+         and `[egress_sets]` is a table of named arrays of egress allowances or egress references \
+         (`tool:NAME`, `set:NAME`) — not mount syntax. Both tables are accepted only at the top of \
+         the user file. TOML assigns keys to the most recent `[table]` header, so \
+         write the top-level `mounts` before the first header and give each tool or set its entries \
+         in its own array. Nested tables are not mount sets or egress sets.",
         crate::one_line::quoted_path(file)
     )
 }
@@ -3167,6 +3234,26 @@ mod tests {
                 "review the [network] table, mounts list and [mount_sets] table",
                 "without [network], mounts or [mount_sets] still",
             ),
+            // #511: the fourth field names itself, alone and in the full
+            // combination, and never borrows `[network]`'s words.
+            (
+                "[egress_sets]\n",
+                "[egress_sets]",
+                "review the [egress_sets] table",
+                "without [egress_sets] still",
+            ),
+            (
+                "mounts = []\n[egress_sets]\n",
+                "mounts and [egress_sets]",
+                "review the mounts list and [egress_sets] table",
+                "without mounts or [egress_sets] still",
+            ),
+            (
+                "mounts = []\n[mount_sets]\n[network]\n[egress_sets]\n",
+                "[network], mounts, [mount_sets] and [egress_sets]",
+                "review the [network] table, mounts list, [mount_sets] table and [egress_sets] table",
+                "without [network], mounts, [mount_sets] or [egress_sets] still",
+            ),
         ] {
             let f = Fixture::new();
             f.symlinked_user(body);
@@ -3335,6 +3422,7 @@ mod tests {
     #[test]
     fn reserved_set_names_are_the_top_level_fields() {
         let fields = [
+            ("egress_sets", "{}"),
             ("image", "\"agent-vm-standard:local\""),
             ("mounts", "[]"),
             ("mount_sets", "{}"),
@@ -3348,6 +3436,333 @@ mod tests {
                 .load()
                 .unwrap_or_else(|error| panic!("{name} must be a top-level field: {error:#}"));
         }
+    }
+
+    /// A8 and R7: `[egress_sets]` is user-only, and presence alone is the reason —
+    /// an empty table, a number and a well-shaped definition are all refused the
+    /// same way, so a project or shipped file cannot even suggest a set name.
+    #[test]
+    fn project_egress_sets_are_refused_even_when_empty() {
+        for body in [
+            "[egress_sets]\n",
+            "[egress_sets]\ncorp = []\n",
+            "egress_sets = 7\n",
+        ] {
+            let f = Fixture::new();
+            f.project(body);
+            let error = f.load().unwrap_err().to_string();
+            assert_eq!(
+                error,
+                format!(
+                    "config: {:?}: egress_sets cannot be declared by the project config; declare \
+                     egress sets in the user config and select them with set:NAME",
+                    f.project
+                ),
+                "{body}"
+            );
+        }
+        // The refusal order is still `[network]`, `mounts`, `[mount_sets]`,
+        // `[egress_sets]`, the first tool's `mounts`.
+        for (body, expected) in [
+            (
+                "[egress_sets]\n[network]\nallow_host = true\n",
+                "network access cannot be granted by the project config",
+            ),
+            (
+                "mounts = []\n[egress_sets]\n",
+                "mounts cannot be declared by the project config",
+            ),
+            (
+                "[mount_sets]\n[egress_sets]\n",
+                "mount_sets cannot be declared by the project config",
+            ),
+            // `[egress_sets]` precedes the first tool's `mounts`, so a file that
+            // declares both is refused for the table, not for the tool field.
+            (
+                "[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = []\n[egress_sets]\n",
+                "egress_sets cannot be declared by the project config",
+            ),
+            // And a tool's own `mounts` still wins over nothing else, unchanged.
+            (
+                "[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = []\n",
+                "tools[0].mounts: mounts cannot be declared by the project config",
+            ),
+        ] {
+            let f = Fixture::new();
+            f.project(body);
+            let error = f.load().unwrap_err().to_string();
+            assert!(error.contains(expected), "{body}: {error}");
+        }
+    }
+
+    #[test]
+    fn builtin_egress_sets_are_refused() {
+        for body in [
+            "[egress_sets]\n",
+            "[egress_sets]\na = []\n",
+            "egress_sets = 7\n",
+        ] {
+            let error = tools_from_builtin_text(body).unwrap_err().to_string();
+            assert_eq!(
+                error,
+                "config: \"default-tools.toml\": egress_sets cannot be declared by the built-in \
+                 config; declare egress sets in the user config and select them with set:NAME",
+                "{body}"
+            );
+        }
+    }
+
+    /// A12 and Q6: an empty `[egress_sets]` through a symlink is refused at load
+    /// with the `[egress_sets]` subject, with nothing referencing it.
+    #[test]
+    fn egress_sets_presence_requires_a_verified_file() {
+        for body in [
+            "[egress_sets]\n",
+            "[egress_sets]\ncorp = [\"10.0.0.5\"]\n",
+            "egress_sets = 7\n",
+        ] {
+            let f = Fixture::new();
+            f.symlinked_user(body);
+            let error = f.load().unwrap_err().to_string();
+            assert!(
+                error.contains("[egress_sets] requires config.toml to be a regular file"),
+                "{body}: {error}"
+            );
+            assert!(error.contains("review the [egress_sets] table"), "{error}");
+            assert!(
+                error.contains("(a symlinked config without [egress_sets] still works)"),
+                "{error}"
+            );
+            assert!(!error.contains("[network]"), "{error}");
+        }
+        // The same file without the table keeps loading, so the refusal above is
+        // about this field and not about symlinks in general.
+        let f = Fixture::new();
+        f.symlinked_user("[[tools]]\nname = \"custom\"\ncommand = \"custom\"\n");
+        assert!(f.load().is_ok());
+    }
+
+    /// A21 and R20: a `tool:` entry inside a user set resolves only against that
+    /// same file's user tools, never the project tier's or the shipped catalog's.
+    #[test]
+    fn egress_set_tool_entries_resolve_only_user_tools() {
+        let f = Fixture::new();
+        f.user(
+            "[[tools]]\nname = \"codex\"\ncommand = \"codex\"\n\
+             network_requests = [\"api.openai.com\"]\n\
+             [egress_sets]\ncorp = [\"tool:codex\", \"10.0.0.5\"]\n\
+             [network]\nallow_egress = [\"set:corp\"]\n",
+        );
+        // The project declares a same-named tool reaching somewhere else: a
+        // resolution that consulted the merged catalog would grant this too.
+        f.project(
+            "[[tools]]\nname = \"codex\"\ncommand = \"codex\"\n\
+             network_requests = [\"project.example\"]\n",
+        );
+        let report = f.load().unwrap();
+        let allowances = report.user_network().unwrap().allowances();
+        assert_eq!(
+            allowances
+                .allowances()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["tcp://api.openai.com:443", "10.0.0.5/32"]
+        );
+        assert_eq!(
+            allowances
+                .references()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["set:corp"]
+        );
+        // A set naming a tool only the project declares is a load error, not a
+        // project grant.
+        let f = Fixture::new();
+        f.user("[egress_sets]\ncorp = [\"tool:project-only\"]\n");
+        f.project(
+            "[[tools]]\nname = \"project-only\"\ncommand = \"c\"\n\
+             network_requests = [\"project.example\"]\n",
+        );
+        let error = f.load().unwrap_err().to_string();
+        assert!(error.contains("egress_sets[0][0]:"), "{error}");
+        assert!(
+            error.contains("must name a tool declared in the user config's own [[tools]]"),
+            "{error}"
+        );
+        assert!(!error.contains("project.example"), "{error}");
+    }
+
+    /// A26(a) and R19: every load stage reports before every later one, so each
+    /// pair of the five stages is exercised with a fixture where both defects are
+    /// present and only the earlier one may surface.
+    ///
+    /// Each expectation is the **complete** error sentence, written out here
+    /// rather than assembled from the production constants, so a rewording is a
+    /// failure here. `{file}` is the fixture's own scratch path, the one byte
+    /// sequence that cannot be a literal.
+    ///
+    /// The stages are 1 `[network]` parse, 2 `[egress_sets]` parse, 3 mounts,
+    /// image and tool validation, 4 set compile, 5 `[network]` resolution. The
+    /// pairs are (1,2) (1,3) (1,4) (1,5) (2,3) (2,4) (2,5) (3,4) (3,5) (4,5).
+    ///
+    /// (2,4) is listed for completeness rather than because a plausible edit
+    /// reverses it: `parse` returns the typed value `compile` consumes, so no
+    /// load path can report a compile error before a parse error without a
+    /// per-definition streaming redesign — which is exactly what this row would
+    /// catch. The reorderings that *are* available (mounts before the tables,
+    /// sets after tool validation) are killed by the (1,3), (2,3) and (4,5) rows,
+    /// measured as mutants.
+    #[test]
+    fn egress_set_errors_surface_in_load_order() {
+        const MALFORMED: &str = "not an IP address, CIDR or hostname (hostnames: one or more \
+             labels of ASCII letters, digits and '-', not ending in a numeric label; write \
+             non-ASCII names as A-labels; no wildcards)";
+        const UNKNOWN_TOOL: &str = "an egress reference must name a tool declared in the user \
+             config's own [[tools]]; built-in and project tools are never used (`agent-vm tools \
+             print` prints the shipped tools to copy there)";
+        const NOT_ARRAY: &str = "must be an array of strings";
+        const BAD_TOOL_NAME: &str = "name must be a single command-name token, not a path";
+        for (body, expected) in [
+            // (1,2): `[network]` parse before `[egress_sets]` parse.
+            (
+                "[network]\nallow_egress = [\"not an allowance\"]\n[egress_sets]\nv = 7\n",
+                format!("config: {{file}}: network.allow_egress[0]: {MALFORMED}"),
+            ),
+            // (1,3): a genuinely top-level `mounts` value. It is a mount error on
+            // its own (`config: <file>: mounts: must be an array of strings`), so
+            // this pair really does reach stage 3 — which is why it may not sit
+            // after `[network]`, where TOML would scope it into that table.
+            (
+                "mounts = 7\n[network]\nallow_egress = [\"not an allowance\"]\n",
+                format!("config: {{file}}: network.allow_egress[0]: {MALFORMED}"),
+            ),
+            // (1,4).
+            (
+                "[network]\nallow_egress = [\"not an allowance\"]\n\
+                 [egress_sets]\nv = [\"tool:nope\"]\n",
+                format!("config: {{file}}: network.allow_egress[0]: {MALFORMED}"),
+            ),
+            // (1,5).
+            (
+                "[network]\nallow_egress = [\"not an allowance\", \"tool:nope\"]\n",
+                format!("config: {{file}}: network.allow_egress[0]: {MALFORMED}"),
+            ),
+            // (2,3) mounts: a top-level `mounts = 7` is a mount error; the bad set
+            // value still wins.
+            (
+                "mounts = 7\n[egress_sets]\nv = 7\n",
+                format!("config: {{file}}: egress_sets[0]: {NOT_ARRAY}"),
+            ),
+            // (2,3) tools.
+            (
+                "[egress_sets]\nv = [\"a b\"]\n\
+                 [[tools]]\nname = \"a/b\"\ncommand = \"c\"\n",
+                format!("config: {{file}}: egress_sets[0][0]: {MALFORMED}"),
+            ),
+            // (2,4): set parse before set compile. `w` is a schema error, `v` is a
+            // compile error, so a compile-first order would report `v`.
+            (
+                "[egress_sets]\nv = [\"tool:nope\"]\nw = 7\n",
+                format!("config: {{file}}: egress_sets[1]: {NOT_ARRAY}"),
+            ),
+            // (2,5).
+            (
+                "[egress_sets]\nv = 7\n[network]\nallow_egress = [\"tool:nope\"]\n",
+                format!("config: {{file}}: egress_sets[0]: {NOT_ARRAY}"),
+            ),
+            // (3,4) tools: tool validation precedes set compile.
+            (
+                "[egress_sets]\nv = [\"tool:nope\"]\n\
+                 [[tools]]\nname = \"a/b\"\ncommand = \"c\"\n",
+                format!(
+                    "config: user config {{file}} declaration [0] tool \"a/b\": {BAD_TOOL_NAME}"
+                ),
+            ),
+            // (3,5).
+            (
+                "[[tools]]\nname = \"a/b\"\ncommand = \"c\"\n\
+                 [network]\nallow_egress = [\"tool:nope\"]\n",
+                format!(
+                    "config: user config {{file}} declaration [0] tool \"a/b\": {BAD_TOOL_NAME}"
+                ),
+            ),
+            // (4,5): set compile before `[network]` resolution.
+            (
+                "[egress_sets]\nv = [\"tool:nope\"]\n\
+                 [network]\nallow_egress = [\"tool:also-nope\"]\n",
+                format!("config: {{file}}: egress_sets[0][0]: {UNKNOWN_TOOL}"),
+            ),
+        ] {
+            let f = Fixture::new();
+            f.user(body);
+            let error = f.load().unwrap_err().to_string();
+            let expected = expected.replace("{file}", &format!("{:?}", f.user));
+            assert_eq!(error, expected, "{body:?}");
+        }
+
+        // Inside stage 2 the order is not "definition by definition": every name
+        // is checked before any value, so a bad key in the *later* definition is
+        // reported while the *earlier* one still holds a schema error. R19 says
+        // "names, schema, entry syntax and unknown sets", and this is what that
+        // reading means (plan Q3: two passes, names first).
+        let f = Fixture::new();
+        f.user("[egress_sets]\na = 7\n\"z bad\" = []\n");
+        let error = f.load().unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "config: {file}: egress_sets: definition 1 has an invalid name; an egress-set name \
+             is one or more ASCII characters: [A-Za-z0-9_] first, then [A-Za-z0-9_.-]"
+                .replace("{file}", &format!("{:?}", f.user)),
+            "names are checked for every definition before any definition's value"
+        );
+    }
+
+    /// TOML assigns keys to the most recent table header, so *where* a
+    /// `allow_egress` key is written decides which construct it lands in — the
+    /// trap USAGE's "TOML scoping trap" bullet documents. One row per shape.
+    ///
+    /// The silent row is the one worth pinning: `[network]`, then `[egress_sets]`,
+    /// then a bare `allow_egress = [...]` is a valid set *named* `allow_egress`.
+    /// Nothing is refused and nothing is granted, so a regression here would be
+    /// invisible without this test — and a reader told the trap loads when it in
+    /// fact refused would be sent to the wrong fix.
+    #[test]
+    fn egress_sets_toml_scoping_is_characterized() {
+        // The scoped assignment: valid, unselected, granting nothing.
+        let f = Fixture::new();
+        f.user("[network]\n[egress_sets]\nallow_egress = [\"10.0.0.5\"]\n");
+        let report = f
+            .load()
+            .expect("the scoping trap is a valid file, not an error");
+        let network = report.user_network().expect("the file declares [network]");
+        assert_eq!(network.allowances().allowances().count(), 0);
+        assert_eq!(network.allowances().references().count(), 0);
+
+        // `set:allow_egress` is what selects it, so the trap is silent, not silent
+        // *and* unfixable.
+        let f = Fixture::new();
+        f.user(
+            "[egress_sets]\nallow_egress = [\"10.0.0.5\"]\n\
+             [network]\nallow_egress = [\"set:allow_egress\"]\n",
+        );
+        let report = f.load().unwrap();
+        let network = report.user_network().unwrap();
+        assert_eq!(
+            network
+                .allowances()
+                .allowances()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["10.0.0.5/32"]
+        );
+        assert_eq!(
+            network
+                .allowances()
+                .references()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["set:allow_egress"]
+        );
     }
 
     /// A project or built-in `[mount_sets]` is refused by presence alone — empty
@@ -8602,14 +9017,18 @@ mod tests {
             ("built-in", &builtin),
             ("another file", &wrong_file),
         ] {
-            let namespace = UserToolRequests::new(ReferenceTrust::verified_for_test(file), tools);
+            let namespace =
+                UserToolRequests::new(ReferenceTrust::verified_for_test(file), tools, None)
+                    .unwrap();
             let failure = resolve(vec![entry.clone()], Some(&namespace)).unwrap_err();
             assert_eq!(failure.index, 0, "{label} tools");
             assert_eq!(failure.error, EntryError::UnknownTool, "{label} tools");
         }
         // The accepted origin, resolved the same way, and expanded to its own
         // requests: `is_ok` would not show the namespace kept the right tool.
-        let namespace = UserToolRequests::new(ReferenceTrust::verified_for_test(file), &right_file);
+        let namespace =
+            UserToolRequests::new(ReferenceTrust::verified_for_test(file), &right_file, None)
+                .unwrap();
         let resolved = resolve(vec![entry], Some(&namespace)).unwrap();
         assert_eq!(
             resolved

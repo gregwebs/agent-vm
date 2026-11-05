@@ -1,12 +1,21 @@
 //! ADR-0059: the `egress_reference` tests, and the A37 source guard over the
-//! production file.
+//! production files.
 //!
-//! Tests live in their own module by construction, not by a rule the code has to
-//! detect: `egress_reference.rs` holds only production code, so the guard's scan
-//! of `include_str!("../egress_reference.rs")` covers production in full and
-//! needs no boundary marker to look for.
+//! Tests live in their own modules by construction, not by a rule the code has to
+//! detect: `egress_reference.rs` and `egress_reference/sets.rs` hold only
+//! production code, and their tests live in `egress_reference/tests.rs` and
+//! `egress_reference/sets/tests.rs`, so the guard's scans of
+//! `include_str!("../egress_reference.rs")` and `include_str!("sets.rs")` cover
+//! production in full and need no boundary marker to look for.
+//!
+//! What those scans can and cannot say is bounded (ADR-0018): they match tokens
+//! in the text, so they catch accidental drift and the named regressions, and
+//! they do **not** establish that no allowance can be minted. A token split
+//! across lines, an alias or re-export, a macro, a helper in the parent module,
+//! or a `//`-leading line that closes an earlier block comment each mint while
+//! the scan is green. Provenance and data flow are structural review (A46).
 
-use self::test_support::{resolve_ok, user_tools};
+use self::test_support::{resolve_ok, set_ref, tool_ref, user_tools};
 use super::*;
 use crate::config::RESERVED_TOOL_NAMES;
 use proptest::prelude::*;
@@ -17,19 +26,52 @@ pub(crate) mod test_support {
 
     /// A namespace built straight from `(name, requests)` pairs, for tests in
     /// other modules that need a resolvable tool without a whole config file.
+    ///
+    /// No sets: a `set:` reference against one of these namespaces is `UnknownSet`
+    /// by construction, which is what the tool-side tests want.
     pub(crate) fn user_tools(
         file: &std::path::Path,
         tools: &[(&str, &[&str])],
+    ) -> UserToolRequests {
+        user_namespace(file, tools, None)
+    }
+
+    /// The same, with `[egress_sets]` declarations, through the real parse and the
+    /// real compile: a fixture that hand-built the closures could disagree with
+    /// what a file does.
+    pub(crate) fn user_namespace(
+        file: &std::path::Path,
+        tools: &[(&str, &[&str])],
+        egress_sets: Option<&str>,
     ) -> UserToolRequests {
         let mut requests = BTreeMap::new();
         for (name, raw) in tools {
             let raw: Vec<String> = raw.iter().map(|request| (*request).to_owned()).collect();
             requests.insert((*name).to_owned(), NetworkRequests::parse(&raw).unwrap());
         }
+        let table: toml::Table = egress_sets.unwrap_or_default().parse().expect("test TOML");
+        let parsed = sets::parse(&toml::Value::Table(table)).expect("test [egress_sets] is valid");
         UserToolRequests {
             trust: ReferenceTrust::verified_for_test(file),
+            sets: Box::new(
+                sets::compile(parsed, |name| tool_expansion(&requests, name))
+                    .expect("test egress sets compile"),
+            ),
             requests,
         }
+    }
+
+    /// The tool reference one claimed `tool:NAME` becomes, spelled here rather
+    /// than constructed inline so the private payload is reached in one place.
+    pub(crate) fn tool_ref(name: &str) -> EgressReference {
+        EgressReference(Target::Tool(name.to_owned()))
+    }
+
+    /// The set reference one claimed `set:NAME` becomes.
+    pub(super) fn set_ref(name: &str) -> EgressReference {
+        EgressReference(Target::Set(
+            super::super::sets::EgressSetName::parse(name).expect("a valid egress-set name"),
+        ))
     }
 
     pub(crate) fn resolve_ok(
@@ -132,12 +174,7 @@ fn reference_parse_table() {
         let AllowanceEntry::Reference(reference) = &entry else {
             panic!("{text} was not claimed")
         };
-        assert_eq!(
-            reference,
-            &EgressReference {
-                tool: expected.to_owned()
-            }
-        );
+        assert_eq!(reference, &tool_ref(expected));
         assert_eq!(reference.to_string(), format!("tool:{expected}"));
     }
     // Not claimed: the grammar decides, exactly as before.
@@ -159,9 +196,7 @@ fn reference_parse_table() {
     );
     assert_eq!(
         AllowanceEntry::parse("tool:443").unwrap(),
-        AllowanceEntry::Reference(EgressReference {
-            tool: "443".to_owned()
-        })
+        AllowanceEntry::Reference(tool_ref("443"))
     );
     // A4: the scheme refusal keeps its own text.
     assert_eq!(
@@ -245,6 +280,388 @@ fn reference_names_match_tool_names() {
     }
 }
 
+/// An independently written oracle for the `set:` kernel, restated without the
+/// spec function for the same reason as [`oracle`].
+fn set_oracle(bytes: &[u8]) -> bool {
+    bytes.len() >= 4 && bytes[..4].eq_ignore_ascii_case(b"set:") && !bytes[4..].starts_with(b"//")
+}
+
+/// A1: the `set:` claim agrees with the byte oracle everywhere the decision can
+/// depend on a byte.
+#[test]
+fn set_claim_matches_byte_oracle() {
+    const ALPHABET: &[u8] = b"sSeEtT:/xX.-\x00\x1b\xc3";
+    for length in 0..=7usize {
+        for combo in 0..(ALPHABET.len() as u64).pow(length as u32) {
+            let mut bytes = Vec::with_capacity(length);
+            let mut rest = combo;
+            for _ in 0..length {
+                bytes.push(ALPHABET[(rest % ALPHABET.len() as u64) as usize]);
+                rest /= ALPHABET.len() as u64;
+            }
+            assert_eq!(
+                set_reference_claim(&bytes),
+                set_oracle(&bytes),
+                "claim disagreed for {bytes:?}"
+            );
+        }
+    }
+    for (bytes, claimed) in [
+        (&b"set:"[..], true),
+        (&b"SET:"[..], true),
+        (&b"SeT:"[..], true),
+        (&b"set:443"[..], true),
+        (&b"set://x.example"[..], false),
+        (&b"set:/"[..], true),
+        (&b"set:x"[..], true),
+        (&b"set"[..], false),
+        (&b"setx"[..], false),
+        (&b""[..], false),
+        (&b"sett:443"[..], false),
+        (&b"tcp://set:443"[..], false),
+        // The neighbour kernel's text: a claim here would route `tool:` twice.
+        (&b"tool:443"[..], false),
+        (&b"TOOL:443"[..], false),
+    ] {
+        assert_eq!(set_reference_claim(bytes), claimed, "{bytes:?}");
+    }
+}
+
+proptest! {
+    #[test]
+    fn set_claim_matches_byte_oracle_on_arbitrary_bytes(
+        bytes in proptest::collection::vec(
+            prop_oneof![
+                Just(b's'), Just(b'S'), Just(b'e'), Just(b'E'), Just(b't'), Just(b'T'),
+                Just(b':'), Just(b'/'), any::<u8>(),
+            ],
+            0..=12,
+        )
+    ) {
+        prop_assert_eq!(set_reference_claim(&bytes), set_oracle(&bytes));
+    }
+}
+
+/// A7's deterministic corpus: every prefix whose two readings a reader could
+/// confuse, each of which one kernel claims at most.
+const CROSS_PREFIX_CORPUS: [&str; 13] = [
+    "set:443",
+    "SET:8443",
+    "tool:443",
+    "set:tool:x",
+    "tool:set:x",
+    "tcp://set:443",
+    "tcp://tool:443",
+    "set://tool:1",
+    "tool://set:1",
+    "sett:443",
+    "toolset:1",
+    "set:",
+    "tool:",
+];
+
+/// A3: no byte string is claimed by both kernels, so the adapter's order cannot
+/// change a decision.
+#[test]
+fn tool_and_set_claims_are_disjoint() {
+    // Exhaustive over the alphabet both prefixes are spelled from, to the length
+    // at which the third byte that separates them has been read.
+    const ALPHABET: &[u8] = b"sSeEtToOlL:";
+    for length in 0..=5usize {
+        for combo in 0..(ALPHABET.len() as u64).pow(length as u32) {
+            let mut bytes = Vec::with_capacity(length);
+            let mut rest = combo;
+            for _ in 0..length {
+                bytes.push(ALPHABET[(rest % ALPHABET.len() as u64) as usize]);
+                rest /= ALPHABET.len() as u64;
+            }
+            assert!(
+                !(reference_claim(&bytes) && set_reference_claim(&bytes)),
+                "{bytes:?} was claimed twice"
+            );
+        }
+    }
+    for text in CROSS_PREFIX_CORPUS {
+        assert!(
+            !(reference_claim(text.as_bytes()) && set_reference_claim(text.as_bytes())),
+            "{text:?} was claimed twice"
+        );
+    }
+}
+
+proptest! {
+    #[test]
+    fn tool_and_set_claims_are_disjoint_on_arbitrary_bytes(
+        bytes in proptest::collection::vec(
+            prop_oneof![
+                Just(b't'), Just(b'T'), Just(b's'), Just(b'S'), Just(b'e'), Just(b'E'),
+                Just(b'o'), Just(b'O'), Just(b'l'), Just(b'L'), Just(b':'), Just(b'/'),
+                any::<u8>(),
+            ],
+            0..=12,
+        )
+    ) {
+        prop_assert!(!(reference_claim(&bytes) && set_reference_claim(&bytes)));
+    }
+}
+
+/// A4, R3 and R4: which `set:` text is a reference, which name it holds, and
+/// what a `set:` scheme still is.
+#[test]
+fn set_reference_parse_table() {
+    for (text, expected) in [
+        ("set:corp", "corp"),
+        ("SET:corp", "corp"),
+        ("Set:8443", "8443"),
+        ("set:0", "0"),
+        ("set:0443", "0443"),
+        ("set:53", "53"),
+        ("set:65536", "65536"),
+        // The prefix folds case; the name does not.
+        ("set:Corp", "Corp"),
+    ] {
+        let entry = AllowanceEntry::parse(text).unwrap();
+        let AllowanceEntry::Reference(reference) = &entry else {
+            panic!("{text} was not claimed")
+        };
+        assert_eq!(reference, &set_ref(expected));
+        assert_eq!(reference.to_string(), format!("set:{expected}"));
+    }
+    // `Corp` and `corp` are distinct names, not one folded name.
+    assert_ne!(set_ref("Corp"), set_ref("corp"));
+    // Not claimed: the grammar decides, exactly as before. `tcp://set:443` is
+    // the rewrite the upgrade note gives, so it must keep meaning what it did.
+    for text in [
+        "tcp://set:443",
+        "set.:443",
+        "set",
+        "setx",
+        "sets",
+        "sett:443",
+    ] {
+        match AllowanceEntry::parse(text).unwrap() {
+            AllowanceEntry::Literal(allowance) => assert_eq!(
+                allowance.to_string(),
+                Allowance::parse(text).unwrap().to_string()
+            ),
+            AllowanceEntry::Reference(reference) => {
+                panic!("{text} was claimed as {reference}")
+            }
+        }
+    }
+    assert_eq!(
+        Allowance::parse("set:8443").unwrap().to_string(),
+        "tcp://set:8443",
+        "the old meaning of `set:8443` must stay the literal meaning"
+    );
+    // A4/R4: `set://…` keeps `Allowance::parse`'s scheme refusal byte for byte.
+    assert_eq!(
+        AllowanceEntry::parse("set://x.example"),
+        Err(EntryError::Allowance(AllowanceError::UnsupportedScheme))
+    );
+    assert_eq!(
+        AllowanceEntry::parse("set://x.example")
+            .unwrap_err()
+            .to_string(),
+        Allowance::parse("set://x.example").unwrap_err().to_string()
+    );
+}
+
+/// A5, A28 and A36's unit half: every name no set can have is one fixed
+/// malformed-reference text, which echoes neither the name nor a sentinel.
+#[test]
+fn malformed_set_names_are_one_fixed_text() {
+    const SENTINEL: &str = "SENTINEL7";
+    const MALFORMED_INDEPENDENT: &str = "an egress reference must be set:NAME with a valid egress-set name ([A-Za-z0-9_] first, then [A-Za-z0-9_.-])";
+    assert_eq!(
+        MALFORMED_SET, MALFORMED_INDEPENDENT,
+        "the sentence A5 pins is the sentence the crate ships"
+    );
+    for name in [
+        "",
+        "-x",
+        ".x",
+        "a/b",
+        "a b",
+        "a:b",
+        "café",
+        "\x1bSENTINEL7",
+        "..",
+        "*",
+        "a\tb",
+    ] {
+        let error = AllowanceEntry::parse(&format!("set:{name}")).unwrap_err();
+        assert_eq!(
+            error,
+            EntryError::MalformedSetReference,
+            "for name {name:?}"
+        );
+        assert_eq!(error.to_string(), MALFORMED_INDEPENDENT);
+        assert!(!error.to_string().contains(SENTINEL));
+    }
+}
+
+/// A6: the reference name rule and the mount-set name rule are one rule.
+///
+/// Differential on purpose: the two namespaces have separate types, and the only
+/// way to keep them from drifting is to ask the proved predicate both ways.
+#[test]
+fn set_reference_names_match_mount_set_names() {
+    let mut corpus: Vec<String> = [
+        "corp", "Corp", "CORP", "8443", "0", "0443", "65536", "a.b", "a-b", "_x", "x_", ".", "..",
+        "-x", ".x", "a/b", "a b", "a:b", "café", "", "\t", "0x10", "a",
+    ]
+    .iter()
+    .map(|name| (*name).to_owned())
+    .collect();
+    corpus.extend(
+        crate::config::TOP_LEVEL_FIELDS
+            .iter()
+            .map(|f| (*f).to_owned()),
+    );
+    for name in corpus {
+        let reference_accepts = matches!(
+            AllowanceEntry::parse(&format!("set:{name}")),
+            Ok(AllowanceEntry::Reference(_))
+        );
+        assert_eq!(
+            crate::config_mounts::mount_set_name_bytes(name.as_bytes()),
+            reference_accepts,
+            "the two name rules disagreed for {name:?}"
+        );
+    }
+}
+
+/// A7: the same claimed-set property for `set:` that the `tool:` helper states —
+/// claimed text is either the fixed malformed error or the reference, and the
+/// grammar's own reading is an error or the hostname `set` on an explicit port
+/// (the R5 break set), never an allowance that survives as written.
+fn claimed_text_is_only_an_error_or_the_set_hostname(text: &str) {
+    let claimed = set_reference_claim(text.as_bytes());
+    let literal = Allowance::parse(text);
+    if !claimed {
+        // The *other* kernel's text is not this helper's to interpret: assert
+        // only that it was delegated, and let the tool helper judge its own.
+        if reference_claim(text.as_bytes()) {
+            assert!(
+                !matches!(AllowanceEntry::parse(text), Ok(AllowanceEntry::Literal(_))),
+                "tool-claimed text reached the allowance grammar as a literal: {text:?}"
+            );
+            return;
+        }
+        match (AllowanceEntry::parse(text), literal) {
+            (Ok(AllowanceEntry::Literal(entry)), Ok(allowance)) => assert_eq!(entry, allowance),
+            (Err(EntryError::Allowance(entry)), Err(error)) => assert_eq!(entry, error),
+            (other, _) => {
+                panic!("unclaimed text left the grammar: {text:?} -> {other:?}")
+            }
+        }
+        return;
+    }
+    let name = text
+        .get(SET_PREFIX_LEN..)
+        .expect("the claim fixes four ASCII bytes, so this is a char boundary");
+    let name_is_valid = crate::config_mounts::mount_set_name_bytes(name.as_bytes());
+    let entry = AllowanceEntry::parse(text);
+    match &entry {
+        Ok(AllowanceEntry::Reference(reference)) => {
+            assert!(
+                name_is_valid,
+                "claimed {text:?} became a reference, but `mount_set_name_bytes` rejects the name {name:?}"
+            );
+            assert!(
+                matches!(&reference.0, Target::Set(set) if set.as_str() == name),
+                "a claimed reference must hold exactly the bytes after the prefix"
+            );
+        }
+        Err(EntryError::MalformedSetReference) => assert!(
+            !name_is_valid,
+            "claimed {text:?} was refused as malformed, but the name {name:?} is valid"
+        ),
+        other => panic!("claimed text did not reach the reference rule: {text:?} -> {other:?}"),
+    }
+    match literal {
+        Err(_) => {}
+        Ok(Allowance::Hostname(hostname)) => {
+            let rendered = hostname.to_string();
+            let port = rendered
+                .strip_prefix("tcp://set:")
+                .unwrap_or_else(|| panic!("claimed {text:?} parsed as {rendered}"));
+            let port: u16 = port.parse().unwrap();
+            assert!(port >= 1 && port != 53 && port != 853, "{text:?} -> {port}");
+        }
+        Ok(Allowance::Address(_)) => panic!("claimed an address: {text:?}"),
+    }
+}
+
+#[test]
+fn set_claims_only_errors_or_the_set_hostname() {
+    // (a) a restricted alphabet with every prefix the grammar cares about.
+    const ALPHABET: &[u8] = b"set:/.0123456789";
+    for prefix in ["", "set:", "SET:", "set://", "tcp://"] {
+        for length in 0..=4usize {
+            for combo in 0..(ALPHABET.len() as u64).pow(length as u32) {
+                let mut text = prefix.to_owned();
+                let mut rest = combo;
+                for _ in 0..length {
+                    text.push(ALPHABET[(rest % ALPHABET.len() as u64) as usize] as char);
+                    rest /= ALPHABET.len() as u64;
+                }
+                claimed_text_is_only_an_error_or_the_set_hostname(&text);
+            }
+        }
+    }
+    // (b) targeted combinations, and A7's cross-prefix corpus.
+    for prefix in [
+        "set:", "SET:", "Set:", "sEt:", "seT:", "sET:", "set:/", "set://", "SET://", "tcp://",
+        "xset:", "s e t:",
+    ] {
+        for suffix in [
+            "",
+            "a",
+            "ab",
+            "abc",
+            "-x",
+            "a b",
+            "a\tb",
+            "\u{1b}",
+            "\u{0}",
+            "café",
+            "\u{1b}SENTINEL7",
+            "/",
+            "//x",
+            ".",
+            "..",
+            "*",
+            "corp",
+            "443",
+            "8443",
+            "0",
+            "65536",
+            "a/../b",
+            "a:b",
+            "tool:x",
+        ] {
+            claimed_text_is_only_an_error_or_the_set_hostname(&format!("{prefix}{suffix}"));
+        }
+    }
+    for text in CROSS_PREFIX_CORPUS {
+        claimed_text_is_only_an_error_or_the_set_hostname(text);
+    }
+}
+
+proptest! {
+    #[test]
+    fn set_claims_only_errors_or_the_set_hostname_on_any_string(text in any::<String>()) {
+        claimed_text_is_only_an_error_or_the_set_hostname(&text);
+    }
+
+    #[test]
+    fn set_claims_only_errors_or_the_set_hostname_on_long_strings(text in ".{0,300}") {
+        claimed_text_is_only_an_error_or_the_set_hostname(&text);
+    }
+}
+
 /// A2: the claimed set is exactly "allowance errors" plus "the hostname
 /// `tool` on an explicit port", i.e. the R27 break set — and claimed text is
 /// *routed*: the branch is the one `config::tool_name_rejection` implies for
@@ -257,6 +674,15 @@ fn claimed_text_is_only_an_error_or_the_tool_hostname(text: &str) {
     let claimed = reference_claim(text.as_bytes());
     let literal = Allowance::parse(text);
     if !claimed {
+        // The *other* kernel's text is not this helper's to interpret: assert
+        // only that it was delegated, and let the set helper judge its own.
+        if set_reference_claim(text.as_bytes()) {
+            assert!(
+                !matches!(AllowanceEntry::parse(text), Ok(AllowanceEntry::Literal(_))),
+                "set-claimed text reached the allowance grammar as a literal: {text:?}"
+            );
+            return;
+        }
         // Unclaimed text is handed to the grammar unchanged: same `Ok`, or
         // the same error variant.
         match (AllowanceEntry::parse(text), literal) {
@@ -289,9 +715,8 @@ fn claimed_text_is_only_an_error_or_the_tool_hostname(text: &str) {
                 name_is_valid,
                 "claimed {text:?} became a reference, but `tool_name_rejection` rejects the name {name:?}"
             );
-            assert_eq!(
-                text.get(PREFIX_LEN..),
-                Some(reference.tool()),
+            assert!(
+                matches!(&reference.0, Target::Tool(name) if Some(name.as_str()) == text.get(PREFIX_LEN..)),
                 "a claimed reference must hold exactly the bytes after the prefix"
             );
         }
@@ -389,6 +814,11 @@ fn reference_claims_only_errors_or_the_tool_hostname() {
     ] {
         claimed_text_is_only_an_error_or_the_tool_hostname(text);
     }
+    // A7: the same cross-prefix corpus both helpers run, so neither can quietly
+    // treat the other's claims as its own.
+    for text in CROSS_PREFIX_CORPUS {
+        claimed_text_is_only_an_error_or_the_tool_hostname(text);
+    }
 }
 
 proptest! {
@@ -450,9 +880,7 @@ fn resolve_dedupes_and_attributes() {
         rendered,
         vec!["tcp://api.openai.com:443", "tcp://auth.openai.com:443"]
     );
-    let codex = EgressReference {
-        tool: "codex".to_owned(),
-    };
+    let codex = tool_ref("codex");
     assert_eq!(resolved.references().collect::<Vec<_>>(), vec![&codex]);
     let name: DomainName = "api.openai.com".parse().unwrap();
     let origin = resolved.hostname_origin(&name);
@@ -469,6 +897,169 @@ fn resolve_dedupes_and_attributes() {
         resolved
             .entry_origin(&Allowance::parse("10.0.0.5").unwrap())
             .direct
+    );
+}
+
+/// A32 (the tool half) and A45: a repeated reference is applied once, and the
+/// count that proves it is not part of the value.
+///
+/// The counter exists because a per-repeat re-application would change nothing a
+/// caller can see: `insert` folds repeated values and repeated provenance, so the
+/// only difference is work.
+#[test]
+fn repeated_tool_references_apply_once() {
+    let tools = user_tools(
+        Path::new(USER_FILE),
+        &[("fetcher", &["b.example", "a.example:8443"])],
+    );
+    let once = resolve_ok(&["tool:fetcher", "10.0.0.9"], Some(&tools));
+    let repeated = resolve_ok(
+        &["tool:fetcher", "tool:fetcher", "10.0.0.9", "tool:fetcher"],
+        Some(&tools),
+    );
+    assert_eq!(once, repeated, "equality ignores the insertion count");
+    // Two expanded allowances plus one literal. Re-applying the cached expansion
+    // per repeat would give 2 + 2 + 1 + 2.
+    assert_eq!(once.insertions, 3);
+    assert_eq!(repeated.insertions, 3);
+    assert_eq!(repeated.references().len(), 1);
+}
+
+/// A45: two resolutions that grant the same thing compare equal whatever they
+/// cost, and a different grant still compares unequal.
+#[test]
+fn insertion_count_is_not_part_of_the_value() {
+    let tools = user_tools(Path::new(USER_FILE), &[("codex", &["api.openai.com"])]);
+    // A repeated *literal* always inserts — only references are skipped — so the
+    // two resolutions differ in cost while granting exactly the same thing.
+    let short = resolve_ok(&["tool:codex", "10.0.0.5"], Some(&tools));
+    let long = resolve_ok(&["tool:codex", "10.0.0.5", "10.0.0.5"], Some(&tools));
+    assert_eq!((short.insertions, long.insertions), (2, 3));
+    assert_eq!(short, long);
+    let other = resolve_ok(&["10.0.0.5"], Some(&tools));
+    assert_ne!(short, other);
+}
+
+/// A31's unit half, R22: a `set:` reference resolves against the user file's own
+/// `[egress_sets]`, and each failure keeps its position and its fixed sentence.
+#[test]
+fn set_resolution_errors_and_precedence() {
+    let parse = |text: &str| AllowanceEntry::parse(text).unwrap();
+    const SENTINEL: &str = "SENTINEL7";
+    // R22: no user config file at all is `NoUserSets`, not `NoUserConfig`: the
+    // namespace a set needs is the sets one.
+    let failure = resolve(vec![parse("set:corp")], None).unwrap_err();
+    assert_eq!(failure.index, 0);
+    assert_eq!(failure.error, EntryError::NoUserSets);
+    assert_eq!(
+        failure.error.to_string(),
+        "an egress reference resolves only against the user config's own [egress_sets], and no user config file was found"
+    );
+    // A namespace with no `[egress_sets]` declares no set, so a well-formed name
+    // is unknown; the position is the entry's, and the name is never echoed.
+    let tools = user_tools(Path::new(USER_FILE), &[("codex", &["api.openai.com"])]);
+    let failure = resolve(
+        vec![parse("10.0.0.5"), parse(&format!("set:{SENTINEL}"))],
+        Some(&tools),
+    )
+    .unwrap_err();
+    assert_eq!(failure.index, 1);
+    assert_eq!(failure.error, EntryError::UnknownSet);
+    assert_eq!(
+        failure.error.to_string(),
+        "an egress reference must name a set declared in the user config's own [egress_sets]; project and built-in configs cannot declare sets"
+    );
+    assert!(!failure.error.to_string().contains(SENTINEL));
+}
+
+/// A32 and R23/R36: a set reference is applied once however often it is written,
+/// and a set and a tool in the same list cost exactly one expansion each.
+///
+/// The expected `insertions` is the discriminator: re-applying a cached expansion
+/// per repeat would grant the same allowances but cost 14 inserts instead of 6.
+#[test]
+fn repeated_references_apply_once() {
+    let tools = test_support::user_namespace(
+        Path::new(USER_FILE),
+        &[("fetcher", &["one.example", "two.example"])],
+        Some("s = [\"10.0.0.1\", \"10.0.0.2\", \"10.0.0.3\"]\n"),
+    );
+    let repeated = resolve_ok(
+        &[
+            "set:s",
+            "set:s",
+            "tool:fetcher",
+            "tool:fetcher",
+            "10.0.0.9",
+            "set:s",
+        ],
+        Some(&tools),
+    );
+    let once = resolve_ok(&["set:s", "tool:fetcher", "10.0.0.9"], Some(&tools));
+    // Three allowances from the set, two from the tool, one literal.
+    assert_eq!(repeated.insertions, 6);
+    assert_eq!(
+        once, repeated,
+        "the repeats granted nothing the first did not"
+    );
+    assert_eq!(repeated.references().len(), 2);
+    assert_eq!(
+        repeated
+            .references()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["set:s", "tool:fetcher"]
+    );
+    assert_eq!(
+        repeated
+            .allowances()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        [
+            "10.0.0.1/32",
+            "10.0.0.2/32",
+            "10.0.0.3/32",
+            "tcp://one.example:443",
+            "tcp://two.example:443",
+            "10.0.0.9/32"
+        ]
+    );
+    // The same set chosen from a CLI list reaches the same closure, on the same
+    // rows: a set is one reference with its closure as the expansion (R24).
+    let from_cli = resolve_ok(&["set:s"], Some(&tools));
+    assert_eq!(from_cli.references().len(), 1);
+    assert_eq!(from_cli.insertions, 3);
+}
+
+/// A31's set lookup and R24: a declared set resolves to its compiled closure,
+/// and `doctor`'s expansion view is that same closure.
+#[test]
+fn a_declared_set_resolves_to_its_closure() {
+    let tools = test_support::user_namespace(
+        Path::new(USER_FILE),
+        &[],
+        Some("corp = [\"10.0.0.5\", \"10.0.0.5/32\"]\n"),
+    );
+    let resolved = resolve_ok(&["set:corp"], Some(&tools));
+    assert_eq!(
+        resolved
+            .allowances()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["10.0.0.5/32"]
+    );
+    assert_eq!(
+        resolved
+            .expansions()
+            .map(|(reference, expansion)| (
+                reference.to_string(),
+                expansion
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            ))
+            .collect::<Vec<_>>(),
+        [("set:corp".to_owned(), vec!["10.0.0.5/32".to_owned()])]
     );
 }
 
@@ -530,7 +1121,7 @@ fn an_untrusted_verdict_precedes_lookup() {
             subject: crate::config_authority::AuthoritySubject::EgressReference,
         },
     );
-    let namespace = UserToolRequests::new(trust, &[]);
+    let namespace = UserToolRequests::new(trust, &[], None).unwrap();
     let failure = resolve(
         vec![AllowanceEntry::parse(&format!("tool:{SENTINEL}")).unwrap()],
         Some(&namespace),
@@ -543,6 +1134,54 @@ fn an_untrusted_verdict_precedes_lookup() {
             "config: \"{USER_FILE}\": an egress reference requires config.toml to be a regular file, but it is reached through a symbolic link; its target may be writable by a guest or project, so review the [[tools]] network_requests before trusting the file (a symlinked config without an egress reference still works)"
         ),
         "the trust check must precede the unknown-name check"
+    );
+    assert!(!failure.error.to_string().contains(SENTINEL));
+}
+
+/// R21 for sets specifically: the trust check is not a property of `tool:`
+/// references.
+///
+/// The set below **is** declared in the namespace, so the only thing that can
+/// refuse this entry is the file's verdict — a trust check written for tools only
+/// resolves the set successfully and fails here. That is why this case is at the
+/// unit level: the launch-level A30 would still catch a tool-only check, but the
+/// unit module on its own reported green (review B, mutation 6).
+#[test]
+fn a_set_reference_is_refused_for_an_untrusted_file() {
+    const SENTINEL: &str = "SENTINEL7";
+    let trust = ReferenceTrust::for_test_untrusted(
+        Path::new(USER_FILE),
+        UntrustedConfig::Refused {
+            refusal: crate::config_authority::AuthorityRefusal::ThroughSymlink,
+            subject: crate::config_authority::AuthoritySubject::EgressReference,
+        },
+    );
+    let declarations: toml::Table = format!("{SENTINEL} = [\"10.0.0.1\"]")
+        .parse()
+        .expect("test TOML");
+    let parsed = super::sets::parse(&toml::Value::Table(declarations))
+        .expect("a literal-only set compiles without the file's tools");
+    let namespace = UserToolRequests::new(trust, &[], Some(parsed)).expect("literal-only set");
+
+    let failure = resolve(
+        vec![AllowanceEntry::parse(&format!("set:{SENTINEL}")).unwrap()],
+        Some(&namespace),
+    )
+    .unwrap_err();
+    assert_eq!(failure.index, 0);
+    assert!(
+        matches!(failure.error, EntryError::Untrusted { .. }),
+        "{failure:?}"
+    );
+    // The tool case's sentence, byte for byte: one variant, one text, both kinds.
+    assert_eq!(
+        failure.error.to_string(),
+        format!(
+            "config: \"{USER_FILE}\": an egress reference requires config.toml to be a regular \
+             file, but it is reached through a symbolic link; its target may be writable by a \
+             guest or project, so review the [[tools]] network_requests before trusting the file \
+             (a symlinked config without an egress reference still works)"
+        )
     );
     assert!(!failure.error.to_string().contains(SENTINEL));
 }
@@ -593,8 +1232,13 @@ const OBLIGATIONS: [&str; 10] = [
 /// so prose stays on lines this skips. That is the only exemption. There is no
 /// lexical reasoning here at all — no comment, string, raw-string or lifetime
 /// state — so a match inside any other line, including inside a trailing
-/// comment or a string, is a violation, and nothing can be hidden from the scan
-/// by a token form the scan does not model.
+/// comment or a string, is a violation.
+///
+/// The price of having no lexer: the exemption is *textual*, so a line whose
+/// first non-whitespace characters are `//` is skipped even when it closes a
+/// block comment opened on an earlier line and then continues as live code. This
+/// scan cannot see that, and closing it would mean reintroducing the lexical
+/// reasoning this repo removed once already. ADR-0018 names the hole.
 fn forbidden_violations(source: &str) -> Vec<String> {
     let mut violations = Vec::new();
     for (index, line) in source.lines().enumerate() {
@@ -605,6 +1249,47 @@ fn forbidden_violations(source: &str) -> Vec<String> {
             if line.contains(forbidden) {
                 violations.push(format!(
                     "line {}: production code reaches `{forbidden}`; a reference must not",
+                    index + 1
+                ));
+            }
+        }
+    }
+    violations
+}
+
+/// The obligation specific to `egress_reference/sets.rs` (#511 R29): the text of
+/// the set graph contains no `Allowance::parse(`.
+///
+/// A token in text, not a proof about authority — see [`set_violations`] for what
+/// that excludes and ADR-0018 for the hole it leaves open.
+///
+/// A filename-scoped list rather than a shared one, because `Allowance::parse(`
+/// *is* how the entry side re-enters the grammar (`fn expand`), so the same token
+/// means opposite things in the two files.
+const SET_OBLIGATIONS: [&str; 1] = ["Allowance::parse("];
+
+/// The same one obligation, written out again, independently of
+/// [`SET_OBLIGATIONS`].
+const SET_OBLIGATIONS_ORACLE: [&str; 1] = ["Allowance::parse("];
+
+/// Every [`FORBIDDEN`] token or [`SET_OBLIGATIONS`] token on a line of `source`
+/// that is not a leading `//` comment.
+///
+/// Same exemption, same reasoning and the same textual hole as
+/// [`forbidden_violations`]. What this establishes is a property of the file's
+/// text — no forbidden token, no `Allowance::parse(` outside `fn expand` — and
+/// not a property of its data flow.
+fn set_violations(source: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+    for (index, line) in source.lines().enumerate() {
+        if line.trim_start().starts_with("//") {
+            continue;
+        }
+        for forbidden in FORBIDDEN.iter().chain(SET_OBLIGATIONS.iter()) {
+            if line.contains(forbidden) {
+                violations.push(format!(
+                    "line {}: the egress-set graph reaches `{forbidden}`; it may only forward \
+                     allowances the file already declared",
                     index + 1
                 ));
             }
@@ -687,6 +1372,26 @@ fn the_resolver_reparses_and_never_reads_a_catalog() {
     );
 }
 
+/// A37, as amended: the set graph's **source text** contains no forbidden token
+/// and no `Allowance::parse(` outside the permitted seam.
+///
+/// That is the whole claim. It is a pattern check over text, so it holds only
+/// for edits that leave the token readable on one non-comment line: a token split
+/// across lines, a re-export or alias, a `macro_rules!` wrapper, a helper in the
+/// parent module, and a `//`-leading line that closes a block comment opened
+/// earlier all reach an allowance while this test stays green. The property the
+/// old name claimed — that the graph cannot mint an allowance — is not
+/// established here and is not establishable by text; allowance provenance and
+/// data flow are **structural review** (ADR-0018, A46).
+#[test]
+fn the_set_graph_source_contains_no_forbidden_token() {
+    let violations = set_violations(include_str!("sets.rs"));
+    assert!(
+        violations.is_empty(),
+        "the A37 check over sets.rs found violations: {violations:?}"
+    );
+}
+
 /// The A37 guard is only a guard if it rejects the edits it exists to reject,
 /// so each obligation gets its own case over a synthetic source string; the file
 /// on disk is never edited.
@@ -701,6 +1406,11 @@ fn the_tripwire_rejects_forbidden_edits_to_production() {
         &FORBIDDEN[..],
         &OBLIGATIONS[..],
         "the forbidden list lost, gained or swapped an obligation"
+    );
+    assert_eq!(
+        &SET_OBLIGATIONS[..],
+        &SET_OBLIGATIONS_ORACLE[..],
+        "the set-graph obligation list lost, gained or swapped an entry"
     );
 
     // Every forbidden token, independently: a code line is flagged, the same
@@ -763,11 +1473,42 @@ fn the_tripwire_rejects_forbidden_edits_to_production() {
         "could not be delimited",
     );
 
-    // And the file that ships passes both checks — the guard test above asserts
-    // the same thing, restated here so this self-test stands alone.
+    // The set graph's own obligation, independently: a code line is flagged, the
+    // same text as a leading `//` comment is not, and the mount token forms are
+    // still refused there.
+    for forbidden in SET_OBLIGATIONS_ORACLE {
+        let code = format!("    let _ = {forbidden}text);\n");
+        let flagged = set_violations(&code);
+        assert_eq!(
+            flagged.len(),
+            1,
+            "`{forbidden}` was not flagged in sets.rs: {flagged:?}"
+        );
+        assert!(flagged[0].contains(forbidden), "{flagged:?}");
+        let comment = format!("    // the set graph must not call {forbidden}\n");
+        assert!(
+            set_violations(&comment).is_empty(),
+            "`{forbidden}` was flagged inside a leading comment"
+        );
+    }
+    for forbidden in OBLIGATIONS {
+        let code = format!("    let _ = {forbidden};\n");
+        assert_eq!(
+            set_violations(&code).len(),
+            1,
+            "`{forbidden}` was not flagged in sets.rs"
+        );
+    }
+
+    // And the files that ship pass both checks — the guard tests above assert the
+    // same thing, restated here so this self-test stands alone.
     assert!(
         production_violations(include_str!("../egress_reference.rs")).is_empty(),
         "the production file itself must pass"
+    );
+    assert!(
+        set_violations(include_str!("sets.rs")).is_empty(),
+        "the set graph itself must pass"
     );
 }
 
@@ -776,9 +1517,7 @@ fn the_tripwire_rejects_forbidden_edits_to_production() {
 fn render_list_matches_the_shared_grammar() {
     let references: Vec<EgressReference> = ["a", "b", "c", "d"]
         .iter()
-        .map(|tool| EgressReference {
-            tool: (*tool).to_owned(),
-        })
+        .map(|tool| tool_ref(tool))
         .collect();
     for (count, expected) in [
         (0usize, ""),

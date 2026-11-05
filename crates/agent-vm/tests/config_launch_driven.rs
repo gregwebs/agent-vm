@@ -13856,3 +13856,308 @@ fn persisted_reference_error_fails_every_route_and_doctor() {
     assert!(text.contains("==> tool configuration"), "{text}");
     assert!(text.contains(&reason), "{text}");
 }
+
+// ---------------------------------------------------------------------------
+// #511: `set:NAME` egress sets
+// ---------------------------------------------------------------------------
+
+/// The two set-specific refusals, written out independently of the production
+/// constants so a reworded sentence fails here rather than moving with it.
+const EGRESS_SET_UNKNOWN: &str = "an egress reference must name a set declared in the user config's own [egress_sets]; project and built-in configs cannot declare sets";
+const EGRESS_SET_NO_CONFIG: &str = "an egress reference resolves only against the user config's own [egress_sets], and no user config file was found";
+
+/// A13 and Q6: a symlinked user file that declares `[egress_sets]` is refused at
+/// load for the *table*, with nothing referencing it, and before any launch
+/// state exists.
+#[test]
+fn egress_sets_unsafe_file_is_refused_before_launch_state() {
+    let h = Harness::warm();
+    let target = h.home_root.join(".config/agent-vm/dotfile");
+    write(&target, "[egress_sets]\ncorp = [\"10.0.0.5\"]\n");
+    h.symlink_user_config(&target);
+    let out = h.launch("shell", &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(&format!(
+            "config: \"{}\": [egress_sets] requires config.toml to be a regular file",
+            h.user_config().display()
+        )),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("review the [egress_sets] table"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(CONFIG_MARKER), "{stderr}");
+    assert!(
+        !h.home_root
+            .join(".config/agent-vm/image-pins.json")
+            .exists()
+    );
+    assert!(!h.state_root.join(project_hash(&h.project_root)).exists());
+    assert!(
+        h.msb_log().lines().all(|line| line == "--version"),
+        "a refused launch makes no runtime call beyond the identity probe: {}",
+        h.msb_log()
+    );
+
+    // The same file without the table still launches, so the refusal is about
+    // this field and not about symlinks.
+    let h = Harness::warm();
+    let target = h.home_root.join(".config/agent-vm/dotfile");
+    write(&target, &requests_tool("custom", &["a.example"]));
+    h.symlink_user_config(&target);
+    let out = h.launch("shell", &["--allow-egress", "api.example.com"]);
+    assert!(
+        stderr_of(&out).contains(CONFIG_MARKER),
+        "{}",
+        stderr_of(&out)
+    );
+}
+
+/// A27 and R20/R23–R25: a persisted nested set reaches policy — domains and
+/// numeric allowances alike — and the notices name the reference the user wrote,
+/// never the set it nests.
+#[test]
+fn persisted_set_reference_grants_its_nested_closure() {
+    let h = Harness::warm();
+    h.write_user(&format!(
+        "{}[egress_sets]\n\
+         agents = [\"tool:codex\", \"set:corp\"]\n\
+         corp = [\"git.corp.example\", \"10.0.0.5\"]\n\
+         \n\
+         [network]\nallow_egress = [\"set:agents\"]\n",
+        requests_tool("codex", &["api.openai.com"])
+    ));
+    let out = h.launch("shell", &[]);
+    let config = normalized_config(&h, &out);
+    assert_eq!(
+        config["network"]["policy"]["rules"],
+        serde_json::json!([
+            {"direction":"egress","destination":{"cidr":"10.0.0.5/32"},"protocols":[],"ports":[],"action":"allow"},
+            {"direction":"egress","destination":{"domain":"api.openai.com"},"protocols":["tcp"],"ports":[{"start":443,"end":443}],"action":"allow"},
+            {"direction":"egress","destination":{"domain":"git.corp.example"},"protocols":["tcp"],"ports":[{"start":443,"end":443}],"action":"allow"}
+        ])
+    );
+    assert_eq!(
+        config["network"]["tls"]["intercepted_ports"],
+        serde_json::json!([443])
+    );
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr
+            .contains("==> Egress policy: allowing 10.0.0.5/32 (persisted grants via set:agents)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "==> Egress policy: allowing TLS to api.openai.com, git.corp.example on ports 443 (persisted grants via set:agents)"
+        ),
+        "{stderr}"
+    );
+    // A nested chain is never named: only the entry the user wrote.
+    assert!(!stderr.contains("set:corp"), "{stderr}");
+}
+
+/// A28: a CLI `set:` resolves with no user `[network]` table at all, and its tag
+/// names the reference on the CLI tier.
+#[test]
+fn cli_set_reference_expands_without_a_network_table() {
+    let h = Harness::warm();
+    h.write_user(&format!(
+        "{}[egress_sets]\nagents = [\"tool:codex\"]\n",
+        requests_tool("codex", &["api.openai.com"])
+    ));
+    let out = h.launch("shell", &["--allow-egress", "set:agents"]);
+    let config = normalized_config(&h, &out);
+    assert_eq!(
+        domain_rules_of(&config),
+        [("api.openai.com".to_owned(), vec![443])]
+    );
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(
+            "==> Egress policy: allowing TLS to api.openai.com on ports 443 (--allow-egress via set:agents)"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("persisted"), "{stderr}");
+}
+
+/// A29: declaring a set grants nothing. Definitions alone mount nothing, and here
+/// nothing at all is allowed — no rule, no tag.
+#[test]
+fn declared_egress_sets_grant_nothing() {
+    let h = Harness::warm();
+    h.write_user("[egress_sets]\ncorp = [\"10.0.0.5\", \"git.corp.example\"]\nempty = []\n");
+    let out = h.launch("shell", &[]);
+    let config = normalized_config(&h, &out);
+    assert_eq!(config["network"]["policy"]["default_egress"], "deny");
+    assert_eq!(config["network"]["policy"]["rules"], serde_json::json!([]));
+    let stderr = stderr_of(&out);
+    assert!(!stderr.contains("via set:"), "{stderr}");
+    assert!(!stderr.contains("10.0.0.5"), "{stderr}");
+    assert!(!stderr.contains("git.corp.example"), "{stderr}");
+}
+
+/// A30 and Q7: a CLI `set:` against a symlinked tools-only file prints the
+/// egress-reference refusal byte-identically at `#1`, and the same file without a
+/// reference still launches.
+///
+/// This proves trust-before-lookup and the refusal bytes; *trust before the
+/// repeat skip* is a review item (A46), because a refused first occurrence
+/// returns before any row exists.
+#[test]
+fn cli_set_reference_requires_a_verified_user_file() {
+    let tools_only = requests_tool("x", &["a.example"]);
+    let h = Harness::warm();
+    let target = h.home_root.join(".config/agent-vm/dotfile");
+    write(&target, &tools_only);
+    h.symlink_user_config(&target);
+    let out = h.launch("shell", &["--allow-egress", "api.example.com"]);
+    assert!(
+        stderr_of(&out).contains(CONFIG_MARKER),
+        "{}",
+        stderr_of(&out)
+    );
+
+    let h = Harness::warm();
+    let target = h.home_root.join(".config/agent-vm/dotfile");
+    write(&target, &tools_only);
+    h.symlink_user_config(&target);
+    let out = h.launch("shell", &["--allow-egress", "set:corp"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(&format!(
+            "--allow-egress #1: config: \"{}\": an egress reference requires config.toml to be a regular file, but it is reached through a symbolic link; its target may be writable by a guest or project, so review the [[tools]] network_requests before trusting the file (a symlinked config without an egress reference still works)",
+            h.user_config().display()
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(CONFIG_MARKER), "{stderr}");
+    assert!(!h.state_root.join(project_hash(&h.project_root)).exists());
+}
+
+/// A31, CLI half: no user config at all is `NoUserSets`, an undeclared name is
+/// `UnknownSet`, both at the entry's position, and neither creates launch state.
+#[test]
+fn cli_set_reference_errors_before_launch_state() {
+    let h = Harness::warm();
+    let out = h.launch("shell", &["--allow-egress", "set:corp"]);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(&format!("--allow-egress #1: {EGRESS_SET_NO_CONFIG}")),
+        "{stderr}"
+    );
+    assert!(!h.state_root.join(project_hash(&h.project_root)).exists());
+
+    let h = Harness::warm();
+    h.write_user(&format!(
+        "{}[egress_sets]\ncorp = [\"10.0.0.5\"]\n",
+        requests_tool("x", &["a.example"])
+    ));
+    let out = h.launch("shell", &["--allow-egress", "set:nope"]);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(&format!("--allow-egress #1: {EGRESS_SET_UNKNOWN}")),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(CONFIG_MARKER), "{stderr}");
+    assert!(!h.state_root.join(project_hash(&h.project_root)).exists());
+}
+
+/// A36 and R28, across the routes: no set refusal echoes a key, a set name or an
+/// entry, whichever of the three carries a sentinel.
+#[test]
+fn set_refusals_never_echo_the_entry_or_its_name() {
+    const SENTINEL: &str = "sk-live-SENTINEL-511";
+    // A key the name rule refuses.
+    let bad_key = format!("[egress_sets]\n\"{SENTINEL} x\" = [\"10.0.0.5\"]\n");
+    // A valid name nothing declares.
+    let undeclared = format!(
+        "[egress_sets]\nok = [\"10.0.0.5\"]\n\n[network]\nallow_egress = [\"set:{SENTINEL}\"]\n"
+    );
+    // An entry the allowance grammar refuses.
+    let bad_entry = format!("[egress_sets]\nok = [\"a b {SENTINEL}\"]\n");
+    // An unknown tool inside a set.
+    let unknown_tool = format!("[egress_sets]\nok = [\"tool:{SENTINEL}\"]\n");
+
+    for (body, expected) in [
+        (
+            bad_key,
+            "egress_sets: definition 0 has an invalid name".to_owned(),
+        ),
+        (
+            undeclared,
+            format!("network.allow_egress[0]: {EGRESS_SET_UNKNOWN}"),
+        ),
+        (bad_entry, "egress_sets[0][0]: ".to_owned()),
+        (
+            unknown_tool,
+            format!("egress_sets[0][0]: {EGRESS_REFERENCE_UNKNOWN}"),
+        ),
+    ] {
+        let h = Harness::new();
+        h.write_user(&body);
+        let out = h.launch("shell", &[]);
+        assert!(!out.status.success(), "{body}");
+        let stderr = stderr_of(&out);
+        assert!(stderr.contains(&expected), "{body}: {stderr}");
+        assert!(
+            !stderr.contains(SENTINEL),
+            "{body} echoed the sentinel: {stderr}"
+        );
+        assert!(!stderr.contains(CONFIG_MARKER), "{stderr}");
+    }
+
+    // The CLI route: an unknown name and a malformed one, both silent about it.
+    for entry in [format!("set:{SENTINEL}"), format!("set:{SENTINEL}/x")] {
+        let h = Harness::warm();
+        h.write_user("[egress_sets]\nok = [\"10.0.0.5\"]\n");
+        let out = h.launch("shell", &["--allow-egress", &entry]);
+        assert_eq!(out.status.code(), Some(1), "{entry}");
+        let stderr = stderr_of(&out);
+        assert!(!stderr.contains(SENTINEL), "{entry}: {stderr}");
+    }
+}
+
+/// A39: a persisted set error fails load, so every route reports it — 125 for both
+/// direct spellings, 1 for a catalog launch, and a nonzero `doctor` that still
+/// renders its tool-configuration section.
+#[test]
+fn persisted_set_error_fails_every_route_and_doctor() {
+    let reason = format!("egress_sets[0][0]: {EGRESS_REFERENCE_UNKNOWN}");
+    let user_config = format!(
+        "{}[egress_sets]\ncorp = [\"tool:nope\"]\n\n[network]\nallow_egress = [\"set:corp\"]\n",
+        requests_tool("x", &["a.example"])
+    );
+    for form in DIRECT_FORMS {
+        let h = Harness::warm();
+        h.write_user(&user_config);
+        let out = h.direct(DirectInvocation {
+            form,
+            options: &[],
+            vector: &["probe"],
+            envs: &[],
+        });
+        assert_eq!(out.status.code(), Some(125), "{form:?}");
+        assert!(stderr_of(&out).contains(&reason), "{}", stderr_of(&out));
+    }
+    let h = Harness::new();
+    h.write_user(&user_config);
+    let out = h.launch("shell", &[]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_saved_refusal(&h, &out, &reason, true);
+
+    let h = Harness::warm();
+    h.write_user(&user_config);
+    let doctor = h.builtin(&["doctor"], &[]);
+    assert!(!doctor.status.success());
+    let text = format!("{}{}", stdout_of(&doctor), stderr_of(&doctor));
+    assert!(text.contains("==> tool configuration"), "{text}");
+    assert!(text.contains(&reason), "{text}");
+}

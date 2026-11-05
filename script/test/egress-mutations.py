@@ -336,12 +336,14 @@ def matrix():
     # Presence, not contents, is what makes a user file authority-bearing
     # (ADR-0040/0046). The anchor is the kernel body, never its `ensures`
     # clause, so replacing it cannot weaken the contract it is checked against.
-    # #397 widened the disjunction from two fields to three, so the anchor and its
-    # test both moved: the body now names `mount_sets` too.
-    authority_or = "if t.network { true } else { t.mounts || t.mount_sets }"
-    authority_or_mutant = "if t.network { t.mounts || t.mount_sets } else { false }"
+    # #397 widened the disjunction from two fields to three and #511 to four, so
+    # the anchor and its test both moved again: the body now names `egress_sets`,
+    # and the oracle is the sixteen-row table.
+    authority_or = "if t.network { true } else { t.mounts || t.mount_sets || t.egress_sets }"
+    authority_or_mutant = ("if t.network { t.mounts || t.mount_sets || t.egress_sets } "
+                           "else { false }")
     add("config-mounts-authority-or", persisted, authority_or, authority_or_mutant,
-        rust("authority_required_matches_the_eight_rows"))
+        rust("authority_required_matches_the_sixteen_rows"))
     add("config-mounts-authority-or-proof", persisted, authority_or, authority_or_mutant,
         gate, "verification results::")
     # The merge/refuse rule decides whether a declaration is silently dropped
@@ -445,12 +447,16 @@ def matrix():
     # The mount trigger is one aggregate over both sites (#396), so the shared
     # anchor is that expression. Every replacement below keeps the struct shape, so
     # a control cannot pass (or fail) on a missing-field compile error.
+    # #511 added the fourth trigger, so the shared anchor grew one line: every
+    # derived mutant keeps it, and no row can pass or fail on a missing-field
+    # compile error instead of on the behaviour it names.
     mounts_present = (
         "        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {\n"
         "            top_level: raw.mounts.is_some(),\n"
         "            tool_field: first_tool_mounts.is_some(),\n"
         "        }),\n"
-        "        mount_sets: raw.mount_sets.is_some(),\n    };")
+        "        mount_sets: raw.mount_sets.is_some(),\n"
+        "        egress_sets: raw.egress_sets.is_some(),\n    };")
     mounts_absent_mutant = mounts_present.replace(
         "mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {\n"
         "            top_level: raw.mounts.is_some(),\n"
@@ -659,6 +665,80 @@ def matrix():
         '    ResolvedMountList::from_leaves(unique.iter().map(|leaf| Arc::new(ConfigMountLeaf { '
         'request: leaf.request.clone(), site: leaf.site.clone() })).collect())',
         rust("tool_closures_share_leaf_payloads_across_catalog_entries"))
+    # -- Named egress sets (#511) ------------------------------------------------
+    # Presence, not contents, is again the rule: `[egress_sets]` makes the file
+    # authority-bearing even empty, so dropping its effect lets a symlinked
+    # sets-only file load through the tools-only compatibility path.
+    egress_sets_source = SRC + "egress_reference/sets.rs"
+    presence_egress_sets_absent = mounts_present.replace(
+        "egress_sets: raw.egress_sets.is_some(),", "egress_sets: false,")
+    add("egress-sets-presence-ignored", SRC + "config.rs", mounts_present,
+        presence_egress_sets_absent, rust("egress_sets_presence_requires_a_verified_file"))
+    # Declaring sets is user-scope only; accepting a project table would let a
+    # checkout name egress for every launch of it.
+    project_egress_sets = ('    if raw.egress_sets.is_some() {\n'
+                           '        return Err(egress_sets_refusal(path, tier));\n'
+                           '    }')
+    add("egress-sets-project-accepted", SRC + "config.rs", project_egress_sets,
+        project_egress_sets.replace("if raw.egress_sets.is_some()", "if false"),
+        rust("project_egress_sets_are_refused_even_when_empty"))
+    # A cycle edge treated as "already seen" is the smallest way to skip the
+    # refusal: the walk completes and the load succeeds.
+    egress_cycle_arm = ('                VisitDecision::Cycle => {\n'
+                        '                    return Err(EgressSetError::Cycle {\n'
+                        '                        definition: set.0,\n'
+                        '                        index,\n'
+                        '                    });\n'
+                        '                }')
+    add("egress-sets-cycle-skipped", egress_sets_source, egress_cycle_arm,
+        "                VisitDecision::Cycle => {}",
+        rust("cycles_are_refused_by_site"))
+    # Every definition is a root: walking only the first leaves an unused set
+    # unvalidated, and compile then finds an order that omits it.
+    egress_walk_roots = "    for root in 0..definitions.len() {"
+    add("egress-sets-unused-unvalidated", egress_sets_source, egress_walk_roots,
+        "    for root in 0..definitions.len().min(1) {",
+        rust("unused_sets_are_compiled"))
+    # A child's closure is the whole reason a set may nest.
+    egress_child_loop = "                    for allowance in &closures[child.0] {"
+    add("egress-sets-nested-closure-dropped", egress_sets_source, egress_child_loop,
+        "                    for allowance in closures[child.0].iter().take(0) {",
+        rust("issue_example_closures"))
+    # The budget's enforcement, as distinct from its kernel: a `false` here admits
+    # every visit a crafted table can produce.
+    egress_budget_check = "        if !egress_set_expansion_work_allowed(self.used) {"
+    add("egress-sets-budget-unchecked", egress_sets_source, egress_budget_check,
+        "        if false {",
+        rust("egress_set_expansion_work_boundary"))
+    # The kernel's polarity: one more visit admitted past the limit is the
+    # difference between a refused file and an unbounded expansion. The anchor is
+    # the body, so the `-proof` twin still bites on the contract.
+    egress_budget_body = "{\n    used < MAX_EGRESS_SET_EXPANSION_WORK\n}"
+    egress_budget_mutant = "{\n    used <= MAX_EGRESS_SET_EXPANSION_WORK\n}"
+    add("egress-sets-budget-off-by-one-proof", egress_sets_source, egress_budget_body,
+        egress_budget_mutant, gate, "verification results::")
+    # A repeated reference re-applies the cached expansion instead of skipping:
+    # the grants are identical, so only the insertion counter can see it.
+    egress_repeat_skip = ('                if resolved.reference_index(&reference).is_some() {\n'
+                          '                    continue;\n'
+                          '                }')
+    egress_repeat_reapplied = (
+        '                if let Some(slot) = resolved.reference_index(&reference) {\n'
+        '                    for allowance in resolved.references[slot].1.clone() {\n'
+        '                        resolved.insert(allowance, false, Some(slot));\n'
+        '                    }\n'
+        '                    continue;\n'
+        '                }')
+    add("egress-sets-repeat-reapplied", REFERENCE, egress_repeat_skip,
+        egress_repeat_reapplied, rust("repeated_references_apply_once"))
+    # Case folding is the whole compatibility claim of R5: without it `SET:8443`
+    # silently keeps its old meaning while `set:8443` becomes a reference.
+    egress_claim_prefix = "    let prefix = (s[0] == 0x73 || s[0] == 0x53)"
+    add("set-claim-case-sensitive", REFERENCE, egress_claim_prefix,
+        "    let prefix = (s[0] == 0x73)",
+        rust("set_claim_matches_byte_oracle"))
+    add("set-claim-case-sensitive-proof", REFERENCE, egress_claim_prefix,
+        "    let prefix = (s[0] == 0x73)", gate, "verification results::")
     return controls
 
 

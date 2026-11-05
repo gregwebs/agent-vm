@@ -1049,12 +1049,15 @@ fn describe_config(report: ConfigReport) -> (String, Option<anyhow::Error>, Opti
 }
 
 /// The persisted egress references of one `[network]` table and what each
-/// grants (ADR-0059).
+/// grants (ADR-0059): `tool:NAME` and, since #511, `set:NAME`.
 ///
 /// Empty when the table has none, so `doctor` output for every config written
 /// before #506 is byte-identical. Each expansion is listed because this is
 /// *user-authored* authority, not ADR-0039's bounded repository metadata — but
-/// bounded per reference, because one declaration can name 64 requests.
+/// bounded per reference, because one declaration can name 64 requests and a
+/// set's closure is already deduplicated by value. A set reference's expansion is
+/// its whole nested closure, which is what makes the entry-level attribution
+/// enough: what `set:NAME` nests is visible here.
 fn describe_egress_references(network: &crate::user_network::UserNetwork) -> String {
     const MAX_SHOWN: usize = 64;
     let mut out = String::new();
@@ -3154,6 +3157,79 @@ substituted."#;
         let (text, failure, _) = describe_config(report);
         assert!(failure.is_none(), "{text}");
         assert!(!text.contains("egress references"), "{text}");
+    }
+
+    /// A35 (i) and (iii): a persisted `set:` reference prints its flattened
+    /// closure as one line, and an unreferenced set prints nothing at all.
+    #[test]
+    fn doctor_lists_persisted_set_references() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let user = dir.path().join("config.toml");
+        std::fs::write(
+            &user,
+            "[[tools]]\nname = \"codex\"\ncommand = \"codex\"\nnetwork_requests = [\"api.openai.com\"]\n\n\
+             [egress_sets]\ncorp = [\"git.corp.example\", \"tcp://registry.corp.example:8443\", \"10.0.0.5\"]\n\
+             agents = [\"tool:codex\", \"set:corp\"]\n\
+             unused = [\"10.9.9.9\"]\n\n\
+             [network]\nallow_egress = [\"set:agents\"]\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&user, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let report = config_report(Some(&user), &dir.path().join("absent.toml"));
+        let (text, failure, _) = describe_config(report);
+        assert!(failure.is_none(), "{text}");
+        assert!(
+            text.ends_with(&format!(
+                "persisted egress references in \"{}\" [network]:\n  set:agents -> tcp://api.openai.com:443, git.corp.example, tcp://registry.corp.example:8443, 10.0.0.5/32",
+                crate::one_line::path(&user)
+            )),
+            "{text}"
+        );
+        // The nested set is flattened into the entry-level line, never listed as
+        // its own reference, and an unused definition adds nothing.
+        assert!(!text.contains("set:corp ->"), "{text}");
+        assert!(!text.contains("unused ->"), "{text}");
+        assert!(!text.contains("10.9.9.9"), "{text}");
+    }
+
+    /// A35 (ii): the 64-item cap and its `+N more` suffix hold for a set's
+    /// expansion too, because the cap is the renderer's, not the reference kind's.
+    #[test]
+    fn doctor_caps_a_large_set_expansion() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let user = dir.path().join("config.toml");
+        let literals: Vec<String> = (0..65).map(|i| format!("\"10.0.0.{i}\"")).collect();
+        std::fs::write(
+            &user,
+            format!(
+                "[egress_sets]\nbig = [{}]\n\n[network]\nallow_egress = [\"set:big\"]\n",
+                literals.join(", ")
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&user, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let report = config_report(Some(&user), &dir.path().join("absent.toml"));
+        let (text, failure, _) = describe_config(report);
+        assert!(failure.is_none(), "{text}");
+        let line = text
+            .lines()
+            .find(|line| line.trim_start().starts_with("set:big -> "))
+            .unwrap_or_else(|| panic!("no set:big line in {text}"));
+        // The whole ordered line, written out independently: the first 64 items in
+        // declaration order, then the suffix. Counting items and checking a tail
+        // would pass for any order, and for a cap that dropped a different 64.
+        let expected = format!(
+            "  set:big -> {}, +1 more",
+            (0..64)
+                .map(|i| format!("10.0.0.{i}/32"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert_eq!(line, expected);
     }
 
     #[test]

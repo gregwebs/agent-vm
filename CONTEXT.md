@@ -719,9 +719,9 @@ tool or store: **declaring one mounts nothing**, and only a launch that selects
 it grants filesystem access. Names are case-sensitive ASCII
 (`[A-Za-z0-9_]` first, then `[A-Za-z0-9_.-]`), so a name can never look like a
 flag, a path or a modifier, and tool/route words are not reserved; the config's own
-top-level field names (`mounts`, `mount_sets`, `network`, `image`, `tools`) are,
-so a key a `[mount_sets]` header scopes into that table is reported as the scoping
-mistake instead of loading as a set. Sets compose:
+top-level field names (`mounts`, `mount_sets`, `network`, `image`, `tools` and
+`egress_sets`) are, so a key a `[mount_sets]` header scopes into that table is
+reported as the scoping mistake instead of loading as a set. Sets compose:
 a set's entries are direct declarations or other set names, forward references
 resolve, and a set-reference **cycle** is invalid (a `tools` cycle is not). Each
 declared set's transitive **closure** is validated at load — unknown names,
@@ -814,12 +814,17 @@ a **user** tool's requests.
 **Egress reference**: an `allow_egress` entry (persisted or `--allow-egress`)
 that stands for other allowances: `tool:NAME` is that **user**-tier tool's own
 network requests as exact `tcp://HOST:PORT` hostname allowances, and `set:NAME`
-is an **Egress set**. Built-in and project tools are never resolved. `tool:NAME`
-implemented in #506; `set:NAME` designed, #511.
+is an **Egress set**. Both resolve against the user file's own `[[tools]]` and
+`[egress_sets]`; built-in and project tools are never resolved, and neither are
+project or built-in sets. `tool:NAME` implemented in #506, `set:NAME` in #511.
 
 **Egress set**: a named list of allowances and egress references in the
-**user** `[egress_sets]` table. Declaring one grants nothing; only a selecting
-`set:NAME` reference does. Designed, not implemented (#511).
+**user** `[egress_sets]` table, compiled at load into one closure with its
+nested sets and tools. Declaring one grants nothing; only a selecting `set:NAME`
+reference does. Every declared set is validated and compiled, used or not, under
+one bounded visit budget; a reference cycle is a config error. Notices and
+`doctor` attribute at entry level — the reference the user wrote, never the sets
+it nests (#511).
 
 **Persisted grant**: user-authored host authority in a user-tier `[network]`
 setting, read only from a verified file and merged per launch. CLI flags override

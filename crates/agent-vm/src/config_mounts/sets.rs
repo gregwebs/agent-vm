@@ -1040,6 +1040,7 @@ mod tests {
                     },
                 ),
                 mount_sets: values.sets.is_some(),
+                egress_sets: table.get("egress_sets").is_some(),
             },
         )
         .unwrap()
@@ -1422,6 +1423,10 @@ mod tests {
     #[test]
     fn top_level_keys_are_reserved_set_names() {
         for (key, value) in [
+            // #511 added the sixth top-level field, so a `[mount_sets]` key named
+            // `egress_sets` is reserved here too: the reservation is the schema's,
+            // not one table's.
+            ("egress_sets", "{}"),
             ("image", "\"agent-vm-standard:local\""),
             ("mounts", "[\"/h/x:/g:ro\"]"),
             ("mount_sets", "{}"),
