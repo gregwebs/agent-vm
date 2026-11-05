@@ -1043,6 +1043,7 @@ mod tests {
             },
         )
         .unwrap()
+        .authorized
         .expect("a mount field makes the file authority-bearing");
         f(&authorized, values)
     }

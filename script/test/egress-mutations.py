@@ -51,6 +51,7 @@ CONTROL_TIMEOUT = 240
 SRC = "crates/agent-vm/src/"
 TEST = "crates/agent-vm/tests/config_launch_driven.rs"
 EGRESS = SRC + "egress_policy.rs"
+REFERENCE = SRC + "egress_reference.rs"
 GRAMMAR = SRC + "egress_grammar.rs"
 NETWORK = SRC + "network.rs"
 FIXTURE = "script/test/lib/egress-fixtures.py"
@@ -242,10 +243,10 @@ def matrix():
     g4 = rust("rejected_allowance_is_refused_before_launch_state_is_created", LAUNCH)
     for name, suffix in (("project", ""), ("mounts", ".mounts"), ("secrets", ".secrets")):
         add("preparse-" + name, SRC + "run.rs",
-            "\n    let network_plan = crate::network::Plan::from_args(args.network, user_network)?;",
+            "\n    let network_plan = crate::network::Plan::from_args(args.network, user_network, user_tools)?;",
             '\n    let early = ProjectSession::for_cwd()?;\n    std::fs::create_dir_all(' +
             ('&early.state_dir' if not suffix else 'early.state_dir.with_extension("' + suffix[1:] + '")') +
-            ')?;\n    let network_plan = crate::network::Plan::from_args(args.network, user_network)?;', g4)
+            ')?;\n    let network_plan = crate::network::Plan::from_args(args.network, user_network, user_tools)?;', g4)
     add("valid-no-fork", TEST,
         '&["--mount", &mount, "--allow-egress", "api.example.com"],',
         '&["--allow-egress", "api.example.com"],', g4)
@@ -413,32 +414,30 @@ def matrix():
         gate, "verification results::")
     add("config-mounts-opt-out-ignored-launch", selection, opt_out, opt_out_mutant,
         rust("opt_out_keeps_cli_core_and_persisted_paths", MOUNTS))
+    # The union now iterates the resolved user tier and the resolved CLI entries;
+    # dropping the user side is the mutation (#506 moved it behind `ResolvedAllowances`).
     add("user-allowances-dropped", EGRESS,
-        "for entry in user_entries.iter().chain(&cli_entries) {",
-        "for entry in cli_entries.iter() {", rust("user_network_table_reaches_the_sandbox_policy", LAUNCH))
-    # The user arm now also builds the tool-field pointer, so the anchor is the
-    # `verify` call and its whole `map_err` chain up to the `?`. Keeping the
-    # pointer inside the mutation keeps the mutant compiling and the refusal text
-    # shape intact, so a control still fails on behaviour rather than on a syntax
-    # error.
-    verify_arm = ('FileTierKind::User => config_authority::verify(&read, triggers).map_err(|error| {\n'
-                  '            // A refusal caused by a tool\'s own field names that field first: the\n'
-                  '            // reader has to find the list they must review, and a file with no\n'
-                  '            // top-level `mounts` has nothing else pointing at it. The numeric site\n'
-                  '            // is echoed, never the tool\'s name or the list\'s contents.\n'
-                  '            let pointer = match first_tool_mounts {\n'
-                  '                Some(declaration) if raw.mounts.is_none() => {\n'
-                  '                    format!("tools[{declaration}].mounts: ")\n'
-                  '                }\n'
-                  '                _ => String::new(),\n'
-                  '            };\n'
-                  '            anyhow!(\n'
-                  '                "config: {}: {pointer}{error}",\n'
-                  '                crate::one_line::quoted_path(path)\n'
-                  '            )\n'
-                  '        })?,')
+        ".flat_map(ResolvedAllowances::allowances)",
+        ".flat_map(ResolvedAllowances::allowances).take(0)", rust("user_network_table_reaches_the_sandbox_policy", LAUNCH))
+    # #506's authority path. A reference must expand to real allowances, and a CLI
+    # reference must consume the verified read's verdict: dropping either is the
+    # kind of regression these two rows exist to kill.
+    add("reference-expansion-dropped", REFERENCE,
+        "    requests\n        .iter()\n        .map(|request| {",
+        "    requests\n        .iter()\n        .take(0)\n        .map(|request| {",
+        rust("expansion_is_port_pinned"))
+    add("reference-trust-unchecked", SRC + "config_authority.rs",
+        "    pub(crate) fn require(&self) -> Result<(), UntrustedConfig> {\n        self.verdict",
+        "    pub(crate) fn require(&self) -> Result<(), UntrustedConfig> {\n        Ok(())",
+        rust("cli_tool_reference_requires_a_verified_user_file", LAUNCH))
+    # The user arm now destructures `Verification` instead of yielding the token
+    # directly, so the anchor is the assignment of the verified token. Discarding
+    # it is the mutation: a present `[network]` then finds no token and load fails
+    # with the "authority was not measured" invariant, which is a behaviour change
+    # rather than a syntax error.
+    verify_arm = "            authorized = verification.authorized;"
     add("verify-always-skipped", SRC + "config.rs", verify_arm,
-        'FileTierKind::User => None,', rust("unsafe_user_network_is_refused_before_launch_state", LAUNCH))
+        "            authorized = None;", rust("unsafe_user_network_is_refused_before_launch_state", LAUNCH))
     # A present `mounts` key makes a user file authority-bearing, empty list
     # included: the trigger reads the *presence* of the field, so both mutants
     # below keep the field but drop its effect, and a symlinked `mounts = []`

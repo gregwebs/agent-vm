@@ -243,3 +243,58 @@ sentences that name them, grow from two to three.
 - The gaps are unchanged and now cover mount sets too: mode `0600` is not
   required, an immediate parent that is a symlink is followed, and ancestors,
   ACLs and replacement races remain accepted.
+
+## Amendment: CLI egress references keep the verified read's verdict (ADR-0059, #506)
+
+`--allow-egress tool:NAME` is a grant decided from the user file, but it is only
+known **after** argv is parsed, which is after `config::load` has dropped its
+`VerifiedRead`. Re-reading or re-measuring at launch would decide from a second
+observation, which Decision 2 rejects, and would run after the credential
+preflight. Pre-scanning argv would duplicate clap's parsing. So the read is
+measured whether or not an authority-bearing field is present, and its verdict is
+kept.
+
+- **Measurement runs on every user read.** `verify` no longer returns before
+  measuring. The cost is one extra `stat` of the immediate parent per user-config
+  load.
+- **Load-time refusal is still decided by presence, and only by presence.**
+  `authorized` is `Some` iff an authority-bearing field is present *and* the file
+  passed, exactly as before, and a refusal is returned only in that case. A
+  tools/image-only config therefore keeps loading — and keeping working through a
+  dotfile symlink — no matter what its facts are.
+- **The verdict is returned beside the token.** `Verification { authorized,
+  references }`, where `ReferenceTrust` owns the read's path and its
+  `Result<(), UntrustedConfig>`. Private fields, minted only by `verify`; the
+  test constructor is `#[cfg(test)]`. `config::read_file_tier` stores it on the
+  user tier's `TierContents` and `ConfigReport` exposes it as
+  `user_tool_requests()`, which the launch carries to `network::Plan::from_args`.
+- **A new subject.** `AuthoritySubject::EgressReference`, with label
+  `an egress reference`, object `[[tools]] network_requests`, and `without`
+  `an egress reference`. `AuthoritySubject::of` never returns it: a flag is not a
+  file field, so a presence trigger cannot be about one. The sentences come from
+  the unchanged `write_refusal`, so a symlinked tools-only file tells the reader:
+  *an egress reference requires config.toml to be a regular file, but it is
+  reached through a symbolic link; … review the [[tools]] network_requests before
+  trusting the file (a symlinked config without an egress reference still
+  works)*.
+- **One contract change in a test.** `verify_measures_nothing_without_triggers`
+  becomes `verify_never_refuses_without_triggers_and_keeps_the_reference_verdict`:
+  a world-writable directory that refuses still yields `Ok`, `authorized == None`,
+  and a retained `Refused { DirWritable, EgressReference }`. That is the new
+  contract, and it is the whole compatibility claim.
+
+| Association | Enforced by |
+|---|---|
+| A *successful* verdict exists only if `authority_refusal` passed on some read | **Types**: private fields; only `verify` mints one |
+| The verdict's file is the path of the read it measured | **Types**: set from `read.path()` inside `verify` |
+| A namespace holds only tools whose origin file equals the verdict's file | **Runtime filter** in `egress_reference::UserToolRequests::new` |
+| The tools came from the **same read** (bytes) as the verdict (facts) | **Single construction site only**: `read_file_tier`'s user arm builds both from one `VerifiedRead` and drops it. Two reads of one path carry equal `PathBuf`s, so types cannot tell them apart. This rests on review and on the `UserToolRequests::new` doc comment. |
+| Resolution never re-measures or re-reads | **Structure plus tests.** `UserToolRequests` is owned data and `egress_reference::resolve` does no I/O; the load-then-change tests fail if anyone re-measures or re-reads. Three facts are changed after the load, one per test: the reference's own path (symlink replaced by a regular `0600` file), the file's bytes (requests rewritten), and the directory's mode **in both directions** (private→world-writable must keep resolving; world-writable→private must keep refusing). A re-measure of only the directory is what the last one exists to catch. |
+
+**Persisted references cannot bypass trust.** They exist only inside `[network]`,
+which triggers verification: a file that fails is refused at load, and a file that
+passes carries `verdict: Ok(())`. `resolve` still runs the check — one path, no
+special case.
+
+The gaps are unchanged: mode `0600` is not required, an immediate parent that is a
+symlink is followed, and ancestors, ACLs and replacement races remain accepted.

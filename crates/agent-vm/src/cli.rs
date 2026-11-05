@@ -279,6 +279,10 @@ pub(crate) enum Dispatch {
         images: ConfiguredImages,
         /// Verified user authority captured before consuming the report, like images.
         user_network: Option<crate::user_network::UserNetwork>,
+        /// The user file's own tools as an egress-reference namespace, captured
+        /// the same way (ADR-0059). `None` when there is no user file, which is
+        /// why a CLI `tool:NAME` then reports "no user config file was found".
+        user_tools: Option<crate::egress_reference::UserToolRequests>,
         /// Verified user `mounts`, captured the same way (ADR-0046). `None` when
         /// the file declared none, so a launch can tell "no declarations" from
         /// "an empty list" — but both select nothing.
@@ -286,6 +290,22 @@ pub(crate) enum Dispatch {
         /// The launch options.
         args: Box<run::Args>,
     },
+}
+
+/// The launch-side values that must be read from the config report **before**
+/// `into_launch_catalog` consumes it, plus the image tiers every built-in may
+/// need.
+///
+/// Grouped rather than passed positionally: the four values are three `Option`s
+/// of *distinct* types plus one plain value, so a transposed pair would not
+/// compile — but a four-positional call site still makes a reader count
+/// arguments to learn what moves where. Naming each field at every site is the
+/// point; type safety is not the reason.
+pub(crate) struct CapturedConfig {
+    images: ConfiguredImages,
+    user_network: Option<crate::user_network::UserNetwork>,
+    user_tools: Option<crate::egress_reference::UserToolRequests>,
+    user_mounts: Option<crate::config_mounts::UserMounts>,
 }
 
 impl Dispatch {
@@ -367,7 +387,7 @@ where
         crate::test_env::guard_held(),
         "parsing argv in a test requires holding the environment guard"
     );
-    let (catalog, images, user_network, user_mounts) = match config {
+    let (catalog, captured) = match config {
         // A dangling `tools` reference is *user* input, so it must degrade to
         // the deferred-error path (ADR-0015) rather than `?`-propagate and take
         // `doctor`/`--help`/`clipboard` down with it. The readable `image` is
@@ -375,19 +395,39 @@ where
         Ok(report) => {
             let images = report.images().clone();
             let user_network = report.user_network().cloned();
+            let user_tools = report.user_tool_requests().cloned();
             let user_mounts = report.user_mounts().cloned();
             match report.into_launch_catalog() {
-                Ok(catalog) => (Catalog::Ready(catalog), images, user_network, user_mounts),
-                Err(error) => (Catalog::Broken(error), images, None, None),
+                Ok(catalog) => (
+                    Catalog::Ready(catalog),
+                    CapturedConfig {
+                        images,
+                        user_network,
+                        user_tools,
+                        user_mounts,
+                    },
+                ),
+                Err(error) => (
+                    Catalog::Broken(error),
+                    CapturedConfig {
+                        images,
+                        user_network: None,
+                        user_tools: None,
+                        user_mounts: None,
+                    },
+                ),
             }
         }
         // The configured tiers are unknown, so the recovery builtins fall back
         // to `--image`/env or the default boot image (D7).
         Err(error) => (
             Catalog::Broken(error),
-            ConfiguredImages::default(),
-            None,
-            None,
+            CapturedConfig {
+                images: ConfiguredImages::default(),
+                user_network: None,
+                user_tools: None,
+                user_mounts: None,
+            },
         ),
     };
 
@@ -499,15 +539,7 @@ where
         // it must not take one (not even shell's fallback) and must not consult
         // the catalog for anything but its health.
         (Some((name, sub)), catalog) if name == crate::launch_target::DIRECT_RUN_VERB => {
-            direct_dispatch(
-                &argv,
-                sub,
-                catalog,
-                &matches,
-                images,
-                user_network,
-                user_mounts,
-            )
+            direct_dispatch(&argv, sub, catalog, &matches, captured)
         }
         // The catalog is authoritative (checked first) so a future built-in
         // added without updating `RESERVED_TOOL_NAMES` fails a test rather
@@ -519,9 +551,10 @@ where
                     args.image.reconcile(&matches);
                     reject_direct_terminal_options(&mut command, &matches, &args)?;
                     Ok(Dispatch::Launch {
-                        images,
-                        user_network,
-                        user_mounts,
+                        images: captured.images,
+                        user_network: captured.user_network,
+                        user_tools: captured.user_tools,
+                        user_mounts: captured.user_mounts,
                         args: Box::new(args),
                         target: LaunchTarget::Tool {
                             entry: Box::new(entry),
@@ -548,7 +581,7 @@ where
                     Ok(Dispatch::Builtin {
                         cmd,
                         catalog: Catalog::Ready(catalog),
-                        images,
+                        images: captured.images,
                     })
                 }
             }
@@ -565,7 +598,7 @@ where
                     Ok(Dispatch::Builtin {
                         cmd: cli.cmd,
                         catalog: Catalog::Broken(config_error),
-                        images,
+                        images: captured.images,
                     })
                 }
                 Err(_) => Err(config_error_with_hint(&config_error, name)),
@@ -586,9 +619,7 @@ fn direct_dispatch(
     sub: &clap::ArgMatches,
     catalog: Catalog,
     matches: &clap::ArgMatches,
-    images: ConfiguredImages,
-    user_network: Option<crate::user_network::UserNetwork>,
-    user_mounts: Option<crate::config_mounts::UserMounts>,
+    captured: CapturedConfig,
 ) -> Result<Dispatch> {
     let vector = after_raw_verb(
         argv,
@@ -630,9 +661,10 @@ fn direct_dispatch(
                 command: direct,
                 terminal,
             },
-            images,
-            user_network,
-            user_mounts,
+            images: captured.images,
+            user_network: captured.user_network,
+            user_tools: captured.user_tools,
+            user_mounts: captured.user_mounts,
             args: Box::new(args),
         }),
     }
@@ -2142,6 +2174,55 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// ADR-0059: both launch routes carry the user file's own tools, so a CLI
+    /// `tool:NAME` resolves the same way through `run`/`--` as through a catalog
+    /// verb. A broken catalog carries `None` with the rest of the launch state.
+    #[test]
+    fn parse_from_carries_user_tools_into_a_launch() {
+        let _env = clear_launch_env();
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("user.toml");
+        std::fs::write(
+            &file,
+            "[[tools]]\nname = \"fetcher\"\ncommand = \"fetcher\"\nnetwork_requests = [\"a.example\"]\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = || crate::config::ConfigPaths {
+            user: Some(file.clone()),
+            project: dir.path().join("absent.toml"),
+            home: None,
+        };
+        let expected = crate::config::load(&paths())
+            .unwrap()
+            .user_tool_requests()
+            .cloned();
+        assert!(expected.is_some());
+        for tokens in [
+            vec!["agent-vm", "shell"],
+            vec!["agent-vm", "run", "probe"],
+            vec!["agent-vm", "--", "probe"],
+        ] {
+            let Dispatch::Launch { user_tools, .. } =
+                parse_from(argv_of(&tokens), crate::config::load(&paths())).unwrap()
+            else {
+                panic!("expected a launch: {tokens:?}")
+            };
+            assert_eq!(user_tools, expected, "{tokens:?}");
+        }
+        // No user file at all: `None`, which is what makes a CLI reference answer
+        // "no user config file was found".
+        std::fs::write(&file, "[[tools]]\nname = \"x\"\ncommand = \"x\"\n").unwrap();
+        let Dispatch::Launch { user_tools, .. } =
+            parse_from(["agent-vm", "shell"], crate::config::load(&paths())).unwrap()
+        else {
+            panic!("launch")
+        };
+        assert!(user_tools.is_some(), "a tools-only file still supplies one");
     }
 
     #[test]

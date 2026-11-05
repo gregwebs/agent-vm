@@ -58,6 +58,8 @@ pub(crate) struct Args {
     /// Numeric grants are address-wide. Hostname grants are TLS-only, SNI- and DNS-verified,
     /// and refused with a host HTTP proxy. Bare hostnames use intercepted ports (443 by default).
     /// Use brackets for a port on an IPv6 address or CIDR.
+    /// `tool:NAME` grants a user-config tool's own `network_requests`, each as
+    /// `tcp://HOST:PORT`.
     #[arg(
         long = "allow-egress",
         value_name = "[tcp://|udp://]IP|CIDR[:PORT] | [tcp://]HOST[:PORT]",
@@ -210,13 +212,17 @@ impl Plan {
     pub(crate) fn from_args(
         args: Args,
         user: Option<&crate::user_network::UserNetwork>,
+        user_tools: Option<&crate::egress_reference::UserToolRequests>,
     ) -> Result<Self> {
-        Self::from_args_with_proxy_lookup(args, user, |variable| std::env::var(variable).ok())
+        Self::from_args_with_proxy_lookup(args, user, user_tools, |variable| {
+            std::env::var(variable).ok()
+        })
     }
 
     fn from_args_with_proxy_lookup(
         args: Args,
         user: Option<&crate::user_network::UserNetwork>,
+        user_tools: Option<&crate::egress_reference::UserToolRequests>,
         lookup: impl Fn(&str) -> Option<String>,
     ) -> Result<Self> {
         let publish_ports = parse_publish_args(&args.publish).context("parsing --publish")?;
@@ -228,6 +234,7 @@ impl Plan {
                 allowances: &args.allow_egress,
             },
             user.map(crate::user_network::UserNetwork::egress),
+            user_tools,
         )?;
         let disabled = lookup("AGENT_VM_PROXY_FROM_ENV").is_some_and(|value| {
             matches!(
@@ -237,18 +244,37 @@ impl Plan {
         });
         let observation = observe_host_proxy(lookup);
         if egress.has_hostnames() && observation.connector_used {
+            // The parenthetical names *which* hostnames are in play, and, when an
+            // egress reference granted any of them, names the reference: removing
+            // an entry from `[network]` also removes its expansion (ADR-0059 R19).
+            // With no reference the three sentences are the pre-#506 bytes.
             use crate::egress_policy::HostnameAuthority;
-            match egress.hostname_authority() {
-                Some(HostnameAuthority::Saved(file)) => anyhow::bail!(
-                    "{HOSTNAME_PROXY_REFUSAL} (persisted hostname grants from \"{}\" [network] apply to every launch; remove them there)",
-                    crate::one_line::path(file)
+            let suffix = match egress.hostname_authority() {
+                Some(HostnameAuthority::Cli { references }) if references.is_empty() => {
+                    String::new()
+                }
+                Some(HostnameAuthority::Cli { references }) => format!(
+                    " (hostnames from --allow-egress{} apply to this launch; stop passing them)",
+                    including_via(&references)
                 ),
-                Some(HostnameAuthority::SavedAndCli(file)) => anyhow::bail!(
-                    "{HOSTNAME_PROXY_REFUSAL} (hostnames from --allow-egress apply to this launch; persisted hostname grants from \"{}\" [network] apply to every launch; remove the persisted ones there and stop passing --allow-egress)",
-                    crate::one_line::path(file)
+                Some(HostnameAuthority::Saved { file, references }) => format!(
+                    " (persisted hostname grants from \"{}\" [network]{} apply to every launch; remove them there)",
+                    crate::one_line::path(file),
+                    including_via(&references)
                 ),
-                _ => anyhow::bail!(HOSTNAME_PROXY_REFUSAL),
-            }
+                Some(HostnameAuthority::SavedAndCli {
+                    file,
+                    saved_references,
+                    cli_references,
+                }) => format!(
+                    " (hostnames from --allow-egress{} apply to this launch; persisted hostname grants from \"{}\" [network]{} apply to every launch; remove the persisted ones there and stop passing --allow-egress)",
+                    including_via(&cli_references),
+                    crate::one_line::path(file),
+                    including_via(&saved_references)
+                ),
+                None => String::new(),
+            };
+            anyhow::bail!("{HOSTNAME_PROXY_REFUSAL}{suffix}");
         }
         let proxy_from_env = observation.connector_used && !disabled;
         let proxy_not_applied_reason = if disabled {
@@ -557,6 +583,19 @@ fn parse_port(entry: &str, field: &str, s: &str) -> Result<u16> {
 }
 
 const HOSTNAME_PROXY_REFUSAL: &str = "hostname allowances cannot be enforced through the host HTTP proxy (HTTPS_PROXY/HTTP_PROXY/ALL_PROXY): the proxy resolves the name, so the address scope is not checked; unset the proxy, use an IP/CIDR allowance, or use --allow-internet-egress";
+
+/// The reference clause of a proxy refusal, or nothing when the tier named no
+/// reference — which is what keeps the pre-#506 sentences byte-identical.
+fn including_via(references: &[&crate::egress_reference::EgressReference]) -> String {
+    if references.is_empty() {
+        String::new()
+    } else {
+        format!(
+            ", including via {},",
+            crate::egress_reference::render_list(references)
+        )
+    }
+}
 struct HostProxyObservation {
     notice: Option<ProxyNotice>,
     connector_used: bool,
@@ -647,7 +686,8 @@ mod tests {
     mod hostname_tests;
 
     fn plan(input: Args) -> Plan {
-        Plan::from_args_with_proxy_lookup(input, None, |_| None).expect("valid networking plan")
+        Plan::from_args_with_proxy_lookup(input, None, None, |_| None)
+            .expect("valid networking plan")
     }
 
     fn test_builder(name: &str) -> SandboxBuilder {
@@ -673,7 +713,7 @@ mod tests {
             },
             &["10.0.0.5"],
         );
-        let plan = Plan::from_args_with_proxy_lookup(args(), Some(&user), |_| None).unwrap();
+        let plan = Plan::from_args_with_proxy_lookup(args(), Some(&user), None, |_| None).unwrap();
         let config = plan
             .apply_to(test_builder("saved-grants"))
             .build()
@@ -702,7 +742,7 @@ mod tests {
             Some(" FaLsE "),
             Some(" OFF "),
         ] {
-            let plan = Plan::from_args_with_proxy_lookup(args(), None, |v| match v {
+            let plan = Plan::from_args_with_proxy_lookup(args(), None, None, |v| match v {
                 "HTTPS_PROXY" => Some("http://127.0.0.1:9".into()),
                 "AGENT_VM_PROXY_FROM_ENV" => opt_out.map(str::to_owned),
                 _ => None,
@@ -726,7 +766,7 @@ mod tests {
                 ));
                 let mut input = args();
                 input.allow_egress.push("api.example.com".into());
-                let error = Plan::from_args_with_proxy_lookup(input, None, |v| match v {
+                let error = Plan::from_args_with_proxy_lookup(input, None, None, |v| match v {
                     "HTTPS_PROXY" => Some("http://127.0.0.1:9".into()),
                     "AGENT_VM_PROXY_FROM_ENV" => opt_out.map(str::to_owned),
                     _ => None,
@@ -743,7 +783,7 @@ mod tests {
         }
 
         // A wildcard NO_PROXY disables the connector.
-        let plan = Plan::from_args_with_proxy_lookup(args(), None, |v| match v {
+        let plan = Plan::from_args_with_proxy_lookup(args(), None, None, |v| match v {
             "HTTPS_PROXY" => Some("http://127.0.0.1:9".into()),
             "NO_PROXY" => Some("*".into()),
             _ => None,
@@ -759,7 +799,7 @@ mod tests {
         );
 
         // An unsupported scheme is never selected by the connector either.
-        let plan = Plan::from_args_with_proxy_lookup(args(), None, |v| {
+        let plan = Plan::from_args_with_proxy_lookup(args(), None, None, |v| {
             (v == "HTTPS_PROXY").then(|| "socks5://127.0.0.1:1080".into())
         })
         .unwrap();
@@ -780,7 +820,7 @@ mod tests {
             Default::default(),
             &["api.example.com"],
         );
-        let error = Plan::from_args_with_proxy_lookup(args(), Some(&user), |v| {
+        let error = Plan::from_args_with_proxy_lookup(args(), Some(&user), None, |v| {
             (v == "HTTPS_PROXY").then(|| "http://127.0.0.1:9".into())
         })
         .unwrap_err()
@@ -797,8 +837,9 @@ mod tests {
             &["10.0.0.5"],
         );
         assert!(
-            Plan::from_args_with_proxy_lookup(args(), Some(&numeric), |v| (v == "HTTPS_PROXY")
-                .then(|| "http://127.0.0.1:9".into()))
+            Plan::from_args_with_proxy_lookup(args(), Some(&numeric), None, |v| (v
+                == "HTTPS_PROXY")
+                .then(|| "http://127.0.0.1:9".into()),)
             .is_ok()
         );
     }
@@ -832,7 +873,7 @@ mod tests {
                 "stop passing --allow-egress)",
             ),
         ] {
-            let error = Plan::from_args_with_proxy_lookup(input, Some(user), proxy)
+            let error = Plan::from_args_with_proxy_lookup(input, Some(user), None, proxy)
                 .unwrap_err()
                 .to_string();
             assert!(
@@ -850,7 +891,7 @@ mod tests {
         let mut cli_only = args();
         cli_only.allow_egress = vec!["cli.example.com".into()];
         assert_eq!(
-            Plan::from_args_with_proxy_lookup(cli_only, None, proxy)
+            Plan::from_args_with_proxy_lookup(cli_only, None, None, proxy,)
                 .unwrap_err()
                 .to_string(),
             HOSTNAME_PROXY_REFUSAL
@@ -862,7 +903,7 @@ mod tests {
         );
         let mut both = args();
         both.allow_egress = vec!["cli.example.com".into()];
-        let error = Plan::from_args_with_proxy_lookup(both, Some(&user), proxy)
+        let error = Plan::from_args_with_proxy_lookup(both, Some(&user), None, proxy)
             .unwrap_err()
             .to_string();
         assert_eq!(
@@ -874,8 +915,8 @@ mod tests {
     }
 
     fn notice_output(input: Args, proxy: impl Fn(&str) -> Option<String>) -> String {
-        let plan =
-            Plan::from_args_with_proxy_lookup(input, None, proxy).expect("valid networking plan");
+        let plan = Plan::from_args_with_proxy_lookup(input, None, None, proxy)
+            .expect("valid networking plan");
         let mut output = Vec::new();
         plan.emit_launch_notices_to(&mut output)
             .expect("notice output");
@@ -931,6 +972,7 @@ mod tests {
                     ..args()
                 },
                 None,
+                None,
                 |_| None,
             )
             .expect_err("invalid publish input is rejected");
@@ -945,6 +987,7 @@ mod tests {
                 allow_egress: vec!["udp://not-an-ip.example".into()],
                 ..args()
             },
+            None,
             None,
             |_| None,
         )
@@ -1407,7 +1450,7 @@ mod tests {
                 "unsafe output: {output}"
             );
         }
-        let plan = Plan::from_args_with_proxy_lookup(args(), None, |variable| {
+        let plan = Plan::from_args_with_proxy_lookup(args(), None, None, |variable| {
             (variable == "https_proxy").then(|| "http:////alice:hunter2@proxy.example:3128".into())
         })
         .expect("valid plan");
@@ -1571,5 +1614,152 @@ mod tests {
         assert_eq!(paths.control, canonical.join("control.sock"));
         assert_eq!(paths.legacy_agent, legacy);
         assert_eq!(paths.legacy_control, legacy.with_extension("control.sock"));
+    }
+
+    /// A24: with a persisted reference the refusal names it; without one the
+    /// three pre-#506 sentences are byte-identical.
+    ///
+    /// Every expectation here is a **complete literal**, independent of
+    /// [`HOSTNAME_PROXY_REFUSAL`]: an expectation built from the production
+    /// constant moves with it, so mutating the base sentence would leave the
+    /// test green. Three new sentences, and the three old ones beside them.
+    #[test]
+    fn hostname_proxy_refusal_names_references() {
+        const CLI_ONLY: &str = "hostname allowances cannot be enforced through the host HTTP proxy (HTTPS_PROXY/HTTP_PROXY/ALL_PROXY): the proxy resolves the name, so the address scope is not checked; unset the proxy, use an IP/CIDR allowance, or use --allow-internet-egress (hostnames from --allow-egress, including via tool:codex, apply to this launch; stop passing them)";
+        const CLI_ONLY_NO_REFERENCE: &str = "hostname allowances cannot be enforced through the host HTTP proxy (HTTPS_PROXY/HTTP_PROXY/ALL_PROXY): the proxy resolves the name, so the address scope is not checked; unset the proxy, use an IP/CIDR allowance, or use --allow-internet-egress";
+        const PERSISTED_ONLY: &str = "hostname allowances cannot be enforced through the host HTTP proxy (HTTPS_PROXY/HTTP_PROXY/ALL_PROXY): the proxy resolves the name, so the address scope is not checked; unset the proxy, use an IP/CIDR allowance, or use --allow-internet-egress (persisted hostname grants from \"/home/u/.config/agent-vm/config.toml\" [network], including via tool:codex, apply to every launch; remove them there)";
+        const PERSISTED_ONLY_NO_REFERENCE: &str = "hostname allowances cannot be enforced through the host HTTP proxy (HTTPS_PROXY/HTTP_PROXY/ALL_PROXY): the proxy resolves the name, so the address scope is not checked; unset the proxy, use an IP/CIDR allowance, or use --allow-internet-egress (persisted hostname grants from \"/home/u/.config/agent-vm/config.toml\" [network] apply to every launch; remove them there)";
+        const BOTH: &str = "hostname allowances cannot be enforced through the host HTTP proxy (HTTPS_PROXY/HTTP_PROXY/ALL_PROXY): the proxy resolves the name, so the address scope is not checked; unset the proxy, use an IP/CIDR allowance, or use --allow-internet-egress (hostnames from --allow-egress, including via tool:codex, apply to this launch; persisted hostname grants from \"/home/u/.config/agent-vm/config.toml\" [network], including via tool:codex, apply to every launch; remove the persisted ones there and stop passing --allow-egress)";
+        const BOTH_NO_REFERENCE: &str = "hostname allowances cannot be enforced through the host HTTP proxy (HTTPS_PROXY/HTTP_PROXY/ALL_PROXY): the proxy resolves the name, so the address scope is not checked; unset the proxy, use an IP/CIDR allowance, or use --allow-internet-egress (hostnames from --allow-egress apply to this launch; persisted hostname grants from \"/home/u/.config/agent-vm/config.toml\" [network] apply to every launch; remove the persisted ones there and stop passing --allow-egress)";
+        let proxy = |v: &str| (v == "HTTPS_PROXY").then(|| "http://127.0.0.1:9".into());
+        let tools = crate::egress_reference::test_support::user_tools(
+            std::path::Path::new("/home/u/.config/agent-vm/config.toml"),
+            &[("codex", &["api.openai.com"])],
+        );
+        let user = crate::user_network::UserNetwork::for_test_with_tools(
+            "/home/u/.config/agent-vm/config.toml",
+            Default::default(),
+            &["tool:codex"],
+            &tools,
+        );
+        let error = Plan::from_args_with_proxy_lookup(args(), Some(&user), Some(&tools), proxy)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, PERSISTED_ONLY);
+
+        // The literal-only sentence is unchanged, byte for byte.
+        let literal = crate::user_network::UserNetwork::for_test(
+            "/home/u/.config/agent-vm/config.toml",
+            Default::default(),
+            &["api.example.com"],
+        );
+        let error = Plan::from_args_with_proxy_lookup(args(), Some(&literal), None, proxy)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, PERSISTED_ONLY_NO_REFERENCE);
+
+        // A CLI reference, alone and alongside the persisted one.
+        let mut reference = args();
+        reference.allow_egress = vec!["tool:codex".into()];
+        let error = Plan::from_args_with_proxy_lookup(reference, None, Some(&tools), proxy)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, CLI_ONLY);
+
+        let mut both = args();
+        both.allow_egress = vec!["tool:codex".into()];
+        let error = Plan::from_args_with_proxy_lookup(both, Some(&user), Some(&tools), proxy)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, BOTH);
+
+        // The three pre-#506 sentences, also pinned independently.
+        let mut cli_literal = args();
+        cli_literal.allow_egress = vec!["cli.example.com".into()];
+        let error = Plan::from_args_with_proxy_lookup(cli_literal, None, None, proxy)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, CLI_ONLY_NO_REFERENCE);
+        let mut both_literal = args();
+        both_literal.allow_egress = vec!["cli.example.com".into()];
+        let error = Plan::from_args_with_proxy_lookup(both_literal, Some(&literal), None, proxy)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, BOTH_NO_REFERENCE);
+    }
+
+    /// A14 (CLI half) and A20: the CLI's own `#N` rendering of a *resolution*
+    /// error, for a tool that declares no requests, and of UNKNOWN — each with a
+    /// sentinel inside the name, so a message that echoed it would fail here.
+    /// The text is pinned as an independent literal, not as the production
+    /// constant.
+    #[test]
+    fn cli_reference_resolution_errors_keep_their_position_and_echo_nothing() {
+        const SENTINEL: &str = "sk-live-SENTINEL-506";
+        let tools = crate::egress_reference::test_support::user_tools(
+            std::path::Path::new("/home/u/.config/agent-vm/config.toml"),
+            &[("no-requests", &[]), ("has-requests", &["a.example"])],
+        );
+        for (entry, expected) in [
+            (
+                "tool:no-requests",
+                "--allow-egress #2: an egress reference must name a tool that declares network_requests; this tool declares none, so the reference would grant nothing",
+            ),
+            (
+                "tool:sk-live-SENTINEL-506",
+                "--allow-egress #2: an egress reference must name a tool declared in the user config's own [[tools]]; built-in and project tools are never used (`agent-vm tools print` prints the shipped tools to copy there)",
+            ),
+        ] {
+            let mut input = args();
+            input.allow_egress = vec!["api.example.com".into(), entry.into()];
+            let error = Plan::from_args_with_proxy_lookup(input, None, Some(&tools), |_| None)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, expected);
+            assert!(!error.contains(SENTINEL), "the name was echoed: {error}");
+            assert!(
+                !error.contains("no-requests"),
+                "the name was echoed: {error}"
+            );
+        }
+        // The same rows reached through a real namespace confirm the tool that
+        // *does* have requests is not the one refused.
+        let mut input = args();
+        input.allow_egress = vec!["tool:has-requests".into()];
+        Plan::from_args_with_proxy_lookup(input, None, Some(&tools), |_| None)
+            .expect("a tool with requests resolves on the flag");
+    }
+
+    /// A19, CLI half: entry-syntax errors precede resolution errors, and within
+    /// each class the first failing entry wins. `#2` is reported even though `#1`
+    /// is also wrong.
+    #[test]
+    fn cli_entry_syntax_errors_precede_resolution_errors() {
+        let tools = crate::egress_reference::test_support::user_tools(
+            std::path::Path::new("/home/u/.config/agent-vm/config.toml"),
+            &[],
+        );
+        let mut input = args();
+        input.allow_egress = vec!["tool:nope".into(), "udp://h.example".into()];
+        let error = Plan::from_args_with_proxy_lookup(input, None, Some(&tools), |_| None)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            format!(
+                "--allow-egress #2: {}",
+                crate::egress_grammar::AllowanceError::UdpHostname
+            )
+        );
+        // And the resolution error keeps its own one-based position.
+        let mut input = args();
+        input.allow_egress = vec!["api.example.com".into(), "tool:nope".into()];
+        let error = Plan::from_args_with_proxy_lookup(input, None, Some(&tools), |_| None)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "--allow-egress #2: an egress reference must name a tool declared in the user config's own [[tools]]; built-in and project tools are never used (`agent-vm tools print` prints the shipped tools to copy there)"
+        );
     }
 }

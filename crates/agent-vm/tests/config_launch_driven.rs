@@ -13312,3 +13312,547 @@ fn a_real_secretspec_serve_round_trip() {
         "a value reached the audit log"
     );
 }
+
+// ---------------------------------------------------------------------------
+// ADR-0059: `tool:NAME` egress references
+// ---------------------------------------------------------------------------
+
+/// The one reference-refusal sentence every route prints, so a route that
+/// reworded it would fail here rather than drift.
+const EGRESS_REFERENCE_MALFORMED: &str = "an egress reference must be tool:NAME with a valid tool name (no whitespace, control characters or '/', not starting with '-', and not `.`, `..`, `*` or a reserved subcommand name)";
+const EGRESS_REFERENCE_UNKNOWN: &str = "an egress reference must name a tool declared in the user config's own [[tools]]; built-in and project tools are never used (`agent-vm tools print` prints the shipped tools to copy there)";
+const EGRESS_REFERENCE_NO_CONFIG: &str = "an egress reference resolves only against the user config's own [[tools]], and no user config file was found";
+
+/// A user `[[tools]]` declaration with the given requests.
+fn requests_tool(name: &str, requests: &[&str]) -> String {
+    let list = requests
+        .iter()
+        .map(|request| format!("\"{request}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[[tools]]\nname = \"{name}\"\ncommand = \"{name}\"\nnetwork_requests = [{list}]\n")
+}
+
+/// The `network.policy.rules` domains of a launch, as `(name, ports)`.
+fn domain_rules_of(config: &serde_json::Value) -> Vec<(String, Vec<u64>)> {
+    config["network"]["policy"]["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|rule| {
+            let name = rule["destination"]["domain"].as_str()?;
+            let ports = rule["ports"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|port| port["start"].as_u64().unwrap())
+                .collect();
+            Some((name.to_owned(), ports))
+        })
+        .collect()
+}
+
+/// A8, A22(i) and A28: a persisted reference expands to exact host:port grants,
+/// its notice names the reference, the report says the requests are covered, and
+/// a bare CLI name still takes every intercepted port.
+#[test]
+fn persisted_tool_reference_grants_exact_hostnames() {
+    let h = Harness::warm();
+    h.write_user(&format!(
+        "{}[network]\nallow_egress = [\"tool:fetcher\"]\n",
+        requests_tool("fetcher", &["api.example.com", "git.example.com:8443"])
+    ));
+    let out = h.launch("fetcher", &["--allow-egress", "bare.example.com"]);
+    let config = normalized_config(&h, &out);
+    assert_eq!(
+        domain_rules_of(&config),
+        [
+            ("api.example.com".to_owned(), vec![443]),
+            ("git.example.com".to_owned(), vec![8443]),
+            ("bare.example.com".to_owned(), vec![443, 8443]),
+        ]
+    );
+    assert_eq!(
+        config["network"]["tls"]["intercepted_ports"],
+        serde_json::json!([443, 8443])
+    );
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(
+            "==> Egress policy: allowing TLS to api.example.com on ports 443 (persisted grants via tool:fetcher)"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "==> Egress policy: allowing TLS to bare.example.com on ports 443, 8443 (--allow-egress)"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("==> Tool network requests (user config): all 2 covered by this launch's"),
+        "{stderr}"
+    );
+}
+
+/// A10: the flag comes **before** the verb. Resolution reads only the user
+/// file's own tools, so the project's launchable `fetcher` is never resolved —
+/// and the failure happens before any launch state exists.
+#[test]
+fn tool_reference_never_resolves_a_project_tool_even_as_the_launch_verb() {
+    let h = Harness::warm();
+    h.write_user("# tools-only\n");
+    h.write_project(&requests_tool("fetcher", &["p.example"]));
+    let out = h.launch("fetcher", &["--allow-egress", "tool:fetcher"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(&format!("--allow-egress #1: {EGRESS_REFERENCE_UNKNOWN}")),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("p.example"), "{stderr}");
+    assert!(!stderr.contains(CONFIG_MARKER), "{stderr}");
+    assert!(
+        !h.home_root
+            .join(".config/agent-vm/image-pins.json")
+            .exists()
+    );
+    assert!(!h.state_root.join(project_hash(&h.project_root)).exists());
+    assert!(
+        h.msb_log().lines().all(|line| line == "--version"),
+        "a refused launch makes no runtime call beyond the identity probe: {}",
+        h.msb_log()
+    );
+}
+
+/// A18: no user config at all is its own answer, not an unknown name.
+#[test]
+fn a_cli_reference_without_a_user_config_says_so() {
+    let h = Harness::warm();
+    let out = h.launch("shell", &["--allow-egress", "tool:x"]);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(&format!("--allow-egress #1: {EGRESS_REFERENCE_NO_CONFIG}")),
+        "{stderr}"
+    );
+    assert!(!h.state_root.join(project_hash(&h.project_root)).exists());
+}
+
+/// A15: a tools-only user config reached through a dotfile symlink keeps working
+/// when no reference is used — with and without a plain hostname allowance — and
+/// refuses a reference with the file's own reason, before any loopback authority
+/// it declares can be used.
+#[test]
+fn cli_tool_reference_requires_a_verified_user_file() {
+    let tools_only = requests_tool("x", &["a.example"]);
+    for options in [&[][..], &["--allow-egress", "api.example.com"][..]] {
+        let h = Harness::warm();
+        let target = h.home_root.join(".config/agent-vm/dotfile");
+        write(&target, &tools_only);
+        h.symlink_user_config(&target);
+        let out = h.launch("shell", options);
+        assert!(
+            stderr_of(&out).contains(CONFIG_MARKER),
+            "a symlinked tools-only config must still launch with {options:?}: {}",
+            stderr_of(&out)
+        );
+    }
+
+    let h = Harness::warm();
+    let target = h.home_root.join(".config/agent-vm/dotfile");
+    write(&target, &tools_only);
+    h.symlink_user_config(&target);
+    let out = h.launch("shell", &["--allow-egress", "tool:x"]);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(&format!(
+            "--allow-egress #1: config: \"{}\": an egress reference requires config.toml to be a regular file, but it is reached through a symbolic link; its target may be writable by a guest or project, so review the [[tools]] network_requests before trusting the file (a symlinked config without an egress reference still works)",
+            h.user_config().display()
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(CONFIG_MARKER), "{stderr}");
+    assert!(!h.state_root.join(project_hash(&h.project_root)).exists());
+
+    // (c) the same bytes as a regular, singly-linked `0600` file.
+    let h = Harness::warm();
+    h.write_user(&tools_only);
+    let out = h.launch("shell", &["--allow-egress", "tool:x"]);
+    let config = normalized_config(&h, &out);
+    assert_eq!(
+        domain_rules_of(&config),
+        [("a.example".to_owned(), vec![443])]
+    );
+}
+
+/// A16: a group- or other-writable tools-only file loads, and refuses only a
+/// reference — naming the mode. Two hard links are the second shape.
+#[test]
+fn group_writable_or_linked_tools_only_config_refuses_only_references() {
+    let tools_only = requests_tool("x", &["a.example"]);
+    // Without a reference the file loads exactly as before.
+    let h = Harness::warm();
+    h.write_user_mode(&tools_only, 0o664);
+    let out = h.launch("shell", &[]);
+    assert!(
+        stderr_of(&out).contains(CONFIG_MARKER),
+        "{}",
+        stderr_of(&out)
+    );
+
+    let h = Harness::warm();
+    h.write_user_mode(&tools_only, 0o664);
+    let out = h.launch("shell", &["--allow-egress", "tool:x"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr_of(&out).contains(
+            "an egress reference refuses a group- or other-writable config.toml; a guest or another account may have written its [[tools]] network_requests, so review the [[tools]] network_requests before trusting the file (fixing the mode does not establish authorship)"
+        ),
+        "{}",
+        stderr_of(&out)
+    );
+
+    let h = Harness::warm();
+    h.write_user_mode(&tools_only, 0o600);
+    let alias = h.user_config().with_file_name("alias.toml");
+    std::fs::hard_link(h.user_config(), &alias).unwrap();
+    let out = h.launch("shell", &["--allow-egress", "tool:x"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr_of(&out).contains(
+            "an egress reference refuses a config.toml with 2 hard links; another name for it may be guest- or project-writable, so review the [[tools]] network_requests before trusting the file"
+        ),
+        "{}",
+        stderr_of(&out)
+    );
+}
+
+/// A33: every direct spelling accepts, expands and refuses a reference exactly
+/// like a catalog launch. Only the exit status differs: 125 for a direct route,
+/// 1 for the catalog counterpart.
+#[test]
+fn direct_routes_accept_and_refuse_references_like_catalog_launches() {
+    let user_config = format!(
+        "{}[network]\nallow_egress = [\"tool:fetcher\"]\n",
+        requests_tool("fetcher", &["api.example.com", "git.example.com:8443"])
+    );
+    for form in DIRECT_FORMS {
+        // Positive: the expansion reaches policy.
+        let h = Harness::warm();
+        h.write_user(&user_config);
+        let out = h.direct(DirectInvocation {
+            form,
+            options: &["--image", BOGUS_IMAGE],
+            vector: &["probe"],
+            envs: &[],
+        });
+        let config = normalized_config(&h, &out);
+        assert_eq!(
+            domain_rules_of(&config),
+            [
+                ("api.example.com".to_owned(), vec![443]),
+                ("git.example.com".to_owned(), vec![8443]),
+            ],
+            "{form:?}"
+        );
+    }
+
+    // Negative: malformed, unknown, and an untrusted file. The message matches
+    // the catalog launch; only the status differs.
+    for (options, reason) in [
+        (
+            &["--allow-egress", "tool:-x"][..],
+            format!("--allow-egress #1: {EGRESS_REFERENCE_MALFORMED}"),
+        ),
+        (
+            &["--allow-egress", "tool:nope"][..],
+            format!("--allow-egress #1: {EGRESS_REFERENCE_UNKNOWN}"),
+        ),
+    ] {
+        for form in DIRECT_FORMS {
+            let h = Harness::warm();
+            h.write_user(&requests_tool("x", &["a.example"]));
+            let mut with_image = vec!["--image", BOGUS_IMAGE];
+            with_image.extend_from_slice(options);
+            let out = h.direct(DirectInvocation {
+                form,
+                options: &with_image,
+                vector: &["probe"],
+                envs: &[],
+            });
+            assert_eq!(out.status.code(), Some(125), "{form:?} {options:?}");
+            assert!(stderr_of(&out).contains(&reason), "{}", stderr_of(&out));
+        }
+        let h = Harness::warm();
+        h.write_user(&requests_tool("x", &["a.example"]));
+        let out = h.launch("shell", options);
+        assert_eq!(out.status.code(), Some(1), "{options:?}");
+        assert!(stderr_of(&out).contains(&reason), "{}", stderr_of(&out));
+    }
+
+    // An untrusted (symlinked) tools-only file refuses on every route.
+    let tools_only = requests_tool("x", &["a.example"]);
+    let trust = "an egress reference requires config.toml to be a regular file, but it is reached through a symbolic link";
+    for form in DIRECT_FORMS {
+        let h = Harness::warm();
+        let target = h.home_root.join(".config/agent-vm/dotfile");
+        write(&target, &tools_only);
+        h.symlink_user_config(&target);
+        let out = h.direct(DirectInvocation {
+            form,
+            options: &["--image", BOGUS_IMAGE, "--allow-egress", "tool:x"],
+            vector: &["probe"],
+            envs: &[],
+        });
+        assert_eq!(out.status.code(), Some(125), "{form:?}");
+        assert!(stderr_of(&out).contains(trust), "{}", stderr_of(&out));
+    }
+    let h = Harness::warm();
+    let target = h.home_root.join(".config/agent-vm/dotfile");
+    write(&target, &tools_only);
+    h.symlink_user_config(&target);
+    let out = h.launch("shell", &["--allow-egress", "tool:x"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr_of(&out).contains(trust), "{}", stderr_of(&out));
+}
+
+/// A33, positive CLI half: a tools-only user config with **no** `[network]`
+/// table, and `--allow-egress tool:fetcher` on both direct spellings.
+///
+/// The persisted rows above cannot show this: they prove that a *persisted*
+/// reference reaches policy, not that a CLI `tool:NAME` survives dispatch on the
+/// direct route. Both direct forms are exercised, with a bare literal in the
+/// same launch so the widened ports are visible next to the pinned ones, and the
+/// catalog route is compared against the same policy.
+#[test]
+fn direct_routes_expand_a_cli_reference_with_no_user_network_table() {
+    let tools_only = requests_tool("fetcher", &["api.example.com", "git.example.com:8443"]);
+    let options = [
+        "--image",
+        BOGUS_IMAGE,
+        "--allow-egress",
+        "tool:fetcher",
+        "--allow-egress",
+        "bare.example.com",
+    ];
+    let check = |h: &Harness, out: &Output, route: &str| {
+        let config = normalized_config(h, out);
+        assert_eq!(
+            domain_rules_of(&config),
+            [
+                ("api.example.com".to_owned(), vec![443]),
+                ("git.example.com".to_owned(), vec![8443]),
+                ("bare.example.com".to_owned(), vec![443, 8443]),
+            ],
+            "{route}"
+        );
+        assert_eq!(
+            config["network"]["tls"]["intercepted_ports"],
+            serde_json::json!([443, 8443]),
+            "{route}"
+        );
+        let stderr = stderr_of(out);
+        assert!(
+            stderr.contains(
+                "==> Egress policy: allowing TLS to api.example.com on ports 443 (--allow-egress via tool:fetcher)"
+            ),
+            "{route}: {stderr}"
+        );
+        assert!(
+            stderr.contains(
+                "==> Egress policy: allowing TLS to bare.example.com on ports 443, 8443 (--allow-egress)"
+            ),
+            "{route}: {stderr}"
+        );
+        // R20/A23: a CLI reference is never called persisted.
+        assert!(!stderr.contains("persisted"), "{route}: {stderr}");
+    };
+    for form in DIRECT_FORMS {
+        let h = Harness::warm();
+        h.write_user(&tools_only);
+        let out = h.direct(DirectInvocation {
+            form,
+            options: &options,
+            vector: &["probe"],
+            envs: &[],
+        });
+        check(&h, &out, &format!("direct {form:?}"));
+    }
+    // The catalog route, for parity: the same flags, the same policy.
+    let h = Harness::warm();
+    h.write_user(&tools_only);
+    let out = h.launch(
+        "fetcher",
+        &[
+            "--allow-egress",
+            "tool:fetcher",
+            "--allow-egress",
+            "bare.example.com",
+        ],
+    );
+    check(&h, &out, "catalog");
+}
+
+/// A11, CLI half: a user file that declares no tools leaves the shipped defaults
+/// catalog in force, and none of that catalog is referenceable — a reference
+/// names the user file's own `[[tools]]` only. The persisted half is
+/// `config::tests::persisted_tool_reference_ignores_project_and_builtin_tools`.
+#[test]
+fn a_cli_reference_never_names_a_defaults_catalog_tool() {
+    let h = Harness::warm();
+    h.write_user("# tools-only: the shipped catalog is in force\n");
+    let out = h.launch(
+        "codex",
+        &[
+            "--allow-egress",
+            "tool:codex",
+            "--allow-egress",
+            "api.example.com",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(&format!("--allow-egress #1: {EGRESS_REFERENCE_UNKNOWN}")),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(CONFIG_MARKER), "{stderr}");
+    assert!(!h.state_root.join(project_hash(&h.project_root)).exists());
+    assert!(
+        !h.home_root
+            .join(".config/agent-vm/image-pins.json")
+            .exists()
+    );
+}
+
+/// A20 across the routes that had no sentinel: the name carries one, so a
+/// refusal that echoed it fails here rather than being assumed clean. Unknown,
+/// no-requests and malformed, on a catalog launch, both direct spellings, and a
+/// persisted entry; the untrusted-file refusal names the file, not the name.
+#[test]
+fn reference_refusals_never_echo_the_entry_or_its_name() {
+    const SENTINEL: &str = "sk-live-SENTINEL-506";
+    let unknown = format!("--allow-egress #1: {EGRESS_REFERENCE_UNKNOWN}");
+    let malformed = format!("--allow-egress #1: {EGRESS_REFERENCE_MALFORMED}");
+    let no_requests = "--allow-egress #1: an egress reference must name a tool that declares network_requests; this tool declares none, so the reference would grant nothing";
+    // One file whose namespace holds a name the sentinel cannot be confused
+    // with, so a reference to the sentinel is UNKNOWN.
+    let unrelated = requests_tool("has-requests", &["a.example"]);
+    // And one that declares the sentinel-named tool with no requests, so the
+    // same reference is NO_REQUESTS instead.
+    let empty_requests = format!("{unrelated}{}", requests_tool(SENTINEL, &[]));
+
+    // Catalog launch: one row per refusal shape.
+    for (entry, reason) in [
+        (format!("tool:{SENTINEL}"), unknown.clone()),
+        (format!("tool:-{SENTINEL}"), malformed.clone()),
+        (format!("tool:{SENTINEL}/x"), malformed.clone()),
+        (format!("tool:{SENTINEL} x"), malformed.clone()),
+    ] {
+        let h = Harness::warm();
+        h.write_user(&unrelated);
+        let out = h.launch("shell", &["--allow-egress", &entry]);
+        assert_eq!(out.status.code(), Some(1), "{entry}");
+        let stderr = stderr_of(&out);
+        assert!(stderr.contains(&reason), "{entry}: {stderr}");
+        assert!(!stderr.contains(SENTINEL), "the name was echoed: {stderr}");
+    }
+    // A tool that exists but declares no requests: the refusal describes the
+    // tool, never names its name.
+    let h = Harness::warm();
+    h.write_user(&empty_requests);
+    let out = h.launch("shell", &["--allow-egress", &format!("tool:{SENTINEL}")]);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains(no_requests), "{stderr}");
+    assert!(!stderr.contains(SENTINEL), "the name was echoed: {stderr}");
+
+    // Both direct spellings: the same UNKNOWN refusal at 125.
+    for form in DIRECT_FORMS {
+        let h = Harness::warm();
+        h.write_user(&unrelated);
+        let entry = format!("tool:{SENTINEL}");
+        let out = h.direct(DirectInvocation {
+            form,
+            options: &["--image", BOGUS_IMAGE, "--allow-egress", &entry],
+            vector: &["probe"],
+            envs: &[],
+        });
+        assert_eq!(out.status.code(), Some(125), "{form:?}");
+        let stderr = stderr_of(&out);
+        assert!(stderr.contains(&unknown), "{form:?}: {stderr}");
+        assert!(!stderr.contains(SENTINEL), "{form:?}: {stderr}");
+    }
+
+    // Persisted: the load error names the position, not the entry.
+    let h = Harness::warm();
+    h.write_user(&format!(
+        "{unrelated}[network]\nallow_egress = [\"tool:{SENTINEL}\"]\n"
+    ));
+    let out = h.launch("shell", &[]);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(&format!(
+            "network.allow_egress[0]: {EGRESS_REFERENCE_UNKNOWN}"
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(SENTINEL), "{stderr}");
+
+    // Untrusted file: the refusal names the file, never the reference it was
+    // asked about.
+    let h = Harness::warm();
+    let target = h.home_root.join(".config/agent-vm/dotfile");
+    write(&target, &requests_tool(SENTINEL, &["a.example"]));
+    h.symlink_user_config(&target);
+    let out = h.launch("shell", &["--allow-egress", &format!("tool:{SENTINEL}")]);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(
+            "an egress reference requires config.toml to be a regular file, but it is reached through a symbolic link"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(SENTINEL), "{stderr}");
+}
+
+/// A33, persisted half: a wrong persisted reference fails load, so every route
+/// reports it — 125 for both direct spellings, 1 for a catalog launch, and a
+/// nonzero `doctor` whose tool-configuration section carries the text.
+#[test]
+fn persisted_reference_error_fails_every_route_and_doctor() {
+    let reason = format!("network.allow_egress[0]: {EGRESS_REFERENCE_UNKNOWN}");
+    let user_config = format!(
+        "{}\n[network]\nallow_egress = [\"tool:nope\"]\n",
+        requests_tool("x", &["a.example"])
+    );
+    for form in DIRECT_FORMS {
+        let h = Harness::warm();
+        h.write_user(&user_config);
+        let out = h.direct(DirectInvocation {
+            form,
+            options: &[],
+            vector: &["probe"],
+            envs: &[],
+        });
+        assert_eq!(out.status.code(), Some(125), "{form:?}");
+        assert!(stderr_of(&out).contains(&reason), "{}", stderr_of(&out));
+    }
+    let h = Harness::new();
+    h.write_user(&user_config);
+    let out = h.launch("shell", &[]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_saved_refusal(&h, &out, &reason, true);
+
+    let h = Harness::warm();
+    h.write_user(&user_config);
+    let doctor = h.builtin(&["doctor"], &[]);
+    assert!(!doctor.status.success());
+    let text = format!("{}{}", stdout_of(&doctor), stderr_of(&doctor));
+    assert!(text.contains("==> tool configuration"), "{text}");
+    assert!(text.contains(&reason), "{text}");
+}

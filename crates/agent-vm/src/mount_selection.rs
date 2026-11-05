@@ -393,6 +393,7 @@ mod tests {
             },
         )
         .unwrap()
+        .authorized
         .expect("a present mount field is authority-bearing");
         from_verified_value(
             &authorized,

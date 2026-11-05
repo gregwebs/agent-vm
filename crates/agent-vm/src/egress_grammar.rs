@@ -1,4 +1,10 @@
 //! Shared allowance syntax must not depend on launch authority.
+//!
+//! `tool:NAME` egress references are claimed **before** this grammar sees an
+//! `allow_egress` entry (`egress_reference::reference_claim`, ADR-0059); the same
+//! text in a `network_requests` entry does reach it, and is read as the hostname
+//! `tool`, which is the documented non-authoritative behaviour. Acceptance and
+//! error bytes are otherwise unchanged.
 
 // The verified byte kernels use raw delimiter comparisons and length tests so
 // their executable code stays aligned with the proofs. Keep the two lint

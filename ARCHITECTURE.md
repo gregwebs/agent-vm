@@ -47,6 +47,7 @@ crates/agent-vm/src/
 ├── egress_grammar.rs       # shared scheme/target/port grammar and allowance errors
 ├── egress_policy.rs        # allowance dispatch + launch egress authority (default-deny)
 ├── egress_hostname.rs      # hostname allowance acceptance, port scope, Domain rule assembly
+├── egress_reference.rs     # tool:NAME → user tool requests; proved prefix claim (ADR-0059)
 ├── dns_name.rs             # shared ASCII DNS label byte kernel (credential + egress)
 ├── network.rs              # published ports, proxy notice, launch Plan
 ├── network_requests.rs     # tool requests: parse, coverage report (never authority)
@@ -103,7 +104,11 @@ A launch is one pass, and the ordering is load-bearing:
    verb (the non-lossy winner IDs, from whole-definition user-wins precedence)
    together with the cross-tier conflicts, and checks `persist` ownership over
    all of those winners — but it binds no reference and folds no closure, so a
-   reference error is not a load error. `ConfigReport::into_launch_catalog`,
+   `tools` reference error is not a load error. (An **egress** reference is a
+   different thing: a persisted `tool:NAME` in `[network] allow_egress` is
+   resolved during that same load and *is* a load error when it cannot be
+   resolved, while a CLI one is decided in `network::Plan::from_args`.)
+   `ConfigReport::into_launch_catalog`,
    reached from `cli::parse_from` and from `doctor`, is what validates every
    retained definition's `tools` references, checks and folds each launch
    winner's closure — providers, requested names and `persist` paths over one
@@ -330,8 +335,11 @@ different walker reaching a fixed point and stay legal.
 ```text
 BEFORE                                       AFTER
 config.toml ──read──> RawConfig              config.toml ──read──> RawConfig
-  [network]? ─yes─> verify+parse (network)     triggers = {network?, mounts?, mount_sets?}  (presence)
-  mounts ───no I/O claim                       any? ─yes─> config_authority::verify(read)  ONE check
+  [network]? ─yes─> verify+parse (network)     config_authority::verify(read)  ONE check, ALWAYS
+  mounts ───no I/O claim                       ├─ measures → {authorized, references}
+                                                  │   authorized = Some iff a trigger is
+                                                  │   present AND the file passed
+                                                  │             (the same presence rule as before)
                                                   ├─ [network]     → user_network::from_verified_table
                                                   └─ mounts/sets   → config_mounts::from_verified_value
                                                                       (~/ expansion, shared grammar,
@@ -343,6 +351,15 @@ argv --mount ──> parse_selector              mount_selection::select(user, p
                     AFTER prepare_forks            claim → protections → … → validate_plan
                                                    → persisted-HOME check → prepare_forks
 ```
+
+**Measurement and enforcement are two things.** `verify` runs on every user read,
+triggers or not, and returns what it measured (`authorized` **and** a
+`ReferenceTrust` carrying the verdict). What a trigger decides is *enforcement*:
+`authorized` is `Some` only when an authority-bearing field is present and the
+file passed, so a tools-only file keeps loading (and keeps working through a
+dotfile symlink) whatever its facts are. The verdict waits, unenforced and
+unused, until a CLI `--allow-egress tool:NAME` asks for it at launch — a decision
+that only exists after argv is parsed, which is why it cannot be made here.
 
 **The persisted guest-HOME collision moved.** A mount that shadows a declared
 `persist` path used to be refused in `run.rs` *after* `prepare` returned — that

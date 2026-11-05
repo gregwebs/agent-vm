@@ -30,6 +30,21 @@
 //! directory that is itself a symlink is followed (only the final component is
 //! refused), mode 0600 is never required, and no ancestor, race or ACL
 //! protection is asserted.
+//!
+//! # One measurement, two consumers (ADR-0059)
+//!
+//! [`verify`] now measures the file on **every** user read, not only when an
+//! authority-bearing field is present: a `tool:NAME` egress reference is passed
+//! on the command line, which is parsed *after* this read is gone, yet it must
+//! be decided by the facts of the very read whose bytes supplied the tools
+//! (ADR-0040 forbids a second observation). So the measured verdict is kept
+//! beside the bytes it came from, in a [`ReferenceTrust`] that carries its file
+//! and outlives the read.
+//!
+//! Refusal at *load* time is still decided by presence alone: only a file that
+//! declares `[network]`, `mounts` or `[mount_sets]` is refused for being
+//! untrusted, so a tools-only dotfile symlink keeps loading exactly as before.
+//! The verdict waits, unused, for a CLI reference to consult it.
 
 use crate::protected_config_dir::authority_file_singly_linked;
 use vstd::prelude::*;
@@ -81,7 +96,11 @@ pub fn authority_refusal(reached: Reached, dir: DirFacts, euid: u32) -> (r: Opti
 } // verus!
 
 use crate::host_paths::{FinalComponent, VerifiedRead};
-use std::{fmt, os::unix::fs::MetadataExt, path::Path};
+use std::{
+    fmt,
+    os::unix::fs::MetadataExt,
+    path::{Path, PathBuf},
+};
 
 verus! {
 /// The two places one user file can declare a mount selection: the top-level
@@ -136,6 +155,9 @@ pub(crate) enum AuthoritySubject {
     NetworkAndMountSets,
     MountsAndMountSets,
     NetworkMountsAndMountSets,
+    /// ADR-0059: a CLI `tool:NAME` egress reference reads `[[tools]]`
+    /// `network_requests`, so *that* is the field a file is being trusted for.
+    EgressReference,
 }
 
 impl AuthoritySubject {
@@ -155,6 +177,7 @@ impl AuthoritySubject {
             Self::NetworkAndMountSets => "[network] and [mount_sets]",
             Self::MountsAndMountSets => "mounts and [mount_sets]",
             Self::NetworkMountsAndMountSets => "[network], mounts and [mount_sets]",
+            Self::EgressReference => "an egress reference",
         }
     }
 
@@ -170,6 +193,7 @@ impl AuthoritySubject {
             Self::NetworkMountsAndMountSets => {
                 "[network] table, mounts list and [mount_sets] table"
             }
+            Self::EgressReference => "[[tools]] network_requests",
         }
     }
 
@@ -185,6 +209,7 @@ impl AuthoritySubject {
             Self::NetworkAndMountSets => "[network] or [mount_sets]",
             Self::MountsAndMountSets => "mounts or [mount_sets]",
             Self::NetworkMountsAndMountSets => "[network], mounts or [mount_sets]",
+            Self::EgressReference => "an egress reference",
         }
     }
 
@@ -194,6 +219,9 @@ impl AuthoritySubject {
     /// [`authority_required`] has said yes. Naming the subject never decides
     /// anything, so it carries no kernel of its own; the `match` is exhaustive
     /// over the three measured facts with no catch-all arm.
+    ///
+    /// `EgressReference` is deliberately unnameable here: a flag is not a file
+    /// field, so a presence trigger can never be about one.
     fn of(triggers: AuthorityTriggers) -> Self {
         match (triggers.network, triggers.mounts, triggers.mount_sets) {
             (false, false, false) => Self::Network,
@@ -226,7 +254,7 @@ impl AuthorizedConfig<'_> {
 
 /// Why a user file could not be trusted, as the field(s) that made it
 /// authority-bearing.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UntrustedConfig {
     /// The verified-read rules rejected the file or its immediate directory.
     /// The refusal variant carries the one extra datum that is valid for it
@@ -307,33 +335,139 @@ fn write_refusal(
     }
 }
 
-/// Decide whether a verified read establishes authority, and mint the token the
+/// The verified read's verdict for an egress reference, owned so it can outlive
+/// the read that produced it (ADR-0059).
+///
+/// A CLI `tool:NAME` is only known after argv is parsed, which is after
+/// `config::load` has dropped its [`VerifiedRead`]. Re-reading or re-measuring at
+/// launch would decide from a second observation, so the verdict from the read
+/// whose bytes supplied the tools is carried here instead.
+///
+/// The file is stored with the verdict and never supplied separately, so a
+/// verdict for one file cannot be paired with another file's tools:
+/// [`crate::egress_reference::UserToolRequests::new`] keeps only tools whose
+/// origin file equals [`Self::file`].
+///
+/// Private fields: only [`verify`] mints one that vouches for anything.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReferenceTrust {
+    file: PathBuf,
+    verdict: Result<(), UntrustedConfig>,
+}
+
+impl ReferenceTrust {
+    pub(crate) fn file(&self) -> &Path {
+        &self.file
+    }
+
+    /// The verdict, with no second check: the value is what the read measured.
+    pub(crate) fn require(&self) -> Result<(), UntrustedConfig> {
+        self.verdict
+    }
+
+    #[cfg(test)]
+    pub(crate) fn verified_for_test(file: &Path) -> Self {
+        Self {
+            file: file.to_owned(),
+            verdict: Ok(()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_untrusted(file: &Path, refusal: UntrustedConfig) -> Self {
+        Self {
+            file: file.to_owned(),
+            verdict: Err(refusal),
+        }
+    }
+}
+
+/// What one read's measurements said, before it is attributed to a field.
+///
+/// Private: it is an intermediate of [`verify`], never a decision a caller can
+/// hold. Attribution is separate because the *same* measurement is reported
+/// under the field that made the file authority-bearing, and under
+/// [`AuthoritySubject::EgressReference`] when it is a CLI reference asking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Measurement {
+    Refused(AuthorityRefusal),
+    DirUnexaminable(std::io::ErrorKind),
+}
+
+impl Measurement {
+    fn into_untrusted(self, subject: AuthoritySubject) -> UntrustedConfig {
+        match self {
+            Self::Refused(refusal) => UntrustedConfig::Refused { refusal, subject },
+            Self::DirUnexaminable(kind) => UntrustedConfig::DirUnexaminable { kind, subject },
+        }
+    }
+}
+
+/// The result of one verified user read.
+#[derive(Debug)]
+pub(crate) struct Verification<'a> {
+    /// `Some` iff an authority-bearing field is present *and* the file passed.
+    /// Unchanged rule: presence is the only load-time trigger.
+    pub(crate) authorized: Option<AuthorizedConfig<'a>>,
+    /// The same read's verdict for a CLI egress reference, which is only known
+    /// after argv is parsed.
+    pub(crate) references: ReferenceTrust,
+}
+
+/// Decide whether a verified read establishes authority, and mint the tokens the
 /// authority-bearing parsers require.
 ///
-/// `Ok(None)` means the file declares no authority-bearing field, so nothing is
-/// measured: a tools/image-only config keeps working through a dotfile symlink
-/// (ADR-0040's compatibility rule). This is the only I/O in the module and it
-/// happens before any credential handling, runtime identity work or launch
-/// state, because a caller loads config first.
+/// The file is measured on every call, but `authorized` is `None` whenever the
+/// file declares no authority-bearing field, so a tools/image-only config keeps
+/// working through a dotfile symlink (ADR-0040's compatibility rule). A refusal
+/// is returned only when such a field is present; the verdict for a later CLI
+/// egress reference is returned in [`Verification::references`] instead, because
+/// a reference is not a file field and must not change what loads.
+///
+/// This is the only I/O in the module and it happens before any credential
+/// handling, runtime identity work or launch state, because a caller loads
+/// config first.
 pub(crate) fn verify<'a>(
     read: &'a VerifiedRead,
     triggers: AuthorityTriggers,
-) -> Result<Option<AuthorizedConfig<'a>>, UntrustedConfig> {
+) -> Result<Verification<'a>, UntrustedConfig> {
+    let file = read.path();
+    let measured = measure(read);
     if !authority_required(triggers) {
-        return Ok(None);
+        // Never a refusal here: presence stays the only load-time trigger, so a
+        // tools-only symlink loads as before. The verdict waits for a CLI
+        // reference, which consult `require()` before resolving a name.
+        return Ok(Verification {
+            authorized: None,
+            references: ReferenceTrust {
+                file: file.to_owned(),
+                verdict: measured.map_err(|measurement| {
+                    measurement.into_untrusted(AuthoritySubject::EgressReference)
+                }),
+            },
+        });
     }
-    let subject = AuthoritySubject::of(triggers);
+    measured.map_err(|measurement| measurement.into_untrusted(AuthoritySubject::of(triggers)))?;
+    Ok(Verification {
+        authorized: Some(AuthorizedConfig { file }),
+        references: ReferenceTrust {
+            file: file.to_owned(),
+            verdict: Ok(()),
+        },
+    })
+}
+
+/// ADR-0040's measurements: the immediate directory's `metadata`, the read's own
+/// final-component facts and the effective uid, handed to the proved kernel.
+fn measure(read: &VerifiedRead) -> Result<(), Measurement> {
     let file = read.path();
     // Separate path observation, not anchored to the read descriptor; ancestors
     // remain trusted (ADR-0040's accepted gap).
-    let parent = file.parent().ok_or(UntrustedConfig::DirUnexaminable {
-        kind: std::io::ErrorKind::NotFound,
-        subject,
-    })?;
-    let meta = std::fs::metadata(parent).map_err(|error| UntrustedConfig::DirUnexaminable {
-        kind: error.kind(),
-        subject,
-    })?;
+    let parent = file
+        .parent()
+        .ok_or(Measurement::DirUnexaminable(std::io::ErrorKind::NotFound))?;
+    let meta =
+        std::fs::metadata(parent).map_err(|error| Measurement::DirUnexaminable(error.kind()))?;
     let dir = DirFacts {
         is_dir: meta.is_dir(),
         uid: meta.uid(),
@@ -348,8 +482,8 @@ pub(crate) fn verify<'a>(
         }),
     };
     match authority_refusal(reached, dir, crate::host_paths::current_euid()) {
-        Some(refusal) => Err(UntrustedConfig::Refused { refusal, subject }),
-        None => Ok(Some(AuthorizedConfig { file })),
+        Some(refusal) => Err(Measurement::Refused(refusal)),
+        None => Ok(()),
     }
 }
 
@@ -366,7 +500,7 @@ mod tests {
     use proptest::prelude::*;
     use std::{fs, os::unix::fs::PermissionsExt};
 
-    const SUBJECTS: [AuthoritySubject; 7] = [
+    const SUBJECTS: [AuthoritySubject; 8] = [
         AuthoritySubject::Network,
         AuthoritySubject::Mounts,
         AuthoritySubject::MountSets,
@@ -374,6 +508,7 @@ mod tests {
         AuthoritySubject::NetworkAndMountSets,
         AuthoritySubject::MountsAndMountSets,
         AuthoritySubject::NetworkMountsAndMountSets,
+        AuthoritySubject::EgressReference,
     ];
 
     /// The three interchangeable slots one refusal sentence is assembled from,
@@ -409,6 +544,13 @@ mod tests {
                 "[network], mounts and [mount_sets]",
                 "[network] table, mounts list and [mount_sets] table",
                 "[network], mounts or [mount_sets]",
+            ),
+            // ADR-0059: not a file field, so all three slots say the same thing
+            // — what a CLI reference needs the file for.
+            AuthoritySubject::EgressReference => (
+                "an egress reference",
+                "[[tools]] network_requests",
+                "an egress reference",
             ),
         }
     }
@@ -578,6 +720,42 @@ mod tests {
         }
     }
 
+    /// The whole-sentence literals for the egress-reference subject (ADR-0059).
+    ///
+    /// A15b and A16 pin these bytes, and they are the *only* text a guest-planted
+    /// tools-only symlink produces, so they are written out here rather than only
+    /// composed from slots above.
+    #[test]
+    fn egress_reference_subject_display_is_byte_identical() {
+        use AuthorityRefusal::*;
+        let subject = AuthoritySubject::EgressReference;
+        for (refusal, pinned) in [
+            (
+                ThroughSymlink,
+                "an egress reference requires config.toml to be a regular file, but it is reached through a symbolic link; its target may be writable by a guest or project, so review the [[tools]] network_requests before trusting the file (a symlinked config without an egress reference still works)",
+            ),
+            (
+                FileWritable,
+                "an egress reference refuses a group- or other-writable config.toml; a guest or another account may have written its [[tools]] network_requests, so review the [[tools]] network_requests before trusting the file (fixing the mode does not establish authorship)",
+            ),
+            (
+                FileLinks(2),
+                "an egress reference refuses a config.toml with 2 hard links; another name for it may be guest- or project-writable, so review the [[tools]] network_requests before trusting the file",
+            ),
+        ] {
+            assert_eq!(
+                UntrustedConfig::Refused { refusal, subject }.to_string(),
+                pinned,
+                "egress-reference refusal text changed for {refusal:?}"
+            );
+        }
+        let kind = std::io::ErrorKind::PermissionDenied;
+        assert_eq!(
+            UntrustedConfig::DirUnexaminable { kind, subject }.to_string(),
+            "an egress reference requires examining the config directory, which failed (PermissionDenied)"
+        );
+    }
+
     fn oracle(reached: Reached, dir: DirFacts, euid: u32) -> Option<AuthorityRefusal> {
         use AuthorityRefusal::*;
         if !dir.is_dir {
@@ -735,14 +913,16 @@ mod tests {
         }
     }
 
-    /// A file with no authority-bearing field is never measured.
+    /// A file with no authority-bearing field is never refused, but the same
+    /// read's verdict for a CLI egress reference is kept.
     ///
-    /// The fixture's directory is world-writable, which the kernel refuses: so
-    /// `Ok(None)` here can only come from `verify` not having looked at all.
-    /// That is ADR-0040's compatibility rule — a tools/image-only config keeps
-    /// working through a dotfile symlink.
+    /// The fixture's directory is world-writable, which the kernel refuses: so a
+    /// passing load here can only come from presence staying the trigger. That is
+    /// ADR-0040's compatibility rule — a tools/image-only config keeps working
+    /// through a dotfile symlink — and ADR-0059's addition is that the *refusal*
+    /// is retained, attributed to the reference, for a CLI `tool:NAME` to consult.
     #[test]
-    fn verify_measures_nothing_without_triggers() {
+    fn verify_never_refuses_without_triggers_and_keeps_the_reference_verdict() {
         let root = tempfile::tempdir().unwrap();
         let nested = root.path().join("open");
         fs::create_dir(&nested).unwrap();
@@ -756,7 +936,17 @@ mod tests {
             mounts: false,
             mount_sets: false,
         };
-        assert!(verify(&read, none).is_ok_and(|authorized| authorized.is_none()));
+        let verification = verify(&read, none).unwrap();
+        assert!(verification.authorized.is_none());
+        assert_eq!(verification.references.file(), file);
+        // The positive half of A17: `Ok` load, no authority, a refusal retained.
+        assert_eq!(
+            verification.references.require().unwrap_err(),
+            UntrustedConfig::Refused {
+                refusal: AuthorityRefusal::DirWritable,
+                subject: AuthoritySubject::EgressReference,
+            }
+        );
         for triggers in [
             AuthorityTriggers {
                 network: true,
@@ -782,6 +972,37 @@ mod tests {
         }
     }
 
+    /// A file that passes carries an unqualified verdict, so a CLI reference can
+    /// resolve against it with no second measurement.
+    #[test]
+    fn passing_reads_mint_an_ok_reference_verdict() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("config.toml");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(&file, b"").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        let read = read_bounded_regular_file_noting_symlink(&file, 100).unwrap();
+        for triggers in [
+            AuthorityTriggers {
+                network: false,
+                mounts: false,
+                mount_sets: false,
+            },
+            AuthorityTriggers {
+                network: true,
+                mounts: false,
+                mount_sets: false,
+            },
+        ] {
+            let verification = verify(&read, triggers).unwrap();
+            assert_eq!(verification.references.require(), Ok(()));
+            assert_eq!(
+                verification.authorized.is_some(),
+                authority_required(triggers)
+            );
+        }
+    }
+
     #[test]
     fn verify_verdicts_on_real_files() {
         if crate::host_paths::current_euid() == 0 {
@@ -802,7 +1023,7 @@ mod tests {
             let read = read_bounded_regular_file_noting_symlink(&file, 100).unwrap();
             assert_eq!(read.path(), file);
             assert_eq!(read.bytes(), b"[network]\n");
-            verify(&read, triggers).map(|authorized| authorized.is_some())
+            verify(&read, triggers).map(|verification| verification.authorized.is_some())
         };
         assert!(load().unwrap());
         for mode in [0o600, 0o644, 0o664, 0o646] {

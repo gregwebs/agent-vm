@@ -814,12 +814,12 @@ a **user** tool's requests.
 **Egress reference**: an `allow_egress` entry (persisted or `--allow-egress`)
 that stands for other allowances: `tool:NAME` is that **user**-tier tool's own
 network requests as exact `tcp://HOST:PORT` hostname allowances, and `set:NAME`
-is an **Egress set**. Built-in and project tools are never resolved. Designed in
-#506, not implemented.
+is an **Egress set**. Built-in and project tools are never resolved. `tool:NAME`
+implemented in #506; `set:NAME` designed, #511.
 
 **Egress set**: a named list of allowances and egress references in the
 **user** `[egress_sets]` table. Declaring one grants nothing; only a selecting
-`set:NAME` reference does. Designed in #506, not implemented.
+`set:NAME` reference does. Designed, not implemented (#511).
 
 **Persisted grant**: user-authored host authority in a user-tier `[network]`
 setting, read only from a verified file and merged per launch. CLI flags override
