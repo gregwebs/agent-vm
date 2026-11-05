@@ -1749,9 +1749,9 @@ oversized file, is reported as potentially sensitive. Only `auth.json` and
 
 `doctor` never resolves `!command` values, expands environment references,
 refreshes OAuth, or writes, rewrites or removes anything; it only reads: the host
-credential files above, the tool configuration, `credentials.yaml`, and the two
-Pi files, plus the names-only secret inventory and optional bounded native
-credential-store check above. Ordinary `doctor` also performs **no** initialization
+credential files above, the tool configuration, `credentials.yaml`, the two
+Pi files, the cached image metadata of the selected image, plus the names-only
+secret inventory and optional bounded native credential-store check above. Ordinary `doctor` also performs **no** initialization
 at all — it is dispatched before microsandbox bootstrap, so it works even when the bundled `msb`
 is missing or unpatched, and it reports the computed paths rather than validating
 that binary. The explicit `agent-vm doctor --reset-msb-db` is the mutating
@@ -1982,7 +1982,24 @@ user:    ghcr.io/gregwebs/agent-vm-standard:v0.1.3 [/home/alice/.config/agent-vm
 project: none
 default: retained default [/home/alice/.config/agent-vm/default-image.json]
 selected (without --image): ghcr.io/gregwebs/agent-vm-standard:v0.1.3 (from user config /home/alice/.config/agent-vm/config.toml)
+
+==> image network requests
+for every launch deb.debian.org
+for codex api.openai.com
+requests never grant access; a launch reports those its grants do not cover, once per image reference, then as changes
 ```
+
+The `==> image network requests` section is the same image selection's declared
+[image and agent requests](#image-network-requests), read straight from the image
+cache: every group in full, covered and empty ones included, with the
+ignored-label and count lines. It never acquires anything, never contacts a
+registry, writes no files and does not read the once-then-changes store, so it is
+the way to see the complete current picture. Its fixed rows are `a local rootfs
+or disk path declares no requests`, `not cached; doctor does not acquire images`,
+`the selected image declares no requests`, and an `unknown:` row when the cached
+metadata, the approval record or the cache location cannot be read. The same
+64-request-label bound as a launch applies, and the excess line says the requests
+above are incomplete.
 
 ### Tool references are local to their file
 
@@ -3579,6 +3596,73 @@ At most 8 sorted unmet entries are printed; further entries produce
 `==>   … and N more not shown`. The report is at most 11 lines. Covered
 requests are never listed beside approval wording, and the grant hint never
 contains a project-supplied value.
+
+### Image network requests
+
+An image can declare the hosts its own software contacts at runtime, in OCI
+config labels under `org.agent-vm.network-requests.`
+([ADR-0060](docs/adr/0060-image-network-requests-reported-once-then-as-changes.md)):
+
+- `…image.<component>` is reported in one `for every launch` group, the union of
+  every such label.
+- `…agent.<agent>` is its own `for <agent>` group. The launcher never matches a
+  group to the tool you launched, so a renamed or wrapper tool cannot silently
+  miss its hosts.
+
+The labels are read from the validated config of exactly the content the launch
+boots — the approved digest, not a moving tag — before the sandbox is created.
+They are **requests**, never authority: a label never grants access, never changes
+the sandbox network policy, and never fails a launch.
+
+Before boot, each group's requests that this launch's grants do not cover are
+printed, once per selected image reference and then as changes:
+
+```text
+==> Image network requests (ghcr.io/x/standard:latest): for every launch deb.debian.org
+==> Image network requests (ghcr.io/x/standard:latest): for codex api.openai.com
+==>   image requests above are not covered by this launch's public or same-name grants (no lookup; DNS, private-answer and TLS client limits still apply); they never grant access and the launch continues; each image reference is reported once, then as changes
+==>   to grant: --allow-egress HOST or tcp://HOST:PORT, or --allow-internet-egress; IP/CIDR, --allow-lan and --allow-host grants are not matched to names
+```
+
+Coverage is the same lookup-free check the tool report uses. It suppresses
+covered requests in a first report and covered additions in a change report. It
+never suppresses a removal, an ignored label or a count line, so a fully covered
+group prints nothing while a host the labels removed still prints.
+
+Later launches of the same reference compare against what was last **shown** for
+each group, so the report is a change list: `+host` for an added request this
+launch cannot reach, `-host` for a removed one.
+
+```text
+==> Image network requests (ghcr.io/x/standard:latest) changed: for codex +api.example.com, -chatgpt.com
+```
+
+Two consequences are deliberate, and `agent-vm doctor` is the way to see the full
+current picture at any time:
+
+- A change whose additions are all covered prints nothing and stays **pending**
+  for that group; the first later launch on which an addition is unreachable
+  shows it. Changing only your grants therefore never re-reports what you were
+  already shown.
+- A request that was covered when its own group's line printed is recorded
+  without being shown, so removing that grant later does not report it. Closing
+  this would require per-request tracking, which would also lose removals of
+  never-shown hosts.
+
+A group you were never shown disappears silently. At most 64 request labels are
+considered, in key order; beyond that a `… beyond the first 64 in key order; this
+report is partial` line appears, once. Invalid labels get one `ignored invalid
+label` line each, and unrecognized keys under the prefix are counted once; the
+raw refused value is never printed.
+
+The baseline lives in `<state root>/image-network-requests.json` — the state root
+the launcher already uses: `AGENT_VM_STATE_DIR`, else an absolute
+`XDG_STATE_HOME/agent-vm`, else `$HOME/.local/state/agent-vm`. It is mode 0600,
+bounded at 256 references and 8 MiB, least recently seen dropped, last writer
+wins. It is display state: a damaged, unreadable or unwritable store means the
+report is simply printed in full again, and a path that is not a regular file (a
+symlink, a directory) is never replaced — every launch reports in full until you
+remove it. To see everything again, run `agent-vm doctor` or delete that file.
 
 ### TLS client requirements
 

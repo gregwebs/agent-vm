@@ -126,6 +126,10 @@ use crate::boot_image::ImageLabel;
 use crate::host_paths::{FlockAttempt, FlockMode};
 use receipt::RECEIPT_REPAIR_GUIDANCE;
 
+/// msb's metadata directory under the cache root. Duplicated from the vendored
+/// `cache::store` on purpose: `doctor` must not construct `GlobalCache`.
+const MANIFESTS_DIRECTORY: &str = "manifests";
+
 mod barrier;
 mod receipt;
 mod reference;
@@ -136,6 +140,17 @@ use receipt::{MergedBinding, Receipt, ReceiptError};
 pub(crate) use reference::{
     CanonicalOciReference, OciTarget, OciTargetError, PinnedReference, ValidatedDigest,
 };
+
+/// What a diagnostic label read found (ADR-0060 R20). Three outcomes, no error
+/// path: a diagnostic observation may not become a failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CachedLabelsRead {
+    /// The image is not in the cache, or its metadata was never published.
+    NotCached,
+    /// The file exists but could not be read or decoded.
+    Unreadable,
+    Present(std::collections::HashMap<String, String>),
+}
 
 /// How an acquisition treats cached native content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,6 +219,52 @@ pub(crate) enum AssociationPolicy {
     RequireProof,
 }
 
+/// msb's metadata file for one cached reference, derived the way msb derives it.
+fn diagnostic_metadata_path(cache_dir: &Path, reference: &Reference) -> std::path::PathBuf {
+    use sha2::{Digest as _, Sha256};
+    let digest: String = Sha256::digest(reference.to_string().as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    cache_dir
+        .join(MANIFESTS_DIRECTORY)
+        .join(format!("{digest}.json"))
+}
+
+/// The cached OCI config labels for `reference`, read for a diagnostic.
+///
+/// Best-effort and **read-only by construction**: `doctor` may not create,
+/// lock or repair anything, and the SDK offers no read-only reader —
+/// `GlobalCache::new` runs `create_dir_all` on eight directories and normal
+/// metadata reads take leases that create lock files
+/// (`vendor/microsandbox/crates/image/lib/cache/store.rs`,
+/// `storage_lease.rs`). So this duplicates msb's own path rule
+/// (`image_cache_key`, `store.rs`: `manifests/<hex sha256(Reference::to_string())>.json`)
+/// rather than calling it; a differential test pins the derivation against
+/// `GlobalCache::image_metadata_path` for four reference shapes.
+///
+/// The read is an observation of what msb cached, not a re-validation: a
+/// concurrent refresh can make it stale, and metadata published by rename is
+/// never torn.
+pub(crate) fn read_cached_labels_for_diagnostics(
+    cache_dir: &Path,
+    reference: &Reference,
+) -> CachedLabelsRead {
+    let path = diagnostic_metadata_path(cache_dir, reference);
+    let bytes = match crate::host_paths::read_optional_bounded_regular_file_no_follow(
+        &path,
+        receipt::MAX_RECEIPT_BYTES,
+    ) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return CachedLabelsRead::NotCached,
+        Err(_) => return CachedLabelsRead::Unreadable,
+    };
+    match serde_json::from_slice::<CachedImageMetadata>(&bytes) {
+        Ok(metadata) => CachedLabelsRead::Present(metadata.config.labels),
+        Err(_) => CachedLabelsRead::Unreadable,
+    }
+}
+
 /// A validated native image: the opaque success token every acquisition
 /// consumer receives.
 ///
@@ -232,6 +293,12 @@ impl ValidatedImage {
     /// The guest environment from these exact validated bytes.
     pub(crate) fn image_env(&self) -> &[String] {
         &self.metadata.config.env
+    }
+
+    /// The OCI config labels of these exact validated bytes (ADR-0060: the image's
+    /// network requests live here, in the same config that was validated for boot).
+    pub(crate) fn image_labels(&self) -> &std::collections::HashMap<String, String> {
+        &self.metadata.config.labels
     }
 
     /// The canonical selected source (a tag or a stated digest).
@@ -1625,6 +1692,87 @@ pub(crate) fn gate_create_returned() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one duplicated rule (Part E.9): msb's metadata path.
+    ///
+    /// It detects drift in the path derivation for four reference shapes — a tag,
+    /// a digest, a Hub alias and a registry with a port. It does **not** detect a
+    /// change in the cache metadata schema or meaning, in approval selection, or
+    /// in the cache-location rule; the genuine acquired-cache row of A14 covers
+    /// those end to end.
+    #[test]
+    fn diagnostic_metadata_path_matches_the_native_cache_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = GlobalCache::new(directory.path()).unwrap();
+        for text in [
+            "ghcr.io/x/standard:latest",
+            "ghcr.io/x/standard@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "alpine",
+            "localhost:5000/x/y:1",
+        ] {
+            let reference: Reference = text.parse().unwrap_or_else(|_| panic!("{text}"));
+            assert_eq!(
+                diagnostic_metadata_path(directory.path(), &reference),
+                cache.image_metadata_path(&reference),
+                "the diagnostic path drifted from msb's for {text}"
+            );
+        }
+    }
+
+    /// The read itself: absent is `NotCached`, undecodable is `Unreadable`, a
+    /// symlink is refused rather than followed, and a published file yields its
+    /// labels.
+    #[test]
+    fn diagnostic_label_read_is_bounded_no_follow_and_reads_labels() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache_dir = directory.path();
+        std::fs::create_dir_all(cache_dir.join(MANIFESTS_DIRECTORY)).unwrap();
+        let reference: Reference = "ghcr.io/x/labeled:1".parse().unwrap();
+        let path = diagnostic_metadata_path(cache_dir, &reference);
+        assert_eq!(
+            read_cached_labels_for_diagnostics(cache_dir, &reference),
+            CachedLabelsRead::NotCached
+        );
+
+        let labels: std::collections::HashMap<String, String> = [(
+            "org.agent-vm.network-requests.agent.codex".to_owned(),
+            "api.openai.com".to_owned(),
+        )]
+        .into_iter()
+        .collect();
+        let metadata = CachedImageMetadata {
+            manifest_digest: "sha256:aa".to_owned(),
+            config_digest: "sha256:bb".to_owned(),
+            raw_manifest_json: "{}".to_owned(),
+            raw_config_json: "{}".to_owned(),
+            config: microsandbox_image::ImageConfig {
+                labels: labels.clone(),
+                ..Default::default()
+            },
+            layers: Vec::new(),
+        };
+        std::fs::write(&path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        assert_eq!(
+            read_cached_labels_for_diagnostics(cache_dir, &reference),
+            CachedLabelsRead::Present(labels)
+        );
+
+        std::fs::write(&path, b"not metadata").unwrap();
+        assert_eq!(
+            read_cached_labels_for_diagnostics(cache_dir, &reference),
+            CachedLabelsRead::Unreadable
+        );
+
+        // A symlink is not a cached file: the read is no-follow.
+        std::fs::remove_file(&path).unwrap();
+        let target = directory.path().join("elsewhere.json");
+        std::fs::write(&target, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert_eq!(
+            read_cached_labels_for_diagnostics(cache_dir, &reference),
+            CachedLabelsRead::Unreadable
+        );
+    }
 
     #[test]
     fn platform_facts_require_every_conjunct() {

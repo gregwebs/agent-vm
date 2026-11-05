@@ -226,6 +226,12 @@ fn main() {{
         println!("{{}}", PROTOCOL_JSON);
         return;
     }}
+    // One line per **real launch invocation**, written to stderr, which the
+    // launcher inherits. That puts the runtime's launch and the launcher's own
+    // report on one stream, so a harness can order them causally instead of
+    // inferring create from a debug line the launcher prints beforehand. The
+    // `--version` and `__launch-protocol` probes never write it.
+    eprintln!("MSB-LAUNCH {{}}", args.join(" "));
     // A real launch (the SDK's `machine` entry point) must fail: this fixture
     // is evidence of cache consumption, never of a working VM.
     std::process::exit(93);

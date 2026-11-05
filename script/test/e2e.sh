@@ -60,9 +60,11 @@
 # pinned runtime silently came from somewhere else.
 #
 # Custom-image cleanup: the group removes the Docker refs it created when it
-# exits — the nine `agent-vm-e2e-258-<run id>:<target>` fixtures and every
+# exits — the nine `agent-vm-e2e-258-<run id>:<target>` fixtures, plus every
 # `localhost:<port>/e2e-<issue>-<run id>:<tag>` ref the rows publish (the row's
-# issue number, not a range). Ownership is the run id embedded in each ref
+# issue number, not a range). The tenth fixture, `…:network-requests-labeled`,
+# is built by `agent-vm image build` into the run's private state (#505 A19), so
+# it has no Docker ref and disappears with `$WORK`. Ownership is the run id embedded in each ref
 # (`-$RUN_ID` before the tag), so nothing is registered and a ref a row created
 # without that marker is not collected. A *failed* run keeps its refs and prints
 # them, with a copy-pasteable removal line, whenever the daemon can be listed
@@ -666,6 +668,11 @@ CUSTOM_NONSTANDARD="agent-vm-e2e-258-$RUN_ID:nonstandard-path"
 CUSTOM_STAMP="agent-vm-e2e-258-$RUN_ID:stamp-present"
 # #399: the direct-stdin `hook-read` row's image (a seed hook that reports EOF).
 CUSTOM_STDIN_SEED="agent-vm-e2e-258-$RUN_ID:stdin-seed-399"
+# #505: an image whose OCI labels declare network requests. Keep these literals in
+# sync with the `network-requests-labeled` target in the fixture Dockerfile.
+CUSTOM_NETREQ="agent-vm-e2e-258-$RUN_ID:network-requests-labeled"
+CUSTOM_NETREQ_BASE="deb.debian.org"
+CUSTOM_NETREQ_CODEX="api.openai.com"
 # The exact body the `stamp-present` fixture target writes to
 # `/etc/agent-vm-image-version`; the e2e check asserts the guest observes this
 # literal. Keep in sync with that target in the fixture Dockerfile.
@@ -758,6 +765,23 @@ check_custom_env_isolation() {
   fi
 }
 
+# #505 A19: the labeled fixture is built through the **launcher's** build path,
+# which is what the acceptance row specifies. `agent-vm image build` exports one
+# OCI archive from `docker buildx build` and publishes it into this run's
+# private image cache; no Docker ref is created, so the cleanup trap has nothing
+# to remove. A builder that supports `--output type=oci` is required — the same
+# prerequisite `image build` documents — and `AGENT_VM_E2E_BUILDER` selects one.
+build_custom_netreq_fixture() {
+  local tag="$1" target="$2"
+  echo "==> Building fixture target $target as $tag with agent-vm image build"
+  local -a builder=()
+  if [ -n "${AGENT_VM_E2E_BUILDER:-}" ]; then
+    builder=(--builder "$AGENT_VM_E2E_BUILDER")
+  fi
+  avm_custom_state image build --tag "$tag" --file "$FIXTURE_DIR/Dockerfile" \
+    --target "$target" ${builder[@]+"${builder[@]}"} "$FIXTURE_DIR"
+}
+
 # Build every exact target and import that same ref into the isolated custom
 # cache the launches use. Building only a target and importing a differently
 # named ref (or importing into the shared dev state) would make the VM checks
@@ -766,8 +790,15 @@ prepare_custom_fixtures() {
   local tag target
   while read -r tag target; do
     [ -n "$tag" ] || continue
-    build_custom_fixtures "$tag" "$target" || return 1
-    import_image "$tag" "$tag" "$CUSTOM_STATE" || return 1
+    case "$target" in
+      network-requests-labeled)
+        build_custom_netreq_fixture "$tag" "$target" || return 1
+        ;;
+      *)
+        build_custom_fixtures "$tag" "$target" || return 1
+        import_image "$tag" "$tag" "$CUSTOM_STATE" || return 1
+        ;;
+    esac
   done <<EOF
 $CUSTOM_MARKER marker-free
 $CUSTOM_NO_BASH no-bash
@@ -778,6 +809,7 @@ $CUSTOM_USER_HOME user-home-set
 $CUSTOM_NONSTANDARD nonstandard-path
 $CUSTOM_STAMP stamp-present
 $CUSTOM_STDIN_SEED stdin-seed-399
+$CUSTOM_NETREQ network-requests-labeled
 EOF
 }
 
@@ -789,7 +821,7 @@ check_custom_fixtures_imported() {
   local ref
   for ref in "$CUSTOM_MARKER" "$CUSTOM_NO_BASH" "$CUSTOM_WRAPPER" \
     "$CUSTOM_INTEGRATIONS" "$CUSTOM_SCRIPT" "$CUSTOM_USER_HOME" \
-    "$CUSTOM_NONSTANDARD" "$CUSTOM_STAMP" "$CUSTOM_STDIN_SEED"; do
+    "$CUSTOM_NONSTANDARD" "$CUSTOM_STAMP" "$CUSTOM_STDIN_SEED" "$CUSTOM_NETREQ"; do
     image_catalog_has "$ref" "$ref" present || return 1
   done
 }
@@ -5062,6 +5094,66 @@ custom_image_runs_program() {
   assert_eq "root completion sentinel" "hello-258=ok" "$(grep '^hello-258=ok$' <<<"$out")" || return 1
 }
 
+# A19 (#505, MANUAL like every row in this group): the labeled fixture built by
+# `agent-vm image build` reports its requests before boot, reports each reference
+# once, and is silent on relaunch. Observational only: a label is not authority,
+# so the guest still runs and the exit status is unchanged.
+#
+# Exact invocation (this row is NOT RUN on a host without a real microVM):
+#   AGENT_VM_E2E_ONLY_ROWS=custom-image-network-requests-labeled \
+#     bash script/test/e2e.sh custom-image
+# Prerequisites: Apple Silicon; `vendor/microsandbox/build/{msb,agentd,
+# libkrunfw.5.dylib}`; Docker with a buildx builder that supports
+# `--output type=oci` (pass it as AGENT_VM_E2E_BUILDER to avoid the default
+# builder); and a built launcher (AGENT_VM_DEV_BIN). Without those the run dies
+# in `inputs`, before this row.
+custom_image_network_requests_labeled() {
+  local name="custom-netreq" proj out store="$CUSTOM_STATE/image-network-requests.json"
+  proj="$(custom_project "$name")" || return 1
+  capture_custom_launch "$name" "$proj" --no-git --image "$CUSTOM_NETREQ" hello-258 || return 1
+  require_launch_ok "$name" || return 1
+  assert_no_host_calls || return 1
+  out="$(read_launch_evidence "$name")" || return 1
+  # The report is exact: one line per group in group order ("every launch"
+  # first, then agents in byte order), then the fixed two-line trailer. Pin the
+  # block as one literal rather than two independent greps, so an extra, missing
+  # or reordered line is a failure.
+  local expected block image_line_count
+  expected="$(printf '%s\n' \
+    "==> Image network requests ($CUSTOM_NETREQ): for every launch $CUSTOM_NETREQ_BASE" \
+    "==> Image network requests ($CUSTOM_NETREQ): for codex $CUSTOM_NETREQ_CODEX" \
+    "==>   image requests above are not covered by this launch's public or same-name grants (no lookup; DNS, private-answer and TLS client limits still apply); they never grant access and the launch continues; each image reference is reported once, then as changes" \
+    "==>   to grant: --allow-egress HOST or tcp://HOST:PORT, or --allow-internet-egress; IP/CIDR, --allow-lan and --allow-host grants are not matched to names")"
+  block="$(awk 'BEGIN { inside = 0 } /^==> Image network requests \(/ { inside = 1 } inside { print } inside && /^==>   to grant: / { exit }' <<<"$out")" || return 1
+  assert_eq "the image report is exactly the two groups and the trailer" "$expected" "$block" || return 1
+  # One line per group in the whole output: no duplicate block later in stderr.
+  image_line_count="$(grep -c '^==> Image network requests ' <<<"$out")" || image_line_count=0
+  assert_eq "the report has one line per group and no second block" "2" "$image_line_count" || return 1
+  # The display store records the entry under the selected reference: the labels
+  # are read from the imported content's validated config, not from the source.
+  [ -f "$store" ] || {
+    echo "    FAIL: no display store at $store"
+    return 1
+  }
+  local entries
+  entries="$(jq -r --arg ref "$CUSTOM_NETREQ" \
+    '[.references[] | select(.reference == $ref)] | length' "$store")" || return 1
+  assert_eq "the store holds one entry keyed by the selection" "1" "$entries" || return 1
+  jq -e --arg ref "$CUSTOM_NETREQ" --arg base "$CUSTOM_NETREQ_BASE" \
+    '.references[] | select(.reference == $ref) | .baseline.image == [$base]' \
+    "$store" >/dev/null || return 1
+  jq -e --arg ref "$CUSTOM_NETREQ" --arg codex "$CUSTOM_NETREQ_CODEX" \
+    '.references[] | select(.reference == $ref) | .baseline["agent.codex"] == [$codex]' \
+    "$store" >/dev/null || return 1
+
+  # A second launch of the same reference says nothing at all.
+  capture_custom_launch "$name-again" "$proj" --no-git --image "$CUSTOM_NETREQ" hello-258 || return 1
+  require_launch_ok "$name-again" || return 1
+  assert_no_host_calls || return 1
+  out="$(read_launch_evidence "$name-again")" || return 1
+  assert_no_match "the relaunch is silent" '^==> Image network requests ' "$out" || return 1
+}
+
 # 2. state persists across independent boots, nonroot + root. Declared persist
 # target, project bind, direct state and (nonroot only) plain HOME sentinels are
 # all read back, with link targets and bind owner bits in both sessions.
@@ -9279,6 +9371,7 @@ run_check "custom-image-setup-verification-selected-ref" custom_image_setup_veri
 
 run_check "custom-image-runs-program" custom_image_runs_program
 run_check "custom-image-stamp-present-nonnumeric" custom_image_stamp_present
+run_check "custom-image-network-requests-labeled" custom_image_network_requests_labeled
 run_check "custom-image-direct-both-forms" custom_image_direct_both_forms
 run_check "custom-image-direct-argv" custom_image_direct_argv
 run_check "custom-image-direct-statuses" custom_image_direct_statuses
