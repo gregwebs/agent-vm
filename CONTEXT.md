@@ -826,6 +826,28 @@ one bounded visit budget; a reference cycle is a config error. Notices and
 `doctor` attribute at entry level — the reference the user wrote, never the sets
 it nests (#511).
 
+**Image request**: a **network request** a **boot image** declares in an
+`org.agent-vm.network-requests.image.<component>` OCI label; it applies to every
+launch of that image. Never a grant. Read from the validated OCI config of the
+content the launch boots, before the sandbox is created, and reported as one
+`for every launch` group (#505).
+See [ADR-0060](docs/adr/0060-image-network-requests-reported-once-then-as-changes.md).
+
+**Agent request**: a **network request** a **boot image** declares for one
+agent in an `org.agent-vm.network-requests.agent.<agent>` label. The launcher
+reports it grouped under that agent and never matches it to the launched tool, so
+a renamed or wrapper tool cannot silently miss its group (#505).
+
+**Image request baseline**: the set last **shown** for each label group of one
+selected image reference, kept in the display store
+(`<state root>/image-network-requests.json`) with the ignored-label facts. It
+advances for a group only when a launch printed a line for that group, so a
+covered-only change stays **pending** until some launch shows it; a covered
+addition that arrives in the same launch as its own group's line is absorbed
+(`agent-vm doctor` lists it). Display state, never authority, bounded at 256
+references and 8 MiB. See
+[ADR-0060](docs/adr/0060-image-network-requests-reported-once-then-as-changes.md).
+
 **Persisted grant**: user-authored host authority in a user-tier `[network]`
 setting, read only from a verified file and merged per launch. CLI flags override
 persisted Boolean values and add allowances for that launch; launches never

@@ -1385,6 +1385,18 @@ pub(crate) async fn launch(
             notices.emit(line)?;
         }
     }
+    // The image's own declarations (ADR-0060), compared to the same authority and
+    // also before it is applied. Non-authoritative in exactly the way the tool
+    // report is: the only consumer of a parsed request is rendering, and the
+    // display store it reads and writes is never an input to policy.
+    if let Some(source) = prepared.request_labels() {
+        crate::image_requests::report_before_boot(
+            source,
+            &label,
+            |request| network_plan.covers(request),
+            |line| notices.emit(line),
+        )?;
+    }
 
     let executable =
         std::env::current_exe().context("resolving agent-vm executable for credential hook")?;
@@ -4533,6 +4545,10 @@ mod tests {
         assert!(select < position("ensure_msb_home("));
         let report = position("network_plan\n            .request_report(");
         assert!(notices < report && report < base_network);
+        // ADR-0060: the image report sits with the tool report, after the egress
+        // notices and before the policy is applied to the builder.
+        let image = position("crate::image_requests::report_before_boot(");
+        assert!(report < image && image < base_network);
         assert!(base_network < credential_network);
         assert!(credential_network < build);
         assert!(build < create);

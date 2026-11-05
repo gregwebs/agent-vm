@@ -382,6 +382,24 @@ fn effective_cache_dir_from(
     Ok(PathBuf::from(msb_home).join("cache"))
 }
 
+/// The OCI image cache directory a launch would use for `msb_home`, without
+/// requiring `MSB_HOME` to be set in this process.
+///
+/// `doctor` is dispatched before the msb bootstrap (`main.rs`), so it cannot call
+/// [`effective_cache_dir`]: that one reads the process-wide `MSB_HOME` that
+/// `point_at_msb_home` writes. The rule is the same one, reached from the home it
+/// is given, so the diagnostic and the launch cannot disagree about where the
+/// cache is.
+pub(crate) fn cache_dir_for(msb_home: &Path) -> Result<PathBuf> {
+    let share = crate::env_flag::enabled(SHARE_MSB_CACHE_ENV);
+    let shared = if share {
+        resolve_shared_cache_dir()?
+    } else {
+        PathBuf::new()
+    };
+    effective_cache_dir_from(share, Some(msb_home.as_os_str()), &shared)
+}
+
 /// The OCI image cache directory the pinned `msb` actually uses in this
 /// process. Mirrors [`point_at_msb_home`]: `MSB_HOME/cache` unless the
 /// shared-cache opt-in redirected `paths.cache`. Must be called after

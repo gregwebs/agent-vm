@@ -53,6 +53,9 @@ pub(crate) const MAX_RETAINED_FINDINGS: usize = 128;
 /// Bytes an accepted provider identifier may contain: ASCII lowercase
 /// letters, digits, `-`, `_` and `.`. Anything else — uppercase, whitespace,
 /// or a byte that could look like a secret — fails the whole-value check.
+///
+/// ADR-0060 reuses the same shape as the image-label NAME rule, so a request
+/// label's `NAME` and a provider id are one verification.
 pub(crate) open spec fn provider_id_byte_allowed(byte: u8) -> bool {
     (b'a' <= byte && byte <= b'z')
         || (b'0' <= byte && byte <= b'9')
@@ -71,7 +74,7 @@ pub(crate) open spec fn provider_id_is_safe_spec(bytes: Seq<u8>) -> bool {
 // `(b'a'..=b'z').contains(&byte)`) is kept so the exec bytes stay
 // syntactically the predicate the `verus!` spec fn unfolds to.
 #[allow(clippy::manual_range_contains)]
-fn provider_id_is_safe_bytes(bytes: &[u8]) -> (ok: bool)
+pub(crate) fn provider_id_is_safe_bytes(bytes: &[u8]) -> (ok: bool)
     ensures ok == provider_id_is_safe_spec(bytes@),
 {
     let len = bytes.len();

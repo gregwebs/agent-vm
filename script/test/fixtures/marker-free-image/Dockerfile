@@ -70,3 +70,12 @@ RUN mkdir -p /opt/e2e-258/bin && mv /bin/bash /opt/e2e-258/bin/bash \
     && test ! -e /bin/bash && test ! -e /usr/bin/bash \
     && test ! -e /usr/local/bin/hello-258 && test ! -e /usr/local/bin/direct-probe-398
 ENV PATH=/opt/e2e-258/bin:/usr/bin:/bin
+
+# #505 (A19): an image that declares its runtime network requests in OCI labels
+# (ADR-0060 / agent-vm-images ADR 0014). `image.base` contributes to *every
+# launch*'s group; `agent.codex` is its own group. Both values are grammatical
+# requests, so a launch reports them and `agent-vm doctor` lists them in full.
+# Keep these literals in sync with `CUSTOM_NETREQ_*` in script/test/e2e.sh.
+FROM marker-free AS network-requests-labeled
+LABEL org.agent-vm.network-requests.image.base="deb.debian.org" \
+      org.agent-vm.network-requests.agent.codex="api.openai.com"

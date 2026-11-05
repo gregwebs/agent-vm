@@ -102,6 +102,10 @@ pub struct ArchiveSpec {
     pub layer: LayerContent,
     /// Omit the layer blob entry from the archive entirely.
     pub omit_layer_blob: bool,
+    /// OCI config `Labels` (ADR-0060's image-network-request labels live here).
+    /// Empty means the `Labels` key is omitted, which is what every unlabeled
+    /// image ships.
+    pub labels: Vec<(String, String)>,
 }
 
 impl Default for ArchiveSpec {
@@ -112,6 +116,7 @@ impl Default for ArchiveSpec {
             descriptor_platform: PlatformSpec::Host,
             layer: LayerContent::Valid,
             omit_layer_blob: false,
+            labels: Vec::new(),
         }
     }
 }
@@ -203,13 +208,24 @@ fn config_json(spec: &ArchiveSpec, diff_id: &str) -> Vec<u8> {
         doc.insert("os".to_string(), os.into());
         doc.insert("architecture".to_string(), arch.into());
     }
-    doc.insert(
-        "config".to_string(),
-        serde_json::json!({
-            "Env": [format!("MARKER={}", spec.marker)],
-            "Cmd": ["/bin/marker"],
-        }),
+    let mut config = serde_json::Map::new();
+    config.insert(
+        "Env".to_string(),
+        serde_json::json!([format!("MARKER={}", spec.marker)]),
     );
+    config.insert("Cmd".to_string(), serde_json::json!(["/bin/marker"]));
+    if !spec.labels.is_empty() {
+        config.insert(
+            "Labels".to_string(),
+            serde_json::Value::Object(
+                spec.labels
+                    .iter()
+                    .map(|(key, value)| (key.clone(), serde_json::json!(value)))
+                    .collect(),
+            ),
+        );
+    }
+    doc.insert("config".to_string(), serde_json::Value::Object(config));
     doc.insert(
         "rootfs".to_string(),
         serde_json::json!({ "type": "layers", "diff_ids": [diff_id] }),
