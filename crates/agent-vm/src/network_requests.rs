@@ -114,6 +114,17 @@ pub(crate) struct NetworkRequestsError {
     position: Option<usize>,
     reason: NetworkRequestError,
 }
+impl NetworkRequestsError {
+    /// The refused field's index, when the refusal has one. A caller that renders
+    /// the reason without the position (`image_requests`) needs the distinction,
+    /// and the fields stay private so that rendering cannot gain a third shape.
+    pub(crate) fn position(&self) -> Option<usize> {
+        self.position
+    }
+    pub(crate) fn reason(&self) -> NetworkRequestError {
+        self.reason
+    }
+}
 impl fmt::Display for NetworkRequestError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use AllowanceError::*;
@@ -165,9 +176,11 @@ impl RequestTier {
         }
     }
 }
-const SCOPE: &str =
+/// One source for the coverage wording, shared by the tool report and the image
+/// report (ADR-0060).
+pub(crate) const SCOPE: &str =
     "public or same-name grants (no lookup; DNS, private-answer and TLS client limits still apply)";
-const GRANT_HINT: &str = "==>   to grant: --allow-egress HOST or tcp://HOST:PORT, or --allow-internet-egress; IP/CIDR, --allow-lan and --allow-host grants are not matched to names";
+pub(crate) const GRANT_HINT: &str = "==>   to grant: --allow-egress HOST or tcp://HOST:PORT, or --allow-internet-egress; IP/CIDR, --allow-lan and --allow-host grants are not matched to names";
 pub(crate) struct RequestReport<'a> {
     tier: RequestTier,
     total: usize,

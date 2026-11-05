@@ -270,10 +270,22 @@ fn run_to(
             write_line(out, "")?;
             write_line(out, &describe_launch_view(&launch))?;
         }
-        let (boot_image_section, boot_image_failure) =
+        let (boot_image_section, boot_image_failure, selection) =
             describe_boot_image(images.as_ref(), &env_slot);
         write_line(out, "")?;
         write_line(out, &boot_image_section)?;
+        // ADR-0060's section: the current picture from the cache, without
+        // acquiring. Omitted when there is no selection, because the boot-image
+        // section above already reports that error. Nothing here changes the exit
+        // status or writes anything.
+        if let Some(boot) = selection {
+            let cached = match crate::msb_install::cache_dir_for(&msb_home) {
+                Ok(cache_dir) => crate::image_pin::cached_request_labels(&boot, &cache_dir),
+                Err(_) => crate::image_requests::CachedLabels::LocationUnknown,
+            };
+            write_line(out, "")?;
+            write_line(out, &crate::image_requests::doctor_section(&cached))?;
+        }
         write_line(out, "")?;
         write_line(out, "==> agent-vm doctor: available operations")?;
         write_line(
@@ -1119,7 +1131,8 @@ fn describe_tier(tier: &TierReport) -> String {
     }
 }
 
-/// Renders the boot-image section and returns the failure it found, if any.
+/// Renders the boot-image section and returns the failure it found, if any, plus
+/// the `Ok` selection so the image-request section can observe the same one.
 ///
 /// Observational by construction: [`boot_image::observe`] reads the retained
 /// record and resolves the selection from **one** snapshot, so the `default`
@@ -1129,7 +1142,7 @@ fn describe_tier(tier: &TierReport) -> String {
 fn describe_boot_image(
     images: Option<&ConfiguredImages>,
     env: &boot_image::EnvOverride,
-) -> (String, Option<anyhow::Error>) {
+) -> (String, Option<anyhow::Error>, Option<boot_image::BootImage>) {
     let mut out = String::from("==> boot image\n");
     let env_override = match env {
         boot_image::EnvOverride::Present(override_) => {
@@ -1150,7 +1163,7 @@ fn describe_boot_image(
             out.push_str(
                 "AGENT_VM_IMAGE_TAG: <present but not valid Unicode; refusing to select>\n",
             );
-            return (out, None);
+            return (out, None, None);
         }
     };
     // An unreadable config leaves the tiers unknown, but the default slot is
@@ -1177,7 +1190,7 @@ fn describe_boot_image(
         // The config could not be read, so the tiers are unknown.
         out.push_str("unknown (configuration could not be read)\n");
         out.push_str(&format!("default: {default_row}"));
-        return (out, failure);
+        return (out, failure, None);
     };
     out.push_str(&format!(
         "user:    {}\n",
@@ -1207,7 +1220,8 @@ fn describe_boot_image(
         )),
         Err(error) => out.push_str(&format!("selected (without --image): error: {error:#}")),
     }
-    (out, failure)
+    let selection = observation.selected.as_ref().ok().cloned();
+    (out, failure, selection)
 }
 
 /// The `default:` row: which immutable image this host retains, the offered
@@ -1629,6 +1643,7 @@ mod tests {
             "==> tool configuration",
             "==> credentials.yaml (launch credentials)",
             "==> boot image",
+            "==> image network requests",
             "==> agent-vm doctor: available operations",
         ] {
             assert!(text.contains(heading), "missing {heading}: {text}");
@@ -1823,6 +1838,9 @@ user:    none
 project: none
 default: not selected; initial recommendation [<fixture>/home/.config/agent-vm/default-image.json]
 selected (without --image): not selected; initial recommendation [<fixture>/home/.config/agent-vm/default-image.json]
+
+==> image network requests
+not cached; doctor does not acquire images
 
 ==> agent-vm doctor: available operations
       --reset-msb-db   move MSB_HOME/db aside (reversible) so the next

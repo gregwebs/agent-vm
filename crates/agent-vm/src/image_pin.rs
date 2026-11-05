@@ -349,9 +349,14 @@ pub(crate) enum DefaultChange {
 pub(crate) struct PreparedSelection {
     sdk_reference: String,
     image_env: Option<Vec<String>>,
+    /// The canonical **selected** target's text, which is the display store's key
+    /// (ADR-0060 R15). `None` for a local path. Deliberately not the approved
+    /// digest: a tag must keep one entry across refreshes.
+    selection: Option<String>,
     /// Held only so the shared publication barrier outlives the SDK's create;
-    /// dropping this value is what releases it.
-    _native: Option<PreparedNativeImage>,
+    /// dropping this value is what releases it. It is also the booted content's
+    /// validated metadata, which is where the image's request labels are read.
+    native: Option<PreparedNativeImage>,
 }
 
 impl PreparedSelection {
@@ -360,15 +365,21 @@ impl PreparedSelection {
         Self {
             sdk_reference: reference.to_owned(),
             image_env: None,
-            _native: None,
+            selection: None,
+            native: None,
         }
     }
 
-    fn approved(approved: &ImmutableImageRef, prepared: PreparedNativeImage) -> Self {
+    fn approved(
+        approved: &ImmutableImageRef,
+        selection: String,
+        prepared: PreparedNativeImage,
+    ) -> Self {
         Self {
             sdk_reference: approved.as_str().to_owned(),
             image_env: Some(prepared.image().image_env().to_vec()),
-            _native: Some(prepared),
+            selection: Some(selection),
+            native: Some(prepared),
         }
     }
 
@@ -384,6 +395,17 @@ impl PreparedSelection {
     /// local path, which has no OCI config.
     pub(crate) fn image_env(&self) -> Option<&[String]> {
         self.image_env.as_deref()
+    }
+
+    /// The image-request report's input: the canonical selected reference and the
+    /// labels of exactly the content this launch boots (ADR-0060 R1, R15).
+    /// `None` for a local path, which has no OCI config and declares nothing.
+    pub(crate) fn request_labels(&self) -> Option<crate::image_requests::LabelSource<'_>> {
+        let native = self.native.as_ref()?;
+        Some(crate::image_requests::LabelSource {
+            selection: self.selection.clone()?,
+            labels: native.image().image_labels(),
+        })
     }
 }
 
@@ -411,15 +433,18 @@ pub(crate) async fn prepare_selected(boot: &BootImage) -> Result<PreparedSelecti
             ));
         }
     };
+    // The store key is the **selected** target's canonical text, never the
+    // approved digest: a tag keeps one display entry across refreshes (R15).
+    let selection = target.canonical().whole();
     let key = PinKey::new(&target)?;
     let current = lookup(&key)?;
     let Some(current) = current else {
-        return prepare_first_pin(boot, &target, &key, &label).await;
+        return prepare_first_pin(boot, &target, &key, &selection, &label).await;
     };
     let prepared = approved_preparation(&current, &label, Rendering::Selection).await?;
     retain_default(boot, &current)?;
     let approved = current.immutable_reference()?;
-    Ok(PreparedSelection::approved(&approved, prepared))
+    Ok(PreparedSelection::approved(&approved, selection, prepared))
 }
 
 /// The absent-approval branch: acquire the source itself, then establish the
@@ -428,6 +453,7 @@ async fn prepare_first_pin(
     boot: &BootImage,
     target: &OciTarget,
     key: &PinKey,
+    selection: &str,
     label: &ImageLabel,
 ) -> Result<PreparedSelection> {
     let prepared = acquire_or_render(
@@ -443,7 +469,11 @@ async fn prepare_first_pin(
     match commit(&candidate, &Approval::initial(&candidate), action) {
         Ok(committed) => {
             let approved = committed.pin.immutable_reference()?;
-            Ok(PreparedSelection::approved(&approved, prepared))
+            Ok(PreparedSelection::approved(
+                &approved,
+                selection.to_owned(),
+                prepared,
+            ))
         }
         Err(error) => {
             // A peer may have committed a different candidate while this
@@ -455,7 +485,11 @@ async fn prepare_first_pin(
                     drop(prepared);
                     let prepared = approved_preparation(&pin, label, Rendering::Selection).await?;
                     let approved = pin.immutable_reference()?;
-                    Ok(PreparedSelection::approved(&approved, prepared))
+                    Ok(PreparedSelection::approved(
+                        &approved,
+                        selection.to_owned(),
+                        prepared,
+                    ))
                 }
                 _ => Err(error),
             }
@@ -769,6 +803,54 @@ fn commit(
     action: DefaultAction,
 ) -> Result<store::Committed> {
     store::Store::host()?.commit(candidate, approval, action)
+}
+
+/// What the image cache holds for the content a launch of `boot` would boot
+/// (ADR-0060 R20): the approved digest when one is approved, otherwise the
+/// canonical selection.
+///
+/// An observation for `doctor`, not a preparation: it never acquires, never
+/// contacts a registry, takes no lock and writes nothing. Approval selection is
+/// shared with launch preparation ([`lookup`] on the same key), so the diagnostic
+/// and the launch cannot disagree about which content is meant.
+pub(crate) fn cached_request_labels(
+    boot: &BootImage,
+    cache_dir: &std::path::Path,
+) -> crate::image_requests::CachedLabels {
+    use crate::image_acquire::CachedLabelsRead;
+    use crate::image_requests::CachedLabels;
+    let parse_reference = |text: &str| text.parse::<microsandbox_image::Reference>().ok();
+    match OciTarget::parse(boot.reference().as_str()) {
+        Ok(target) => {
+            let key = match PinKey::new(&target) {
+                Ok(key) => key,
+                Err(_) => return CachedLabels::Unreadable,
+            };
+            let reference = match lookup(&key) {
+                // A damaged approval record is its own fixed row: the launch would
+                // fail here, so nothing can be said about the cached content.
+                Err(_) => return CachedLabels::ApprovalUnreadable,
+                Ok(Some(pin)) => match pin.immutable_reference() {
+                    Ok(approved) => parse_reference(approved.as_str()),
+                    Err(_) => return CachedLabels::Unreadable,
+                },
+                Ok(None) => parse_reference(target.canonical().whole().as_str()),
+            };
+            let Some(reference) = reference else {
+                return CachedLabels::Unreadable;
+            };
+            match crate::image_acquire::read_cached_labels_for_diagnostics(cache_dir, &reference) {
+                CachedLabelsRead::NotCached => CachedLabels::NotCached,
+                CachedLabelsRead::Unreadable => CachedLabels::Unreadable,
+                CachedLabelsRead::Present(labels) => CachedLabels::Present(labels),
+            }
+        }
+        // A local path has no OCI config; an unusable reference cannot be
+        // observed at all, and the boot-image section above already names that
+        // failure, so it gets the same "cannot be read" row.
+        Err(OciTargetError::LocalPath) => CachedLabels::LocalPath,
+        Err(OciTargetError::InvalidReference) => CachedLabels::Unreadable,
+    }
 }
 
 /// Logical fallback read: bounded, shared, journal-aware and strictly read-only.

@@ -246,6 +246,17 @@ Each project directory gets:
   `${AGENT_VM_STATE_DIR-${XDG_STATE_HOME-$HOME/.local/state}/agent-vm}/<hash>/`.
 - **A sandbox name**, `agent-vm-<hash>-<pid>`.
 
+Host-wide, beside those project directories, one display file:
+
+- `<state_root>/image-network-requests.json` keeps the image-request display
+  state for every selected image reference: the set last *shown* for each request
+  group, plus the ignored-label facts. It is 0600, atomic-replaced, lock-free
+  (last writer wins) and bounded at 256 references and 8 MiB. It is display state
+  only — no launch reads it for policy — so a damaged file, a write failure or a
+  path that is not a regular file degrades to "report in full again" and never to
+  a failed launch. See
+  [ADR-0060](docs/adr/0060-image-network-requests-reported-once-then-as-changes.md).
+
 The PID suffix is deliberate. An earlier design used a bare `agent-vm-<hash>`,
 which made the name double as garbage collection: a second launch in the same
 project would `.replace()` the first, giving it 10 s to exit and then killing

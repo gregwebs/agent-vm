@@ -739,6 +739,58 @@ def matrix():
         rust("set_claim_matches_byte_oracle"))
     add("set-claim-case-sensitive-proof", REFERENCE, egress_claim_prefix,
         "    let prefix = (s[0] == 0x73)", gate, "verification results::")
+    # -- Image-declared network requests (#505, ADR-0060) -----------------------
+    # Every anchor below is executable-body text that occurs exactly once: the
+    # kernel anchors include the `ensures` line plus the whole body (the
+    # `limit_body` precedent), so the spec text can never be what is mutated.
+    image_requests = SRC + "image_requests.rs"
+    image_store = SRC + "image_requests/baseline.rs"
+    label_limit_body = ("    ensures ok == request_label_count_within_limit_spec(count),\n"
+                        "{\n"
+                        "    count <= MAX_REQUEST_LABELS\n}")
+    label_limit_mutant = ("    ensures ok == request_label_count_within_limit_spec(count),\n"
+                          "{\n"
+                          "    count <= MAX_REQUEST_LABELS + 1\n}")
+    label_units = rust("image_requests::tests::label_budget_")
+    add("image-label-limit", image_requests, label_limit_body, label_limit_mutant, label_units)
+    add("image-label-limit-proof", image_requests, label_limit_body, label_limit_mutant, gate,
+        "verification results::")
+    # The kind precedence: the Agent arm answering Image is one word, and the
+    # table notices. `requires !(image_word && agent_word)` keeps the two arms
+    # mutually exclusive, so this is the only way to invert the decision.
+    kind_body = ("    ensures k == request_label_kind_spec(f),\n"
+                 "{\n"
+                 "    if !f.under_prefix {\n"
+                 "        RequestLabelKind::NotRequest\n"
+                 "    } else if f.image_word && f.name_safe {\n"
+                 "        RequestLabelKind::Image\n"
+                 "    } else if f.agent_word && f.name_safe {\n"
+                 "        RequestLabelKind::Agent\n"
+                 "    } else {\n"
+                 "        RequestLabelKind::Unrecognized\n"
+                 "    }\n"
+                 "}")
+    kind_mutant = kind_body.replace("        RequestLabelKind::Agent\n", "        RequestLabelKind::Image\n")
+    add("image-label-kind", image_requests, kind_body, kind_mutant, rust("image_requests::tests::key_kind_"))
+    add("image-label-kind-proof", image_requests, kind_body, kind_mutant, gate, "verification results::")
+    # The one place coverage touches the report. Admitting every addition is the
+    # mutant that makes a fully covered group print.
+    coverage_filter = "    added.filter(|request| !covered(request)).collect()"
+    add("image-coverage-ignored", image_requests, coverage_filter,
+        "    added.filter(|_| true).collect()", rust("image_requests::tests::compose_covered_"))
+    # The store's count bound. There is no pre-truncation to 256 on the write
+    # path, so the encode row reaches the predicate at 257 and the decode row
+    # hands it a hand-written 257.
+    store_limit_body = ("    ensures ok == baseline_store_admits_spec(count, bytes),\n"
+                        "{\n"
+                        "    count <= MAX_BASELINE_REFERENCES && bytes <= MAX_BASELINE_BYTES\n}")
+    store_limit_mutant = ("    ensures ok == baseline_store_admits_spec(count, bytes),\n"
+                          "{\n"
+                          "    count <= MAX_BASELINE_REFERENCES + 1 && bytes <= MAX_BASELINE_BYTES\n}")
+    add("image-baseline-limit", image_store, store_limit_body, store_limit_mutant,
+        rust("image_requests::baseline::tests::admission_"))
+    add("image-baseline-limit-proof", image_store, store_limit_body, store_limit_mutant, gate,
+        "verification results::")
     return controls
 
 
