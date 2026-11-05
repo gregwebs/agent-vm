@@ -1009,6 +1009,13 @@ fn describe_config(report: ConfigReport) -> (String, Option<anyhow::Error>, Opti
         "resolved: declared tools; launch-verb order\n"
     };
     let conflicts = render_conflicts(report.conflicts());
+    // The persisted egress references are user-authored authority, so `doctor`
+    // shows what each one grants. Rendered before the report is consumed by
+    // `into_launch_catalog`, like every other borrow here.
+    let egress_references = report
+        .user_network()
+        .map(describe_egress_references)
+        .unwrap_or_default();
 
     let mut out = String::from("==> tool configuration\n");
     out.push_str(&tiers);
@@ -1035,9 +1042,40 @@ fn describe_config(report: ConfigReport) -> (String, Option<anyhow::Error>, Opti
         }
     };
     out.push_str(&conflicts);
+    out.push_str(&egress_references);
     // Drop the final newline: the caller adds one via `writeln!`.
     out.truncate(out.trim_end_matches('\n').len());
     (out, failure, catalog)
+}
+
+/// The persisted egress references of one `[network]` table and what each
+/// grants (ADR-0059).
+///
+/// Empty when the table has none, so `doctor` output for every config written
+/// before #506 is byte-identical. Each expansion is listed because this is
+/// *user-authored* authority, not ADR-0039's bounded repository metadata — but
+/// bounded per reference, because one declaration can name 64 requests.
+fn describe_egress_references(network: &crate::user_network::UserNetwork) -> String {
+    const MAX_SHOWN: usize = 64;
+    let mut out = String::new();
+    for (reference, expansion) in network.allowances().expansions() {
+        let mut grants: Vec<String> = expansion
+            .iter()
+            .take(MAX_SHOWN)
+            .map(ToString::to_string)
+            .collect();
+        if expansion.len() > MAX_SHOWN {
+            grants.push(format!("+{} more", expansion.len() - MAX_SHOWN));
+        }
+        if out.is_empty() {
+            out.push_str(&format!(
+                "persisted egress references in \"{}\" [network]:\n",
+                crate::one_line::path(network.file())
+            ));
+        }
+        out.push_str(&format!("  {reference} -> {}\n", grants.join(", ")));
+    }
+    out
 }
 
 /// The `warning:` blocks for cross-tier shadows, in project declaration order.
@@ -3077,6 +3115,45 @@ substituted."#;
             home: None,
         })
         .expect("fixture config should load")
+    }
+
+    /// A25: the persisted-reference block, and nothing new for a table without
+    /// one. Every other `doctor` row is untouched, so the block is additive.
+    #[test]
+    fn doctor_lists_persisted_egress_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("config.toml");
+        std::fs::write(
+            &user,
+            "[[tools]]\nname = \"codex\"\ncommand = \"codex\"\nnetwork_requests = [\"api.openai.com\", \"auth.openai.com\", \"chatgpt.com\"]\n\n[network]\nallow_egress = [\"tool:codex\"]\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&user, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let report = config_report(Some(&user), &dir.path().join("absent.toml"));
+        let (text, failure, _) = describe_config(report);
+        assert!(failure.is_none(), "{text}");
+        assert!(
+            text.ends_with(&format!(
+                "persisted egress references in \"{}\" [network]:\n  tool:codex -> tcp://api.openai.com:443, tcp://auth.openai.com:443, tcp://chatgpt.com:443",
+                crate::one_line::path(&user)
+            )),
+            "{text}"
+        );
+
+        // A `[network]` table with no reference prints nothing new.
+        let other = dir.path().join("other.toml");
+        std::fs::write(
+            &other,
+            "[[tools]]\nname = \"codex\"\ncommand = \"codex\"\n\n[network]\nallow_egress = [\"10.0.0.5\"]\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let report = config_report(Some(&other), &dir.path().join("absent.toml"));
+        let (text, failure, _) = describe_config(report);
+        assert!(failure.is_none(), "{text}");
+        assert!(!text.contains("egress references"), "{text}");
     }
 
     #[test]

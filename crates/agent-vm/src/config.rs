@@ -108,6 +108,7 @@
 
 use crate::config_authority::{self, AuthorityTriggers};
 use crate::config_mounts::{self, ResolvedMountList, UserMounts};
+use crate::egress_reference::UserToolRequests;
 use crate::user_network::{self, UserNetwork};
 
 use crate::network_requests::{NetworkRequests, RequestTier};
@@ -220,6 +221,8 @@ pub(crate) struct ConfigReport {
     images: ConfiguredImages,
     user_network: Option<UserNetwork>,
     user_mounts: Option<UserMounts>,
+    /// The user file's own tools as an egress-reference namespace (ADR-0059).
+    user_tools: Option<UserToolRequests>,
     uses_defaults: bool,
     conflicts: Vec<ConfigConflict>,
 }
@@ -252,6 +255,17 @@ impl ConfigReport {
     /// Read before into_launch_catalog consumes the report, like images.
     pub(crate) fn user_network(&self) -> Option<&UserNetwork> {
         self.user_network.as_ref()
+    }
+
+    /// The namespace a CLI `tool:NAME` resolves against: the **user tier's own**
+    /// tools, from the same read as their trust verdict, captured before the
+    /// cross-tier merge (ADR-0059).
+    ///
+    /// `None` when there is no user file at all, which is why a reference then
+    /// reports "no user config file was found" rather than an unknown name. Read
+    /// before `into_launch_catalog` consumes the report, like [`Self::images`].
+    pub(crate) fn user_tool_requests(&self) -> Option<&UserToolRequests> {
+        self.user_tools.as_ref()
     }
 
     /// The verified user mount configuration, `Some` when the file declares
@@ -1077,6 +1091,7 @@ pub(crate) fn load(paths: &ConfigPaths) -> Result<ConfigReport> {
         },
         user_network: user_contents.network,
         user_mounts: mounts,
+        user_tools: user_contents.reference_tools,
         uses_defaults,
         conflicts,
     })
@@ -1092,6 +1107,9 @@ struct TierContents {
     mounts: Option<UserMounts>,
     tools: Vec<Tool>,
     image: Option<ConfiguredImage>,
+    /// The user tier's egress-reference namespace, built from these tools. `None`
+    /// for the project tier and for an absent user file.
+    reference_tools: Option<UserToolRequests>,
 }
 
 impl TierContents {
@@ -1101,6 +1119,7 @@ impl TierContents {
             image: None,
             network: None,
             mounts: None,
+            reference_tools: None,
         }
     }
 }
@@ -1188,29 +1207,38 @@ fn read_file_tier(source: TierSource<'_>) -> Result<(TierReport, TierContents)> 
         }),
         mount_sets: raw.mount_sets.is_some(),
     };
-    let authorized = match kind {
-        FileTierKind::User => config_authority::verify(&read, triggers).map_err(|error| {
-            // A refusal caused by a tool's own field names that field first: the
-            // reader has to find the list they must review, and a file with no
-            // top-level `mounts` has nothing else pointing at it. The numeric site
-            // is echoed, never the tool's name or the list's contents.
-            let pointer = match first_tool_mounts {
-                Some(declaration) if raw.mounts.is_none() => {
-                    format!("tools[{declaration}].mounts: ")
-                }
-                _ => String::new(),
-            };
-            anyhow!(
-                "config: {}: {pointer}{error}",
-                crate::one_line::quoted_path(path)
-            )
-        })?,
+    let authorized: Option<config_authority::AuthorizedConfig<'_>>;
+    let reference_trust: Option<crate::config_authority::ReferenceTrust>;
+    match kind {
+        FileTierKind::User => {
+            let verification = config_authority::verify(&read, triggers).map_err(|error| {
+                // A refusal caused by a tool's own field names that field first: the
+                // reader has to find the list they must review, and a file with no
+                // top-level `mounts` has nothing else pointing at it. The numeric site
+                // is echoed, never the tool's name or the list's contents.
+                let pointer = match first_tool_mounts {
+                    Some(declaration) if raw.mounts.is_none() => {
+                        format!("tools[{declaration}].mounts: ")
+                    }
+                    _ => String::new(),
+                };
+                anyhow!(
+                    "config: {}: {pointer}{error}",
+                    crate::one_line::quoted_path(path)
+                )
+            })?;
+            authorized = verification.authorized;
+            // The same read's verdict for a CLI egress reference, which argv
+            // parsing learns about only after this read is gone (ADR-0059).
+            reference_trust = Some(verification.references);
+        }
         FileTierKind::Project => {
             refuse_project_authority(&raw, path)?;
-            None
+            authorized = None;
+            reference_trust = None;
         }
-    };
-    let network = match raw.network.as_ref() {
+    }
+    let parsed_network = match raw.network.as_ref() {
         Some(table) => {
             // A present field always produced a token above (presence *is* the
             // trigger), so this arm cannot be reached with `None`. Refusing
@@ -1270,6 +1298,27 @@ fn read_file_tier(source: TierSource<'_>) -> Result<(TierReport, TierContents)> 
         None => config_mounts::ToolMountLists::empty(),
     };
     let tools = validate_tools(raw.tools, kind.origin(path), tool_lists)?;
+    // This tier's own validated tools, before `merge` and from the same read as
+    // the verdict: the only namespace an egress reference may resolve against
+    // (ADR-0059). The project tier gets `None`, so it can never be one.
+    let reference_tools = reference_trust.map(|trust| UserToolRequests::new(trust, &tools));
+    let network = match parsed_network {
+        Some(parsed) => {
+            // A `[network]` table is authority-bearing, so the user arm always
+            // produced a namespace. Refusing rather than skipping keeps that
+            // invariant load-bearing.
+            let Some(user_tools) = reference_tools.as_ref() else {
+                return Err(anyhow!(
+                    "config: {}: [network]: authority was not measured",
+                    crate::one_line::quoted_path(path)
+                ));
+            };
+            Some(parsed.resolve(user_tools).map_err(|error| {
+                anyhow!("config: {}: {error}", crate::one_line::quoted_path(path))
+            })?)
+        }
+        None => None,
+    };
 
     Ok((
         TierReport {
@@ -1283,6 +1332,7 @@ fn read_file_tier(source: TierSource<'_>) -> Result<(TierReport, TierContents)> 
             image,
             network,
             mounts,
+            reference_tools,
         },
     ))
 }
@@ -2118,79 +2168,101 @@ fn validate_tools(
 }
 
 fn validate_name(raw: &str, origin: &ToolOrigin, index: usize) -> Result<ToolName> {
-    if raw.is_empty() {
+    if let Some(rejection) = tool_name_rejection(raw) {
         return Err(declaration_error(
             origin,
             index,
-            None,
-            "name must not be empty",
+            rejection.echoes_name().then_some(raw),
+            rejection.reason(),
         ));
+    }
+    Ok(ToolName(raw.to_string()))
+}
+
+/// Why one string cannot be a tool name, and nowhere else.
+///
+/// An enum rather than a `Result<ToolName, &'static str>`, because a second
+/// caller decides a different thing from the same rule: ADR-0059 accepts
+/// `tool:NAME` as an egress reference iff this predicate is `None`, and a
+/// reference rejection needs a *fixed* text, never the declaration diagnostic.
+/// The reasons are the same strings `[[tools]]` has always printed, so a tool
+/// and a reference cannot disagree about what a name is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolNameRejection {
+    Empty,
+    WhitespaceOrControl,
+    LeadingDash,
+    Path,
+    Dots,
+    Wildcard,
+    DirectRun,
+    Reserved,
+}
+
+impl ToolNameRejection {
+    /// The declaration diagnostic, byte-identical to what `validate_name` printed
+    /// before this rule was extracted.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Empty => "name must not be empty",
+            Self::WhitespaceOrControl => "name must not contain whitespace or control characters",
+            Self::LeadingDash => "name must not start with '-'",
+            Self::Path => "name must be a single command-name token, not a path",
+            Self::Dots => "name must not be `.` or `..`",
+            Self::Wildcard => "name `*` is reserved: it is the wildcard in a tool's `tools` list",
+            // `run` is reserved for the direct runner, and a generic "reserved"
+            // message would leave the user with no migration path (issue #398).
+            // This precedes the set check so the rename advice is specific.
+            Self::DirectRun => {
+                "name `run` is reserved: `agent-vm run PROGRAM [ARG...]` runs a guest \
+                 program directly. Rename this tool (for example `run-tool`) and launch \
+                 it by the new name."
+            }
+            Self::Reserved => "name is reserved for an agent-vm subcommand; choose another name",
+        }
+    }
+
+    /// Whether the declaration diagnostic quotes the name it refused. Only an
+    /// empty name is unquotable — it would render as `""` and blame nothing.
+    fn echoes_name(self) -> bool {
+        !matches!(self, Self::Empty)
+    }
+}
+
+/// The one tool-name rule, shared by `[[tools]]` validation and ADR-0059's
+/// `tool:NAME` egress references.
+///
+/// Order matters only for *which* reason is reported; every check is independent
+/// of the others.
+pub(crate) fn tool_name_rejection(raw: &str) -> Option<ToolNameRejection> {
+    if raw.is_empty() {
+        return Some(ToolNameRejection::Empty);
     }
     if raw
         .chars()
         .any(|character| character.is_whitespace() || character.is_control())
     {
-        return Err(declaration_error(
-            origin,
-            index,
-            Some(raw),
-            "name must not contain whitespace or control characters",
-        ));
+        return Some(ToolNameRejection::WhitespaceOrControl);
     }
     if raw.starts_with('-') {
-        return Err(declaration_error(
-            origin,
-            index,
-            Some(raw),
-            "name must not start with '-'",
-        ));
+        return Some(ToolNameRejection::LeadingDash);
     }
     if raw.contains('/') {
-        return Err(declaration_error(
-            origin,
-            index,
-            Some(raw),
-            "name must be a single command-name token, not a path",
-        ));
+        return Some(ToolNameRejection::Path);
     }
     if raw.chars().all(|character| character == '.') {
-        return Err(declaration_error(
-            origin,
-            index,
-            Some(raw),
-            "name must not be `.` or `..`",
-        ));
+        return Some(ToolNameRejection::Dots);
     }
     if raw == ALL_TOOLS_WILDCARD {
-        return Err(declaration_error(
-            origin,
-            index,
-            Some(raw),
-            "name `*` is reserved: it is the wildcard in a tool's `tools` list",
-        ));
+        return Some(ToolNameRejection::Wildcard);
     }
-    // `run` is reserved for the direct runner, and a generic "reserved"
-    // message would leave the user with no migration path (issue #398). This
-    // precedes the set check so the rename advice is specific.
     if raw == crate::launch_target::DIRECT_RUN_VERB {
-        return Err(declaration_error(
-            origin,
-            index,
-            Some(raw),
-            "name `run` is reserved: `agent-vm run PROGRAM [ARG...]` runs a guest \
-             program directly. Rename this tool (for example `run-tool`) and launch \
-             it by the new name.",
-        ));
+        return Some(ToolNameRejection::DirectRun);
     }
     if RESERVED_TOOL_NAMES.contains(&raw) {
-        return Err(declaration_error(
-            origin,
-            index,
-            Some(raw),
-            "name is reserved for an agent-vm subcommand; choose another name",
-        ));
+        return Some(ToolNameRejection::Reserved);
     }
-    Ok(ToolName(raw.to_string()))
+    None
 }
 
 fn validate_command(
@@ -8376,5 +8448,464 @@ mod tests {
                 assert_eq!(a.persist(), b.persist());
             }
         }
+    }
+
+    // -- ADR-0059 egress references ---------------------------------------
+
+    /// Every allowance a loaded user `[network]` table grants, in order.
+    fn saved_allowances(report: &ConfigReport) -> Vec<String> {
+        report
+            .user_network()
+            .expect("the fixture declares [network]")
+            .allowances()
+            .allowances()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    const UNKNOWN_TOOL: &str = "an egress reference must name a tool declared in the user config's own [[tools]]; built-in and project tools are never used (`agent-vm tools print` prints the shipped tools to copy there)";
+    const NO_REQUESTS: &str = "an egress reference must name a tool that declares network_requests; this tool declares none, so the reference would grant nothing";
+
+    fn network_table(entries: &str) -> String {
+        format!("\n[network]\nallow_egress = [{entries}]\n")
+    }
+
+    /// A7: the reference expands, in request order, to exact host:port grants.
+    #[test]
+    fn persisted_tool_reference_expands_to_exact_hostnames() {
+        let fixture = Fixture::new();
+        let user = format!(
+            "[[tools]]\nname = \"fetcher\"\ncommand = \"fetcher\"\nnetwork_requests = [\"b.example\", \"a.example:8443\"]\n{}",
+            network_table("\"tool:fetcher\"")
+        );
+        fixture.user(&user);
+        let report = fixture.load().unwrap();
+        assert_eq!(
+            saved_allowances(&report),
+            ["tcp://a.example:8443", "tcp://b.example:443"]
+        );
+    }
+
+    /// A9: own requests only. `tool:shell` would otherwise grant everything.
+    #[test]
+    fn own_requests_only_not_the_tools_closure() {
+        let fixture = Fixture::new();
+        let user = format!(
+            "[[tools]]\nname = \"a\"\ncommand = \"a\"\ntools = [\"b\"]\nnetwork_requests = [\"a.example\"]\n\
+             [[tools]]\nname = \"b\"\ncommand = \"b\"\nnetwork_requests = [\"b.example\"]\n{}",
+            network_table("\"tool:a\"")
+        );
+        fixture.user(&user);
+        let report = fixture.load().unwrap();
+        assert_eq!(saved_allowances(&report), ["tcp://a.example:443"]);
+    }
+
+    /// A10/A11, persisted: the namespace is the user file's own tools, so a
+    /// project declaration of the same name is never resolved — not even when it
+    /// is the launchable verb.
+    #[test]
+    fn persisted_tool_reference_ignores_project_and_builtin_tools() {
+        let fixture = Fixture::new();
+        fixture
+            .user("[[tools]]\nname = \"unrelated\"\ncommand = \"unrelated\"\n")
+            .project("[[tools]]\nname = \"fetcher\"\ncommand = \"fetcher\"\nnetwork_requests = [\"p.example\"]\n");
+        let error = fixture
+            .user(&format!(
+                "[[tools]]\nname = \"unrelated\"\ncommand = \"unrelated\"\n{}",
+                network_table("\"tool:fetcher\"")
+            ))
+            .load()
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            format!(
+                "config: {}: network.allow_egress[0]: {UNKNOWN_TOOL}",
+                crate::one_line::quoted_path(&fixture.user)
+            )
+        );
+        // The built-in catalog is equally unnameable: with no user tools at all,
+        // the shipped `codex` does not resolve.
+        let fixture = Fixture::new();
+        fixture.project("").user(&network_table("\"tool:codex\""));
+        let error = fixture.load().unwrap_err().to_string();
+        assert!(error.contains(&format!("network.allow_egress[0]: {UNKNOWN_TOOL}")));
+        assert!(error.contains("network.allow_egress[0]"), "{error}");
+    }
+
+    /// A12: a user definition shadows the project's for *resolution* too, because
+    /// the namespace is the user tier before the merge.
+    #[test]
+    fn user_tool_shadowing_a_project_tool_expands_the_user_requests() {
+        let fixture = Fixture::new();
+        fixture
+            .user(&format!(
+                "[[tools]]\nname = \"codex\"\ncommand = \"codex\"\nnetwork_requests = [\"u.example\"]\n{}",
+                network_table("\"tool:codex\"")
+            ))
+            .project("[[tools]]\nname = \"codex\"\ncommand = \"codex\"\nnetwork_requests = [\"p.example\"]\n");
+        let report = fixture.load().unwrap();
+        assert_eq!(saved_allowances(&report), ["tcp://u.example:443"]);
+    }
+
+    /// A13: only tools whose origin file is the file the verdict measured.
+    ///
+    /// Three excluded origins and one accepted one, each resolved through the same
+    /// constructor the loader uses. Every exclusion must fail as an **unknown
+    /// tool**: an erroneously included tool could also fail, for instance with
+    /// no requests, so a bare `is_ok` check would accept a wrong filter. A
+    /// variant-only filter excludes project and built-in tools and fails only the
+    /// wrong-file case; dropping the filter entirely fails all three.
+    #[test]
+    fn user_tool_requests_filter_by_origin_and_file() {
+        use crate::config_authority::ReferenceTrust;
+        use crate::egress_reference::{AllowanceEntry, EntryError, UserToolRequests, resolve};
+        let file = Path::new("/home/u/.config/agent-vm/config.toml");
+        let other = Path::new("/home/u/other.toml");
+        // Hand-built `RawTool` values straight into `validate_tools`, which is
+        // the same validation a decoded file goes through; the point here is the
+        // origin filter, not TOML decoding.
+        let raw = |name: &str| RawTool {
+            name: name.to_owned(),
+            command: name.to_owned(),
+            args: Vec::new(),
+            credentials: Vec::new(),
+            tools: None,
+            persist: Vec::new(),
+            interactive_shell: false,
+            env: BTreeMap::new(),
+            network_requests: vec!["a.example".to_owned()],
+            mounts: None,
+        };
+        let project = validate_tools(
+            vec![raw("codex")],
+            ToolOrigin::Project(PathBuf::from("/p/config.toml")),
+            config_mounts::ToolMountLists::empty(),
+        )
+        .unwrap();
+        let builtin = default_tools().unwrap();
+        let wrong_file = validate_tools(
+            vec![raw("codex")],
+            ToolOrigin::User(other.to_path_buf()),
+            config_mounts::ToolMountLists::empty(),
+        )
+        .unwrap();
+        let right_file = validate_tools(
+            vec![raw("codex")],
+            ToolOrigin::User(file.to_path_buf()),
+            config_mounts::ToolMountLists::empty(),
+        )
+        .unwrap();
+        let entry = AllowanceEntry::parse("tool:codex").unwrap();
+        for (label, tools) in [
+            ("project", &project),
+            ("built-in", &builtin),
+            ("another file", &wrong_file),
+        ] {
+            let namespace = UserToolRequests::new(ReferenceTrust::verified_for_test(file), tools);
+            let failure = resolve(vec![entry.clone()], Some(&namespace)).unwrap_err();
+            assert_eq!(failure.index, 0, "{label} tools");
+            assert_eq!(failure.error, EntryError::UnknownTool, "{label} tools");
+        }
+        // The accepted origin, resolved the same way, and expanded to its own
+        // requests: `is_ok` would not show the namespace kept the right tool.
+        let namespace = UserToolRequests::new(ReferenceTrust::verified_for_test(file), &right_file);
+        let resolved = resolve(vec![entry], Some(&namespace)).unwrap();
+        assert_eq!(
+            resolved
+                .allowances()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["tcp://a.example:443"],
+            "same-file tools resolve"
+        );
+    }
+
+    /// A14 and R14's persisted ordering: a `[network]` *syntax* error precedes a
+    /// tool-validation error, and a reference's *resolution* error follows it.
+    #[test]
+    fn persisted_reference_errors_follow_todays_order() {
+        let empty_tool = "[[tools]]\nname = \"t\"\ncommand = \"\"\n";
+        let fixture = Fixture::new();
+        let error = fixture
+            .user(&format!(
+                "{empty_tool}{}",
+                network_table("\"udp://h.example\"")
+            ))
+            .load()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(
+                "network.allow_egress[0]: hostnames allow TLS over TCP only; use tcp://HOST:PORT, or an IP/CIDR for UDP"
+            ),
+            "{error}"
+        );
+        let fixture = Fixture::new();
+        let error = fixture
+            .user(&format!("{empty_tool}{}", network_table("\"tool:nope\"")))
+            .load()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("declaration [0] tool \"t\": command must not be empty"),
+            "{error}"
+        );
+    }
+
+    /// A14: a user tool with no requests grants nothing, so the reference is an
+    /// error rather than a silently empty grant.
+    #[test]
+    fn persisted_reference_to_a_tool_without_requests_is_refused() {
+        let fixture = Fixture::new();
+        let error = fixture
+            .user(&format!(
+                "[[tools]]\nname = \"shell\"\ncommand = \"bash\"\n{}",
+                network_table("\"tool:shell\"")
+            ))
+            .load()
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            format!(
+                "config: {}: network.allow_egress[0]: {NO_REQUESTS}",
+                crate::one_line::quoted_path(&fixture.user)
+            )
+        );
+    }
+
+    /// A26: the project tier gains nothing, byte for byte.
+    #[test]
+    fn project_tool_reference_keeps_the_presence_refusal() {
+        let fixture = Fixture::new();
+        let error = fixture
+            .project(&network_table("\"tool:codex\""))
+            .load()
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            format!(
+                "config: {}: network.allow_egress: network access cannot be granted by the project config; use --allow-* launch flags, or [network] in the user config",
+                crate::one_line::quoted_path(&fixture.project)
+            )
+        );
+    }
+
+    /// A resolved reference uses the captured directory verdict in **both**
+    /// directions, which A31 (link replaced by a file) alone cannot show: that
+    /// test would still pass if resolution re-measured *only the directory*.
+    ///
+    /// Made writable after load, the captured passing verdict still resolves;
+    /// made private after load, the captured `DirWritable` refusal still refuses.
+    #[test]
+    fn captured_directory_verdict_is_not_remeasured() {
+        use std::os::unix::fs::PermissionsExt;
+        let tools_only =
+            "[[tools]]\nname = \"x\"\ncommand = \"x\"\nnetwork_requests = [\"a.example\"]\n";
+        let resolve_x = |report: &ConfigReport| {
+            crate::egress_reference::resolve(
+                vec![crate::egress_reference::AllowanceEntry::parse("tool:x").unwrap()],
+                report.user_tool_requests(),
+            )
+        };
+
+        // Passing read, then the directory becomes writable.
+        let fixture = Fixture::new();
+        fixture.user(tools_only);
+        let directory = fixture.user.parent().unwrap().to_path_buf();
+        let report = fixture.load().expect("a private directory loads");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let resolved = resolve_x(&report).expect("the captured passing verdict still resolves");
+        assert_eq!(
+            resolved
+                .allowances()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["tcp://a.example:443"]
+        );
+
+        // Refused read, then the directory becomes private.
+        let fixture = Fixture::new();
+        fixture.user(tools_only);
+        let directory = fixture.user.parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let report = fixture
+            .load()
+            .expect("a tools-only file still loads whatever its directory is");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let failure = resolve_x(&report).unwrap_err();
+        assert_eq!(
+            failure.error.to_string(),
+            format!(
+                "config: {}: an egress reference refuses a config.toml whose directory is group- or other-writable; a guest or another account may be able to replace the file, so review the [[tools]] network_requests before trusting it",
+                crate::one_line::quoted_path(&fixture.user)
+            ),
+            "the captured refusal survives the directory becoming private"
+        );
+    }
+
+    /// A31: the verdict travels with the read. Replacing the symlink with a
+    /// regular `0600` file afterwards does not make the captured namespace
+    /// trusted, because nothing re-measures.
+    #[test]
+    fn captured_reference_verdict_is_not_remeasured() {
+        let fixture = Fixture::new();
+        let tools_only =
+            "[[tools]]\nname = \"x\"\ncommand = \"x\"\nnetwork_requests = [\"a.example\"]\n";
+        fixture.symlinked_user(tools_only);
+        let report = fixture.load().expect("a tools-only symlink still loads");
+        // The same bytes as a regular, singly-linked `0600` file.
+        std::fs::remove_file(&fixture.user).unwrap();
+        write_file(&fixture.user, tools_only);
+        let namespace = report.user_tool_requests().expect("a user tier");
+        let failure = crate::egress_reference::resolve(
+            vec![crate::egress_reference::AllowanceEntry::parse("tool:x").unwrap()],
+            Some(namespace),
+        )
+        .unwrap_err();
+        assert_eq!(
+            failure.error.to_string(),
+            format!(
+                "config: {}: an egress reference requires config.toml to be a regular file, but it is reached through a symbolic link; its target may be writable by a guest or project, so review the [[tools]] network_requests before trusting the file (a symlinked config without an egress reference still works)",
+                crate::one_line::quoted_path(&fixture.user)
+            )
+        );
+    }
+
+    /// A32: the namespace is owned data. Rewriting the file after load cannot
+    /// change what the captured namespace expands to, because nothing re-reads.
+    #[test]
+    fn captured_namespace_is_not_reread() {
+        let fixture = Fixture::new();
+        fixture
+            .user("[[tools]]\nname = \"x\"\ncommand = \"x\"\nnetwork_requests = [\"a.example\"]\n");
+        let report = fixture.load().unwrap();
+        fixture
+            .user("[[tools]]\nname = \"x\"\ncommand = \"x\"\nnetwork_requests = [\"b.example\"]\n");
+        let namespace = report.user_tool_requests().expect("a user tier");
+        let resolved = crate::egress_reference::resolve(
+            vec![crate::egress_reference::AllowanceEntry::parse("tool:x").unwrap()],
+            Some(namespace),
+        )
+        .unwrap();
+        assert_eq!(
+            resolved
+                .allowances()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["tcp://a.example:443"]
+        );
+    }
+
+    /// A34: the disclosed rebinding. `tool:8443` used to be the hostname `tool`
+    /// on port 8443; it is now a reference to a tool of that name, and a user tool
+    /// named `8443` silently redirects it.
+    #[test]
+    fn numeric_tool_name_rebinds_a_former_tool_port_hostname() {
+        let fixture = Fixture::new();
+        let user = format!(
+            "[[tools]]\nname = \"8443\"\ncommand = \"n\"\nnetwork_requests = [\"other.example:9443\"]\n{}",
+            network_table("\"tool:8443\", \"TOOL:8443\"")
+        );
+        fixture.user(&user);
+        let report = fixture.load().unwrap();
+        assert_eq!(
+            saved_allowances(&report),
+            ["tcp://other.example:9443"],
+            "one entry: the two spellings are one reference"
+        );
+        // The literal spelling still means what it always did.
+        let fixture = Fixture::new();
+        fixture
+            .user(&format!(
+                "[[tools]]\nname = \"8443\"\ncommand = \"n\"\nnetwork_requests = [\"other.example:9443\"]\n{}",
+                network_table("\"tcp://tool:8443\"")
+            ));
+        let report = fixture.load().unwrap();
+        assert_eq!(
+            saved_allowances(&report),
+            ["tcp://tool:8443"],
+            "the documented fix keeps the old meaning"
+        );
+    }
+
+    /// A36: the USAGE example, byte-identical — checked against `USAGE.md`
+    /// itself, not against a copy of it.
+    ///
+    /// Two links, both inside the "Egress references (user tools)" section and
+    /// both bounded by the next heading (a search that runs to EOF would accept a
+    /// snippet or an output block anywhere later in the file): the example TOML is
+    /// asserted to occur there before it is loaded, and the *documented expansion*
+    /// is read out of the same section and compared with what the loader produces.
+    /// Editing either half of the documentation without editing this test fails
+    /// here.
+    #[test]
+    fn usage_egress_reference_example_loads() {
+        const USAGE_EXAMPLE: &str = r#"[[tools]]
+name = "fetcher"
+command = "fetcher"
+network_requests = ["api.example.com", "git.example.com:8443"]
+
+[network]
+allow_egress = ["tool:fetcher"]
+"#;
+        let usage = include_str!("../../../USAGE.md");
+        let (_, section) = usage
+            .split_once("### Egress references (user tools)")
+            .expect("USAGE documents egress references");
+        let section = section
+            .split_once("\n#")
+            .map_or(section, |(section, _)| section);
+        assert!(
+            section.contains(USAGE_EXAMPLE),
+            "USAGE.md's egress-reference section must carry this exact example"
+        );
+        let documented: Vec<String> = section
+            .split_once("`tool:fetcher` grants exactly two allowances, in request order:")
+            .expect("USAGE documents what the example grants")
+            .1
+            .split_once("```text\n")
+            .expect("the documented expansion is a text block")
+            .1
+            .split_once("\n```")
+            .expect("the documented expansion block is closed")
+            .0
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let fixture = Fixture::new();
+        fixture.project("").user(USAGE_EXAMPLE);
+        let report = fixture.load().expect("the documented example loads");
+        assert_eq!(
+            saved_allowances(&report),
+            documented,
+            "the documented expansion, in the documented order"
+        );
+    }
+
+    /// A23's unit half and the `[network]` trigger rule: a user file that declares
+    /// no authority-bearing field still loads and still supplies a namespace, so a
+    /// CLI reference works without a `[network]` table.
+    #[test]
+    fn a_tools_only_user_file_still_supplies_a_namespace() {
+        let fixture = Fixture::new();
+        fixture.project("").user(
+            "[[tools]]\nname = \"fetcher\"\ncommand = \"fetcher\"\nnetwork_requests = [\"a.example\"]\n",
+        );
+        let report = fixture.load().unwrap();
+        assert!(report.user_network().is_none());
+        let namespace = report.user_tool_requests().expect("the user tier loaded");
+        let resolved = crate::egress_reference::resolve(
+            vec![crate::egress_reference::AllowanceEntry::parse("tool:fetcher").unwrap()],
+            Some(namespace),
+        )
+        .unwrap();
+        assert!(
+            resolved
+                .allowances()
+                .any(|allowance| allowance.to_string() == "tcp://a.example:443")
+        );
     }
 }

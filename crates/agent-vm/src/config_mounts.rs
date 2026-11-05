@@ -734,6 +734,7 @@ mod tests {
             },
         )
         .unwrap()
+        .authorized
         .expect("a mounts-bearing file is authority-bearing");
         f(&authorized, &file)
     }

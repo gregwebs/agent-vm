@@ -745,6 +745,7 @@ pub(crate) async fn launch(
     target: LaunchTarget,
     images: &ConfiguredImages,
     user_network: Option<&crate::user_network::UserNetwork>,
+    user_tools: Option<&crate::egress_reference::UserToolRequests>,
     user_mounts: Option<&crate::config_mounts::UserMounts>,
     credential_preflight: CredentialPreflight,
     args: Args,
@@ -775,7 +776,7 @@ pub(crate) async fn launch(
     // with no bearing on the plan's order, and the selection it feeds cannot
     // re-read the flag after the move.
     let config_mount_policy = args.config_mount_policy();
-    let network_plan = crate::network::Plan::from_args(args.network, user_network)?;
+    let network_plan = crate::network::Plan::from_args(args.network, user_network, user_tools)?;
     // The one output policy for this selection: explicit sources render their
     // escaped reference; the default tier renders a fixed label and redacts the
     // reference from every notice, debug dump, progress line and error chain.
@@ -4515,7 +4516,7 @@ mod tests {
             .0;
         let position = |needle| production.find(needle).expect("launch step is present");
         let plan = position(
-            "let network_plan = crate::network::Plan::from_args(args.network, user_network)?;",
+            "let network_plan = crate::network::Plan::from_args(args.network, user_network, user_tools)?;",
         );
         let notices = position(".emit_launch_notices()");
         let base_network = position("builder = network_plan.apply_to(builder);");

@@ -96,3 +96,28 @@ Amendment 2026-10-12 (#328): Claude/Codex/OpenCode/Pi defaults declare scoped
 baseline requests, independently of credential proxy hosts; Copilot is pending
 #340. [Endpoint evidence and maintenance](../default-tool-network-requests.md)
 define the version/auth conditions and exclusions. Behavior is unchanged.
+
+## Amendment (#506): one way requests become authority
+
+A request still grants nothing by being declared, by being *reported*, or by
+being declared in a project config. [#506](https://github.com/gregwebs/agent-vm/issues/506)
+adds exactly one route by which a request becomes authority: a user-tier
+`tool:NAME` **egress reference** in that user's own `allow_egress`, which grants
+that tool's own requests as exact `tcp://HOST:PORT` hostname allowances
+([ADR-0059](0059-user-tool-requests-as-egress-authority.md)).
+
+- The route lives in `egress_reference.rs`, not in `network_requests.rs`: requests
+  keep their own grammar (`Allowance::parse`, unchanged semantics), so a
+  non-numeric `network_requests` entry such as `tool:codex` still fails with the
+  same port error it always did. A *numeric* one is not a reference and never
+  was: `tool:8443` is request metadata for the hostname `tool` on port 8443,
+  valid before #506 and after it. Nothing here rejects `tool:` in a request.
+- Expansion re-parses through the unchanged allowance grammar, so an expanded
+  name is an ordinary hostname allowance and inherits this ADR's coverage,
+  private-answer and TLS-client consequences unchanged.
+- The report text and its grant hint are unchanged. Requests still "never grant
+  access" on their own; USAGE states the one exception.
+- `network_requests.rs`'s data-flow tripwire is unchanged: the request path still
+  reaches no resolver, socket, credential or provisioning subsystem. The
+  reference path reads the *already parsed* request set from the user tier's own
+  validated tools.

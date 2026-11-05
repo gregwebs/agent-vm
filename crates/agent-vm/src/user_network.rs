@@ -12,8 +12,10 @@
 
 use crate::{
     config_authority::AuthorizedConfig,
-    egress_grammar::AllowanceError,
-    egress_policy::{Allowance, UserEgress},
+    egress_policy::UserEgress,
+    egress_reference::{
+        AllowanceEntry, EntryError, EntryFailure, ResolvedAllowances, UserToolRequests,
+    },
 };
 use std::{
     fmt,
@@ -41,7 +43,7 @@ pub(crate) struct SavedGroups {
 pub(crate) struct UserNetwork {
     file: PathBuf,
     groups: SavedGroups,
-    allowances: Vec<Allowance>,
+    allowances: ResolvedAllowances,
 }
 
 impl UserNetwork {
@@ -57,23 +59,44 @@ impl UserNetwork {
             allowances: &self.allowances,
         }
     }
+    /// Every allowance this table grants, with its reference attributions.
+    /// Read by `doctor` for the persisted-reference block.
+    pub(crate) fn allowances(&self) -> &ResolvedAllowances {
+        &self.allowances
+    }
     #[cfg(test)]
     pub(crate) fn for_test(
         file: impl Into<PathBuf>,
         groups: SavedGroups,
         allowances: &[&str],
     ) -> Self {
-        let mut entries = Vec::new();
-        for text in allowances {
-            let entry = Allowance::parse(text).unwrap();
-            if !entries.contains(&entry) {
-                entries.push(entry);
-            }
-        }
+        Self::resolved(file, groups, allowances, None)
+    }
+    /// A saved table whose entries may include egress references.
+    #[cfg(test)]
+    pub(crate) fn for_test_with_tools(
+        file: impl Into<PathBuf>,
+        groups: SavedGroups,
+        allowances: &[&str],
+        user_tools: &UserToolRequests,
+    ) -> Self {
+        Self::resolved(file, groups, allowances, Some(user_tools))
+    }
+    #[cfg(test)]
+    fn resolved(
+        file: impl Into<PathBuf>,
+        groups: SavedGroups,
+        allowances: &[&str],
+        user_tools: Option<&UserToolRequests>,
+    ) -> Self {
+        let entries = allowances
+            .iter()
+            .map(|text| AllowanceEntry::parse(text).unwrap())
+            .collect();
         Self {
             file: file.into(),
             groups,
-            allowances: entries,
+            allowances: crate::egress_reference::resolve(entries, user_tools).unwrap(),
         }
     }
 }
@@ -101,7 +124,19 @@ pub(crate) enum SettingReason {
     /// recent table header. Names the fix instead of calling it an unknown
     /// setting; the value is never read, let alone echoed.
     TopLevelMounts,
-    Allowance(AllowanceError),
+    /// An entry's own reason: an allowance-grammar error, or an egress
+    /// reference that could not be resolved.
+    Entry(EntryError),
+}
+
+impl UserNetworkError {
+    /// One reference failure, positioned inside `allow_egress`.
+    fn unresolved(failure: EntryFailure) -> Self {
+        Self::Setting {
+            setting: SettingPath::EgressEntry(failure.index),
+            reason: SettingReason::Entry(failure.error),
+        }
+    }
 }
 
 impl fmt::Display for UserNetworkError {
@@ -133,10 +168,38 @@ impl fmt::Display for UserNetworkError {
                         "{MOUNTS_KEY} is not a network setting; a top-level mounts list must be \
                          written before the first table header (keys after [network] belong to it)"
                     ),
-                    SettingReason::Allowance(error) => error.fmt(f),
+                    SettingReason::Entry(error) => error.fmt(f),
                 }
             }
         }
+    }
+}
+
+/// The `[network]` table of a verified file, parsed but not yet resolved.
+///
+/// Two steps, because a reference's *resolution* error must come after tool
+/// validation while its *syntax* error must come before it (R14): the entries are
+/// classified here, where the table is parsed, and turned into allowances by
+/// [`Self::resolve`], which `config::read_file_tier` calls once the tier's tools
+/// are validated.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ParsedUserNetwork {
+    file: PathBuf,
+    groups: SavedGroups,
+    entries: Vec<AllowanceEntry>,
+}
+
+impl ParsedUserNetwork {
+    pub(crate) fn resolve(
+        self,
+        user_tools: &UserToolRequests,
+    ) -> Result<UserNetwork, UserNetworkError> {
+        Ok(UserNetwork {
+            file: self.file,
+            groups: self.groups,
+            allowances: crate::egress_reference::resolve(self.entries, Some(user_tools))
+                .map_err(UserNetworkError::unresolved)?,
+        })
     }
 }
 
@@ -147,7 +210,7 @@ impl fmt::Display for UserNetworkError {
 pub(crate) fn from_verified_table(
     authorized: &AuthorizedConfig<'_>,
     table: &toml::Table,
-) -> Result<UserNetwork, UserNetworkError> {
+) -> Result<ParsedUserNetwork, UserNetworkError> {
     parse_table(authorized.file(), table)
 }
 
@@ -158,9 +221,9 @@ fn parse_bool(setting: &'static str, value: &toml::Value) -> Result<bool, UserNe
     })
 }
 
-fn parse_table(file: &Path, table: &toml::Table) -> Result<UserNetwork, UserNetworkError> {
+fn parse_table(file: &Path, table: &toml::Table) -> Result<ParsedUserNetwork, UserNetworkError> {
     let mut groups = SavedGroups::default();
-    let mut allowances = Vec::new();
+    let mut parsed_entries = Vec::new();
     for (key, value) in table {
         match key.as_str() {
             INTERNET_SETTING => groups.internet = Some(parse_bool(INTERNET_SETTING, value)?),
@@ -176,13 +239,12 @@ fn parse_table(file: &Path, table: &toml::Table) -> Result<UserNetwork, UserNetw
                         setting: SettingPath::EgressEntry(index),
                         reason: SettingReason::NotString,
                     })?;
-                    let entry = Allowance::parse(text).map_err(|e| UserNetworkError::Setting {
-                        setting: SettingPath::EgressEntry(index),
-                        reason: SettingReason::Allowance(e),
-                    })?;
-                    if !allowances.contains(&entry) {
-                        allowances.push(entry);
-                    }
+                    let entry =
+                        AllowanceEntry::parse(text).map_err(|error| UserNetworkError::Setting {
+                            setting: SettingPath::EgressEntry(index),
+                            reason: SettingReason::Entry(error),
+                        })?;
+                    parsed_entries.push(entry);
                 }
             }
             _ => {
@@ -198,10 +260,10 @@ fn parse_table(file: &Path, table: &toml::Table) -> Result<UserNetwork, UserNetw
             }
         }
     }
-    Ok(UserNetwork {
+    Ok(ParsedUserNetwork {
         file: file.to_owned(),
         groups,
-        allowances,
+        entries: parsed_entries,
     })
 }
 
@@ -259,6 +321,15 @@ mod tests {
         );
     }
 
+    /// The literal-only namespace every accepting test resolves against: a
+    /// literal entry needs no tools, and no test here uses a reference.
+    fn no_tools() -> UserToolRequests {
+        UserToolRequests::new(
+            crate::config_authority::ReferenceTrust::verified_for_test(Path::new("user.toml")),
+            &[],
+        )
+    }
+
     #[test]
     fn parse_accepts_settings_and_canonicalizes() {
         let parsed = parse_table(
@@ -272,6 +343,8 @@ allow_egress = ["10.0.0.5", "10.0.0.5/32", "API.example.com.", "api.example.com"
 "#,
             ),
         )
+        .unwrap()
+        .resolve(&no_tools())
         .unwrap();
         assert_eq!(
             parsed,
@@ -285,16 +358,19 @@ allow_egress = ["10.0.0.5", "10.0.0.5/32", "API.example.com.", "api.example.com"
                 &["10.0.0.5/32", "api.example.com"]
             )
         );
-        let empty = parse_table(Path::new("user.toml"), &table("")).unwrap();
+        let empty = parse_table(Path::new("user.toml"), &table(""))
+            .unwrap()
+            .resolve(&no_tools())
+            .unwrap();
         assert_eq!(empty.groups, SavedGroups::default());
-        assert!(empty.allowances.is_empty());
+        assert!(empty.allowances().allowances().next().is_none());
         let view = parsed.egress();
         assert_eq!(view.file, parsed.file());
         assert_eq!(
             (view.internet, view.lan, view.host),
             (Some(false), Some(true), Some(true))
         );
-        assert_eq!(view.allowances.len(), 2);
+        assert_eq!(view.allowances.allowances().count(), 2);
     }
 
     /// TOML scopes `mounts` into `[network]` when it is written after that
@@ -362,6 +438,35 @@ allow_egress = ["10.0.0.5", "10.0.0.5/32", "API.example.com.", "api.example.com"
                 .to_string();
             assert_eq!(error, expected);
             assert!(!error.contains(sentinel));
+        }
+    }
+
+    /// A resolved reference failure keeps this module's setting prefix, so the
+    /// load error reads `config: "<file>": network.allow_egress[N]: <reason>`
+    /// (R15) — and never echoes the entry or the name it named (R17).
+    #[test]
+    fn reference_failures_keep_the_entry_prefix_and_echo_nothing() {
+        const SENTINEL: &str = "sk-live-SENTINEL";
+        let tools = UserToolRequests::new(
+            crate::config_authority::ReferenceTrust::verified_for_test(Path::new("user.toml")),
+            &[],
+        );
+        for (text, expected) in [
+            (
+                format!("allow_egress = [\"10.0.0.1\", \"TOOL:{SENTINEL}\"]"),
+                "network.allow_egress[1]: an egress reference must name a tool declared in the user config's own [[tools]]; built-in and project tools are never used (`agent-vm tools print` prints the shipped tools to copy there)",
+            ),
+            (
+                "allow_egress = [\"tool:a b\"]".to_owned(),
+                "network.allow_egress[0]: an egress reference must be tool:NAME with a valid tool name (no whitespace, control characters or '/', not starting with '-', and not `.`, `..`, `*` or a reserved subcommand name)",
+            ),
+        ] {
+            let error = parse_table(Path::new("user.toml"), &table(&text))
+                .and_then(|parsed| parsed.resolve(&tools))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, expected);
+            assert!(!error.contains(SENTINEL));
         }
     }
 }

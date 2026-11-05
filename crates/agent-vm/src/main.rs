@@ -22,6 +22,7 @@ mod doctor;
 mod egress_grammar;
 mod egress_hostname;
 mod egress_policy;
+mod egress_reference;
 mod embedded_runtime;
 mod env_flag;
 mod github_graphql;
@@ -299,6 +300,7 @@ fn run_dispatch(dispatch: Dispatch) -> Result<()> {
                 target,
                 images,
                 user_network,
+                user_tools,
                 user_mounts,
                 args,
             } => exit_with(
@@ -306,6 +308,7 @@ fn run_dispatch(dispatch: Dispatch) -> Result<()> {
                     target,
                     &images,
                     user_network.as_ref(),
+                    user_tools.as_ref(),
                     user_mounts.as_ref(),
                     credential_preflight,
                     *args,
