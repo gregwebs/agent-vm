@@ -1198,7 +1198,7 @@ recent `[table]` header, so write it **before the first one**:
 | `[mounts]` (table form) | top-level and present, so verified, then `mounts: must be an array of strings` |
 | `[tools.env]` with `mounts = "~/private:ro"` | a legitimate **environment variable** named `mounts`; no mount is selected and no authority is asked for |
 | `[[tools]]` with `mounts = 7` | a wrong type, still authority-bearing first, then `tools[0].mounts: must be an array of strings` |
-| `[mount_sets]` then `mounts = [...]`, `image = "…"`, `tools = [...]`, `network = {}` or `mount_sets = {}` | refused: those five are the config's own top-level field names, so they can never be set names. The sentence names the key and the fix: `mount_sets[0]: image is not a mount set; a top-level image must be written before the first table header (keys after [mount_sets] belong to it)` |
+| `[mount_sets]` then `mounts = [...]`, `image = "…"`, `tools = [...]`, `network = {}`, `mount_sets = {}` or `egress_sets = {}` | refused: those six are the config's own top-level field names, so they can never be set names. The sentence names the key and the fix: `mount_sets[0]: image is not a mount set; a top-level image must be written before the first table header (keys after [mount_sets] belong to it)` |
 | `[mount_sets.foo]` (nested table) | refused: a set's value must be an array of declarations or set names |
 | `mount_sets = []` or any non-table | `mount_sets: must be a table of named arrays of mount declarations` |
 
@@ -1255,9 +1255,9 @@ persisted paths.
 `a/b`, `a b` and any non-ASCII spelling are not. Tool, route and command words are
 not reserved: a set may be called `pi` or `shell`, and `--mount pi` selects the
 set and never a tool. The config's own top-level field names are reserved —
-`mounts`, `mount_sets`, `network`, `image` and `tools` — because TOML assigns a
-key to the most recent `[table]` header, so a top-level key written after
-`[mount_sets]` lands in that table. Refusing those names turns the scoping
+`mounts`, `mount_sets`, `network`, `image`, `tools` and `egress_sets` — because
+TOML assigns a key to the most recent `[table]` header, so a top-level key written
+after `[mount_sets]` lands in that table. Refusing those names turns the scoping
 mistake into one sentence that names it, instead of `mounts = [...]` quietly
 becoming a set named `mounts` that selects nothing. There is no implicit `agent`
 set and no inference from tool names.
@@ -3024,6 +3024,11 @@ directory whose path contains a comma is skipped with a warning —
 > name. Rewrite such entries as `tcp://tool:P` **before upgrading** to keep the
 > old meaning. See [Egress references](#egress-references-user-tools).
 
+> **Upgrade note (0.7.32): `set:PORT` hostnames.** An `allow_egress` entry that starts with `set:` in any ASCII case — other than a `set://…` URL, which is still refused as an unsupported scheme — is now an **egress set reference**, not an allowance. Before 0.7.32, `set:8443` meant the hostname `set` on port 8443. The texts whose meaning changes are exactly every ASCII-case variant of `set:P` for canonical decimal `P` in 1–65535 except 53 and 853, and texts that were previously invalid (`set:0`, `set:0443`, `set:53`, `set:65536`) can now resolve too.
+> Unlike the `tool:` note above, this one **is fail-closed**: an existing entry names a set, and a file that does not declare one is refused. A trusted user file that declares no `[egress_sets]` refuses the entry as an unknown set; with no user file at all it is "no egress sets"; against an unsafe (symlinked or writable) tools-only file it is the egress-reference refusal. Nothing is silently re-granted — only a later edit that declares a set of that name can grant anything. Rewrite such entries as `tcp://set:P` to keep the old meaning. See [Egress sets](#egress-sets-user-config).
+>
+> **Also in 0.7.32: `egress_sets` is a reserved set name.** The new field is a top-level field, so it is reserved in **both** named-set tables. An existing `[mount_sets]` set called `egress_sets` is now refused at load — `mount_sets[0]: egress_sets is not a mount set; a top-level egress_sets must be written before the first table header (keys after [mount_sets] belong to it)` — and it is not a `set:` in `allow_egress` that also breaks, so the fix is local: rename the mount set. This fails closed; nothing is renamed or silently dropped on your behalf.
+
 Tool-launch guest egress is **denied by default**, including DNS query authorization.
 Before **0.2.0**, the guest reached the public internet by default; agents that
 call provider APIs now need `--allow-internet-egress`, or a TLS hostname
@@ -3074,10 +3079,12 @@ grants back.
 The same numeric and hostname grammar applies; an empty table grants nothing
 but still requires a verified file.
 
-A CLI `--allow-egress tool:NAME` needs the same verified user file, because it
-resolves against that file's own `[[tools]]`; the entry stays a CLI grant for
-that launch only. A tools-only symlink works without one. See
-[Egress references](#egress-references-user-tools).
+A CLI `--allow-egress tool:NAME` or `--allow-egress set:NAME` needs the same
+verified user file, because it resolves against that file's own `[[tools]]` or
+`[egress_sets]`; the entry stays a CLI grant for that launch only. A tools-only
+symlink works without one. See
+[Egress references](#egress-references-user-tools) and
+[Egress sets](#egress-sets-user-config).
 
 The config must be a regular file, **not a symlink**, with one hard link, owned
 by you and not group/other-writable (`0600` or `0644` is fine). Its immediate
@@ -3087,11 +3094,12 @@ checked. A tools/image-only symlink still works; review the file's `[network]`
 table before replacing it with the file itself to carry authority.
 
 This one policy covers **every** authority-bearing user field: the same check
-runs for `[network]`, for [`mounts`](#config-mounts-user-config), and for a file
-containing both. Presence decides it, not contents — `mounts = []` and an empty
-`[network]` grant nothing yet are exactly the bytes worth planting, so a file
-that carries either is verified. A tools/image-only symlink keeps working;
-adding authority to it does not.
+runs for `[network]`, for [`mounts`](#config-mounts-user-config), for
+`[mount_sets]` and for `[egress_sets]`, in any combination. Presence decides it,
+not contents — `mounts = []`, an empty `[network]` and an empty `[egress_sets]`
+grant nothing yet are exactly the bytes worth planting, so a file that carries
+any of them is verified. A tools/image-only symlink keeps working; adding
+authority to it does not.
 
 Notices name the file and each grant's source, for example:
 
@@ -3345,10 +3353,140 @@ persisted egress references in "/home/u/.config/agent-vm/config.toml" [network]:
   tool:fetcher -> tcp://api.example.com:443, tcp://git.example.com:8443
 ```
 
-`set:NAME` and user-defined `[egress_sets]` are designed but not implemented
-([#511](https://github.com/gregwebs/agent-vm/issues/511)). `tool:` inside a
-`network_requests` entry is not a reference: requests stay
-[non-authoritative metadata](#tool-network-requests).
+`tool:` inside a `network_requests` entry is not a reference: requests stay
+[non-authoritative metadata](#tool-network-requests). The same holds for `set:`.
+
+### Egress sets (user config)
+
+A **named egress set** is a list of allowances you write once and select by name.
+Declare it in `[egress_sets]` in your **user** file, and reference it with
+`set:NAME` in persisted `[network] allow_egress`, in `--allow-egress`, or inside
+another set:
+
+```toml
+[[tools]]
+name = "codex"
+command = "codex"
+network_requests = ["api.openai.com"]
+
+[[tools]]
+name = "claude"
+command = "claude"
+network_requests = ["api.anthropic.com"]
+
+[egress_sets]
+corp   = ["git.corp.example", "tcp://registry.corp.example:8443", "10.0.0.5"]
+agents = ["tool:codex", "tool:claude", "set:corp"]
+
+[network]
+allow_egress = ["set:agents"]
+```
+
+`set:agents` grants `agents`' whole closure — the tool requests and the nested
+set — once, in first-seen order with duplicates removed:
+
+```text
+tcp://api.openai.com:443
+tcp://api.anthropic.com:443
+git.corp.example
+tcp://registry.corp.example:8443
+10.0.0.5/32
+```
+
+How one entry becomes authority:
+
+```text
+user config.toml (one verified read)
+  [[tools]] codex / claude          [egress_sets] corp, agents      [network]
+        │                                  │                             │
+        │ validate_tools                   │ parse_sets (verified token)  │
+        ▼                                  ▼                             │
+   this file's tools ──────► compile every set's closure                 │
+                             (tool: and set: folded in, budgeted)        │
+                                        │                               │
+                                        ▼                               ▼
+                              resolve set:NAME to its closure ──────────┘
+                                        │
+                                        ▼
+                              the same canonical union as hand-written entries
+```
+
+Rules:
+
+- **User tier only.** A project or built-in `[egress_sets]` is refused by
+  presence, empty table included: `egress_sets cannot be declared by the project
+  config; declare egress sets in the user config and select them with set:NAME`.
+- **Presence verifies the file.** A file that declares `[egress_sets]` is
+  authority-bearing, so it must be a regular, singly-linked file owned by you in
+  a directory you own. An empty table counts.
+- **Declaring grants nothing.** Only a `set:` entry in `[network] allow_egress`
+  or `--allow-egress` grants; the definitions alone allow no traffic.
+- **Names** are one or more ASCII characters: `[A-Za-z0-9_]` first, then
+  `[A-Za-z0-9_.-]`. Case is significant, so `Corp` and `corp` are two sets.
+  Numeric names (`8443`) are valid names. The `set:` prefix folds case; the name
+  does not.
+- **Nesting and forward references.** A set may list literals, `tool:NAME` and
+  `set:NAME`, and may name a set declared before or after it. `tool:NAME` inside
+  a set resolves against **the same file's own `[[tools]]`**, exactly as a
+  `[network]` entry does — never the project tier, never the shipped catalog.
+- **Cycles are config errors**, including a cycle in a set nothing references.
+  The error names the entry that closes it:
+  `egress_sets[1][0]: egress-set reference cycle`.
+- **Every declared set is validated**, used or not: an unknown set, an unknown
+  tool, a malformed allowance or a cycle fails the load wherever it is written,
+  as `config: "<file>": egress_sets[D][I]: <reason>`.
+- **Expansion is bounded.** Compiling the whole table may charge at most 65,536
+  allowance visits (a literal entry, each allowance of a `tool:` expansion, each
+  allowance of a child set's closure; a repeated `tool:`/`set:` in one set is
+  free). Exhaustion is
+  `egress_sets: expansion work exceeds limit of 65536 allowance visits`.
+- **A bare member widens** to every intercepted port, exactly like a bare
+  `[network]` entry: `git.corp.example` above takes 443 *and* 8443 because the
+  same closure pins `tcp://registry.corp.example:8443`.
+- **Notices and `doctor` name the reference you wrote, not the sets it nests**;
+  `doctor`'s expansion shows what the nesting grants. A nested chain has several
+  paths and unbounded depth, and the entry-level reference is the thing you
+  delete to revoke, so `set:agents` is named and `set:corp` is not.
+- **TOML scoping trap.** A key written after a `[table]` header belongs to that
+  table, and two different mistakes follow from it. First: a *reserved* top-level
+  field written after `[egress_sets]` becomes a set definition, so a late
+  `network = {}` or `mounts = [...]` is refused by name
+  (`egress_sets[0]: mounts is not an egress set; a top-level mounts must be
+  written before the first table header (keys after [egress_sets] belong to it)`).
+  Second, and silently: a bare `allow_egress = [...]` after `[egress_sets]` is a
+  **valid set named `allow_egress`**, not a network grant. Nothing is refused, no
+  traffic is granted, and the launch is all-denied
+  (`==> Egress policy: all guest egress denied …`) until an entry says
+  `set:allow_egress`. `allow_egress` is a key of `[network]`, so write it under
+  that header — and write every top-level assignment before the first header.
+- **A mount set may not be called `egress_sets`**: the six top-level field names
+  are reserved set names in both tables.
+
+Notices:
+
+```text
+==> Egress policy: allowing 10.0.0.5/32 (persisted grants via set:agents)
+==> Egress policy: allowing TLS to api.openai.com, api.anthropic.com on ports 443 (persisted grants via set:agents)
+==> Egress policy: allowing TLS to git.corp.example on ports 443, 8443 (persisted grants via set:agents)
+==> Egress policy: allowing TLS to registry.corp.example on ports 8443 (persisted grants via set:agents)
+```
+
+A set and a tool granting the same name are listed together, in entry order:
+
+```text
+==> Egress policy: allowing TLS to api.openai.com on ports 443 (persisted grants via tool:codex and set:agents)
+```
+
+`agent-vm doctor` lists each persisted entry-level reference with its flattened
+closure (64 items, then `+N more`):
+
+```text
+persisted egress references in "/home/u/.config/agent-vm/config.toml" [network]:
+  set:agents -> tcp://api.openai.com:443, tcp://api.anthropic.com:443, git.corp.example, tcp://registry.corp.example:8443, 10.0.0.5/32
+```
+
+Upgrading is where this can surprise you: see the
+[0.7.32 upgrade note](#ports--egress).
 
 ### DNS and launch behavior
 

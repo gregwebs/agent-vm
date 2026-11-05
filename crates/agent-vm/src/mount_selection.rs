@@ -390,6 +390,7 @@ mod tests {
                     },
                 ),
                 mount_sets: table.get("mount_sets").is_some(),
+                egress_sets: table.get("egress_sets").is_some(),
             },
         )
         .unwrap()

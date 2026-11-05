@@ -327,7 +327,9 @@ mod tests {
         UserToolRequests::new(
             crate::config_authority::ReferenceTrust::verified_for_test(Path::new("user.toml")),
             &[],
+            None,
         )
+        .unwrap()
     }
 
     #[test]
@@ -441,6 +443,41 @@ allow_egress = ["10.0.0.5", "10.0.0.5/32", "API.example.com.", "api.example.com"
         }
     }
 
+    /// A31 and R22/R28: a `set:` failure in a persisted entry keeps the same
+    /// position prefix a `tool:` failure does, and echoes neither the entry nor
+    /// the name inside it.
+    #[test]
+    fn set_reference_failures_keep_the_entry_prefix_and_echo_nothing() {
+        const SENTINEL: &str = "SENTINEL7";
+        let tools = UserToolRequests::new(
+            crate::config_authority::ReferenceTrust::verified_for_test(Path::new("user.toml")),
+            &[],
+            None,
+        )
+        .unwrap();
+        for (text, expected) in [
+            (
+                format!("allow_egress = [\"10.0.0.1\", \"SET:{SENTINEL}\"]"),
+                "network.allow_egress[1]: an egress reference must name a set declared in the user config's own [egress_sets]; project and built-in configs cannot declare sets",
+            ),
+            (
+                "allow_egress = [\"set:a b\"]".to_owned(),
+                "network.allow_egress[0]: an egress reference must be set:NAME with a valid egress-set name ([A-Za-z0-9_] first, then [A-Za-z0-9_.-])",
+            ),
+            (
+                format!("allow_egress = [\"set:{SENTINEL}\\u0000\"]"),
+                "network.allow_egress[0]: an egress reference must be set:NAME with a valid egress-set name ([A-Za-z0-9_] first, then [A-Za-z0-9_.-])",
+            ),
+        ] {
+            let error = parse_table(Path::new("user.toml"), &table(&text))
+                .and_then(|parsed| parsed.resolve(&tools))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, expected, "{text}");
+            assert!(!error.contains(SENTINEL), "{error}");
+        }
+    }
+
     /// A resolved reference failure keeps this module's setting prefix, so the
     /// load error reads `config: "<file>": network.allow_egress[N]: <reason>`
     /// (R15) — and never echoes the entry or the name it named (R17).
@@ -450,7 +487,9 @@ allow_egress = ["10.0.0.5", "10.0.0.5/32", "API.example.com.", "api.example.com"
         let tools = UserToolRequests::new(
             crate::config_authority::ReferenceTrust::verified_for_test(Path::new("user.toml")),
             &[],
-        );
+            None,
+        )
+        .unwrap();
         for (text, expected) in [
             (
                 format!("allow_egress = [\"10.0.0.1\", \"TOOL:{SENTINEL}\"]"),

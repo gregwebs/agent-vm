@@ -296,5 +296,44 @@ which triggers verification: a file that fails is refused at load, and a file th
 passes carries `verdict: Ok(())`. `resolve` still runs the check — one path, no
 special case.
 
-The gaps are unchanged: mode `0600` is not required, an immediate parent that is a
-symlink is followed, and ancestors, ACLs and replacement races remain accepted.
+## Amendment: `[egress_sets]` joins the shared gate (#511)
+
+#511 adds a fourth authority-bearing user field, the `[egress_sets]` table, and it
+reaches Decision 2's read unchanged. Nothing in this ADR's threat model, rule
+sequence or accepted gaps changes; the fields that reach the gate, and the
+sentences that name them, grow from three to four.
+
+- `authority_required({network, mounts, mount_sets, egress_sets}) ==
+  (network || mounts || mount_sets || egress_sets)` — the same kernel, extended to
+  four fields and still total over all sixteen combinations (fifteen true).
+- Decision 2's rule now reads "a present `[network]`, `mounts`, `[mount_sets]`
+  **or** `[egress_sets]`", and one file declaring any subset is verified once.
+  Presence is still the whole trigger — the *field is written*, empty table,
+  wrong type or populated table alike, which is what makes the verified read run.
+  What follows that read depends on the file, and the two outcomes are different:
+  an **unsafe** file is refused before any schema parsing, so a symlinked empty
+  `[egress_sets]` table and a symlinked `egress_sets = 7` both fail with the
+  `[egress_sets]` authority sentence; a **trusted** file proceeds to its own
+  schema errors, so `egress_sets = 7` reports
+  `egress_sets: must be a table of named arrays of egress allowances and
+  references` and a trusted empty table is accepted (declaring a set grants
+  nothing). Presence triggers verification; it does not by itself refuse.
+- **The sentences are data now, and the old bytes are pinned.** Sixteen subjects
+  is three tables of sixteen arms plus sixteen literal rows, and a subject that
+  folded `[egress_sets]` into `[network]` would tell the reader to review a table
+  the file lacks — the exact failure #397's amendment forbids. `AuthoritySubject`
+  therefore holds the four presence bits and composes its three slots from one
+  fixed phrase table (`[network]`, `mounts`, `[mount_sets]`, `[egress_sets]`, in
+  that order) with the grammar the slots already shared: `a`, `a and b`,
+  `a, b and c`, `a, b, c and d`, and `or` in the "without" aside. Every
+  pre-#511 sentence is byte-identical, pinned by whole-sentence literals for the
+  `[network]`-only subject and by fifteen literal slot rows; the eight new
+  subjects have their own literal rows, never composed from the phrase table.
+- The unreachable all-false input is **normalized** to the `[network]`-only
+  subject rather than copied, so no slot can render empty. #511 is the first
+  change that made the empty set representable at all, so this row is new.
+- The refusal order is unchanged and extended: `[network]`, `mounts`,
+  `[mount_sets]`, `[egress_sets]`, then the first tool's `mounts`.
+- The gaps are unchanged and now cover egress sets too: mode `0600` is not
+  required, an immediate parent that is a symlink is followed, and ancestors,
+  ACLs and replacement races remain accepted.

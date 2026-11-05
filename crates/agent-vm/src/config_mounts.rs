@@ -65,6 +65,11 @@ mod sets;
 #[cfg(test)]
 pub(crate) use sets::MAX_MOUNT_SET_EXPANSION_WORK;
 pub(crate) use sets::{MountExpansionWork, UserMounts, merge_tool_mounts};
+// The walk's colour kernel and its two types are the only part of the mount-set
+// graph the egress-set graph reuses (#511): "is this edge a cycle, a descent or
+// shared structure?" is the same question for both, and one proved answer is
+// better than two that could drift.
+pub(crate) use sets::{VisitDecision, VisitState, visit_decision};
 
 use crate::{
     config_authority::AuthorizedConfig,
@@ -731,6 +736,7 @@ mod tests {
                 network: false,
                 mounts: true,
                 mount_sets: false,
+                egress_sets: false,
             },
         )
         .unwrap()

@@ -103,7 +103,7 @@ pub(crate) struct UserEgress<'a> {
     pub(crate) host: Option<bool>,
     pub(crate) allowances: &'a ResolvedAllowances,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Allowance {
     Address(EgressAllowance),
     Hostname(HostnameAllowance),
@@ -239,7 +239,8 @@ impl TierSources<'_> {
         let cli = phrase("--allow-egress", &self.cli);
         // Legacy " and " when no reference is involved; "; " otherwise, because
         // `persisted grants via tool:a and --allow-egress` reads as one list of
-        // references rather than two sources.
+        // references rather than two sources. The set kind needs nothing here:
+        // attribution is per tier and per reference, not per reference kind.
         let joiner = if self.user.via.is_empty() && self.cli.via.is_empty() {
             " and "
         } else {
@@ -307,7 +308,8 @@ pub(crate) struct EgressAuthority {
     hostnames: Vec<HostnameAllowance>,
     provenance: Option<Provenance>,
     /// This launch's CLI entries after resolution, kept so a notice can attribute
-    /// a hostname to `--allow-egress via tool:NAME` even with no user table.
+    /// a hostname to `--allow-egress via tool:NAME` (or `set:NAME`) even with no
+    /// user table.
     cli: ResolvedAllowances,
 }
 impl EgressAuthority {
@@ -391,15 +393,23 @@ impl EgressAuthority {
     }
     /// Where the launch's hostname authority comes from, for the ambient-proxy
     /// refusal. `Some` iff some hostname allowance exists.
+    ///
+    /// Each arm names only the references whose own expansion contains a
+    /// hostname: a set of addresses, or an empty set, grants no hostname and
+    /// deleting it would not remove the refusal. The pre-#506 bytes come back
+    /// when the filtered list is empty, exactly as when no reference exists.
     pub(crate) fn hostname_authority(&self) -> Option<HostnameAuthority<'_>> {
         if self.hostnames.is_empty() {
             return None;
         }
-        let cli = self.cli.references().collect::<Vec<_>>();
+        let cli = self.cli.hostname_references().collect::<Vec<_>>();
         let Some(provenance) = self.provenance.as_ref() else {
             return Some(HostnameAuthority::Cli { references: cli });
         };
-        let saved = provenance.user_entries.references().collect::<Vec<_>>();
+        let saved = provenance
+            .user_entries
+            .hostname_references()
+            .collect::<Vec<_>>();
         Some(
             match (
                 provenance.user_entries.has_hostnames(),
@@ -1955,6 +1965,82 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    /// A33 and R25: a set reference attributes what it grants at entry level —
+    /// including a numeric allowance — and a nested set is never named.
+    #[test]
+    fn set_reference_notices_attribute_entry_level_references() {
+        let namespace = crate::egress_reference::test_support::user_namespace(
+            std::path::Path::new(REFERENCE_USER_FILE),
+            &[("codex", &["api.openai.com"])],
+            Some(
+                "agents = [\"tool:codex\", \"set:corp\"]\n\
+                 corp = [\"10.0.0.5\", \"git.corp.example\"]\n",
+            ),
+        );
+
+        // (i) a persisted `set:agents`: every line names the reference the user
+        // wrote, and none names `set:corp`, which they did not.
+        let authority =
+            resolve_saved_with_tools(Default::default(), &["set:agents"], empty_cli(), &namespace);
+        let mut out = Vec::new();
+        authority.write_notices(&mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains(
+                "==> Egress policy: allowing 10.0.0.5/32 (persisted grants via set:agents)\n"
+            ),
+            "{text}"
+        );
+        // A bare literal inside a set is grouped with every other bare name at
+        // the intercepted ports, exactly as a bare `[network]` entry is: a set
+        // member is an allowance, not a second kind of thing.
+        assert!(
+            text.contains(
+                "==> Egress policy: allowing TLS to api.openai.com, git.corp.example on ports 443 (persisted grants via set:agents)\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("set:corp"), "a nested set was named: {text}");
+
+        // (ii) a set and a tool granting the same name render in the shared list
+        // grammar, in entry order.
+        let authority = resolve_saved_with_tools(
+            Default::default(),
+            &["tool:codex", "set:agents"],
+            empty_cli(),
+            &namespace,
+        );
+        let mut out = Vec::new();
+        authority.write_notices(&mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains(
+                "==> Egress policy: allowing TLS to api.openai.com on ports 443 (persisted grants via tool:codex and set:agents)\n"
+            ),
+            "{text}"
+        );
+        // The line no tool grants keeps naming only the set: attribution is per
+        // allowance, not per tier.
+        assert!(
+            text.contains(
+                "==> Egress policy: allowing TLS to git.corp.example on ports 443 (persisted grants via set:agents)\n"
+            ),
+            "{text}"
+        );
+
+        // (iii) a CLI set reference is tagged as the CLI's, with no persisted
+        // word anywhere.
+        let text = cli_refusal_lines(&["set:agents"], &namespace);
+        assert!(
+            text.contains(
+                "==> Egress policy: allowing 10.0.0.5/32 (--allow-egress via set:agents)\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("persisted"), "{text}");
+        assert!(!text.contains("set:corp"), "{text}");
     }
 
     /// A23: a launch whose only authority is CLI references prints no line

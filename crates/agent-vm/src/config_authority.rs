@@ -3,16 +3,16 @@
 //! The user config is shared by every project on the host, so a guest in one
 //! project can plant a file that a later launch in another project reads. A
 //! field that *grants* something — egress under ADR-0040, host mounts under
-//! ADR-0046, named mount sets under ADR-0048 — may therefore only be taken from
-//! bytes whose file and immediate directory this user owns, singly named, and
-//! not group- or other-writable.
+//! ADR-0046, named mount sets under ADR-0048, named egress sets under #511 — may
+//! therefore only be taken from bytes whose file and immediate directory this
+//! user owns, singly named, and not group- or other-writable.
 //!
 //! **Presence, not contents, is what makes a file authority-bearing.** An empty
-//! `[network]` table, an empty `mounts` array and an empty `[mount_sets]` table
-//! grant nothing, yet all three are the bytes an attacker would plant: what is
-//! being decided is whether the *file* is the user's own, so a caller that reads
-//! contents to decide would skip the check on exactly the cheapest file to
-//! plant. A file that declares `mount_sets` without `mounts` is therefore just as
+//! `[network]` table, an empty `mounts` array, an empty `[mount_sets]` table and
+//! an empty `[egress_sets]` table grant nothing, yet all four are the bytes an
+//! attacker would plant: what is being decided is whether the *file* is the
+//! user's own, so a caller that reads contents to decide would skip the check on
+//! exactly the cheapest file to plant. A file that declares `mount_sets` without `mounts` is therefore just as
 //! authority-bearing as one that declares `mounts`, and so is one whose only
 //! mount list sits inside a full `[[tools]]` definition (#396):
 //! [`mount_authority_present`] is where those two mount sites are aggregated, so
@@ -42,8 +42,9 @@
 //! and outlives the read.
 //!
 //! Refusal at *load* time is still decided by presence alone: only a file that
-//! declares `[network]`, `mounts` or `[mount_sets]` is refused for being
-//! untrusted, so a tools-only dotfile symlink keeps loading exactly as before.
+//! declares `[network]`, `mounts`, `[mount_sets]` or `[egress_sets]` is refused
+//! for being untrusted, so a tools-only dotfile symlink keeps loading exactly as
+//! before.
 //! The verdict waits, unused, for a CLI reference to consult it.
 
 use crate::protected_config_dir::authority_file_singly_linked;
@@ -118,7 +119,7 @@ pub struct MountAuthorityFacts { pub top_level: bool, pub tool_field: bool }
 /// is one OR, never a nonempty test.
 ///
 /// This only widens *which* files are measured; [`authority_required`] keeps its
-/// three-trigger contract and [`AuthoritySubject`] keeps its wording, so a file
+/// four-trigger contract and [`AuthoritySubject`] keeps its wording, so a file
 /// whose only old authority field is `[network]` prints the same bytes as before.
 pub fn mount_authority_present(f: MountAuthorityFacts) -> (r: bool)
     ensures r == (f.top_level || f.tool_field),
@@ -129,110 +130,144 @@ pub fn mount_authority_present(f: MountAuthorityFacts) -> (r: bool)
 /// Which authority-bearing fields one user file declares. Named facts rather
 /// than adjacent booleans, so a call site cannot swap them.
 #[derive(Clone, Copy, Debug)]
-pub struct AuthorityTriggers { pub network: bool, pub mounts: bool, pub mount_sets: bool }
+pub struct AuthorityTriggers { pub network: bool, pub mounts: bool, pub mount_sets: bool, pub egress_sets: bool }
 
-/// ADR-0040/0046/0048: presence, not contents, makes a user file
+/// ADR-0040/0046/0048/#511: presence, not contents, makes a user file
 /// authority-bearing. `t.mounts` is already the aggregate of the top-level
 /// `mounts` array and every tool's `mounts` field ([`mount_authority_present`]).
 pub fn authority_required(t: AuthorityTriggers) -> (r: bool)
-    ensures r == (t.network || t.mounts || t.mount_sets),
+    ensures r == (t.network || t.mounts || t.mount_sets || t.egress_sets),
 {
-    if t.network { true } else { t.mounts || t.mount_sets }
+    if t.network { true } else { t.mounts || t.mount_sets || t.egress_sets }
 }
 } // verus!
 
-/// The field(s) a refusal is about, so one refusal kernel can report itself
-/// under `[network]`, under `mounts`, under `mount_sets`, or under any
-/// combination of the three.
+/// Which of the four authority-bearing fields one file declares, in the order
+/// every sentence names them.
 ///
-/// Only diagnostic wording depends on this; which refusals fire does not.
+/// `Default` is the empty set, which is reachable only from tests and is
+/// normalized by [`AuthoritySubject::of`]; no sentence can be built from it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AuthorityFields {
+    network: bool,
+    mounts: bool,
+    mount_sets: bool,
+    egress_sets: bool,
+}
+
+/// The field(s) a refusal is about, so one refusal kernel can report itself
+/// under any nonempty combination of `[network]`, `mounts`, `[mount_sets]` and
+/// `[egress_sets]`.
+///
+/// Only diagnostic wording depends on this; which refusals fire does not. Held
+/// as data rather than as sixteen enum variants: the three slots are one shared
+/// grammar (list the present fields, `and`/`or` before the last), enumerating
+/// them would triple with every future field, and a *folded* subject — say,
+/// naming `[egress_sets]` under `[network]` — would send a reader to review a
+/// table the file does not have (ADR-0040's #397 amendment).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AuthoritySubject {
-    Network,
-    Mounts,
-    MountSets,
-    NetworkAndMounts,
-    NetworkAndMountSets,
-    MountsAndMountSets,
-    NetworkMountsAndMountSets,
+    /// Never all-false: only [`Self::of`] builds one, and it normalizes the
+    /// empty set.
+    Fields(AuthorityFields),
     /// ADR-0059: a CLI `tool:NAME` egress reference reads `[[tools]]`
     /// `network_requests`, so *that* is the field a file is being trusted for.
+    /// Not a file field, so [`Self::of`] cannot return it.
     EgressReference,
+}
+
+/// `(label, object, without)` per field, in the fixed order sentences name them.
+const FIELD_PHRASES: [(&str, &str, &str); 4] = [
+    ("[network]", "[network] table", "[network]"),
+    ("mounts", "mounts list", "mounts"),
+    ("[mount_sets]", "[mount_sets] table", "[mount_sets]"),
+    ("[egress_sets]", "[egress_sets] table", "[egress_sets]"),
+];
+
+/// `a`, `a and b`, `a, b and c`: the one list grammar all three slots share.
+fn join_phrases(phrases: &[&str], conjunction: &str) -> String {
+    match phrases.split_last() {
+        None => String::new(),
+        Some((last, [])) => (*last).to_owned(),
+        Some((last, rest)) => format!("{}{conjunction}{last}", rest.join(", ")),
+    }
 }
 
 impl AuthoritySubject {
     // Three slots, because one sentence per refusal is assembled from three
     // grammatical positions and a subject fills each differently. Keeping the
-    // tails in one `match` (see `write_refusal`) and the slots here is what lets
-    // `[network]` and `mounts` stay byte-identical while `mount_sets` reuses the
-    // sentence.
+    // tails in one `format!` (see `write_refusal`) and the slots here is what
+    // lets `[network]` and `mounts` stay byte-identical while each later field
+    // reuses the sentence.
 
     /// Opens every refusal sentence.
-    fn label(self) -> &'static str {
+    fn label(self) -> String {
         match self {
-            Self::Network => "[network]",
-            Self::Mounts => "mounts",
-            Self::MountSets => "[mount_sets]",
-            Self::NetworkAndMounts => "[network] and mounts",
-            Self::NetworkAndMountSets => "[network] and [mount_sets]",
-            Self::MountsAndMountSets => "mounts and [mount_sets]",
-            Self::NetworkMountsAndMountSets => "[network], mounts and [mount_sets]",
-            Self::EgressReference => "an egress reference",
+            Self::Fields(fields) => join_phrases(&fields.present(0), " and "),
+            Self::EgressReference => "an egress reference".to_owned(),
         }
     }
 
     /// What the reader is told to review before trusting the file.
-    fn object(self) -> &'static str {
+    fn object(self) -> String {
         match self {
-            Self::Network => "[network] table",
-            Self::Mounts => "mounts list",
-            Self::MountSets => "[mount_sets] table",
-            Self::NetworkAndMounts => "[network] table and mounts list",
-            Self::NetworkAndMountSets => "[network] table and [mount_sets] table",
-            Self::MountsAndMountSets => "mounts list and [mount_sets] table",
-            Self::NetworkMountsAndMountSets => {
-                "[network] table, mounts list and [mount_sets] table"
-            }
-            Self::EgressReference => "[[tools]] network_requests",
+            Self::Fields(fields) => join_phrases(&fields.present(1), " and "),
+            Self::EgressReference => "[[tools]] network_requests".to_owned(),
         }
     }
 
     /// The "a symlinked config without …" aside names the fields, unqualified
     /// by "table"/"list", because it describes the file's compatibility. A file
     /// without `mounts` is *not* safe when it declares `mount_sets`.
-    fn without(self) -> &'static str {
+    fn without(self) -> String {
         match self {
-            Self::Network => "[network]",
-            Self::Mounts => "mounts",
-            Self::MountSets => "[mount_sets]",
-            Self::NetworkAndMounts => "[network] or mounts",
-            Self::NetworkAndMountSets => "[network] or [mount_sets]",
-            Self::MountsAndMountSets => "mounts or [mount_sets]",
-            Self::NetworkMountsAndMountSets => "[network], mounts or [mount_sets]",
-            Self::EgressReference => "an egress reference",
+            Self::Fields(fields) => join_phrases(&fields.present(2), " or "),
+            Self::EgressReference => "an egress reference".to_owned(),
         }
     }
 
     /// Which subject a set of triggers is about.
     ///
-    /// `(false, false, false)` is unreachable: callers only ask once
-    /// [`authority_required`] has said yes. Naming the subject never decides
-    /// anything, so it carries no kernel of its own; the `match` is exhaustive
-    /// over the three measured facts with no catch-all arm.
+    /// The all-false input is *unreachable*: callers only ask once
+    /// [`authority_required`] has said yes. It is nevertheless normalized to the
+    /// `[network]`-only subject rather than copied, because a slot built from an
+    /// empty set would render an empty word in the middle of a refusal sentence
+    /// while claiming nothing about the file.
     ///
     /// `EgressReference` is deliberately unnameable here: a flag is not a file
     /// field, so a presence trigger can never be about one.
     fn of(triggers: AuthorityTriggers) -> Self {
-        match (triggers.network, triggers.mounts, triggers.mount_sets) {
-            (false, false, false) => Self::Network,
-            (true, false, false) => Self::Network,
-            (false, true, false) => Self::Mounts,
-            (false, false, true) => Self::MountSets,
-            (true, true, false) => Self::NetworkAndMounts,
-            (true, false, true) => Self::NetworkAndMountSets,
-            (false, true, true) => Self::MountsAndMountSets,
-            (true, true, true) => Self::NetworkMountsAndMountSets,
+        let fields = AuthorityFields {
+            network: triggers.network,
+            mounts: triggers.mounts,
+            mount_sets: triggers.mount_sets,
+            egress_sets: triggers.egress_sets,
+        };
+        if !(triggers.network || triggers.mounts || triggers.mount_sets || triggers.egress_sets) {
+            return Self::Fields(AuthorityFields {
+                network: true,
+                ..AuthorityFields::default()
+            });
         }
+        Self::Fields(fields)
+    }
+}
+
+impl AuthorityFields {
+    /// The phrases of the present fields for one of the three slots, in the order
+    /// a sentence names them.
+    fn present(self, slot: usize) -> Vec<&'static str> {
+        let flags = [self.network, self.mounts, self.mount_sets, self.egress_sets];
+        flags
+            .iter()
+            .zip(FIELD_PHRASES)
+            .filter(|(present, _)| **present)
+            .map(|(_, phrases)| match slot {
+                0 => phrases.0,
+                1 => phrases.1,
+                _ => phrases.2,
+            })
+            .collect()
     }
 }
 
@@ -289,8 +324,8 @@ impl fmt::Display for UntrustedConfig {
 /// say "before trusting the file", `DirWritable` says "before trusting it", and
 /// `DirNotDirectory` has no review caveat at all. The tails are deliberately
 /// *not* normalised — they are read by a human deciding whether to trust a
-/// hostile file, and they are byte-pinned for the `Network` subject because
-/// #394 changed nothing about persisted network authority.
+/// hostile file, and they are byte-pinned for the `[network]`-only subject
+/// because #394 changed nothing about persisted network authority.
 fn write_refusal(
     f: &mut fmt::Formatter<'_>,
     subject: AuthoritySubject,
@@ -500,51 +535,118 @@ mod tests {
     use proptest::prelude::*;
     use std::{fs, os::unix::fs::PermissionsExt};
 
-    const SUBJECTS: [AuthoritySubject; 8] = [
-        AuthoritySubject::Network,
-        AuthoritySubject::Mounts,
-        AuthoritySubject::MountSets,
-        AuthoritySubject::NetworkAndMounts,
-        AuthoritySubject::NetworkAndMountSets,
-        AuthoritySubject::MountsAndMountSets,
-        AuthoritySubject::NetworkMountsAndMountSets,
-        AuthoritySubject::EgressReference,
-    ];
+    /// Every subject a refusal can be built for: the fifteen nonempty field
+    /// combinations, then ADR-0059's reference subject.
+    fn every_subject() -> Vec<AuthoritySubject> {
+        let mut subjects = Vec::new();
+        for network in [false, true] {
+            for mounts in [false, true] {
+                for mount_sets in [false, true] {
+                    for egress_sets in [false, true] {
+                        if network || mounts || mount_sets || egress_sets {
+                            subjects.push(AuthoritySubject::of(AuthorityTriggers {
+                                network,
+                                mounts,
+                                mount_sets,
+                                egress_sets,
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+        subjects.push(AuthoritySubject::EgressReference);
+        subjects
+    }
 
     /// The three interchangeable slots one refusal sentence is assembled from,
     /// written out per subject.
     ///
     /// These are literals, so a subject whose wording changes fails here; the
     /// composition in `pinned_refusal_display` is a `format!` of the same shape
-    /// as `write_refusal`, which is why the `Network` subject additionally has
-    /// whole-sentence literals in `network_subject_display_is_byte_identical`.
+    /// as `write_refusal`, which is why the `[network]`-only subject additionally
+    /// has whole-sentence literals in `network_subject_display_is_byte_identical`.
+    /// The rows are never composed from `FIELD_PHRASES`: a table that agrees with
+    /// itself would accept any wrong wording.
     fn pinned_subject_slots(
         subject: AuthoritySubject,
     ) -> (&'static str, &'static str, &'static str) {
         match subject {
-            AuthoritySubject::Network => ("[network]", "[network] table", "[network]"),
-            AuthoritySubject::Mounts => ("mounts", "mounts list", "mounts"),
-            AuthoritySubject::MountSets => ("[mount_sets]", "[mount_sets] table", "[mount_sets]"),
-            AuthoritySubject::NetworkAndMounts => (
-                "[network] and mounts",
-                "[network] table and mounts list",
-                "[network] or mounts",
-            ),
-            AuthoritySubject::NetworkAndMountSets => (
-                "[network] and [mount_sets]",
-                "[network] table and [mount_sets] table",
-                "[network] or [mount_sets]",
-            ),
-            AuthoritySubject::MountsAndMountSets => (
-                "mounts and [mount_sets]",
-                "mounts list and [mount_sets] table",
-                "mounts or [mount_sets]",
-            ),
-            AuthoritySubject::NetworkMountsAndMountSets => (
-                "[network], mounts and [mount_sets]",
-                "[network] table, mounts list and [mount_sets] table",
-                "[network], mounts or [mount_sets]",
-            ),
+            AuthoritySubject::Fields(fields) => match (
+                fields.network,
+                fields.mounts,
+                fields.mount_sets,
+                fields.egress_sets,
+            ) {
+                (true, false, false, false) => ("[network]", "[network] table", "[network]"),
+                (false, true, false, false) => ("mounts", "mounts list", "mounts"),
+                (false, false, true, false) => {
+                    ("[mount_sets]", "[mount_sets] table", "[mount_sets]")
+                }
+                (true, true, false, false) => (
+                    "[network] and mounts",
+                    "[network] table and mounts list",
+                    "[network] or mounts",
+                ),
+                (true, false, true, false) => (
+                    "[network] and [mount_sets]",
+                    "[network] table and [mount_sets] table",
+                    "[network] or [mount_sets]",
+                ),
+                (false, true, true, false) => (
+                    "mounts and [mount_sets]",
+                    "mounts list and [mount_sets] table",
+                    "mounts or [mount_sets]",
+                ),
+                (true, true, true, false) => (
+                    "[network], mounts and [mount_sets]",
+                    "[network] table, mounts list and [mount_sets] table",
+                    "[network], mounts or [mount_sets]",
+                ),
+                // #511: `[egress_sets]` is the fourth field, so it is last in
+                // every list — including when it is the only one.
+                (false, false, false, true) => {
+                    ("[egress_sets]", "[egress_sets] table", "[egress_sets]")
+                }
+                (true, false, false, true) => (
+                    "[network] and [egress_sets]",
+                    "[network] table and [egress_sets] table",
+                    "[network] or [egress_sets]",
+                ),
+                (false, true, false, true) => (
+                    "mounts and [egress_sets]",
+                    "mounts list and [egress_sets] table",
+                    "mounts or [egress_sets]",
+                ),
+                (false, false, true, true) => (
+                    "[mount_sets] and [egress_sets]",
+                    "[mount_sets] table and [egress_sets] table",
+                    "[mount_sets] or [egress_sets]",
+                ),
+                (true, true, false, true) => (
+                    "[network], mounts and [egress_sets]",
+                    "[network] table, mounts list and [egress_sets] table",
+                    "[network], mounts or [egress_sets]",
+                ),
+                (true, false, true, true) => (
+                    "[network], [mount_sets] and [egress_sets]",
+                    "[network] table, [mount_sets] table and [egress_sets] table",
+                    "[network], [mount_sets] or [egress_sets]",
+                ),
+                (false, true, true, true) => (
+                    "mounts, [mount_sets] and [egress_sets]",
+                    "mounts list, [mount_sets] table and [egress_sets] table",
+                    "mounts, [mount_sets] or [egress_sets]",
+                ),
+                (true, true, true, true) => (
+                    "[network], mounts, [mount_sets] and [egress_sets]",
+                    "[network] table, mounts list, [mount_sets] table and [egress_sets] table",
+                    "[network], mounts, [mount_sets] or [egress_sets]",
+                ),
+                (false, false, false, false) => {
+                    unreachable!("`of` normalizes the empty trigger set")
+                }
+            },
             // ADR-0059: not a file field, so all three slots say the same thing
             // — what a CLI reference needs the file for.
             AuthoritySubject::EgressReference => (
@@ -640,7 +742,14 @@ mod tests {
     #[test]
     fn network_subject_display_is_byte_identical() {
         use AuthorityRefusal::*;
-        let subject = AuthoritySubject::Network;
+        // The `[network]`-only subject, built the one way a subject now can be.
+        // Every expected sentence below is frozen at its pre-#394 spelling.
+        let subject = AuthoritySubject::of(AuthorityTriggers {
+            network: true,
+            mounts: false,
+            mount_sets: false,
+            egress_sets: false,
+        });
         for (refusal, pinned) in [
             (
                 DirNotDirectory,
@@ -688,7 +797,7 @@ mod tests {
     /// bytes must tell the reader to review the field first.
     #[test]
     fn untrusted_refusals_never_advise_adopting_a_guests_file() {
-        for subject in SUBJECTS {
+        for subject in every_subject() {
             let caveat = format!("review the {} before trusting", subject.object());
             for refusal in every_refusal() {
                 let text = UntrustedConfig::Refused { refusal, subject }.to_string();
@@ -718,6 +827,77 @@ mod tests {
             );
             assert!(!text.contains(&caveat), "{text}");
         }
+    }
+
+    /// The whole-sentence literals for the `[egress_sets]`-only subject (#511).
+    ///
+    /// One of the eight new subjects, and the one a tools-and-sets-only user file
+    /// produces. Written out whole rather than composed from `pinned_subject_slots`,
+    /// so a composition bug cannot hide behind a table that agrees with itself.
+    #[test]
+    fn egress_sets_subject_display_is_byte_identical() {
+        use AuthorityRefusal::*;
+        let subject = AuthoritySubject::of(AuthorityTriggers {
+            network: false,
+            mounts: false,
+            mount_sets: false,
+            egress_sets: true,
+        });
+        for (refusal, pinned) in [
+            (
+                DirNotDirectory,
+                "[egress_sets] refuses a config.toml whose directory is not a directory",
+            ),
+            (
+                ThroughSymlink,
+                "[egress_sets] requires config.toml to be a regular file, but it is reached through a symbolic link; its target may be writable by a guest or project, so review the [egress_sets] table before trusting the file (a symlinked config without [egress_sets] still works)",
+            ),
+            (
+                FileWritable,
+                "[egress_sets] refuses a group- or other-writable config.toml; a guest or another account may have written its [egress_sets] table, so review the [egress_sets] table before trusting the file (fixing the mode does not establish authorship)",
+            ),
+            (
+                FileLinks(3),
+                "[egress_sets] refuses a config.toml with 3 hard links; another name for it may be guest- or project-writable, so review the [egress_sets] table before trusting the file",
+            ),
+        ] {
+            assert_eq!(
+                UntrustedConfig::Refused { refusal, subject }.to_string(),
+                pinned,
+                "egress-sets refusal text changed for {refusal:?}"
+            );
+        }
+        let kind = std::io::ErrorKind::PermissionDenied;
+        assert_eq!(
+            UntrustedConfig::DirUnexaminable { kind, subject }.to_string(),
+            "[egress_sets] requires examining the config directory, which failed (PermissionDenied)"
+        );
+    }
+
+    /// A44: the all-false trigger set names `[network]` in all three slots.
+    ///
+    /// The input is unreachable through [`verify`], but `of` is what a future
+    /// caller would reuse, and an empty slot would render a refusal sentence with a
+    /// missing word — a diagnostic that describes no file field at all.
+    #[test]
+    fn the_empty_trigger_set_names_network() {
+        let subject = AuthoritySubject::of(AuthorityTriggers {
+            network: false,
+            mounts: false,
+            mount_sets: false,
+            egress_sets: false,
+        });
+        assert_eq!(subject.label(), "[network]");
+        assert_eq!(subject.object(), "[network] table");
+        assert_eq!(subject.without(), "[network]");
+        assert_eq!(
+            UntrustedConfig::Refused {
+                refusal: AuthorityRefusal::FileWritable,
+                subject,
+            }
+            .to_string(),
+            "[network] refuses a group- or other-writable config.toml; a guest or another account may have written its [network] table, so review the [network] table before trusting the file (fixing the mode does not establish authorship)"
+        );
     }
 
     /// The whole-sentence literals for the egress-reference subject (ADR-0059).
@@ -819,34 +999,47 @@ mod tests {
 
     /// The presence-not-contents rule, against an independent table.
     ///
-    /// The oracle is an explicit `match` on the eight rows rather than a
-    /// disjunction: written as `network || mounts || mount_sets` it would be the
-    /// same expression as the contract, so a body that computed something else
-    /// could only be caught by the proof.
+    /// The oracle is an explicit `match` on all sixteen rows rather than a
+    /// disjunction: written as `network || mounts || mount_sets || egress_sets` it
+    /// would be the same expression as the contract, so a body that computed
+    /// something else could only be caught by the proof. The all-false row is the
+    /// one that keeps `egress_sets` from turning "declares nothing" into
+    /// "authority-bearing".
     #[test]
-    fn authority_required_matches_the_eight_rows() {
+    fn authority_required_matches_the_sixteen_rows() {
         for network in [false, true] {
             for mounts in [false, true] {
                 for mount_sets in [false, true] {
-                    let expected = match (network, mounts, mount_sets) {
-                        (false, false, false) => false,
-                        (false, false, true) => true,
-                        (false, true, false) => true,
-                        (false, true, true) => true,
-                        (true, false, false) => true,
-                        (true, false, true) => true,
-                        (true, true, false) => true,
-                        (true, true, true) => true,
-                    };
-                    assert_eq!(
-                        authority_required(AuthorityTriggers {
-                            network,
-                            mounts,
-                            mount_sets
-                        }),
-                        expected,
-                        "network={network} mounts={mounts} mount_sets={mount_sets}"
-                    );
+                    for egress_sets in [false, true] {
+                        let expected = match (network, mounts, mount_sets, egress_sets) {
+                            (false, false, false, false) => false,
+                            (false, false, false, true) => true,
+                            (false, false, true, false) => true,
+                            (false, false, true, true) => true,
+                            (false, true, false, false) => true,
+                            (false, true, false, true) => true,
+                            (false, true, true, false) => true,
+                            (false, true, true, true) => true,
+                            (true, false, false, false) => true,
+                            (true, false, false, true) => true,
+                            (true, false, true, false) => true,
+                            (true, false, true, true) => true,
+                            (true, true, false, false) => true,
+                            (true, true, false, true) => true,
+                            (true, true, true, false) => true,
+                            (true, true, true, true) => true,
+                        };
+                        assert_eq!(
+                            authority_required(AuthorityTriggers {
+                                network,
+                                mounts,
+                                mount_sets,
+                                egress_sets
+                            }),
+                            expected,
+                            "network={network} mounts={mounts} mount_sets={mount_sets} egress_sets={egress_sets}"
+                        );
+                    }
                 }
             }
         }
@@ -883,34 +1076,59 @@ mod tests {
 
     /// Every nonempty presence combination names a distinct sentence subject,
     /// and the subject names exactly the fields that are present. This is what
-    /// keeps a `[mount_sets]`-only file from being described as a `mounts` file.
+    /// keeps a `[mount_sets]`-only file from being described as a `mounts` file,
+    /// and a `[egress_sets]`-only file from being described as a `[network]` one.
     #[test]
     fn subject_names_exactly_the_present_fields() {
+        let mut labels = Vec::new();
         for network in [false, true] {
             for mounts in [false, true] {
                 for mount_sets in [false, true] {
-                    if !(network || mounts || mount_sets) {
-                        continue;
+                    for egress_sets in [false, true] {
+                        if !(network || mounts || mount_sets || egress_sets) {
+                            continue;
+                        }
+                        let subject = AuthoritySubject::of(AuthorityTriggers {
+                            network,
+                            mounts,
+                            mount_sets,
+                            egress_sets,
+                        });
+                        let expected = match (network, mounts, mount_sets, egress_sets) {
+                            (true, false, false, false) => "[network]",
+                            (false, true, false, false) => "mounts",
+                            (false, false, true, false) => "[mount_sets]",
+                            (false, false, false, true) => "[egress_sets]",
+                            (true, true, false, false) => "[network] and mounts",
+                            (true, false, true, false) => "[network] and [mount_sets]",
+                            (true, false, false, true) => "[network] and [egress_sets]",
+                            (false, true, true, false) => "mounts and [mount_sets]",
+                            (false, true, false, true) => "mounts and [egress_sets]",
+                            (false, false, true, true) => "[mount_sets] and [egress_sets]",
+                            (true, true, true, false) => "[network], mounts and [mount_sets]",
+                            (true, true, false, true) => "[network], mounts and [egress_sets]",
+                            (true, false, true, true) => {
+                                "[network], [mount_sets] and [egress_sets]"
+                            }
+                            (false, true, true, true) => "mounts, [mount_sets] and [egress_sets]",
+                            (true, true, true, true) => {
+                                "[network], mounts, [mount_sets] and [egress_sets]"
+                            }
+                            (false, false, false, false) => unreachable!("skipped above"),
+                        };
+                        assert_eq!(subject.label(), expected);
+                        labels.push(subject.label());
                     }
-                    let subject = AuthoritySubject::of(AuthorityTriggers {
-                        network,
-                        mounts,
-                        mount_sets,
-                    });
-                    let expected = match (network, mounts, mount_sets) {
-                        (true, false, false) => "[network]",
-                        (false, true, false) => "mounts",
-                        (false, false, true) => "[mount_sets]",
-                        (true, true, false) => "[network] and mounts",
-                        (true, false, true) => "[network] and [mount_sets]",
-                        (false, true, true) => "mounts and [mount_sets]",
-                        (true, true, true) => "[network], mounts and [mount_sets]",
-                        (false, false, false) => unreachable!("skipped above"),
-                    };
-                    assert_eq!(subject.label(), expected);
                 }
             }
         }
+        // Fifteen nonempty field combinations, and no two worded alike: a
+        // collision would let one file's refusal describe another's fields.
+        assert_eq!(labels.len(), 15);
+        let mut distinct = labels.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), 15);
     }
 
     /// A file with no authority-bearing field is never refused, but the same
@@ -935,6 +1153,7 @@ mod tests {
             network: false,
             mounts: false,
             mount_sets: false,
+            egress_sets: false,
         };
         let verification = verify(&read, none).unwrap();
         assert!(verification.authorized.is_none());
@@ -952,16 +1171,28 @@ mod tests {
                 network: true,
                 mounts: false,
                 mount_sets: false,
+                egress_sets: false,
             },
             AuthorityTriggers {
                 network: false,
                 mounts: true,
                 mount_sets: false,
+                egress_sets: false,
             },
             AuthorityTriggers {
                 network: false,
                 mounts: false,
                 mount_sets: true,
+                egress_sets: false,
+            },
+            // #511: `[egress_sets]` alone is authority-bearing by presence, so a
+            // sets-only file that is reached through a symlink is refused before
+            // anything reads a definition.
+            AuthorityTriggers {
+                network: false,
+                mounts: false,
+                mount_sets: false,
+                egress_sets: true,
             },
         ] {
             let error = verify(&read, triggers).unwrap_err().to_string();
@@ -987,11 +1218,19 @@ mod tests {
                 network: false,
                 mounts: false,
                 mount_sets: false,
+                egress_sets: false,
             },
             AuthorityTriggers {
                 network: true,
                 mounts: false,
                 mount_sets: false,
+                egress_sets: false,
+            },
+            AuthorityTriggers {
+                network: false,
+                mounts: false,
+                mount_sets: false,
+                egress_sets: true,
             },
         ] {
             let verification = verify(&read, triggers).unwrap();
@@ -1018,6 +1257,7 @@ mod tests {
             network: true,
             mounts: false,
             mount_sets: false,
+            egress_sets: false,
         };
         let load = || {
             let read = read_bounded_regular_file_noting_symlink(&file, 100).unwrap();

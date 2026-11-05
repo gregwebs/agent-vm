@@ -59,7 +59,8 @@ pub(crate) struct Args {
     /// and refused with a host HTTP proxy. Bare hostnames use intercepted ports (443 by default).
     /// Use brackets for a port on an IPv6 address or CIDR.
     /// `tool:NAME` grants a user-config tool's own `network_requests`, each as
-    /// `tcp://HOST:PORT`.
+    /// `tcp://HOST:PORT`; `set:NAME` grants a user-config `[egress_sets]` entry's
+    /// compiled closure.
     #[arg(
         long = "allow-egress",
         value_name = "[tcp://|udp://]IP|CIDR[:PORT] | [tcp://]HOST[:PORT]",
@@ -1673,6 +1674,25 @@ mod tests {
             .to_string();
         assert_eq!(error, BOTH);
 
+        // #511 A34: a *set* reference names itself in the same two slots, and
+        // the tool sentence above stays byte-identical.
+        const PERSISTED_SET: &str = "hostname allowances cannot be enforced through the host HTTP proxy (HTTPS_PROXY/HTTP_PROXY/ALL_PROXY): the proxy resolves the name, so the address scope is not checked; unset the proxy, use an IP/CIDR allowance, or use --allow-internet-egress (persisted hostname grants from \"/home/u/.config/agent-vm/config.toml\" [network], including via set:corp, apply to every launch; remove them there)";
+        let sets = crate::egress_reference::test_support::user_namespace(
+            std::path::Path::new("/home/u/.config/agent-vm/config.toml"),
+            &[],
+            Some("corp = [\"git.corp.example\"]\n"),
+        );
+        let user = crate::user_network::UserNetwork::for_test_with_tools(
+            "/home/u/.config/agent-vm/config.toml",
+            Default::default(),
+            &["set:corp"],
+            &sets,
+        );
+        let error = Plan::from_args_with_proxy_lookup(args(), Some(&user), Some(&sets), proxy)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, PERSISTED_SET);
+
         // The three pre-#506 sentences, also pinned independently.
         let mut cli_literal = args();
         cli_literal.allow_egress = vec!["cli.example.com".into()];
@@ -1686,6 +1706,135 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert_eq!(error, BOTH_NO_REFERENCE);
+    }
+
+    /// R26, corrected for sets: the refusal names a reference only when that
+    /// reference's **own expansion** grants a hostname.
+    ///
+    /// A set of addresses, an empty set, or a set that repeats a literal's
+    /// hostname is not a source of hostname authority, so naming it would send
+    /// the reader to delete a line whose removal changes nothing. Every
+    /// expectation is a complete literal sentence, not a substring, so a suffix
+    /// that quietly disappeared would fail here.
+    #[test]
+    fn hostname_proxy_refusal_names_only_references_that_grant_hostnames() {
+        const REFUSAL: &str = concat!(
+            "hostname allowances cannot be enforced through the host HTTP proxy ",
+            "(HTTPS_PROXY/HTTP_PROXY/ALL_PROXY): the proxy resolves the name, so the address ",
+            "scope is not checked; unset the proxy, use an IP/CIDR allowance, or use ",
+            "--allow-internet-egress"
+        );
+        const SAVED_HEAD: &str =
+            " (persisted hostname grants from \"/home/u/.config/agent-vm/config.toml\" [network]";
+        const SAVED_TAIL: &str = " apply to every launch; remove them there)";
+        const CLI_HEAD: &str = " (hostnames from --allow-egress";
+        const BOTH_MIDDLE: &str = " apply to this launch; persisted hostname grants from \"/home/u/.config/agent-vm/config.toml\" [network]";
+        const BOTH_TAIL: &str = " apply to every launch; remove the persisted ones there and stop passing --allow-egress)";
+        let proxy = |v: &str| (v == "HTTPS_PROXY").then(|| "http://127.0.0.1:9".into());
+        let file = std::path::Path::new("/home/u/.config/agent-vm/config.toml");
+        // One namespace holds every case: a set of addresses, an empty set and a
+        // set that does grant a hostname.
+        let sets = crate::egress_reference::test_support::user_namespace(
+            file,
+            &[],
+            Some("num = [\"10.0.0.1\"]\nempty = []\ncorp = [\"git.corp.example\"]\n"),
+        );
+        let saved = |entries: &[&str]| {
+            crate::user_network::UserNetwork::for_test_with_tools(
+                file,
+                Default::default(),
+                entries,
+                &sets,
+            )
+        };
+        let refusal = |plan: Result<Plan>| plan.unwrap_err().to_string();
+
+        // Persisted tier: an address set and an empty set are silent; the set
+        // that grants a hostname is named. The literal is what makes the
+        // sentence appear at all.
+        for entries in [
+            &["set:num", "api.example.com"][..],
+            &["set:empty", "api.example.com"][..],
+        ] {
+            assert_eq!(
+                refusal(Plan::from_args_with_proxy_lookup(
+                    args(),
+                    Some(&saved(entries)),
+                    Some(&sets),
+                    proxy
+                )),
+                format!("{REFUSAL}{SAVED_HEAD}{SAVED_TAIL}"),
+                "{entries:?}"
+            );
+        }
+        assert_eq!(
+            refusal(Plan::from_args_with_proxy_lookup(
+                args(),
+                Some(&saved(&[
+                    "set:num",
+                    "set:empty",
+                    "set:corp",
+                    "api.example.com"
+                ])),
+                Some(&sets),
+                proxy
+            )),
+            format!("{REFUSAL}{SAVED_HEAD}, including via set:corp,{SAVED_TAIL}")
+        );
+
+        // CLI tier: the same three shapes, through `--allow-egress`. With no
+        // hostname-granting reference the bare sentence is the pre-#506 one.
+        let cli = |entries: &[&str]| Args {
+            allow_egress: entries.iter().map(|e| (*e).to_owned()).collect(),
+            ..args()
+        };
+        for entries in [
+            &["set:num", "api.example.com"][..],
+            &["set:empty", "api.example.com"][..],
+        ] {
+            assert_eq!(
+                refusal(Plan::from_args_with_proxy_lookup(
+                    cli(entries),
+                    None,
+                    Some(&sets),
+                    proxy
+                )),
+                REFUSAL,
+                "{entries:?}"
+            );
+        }
+        assert_eq!(
+            refusal(Plan::from_args_with_proxy_lookup(
+                cli(&["set:corp"]),
+                None,
+                Some(&sets),
+                proxy
+            )),
+            format!(
+                "{REFUSAL}{CLI_HEAD}, including via set:corp, apply to this launch; stop passing them)"
+            )
+        );
+
+        // Mixed tiers, one each way: the address-only CLI set is silent while
+        // the persisted hostname set is named, and vice versa.
+        assert_eq!(
+            refusal(Plan::from_args_with_proxy_lookup(
+                cli(&["set:num", "cli.example.com"]),
+                Some(&saved(&["set:corp"])),
+                Some(&sets),
+                proxy
+            )),
+            format!("{REFUSAL}{CLI_HEAD}{BOTH_MIDDLE}, including via set:corp,{BOTH_TAIL}")
+        );
+        assert_eq!(
+            refusal(Plan::from_args_with_proxy_lookup(
+                cli(&["set:corp", "cli.example.com"]),
+                Some(&saved(&["set:num", "api.example.com"])),
+                Some(&sets),
+                proxy
+            )),
+            format!("{REFUSAL}{CLI_HEAD}, including via set:corp,{BOTH_MIDDLE}{BOTH_TAIL}")
+        );
     }
 
     /// A14 (CLI half) and A20: the CLI's own `#N` rendering of a *resolution*

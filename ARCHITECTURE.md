@@ -47,7 +47,9 @@ crates/agent-vm/src/
 ├── egress_grammar.rs       # shared scheme/target/port grammar and allowance errors
 ├── egress_policy.rs        # allowance dispatch + launch egress authority (default-deny)
 ├── egress_hostname.rs      # hostname allowance acceptance, port scope, Domain rule assembly
-├── egress_reference.rs     # tool:NAME → user tool requests; proved prefix claim (ADR-0059)
+├── egress_reference.rs     # tool:NAME / set:NAME → user tool requests and set closures;
+│                           #   two proved prefix claims, one namespace (ADR-0059, #511)
+│   └── sets.rs             #   the egress-set graph: names, references, cycles, budgeted closures
 ├── dns_name.rs             # shared ASCII DNS label byte kernel (credential + egress)
 ├── network.rs              # published ports, proxy notice, launch Plan
 ├── network_requests.rs     # tool requests: parse, coverage report (never authority)
@@ -55,7 +57,8 @@ crates/agent-vm/src/
 ├── config_mounts.rs        # user-tier `mounts` + `[mount_sets]`: schema, `~/` expansion, load-time claim
 │   └── sets.rs             #   the set graph: names, references, cycles, indexed bounded closures
 ├── mount_selection.rs      # one launch's declarations: verified user defaults, then argv (paths or names)
-├── config_authority.rs     # ADR-0040 verified read, one gate for [network], mounts and mount_sets
+├── config_authority.rs     # ADR-0040 verified read: one gate for [network], mounts,
+│                           #   mount_sets and egress_sets (four presence triggers)
 ├── boot_image.rs           # the one boot-image selection seam (CLI/env/config/default)
 │   ├── default_selection.rs#   journal-aware logical default read (bounded shared lock)
 │   └── upgrade.rs          #   set-default command shape: explicit typed target
@@ -105,9 +108,11 @@ A launch is one pass, and the ordering is load-bearing:
    together with the cross-tier conflicts, and checks `persist` ownership over
    all of those winners — but it binds no reference and folds no closure, so a
    `tools` reference error is not a load error. (An **egress** reference is a
-   different thing: a persisted `tool:NAME` in `[network] allow_egress` is
-   resolved during that same load and *is* a load error when it cannot be
-   resolved, while a CLI one is decided in `network::Plan::from_args`.)
+   different thing: a persisted `tool:NAME` or `set:NAME` in
+   `[network] allow_egress` is resolved during that same load and *is* a load
+   error when it cannot be resolved — as is every declared `[egress_sets]`
+   definition, referenced or not — while a CLI one is decided in
+   `network::Plan::from_args`.)
    `ConfigReport::into_launch_catalog`,
    reached from `cli::parse_from` and from `doctor`, is what validates every
    retained definition's `tools` references, checks and folds each launch
@@ -358,8 +363,9 @@ triggers or not, and returns what it measured (`authorized` **and** a
 `authorized` is `Some` only when an authority-bearing field is present and the
 file passed, so a tools-only file keeps loading (and keeps working through a
 dotfile symlink) whatever its facts are. The verdict waits, unenforced and
-unused, until a CLI `--allow-egress tool:NAME` asks for it at launch — a decision
-that only exists after argv is parsed, which is why it cannot be made here.
+unused, until a CLI `--allow-egress tool:NAME` or `set:NAME` asks for it at
+launch — a decision that only exists after argv is parsed, which is why it
+cannot be made here.
 
 **The persisted guest-HOME collision moved.** A mount that shadows a declared
 `persist` path used to be refused in `run.rs` *after* `prepare` returned — that
