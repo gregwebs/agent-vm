@@ -7,6 +7,15 @@
 //! display and commit cannot ride the same consent — the commit's compare-and-
 //! swap checks that digest under the host lock and refuses a different one.
 //!
+//! # Three consent surfaces, one rendering rule
+//!
+//! A typed answer on a terminal, `--yes`, and an explicit `image build`/`image
+//! import` are the three ways a replacement may be authorized. The first two are
+//! questions; the third is the consequence of a command the user already ran, so
+//! nothing is read and nothing is asked. All three still render the change before
+//! it is committed: a user who authorized the operation can see what it did, and
+//! a render that cannot be written commits nothing.
+//!
 //! # Why the read is bounded and never repeated
 //!
 //! A terminal answer is one canonical line, so the program reads at most
@@ -82,6 +91,49 @@ pub(super) fn approve(
         return Err(not_approved());
     }
     Ok(Approval::replacement(candidate, expected))
+}
+
+/// The publishing command is the consent (#391): render the change, then mint
+/// it. A render that cannot be written commits nothing.
+///
+/// `source` is already escaped (`ImageLabel::for_result_reference`); this module
+/// never treats it as a shell word.
+pub(super) fn approve_publication(
+    candidate: &ValidatedCandidate,
+    expected: Option<ApprovedPin>,
+    source: &str,
+) -> Result<Approval> {
+    let platform = HostLinuxPlatform::host();
+    let render = publication_render(source, &platform, expected.as_ref(), &candidate.digest);
+    std::io::stderr()
+        .write_all(render.as_bytes())
+        .map_err(|_| publication_render_failed())?;
+    Ok(match expected {
+        Some(pin) => Approval::replacement(candidate, pin),
+        None => Approval::initial(candidate),
+    })
+}
+
+/// Full digests, the approval key's platform, and `none` for a first approval:
+/// a truncated digest could not be compared with the store by eye, and a
+/// question mark would promise an answer this command never reads.
+fn publication_render(
+    source: &str,
+    platform: &HostLinuxPlatform,
+    old: Option<&ApprovedPin>,
+    new: &ManifestDigest,
+) -> String {
+    format!(
+        "Approving the image published as {} ({}):\n  old: {}\n  new: {}\n",
+        source,
+        platform.render(),
+        old.map_or("none".to_string(), |pin| pin.digest.as_str().to_string()),
+        new.as_str()
+    )
+}
+
+fn publication_render_failed() -> anyhow::Error {
+    anyhow!("the image approval change could not be shown, so nothing was approved")
 }
 
 fn ask(stderr: &mut impl Write) -> Result<bool> {
@@ -198,6 +250,8 @@ fn prompt_is_permitted(facts: TerminalFacts) -> (ok: bool)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::image_acquire::OciTarget;
+    use crate::image_pin::{PinKey, PinRevision};
 
     #[test]
     fn pure_decisions_match_their_truth_tables() {
@@ -298,5 +352,50 @@ mod tests {
             "no raw control byte reaches the terminal"
         );
         assert!(text.contains("\\x1b"), "the escape is visible, not dropped");
+    }
+
+    /// The publishing command's render: both shapes, full digests, the platform
+    /// the pin is keyed by, and no question mark — nothing is read here.
+    #[test]
+    fn publication_render_names_full_digests_and_a_first_approval() {
+        let platform = HostLinuxPlatform::for_tests();
+        let old = ManifestDigest::parse(&format!("sha256:{}", "a".repeat(64))).unwrap();
+        let new = ManifestDigest::parse(&format!("sha384:{}", "b".repeat(96))).unwrap();
+        let key = PinKey::new(&OciTarget::parse("example.com/team/app:dev").unwrap()).unwrap();
+        let previous = ApprovedPin {
+            key,
+            digest: old.clone(),
+            revision: PinRevision(1),
+        };
+
+        let replacement = publication_render(
+            "example.com/team/\\x1b[31mapp:dev",
+            &platform,
+            Some(&previous),
+            &new,
+        );
+        assert!(
+            replacement.contains(&format!("old: {old}")),
+            "{replacement}"
+        );
+        assert!(
+            replacement.contains(&format!("new: {new}")),
+            "{replacement}"
+        );
+        assert!(replacement.contains("(linux/"));
+        assert!(replacement.contains("\\x1b"), "the escape is visible");
+        assert!(
+            !replacement.contains('\u{1b}'),
+            "no raw control byte reaches the terminal"
+        );
+        assert!(!replacement.contains("[y/N]"), "nothing is asked");
+
+        let first = publication_render("example.com/team/app:dev", &platform, None, &new);
+        assert!(first.contains("old: none"), "{first}");
+        assert!(first.contains(&format!("new: {new}")), "{first}");
+        assert!(
+            !first.contains("sha256:"),
+            "no invented predecessor: {first}"
+        );
     }
 }

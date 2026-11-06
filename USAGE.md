@@ -316,17 +316,46 @@ agent-vm image set-default --image ghcr.io/owner/app:dev --yes
 ```
 
 `--yes` exists only on these two verbs (no `-y`, no environment variable and no
-launch, setup, build or import flag). The change is still printed, so the old
+launch, setup or build/import flag). The change is still printed, so the old
 and new digests appear in the log without a human at the terminal. A first pin
 or an unchanged digest never prompts and does not need `--yes`.
 
-Without `--yes`, a replacement needs **both stdin and stderr to be terminals**.
-Pipes, files, CI runners and `2>log` all refuse a changed pin with status 1,
-fixed guidance naming the `--yes` form, and the stored approval untouched;
-stdin is not read, so a piped script cannot answer a question it was never
-shown. A first pin or an unchanged digest succeeds without a terminal. Cloud
-and CI automation must therefore use `--yes`, which authorizes one exact
-candidate rather than "whatever is current".
+`image build` and `image import` are the third consent surface: the bytes they
+approve are the ones the command was asked to publish, so they render the same
+old/new digests and never ask. They are the only verbs that approve a
+**replacement** without either a prompt or `--yes`; a first pin or an unchanged
+digest needs neither on any verb, and `--yes` is itself prompt-free. There is no
+`--yes` and no `--no-approve` on either verb — declining is done by not running
+them. See
+[Retained default and staging boundaries](#retained-default-and-staging-boundaries).
+
+For `image refresh` and `image set-default`, a replacement without `--yes` needs
+**both stdin and stderr to be terminals**. Pipes, files, CI runners and `2>log`
+all refuse a changed pin with status 1, fixed guidance naming the `--yes` form,
+and the stored approval untouched; stdin is not read, so a piped script cannot
+answer a question it was never shown. A first pin or an unchanged digest
+succeeds without a terminal, and `image build`/`image import` never need one
+(above). Cloud and CI automation driving the other two verbs must therefore use
+`--yes`, which authorizes one exact candidate rather than "whatever is current".
+
+#### If an approved image is reported unavailable
+
+An approval names one digest, and a launch reads exactly that digest out of the
+cache. Another publication can write the same digest-spelled name — an imported
+archive that carries `repo@<digest>` among its own names does — so agent-vm keeps
+**content evidence** for every entry it has validated: the first pin a launch
+makes from a warm cache, a publication's read-back and an explicit refresh all
+leave one, and a launch whose digest key no longer holds the approved content
+restores that key from it and boots offline.
+
+The evidence only exists from the version that wrote it. An approval created by
+an **older** agent-vm has none until a launch validates its content again, so if
+something overwrites that digest key *before* any newer launch touches it, nothing
+on this host recorded what the key held and it cannot be repaired. The launch then
+stops with `the approved image content is not available` and tells you to fetch
+the digest or restore the cache; it never falls back to the tag. Reacquiring the
+approved digest (or moving the cache back) is the only recovery for that case;
+afterwards a launch records the evidence and the same overwrite is repairable.
 
 #### Damaged or reset approvals
 
@@ -353,13 +382,40 @@ unchanged in *when* it may happen: an absent record is retained only after
 successful acquisition — for any successful default-tier preparation, not only a
 first pin — and an existing record is never moved by a launch.
 
-`image build` and `image import` publish cache aliases but never create or
-replace a pin or the retained default (issue #391). Importing over a tag you
-once approved does **not** approve the imported bytes: a launch keeps using the
-approved digest until you run `image refresh --image REF` and approve the
-change. A daemon-only image may not be available from a registry, so it cannot
-be registry-refreshed; the import itself remains the supported way to get it
-into the cache.
+`image build` and `image import` approve exactly the one **result reference**
+they name — a build's `--tag`, or an import's `--tag` or its inferred `--docker`
+source — at the content they published, for this host's platform, with no
+prompt (issue #391). The command that supplied the bytes is the consent, so a
+rebuild or a re-import is immediately what the next launch of that reference
+boots. The change is rendered on stderr before it is committed:
+
+```text
+Approving the image published as docker.io/library/app:dev (linux/arm64):
+  old: sha256:<full old digest>
+  new: sha256:<full new digest>
+```
+
+A first approval shows `old: none`. Republishing content that is already
+approved — the same digest, or the same verified config and ordered layer diff
+IDs under another manifest digest — neither rewrites the approval nor renders an
+approval change. Both verbs still print their usual completion sentence on
+stdout.
+
+Names the archive itself carries are published to the cache but **never**
+approved: an alias over a reference you approved earlier leaves that approval
+exactly where it was. Neither verb adopts or moves the retained default — the
+store's journal recovery of an interrupted run is the one exception, below — and
+a default-tier launch keeps booting its own digest (issue #392).
+
+Because approval is part of the operation, both verbs need a usable `HOME` and a
+readable approval store, checked before Docker runs and before anything is
+published: a damaged store fails the command with nothing built and nothing
+imported. A published result that cannot be validated for this host — a
+foreign-architecture config, for instance — exits nonzero and says the image was
+published to the cache but its approval was not updated, so a launch keeps
+booting the content approved for it before. A daemon-only image may not be
+available from a registry, so it cannot be registry-refreshed; the import itself
+is the supported way to get it into the cache.
 
 The store holds at most 4096 approvals of at most 4096 source bytes each, and
 the record may not exceed 4 MiB; exceeding a bound is a schema error, not a
@@ -675,8 +731,16 @@ Export/save must succeed before ingestion; if ingestion then fails, `--tag` is
 restored to what it named before (or removed if new), but an archive-supplied
 name may already have changed. Native blobs can remain after failed ingestion.
 Rollback failure is reported with the import error. Process termination
-mid-import is not covered; concurrent writers are not serialized and rollback
-can revert another writer's commit.
+mid-import is not covered. Two concurrent `image build`/`image import` runs do
+serialize where it matters — each takes the cache's exclusive publication
+barrier — but a direct SDK client or an older binary that takes no barrier is
+not serialized, and a rollback can revert that writer's commit.
+
+An approval this binary establishes carries content evidence for its digest, so a
+digest key an archive later overwrites is repaired from it on the next launch; an
+approval written by an older agent-vm has none, so that one overwrite is not
+repairable. See
+[If an approved image is reported unavailable](#if-an-approved-image-is-reported-unavailable).
 
 Build prints the `--image` value to launch with on stdout. Import prints the
 same sentence unless the configuration already selects exactly the reference it
@@ -690,25 +754,39 @@ which behaves like "a different image configured" (guidance plus the hint). A
 retained or recommended fallback is not a configured image, so it gets only the
 launch sentence.
 
-Errors and Docker's progress go to stderr. Usage errors from `image import` do
-not echo rejected values. A printed reference is a shell word: a plain one prints
-unchanged, and one holding non-ASCII or control bytes uses `$'…'` escapes that
-leave the reference unchanged. Those escapes are read only by bash and zsh, so
-such a notice says `(quoted for bash or zsh)`.
+Errors, Docker's progress and the approval change go to stderr; stdout keeps the
+single completion sentence. Usage errors from `image import` do not echo
+rejected values. A reference printed as completion guidance to paste back is a
+shell word: a plain one prints unchanged, and one holding non-ASCII or control
+bytes uses `$'…'` escapes that leave the reference unchanged. Those escapes are
+read only by bash and zsh, so such a notice says `(quoted for bash or zsh)`. The
+approval render is not such a word: it is display text on stderr, escaped for
+the terminal (a control byte renders as `\x1b`) and deliberately not pasteable.
 
 A registry acquisition failure for an explicit mutable tag prints an import
 hint and retains the registry error chain. It does not prove the image exists
 in Docker. Digests and the redacted default image get no hint; launch never
 runs Docker or automatically imports.
 
-Neither verb writes configuration, a host pin or a retained default, adopts a
-default, boots a guest, installs runtime tools or triggers a launch build. Build
-does not consult image selection at all. Import observes it — read-only, with
-the same selector and environment rule as `image show` — once, after the native
-publication succeeds, and only to decide that guidance. The observation is a
-snapshot: a later config edit or launch decides what actually boots. Import
-publishing a name does not approve that name's content (#391); see
+Neither verb writes configuration or a retained default, adopts a default,
+boots a guest or installs runtime tools. Each records exactly one host approval,
+for its own result reference, after the publication succeeds — nothing else
+outside the cache (#391). The one documented exception is the store's own
+journal recovery: any explicit image write, this one included, first completes a
+retained-default intent an interrupted run left behind (#390), which restores or
+removes `default-image.json` and clears the intent; neither verb ever *adopts* a
+new default. See
 [Retained default and staging boundaries](#retained-default-and-staging-boundaries).
+Build does not consult image selection at all. Import observes it — read-only,
+with the same selector and environment rule as `image show` — once, after the
+native publication succeeds, and only to decide that guidance. The observation
+is a snapshot: a later config edit or launch decides what actually boots.
+
+Both verbs therefore need a usable `HOME`: it is checked, together with the
+approval store, before Docker runs. A published result that cannot be validated
+for this host's platform — a foreign-architecture image in the archive, for
+instance — is published to the cache but not approved, and the command exits 1
+saying so.
 Successful import is **not** proof of the boot image contract;
 `shell`/`setup` diagnose unusable software.
 

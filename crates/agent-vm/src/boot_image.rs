@@ -357,6 +357,17 @@ impl ImageLabel {
         }
     }
 
+    /// The reference an explicit build/import names as its own result: shown,
+    /// escaped, with no origin (it is the command's own argument, not a
+    /// selection tier).
+    pub(crate) fn for_result_reference(reference: &str) -> Self {
+        Self {
+            text: crate::config::escape_str(reference),
+            origin: None,
+            redacted: false,
+        }
+    }
+
     /// The reference for an explicit source or the fixed label for the default
     /// tier — without the `(from …)` origin.
     pub(crate) fn text(&self) -> &str {
@@ -1429,5 +1440,19 @@ mod tests {
         let requested = override_for("bad\u{1b}[31mref", OverrideSource::CommandLine);
         let boot = select(Some(requested), &configured).unwrap();
         assert!(!boot.to_string().contains('\u{1b}'), "{boot}");
+    }
+
+    /// A published result is the command's own argument, not a selection tier:
+    /// it is shown (escaped) and never redacted, and carries no origin.
+    #[test]
+    fn a_result_reference_label_is_escaped_and_never_redacted() {
+        let label = ImageLabel::for_result_reference("example.com/team/app:dev");
+        assert_eq!(label.text(), "example.com/team/app:dev");
+        assert!(!label.is_redacted());
+        assert_eq!(label.to_string(), "example.com/team/app:dev");
+
+        let escaped = ImageLabel::for_result_reference("example.com/team/bad\u{1b}[31m:dev");
+        assert!(!escaped.text().contains('\u{1b}'));
+        assert!(escaped.text().contains("\\x1b"), "{}", escaped.text());
     }
 }

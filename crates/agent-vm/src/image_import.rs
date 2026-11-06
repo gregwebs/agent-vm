@@ -5,6 +5,12 @@
 //! when that is omitted (#385) — plus any names the archive itself carries (see
 //! [`crate::image_publish`]); a failed import restores that reference only.
 //!
+//! The one record besides the cache it changes is the host approval of that
+//! result reference, which it takes without asking: the command that supplied
+//! the bytes is the consent (#391). The change is rendered on stderr before it is
+//! committed, and nothing else — no archive alias, no retained default, no
+//! configuration — is approved.
+//!
 //! A successful import *observes* the selection (read-only, after publication)
 //! solely to decide whether launch guidance is noise: a result reference the
 //! configuration already selects needs no hint.
@@ -159,20 +165,23 @@ pub(crate) fn preflight(args: &Args) -> Result<()> {
 
 pub(crate) async fn run(args: Args, configured: Result<&ConfiguredImages>) -> Result<i32> {
     let tag = args.result_reference()?;
-    match args.source.into_source()? {
-        Source::Input(path) => {
-            // Repeated: `run` stays self-contained; `preflight` is the boundary
-            // that keeps a path typo from creating state.
-            require_regular_file(&path)?;
-            let target = ImageTarget::resolve().await?;
-            target
-                .publish(&path, &tag)
-                .await
-                .context("importing image")?;
-        }
+    let source = args.source.into_source()?;
+    if let Source::Input(path) = &source {
+        // Repeated: `run` stays self-contained; `preflight` is the boundary
+        // that keeps a path typo from creating state.
+        require_regular_file(path)?;
+    }
+    // Resolve before Docker: invalid shared config must fail first.
+    let target = ImageTarget::resolve().await?;
+    // HOME and a readable pin store are checked before Docker runs or the
+    // archive is published (R9): a damaged store must not cost a save.
+    crate::image_pin::publication_preflight(&tag)?;
+    let published = match source {
+        Source::Input(path) => target
+            .publish(&path, &tag)
+            .await
+            .context("importing image")?,
         Source::Docker(source) => {
-            // Resolve before Docker: invalid shared config must fail first.
-            let target = ImageTarget::resolve().await?;
             let staging = target.stage()?;
             let exit = save_archive(&source, staging.path()).await?;
             if exit != 0 {
@@ -188,9 +197,13 @@ pub(crate) async fn run(args: Args, configured: Result<&ConfiguredImages>) -> Re
             target
                 .publish(staging.path(), &tag)
                 .await
-                .context("importing image")?;
+                .context("importing image")?
         }
-    }
+    };
+    // The command that supplied the bytes is the consent (#391). The read-back
+    // runs only now, after `publish`'s exclusive barrier is released.
+    #[allow(clippy::disallowed_methods)] // `image import` names the result it approves (#391).
+    crate::image_pin::approve_published(&published).await?;
     // Observed only now, after publication: the selector's default tier arms a
     // process-global dependency-log guard, so running it before the native
     // work would change diagnostics this command already had. The observation

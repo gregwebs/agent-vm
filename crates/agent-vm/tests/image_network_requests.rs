@@ -1389,6 +1389,11 @@ fn a14_doctor_shows_every_group_in_full_without_writing_anything() {
 /// The unapproved-selection read: an image imported into the cache and never
 /// launched. Doctor's fallback path hashes the canonical *selection*, so this is
 /// the only row that exercises it — the launched rows read the approved digest.
+///
+/// The import therefore runs under a separate HOME: an explicit import approves
+/// its own result reference (#391), which would move this row onto the approved
+/// branch and silently lose the coverage. The state root is shared, and that is
+/// where the cache lives.
 #[test]
 fn a14b_doctor_reads_an_imported_image_that_was_never_launched() {
     let h = Harness::new(Mode::LaunchSeam);
@@ -1403,8 +1408,12 @@ fn a14b_doctor_reads_an_imported_image_that_was_never_launched() {
     };
     image_archive::write(&archive, &spec);
     let tag = format!("{}/images:a14b", server.host);
+    let seed_home = tempfile::Builder::new()
+        .prefix("av-seed-home-")
+        .tempdir()
+        .unwrap();
     let mut command = h.command();
-    command.args([
+    command.env("HOME", seed_home.path()).args([
         "image",
         "import",
         "--input",
@@ -1414,6 +1423,17 @@ fn a14b_doctor_reads_an_imported_image_that_was_never_launched() {
     ]);
     let imported = bounded(command);
     assert!(imported.status.success(), "{}", stderr(&imported));
+    assert!(
+        seed_home
+            .path()
+            .join(".config/agent-vm/image-pins.json")
+            .exists(),
+        "the fixture import approves its own result reference (#391)"
+    );
+    assert!(
+        !h.home.join(".config/agent-vm/image-pins.json").exists(),
+        "the selection must stay unapproved, so doctor reads the fallback path"
+    );
 
     let out = doctor_for(&h, &tag);
     assert!(out.status.success(), "{}", stderr(&out));

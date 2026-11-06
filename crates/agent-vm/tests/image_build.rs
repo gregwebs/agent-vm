@@ -28,10 +28,14 @@ use std::time::{Duration, Instant};
 
 use microsandbox_image::{CachedImageMetadata, GlobalCache, Reference};
 
+#[path = "support/cache_inventory.rs"]
+mod cache_inventory;
 #[path = "support/fake_msb.rs"]
 mod fake_msb;
 #[path = "support/image_archive.rs"]
 mod image_archive;
+#[path = "support/pin_gate.rs"]
+mod pin_gate;
 mod support;
 
 use image_archive::{ArchiveSpec, LayerContent, PlatformSpec, Written};
@@ -42,6 +46,18 @@ fn agent_vm_bin() -> PathBuf {
 
 fn reference(raw: &str) -> Reference {
     raw.parse().expect("test reference parses")
+}
+
+/// Every published `<hash>.json` key under `manifests/`, as relative paths.
+///
+/// Only metadata counts: the native cache also creates `.agent-vm-acquire.lock`
+/// guards and `.msb-leases` bookkeeping beside it, which are not references.
+fn manifests_json(h: &Harness) -> Vec<PathBuf> {
+    let root = h.cache_dir().join("manifests");
+    snapshot(&root)
+        .into_keys()
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -916,18 +932,37 @@ fn build_ignores_config_the_retained_record_and_image_overrides() {
     let output = run_with_timeout(cmd, Duration::from_secs(60));
     assert_eq!(code_of(&output), 0, "{}", stderr_of(&output));
 
-    // No config/default file changed; no record was created.
+    // No config/default file changed. The only new file under `.config` is the
+    // approval of `app:dev` this build published (#391); the corrupt retained
+    // record is neither read nor repaired, which is why its exact bytes survive.
     let after = snapshot(&harness.home);
-    let home_config_before: BTreeMap<_, _> = before
-        .iter()
-        .filter(|(path, _)| path.starts_with(&config_dir))
-        .collect();
-    let home_config_after: BTreeMap<_, _> = after
-        .iter()
-        .filter(|(path, _)| path.starts_with(&config_dir))
-        .collect();
+    let home_config_before: BTreeMap<_, _> = without_approvals(
+        &config_dir,
+        before
+            .iter()
+            .filter(|(path, _)| path.starts_with(&config_dir))
+            .map(|(path, bytes)| (path.clone(), bytes.clone()))
+            .collect(),
+    );
+    let home_config_after: BTreeMap<_, _> = without_approvals(
+        &config_dir,
+        after
+            .iter()
+            .filter(|(path, _)| path.starts_with(&config_dir))
+            .map(|(path, bytes)| (path.clone(), bytes.clone()))
+            .collect(),
+    );
     assert_eq!(home_config_before, home_config_after);
-    assert!(config_dir.join("default-image.json").exists());
+    assert_eq!(
+        fs::read(config_dir.join("default-image.json")).unwrap(),
+        b"{ not json",
+        "the corrupt retained record is neither read nor repaired"
+    );
+    assert_eq!(
+        pin_for(&harness, "docker.io/library/app:dev"),
+        Some((written.manifest_digest.clone(), 1)),
+        "the build approves exactly its own --tag"
+    );
     assert!(
         fs::read(project.path().join(".agent-vm/layers/POISON")).unwrap() == b"stale",
         "former layer directory is untouched"
@@ -1343,7 +1378,7 @@ fn metadata_write_io_error_is_reported_and_keeps_old_result() {
 /// absent descriptor platform, and never compares the config's platform with
 /// the host. These record the boundary without repairing it.
 #[test]
-fn absent_platform_and_foreign_config_are_accepted_and_characterized() {
+fn absent_platform_and_foreign_config_are_published_but_not_approved() {
     for (name, spec) in [
         (
             "absent-descriptor-foreign-config",
@@ -1369,15 +1404,34 @@ fn absent_platform_and_foreign_config_are_accepted_and_characterized() {
         let written = image_archive::write(&path, &spec);
         harness.replay_file(&path);
         let output = harness.run(&["image", "build", "--tag", "limitation:test"]);
+        // Publication still accepts a foreign *config* platform (that part of
+        // ADR-0043's characterization is unchanged), but nothing can be approved
+        // for this host, so the command fails closed after publishing (#391, G4).
         assert_eq!(
             code_of(&output),
-            0,
-            "{name}: native import currently accepts this: {}",
+            1,
+            "{name}: a foreign config cannot be approved for this host: {}",
             stderr_of(&output)
+        );
+        let shown = stderr_of(&output);
+        assert!(
+            shown.contains(
+                "docker.io/library/limitation:test was published to agent-vm's image cache, but \
+                 its approval was not updated"
+            ),
+            "{name}: {shown}"
+        );
+        assert!(
+            shown.contains("never contacts a registry"),
+            "{name}: the read-back is cache-only: {shown}"
         );
         assert_eq!(
             metadata(&harness.cache_dir(), "limitation:test").manifest_digest,
             written.manifest_digest,
+        );
+        assert!(
+            pins(&harness).is_none(),
+            "{name}: nothing may be approved for this host"
         );
     }
 }
@@ -1754,6 +1808,197 @@ fn assert_imported(cache: &Path, raw: &str, written: &Written) {
     assert!(layer_materialized(cache, &written.diff_id));
     assert_eq!(actual.layers[0].diff_id, written.diff_id);
 }
+
+// ---------------------------------------------------------------------------
+// Host approvals (#391)
+// ---------------------------------------------------------------------------
+//
+// The store's exact bytes are the oracle, not a parsed view: "unchanged" has to
+// mean byte-identical, and a revision bump is a byte change.
+
+fn pins_path(h: &Harness) -> PathBuf {
+    h.home.join(".config/agent-vm/image-pins.json")
+}
+
+/// The approval store's raw bytes, or `None` when nothing was approved.
+fn pins(h: &Harness) -> Option<Vec<u8>> {
+    fs::read(pins_path(h)).ok()
+}
+
+fn pin_records(h: &Harness) -> Vec<serde_json::Value> {
+    let Some(bytes) = pins(h) else {
+        return Vec::new();
+    };
+    let store: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("the approval store is valid JSON");
+    store["pins"]
+        .as_array()
+        .expect("the approval store has a `pins` array")
+        .clone()
+}
+
+/// One record's `(manifest digest, revision)` for the canonical reference.
+fn pin_for(h: &Harness, canonical: &str) -> Option<(String, u64)> {
+    pin_records(h)
+        .into_iter()
+        .find(|record| record["reference"] == canonical)
+        .map(|record| {
+            (
+                record["manifest_digest"]
+                    .as_str()
+                    .expect("a stored digest")
+                    .to_owned(),
+                record["revision"].as_u64().expect("a stored revision"),
+            )
+        })
+}
+
+/// The host-platform record for one canonical reference. Selected by platform as
+/// well as reference: these rows deliberately seed a foreign-platform sibling for
+/// the same reference, and a lookup that took whichever record came first could
+/// assert against that sibling instead.
+fn host_record(h: &Harness, canonical: &str) -> serde_json::Value {
+    pin_records(h)
+        .into_iter()
+        .find(|record| {
+            record["reference"] == canonical
+                && record["platform"]["architecture"] == image_archive::host_arch()
+        })
+        .unwrap_or_else(|| panic!("no host-platform record for {canonical}"))
+}
+
+/// Every cache-only content receipt under this cache, parsed
+/// (`agent-vm-content-metadata/<hash>.json`).
+fn content_receipts(h: &Harness) -> Vec<serde_json::Value> {
+    snapshot(&h.cache_dir().join("agent-vm-content-metadata"))
+        .into_iter()
+        .filter(|(path, _)| path.extension().is_some_and(|ext| ext == "json"))
+        .map(|(path, bytes)| {
+            serde_json::from_slice(&bytes)
+                .unwrap_or_else(|error| panic!("{} is not a receipt: {error}", path.display()))
+        })
+        .collect()
+}
+
+/// The invariant that makes an approval repairable (#391): every pin one of the
+/// rows below approves owns a content receipt for its **exact acquired
+/// identity** — `repo@digest`, not just the digest — and its platform.
+///
+/// The native loader publishes a digest-spelled archive name over the canonical
+/// child key, and `repair_child_key` restores it only from such a receipt. A pin
+/// without one loses its offline availability to an unrelated archive alias. The
+/// receipt's key is the whole acquired reference (`receipt.rs:279-288,376-399`),
+/// so two repositories that hold identical content have two different receipts
+/// and neither may stand in for the other: matching a digest alone would accept a
+/// receipt no repair would ever read.
+///
+/// The claim is limited to the paths these rows exercise — an explicit `image
+/// build`/`image import` publication — which is every approval path that runs
+/// here; a pin a launch first-pins is covered by its own rows. Only
+/// host-platform records are checked: that is the platform those paths approve
+/// (one fixture forges a foreign-platform record to prove preservation).
+fn assert_every_pin_has_a_content_receipt(h: &Harness) {
+    let records = pin_records(h);
+    assert!(!records.is_empty(), "this row must have approved something");
+    let receipts = content_receipts(h);
+    assert!(
+        !receipts.is_empty(),
+        "an approval wrote no content receipt, so no approved digest could be repaired"
+    );
+    for record in &records {
+        if record["platform"]["architecture"] != image_archive::host_arch() {
+            continue;
+        }
+        let digest = record["manifest_digest"].as_str().expect("a stored digest");
+        // The pin stores the canonical *tag*; the receipt is keyed by the
+        // canonical `repo@digest` the same way `PinnedReference::whole` builds it.
+        let tagged: Reference = record["reference"]
+            .as_str()
+            .expect("a stored reference")
+            .parse()
+            .expect("a stored canonical reference parses");
+        let acquired = reference(&format!(
+            "{}/{}@{digest}",
+            tagged.registry(),
+            tagged.repository()
+        ))
+        .whole();
+        assert!(
+            receipts.iter().any(|receipt| {
+                receipt["acquired_reference"] == acquired
+                    && receipt["platform"] == record["platform"]
+            }),
+            "the pin for {} has no content receipt for {acquired}: {receipts:#?}",
+            record["reference"]
+        );
+    }
+}
+
+/// The two-repository negative control for the invariant above: identical content
+/// in two repositories is two acquired identities, and only the receipt whose
+/// `acquired_reference` names the pin's own repository can repair it.
+///
+/// A helper that matched on the digest alone would report the orphaned pin below
+/// as covered by the other repository's receipt, which no lookup would ever read.
+#[test]
+#[should_panic(expected = "docker.io/library/other:two")]
+fn a_same_digest_pin_of_another_repository_is_not_covered_by_its_receipt() {
+    let harness = Harness::new();
+    // One archive, imported twice: byte-identical, so both repositories resolve to
+    // the same manifest digest.
+    let archive = image_archive::write(&harness.home.join("same.tar"), &ArchiveSpec::default());
+    let out = import_input(&harness, &archive.path, "app:one");
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    let out = import_input(&harness, &archive.path, "other:two");
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    let one = pin_for(&harness, "docker.io/library/app:one").expect("app:one approved");
+    let two = pin_for(&harness, "docker.io/library/other:two").expect("other:two approved");
+    assert_eq!(
+        one.0, two.0,
+        "the fixture must give both repositories one digest, or this is not the case"
+    );
+
+    // Withhold only the *other* repository's receipt, keeping its pin: the state
+    // the old digest-only match accepted as fine.
+    let repository = harness.cache_dir().join("agent-vm-content-metadata");
+    let orphan = format!("docker.io/library/other@{}", two.0);
+    let mut dropped = false;
+    for entry in fs::read_dir(&repository).unwrap() {
+        let path = entry.unwrap().path();
+        let receipt: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        if receipt["acquired_reference"] == orphan.as_str() {
+            fs::remove_file(&path).unwrap();
+            dropped = true;
+        }
+    }
+    assert!(
+        dropped,
+        "the other repository must have had its own receipt"
+    );
+    assert!(
+        content_receipts(&harness)
+            .iter()
+            .any(|receipt| receipt["acquired_reference"]
+                == format!("docker.io/library/app@{}", one.0).as_str()),
+        "the first repository's receipt must survive, so the match discriminates on identity"
+    );
+    assert_every_pin_has_a_content_receipt(&harness);
+}
+
+/// Every digest-addressed artifact of the approved `repo@digest`, before it is
+/// disturbed: the immutable metadata, fsmeta, the VMDK descriptor, layer EROFS,
+/// layer tar blobs and every extent the descriptor names.
+fn old_inventory(
+    h: &Harness,
+    canonical_repo: &str,
+    written: &Written,
+) -> cache_inventory::Inventory {
+    cache_inventory::Inventory::take(
+        &cache(&h.cache_dir()),
+        &format!("{canonical_repo}@{}", written.manifest_digest),
+        written,
+    )
+}
 #[test]
 fn docker_import_saves_exactly_and_publishes() {
     let mut harness = Harness::new();
@@ -2054,8 +2299,17 @@ fn docker_import_never_writes_selection_or_config() {
     let a = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
     harness.replay(&a);
     assert_eq!(code_of(&import_docker(&harness, "app:dev")), 0);
-    assert_eq!(snapshot(&config), before);
+    assert_eq!(
+        without_approvals(&config.join("agent-vm"), snapshot(&config)),
+        before
+    );
     assert!(!config.join("agent-vm/default-image.json").exists());
+    // One host approval, for the result reference — neither a selection nor a
+    // configuration (#391).
+    assert_eq!(
+        pin_for(&harness, "docker.io/library/app:dev"),
+        Some((a.manifest_digest.clone(), 1))
+    );
 }
 #[test]
 fn build_success_notice_is_on_stdout() {
@@ -2111,9 +2365,14 @@ fn docker_save_archive_publishes_tag_and_its_repotags() {
         if tags.is_some() {
             assert_imported(&harness.cache_dir(), "z-source:dev", &written[0]);
         }
+        // Each published key is one `manifests/<hash>.json`; the read-back's
+        // `repo@child` preservation adds one more content-addressed key. The
+        // `.agent-vm-acquire.lock` guards are not metadata and are not counted.
+        let published = if tags.is_some() { 2 } else { 1 };
         assert_eq!(
-            snapshot(&harness.metadata_snapshot_root()).len(),
-            if tags.is_some() { 2 } else { 1 }
+            manifests_json(&harness).len(),
+            published + 1,
+            "published keys plus the read-back's child key"
         );
         assert!(!stdout_of(&out).contains("z-source"));
     }
@@ -2315,9 +2574,30 @@ impl Harness {
     }
 
     /// Every file under the user config directory, for "unchanged" assertions.
+    ///
+    /// Approvals are asserted separately (#391): a successful build/import
+    /// writes `image-pins.json` and its lock by design, so including them would
+    /// make every such snapshot trivially unequal.
     fn config_snapshot(&self) -> BTreeMap<PathBuf, Vec<u8>> {
-        snapshot(&self.home.join(".config"))
+        let config = self.home.join(".config");
+        without_approvals(&config.join("agent-vm"), snapshot(&config))
     }
+}
+
+/// Drop exactly the host approval store and its coordination file —
+/// `<store_dir>/image-pins.json` and its `.lock`, `store_dir` being
+/// `$HOME/.config/agent-vm` — not every file anywhere that happens to share
+/// those basenames.
+fn without_approvals(
+    store_dir: &Path,
+    files: BTreeMap<PathBuf, Vec<u8>>,
+) -> BTreeMap<PathBuf, Vec<u8>> {
+    let store = store_dir.join("image-pins.json");
+    let lock = store_dir.join("image-pins.lock");
+    files
+        .into_iter()
+        .filter(|(path, _)| *path != store && *path != lock)
+        .collect()
 }
 
 /// The existing import completion sentence, exactly as printed.
@@ -2420,9 +2700,15 @@ fn import_is_silent_when_the_configuration_selects_the_result() {
             stdout_of(&out)
         );
         // Import observes; it never writes configuration or a default record.
+        // Its one write is the approval of the result reference (#391).
         assert_eq!(harness.config_snapshot(), before);
         assert!(!harness.record_path().exists());
         assert!(harness.msb_invocations().is_empty());
+        assert_eq!(
+            pin_records(&harness).len(),
+            1,
+            "docker={docker}: exactly the result reference is approved"
+        );
     }
 }
 
@@ -2559,6 +2845,11 @@ fn import_keeps_only_the_launch_guidance_for_a_fallback_selection() {
     assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
     assert_eq!(stdout_of(&out), launch_notice("app:dev"));
     assert_eq!(harness.config_snapshot(), before);
+    assert_eq!(
+        pin_records(&harness).len(),
+        1,
+        "the retained default is untouched; only the result reference is approved"
+    );
     // The private retained reference is never disclosed.
     for text in [stdout_of(&out), stderr_of(&out)] {
         assert!(!text.contains("private-a"), "{text}");
@@ -2616,6 +2907,7 @@ fn import_survives_an_unreadable_selection() {
         format!("{}{SHOW_HINT}", launch_notice("app:dev"))
     );
     assert_eq!(harness.config_snapshot(), before);
+    assert_eq!(pin_records(&harness).len(), 1);
     for text in [stdout_of(&out), stderr_of(&out)] {
         assert!(!text.contains("SENTINEL_RECORD"), "{text}");
     }
@@ -2832,4 +3124,1254 @@ fn import_primary_tag_uses_the_canonical_cache_key() {
         !cache.image_metadata_path(&old).exists(),
         "the pre-canonical spelling must not become a second cache entry"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 15. Explicit build/import approve their own result reference (#391)
+// ---------------------------------------------------------------------------
+//
+// The publishing command is the consent: no prompt, no `--yes`, and the change
+// is rendered on stderr before it is committed. Every row asserts the store's
+// bytes or a specific record, never "a pin exists somewhere".
+
+/// A pin gate plus the short-lived `/tmp` directory its socket must live in
+/// (`sockaddr_un` bounds the path).
+fn pin_gate_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("av391-")
+        .tempdir_in("/tmp")
+        .expect("create the pin-gate directory")
+}
+
+/// The three rendered lines, exactly: canonical reference, host platform, full
+/// old and new digests — and no question, because nothing is read.
+fn assert_render(out: &Output, reference: &str, old: &str, new: &str) {
+    let shown = stderr_of(out);
+    let expected = format!(
+        "Approving the image published as {reference} (linux/{}):\n  old: {old}\n  new: {new}\n",
+        image_archive::host_arch()
+    );
+    assert!(
+        shown.contains(&expected),
+        "expected the approval render:\n{expected}\nin:\n{shown}"
+    );
+    assert!(
+        !shown.contains("Approve this exact image change?"),
+        "an explicit build/import never prompts: {shown}"
+    );
+}
+
+#[test]
+fn first_build_and_import_pin_their_result_at_revision_one() {
+    let platform = serde_json::json!({
+        "os": "linux",
+        "architecture": image_archive::host_arch(),
+        "variant": null,
+    });
+
+    // A build.
+    let mut harness = Harness::new();
+    let a = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+    harness.replay(&a);
+    let out = harness.run(&["image", "build", "--tag", "app:dev"]);
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(
+        stdout_of(&out),
+        "Imported build result as app:dev; launch it with `--image app:dev`\n",
+        "the existing single completion notice is unchanged"
+    );
+    assert_render(
+        &out,
+        "docker.io/library/app:dev",
+        "none",
+        &a.manifest_digest,
+    );
+    let records = pin_records(&harness);
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["reference"], "docker.io/library/app:dev");
+    assert_eq!(records[0]["manifest_digest"], a.manifest_digest);
+    assert_eq!(records[0]["revision"], 1);
+    assert_eq!(records[0]["platform"], platform);
+    assert!(
+        !harness.record_path().exists(),
+        "a build never adopts or writes the retained default"
+    );
+    assert_every_pin_has_a_content_receipt(&harness);
+
+    // An import into a fresh HOME.
+    let harness = Harness::new();
+    let a = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+    let out = import_input(&harness, &a.path, "app:dev");
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(stdout_of(&out), launch_notice("app:dev"));
+    assert_render(
+        &out,
+        "docker.io/library/app:dev",
+        "none",
+        &a.manifest_digest,
+    );
+    assert_eq!(
+        pin_for(&harness, "docker.io/library/app:dev"),
+        Some((a.manifest_digest.clone(), 1))
+    );
+    assert_eq!(pin_records(&harness).len(), 1);
+    assert!(!harness.record_path().exists());
+    assert_every_pin_has_a_content_receipt(&harness);
+}
+
+/// An image whose OCI config declares an architecture `variant` — which is what
+/// the Docker daemon writes for every arm64 image it builds itself (the classic
+/// builder `docker build` uses, and `docker import`) — must approve its result
+/// like any other image: the read-back validates published content, and a
+/// declared `variant` is part of the platform an image states, not corruption.
+///
+/// Regression for the receipt's platform check, which compared the config's
+/// `variant` with `Platform::host_linux()` (which carries none) by exact
+/// equality and so rejected a real arm64 archive as a *corrupt receipt* after
+/// publishing it — the command exited 1 with no approval. Requires
+/// `ArchiveSpec::config_variant`; the only variable under test is the `variant`
+/// bytes, since the same fixture without it pins in
+/// `first_build_and_import_pin_their_result_at_revision_one`.
+#[test]
+fn an_image_config_that_declares_an_architecture_variant_is_approved() {
+    let variant = if image_archive::host_arch() == "arm64" {
+        "v8"
+    } else {
+        "v1"
+    };
+    let harness = Harness::new();
+    let a = image_archive::write(
+        &harness.home.join("a.tar"),
+        &ArchiveSpec {
+            config_variant: Some(variant.to_string()),
+            ..ArchiveSpec::default()
+        },
+    );
+    let out = import_input(&harness, &a.path, "app:dev");
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(stdout_of(&out), launch_notice("app:dev"));
+    assert_render(
+        &out,
+        "docker.io/library/app:dev",
+        "none",
+        &a.manifest_digest,
+    );
+    assert_eq!(
+        pin_for(&harness, "docker.io/library/app:dev"),
+        Some((a.manifest_digest.clone(), 1)),
+        "an image that declares a platform variant still approves its own result"
+    );
+}
+
+#[test]
+fn republishing_the_approved_content_leaves_the_pin_store_byte_identical() {
+    let mut harness = Harness::new();
+    let a = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+    harness.replay(&a);
+    assert_eq!(
+        code_of(&harness.run(&["image", "build", "--tag", "app:dev"])),
+        0
+    );
+    let approved = pins(&harness).expect("the first build approves");
+
+    // The same bytes again, by build and by import.
+    for _ in 0..1 {
+        let out = harness.run(&["image", "build", "--tag", "app:dev"]);
+        assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+        assert_eq!(pins(&harness).as_ref(), Some(&approved));
+        assert!(
+            !stderr_of(&out).contains("Approving"),
+            "an unchanged approval prints nothing: {}",
+            stderr_of(&out)
+        );
+    }
+    for _ in 0..1 {
+        let out = import_input(&harness, &a.path, "app:dev");
+        assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+        assert_eq!(pins(&harness).as_ref(), Some(&approved));
+        assert!(!stderr_of(&out).contains("Approving"));
+    }
+
+    // Same config bytes and diff IDs, different manifest digest: equal guest
+    // content, so the stored approval stands and nothing is written.
+    let annotated = image_archive::write(
+        &harness.home.join("annotated.tar"),
+        &ArchiveSpec {
+            manifest_annotation: Some("v2".into()),
+            ..ArchiveSpec::default()
+        },
+    );
+    assert_ne!(
+        annotated.manifest_digest, a.manifest_digest,
+        "the fixture must change the manifest digest"
+    );
+    assert_eq!(annotated.config_digest, a.config_digest);
+    assert_eq!(annotated.diff_id, a.diff_id);
+    let out = import_input(&harness, &annotated.path, "app:dev");
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(pins(&harness).as_ref(), Some(&approved));
+    assert!(!stderr_of(&out).contains("Approving"));
+    assert_eq!(
+        pin_for(&harness, "docker.io/library/app:dev"),
+        Some((a.manifest_digest.clone(), 1)),
+        "equivalent content keeps the stored digest and revision"
+    );
+    assert!(
+        has_metadata(
+            &harness.cache_dir(),
+            &format!("docker.io/library/app@{}", a.manifest_digest)
+        ),
+        "the approved repo@digest key still exists"
+    );
+    assert_every_pin_has_a_content_receipt(&harness);
+}
+
+/// Run one accepted spelling/form of a result reference as a fresh HOME's
+/// **first** operation.
+fn first_pin_via(route: &str) -> (Harness, Written, Output) {
+    let mut harness = Harness::new();
+    let a = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+    harness.replay(&a);
+    let out = match route {
+        "explicit-canonical-import" => {
+            import_input(&harness, &a.path, "registry-1.docker.io/alpine:dev")
+        }
+        "inferred-docker-import" => harness.run(&["image", "import", "--docker", "alpine:dev"]),
+        "bare-import" => import_input(&harness, &a.path, "alpine:dev"),
+        "index-build" => harness.run(&[
+            "image",
+            "build",
+            "--tag",
+            "index.docker.io/library/alpine:dev",
+        ]),
+        other => panic!("unknown route {other}"),
+    };
+    (harness, a, out)
+}
+
+#[test]
+fn every_result_spelling_pins_one_canonical_reference() {
+    // (a) Each accepted spelling/form must approve on its own. After another
+    // route has already approved, "the store did not change" would also pass for
+    // a route that approves nothing, so every route starts in a fresh HOME and
+    // asserts its own record.
+    for route in [
+        "explicit-canonical-import",
+        "inferred-docker-import",
+        "bare-import",
+        "index-build",
+    ] {
+        let (harness, a, out) = first_pin_via(route);
+        assert_eq!(code_of(&out), 0, "{route}: {}", stderr_of(&out));
+        let records = pin_records(&harness);
+        assert_eq!(records.len(), 1, "{route}: {records:#?}");
+        assert_eq!(
+            records[0]["reference"], "docker.io/library/alpine:dev",
+            "{route}: every spelling folds to one canonical key"
+        );
+        assert_eq!(
+            records[0]["manifest_digest"], a.manifest_digest,
+            "{route}: approved at the bytes it published"
+        );
+        assert_eq!(
+            records[0]["revision"], 1,
+            "{route}: a first pin is revision 1"
+        );
+        assert_render(
+            &out,
+            "docker.io/library/alpine:dev",
+            "none",
+            &a.manifest_digest,
+        );
+        assert_every_pin_has_a_content_receipt(&harness);
+    }
+
+    // (b) Different bytes published through another spelling of the same
+    // reference replace that one canonical record rather than appending a second.
+    let mut harness = Harness::new();
+    let a = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+    let out = import_input(&harness, &a.path, "registry-1.docker.io/alpine:dev");
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    let b = image_archive::write(
+        &harness.home.join("b.tar"),
+        &ArchiveSpec {
+            marker: "B".into(),
+            ..ArchiveSpec::default()
+        },
+    );
+    harness.replay(&b);
+    let out = harness.run(&[
+        "image",
+        "build",
+        "--tag",
+        "index.docker.io/library/alpine:dev",
+    ]);
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert_render(
+        &out,
+        "docker.io/library/alpine:dev",
+        &a.manifest_digest,
+        &b.manifest_digest,
+    );
+    assert_eq!(
+        pin_records(&harness).len(),
+        1,
+        "one canonical reference, one record"
+    );
+    assert_eq!(
+        pin_for(&harness, "docker.io/library/alpine:dev"),
+        Some((b.manifest_digest.clone(), 2)),
+        "a cross-spelling publication replaces the same canonical record"
+    );
+    assert_every_pin_has_a_content_receipt(&harness);
+
+    // (c) Convergence: every spelling of the *same* content leaves the store
+    // byte-identical.
+    let mut harness = Harness::new();
+    let a = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+    harness.replay(&a);
+
+    // (i) an explicit canonical-equivalent --tag spelling.
+    let out = import_input(&harness, &a.path, "registry-1.docker.io/alpine:dev");
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    let approved = pins(&harness).expect("the first import approves");
+    assert_eq!(
+        pin_for(&harness, "docker.io/library/alpine:dev"),
+        Some((a.manifest_digest.clone(), 1))
+    );
+    assert_eq!(
+        pin_records(&harness).len(),
+        1,
+        "{:?}",
+        pin_records(&harness)
+    );
+
+    // (ii) an inferred `--docker` source, no `--tag`.
+    let out = harness.run(&["image", "import", "--docker", "alpine:dev"]);
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(pins(&harness).as_ref(), Some(&approved));
+
+    // (iii) the bare spelling.
+    let out = import_input(&harness, &a.path, "alpine:dev");
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(pins(&harness).as_ref(), Some(&approved));
+
+    // (iv) `index.docker.io` on a build.
+    let out = harness.run(&[
+        "image",
+        "build",
+        "--tag",
+        "index.docker.io/library/alpine:dev",
+    ]);
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(pins(&harness).as_ref(), Some(&approved));
+    assert_eq!(pin_records(&harness).len(), 1);
+    assert_every_pin_has_a_content_receipt(&harness);
+}
+
+#[test]
+fn archive_aliases_never_create_or_replace_a_pin() {
+    let mut harness = Harness::new();
+    let a = image_archive::write(
+        &harness.home.join("a.tar"),
+        &ArchiveSpec {
+            marker: "A".into(),
+            ..ArchiveSpec::default()
+        },
+    );
+    harness.replay(&a);
+    assert_eq!(
+        code_of(&harness.run(&["image", "build", "--tag", "z-source:dev"])),
+        0
+    );
+    let approved = pins(&harness).expect("the seed build approves z-source:dev");
+    assert_eq!(
+        pin_for(&harness, "docker.io/library/z-source:dev"),
+        Some((a.manifest_digest.clone(), 1))
+    );
+
+    // A Docker-save archive whose RepoTags name the approved reference and an
+    // unapproved one, imported under a third reference.
+    let save = image_archive::write_docker_save(
+        &harness.home.join("save.tar"),
+        &[image_archive::DockerSaveImage {
+            marker: "B".into(),
+            repo_tags: Some(vec!["z-source:dev".into(), "y-unpinned:dev".into()]),
+        }],
+    );
+    harness.replay(&save[0]);
+    let out = harness.run(&[
+        "image",
+        "import",
+        "--docker",
+        "z-source:dev",
+        "--tag",
+        "a-target:dev",
+    ]);
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+
+    // The alias now names B in the cache...
+    assert_eq!(
+        metadata(&harness.cache_dir(), "z-source:dev").config_digest,
+        save[0].config_digest,
+        "the archive's own name is published"
+    );
+    // ...but the approved record for it is untouched.
+    assert_eq!(
+        pin_for(&harness, "docker.io/library/z-source:dev"),
+        Some((a.manifest_digest.clone(), 1)),
+        "an archive alias never replaces an established approval"
+    );
+    assert_eq!(
+        pin_for(&harness, "docker.io/library/y-unpinned:dev"),
+        None,
+        "an archive alias never creates an approval"
+    );
+    // The one new record is the reference the command named, at the digest the
+    // loader reported for it (a Docker-save fixture has no manifest digest of
+    // its own to compare with).
+    let published = metadata(&harness.cache_dir(), "a-target:dev").manifest_digest;
+    assert_eq!(
+        pin_for(&harness, "docker.io/library/a-target:dev"),
+        Some((published, 1))
+    );
+    assert_eq!(
+        pin_records(&harness).len(),
+        2,
+        "{:?}",
+        pin_records(&harness)
+    );
+    assert_ne!(pins(&harness).as_ref(), Some(&approved));
+    assert_every_pin_has_a_content_receipt(&harness);
+}
+
+#[test]
+fn failed_publication_preserves_every_pin_and_digest_addressed_artifact() {
+    // Each case starts from the same seeded state: T=`app:dev` approved at A and
+    // U=`other:keep` approved at A′. The refusal must not touch either record,
+    // either artifact set, or anything content-addressed.
+    for case in [
+        "exporter-exit",
+        "save-exit",
+        "garbage-archive",
+        "integrity",
+        "missing-blob",
+        "foreign-descriptor",
+        "metadata-write-io",
+        "shared-layer",
+        "late-alias",
+        "foreign-config",
+    ] {
+        let mut harness = Harness::new();
+        let a = seed_build(&mut harness, "app:dev", "A");
+        let keep = seed_build(&mut harness, "other:keep", "A2");
+        let approved = pins(&harness).expect("both seeds approve");
+        assert_eq!(pin_records(&harness).len(), 2);
+        let t_before = old_inventory(&harness, "docker.io/library/app", &a);
+        let u_before = old_inventory(&harness, "docker.io/library/other", &keep);
+        assert!(
+            t_before.len() > 1,
+            "{case}: the inventory must be non-trivial"
+        );
+        assert!(
+            u_before.len() > 1,
+            "{case}: the inventory must be non-trivial"
+        );
+
+        let path = harness.home.join(format!("{case}.tar"));
+        // One base spec per case, with the differing field set by name: adjacent
+        // same-typed arguments are exactly what a reader confuses.
+        let mut spec = ArchiveSpec {
+            marker: "B".into(),
+            ..ArchiveSpec::default()
+        };
+        let out = match case {
+            "exporter-exit" => {
+                harness.docker_exit(23);
+                harness.run(&["image", "build", "--tag", "app:dev"])
+            }
+            "save-exit" => {
+                harness.docker_exit(23);
+                import_docker(&harness, "app:dev")
+            }
+            "garbage-archive" => {
+                image_archive::write_garbage(&path);
+                harness.replay_file(&path);
+                harness.run(&["image", "build", "--tag", "app:dev"])
+            }
+            "integrity" => {
+                spec.layer = LayerContent::DigestMismatch;
+                image_archive::write(&path, &spec);
+                harness.replay_file(&path);
+                harness.run(&["image", "build", "--tag", "app:dev"])
+            }
+            "missing-blob" => {
+                spec.omit_layer_blob = true;
+                let written = image_archive::write(&path, &spec);
+                harness.replay(&written);
+                harness.run(&["image", "build", "--tag", "app:dev"])
+            }
+            "foreign-descriptor" => {
+                spec.descriptor_platform = PlatformSpec::Foreign;
+                image_archive::write(&path, &spec);
+                harness.replay_file(&path);
+                harness.run(&["image", "build", "--tag", "app:dev"])
+            }
+            "metadata-write-io" => {
+                // A directory where the native `.json.part` temp file must be
+                // created: an error *return*, not process death.
+                let part = cache(&harness.cache_dir())
+                    .image_metadata_path(&reference("app:dev"))
+                    .with_extension("json.part");
+                fs::create_dir_all(&part).unwrap();
+                let written = image_archive::write(&path, &spec);
+                harness.replay(&written);
+                harness.run(&["image", "build", "--tag", "app:dev"])
+            }
+            "shared-layer" => {
+                // Reuse A's own config and layer — same marker, so the same
+                // config digest, blob and diff ID — under a new manifest digest,
+                // and fail at the requested key's metadata write: the collision
+                // the other cases (all distinct layers) never create.
+                spec.marker = "A".into();
+                spec.manifest_annotation = Some("shared".into());
+                let part = cache(&harness.cache_dir())
+                    .image_metadata_path(&reference("app:dev"))
+                    .with_extension("json.part");
+                fs::create_dir_all(&part).unwrap();
+                let written = image_archive::write(&path, &spec);
+                assert_eq!(
+                    written.config_digest, a.config_digest,
+                    "{case}: the fixture must reuse A's config"
+                );
+                assert_eq!(
+                    written.diff_id, a.diff_id,
+                    "{case}: the fixture must reuse A's layer"
+                );
+                assert_ne!(
+                    written.manifest_digest, a.manifest_digest,
+                    "{case}: a distinct manifest, or nothing new is published"
+                );
+                harness.replay(&written);
+                harness.run(&["image", "build", "--tag", "app:dev"])
+            }
+            "late-alias" => {
+                // A Docker-save alias that cannot be published: the requested
+                // reference is restored, the alias may have moved (ADR-0043).
+                let blocked = cache(&harness.cache_dir())
+                    .image_metadata_path(&reference("z-source:dev"))
+                    .with_extension("json.part");
+                fs::create_dir_all(&blocked).unwrap();
+                let save = image_archive::write_docker_save(
+                    &path,
+                    &[image_archive::DockerSaveImage {
+                        marker: "B".into(),
+                        repo_tags: Some(vec!["z-source:dev".into()]),
+                    }],
+                );
+                harness.replay(&save[0]);
+                harness.run(&["image", "build", "--tag", "app:dev"])
+            }
+            "foreign-config" => {
+                spec.config_platform = PlatformSpec::Foreign;
+                let written = image_archive::write(&path, &spec);
+                harness.replay(&written);
+                harness.run(&["image", "build", "--tag", "app:dev"])
+            }
+            other => panic!("unknown case {other}"),
+        };
+
+        // Docker's own status passes through for a Docker failure; the approval
+        // failure path exits 1. Either way the command fails.
+        assert!(
+            !out.status.success(),
+            "{case}: must fail: {}",
+            stderr_of(&out)
+        );
+        assert_eq!(
+            pins(&harness).as_ref(),
+            Some(&approved),
+            "{case}: no approval may move"
+        );
+        t_before.unchanged();
+        u_before.unchanged();
+
+        if case == "foreign-config" {
+            // Publication is not rolled back: the alias now names the foreign
+            // image, and the command says so instead of claiming success.
+            let shown = stderr_of(&out);
+            assert!(
+                shown.contains(
+                    "docker.io/library/app:dev was published to agent-vm's image cache, but its \
+                     approval was not updated"
+                ),
+                "{case}: {shown}"
+            );
+            assert!(
+                shown.contains("never contacts a registry"),
+                "{case}: the read-back never becomes a registry request: {shown}"
+            );
+            assert_eq!(code_of(&out), 1, "{case}: an approval failure exits 1");
+            assert!(stdout_of(&out).is_empty(), "{case}: no completion notice");
+            assert_ne!(
+                metadata(&harness.cache_dir(), "app:dev").config_digest,
+                a.config_digest,
+                "{case}: the foreign image is still published"
+            );
+        } else {
+            assert_eq!(
+                metadata(&harness.cache_dir(), "app:dev").manifest_digest,
+                a.manifest_digest,
+                "{case}: the requested reference is restored"
+            );
+            assert!(!stderr_of(&out).contains("was published to agent-vm's image cache"));
+        }
+    }
+}
+
+/// What a retained default looks like before either verb runs.
+#[derive(Clone, Copy)]
+enum RetainedDefaultCase {
+    Absent,
+    /// Valid JSON of no schema at all: positively proves a damaged record is
+    /// neither read, repaired nor replaced.
+    Corrupt,
+    /// A record this binary *would* accept, so a regression that only moves
+    /// usable defaults cannot hide behind the corrupt case.
+    Valid,
+}
+
+/// A valid version-1 retained default. Deliberately unrelated to the cache, so a
+/// write would be visible as a byte difference.
+const VALID_RETAINED_DEFAULT: &str = concat!(
+    r#"{"version":1,"image":"docker.io/library/retained@sha256:"#,
+    "1111111111111111111111111111111111111111111111111111111111111111",
+    "\"}\n"
+);
+
+#[test]
+fn approval_moves_only_the_result_record() {
+    for case in [
+        RetainedDefaultCase::Absent,
+        RetainedDefaultCase::Corrupt,
+        RetainedDefaultCase::Valid,
+    ] {
+        let mut harness = Harness::new();
+        // Seed U with a build, so the record exists before anything else runs.
+        let u = seed_build(&mut harness, "other:keep", "U");
+        // A record for the *other* platform of the same reference: it must be
+        // preserved, not borrowed. Seeded for the reference this row does *not*
+        // operate...
+        let foreign_platform = serde_json::json!({
+            "os": "linux",
+            "architecture": if image_archive::host_arch() == "arm64" { "amd64" } else { "arm64" },
+            "variant": null,
+        });
+        let mut store: serde_json::Value =
+            serde_json::from_slice(&pins(&harness).unwrap()).unwrap();
+        let mut foreign = store["pins"][0].clone();
+        foreign["platform"] = foreign_platform.clone();
+        store["pins"].as_array_mut().unwrap().push(foreign.clone());
+        // ...and for the operated result key itself, so a regression that deletes
+        // every platform of the approved reference is caught here.
+        let mut operated_foreign = foreign.clone();
+        operated_foreign["reference"] = serde_json::json!("docker.io/library/t:dev");
+        store["pins"]
+            .as_array_mut()
+            .unwrap()
+            .push(operated_foreign.clone());
+        fs::write(pins_path(&harness), serde_json::to_vec(&store).unwrap()).unwrap();
+        // A user config and a project config the approval must not touch.
+        harness.write_user_image("app:elsewhere");
+        let project = harness.write_project_image("app:project");
+        // Negative control for the snapshot filter: an unrelated tool's
+        // identically named file must stay *in* the comparison, so a filter that
+        // drops every `image-pins.json` is caught rather than hidden.
+        let unrelated = harness.home.join(".config/other-tool/image-pins.json");
+        fs::create_dir_all(unrelated.parent().unwrap()).unwrap();
+        fs::write(&unrelated, b"{\"unrelated\":true}\n").unwrap();
+        match case {
+            RetainedDefaultCase::Absent => {}
+            RetainedDefaultCase::Corrupt => {
+                harness.write_record("\"not the schema\"");
+            }
+            RetainedDefaultCase::Valid => {
+                harness.write_record(VALID_RETAINED_DEFAULT);
+            }
+        }
+        let config_before = snapshot(&harness.home.join(".config"));
+        let record_before = fs::read(harness.record_path()).ok();
+        let u_record = pin_records(&harness)
+            .into_iter()
+            .find(|record| record["reference"] == "docker.io/library/other:keep")
+            .expect("the U record survives the foreign insertion");
+
+        let t = image_archive::write(&harness.home.join("t.tar"), &ArchiveSpec::default());
+        harness.replay(&t);
+        let out = harness.run(&["image", "build", "--tag", "t:dev"]);
+        assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+        assert_eq!(
+            host_record(&harness, "docker.io/library/t:dev")["manifest_digest"],
+            t.manifest_digest,
+            "the first build approves the operated reference"
+        );
+        assert_eq!(
+            host_record(&harness, "docker.io/library/t:dev")["revision"],
+            1,
+            "at revision one"
+        );
+        // AC8's sibling case must also cover *replacement*, not just insertion:
+        // different bytes under the same reference. A defect that deletes every
+        // platform of a replaced record passes a first-pin-only fixture.
+        let rebuilt = image_archive::write(
+            &harness.home.join("rebuilt.tar"),
+            &ArchiveSpec {
+                marker: "T-rebuilt".into(),
+                ..ArchiveSpec::default()
+            },
+        );
+        assert_ne!(rebuilt.manifest_digest, t.manifest_digest);
+        harness.replay(&rebuilt);
+        let out = harness.run(&["image", "build", "--tag", "t:dev"]);
+        assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+        assert_eq!(
+            host_record(&harness, "docker.io/library/t:dev")["manifest_digest"],
+            rebuilt.manifest_digest,
+            "the replacement records the second publication"
+        );
+        assert_eq!(
+            host_record(&harness, "docker.io/library/t:dev")["revision"],
+            2,
+            "a replacement moves the operated record to revision two"
+        );
+        let t2 = image_archive::write(
+            &harness.home.join("t2.tar"),
+            &ArchiveSpec {
+                marker: "T2".into(),
+                ..ArchiveSpec::default()
+            },
+        );
+        let out = import_input(&harness, &t2.path, "t2:dev");
+        assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+
+        // Exactly the two new records, plus the U record and both foreign
+        // platform siblings, unchanged.
+        let records = pin_records(&harness);
+        assert_eq!(records.len(), 5, "{records:#?}");
+        let find = |reference: &str, foreign: bool| {
+            records
+                .iter()
+                .find(|record| {
+                    record["reference"] == reference
+                        && (record["platform"]["architecture"] == image_archive::host_arch())
+                            != foreign
+                })
+                .cloned()
+        };
+        assert_eq!(
+            find("docker.io/library/other:keep", false),
+            Some(u_record.clone())
+        );
+        assert_eq!(
+            find("docker.io/library/other:keep", true),
+            Some(foreign.clone()),
+            "the other platform's record is neither borrowed nor replaced"
+        );
+        assert_eq!(
+            find("docker.io/library/t:dev", true),
+            Some(operated_foreign),
+            "the operated reference keeps its other-platform record byte for byte"
+        );
+        assert_eq!(
+            find("docker.io/library/t:dev", false).expect("the build's own record")["manifest_digest"],
+            rebuilt.manifest_digest,
+            "the replaced record names the second publication"
+        );
+        assert_eq!(
+            find("docker.io/library/t:dev", false).expect("the build's own record")["revision"],
+            2,
+            "and it is still the replacement, not a fresh first pin"
+        );
+        assert_eq!(
+            find("docker.io/library/t2:dev", false).expect("the import's own record")["manifest_digest"],
+            t2.manifest_digest
+        );
+
+        // Configuration, the retained default and the cache keys are untouched
+        // except for the two references the commands named.
+        let config_dir = harness.home.join(".config");
+        let store_dir = config_dir.join("agent-vm");
+        let config_after = without_approvals(&store_dir, snapshot(&config_dir));
+        let config_before = without_approvals(&store_dir, config_before);
+        assert!(
+            config_after.contains_key(&unrelated),
+            "a tighter filter must not hide another tool's identically named file"
+        );
+        assert_eq!(config_after, config_before);
+        assert_eq!(
+            fs::read(project.join(".agent-vm/config.toml")).unwrap(),
+            b"image = \"app:project\"\n".to_vec(),
+            "the project configuration is untouched"
+        );
+        assert_eq!(fs::read(harness.record_path()).ok(), record_before);
+        match case {
+            RetainedDefaultCase::Absent => {
+                assert!(!harness.record_path().exists(), "no default may appear")
+            }
+            RetainedDefaultCase::Corrupt => {}
+            RetainedDefaultCase::Valid => assert_eq!(
+                fs::read(harness.record_path()).unwrap(),
+                VALID_RETAINED_DEFAULT.as_bytes(),
+                "a valid retained default the user already had is byte-identical"
+            ),
+        }
+        assert_eq!(
+            metadata(&harness.cache_dir(), "other:keep").manifest_digest,
+            u.manifest_digest
+        );
+        assert_every_pin_has_a_content_receipt(&harness);
+    }
+}
+
+#[test]
+fn a_missing_approved_digest_is_a_replacement_not_a_registry_fetch() {
+    let harness = Harness::new();
+    let a = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+    let out = import_input(&harness, &a.path, "app:dev");
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(
+        pin_for(&harness, "docker.io/library/app:dev"),
+        Some((a.manifest_digest.clone(), 1))
+    );
+
+    // Withhold every trace of the approved content: the content-addressed key
+    // *and* its receipt, because a receipt repairs that key (D10) and would make
+    // this a resumable repair rather than a missing digest. No registry is
+    // reachable from this harness, so any comparison that fetched `repo@A` would
+    // fail loudly.
+    let approved_key = cache(&harness.cache_dir()).image_metadata_path(&reference(&format!(
+        "docker.io/library/app@{}",
+        a.manifest_digest
+    )));
+    fs::remove_file(&approved_key).unwrap();
+    fs::remove_dir_all(harness.cache_dir().join("agent-vm-content-metadata")).unwrap();
+    assert!(
+        content_receipts(&harness).is_empty(),
+        "the test must leave no evidence that can restore the approved digest"
+    );
+
+    let b = image_archive::write(
+        &harness.home.join("b.tar"),
+        &ArchiveSpec {
+            marker: "B".into(),
+            ..ArchiveSpec::default()
+        },
+    );
+    let out = import_input(&harness, &b.path, "app:dev");
+    assert_eq!(
+        code_of(&out),
+        0,
+        "an unprovable approved digest is a replacement, not a failure: {}",
+        stderr_of(&out)
+    );
+    assert_eq!(
+        pin_for(&harness, "docker.io/library/app:dev"),
+        Some((b.manifest_digest.clone(), 2)),
+        "equivalence needs the old content in this cache; absent, it is a replacement"
+    );
+    assert_render(
+        &out,
+        "docker.io/library/app:dev",
+        &a.manifest_digest,
+        &b.manifest_digest,
+    );
+    assert_every_pin_has_a_content_receipt(&harness);
+}
+
+/// Write a store whose bytes are not the version 1 schema, plus the lock that
+/// says it was written deliberately.
+fn damage_store(harness: &Harness) {
+    fs::create_dir_all(pins_path(harness).parent().unwrap()).unwrap();
+    fs::write(pins_path(harness), b"{\"version\":1").unwrap();
+    fs::write(harness.home.join(".config/agent-vm/image-pins.lock"), b"").unwrap();
+}
+
+#[test]
+fn a_damaged_approval_store_or_missing_home_fails_before_docker_runs() {
+    let damaged = b"{\"version\":1".to_vec();
+
+    // Every publication form refuses the damaged store before it runs Docker or
+    // publishes anything.
+    for form in ["build", "import-input", "import-docker"] {
+        let mut harness = Harness::new();
+        let path = harness.home.join("a.tar");
+        let written = image_archive::write(&path, &ArchiveSpec::default());
+        harness.replay(&written);
+        damage_store(&harness);
+        let out = match form {
+            "build" => harness.run(&["image", "build", "--tag", "app:dev"]),
+            "import-input" => import_input(&harness, &path, "app:dev"),
+            _ => import_docker(&harness, "app:dev"),
+        };
+        assert_eq!(code_of(&out), 1, "{form}: {}", stderr_of(&out));
+        let shown = stderr_of(&out);
+        assert!(
+            shown.contains(
+                "image pin authority at $HOME/.config/agent-vm/image-pins.json is damaged"
+            ),
+            "{form}: {shown}"
+        );
+        assert!(
+            shown.contains("nothing was built or imported"),
+            "{form}: {shown}"
+        );
+        assert!(
+            harness.docker_calls().is_empty(),
+            "{form}: Docker must not run"
+        );
+        assert!(
+            snapshot(&harness.metadata_snapshot_root()).is_empty(),
+            "{form}: nothing may be published"
+        );
+        assert_eq!(fs::read(pins_path(&harness)).unwrap(), damaged);
+        assert!(!harness.record_path().exists());
+    }
+
+    // Precedence this change deliberately introduces (R9, D7): a damaged store
+    // is reported before Docker's own failure...
+    let mut harness = Harness::new();
+    damage_store(&harness);
+    harness.docker_exit(23);
+    let out = harness.run(&["image", "build", "--tag", "app:dev"]);
+    assert_eq!(
+        code_of(&out),
+        1,
+        "the pin-store refusal precedes Docker's status: {}",
+        stderr_of(&out)
+    );
+    assert!(stderr_of(&out).contains("is damaged"));
+    assert!(stderr_of(&out).contains("nothing was built or imported"));
+    assert!(harness.docker_calls().is_empty());
+
+    // ...and before archive-content errors only `load_archive` would detect.
+    let harness = Harness::new();
+    damage_store(&harness);
+    let garbage = harness.home.join("garbage.tar");
+    image_archive::write_garbage(&garbage);
+    let out = import_input(&harness, &garbage, "app:dev");
+    assert_eq!(code_of(&out), 1, "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains("is damaged"));
+    assert!(snapshot(&harness.metadata_snapshot_root()).is_empty());
+    assert_eq!(fs::read(pins_path(&harness)).unwrap(), damaged);
+
+    // An unusable HOME is refused before Docker runs too. Both spellings fail in
+    // the prologue, which is earlier still.
+    for home in [Some("relative"), None] {
+        let mut harness = Harness::new();
+        let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+        harness.replay(&written);
+        match home {
+            Some(value) => harness.set("HOME", value),
+            None => harness.unset("HOME"),
+        };
+        let out = harness.run(&["image", "build", "--tag", "app:dev"]);
+        assert_eq!(code_of(&out), 1, "HOME={home:?}: {}", stderr_of(&out));
+        assert!(
+            harness.docker_calls().is_empty(),
+            "HOME={home:?}: Docker must not run: {}",
+            stderr_of(&out)
+        );
+    }
+}
+
+#[test]
+fn a_failed_approval_save_after_publication_reports_published_but_not_approved() {
+    for verb in ["import", "build"] {
+        let mut harness = Harness::new();
+        let a = seed_build(&mut harness, "app:dev", "A");
+        let approved = pins(&harness).expect("the seed approves");
+        let inventory = old_inventory(&harness, "docker.io/library/app", &a);
+        let record_before = fs::read(harness.record_path()).ok();
+        let config_dir = harness.home.join(".config");
+        let config_before = without_approvals(&config_dir.join("agent-vm"), snapshot(&config_dir));
+
+        let b = image_archive::write(
+            &harness.home.join("b.tar"),
+            &ArchiveSpec {
+                marker: "B".into(),
+                ..ArchiveSpec::default()
+            },
+        );
+        harness.replay(&b);
+        let path = b.path.to_string_lossy().into_owned();
+        let argv: Vec<&str> = match verb {
+            "import" => vec!["image", "import", "--input", &path, "--tag", "app:dev"],
+            _ => vec!["image", "build", "--tag", "app:dev"],
+        };
+
+        let dir = pin_gate_dir();
+        let mut gate = pin_gate::PinGate::new(dir.path());
+        let peer = pin_gate::PinPeer::spawn(harness.base_command(), &gate, &argv);
+        gate.expect(pin_gate::PinStage::Published)
+            .reply(pin_gate::Reply::Continue);
+        gate.expect(pin_gate::PinStage::CandidateReady)
+            .reply(pin_gate::Reply::Continue);
+        gate.expect(pin_gate::PinStage::BeforePinLock)
+            .reply(pin_gate::Reply::Continue);
+        gate.expect(pin_gate::PinStage::PinLocked)
+            .reply(pin_gate::Reply::Continue);
+        gate.expect(pin_gate::PinStage::BeforePinSave)
+            .reply(pin_gate::Reply::FailBeforeSave);
+        let out = peer.wait();
+
+        assert_eq!(code_of(&out), 1, "{verb}: {}", stderr_of(&out));
+        let shown = stderr_of(&out);
+        // Rendered before the commit was attempted, so the operator saw the
+        // change that was then refused.
+        assert_render(
+            &out,
+            "docker.io/library/app:dev",
+            &a.manifest_digest,
+            &b.manifest_digest,
+        );
+        let render_at = shown.find("Approving the image published as").unwrap();
+        let context_at = shown
+            .find("was published to agent-vm's image cache, but its approval was not updated")
+            .unwrap_or_else(|| panic!("{verb}: no published-but-not-approved context: {shown}"));
+        assert!(
+            render_at < context_at,
+            "{verb}: the render must precede the failure: {shown}"
+        );
+        assert!(
+            shown.contains("image pin authority at $HOME/.config/agent-vm/image-pins.json could not be accessed or saved"),
+            "{verb}: the store's save error: {shown}"
+        );
+        assert!(
+            stdout_of(&out).is_empty(),
+            "{verb}: no completion notice may point at unapproved content: {}",
+            stdout_of(&out)
+        );
+        // Publication is not rolled back; the approval and everything else are
+        // exactly as they were.
+        assert_eq!(
+            metadata(&harness.cache_dir(), "app:dev").manifest_digest,
+            b.manifest_digest
+        );
+        assert_eq!(pins(&harness).as_ref(), Some(&approved));
+        assert_eq!(fs::read(harness.record_path()).ok(), record_before);
+        assert_eq!(
+            without_approvals(&config_dir.join("agent-vm"), snapshot(&config_dir)),
+            config_before
+        );
+        inventory.unchanged();
+    }
+}
+
+/// A pipe whose read end is already closed: every write to the returned end
+/// fails with `EPIPE`. `eprintln!` swallows that, so only a writer that checks —
+/// the approval render — notices.
+///
+/// This is used with `image import --input`, which runs no child process: a
+/// *child* inheriting this end would die by `SIGPIPE` (the fake Docker is bash),
+/// and the failure would then be Docker's rather than the render's.
+fn closed_stderr_pipe() -> fs::File {
+    use std::os::fd::FromRawFd as _;
+
+    let mut fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "create a pipe");
+    assert_eq!(unsafe { libc::close(fds[0]) }, 0, "close the read end");
+    unsafe { fs::File::from_raw_fd(fds[1]) }
+}
+
+/// Run `cmd` with the stderr it was given and collect only stdout, bounded.
+fn run_collecting_stdout(mut cmd: Command) -> Output {
+    cmd.stdout(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn agent-vm");
+    let mut stdout_pipe = child.stdout.take().unwrap();
+    let stdout = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        stdout_pipe.read_to_end(&mut buf).expect("drain stdout");
+        buf
+    });
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("agent-vm did not exit within the bound");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    Output {
+        status,
+        stdout: stdout.join().unwrap(),
+        stderr: Vec::new(),
+    }
+}
+
+/// `image import --input` under a chosen stderr.
+fn import_with_stderr(harness: &Harness, archive: &Path, tag: &str, stderr: Stdio) -> Output {
+    let mut cmd = harness.base_command();
+    cmd.args([
+        "image",
+        "import",
+        "--input",
+        archive.to_str().unwrap(),
+        "--tag",
+        tag,
+    ])
+    .stdin(Stdio::null())
+    .stderr(stderr);
+    run_collecting_stdout(cmd)
+}
+
+/// R5's failed-render clause: an approval change that cannot be *shown* commits
+/// nothing and prints no notice, while the publication it describes stands.
+///
+/// The error text cannot be read back — the sink that failed is the one stderr
+/// would use — so the oracle is the state, plus a control proving the sink alone
+/// fails nothing: an *unchanged* approval renders nothing, so the same failing
+/// sink leaves that run successful.
+#[test]
+fn a_failed_approval_render_commits_nothing_and_prints_no_notice() {
+    let harness = Harness::new();
+    let a = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+
+    // (1) A first pin has to render, so a sink that refuses the render fails the
+    // command before the commit.
+    let out = import_with_stderr(
+        &harness,
+        &a.path,
+        "app:dev",
+        Stdio::from(closed_stderr_pipe()),
+    );
+    assert_eq!(
+        code_of(&out),
+        1,
+        "a render that cannot be written must fail the command"
+    );
+    assert!(
+        !pins_path(&harness).exists(),
+        "a failed render commits nothing: {:?}",
+        pins(&harness)
+    );
+    assert!(
+        !harness.record_path().exists(),
+        "a failed render writes no retained default"
+    );
+    assert!(
+        stdout_of(&out).is_empty(),
+        "no completion notice may point at unapproved content: {}",
+        stdout_of(&out)
+    );
+    assert_eq!(
+        metadata(&harness.cache_dir(), "app:dev").manifest_digest,
+        a.manifest_digest,
+        "the publication is not rolled back"
+    );
+    assert!(
+        !content_receipts(&harness).is_empty(),
+        "the read-back ran before the render refused: the refusal is the render's"
+    );
+
+    // (2) The same content with a working stderr approves at revision 1, so the
+    // refusal above is the sink and not the fixture.
+    let out = import_input(&harness, &a.path, "app:dev");
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(
+        pin_for(&harness, "docker.io/library/app:dev"),
+        Some((a.manifest_digest.clone(), 1))
+    );
+    assert_render(
+        &out,
+        "docker.io/library/app:dev",
+        "none",
+        &a.manifest_digest,
+    );
+    let approved = pins(&harness).expect("the control approved");
+
+    // (3) Under the same failing sink an unchanged approval renders nothing, so
+    // it succeeds: the sink alone never fails a command.
+    let out = import_with_stderr(
+        &harness,
+        &a.path,
+        "app:dev",
+        Stdio::from(closed_stderr_pipe()),
+    );
+    assert_eq!(
+        code_of(&out),
+        0,
+        "an unchanged approval renders nothing, so a failing stderr is harmless"
+    );
+    assert_eq!(pins(&harness).as_ref(), Some(&approved));
+    assert_eq!(
+        stdout_of(&out),
+        "Imported app:dev into agent-vm's image cache; launch it with `--image app:dev`\n"
+    );
+}
+
+#[test]
+fn a_killed_command_after_publication_preserves_pins_and_artifacts() {
+    use pin_gate::{PinStage, Reply};
+
+    for stop in [PinStage::Published, PinStage::BeforePinSave] {
+        let mut harness = Harness::new();
+        let a = seed_build(&mut harness, "app:dev", "A");
+        let approved = pins(&harness).expect("the seed approves");
+        let inventory = old_inventory(&harness, "docker.io/library/app", &a);
+
+        let b = image_archive::write(
+            &harness.home.join("b.tar"),
+            &ArchiveSpec {
+                marker: "B".into(),
+                ..ArchiveSpec::default()
+            },
+        );
+        let path = b.path.to_string_lossy().into_owned();
+        let dir = pin_gate_dir();
+        let mut gate = pin_gate::PinGate::new(dir.path());
+        let peer = pin_gate::PinPeer::spawn(
+            harness.base_command(),
+            &gate,
+            &["image", "import", "--input", &path, "--tag", "app:dev"],
+        );
+        // Hold the checkpoint open until the child is dead, so it is killed
+        // while genuinely blocked rather than racing its own gate error.
+        let mut held = None;
+        for stage in [
+            PinStage::Published,
+            PinStage::CandidateReady,
+            PinStage::BeforePinLock,
+            PinStage::PinLocked,
+            PinStage::BeforePinSave,
+        ] {
+            let checkpoint = gate.expect(stage);
+            if stage == stop {
+                held = Some(checkpoint);
+                break;
+            }
+            checkpoint.reply(Reply::Continue);
+        }
+        let out = peer.kill_and_collect();
+        drop(held);
+
+        assert!(
+            out.status.code().is_none(),
+            "{stop:?}: the child must die, not exit: {out:?}"
+        );
+        // Nothing was saved before the transaction completed, so the store's
+        // bytes are untouched...
+        assert_eq!(pins(&harness).as_ref(), Some(&approved), "{stop:?}");
+        inventory.unchanged();
+        // ...while the publication stands: no rollback is promised on process
+        // death (ADR-0043). Only the approval decides what a launch boots.
+        assert_eq!(
+            metadata(&harness.cache_dir(), "app:dev").manifest_digest,
+            b.manifest_digest,
+            "{stop:?}: publication is not rolled back"
+        );
+    }
 }

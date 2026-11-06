@@ -34,6 +34,9 @@ use std::time::Duration;
 /// One publication stage. Ordered as production reaches them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinStage {
+    /// The result reference is published and the exclusive barrier is released,
+    /// before its read-back (#391).
+    Published,
     /// The candidate's content is acquired and validated but not approved.
     CandidateReady,
     /// About to open the host pin-store lock.
@@ -55,6 +58,7 @@ pub enum PinStage {
 impl PinStage {
     fn wire(self) -> &'static str {
         match self {
+            Self::Published => "published",
             Self::CandidateReady => "candidate-ready",
             Self::BeforePinLock => "before-pin-lock",
             Self::PinLocked => "pin-locked",
@@ -68,6 +72,7 @@ impl PinStage {
 
     fn parse(text: &str) -> Option<Self> {
         [
+            Self::Published,
             Self::CandidateReady,
             Self::BeforePinLock,
             Self::PinLocked,
@@ -269,6 +274,23 @@ impl PinPeer {
                 panic!("the pin peer exceeded {}s", BOUND.as_secs());
             }
         }
+    }
+
+    /// `SIGKILL` the child and collect what it wrote. Process death is the one
+    /// failure no in-process fault can stand in for: it must leave the store as
+    /// the last completed transaction left it.
+    pub fn kill_and_collect(mut self) -> Output {
+        let mut child = self.child.take().expect("peer already collected");
+        child.kill().expect("kill the pin peer");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let task = std::thread::spawn(move || {
+            let _ = sender.send(child.wait_with_output().expect("reap the pin peer"));
+        });
+        let output = receiver
+            .recv_timeout(BOUND)
+            .expect("the killed pin peer was not reaped");
+        task.join().expect("pin peer collection thread");
+        output
     }
 }
 

@@ -10,6 +10,8 @@ use std::process::{Command, Output};
 use std::time::Duration;
 #[path = "support/acquisition_gate.rs"]
 mod acquisition_gate;
+#[path = "support/cache_inventory.rs"]
+mod cache_inventory;
 #[path = "support/fake_msb.rs"]
 mod fake_msb;
 #[path = "support/image_archive.rs"]
@@ -21,6 +23,7 @@ use acquisition_gate::{
     AcquisitionGate, AcquisitionStage, GateReply, Peer, assert_guard_free, assert_guard_held,
     guard_path,
 };
+use cache_inventory::{artifact_paths, assert_unchanged, hash_paths};
 use image_archive::{ArchiveSpec, LayerContent, PlatformSpec};
 use oci_registry::{Image, Server};
 
@@ -269,7 +272,7 @@ struct Snapshot {
 impl Snapshot {
     fn take(h: &Harness, pin: &str, image: &Image) -> Self {
         let cache = h.cache();
-        let (metadata, others) = artifact_paths(&cache, pin, image);
+        let (metadata, others) = artifact_paths(&cache, pin, &image.written);
         Self {
             record: fs::read(h.record()).unwrap(),
             pins: fs::read(h.home.join(".config/agent-vm/image-pins.json")).unwrap(),
@@ -302,7 +305,7 @@ impl ReferenceSnapshot {
         // The reference's own metadata file is deliberately excluded: a refresh
         // legitimately replaces it. Everything content-addressed below it must
         // survive byte-identically.
-        let (_, others) = artifact_paths(cache, reference, image);
+        let (_, others) = artifact_paths(cache, reference, &image.written);
         Self {
             files: hash_paths(others),
         }
@@ -313,73 +316,7 @@ impl ReferenceSnapshot {
 }
 
 fn assert_inventory_unchanged(files: &BTreeMap<PathBuf, (u64, String)>) {
-    for (path, (len, hash)) in files {
-        let bytes = fs::read(path).unwrap();
-        assert_eq!(bytes.len() as u64, *len, "{}", path.display());
-        assert_eq!(
-            image_archive::sha256_hex(&bytes),
-            *hash,
-            "{}",
-            path.display()
-        );
-    }
-}
-
-/// Independently checked baseline metadata plus every artifact path it names.
-fn artifact_paths(cache: &GlobalCache, reference: &str, image: &Image) -> (PathBuf, Vec<PathBuf>) {
-    let reference: Reference = reference.parse().unwrap();
-    let metadata_path = cache.image_metadata_path(&reference);
-    let metadata_bytes = fs::read(&metadata_path).unwrap();
-    let metadata: serde_json::Value = serde_json::from_slice(&metadata_bytes).unwrap();
-    assert_eq!(metadata["manifest_digest"], image.written.manifest_digest);
-    assert_eq!(metadata["config_digest"], image.written.config_digest);
-    assert_eq!(
-        image_archive::sha256_hex(metadata["raw_manifest_json"].as_str().unwrap().as_bytes()),
-        image.written.manifest_digest
-    );
-    assert_eq!(
-        image_archive::sha256_hex(metadata["raw_config_json"].as_str().unwrap().as_bytes()),
-        image.written.config_digest
-    );
-    assert_eq!(metadata["layers"][0]["diff_id"], image.written.diff_id);
-    let manifest = image.written.manifest_digest.parse().unwrap();
-    let descriptor = cache.vmdk_path(&manifest);
-    let mut paths = vec![cache.fsmeta_erofs_path(&manifest), descriptor.clone()];
-    for layer in metadata["layers"].as_array().unwrap() {
-        paths.push(cache.layer_erofs_path(&layer["diff_id"].as_str().unwrap().parse().unwrap()));
-        let tar = cache.tar_path(&layer["digest"].as_str().unwrap().parse().unwrap());
-        if tar.exists() {
-            paths.push(tar);
-        }
-    }
-    let descriptor_bytes = fs::read_to_string(&descriptor).unwrap();
-    for line in descriptor_bytes
-        .lines()
-        .filter(|line| line.starts_with("RW ") || line.starts_with("RDONLY "))
-    {
-        if let Some(path) = line.split('"').nth(1) {
-            let path = Path::new(path);
-            paths.push(if path.is_absolute() {
-                path.to_owned()
-            } else {
-                descriptor.parent().unwrap().join(path)
-            });
-        }
-    }
-    (metadata_path, paths)
-}
-
-fn hash_paths(paths: impl IntoIterator<Item = PathBuf>) -> BTreeMap<PathBuf, (u64, String)> {
-    paths
-        .into_iter()
-        .map(|path| {
-            let bytes = fs::read(&path).unwrap();
-            (
-                path,
-                (bytes.len() as u64, image_archive::sha256_hex(&bytes)),
-            )
-        })
-        .collect()
+    assert_unchanged(files);
 }
 
 /// The metadata digest recorded under a cache key, read independently of any
@@ -3379,7 +3316,12 @@ fn receipt_is_cache_only_and_alias_overwrite_is_repaired() {
     // Receipt loss must not prevent explicit immutable reacquisition. This is
     // distinct from a warm launch repairing from an extant child receipt.
     fs::remove_file(path).unwrap();
-    assert!(receipts(&h).is_empty());
+    assert!(
+        receipts(&h)
+            .iter()
+            .all(|(_, value)| value["acquired_reference"] != canonical),
+        "no receipt for A may remain; the import's own receipt describes B"
+    );
     let requests_before = server.count();
     success(&h.refresh(Some(&canonical)));
     assert!(

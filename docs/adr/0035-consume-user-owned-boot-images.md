@@ -143,8 +143,9 @@ the contributor gitlink and launcher recommendation, without a runtime source de
   the launcher's `include_dir!` image embed, the composition machinery
   (`layer.rs`, `layer/contract.rs`, `tool_layer.rs`), and (from #390) the
   launch-time update check with `--update-check`, `AGENT_VM_UPDATE_CHECK`, its
-  banner and its pulled-digest marker. Importing over a tag does not approve it;
-  explicit import approval remains #391.
+  banner and its pulled-digest marker. Importing over an *alias* does not approve
+  it; from #391 an explicit build/import approves its own named result reference
+  (see the [ADR-0043 amendment](0043-image-command-group-and-daemon-import.md)).
 - **`setup` verifies declared tools only, and is fatal on any image.** The
   verification targets are exactly the tools the configuration declares (the
   synthesized `shell` fallback is not among them); a command the configuration
@@ -185,8 +186,9 @@ the contributor gitlink and launcher recommendation, without a runtime source de
   [USAGE](../../USAGE.md#explicitly-setting-the-default).
 - **#390 fulfilled.** Every OCI tier is pinned host-wide; warm launches are
   registry-free; cache loss reacquires the approved digest; refresh/set-default
-  are the only movement checks. The retained default stays digest-only (#392)
-  and import/build cannot silently approve content (#391). Native behaviour and
+  are the only movement checks. The retained default stays digest-only (#392),
+  and import/build can approve nothing but the result reference they name (#391,
+  [ADR-0043](0043-image-command-group-and-daemon-import.md)). Native behaviour and
   live-guest observations are manual evidence; boot-free checks cannot prove
   guest execution. See
   [USAGE](../../USAGE.md#host-wide-approval-of-oci-image-content).

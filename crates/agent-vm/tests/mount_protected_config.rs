@@ -88,14 +88,26 @@ impl Harness {
         self.seed_image_at_state_from(state, self.project.path());
     }
 
+    /// Seed the cache from a **throwaway** HOME, never this harness's.
+    ///
+    /// An explicit import approves its own result reference (#391), and its
+    /// approval store would create `$HOME/.config/agent-vm` — the very path the
+    /// guard rows here symlink, so setup would fail before the guard under test
+    /// was ever reached. Deleting that directory afterwards would instead
+    /// destroy the topology the row is about. The state root is shared, and that
+    /// is where the cache lives.
     fn seed_image_at_state_from(&self, state: &Path, project: &Path) {
         let archive = self.home.path().join("fixture-boot.tar");
         image_archive::write(&archive, &image_archive::ArchiveSpec::default());
+        let seed_home = tempfile::Builder::new()
+            .prefix("av-seed-home-")
+            .tempdir()
+            .unwrap();
         let mut import = Command::new(agent_vm_bin());
         import
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
-            .env("HOME", self.home.path())
+            .env("HOME", seed_home.path())
             .env("AGENT_VM_STATE_DIR", state)
             .env("MSB_PATH", &self.fake_msb)
             .current_dir(project)
@@ -112,6 +124,18 @@ impl Harness {
             out.status.success(),
             "fixture import failed: {}",
             stderr_of(&out)
+        );
+        assert!(
+            seed_home
+                .path()
+                .join(".config/agent-vm/image-pins.json")
+                .exists(),
+            "the fixture import approves its own result reference (#391)"
+        );
+        assert!(
+            !self.home.path().join(".config").exists(),
+            "seeding must leave this HOME with no `.config` at all, so the guard \
+             rows below start from the same topology they assert"
         );
     }
 

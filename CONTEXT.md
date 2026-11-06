@@ -510,7 +510,9 @@ daemon store is not it.
 
 It is not an approval authority: publishing an alias, deleting the cache or
 redirecting it never changes an **image pin**, and a pinned launch reacquires
-the approved digest rather than trusting whatever an alias names.
+the approved digest rather than trusting whatever an alias names. Only the
+**result reference** an explicit build/import names is approved, and only by
+that command: an archive-carried alias never creates or replaces a pin.
 
 _Avoid_: "local images" without saying which store.
 
@@ -576,7 +578,8 @@ Stored in the user-scoped `$HOME/.config/agent-vm/image-pins.json` (with
 cache**, `AGENT_VM_STATE_DIR` and the **retained default boot image**. A launch
 or `setup` consumes `repo@child`, never the selected tag or index. Only
 `image refresh` and `image set-default` re-resolve a source and request an
-**image approval**. Local rootfs/disk launches are never pinned.
+**image approval**; `image build` and `image import` approve their own result
+reference without asking. Local rootfs/disk launches are never pinned.
 
 _Avoid_: "lock file"; "tag pin" (a pin names a child digest, not a tag); "cache
 entry" (cache evidence is not approval).
@@ -598,11 +601,15 @@ The deliberate, candidate-scoped replacement of an **image pin**: the escaped
 source, platform and full old/new digests are shown, the default answer is No,
 and `--yes` (only on `image refresh` / `image set-default`) pre-authorizes
 exactly that resolved candidate. Distinct from **credential authorization**
-(which host credential may be injected) and from cache repair. Without a
-terminal on stdin and stderr a changed pin is refused (status 1) without reading
-input; a first pin or an unchanged digest needs no approval. An immutable
-source that resolves to different content is an integrity failure, never an
-approvable change.
+(which host credential may be injected) and from cache repair. On `image
+refresh` and `image set-default`, a changed pin without `--yes` and without a
+terminal on stdin and stderr is refused (status 1) without reading input; a first
+pin or an unchanged digest needs no approval on any surface. An explicit `image build` or
+`image import` is the third consent surface and the only one that replaces an
+approval without a prompt *or* `--yes`: it approves exactly the result
+reference it published, at the content it published, and the change is rendered
+on stderr before it is committed. An immutable source that resolves to
+different content is an integrity failure, never an approvable change.
 
 _Avoid_: "confirmation prompt" (it is a recorded host decision); "update check"
 (there is no launch-time probe); "cache approval".

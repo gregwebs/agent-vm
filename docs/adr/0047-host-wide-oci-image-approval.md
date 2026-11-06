@@ -7,9 +7,10 @@ and completes the model begun in
 [ADR-0035](0035-consume-user-owned-boot-images.md) (whose retained-default
 decision this ADR extends). Builds on the acquisition infrastructure of #389
 ([ADR-0043](0043-image-command-group-and-daemon-import.md) places the verbs).
-Follow-ups #391 (explicit import approval) and #392 (default source-reference
-retention) are deliberately not decided here; the staging boundary below records
-what stays open.
+Amended in **0.7.34** by #391: an explicit build/import approves its own result
+reference (see [ADR-0043](0043-image-command-group-and-daemon-import.md)).
+Follow-up #392 (default source-reference retention) is deliberately not decided
+here; the boundary below records what stays open.
 
 ## Context
 
@@ -105,9 +106,11 @@ transaction an older binary participates in.
 nothing; mutations take pin EX then default EX for one bounded read-modify-write
 (30 s combined). Network acquisition and the human prompt never run under a HOME
 lock. The cache keeps its shared/exclusive publication barrier: shared across
-launch/prepare/validate and the SDK create, exclusive across import/build
-publication. Import/build can publish cache aliases but can never create or
-replace a HOME pin or fallback (#391). Local rootfs/disk launches bypass approval
+launch/prepare/validate, the SDK create and an import/build read-back, exclusive
+across import/build publication. Import/build can publish cache aliases but can
+never create or replace a HOME pin or fallback through them; the one approval
+they cause is of the result reference the command named, taken after the
+exclusive barrier is released (#391). Local rootfs/disk launches bypass approval
 entirely.
 
 **Corruption is closed.** Malformed, oversized, unreadable, symlinked or
@@ -137,10 +140,12 @@ verb (status 2), forwarded verbatim after it.
 - A moved tag is invisible until an explicit operation; that is the intended
   trade — reproducibility over implicit freshness — and the verbs for moving are
   discoverable in `image --help` and USAGE.
-- Import/build can no longer silently redirect a pinned launch, so an iterating
-  user must approve explicitly with `image refresh --image REF`. A daemon-only
-  image may not be registry-refreshable; that limitation is documented rather
-  than papered over with automatic import approval (#391).
+- An iterating user needs no `image refresh`: a rebuild or re-import under the
+  reference they select approves that reference itself, prompts nothing and is
+  rendered on stderr (#391). An import under a *different* reference still cannot
+  redirect a pinned launch, so a daemon-only image must be imported under the
+  reference that will be selected — it may not be registry-refreshable, and that
+  limitation stays documented rather than papered over with alias approval.
 - The retained default keeps digest-only storage, so a bare refresh cannot follow
   the source tag it was originally chosen from (#392).
 - Older launchers and direct `msb` clients do not consult the store; a binary
@@ -189,5 +194,6 @@ verb (status 2), forwarded verbatim after it.
   partial-rollback limitation is the honest boundary.
 - **Approve import/build results silently.** Rejected: it would let an alias
   publication replace established approval without a candidate shown to a human —
-  the defect #390 removes. #391 may add an explicit import approval surface; it
-  is not assumed here.
+  the defect #390 removes. #391 approved the one named result instead, and it is
+  still rendered before the commit; what it does not do is ask, because the
+  command that supplied the bytes was the request.

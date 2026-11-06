@@ -50,6 +50,9 @@ mod gate {
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) enum Stage {
+        /// The result reference is published and the exclusive barrier is
+        /// released, before its read-back (#391).
+        Published,
         /// The candidate is acquired and validated but not yet approved.
         CandidateReady,
         BeforePinLock,
@@ -65,6 +68,7 @@ mod gate {
         #[cfg(debug_assertions)]
         fn wire(self) -> &'static str {
             match self {
+                Self::Published => "published",
                 Self::CandidateReady => "candidate-ready",
                 Self::BeforePinLock => "before-pin-lock",
                 Self::PinLocked => "pin-locked",
@@ -231,6 +235,12 @@ impl PinFile {
         }
         Ok(None)
     }
+}
+
+/// Report that a result reference is published and the exclusive publication
+/// barrier is released, before its read-back (#391).
+pub(super) fn published_ready() -> Result<()> {
+    gate::checkpoint(gate::Stage::Published)
 }
 
 /// Report that a candidate is acquired and validated but not yet approved.
