@@ -36,15 +36,17 @@
 //!   must not care). That is also why an unused set's absent source cannot block
 //!   an unrelated tool.
 //!
-//! Load-time diagnostics name the field and the numeric position and never the
-//! value: a `mounts` entry or `mount_sets` key can carry attacker-chosen text,
-//! and the sentence is printed to a user deciding whether to trust the file.
-//! Set-entry sites are `mount_sets[DEFINITION][INDEX]` with both numbers, so even
-//! an invalid *key* is named without echoing it, and a tool list is
+//! Load-time diagnostics name the field, the numeric position **and** the entry
+//! that failed, because an index alone cannot be found in a file. Every echoed
+//! entry goes through `config::quoted_str`, so a `mounts` entry — attacker-chosen
+//! text, printed to a user deciding whether to trust the file — cannot end the
+//! line it is printed on or read as a second diagnostic. A `mount_sets` *key* is
+//! still never echoed: set-entry sites are `mount_sets[DEFINITION][INDEX]` with
+//! both numbers, so an invalid key is named by position. A tool list is
 //! `tools[DECLARATION].mounts[INDEX]` — never the tool's name, which is not yet
-//! validated when presence is decided. The one word a sentence may name is a
-//! *fixed vocabulary*, never the file: a `[mount_sets]` key equal to one of the
-//! config's top-level field names is refused by that name, because it is a
+//! validated when presence is decided. The one word a sentence may name literally
+//! is a *fixed vocabulary*, never the file: a `[mount_sets]` key equal to one of
+//! the config's top-level field names is refused by that name, because it is a
 //! TOML-scoping mistake rather than a set, and [`crate::config::top_level_field`]
 //! can only ever return those five spellings. A *launch-time* refusal is a
 //! different question — it has to name the host or guest path it could not
@@ -72,6 +74,7 @@ pub(crate) use sets::{MountExpansionWork, UserMounts, merge_tool_mounts};
 pub(crate) use sets::{VisitDecision, VisitState, visit_decision};
 
 use crate::{
+    config::quoted_str,
     config_authority::AuthorizedConfig,
     mount::{
         ExtraMount, HostSyntax, MountRequest, MountSpecError, MountSpecErrorKind, parse_mount_spec,
@@ -207,7 +210,8 @@ impl fmt::Display for InvalidMountSetName {
 /// `mount_sets` key is attacker-chosen text, so an invalid key is named by its
 /// sorted position and a valid one by the same number rather than by its own
 /// bytes, and a tool's own name is not yet validated when presence decided
-/// authority. A *launch-time* refusal renders the equivalent [`crate::mount::MountOrigin`]
+/// authority. The entry at that site is quoted beside it by the sentence that has
+/// one. A *launch-time* refusal renders the equivalent [`crate::mount::MountOrigin`]
 /// instead, where the set name is escaped.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum EntrySite {
@@ -548,8 +552,10 @@ fn host_syntax(home: Option<&Path>) -> HostSyntax<'_> {
     }
 }
 
-/// Why a `mounts` list or a `[mount_sets]` table was rejected. Every variant
-/// renders without echoing any config text; `config` adds the file name around it.
+/// Why a `mounts` list or a `[mount_sets]` table was rejected. A sentence names
+/// the site and, when it has one, the offending entry's own text — quoted and
+/// byte-escaped by `config::quoted_str`, so an entry can neither forge a second
+/// line nor read as a different entry. `config` adds the file name around it.
 #[derive(Debug)]
 pub(crate) enum UserMountsError {
     /// `mounts` was present but not an array.
@@ -562,10 +568,14 @@ pub(crate) enum UserMountsError {
     ToolListNotArray { declaration: usize },
     /// One entry of declaration `declaration`'s own list was not a string.
     ToolListNotString { declaration: usize, index: usize },
-    /// One entry failed the shared `HOST[:GUEST][:MODE]...` grammar.
+    /// One entry failed the shared `HOST[:GUEST][:MODE]...` grammar. `declaration`
+    /// is the entry as written, so the reader can see which one it was — an index
+    /// alone cannot be found in a file, and one bad segment is invisible in a
+    /// sentence that names no segment.
     Entry {
         site: EntrySite,
         kind: MountSpecErrorKind,
+        declaration: String,
     },
     /// The claim refused a guest spelling (`/`, relative, `..`, `:`).
     GuestNotMountable { site: EntrySite },
@@ -593,9 +603,15 @@ pub(crate) enum UserMountsError {
     /// One entry of the `definition`th set is not a string.
     SetNotString { definition: usize, index: usize },
     /// A set name was written with a `:` — modes, a guest path or an exclusion.
-    SetReferenceModified { site: EntrySite },
+    SetReferenceModified {
+        site: EntrySite,
+        declaration: String,
+    },
     /// A reference names no declared set. Never a path lookup fallback.
-    UnknownSet { site: EntrySite },
+    UnknownSet {
+        site: EntrySite,
+        declaration: String,
+    },
     /// A set reference cycle. `tools` cycles stay legal; this is the mount half.
     Cycle { site: EntrySite },
     /// The admitted leaf-visit budget for validating every declared closure is
@@ -643,7 +659,11 @@ impl fmt::Display for UserMountsError {
             Self::ToolListNotString { declaration, index } => {
                 write!(f, "tools[{declaration}].mounts[{index}]: must be a string")
             }
-            Self::Entry { site, kind } => write!(f, "{site}: {kind}"),
+            Self::Entry {
+                site,
+                kind,
+                declaration,
+            } => write!(f, "{site} {}: {kind}", quoted_str(declaration)),
             Self::GuestNotMountable { site } => write!(
                 f,
                 "{site}: guest path must be absolute, must not be /, and must not contain `..`, \
@@ -677,12 +697,17 @@ impl fmt::Display for UserMountsError {
             Self::SetNotString { definition, index } => {
                 write!(f, "mount_sets[{definition}][{index}]: must be a string")
             }
-            Self::SetReferenceModified { site } => write!(
+            Self::SetReferenceModified { site, declaration } => write!(
                 f,
-                "{site}: a mount-set reference is a bare name; modes, a guest path and exclusions \
-                 belong to the paths declared inside the set"
+                "{site} {}: a mount-set reference is a bare name; modes, a guest path and \
+                 exclusions belong to the paths declared inside the set",
+                quoted_str(declaration)
             ),
-            Self::UnknownSet { site } => write!(f, "{site}: unknown mount set name"),
+            Self::UnknownSet { site, declaration } => write!(
+                f,
+                "{site} {}: unknown mount set name",
+                quoted_str(declaration)
+            ),
             Self::Cycle { site } => write!(f, "{site}: mount-set reference cycle"),
             Self::ExpansionWorkLimit => write!(
                 f,
@@ -715,8 +740,14 @@ mod tests {
     use crate::mount::{MountPolicy, Spelling};
     use std::{fs, os::unix::fs::PermissionsExt};
 
-    const GUEST_NOT_MOUNTABLE: &str = "mounts[0]: guest path must be absolute, must not be /, and \
-                                       must not contain `..`, `:`, `;`, `,` or control characters";
+    const GUEST_NOT_MOUNTABLE: &str = "guest path must be absolute, must not be /, and must not \
+                                       contain `..`, `:`, `;`, `,` or control characters";
+
+    /// How a load sentence names an entry: the site, then the entry as the file
+    /// wrote it, quoted and byte-escaped the way every config-chosen value is.
+    fn at(site: &str, entry: &str) -> String {
+        format!("{site} {}: ", quoted_str(entry))
+    }
 
     /// A verified read of a throwaway `config.toml`, handed to `f`.
     ///
@@ -825,30 +856,37 @@ mod tests {
                 "{text}"
             );
         }
-        let refused = "mounts[0]: host path must be absolute or start with ~/ (environment \
-                       variables and other relative paths are not expanded)";
-        for text in [
-            r#"["~"]"#,
-            r#"["~user/ref"]"#,
-            r#"["$HOME/ref"]"#,
-            r#"["${HOME}/ref"]"#,
-            r#"["./ref"]"#,
-            r#"["."]"#,
-            r#"[".."]"#,
-            r#"["..."]"#,
-            r#"["../ref"]"#,
+        let refused = "host path must be absolute or start with ~/ (environment variables and \
+                       other relative paths are not expanded)";
+        for (text, entry) in [
+            (r#"["~"]"#, "~"),
+            (r#"["~user/ref"]"#, "~user/ref"),
+            (r#"["$HOME/ref"]"#, "$HOME/ref"),
+            (r#"["${HOME}/ref"]"#, "${HOME}/ref"),
+            (r#"["./ref"]"#, "./ref"),
+            (r#"["."]"#, "."),
+            (r#"[".."]"#, ".."),
+            (r#"["..."]"#, "..."),
+            (r#"["../ref"]"#, "../ref"),
         ] {
-            assert_eq!(rendered(parse(text, Some(plain))), refused, "{text}");
+            assert_eq!(
+                rendered(parse(text, Some(plain))),
+                format!("{}{refused}", at("mounts[0]", entry)),
+                "{text}"
+            );
         }
         // The index is part of the sentence, not a fixed `[0]`.
         assert_eq!(
             rendered(parse(r#"["/abs", "./rel"]"#, Some(plain))),
-            refused.replace("mounts[0]", "mounts[1]")
+            format!("{}{refused}", at("mounts[1]", "./rel"))
         );
         // No UTF-8 home rejects only the `~/` spellings.
         assert_eq!(
             rendered(parse(r#"["~/ref"]"#, None)),
-            "mounts[0]: a ~/ host path needs a UTF-8 $HOME"
+            format!(
+                "{}a ~/ host path needs a UTF-8 $HOME",
+                at("mounts[0]", "~/ref")
+            )
         );
         assert_eq!(
             sources(&parse(r#"["/abs/ref"]"#, None).unwrap()),
@@ -860,7 +898,10 @@ mod tests {
         let non_utf8 = Path::new(std::ffi::OsStr::from_bytes(b"/h/\xff"));
         assert_eq!(
             rendered(parse(r#"["~/ref"]"#, Some(non_utf8))),
-            "mounts[0]: a ~/ host path needs a UTF-8 $HOME"
+            format!(
+                "{}a ~/ host path needs a UTF-8 $HOME",
+                at("mounts[0]", "~/ref")
+            )
         );
         assert_eq!(
             sources(&parse(r#"["/abs/ref"]"#, Some(non_utf8)).unwrap()),
@@ -891,23 +932,29 @@ mod tests {
         for (text, expected) in [
             (
                 r#"["/abs:./rel"]"#,
-                "mounts[0]: guest path must be absolute",
+                at("mounts[0]", "/abs:./rel") + "guest path must be absolute",
             ),
             (
                 r#"["/abs:rel"]"#,
-                "mounts[0]: unknown mode keyword (expected ro, rw, fork, follow-links, or \
-                 exclude=REL)",
+                at("mounts[0]", "/abs:rel")
+                    + "unknown mode keyword \"rel\" (expected ro, rw, fork, follow-links, or \
+                       exclude=REL)",
             ),
-            (r#"["/abs:/"]"#, GUEST_NOT_MOUNTABLE),
-            (r#"["/abs:/a/../b"]"#, GUEST_NOT_MOUNTABLE),
+            (r#"["/abs:/"]"#, format!("mounts[0]: {GUEST_NOT_MOUNTABLE}")),
+            (
+                r#"["/abs:/a/../b"]"#,
+                format!("mounts[0]: {GUEST_NOT_MOUNTABLE}"),
+            ),
         ] {
             assert_eq!(rendered(parse(text, home)), expected, "{text:?}");
         }
         // A control character in the guest cannot cross the boot-params frame,
-        // so the grammar refuses it before the claim sees the declaration.
+        // so the grammar refuses it before the claim sees the declaration. The
+        // entry is still quoted, so the tab prints as itself-escaped text.
         assert_eq!(
             rendered(parse("[\"/abs:/a\tb\"]", home)),
-            "mounts[0]: guest path contains control characters that can't be carried into the guest"
+            at("mounts[0]", "/abs:/a\tb")
+                + "guest path contains control characters that can't be carried into the guest"
         );
         // The same `:ro`/`:rw` grammar, and a normalized guest reaches the claim.
         let mounts = parse(r#"["/abs:/g//./x:ro"]"#, None).unwrap();
@@ -924,65 +971,104 @@ mod tests {
         ));
     }
 
-    /// Every rejection names `mounts` and the index, and never echoes the value.
+    /// Every rejection names `mounts` and the index, and every rejection that has
+    /// the entry in hand quotes it: a numeric site cannot be found in a file, and
+    /// one bad segment is invisible in a sentence that names no segment. The last
+    /// two rows have no single entry text of their own — a non-string entry and a
+    /// claim conflict — and keep the site-only sentence.
     #[test]
-    fn errors_are_value_free_and_index_named() {
-        const SENTINEL: &str = "s3cr3t-SENTINEL";
+    fn errors_name_the_site_and_quote_the_entry() {
         let home = Some(Path::new("/h"));
         for (text, expected) in [
             (
                 r#"["/abs:ro:rw"]"#,
-                "mounts[0]: conflicting modes `ro` and `rw`",
+                at("mounts[0]", "/abs:ro:rw") + "conflicting modes `ro` and `rw`",
             ),
             (
                 r#"["/abs:exclude=hidden"]"#,
-                "mounts[0]: :exclude is only supported on :fork mounts",
+                at("mounts[0]", "/abs:exclude=hidden")
+                    + ":exclude is only supported on :fork mounts",
             ),
             (
                 r#"["/abs:fork:exclude="]"#,
-                "mounts[0]: exclude must be a non-empty relative path of normal components",
+                at("mounts[0]", "/abs:fork:exclude=")
+                    + "exclude must be a non-empty relative path of normal components",
             ),
             (
                 r#"["/abs::ro"]"#,
-                "mounts[0]: empty segment (stray `:`); expected HOST[:GUEST][:MODE]...",
+                at("mounts[0]", "/abs::ro")
+                    + "empty segment (stray `:`); expected HOST[:GUEST][:MODE]...",
             ),
             (
                 r#"[""]"#,
-                "mounts[0]: mount declaration must be HOST[:GUEST][:MODE]... (non-empty)",
+                at("mounts[0]", "")
+                    + "mount declaration must be HOST[:GUEST][:MODE]... (non-empty)",
             ),
             (
                 r#"[":/g"]"#,
-                "mounts[0]: mount declaration must be HOST[:GUEST][:MODE]... (non-empty)",
+                at("mounts[0]", ":/g")
+                    + "mount declaration must be HOST[:GUEST][:MODE]... (non-empty)",
             ),
-            (r#"["/a", 7]"#, "mounts[1]: must be a string"),
-            (r#"["/a", ["/b"]]"#, "mounts[1]: must be a string"),
-            (r#""/a""#, "mounts: must be an array of strings"),
-            (r#"["/a", "/b:/g", "/c:/g:fork"]"#, CONFLICT),
+            (r#"["/a", 7]"#, "mounts[1]: must be a string".to_string()),
+            (
+                r#"["/a", ["/b"]]"#,
+                "mounts[1]: must be a string".to_string(),
+            ),
+            (r#""/a""#, "mounts: must be an array of strings".to_string()),
+            (r#"["/a", "/b:/g", "/c:/g:fork"]"#, CONFLICT.to_string()),
         ] {
             assert_eq!(rendered(parse(text, home)), expected, "{text}");
         }
-        // The sentinel sits in the invalid position of an otherwise valid
-        // declaration, so any echo would put it in the sentence.
-        for text in [
-            format!(r#"["./{SENTINEL}"]"#),
-            format!(r#"["/a:{SENTINEL}"]"#),
-            format!(r#"["/a:/g:{SENTINEL}"]"#),
-            format!(r#"["/a:/g:exclude={SENTINEL}/../x"]"#),
-            format!(r#"["/a", "{SENTINEL}"]"#),
-            format!(r#"[1, "{SENTINEL}"]"#),
-            format!(r#"["/a", {{ {SENTINEL} = 1 }}]"#),
-        ] {
-            let error = rendered(parse(&text, home));
-            assert!(!error.contains(SENTINEL), "{text} echoed a value: {error}");
-            assert!(
-                error.starts_with("mounts:") || error.starts_with("mounts["),
-                "{text}: {error}"
-            );
-        }
         assert_eq!(
-            rendered(parse(&format!(r#"{{ "{SENTINEL}" = 1 }}"#), home)),
+            rendered(parse(r#"{ a = 1 }"#, home)),
             "mounts: must be an array of strings"
         );
+    }
+
+    /// The echoed entry is one escaped token, never a second line: a spelling
+    /// carrying a newline, a carriage return or an ANSI escape prints as `\xNN`,
+    /// so no entry can forge a diagnostic of its own in a report a user is asked
+    /// to trust. Each sentinel sits in the invalid position of an otherwise valid
+    /// declaration, so the refusal is the grammar's, not a schema one. Nothing is
+    /// lost either: the reader has to recognize the spelling they wrote, and the
+    /// escape is what they must fix.
+    #[test]
+    fn an_echoed_entry_cannot_forge_a_line() {
+        const SENTINEL: &str = "s3cr3t-SENTINEL";
+        let home = Some(Path::new("/h"));
+        for (text, entry) in [
+            (
+                format!("[\"/a:/g:{SENTINEL}\"]"),
+                format!("/a:/g:{SENTINEL}"),
+            ),
+            (
+                "[\"/a:/g:ro\\n==> Mounting /etc -> /etc\"]".to_string(),
+                "/a:/g:ro\n==> Mounting /etc -> /etc".to_string(),
+            ),
+            (
+                format!("[\"/a:/g:ro\\r{SENTINEL}\"]"),
+                format!("/a:/g:ro\r{SENTINEL}"),
+            ),
+            (
+                format!("[\"/a:/g:ro\\u001b[2K{SENTINEL}\"]"),
+                format!("/a:/g:ro\u{1b}[2K{SENTINEL}"),
+            ),
+            (
+                format!("[\"/a\\n:{SENTINEL}\"]"),
+                format!("/a\n:{SENTINEL}"),
+            ),
+        ] {
+            let error = rendered(parse(&text, home));
+            assert_eq!(error.lines().count(), 1, "{entry:?} forged a line: {error}");
+            assert!(
+                !error.contains('\u{1b}') && !error.contains('\r'),
+                "{entry:?}: a terminal control byte survived: {error:?}"
+            );
+            assert!(
+                error.contains(&quoted_str(&entry)),
+                "{entry:?}: the entry is not quoted back: {error}"
+            );
+        }
     }
 
     const CONFLICT: &str =
@@ -1090,7 +1176,7 @@ mod tests {
                 )
                 .unwrap_err()
                 .to_string(),
-                "mounts[0]: a mount-set reference is a bare name; modes, a guest path and \
+                "mounts[0] \"agent:ro\": a mount-set reference is a bare name; modes, a guest path and \
                  exclusions belong to the paths declared inside the set"
             );
             let tools = [ToolMountValue {
@@ -1109,45 +1195,49 @@ mod tests {
                 )
                 .unwrap_err()
                 .to_string(),
-                "tools[2].mounts[0]: a mount-set reference is a bare name; modes, a guest path \
-                 and exclusions belong to the paths declared inside the set"
+                "tools[2].mounts[0] \"agent:ro\": a mount-set reference is a bare name; modes, a \
+                 guest path and exclusions belong to the paths declared inside the set"
             );
         });
     }
 
-    /// Every tool-list rejection names the numeric declaration and entry, and never
-    /// echoes a value or a key.
+    /// Every tool-list rejection names the numeric declaration and entry, and
+    /// quotes the entry when it has one; never a key, and never a tool's name
+    /// (not yet validated when presence is decided).
     #[test]
-    fn tool_list_errors_name_numeric_sites_without_values() {
+    fn tool_list_errors_name_the_site_and_quote_the_entry() {
         const SENTINEL: &str = "s3cr3t-SENTINEL-396";
         let home = Some(Path::new("/h"));
-        let rows: Vec<(String, &str)> = vec![
+        let rows: Vec<(String, String)> = vec![
             (
                 "7".to_string(),
-                "tools[1].mounts: must be an array of strings",
+                "tools[1].mounts: must be an array of strings".to_string(),
             ),
             (
                 r#"["/a", 7]"#.to_string(),
-                "tools[1].mounts[1]: must be a string",
+                "tools[1].mounts[1]: must be a string".to_string(),
             ),
             (
                 format!("[\"./{SENTINEL}\"]"),
-                "tools[1].mounts[0]: host path must be absolute",
+                at("tools[1].mounts[0]", &format!("./{SENTINEL}")) + "host path must be absolute",
             ),
             (
                 format!("[\"/a:/g:{SENTINEL}\"]"),
-                "tools[1].mounts[0]: unknown mode keyword",
+                at("tools[1].mounts[0]", &format!("/a:/g:{SENTINEL}"))
+                    + &format!("unknown mode keyword {}", quoted_str(SENTINEL)),
             ),
             (
                 format!("[\"/a:/g:exclude={SENTINEL}/../x\"]"),
-                "tools[1].mounts[0]: exclude must be a non-empty relative path of normal \
-                 components",
+                at(
+                    "tools[1].mounts[0]",
+                    &format!("/a:/g:exclude={SENTINEL}/../x"),
+                ) + "exclude must be a non-empty relative path of normal components",
             ),
             // A sentinel that *is* a valid mount-set name reaches the set
             // grammar, not the path grammar: one selector decides both sites.
             (
                 format!("[\"/a\", \"{SENTINEL}\"]"),
-                "tools[1].mounts[1]: unknown mount set name",
+                at("tools[1].mounts[1]", SENTINEL) + "unknown mount set name",
             ),
         ];
         let value = |text: &str| -> toml::Value {
@@ -1175,8 +1265,7 @@ mod tests {
                 )
                 .unwrap_err()
                 .to_string();
-                assert!(!error.contains(SENTINEL), "{text}: value echoed: {error}");
-                assert!(error.starts_with(expected), "{text}: {error}");
+                assert!(error.starts_with(&expected), "{text}: {error}");
             });
         }
     }
