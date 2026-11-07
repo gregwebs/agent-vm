@@ -8,15 +8,13 @@
 project layer chains, `--layer`, derived images and the layer contract are
 removed.
 
-**Superseded in part by [ADR-0032](0032-one-layer-kind.md)** (issue #207). This
-ADR's two load-bearing models are retired: the ordered **layer chain** (every
-layer now builds `FROM` a declared parent and is joined by stitching) and the
-**layer image contract** (C1–C8, now [ADR-0031](0031-tool-image-contract.md)'s
-T/S clauses governing every layer image). What survives and is still normative
-elsewhere in this file: registry-less ingest, hash-as-staleness-check, hard-fail,
-the `--layer` flag, the `$AGENT_VM_LAYER` rejection, and the `Base link`
-(ADR-0003 issue-#98 amendment). The text below is kept as the history of how
-layers were built, and its clause table is no longer normative for anything.
+**Superseded in part by the layer redesign of issue #207**, whose own records,
+ADR-0029 to ADR-0034, were also never implemented and are summarised in
+[ADR-0035's appendix](0035-consume-user-owned-boot-images.md#appendix-the-abandoned-layer-composition-design).
+This ADR's two load-bearing models are retired: the ordered **layer chain** and
+the **layer image contract** (C1–C8). Nothing in this file is normative now:
+`--layer`, `$AGENT_VM_LAYER`, the base link and the build-on-launch path are all
+removed (ADR-0035). The text is kept as the history of how layers were built.
 
 Accepted. A project declares an ordered **chain** of layers; `--layer` is a
 repeatable flag appended after the project's own chain; `$AGENT_VM_LAYER` is
@@ -213,10 +211,12 @@ unchanged.)
 
 ### The layer image contract
 
-> **Retired by [ADR-0032](0032-one-layer-kind.md).** The table below governed
-> project tooling layers until layers and tools became one kind. It is kept for
-> history; the normative contract for every layer image is
-> [ADR-0031](0031-tool-image-contract.md)'s, as widened by ADR-0032.
+> **Retired.** The table below governed project tooling layers. Its replacement
+> in the abandoned layer redesign (ADR-0029–0034, see
+> [ADR-0035's appendix](0035-consume-user-owned-boot-images.md#appendix-the-abandoned-layer-composition-design))
+> was never built, so no clause here is normative for anything. The contract a
+> boot image is held to today is the
+> [boot image contract](../../USAGE.md#boot-image-contract).
 
 Each chain step's `Dockerfile` (`.agent-vm/layers/<NN-name>/Dockerfile`)
 MUST satisfy all eight clauses below. Four are **enforced** — checked
@@ -238,14 +238,13 @@ before the prompt and gives an error the image check cannot phrase
 | **C7** | **Installs tools readable and executable by any uid** (`a+rX`; not inside a `0700` home). | Documented | — | The guest runs as an arbitrary host uid (ADR-0001), so mode-0700 tools are unusable |
 | **C8** | **Advertises a capability only when it works.** Write `/etc/agent-vm-capabilities/<name>` only after the layer's own build-time sanity checks pass (API 2; `chrome-devtools-mcp` is the worked example). | Documented | — | The launcher wires up an MCP that then fails at runtime |
 
-Decided, not yet built: **tool images** follow their own contract,
-[ADR-0031](0031-tool-image-contract.md)'s tool image contract and stitch
-checks. This table will then govern project tooling layers only.
+Decided, never built: **tool images** were to follow their own contract. That
+stitched-DAG contract was abandoned with the rest of ADR-0029–0034; see
+[ADR-0035's appendix](0035-consume-user-owned-boot-images.md#appendix-the-abandoned-layer-composition-design).
 
-This table is the only normative copy of the contract. `CONTEXT.md`,
-`USAGE.md` and `examples/layers/README.md` link here; a clause change is an
-edit to this table plus, if the wording of an error changes,
-`crates/agent-vm/src/layer/contract.rs`.
+This table was once the only normative copy of the contract; it no longer binds
+anything, and `crates/agent-vm/src/layer/contract.rs` is gone with the rest of
+the layer machinery.
 
 C4 does **not** cover foreign binaries a step installs with `RUN` or copies
 from another stage — that needs layer decompression, so it is documented only,

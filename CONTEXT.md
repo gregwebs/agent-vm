@@ -669,8 +669,10 @@ guest state. Invisible to `pi list` / `pi update`. See
 ## Retired terms
 
 These named a system the launcher no longer has; they are kept here so older
-notes and ADRs still resolve. See
-[ADR-0035](docs/adr/0035-consume-user-owned-boot-images.md).
+notes still resolve. See
+[ADR-0035](docs/adr/0035-consume-user-owned-boot-images.md) and its appendix,
+which also records why the design was abandoned (its own records, ADR-0029 to
+ADR-0034, are removed).
 
 **Base link** (the retired Docker-local import tag), **Layer**, **Composition root**, **Base selection**, **Composed default
 image**, **Parent**, **Layer image**, **Current tag**, **Stitching**,

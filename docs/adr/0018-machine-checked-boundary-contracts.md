@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted. Implementation decision for [agent-vm #124](https://github.com/gregwebs/agent-vm/issues/124). Builds on the terms **Boundary contract** in [CONTEXT.md](../../CONTEXT.md) and **Layer image contract**, and pairs with the pinned-toolchain invariant enforced by `script/check-rust-toolchain.sh`.
+Accepted. Implementation decision for [agent-vm #124](https://github.com/gregwebs/agent-vm/issues/124). Builds on the term **Boundary contract** in [CONTEXT.md](../../CONTEXT.md), and pairs with the pinned-toolchain invariant enforced by `script/check-rust-toolchain.sh`.
 
 ## Context
 
