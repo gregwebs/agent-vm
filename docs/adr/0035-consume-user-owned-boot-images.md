@@ -23,6 +23,10 @@ Supersedes [ADR-0003](0003-project-tooling-layers.md),
 [ADR-0034](0034-versioned-image-releases.md). Amends
 [ADR-0015](0015-config-driven-tools.md) and
 [ADR-0022](0022-dsh-tool-layer.md).
+Amended in **0.7.35** by [ADR-0061](0061-explicit-launch-builds.md) (#527): an
+explicit `--dockerfile FILE` launch builds that Dockerfile and boots the result,
+with no pin. The launcher still builds nothing implicitly — no environment
+variable, config key or catalog field can start a build.
 
 ## Context
 

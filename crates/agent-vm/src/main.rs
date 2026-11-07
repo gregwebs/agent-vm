@@ -44,6 +44,7 @@ mod image_pin;
 mod image_publish;
 mod image_requests;
 mod intercept_hook;
+mod launch_build;
 mod launch_notice;
 mod launch_target;
 mod mount;

@@ -9,7 +9,9 @@ import tag, selection-aware import completion). Amended in **0.7.0** by #389:
 group, and no top-level `pull`/`upgrade` alias exists. Amended in **0.7.2** by
 #390: both update verbs take a nested `--yes` (candidate replacement consent).
 Amended in **0.7.34** by #391: an explicit build/import approves its own result
-reference, prompt-free.
+reference, prompt-free. Amended in **0.7.35** by [ADR-0061](0061-explicit-launch-builds.md)
+(#527): a launch may build, but only for an explicit `--dockerfile FILE`, and
+that build publishes through this same module without approving anything.
 
 ## Context
 
@@ -41,7 +43,9 @@ Docker daemon / archive → image import ─────────────
   `image` is reserved; `build` is available to configured tools.
 - Launch/`image refresh`/setup registry failures for explicit mutable tags get a text-only
   import hint, with the original error chain retained. Digests and redacted
-  defaults get no hint. Launch never runs Docker or falls back to import.
+  defaults get no hint. No launch runs Docker or falls back to import, except the
+  explicit `--dockerfile` launch build of
+  [ADR-0061](0061-explicit-launch-builds.md).
 - **Nested `--yes` on the update verbs (#390).** `image refresh [--yes]` and
   `image set-default --image REF [--yes]` use `--yes` to pre-authorize exactly
   the one current registry candidate they resolved and displayed. It never

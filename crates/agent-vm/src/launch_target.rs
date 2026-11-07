@@ -429,6 +429,10 @@ impl DirectCommand {
     pub(crate) fn program(&self) -> &str {
         &self.program
     }
+    #[cfg(test)]
+    pub(crate) fn args(&self) -> &[String] {
+        &self.args
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

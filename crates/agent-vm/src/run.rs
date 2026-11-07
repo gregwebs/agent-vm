@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
-use microsandbox::{Sandbox, sandbox::PullPolicy};
+use microsandbox::Sandbox;
 
 use crate::boot_image::{self, ImageArgs};
 use crate::config::{self, ConfiguredImages, Tool};
@@ -433,6 +433,7 @@ Examples:
   agent-vm -t run htop                             force a PTY for a direct command
   agent-vm -T run build.sh >out.log                force streaming I/O for one
   agent-vm shell <command>                         run one command, then exit
+  agent-vm --dockerfile ./Dockerfile shell         build this Dockerfile, then boot it
   agent-vm --memory 8 --cpus 4 <tool>              a bigger sandbox
   agent-vm --mount ~/ref:ro <tool>                 read-only extra mount
   agent-vm --mount /etc/hosts:/host-hosts:ro <tool>
@@ -683,6 +684,18 @@ pub struct Args {
     #[command(flatten)]
     network: crate::network::Args,
 
+    /// Build this Dockerfile with Docker and boot the result.
+    ///
+    /// The build context is the Dockerfile's own directory; both are resolved from the
+    /// current directory. Every such launch builds (Docker's build cache is the only
+    /// reuse) and boots exactly what it built, without an image approval. Cannot be
+    /// combined with --image; AGENT_VM_IMAGE_TAG and config `image` are ignored for
+    /// this launch. There is deliberately no environment variable or config setting:
+    /// only typing it builds. For build options or a reusable name, use
+    /// `agent-vm image build` and --image.
+    #[arg(long = "dockerfile", value_name = "FILE", help_heading = "Image")]
+    pub(crate) dockerfile: Option<PathBuf>,
+
     /// The image this session boots. See "Selecting the boot image" in
     /// USAGE.md for the full precedence (flag/env > user config > project
     /// config > default).
@@ -704,6 +717,20 @@ pub struct Args {
 }
 
 impl Args {
+    /// The launch build this invocation typed, if any.
+    ///
+    /// A typed `--image` alongside is a conflict even though `cli` rejects that argv
+    /// first: an `Args` assembled in code must not silently pick a winner. Only the
+    /// command line conflicts; `AGENT_VM_IMAGE_TAG` is a lower tier (ADR-0061 §2).
+    pub(crate) fn launch_build(
+        &self,
+    ) -> Result<Option<&Path>, crate::launch_build::DockerfileImageConflict> {
+        match (&self.dockerfile, self.image.typed_on_command_line()) {
+            (Some(_), true) => Err(crate::launch_build::DockerfileImageConflict),
+            (dockerfile, _) => Ok(dockerfile.as_deref()),
+        }
+    }
+
     /// `--no-config-mounts`, read once here so selection has one policy value to
     /// consume instead of a flag it could reinterpret.
     pub(crate) fn config_mount_policy(&self) -> crate::mount_selection::ConfigMountPolicy {
@@ -765,12 +792,31 @@ pub(crate) async fn launch(
     // instead of sharing a stricter rule.
     let direct_launch = invocation.guard() == ProgramGuard::Direct;
     let provisioned = grant.provisioned();
-    // The one image selection for this session — a property of the session,
-    // not of the launched tool. Resolved first, before any side effect:
-    // an invalid override (a typed empty `--image`) or an unreadable
-    // configured image must not create state. `args.image.requested()` also
-    // applies the empty-`AGENT_VM_IMAGE_TAG`-is-unset rule.
-    let boot = boot_image::select(args.image.requested()?, images)?;
+    // ADR-0061: a typed --dockerfile selects a launch build, and only a launch has it.
+    // `requested()?` is evaluated unconditionally: it is the wiring check that
+    // `reconcile` ran (a supplied value with no agreed origin is a bug, not a
+    // selection), and it still rejects a malformed `--image`/`AGENT_VM_IMAGE_TAG`
+    // before anything else runs. A well-formed one is then *ignored*, because
+    // `--dockerfile` outranks it. The typed `--image` conflict is a separate,
+    // explicit check (`launch_build()`), not something `requested()` reports.
+    // Resolving the Dockerfile reads the file system but writes nothing.
+    let requested = args.image.requested()?;
+    let launch_build = args
+        .launch_build()?
+        .map(crate::launch_build::LaunchBuild::resolve)
+        .transpose()?;
+    // Pure CLI arithmetic, so it stays on the near side of every side effect:
+    // ADR-0061 §8 puts the build after CLI validation, and `--memory 5000000`
+    // must not cost a multi-minute build before it fails.
+    let memory_mib: u32 = args
+        .memory
+        .checked_mul(1024)
+        .context("--memory in GiB overflows u32 MiB")?;
+    let cpus = args.cpus;
+    let boot = match &launch_build {
+        Some(build) => build.boot_image(),
+        None => boot_image::select(requested, images)?,
+    };
     // `--no-config-mounts` is read once, here, because the network plan below
     // moves one of `args`' fields out: the policy is a plain `Copy` decision
     // with no bearing on the plan's order, and the selection it feeds cannot
@@ -896,6 +942,17 @@ pub(crate) async fn launch(
     // See src/msb_preflight.rs and issue #30.
     crate::msb_preflight::ensure_db_not_ahead().await?;
     crate::msb_install::ensure_socket_paths_fit(&session.sandbox_name)?;
+    let mut notices = LaunchNotices::to_stderr();
+    // ADR-0061 §8: after every side-effect-free rejection and the cache preflight,
+    // before the Pi migration, banner, session state, credential sessions and
+    // snapshots — a failed build leaves nothing of this session behind.
+    let built = match &launch_build {
+        Some(build) => {
+            notices.emit(build.notice())?;
+            Some(build.build(&label).await?)
+        }
+        None => None,
+    };
     // Pre-#96 projects hold a real `<state>/home/.pi` directory that the new
     // compiled link would refuse to replace. Runs before ensure_dirs so the
     // rename lands on a free name, and in BOTH guest modes. It is
@@ -911,7 +968,6 @@ pub(crate) async fn launch(
     // compiled Pi home is unconditional. The banner supplies project/state
     // context; the findings themselves stay field-only. Advisory: this never
     // denies the launch.
-    let mut notices = LaunchNotices::to_stderr();
     notices.emit(launch_banner(&session))?;
     // The selected boot image, once, before the session provisions any state
     // (D10). `boot` was resolved before the first side effect above; `label`
@@ -950,16 +1006,10 @@ pub(crate) async fn launch(
     // The selected boot image's own text, kept as this session's source
     // identity for notices and the guest command line. What the SDK is given is
     // decided by the preparation below. No launch invokes Docker or builds an
-    // image; a custom image is selected with
-    // `--image`/`AGENT_VM_IMAGE_TAG`/config and booted verbatim
-    // (`boot_image::select` above is the sole selection owner).
-    let image = boot.reference().as_str().to_string();
-
-    let memory_mib: u32 = args
-        .memory
-        .checked_mul(1024)
-        .context("--memory in GiB overflows u32 MiB")?;
-    let cpus = args.cpus;
+    // image, except for an explicit `--dockerfile` launch build (ADR-0061); an
+    // ordinary custom image is selected with `--image`/`AGENT_VM_IMAGE_TAG`/config
+    // and booted verbatim (`boot_image::select` above is the sole selection owner).
+    let image = boot.contract_display();
 
     // Mount the host project at the *same* absolute path inside the guest so
     // that anything the agent emits (compiler errors, stack traces, git
@@ -990,7 +1040,8 @@ pub(crate) async fn launch(
     }
     let mut patch_builder_steps = mkdir_chain(Path::new(&project_guest_path));
     // PullPolicy::IfMissing keeps the slow part (pull + materialize) off every
-    // launch. There is no launch-time registry probe of any kind: a warm launch
+    // launch (with PullPolicy::Never for launch builds, which never contact a
+    // registry). There is no launch-time registry probe of any kind: a warm launch
     // must not query a mutable tag, and checking for movement is the explicit
     // `agent-vm image refresh` operation's job.
 
@@ -1201,12 +1252,14 @@ pub(crate) async fn launch(
     // is handed to the SDK, so a later create failure cannot leave a launch on
     // unapproved bytes. The returned value holds the shared publication barrier
     // across both create variants.
-    let prepared = crate::image_pin::prepare_selected(&boot)
-        .await
-        .context("preparing the boot image")?;
+    let prepared = match &built {
+        Some(built) => crate::image_pin::prepare_unpinned(built, &label).await,
+        None => crate::image_pin::prepare_selected(&boot).await,
+    }
+    .context("preparing the boot image")?;
     let sdk_image = prepared.sdk_reference().to_owned();
     let acquisition_reference = sdk_image.clone();
-    let is_local_registry = crate::pull::is_plain_http_registry(&sdk_image);
+    let is_local_registry = prepared.registry_is_insecure(&sdk_image);
     // `.workdir()` becomes libkrun's `KRUN_WORKDIR`, which rides the
     // printable-ASCII-only kernel command line. When the real project path
     // isn't cmdline-safe (non-ASCII / whitespace) we hand libkrun `/` and
@@ -1230,7 +1283,7 @@ pub(crate) async fn launch(
         // alias, which just forwards to this same call.
         .root_disk(crate::defaults::WRITABLE_UPPER_MIB)
         .registry(|r| if is_local_registry { r.insecure() } else { r })
-        .pull_policy(PullPolicy::IfMissing)
+        .pull_policy(prepared.pull_policy())
         .cpus(cpus)
         .memory(memory_mib)
         .workdir(krun_workdir);
@@ -10068,5 +10121,198 @@ unset _avm_command _avm_external _avm_lookup_status; exec -- 'cat'"#;
                 );
             }
         }
+    }
+
+    #[test]
+    fn launch_build_table_conflict_and_options() {
+        use crate::boot_image::OverrideSource;
+        use clap::Parser as _;
+
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            args: Args,
+        }
+
+        let d_path = PathBuf::from("Dockerfile");
+        let cases = [
+            (None, None, Ok(None)),
+            (None, Some(OverrideSource::Environment), Ok(None)),
+            (None, Some(OverrideSource::CommandLine), Ok(None)),
+            (Some(d_path.clone()), None, Ok(Some(d_path.as_path()))),
+            (
+                Some(d_path.clone()),
+                Some(OverrideSource::Environment),
+                Ok(Some(d_path.as_path())),
+            ),
+            (
+                Some(d_path.clone()),
+                Some(OverrideSource::CommandLine),
+                Err(crate::launch_build::DockerfileImageConflict),
+            ),
+        ];
+
+        for (dockerfile, origin, expected) in cases {
+            let mut args = TestCli::try_parse_from(["agent-vm"]).unwrap().args;
+            args.dockerfile = dockerfile;
+            args.image = ImageArgs::for_test(Some("img:1".into()), origin);
+            assert_eq!(args.launch_build(), expected);
+        }
+    }
+
+    #[test]
+    fn launch_applies_launch_build_pipeline_order_before_boot() {
+        // Only the **body of `launch`**, with whole-line comments removed. Searching
+        // the whole file would let a comment (or a same-named helper elsewhere)
+        // satisfy a needle at the wrong place: move a step and leave its name in a
+        // note at the old site, and a file-wide search stays green. Whole-line
+        // stripping is enough — no search needle lives in a trailing comment — and
+        // it cannot corrupt a string literal the way stripping `//` mid-line would.
+        let source = include_str!("run.rs")
+            .split_once("#[cfg(test)]")
+            .expect("run.rs has a test module")
+            .0;
+        let from_launch = source
+            .split_once("pub(crate) async fn launch(")
+            .expect("run.rs defines launch")
+            .1;
+        let body_end = from_launch
+            .find("\n}\n")
+            .expect("launch's body is closed at column 0");
+        let production: String = from_launch[..body_end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let position = |needle| {
+            production
+                .find(needle)
+                .unwrap_or_else(|| panic!("launch step {needle} is present"))
+        };
+        let requested = position("args.image.requested()?");
+        let resolve = position("LaunchBuild::resolve");
+        let memory = position("--memory in GiB overflows u32 MiB");
+        let mount_prep = position("mount::prepare(");
+        let msb_home = position("ensure_msb_home(");
+        let db_ahead = position("ensure_db_not_ahead(");
+        let socket_fit = position("ensure_socket_paths_fit(");
+        let build = position("Some(build.build(&label).await?)");
+        let migrate = position("migrate_legacy_pi_home()");
+        let banner = position("notices.emit(launch_banner(");
+        let dirs = position("session.ensure_dirs(");
+        let cred_resolve = position("credential_preflight.resolve(");
+        let cred_refresh = position("crate::secrets::refresh(");
+        let prepare_unpinned = position("prepare_unpinned(");
+        let pull_policy = position(".pull_policy(prepared.pull_policy())");
+
+        assert!(
+            requested < resolve,
+            "requested() must precede LaunchBuild::resolve"
+        );
+        assert!(
+            resolve < memory,
+            "resolve must precede the pure --memory arithmetic"
+        );
+        assert!(memory < mount_prep, "memory must precede mount::prepare");
+        assert!(
+            mount_prep < socket_fit,
+            "mount prep must precede socket fit"
+        );
+        assert!(
+            msb_home < build && db_ahead < build,
+            "msb preflight precedes build"
+        );
+        assert!(socket_fit < build, "socket fit must precede build");
+        assert!(build < migrate, "build must precede migrate_legacy_pi_home");
+        assert!(migrate < banner, "migrate must precede banner");
+        assert!(banner < dirs, "banner must precede ensure_dirs");
+        assert!(dirs < cred_resolve, "dirs must precede cred resolve");
+        assert!(
+            cred_resolve < cred_refresh,
+            "cred resolve must precede refresh"
+        );
+        assert!(
+            cred_refresh < prepare_unpinned,
+            "refresh must precede prepare_unpinned"
+        );
+        assert!(
+            prepare_unpinned < pull_policy,
+            "prepare_unpinned must precede pull_policy"
+        );
+
+        // Verify PullPolicy::IfMissing no longer appears in the create chain
+        let create_chain = &production[pull_policy - 200..pull_policy + 100];
+        assert!(
+            !create_chain.contains("PullPolicy::IfMissing"),
+            "PullPolicy::IfMissing must not be hardcoded in builder"
+        );
+
+        // R16's other half: the `.insecure()` decision comes from the selection,
+        // and the builder consumes it — never an unconditional `r.insecure()`
+        // and never a bare plain-HTTP reading inside `launch`.
+        assert!(
+            production
+                .contains("let is_local_registry = prepared.registry_is_insecure(&sdk_image);"),
+            "the create must take its insecure decision from PreparedSelection"
+        );
+        assert!(
+            production.contains(".registry(|r| if is_local_registry { r.insecure() } else { r })"),
+            "the insecure decision must be consumed by the registry hook"
+        );
+        assert!(
+            !production.contains(".registry(|r| r.insecure())"),
+            "insecure registry access must never be unconditional"
+        );
+        assert!(
+            !production.contains("crate::pull::is_plain_http_registry("),
+            "launch must not read the plain-HTTP predicate directly"
+        );
+    }
+
+    #[test]
+    fn requested_rejects_a_supplied_but_unreconciled_or_unusable_value() {
+        use clap::Parser as _;
+
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            args: Args,
+        }
+
+        let mut args = TestCli::try_parse_from(["agent-vm"]).unwrap().args;
+        assert!(args.image.requested().unwrap().is_none());
+
+        // Present with no agreed origin: the wiring bug.
+        args.image = ImageArgs::for_test(Some("valid:tag".into()), None);
+        assert!(args.image.requested().is_err());
+
+        // Present and reconciled but unusable: rejected here, not later.
+        for raw in [String::new(), "bad\0tag".to_string()] {
+            args.image = ImageArgs::for_test(
+                Some(raw),
+                Some(crate::boot_image::OverrideSource::Environment),
+            );
+            assert!(args.image.requested().is_err());
+        }
+
+        args.image = ImageArgs::for_test(
+            Some("valid:tag".into()),
+            Some(crate::boot_image::OverrideSource::Environment),
+        );
+        assert!(args.image.requested().is_ok());
+    }
+
+    #[test]
+    fn dockerfile_has_no_env_binding() {
+        use clap::Args as _;
+        let cmd = Args::augment_args(clap::Command::new("test"));
+        let arg = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "dockerfile")
+            .expect("--dockerfile is a launch option");
+        assert!(
+            arg.get_env().is_none(),
+            "--dockerfile must not have an env binding"
+        );
     }
 }

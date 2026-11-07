@@ -30,6 +30,8 @@ use microsandbox_image::{CachedImageMetadata, GlobalCache, Reference};
 
 #[path = "support/cache_inventory.rs"]
 mod cache_inventory;
+#[path = "support/fake_docker.rs"]
+mod fake_docker;
 #[path = "support/fake_msb.rs"]
 mod fake_msb;
 #[path = "support/image_archive.rs"]
@@ -96,7 +98,7 @@ impl Harness {
         let msb_log = bin.path().join("msb.log");
         let archive = home.path().join("replay.tar");
 
-        write_fake_docker(&bin.path().join("docker"));
+        fake_docker::write(&bin.path().join("docker"));
         write_fake_msb(&bin.path().join("msb"), fake_msb::VERSION_LINE);
 
         Self {
@@ -210,25 +212,7 @@ impl Harness {
 
     /// Every fake-Docker invocation's argv, in order.
     fn docker_calls(&self) -> Vec<Vec<OsString>> {
-        let bytes = fs::read(&self.docker_log).unwrap_or_default();
-        let mut calls: Vec<Vec<OsString>> = Vec::new();
-        let mut current: Option<Vec<OsString>> = None;
-        for token in bytes.split(|byte| *byte == 0) {
-            match token {
-                b"CALL" => current = Some(Vec::new()),
-                b"END" => {
-                    calls.push(current.take().expect("END after CALL"));
-                }
-                b"UNEXPECTED" | b"" => {}
-                other => {
-                    if let Some(call) = current.as_mut() {
-                        call.push(OsString::from_vec(other.to_vec()));
-                    }
-                }
-            }
-        }
-        assert!(current.is_none(), "the docker log ended mid-call");
-        calls
+        fake_docker::calls(&self.docker_log)
     }
 
     /// Did the fake `msb` receive any invocation other than `--version`?
@@ -245,60 +229,6 @@ impl Harness {
                 .collect(),
         ]
     }
-}
-
-fn write_fake_docker(path: &Path) {
-    let script = r#"#!/bin/bash
-# Fake Docker for agent-vm image build/import tests. Records argv NUL-separated, replays a
-# fixture archive on stdout, and can fail or die by signal on demand.
-{
-  printf 'CALL\0'
-  for a in "$@"; do printf '%s\0' "$a"; done
-  printf 'END\0'
-} >> "${FAKE_DOCKER_LOG:?}"
-
-case "${1:-} ${2:-}" in
-  "buildx build") mode=build ;;
-  "image save")
-    [ "${3:-}" = --output ] && [ -n "${4:-}" ] && [ "${5:-}" = -- ] && [ "$#" -eq 6 ] || { printf 'UNEXPECTED\0' >> "$FAKE_DOCKER_LOG"; exit 97; }
-    mode=save; out="$4" ;;
-  *) printf 'UNEXPECTED\0' >> "${FAKE_DOCKER_LOG:?}"; echo "fake docker: unexpected subcommand" >&2; exit 97 ;;
-esac
-
-emit_archive() {
-  if [ "$mode" = save ]; then cat "$FAKE_DOCKER_ARCHIVE" > "$out"; else cat "$FAKE_DOCKER_ARCHIVE"; fi
-}
-
-if [ -n "${FAKE_DOCKER_SLEEP:-}" ]; then
-  sleep "${FAKE_DOCKER_SLEEP}"
-fi
-
-printf '%s\n' "${FAKE_DOCKER_STDERR_MARKER:-}" >&2
-
-if [ -n "${FAKE_DOCKER_STDERR_BYTES:-}" ]; then
-  head -c "${FAKE_DOCKER_STDERR_BYTES}" /dev/zero | tr '\0' 'x' >&2
-fi
-
-if [ -n "${FAKE_DOCKER_SIGNAL:-}" ]; then
-  kill "-${FAKE_DOCKER_SIGNAL}" "$$"
-  sleep 1
-  exit 98
-fi
-
-if [ -n "${FAKE_DOCKER_EXIT:-}" ] && [ "${FAKE_DOCKER_EXIT}" != "0" ]; then
-  if [ -n "${FAKE_DOCKER_EMIT_ON_FAILURE:-}" ] && [ -n "${FAKE_DOCKER_ARCHIVE:-}" ]; then
-    emit_archive
-  fi
-  exit "${FAKE_DOCKER_EXIT}"
-fi
-
-if [ -n "${FAKE_DOCKER_ARCHIVE:-}" ]; then
-  emit_archive
-fi
-exit 0
-"#;
-    fs::write(path, script).expect("write fake docker");
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod fake docker");
 }
 
 fn write_fake_msb(path: &Path, version_line: &str) {

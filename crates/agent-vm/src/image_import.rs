@@ -17,7 +17,7 @@
 
 use crate::boot_image::BootImage;
 use crate::config::ConfiguredImages;
-use crate::image_publish::{ImageTarget, ResultReference};
+use crate::image_publish::{ImageTarget, PublishPurpose, ResultReference};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Args as ClapArgs;
 use std::io::Write as _;
@@ -178,7 +178,7 @@ pub(crate) async fn run(args: Args, configured: Result<&ConfiguredImages>) -> Re
     crate::image_pin::publication_preflight(&tag)?;
     let published = match source {
         Source::Input(path) => target
-            .publish(&path, &tag)
+            .publish(&path, &tag, PublishPurpose::Approval)
             .await
             .context("importing image")?,
         Source::Docker(source) => {
@@ -195,7 +195,7 @@ pub(crate) async fn run(args: Args, configured: Result<&ConfiguredImages>) -> Re
                 return Ok(exit);
             }
             target
-                .publish(staging.path(), &tag)
+                .publish(staging.path(), &tag, PublishPurpose::Approval)
                 .await
                 .context("importing image")?
         }

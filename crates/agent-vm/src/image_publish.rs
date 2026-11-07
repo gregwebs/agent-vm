@@ -1,4 +1,5 @@
-//! Publication into the ambient SDK cache, shared by explicit build and import.
+//! Publication into the ambient SDK cache, shared by explicit build, import, and
+//! the launch build.
 //!
 //! # Why not shell out to `msb image load`?
 //!
@@ -50,7 +51,7 @@ reference cannot be updated by a later build or import";
 /// The `--tag` result reference. A distinct type from a launch `ImageRef` so a
 /// digest-pinned value (valid for `--image`) is a compile-time-different,
 /// parse-time-rejected value here.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct ResultReference(ImageRef);
 
 impl std::str::FromStr for ResultReference {
@@ -89,6 +90,11 @@ impl std::str::FromStr for ResultReference {
 impl ResultReference {
     pub(crate) fn as_str(&self) -> &str {
         self.0.as_str()
+    }
+
+    /// The launch build boots its own result reference (ADR-0061).
+    pub(crate) fn image_ref(&self) -> &ImageRef {
+        &self.0
     }
 }
 
@@ -129,6 +135,18 @@ pub(crate) struct ImageTarget {
     msb_home: PathBuf,
 }
 
+/// The caller's intent when publishing an image.
+///
+/// Controls the post-publication failure diagnostic if the native loader reports
+/// an unidentifiable digest: an explicit build/import explains that approval was
+/// not updated, while a launch build explains that the build result could not be
+/// confirmed and nothing was booted (ADR-0061 §5).
+#[derive(Clone, Copy)]
+pub(crate) enum PublishPurpose<'a> {
+    Approval,
+    LaunchBuild { typed: &'a Path },
+}
+
 impl ImageTarget {
     /// DB preflight, then the ambient SDK backend's cache dir and MSB_HOME.
     ///
@@ -138,7 +156,7 @@ impl ImageTarget {
         crate::msb_preflight::ensure_db_not_ahead().await?;
         let backend = microsandbox::backend::default_backend();
         let cache_dir = backend.as_local().ok_or_else(|| anyhow!(
-            "agent-vm image imports into the local image cache, but the resolved backend is not local; unset the cloud backend selection"
+            "agent-vm publishes images into the local image cache, but the resolved backend is not local; unset the cloud backend selection"
         ))?.cache_dir();
         let msb_home = std::env::var_os("MSB_HOME").ok_or_else(|| anyhow!(
             "MSB_HOME is not set; agent-vm's msb setup did not run before dispatch (this is an internal invariant — `image` is not in the needs_msb_setup exclusion list in main.rs)"
@@ -147,6 +165,11 @@ impl ImageTarget {
             cache_dir,
             msb_home,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cache_dir(&self) -> &Path {
+        &self.cache_dir
     }
 
     /// A private 0700 dir under MSB_HOME/tmp holding an empty 0600 `result.tar`.
@@ -190,6 +213,7 @@ impl ImageTarget {
         &self,
         archive: &Path,
         result: &ResultReference,
+        purpose: PublishPurpose<'_>,
     ) -> Result<Published> {
         // The requested reference is the ONE canonical acquisition key, so an
         // import under an equivalent spelling (`alpine:dev`,
@@ -245,6 +269,7 @@ impl ImageTarget {
                         )
                     }),
                     &requested,
+                    purpose,
                 )?;
                 Ok(Published { target, digest })
             }
@@ -304,18 +329,30 @@ pub(crate) fn approval_not_updated(reference: &str) -> String {
 fn published_identity<'a>(
     loaded: impl IntoIterator<Item = (&'a str, &'a str)>,
     requested: &str,
+    purpose: PublishPurpose<'_>,
 ) -> Result<ValidatedDigest> {
     loaded
         .into_iter()
         .find(|(reference, _)| *reference == requested)
         .and_then(|(_, digest)| ValidatedDigest::parse(digest).ok())
-        .ok_or_else(|| {
-            anyhow!(
+        .ok_or_else(|| match purpose {
+            PublishPurpose::Approval => anyhow!(
                 "internal error: the native loader did not report a usable manifest digest for \
                  the published result reference, so its content cannot be approved"
-            )
+            ),
+            PublishPurpose::LaunchBuild { .. } => anyhow!(
+                "internal error: the native loader did not report a usable manifest digest for \
+                 the published result reference, so its content cannot be booted"
+            ),
         })
-        .with_context(|| approval_not_updated(&escape_str(requested)))
+        .with_context(|| match purpose {
+            PublishPurpose::Approval => approval_not_updated(&escape_str(requested)),
+            PublishPurpose::LaunchBuild { typed } => format!(
+                "the --dockerfile {} build result was published to agent-vm's image cache, but its \
+                 digest could not be confirmed; nothing was booted",
+                crate::one_line::path(typed)
+            ),
+        })
 }
 
 /// Removed (recursively) when dropped.
@@ -494,7 +531,7 @@ mod tests {
 
 #[cfg(test)]
 #[path = "../tests/support/image_archive.rs"]
-mod test_archive;
+pub(crate) mod test_archive;
 
 #[cfg(test)]
 mod publication_tests {
@@ -502,7 +539,7 @@ mod publication_tests {
     use std::os::unix::fs::MetadataExt as _;
 
     /// Publishing never approves: the shared helper has no approval side effect,
-    /// so a verb that reuses it (a future `--dockerfile` launch build, say)
+    /// so a verb that reuses it (a `--dockerfile` launch build)
     /// inherits none. A `.config` directory appearing here would mean some
     /// approval code moved inside `publish`.
     #[test]
@@ -522,7 +559,11 @@ mod publication_tests {
         };
         let published = tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(target.publish(&written.path, &"app:dev".parse().unwrap()))
+            .block_on(target.publish(
+                &written.path,
+                &"app:dev".parse().unwrap(),
+                PublishPurpose::Approval,
+            ))
             .unwrap();
         assert_eq!(published.digest().as_str(), written.manifest_digest);
         assert_eq!(
@@ -550,6 +591,7 @@ mod publication_tests {
                     ("docker.io/library/app:dev", second.as_str()),
                 ],
                 "docker.io/library/app:dev",
+                PublishPurpose::Approval,
             )
             .unwrap()
             .as_str(),
@@ -560,7 +602,12 @@ mod publication_tests {
             vec![("docker.io/library/z:alias", first.as_str())],
             vec![("docker.io/library/app:dev", "not-a-digest")],
         ] {
-            let error = published_identity(loaded, "docker.io/library/app:dev").unwrap_err();
+            let error = published_identity(
+                loaded,
+                "docker.io/library/app:dev",
+                PublishPurpose::Approval,
+            )
+            .unwrap_err();
             let shown = format!("{error:#}");
             assert!(
                 shown.contains(
@@ -579,10 +626,35 @@ mod publication_tests {
 
         // The reference in the sentence is escaped, like every other diagnostic
         // spelling this crate renders.
-        let error = published_identity([], "docker.io/library/\x1bapp:dev").unwrap_err();
+        let error = published_identity(
+            [],
+            "docker.io/library/\x1bapp:dev",
+            PublishPurpose::Approval,
+        )
+        .unwrap_err();
         let shown = format!("{error:#}");
         assert!(!shown.contains('\u{1b}'), "no raw control byte: {shown}");
         assert!(shown.contains("\\x1b"), "the escape is visible: {shown}");
+
+        // Launch build purpose uses the launch sentence and never mentions approval.
+        let launch_typed = Path::new("sub/Dockerfile");
+        let error = published_identity(
+            [],
+            "docker.io/library/app:dev",
+            PublishPurpose::LaunchBuild {
+                typed: launch_typed,
+            },
+        )
+        .unwrap_err();
+        let shown = format!("{error:#}");
+        assert!(
+            shown.contains("the --dockerfile sub/Dockerfile build result was published to agent-vm's image cache, but its digest could not be confirmed; nothing was booted"),
+            "launch build message expected: {shown}"
+        );
+        assert!(
+            !shown.contains("approval"),
+            "launch build must never mention approval: {shown}"
+        );
     }
 
     #[test]
@@ -601,8 +673,10 @@ mod publication_tests {
         let metadata = std::fs::metadata(&path).unwrap();
         assert_eq!(metadata.mode() & 0o777, 0o600);
         assert_eq!(metadata.len(), 0);
+        let stage_dir = path.parent().unwrap().to_path_buf();
         drop(stage);
         assert!(!path.exists());
+        assert!(!stage_dir.exists(), "staging dir must be removed on drop");
     }
 
     #[test]

@@ -16,8 +16,8 @@ config to microsandbox and supervises the session (`run.rs`). It is the host
 half of the pair whose other half is the **in-guest** side (`intercept_hook`,
 agentd).
 
-_Avoid_: using it for the image builder alone (the launcher consumes finished images; `agent-vm image` builds/imports
-them without launching a tool); for the `agent-vm` binary in its non-tool-launching
+_Avoid_: using it for the image builder alone (the launcher consumes finished images, building one only for a
+**launch build**; `agent-vm image` builds/imports them without launching a tool); for the `agent-vm` binary in its non-tool-launching
 verbs (`doctor`, `setup`, `image`), even though setup can boot a verification
 guest; or for microsandbox.
 
@@ -535,17 +535,36 @@ stamp. _Avoid_: image API, image-API version.
 ## Image selection
 
 The one image a session boots, chosen independently of the launched tool:
+either a **launch build** (`--dockerfile`) or, when the launch does not type it,
 `--image` (command line) > `AGENT_VM_IMAGE_TAG` (an empty value is unset) >
 user config `image` > project config `image` > the **default boot image**. The
 catalog is never an input, so changing a runtime tool declaration cannot change
 the image. A config-file `image` must be an OCI reference; `--image`
-additionally accepts whatever msb accepts (a local rootfs or disk image). No
-launch builds an image. See
+additionally accepts whatever msb accepts (a local rootfs or disk image).
+`--dockerfile` beside a typed `--image` is a usage error, not a precedence
+question. Only a launch build
+builds an image; nothing else a launch reads can. See
 [USAGE.md#selecting-the-boot-image](USAGE.md#selecting-the-boot-image) and
 [ADR-0035](docs/adr/0035-consume-user-owned-boot-images.md). Winning is not
 authorization: every OCI source is recorded as an **image pin**, and a launch
 consumes the approved child digest. Precedence only chooses which pin's source
-is looked up. Local paths remain unpinned.
+is looked up. Local paths and launch builds remain unpinned.
+
+## Launch build
+
+A Docker build the **launcher** runs because the user typed `--dockerfile FILE`
+on the command line, never because of an environment variable, a config file or
+the **catalog**. Its context is the Dockerfile's own directory. Every such launch
+builds; Docker's own build cache is the only reuse. The result is published
+into the **image cache** under an internal name derived from the Dockerfile's
+path, and that launch boots exactly the content it just built. Typing the flag is
+the consent, so a launch build writes no **image pin** and needs no **image
+approval**. A build failure is the launcher's own failure, never a guest status.
+For a named, reusable image, use `agent-vm image build` and `--image`.
+
+_Avoid_: "derived image", "project image" (retired terms for automatic builds);
+"auto-build".
+
 
 ## Retained default boot image
 
@@ -579,7 +598,8 @@ cache**, `AGENT_VM_STATE_DIR` and the **retained default boot image**. A launch
 or `setup` consumes `repo@child`, never the selected tag or index. Only
 `image refresh` and `image set-default` re-resolve a source and request an
 **image approval**; `image build` and `image import` approve their own result
-reference without asking. Local rootfs/disk launches are never pinned.
+reference without asking. Local rootfs/disk launches and **launch builds** are
+never pinned.
 
 _Avoid_: "lock file"; "tag pin" (a pin names a child digest, not a tag); "cache
 entry" (cache evidence is not approval).
