@@ -1,11 +1,11 @@
 //! `agent-vm image build` — explicitly build a user Dockerfile and import the result
 //! into the local image cache (#260).
 //!
-//! It does **not** choose, adopt or
-//! boot an image: it exports one anonymous OCI archive with `docker buildx
-//! build`, then hands that archive to the native importer under `--tag` (plus
-//! any names the archive itself carries; see [`crate::image_publish`]). Running
-//! the result is a separate `agent-vm --image REF shell` operation (see
+//! It does **not** choose, adopt or boot an image, and the only record it changes
+//! besides the cache is the host approval of its own `--tag` (#391): it exports
+//! one anonymous OCI archive with `docker buildx build`, hands that archive to
+//! the native importer under `--tag`, then approves the content it published.
+//! Running the result is a separate `agent-vm --image REF shell` operation (see
 //! CONTEXT.md → *Boot image* / *Launcher*).
 //!
 //! ```text
@@ -17,10 +17,13 @@
 //! microsandbox_image::load_archive(cache, archive, tags=[result])
 //!         │  materializes content, publishes --tag (restored on failure)
 //!         ▼
+//! read back (shared barrier, cache only) → approve --tag (stderr old/new)
+//!         ▼
 //! result ref is launchable via `agent-vm --image result shell`
 //! ```
 //!
-//! Publication lives in [`crate::image_publish`].
+//! Publication lives in [`crate::image_publish`]; the approval of its result in
+//! [`crate::image_pin::approve_published`].
 
 use std::ffi::OsString;
 use std::io::Write as _;
@@ -91,6 +94,9 @@ pub(crate) struct Args {
 /// process exit code.
 pub(crate) async fn run(args: Args) -> Result<i32> {
     let target = ImageTarget::resolve().await?;
+    // HOME and a readable pin store are checked before Docker runs or the
+    // archive is published (R9): a damaged store must not cost a build.
+    crate::image_pin::publication_preflight(&args.tag)?;
     let staging = target.stage()?;
     let exit = export_archive(&args, staging.writer()?).await?;
     if exit != 0 {
@@ -104,10 +110,15 @@ pub(crate) async fn run(args: Args) -> Result<i32> {
         return Ok(exit);
     }
 
-    target
+    let published = target
         .publish(staging.path(), &args.tag)
         .await
         .context("importing build result")?;
+    // The command that supplied the bytes is the consent (#391). The read-back
+    // runs only now, after `publish`'s exclusive barrier is released.
+    #[allow(clippy::disallowed_methods)]
+    // `image build --tag` names the result it approves (#391).
+    crate::image_pin::approve_published(&published).await?;
     let shown = args.tag.shell_arg();
     let shell_note = crate::shell::note_parenthetical(&[&shown]);
     let _ = writeln!(

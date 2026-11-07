@@ -314,8 +314,12 @@ impl Harness {
         }
     }
 
-    /// Import genuine host-valid bytes through the public CLI. Import alone
-    /// must not create approval/default records; first launch still proves that.
+    /// Seed genuine host-valid bytes through the public CLI.
+    ///
+    /// Seeds the cache under a separate HOME, so this HOME holds no approval and
+    /// the first launch still establishes it: an explicit import approves its own
+    /// result reference (#391), and these rows are about what a *launch* writes.
+    /// The state directory is shared, which is where the cache lives.
     fn warm() -> Self {
         let h = Self::new();
         let archive = h.home_root.join("builder-image.tar");
@@ -360,6 +364,10 @@ impl Harness {
                 .unwrap();
         }
         std::fs::write(&archive, output.into_inner().unwrap()).unwrap();
+        let seed_home = tempfile::Builder::new()
+            .prefix("av-seed-home-")
+            .tempdir()
+            .unwrap();
         let out = h.builtin(
             &[
                 "image",
@@ -369,7 +377,7 @@ impl Harness {
                 "--tag",
                 BOGUS_IMAGE,
             ],
-            &[],
+            &[("HOME", seed_home.path().to_str().unwrap())],
         );
         assert!(
             out.status.success(),
@@ -377,9 +385,17 @@ impl Harness {
             stderr_of(&out)
         );
         assert!(
+            seed_home
+                .path()
+                .join(".config/agent-vm/image-pins.json")
+                .exists(),
+            "the fixture import approves its own result reference (#391)"
+        );
+        assert!(
             !h.home_root
                 .join(".config/agent-vm/image-pins.json")
-                .exists()
+                .exists(),
+            "the seeding HOME wrote no approval, so the first launch still pins"
         );
         h.assert_no_selection("fixture import");
         h
@@ -9382,11 +9398,22 @@ fn an_old_spelling_warm_cache_launch_is_registry_free() {
             .reply(GateReply::Continue);
         assert!(!launch.wait().status.success());
         if kind == "tag" {
-            assert_eq!(
-                std::fs::read_dir(&receipts).unwrap().count(),
-                0,
-                "cache-only validation must not invent a source binding"
-            );
+            // A cache-only validation records **content** evidence for the entry
+            // it validated (D11) -- that is what makes an approved digest
+            // repairable after an archive alias -- but it observes no registry
+            // association, so no receipt may claim one.
+            if let Ok(dir) = std::fs::read_dir(&receipts) {
+                for entry in dir {
+                    let receipt: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(entry.unwrap().path()).unwrap())
+                            .unwrap();
+                    assert_eq!(
+                        receipt["source_bindings"],
+                        serde_json::json!([]),
+                        "cache-only validation must not invent a source binding"
+                    );
+                }
+            }
         }
         assert!(
             h.msb_log()
@@ -9779,10 +9806,18 @@ fn a_warm_index_launch_without_a_receipt_consumes_the_child() {
         !stderr.contains("usable immutable identity"),
         "a launch consuming an unprovable association must not refuse it: {stderr}"
     );
-    assert!(
-        !receipts.exists(),
-        "consuming the cache must record no new identity claim"
-    );
+    // Consumption records **content** evidence for the entry it validated (D11),
+    // which is what a later archive alias needs to be repaired, and never a
+    // source binding: what the cache holds says nothing about where it came from.
+    for entry in std::fs::read_dir(&receipts).unwrap() {
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(entry.unwrap().path()).unwrap()).unwrap();
+        assert_eq!(
+            receipt["source_bindings"],
+            serde_json::json!([]),
+            "consuming the cache must record no new registry association"
+        );
+    }
 }
 
 /// Remove the materialized content behind a cached entry, keeping its metadata and

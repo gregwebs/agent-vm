@@ -2,10 +2,11 @@
 //!
 //! One selection key — the canonical OCI reference plus the host Linux platform
 //! — maps to the approved native manifest content. Everything a launch or a
-//! setup boots from a registry goes through [`prepare_selected`], and every
-//! deliberate re-resolution goes through [`update`]: there is one ordinary
-//! preparation and one explicit approval path, so no consumer can quietly
-//! acquire content the others would refuse.
+//! setup boots from a registry goes through [`prepare_selected`], every
+//! deliberate re-resolution goes through [`update`], and an explicit
+//! build/import approves its own published result through [`approve_published`]
+//! (#391): there is one ordinary preparation and one explicit approval path, so
+//! no consumer can quietly acquire content the others would refuse.
 //!
 //! # Approval normally precedes create
 //!
@@ -45,7 +46,10 @@ use crate::image_acquire::{
 pub(crate) use crate::image_acquire::{CanonicalOciReference, ValidatedDigest as ManifestDigest};
 
 mod approval;
+mod publication;
 mod store;
+
+pub(crate) use publication::{approve_published, publication_preflight};
 
 // `Option` normally accepts missing fields in serde. Version 1 requires the
 // field even when its value is null; deserialize_with disables that default.
@@ -449,6 +453,11 @@ pub(crate) async fn prepare_selected(boot: &BootImage) -> Result<PreparedSelecti
 
 /// The absent-approval branch: acquire the source itself, then establish the
 /// first pin before create.
+///
+/// The acquisition is cache-first ([`AcquireMode::CachedOrAcquire`]), so this
+/// first pin leaves content evidence for the digest it records: a warm cache hit
+/// writes the receipt a later repair reads, which keeps the new approval
+/// launchable offline even if an archive overwrites the digest-spelled key.
 async fn prepare_first_pin(
     boot: &BootImage,
     target: &OciTarget,
@@ -748,6 +757,9 @@ enum Rendering {
     /// `image set-default`'s typed target: closed stage text only, plus the
     /// retained-default guarantee the command promises.
     Explicit,
+    /// An explicit build/import reading back what it just published: the
+    /// explicit chain, and never the import hint — the command *is* the import.
+    Publication,
 }
 
 /// Render an acquisition failure for one selection without leaking a redacted
@@ -763,6 +775,13 @@ fn render_failure(
             "{}; this command did not change the retained default",
             error.redacted_message()
         );
+    }
+    // A build/import read-back cannot fail on a registry (its mode never
+    // contacts one), so the hint could not fire anyway; the variant keeps that
+    // structural rather than incidental, so a future mode change cannot print
+    // "import it with --docker" straight after an import.
+    if rendering == Rendering::Publication {
+        return error.into_explicit_error();
     }
     if label.is_redacted() {
         return match error {
@@ -1202,6 +1221,53 @@ mod tests {
     fn approval_modes_come_from_one_yes_reading() {
         assert_eq!(ApprovalMode::of_flag(true), ApprovalMode::Yes);
         assert_eq!(ApprovalMode::of_flag(false), ApprovalMode::Ask);
+    }
+
+    /// A build/import read-back renders the explicit chain and never the import
+    /// hint: the command *is* the import. Differential, so dropping the arm is
+    /// visible rather than silently equal.
+    #[test]
+    fn publication_failures_keep_the_explicit_chain_without_the_import_hint() {
+        let label = ImageLabel::for_result_reference("example.com/team/app:dev");
+        let pull = || AcquireError::Native {
+            stage: crate::image_acquire::AcquireStage::Pull,
+            source: microsandbox_image::ImageError::Registry(
+                std::io::Error::other("Not authorized").into(),
+            ),
+        };
+        let selection = format!(
+            "{:#}",
+            render_failure(&label, Rendering::Selection, label.text(), pull())
+        );
+        assert!(selection.contains("image import"), "{selection}");
+
+        let publication = format!(
+            "{:#}",
+            render_failure(&label, Rendering::Publication, label.text(), pull())
+        );
+        assert!(
+            !publication.contains("image import"),
+            "an import must not be told to import: {publication}"
+        );
+        assert!(
+            publication.contains("Not authorized"),
+            "the explicit chain is kept: {publication}"
+        );
+
+        let miss = format!(
+            "{:#}",
+            render_failure(
+                &label,
+                Rendering::Publication,
+                label.text(),
+                AcquireError::NotCached
+            )
+        );
+        assert!(
+            miss.contains("never contacts a registry"),
+            "the read-back's own miss text: {miss}"
+        );
+        assert!(!miss.contains("image import"), "{miss}");
     }
 
     #[test]

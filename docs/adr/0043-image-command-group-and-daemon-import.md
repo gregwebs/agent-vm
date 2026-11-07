@@ -7,9 +7,9 @@ decision (#260); implements #359. Amended in **0.6.9** by #385 (defaulted
 import tag, selection-aware import completion). Amended in **0.7.0** by #389:
 `image refresh` (boot-free native acquisition) and `image set-default` join the
 group, and no top-level `pull`/`upgrade` alias exists. Amended in **0.7.2** by
-#390: both update verbs take a nested `--yes` (candidate replacement consent),
-and import/build publication is explicitly outside the host approval authority
-(#391).
+#390: both update verbs take a nested `--yes` (candidate replacement consent).
+Amended in **0.7.34** by #391: an explicit build/import approves its own result
+reference, prompt-free.
 
 ## Context
 
@@ -50,14 +50,21 @@ Docker daemon / archive → image import ─────────────
   `--yes`. A first pin or an unchanged digest ignores it. This is digest-
   replacement consent, not the removed composition/build `--yes` [ADR-0035](0035-consume-user-owned-boot-images.md)
   rejected.
-- **Import/build are outside approval (#391 staging).** Both verbs remain
-  cache-publication surfaces: they create no host pin and never replace an
-  existing approval or the retained default. Importing over a tag that is
-  already approved therefore does not approve the imported bytes; only an
-  explicit `image refresh --image REF` (prompt or `--yes`) moves the pin. A
-  daemon-only image may have no registry content to refresh, so it cannot be
-  approved through refresh — a documented limitation rather than a reason to
-  let an alias publication decide.
+- **Import/build approve only their result reference (#391).** Each publishes
+  cache content *and* approves exactly the one reference its own argument names —
+  a build's `--tag`, or an import's `--tag` or inferred `--docker` source — at
+  the content it published, for the host Linux platform. No prompt and no
+  `--yes`: the command that supplied the bytes is the consent. The change is
+  rendered on stderr before it is committed, and an unchanged approval is
+  neither rewritten nor rendered. Archive-carried aliases are published to the
+  cache but never approved, and neither verb adopts or moves the retained
+  default (the store's own journal recovery of an interrupted run — which any
+  explicit image write performs — is the one write that may, and it adopts
+  nothing). The approval runs after the
+  exclusive publication barrier is released, because its cache-only read-back
+  takes the shared barrier: approving inside `publish` would self-deadlock. A
+  published result that cannot be validated for this host is not approved, and
+  the command exits nonzero saying the image was published but not approved.
 
 ### Publication semantics
 
@@ -67,13 +74,21 @@ multi-image archive is published under its own names; `--tag` names the first.
 References commit one at a time, not as an atomic one-target publication.
 On failure, `image_publish` restores the requested tag's previous metadata (or
 removes it if new). Aliases are not restored; native blobs may remain. A failed
-rollback reports both errors. Process termination mid-import and concurrent
-publication of the same reference are not covered: rollback can revert a
-concurrent writer, and the native loader takes no publication lock. **None of
-this can change launch content under an existing pin**: the approval is
-separate from the cache, and a pinned launch validates the approved `repo@child`
-entry before the SDK consumes it (restoring it from its cache-only receipt when
-an alias overwrote the metadata).
+rollback reports both errors. Process termination mid-import is not covered, and
+neither is a concurrent writer that takes no publication barrier: rollback can
+revert a direct SDK client or an older binary, because the native loader itself
+takes no lock. Participating `image build`/`image import` runs do serialize on
+that barrier, whatever reference each names — each holds it exclusively from its
+requested-alias snapshot through the loader and its rollback. **Only the
+result reference the command itself approves can change launch content under an
+existing pin** (#391): every other name is cache evidence, and a pinned launch
+validates the approved `repo@child` entry before the SDK consumes it, restoring
+it from its content receipt when an alias overwrote the metadata. Every cache
+entry this binary validates leaves such a receipt; an approval created by an
+older binary has none until a launch re-validates its content, and if an archive
+overwrote that digest key first, nothing on the host recorded what it held —
+the launch then reports the approved content as unavailable instead of falling
+back to the tag.
 
 ### Output and diagnostics
 
@@ -81,7 +96,9 @@ Both completion notices go to stdout; stderr carries errors and Docker output.
 This moves build's notice from stderr. Import parse diagnostics are replaced
 with fixed value-free text (exit 2); build retains clap's diagnostics. Printed
 commands use one bash/zsh shell word per reference (`$'…'` for non-ASCII), so
-accepted spellings remain copy-pasteable without terminal control bytes.
+accepted spellings remain copy-pasteable without terminal control bytes. The
+#391 approval render is excluded from that rule: it is display text on stderr,
+terminal-escaped for safety and deliberately not pasteable.
 
 #385 makes import's completion **selection-aware**, and only after publication:
 import observes the selection once through the same typed selector and
@@ -104,8 +121,11 @@ own diagnostics.
 - Auto-import or `docker image inspect` at launch: rejected, violates ADR-0035.
 - Keep `build` as an alias: rejected, violates ADR-0042's single surface.
 - Give import/build an automatic or implicit approval: rejected; an archive can
-  name an unknown alias set, and silently authorizing one would recreate the
-  #390 defect. An explicit import approval, if wanted, is #391.
+  name an unknown alias set, and silently authorizing any of them would recreate
+  the #390 defect. Approving the one reference the command names was accepted in
+  #391 — the command names it explicitly, so the command is the consent.
+- Approve every archive-supplied name: rejected, same unknown alias set, and no
+  argument names it.
 - Replace the registry error with the hint: rejected, loses network/TLS detail.
 - Patch the vendored loader or reimplement one-target import: rejected; keep
   native `msb image load` parity and accept documented aliases (user decision).
@@ -120,10 +140,11 @@ Scripts reading its notice from stderr must read stdout. See the
 Importing `--docker src --tag dst` also leaves `src` in agent-vm's cache.
 The `msb image load` passthrough is unchanged and still has catalog semantics.
 
-From #390, an import or build that publishes over an approved tag does not switch
-a launch to the new bytes: approve the change explicitly with
-`agent-vm image refresh --image REF` (prompt or `--yes`), or select the imported
-result with `--image`. A daemon-only image has no registry source to refresh; it
-must be selected explicitly and its first selection becomes the pin. The
-multi-alias rollback limitation above still applies to the cache, not to
-approval.
+From #391, a rebuild or re-import under an approved result reference switches the
+next launch of that reference to the new bytes, with no prompt and no registry
+request. Importing over an *alias* does not: an archive-supplied name never
+approves anything, so a reference approved earlier keeps its digest until that
+reference is itself published or refreshed. A daemon-only image therefore needs
+no `image refresh` to become launchable — importing it under the reference you
+will select is enough. The multi-alias rollback limitation above still applies
+to the cache, not to approval.

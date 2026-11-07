@@ -7325,6 +7325,7 @@ custom_image_host_pins() {
   local proj live out reads_before reads_after deadline target ready=0
   local live_pid=0 identity="" tick="" rootid="" tag_before digest_before b_before
   local cold_state cold_proj default_home default_state rootfs pin_snapshot default_snapshot docker_host
+  local pins_revision_before explicit_snapshot
   # The group's own precondition is Apple Silicon, so the measured host platform
   # these pins are keyed by is exactly linux/arm64.
   local host_arch="arm64"
@@ -7475,20 +7476,32 @@ custom_image_host_pins() {
     result=1
   fi
 
-  # ---- an import alias over the pinned tag does not switch the guest ----
+  # ---- an archive alias over the pinned tag does not switch the guest (#391) ----
+  # The archive carries the pinned tag as one of its own names (a Docker-save
+  # RepoTag), while the command names a *different* result reference. Only the
+  # named result reference is approved, so the pinned tag's record is untouched.
   pins_env "$WORK/pins-home" "$WORK/pins-state"
   pin_snapshot="$(cat "$(pins_store)")"
+  docker tag "$CUSTOM_STAMP" "$tag" || result=1
   DOCKER_HOST="$docker_host" DOCKER_CONFIG="$PINS_HOME/docker" \
-    pins_avm image import --docker "$CUSTOM_STAMP" --tag "$tag" \
+    pins_avm image import --docker "$tag" \
+      --tag "localhost:$port/$repo:alias-result" \
     >"$WORK/pins-import.out" 2>&1 || {
-    echo "    FAIL: importing fixture B over the pinned tag failed"
+    echo "    FAIL: importing an archive that aliases the pinned tag failed"
     cat "$WORK/pins-import.out"
     result=1
   }
-  assert_eq "import leaves the approval bytes unchanged" "$pin_snapshot" "$(cat "$(pins_store)")" || result=1
+  if ! jq -e --arg r "$tag" '.pins[] | select(.reference == $r)' \
+    <<<"$pin_snapshot" >/dev/null 2>&1; then
+    echo "    FAIL: the pinned tag had no record before the alias import"
+    result=1
+  fi
+  assert_eq "an archive alias leaves the pinned tag's approval unchanged" \
+    "$(jq -c --arg r "$tag" '.pins[] | select(.reference == $r)' <<<"$pin_snapshot")" \
+    "$(jq -c --arg r "$tag" '.pins[] | select(.reference == $r)' "$(pins_store)")" || result=1
   pins_launch pins-after-import "$proj" --image "$tag" hello-258 || result=1
   require_launch_ok pins-after-import || result=1
-  assert_eq "an import alias cannot swap the pinned guest" "stamp=absent" \
+  assert_eq "an archive alias cannot swap the pinned guest" "stamp=absent" \
     "$(pins_stamp pins-after-import)" || result=1
 
   # ---- a live A guest keeps running while the tag moves and nothing probes it ----
@@ -7645,9 +7658,12 @@ custom_image_host_pins() {
     cat "$WORK/pins-approve.out"
     result=1
   }
+  # A replacement appends the record (`store.rs` keeps the others, then pushes),
+  # and the alias import above added another record, so select by reference.
   if ! jq -e --arg ref "$tag" --arg digest "$digest_b" \
-    '.pins[0].reference == $ref and .pins[0].manifest_digest == $digest
-     and .pins[0].revision >= 2' "$(pins_store)" >/dev/null 2>&1; then
+    '[.pins[] | select(.reference == $ref)]
+     | length == 1 and .[0].manifest_digest == $digest and .[0].revision >= 2' \
+    "$(pins_store)" >/dev/null 2>&1; then
     echo "    FAIL: the approved pin does not name the frozen candidate B"
     cat "$(pins_store)" 2>/dev/null || true
     result=1
@@ -7705,6 +7721,62 @@ custom_image_host_pins() {
     "$(grep '^declared=' <<<"$out")" || result=1
   assert_eq "B reads the first launch's HOME file" "plain=pins-sentinel" \
     "$(grep '^plain=' <<<"$out")" || result=1
+
+  # ---- an explicit import of the pinned tag moves the guest (#391) ----
+  # $tag is approved at B. Importing A's bytes under $tag is the command naming
+  # the result reference, so it approves that reference: no prompt, old/new on
+  # stderr, revision +1, and the next launch boots A with no registry read.
+  pins_env "$WORK/pins-home" "$WORK/pins-state"
+  pin_snapshot="$(cat "$(pins_store)")"
+  pins_revision_before="$(jq -r --arg r "$tag" \
+    '.pins[] | select(.reference == $r) | .revision' "$(pins_store)")" || result=1
+  DOCKER_HOST="$docker_host" DOCKER_CONFIG="$PINS_HOME/docker" \
+    pins_avm image import --docker "$CUSTOM_MARKER" --tag "$tag" \
+    >"$WORK/pins-explicit-import.out" 2>&1 || {
+    echo "    FAIL: an explicit import of the pinned tag failed"
+    cat "$WORK/pins-explicit-import.out"
+    result=1
+  }
+  assert_match "the explicit import renders the approved predecessor" \
+    "  old: $digest_b" "$(cat "$WORK/pins-explicit-import.out")" || result=1
+  # The Docker-save manifest digest is synthesized by the native loader, so it is
+  # not $digest_a; only the shape and the change are asserted.
+  assert_match "the explicit import renders the new digest" \
+    "  new: sha256:" "$(cat "$WORK/pins-explicit-import.out")" || result=1
+  assert_no_match "an explicit import never prompts" \
+    "Approve this exact image change" "$(cat "$WORK/pins-explicit-import.out")" || result=1
+  if ! jq -e --arg r "$tag" --arg old "$digest_b" \
+    '.pins[] | select(.reference == $r)
+     | .manifest_digest != $old' "$(pins_store)" >/dev/null 2>&1; then
+    echo "    FAIL: the explicit import did not move the pinned tag off B"
+    cat "$(pins_store)" 2>/dev/null || true
+    result=1
+  fi
+  assert_eq "the explicit import bumps the revision by one" \
+    "$(( pins_revision_before + 1 ))" \
+    "$(jq -r --arg r "$tag" '.pins[] | select(.reference == $r) | .revision' \
+      "$(pins_store)")" || result=1
+  reads_before="$(registry_read_count "$container")" || result=1
+  pins_launch pins-explicit-import "$proj" --image "$tag" hello-258 || result=1
+  require_launch_ok pins-explicit-import || result=1
+  assert_eq "an explicit import moves what the next launch boots" "stamp=absent" \
+    "$(pins_stamp pins-explicit-import)" || result=1
+  reads_after="$(registry_read_count "$container")" || result=1
+  assert_eq "the moved approval costs no registry read" "$reads_before" "$reads_after" || result=1
+  # The same import again is an unchanged approval: no write, no render.
+  explicit_snapshot="$(cat "$(pins_store)")"
+  DOCKER_HOST="$docker_host" DOCKER_CONFIG="$PINS_HOME/docker" \
+    pins_avm image import --docker "$CUSTOM_MARKER" --tag "$tag" \
+    >"$WORK/pins-explicit-reimport.out" 2>&1 || {
+    echo "    FAIL: repeating the explicit import failed"
+    cat "$WORK/pins-explicit-reimport.out"
+    result=1
+  }
+  assert_eq "repeating the explicit import leaves the store byte-identical" \
+    "$explicit_snapshot" "$(cat "$(pins_store)")" || result=1
+  assert_no_match "an unchanged approval renders nothing" \
+    "Approving the image published as" "$(cat "$WORK/pins-explicit-reimport.out")" || result=1
+  pin_snapshot="$(cat "$(pins_store)")"
 
   # ---- local paths bypass approval (one invariant) ----
   # The invariant this row proves is the local/OCI boundary itself: a local
@@ -8006,10 +8078,10 @@ custom_explicit_build_workflow() {
     "$AGENT_VM" image build --tag "$BUILD_REF" --builder "$BUILDER" --target stamp-present "$FIXTURE_DIR") || return 1
   [ ! -e "$WORK/rebuild260.oci.tar.error" ] || return 1
   python3 "$REPO_ROOT/script/test/fixtures/build-archive-oracle.py" "$WORK/rebuild260.oci.tar" > "$WORK/rebuild260.report.json" || return 1
-  # #391 staging: the successful build published a new alias, but an established
-  # pin is not replaced by a cache publication. The launch stays on the approved
-  # marker-free child; a fresh HOME with no approval sees the rebuilt content.
-  explicit_boot build260-replaced absent --no-git --image "$BUILD_REF" shell hello-258 || return 1
+  # #391: an explicit build approves the result reference it published, so the
+  # established pin for `$BUILD_REF` moved to the rebuilt content and this launch
+  # boots it. A fresh HOME with no approval sees the same rebuilt content.
+  explicit_boot build260-replaced present --no-git --image "$BUILD_REF" shell hello-258 || return 1
   local rebuilt_home="$WORK/bh-rebuilt"
   BUILD_HOME="$rebuilt_home" BUILD_STATE="$original_state" BUILD_PROJECT="$original_project"
   explicit_boot build260-rebuilt-fresh present --no-git --image "$BUILD_REF" shell hello-258 || return 1

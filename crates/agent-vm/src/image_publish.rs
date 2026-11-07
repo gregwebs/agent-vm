@@ -27,9 +27,15 @@
 //! Publication takes the cache-wide **exclusive** publication barrier, so no
 //! shared preparation is reading metadata while aliases move and two
 //! publications cannot interleave their rollbacks.
+//!
+//! `publish` returns what it published — canonical result reference and manifest
+//! digest — and holds no barrier afterwards; approval is the caller's separate,
+//! explicit step (#391), because the read-back takes the shared barrier and would
+//! deadlock under this exclusive one.
 
 use crate::boot_image::ImageRef;
 use crate::config::escape_str;
+use crate::image_acquire::ValidatedDigest;
 use anyhow::{Context, Result, anyhow};
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
@@ -176,7 +182,15 @@ impl ImageTarget {
     ///
     /// Only `result` is restored: an alias the archive named may already have
     /// changed (user decision, see the module's publication guarantees).
-    pub(crate) async fn publish(&self, archive: &Path, result: &ResultReference) -> Result<()> {
+    ///
+    /// On success the returned [`Published`] names exactly `result` and the
+    /// digest the loader wrote for it; nothing in it names an alias, so a caller
+    /// cannot approve a reference this command did not publish.
+    pub(crate) async fn publish(
+        &self,
+        archive: &Path,
+        result: &ResultReference,
+    ) -> Result<Published> {
         // The requested reference is the ONE canonical acquisition key, so an
         // import under an equivalent spelling (`alpine:dev`,
         // `registry-1.docker.io/alpine:dev`) lands where a launch/refresh will
@@ -213,19 +227,95 @@ impl ImageTarget {
             &self.cache_dir,
             archive,
             microsandbox_image::ImageLoadOptions {
-                tags: vec![requested],
+                tags: vec![requested.clone()],
                 progress: None,
             },
         )
         .await
         {
-            Ok(_) => Ok(()),
+            // Post-publication: the loader committed, so a missing identity is
+            // reported as published-but-not-approved, never as a rolled-back
+            // import (D1).
+            Ok(loaded) => {
+                let digest = published_identity(
+                    loaded.iter().map(|image| {
+                        (
+                            image.reference.as_str(),
+                            image.metadata.manifest_digest.as_str(),
+                        )
+                    }),
+                    &requested,
+                )?;
+                Ok(Published { target, digest })
+            }
             Err(import) => match restore_reference(&path, &prior) {
                 Ok(()) => Err(import.into()),
                 Err(restore) => Err(failed_publication(import, restore, result)),
             },
         }
     }
+}
+
+/// What one explicit publication put under its result reference: the canonical
+/// target and the manifest digest the native loader reported for it.
+///
+/// Holds no barrier, so nothing reachable from it runs under the exclusive
+/// guard. Constructed only by [`ImageTarget::publish`], which is why the digest
+/// here cannot be a value the caller chose.
+pub(crate) struct Published {
+    target: crate::image_acquire::OciTarget,
+    digest: ValidatedDigest,
+}
+
+impl Published {
+    pub(crate) fn target(&self) -> &crate::image_acquire::OciTarget {
+        &self.target
+    }
+
+    pub(crate) fn digest(&self) -> &ValidatedDigest {
+        &self.digest
+    }
+}
+
+impl std::fmt::Debug for Published {
+    /// Never renders the reference: a result reference can name a private
+    /// registry, and `Debug` reaches logs the escaped diagnostics do not.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Published(<redacted reference>)")
+    }
+}
+
+/// The published-but-not-approved sentence (#391, G4), defined once: the
+/// identity hand-off below and every post-read-back failure in
+/// `image_pin::publication::approve_published` attach it. `reference` is already
+/// escaped (`escape_str`, the spelling `ImageLabel::for_result_reference` shows).
+pub(crate) fn approval_not_updated(reference: &str) -> String {
+    format!(
+        "{reference} was published to agent-vm's image cache, but its approval was not \
+         updated, so a launch still boots the content previously approved for it, if any"
+    )
+}
+
+/// The manifest digest the loader reported for exactly the requested key.
+///
+/// Failure happens **after** the loader committed, so it says so rather than
+/// looking like a failed import. Takes `(reference, manifest digest)` pairs
+/// rather than `LoadedImage` so its unit test needs no native metadata.
+fn published_identity<'a>(
+    loaded: impl IntoIterator<Item = (&'a str, &'a str)>,
+    requested: &str,
+) -> Result<ValidatedDigest> {
+    loaded
+        .into_iter()
+        .find(|(reference, _)| *reference == requested)
+        .and_then(|(_, digest)| ValidatedDigest::parse(digest).ok())
+        .ok_or_else(|| {
+            anyhow!(
+                "internal error: the native loader did not report a usable manifest digest for \
+                 the published result reference, so its content cannot be approved"
+            )
+        })
+        .with_context(|| approval_not_updated(&escape_str(requested)))
 }
 
 /// Removed (recursively) when dropped.
@@ -403,9 +493,97 @@ mod tests {
 }
 
 #[cfg(test)]
+#[path = "../tests/support/image_archive.rs"]
+mod test_archive;
+
+#[cfg(test)]
 mod publication_tests {
     use super::*;
     use std::os::unix::fs::MetadataExt as _;
+
+    /// Publishing never approves: the shared helper has no approval side effect,
+    /// so a verb that reuses it (a future `--dockerfile` launch build, say)
+    /// inherits none. A `.config` directory appearing here would mean some
+    /// approval code moved inside `publish`.
+    #[test]
+    fn publication_alone_never_writes_an_approval() {
+        let mut env = crate::test_env::guard();
+        let home = tempfile::tempdir().unwrap();
+        env.set_var("HOME", home.path());
+        let root = tempfile::tempdir().unwrap();
+        let archive_dir = tempfile::tempdir().unwrap();
+        let written = test_archive::write(
+            &archive_dir.path().join("a.tar"),
+            &test_archive::ArchiveSpec::default(),
+        );
+        let target = ImageTarget {
+            cache_dir: root.path().join("cache"),
+            msb_home: root.path().to_path_buf(),
+        };
+        let published = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(target.publish(&written.path, &"app:dev".parse().unwrap()))
+            .unwrap();
+        assert_eq!(published.digest().as_str(), written.manifest_digest);
+        assert_eq!(
+            published.target().canonical().whole(),
+            "docker.io/library/app:dev"
+        );
+        assert!(
+            !home.path().join(".config").exists(),
+            "publication wrote a HOME approval record"
+        );
+    }
+
+    /// The identity hand-off failure happens **after** the loader committed, so
+    /// it says so and keeps the internal cause: a bare internal error would read
+    /// as a failed import and lose the reason.
+    #[test]
+    fn an_unidentified_publication_is_reported_as_published_but_not_approved() {
+        let first = format!("sha256:{}", "a".repeat(64));
+        let second = format!("sha256:{}", "b".repeat(64));
+        // An alias listed first must not be mistaken for the requested key.
+        assert_eq!(
+            published_identity(
+                [
+                    ("docker.io/library/z:alias", first.as_str()),
+                    ("docker.io/library/app:dev", second.as_str()),
+                ],
+                "docker.io/library/app:dev",
+            )
+            .unwrap()
+            .as_str(),
+            second
+        );
+
+        for loaded in [
+            vec![("docker.io/library/z:alias", first.as_str())],
+            vec![("docker.io/library/app:dev", "not-a-digest")],
+        ] {
+            let error = published_identity(loaded, "docker.io/library/app:dev").unwrap_err();
+            let shown = format!("{error:#}");
+            assert!(
+                shown.contains(
+                    "docker.io/library/app:dev was published to agent-vm's image cache, but its \
+                     approval was not updated"
+                ),
+                "the context sentence must name the escaped reference: {shown}"
+            );
+            assert!(
+                shown.contains(
+                    "internal error: the native loader did not report a usable manifest digest"
+                ),
+                "the internal cause must be preserved: {shown}"
+            );
+        }
+
+        // The reference in the sentence is escaped, like every other diagnostic
+        // spelling this crate renders.
+        let error = published_identity([], "docker.io/library/\x1bapp:dev").unwrap_err();
+        let shown = format!("{error:#}");
+        assert!(!shown.contains('\u{1b}'), "no raw control byte: {shown}");
+        assert!(shown.contains("\\x1b"), "the escape is visible: {shown}");
+    }
 
     #[test]
     fn stage_creates_private_dir_and_empty_0600_file() {

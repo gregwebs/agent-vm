@@ -6,8 +6,10 @@
 //! here would select, so it is dispatched before runtime discovery and setup
 //! (see `main`). `refresh` acquires bytes natively and never boots. `build`/
 //! `import` are the explicit user-owned publication verbs from ADR-0043; only
-//! they may invoke Docker. `import` additionally *observes* the selection after
-//! publishing (#385) — it never changes it.
+//! they may invoke Docker. They are also the only verbs that approve a
+//! **replacement** without either a prompt or `--yes`: each approves exactly
+//! its own result reference (#391). `import` additionally *observes* the
+//! selection after publishing (#385) — it never changes it.
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Args as ClapArgs, Subcommand};
@@ -79,9 +81,11 @@ pub(crate) enum ImageCmd {
     /// recommendation never chooses it. Overrides and running sessions are
     /// unchanged.
     SetDefault(crate::boot_image::upgrade::Args),
-    /// Explicitly build a Dockerfile and import the result into agent-vm's image cache.
+    /// Explicitly build a Dockerfile, import the result into agent-vm's image
+    /// cache and approve it for its `--tag`.
     Build(crate::image_build::Args),
-    /// Import a finished image from the local Docker daemon or an archive into agent-vm's image cache.
+    /// Import a finished image from the local Docker daemon or an archive into
+    /// agent-vm's image cache and approve it for its result reference.
     Import(crate::image_import::Args),
 }
 

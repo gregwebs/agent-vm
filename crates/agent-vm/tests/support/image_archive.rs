@@ -106,6 +106,17 @@ pub struct ArchiveSpec {
     /// Empty means the `Labels` key is omitted, which is what every unlabeled
     /// image ships.
     pub labels: Vec<(String, String)>,
+    /// A manifest-level annotation value. `Some` changes the manifest digest
+    /// without touching config bytes or diff IDs, which is exactly the
+    /// "different manifest digest, same guest content" case approval
+    /// equivalence has to recognize (#391).
+    pub manifest_annotation: Option<String>,
+    /// The OCI config's `variant` field (e.g. `v8`). `None` omits it, which is
+    /// what every pre-existing fixture did; real arm64 images written by the
+    /// Docker daemon (`docker save` of a classic build, `docker import`) always
+    /// declare one, so this knob is the difference between a fixture shape and a
+    /// real archive.
+    pub config_variant: Option<String>,
 }
 
 impl Default for ArchiveSpec {
@@ -117,6 +128,8 @@ impl Default for ArchiveSpec {
             layer: LayerContent::Valid,
             omit_layer_blob: false,
             labels: Vec::new(),
+            manifest_annotation: None,
+            config_variant: None,
         }
     }
 }
@@ -166,6 +179,7 @@ pub fn write(path: &Path, spec: &ArchiveSpec) -> Written {
         config_bytes.len(),
         &layer_digest,
         declared.len(),
+        spec.manifest_annotation.as_deref(),
     );
     let manifest_digest = sha256_hex(&manifest_bytes);
 
@@ -208,6 +222,9 @@ fn config_json(spec: &ArchiveSpec, diff_id: &str) -> Vec<u8> {
         doc.insert("os".to_string(), os.into());
         doc.insert("architecture".to_string(), arch.into());
     }
+    if let Some(variant) = &spec.config_variant {
+        doc.insert("variant".to_string(), variant.clone().into());
+    }
     let mut config = serde_json::Map::new();
     config.insert(
         "Env".to_string(),
@@ -238,8 +255,9 @@ fn manifest_json(
     config_size: usize,
     layer_digest: &str,
     layer_size: usize,
+    annotation: Option<&str>,
 ) -> Vec<u8> {
-    serde_json::to_vec(&serde_json::json!({
+    let mut manifest = serde_json::json!({
         "schemaVersion": 2,
         "mediaType": "application/vnd.oci.image.manifest.v1+json",
         "config": {
@@ -252,8 +270,11 @@ fn manifest_json(
             "digest": layer_digest,
             "size": layer_size,
         }],
-    }))
-    .expect("serialize manifest")
+    });
+    if let Some(annotation) = annotation {
+        manifest["annotations"] = serde_json::json!({ "org.agent-vm.test.variant": annotation });
+    }
+    serde_json::to_vec(&manifest).expect("serialize manifest")
 }
 
 fn index_json(spec: &ArchiveSpec, manifest_digest: &str, manifest_size: usize) -> Vec<u8> {
@@ -330,6 +351,46 @@ fn hex_lower(bytes: &[u8]) -> String {
 pub struct DockerSaveImage {
     pub marker: String,
     pub repo_tags: Option<Vec<String>>,
+}
+
+/// The OCI manifest a docker-save import synthesizes for one fixture image, and
+/// its digest.
+///
+/// `docker save` carries no image manifest, so the native importer builds one
+/// from the config descriptor and the layer descriptors
+/// (`archive/docker.rs:913-924`). Deriving those bytes here — from the fixture's
+/// own config and layer, never from a cache or a store — gives a test an
+/// expected identity for a docker-save import that is independent of the code
+/// path under test. The layer is an uncompressed tar, so its media type is the
+/// plain OCI layer type.
+pub fn docker_save_manifest(marker: &str) -> (Vec<u8>, String) {
+    let layer = layer_tar(marker);
+    let layer_digest = sha256_hex(&layer);
+    let config = config_json(
+        &ArchiveSpec {
+            marker: marker.to_string(),
+            ..Default::default()
+        },
+        &layer_digest,
+    );
+    let config_digest = sha256_hex(&config);
+    let manifest = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": config_digest,
+            "size": config.len(),
+        },
+        "layers": [{
+            "mediaType": "application/vnd.oci.image.layer.v1.tar",
+            "digest": layer_digest,
+            "size": layer.len(),
+        }],
+    }))
+    .expect("serialize the synthesized manifest");
+    let digest = sha256_hex(&manifest);
+    (manifest, digest)
 }
 
 pub fn write_docker_save(path: &Path, images: &[DockerSaveImage]) -> Vec<Written> {

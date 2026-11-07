@@ -1099,7 +1099,9 @@ pin — while staying write-once, so an existing record is never moved by a laun
 is keyed by its canonical reference plus the host Linux platform in
 `image-pins.json`. A launch or setup consumes the approved host child and never
 resolves the selected tag; only `image refresh` and `image set-default`
-re-resolve and ask. The store is host-wide (projects and state roots share it)
+re-resolve and ask, and `image build`/`image import` approve the result reference
+they just published without asking (#391). The store is host-wide (projects and
+state roots share it)
 and holds no cache path, timestamp or launcher version: deleting the cache
 reacquires the approved digest, and deleting the store is a deliberate approval
 reset. Local rootfs/disk launches bypass this path with their text unchanged.
@@ -1329,9 +1331,14 @@ against power loss, and older binaries do not know about it.
 **What stays outside approval.** The cache receipt is cache evidence: it proves
 which child a digest-stated source was validated against and repairs metadata an
 alias overwrote, and deleting the cache deletes only receipts. Native cache
-publication from import/build takes the exclusive barrier but can never create or
-replace a HOME pin or fallback (#391). Local rootfs/disk launches never enter
-this module. See
+publication from import/build takes the exclusive barrier and rolls back only the
+requested reference; the archive aliases it also publishes can never create or
+replace a HOME pin, and neither verb adopts or moves the fallback (the store's
+journal recovery of an interrupted run is the one write that may, and it adopts
+nothing). The one approval a publication does cause is separate from it: after
+the exclusive barrier is released, `image_pin::approve_published` reads the
+result reference back from the cache and commits exactly that record (#391).
+Local rootfs/disk launches never enter this module. See
 [ADR-0047](docs/adr/0047-host-wide-oci-image-approval.md) for the decision and
 its rejected alternatives.
 
@@ -1342,7 +1349,11 @@ its rejected alternatives.
 - **shared** for acquisition/validation, canonical metadata and receipt writes,
   launch and setup through the SDK's cache consumption, and explicit refresh;
 - **exclusive** for archive publication (import/build) from the requested-alias
-  snapshot through the loader or its rollback.
+  snapshot through the loader or its rollback;
+- the publication's read-back is a **shared** holder taken after the exclusive
+  guard is dropped — never an upgrade. A second descriptor in the same process
+  would wait forever behind its own exclusive lock, which is why approval of the
+  published result is a separate call the verb makes after `publish` returns.
 
 Lock order is one hierarchy, never host→cache: publication barrier → reference
 guards sorted by native metadata-key bytes → native per-reference pull lock →
@@ -1358,10 +1369,13 @@ nested inside a cache reference guard: `image-pins.lock` (exclusive) → retaine
 pin commits while the preparation still holds the shared barrier, so validated
 content cannot be republished away between validation and commit; an explicit
 update revalidates its frozen candidate under a fresh shared barrier immediately
-before the transaction. Network I/O and the human prompt
-never run under a HOME lock; a shared cache holder therefore never blocks on a
-human, and an EX cache publisher cannot starve a bounded reader beyond its
-deadline.
+before the transaction. Network I/O and the human prompt never run under a HOME
+lock, so a shared cache holder never blocks on a human decision, and a peer
+waiting for the HOME lock gives up at its bound (2 s for a read, 30 s for a
+mutation). The publication barrier itself has **no** deadline by design
+(`image_acquire/barrier.rs`), so an EX archive publisher can make a shared
+holder wait for as long as that publication runs; what is bounded is the HOME
+lock acquisition, not end-to-end cache preparation.
 
 The reference guard is a persistent sibling of the native reference metadata in
 the **actual backend cache**, keyed by the canonical reference. It serializes
@@ -1396,10 +1410,12 @@ not recompile the launcher. Users explicitly build/import through
 `image_publish`):
 
 ```text
-main input preflight → MSB prologue → ambient cache → completed export/save/archive
+main input preflight → MSB prologue → ambient cache → pin-store preflight
+  → completed export/save/archive
   → exclusive publication barrier
   → native materialization → sequential tag/alias publication
                             → on failure: restore requested tag only
+  → EX released → shared read-back (cache only) → approve result ref (render, CAS)
 ```
 
 Failed exporters never import, even if complete bytes were emitted. Native
@@ -1413,8 +1429,13 @@ successful publication it observes the selection once, through the same
 `boot_image` selector and environment rule as `image show`, so a result
 reference the configuration already selects prints no launch guidance (#385).
 Build consults no selection. Neither verb writes configuration, adopts a
-default, boots or acquires anything; a failed observation leaves the completed
-import successful and only adds the `image show` hint. See [the canonical user
+default or boots; the only acquisitions either makes are cache-only reads of its
+own result reference and, when a replacement has to be decided, of the content
+previously approved for it, and the only `HOME` write is that result
+reference's approval — plus the store's own journal recovery of an interrupted
+run, which any explicit image write performs (#390) and which adopts no new
+default. A failed observation leaves the completed import successful and only
+adds the `image show` hint. See [the canonical user
 contract](USAGE.md#explicit-builds-and-archive-import) for driver limitations,
 archive workflows and host-build trust.
 

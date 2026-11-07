@@ -21,6 +21,19 @@
 //! `PullPolicy::Always` and `force: false` so valid layers are reused, never
 //! destroyed. No sandbox, VM, Docker or alternate download backend is involved.
 //!
+//! [`AcquireMode::CachedOnly`] is the same read with no acquisition at all: a
+//! miss is [`AcquireError::NotCached`], so a caller that just published can
+//! validate its own result without ever contacting a registry.
+//!
+//! Every cache-first read that validates a complete host-platform entry keeps it
+//! as **content** evidence: the content-addressed `repo@child` metadata and, when
+//! the cache holds no receipt yet, a receipt that binds no source. That is what
+//! lets a later archive alias which overwrites the digest-spelled key be
+//! repaired, so an approved image stays launchable offline — whether the approval
+//! came from an explicit publication or from a launch's first pin. The receipt
+//! deliberately records no registry association: a validated cache entry says
+//! what the cache holds, never what a registry source resolves to.
+//!
 //! # Source bindings are best-effort provenance, never authority
 //!
 //! A fresh acquisition records the source→acquired association in a cache-only
@@ -156,31 +169,50 @@ pub(crate) enum CachedLabelsRead {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AcquireMode {
     /// The cache-first **acquisition** path: use a complete validated cached
-    /// entry when one exists, acquire only on a miss. A launch does not come
-    /// through here — it calls [`prepare_cached`], which consumes the cache and
-    /// establishes nothing. The first-pin consumer of this mode arrives with the
-    /// approval store, which is not part of this change; this module's
-    /// `only_the_establishing_mode_reads_the_cache_strictly` test is its caller.
-    #[allow(dead_code)]
+    /// entry when one exists, acquire only on a miss. A launch that already holds
+    /// an approval it may merely consume calls [`prepare_cached`] instead, which
+    /// establishes nothing; the first-pin and approved-digest paths of
+    /// [`crate::image_pin`] come through here, so a warm launch's first pin leaves
+    /// content evidence behind.
     CachedOrAcquire,
     /// Always resolve the current source, even when it is cached. This is the
     /// explicit refresh/set-default path.
     ResolveCurrent,
+    /// Read back what this process just published: a complete validated cached
+    /// entry or [`AcquireError::NotCached`]. Never constructs a registry client
+    /// and never writes the source key; the cache-first read keeps the strict
+    /// establishing policy.
+    CachedOnly,
 }
 
 impl AcquireMode {
     /// The association policy of this mode's cache-first read, or `None` when the
     /// mode never consumes a cached entry at all.
     ///
-    /// Only [`AcquireMode::CachedOrAcquire`] reads the cache here, and it
-    /// establishes content this process will persist and later trust, so it keeps
-    /// the strict rule. A launch that merely consumes the cache passes
-    /// [`AssociationPolicy::Consume`] to [`prepare_cached`] instead: it is not an
-    /// acquisition and persists no new identity claim.
+    /// Both cache-first modes read the cache and establish content this process
+    /// will persist and later trust, so both keep the strict rule. A launch that
+    /// merely consumes the cache passes [`AssociationPolicy::Consume`] to
+    /// [`prepare_cached`] instead: it is not an acquisition and persists no new
+    /// identity claim.
     fn cache_first_policy(self) -> Option<AssociationPolicy> {
         match self {
-            Self::CachedOrAcquire => Some(AssociationPolicy::RequireProof),
+            Self::CachedOrAcquire | Self::CachedOnly => Some(AssociationPolicy::RequireProof),
             Self::ResolveCurrent => None,
+        }
+    }
+
+    /// The evidence this mode's cache-first read preserves.
+    ///
+    /// Every cache-first read that validates a complete host-platform entry
+    /// records **content** evidence for the content-addressed child it
+    /// validated — enough to repair that key after an archive alias overwrites
+    /// it, and nothing that would claim a registry association no cache read
+    /// observed ([`Preservation::ValidatedContent`]). `ResolveCurrent` performs
+    /// no cache-first read at all, so it has no hit to record.
+    fn preservation(self) -> Preservation {
+        match self {
+            Self::CachedOrAcquire | Self::CachedOnly => Preservation::ValidatedContent,
+            Self::ResolveCurrent => Preservation::ValidatedCache,
         }
     }
 }
@@ -491,6 +523,10 @@ pub(crate) enum AcquireError {
     /// A validated identity could not be expressed as a canonical immutable
     /// reference. Internal invariant failure; names no value.
     Identity,
+    /// [`AcquireMode::CachedOnly`] found no complete, identity-consistent,
+    /// host-platform entry. Not a failure to find bytes: this mode never looks
+    /// for them anywhere else.
+    NotCached,
 }
 
 impl AcquireError {
@@ -527,6 +563,9 @@ impl AcquireError {
             Self::CachedEntry(error) => error.describe().to_string(),
             Self::Identity => {
                 "the acquired image did not yield a usable immutable identity".to_string()
+            }
+            Self::NotCached => {
+                "the image cache holds no complete host-platform image for this reference, and this operation never contacts a registry".to_string()
             }
         }
     }
@@ -652,11 +691,21 @@ fn native_category(error: &ImageError) -> &'static str {
 }
 
 /// Which evidence a preservation rests on. Only a fresh native acquisition may
-/// add a source binding.
-#[derive(Clone, Copy)]
+/// add a source binding; the other two record content alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Preservation {
+    /// A native pull this process ran: content *and* the source it came from.
     FreshAcquisition,
+    /// No cache-first read ran, so there is no hit to record: it writes no
+    /// receipt and binds no source.
     ValidatedCache,
+    /// A cache-first read validated a complete host-platform entry. Validation
+    /// evidence *is* content evidence — it says what the cache holds, never what
+    /// a registry source resolves to — so it preserves the child's metadata and a
+    /// receipt that binds no source. Both a launch's first pin and a
+    /// publication's read-back come through here, which is what keeps every
+    /// approval repairable after an archive alias overwrites its digest key.
+    ValidatedContent,
 }
 
 impl Preservation {
@@ -665,13 +714,45 @@ impl Preservation {
     /// Only a source that states an immutable digest gets a binding: the
     /// association check consults bindings for exactly those sources, so a
     /// mutable tag would spend one of the bounded slots on evidence nothing
-    /// reads, and per-commit tags would eventually exhaust it for no gain.
+    /// reads, and per-commit tags would eventually exhaust it for no gain. A
+    /// cache read records none under any evidence: neither completeness nor a
+    /// publication observed a registry association to bind.
     fn binding(self, target: &OciTarget) -> Option<SourceBinding> {
         match self {
             Self::FreshAcquisition => target
                 .stated_digest()
                 .map(|_| SourceBinding::of(target.canonical())),
-            Self::ValidatedCache => None,
+            Self::ValidatedCache | Self::ValidatedContent => None,
+        }
+    }
+
+    /// Whether this evidence establishes the content-addressed child key: it may
+    /// publish that key and, when no receipt exists, write one.
+    ///
+    /// A cache read that validated content holds exactly what a later
+    /// digest-spelled archive alias can overwrite and
+    /// [`NativeAcquisition::repair_child_key`] restores. Writing it is idempotent:
+    /// an existing receipt merges no new binding and is not rewritten.
+    fn establishes(self) -> bool {
+        match self {
+            Self::FreshAcquisition | Self::ValidatedContent => true,
+            Self::ValidatedCache => false,
+        }
+    }
+
+    /// Whether this evidence publishes the child key even when the cache already
+    /// holds exactly this content under it.
+    ///
+    /// A fresh pull publishes what it fetched. A cache-first read already *found*
+    /// its entry, so rewriting identical bytes would only replace a file another
+    /// reader may be validating — the same reason
+    /// [`NativeAcquisition::needs_repair`] exists. Such a read still publishes when
+    /// the key holds something else (a child behind a stated index digest, or an
+    /// alias that overwrote it), which is what keeps an approved digest available.
+    fn republishes_unchanged(self) -> bool {
+        match self {
+            Self::FreshAcquisition => true,
+            Self::ValidatedCache | Self::ValidatedContent => false,
         }
     }
 }
@@ -789,10 +870,16 @@ impl NativeAcquisition {
     ) -> Result<ValidatedImage, AcquireError> {
         self.ensure_registry(target)?;
         if let Some(policy) = mode.cache_first_policy()
-            && let Some(image) = self.cached(target, policy).await?
+            && let Some(image) = self.cached(target, policy, mode.preservation()).await?
         {
             gate::detail(gate::Stage::CacheHit).map_err(AcquireError::TestGate)?;
             return Ok(image);
+        }
+        // No fall-through for a read-back: `resolve_and_preserve` would pull from
+        // the registry and rewrite the source key this process was asked only to
+        // read.
+        if mode == AcquireMode::CachedOnly {
+            return Err(AcquireError::NotCached);
         }
         self.resolve_and_preserve(target, label).await
     }
@@ -806,12 +893,16 @@ impl NativeAcquisition {
     /// spelling. Reuse requires the same complete/identity/platform validation
     /// as a canonical entry; the validated metadata is then republished under the
     /// canonical key so the old spelling is never needed again.
+    ///
+    /// `evidence` is what the hit may preserve; see
+    /// [`AcquireMode::preservation`].
     async fn cached(
         &self,
         target: &OciTarget,
         policy: AssociationPolicy,
+        evidence: Preservation,
     ) -> Result<Option<ValidatedImage>, AcquireError> {
-        match self.lookup(target, policy).await? {
+        match self.lookup(target, policy, evidence).await? {
             CacheLookup::Hit(metadata) => Ok(Some(self.validated(target, *metadata)?)),
             CacheLookup::Absent | CacheLookup::Unusable => Ok(None),
         }
@@ -829,6 +920,7 @@ impl NativeAcquisition {
         &self,
         target: &OciTarget,
         policy: AssociationPolicy,
+        evidence: Preservation,
     ) -> Result<CacheLookup, AcquireError> {
         let canonical = target.canonical();
         // Quiet: the reporting stages belong to the snapshot→validate interval
@@ -847,8 +939,7 @@ impl NativeAcquisition {
                     return Ok(CacheLookup::Unusable);
                 }
                 gate::detail(gate::Stage::CacheValidated).map_err(AcquireError::TestGate)?;
-                self.preserve(target, &metadata, Preservation::ValidatedCache)
-                    .await?;
+                self.preserve(target, &metadata, evidence).await?;
                 return Ok(CacheLookup::Hit(Box::new(metadata)));
             }
             None if canonical_present => {
@@ -882,8 +973,7 @@ impl NativeAcquisition {
             return Ok(CacheLookup::Unusable);
         }
         gate::detail(gate::Stage::CacheValidated).map_err(AcquireError::TestGate)?;
-        self.preserve(target, &metadata, Preservation::ValidatedCache)
-            .await?;
+        self.preserve(target, &metadata, evidence).await?;
         match self
             .migrate_canonical_key(target, &metadata, policy)
             .await?
@@ -1129,10 +1219,18 @@ impl NativeAcquisition {
     ///
     /// The child key is content-addressed, so publishing it can never revert a
     /// moved tag — but rewriting an entry that already holds exactly this content
-    /// is not a repair either, so a cache hit writes nothing. A fresh acquisition
-    /// writes its child key unconditionally: the native pull published the
-    /// *requested* spelling, so the derived child key is this module's own
-    /// publication and its readback is the completeness proof.
+    /// is not a repair either, so a cache-first read publishes only what
+    /// [`NativeAcquisition::needs_repair`] reports. A fresh acquisition
+    /// ([`Preservation::republishes_unchanged`]) always publishes: the native pull
+    /// wrote the *requested* spelling, so the derived child key is this module's
+    /// own publication and its readback is the completeness proof.
+    ///
+    /// Evidence that establishes content ([`Preservation::establishes`]) records
+    /// the receipt a later repair reads when the cache holds none: that receipt is
+    /// what [`NativeAcquisition::repair_child_key`] restores after an archive alias
+    /// overwrites the digest-spelled key. The write is idempotent — an existing
+    /// receipt merges no new binding and is not rewritten — so a warm launch writes
+    /// at most one small file per digest, once.
     async fn preserve(
         &self,
         target: &OciTarget,
@@ -1160,15 +1258,12 @@ impl NativeAcquisition {
                 // repeated one is already stored, so the file already says this.
                 MergedBinding::Unchanged => None,
             },
-            None => match evidence {
-                Preservation::FreshAcquisition => Some(incoming),
-                // Cache completeness is not a newly learned registry binding.
-                Preservation::ValidatedCache => None,
-            },
+            // Only evidence that establishes content may record a new receipt: a
+            // mode with no cache-first read has no hit to record.
+            None if evidence.establishes() => Some(incoming),
+            None => None,
         };
-        if matches!(evidence, Preservation::FreshAcquisition)
-            || self.needs_repair(acquired.reference(), metadata)?
-        {
+        if evidence.republishes_unchanged() || self.needs_repair(acquired.reference(), metadata)? {
             self.publish_metadata(acquired.reference(), metadata)
                 .await?;
         }
@@ -2120,10 +2215,44 @@ mod tests {
         assert_eq!(Preservation::ValidatedCache.binding(&tag), None);
         assert_eq!(Preservation::ValidatedCache.binding(&pin), None);
         assert_eq!(
+            Preservation::ValidatedContent.binding(&tag),
+            None,
+            "a cache read never names a registry source"
+        );
+        assert_eq!(
+            Preservation::ValidatedContent.binding(&pin),
+            None,
+            "validated content is content evidence, never a claimed association"
+        );
+        assert_eq!(
             Preservation::FreshAcquisition.binding(&pin),
             Some(SourceBinding::of(pin.canonical())),
             "an immutable source keeps the association only a receipt can prove"
         );
+    }
+
+    /// Only evidence that *establishes* content writes the child key and, when it
+    /// is absent, a receipt.
+    #[test]
+    fn only_establishing_evidence_records_content() {
+        assert!(Preservation::FreshAcquisition.establishes());
+        assert!(Preservation::ValidatedContent.establishes());
+        assert!(
+            !Preservation::ValidatedCache.establishes(),
+            "a mode with no cache-first read has no hit to record"
+        );
+    }
+
+    /// Only a fresh pull rewrites a child key it already holds; every cache-first
+    /// read publishes only what [`NativeAcquisition::needs_repair`] reports.
+    #[test]
+    fn only_a_fresh_pull_republishes_identical_content() {
+        assert!(Preservation::FreshAcquisition.republishes_unchanged());
+        assert!(
+            !Preservation::ValidatedContent.republishes_unchanged(),
+            "a validating read must not rewrite an entry it just validated"
+        );
+        assert!(!Preservation::ValidatedCache.republishes_unchanged());
     }
 
     /// The token keeps the source binding and the acquired identity separate and
@@ -2244,7 +2373,11 @@ mod tests {
         std::fs::write(&metadata_path, b"{}").unwrap();
         assert!(
             acquisition
-                .cached(&target, AssociationPolicy::RequireProof)
+                .cached(
+                    &target,
+                    AssociationPolicy::RequireProof,
+                    Preservation::ValidatedCache,
+                )
                 .await
                 .unwrap()
                 .is_none(),
@@ -2257,7 +2390,11 @@ mod tests {
         std::fs::remove_file(&metadata_path).unwrap();
         assert!(
             acquisition
-                .cached(&target, AssociationPolicy::RequireProof)
+                .cached(
+                    &target,
+                    AssociationPolicy::RequireProof,
+                    Preservation::ValidatedCache,
+                )
                 .await
                 .unwrap()
                 .is_none(),
@@ -2265,16 +2402,83 @@ mod tests {
         );
     }
 
-    /// Only the cache-first acquisition mode reads the cache here, and it is the
-    /// one that establishes content, so it keeps the strict association rule.
-    /// A deliberate resolution never short-circuits on cache contents.
+    /// Every cache-first mode records **content** evidence and no binding; only a
+    /// mode that performs no cache-first read records nothing. This is the
+    /// mapping D10/D11 depend on: a launch's first pin and a publication's
+    /// read-back both leave a repairable child key.
     #[test]
-    fn only_the_establishing_mode_reads_the_cache_strictly() {
+    fn every_cache_first_mode_preserves_content_evidence() {
+        assert_eq!(
+            AcquireMode::CachedOnly.preservation(),
+            Preservation::ValidatedContent
+        );
+        assert_eq!(
+            AcquireMode::CachedOrAcquire.preservation(),
+            Preservation::ValidatedContent
+        );
+        assert_eq!(
+            AcquireMode::ResolveCurrent.preservation(),
+            Preservation::ValidatedCache
+        );
+    }
+
+    /// Only the cache-first modes read the cache here, and they are the ones that
+    /// establish content, so they keep the strict association rule. A deliberate
+    /// resolution never short-circuits on cache contents.
+    #[test]
+    fn only_the_establishing_modes_read_the_cache_strictly() {
         assert_eq!(
             AcquireMode::CachedOrAcquire.cache_first_policy(),
             Some(AssociationPolicy::RequireProof)
         );
+        assert_eq!(
+            AcquireMode::CachedOnly.cache_first_policy(),
+            Some(AssociationPolicy::RequireProof)
+        );
         assert_eq!(AcquireMode::ResolveCurrent.cache_first_policy(), None);
+    }
+
+    /// A read-back never becomes a registry request, and never rewrites the
+    /// source key: a fall-through to `resolve_and_preserve` would return a
+    /// registry construction/pull error and could replace the alias with
+    /// registry content.
+    #[tokio::test]
+    async fn cached_only_never_falls_back_to_a_registry() {
+        let directory = tempfile::tempdir().unwrap();
+        let acquisition = fixture_acquisition(directory.path());
+        let target = OciTarget::parse("localhost:5000/absent:tag").unwrap();
+        let label = crate::boot_image::ImageLabel::for_tests("localhost:5000/absent:tag");
+        assert!(
+            matches!(
+                acquisition
+                    .acquire(&target, &label, AcquireMode::CachedOnly)
+                    .await,
+                Err(AcquireError::NotCached)
+            ),
+            "an absent entry is a read-back miss"
+        );
+
+        // Present but unusable metadata (no materialized layers) is a miss too,
+        // and the file keeps exactly the bytes it had: no source-key rewrite.
+        let path = acquisition.cache.image_metadata_path(target.reference());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let metadata = fixture_metadata(&format!("sha256:{}", "b".repeat(64)));
+        std::fs::write(&path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(
+            matches!(
+                acquisition
+                    .acquire(&target, &label, AcquireMode::CachedOnly)
+                    .await,
+                Err(AcquireError::NotCached)
+            ),
+            "an unusable cached entry is a read-back miss"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "the source key is never rewritten by a read-back"
+        );
     }
 
     /// A mutable tag claims no immutable identity, so completeness is all either

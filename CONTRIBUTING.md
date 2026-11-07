@@ -451,8 +451,11 @@ approval naming the selected reference and the measured `linux/arm64` platform;
 observe guest A and zero registry requests on a warm launch that inherits the
 removed advisory variable; reacquire A by digest into a fresh independent
 state/cache and confirm neither record's bytes changed; decline (`n`, empty) and
-fail a candidate and still boot A; approve B with `--yes` and boot B; and show
-that an import alias over the pinned tag cannot move the guest. A live A guest
+fail a candidate and still boot A; approve B with `--yes` and boot B; show that an
+import alias over the pinned tag cannot move the guest; and then show that an
+explicit `image import --docker … --tag $tag` of the pinned tag *does* move it —
+no prompt, `old:`/`new:` on stderr, revision +1, zero registry reads — while the
+same import repeated leaves `image-pins.json` byte-identical. A live A guest
 runs throughout: its PID, its own rootfs content and its booted image stamp must
 be unchanged after both update verbs, and a new B guest in the same project must
 read back the project-state, declared-state and launch-HOME files that the first
@@ -912,8 +915,19 @@ CLI-produced bytes; a hand-built store must satisfy the same strict schema, or
 the test is asserting corruption, not approval. Pin lookups take a shared lock
 and create nothing, so an absent store is a legal read-only state; mutations
 create the directory and lock. A changed pin needs `--yes` or both stdin and
-stderr on a real PTY. Native cache/receipt bytes are never approval, and a
-test must not delete approvals to work around a cache problem.
+stderr on a real PTY — except on `image build`/`image import`, which approve
+their own result reference prompt-free (#391). Native cache/receipt bytes are
+never approval, and a test must not delete approvals to work around a cache
+problem.
+
+That last rule shapes fixture seeding: an `image build` or `image import`
+through the compiled CLI **approves its result reference**, so a fixture that
+must seed the cache *without* approving runs it under a separate throwaway
+`HOME` (the cache lives under `AGENT_VM_STATE_DIR`, not `HOME`, so the launch
+still finds its bytes) and keeps asserting that the real `HOME` holds no
+approval. Do not "fix" such a row by deleting the approval or removing
+`$HOME/.config` afterwards — the test that asserts a first launch writes nothing,
+or that symlinks `.config`, is about the topology the deletion would destroy.
 
 The macOS keychain item Claude Code keeps its login in (#492) is a fourth seam. A
 fake `security` earlier on `PATH` is how a test controls it, exactly as a fake
@@ -963,10 +977,12 @@ seams make the coordination behaviour orderable without sleeps:
   still ahead of this consumer), `canonical-readback` and `receipt` stages. A
   missing or malformed reply is a failure, never a skip.
 - `AGENT_VM_TEST_PIN_GATE` is the same shape for the host approval transaction.
-  It reports `candidate-ready`, `before-pin-lock`, `pin-locked`,
-  `before-intent-save`, `intent-saved`, `default-saved`, `before-pin-save` and
-  `pin-committed`, and accepts `continue`, or `fail-before-save` only at the two
-  write-preceding stages (the seam is one atomic save, so a rename fault is not a
+  It reports `published` (an explicit build/import has published its result
+  reference and the exclusive barrier is released, before the read-back),
+  `candidate-ready`, `before-pin-lock`, `pin-locked`, `before-intent-save`,
+  `intent-saved`, `default-saved`, `before-pin-save` and `pin-committed`, and
+  accepts `continue`, or `fail-before-save` only at the two write-preceding
+  stages (the seam is one atomic save, so a rename fault is not a
   separate stage). Stages name no reference, digest or
   path, so a gate can neither forge content nor grant approval. Release builds
   ignore the variable entirely; a test pins that exclusion.
@@ -995,7 +1011,7 @@ while ordinary `setup` intentionally creates a verification guest.
 | `cargo test --workspace` | yes (`ci.yml`) | `#[ignore]`d e2e excluded |
 | `cargo check --release -p agent-vm --tests` | yes (`ci.yml`) | type-check only; pins that the release test profile still compiles under the test cfg, since CI's run is the debug profile |
 | `script/test/e2e.sh` | **no** | native installed registry/archive joins; custom/all additionally require Apple Silicon and Docker; `custom-image` includes the always-run host-pin A/B rows |
-| `cargo test --test image_pin_approval` | yes (`cargo test -p agent-vm`) | boot-free compiled-CLI approval matrix: PTY yes/no/empty/EOF/interruption, `--yes`, nonterminal refusal, frozen candidate, CAS/stale revision, journal recovery, cache-loss digest reacquisition. No VM evidence |
+| `cargo test --test image_pin_approval` | yes (`cargo test -p agent-vm`) | boot-free compiled-CLI approval matrix: PTY yes/no/empty/EOF/interruption, `--yes`, nonterminal refusal, frozen candidate, CAS/stale revision, journal recovery, cache-loss digest reacquisition, and build/import result approval (import→rebuild→launch moves what the SDK is handed; an archive alias never does; a concurrent refresh keeps its pin). No VM evidence |
 | `cargo test … -- --ignored` | **no** | keychain round-trip; operator opt-in, never ordinary CI |
 | `AGENT_VM_E2E_SECRETSPEC=/opt/homebrew/bin/secretspec cargo test -p agent-vm --test config_launch_driven a_real_secretspec_serve_round_trip -- --ignored --exact` | **no** | the real `secretspec` binary as-is (no chmod/chown/copy/reinstall); isolated `HOME`, a manifest inside the test harness's own `TempDir`, and — for every command the test runs itself — a cleared environment repopulated with only `HOME`, `PATH=/usr/bin:/bin` and `XDG_{CONFIG,DATA,STATE,CACHE}_HOME` under that `HOME`, so a developer's `SECRETSPEC_*`, `XDG_*` and real audit store are never consulted; absent the variable the test refuses to run rather than auto-detecting an install |
 | `script/test/single-binary-contract.sh` | yes (`ci.yml`) | fake payload; lone copy, reuse, concurrency, tamper, unwritable, rejected-launch state, and `image show` unpacking nothing (C12); the only `embedded-runtime` clippy pass, which is what lints the payload build module |

@@ -11,6 +11,7 @@
 //! run must refuse rather than answer for a human.
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
@@ -30,7 +31,7 @@ mod support;
 use fake_msb::{FakeMsb, Mode};
 use image_archive::{ArchiveSpec, LayerContent, PlatformSpec};
 use oci_registry::{Image, Server};
-use pin_gate::{PinGate, PinStage, Reply};
+use pin_gate::{PinGate, PinPeer, PinStage, Reply};
 use pty::{Action, Pty};
 
 /// The prompt the approval path waits for. Asserted as a literal so a wording
@@ -60,6 +61,22 @@ impl Harness {
         let bin = root.path().join("bin");
         fs::create_dir_all(&bin).unwrap();
         let runtime = fake_msb::install_pair(&bin, mode);
+        // A fake Docker for `image build`: it replays `$FAKE_DOCKER_ARCHIVE` on
+        // stdout and refuses anything but `buildx build`, so a wrong invocation
+        // fails loudly.
+        let docker = bin.join("docker");
+        fs::write(
+            &docker,
+            "#!/bin/sh\n\
+             if [ \"$1\" = buildx ] && [ \"$2\" = build ]; then\n\
+             \x20 cat \"$FAKE_DOCKER_ARCHIVE\"\n\
+             \x20 exit 0\n\
+             fi\n\
+             echo 'fake docker: unexpected subcommand' >&2\n\
+             exit 97\n",
+        )
+        .unwrap();
+        fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
         Self {
             root,
             home,
@@ -121,6 +138,64 @@ impl Harness {
             .to_owned()
     }
 
+    /// The record for one canonical reference. Selecting by reference, not by
+    /// position: once two references are approved the store's order is an
+    /// implementation detail, and a replacement moves its record to the end.
+    fn pin_for(&self, reference: &str) -> Option<(String, u64)> {
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(self.pins()).ok()?).ok()?;
+        value["pins"]
+            .as_array()?
+            .iter()
+            // These harness references are already canonical
+            // (`127.0.0.1:PORT/images:tag`), so the stored spelling is the
+            // text the test names.
+            .find(|record| record["reference"] == reference)
+            .map(|record| {
+                (
+                    record["manifest_digest"].as_str().unwrap().to_owned(),
+                    record["revision"].as_u64().unwrap(),
+                )
+            })
+    }
+
+    fn pinned_digest_for(&self, reference: &str) -> Option<String> {
+        self.pin_for(reference).map(|(digest, _)| digest)
+    }
+
+    fn approval_records(&self) -> usize {
+        serde_json::from_slice::<serde_json::Value>(&fs::read(self.pins()).unwrap()).unwrap()
+            ["pins"]
+            .as_array()
+            .unwrap()
+            .len()
+    }
+
+    /// `agent-vm image import --input ARCHIVE --tag REF`, on a null stdin so a
+    /// prompt path would refuse instead of reading a terminal this test does not
+    /// have: "no prompt" is proven, not assumed.
+    fn import(&self, archive: &Path, tag: &str) -> Output {
+        let mut command = self.command();
+        command.stdin(std::process::Stdio::null()).args([
+            "image",
+            "import",
+            "--input",
+            archive.to_str().unwrap(),
+            "--tag",
+            tag,
+        ]);
+        bounded(command)
+    }
+
+    /// `agent-vm image build --tag REF` with a fake Docker that replays
+    /// `archive` on stdout.
+    fn build(&self, archive: &Path, tag: &str) -> Output {
+        let mut command = self.command();
+        command
+            .env("FAKE_DOCKER_ARCHIVE", archive)
+            .args(["image", "build", "--tag", tag]);
+        bounded(command)
+    }
+
     fn msb_invocations(&self) -> String {
         fs::read_to_string(&self.runtime.invocations).unwrap_or_default()
     }
@@ -164,6 +239,30 @@ fn create_invocations(h: &Harness) -> usize {
 
 fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+fn stdout_of(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// The digest half of a `repo@digest` identity, as the store records it.
+fn digest_of(child: &str) -> String {
+    child
+        .rsplit_once('@')
+        .expect("an acquired identity is repo@digest")
+        .1
+        .to_owned()
+}
+
+/// An OCI archive fixture named for this test, with `marker` inside its layer.
+fn archive_at(h: &Harness, name: &str, marker: &str) -> image_archive::Written {
+    image_archive::write(
+        &h.root.path().join(name),
+        &ArchiveSpec {
+            marker: marker.to_owned(),
+            ..ArchiveSpec::default()
+        },
+    )
 }
 
 /// The image reference the SDK was handed, read from the opt-in config dump.
@@ -584,51 +683,797 @@ fn removed_update_check_is_an_unknown_option_before_the_verb_and_forwarded_after
     assert_eq!(sdk_image(&h.launch(&tag)), child);
 }
 
-/// Import may publish an alias, never an approval: a launch keeps consuming the
-/// approved digest with no tag query, even when the alias now names B.
+/// An archive alias never moves an approval, and the reference the command
+/// names is approved (#391). A launch of the aliased reference keeps consuming
+/// its approved digest with no tag query; a launch of the *result* reference
+/// boots the imported bytes.
 #[test]
 fn import_alias_cannot_bypass_an_established_pin() {
     let h = Harness::new(Mode::LaunchSeam);
     let server = Server::new();
-    let a = h.image(&ArchiveSpec::default());
     let child = server.image("images", "alias", &image_archive_image(&h, "alias-a"));
-    let tag = format!("{}/images:alias", server.host);
-    let _ = a;
-    let cold = h.launch(&tag);
+    let alias = format!("{}/images:alias", server.host);
+    let result = format!("{}/images:result", server.host);
+
+    let cold = h.launch(&alias);
     assert!(!cold.status.success());
     assert_eq!(sdk_image(&cold), child);
-    let pinned = h.pinned_digest();
+    let pinned = h
+        .pinned_digest_for(&alias)
+        .expect("the launch established a pin");
 
-    // Import B's archive under the SAME tag string.
+    // A Docker-save archive whose RepoTags name the approved reference, imported
+    // under a different result reference.
     let archive_path = h.root.path().join("alias-b.tar");
-    let _ = image_archive::write_docker_save(
+    let save = image_archive::write_docker_save(
         &archive_path,
         &[image_archive::DockerSaveImage {
             marker: "alias-b".into(),
-            repo_tags: Some(vec![tag.clone()]),
+            repo_tags: Some(vec![alias.clone()]),
         }],
     );
-    let mut command = h.command();
-    command.args([
-        "image",
-        "import",
-        "--input",
-        archive_path.to_str().unwrap(),
-        "--tag",
-        &tag,
-    ]);
-    let imported = bounded(command);
-    assert!(imported.status.success(), "{}", stderr(&imported));
+    let imported = h.import(&archive_path, &result);
+    assert_eq!(
+        imported.status.code(),
+        Some(0),
+        "an import never prompts: {}",
+        stderr(&imported)
+    );
+
+    assert_eq!(
+        h.pinned_digest_for(&alias),
+        Some(pinned),
+        "an archive alias never replaces an established approval"
+    );
+    // The authority for the result half is the fixture, never the approval or the
+    // cache under test: `docker_save_manifest` derives the manifest a docker-save
+    // import synthesizes from the archive's own config and layer descriptors, so
+    // the result must hold *that* manifest and the pin must name it — not A's
+    // digest and not some other manifest that happens to share the config.
+    let published = published_metadata(&cache_metadata_path(&h, &result));
+    assert_eq!(
+        published["config_digest"], save[0].config_digest,
+        "the result reference holds the bytes the archive carried"
+    );
+    let (_, approved_result) = image_archive::docker_save_manifest("alias-b");
+    assert_eq!(
+        published["manifest_digest"], approved_result,
+        "the result reference holds the fixture's synthesized manifest"
+    );
+    assert_eq!(
+        h.pinned_digest_for(&result),
+        Some(approved_result.clone()),
+        "the result reference is approved at the fixture's manifest"
+    );
+    assert_ne!(
+        approved_result,
+        digest_of(&child),
+        "the result reference is not approved at the alias's approved digest"
+    );
 
     let before = server.count();
-    let warm = h.launch(&tag);
+    let warm = h.launch(&alias);
     assert!(!warm.status.success());
-    assert_eq!(sdk_image(&warm), child, "the approval survives an import");
-    assert_eq!(h.pinned_digest(), pinned);
+    assert_eq!(sdk_image(&warm), child, "the alias's approval is unchanged");
     assert_eq!(
         server.count(),
         before,
         "an approved launch makes no registry request after an import"
+    );
+
+    // The result reference is approved at the imported bytes, and a warm launch
+    // consumes exactly that `repo@digest` from the cache the import filled.
+    let booted = h.launch(&result);
+    assert_eq!(
+        sdk_image(&booted),
+        format!("{}/images@{approved_result}", server.host)
+    );
+}
+
+/// The three-line render, exactly, for the canonical reference and host
+/// platform.
+fn assert_render(shown: &str, reference: &str, old: &str, new: &str) {
+    let expected = format!(
+        "Approving the image published as {reference} (linux/{}):\n  old: {old}\n  new: {new}\n",
+        image_archive::host_arch()
+    );
+    assert!(
+        shown.contains(&expected),
+        "expected the approval render:\n{expected}\nin:\n{shown}"
+    );
+    assert!(
+        !shown.contains("Approve this exact image change?"),
+        "an explicit build/import never prompts: {shown}"
+    );
+}
+
+fn import_notice(tag: &str) -> String {
+    format!("Imported {tag} into agent-vm's image cache; launch it with `--image {tag}`\n")
+}
+
+fn build_notice(tag: &str) -> String {
+    format!("Imported build result as {tag}; launch it with `--image {tag}`\n")
+}
+
+/// AC1/AC2/AC3/AC10: what a launch boots follows the explicit publications.
+///
+/// The tag is never served, so a registry request at any point would fail the
+/// run: every launch here consumes the approved `repo@digest` from the cache.
+#[test]
+fn explicit_import_then_rebuild_move_what_a_launch_boots() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let tag = format!("{}/images:t", server.host);
+
+    let a = archive_at(&h, "a.tar", "A");
+    let b = archive_at(&h, "b.tar", "B");
+    let c = archive_at(&h, "c.tar", "C");
+
+    // 1. Import A: revision 1.
+    let out = h.import(&a.path, &tag);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout_of(&out), import_notice(&tag));
+    assert_render(&stderr(&out), &tag, "none", &a.manifest_digest);
+    assert_eq!(h.pin_for(&tag), Some((a.manifest_digest.clone(), 1)));
+    assert_eq!(h.approval_records(), 1);
+    assert_eq!(
+        sdk_image(&h.launch(&tag)),
+        format!("{}/images@{}", server.host, a.manifest_digest)
+    );
+
+    // 2. Import B: revision 2, rendered against A.
+    let out = h.import(&b.path, &tag);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout_of(&out), import_notice(&tag));
+    assert_render(&stderr(&out), &tag, &a.manifest_digest, &b.manifest_digest);
+    assert_eq!(h.pin_for(&tag), Some((b.manifest_digest.clone(), 2)));
+    assert_eq!(
+        sdk_image(&h.launch(&tag)),
+        format!("{}/images@{}", server.host, b.manifest_digest)
+    );
+
+    // 3. A rebuild under the same tag: revision 3, rendered against B.
+    let out = h.build(&c.path, &tag);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout_of(&out), build_notice(&tag));
+    assert_render(&stderr(&out), &tag, &b.manifest_digest, &c.manifest_digest);
+    assert_eq!(h.pin_for(&tag), Some((c.manifest_digest.clone(), 3)));
+    assert_eq!(
+        sdk_image(&h.launch(&tag)),
+        format!("{}/images@{}", server.host, c.manifest_digest)
+    );
+
+    // 4. Republishing C leaves the store byte-identical and stderr silent.
+    let approved = fs::read(h.pins()).unwrap();
+    let out = h.import(&c.path, &tag);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(fs::read(h.pins()).unwrap(), approved);
+    assert!(!stderr(&out).contains("Approving"), "{}", stderr(&out));
+    assert_eq!(h.pin_for(&tag), Some((c.manifest_digest.clone(), 3)));
+
+    // The tag was never fetched: every launch was served from the cache.
+    assert_eq!(server.count(), 0, "{:?}", server.requests());
+}
+
+/// AC9/AC10: a concurrent `image refresh` that commits between this import's
+/// observation and its commit wins, and the import reports a stale approval.
+/// The render is already on stderr at the checkpoint that precedes the commit,
+/// and the store is still on the previous digest at that instant.
+#[test]
+fn a_concurrent_refresh_wins_and_the_import_reports_a_stale_approval() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let c = h.image(&ArchiveSpec {
+        marker: "stale-c".into(),
+        ..Default::default()
+    });
+    let pin_a = server.image("images", "stale", &a);
+    let tag = format!("{}/images:stale", server.host);
+    assert!(h.refresh(&tag, false).status.success(), "first pin");
+    assert_eq!(
+        h.pinned_digest_for(&tag),
+        Some(digest_of(&pin_a)),
+        "the first pin records the registry's child digest"
+    );
+
+    let b = archive_at(&h, "stale-b.tar", "stale-b");
+
+    let stderr_path = h.root.path().join("stale-import.log");
+    let mut gate = PinGate::new(h.root.path());
+    let mut command = h.command();
+    gate.attach(&mut command);
+    let child = command
+        .stdin(std::process::Stdio::null())
+        .args([
+            "image",
+            "import",
+            "--input",
+            b.path.to_str().unwrap(),
+            "--tag",
+            &tag,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::from(
+            fs::File::create(&stderr_path).unwrap(),
+        ))
+        .spawn()
+        .expect("spawn the gated import");
+
+    gate.expect(PinStage::Published).reply(Reply::Continue);
+    gate.expect(PinStage::CandidateReady).reply(Reply::Continue);
+    // Held *after* the render and the predecessor observation, *before* the
+    // commit: exactly the window the compare-and-swap covers.
+    let held = gate.expect(PinStage::BeforePinLock);
+
+    let rendered = fs::read_to_string(&stderr_path).unwrap();
+    assert_render(&rendered, &tag, &digest_of(&pin_a), &b.manifest_digest);
+    assert_eq!(
+        h.pinned_digest_for(&tag),
+        Some(digest_of(&pin_a)),
+        "the render precedes the commit: the store still holds the predecessor"
+    );
+
+    // The winner: a refresh that replaces A with C while this import waits.
+    let pin_c = server.image("images", "stale", &c);
+    let refreshed = h.refresh(&tag, true);
+    assert_eq!(refreshed.status.code(), Some(0), "{}", stderr(&refreshed));
+    assert_eq!(h.pinned_digest_for(&tag), Some(digest_of(&pin_c)));
+
+    held.reply(Reply::Continue);
+    // The commit's under-lock reread happens next; the conflicting predecessor
+    // is detected there, before any save checkpoint.
+    gate.expect(PinStage::PinLocked).reply(Reply::Continue);
+    let output = child.wait_with_output().expect("collect the import");
+    drop(gate);
+    assert_eq!(output.status.code(), Some(1));
+    let shown = fs::read_to_string(&stderr_path).unwrap();
+    assert!(
+        shown.contains("image approval is stale; retry the explicit operation"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("but its approval was not updated"),
+        "{shown}"
+    );
+    assert_eq!(
+        h.pin_for(&tag),
+        Some((digest_of(&pin_c), 2)),
+        "the winner stands"
+    );
+    assert_eq!(sdk_image(&h.launch(&tag)), pin_c, "the winner's bytes boot");
+}
+
+/// R2/D1's "the alias moved after publication" (not AC7, which is about failed
+/// and interrupted loads): the read-back is pinned to what publication reported,
+/// not to whatever the cache key names now. Dropping the `Published.digest`
+/// comparison would approve C under T.
+#[test]
+fn a_result_moved_before_read_back_is_not_approved() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let tag = format!("{}/images:t", server.host);
+    let other = format!("{}/images:other", server.host);
+
+    // Materialize C and approve it under a different reference.
+    let c = archive_at(&h, "moved-c.tar", "moved-c");
+    let out = h.import(&c.path, &other);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let c_record = h.pin_for(&other).expect("C is approved under :other");
+
+    let b = archive_at(&h, "moved-b.tar", "moved-b");
+    let mut gate = PinGate::new(h.root.path());
+    let mut command = h.command();
+    gate.attach(&mut command);
+    let child = command
+        .stdin(std::process::Stdio::null())
+        .args([
+            "image",
+            "import",
+            "--input",
+            b.path.to_str().unwrap(),
+            "--tag",
+            &tag,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the gated import");
+
+    // While the child is held right after publication, overwrite T's cache
+    // metadata with the bytes `:other` published. Both files are addressed by
+    // their exact references, not by a digest search: a second key naming the
+    // same digest must not decide which file this test overwrites.
+    let checkpoint = gate.expect(PinStage::Published);
+    let c_metadata = cache_metadata_path(&h, &other);
+    let b_metadata = cache_metadata_path(&h, &tag);
+    assert_ne!(c_metadata, b_metadata, "the two references have two keys");
+    assert_eq!(
+        published_metadata(&c_metadata)["manifest_digest"],
+        c.manifest_digest,
+        "`:other` holds C before the injection"
+    );
+    assert_eq!(
+        published_metadata(&b_metadata)["manifest_digest"],
+        b.manifest_digest,
+        "T holds B before the injection"
+    );
+    fs::copy(&c_metadata, &b_metadata).unwrap();
+    checkpoint.reply(Reply::Continue);
+
+    // Every later checkpoint the child reaches is a defect: it must refuse.
+    gate.expect_none(Duration::from_secs(5));
+    let output = child.wait_with_output().expect("collect the import");
+    drop(gate);
+    assert_eq!(output.status.code(), Some(1));
+    let shown = stderr(&output);
+    assert!(
+        shown.contains("changed in the image cache before it could be approved"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("but its approval was not updated"),
+        "{shown}"
+    );
+    assert_eq!(h.pin_for(&tag), None, "nothing is approved for T");
+    assert_eq!(h.pin_for(&other), Some(c_record));
+}
+
+/// The native cache's metadata file for one digest-spelled reference.
+fn cache_metadata_path(h: &Harness, reference: &str) -> PathBuf {
+    microsandbox_image::GlobalCache::new(&h.cache())
+        .expect("open the harness cache")
+        .image_metadata_path(&reference.parse().expect("a cache reference"))
+}
+
+/// The parsed metadata a key's file holds.
+fn published_metadata(path: &Path) -> serde_json::Value {
+    serde_json::from_slice(&fs::read(path).expect("a published metadata file"))
+        .expect("published metadata is JSON")
+}
+
+/// Every cache-only receipt the harness's cache holds, parsed.
+fn content_receipts(h: &Harness) -> Vec<serde_json::Value> {
+    let Ok(entries) = fs::read_dir(h.cache().join("agent-vm-content-metadata")) else {
+        return Vec::new();
+    };
+    entries
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .map(|path| serde_json::from_slice(&fs::read(&path).unwrap()).unwrap())
+        .collect()
+}
+
+/// The receipt for one acquired digest, if the cache keeps one.
+fn receipt_for(h: &Harness, digest: &str) -> Option<serde_json::Value> {
+    content_receipts(h)
+        .into_iter()
+        .find(|receipt| receipt["acquired_digest"] == digest)
+}
+
+/// D10: an approval owns a **content receipt** for the digest it approved.
+///
+/// The native loader publishes a digest-spelled archive name over the canonical
+/// child key, so a publication-backed approval whose read-back kept no receipt
+/// would lose its offline availability to an unrelated archive alias: the launch
+/// would find B's content under A's key, fail the strict association check and
+/// fall through to a registry that does not serve this tag.
+#[test]
+fn an_archive_alias_of_the_approved_digest_is_repaired_on_launch() {
+    let h = Harness::new(Mode::LaunchSeam);
+    // Bound but never served: a registry request here fails the run instead of
+    // silently succeeding.
+    let server = Server::new();
+    let tag = format!("{}/images:t", server.host);
+
+    // 1. Import A under T. The read-back preserves a content-only receipt for
+    //    the digest it approved.
+    let a = archive_at(&h, "repair-a.tar", "repair-a");
+    let imported = h.import(&a.path, &tag);
+    assert_eq!(imported.status.code(), Some(0), "{}", stderr(&imported));
+    let a_pin = (a.manifest_digest.clone(), 1);
+    assert_eq!(h.pin_for(&tag), Some(a_pin.clone()));
+    let receipt = receipt_for(&h, &a.manifest_digest).expect(
+        "the read-back must keep a content receipt for the digest it approved (D10); without \
+         one, an archive alias of that digest cannot be repaired",
+    );
+    assert_eq!(
+        receipt["source_bindings"],
+        serde_json::json!([]),
+        "a publication proves what the cache holds, never a registry association"
+    );
+
+    // A's content-addressed metadata, byte for byte.
+    let approved_key = format!("{}/images@{}", server.host, a.manifest_digest);
+    let approved_path = cache_metadata_path(&h, &approved_key);
+    let approved_bytes = fs::read(&approved_path).unwrap();
+
+    // 2. Import B under a *different* result reference, spelling the approved
+    //    digest as an archive-carried name. The loader publishes that name, so
+    //    A's child key now describes B.
+    let other = format!("{}/images:other", server.host);
+    let save = image_archive::write_docker_save(
+        &h.root.path().join("repair-b.tar"),
+        &[image_archive::DockerSaveImage {
+            marker: "repair-b".into(),
+            repo_tags: Some(vec![approved_key.clone()]),
+        }],
+    );
+    let imported = h.import(&save[0].path, &other);
+    assert_eq!(imported.status.code(), Some(0), "{}", stderr(&imported));
+    // B's identity comes from the fixture (`docker_save_manifest`), not from the
+    // store record this row is about: comparing that record with itself would
+    // pass for any digest at all.
+    let (_, b_digest) = image_archive::docker_save_manifest("repair-b");
+    assert_eq!(
+        h.pin_for(&other),
+        Some((b_digest.clone(), 1)),
+        "the reference the command named is approved at the fixture's own manifest"
+    );
+    assert_eq!(
+        published_metadata(&cache_metadata_path(&h, &other))["manifest_digest"],
+        serde_json::json!(b_digest),
+        "the result reference holds the fixture's synthesized manifest"
+    );
+    let overwritten: serde_json::Value =
+        serde_json::from_slice(&fs::read(&approved_path).unwrap()).unwrap();
+    assert_eq!(
+        overwritten["manifest_digest"],
+        serde_json::json!(b_digest),
+        "the fixture must really overwrite the digest-spelled key"
+    );
+
+    // 3. T's approval is unchanged, and its launch repairs A from the receipt.
+    assert_eq!(
+        h.pin_for(&tag),
+        Some(a_pin),
+        "an archive-carried name never replaces an approval"
+    );
+    let before = server.count();
+    let launched = h.launch(&tag);
+    assert_eq!(
+        sdk_image(&launched),
+        approved_key,
+        "the launch boots the approved digest, not the alias: {}",
+        stderr(&launched)
+    );
+    assert_eq!(
+        server.count(),
+        before,
+        "a repaired approved digest needs no registry: {:?}",
+        server.requests()
+    );
+    assert_eq!(
+        fs::read(&approved_path).unwrap(),
+        approved_bytes,
+        "the repair restores the approved key byte for byte"
+    );
+    // 4. B's own result reference stays at B.
+    assert_eq!(h.pin_for(&other), Some((b_digest, 1)));
+}
+
+/// D10 / G4: an alias-carrying publication whose *own* approval fails at the save
+/// still leaves the previously approved image launchable offline. The receipt
+/// that repairs A is published before the commit that failed, so a refused
+/// approval cannot cost an approved image its availability.
+#[test]
+fn a_failed_approval_after_an_alias_publication_keeps_the_approved_image_launchable() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let tag = format!("{}/images:t", server.host);
+
+    let a = archive_at(&h, "repair-a.tar", "repair-a");
+    let imported = h.import(&a.path, &tag);
+    assert_eq!(imported.status.code(), Some(0), "{}", stderr(&imported));
+    let a_pin = (a.manifest_digest.clone(), 1);
+    assert_eq!(h.pin_for(&tag), Some(a_pin.clone()));
+    let approved_key = format!("{}/images@{}", server.host, a.manifest_digest);
+    let approved_path = cache_metadata_path(&h, &approved_key);
+    let approved_bytes = fs::read(&approved_path).unwrap();
+
+    // The alias-carrying publication, forced to fail its approval save.
+    let other = format!("{}/images:other", server.host);
+    let save = image_archive::write_docker_save(
+        &h.root.path().join("repair-b.tar"),
+        &[image_archive::DockerSaveImage {
+            marker: "repair-b".into(),
+            repo_tags: Some(vec![approved_key.clone()]),
+        }],
+    );
+    let save_path = save[0].path.to_string_lossy().into_owned();
+    let mut gate = PinGate::new(h.root.path());
+    let peer = PinPeer::spawn(
+        h.command(),
+        &gate,
+        &["image", "import", "--input", &save_path, "--tag", &other],
+    );
+    for stage in [
+        PinStage::Published,
+        PinStage::CandidateReady,
+        PinStage::BeforePinLock,
+        PinStage::PinLocked,
+    ] {
+        gate.expect(stage).reply(Reply::Continue);
+    }
+    gate.expect(PinStage::BeforePinSave)
+        .reply(Reply::FailBeforeSave);
+    let out = peer.wait();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("but its approval was not updated"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(
+        h.pin_for(&other),
+        None,
+        "the refused approval records nothing"
+    );
+    assert_eq!(h.pin_for(&tag), Some(a_pin.clone()));
+    let overwritten: serde_json::Value =
+        serde_json::from_slice(&fs::read(&approved_path).unwrap()).unwrap();
+    assert_ne!(
+        overwritten["manifest_digest"], a.manifest_digest,
+        "the publication is not rolled back, so the alias still moved"
+    );
+
+    // G4's promise, now true: a launch keeps booting the previously approved
+    // content, with no registry request.
+    let before = server.count();
+    let launched = h.launch(&tag);
+    assert_eq!(
+        sdk_image(&launched),
+        approved_key,
+        "the approved image still boots after a refused approval: {}",
+        stderr(&launched)
+    );
+    assert_eq!(server.count(), before, "{:?}", server.requests());
+    assert_eq!(
+        fs::read(&approved_path).unwrap(),
+        approved_bytes,
+        "the repair restores the approved key byte for byte"
+    );
+}
+
+/// Seed the cache with approved-ready content but neither an approval nor a
+/// content receipt: the state a host that predates content receipts is in after
+/// the import it once ran, whose approval this home has never recorded.
+fn seed_receiptless_cache(h: &Harness, archive: &Path, tag: &str) {
+    // The cache lives in the state directory and approvals live in `$HOME`, so
+    // an import under a throwaway home fills exactly one of the two.
+    let elsewhere = h.root.path().join("seeding-home");
+    fs::create_dir_all(&elsewhere).unwrap();
+    let mut command = h.command();
+    command
+        .env("HOME", &elsewhere)
+        .stdin(std::process::Stdio::null())
+        .args([
+            "image",
+            "import",
+            "--input",
+            archive.to_str().unwrap(),
+            "--tag",
+            tag,
+        ]);
+    let seeded = bounded(command);
+    assert_eq!(seeded.status.code(), Some(0), "{}", stderr(&seeded));
+    assert_eq!(
+        h.pin_for(tag),
+        None,
+        "the throwaway import must approve nothing in the home under test"
+    );
+    forget_content_receipts(h);
+}
+
+/// Drop every content receipt, so the cache looks like one written before this
+/// change: validated content, no evidence of it.
+fn forget_content_receipts(h: &Harness) {
+    match fs::remove_dir_all(h.cache().join("agent-vm-content-metadata")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        result => result.expect("drop the content receipts"),
+    }
+    assert!(
+        content_receipts(h).is_empty(),
+        "the seed must leave the cache with no content evidence"
+    );
+}
+
+/// D11: a pin created by a launch from a **warm** cache — the shape of every pin
+/// written before content evidence existed — still leaves that evidence, so an
+/// archive alias of its digest cannot cost it offline availability.
+///
+/// The repair D10 added reads a content receipt for the exact acquired
+/// `repo@digest`; a first pin that went through `CachedOrAcquire` used to write
+/// none, and no part of this path can invent one from a cache whose key the
+/// alias has already overwritten.
+#[test]
+fn a_receiptless_legacy_pin_survives_an_archive_alias_of_its_digest() {
+    let h = Harness::new(Mode::LaunchSeam);
+    // Bound but never served: a registry request fails this row instead of
+    // silently succeeding.
+    let server = Server::new();
+    let tag = format!("{}/images:t", server.host);
+    let a = archive_at(&h, "legacy-a.tar", "legacy-a");
+    let approved_key = format!("{}/images@{}", server.host, a.manifest_digest);
+
+    // 1. Cache content, no approval, no receipt.
+    seed_receiptless_cache(&h, &a.path, &tag);
+
+    // 2. The launch is the first post-upgrade event: a warm cache hit with no
+    //    approval to start from, and no registry to ask.
+    let before = server.count();
+    let first = h.launch(&tag);
+    assert_eq!(
+        server.count(),
+        before,
+        "a warm first pin must not contact the registry: {:?}",
+        server.requests()
+    );
+    assert_eq!(
+        sdk_image(&first),
+        approved_key,
+        "the warm launch boots the digest the cache holds: {}",
+        stderr(&first)
+    );
+    let a_pin = (a.manifest_digest.clone(), 1);
+    assert_eq!(h.pin_for(&tag), Some(a_pin.clone()));
+    // A's content-addressed metadata, byte for byte.
+    let approved_path = cache_metadata_path(&h, &approved_key);
+    let approved_bytes = fs::read(&approved_path).unwrap();
+
+    // 3. Import B under a *different* result reference, spelling A's digest as an
+    //    archive-carried name: the loader publishes that name, so A's key now
+    //    describes B.
+    let other = format!("{}/images:other", server.host);
+    let save = image_archive::write_docker_save(
+        &h.root.path().join("legacy-b.tar"),
+        &[image_archive::DockerSaveImage {
+            marker: "legacy-b".into(),
+            repo_tags: Some(vec![approved_key.clone()]),
+        }],
+    );
+    let imported = h.import(&save[0].path, &other);
+    assert_eq!(imported.status.code(), Some(0), "{}", stderr(&imported));
+    let (_, b_digest) = image_archive::docker_save_manifest("legacy-b");
+    assert_eq!(
+        h.pin_for(&other),
+        Some((b_digest.clone(), 1)),
+        "the alias import approves its own result at the fixture's synthesized manifest"
+    );
+    let overwritten: serde_json::Value =
+        serde_json::from_slice(&fs::read(&approved_path).unwrap()).unwrap();
+    assert_eq!(
+        overwritten["manifest_digest"],
+        serde_json::json!(b_digest),
+        "the fixture must really overwrite the digest-spelled key"
+    );
+
+    // 4. The approved tag still launches offline, at A, with A's metadata
+    //    restored from the receipt.
+    assert_eq!(
+        h.pin_for(&tag),
+        Some(a_pin),
+        "an archive name never moves an approval"
+    );
+    let before = server.count();
+    let launched = h.launch(&tag);
+    assert_eq!(
+        sdk_image(&launched),
+        approved_key,
+        "the legacy pin still boots its approved digest: {}",
+        stderr(&launched)
+    );
+    assert_eq!(
+        server.count(),
+        before,
+        "a repaired approved digest needs no registry: {:?}",
+        server.requests()
+    );
+    assert_eq!(
+        fs::read(&approved_path).unwrap(),
+        approved_bytes,
+        "the repair restores the approved key byte for byte"
+    );
+
+    // 5. The evidence that made the repair possible: the first pin validated
+    //    content, so it left a content-only receipt for the exact identity a
+    //    repair looks up. Asserted last so a missing receipt still shows up as the
+    //    offline failure above, which is what a user would see.
+    let receipt = receipt_for(&h, &a.manifest_digest).expect(
+        "a first pin validates content, so it must leave content evidence for it (D11); \
+         without one, an archive alias of that digest cannot be repaired",
+    );
+    assert_eq!(
+        receipt["source_bindings"],
+        serde_json::json!([]),
+        "a cache hit proves what the cache holds, never a registry association"
+    );
+    assert_eq!(
+        receipt["acquired_reference"],
+        serde_json::json!(approved_key),
+        "the receipt names the exact acquired identity a repair will look up"
+    );
+}
+
+/// The same legacy sequence, with the alias import's own approval forced to fail
+/// at the save: a refused approval must not cost the previously pinned image its
+/// offline availability (G4).
+#[test]
+fn a_failed_approval_after_a_legacy_pin_cannot_cost_it_offline_availability() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let tag = format!("{}/images:t", server.host);
+    let a = archive_at(&h, "legacy-a.tar", "legacy-a");
+    let approved_key = format!("{}/images@{}", server.host, a.manifest_digest);
+    seed_receiptless_cache(&h, &a.path, &tag);
+    let first = h.launch(&tag);
+    assert_eq!(sdk_image(&first), approved_key, "{}", stderr(&first));
+    let a_pin = (a.manifest_digest.clone(), 1);
+    assert_eq!(h.pin_for(&tag), Some(a_pin.clone()));
+    let approved_path = cache_metadata_path(&h, &approved_key);
+    let approved_bytes = fs::read(&approved_path).unwrap();
+
+    let other = format!("{}/images:other", server.host);
+    let save = image_archive::write_docker_save(
+        &h.root.path().join("legacy-b.tar"),
+        &[image_archive::DockerSaveImage {
+            marker: "legacy-b".into(),
+            repo_tags: Some(vec![approved_key.clone()]),
+        }],
+    );
+    let save_path = save[0].path.to_string_lossy().into_owned();
+    let mut gate = PinGate::new(h.root.path());
+    let peer = PinPeer::spawn(
+        h.command(),
+        &gate,
+        &["image", "import", "--input", &save_path, "--tag", &other],
+    );
+    for stage in [
+        PinStage::Published,
+        PinStage::CandidateReady,
+        PinStage::BeforePinLock,
+        PinStage::PinLocked,
+    ] {
+        gate.expect(stage).reply(Reply::Continue);
+    }
+    gate.expect(PinStage::BeforePinSave)
+        .reply(Reply::FailBeforeSave);
+    let out = peer.wait();
+    drop(gate);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("but its approval was not updated"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(
+        h.pin_for(&other),
+        None,
+        "the refused approval records nothing"
+    );
+    assert_eq!(h.pin_for(&tag), Some(a_pin));
+    let (_, b_digest) = image_archive::docker_save_manifest("legacy-b");
+    let overwritten: serde_json::Value =
+        serde_json::from_slice(&fs::read(&approved_path).unwrap()).unwrap();
+    assert_eq!(
+        overwritten["manifest_digest"],
+        serde_json::json!(b_digest),
+        "the publication is not rolled back, so the alias still moved"
+    );
+
+    let before = server.count();
+    let launched = h.launch(&tag);
+    assert_eq!(
+        sdk_image(&launched),
+        approved_key,
+        "the legacy pin still boots after a refused approval: {}",
+        stderr(&launched)
+    );
+    assert_eq!(server.count(), before, "{:?}", server.requests());
+    assert_eq!(
+        fs::read(&approved_path).unwrap(),
+        approved_bytes,
+        "the repair restores the approved key byte for byte"
     );
 }
 

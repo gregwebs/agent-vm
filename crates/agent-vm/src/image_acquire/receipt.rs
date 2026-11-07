@@ -493,10 +493,26 @@ impl Receipt {
         {
             return Err(ReceiptError::Corrupt);
         }
-        // The preserved metadata's own platform must still be this host Linux
-        // one: a receipt is only meaningful for the platform key it lives under.
+        // The preserved metadata's own platform must still be acceptable under
+        // this receipt's platform key: a receipt is only meaningful for the
+        // platform key it lives under.
+        //
+        // Acceptance is the cache-completeness rule, not exact equality. A host
+        // key states no variant, and an image whose OCI config declares one —
+        // which the Docker daemon writes for every arm64 image it builds itself
+        // (`docker import`, the classic `docker build` builder) — is still this
+        // host's image. Exact equality refused those as `Corrupt`, so any such
+        // image could not be approved at all (#391 review, verifier V44).
         let measured = check_metadata_platform(&file.metadata.raw_config_json)?;
-        if measured != file.platform {
+        if !receipt_platform_matches(ReceiptPlatformFacts {
+            os_matches: measured.os == file.platform.os,
+            architecture_matches: measured.architecture == file.platform.architecture,
+            variant_acceptable: file
+                .platform
+                .variant
+                .as_ref()
+                .is_none_or(|variant| measured.variant.as_ref() == Some(variant)),
+        }) {
             return Err(ReceiptError::Corrupt);
         }
         for layer in &file.metadata.layers {
@@ -514,6 +530,28 @@ impl Receipt {
         }
         Ok(())
     }
+}
+
+verus! {
+/// The measured facts of "this preserved config is acceptable under the receipt's
+/// platform key". Named fields rather than adjacent booleans, so an argument
+/// swap cannot invert the decision.
+#[derive(Clone, Copy)]
+struct ReceiptPlatformFacts {
+    os_matches: bool,
+    architecture_matches: bool,
+    /// The key states no variant (the host case) and so accepts any, or the key's
+    /// variant is the one the config declares.
+    variant_acceptable: bool,
+}
+
+/// The receipt's platform rule, contracted (ADR-0018), and the same rule
+/// [`crate::image_acquire::check_platform`] applies to a cached entry: an image
+/// of the host OS and architecture is this host's image whether or not its
+/// config names a variant the host does not.
+fn receipt_platform_matches(facts: ReceiptPlatformFacts) -> (ok: bool)
+    ensures ok == (facts.os_matches && facts.architecture_matches && facts.variant_acceptable),
+{ facts.os_matches && facts.architecture_matches && facts.variant_acceptable }
 }
 
 verus! {
@@ -798,12 +836,83 @@ mod tests {
         }
     }
 
+    /// The same metadata with an architecture `variant` declared in its OCI
+    /// config, as the Docker daemon writes for images it builds itself.
+    fn metadata_with_variant(digest: &str, variant: Option<&str>) -> CachedImageMetadata {
+        let base = metadata(digest);
+        let mut config: serde_json::Value = serde_json::from_str(&base.raw_config_json).unwrap();
+        if let Some(variant) = variant {
+            config["variant"] = serde_json::Value::String(variant.to_string());
+        }
+        let raw_config = config.to_string();
+        let parsed = ImageConfig::parse(raw_config.as_bytes()).unwrap().0;
+        CachedImageMetadata {
+            raw_config_json: raw_config,
+            config: parsed,
+            ..base
+        }
+    }
+
     fn acquired(digest: &str) -> PinnedReference {
         let typed = ValidatedDigest::parse(digest).unwrap();
         CanonicalOciReference::parse("localhost:5000/a:tag")
             .unwrap()
             .with_digest(&typed)
             .unwrap()
+    }
+
+    /// An image whose config declares an architecture `variant` is still this
+    /// host's image: the Docker daemon writes `v8` for every arm64 image it
+    /// builds itself, and the cache-completeness rule accepts it. Exact equality
+    /// with the host key (which states no variant) refused those as `Corrupt`, so
+    /// no such image could be approved (#391, verifier V44).
+    #[test]
+    fn a_config_variant_is_acceptable_under_a_variantless_host_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let platform = Platform::host_linux();
+        let variant = if cfg!(target_arch = "aarch64") {
+            "v8"
+        } else {
+            "v3"
+        };
+        let declared = metadata_with_variant(&digest, Some(variant));
+        let receipt = Receipt::new(&acquired(&digest), &platform, &declared, None)
+            .expect("a declared variant is part of a host image, not corruption");
+        receipt.write(directory.path()).unwrap();
+        let read = Receipt::read(directory.path(), &acquired(&digest), &platform)
+            .unwrap()
+            .expect("receipt present");
+        assert_eq!(read.metadata().config_digest, declared.config_digest);
+
+        // A key that states a variant still has to see that exact variant, so the
+        // looser host rule cannot be borrowed to accept a different one.
+        let arch = platform.arch.to_string();
+        let named = Platform::with_variant("linux", arch.as_str(), variant);
+        assert!(Receipt::new(&acquired(&digest), &named, &declared, None).is_ok());
+        assert_eq!(
+            Receipt::new(&acquired(&digest), &named, &metadata(&digest), None).err(),
+            Some(ReceiptError::Corrupt),
+            "a config with no variant does not satisfy a key that names one"
+        );
+    }
+
+    /// Every Boolean combination of the receipt platform rule, independent of any
+    /// parser: identical to the cache-completeness rule, which is the point.
+    #[test]
+    fn receipt_platform_truth_table() {
+        for bits in 0u8..8 {
+            let facts = ReceiptPlatformFacts {
+                os_matches: bits & 1 != 0,
+                architecture_matches: bits & 2 != 0,
+                variant_acceptable: bits & 4 != 0,
+            };
+            assert_eq!(
+                receipt_platform_matches(facts),
+                facts.os_matches && facts.architecture_matches && facts.variant_acceptable,
+                "facts {bits}"
+            );
+        }
     }
 
     #[test]
