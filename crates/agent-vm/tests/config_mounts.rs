@@ -1071,6 +1071,178 @@ fn normalized_guest_spellings_merge_and_conflict_across_sources() {
     h.assert_refused_before_launch_state(&out, &before, "is claimed by different declarations");
 }
 
+/// A guest `~/` is the host `$HOME` text expanded before the claim (#530): it and
+/// the absolute spelling are one declaration — one bind, no conflict, one fork —
+/// and it means the host home under `--root` too, never `/root`.
+#[test]
+fn a_guest_tilde_is_the_host_home_spelled_out() {
+    let h = Harness::new();
+    seed_source(&h, "a");
+    let home = h.home_root.display().to_string();
+    let guest = format!("{home}/x");
+
+    // The two config spellings of one declaration merge, and so does the
+    // shell-expanded `--mount` twin.
+    h.write_user(&format!("mounts = [\"~/a:~/x:ro\", \"~/a:{guest}:ro\"]\n"));
+    let out = h.launch(&["--mount", &format!("{home}/a:{guest}:ro")], "shell", &[]);
+    let stderr = stderr_of(&out);
+    let binds = bind_mounts(&debug_config_json(&stderr));
+    let at_guest: Vec<_> = binds
+        .iter()
+        .filter(|(_, bind_guest, _)| bind_guest == &guest)
+        .collect();
+    assert_eq!(
+        at_guest.len(),
+        1,
+        "`~/x` and `{guest}` are one claim, not two binds: {binds:?}"
+    );
+    assert_eq!(at_guest[0].0, format!("{home}/a"), "{binds:?}");
+    assert!(at_guest[0].2, "the merged declaration keeps :ro: {binds:?}");
+
+    // Under `--root` the guest is still the host home path: `~/` never means the
+    // guest's own home.
+    let out = h.launch(&["--root"], "shell", &[]);
+    let stderr = stderr_of(&out);
+    let binds = bind_mounts(&debug_config_json(&stderr));
+    assert!(
+        binds
+            .iter()
+            .any(|(_, bind_guest, ro)| bind_guest == &guest && *ro),
+        "a `~/` guest is the host home under --root too: {binds:?}"
+    );
+    assert!(
+        !binds
+            .iter()
+            .any(|(_, bind_guest, _)| bind_guest.starts_with("/root/x")),
+        "`~/` must never mean the guest's home: {binds:?}"
+    );
+}
+
+/// Fork identity: a config `~/src:~/f:fork` and an absolute
+/// `<home>/src:<home>/f:fork` are one project-scoped fork, because the guest was
+/// expanded before `fork_id` hashed it (#530/R4).
+#[test]
+fn a_guest_tilde_fork_is_the_absolute_declarations_fork() {
+    let h = Harness::new();
+    let home = h.home_root.display().to_string();
+    let src = seed_source(&h, "src");
+    let fork_guest = format!("{home}/f");
+
+    h.write_user("mounts = [\"~/src:~/f:fork\"]\n");
+    let seeded = h.launch(&[], "shell", &[]);
+    let seeded_stderr = stderr_of(&seeded);
+    assert!(
+        seeded_stderr.contains("==> Initialized fork"),
+        "{seeded_stderr}"
+    );
+    let committed = only_fork_data(&h);
+
+    // The spelled-out twin is the same declaration: the same store, no reseed.
+    let reused = h.launch(
+        &[
+            "--no-config-mounts",
+            "--mount",
+            &format!("{home}/src:{fork_guest}:fork"),
+        ],
+        "shell",
+        &[],
+    );
+    let stderr = stderr_of(&reused);
+    assert!(stderr.contains("==> Reusing fork"), "{stderr}");
+    let binds = bind_mounts(&debug_config_json(&stderr));
+    assert!(
+        binds
+            .iter()
+            .any(|(host, guest, _)| Path::new(host) == committed && guest == &fork_guest),
+        "the spelled-out declaration must bind the same committed copy: {binds:?}"
+    );
+    assert_eq!(h.fork_dirs().len(), 1, "one declaration, one fork");
+    assert!(src.join("content").exists());
+}
+
+/// The other two sites reach a launch the same way (#530/R1): a named set
+/// selected explicitly, and a full user tool's own list. Both bind the host home
+/// spelling at the guest it expanded to, and never the guest's own home.
+#[test]
+fn a_guest_tilde_applies_to_set_and_tool_declarations() {
+    let h = Harness::new();
+    let set_source = seed_source(&h, "set-a");
+    let tool_source = seed_source(&h, "tool-a");
+    let home = h.home_root.display().to_string();
+    let set_guest = format!("{home}/set-g");
+    let tool_guest = format!("{home}/tool-g");
+    h.write_user(
+        "[mount_sets]\nset-a = [\"~/set-a:~/set-g:ro\"]\n\
+         [[tools]]\nname = \"probe\"\ncommand = \"/bin/echo\"\n\
+         mounts = [\"~/tool-a:~/tool-g:rw\"]\n",
+    );
+
+    // Definitions alone select nothing, so the set is named explicitly.
+    let out = h.launch(&["--mount", "set-a"], "shell", &[]);
+    let stderr = stderr_of(&out);
+    let binds = bind_mounts(&debug_config_json(&stderr));
+    assert!(
+        binds
+            .iter()
+            .any(|(host, guest, readonly)| Path::new(host) == set_source
+                && guest == &set_guest
+                && *readonly),
+        "a set leaf's `~/` guest is the host home: {binds:?}"
+    );
+    assert!(
+        !binds.iter().any(|(_, guest, _)| guest == "/root/set-g"),
+        "`~/` must never mean the guest's home: {binds:?}"
+    );
+
+    let out = h.launch(&[], "probe", &[]);
+    let stderr = stderr_of(&out);
+    let binds = bind_mounts(&debug_config_json(&stderr));
+    assert!(
+        binds
+            .iter()
+            .any(|(host, guest, readonly)| Path::new(host) == tool_source
+                && guest == &tool_guest
+                && !*readonly),
+        "a user tool's `~/` guest is the host home: {binds:?}"
+    );
+    assert!(
+        !binds.iter().any(|(_, guest, _)| guest == &set_guest),
+        "the tool launch selected no set: {binds:?}"
+    );
+}
+
+/// A `$HOME` carrying `,` is refused with the entry *and* what it expanded to,
+/// on one escaped line (#530/R8): the offending byte lives in a directory name
+/// the reader would otherwise have to find in their own `$HOME`. `HOME` here is
+/// an alias of the harness home whose name carries the comma, so the captured
+/// spelling — the one that must be shown — is that alias.
+#[test]
+fn a_refusal_names_the_expansion_of_a_comma_home() {
+    let h = Harness::new();
+    seed_source(&h, "a");
+    h.write_user("mounts = [\"~/a:~/x:ro\"]\n");
+    let alias_parent = tempfile::tempdir_in(support::workspace_tmpdir()).unwrap();
+    let alias = alias_parent.path().canonicalize().unwrap().join("h,o");
+    std::os::unix::fs::symlink(&h.home_root, &alias).unwrap();
+
+    let out = h.launch_with_home(&alias, &[], "shell", &[]);
+    let stderr = stderr_of(&out);
+    assert!(!out.status.success(), "the launch must refuse: {stderr}");
+    let home = alias.display();
+    let expected = format!(
+        "mounts[0] \"~/a:~/x:ro\" (expands to \"{home}/a:{home}/x:ro\"): guest path must be \
+         absolute, must not be /, and must not contain `..`, `:`, `;`, `,` or control characters"
+    );
+    assert!(
+        stderr.contains(&expected),
+        "expected {expected:?} in: {stderr}"
+    );
+    assert!(
+        !stderr.contains(CONFIG_MARKER),
+        "the refusal must precede builder wiring: {stderr}"
+    );
+}
+
 /// A config declaration and a `--mount` at one guest path with different hosts
 /// are refused — never last-wins, never a CLI override. The refusal names both
 /// origins and the opt-out that resolves it.

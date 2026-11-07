@@ -3878,12 +3878,37 @@ mod tests {
         assert_eq!(spellings, ["/h//ref", "/abs/ref"]);
         assert_ne!(std::env::var("HOME").ok(), Some("/h/".to_string()));
 
+        // A guest `~/` is the same captured home (#530), expanded before the
+        // claim so `~/g` and `/h/g` are one declaration.
+        write_file(&user, "mounts = [\"/abs:~/g\"]\n");
+        let report = load(&with_home(Some(PathBuf::from("/h/")))).unwrap();
+        let guests: Vec<String> = report
+            .user_mounts()
+            .unwrap()
+            .defaults()
+            .expect("the file declares defaults")
+            .requests()
+            .map(|request| request.mount.guest.display().to_string())
+            .collect();
+        assert_eq!(guests, ["/h/g"]);
+
         // No captured home: `~/` is refused rather than derived from the user
         // path's parent (`<tmp>/cfg`), and an absolute entry still loads.
+        write_file(&user, "mounts = [\"~/ref\", \"/abs/ref\"]\n");
         assert_eq!(
             load(&with_home(None)).unwrap_err().to_string(),
             format!(
-                "config: {:?}: mounts[0] \"~/ref\": a ~/ host path needs a UTF-8 $HOME",
+                "config: {:?}: mounts[0] \"~/ref\": a ~/ host or guest path needs a UTF-8 $HOME",
+                user
+            )
+        );
+        // The guest field is refused by the same sentence, and only when it is a
+        // field that needed expanding.
+        write_file(&user, "mounts = [\"/abs:~/g\"]\n");
+        assert_eq!(
+            load(&with_home(None)).unwrap_err().to_string(),
+            format!(
+                "config: {:?}: mounts[0] \"/abs:~/g\": a ~/ host or guest path needs a UTF-8 $HOME",
                 user
             )
         );
@@ -3899,7 +3924,7 @@ mod tests {
             load(&with_home(Some(non_utf8)))
                 .unwrap_err()
                 .to_string()
-                .contains("mounts[0] \"~/ref\": a ~/ host path needs a UTF-8 $HOME")
+                .contains("mounts[0] \"~/ref\": a ~/ host or guest path needs a UTF-8 $HOME")
         );
     }
 

@@ -596,15 +596,16 @@ fn fork_root_context(verb: &str, declaration: Declaration<'_>, source: &Path) ->
     }
 }
 
-// The pure decisions this module makes about a declaration. Three of them decide
-// what a launch is allowed to do — which host spelling the grammar accepts, and
-// whether two claims at one guest path merge or are refused — so per ADR-0018
-// they are kernels and every byte outside them is a trusted adapter. A kernel
-// body is written in a shape its `ensures` clause does not use, so a mutation
-// control can name the body alone (see `script/test/egress-mutations.py`);
-// `host_spelling` is the one documented exception, just below.
+// The pure decisions this module makes about a declaration. Four of them decide
+// what a launch is allowed to do — which path spellings a grammar accepts, whether
+// a segment is a guest path or a mode keyword, and whether two claims at one guest
+// path merge or are refused — so per ADR-0018 they are kernels and every byte
+// outside them is a trusted adapter. A kernel body is written in a shape its
+// `ensures` clause does not use, so a mutation control can name the body alone
+// (see `script/test/egress-mutations.py`); `path_spelling` is the one documented
+// exception, just below.
 verus! {
-/// Which host spellings a grammar accepts.
+/// Which path spellings a grammar accepts, in either path field.
 ///
 /// `--mount` gets `Disabled`: the shell already expanded `~`, so a quoted `~/x`
 /// is a relative path and must stay "must be absolute" (ADR-0046 pins that).
@@ -613,9 +614,10 @@ verus! {
 pub enum HomeExpansion { Disabled, Enabled }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Structural)]
-pub enum HostSpelling { Literal, ExpandHome, Refused }
+pub enum PathSpelling { Literal, ExpandHome, Refused }
 
 pub open spec fn starts_slash(b: Seq<u8>) -> bool { b.len() >= 1 && b[0] == 0x2fu8 }
+pub open spec fn starts_dot(b: Seq<u8>) -> bool { b.len() >= 1 && b[0] == 0x2eu8 }
 pub open spec fn starts_tilde_slash(b: Seq<u8>) -> bool {
     b.len() >= 2 && b[0] == 0x7eu8 && b[1] == 0x2fu8 }
 
@@ -626,15 +628,29 @@ pub open spec fn starts_tilde_slash(b: Seq<u8>) -> bool {
 // anchors on the home-expansion arm's own byte tests rather than on a single
 // expression the `ensures` also spells.
 #[allow(clippy::len_zero)]
-pub fn host_spelling(bytes: &[u8], home: HomeExpansion) -> (d: HostSpelling)
+pub fn path_spelling(bytes: &[u8], home: HomeExpansion) -> (d: PathSpelling)
     ensures
-        (d == HostSpelling::Literal) == starts_slash(bytes@),
-        (d == HostSpelling::ExpandHome) == (home == HomeExpansion::Enabled && starts_tilde_slash(bytes@)),
-        home == HomeExpansion::Disabled ==> d != HostSpelling::ExpandHome,
+        (d == PathSpelling::Literal) == starts_slash(bytes@),
+        (d == PathSpelling::ExpandHome) == (home == HomeExpansion::Enabled && starts_tilde_slash(bytes@)),
+        home == HomeExpansion::Disabled ==> d != PathSpelling::ExpandHome,
 {
-    if bytes.len() >= 1 && bytes[0] == 0x2f { HostSpelling::Literal }
-    else if home == HomeExpansion::Enabled && bytes.len() >= 2 && bytes[0] == 0x7e && bytes[1] == 0x2f { HostSpelling::ExpandHome }
-    else { HostSpelling::Refused }
+    if bytes.len() >= 1 && bytes[0] == 0x2f { PathSpelling::Literal }
+    else if home == HomeExpansion::Enabled && bytes.len() >= 2 && bytes[0] == 0x7e && bytes[1] == 0x2f { PathSpelling::ExpandHome }
+    else { PathSpelling::Refused }
+}
+
+/// The sole rule that disambiguates `HOST:GUEST` from `HOST:MODE`: a guest is a
+/// path spelling the grammar accepts, or a `.`-relative path kept a guest so it is
+/// refused as "must be absolute" rather than as an unknown mode. `~/` is a guest
+/// only where `~/` expands (#530), so argv keeps reading `/a:~/b` as a mode.
+#[allow(clippy::len_zero)]
+pub fn segment_is_guest_path(bytes: &[u8], home: HomeExpansion) -> (g: bool)
+    ensures
+        g == (starts_dot(bytes@) || starts_slash(bytes@)
+              || (home == HomeExpansion::Enabled && starts_tilde_slash(bytes@))),
+        (home == HomeExpansion::Disabled && starts_tilde_slash(bytes@)) ==> !g,
+{
+    (bytes.len() >= 1 && bytes[0] == 0x2e) || path_spelling(bytes, home) != PathSpelling::Refused
 }
 
 /// The six facts [`same_declaration`] measures. Named fields rather than six
@@ -682,12 +698,12 @@ pub fn claim_decision(f: ClaimFacts) -> (d: ClaimDecision)
 }
 } // verus!
 
-/// A `GUEST` segment must start with `/` or `.`; anything trailing that
-/// doesn't is a mode keyword. This is the sole rule that disambiguates
-/// `HOST:GUEST` from `HOST:MODE` (e.g. `HOST:ro`) since both are a single
-/// segment right after `HOST`.
-fn segment_is_guest_path(seg: &str) -> bool {
-    seg.starts_with('/') || seg.starts_with('.')
+/// `~/rest` → `home` + `/rest`: replace exactly the one leading `~` and keep the
+/// rest byte for byte, so a trailing-slash HOME keeps its `//` (ADR-0046 D3). One
+/// substitution for both path fields, so a host and a guest `~/` cannot expand
+/// differently.
+fn expand_home(home: &str, field: &str) -> String {
+    format!("{home}{}", &field[1..])
 }
 
 /// Which host spellings one caller's grammar accepts.
@@ -785,7 +801,7 @@ impl fmt::Display for MountSpecErrorKind {
                 "host path must be absolute or start with ~/ (environment variables and other \
                  relative paths are not expanded)",
             ),
-            Self::HomeUnavailable => f.write_str("a ~/ host path needs a UTF-8 $HOME"),
+            Self::HomeUnavailable => f.write_str("a ~/ host or guest path needs a UTF-8 $HOME"),
             Self::GuestNotAbsolute => f.write_str("guest path must be absolute"),
             Self::GuestUnmountable => f.write_str(
                 "guest path contains control characters that can't be carried into the guest",
@@ -815,19 +831,20 @@ impl fmt::Display for MountSpecErrorKind {
 /// Grammar: `HOST[:GUEST][:MODE][:MODE]...`. `HOST` alone defaults `GUEST`
 /// to the same path (mirror), read-write. `GUEST`, if present,
 /// must be the segment immediately after `HOST` and must start with `/` or
-/// `.` (see [`segment_is_guest_path`]); everything after that is a mode
-/// keyword (`ro`/`rw` — see [`MountMode`]). Path validity is checked before
-/// mode keywords so `relativehost:bogus` reports the host error, not
-/// "unknown mode". `ro`+`rw` together, and any keyword `MountMode` doesn't
-/// recognize, are hard parse-time errors.
+/// `.`, or `~/` where the grammar expands it (see [`segment_is_guest_path`]);
+/// everything after that is a mode keyword (`ro`/`rw` — see [`MountMode`]).
+/// Path validity is checked before mode keywords so `relativehost:bogus`
+/// reports the host error, not "unknown mode". `ro`+`rw` together, and any
+/// keyword `MountMode` doesn't recognize, are hard parse-time errors.
 ///
 /// Colon-bearing guest paths are undocumented/pathological: the grammar splits
 /// on every colon, so a trailing token is read as a mode keyword and fails as
 /// "unknown mode keyword \"x\"" (`/h:/g:x`). A relative `GUEST` segment is
 /// likewise classified as a mode keyword and fails as "unknown mode keyword
 /// \"relative-guest\"" rather than "guest path must be absolute" — still a hard
-/// error, just a different message. Both are pinned by
-/// `parse_extra_mounts_colon_in_guest_now_mode_error` and
+/// error, just a different message. `--mount /a:~/b` stays one of those: argv
+/// never expands `~`, so the would-be guest `~/b` is read as a mode. Both are
+/// pinned by `parse_extra_mounts_colon_in_guest_now_mode_error` and
 /// `parse_extra_mounts_rejects_relative_paths`.
 pub(crate) fn parse_mount_spec(
     entry: &str,
@@ -846,12 +863,10 @@ pub(crate) fn parse_mount_spec(
     }
     // The host decision, before `GUEST` mirrors it: a mirror must be the path
     // the mount really names, so `~/ref` mirrors the *expanded* host.
-    let host_s = match host_spelling(host_s.as_bytes(), syntax.expansion()) {
-        HostSpelling::Literal => host_s,
-        HostSpelling::ExpandHome => match syntax.home() {
-            // Replace exactly the one leading `~`; the rest (starting with `/`)
-            // is kept byte-for-byte, so a trailing-slash HOME keeps its `//`.
-            Some(home) => format!("{home}{}", &host_s[1..]),
+    let host_s = match path_spelling(host_s.as_bytes(), syntax.expansion()) {
+        PathSpelling::Literal => host_s,
+        PathSpelling::ExpandHome => match syntax.home() {
+            Some(home) => expand_home(home, &host_s),
             None => {
                 return Err(MountSpecError::new(
                     MountSpecErrorKind::HomeUnavailable,
@@ -861,7 +876,7 @@ pub(crate) fn parse_mount_spec(
                 ));
             }
         },
-        HostSpelling::Refused => {
+        PathSpelling::Refused => {
             return Err(MountSpecError::new(
                 MountSpecErrorKind::HostNotAccepted,
                 anyhow::anyhow!("--mount host path {host_s:?} must be absolute"),
@@ -869,10 +884,32 @@ pub(crate) fn parse_mount_spec(
         }
     };
 
-    // Optional GUEST: only the first tail segment, and only if it
-    // looks like a path. Otherwise GUEST mirrors HOST (today's default).
-    let guest_s = if tail.first().is_some_and(|s| segment_is_guest_path(s)) {
-        tail.remove(0).to_string()
+    // Optional GUEST: only the first tail segment, and only if it looks like a
+    // path under this grammar. Otherwise GUEST mirrors HOST (today's default).
+    // The guest then goes through the same spelling decision as the host, so
+    // everything downstream sees an absolute path, exactly as if it were typed.
+    let expansion = syntax.expansion();
+    let explicit_guest = tail
+        .first()
+        .is_some_and(|s| segment_is_guest_path(s.as_bytes(), expansion));
+    let guest_s = if explicit_guest {
+        let seg = tail.remove(0);
+        match path_spelling(seg.as_bytes(), expansion) {
+            // `Refused` here is only a `.`-relative guest: kept as written so the
+            // absolute check below refuses it with today's bytes.
+            PathSpelling::Literal | PathSpelling::Refused => seg.to_string(),
+            PathSpelling::ExpandHome => match syntax.home() {
+                Some(home) => expand_home(home, seg),
+                None => {
+                    return Err(MountSpecError::new(
+                        MountSpecErrorKind::HomeUnavailable,
+                        anyhow::anyhow!(
+                            "--mount guest path {seg:?} needs a UTF-8 $HOME to expand `~`"
+                        ),
+                    ));
+                }
+            },
+        }
     } else {
         host_s.clone()
     };
@@ -911,7 +948,7 @@ pub(crate) fn parse_mount_spec(
 
     // --- Then classify the remaining tail segments as mode keywords. ---
     let mut modes: Vec<MountMode> = Vec::new();
-    for kw in tail {
+    for (position, kw) in tail.into_iter().enumerate() {
         if kw.is_empty() {
             // e.g. `/h::ro` — a stray `::`. Point at it rather than
             // reporting "unknown mode keyword \"\"".
@@ -927,11 +964,23 @@ pub(crate) fn parse_mount_spec(
             continue;
         }
         let mode = MountMode::from_keyword(kw).ok_or_else(|| {
+            // The shell expands `~` only at the start of a word, never after
+            // `:`, so a `~/` where a guest belongs is a guest the user meant
+            // config-style; say how to write it. Asked through the one
+            // classifier, as "would config expand this?".
+            let tilde_guest = position == 0
+                && !explicit_guest
+                && path_spelling(kw.as_bytes(), HomeExpansion::Enabled) == PathSpelling::ExpandHome;
+            let hint = if tilde_guest {
+                "; the shell does not expand ~ after ':', so write the guest path absolute"
+            } else {
+                ""
+            };
             MountSpecError::new(
                 MountSpecErrorKind::UnknownMode(kw.to_string()),
                 anyhow::anyhow!(
                     "--mount {entry:?}: unknown mode keyword {kw:?} \
-                     (expected `ro`, `rw`, `fork`, `follow-links`, or `exclude=REL`)"
+                     (expected `ro`, `rw`, `fork`, `follow-links`, or `exclude=REL`){hint}"
                 ),
             )
         })?;
@@ -955,14 +1004,18 @@ pub(crate) fn parse_mount_spec(
     let mut exclusions = Vec::new();
     // Exclusion values share the suffix list with modes.  They are parsed
     // here (before any source I/O) so an already READY fork can be reused
-    // after its source has disappeared.
-    for suffix in entry.split(':').skip(
-        if segment_is_guest_path(entry.split(':').nth(1).unwrap_or("")) {
+    // after its source has disappeared. The second segment is classified
+    // *trimmed*, exactly as GUEST above was, so the two cannot disagree about
+    // where the modes start.
+    let second = entry.split(':').nth(1).unwrap_or_default().trim();
+    for suffix in entry
+        .split(':')
+        .skip(if segment_is_guest_path(second.as_bytes(), expansion) {
             2
         } else {
             1
-        },
-    ) {
+        })
+    {
         let suffix = suffix.trim();
         if let Some(value) = suffix.strip_prefix("exclude=") {
             exclusions.push(
@@ -1014,6 +1067,40 @@ pub(crate) fn parse_mount_spec(
         policy,
         exclusions,
     })
+}
+
+/// `entry` with each path field the grammar expanded spelled out, every other
+/// byte as written: what a refusal after expansion shows beside the entry, so a
+/// HOME carrying `,` `;` `:` or a control byte is visible to whoever must fix it.
+/// `None` when nothing expanded — a refusal of an entry that expanded nothing
+/// keeps today's bytes (D3/R8a).
+///
+/// Field position mirrors [`parse_mount_spec`]: the host is segment 0, and the
+/// guest is segment 1 iff it is a guest path under this grammar.
+pub(crate) fn expanded_entry(entry: &str, syntax: HostSyntax<'_>) -> Option<String> {
+    let home = syntax.home()?;
+    let expansion = syntax.expansion();
+    let mut expanded = false;
+    let fields: Vec<String> = entry
+        .split(':')
+        .enumerate()
+        .map(|(index, raw)| {
+            let field = raw.trim_start();
+            let path = index == 0
+                || (index == 1 && segment_is_guest_path(field.trim_end().as_bytes(), expansion));
+            if path && path_spelling(field.as_bytes(), expansion) == PathSpelling::ExpandHome {
+                expanded = true;
+                format!(
+                    "{}{}",
+                    &raw[..raw.len() - field.len()],
+                    expand_home(home, field)
+                )
+            } else {
+                raw.to_string()
+            }
+        })
+        .collect();
+    expanded.then(|| fields.join(":"))
 }
 
 /// Parse the raw `--mount` argv strings into `ExtraMount`s.
@@ -2632,6 +2719,34 @@ mod tests {
                 "/abs-host:relative-guest",
                 "--mount \"/abs-host:relative-guest\": unknown mode keyword \"relative-guest\" (expected `ro`, `rw`, `fork`, `follow-links`, or `exclude=REL`)",
             ),
+            // #530/R9: a `~/` where the guest belongs is a mode keyword to argv,
+            // and the refusal says how to write what the user meant. Only that
+            // position earns the hint: a bare `~`, `~user/…` and a `~`-led token
+            // after a guest or after another mode keep today's bytes.
+            (
+                "/a:~/b",
+                "--mount \"/a:~/b\": unknown mode keyword \"~/b\" (expected `ro`, `rw`, `fork`, `follow-links`, or `exclude=REL`); the shell does not expand ~ after ':', so write the guest path absolute",
+            ),
+            (
+                "/a:~/b:ro",
+                "--mount \"/a:~/b:ro\": unknown mode keyword \"~/b\" (expected `ro`, `rw`, `fork`, `follow-links`, or `exclude=REL`); the shell does not expand ~ after ':', so write the guest path absolute",
+            ),
+            (
+                "/a:~",
+                "--mount \"/a:~\": unknown mode keyword \"~\" (expected `ro`, `rw`, `fork`, `follow-links`, or `exclude=REL`)",
+            ),
+            (
+                "/a:~user/x",
+                "--mount \"/a:~user/x\": unknown mode keyword \"~user/x\" (expected `ro`, `rw`, `fork`, `follow-links`, or `exclude=REL`)",
+            ),
+            (
+                "/a:/g:~/b",
+                "--mount \"/a:/g:~/b\": unknown mode keyword \"~/b\" (expected `ro`, `rw`, `fork`, `follow-links`, or `exclude=REL`)",
+            ),
+            (
+                "/a:ro:~/b",
+                "--mount \"/a:ro:~/b\": unknown mode keyword \"~/b\" (expected `ro`, `rw`, `fork`, `follow-links`, or `exclude=REL`)",
+            ),
             (
                 "/:/mnt/a\tb",
                 "--mount guest path \"/mnt/a\\tb\" contains control characters that can't be carried into the guest; pass a guest path without tabs/newlines",
@@ -2728,28 +2843,46 @@ mod tests {
 
     // ── shared grammar and claim kernels ─────────────────────────
 
-    /// `host_spelling` against an oracle written from the specification, not from
+    /// `path_spelling` against an oracle written from the specification, not from
     /// the kernel: `Literal` exactly for a leading `/`, `ExpandHome` exactly for a
     /// leading `~/` *when expansion is enabled*, and `Refused` otherwise. The
     /// specs erase under a plain build, so this table is what says the decision
-    /// is the right one.
+    /// is the right one. The decision now serves **both** path fields (#530), so
+    /// the table carries the spellings either field can be given.
     #[test]
-    fn host_spelling_matches_the_oracle_table() {
-        fn oracle(home: HomeExpansion, text: &str) -> HostSpelling {
+    fn path_spelling_matches_the_oracle_table() {
+        fn oracle(home: HomeExpansion, text: &str) -> PathSpelling {
             match (home, text.starts_with('/'), text.starts_with("~/")) {
-                (_, true, _) => HostSpelling::Literal,
-                (HomeExpansion::Enabled, false, true) => HostSpelling::ExpandHome,
-                _ => HostSpelling::Refused,
+                (_, true, _) => PathSpelling::Literal,
+                (HomeExpansion::Enabled, false, true) => PathSpelling::ExpandHome,
+                _ => PathSpelling::Refused,
             }
         }
         const TEXTS: &[&str] = &[
-            "", "/", "//", "/x", "/ ", "~", "~/", "~/x", "~x", "x", "./x", "foo/bar", "~//x",
+            "",
+            "/",
+            "//",
+            "/x",
+            "/ ",
+            "~",
+            "~/",
+            "~/x",
+            "~x",
+            "x",
+            "./x",
+            "foo/bar",
+            "~//x",
             "/~/x",
+            ".",
+            "..",
+            "ro",
+            "exclude=x",
+            "~user/x",
         ];
         for home in [HomeExpansion::Disabled, HomeExpansion::Enabled] {
             for text in TEXTS {
                 assert_eq!(
-                    host_spelling(text.as_bytes(), home),
+                    path_spelling(text.as_bytes(), home),
                     oracle(home, text),
                     "for {home:?} {text:?}"
                 );
@@ -2757,10 +2890,99 @@ mod tests {
         }
     }
 
+    /// `segment_is_guest_path` against the specification's own rule — `.`- or
+    /// `/`-led, or `~/` where `~/` expands — over the spellings either field is
+    /// given and both grammars. This is the rule that decides whether the segment
+    /// after `HOST` is a guest or a mode keyword, so a wrong row would silently
+    /// switch a mount's destination for a mode.
+    #[test]
+    fn segment_is_guest_path_matches_the_oracle_table() {
+        fn oracle(home: HomeExpansion, text: &str) -> bool {
+            text.starts_with('.')
+                || text.starts_with('/')
+                || (home == HomeExpansion::Enabled && text.starts_with("~/"))
+        }
+        const TEXTS: &[&str] = &[
+            "/x",
+            "//",
+            "/",
+            "~/x",
+            "~/",
+            "~//x",
+            "./x",
+            ".",
+            "..",
+            "~",
+            "~x",
+            "~user/x",
+            "ro",
+            "rw",
+            "fork",
+            "follow-links",
+            "exclude=x",
+            "",
+            "x",
+            "$HOME/x",
+        ];
+        for home in [HomeExpansion::Disabled, HomeExpansion::Enabled] {
+            for text in TEXTS {
+                assert_eq!(
+                    segment_is_guest_path(text.as_bytes(), home),
+                    oracle(home, text),
+                    "for {home:?} {text:?}"
+                );
+            }
+        }
+        // A mode keyword must never be read as a guest under either grammar, or
+        // `HOST:ro` would become a guest path named `ro`.
+        for keyword in ["ro", "rw", "fork", "follow-links", "exclude=REL"] {
+            for home in [HomeExpansion::Disabled, HomeExpansion::Enabled] {
+                assert!(
+                    !segment_is_guest_path(keyword.as_bytes(), home),
+                    "{keyword:?} is a mode keyword for {home:?}"
+                );
+            }
+        }
+    }
+
+    /// The expansion a refusal after expansion shows (D1): the whole entry with
+    /// each `~/` *path* field spelled out, every other byte as written — so a HOME
+    /// carrying `,` `;` `:` or a control byte is visible beside the entry that
+    /// cannot be mounted. `None` whenever nothing expanded, which is what keeps a
+    /// refusal of an untouched entry byte-identical to today (D3/R8a).
+    #[test]
+    fn expanded_entry_substitutes_only_expanded_fields() {
+        let config = HostSyntax::AbsoluteOrHome { home: Some("/h") };
+        for (entry, expected) in [
+            ("~/a:~/x:ro", Some("/h/a:/h/x:ro")),
+            ("/a:~/x", Some("/a:/h/x")),
+            // The mirror case: the host is the only field written as a path.
+            ("~/a", Some("/h/a")),
+            (" ~/a : ~/x ", Some(" /h/a : /h/x ")),
+            // Segment 2 is never a path, and a literal entry expands nothing.
+            ("/a:/x", None),
+            ("/a:ro:~/x", None),
+        ] {
+            assert_eq!(
+                expanded_entry(entry, config).as_deref(),
+                expected,
+                "for config {entry:?}"
+            );
+        }
+        // argv never expands a path field, and neither does a config grammar
+        // with no usable home: there is nothing to show beside the entry.
+        assert_eq!(expanded_entry("~/a:~/x", HostSyntax::AbsoluteOnly), None);
+        assert_eq!(
+            expanded_entry("~/a:~/x", HostSyntax::AbsoluteOrHome { home: None }),
+            None
+        );
+    }
+
     /// `--mount` is absolute-only, so the `~/` expansion cannot be reached from
-    /// argv at all: replacing the `home == HomeExpansion::Enabled` guard with a
-    /// bare length check would turn a quoted `~/x` into an expansion instead of
-    /// the "must be absolute" the shell contract promises.
+    /// argv at all — in either field: replacing the `home == HomeExpansion::Enabled`
+    /// guard with a bare length check would turn a quoted `~/x` into an expansion
+    /// instead of the "must be absolute" the shell contract promises, and passing
+    /// the wrong grammar would turn argv's `/x:~/y` into a guest.
     #[test]
     fn only_the_config_syntax_may_expand_a_tilde() {
         assert_eq!(
@@ -2781,11 +3003,25 @@ mod tests {
         )
         .expect("the config syntax expands `~/`");
         assert_eq!(mount.source_spelling, "/home/u/x");
+        // The guest field follows the host field's grammar: a `~/` guest is a
+        // mode keyword on argv and a guest path in the config.
+        let error = parse_mount_spec("/x:~/y", HostSyntax::AbsoluteOnly)
+            .expect_err("argv reads a `~/` guest as a mode keyword");
+        assert_eq!(error.kind(), MountSpecErrorKind::UnknownMode("~/y".into()));
+        let mount = parse_mount_spec(
+            "/x:~/y",
+            HostSyntax::AbsoluteOrHome {
+                home: Some("/home/u"),
+            },
+        )
+        .expect("the config syntax expands a `~/` guest");
+        assert_eq!(&mount.host, &PathBuf::from("/x"));
+        assert_eq!(&mount.guest, &PathBuf::from("/home/u/y"));
     }
 
     /// A non-UTF-8 (or otherwise unusable) HOME is a rejection, never a silent
-    /// relative path, and a caller cannot smuggle a relative host through the
-    /// config syntax either.
+    /// relative path — in either path field — and a caller cannot smuggle a
+    /// relative host or guest through the config syntax either.
     #[test]
     fn a_tilde_host_without_a_usable_home_is_refused() {
         // No usable HOME is its own kind — the config route tells the user the
@@ -2806,6 +3042,58 @@ mod tests {
         )
         .expect("a usable home expands");
         assert_eq!(mount.source_spelling, "/home/u/x");
+
+        // The guest field: refused with the same kind, so the config route can
+        // print one sentence covering both fields.
+        let error = parse_mount_spec("/x:~/y", HostSyntax::AbsoluteOrHome { home: None })
+            .expect_err("a `~/` guest cannot be expanded without a home");
+        assert_eq!(error.kind(), MountSpecErrorKind::HomeUnavailable);
+        // A relative home cannot make a relative *guest* absolute either: the
+        // expanded guest stays relative, so the absolute-guest check refuses it.
+        let error = parse_mount_spec("/x:~/y", HostSyntax::AbsoluteOrHome { home: Some("rel") })
+            .expect_err("a relative home cannot make a relative guest absolute");
+        assert_eq!(error.kind(), MountSpecErrorKind::GuestNotAbsolute);
+        // The host decision comes first, so an entry whose *host* needs the home
+        // reports the host's refusal rather than the guest's.
+        let error = parse_mount_spec("~/x:~/y", HostSyntax::AbsoluteOrHome { home: None })
+            .expect_err("the host field is decided first");
+        assert_eq!(error.kind(), MountSpecErrorKind::HomeUnavailable);
+    }
+
+    /// R2's spelling half, at the layer that produces it: a `$HOME` ending in `/`
+    /// leaves its `//` in the guest path `parse_mount_spec` returns, and it is the
+    /// *normalization*, not the expansion, that makes `/h//x` and `/h/x` one
+    /// claim. Compared on the bytes (`as_os_str`) because `PathBuf`'s `==`
+    /// compares components and so accepts either spelling.
+    #[test]
+    fn a_guest_home_expansion_keeps_the_concatenated_spelling() {
+        const TRAILING: &str = "/h/";
+        let mount = parse_mount_spec(
+            "/a:~/x",
+            HostSyntax::AbsoluteOrHome {
+                home: Some(TRAILING),
+            },
+        )
+        .expect("a `~/` guest is accepted by the config syntax");
+        assert_eq!(&mount.host, &PathBuf::from("/a"));
+        assert_eq!(mount.guest.as_os_str(), std::ffi::OsStr::new("/h//x"));
+        let normalized = normalize_request(MountRequest {
+            origin: config_origin(0),
+            mount,
+        })
+        .expect("the expanded guest is mountable");
+        assert_eq!(normalized.mount.guest, PathBuf::from("/h/x"));
+
+        // The mirror spelling is the same concatenation: with no guest segment,
+        // the host's expanded text — `//` included — is the guest.
+        let mirror = parse_mount_spec(
+            "~/a",
+            HostSyntax::AbsoluteOrHome {
+                home: Some(TRAILING),
+            },
+        )
+        .expect("a `~/` host is accepted by the config syntax");
+        assert_eq!(mirror.guest.as_os_str(), std::ffi::OsStr::new("/h//a"));
     }
 
     proptest::proptest! {
@@ -2830,36 +3118,61 @@ mod tests {
             prop_assert_eq!(&mount.spelled_host, &PathBuf::from(&expanded));
             prop_assert_eq!(&mount.host, &mount.spelled_host);
             prop_assert_eq!(&mount.guest, &mount.host, "the mirror guest is the expanded host");
+            // The guest field is the same substitution: the mount is the one
+            // `<home>/x:~/<rest>` names, not a `/h//<rest>` surprise.
+            let guest = parse_mount_spec(
+                &format!("/abs:~/{rest}"),
+                HostSyntax::AbsoluteOrHome { home: Some(&home) },
+            )
+            .expect("a `~/` guest is accepted by the config syntax");
+            prop_assert_eq!(&guest.host, &PathBuf::from("/abs"));
+            prop_assert_eq!(&guest.guest, &PathBuf::from(&expanded));
         }
 
         /// Differential: a config declaration and the argv declaration the
         /// *shell* would produce from it are one declaration. They merge rather
         /// than conflict, and they name one fork — which is the property that
         /// keeps provenance out of fork identity.
+        ///
+        /// Total over normalization outcomes: the generated `rest` can carry a
+        /// component no guest may keep (`..`), so what is asserted is that both
+        /// routes *agree* — both refuse or both succeed — and only on success
+        /// that they name one claim and one fork. A guest field spelled the two
+        /// ways (`~/g` and `<home>/g`) is generated too, which is the #530
+        /// equivalence.
         #[test]
         fn config_and_shell_expanded_cli_declarations_are_identical(
             home_tail in proptest::collection::vec("[a-z]{1,6}", 1..4),
             rest in "[a-zA-Z0-9._/$-]{1,12}",
-            guest in proptest::option::of("[a-z]{1,6}(/[a-z]{1,6}){0,2}"),
+            guest in proptest::option::of((
+                "[a-z]{1,6}(/[a-z]{1,6}){0,2}",
+                proptest::sample::select(vec!["/", "~/"]),
+            )),
             mode in proptest::sample::select(vec!["ro", "rw", "fork", "follow-links"]),
             exclusion in proptest::option::of("[a-z]{1,6}"),
         ) {
             use proptest::prop_assert;
             use proptest::prop_assert_eq;
             let home = format!("/home/{}", home_tail.join("/"));
-            let mut suffix = String::new();
-            if let Some(guest) = &guest {
-                suffix.push_str(&format!(":/{guest}"));
+            let mut config_suffix = String::new();
+            let mut cli_suffix = String::new();
+            if let Some((guest, prefix)) = &guest {
+                config_suffix.push_str(&format!(":{prefix}{guest}"));
+                // The shell expanded the `~` for argv, and only there.
+                let prefix = if *prefix == "~/" { format!("{home}/") } else { (*prefix).to_string() };
+                cli_suffix.push_str(&format!(":{prefix}{guest}"));
             }
-            suffix.push_str(&format!(":{mode}"));
+            config_suffix.push_str(&format!(":{mode}"));
+            cli_suffix.push_str(&format!(":{mode}"));
             // `:exclude` is fork-only, so it may only be generated there.
             if mode == "fork"
                 && let Some(exclusion) = &exclusion
             {
-                suffix.push_str(&format!(":exclude={exclusion}"));
+                config_suffix.push_str(&format!(":exclude={exclusion}"));
+                cli_suffix.push_str(&format!(":exclude={exclusion}"));
             }
-            let config_text = format!("~/{rest}{suffix}");
-            let cli_text = format!("{home}/{rest}{suffix}");
+            let config_text = format!("~/{rest}{config_suffix}");
+            let cli_text = format!("{home}/{rest}{cli_suffix}");
             let from_config = parse_mount_spec(
                 &config_text,
                 HostSyntax::AbsoluteOrHome { home: Some(&home) },
@@ -2875,6 +3188,60 @@ mod tests {
                 fork_id(&from_config, IDENTITY_VERSION),
                 fork_id(&from_cli[0], IDENTITY_VERSION)
             );
+            // The claim key is the *normalized* guest, and it is decided before
+            // anything downstream: both routes must reach the same verdict and,
+            // when accepted, the same guest and fork.
+            let config_norm =
+                normalize_request(MountRequest { origin: config_origin(0), mount: from_config });
+            let cli_norm = normalize_request(MountRequest {
+                origin: MountOrigin::Cli,
+                mount: from_cli.into_iter().next().expect("one argv declaration"),
+            });
+            prop_assert_eq!(
+                config_norm.is_ok(),
+                cli_norm.is_ok(),
+                "{} and {} disagree about the guest path",
+                config_text,
+                cli_text
+            );
+            if let (Ok(config_norm), Ok(cli_norm)) = (config_norm, cli_norm) {
+                prop_assert_eq!(&config_norm.mount.guest, &cli_norm.mount.guest);
+                prop_assert!(same_declaration(&config_norm.mount, &cli_norm.mount));
+                prop_assert_eq!(
+                    fork_id(&config_norm.mount, IDENTITY_VERSION),
+                    fork_id(&cli_norm.mount, IDENTITY_VERSION)
+                );
+            }
+        }
+    }
+
+    /// The deterministic companion of the differential property: a guest `..`
+    /// survives parsing on both routes and is refused by the same claim.
+    #[test]
+    fn a_parent_component_refuses_on_both_routes() {
+        let home = Some("/home/u");
+        for (config_text, cli_text) in
+            [("~/..", "/home/u/.."), ("~/a:~/..", "/home/u/a:/home/u/..")]
+        {
+            let from_config = parse_mount_spec(config_text, HostSyntax::AbsoluteOrHome { home })
+                .expect("the config syntax accepts it");
+            let from_cli = parse_extra_mounts(&[cli_text.to_string()])
+                .expect("argv accepts the shell-expanded text");
+            for (text, mount, origin) in [
+                (config_text, from_config, config_origin(0)),
+                (
+                    cli_text,
+                    from_cli.into_iter().next().unwrap(),
+                    MountOrigin::Cli,
+                ),
+            ] {
+                let error = normalize_request(MountRequest { origin, mount })
+                    .expect_err("no guest path may keep `..`");
+                assert!(
+                    matches!(error, ClaimError::Guest { .. }),
+                    "{text:?}: {error}"
+                );
+            }
         }
     }
 
@@ -2948,6 +3315,9 @@ mod tests {
                 "/abs-host:relative-guest",
                 MountSpecErrorKind::UnknownMode("relative-guest".into()),
             ),
+            // argv never expands a guest `~/`, so it is a mode keyword there.
+            ("/a:~/b", MountSpecErrorKind::UnknownMode("~/b".into())),
+            ("/a:~", MountSpecErrorKind::UnknownMode("~".into())),
             ("/:/mnt/a\tb", MountSpecErrorKind::GuestUnmountable),
             ("/host:", MountSpecErrorKind::EmptySegment),
             ("/h::ro", MountSpecErrorKind::EmptySegment),

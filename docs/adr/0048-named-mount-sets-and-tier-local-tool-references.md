@@ -114,6 +114,12 @@ uses the host user's home; guest destinations retain the existing absolute-path
 rules. Moving an equivalent declaration from CLI to config must preserve fork
 identity: tool names, set names, and configuration provenance do not enter its key.
 
+_Amended by [#530](https://github.com/gregwebs/agent-vm/issues/530)._ A config
+`GUEST` may also be spelled `~/`: it expands to the host home before guest
+normalization, so it and its spelled-out absolute form are one declaration.
+Every other guest rule is unchanged — absolute after expansion, not `/`, no `..`,
+`:`, `;`, `,` or control bytes.
+
 Mount-bearing user configuration uses the verified-file authority checks of
 [ADR-0040](0040-persisted-user-network-authority.md), including when declarations
 are empty. The file and immediate parent must satisfy ownership and mode checks;

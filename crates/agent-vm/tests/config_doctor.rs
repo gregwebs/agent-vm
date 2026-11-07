@@ -2224,6 +2224,52 @@ fn doctor_accepts_tool_mounts_without_inspecting_sources() {
     );
 }
 
+/// #530: a config mount's **guest** field may spell `~/`, meaning the host
+/// `$HOME` text. The operator's motivating declarations load through the real
+/// CLI and the real config discovery — a `[mount_sets]` entry holding both of
+/// them, selected by a full user tool's own `mounts` — so `doctor` (boot-free)
+/// exits 0. Before #530 either entry was refused at load as `unknown mode
+/// keyword "~/…"`, which is exactly what `doctor` renders and exits nonzero on.
+///
+/// The calibration row at the end keeps this from being vacuous: the same file
+/// with a guest that is *not* a path spelling is still refused, so a loader that
+/// never parsed these entries cannot pass the success row.
+#[test]
+fn doctor_accepts_a_guest_tilde_in_a_set_and_in_a_tool() {
+    let h = Harness::new();
+    let config = "[mount_sets]\nkache = [\n  \
+         \"~/.pi/agent/quota-dispatch.agent-vm.json:~/.pi/agent/quota-dispatch.json:ro\",\n  \
+         \"~/Library/Caches/kache:~/.cache/kache:rw\",\n\
+         ]\n\
+         [[tools]]\nname = \"t\"\ncommand = \"t\"\ncredentials = [\"openai\"]\nmounts = [\"kache\"]\n";
+    h.write_user(config);
+    let out = h.run_doctor();
+    assert_success(&out);
+    // The tool row proves the whole file was resolved, not just tolerated.
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.contains("t -> \"t\"; args=0; credentials=openai"),
+        "{stdout}"
+    );
+
+    // Calibration: `~` alone is still a mode keyword in the guest position, so
+    // the fixture's success above came from loading the `~/` entries.
+    h.write_user(&config.replace(":~/.cache/kache:rw", ":~:rw"));
+    let out = h.run_doctor();
+    assert!(
+        !out.status.success(),
+        "a refused mount entry must exit nonzero: {}",
+        stdout_of(&out)
+    );
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(
+            "mount_sets[0][1] \"~/Library/Caches/kache:~:rw\": unknown mode keyword \"~\""
+        ),
+        "{stderr}"
+    );
+}
+
 /// #396: a *broken* tool mount declaration is reported with the exact file and
 /// numeric field, and `--help` still works.
 #[test]

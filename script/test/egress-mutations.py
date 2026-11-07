@@ -378,14 +378,30 @@ def matrix():
     add("config-mounts-claim-conflict-merged-launch", mounts, conflict_merged,
         conflict_merged_mutant,
         rust("config_and_cli_conflicts_are_refused_naming_both", MOUNTS))
-    # `~` may expand for user `mounts` and never for `--mount`: the shell already
-    # expanded argv, so a quoted `~/x` must stay "must be absolute".
+    # `~` may expand for config path fields and never for `--mount`: the shell
+    # already expanded argv, so a quoted `~/x` must stay "must be absolute".
     home_on_cli = "else if home == HomeExpansion::Enabled && bytes.len() >= 2"
     home_on_cli_mutant = "else if bytes.len() >= 2"
     add("config-mounts-home-expanded-on-cli", mounts, home_on_cli, home_on_cli_mutant,
-        rust("host_spelling_matches_the_oracle_table"))
+        rust("path_spelling_matches_the_oracle_table"))
     add("config-mounts-home-expanded-on-cli-proof", mounts, home_on_cli, home_on_cli_mutant,
         gate, "verification results::")
+    # The guest field may expand `~/` only where the host may (#530): argv keeps
+    # reading `/a:~/b` as a mode. Kernel body: killed by the oracle and the proof.
+    guest_kernel = "|| path_spelling(bytes, home) != PathSpelling::Refused"
+    guest_kernel_mutant = "|| path_spelling(bytes, HomeExpansion::Enabled) != PathSpelling::Refused"
+    add("config-mounts-guest-home-expanded-on-cli", mounts, guest_kernel,
+        guest_kernel_mutant, rust("segment_is_guest_path_matches_the_oracle_table"))
+    add("config-mounts-guest-home-expanded-on-cli-proof", mounts, guest_kernel,
+        guest_kernel_mutant, gate, "verification results::")
+    # The adapter: `parse_mount_spec` must pass its own grammar's expansion. With
+    # `Enabled`, argv `/x:~/y` becomes a `~/y` guest refused as "must be absolute"
+    # instead of an unknown mode, which the unit row observes.
+    guest_call = ".is_some_and(|s| segment_is_guest_path(s.as_bytes(), expansion));"
+    guest_call_mutant = (
+        ".is_some_and(|s| segment_is_guest_path(s.as_bytes(), HomeExpansion::Enabled));")
+    add("config-mounts-guest-classified-with-config-grammar", mounts, guest_call,
+        guest_call_mutant, rust("only_the_config_syntax_may_expand_a_tilde"))
     # A mount that shadows a declared `persist` link is refused inside
     # `mount::prepare`, ahead of `prepare_forks` (ADR-0046 Decision 6). Skipping
     # the check does not merely move a message: the plan publishes a fork copy of
