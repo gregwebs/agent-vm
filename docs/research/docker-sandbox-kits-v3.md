@@ -1,5 +1,12 @@
 # Docker Sandbox Kits v3: composition model and its overlap with agent-vm
 
+> **Historical.** Written against the layer-composition design (ADR-0029–0034)
+> while it was still planned. That design was never implemented and was
+> superseded by [ADR-0035](../adr/0035-consume-user-owned-boot-images.md), whose
+> appendix records why. Read the comparisons below as what agent-vm *then*
+> intended, not what it does; ADR references here are to removed records and are
+> not links.
+
 **Research date:** 2026-09-29
 
 **Upstream snapshot:** [`docker/sandbox-kit-spec`](https://github.com/docker/sandbox-kit-spec) @ `3e2f362d74b978f6eb1ac43fe32b2fb136d7fa6e` (2026-09-29), `docs/spec/SPEC-v3.md` (1117 lines) and the Go implementation it declares authoritative.

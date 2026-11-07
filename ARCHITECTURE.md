@@ -1029,7 +1029,7 @@ Three build-time subtleties are worth knowing:
   tree world-readable, which is what lets the same `PATH` work for both
 guest-user modes. The prefix
   itself is created by the base (`RUN mkdir -p /opt/agent && chmod 755
-  /opt/agent`), so every layer inherits a `a+rX` (C7) starting point.
+  /opt/agent`), so every layer inherits an `a+rX` starting point.
 - The running guest symlinks `$HOME/.claude` onto persistent state, which
   **shadows** the LSP plugin tree baked at build time. The claude recipe
   therefore stashes the plugins to `/opt/agent-vm/claude-seed` and installs a
@@ -1949,9 +1949,9 @@ directories the user never asked for. The state-root precedence is in
 | Mirroring the host `$HOME` and username into the guest | [ADR-0002](docs/adr/0002-mirror-host-home-and-username.md) |
 | Project tooling layers (`.agent-vm/layers/`, plus any `--layer DIR`; superseded by ADR-0035) | [ADR-0003](docs/adr/0003-project-tooling-layers.md) |
 | One shared `MSB_HOME`, not schema-namespaced | [ADR-0004](docs/adr/0004-single-shared-msb-home.md) |
-| Deferring the sea-orm / sqlx major bump | [ADR-0005](docs/adr/0005-defer-sea-orm-sqlx-major-bump.md) |
+| Deferring the sea-orm / sqlx major bump (superseded; the bump landed with ADR-0006) | [ADR-0005](docs/adr/0005-defer-sea-orm-sqlx-major-bump.md) |
 | Adopting a clean microsandbox v0.6.15 baseline (dropping the libkrun fork; baseline superseded by ADR-0027) | [ADR-0006](docs/adr/0006-adopt-clean-v0.6.15-baseline.md) |
-| Heartbeat keep-alive and runtime-exit reporting | [ADR-0007](docs/adr/0007-heartbeat-keep-alive-and-runtime-exit-reporting.md) |
+| Heartbeat keep-alive and runtime-exit reporting (accepted, but not in the pinned `vendor/microsandbox`; see issue #86) | [ADR-0007](docs/adr/0007-heartbeat-keep-alive-and-runtime-exit-reporting.md) |
 | Migrating 0.5.7 state to v0.6.15 (target restated as the v0.7.4 schema by ADR-0027) | [ADR-0008](docs/adr/0008-migrate-0.5.7-state-to-v0.6.15.md) |
 | Adopting `origin/main`'s network features (branch framing superseded by ADR-0027) | [ADR-0009](docs/adr/0009-adopt-origin-main-network-features.md) |
 | Wiring file-backed credential injection | [ADR-0010](docs/adr/0010-wire-file-backed-credential-injection.md) |
@@ -1959,30 +1959,46 @@ directories the user never asked for. The state-root precedence is in
 | A stable wrapper around image-installed Pi | [ADR-0012](docs/adr/0012-stable-pi-image-customization-seam.md) |
 | Forked mounts and opaque exclusions (superseded for file forks and live exclusions) | [ADR-0013](docs/adr/0013-add-forked-mounts.md) |
 | Narrowing fork mounts to directories; files read-only | [ADR-0014](docs/adr/0014-narrow-fork-mounts-to-directories.md) |
+| CLI subcommands generated from the resolved tool config (`layer` field removed by ADR-0035) | [ADR-0015](docs/adr/0015-config-driven-tools.md) |
+| Tool-declared guest env and the precedence rule that makes it safe | [ADR-0016](docs/adr/0016-tool-declared-guest-env.md) |
+| Credential provisioning gated on the tools a tool declares (amended by ADR-0048) | [ADR-0017](docs/adr/0017-tool-declared-provisioning.md) |
+| Machine-checked contracts on the pure sandbox-boundary predicates | [ADR-0018](docs/adr/0018-machine-checked-boundary-contracts.md) |
+| A tool-free base image plus per-tool layers (superseded by ADR-0035) | [ADR-0019](docs/adr/0019-tool-free-base-and-per-tool-layers.md) |
+| Keeping host Pi credential files out of every mount mode | [ADR-0020](docs/adr/0020-protect-host-pi-credential-files.md) |
+| Project-scoped Pi home and the wrapper's parity policy | [ADR-0021](docs/adr/0021-project-scoped-pi-home-and-wrapper-parity.md) |
+| The DeepSeek Harness (`dsh`) tool layer (launcher layer removed by ADR-0035) | [ADR-0022](docs/adr/0022-dsh-tool-layer.md) |
+| Image-owned Pi extension packages | [ADR-0023](docs/adr/0023-image-owned-pi-extension-packages.md) |
+| Host-side secret inventory for `agent-vm secret` | [ADR-0024](docs/adr/0024-host-secret-inventory.md) |
 | User-authorized YAML credentials (`credentials.yaml`) | [ADR-0025](docs/adr/0025-yaml-credential-shielding.md) |
 | Accepting Basic auth in the header substitution scope (microsandbox 0.7.4) | [ADR-0026](docs/adr/0026-accept-basic-auth-in-header-substitution-scope.md) |
 | Adopting the v0.7.4 fork baseline (supersedes in part ADR-0006's baseline, ADR-0008's target and evidence base, and ADR-0009's branch framing) | [ADR-0027](docs/adr/0027-adopt-v0.7.4-fork-baseline.md) |
 | An explicit `--image`/`--base-image` overrides the other flag's environment variable (superseded by ADR-0035) | [ADR-0028](docs/adr/0028-explicit-image-flag-beats-the-other-environment-variable.md) |
-| Compose tool images by layer stitching (superseded by ADR-0035) | [ADR-0029](docs/adr/0029-compose-tool-images-by-layer-stitching.md) |
-| Tool versions in identity and current tags (superseded by ADR-0035) | [ADR-0030](docs/adr/0030-tool-versions-in-identity-and-current-tags.md) |
-| The tool image contract and stitch checks (superseded by ADR-0035) | [ADR-0031](docs/adr/0031-tool-image-contract.md) |
-| One layer kind — a tool is a layer with a command (superseded by ADR-0035) | [ADR-0032](docs/adr/0032-one-layer-kind.md) |
-| Default to rebase, preserving build provenance (superseded by ADR-0035) | [ADR-0033](docs/adr/0033-default-rebase-with-build-provenance.md) |
-| Versioned image releases instead of a continuously published registry (amended by ADR-0035) | [ADR-0034](docs/adr/0034-versioned-image-releases.md) |
-| Consume user-owned boot images (supersedes ADR-0003/0019/0028–0033; amends ADR-0034/0015/0022) | [ADR-0035](docs/adr/0035-consume-user-owned-boot-images.md) |
+| Consume user-owned boot images (supersedes ADR-0003/0019/0028; amends ADR-0015/0022; its appendix records why the abandoned layer-composition design, ADR-0029–0034, was not taken) | [ADR-0035](docs/adr/0035-consume-user-owned-boot-images.md) |
 | Default-deny launch egress and CLI-only authority | [ADR-0036](docs/adr/0036-default-deny-launch-egress.md) |
 | Hostname egress allowances — TLS on intercepted ports only | [ADR-0037](docs/adr/0037-hostname-egress-allowances.md) |
 | Authority config-directory exposure guard | [ADR-0038](docs/adr/0038-config-dir-exposure-guard.md) |
 | Non-authoritative tool network requests | [ADR-0039](docs/adr/0039-non-authoritative-tool-network-requests.md) |
+| Persisted user network authority (amends ADR-0036/0038/0018) | [ADR-0040](docs/adr/0040-persisted-user-network-authority.md) |
+| Single-binary embedded runtime | [ADR-0041](docs/adr/0041-single-binary-embedded-runtime.md) |
+| Launch options before the tool verb | [ADR-0042](docs/adr/0042-launch-options-before-the-tool-verb.md) |
+| Image command group and Docker-daemon import (amends ADR-0035's build/import decision) | [ADR-0043](docs/adr/0043-image-command-group-and-daemon-import.md) |
 | Pi reaches host Codex through an image-owned provider | [ADR-0044](docs/adr/0044-pi-reaches-host-codex-through-an-image-owned-provider.md) |
+| Verified user config mounts | [ADR-0046](docs/adr/0046-verified-user-config-mounts.md) |
 | Host-wide OCI image approval and pinned consumption (#390) | [ADR-0047](docs/adr/0047-host-wide-oci-image-approval.md) |
+| Named mount sets and tier-local tool references (#395–#397) | [ADR-0048](docs/adr/0048-named-mount-sets-and-tier-local-tool-references.md) |
 | One dialect rule for a printed command (#434) | [ADR-0049](docs/adr/0049-one-dialect-rule-for-printed-commands.md) |
 | One rule for a relative state root (#437) | [ADR-0050](docs/adr/0050-one-rule-for-a-relative-state-root.md) |
 | The reset undo refuses a recreated db (#432) | [ADR-0051](docs/adr/0051-the-reset-undo-refuses-a-recreated-db.md) |
 | Direct-command input ownership and the detached stdin reader (#399) | [ADR-0052](docs/adr/0052-direct-command-input-ownership.md) |
 | Guest exit-signal identity through agentd, the protocol and the SDK accessor (#467) | [ADR-0053](docs/adr/0053-guest-exit-signal-identity.md) |
+| Omit nodes a fork seed cannot carry (amends ADR-0013/0014) | [ADR-0054](docs/adr/0054-omit-nodes-a-fork-seed-cannot-carry.md) |
 | SecretSpec as a read-only credential source (#202) | [ADR-0055](docs/adr/0055-secretspec-serve-credential-source.md) |
 | macOS keychain item as a second Anthropic host credential location (#492) | [ADR-0056](docs/adr/0056-macos-keychain-as-a-host-credential-location.md) |
+| Live approvals use two generic runtime extension points (proposed, not implemented) | [ADR-0057](docs/adr/0057-live-approvals-use-two-generic-runtime-extension-points.md) |
+| Antigravity as a fifth credential provider (#507) | [ADR-0058](docs/adr/0058-antigravity-credential-provider.md) |
+| User tool requests as egress authority (partly reverses ADR-0039) | [ADR-0059](docs/adr/0059-user-tool-requests-as-egress-authority.md) |
+| Image network requests reported once per reference, then as changes | [ADR-0060](docs/adr/0060-image-network-requests-reported-once-then-as-changes.md) |
+| Explicit launch builds with `--dockerfile` (amends ADR-0035's "no launch builds an image") | [ADR-0061](docs/adr/0061-explicit-launch-builds.md) |
 
 ## Deliberate non-goals
 

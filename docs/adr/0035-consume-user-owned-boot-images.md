@@ -13,15 +13,12 @@ Amended for **all-source host-wide approval** by [agent-vm
 pinned, a changed pin needs candidate-scoped consent, and launches consume only
 approved child content.
 Supersedes [ADR-0003](0003-project-tooling-layers.md),
-[ADR-0019](0019-tool-free-base-and-per-tool-layers.md),
-[ADR-0028](0028-explicit-image-flag-beats-the-other-environment-variable.md),
-[ADR-0029](0029-compose-tool-images-by-layer-stitching.md),
-[ADR-0030](0030-tool-versions-in-identity-and-current-tags.md),
-[ADR-0031](0031-tool-image-contract.md),
-[ADR-0032](0032-one-layer-kind.md) and
-[ADR-0033](0033-default-rebase-with-build-provenance.md) and
-[ADR-0034](0034-versioned-image-releases.md). Amends
-[ADR-0015](0015-config-driven-tools.md) and
+[ADR-0019](0019-tool-free-base-and-per-tool-layers.md) and
+[ADR-0028](0028-explicit-image-flag-beats-the-other-environment-variable.md).
+It also superseded ADR-0029 to ADR-0034, six records of a launcher-owned image
+composition system that was never built; those files are removed and
+[the appendix below](#appendix-the-abandoned-layer-composition-design) keeps why
+each was not taken. Amends [ADR-0015](0015-config-driven-tools.md) and
 [ADR-0022](0022-dsh-tool-layer.md).
 Amended in **0.7.35** by [ADR-0061](0061-explicit-launch-builds.md) (#527): an
 explicit `--dockerfile FILE` launch builds that Dockerfile and boots the result,
@@ -44,8 +41,8 @@ mounts, networking and state; users own their image's software, accounts and
 updates. Under that boundary the launcher only ever **consumes** a finished
 image.
 
-The Layer DAG (ADR-0029–0033) was never implemented — no code ever composed a
-DAG, stitched images, or maintained current tags. What *is* implemented is the
+The Layer DAG those records proposed was never implemented — no code ever
+composed a DAG, stitched images, or maintained current tags. What *is* implemented is the
 image production pipeline: committed recipe/version pins, lockfiles and the
 source-integrity gates, now retained at the independent [image owner](https://github.com/gregwebs/agent-vm-images). #263/#264 implemented source maintenance/publication; #265 moves
 the contributor gitlink and launcher recommendation, without a runtime source dependency.
@@ -167,8 +164,8 @@ the contributor gitlink and launcher recommendation, without a runtime source de
 - A project can recommend an image but cannot override the user's selection
   (the user tier outranks the project tier, exactly as it does for tool
   declarations, ADR-0015). It still cannot bind host paths through `image`.
-- Retained from ADR-0034: independent image versioning and integrity
-  verification principles. Withdrawn by this ADR: same-repository image sources,
+- Retained from the abandoned ADR-0034 design: independent image versioning
+  and integrity verification principles. Withdrawn by this ADR: same-repository image sources,
   archive-only distribution, a shared launcher composer, and a launcher-fixed
   image selection; release and distribution work moves to
   [#263–#265](https://github.com/gregwebs/agent-vm/issues/263).
@@ -201,8 +198,10 @@ the contributor gitlink and launcher recommendation, without a runtime source de
 
 ## Alternatives
 
-- **Finish the Layer DAG** (ADR-0029–0033). Rejected: it keeps the image a
-  consequence of the catalog, which is the defect, and none of it was built.
+- **Finish the Layer DAG** (the abandoned ADR-0029–0033 design, see
+  [the appendix](#appendix-the-abandoned-layer-composition-design)). Rejected:
+  it keeps the image a consequence of the catalog, which is the defect, and none
+  of it was built.
 - **Keep `--base-image` as a development knob.** Rejected: it preserves a second
   image-selection system and a local-build path on every launch.
 - **Let the project tier outrank the user tier for `image`.** Rejected: a cloned
@@ -237,3 +236,67 @@ archives and Docker-daemon images are imported with
 See [USAGE](../../USAGE.md#explicit-builds-and-archive-import) for the canonical
 option surface and trust boundary. Docker, async ingestion and I/O are not
 formally proved by the small result-reference acceptance kernel.
+
+## Appendix: the abandoned layer-composition design
+
+Six records removed from this directory — ADR-0029 to ADR-0034 — and
+`docs/specs/image-composition.md` described a launcher-owned image composition
+system: layers built `FROM` a declared parent, stitched into a new OCI manifest,
+keyed on their inputs, versioned by current tags in the image cache, and released
+as archives from a shared composer. None of it was ever built. The files were
+removed rather than kept as history because every clause describes machinery the
+launcher does not have; what is kept is why each was not taken.
+
+**The shared reason.** All of it existed to make the boot image a consequence of
+the tool catalog — the coupling this ADR removes. Each mechanism was sound only
+inside that frame, and each carried a cost the frame does not justify: a
+launcher-owned OCI manifest writer, a second content-addressed store with no
+garbage collection and a ~18 s non-incremental ingest, and image versions moved
+by a cache whose deletion resets them. Users get the same capability from an
+ordinary Dockerfile `FROM`/multistage, `image import` and `--image`.
+
+**ADR-0029 — stitch independently built layer images into a DAG.** Each layer
+built `FROM` a declared parent; the launcher concatenated their layers into one
+manifest and drove `buildx bake` per group. Not taken: outside that frame nothing
+needs it, and it is where the launcher-owned OCI writer and the second store come
+from. Its simpler alternative had already been rejected before it: a `COPY
+--link` merge build needs a per-tool filesystem footprint, and the hand-written
+table was wrong twice for shipped tools.
+
+**ADR-0030 — tool versions as identity inputs, moved by a mutable current tag.**
+Not taken: upgrades lived in the image cache, so deleting the cache reset every
+upgrade and any launcher recipe edit reset them again. Version truth is the image
+owner's — committed pins and exact installs — and moving it is an ordinary image
+replacement.
+
+**ADR-0031 — a T1–T7 / S1–S4 contract over every layer image, checked at stitch
+time.** Not taken: most clauses mean something only to a stitcher. The overlap
+refusal exists because stitching silently loses one writer's file; the file-list
+reader and symlink resolver exist only to detect that. What a booted-verbatim
+image can be held to is what the guest can answer: the
+[boot image contract](../../USAGE.md#boot-image-contract) and `setup`'s
+`--version` probe over the declared tools.
+
+**ADR-0032 — one layer kind, everything stitched, accounts declared rather than
+appended.** Not taken: it simplified a design that was itself abandoned, and it
+billed costs of its own. A declared account sat at the composition root, so
+changing one rebuilt every layer above it, and a *shipped* layer declaring an
+account needed CI to bake it into the published template.
+
+**ADR-0033 — default to rebase, preserving build provenance.** Not taken: it
+accepted runtime/ABI breakage on a base update with a warning as the only
+mitigation, to avoid reinstalling agents. Reinstalling is not the launcher's cost
+once the launcher builds nothing.
+
+**ADR-0034 — versioned image releases instead of a continuous registry.** Not
+taken as written, and not a dead end: independent versioning, committed
+recipe/version pins and source-integrity gates survived into the
+[image owner](https://github.com/gregwebs/agent-vm-images), which is what this
+ADR retains. Explicitly withdrawn: same-repository sources, archive-only
+distribution, a shared launcher composer and launcher-fixed selection.
+
+**The composition spec.** It was a `/breakdown` handoff assembling those six into
+interfaces and acceptance criteria, for a design with no implementation and, once
+this ADR landed, no owner. Its interfaces never existed. The live replacements
+are [selecting the boot image](../../USAGE.md#selecting-the-boot-image),
+[ADR-0047](0047-host-wide-oci-image-approval.md) and the image repository.
