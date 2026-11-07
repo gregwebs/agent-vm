@@ -2127,15 +2127,15 @@ fn an_unused_mount_set_error_is_reported_and_a_missing_source_is_not() {
         ),
         (
             "[mount_sets]\nunused = [\"nope\"]\n",
-            "mount_sets[0][0]: unknown mount set name",
+            "mount_sets[0][0] \"nope\": unknown mount set name",
         ),
         (
             "mounts = [\"nope\"]\n[mount_sets]\nunused = []\n",
-            "mounts[0]: unknown mount set name",
+            "mounts[0] \"nope\": unknown mount set name",
         ),
         (
             "[mount_sets]\nbad = [\"agent:ro\"]\n",
-            "mount_sets[0][0]: a mount-set reference is a bare name",
+            "mount_sets[0][0] \"agent:ro\": a mount-set reference is a bare name",
         ),
     ] {
         let h = Harness::new();
@@ -2239,11 +2239,11 @@ fn doctor_reports_tool_mount_errors_with_exact_file_and_field() {
         ),
         (
             "[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = [\"nope\"]\n",
-            "tools[0].mounts[0]: unknown mount set name",
+            "tools[0].mounts[0] \"nope\": unknown mount set name",
         ),
         (
             "[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = [\"agent:ro\"]\n",
-            "tools[0].mounts[0]: a mount-set reference is a bare name",
+            "tools[0].mounts[0] \"agent:ro\": a mount-set reference is a bare name",
         ),
         (
             // A closure conflict: two valid lists that only disagree together.

@@ -2718,11 +2718,11 @@ fn named_mount_sets_reference_errors_refuse_load_under_every_option() {
     for (body, needle) in [
         (
             "mounts = [\"nope\"]\n[mount_sets]\nunused = []\n",
-            "mounts[0]: unknown mount set name",
+            "mounts[0] \"nope\": unknown mount set name",
         ),
         (
             "[mount_sets]\nunused = [\"nope\"]\n",
-            "mount_sets[0][0]: unknown mount set name",
+            "mount_sets[0][0] \"nope\": unknown mount set name",
         ),
         (
             "[mount_sets]\na = [\"a\"]\n",

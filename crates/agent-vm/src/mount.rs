@@ -722,13 +722,14 @@ impl HostSyntax<'_> {
     }
 }
 
-/// Why a declaration was rejected, without any value from the declaration.
+/// Why a declaration was rejected.
 ///
 /// The CLI renders [`MountSpecError::into_cli`] and keeps today's bytes (pinned
-/// by `cli_parse_errors_are_pinned`). A config route renders the kind instead,
-/// because echoing a `mounts` entry could print an attacker-chosen path into a
-/// diagnostic the user is asked to trust.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// by `cli_parse_errors_are_pinned`). A config route renders the kind instead, so
+/// one rejection is one decision for both sources. The kind names only what the
+/// grammar classified — the word it read as a mode keyword, the two modes that
+/// conflict — never the declaration: the caller quotes the entry it was given.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MountSpecErrorKind {
     EmptyHost,
     HostNotAccepted,
@@ -736,7 +737,8 @@ pub(crate) enum MountSpecErrorKind {
     GuestNotAbsolute,
     GuestUnmountable,
     EmptySegment,
-    UnknownMode,
+    /// The segment offered as a mode keyword, escaped by the config rendering.
+    UnknownMode(String),
     ConflictingModes(&'static str, &'static str),
     BadExclusion,
     ExcludeOnLiveBind,
@@ -761,18 +763,19 @@ impl MountSpecError {
         self.cli
     }
 
-    /// The config route renders this instead of the CLI sentence, so a `mounts`
-    /// entry's value never reaches a diagnostic.
+    /// The config route renders this instead of the CLI sentence: the CLI text
+    /// names its spelling with `{:?}`, and a config entry is quoted by the caller
+    /// that owns it (`config_mounts`) instead.
     pub(crate) fn kind(&self) -> MountSpecErrorKind {
-        self.kind
+        self.kind.clone()
     }
 }
 
 impl fmt::Display for MountSpecErrorKind {
-    /// The config route's sentence for one rejection: the *kind*, never the
-    /// declaration text. A `mounts` entry can carry an attacker-chosen path, so
-    /// it must not reach a diagnostic the user is asked to trust; `--mount`
-    /// keeps [`MountSpecError::into_cli`]'s bytes instead.
+    /// The config route's sentence for one rejection: the *kind* and the segments
+    /// it classified, never the declaration text, which the caller quotes itself
+    /// through `config`'s escaping. `--mount` keeps
+    /// [`MountSpecError::into_cli`]'s bytes instead.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyHost => {
@@ -790,8 +793,11 @@ impl fmt::Display for MountSpecErrorKind {
             Self::EmptySegment => {
                 f.write_str("empty segment (stray `:`); expected HOST[:GUEST][:MODE]...")
             }
-            Self::UnknownMode => f.write_str(
-                "unknown mode keyword (expected ro, rw, fork, follow-links, or exclude=REL)",
+            Self::UnknownMode(keyword) => write!(
+                f,
+                "unknown mode keyword {} (expected ro, rw, fork, follow-links, or \
+                 exclude=REL)",
+                quoted_str(keyword)
             ),
             Self::ConflictingModes(first, second) => {
                 write!(f, "conflicting modes `{first}` and `{second}`")
@@ -922,7 +928,7 @@ pub(crate) fn parse_mount_spec(
         }
         let mode = MountMode::from_keyword(kw).ok_or_else(|| {
             MountSpecError::new(
-                MountSpecErrorKind::UnknownMode,
+                MountSpecErrorKind::UnknownMode(kw.to_string()),
                 anyhow::anyhow!(
                     "--mount {entry:?}: unknown mode keyword {kw:?} \
                      (expected `ro`, `rw`, `fork`, `follow-links`, or `exclude=REL`)"
@@ -2928,21 +2934,27 @@ mod tests {
 
     /// One row per rejection `--mount` can produce, asserting the *kind* rather
     /// than the bytes (the bytes are pinned above). The config route renders its
-    /// value-free sentence from the kind, so a mis-mapped rejection would send a
-    /// user looking at the wrong field of their `mounts` list.
+    /// sentence from the kind, so a mis-mapped rejection would send a user looking
+    /// at the wrong field of their `mounts` list.
     #[test]
     fn every_rejection_reports_its_own_kind() {
-        const CASES: &[(&str, MountSpecErrorKind)] = &[
+        let cases: &[(&str, MountSpecErrorKind)] = &[
             (":/guest", MountSpecErrorKind::EmptyHost),
             ("", MountSpecErrorKind::EmptyHost),
             ("relative-host", MountSpecErrorKind::HostNotAccepted),
             ("~/x", MountSpecErrorKind::HostNotAccepted),
             ("/host:./rel", MountSpecErrorKind::GuestNotAbsolute),
-            ("/abs-host:relative-guest", MountSpecErrorKind::UnknownMode),
+            (
+                "/abs-host:relative-guest",
+                MountSpecErrorKind::UnknownMode("relative-guest".into()),
+            ),
             ("/:/mnt/a\tb", MountSpecErrorKind::GuestUnmountable),
             ("/host:", MountSpecErrorKind::EmptySegment),
             ("/h::ro", MountSpecErrorKind::EmptySegment),
-            ("/:bogus-mode", MountSpecErrorKind::UnknownMode),
+            (
+                "/:bogus-mode",
+                MountSpecErrorKind::UnknownMode("bogus-mode".into()),
+            ),
             ("/:ro:rw", MountSpecErrorKind::ConflictingModes("ro", "rw")),
             (
                 "/x:fork:ro",
@@ -2953,10 +2965,10 @@ mod tests {
             ("/x:fork:exclude=a::b", MountSpecErrorKind::EmptySegment),
             ("/x:exclude=hidden", MountSpecErrorKind::ExcludeOnLiveBind),
         ];
-        for (entry, kind) in CASES {
+        for (entry, kind) in cases {
             let error = parse_mount_spec(entry, HostSyntax::AbsoluteOnly)
                 .expect_err("argv rejects it, so the shared grammar does too");
-            assert_eq!(error.kind(), *kind, "for --mount {entry:?}");
+            assert_eq!(error.kind(), kind.clone(), "for --mount {entry:?}");
             // The argv wrapper consumes exactly this error, so a rejection here is
             // a rejection on the `--mount` route.
             assert!(parse_extra_mounts(&[(*entry).to_string()]).is_err());

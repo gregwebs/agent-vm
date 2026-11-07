@@ -582,16 +582,25 @@ impl UserMounts {
                     )?),
                     Ok(MountSelector::Set(target)) => match index.get(&target) {
                         Some(&target) => Entry::Reference(target),
-                        None => return Err(UserMountsError::UnknownSet { site }),
+                        None => {
+                            return Err(UserMountsError::UnknownSet {
+                                site,
+                                declaration: text.to_string(),
+                            });
+                        }
                     },
                     Err(SelectorError::Direct(error)) => {
                         return Err(UserMountsError::Entry {
                             site,
                             kind: error.kind(),
+                            declaration: text.to_string(),
                         });
                     }
                     Err(SelectorError::SetModifier) => {
-                        return Err(UserMountsError::SetReferenceModified { site });
+                        return Err(UserMountsError::SetReferenceModified {
+                            site,
+                            declaration: text.to_string(),
+                        });
                     }
                 });
             }
@@ -740,16 +749,25 @@ fn bind_entries(
             )?),
             Ok(MountSelector::Set(target)) => match sets.requests_for_set(&target) {
                 Some(selected) => Entry::Reference(selected.set),
-                None => return Err(UserMountsError::UnknownSet { site: entry_site }),
+                None => {
+                    return Err(UserMountsError::UnknownSet {
+                        site: entry_site,
+                        declaration: text.to_string(),
+                    });
+                }
             },
             Err(SelectorError::Direct(error)) => {
                 return Err(UserMountsError::Entry {
                     site: entry_site,
                     kind: error.kind(),
+                    declaration: text.to_string(),
                 });
             }
             Err(SelectorError::SetModifier) => {
-                return Err(UserMountsError::SetReferenceModified { site: entry_site });
+                return Err(UserMountsError::SetReferenceModified {
+                    site: entry_site,
+                    declaration: text.to_string(),
+                });
             }
         });
     }
@@ -1081,6 +1099,12 @@ mod tests {
         result.unwrap_err().to_string()
     }
 
+    /// How a load sentence names an entry: the site, then the entry as the file
+    /// wrote it, quoted and byte-escaped the way every config-chosen value is.
+    fn at(site: &str, entry: &str) -> String {
+        format!("{site} {}: ", crate::config::quoted_str(entry))
+    }
+
     fn set(name: &str) -> MountSetName {
         MountSetName::parse(name).unwrap()
     }
@@ -1328,22 +1352,24 @@ mod tests {
         );
     }
 
-    /// Every reference error: unknown in defaults, unknown in an unused set, a
-    /// self cycle, a two-node cycle, a longer cycle and a disconnected one.
+    /// Every reference error names the site, and an entry that names no set is
+    /// quoted back so a typo is visible beside the definitions it should have
+    /// matched. A cycle names positions only: the entry that closes it is a set
+    /// name already present in the file, and the site locates it.
     #[test]
     fn reference_errors_are_named_by_site() {
         // `[mount_sets]` sorted: agent < deep < docs for the multi-hop fixture.
         assert_eq!(
             rendered(defaults_and_sets("[\"ref\"]", "")),
-            "mounts[0]: unknown mount set name"
+            at("mounts[0]", "ref") + "unknown mount set name"
         );
         assert_eq!(
             rendered(defaults_and_sets("[\"/a:ro\", \"ref\"]", "")),
-            "mounts[1]: unknown mount set name"
+            at("mounts[1]", "ref") + "unknown mount set name"
         );
         assert_eq!(
             rendered(sets("unused = [\"nope\"]\n")),
-            "mount_sets[0][0]: unknown mount set name"
+            at("mount_sets[0][0]", "nope") + "unknown mount set name"
         );
         assert_eq!(
             rendered(sets("a = [\"a\"]\n")),
@@ -1366,22 +1392,25 @@ mod tests {
         assert!(sets("a = [\"shared\"]\nb = [\"shared\"]\nshared = [\"/h/s:/s:ro\"]\n").is_ok());
     }
 
-    /// A set entry's own grammar and modifier refusals name the set's coordinates.
+    /// A set entry's own grammar and modifier refusals name the set's coordinates
+    /// and quote the entry; a claim refusal keeps the site and its own sentence.
     #[test]
     fn set_entries_keep_the_direct_grammar_and_refuse_modifiers() {
         assert_eq!(
             rendered(sets("a = [\"agent:ro\"]\n")),
-            "mount_sets[0][0]: a mount-set reference is a bare name; modes, a guest path and \
-             exclusions belong to the paths declared inside the set"
+            at("mount_sets[0][0]", "agent:ro")
+                + "a mount-set reference is a bare name; modes, a guest path and exclusions \
+                   belong to the paths declared inside the set"
         );
         assert_eq!(
             rendered(sets("a = [\"/abs:ro:rw\"]\n")),
-            "mount_sets[0][0]: conflicting modes `ro` and `rw`"
+            at("mount_sets[0][0]", "/abs:ro:rw") + "conflicting modes `ro` and `rw`"
         );
         assert_eq!(
             rendered(sets("a = [\"./rel\"]\n")),
-            "mount_sets[0][0]: host path must be absolute or start with ~/ (environment variables \
-             and other relative paths are not expanded)"
+            at("mount_sets[0][0]", "./rel")
+                + "host path must be absolute or start with ~/ (environment variables and other \
+                   relative paths are not expanded)"
         );
         assert_eq!(
             rendered(sets("a = [\"/abs:/a/../b\"]\n")),
@@ -1398,12 +1427,14 @@ mod tests {
         );
         assert_eq!(
             rendered(sets("a = [\"/abs:ro:x\"]\n")),
-            "mount_sets[0][0]: unknown mode keyword (expected ro, rw, fork, follow-links, or \
-             exclude=REL)"
+            at("mount_sets[0][0]", "/abs:ro:x")
+                + "unknown mode keyword \"x\" (expected ro, rw, fork, follow-links, or \
+                   exclude=REL)"
         );
         assert_eq!(
             rendered(sets("a = [\"/abs:\"]\n")),
-            "mount_sets[0][0]: empty segment (stray `:`); expected HOST[:GUEST][:MODE]..."
+            at("mount_sets[0][0]", "/abs:")
+                + "empty segment (stray `:`); expected HOST[:GUEST][:MODE]..."
         );
         assert_eq!(
             rendered(sets("a = { b = 1 }\n")),
@@ -1586,7 +1617,7 @@ mod tests {
             with_authorized("[mount_sets]\na = [\"~/ref\"]\n", |authorized, values| {
                 rendered(from_verified_value(authorized, values, None))
             }),
-            "mount_sets[0][0]: a ~/ host path needs a UTF-8 $HOME"
+            at("mount_sets[0][0]", "~/ref") + "a ~/ host path needs a UTF-8 $HOME"
         );
     }
 
@@ -2150,14 +2181,15 @@ mod tests {
             rendered(parse_document(
                 "[[tools]]\nname = \"a\"\ncommand = \"a\"\nmounts = [\"empty:ro\"]\n"
             )),
-            "tools[0].mounts[0]: a mount-set reference is a bare name; modes, a guest path and \
-             exclusions belong to the paths declared inside the set"
+            at("tools[0].mounts[0]", "empty:ro")
+                + "a mount-set reference is a bare name; modes, a guest path and exclusions \
+                   belong to the paths declared inside the set"
         );
         assert_eq!(
             rendered(parse_document(
                 "[[tools]]\nname = \"a\"\ncommand = \"a\"\nmounts = [\"modified\"]\n"
             )),
-            "tools[0].mounts[0]: unknown mount set name"
+            at("tools[0].mounts[0]", "modified") + "unknown mount set name"
         );
         // An empty set costs no leaf and selects nothing.
         let mut mounts = parse_document(

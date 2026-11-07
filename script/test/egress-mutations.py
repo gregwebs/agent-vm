@@ -526,7 +526,12 @@ def matrix():
         "                VisitDecision::Cycle => {}",
         rust("named_mount_sets_reference_errors_refuse_load_under_every_option", MOUNTS))
     # An unknown reference must be refused at load, in an unused set too.
-    unknown_set = ('                        None => return Err(UserMountsError::UnknownSet { site }),\n'
+    unknown_set = ('                        None => {\n'
+                   '                            return Err(UserMountsError::UnknownSet {\n'
+                   '                                site,\n'
+                   '                                declaration: text.to_string(),\n'
+                   '                            });\n'
+                   '                        }\n'
                    '                    },\n'
                    '                    Err(SelectorError::Direct(error)) => {')
     add("mount-sets-unknown-set-skipped", sets_source, unknown_set,

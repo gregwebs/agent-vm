@@ -3883,7 +3883,7 @@ mod tests {
         assert_eq!(
             load(&with_home(None)).unwrap_err().to_string(),
             format!(
-                "config: {:?}: mounts[0]: a ~/ host path needs a UTF-8 $HOME",
+                "config: {:?}: mounts[0] \"~/ref\": a ~/ host path needs a UTF-8 $HOME",
                 user
             )
         );
@@ -3899,7 +3899,7 @@ mod tests {
             load(&with_home(Some(non_utf8)))
                 .unwrap_err()
                 .to_string()
-                .contains("mounts[0]: a ~/ host path needs a UTF-8 $HOME")
+                .contains("mounts[0] \"~/ref\": a ~/ host path needs a UTF-8 $HOME")
         );
     }
 
@@ -3933,33 +3933,63 @@ mod tests {
         assert_eq!(
             error,
             format!(
-                "config: {:?}: mounts[0]: :exclude is only supported on :fork mounts",
+                "config: {:?}: mounts[0] \"/a:/g:exclude=hidden\": :exclude is only supported on \
+                 :fork mounts",
                 f.user
             )
         );
     }
 
-    /// No mount value ever reaches a diagnostic, and every message names the
-    /// index and the file.
+    /// Every mount load error names the file and the site, and quotes the entry
+    /// that failed, escaped. The two shape errors — a non-string entry and a
+    /// non-array list — have no entry text of their own and name the site only;
+    /// neither echoes the key or the value it refused.
     #[test]
-    fn user_mounts_errors_name_the_index_and_never_echo_values() {
+    fn user_mount_errors_name_the_file_site_and_quote_the_entry() {
         const SENTINEL: &str = "s3cr3t-SENTINEL-305";
+        for (body, entry) in [
+            (format!("mounts = [\"{SENTINEL}\"]\n"), SENTINEL.to_string()),
+            (
+                format!("mounts = [\"{SENTINEL}\", \"/a\"]\n"),
+                SENTINEL.to_string(),
+            ),
+            (
+                format!("mounts = [\"/a:{SENTINEL}\"]\n"),
+                format!("/a:{SENTINEL}"),
+            ),
+            (
+                format!("mounts = [\"/a:/g:{SENTINEL}\"]\n"),
+                format!("/a:/g:{SENTINEL}"),
+            ),
+            (
+                format!("mounts = [\"/a:/g:exclude={SENTINEL}/../x\"]\n"),
+                format!("/a:/g:exclude={SENTINEL}/../x"),
+            ),
+            (
+                format!("mounts = [\"/a:/g\", \"{SENTINEL}:/g\"]\n"),
+                format!("{SENTINEL}:/g"),
+            ),
+        ] {
+            let f = Fixture::new();
+            f.user(&body);
+            let error = f.load().unwrap_err().to_string();
+            assert!(error.contains("mounts"), "{error}");
+            assert!(error.contains(&format!("{:?}", f.user)), "{error}");
+            assert!(
+                error.contains(&crate::config::quoted_str(&entry)),
+                "{body}: the entry is quoted back escaped: {error}"
+            );
+        }
+        // No entry text exists for these two, so neither the value nor the key
+        // may appear.
         for body in [
-            format!("mounts = [\"{SENTINEL}\"]\n"),
-            format!("mounts = [\"{SENTINEL}\", \"/a\"]\n"),
-            format!("mounts = [\"/a:{SENTINEL}\"]\n"),
-            format!("mounts = [\"/a:/g:{SENTINEL}\"]\n"),
-            format!("mounts = [\"/a:/g:exclude={SENTINEL}/../x\"]\n"),
-            format!("mounts = [\"/a:/g\", \"{SENTINEL}:/g\"]\n"),
             format!("mounts = [1, \"{SENTINEL}\"]\n"),
             format!("mounts = {{ {SENTINEL} = 1 }}\n"),
         ] {
             let f = Fixture::new();
             f.user(&body);
             let error = f.load().unwrap_err().to_string();
-            assert!(!error.contains(SENTINEL), "value echoed: {error}");
-            assert!(error.contains("mounts"), "{error}");
-            assert!(error.contains(&format!("{:?}", f.user)), "{error}");
+            assert!(!error.contains(SENTINEL), "{body}: value echoed: {error}");
         }
         // The index is the entry's position, not a constant.
         let f = Fixture::new();
@@ -4954,43 +4984,50 @@ mod tests {
         );
         assert!(origins[1].starts_with("tools[0].mounts[1]"), "{origins:?}");
 
-        // Numeric, value-free diagnostics for the tool site.
+        // Numeric sites, and the entry quoted back when the entry's own grammar
+        // is what refused it.
         const SENTINEL: &str = "s3cr3t-SENTINEL-396";
         for (body, expected) in [
-            (
-                "mounts = [\"/a:/g:ro\", \"/a:/g:rw\"]\n".to_string(),
-                "mounts[1]: claims".to_string(),
-            ),
             (
                 tool(&format!(
                     "name = \"t\"\ncommand = \"t\"\nmounts = [\"./{SENTINEL}:/g\"]\n"
                 )),
-                "tools[0].mounts[0]: host path must be absolute".to_string(),
+                format!("tools[0].mounts[0] \"./{SENTINEL}:/g\": host path must be absolute"),
             ),
             (
                 tool(&format!(
                     "name = \"t\"\ncommand = \"t\"\nmounts = [\"/a:/g:exclude={SENTINEL}\"]\n"
                 )),
-                "tools[0].mounts[0]: :exclude is only supported".to_string(),
+                format!(
+                    "tools[0].mounts[0] \"/a:/g:exclude={SENTINEL}\": :exclude is only supported"
+                ),
             ),
             (
                 tool("name = \"t\"\ncommand = \"t\"\nmounts = [\"nope\"]\n"),
-                "tools[0].mounts[0]: unknown mount set name".to_string(),
+                "tools[0].mounts[0] \"nope\": unknown mount set name".to_string(),
             ),
             (
                 tool("name = \"t\"\ncommand = \"t\"\nmounts = [\"agent:ro\"]\n"),
-                "tools[0].mounts[0]: a mount-set reference is a bare name".to_string(),
+                "tools[0].mounts[0] \"agent:ro\": a mount-set reference is a bare name".to_string(),
             ),
         ] {
             let f = Fixture::new();
             f.user(&body);
             let error = f.load().unwrap_err().to_string();
-            assert!(!error.contains(SENTINEL), "{body}: value echoed: {error}");
             assert!(
                 error.contains(&expected),
                 "{body}: {expected} not in {error}"
             );
         }
+        // A claim conflict names both sites and no entry text.
+        let f = Fixture::new();
+        f.user("mounts = [\"/a:/g:ro\", \"/a:/g:rw\"]\n");
+        assert!(
+            f.load()
+                .unwrap_err()
+                .to_string()
+                .contains("mounts[1]: claims"),
+        );
     }
 
     /// Whole-definition merging is unchanged: a project definition never fills an
