@@ -219,6 +219,16 @@ Network egress:
           [possible values: true, false]
 
 Image:
+      --dockerfile <FILE>
+          Build this Dockerfile with Docker and boot the result.
+
+          The build context is the Dockerfile's own directory; both are resolved from the current
+          directory. Every such launch builds (Docker's build cache is the only reuse) and boots
+          exactly what it built, without an image approval. Cannot be combined with --image;
+          AGENT_VM_IMAGE_TAG and config `image` are ignored for this launch. There is deliberately
+          no environment variable or config setting: only typing it builds. For build options or a
+          reusable name, use `agent-vm image build` and --image.
+
       --image <REF>
           Boot this image instead of the configured one.
 
@@ -263,6 +273,7 @@ Examples:
   agent-vm -t run htop                             force a PTY for a direct command
   agent-vm -T run build.sh >out.log                force streaming I/O for one
   agent-vm shell <command>                         run one command, then exit
+  agent-vm --dockerfile ./Dockerfile shell         build this Dockerfile, then boot it
   agent-vm --memory 8 --cpus 4 <tool>              a bigger sandbox
   agent-vm --mount ~/ref:ro <tool>                 read-only extra mount
   agent-vm --mount /etc/hosts:/host-hosts:ro <tool>

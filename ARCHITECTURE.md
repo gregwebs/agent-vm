@@ -1338,7 +1338,14 @@ journal recovery of an interrupted run is the one write that may, and it adopts
 nothing). The one approval a publication does cause is separate from it: after
 the exclusive barrier is released, `image_pin::approve_published` reads the
 result reference back from the cache and commits exactly that record (#391).
-Local rootfs/disk launches never enter this module. See
+Local rootfs/disk launches never enter this module. A **launch build**
+(`--dockerfile`, [ADR-0061](docs/adr/0061-explicit-launch-builds.md)) publishes
+through the same `image_publish` path — one exclusive-barrier `load_archive`
+under `agent-vm.invalid/dockerfile/<sha256 of the canonical Dockerfile
+path>:latest` — then reads that reference back cache-only and boots
+`repo@digest` under the shared barrier. It adds no lock edge and no approval:
+nothing is written to the pin store, and the SDK create for it uses
+`PullPolicy::Never`, so the internal name is never resolved as a registry. See
 [ADR-0047](docs/adr/0047-host-wide-oci-image-approval.md) for the decision and
 its rejected alternatives.
 

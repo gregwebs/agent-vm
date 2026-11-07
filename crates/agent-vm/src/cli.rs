@@ -549,6 +549,11 @@ where
                 Some(entry) => {
                     let mut args = run::Args::from_arg_matches(&matches)?;
                     args.image.reconcile(&matches);
+                    args.launch_build().map_err(|conflict| {
+                        anyhow::Error::new(
+                            command.error(clap::error::ErrorKind::ArgumentConflict, conflict),
+                        )
+                    })?;
                     reject_direct_terminal_options(&mut command, &matches, &args)?;
                     Ok(Dispatch::Launch {
                         images: captured.images,
@@ -632,6 +637,12 @@ fn direct_dispatch(
         .map_err(|error| anyhow::Error::new(direct_program_error(&error)))?;
     let mut args = run::Args::from_arg_matches(matches)?;
     args.image.reconcile(matches);
+    args.launch_build().map_err(|conflict| {
+        anyhow::Error::new(direct_usage_error(
+            clap::error::ErrorKind::ArgumentConflict,
+            conflict,
+        ))
+    })?;
     // The terminal mode is resolved exactly once, here, and frozen into the
     // target: missing/empty program and conflicting flags are usage errors (2)
     // before any further validation, and a forced PTY with non-terminal stdin is
@@ -1354,7 +1365,7 @@ fn validate_builtin_args(command: &clap::Command, cmd: &Cmd) -> Result<()> {
 mod tests {
     use super::*;
     use crate::config::{ConfigPaths, LaunchCatalog, RESERVED_TOOL_NAMES};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     const MYTOOL: &str = "[[tools]]\nname = \"mytool\"\ncommand = \"my-agent\"\n";
     const SHELL_ONLY: &str =
@@ -4231,6 +4242,7 @@ mod tests {
                 ),
                 ("allow-lan".to_string(), None, OptionShape::EqualsOnlyValue),
                 ("allow-host".to_string(), None, OptionShape::EqualsOnlyValue),
+                ("dockerfile".to_string(), None, OptionShape::RequiredValue),
                 ("image".to_string(), None, OptionShape::RequiredValue),
                 ("root".to_string(), None, OptionShape::Flag),
             ]
@@ -4435,5 +4447,99 @@ mod tests {
             assert!(rendered.contains("run-tool"), "{rendered}");
         }
         assert_eq!(nearest_builtin("rnu"), Some("run"));
+    }
+
+    #[test]
+    fn dockerfile_launch_option_cli_parsing_and_conflicts() {
+        let mut env = clear_launch_env();
+        // --dockerfile D --image R shell -> ArgumentConflict
+        for argv in [
+            vec!["agent-vm", "--dockerfile", "D", "--image", "R", "shell"],
+            vec![
+                "agent-vm",
+                "--dockerfile",
+                "D",
+                "--image",
+                "R",
+                "run",
+                "true",
+            ],
+            vec![
+                "agent-vm",
+                "--dockerfile",
+                "D",
+                "--image",
+                "R",
+                "--",
+                "true",
+            ],
+        ] {
+            let error = usage_error(parse_from(argv_of(&argv), Ok(report_from(SHELL_ONLY))));
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+            assert_eq!(error.exit_code(), 2);
+            assert!(
+                error
+                    .to_string()
+                    .contains("--dockerfile and --image cannot be used together")
+            );
+        }
+
+        // AGENT_VM_IMAGE_TAG=R --dockerfile D shell -> Dispatch::Launch with launch_build() == Ok(Some(D))
+        {
+            env.set_var("AGENT_VM_IMAGE_TAG", "some:tag");
+            let dispatch = parse_from(
+                argv_of(&["agent-vm", "--dockerfile", "MyDockerfile", "shell"]),
+                Ok(report_from(SHELL_ONLY)),
+            )
+            .unwrap();
+            let (args, _) = launch_of(dispatch);
+            assert_eq!(args.launch_build(), Ok(Some(Path::new("MyDockerfile"))));
+        }
+
+        // --dockerfile D setup -> "launch option '--dockerfile' cannot be used with 'setup'"
+        {
+            let error = usage_error(parse_from(
+                argv_of(&["agent-vm", "--dockerfile", "D", "setup"]),
+                Ok(report_from(SHELL_ONLY)),
+            ));
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+            assert_eq!(error.exit_code(), 2);
+            let text = error.to_string();
+            assert!(text.contains("'--dockerfile'") && text.contains("'setup'"));
+        }
+
+        // shell --dockerfile D -> tool args ["--dockerfile", "D"]
+        {
+            let dispatch = parse_from(
+                argv_of(&["agent-vm", "shell", "--dockerfile", "D"]),
+                Ok(report_from(SHELL_ONLY)),
+            )
+            .unwrap();
+            let (args, tool_args) = launch_of(dispatch);
+            assert_eq!(args.dockerfile, None);
+            assert_eq!(tool_args, ["--dockerfile", "D"]);
+        }
+
+        // --dockerfile D -- cat - -> direct route with program cat -
+        {
+            let dispatch = parse_from(
+                argv_of(&["agent-vm", "--dockerfile", "D", "--", "cat", "-"]),
+                Ok(report_from(SHELL_ONLY)),
+            )
+            .unwrap();
+            match dispatch {
+                Dispatch::Launch { args, target, .. } => {
+                    assert_eq!(args.dockerfile, Some(PathBuf::from("D")));
+                    match target {
+                        LaunchTarget::Direct { command, .. } => {
+                            assert_eq!(command.program(), "cat");
+                            assert_eq!(command.args(), ["-"]);
+                        }
+                        _ => panic!("expected direct command"),
+                    }
+                }
+                _ => panic!("expected launch"),
+            }
+        }
     }
 }

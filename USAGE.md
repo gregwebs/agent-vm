@@ -202,6 +202,7 @@ catalog never changes it). First present source wins:
 
 | source | how |
 |---|---|
+| launch build | `--dockerfile FILE` (builds and boots; cannot be combined with `--image`; outranks `AGENT_VM_IMAGE_TAG`, config `image` and the default) |
 | command line | `--image REF` |
 | environment | `AGENT_VM_IMAGE_TAG=REF` (an empty value counts as unset) |
 | user config | top-level `image = "REF"` in `~/.config/agent-vm/config.toml` |
@@ -221,9 +222,11 @@ with an error naming the file (never echoing the value).
 rootfs or disk image is still bootable **from the command line**, where you
 typed it.
 
-**No launch builds an image or runs Docker.** Selection and acquisition only. An
-image that fails to acquire is a launch failure — there is no fallback image and
-no local build.
+**No launch builds an image or runs Docker, except for an explicit `--dockerfile FILE` launch build.**
+Selection and acquisition only. An image that fails to acquire is a launch failure — there is no
+fallback image and no implicit local build. Passing `--dockerfile FILE` builds the Dockerfile
+with context set to its parent directory, publishes it to agent-vm's native cache under an internal
+name, and boots the resulting image without an approval pin.
 
 **A missing program fails; agent-vm never installs it.** If the selected image
 does not contain the tool's `command`, the launch prints a contract diagnostic
@@ -765,8 +768,9 @@ the terminal (a control byte renders as `\x1b`) and deliberately not pasteable.
 
 A registry acquisition failure for an explicit mutable tag prints an import
 hint and retains the registry error chain. It does not prove the image exists
-in Docker. Digests and the redacted default image get no hint; launch never
-runs Docker or automatically imports.
+in Docker. Digests and the redacted default image get no hint; no launch runs
+Docker or imports automatically, except the explicit
+[launch build](#launch-builds---dockerfile).
 
 Neither verb writes configuration or a retained default, adopts a default,
 boots a guest or installs runtime tools. Each records exactly one host approval,
@@ -800,6 +804,81 @@ Dockerfile/context/builder. Docker inherits ordinary host environment,
 credentials and stdin; agent-vm does not invoke runtime credential capture or
 provisioning. Avoid sensitive build CLI values: build's ordinary clap usage
 errors can echo rejected values; only import gets value-free parse errors.
+
+#### Launch builds (`--dockerfile`)
+
+When you are iterating on a Dockerfile, skip the separate build step: a launch
+build does both in one command.
+
+```sh
+agent-vm --dockerfile ./Dockerfile shell
+agent-vm --memory 8 --dockerfile path/to/Dockerfile -- cargo build
+```
+
+It is a launch option, so it goes before the tool verb or the runner, exactly
+like `--image`. The build context is the Dockerfile's own directory (`./` for a
+Dockerfile in the current directory), and both paths are resolved relative to
+your current directory. There is no separate context argument.
+
+This is the one launch that runs Docker (ADR-0061). Every launch build builds;
+Docker's own BuildKit cache is the only reuse, and agent-vm computes no source
+hash to skip work. The result is published into agent-vm's own image cache under
+an internal name, `agent-vm.invalid/dockerfile/<sha256 of the Dockerfile's
+canonical path>:latest`, and this launch boots exactly the content it just built
+— not whatever that name holds later.
+
+A launch build writes no `image-pins.json` entry and prompts for nothing: typing
+the flag is the consent to build and boot that result, so there is no approval to
+review and no `--yes`. Nothing else can trigger one — there is no
+`AGENT_VM_DOCKERFILE`, no `image = …`-style config key and no catalog field, so a
+repository, a tool declaration or an environment variable you inherit can never
+start an unrequested build.
+
+`--dockerfile` and `--image` cannot be combined: that argv is a usage error
+(status 2). `AGENT_VM_IMAGE_TAG`, a user or project config `image`, and the
+default boot image are ignored rather than conflicting, since `--dockerfile`
+outranks every one of them. `setup` does not accept the flag.
+
+Docker's own progress and its build output go to **stderr**, and the launcher's
+stdout is untouched, so `agent-vm --dockerfile F run build >out.log` keeps
+`out.log` free of build chatter. Docker's stdin is `/dev/null`, which leaves your
+own input for the guest — `echo hi | agent-vm --dockerfile F -- cat -` still
+feeds `cat` on the guest side.
+
+A failed build or a failed publication is the launcher's own failure, never a
+guest exit status: a direct command exits **125** and a tool launch exits 1,
+regardless of Docker's own exit code. Because the build runs before the session
+provisions state, a failed build leaves no session directory behind — with one
+exception it inherits from the mount layer: a `:fork` mount seeds its
+project-scoped copy during mount preparation, which runs first, so a failed
+build can leave that copy behind.
+
+What a launch build deliberately cannot do:
+
+- **No build options.** No `--build-arg`, `--target`, `--builder`, `--no-cache`,
+  `--progress` or `--pull`; use `agent-vm image build` (which accepts them) plus
+  `--image`, or an ordinary `docker buildx build` you run yourself. Docker still
+  honours `BUILDX_BUILDER` and `DOCKER_HOST` from your environment, so a builder
+  chosen that way applies to every launch build you run.
+- **No reusable name and no pruning.** Superseded launch-build content stays in
+  the cache, exactly as `image build` output does; only the current digest of a
+  given Dockerfile is booted. Use `image build --tag` for content you want to
+  keep, share or prune deliberately.
+- **Never pulled by name.** If the built content is missing from the cache when
+  this launch reaches the guest, the launch fails instead of pulling: agent-vm
+  never contacts `agent-vm.invalid`, on this host or anywhere else. (Your
+  Dockerfile's own `FROM` images are a separate matter — Docker pulls those as
+  usual during the build.)
+- **No `-` Dockerfile.** Stdin is `/dev/null` by design, so `--dockerfile -` is
+  not a way to pipe a Dockerfile in; pass a file.
+
+A Dockerfile in `$HOME` makes your whole home directory the build context, and a
+remote builder would receive it — with a `COPY . .` line, so would the image. Keep
+the Dockerfile in a project directory. A launch build runs Docker before
+credentials are resolved, so a missing credential is reported after the build.
+The build is also **not** credential-shielded guest execution: Docker inherits
+ordinary host environment and credentials, so trust the Dockerfile and its
+context exactly as you would for `image build`.
 
 ## Boot image contract
 
@@ -902,6 +981,7 @@ Available launch options:
 |---|---|
 | `--memory N` | VM memory GiB (default 2) |
 | `--cpus N` | vCPUs (default 2) |
+| `--dockerfile FILE` | build this Dockerfile and boot the result (context is the Dockerfile's parent directory; mutually exclusive with `--image`) |
 | `--image REF` | boot this image instead of the configured one (env `AGENT_VM_IMAGE_TAG`); see [Selecting the boot image](#selecting-the-boot-image) |
 | `--no-git` | skip gh/git auth injection (still respects `--repo`) |
 | `--repo OWNER/NAME` | add to the GitHub allow-list (repeatable) |

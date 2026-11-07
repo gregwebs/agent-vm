@@ -144,6 +144,19 @@ pub(crate) fn is_plain_http_registry(image_ref: &str) -> bool {
         || host.ends_with(".localhost")
 }
 
+/// Whether the SDK create must turn on `.insecure()` (plain-HTTP registry) for
+/// this image.
+///
+/// Never for a **launch build** (ADR-0061): its internal `agent-vm.invalid/…`
+/// name is a cache key, not a registry, and `PullPolicy::Never` forbids the
+/// fetch that would need the plain-HTTP reading. Extracted from the create chain
+/// so the decision is one named, testable predicate (ADR-0018's "new pure
+/// function that decides a security boundary"); [`is_plain_http_registry`] keeps
+/// owning what "plain HTTP" means.
+pub(crate) fn registry_is_insecure(cache_only: bool, image_ref: &str) -> bool {
+    !cache_only && is_plain_http_registry(image_ref)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,5 +249,24 @@ mod tests {
     fn preflight_refuses_a_typed_empty_target() {
         let error = preflight(&args_with(Some(""))).unwrap_err();
         assert!(error.to_string().contains("must not be empty"), "{error}");
+    }
+
+    /// The exact conjunction behind `.insecure()`, over all four combinations.
+    /// A cache-only selection (a launch build) is never plain-HTTP, whatever the
+    /// reference looks like.
+    #[test]
+    fn insecure_needs_a_non_cache_only_plain_http_reference() {
+        for (cache_only, reference, expected) in [
+            (false, "registry.local:5000/app:1", true),
+            (false, "ghcr.io/o/app:1", false),
+            (true, "registry.local:5000/app:1", false),
+            (true, "ghcr.io/o/app:1", false),
+        ] {
+            assert_eq!(
+                registry_is_insecure(cache_only, reference),
+                expected,
+                "cache_only={cache_only} reference={reference}"
+            );
+        }
     }
 }

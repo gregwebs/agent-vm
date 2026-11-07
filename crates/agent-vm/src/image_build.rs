@@ -23,14 +23,15 @@
 //! ```
 //!
 //! Publication lives in [`crate::image_publish`]; the approval of its result in
-//! [`crate::image_pin::approve_published`].
+//! [`crate::image_pin::approve_published`]. The launch build
+//! ([`crate::launch_build`]) reuses this export with null stdin.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use crate::image_publish::{ImageTarget, ResultReference};
+use crate::image_publish::{ImageTarget, PublishPurpose, ResultReference};
 use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 
@@ -60,34 +61,49 @@ pub(crate) struct Args {
     #[arg(short = 'f', long = "file", value_name = "DOCKERFILE")]
     dockerfile: Option<PathBuf>,
 
-    /// Set a build-time variable (`KEY[=VALUE]`), passed verbatim to Docker.
-    /// A bare `KEY` reads the host environment as Docker normally does.
-    #[arg(long = "build-arg", value_name = "KEY[=VALUE]")]
-    build_args: Vec<OsString>,
-
-    /// Build only up to this Dockerfile stage.
-    #[arg(long, value_name = "STAGE")]
-    target: Option<OsString>,
-
-    /// Buildx builder instance to use for this build.
-    #[arg(long, value_name = "NAME")]
-    builder: Option<OsString>,
-
-    /// Always attempt to pull newer base images.
-    #[arg(long)]
-    pull: bool,
-
-    /// Do not use Docker's builder cache.
-    #[arg(long = "no-cache")]
-    no_cache: bool,
-
-    /// Buildx progress output mode (`auto`, `plain`, `tty`, `rawjson`).
-    #[arg(long, value_name = "MODE")]
-    progress: Option<OsString>,
+    #[command(flatten)]
+    options: BuildOptions,
 
     /// Build context path. Passed to Docker untouched.
     #[arg(value_name = "CONTEXT", default_value = ".")]
     context: OsString,
+}
+
+/// The user-tunable part of `docker buildx build`. A launch build uses the
+/// default (none): options belong to `image build` (ADR-0061).
+#[derive(ClapArgs, Default)]
+pub(crate) struct BuildOptions {
+    /// Set a build-time variable (`KEY[=VALUE]`), passed verbatim to Docker.
+    /// A bare `KEY` reads the host environment as Docker normally does.
+    #[arg(long = "build-arg", value_name = "KEY[=VALUE]")]
+    pub(crate) build_args: Vec<OsString>,
+
+    /// Build only up to this Dockerfile stage.
+    #[arg(long, value_name = "STAGE")]
+    pub(crate) target: Option<OsString>,
+
+    /// Buildx builder instance to use for this build.
+    #[arg(long, value_name = "NAME")]
+    pub(crate) builder: Option<OsString>,
+
+    /// Always attempt to pull newer base images.
+    #[arg(long)]
+    pub(crate) pull: bool,
+
+    /// Do not use Docker's builder cache.
+    #[arg(long = "no-cache")]
+    pub(crate) no_cache: bool,
+
+    /// Buildx progress output mode (`auto`, `plain`, `tty`, `rawjson`).
+    #[arg(long, value_name = "MODE")]
+    pub(crate) progress: Option<OsString>,
+}
+
+/// Docker's inputs for one anonymous host-platform OCI export.
+pub(crate) struct DockerBuild<'a> {
+    pub(crate) dockerfile: Option<&'a OsStr>,
+    pub(crate) context: &'a OsStr,
+    pub(crate) options: &'a BuildOptions,
 }
 
 /// Build the user's Dockerfile and import the result under `--tag`. Returns the
@@ -98,7 +114,19 @@ pub(crate) async fn run(args: Args) -> Result<i32> {
     // archive is published (R9): a damaged store must not cost a build.
     crate::image_pin::publication_preflight(&args.tag)?;
     let staging = target.stage()?;
-    let exit = export_archive(&args, staging.writer()?).await?;
+    let build = DockerBuild {
+        dockerfile: args.dockerfile.as_deref().map(Path::as_os_str),
+        context: &args.context,
+        options: &args.options,
+    };
+    let exit = export_archive(&build, staging.writer()?, Stdio::inherit())
+        .await
+        .with_context(|| {
+            format!(
+                "running `docker buildx build` for --tag {}; {DOCKER_STAGE_HINT}",
+                escape_str(args.tag.as_str())
+            )
+        })?;
     if exit != 0 {
         // A nonzero exporter status is a failure even if complete bytes were
         // written: never import an archive from a command that reported
@@ -111,7 +139,7 @@ pub(crate) async fn run(args: Args) -> Result<i32> {
     }
 
     let published = target
-        .publish(staging.path(), &args.tag)
+        .publish(staging.path(), &args.tag, PublishPurpose::Approval)
         .await
         .context("importing build result")?;
     // The command that supplied the bytes is the consent (#391). The read-back
@@ -128,22 +156,22 @@ pub(crate) async fn run(args: Args) -> Result<i32> {
     Ok(0)
 }
 
-/// Run `docker buildx build …` with the archive file as its stdout. Inherits
-/// stdin (native Dockerfile/context input) and stderr (live build progress).
-async fn export_archive(args: &Args, archive: std::fs::File) -> Result<i32> {
+/// Run `docker buildx build …` with `archive` as stdout and stderr inherited.
+/// `stdin` is the caller's decision: `image build` inherits it (Docker's own
+/// `-f -`/context-on-stdin), while a launch build passes `Stdio::null()` so a
+/// direct command's input is never consumed (ADR-0061 §9, ADR-0052).
+pub(crate) async fn export_archive(
+    build: &DockerBuild<'_>,
+    archive: std::fs::File,
+    stdin: Stdio,
+) -> std::io::Result<i32> {
     let stdout = Stdio::from(archive);
-    let status = build_command(args)
-        .stdin(Stdio::inherit())
+    let status = build_command(build)
+        .stdin(stdin)
         .stdout(stdout)
         .stderr(Stdio::inherit())
         .status()
-        .await
-        .with_context(|| {
-            format!(
-                "running `docker buildx build` for --tag {}; {DOCKER_STAGE_HINT}",
-                escape_str(args.tag.as_str())
-            )
-        })?;
+        .await?;
     Ok(crate::msb_cmd::exit_code_from_status(status))
 }
 
@@ -153,28 +181,28 @@ async fn export_archive(args: &Args, archive: std::fs::File) -> Result<i32> {
 ///
 /// Deliberately no Docker `-t`: the result reference is supplied only to the
 /// importer's tags, so there is one image and no Docker-store alias.
-fn build_command(args: &Args) -> tokio::process::Command {
+fn build_command(build: &DockerBuild<'_>) -> tokio::process::Command {
     let mut command = tokio::process::Command::new("docker");
     command.args(["buildx", "build"]);
-    if let Some(builder) = &args.builder {
+    if let Some(builder) = &build.options.builder {
         command.arg("--builder").arg(builder);
     }
-    if let Some(dockerfile) = &args.dockerfile {
+    if let Some(dockerfile) = build.dockerfile {
         command.arg("-f").arg(dockerfile);
     }
-    for build_arg in &args.build_args {
+    for build_arg in &build.options.build_args {
         command.arg("--build-arg").arg(build_arg);
     }
-    if let Some(target) = &args.target {
+    if let Some(target) = &build.options.target {
         command.arg("--target").arg(target);
     }
-    if args.pull {
+    if build.options.pull {
         command.arg("--pull");
     }
-    if args.no_cache {
+    if build.options.no_cache {
         command.arg("--no-cache");
     }
-    if let Some(progress) = &args.progress {
+    if let Some(progress) = &build.options.progress {
         command.arg("--progress").arg(progress);
     }
     command
@@ -189,7 +217,7 @@ fn build_command(args: &Args) -> tokio::process::Command {
         // paths in `--output type=oci,dest=<path>`.
         .arg("--output")
         .arg("type=oci,dest=-")
-        .arg(&args.context);
+        .arg(build.context);
     command
 }
 
@@ -229,12 +257,12 @@ mod tests {
         let args = parse(&["t", "--tag", "my-app:dev"]).expect("minimal invocation parses");
         assert_eq!(args.context, OsString::from("."));
         assert!(args.dockerfile.is_none());
-        assert!(args.build_args.is_empty());
-        assert!(args.target.is_none());
-        assert!(args.builder.is_none());
-        assert!(!args.pull);
-        assert!(!args.no_cache);
-        assert!(args.progress.is_none());
+        assert!(args.options.build_args.is_empty());
+        assert!(args.options.target.is_none());
+        assert!(args.options.builder.is_none());
+        assert!(!args.options.pull);
+        assert!(!args.options.no_cache);
+        assert!(args.options.progress.is_none());
     }
 
     #[test]
@@ -262,10 +290,19 @@ mod tests {
             .collect()
     }
 
+    fn docker_build_from_args<'a>(args: &'a Args) -> DockerBuild<'a> {
+        DockerBuild {
+            dockerfile: args.dockerfile.as_deref().map(Path::as_os_str),
+            context: &args.context,
+            options: &args.options,
+        }
+    }
+
     #[test]
     fn owned_output_and_platform_flags_are_always_present() {
         let args = parse(&["t", "--tag", "a:1"]).expect("parses");
-        let argv = argv_of(&build_command(&args));
+        let build = docker_build_from_args(&args);
+        let argv = argv_of(&build_command(&build));
         let render = |argv: &[OsString]| {
             argv.iter()
                 .map(|arg| arg.to_string_lossy().into_owned())
@@ -322,7 +359,8 @@ mod tests {
             "the context",
         ])
         .expect("parses");
-        let rendered: Vec<String> = argv_of(&build_command(&args))
+        let build = docker_build_from_args(&args);
+        let rendered: Vec<String> = argv_of(&build_command(&build))
             .iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
@@ -349,11 +387,42 @@ mod tests {
     #[test]
     fn no_dockerfile_flag_when_the_option_is_omitted() {
         let args = parse(&["t", "--tag", "a:1"]).expect("parses");
-        let rendered: Vec<String> = argv_of(&build_command(&args))
+        let build = docker_build_from_args(&args);
+        let rendered: Vec<String> = argv_of(&build_command(&build))
             .iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
         assert!(!rendered.contains(&"-f".to_string()));
+    }
+
+    #[test]
+    fn launch_build_argv_has_only_owned_flags_plus_file_and_context() {
+        let options = BuildOptions::default();
+        let build = DockerBuild {
+            dockerfile: Some(OsStr::new("/abs/Dockerfile")),
+            context: OsStr::new("/abs"),
+            options: &options,
+        };
+        let argv = argv_of(&build_command(&build));
+        let rendered: Vec<String> = argv
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(rendered[0..2], ["buildx", "build"]);
+        assert_eq!(
+            rendered
+                .windows(2)
+                .find(|w| w[0] == "-f")
+                .map(|w| w[1].as_str()),
+            Some("/abs/Dockerfile")
+        );
+        assert_eq!(rendered.last().map(String::as_str), Some("/abs"));
+        assert!(
+            !rendered.iter().any(|arg| arg == "-t"
+                || arg == "--tag"
+                || arg == "--builder"
+                || arg == "--progress")
+        );
     }
 
     #[test]

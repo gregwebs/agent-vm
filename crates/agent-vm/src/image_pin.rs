@@ -29,15 +29,23 @@
 //! A local rootfs directory or disk image is a supported launch target and
 //! nothing about it is approvable: [`prepare_selected`] hands the original text
 //! back untouched and never touches the store, the cache barrier or a receipt.
+//!
+//! # What a launch build is here
+//!
+//! A launch build (`--dockerfile`) boots its own result without approval: typing
+//! the flag is the consent (ADR-0061). It bypasses the pin store completely.
+//! Right after publication the tag is read back cache-only and must match the
+//! loader's reported digest; preparation later reads that immutable `repo@digest`
+//! cache-only under the shared barrier held through create.
 
 use std::fmt;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use microsandbox_image::Platform;
 use serde::{Deserialize, Serialize};
 use vstd::prelude::*;
 
-use crate::boot_image::{BootImage, ImageLabel, ImageRef, ImmutableImageRef};
+use crate::boot_image::{BootImage, ImageLabel, ImageRef, ImageSource, ImmutableImageRef};
 use crate::config;
 use crate::image_acquire::{
     self, AcquireError, AcquireMode, ContentIdentity, OciTarget, OciTargetError,
@@ -48,8 +56,10 @@ pub(crate) use crate::image_acquire::{CanonicalOciReference, ValidatedDigest as 
 mod approval;
 mod publication;
 mod store;
+mod unpinned;
 
 pub(crate) use publication::{approve_published, publication_preflight};
+pub(crate) use unpinned::{BuiltImage, prepare_unpinned, read_back_unpinned};
 
 // `Option` normally accepts missing fields in serde. Version 1 requires the
 // field even when its value is null; deserialize_with disables that default.
@@ -347,9 +357,9 @@ pub(crate) enum DefaultChange {
 /// One prepared selection: what the SDK is given, the environment facts of
 /// exactly that content, and the shared publication barrier the create needs.
 ///
-/// Constructed only by [`prepare_selected`]. Dropping it releases the barrier,
-/// which callers do immediately after the SDK create resolves and before guest
-/// hooks, commands, or in-guest tool probes.
+/// Constructed only by [`prepare_selected`] or [`prepare_unpinned`]. Dropping it
+/// releases the barrier, which callers do immediately after the SDK create resolves
+/// and before guest hooks, commands, or in-guest tool probes.
 pub(crate) struct PreparedSelection {
     sdk_reference: String,
     image_env: Option<Vec<String>>,
@@ -361,6 +371,7 @@ pub(crate) struct PreparedSelection {
     /// dropping this value is what releases it. It is also the booted content's
     /// validated metadata, which is where the image's request labels are read.
     native: Option<PreparedNativeImage>,
+    cache_only: bool,
 }
 
 impl PreparedSelection {
@@ -371,10 +382,11 @@ impl PreparedSelection {
             image_env: None,
             selection: None,
             native: None,
+            cache_only: false,
         }
     }
 
-    fn approved(
+    fn immutable_content(
         approved: &ImmutableImageRef,
         selection: String,
         prepared: PreparedNativeImage,
@@ -384,7 +396,40 @@ impl PreparedSelection {
             image_env: Some(prepared.image().image_env().to_vec()),
             selection: Some(selection),
             native: Some(prepared),
+            cache_only: false,
         }
+    }
+
+    fn cache_only(mut self) -> Self {
+        self.cache_only = true;
+        self
+    }
+
+    /// How the SDK may resolve this image. A launch build never pulls: its
+    /// registry host (`agent-vm.invalid`) must not be contacted if the cache lost it.
+    pub(crate) fn pull_policy(&self) -> microsandbox::sandbox::PullPolicy {
+        if self.cache_only {
+            microsandbox::sandbox::PullPolicy::Never
+        } else {
+            microsandbox::sandbox::PullPolicy::IfMissing
+        }
+    }
+
+    /// Whether this selection is forbidden any registry access. Read by
+    /// [`Self::registry_is_insecure`] and by tests.
+    #[cfg(test)]
+    pub(crate) fn is_cache_only(&self) -> bool {
+        self.cache_only
+    }
+
+    /// Whether `.insecure()` (plain HTTP) applies to what the SDK is given.
+    ///
+    /// The one place the cache-only fact and the reference are combined, so the
+    /// create line and the tests exercise the same function rather than a copy
+    /// of it: a launch build's `agent-vm.invalid/...` name is a cache key, never
+    /// a registry, and `PullPolicy::Never` forbids the fetch anyway.
+    pub(crate) fn registry_is_insecure(&self, sdk_image: &str) -> bool {
+        crate::pull::registry_is_insecure(self.cache_only, sdk_image)
     }
 
     /// The reference handed to the SDK's `.image(...)`: an approved
@@ -423,6 +468,14 @@ impl PreparedSelection {
 /// preparation revalidates the winner's frozen digest and uses it, or fails
 /// before create.
 pub(crate) async fn prepare_selected(boot: &BootImage) -> Result<PreparedSelection> {
+    // A launch build has no approval to consume, and treating its internal tag as
+    // an OCI source here would first-pin it and turn on `IfMissing` + `.insecure()`
+    // for that name — the exposure `prepare_unpinned` exists to prevent.
+    // Structurally unreachable (`run::launch` branches on the same fact), so a
+    // mismatch is an internal error, not a user error.
+    if matches!(boot.source(), ImageSource::LaunchBuild(_)) {
+        bail!("internal error: a launch build is prepared by prepare_unpinned, never by pinning");
+    }
     let label = boot.label();
     let target = match OciTarget::parse(boot.reference().as_str()) {
         Ok(target) => target,
@@ -448,7 +501,9 @@ pub(crate) async fn prepare_selected(boot: &BootImage) -> Result<PreparedSelecti
     let prepared = approved_preparation(&current, &label, Rendering::Selection).await?;
     retain_default(boot, &current)?;
     let approved = current.immutable_reference()?;
-    Ok(PreparedSelection::approved(&approved, selection, prepared))
+    Ok(PreparedSelection::immutable_content(
+        &approved, selection, prepared,
+    ))
 }
 
 /// The absent-approval branch: acquire the source itself, then establish the
@@ -478,7 +533,7 @@ async fn prepare_first_pin(
     match commit(&candidate, &Approval::initial(&candidate), action) {
         Ok(committed) => {
             let approved = committed.pin.immutable_reference()?;
-            Ok(PreparedSelection::approved(
+            Ok(PreparedSelection::immutable_content(
                 &approved,
                 selection.to_owned(),
                 prepared,
@@ -494,7 +549,7 @@ async fn prepare_first_pin(
                     drop(prepared);
                     let prepared = approved_preparation(&pin, label, Rendering::Selection).await?;
                     let approved = pin.immutable_reference()?;
-                    Ok(PreparedSelection::approved(
+                    Ok(PreparedSelection::immutable_content(
                         &approved,
                         selection.to_owned(),
                         prepared,
@@ -1121,6 +1176,45 @@ mod tests {
         let selection = PreparedSelection::local("/host/rootfs");
         assert_eq!(selection.sdk_reference(), "/host/rootfs");
         assert!(selection.image_env().is_none());
+    }
+
+    /// A launch build must never be pinned: `run::launch` branches on the same
+    /// fact, so reaching the pin path with one is a wiring bug, and it fails
+    /// loudly instead of first-pinning the internal name (which would turn on
+    /// `IfMissing` + `.insecure()` for it).
+    #[tokio::test]
+    async fn prepare_selected_refuses_a_launch_build_selection() {
+        let boot = BootImage::launch_build(
+            ImageRef::from_config("agent-vm.invalid/dockerfile/abc:latest").unwrap(),
+            std::path::PathBuf::from("Dockerfile"),
+        );
+        let error = prepare_selected(&boot).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "internal error: a launch build is prepared by prepare_unpinned, never by pinning"
+        );
+    }
+
+    /// R16 is a conjunction: only a launch build may skip the registry. A
+    /// selection that is `cache_only` by accident would turn every warm launch
+    /// into a cache miss, and a `Never` policy on an approved-but-uncached image
+    /// would fail instead of pulling. Both ordinary constructors must keep
+    /// `IfMissing`.
+    #[test]
+    fn only_a_launch_build_is_cache_only() {
+        use microsandbox::sandbox::PullPolicy;
+
+        let local = PreparedSelection::local("/host/rootfs");
+        assert_eq!(local.pull_policy(), PullPolicy::IfMissing);
+        assert!(!local.is_cache_only());
+
+        // `cache_only` is private to this module, so `unpinned` is the only
+        // caller that can set it.
+        assert!(
+            PreparedSelection::local("/host/rootfs")
+                .cache_only()
+                .is_cache_only()
+        );
     }
 
     /// The lost `pull.rs` redaction row, moved here with `render_failure`: a

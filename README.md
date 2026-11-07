@@ -107,7 +107,7 @@ Full flag, subcommand, networking, and troubleshooting reference:
 [Direct commands](USAGE.md#direct-commands), with the approved contract in
 [docs/specs/direct-command-launch.md](docs/specs/direct-command-launch.md).
 
-Build and select your own finished image; launches never run Docker:
+Build and select your own finished image (or pass `--dockerfile FILE` to build and boot directly); launches never run Docker implicitly:
 
 ```sh
 agent-vm image build --tag my-image:dev --builder native-oci .

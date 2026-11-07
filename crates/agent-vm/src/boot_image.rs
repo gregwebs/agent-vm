@@ -6,11 +6,16 @@
 //! precedence order every verb shares —
 //!
 //! ```text
-//! --image  >  AGENT_VM_IMAGE_TAG (empty = unset)  >  user image  >  project image  >  default
+//! --dockerfile (launch only; exclusive with a typed --image)
+//!   > --image > AGENT_VM_IMAGE_TAG (empty = unset) > user image > project image > default
 //! ```
 //!
 //! — so `run`, `image refresh`, `setup`, `doctor`, `image show` and import's completion
-//! check cannot disagree about which image a session boots. The **catalog is deliberately not an input**: changing the
+//! check cannot disagree about which image a session boots. `run::launch` resolves
+//! `--dockerfile` first because only a launch has the flag; when it is present the
+//! lower tiers are ignored, and a typed `--image` beside it is an explicit conflict
+//! rather than an override.
+//! The **catalog is deliberately not an input**: changing the
 //! runtime tool declaration must never change the image (issue #259).
 //!
 //! # The default slot: a recommendation, then a retained selection
@@ -197,6 +202,9 @@ impl ImmutableImageRef {
 /// same-typed parameter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ImageSource {
+    /// `--dockerfile FILE`, as typed. The reference is the launch build's
+    /// internal tag; a launch build is never pinned (ADR-0061).
+    LaunchBuild(PathBuf),
     /// `--image`.
     CommandLine,
     /// `AGENT_VM_IMAGE_TAG`.
@@ -217,6 +225,9 @@ impl ImageSource {
     /// `user config /home/dev/.config/agent-vm/config.toml`.
     pub(crate) fn describe(&self) -> String {
         match self {
+            ImageSource::LaunchBuild(file) => {
+                format!("--dockerfile {}", crate::one_line::path(file))
+            }
             ImageSource::CommandLine => "command line".to_string(),
             ImageSource::Environment => "env AGENT_VM_IMAGE_TAG".to_string(),
             ImageSource::UserConfig(file) => {
@@ -243,6 +254,15 @@ pub(crate) struct BootImage {
 }
 
 impl BootImage {
+    /// A launch build's selection. Only `run::launch` constructs one: no other
+    /// verb has `--dockerfile`.
+    pub(crate) fn launch_build(reference: ImageRef, dockerfile: PathBuf) -> Self {
+        Self {
+            reference,
+            source: ImageSource::LaunchBuild(dockerfile),
+        }
+    }
+
     pub(crate) fn reference(&self) -> &ImageRef {
         &self.reference
     }
@@ -271,7 +291,8 @@ impl BootImage {
             ImageSource::CommandLine
             | ImageSource::Environment
             | ImageSource::UserConfig(_)
-            | ImageSource::ProjectConfig(_) => DefaultSourceFacts {
+            | ImageSource::ProjectConfig(_)
+            | ImageSource::LaunchBuild(_) => DefaultSourceFacts {
                 retained: false,
                 initial: false,
             },
@@ -291,18 +312,44 @@ impl BootImage {
     /// [`inspect_selection`] is the single, deliberate exception: a user who
     /// asks `agent-vm image show` is asking for the reference itself.
     pub(crate) fn label(&self) -> ImageLabel {
-        if self.is_default() {
-            ImageLabel {
+        match &self.source {
+            ImageSource::LaunchBuild(_) => ImageLabel {
+                text: self.source.describe(),
+                origin: None,
+                redacted: false,
+            },
+            _ if self.is_default() => ImageLabel {
                 text: "the default boot image".to_string(),
                 origin: None,
                 redacted: true,
-            }
-        } else {
-            ImageLabel {
+            },
+            _ => ImageLabel {
                 text: crate::config::escape_str(self.reference.as_str()),
                 origin: Some(self.source.describe()),
                 redacted: false,
-            }
+            },
+        }
+    }
+
+    /// The display string passed to contract diagnostics
+    /// (`image_contract::missing_program_message` and `launch_shell_spawn_diagnostic`).
+    ///
+    /// For a launch build (`--dockerfile`), this is:
+    /// `--dockerfile <typed> (built as agent-vm.invalid/dockerfile/<hash>:latest)`.
+    /// For every other source, it is the reference text unchanged.
+    ///
+    /// **Raw text on purpose.** Both consumers apply `config::escape_str`
+    /// themselves, so pre-escaping here would double-escape: a control byte
+    /// would print as `\\x0a` and a non-ASCII path would print as the byte
+    /// escapes of its UTF-8 rather than as itself.
+    pub(crate) fn contract_display(&self) -> String {
+        match &self.source {
+            ImageSource::LaunchBuild(typed) => format!(
+                "--dockerfile {} (built as {})",
+                typed.to_string_lossy(),
+                self.reference.as_str()
+            ),
+            _ => self.reference.as_str().to_string(),
         }
     }
 }
@@ -465,6 +512,11 @@ pub(crate) struct ImageArgs {
 }
 
 impl ImageArgs {
+    /// Whether `--image` was typed (not `AGENT_VM_IMAGE_TAG`). Valid after `reconcile`.
+    pub(crate) fn typed_on_command_line(&self) -> bool {
+        self.origin == Some(OverrideSource::CommandLine)
+    }
+
     /// A test-only constructor for a reconciled argument, so a caller's unit
     /// tests can exercise its own preflight without building a clap parser.
     #[cfg(test)]
@@ -659,6 +711,9 @@ fn inspection_provenance(source: &ImageSource) -> Result<(&'static str, Option<&
         // command-line selection; a value-free internal error, not a panic.
         ImageSource::CommandLine => {
             bail!("internal error: an image selected by --image cannot be inspected")
+        }
+        ImageSource::LaunchBuild(_) => {
+            bail!("internal error: a launch build cannot be inspected")
         }
     }
 }
@@ -1454,5 +1509,54 @@ mod tests {
         let escaped = ImageLabel::for_result_reference("example.com/team/bad\u{1b}[31m:dev");
         assert!(!escaped.text().contains('\u{1b}'));
         assert!(escaped.text().contains("\\x1b"), "{}", escaped.text());
+    }
+
+    #[test]
+    fn launch_build_selection_label_contract_display_and_inspection() {
+        let reference =
+            ImageRef::from_config("agent-vm.invalid/dockerfile/abcdef1234:latest").unwrap();
+        let boot = BootImage::launch_build(reference.clone(), PathBuf::from("d/Dockerfile"));
+        assert!(!boot.is_default());
+        assert_eq!(boot.source().describe(), "--dockerfile d/Dockerfile");
+        let label = boot.label();
+        assert_eq!(label.text(), "--dockerfile d/Dockerfile");
+        assert_eq!(label.origin.as_deref(), None);
+        assert!(!label.is_redacted());
+        assert_eq!(label.to_string(), "--dockerfile d/Dockerfile");
+        assert_eq!(boot.to_string(), "--dockerfile d/Dockerfile");
+        assert_eq!(
+            boot.contract_display(),
+            "--dockerfile d/Dockerfile (built as agent-vm.invalid/dockerfile/abcdef1234:latest)"
+        );
+
+        // A non-ASCII path stays readable: `contract_display` is raw text and the
+        // contract diagnostic escapes exactly once.
+        let non_ascii = BootImage::launch_build(
+            ImageRef::from_config("agent-vm.invalid/dockerfile/abcdef1234:latest").unwrap(),
+            PathBuf::from("../проект/Dockerfile"),
+        );
+        assert_eq!(
+            non_ascii.contract_display(),
+            concat!(
+                "--dockerfile ../проект/Dockerfile (built as ",
+                "agent-vm.invalid/dockerfile/abcdef1234:latest)"
+            )
+        );
+        let inspection_err = inspection_provenance(boot.source()).unwrap_err();
+        assert!(
+            inspection_err
+                .to_string()
+                .contains("a launch build cannot be inspected")
+        );
+
+        // Normal source contract_display is unchanged
+        let normal = BootImage {
+            reference,
+            source: ImageSource::CommandLine,
+        };
+        assert_eq!(
+            normal.contract_display(),
+            "agent-vm.invalid/dockerfile/abcdef1234:latest"
+        );
     }
 }

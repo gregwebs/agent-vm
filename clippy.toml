@@ -21,4 +21,5 @@ disallowed-methods = [
   { path = "agent_vm::mount::Spelling::stored_bytes", reason = "identity only (fork hash); render a spelling with Spelling::render(Declaration)" },
   { path = "agent_vm::mount::Spelling::as_source_path", reason = "filesystem calls and quoted_path only; render a spelling with Spelling::render(Declaration)" },
   { path = "agent_vm::image_pin::publication::approve_published", reason = "approval of published bytes is a per-verb decision (#391); only image build/import may call it" },
+  { path = "agent_vm::image_pin::unpinned::read_back_unpinned", reason = "booting published bytes unpinned is the launch build's decision (ADR-0061); only launch_build::LaunchBuild::build may call it" },
 ]
