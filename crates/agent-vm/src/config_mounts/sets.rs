@@ -579,6 +579,8 @@ impl UserMounts {
                         },
                         site,
                         mount,
+                        text,
+                        syntax,
                     )?),
                     Ok(MountSelector::Set(target)) => match index.get(&target) {
                         Some(&target) => Entry::Reference(target),
@@ -590,11 +592,7 @@ impl UserMounts {
                         }
                     },
                     Err(SelectorError::Direct(error)) => {
-                        return Err(UserMountsError::Entry {
-                            site,
-                            kind: error.kind(),
-                            declaration: text.to_string(),
-                        });
+                        return Err(UserMountsError::entry(site, &error, text, syntax));
                     }
                     Err(SelectorError::SetModifier) => {
                         return Err(UserMountsError::SetReferenceModified {
@@ -698,9 +696,11 @@ impl Builder {
         origin: MountOrigin,
         site: EntrySite,
         mount: ExtraMount,
+        text: &str,
+        syntax: HostSyntax<'_>,
     ) -> Result<LeafId, UserMountsError> {
         let request = normalize_request(MountRequest { origin, mount })
-            .map_err(|error| UserMountsError::from_claim(error, &site))?;
+            .map_err(|error| UserMountsError::from_claim(error, &site, text, syntax))?;
         self.leaves
             .push(Arc::new(ConfigMountLeaf { request, site }));
         Ok(LeafId(self.leaves.len() - 1))
@@ -746,6 +746,8 @@ fn bind_entries(
                 },
                 entry_site,
                 mount,
+                text,
+                syntax,
             )?),
             Ok(MountSelector::Set(target)) => match sets.requests_for_set(&target) {
                 Some(selected) => Entry::Reference(selected.set),
@@ -757,11 +759,7 @@ fn bind_entries(
                 }
             },
             Err(SelectorError::Direct(error)) => {
-                return Err(UserMountsError::Entry {
-                    site: entry_site,
-                    kind: error.kind(),
-                    declaration: text.to_string(),
-                });
+                return Err(UserMountsError::entry(entry_site, &error, text, syntax));
             }
             Err(SelectorError::SetModifier) => {
                 return Err(UserMountsError::SetReferenceModified {
@@ -1600,7 +1598,7 @@ mod tests {
     }
 
     /// `~/` expansion inside a set uses the captured host home and the same
-    /// concatenation rules as the defaults list.
+    /// concatenation rules as the defaults list — in either path field (#530).
     #[test]
     fn set_entries_expand_the_host_home() {
         let mounts = sets("a = [\"~/ref:/g:ro\"]\n").unwrap();
@@ -1613,11 +1611,33 @@ mod tests {
             expansion(&mounts, "a"),
             [(Spelling::new("/home/graph/ref/"), "/g".to_string(), true)]
         );
+        let mounts = sets("a = [\"~/ref:~/g:ro\"]\n").unwrap();
+        assert_eq!(
+            expansion(&mounts, "a"),
+            [(
+                Spelling::new("/home/graph/ref"),
+                "/home/graph/g".to_string(),
+                true
+            )]
+        );
         assert_eq!(
             with_authorized("[mount_sets]\na = [\"~/ref\"]\n", |authorized, values| {
                 rendered(from_verified_value(authorized, values, None))
             }),
-            at("mount_sets[0][0]", "~/ref") + "a ~/ host path needs a UTF-8 $HOME"
+            at("mount_sets[0][0]", "~/ref") + "a ~/ host or guest path needs a UTF-8 $HOME"
+        );
+        // A claim refusal of a set entry that expanded a field shows the expansion,
+        // naming the set's coordinates (#530/R8).
+        assert_eq!(
+            with_authorized("[mount_sets]\na = [\"~/a:~/x\"]\n", |authorized, values| {
+                rendered(from_verified_value(
+                    authorized,
+                    values,
+                    Some(Path::new("/h,o")),
+                ))
+            }),
+            "mount_sets[0][0] \"~/a:~/x\" (expands to \"/h,o/a:/h,o/x\"): guest path must be \
+             absolute, must not be /, and must not contain `..`, `:`, `;`, `,` or control characters"
         );
     }
 

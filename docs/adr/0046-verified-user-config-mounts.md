@@ -153,6 +153,18 @@ and diagnostic text; live-bind sources are canonicalized later for the bind
 alone, as they are for `--mount`. Rewriting it here would silently give a config
 entry a different fork from the CLI entry it means to match.
 
+_Amended by [#530](https://github.com/gregwebs/agent-vm/issues/530)._ `GUEST`
+gains the same form: a guest segment starting with `~/` is a guest path and
+expands to the **host** `$HOME` text by the same concatenation, under `--root`
+too (it means "your host home", not the guest's). It expands before guest
+normalization and claiming, so `~/x` and `<home>/x` are one declaration and one
+fork. No usable `$HOME` refuses either field with one sentence; bare `~` stays
+refused; `--mount` stays absolute-only, and when the segment right after `HOST`
+is a `~/…` its unknown-mode refusal hints at the absolute spelling. A guest
+refusal that depends on the expansion quotes the entry and shows
+`(expands to "…")`; other refusals keep their bytes. One verified classifier,
+`mount::path_spelling`, decides both fields.
+
 ## Decision 4: One selection seam, one claim rule, no override
 
 A launch has three declaration sources, in this order: the verified user
@@ -229,9 +241,9 @@ unwrapped error unchanged.
 
 [ADR-0018](0018-machine-checked-boundary-contracts.md) records the new and moved
 decisions as contracts: `config_authority::authority_refusal` (moved and renamed,
-body unchanged), `authority_required`, `mount::host_spelling`,
-`mount::declarations_equivalent` and `claim_decision`, and
-`mount_selection::config_mounts_selected`. What stays trusted is the usual shell:
+body unchanged), `authority_required`, `mount::path_spelling`,
+`mount::segment_is_guest_path`, `mount::declarations_equivalent` and
+`claim_decision`, and `mount_selection::config_mounts_selected`. What stays trusted is the usual shell:
 the `O_NOFOLLOW`/`fstat` measurement, `$HOME` capture, `str`/`Path` splitting and
 formatting, `normalize_guest`, `same_declaration`'s field reads, notices, and all
 filesystem, sandbox and runtime behaviour. Neither the proofs nor the boot-free

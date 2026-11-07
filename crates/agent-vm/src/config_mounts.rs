@@ -77,8 +77,8 @@ use crate::{
     config::quoted_str,
     config_authority::AuthorizedConfig,
     mount::{
-        ExtraMount, HostSyntax, MountRequest, MountSpecError, MountSpecErrorKind, parse_mount_spec,
-        same_declaration,
+        ExtraMount, HostSyntax, MountRequest, MountSpecError, MountSpecErrorKind, expanded_entry,
+        parse_mount_spec, same_declaration,
     },
 };
 use std::{fmt, path::Path, sync::Arc};
@@ -571,14 +571,23 @@ pub(crate) enum UserMountsError {
     /// One entry failed the shared `HOST[:GUEST][:MODE]...` grammar. `declaration`
     /// is the entry as written, so the reader can see which one it was — an index
     /// alone cannot be found in a file, and one bad segment is invisible in a
-    /// sentence that names no segment.
+    /// sentence that names no segment. `expanded` is the same entry with its `~/`
+    /// fields spelled out, present only when the refusal depends on what `$HOME`
+    /// expanded to (#530).
     Entry {
         site: EntrySite,
         kind: MountSpecErrorKind,
         declaration: String,
+        expanded: Option<String>,
     },
-    /// The claim refused a guest spelling (`/`, relative, `..`, `:`).
-    GuestNotMountable { site: EntrySite },
+    /// The claim refused a guest spelling (`/`, relative, `..`, `:`, `;`, `,`).
+    /// `expansion` is `Some` only when a field of the entry expanded, because
+    /// only then can the refusal depend on what it expanded to (#530): otherwise
+    /// the sentence stays site-only, exactly as before.
+    GuestNotMountable {
+        site: EntrySite,
+        expansion: Option<Expansion>,
+    },
     /// Unreachable from config load, which passes no core paths — stated rather
     /// than assumed so the sentence stays value-free if it ever fires.
     CoreCollision { site: EntrySite },
@@ -629,14 +638,47 @@ pub(crate) enum UserMountsError {
 }
 
 impl UserMountsError {
+    /// The one binder for a grammar refusal, shared by the defaults, set and tool
+    /// lists, so the three sites cannot disagree about what a refusal holds.
+    ///
+    /// Only the one parse-time guest check that reads expanded text
+    /// (`GuestUnmountable`, control bytes) carries the expansion (D2); every other
+    /// parse kind — mode, exclusion, empty segment, a `.`-relative guest — is
+    /// decided before or without it and keeps its bytes.
+    fn entry(site: EntrySite, error: &MountSpecError, text: &str, syntax: HostSyntax<'_>) -> Self {
+        let kind = error.kind();
+        let expanded = matches!(kind, MountSpecErrorKind::GuestUnmountable)
+            .then(|| expanded_entry(text, syntax))
+            .flatten();
+        Self::Entry {
+            site,
+            kind,
+            declaration: text.to_string(),
+            expanded,
+        }
+    }
+
     /// Map a claim failure about one entry of this file onto the entry's site.
-    fn from_claim(error: crate::mount::ClaimError, site: &EntrySite) -> Self {
+    ///
+    /// Every claim `Guest` refusal is a guest refusal, and only a guest refusal
+    /// can depend on what the entry expanded to: `text` and `syntax` let it show
+    /// the expansion when there is one, and nothing when there is not.
+    fn from_claim(
+        error: crate::mount::ClaimError,
+        site: &EntrySite,
+        text: &str,
+        syntax: HostSyntax<'_>,
+    ) -> Self {
         match error {
             // The grammar's own sentence names the guest spelling, so only the
             // kind survives to the config route.
-            crate::mount::ClaimError::Guest { .. } => {
-                Self::GuestNotMountable { site: site.clone() }
-            }
+            crate::mount::ClaimError::Guest { .. } => Self::GuestNotMountable {
+                site: site.clone(),
+                expansion: expanded_entry(text, syntax).map(|expanded| Expansion {
+                    declaration: text.to_string(),
+                    expanded,
+                }),
+            },
             crate::mount::ClaimError::Core { .. } => Self::CoreCollision { site: site.clone() },
             // A single-entry claim cannot conflict with anything.
             crate::mount::ClaimError::Conflict { .. } => Self::Conflict {
@@ -644,6 +686,37 @@ impl UserMountsError {
                 other: site.clone(),
             },
         }
+    }
+}
+
+/// The claim-time guest refusal's reason, one sentence for both shapes (with and
+/// without an expansion) so the two cannot drift.
+const NOT_MOUNTABLE_REASON: &str = "guest path must be absolute, must not be /, and must not \
+                                   contain `..`, `:`, `;`, `,` or control characters";
+
+/// An entry as written and as expanded: the pair a refusal after expansion shows,
+/// as one value so neither half can be printed without the other. Only a
+/// builder that measured an expansion can construct one, which is what keeps a
+/// quoted entry without its expansion unrepresentable (D3).
+#[derive(Debug)]
+pub(crate) struct Expansion {
+    pub(crate) declaration: String,
+    pub(crate) expanded: String,
+}
+
+/// `"<entry>"`, or `"<entry>" (expands to "<expanded>")` when the entry
+/// expanded a field: what a refusal shows of the declaration it was given. Both
+/// halves are config-chosen text, so both are byte-escaped — one spelling cannot
+/// forge either a line or a second diagnostic. One helper so a variant cannot
+/// quote the entry without its expansion, or escape only one of them.
+fn written(declaration: &str, expanded: Option<&str>) -> String {
+    match expanded {
+        Some(expanded) => format!(
+            "{} (expands to {})",
+            quoted_str(declaration),
+            quoted_str(expanded)
+        ),
+        None => quoted_str(declaration),
     }
 }
 
@@ -663,11 +736,23 @@ impl fmt::Display for UserMountsError {
                 site,
                 kind,
                 declaration,
-            } => write!(f, "{site} {}: {kind}", quoted_str(declaration)),
-            Self::GuestNotMountable { site } => write!(
+                expanded,
+            } => write!(
                 f,
-                "{site}: guest path must be absolute, must not be /, and must not contain `..`, \
-                 `:`, `;`, `,` or control characters"
+                "{site} {}: {kind}",
+                written(declaration, expanded.as_deref())
+            ),
+            Self::GuestNotMountable {
+                site,
+                expansion: None,
+            } => write!(f, "{site}: {NOT_MOUNTABLE_REASON}"),
+            Self::GuestNotMountable {
+                site,
+                expansion: Some(expanded),
+            } => write!(
+                f,
+                "{site} {}: {NOT_MOUNTABLE_REASON}",
+                written(&expanded.declaration, Some(&expanded.expanded))
             ),
             Self::CoreCollision { site } => {
                 write!(f, "{site}: guest path collides with an agent-vm core mount")
@@ -738,7 +823,7 @@ mod tests {
     use crate::config_authority::{AuthorityTriggers, verify};
     use crate::host_paths::read_bounded_regular_file_noting_symlink;
     use crate::mount::{MountPolicy, Spelling};
-    use std::{fs, os::unix::fs::PermissionsExt};
+    use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
 
     const GUEST_NOT_MOUNTABLE: &str = "guest path must be absolute, must not be /, and must not \
                                        contain `..`, `:`, `;`, `,` or control characters";
@@ -747,6 +832,16 @@ mod tests {
     /// wrote it, quoted and byte-escaped the way every config-chosen value is.
     fn at(site: &str, entry: &str) -> String {
         format!("{site} {}: ", quoted_str(entry))
+    }
+
+    /// How a refusal *after expansion* names its entry (#530): the site, the entry
+    /// as written, then what it expanded to — both escaped.
+    fn at_expanded(site: &str, entry: &str, expanded: &str) -> String {
+        format!(
+            "{site} {} (expands to {}): ",
+            quoted_str(entry),
+            quoted_str(expanded)
+        )
     }
 
     /// A verified read of a throwaway `config.toml`, handed to `f`.
@@ -783,6 +878,60 @@ mod tests {
             .unwrap()
             .remove("mounts")
             .unwrap()
+    }
+
+    /// The `[mount_sets]` table of a one-line document, holding one definition so
+    /// a set entry has a site that names it.
+    fn mount_set(text: &str) -> toml::Value {
+        format!("[mount_sets]\na = {text}\n")
+            .parse::<toml::Table>()
+            .unwrap()
+            .remove("mount_sets")
+            .unwrap()
+    }
+
+    /// What each of the three sites renders for one entry against one captured
+    /// home: the defaults list, one `[mount_sets]` leaf and a full user tool's own
+    /// list (#530/R8). Every site parses the same grammar, so a row asserts one
+    /// sentence — site prefix aside — for all three, and a site that forgot the
+    /// expansion is a failure rather than an untested path.
+    fn refusal_at_every_site(home: &str, entry: &str) -> [(&'static str, String); 3] {
+        let home = Some(Path::new(home));
+        let text = format!("[\"{entry}\"]");
+        let defaults = rendered(parse(&text, home));
+        let list = value(&text);
+        let sets = mount_set(&text);
+        let (set, tool) = with_authorized(|authorized, _| {
+            let tools = [ToolMountValue {
+                declaration: 1,
+                value: &list,
+            }];
+            (
+                rendered(from_verified_value(
+                    authorized,
+                    MountValues {
+                        defaults: None,
+                        sets: Some(&sets),
+                        tools: &[],
+                    },
+                    home,
+                )),
+                rendered(from_verified_value(
+                    authorized,
+                    MountValues {
+                        defaults: None,
+                        sets: None,
+                        tools: &tools,
+                    },
+                    home,
+                )),
+            )
+        });
+        [
+            ("mounts[0]", defaults),
+            ("mount_sets[0][0]", set),
+            ("tools[1].mounts[0]", tool),
+        ]
     }
 
     fn parse(text: &str, home: Option<&Path>) -> Result<UserMounts, UserMountsError> {
@@ -884,8 +1033,15 @@ mod tests {
         assert_eq!(
             rendered(parse(r#"["~/ref"]"#, None)),
             format!(
-                "{}a ~/ host path needs a UTF-8 $HOME",
+                "{}a ~/ host or guest path needs a UTF-8 $HOME",
                 at("mounts[0]", "~/ref")
+            )
+        );
+        assert_eq!(
+            rendered(parse(r#"["/abs:~/x"]"#, None)),
+            format!(
+                "{}a ~/ host or guest path needs a UTF-8 $HOME",
+                at("mounts[0]", "/abs:~/x")
             )
         );
         assert_eq!(
@@ -899,14 +1055,88 @@ mod tests {
         assert_eq!(
             rendered(parse(r#"["~/ref"]"#, Some(non_utf8))),
             format!(
-                "{}a ~/ host path needs a UTF-8 $HOME",
+                "{}a ~/ host or guest path needs a UTF-8 $HOME",
                 at("mounts[0]", "~/ref")
+            )
+        );
+        assert_eq!(
+            rendered(parse(r#"["/abs:~/x"]"#, Some(non_utf8))),
+            format!(
+                "{}a ~/ host or guest path needs a UTF-8 $HOME",
+                at("mounts[0]", "/abs:~/x")
             )
         );
         assert_eq!(
             sources(&parse(r#"["/abs/ref"]"#, Some(non_utf8)).unwrap()),
             ["/abs/ref"]
         );
+    }
+
+    /// A guest `~/` is the host `$HOME` **text** (#530/R1–R3), by the same
+    /// concatenation as a `~/` host and whatever the host is spelled as, from
+    /// every site that parses the shared grammar. The oracle is `format!` on the
+    /// captured home, never the kernel's predicate.
+    #[test]
+    fn guest_home_expansion_cases() {
+        let plain = Path::new("/h");
+        let trailing = Path::new("/h/");
+        for (text, home, expected_host, expected_guest, readonly) in [
+            (r#"["/abs:~/x"]"#, Some(plain), "/abs", "/h/x", false),
+            // A trailing-slash HOME keeps its `//` in the spelling and the same
+            // guest after normalization (R2).
+            (r#"["/abs:~/x"]"#, Some(trailing), "/abs", "/h/x", false),
+            (r#"["~/a:~/x:ro"]"#, Some(plain), "/h/a", "/h/x", true),
+            // `~/` alone is the home itself; a doubled slash normalizes away.
+            (r#"["/abs:~/"]"#, Some(plain), "/abs", "/h", false),
+            (r#"["/abs:~//x"]"#, Some(plain), "/abs", "/h/x", false),
+            // Surrounding whitespace is the shared grammar's to trim.
+            (r#"["  /abs : ~/x "]"#, Some(plain), "/abs", "/h/x", false),
+            // The two entries #530 was filed for must load.
+            (
+                r#"["~/.pi/agent/quota-dispatch.agent-vm.json:~/.pi/agent/quota-dispatch.json:ro"]"#,
+                Some(plain),
+                "/h/.pi/agent/quota-dispatch.agent-vm.json",
+                "/h/.pi/agent/quota-dispatch.json",
+                true,
+            ),
+            (
+                r#"["~/Library/Caches/kache:~/.cache/kache:rw"]"#,
+                Some(plain),
+                "/h/Library/Caches/kache",
+                "/h/.cache/kache",
+                false,
+            ),
+        ] {
+            let mounts = parse(text, home).expect("row parses");
+            let requests = defaults_requests(&mounts);
+            assert_eq!(requests.len(), 1, "{text}");
+            let mount = &requests[0].mount;
+            assert_eq!(mount.source_spelling, expected_host, "{text}");
+            assert_eq!(mount.guest, PathBuf::from(expected_guest), "{text}");
+            assert_eq!(
+                matches!(mount.policy, MountPolicy::BindReadOnly { .. }),
+                readonly,
+                "{text}"
+            );
+        }
+        // Only `~/` is a guest spelling: the other `~` forms stay unknown mode
+        // keywords, with today's bytes (R7).
+        for (text, entry, keyword) in [
+            (r#"["/abs:~"]"#, "/abs:~", "~"),
+            (r#"["/abs:~user/x"]"#, "/abs:~user/x", "~user/x"),
+            (r#"["/abs:$HOME/x"]"#, "/abs:$HOME/x", "$HOME/x"),
+        ] {
+            assert_eq!(
+                rendered(parse(text, Some(plain))),
+                at("mounts[0]", entry)
+                    + &format!(
+                        "unknown mode keyword {} (expected ro, rw, fork, follow-links, or \
+                         exclude=REL)",
+                        quoted_str(keyword)
+                    ),
+                "{text}"
+            );
+        }
     }
 
     /// The mirror guest is the *expanded* host — the spelling fork identity
@@ -945,6 +1175,12 @@ mod tests {
                 r#"["/abs:/a/../b"]"#,
                 format!("mounts[0]: {GUEST_NOT_MOUNTABLE}"),
             ),
+            // R8a's companion: a `~/` guest expands *into* a `..`, so the entry
+            // that was refused for a reason the expansion produced shows it.
+            (
+                r#"["/abs:~/../b"]"#,
+                at_expanded("mounts[0]", "/abs:~/../b", "/abs:/h/../b") + GUEST_NOT_MOUNTABLE,
+            ),
         ] {
             assert_eq!(rendered(parse(text, home)), expected, "{text:?}");
         }
@@ -969,6 +1205,107 @@ mod tests {
                 .policy,
             MountPolicy::BindReadWrite
         ));
+    }
+
+    /// A refusal that depends on what `~/` expanded to shows the expansion beside
+    /// the entry (#530/R8): a guest path built from a HOME carrying `,` `;` `:`
+    /// `..` or a control byte is unfixable without seeing which byte came from
+    /// where. One escaped line, from the defaults, set and tool sites alike; and
+    /// a refusal that the expansion did not cause keeps #529's bytes (R8a/D2).
+    #[test]
+    fn a_refusal_after_expansion_shows_what_it_expanded_to() {
+        const CONTROL: &str =
+            "guest path contains control characters that can't be carried into the guest";
+        for (home, reason) in [
+            ("/h,o", GUEST_NOT_MOUNTABLE),
+            ("/h;o", GUEST_NOT_MOUNTABLE),
+            ("/h:o", GUEST_NOT_MOUNTABLE),
+            ("/a/../h", GUEST_NOT_MOUNTABLE),
+            // Control characters — tab, newline and ESC — are refused at parse,
+            // not at the claim, and none may reach the sentence raw.
+            ("/h\to", CONTROL),
+            ("/h\no", CONTROL),
+            ("/h\x1bo", CONTROL),
+        ] {
+            for (entry, expanded) in [
+                ("~/a:~/x", format!("{home}/a:{home}/x")),
+                // The mirror: the host is the only field written as a path.
+                ("~/a", format!("{home}/a")),
+                ("/abs:~/x", format!("/abs:{home}/x")),
+            ] {
+                for (site, error) in refusal_at_every_site(home, entry) {
+                    assert_eq!(
+                        error,
+                        at_expanded(site, entry, &expanded) + reason,
+                        "{site} {entry:?} under {home:?}"
+                    );
+                    // Neither the entry nor the expansion can forge a second
+                    // diagnostic, and neither prints a control byte itself.
+                    assert_eq!(error.lines().count(), 1, "{home:?}: {error:?}");
+                    assert!(
+                        !error.chars().any(char::is_control),
+                        "{home:?}: a raw control byte survived: {error:?}"
+                    );
+                }
+            }
+        }
+        // The two control bytes that are not `\t` keep a literal pin: the escaped
+        // spelling is what a config author greps their `$HOME` for, so it is
+        // asserted as bytes rather than through `quoted_str` alone.
+        let newline = refusal_at_every_site("/h\no", "/abs:~/x");
+        assert_eq!(
+            newline[0].1,
+            "mounts[0] \"/abs:~/x\" (expands to \"/abs:/h\\x0ao/x\"): guest path contains \
+             control characters that can't be carried into the guest"
+        );
+        let escape = refusal_at_every_site("/h\x1bo", "/abs:~/x");
+        assert_eq!(
+            escape[0].1,
+            "mounts[0] \"/abs:~/x\" (expands to \"/abs:/h\\x1bo/x\"): guest path contains \
+             control characters that can't be carried into the guest"
+        );
+        // Refusals the expansion did not cause keep today's bytes — a mode
+        // keyword, an exclusion (an invalid value and a live bind), an empty
+        // segment and a `.`-relative guest (D2) — and a claim refusal of an entry
+        // that expanded nothing stays site-only (R8a). `None` is that site-only
+        // sentence, which is the one shape that has no entry text.
+        for (entry, reason) in [
+            (
+                "~/a:~/x:bogus",
+                Some(
+                    "unknown mode keyword \"bogus\" (expected ro, rw, fork, follow-links, or \
+                     exclude=REL)",
+                ),
+            ),
+            (
+                "~/a:~/x::ro",
+                Some("empty segment (stray `:`); expected HOST[:GUEST][:MODE]..."),
+            ),
+            (
+                "~/a:~/x:fork:exclude=..",
+                Some("exclude must be a non-empty relative path of normal components"),
+            ),
+            (
+                "~/a:~/x:exclude=sub",
+                Some(":exclude is only supported on :fork mounts"),
+            ),
+            ("~/a:./rel", Some("guest path must be absolute")),
+            ("/abs:/a/../b", None),
+        ] {
+            for (site, error) in refusal_at_every_site("/h,o", entry) {
+                let expected = match reason {
+                    Some(reason) => at(site, entry) + reason,
+                    None => format!("{site}: {GUEST_NOT_MOUNTABLE}"),
+                };
+                assert_eq!(error, expected, "{site} {entry:?}");
+                assert!(!error.contains("expands to"), "{site} {entry:?}: {error}");
+            }
+        }
+        // A `,` in the *host* is not a load question: only a guest path is.
+        assert_eq!(
+            guests(&parse(r#"["~/a:/g"]"#, Some(Path::new("/h,o"))).unwrap()),
+            ["/g"]
+        );
     }
 
     /// Every rejection names `mounts` and the index, and every rejection that has
@@ -1099,6 +1436,16 @@ mod tests {
             guests(&parse(r#"["/p:/p", "/p/c:/p/c"]"#, None).unwrap()),
             ["/p", "/p/c"]
         );
+        // A guest `~/` was expanded before the claim, so it *is* the spelled-out
+        // absolute declaration: one request, not a conflict (#530/R4).
+        for text in [
+            r#"["~/a:~/x:ro", "~/a:/h/x:ro"]"#,
+            r#"["~/a:~/x", "~/a:/h//x/."]"#,
+        ] {
+            let mounts = parse(text, Some(Path::new("/h"))).expect("one declaration twice");
+            assert_eq!(mounts.len(), 1, "{text}");
+            assert_eq!(guests(&mounts), ["/h/x"], "{text}");
+        }
     }
 
     /// The same declarations, whether they sit in a tool's own list or the
@@ -1121,6 +1468,7 @@ mod tests {
             r#"["/abs/ref:/g/fork:fork"]"#,
             r#"["~/ref"]"#,
             r#"["~/ref/:/g//./x:rw"]"#,
+            r#"["~/ref:~/g:ro"]"#,
             r#"["  ~/ref  "]"#,
         ] {
             let value = tool_value(text);

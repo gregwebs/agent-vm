@@ -1174,10 +1174,13 @@ with the grace and the `128 + N` convention above.
 (`--mount agent`) or `HOST[:GUEST][:MODE]...`. A bare name is an exact lookup in
 your config's `[mount_sets]` and takes no modes; every working absolute path keeps
 this grammar, `HOST` must be absolute (the shell expands `~`, so a quoted `~/ref`
-is refused), `GUEST` defaults to `HOST` (a mirror at the same absolute path), and
+is refused), `GUEST` must be absolute too (`GUEST` defaults to `HOST`, a mirror at
+the same absolute path — and the shell does not expand `~` after `:`, so
+`--mount /a:~/b` is refused with a hint to write the guest path absolute), and
 valid mode tokens are `ro`, `rw`, `fork`, `follow-links`, and `exclude=REL`.
 Contradictory tokens (`ro`+`rw`, `rw`+`follow-links`, `fork`+`ro`, `fork`+`rw`)
-are parse errors.
+are parse errors. Config entries differ: they accept `~/` in both path fields —
+see [Config mounts (user config)](#config-mounts-user-config).
 
 | declaration | source and behavior |
 |---|---|
@@ -1261,16 +1264,26 @@ guest-path rules (absolute, not `/`, no `..`, `:`, `;`, `,` or control
 characters), and the same checks (host Pi credential files,
 the [protected config directory](#agent-vms-config-directory-is-never-writable-from-the-guest),
 core-mount collisions, the file-mount restriction, and collisions with a declared
-`persist` path). Only `HOST` differs:
+`persist` path). Only path spelling differs:
 
-- `~/` is replaced by your `$HOME` **text**, exactly as an unquoted
-  `--mount ~/ref` is expanded by the shell. Nothing else relative is accepted:
-  `$HOME/x`, `${HOME}/x`, `~`, `~user/x`, `rel` and `./x` are rejected — there is
-  no environment expansion. A `$HOME` ending in `/` therefore produces `//`,
-  which is also what the shell gives you.
+- `~/` at the start of `HOST` **or** `GUEST` is replaced by your `$HOME` **text**,
+  exactly as an unquoted `--mount ~/ref` is expanded by the shell — so
+  `~/Library/Caches/kache:~/.cache/kache:rw` binds `$HOME/Library/Caches/kache`
+  from the host at `$HOME/.cache/kache` in the guest. A guest `~/` means your
+  *host* home under `--root` too, never `/root`. No other relative form is
+  accepted in either field: `$HOME/x`, `${HOME}/x`, `~`, `~user/x`, `rel` and
+  `./x` are rejected — there is no environment expansion. A `$HOME` ending in `/`
+  therefore produces `//`, which is also what the shell gives you; the guest is
+  normalized after expansion, so `/h//x` and `/h/x` are one claim.
 - The spelling is preserved, never canonicalized, because fork identity depends
   on it: `~/ref` and an equivalent absolute path name the same source only if
-  they are the same bytes.
+  they are the same bytes. A guest `~/` expands before the claim, so
+  `~/a:~/x` and `~/a:/home/you/x` are one declaration and one fork.
+- A refusal that depends on what `$HOME` expanded to quotes the entry and shows
+  the expansion — `mounts[0] "~/a:~/x" (expands to "/h,o/a:/h,o/x"): …`. A
+  claim-time guest-path refusal stays site-only when the entry expanded nothing;
+  other refusals keep their existing wording. Without a usable UTF-8 `$HOME`,
+  either field spelled `~/` is refused with one sentence.
 - **These mounts reach every project you launch in, including repositories you
   have not read.** Prefer `:ro` and `:fork`; a `:rw` config mount is a standing
   invitation to every future checkout. Their git remotes join the GitHub
@@ -1464,7 +1477,8 @@ are not, precisely as for direct entries.
 
 **Host paths and identity are unchanged.** Inside a set, `~/` expands by
 concatenation onto your host `$HOME` text (not the guest's, and not the config
-file's directory); guest destinations stay absolute; there is no environment or
+file's directory), a guest `~/` expands the same way, and after expansion guest
+destinations stay absolute; there is no environment or
 other relative expansion. The expanded spelling is preserved, so fork identity is
 unchanged: moving the same declaration between `--mount`, the defaults list and a
 named or nested set reuses the same project-scoped fork, and no set name, nesting,

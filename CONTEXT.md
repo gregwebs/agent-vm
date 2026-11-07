@@ -722,8 +722,9 @@ to a launch of that tool, own plus inherited through its `tools` closure. All of
 it is suppressed for one launch by `--no-config-mounts`, which never touches an
 explicit `--mount`. A config mount is parsed, claimed and prepared exactly like a
 `--mount` (same grammar, guest-path rules, merge/refuse rule and protections); it
-differs in host spelling (`~/` expands to the `$HOME` text, and no other relative
-form is accepted) and in origin, which diagnostics report as `mounts[N] in
+differs in path spelling: `~/` in `HOST` or `GUEST` expands to the host `$HOME`
+text (under `--root` too), and no other relative form is accepted. It also
+differs in origin, which diagnostics report as `mounts[N] in
 "<file>"`, `tools[N].mounts[I] in "<file>"` or `mount_sets["NAME"][I] in
 "<file>"`. Its declarations are read only from a **verified file**: the presence
 of any of those fields, not its contents, is what makes the user config
