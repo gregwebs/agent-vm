@@ -181,6 +181,19 @@ fn relative_path(from: &Path, to: &Path) -> PathBuf {
 
 type Snapshot = BTreeMap<String, String>;
 
+/// The pre-launch state a refused plan must leave untouched, plus the watermark
+/// for the fake runtime's invocation log.
+///
+/// That log accumulates across every launch in one test binary, and a preceding
+/// *successful* launch legitimately logs the launch-protocol probe and the
+/// machine invocation. A refusal can only answer for the invocations it runs
+/// itself, so the oracle compares [`Before::entries`] and inspects only the
+/// lines appended after [`Before::invocation_lines`].
+struct Before {
+    entries: Snapshot,
+    invocation_lines: usize,
+}
+
 fn tree_of(label: &str, root: &Path, out: &mut Snapshot) {
     let Ok(read) = std::fs::read_dir(root) else {
         return;
@@ -391,6 +404,14 @@ impl Harness {
         stores.pop()
     }
 
+    /// Capture the pre-launch state for [`Harness::assert_refused_before_launch_state`].
+    fn before(&self) -> Before {
+        Before {
+            entries: self.snapshot(),
+            invocation_lines: self.msb_log().lines().count(),
+        }
+    }
+
     fn snapshot(&self) -> Snapshot {
         let mut entries = Snapshot::new();
         tree_of("state", &self.state_root, &mut entries);
@@ -405,7 +426,7 @@ impl Harness {
 
     /// The refusal oracle. [`refusal_oracle_is_calibrated`] is what keeps it from
     /// being vacuous.
-    fn assert_refused_before_launch_state(&self, out: &Output, before: &Snapshot, needle: &str) {
+    fn assert_refused_before_launch_state(&self, out: &Output, before: &Before, needle: &str) {
         let stderr = stderr_of(out);
         assert!(!out.status.success(), "the launch must fail: {stderr}");
         assert!(
@@ -422,10 +443,12 @@ impl Harness {
         );
         assert_eq!(
             self.snapshot(),
-            *before,
+            before.entries,
             "a refused plan must not create or mutate launch state: {stderr}"
         );
-        for line in self.msb_log().lines() {
+        // Only what this launch appended: an earlier accepted launch in the
+        // same test already logged its own probes.
+        for line in self.msb_log().lines().skip(before.invocation_lines) {
             let first = line.split_whitespace().next().unwrap_or_default();
             assert_eq!(
                 first, "--version",
@@ -740,20 +763,20 @@ fn refusal_oracle_is_calibrated() {
     let repo = build_worktree(&h);
     // Refused: `off` is not it — a broken pointer is.
     repo.write_pointer("not a gitdir line\n");
-    let before = h.snapshot();
+    let before = h.before();
     let refused = h.launch(&[], "shell", &[]);
     h.assert_refused_before_launch_state(&refused, &before, "git worktree repair");
 
     // Accepted: the real layout.
     let repo = build_worktree(&h);
     let _ = repo;
-    let before = h.snapshot();
+    let before = h.before();
     let accepted = h.launch(&[], "shell", &[]);
     let (_, stderr) = reached_builder(&accepted);
     assert!(stderr.contains(NOTICE_RO), "{stderr}");
     assert_ne!(
         h.snapshot(),
-        before,
+        before.entries,
         "an accepted plan must mutate launch state: {stderr}"
     );
 
@@ -764,24 +787,24 @@ fn refusal_oracle_is_calibrated() {
     write_file(&nested.join("a/same.txt"), "one\n");
     write_file(&nested.join("b/same.txt"), "one\n");
     write_file(&nested.join("a/b/c/depth3.txt"), "deep\n");
-    let before = h.snapshot();
+    let before = h.before();
     std::fs::write(nested.join("b/same.txt"), "two\n").unwrap();
     assert_ne!(
         h.snapshot(),
-        before,
+        before.entries,
         "a change to one of two same-named files in different directories"
     );
-    let before = h.snapshot();
+    let before = h.before();
     std::fs::write(nested.join("a/b/c/depth3.txt"), "deeper\n").unwrap();
-    assert_ne!(h.snapshot(), before, "a depth-3 change");
+    assert_ne!(h.snapshot(), before.entries, "a depth-3 change");
     use std::os::unix::fs::PermissionsExt as _;
-    let before = h.snapshot();
+    let before = h.before();
     std::fs::set_permissions(
         nested.join("a/same.txt"),
         std::fs::Permissions::from_mode(0o600),
     )
     .unwrap();
-    assert_ne!(h.snapshot(), before, "a mode-only change");
+    assert_ne!(h.snapshot(), before.entries, "a mode-only change");
 }
 
 // ---------------------------------------------------------------------------
@@ -917,7 +940,7 @@ fn a_common_directory_containing_another_checkout_is_refused() {
         let h = Harness::new();
         let bare = h.home_root.join("repos/bare");
         let inner = build_bare_with_inner_worktree(&h, &bare);
-        let before = h.snapshot();
+        let before = h.before();
         let out = h.launch(options, "shell", &[]);
         let stderr = stderr_of(&out);
         h.assert_refused_before_launch_state(&out, &before, "contains the checkout");
@@ -956,7 +979,7 @@ fn a_common_directory_containing_another_checkout_is_refused() {
             format!("gitdir: {}\n", spelled.display()),
         )
         .unwrap();
-        let before = h.snapshot();
+        let before = h.before();
         let out = h.launch_in(&inner, options, "shell", &[]);
         h.assert_refused_before_launch_state(&out, &before, "contains the checkout");
 
@@ -1031,7 +1054,7 @@ fn a_common_directory_containing_the_state_source_is_refused() {
         // The state source the guest would get at `/agent-vm-state`.
         let state = h.home_root.join("b/s");
 
-        let before = h.snapshot();
+        let before = h.before();
         let out = h.launch_in_with_state(&h.project_root, &state, options, "shell", &[]);
         let stderr = stderr_of(&out);
         h.assert_refused_before_launch_state(
@@ -1484,7 +1507,7 @@ fn broken_relationships_are_refused_before_launch_state() {
     for (name, break_it) in cases {
         let repo = build_worktree(&h);
         break_it(&repo);
-        let before = h.snapshot();
+        let before = h.before();
         let out = h.launch(&[], "shell", &[]);
         let stderr = stderr_of(&out);
         h.assert_refused_before_launch_state(&out, &before, "git worktree repair");
@@ -1526,7 +1549,7 @@ fn a_symlink_dependent_layout_is_refused() {
     spelled.push(&id);
     repo.write_pointer(&format!("gitdir: {}\n", spelled.display()));
 
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&[], "shell", &[]);
     let stderr = stderr_of(&out);
     h.assert_refused_before_launch_state(&out, &before, "cannot be mounted at its host paths");
@@ -1563,7 +1586,7 @@ fn a_worktree_inside_the_common_directory_is_refused() {
         ],
     );
 
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch_in(&inside, &[], "shell", &[]);
     let stderr = stderr_of(&out);
     h.assert_refused_before_launch_state(&out, &before, "contains one of agent-vm's own mounts");
@@ -1638,7 +1661,7 @@ fn metadata_inside_the_project_bind_is_reported_as_reachable() {
 
     // The other half of the same invariant: a `prepare` failure on a launch with
     // no automatic requests must not be framed with `--git-mount=off`.
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&["--mount", "/a", "--mount", "/a:ro"], "shell", &[]);
     let stderr = stderr_of(&out);
     h.assert_refused_before_launch_state(&out, &before, "claimed by different declarations");
@@ -1705,7 +1728,7 @@ fn a_remapped_project_is_refused_before_launch_state() {
         &format!("{}\n", alias.join(".git").display()),
     );
 
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch_in(&remapped, &[], "shell", &[]);
     let stderr = stderr_of(&out);
     h.assert_refused_before_launch_state(&out, &before, "cannot be mounted at its host paths");
@@ -1798,7 +1821,7 @@ fn metadata_under_a_guest_tmpfs_prefix_is_refused_before_launch_state() {
     );
     let metadata = common.display().to_string();
 
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&[], "shell", &[]);
     let stderr = stderr_of(&out);
     h.assert_refused_before_launch_state(
@@ -1873,7 +1896,7 @@ fn off_bypasses_discovery_only() {
     assert!(automatic_binds(&h, &config).is_empty(), "{stderr}");
 
     // The unrelated `--mount` validation still refuses a self-contradictory plan.
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(
         &["--git-mount=off", "--mount", "/a", "--mount", "/a:ro"],
         "shell",
@@ -1930,7 +1953,7 @@ fn equivalent_declarations_merge_and_different_ones_are_refused() {
     //     config entry from (b) is removed first, so the pair under test is argv
     //     against the automatic request.
     std::fs::remove_file(h.user_config()).unwrap();
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&["--mount", &common], "shell", &[]);
     let stderr = stderr_of(&out);
     h.assert_refused_before_launch_state(&out, &before, "claimed by different declarations");
@@ -1942,7 +1965,7 @@ fn equivalent_declarations_merge_and_different_ones_are_refused() {
 
     // (d) A differing config declaration names its own site.
     h.write_user(&format!("mounts = [\"{common}:rw\"]\n"));
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&[], "shell", &[]);
     let stderr = stderr_of(&out);
     h.assert_refused_before_launch_state(&out, &before, "claimed by different declarations");
@@ -2093,7 +2116,7 @@ fn an_enclosing_declaration_is_never_shadowed() {
     //     refused pre-boot, naming both origins.
     let elsewhere = h.home_root.join("elsewhere");
     std::fs::create_dir_all(&elsewhere).unwrap();
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(
         &[
             "--mount",
@@ -2115,7 +2138,7 @@ fn an_enclosing_declaration_is_never_shadowed() {
 
     // (e) An enclosing `:fork` hands the guest a copy, so a same-host match proves
     //     nothing: refused rather than merged.
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(
         &[
             "--mount",
@@ -2181,7 +2204,7 @@ fn an_enclosing_declaration_is_never_shadowed() {
     //     the mode.
     for options in [&["--git-mount=ro"][..], &["--git-mount=rw"][..]] {
         let missing = h.home_root.join("missing-source");
-        let before = h.snapshot();
+        let before = h.before();
         let out = h.launch(
             &[
                 options[0],
@@ -2207,7 +2230,7 @@ fn an_enclosing_declaration_is_never_shadowed() {
         );
         assert_eq!(
             h.snapshot(),
-            before,
+            before.entries,
             "(g) {options:?}: no launch state: {stderr}"
         );
     }
@@ -2319,7 +2342,7 @@ fn protections_refuse_automatic_binds_exactly_as_mount() {
 
     // (a) A bare repository at `$HOME/.pi` holding a protected Pi credential file.
     build_bare_pi(&h);
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&[], "shell", &[]);
     h.assert_refused_before_launch_state(&out, &before, "auth.json");
 
@@ -2327,7 +2350,7 @@ fn protections_refuse_automatic_binds_exactly_as_mount() {
     //     directory: `rw` is refused, `ro` is accepted.
     build_bare_worktree(&h, &h.home_root.join(".config"));
     std::fs::create_dir_all(h.home_root.join(".config/agent-vm")).unwrap();
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&["--git-mount=rw"], "shell", &[]);
     h.assert_refused_before_launch_state(&out, &before, "would let the guest change what");
     let accepted = h.launch(&[], "shell", &[]);
@@ -2346,7 +2369,7 @@ fn protections_refuse_automatic_binds_exactly_as_mount() {
 
     // (c) A bare repository at `$HOME` collides with the guest HOME core mount.
     build_bare_worktree(&h, &h.home_root);
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&[], "shell", &[]);
     let stderr = stderr_of(&out);
     h.assert_refused_before_launch_state(&out, &before, "collides with an agent-vm core mount");
@@ -2362,7 +2385,7 @@ fn protections_refuse_automatic_binds_exactly_as_mount() {
     h.write_project(
         "[[tools]]\nname = \"aider\"\ncommand = \"/bin/echo\"\ncredentials = []\npersist = [\"code\"]\n",
     );
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&[], "aider", &[]);
     let stderr = stderr_of(&out);
     h.assert_refused_before_launch_state(&out, &before, "would collide with the guest mount point");
@@ -2415,7 +2438,7 @@ fn a_fully_cross_linked_forgery_is_refused() {
 
     // (a) no `HEAD` anywhere.
     let (forged, _) = build_forgery(&h, "a");
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&[], "shell", &[]);
     let stderr = stderr_of(&out);
     h.assert_refused_before_launch_state(&out, &before, "not a Git directory");
@@ -2430,7 +2453,7 @@ fn a_fully_cross_linked_forgery_is_refused() {
     let (forged, _) = build_forgery(&h, "b");
     write_file(&forged.join("HEAD"), "ref: refs/heads/main\n");
     write_file(&forged.join("worktrees/f/HEAD"), "garbage\n");
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&[], "shell", &[]);
     let stderr = stderr_of(&out);
     h.assert_refused_before_launch_state(&out, &before, "not a Git directory");
@@ -2446,7 +2469,7 @@ fn a_fully_cross_linked_forgery_is_refused() {
         "(c) the oracle: host git accepts this layout, so the refusal is agent-vm's \
          stricter rule and not a different error"
     );
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&[], "shell", &[]);
     let stderr = stderr_of(&out);
     h.assert_refused_before_launch_state(&out, &before, "is not a Git directory");
@@ -2598,7 +2621,7 @@ fn a_missing_commondir_is_refused_and_other_gitfiles_are_unchanged() {
     // (a) `commondir` deleted from the real layout A.
     let repo = build_worktree(&h);
     std::fs::remove_file(repo.per_worktree.join("commondir")).unwrap();
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&[], "shell", &[]);
     let stderr = stderr_of(&out);
     h.assert_refused_before_launch_state(&out, &before, "git worktree repair");
@@ -2615,7 +2638,7 @@ fn a_missing_commondir_is_refused_and_other_gitfiles_are_unchanged() {
     let repo = build_worktree(&h);
     std::fs::remove_file(repo.per_worktree.join("commondir")).unwrap();
     std::fs::remove_file(repo.per_worktree.join("gitdir")).unwrap();
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&[], "shell", &[]);
     h.assert_refused_before_launch_state(&out, &before, "git worktree repair");
 
@@ -2706,7 +2729,7 @@ fn a_refused_plan_publishes_no_fork() {
     // (a) a differing explicit declaration at the automatic guest path.
     let repo = build_worktree(&h);
     let common = repo.common.canonicalize().unwrap().display().to_string();
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&["--mount", &fork, "--mount", &common], "shell", &[]);
     let stderr = stderr_of(&out);
     h.assert_refused_before_launch_state(&out, &before, "claimed by different declarations");
@@ -2721,7 +2744,7 @@ fn a_refused_plan_publishes_no_fork() {
 
     // (b) a Pi protection refusal.
     build_bare_pi(&h);
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&["--mount", &fork], "shell", &[]);
     let stderr = stderr_of(&out);
     h.assert_refused_before_launch_state(&out, &before, "auth.json");
@@ -2733,7 +2756,7 @@ fn a_refused_plan_publishes_no_fork() {
     h.write_project(
         "[[tools]]\nname = \"aider\"\ncommand = \"/bin/echo\"\ncredentials = []\npersist = [\"code\"]\n",
     );
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&["--mount", &fork], "aider", &[]);
     let stderr = stderr_of(&out);
     h.assert_refused_before_launch_state(&out, &before, "would collide with the guest mount point");
