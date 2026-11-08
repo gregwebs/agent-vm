@@ -15,9 +15,8 @@
 # is the count of test functions, which is a proxy for cost, not the cost: a
 # `config_launch_driven` case measured ~1.0s, a `config_mounts` case ~0.5s and a
 # unit test in the binary ~0.04s. The binary's own unit tests are why the proxy
-# is imperfect — 1887 of them cost 71s in total, so instead of being dealt like
-# a 1887-case target they go to the shard with the fewest test functions, along
-# with the doctests (neither needs a test binary of its own to be counted).
+# is imperfect — 1907 of them cost 126s in total, so instead of being dealt like
+# a 1907-case target they go to the shard with the fewest test functions.
 set -euo pipefail
 
 REPO_ROOT="$(cd "${BASH_SOURCE[0]%/*}/../.." && pwd)"
@@ -28,8 +27,8 @@ usage() {
 Usage: script/test/ci-test-shard.sh <shard-index> <shard-count>
 
 Run one shard of the agent-vm test suite: the integration test files dealt to
-this shard, plus — on the shard that owes them — the binary's unit tests and the
-doctests. A failure in any of them stops the shard, as `cargo test` would.
+this shard, plus — on the shard that owes them — the binary's own unit tests. A
+failure in any of them stops the shard, as `cargo test` would.
 EOF
 }
 
@@ -60,7 +59,7 @@ if ((${#weights[@]} == 0)); then
     exit 1
 fi
 
-# Deal the targets, then name the shard that owes the unit tests and doctests.
+# Deal the targets, then name the shard that owes the binary's unit tests.
 # Output is "T <shard> <weight> <name>" per target, in the same descending-weight
 # order the targets were dealt, and a final "U <shard>".
 deal="$(
@@ -118,12 +117,15 @@ for target in "${targets[@]}"; do
     echo "  $target"
 done
 
-# The unit tests and doctests need no separate target name: `--bin` is the
-# binary's own tests, exactly what `cargo test -p agent-vm` runs first.
+# The unit tests need no separate target name: `--bin` is the binary's own
+# tests, exactly what `cargo test -p agent-vm` runs first. There are no doctests
+# to run here — the crate is a bin, so `--doc` reports "no library targets
+# found", and `cargo test -p agent-vm` runs none (the only Doc-tests target in
+# the workspace belongs to msb-krun-compat-evidence, which `ci-contracts.sh`
+# tests).
 if ((units_shard == shard)); then
-    echo "ci-test-shard: unit tests and doctests are shard $shard's"
+    echo "ci-test-shard: the binary's unit tests are shard $shard's"
     cargo test -p agent-vm --bin agent-vm
-    cargo test -p agent-vm --doc
 fi
 
 if ((${#targets[@]} > 0)); then
