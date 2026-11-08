@@ -35,7 +35,7 @@ cp Cargo.lock "$tmp/root.lock"
 python3 - "$tmp/root.lock" <<'PY'
 import pathlib, sys
 p = pathlib.Path(sys.argv[1]); s = p.read_text(); start = s.index('name = "msb_krun"'); end = s.index('[[package]]', start + 1)
-p.write_text(s[:start] + s[start:end].replace('version = "0.1.41"', 'version = "0.1.40"', 1) + s[end:])
+p.write_text(s[:start] + s[start:end].replace('version = "0.1.42"', 'version = "0.1.40"', 1) + s[end:])
 PY
 expect_failure 'msb_krun is 0.1.40' --root-lock "$tmp/root.lock"
 
@@ -60,8 +60,29 @@ PY
 expect_failure 'locks disagree' --root-lock "$tmp/checksum.lock"
 
 cp Cargo.toml "$tmp/patch.toml"
-printf '\n[patch.crates-io]\nmsb_krun = "0.1.41"\n' >>"$tmp/patch.toml"
+printf '\n[patch.crates-io]\nmsb_krun = "0.1.42"\n' >>"$tmp/patch.toml"
 expect_failure 'overrides cohort crate' --root-manifest "$tmp/patch.toml"
+
+# The version map is per crate: the outer workspace and the vendored lock
+# legitimately pin different releases of three independently published crates,
+# so an unaccepted version must still fail next to an accepted one.
+cp Cargo.lock "$tmp/version.lock"
+python3 - "$tmp/version.lock" <<'PY'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1]); s = p.read_text(); start = s.index('name = "msb_krun_arch_gen"'); end = s.index('[[package]]', start + 1)
+p.write_text(s[:start] + s[start:end].replace('version = "0.1.45"', 'version = "0.1.44"', 1) + s[end:])
+PY
+expect_failure 'msb_krun_arch_gen is 0.1.44' --root-lock "$tmp/version.lock"
+
+# One release in both locks is one published artifact: the checksum must match
+# even where the version map accepts more than one release.
+cp vendor/microsandbox/Cargo.lock "$tmp/nested-checksum.lock"
+python3 - "$tmp/nested-checksum.lock" <<'PY'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1]); s = p.read_text(); start = s.index('name = "msb_krun_utils"'); end = s.index('[[package]]', start + 1)
+p.write_text(s[:start] + s[start:end].replace('checksum = "', 'checksum = "different-', 1) + s[end:])
+PY
+expect_failure 'disagree on msb_krun_utils source/checksum' --nested-lock "$tmp/nested-checksum.lock"
 expect_failure 'firmware gitlink mode is' --gitlink-mode 100644
 expect_failure 'expected gitlink deadbeef' --gitlink deadbeef
 expect_failure 'recursive submodule is not initialized' --firmware-head ''

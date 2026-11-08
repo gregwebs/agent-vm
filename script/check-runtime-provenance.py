@@ -13,7 +13,26 @@ COHORT = frozenset((
     "msb_krun_devices", "msb_krun_hvf", "msb_krun_kernel", "msb_krun_polly",
     "msb_krun_smbios", "msb_krun_utils", "msb_krun_vmm",
 ))
-VERSION = "0.1.41"
+# The version each cohort crate must resolve to, checked per crate rather than as
+# one number. Most of the cohort ships as a unit at the runtime's release
+# version; `arch_gen`, `cpuid` and `smbios` are published on their own cadence,
+# so the outer workspace resolves 0.1.45 while the vendored lock still pins
+# 0.1.42 — two official crates.io releases of the fork. Naming the accepted set
+# per crate keeps a lock from drifting to an unpublished or edited crate, which
+# a single version string could not express once the halves legitimately differ.
+VERSIONS: dict[str, frozenset[str]] = {
+    "msb_krun": frozenset(("0.1.42",)),
+    "msb_krun_arch": frozenset(("0.1.42",)),
+    "msb_krun_arch_gen": frozenset(("0.1.42", "0.1.45")),
+    "msb_krun_cpuid": frozenset(("0.1.42", "0.1.45")),
+    "msb_krun_devices": frozenset(("0.1.42",)),
+    "msb_krun_hvf": frozenset(("0.1.42",)),
+    "msb_krun_kernel": frozenset(("0.1.42",)),
+    "msb_krun_polly": frozenset(("0.1.42",)),
+    "msb_krun_smbios": frozenset(("0.1.42", "0.1.45")),
+    "msb_krun_utils": frozenset(("0.1.42",)),
+    "msb_krun_vmm": frozenset(("0.1.42",)),
+}
 FIRMWARE_VERSION = "5.6.1"
 FIRMWARE_ABI = "5"
 REGISTRY_PREFIX = "registry+https://github.com/rust-lang/crates.io-index"
@@ -46,8 +65,9 @@ def cohort_packages(lock_path: pathlib.Path) -> dict[str, tuple[str, str, str]]:
         checksum = package.get("checksum", "")
         if name in selected:
             fail(f"{lock_path}: duplicate cohort package {name}")
-        if version != VERSION:
-            fail(f"{lock_path}: {name} is {version}, expected {VERSION}")
+        if version not in VERSIONS[name]:
+            expected = " or ".join(sorted(VERSIONS[name]))
+            fail(f"{lock_path}: {name} is {version}, expected {expected}")
         if not source.startswith(REGISTRY_PREFIX):
             fail(f"{lock_path}: {name} has non-registry source {source!r}")
         if not checksum:
@@ -56,6 +76,25 @@ def cohort_packages(lock_path: pathlib.Path) -> dict[str, tuple[str, str, str]]:
     if set(selected) != COHORT:
         fail(f"{lock_path}: cohort mismatch; missing={sorted(COHORT - set(selected))}, extra={sorted(set(selected) - COHORT)}")
     return selected
+
+
+def compare_locks(
+    root: dict[str, tuple[str, str, str]], nested: dict[str, tuple[str, str, str]]
+) -> None:
+    """Check that both Cargo roots resolve each cohort crate to the same release.
+
+    A crate with one accepted version must match exactly, checksum included. A
+    crate with several may differ in version only: when both roots land on the
+    same one, the checksum still proves they read the same published artifact.
+    """
+    for name, (root_version, root_source, root_checksum) in root.items():
+        nested_version, nested_source, nested_checksum = nested[name]
+        if root_version != nested_version:
+            # Only a crate with several accepted releases can reach this point:
+            # `cohort_packages` already narrowed each lock to `VERSIONS[name]`.
+            continue
+        if (root_source, root_checksum) != (nested_source, nested_checksum):
+            fail(f"root and nested Cargo locks disagree on {name} source/checksum")
 
 
 def check_manifest(path: pathlib.Path) -> None:
@@ -84,8 +123,9 @@ def check_metadata(path: pathlib.Path) -> None:
     if set(selected) != COHORT:
         fail(f"{path}: metadata cohort mismatch; missing={sorted(COHORT - set(selected))}, extra={sorted(set(selected) - COHORT)}")
     for name, (version, source) in selected.items():
-        if version != VERSION or not source.startswith(REGISTRY_PREFIX):
-            fail(f"{path}: {name} is {version} from {source!r}; expected registry {VERSION}")
+        expected = " or ".join(sorted(VERSIONS[name]))
+        if version not in VERSIONS[name] or not source.startswith(REGISTRY_PREFIX):
+            fail(f"{path}: {name} is {version} from {source!r}; expected registry {expected}")
 
 
 def check_firmware(args: argparse.Namespace) -> None:
@@ -134,8 +174,7 @@ def main() -> None:
     try:
         root = cohort_packages(args.root_lock)
         nested = cohort_packages(args.nested_lock)
-        if root != nested:
-            fail("root and nested Cargo locks disagree on cohort version/source/checksum")
+        compare_locks(root, nested)
         check_manifest(args.root_manifest)
         check_manifest(args.nested_manifest)
         check_firmware(args)
@@ -147,7 +186,8 @@ def main() -> None:
     except (OSError, tomllib.TOMLDecodeError, json.JSONDecodeError, ValueError) as error:
         print(f"runtime provenance: FAIL: {error}", file=sys.stderr)
         sys.exit(1)
-    print(f"runtime provenance: root+nested registry cohort {VERSION}; checksums equal; firmware {args.gitlink[:12]} version {FIRMWARE_VERSION} ABI {FIRMWARE_ABI}")
+    pins = "/".join(sorted({version for versions in VERSIONS.values() for version in versions}))
+    print(f"runtime provenance: root+nested registry cohort {pins}; checksums equal; firmware {args.gitlink[:12]} version {FIRMWARE_VERSION} ABI {FIRMWARE_ABI}")
 
 
 if __name__ == "__main__":
