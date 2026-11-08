@@ -1,8 +1,19 @@
 name: verus
 
+# Same shape as ci.yml: `push` is gated to `main` and the `ci/` scratch prefix
+# so a PR branch does not run the verification twice (once for `push`, once for
+# `pull_request`). Verification is the most expensive job in CI -- it unpacks a
+# 1.6 GB Verus tree -- so the duplicate run is the one worth removing first.
 on:
   push:
+    branches: ["main", "ci/**"]
   pull_request:
+  workflow_dispatch:
+
+# Everything except a `main` push is superseded by a newer run; see ci.yml.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read

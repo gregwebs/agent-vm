@@ -1107,6 +1107,29 @@ Relabelling a stale comment is not the same operation as bumping a pin. Moving a
 hash changes what CI runs, so decide that on its own and let Dependabot's cooldown
 do it where it can.
 
+## CI on a branch
+
+CI runs on `pull_request` for every branch under review, on `push` to `main`,
+and on `push` to a branch named `ci/<something>` — the prefix is how you ask for
+a full run before a PR exists. `gh workflow run CI --ref <branch>` does the same
+and works on any name; use it for a one-off, the prefix when you expect to push
+repeatedly.
+
+```bash
+git switch -c ci/try-new-lint
+# ...work, push...
+git push -u origin ci/try-new-lint
+```
+
+Runs on a non-`main` ref are superseded: a second push cancels the first run.
+A `main` push is never cancelled, so every landed commit keeps its own run.
+
+Keep the prefix for pre-PR branches. Opening a PR *from* a `ci/` branch brings
+back exactly the duplicate the prefix exists to avoid — one run for the `push`,
+one for the `pull_request`, same commit. Rename to the PR branch name with
+`gh pr` after opening, or open the PR from a branch without the prefix and use
+`ci/` only for throwaway verification.
+
 ## Commit message style
 
 Commits on this branch use a multi-paragraph "Why / How" style.
