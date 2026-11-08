@@ -1057,7 +1057,7 @@ while ordinary `setup` intentionally creates a verification guest.
 
 | Harness | Runs on CI | Notes |
 |---|---|---|
-| `cargo test --workspace` | yes (`ci.yml`) | `#[ignore]`d e2e excluded |
+| `cargo test -p agent-vm` (per shard: `script/test/ci-test-shard.sh`) | yes (`ci.yml`, 3 shard jobs) | `#[ignore]`d e2e excluded; the shard runner deals the integration test targets and gives the unit tests and doctests to the lightest shard |
 | `cargo check --release -p agent-vm --tests` | yes (`ci.yml`) | type-check only; pins that the release test profile still compiles under the test cfg, since CI's run is the debug profile |
 | `script/test/e2e.sh` | **no** | native installed registry/archive joins; custom/all additionally require Apple Silicon and Docker; `custom-image` includes the always-run host-pin A/B rows |
 | `cargo test --test image_pin_approval` | yes (`cargo test -p agent-vm`) | boot-free compiled-CLI approval matrix: PTY yes/no/empty/EOF/interruption, `--yes`, nonterminal refusal, frozen candidate, CAS/stale revision, journal recovery, cache-loss digest reacquisition, and build/import result approval (import→rebuild→launch moves what the SDK is handed; an archive alias never does; a concurrent refresh keeps its pin). No VM evidence |
@@ -1129,6 +1129,14 @@ git push -u origin ci/try-new-lint
 
 Runs on a non-`main` ref are superseded: a second push cancels the first run.
 A `main` push is never cancelled, so every landed commit keeps its own run.
+
+One job is one sum of its steps, so `ci.yml`'s legs run as separate jobs:
+`contracts` (the pre-build gate), `test` (one job per shard), `lint` (fmt,
+clippy, the single-binary contract and, on a `main` push only, the release
+build) and `macos-build-script`. `build-and-test` aggregates them and is the
+one check to require on a branch; it fails if any leg did. The release build
+is `main`-only because nothing in CI consumes `target/release/agent-vm`;
+`cargo check --release --tests` still runs on every commit.
 
 Keep the prefix for pre-PR branches. Opening a PR *from* a `ci/` branch brings
 back exactly the duplicate the prefix exists to avoid — one run for the `push`,

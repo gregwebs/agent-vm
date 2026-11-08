@@ -101,6 +101,7 @@ fi
 # Go/Rust installers) moved to agent-vm-images, whose
 # script/test/example-layers.sh guards them.
 syntax_check=(
+    script/test/ci-test-shard.sh
     vendor/microsandbox/vendor/libkrunfw/build_in_docker.sh
     script/check-runtime-provenance.sh
     script/test/runtime-provenance.sh
@@ -157,6 +158,7 @@ syntax_check=(
 # that `build_in_docker.sh` invokes; it is deliberately a superset-by-one of
 # syntax_check rather than a divergence from the criterion above.
 shellcheck_files=(
+    script/test/ci-test-shard.sh
     vendor/microsandbox/vendor/libkrunfw/build_in_docker.sh
     vendor/microsandbox/vendor/libkrunfw/scripts/test-build-in-docker.sh
     script/check-runtime-provenance.sh
@@ -225,6 +227,11 @@ assert_listed 'shellcheck' "$self_relative" "${shellcheck_files[@]}"
 
 assert_listed 'bash -n' 'script/test/single-binary-contract.sh' "${syntax_check[@]}"
 assert_listed 'shellcheck' 'script/test/single-binary-contract.sh' "${shellcheck_files[@]}"
+# ci.yml's test matrix runs the shard runner, so the shell guard covers it: it
+# decides which test targets each leg executes, so a typo here would run a
+# shard's worth of tests nowhere.
+assert_listed 'bash -n' 'script/test/ci-test-shard.sh' "${syntax_check[@]}"
+assert_listed 'shellcheck' 'script/test/ci-test-shard.sh' "${shellcheck_files[@]}"
 assert_listed 'bash -n' 'script/test/persisted-network-live.sh' "${syntax_check[@]}"
 assert_listed 'shellcheck' 'script/test/persisted-network-live.sh' "${shellcheck_files[@]}"
 assert_listed 'bash -n' 'script/test/persisted-network-contract.sh' "${syntax_check[@]}"
