@@ -21,8 +21,22 @@ concurrency:
 permissions:
   contents: read
 
+# The jobs below are independent gates, and they are separate jobs because one
+# job pays the *sum* of its steps while parallel jobs pay the longest. Measured
+# on a single `build-and-test` job (run 42481235526, 30m18s): contracts 9m25s,
+# test 11m01s, release build 5m10s, single-binary contract 1m39s, clippy 0m43s.
+# They are split here, so a PR now costs roughly the longest leg instead.
+#
+# Each job carries its own cargo cache (Swatinem/rust-cache keys on the job id),
+# so the first run of a job is cold and later runs are not. Keep the split in
+# step with that: adding a step to the wrong job is how one leg becomes the new
+# critical path.
 jobs:
-  build-and-test:
+  # The pre-build gate: runtime source provenance, harness contracts and the
+  # shell guard rail. It builds nothing of its own except the compatibility
+  # evidence crate, so it runs beside the build legs rather than in front of
+  # them — but it still gates: `build-and-test` below fails if it fails.
+  contracts:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -39,6 +53,13 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Keep the vendored path crates' artefacts. The action's defaults drop
+          # every crate without a registry source (`vendor/microsandbox/*`), so a
+          # warm run recompiled ~16 of them anyway; release-npm.yml sets these
+          # two for the same reason and documents it there.
+          cache-all-crates: "true"
+          cache-workspace-crates: "true"
 
       - name: Install build dependencies
         run: |
@@ -53,29 +74,80 @@ jobs:
         run: |
           "$HOME/go/bin/actionlint"
 
-      # No guest agentd is staged first: the vendored filesystem crate embeds
-      # `build/agentd` only under `embed-binaries`, which only the `msb` CLI
-      # enables. agent-vm drives that external `msb`, which carries the agent.
-      - name: Build
-        run: cargo build --release -p agent-vm
+  # One job per shard. `cargo test` runs a package's test binaries one at a
+  # time, so the suite cost the sum of their wall clocks — 609s, 243s of it in
+  # tests/config_launch_driven.rs alone. `script/test/ci-test-shard.sh` deals
+  # the test targets to the shards; the shard count is this matrix's length.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
 
-      - name: Test
-        run: timeout --signal=TERM --kill-after=10s 30m cargo test -p agent-vm
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1 (2026-08-05)
+        with:
+          toolchain: "1.98.1"
+          components: rustfmt, clippy
 
-      - name: Single-binary contract
-        run: bash script/test/single-binary-contract.sh
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-all-crates: "true"
+          cache-workspace-crates: "true"
 
-      # Type-check-only. CI runs the *debug* test profile, so the release test
-      # profile rots silently: a `#[cfg(test)]` use of a `#[cfg(debug_assertions)]`
-      # item (the recording keychain) compiled in debug and broke `--release`.
-      # `cargo check` is deliberate rather than `cargo test --no-run`: the class
-      # of rot here is a name-resolution error, which `check` catches, while
-      # `--no-run` pays for release codegen and linking for no extra coverage.
-      # Neither runs the tests: the debug-only seams are compiled out under
-      # `--release` and the tests that need them fail loudly rather than skip
-      # (see `tests/secret_pty.rs`), so the release *run* is not a gate.
-      - name: Check release tests
-        run: cargo check --release -p agent-vm --tests
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libcap-ng-dev libdbus-1-dev
+
+      # The three shards share one cache key (the action keys on the job id, not
+      # the matrix index), so the first shard to finish saves what all three
+      # restored. The timeout covers a shard's own worst case, not the suite's.
+      - name: Test (shard ${{ matrix.shard }}/${{ strategy.job-total }})
+        env:
+          # Through the environment, not interpolated into `run`: a matrix value
+          # in a script body is a template expansion zizmor flags.
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ strategy.job-total }}
+        run: |
+          timeout --signal=TERM --kill-after=10s 30m \
+            bash script/test/ci-test-shard.sh "$SHARD" "$SHARDS"
+
+  # Everything that needs only a debug build of the workspace, plus the one
+  # place a real release binary is linked.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1 (2026-08-05)
+        with:
+          toolchain: "1.98.1"
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-all-crates: "true"
+          cache-workspace-crates: "true"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libcap-ng-dev libdbus-1-dev
 
       - name: Format check
         continue-on-error: true
@@ -87,6 +159,40 @@ jobs:
       # `continue-on-error`: it is clean as of this commit and must stay clean.
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Single-binary contract
+        run: bash script/test/single-binary-contract.sh
+
+      # No guest agentd is staged first: the vendored filesystem crate embeds
+      # `build/agentd` only under `embed-binaries`, which only the `msb` CLI
+      # enables. agent-vm drives that external `msb`, which carries the agent.
+      #
+      # A real release link, and the only step that pays for one: release
+      # codegen+link measured 5m10s, and nothing in this workflow consumes
+      # `target/release/agent-vm` — the single-binary contract builds its own
+      # debug binary. So a PR no longer pays it, while `main` (which ships)
+      # still proves the binary links. `Check release tests` below keeps the
+      # release test profile compiling on every run.
+      - name: Build (release)
+        if: github.ref == 'refs/heads/main'
+        run: cargo build --release -p agent-vm
+
+      # Type-check-only. CI runs the *debug* test profile, so the release test
+      # profile rots silently: a `#[cfg(test)]` use of a `#[cfg(debug_assertions)]`
+      # item (the recording keychain) compiled in debug and broke `--release`.
+      # `cargo check` is deliberate rather than `cargo test --no-run`: the class
+      # of rot here is a name-resolution error, which `check` catches, while
+      # `--no-run` pays for release codegen and linking for no extra coverage.
+      # Neither runs the tests: the debug-only seams are compiled out under
+      # `--release` and the tests that need them fail loudly rather than skip
+      # (see `tests/secret_pty.rs`), so the release *run* is not a gate.
+      #
+      # Only a `main` run produces release artefacts, so a PR's check can be
+      # cold (a release type-check of the dependency tree, a couple of minutes)
+      # whenever a PR was the first run for a new Cargo.lock. It is type-check
+      # work off the critical path, not a build.
+      - name: Check release tests
+        run: cargo check --release -p agent-vm --tests
 
   # macOS is a first-class supported host (script/build/macos.sh,
   # macos-build.md) but a full libkrunfw/msb build is too slow for per-PR
@@ -107,3 +213,19 @@ jobs:
 
       - name: Run macOS build script workflow tests
         run: bash script/test/build-workflow.sh
+
+  # The single check to require on a branch. Every leg above is independent, so
+  # this job only aggregates them — and it keeps the name the pre-split workflow
+  # used, so a branch protection rule that names it needs no change. `always()`
+  # is what lets it run when a leg failed (a job with `needs` is otherwise
+  # skipped, and a skipped required check never turns red).
+  build-and-test:
+    if: always()
+    needs: [contracts, test, lint, macos-build-script]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail when a leg did not pass
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+        run: |
+          echo "::error::a CI leg failed or was skipped (see the jobs above)"
+          exit 1

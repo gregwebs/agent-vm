@@ -106,12 +106,24 @@ assert_contains "$output" "Cargo.toml"
 assert_contains "$output" "$current_channel"
 assert_contains "$output" "$other_channel"
 
-# Case 3: mismatched ci.yml toolchain input.
+# Case 3: mismatched ci.yml toolchain input -- every copy drifts, since sed
+# rewrites each line independently.
 tree="$(make_tree case3-ci)"
 sed -i.bak "s/toolchain: \"$current_channel\"/toolchain: \"$other_channel\"/" "$tree/.github/workflows/ci.yml"
 rm -f "$tree/.github/workflows/ci.yml.bak"
 output="$(expect_fail "$tree" 1)"
 assert_contains "$output" "ci.yml"
+assert_contains "$output" "$other_channel"
+
+# Case 3b: exactly one of ci.yml's copies drifts (proves per-copy checking; the
+# workflow installs the toolchain once per job, and case 3 only proves that a
+# fully-drifted file fails).
+tree="$(make_tree case3b-ci-one-copy)"
+replace_first_occurrence "$tree/.github/workflows/ci.yml" \
+    "toolchain: \"$current_channel\"" "toolchain: \"$other_channel\""
+output="$(expect_fail "$tree" 1)"
+assert_contains "$output" "ci.yml"
+assert_contains "$output" "copy 1 of"
 assert_contains "$output" "$other_channel"
 
 # Case 4: one of release-npm.yml's two occurrences drifts (proves

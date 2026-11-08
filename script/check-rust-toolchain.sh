@@ -10,7 +10,9 @@
 #   - Cargo.toml rust-version (workspace.package): Cargo's declared MSRV,
 #     kept in exact lockstep with the channel by policy (see its comment).
 #   - .github/workflows/ci.yml: dtolnay/rust-toolchain's `toolchain:` input,
-#     pinned explicitly rather than auto-read for CI-install auditability.
+#     pinned explicitly rather than auto-read for CI-install auditability. The
+#     workflow's jobs each install the toolchain, so the literal repeats once
+#     per job: every copy must agree with the channel.
 #   - .github/workflows/verus.yml: the verification job's own
 #     dtolnay/rust-toolchain `toolchain:` input. Doubly constrained -- it must
 #     equal this channel and the toolchain named in the pinned Verus release's
@@ -111,19 +113,27 @@ check_cargo_toml() {
 }
 
 check_ci_yml() {
-    local file=.github/workflows/ci.yml found
-    found="$(sed -n 's/^[[:space:]]*toolchain: "\(.*\)"$/\1/p' "$file")"
-    if [[ -z "$found" ]]; then
+    local file=.github/workflows/ci.yml values found count=0 total
+    values="$(sed -n 's/^[[:space:]]*toolchain: "\(.*\)"$/\1/p' "$file")"
+    if [[ -z "$values" ]]; then
         fail_missing_anchor "$file" 'toolchain: "..." (dtolnay/rust-toolchain input)'
         return
     fi
-    if [[ "$found" == "$channel" ]]; then
-        ok "$file toolchain = $found"
+    total="$(printf '%s\n' "$values" | wc -l | tr -d ' ')"
+    # One copy per job that installs the toolchain. Every copy is checked, not
+    # merely the first: a drifted copy would compile one CI leg with a Rust the
+    # rest of the tree is never tested against, which presence alone misses.
+    while IFS= read -r found; do
+        count=$((count + 1))
+        if [[ "$found" == "$channel" ]]; then
+            continue
+        fi
+        fail "$file toolchain is $found but canonical channel is $channel (copy $count of $total)"
+        printf '       fix: set toolchain: "%s" in %s, or update rust-toolchain.toml if %s was intended.\n' \
+            "$channel" "$file" "$found"
         return
-    fi
-    fail "$file toolchain is $found but canonical channel is $channel"
-    printf '       fix: set toolchain: "%s" in %s, or update rust-toolchain.toml if %s was intended.\n' \
-        "$channel" "$file" "$found"
+    done <<<"$values"
+    ok "$file toolchain = $channel ($count copies)"
 }
 
 check_verus_yml() {
