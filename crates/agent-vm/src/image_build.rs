@@ -2,7 +2,7 @@
 //! into the local image cache (#260).
 //!
 //! It does **not** choose, adopt or boot an image, and the only record it changes
-//! besides the cache is the host approval of its own `--tag` (#391): it exports
+//! besides the cache is the invoking project's approval of its own `--tag` (#391): it exports
 //! one anonymous OCI archive with `docker buildx build`, hands that archive to
 //! the native importer under `--tag`, then approves the content it published.
 //! Running the result is a separate `agent-vm --image REF shell` operation (see
@@ -109,10 +109,14 @@ pub(crate) struct DockerBuild<'a> {
 /// Build the user's Dockerfile and import the result under `--tag`. Returns the
 /// process exit code.
 pub(crate) async fn run(args: Args) -> Result<i32> {
+    // Captured before the build: this command approves its result under the
+    // project it started in, however Docker changes what `getcwd` reports.
+    #[allow(clippy::disallowed_methods)] // one capture per command: every consumer borrows it.
+    let project = crate::project::ProjectDir::capture()?;
     let target = ImageTarget::resolve().await?;
     // HOME and a readable pin store are checked before Docker runs or the
     // archive is published (R9): a damaged store must not cost a build.
-    crate::image_pin::publication_preflight(&args.tag)?;
+    let scope = crate::image_pin::publication_preflight(&args.tag, &project)?;
     let staging = target.stage()?;
     let build = DockerBuild {
         dockerfile: args.dockerfile.as_deref().map(Path::as_os_str),
@@ -146,7 +150,7 @@ pub(crate) async fn run(args: Args) -> Result<i32> {
     // runs only now, after `publish`'s exclusive barrier is released.
     #[allow(clippy::disallowed_methods)]
     // `image build --tag` names the result it approves (#391).
-    crate::image_pin::approve_published(&published).await?;
+    crate::image_pin::approve_published(&published, &scope).await?;
     let shown = args.tag.shell_arg();
     let shell_note = crate::shell::note_parenthetical(&[&shown]);
     let _ = writeln!(

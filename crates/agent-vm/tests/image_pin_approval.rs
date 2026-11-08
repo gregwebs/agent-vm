@@ -33,6 +33,7 @@ use image_archive::{ArchiveSpec, LayerContent, PlatformSpec};
 use oci_registry::{Image, Server};
 use pin_gate::{PinGate, PinPeer, PinStage, Reply};
 use pty::{Action, Pty};
+use sha2::{Digest as _, Sha256};
 
 /// The prompt the approval path waits for. Asserted as a literal so a wording
 /// change fails here rather than silently moving the expectation.
@@ -65,10 +66,15 @@ impl Harness {
         // stdout and refuses anything but `buildx build`, so a wrong invocation
         // fails loudly.
         let docker = bin.join("docker");
+        // Two opt-in hooks, inert unless a test sets them: a marker proving the
+        // build ran at all, and a cwd rename standing in for a user renaming
+        // their project while `docker buildx build` runs.
         fs::write(
             &docker,
             "#!/bin/sh\n\
              if [ \"$1\" = buildx ] && [ \"$2\" = build ]; then\n\
+             \x20 if [ -n \"$FAKE_DOCKER_MARKER\" ]; then echo ran >> \"$FAKE_DOCKER_MARKER\"; fi\n\
+             \x20 if [ -n \"$FAKE_DOCKER_RENAME_CWD_TO\" ]; then mv \"$(pwd -P)\" \"$FAKE_DOCKER_RENAME_CWD_TO\" || exit 98; fi\n\
              \x20 cat \"$FAKE_DOCKER_ARCHIVE\"\n\
              \x20 exit 0\n\
              fi\n\
@@ -203,6 +209,78 @@ impl Harness {
     fn cache(&self) -> PathBuf {
         self.state.join("msb-home/cache")
     }
+
+    /// A second project under the harness root.
+    fn project_at(&self, name: &str) -> PathBuf {
+        let dir = self.root.path().join(name);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// [`Self::command`] rooted at another project and state root: the
+    /// cross-project rows need both to differ from the launching project's.
+    fn command_in(&self, project: &Path, state: &Path) -> Command {
+        let mut command = self.command();
+        command
+            .current_dir(project)
+            .env("AGENT_VM_STATE_DIR", state);
+        command
+    }
+
+    fn pins_value(&self) -> Option<serde_json::Value> {
+        serde_json::from_slice(&fs::read(self.pins()).ok()?).ok()
+    }
+
+    /// The record for one (project, reference) pair. The store holds one record
+    /// per project **and** reference, so a reference-only reader would read
+    /// another project's approval once two projects share this HOME.
+    fn record_in(&self, project: &Path, reference: &str) -> Option<serde_json::Value> {
+        let id = project_id(project);
+        self.pins_value()?["pins"]
+            .as_array()?
+            .iter()
+            .find(|record| record["project"] == id.as_str() && record["reference"] == reference)
+            .cloned()
+    }
+
+    fn pin_in(&self, project: &Path, reference: &str) -> Option<(String, u64)> {
+        let record = self.record_in(project, reference)?;
+        Some((
+            record["manifest_digest"].as_str()?.to_owned(),
+            record["revision"].as_u64()?,
+        ))
+    }
+
+    fn records_in(&self, project: &Path) -> usize {
+        let id = project_id(project);
+        self.pins_value()
+            .and_then(|value| {
+                value["pins"].as_array().map(|pins| {
+                    pins.iter()
+                        .filter(|record| record["project"] == id.as_str())
+                        .count()
+                })
+            })
+            .unwrap_or(0)
+    }
+}
+
+/// The project identifier, computed independently of the binary: the lowercase
+/// hex SHA-256 of the canonical directory's bytes, which is also the prefix the
+/// session state directory is named from.
+fn project_id(dir: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(
+        dir.canonicalize()
+            .expect("canonicalize the project")
+            .as_os_str()
+            .as_encoded_bytes(),
+    );
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn bounded(mut command: Command) -> Output {
@@ -774,7 +852,7 @@ fn import_alias_cannot_bypass_an_established_pin() {
 /// platform.
 fn assert_render(shown: &str, reference: &str, old: &str, new: &str) {
     let expected = format!(
-        "Approving the image published as {reference} (linux/{}):\n  old: {old}\n  new: {new}\n",
+        "Approving the image published as {reference} (linux/{}) for this project:\n  old: {old}\n  new: {new}\n",
         image_archive::host_arch()
     );
     assert!(
@@ -1504,62 +1582,700 @@ fn directory_selection_is_never_pinned() {
     let _: &Path = &rootfs;
 }
 
+/// AC1/AC2, spec R4: approvals are per project. P1 pins a tag at A; P2 (same
+/// HOME, independent cache) first-pins the same tag at whatever the registry
+/// serves now, and P2's refresh moves only P2's record. P1 keeps booting A with
+/// zero registry requests.
 #[test]
-fn projects_and_independent_caches_share_one_approval() {
+fn projects_keep_independent_approvals_for_one_tag() {
     let h = Harness::new(Mode::LaunchSeam);
     let server = Server::new();
+    let tag = format!("{}/images:split", server.host);
     let a = h.image(&ArchiveSpec::default());
-    let approved_a = server.image("images", "shared", &a);
-    let tag = format!("{}/images:shared", server.host);
-    assert_eq!(sdk_image(&h.launch(&tag)), approved_a);
-    let old = fs::read(h.pins()).unwrap();
-    let project = h.root.path().join("second-project");
-    fs::create_dir(&project).unwrap();
-    let state = tempfile::Builder::new()
-        .prefix("avshare-")
+    let child_a = server.image("images", "split", &a);
+
+    // P1 pins the tag at A and boots A.
+    let first = h.launch(&tag);
+    assert!(!first.status.success(), "the fake runtime cannot boot");
+    assert_eq!(sdk_image(&first), child_a);
+    let p1_record = h
+        .record_in(&h.project, &tag)
+        .expect("P1 records its own approval");
+    assert_eq!(p1_record["manifest_digest"], digest_of(&child_a));
+    assert_eq!(p1_record["revision"], 1);
+
+    // The registry moves the tag to B. P2 has no approval, so its first pin
+    // resolves afresh from the registry: P1's record is never consulted.
+    let p2 = h.project_at("second-project");
+    let p2_state = tempfile::Builder::new()
+        .prefix("avsplit-")
         .tempdir_in("/tmp")
         .unwrap();
-    let second = || {
-        let mut cmd = h.command();
-        cmd.current_dir(&project)
-            .env("AGENT_VM_STATE_DIR", state.path());
-        cmd
-    };
     let b = h.image(&ArchiveSpec {
-        marker: "shared-b".into(),
+        marker: "split-b".into(),
         ..Default::default()
     });
-    let approved_b = server.image("images", "shared", &b);
-    let start = server.count();
-    let mut cmd = second();
-    cmd.args(["--image", &tag, "shell", "--", "true"]);
-    assert_eq!(sdk_image(&bounded(cmd)), approved_a);
-    assert_eq!(fs::read(h.pins()).unwrap(), old);
-    let requests = server.requests();
-    assert!(
-        requests[start..]
-            .iter()
-            .any(|(_, p)| p == &format!("/v2/images/manifests/{}", a.written.manifest_digest))
+    let child_b = server.image("images", "split", &b);
+    assert_ne!(child_a, child_b);
+    let mut command = h.command_in(&p2, p2_state.path());
+    command.args(["--image", &tag, "shell", "--", "true"]);
+    assert_eq!(sdk_image(&bounded(command)), child_b);
+    assert_eq!(
+        h.record_in(&h.project, &tag).unwrap(),
+        p1_record,
+        "P2's first pin leaves P1's record byte-identical"
     );
-    assert!(
-        !requests[start..]
-            .iter()
-            .any(|(_, p)| p == "/v2/images/manifests/shared")
+    assert_eq!(
+        h.pin_in(&p2, &tag),
+        Some((digest_of(&child_b), 1)),
+        "P2's own first pin, at revision 1"
     );
-    let mut cmd = second();
-    cmd.args(["image", "refresh", "--image", &tag, "--yes"]);
-    let out = bounded(cmd);
-    assert!(out.status.success(), "{}", stderr(&out));
-    assert_eq!(h.pinned_digest(), b.written.manifest_digest);
-    let out = h.launch(&tag);
-    assert_eq!(sdk_image(&out), approved_b);
-    let start = server.count();
-    assert_eq!(sdk_image(&h.launch(&tag)), approved_b);
+
+    // A warm P1 launch boots A with no registry request at all.
+    let before = server.count();
+    assert_eq!(sdk_image(&h.launch(&tag)), child_a);
     assert_eq!(
         server.count(),
-        start,
-        "approval applies across both projects"
+        before,
+        "a warm P1 launch must make no registry request: {:?}",
+        &server.requests()[before..]
     );
+
+    // The registry moves the tag again; P2 refreshes with consent.
+    let c = h.image(&ArchiveSpec {
+        marker: "split-c".into(),
+        ..Default::default()
+    });
+    let child_c = server.image("images", "split", &c);
+    let mut command = h.command_in(&p2, p2_state.path());
+    command.args(["image", "refresh", "--image", &tag, "--yes"]);
+    let refreshed = bounded(command);
+    assert!(refreshed.status.success(), "{}", stderr(&refreshed));
+    assert_eq!(
+        h.pin_in(&p2, &tag),
+        Some((digest_of(&child_c), 2)),
+        "only P2's record is replaced, at revision 2"
+    );
+    assert_eq!(
+        h.record_in(&h.project, &tag).unwrap(),
+        p1_record,
+        "P2's refresh leaves P1's record and revision unchanged"
+    );
+    let before = server.count();
+    assert_eq!(sdk_image(&h.launch(&tag)), child_a);
+    assert_eq!(server.count(), before, "P1 still boots A, offline");
+}
+
+/// Spec R4 through the prompt path: declining a replacement in P1 leaves every
+/// other project's record untouched (it guards the prompt's key, not only the
+/// `--yes` path's).
+#[test]
+fn a_declined_refresh_in_one_project_cannot_touch_another() {
+    let h = Harness::new(Mode::StrictAcquisition);
+    let server = Server::new();
+    let tag = format!("{}/images:decline", server.host);
+    let a = h.image(&ArchiveSpec::default());
+    let child_a = server.image("images", "decline", &a);
+
+    // Both projects first-pin A while the tag still means A.
+    assert!(!h.launch(&tag).status.success());
+    let p2 = h.project_at("decline-project");
+    let p2_state = tempfile::Builder::new()
+        .prefix("avdecline-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let mut command = h.command_in(&p2, p2_state.path());
+    command.args(["--image", &tag, "shell", "--", "true"]);
+    assert_eq!(sdk_image(&bounded(command)), child_a);
+    let p1_record = h.record_in(&h.project, &tag).unwrap();
+    let p2_record = h.record_in(&p2, &tag).unwrap();
+    assert_eq!(p2_record["manifest_digest"], digest_of(&child_a));
+
+    // Move the tag, then decline the replacement in P1.
+    let b = h.image(&ArchiveSpec {
+        marker: "decline-b".into(),
+        ..Default::default()
+    });
+    server.image("images", "decline", &b);
+    let mut command = h.command();
+    command.args(["image", "refresh", "--image", &tag]);
+    let mut terminal = Pty::spawn(&mut command, PROMPT).expect("open a pseudo-terminal");
+    let (status, out) = terminal
+        .drive(&Action::Write(b"n\n"), Duration::from_secs(60))
+        .expect("drive the approval prompt");
+    let text = String::from_utf8_lossy(&out);
+    assert!(!status.success(), "a declined approval fails: {text}");
+    assert!(text.contains("Replace the approved image for"), "{text}");
+    assert_eq!(h.record_in(&h.project, &tag).unwrap(), p1_record);
+    assert_eq!(h.record_in(&p2, &tag).unwrap(), p2_record);
+}
+
+/// AC3: a symlink alias is the same project (one record, no registry request on
+/// the warm launch); a subdirectory is a different project (its own first pin).
+#[test]
+fn a_symlink_alias_shares_a_project_and_a_subdirectory_does_not() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let tag = format!("{}/images:alias", server.host);
+    let a = h.image(&ArchiveSpec::default());
+    let child_a = server.image("images", "alias", &a);
+
+    let alias = h.root.path().join("alias");
+    std::os::unix::fs::symlink(&h.project, &alias).unwrap();
+    let mut command = h.command_in(&alias, &h.state);
+    command.args(["--image", &tag, "shell", "--", "true"]);
+    assert_eq!(sdk_image(&bounded(command)), child_a);
+    assert_eq!(h.records_in(&h.project), 1, "the alias is the same project");
+    assert_eq!(h.records_in(&alias), 1);
+
+    let before = server.count();
+    let mut command = h.command_in(&alias, &h.state);
+    command.args(["--image", &tag, "shell", "--", "true"]);
+    assert_eq!(sdk_image(&bounded(command)), child_a);
+    assert_eq!(
+        server.count(),
+        before,
+        "the alias consumes the project's approval: {:?}",
+        &server.requests()[before..]
+    );
+    assert_eq!(
+        h.records_in(&h.project),
+        1,
+        "no second record for the alias"
+    );
+
+    // A subdirectory is a distinct project with its own first pin.
+    let sub = h.project.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    let mut command = h.command_in(&sub, &h.state);
+    command.args(["--image", &tag, "shell", "--", "true"]);
+    assert_eq!(sdk_image(&bounded(command)), child_a);
+    assert_eq!(h.records_in(&h.project), 1, "the parent is unchanged");
+    assert_eq!(h.records_in(&sub), 1, "the subdirectory pins separately");
+    assert_eq!(
+        h.pin_in(&sub, &tag),
+        Some((digest_of(&child_a), 1)),
+        "a subdirectory's own first pin"
+    );
+}
+
+/// AC3 control: the state root is not the approval scope. A cold cache under a
+/// second `AGENT_VM_STATE_DIR` still boots the project's approved digest, asks
+/// the registry for that digest and never for the tag, and writes nothing.
+#[test]
+fn another_state_root_is_the_same_project() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let tag = format!("{}/images:stateroot", server.host);
+    let a = h.image(&ArchiveSpec::default());
+    let child_a = server.image("images", "stateroot", &a);
+    assert!(!h.launch(&tag).status.success());
+    assert_eq!(sdk_image(&h.launch(&tag)), child_a);
+    let store = fs::read(h.pins()).unwrap();
+
+    let b = h.image(&ArchiveSpec {
+        marker: "stateroot-b".into(),
+        ..Default::default()
+    });
+    server.image("images", "stateroot", &b);
+
+    let cold_state = tempfile::Builder::new()
+        .prefix("avcold-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    // What makes this row a cold-cache control: the second state root holds no
+    // cache at all, so the launch has to reach the registry for the approved
+    // digest rather than reuse the first project's bytes.
+    assert!(
+        !cold_state.path().join("msb-home/cache").exists(),
+        "the second state root starts with no cache"
+    );
+    let before = server.requests().len();
+    let mut command = h.command_in(&h.project, cold_state.path());
+    command.args(["--image", &tag, "shell", "--", "true"]);
+    let cold = bounded(command);
+    assert_eq!(
+        sdk_image(&cold),
+        child_a,
+        "the state root is not the approval scope"
+    );
+    let requests = server.requests();
+    let after = &requests[before..];
+    assert!(
+        after
+            .iter()
+            .any(|(_, path)| path == &format!("/v2/images/manifests/{}", a.written.manifest_digest)),
+        "the cold cache requests the approved digest: {after:?}"
+    );
+    assert!(
+        !after
+            .iter()
+            .any(|(_, path)| path == "/v2/images/manifests/stateroot"),
+        "the tag is never requested: {after:?}"
+    );
+    assert_eq!(fs::read(h.pins()).unwrap(), store, "no record was written");
+}
+
+/// AC4: an import in P1 approves the result for P1 only. P2's existing
+/// approval for the same reference is byte-identical, and a P2 launch still
+/// hands the SDK P2's approved digest.
+#[test]
+fn an_import_approves_only_its_own_project() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let tag = format!("{}/images:import-scope", server.host);
+    let old = archive_at(&h, "import-scope-old.tar", "old");
+    let new = archive_at(&h, "import-scope-new.tar", "new");
+    let p2 = h.project_at("import-project");
+
+    // P2 imports the old bytes under the reference; both projects share the
+    // state root, so they share the cache but not the approval.
+    let mut command = h.command_in(&p2, &h.state);
+    command
+        .stdin(std::process::Stdio::null())
+        .args(["image", "import", "--input", old.path.to_str().unwrap()])
+        .args(["--tag", &tag]);
+    let out = bounded(command);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let p2_record = h.record_in(&p2, &tag).unwrap();
+    assert_eq!(p2_record["manifest_digest"], old.manifest_digest);
+
+    // P1 imports different bytes under the same reference.
+    let out = h.import(&new.path, &tag);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        h.pin_in(&h.project, &tag),
+        Some((new.manifest_digest.clone(), 1)),
+        "P1 approves its own result at revision 1"
+    );
+    assert_eq!(
+        h.record_in(&p2, &tag).unwrap(),
+        p2_record,
+        "P2's approval is byte-identical"
+    );
+
+    let mut command = h.command_in(&p2, &h.state);
+    command.args(["--image", &tag, "shell", "--", "true"]);
+    assert_eq!(
+        sdk_image(&bounded(command)),
+        format!("{}/images@{}", server.host, old.manifest_digest),
+        "P2 still hands the SDK its own approved digest"
+    );
+    assert_eq!(server.count(), 0, "{:?}", server.requests());
+}
+
+/// AC4 for `image build`: the same isolation through the Docker path.
+#[test]
+fn a_build_approves_only_its_own_project() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let tag = format!("{}/images:build-scope", server.host);
+    let old = archive_at(&h, "build-scope-old.tar", "old");
+    let new = archive_at(&h, "build-scope-new.tar", "new");
+    let p2 = h.project_at("build-project");
+
+    let mut command = h.command_in(&p2, &h.state);
+    command
+        .env("FAKE_DOCKER_ARCHIVE", &old.path)
+        .args(["image", "build", "--tag", &tag]);
+    let out = bounded(command);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let p2_record = h.record_in(&p2, &tag).unwrap();
+    assert_eq!(p2_record["manifest_digest"], old.manifest_digest);
+
+    let out = h.build(&new.path, &tag);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        h.pin_in(&h.project, &tag),
+        Some((new.manifest_digest.clone(), 1)),
+        "P1 approves its own build result at revision 1"
+    );
+    assert_eq!(
+        h.record_in(&p2, &tag).unwrap(),
+        p2_record,
+        "P2's approval is byte-identical"
+    );
+
+    let mut command = h.command_in(&p2, &h.state);
+    command.args(["--image", &tag, "shell", "--", "true"]);
+    assert_eq!(
+        sdk_image(&bounded(command)),
+        format!("{}/images@{}", server.host, old.manifest_digest),
+        "P2 still hands the SDK its own approved digest"
+    );
+}
+
+/// AC4/R3: `doctor` observes the invoking project's approval, not another
+/// project's, even though both share one HOME and one cache.
+#[test]
+fn doctor_reports_each_projects_own_approved_content() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let tag = format!("{}/images:doctor-scope", server.host);
+    let labelled = |h: &Harness, marker: &str, host: &str| {
+        h.image(&ArchiveSpec {
+            marker: marker.to_owned(),
+            labels: vec![(
+                "org.agent-vm.network-requests.image.base".to_owned(),
+                host.to_owned(),
+            )],
+            ..Default::default()
+        })
+    };
+    let a = labelled(&h, "doctor-a", "a.example");
+    let child_a = server.image("images", "doctor-scope", &a);
+    assert!(!h.launch(&tag).status.success());
+    assert_eq!(sdk_image(&h.launch(&tag)), child_a);
+
+    // Move the tag and let P2 approve B for itself. A first pin here would be
+    // cache-first and reuse P1's alias, so P2 resolves explicitly: a shared
+    // cache is still shared, only the approval is per project.
+    let p2 = h.project_at("doctor-project");
+    let b = labelled(&h, "doctor-b", "b.example");
+    server.image("images", "doctor-scope", &b);
+    let mut command = h.command_in(&p2, &h.state);
+    command.args(["image", "refresh", "--image", &tag, "--yes"]);
+    let out = bounded(command);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(h.pin_in(&p2, &tag).unwrap().1, 1, "P2's own first approval");
+
+    let doctor_in = |project: &Path| {
+        let mut command = h.command_in(project, &h.state);
+        command.env("AGENT_VM_IMAGE_TAG", &tag).arg("doctor");
+        let out = bounded(command);
+        assert!(out.status.success(), "{}", stderr(&out));
+        stdout_of(&out)
+    };
+    let section = |text: &str| {
+        let start = text
+            .find("==> image network requests")
+            .unwrap_or_else(|| panic!("no image section in:\n{text}"));
+        let rest = &text[start..];
+        let end = rest
+            .find("\n==> agent-vm doctor: available operations")
+            .unwrap_or(rest.len());
+        rest[..end].to_owned()
+    };
+    let p1_section = section(&doctor_in(&h.project));
+    let p2_section = section(&doctor_in(&p2));
+    assert!(
+        p1_section.contains("for every launch a.example"),
+        "P1's own approved content:\n{p1_section}"
+    );
+    assert!(
+        !p1_section.contains("b.example"),
+        "P1 must not report P2's content:\n{p1_section}"
+    );
+    assert!(
+        p2_section.contains("for every launch b.example"),
+        "P2's own approved content:\n{p2_section}"
+    );
+    assert!(
+        !p2_section.contains("a.example"),
+        "P2 must not report P1's content:\n{p2_section}"
+    );
+}
+
+/// A CLI-shaped version-1 store, exactly what 0.7.38 writes: the bytes the
+/// upgrade section archives.
+fn legacy_store() -> Vec<u8> {
+    serde_json::to_vec_pretty(&serde_json::json!({
+        "version": 1,
+        "pins": [{
+            "reference": "127.0.0.1:1/images:legacy",
+            "platform": {
+                "os": "linux",
+                "architecture": image_archive::host_arch(),
+                "variant": null
+            },
+            "manifest_digest": format!("sha256:{}", "1".repeat(64)),
+            "revision": 1
+        }],
+        "pending_default": null
+    }))
+    .unwrap()
+}
+
+fn config_dir(h: &Harness) -> PathBuf {
+    h.home.join(".config/agent-vm")
+}
+
+/// Install `bytes` as the store, with the stable lock a real store always has.
+fn seed_store(h: &Harness, bytes: &[u8]) {
+    fs::create_dir_all(config_dir(h)).unwrap();
+    fs::write(h.pins(), bytes).unwrap();
+    fs::write(config_dir(h).join("image-pins.lock"), b"").unwrap();
+}
+
+/// AC5: a valid, lock-accompanied version-1 store refuses every OCI command
+/// with the legacy error — before any registry request, cache publication,
+/// Docker run or SDK create — and no approval-authority file is created or
+/// changed. `--yes` changes nothing, a local path still reaches the runtime,
+/// and once the store is archived the next launch makes a first pin.
+#[test]
+fn a_legacy_host_wide_store_is_refused_until_upgraded() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let tag = format!("{}/images:legacy", server.host);
+    let image = h.image(&ArchiveSpec::default());
+    server.image("images", "legacy", &image);
+    let archive = archive_at(&h, "legacy.tar", "legacy");
+    let legacy = legacy_store();
+    seed_store(&h, &legacy);
+    let docker_marker = h.root.path().join("docker-ran");
+    let authority_files = || {
+        let mut names: Vec<String> = fs::read_dir(config_dir(&h))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    };
+    let before_files = authority_files();
+
+    let mut outputs = Vec::new();
+    let run = |args: &[&str]| {
+        let mut command = h.command();
+        command
+            .env("FAKE_DOCKER_ARCHIVE", &archive.path)
+            .env("FAKE_DOCKER_MARKER", &docker_marker)
+            .stdin(std::process::Stdio::null())
+            .args(args);
+        bounded(command)
+    };
+    outputs.push(("launch", run(&["--image", &tag, "shell", "--", "true"])));
+    outputs.push(("setup", run(&["setup", "--image", &tag, "--no-verify"])));
+    outputs.push(("refresh", run(&["image", "refresh", "--image", &tag])));
+    outputs.push((
+        "refresh --yes",
+        run(&["image", "refresh", "--image", &tag, "--yes"]),
+    ));
+    outputs.push((
+        "set-default",
+        run(&["image", "set-default", "--image", &tag]),
+    ));
+    outputs.push((
+        "set-default --yes",
+        run(&["image", "set-default", "--image", &tag, "--yes"]),
+    ));
+    outputs.push(("build", run(&["image", "build", "--tag", &tag])));
+    outputs.push((
+        "import",
+        run(&[
+            "image",
+            "import",
+            "--input",
+            archive.path.to_str().unwrap(),
+            "--tag",
+            &tag,
+        ]),
+    ));
+    for (label, out) in &outputs {
+        let text = stderr(out);
+        assert!(!out.status.success(), "{label} must fail: {text}");
+        assert!(
+            text.contains("host-wide version 1 format"),
+            "{label} must name the legacy format: {text}"
+        );
+        assert!(
+            !text.contains("damaged"),
+            "{label} must not call a legacy store damage: {text}"
+        );
+    }
+    assert_eq!(
+        create_invocations(&h),
+        0,
+        "no SDK create may happen: {}",
+        h.msb_invocations()
+    );
+    assert_eq!(
+        server.count(),
+        0,
+        "no registry request may happen: {:?}",
+        server.requests()
+    );
+    assert!(
+        !docker_marker.exists(),
+        "Docker must not run for a refused build"
+    );
+    assert_eq!(
+        fs::read(h.pins()).unwrap(),
+        legacy,
+        "the legacy store is never rewritten"
+    );
+    assert_eq!(
+        authority_files(),
+        before_files,
+        "no approval-authority file is created"
+    );
+
+    // A local rootfs launch bypasses approval entirely and reaches the runtime.
+    let rootfs = h.project_at("rootfs");
+    let mut command = h.command();
+    command.args(["--image", rootfs.to_str().unwrap(), "shell", "--", "true"]);
+    let local = bounded(command);
+    assert!(
+        !stderr(&local).contains("image-pins.json"),
+        "a local path never consults the approval store: {}",
+        stderr(&local)
+    );
+    // The existing local-path runtime path, reached unchanged. That path then
+    // fails at config validation (`root_disk() is only valid for OCI images`),
+    // which is the known non-OCI limitation, not an approval refusal.
+    assert!(
+        stderr(&local).contains("rootfs"),
+        "a local path reaches the runtime unchanged: {}",
+        stderr(&local)
+    );
+
+    // The upgrade's effect: archive the store (keeping the lock), then a launch
+    // makes a first pin.
+    fs::rename(h.pins(), h.root.path().join("v1-archive-image-pins.json")).unwrap();
+    let out = h.launch(&tag);
+    assert_eq!(
+        sdk_image(&out),
+        format!("{}/images@{}", server.host, image.written.manifest_digest),
+        "the archived store's next launch makes a first pin"
+    );
+    let record = h.record_in(&h.project, &tag).expect("a first pin");
+    let store: serde_json::Value = serde_json::from_slice(&fs::read(h.pins()).unwrap()).unwrap();
+    assert_eq!(store["version"], 2);
+    assert_eq!(record["revision"], 1);
+}
+
+/// AC6: a version-2 store whose `project` field is malformed is damage, not the
+/// legacy error.
+#[test]
+fn a_malformed_project_scope_is_damage_not_legacy() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let tag = format!("{}/images:malformed", server.host);
+    let image = h.image(&ArchiveSpec::default());
+    server.image("images", "malformed", &image);
+    let out = h.refresh(&tag, false);
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let mut store: serde_json::Value =
+        serde_json::from_slice(&fs::read(h.pins()).unwrap()).unwrap();
+    store["pins"][0]["project"] = "XYZ".into();
+    fs::write(h.pins(), serde_json::to_vec(&store).unwrap()).unwrap();
+    let bytes = fs::read(h.pins()).unwrap();
+
+    let before = server.count();
+    let out = h.launch(&tag);
+    let text = stderr(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("damaged"), "{text}");
+    assert!(!text.contains("host-wide version 1"), "{text}");
+    assert_eq!(fs::read(h.pins()).unwrap(), bytes);
+    assert_eq!(
+        server.count(),
+        before,
+        "a damaged store fails before the network: {:?}",
+        &server.requests()[before..]
+    );
+}
+
+/// AC7: the pin's `project` names the same project whose 12-hex prefix names
+/// the session state directory the launch created.
+#[test]
+fn a_launch_pin_names_its_session_project() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let tag = format!("{}/images:identity", server.host);
+    let image = h.image(&ArchiveSpec::default());
+    let child = server.image("images", "identity", &image);
+    let id = project_id(&h.project);
+
+    assert_eq!(sdk_image(&h.launch(&tag)), child);
+    let record = h.record_in(&h.project, &tag).expect("the launch pinned");
+    assert_eq!(record["project"], id.as_str());
+    let session = h.state.join(&id[..12]);
+    assert!(
+        session.join("claude").is_dir(),
+        "the launch created the session directory named by the project's prefix: {}",
+        session.display()
+    );
+}
+
+/// AC7: an external rename while Docker runs does not split the command. The
+/// approval lands under the project the command started in, and no record names
+/// the renamed path.
+#[test]
+fn a_project_renamed_during_docker_export_keeps_its_identity() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let tag = format!("{}/images:rename-build", server.host);
+    server.image("images", "rename-build", &h.image(&ArchiveSpec::default()));
+    let archive = archive_at(&h, "rename-build.tar", "rename-build");
+    let original = project_id(&h.project);
+    let renamed = h.root.path().join("renamed-project");
+
+    let mut command = h.command();
+    command
+        .env("FAKE_DOCKER_ARCHIVE", &archive.path)
+        .env("FAKE_DOCKER_RENAME_CWD_TO", &renamed)
+        .args(["image", "build", "--tag", &tag]);
+    let out = bounded(command);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(renamed.is_dir(), "the fake Docker renamed the project");
+    assert!(!h.project.exists());
+
+    let store: serde_json::Value = serde_json::from_slice(&fs::read(h.pins()).unwrap()).unwrap();
+    let records = store["pins"].as_array().unwrap();
+    assert_eq!(records.len(), 1, "{store}");
+    assert_eq!(
+        records[0]["project"], original,
+        "the approval names the project the command started in"
+    );
+    assert_ne!(
+        records[0]["project"],
+        project_id(&renamed),
+        "no record names the renamed path"
+    );
+    assert_eq!(records[0]["manifest_digest"], archive.manifest_digest);
+}
+
+/// AC7 through the first-pin path: renaming the project while the candidate is
+/// acquired still records the project the command started in, and the session
+/// directory carries the same identity.
+#[test]
+fn a_project_renamed_during_first_pin_acquisition_keeps_its_identity() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let tag = format!("{}/images:rename-pin", server.host);
+    let image = h.image(&ArchiveSpec::default());
+    let child = server.image("images", "rename-pin", &image);
+    let original = project_id(&h.project);
+    let renamed = h.root.path().join("renamed-during-pin");
+
+    let mut gate = PinGate::new(h.root.path());
+    let mut command = h.command();
+    gate.attach(&mut command);
+    let launched = PinPeer::spawn(command, &gate, &["--image", &tag, "shell", "--", "true"]);
+    gate.expect(PinStage::CandidateReady).reply(Reply::Continue);
+    let checkpoint = gate.expect(PinStage::BeforePinLock);
+    // The child is paused before its first write: rename the project now, the
+    // way an external process can, with no `chdir` in the child.
+    fs::rename(&h.project, &renamed).unwrap();
+    checkpoint.reply(Reply::Continue);
+    gate.expect(PinStage::PinLocked).reply(Reply::Continue);
+    gate.expect(PinStage::BeforePinSave).reply(Reply::Continue);
+    gate.expect(PinStage::PinCommitted).reply(Reply::Continue);
+    let out = launched.wait();
+    drop(gate);
+    assert_eq!(sdk_image(&out), child);
+
+    let store: serde_json::Value = serde_json::from_slice(&fs::read(h.pins()).unwrap()).unwrap();
+    let records = store["pins"].as_array().unwrap();
+    assert_eq!(records.len(), 1, "{store}");
+    assert_eq!(records[0]["project"], original);
+    assert_ne!(records[0]["project"], project_id(&renamed));
+    assert!(
+        h.state.join(&original[..12]).join("claude").is_dir(),
+        "the session directory carries the same identity"
+    );
+    assert!(!h.state.join(&project_id(&renamed)[..12]).exists());
 }
 
 #[test]

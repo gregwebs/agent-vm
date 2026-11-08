@@ -22,16 +22,15 @@
 //! once is the user's call.
 
 use std::{
-    env,
     io::ErrorKind,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
-use sha2::{Digest, Sha256};
 
 use crate::guest_home::{self, GuestHomeLink, LinkSource};
 use crate::host_paths::{EntryType, GuestStateDir};
+use crate::project::ProjectDir;
 
 /// Everything Phase 2 needs to know about a project invocation.
 pub struct ProjectSession {
@@ -42,17 +41,15 @@ pub struct ProjectSession {
 }
 
 impl ProjectSession {
-    /// Build a session rooted at the current working directory.
-    pub fn for_cwd() -> Result<Self> {
-        let project_dir = env::current_dir()
-            .context("reading current directory")?
-            .canonicalize()
-            .context("canonicalizing current directory")?;
-        Self::for_dir(project_dir)
-    }
-
-    fn for_dir(project_dir: PathBuf) -> Result<Self> {
-        let project_hash = hash_path(&project_dir);
+    /// Build the session for a command's one captured project.
+    ///
+    /// The state-directory name is the first 12 hex of the project digest — a
+    /// prefix of the same SHA-256 the pin authority keys on
+    /// ([`ProjectDir::digest_hex`]) — so session state and approvals name one
+    /// project and every existing `<state>/<hash>` stays reachable.
+    pub fn for_project(project: &ProjectDir) -> Result<Self> {
+        let project_dir = project.path().to_owned();
+        let project_hash = project.digest_hex()[..12].to_owned();
         // One state-root rule, in `host_paths`: absolute, or an error naming
         // the value (#437). The hash is over the canonical project dir, so the
         // root being absolute is what makes `state_dir` cwd-independent.
@@ -468,33 +465,14 @@ fn force_symlink(target: &str, link: &Path) -> Result<()> {
 /// would otherwise fail with ENOENT or mis-report "two populated homes".
 const MIGRATION_LOCK: &str = ".pi-migration.lock";
 
-/// 12-hex-char prefix of SHA256(canonical_path). Short enough to keep sandbox
-/// names readable; long enough that two project dirs are very unlikely to
-/// collide on the same host.
-fn hash_path(path: &Path) -> String {
-    let mut h = Sha256::new();
-    h.update(path.as_os_str().as_encoded_bytes());
-    let digest = h.finalize();
-    let mut s = String::with_capacity(12);
-    for byte in &digest[..6] {
-        use std::fmt::Write;
-        write!(&mut s, "{byte:02x}").unwrap();
-    }
-    s
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use super::*;
 
-    #[test]
-    fn hash_is_stable_and_short() {
-        let h = hash_path(Path::new("/some/project"));
-        assert_eq!(h.len(), 12);
-        assert_eq!(h, hash_path(Path::new("/some/project")));
-        assert_ne!(h, hash_path(Path::new("/other/project")));
+    fn project(path: &Path) -> ProjectDir {
+        ProjectDir::from_path_for_tests(path).expect("canonicalize the fixture project")
     }
 
     #[test]
@@ -504,8 +482,9 @@ mod tests {
         // sandbox names within the same process (PID disambiguator —
         // and across processes the PIDs differ by definition).
         let dir = std::env::temp_dir();
-        let a = ProjectSession::for_dir(dir.clone()).expect("for_dir a");
-        let b = ProjectSession::for_dir(dir.clone()).expect("for_dir b");
+        let dir = project(&dir);
+        let a = ProjectSession::for_project(&dir).expect("for_project a");
+        let b = ProjectSession::for_project(&dir).expect("for_project b");
         assert_eq!(a.state_dir, b.state_dir);
         assert_eq!(a.project_hash, b.project_hash);
         // Same process → same PID → same name within-process. The

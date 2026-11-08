@@ -79,6 +79,9 @@ if [[ "$guard_only" == false ]]; then
     bash "$REPO_ROOT/script/test/egress-default-deny-contract.sh"
     bash "$REPO_ROOT/script/test/config-dir-guard-contract.sh"
     bash "$REPO_ROOT/script/test/config-mounts-contract.sh"
+    # #532 S1: the USAGE upgrade/rollback text is the operator's only copy of
+    # the procedure, so the text itself is executed here rather than retyped.
+    bash "$REPO_ROOT/script/test/pin-store-upgrade-contract.sh"
     bash "$REPO_ROOT/script/test/build-provenance-contract.sh"
     bash "$REPO_ROOT/script/test/persisted-network-contract.sh"
     # Mutation anchors must still name lines that exist; otherwise the
@@ -129,6 +132,7 @@ syntax_check=(
     script/test/config-dir-guard-contract.sh
     script/test/config-mounts-live.sh
     script/test/config-mounts-contract.sh
+    script/test/pin-store-upgrade-contract.sh
     script/test/fixtures/config-mounts/guest-cm-probe.sh
     script/test/fixtures/config-mounts/guest-gm-probe.sh
     script/test/fixtures/config-dir-guard/guest-n1a.sh
@@ -185,6 +189,7 @@ shellcheck_files=(
     script/test/config-dir-guard-contract.sh
     script/test/config-mounts-live.sh
     script/test/config-mounts-contract.sh
+    script/test/pin-store-upgrade-contract.sh
     script/test/fixtures/config-mounts/guest-cm-probe.sh
     script/test/fixtures/config-mounts/guest-gm-probe.sh
     script/test/fixtures/config-dir-guard/guest-n1a.sh

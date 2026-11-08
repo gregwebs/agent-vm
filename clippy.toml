@@ -11,12 +11,21 @@
 # everywhere and allowed at its call site with its reason, so a new use cannot be
 # added without a visible, reviewable `#[allow]`.
 #
+# `project::ProjectDir::capture` reads the working directory. A command captures
+# it exactly once, at its entry point, and passes the value to every consumer: an
+# external rename changes what `getcwd` returns without any `chdir`, so a second
+# read could name a second project mid-command and approve content under a path
+# the user never ran in (ADR-0063). Each entry point allows it on its single
+# `let project = ...;` statement, so a second capture in the same function still
+# trips the lint.
+#
 # `image_pin::publication::approve_published` records an approval of content a
 # command just published. Only the two verbs whose own argument names that
 # content may do it (`image build --tag`, `image import`); a future caller of the
 # shared publication helper inherits publication but never approval, and adding
 # an `#[allow]` is the visible decision it must make.
 disallowed-methods = [
+  { path = "agent_vm::project::ProjectDir::capture", reason = "one capture per command: pass the entry point's ProjectDir to every consumer" },
   { path = "agent_vm::mount::Spelling::stored_str", reason = "identity only (fork manifest); render a spelling with Spelling::render(Declaration)" },
   { path = "agent_vm::mount::Spelling::stored_bytes", reason = "identity only (fork hash); render a spelling with Spelling::render(Declaration)" },
   { path = "agent_vm::mount::Spelling::as_source_path", reason = "filesystem calls and quoted_path only; render a spelling with Spelling::render(Declaration)" },

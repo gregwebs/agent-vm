@@ -3078,7 +3078,7 @@ fn pin_gate_dir() -> tempfile::TempDir {
 fn assert_render(out: &Output, reference: &str, old: &str, new: &str) {
     let shown = stderr_of(out);
     let expected = format!(
-        "Approving the image published as {reference} (linux/{}):\n  old: {old}\n  new: {new}\n",
+        "Approving the image published as {reference} (linux/{}) for this project:\n  old: {old}\n  new: {new}\n",
         image_archive::host_arch()
     );
     assert!(

@@ -9,6 +9,9 @@ decision this ADR extends). Builds on the acquisition infrastructure of #389
 ([ADR-0043](0043-image-command-group-and-daemon-import.md) places the verbs).
 Amended in **0.7.34** by #391: an explicit build/import approves its own result
 reference (see [ADR-0043](0043-image-command-group-and-daemon-import.md)).
+Amended by [ADR-0063](0063-project-scoped-oci-image-approval.md) (#532):
+approvals are scoped to a **project** and the store format is version 2; the
+body below is the historical decision.
 Follow-up #392 (default source-reference retention) is deliberately not decided
 here; the boundary below records what stays open.
 

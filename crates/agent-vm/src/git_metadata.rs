@@ -67,7 +67,7 @@ pub(crate) enum GitMountMode {
 /// are equal for every ordinary launch, so transposing them would be invisible
 /// until a remapped project silently mounted the wrong spellings.
 pub(crate) struct LaunchTopology<'a> {
-    /// Canonical host launch directory (`ProjectSession::for_cwd`).
+    /// Canonical host launch directory (`ProjectDir::capture`).
     pub(crate) project_dir: &'a Path,
     /// The guest path the project is mirrored at — `/workspace` when remapped.
     pub(crate) project_guest: &'a Path,

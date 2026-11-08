@@ -27,6 +27,7 @@ use crate::launch_notice::{LaunchNotices, NoticeSink};
 use crate::launch_target::{LaunchTarget, ProgramGuard};
 use crate::mount::{self, MountRequests};
 use crate::one_line;
+use crate::project::ProjectDir;
 use crate::protected_host_files::CoreHostSource;
 use crate::session::ProjectSession;
 use crate::shell::guest_script_word;
@@ -810,6 +811,8 @@ pub(crate) async fn launch(
     credential_preflight: CredentialPreflight,
     args: Args,
 ) -> Result<i32> {
+    #[allow(clippy::disallowed_methods)] // one capture per command: every consumer borrows it.
+    let project = ProjectDir::capture()?;
     let (grant, invocation) = target.into_parts();
     // The output policy belongs to the target, not to the sink: a direct launch
     // answers a broken stdout/stderr pipe as its own failure (#398), while a
@@ -905,7 +908,7 @@ pub(crate) async fn launch(
     // `ProtectedHostFiles::require_home` refuses on.
     let mount_home = user::host_home_dir();
 
-    let session = ProjectSession::for_cwd()?;
+    let session = ProjectSession::for_project(&project)?;
     // AC#6 (agent-vm issue #40): fail closed, before touching the
     // filesystem or booting anything, if this sandbox's real agent/control
     // socket paths would overflow the platform's Unix-domain-socket path
@@ -1336,7 +1339,7 @@ pub(crate) async fn launch(
     // across both create variants.
     let prepared = match &built {
         Some(built) => crate::image_pin::prepare_unpinned(built, &label).await,
-        None => crate::image_pin::prepare_selected(&boot).await,
+        None => crate::image_pin::prepare_selected(&boot, &project).await,
     }
     .context("preparing the boot image")?;
     let sdk_image = prepared.sdk_reference().to_owned();

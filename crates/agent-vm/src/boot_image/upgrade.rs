@@ -14,6 +14,7 @@ use std::str::FromStr;
 use super::ImageRef;
 use crate::image_acquire::{OciTarget, OciTargetError};
 use crate::image_pin::{ApprovalMode, ExplicitOperation, UpdateOutcome};
+use crate::project::ProjectDir;
 use anyhow::Result;
 
 /// The fixed refusal for a local rootfs/disk `--image` target. Names no value:
@@ -100,10 +101,13 @@ impl clap::builder::TypedValueParser for SetDefaultTargetParser {
 }
 
 pub(crate) async fn run(args: Args) -> Result<()> {
+    #[allow(clippy::disallowed_methods)] // one capture per command: every consumer borrows it.
+    let project = ProjectDir::capture()?;
     crate::msb_preflight::ensure_db_not_ahead().await?;
     crate::image_log_guard::activate();
     let outcome = crate::image_pin::update(
         ExplicitOperation::SetDefault(&args.target.0),
+        &project,
         ApprovalMode::of_flag(args.yes),
     )
     .await?;

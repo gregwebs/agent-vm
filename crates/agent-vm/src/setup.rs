@@ -66,6 +66,7 @@ use crate::boot_image;
 use crate::config::{self, Catalog, ConfiguredImages, LaunchCatalog};
 use crate::image_acquire::{OciTarget, OciTargetError};
 use crate::image_pin::{PreparedSelection, prepare_selected};
+use crate::project::ProjectDir;
 
 /// The fixed refusal for a setup target that is a local rootfs or disk path.
 /// Names no value: the rejected text is user input.
@@ -139,6 +140,8 @@ fn verification_targets(catalog: &LaunchCatalog) -> Vec<VerifyTarget> {
 }
 
 pub async fn run(args: Args, catalog: Catalog, images: ConfiguredImages) -> Result<()> {
+    #[allow(clippy::disallowed_methods)] // one capture per command: every consumer borrows it.
+    let project = ProjectDir::capture()?;
     // setup also reaches connect_and_migrate (via Sandbox::builder/build and
     // Sandbox::remove), so it can hit the same forward-migrated-DB crash as
     // the boot path. See src/msb_preflight.rs and issue #30.
@@ -193,7 +196,7 @@ pub async fn run(args: Args, catalog: Catalog, images: ConfiguredImages) -> Resu
     // commits the first pin before anything is created. The returned value holds
     // the shared publication barrier across the acquisition and, when
     // verification is requested, across the SDK's verify create.
-    let prepared = prepare_selected(&boot).await?;
+    let prepared = prepare_selected(&boot, &project).await?;
 
     if !args.no_verify {
         verify_image(&boot, &targets, prepared).await?;

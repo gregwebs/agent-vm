@@ -123,7 +123,7 @@ cached layers, and publishes a complete host-Linux cache entry using the
 ambient microsandbox cache with native registry auth, trust and managed HTTP
 policy. It creates no sandbox, boots no guest and touches no project or running
 guest. Selection, precedence and recovery are unchanged. Every OCI selection
-is also a host-wide **image approval** (next section); refresh is one of the
+is also a **project-scoped image approval** (next section); refresh is one of the
 two explicit operations allowed to re-resolve a source and ask for consent. A
 launch never checks a tag for movement: there is no launch-time update check,
 flag, environment variable, banner or marker.
@@ -232,24 +232,33 @@ name, and boots the resulting image without an approval pin.
 does not contain the tool's `command`, the launch prints a contract diagnostic
 and exits 127.
 
-### Host-wide approval of OCI image content
+### Project-scoped approval of OCI image content
 
 Every OCI image you select — `--image`, `AGENT_VM_IMAGE_TAG`, user or project
-`image`, or the default tier — is **approved once per host and platform**.
-agent-vm keeps that approval in:
+`image`, or the default tier — is **approved once per project and platform**.
+agent-vm keeps those approvals in:
 
 ```text
-$HOME/.config/agent-vm/image-pins.json   approvals (private, version 1)
+$HOME/.config/agent-vm/image-pins.json   approvals (private, version 2)
 $HOME/.config/agent-vm/image-pins.lock   coordination
 ```
 
-One entry binds the canonical OCI reference plus the host Linux platform
-(`linux/arm64`, `linux/amd64`) to the approved host-platform manifest **child**
-digest. The store is host-wide: every project and every launch `HOME` share it,
-and it is independent of the microsandbox cache, of `AGENT_VM_STATE_DIR` and of
-project files. Approvals are never written into `config.toml`. Selection
-precedence is unchanged (table above): a pin never chooses the image; it fixes
-what an already-selected reference may resolve to.
+One entry binds a **project**, the canonical OCI reference and the host Linux
+platform (`linux/arm64`, `linux/amd64`) to the approved host-platform manifest
+**child** digest. A project is the canonical working directory of the command,
+not its Git repository: worktrees and subdirectories are distinct projects, and
+symlink aliases of one directory are the same project. It is captured once when
+the command starts, so renaming the directory mid-command does not split the
+approval. Another project's approval for the same reference is never consulted:
+a fresh project's first launch resolves the reference afresh.
+
+The store is host-managed and shared by every project on the host, exactly like
+`$HOME` itself, but each record belongs to one project. It is independent of the
+microsandbox cache, of `AGENT_VM_STATE_DIR` and of project files, so a shared
+cache is still shared — only the approval is not. Approvals are never written
+into `config.toml`. Selection precedence is unchanged (table above): a pin never
+chooses the image; it fixes what an already-selected reference may resolve to.
+
 
 **Acquisition precedes the guest, approval precedes create.** On the first
 selection of a reference, agent-vm acquires and validates the image, commits
@@ -293,7 +302,7 @@ When an explicit refresh or set-default resolves different content for an
 existing mutable pin, agent-vm prints the change and asks on stderr:
 
 ```text
-Replace the approved image for ghcr.io/owner/app:dev (linux/arm64)?
+Replace the approved image for ghcr.io/owner/app:dev (linux/arm64) in this project?
   old: sha256:<full old digest>
   new: sha256:<full current digest>
 Approve this exact image change? [y/N]
@@ -368,11 +377,300 @@ a hard error, never "no approvals yet". OCI launches, setup and updates fail
 until it is repaired, because silently re-pinning would authorize content
 nobody approved. The damaged bytes are left in place. Recovery: restore the
 file from a backup; or, to deliberately **reset approvals**, move
-`image-pins.json` aside and leave the cache alone. A reset makes the next
-selection of each reference a first selection again — it re-approves whatever
-that reference resolves to at that moment. Never delete approvals to work
-around a cache problem: cache records have their own restore/reacquire
-recovery, and an approval is not cache evidence.
+`image-pins.json` aside and leave the cache alone. A reset is per file, so it
+drops every project's approvals: the next selection of each reference is a first
+selection again, and it re-approves whatever that reference resolves to at that
+moment. Never delete approvals to work around a cache problem: cache records
+have their own restore/reacquire recovery, and an approval is not cache
+evidence.
+
+#### Upgrading from host-wide approvals
+
+agent-vm 0.7.39 keeps approvals per project. It refuses an older host-wide
+`image-pins.json` (version 1) instead of guessing which project each approval
+belonged to. Until you upgrade it, OCI launches, `setup`, `image refresh`,
+`image set-default`, `image build` and `image import` fail; local rootfs/disk
+launches bypass approval.
+
+Close every agent-vm session and command, then run (needs `jq`, `cmp`, `pgrep`,
+`mktemp`):
+
+<!-- pin-store-upgrade -->
+```sh
+bash -euo pipefail <<'EOF'
+trap 'echo "upgrade stopped: the command on line $LINENO failed" >&2' ERR
+fail() { echo "upgrade stopped: $*" >&2; exit 1; }
+# An ordinary file, never a symlink: every file this block archives, replaces or
+# deletes is one, so a pre-placed link cannot redirect a write or a removal.
+regular() { [ -f "$1" ] && [ ! -L "$1" ]; }
+# Any directory entry, a dangling symlink included: `-e` is false for one, and
+# a link whose target appears later must not be read as a missing file.
+present() { [ -e "$1" ] || [ -L "$1" ]; }
+# Identical bytes, or both absent. A cmp error (status 2) stops the block.
+matches() {
+  if ! present "$1" && ! present "$2"; then return 0; fi
+  if ! present "$1" || ! present "$2"; then return 1; fi
+  status=0; cmp -s "$1" "$2" || status=$?
+  [ "$status" -le 1 ] || fail "could not compare $1 with $2"
+  return "$status"
+}
+for tool in jq cmp pgrep mktemp; do command -v "$tool" >/dev/null || fail "$tool is required"; done
+# Any process whose command starts with an agent-vm binary, whatever it is named:
+# `agent-vm`, `agent-vm-dev`, `agent-vm-0.7.38`, or a copy on some other path.
+pattern='^([^ ]*/)?agent-vm[^/ ]*( |$)'
+running=0; pgrep -f "$pattern" >/dev/null || running=$?
+case "$running" in
+  0) fail "close every agent-vm session and command first" ;;
+  1) ;; # no agent-vm process
+  *) fail "pgrep failed (status $running)" ;;
+esac
+cd "$HOME/.config/agent-vm" || fail "$HOME/.config/agent-vm does not exist"
+umask 077
+present image-pins.json || fail "there is no image-pins.json to upgrade"
+regular image-pins.json || fail "image-pins.json is not an ordinary file; move it aside"
+# The version is the only thing this block needs to know about the store's
+# contents: everything else is copied byte for byte, so shape is never a reason
+# to refuse an approval — shell cannot reproduce the old reader's grammar, bounds
+# or recovery rules, and a wrong guess either discards a file it would have
+# accepted or archives one it would not.
+version="$(jq -r 'if .version == 1 then "v1" else "other" end' image-pins.json)"
+[ "$version" = v1 ] || fail "image-pins.json is not a version 1 store"
+# An interrupted `image set-default` leaves `pending_default`, and finishing it
+# means deciding the retained default from JSON. The previous release owns that
+# decision; this block must not guess it.
+pending="$(jq -r 'if .pending_default == null then "none" else "journal" end' image-pins.json)"
+if [ "$pending" != none ]; then
+  echo "upgrade stopped: image-pins.json records an interrupted image set-default (pending_default); nothing was changed." >&2
+  echo "Finish the journal with agent-vm 0.7.38, which needs network access, then run this block again." >&2
+  echo "Repeat the intent with the digest the journal already holds; a tag may have moved since:" >&2
+  echo "  digest=\"\$(jq -r '.pending_default.proposed | fromjson | .image' image-pins.json)\"" >&2
+  echo "  agent-vm image set-default --image \"\$digest\"   # agent-vm 0.7.38" >&2
+  echo "or archive the pair by hand and accept the reset (see below)." >&2
+  exit 1
+fi
+if present default-image.json; then
+  regular default-image.json || fail "default-image.json is not an ordinary file; move it aside"
+fi
+if present v1-archive; then
+  # A rerun. The archive must hold this exact pair.
+  [ -d v1-archive ] && [ ! -L v1-archive ] || fail "v1-archive is not a plain directory; move it aside"
+  regular v1-archive/image-pins.json || fail "v1-archive/image-pins.json is not an ordinary file; move the archive aside"
+  matches v1-archive/image-pins.json image-pins.json || fail "v1-archive/ holds a different store; move it aside"
+  if present v1-archive/default-image.json; then
+    regular v1-archive/default-image.json || fail "v1-archive/default-image.json is not an ordinary file; move the archive aside"
+  fi
+  matches v1-archive/default-image.json default-image.json || fail "default-image.json differs from v1-archive/; restore it or move the archive aside"
+else
+  partial="$(mktemp -d v1-archive.XXXXXX)"
+  cp -p image-pins.json "$partial/"
+  if present default-image.json; then cp -p default-image.json "$partial/"; fi
+  mv "$partial" v1-archive
+fi
+matches v1-archive/image-pins.json image-pins.json || fail "the archive does not match image-pins.json"
+rm image-pins.json
+echo "archived the host-wide approvals in $PWD/v1-archive"
+EOF
+```
+<!-- /pin-store-upgrade -->
+
+Any failing command stops the block. It refuses while any command whose name
+starts with `agent-vm` runs — `agent-vm`, `agent-vm-dev`, `agent-vm-0.7.38` or a
+copy on any path. Two blind spots are known and closed by hand: a copy renamed
+to something unrelated, and a copy on a path containing a space, which
+`pgrep -f` cannot tell from an argument boundary (tracked separately; the
+pattern is not widened here). It decodes nothing: the store is asked only
+whether it is a version 1 file and whether it carries an interrupted
+`set-default` journal, and then both files are copied byte for byte — no
+approval, digest or default is ever re-derived, rewritten or installed from
+JSON here. What it refuses is anything it cannot copy exactly: a store that is
+not version 1, an interrupted `image set-default` (below), a symlink (counted
+as present even when its target does not exist, so it is reported rather than
+read as a missing file), and a `v1-archive/` that is not a plain directory. A
+file is only ever replaced by renaming a freshly created one into place, so a
+pre-placed name is never written through. It keeps the exact old pair in
+`v1-archive/` and then removes the old store. If it stops part-way, fix the
+reported problem and run it again: it resumes only if the live pair still
+matches the archive, and otherwise stops without changes.
+
+**An interrupted `image set-default` stops it.** That command journals its
+intent in the store (`pending_default`) before it writes the default, so a
+crash or a kill leaves both files half-finished. Which of the two defaults
+takes effect is a decision the previous release already knows how to make and
+shell cannot reliably repeat, so the block refuses that state untouched and
+tells you to hand it back.
+
+Hand it back by running the release that wrote the store — agent-vm 0.7.38 —
+against it once. That release finishes or discards the journal inside its next
+image transaction, and no transaction begins until its image has been acquired,
+so the run needs **network access** and a reference the registry still serves.
+Get 0.7.38 from the npm distribution
+(`npm install -g @wirenboard/agent-vm@0.7.38`), or from the copy you were
+running before this upgrade, and repeat the interrupted `set-default` with the
+exact digest the journal already holds rather than the tag you typed:
+
+```sh
+cd ~/.config/agent-vm
+digest="$(jq -r '.pending_default.proposed | fromjson | .image' image-pins.json)"
+agent-vm image set-default --image "$digest"
+```
+
+A tag that has moved since resolves different content: it may prompt for a new
+approval, and even when it does not it records that other intent instead of
+finishing this one. The digest above is exactly what the interrupted run was
+setting, so repeating it completes the journal. Then run the upgrade block
+again against the finished store.
+
+One state 0.7.38 will not adopt: a physical `default-image.json` that matches
+neither side of the journal (hand-edited, deleted while the journal names a
+previous default, or written by something else after the interruption). That
+release checks the pair before any registry request and refuses it with "image
+pin default transaction requires recovery", so no amount of network access
+helps. Only the hand-archive route below remains, and it takes the default
+along with the store.
+
+If you would rather reset than run the older release, archive the **pair**
+yourself and accept it: `mkdir -p ~/.config/agent-vm/v1-archive`, then move
+both `image-pins.json` and `default-image.json` into it. Move the store alone
+only when there is no `default-image.json` at all: the journal names the default
+it was replacing, and the rollback refuses an archived store whose journal names
+a default that was not archived with it, because the older release would refuse
+that pair. Approvals are then gone, and the default stays whatever the
+interrupted `set-default` had already written — the journal in the archived
+store still records both sides if you want to put the older one back by hand.
+
+**This resets approvals.** Each project's next launch of a reference makes a
+first pin, cache-first: with a warm cache it usually reuses the content you
+had; after a cache loss or a moved alias a mutable tag resolves to whatever its
+registry serves now, which may be newer. To keep exact earlier content, launch
+the digest from the archive:
+
+```sh
+jq -r '.pins[] | "\(.reference)  \(.manifest_digest)"' ~/.config/agent-vm/v1-archive/image-pins.json
+```
+
+To return to an older agent-vm, close every agent-vm process — the rollback runs
+the same quiescence check as the upgrade, with the same two blind spots (a
+renamed copy, a path containing a space), so close those by hand — and run the
+rollback block. It keeps the current approvals and default in `v2-archive/`
+and restores the archived pair byte for byte, so the older agent-vm sees what
+it last wrote, even if `image set-default` changed the default since the
+upgrade. It checks that the archived store is a version 1 file, and that an
+archived store carrying an interrupted `image set-default` journal naming a
+previous default was archived together with that default — it never interprets
+the records or the default it restores — and renames each restored file into
+place. Both archive directories must be plain directories, and a symlink in
+either is refused rather than followed or read as absence. If it stops
+part-way, run it again: it resumes when the pair it archived is still live (or
+there was no live store to archive), and otherwise stops without changes:
+
+<!-- pin-store-rollback -->
+```sh
+bash -euo pipefail <<'EOF'
+trap 'echo "rollback stopped: the command on line $LINENO failed" >&2' ERR
+fail() { echo "rollback stopped: $*" >&2; exit 1; }
+# An ordinary file, never a symlink: every file this block archives, restores or
+# deletes is one, so a pre-placed link cannot redirect a write or a removal.
+regular() { [ -f "$1" ] && [ ! -L "$1" ]; }
+# Any directory entry, a dangling symlink included: `-e` is false for one, and
+# a link whose target appears later must not be read as a missing file.
+present() { [ -e "$1" ] || [ -L "$1" ]; }
+# Identical bytes, or both absent. A cmp error (status 2) stops the block.
+matches() {
+  if ! present "$1" && ! present "$2"; then return 0; fi
+  if ! present "$1" || ! present "$2"; then return 1; fi
+  status=0; cmp -s "$1" "$2" || status=$?
+  [ "$status" -le 1 ] || fail "could not compare $1 with $2"
+  return "$status"
+}
+for tool in jq cmp pgrep mktemp; do command -v "$tool" >/dev/null || fail "$tool is required"; done
+# Any process whose command starts with an agent-vm binary, whatever it is named:
+# `agent-vm`, `agent-vm-dev`, `agent-vm-0.7.38`, or a copy on some other path.
+pattern='^([^ ]*/)?agent-vm[^/ ]*( |$)'
+running=0; pgrep -f "$pattern" >/dev/null || running=$?
+case "$running" in
+  0) fail "close every agent-vm session and command first" ;;
+  1) ;; # no agent-vm process
+  *) fail "pgrep failed (status $running)" ;;
+esac
+cd "$HOME/.config/agent-vm" || fail "$HOME/.config/agent-vm does not exist"
+umask 077
+[ -d v1-archive ] && [ ! -L v1-archive ] || fail "v1-archive is not a plain directory; move it aside"
+regular v1-archive/image-pins.json || fail "v1-archive/image-pins.json is missing or not an ordinary file"
+# Only the format version, and whether an archived journal names a previous
+# default, are read: the archived pair is restored byte for byte, so this block
+# never decides what an approval or a default means.
+version="$(jq -r 'if .version == 1 then "v1" else "other" end' v1-archive/image-pins.json)"
+[ "$version" = v1 ] || fail "v1-archive/image-pins.json is not a version 1 store; restore it from backup"
+# A version 1 store can carry an interrupted `image set-default` journal: the
+# default it was replacing, and the one it was writing. Restored without the
+# default, the pair is one the old reader refuses ("requires recovery"), so a
+# journal that names a previous default is only restorable with it. This asks
+# whether one exists; it decodes neither side.
+if ! present v1-archive/default-image.json; then
+  journal="$(jq -r 'if .pending_default == null then "none"
+    elif .pending_default.previous == null then "none"
+    else "journal" end' v1-archive/image-pins.json)"
+  [ "$journal" = none ] ||
+    fail "v1-archive/image-pins.json records an interrupted image set-default" \
+      "and no default was archived with it; the old reader refuses that pair —" \
+      "move the default-image.json that belongs with it into v1-archive/," \
+      "or run the previous release once"
+fi
+if present v1-archive/default-image.json; then
+  regular v1-archive/default-image.json || fail "v1-archive/default-image.json is not an ordinary file; restore it from backup"
+fi
+if present image-pins.json; then
+  regular image-pins.json || fail "image-pins.json is not an ordinary file; move it aside"
+fi
+if present default-image.json; then
+  regular default-image.json || fail "default-image.json is not an ordinary file; move it aside"
+fi
+if matches v1-archive/image-pins.json image-pins.json; then
+  matches v1-archive/default-image.json default-image.json ||
+    fail "image-pins.json is restored but default-image.json differs from v1-archive/; restore it by hand"
+  echo "already rolled back"; exit 0
+fi
+if present v2-archive; then
+  # A rerun. The live store must still be the archived one, unless there was no
+  # store to archive; the default may already be the restored v1 one.
+  [ -d v2-archive ] && [ ! -L v2-archive ] || fail "v2-archive is not a plain directory; move it aside"
+  if present v2-archive/image-pins.json; then
+    regular v2-archive/image-pins.json || fail "v2-archive/image-pins.json is not an ordinary file; move the archive aside"
+  fi
+  matches v2-archive/image-pins.json image-pins.json || fail "v2-archive/ holds a different store; move it aside"
+  if present v2-archive/default-image.json; then
+    regular v2-archive/default-image.json || fail "v2-archive/default-image.json is not an ordinary file; move the archive aside"
+  fi
+  matches v2-archive/default-image.json default-image.json ||
+    matches v1-archive/default-image.json default-image.json ||
+    fail "default-image.json matches neither archive; restore it or move v2-archive/ aside"
+else
+  partial="$(mktemp -d v2-archive.XXXXXX)"
+  if present image-pins.json; then cp -p image-pins.json "$partial/"; fi
+  if present default-image.json; then cp -p default-image.json "$partial/"; fi
+  mv "$partial" v2-archive
+fi
+# Restore the archived pair, default first, so the store is never live while the
+# default it names is not. Each file is written to a fresh file beside it and
+# renamed into place, so no pre-existing name — and no symlink at one — is ever
+# written through.
+if present v1-archive/default-image.json; then
+  staging="$(mktemp default-image.json.new.XXXXXX)"
+  cp -p v1-archive/default-image.json "$staging"
+  mv "$staging" default-image.json
+else
+  rm -f default-image.json
+fi
+staging="$(mktemp image-pins.json.new.XXXXXX)"
+cp -p v1-archive/image-pins.json "$staging"
+mv "$staging" image-pins.json
+echo "restored the host-wide approvals; current ones are in $PWD/v2-archive"
+EOF
+```
+<!-- /pin-store-rollback -->
+
+Find one project's records with `printf %s "$(pwd -P)" | shasum -a 256` run in
+that project.
 
 #### Retained default and staging boundaries
 
@@ -393,7 +691,7 @@ rebuild or a re-import is immediately what the next launch of that reference
 boots. The change is rendered on stderr before it is committed:
 
 ```text
-Approving the image published as docker.io/library/app:dev (linux/arm64):
+Approving the image published as docker.io/library/app:dev (linux/arm64) for this project:
   old: sha256:<full old digest>
   new: sha256:<full new digest>
 ```
@@ -456,7 +754,7 @@ These are the [selection table](#selecting-the-boot-image) rows in the same
 order; `AGENT_VM_IMAGE_TAG=""` counts as unset, exactly as for a launch.
 
 `Image:` reports the selected **source**, not the approved guest content. The
-digest a launch would actually consume is a separate host approval and is not
+digest a launch would actually consume is a separate project approval and is not
 printed here.
 
 The command is read-only and offline. It consults no cached image, Docker,
@@ -521,10 +819,10 @@ multiarch index, and a newer release may change it). How the two interact:
   a launcher upgrade, a project image, or a cache loss leaves the retained
   digest alone. Automatic adoption is insert-if-absent under the host lock, so
   concurrent first launches cannot overwrite each other.
-- **The digest is also a host approval.** The default tier participates in the
-  same [host-wide approval](#host-wide-approval-of-oci-image-content) as every
-  other source: once pinned, a launch consumes the approved child and makes no
-  registry contact. The record still holds only the digest (#392), so a bare
+- **The digest is also a project approval.** The default tier participates in
+  the same [project-scoped approval](#project-scoped-approval-of-oci-image-content)
+  as every other source: once pinned, a launch consumes the approved child and
+  makes no registry contact. The record still holds only the digest (#392), so a bare
   `image refresh` reacquires it rather than following a tag.
 - **The digest must resolve.** A retained digest whose content is unavailable
   (registry gone, content deleted) fails the launch with the same error a
@@ -544,7 +842,7 @@ registry serves now*: after a cache loss a `:latest` launch may fetch different
 bytes than before. A digest names exact content. That is why the retained record
 and the initial recommendation are digest-pinned, and why the launcher never
 polls a tag: a launch makes no registry contact beyond acquiring what an
-[approval](#host-wide-approval-of-oci-image-content) already names, and
+[approval](#project-scoped-approval-of-oci-image-content) already names, and
 checking for movement is the explicit `agent-vm image refresh` operation's job.
 
 **Observing and recovering.** `agent-vm doctor` prints a fixed label —
@@ -773,8 +1071,8 @@ Docker or imports automatically, except the explicit
 [launch build](#launch-builds---dockerfile).
 
 Neither verb writes configuration or a retained default, adopts a default,
-boots a guest or installs runtime tools. Each records exactly one host approval,
-for its own result reference, after the publication succeeds — nothing else
+boots a guest or installs runtime tools. Each records exactly one approval, for
+its own result reference in the invoking project, after the publication succeeds — nothing else
 outside the cache (#391). The one documented exception is the store's own
 journal recovery: any explicit image write, this one included, first completes a
 retained-default intent an interrupted run left behind (#390), which restores or

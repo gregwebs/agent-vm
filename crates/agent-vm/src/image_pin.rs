@@ -1,7 +1,10 @@
-//! Host-wide OCI approval authority. Cache evidence is never approval.
+//! Project-scoped OCI approval authority. Cache evidence is never approval.
 //!
-//! One selection key — the canonical OCI reference plus the host Linux platform
-//! — maps to the approved native manifest content. Everything a launch or a
+//! One selection key — a project, the canonical OCI reference and the host
+//! Linux platform — maps to the approved native manifest content. The project is
+//! the command's captured working directory (see [`crate::project`]), so an
+//! approval made in one project never changes what another project boots, while
+//! cached bytes stay shared. Everything a launch or a
 //! setup boots from a registry goes through [`prepare_selected`], every
 //! deliberate re-resolution goes through [`update`], and an explicit
 //! build/import approves its own published result through [`approve_published`]
@@ -52,6 +55,7 @@ use crate::image_acquire::{
     PreparedNativeImage, ValidatedImage,
 };
 pub(crate) use crate::image_acquire::{CanonicalOciReference, ValidatedDigest as ManifestDigest};
+use crate::project::ProjectDir;
 
 mod approval;
 mod publication;
@@ -140,18 +144,60 @@ impl HostLinuxPlatform {
     }
 }
 
+/// The approval scope of one project: the lowercase hex SHA-256 of its captured
+/// directory. Only [`ProjectId::of`] and `parse` construct one, so a stored
+/// record can never name a scope this module would not produce.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ProjectId(String);
+
+impl ProjectId {
+    pub(crate) fn of(project: &ProjectDir) -> Self {
+        Self(project.digest_hex())
+    }
+
+    /// Store decoding only; the caller maps `Err` to its damaged-store error.
+    fn parse(stored: &str) -> std::result::Result<Self, ()> {
+        project_id_bytes_are_acceptable(stored)
+            .then(|| Self(stored.to_owned()))
+            .ok_or(())
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[cfg(test)]
+    fn for_tests(fill: char) -> Self {
+        Self(fill.to_string().repeat(64))
+    }
+}
+
+/// The measured half of [`project_id_is_acceptable`] for one stored spelling,
+/// shared by the store decoder and by a record's field facts so both read the
+/// same bytes the same way.
+pub(crate) fn project_id_bytes_are_acceptable(stored: &str) -> bool {
+    project_id_is_acceptable(
+        stored.len(),
+        stored
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+    )
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct PinKey {
+    project: ProjectId,
     reference: CanonicalOciReference,
     platform: HostLinuxPlatform,
 }
 
 impl PinKey {
-    pub(crate) fn new(target: &OciTarget) -> Result<Self> {
+    pub(crate) fn new(project: &ProjectId, target: &OciTarget) -> Result<Self> {
         if !source_within_limit(target.canonical().whole().len()) {
             return Err(anyhow!("image pin source exceeds the size limit"));
         }
         Ok(Self {
+            project: project.clone(),
             reference: target.canonical().clone(),
             platform: HostLinuxPlatform::host(),
         })
@@ -204,11 +250,11 @@ pub(crate) struct ValidatedCandidate {
 }
 
 impl ValidatedCandidate {
-    pub(crate) fn from_image(image: &ValidatedImage) -> Result<Self> {
+    pub(crate) fn from_image(image: &ValidatedImage, project: &ProjectId) -> Result<Self> {
         let target = OciTarget::parse(&image.source().whole())
             .map_err(|_| anyhow!("validated image source is unusable"))?;
         Ok(Self {
-            key: PinKey::new(&target)?,
+            key: PinKey::new(project, &target)?,
             digest: image.acquired_digest().clone(),
             identity: image.content_identity(),
         })
@@ -330,7 +376,7 @@ impl UpdateOutcome {
     }
 }
 
-/// What one transaction did to the host approval for the operated key.
+/// What one transaction did to the project's approval for the operated key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ApprovalChange {
     /// The first approval for this key.
@@ -458,7 +504,7 @@ impl PreparedSelection {
     }
 }
 
-/// The one ordinary preparation for a launch and a setup.
+/// The one ordinary preparation for a launch and a setup, scoped to `project`.
 ///
 /// A local path short-circuits with its original text. An existing approval is
 /// consumed as `repo@approved child` and never re-resolved from its tag. An
@@ -467,7 +513,10 @@ impl PreparedSelection {
 /// returned. A concurrent different candidate is never overwritten: this
 /// preparation revalidates the winner's frozen digest and uses it, or fails
 /// before create.
-pub(crate) async fn prepare_selected(boot: &BootImage) -> Result<PreparedSelection> {
+pub(crate) async fn prepare_selected(
+    boot: &BootImage,
+    project: &ProjectDir,
+) -> Result<PreparedSelection> {
     // A launch build has no approval to consume, and treating its internal tag as
     // an OCI source here would first-pin it and turn on `IfMissing` + `.insecure()`
     // for that name — the exposure `prepare_unpinned` exists to prevent.
@@ -493,7 +542,9 @@ pub(crate) async fn prepare_selected(boot: &BootImage) -> Result<PreparedSelecti
     // The store key is the **selected** target's canonical text, never the
     // approved digest: a tag keeps one display entry across refreshes (R15).
     let selection = target.canonical().whole();
-    let key = PinKey::new(&target)?;
+    // After the local-path return: a local rootfs/disk never derives a project
+    // identifier, and its launch never touches the store (R11).
+    let key = PinKey::new(&ProjectId::of(project), &target)?;
     let current = lookup(&key)?;
     let Some(current) = current else {
         return prepare_first_pin(boot, &target, &key, &selection, &label).await;
@@ -527,7 +578,7 @@ async fn prepare_first_pin(
         AcquireMode::CachedOrAcquire,
     )
     .await?;
-    let candidate = ValidatedCandidate::from_image(prepared.image())?;
+    let candidate = ValidatedCandidate::from_image(prepared.image(), &key.project)?;
     store::candidate_ready()?;
     let action = adoption(boot)?;
     match commit(&candidate, &Approval::initial(&candidate), action) {
@@ -616,7 +667,8 @@ fn retain_default(boot: &BootImage, pin: &ApprovedPin) -> Result<()> {
     Ok(())
 }
 
-/// One explicit re-resolution plus the candidate-scoped approval it needs.
+/// One explicit re-resolution plus the candidate-scoped approval it needs, in
+/// `project`.
 ///
 /// The source is resolved exactly once. The frozen candidate is revalidated
 /// under a fresh shared barrier after any human wait, and the host transaction
@@ -625,10 +677,11 @@ fn retain_default(boot: &BootImage, pin: &ApprovedPin) -> Result<()> {
 /// acquisition leaves the previous approval and default logically unchanged.
 pub(crate) async fn update(
     operation: ExplicitOperation<'_>,
+    project: &ProjectDir,
     mode: ApprovalMode,
 ) -> Result<UpdateOutcome> {
     let plan = Plan::resolve(operation)?;
-    let key = PinKey::new(&plan.target)?;
+    let key = PinKey::new(&ProjectId::of(project), &plan.target)?;
     let current = lookup(&key)?;
     if !matches!(plan.default_action, DefaultAction::None) {
         // A damaged fallback is a hard error before any registry request: a
@@ -642,7 +695,7 @@ pub(crate) async fn update(
         AcquireMode::ResolveCurrent,
     )
     .await?;
-    let candidate = ValidatedCandidate::from_image(prepared.image())?;
+    let candidate = ValidatedCandidate::from_image(prepared.image(), &key.project)?;
     store::candidate_ready()?;
     let approval = match &current {
         None => Approval::initial(&candidate),
@@ -889,6 +942,7 @@ fn commit(
 /// and the launch cannot disagree about which content is meant.
 pub(crate) fn cached_request_labels(
     boot: &BootImage,
+    project: Option<&ProjectDir>,
     cache_dir: &std::path::Path,
 ) -> crate::image_requests::CachedLabels {
     use crate::image_acquire::CachedLabelsRead;
@@ -896,7 +950,13 @@ pub(crate) fn cached_request_labels(
     let parse_reference = |text: &str| text.parse::<microsandbox_image::Reference>().ok();
     match OciTarget::parse(boot.reference().as_str()) {
         Ok(target) => {
-            let key = match PinKey::new(&target) {
+            // No captured project means this diagnostic cannot name which
+            // project's approval a launch would consume, and a launch would
+            // fail before reaching the store at all.
+            let Some(project) = project else {
+                return CachedLabels::ApprovalUnreadable;
+            };
+            let key = match PinKey::new(&ProjectId::of(project), &target) {
                 Ok(key) => key,
                 Err(_) => return CachedLabels::Unreadable,
             };
@@ -941,6 +1001,7 @@ macro_rules! redacted_debug {
 }
 redacted_debug!(
     HostLinuxPlatform,
+    ProjectId,
     PinKey,
     ApprovedPin,
     ValidatedCandidate,
@@ -1019,9 +1080,15 @@ struct JournalFacts {
 fn journal_pair_is_acceptable(facts: JournalFacts) -> (ok: bool)
     ensures ok == (facts.previous_matches || facts.proposed_matches),
 { facts.previous_matches || facts.proposed_matches }
+/// A project identifier is exactly a lowercase hex SHA-256: 64 characters,
+/// which is what the store decoder admits and what [`ProjectId::of`] produces.
+fn project_id_is_acceptable(bytes: usize, lowercase_hex: bool) -> (ok: bool)
+    ensures ok == (bytes == 64 && lowercase_hex),
+{ bytes == 64 && lowercase_hex }
 /// One record's measured field facts, named so a swap cannot silently accept a
 /// pin file it should refuse.
 struct PinFieldFacts {
+    project: bool,
     source_bounded: bool,
     canonical: bool,
     platform: bool,
@@ -1030,13 +1097,13 @@ struct PinFieldFacts {
 }
 
 fn pin_fields_are_acceptable(facts: PinFieldFacts) -> (ok: bool)
-    ensures ok == (facts.source_bounded && facts.canonical && facts.platform && facts.revision && facts.digest),
-{ facts.source_bounded && facts.canonical && facts.platform && facts.revision && facts.digest }
+    ensures ok == (facts.project && facts.source_bounded && facts.canonical && facts.platform && facts.revision && facts.digest),
+{ facts.project && facts.source_bounded && facts.canonical && facts.platform && facts.revision && facts.digest }
 /// The top-level schema facts. Field validity is each record's own decision, so
 /// it is not a second, always-true argument here.
 fn schema_is_acceptable(version: u32, keys_unique: bool) -> (ok: bool)
-    ensures ok == (version == 1 && keys_unique),
-{ version == 1 && keys_unique }
+    ensures ok == (version == 2 && keys_unique),
+{ version == 2 && keys_unique }
 /// The measured facts of an approval-equivalence comparison. Named fields rather
 /// than adjacent booleans, so an argument swap cannot invert the decision.
 struct ContentFacts {
@@ -1053,6 +1120,7 @@ fn content_is_equivalent(facts: ContentFacts) -> (ok: bool)
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
@@ -1113,23 +1181,32 @@ mod tests {
                 bits & 3 == 3
             );
         }
-        for bits in 0u8..32 {
+        for bits in 0u8..64 {
             assert_eq!(
                 pin_fields_are_acceptable(PinFieldFacts {
-                    source_bounded: bits & 1 != 0,
-                    canonical: bits & 2 != 0,
-                    platform: bits & 4 != 0,
-                    revision: bits & 8 != 0,
-                    digest: bits & 16 != 0,
+                    project: bits & 1 != 0,
+                    source_bounded: bits & 2 != 0,
+                    canonical: bits & 4 != 0,
+                    platform: bits & 8 != 0,
+                    revision: bits & 16 != 0,
+                    digest: bits & 32 != 0,
                 }),
-                bits == 31
+                bits == 63
             );
         }
-        for version in [0, 1, 2, u32::MAX] {
+        for version in [0, 1, 2, 3, u32::MAX] {
             for unique in [false, true] {
                 assert_eq!(
                     schema_is_acceptable(version, unique),
-                    version == 1 && unique
+                    version == 2 && unique
+                );
+            }
+        }
+        for bytes in [0, 63, 64, 65] {
+            for lowercase_hex in [false, true] {
+                assert_eq!(
+                    project_id_is_acceptable(bytes, lowercase_hex),
+                    bytes == 64 && lowercase_hex
                 );
             }
         }
@@ -1152,7 +1229,7 @@ mod tests {
     #[test]
     fn host_linux_and_redacted_debug() {
         let target = OciTarget::parse("private.example/team/secret:tag").unwrap();
-        let key = PinKey::new(&target).unwrap();
+        let key = PinKey::new(&ProjectId::for_tests('a'), &target).unwrap();
         assert_eq!(key.platform.os, "linux");
         assert_eq!(key.platform.variant, None);
         assert!(key.platform.valid());
@@ -1169,6 +1246,24 @@ mod tests {
                 .digest()
                 .is_some()
         );
+    }
+
+    /// Session state and approval authority are two consumers of ONE captured
+    /// project. If they derived it independently they could disagree after an
+    /// external rename, and one command would write two projects' records.
+    #[test]
+    fn session_and_pins_derive_from_one_capture() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("project");
+        std::fs::create_dir(&dir).unwrap();
+        let project =
+            ProjectDir::from_path_for_tests(&dir).expect("canonicalize the fixture project");
+        let session = crate::session::ProjectSession::for_project(&project)
+            .expect("a project with HOME set has a session");
+        let id = ProjectId::of(&project);
+        assert_eq!(session.project_dir, project.path());
+        assert_eq!(session.project_hash, id.as_str()[..12]);
+        assert_eq!(id.as_str().len(), 64);
     }
 
     #[test]
@@ -1188,7 +1283,9 @@ mod tests {
             ImageRef::from_config("agent-vm.invalid/dockerfile/abc:latest").unwrap(),
             std::path::PathBuf::from("Dockerfile"),
         );
-        let error = prepare_selected(&boot).await.unwrap_err();
+        let project = ProjectDir::from_path_for_tests(std::env::current_dir().unwrap().as_path())
+            .expect("canonicalize the test cwd");
+        let error = prepare_selected(&boot, &project).await.unwrap_err();
         assert_eq!(
             error.to_string(),
             "internal error: a launch build is prepared by prepare_unpinned, never by pinning"

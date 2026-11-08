@@ -62,7 +62,8 @@ crates/agent-vm/src/
 ├── boot_image.rs           # the one boot-image selection seam (CLI/env/config/default)
 │   ├── default_selection.rs#   journal-aware logical default read (bounded shared lock)
 │   └── upgrade.rs          #   set-default command shape: explicit typed target
-├── image_pin.rs            # host-wide OCI approval: prepare before create, explicit update
+├── project.rs              # the one project capture (canonical cwd → session + approval scope)
+├── image_pin.rs            # project-scoped OCI approval: prepare before create, explicit update
 │   ├── store.rs            #   strict HOME pin store, CAS kernel, journaled default transaction
 │   └── approval.rs         #   candidate-scoped terminal consent (--yes or a real TTY)
 ├── image_acquire.rs        # shared boot-free acquisition: canonical target, validated token, barrier
@@ -1103,7 +1104,7 @@ selected image verbatim (see
    ▼                                                           │  with pin: consume child    guest
 $HOME/.config/agent-vm/default-image.json ◄───────────────────┴─ (default-tier first pin only,
    (digest-only fallback, #392)                                    after acquisition success)
-$HOME/.config/agent-vm/image-pins.json ◄────────────────────────── host approval, every OCI source
+$HOME/.config/agent-vm/image-pins.json ◄───────────── project approval, every OCI source
 $HOME/.config/agent-vm/image-pins.lock
 ```
 
@@ -1117,15 +1118,17 @@ and it happens for every successful default-tier preparation — not only a firs
 pin — while staying write-once, so an existing record is never moved by a launch.
 
 **Approval is not cache evidence either.** Every OCI selection — from any tier —
-is keyed by its canonical reference plus the host Linux platform in
+is keyed by **`(project, canonical reference, host Linux platform)`** in
 `image-pins.json`. A launch or setup consumes the approved host child and never
 resolves the selected tag; only `image refresh` and `image set-default`
 re-resolve and ask, and `image build`/`image import` approve the result reference
-they just published without asking (#391). The store is host-wide (projects and
-state roots share it)
-and holds no cache path, timestamp or launcher version: deleting the cache
-reacquires the approved digest, and deleting the store is a deliberate approval
-reset. Local rootfs/disk launches bypass this path with their text unchanged.
+they just published without asking (#391). The *file* is host-managed and shared
+by every project, but each record is scoped to the **project** the command
+captured, so one project's approval is never another's. Neither the state root
+nor the cache is a scope: the store holds no cache path, timestamp or launcher
+version; deleting the cache reacquires the approved digest, and deleting the
+store is a deliberate approval reset. Local rootfs/disk launches bypass this path
+with their text unchanged.
 `agent-vm image show` is the one *disclosure* edge: it returns the selected
 source and its provenance from the same selector (and the same single
 journal-aware default observation), before runtime discovery, and creates or
@@ -1169,7 +1172,7 @@ logical default (idempotently) before doing its own work. Readers never recover,
 clear or write: they observe the old logical state. No fsync/power-loss guarantee
 is claimed, and older binaries do not participate in the journal. Old cache
 artifacts and active sessions are never removed by set-default. See
-[USAGE](USAGE.md#host-wide-approval-of-oci-image-content) for the operational details.
+[USAGE](USAGE.md#project-scoped-approval-of-oci-image-content) for the operational details.
 
 `image refresh` acquires without launching or replacing a retained record;
 only a successful default-tier acquisition may initialize an absent record:
@@ -1286,29 +1289,43 @@ cannot account for. The rendered text names only cache-side recovery (restore th
 image cache from a backup, or remove the receipt and re-acquire) and never
 suggests deleting HOME approval records, a store acquisition does not touch.
 
-### Host-wide approval: store, candidate and journal
+### Project-scoped approval: store, candidate and journal
 
 `image_pin` is the only module that answers "may this content be consumed?".
 It owns two small HOME files, separate from the retained-default record:
 
 ```json
-{"version":1,
- "pins":[{"reference":"docker.io/library/alpine:latest",
+{"version":2,
+ "pins":[{"project":"<64 hex>",
+           "reference":"docker.io/library/alpine:latest",
            "platform":{"os":"linux","architecture":"arm64","variant":null},
            "manifest_digest":"sha256:<64 hex>","revision":1}],
  "pending_default":null}
 ```
 
-`image-pins.json` is strict version-1 JSON: unknown, duplicate or missing fields,
-duplicate canonical keys, unsupported versions, invalid/zero/overflow revisions,
+`image-pins.json` is strict version-2 JSON: unknown, duplicate or missing fields,
+duplicate (project, reference, platform) keys, unsupported versions, a `project`
+that is not 64 lowercase hex characters, invalid/zero/overflow revisions,
 non-canonical spellings, non-regular/symlink/oversized files and trailing bytes
 are closed corruption errors. Only `ENOENT` means "absent". Bounds are 4 MiB,
-4096 pins and 4096 source bytes, checked on read and before every write.
-`image-pins.lock` is a stable private flock: a bounded shared snapshot for
-lookups, one exclusive read-modify-write for a commit. A missing lock beside a
-store is damage, not absence; a lock without a store is a valid first-writer
+4096 pins and 4096 source bytes, checked on read and before every write; reaching
+_either_ growth limit at commit — records or bytes — is a *full* store, not
+damage, because the file on disk is still well-formed. A version-1 store is
+recognized by a lenient version probe and refused with its own error naming the
+USAGE upgrade section: it is never read, rewritten, moved or recovered, and no
+approval-authority file is created first. `image-pins.lock` is a stable private
+flock: a bounded shared snapshot for lookups, one exclusive read-modify-write for
+a commit. A missing lock beside a store of either version is damage on both the
+observation and the mutation path; a lock without a store is a valid first-writer
 state. Platform entries for a foreign architecture are preserved verbatim but
 never borrowed as native approval.
+
+**The project column comes from one capture.** `project.rs` canonicalizes the
+command's working directory once, at its entry point, and every consumer borrows
+that `ProjectDir`: session state takes its 12-hex prefix, approvals take the full
+digest as `ProjectId`. A second capture is a visible edit, because
+`ProjectDir::capture` is a clippy `disallowed-methods` entry allowed only at the
+eight entry points.
 
 **Candidate-scoped consent.** `ValidatedCandidate` can only be minted from a
 complete native acquisition; `Approval` binds that candidate's digest and the
@@ -1368,7 +1385,9 @@ path>:latest` — then reads that reference back cache-only and boots
 nothing is written to the pin store, and the SDK create for it uses
 `PullPolicy::Never`, so the internal name is never resolved as a registry. See
 [ADR-0047](docs/adr/0047-host-wide-oci-image-approval.md) for the decision and
-its rejected alternatives.
+its rejected alternatives, and
+[ADR-0063](docs/adr/0063-project-scoped-oci-image-approval.md) for the project
+scope that amends it.
 
 ### Same-cache publication barrier and reference guards
 
@@ -2006,6 +2025,7 @@ directories the user never asked for. The state-root precedence is in
 | Pi reaches host Codex through an image-owned provider | [ADR-0044](docs/adr/0044-pi-reaches-host-codex-through-an-image-owned-provider.md) |
 | Verified user config mounts | [ADR-0046](docs/adr/0046-verified-user-config-mounts.md) |
 | Host-wide OCI image approval and pinned consumption (#390) | [ADR-0047](docs/adr/0047-host-wide-oci-image-approval.md) |
+| Project-scoped OCI image approval (amends ADR-0047) | [ADR-0063](docs/adr/0063-project-scoped-oci-image-approval.md) |
 | Named mount sets and tier-local tool references (#395–#397) | [ADR-0048](docs/adr/0048-named-mount-sets-and-tier-local-tool-references.md) |
 | One dialect rule for a printed command (#434) | [ADR-0049](docs/adr/0049-one-dialect-rule-for-printed-commands.md) |
 | One rule for a relative state root (#437) | [ADR-0050](docs/adr/0050-one-rule-for-a-relative-state-root.md) |

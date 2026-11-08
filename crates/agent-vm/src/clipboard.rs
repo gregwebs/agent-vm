@@ -20,6 +20,7 @@ use anyhow::{Context, Result};
 use clap::{Args as ClapArgs, Subcommand};
 
 use crate::host_paths::atomic_write;
+use crate::project::ProjectDir;
 use crate::session::ProjectSession;
 
 #[derive(ClapArgs)]
@@ -48,7 +49,9 @@ enum Op {
 }
 
 pub fn run(args: Args) -> Result<()> {
-    let session = ProjectSession::for_cwd()?;
+    #[allow(clippy::disallowed_methods)] // one capture per command: every consumer borrows it.
+    let project = ProjectDir::capture()?;
+    let session = ProjectSession::for_project(&project)?;
     // Clipboard runs inside the guest, with the project config present but no
     // launch catalog in hand; the compiled-in link list is enough for the state
     // dirs it needs.
