@@ -1,8 +1,22 @@
 name: CI
 
+# A same-repo branch push fires *both* `push` and `pull_request` while a PR is
+# open, so an ungated `push` runs every job twice for one commit. `push` is
+# gated to `main` (landed commits) and to the `ci/` scratch prefix
+# (pre-PR branches), while `pull_request` covers every branch under review. See
+# CONTRIBUTING.md — *CI on a branch*.
 on:
   push:
+    branches: ["main", "ci/**"]
   pull_request:
+  workflow_dispatch:
+
+# Everything except a `main` push is superseded by a newer run: re-pushing to a
+# PR or to a `ci/` scratch branch cancels the run for the commit it replaced.
+# `main` pushes are left to finish, so each landed commit keeps its own run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
