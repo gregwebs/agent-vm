@@ -140,7 +140,11 @@ A launch is one pass, and the ordering is load-bearing:
 4. Still inside `run::launch`, in order: image selection, the network plan,
    the launch's mount selection (`mount_selection::select`: the verified user
    config's `mounts` defaults unless `--no-config-mounts`, then argv `--mount`,
-   whose bare names select a user `[mount_sets]` entry) and
+   whose bare names select a user `[mount_sets]` entry),
+   `git_metadata::discover` (the automatic Git metadata mounts for a linked
+   worktree at the launch directory; it reads `.git`, `commondir` and two `HEAD`s
+   and writes nothing, so it stays on the near side of the fork boundary —
+   [ADR-0062](docs/adr/0062-automatic-git-metadata-mounts.md)) and
    `mount::prepare` (which owns the side-effect-free topology rejection and the
    persisted guest-HOME collision, and publishes forks only after both pass),
    the guest-HOME links and the root-mode decision; `session` derives the project
@@ -317,11 +321,13 @@ table.
 
 ### Extra and forked mounts: `ro`, `rw`, `fork`, `follow-links`
 
-**Three declaration inputs, one seam.** `--mount` is not the only way a launch
+**Four declaration inputs, one seam.** `--mount` is not the only way a launch
 can ask for a mount: a verified user config's top-level `mounts` selects
-[mounts for every launch](docs/adr/0046-verified-user-config-mounts.md), and its
+[mounts for every launch](docs/adr/0046-verified-user-config-mounts.md), its
 `[mount_sets]` table names reusable lists that either input may select by name
-([ADR-0048](docs/adr/0048-named-mount-sets-and-tier-local-tool-references.md)).
+([ADR-0048](docs/adr/0048-named-mount-sets-and-tier-local-tool-references.md)),
+and a linked worktree at the launch directory contributes its Git metadata
+directly ([ADR-0062](docs/adr/0062-automatic-git-metadata-mounts.md)).
 `mount_selection::select` is the only place that decides *which sources* one
 launch requests — the user config's defaults unless `--no-config-mounts`, then
 argv in order, each entry classified as a path or an exact set name — and it does
@@ -334,6 +340,21 @@ their origin, applies one claim rule (identical declarations at one guest path
 merge; different ones are refused, config-versus-CLI included), and runs the same
 protections and topology checks. Nothing downstream can tell a config
 declaration from a CLI one except the origin string in a diagnostic.
+
+**The fourth input is appended, not selected.** `git_metadata::discover` runs
+after `mount_selection::select` and its requests are appended to the argv ones, so
+an equivalent explicit or config declaration is the *first* seen and keeps its
+own origin; the automatic bind then merges into it. Automatic binds are also left
+out of `repo_scan_roots`, so `--git-mount` cannot widen the GitHub allow-list.
+
+**Appended means "never outranks", not merely "later".** The runtime mounts a
+parent before its child, so an automatic bind below a declaration the user wrote
+would decide the access for part of that route — which is why discovery reads the
+selected declarations too. It merges when the declaration is a plain live bind of
+the same host directory, and refuses before boot otherwise; `claim` cannot see
+either case, because the two guest paths differ. The same rule gives the metadata a
+third outcome besides "bound" and "inside the project bind": reachable through
+someone else's route, which the launch notice says in those words.
 
 **Sets are validated as a graph, not resolved at launch.** `config_mounts::sets`
 parses the table, binds every reference by exact name (forward references

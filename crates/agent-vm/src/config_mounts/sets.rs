@@ -2024,9 +2024,10 @@ mod tests {
                 MountOrigin::UserConfig { index, .. }
                 | MountOrigin::UserSet { index, .. }
                 | MountOrigin::UserTool { index, .. } => *index,
-                // Neither route in this test tags anything `Cli`; naming it keeps
-                // the match exhaustive rather than adding a catch-all.
-                MountOrigin::Cli => usize::MAX,
+                // Neither route in this test tags anything `Cli` or automatic;
+                // naming them keeps the match exhaustive rather than adding a
+                // catch-all.
+                MountOrigin::Cli | MountOrigin::GitMetadata { .. } => usize::MAX,
             })
             .collect()
     }

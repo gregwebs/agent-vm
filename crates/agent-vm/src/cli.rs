@@ -2482,6 +2482,95 @@ mod tests {
         );
     }
 
+    /// `--git-mount` borrows the launch-option route exactly like
+    /// `--no-config-mounts`: the route walker's table carries it, every verb that
+    /// takes launch options accepts it, a direct command still sees its own
+    /// program, and the same token after the verb is the tool's argument.
+    #[test]
+    fn git_mount_is_a_launch_option_before_the_verb() {
+        let _env = clear_launch_env();
+        use crate::git_metadata::GitMountMode;
+
+        for tokens in [
+            vec!["agent-vm", "--git-mount=rw", "shell"],
+            vec!["agent-vm", "--git-mount", "rw", "shell"],
+            vec!["agent-vm", "--git-mount=rw", "run", "probe"],
+            vec!["agent-vm", "--git-mount", "rw", "--", "probe"],
+            vec!["agent-vm", "--git-mount", "rw", "mytool"],
+        ] {
+            let Dispatch::Launch { args, target, .. } =
+                parse_from(argv_of(&tokens), Ok(report_from(MYTOOL))).unwrap()
+            else {
+                panic!("expected a launch: {tokens:?}")
+            };
+            assert_eq!(args.git_mount_mode(), GitMountMode::ReadWrite, "{tokens:?}");
+            // Launcher-side only: a direct command's program and argv are
+            // untouched by the mode.
+            if target.is_direct() {
+                let (_, invocation) = target.into_parts();
+                assert_eq!(invocation.program(), "probe", "{tokens:?}");
+                assert!(invocation.argv().is_empty(), "{tokens:?}");
+            }
+        }
+
+        // After the verb it is the tool's own argument, so the launch keeps the
+        // default: write access is never inferred from a forwarded token.
+        let (args, tool_args) = launch_of(
+            parse_from(
+                ["agent-vm", "mytool", "--git-mount=off"],
+                Ok(report_from(MYTOOL)),
+            )
+            .unwrap(),
+        );
+        assert_eq!(args.git_mount_mode(), GitMountMode::ReadOnly);
+        assert_eq!(tool_args, ["--git-mount=off"]);
+
+        // `off` is spelled the same way wherever launch options go.
+        let (args, tool_args) = launch_of(
+            parse_from(
+                ["agent-vm", "--git-mount=off", "mytool"],
+                Ok(report_from(MYTOOL)),
+            )
+            .unwrap(),
+        );
+        assert_eq!(args.git_mount_mode(), GitMountMode::Off);
+        assert!(tool_args.is_empty());
+
+        // The default is `ro`, so a launch that never mentions the flag is
+        // read-only rather than writable.
+        let (args, _) =
+            launch_of(parse_from(["agent-vm", "mytool"], Ok(report_from(MYTOOL))).unwrap());
+        assert_eq!(args.git_mount_mode(), GitMountMode::ReadOnly);
+
+        // Before a built-in it is a launch option used where built-ins take none,
+        // so clap's own rejection names it.
+        let error = usage_error(parse_from(
+            ["agent-vm", "--git-mount=rw", "doctor"],
+            Ok(report_from(MYTOOL)),
+        ));
+        assert_eq!(error.exit_code(), 2);
+        assert!(
+            error
+                .to_string()
+                .contains("the launch option '--git-mount' cannot be used with 'doctor'"),
+            "{error}"
+        );
+
+        // A mode outside the grammar is a usage error that lists the accepted
+        // ones, so a typo never silently becomes the default. A direct route is
+        // asked here because only those return clap's error to the caller instead
+        // of rendering it (`parse_from`'s route policy).
+        let error = usage_error(parse_from(
+            ["agent-vm", "--git-mount=maybe", "--", "p"],
+            Ok(report_from(MYTOOL)),
+        ));
+        assert_eq!(error.exit_code(), 2);
+        let rendered = error.to_string();
+        for value in ["ro", "rw", "off"] {
+            assert!(rendered.contains(value), "missing {value} in: {rendered}");
+        }
+    }
+
     // -- Direct terminal options (issue #400) ----------------------------
 
     /// The launch options (not the target) of a dispatch, so a test can assert
@@ -4228,6 +4317,7 @@ mod tests {
                 ),
                 ("mount".to_string(), None, OptionShape::RequiredValue),
                 ("no-config-mounts".to_string(), None, OptionShape::Flag),
+                ("git-mount".to_string(), None, OptionShape::RequiredValue),
                 // The direct terminal controls are ordinary flags derived by the
                 // same walker: no value, no second parser (issue #400).
                 ("tty".to_string(), Some('t'), OptionShape::Flag),
@@ -4262,6 +4352,8 @@ mod tests {
             vec!["agent-vm", "-p", "1:2"],
             vec!["agent-vm", "--allow-lan", "--allow-host=true"],
             vec!["agent-vm", "--image", "x", "--recipe-dir", "y"],
+            vec!["agent-vm", "--git-mount", "rw"],
+            vec!["agent-vm", "--git-mount=off"],
         ] {
             let accepted = launch_prefix_error(&argv_of(&tokens)).is_none();
             if tokens.contains(&"--recipe-dir") {

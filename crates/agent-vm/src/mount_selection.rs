@@ -266,6 +266,15 @@ fn explicit_set(user: Option<&UserMounts>, name: &MountSetName) -> Result<Resolv
 }
 
 impl Selection {
+    /// The declarations as selected, borrowed before `prepare` consumes them.
+    ///
+    /// `git_metadata::discover` runs between selection and preparation and must
+    /// see them: an automatic bind that lands inside one of these routes would
+    /// otherwise silently outrank it (ADR-0062 D5).
+    pub(crate) fn requests(&self) -> &[MountRequest] {
+        self.requests.as_slice()
+    }
+
     /// Hand the declarations to `prepare`. Fallible-free because selection has
     /// already done everything but I/O.
     pub(crate) fn take_requests(&mut self) -> MountRequests {

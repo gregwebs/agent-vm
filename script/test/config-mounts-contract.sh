@@ -447,6 +447,171 @@ if run_tool_probe "$toolroot" "$forkhome" tool-unknown >/dev/null 2>&1; then
 fi
 echo 'tool-mount probe controls passed (rows, positive/negative controls, fork-read and sentinel mismatches; no VM)'
 
+# --- Automatic Git metadata probe rows (#535, ADR-0062) ---------------------
+# Host-only controls, never native evidence: the probe's own statements run
+# against a real linked worktree on this filesystem, including the controls a
+# probe which always answers the same way cannot pass. No VM is booted.
+GM_PROBE="$FIXTURES/guest-gm-probe.sh"
+gm="$work/gm"
+mkdir -p "$gm/home" "$gm/main" "$gm/wt"
+# Every `git` call goes through an environment built from scratch, so a
+# developer's `GIT_DIR`, `GIT_COMMON_DIR` or `worktree.useRelativePaths` cannot
+# change the pointer these rows are about.
+gm_git() {
+    local directory="$1"
+    shift
+    ( cd "$directory" &&
+        env -i PATH="$PATH" HOME="$gm/home" \
+            GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+            git -c init.defaultBranch=main -c commit.gpgsign=false \
+                -c core.hooksPath=/dev/null -c protocol.file.allow=always "$@" )
+}
+gm_git "$gm/main" init -q
+for pair in 'user.name gm' 'user.email gm@example.invalid' 'commit.gpgsign false' \
+    'tag.gpgsign false' 'core.hooksPath /dev/null'; do
+    # shellcheck disable=SC2086 # the pair is two words on purpose.
+    gm_git "$gm/main" config $pair
+done
+printf 'seed\n' > "$gm/main/tracked.txt"
+gm_git "$gm/main" add tracked.txt
+gm_git "$gm/main" commit -q -m seed
+gm_git "$gm/main" worktree add -q "$gm/wt" -b gm
+common="$(cd "$gm/main/.git" && pwd -P)"
+cp "$GM_PROBE" "$gm/wt/guest-gm-probe.sh"
+
+gm_probe_at() {
+    local directory="$1" phase="$2" metadata="$3"
+    shift 3
+    # The same allow-list `gm_git` uses, and for the same reason: this runs with
+    # the caller's environment and HOME, and the `rw` phase commits. Git hooks
+    # export `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`, so an inherited one would
+    # let this control commit into the *developer's* repository instead of the
+    # fixture. Measured below by the hostile-environment control.
+    ( cd "$directory" &&
+        env -i PATH="$PATH" HOME="$gm/home" \
+            GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+            bash ./guest-gm-probe.sh "$phase" "$metadata" "$@" )
+}
+
+# The seed commit the `ro` row reads as `log -1`.
+seed_oid="$(gm_git "$gm/main" rev-parse main)"
+
+# Positive control for the row itself: the fixture commits, which is what a spent
+# boot would otherwise be the first to discover. Identity, signing and hooks are
+# repo-local *and* command-scoped, so nothing depends on this host's gitconfig.
+out="$(gm_probe_at "$gm/wt" rw "$common")"
+[[ "$out" =~ ^GM-N2\ commit=[0-9a-f]{40}$ ]] ||
+    fail "GM-N2 control could not commit in the fixture: $out"
+oid="${out#GM-N2 commit=}"
+[[ "$(gm_git "$gm/main" rev-parse gm)" == "$oid" ]] ||
+    fail 'GM-N2 control: the host branch did not move to the guest object id'
+gm_git "$gm/main" cat-file -e "$oid" ||
+    fail 'GM-N2 control: the host cannot read the object the guest created'
+
+# Put the guest's branch back on the seed commit, so the `ro` row below reads the
+# same subject the native row expects. The worktree's edited file stays edited,
+# which is what `diff=tracked.txt` is about.
+gm_git "$gm/main" update-ref refs/heads/gm "$seed_oid"
+
+# The read-only row on a *writable* tree is the negative control: the same
+# relative write through the metadata path is allowed here, so a `denied` in the
+# native row cannot come from the probe's own wording.
+out="$(gm_probe_at "$gm/wt" ro "$common")"
+[[ "$out" == 'GM-N1 log=seed diff=tracked.txt write=allowed add=allowed' ]] ||
+    fail "GM-N1 negative control (writable tree) did not report allowed write and add: $out"
+
+# Positive control on a tree the host made unwritable. Both halves — the object
+# write and the index write — must be denied, which is what the native row's
+# expected line asserts.
+if [[ "$is_root" == true ]]; then
+    echo 'NOT RUN GM-N1 read-only control: running as root, mode 0555 does not deny writes'
+else
+    chmod -R a-w "$gm/main/.git"
+    out="$(gm_probe_at "$gm/wt" ro "$common")"
+    chmod -R u+w "$gm/main/.git"
+    [[ "$out" == 'GM-N1 log=seed diff=tracked.txt write=denied add=denied' ]] ||
+        fail "GM-N1 positive control (a-w tree) did not report denied write and add: $out"
+fi
+
+# The `off` row's three outcomes, as far as a host can show them. `GM-N3 absent`
+# is guest-only: with the metadata unbound the guest's Git cannot resolve the
+# repository *and* the host path is not there. On this host the fixture's working
+# directory is a real worktree, so Git always resolves, and the control pins the
+# other two outcomes instead of pretending to the third.
+out="$(gm_probe_at "$gm/wt" off /nonexistent/metadata)"
+[[ "$out" == 'GM-N3 resolved' ]] ||
+    fail "GM-N3 control: an absent metadata path must still report that Git resolved here: $out"
+out="$(gm_probe_at "$gm/wt" off "$common")"
+[[ "$out" == 'GM-N3 present' ]] ||
+    fail "GM-N3 control did not see an existing metadata path: $out"
+
+# The `control` row: one launch, the same relative write through both paths.
+out="$(gm_probe_at "$gm/wt" control "$common" "$common")"
+[[ "$out" == 'GM-N4 automatic=allowed alias=allowed' ]] ||
+    fail "GM-N4 control output: $out"
+# A missing alias path is a denial, not a silent pass.
+out="$(gm_probe_at "$gm/wt" control "$common" /nonexistent-alias)"
+[[ "$out" == 'GM-N4 automatic=allowed alias=denied' ]] ||
+    fail "GM-N4 negative control did not deny the absent alias: $out"
+
+# The hostile-environment control. Both halves of it matter:
+#
+# * with the allow-list above, a `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE` pair
+#   inherited from the caller — which is what a Git hook exports — changes
+#   nothing: the sentinel stays byte-identical and the fixture branch moves;
+# * run *without* the allow-list, the same probe commits into the sentinel, which
+#   is what makes the first half a measurement rather than a blind spot.
+sentinel="$work/sentinel"
+mkdir -p "$sentinel"
+gm_git "$sentinel" init -q
+for pair in 'user.name sentinel' 'user.email sentinel@example.invalid' \
+    'commit.gpgsign false' 'core.hooksPath /dev/null'; do
+    # shellcheck disable=SC2086 # the pair is two words on purpose.
+    gm_git "$sentinel" config $pair
+done
+printf 'sentinel\n' > "$sentinel/sentinel.txt"
+gm_git "$sentinel" add sentinel.txt
+gm_git "$sentinel" commit -q -m sentinel
+sentinel_head="$(gm_git "$sentinel" rev-parse HEAD)"
+sentinel_index="$(cksum < "$sentinel/.git/index")"
+fixture_branch="$(gm_git "$gm/main" rev-parse gm)"
+
+out="$(GIT_DIR="$sentinel/.git" GIT_WORK_TREE="$sentinel" \
+    GIT_INDEX_FILE="$sentinel/.git/index" gm_probe_at "$gm/wt" rw "$common")"
+[[ "$out" =~ ^GM-N2\ commit=[0-9a-f]{40}$ ]] ||
+    fail "hostile-environment control could not commit in the fixture: $out"
+[[ "$(gm_git "$sentinel" rev-parse HEAD)" == "$sentinel_head" ]] ||
+    fail 'hostile-environment control: an inherited GIT_DIR moved the sentinel HEAD'
+[[ "$(cksum < "$sentinel/.git/index")" == "$sentinel_index" ]] ||
+    fail 'hostile-environment control: an inherited GIT_INDEX_FILE rewrote the sentinel index'
+[[ "$(gm_git "$gm/main" rev-parse gm)" != "$fixture_branch" ]] ||
+    fail 'hostile-environment control: the fixture branch did not move, so nothing was observed'
+
+# The same call without the allow-list, to show the sentinel can be reached. It
+# drops `GIT_WORK_TREE`: with it, `git add` looks inside the sentinel, where
+# nothing the probe writes exists, so the demonstration would be a no-op rather
+# than a leak. `GIT_DIR` alone is what a hook exports, and that is enough.
+GIT_DIR="$sentinel/.git" GIT_INDEX_FILE="$sentinel/.git/index" \
+    bash -c 'cd "$1" && bash ./guest-gm-probe.sh rw "$2"' _ "$gm/wt" "$common" \
+    >/dev/null 2>&1 || true
+[[ "$(gm_git "$sentinel" rev-parse HEAD)" != "$sentinel_head" ]] ||
+    fail 'hostile-environment control is vacuous: the sentinel cannot be reached even without the allow-list'
+# Restore the tree the `control` rows wrote through.
+rm -f "$common/objects/gm-probe"
+
+# The native rows' own bookkeeping: a BLOCKED row is never a pass, and the commit
+# oracle rejects an unmoved branch. Boot-free, so this is the only place the
+# decision runs in CI.
+python3 "$SCRIPT_DIR/lib/config-mounts.py" --self-check ||
+    fail 'the GM row logic self-check failed'
+# And the dispatch itself, over real fixtures and fake launches: `GM-MISSING`
+# blocks all seven rows after one launch, a commit line naming the seed object
+# fails `GM-N2-host`, and a real commit passes.
+python3 "$SCRIPT_DIR/lib/config-mounts.py" --dispatch-check ||
+    fail 'the GM dispatch check failed'
+
+echo 'automatic Git metadata probe controls passed (commit positive control, writable negative control, a-w positive control, off present/resolved, alias present/absent, hostile-environment isolation with its leak demonstration, GM row logic self-check, GM dispatch check; no VM; GM-N3 absent is guest-only)'
+
 # --- Wrapper preflight refusals ----------------------------------------------
 # The fakes make the host gate deterministic, record every native scratch
 # allocation, and keep CI (Linux) able to run these controls.

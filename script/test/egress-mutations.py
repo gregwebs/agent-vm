@@ -45,7 +45,7 @@ CLEAN_PACKAGE = ["cargo", "clean", "-p", "agent-vm"]
 # outside every per-control timeout.
 WARMUP = ["cargo", "test", "--locked", "-p", "agent-vm", "--no-run",
           "--bin", "agent-vm", "--test", "config_launch_driven",
-          "--test", "config_mounts"]
+          "--test", "config_mounts", "--test", "git_metadata_mounts"]
 WARMUP_TIMEOUT = 3600
 CONTROL_TIMEOUT = 240
 SRC = "crates/agent-vm/src/"
@@ -58,6 +58,7 @@ FIXTURE = "script/test/lib/egress-fixtures.py"
 PROBE = "script/test/fixtures/egress-probe.sh"
 LAUNCH = "config_launch_driven"
 MOUNTS = "config_mounts"
+GIT_MOUNTS = "git_metadata_mounts"
 
 
 def rust(pattern, test=None):
@@ -812,6 +813,141 @@ def matrix():
         rust("image_requests::baseline::tests::admission_"))
     add("image-baseline-limit-proof", image_store, store_limit_body, store_limit_mutant, gate,
         "verification results::")
+    # --- Automatic Git metadata mounts (#535, ADR-0062) -------------------
+    # Every anchor is a kernel *body*; its `ensures` states the same decision in
+    # a shape the body never uses, so the `-proof` twins catch a mutated
+    # implementation rather than a weakened contract. The launch rows are the
+    # only ones that can see the discovery adapter at all.
+    git_metadata = SRC + "git_metadata.rs"
+    git_off = "    if mode.off {\n        MountAccessDecision::Skip"
+    git_off_mutant = "    if mode.off {\n        MountAccessDecision::ReadOnly"
+    add("git-mount-off-ignored", git_metadata, git_off, git_off_mutant,
+        rust("git_mount_access_matches_the_three_rows"))
+    add("git-mount-off-ignored-proof", git_metadata, git_off, git_off_mutant, gate,
+        "verification results::")
+    add("git-mount-off-ignored-launch", git_metadata, git_off, git_off_mutant,
+        rust("off_bypasses_discovery_only", GIT_MOUNTS))
+    # A pointer file is untrusted text: dropping the control-byte test admits a
+    # newline (which forges a diagnostic line) and a tab (which breaks the
+    # boot-params framing).
+    git_control = "        if is_control_byte(bytes[j]) {"
+    git_control_mutant = "        if false && is_control_byte(bytes[j]) {"
+    add("git-pointer-control-byte-accepted", git_metadata, git_control, git_control_mutant,
+        rust("pointer_path_span_matches_the_oracle_table"))
+    add("git-pointer-control-byte-accepted-proof", git_metadata, git_control,
+        git_control_mutant, gate, "verification results::")
+    # The back-pointer is one of the two facts that make the directory *this*
+    # worktree's registration rather than any directory Git would open.
+    git_back = "    if !f.back_pointer_matches {"
+    git_back_mutant = "    if false && !f.back_pointer_matches {"
+    add("git-back-pointer-ignored", git_metadata, git_back, git_back_mutant,
+        rust("worktree_verdict_matches_the_oracle_on_all_4096_rows"))
+    add("git-back-pointer-ignored-proof", git_metadata, git_back, git_back_mutant, gate,
+        "verification results::")
+    add("git-back-pointer-ignored-launch", git_metadata, git_back, git_back_mutant,
+        rust("broken_relationships_are_refused_before_launch_state", GIT_MOUNTS))
+    # Guest-spelling consistency is what refuses a `..` that crosses a symlink:
+    # the guest would resolve a different directory than the host.
+    git_spelling = "    if !f.guest_spelling_consistent {"
+    git_spelling_mutant = "    if false && !f.guest_spelling_consistent {"
+    add("git-symlink-layout-accepted", git_metadata, git_spelling, git_spelling_mutant,
+        rust("worktree_verdict_matches_the_oracle_on_all_4096_rows"))
+    add("git-symlink-layout-accepted-proof", git_metadata, git_spelling,
+        git_spelling_mutant, gate, "verification results::")
+    # No launch twin: with the fact forced true, layout D is *still* refused —
+    # the coverage rule sees the guest spelling nest while the host path does
+    # not — so the two refusals are indistinguishable at the launch boundary and
+    # the kernel table plus the proof are what kill this mutation.
+    # Binding a metadata directory that is already inside the project would make
+    # part of the writable project bind read-only.
+    git_inside = "    if f.inside_project {"
+    git_inside_mutant = "    if false && f.inside_project {"
+    add("git-covered-by-project-binds", git_metadata, git_inside, git_inside_mutant,
+        rust("metadata_placement_matches_the_exhaustive_table"))
+    add("git-covered-by-project-binds-proof", git_metadata, git_inside, git_inside_mutant,
+        gate, "verification results::")
+    # The launch twin: a worktree whose common directory lives inside the project
+    # bind, where the mutant binds it read-only inside a writable route.
+    add("git-covered-by-project-binds-launch", git_metadata, git_inside, git_inside_mutant,
+        rust("metadata_inside_the_project_bind_is_reported_as_reachable", GIT_MOUNTS))
+    # A checkout inside the common directory. A bare repository is all metadata and
+    # is bound whole, so the `.git`-entry rule cannot keep a *registered* worktree
+    # created inside it out: the bind would carry another worktree's source.
+    git_contained = "    if f.contains_checkout {"
+    git_contained_mutant = "    if false && f.contains_checkout {"
+    add("git-checkout-in-common-bound", git_metadata, git_contained, git_contained_mutant,
+        rust("metadata_placement_matches_the_exhaustive_table"))
+    add("git-checkout-in-common-bound-proof", git_metadata, git_contained,
+        git_contained_mutant, gate, "verification results::")
+    add("git-checkout-in-common-bound-launch", git_metadata, git_contained,
+        git_contained_mutant,
+        rust("a_common_directory_containing_another_checkout_is_refused", GIT_MOUNTS))
+    # POSIX clamps `/..` to `/`; this kernel refuses it, because clamping lets a
+    # pointer walk out of the directory Git resolved and back into another one.
+    # The anchor is the resolver's *executable* escape branch. A spec-body
+    # anchor would be invisible to `cargo test` (the spec erases), so the two
+    # cargo rows below could not kill it and only the proof would. Mutating the
+    # exec branch to clamp — the POSIX rule this kernel deliberately rejects —
+    # is observable through both the table and a launch.
+    git_escape = ("        } else {\n"
+                  "            escaped = true;\n"
+                  "            i += 1;\n"
+                  "        }")
+    git_escape_mutant = ("        } else {\n"
+                         "            i += 1;\n"
+                         "        }")
+    add("git-parent-clamped-at-root", git_metadata, git_escape, git_escape_mutant,
+        rust("resolve_components_matches_the_stack_oracle"))
+    add("git-parent-clamped-at-root-proof", git_metadata, git_escape, git_escape_mutant,
+        gate, "verification results::")
+    add("git-parent-clamped-at-root-launch", git_metadata, git_escape, git_escape_mutant,
+        rust("broken_relationships_are_refused_before_launch_state", GIT_MOUNTS))
+    # A `HEAD`-less directory is not a Git directory, whatever the relationship
+    # facts say. The twin sits in the `HEAD` kernel itself.
+    git_head = "    if !f.worktree_is_git_dir {"
+    git_head_mutant = "    if false && !f.worktree_is_git_dir {"
+    add("git-head-unchecked", git_metadata, git_head, git_head_mutant,
+        rust("worktree_verdict_matches_the_oracle_on_all_4096_rows"))
+    add("git-head-unchecked-proof", git_metadata, git_head, git_head_mutant, gate,
+        "verification results::")
+    add("git-head-unchecked-launch", git_metadata, git_head, git_head_mutant,
+        rust("a_fully_cross_linked_forgery_is_refused", GIT_MOUNTS))
+    git_headref = ("        bytes.len() - i >= 5\n"
+                   "            && bytes[i] == 0x72u8")
+    git_headref_mutant = ("        true || bytes.len() - i >= 5\n"
+                          "            && bytes[i] == 0x72u8")
+    add("git-headref-any-ref-prefix", git_metadata, git_headref, git_headref_mutant,
+        rust("headref_valid_matches_the_git_table"))
+    add("git-headref-any-ref-prefix-proof", git_metadata, git_headref,
+        git_headref_mutant, gate, "verification results::")
+    # A missing `commondir` with linked-layout evidence is a *damaged* worktree,
+    # not a submodule: ignoring the evidence silently disables the feature.
+    git_evidence = "        return if f.linked_evidence {"
+    git_evidence_mutant = "        return if false && f.linked_evidence {"
+    add("git-missing-commondir-not-linked", git_metadata, git_evidence,
+        git_evidence_mutant, rust("worktree_verdict_matches_the_oracle_on_all_4096_rows"))
+    add("git-missing-commondir-not-linked-proof", git_metadata, git_evidence,
+        git_evidence_mutant, gate, "verification results::")
+    add("git-missing-commondir-not-linked-launch", git_metadata, git_evidence,
+        git_evidence_mutant,
+        rust("a_missing_commondir_is_refused_and_other_gitfiles_are_unchanged", GIT_MOUNTS))
+    # The enclosing-declaration decision (#535 M2). Accepting a declaration that
+    # maps the metadata path somewhere else is what makes the automatic child bind
+    # outrank the user's route: the kernel, its table and a real refusal all see it.
+    git_enclosure = ("    } else {\n"
+                     "        Enclosure::Shadowed\n"
+                     "    }")
+    git_enclosure_mutant = ("    } else {\n"
+                            "        Enclosure::Reachable\n"
+                            "    }")
+    add("git-enclosing-declaration-shadowed", git_metadata, git_enclosure,
+        git_enclosure_mutant,
+        rust("declaration_enclosure_matches_the_exhaustive_table"))
+    add("git-enclosing-declaration-shadowed-proof", git_metadata, git_enclosure,
+        git_enclosure_mutant, gate, "verification results::")
+    add("git-enclosing-declaration-shadowed-launch", git_metadata, git_enclosure,
+        git_enclosure_mutant,
+        rust("an_enclosing_declaration_is_never_shadowed", GIT_MOUNTS))
     return controls
 
 
