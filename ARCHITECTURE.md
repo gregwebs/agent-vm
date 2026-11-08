@@ -595,9 +595,13 @@ refuse a stale or dirty candidate before boot. See
 default/strict invalidation policy and its accepted blind spots.
 
 `./script/check-runtime-provenance.sh` checks both independent Cargo roots (the
-outer workspace and `vendor/microsandbox`) for the identical official crates.io
-`msb_krun*` 0.1.41 cohort and checksum map, plus the pinned `vendor/libkrunfw`
-gitlink, firmware version/ABI, and the x86 source-configuration contract. This
+outer workspace and `vendor/microsandbox`) for the official crates.io
+`msb_krun*` cohort: a per-crate version map (0.1.42, with `msb_krun_arch_gen`,
+`msb_krun_cpuid` and `msb_krun_smbios` independently published at 0.1.45 in the
+outer workspace while the vendored lock still pins 0.1.42), and a checksum map
+that must agree wherever the two roots resolve one release. It also checks the
+pinned `vendor/libkrunfw` gitlink, firmware version/ABI, and the x86
+source-configuration contract. This
 establishes **source identity**, not an attestation that a given executable came
 from that source; release provenance is separate, unfinished work.
 
