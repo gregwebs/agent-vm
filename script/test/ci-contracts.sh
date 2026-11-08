@@ -130,6 +130,7 @@ syntax_check=(
     script/test/config-mounts-live.sh
     script/test/config-mounts-contract.sh
     script/test/fixtures/config-mounts/guest-cm-probe.sh
+    script/test/fixtures/config-mounts/guest-gm-probe.sh
     script/test/fixtures/config-dir-guard/guest-n1a.sh
     script/test/fixtures/config-dir-guard/guest-n1b.sh
     script/test/fixtures/config-dir-guard/guest-n3.sh
@@ -185,6 +186,7 @@ shellcheck_files=(
     script/test/config-mounts-live.sh
     script/test/config-mounts-contract.sh
     script/test/fixtures/config-mounts/guest-cm-probe.sh
+    script/test/fixtures/config-mounts/guest-gm-probe.sh
     script/test/fixtures/config-dir-guard/guest-n1a.sh
     script/test/fixtures/config-dir-guard/guest-n1b.sh
     script/test/fixtures/config-dir-guard/guest-n3.sh

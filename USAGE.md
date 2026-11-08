@@ -988,6 +988,7 @@ Available launch options:
 | `--allow-missing-credentials` | warn and launch when a requested YAML credential is missing or unreadable (including a SecretSpec read that is unavailable or missing), instead of refusing — see [Authorizing a stored value for injection](#authorizing-a-stored-value-for-injection). Never covers a built-in provider's own missing host credential, or a SecretSpec value agent-vm rejects |
 | `--mount SET\|HOST[:GUEST][:MODE]...` | a bare `SET` name selects that user-defined [mount set](#named-mount-sets-user-config), exactly and case-sensitively, and never a relative path, a directory or a tool; otherwise an extra live bind or project-scoped `:fork`. Directory binds default to writable; a regular file needs an explicit `:ro`. Modes: `:ro`, `:rw`, `:fork`, `:follow-links`, and fork-only repeatable `:exclude=REL`; see [Extra and forked mounts](#extra-and-forked-mounts). A live bind that would expose a host Pi credential file is refused — see [Host Pi credential files are never mounted](#host-pi-credential-files-are-never-mounted). Capacity is host-specific. |
 | `--allow-internet-egress`, `--allow-lan`, `--allow-host`, `--allow-egress`, `--publish`, `--auto-publish` | see [Ports & egress](#ports--egress); egress is denied by default |
+| `--git-mount=ro\|rw\|off` | automatic [Git metadata mounts](#git-metadata-for-linked-worktrees) for a linked worktree at the launch directory; default `ro`; independent of `--no-git` and `--no-config-mounts` |
 | `--no-config-mounts` | skip this launch's automatic [config mounts](#config-mounts-user-config) (the user config's `mounts`); an explicit `--mount`, including `--mount NAME`, credentials, persisted paths and every config check still apply |
 | `--root` | run the guest as root (uid 0) instead of the default host user — see [Guest user](#guest-user----root) |
 | `-t`, `--tty` | force a PTY for a **direct** command, even with redirected stdout; requires terminal stdin — see [Direct commands](#direct-commands) |
@@ -1167,6 +1168,104 @@ PTY the terminal is in raw mode, so `Ctrl-C` is the byte `0x03` delivered to the
 guest as ordinary input; the host raises no signal. With streaming I/O the
 terminal stays cooked, so `Ctrl-C` *is* a host `SIGINT` and is forwarded as one,
 with the grace and the `128 + N` convention above.
+
+### Git metadata for linked worktrees
+
+A linked worktree (`git worktree add`) keeps its own `.git` **pointer file** and the
+per-worktree metadata in the main checkout's `.git`. Only the worktree's source is under the
+project bind, so without help the guest's `git log` fails with "not a git repository". When
+the launch directory's root is a linked worktree, agent-vm mounts that worktree's Git
+metadata directories **at the paths Git computed**, so ordinary Git commands work in the
+guest.
+
+| `--git-mount` | what the guest gets |
+| --- | --- |
+| `ro` (default) | the metadata directories bound read-only; `git log`, `git diff` and `git status` work, and a write through that bind is refused |
+| `rw` | the same binds, writable: the guest can stage, commit and change refs, objects, config and **hooks** that later run on the host |
+| `off` | no discovery at all — not even a read of `.git` |
+
+What is mounted:
+
+- the **common directory** (`.git` in the main checkout: objects, refs, config, hooks and
+  every worktree's registration) when the per-worktree directory lives inside it — one bind
+  covers both — and the per-worktree directory separately when it does not;
+- never the main checkout's source, never another checkout, never `objects/info/alternates`
+  targets, and never a submodule's or `--separate-git-dir`'s metadata (those are not linked
+  worktrees). "Never another checkout" is measured on canonical host paths, not on the guest
+  spelling: a bare repository is all metadata and is bound whole, so a worktree *registered
+  inside* one is refused rather than bound, and so is a symlinked alias of it. The residual
+  is a checkout Git never registered there.
+
+The launch prints one line, `==> Git metadata: linked worktree, read-only`, or, for `rw`, a
+line that says the guest can change refs, objects, hooks and config shared by every worktree.
+When the guest already reaches the metadata — it is inside the project bind, or a declaration
+of yours carries it — nothing is added, and the line names that route instead of claiming an
+access of its own: the metadata is exactly as writable as the route carrying it makes it.
+
+`ro` is the default because it is what makes history readable without a prompt, an approval
+store or a persisted setting: there is deliberately **no environment variable and no config
+key** for the mode — write access to a repository is a per-launch decision.
+
+The requests go through the same claim and protection pipeline as `--mount`, so:
+
+- an equivalent `--mount <metadata>:ro` (or a `mounts` entry) **merges** into one bind and
+  keeps its own origin in the diagnostics; a different one is refused naming both;
+- a declaration that **encloses** the metadata guest path is never shadowed. The automatic
+  requests are appended after yours, and the runtime mounts a parent before its child, so an
+  automatic child bind would otherwise decide the access for part of your route. If the
+  declaration is a plain live bind of the same host directory (`--mount ~/repos` for
+  `~/repos/main/.git`) no automatic mount is added at all, in `ro` **and** `rw`, and the line
+  says the metadata is reachable through it. Anything else — a different host directory, a
+  `:fork` or a `:follow-links` route — is refused before boot naming both declarations and
+  `--git-mount=off`;
+- the host Pi credential files, the writable `~/.config/agent-vm` directory, agent-vm's own
+  mounts and every declared `persist` link are guarded exactly as for `--mount`. "Agent-vm's own
+  mounts" is measured on their canonical host paths as well as their guest spellings: a
+  metadata directory that would enclose your state directory, or the guest home inside it, is
+  refused even when a symlinked pointer hides that from the guest path;
+- the metadata is not added to the GitHub repository allow-list, so `--no-git` keeps its
+  meaning;
+- `--no-git` and `--no-config-mounts` do not change the automatic Git mounts.
+
+A broken or unmountable layout is refused **before boot**, never silently skipped:
+
+```text
+Error: linked worktree metadata for "/home/me/wt" is unusable: "/home/me/main/.git/worktrees/wt/commondir" is missing. Run `git worktree repair` in the main checkout or in "/home/me/wt", or pass --git-mount=off to launch without automatic Git metadata mounts.
+```
+
+`git worktree repair` is the fix for a broken relationship. `--git-mount=off` is the escape
+hatch, and it is the only thing that skips discovery: a malformed `--mount`, a broken config
+or any other check still refuses the launch.
+
+Not covered:
+
+- launches from a **subdirectory** of a worktree (the launch directory must be the worktree
+  root), and ancestors or extra-mounted roots;
+- a project remapped to `/workspace` (a path under the guest's tmpfs mounts or with control
+  characters) — the guest could not resolve Git's relative pointers, so the layout is
+  refused;
+- submodules, `--separate-git-dir` directories and `objects/info/alternates` targets.
+
+Limits worth stating plainly:
+
+- `ro` protects **that bind**, not the repository. The writable project bind and any other
+  writable route to the same directory still write — an *enclosing* route does not even get an
+  automatic child bind, so nothing is made read-only — the guest can read shared history, refs
+  and other worktrees' records, and an attacker who can write a complete Git-valid
+  registration into a directory can still have it mounted. See
+  [ADR-0062](docs/adr/0062-automatic-git-metadata-mounts.md).
+- `rw` exposes shared `config` and `hooks`: a hook the guest writes runs on the host the next
+  time Git runs there.
+
+Upgrading from 0.7.36: the old workaround, a **writable** `mounts = ["…/main/.git"]` entry or
+`--mount …/main/.git`, is now refused on a default launch: the automatic read-only bind and
+that declaration disagree at one guest path. The refusal is deliberate (an equivalent
+declaration merges, a different one is refused), and there is a remedy for every intention:
+
+- history only — make the entry `:ro`, or drop it and let the automatic bind do the work;
+- write access — add `--git-mount=rw`, which is the *same* declaration as a writable entry, so
+  the plan keeps one bind and the entry keeps its own origin in the diagnostics;
+- neither — `--git-mount=off`.
 
 ### Extra and forked mounts
 

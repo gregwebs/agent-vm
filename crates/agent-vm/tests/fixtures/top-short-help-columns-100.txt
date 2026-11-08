@@ -41,6 +41,9 @@ Mounts & ports:
       --no-config-mounts
           Skip this launch's automatic config mounts: the top-level `mounts` defaults and the
           launched tool's own and inherited `mounts` in `~/.config/agent-vm/config.toml`
+      --git-mount <MODE>
+          Automatic Git metadata mounts for a linked worktree rooted at the launch directory: `ro`
+          (default), `rw`, or `off` [default: ro] [possible values: ro, rw, off]
   -p, --publish <[BIND:]HOST_PORT:GUEST_PORT>
           Publish a guest TCP port to the host, docker-style (repeatable)
       --auto-publish

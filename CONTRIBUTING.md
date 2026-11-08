@@ -691,6 +691,41 @@ synchronizes with the host; CM-N4 proves `--no-config-mounts` removes all three
 while the project mount still works (a positive control that the guest ran);
 CM-N5 proves an equivalent `--mount` reuses the config fork's identity.
 
+The automatic Git metadata rows (#535, [ADR-0062](docs/adr/0062-automatic-git-metadata-mounts.md))
+continue the same run over a real linked worktree, `work/gm/wt`, built by a `gm_git` helper
+that clears the environment and repopulates it from an allow-list — a developer's `GIT_DIR`,
+`GIT_COMMON_DIR` or `worktree.useRelativePaths` would otherwise change the `.git` shape every
+row is about. The repo-local identity, signing and hook policy are written with `git config`
+**before** the first commit, and the probe pins them again command-scoped, so neither the host
+nor the image gitconfig can reintroduce signing or a hook. `snapshot_validation` covers
+`work/gm` and the receipts keep `GM-` lines beside the `CM-` ones.
+
+- **GM-N1** — the default `ro`: `git log` reads the seed subject, `git diff` lists the edited
+  file, and both a write through the metadata bind and `git add` are denied. The host oracle
+  checks the common directory's tree digest is unchanged and the write target is absent.
+- **GM-N2** — `--git-mount=rw`: the guest commits, and the host oracle requires four facts, not
+  one: the branch *moved* off the recorded baseline, the tip is the object id the guest
+  printed, the tip's parent is that baseline, and `tracked.txt` at the tip carries the edit
+  the guest made. The id alone would say nothing about movement, ancestry or content.
+- **GM-N3** — `--git-mount=off`: no notice, nothing bound, so the guest's Git cannot resolve
+  the repository.
+- **GM-N4** — in **one** launch the same relative write at the same metadata root is denied
+  through the automatic `ro` bind and allowed through an explicit `--mount …:/gm-alt:rw`
+  alias. This is recorded as "`ro` is not repository-wide write protection", never as an
+  enforcement failure.
+
+Every GM row also carries `--no-git`, so the group proves independence from that flag. A
+guest image with no `git` is measured **once**, from the first GM launch, and then every GM
+row and host oracle is recorded as `BLOCKED: guest image has no git`: a third status in
+`summary.tsv` and `totals.json` that is counted in neither `passed` nor `failed`, never a
+pass and never a product failure. The remaining GM launches are skipped, since each would
+measure the same absence. Two boot-free checks keep that logic honest, and
+`config-mounts-contract.sh` runs both: `--self-check` exercises the receipt and the GM-N2
+oracle directly, and `--dispatch-check` drives the **real** GM dispatch over real fixtures and
+fake launches — `GM-MISSING` must block all seven rows after exactly one launch, a `GM-N2`
+line naming the seed object must fail `GM-N2-host`, and a launch that really commits must
+pass.
+
 The named-mount-set rows (#397, `[mount_sets]`) continue the same run over the
 same owned synthetic `home/cm/{ro,rw,fork}` fixtures, after the N rows' cleanup:
 
@@ -818,8 +853,16 @@ cover; Linux/amd64 native evidence remains outstanding rather than implied.
 
 `bash script/test/config-mounts-contract.sh` is the boot-free companion: it runs
 the guest probe against a host-only synthetic layout (permission and negative
-controls included) and asserts that the wrapper rejects a relative
-`AGENT_VM_BIN` and a non-digest image without allocating scratch. It is in
+controls included) — including the GM rows, where a real commit is the positive
+control ("the fixture can commit before a boot is spent"), the same write on a
+writable tree is the negative control, and a `chmod -R a-w` tree is the positive
+control with its `NOT RUN … running as root` line when uid is 0 and asserts that the wrapper rejects a relative
+`AGENT_VM_BIN` and a non-digest image without allocating scratch. The GM probe runs
+under the same cleared environment as `gm_git` — `env -i` plus `PATH`, `HOME` and the two
+config overrides — because its `rw` phase commits and Git hooks export
+`GIT_DIR`/`GIT_INDEX_FILE`: the hostile-environment control points all three at a sentinel
+repository and requires the sentinel to stay byte-identical while the fixture branch moves,
+then repeats the call *without* the allow-list to show the sentinel can be reached. It is in
 `ci-contracts.sh`; it is host-only and **never** native evidence.
 
 #### `bash -c`, not `bash -lc`, for in-guest commands
@@ -1021,10 +1064,10 @@ while ordinary `setup` intentionally creates a verification guest.
 | `script/test/persisted-network-contract.sh` | yes (`ci-contracts.sh`) | host-only snippet controls, checker P1–P5 and live-shell P6–P10; no native evidence |
 | `script/test/build-provenance-contract.sh` | yes (`ci-contracts.sh`) | real Cargo/Git build-identity controls B1–B19; no native evidence |
 | `script/test/persisted-network-live.sh` | **no** | dedicated macOS arm64 PN rows; required evidence or written waiver |
-| `script/test/config-mounts-contract.sh` | yes (`ci-contracts.sh`) | host-only probe/preflight controls; no native evidence |
+| `script/test/config-mounts-contract.sh` | yes (`ci-contracts.sh`) | host-only probe/preflight controls, including the #535 GM probe controls (real commit, writable-tree negative control, `a-w` positive control, hostile-environment isolation) and the GM row-logic self-check; no native evidence |
 | `script/test/e2e-image-cleanup-contract.sh` | yes (`ci-contracts.sh`) | decoy-`docker` sweep controls C1–C8, the production `cleanup_work` in a child (C9, C9b) and the guard-membership mutation (C10); no daemon, no native evidence |
 | `script/test/reclaim-docker-cache-contract.sh` | yes (`ci-contracts.sh`) | decoy-`docker` controls D1–D11 for the #473 reclaim tool: a report (with or without `--builder`) prunes nothing, `--prune` is one prune between two reads, and an unreachable builder, an unknown or partial `du` summary, an unreadable size, or an empty `--builder` value fails instead of reading as an empty cache; no daemon, no native evidence |
-| `script/test/config-mounts-live.sh` | **no** | dedicated macOS arm64 CM rows: candidate + runtime (`msb`, `libkrunfw`) identity, host/platform, digest, expected vs actual; required evidence or a `BLOCKED:` line |
+| `script/test/config-mounts-live.sh` | **no** | dedicated macOS arm64 CM and GM (#535) rows: candidate + runtime (`msb`, `libkrunfw`) identity, host/platform, digest, expected vs actual; required evidence or a `BLOCKED:` line |
 | `script/test/verus-verification.sh` | yes | machine-checked boundary contracts |
 | Image source/build/installer/runtime/egress audits | independent image repo CI | migrated; equivalence not verified by launcher CI |
 

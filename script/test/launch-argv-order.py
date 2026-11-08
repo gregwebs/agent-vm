@@ -38,6 +38,7 @@ LAUNCH_OPTIONS = [
     "--allow-missing-credentials",
     "--mount",
     "--no-config-mounts",
+    "--git-mount",
     "--publish",
     "--auto-publish",
     "--allow-egress",
@@ -107,6 +108,9 @@ def check_line_matching_controls() -> None:
         # the launcher's, after it the tool's (see `detected` below).
         "agent-vm --no-config-mounts shell",
         "agent-vm --no-config-mounts run probe",
+        # #535's mode is a launch option on the same route, in both spellings.
+        "agent-vm --git-mount=rw shell",
+        "agent-vm --git-mount ro run probe",
     ]
     for line in accepted:
         hits = shell_line_hits(line)
@@ -118,6 +122,9 @@ def check_line_matching_controls() -> None:
         # Post-verb is a forwarded tool argument, so config mounts would still
         # apply: the sweep must keep flagging it rather than learn to accept it.
         "agent-vm shell --no-config-mounts",
+        # After the verb the mode is the tool's argument, so the launch keeps the
+        # `ro` default: the sweep must keep flagging it.
+        "agent-vm shell --git-mount=rw",
     ]
     for line in detected:
         if not shell_line_hits(line):

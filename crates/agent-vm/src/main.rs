@@ -25,6 +25,7 @@ mod egress_policy;
 mod egress_reference;
 mod embedded_runtime;
 mod env_flag;
+mod git_metadata;
 mod github_graphql;
 mod guest_home;
 mod guest_paths;

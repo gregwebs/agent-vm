@@ -25,7 +25,7 @@ use crate::host_signals::{
 use crate::image_contract;
 use crate::launch_notice::{LaunchNotices, NoticeSink};
 use crate::launch_target::{LaunchTarget, ProgramGuard};
-use crate::mount;
+use crate::mount::{self, MountRequests};
 use crate::one_line;
 use crate::protected_host_files::CoreHostSource;
 use crate::session::ProjectSession;
@@ -239,7 +239,12 @@ fn git_identity_notice(identity: Option<&crate::secrets::HostGitIdentity>) -> St
     }
 }
 
-fn guest_path_is_safe(project: &Path) -> bool {
+/// Whether the guest can safely mirror a path: a path under one of the guest's
+/// tmpfs mounts would be wiped at boot, so `resolve_project_guest_path` falls
+/// back to `/workspace` there. `pub(crate)` because `git_metadata` asks the same
+/// question about a Git metadata directory (#535) instead of restating the
+/// prefix list.
+pub(crate) fn guest_path_is_safe(project: &Path) -> bool {
     let s = match project.to_str() {
         Some(s) => s,
         None => return false,
@@ -442,6 +447,7 @@ Examples:
                                                    follow symlinks in a skills dir
   agent-vm --mount ~/config:/config:fork:exclude=credentials.json <tool>
                                                    seed an independent writable copy
+  agent-vm --git-mount=rw <tool>                   let Git write this worktree's metadata
   agent-vm --repo owner/other-repo <tool>          widen the GitHub allow-list
 
 Fork mounts:
@@ -645,6 +651,26 @@ pub struct Args {
     )]
     no_config_mounts: bool,
 
+    /// Automatic Git metadata mounts for a linked worktree rooted at the launch
+    /// directory: `ro` (default), `rw`, or `off`.
+    ///
+    /// Mounts only that worktree's per-worktree and shared `.git` directories at
+    /// their host paths, never another checkout's source. `ro` protects that bind,
+    /// not the repository: other writable routes still write, and the guest can
+    /// read shared history, refs and other worktrees' records. `rw` lets the guest
+    /// change shared refs, objects, config and hooks that later run on the host.
+    /// There is deliberately no environment variable or config setting: write
+    /// access is chosen per launch. `off` skips discovery entirely.
+    /// Independent of `--no-git` (GitHub credentials) and `--no-config-mounts`.
+    #[arg(
+        long = "git-mount",
+        value_enum,
+        default_value_t = crate::git_metadata::GitMountMode::ReadOnly,
+        value_name = "MODE",
+        help_heading = "Mounts & ports"
+    )]
+    git_mount: crate::git_metadata::GitMountMode,
+
     /// Force a PTY for a direct command, even when stdout is redirected.
     ///
     /// Launch options precede `run` or the top-level `--`; the same token after
@@ -741,6 +767,13 @@ impl Args {
         }
     }
 
+    /// `--git-mount`, read once here so discovery has one mode value to consume
+    /// instead of a flag it could reinterpret (the `config_mount_policy`
+    /// precedent).
+    pub(crate) fn git_mount_mode(&self) -> crate::git_metadata::GitMountMode {
+        self.git_mount
+    }
+
     /// The terminal preference these flags express.
     ///
     /// Both set is a typed conflict even though clap rejects that argv: an
@@ -822,6 +855,9 @@ pub(crate) async fn launch(
     // with no bearing on the plan's order, and the selection it feeds cannot
     // re-read the flag after the move.
     let config_mount_policy = args.config_mount_policy();
+    // Same reason, one flag earlier in the list: read once, before `args.network`
+    // moves, so discovery never re-reads it.
+    let git_mount_mode = args.git_mount_mode();
     let network_plan = crate::network::Plan::from_args(args.network, user_network, user_tools)?;
     // The one output policy for this selection: explicit sources render their
     // escaped reference; the default tier renders a fixed label and redacts the
@@ -891,13 +927,27 @@ pub(crate) async fn launch(
         &session.project_dir,
         &session.state_dir,
     );
+    // Built once and cloned into the context, which owns its copy: discovery
+    // borrows the original to decide whether a metadata directory would contain
+    // one of agent-vm's own mounts. Both spellings, because a guest path is a
+    // lexical string: the host source is what the bind really exposes.
+    let core_guest_mounts: Vec<PathBuf> = core_volumes
+        .iter()
+        .map(|volume| PathBuf::from(&volume.guest_path))
+        .collect();
+    // The project bind is deliberately absent: `git_metadata`'s `contains_checkout`
+    // measures the canonical project directory already, and it has the refusal that
+    // names a *checkout*. Listing it here too would only steal that reason, because
+    // `covers_core` is decided first.
+    let core_host_sources: Vec<PathBuf> = core_volumes
+        .iter()
+        .filter(|volume| volume.bind != crate::protected_host_files::CoreBind::ProjectDir)
+        .map(|volume| crate::git_metadata::canonical_host_source(&volume.host_path))
+        .collect();
     let mount_context = launch_mount_context(
         session.mount_store_dir(),
         mount_home.clone(),
-        core_volumes
-            .iter()
-            .map(|volume| PathBuf::from(&volume.guest_path))
-            .collect(),
+        core_guest_mounts.clone(),
         // Core binds are writable too; the role names the remedy on refusal.
         core_volumes
             .iter()
@@ -919,21 +969,48 @@ pub(crate) async fn launch(
         config_mount_policy,
         &args.mount,
     )?;
+    // Reads host Git metadata and writes nothing, so it stays on the near side of
+    // `prepare`, whose fork publication is the first possible host mutation.
+    // After `select` so a malformed `--mount` keeps reporting first — and so the
+    // declarations it selected are visible, because an automatic bind below one
+    // of them would silently outrank the access the user asked for.
+    let git_metadata = crate::git_metadata::discover(
+        git_mount_mode,
+        crate::git_metadata::LaunchTopology {
+            project_dir: &session.project_dir,
+            project_guest: Path::new(&project_guest_path),
+            core_guest_mounts: &core_guest_mounts,
+            core_host_sources: &core_host_sources,
+            selected: selection.requests(),
+        },
+    )?;
     // Captured before `prepare` so the error context and the emitted plan share
     // one fact; named for the method, not for `mount_context` above, which is the
     // context *value* `prepare` measures against.
     let preparation_context = selection.preparation_context();
-    let mount_requests = selection.take_requests();
-    let mount_plan = mount::prepare(mount_requests, &mount_context).map_err(|error| {
-        // A persisted-HOME collision is not a `--mount` failure — the core
-        // project bind alone can cause it — and its own sentence already names
-        // the remedy, so it keeps its exact bytes and its own top line.
-        if error.is::<crate::guest_home::PersistCollision>() {
-            error
-        } else {
-            error.context(preparation_context)
-        }
-    })?;
+    // Appended after argv: an equivalent explicit or config declaration keeps its
+    // own origin (`claim` keeps the first seen), so this feature cannot change how
+    // an existing declaration is reported or scanned.
+    let (git_requests, git_report) = git_metadata.into_parts();
+    let mut mount_requests = selection.take_requests().into_inner();
+    mount_requests.extend(git_requests);
+    let mount_plan =
+        mount::prepare(MountRequests::new(mount_requests), &mount_context).map_err(|error| {
+            // A persisted-HOME collision is not a `--mount` failure — the core
+            // project bind alone can cause it — and its own sentence already names
+            // the remedy, so `prepare`'s own `preparation_context` frame is not
+            // added. `GitMetadataReport::annotate` still wraps it when this launch
+            // has automatic requests, which T15(d) relies on: the reader has to
+            // know that `--git-mount=off` removes the only new input to the plan.
+            let error = if error.is::<crate::guest_home::PersistCollision>() {
+                error
+            } else {
+                error.context(preparation_context)
+            };
+            git_report.annotate(error)
+        })?;
+    // Race-only check: a deterministic rejection never reaches here (ADR-0062 D2b).
+    git_report.verify_prepared(&mount_plan)?;
 
     // These checks open/create Microsandbox state, so they must remain after
     // the side-effect-free mount rejection boundary.
@@ -1078,6 +1155,11 @@ pub(crate) async fn launch(
     // notice describes them. Both lines print after the banner, so a rejected
     // topology still emits nothing.
     if let Some(notice) = selection.notice() {
+        notices.emit(notice)?;
+    }
+    // After the config line, so a reader meets the file's declarations before the
+    // launch's own, and before `prepare`'s notices.
+    if let Some(notice) = git_report.notice() {
         notices.emit(notice)?;
     }
     for notice in &mount_plan.notices {
@@ -4596,6 +4678,13 @@ mod tests {
         let select = position("mount_selection::select(");
         assert!(select < position("mount::prepare("));
         assert!(select < position("ensure_msb_home("));
+        // ADR-0062: discovery reads host Git metadata and writes nothing, so it
+        // belongs after the pure selection and on the near side of the boundary
+        // whose fork publication is the first possible host mutation.
+        let discover = position("git_metadata::discover(");
+        assert!(select < discover);
+        assert!(discover < position("mount::prepare("));
+        assert!(discover < position("ensure_msb_home("));
         let report = position("network_plan\n            .request_report(");
         assert!(notices < report && report < base_network);
         // ADR-0060: the image report sits with the tool report, after the egress
@@ -10214,6 +10303,10 @@ unset _avm_command _avm_external _avm_lookup_status; exec -- 'cat'"#;
             "resolve must precede the pure --memory arithmetic"
         );
         assert!(memory < mount_prep, "memory must precede mount::prepare");
+        assert!(
+            position("git_metadata::discover(") < mount_prep,
+            "Git metadata discovery must precede mount::prepare"
+        );
         assert!(
             mount_prep < socket_fit,
             "mount prep must precede socket fit"

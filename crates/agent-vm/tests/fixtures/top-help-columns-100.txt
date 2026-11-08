@@ -138,6 +138,21 @@ Mounts & ports:
           decision made at the command line, and the same option placed after the tool verb is
           forwarded to the tool.
 
+      --git-mount <MODE>
+          Automatic Git metadata mounts for a linked worktree rooted at the launch directory: `ro`
+          (default), `rw`, or `off`.
+
+          Mounts only that worktree's per-worktree and shared `.git` directories at their host
+          paths, never another checkout's source. `ro` protects that bind, not the repository: other
+          writable routes still write, and the guest can read shared history, refs and other
+          worktrees' records. `rw` lets the guest change shared refs, objects, config and hooks that
+          later run on the host. There is deliberately no environment variable or config setting:
+          write access is chosen per launch. `off` skips discovery entirely. Independent of
+          `--no-git` (GitHub credentials) and `--no-config-mounts`.
+
+          [default: ro]
+          [possible values: ro, rw, off]
+
   -p, --publish <[BIND:]HOST_PORT:GUEST_PORT>
           Publish a guest TCP port to the host, docker-style (repeatable).
 
@@ -282,6 +297,7 @@ Examples:
                                                    follow symlinks in a skills dir
   agent-vm --mount ~/config:/config:fork:exclude=credentials.json <tool>
                                                    seed an independent writable copy
+  agent-vm --git-mount=rw <tool>                   let Git write this worktree's metadata
   agent-vm --repo owner/other-repo <tool>          widen the GitHub allow-list
 
 Fork mounts:

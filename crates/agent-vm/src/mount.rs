@@ -187,7 +187,44 @@ pub(crate) struct ExtraMount {
     pub(crate) exclusions: Vec<PathBuf>,
 }
 
+/// Whether an automatic bind is writable, as a two-valued type rather than a
+/// `bool`: the arguments it sits beside are paths, so a bare `true` at the call
+/// site would read as "yes" to a question the reader has to scroll for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BindAccess {
+    ReadOnly,
+    ReadWrite,
+}
+
 impl ExtraMount {
+    /// A live bind whose guest path is its host spelling — the shape
+    /// `--mount PATH[:ro]` parses to.
+    ///
+    /// That shape is the whole point: [`same_declaration`] compares spellings and
+    /// paths, so an equivalent explicit declaration *merges* into this one
+    /// instead of conflicting at the shared guest path (spec R10). `follow_links`
+    /// is off because the source is a measured directory, not a tree the user
+    /// asked to walk, and `exclusions` is empty because `:exclude` is fork-only.
+    ///
+    /// `None` for a non-UTF-8 spelling, because [`Spelling`] is text: the caller
+    /// turns that into a refusal rather than a silently unusable mount.
+    pub(crate) fn automatic_bind(spelling: &Path, access: BindAccess) -> Option<Self> {
+        let text = spelling.to_str()?;
+        Some(Self {
+            source_spelling: Spelling::new(text),
+            host: spelling.to_path_buf(),
+            spelled_host: spelling.to_path_buf(),
+            guest: spelling.to_path_buf(),
+            policy: match access {
+                BindAccess::ReadOnly => MountPolicy::BindReadOnly {
+                    follow_links: false,
+                },
+                BindAccess::ReadWrite => MountPolicy::BindReadWrite,
+            },
+            exclusions: Vec::new(),
+        })
+    }
+
     fn is_readonly(&self) -> bool {
         matches!(self.policy, MountPolicy::BindReadOnly { .. })
     }
@@ -203,6 +240,27 @@ impl ExtraMount {
     }
 }
 
+/// Which of a linked worktree's two Git metadata directories one automatic
+/// declaration is about. Diagnostics only, like [`MountOrigin`]: it never reaches
+/// [`same_declaration`] or `fork_id`, so an equivalent `--mount` still merges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GitMetadataRole {
+    /// The shared `$GIT_COMMON_DIR`: objects, refs, config, hooks, `worktrees/`.
+    Common,
+    /// This worktree's own `$GIT_COMMON_DIR/worktrees/<id>`: HEAD, index, logs.
+    Worktree,
+}
+
+impl GitMetadataRole {
+    /// The words every diagnostic and notice uses for this role.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Common => "common directory",
+            Self::Worktree => "per-worktree directory",
+        }
+    }
+}
+
 /// Where a declaration came from.
 ///
 /// Diagnostics only: never part of [`same_declaration`] or [`fork_id`]. A config
@@ -212,6 +270,12 @@ impl ExtraMount {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MountOrigin {
     Cli,
+    /// One of the two Git metadata binds `--git-mount` adds for a linked worktree
+    /// (#535). Built only by [`crate::git_metadata::discover`], which validated
+    /// the relationship before naming it.
+    GitMetadata {
+        role: GitMetadataRole,
+    },
     /// A verified user `mounts` entry: the file it came from and its index.
     /// Built only by [`crate::config_mounts`], from the verified read that
     /// authority was measured on.
@@ -264,6 +328,12 @@ impl fmt::Display for MountOrigin {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Cli => f.write_str("--mount"),
+            // Automatic and unattributable to a typed declaration, so the role is
+            // the whole name. `git rebase`-style advice belongs in the launch
+            // context, not here: one origin cannot know which flag skipped it.
+            Self::GitMetadata { role } => {
+                write!(f, "automatic Git metadata mount ({})", role.name())
+            }
             // Rendering the file through `quoted_path` escapes it the way the
             // rest of the config diagnostics do, so an entry point cannot forge
             // the rest of the sentence and one launch never shows two escapings
@@ -341,6 +411,16 @@ impl MountRequests {
     pub(crate) fn into_inner(self) -> Vec<MountRequest> {
         self.0
     }
+
+    /// The declarations as selected, before `prepare` consumes them.
+    ///
+    /// `git_metadata::discover` reads them to see whether an automatic bind would
+    /// land inside a route the user already declared (ADR-0062 D5). Borrowing
+    /// rather than cloning: the automatic side only needs each guest path, source
+    /// path and policy.
+    pub(crate) fn as_slice(&self) -> &[MountRequest] {
+        &self.0
+    }
 }
 
 #[cfg(test)]
@@ -404,22 +484,29 @@ pub(crate) enum Declaration<'a> {
         declaration: usize,
         index: usize,
     },
+    /// An automatic Git metadata bind (#535). Its spelling came from an untrusted
+    /// pointer file, so it takes the escaped arm everywhere.
+    GitMetadata { role: GitMetadataRole },
 }
 
 impl Declaration<'_> {
-    /// True for every config-sourced rendering: the byte-escaping policy that
-    /// keeps config-chosen text to one line and makes two entries that differ
-    /// only outside ASCII print differently.
-    fn is_config(self) -> bool {
+    /// True for every rendering that must byte-escape text: every config-sourced
+    /// declaration and the automatic Git metadata binds.
+    ///
+    /// Not named `is_config` any more, because the automatic origin is not config:
+    /// what the two share is that nobody typed the bytes, so a diagnostic must not
+    /// let them end the line they print on.
+    fn escapes_text(self) -> bool {
         !matches!(self, Self::Argv)
     }
-}
 
-impl Declaration<'_> {
     /// `--mount` or `mounts[N] in "<file>"`: the name a refusal starts with.
     pub(crate) fn subject(self) -> String {
         match self {
             Self::Argv => "--mount".to_string(),
+            Self::GitMetadata { role } => {
+                format!("automatic Git metadata mount ({})", role.name())
+            }
             Self::UserConfig { file, index } => {
                 format!("mounts[{index}] in {}", crate::one_line::quoted_path(file))
             }
@@ -456,7 +543,7 @@ impl Declaration<'_> {
         match self {
             Self::Argv => crate::one_line::text(spelling).to_string(),
             config => {
-                debug_assert!(config.is_config());
+                debug_assert!(config.escapes_text());
                 quoted_str(spelling)
             }
         }
@@ -470,7 +557,7 @@ impl Declaration<'_> {
         match self {
             Self::Argv => format!("{spelling:?}"),
             config => {
-                debug_assert!(config.is_config());
+                debug_assert!(config.escapes_text());
                 quoted_str(spelling)
             }
         }
@@ -491,7 +578,7 @@ impl Declaration<'_> {
         match self {
             Self::Argv => crate::one_line::path(path).to_string(),
             config => {
-                debug_assert!(config.is_config());
+                debug_assert!(config.escapes_text());
                 quoted_path(path)
             }
         }
@@ -512,7 +599,7 @@ impl Declaration<'_> {
         match self {
             Self::Argv => crate::one_line::path(path).to_string(),
             config => {
-                debug_assert!(config.is_config());
+                debug_assert!(config.escapes_text());
                 format!("{} {}", config.subject(), quoted_path(path))
             }
         }
@@ -541,6 +628,7 @@ fn declaration_origin<'a>(mount: &ExtraMount, origins: &'a DeclaredOrigins) -> D
             declaration: *declaration,
             index: *index,
         },
+        Some(MountOrigin::GitMetadata { role }) => Declaration::GitMetadata { role: *role },
         // A discovered bind is not a declaration, and `MountOrigin::Cli` is an
         // argv one; both keep the historical `--mount` text.
         Some(MountOrigin::Cli) | None => Declaration::Argv,
@@ -3878,6 +3966,13 @@ impl fmt::Display for ClaimError {
                         "{origin}: guest path {guest} collides with an agent-vm core mount; \
                          pass --no-config-mounts to launch without it"
                     ),
+                    // Nobody typed this declaration, so the only remedy the reader
+                    // can act on is the mode that skips discovery altogether.
+                    MountOrigin::GitMetadata { .. } => write!(
+                        f,
+                        "{origin}: guest path {guest} collides with an agent-vm core mount; \
+                         pass --git-mount=off to launch without automatic Git metadata mounts"
+                    ),
                 }
             }
             Self::Conflict {
@@ -3999,10 +4094,12 @@ pub(crate) fn normalize_request(request: MountRequest) -> Result<MountRequest, C
     })
 }
 
-/// Prepare a complete, closed mount plan.  This is deliberately the only
-/// boundary allowed to inspect mount sources or create fork state. The
-/// Pi-file, config-directory and persisted-guest-HOME guards all run before any
-/// fork/session mutation.
+/// Prepare a complete, closed mount plan. This is deliberately the only boundary
+/// allowed to create fork state, or to touch a mount source in any way other than
+/// the read-only Git metadata discovery that runs before it
+/// ([`crate::git_metadata::discover`] reads `.git`, `commondir` and two `HEAD`s
+/// and writes nothing). The Pi-file, config-directory and persisted-guest-HOME
+/// guards all run before any fork/session mutation.
 ///
 /// Declarations arrive as [`MountRequests`] so every one names the source it
 /// came from, whichever route produced it; from here on a config mount and a
@@ -4222,9 +4319,21 @@ pub(crate) fn prepare(
     // canonical source (after `expand_follow_links`), and forks carry their
     // committed `data` (after `sync_fork_representations`), never the original
     // source. Followed aliases are not scanned as separate roots.
+    //
+    // Automatic Git metadata binds are excluded (#535): they are not a declaration
+    // the user made, and the worktree they belong to is already a scan root, so
+    // scanning them again could only widen the GitHub allow-list towards a
+    // repository nobody asked for. An *equivalent* `--mount` keeps its own origin
+    // (requests are appended after argv), so it is still scanned.
     let repo_scan_roots = expanded
         .iter()
         .take(explicit_count)
+        .filter(|mount| {
+            !matches!(
+                origins.get(&mount.guest),
+                Some(MountOrigin::GitMetadata { .. })
+            )
+        })
         .map(|mount| RepoScanRoot {
             host: mount.host.clone(),
         })
@@ -4339,6 +4448,7 @@ fn discovered_by(declarations: &[(Declaration<'_>, String)]) -> String {
                     Declaration::UserTool { file, .. } => {
                         format!("tool mounts in {}", crate::one_line::quoted_path(file))
                     }
+                    Declaration::GitMetadata { .. } => "automatic Git metadata mounts".to_string(),
                 };
                 if !sources.contains(&source) {
                     sources.push(source);
@@ -5879,6 +5989,118 @@ mod prepare_tests {
         .unwrap();
         assert_eq!(plan.volumes.len(), 1);
         assert_eq!(plan.volumes[0].guest, PathBuf::from("/g/x"));
+    }
+
+    /// The two refusal sentences an automatic Git metadata bind (#535) can
+    /// produce, byte for byte: the core collision names the opt-out instead of a
+    /// flag nobody typed, and the conflict names the automatic origin beside the
+    /// declaration it disagreed with.
+    #[test]
+    fn git_metadata_claim_errors_are_pinned() {
+        let root = tempfile::tempdir().unwrap();
+        let common = root.path().join("repos/main/.git");
+        fs::create_dir_all(&common).unwrap();
+        let automatic = MountOrigin::GitMetadata {
+            role: GitMetadataRole::Common,
+        };
+        let automatic_request = || MountRequest {
+            origin: automatic.clone(),
+            mount: ExtraMount::automatic_bind(&common, BindAccess::ReadOnly)
+                .expect("a UTF-8 fixture path"),
+        };
+
+        let mut with_core = context(root.path());
+        with_core.core_guest_mounts = vec![common.clone()];
+        let error = claim(vec![automatic_request()], &with_core.core_guest_mounts).unwrap_err();
+        assert_eq!(
+            format!("{error}"),
+            format!(
+                "{automatic}: guest path {} collides with an agent-vm core mount; \
+                 pass --git-mount=off to launch without automatic Git metadata mounts",
+                common.display()
+            )
+        );
+
+        let error = claim(
+            vec![
+                MountRequest {
+                    origin: MountOrigin::Cli,
+                    // Writable, so it differs from the automatic read-only
+                    // declaration at the same guest path.
+                    mount: parse_mount_spec(
+                        &common.display().to_string(),
+                        HostSyntax::AbsoluteOnly,
+                    )
+                    .expect("the fixture declaration parses"),
+                },
+                automatic_request(),
+            ],
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(
+            format!("{error}"),
+            format!(
+                "guest path {} is claimed by different declarations (--mount and {automatic}); \
+                 identical declarations are merged and different ones are refused",
+                common.display()
+            )
+        );
+    }
+
+    /// An automatic Git metadata bind is not a repository-scanning root (#535):
+    /// the worktree it belongs to is already one, and scanning the metadata would
+    /// let a `--git-mount` change the GitHub allow-list. An *equivalent* explicit
+    /// declaration keeps its own origin, is scanned as before, and is the only
+    /// entry in the list.
+    #[test]
+    fn git_metadata_binds_are_not_repo_scan_roots() {
+        let root = tempfile::tempdir().unwrap();
+        let common = root.path().join("repos/main/.git");
+        fs::create_dir_all(&common).unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let automatic = MountRequest {
+            origin: MountOrigin::GitMetadata {
+                role: GitMetadataRole::Common,
+            },
+            mount: ExtraMount::automatic_bind(&common, BindAccess::ReadOnly)
+                .expect("a UTF-8 fixture path"),
+        };
+
+        let plan = prepare(
+            MountRequests::new(vec![automatic.clone()]),
+            &context(store.path()),
+        )
+        .unwrap();
+        assert!(
+            plan.repo_scan_roots.is_empty(),
+            "an automatic bind is not a scan root: {:?}",
+            plan.repo_scan_roots
+        );
+
+        let plan = prepare(
+            MountRequests::new(vec![
+                MountRequest {
+                    origin: MountOrigin::Cli,
+                    mount: parse_mount_spec(
+                        &format!("{}:ro", common.display()),
+                        HostSyntax::AbsoluteOnly,
+                    )
+                    .expect("the fixture declaration parses"),
+                },
+                automatic,
+            ]),
+            &context(store.path()),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.repo_scan_roots
+                .iter()
+                .map(|root| root.host.clone())
+                .collect::<Vec<_>>(),
+            vec![common.canonicalize().unwrap()],
+            "the argv declaration keeps its own origin and is scanned once"
+        );
     }
 
     /// One refusal, two renderings: the argv half of every sentence the config

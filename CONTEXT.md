@@ -698,6 +698,15 @@ _Avoid_: "verified module" — the unit is the decision, not the module it lives
 in; "contract test" — a test samples the input space, a contract is checked for
 all inputs.
 
+## Git metadata mount
+
+An additional live mount exposing the per-worktree or shared Git metadata of
+the linked worktree at the launch directory; it is not a mount of another
+checkout. Its mode describes that additional mount, not repository-wide write
+permissions.
+
+_Avoid_: "read-only repository", which promises more than a mount mode.
+
 ## Forked mount
 
 A writable, project-scoped persistent mount initialized once from a host
