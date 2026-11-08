@@ -283,7 +283,7 @@ fn config_dir(h: &Harness) -> PathBuf {
 fn hash_project(project: &Path) -> String {
     use sha2::{Digest, Sha256};
     use std::os::unix::ffi::OsStrExt;
-    // session.rs::hash_path: first six SHA-256 bytes over the canonical path.
+    // project.rs::digest_hex: the 12-hex prefix of SHA-256 over the canonical path.
     let path = project.canonicalize().unwrap();
     Sha256::digest(path.as_os_str().as_bytes())[..6]
         .iter()

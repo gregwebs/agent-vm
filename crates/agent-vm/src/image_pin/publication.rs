@@ -22,27 +22,46 @@ use anyhow::{Context as _, Result, anyhow};
 use super::*;
 use crate::image_publish::{Published, ResultReference};
 
+/// The key a publication preflight checked, carried to the approval that
+/// follows the Docker run: a build/import approves under the project and
+/// result key its own preflight checked, however long Docker ran in between.
+pub(crate) struct PublicationScope {
+    key: PinKey,
+}
+
 /// A bounded advisory check before any Docker work or publication: refuse early
 /// when HOME is unusable or the store is unreadable/damaged/locked. A pass does
 /// not promise the later commit can be saved (write permission, capacity,
 /// revisions and concurrent writers are only known at commit). The observation
 /// is discarded: the predecessor is re-read after the read-back.
-pub(crate) fn publication_preflight(result: &ResultReference) -> Result<()> {
+pub(crate) fn publication_preflight(
+    result: &ResultReference,
+    project: &ProjectDir,
+) -> Result<PublicationScope> {
     let target = OciTarget::parse(result.as_str())
         .map_err(|_| anyhow!("the result reference is not a usable OCI target"))?;
-    lookup(&PinKey::new(&target)?).map(drop).context(
-        "checking the host image approval before publishing; nothing was built or imported",
-    )
+    let key = PinKey::new(&ProjectId::of(project), &target)?;
+    lookup(&key).map(drop).context(
+        "checking the project image approval before publishing; nothing was built or imported",
+    )?;
+    Ok(PublicationScope { key })
 }
 
-pub(crate) async fn approve_published(published: &Published) -> Result<()> {
+pub(crate) async fn approve_published(
+    published: &Published,
+    scope: &PublicationScope,
+) -> Result<()> {
     let label = ImageLabel::for_result_reference(&published.target().canonical().whole());
-    approve(published, &label)
+    approve(published, &label, scope)
         .await
         .with_context(|| crate::image_publish::approval_not_updated(label.text()))
 }
 
-async fn approve(published: &Published, label: &ImageLabel) -> Result<()> {
+async fn approve(
+    published: &Published,
+    label: &ImageLabel,
+    scope: &PublicationScope,
+) -> Result<()> {
     store::published_ready()?;
     let prepared = acquire_or_render(
         published.target(),
@@ -54,7 +73,12 @@ async fn approve(published: &Published, label: &ImageLabel) -> Result<()> {
     if prepared.image().acquired_digest() != published.digest() {
         return Err(moved_before_approval());
     }
-    let candidate = ValidatedCandidate::from_image(prepared.image())?;
+    let candidate = ValidatedCandidate::from_image(prepared.image(), &scope.key.project)?;
+    if candidate.key != scope.key {
+        return Err(anyhow!(
+            "internal error: the published result is not the reference the preflight checked"
+        ));
+    }
     store::candidate_ready()?;
     let approval = match lookup(&candidate.key)? {
         Some(pin) if pin.digest == candidate.digest => Approval::equivalent(&pin, &candidate),

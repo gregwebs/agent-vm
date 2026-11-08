@@ -15,7 +15,7 @@
 //!
 //! # Why this module only encodes, decodes and snapshots now
 //!
-//! The record's *decisions* belong to the host approval authority: the first pin
+//! The record's *decisions* belong to the project approval authority: the first pin
 //! and the fallback are committed as one journaled transaction
 //! ([`crate::image_pin`]), because a fallback can only be retained for content
 //! that was measured and approved. So the mutators that used to live here are

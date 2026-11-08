@@ -185,7 +185,7 @@ const DEFAULT_TOOLS_TOML: &str = include_str!("default-tools.toml");
 
 /// Where the two config files live. `user` is `None` only when `$HOME` is
 /// unavailable; the project path is always the canonical cwd plus the fixed
-/// relative location (consistent with [`crate::session::ProjectSession::for_cwd`]).
+/// relative location (consistent with [`crate::project::ProjectDir::capture`]).
 pub(crate) struct ConfigPaths {
     pub(crate) user: Option<PathBuf>,
     pub(crate) project: PathBuf,

@@ -121,6 +121,7 @@ use crate::credential_resolver;
 use crate::credential_yaml::{AuthorizationSet, GuestEnvName, SourceKind, SourceSelection};
 use crate::host_credential::{AnthropicHostRead, ReadBudget, Unusable, read_anthropic};
 use crate::pi_credential_inspection::{PiCredentialReport, inspect_project};
+use crate::project::ProjectDir;
 use crate::secret_store::{Availability, ServiceName};
 
 #[derive(ClapArgs)]
@@ -190,6 +191,11 @@ fn run_to(
     out: &mut impl std::io::Write,
     gather_store: impl FnOnce() -> Result<Availability>,
 ) -> Result<()> {
+    // The one capture for this command. Doctor is a report: an unreadable cwd
+    // is rendered with its cause, never a failed run, so the capture is held as
+    // data rather than `?`-propagated.
+    #[allow(clippy::disallowed_methods)] // one capture per command: every consumer borrows it.
+    let project = ProjectDir::capture();
     let msb_home = crate::msb_install::msb_home_dir()?;
 
     if !args.reset_msb_db {
@@ -258,7 +264,10 @@ fn run_to(
             )?;
             write_line(out, "")?;
         }
-        write_line(out, &describe_credentials(&gather_credentials(), &launch))?;
+        write_line(
+            out,
+            &describe_credentials(&gather_credentials(&project), &launch),
+        )?;
         write_line(out, "")?;
         // Submit preceding sections before a native read can emit its slow notice.
         out.flush().context("writing doctor output")?;
@@ -280,7 +289,11 @@ fn run_to(
         // status or writes anything.
         if let Some(boot) = selection {
             let cached = match crate::msb_install::cache_dir_for(&msb_home) {
-                Ok(cache_dir) => crate::image_pin::cached_request_labels(&boot, &cache_dir),
+                Ok(cache_dir) => crate::image_pin::cached_request_labels(
+                    &boot,
+                    project.as_ref().ok(),
+                    &cache_dir,
+                ),
                 Err(_) => crate::image_requests::CachedLabels::LocationUnknown,
             };
             write_line(out, "")?;
@@ -406,8 +419,9 @@ struct CredReport {
     /// a directory name carrying a newline cannot split the table.
     hosts: Vec<(&'static str, Option<PathBuf>, HostCred)>,
     /// The project `doctor` was run in, and whether its per-project
-    /// host-only token files exist. `None` when the cwd can't be resolved.
-    project: Option<ProjectCreds>,
+    /// host-only token files exist. Never absent: an unresolved capture is
+    /// [`ProjectCreds::Unresolved`], so the report can always say why.
+    project: ProjectCreds,
     /// `now` in epoch ms, for rendering "expires in ...".
     now_ms: i64,
     /// The Anthropic row's macOS keychain clause. Additive on purpose: every
@@ -416,7 +430,18 @@ struct CredReport {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct ProjectCreds {
+enum ProjectCreds {
+    /// The project's measured state.
+    Measured(MeasuredProject),
+    /// Why this project's state could not be measured. Rendered, never dropped:
+    /// the cause is either the cwd capture or the state-directory derive, and
+    /// both are things the user can act on. An absent row with no cause sends
+    /// them looking for a bug that is really a capture failure.
+    Unresolved { why: String },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct MeasuredProject {
     /// Both measured: the resolved project cwd and this project's state dir.
     /// Escaped by [`describe_credentials`] at the point of printing.
     dir: PathBuf,
@@ -434,7 +459,7 @@ struct ProjectCreds {
 /// per-project capture state for the cwd. Never prints or returns token
 /// bytes — only presence, parseability, and the Claude expiry, which is
 /// exactly what a user debugging "the in-VM agent is signed out" needs.
-fn gather_credentials() -> CredReport {
+fn gather_credentials(project: &Result<ProjectDir>) -> CredReport {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -474,7 +499,7 @@ fn gather_credentials() -> CredReport {
 
     CredReport {
         hosts,
-        project: gather_project_creds(),
+        project: gather_project_creds(project),
         now_ms,
         anthropic_keychain: keychain_view(&anthropic),
     }
@@ -562,8 +587,23 @@ impl From<&Unusable> for HostCred {
     }
 }
 
-fn gather_project_creds() -> Option<ProjectCreds> {
-    let session = crate::session::ProjectSession::for_cwd().ok()?;
+fn gather_project_creds(project: &Result<ProjectDir>) -> ProjectCreds {
+    let project = match project {
+        Ok(project) => project,
+        Err(error) => {
+            return ProjectCreds::Unresolved {
+                why: format!("{error:#}"),
+            };
+        }
+    };
+    let session = match crate::session::ProjectSession::for_project(project) {
+        Ok(session) => session,
+        Err(error) => {
+            return ProjectCreds::Unresolved {
+                why: format!("{error:#}"),
+            };
+        }
+    };
     let captured = [
         (
             "claude",
@@ -583,7 +623,7 @@ fn gather_project_creds() -> Option<ProjectCreds> {
     .filter(|(_, path)| path.exists())
     .map(|(label, _)| label)
     .collect();
-    Some(ProjectCreds {
+    ProjectCreds::Measured(MeasuredProject {
         dir: session.project_dir.clone(),
         state_dir: session.state_dir.clone(),
         captured,
@@ -710,25 +750,34 @@ fn describe_credentials(report: &CredReport, launch: &LaunchView) -> String {
     }
 
     match &report.project {
-        None => out.push_str("\n==> this project: <cwd could not be resolved>\n"),
-        Some(project) => {
+        ProjectCreds::Unresolved { why } => out.push_str(&format!(
+            "\n==> this project: <cwd could not be resolved: {}>\n",
+            crate::config::quoted_str(why)
+        )),
+        ProjectCreds::Measured(MeasuredProject {
+            dir,
+            state_dir,
+            captured,
+            guest_claude_placeholder,
+            pi_credentials,
+        }) => {
             out.push_str(&format!(
                 "\n==> this project\ndir:      {}\nstate:    {}\ncaptured: {}\nguest Claude cred file: {}\n",
-                crate::one_line::path(&project.dir),
-                crate::one_line::path(&project.state_dir),
-                if project.captured.is_empty() {
+                crate::one_line::path(dir),
+                crate::one_line::path(state_dir),
+                if captured.is_empty() {
                     "<none> (nothing to substitute on the wire)".to_string()
                 } else {
-                    project.captured.join(", ")
+                    captured.join(", ")
                 },
-                if project.guest_claude_placeholder {
+                if *guest_claude_placeholder {
                     "placeholder present"
                 } else {
                     "absent"
                 },
             ));
             out.push('\n');
-            out.push_str(&project.pi_credentials.doctor_section());
+            out.push_str(&pi_credentials.doctor_section());
         }
     }
 
@@ -1613,7 +1662,10 @@ mod tests {
             }
         }
         fn normalize(&self, text: &str) -> String {
-            let session = crate::session::ProjectSession::for_cwd().unwrap();
+            let project =
+                crate::project::ProjectDir::from_path_for_tests(&std::env::current_dir().unwrap())
+                    .unwrap();
+            let session = crate::session::ProjectSession::for_project(&project).unwrap();
             text.replace(&session.state_dir.display().to_string(), "<project-state>")
                 .replace(
                     &self
@@ -2472,7 +2524,7 @@ A fresh database will be created on the next `agent-vm shell`/`run`.
     #[test]
     fn the_project_section_cannot_forge_a_line() {
         let mut r = report(vec![]);
-        let project = r.project.as_mut().unwrap();
+        let project = r.project.measured_mut();
         project.dir = PathBuf::from("/work/pr\nFORGED-PROJECT");
         project.state_dir = PathBuf::from("/state/st\nFORGED-STATE");
 
@@ -2615,7 +2667,7 @@ A fresh database will be created on the next `agent-vm shell`/`run`.
         );
         // Absent: the fourth one has no file at all.
 
-        let report = gather_credentials();
+        let report = gather_credentials(&Err(anyhow!("reading current directory: no cwd")));
         let text = describe_credentials(&report, &LaunchView::default());
         let detail = |label: &str| {
             let mut lines = text.lines();
@@ -2692,10 +2744,23 @@ A fresh database will be created on the next `agent-vm shell`/`run`.
         assert_eq!(describe_expiry(0, 15 * 60_000), "EXPIRED 15m ago");
     }
 
+    impl ProjectCreds {
+        /// The measured row, for the tests that rewrite one of its fields.
+        /// A fixture that is unresolved is a test bug, not a rendered cause.
+        fn measured_mut(&mut self) -> &mut MeasuredProject {
+            match self {
+                Self::Measured(project) => project,
+                Self::Unresolved { why } => {
+                    panic!("this fixture is measured, not unresolved: {why}")
+                }
+            }
+        }
+    }
+
     fn report(hosts: Vec<(&'static str, Option<PathBuf>, HostCred)>) -> CredReport {
         CredReport {
             hosts,
-            project: Some(ProjectCreds {
+            project: ProjectCreds::Measured(MeasuredProject {
                 dir: PathBuf::from("/p"),
                 state_dir: PathBuf::from("/s/abc"),
                 captured: vec!["claude"],
@@ -2705,6 +2770,26 @@ A fresh database will be created on the next `agent-vm shell`/`run`.
             now_ms: 0,
             anthropic_keychain: None,
         }
+    }
+
+    /// A project row that could not be measured states its cause. Doctor's job
+    /// is the diagnosis: an absent row without one is the bug this row exists to
+    /// prevent.
+    #[test]
+    fn an_unresolved_project_renders_its_cause() {
+        let mut unresolved = report(Vec::new());
+        unresolved.project = ProjectCreds::Unresolved {
+            why: "canonicalizing current directory: No such file or directory (os error 2)"
+                .to_string(),
+        };
+
+        let text = describe_credentials(&unresolved, &LaunchView::default());
+
+        assert!(
+            text.contains("==> this project: <cwd could not be resolved: "),
+            "{text}"
+        );
+        assert!(text.contains("No such file or directory"), "{text}");
     }
 
     #[test]
@@ -3112,8 +3197,8 @@ substituted."#;
                 expires_at_ms: Some(HOUR_MS),
             },
         )]);
-        r.project.as_mut().unwrap().captured.clear();
-        r.project.as_mut().unwrap().guest_claude_placeholder = false;
+        r.project.measured_mut().captured.clear();
+        r.project.measured_mut().guest_claude_placeholder = false;
 
         let text = describe_credentials(&r, &LaunchView::default());
 

@@ -1,4 +1,4 @@
-//! Candidate-scoped consent for replacing one host approval.
+//! Candidate-scoped consent for replacing one project's approval.
 //!
 //! Everything the human decision needs is bound here and nowhere else: the
 //! escaped source, the platform the approval is keyed by, and the two full
@@ -57,7 +57,7 @@ pub(super) struct ApprovalRequest<'a> {
 impl ApprovalRequest<'_> {
     fn render(&self) -> String {
         format!(
-            "Replace the approved image for {} ({})?\n  old: {}\n  new: {}\n",
+            "Replace the approved image for {} ({}) in this project?\n  old: {}\n  new: {}\n",
             self.source,
             self.platform.render(),
             self.old.as_str(),
@@ -124,7 +124,7 @@ fn publication_render(
     new: &ManifestDigest,
 ) -> String {
     format!(
-        "Approving the image published as {} ({}):\n  old: {}\n  new: {}\n",
+        "Approving the image published as {} ({}) for this project:\n  old: {}\n  new: {}\n",
         source,
         platform.render(),
         old.map_or("none".to_string(), |pin| pin.digest.as_str().to_string()),
@@ -251,7 +251,7 @@ fn prompt_is_permitted(facts: TerminalFacts) -> (ok: bool)
 mod tests {
     use super::*;
     use crate::image_acquire::OciTarget;
-    use crate::image_pin::{PinKey, PinRevision};
+    use crate::image_pin::{PinKey, PinRevision, ProjectId};
 
     #[test]
     fn pure_decisions_match_their_truth_tables() {
@@ -348,6 +348,10 @@ mod tests {
         assert!(text.contains(&"b".repeat(96)));
         assert!(text.contains("(linux/"));
         assert!(
+            text.contains(" in this project?"),
+            "the prompt names the approval scope: {text}"
+        );
+        assert!(
             !text.contains('\u{1b}'),
             "no raw control byte reaches the terminal"
         );
@@ -361,7 +365,11 @@ mod tests {
         let platform = HostLinuxPlatform::for_tests();
         let old = ManifestDigest::parse(&format!("sha256:{}", "a".repeat(64))).unwrap();
         let new = ManifestDigest::parse(&format!("sha384:{}", "b".repeat(96))).unwrap();
-        let key = PinKey::new(&OciTarget::parse("example.com/team/app:dev").unwrap()).unwrap();
+        let key = PinKey::new(
+            &ProjectId::for_tests('a'),
+            &OciTarget::parse("example.com/team/app:dev").unwrap(),
+        )
+        .unwrap();
         let previous = ApprovedPin {
             key,
             digest: old.clone(),
@@ -383,6 +391,10 @@ mod tests {
             "{replacement}"
         );
         assert!(replacement.contains("(linux/"));
+        assert!(
+            replacement.contains(" for this project:"),
+            "the render names the approval scope: {replacement}"
+        );
         assert!(replacement.contains("\\x1b"), "the escape is visible");
         assert!(
             !replacement.contains('\u{1b}'),

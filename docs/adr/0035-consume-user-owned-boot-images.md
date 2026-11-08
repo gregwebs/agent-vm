@@ -7,11 +7,12 @@ slice 2 of [agent-vm #257](https://github.com/gregwebs/agent-vm/issues/257);
 the retained-default decision below is [agent-vm
 #261](https://github.com/gregwebs/agent-vm/issues/261), slice 4 (amended, see
 *Decision*). Explicit replacement is implemented by [#262](https://github.com/gregwebs/agent-vm/issues/262).
-Amended for **all-source host-wide approval** by [agent-vm
+Amended for **all-source approval** by [agent-vm
 #390](https://github.com/gregwebs/agent-vm/issues/390) and
 [ADR-0047](0047-host-wide-oci-image-approval.md): every OCI selection is now
 pinned, a changed pin needs candidate-scoped consent, and launches consume only
-approved child content.
+approved child content. That approval is per **project** since #532
+([ADR-0063](0063-project-scoped-oci-image-approval.md)).
 Supersedes [ADR-0003](0003-project-tooling-layers.md),
 [ADR-0019](0019-tool-free-base-and-per-tool-layers.md) and
 [ADR-0028](0028-explicit-image-flag-beats-the-other-environment-variable.md).
@@ -77,9 +78,9 @@ the contributor gitlink and launcher recommendation, without a runtime source de
   a changed pin requires candidate-scoped consent (escaped source, full old/new
   digests, default No) from `--yes` on either `image refresh` or
   `image set-default`, or from an interactive terminal on both ends of either
-  verb. The approval store is host-wide in
-  `$HOME/.config/agent-vm/image-pins.json`, independent of projects, the cache
-  and `AGENT_VM_STATE_DIR`. A digest selection keeps its stated identity —
+  verb. The approval store is per **project** ([ADR-0063](0063-project-scoped-oci-image-approval.md))
+  in `$HOME/.config/agent-vm/image-pins.json`, independent of the cache and of
+  `AGENT_VM_STATE_DIR`. A digest selection keeps its stated identity —
   mismatching content is an integrity failure, never an approvable replacement —
   while a multiarch index may resolve to its verified child. Equivalence for “no
   replacement needed” is native guest content (verified config digest plus
@@ -192,7 +193,7 @@ the contributor gitlink and launcher recommendation, without a runtime source de
   [ADR-0043](0043-image-command-group-and-daemon-import.md)). Native behaviour and
   live-guest observations are manual evidence; boot-free checks cannot prove
   guest execution. See
-  [USAGE](../../USAGE.md#host-wide-approval-of-oci-image-content).
+  [USAGE](../../USAGE.md#project-scoped-approval-of-oci-image-content).
 - Follow-up evidence: [#265](https://github.com/gregwebs/agent-vm/issues/265)
   (native installed consumption on both architectures).
 

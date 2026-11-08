@@ -9,7 +9,7 @@
 //!
 //! This is the explicit operation that *checks for movement*: it re-resolves the
 //! selected source even when the cache is warm, then hands the validated
-//! candidate to the host approval authority ([`crate::image_pin::update`]). A
+//! candidate to the project's approval authority ([`crate::image_pin::update`]). A
 //! replaced approval needs the user's consent — this command's own `--yes`, or a
 //! default-No prompt on a terminal — and a decline, an interruption or any
 //! acquisition/publication failure leaves the previous approval and default
@@ -26,6 +26,7 @@ use crate::boot_image;
 use crate::config::{Catalog, ConfiguredImages};
 use crate::image_acquire::{OciTarget, OciTargetError};
 use crate::image_pin::{ApprovalMode, ExplicitOperation};
+use crate::project::ProjectDir;
 
 /// The fixed refusal for a refresh target that is a local rootfs or disk path.
 /// Names no value: the rejected text is user input.
@@ -62,6 +63,8 @@ pub struct Args {
 }
 
 pub async fn run(args: Args, catalog: Catalog, images: ConfiguredImages) -> Result<()> {
+    #[allow(clippy::disallowed_methods)] // one capture per command: every consumer borrows it.
+    let project = ProjectDir::capture()?;
     // The native pull still reaches the shared microsandbox state (its cache and
     // registry configuration), so it can hit the same forward-migrated-DB crash
     // as the boot path. See src/msb_preflight.rs and issue #30.
@@ -85,6 +88,7 @@ pub async fn run(args: Args, catalog: Catalog, images: ConfiguredImages) -> Resu
     // returns.
     crate::image_pin::update(
         ExplicitOperation::Refresh(&boot),
+        &project,
         ApprovalMode::of_flag(args.yes),
     )
     .await?;

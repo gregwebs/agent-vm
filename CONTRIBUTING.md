@@ -951,11 +951,17 @@ invocations keep dependency logging unchanged. The CLI regression
 default-tier `RUST_LOG=trace image refresh` leaks no repository marker and includes a
 positive explicit-source control.
 
-The host approval store is a third seam. A test that wants a pre-approved host
-writes `$HOME/.config/agent-vm/image-pins.json` (strict version 1, one entry per
-canonical reference + platform) through the compiled CLI or by copying
-CLI-produced bytes; a hand-built store must satisfy the same strict schema, or
-the test is asserting corruption, not approval. Pin lookups take a shared lock
+The host approval store is a third seam, and since #532 it is **per project**
+([ADR-0063](docs/adr/0063-project-scoped-oci-image-approval.md)). A test that
+wants a pre-approved host writes `$HOME/.config/agent-vm/image-pins.json` (strict
+version 2, one entry per project + canonical reference + platform) through the
+compiled CLI or by copying CLI-produced bytes; a hand-built store must satisfy
+the same strict schema, or the test is asserting corruption, not approval. An
+explicit command (`image refresh`, `set-default`, `build`, `import`, `setup`)
+must run in the same directory as the launch it asserts on: the project is the
+command's cwd, and a different cwd is a different project's approval. A
+version-1 store is refused outright, so an old fixture proves the legacy
+refusal, not approval. Pin lookups take a shared lock
 and create nothing, so an absent store is a legal read-only state; mutations
 create the directory and lock. A changed pin needs `--yes` or both stdin and
 stderr on a real PTY — except on `image build`/`image import`, which approve

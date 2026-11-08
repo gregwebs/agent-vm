@@ -141,5 +141,6 @@ for builder prerequisites and host-build trust.
   the way they do.
 - [Host-wide OCI image approval](docs/adr/0047-host-wide-oci-image-approval.md) —
   why every selected image is pinned per host platform and how a digest change is
-  approved.
+  approved, and [project-scoped approval](docs/adr/0063-project-scoped-oci-image-approval.md)
+  — why that approval is now per project.
 - [CODING_STANDARDS.md](CODING_STANDARDS.md) — repo coding standards.

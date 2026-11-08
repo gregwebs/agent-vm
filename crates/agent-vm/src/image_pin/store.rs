@@ -27,6 +27,12 @@ use crate::config;
 use crate::host_paths::{self, FlockMode, FlockWait};
 
 const MAX_BYTES: u64 = 4 * 1024 * 1024;
+const STORE_VERSION: u32 = 2;
+/// The host-wide format before #532. Recognized only to refuse it with upgrade
+/// instructions: it is never read, rewritten, moved or recovered, because
+/// guessing which project each approval belonged to would authorize content
+/// nothing measured.
+const LEGACY_VERSION: u32 = 1;
 const READ_WAIT: Duration = Duration::from_secs(2);
 const WRITE_WAIT: Duration = Duration::from_secs(30);
 
@@ -131,10 +137,17 @@ struct PinFile {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PinRecord {
+    project: String,
     reference: String,
     platform: HostLinuxPlatform,
     manifest_digest: String,
     revision: u64,
+}
+/// Lenient on purpose: it reads only `version`, so a legacy file is recognized
+/// even though version 2's strict schema rejects it.
+#[derive(Deserialize)]
+struct VersionProbe {
+    version: u32,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -146,9 +159,11 @@ struct PendingDefault {
 
 impl PinRecord {
     fn validated(&self) -> Result<ApprovedPin> {
+        let project = ProjectId::parse(&self.project).map_err(|()| corrupt())?;
         let reference = CanonicalOciReference::parse(&self.reference).map_err(|_| corrupt())?;
         let digest = ManifestDigest::parse(&self.manifest_digest).map_err(|_| corrupt())?;
         if !pin_fields_are_acceptable(PinFieldFacts {
+            project: project_id_bytes_are_acceptable(&self.project),
             source_bounded: source_within_limit(self.reference.len()),
             canonical: reference.whole() == self.reference,
             platform: self.platform.valid(),
@@ -159,6 +174,7 @@ impl PinRecord {
         }
         Ok(ApprovedPin {
             key: PinKey {
+                project,
                 reference,
                 platform: self.platform.clone(),
             },
@@ -168,6 +184,7 @@ impl PinRecord {
     }
     fn of(pin: &ApprovedPin) -> Self {
         Self {
+            project: pin.key.project.as_str().to_owned(),
             reference: pin.key.reference.whole(),
             platform: pin.key.platform.clone(),
             manifest_digest: pin.digest.as_str().to_owned(),
@@ -179,7 +196,7 @@ impl PinRecord {
 impl PinFile {
     fn empty() -> Self {
         Self {
-            version: 1,
+            version: STORE_VERSION,
             pins: Vec::new(),
             pending_default: None,
         }
@@ -187,6 +204,17 @@ impl PinFile {
     fn decode(bytes: &[u8]) -> Result<Self> {
         if !store_bytes_within_limit(bytes.len()) {
             return Err(corrupt());
+        }
+        // Every read path (observation and `begin`'s pre-read) reaches this
+        // before the directory, a lock or a record exists, so a legacy store is
+        // refused before any approval-authority write.
+        if matches!(
+            serde_json::from_slice::<VersionProbe>(bytes),
+            Ok(VersionProbe {
+                version: LEGACY_VERSION
+            })
+        ) {
+            return Err(legacy());
         }
         let file: Self = serde_json::from_slice(bytes).map_err(|_| corrupt())?;
         file.validate()?;
@@ -201,6 +229,7 @@ impl PinFile {
         for record in &self.pins {
             record.validated()?;
             unique &= keys.insert((
+                record.project.clone(),
                 record.reference.clone(),
                 record.platform.os.clone(),
                 record.platform.architecture.clone(),
@@ -219,10 +248,18 @@ impl PinFile {
         Ok(())
     }
     fn encode(&self) -> Result<Vec<u8>> {
+        // Growth past either bound is a full store, not damage: the file on disk
+        // is still well-formed, and reporting it as damage would tell a user to
+        // restore a backup that does not exist. The byte bound is checked after
+        // serializing, because that is where the size is known. Decoding keeps
+        // `corrupt()` for an over-bound file on disk: there it *is* damage.
+        if !pin_count_within_limit(self.pins.len()) {
+            return Err(full());
+        }
         self.validate()?;
         let bytes = serde_json::to_vec(self).map_err(|_| corrupt())?;
-        if !store_bytes_within_limit(bytes.len()) || !pin_count_within_limit(self.pins.len()) {
-            return Err(corrupt());
+        if !store_bytes_within_limit(bytes.len()) {
+            return Err(full());
         }
         Ok(bytes)
     }
@@ -251,6 +288,21 @@ pub(super) fn candidate_ready() -> Result<()> {
 fn corrupt() -> anyhow::Error {
     anyhow!(
         "image pin authority at $HOME/.config/agent-vm/image-pins.json is damaged; restore its intended records from backup or deliberately move it aside to reset approvals"
+    )
+}
+fn legacy() -> anyhow::Error {
+    anyhow!(
+        "image pin authority at $HOME/.config/agent-vm/image-pins.json uses the host-wide \
+         version 1 format, which this agent-vm no longer reads: approvals are now per \
+         project. Archiving it resets approvals, and mutable tags may then resolve to newer \
+         content; see \"Upgrading from host-wide approvals\" in USAGE.md"
+    )
+}
+fn full() -> anyhow::Error {
+    anyhow!(
+        "image pin authority at $HOME/.config/agent-vm/image-pins.json holds the maximum \
+         number of approvals it can store (the record or byte bound), so nothing was approved; \
+         archive it to reset approvals"
     )
 }
 fn failure() -> anyhow::Error {
@@ -354,10 +406,15 @@ impl Store {
     /// the pin lock is always taken before the default lock, and any previous
     /// intent is recovered here — the only place recovery happens.
     fn begin(&self, touch_default: bool) -> Result<(PinFile, Locks)> {
-        let preread = self.read()?;
+        // Before the pre-read, matching `observe_slot`: a record without its
+        // stable lock is damage on both paths, whatever the record's version.
+        // Only a lockless legacy store observes this order (it used to report
+        // the legacy error here and now reports damage, as a version-1 binary
+        // already did for it).
         if exists(&self.record())? && !exists(&self.lock_path())? {
             return Err(corrupt());
         }
+        let preread = self.read()?;
         if touch_default
             || preread
                 .as_ref()
@@ -766,11 +823,19 @@ mod tests {
     }
 
     const SOURCE: &str = "docker.io/library/alpine:latest";
+    /// The project every single-project fixture uses: one fill character, so a
+    /// row that accidentally scopes to another project cannot pass by luck.
+    fn project() -> ProjectId {
+        ProjectId::for_tests('a')
+    }
     fn candidate(byte: char) -> ValidatedCandidate {
+        candidate_in(&project(), byte)
+    }
+    fn candidate_in(project: &ProjectId, byte: char) -> ValidatedCandidate {
         // This test-only constructor exercises the store independently of
         // registry I/O. Production construction requires ValidatedImage.
         ValidatedCandidate {
-            key: PinKey::new(&OciTarget::parse(SOURCE).unwrap()).unwrap(),
+            key: PinKey::new(project, &OciTarget::parse(SOURCE).unwrap()).unwrap(),
             digest: ManifestDigest::parse(&format!("sha256:{}", byte.to_string().repeat(64)))
                 .unwrap(),
             identity: ContentIdentity {
@@ -789,7 +854,7 @@ mod tests {
     fn file() -> PinFile {
         let c = candidate('a');
         PinFile {
-            version: 1,
+            version: STORE_VERSION,
             pins: vec![PinRecord::of(&ApprovedPin {
                 key: c.key,
                 digest: c.digest,
@@ -829,7 +894,13 @@ mod tests {
             v.as_object_mut().unwrap().remove(field);
             cases.push(serde_json::to_vec(&v).unwrap());
         }
-        for field in ["reference", "platform", "manifest_digest", "revision"] {
+        for field in [
+            "project",
+            "reference",
+            "platform",
+            "manifest_digest",
+            "revision",
+        ] {
             let mut v = value.clone();
             v["pins"][0].as_object_mut().unwrap().remove(field);
             cases.push(serde_json::to_vec(&v).unwrap());
@@ -843,7 +914,7 @@ mod tests {
             cases.push(serde_json::to_vec(&v).unwrap());
         }
         for (path, bad) in [
-            ("version", serde_json::json!(2)),
+            ("version", serde_json::json!(3)),
             ("version", serde_json::json!("1")),
             ("extra", serde_json::json!(null)),
         ] {
@@ -852,6 +923,12 @@ mod tests {
             cases.push(serde_json::to_vec(&v).unwrap());
         }
         for (field, bad) in [
+            ("project", serde_json::json!("")),
+            ("project", serde_json::json!("a".repeat(63))),
+            ("project", serde_json::json!("a".repeat(65))),
+            ("project", serde_json::json!("A".repeat(64))),
+            ("project", serde_json::json!("g".repeat(64))),
+            ("project", serde_json::json!(7)),
             ("reference", serde_json::json!("alpine")),
             (
                 "reference",
@@ -883,7 +960,7 @@ mod tests {
         }
         let text = String::from_utf8(valid.clone()).unwrap();
         cases.push(
-            text.replacen("\"version\":1", "\"version\":1,\"version\":1", 1)
+            text.replacen("\"version\":2", "\"version\":2,\"version\":2", 1)
                 .into_bytes(),
         );
         cases.push(
@@ -1481,5 +1558,261 @@ mod tests {
             std::fs::read(store.directory.join(SELECTION_FILE)).unwrap(),
             b"damaged unused fallback"
         );
+    }
+
+    /// One reference, two projects: the uniqueness tuple and the lookup both
+    /// select by project, so neither project's record can answer for the other.
+    #[test]
+    fn same_reference_in_two_projects_is_two_keys() {
+        let (_dir, store) = paths();
+        let a = candidate_in(&ProjectId::for_tests('a'), 'a');
+        let b = candidate_in(&ProjectId::for_tests('b'), 'b');
+        assert_eq!(a.key.reference, b.key.reference);
+        let first = store
+            .commit_pin(&a, &Approval::initial(&a), DefaultAction::None)
+            .unwrap();
+        let second = store
+            .commit_pin(&b, &Approval::initial(&b), DefaultAction::None)
+            .unwrap();
+        assert_eq!(
+            (first.revision, second.revision),
+            (PinRevision(1), PinRevision(1))
+        );
+        assert_eq!(store.read().unwrap().unwrap().pins.len(), 2);
+        assert_eq!(store.lookup(&a.key).unwrap().unwrap().digest, a.digest);
+        assert_eq!(store.lookup(&b.key).unwrap().unwrap().digest, b.digest);
+    }
+
+    /// Spec R4, at the store: a first pin, an equivalent re-resolution and a
+    /// consented replacement in project A leave project B's record
+    /// byte-for-byte identical, and B's lookup never returns A's record.
+    #[test]
+    fn a_commit_in_one_project_leaves_another_byte_identical() {
+        let (_dir, store) = paths();
+        let other_project = ProjectId::for_tests('b');
+        let other = candidate_in(&other_project, 'f');
+        store
+            .commit_pin(&other, &Approval::initial(&other), DefaultAction::None)
+            .unwrap();
+        let record_of = |project: &ProjectId| {
+            let file = store.read().unwrap().unwrap();
+            serde_json::to_value(
+                file.pins
+                    .iter()
+                    .find(|record| record.project == project.as_str())
+                    .expect("the project has a record"),
+            )
+            .unwrap()
+        };
+        let untouched = record_of(&other_project);
+
+        let a = candidate('a');
+        let first = store
+            .commit_pin(&a, &Approval::initial(&a), DefaultAction::None)
+            .unwrap();
+        assert_eq!(record_of(&other_project), untouched, "after a first pin");
+        store
+            .commit_pin(&a, &Approval::initial(&a), DefaultAction::None)
+            .unwrap();
+        assert_eq!(
+            record_of(&other_project),
+            untouched,
+            "after an equivalent re-resolution"
+        );
+        let b = candidate('b');
+        let replaced = store
+            .commit_pin(&b, &replacement(&b, first), DefaultAction::None)
+            .unwrap();
+        assert_eq!(replaced.revision, PinRevision(2));
+        assert_eq!(record_of(&other_project), untouched, "after a replacement");
+        assert_eq!(
+            store.lookup(&other.key).unwrap().unwrap().digest,
+            other.digest
+        );
+    }
+
+    /// Spec R7: a version-1 store with its lock is refused with the legacy
+    /// error, never read as empty, never rewritten, and never reported as
+    /// damage on any approval-authority path.
+    #[test]
+    fn legacy_store_is_refused_not_read_or_rewritten() {
+        let bytes = br#"{"version":1,"pins":[],"pending_default":null}"#.to_vec();
+        let (_dir, store) = paths();
+        std::fs::create_dir_all(&store.directory).unwrap();
+        open_lock(&store.lock_path(), true).unwrap();
+        std::fs::write(store.record(), &bytes).unwrap();
+        let a = candidate('a');
+        for error in [
+            store.lookup(&a.key).unwrap_err(),
+            store
+                .commit_pin(&a, &Approval::initial(&a), DefaultAction::None)
+                .unwrap_err(),
+            store
+                .commit_pin(&a, &Approval::initial(&a), DefaultAction::Set)
+                .unwrap_err(),
+            store.load_default().unwrap_err(),
+        ] {
+            let text = format!("{error:#}");
+            assert!(text.contains("host-wide version 1 format"), "{text}");
+            assert!(text.contains("image-pins.json"), "{text}");
+            assert!(text.contains("USAGE.md"), "{text}");
+            assert!(!text.contains("damaged"), "{text}");
+        }
+        assert_eq!(std::fs::read(store.record()).unwrap(), bytes);
+        assert!(!store.directory.join(SELECTION_FILE).exists());
+        assert!(!store.directory.join(DEFAULT_LOCK_FILE).exists());
+    }
+
+    /// Spec R8: a record present without its stable lock is damage on both the
+    /// observation and the `begin` path, whatever its version — matching what a
+    /// version-1 binary already reported for it.
+    #[test]
+    fn a_lockless_store_is_damage_on_both_paths() {
+        let legacy = br#"{"version":1,"pins":[],"pending_default":null}"#.to_vec();
+        for bytes in [legacy, file().encode().unwrap()] {
+            let (_dir, store) = paths();
+            std::fs::create_dir_all(&store.directory).unwrap();
+            std::fs::write(store.record(), &bytes).unwrap();
+            let a = candidate('a');
+            for error in [
+                store.lookup(&a.key).unwrap_err(),
+                store
+                    .commit_pin(&a, &Approval::initial(&a), DefaultAction::None)
+                    .unwrap_err(),
+            ] {
+                assert!(error.to_string().contains("damaged"), "{error}");
+            }
+            assert!(!store.lock_path().exists());
+            assert_eq!(std::fs::read(store.record()).unwrap(), bytes);
+        }
+    }
+
+    /// Spec R9: reaching the record bound at commit is a full store, not
+    /// damage, and leaves the store unchanged.
+    #[test]
+    fn a_full_store_is_reported_as_full() {
+        let (_dir, store) = paths();
+        let mut f = file();
+        let template = f.pins[0].clone();
+        f.pins = (0..4096)
+            .map(|i| {
+                let mut record = template.clone();
+                record.reference = format!("example.com/image{i}:latest");
+                record
+            })
+            .collect();
+        install(&store, &f);
+        let before = std::fs::read(store.record()).unwrap();
+        let a = candidate('a');
+        let error = store
+            .commit_pin(&a, &Approval::initial(&a), DefaultAction::None)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("maximum number of approvals"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(store.record()).unwrap(), before);
+    }
+
+    /// Spec R9 for the *other* growth limit: `encode` reports a full store for
+    /// the byte bound as well as the record bound, so a valid store can never be
+    /// reported as damaged only because it grew.
+    ///
+    /// The check is defensive by measurement, not by assumption: a record is
+    /// bounded by a 64-byte project, the longest canonical reference the OCI
+    /// parser accepts, a platform with a 64-byte variant, a 71-byte digest and a
+    /// `u64` revision, so 4096 of them do not reach 4 MiB. This builds that
+    /// worst case, proves it fits, and proves the next record is refused as
+    /// full — with the store's bytes untouched.
+    #[test]
+    fn a_store_at_its_growth_limit_is_full_not_damaged() {
+        let longest_reference = (1..275usize)
+            .map(|n| format!("example.com/{n}{}:latest", "e".repeat(n)))
+            .rfind(|reference| CanonicalOciReference::parse(reference).is_ok())
+            .expect("the OCI parser accepts some long reference");
+        let mut f = file();
+        let mut template = f.pins[0].clone();
+        template.platform.variant = Some("v".repeat(64));
+        template.revision = u64::MAX;
+        f.pins = (0..4096)
+            .map(|i| {
+                let mut record = template.clone();
+                // Unique keys, each as large as the schema allows.
+                record.reference = format!("{i}.{longest_reference}");
+                record
+            })
+            .collect();
+        let bytes = f
+            .encode()
+            .expect("the schema's maximum store fits in the byte bound");
+        assert!(
+            store_bytes_within_limit(bytes.len()),
+            "the byte bound is unreachable by growth: {} bytes",
+            bytes.len()
+        );
+        let (_dir, store) = paths();
+        install(&store, &f);
+        let before = std::fs::read(store.record()).unwrap();
+        let a = candidate('a');
+        let error = store
+            .commit_pin(&a, &Approval::initial(&a), DefaultAction::None)
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("maximum number of approvals"), "{message}");
+        assert!(!message.contains("damaged"), "{message}");
+        assert_eq!(std::fs::read(store.record()).unwrap(), before);
+    }
+
+    /// Spec R7: the legacy refusal is the user's only map to the procedure, and
+    /// every OCI command fails until they run it. So the message must carry the
+    /// three facts R7 names — the format it found, that archiving resets
+    /// approvals, and that a mutable tag may resolve to newer content — and the
+    /// USAGE section it points at must exist, holding exactly the one upgrade
+    /// and one rollback block an operator is told to paste.
+    ///
+    /// The section name is taken *from the error*, not restated here, so
+    /// renaming the heading without the message (or the reverse) fails.
+    #[test]
+    fn the_legacy_refusal_names_its_facts_and_an_existing_usage_section() {
+        let message = format!("{:#}", legacy());
+        for fact in [
+            "host-wide version 1 format",
+            "resets approvals",
+            "newer content",
+            "image-pins.json",
+        ] {
+            assert!(message.contains(fact), "R7 requires {fact:?}: {message}");
+        }
+        let section = message
+            .split('"')
+            .nth(1)
+            .filter(|quoted| quoted.contains("Upgrading"))
+            .unwrap_or_else(|| panic!("the message must quote the section it names: {message}"));
+
+        let usage = include_str!("../../../../USAGE.md");
+        let heading = usage
+            .lines()
+            .find(|line| line.trim_start_matches('#').trim() == section);
+        assert!(
+            heading.is_some(),
+            "USAGE.md has no {section:?} heading for the refusal that quotes it"
+        );
+        assert!(
+            heading.unwrap().starts_with("###"),
+            "{section:?} must be a section of its own: {}",
+            heading.unwrap()
+        );
+        for marker in ["upgrade", "rollback"] {
+            for tag in [
+                format!("<!-- pin-store-{marker} -->"),
+                format!("<!-- /pin-store-{marker} -->"),
+            ] {
+                assert_eq!(
+                    usage.matches(&tag).count(),
+                    1,
+                    "USAGE.md must carry exactly one {tag}"
+                );
+            }
+        }
     }
 }

@@ -566,6 +566,22 @@ _Avoid_: "derived image", "project image" (retired terms for automatic builds);
 "auto-build".
 
 
+## Project
+
+The canonical host working directory of an agent-vm command, not its Git
+repository or build context. Worktrees and subdirectories are distinct projects;
+symlink aliases of the same directory are one project.
+
+The command captures it **once**, at its entry point, and session state and
+**image pins** both consume that one capture: an external `rename` changes what
+the process's working directory is called without any `chdir`, so a second read
+could name a second project mid-command. The identifier stored in approvals is
+the lowercase hex SHA-256 of the captured path's bytes; the 12-hex name of the
+project's state directory under `$AGENT_VM_STATE_DIR` is that digest's prefix.
+
+_Avoid_: "workspace", "repo" (both are other things), "current directory"
+(the project is a capture, not an ambient read).
+
 ## Retained default boot image
 
 The digest-pinned image a host keeps as its default after acquiring it, in the
@@ -577,8 +593,8 @@ insert-if-absent, so no failed or concurrent first launch overwrites it. The
 default tier also has an **image pin**, so warm launches consume the approved
 child without registry contact. A **deliberate `image set-default`** is
 successful native acquisition, candidate approval and a journaled transaction
-that replaces this retained fallback and its shared pin together; it affects
-future default-image sessions only. The record holds a digest only — no source
+that replaces this retained fallback and its pin in the invoking **project**
+together; it affects future default-image sessions only. The record holds a digest only — no source
 tag, platform or tool metadata — so a bare `image refresh` reacquires that
 digest rather than following a tag (issue #392). See
 [USAGE.md#explicitly-setting-the-default](USAGE.md#explicitly-setting-the-default)
@@ -589,20 +605,24 @@ entry, default config, pinned layer.
 
 ## Image pin
 
-One host-wide approval record: the canonical OCI reference plus the measured
-host Linux platform (`linux/<arch>[/<variant>]`) of the **boot image**, mapped to
-the approved host-platform manifest **child** digest and a monotonic revision.
-Stored in the user-scoped `$HOME/.config/agent-vm/image-pins.json` (with
-`image-pins.lock`), shared by every project and independent of the **image
-cache**, `AGENT_VM_STATE_DIR` and the **retained default boot image**. A launch
-or `setup` consumes `repo@child`, never the selected tag or index. Only
-`image refresh` and `image set-default` re-resolve a source and request an
-**image approval**; `image build` and `image import` approve their own result
-reference without asking. Local rootfs/disk launches and **launch builds** are
-never pinned.
+One **project**-scoped approval record: the **project** identifier, the canonical
+OCI reference and the measured host Linux platform
+(`linux/<arch>[/<variant>]`) of the **boot image**, mapped to the approved
+host-platform manifest **child** digest and a monotonic revision. Stored in the
+user-scoped `$HOME/.config/agent-vm/image-pins.json` (with `image-pins.lock`),
+host-managed and independent of the **image cache**, `AGENT_VM_STATE_DIR`,
+repository files and the **retained default boot image**. A launch or `setup`
+consumes `repo@child`, never the selected tag or index. Only `image refresh` and
+`image set-default` re-resolve a source and request an **image approval**;
+`image build` and `image import` approve their own result reference without
+asking. Each of those reads and writes only the invoking project's records:
+approval changes in one project never change another project's approved content,
+while cached bytes stay shared. Local rootfs/disk launches and **launch builds**
+are never pinned.
 
 _Avoid_: "lock file"; "tag pin" (a pin names a child digest, not a tag); "cache
-entry" (cache evidence is not approval).
+entry" (cache evidence is not approval); "host-wide approval" (per project since
+[ADR-0063](docs/adr/0063-project-scoped-oci-image-approval.md)).
 
 ## Image candidate
 

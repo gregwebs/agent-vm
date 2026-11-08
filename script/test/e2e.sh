@@ -778,7 +778,16 @@ build_custom_netreq_fixture() {
   if [ -n "${AGENT_VM_E2E_BUILDER:-}" ]; then
     builder=(--builder "$AGENT_VM_E2E_BUILDER")
   fi
-  avm_custom_state image build --tag "$tag" --file "$FIXTURE_DIR/Dockerfile" \
+  # `image build` approves its result under $HOME and the invoking project
+  # (#532), so run it under this run's own HOME, exactly like the launches that
+  # read it: the operator's real approvals are then neither read nor written.
+  # Docker's own plugin/context configuration still comes from the operator
+  # (`BUILD_DOCKER_CONFIG`/`BUILD_BUILDX_CONFIG`, captured before HOME isolation),
+  # because a fresh HOME cannot find the buildx plugin or the active context.
+  HOME="$CUSTOM_HOME" DOCKER_CONFIG="$BUILD_DOCKER_CONFIG" \
+    BUILDX_CONFIG="$BUILD_BUILDX_CONFIG" XDG_CONFIG_HOME="$WORK/offline-config" \
+    avm_custom_state image build --tag "$tag" \
+    --file "$FIXTURE_DIR/Dockerfile" \
     --target "$target" ${builder[@]+"${builder[@]}"} "$FIXTURE_DIR"
 }
 
@@ -7038,7 +7047,7 @@ custom_image_default_upgrade() {
   return "$result"
 }
 
-# ------------------------------------------- host-wide image pins (#390) ---
+# ------------- project-scoped image pins (#390, #532) in one HOST file ---
 
 PINS_HOME=""
 PINS_STATE=""
@@ -7067,12 +7076,23 @@ pins_launch() {
     HOST_SHIM_LOG="$HOST_SHIM_LOG" "$PINS_BIN" "$@"
 }
 
+# Every explicit verb runs in the project whose approval it must read or write:
+# a project is the command's working directory, so a verb run from the script's
+# own cwd would act on a different project's records.
 pins_avm() {
-  "${PINS_ENV[@]}" "$PINS_BIN" "$@"
+  local proj="$1"
+  shift
+  (cd "$proj" && "${PINS_ENV[@]}" "$PINS_BIN" "$@")
 }
 
 pins_store() {
   printf '%s' "$PINS_HOME/.config/agent-vm/image-pins.json"
+}
+
+# The project identifier a pin records: the lowercase hex SHA-256 of the
+# canonical directory, which is also the prefix of its state-directory name.
+pins_project_id() {
+  printf %s "$(cd "$1" && pwd -P)" | shasum -a 256 | awk '{print $1}'
 }
 
 pins_record() {
@@ -7286,15 +7306,15 @@ pins_stamp() {
   grep '^stamp=' "$WORK/$1.out" || true
 }
 
-# One PTY replacement attempt: stdin is piped into `script`, which gives the
-# child a real terminal on both ends. The answer text is the input.
+# One PTY replacement attempt in `proj`: stdin is piped into `script`, which
+# gives the child a real terminal on both ends. The answer text is the input.
 pins_pty_update() {
-  local name="$1" input="$2"
-  shift 2
+  local name="$1" proj="$2" input="$3"
+  shift 3
   rm -f "$WORK/$name.pty"
   local status=0
-  printf '%s' "$input" | /usr/bin/script -q "$WORK/$name.pty" \
-    "${PINS_ENV[@]}" "${OFFLINE_ENV[@]}" "$PINS_BIN" "$@" \
+  printf '%s' "$input" | (cd "$proj" && /usr/bin/script -q "$WORK/$name.pty" \
+    "${PINS_ENV[@]}" "${OFFLINE_ENV[@]}" "$PINS_BIN" "$@") \
     >"$WORK/$name.out" 2>&1 || status=$?
   PIN_PTY_STATUS=$status
   tr -d '\r' <"$WORK/$name.pty" >"$WORK/$name.pty.txt" 2>/dev/null || true
@@ -7314,7 +7334,8 @@ pins_live_advanced() {
   return 1
 }
 
-# 12. #390: every OCI selection is approved host-wide. One registry tag moves
+# 12. #390/#532: every OCI selection is approved per (project, reference,
+# platform) in one host-managed file. One registry tag moves
 # A→B; the guest stamp (`marker-free` = A prints stamp=absent, `stamp-present` =
 # B prints stamp=present) proves which content booted, and exact registry
 # access-request counts prove what was (not) consulted. A live A guest runs
@@ -7324,8 +7345,8 @@ custom_image_host_pins() {
   local reg="registry:3@sha256:ddf754342cfc8acc51a56d5d0ab6af06826461864460636d8bd5c546dab2a7b8"
   local proj live out reads_before reads_after deadline target ready=0
   local live_pid=0 identity="" tick="" rootid="" tag_before digest_before b_before
-  local cold_state cold_proj default_home default_state rootfs pin_snapshot default_snapshot docker_host
-  local pins_revision_before explicit_snapshot
+  local cold_state default_home default_state rootfs pin_snapshot default_snapshot docker_host
+  local pins_revision_before explicit_snapshot proj_id live_id iso_proj iso_state iso_id proj_record_before
   # The group's own precondition is Apple Silicon, so the measured host platform
   # these pins are keyed by is exactly linux/arm64.
   local host_arch="arm64"
@@ -7412,8 +7433,10 @@ custom_image_host_pins() {
   # group runs only on Apple Silicon (`linux/arm64`), so naming that architecture
   # is a real assertion rather than a restatement of "an entry exists". A variant
   # is optional in the schema and must be a printable spelling when it is present.
-  if ! jq -e --arg ref "$tag" --arg digest "$digest_a" --arg arch "$host_arch" \
-    '.version == 1 and (.pins | length) == 1
+  proj_id="$(pins_project_id "$proj")"
+  if ! jq -e --arg ref "$tag" --arg digest "$digest_a" --arg arch "$host_arch" --arg p "$proj_id" \
+    '.version == 2 and (.pins | length) == 1
+     and .pins[0].project == $p
      and .pins[0].reference == $ref and .pins[0].manifest_digest == $digest
      and .pins[0].platform.os == "linux"
      and .pins[0].platform.architecture == $arch
@@ -7422,7 +7445,7 @@ custom_image_host_pins() {
           or (.pins[0].platform.variant | test("^[!-~]{1,64}$")))
      and .pins[0].revision >= 1' \
     "$WORK/pins-hold/store.json" >/dev/null 2>&1; then
-    echo "    FAIL: the first pin was not committed for the selected reference and host platform before create"
+    echo "    FAIL: the first pin was not committed for this project, reference and host platform before create"
     cat "$WORK/pins-hold/store.json" 2>/dev/null || true
     result=1
   fi
@@ -7484,27 +7507,48 @@ custom_image_host_pins() {
   pin_snapshot="$(cat "$(pins_store)")"
   docker tag "$CUSTOM_STAMP" "$tag" || result=1
   DOCKER_HOST="$docker_host" DOCKER_CONFIG="$PINS_HOME/docker" \
-    pins_avm image import --docker "$tag" \
+    pins_avm "$proj" image import --docker "$tag" \
       --tag "localhost:$port/$repo:alias-result" \
     >"$WORK/pins-import.out" 2>&1 || {
     echo "    FAIL: importing an archive that aliases the pinned tag failed"
     cat "$WORK/pins-import.out"
     result=1
   }
-  if ! jq -e --arg r "$tag" '.pins[] | select(.reference == $r)' \
+  if ! jq -e --arg r "$tag" --arg p "$proj_id" \
+    '.pins[] | select(.project == $p and .reference == $r)' \
     <<<"$pin_snapshot" >/dev/null 2>&1; then
     echo "    FAIL: the pinned tag had no record before the alias import"
     result=1
   fi
   assert_eq "an archive alias leaves the pinned tag's approval unchanged" \
-    "$(jq -c --arg r "$tag" '.pins[] | select(.reference == $r)' <<<"$pin_snapshot")" \
-    "$(jq -c --arg r "$tag" '.pins[] | select(.reference == $r)' "$(pins_store)")" || result=1
+    "$(jq -c --arg r "$tag" --arg p "$proj_id" '.pins[] | select(.project == $p and .reference == $r)' <<<"$pin_snapshot")" \
+    "$(jq -c --arg r "$tag" --arg p "$proj_id" '.pins[] | select(.project == $p and .reference == $r)' "$(pins_store)")" || result=1
   pins_launch pins-after-import "$proj" --image "$tag" hello-258 || result=1
   require_launch_ok pins-after-import || result=1
   assert_eq "an archive alias cannot swap the pinned guest" "stamp=absent" \
     "$(pins_stamp pins-after-import)" || result=1
 
   # ---- a live A guest keeps running while the tag moves and nothing probes it ----
+  # The live guest runs in its own project, so approve A *there* first — and
+  # approve the **tag**, the reference the guest actually selects (#532 S1: a pin
+  # key is (project, canonical reference, platform), and a digest-spelled approval
+  # of $ref_a approves a different key). The registry still serves A under this
+  # tag here; it moves to B below. An unapproved project would instead first-pin
+  # cache-first from the alias import above, which published B under this tag, so
+  # the approval is what makes the guest boot A rather than a cache accident.
+  live_id="$(pins_project_id "$live")"
+  pins_avm "$live" image refresh --image "$tag" >"$WORK/pins-live-pin.out" 2>&1 || {
+    echo "    FAIL: could not approve A for the tag in the live guest's project"
+    cat "$WORK/pins-live-pin.out"
+    result=1
+  }
+  if ! jq -e --arg p "$live_id" --arg r "$tag" --arg d "$digest_a" \
+    '.pins[] | select(.project == $p and .reference == $r) | .manifest_digest == $d' \
+    "$(pins_store)" >/dev/null 2>&1; then
+    echo "    FAIL: the live guest's project did not approve A for the tag it launches"
+    cat "$(pins_store)" 2>/dev/null || true
+    result=1
+  fi
   (cd "$live" || exit 1; exec "${PINS_ENV[@]}" "${OFFLINE_ENV[@]}" \
     XDG_CONFIG_HOME="$WORK/offline-config" PATH="$SHIM_DIR:/usr/bin:/bin" \
     HOST_SHIM_LOG="$HOST_SHIM_LOG" \
@@ -7552,12 +7596,13 @@ custom_image_host_pins() {
   pin_snapshot="$(cat "$(pins_store)")"
   if [ -e "$(pins_record)" ]; then default_snapshot="$(cat "$(pins_record)")"; else default_snapshot="<absent>"; fi
   cold_state="$WORK/pcs"
-  cold_proj="$(custom_project pins-cold)" || result=1
   mkdir -p "$cold_state/msb-home" || result=1
   tag_before="$(pins_registry_count "$container" "$repo/manifests/pin")" || result=1
   digest_before="$(pins_registry_count "$container" "$repo/manifests/$digest_a")" || result=1
+  # Same project, independent state root and cache: the approval is the
+  # project's, not the cache's.
   pins_env "$WORK/pins-home" "$cold_state"
-  pins_launch pins-cold "$cold_proj" --image "$tag" hello-258 || result=1
+  pins_launch pins-cold "$proj" --image "$tag" hello-258 || result=1
   require_launch_ok pins-cold || result=1
   assert_eq "a cold independent cache reacquires A" "stamp=absent" "$(pins_stamp pins-cold)" || result=1
   assert_eq "a cold cache never queries the moved tag" "$tag_before" \
@@ -7575,13 +7620,12 @@ custom_image_host_pins() {
   assert_eq "warm A remains usable after its registry content is gone" "stamp=absent" \
     "$(pins_stamp pins-warm-unavailable)" || result=1
   cold_state="$WORK/pcm"
-  cold_proj="$(custom_project pins-cold-missing)" || result=1
   mkdir -p "$cold_state/msb-home" || result=1
   digest_before="$(pins_registry_count "$container" "$repo/manifests/$digest_a")" || result=1
   tag_before="$(pins_registry_count "$container" "$repo/manifests/pin")" || result=1
   b_before="$(pins_registry_count "$container" "$repo/manifests/$digest_b")" || result=1
   pins_env "$WORK/pins-home" "$cold_state"
-  pins_launch pins-cold-missing "$cold_proj" --image "$tag" hello-258 || result=1
+  pins_launch pins-cold-missing "$proj" --image "$tag" hello-258 || result=1
   if [ "$CAPTURE_STATUS" -eq 0 ]; then
     echo "    FAIL: an unavailable approved digest must fail the cold launch"
     result=1
@@ -7612,7 +7656,7 @@ custom_image_host_pins() {
   # ---- decline, fail, approve; the live A guest is untouched ----
   pins_env "$WORK/pins-home" "$WORK/pins-state"
   pin_snapshot="$(cat "$(pins_store)")"
-  pins_pty_update pins-decline $'n\n' image refresh --image "$tag"
+  pins_pty_update pins-decline "$proj" $'n\n' image refresh --image "$tag"
   assert_eq "a declined replacement exits nonzero" "1" "$PIN_PTY_STATUS" || result=1
   assert_match "decline prompt names the escaped source and its platform" \
     "Replace the approved image for localhost:$port/$repo:pin \\(linux/$host_arch\\)" \
@@ -7622,7 +7666,7 @@ custom_image_host_pins() {
   assert_match "decline prompt shows the full new digest" "new: $digest_b" \
     "$(pins_pty_text pins-decline)" || result=1
   assert_eq "declining leaves the approval unchanged" "$pin_snapshot" "$(cat "$(pins_store)")" || result=1
-  pins_pty_update pins-decline-empty $'\n' image refresh --image "$tag"
+  pins_pty_update pins-decline-empty "$proj" $'\n' image refresh --image "$tag"
   assert_eq "an empty answer exits nonzero" "1" "$PIN_PTY_STATUS" || result=1
   assert_match "empty answer still renders the full old digest" "old: $digest_a" \
     "$(pins_pty_text pins-decline-empty)" || result=1
@@ -7640,7 +7684,7 @@ custom_image_host_pins() {
     result=1
   }
   pins_env "$WORK/pins-home" "$WORK/pins-state"
-  pins_avm image refresh --image "$tag" --yes >"$WORK/pins-broken.out" 2>&1 && {
+  pins_avm "$proj" image refresh --image "$tag" --yes >"$WORK/pins-broken.out" 2>&1 && {
     echo "    FAIL: a broken candidate must fail the approved refresh"
     result=1
   }
@@ -7653,15 +7697,16 @@ custom_image_host_pins() {
   # Approve B explicitly.
   docker tag "$CUSTOM_STAMP" "$tag" || result=1
   docker push "$tag" >/dev/null || result=1
-  pins_avm image refresh --image "$tag" --yes >"$WORK/pins-approve.out" 2>&1 || {
+  pins_avm "$proj" image refresh --image "$tag" --yes >"$WORK/pins-approve.out" 2>&1 || {
     echo "    FAIL: approving the resolved candidate failed"
     cat "$WORK/pins-approve.out"
     result=1
   }
   # A replacement appends the record (`store.rs` keeps the others, then pushes),
-  # and the alias import above added another record, so select by reference.
-  if ! jq -e --arg ref "$tag" --arg digest "$digest_b" \
-    '[.pins[] | select(.reference == $ref)]
+  # and the live guest's own project holds its own record for this reference, so
+  # select by project and reference.
+  if ! jq -e --arg ref "$tag" --arg digest "$digest_b" --arg p "$proj_id" \
+    '[.pins[] | select(.project == $p and .reference == $ref)]
      | length == 1 and .[0].manifest_digest == $digest and .[0].revision >= 2' \
     "$(pins_store)" >/dev/null 2>&1; then
     echo "    FAIL: the approved pin does not name the frozen candidate B"
@@ -7675,9 +7720,47 @@ custom_image_host_pins() {
   assert_eq "future launches boot approved B" "stamp=present" "$(pins_stamp pins-approved)" || result=1
   reads_after="$(registry_read_count "$container")" || result=1
   assert_eq "warm approved B makes zero registry reads" "$reads_before" "$reads_after" || result=1
+
+  # ---- approvals are per project (S1) ----
+  # A different project with its own cold state/cache resolves the moved tag
+  # afresh: it boots B and records *its own* approval, while the launching
+  # project's record stays byte-identical.
+  iso_proj="$(custom_project pins-iso-new-project)" || result=1
+  iso_state="$WORK/pis"
+  mkdir -p "$iso_state/msb-home" || result=1
+  proj_record_before="$(jq -c --arg p "$proj_id" --arg r "$tag" \
+    '.pins[] | select(.project == $p and .reference == $r)' "$(pins_store)")"
+  pins_env "$WORK/pins-home" "$iso_state"
+  pins_launch pins-iso-new-project "$iso_proj" --image "$tag" hello-258 || result=1
+  require_launch_ok pins-iso-new-project || result=1
+  assert_eq "a new project's first pin resolves afresh and boots B" "stamp=present" \
+    "$(pins_stamp pins-iso-new-project)" || result=1
+  iso_id="$(pins_project_id "$iso_proj")"
+  if ! jq -e --arg p "$iso_id" --arg r "$tag" --arg d "$digest_b" \
+    '.pins[] | select(.project == $p and .reference == $r) | .manifest_digest == $d' \
+    "$(pins_store)" >/dev/null 2>&1; then
+    echo "    FAIL: the new project did not record its own approval for the moved tag"
+    cat "$(pins_store)" 2>/dev/null || true
+    result=1
+  fi
+  assert_eq "a new project's first pin leaves another project's record byte-identical" \
+    "$proj_record_before" \
+    "$(jq -c --arg p "$proj_id" --arg r "$tag" \
+      '.pins[] | select(.project == $p and .reference == $r)' "$(pins_store)")" || result=1
+  pins_env "$WORK/pins-home" "$WORK/pins-state"
+  # The live guest's project approved the tag at A above; approving B in this
+  # project must not have changed it.
+  if ! jq -e --arg p "$live_id" --arg r "$tag" --arg d "$digest_a" \
+    '.pins[] | select(.project == $p and .reference == $r) | .manifest_digest == $d' \
+    "$(pins_store)" >/dev/null 2>&1; then
+    echo "    FAIL: approving B in one project changed another project's approval"
+    cat "$(pins_store)" 2>/dev/null || true
+    result=1
+  fi
+
   # set-default: the explicit target ignores ambient selection, stores the
   # approved host child, and future precedence is unchanged.
-  pins_avm image set-default --image "$tag" --yes >"$WORK/pins-set-default.out" 2>&1 || {
+  pins_avm "$proj" image set-default --image "$tag" --yes >"$WORK/pins-set-default.out" 2>&1 || {
     echo "    FAIL: set-default of the approved target failed"
     cat "$WORK/pins-set-default.out"
     result=1
@@ -7728,10 +7811,10 @@ custom_image_host_pins() {
   # stderr, revision +1, and the next launch boots A with no registry read.
   pins_env "$WORK/pins-home" "$WORK/pins-state"
   pin_snapshot="$(cat "$(pins_store)")"
-  pins_revision_before="$(jq -r --arg r "$tag" \
-    '.pins[] | select(.reference == $r) | .revision' "$(pins_store)")" || result=1
+  pins_revision_before="$(jq -r --arg r "$tag" --arg p "$proj_id" \
+    '.pins[] | select(.project == $p and .reference == $r) | .revision' "$(pins_store)")" || result=1
   DOCKER_HOST="$docker_host" DOCKER_CONFIG="$PINS_HOME/docker" \
-    pins_avm image import --docker "$CUSTOM_MARKER" --tag "$tag" \
+    pins_avm "$proj" image import --docker "$CUSTOM_MARKER" --tag "$tag" \
     >"$WORK/pins-explicit-import.out" 2>&1 || {
     echo "    FAIL: an explicit import of the pinned tag failed"
     cat "$WORK/pins-explicit-import.out"
@@ -7745,8 +7828,8 @@ custom_image_host_pins() {
     "  new: sha256:" "$(cat "$WORK/pins-explicit-import.out")" || result=1
   assert_no_match "an explicit import never prompts" \
     "Approve this exact image change" "$(cat "$WORK/pins-explicit-import.out")" || result=1
-  if ! jq -e --arg r "$tag" --arg old "$digest_b" \
-    '.pins[] | select(.reference == $r)
+  if ! jq -e --arg r "$tag" --arg old "$digest_b" --arg p "$proj_id" \
+    '.pins[] | select(.project == $p and .reference == $r)
      | .manifest_digest != $old' "$(pins_store)" >/dev/null 2>&1; then
     echo "    FAIL: the explicit import did not move the pinned tag off B"
     cat "$(pins_store)" 2>/dev/null || true
@@ -7754,7 +7837,8 @@ custom_image_host_pins() {
   fi
   assert_eq "the explicit import bumps the revision by one" \
     "$(( pins_revision_before + 1 ))" \
-    "$(jq -r --arg r "$tag" '.pins[] | select(.reference == $r) | .revision' \
+    "$(jq -r --arg r "$tag" --arg p "$proj_id" \
+      '.pins[] | select(.project == $p and .reference == $r) | .revision' \
       "$(pins_store)")" || result=1
   reads_before="$(registry_read_count "$container")" || result=1
   pins_launch pins-explicit-import "$proj" --image "$tag" hello-258 || result=1
@@ -7766,7 +7850,7 @@ custom_image_host_pins() {
   # The same import again is an unchanged approval: no write, no render.
   explicit_snapshot="$(cat "$(pins_store)")"
   DOCKER_HOST="$docker_host" DOCKER_CONFIG="$PINS_HOME/docker" \
-    pins_avm image import --docker "$CUSTOM_MARKER" --tag "$tag" \
+    pins_avm "$proj" image import --docker "$CUSTOM_MARKER" --tag "$tag" \
     >"$WORK/pins-explicit-reimport.out" 2>&1 || {
     echo "    FAIL: repeating the explicit import failed"
     cat "$WORK/pins-explicit-reimport.out"

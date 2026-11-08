@@ -58,6 +58,7 @@ mod network;
 mod network_requests;
 mod one_line;
 mod pi_credential_inspection;
+mod project;
 mod protected_config_dir;
 mod protected_host_files;
 mod pull;

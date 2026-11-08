@@ -30,8 +30,8 @@ const ATOMIC_WRITE_RETRIES: usize = 16;
 /// Every caller joins, hashes, persists or prints the value, so a spelling
 /// relative to the cwd agent-vm happened to run in is a trap: `doctor`'s undo
 /// instruction only worked from the directory it was printed in (#433), and
-/// [`crate::session::ProjectSession::for_dir`] hashes the project but not the
-/// root. Each source therefore keeps its own contract, once:
+/// [`crate::session::ProjectSession::for_project`] hashes the project but not
+/// the root. Each source therefore keeps its own contract, once:
 ///
 /// - `AGENT_VM_STATE_DIR` is agent-vm's own override. A set but empty or
 ///   relative value is an error naming it — the discipline

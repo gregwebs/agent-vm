@@ -3405,12 +3405,22 @@ fn only_mutating_verbs_create_the_pin_store_and_the_gate_control_is_bounded() {
     success(&h.refresh(Some(&tag)));
     let approved = fs::read_to_string(&pins).expect("refresh approved the acquired content");
     let value: serde_json::Value = serde_json::from_str(&approved).unwrap();
-    assert_eq!(value["version"], 1);
+    assert_eq!(value["version"], 2);
     assert_eq!(value["pins"].as_array().unwrap().len(), 1);
     assert_eq!(
         value["pins"][0]["manifest_digest"],
         pin.as_str().rsplit_once('@').unwrap().1
     );
+    // The record names the invoking project: the canonical harness project.
+    let project = h.root.path().canonicalize().unwrap();
+    let expected_project: String = {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(project.as_os_str().as_encoded_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    };
+    assert_eq!(value["pins"][0]["project"], expected_project);
     success(&h.set_default(&pin));
     success(&h.run(&["setup", "--no-verify"]));
 
