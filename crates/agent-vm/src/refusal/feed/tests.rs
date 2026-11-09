@@ -759,7 +759,7 @@ async fn finish_drains_lines_written_after_the_last_poll() {
 /// The whole path, real engine and real log: a line written to the runtime's
 /// file reaches the project log within AC3's two seconds — measured from the
 /// moment the follower *ingested* it, not from the moment the file appeared,
-/// because the runtime's own poll (up to [`POLL_INTERVAL`]) is ingestion and the
+/// because the runtime's own poll (up to two seconds) is ingestion and the
 /// deadline is about what happens after it.
 #[tokio::test]
 async fn a_line_reaches_the_log_within_two_seconds_of_ingestion() {
@@ -814,7 +814,7 @@ async fn a_line_reaches_the_log_within_two_seconds_of_ingestion() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(
-            ingested.duration_since(task_start) <= POLL_INTERVAL,
+            ingested.duration_since(task_start) <= Duration::from_secs(2),
             "ingestion itself is bounded by one fallback poll: {:?}",
             ingested.duration_since(task_start)
         );

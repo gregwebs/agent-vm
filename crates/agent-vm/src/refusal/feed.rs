@@ -27,23 +27,21 @@ use tokio::sync::{broadcast, watch};
 use super::SessionSnapshot;
 use super::log::SessionsDir;
 
-/// How often the follower wakes to notice "nothing happened" — the tick that
-/// posts a dirty snapshot and refreshes the heartbeat. The runtime's own
-/// fallback poll is 2 s (`logs/stream.rs`), so this is the ingestion bound AC3
-/// names; the persistence tick is shorter ([`POST_TICK`]) because the write
-/// deadline is measured from ingestion, not from the last tick.
-pub(crate) const POLL_INTERVAL: Duration = Duration::from_secs(2);
-
-/// The longest the log may trail ingestion by while writes succeed (AC3).
+/// The longest the log may trail ingestion by while writes succeed (AC3). The
+/// ingestion side of that bound is the runtime's own fallback poll (2 s,
+/// `logs/stream.rs`), which nothing here can shorten.
 pub(crate) const POST_INTERVAL: Duration = Duration::from_secs(2);
 
 /// The persistence tick: the follower posts a dirty snapshot on the first tick
 /// after ingestion, so the tick *is* the rate limit and the log trails ingestion
-/// by at most this plus the write. A quarter of [`POST_INTERVAL`] leaves the
-/// AC3 bound real headroom for the write itself — a tick of the full interval
-/// would make the bound exactly the interval, so any scheduling latency at all
-/// would break it.
-const POST_TICK: Duration = Duration::from_millis(500);
+/// by at most this plus the write.
+///
+/// A quarter of [`POST_INTERVAL`] on purpose. A tick of the full interval would
+/// make the bound exactly the interval, so any scheduling latency at all would
+/// break it — which is what the previous shape did: it gated the post on
+/// "`POST_INTERVAL` since the last post" *and* woke every `POST_INTERVAL`, so a
+/// sub-millisecond offset could push a post a whole tick later.
+const POST_TICK: Duration = Duration::from_millis(POST_INTERVAL.as_millis() as u64 / 4);
 
 /// How often a session with no control socket writes a heartbeat. Three of
 /// these fit inside [`super::log::HEARTBEAT_STALE_MS`], so one missed write does

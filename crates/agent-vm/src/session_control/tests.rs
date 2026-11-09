@@ -15,7 +15,7 @@ use tokio::sync::watch;
 
 use super::*;
 use crate::refusal::SessionRefusals;
-use crate::refusal::feed::{LiveRefusals, POLL_INTERVAL};
+use crate::refusal::feed::LiveRefusals;
 use crate::refusal::log::SessionsDir;
 
 const SID: &str = "0a1b2c3d";
@@ -561,13 +561,6 @@ async fn dropping_a_session_unlinks_its_socket() {
         !socket.exists(),
         "dropping the session unlinks its own socket"
     );
-}
-
-#[test]
-fn the_poll_interval_is_the_ingestion_bound() {
-    // AC3: a record is listed once the SDK yields it — a watch event, or at most
-    // one fallback poll, which is what bounds a silent file.
-    assert!(POLL_INTERVAL <= Duration::from_secs(2));
 }
 
 // -- the teardown path -----------------------------------------------------
