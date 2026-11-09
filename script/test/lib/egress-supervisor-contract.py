@@ -133,6 +133,17 @@ class Contracts(unittest.TestCase):
                 self.assertNotIn("shell", command.argv)
             self.assertNotIn("-c", command.argv)
             self.assertFalse(case.extras and not case.case.startswith(("PX", "FL")))
+        # ADR-0065: both allowance cases are built with their seed and restore
+        # steps declared and from the launched project, so the harness cannot run
+        # one without its record.
+        for allowance_case in ("PA1", "PA1x"):
+            command = next(c for c in commands if c.case == allowance_case)
+            self.assertTrue(command.setup, allowance_case)
+            self.assertIn("allowance record", command.setup[0])
+            self.assertIn("remove the record", command.setup[0])
+            self.assertEqual(Path(command.cwd), self.work / "proj")
+        self.assertEqual([c.case for c in commands if c.setup],
+                         ["PA1", "PA1x", "CR1c", "CR1"])
         printed = subprocess.check_output([sys.executable, str(MODULE_PATH), "run", "--print-plan",
             "--work", str(self.work), "--binary", str(self.binary), "--lan", "192.168.1.2"], cwd="/")
         plan = [json.loads(line) for line in printed.splitlines()]

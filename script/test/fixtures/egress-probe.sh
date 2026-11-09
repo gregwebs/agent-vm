@@ -833,6 +833,16 @@ _case_dispatch() {
             if [[ "$case_id" != PX2 ]]; then
                 _case_flow 1 tcp "$lan" 18081 lan-tcp81 || return 2
             fi ;;
+        PA1)
+            # ADR-0065: the grant is a project allowance record, not a flag, so
+            # this row's evidence is that the launcher applied it.
+            _case_flow 0 tcp "$lan" 18080 lan-tcp80 || return 2
+            _case_flow 1 tcp "$lan" 18081 lan-tcp81 || return 2 ;;
+        PA1x)
+            # The same record under another project's digest: the flow must be
+            # refused, which is what makes PA1 evidence of identity and not of
+            # "a record exists".
+            _case_flow 1 tcp "$lan" 18080 lan-tcp80 || return 2 ;;
         UP1)
             _case_flow 0 udp "$lan" 19090 lan-udp90 || return 2
             _case_flow 1 udp "$lan" 18080 lan-udp80 || return 2

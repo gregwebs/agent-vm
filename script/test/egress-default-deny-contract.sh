@@ -30,7 +30,7 @@ with tempfile.TemporaryDirectory(prefix="egress-outside-") as tmp:
     # Independent §10.2 inventory: deriving this from CASES would allow a
     # deleted case to disappear from both the builder and its expected output.
     expected = {(case, "ipv4") for case in (
-        "NR1 NR2 NR3 P0 LC1 HC1 I1 D1 D1f L1 H1 I1a LH1 AD1 TP1 UP1 UP2 CI1 "
+        "NR1 NR2 NR3 P0 LC1 HC1 I1 D1 D1f L1 H1 I1a LH1 AD1 TP1 PA1 PA1x UP1 UP2 CI1 "
         "PX1 PX2 PX3 FL0 FL1 FL2 CR1c CR1 IN1 IN2 HK1c HK1 HK2c HK2 CL1").split()}
     expected |= {(case, "ipv6") for case in ("V6c", "DNS6c", "V6", "D1")}
     expected |= {("RB1", variant) for variant in
@@ -48,7 +48,7 @@ with tempfile.TemporaryDirectory(prefix="egress-outside-") as tmp:
                                       "--print-plan"], text=True, timeout=10)
     rows = [json.loads(line) for line in output.splitlines()]
     cases = [row for row in rows if row["kind"] != "admin"]
-    assert len(cases) == len(expected) == 82
+    assert len(cases) == len(expected) == 84
     assert {(row["case"], row["variant"]) for row in cases} == expected
     base = {"HOME", "XDG_CONFIG_HOME", "AGENT_VM_STATE_DIR", "PATH", "TERM", "AGENT_VM_SHARE_MSB_CACHE"}
     for row in cases:
@@ -100,7 +100,7 @@ with tempfile.TemporaryDirectory(prefix="egress-outside-") as tmp:
         if row["case"] in ("NR1", "NR2", "NR3"):
             # Full-row equality also pins argv, cwd, tools and grant semantics.
             assert row == next(full for full in cases if full["case"] == row["case"])
-    print("host-only per-case print-plan inventory PASS: 82 cases, 9 admin objects; smoke 11 cases, 9 admin objects")
+    print("host-only per-case print-plan inventory PASS: 84 cases, 9 admin objects; smoke 11 cases, 9 admin objects")
 PY
 
 # Primitive status/wire controls and dispatcher expectations are complementary:

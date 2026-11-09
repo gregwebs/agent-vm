@@ -60,6 +60,9 @@ MATRIX = {
     "UP1": [U90(True), U80(False), T80(False)],
     "UP2": [T80(True), U80(True), T81(False)],
     "CI1": [T80(True), T81(False)],
+    # ADR-0065: the same grant as TP1, held as a project allowance record.
+    "PA1": [T80(True), T81(False)],
+    "PA1x": [T80(False)],
     "PX1": [T80(True), T81(False)],
     "PX2": [T80(True)],
     "PX3": [T80(False), P("1.1.1.1", False)],

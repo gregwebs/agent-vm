@@ -354,6 +354,9 @@ CASES = (
     Case("LH1", flags=("--allow-lan", "--allow-host")),
     Case("AD1", flags=("--allow-egress", "1.1.1.1")),
     Case("TP1", flags=("--allow-egress", "tcp://{lan}:18080")),
+    # ADR-0065: the same grant, written as a project allowance record instead of
+    # a flag — and the same record under another project's digest.
+    Case("PA1"), Case("PA1x"),
     Case("UP1", flags=("--allow-egress", "udp://[{lan}/32]:19090")),
     Case("UP2", flags=("--allow-egress", "{lan}:18080")),
     Case("CI1", flags=("--allow-egress", "tcp://[{cidr}]:18080")),
@@ -553,6 +556,8 @@ def expected_attempts(case: Case) -> tuple[str, ...]:
         "LH1": ("lan-tcp80", "host-tcp80", "public-1111"),
         "AD1": ("public-1111", "public-1001", *gateway, *explicit),
         "TP1": ("lan-tcp80", "lan-udp80", "lan-tcp81"),
+        "PA1": ("lan-tcp80", "lan-tcp81"),
+        "PA1x": ("lan-tcp80",),
         "UP1": ("lan-udp90", "lan-udp80", "lan-tcp80"),
         "UP2": ("lan-tcp80", "lan-udp80", "lan-tcp81"),
         "CI1": ("lan-tcp80", "lan-tcp81"),
@@ -583,6 +588,7 @@ def attempt_expectations(case: Case) -> dict[str, str]:
         "D1f": ("lan-tcp80", "public-1111"), "L1": ("public-1111", "host-tcp80"),
         "H1": ("lan-tcp80", "public-1111", "answer"), "LH1": ("public-1111",),
         "AD1": ("public-1001",), "TP1": ("lan-udp80", "lan-tcp81"),
+        "PA1": ("lan-tcp81",), "PA1x": ("lan-tcp80",),
         "UP1": ("lan-udp80", "lan-tcp80"), "UP2": ("lan-tcp81",), "CI1": ("lan-tcp81",),
         "PX1": ("lan-tcp81",), "PX3": ("lan-tcp80", "public-1111"),
         "FL1": ("lan-tcp80",), "FL2": ("lan-tcp80",), "CR1": ("public-1111",),
@@ -782,6 +788,9 @@ def build_command(case: Case, work: Path, binary: str, lan: str, *, answer="ANSW
         argv.extend((case.case, ident, lan, case.variant, extra))
     project = work / (case.case[:3] if case.case.startswith("HK") else "creds" if case.tool == "egresscreds" else "proj")
     setup = ("private synthetic anthropic OAuth seed; remove seed and captured material",) if case.tool == "egresscreds" else ()
+    if case.case in ALLOWANCE_CASES:
+        setup += ("private project allowance record seeded for this case's project digest; "
+                  "remove the record after the launch",)
     if hostname_tier(case.case):
         protocols = {row[0]: row[1] for row in hostname_rows(case)}
     else:
@@ -1548,6 +1557,66 @@ def remove_credentials(work: Path) -> list[str]:
     return failures
 
 
+# The ADR-0065 cases: a project allowance record, written by the harness because
+# this release has no writer.
+ALLOWANCE_CASES = ("PA1", "PA1x")
+
+
+def allowance_store(work: Path) -> Path:
+    return work / "home/.config/agent-vm/allowances.json"
+
+
+def seed_allowances(work: Path, case: Case, lan: str):
+    """Write the one record each ADR-0065 case launches under.
+
+    PA1's record is this launch's own project; PA1x's is a *different* project
+    that is never launched from, so the only difference between the two cases is
+    the record's identity. The digest is over the canonical path, and this work
+    directory may sit under `/tmp` (a symlink to `/private/tmp` on macOS), so the
+    path is realpath'ed exactly as the launcher canonicalizes it.
+    """
+    if case.case not in ALLOWANCE_CASES:
+        raise RuntimeError(f"{case.case} has no allowance record")
+    directory = allowance_store(work).parent
+    directory.mkdir(parents=True, exist_ok=True)
+    directory.chmod(0o700)
+    project = work / ("proj" if case.case == "PA1" else "other")
+    if case.case == "PA1x":
+        project.mkdir(parents=True, exist_ok=True)
+    project = Path(os.path.realpath(project))
+    record = {"v": 1, "records": [{
+        "project": hashlib.sha256(os.fsencode(project)).hexdigest(),
+        "path": str(project),
+        "destination": f"tcp://{lan}:18080",
+        "recorded_ms": 1762680120000}]}
+    path = allowance_store(work)
+    path.write_text(json.dumps(record))
+    path.chmod(0o600)
+
+
+def remove_allowances(work: Path) -> list[str]:
+    """Remove the case's record, and report anything of the store's own left.
+
+    Only `allowances.*` names are checked: a launch writes its image pin into the
+    same directory, so "anything else" there is not this case's evidence. A lock
+    or a set-aside sibling would be, because this release writes neither.
+    """
+    failures = []
+    path = allowance_store(work)
+    try:
+        within(path, work)
+        if path.is_symlink():
+            raise RuntimeError("allowance record symlink refused")
+        path.unlink(missing_ok=True)
+        if path.exists():
+            failures.append(f"allowance record remains: {path}")
+        for sibling in sorted(path.parent.glob("allowances.*")):
+            failures.append(f"the store left {sibling.name} behind; this release writes no lock")
+    except (OSError, RuntimeError) as error:
+        failures.append(str(error))
+    return failures
+
+
 def verified_archive(assets: Path) -> Path:
     manifest = repo_root() / "crates/agent-vm/tests/fixtures/standard-release/release.json"
     if (assets / "release.json").read_bytes() != manifest.read_bytes():
@@ -1995,6 +2064,11 @@ def orchestrate(args) -> int:
             if case.tool == "egresscreds":
                 prepare_project(work, work / "creds")
                 seed_credentials(work)
+            # ADR-0065: the record is per case and per digest, and must not
+            # survive into any other case in this shared `work/home`.
+            allowance_leaked = allowance_store(work).exists()
+            if case.case in ALLOWANCE_CASES:
+                seed_allowances(work, case, args.lan)
             before = snapshot_validation(work) if not case.guest else None
             proxy_before = (work / "fx/receipts.log").read_text() if (work / "fx/receipts.log").exists() else ""
             receipt_offset = len(_receipt_lines(work))
@@ -2113,6 +2187,12 @@ def orchestrate(args) -> int:
             failures.extend(cleanup_launch(owned))
             if case.tool == "egresscreds":
                 failures.extend(remove_credentials(work))
+            if allowance_leaked and case.case not in ALLOWANCE_CASES:
+                failures.append("a project allowance record was left from an earlier case")
+            if case.case in ALLOWANCE_CASES:
+                failures.extend(remove_allowances(work))
+            if allowance_store(work).exists():
+                failures.append("project allowance record survived its own case")
             if (work / "config/agent-vm/default-image.json").exists() or (work / "home/.config/agent-vm/default-image.json").exists():
                 failures.append("explicit image adopted default")
             result = {"case": case, "status": "FAIL" if failures else "PASS", "failures": failures, "attempts": rows}
