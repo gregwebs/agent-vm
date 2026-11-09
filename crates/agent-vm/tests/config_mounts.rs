@@ -102,17 +102,17 @@ fn stderr_of(out: &Output) -> String {
 /// order-independent.
 type Snapshot = BTreeMap<String, String>;
 
-/// The pre-launch state a refused plan must leave untouched, plus the watermark
-/// for the fake runtime's invocation log.
+/// The pre-launch state a refused plan must leave untouched, plus the fake
+/// runtime's invocation log as it stood.
 ///
-/// That log accumulates across every launch in one test binary, and a preceding
+/// Every launch through this [`Harness`] appends to that log, and a preceding
 /// *successful* launch legitimately logs the launch-protocol probe and the
 /// machine invocation. A refusal can only answer for the invocations it runs
-/// itself, so the oracle compares [`Before::entries`] and inspects only the
-/// lines appended after [`Before::invocation_lines`].
+/// itself, so the oracle compares [`Before::entries`] and requires [`Before::log`]
+/// to be an unchanged prefix of the log it reads back.
 struct Before {
     entries: Snapshot,
-    invocation_lines: usize,
+    log: String,
 }
 
 /// Walk `root` recursively into `out`, prefixing every key with `label`. A
@@ -404,8 +404,28 @@ impl Harness {
     }
 
     /// Every argv the fake runtime was invoked with, one per line.
+    ///
+    /// A missing log means no invocation has run yet; any other read error is a
+    /// failure, because reading it as an empty log would leave the oracle below
+    /// with nothing to examine and let a launch that reached the runtime pass.
     fn msb_log(&self) -> String {
-        std::fs::read_to_string(&self.fake_msb.invocations).unwrap_or_default()
+        match std::fs::read_to_string(&self.fake_msb.invocations) {
+            Ok(log) => log,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => panic!(
+                "reading {} failed: {error}",
+                self.fake_msb.invocations.display()
+            ),
+        }
+    }
+
+    /// Capture the pre-launch state and invocation log for
+    /// [`Harness::assert_refused_before_launch_state`].
+    fn before(&self) -> Before {
+        Before {
+            entries: self.snapshot(),
+            log: self.msb_log(),
+        }
     }
 
     /// Everything a refused launch must have left untouched: the state root
@@ -416,14 +436,6 @@ impl Harness {
     ///
     /// `<state>.secrets` is a *sibling* of the state dir, so the recursive walk
     /// cannot find it — it is listed separately for exactly that reason.
-    /// Capture the pre-launch state for [`Harness::assert_refused_before_launch_state`].
-    fn before(&self) -> Before {
-        Before {
-            entries: self.snapshot(),
-            invocation_lines: self.msb_log().lines().count(),
-        }
-    }
-
     fn snapshot(&self) -> Snapshot {
         let mut entries = Snapshot::new();
         tree_of("state", &self.state_root, &mut entries);
@@ -458,9 +470,18 @@ impl Harness {
             before.entries,
             "a refused plan must not create or mutate launch state: {stderr}"
         );
+        let log = self.msb_log();
+        // The log only grows, so the pre-launch text must still be there. Reading
+        // a shorter or replaced log as "nothing appended" would let a launch that
+        // reached the runtime pass the loop below by examining zero lines.
+        assert!(
+            log.starts_with(&before.log),
+            "the invocation log must only grow: {} is not a prefix of {log:?}",
+            before.log
+        );
         // Only what this launch appended: an earlier accepted launch in the
         // same test already logged its own probes.
-        for line in self.msb_log().lines().skip(before.invocation_lines) {
+        for line in log[before.log.len()..].lines() {
             let first = line.split_whitespace().next().unwrap_or_default();
             assert_eq!(
                 first, "--version",
@@ -679,6 +700,89 @@ fn refusal_oracle_is_calibrated() {
         before.entries,
         "an accepted plan must mutate launch state: {stderr}"
     );
+
+    // An accepted launch reaching the builder is only half the calibration: the
+    // oracle's own refusals must fire. Without these rows, deleting its
+    // invocation-log check, its prefix check, its read-error handling or its
+    // snapshot check would leave every "nothing changed" assertion in this file
+    // green for the wrong reason — the exact vacuity the module comment claims
+    // this test prevents.
+    //
+    // (a) A refused-looking launch that reached the runtime for more than its
+    // version: the appended line is what the log check exists to catch.
+    let before = h.before();
+    append_invocation(&h, "machine --json");
+    assert_refusal_oracle_panics(&h, &before, "may only probe the runtime version");
+
+    // (b) The same launch with the log truncated instead of grown. A watermark
+    // that counted lines would find nothing to examine and pass.
+    let before = h.before();
+    std::fs::write(&h.fake_msb.invocations, "").expect("truncate the invocation log");
+    assert_refusal_oracle_panics(&h, &before, "the invocation log must only grow");
+
+    // (c) A launch that mutated the state root after `before()`: the snapshot
+    // check, not the log check, must catch it.
+    let before = h.before();
+    std::fs::write(h.state_root.join("calibration"), "mutated").unwrap();
+    assert_refusal_oracle_panics(&h, &before, "must not create or mutate launch state");
+
+    // (d) A log that cannot be read at all must fail loudly; reading it as empty
+    // is what leaves the log check with nothing to examine.
+    let before = h.before();
+    std::fs::remove_file(&h.fake_msb.invocations).expect("remove the invocation log");
+    std::fs::create_dir(&h.fake_msb.invocations).expect("replace the log with a directory");
+    assert_refusal_oracle_panics(&h, &before, "failed");
+}
+
+/// The needle of the synthetic refusals below: present in their stderr, so the
+/// oracle gets past its own needle assertion and reaches the check under test.
+const SYNTHETIC_REFUSAL: &str = "synthetic refusal";
+
+/// Run [`Harness::assert_refused_before_launch_state`] on a refused-looking
+/// launch and require it to panic, saying `expected`.
+fn assert_refusal_oracle_panics(h: &Harness, before: &Before, expected: &str) {
+    let refusal = refused_output(SYNTHETIC_REFUSAL);
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        h.assert_refused_before_launch_state(&refusal, before, SYNTHETIC_REFUSAL)
+    }));
+    let message = panic_message(caught.expect_err("the refusal oracle accepted a refused plan"));
+    assert!(
+        message.contains(expected),
+        "expected the refusal mentioning {expected:?}, got: {message}"
+    );
+}
+
+/// A refused-looking [`Output`] (non-zero exit, [`SYNTHETIC_REFUSAL`] on stderr,
+/// neither accepted-launch marker) for calibrating the refusal oracle.
+fn refused_output(needle: &str) -> Output {
+    Command::new("sh")
+        .args(["-c", "printf '%s\\n' \"$1\" >&2; exit 1", "sh", needle])
+        .output()
+        .expect("synthesize a refused output")
+}
+
+/// Append one invocation line to the harness's runtime log, as the fake does.
+fn append_invocation(h: &Harness, line: &str) {
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&h.fake_msb.invocations)
+        .expect("open the harness's invocation log")
+        .write_all(format!("{line}\n").as_bytes())
+        .expect("append to the harness's invocation log");
+}
+
+/// The message a caught panic carries, so a calibration can assert *which* check
+/// fired rather than merely that something panicked.
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else {
+        panic!("the panic payload is not a message");
+    }
 }
 
 // ---------------------------------------------------------------------------
