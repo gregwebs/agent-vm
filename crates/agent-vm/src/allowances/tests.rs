@@ -312,6 +312,39 @@ fn notice_wording_golden() {
     );
 }
 
+/// C8 (plan §8.6): a newer file's records are decoded — `doctor` counts them —
+/// and never applied. The `Newer` variant *carries* the records, so this is the
+/// one test that keeps "carries" from becoming "applies".
+#[test]
+fn newer_is_never_applied() {
+    let project = project_id("newer-never");
+    let file = PathBuf::from("/home/a/.config/agent-vm/allowances.json");
+    let view = from_read(
+        store::Read::Newer {
+            v: 2,
+            records: vec![
+                record(&project, "10.0.0.5", 1_762_680_120_000),
+                record(&project, "api.example.com", 1_762_680_120_000),
+            ],
+        },
+        file.clone(),
+        &project,
+    );
+    assert_eq!(view.allowances().len(), 0, "nothing from a newer file");
+    assert_eq!(destinations(&view), Vec::<String>::new());
+    assert_eq!(
+        view.notice(),
+        Some(
+            format!(
+                "project allowances not applied: {} was written by a newer agent-vm (version 2); this version applies none of it",
+                crate::one_line::quoted_path(&file)
+            )
+            .as_str()
+        )
+    );
+    assert_eq!(view.file(), Some(file.as_path()));
+}
+
 /// A record can never name a project whose path is not UTF-8, and nothing in
 /// the read path converts a path to text on the way.
 ///
@@ -516,6 +549,12 @@ fn coverage_table() {
             "host, sni",
             &["api.example.com"][..],
             host_entry("api.example.com", 443, "tls-sni", "sni"),
+            true,
+        ),
+        (
+            "host, tcp-hostname site",
+            &["api.example.com"][..],
+            host_entry("api.example.com", 443, "tcp-hostname", "sni"),
             true,
         ),
         (
@@ -750,7 +789,10 @@ fn cache_binding(entry: &RefusalEntry) -> Option<(&str, std::net::IpAddr)> {
 // --- B3/B4/B5: the property tests -------------------------------------------
 
 /// Every record spelling the generators may choose, mixable across kinds.
-const VOCABULARY: [&str; 18] = [
+///
+/// The first [`ADDRESS_VOCABULARY_LEN`] entries are address-only, which is what
+/// `address_only_sets_are_exact` draws from.
+const VOCABULARY: [&str; 21] = [
     "10.0.0.5",
     "10.0.0.5/32",
     "192.168.1.7/24",
@@ -765,34 +807,48 @@ const VOCABULARY: [&str; 18] = [
     "udp://[203.0.113.10/32]:443",
     "[203.0.113.10/32]:8443",
     "tcp://[203.0.113.10/32]:1",
+    "10.0.0.5/1",
+    "2001:db8::/127",
     "api.example.com",
     "API.example.com.",
     "xn--bcher-kva.example",
     "tcp://api.example.com:8443",
+    "tcp://xn--bcher-kva.example:9443",
 ];
+const ADDRESS_VOCABULARY_LEN: usize = 16;
 
-/// Address entries at the three sites a `Cidr` rule can decide.
-const ADDRESS_PROBES: [(&str, &str, Option<u16>, &str); 12] = [
+/// Address entries at the three sites a `Cidr` rule can decide, including the
+/// protocol, ports and prefix lengths the first generator missed.
+const ADDRESS_PROBES: [(&str, &str, Option<u16>, &str); 17] = [
     ("tcp", "203.0.113.10", Some(443), "tcp-syn"),
     ("tcp", "203.0.113.10", Some(444), "tcp-syn"),
     ("tcp", "203.0.113.10", Some(8443), "tcp-syn"),
     ("tcp", "203.0.113.10", Some(1), "tcp-syn"),
+    ("tcp", "203.0.113.10", Some(442), "tcp-syn"),
+    ("tcp", "203.0.113.10", Some(65535), "tcp-syn"),
     ("tcp", "203.0.113.1", Some(443), "tcp-syn"),
     ("tcp", "192.168.1.7", Some(443), "tcp-syn"),
     ("udp", "203.0.113.10", Some(443), "udp"),
     ("udp", "192.168.1.7", Some(53), "udp"),
+    ("udp", "2001:db8::1", Some(53), "udp"),
     ("icmpv4", "203.0.113.10", None, "icmp"),
     ("icmpv4", "192.168.1.7", None, "icmp"),
+    ("icmpv6", "2001:db8::1", None, "icmp"),
+    ("icmpv6", "2001:db8::2", None, "icmp"),
     ("tcp", "::ffff:203.0.113.10", Some(443), "tcp-syn"),
     ("tcp", "2001:db8::1", Some(443), "tcp-syn"),
 ];
 
-const HOST_PROBES: [(&str, u16); 5] = [
-    ("api.example.com", 443),
-    ("api.example.com", 8443),
-    ("api.example.com", 80),
-    ("xn--bcher-kva.example", 443),
-    ("other.example", 443),
+/// Host entries at both TCP sites that can decide a Domain rule. The site is
+/// generated because `probe` accepts two of them, and a generator that only
+/// produced `tls-sni` would leave the `tcp-hostname` arm unexercised.
+const HOST_PROBES: [(&str, u16, &str); 6] = [
+    ("api.example.com", 443, "tls-sni"),
+    ("api.example.com", 8443, "tls-sni"),
+    ("api.example.com", 80, "tls-sni"),
+    ("api.example.com", 443, "tcp-hostname"),
+    ("xn--bcher-kva.example", 443, "tls-sni"),
+    ("other.example", 443, "tcp-hostname"),
 ];
 
 const DNS_PROBES: [&str; 4] = [
@@ -807,7 +863,10 @@ fn any_records() -> impl Strategy<Value = Vec<&'static str>> {
 }
 
 fn address_only_records() -> impl Strategy<Value = Vec<&'static str>> {
-    proptest::collection::vec(proptest::sample::select(&VOCABULARY[..14]), 0..4)
+    proptest::collection::vec(
+        proptest::sample::select(&VOCABULARY[..ADDRESS_VOCABULARY_LEN]),
+        0..4,
+    )
 }
 
 proptest! {
@@ -824,7 +883,7 @@ proptest! {
         dns in proptest::sample::select(DNS_PROBES.as_slice()),
     ) {
         let address_entry = address_entry(address.0, address.1, address.2, address.3);
-        let host_entry = host_entry(host.0, host.1, "tls-sni", "sni");
+        let host_entry = host_entry(host.0, host.1, host.2, "sni");
         let dns_entry = dns_entry(dns, "dns-query");
         for entry in [address_entry, host_entry, dns_entry] {
             if covers(&records, &entry) {
@@ -947,6 +1006,21 @@ fn record_for(path: &Path, destination: &str, recorded_ms: i64) -> store::Stored
     }
 }
 
+/// The section for a store on disk: the test's door onto
+/// [`doctor_section_from`], which is the same function `doctor` calls.
+fn doctor_section_at(
+    store: Option<&store::Store>,
+    host_error: Option<anyhow::Error>,
+    project: Option<ProjectId>,
+) -> (String, Option<anyhow::Error>) {
+    doctor_section_from(
+        store.map(store::Store::file),
+        store.map(store::Store::read),
+        host_error,
+        project,
+    )
+}
+
 fn write_store(dir: &Path, records: Vec<store::StoredRecord>, v: u32) -> String {
     let lines: Vec<String> = records
         .iter()
@@ -1046,6 +1120,59 @@ fn allowances_section_states() {
         "{section}"
     );
 
+    // A recorded path that is now a symlink: a live one still names a project
+    // (followed, not called gone), a dangling one is an orphan, and a link that
+    // cannot be inspected is *unknown* rather than a definite orphan.
+    let (dir, store) = doctor_store(&root.path().join("links"));
+    let live_target = root.path().join("live-target");
+    std::fs::create_dir(&live_target).unwrap();
+    let live_link = root.path().join("link-live");
+    std::os::unix::fs::symlink(&live_target, &live_link).unwrap();
+    let dead_link = root.path().join("link-dead");
+    std::os::unix::fs::symlink(root.path().join("absent-target"), &dead_link).unwrap();
+    let loop_link = root.path().join("link-loop");
+    std::os::unix::fs::symlink(&loop_link, &loop_link).unwrap();
+    write_store(
+        &dir,
+        vec![
+            record_for(&live_link, "10.0.0.5", 0),
+            record_for(&dead_link, "10.0.0.6", 0),
+            record_for(&loop_link, "10.0.0.7", 0),
+        ],
+        1,
+    );
+    let (section, failure) = doctor_section_at(Some(&store), None, None);
+    assert!(failure.is_none(), "{section}");
+    assert!(
+        section.contains(&format!(
+            "\n  {} (1 allowance(s))",
+            crate::one_line::path(&live_link)
+        )),
+        "a live symlink is followed, not called gone: {section}"
+    );
+    assert!(
+        section.contains(&format!(
+            "\n  orphaned: {} (1 allowance(s))",
+            crate::one_line::path(&dead_link)
+        )),
+        "a dangling symlink is an orphan: {section}"
+    );
+    assert!(
+        section.contains(&format!(
+            "\n  unknown: {} (",
+            crate::one_line::path(&loop_link)
+        )),
+        "an uninspectable link is unknown, not gone: {section}"
+    );
+    assert!(
+        section.contains("orphaned: 1 project path(s) no longer exist"),
+        "{section}"
+    );
+    assert!(
+        section.contains("unknown: 1 project path(s) could not be checked"),
+        "{section}"
+    );
+
     // A newer file is counted, not applied, and does not fail the run.
     let (dir, store) = doctor_store(&root.path().join("newer"));
     write_store(
@@ -1119,6 +1246,22 @@ fn allowances_section_states() {
         "{section}"
     );
     assert!(failure.is_some(), "an unusable $HOME fails the run");
+
+    // AC10's `unsettled` arm, driven through the same function with the state
+    // the reader would have returned: it prints the state *and* fails the run.
+    // A mutant returning `(section, None)` here would leave `doctor` exiting 0
+    // on a store that was not used.
+    let (section, failure) = doctor_section_from(
+        Some(PathBuf::from("/home/a/.config/agent-vm/allowances.json")),
+        Some(store::Read::NotUsed(store::Problem::Unsettled)),
+        None,
+        Some(own.clone()),
+    );
+    assert!(
+        section.contains("(changed while being read; not used)"),
+        "{section}"
+    );
+    assert!(failure.is_some(), "an unsettled store fails the run");
 }
 
 /// The timestamp renderer is a calendar, so it gets a table rather than one
@@ -1144,9 +1287,43 @@ fn recorded_at_is_a_utc_calendar() {
         (1_762_680_120_000, "2025-11-09 09:22Z"),
         (4_102_444_800_000, "2100-01-01 00:00Z"),
         (4_107_542_400_000, "2100-03-01 00:00Z"),
+        // Pre-year-1 instants, computed by [`days_from_civil`] rather than
+        // pinned: `access` reaches them from a refusal log's unrestricted
+        // `last_ms` (`access --all` bypasses the time window), so the `else`
+        // arm of `civil_from_days` is reachable production input, not a
+        // hypothetical direct call.
+        (days_from_civil(0, 2, 29) * 86_400_000, "0000-02-29 00:00Z"),
+        (
+            days_from_civil(-1, 12, 31) * 86_400_000,
+            "-001-12-31 00:00Z",
+        ),
+        (days_from_civil(1, 1, 1) * 86_400_000, "0001-01-01 00:00Z"),
+        // The exact value a review drove through `agent-vm access --all` (a
+        // logged `last_ms`), which is the production route into the negative
+        // era arm.
+        (-62_162_121_600_000, "0000-02-29 00:00Z"),
     ] {
         assert_eq!(recorded_at(ms), expected, "{ms}");
     }
+    // No timestamp may panic the renderer, whatever the log says: the value is
+    // deserialized as an unrestricted `i64`.
+    for extreme in [i64::MIN, i64::MIN + 1, i64::MAX - 1, i64::MAX] {
+        assert!(!recorded_at(extreme).is_empty(), "{extreme}");
+    }
+}
+
+/// Howard Hinnant's `days_from_civil`, the inverse `civil_from_days` is defined
+/// by, written here so a pre-year-1 expectation is *computed*: the day count and
+/// the calendar date are then checked against each other rather than a number
+/// nobody can confirm.
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let shifted_month = if month > 2 { month - 3 } else { month + 9 } as i64;
+    let day_of_year = (153 * shifted_month + 2) / 5 + day as i64 - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 /// The two entry points that read `$HOME`: a store is found where `$HOME` says

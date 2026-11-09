@@ -1969,10 +1969,65 @@ mod tests {
         )
     }
 
+    /// The notices with provenance normalised away.
+    ///
+    /// R3 says the notices are equal **up to provenance tags**. Provenance
+    /// reaches the text in three ways, and all three are normalised here:
+    ///
+    /// * the `==> Egress authority: …` headers name the file and the tier;
+    /// * an `allowing …` line ends with the source tag;
+    /// * hostname lines are *grouped* by source, so two names from two tiers
+    ///   print on two lines where one tier prints them on one.
+    ///
+    /// The third is why the hostname lines become a ports→names map rather than
+    /// a string: the claim is that the same names are allowed on the same
+    /// ports, not that provenance-shaped formatting is identical.
+    fn normalised_notices(
+        authority: &EgressAuthority,
+    ) -> (
+        Vec<String>,
+        std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    ) {
+        fn without_tag(line: &str) -> &str {
+            let Some(body) = line.strip_suffix(')') else {
+                return line;
+            };
+            match body.rsplit_once(" (") {
+                Some((head, _)) => head,
+                None => line,
+            }
+        }
+        let mut output = Vec::new();
+        authority.write_notices(&mut output).unwrap();
+        let mut other = Vec::new();
+        let mut hostnames: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        for line in String::from_utf8(output).unwrap().lines() {
+            if line.starts_with("==> Egress authority: ") {
+                continue;
+            }
+            let bare = without_tag(line);
+            let Some(rest) = bare.strip_prefix("==> Egress policy: allowing TLS to ") else {
+                other.push(bare.to_owned());
+                continue;
+            };
+            let Some((names, ports)) = rest.rsplit_once(" on ports ") else {
+                other.push(bare.to_owned());
+                continue;
+            };
+            let group = hostnames.entry(ports.to_owned()).or_default();
+            for name in names.split(", ") {
+                group.insert(name.to_owned());
+            }
+        }
+        (other, hostnames)
+    }
+
     proptest! {
         /// R3: `set_recorded(R)` equals resolving `C` with `R` appended as
         /// `--allow-egress` entries — on the policy, on `has_hostnames`, on the
-        /// intercepted ports, and on TLS coverage over a name/port grid.
+        /// intercepted ports, on TLS coverage over a name/port grid, and on the
+        /// notices up to provenance tags.
         #[test]
         fn recorded_merge_equals_cli_append_on_every_view(
             saved in any::<[Option<bool>; 3]>(),
@@ -2001,17 +2056,18 @@ mod tests {
             );
             let mut equivalent_entries: Vec<String> = configured.iter().map(|s| (*s).into()).collect();
             equivalent_entries.extend(recorded.iter().map(|s| (*s).into()));
-            let equivalent = EgressAuthority::resolve(
-                CliEgress {
-                    internet: Some(flags[0].or(saved[0]).unwrap_or(false)),
-                    lan: Some(flags[1].or(saved[1]).unwrap_or(false)),
-                    host: Some(flags[2].or(saved[2]).unwrap_or(false)),
-                    allowances: &equivalent_entries,
-                },
-                None,
-                None,
-            ).unwrap();
+            // The equivalent launch resolves the *same* saved file and the same
+            // flags, with the recorded entries appended as `--allow-egress`
+            // entries. Resolving it any other way would compare notice lines
+            // that name a grant's *source* ("persisted grant" against
+            // "--allow-host"), which R3 does not equate.
+            let equivalent = resolve_saved(
+                crate::user_network::SavedGroups { internet: saved[0], lan: saved[1], host: saved[2] },
+                &equivalent_entries.iter().map(String::as_str).collect::<Vec<_>>(),
+                CliEgress { internet: flags[0], lan: flags[1], host: flags[2], allowances: &[] },
+            );
             prop_assert_eq!(every_view(&merged), every_view(&equivalent));
+            prop_assert_eq!(normalised_notices(&merged), normalised_notices(&equivalent));
         }
 
         /// `set_recorded` replaces, and never accumulates: a second call is the

@@ -33,16 +33,21 @@ use crate::config;
 use crate::config_authority::{
     AuthorityRefusal, DirFacts, FileFacts, Reached, authority_refusal, raw_mode_u32,
 };
-use crate::host_paths::{
-    HostFileFacts, NoFollowRead, current_euid, read_bounded_regular_file_no_follow_checkpointed,
-};
+use crate::host_paths::{HostFileFacts, current_euid, open_regular_no_follow_checkpointed};
 
 /// The one name this module reads.
-pub(super) const FILE: &str = "allowances.json";
+pub(crate) const FILE: &str = "allowances.json";
 /// The schema version this build writes and reads (ADR-0065 P1).
 const VERSION: u32 = 1;
 /// A store bigger than this is not a record table anyone wrote by hand.
 const MAX_BYTES: u64 = 1024 * 1024;
+/// How much of the file the version probe reads from the start.
+///
+/// The schema puts `v` first (ADR-0065 P1), so this covers every file this or a
+/// later release writes. It is a bound on *reading*, not on the file: a newer
+/// file bigger than [`MAX_BYTES`] is still `Newer`, because a later release
+/// writing a larger body must not be told to move its file aside as damaged.
+const VERSION_PROBE_BYTES: usize = 4096;
 /// The record bound, so one project's view cannot grow without end.
 const MAX_RECORDS: usize = 4096;
 /// Longer than this is not a canonical allowance spelling.
@@ -197,25 +202,26 @@ impl Store {
             if !stated.is_file() {
                 return Read::NotUsed(Problem::Damaged(Damage::NotAFile(stated.file_type())));
             }
-            if stated.len() > MAX_BYTES {
-                return Read::NotUsed(Problem::Damaged(Damage::TooLarge));
-            }
-            let (bytes, facts) =
-                match read_bounded_regular_file_no_follow_checkpointed(&file, MAX_BYTES, || {
-                    after_open()
-                }) {
-                    Ok(NoFollowRead::File(bytes, facts)) => (bytes, facts),
-                    // The path became a symlink after the `lstat` above. Still
-                    // `O_NOFOLLOW`: a symlink is untrusted, never damaged.
-                    Ok(NoFollowRead::Symlink) => {
-                        return Read::NotUsed(Problem::Untrusted(AuthorityRefusal::ThroughSymlink));
-                    }
-                    Err(error) => return Read::NotUsed(Problem::Unreadable(error_line(&error))),
-                };
+            // Open, then classify in the order the distinctions require:
+            // an unlinked descriptor is a rename (retried, AC7), then trust,
+            // then version, then size, then the strict decode. Classifying
+            // size or damage first would describe a foreign or newer file with
+            // the remedy for a broken one.
+            let opened = match open_regular_no_follow_checkpointed(&file, &mut after_open) {
+                Ok(Some(opened)) => opened,
+                // The path became a symlink after the `lstat` above. Still
+                // `O_NOFOLLOW`: a symlink is untrusted, never damaged.
+                Ok(None) => {
+                    return Read::NotUsed(Problem::Untrusted(AuthorityRefusal::ThroughSymlink));
+                }
+                Err(error) => return Read::NotUsed(Problem::Unreadable(error_line(&error))),
+            };
+            let facts = opened.facts();
             if facts.nlink == 0 {
                 // The descriptor outlived its name: the file was renamed over (or
                 // unlinked) after `open`. A rename is what a writer does, not
-                // what an attacker does, so this is retried rather than refused.
+                // what an attacker does, so this is retried rather than refused
+                // — before the size or version can turn it into a warning.
                 continue;
             }
             let dir = match std::fs::metadata(&self.dir) {
@@ -225,6 +231,30 @@ impl Store {
             if let Some(refusal) = trust(&facts, &dir, euid) {
                 return Read::NotUsed(Problem::Untrusted(refusal));
             }
+            // A later release's file is classified by what it says it is, not
+            // by how big it grew: a newer file bigger than this build reads is
+            // `Newer` (nothing applied, `doctor` counts it), never damage whose
+            // remedy is "move it aside".
+            if facts.size > MAX_BYTES {
+                let probe = match opened.prefix(VERSION_PROBE_BYTES) {
+                    Ok(probe) => probe,
+                    Err(error) => return Read::NotUsed(Problem::Unreadable(error_line(&error))),
+                };
+                let Some(v) = leading_version(&probe).filter(|v| *v > VERSION) else {
+                    return Read::NotUsed(Problem::Damaged(Damage::TooLarge));
+                };
+                // The records this build can still read, bounded: `doctor`'s
+                // counts only; `from_read` never applies them.
+                let records = opened
+                    .prefix(usize::try_from(MAX_BYTES).unwrap_or(usize::MAX))
+                    .map(|bytes| lenient_records(&bytes))
+                    .unwrap_or_default();
+                return Read::Newer { v, records };
+            }
+            let bytes = match opened.read_bounded(MAX_BYTES) {
+                Ok(bytes) => bytes,
+                Err(error) => return Read::NotUsed(Problem::Unreadable(error_line(&error))),
+            };
             return decode(&bytes, raw_mode_u32(facts.mode) & 0o777);
         }
         Read::NotUsed(Problem::Unsettled)
@@ -378,10 +408,34 @@ fn lenient_records(bytes: &[u8]) -> Vec<StoredRecord> {
     records
 }
 
+/// The `v` field of a file too large to decode whole, read from a bounded
+/// prefix.
+///
+/// The schema puts `v` first (ADR-0065 P1), so this reads only the document's
+/// leading key and its number. Anything else — a reordered key, a prefix cut
+/// before the value — answers `None`, which classifies an oversized file as
+/// damage. That is the conservative direction: it applies nothing either way,
+/// and `doctor` still reports the file.
+fn leading_version(prefix: &[u8]) -> Option<u32> {
+    let text = String::from_utf8_lossy(prefix);
+    let rest = text.trim_start().strip_prefix('{')?;
+    let rest = rest.trim_start().strip_prefix("\"v\"")?;
+    let rest = rest.trim_start().strip_prefix(':')?;
+    let rest = rest.trim_start();
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    rest[..digits].parse().ok()
+}
+
 /// One line, escaped, for a `Problem::Unreadable`. The message is a measured
 /// operation and its cause; `one_line` is the policy every measured path uses.
 fn error_line(error: &dyn std::fmt::Display) -> String {
-    crate::one_line::text(&format!("{error}")).to_string()
+    // `{:#}` keeps the whole `anyhow` chain: `{error}` prints only the outermost
+    // context, which turns "Permission denied" into "could not be read (opening
+    // …)" and leaves the user nothing actionable.
+    crate::one_line::text(&format!("{error:#}")).to_string()
 }
 
 #[cfg(test)]

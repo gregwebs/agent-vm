@@ -37,6 +37,11 @@
 
 mod store;
 
+/// The store's file name, spelled once: the guard measures the same file this
+/// module reads, so a rename cannot leave one of them looking at a path that no
+/// longer exists.
+pub(crate) use store::FILE;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::anyhow;
@@ -518,16 +523,26 @@ mod tests;
 /// orphan are facts, not failures.
 pub(crate) fn doctor_section(project: Option<&ProjectDir>) -> (String, Option<anyhow::Error>) {
     let (store, host_error) = host_store();
-    doctor_section_at(store.as_ref(), host_error, project.map(ProjectId::of))
+    doctor_section_from(
+        store.as_ref().map(store::Store::file),
+        store.as_ref().map(store::Store::read),
+        host_error,
+        project.map(ProjectId::of),
+    )
 }
 
-fn doctor_section_at(
-    store: Option<&store::Store>,
+/// The classification turned into a section. Separate from [`doctor_section`] so
+/// a test can drive every read state, `Unsettled` included, without a writer to
+/// race: the state and the failure it returns are one decision, and a mutant
+/// that printed the notice without the failure would otherwise survive.
+fn doctor_section_from(
+    file: Option<PathBuf>,
+    read: Option<store::Read>,
     host_error: Option<anyhow::Error>,
     project: Option<ProjectId>,
 ) -> (String, Option<anyhow::Error>) {
     let mut section = String::from("==> project allowances\n");
-    let Some(store) = store else {
+    let (Some(file), Some(read)) = (file, read) else {
         match host_error {
             // No `$HOME` means no user config is read at all (ADR-0038), so
             // there is no store to be wrong — but a user who set `$HOME` to
@@ -548,7 +563,6 @@ fn doctor_section_at(
         }
         return (section, None);
     };
-    let file = store.file();
     let path = crate::one_line::path(&file);
     let failure = |section: String| {
         (
@@ -558,7 +572,7 @@ fn doctor_section_at(
             )),
         )
     };
-    match store.read() {
+    match read {
         store::Read::Absent => {
             section.push_str(&format!("file: {path} (absent; nothing recorded)"));
             (section, None)
@@ -655,7 +669,12 @@ fn describe_records(
     let mut unknown = 0usize;
     for (path, count) in &others {
         let allowances = plural(*count);
-        match std::fs::symlink_metadata(path) {
+        // Follow the link: a recorded path replaced by a symlink to a live
+        // directory still names a project that exists, so calling it gone would
+        // be a false statement about the host. A link whose target is missing is
+        // an orphan; one that cannot be inspected at all (a loop, a permission
+        // failure) is *unknown*, never asserted gone.
+        match std::fs::metadata(path) {
             Ok(metadata) if metadata.is_dir() => {
                 section.push_str(&format!(
                     "\n  {} ({allowances})",

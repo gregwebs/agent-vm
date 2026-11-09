@@ -516,7 +516,7 @@ fn authority_file_links(
     lstat: impl Fn(&Path) -> std::io::Result<std::fs::Metadata>,
 ) -> Result<Vec<(PathBuf, u64)>> {
     let mut links = Vec::new();
-    for name in ["config.toml", "allowances.json"] {
+    for name in ["config.toml", crate::allowances::FILE] {
         let file = spelled.join(name);
         match lstat(&file) {
             Ok(m) if m.is_file() => links.push((file, m.nlink())),
@@ -908,14 +908,16 @@ mod tests {
             authority_file_links(dir, exists("config.toml", 1)).unwrap(),
             vec![(dir.join("config.toml"), 1)]
         );
-        // `allowances.json` alone: the ADR-0065 addition.
+        // The store's own name, from the one place it is spelled: the ADR-0065
+        // addition. The guard measures `allowances::FILE`, so a rename cannot
+        // leave it looking at a path the reader never opens.
         assert_eq!(
-            authority_file_links(dir, exists("allowances.json", 1)).unwrap(),
-            vec![(dir.join("allowances.json"), 1)]
+            authority_file_links(dir, exists(crate::allowances::FILE, 1)).unwrap(),
+            vec![(dir.join(crate::allowances::FILE), 1)]
         );
         // A second name for it is recorded, and the guard refuses.
-        let links = authority_file_links(dir, exists("allowances.json", 2)).unwrap();
-        assert_eq!(links, vec![(dir.join("allowances.json"), 2)]);
+        let links = authority_file_links(dir, exists(crate::allowances::FILE, 2)).unwrap();
+        assert_eq!(links, vec![(dir.join(crate::allowances::FILE), 2)]);
         let guard = ProtectedConfigDir {
             dirs: vec![MeasuredDir {
                 spelled: dir.to_path_buf(),
@@ -933,7 +935,7 @@ mod tests {
         };
         let error = guard.check_authority_links().unwrap_err().to_string();
         assert!(error.contains("has 2 hard links"), "{error}");
-        assert!(error.contains("allowances.json"), "{error}");
+        assert!(error.contains(crate::allowances::FILE), "{error}");
         // An uninspectable file refuses, naming it (E2).
         let error = authority_file_links(dir, |path| {
             if path == dir.join("config.toml") {
@@ -944,14 +946,14 @@ mod tests {
         })
         .unwrap_err()
         .to_string();
-        assert!(error.contains("allowances.json"), "{error}");
+        assert!(error.contains(crate::allowances::FILE), "{error}");
         assert!(
             error.contains("cannot determine whether a mount would expose"),
             "{error}"
         );
         // A non-file is not this check's business: the reader classifies it.
         let links = authority_file_links(dir, |path| {
-            if path == dir.join("allowances.json") {
+            if path == dir.join(crate::allowances::FILE) {
                 std::fs::symlink_metadata(tempfile::tempdir().unwrap().path())
             } else {
                 Err(Error::from(ErrorKind::NotFound))

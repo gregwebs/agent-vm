@@ -418,8 +418,9 @@ fn a_read_mutates_nothing() {
     assert_eq!(AuthoritySnapshot::take(&dir), before);
 }
 
-/// The size bound is applied from `lstat`, before any decode: a 2 MiB file is
-/// never parsed, so its contents cannot influence the outcome.
+/// The size bound is applied after trust and the version probe, and before the
+/// strict decode: a 2 MiB *current-version* file is never decoded, so its body
+/// cannot influence the outcome.
 #[test]
 fn oversized_is_damaged_before_decode() {
     let root = tempfile::tempdir().unwrap();
@@ -449,6 +450,70 @@ fn older_version_is_damaged() {
         store_at(&dir).read(),
         Read::NotUsed(Problem::Damaged(Damage::OlderVersion(0)))
     ));
+}
+
+/// MA7: trust is decided before size and version. A file this user does not
+/// trust is described as something another account or guest may have written,
+/// not as damage to move aside — for a file that is *also* oversized or newer.
+#[test]
+fn untrusted_beats_damaged_and_newer() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = tempfile::tempdir().unwrap();
+    let dir = authority_dir(root.path());
+    let oversized = |body: &str| {
+        let mut body = body.to_owned();
+        body.push_str(&" ".repeat(MAX_BYTES as usize + 1 - body.len()));
+        body
+    };
+    for (row, body) in [
+        (
+            "oversized",
+            oversized(&file_of(&[record("/tmp/a", "10.0.0.5")])),
+        ),
+        (
+            "oversized newer",
+            oversized(&format!(
+                r#"{{"v":2,"records":[{}]}}"#,
+                record("/tmp/a", "10.0.0.5")
+            )),
+        ),
+    ] {
+        let file = write(&dir, &body);
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let read = store_at(&dir).read();
+        assert!(
+            matches!(
+                &read,
+                Read::NotUsed(Problem::Untrusted(AuthorityRefusal::FileWritable))
+            ),
+            "{row}: {}",
+            damage_name(&read)
+        );
+    }
+}
+
+/// MA7: a newer file is classified by what it says it is, so a later release's
+/// larger body is not called damage and not sent to "move it aside".
+#[test]
+fn oversized_newer_file_is_newer_not_damaged() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = authority_dir(root.path());
+    let mut body = format!(r#"{{"v":2,"records":[{}]}}"#, record("/tmp/a", "10.0.0.5"));
+    body.push_str(&" ".repeat(MAX_BYTES as usize + 1 - body.len()));
+    write(&dir, &body);
+    let before = AuthoritySnapshot::take(&dir);
+    let read = store_at(&dir).read();
+    let Read::Newer { v, records } = &read else {
+        panic!(
+            "an oversized newer file is Newer, not {}",
+            damage_name(&read)
+        );
+    };
+    assert_eq!(*v, 2);
+    // The records this build can read, for `doctor`'s counts; never applied by
+    // anything (`allowances::tests::newer_is_never_applied`).
+    assert_eq!(records.len(), 1);
+    assert_eq!(AuthoritySnapshot::take(&dir), before);
 }
 
 /// A later release's file is `Newer`, never damage — and its records are read
@@ -572,25 +637,37 @@ fn trust_matrix() {
     );
     assert_eq!(authority_refusal(own_file(7), trusted_dir(7), 7), None);
     // The adapter's own mapping, over the same facts, is what `read_with` uses.
-    let dir_metadata = |uid: u32, mode: u32| {
+    let dir_metadata = |mode: u32| {
         // A real directory, chmod'ed, so `Metadata` carries the injected mode;
         // ownership cannot be faked without root, which row (b) reports.
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("d");
         std::fs::create_dir(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
-        let metadata = std::fs::symlink_metadata(&dir).unwrap();
-        let _ = uid;
-        metadata
+        std::fs::symlink_metadata(&dir).unwrap()
     };
-    assert_eq!(trust(&file, &dir_metadata(own, 0o700), own), None);
+    assert_eq!(trust(&file, &dir_metadata(0o700), own), None);
     assert_eq!(
-        trust(&file, &dir_metadata(own, 0o775), own),
+        trust(&file, &dir_metadata(0o775), own),
         Some(AuthorityRefusal::DirWritable)
     );
     assert_eq!(
-        trust(&file, &dir_metadata(own, 0o777), own),
+        trust(&file, &dir_metadata(0o777), own),
         Some(AuthorityRefusal::DirWritable)
+    );
+    // And the file's own ownership, injected independently of the directory: a
+    // trusted 0700 directory does not launder a file someone else owns. This is
+    // AC4's "foreign file owner (injected independently of the directory)".
+    assert_eq!(
+        trust(
+            &HostFileFacts {
+                uid: own + 1,
+                ..file
+            },
+            &dir_metadata(0o700),
+            own
+        ),
+        Some(AuthorityRefusal::FileOwner)
     );
 
     // (b) Real files. The mode predicate reads mode bits, so these rows hold
@@ -674,11 +751,43 @@ fn unreadable_is_not_damage() {
         "{}",
         damage_name(&read)
     );
+    // And the cause survives: the message says what failed *and* why, so a user
+    // can tell a permission problem from a race or a missing file.
+    let Read::NotUsed(Problem::Unreadable(message)) = &read else {
+        unreachable!("asserted above")
+    };
+    assert!(message.contains("opening"), "{message}");
+    assert!(
+        message.contains("Permission denied") || message.contains("os error 13"),
+        "the errno must reach the user: {message}"
+    );
     assert!(!matches!(
         read,
         Read::NotUsed(Problem::Damaged(_)) | Read::NotUsed(Problem::Untrusted(_))
     ));
     assert_eq!(AuthoritySnapshot::take(&dir), before);
+}
+
+/// The directory's uid is read from the real `Metadata`, and the directory is
+/// decided first: a reader that invented the directory's owner from the euid
+/// would call this a file problem, and one that mapped the *file's* uid from
+/// the directory would call a healthy store untrusted.
+#[test]
+fn the_directory_owner_comes_from_real_metadata_and_decides_first() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = authority_dir(root.path());
+    write(&dir, &file_of(&[record("/tmp/a", "10.0.0.5")]));
+    let own = crate::host_paths::current_euid();
+    assert!(matches!(store_at(&dir).read(), Read::Current { .. }));
+    let read = store_at(&dir).read_with(own.wrapping_add(1), || {});
+    assert!(
+        matches!(
+            &read,
+            Read::NotUsed(Problem::Untrusted(AuthorityRefusal::DirOwner))
+        ),
+        "{}",
+        damage_name(&read)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -703,6 +812,33 @@ fn replaced_once_between_open_and_fstat_reads_the_new_file() {
         }
     });
     assert_eq!(attempts, 2, "one reopen, not a loop");
+    assert_eq!(destinations(&read), ["api.example.com"]);
+}
+
+/// AC7 with an old descriptor that looks broken: the reopen decision is the
+/// descriptor's link count, so a size or read failure on the *old* file cannot
+/// pre-empt the retry and turn a healthy replacement into a warning.
+#[test]
+fn an_unlinked_oversized_descriptor_still_reopens() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = authority_dir(root.path());
+    let mut oversized = file_of(&[record("/tmp/a", "10.0.0.5")]);
+    oversized.push_str(&" ".repeat(MAX_BYTES as usize + 1 - oversized.len()));
+    write(&dir, &oversized);
+    let next = dir.join("next.json");
+    std::fs::write(&next, file_of(&[record("/tmp/b", "api.example.com")])).unwrap();
+    std::fs::set_permissions(&next, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mut attempts = 0;
+    let read = store_at(&dir).read_with(crate::host_paths::current_euid(), || {
+        attempts += 1;
+        if attempts == 1 {
+            std::fs::rename(&next, dir.join(FILE)).unwrap();
+        }
+    });
+    assert_eq!(
+        attempts, 2,
+        "the old descriptor was retried, not classified"
+    );
     assert_eq!(destinations(&read), ["api.example.com"]);
 }
 

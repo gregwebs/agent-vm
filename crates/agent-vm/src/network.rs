@@ -1013,6 +1013,52 @@ mod tests {
         );
     }
 
+    /// R3's TLS enablement, through the *applied* plan rather than the
+    /// authority's own accessor: `Plan::apply_to` is what decides `tls.enabled`,
+    /// and it derives it from the intercepted ports. A merge that reached the
+    /// policy but not the applied TLS decision would pass every other test.
+    #[tokio::test]
+    async fn recorded_merge_equals_cli_append_on_the_applied_tls_decision() {
+        const RECORDED: [&str; 4] = [
+            "api.example.com",
+            "tcp://api.example.com:8443",
+            "other.example",
+            "10.0.0.5",
+        ];
+        for bits in 0..1u8 << RECORDED.len() {
+            let recorded: Vec<&str> = RECORDED
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| bits & (1 << index) != 0)
+                .map(|(_, spelling)| *spelling)
+                .collect();
+            let mut merged = plan(args());
+            assert_eq!(
+                merged.adopt_recorded(
+                    Path::new(ALLOWANCE_FILE),
+                    &crate::allowances::ProjectAllowances::for_tests(&recorded)
+                ),
+                None,
+                "{recorded:?}"
+            );
+            let applied = recorded_network(&merged, &format!("merged-{bits}")).await;
+            let equivalent = plan(Args {
+                allow_egress: recorded.iter().map(|text| (*text).to_owned()).collect(),
+                ..args()
+            });
+            let expected = recorded_network(&equivalent, &format!("equivalent-{bits}")).await;
+            assert_eq!(
+                applied["tls"]["enabled"], expected["tls"]["enabled"],
+                "{recorded:?}"
+            );
+            assert_eq!(
+                applied["tls"]["intercepted_ports"], expected["tls"]["intercepted_ports"],
+                "{recorded:?}"
+            );
+            assert_eq!(applied["policy"], expected["policy"], "{recorded:?}");
+        }
+    }
+
     #[test]
     fn user_hostname_with_host_proxy_is_refused() {
         let user = crate::user_network::UserNetwork::for_test(
