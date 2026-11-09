@@ -56,11 +56,16 @@ fn address(ip: &str, port: u16) -> Destination {
     }
 }
 
+/// No store: every row keeps slice 1's ACTION text.
+fn empty_view() -> crate::allowances::ProjectView {
+    crate::allowances::ProjectView::empty()
+}
+
 /// Run the command with no live sockets: only the log answers.
 async fn run_logged(dir: &SessionsDir, args: Args) -> (i32, String, String) {
     let mut out = Vec::new();
     let mut err = Vec::new();
-    let status = run_in(Some(dir), &args, NOW, &mut out, &mut err)
+    let status = run_in(Some(dir), &args, &empty_view(), NOW, &mut out, &mut err)
         .await
         .expect("the command succeeds");
     (
@@ -333,7 +338,7 @@ async fn unknown_session_id_exits_1() {
         let mut out = Vec::new();
         let mut err = Vec::new();
         assert!(
-            run_in(Some(&dir), &args, NOW, &mut out, &mut err)
+            run_in(Some(&dir), &args, &empty_view(), NOW, &mut out, &mut err)
                 .await
                 .is_err(),
             "{bad:?} is not a session ID"
@@ -472,7 +477,7 @@ async fn a_fresh_project_prints_no_refusals_and_creates_nothing() {
     assert!(!path.exists());
     let mut out = Vec::new();
     let mut err = Vec::new();
-    let status = run_in(None, &table_args(), NOW, &mut out, &mut err)
+    let status = run_in(None, &table_args(), &empty_view(), NOW, &mut out, &mut err)
         .await
         .unwrap();
     assert_eq!(status, 0);
@@ -702,4 +707,130 @@ async fn a_newer_version_log_is_read_with_one_warning_and_never_replaced() {
         bytes,
         "reading a newer log never replaces it"
     );
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0065: the ACTION cell of a covered row
+// ---------------------------------------------------------------------------
+
+/// Run with a store in force.
+async fn run_with(
+    dir: &SessionsDir,
+    allowances: &crate::allowances::ProjectView,
+) -> (i32, String, String) {
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let status = run_in(Some(dir), &DEFAULT, allowances, NOW, &mut out, &mut err)
+        .await
+        .expect("the command succeeds");
+    (
+        status,
+        String::from_utf8(out).unwrap(),
+        String::from_utf8(err).unwrap(),
+    )
+}
+
+/// A covered row names the record and says application is *not* confirmed; an
+/// uncovered row keeps slice 1's text byte for byte.
+#[tokio::test]
+async fn covered_row_says_recorded_not_confirmed() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = session_dir(root.path());
+    // The address's own record covers it.
+    let covered = entry("46d712fd", address("203.0.113.10", 443), NOW - 60_000);
+    // A hostname's record covers it, through SNI.
+    let mut host = entry(
+        "88f5da9d",
+        Destination::Host {
+            protocol: "tcp".into(),
+            name: "cdn.example".into(),
+            port: Some(443),
+        },
+        NOW - 120_000,
+    );
+    host.name = Some(GuestName {
+        name: "cdn.example".into(),
+        source: "sni".into(),
+        truncated: false,
+    });
+    // The name was TLS-verified at this site, which is what makes an exact
+    // record a claim `covers` will make.
+    host.last_site = "tls-sni".into();
+    // Nothing recorded names this one.
+    let uncovered = entry("a00b2078", address("10.0.0.7", 8443), NOW - 240_000);
+    dir.write(
+        &snapshot("0a1b2c3d", NOW - 300_000, vec![covered, host, uncovered]),
+        NOW,
+    )
+    .unwrap();
+
+    let view = crate::allowances::ProjectView::for_tests(
+        &["tcp://[203.0.113.10/32]:443", "cdn.example"],
+        NOW - 60_000,
+        None,
+    );
+    let (status, out, err) = run_with(&dir, &view).await;
+    assert_eq!(status, 0);
+    assert!(err.is_empty(), "{err}");
+    let action = |id: &str| -> String {
+        out.lines()
+            .find(|line| line.starts_with(id))
+            .unwrap_or_else(|| panic!("no row {id}: {out}"))
+            .split("  ")
+            .filter(|cell| !cell.is_empty())
+            .last()
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(
+        action("46d712fd"),
+        "recorded project allowance tcp://[203.0.113.10/32]:443 (2025-10-09 08:52Z); not confirmed for this session"
+    );
+    assert_eq!(
+        action("88f5da9d"),
+        "recorded project allowance cdn.example (2025-10-09 08:52Z); not confirmed for this session"
+    );
+    // Slice 1's text, unchanged, for the row no record names.
+    assert_eq!(
+        action("a00b2078"),
+        "no grant in this version; relaunch with --allow-egress"
+    );
+    // The claim is about a file, never about the session: the old wording that
+    // promised nothing must not survive on a covered row.
+    assert!(!out.contains("; allowed"));
+}
+
+/// One store problem is one `warning:` line, and it changes no row: the table
+/// is what the log says either way.
+#[tokio::test]
+async fn a_store_problem_is_one_warning() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = session_dir(root.path());
+    let row = entry("46d712fd", address("203.0.113.10", 443), NOW - 60_000);
+    dir.write(&snapshot("0a1b2c3d", NOW - 300_000, vec![row]), NOW)
+        .unwrap();
+
+    let view = crate::allowances::ProjectView::for_tests(
+        &[],
+        NOW - 60_000,
+        Some(
+            "project allowances not applied: \"/home/a/.config/agent-vm/allowances.json\" could not be used (not a JSON document this build reads); this version does not repair it — move it aside to start over",
+        ),
+    );
+    let (status, out, err) = run_with(&dir, &view).await;
+    assert_eq!(status, 0, "{out}");
+    assert_eq!(
+        err.lines()
+            .filter(|line| line.starts_with("warning: "))
+            .count(),
+        1,
+        "{err}"
+    );
+    assert!(err.contains("allowances.json"), "{err}");
+    // Not covered, so the row says what it said before the store existed.
+    assert!(
+        out.contains("no grant in this version; relaunch with --allow-egress"),
+        "{out}"
+    );
+    assert!(!out.contains("recorded project allowance"), "{out}");
 }

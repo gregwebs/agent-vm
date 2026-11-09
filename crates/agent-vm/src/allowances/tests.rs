@@ -10,6 +10,7 @@
 
 use std::{
     net::SocketAddr,
+    os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
     sync::OnceLock,
 };
@@ -897,4 +898,217 @@ fn first_matching_record_in_file_order() {
         };
         assert_eq!(record.destination().to_string(), expected);
     }
+}
+
+// ---------------------------------------------------------------------------
+// H. `doctor`'s section
+// ---------------------------------------------------------------------------
+
+/// A store on disk for `doctor`, with the authority directory at 0700.
+fn doctor_store(root: &Path) -> (PathBuf, store::Store) {
+    let dir = root.join("agent-vm");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let store = store::Store::at(&dir);
+    (dir, store)
+}
+
+fn record_for(path: &Path, destination: &str, recorded_ms: i64) -> store::StoredRecord {
+    store::StoredRecord {
+        project: crate::project::digest_hex_of(path),
+        path: path.display().to_string(),
+        destination: destination.to_owned(),
+        recorded_ms,
+    }
+}
+
+fn write_store(dir: &Path, records: Vec<store::StoredRecord>, v: u32) -> String {
+    let lines: Vec<String> = records
+        .iter()
+        .map(|record| {
+            format!(
+                r#"{{"project":"{}","path":"{}","destination":"{}","recorded_ms":{}}}"#,
+                record.project, record.path, record.destination, record.recorded_ms
+            )
+        })
+        .collect();
+    let body = format!(r#"{{"v":{v},"records":[{}]}}"#, lines.join(","));
+    std::fs::write(dir.join(store::FILE), body.as_bytes()).unwrap();
+    std::fs::set_permissions(
+        dir.join(store::FILE),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    body
+}
+
+/// The section's states, in one table: the file line, the counts, the orphan
+/// and unknown classifications, the mode clause, and which states make `doctor`
+/// exit nonzero.
+#[test]
+fn allowances_section_states() {
+    let own = project_id("doctor-own");
+    let other = project_id("doctor-other");
+    let root = tempfile::tempdir().unwrap();
+    let present = root.path().join("present");
+    std::fs::create_dir(&present).unwrap();
+    let missing = root.path().join("gone");
+
+    // A current file: this project, another project that still exists, one that
+    // does not, and a destination this build cannot parse.
+    let (dir, store) = doctor_store(root.path());
+    write_store(
+        &dir,
+        vec![
+            record_for(
+                &project_path("doctor-own"),
+                "tcp://[203.0.113.10/32]:443",
+                1_762_680_120_000,
+            ),
+            record_for(&project_path("doctor-own"), "tool:codex", 1_762_680_120_000),
+            record_for(&present, "10.0.0.5", 1_762_680_120_000),
+            record_for(&missing, "10.0.0.6", 1_762_680_120_000),
+        ],
+        1,
+    );
+    let (section, failure) = doctor_section_at(Some(&store), None, Some(own.clone()));
+    assert!(failure.is_none(), "a current store is not a failure");
+    assert_eq!(
+        section,
+        format!(
+            "==> project allowances\n\
+             file: {file} (version 1, mode 0600)\n\
+             this project: 2\n  \
+             tcp://[203.0.113.10/32]:443  recorded 2025-11-09 09:22Z\n  \
+             tool:codex  not applied: port must be a decimal number 1-65535\n\
+             other projects: 2\n  \
+             {present} (1 allowance(s))\n  \
+             orphaned: {missing} (1 allowance(s))\n\
+             orphaned: 1 project path(s) no longer exist",
+            file = crate::one_line::path(&dir.join(store::FILE)),
+            present = crate::one_line::path(&present),
+            missing = crate::one_line::path(&missing),
+        )
+    );
+
+    // A newer file is counted, not applied, and does not fail the run.
+    let (dir, store) = doctor_store(&root.path().join("newer"));
+    write_store(
+        &dir,
+        vec![record_for(&present, "10.0.0.5", 1_762_680_120_000)],
+        2,
+    );
+    let (section, failure) = doctor_section_at(Some(&store), None, Some(other.clone()));
+    assert!(failure.is_none(), "a newer file is not a failure");
+    assert!(
+        section.contains("(written by a newer agent-vm, version 2; not applied)"),
+        "{section}"
+    );
+    assert!(section.contains("this project: 0"), "{section}");
+    assert!(section.contains("other projects: 1"), "{section}");
+
+    // Modes: 0644 and 0400 say what agent-vm would write without claiming
+    // anything about who can read them.
+    for (mode, clause) in [
+        (0o644, "; group- or other-readable, agent-vm writes 0600"),
+        (0o400, "; agent-vm writes 0600"),
+        (0o600, ""),
+    ] {
+        let (dir, store) = doctor_store(&root.path().join(format!("mode-{mode:o}")));
+        write_store(&dir, vec![record_for(&present, "10.0.0.5", 0)], 1);
+        std::fs::set_permissions(dir.join(store::FILE), std::fs::Permissions::from_mode(mode))
+            .unwrap();
+        let (section, _) = doctor_section_at(Some(&store), None, None);
+        assert!(
+            section.contains(&format!("(version 1, mode {mode:04o}{clause})")),
+            "{mode:o}: {section}"
+        );
+    }
+
+    // Every state that makes doctor fail: damaged, untrusted, unreadable,
+    // unsettled (the retry is driven at the read level) and an unusable $HOME.
+    let (dir, store) = doctor_store(&root.path().join("damaged"));
+    std::fs::write(dir.join(store::FILE), b"not json").unwrap();
+    let (section, failure) = doctor_section_at(Some(&store), None, None);
+    assert!(
+        section.contains("(not used: could not be used (not a JSON document this build reads))"),
+        "{section}"
+    );
+    assert!(failure.is_some(), "{section}");
+
+    let (dir, store) = doctor_store(&root.path().join("untrusted"));
+    write_store(&dir, vec![record_for(&present, "10.0.0.5", 0)], 1);
+    std::fs::set_permissions(
+        dir.join(store::FILE),
+        std::fs::Permissions::from_mode(0o666),
+    )
+    .unwrap();
+    let (section, failure) = doctor_section_at(Some(&store), None, None);
+    assert!(
+        section.contains("(not used: is group- or other-writable)"),
+        "{section}"
+    );
+    assert!(failure.is_some(), "{section}");
+
+    let (section, failure) = doctor_section_at(None, None, None);
+    assert_eq!(
+        section,
+        "==> project allowances\nfile: not checked ($HOME is not set)"
+    );
+    assert!(failure.is_none(), "an unset $HOME is not a failure");
+
+    let (section, failure) =
+        doctor_section_at(None, Some(anyhow::anyhow!("$HOME is set but empty")), None);
+    assert!(
+        section.contains("file: not read ($HOME is set but empty)"),
+        "{section}"
+    );
+    assert!(failure.is_some(), "an unusable $HOME fails the run");
+}
+
+/// The orphan classification's third row: a path whose *ancestor* cannot be
+/// inspected is `unknown`, never counted as orphaned. The check reads the mode
+/// bits, so it cannot run as root, where every path is inspectable.
+#[test]
+fn doctor_reports_an_uninspectable_project_as_unknown() {
+    if crate::host_paths::current_euid() == 0 {
+        eprintln!(
+            "uninspectable-path fixture NOT RUN: running as root, so every path is inspectable"
+        );
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (dir, store) = doctor_store(root.path());
+    let locked = root.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::create_dir(locked.join("project")).unwrap();
+    write_store(
+        &dir,
+        vec![record_for(&locked.join("project"), "10.0.0.5", 0)],
+        1,
+    );
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let (section, failure) = doctor_section_at(Some(&store), None, None);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(failure.is_none(), "{section}");
+    assert!(
+        section.contains("unknown: 1 project path(s) could not be checked"),
+        "{section}"
+    );
+    assert!(!section.contains("no longer exist"), "{section}");
+    // An intermediate component that became a *file* answers `NotADirectory`,
+    // which is the same fact as a missing path.
+    let file = root.path().join("now-a-file");
+    std::fs::write(&file, b"").unwrap();
+    let (dir, store) = doctor_store(&root.path().join("not-a-dir"));
+    write_store(
+        &dir,
+        vec![record_for(&file.join("project"), "10.0.0.5", 0)],
+        1,
+    );
+    let (section, _) = doctor_section_at(Some(&store), None, None);
+    assert!(
+        section.contains("orphaned: 1 project path(s) no longer exist"),
+        "{section}"
+    );
 }

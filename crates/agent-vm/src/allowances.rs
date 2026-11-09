@@ -39,6 +39,8 @@ mod store;
 
 use std::path::{Path, PathBuf};
 
+use anyhow::anyhow;
+
 use microsandbox_network::policy::{
     Action, Destination as RuleDestination, Direction, DomainName, NetworkPolicy, Protocol, Rule,
 };
@@ -199,12 +201,28 @@ impl ProjectView {
         self.notice.as_deref()
     }
 
+    /// An empty view: a command with no store.
     #[cfg(test)]
     pub(crate) fn empty() -> Self {
         Self {
             file: None,
             allowances: ProjectAllowances::default(),
             notice: None,
+        }
+    }
+
+    /// A view with records and, optionally, a notice: the seam `access`'s tests
+    /// use to render a covered row without a file.
+    #[cfg(test)]
+    pub(crate) fn for_tests(spellings: &[&str], recorded_ms: i64, notice: Option<&str>) -> Self {
+        let mut allowances = ProjectAllowances::for_tests(spellings);
+        for entry in &mut allowances.entries {
+            entry.recorded_ms = recorded_ms;
+        }
+        Self {
+            file: Some(PathBuf::from("/home/a/.config/agent-vm/allowances.json")),
+            allowances,
+            notice: notice.map(str::to_owned),
         }
     }
 }
@@ -485,3 +503,242 @@ fn admits_dns_query(
 
 #[cfg(test)]
 mod tests;
+
+// ---------------------------------------------------------------------------
+// `agent-vm doctor`
+// ---------------------------------------------------------------------------
+
+/// The doctor section and, when the store is not in use, the error that makes
+/// doctor exit nonzero *after* printing every later section.
+///
+/// `doctor` reports what is on the host rather than what a launch would do, so
+/// this reads the same one store the launch reads and names every state —
+/// including the ones that are not this build's fault. A store this build cannot
+/// use is a failure to report; a newer file, an unparseable destination and an
+/// orphan are facts, not failures.
+pub(crate) fn doctor_section(project: Option<&ProjectDir>) -> (String, Option<anyhow::Error>) {
+    let (store, host_error) = host_store();
+    doctor_section_at(store.as_ref(), host_error, project.map(ProjectId::of))
+}
+
+fn doctor_section_at(
+    store: Option<&store::Store>,
+    host_error: Option<anyhow::Error>,
+    project: Option<ProjectId>,
+) -> (String, Option<anyhow::Error>) {
+    let mut section = String::from("==> project allowances\n");
+    let Some(store) = store else {
+        match host_error {
+            // No `$HOME` means no user config is read at all (ADR-0038), so
+            // there is no store to be wrong — but a user who set `$HOME` to
+            // something unusable needs to know why nothing was read.
+            None => section.push_str("file: not checked ($HOME is not set)"),
+            Some(error) => {
+                section.push_str(&format!(
+                    "file: not read ({})",
+                    crate::one_line::text(&format!("{error:#}"))
+                ));
+                return (
+                    section,
+                    Some(anyhow!(
+                        "project allowance store not read; see project allowances section"
+                    )),
+                );
+            }
+        }
+        return (section, None);
+    };
+    let file = store.file();
+    let path = crate::one_line::path(&file);
+    let failure = |section: String| {
+        (
+            section,
+            Some(anyhow!(
+                "project allowance store is not in use; see project allowances section"
+            )),
+        )
+    };
+    match store.read() {
+        store::Read::Absent => {
+            section.push_str(&format!("file: {path} (absent; nothing recorded)"));
+            (section, None)
+        }
+        store::Read::NotUsed(problem) => {
+            let state = match &problem {
+                store::Problem::Damaged(damage) => {
+                    format!("could not be used ({})", damage.clause())
+                }
+                store::Problem::Untrusted(refusal) => refusal_clause(refusal),
+                store::Problem::Unreadable(error) => format!("could not be read ({error})"),
+                store::Problem::Unsettled => {
+                    section.push_str(&format!(
+                        "file: {path} (changed while being read; not used)"
+                    ));
+                    return failure(section);
+                }
+            };
+            section.push_str(&format!("file: {path} (not used: {state})"));
+            failure(section)
+        }
+        store::Read::Current { records, mode } => {
+            section.push_str(&format!(
+                "file: {path} (version 1, mode {mode:04o}{})",
+                mode_clause(mode)
+            ));
+            describe_records(&mut section, &records, project.as_ref());
+            (section, None)
+        }
+        store::Read::Newer { v, records } => {
+            section.push_str(&format!(
+                "file: {path} (written by a newer agent-vm, version {v}; not applied)"
+            ));
+            // Counted from the records this build could read: a newer file's
+            // extra fields must not hide the sizes of the tables it holds.
+            describe_records(&mut section, &records, project.as_ref());
+            (section, None)
+        }
+    }
+}
+
+/// What the file's mode means for a reader, in the two cases worth saying. Only
+/// the group/other bits are a warning; anything else is simply not what
+/// agent-vm would write.
+fn mode_clause(mode: u32) -> &'static str {
+    if mode & 0o044 != 0 {
+        "; group- or other-readable, agent-vm writes 0600"
+    } else if mode != 0o600 {
+        "; agent-vm writes 0600"
+    } else {
+        ""
+    }
+}
+
+/// `this project`, `other projects`, `orphaned` and `unknown`, in one pass over
+/// the records.
+fn describe_records(
+    section: &mut String,
+    records: &[store::StoredRecord],
+    project: Option<&ProjectId>,
+) {
+    let ours: Vec<&store::StoredRecord> = records
+        .iter()
+        .filter(|record| project.is_some_and(|project| record.project == project.as_str()))
+        .collect();
+    section.push_str(&format!("\nthis project: {}", ours.len()));
+    for record in &ours {
+        match Allowance::parse(&record.destination) {
+            Ok(destination) => section.push_str(&format!(
+                "\n  {}  recorded {}",
+                crate::config::escape_str(&destination.to_string()),
+                recorded_at(record.recorded_ms)
+            )),
+            Err(error) => section.push_str(&format!(
+                "\n  {}  not applied: {error}",
+                crate::config::escape_str(&record.destination)
+            )),
+        }
+    }
+
+    // Every project that is not this one, in file order, with its own count.
+    let mut others: Vec<(&str, usize)> = Vec::new();
+    for record in records {
+        if project.is_some_and(|project| record.project == project.as_str()) {
+            continue;
+        }
+        match others.iter_mut().find(|(path, _)| *path == record.path) {
+            Some((_, count)) => *count += 1,
+            None => others.push((record.path.as_str(), 1)),
+        }
+    }
+    section.push_str(&format!("\nother projects: {}", others.len()));
+    let mut orphaned = 0usize;
+    let mut unknown = 0usize;
+    for (path, count) in &others {
+        let allowances = plural(*count);
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_dir() => {
+                section.push_str(&format!(
+                    "\n  {} ({allowances})",
+                    crate::one_line::path(Path::new(path))
+                ));
+            }
+            Ok(_) => {
+                orphaned += 1;
+                section.push_str(&format!(
+                    "\n  orphaned: {} ({allowances})",
+                    crate::one_line::path(Path::new(path))
+                ));
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                // An intermediate component that became a file answers
+                // `NotADirectory`, which is the same fact as a missing path.
+                orphaned += 1;
+                section.push_str(&format!(
+                    "\n  orphaned: {} ({allowances})",
+                    crate::one_line::path(Path::new(path))
+                ));
+            }
+            Err(error) => {
+                unknown += 1;
+                section.push_str(&format!(
+                    "\n  unknown: {} ({:?})",
+                    crate::one_line::path(Path::new(path)),
+                    error.kind()
+                ));
+            }
+        }
+    }
+    if orphaned > 0 {
+        section.push_str(&format!(
+            "\norphaned: {orphaned} project path(s) no longer exist"
+        ));
+    }
+    if unknown > 0 {
+        section.push_str(&format!(
+            "\nunknown: {unknown} project path(s) could not be checked"
+        ));
+    }
+}
+
+fn plural(count: usize) -> String {
+    format!("{count} allowance(s)")
+}
+
+/// `YYYY-MM-DD HH:MMZ` in UTC: a record's timestamp does not need seconds, and
+/// one rendering serves `doctor` and the `access` ACTION cell.
+pub(crate) fn recorded_at(ms: i64) -> String {
+    let seconds = ms.div_euclid(1000);
+    let days = seconds.div_euclid(86_400);
+    let seconds_of_day = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}Z")
+}
+
+/// Howard Hinnant's `civil_from_days`, so the report needs no calendar crate.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = (z - era * 146_097) as u64;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era as i64 + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * shifted_month + 2) / 5 + 1) as u32;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    } as u32;
+    if month <= 2 {
+        year += 1;
+    }
+    (year, month, day)
+}

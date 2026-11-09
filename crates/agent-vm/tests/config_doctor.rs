@@ -2473,3 +2473,122 @@ fn doctor_names_the_keychain_when_it_wins() {
         "doctor must never print a bearer:\n{stdout}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// ADR-0065: the project allowance store is reported, and its failure exits
+// nonzero only after every later section has printed
+// ---------------------------------------------------------------------------
+
+#[path = "support/authority_snapshot.rs"]
+mod authority_snapshot;
+
+impl Harness {
+    /// Write the store at the modes the launcher writes, and return its path.
+    fn write_allowances(&self, bytes: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = authority_snapshot::empty_authority_dir(&self.home_root);
+        let file = dir.join("allowances.json");
+        std::fs::write(&file, bytes).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        file
+    }
+}
+
+/// A store this build cannot use fails the run — after every section, so the
+/// user still gets the report they ran `doctor` for — and changes nothing.
+#[test]
+fn untrusted_and_unreadable_stores_fail_after_every_section() {
+    use std::os::unix::fs::PermissionsExt as _;
+    for row in ["group-writable", "damaged", "directory"] {
+        let h = Harness::new();
+        let file = h.write_allowances(r#"{"v":1,"records":[]}"#);
+        match row {
+            "group-writable" => {
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o666)).unwrap()
+            }
+            "damaged" => std::fs::write(&file, b"not json").unwrap(),
+            _ => {
+                std::fs::remove_file(&file).unwrap();
+                std::fs::create_dir(&file).unwrap();
+            }
+        }
+        let directory = h.home_root.join(".config/agent-vm");
+        let before = authority_snapshot::take(&directory);
+        let out = h.run_doctor();
+        let text = format!("{}{}", stdout_of(&out), stderr_of(&out));
+        assert!(!out.status.success(), "{row}: doctor exited 0: {text}");
+        assert!(text.contains("==> project allowances"), "{row}: {text}");
+        assert!(text.contains("not used: "), "{row}: {text}");
+        assert!(text.contains("allowances.json"), "{row}: {text}");
+        // The trailing failure comes after the last section, which is what makes
+        // it a report rather than an early exit.
+        assert!(
+            text.contains("==> agent-vm doctor: available operations"),
+            "{row}: doctor stopped before its last section: {text}"
+        );
+        assert_eq!(
+            authority_snapshot::take(&directory),
+            before,
+            "{row}: doctor changed the authority directory"
+        );
+    }
+}
+
+/// The digest a record's `project` column carries: the full lowercase hex
+/// SHA-256 of the canonical path's bytes, computed independently of the
+/// launcher.
+fn allowance_digest(path: &Path) -> String {
+    use sha2::{Digest as _, Sha256};
+    Sha256::digest(path.as_os_str().as_encoded_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// A readable store is reported with this project's records and orphans, and a
+/// newer file is reported as not applied — not as a failure.
+#[test]
+fn a_current_and_a_newer_store_are_reported_without_failing() {
+    for (row, version) in [("current", 1u32), ("newer", 2)] {
+        let h = Harness::new();
+        let project = h.project_root.clone();
+        let orphan = h.home_root.join("old-project");
+        h.write_allowances(&format!(
+            r#"{{"v":{version},"records":[
+                {{"project":"{own}","path":"{own_path}","destination":"10.0.0.5","recorded_ms":1762680120000}},
+                {{"project":"{gone}","path":"{gone_path}","destination":"10.0.0.6","recorded_ms":1762680120000}}
+            ]}}"#,
+            own = allowance_digest(&project),
+            own_path = project.display(),
+            gone = allowance_digest(&orphan),
+            gone_path = orphan.display(),
+        ));
+        let out = h.run_doctor();
+        let text = format!("{}{}", stdout_of(&out), stderr_of(&out));
+        assert!(text.contains("==> project allowances"), "{row}: {text}");
+        assert!(text.contains("this project: 1"), "{row}: {text}");
+        assert!(
+            text.contains("10.0.0.5/32  recorded 2025-11-09 09:22Z"),
+            "{row}: {text}"
+        );
+        assert!(text.contains("other projects: 1"), "{row}: {text}");
+        assert!(
+            text.contains("orphaned: 1 project path(s) no longer exist"),
+            "{row}: {text}"
+        );
+        if version == 1 {
+            assert!(out.status.success(), "{row}: {text}");
+            assert!(text.contains("(version 1, mode 0600)"), "{row}: {text}");
+            assert!(!text.contains("newer agent-vm"), "{row}: {text}");
+        } else {
+            assert!(
+                out.status.success(),
+                "a newer store is not a failure: {row}: {text}"
+            );
+            assert!(
+                text.contains("(written by a newer agent-vm, version 2; not applied)"),
+                "{row}: {text}"
+            );
+        }
+    }
+}
