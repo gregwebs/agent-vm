@@ -14594,3 +14594,38 @@ fn a_launch_without_a_store_creates_none() {
     );
     assert_eq!(authority_snapshot::take(&directory), before);
 }
+
+/// AC4's unreadable row, and the guard's boundary: `lstat` succeeds, so the
+/// launch is not refused; the *read* fails, so the store degrades with one
+/// warning. The only row that cannot run as root, where mode 000 is readable.
+#[test]
+fn unreadable_allowances_degrades_not_refuses() {
+    use std::os::unix::fs::PermissionsExt as _;
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!(
+            "unreadable allowances fixture NOT RUN: running as root, so mode 000 is readable"
+        );
+        return;
+    }
+    let h = Harness::warm();
+    let file = h.seed_allowances(&allowance_file(&[allowance_record(
+        &h.project_root,
+        "tcp://[203.0.113.10/32]:443",
+    )]));
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let out = h.launch("shell", &[]);
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+    let warnings = allowance_warnings(&stderr);
+    assert_eq!(warnings.len(), 1, "{stderr}");
+    assert!(
+        warnings[0].contains("could not be read"),
+        "the warning names the cause: {warnings:?}"
+    );
+    assert!(
+        !applied_rules(&stderr)
+            .iter()
+            .any(|rule| rule["destination"]["cidr"] == "203.0.113.10/32"),
+        "{stderr}"
+    );
+}

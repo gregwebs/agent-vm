@@ -251,7 +251,9 @@ struct MeasuredDir {
     /// not the per-`$HOME` authority dir, whose remedy names the state root.
     home: Option<PathBuf>,
     purpose: StorePurpose,
-    config_file_links: Option<(PathBuf, u64)>,
+    /// Every authority store file the one-link check measures, with its link
+    /// count: `config.toml` and `allowances.json` (ADR-0065 P7).
+    authority_file_links: Vec<(PathBuf, u64)>,
     ids: Vec<Option<(u64, u64)>>,
     paths: Vec<Vec<u8>>,
     prospective_ids: Vec<(u64, u64)>,
@@ -454,13 +456,7 @@ fn under_identity(path: &Path, identity: Option<(u64, u64)>) -> bool {
 fn measure_authority_store(home: &Path) -> Result<MeasuredDir> {
     let spelled = home.join(config::USER_CONFIG_DIR_RELATIVE);
     let resolution = resolve(&spelled, Walk::Authority)?;
-    let file = spelled.join("config.toml");
-    let config_file_links = match fs::symlink_metadata(&file) {
-        Ok(m) if m.is_file() => Some((file.clone(), m.nlink())),
-        Ok(_) => None,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e).with_context(|| uncertain(&file)),
-    };
+    let authority_file_links = authority_file_links(&spelled, |path| fs::symlink_metadata(path))?;
     let mut ids = Vec::new();
     let mut paths = Vec::new();
     for r in &resolution.routes {
@@ -493,13 +489,43 @@ fn measure_authority_store(home: &Path) -> Result<MeasuredDir> {
         spelled,
         home: Some(home),
         purpose: StorePurpose::LaunchAuthority,
-        config_file_links,
+        authority_file_links,
         ids,
         paths,
         prospective_ids,
         prospective_anchors,
         prospective_suffixes,
     })
+}
+
+/// ADR-0038 Decision 2's one-link check, over every authority file that can
+/// grant something: `config.toml` and, since ADR-0065, `allowances.json`.
+///
+/// Both are measured identically because both decide authority, and a second
+/// name for either one is a file a guest could write and then unlink before the
+/// next launch read it.
+///
+/// Three outcomes per file, and the middle one is this function's whole point:
+/// a regular file records its link count; a missing file and a non-file are
+/// ignored — the *reader* classifies those, as `Damaged` or `Untrusted`; and any
+/// other error refuses the launch (ADR-0065 E2). Deferring the uninspectable
+/// case to the reader would be wrong for the reason the check exists: not
+/// applying the file now does not stop laundering into the *next* launch.
+fn authority_file_links(
+    spelled: &Path,
+    lstat: impl Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+) -> Result<Vec<(PathBuf, u64)>> {
+    let mut links = Vec::new();
+    for name in ["config.toml", "allowances.json"] {
+        let file = spelled.join(name);
+        match lstat(&file) {
+            Ok(m) if m.is_file() => links.push((file, m.nlink())),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| uncertain(&file)),
+        }
+    }
+    Ok(links)
 }
 
 /// One additional host-only store (ADR-0064) measured exactly like the
@@ -532,7 +558,7 @@ fn measure_store(spelled: PathBuf, purpose: StorePurpose) -> Result<MeasuredDir>
         spelled,
         home: None,
         purpose,
-        config_file_links: None,
+        authority_file_links: Vec::new(),
         ids,
         paths,
         prospective_ids,
@@ -580,13 +606,13 @@ impl ProtectedConfigDir {
     }
     pub(crate) fn check_authority_links(&self) -> Result<()> {
         for d in &self.dirs {
-            if let Some((file, n)) = &d.config_file_links
-                && !authority_file_singly_linked(*n)
-            {
-                bail!(
-                    "\"{}\" has {n} hard links; agent-vm will not launch while another name for it could be written from a guest and then removed. Remove the other links, or replace the file with a copy.",
-                    crate::one_line::path(file)
-                );
+            for (file, n) in &d.authority_file_links {
+                if !authority_file_singly_linked(*n) {
+                    bail!(
+                        "\"{}\" has {n} hard links; agent-vm will not launch while another name for it could be written from a guest and then removed. Remove the other links, or replace the file with a copy.",
+                        crate::one_line::path(file)
+                    );
+                }
             }
         }
         Ok(())
@@ -842,6 +868,99 @@ mod tests {
             assert_eq!(authority_file_singly_linked(n), n == 1);
         }
     }
+    /// ADR-0065 E1/E2: both authority files are measured, an uninspectable one
+    /// refuses, and a missing or non-file one is left to the reader.
+    ///
+    /// The injected `lstat` is the whole point: the ordinary read error (EACCES
+    /// on an unreadable file) must *not* be what this asserts, so the cases
+    /// below separate a failing `lstat` from a present-but-unreadable file.
+    #[test]
+    fn authority_file_links_measures_both_files_and_refuses_an_uninspectable_one() {
+        use std::io::{Error, ErrorKind};
+        let dir = Path::new("/authority");
+        let exists = |name: &str, nlink: u64| {
+            let name = name.to_owned();
+            move |path: &Path| {
+                if path == dir.join(&name) {
+                    // A real regular file, then a hard link to it, so the mode
+                    // and link count come from the kernel rather than a stub.
+                    let root = tempfile::tempdir().unwrap();
+                    let file = root.path().join("f");
+                    std::fs::write(&file, b"").unwrap();
+                    let alias = root.path().join("alias");
+                    for _ in 1..nlink {
+                        std::fs::hard_link(&file, &alias).unwrap();
+                    }
+                    std::fs::symlink_metadata(&file)
+                } else {
+                    Err(Error::from(ErrorKind::NotFound))
+                }
+            }
+        };
+        // Neither file: nothing measured, no error.
+        assert!(
+            authority_file_links(dir, |_| Err(Error::from(ErrorKind::NotFound)))
+                .unwrap()
+                .is_empty()
+        );
+        // `config.toml` alone, singly named: measured, and the guard passes.
+        assert_eq!(
+            authority_file_links(dir, exists("config.toml", 1)).unwrap(),
+            vec![(dir.join("config.toml"), 1)]
+        );
+        // `allowances.json` alone: the ADR-0065 addition.
+        assert_eq!(
+            authority_file_links(dir, exists("allowances.json", 1)).unwrap(),
+            vec![(dir.join("allowances.json"), 1)]
+        );
+        // A second name for it is recorded, and the guard refuses.
+        let links = authority_file_links(dir, exists("allowances.json", 2)).unwrap();
+        assert_eq!(links, vec![(dir.join("allowances.json"), 2)]);
+        let guard = ProtectedConfigDir {
+            dirs: vec![MeasuredDir {
+                spelled: dir.to_path_buf(),
+                home: None,
+                purpose: StorePurpose::LaunchAuthority,
+                authority_file_links: links,
+                ids: Vec::new(),
+                paths: Vec::new(),
+                prospective_ids: Vec::new(),
+                prospective_anchors: Vec::new(),
+                prospective_suffixes: Vec::new(),
+            }],
+            sessions: Vec::new(),
+            cwd: "/".into(),
+        };
+        let error = guard.check_authority_links().unwrap_err().to_string();
+        assert!(error.contains("has 2 hard links"), "{error}");
+        assert!(error.contains("allowances.json"), "{error}");
+        // An uninspectable file refuses, naming it (E2).
+        let error = authority_file_links(dir, |path| {
+            if path == dir.join("config.toml") {
+                std::fs::symlink_metadata(tempfile::tempdir().unwrap().path())
+            } else {
+                Err(Error::from(ErrorKind::PermissionDenied))
+            }
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("allowances.json"), "{error}");
+        assert!(
+            error.contains("cannot determine whether a mount would expose"),
+            "{error}"
+        );
+        // A non-file is not this check's business: the reader classifies it.
+        let links = authority_file_links(dir, |path| {
+            if path == dir.join("allowances.json") {
+                std::fs::symlink_metadata(tempfile::tempdir().unwrap().path())
+            } else {
+                Err(Error::from(ErrorKind::NotFound))
+            }
+        })
+        .unwrap();
+        assert!(links.is_empty(), "{links:?}");
+    }
+
     #[test]
     fn existing_entry_table() {
         let ids = [Some((1, 2)), None, Some((3, 4))];
@@ -909,7 +1028,7 @@ mod tests {
             spelled: "/authority".into(),
             home: Some("/home".into()),
             purpose: StorePurpose::LaunchAuthority,
-            config_file_links: None,
+            authority_file_links: Vec::new(),
             ids: vec![],
             paths: vec![],
             prospective_ids: ids.to_vec(),
