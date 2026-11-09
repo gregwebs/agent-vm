@@ -1,6 +1,7 @@
 //! agent-vm — sandboxed microVMs for AI coding agents on microsandbox.
 
 mod access_cmd;
+mod allowances;
 mod boot_image;
 mod cli;
 mod clipboard;
