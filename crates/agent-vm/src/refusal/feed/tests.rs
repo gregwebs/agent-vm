@@ -490,14 +490,21 @@ fn an_older_snapshot_never_overwrites_the_final() {
 /// `post` and `post_final` share one slot, so a dirty tick that lands between the
 /// final offer and the final write must not replace it: the record that says the
 /// session ended is the one a reader needs.
+///
+/// The window is made deterministic by keeping the writer busy: it is stuck
+/// writing an earlier snapshot while the final is *offered* and the second post
+/// arrives, so the final is still only pending when the second post would replace
+/// it.
 #[test]
 fn a_post_cannot_displace_a_pending_final() {
     let (_root, dir) = dir();
-    // Hold the log's own lock so the final job stays pending while the second
-    // post arrives.
     let held = crate::host_paths::open_lock_file(&dir.path().join("refusals.lock")).unwrap();
     crate::host_paths::flock_exclusive(&held).unwrap();
     let persist = Persister::new(dir.clone());
+    // The writer takes this job and blocks in the log's own lock, leaving the
+    // pending slot free for the two below.
+    persist.post(snapshot(0, false));
+    std::thread::sleep(Duration::from_millis(100));
     let wait = persist.post_final(snapshot(1, true));
     persist.post(snapshot(2, false));
     std::thread::sleep(Duration::from_millis(50));
