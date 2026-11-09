@@ -163,21 +163,109 @@ pub fn exposing_entry(root: &[u8], root_id: Option<(u64, u64)>, ids: &[Option<(u
 }
 }
 
+/// Which host-only store a measured directory is.
+///
+/// The purpose decides the wording of a refusal and its remedy, and it is what
+/// separates the ADR-0038 authority store (one per `$HOME`, measured with a
+/// `home`) from the ADR-0064 stores that join it afterwards.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StorePurpose {
+    /// `$HOME/.config/agent-vm`: the launch authority a guest must not author.
+    LaunchAuthority,
+    /// `<state root>/<hash>.sessions`: this project's refusal records and
+    /// control sockets (ADR-0064).
+    ProjectSessions,
+    /// `MSB_HOME`: the runtime's own writable state, where every sandbox's
+    /// `network.log` is written (ADR-0064, R1).
+    RuntimeState,
+}
+
+impl StorePurpose {
+    /// The clause that follows "…or a directory agent-vm resolves through to
+    /// reach it" in a refusal. Written so the authority store's sentence is
+    /// byte-identical to the one it replaced.
+    fn clause(self) -> &'static str {
+        match self {
+            Self::LaunchAuthority => "where agent-vm reads launch authority",
+            Self::ProjectSessions => {
+                "where agent-vm keeps this project's refusal records and control sockets"
+            }
+            Self::RuntimeState => "where the sandbox runtime writes its own state",
+        }
+    }
+    /// What a guest could plant at a store path that does not exist yet, for the
+    /// prospective spelling of the same refusal.
+    fn planted(self) -> &'static str {
+        match self {
+            Self::LaunchAuthority => "authority",
+            Self::ProjectSessions => "a refusal record",
+            Self::RuntimeState => "runtime state",
+        }
+    }
+    /// What a guest that can write the store could do, as the reason a refusal
+    /// gives for stopping the launch.
+    fn consequence(self) -> &'static str {
+        match self {
+            Self::LaunchAuthority => "the guest could rewrite that authority for a later launch",
+            Self::ProjectSessions => "the guest could forge or erase them",
+            Self::RuntimeState => {
+                "the guest could forge or erase every sandbox's refusal log, including this \
+                 project's"
+            }
+        }
+    }
+}
+
+/// One host-only store that joins the measured set.
+///
+/// `path` is a spelling, not a resolved path: `measure` resolves it through the
+/// same walk as the authority stores, so a `:fork`/`:ro` bind of a
+/// route to a store is refused exactly as a route to the authority dir is (`R1`).
+#[derive(Debug, Clone)]
+pub(crate) struct Store {
+    purpose: StorePurpose,
+    path: PathBuf,
+}
+
+impl Store {
+    pub(crate) fn new(purpose: StorePurpose, path: impl Into<PathBuf>) -> Self {
+        Self {
+            purpose,
+            path: path.into(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ProtectedConfigDir {
     dirs: Vec<MeasuredDir>,
+    /// `R2`: the `.sessions` directories no bind of *any* mode may name, even
+    /// though `R1` exempts `:ro`/`:fork` (D3).
+    sessions: Vec<SessionsDir>,
     cwd: PathBuf,
 }
 #[derive(Debug)]
 struct MeasuredDir {
     spelled: PathBuf,
-    home: PathBuf,
+    /// The home this store's authority dir lives in; `None` for a store that is
+    /// not the per-`$HOME` authority dir, whose remedy names the state root.
+    home: Option<PathBuf>,
+    purpose: StorePurpose,
     config_file_links: Option<(PathBuf, u64)>,
     ids: Vec<Option<(u64, u64)>>,
     paths: Vec<Vec<u8>>,
     prospective_ids: Vec<(u64, u64)>,
     prospective_anchors: Vec<Vec<Vec<u8>>>,
     prospective_suffixes: Vec<Vec<Vec<u8>>>,
+}
+
+/// A `.sessions` directory, in the three spellings `R2` needs: the resolved
+/// path, the directory's own identity, and the anchored lexical path for a
+/// root that does not exist yet.
+#[derive(Debug)]
+struct SessionsDir {
+    identity: Option<(u64, u64)>,
+    anchored: PathBuf,
 }
 #[derive(Clone, Debug)]
 struct WriteRoute {
@@ -322,65 +410,149 @@ fn components(path: &Path) -> Vec<Vec<u8>> {
 fn suffix_components(suffix: &[OsString]) -> Vec<Vec<u8>> {
     suffix.iter().map(|s| s.as_bytes().to_vec()).collect()
 }
+/// The walk's answer as one path: the deepest existing ancestor it reached,
+/// followed by the components that do not exist yet. `resolve` bails on an
+/// unreadable or non-absolute root; the lexical spelling is then the only
+/// answer left, and it is the one the caller typed.
+fn anchored_resolved(cwd: &Path, path: &Path) -> PathBuf {
+    let spelled = anchored(cwd, path);
+    let Ok(resolution) = resolve(&spelled, Walk::Authority) else {
+        return spelled;
+    };
+    let mut end = resolution.end.0.path;
+    for component in resolution.end.1 {
+        end.push(component);
+    }
+    end
+}
+
+/// The ADR-0038 authority directory of one `$HOME`: the one store measured
+/// with a `home`, because its remedy names running from a narrower project
+/// directory rather than pointing `AGENT_VM_STATE_DIR` elsewhere.
+fn measure_authority_store(home: &Path) -> Result<MeasuredDir> {
+    let spelled = home.join(config::USER_CONFIG_DIR_RELATIVE);
+    let resolution = resolve(&spelled, Walk::Authority)?;
+    let file = spelled.join("config.toml");
+    let config_file_links = match fs::symlink_metadata(&file) {
+        Ok(m) if m.is_file() => Some((file.clone(), m.nlink())),
+        Ok(_) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| uncertain(&file)),
+    };
+    let mut ids = Vec::new();
+    let mut paths = Vec::new();
+    for r in &resolution.routes {
+        ids.push(Some((r.dev, r.ino)));
+        paths.push(r.path.as_os_str().as_bytes().to_vec());
+    }
+    ids.push(None);
+    paths.push(spelled.as_os_str().as_bytes().to_vec());
+    let mut prospective_ids = Vec::new();
+    let mut prospective_anchors = Vec::new();
+    let mut prospective_suffixes = Vec::new();
+    for p in resolution.prospective {
+        prospective_ids.push((p.anchor.dev, p.anchor.ino));
+        prospective_anchors.push(components(&p.anchor.path));
+        prospective_suffixes.push(suffix_components(&p.suffix));
+        let mut full = p.anchor.path;
+        for c in p.suffix {
+            full.push(c);
+        }
+        ids.push(None);
+        paths.push(full.as_os_str().as_bytes().to_vec());
+    }
+    // A home may itself be missing; its walk still locates prospective authority.
+    let resolved_home = resolve(home, Walk::Authority)?;
+    let mut home = resolved_home.end.0.path;
+    for c in resolved_home.end.1 {
+        home.push(c);
+    }
+    Ok(MeasuredDir {
+        spelled,
+        home: Some(home),
+        purpose: StorePurpose::LaunchAuthority,
+        config_file_links,
+        ids,
+        paths,
+        prospective_ids,
+        prospective_anchors,
+        prospective_suffixes,
+    })
+}
+
+/// One additional host-only store (ADR-0064) measured exactly like the
+/// authority directory, so every `R1` predicate applies unchanged.
+fn measure_store(spelled: PathBuf, purpose: StorePurpose) -> Result<MeasuredDir> {
+    let resolution = resolve(&spelled, Walk::Authority)?;
+    let mut ids = Vec::new();
+    let mut paths = Vec::new();
+    for r in &resolution.routes {
+        ids.push(Some((r.dev, r.ino)));
+        paths.push(r.path.as_os_str().as_bytes().to_vec());
+    }
+    ids.push(None);
+    paths.push(spelled.as_os_str().as_bytes().to_vec());
+    let mut prospective_ids = Vec::new();
+    let mut prospective_anchors = Vec::new();
+    let mut prospective_suffixes = Vec::new();
+    for p in resolution.prospective {
+        prospective_ids.push((p.anchor.dev, p.anchor.ino));
+        prospective_anchors.push(components(&p.anchor.path));
+        prospective_suffixes.push(suffix_components(&p.suffix));
+        let mut full = p.anchor.path;
+        for c in p.suffix {
+            full.push(c);
+        }
+        ids.push(None);
+        paths.push(full.as_os_str().as_bytes().to_vec());
+    }
+    Ok(MeasuredDir {
+        spelled,
+        home: None,
+        purpose,
+        config_file_links: None,
+        ids,
+        paths,
+        prospective_ids,
+        prospective_anchors,
+        prospective_suffixes,
+    })
+}
 
 impl ProtectedConfigDir {
-    pub(crate) fn measure(homes: &[PathBuf], cwd: &Path) -> Result<Self> {
+    /// Measure the authority stores (one per `$HOME`) and the extra host-only
+    /// stores this launcher writes refusal artefacts into (ADR-0064).
+    pub(crate) fn measure(homes: &[PathBuf], stores: &[Store], cwd: &Path) -> Result<Self> {
         let mut dirs: Vec<MeasuredDir> = Vec::new();
         for home in homes {
             let home = anchored(cwd, home);
-            let spelled = home.join(config::USER_CONFIG_DIR_RELATIVE);
-            if dirs.iter().any(|d| d.spelled == spelled) {
+            let dir = measure_authority_store(&home)?;
+            if dirs.iter().any(|d| d.spelled == dir.spelled) {
                 continue;
             }
-            let resolution = resolve(&spelled, Walk::Authority)?;
-            let file = spelled.join("config.toml");
-            let config_file_links = match fs::symlink_metadata(&file) {
-                Ok(m) if m.is_file() => Some((file.clone(), m.nlink())),
-                Ok(_) => None,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                Err(e) => return Err(e).with_context(|| uncertain(&file)),
-            };
-            let mut ids = Vec::new();
-            let mut paths = Vec::new();
-            for r in &resolution.routes {
-                ids.push(Some((r.dev, r.ino)));
-                paths.push(r.path.as_os_str().as_bytes().to_vec());
+            dirs.push(dir);
+        }
+        let mut sessions: Vec<SessionsDir> = Vec::new();
+        for store in stores {
+            let dir = measure_store(anchored(cwd, &store.path), store.purpose)?;
+            if dirs.iter().any(|d| d.spelled == dir.spelled) {
+                continue;
             }
-            ids.push(None);
-            paths.push(spelled.as_os_str().as_bytes().to_vec());
-            let mut prospective_ids = Vec::new();
-            let mut prospective_anchors = Vec::new();
-            let mut prospective_suffixes = Vec::new();
-            for p in resolution.prospective {
-                prospective_ids.push((p.anchor.dev, p.anchor.ino));
-                prospective_anchors.push(components(&p.anchor.path));
-                prospective_suffixes.push(suffix_components(&p.suffix));
-                let mut full = p.anchor.path;
-                for c in p.suffix {
-                    full.push(c);
-                }
-                ids.push(None);
-                paths.push(full.as_os_str().as_bytes().to_vec());
+            match store.purpose {
+                StorePurpose::ProjectSessions => sessions.push(SessionsDir {
+                    identity: fs::symlink_metadata(&dir.spelled)
+                        .ok()
+                        .filter(|m| m.is_dir())
+                        .map(|m| (m.dev(), m.ino())),
+                    anchored: anchored_resolved(cwd, &dir.spelled),
+                }),
+                StorePurpose::LaunchAuthority | StorePurpose::RuntimeState => {}
             }
-            // A home may itself be missing; its walk still locates prospective authority.
-            let resolved_home = resolve(&home, Walk::Authority)?;
-            let mut home = resolved_home.end.0.path;
-            for c in resolved_home.end.1 {
-                home.push(c);
-            }
-            dirs.push(MeasuredDir {
-                spelled,
-                home,
-                config_file_links,
-                ids,
-                paths,
-                prospective_ids,
-                prospective_anchors,
-                prospective_suffixes,
-            });
+            dirs.push(dir);
         }
         Ok(Self {
             dirs,
+            sessions,
             cwd: cwd.to_path_buf(),
         })
     }
@@ -435,11 +607,13 @@ impl ProtectedConfigDir {
                 let canonical = fs::canonicalize(&root).with_context(|| uncertain(&root))?;
                 if let Some(d) = self.decide(Some(&root), &canonical, Some((m.dev(), m.ino()))) {
                     bail!(
-                        "agent-vm's {} \"{}\" is, or contains, \"{}\" or a directory agent-vm resolves through to reach it, where agent-vm reads launch authority; the guest could rewrite that authority for a later launch. {}",
+                        "agent-vm's {} \"{}\" is, or contains, \"{}\" or a directory agent-vm resolves through to reach it, {}; {}. {}",
                         source.bind.description(),
                         crate::one_line::path(&root),
                         crate::one_line::path(&d.spelled),
-                        remedy(source.bind, &canonical, d)
+                        d.purpose.clause(),
+                        d.purpose.consequence(),
+                        remedy(source.bind, &canonical, d.purpose, d.home.as_deref())
                     );
                 }
             }
@@ -450,11 +624,13 @@ impl ProtectedConfigDir {
                 }
                 if let Some(d) = self.decide_prospective(&anchor, &suffix) {
                     bail!(
-                        "agent-vm's {} \"{}\" does not exist yet; once created it could be, or contain, a directory in which agent-vm looks up names on the way to \"{}\", where agent-vm reads launch authority, so the guest could plant authority there for a later launch. (Names that do not exist yet are compared ignoring letter case, and a name ending in '.' or containing characters other than ASCII letters, digits, '.', '-' or '_' is assumed to match any name.) {}",
+                        "agent-vm's {} \"{}\" does not exist yet; once created it could be, or contain, a directory in which agent-vm looks up names on the way to \"{}\", {}, so the guest could plant {} there for a later launch. (Names that do not exist yet are compared ignoring letter case, and a name ending in '.' or containing characters other than ASCII letters, digits, '.', '-' or '_' is assumed to match any name.) {}",
                         source.bind.description(),
                         crate::one_line::path(&root),
                         crate::one_line::path(&d.spelled),
-                        remedy(source.bind, &root, d)
+                        d.purpose.clause(),
+                        d.purpose.planted(),
+                        remedy(source.bind, &root, d.purpose, d.home.as_deref())
                     );
                 }
             }
@@ -488,8 +664,9 @@ impl ProtectedConfigDir {
                     // `render_quoted` escapes, so these bytes are never printed raw.
                     let declared = spelling.render_quoted(declaration);
                     bail!(
-                        "{subject} {declared} would let the guest change what {} contains or resolves to, where agent-vm reads launch authority. Mount it read-only (:ro), or mount a narrower path that does not contain it.",
-                        crate::one_line::quoted_path(&d.spelled)
+                        "{subject} {declared} would let the guest change what {} contains or resolves to, {}. Mount it read-only (:ro), or mount a narrower path that does not contain it.",
+                        crate::one_line::quoted_path(&d.spelled),
+                        d.purpose.clause()
                     );
                 }
             }
@@ -498,10 +675,95 @@ impl ProtectedConfigDir {
         }
         Ok(())
     }
+
+    /// The `.sessions` directory a bind root names or lies inside, if any.
+    ///
+    /// `R2` (ADR-0064) is deliberately separate from `R1`: `exposing_entry`
+    /// decides *is or contains* for a **writable** bind only, and D3 keeps
+    /// `:ro`/`:fork` ancestors exempt. A bind *at or inside* `.sessions` can
+    /// name one `refusals.json`, `refusals.lock` or socket whatever its mode, so
+    /// it is refused in every mode. Three spellings of "inside", because the
+    /// directory may not exist yet:
+    ///
+    /// - the resolved path is `.sessions` or a separator-prefixed descendant;
+    /// - the root *is* the directory, by `(dev, ino)` even under another name;
+    /// - for a root that does not exist, the anchored lexical path is inside.
+    pub(crate) fn sessions_dir_named_by(&self, host: &Path) -> Option<&Path> {
+        let anchored_host = anchored_resolved(&self.cwd, host);
+        let host_bytes = anchored_host.as_os_str().as_bytes();
+        let identity = fs::symlink_metadata(&anchored_host)
+            .ok()
+            .filter(|m| m.is_dir())
+            .map(|m| (m.dev(), m.ino()));
+        self.sessions
+            .iter()
+            .find(|sessions| {
+                let named_by_identity = identity.is_some() && identity == sessions.identity;
+                let inside = config::byte_path_contains(
+                    sessions.anchored.as_os_str().as_bytes(),
+                    host_bytes,
+                );
+                named_by_identity || inside
+            })
+        .map(|sessions| sessions.anchored.as_path())
+    }
+
+    /// Refuse a core bind, in any mode, that names this project's `.sessions`
+    /// directory or anything in it (`R2`, ADR-0064).
+    pub(crate) fn check_core_bind_names_sessions(&self, source: &CoreHostSource) -> Result<()> {
+        let root = anchored(&self.cwd, &source.path);
+        if let Some(sessions) = self.sessions_dir_named_by(&root) {
+            bail!(
+                "agent-vm's {} \"{}\" is, or lies inside, \"{}\", where agent-vm keeps this \
+                 project's refusal records and control socket; the guest could forge or erase \
+                 them. {}",
+                source.bind.description(),
+                crate::one_line::path(&root),
+                crate::one_line::path(sessions),
+                remedy(source.bind, &root, StorePurpose::ProjectSessions, None)
+            );
+        }
+        Ok(())
+    }
+
+    /// Refuse a mount declaration, in any mode, that names this project's
+    /// `.sessions` directory or anything in it (`R2`, ADR-0064).
+    pub(crate) fn check_mount_names_sessions(
+        &self,
+        declaration: Declaration<'_>,
+        spelling: &Spelling,
+        host: &Path,
+    ) -> Result<()> {
+        let Some(sessions) = self.sessions_dir_named_by(host) else {
+            return Ok(());
+        };
+        // `render_quoted` escapes, so these bytes are never printed raw.
+        let declared = spelling.render_quoted(declaration);
+        bail!(
+            "{} {declared} is, or lies inside, \"{}\", where agent-vm keeps this project's \
+             refusal records and control socket, so the guest could forge or erase them. Mount \
+             a path that does not include it.",
+            declaration.subject(),
+            crate::one_line::quoted_path(sessions)
+        );
+    }
+
 }
-fn remedy(bind: CoreBind, root: &Path, dir: &MeasuredDir) -> &'static str {
+fn remedy(
+    bind: CoreBind,
+    root: &Path,
+    purpose: StorePurpose,
+    home: Option<&Path>,
+) -> &'static str {
+    // A store that is not the per-`$HOME` authority dir is agent-vm's own state
+    // (ADR-0064). There is no narrower project directory to offer when the
+    // state root itself sits inside the project, so the remedy is the documented
+    // move (USAGE, "Moving the state root").
+    if purpose != StorePurpose::LaunchAuthority && bind == CoreBind::ProjectDir {
+        return "Move agent-vm's state root outside the project (see \"Moving the state root\" in USAGE.md), or run agent-vm from a directory that does not contain it.";
+    }
     match bind {
-        CoreBind::ProjectDir if root == dir.home => {
+        CoreBind::ProjectDir if Some(root) == home => {
             "Run agent-vm from a project directory instead of $HOME."
         }
         CoreBind::ProjectDir => "Run agent-vm from a directory that does not contain it.",
@@ -623,7 +885,8 @@ mod tests {
         );
         let d = MeasuredDir {
             spelled: "/authority".into(),
-            home: "/home".into(),
+            home: Some("/home".into()),
+            purpose: StorePurpose::LaunchAuthority,
             config_file_links: None,
             ids: vec![],
             paths: vec![],
@@ -633,6 +896,7 @@ mod tests {
         };
         let guard = ProtectedConfigDir {
             dirs: vec![d],
+            sessions: Vec::new(),
             cwd: "/".into(),
         };
         let anchor = WriteRoute {
@@ -696,7 +960,7 @@ mod tests {
             }
         }
         fn guard(&self) -> ProtectedConfigDir {
-            ProtectedConfigDir::measure(std::slice::from_ref(&self.home), &self.cwd).unwrap()
+            ProtectedConfigDir::measure(std::slice::from_ref(&self.home), &[], &self.cwd).unwrap()
         }
         fn check(&self, path: &Path) -> Result<()> {
             self.guard()
@@ -751,21 +1015,21 @@ mod tests {
         fs::remove_file(t.home.join(".config")).unwrap();
         symlink(".config", t.home.join(".config")).unwrap();
         assert!(
-            ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &t.cwd)
+            ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &t.cwd)
                 .unwrap_err()
                 .to_string()
                 .contains("cannot determine")
         );
         fs::remove_file(t.home.join(".config")).unwrap();
         fs::write(t.home.join(".config"), "file").unwrap();
-        assert!(ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &t.cwd).is_err());
+        assert!(ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &t.cwd).is_err());
     }
     #[test]
     fn both_homes_and_messages() {
         let t = Tree::new();
         let other = t.cwd.join("other");
         fs::create_dir(&other).unwrap();
-        let guard = ProtectedConfigDir::measure(&[t.home.clone(), other.clone()], &t.cwd).unwrap();
+        let guard = ProtectedConfigDir::measure(&[t.home.clone(), other.clone()], &[], &t.cwd).unwrap();
         for home in [&t.home, &other] {
             assert!(
                 guard
@@ -809,7 +1073,7 @@ mod tests {
         let home = t.cwd.join("дом");
         fs::create_dir(&home).unwrap();
         fs::create_dir_all(home.join(".config/agent-vm")).unwrap();
-        let guard = ProtectedConfigDir::measure(std::slice::from_ref(&home), &t.cwd).unwrap();
+        let guard = ProtectedConfigDir::measure(std::slice::from_ref(&home), &[], &t.cwd).unwrap();
         for message in [
             guard
                 .check_core_bind(&CoreHostSource::new(CoreBind::StateDir, home.clone()))
@@ -934,7 +1198,7 @@ mod tests {
         let cfg = t.home.join(".config");
         fs::create_dir(&cfg).unwrap();
         fs::set_permissions(&cfg, fs::Permissions::from_mode(0o000)).unwrap();
-        let err = ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &t.cwd).unwrap_err();
+        let err = ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &t.cwd).unwrap_err();
         fs::set_permissions(&cfg, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(err.to_string().contains("cannot determine"));
 
@@ -945,7 +1209,7 @@ mod tests {
         fs::create_dir_all(&cfg).unwrap();
         fs::write(cfg.join("config.toml"), "# no network\n").unwrap();
         fs::set_permissions(&cfg, fs::Permissions::from_mode(0o000)).unwrap();
-        let err = ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &t.cwd).unwrap_err();
+        let err = ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &t.cwd).unwrap_err();
         fs::set_permissions(&cfg, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(err.to_string().contains("cannot determine"));
         assert!(err.to_string().contains("config.toml"));
@@ -1034,5 +1298,187 @@ mod tests {
             }
             assert!(may_name_same_entry(a.as_bytes(), b.as_bytes()));
         }
+    }
+
+    // -- R1/R2: the ADR-0064 stores -----------------------------------------
+
+    /// The same tree, plus the two stores a launch writes besides the authority
+    /// directory: this project's `.sessions` directory under the state root and
+    /// `MSB_HOME` beside it.
+    impl Tree {
+        fn sessions(&self) -> PathBuf {
+            self.state.join("ab12cd34ef56.sessions")
+        }
+        fn msb_home(&self) -> PathBuf {
+            self.state.join("msb-home")
+        }
+        fn guard_with(&self, stores: &[Store]) -> ProtectedConfigDir {
+            ProtectedConfigDir::measure(std::slice::from_ref(&self.home), stores, &self.cwd)
+                .unwrap()
+        }
+        fn launch_stores(&self) -> Vec<Store> {
+            vec![
+                Store::new(StorePurpose::ProjectSessions, self.sessions()),
+                Store::new(StorePurpose::RuntimeState, self.msb_home()),
+            ]
+        }
+        /// A `--mount` declaration of `path`, in whichever mode `access` names.
+        fn mount(&self, guard: &ProtectedConfigDir, path: &Path, read_only: bool) -> Result<()> {
+            if !read_only {
+                guard.check_writable_mount(
+                    Declaration::Argv,
+                    &Spelling::new("/decl"),
+                    path,
+                    path,
+                )?;
+            }
+            guard.check_mount_names_sessions(Declaration::Argv, &Spelling::new("/decl"), path)
+        }
+    }
+
+    /// R1 for the state root: a writable live bind of the directory that holds
+    /// `.sessions` would let the guest write this project's refusal log.
+    #[test]
+    fn a_writable_state_root_bind_exposes_the_sessions_dir() {
+        let t = Tree::new();
+        fs::create_dir_all(t.sessions()).unwrap();
+        let guard = t.guard_with(&t.launch_stores());
+        let message = guard
+            .check_writable_mount(Declaration::Argv, &Spelling::new("/decl"), &t.state, &t.state)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("refusal records and control sockets"), "{message}");
+        assert!(message.contains(&t.sessions().display().to_string()), "{message}");
+        assert!(message.contains(":ro"), "{message}");
+    }
+
+    /// R1 for `MSB_HOME`: every sandbox's `network.log` lives inside it.
+    #[test]
+    fn a_writable_bind_of_msb_home_is_refused() {
+        let t = Tree::new();
+        fs::create_dir_all(t.msb_home().join("sandboxes/agent-vm-x/logs")).unwrap();
+        let guard = t.guard_with(&t.launch_stores());
+        let message = guard
+            .check_writable_mount(Declaration::Argv, &Spelling::new("/decl"), &t.msb_home(), &t.msb_home())
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("sandbox runtime"), "{message}");
+        // A sibling of it is untouched: the store is the directory, not the root.
+        fs::create_dir_all(t.state.join("msb-home-next")).unwrap();
+        assert!(
+            guard
+                .check_writable_mount(
+                    Declaration::Argv,
+                    &Spelling::new("/decl"),
+                    &t.state.join("msb-home-next"),
+                    &t.state.join("msb-home-next"),
+                )
+                .is_ok()
+        );
+    }
+
+    /// The two core binds beside the store stay allowed: the state bind is
+    /// `<state>/<hash>`, a *sibling* of `<state>/<hash>.sessions`, and the guest
+    /// home is below it.
+    #[test]
+    fn the_core_state_bind_beside_it_is_allowed() {
+        let t = Tree::new();
+        fs::create_dir_all(t.sessions()).unwrap();
+        fs::create_dir_all(t.state.join("ab12cd34ef56/home")).unwrap();
+        let guard = t.guard_with(&t.launch_stores());
+        for (bind, path) in [
+            (CoreBind::StateDir, t.state.join("ab12cd34ef56")),
+            (CoreBind::GuestHome, t.state.join("ab12cd34ef56/home")),
+            (CoreBind::ProjectDir, t.cwd.clone()),
+        ] {
+            guard
+                .check_core_bind(&CoreHostSource::new(bind, path.clone()))
+                .unwrap_or_else(|e| panic!("{} refused: {e:#}", path.display()));
+            guard
+                .check_core_bind_names_sessions(&CoreHostSource::new(bind, path))
+                .unwrap();
+        }
+    }
+
+    /// A project that has never launched has no `.sessions` directory yet, so
+    /// the store has to be refused while it does not exist: `measure` records
+    /// the path its walk would reach, and a writable bind of the state root is
+    /// refused against that path rather than against a directory on disk.
+    ///
+    /// The `.sessions` store is a *sibling* of the state directory, so the
+    /// prospective spelling of a missing root cannot reach it: a core bind of
+    /// `<state>/<hash>` never names `<state>/<hash>.sessions`.
+    #[test]
+    fn a_missing_sessions_dir_is_protected_prospectively() {
+        let t = Tree::new();
+        assert!(!t.sessions().exists());
+        let guard = t.guard_with(&t.launch_stores());
+        let message = guard
+            .check_writable_mount(Declaration::Argv, &Spelling::new("/decl"), &t.state, &t.state)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains(t.sessions().to_str().unwrap()), "{message}");
+        assert!(message.contains("refusal records"), "{message}");
+        // Nor does a missing core bind reach it.
+        assert!(
+            guard
+                .check_core_bind(&CoreHostSource::new(
+                    CoreBind::StateDir,
+                    t.state.join("ab12cd34ef56"),
+                ))
+                .is_ok()
+        );
+    }
+
+    /// R2 for the files themselves: whatever a bind's mode says, a bind of
+    /// `refusals.json` or `refusals.lock` names one refusal artefact.
+    #[test]
+    fn ro_and_fork_binds_of_refusals_json_and_the_lock_are_refused() {
+        let t = Tree::new();
+        fs::create_dir_all(t.sessions()).unwrap();
+        for name in ["refusals.json", "refusals.lock", "ab12cd34.sock"] {
+            fs::write(t.sessions().join(name), "x").unwrap();
+            for read_only in [false, true] {
+                let message = t
+                    .mount(&t.guard_with(&t.launch_stores()), &t.sessions().join(name), read_only)
+                    .unwrap_err()
+                    .to_string();
+                assert!(message.contains("lies inside"), "{message}");
+                assert!(message.contains("refusal records"), "{message}");
+            }
+        }
+    }
+
+    /// A bind *inside* a `.sessions` directory that does not exist yet: the
+    /// lexical spelling is the only evidence there is.
+    #[test]
+    fn a_bind_spelled_inside_a_missing_sessions_dir_is_refused() {
+        let t = Tree::new();
+        let guard = t.guard_with(&t.launch_stores());
+        for inside in [t.sessions(), t.sessions().join("nothing-here.json")] {
+            assert!(t.mount(&guard, &inside, true).is_err(), "{}", inside.display());
+        }
+        // A directory whose *name* merely starts with the store's does not.
+        let beside = t.state.join("ab12cd34ef56.sessions-backup");
+        fs::create_dir_all(&beside).unwrap();
+        assert!(t.mount(&guard, &beside, true).is_ok());
+    }
+
+    /// D3: a `:ro`/`:fork` bind of a strict ancestor stays exempt from R1, so it
+    /// must stay exempt from R2 too — the state root itself contains `.sessions`
+    /// and is not *inside* it.
+    #[test]
+    fn a_ro_bind_of_an_ancestor_is_allowed() {
+        let t = Tree::new();
+        fs::create_dir_all(t.sessions()).unwrap();
+        let guard = t.guard_with(&t.launch_stores());
+        for ancestor in [t.state.clone(), t.cwd.clone(), t.home.clone()] {
+            assert!(t.mount(&guard, &ancestor, true).is_ok(), "{}", ancestor.display());
+        }
+        // The writable spelling of the same ancestor is still R1's refusal...
+        assert!(t.mount(&guard, &t.state, false).is_err());
+        // ...and readability of the strict ancestor D3 is about is unchanged.
+        fs::create_dir_all(t.home.join(".config/agent-vm")).unwrap();
+        assert!(t.mount(&t.guard_with(&t.launch_stores()), &t.home, true).is_ok());
     }
 }

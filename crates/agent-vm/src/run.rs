@@ -975,6 +975,7 @@ pub(crate) async fn launch(
         // The same link list both provisioning sites consume, so the pre-fork
         // collision check cannot drift from the links that are actually created.
         crate::guest_home::PersistedHome::new(guest_home_path, &home_links),
+        launch_stores(&session)?,
     )?;
     // Selection is pure: it decides which declaration sources this launch asks
     // for (verified user `mounts` unless `--no-config-mounts`, then argv) and
@@ -3703,6 +3704,7 @@ fn launch_mount_context(
     core_guest_mounts: Vec<PathBuf>,
     core_host_sources: Vec<CoreHostSource>,
     persisted_home: crate::guest_home::PersistedHome,
+    stores: Vec<crate::protected_config_dir::Store>,
 ) -> Result<mount::MountContext> {
     let authority_home = config::host_home_dir().context("locating the authority home")?;
     Ok(mount::MountContext {
@@ -3713,7 +3715,20 @@ fn launch_mount_context(
         core_guest_mounts,
         core_host_sources,
         persisted_home,
+        stores,
     })
+}
+
+/// The host-only stores this launch writes besides the authority directory:
+/// this project's `.sessions` directory and the runtime's own `MSB_HOME`
+/// (ADR-0064). Both are measured *before* they exist, so a state root inside
+/// the project or under a writable `--mount` is refused rather than adopted.
+fn launch_stores(session: &ProjectSession) -> Result<Vec<crate::protected_config_dir::Store>> {
+    use crate::protected_config_dir::{Store, StorePurpose};
+    Ok(vec![
+        Store::new(StorePurpose::ProjectSessions, session.sessions_dir()),
+        Store::new(StorePurpose::RuntimeState, crate::msb_install::msb_home_dir()?),
+    ])
 }
 
 /// The production streaming lifecycle, opened for the subprocess cases in
@@ -3847,6 +3862,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             crate::guest_home::PersistedHome::none(),
+            Vec::new(),
         )
         .unwrap();
         let selected = context.authority_home.as_ref().expect("raw authority HOME");
@@ -6127,6 +6143,7 @@ options ndots:2 timeout:1";
             core_guest_mounts: Vec::new(),
             core_host_sources: Vec::new(),
             persisted_home: crate::guest_home::PersistedHome::none(),
+            stores: Vec::new(),
         };
         let guest = PathBuf::from("/home/guest/.pi");
 
@@ -6210,6 +6227,7 @@ options ndots:2 timeout:1";
                     core_guest_mounts: Vec::new(),
                     core_host_sources: Vec::new(),
                     persisted_home: crate::guest_home::PersistedHome::none(),
+                    stores: Vec::new(),
                 },
             )
             .unwrap();
@@ -6256,6 +6274,7 @@ options ndots:2 timeout:1";
             core_guest_mounts: Vec::new(),
             core_host_sources: Vec::new(),
             persisted_home: crate::guest_home::PersistedHome::none(),
+            stores: Vec::new(),
         };
         let first = mount::prepare(
             mount::parse_extra_mounts(std::slice::from_ref(&raw)).unwrap(),
@@ -6305,6 +6324,7 @@ options ndots:2 timeout:1";
                 core_guest_mounts: Vec::new(),
                 core_host_sources: Vec::new(),
                 persisted_home: crate::guest_home::PersistedHome::none(),
+                stores: Vec::new(),
             },
         )
         .unwrap();
