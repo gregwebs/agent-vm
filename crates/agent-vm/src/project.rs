@@ -72,15 +72,7 @@ impl ProjectDir {
 
     /// The full lowercase hex SHA-256 of the canonical path's bytes (64 chars).
     pub(crate) fn digest_hex(&self) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(self.0.as_os_str().as_encoded_bytes());
-        let digest = hasher.finalize();
-        let mut hex = String::with_capacity(64);
-        for byte in digest {
-            use std::fmt::Write;
-            write!(&mut hex, "{byte:02x}").expect("writing to a String cannot fail");
-        }
-        hex
+        digest_hex_of(&self.0)
     }
 
     /// Canonicalizes `path`; the unit tests' seam for alias/subdirectory rows.
@@ -88,6 +80,21 @@ impl ProjectDir {
     pub(crate) fn from_path_for_tests(path: &Path) -> Result<Self> {
         canonical(path.to_owned())
     }
+}
+
+/// [`ProjectDir::digest_hex`] for a path that is not a capture: a store record's
+/// `path` column must hash to its `project` column, and that check has only the
+/// stored bytes (ADR-0065 D2).
+pub(crate) fn digest_hex_of(path: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(path.as_os_str().as_encoded_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write;
+        write!(&mut hex, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    hex
 }
 
 fn canonical(path: PathBuf) -> Result<ProjectDir> {
@@ -186,6 +193,21 @@ mod tests {
         assert_eq!(direct.digest_hex(), alias.digest_hex());
         assert_eq!(direct.path(), alias.path());
         assert_ne!(direct.digest_hex(), sub.digest_hex());
+    }
+
+    /// The free-function form hashes the same bytes the capture does, which is
+    /// what lets a store record's `path` column be checked against its `project`
+    /// column without a capture (ADR-0065 D2).
+    #[test]
+    fn digest_of_a_path_equals_the_captures_digest() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("app");
+        std::fs::create_dir(&dir).unwrap();
+        let project = ProjectDir::from_path_for_tests(&dir).unwrap();
+        assert_eq!(digest_hex_of(project.path()), project.digest_hex());
+        // And it is a hash of exactly the bytes it was handed, not a canonical
+        // spelling: an unavailable path still has a digest.
+        assert_eq!(digest_hex_of(Path::new("/no/such/place")).len(), 64);
     }
 
     /// The rename race is refused, deterministically: `resolve` is the seam

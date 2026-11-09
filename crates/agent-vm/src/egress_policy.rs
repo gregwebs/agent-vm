@@ -164,7 +164,7 @@ impl EgressAllowance {
             port: trusted_port(layout.port)?,
         })
     }
-    fn rule(&self) -> microsandbox_network::policy::Rule {
+    pub(crate) fn rule(&self) -> microsandbox_network::policy::Rule {
         use microsandbox_network::policy::{Action, Destination, Direction, PortRange, Rule};
         Rule {
             direction: Direction::Egress,

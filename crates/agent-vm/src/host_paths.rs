@@ -228,13 +228,51 @@ pub(crate) fn read_bounded_regular_file_no_follow(
     path: &Path,
     max: u64,
 ) -> Result<(Vec<u8>, HostFileFacts)> {
-    match open_no_follow(path)? {
-        NoFollowOpen::File(fd) => read_regular_no_follow_fd(fd, path, max),
-        NoFollowOpen::Symlink => Err(anyhow!(
-            "{} is a symbolic link; refusing to follow it",
-            path_in_line(path)
-        )),
+    match read_bounded_regular_file_no_follow_checkpointed(path, max, || {})? {
+        NoFollowRead::File(bytes, facts) => Ok((bytes, facts)),
+        NoFollowRead::Symlink => Err(symlink_refusal(path)),
     }
+}
+
+/// How [`read_bounded_regular_file_no_follow_checkpointed`] ended.
+///
+/// A final symlink is a distinct outcome rather than an error, because a caller
+/// that decides *why* it will not use the file (ADR-0065's project allowance
+/// record calls a symlink untrusted, never damaged) cannot recover that from an
+/// `anyhow` chain.
+pub(crate) enum NoFollowRead {
+    File(Vec<u8>, HostFileFacts),
+    Symlink,
+}
+
+/// [`read_bounded_regular_file_no_follow`] with a checkpoint between `open` and
+/// the descriptor's own `fstat`.
+///
+/// The seam exists for one reader-side race: a rename over the path after
+/// `open` leaves a valid descriptor whose `nlink` is 0, which is a healthy
+/// replacement and not distrust (ADR-0065 AC7). A test needs the replacement to
+/// happen at exactly that moment; production passes a no-op, so there is still
+/// one read path.
+pub(crate) fn read_bounded_regular_file_no_follow_checkpointed(
+    path: &Path,
+    max: u64,
+    after_open: impl FnOnce(),
+) -> Result<NoFollowRead> {
+    match open_no_follow(path)? {
+        NoFollowOpen::File(fd) => {
+            after_open();
+            read_regular_no_follow_fd(fd, path, max)
+                .map(|(bytes, facts)| NoFollowRead::File(bytes, facts))
+        }
+        NoFollowOpen::Symlink => Ok(NoFollowRead::Symlink),
+    }
+}
+
+fn symlink_refusal(path: &Path) -> anyhow::Error {
+    anyhow!(
+        "{} is a symbolic link; refusing to follow it",
+        path_in_line(path)
+    )
 }
 
 enum NoFollowOpen {
