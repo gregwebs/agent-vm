@@ -353,6 +353,12 @@ impl Drop for LiveSession {
         }
         if let Some(running) = lock(&self.running).take() {
             let _ = running.stop.send(true);
+            // The accept loop exits when it observes the stop, but nothing here
+            // can await it: unlink now, so a launch that errors early leaves no
+            // socket behind for the next `access` to dial. Unlinking a bound
+            // socket is safe — the listener keeps working, and a *new* dial gets
+            // ENOENT, which is what a session that is gone should answer.
+            let _ = std::fs::remove_file(&running.socket);
         }
     }
 }

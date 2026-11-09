@@ -456,6 +456,31 @@ async fn discovery_sees_a_live_session_and_the_log_beside_it() {
     live.finish().await;
 }
 
+/// A launch that errors before `create` never reaches a teardown, so `Drop` is
+/// the only chance to leave no socket behind.
+#[tokio::test]
+async fn dropping_a_session_unlinks_its_socket() {
+    let root = tempfile::tempdir().unwrap();
+    let project = ProjectSession {
+        project_dir: root.path().to_path_buf(),
+        project_hash: "ab12cd34ef56".to_owned(),
+        state_dir: root.path().join("ab12cd34ef56"),
+        sandbox_name: "agent-vm-ab12cd34ef56-1".to_owned(),
+    };
+    let socket = {
+        let live = LiveSession::start(&project).await;
+        let socket = project
+            .sessions_dir()
+            .join(format!("{}.sock", live.id().as_str()));
+        assert!(socket.exists());
+        socket
+    };
+    assert!(
+        !socket.exists(),
+        "dropping the session unlinks its own socket"
+    );
+}
+
 #[test]
 fn the_poll_interval_is_the_ingestion_bound() {
     // AC3: a record is listed once the SDK yields it — a watch event, or at most
