@@ -1024,8 +1024,16 @@ class OwnedLaunch:
                     self.errors.append(message)
             self.stop_observing.wait(0.05)
 
+    def sessions_dir(self) -> Path:
+        return self.work / "state" / f"{self.project_hash}.sessions"
+
     def _refusal_feed_while_running(self):
-        """Ask the host what the *live* session refused (ADR-0064 RF1)."""
+        """Ask the host what the *live* session refused (ADR-0064 RF1).
+
+        The session ID is the one socket this launch reserved: `--session` then
+        names exactly the session under test, not the other cases' sessions the
+        shared log has accumulated.
+        """
         deadline = time.monotonic() + 120
         while time.monotonic() < deadline and not self.stop_observing.is_set():
             text = self.log.read_text(errors="replace") if self.log.exists() else ""
@@ -1035,12 +1043,48 @@ class OwnedLaunch:
         else:
             self.errors.append("RF1 READY never appeared")
             return
-        try:
-            status, output = refusal_feed_query(self.work, self.command)
-        except (OSError, subprocess.SubprocessError) as error:
-            self.errors.append(f"live access failed: {error}")
+        socket_ids = sorted(path.stem for path in self.sessions_dir().glob("*.sock"))
+        if len(socket_ids) != 1:
+            self.errors.append(f"expected one live session socket, saw {socket_ids}")
             return
+        (self.work / "RF1-session.txt").write_text(socket_ids[0])
+        # AC3 allows the record to trail the refusal by up to 2 s of ingestion
+        # plus 2 s of persistence, so the host asks until it answers; the case is
+        # about *whether* a live session shows its refusals, not about the first
+        # instant it could.
+        status, output, waited = 1, "", 0.0
+        while waited < 20:
+            try:
+                status, output = refusal_feed_query(self.work, self.command, socket_ids[0])
+            except (OSError, subprocess.SubprocessError) as error:
+                self.errors.append(f"live access failed: {error}")
+                return
+            if refusal_feed_rows(output):
+                break
+            time.sleep(0.5)
+            waited += 0.5
         (self.work / "RF1-live.txt").write_text(f"status={status}\n{output}")
+        if self.command.variant != "kill9":
+            return
+        # The unclean end: kill the launcher while the guest is mid-sleep, so
+        # nothing writes `ended` and only the log speaks for the session. The log
+        # is waited for too, or the case would prove that a killed launcher loses
+        # whatever it had not written — which is a different, weaker claim.
+        log_path = self.sessions_dir() / "refusals.json"
+        while time.monotonic() < deadline:
+            try:
+                record = json.loads(log_path.read_text())
+            except (OSError, ValueError):
+                record = {"sessions": []}
+            persisted = next((row for row in record.get("sessions", [])
+                              if row.get("info", {}).get("id") == socket_ids[0]), None)
+            if persisted and persisted.get("entries"):
+                break
+            time.sleep(0.25)
+        while self.launcher is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if self.launcher is not None:
+            signal_identity(self.launcher, signal.SIGKILL)
 
     def run(self):
         monitor = threading.Thread(target=self._monitor)
@@ -1383,7 +1427,8 @@ RF1_HINT = ("==> The sandbox refused a guest network request; run `agent-vm acce
             "to see refusals (shown once per session)")
 
 
-def refusal_feed_query(work: Path, command: Command, timeout: float = 30) -> tuple[int, str]:
+def refusal_feed_query(work: Path, command: Command, session: str = "",
+                       timeout: float = 30) -> tuple[int, str]:
     """`agent-vm access --all` in the launch's own project and environment.
 
     The command reads the project's refusal log and dials its control sockets, so
@@ -1391,7 +1436,7 @@ def refusal_feed_query(work: Path, command: Command, timeout: float = 30) -> tup
     the whole point of the case: a *separate* process, exactly as a user would
     run it.
     """
-    argv = (command.argv[0], "access", "--all")
+    argv = (command.argv[0], "access", "--all", *(("--session", session) if session else ()))
     done = subprocess.run(argv, env=command.env, cwd=command.cwd, stdin=subprocess.DEVNULL,
                           capture_output=True, text=True, timeout=timeout)
     return done.returncode, done.stdout + done.stderr
@@ -1413,37 +1458,43 @@ def refusal_feed_rows(text: str) -> dict[str, dict[str, str]]:
     return rows
 
 
-def check_refusal_feed(work: Path, command: Command, status: int, text: str,
+def check_refusal_feed(work: Path, command: Command, session: str, status: int, text: str,
                        live_status: int, live_text: str, after_status: int,
                        after_text: str) -> list[str]:
-    """ADR-0064 RF1: one live row group, the same IDs afterwards, one hint."""
+    """ADR-0064 RF1, for the one session this launch reserved.
+
+    The project's log also holds every earlier case's session, so the verdict is
+    scoped by `--session`: a row from another case says nothing about this one.
+    """
     failures: list[str] = []
     lines = text.splitlines()
-    if sum(1 for line in lines if line == RF1_HINT) != 1:
-        failures.append(f"the hint must appear exactly once: "
-                        f"{sum(1 for line in lines if line == RF1_HINT)}")
-    live_rows = refusal_feed_rows(live_text)
-    after_rows = refusal_feed_rows(after_text)
-    if len(live_rows) < 2:
-        failures.append(f"two live rows expected, saw {sorted(live_rows)}: {live_text!r}")
-    for row in live_rows.values():
-        if " running" not in row["line"] and not row["line"].count("running"):
-            failures.append(f"live row is not running: {row['line']!r}")
+    hints = sum(1 for line in lines if line == RF1_HINT)
+    if hints != 1:
+        failures.append(f"the hint must appear exactly once, saw {hints}")
     if live_status != 0 or after_status != 0:
         failures.append(f"access exited {live_status}/{after_status}")
-    for ident in live_rows:
-        if ident not in after_rows:
-            failures.append(f"ID {ident} is not in the log after the session ended")
-        elif command.variant == "kill9":
-            if "ended (unclean)" not in after_rows[ident]["line"]:
-                failures.append(f"killed session must read ended (unclean): "
-                                f"{after_rows[ident]['line']!r}")
-        elif not re.search(r"ended(?! \()", after_rows[ident]["line"]):
-            failures.append(f"row is not ended: {after_rows[ident]['line']!r}")
-    if "No refusals" in after_text:
-        failures.append("the log is empty after the session ended")
-    if status not in (0, 137, -9) :
-        failures.append(f"launch status {status}")
+    live_rows = refusal_feed_rows(live_text)
+    after_rows = refusal_feed_rows(after_text)
+    # The two destinations the guest tried, by the evidence the row carries.
+    wanted = {"203.0.113.10:443": "nothing", "blocked.example": "nothing"}
+    for needle in wanted:
+        if not any(needle in row["line"] for row in live_rows.values()):
+            failures.append(f"live table has no row for {needle}: {live_text!r}")
+        if not any(needle in row["line"] for row in after_rows.values()):
+            failures.append(f"log has no row for {needle} after the session: {after_text!r}")
+    for row in live_rows.values():
+        if command.variant != "kill9" and not re.search(r"\brunning\b", row["line"]):
+            failures.append(f"live row is not running: {row['line']!r}")
+    label = "ended (unclean)" if command.variant == "kill9" else "ended"
+    for row in after_rows.values():
+        if label not in row["line"]:
+            failures.append(f"row must read {label}: {row['line']!r}")
+    if len(live_rows) != len(after_rows):
+        failures.append(f"the same rows must survive the session: "
+                        f"{len(live_rows)} live, {len(after_rows)} logged")
+    expected_status = -signal.SIGKILL if command.variant == "kill9" else 0
+    if status != expected_status:
+        failures.append(f"launch status {status}, expected {expected_status}")
     return failures
 
 
@@ -1702,7 +1753,13 @@ def health_command(work: Path) -> Command:
 
 
 def selected_cases(smoke=False):
-    return tuple(case for case in CASES if not smoke or (case.case in ("P0", "LC1", "HC1", "I1", "D1", "L1", "NR1", "NR2", "NR3", "RF1") and not case.optional))
+    # `AGENT_VM_EGRESS_CASES=RF1` narrows a tier to named cases, so one case can
+    # be re-run after a fix without paying for the whole sweep.
+    only = {name for name in os.environ.get("AGENT_VM_EGRESS_CASES", "").split(",") if name}
+    chosen = tuple(case for case in CASES
+                   if not smoke or (case.case in ("P0", "LC1", "HC1", "I1", "D1", "L1", "NR1",
+                                                  "NR2", "NR3", "RF1") and not case.optional))
+    return tuple(case for case in chosen if not only or case.case in only)
 
 
 def fixture_command(work: Path) -> Command:
@@ -1957,8 +2014,11 @@ def orchestrate(args) -> int:
                     recorded = (work / "RF1-live.txt").read_text(errors="replace")
                     first, _, rest = recorded.partition("\n")
                     live_status, live_output = int(first.split("=", 1)[1]), rest
-                after_status, after_output = refusal_feed_query(work, command)
-                failures.extend(check_refusal_feed(work, command, status, owned_text,
+                session = ""
+                if (work / "RF1-session.txt").exists():
+                    session = (work / "RF1-session.txt").read_text().strip()
+                after_status, after_output = refusal_feed_query(work, command, session)
+                failures.extend(check_refusal_feed(work, command, session, status, owned_text,
                                                    live_status, live_output,
                                                    after_status, after_output))
                 if owned.errors:
@@ -1980,7 +2040,8 @@ def orchestrate(args) -> int:
             text = owned.log.read_text(errors="replace") if owned.log.exists() else ""
             rows = attempts_for(case, ident, text)
             failures.extend(check_attempt_inventory(command, rows))
-            expected = 124 if case.case == "CL1" else 7 if case.case == "HK2" else 0
+            expected = (124 if case.case == "CL1" else 7 if case.case == "HK2"
+                        else -signal.SIGKILL if case.case == "RF1" and case.variant == "kill9" else 0)
             if case.case in ("NR1", "NR2", "NR3"):
                 failures.extend(check_default_request_diagnostics(case, status, text))
             elif case.guest:
@@ -1988,7 +2049,10 @@ def orchestrate(args) -> int:
                     failures.append(f"primary expected {expected}, actual {status}")
                 if case.case != "HK2" and f"CASE {case.case} BEGIN" not in text.splitlines():
                     failures.append("guest BEGIN missing")
-                if case.case not in ("CL1", "HK2") and f"CASE {case.case} END" not in text.splitlines():
+                # A killed guest never prints its END marker (RF1's kill9 variant).
+                if (case.case not in ("CL1", "HK2")
+                        and not (case.case == "RF1" and case.variant == "kill9")
+                        and f"CASE {case.case} END" not in text.splitlines()):
                     failures.append("guest END missing")
                 if case.case == "HK2" and not strict_hook_rejected(text):
                     failures.append("strict hook did not reject before tool execution")
@@ -1996,7 +2060,7 @@ def orchestrate(args) -> int:
                     failures.append("recovered hook denial marker missing")
                 if case.case == "D1" and ("Egress policy: all guest egress denied" not in text or "DNS: queries denied" not in text):
                     failures.append("default-deny notice missing")
-                if case.case not in ("P0", "CL1") and not rows:
+                if case.case not in ("P0", "CL1", "RF1") and not rows:
                     failures.append("no attempts observed")
                 failures.extend(check_attempts(work, case, text, rows, receipt_offset))
             else:

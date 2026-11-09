@@ -745,17 +745,15 @@ pub(crate) async fn discover(dir: &SessionsDir, _now_ms: i64) -> Discovery {
 
     let mut live = Vec::new();
     let mut unresponsive = Vec::new();
-    let mut gone: Vec<String> = Vec::new();
     for (path, id, result) in answers {
         match result {
             Ok(session) => live.push(session),
             Err(error) => {
-                // A refused connection is a stale socket: unlink it and fall back
-                // to the log. A timeout is a session that is alive but busy; it is
-                // reported, not removed.
+                // A refused connection is a stale socket: unlink it, and let the
+                // log speak for that session. A timeout is a session that is alive
+                // but busy; it is reported, not removed.
                 if is_refused(&error) {
                     let _ = std::fs::remove_file(&path);
-                    gone.push(id.as_str().to_owned());
                 } else {
                     unresponsive.push(id);
                 }
@@ -763,15 +761,11 @@ pub(crate) async fn discover(dir: &SessionsDir, _now_ms: i64) -> Discovery {
         }
     }
 
+    // Every logged session is kept, including one whose socket was just stale:
+    // that is exactly the `ended (unclean)` case, and dropping it here would hide
+    // the record that says the session ran at all.
     let logged = match dir.read() {
-        Ok(log) => log
-            .sessions
-            .into_iter()
-            .filter(|session| {
-                let id = session.info.id.as_str();
-                !gone.iter().any(|gone| gone == id)
-            })
-            .collect(),
+        Ok(log) => log.sessions,
         Err(error) => {
             warnings.push(format!("could not read the refusal log: {error:#}"));
             Vec::new()
