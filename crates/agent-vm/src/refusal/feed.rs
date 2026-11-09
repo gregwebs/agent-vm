@@ -17,7 +17,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
-use futures::StreamExt as _;
 use futures::future::BoxFuture;
 use microsandbox::MicrosandboxError;
 use microsandbox::logs::{
@@ -30,12 +29,21 @@ use super::log::SessionsDir;
 
 /// How often the follower wakes to notice "nothing happened" — the tick that
 /// posts a dirty snapshot and refreshes the heartbeat. The runtime's own
-/// fallback poll is 2 s (`logs/stream.rs`), so a shorter interval would only
-/// spin.
+/// fallback poll is 2 s (`logs/stream.rs`), so this is the ingestion bound AC3
+/// names; the persistence tick is shorter ([`POST_TICK`]) because the write
+/// deadline is measured from ingestion, not from the last tick.
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// The longest the log may trail ingestion by while writes succeed (AC3).
 pub(crate) const POST_INTERVAL: Duration = Duration::from_secs(2);
+
+/// The persistence tick: the follower posts a dirty snapshot on the first tick
+/// after ingestion, so the tick *is* the rate limit and the log trails ingestion
+/// by at most this plus the write. A quarter of [`POST_INTERVAL`] leaves the
+/// AC3 bound real headroom for the write itself — a tick of the full interval
+/// would make the bound exactly the interval, so any scheduling latency at all
+/// would break it.
+const POST_TICK: Duration = Duration::from_millis(500);
 
 /// How often a session with no control socket writes a heartbeat. Three of
 /// these fit inside [`super::log::HEARTBEAT_STALE_MS`], so one missed write does
@@ -169,19 +177,51 @@ impl LiveRefusals {
 ///
 /// A once-flag rather than a rate limit: the ticket asks for one line per
 /// session, at the first refusal, and a refusal storm must not turn into a
-/// notice storm.
-#[derive(Default)]
+/// notice storm. The flag is per *session*, which is why the follower and the
+/// teardown drain share one `Hint` (owned by `LiveSession`): a second `Hint`
+/// would let a refusal first read at teardown print a second line.
 pub(crate) struct Hint {
     fired: AtomicBool,
+    /// Where the line goes. Production is stderr; a test captures it, so the
+    /// once-ness can be counted rather than inferred from a flag.
+    sink: HintSink,
+}
+
+enum HintSink {
+    Stderr,
+    #[cfg(test)]
+    Capture(Arc<Mutex<Vec<String>>>),
 }
 
 /// The hint's text. No guest text, because a name the guest chose must never be
 /// able to forge a launcher line.
 pub(crate) const HINT: &str = "==> The sandbox refused a guest network request; run `agent-vm access` to see refusals (shown once per session)";
 
+impl Default for Hint {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Hint {
     pub(crate) fn new() -> Self {
-        Self::default()
+        Self {
+            fired: AtomicBool::new(false),
+            sink: HintSink::Stderr,
+        }
+    }
+
+    /// A hint that records what it would have printed.
+    #[cfg(test)]
+    pub(crate) fn capture() -> (Self, Arc<Mutex<Vec<String>>>) {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                fired: AtomicBool::new(false),
+                sink: HintSink::Capture(Arc::clone(&lines)),
+            },
+            lines,
+        )
     }
 
     /// Deliver the hint at most once. Detached, so a stalled stderr delays no
@@ -190,13 +230,23 @@ impl Hint {
         if self.fired.swap(true, Ordering::SeqCst) {
             return;
         }
-        let line = if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
-            // Framed so a line the guest is mid-way through cannot swallow it.
-            format!("\r{HINT}\r")
-        } else {
-            HINT.to_owned()
-        };
-        drop(crate::launch_notice::LaunchNotices::to_stderr().emit_detached(line));
+        match &self.sink {
+            HintSink::Stderr => {
+                let line = if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+                    // Framed so a line the guest is mid-way through cannot
+                    // swallow it.
+                    format!("\r{HINT}\r")
+                } else {
+                    HINT.to_owned()
+                };
+                drop(crate::launch_notice::LaunchNotices::to_stderr().emit_detached(line));
+            }
+            #[cfg(test)]
+            HintSink::Capture(lines) => lines
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(HINT.to_owned()),
+        }
     }
 
     #[cfg(test)]
@@ -222,6 +272,13 @@ pub(crate) fn options(start: &LogStreamStart) -> LogStreamOptions {
 /// Returns the last cursor it read, so the caller can drain the rest of the file
 /// after the producer has stopped (§6.4's `finish`) instead of losing whatever
 /// was written after the last poll.
+///
+/// Every wait — the `open`, the pause between attempts, and the stream itself —
+/// runs under the one ticker and the one stop check. That is what makes AC3's
+/// persistence deadline a property of the follower rather than of a healthy
+/// stream: a session whose stream will not open is exactly when a dirty record
+/// would otherwise wait, and a session told to stop is exactly when it must not
+/// keep sleeping through the pause.
 pub(crate) async fn follow(
     open: Opener,
     live: Arc<LiveRefusals>,
@@ -234,15 +291,29 @@ pub(crate) async fn follow(
     let mut dirty = false;
     let mut start = LogStreamStart::Beginning;
     let mut failures = 0u32;
-    let mut ticker = tokio::time::interval(POLL_INTERVAL);
+    let mut ticker = tokio::time::interval(POST_TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut last_post = tokio::time::Instant::now();
+    let mut beat = Beat {
+        persist: persist.clone(),
+        last_post: tokio::time::Instant::now(),
+    };
 
-    loop {
-        if *stop.borrow() {
-            return cursor;
-        }
-        let stream = match open(options(&start)).await {
+    let cursor = 'follow: loop {
+        let opened = match wait(
+            open(options(&start)),
+            &mut stop,
+            &mut ticker,
+            &mut beat,
+            &live,
+            has_socket,
+            &mut dirty,
+        )
+        .await
+        {
+            Some(opened) => opened,
+            None => break 'follow cursor,
+        };
+        let mut stream = match opened {
             Ok(stream) => stream,
             Err(error) => {
                 if !resume_after(
@@ -253,65 +324,165 @@ pub(crate) async fn follow(
                     &live,
                     &mut dirty,
                 ) {
-                    return cursor;
+                    break 'follow cursor;
                 }
-                tokio::time::sleep(REOPEN_PAUSE).await;
+                if wait(
+                    tokio::time::sleep(REOPEN_PAUSE),
+                    &mut stop,
+                    &mut ticker,
+                    &mut beat,
+                    &live,
+                    has_socket,
+                    &mut dirty,
+                )
+                .await
+                .is_none()
+                {
+                    break 'follow cursor;
+                }
                 continue;
             }
         };
-        let mut stream = stream;
-        failures = 0;
         loop {
-            tokio::select! {
-                biased;
-                changed = stop.changed() => {
-                    // A sender that dropped is a stop too: nothing else sets it.
-                    if changed.is_err() || *stop.borrow() {
-                        return cursor;
-                    }
+            // No reset here: the failure count is reset by a *read*
+            // (`Some(Ok(_))` below), not by an open. A stream that opens and
+            // then errors immediately is the case the cap exists for, so an
+            // open on its own must not excuse it.
+            let next = wait(
+                futures::StreamExt::next(&mut stream),
+                &mut stop,
+                &mut ticker,
+                &mut beat,
+                &live,
+                has_socket,
+                &mut dirty,
+            )
+            .await;
+            match next {
+                None => break 'follow cursor,
+                Some(Some(Ok(entry))) => {
+                    failures = 0;
+                    accept(entry, &live, &hint, &mut dirty, &mut cursor);
                 }
-                _ = ticker.tick() => {
-                    let now_ms = now_ms();
-                    live.beat(now_ms);
-                    let due = dirty && last_post.elapsed() >= POST_INTERVAL;
-                    let heartbeat = !has_socket && last_post.elapsed() >= HEARTBEAT_INTERVAL;
-                    if due || heartbeat {
-                        persist.post(live.snapshot());
-                        last_post = tokio::time::Instant::now();
-                        dirty = false;
+                Some(Some(Err(error))) => {
+                    if !resume_after(
+                        &error,
+                        &mut start,
+                        &mut failures,
+                        &mut cursor,
+                        &live,
+                        &mut dirty,
+                    ) {
+                        break 'follow cursor;
                     }
+                    if wait(
+                        tokio::time::sleep(REOPEN_PAUSE),
+                        &mut stop,
+                        &mut ticker,
+                        &mut beat,
+                        &live,
+                        has_socket,
+                        &mut dirty,
+                    )
+                    .await
+                    .is_none()
+                    {
+                        break 'follow cursor;
+                    }
+                    break;
                 }
-                item = stream.next() => {
-                    match item {
-                        Some(Ok(entry)) => {
-                            failures = 0;
-                            accept(entry, &live, &hint, &mut dirty, &mut cursor);
-                        }
-                        Some(Err(error)) => {
-                            if !resume_after(&error, &mut start, &mut failures, &mut cursor, &live, &mut dirty) {
-                                return cursor;
-                            }
-                            tokio::time::sleep(REOPEN_PAUSE).await;
-                            break;
-                        }
-                        // The stream ended by itself. That is not "no more
-                        // refusals forever", so the follower tries the same
-                        // resume as an error would, bounded.
-                        None => {
-                            failures += 1;
-                            if failures > REOPEN_TRIES {
-                                return cursor;
-                            }
-                            start = match &cursor {
-                                Some(cursor) => LogStreamStart::From(cursor.clone()),
-                                None => LogStreamStart::Beginning,
-                            };
-                            tokio::time::sleep(REOPEN_PAUSE).await;
-                            break;
-                        }
+                // The stream ended by itself. That is not "no more refusals
+                // forever", so the follower tries the same resume as an error
+                // would, bounded.
+                Some(None) => {
+                    failures += 1;
+                    if failures > REOPEN_TRIES {
+                        break 'follow cursor;
                     }
+                    start = match &cursor {
+                        Some(cursor) => LogStreamStart::From(cursor.clone()),
+                        None => LogStreamStart::Beginning,
+                    };
+                    if wait(
+                        tokio::time::sleep(REOPEN_PAUSE),
+                        &mut stop,
+                        &mut ticker,
+                        &mut beat,
+                        &live,
+                        has_socket,
+                        &mut dirty,
+                    )
+                    .await
+                    .is_none()
+                    {
+                        break 'follow cursor;
+                    }
+                    break;
                 }
             }
+        }
+    };
+    // Leaving with a dirty record would wait for the next tick of a task that is
+    // gone, so the last change is offered here even though nothing may be left to
+    // write it (a teardown's `post_final` follows, and the persister keeps the
+    // newer job).
+    flush(&persist, &live, &mut dirty);
+    cursor
+}
+
+/// The tick's work, kept in one value so a wait can drive it without owning the
+/// follower's whole state.
+struct Beat {
+    persist: PersistHandle,
+    /// When a snapshot was last offered, for the socketless heartbeat only: a
+    /// dirty record is offered on the next tick regardless.
+    last_post: tokio::time::Instant,
+}
+
+/// Offer a dirty snapshot. The tick is the rate limit, so there is no second
+/// one here: a dirty record is posted on the first tick after ingestion.
+fn flush(persist: &PersistHandle, live: &LiveRefusals, dirty: &mut bool) {
+    if *dirty {
+        persist.post(live.snapshot());
+        *dirty = false;
+    }
+}
+
+/// Await `future` while keeping the ticker and the stop check alive.
+///
+/// `None` means the stop was set (or its sender dropped): the caller stops
+/// following. Every wait in [`follow`] goes through here, so a stop interrupts a
+/// pause, an `open` and a stalled stream alike, and the persistence tick runs in
+/// all of them.
+async fn wait<F: std::future::Future>(
+    future: F,
+    stop: &mut watch::Receiver<bool>,
+    ticker: &mut tokio::time::Interval,
+    beat: &mut Beat,
+    live: &LiveRefusals,
+    has_socket: bool,
+    dirty: &mut bool,
+) -> Option<F::Output> {
+    let mut future = std::pin::pin!(future);
+    loop {
+        tokio::select! {
+            biased;
+            changed = stop.changed() => {
+                // A sender that dropped is a stop too: nothing else sets it.
+                if changed.is_err() || *stop.borrow() {
+                    return None;
+                }
+            }
+            _ = ticker.tick() => {
+                live.beat(now_ms());
+                let heartbeat = !has_socket && beat.last_post.elapsed() >= HEARTBEAT_INTERVAL;
+                if *dirty || heartbeat {
+                    beat.persist.post(live.snapshot());
+                    beat.last_post = tokio::time::Instant::now();
+                    *dirty = false;
+                }
+            }
+            output = &mut future => return Some(output),
         }
     }
 }
@@ -361,9 +532,11 @@ pub(crate) fn accept(
 ) {
     *cursor = Some(entry.cursor.clone());
     let Ok(record) = serde_json::from_slice::<NetworkLogRecord>(&entry.data) else {
-        // A malformed line is neither a refusal nor a count. It is not a gap
-        // either: the line was read, and the runtime wrote something this build
-        // does not understand.
+        // The runtime wrote a record this build cannot decode: a newer format
+        // version, or an event tag these SDK enums do not carry (`serde` has no
+        // `#[serde(other)]` to fall back to). The line was read but its meaning
+        // was not, so whether it was a refusal is unknown — a gap, not silence.
+        live.mark_gap(dirty);
         return;
     };
     if live.ingest(&record, dirty, now_ms()) {
@@ -397,6 +570,11 @@ struct SlotState {
     /// The revision the last write put on disk.
     written_rev: u64,
     stopping: bool,
+    /// Set when [`PersistHandle::post_final`] has offered the final snapshot.
+    /// Nothing may displace it: the terminal record is the one that says the
+    /// session ended, and a dirty tick between the offer and the write would
+    /// otherwise replace it with a snapshot that is not final.
+    final_offered: bool,
     /// Set when the final snapshot has been written (or failed).
     finished: bool,
 }
@@ -422,6 +600,7 @@ impl Persister {
                 pending: None,
                 written_rev: 0,
                 stopping: false,
+                final_offered: false,
                 finished: false,
             }),
             wake: Condvar::new(),
@@ -474,9 +653,12 @@ impl PersistHandle {
     }
 
     /// Offer a snapshot. Never blocks, never waits for the disk.
+    ///
+    /// Refused once the final snapshot has been offered: a `post` that landed
+    /// after it would displace the record that says the session ended.
     pub(crate) fn post(&self, snapshot: SessionSnapshot) {
         let mut state = self.lock();
-        if state.stopping || state.finished {
+        if state.stopping || state.final_offered || state.finished {
             return;
         }
         state.pending = Some(Job::Snapshot(snapshot));
@@ -486,8 +668,9 @@ impl PersistHandle {
     /// Offer the final snapshot, after which nothing replaces it.
     pub(crate) fn post_final(&self, snapshot: SessionSnapshot) -> FinalWait {
         let mut state = self.lock();
-        if !state.stopping && !state.finished {
+        if !state.stopping && !state.final_offered && !state.finished {
             state.pending = Some(Job::Final(snapshot));
+            state.final_offered = true;
             self.slot.wake.notify_one();
         }
         let wait = FinalWait {

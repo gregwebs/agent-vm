@@ -15,6 +15,7 @@ use microsandbox::logs::{LogCursor, LogEntry, LogSource, LogStreamOptions, LogSt
 use microsandbox_types::Protocol;
 
 use futures::FutureExt as _;
+use futures::StreamExt as _;
 
 use super::*;
 use crate::refusal::log::SessionsDir;

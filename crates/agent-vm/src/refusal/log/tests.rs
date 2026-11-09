@@ -301,72 +301,193 @@ fn serialized_size_never_exceeds_2_mib() {
     assert!(bytes.len() as u64 <= MAX_LOG_BYTES, "{} bytes", bytes.len());
 }
 
+/// A socket file for `id`, so the session that names it looks live. The prune
+/// rule now drops an empty session whose socket is gone, which is the behaviour
+/// the reservation's own write has to leave alone.
+fn bind_socket(dir: &SessionsDir, id: &SessionId) -> std::io::Result<()> {
+    std::os::unix::net::UnixListener::bind(dir.socket_path(id)).map(drop)
+}
+
+/// The three ways a candidate is refused — an ID the log already holds, a socket
+/// name already on disk, and a bind that loses the race — are each *forced*
+/// here. Left to `SessionId::generate`, none of them would happen often enough
+/// to be evidence.
 #[test]
 fn sid_reservation_redraws_on_log_and_socket_collision() {
     let (_root, dir) = dir();
+    // Candidates, in the order the draw returns them.
+    let in_log = sid("0000000a");
+    let socket_taken = sid("0000000b");
+    let loses_the_race = sid("0000000c");
+    let free = sid("0000000d");
+    // `in_log` is in the log, and `socket_taken` has a socket file, but no log
+    // entry: exactly the case the `exists` check exists for.
+    dir.write(&filled(session("0000000a", true), 1, NOW), NOW)
+        .unwrap();
+    bind_socket(&dir, &in_log).unwrap();
+    bind_socket(&dir, &socket_taken).unwrap();
+
+    let mut script = [
+        in_log.clone(),
+        socket_taken.clone(),
+        loses_the_race.clone(),
+        free.clone(),
+    ]
+    .into_iter();
     let mut drawn = Vec::new();
+    let mut binds = Vec::new();
     let reserved = dir
-        .reserve(NOW, 42, true, |id| {
-            drawn.push(id.as_str().to_owned());
-            Ok::<_, std::io::Error>(())
-        })
+        .reserve_drawn(
+            NOW,
+            42,
+            true,
+            || {
+                let id = script.next().expect("the draw ran out of candidates");
+                drawn.push(id.as_str().to_owned());
+                id
+            },
+            |id| {
+                binds.push(id.as_str().to_owned());
+                if *id == loses_the_race {
+                    return Err(std::io::ErrorKind::AddrInUse.into());
+                }
+                bind_socket(&dir, id)
+            },
+        )
         .unwrap()
         .expect("the lock was free");
-    assert_eq!(drawn.len(), 1);
-    assert_eq!(reserved.snapshot.info.id.as_str(), drawn[0]);
-    assert_eq!(
-        dir.read()
-            .unwrap()
-            .sessions
-            .first()
-            .map(|s| s.info.id.as_str()),
-        Some(drawn[0].as_str())
-    );
 
-    // A second reservation never reuses the first's ID, even though the log
-    // already holds it.
-    let mut second = Vec::new();
-    dir.reserve(NOW, 43, true, |id| {
-        second.push(id.as_str().to_owned());
-        Ok::<_, std::io::Error>(())
-    })
-    .unwrap()
-    .unwrap();
-    assert_ne!(second[0], drawn[0]);
-
-    // A socket name already on disk forces a redraw.
-    let taken = dir.socket_path(&sid("deadbeef"));
-    std::fs::write(&taken, "").unwrap();
-    let mut attempts = 0;
-    let reserved = dir
-        .reserve(NOW, 44, true, |id| {
-            attempts += 1;
-            if attempts == 1 {
-                assert!(id.as_str().len() == 8);
-                return Err(std::io::ErrorKind::AddrInUse.into());
-            }
-            Ok::<_, std::io::Error>(())
-        })
-        .unwrap()
-        .expect("a redraw found a free name");
-    assert_eq!(attempts, 2);
     assert_eq!(
-        dir.read().unwrap().sessions.len(),
-        3,
-        "each reservation wrote one session"
+        drawn,
+        ["0000000a", "0000000b", "0000000c", "0000000d"],
+        "each refused candidate costs exactly one redraw, in the order they happen"
     );
-    assert!(!reserved.snapshot.info.id.as_str().is_empty());
+    assert_eq!(
+        binds,
+        ["0000000c", "0000000d"],
+        "the candidate the log or the socket already names is never bound"
+    );
+    assert_eq!(reserved.snapshot.info.id, free);
+    assert_eq!(reserved.snapshot.info.pid, 42);
+    let log = dir.read().unwrap();
+    let ids: Vec<&str> = log
+        .sessions
+        .iter()
+        .map(|session| session.info.id.as_str())
+        .collect();
+    // The pre-written session and the reserved one; nothing was written for a
+    // candidate that was refused.
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    assert!(ids.contains(&"0000000a"));
+    assert!(ids.contains(&"0000000d"));
+    assert!(
+        dir.socket_path(&free).exists(),
+        "the reserved socket is the one bound"
+    );
 }
 
 #[test]
 fn a_damaged_log_is_set_aside() {
     let (_root, dir) = dir();
     std::fs::write(dir.record(), b"{not json").unwrap();
-    assert!(dir.read().unwrap().sessions.is_empty());
-    // Reading does not repair; writing sets the damaged file aside and starts over.
+    // Reading reports the damage and leaves the file exactly where it is: a
+    // reader that repaired would be a writer without the lock.
+    let log = dir.read().unwrap();
+    assert!(log.sessions.is_empty());
+    assert_eq!(log.damaged, Some(Damage::Undecodable));
+    assert_eq!(std::fs::read(dir.record()).unwrap(), b"{not json");
+    assert!(
+        !dir.path().join("refusals.json.damaged").exists(),
+        "the read path created no `.damaged` file"
+    );
+
+    // Writing sets the damaged file aside and starts over.
+    let own = filled(session("00000001", true), 1, NOW);
+    let report = dir.write(&own, NOW).unwrap();
+    assert!(
+        report
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("could not be used")),
+        "{:?}",
+        report.warning
+    );
+    assert!(dir.path().join("refusals.json.damaged").exists());
+    assert_eq!(dir.read().unwrap().sessions.len(), 1);
+}
+
+/// The interleaving that made a read mutate the log: a damaged file exists, a
+/// writer replaces it with a good one, and a reader that had already read the
+/// damaged bytes renames what is *now* the writer's good file. The read path's
+/// repair was a rename, so "a read leaves the record's identity alone" is
+/// exactly what makes that impossible.
+#[test]
+fn a_reader_never_renames_the_log_out_from_under_a_writer() {
+    use std::os::unix::fs::MetadataExt as _;
+    let (_root, dir) = dir();
+    std::fs::write(dir.record(), b"{not json").unwrap();
+    let identity = |path: &Path| {
+        let m = std::fs::metadata(path).unwrap();
+        (m.dev(), m.ino())
+    };
+    let before = identity(&dir.record());
+    let _ = dir.read().unwrap();
+    assert_eq!(
+        identity(&dir.record()),
+        before,
+        "a read must not replace or move the record"
+    );
+    assert!(!dir.path().join("refusals.json.damaged").exists());
+
+    // The same under contention: a writer replacing a damaged file while readers
+    // run cannot end with the writer's good file renamed away.
+    let good = filled(session("00000002", true), 1, NOW);
+    for _ in 0..20 {
+        std::fs::write(dir.record(), b"{not json").unwrap();
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..5 {
+                        let _ = dir.read();
+                    }
+                })
+            })
+            .collect();
+        dir.write(&good, NOW).unwrap();
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        let log = dir.read().unwrap();
+        assert_eq!(
+            log.damaged, None,
+            "the writer's good file was not renamed away"
+        );
+        assert_eq!(log.sessions.len(), 1);
+        assert_eq!(log.sessions[0].info.id.as_str(), "00000002");
+    }
+}
+
+/// A failure to *open* the file is not damage. EMFILE, EACCES and EIO say nothing
+/// about the bytes, and setting such a file aside would destroy a good log.
+#[test]
+fn a_transient_read_failure_is_not_damage() {
+    let (_root, dir) = dir();
     let own = filled(session("00000001", true), 1, NOW);
     dir.write(&own, NOW).unwrap();
-    assert!(dir.path().join("refusals.json.damaged").exists());
+    let bytes = std::fs::read(dir.record()).unwrap();
+    std::fs::set_permissions(dir.record(), std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let error = dir
+        .read()
+        .expect_err("an unreadable log is an error, not an answer");
+    assert!(format!("{error:#}").contains("refusals.json"), "{error:#}");
+    assert!(
+        !dir.path().join("refusals.json.damaged").exists(),
+        "an unreadable log is not renamed away"
+    );
+    std::fs::set_permissions(dir.record(), std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(std::fs::read(dir.record()).unwrap(), bytes);
     assert_eq!(dir.read().unwrap().sessions.len(), 1);
 }
 
@@ -381,17 +502,56 @@ fn a_newer_version_log_is_never_overwritten() {
     });
     let bytes = serde_json::to_vec(&newer).unwrap();
     std::fs::write(dir.record(), &bytes).unwrap();
+    // The read path must recognise it from `v` alone, before decoding the body.
+    let read = dir.read().unwrap();
+    assert_eq!(read.evicted_sessions, 7);
     let own = filled(session("00000001", true), 1, NOW);
     let report = dir.write(&own, NOW).unwrap();
     assert!(report.warning.is_some(), "one warning, once");
     assert_eq!(report.evicted_sessions, 7);
     assert_eq!(std::fs::read(dir.record()).unwrap(), bytes);
     assert!(
+        !dir.path().join("refusals.json.damaged").exists(),
+        "a newer log is never treated as damage"
+    );
+    assert!(
         dir.reserve(NOW, 1, true, |_| Ok::<_, std::io::Error>(()))
             .unwrap()
             .is_none(),
         "a newer log is not reserved into either"
     );
+}
+
+/// The case `v`-first decoding exists for: a newer build changes the snapshot
+/// shape, so the body no longer decodes as this build's `LogFile`. Deciding from
+/// the decode would call it damaged, and a damaged file is one this build
+/// replaces — which is exactly what AC12 forbids for a newer version.
+#[test]
+fn a_newer_log_with_a_changed_shape_is_never_overwritten() {
+    let (_root, dir) = dir();
+    let newer = serde_json::json!({
+        "v": 2,
+        "evicted_sessions": 3,
+        "sessions": [{"id": "0a1b2c3d", "entries": "this build cannot read it"}]
+    });
+    let bytes = serde_json::to_vec(&newer).unwrap();
+    std::fs::write(dir.record(), &bytes).unwrap();
+
+    let read = dir.read().unwrap();
+    assert_eq!(read.damaged, None, "a newer version is not damage");
+    assert_eq!(read.evicted_sessions, 3, "what still decodes is reported");
+    assert!(read.sessions.is_empty(), "what does not decode is dropped");
+    assert_eq!(std::fs::read(dir.record()).unwrap(), bytes);
+
+    let own = filled(session("00000001", true), 1, NOW);
+    let report = dir.write(&own, NOW).unwrap();
+    assert!(report.warning.is_some(), "one warning, once");
+    assert_eq!(
+        std::fs::read(dir.record()).unwrap(),
+        bytes,
+        "never overwritten"
+    );
+    assert!(!dir.path().join("refusals.json.damaged").exists());
 }
 
 #[test]
@@ -465,4 +625,20 @@ fn prune_drops_history_and_keeps_the_writer() {
             .iter()
             .all(|s| s.info.id.as_str() != "00000003")
     );
+
+    // An empty session that claims a socket whose file is gone is a pre-create
+    // failure or a killed empty session: nothing to act on, and 30 days of the
+    // 2 MiB bound. One whose socket is still there may still be reachable.
+    std::os::unix::net::UnixListener::bind(dir.socket_path(&sid("00000005"))).unwrap();
+    dir.write(&session("00000005", true), NOW).unwrap();
+    dir.write(&session("00000004", true), NOW).unwrap();
+    dir.write(&own, NOW).unwrap();
+    let log = dir.read().unwrap();
+    let ids: Vec<&str> = log
+        .sessions
+        .iter()
+        .map(|session| session.info.id.as_str())
+        .collect();
+    assert!(!ids.contains(&"00000004"), "no socket, no entries: {ids:?}");
+    assert!(ids.contains(&"00000005"), "its socket is live: {ids:?}");
 }

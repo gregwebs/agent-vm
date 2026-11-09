@@ -393,10 +393,11 @@ impl SessionRefusals {
                     self.snapshot.suppressed.saturating_add(suppressed.count);
                 Some(self.bump(None))
             }
-            // `#[non_exhaustive]`: a newer runtime may write an event this build
-            // cannot interpret. It is not a refusal and not a count, so nothing
-            // changes — but the revision does not move either, so the entry list
-            // is unchanged rather than silently partial.
+            // Required by `NetworkLogEvent`'s `#[non_exhaustive]`, and
+            // unreachable for a record that decoded at all: an unknown `event`
+            // tag fails the whole `NetworkLogRecord` decode before this point
+            // (which [`super::feed::accept`] records as a gap). Nothing changes
+            // here, not even the revision.
             _ => None,
         }
     }
@@ -556,12 +557,14 @@ fn destination(refusal: &NetworkRefusal) -> Destination {
 
 /// Which of the three kinds a `(site, layer)` pair is (§5).
 ///
-/// Total with a wildcard arm on purpose: both enums are `#[non_exhaustive]`, so a
-/// site or layer a newer runtime adds must be *classified*, not fail to compile
-/// and not be dropped. The fail-safe answer is [`Kind::PolicyLock`], which offers
-/// no action — the wrong choice for a network denial is an action that would not
-/// work, and the wrong choice for a policy lock would be a promise slice 1 cannot
-/// keep.
+/// Total with a wildcard arm, and the wildcard is the *common* path, not a
+/// forward-compatibility formality: 15 of the runtime's 24 sites are not egress
+/// decisions an allowance reaches, so they land there. Both enums are
+/// `#[non_exhaustive]`, so the arm also gives a site or layer a later runtime
+/// adds an answer instead of failing to compile. The fail-safe answer is
+/// [`Kind::PolicyLock`], which offers no action — the wrong choice for a network
+/// denial is an action that would not work, and the wrong choice for a policy
+/// lock would be a promise this slice cannot keep.
 pub(crate) fn classify(site: RefusalSite, layer: RefusalLayer) -> Kind {
     if matches!(layer, RefusalLayer::Platform) {
         return Kind::PolicyLock;

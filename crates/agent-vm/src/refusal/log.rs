@@ -129,68 +129,99 @@ impl SessionsDir {
         self.path.join(format!("{}.sock", session.as_str()))
     }
 
-    /// The log as it stands. No lock and no creation: the atomic replace always
-    /// leaves a complete file, so a reader cannot see a partial one.
+    /// The log as it stands. No lock, no creation, and **no mutation**: the
+    /// atomic replace always leaves a complete file, so a reader cannot see a
+    /// partial one, and repairing it here would be a write dressed as a read.
     ///
-    /// A damaged or unreadable record is reported as an empty log here — reading
-    /// must not have the side effect of repairing it; [`Self::write`] is the one
-    /// place that sets damage aside.
+    /// Deliberately so: a damaged record exists; a writer takes the lock, sets it
+    /// aside and atomically writes a good one; a reader holding the bytes it read
+    /// before the writer ran would otherwise rename that *good* file to
+    /// `.damaged` and destroy every session's history. [`Self::write`] is the one
+    /// place that sets damage aside, and it re-reads under the lock to do it.
+    ///
+    /// A record this build cannot use is reported as an empty log carrying its
+    /// [`Damage`], so a reader can say why rather than pretend the project never
+    /// refused anything. A transient failure to open or read the file is not
+    /// damage and is returned as an error.
     pub(crate) fn read(&self) -> Result<Log> {
-        Ok(self.load()?.unwrap_or_else(|| Log {
-            evicted_sessions: 0,
-            sessions: Vec::new(),
-            writable: true,
-        }))
+        match self.load()? {
+            Loaded::Absent => Ok(Log::empty()),
+            Loaded::Current(log) => Ok(log),
+            Loaded::Newer(log) => Ok(Log {
+                writable: false,
+                ..log
+            }),
+            Loaded::Damaged(damage) => Ok(Log {
+                damaged: Some(damage),
+                ..Log::empty()
+            }),
+        }
     }
 
-    /// Decode the record. `Ok(None)` when it is absent or damaged.
+    /// Decode the record without touching it.
     ///
-    /// The `writable` flag is the only reason this is not a plain `Log`: a file
-    /// written by a newer build must not be replaced, and the difference has to
-    /// survive the decode.
-    fn load(&self) -> Result<Option<Log>> {
+    /// The version is read first and on its own, so a file a newer build wrote is
+    /// recognised from `v` alone — deciding from a full decode would mean a
+    /// changed snapshot shape makes a newer file look damaged, and a damaged file
+    /// is one this build replaces (AC12: a newer version is never overwritten).
+    ///
+    /// `Err` is a transient failure to open or read the file: EMFILE, EACCES, EIO.
+    /// It is not damage, and treating it as damage would set aside a log that is
+    /// perfectly good.
+    fn load(&self) -> Result<Loaded> {
+        let record = self.record();
+        match std::fs::symlink_metadata(&record) {
+            Ok(metadata) if !metadata.is_file() => {
+                return Ok(Loaded::Damaged(Damage::NotAFile(metadata.file_type())));
+            }
+            Ok(metadata) if metadata.len() > MAX_LOG_BYTES => {
+                return Ok(Loaded::Damaged(Damage::TooLarge));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Loaded::Absent),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("stating {}", crate::one_line::path(&record)));
+            }
+        }
         let bytes = match host_paths::read_optional_bounded_regular_file_no_follow(
-            &self.record(),
+            &record,
             MAX_LOG_BYTES,
         ) {
             Ok(Some(bytes)) => bytes,
-            Ok(None) => return Ok(None),
-            // A symlink, a directory or an oversized file is damage, not an
-            // error to propagate: this is a display store.
-            Err(_) => {
-                self.set_aside();
-                return Ok(None);
-            }
+            // It vanished between the stat and the open, or a transient failure
+            // interrupted the read: neither is damage.
+            Ok(None) => return Ok(Loaded::Absent),
+            Err(error) => return Err(error),
         };
-        let file: LogFile = match serde_json::from_slice(&bytes) {
-            Ok(file) => file,
-            Err(_) => {
-                self.set_aside();
-                return Ok(None);
-            }
+        let v = match serde_json::from_slice::<Version>(&bytes) {
+            Ok(version) => version.v,
+            Err(_) => return Ok(Loaded::Damaged(Damage::Undecodable)),
         };
-        if file.v > LOG_VERSION {
-            return Ok(Some(Log {
+        if v > LOG_VERSION {
+            return Ok(Loaded::Newer(decode_newer(&bytes)));
+        }
+        if v < LOG_VERSION {
+            return Ok(Loaded::Damaged(Damage::OlderVersion(v)));
+        }
+        match serde_json::from_slice::<LogFile>(&bytes) {
+            Ok(file) => Ok(Loaded::Current(Log {
                 evicted_sessions: file.evicted_sessions,
                 sessions: file.sessions,
-                writable: false,
-            }));
+                writable: true,
+                damaged: None,
+            })),
+            Err(_) => Ok(Loaded::Damaged(Damage::Undecodable)),
         }
-        if file.v < LOG_VERSION {
-            self.set_aside();
-            return Ok(None);
-        }
-        Ok(Some(Log {
-            evicted_sessions: file.evicted_sessions,
-            sessions: file.sessions,
-            writable: true,
-        }))
     }
 
     /// Move a damaged record out of the way so the next write can start over.
     ///
     /// `rename` is atomic, so a concurrent reader sees either the damaged file or
-    /// none; the suffix keeps the evidence instead of deleting it.
+    /// none; the suffix keeps the evidence instead of deleting it. Only
+    /// [`Self::write`] and [`Self::reserve`] call this, and only under the log
+    /// lock and after re-reading: a reader must never rename a file a writer has
+    /// already replaced.
     fn set_aside(&self) {
         let damaged = self.path.join("refusals.json.damaged");
         if let Err(error) = std::fs::rename(self.record(), &damaged) {
@@ -210,14 +241,23 @@ impl SessionsDir {
         if host_paths::flock_exclusive_within(&lock, LOCK_WAIT, |_| {})? == FlockWait::TimedOut {
             bail!("the refusal log is locked by another session");
         }
-        let mut log = self.load()?.unwrap_or_else(|| Log {
-            evicted_sessions: 0,
-            sessions: Vec::new(),
-            writable: true,
-        });
+        let mut log = match self.load()? {
+            Loaded::Absent => Log::empty(),
+            Loaded::Current(log) => log,
+            // A newer build's log may hold fields this one would silently drop.
+            Loaded::Newer(log) => log,
+            Loaded::Damaged(damage) => {
+                // The one place damage is set aside, and it is under the lock, so
+                // no reader can have renamed the file this decision is about.
+                self.set_aside();
+                Log {
+                    damaged: Some(damage),
+                    ..Log::empty()
+                }
+            }
+        };
         if !log.writable {
-            // One warning, and never an overwrite: a newer build's log may hold
-            // fields this one would silently drop.
+            // One warning, and never an overwrite.
             return Ok(WriteReport {
                 evicted_sessions: log.evicted_sessions,
                 warning: Some(format!(
@@ -226,9 +266,15 @@ impl SessionsDir {
                 )),
             });
         }
+        let repaired = log.damaged.take().map(|damage| {
+            format!(
+                "the refusal log could not be used ({damage}); it was kept as {} and replaced",
+                crate::one_line::path(&self.path.join("refusals.json.damaged"))
+            )
+        });
 
         log.upsert(own);
-        log.prune(now_ms, own.info.id.as_str());
+        log.prune(now_ms, own.info.id.as_str(), &self.path);
         let evicted = log.evict(own.info.id.as_str());
         log.evicted_sessions = log.evicted_sessions.saturating_add(evicted);
 
@@ -243,7 +289,7 @@ impl SessionsDir {
             .with_context(|| format!("writing {}", crate::one_line::path(&self.record())))?;
         Ok(WriteReport {
             evicted_sessions: log.evicted_sessions,
-            warning: None,
+            warning: repaired,
         })
     }
 
@@ -262,22 +308,40 @@ impl SessionsDir {
         now_ms: i64,
         pid: u32,
         socket: bool,
+        bind: impl FnMut(&SessionId) -> std::io::Result<T>,
+    ) -> Result<Option<Reserved<T>>> {
+        self.reserve_drawn(now_ms, pid, socket, SessionId::generate, bind)
+    }
+
+    /// [`Self::reserve`] with the draw injected, so a test can force the two
+    /// collision candidates — an ID the log already holds and an ID whose socket
+    /// name is taken — that the draw is otherwise free to skip.
+    fn reserve_drawn<T>(
+        &self,
+        now_ms: i64,
+        pid: u32,
+        socket: bool,
+        mut draw: impl FnMut() -> SessionId,
         mut bind: impl FnMut(&SessionId) -> std::io::Result<T>,
     ) -> Result<Option<Reserved<T>>> {
         let lock = host_paths::open_lock_file(&self.lock_path())?;
         if host_paths::flock_exclusive_within(&lock, LOCK_WAIT, |_| {})? == FlockWait::TimedOut {
             return Ok(None);
         }
-        let mut log = self.load()?.unwrap_or_else(|| Log {
-            evicted_sessions: 0,
-            sessions: Vec::new(),
-            writable: true,
-        });
-        if !log.writable {
-            return Ok(None);
-        }
+        let mut log = match self.load()? {
+            Loaded::Absent => Log::empty(),
+            Loaded::Newer(_) => return Ok(None),
+            Loaded::Damaged(damage) => {
+                self.set_aside();
+                Log {
+                    damaged: Some(damage),
+                    ..Log::empty()
+                }
+            }
+            Loaded::Current(log) => log,
+        };
         for _ in 0..RESERVE_TRIES {
-            let id = SessionId::generate();
+            let id = draw();
             if log.contains(id.as_str()) || self.socket_path(&id).exists() {
                 continue;
             }
@@ -299,7 +363,7 @@ impl SessionsDir {
                 socket,
             });
             log.upsert(&snapshot);
-            log.prune(now_ms, snapshot.info.id.as_str());
+            log.prune(now_ms, snapshot.info.id.as_str(), &self.path);
             let bytes = log.encode()?;
             host_paths::atomic_write(&self.record(), &bytes, 0o600)
                 .with_context(|| format!("writing {}", crate::one_line::path(&self.record())))?;
@@ -322,13 +386,26 @@ pub(crate) struct WriteReport {
 }
 
 /// The log's content, decoded.
+#[derive(Debug)]
 pub(crate) struct Log {
     pub(crate) evicted_sessions: u64,
     pub(crate) sessions: Vec<SessionSnapshot>,
     writable: bool,
+    /// Why this build could not use the record, when it could not. A reader
+    /// reports it; the writer that repairs it reports it in [`WriteReport`].
+    pub(crate) damaged: Option<Damage>,
 }
 
 impl Log {
+    fn empty() -> Self {
+        Self {
+            evicted_sessions: 0,
+            sessions: Vec::new(),
+            writable: true,
+            damaged: None,
+        }
+    }
+
     /// Only the eviction tests build a log without a file: the ordering rule is
     /// what they are about, and a file would only add I/O.
     #[cfg(test)]
@@ -336,7 +413,7 @@ impl Log {
         Self {
             evicted_sessions,
             sessions,
-            writable: true,
+            ..Self::empty()
         }
     }
 
@@ -363,7 +440,7 @@ impl Log {
     /// the other three drop an entry that says nothing a reader could act on: an
     /// ended session with no refusals, a socketless session whose heartbeat
     /// stopped, and a session whose socket file is gone.
-    fn prune(&mut self, now_ms: i64, own: &str) {
+    fn prune(&mut self, now_ms: i64, own: &str, dir: &Path) {
         self.sessions.retain(|session| {
             if session.info.id.as_str() == own {
                 return true;
@@ -376,6 +453,14 @@ impl Log {
                 return true;
             }
             if session.ended_ms.is_some() {
+                return false;
+            }
+            if session.info.socket && socket_gone(dir, session.info.id.as_str()) {
+                // It claimed a socket, the socket is gone, and it refused
+                // nothing: either it never got as far as serving (every
+                // pre-create failure looks like this) or it was killed while
+                // empty. Either way there is nothing a reader could act on, and
+                // keeping it spends the 2 MiB bound on 30 days of empty record.
                 return false;
             }
             match (session.info.socket, session.heartbeat_ms) {
@@ -434,6 +519,18 @@ impl Log {
     }
 }
 
+/// Whether `<sid>.sock` is gone from `dir`.
+///
+/// Only a `NotFound` answer counts: the rule prunes a session whose socket is
+/// *gone*, so a directory that cannot be read keeps the record rather than
+/// dropping one that may still be reachable.
+fn socket_gone(dir: &Path, sid: &str) -> bool {
+    match std::fs::symlink_metadata(dir.join(format!("{sid}.sock"))) {
+        Ok(_) => false,
+        Err(error) => error.kind() == ErrorKind::NotFound,
+    }
+}
+
 /// When this session was last doing anything at all.
 pub(crate) fn activity_ms(session: &SessionSnapshot) -> i64 {
     let entries = session
@@ -480,6 +577,91 @@ struct LogFile {
     evicted_sessions: u64,
     #[serde(default)]
     sessions: Vec<SessionSnapshot>,
+}
+
+/// Just the version, so a newer file is recognised from `v` alone.
+#[derive(Deserialize)]
+struct Version {
+    v: u32,
+}
+
+/// What one read of the record found.
+enum Loaded {
+    Absent,
+    /// This build's version, decoded whole.
+    Current(Log),
+    /// A newer build's version. Carries whatever of it still decodes, and is
+    /// never written over.
+    Newer(Log),
+    /// Not a log this build can use. Nothing has been done about it: only a
+    /// writer, under the lock, may set it aside.
+    Damaged(Damage),
+}
+
+/// Why the record is not a log this build can use.
+///
+/// The list is the whole of what counts as damage. A *transient* failure —
+/// EMFILE, EACCES, EIO — is not on it: a log nobody could open this instant is
+/// not a log to rename away.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Damage {
+    /// A symlink, a directory, a socket or anything else that is not a plain
+    /// file. Following one would read a file this build does not own.
+    NotAFile(std::fs::FileType),
+    /// Past [`MAX_LOG_BYTES`]: not a log this build wrote, and reading it would
+    /// cost unbounded memory.
+    TooLarge,
+    /// Not JSON, or JSON without a version this build can read.
+    Undecodable,
+    /// A version below this build's. Reported as damage rather than migrated: no
+    /// earlier on-disk version of this log ever existed, so a lower `v` is not
+    /// something this build can interpret.
+    OlderVersion(u32),
+}
+
+impl std::fmt::Display for Damage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAFile(kind) => write!(f, "it is not a regular file ({kind:?})"),
+            Self::TooLarge => write!(f, "it is larger than {MAX_LOG_BYTES} bytes"),
+            Self::Undecodable => f.write_str("it is not a refusal log this version can read"),
+            Self::OlderVersion(v) => {
+                write!(
+                    f,
+                    "it declares version {v}, and this version writes {LOG_VERSION}"
+                )
+            }
+        }
+    }
+}
+
+/// A newer build's log, decoded as far as this build can.
+///
+/// Best effort by design: the point of reading `v` first is that a changed
+/// snapshot shape no longer turns a newer file into "damaged" and therefore into
+/// a file this build replaces. Whatever does not decode is dropped from the
+/// *display*, never from the file.
+fn decode_newer(bytes: &[u8]) -> Log {
+    // Two decodes rather than one, so a session whose shape changed costs the
+    // session list and not the eviction count as well.
+    #[derive(Deserialize, Default)]
+    struct Counters {
+        #[serde(default)]
+        evicted_sessions: u64,
+    }
+    #[derive(Deserialize, Default)]
+    struct Sessions {
+        #[serde(default)]
+        sessions: Vec<SessionSnapshot>,
+    }
+    let counters = serde_json::from_slice::<Counters>(bytes).unwrap_or_default();
+    let sessions = serde_json::from_slice::<Sessions>(bytes).unwrap_or_default();
+    Log {
+        evicted_sessions: counters.evicted_sessions,
+        sessions: sessions.sessions,
+        writable: false,
+        damaged: None,
+    }
 }
 
 #[cfg(test)]
