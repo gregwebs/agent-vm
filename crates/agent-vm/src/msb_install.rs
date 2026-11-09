@@ -601,6 +601,17 @@ fn socket_path_fits(len: usize) -> (ok: bool)
 
 } // verus!
 
+/// Whether a Unix socket at `path` can be bound on this platform.
+///
+/// The launcher's own control socket (`<state root>/<hash>.sessions/<sid>.sock`)
+/// is host-owned, so an over-long one is *not* a hard error the way the runtime's
+/// is: the session keeps its log and `agent-vm access` loses only the live view
+/// (ADR-0064). Trusted adapter over the Verus-proved `socket_path_fits`; the byte
+/// measurement is the part no proof covers.
+pub(crate) fn unix_socket_path_fits(path: &Path) -> bool {
+    socket_path_fits(path.as_os_str().len())
+}
+
 /// Fail closed, before boot, if `sandbox_name`'s real agent/control socket
 /// paths under `msb_home_dir()` would overflow this platform's
 /// `sockaddr_un.sun_path` (AC#6, agent-vm issue #40).

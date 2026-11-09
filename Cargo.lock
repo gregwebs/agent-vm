@@ -28,6 +28,7 @@ dependencies = [
  "chrono",
  "clap",
  "console",
+ "futures",
  "getrandom 0.4.2",
  "indicatif",
  "ipnetwork",

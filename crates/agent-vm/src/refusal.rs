@@ -580,6 +580,7 @@ pub(crate) fn classify(site: RefusalSite, layer: RefusalLayer) -> Kind {
     }
 }
 
+pub(crate) mod feed;
 pub(crate) mod log;
 
 #[cfg(test)]

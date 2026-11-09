@@ -69,6 +69,7 @@ mod secret;
 mod secret_store;
 mod secrets;
 mod session;
+mod session_control;
 mod setup;
 mod shell;
 #[cfg(test)]

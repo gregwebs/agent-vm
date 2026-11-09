@@ -74,7 +74,7 @@ sea-orm = { version = "1.1", default-features = false, features = ["sqlx-sqlite"
 # `direct_pty.rs`'s SIGWINCH stream, which a resize must observe; the vendored
 # SDK already enables it, so this names an existing capability instead of
 # adding compilation.
-tokio = { version = "1.42", features = ["macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.42", features = ["macros", "net", "io-util", "process", "rt-multi-thread", "signal", "sync", "time"] }
 # `wrap_help` makes clap detect the terminal width and wrap long help
 # text to it; without it the multi-paragraph `--help` prose renders as
 # unbroken one-line-per-paragraph walls.
@@ -86,6 +86,10 @@ tokio = { version = "1.42", features = ["macros", "process", "rt-multi-thread", 
 # `&*name` workaround with `E0521`, since `Str` wants `'static`).
 clap = { version = "4.5", features = ["derive", "env", "string", "wrap_help"] }
 anyhow = "1.0"
+# `StreamExt::next` over the SDK's log stream, and `BoxFuture` for the refusal
+# feed's opener. The vendored SDK already depends on this exact major, so this
+# names a crate in the graph rather than adding compilation.
+futures = "0.3"
 base64 = "0.22"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }

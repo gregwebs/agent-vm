@@ -23,6 +23,16 @@ pub(crate) trait ExecTeardown: Sync {
     async fn kill_with_timeout(&self, timeout: Duration) -> Result<()>;
     async fn wait(&self) -> Result<()>;
     async fn remove(&self) -> Result<()>;
+
+    /// Run once, after the producer has stopped and before `remove`.
+    ///
+    /// One hook, not one per caller: every path that removes *this session's*
+    /// sandbox goes through [`cleanup_exec_sandbox_failures`], so "producer
+    /// stopped → drain what it wrote → persist it → remove" cannot differ
+    /// between the ordinary end, the forced end (#401) and a failure (#258).
+    /// The default is a no-op so the trait's existing implementors — the
+    /// `Sandbox` adapter and the test stubs — need no change.
+    async fn before_remove(&self) {}
 }
 
 impl ExecTeardown for Sandbox {
@@ -123,6 +133,9 @@ pub(crate) async fn cleanup_exec_sandbox_failures(
             Err(_) => failures.push(format!("reap: timed out after {EXEC_REAP_TIMEOUT:?}")),
         }
     }
+    // Between the reap and the remove: the producer has stopped, so whatever it
+    // wrote is on disk to be read, and the sandbox's log directory still exists.
+    teardown.before_remove().await;
     match tokio::time::timeout(EXEC_REMOVE_TIMEOUT, teardown.remove()).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => failures.push(format!("remove: {error}")),
@@ -141,5 +154,133 @@ pub(crate) async fn cleanup_exec_sandbox(teardown: &impl ExecTeardown) -> anyhow
         Ok(())
     } else {
         Err(anyhow::anyhow!("{}", failures.join("; ")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// A teardown that records the order of its own steps.
+    struct Recorder {
+        steps: Mutex<Vec<&'static str>>,
+        stop_fails: bool,
+    }
+
+    impl Recorder {
+        fn new(stop_fails: bool) -> Self {
+            Self {
+                steps: Mutex::new(Vec::new()),
+                stop_fails,
+            }
+        }
+        fn step(&self, name: &'static str) -> Result<()> {
+            self.steps.lock().unwrap().push(name);
+            Ok(())
+        }
+        fn recorded(&self) -> Vec<&'static str> {
+            self.steps.lock().unwrap().clone()
+        }
+    }
+
+    impl ExecTeardown for Recorder {
+        async fn stop_and_wait(&self) -> Result<()> {
+            self.step("stop")?;
+            if self.stop_fails {
+                anyhow::bail!("the guest refused to stop");
+            }
+            Ok(())
+        }
+        async fn kill_with_timeout(&self, _timeout: Duration) -> Result<()> {
+            self.step("kill")
+        }
+        async fn wait(&self) -> Result<()> {
+            self.step("reap")
+        }
+        async fn remove(&self) -> Result<()> {
+            self.step("remove")
+        }
+        async fn before_remove(&self) {
+            self.steps.lock().unwrap().push("before_remove");
+        }
+    }
+
+    /// ADR-0064: the hook runs once, after the producer has stopped and before
+    /// the sandbox is removed, and it runs in both modes and whatever the earlier
+    /// steps did. Ordering it anywhere else would drain a file the runtime has not
+    /// flushed, or drain one that no longer exists.
+    #[test]
+    fn before_remove_runs_between_reap_and_remove_in_every_mode() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        for (mode, stop_fails, expected) in [
+            (
+                TeardownMode::Ordinary,
+                false,
+                vec!["stop", "before_remove", "remove"],
+            ),
+            (
+                TeardownMode::Ordinary,
+                true,
+                vec!["stop", "kill", "reap", "before_remove", "remove"],
+            ),
+            (
+                TeardownMode::Forced,
+                false,
+                vec!["kill", "reap", "before_remove", "remove"],
+            ),
+        ] {
+            let recorder = Recorder::new(stop_fails);
+            let failures =
+                runtime.block_on(cleanup_exec_sandbox_failures(&recorder, mode));
+            assert_eq!(
+                recorder.recorded(),
+                expected,
+                "mode {mode:?}, stop_fails={stop_fails}"
+            );
+            if stop_fails && mode == TeardownMode::Ordinary {
+                assert_eq!(failures.len(), 1, "the failed stop is still reported");
+            } else {
+                assert!(failures.is_empty(), "{failures:?}");
+            }
+        }
+    }
+
+    /// A forced teardown whose earlier steps did nothing still runs the hook: a
+    /// kill that errored must not also cost the session its refusals.
+    #[test]
+    fn before_remove_runs_even_when_every_earlier_step_failed() {
+        struct Failing(Mutex<Vec<&'static str>>);
+        impl ExecTeardown for Failing {
+            async fn stop_and_wait(&self) -> Result<()> {
+                anyhow::bail!("no")
+            }
+            async fn kill_with_timeout(&self, _t: Duration) -> Result<()> {
+                anyhow::bail!("no")
+            }
+            async fn wait(&self) -> Result<()> {
+                anyhow::bail!("no")
+            }
+            async fn remove(&self) -> Result<()> {
+                anyhow::bail!("no")
+            }
+            async fn before_remove(&self) {
+                self.0.lock().unwrap().push("before_remove");
+            }
+        }
+        let recorder = Failing(Mutex::new(Vec::new()));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let failures = runtime.block_on(cleanup_exec_sandbox_failures(
+            &recorder,
+            TeardownMode::Ordinary,
+        ));
+        assert_eq!(failures.len(), 4, "every step reported: {failures:?}");
+        assert_eq!(recorder.0.lock().unwrap().as_slice(), ["before_remove"]);
     }
 }
