@@ -333,20 +333,36 @@ fn damaged_and_untrusted_stores_warn_and_change_nothing() {
         let project = root.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         seed_session_log(&state, &project, now_ms());
+        // Every row starts from a record that would cover the session's entry
+        // (`203.0.113.10:443`), so "makes no row claim" can fail: a store the
+        // command wrongly trusted would print the covered ACTION cell.
+        const COVERING: &str = "tcp://[203.0.113.10/32]:443";
         let file = match corrupt {
             0 => {
-                let file = write_allowances(&authority, &project, "10.0.0.5");
+                let file = write_allowances(&authority, &project, COVERING);
                 std::fs::write(&file, b"not json").unwrap();
                 file
             }
             1 => {
-                let file = write_allowances(&authority, &project, "10.0.0.5");
+                let file = write_allowances(&authority, &project, COVERING);
                 std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o666)).unwrap();
                 file
             }
             _ => {
-                let file = write_allowances(&authority, &project, "10.0.0.5");
-                std::fs::write(&file, r#"{"v":2,"records":[]}"#).unwrap();
+                // A newer file that *does* carry a covering record: applying
+                // one token's worth of it would show up as a covered row.
+                let file = write_allowances(&authority, &project, COVERING);
+                let path = project.canonicalize().unwrap();
+                std::fs::write(
+                    &file,
+                    format!(
+                        r#"{{"v":2,"records":[{{"project":"{}","path":"{}","destination":"{COVERING}","recorded_ms":1760000000000}}],"added":true}}"#,
+                        digest_of(&project),
+                        path.display()
+                    ),
+                )
+                .unwrap();
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
                 file
             }
         };
@@ -370,9 +386,18 @@ fn damaged_and_untrusted_stores_warn_and_change_nothing() {
             "{row}: access changed the authority directory"
         );
         assert!(file.exists(), "{row}: the store was removed");
+        let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
-            !String::from_utf8_lossy(&out.stdout).contains("recorded project allowance"),
-            "{row}"
+            !stdout.contains("recorded project allowance"),
+            "{row}: {stdout}"
+        );
+        let row_text = stdout
+            .lines()
+            .find(|line| line.starts_with("0e7e41fb "))
+            .unwrap_or_else(|| panic!("{row}: no row: {stdout}"));
+        assert!(
+            row_text.contains("no grant in this version"),
+            "{row}: a store this build must not use changed the row: {row_text}"
         );
     }
 }

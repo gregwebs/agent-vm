@@ -14271,33 +14271,37 @@ fn applied_rules(stderr: &str) -> Vec<serde_json::Value> {
         .clone()
 }
 
-/// Exactly one `warning:` line, and it is the store's. Two warnings for one
-/// broken store is a bug; none is a silent degradation.
-fn allowance_warnings(stderr: &str) -> Vec<String> {
+/// The `warning:` lines that mention `needle`, in order. A count is only
+/// meaningful over lines that actually say what they are about.
+fn warnings_mentioning(stderr: &str, needle: &str) -> Vec<String> {
     stderr
         .lines()
-        .filter(|line| line.starts_with("warning: ") && line.contains("allowance"))
+        .filter(|line| line.starts_with("warning: ") && line.contains(needle))
         .map(str::to_owned)
         .collect()
 }
 
-/// This store's entries and the directory's own mode: the slice of the
-/// authority directory a read of `allowances.json` is allowed to disturb.
+/// Exactly one `warning:` line naming the store's file, and it is the store's.
+/// Two warnings for one broken store is a bug; none is a silent degradation; and
+/// a warning that does not name the file fails AC4's "naming the file".
+fn allowance_warnings(stderr: &str) -> Vec<String> {
+    warnings_mentioning(stderr, "allowances.json")
+}
+
+/// The authority directory as one launch must leave it, minus the two things a
+/// launch legitimately writes: its own image pin, and the directory's size and
+/// mtime (which move when the pin appears; its identity and mode are still
+/// evidence). Everything else — a rewritten `config.toml`, a stray
+/// `atomic_write` temp, an `allowances.tmp`, a lock — is compared byte for byte.
 fn allowance_facts(directory: &Path) -> authority_snapshot::Snapshot {
     use std::ffi::OsString;
     let mut facts = authority_snapshot::take(directory);
-    // The directory's size and mtime move whenever *any* launcher store adds a
-    // name here — the image pin does, on every launch — so only its identity and
-    // mode are this store's evidence.
     let directory = facts.remove(&OsString::new()).unwrap_or_default();
     let identity = directory
         .split_once(" size=")
         .map_or(directory.clone(), |(head, _)| head.to_owned());
-    facts.retain(|name, _| {
-        name == "allowances.json"
-            || name == "allowances.lock"
-            || name.to_string_lossy().starts_with("allowances.json.")
-    });
+    facts.remove(&OsString::from("image-pins.json"));
+    facts.remove(&OsString::from("image-pins.lock"));
     facts.insert(OsString::new(), identity);
     facts
 }
@@ -14380,8 +14384,16 @@ fn project_allowance_is_not_inherited_by_another_moved_or_copied_project() {
 }
 
 /// AC4: every way a store can be unusable degrades to configured authority with
-/// exactly one warning, reaches `builder.build()`, and leaves the authority
-/// directory untouched.
+/// exactly one warning naming the file, reaches `builder.build()`, and leaves the
+/// authority directory untouched.
+///
+/// "Configured authority only" is asserted as *the whole applied rule vector*,
+/// against a launch that configures one address: a regression that dropped the
+/// configured rule together with the unusable store, or added an unrelated one,
+/// fails here. Every row that can hold a record does hold one, so "no record
+/// applied" is not vacuous — only the two file-level states (no JSON at all, a
+/// directory at the name) cannot, and they are the states in which no record
+/// could be read by anyone.
 ///
 /// `newer` is not damage: it applies nothing and says so, and the launch is the
 /// same. The state E1 (a hard link) is excluded here because it refuses the
@@ -14389,9 +14401,15 @@ fn project_allowance_is_not_inherited_by_another_moved_or_copied_project() {
 #[test]
 fn project_allowance_degraded_store_warns_once_and_reaches_build() {
     use std::os::unix::fs::PermissionsExt as _;
-    // One well-formed record and one that does not parse, so "the configured
-    // rules only" is distinguishable from "the whole file was dropped".
-    let good = |h: &Harness| allowance_record(&h.project_root, "tcp://[203.0.113.10/32]:443");
+    const CONFIGURED: &str = "198.51.100.0/24";
+    fn good(h: &Harness) -> String {
+        allowance_record(&h.project_root, "tcp://[203.0.113.10/32]:443")
+    }
+    fn oversized(h: &Harness) -> String {
+        let mut body = allowance_file(&[good(h)]);
+        body.push_str(&" ".repeat(1024 * 1024 + 1 - body.len()));
+        body
+    }
     type Seed = Box<dyn Fn(&Harness) -> PathBuf>;
     let cases: Vec<(&str, Seed)> = vec![
         (
@@ -14400,7 +14418,9 @@ fn project_allowance_degraded_store_warns_once_and_reaches_build() {
         ),
         (
             "unknown field",
-            Box::new(move |h| h.seed_allowances(r#"{"v":1,"records":[],"extra":1}"#)),
+            Box::new(move |h| {
+                h.seed_allowances(&format!(r#"{{"v":1,"records":[{}],"extra":1}}"#, good(h)))
+            }),
         ),
         (
             "group-writable",
@@ -14424,7 +14444,17 @@ fn project_allowance_degraded_store_warns_once_and_reaches_build() {
         ),
         (
             "newer version",
-            Box::new(move |h| h.seed_allowances(r#"{"v":2,"records":[],"extra":1}"#)),
+            Box::new(move |h| {
+                h.seed_allowances(&format!(r#"{{"v":2,"records":[{}],"extra":1}}"#, good(h)))
+            }),
+        ),
+        (
+            "older version",
+            Box::new(move |h| h.seed_allowances(&format!(r#"{{"v":0,"records":[{}]}}"#, good(h)))),
+        ),
+        (
+            "over one MiB",
+            Box::new(move |h| h.seed_allowances(&oversized(h))),
         ),
         (
             "directory at the name",
@@ -14438,14 +14468,14 @@ fn project_allowance_degraded_store_warns_once_and_reaches_build() {
     ];
     for (row, seed) in cases {
         let h = Harness::warm();
-        let _file = seed(&h);
+        let file = seed(&h);
         let directory = h.home_root.join(".config/agent-vm");
-        // A launch also writes its own image pin into this directory, so only
-        // this store's entries and the directory's own mode are this row's
-        // evidence: a reader that created `allowances.lock` or rewrote the file
-        // would fail here, and a pin write would not.
+        // Only the image pin a launch legitimately writes is excluded; every
+        // other name, byte and mode bit in this directory is this row's
+        // evidence, so a rewritten `config.toml`, a stray atomic-write temp, a
+        // lock or a rewritten store all fail.
         let before = allowance_facts(&directory);
-        let out = h.launch("shell", &[]);
+        let out = h.launch("shell", &["--allow-egress", CONFIGURED]);
         let stderr = stderr_of(&out);
         assert!(stderr.contains(CONFIG_MARKER), "{row}: {stderr}");
         let warnings = allowance_warnings(&stderr);
@@ -14454,16 +14484,30 @@ fn project_allowance_degraded_store_warns_once_and_reaches_build() {
             warnings[0].contains("project allowances not applied:"),
             "{row}: {warnings:?}"
         );
+        // AC4: the warning names the file it read.
         assert!(
-            !applied_rules(&stderr)
-                .iter()
-                .any(|rule| rule["destination"]["cidr"] == "203.0.113.10/32"),
-            "{row}: a degraded store applied a record: {stderr}"
+            warnings[0].contains(&format!("\"{}\"", file.display())),
+            "{row}: the warning does not name {}: {warnings:?}",
+            file.display()
+        );
+        // Configured authority only, as the whole rule vector: the one address
+        // the launch asked for, and nothing from the store.
+        let expected = serde_json::json!([{
+            "direction": "egress",
+            "destination": {"cidr": CONFIGURED},
+            "protocols": [],
+            "ports": [],
+            "action": "allow",
+        }]);
+        assert_eq!(
+            applied_rules(&stderr),
+            expected.as_array().unwrap().clone(),
+            "{row}: the launch did not keep exactly its configured authority: {stderr}"
         );
         assert_eq!(
             allowance_facts(&directory),
             before,
-            "{row}: the launch changed this store"
+            "{row}: the launch changed the authority directory"
         );
     }
 }
@@ -14507,7 +14551,9 @@ fn project_allowance_hostname_is_skipped_under_a_host_proxy() {
         !stderr.contains("refuses hostname allowances with a host HTTP proxy"),
         "the launch was refused: {stderr}"
     );
-    let warnings = allowance_warnings(&stderr);
+    // The proxy skip is not the file's fault, so its line does not name the
+    // file: count it as an allowance warning, not a store warning.
+    let warnings = warnings_mentioning(&stderr, "allowance");
     assert_eq!(warnings.len(), 1, "{stderr}");
     assert!(
         warnings[0].contains("1 project hostname allowance(s) not applied"),
@@ -14534,12 +14580,16 @@ fn project_allowance_hostname_is_skipped_under_a_host_proxy() {
 
 /// AC2 through the real binary: a launch whose only hostname is a recorded one
 /// installs interception, and the notices say where it came from.
+///
+/// The record names port 8443 rather than 443, so the intercepted-ports
+/// assertion discriminates: `[443]` is the dense default even when TLS is off,
+/// and only the recorded set contributes 8443 beside it.
 #[test]
 fn project_allowance_record_only_hostname_enables_interception() {
     let h = Harness::warm();
     h.seed_allowances(&allowance_file(&[allowance_record(
         &h.project_root,
-        "api.example.com",
+        "tcp://api.example.com:8443",
     )]));
     let out = h.launch("shell", &[]);
     let stderr = stderr_of(&out);
@@ -14548,17 +14598,19 @@ fn project_allowance_record_only_hostname_enables_interception() {
     assert_eq!(config["network"]["tls"]["enabled"], true, "{stderr}");
     assert_eq!(
         config["network"]["tls"]["intercepted_ports"],
-        serde_json::json!([443])
+        serde_json::json!([443, 8443]),
+        "8443 is the record's contribution; a default-only set would be [443]"
     );
     assert!(
         applied_rules(&stderr)
             .iter()
-            .any(|rule| rule["destination"]["domain"] == "api.example.com"),
+            .any(|rule| rule["destination"]["domain"] == "api.example.com"
+                && rule["ports"] == serde_json::json!([{"start": 8443, "end": 8443}])),
         "{stderr}"
     );
     assert!(
         stderr.contains(
-            "==> Egress policy: allowing TLS to api.example.com on ports 443 (project allowance)"
+            "==> Egress policy: allowing TLS to api.example.com on ports 8443 (project allowance)"
         ),
         "{stderr}"
     );

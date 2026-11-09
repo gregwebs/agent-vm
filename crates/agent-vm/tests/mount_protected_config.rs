@@ -767,7 +767,11 @@ fn m14_rw_file_bind_of_allowances_json_refused() {
 }
 
 /// m15 — E1: a second hard link to `allowances.json` refuses the launch, naming
-/// the file; removing the link lets the same topology launch.
+/// *the authority file*; removing the link lets the same topology launch.
+///
+/// The alias lives in the project directory and is also named
+/// `allowances.json`, so a bare name match would pass on either path. The
+/// assertion names the authority path, which only the guard can print.
 #[test]
 fn m15_hard_linked_allowances_json_refuses_launch_then_single_link_control() {
     let h = Harness::new();
@@ -777,8 +781,15 @@ fn m15_hard_linked_allowances_json_refuses_launch_then_single_link_control() {
     let out = h.run_shell(&[]);
     let stderr = stderr_of(&out);
     assert!(!out.status.success(), "{stderr}");
-    assert!(stderr.contains("has 2 hard links"), "{stderr}");
-    assert!(stderr.contains("allowances.json"), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "\"{}\" has 2 hard links",
+            h.home_path()
+                .join(".config/agent-vm/allowances.json")
+                .display()
+        )),
+        "the refusal names the authority file: {stderr}"
+    );
     assert_no_launch_side_effects(&h, &stderr);
     std::fs::remove_file(alias).unwrap();
     let text = reached(h.run_shell(&[]));
