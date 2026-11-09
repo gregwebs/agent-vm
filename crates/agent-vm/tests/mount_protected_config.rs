@@ -630,3 +630,58 @@ fn m12_home_launch_refused_with_valid_network_authority() {
     assert!(!stderr.contains("Egress policy"));
     assert_no_launch_side_effects(&h, &stderr);
 }
+
+/// ADR-0064 D2: a state root inside the project is refused, because the
+/// project bind is writable and `<state>/<hash>.sessions` would sit in it.
+#[test]
+fn a_state_root_inside_the_project_is_refused_naming_the_sessions_dir() {
+    let h = Harness::new();
+    let state_inside = h.project.path().join("agent-vm-state");
+    std::fs::create_dir_all(&state_inside).unwrap();
+    let mut cmd = Command::new(agent_vm_bin());
+    cmd.env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("AGENT_VM_STATE_DIR", &state_inside)
+        .env("HOME", h.home.path())
+        .env("MSB_PATH", &h.fake_msb)
+        .current_dir(h.project.path())
+        .args(["--no-git", "--image", &h.image, "shell"]);
+    let out = run_with_timeout(cmd, Duration::from_secs(15));
+    let stderr = stderr_of(&out);
+    assert!(!out.status.success(), "{stderr}");
+    let sessions = state_inside
+        .canonicalize()
+        .unwrap()
+        .join(format!("{}.sessions", hash_project(h.project.path())));
+    assert!(
+        stderr.contains(&sessions.display().to_string()),
+        "the refusal names the sessions directory {sessions:?}: {stderr}"
+    );
+    assert!(
+        stderr.contains("refusal records and control sockets"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("Moving the state root"),
+        "the remedy points at the documented move: {stderr}"
+    );
+}
+
+/// ADR-0064 R2: a read-only bind of the `.sessions` directory is still refused.
+/// D3 exempts `:ro` *ancestors*; it does not exempt the directory itself.
+#[test]
+fn a_ro_mount_of_the_sessions_dir_is_refused() {
+    let h = Harness::new();
+    let state = h.state.path().canonicalize().unwrap();
+    let sessions = state.join(format!("{}.sessions", hash_project(h.project.path())));
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(sessions.join("refusals.json"), "{\"v\":1}\n").unwrap();
+    let declared = format!("{}:/sessions:ro", sessions.display());
+    let out = h.run_shell(&[declared.as_str()]);
+    let stderr = stderr_of(&out);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("lies inside"), "{stderr}");
+    assert!(stderr.contains(&sessions.display().to_string()), "{stderr}");
+    // The plan was rejected before any launch state was created.
+    assert!(!stderr.contains("[debug] sandbox config JSON:"), "{stderr}");
+}

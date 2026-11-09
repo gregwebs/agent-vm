@@ -76,6 +76,11 @@ crates/agent-vm/src/
 ├── image_publish.rs        # staging, native publication, requested-reference rollback
 ├── image_miss.rs           # registry-failure import hint
 ├── tools_cmd.rs            # tools verb group: `print` the built-in definitions as user TOML
+├── access_cmd.rs           # the `access` report: select, render and label refusals (ADR-0064)
+├── refusal.rs              # coalescing, entry keys, kinds, refusal IDs (pure)
+│   ├── log.rs              #   the project refusal log: flock, atomic replace, eviction
+│   └── feed.rs             #   follow network.log, one ordered persister thread, the hint
+├── session_control.rs      # the per-session control socket, protocol v1, discovery (ADR-0064)
 ├── msb_install.rs          # locate + version-verify the bundled msb; MSB_HOME
 ├── msb_preflight.rs        # fail fast on a forward-migrated msb.db
 ├── doctor.rs               # operator diagnostics and db recovery

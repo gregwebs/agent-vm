@@ -266,6 +266,15 @@ impl ProjectSession {
             .with_file_name(format!("{}.mounts", self.project_hash))
     }
 
+    /// This project's refusal artefacts: the control sockets and the project
+    /// refusal log (ADR-0064). A sibling of the guest-visible state directory —
+    /// like the secret and fork stores — so no guest bind reaches it by default,
+    /// and the ADR-0038 guard refuses one that would (`R1`/`R2`).
+    pub fn sessions_dir(&self) -> PathBuf {
+        self.state_dir
+            .with_file_name(format!("{}.sessions", self.project_hash))
+    }
+
     /// Host-absolute HOME for the non-root guest — `<state_dir>/home`. This
     /// is the *host-side bind source*; the guest-visible mount path is the
     /// mirrored host `$HOME` (e.g. `/Users/claude`), not this path — see

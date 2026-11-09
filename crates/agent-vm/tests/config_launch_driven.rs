@@ -5183,7 +5183,7 @@ fn doctor_tool_order(text: &str) -> Vec<String> {
 fn help_tool_order(text: &str) -> Vec<String> {
     // Fixed built-ins, including the direct runner (`run`, #398): the point of
     // this helper is the *catalog* launch verbs and their order.
-    const BUILTINS: [&str; 9] = [
+    const BUILTINS: [&str; 10] = [
         "setup",
         "msb",
         "clipboard",
@@ -5191,6 +5191,8 @@ fn help_tool_order(text: &str) -> Vec<String> {
         "secret",
         "image",
         "tools",
+        // `access` (ADR-0064) is a built-in report, not a catalog launch verb.
+        "access",
         "run",
         "help",
     ];
@@ -6719,11 +6721,14 @@ fn the_selection_is_scoped_to_user_home_not_state_or_cwd() {
 
     // A different project cwd and a different state root must not move the
     // bookmark: it is user-scoped, not cache- or project-scoped. The state root
-    // stays short, or the sandbox control socket exceeds `sun_path`.
+    // stays short, or the sandbox control socket exceeds `sun_path`. It is also
+    // a *sibling* of the cwd, not the cwd itself: a state root inside the project
+    // is refused now (ADR-0064 D2).
     let elsewhere = tempfile::tempdir_in("/tmp").unwrap();
+    let state = tempfile::tempdir_in("/tmp").unwrap();
     let mut cmd = harness.shared_command(&harness.state_root.join("msb-home/cache"));
     cmd.env("AGENT_VM_TEST_DEFAULT_IMAGE", recommendation_b())
-        .env("AGENT_VM_STATE_DIR", elsewhere.path())
+        .env("AGENT_VM_STATE_DIR", state.path())
         .current_dir(elsewhere.path());
     let out = Harness::run_on(cmd, &["shell"]);
     let stderr = stderr_of(&out);

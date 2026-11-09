@@ -88,6 +88,7 @@ fn stderr_of(out: &Output) -> String {
 
 fn state_tree(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     fn visit(root: &Path, path: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+        use std::os::unix::fs::FileTypeExt as _;
         for entry in std::fs::read_dir(path).unwrap() {
             let entry = entry.unwrap();
             let relative = entry.path().strip_prefix(root).unwrap().to_path_buf();
@@ -105,6 +106,10 @@ fn state_tree(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
                         .as_bytes()
                         .to_vec(),
                 ));
+            } else if metadata.file_type().is_socket() {
+                // A live session's control socket (ADR-0064): the kernel does not
+                // allow reading one, and it is not part of a fork's content.
+                out.push((relative, b"socket".to_vec()));
             } else {
                 out.push((relative, std::fs::read(entry.path()).unwrap()));
             }

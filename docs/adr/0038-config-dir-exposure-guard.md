@@ -5,7 +5,13 @@
 Accepted for [#323](https://github.com/gregwebs/agent-vm/issues/323), the guard
 half of #302 A2. This guard did not accept persisted `[network]` authority.
 Amended by [ADR-0040](0040-persisted-user-network-authority.md): #305 adds its verified user-tier read,
-without changing this guard. Breaking guard release: **0.3.0**.
+without changing this guard. Amended by
+[ADR-0064](0064-read-only-refusal-feed.md): the measured set gains the project's
+`<hash>.sessions` directory and `MSB_HOME`, and a bind in *any* mode whose root is
+or lies inside `.sessions` is refused, because a `:ro` bind of `refusals.json`,
+`refusals.lock` or a socket names one artefact whatever its mode says. Decision 1's
+writable-bind predicates and the `:ro`/`:fork` exemption for *ancestors* stand
+unchanged. Breaking guard release: **0.3.0** (ADR-0064's additions: **0.7.43**).
 
 ## Context
 

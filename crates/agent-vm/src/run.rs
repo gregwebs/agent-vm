@@ -975,6 +975,7 @@ pub(crate) async fn launch(
         // The same link list both provisioning sites consume, so the pre-fork
         // collision check cannot drift from the links that are actually created.
         crate::guest_home::PersistedHome::new(guest_home_path, &home_links),
+        launch_stores(&session)?,
     )?;
     // Selection is pure: it decides which declaration sources this launch asks
     // for (verified user `mounts` unless `--no-config-mounts`, then argv) and
@@ -1049,6 +1050,12 @@ pub(crate) async fn launch(
         }
         None => None,
     };
+    // ADR-0064: the session's control socket and refusal log exist before the
+    // sandbox does, so a session that is still starting cannot miss a change
+    // aimed at it (AC9), and every side-effect-free rejection above has already
+    // returned. It never fails the launch: a state root that cannot be adopted
+    // costs the feed, with one notice, and the VM still boots.
+    let live = crate::session_control::LiveSession::start(&session).await;
     // Pre-#96 projects hold a real `<state>/home/.pi` directory that the new
     // compiled link would refuse to replace. Runs before ensure_dirs so the
     // rename lands on a free name, and in BOTH guest modes. It is
@@ -1747,6 +1754,13 @@ pub(crate) async fn launch(
             return Err(label.redact_error("booting a sandbox from", error));
         }
     };
+    // ADR-0064: follow the runtime's own `network.log` from the moment the
+    // sandbox exists, and hand the whole teardown below one value that also
+    // finishes the feed (`LaunchTeardown::before_remove`). Every later teardown
+    // argument is `&teardown` so no path can remove the sandbox without first
+    // draining and persisting what it refused.
+    live.follow(&sandbox);
+    let teardown = crate::session_control::LaunchTeardown::new(&sandbox, &live);
     // One log location for every failure report below; `finish_failed_exec` is
     // the single owner of the `(full logs: …)` suffix.
     let log_dir = sandbox_log_dir(&session.sandbox_name).display().to_string();
@@ -1754,7 +1768,7 @@ pub(crate) async fn launch(
         live_launch_result(
             notices.emit(format!("[profile] create: {:?}", t_create.elapsed())),
             direct_launch,
-            &sandbox,
+            &teardown,
             &log_dir,
         )
         .await?;
@@ -1781,11 +1795,15 @@ pub(crate) async fn launch(
         };
         if direct_launch {
             // Same teardown as any other direct infrastructure failure.
-            return Err(finish_failed_exec(&sandbox, missing(), &log_dir).await);
+            return Err(finish_failed_exec(&teardown, missing(), &log_dir).await);
         }
         // The legacy route keeps its own stop-and-report behavior and its exact
-        // wording, including the log suffix it appends itself.
+        // wording, including the log suffix it appends itself. This branch stops
+        // without removing, so the sandbox outlives the command: the feed is
+        // finished here, or this session's `refusals.json` would trail the guest
+        // until `Drop`.
         let _ = sandbox.stop().await;
+        live.finish().await;
         return Err(anyhow::anyhow!("{:#}; full logs: {log_dir}", missing()));
     }
 
@@ -1810,7 +1828,7 @@ pub(crate) async fn launch(
         crate::secrets::sync_chrome_mcp(&session.state_dir, chrome_mcp_enabled)
             .context("synchronizing Chrome MCP configuration"),
         direct_launch,
-        &sandbox,
+        &teardown,
         &log_dir,
     )
     .await?;
@@ -1820,7 +1838,7 @@ pub(crate) async fn launch(
             .start_event_reporting(&sandbox)
             .context("starting auto-publish event reporting"),
         direct_launch,
-        &sandbox,
+        &teardown,
         &log_dir,
     )
     .await?;
@@ -1909,7 +1927,7 @@ pub(crate) async fn launch(
     let (_host_signal_guard, mut supervision) = if direct_launch {
         match crate::host_signals::install(crate::host_signals::GRACE) {
             Ok((guard, supervision)) => (Some(guard), supervision),
-            Err(error) => return Err(finish_failed_exec(&sandbox, error, &log_dir).await),
+            Err(error) => return Err(finish_failed_exec(&teardown, error, &log_dir).await),
         }
     } else {
         (None, Supervision::legacy())
@@ -1920,7 +1938,7 @@ pub(crate) async fn launch(
         live_launch_result(
             notices.emit(format!("==> Attaching to {command_display}")),
             direct_launch,
-            &sandbox,
+            &teardown,
             &log_dir,
         )
         .await?;
@@ -1964,7 +1982,7 @@ pub(crate) async fn launch(
                     contract_spawn_diagnostic(&image, &error),
                     error.context(format!("attaching to {command_display}")),
                 );
-                return Err(finish_failed_exec(&sandbox, primary, &log_dir).await);
+                return Err(finish_failed_exec(&teardown, primary, &log_dir).await);
             }
         };
         // The session is raced against the sandbox's own lifetime: a runtime
@@ -1977,7 +1995,7 @@ pub(crate) async fn launch(
                     contract_spawn_diagnostic(&image, &error),
                     error.context(format!("attaching to {command_display}")),
                 );
-                return Err(finish_failed_exec(&sandbox, primary, &log_dir).await);
+                return Err(finish_failed_exec(&teardown, primary, &log_dir).await);
             }
         }
     } else if exec_io == ExecIo::Attach {
@@ -1986,7 +2004,7 @@ pub(crate) async fn launch(
         live_launch_result(
             notices.emit(format!("==> Attaching to {command_display}")),
             direct_launch,
-            &sandbox,
+            &teardown,
             &log_dir,
         )
         .await?;
@@ -2005,7 +2023,7 @@ pub(crate) async fn launch(
                     contract_spawn_diagnostic(&image, &error),
                     error.context(format!("attaching to {command_display}")),
                 );
-                return Err(finish_failed_exec(&sandbox, primary, &log_dir).await);
+                return Err(finish_failed_exec(&teardown, primary, &log_dir).await);
             }
         }
     } else {
@@ -2032,7 +2050,7 @@ pub(crate) async fn launch(
         live_launch_result(
             notices.emit(running_notice),
             direct_launch,
-            &sandbox,
+            &teardown,
             &log_dir,
         )
         .await?;
@@ -2055,7 +2073,7 @@ pub(crate) async fn launch(
                     contract_spawn_diagnostic(&image, &error),
                     error.context(format!("running {command_display} in sandbox")),
                 );
-                return Err(finish_failed_exec(&sandbox, primary, &log_dir).await);
+                return Err(finish_failed_exec(&teardown, primary, &log_dir).await);
             }
         };
         let mut stdout = tokio::io::stdout();
@@ -2075,7 +2093,7 @@ pub(crate) async fn launch(
             StreamInput::NotForwarded
         };
         stream_exec_with_cleanup(
-            &sandbox,
+            &teardown,
             handle,
             runtime_exit,
             input,
@@ -2098,7 +2116,7 @@ pub(crate) async fn launch(
         live_launch_result(
             notices.emit(format!("[profile] run:    {:?}", t_run.elapsed())),
             direct_launch,
-            &sandbox,
+            &teardown,
             &log_dir,
         )
         .await?;
@@ -2106,7 +2124,7 @@ pub(crate) async fn launch(
 
     let exit = finish_launch(
         &mut notices,
-        &sandbox,
+        &teardown,
         ended,
         direct_launch,
         inner_cmd,
@@ -3703,6 +3721,7 @@ fn launch_mount_context(
     core_guest_mounts: Vec<PathBuf>,
     core_host_sources: Vec<CoreHostSource>,
     persisted_home: crate::guest_home::PersistedHome,
+    stores: Vec<crate::protected_config_dir::Store>,
 ) -> Result<mount::MountContext> {
     let authority_home = config::host_home_dir().context("locating the authority home")?;
     Ok(mount::MountContext {
@@ -3713,7 +3732,23 @@ fn launch_mount_context(
         core_guest_mounts,
         core_host_sources,
         persisted_home,
+        stores,
     })
+}
+
+/// The host-only stores this launch writes besides the authority directory:
+/// this project's `.sessions` directory and the runtime's own `MSB_HOME`
+/// (ADR-0064). Both are measured *before* they exist, so a state root inside
+/// the project or under a writable `--mount` is refused rather than adopted.
+fn launch_stores(session: &ProjectSession) -> Result<Vec<crate::protected_config_dir::Store>> {
+    use crate::protected_config_dir::{Store, StorePurpose};
+    Ok(vec![
+        Store::new(StorePurpose::ProjectSessions, session.sessions_dir()),
+        Store::new(
+            StorePurpose::RuntimeState,
+            crate::msb_install::msb_home_dir()?,
+        ),
+    ])
 }
 
 /// The production streaming lifecycle, opened for the subprocess cases in
@@ -3847,6 +3882,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             crate::guest_home::PersistedHome::none(),
+            Vec::new(),
         )
         .unwrap();
         let selected = context.authority_home.as_ref().expect("raw authority HOME");
@@ -4720,6 +4756,39 @@ mod tests {
         assert!(base_network < credential_network);
         assert!(credential_network < build);
         assert!(build < create);
+
+        // ADR-0064: the session's socket and log exist before the store read and
+        // before create (AC9), the feed starts the moment the sandbox does, and
+        // nothing between the two removes this session's sandbox without the
+        // teardown hook that finishes the feed.
+        let live_start = position("LiveSession::start(&session)");
+        let follow = position("live.follow(&sandbox);");
+        let log_dir = position("let log_dir = sandbox_log_dir(");
+        assert!(
+            live_start < create,
+            "the socket is bound before create (AC9)"
+        );
+        assert!(
+            create < follow,
+            "following starts with the sandbox, not before"
+        );
+        assert!(follow < log_dir);
+        // Every teardown argument after `live.follow` is the one value that also
+        // finishes the feed: a raw `&sandbox` there would remove the VM without
+        // draining or persisting what it refused.
+        let after_follow = &production[follow..];
+        assert!(
+            !after_follow.contains("\n            &sandbox,"),
+            "a teardown argument after `live.follow` still names `&sandbox`"
+        );
+        assert!(
+            !after_follow.contains("finish_failed_exec(&sandbox"),
+            "a failure path after `live.follow` still tears down `&sandbox`"
+        );
+        assert!(
+            after_follow.contains("LaunchTeardown::new(&sandbox, &live)"),
+            "the teardown value is the sandbox plus the feed"
+        );
     }
 
     #[test]
@@ -6127,6 +6196,7 @@ options ndots:2 timeout:1";
             core_guest_mounts: Vec::new(),
             core_host_sources: Vec::new(),
             persisted_home: crate::guest_home::PersistedHome::none(),
+            stores: Vec::new(),
         };
         let guest = PathBuf::from("/home/guest/.pi");
 
@@ -6210,6 +6280,7 @@ options ndots:2 timeout:1";
                     core_guest_mounts: Vec::new(),
                     core_host_sources: Vec::new(),
                     persisted_home: crate::guest_home::PersistedHome::none(),
+                    stores: Vec::new(),
                 },
             )
             .unwrap();
@@ -6256,6 +6327,7 @@ options ndots:2 timeout:1";
             core_guest_mounts: Vec::new(),
             core_host_sources: Vec::new(),
             persisted_home: crate::guest_home::PersistedHome::none(),
+            stores: Vec::new(),
         };
         let first = mount::prepare(
             mount::parse_extra_mounts(std::slice::from_ref(&raw)).unwrap(),
@@ -6305,6 +6377,7 @@ options ndots:2 timeout:1";
                 core_guest_mounts: Vec::new(),
                 core_host_sources: Vec::new(),
                 persisted_home: crate::guest_home::PersistedHome::none(),
+                stores: Vec::new(),
             },
         )
         .unwrap();

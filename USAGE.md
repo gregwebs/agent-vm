@@ -89,6 +89,8 @@ secret set SERVICE                  store or replace one of your own values in t
                                     host system keychain (hidden prompt, or pipe it on stdin)
 secret ls                           list the service names agent-vm has stored, and their status
 secret rm SERVICE                   remove one stored value
+access [--session ID] [--all]       show what the project's sandboxes refused,
+                                    live and from the project refusal log
 ```
 
 The launch verbs are generated from your tool configuration (see *Tool
@@ -2110,6 +2112,44 @@ other links or replace it with a copy. Non-launch verbs still work.
 aliases remain #322/#321. See [ADR-0038](docs/adr/0038-config-dir-exposure-guard.md)
 for the trusted boundary and accepted gaps.
 
+**Two more host-only stores are guarded (0.7.43).** The same rule now covers
+`MSB_HOME` (where the runtime writes every sandbox's refusal log) and this
+project's `<state root>/<hash>.sessions` directory (where `agent-vm access`
+reads them). In addition, a bind **in any mode** — `:ro` and `:fork` included —
+whose root is `<hash>.sessions` or lies inside it is refused, because a bind of
+`refusals.json`, `refusals.lock` or a `<sid>.sock` names one refusal artefact
+whatever its mode says. A `:ro`/`:fork` bind of a *strict ancestor* is still
+allowed: it can read the records, which hold no payloads, but cannot write them.
+See [ADR-0064](docs/adr/0064-read-only-refusal-feed.md) and
+[Moving the state root](#moving-the-state-root).
+
+### Moving the state root
+
+If your state root is inside the project you launch from, or under a writable
+`--mount`, every launch from there now refuses with a message naming
+`<hash>.sessions` and this section. Move it once:
+
+1. **Stop every session of the affected projects.** An older agent-vm installs
+   no guard, so a guest of a *running* session can still write `.sessions` while
+   you move its state.
+2. Choose a state root outside every project you launch from, for example
+   `export AGENT_VM_STATE_DIR=~/.avm`. Launching from, or mounting, a narrower
+   directory works too, and needs no move.
+3. Or move the existing root and point the variable at the new place:
+
+   ```bash
+   mv ~/.local/state/agent-vm ~/.avm && export AGENT_VM_STATE_DIR=~/.avm
+   ```
+
+   That one directory holds this project's state, `.secrets`, `.mounts`, image
+   pins and — when `AGENT_VM_STATE_DIR` was set — `msb-home`. The private
+   `msb.db` records absolute paths, so if the runtime rejects it, run
+   `agent-vm doctor --reset-msb-db`, which resets the runtime's own database
+   only: image approvals, secret stores and forks are untouched.
+4. An existing `.sessions` is adopted where it is, and only if it is a real
+   directory owned by you with mode exactly `0700`; anything else is not
+   adopted, and one notice says so.
+
 ### Host Pi credential files are never mounted
 
 Two host files must never reach the guest: `~/.pi/agent/auth.json` (Pi's
@@ -3598,6 +3638,86 @@ uses (`AGENT_VM_STATE_DIR`, else `$XDG_STATE_HOME/agent-vm`, else
 `AGENT_VM_STATE_DIR` is refused and a relative `XDG_STATE_HOME` is ignored. A
 directory whose path contains a comma is skipped with a warning —
 `CLAUDE_CONFIG_DIR` is comma-separated with no way to escape one.
+
+## Seeing what the sandbox refused
+
+The runtime refuses a guest's egress attempt and records why: the site that
+decided, whether the policy was yours or the platform's, the protocol, the
+destination, and any name the guest supplied. `agent-vm access` shows that list
+for the current project — from the sessions running right now, and from the
+project's own refusal log afterwards.
+
+```bash
+agent-vm access                       # the last 24 hours
+agent-vm access --all                 # the whole retained log
+agent-vm access --session 3f9a12c4    # one live or logged session
+```
+
+```text
+ID        KIND            DESTINATION                                                         COUNT  LAST-SEEN          SESSION          ACTION
+46d712fd  network denial  tcp 203.0.113.10:443 · api.example.com (DNS cache, guest-supplied)  3      2025-10-09 08:52Z  running          no grant in this version; relaunch with --allow-egress
+88f5da9d  network denial  tcp cdn.example:443 (SNI, guest-supplied) · last IP 198.51.100.8    1      2025-10-09 08:51Z  ended (unclean)  no grant in this version; relaunch with --allow-egress
+a00b2078  policy lock     tcp 10.0.0.7:53                                                     1      2025-10-09 08:49Z  ended            can't be allowed: platform policy
+```
+
+**Refusals coalesce.** One row is one destination in one session. The
+destination is what an allowance would have to name, so a name the guest supplied
+over TLS SNI or an HTTP `Host` is the destination, with the address kept as
+evidence; a DNS answer the guest's own resolver produced is evidence, and the
+address is the destination; a name the guest asked the resolver for is the
+destination. Every guest-supplied name is marked and escaped — it is text, never
+a fact.
+
+**The ID is stable.** Eight hex digits, derived once from the session and the
+destination, stored in the log and never recomputed, so a row you copied from a
+run is the same row after the session ends. The same ID appearing in two sessions
+is flagged in a footer and never renamed.
+
+**The session column** is one of `running`, `running (no control socket)`,
+`ended`, `ended (unclean)` or `not responding`. A session that bound no control
+socket (a state root too deep for the kernel's socket path limit, or a busy log)
+is still listed from the log while its heartbeat is fresh; one that stopped
+without cleaning up is `ended (unclean)`.
+
+**The action column says why nothing can be done yet.** This release grants
+nothing: it lists refusals and names the reason. `no grant in this version;
+relaunch with --allow-egress` is a network denial an allowance will cover later;
+`can't be allowed: platform policy` is the deployment floor; `can't be allowed
+here: credential policy` is the credential boundary; `can't be allowed: built-in
+rule <site>` is an engine rule no allowance reaches.
+
+**Footers, never rows.** A count appears under the table when the runtime decided
+refusals it did not write (`suppressed`), when a session hit its per-session limit
+(`lost`), when the log rotated past what the launcher could read (`some refusals
+were missed (count unknown)`), and when whole sessions were evicted to keep the
+log bounded. A missed rotation cannot be counted — the records are gone — so the
+footer says so instead of inventing a number.
+
+**One hint.** The first refusal in a session prints once on stderr:
+
+```text
+==> The sandbox refused a guest network request; run `agent-vm access` to see refusals (shown once per session)
+```
+
+**Where it lives.** `<state root>/<hash>.sessions/`: `refusals.json` (the log)
+and one `<sid>.sock` per running session. The directory is `0700`, the socket
+`0600`, the peer's UID must match yours, and there is no TCP listener. See
+[ADR-0064](docs/adr/0064-read-only-refusal-feed.md).
+
+**When it degrades.** Nothing here can fail a launch, and each failure costs a
+named part of the feature. Precisely what happens:
+
+| What went wrong | What you see, and what you lose |
+|---|---|
+| The `.sessions` directory cannot be created or adopted (not a real directory, another owner, a mode other than `0700`) | One notice naming it. This session has no log and no socket, and `agent-vm access` never lists it. |
+| The socket path is longer than the kernel allows | The runtime's own control socket path is twelve bytes longer than this one, so a state root deep enough to overflow the launcher's socket is refused before this feature runs, with its own error naming the fix. Should the launcher's socket alone ever be over budget, it prints one notice, keeps recording to the log, and you lose the live view, not the record. |
+| Another session holds the log lock when this one starts | One notice. No live view; this session's refusals are still recorded, on a later attempt at the lock. |
+| A write to the log fails (full disk, permissions, a lock held elsewhere) | One warning on stderr, worded as "this session's refusals are not being recorded", and a second one only after a write succeeds again. The live view keeps working for as long as the session runs; whatever was not written is lost when it ends. |
+| The log on disk cannot be used (not a regular file, larger than 2 MiB, not decodable, or below this build's version) | `agent-vm access` prints one warning naming the file and says the sessions it held are not listed. Only a later write from a session replaces a damaged file, keeping the old one as `refusals.json.damaged`. |
+| The log was written by a *newer* agent-vm | One warning; the file is read but never replaced. A newer file whose contents this build cannot fully decode is still recognised as newer, from its version alone, and still never replaced. |
+| A reader cannot keep up | It is dropped, or resynchronised with a whole snapshot. Nobody else is slowed. |
+| The runtime's own log cannot be read for a while | The session's rows stay listed and gain `some refusals were missed (count unknown)`; a late record is never counted twice. |
+| A write evicts sessions to stay in bounds | A footer counts the sessions whose records are **gone**. A live session that is evicted is written back by its owner and is not counted. |
 
 ## Ports & egress
 

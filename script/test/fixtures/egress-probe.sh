@@ -754,6 +754,7 @@ _case_dispatch() {
     local gw hmi=host.microsandbox.internal proto expected
     case "$case_id" in
         P0) _case_preflight; return $? ;;
+        RF1) _case_refusal_feed; return $? ;;
         CL1) sleep 600; return $? ;;
         HK1|HK1c|HK2|HK2c) return 0 ;; # the sourced project hook owns the attempt
     esac
@@ -1027,6 +1028,22 @@ _case_dispatch() {
         PXH1) return 0 ;; # validation-only: no guest probe runs
         *) echo "CASE $case_id UNKNOWN"; return "$PROBE_USAGE" ;;
     esac
+}
+
+# ADR-0064 RF1: the read-only refusal feed. Two refusals a reader will
+# recognise — a refused TCP connect and a refused DNS lookup — then a sleep long
+# enough for the harness to ask the *host* what the live session refused. Both
+# probes ignore their own outcome: a refusal is the expected result, and this
+# case's evidence is the host-side table, not the probe's exit status. Each is
+# bounded, because a silently dropped SYN must not eat the harness's deadline.
+_case_refusal_feed() {
+    local rc=0
+    timeout --kill-after=1 5 bash -c 'exec 3<>/dev/tcp/203.0.113.10/443' || true
+    timeout --kill-after=1 5 getent hosts blocked.example >/dev/null 2>&1 || true
+    echo "RF1 READY"
+    sleep "${RF1_SLEEP:-25}"
+    echo "RF1 DONE"
+    return "$rc"
 }
 
 dispatch() {

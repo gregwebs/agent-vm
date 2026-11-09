@@ -244,6 +244,9 @@ pub(crate) enum Cmd {
     /// Print the built-in tool definitions as user-config TOML.
     Tools(crate::tools_cmd::Args),
 
+    /// Show what the project's sandboxes refused, live and after they ended.
+    Access(crate::access_cmd::Args),
+
     /// Internal: invoked by msb's interceptor hook for matched OAuth
     /// and scoped GitHub requests. Reads stdin and writes the protocol
     /// response on stdout. Not meant for direct use.
@@ -335,6 +338,7 @@ pub(crate) const BUILTIN_SUBCOMMANDS: &[&str] = &[
     "secret",
     "image",
     "tools",
+    "access",
     "_intercept-hook",
     // The direct runner (issue #398) is a fixed launch route, so it is a
     // built-in *name* even though its target is user-supplied argv.
@@ -703,6 +707,7 @@ fn reconcile_image_args(sub: &clap::ArgMatches, cmd: &mut Cmd) {
         | Cmd::Doctor(_)
         | Cmd::Secret(_)
         | Cmd::Tools(_)
+        | Cmd::Access(_)
         | Cmd::InterceptHook(_) => {}
     }
 }
@@ -1348,6 +1353,7 @@ fn validate_builtin_args(command: &clap::Command, cmd: &Cmd) -> Result<()> {
         | Cmd::Doctor(_)
         | Cmd::Secret(_)
         | Cmd::Tools(_)
+        | Cmd::Access(_)
         | Cmd::InterceptHook(_) => Ok(()),
     };
     validated.map_err(|error| {
@@ -2999,6 +3005,7 @@ mod tests {
                 "secret",
                 "image",
                 "tools",
+                "access",
                 "_intercept-hook",
                 "run",
                 "shell",
@@ -3151,6 +3158,7 @@ mod tests {
             "secret",
             "image",
             "tools",
+            "access",
         ] {
             assert!(help.contains(builtin), "missing builtin {builtin}: {help}");
         }

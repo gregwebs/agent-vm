@@ -119,6 +119,7 @@ struct Before {
 /// missing root contributes nothing — several of these trees legitimately do
 /// not exist before a launch.
 fn tree_of(label: &str, root: &Path, out: &mut Snapshot) {
+    use std::os::unix::fs::FileTypeExt as _;
     let Ok(read) = std::fs::read_dir(root) else {
         return;
     };
@@ -139,6 +140,10 @@ fn tree_of(label: &str, root: &Path, out: &mut Snapshot) {
             // `OsStr`'s `Debug` renders the raw bytes, so a non-UTF-8 target
             // still compares exactly instead of collapsing to U+FFFD.
             format!("symlink:{:?}", target.as_os_str())
+        } else if metadata.file_type().is_socket() {
+            // A live session's control socket (ADR-0064) is part of the tree, and
+            // reading one is not a filesystem operation the kernel allows.
+            "socket".to_string()
         } else {
             let bytes = std::fs::read(entry.path()).unwrap();
             format!("file:{}:{:016x}", bytes.len(), digest(&bytes))

@@ -912,6 +912,48 @@ setting, read only from a verified file and merged per launch. CLI flags overrid
 persisted Boolean values and add allowances for that launch; launches never
 write grants back. The project tier refuses `[network]`.
 See [ADR-0040](docs/adr/0040-persisted-user-network-authority.md).
+
+**Session**: one launch — one launcher process and its VM, from boot to
+teardown. A relaunch is a new session; there is no resume.
+
+**Session allowance**: a network allowance that lives only as long as its
+session and is never persisted.
+
+**Project allowance**: a permanent network allowance (until revoked, no expiry)
+bound to one project's path identity, whatever tool is launched. A moved or
+copied project does not inherit it. Its authorization record is host-controlled
+and unreachable from any guest bind. Host-wide breadth is never granted from a
+live approval.
+
+**Sandbox refusal**: any refusal the sandbox imposes on the guest and can
+report. Its kinds are **network denial**, **policy lock** (administrator or
+platform), **credential refusal** and **GitHub repository refusal**; only a
+network denial can be lifted by an allowance. Showing a refusal never
+authorizes anything.
+
+_Avoid_: "block" as a noun ("sandbox block"); "denial" for the non-network
+kinds.
+
+**Refusal ID**: the 8-hex ID of one entry in the **project refusal log**,
+derived once from `(session, (kind, destination))` and then stored, never
+recomputed. It coalesces every refusal of that destination in that session, so it
+names a row a reader can quote and a later slice can grant against. The same
+destination in another session gets a different ID; the same ID appearing in two
+sessions is flagged in a footer and never renamed. See
+[ADR-0064](docs/adr/0064-read-only-refusal-feed.md).
+
+**Project refusal log**: the launcher's own bounded copy of what this project's
+sessions refused — `<state root>/<hash>.sessions/refusals.json`, a host-only
+sibling of the guest-visible state directory, beside `<hash>.secrets` and
+`<hash>.mounts`. It exists because the runtime's `network.log` dies with its
+sandbox; it is a *display* store, so it self-heals (a damaged file is set aside
+and rewritten) where an authority store refuses. Its directory also holds the
+**session control sockets** `<hash>.sessions/<sid>.sock` that `agent-vm access`
+dials, owned by the launcher and never TCP. A guest bind cannot write it.
+
+_Avoid_: "block log", "refusal cache" (it is the record, not a cache of one), and
+"refusal list" for anything but the rendered table.
+
 See [ADR-0036](docs/adr/0036-default-deny-launch-egress.md) for DNS limitations and
 [ADR-0037](docs/adr/0037-hostname-egress-allowances.md) for hostname allowances;
 [ADR-0039](docs/adr/0039-non-authoritative-tool-network-requests.md) for requests.

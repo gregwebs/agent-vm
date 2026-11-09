@@ -1,5 +1,6 @@
 //! agent-vm — sandboxed microVMs for AI coding agents on microsandbox.
 
+mod access_cmd;
 mod boot_image;
 mod cli;
 mod clipboard;
@@ -63,11 +64,13 @@ mod protected_config_dir;
 mod protected_host_files;
 mod pull;
 mod pull_progress;
+mod refusal;
 mod run;
 mod secret;
 mod secret_store;
 mod secrets;
 mod session;
+mod session_control;
 mod setup;
 mod shell;
 #[cfg(test)]
@@ -196,6 +199,18 @@ fn run_dispatch(dispatch: Dispatch) -> Result<()> {
         return exit_with(secret::run(args)?);
     }
 
+    // `access` reads this project's refusal log and dials its control sockets. It
+    // needs no msb, no image and no config — the moment a user needs it is the
+    // moment something else is broken (ADR-0064, AC13) — so it returns before
+    // credential preflight, `point_at_msb` and the runtime.
+    if let Dispatch::Builtin {
+        cmd: crate::cli::Cmd::Access(args),
+        ..
+    } = dispatch
+    {
+        return exit_with(access_cmd::run(args)?);
+    }
+
     // `tools print` prints the definitions compiled into this binary (#510), so the
     // discovered config's result cannot matter: it returns before credential
     // preflight, the MSB prologue, state creation and the runtime. The carried
@@ -267,7 +282,7 @@ fn run_dispatch(dispatch: Dispatch) -> Result<()> {
     let needs_msb_setup = !matches!(
         dispatch,
         Dispatch::Builtin {
-            cmd: Cmd::InterceptHook(_) | Cmd::Clipboard(_),
+            cmd: Cmd::InterceptHook(_) | Cmd::Clipboard(_) | Cmd::Access(_),
             ..
         }
     );
@@ -365,6 +380,12 @@ fn run_dispatch(dispatch: Dispatch) -> Result<()> {
                 cmd: Cmd::Tools(_), ..
             } => {
                 unreachable!("Cmd::Tools is dispatched pre-runtime, see above")
+            }
+            Dispatch::Builtin {
+                cmd: Cmd::Access(_),
+                ..
+            } => {
+                unreachable!("Cmd::Access is dispatched pre-runtime, see above")
             }
         }
     })

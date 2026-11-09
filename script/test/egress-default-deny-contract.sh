@@ -42,11 +42,13 @@ with tempfile.TemporaryDirectory(prefix="egress-outside-") as tmp:
         "HP1 HP2 HP2c HP3 HP4 HP5 HP6 HP6c PXH1").split()}
     expected |= {("RB2", variant) for variant in
                  ("hostname-only", "lan", "udp", "tcp", "port", "tcp-port")}
+    # ADR-0064: the refusal feed and its unclean-end variant.
+    expected |= {("RF1", variant) for variant in ("ipv4", "kill9")}
     output = subprocess.check_output(["bash", str(root / "script/test/egress-default-deny.sh"),
                                       "--print-plan"], text=True, timeout=10)
     rows = [json.loads(line) for line in output.splitlines()]
     cases = [row for row in rows if row["kind"] != "admin"]
-    assert len(cases) == len(expected) == 80
+    assert len(cases) == len(expected) == 82
     assert {(row["case"], row["variant"]) for row in cases} == expected
     base = {"HOME", "XDG_CONFIG_HOME", "AGENT_VM_STATE_DIR", "PATH", "TERM", "AGENT_VM_SHARE_MSB_CACHE"}
     for row in cases:
@@ -88,15 +90,17 @@ with tempfile.TemporaryDirectory(prefix="egress-outside-") as tmp:
                                             "--smoke", "--print-plan"], text=True, timeout=10)
     smoke = [json.loads(line) for line in smoke_output.splitlines()]
     smoke_cases = [row for row in smoke if row["kind"] != "admin"]
-    smoke_expected = {(case, "ipv4") for case in ("P0", "LC1", "HC1", "I1", "D1", "L1", "NR1", "NR2", "NR3")}
-    assert len(smoke_cases) == 9 and {(row["case"], row["variant"]) for row in smoke_cases} == smoke_expected
+    smoke_expected = {(case, "ipv4") for case in ("P0", "LC1", "HC1", "I1", "D1", "L1", "NR1",
+                                                  "NR2", "NR3")}
+    smoke_expected |= {("RF1", variant) for variant in ("ipv4", "kill9")}
+    assert len(smoke_cases) == 11 and {(row["case"], row["variant"]) for row in smoke_cases} == smoke_expected
     assert len([row for row in smoke if row["kind"] == "admin"]) == 9
     assert {(row["case"], row["variant"]) for row in smoke if row["kind"] == "admin"} == expected_admin
     for row in smoke_cases:
         if row["case"] in ("NR1", "NR2", "NR3"):
             # Full-row equality also pins argv, cwd, tools and grant semantics.
             assert row == next(full for full in cases if full["case"] == row["case"])
-    print("host-only per-case print-plan inventory PASS: 80 cases, 9 admin objects; smoke 9 cases, 9 admin objects")
+    print("host-only per-case print-plan inventory PASS: 82 cases, 9 admin objects; smoke 11 cases, 9 admin objects")
 PY
 
 # Primitive status/wire controls and dispatcher expectations are complementary:

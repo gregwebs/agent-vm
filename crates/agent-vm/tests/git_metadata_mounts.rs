@@ -24,6 +24,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Read;
+use std::os::unix::fs::FileTypeExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -220,6 +221,10 @@ fn tree_of(label: &str, root: &Path, out: &mut Snapshot) {
         } else if metadata.file_type().is_symlink() {
             let target = std::fs::read_link(entry.path()).unwrap();
             format!("symlink:{mode:o}:{:?}", target.as_os_str())
+        } else if metadata.file_type().is_socket() {
+            // A live session's control socket (ADR-0064) is part of the tree, and
+            // reading one is not a filesystem operation the kernel allows.
+            format!("socket:{mode:o}")
         } else {
             let bytes = std::fs::read(entry.path()).unwrap();
             format!("file:{mode:o}:{}:{:016x}", bytes.len(), digest(&bytes))

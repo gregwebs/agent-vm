@@ -3972,6 +3972,10 @@ pub(crate) struct MountContext {
     /// against every destination before any fork is published
     /// ([`crate::guest_home::PersistedHome`]).
     pub(crate) persisted_home: crate::guest_home::PersistedHome,
+    /// host-only stores a writable bind must not reach: this project's
+    /// `.sessions` directory and `MSB_HOME`, beside the per-`$HOME` authority
+    /// directory `prepare` measures itself (ADR-0064).
+    pub(crate) stores: Vec<crate::protected_config_dir::Store>,
 }
 
 /// Normalize the guest spelling before it participates in identity or
@@ -4249,10 +4253,14 @@ pub(crate) fn prepare(
         .cloned()
         .collect();
     let cwd = std::env::current_dir().context("reading the launch directory")?;
-    let config_dir = crate::protected_config_dir::ProtectedConfigDir::measure(&homes, &cwd)?;
+    let config_dir =
+        crate::protected_config_dir::ProtectedConfigDir::measure(&homes, &context.stores, &cwd)?;
     config_dir.check_authority_links()?;
     for source in &context.core_host_sources {
         config_dir.check_core_bind(source)?;
+        // R2 (ADR-0064): `.sessions` is refused in every mode, so this is not
+        // part of the writable-bind loop below.
+        config_dir.check_core_bind_names_sessions(source)?;
     }
 
     // Reject and deduplicate explicit claims before touching the store/source.
@@ -4350,6 +4358,15 @@ pub(crate) fn prepare(
             declaration_origin(mount, &origins),
             &mount.source_spelling,
             &mount.spelled_host,
+            &mount.host,
+        )?;
+    }
+    // R2 (ADR-0064): *every* mode, including `:ro` and `:fork`, because a bind
+    // at or inside `.sessions` names one refusal file whatever its mode says.
+    for mount in &expanded {
+        config_dir.check_mount_names_sessions(
+            declaration_origin(mount, &origins),
+            &mount.source_spelling,
             &mount.host,
         )?;
     }
@@ -5912,6 +5929,7 @@ mod prepare_tests {
             core_guest_mounts: Vec::new(),
             core_host_sources: Vec::new(),
             persisted_home: crate::guest_home::PersistedHome::none(),
+            stores: Vec::new(),
         }
     }
 
@@ -5938,6 +5956,7 @@ mod prepare_tests {
             core_guest_mounts: Vec::new(),
             core_host_sources: Vec::new(),
             persisted_home: crate::guest_home::PersistedHome::none(),
+            stores: Vec::new(),
         }
     }
 
@@ -6854,6 +6873,7 @@ mod prepare_tests {
                 core_guest_mounts: vec![target],
                 core_host_sources: Vec::new(),
                 persisted_home: crate::guest_home::PersistedHome::none(),
+                stores: Vec::new(),
             };
 
             let error =
@@ -7002,6 +7022,7 @@ mod prepare_tests {
                         core_guest_mounts: vec![root.path().join("core-child")],
                         core_host_sources: Vec::new(),
                         persisted_home: crate::guest_home::PersistedHome::none(),
+                        stores: Vec::new(),
                     },
                 );
                 assert!(
@@ -7090,6 +7111,7 @@ mod prepare_tests {
                 core_guest_mounts: Vec::new(),
                 core_host_sources: Vec::new(),
                 persisted_home: crate::guest_home::PersistedHome::none(),
+                stores: Vec::new(),
             },
         )
         .unwrap_err();
@@ -10441,6 +10463,7 @@ mod config_dir_guard_tests {
                 core_guest_mounts: vec![],
                 core_host_sources: sources,
                 persisted_home: crate::guest_home::PersistedHome::none(),
+                stores: Vec::new(),
             }
         }
         fn refused(&self, requests: Vec<ExtraMount>, context: &MountContext, text: &str) {
