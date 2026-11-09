@@ -532,14 +532,21 @@ impl Log {
 
 /// Whether `<sid>.sock` is gone from `dir`.
 ///
+/// The hidden name counts too: a session binds `<sid>.sock.tmp` and renames it
+/// into place, so between its reservation's write and that rename its visible
+/// socket does not exist yet. Without this, another session writing in that
+/// window would prune the reservation as an empty session with no socket.
+///
 /// Only a `NotFound` answer counts: the rule prunes a session whose socket is
 /// *gone*, so a directory that cannot be read keeps the record rather than
 /// dropping one that may still be reachable.
 fn socket_gone(dir: &Path, sid: &str) -> bool {
-    match std::fs::symlink_metadata(dir.join(format!("{sid}.sock"))) {
-        Ok(_) => false,
-        Err(error) => error.kind() == ErrorKind::NotFound,
-    }
+    [format!("{sid}.sock"), format!("{sid}.sock.tmp")]
+        .into_iter()
+        .all(|name| match std::fs::symlink_metadata(dir.join(name)) {
+            Ok(_) => false,
+            Err(error) => error.kind() == ErrorKind::NotFound,
+        })
 }
 
 /// When this session was last doing anything at all.

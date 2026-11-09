@@ -639,6 +639,10 @@ fn prune_drops_history_and_keeps_the_writer() {
     std::os::unix::net::UnixListener::bind(dir.socket_path(&sid("00000005"))).unwrap();
     dir.write(&session("00000005", true), NOW).unwrap();
     dir.write(&session("00000004", true), NOW).unwrap();
+    // A session that has reserved its ID and bound the hidden name but not yet
+    // renamed it into place is not an empty session without a socket.
+    std::os::unix::net::UnixListener::bind(dir.path().join("00000006.sock.tmp")).unwrap();
+    dir.write(&session("00000006", true), NOW).unwrap();
     dir.write(&own, NOW).unwrap();
     let log = dir.read().unwrap();
     let ids: Vec<&str> = log
@@ -648,4 +652,8 @@ fn prune_drops_history_and_keeps_the_writer() {
         .collect();
     assert!(!ids.contains(&"00000004"), "no socket, no entries: {ids:?}");
     assert!(ids.contains(&"00000005"), "its socket is live: {ids:?}");
+    assert!(
+        ids.contains(&"00000006"),
+        "a socket bound but not yet renamed is not gone: {ids:?}"
+    );
 }
