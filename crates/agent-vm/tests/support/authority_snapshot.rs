@@ -50,13 +50,12 @@ pub fn take(dir: &Path) -> Snapshot {
         let entry = entry.expect("a directory entry");
         let path = entry.path();
         let metadata = std::fs::symlink_metadata(&path).expect("lstat");
-        let content = if metadata.file_type().is_symlink() {
-            Some(std::fs::read_link(&path).expect("readlink"))
-        } else if metadata.file_type().is_file() {
-            None
-        } else {
-            None
-        };
+        // Only a symlink has a target to record; a regular file's *bytes* are
+        // appended below, and everything else is recorded by its facts alone.
+        let content = metadata
+            .file_type()
+            .is_symlink()
+            .then(|| std::fs::read_link(&path).expect("readlink"));
         let rendered = render(&metadata, content.as_deref());
         // Only a regular file is ever opened, and its bytes are part of the
         // evidence: a rewritten file with the same size must still differ.

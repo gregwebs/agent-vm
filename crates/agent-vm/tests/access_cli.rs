@@ -216,10 +216,7 @@ mod authority_snapshot;
 /// second, because the first is never read by this command.
 fn home_with_authority_dir(root: &Path) -> (PathBuf, PathBuf) {
     let home = broken_home(root);
-    let dir = home.join(".config/agent-vm");
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let dir = authority_snapshot::empty_authority_dir(&home);
     (home, dir)
 }
 

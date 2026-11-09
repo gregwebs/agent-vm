@@ -14392,7 +14392,8 @@ fn project_allowance_degraded_store_warns_once_and_reaches_build() {
     // One well-formed record and one that does not parse, so "the configured
     // rules only" is distinguishable from "the whole file was dropped".
     let good = |h: &Harness| allowance_record(&h.project_root, "tcp://[203.0.113.10/32]:443");
-    let cases: Vec<(&str, Box<dyn Fn(&Harness) -> PathBuf>)> = vec![
+    type Seed = Box<dyn Fn(&Harness) -> PathBuf>;
+    let cases: Vec<(&str, Seed)> = vec![
         (
             "undecodable",
             Box::new(move |h| h.seed_allowances("this is not json")),
