@@ -173,8 +173,8 @@ def matrix():
     proxy = rust("hostname_proxy_selection_mirrors_the_host_connector")
     add("domain-all-ports", hostname, "ports: effective.into_iter().map(PortRange::single).collect(),", "ports: vec![],", shape)
     add("domain-any-protocol", hostname, "protocols: vec![Protocol::Tcp],", "protocols: vec![],", shape)
-    add("domain-first", EGRESS, "rules.extend(domain_rules(&self.hostnames, &ports));", "rules.splice(0..0, domain_rules(&self.hostnames, &ports));", shape)
-    add("hostname-dns", EGRESS, "rules.extend(domain_rules(&self.hostnames, &ports));", "rules.push(Rule::allow_dns()); rules.extend(domain_rules(&self.hostnames, &ports));", shape)
+    add("domain-first", EGRESS, "rules.extend(domain_rules(&self.effective.hostnames, &ports));", "rules.splice(0..0, domain_rules(&self.hostnames, &ports));", shape)
+    add("hostname-dns", EGRESS, "rules.extend(domain_rules(&self.effective.hostnames, &ports));", "rules.push(Rule::allow_dns()); rules.extend(domain_rules(&self.effective.hostnames, &ports));", shape)
     add("tls-ports-missing", NETWORK, "Some(ports) => tls.intercepted_ports(ports.clone()),", "Some(_) => tls,", rust("hostname_launch_keeps_strict_and_intercepts_every_domain_port"))
     add("tls-off", NETWORK, "let enable_tls = !publish_ports.is_empty() || hostname_ports.is_some();", "let enable_tls = !publish_ports.is_empty();", rust("hostname_launch_keeps_strict_and_intercepts_every_domain_port"))
     add("bare-port-443-only", hostname, "HostnameScope::InterceptedPorts => ports.to_vec(),", "HostnameScope::InterceptedPorts => { let _ = ports; vec![443] },", shape)
@@ -244,10 +244,10 @@ def matrix():
     g4 = rust("rejected_allowance_is_refused_before_launch_state_is_created", LAUNCH)
     for name, suffix in (("project", ""), ("mounts", ".mounts"), ("secrets", ".secrets")):
         add("preparse-" + name, SRC + "run.rs",
-            "\n    let network_plan = crate::network::Plan::from_args(args.network, user_network, user_tools)?;",
+            "\n    let mut network_plan = crate::network::Plan::from_args(args.network, user_network, user_tools)?;",
             '\n    let early = ProjectSession::for_cwd()?;\n    std::fs::create_dir_all(' +
             ('&early.state_dir' if not suffix else 'early.state_dir.with_extension("' + suffix[1:] + '")') +
-            ')?;\n    let network_plan = crate::network::Plan::from_args(args.network, user_network, user_tools)?;', g4)
+            ')?;\n    let mut network_plan = crate::network::Plan::from_args(args.network, user_network, user_tools)?;', g4)
     add("valid-no-fork", TEST,
         '&["--mount", &mount, "--allow-egress", "api.example.com"],',
         '&["--allow-egress", "api.example.com"],', g4)
@@ -615,8 +615,12 @@ def matrix():
         rust("mount_set_expansion_work_boundary"))
     add("mount-sets-budget-off-by-one-proof", sets_source, budget_body, budget_mutant,
         gate, "verification results::")
-    add("descriptor-reopen", SRC + "host_paths.rs", "            after_open();",
-        "            after_open(); drop(fd); let fd = rfs::open(path, OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC, Mode::empty())?;",
+    # The anchor names the *noting-symlink* reader's checkpoint plus the line it
+    # exists for: #557 added a second checkpointed reader, so a bare
+    # `after_open();` is no longer one statement.
+    add("descriptor-reopen", SRC + "host_paths.rs",
+        "            after_open();\n            read_regular_no_follow_fd(fd, path, max).map(|(bytes, facts)| VerifiedRead {",
+        "            after_open(); drop(fd); let fd = rfs::open(path, OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC, Mode::empty())?;\n            read_regular_no_follow_fd(fd, path, max).map(|(bytes, facts)| VerifiedRead {",
         rust("noting_symlink_takes_bytes_and_facts_from_the_opened_descriptor"))
     # The built-in tier's refusals moved into the one routine both non-user tiers
     # share (#396), so the anchor is that routine's network arm — still the exact
