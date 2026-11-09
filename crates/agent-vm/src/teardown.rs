@@ -68,6 +68,17 @@ const EXEC_KILL_TIMEOUT: Duration = Duration::from_secs(5);
 const EXEC_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 const EXEC_REMOVE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The backstop for [`ExecTeardown::before_remove`], the only teardown step whose
+/// own work has several bounded parts.
+///
+/// A backstop, not a budget: `before_remove` bounds each of its own steps
+/// (a 2 s drain, a 2 s wait for the final write, a 2.5 s close) and this only
+/// fires if one of those bounds is itself broken — a wait tokio cannot cancel, or
+/// a blocking call on a worker thread. Without it the step was the one teardown
+/// operation with no deadline at all, in both modes, including the one a user
+/// reaches by pressing Ctrl-C twice.
+pub(crate) const EXEC_RECORD_TIMEOUT: Duration = Duration::from_secs(7);
+
 /// Which teardown a session's end demands.
 ///
 /// One owner, two modes: this is not a second teardown path, it is the same order
@@ -135,7 +146,19 @@ pub(crate) async fn cleanup_exec_sandbox_failures(
     }
     // Between the reap and the remove: the producer has stopped, so whatever it
     // wrote is on disk to be read, and the sandbox's log directory still exists.
-    teardown.before_remove().await;
+    //
+    // A timeout here is deliberately **not** a teardown failure: the refusal feed
+    // cannot fail a launch (AC14), so the record being late is a lost record and
+    // never a refused remove. The remove below still runs, which is the whole
+    // point of bounding this step.
+    if tokio::time::timeout(EXEC_RECORD_TIMEOUT, teardown.before_remove())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            "recording the session's last refusals did not finish within {EXEC_RECORD_TIMEOUT:?}; removing the sandbox anyway"
+        );
+    }
     match tokio::time::timeout(EXEC_REMOVE_TIMEOUT, teardown.remove()).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => failures.push(format!("remove: {error}")),
@@ -245,6 +268,62 @@ mod tests {
             } else {
                 assert!(failures.is_empty(), "{failures:?}");
             }
+        }
+    }
+
+    /// The record step is the only teardown operation whose own work has several
+    /// parts, and it used to be the only one with no deadline. A step that never
+    /// returns must not stop the sandbox being removed — in either mode.
+    #[test]
+    fn a_wedged_record_step_is_cut_off_and_the_sandbox_still_removed() {
+        struct Wedged(Mutex<Vec<&'static str>>);
+        impl ExecTeardown for Wedged {
+            async fn stop_and_wait(&self) -> Result<()> {
+                self.0.lock().unwrap().push("stop");
+                Ok(())
+            }
+            async fn kill_with_timeout(&self, _t: Duration) -> Result<()> {
+                self.0.lock().unwrap().push("kill");
+                Ok(())
+            }
+            async fn wait(&self) -> Result<()> {
+                self.0.lock().unwrap().push("reap");
+                Ok(())
+            }
+            async fn remove(&self) -> Result<()> {
+                self.0.lock().unwrap().push("remove");
+                Ok(())
+            }
+            async fn before_remove(&self) {
+                // The failure mode: a blocking wait that no bound inside the step
+                // can cancel.
+                futures::future::pending::<()>().await
+            }
+        }
+        for mode in [TeardownMode::Ordinary, TeardownMode::Forced] {
+            let wedged = Wedged(Mutex::new(Vec::new()));
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                tokio::time::pause();
+                let started = tokio::time::Instant::now();
+                let failures = cleanup_exec_sandbox_failures(&wedged, mode).await;
+                // The remove still ran, and a late record is not a failure of the
+                // teardown: the feed may never fail a launch (AC14).
+                assert!(failures.is_empty(), "{mode:?}: {failures:?}");
+                assert!(
+                    started.elapsed() <= EXEC_RECORD_TIMEOUT + EXEC_REMOVE_TIMEOUT,
+                    "{mode:?}: {:?}",
+                    started.elapsed()
+                );
+            });
+            assert!(
+                wedged.0.lock().unwrap().ends_with(&["remove"]),
+                "{mode:?}: {:?}",
+                wedged.0.lock().unwrap()
+            );
         }
     }
 

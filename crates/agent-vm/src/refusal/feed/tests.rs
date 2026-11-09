@@ -138,7 +138,8 @@ async fn fake_stream_ingests_and_hints_once() {
     ])
     .0;
     let live = live();
-    let hint = Arc::new(Hint::new());
+    let (hint, lines) = Hint::capture();
+    let hint = Arc::new(hint);
 
     let cursor = drive(
         opener,
@@ -154,6 +155,11 @@ async fn fake_stream_ingests_and_hints_once() {
     assert_eq!(snapshot.entries[0].count, 2);
     assert_eq!(snapshot.suppressed, 7);
     assert!(hint.fired(), "the hint fires at the first refusal");
+    // Three refusals were folded in; exactly one line was emitted. A flag would
+    // say the same thing whether the sink had been written once or five times.
+    let lines = lines.lock().unwrap();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0], HINT);
     assert_eq!(
         cursor,
         Some(cursor_for(40)),
@@ -189,8 +195,47 @@ async fn records_before_session_start_are_ignored() {
     assert!(cursor.is_some(), "the line was still consumed");
 }
 
+/// A *general* I/O error leaves the cursor valid, so following resumes from it.
+/// This is the arm that keeps a healthy stream from being re-read from the
+/// beginning after one transient failure.
 #[tokio::test]
-async fn a_generic_error_resumes_from_the_cursor() {
+async fn a_generic_error_resumes_from_the_last_cursor() {
+    let (_root, dir) = dir();
+    let persist = Persister::new(dir.clone());
+    let (opener, seen) = scripted(vec![
+        Ok(entry(record_line(1, 443, None), 10)),
+        Err(MicrosandboxError::Io(std::io::Error::other(
+            "the log file went away",
+        ))),
+    ]);
+    let live = live();
+    let hint = Arc::new(Hint::new());
+    drive(
+        opener,
+        Arc::clone(&live),
+        persist,
+        hint,
+        Duration::from_millis(1_600),
+    )
+    .await;
+
+    let seen = seen.lock().unwrap();
+    assert!(seen.len() >= 2, "the stream was reopened");
+    assert!(matches!(seen[0].start, LogStreamStart::Beginning));
+    assert!(
+        matches!(&seen[1].start, LogStreamStart::From(cursor) if *cursor == cursor_for(10)),
+        "a general error resumes from the last cursor, not the beginning: {:?}",
+        seen[1].start
+    );
+    assert!(live.snapshot().gap, "the failure is still visible as a gap");
+    assert_eq!(live.snapshot().entries.len(), 1, "nothing was re-read");
+}
+
+/// An invalid cursor means the file being read has left the retention chain, so
+/// every retained file is newer: reopening from the beginning cannot double
+/// count.
+#[tokio::test]
+async fn an_invalid_cursor_reopens_from_the_beginning() {
     let (_root, dir) = dir();
     let persist = Persister::new(dir.clone());
     let (opener, seen) = scripted(vec![
@@ -287,6 +332,124 @@ async fn open_failure_degrades_without_error() {
     assert!(live.snapshot().gap, "the failure is visible as a gap");
 }
 
+/// AC3's persistence bound is measured from *ingestion*, and it holds even when
+/// the stream never opens again: repeated open failures, the resume budget
+/// running out and the pause between attempts are exactly when a dirty record
+/// used to sit unposted, because the ticker only lived inside an open stream.
+#[tokio::test]
+async fn a_dirty_record_is_persisted_within_two_seconds_however_the_stream_fails() {
+    let (_root, dir) = dir();
+    let persist = Persister::new(dir.clone());
+    let live = live();
+    let hint = Arc::new(Hint::new());
+    let opened = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&opened);
+    let opener: Opener = Arc::new(move |_options| {
+        let nth = counter.fetch_add(1, Ordering::SeqCst);
+        async move {
+            if nth == 0 {
+                // One refusal, then the stream dies and every reopen fails.
+                Ok(Box::pin(futures::stream::iter(vec![
+                    Ok(entry(record_line(1, 443, None), 10)),
+                    Err(MicrosandboxError::InvalidCursor("stale".to_owned())),
+                ])) as LogStream)
+            } else {
+                Err(MicrosandboxError::InvalidCursor("no stream".to_owned()))
+            }
+        }
+        .boxed()
+    });
+    let (stop, receiver) = watch::channel(false);
+    let task = tokio::spawn(follow(
+        opener,
+        Arc::clone(&live),
+        persist.handle(),
+        hint,
+        receiver,
+        true,
+    ));
+
+    let ingested = loop {
+        if !live.snapshot().entries.is_empty() {
+            break std::time::Instant::now();
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    };
+    let written = loop {
+        let persisted = dir
+            .read()
+            .unwrap()
+            .sessions
+            .iter()
+            .any(|session| session.info.id.as_str() == SID && !session.entries.is_empty());
+        if persisted {
+            break std::time::Instant::now();
+        }
+        assert!(
+            std::time::Instant::now().duration_since(ingested) < POST_INTERVAL,
+            "the record was still unposted {POST_INTERVAL:?} after ingestion"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let trailed = written.duration_since(ingested);
+    assert!(
+        trailed <= POST_INTERVAL,
+        "the log trailed ingestion by {trailed:?}"
+    );
+
+    // The write happened *while* the stream was failing, not after it recovered:
+    // the follower then exhausts its reopen budget and the pauses it sleeps are
+    // the ones that used to run without a ticker.
+    let cursor = tokio::time::timeout(Duration::from_secs(15), task)
+        .await
+        .expect("following stops on its own")
+        .expect("no panic");
+    assert!(cursor.is_some(), "the one entry was read");
+    assert!(
+        opened.load(Ordering::SeqCst) >= 3,
+        "the open-failure path ran: {} opens",
+        opened.load(Ordering::SeqCst)
+    );
+    assert!(live.snapshot().gap, "the failures are visible as a gap");
+    let _ = stop.send(true);
+}
+
+/// A record the runtime wrote in a shape this build cannot decode is a gap, not
+/// silence: whether it was a refusal is unknown, and a session that hid that
+/// would understate what it refused.
+#[tokio::test]
+async fn an_undecodable_record_marks_a_gap() {
+    let (_root, dir) = dir();
+    let persist = Persister::new(dir.clone());
+    let opener = scripted(vec![
+        // A newer format version, and an event tag these enums do not carry:
+        // `serde` has no `#[serde(other)]`, so the whole record fails to decode.
+        Ok(entry(
+            r#"{"v":2,"t":"2025-10-09T09:33:24.000Z","s":"network","event":"quota"}"#.to_owned(),
+            10,
+        )),
+        Ok(entry(record_line(2, 443, None), 20)),
+    ])
+    .0;
+    let live = live();
+    let hint = Arc::new(Hint::new());
+    let cursor = drive(
+        opener,
+        Arc::clone(&live),
+        persist,
+        Arc::clone(&hint),
+        Duration::from_millis(200),
+    )
+    .await;
+    assert!(live.snapshot().gap, "the undecodable line is a gap");
+    assert_eq!(
+        live.snapshot().entries.len(),
+        1,
+        "the decodable line after it is still read"
+    );
+    assert_eq!(cursor, Some(cursor_for(20)));
+}
+
 // -- the persister ---------------------------------------------------------
 
 fn snapshot(rev: u64, ended: bool) -> crate::refusal::SessionSnapshot {
@@ -321,6 +484,32 @@ fn an_older_snapshot_never_overwrites_the_final() {
         .find(|session| session.info.id.as_str() == SID)
         .expect("written");
     assert_eq!(mine.rev, 3);
+    assert!(mine.ended_ms.is_some());
+}
+
+/// `post` and `post_final` share one slot, so a dirty tick that lands between the
+/// final offer and the final write must not replace it: the record that says the
+/// session ended is the one a reader needs.
+#[test]
+fn a_post_cannot_displace_a_pending_final() {
+    let (_root, dir) = dir();
+    // Hold the log's own lock so the final job stays pending while the second
+    // post arrives.
+    let held = crate::host_paths::open_lock_file(&dir.path().join("refusals.lock")).unwrap();
+    crate::host_paths::flock_exclusive(&held).unwrap();
+    let persist = Persister::new(dir.clone());
+    let wait = persist.post_final(snapshot(1, true));
+    persist.post(snapshot(2, false));
+    std::thread::sleep(Duration::from_millis(50));
+    drop(held);
+    assert!(wait.wait(FINAL_WAIT), "the final write landed");
+    let log = dir.read().unwrap();
+    let mine = log
+        .sessions
+        .iter()
+        .find(|session| session.info.id.as_str() == SID)
+        .expect("written");
+    assert_eq!(mine.rev, 1, "the post did not replace the final record");
     assert!(mine.ended_ms.is_some());
 }
 
@@ -560,8 +749,13 @@ async fn finish_drains_lines_written_after_the_last_poll() {
     .await;
 }
 
+/// The whole path, real engine and real log: a line written to the runtime's
+/// file reaches the project log within AC3's two seconds — measured from the
+/// moment the follower *ingested* it, not from the moment the file appeared,
+/// because the runtime's own poll (up to [`POLL_INTERVAL`]) is ingestion and the
+/// deadline is about what happens after it.
 #[tokio::test]
-async fn a_line_is_persisted_within_5_s() {
+async fn a_line_reaches_the_log_within_two_seconds_of_ingestion() {
     const NAME: &str = "agent-vm-refusal-persist";
     let (home, logs) = real_engine_home(NAME);
     let backend = backend(home.path());
@@ -570,6 +764,7 @@ async fn a_line_is_persisted_within_5_s() {
     let persist = Persister::new(dir.clone());
 
     microsandbox::with_backend(Arc::clone(&backend), async {
+        let task_start = std::time::Instant::now();
         let (stop, receiver) = watch::channel(false);
         let task = tokio::spawn(follow(
             public_opener(NAME, Arc::clone(&backend)),
@@ -579,12 +774,21 @@ async fn a_line_is_persisted_within_5_s() {
             receiver,
             true,
         ));
-        let started = std::time::Instant::now();
         std::fs::write(
             logs.join("network.log"),
             format!("{}\n", record_line(1, 3001, None)),
         )
         .unwrap();
+        let ingested = loop {
+            if !live.snapshot().entries.is_empty() {
+                break std::time::Instant::now();
+            }
+            assert!(
+                task_start.elapsed() < Duration::from_secs(30),
+                "the runtime's own stream never yielded the line"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
         loop {
             let persisted = dir
                 .read()
@@ -595,12 +799,18 @@ async fn a_line_is_persisted_within_5_s() {
             if persisted {
                 break;
             }
+            let trailed = std::time::Instant::now().duration_since(ingested);
             assert!(
-                started.elapsed() < Duration::from_secs(5),
-                "a refusal must reach the log within 5 s"
+                trailed < POST_INTERVAL,
+                "the log trailed ingestion by {trailed:?}"
             );
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        assert!(
+            ingested.duration_since(task_start) <= POLL_INTERVAL,
+            "ingestion itself is bounded by one fallback poll: {:?}",
+            ingested.duration_since(task_start)
+        );
         let _ = stop.send(true);
         let _ = task.await;
     })

@@ -50,6 +50,14 @@ const MAX_SUBSCRIBERS: usize = 16 - 4;
 /// How long `finish` waits for open connections after telling them the session
 /// ended, before aborting them.
 const CONNECTION_GRACE: Duration = Duration::from_millis(500);
+/// The whole teardown drain, `open` included. A drain that cannot open the
+/// runtime's file has nothing to read, and waiting for one is not worth the
+/// teardown's time.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// The backstop join on the follower after its stop is set. Its own waits all
+/// honour the stop, so this only decides how long an uncancellable `open` may
+/// hold up the teardown.
+const FOLLOWER_STOP_WAIT: Duration = Duration::from_secs(1);
 
 /// A notice that must not delay a launch or a teardown.
 fn notice(message: impl std::fmt::Display) {
@@ -71,6 +79,11 @@ pub(crate) struct LiveSession {
     info: SessionInfo,
     live: Option<Arc<LiveRefusals>>,
     persister: Option<Persister>,
+    /// The one hint this session ever prints (AC7). Shared by the follower and by
+    /// the teardown drain: a second `Hint` would let a refusal first read at
+    /// teardown — or one the follower already reported, read again by the drain —
+    /// print a second line.
+    hint: Arc<Hint>,
     /// The opener the follower and the drain share: a `Sandbox` clone behind an
     /// `Arc<dyn Fn>`, so both can hold it.
     open: Mutex<Option<Opener>>,
@@ -113,7 +126,9 @@ impl LiveSession {
             }
         };
         let socket = dir.socket_path(&info.id);
-        if !crate::msb_install::unix_socket_path_fits(&socket) {
+        // The name bound first is the hidden one, so the path budget has to be
+        // checked for it: it is the longest spelling this session ever binds.
+        if !crate::msb_install::unix_socket_path_fits(&Hidden::tmp_path(&dir, &info.id)) {
             notice(format!(
                 "==> Refusals are recorded but not served live: {} is longer than a Unix \
                  socket path allows. Set a shorter AGENT_VM_STATE_DIR to get live refusals.",
@@ -129,56 +144,61 @@ impl LiveSession {
         }
 
         // Binding happens inside the reservation, so a name another session still
-        // holds is redrawn rather than adopted.
-        let reserved = match dir.reserve(info.started_ms, info.pid, true, |id| {
-            UnixListener::bind(dir.socket_path(id))
-        }) {
-            Ok(Some(reserved)) => reserved,
-            Ok(None) => {
-                notice("==> Refusals are not recorded: the project's refusal log is busy");
-                return Self::with_dir(
-                    &dir,
-                    SessionInfo {
-                        socket: false,
-                        ..info
-                    },
-                );
-            }
+        // holds is redrawn rather than adopted. The socket is bound under a hidden
+        // name and renamed into place by `publish`.
+        let reserved =
+            match dir.reserve(info.started_ms, info.pid, true, |id| Hidden::bind(&dir, id)) {
+                Ok(Some(reserved)) => reserved,
+                Ok(None) => {
+                    notice("==> Refusals are not recorded: the project's refusal log is busy");
+                    return Self::with_dir(
+                        &dir,
+                        SessionInfo {
+                            socket: false,
+                            ..info
+                        },
+                    );
+                }
+                Err(error) => {
+                    notice(format!(
+                        "==> Refusals are recorded but not served live: {error:#}"
+                    ));
+                    return Self::with_dir(
+                        &dir,
+                        SessionInfo {
+                            socket: false,
+                            ..info
+                        },
+                    );
+                }
+            };
+        let bound_socket = dir.socket_path(&reserved.snapshot.info.id);
+        let listener = match reserved.bound.publish() {
+            Ok(listener) => listener,
             Err(error) => {
                 notice(format!(
                     "==> Refusals are recorded but not served live: {error:#}"
                 ));
+                // The session is left with no socket, and with *its own* reserved
+                // ID: writing the unreserved one would orphan the reservation.
                 return Self::with_dir(
                     &dir,
                     SessionInfo {
                         socket: false,
-                        ..info
+                        ..reserved.snapshot.info
                     },
                 );
             }
         };
-        let bound_socket = dir.socket_path(&reserved.snapshot.info.id);
-        if let Err(error) = set_socket_mode(&bound_socket) {
-            notice(format!(
-                "==> Refusals are recorded but not served live: {error:#}"
-            ));
-            let _ = std::fs::remove_file(&bound_socket);
-            return Self::with_dir(
-                &dir,
-                SessionInfo {
-                    socket: false,
-                    ..info
-                },
-            );
-        }
         let listening = LiveRefusals::new(SessionRefusals::resume(reserved.snapshot.clone()));
         let persister = Persister::new(dir.clone());
         let (stop, receiver) = watch::channel(false);
-        let task = tokio::spawn(serve(reserved.bound, Arc::clone(&listening), receiver));
+        let task = tokio::spawn(serve(listener, Arc::clone(&listening), receiver));
         Self {
             info: reserved.snapshot.info,
             live: Some(listening),
             persister: Some(persister),
+            hint: Arc::new(Hint::new()),
             open: Mutex::new(None),
             running: Mutex::new(Some(Running {
                 stop,
@@ -195,6 +215,7 @@ impl LiveSession {
             info,
             live: None,
             persister: None,
+            hint: Arc::new(Hint::new()),
             open: Mutex::new(None),
             running: Mutex::new(None),
             following: Mutex::new(None),
@@ -213,6 +234,7 @@ impl LiveSession {
             info,
             live: Some(live),
             persister: Some(persister),
+            hint: Arc::new(Hint::new()),
             open: Mutex::new(None),
             running: Mutex::new(None),
             following: Mutex::new(None),
@@ -251,7 +273,7 @@ impl LiveSession {
             open,
             Arc::clone(&live),
             persister.handle(),
-            Arc::new(Hint::new()),
+            Arc::clone(&self.hint),
             receiver,
             self.info.socket,
         ));
@@ -273,16 +295,31 @@ impl LiveSession {
             return;
         };
         // 1–2. Stop the follower, then drain from its last cursor to end of file.
+        // The slot is emptied before the awaits: a `std::sync::MutexGuard` held
+        // across one would stall every other thread that wanted it.
         let following = lock(&self.following).take();
         if let Some(following) = following {
             let _ = following.stop.send(true);
-            let cursor = following.task.await.ok().flatten();
-            self.drain(&live, cursor).await;
+            // The follower's own stop check is inside every wait it does, so this
+            // join is prompt; the bound is the backstop for an `open` that cannot
+            // be cancelled.
+            match tokio::time::timeout(FOLLOWER_STOP_WAIT, following.task).await {
+                Ok(Ok(cursor)) => self.drain(&live, cursor).await,
+                // A panicked or unresponsive follower has no known position, so
+                // draining from the beginning could count records twice. Saying
+                // the count is unknown is the honest record (AC6).
+                Ok(Err(_)) | Err(_) => live.note_gap(),
+            }
         }
         // 3. The final snapshot, written before any reader is told it ended.
         let snapshot = live.ended(feed::now_ms());
         if let Some(persister) = &self.persister {
-            let _ = persister.post_final(snapshot).wait(feed::FINAL_WAIT);
+            let wait = persister.post_final(snapshot);
+            // Off a worker thread: the wait is a `Condvar`, and blocking a
+            // runtime worker for up to `FINAL_WAIT` would stall every other task
+            // on it — including the connections `close_socket` is about to tell
+            // the session ended.
+            let _ = tokio::task::spawn_blocking(move || wait.wait(feed::FINAL_WAIT)).await;
         }
         // 4–5. Tell subscribers, close, unlink.
         self.close_socket().await;
@@ -296,23 +333,29 @@ impl LiveSession {
         let Some(open) = lock(&self.open).clone() else {
             return;
         };
-        let options = feed::drain_options(cursor);
-        let Ok(mut stream) = open(options).await else {
+        // The deadline covers the `open` as well as the reads: an `open` that
+        // never returns used to sit in front of the deadline, not inside it.
+        let deadline = tokio::time::Instant::now() + DRAIN_TIMEOUT;
+        let Ok(Ok(mut stream)) =
+            tokio::time::timeout_at(deadline, open(feed::drain_options(cursor))).await
+        else {
             return;
         };
         // A drain must terminate: the stream was opened without `follow`, so it
         // ends at EOF. The bound is for a runtime whose file never closes.
         let mut dirty = false;
         let mut cursor = None;
-        let hint = Arc::new(Hint::new());
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
             let next = tokio::time::timeout_at(deadline, stream.next()).await;
             match next {
                 // The drain is the last chance to see these records, so the hint
                 // fires here too — a refusal the operator never saw live is still
-                // a refusal they should be told to look at.
-                Ok(Some(Ok(entry))) => feed::accept(entry, live, &hint, &mut dirty, &mut cursor),
+                // a refusal they should be told to look at. It is the session's
+                // one `Hint`, so a refusal the follower already reported cannot
+                // print a second line (AC7).
+                Ok(Some(Ok(entry))) => {
+                    feed::accept(entry, live, &self.hint, &mut dirty, &mut cursor)
+                }
                 Ok(Some(Err(_))) | Ok(None) | Err(_) => break,
             }
         }
@@ -333,10 +376,66 @@ fn peer_is_allowed(peer_uid: u32, euid: u32) -> bool {
     peer_uid == euid
 }
 
-fn set_socket_mode(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("setting the mode of {}", crate::one_line::path(path)))
+/// A socket bound but not yet announced: the hidden name, and the name it will
+/// be renamed to.
+///
+/// Tokio's `UnixListener::bind` is `bind()` then `listen()`. A `connect` that
+/// lands between the two gets `ECONNREFUSED`, and [`discover`] reads a refused
+/// connection as a stale socket and unlinks it — so the session would spend its
+/// whole life reading `ended (unclean)` and `access` could never reach it. Bound
+/// under `<sid>.sock.tmp`, listened, chmodded and *then* renamed, the visible name
+/// never exists in a not-listening state. The rename is also what lets the mode be
+/// set before anything can connect.
+///
+/// Discovery ignores the hidden name for free: it only ever considers a name that
+/// ends in `.sock` whose stem is 8 hex, and `deadbeef.sock.tmp` is neither.
+struct Hidden {
+    listener: UnixListener,
+    tmp: PathBuf,
+    path: PathBuf,
+}
+
+impl Hidden {
+    /// The hidden name this session binds first.
+    fn tmp_path(dir: &SessionsDir, id: &SessionId) -> PathBuf {
+        dir.path().join(format!("{}.sock.tmp", id.as_str()))
+    }
+
+    /// Bind and listen under the hidden name. Nothing can dial it under this name,
+    /// and nothing can dial the visible name until [`Self::publish`] runs.
+    fn bind(dir: &SessionsDir, id: &SessionId) -> std::io::Result<Self> {
+        let tmp = Self::tmp_path(dir, id);
+        let listener = UnixListener::bind(&tmp)?;
+        Ok(Self {
+            listener,
+            tmp,
+            path: dir.socket_path(id),
+        })
+    }
+
+    /// Mode 0600, then rename into place. Both happen while the socket is already
+    /// listening, so a client that sees the name can connect.
+    fn publish(self) -> Result<UnixListener> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let result = std::fs::set_permissions(&self.tmp, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("setting the mode of {}", crate::one_line::path(&self.tmp)))
+            .and_then(|()| {
+                std::fs::rename(&self.tmp, &self.path).with_context(|| {
+                    format!(
+                        "moving {} to {}",
+                        crate::one_line::path(&self.tmp),
+                        crate::one_line::path(&self.path)
+                    )
+                })
+            });
+        if result.is_err() {
+            // The hidden name must not outlive a failed publish: it is not a name
+            // discovery can ever report or clean up.
+            let _ = std::fs::remove_file(&self.tmp);
+        }
+        // The listener is returned even for an error so it is closed with `self`.
+        result.map(|()| self.listener)
+    }
 }
 
 impl Drop for LiveSession {
@@ -344,9 +443,19 @@ impl Drop for LiveSession {
     /// `live_launch_result` failure, never reaches a teardown, so the follower and
     /// the socket are released here instead. The socket is unlinked by the accept
     /// loop when it observes the stop.
+    ///
+    /// What is still here decides what runs, not the `finished` flag: a `finish`
+    /// that was cancelled part-way has already set the flag and left the socket
+    /// bound, and returning early on the flag leaked it for the rest of the
+    /// process's life. The slots are taken out by `finish` as it uses them, so a
+    /// completed `finish` leaves nothing for this to repeat.
     fn drop(&mut self) {
-        if self.finished.swap(true, Ordering::SeqCst) {
-            return;
+        self.finished.store(true, Ordering::SeqCst);
+        if let (Some(live), Some(persister)) = (&self.live, &self.persister) {
+            // The final record, so a launch that never reaches a teardown still
+            // leaves one that says the session ended. Not waited for: `Drop` may
+            // not block, and a `finish` that already wrote it makes this a no-op.
+            drop(persister.post_final(live.ended(feed::now_ms())));
         }
         if let Some(following) = lock(&self.following).take() {
             let _ = following.stop.send(true);
@@ -438,9 +547,15 @@ async fn serve(listener: UnixListener, live: Arc<LiveRefusals>, mut stop: watch:
                 };
                 let live = Arc::clone(&live);
                 let subscribers = Arc::clone(&subscribers);
+                // The session's stop signal reaches the connection, so a
+                // subscriber waiting in `updates.recv()` learns the session ended
+                // instead of only being aborted. Nothing closes the broadcast
+                // channel: `LiveState` holds the sender and every connection holds
+                // an `Arc` to it, so `RecvError::Closed` can never fire.
+                let stop = stop.clone();
                 tasks.spawn(async move {
                     let _permit = permit;
-                    handle_connection(stream, live, subscribers).await;
+                    handle_connection(stream, live, subscribers, stop).await;
                 });
             }
             // Reap finished connections so the set does not grow forever.
@@ -464,6 +579,7 @@ async fn handle_connection(
     stream: UnixStream,
     live: Arc<LiveRefusals>,
     subscribers: Arc<Semaphore>,
+    mut stop: watch::Receiver<bool>,
 ) {
     // The peer must be this user. A socket in a 0700 directory is already
     // unreachable by another user; this is the check the kernel can make, not a
@@ -515,7 +631,7 @@ async fn handle_connection(
                 let _ = write_reply(&mut writer, &error("too-many-subscribers")).await;
                 return;
             };
-            subscribe_connection(&mut writer, &live).await;
+            subscribe_connection(&mut writer, &live, &mut stop).await;
         }
         _ => {
             let _ = write_reply(&mut writer, &error("bad-request")).await;
@@ -538,7 +654,11 @@ async fn write_reply(stream: &mut UnixStream, reply: &Reply) -> std::io::Result<
     }
 }
 
-async fn subscribe_connection(stream: &mut UnixStream, live: &LiveRefusals) {
+async fn subscribe_connection(
+    stream: &mut UnixStream,
+    live: &LiveRefusals,
+    stop: &mut watch::Receiver<bool>,
+) {
     // The handoff: snapshot and subscription under one lock, so the client
     // receives everything after the snapshot exactly once.
     let (snapshot, mut updates) = live.subscribe();
@@ -566,7 +686,31 @@ async fn subscribe_connection(stream: &mut UnixStream, live: &LiveRefusals) {
         return;
     }
     loop {
-        match updates.recv().await {
+        // The ended reply is the point of subscribing: a client that waits for it
+        // must be told, and a broadcast channel that is never closed cannot tell
+        // it. The stop is the one signal the server owns.
+        let received = tokio::select! {
+            biased;
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    None
+                } else {
+                    continue;
+                }
+            }
+            update = updates.recv() => Some(update),
+        };
+        let Some(received) = received else {
+            let _ = write_reply(
+                stream,
+                &Reply::Ended {
+                    v: PROTOCOL_VERSION,
+                },
+            )
+            .await;
+            return;
+        };
+        match received {
             Ok(update) => {
                 let reply = Reply::Update {
                     v: PROTOCOL_VERSION,

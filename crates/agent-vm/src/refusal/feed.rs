@@ -158,6 +158,14 @@ impl LiveRefusals {
         }
     }
 
+    /// Record a gap the follower could not record itself: its position is unknown
+    /// because it panicked or would not stop, so what it skipped cannot be
+    /// re-read without counting some records twice.
+    pub(crate) fn note_gap(&self) {
+        let mut dirty = false;
+        self.mark_gap(&mut dirty);
+    }
+
     fn beat(&self, now_ms: i64) {
         self.lock().session.beat(now_ms);
     }
