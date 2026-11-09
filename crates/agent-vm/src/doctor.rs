@@ -1834,7 +1834,7 @@ mod tests {
         let expected = r###"==> active microsandbox home
 MSB_HOME: <fixture>/state/msb-home
 db:       <fixture>/state/msb-home/db/msb.db (absent)
-this build's bundled schema: m20261022_000001
+this build's bundled schema: m20261030_000001
 
 ==> host agent credentials
 claude    <fixture>/home/.claude/.credentials.json

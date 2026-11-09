@@ -102,6 +102,19 @@ fn stderr_of(out: &Output) -> String {
 /// order-independent.
 type Snapshot = BTreeMap<String, String>;
 
+/// The pre-launch state a refused plan must leave untouched, plus the fake
+/// runtime's invocation log as it stood.
+///
+/// Every launch through this [`Harness`] appends to that log, and a preceding
+/// *successful* launch legitimately logs the launch-protocol probe and the
+/// machine invocation. A refusal can only answer for the invocations it runs
+/// itself, so the oracle compares [`Before::entries`] and requires [`Before::log`]
+/// to be an unchanged prefix of the log it reads back.
+struct Before {
+    entries: Snapshot,
+    log: String,
+}
+
 /// Walk `root` recursively into `out`, prefixing every key with `label`. A
 /// missing root contributes nothing — several of these trees legitimately do
 /// not exist before a launch.
@@ -391,8 +404,28 @@ impl Harness {
     }
 
     /// Every argv the fake runtime was invoked with, one per line.
+    ///
+    /// A missing log means no invocation has run yet; any other read error is a
+    /// failure, because reading it as an empty log would leave the oracle below
+    /// with nothing to examine and let a launch that reached the runtime pass.
     fn msb_log(&self) -> String {
-        std::fs::read_to_string(&self.fake_msb.invocations).unwrap_or_default()
+        match std::fs::read_to_string(&self.fake_msb.invocations) {
+            Ok(log) => log,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => panic!(
+                "reading {} failed: {error}",
+                self.fake_msb.invocations.display()
+            ),
+        }
+    }
+
+    /// Capture the pre-launch state and invocation log for
+    /// [`Harness::assert_refused_before_launch_state`].
+    fn before(&self) -> Before {
+        Before {
+            entries: self.snapshot(),
+            log: self.msb_log(),
+        }
     }
 
     /// Everything a refused launch must have left untouched: the state root
@@ -417,7 +450,7 @@ impl Harness {
 
     /// The refusal oracle. See the module comment: `refusal_oracle_is_calibrated`
     /// is what keeps it from being vacuous.
-    fn assert_refused_before_launch_state(&self, out: &Output, before: &Snapshot, needle: &str) {
+    fn assert_refused_before_launch_state(&self, out: &Output, before: &Before, needle: &str) {
         let stderr = stderr_of(out);
         assert!(!out.status.success(), "the launch must fail: {stderr}");
         assert!(
@@ -434,10 +467,21 @@ impl Harness {
         );
         assert_eq!(
             self.snapshot(),
-            *before,
+            before.entries,
             "a refused plan must not create or mutate launch state: {stderr}"
         );
-        for line in self.msb_log().lines() {
+        let log = self.msb_log();
+        // The log only grows, so the pre-launch text must still be there. Reading
+        // a shorter or replaced log as "nothing appended" would let a launch that
+        // reached the runtime pass the loop below by examining zero lines.
+        assert!(
+            log.starts_with(&before.log),
+            "the invocation log must only grow: {} is not a prefix of {log:?}",
+            before.log
+        );
+        // Only what this launch appended: an earlier accepted launch in the
+        // same test already logged its own probes.
+        for line in log[before.log.len()..].lines() {
             let first = line.split_whitespace().next().unwrap_or_default();
             assert_eq!(
                 first, "--version",
@@ -543,7 +587,7 @@ fn a_cli_fork_shadowing_a_persist_path_publishes_no_fork() {
     let guest = format!("{}/code", h.home_root.display());
     let mount = format!("{}:{guest}:fork", source.display());
 
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&["--mount", &mount], "aider", &[]);
     let stderr = stderr_of(&out);
     assert!(
@@ -587,7 +631,7 @@ fn an_unrelated_fork_with_a_colliding_live_mount_publishes_no_fork() {
     let fork = format!("{}:/f:fork", other.display());
     let bind = format!("{}:{guest}:ro", live.display());
 
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&["--mount", &fork, "--mount", &bind], "aider", &[]);
     let stderr = stderr_of(&out);
     assert_eq!(
@@ -644,7 +688,7 @@ fn refusal_oracle_is_calibrated() {
     std::fs::write(source.join("seed"), "seed").unwrap();
     // The same fork mount, but at a guest path that shadows nothing.
     let mount = format!("{}:/f:fork", source.display());
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&["--mount", &mount], "aider", &[]);
     let stderr = stderr_of(&out);
     assert!(
@@ -653,9 +697,92 @@ fn refusal_oracle_is_calibrated() {
     );
     assert_ne!(
         h.snapshot(),
-        before,
+        before.entries,
         "an accepted plan must mutate launch state: {stderr}"
     );
+
+    // An accepted launch reaching the builder is only half the calibration: the
+    // oracle's own refusals must fire. Without these rows, deleting its
+    // invocation-log check, its prefix check, its read-error handling or its
+    // snapshot check would leave every "nothing changed" assertion in this file
+    // green for the wrong reason — the exact vacuity the module comment claims
+    // this test prevents.
+    //
+    // (a) A refused-looking launch that reached the runtime for more than its
+    // version: the appended line is what the log check exists to catch.
+    let before = h.before();
+    append_invocation(&h, "machine --json");
+    assert_refusal_oracle_panics(&h, &before, "may only probe the runtime version");
+
+    // (b) The same launch with the log truncated instead of grown. A watermark
+    // that counted lines would find nothing to examine and pass.
+    let before = h.before();
+    std::fs::write(&h.fake_msb.invocations, "").expect("truncate the invocation log");
+    assert_refusal_oracle_panics(&h, &before, "the invocation log must only grow");
+
+    // (c) A launch that mutated the state root after `before()`: the snapshot
+    // check, not the log check, must catch it.
+    let before = h.before();
+    std::fs::write(h.state_root.join("calibration"), "mutated").unwrap();
+    assert_refusal_oracle_panics(&h, &before, "must not create or mutate launch state");
+
+    // (d) A log that cannot be read at all must fail loudly; reading it as empty
+    // is what leaves the log check with nothing to examine.
+    let before = h.before();
+    std::fs::remove_file(&h.fake_msb.invocations).expect("remove the invocation log");
+    std::fs::create_dir(&h.fake_msb.invocations).expect("replace the log with a directory");
+    assert_refusal_oracle_panics(&h, &before, "failed");
+}
+
+/// The needle of the synthetic refusals below: present in their stderr, so the
+/// oracle gets past its own needle assertion and reaches the check under test.
+const SYNTHETIC_REFUSAL: &str = "synthetic refusal";
+
+/// Run [`Harness::assert_refused_before_launch_state`] on a refused-looking
+/// launch and require it to panic, saying `expected`.
+fn assert_refusal_oracle_panics(h: &Harness, before: &Before, expected: &str) {
+    let refusal = refused_output(SYNTHETIC_REFUSAL);
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        h.assert_refused_before_launch_state(&refusal, before, SYNTHETIC_REFUSAL)
+    }));
+    let message = panic_message(caught.expect_err("the refusal oracle accepted a refused plan"));
+    assert!(
+        message.contains(expected),
+        "expected the refusal mentioning {expected:?}, got: {message}"
+    );
+}
+
+/// A refused-looking [`Output`] (non-zero exit, [`SYNTHETIC_REFUSAL`] on stderr,
+/// neither accepted-launch marker) for calibrating the refusal oracle.
+fn refused_output(needle: &str) -> Output {
+    Command::new("sh")
+        .args(["-c", "printf '%s\\n' \"$1\" >&2; exit 1", "sh", needle])
+        .output()
+        .expect("synthesize a refused output")
+}
+
+/// Append one invocation line to the harness's runtime log, as the fake does.
+fn append_invocation(h: &Harness, line: &str) {
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&h.fake_msb.invocations)
+        .expect("open the harness's invocation log")
+        .write_all(format!("{line}\n").as_bytes())
+        .expect("append to the harness's invocation log");
+}
+
+/// The message a caught panic carries, so a calibration can assert *which* check
+/// fired rather than merely that something panicked.
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else {
+        panic!("the panic payload is not a message");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -716,7 +843,7 @@ fn empty_mounts_still_requires_a_verified_file() {
     let target = h.home_root.join("dotfiles/config.toml");
     write_file(&target, "mounts = []\n");
     h.symlink_user_config(&target);
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&[], "shell", &[]);
     h.assert_refused_before_launch_state(
         &out,
@@ -809,7 +936,7 @@ fn unsafe_user_mounts_are_refused_before_launch_state() {
             _ => "",
         };
 
-        let before = h.snapshot();
+        let before = h.before();
         let out = h.launch(&[], "shell", &[]);
         let stderr = stderr_of(&out);
         if reason.is_empty() {
@@ -1049,7 +1176,7 @@ fn normalized_guest_spellings_merge_and_conflict_across_sources() {
     seed_source(&h, "a");
     let b = seed_source(&h, "b");
     h.write_user("mounts = [\"~/a:/g//./x:ro\"]\n");
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(
         &["--mount", &format!("{}:/g/x:ro", b.display())],
         "shell",
@@ -1263,7 +1390,7 @@ fn config_and_cli_conflicts_are_refused_naming_both() {
             [unrelated.as_str(), conflicting.as_str()]
         };
         let options: Vec<&str> = argv.iter().flat_map(|mount| ["--mount", *mount]).collect();
-        let before = h.snapshot();
+        let before = h.before();
         let out = h.launch(&options, "shell", &[]);
         let stderr = stderr_of(&out);
         assert!(
@@ -1294,7 +1421,7 @@ fn config_cli_mode_conflict_is_refused() {
     let h = Harness::new();
     let a = seed_source(&h, "a");
     h.write_user("mounts = [\"~/a:/g:ro\"]\n");
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(
         &["--mount", &format!("{}:/g:rw", a.display())],
         "shell",
@@ -1316,7 +1443,7 @@ fn a_self_conflicting_mounts_list_fails_even_with_opt_out() {
     let h = Harness::new();
     h.write_user("mounts = [\"~/a:/g:ro\", \"~/b:/g:ro\"]\n");
     for options in [vec![], vec!["--no-config-mounts"]] {
-        let before = h.snapshot();
+        let before = h.before();
         let out = h.launch(&options, "shell", &[]);
         let stderr = stderr_of(&out);
         assert!(
@@ -1378,7 +1505,7 @@ fn config_mount_onto_a_core_path_is_refused() {
     seed_source(&h, "a");
     let project = h.project_root.display().to_string();
     h.write_user(&format!("mounts = [\"~/a:{project}:ro\"]\n"));
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&[], "shell", &[]);
     let stderr = stderr_of(&out);
     assert!(
@@ -1401,7 +1528,7 @@ fn writable_config_mount_containing_the_config_dir_is_refused() {
     let h = Harness::new();
     h.write_user("mounts = [\"~/.config:rw\"]\n");
     let config_dir = h.home_root.join(".config/agent-vm");
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&[], "shell", &[]);
     let stderr = stderr_of(&out);
     assert!(
@@ -1422,7 +1549,7 @@ fn live_config_mount_of_pi_home_is_refused() {
     let auth = h.home_root.join(".pi/agent/auth.json");
     write_file(&auth, "{\"token\":\"host\"}");
     h.write_user("mounts = [\"~/.pi:ro\"]\n");
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&[], "shell", &[]);
     let stderr = stderr_of(&out);
     assert!(
@@ -1447,7 +1574,7 @@ fn writable_config_file_mount_is_refused() {
     let file = h.home_root.join("bare");
     std::fs::write(&file, "bare").unwrap();
     h.write_user(&format!("mounts = [\"~/bare:{}\"]\n", file.display()));
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&[], "shell", &[]);
     let stderr = stderr_of(&out);
     assert!(
@@ -1466,7 +1593,7 @@ fn config_fork_of_a_file_names_the_declaration() {
     let file = h.home_root.join("bare");
     std::fs::write(&file, "bare").unwrap();
     h.write_user("mounts = [\"~/bare:/guest:fork\"]\n");
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&[], "shell", &[]);
     let stderr = stderr_of(&out);
     h.assert_refused_before_launch_state(&out, &before, &config_declaration(&h, 0));
@@ -1518,7 +1645,7 @@ fn config_fifo_source_names_the_declaration() {
             .is_fifo()
     );
     h.write_user(&format!("mounts = [\"{}:/guest:ro\"]\n", fifo.display()));
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&[], "shell", &[]);
     let stderr = stderr_of(&out);
     h.assert_refused_before_launch_state(&out, &before, &config_declaration(&h, 0));
@@ -1612,7 +1739,7 @@ fn a_config_source_spelling_cannot_forge_a_diagnostic_line() {
     let forged = h.home_root.join("bad\nFORGED-LINE");
     std::fs::write(&forged, "x").unwrap();
     h.write_user("mounts = [\"~/bad\\nFORGED-LINE:/guest:rw\"]\n");
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&[], "shell", &[]);
     let stderr = stderr_of(&out);
     h.assert_refused_before_launch_state(&out, &before, &config_declaration(&h, 0));
@@ -1899,7 +2026,7 @@ fn a_config_fork_shadowing_a_persist_path_is_refused_before_any_fork() {
         h.home_root.display()
     ));
 
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&[], "aider", &[]);
     let stderr = stderr_of(&out);
     assert_eq!(
@@ -1945,7 +2072,7 @@ fn a_root_mode_config_fork_shadowing_a_persist_path_is_refused_before_any_fork()
     std::fs::write(src.join("seed"), "seed").unwrap();
     h.write_user("mounts = [\"~/src:/root/code:fork\"]\n");
 
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&["--root"], "aider", &[]);
     let stderr = stderr_of(&out);
     assert_eq!(
@@ -2120,7 +2247,7 @@ fn a_selected_missing_config_source_fails_before_state() {
     let h = Harness::new();
     h.write_user("mounts = [\"~/missing:ro\"]\n");
     let missing = h.home_root.join("missing");
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&[], "shell", &[]);
     let stderr = stderr_of(&out);
     assert!(
@@ -2338,7 +2465,7 @@ fn opt_out_keeps_persisted_network_grants() {
     let target = h.home_root.join("dotfiles/config.toml");
     write_file(&target, body);
     h.symlink_user_config(&target);
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&["--no-config-mounts"], "shell", &[]);
     let stderr = stderr_of(&out);
     assert!(
@@ -2469,7 +2596,7 @@ fn config_mounts_apply_to_direct_commands() {
 fn mounts_after_a_network_header_is_refused_with_a_hint() {
     let h = Harness::new();
     h.write_user("[network]\nallow_host = true\nmounts = []\n");
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&[], "shell", &[]);
     let stderr = stderr_of(&out);
     assert!(
@@ -2791,7 +2918,7 @@ fn named_mount_sets_unsafe_file_is_refused_before_launch_state() {
     ] {
         let h = Harness::new();
         h.write_user_mode(body, 0o664);
-        let before = h.snapshot();
+        let before = h.before();
         let out = h.launch(&[], "shell", &[]);
         let stderr = stderr_of(&out);
         assert!(
@@ -2820,7 +2947,7 @@ fn named_mount_sets_unknown_names_never_fall_back() {
     h.write_project("[[tools]]\nname = \"agent\"\ncommand = \"/bin/echo\"\ncredentials = []\n");
     h.write_user("[mount_sets]\nother = []\n");
 
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&["--mount", "agent"], "shell", &[]);
     let stderr = stderr_of(&out);
     assert!(
@@ -2858,7 +2985,7 @@ fn named_mount_sets_refuse_per_selection_modifiers() {
         ("all-set:exclude=x", "a mount-set name is a bare name"),
         ("unknown:ro", "a mount-set name is a bare name"),
     ] {
-        let before = h.snapshot();
+        let before = h.before();
         let out = h.launch(&["--mount", selection], "shell", &[]);
         let stderr = stderr_of(&out);
         assert!(stderr.contains(needle), "{selection}: {stderr}");
@@ -2912,7 +3039,7 @@ fn named_mount_sets_reference_errors_refuse_load_under_every_option() {
         let h = Harness::new();
         h.write_user(body);
         for options in [vec![], vec!["--no-config-mounts"]] {
-            let before = h.snapshot();
+            let before = h.before();
             let out = h.launch(&options, "shell", &[]);
             let stderr = stderr_of(&out);
             assert!(stderr.contains(needle), "{body}: {options:?}: {stderr}");
@@ -2965,7 +3092,7 @@ fn named_mount_sets_expansion_chain_refuses_before_state() {
     let h = Harness::new();
     h.write_user(&chain_document(4_000));
     for options in [vec![], vec!["--no-config-mounts"]] {
-        let before = h.snapshot();
+        let before = h.before();
         let out = h.launch(&options, "shell", &[]);
         let stderr = stderr_of(&out);
         assert!(stderr.contains(LIMIT), "{options:?}: {stderr}");
@@ -3009,7 +3136,7 @@ fn named_mount_sets_unused_missing_source_is_never_checked() {
     );
 
     for name in ["absent-set", "missing-set"] {
-        let before = h.snapshot();
+        let before = h.before();
         let out = h.launch(&["--mount", name], "shell", &[]);
         let stderr = stderr_of(&out);
         assert!(!out.status.success(), "{name}: {stderr}");
@@ -3050,7 +3177,7 @@ fn named_mount_sets_conflicts_are_refused_in_both_orders() {
         seed_source(&h2, "a");
         seed_source(&h2, "b");
         h2.write_user(body);
-        let before = h2.snapshot();
+        let before = h2.before();
         let out = h2.launch(options, "shell", &[]);
         let stderr = stderr_of(&out);
         assert!(
@@ -3090,7 +3217,7 @@ fn named_mount_sets_conflicts_are_refused_in_both_orders() {
         } else {
             vec!["--no-config-mounts", "--mount", &direct, "--mount", "s"]
         };
-        let before = h2.snapshot();
+        let before = h2.before();
         let out = h2.launch(&argv, "shell", &[]);
         let stderr = stderr_of(&out);
         assert!(
@@ -3143,7 +3270,7 @@ fn named_mount_sets_respect_the_shared_protections() {
     // A writable config-directory ancestor.
     let h = Harness::new();
     h.write_user("[mount_sets]\ncfg = [\"~/.config:rw\"]\n");
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&["--mount", "cfg"], "shell", &[]);
     h.assert_refused_before_launch_state(&out, &before, &set_declaration(&h, "cfg", 0));
 
@@ -3152,7 +3279,7 @@ fn named_mount_sets_respect_the_shared_protections() {
     let auth = h.home_root.join(".pi/agent/auth.json");
     write_file(&auth, "{\"token\":\"host\"}");
     h.write_user("[mount_sets]\npi-live = [\"~/.pi:ro\"]\n");
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&["--mount", "pi-live"], "shell", &[]);
     h.assert_refused_before_launch_state(
         &out,
@@ -3171,7 +3298,7 @@ fn named_mount_sets_respect_the_shared_protections() {
         "[mount_sets]\nfile = [\"~/bare:{}\"]\n",
         file.display()
     ));
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&["--mount", "file"], "shell", &[]);
     h.assert_refused_before_launch_state(&out, &before, "a file can only be mounted read-only");
 
@@ -3180,7 +3307,7 @@ fn named_mount_sets_respect_the_shared_protections() {
     let h = Harness::new();
     seed_source(&h, "a");
     h.write_user("[mount_sets]\ncore = [\"~/a:/agent-vm-state:ro\"]\n");
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&["--mount", "core"], "shell", &[]);
     let stderr = stderr_of(&out);
     assert!(
@@ -3201,7 +3328,7 @@ fn named_mount_sets_respect_the_shared_protections() {
         "[mount_sets]\nfork = [\"~/src:{}/code:fork\"]\n",
         h.home_root.display()
     ));
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&["--mount", "fork"], "aider", &[]);
     assert_eq!(
         stderr_of(&out).lines().next().unwrap_or_default(),
@@ -3602,7 +3729,7 @@ fn named_mount_sets_fail_only_when_a_launch_selects_both() {
     }
 
     for order in [["x", "y"], ["y", "x"]] {
-        let before = h.snapshot();
+        let before = h.before();
         let out = h.launch(&["--mount", order[0], "--mount", order[1]], "shell", &[]);
         let stderr = stderr_of(&out);
         assert!(
@@ -3706,7 +3833,7 @@ fn named_mount_sets_look_up_names_case_sensitively() {
         "`--mount a` selects the `a` set: {binds:?}"
     );
 
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&["--mount", "Agent"], "shell", &[]);
     let stderr = stderr_of(&out);
     assert!(
@@ -3754,7 +3881,7 @@ fn named_mount_sets_cannot_be_declared_or_selected_by_the_project() {
         ),
     ] {
         h.write_project(body);
-        let before = h.snapshot();
+        let before = h.before();
         let out = h.launch(&[], "shell", &[]);
         let stderr = stderr_of(&out);
         assert!(
@@ -4054,7 +4181,7 @@ fn tool_mount_conflicts_name_both_sites_without_overrides() {
              mounts = [\"{own}\"]\n\
              [[tools]]\nname = \"other\"\ncommand = \"/bin/echo\"\nmounts = [\"{inherited}\"]\n"
         ));
-        let before = h.snapshot();
+        let before = h.before();
         let out = h.launch(&[], "launch", &[]);
         h.assert_refused_before_launch_state(
             &out,
@@ -4064,7 +4191,7 @@ fn tool_mount_conflicts_name_both_sites_without_overrides() {
         );
         // The opt-out cannot hide it: the closure is a load-time fact, and the flag
         // only removes automatic *selection*.
-        let before = h.snapshot();
+        let before = h.before();
         let out = h.launch(&["--no-config-mounts"], "launch", &[]);
         h.assert_refused_before_launch_state(&out, &before, "claims the same guest path");
     }
@@ -4180,7 +4307,7 @@ fn tool_mount_conflicts_name_every_opposing_declaration_pair() {
         let b = seed_dir(&h, "b");
         let (verb, argv, needle, names) = build(&h, &b);
         let options: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let before = h.snapshot();
+        let before = h.before();
         let out = h.launch(&options, verb, &[]);
         let stderr = stderr_of(&out);
         let claim = stderr
@@ -4226,7 +4353,7 @@ fn tool_mount_conflicts_cover_each_differing_declaration_field() {
             "mounts = [\"{defaults}\"]\n[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\n\
              tools = []\nmounts = [\"{tool_list}\"]\n"
         ));
-        let before = h.snapshot();
+        let before = h.before();
         let out = h.launch(&[], "t", &[]);
         let stderr = stderr_of(&out);
         let clause = format!("mounts[0] in \"{file}\"");
@@ -4260,7 +4387,7 @@ fn project_tool_mount_presence_is_a_load_error_even_when_hidden() {
         // hidden loser — refused all the same, because the field is authority.
         h.write_user("[[tools]]\nname = \"hidden\"\ncommand = \"/bin/echo\"\n");
         h.write_project(&body);
-        let before = h.snapshot();
+        let before = h.before();
         let out = h.launch(&[], "hidden", &[]);
         h.assert_refused_before_launch_state(
             &out,
@@ -4318,7 +4445,7 @@ fn project_tool_edges_never_select_user_mounts() {
     // A project reference to a name only the user declares is the exact
     // cross-tier error, not a mount source.
     h.write_project("[[tools]]\nname = \"local\"\ncommand = \"/bin/echo\"\ntools = [\"pi\"]\n");
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&[], "local", &[]);
     h.assert_refused_before_launch_state(
         &out,
@@ -4346,7 +4473,7 @@ fn empty_present_tool_mounts_require_authority_before_any_launch() {
     ] {
         let h = Harness::new();
         h.write_user_mode(body, 0o664);
-        let before = h.snapshot();
+        let before = h.before();
         let out = h.launch(&[], "t", &[]);
         h.assert_refused_before_launch_state(
             &out,
@@ -4364,7 +4491,7 @@ fn empty_present_tool_mounts_require_authority_before_any_launch() {
         "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\nmounts = []\n",
     );
     h.symlink_user_config(&target);
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&[], "t", &[]);
     h.assert_refused_before_launch_state(
         &out,
@@ -4515,7 +4642,7 @@ fn tool_mount_opt_out_keeps_all_nonmount_facets_and_checks() {
         "mounts = []\n[mount_sets]\ncyc = [\"cyc\"]\n\
          [[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\nmounts = []\n",
     );
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&["--no-config-mounts"], "t", &[]);
     h.assert_refused_before_launch_state(&out, &before, "mount-set reference cycle");
     // A selected declaration whose source is missing refuses too.
@@ -4523,7 +4650,7 @@ fn tool_mount_opt_out_keeps_all_nonmount_facets_and_checks() {
         "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\n\
          mounts = [\"/nonexistent-agent-vm-396:/gone:ro\"]\n",
     );
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&[], "t", &[]);
     h.assert_refused_before_launch_state(&out, &before, "tools[0].mounts[0]");
 }
@@ -4536,7 +4663,7 @@ fn tool_mount_only_definition_never_patches_shipped_catalog() {
     // cannot be a partial override.
     let h = Harness::new();
     h.write_user("[[tools]]\nname = \"pi\"\nmounts = [\"/a:/a:ro\"]\n");
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&[], "pi", &[]);
     h.assert_refused_before_launch_state(&out, &before, "invalid TOML or tool schema");
 
@@ -4578,7 +4705,7 @@ fn unselected_tool_sources_are_not_inspected_and_selected_missing_fails() {
             .any(|(_, guest, _)| guest == "/gone")
     );
     // Selected, the same declaration fails at preparation and names its site.
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&[], "broken", &[]);
     h.assert_refused_before_launch_state(&out, &before, "tools[1].mounts[0]");
     // Under the opt-out the automatic selection is gone, so the once-failing verb
@@ -4726,7 +4853,7 @@ fn inherited_mounts_and_persist_collide_before_any_fork() {
              [[tools]]\nname = \"u\"\ncommand = \"/bin/echo\"\n\
              mounts = {other_mounts}\npersist = {other_persist}\n"
         ));
-        let before = h.snapshot();
+        let before = h.before();
         let out = h.launch(&[], "t", &[]);
         let stderr = stderr_of(&out);
         assert!(
@@ -4739,7 +4866,7 @@ fn inherited_mounts_and_persist_collide_before_any_fork() {
             "no fork may be published before the collision is refused: {stderr}"
         );
         assert!(!stderr.contains(CONFIG_MARKER), "{stderr}");
-        assert_eq!(h.snapshot(), before, "{stderr}");
+        assert_eq!(h.snapshot(), before.entries, "{stderr}");
         assert!(h.fork_dirs().is_empty(), "{stderr}");
     }
 
@@ -4754,7 +4881,7 @@ fn inherited_mounts_and_persist_collide_before_any_fork() {
          mounts = [\"~/fork-src:/f:fork\", \"~/live:{shadow}:ro\"]\n\
          [[tools]]\nname = \"u\"\ncommand = \"/bin/echo\"\npersist = [\"x-state\"]\n"
     ));
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&[], "t", &[]);
     let stderr = stderr_of(&out);
     assert!(
@@ -4763,7 +4890,7 @@ fn inherited_mounts_and_persist_collide_before_any_fork() {
     );
     assert!(!stderr.contains("Initialized fork"), "{stderr}");
     assert!(h.fork_dirs().is_empty(), "{stderr}");
-    assert_eq!(h.snapshot(), before, "{stderr}");
+    assert_eq!(h.snapshot(), before.entries, "{stderr}");
 }
 
 /// #396 AC-guards: every core, config-directory, protected-Pi, file and follow-link
@@ -4779,7 +4906,7 @@ fn tool_mount_routes_retain_core_config_file_and_follow_guards() {
         "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\n\
          mounts = [\"~/src:/agent-vm-state:ro\"]\n",
     );
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&[], "t", &[]);
     h.assert_refused_before_launch_state(&out, &before, "tools[0].mounts[0] in");
 
@@ -4790,7 +4917,7 @@ fn tool_mount_routes_retain_core_config_file_and_follow_guards() {
         "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\ntools = []\n\
          mounts = [\"~/.config:rw\"]\n",
     );
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&[], "t", &[]);
     h.assert_refused_before_launch_state(&out, &before, "would let the guest change what");
     assert!(
@@ -4805,7 +4932,7 @@ fn tool_mount_routes_retain_core_config_file_and_follow_guards() {
     let auth = h.home_root.join(".pi/agent/auth.json");
     write_file(&auth, "{\"token\":\"host\"}");
     h.write_user("[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\nmounts = [\"~/.pi:ro\"]\n");
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&[], "t", &[]);
     let stderr = stderr_of(&out);
     assert!(
@@ -4831,7 +4958,7 @@ fn tool_mount_routes_retain_core_config_file_and_follow_guards() {
         "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\nmounts = [\"{}:/file:rw\"]\n",
         file.display()
     ));
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&[], "t", &[]);
     h.assert_refused_before_launch_state(&out, &before, "a file can only be mounted read-only");
     h.write_user(&format!(
@@ -4855,7 +4982,7 @@ fn tool_mount_routes_retain_core_config_file_and_follow_guards() {
         "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\nmounts = [\"{}:/f:fork\"]\n",
         file.display()
     ));
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&[], "t", &[]);
     let stderr = stderr_of(&out);
     assert!(
@@ -4922,7 +5049,7 @@ fn tool_mount_routes_retain_core_config_file_and_follow_guards() {
         "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\n\
          mounts = [\"~/farm:/farm:ro:follow-links\"]\n",
     );
-    let before = h.snapshot();
+    let before = h.before();
     let out = h.launch(&[], "t", &[]);
     let stderr = stderr_of(&out);
     assert!(stderr.contains("which is outside your $HOME"), "{stderr}");

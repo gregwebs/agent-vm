@@ -2,11 +2,14 @@
 
 ## Status
 
-Proposed. This is the runtime boundary for [Live network approvals on
-macOS](https://github.com/gregwebs/agent-vm/issues/501). The work is tracked in
-[record egress refusals](https://github.com/gregwebs/agent-vm/issues/502) and
+Accepted. This is the runtime boundary for [Live network approvals on
+macOS](https://github.com/gregwebs/agent-vm/issues/501). Both extension points
+have landed in the fork: [record egress
+refusals](https://github.com/gregwebs/agent-vm/issues/502) as refusal log out, and
 [replace a running sandbox's network
-policy](https://github.com/gregwebs/agent-vm/issues/503).
+policy](https://github.com/gregwebs/agent-vm/issues/503) as policy replace in.
+agent-vm calls neither; the `vendor/microsandbox` pin (fork main `dee2001c`,
+0.7.13) carries both, and #501 slice 1 adds the first reader of the refusal log.
 
 ## Decision
 

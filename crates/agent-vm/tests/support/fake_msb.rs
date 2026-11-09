@@ -37,11 +37,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// `msb_install::expected_msb_version()`: these are black-box tests that spawn
 /// the compiled binary and do not link the crate. If it drifts, every harness
 /// fails at `point_at_msb`.
-pub const VERSION_LINE: &str = "msb 0.7.11";
+pub const VERSION_LINE: &str = "msb 0.7.13";
 
 /// Launch capabilities of the packaged runtime with `net` enabled. Both fakes
 /// share this source; the contract test compares it to the bundled CLI handler.
-const PROTOCOL_JSON: &str = r#"{"protocols":[2,1],"required_restore_backing":true,"header_credentials":true,"tcp_accept_queue_size":true,"max_inbound_tcp_connections":true,"http_deny_message":true,"http_deny_json":true,"http_connect_proxy":true,"http_connect_proxy_auth":true,"proxy_from_env":true,"guest_clock":true,"fs_state_limit":true,"exec_limits":true}"#;
+const PROTOCOL_JSON: &str = r#"{"protected_guest_state":true,"protocols":[2,1],"required_restore_backing":true,"header_credentials":true,"tcp_accept_queue_size":true,"max_inbound_tcp_connections":true,"http_deny_message":true,"http_deny_json":true,"http_connect_proxy":true,"http_connect_proxy_auth":true,"proxy_from_env":true,"guest_clock":true,"fs_state_limit":true,"nested_virt":false,"exec_limits":true}"#;
 
 /// How the fake runtime answers an invocation other than `--version`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -329,6 +329,62 @@ pub fn output_retrying_busy(mut command: std::process::Command) -> std::process:
 mod tests {
     use super::*;
 
+    /// The one host probe this fixture models: the exact expression the vendored
+    /// `__launch-protocol` handler runs for `nested_virt`, which is discovered on
+    /// the host rather than advertised as a constant.
+    const NESTED_VIRT_PROBE: &str =
+        "Some(microsandbox_runtime::nested_virt_supported().unwrap_or(false))";
+
+    /// The handler wraps that expression across lines, so the comparison ignores
+    /// layout and reads the expression.
+    fn without_whitespace(expression: &str) -> String {
+        expression.split_whitespace().collect()
+    }
+
+    /// Require `value` to be [`NESTED_VIRT_PROBE`] and nothing else.
+    ///
+    /// The fake answers a fixed `false` here, so this oracle guards which
+    /// expression the runtime runs, not what it returns. Merely mentioning the
+    /// probe would also accept `Some(false && …nested_virt_supported()…)`, which
+    /// advertises a hard `false` on a capable host.
+    fn assert_host_probe(name: &str, value: &str) {
+        assert_eq!(
+            without_whitespace(value),
+            NESTED_VIRT_PROBE,
+            "{name} is host-probed by an unreviewed expression: {value}"
+        );
+    }
+
+    #[test]
+    fn host_probe_is_the_reviewed_expression() {
+        assert_host_probe(
+            "nested_virt",
+            "Some(
+                 microsandbox_runtime::nested_virt_supported().unwrap_or(false)
+             )",
+        );
+        // The shape the replaced `contains("nested_virt_supported()")` predicate
+        // accepted: a probe short-circuited to `false` on every host.
+        let broken =
+            "Some(false && microsandbox_runtime::nested_virt_supported().unwrap_or(false))";
+        assert!(
+            std::panic::catch_unwind(|| assert_host_probe("nested_virt", broken)).is_err(),
+            "a probe that advertises a hard `false` must not pass as host-probed"
+        );
+    }
+
+    #[test]
+    fn field_splitter_refuses_a_truncated_literal() {
+        // What an early `})` inside the vendored literal would leave the caller
+        // with: everything after it, including whole capabilities, never read.
+        // The caller cuts at the first `})`, so the splitter is the only place
+        // that can notice.
+        assert!(
+            std::panic::catch_unwind(|| split_fields("nested_virt: Some(match host {")).is_err(),
+            "a literal that does not end at depth 0 must not split into fields"
+        );
+    }
+
     #[test]
     fn every_mode_installs_a_complete_pair() {
         for mode in [Mode::VersionOnly, Mode::StrictAcquisition, Mode::LaunchSeam] {
@@ -387,12 +443,14 @@ mod tests {
             .0;
         let mut actual = serde_json::Map::new();
         let mut net_gated = 0;
-        for line in fields
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-        {
-            let (name, value) = line.trim_end_matches(',').split_once(':').unwrap();
+        // Capabilities the runtime discovers on the host instead of advertising
+        // a constant. The fake answers a fixed `false` there, so this oracle
+        // checks that the field exists and that the probe behind it is the
+        // expected one, not its value.
+        let mut host_probed = Vec::new();
+        for field in split_fields(fields) {
+            let (name, value) = field.split_once(':').expect("a `name: value` field");
+            let name = name.trim();
             let value = value.trim();
             let parsed = if value == "cfg!(feature = \"net\")" {
                 // The fixture models the packaged net-enabled binary, not a
@@ -401,23 +459,78 @@ mod tests {
                 serde_json::Value::Bool(true)
             } else if let Some(array) = value.strip_prefix("vec!") {
                 serde_json::from_str(array).expect("literal protocol array")
-            } else {
-                assert!(
-                    matches!(value, "true" | "false"),
-                    "unknown capability expression: {line}"
-                );
+            } else if matches!(value, "true" | "false") {
                 serde_json::from_str(value).unwrap()
+            } else if value.starts_with("Some(") {
+                assert_host_probe(name, value);
+                host_probed.push(name);
+                continue;
+            } else {
+                panic!("unknown capability expression: {name}: {value}");
             };
-            assert!(actual.insert(name.trim().to_owned(), parsed).is_none());
+            assert!(actual.insert(name.to_owned(), parsed).is_none());
         }
         assert_eq!(
             net_gated, 6,
             "review feature-gating changes at a vendor bump"
         );
         assert_eq!(
-            serde_json::Value::Object(actual),
-            serde_json::from_str::<serde_json::Value>(PROTOCOL_JSON).unwrap()
+            host_probed,
+            ["nested_virt"],
+            "the host-probed capability set changed; review the fake's fixture"
         );
+        let mut expected =
+            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(PROTOCOL_JSON)
+                .unwrap();
+        for name in host_probed {
+            assert!(
+                expected
+                    .remove(name)
+                    .is_some_and(|value| value.is_boolean()),
+                "the fake must still advertise {name} as a boolean"
+            );
+        }
+        assert_eq!(
+            serde_json::Value::Object(actual),
+            serde_json::Value::Object(expected)
+        );
+    }
+
+    /// Split the `LaunchCapabilities { … }` literal into top-level fields.
+    ///
+    /// A line-based split cannot read a field whose value spans lines (a host
+    /// probe is written as `Some(\n …\n)`), so this counts the delimiters inside
+    /// a value and only splits on the commas between fields.
+    fn split_fields(fields: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut depth = 0usize;
+        let mut start = 0usize;
+        for (index, character) in fields.char_indices() {
+            match character {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => {
+                    depth = depth
+                        .checked_sub(1)
+                        .expect("the LaunchCapabilities literal is unbalanced")
+                }
+                ',' if depth == 0 => {
+                    out.push(&fields[start..index]);
+                    start = index + 1;
+                }
+                _ => {}
+            }
+        }
+        out.push(&fields[start..]);
+        out.retain(|field| !field.trim().is_empty());
+        // The caller stops at the first `})`, which an unbalanced literal could
+        // match early and hide the fields after it. Requiring depth 0 at the end
+        // turns such a truncation into a failure instead of a shorter, silently
+        // unchecked capability list.
+        assert_eq!(
+            depth, 0,
+            "the LaunchCapabilities literal must end at bracket depth 0"
+        );
+        out
     }
 
     #[test]

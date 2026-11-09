@@ -1094,7 +1094,7 @@ mod tests {
         // bump that the vendored Cargo.toml's version didn't actually track,
         // which `include_str!` alone can't catch (it'd just read the new
         // value). Bump this literal by hand alongside the gitlink.
-        assert_eq!(expected_msb_version(), "0.7.11");
+        assert_eq!(expected_msb_version(), "0.7.13");
     }
 
     #[test]
