@@ -130,6 +130,25 @@ impl ProjectAllowances {
         }
     }
 
+    /// A set built from spellings: the seam `network`'s and `access`'s tests
+    /// use to hand the policy computation records without a file. Test-only,
+    /// because a production caller must never assemble a set the schema did not
+    /// check.
+    #[cfg(test)]
+    pub(crate) fn for_tests(spellings: &[&str]) -> Self {
+        let mut entries: Vec<ProjectAllowance> = Vec::new();
+        for text in spellings {
+            let destination = Allowance::parse(text).expect(text);
+            if !entries.iter().any(|held| held.destination == destination) {
+                entries.push(ProjectAllowance {
+                    destination,
+                    recorded_ms: 0,
+                });
+            }
+        }
+        Self { entries }
+    }
+
     /// The port set a hostname record's rules are built from: every recorded
     /// hostname contributes, exactly as the launch's own producer does, so a
     /// bare recorded name covers the ports a *recorded* `tcp://NAME:PORT` adds

@@ -1,6 +1,8 @@
 //! Launch networking configuration, validation, and lifecycle reporting.
 
 use crate::network_requests::{NetworkRequest, NetworkRequests, RequestReport, RequestTier};
+use std::path::Path;
+
 use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 use microsandbox::{Sandbox, sandbox::SandboxBuilder};
@@ -100,6 +102,15 @@ pub(crate) struct Plan {
     proxy_from_env: bool,
     proxy_not_applied_reason: &'static str,
     proxy_notice: Option<ProxyNotice>,
+    /// Whether a host HTTP proxy connector is in use for this launch, whatever
+    /// `AGENT_VM_PROXY_FROM_ENV` says.
+    ///
+    /// The plan already refuses a *configured* hostname for exactly this reason:
+    /// the runtime resolves the name on the host, so the sandbox never sees an
+    /// SNI it could verify. A *recorded* hostname must not refuse the launch
+    /// (ADR-0065 P6), so it is skipped instead — under the same predicate, so
+    /// the two cannot disagree about when a name is unrepresentable.
+    host_proxy_used: bool,
 }
 
 #[derive(Debug)]
@@ -293,6 +304,41 @@ impl Plan {
             proxy_from_env,
             proxy_not_applied_reason,
             proxy_notice,
+            host_proxy_used: observation.connector_used,
+        })
+    }
+
+    /// Adopt this project's recorded allowances into the one policy computation
+    /// (ADR-0065 P6). Never fails.
+    ///
+    /// The returned [`Some`] is the one notice for the only case a record cannot
+    /// be carried: a hostname while a host HTTP proxy is in use. Every other
+    /// record either joins the authority or never reached here, because the
+    /// facade already refused it.
+    pub(crate) fn adopt_recorded(
+        &mut self,
+        file: &Path,
+        recorded: &crate::allowances::ProjectAllowances,
+    ) -> Option<String> {
+        if recorded.len() == 0 {
+            return None;
+        }
+        let mut applied = Vec::with_capacity(recorded.len());
+        let mut skipped = 0usize;
+        for destination in recorded.destinations() {
+            if self.host_proxy_used
+                && matches!(destination, crate::egress_policy::Allowance::Hostname(_))
+            {
+                skipped += 1;
+                continue;
+            }
+            applied.push(destination.clone());
+        }
+        self.egress.set_recorded(file, applied);
+        (skipped > 0).then(|| {
+            format!(
+                "{skipped} project hostname allowance(s) not applied: a host HTTP proxy resolves those names from the host, so the sandbox cannot intercept them; remove the proxy to apply them"
+            )
         })
     }
 
@@ -814,6 +860,156 @@ mod tests {
             String::from_utf8(output)
                 .unwrap()
                 .contains("found but not applied to this sandbox: not a usable http:// proxy")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // E1–E3: the recorded set reaches one policy computation (ADR-0065 P6)
+    // -----------------------------------------------------------------------
+
+    const ALLOWANCE_FILE: &str = "/home/a/.config/agent-vm/allowances.json";
+
+    /// [`configured_network`] for a plan that already has its recorded set.
+    async fn recorded_network(plan: &Plan, name: &str) -> serde_json::Value {
+        let config = plan
+            .apply_to(test_builder(name))
+            .build()
+            .await
+            .expect("network config");
+        serde_json::to_value(config.spec.network).expect("network serializes")
+    }
+
+    fn notices_of(plan: &Plan) -> String {
+        let mut output = Vec::new();
+        plan.emit_launch_notices_to(&mut output).unwrap();
+        String::from_utf8(output).unwrap()
+    }
+
+    /// AC1: one recorded address is a rule in the config this launch applies,
+    /// and the notices name it as the project's own.
+    #[tokio::test]
+    async fn recorded_address_reaches_the_applied_policy() {
+        let mut plan = plan(args());
+        assert_eq!(
+            plan.adopt_recorded(
+                Path::new(ALLOWANCE_FILE),
+                &crate::allowances::ProjectAllowances::for_tests(&["tcp://[203.0.113.10/32]:443"])
+            ),
+            None,
+            "an address record is never skipped"
+        );
+        let network = recorded_network(&plan, "recorded-address").await;
+        assert_eq!(
+            network["policy"]["rules"],
+            serde_json::json!([
+                {"direction":"egress","destination":{"cidr":"203.0.113.10/32"},"protocols":["tcp"],"ports":[{"start":443,"end":443}],"action":"allow"}
+            ])
+        );
+        // An address record intercepts nothing: TLS stays off.
+        assert_eq!(network["tls"]["enabled"], false);
+        let notices = notices_of(&plan);
+        assert!(
+            notices.contains(&format!(
+                "==> Egress authority: 1 project allowance(s) from \"{ALLOWANCE_FILE}\""
+            )),
+            "{notices}"
+        );
+        assert!(
+            notices.contains(
+                "==> Egress policy: allowing tcp://[203.0.113.10/32]:443 (project allowance)"
+            ),
+            "{notices}"
+        );
+    }
+
+    /// AC6: with a host HTTP proxy in use, recorded hostnames are skipped with
+    /// one warning; recorded addresses still apply and the launch is not
+    /// refused. A configured hostname in the same launch *is* refused, so this
+    /// is not the refusal path with the wrong message.
+    #[tokio::test]
+    async fn recorded_hostnames_are_skipped_with_a_host_proxy() {
+        let mut plan = Plan::from_args_with_proxy_lookup(args(), None, None, |variable| {
+            (variable == "HTTPS_PROXY").then(|| "http://127.0.0.1:9".into())
+        })
+        .unwrap();
+        let notice = plan
+            .adopt_recorded(
+                Path::new(ALLOWANCE_FILE),
+                &crate::allowances::ProjectAllowances::for_tests(&[
+                    "tcp://[203.0.113.10/32]:443",
+                    "api.example.com",
+                ]),
+            )
+            .expect("one notice for the skipped hostname");
+        assert!(
+            notice.starts_with("1 project hostname allowance(s) not applied: "),
+            "{notice}"
+        );
+        assert!(notice.contains("host HTTP proxy"), "{notice}");
+        let network = recorded_network(&plan, "recorded-proxy").await;
+        let rules = network["policy"]["rules"].as_array().unwrap();
+        assert!(
+            rules
+                .iter()
+                .any(|rule| rule["destination"]["cidr"] == "203.0.113.10/32"),
+            "{rules:?}"
+        );
+        assert!(
+            !rules
+                .iter()
+                .any(|rule| rule["destination"]["domain"].is_string()),
+            "a skipped hostname installs no Domain rule: {rules:?}"
+        );
+        assert_eq!(network["tls"]["enabled"], false);
+        let notices = notices_of(&plan);
+        assert!(
+            notices.contains(
+                "==> Egress policy: allowing tcp://[203.0.113.10/32]:443 (project allowance)"
+            ),
+            "{notices}"
+        );
+        assert!(!notices.contains("allowing TLS to"), "{notices}");
+    }
+
+    /// AC2: a launch whose *only* hostname is a recorded one still installs the
+    /// whole interception apparatus — Domain rule, TLS on, port 443, and
+    /// request coverage — and says where it came from.
+    #[tokio::test]
+    async fn record_only_hostname_installs_interception() {
+        let mut plan = plan(args());
+        assert_eq!(
+            plan.adopt_recorded(
+                Path::new(ALLOWANCE_FILE),
+                &crate::allowances::ProjectAllowances::for_tests(&["api.example.com"])
+            ),
+            None
+        );
+        let network = recorded_network(&plan, "recorded-hostname").await;
+        assert_eq!(
+            network["policy"]["rules"],
+            serde_json::json!([
+                {"direction":"egress","destination":{"domain":"api.example.com"},"protocols":["tcp"],"ports":[{"start":443,"end":443}],"action":"allow"}
+            ])
+        );
+        assert_eq!(network["tls"]["enabled"], true);
+        assert_eq!(
+            network["tls"]["intercepted_ports"],
+            serde_json::json!([443])
+        );
+        let requests =
+            crate::network_requests::NetworkRequests::parse(&["api.example.com:443".to_owned()])
+                .unwrap();
+        assert!(requests.iter().all(|request| plan.covers(request)));
+        let notices = notices_of(&plan);
+        assert!(
+            notices.contains(
+                "==> Egress policy: allowing TLS to api.example.com on ports 443 (project allowance)"
+            ),
+            "{notices}"
+        );
+        assert!(
+            notices.contains("==> TLS interception: ports 443 — global to every destination"),
+            "{notices}"
         );
     }
 

@@ -877,7 +877,7 @@ pub(crate) async fn launch(
     // Same reason, one flag earlier in the list: read once, before `args.network`
     // moves, so discovery never re-reads it.
     let git_mount_mode = args.git_mount_mode();
-    let network_plan = crate::network::Plan::from_args(args.network, user_network, user_tools)?;
+    let mut network_plan = crate::network::Plan::from_args(args.network, user_network, user_tools)?;
     // The one output policy for this selection: explicit sources render their
     // escaped reference; the default tier renders a fixed label and redacts the
     // reference from every notice, debug dump, progress line and error chain.
@@ -1528,6 +1528,20 @@ pub(crate) async fn launch(
     // suppressed. That decision is made once, in `assemble_guest_env` below,
     // rather than at each emission site; see `credential_resolver`.
 
+    // ADR-0065: the project's recorded allowances join this launch's egress
+    // authority here — after the control socket exists (ADR-0064 AC9), before
+    // the notices that describe and the policy that enforces the result. Never
+    // fails the launch: a store problem is one warning and the configured
+    // authority stays exactly as it was.
+    let recorded = crate::allowances::for_launch(&project);
+    if let Some(notice) = recorded.notice() {
+        notices.emit(format!("warning: {notice}"))?;
+    }
+    if let Some(file) = recorded.file()
+        && let Some(notice) = network_plan.adopt_recorded(file, recorded.allowances())
+    {
+        notices.emit(format!("warning: {notice}"))?;
+    }
     network_plan
         .emit_launch_notices()
         .context("writing launch networking notices")?;
@@ -4725,7 +4739,7 @@ mod tests {
             .0;
         let position = |needle| production.find(needle).expect("launch step is present");
         let plan = position(
-            "let network_plan = crate::network::Plan::from_args(args.network, user_network, user_tools)?;",
+            "let mut network_plan = crate::network::Plan::from_args(args.network, user_network, user_tools)?;",
         );
         let notices = position(".emit_launch_notices()");
         let base_network = position("builder = network_plan.apply_to(builder);");
@@ -4762,6 +4776,19 @@ mod tests {
         // nothing between the two removes this session's sandbox without the
         // teardown hook that finishes the feed.
         let live_start = position("LiveSession::start(&session)");
+        // ADR-0065: the recorded set is read after the socket exists (so the
+        // session cannot miss a change aimed at it) and before the notices and
+        // the policy, so one computation produces every derived view.
+        let recorded = position("crate::allowances::for_launch(&project)");
+        let adopt = position(".adopt_recorded(");
+        assert!(
+            live_start < recorded,
+            "the store is read after the control socket exists (ADR-0064 AC9)"
+        );
+        assert!(
+            recorded < adopt && adopt < notices,
+            "the recorded set joins the authority before the notices describe it"
+        );
         let follow = position("live.follow(&sandbox);");
         let log_dir = position("let log_dir = sandbox_log_dir(");
         assert!(

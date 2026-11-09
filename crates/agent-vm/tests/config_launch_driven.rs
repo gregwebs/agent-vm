@@ -14201,3 +14201,396 @@ fn persisted_set_error_fails_every_route_and_doctor() {
     assert!(text.contains("==> tool configuration"), "{text}");
     assert!(text.contains(&reason), "{text}");
 }
+
+// ---------------------------------------------------------------------------
+// ADR-0065: the project allowance record reaches the launch
+// ---------------------------------------------------------------------------
+//
+// A record written by hand (PR 1 has no writer) and a real launch: the store is
+// read between the control socket and the notices, and the resulting
+// `SandboxConfig` is the one the runtime would be given.
+
+#[path = "support/authority_snapshot.rs"]
+mod authority_snapshot;
+
+/// The record table's `project` column: the full lowercase hex SHA-256 of the
+/// canonical path's bytes, computed here independently of the launcher
+/// (`project::digest_hex`).
+fn allowance_digest(path: &Path) -> String {
+    use sha2::{Digest as _, Sha256};
+    use std::os::unix::ffi::OsStrExt as _;
+    Sha256::digest(path.as_os_str().as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// One record line, as literal JSON: PR 1 has no writer, so every fixture is
+/// hand-written exactly as a later release would encode it.
+fn allowance_record(project: &Path, destination: &str) -> String {
+    format!(
+        r#"{{"project":"{}","path":"{}","destination":"{}","recorded_ms":1762680120000}}"#,
+        allowance_digest(project),
+        project.display(),
+        destination
+    )
+}
+
+fn allowance_file(records: &[String]) -> String {
+    format!(r#"{{"v":1,"records":[{}]}}"#, records.join(","))
+}
+
+impl Harness {
+    /// Write the authority directory and a store into it: 0700 and 0600, the
+    /// modes the launcher itself writes.
+    fn seed_allowances(&self, bytes: &str) -> PathBuf {
+        let dir = authority_snapshot::empty_authority_dir(&self.home_root);
+        let file = dir.join("allowances.json");
+        std::fs::write(&file, bytes).unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        file
+    }
+
+    /// [`Self::launch`] from another working directory, so a moved or copied
+    /// project is a real directory and not a rewritten string.
+    fn launch_in(&self, project: &Path, tool: &str, options: &[&str]) -> Output {
+        let mut cmd = self.base_command();
+        cmd.current_dir(project);
+        cmd.args(["--image", BOGUS_IMAGE]);
+        cmd.args(options).arg(tool);
+        run_with_timeout(cmd, Duration::from_secs(20))
+    }
+}
+
+/// The network rules the launch applied, as the runtime would receive them.
+fn applied_rules(stderr: &str) -> Vec<serde_json::Value> {
+    debug_config_json(stderr)["network"]["policy"]["rules"]
+        .as_array()
+        .expect("the policy has a rule list")
+        .clone()
+}
+
+/// Exactly one `warning:` line, and it is the store's. Two warnings for one
+/// broken store is a bug; none is a silent degradation.
+fn allowance_warnings(stderr: &str) -> Vec<String> {
+    stderr
+        .lines()
+        .filter(|line| line.starts_with("warning: ") && line.contains("allowance"))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// This store's entries and the directory's own mode: the slice of the
+/// authority directory a read of `allowances.json` is allowed to disturb.
+fn allowance_facts(directory: &Path) -> authority_snapshot::Snapshot {
+    use std::ffi::OsString;
+    let mut facts = authority_snapshot::take(directory);
+    // The directory's size and mtime move whenever *any* launcher store adds a
+    // name here — the image pin does, on every launch — so only its identity and
+    // mode are this store's evidence.
+    let directory = facts.remove(&OsString::new()).unwrap_or_default();
+    let identity = directory
+        .split_once(" size=")
+        .map_or(directory.clone(), |(head, _)| head.to_owned());
+    facts.retain(|name, _| {
+        name == "allowances.json"
+            || name == "allowances.lock"
+            || name.to_string_lossy().starts_with("allowances.json.")
+    });
+    facts.insert(OsString::new(), identity);
+    facts
+}
+
+/// AC1: a usable address record for this project is a rule in the config the
+/// next launch builds, and the notices name it as the project's own.
+#[test]
+fn project_allowance_reaches_the_sandbox_config() {
+    let h = Harness::warm();
+    h.seed_allowances(&allowance_file(&[allowance_record(
+        &h.project_root,
+        "tcp://[203.0.113.10/32]:443",
+    )]));
+    let out = h.launch("shell", &[]);
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+    assert!(
+        applied_rules(&stderr)
+            .iter()
+            .any(|rule| rule["destination"]["cidr"] == "203.0.113.10/32"
+                && rule["ports"] == serde_json::json!([{"start": 443, "end": 443}])),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "==> Egress policy: allowing tcp://[203.0.113.10/32]:443 (project allowance)"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("project allowance(s) from \""),
+        "the header names the file: {stderr}"
+    );
+    assert!(allowance_warnings(&stderr).is_empty(), "{stderr}");
+}
+
+/// AC1's negative half: another project inherits nothing — not a sibling
+/// directory, not the same directory moved, not a copy of it.
+#[test]
+fn project_allowance_is_not_inherited_by_another_moved_or_copied_project() {
+    let h = Harness::warm();
+    h.seed_allowances(&allowance_file(&[allowance_record(
+        &h.project_root,
+        "tcp://[203.0.113.10/32]:443",
+    )]));
+    // A fresh scratch tree, so no earlier run can leave one of these names
+    // behind (and so `cp` never has to merge into an existing directory).
+    let scratch = support::project_tempdir();
+    let sibling = scratch.path().join("sibling");
+    let moved = scratch.path().join("moved");
+    let copied = scratch.path().join("copied");
+    std::fs::create_dir(&sibling).unwrap();
+    // `moved` is the same contents at a new path, and `copied` is a byte copy.
+    std::fs::rename(&h.project_root, &moved).unwrap();
+    std::fs::create_dir_all(&h.project_root).unwrap();
+    let copy = std::process::Command::new("cp")
+        .arg("-R")
+        .arg(format!("{}/.", h.project_root.display()))
+        .arg(&copied)
+        .status()
+        .expect("cp runs");
+    assert!(copy.success(), "cp -R failed");
+    for project in [&sibling, &moved, &copied] {
+        let out = h.launch_in(project, "shell", &[]);
+        let stderr = stderr_of(&out);
+        assert!(
+            stderr.contains(CONFIG_MARKER),
+            "{}: {stderr}",
+            project.display()
+        );
+        assert!(
+            !applied_rules(&stderr)
+                .iter()
+                .any(|rule| rule["destination"]["cidr"] == "203.0.113.10/32"),
+            "{}: the record followed the project: {stderr}",
+            project.display()
+        );
+        assert!(allowance_warnings(&stderr).is_empty(), "{stderr}");
+    }
+}
+
+/// AC4: every way a store can be unusable degrades to configured authority with
+/// exactly one warning, reaches `builder.build()`, and leaves the authority
+/// directory untouched.
+///
+/// `newer` is not damage: it applies nothing and says so, and the launch is the
+/// same. The state E1 (a hard link) is excluded here because it refuses the
+/// launch; `mount_protected_config` owns it.
+#[test]
+fn project_allowance_degraded_store_warns_once_and_reaches_build() {
+    use std::os::unix::fs::PermissionsExt as _;
+    // One well-formed record and one that does not parse, so "the configured
+    // rules only" is distinguishable from "the whole file was dropped".
+    let good = |h: &Harness| allowance_record(&h.project_root, "tcp://[203.0.113.10/32]:443");
+    let cases: Vec<(&str, Box<dyn Fn(&Harness) -> PathBuf>)> = vec![
+        (
+            "undecodable",
+            Box::new(move |h| h.seed_allowances("this is not json")),
+        ),
+        (
+            "unknown field",
+            Box::new(move |h| h.seed_allowances(r#"{"v":1,"records":[],"extra":1}"#)),
+        ),
+        (
+            "group-writable",
+            Box::new(move |h| {
+                let file = h.seed_allowances(&allowance_file(&[good(h)]));
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o666)).unwrap();
+                file
+            }),
+        ),
+        (
+            "symlink",
+            Box::new(move |h| {
+                let dir = authority_snapshot::empty_authority_dir(&h.home_root);
+                let target = h.home_root.join("elsewhere.json");
+                std::fs::write(&target, allowance_file(&[good(h)])).unwrap();
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+                let file = dir.join("allowances.json");
+                std::os::unix::fs::symlink(&target, &file).unwrap();
+                file
+            }),
+        ),
+        (
+            "newer version",
+            Box::new(move |h| h.seed_allowances(r#"{"v":2,"records":[],"extra":1}"#)),
+        ),
+        (
+            "directory at the name",
+            Box::new(move |h| {
+                let dir = authority_snapshot::empty_authority_dir(&h.home_root);
+                let file = dir.join("allowances.json");
+                std::fs::create_dir(&file).unwrap();
+                file
+            }),
+        ),
+    ];
+    for (row, seed) in cases {
+        let h = Harness::warm();
+        let _file = seed(&h);
+        let directory = h.home_root.join(".config/agent-vm");
+        // A launch also writes its own image pin into this directory, so only
+        // this store's entries and the directory's own mode are this row's
+        // evidence: a reader that created `allowances.lock` or rewrote the file
+        // would fail here, and a pin write would not.
+        let before = allowance_facts(&directory);
+        let out = h.launch("shell", &[]);
+        let stderr = stderr_of(&out);
+        assert!(stderr.contains(CONFIG_MARKER), "{row}: {stderr}");
+        let warnings = allowance_warnings(&stderr);
+        assert_eq!(warnings.len(), 1, "{row}: {warnings:?}\n{stderr}");
+        assert!(
+            warnings[0].contains("project allowances not applied:"),
+            "{row}: {warnings:?}"
+        );
+        assert!(
+            !applied_rules(&stderr)
+                .iter()
+                .any(|rule| rule["destination"]["cidr"] == "203.0.113.10/32"),
+            "{row}: a degraded store applied a record: {stderr}"
+        );
+        assert_eq!(
+            allowance_facts(&directory),
+            before,
+            "{row}: the launch changed this store"
+        );
+    }
+}
+
+/// AC5: one unparseable destination is skipped with one warning naming it, and
+/// the launch's other records still apply.
+#[test]
+fn project_allowance_skips_one_unparseable_destination() {
+    let h = Harness::warm();
+    h.seed_allowances(&allowance_file(&[
+        allowance_record(&h.project_root, "tool:codex"),
+        allowance_record(&h.project_root, "tcp://[203.0.113.10/32]:443"),
+    ]));
+    let out = h.launch("shell", &[]);
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+    let warnings = allowance_warnings(&stderr);
+    assert_eq!(warnings.len(), 1, "{stderr}");
+    assert!(warnings[0].contains("\"tool:codex\""), "{stderr}");
+    assert!(
+        applied_rules(&stderr)
+            .iter()
+            .any(|rule| rule["destination"]["cidr"] == "203.0.113.10/32"),
+        "the other record still applies: {stderr}"
+    );
+}
+
+/// AC6: under a host HTTP proxy the recorded hostname is skipped with one
+/// warning, the address still applies, and the launch is not refused.
+#[test]
+fn project_allowance_hostname_is_skipped_under_a_host_proxy() {
+    let h = Harness::warm();
+    h.seed_allowances(&allowance_file(&[
+        allowance_record(&h.project_root, "api.example.com"),
+        allowance_record(&h.project_root, "tcp://[203.0.113.10/32]:443"),
+    ]));
+    let out = h.launch_with_env("shell", &[], &[("HTTPS_PROXY", "http://127.0.0.1:9")]);
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+    assert!(
+        !stderr.contains("refuses hostname allowances with a host HTTP proxy"),
+        "the launch was refused: {stderr}"
+    );
+    let warnings = allowance_warnings(&stderr);
+    assert_eq!(warnings.len(), 1, "{stderr}");
+    assert!(
+        warnings[0].contains("1 project hostname allowance(s) not applied"),
+        "{stderr}"
+    );
+    let rules = applied_rules(&stderr);
+    assert!(
+        rules
+            .iter()
+            .any(|rule| rule["destination"]["cidr"] == "203.0.113.10/32"),
+        "{stderr}"
+    );
+    assert!(
+        !rules
+            .iter()
+            .any(|rule| rule["destination"]["domain"].is_string()),
+        "{stderr}"
+    );
+    // "TLS is off" is `network::tests`' claim: a real launch's credential
+    // overlay unions its own interception ports (ADR-0037), so `tls.enabled`
+    // here says nothing about the recorded set.
+    assert!(!stderr.contains("allowing TLS to"), "{stderr}");
+}
+
+/// AC2 through the real binary: a launch whose only hostname is a recorded one
+/// installs interception, and the notices say where it came from.
+#[test]
+fn project_allowance_record_only_hostname_enables_interception() {
+    let h = Harness::warm();
+    h.seed_allowances(&allowance_file(&[allowance_record(
+        &h.project_root,
+        "api.example.com",
+    )]));
+    let out = h.launch("shell", &[]);
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+    let config = debug_config_json(&stderr);
+    assert_eq!(config["network"]["tls"]["enabled"], true, "{stderr}");
+    assert_eq!(
+        config["network"]["tls"]["intercepted_ports"],
+        serde_json::json!([443])
+    );
+    assert!(
+        applied_rules(&stderr)
+            .iter()
+            .any(|rule| rule["destination"]["domain"] == "api.example.com"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "==> Egress policy: allowing TLS to api.example.com on ports 443 (project allowance)"
+        ),
+        "{stderr}"
+    );
+}
+
+/// R5: a launch with no store does not create one, and the authority directory
+/// keeps exactly the entries it had.
+#[test]
+fn a_launch_without_a_store_creates_none() {
+    let h = Harness::warm();
+    let out = h.launch("shell", &[]);
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+    assert!(
+        !h.home_root
+            .join(".config/agent-vm/allowances.json")
+            .exists()
+    );
+    assert!(
+        !h.home_root
+            .join(".config/agent-vm/allowances.lock")
+            .exists()
+    );
+
+    // And with an authority directory present but empty, reading it adds
+    // nothing — not a lock, not a file.
+    let directory = authority_snapshot::empty_authority_dir(&h.home_root);
+    let before = authority_snapshot::take(&directory);
+    let out = h.launch("shell", &[]);
+    assert!(
+        stderr_of(&out).contains(CONFIG_MARKER),
+        "{}",
+        stderr_of(&out)
+    );
+    assert_eq!(authority_snapshot::take(&directory), before);
+}

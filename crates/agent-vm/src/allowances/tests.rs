@@ -417,17 +417,7 @@ fn dns_entry(name: &str, site: &str) -> RefusalEntry {
 /// A record set built from spellings, without a file: group B is about the
 /// query, not the read.
 fn set(spellings: &[&str]) -> ProjectAllowances {
-    let mut entries: Vec<ProjectAllowance> = Vec::new();
-    for text in spellings {
-        let destination = Allowance::parse(text).expect(text);
-        if !entries.iter().any(|held| held.destination == destination) {
-            entries.push(ProjectAllowance {
-                destination,
-                recorded_ms: 0,
-            });
-        }
-    }
-    ProjectAllowances { entries }
+    ProjectAllowances::for_tests(spellings)
 }
 
 fn covers(spellings: &[&str], entry: &RefusalEntry) -> bool {
