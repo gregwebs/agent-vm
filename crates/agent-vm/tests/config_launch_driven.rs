@@ -14582,6 +14582,8 @@ fn a_launch_without_a_store_creates_none() {
             .join(".config/agent-vm/allowances.lock")
             .exists()
     );
+    // AC4's other half: an absent store prints *nothing*, not an empty warning.
+    assert!(allowance_warnings(&stderr).is_empty(), "{stderr}");
 
     // And with an authority directory present but empty, reading it adds
     // nothing — not a lock, not a file.
@@ -14591,6 +14593,11 @@ fn a_launch_without_a_store_creates_none() {
     assert!(
         stderr_of(&out).contains(CONFIG_MARKER),
         "{}",
+        stderr_of(&out)
+    );
+    assert!(
+        allowance_warnings(&stderr_of(&out)).is_empty(),
+        "an empty directory is silently nothing: {}",
         stderr_of(&out)
     );
     assert_eq!(authority_snapshot::take(&directory), before);

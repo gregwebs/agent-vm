@@ -177,6 +177,19 @@ fn unusable_destinations_are_named() {
     assert_eq!(notice.matches(" (").count(), 3, "{notice}");
     assert!(notice.ends_with(" and 1 more"), "{notice}");
     assert!(!notice.contains("set:x"), "{notice}");
+    // Exactly three unusable records name all three and claim no tail: a `>=`
+    // in the "more" test would print "and 0 more".
+    let exactly_three = view_of(
+        vec![
+            record(&a, "tool:codex", 1),
+            record(&a, "host.microsandbox.internal", 2),
+            record(&a, "udp://a.example", 3),
+        ],
+        &a,
+    );
+    let notice = exactly_three.notice().unwrap();
+    assert!(!notice.contains("more"), "{notice}");
+    assert_eq!(notice.matches(" (").count(), 3, "{notice}");
     // The usable record still applies.
     assert_eq!(destinations(&view), ["10.0.0.5/32"]);
 }
@@ -462,6 +475,18 @@ fn coverage_table() {
             &["203.0.113.10"][..],
             address_entry("icmpv4", "203.0.113.10", None, "icmp"),
             true,
+        ),
+        (
+            "address/icmpv6, bare v6 record",
+            &["2001:db8::1"][..],
+            address_entry("icmpv6", "2001:db8::1", None, "icmp"),
+            true,
+        ),
+        (
+            "address/icmpv6, v4 record",
+            &["203.0.113.10"][..],
+            address_entry("icmpv6", "2001:db8::1", None, "icmp"),
+            false,
         ),
         (
             "address/cidr, inside",
@@ -991,6 +1016,36 @@ fn allowances_section_states() {
         )
     );
 
+    // One other project with two records, and one whose path is now a *file*:
+    // the count is per project, and a non-directory is an orphan.
+    let (dir, store) = doctor_store(&root.path().join("counting"));
+    let was_file = root.path().join("was-a-file");
+    std::fs::write(&was_file, b"").unwrap();
+    write_store(
+        &dir,
+        vec![
+            record_for(&present, "10.0.0.5", 0),
+            record_for(&present, "10.0.0.6", 0),
+            record_for(&was_file, "10.0.0.7", 0),
+        ],
+        1,
+    );
+    let (section, failure) = doctor_section_at(Some(&store), None, None);
+    assert!(failure.is_none(), "{section}");
+    assert!(section.contains("other projects: 2"), "{section}");
+    assert!(section.contains("(2 allowance(s))"), "{section}");
+    assert!(
+        section.contains(&format!(
+            "orphaned: {} (1 allowance(s))",
+            crate::one_line::path(&was_file)
+        )),
+        "{section}"
+    );
+    assert!(
+        section.contains("orphaned: 1 project path(s) no longer exist"),
+        "{section}"
+    );
+
     // A newer file is counted, not applied, and does not fail the run.
     let (dir, store) = doctor_store(&root.path().join("newer"));
     write_store(
@@ -1064,6 +1119,75 @@ fn allowances_section_states() {
         "{section}"
     );
     assert!(failure.is_some(), "an unusable $HOME fails the run");
+}
+
+/// The timestamp renderer is a calendar, so it gets a table rather than one
+/// date: every month, both leap years and a non-leap century, and one instant
+/// before the epoch. Each row is an independently computed UTC reading, so a
+/// rewritten formula fails on the row whose arithmetic it changed.
+#[test]
+fn recorded_at_is_a_utc_calendar() {
+    for (ms, expected) in [
+        (0_i64, "1970-01-01 00:00Z"),
+        (-86_400_000, "1969-12-31 00:00Z"),
+        (951_782_400_000, "2000-02-29 00:00Z"),
+        (1_704_067_200_000, "2024-01-01 00:00Z"),
+        (1_706_745_540_000, "2024-01-31 23:59Z"),
+        (1_709_164_800_000, "2024-02-29 00:00Z"),
+        (1_709_251_200_000, "2024-03-01 00:00Z"),
+        (1_718_454_840_000, "2024-06-15 12:34Z"),
+        (1_720_051_200_000, "2024-07-04 00:00Z"),
+        (1_727_654_400_000, "2024-09-30 00:00Z"),
+        (1_732_924_800_000, "2024-11-30 00:00Z"),
+        (1_735_689_540_000, "2024-12-31 23:59Z"),
+        (1_735_689_600_000, "2025-01-01 00:00Z"),
+        (1_762_680_120_000, "2025-11-09 09:22Z"),
+        (4_102_444_800_000, "2100-01-01 00:00Z"),
+        (4_107_542_400_000, "2100-03-01 00:00Z"),
+    ] {
+        assert_eq!(recorded_at(ms), expected, "{ms}");
+    }
+}
+
+/// The two entry points that read `$HOME`: a store is found where `$HOME` says
+/// it is, and an unusable `$HOME` is the one section state that is not about a
+/// file. This is the only test in the module that touches the environment, and
+/// it holds the process-wide guard while it does.
+#[test]
+fn doctor_section_and_the_launch_view_read_the_store_under_home() {
+    let mut env = crate::test_env::guard();
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let project = root.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let (dir, _) = doctor_store(&home.join(".config"));
+    let project = project.canonicalize().unwrap();
+    write_store(
+        &dir,
+        vec![record_for(&project, "tcp://[203.0.113.10/32]:443", 0)],
+        1,
+    );
+    env.set_var("HOME", &home);
+    let (section, failure) = doctor_section(Some(
+        &crate::project::ProjectDir::from_path_for_tests(&project).unwrap(),
+    ));
+    assert!(failure.is_none(), "{section}");
+    assert!(section.contains("(version 1, mode 0600)"), "{section}");
+    assert!(section.contains("this project: 1"), "{section}");
+    // The launch's view selects the same record, so the two commands cannot
+    // disagree about what this project has.
+    let view = for_launch(&crate::project::ProjectDir::from_path_for_tests(&project).unwrap());
+    assert_eq!(view.allowances().len(), 1);
+    assert!(view.notice().is_none(), "{:?}", view.notice());
+
+    // An unusable `$HOME` is not the file's fault, and is still reported.
+    env.set_var("HOME", "");
+    let (section, failure) = doctor_section(None);
+    assert!(
+        section.contains("file: not read ($HOME is set but empty)"),
+        "{section}"
+    );
+    assert!(failure.is_some(), "{section}");
 }
 
 /// The orphan classification's third row: a path whose *ancestor* cannot be

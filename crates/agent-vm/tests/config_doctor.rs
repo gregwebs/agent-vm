@@ -2499,14 +2499,24 @@ impl Harness {
 #[test]
 fn untrusted_and_unreadable_stores_fail_after_every_section() {
     use std::os::unix::fs::PermissionsExt as _;
-    for row in ["group-writable", "damaged", "directory"] {
+    // Mode 000 is the unreadable row; as root every mode is readable, so that
+    // row cannot run and is left out rather than passing for the wrong reason.
+    let rows: &[&str] = if unsafe { libc::geteuid() } == 0 {
+        &["group-writable", "damaged", "directory"]
+    } else {
+        &["group-writable", "damaged", "directory", "unreadable"]
+    };
+    for row in rows {
         let h = Harness::new();
         let file = h.write_allowances(r#"{"v":1,"records":[]}"#);
-        match row {
+        match *row {
             "group-writable" => {
                 std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o666)).unwrap()
             }
             "damaged" => std::fs::write(&file, b"not json").unwrap(),
+            "unreadable" => {
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap()
+            }
             _ => {
                 std::fs::remove_file(&file).unwrap();
                 std::fs::create_dir(&file).unwrap();

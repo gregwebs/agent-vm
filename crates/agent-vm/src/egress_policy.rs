@@ -319,19 +319,24 @@ struct Destinations {
 }
 
 impl Destinations {
-    /// Append `other` after `self`, deduplicating by canonical value — the same
-    /// rule `resolve` applies to a launch's own entries.
+    /// Append one entry, deduplicating by canonical value — the same rule
+    /// `resolve` applies to a launch's own entries.
+    fn push(&mut self, allowance: &Allowance) {
+        match allowance {
+            Allowance::Address(address) if !self.addresses.contains(address) => {
+                self.addresses.push(*address);
+            }
+            Allowance::Hostname(hostname) if !self.hostnames.contains(hostname) => {
+                self.hostnames.push(hostname.clone());
+            }
+            _ => {}
+        }
+    }
+
+    /// [`Self::push`] over a set, in its own order.
     fn extend_with(&mut self, other: &[Allowance]) {
         for allowance in other {
-            match allowance {
-                Allowance::Address(address) if !self.addresses.contains(address) => {
-                    self.addresses.push(*address);
-                }
-                Allowance::Hostname(hostname) if !self.hostnames.contains(hostname) => {
-                    self.hostnames.push(hostname.clone());
-                }
-                _ => {}
-            }
+            self.push(allowance);
         }
     }
 }
@@ -414,14 +419,13 @@ impl EgressAuthority {
         })?;
         let user_entries = user.as_ref().map(|u| u.allowances.clone());
         let mut configured = Destinations::default();
-        configured.extend_with(
-            &user_entries
-                .iter()
-                .flat_map(ResolvedAllowances::allowances)
-                .cloned()
-                .collect::<Vec<_>>(),
-        );
-        configured.extend_with(&cli.allowances().cloned().collect::<Vec<_>>());
+        for allowance in user_entries
+            .iter()
+            .flat_map(ResolvedAllowances::allowances)
+            .chain(cli.allowances())
+        {
+            configured.push(allowance);
+        }
         let provenance = user.map(|u| Provenance {
             file: u.file.to_owned(),
             internet: GroupOrigin {
