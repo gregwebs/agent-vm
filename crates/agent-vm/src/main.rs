@@ -63,6 +63,7 @@ mod protected_config_dir;
 mod protected_host_files;
 mod pull;
 mod pull_progress;
+mod refusal;
 mod run;
 mod secret;
 mod secret_store;

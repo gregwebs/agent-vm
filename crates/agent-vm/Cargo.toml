@@ -200,6 +200,10 @@ tar = "0.4"
 # declares, so the resolver reuses the proptest 1.11 already in the graph
 # rather than adding a second resolution.
 proptest = "1"
+# Names `chrono::DateTime<Utc>` in the refusal tests, which build
+# `NetworkLogRecord`s with explicit timestamps. Already in the build graph
+# (the SDK's log types are chrono-based), so this adds no compilation.
+chrono = "0.4"
 # Used only by the msb_preflight / preflight_boot / msb_passthrough tests to
 # CONSTRUCT a valid SQLite fixture DB with a seaql_migrations table (a plain
 # `std::fs::write` of arbitrary bytes, as doctor_reset.rs's fixture does, is

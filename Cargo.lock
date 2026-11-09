@@ -25,6 +25,7 @@ version = "0.7.42"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "chrono",
  "clap",
  "console",
  "getrandom 0.4.2",
