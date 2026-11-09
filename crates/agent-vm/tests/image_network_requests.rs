@@ -1264,7 +1264,7 @@ fn a11_a_labeled_launch_emits_the_same_network_object_as_an_unlabeled_one() {
 /// that (#505 review C's bounded-evidence note). `mtime_nsec` is compared too,
 /// so a same-second rewrite cannot hide.
 fn tree(root: &Path) -> Vec<(PathBuf, String)> {
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt};
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -1286,6 +1286,10 @@ fn tree(root: &Path) -> Vec<(PathBuf, String)> {
                 stack.push(path);
             } else if metadata.file_type().is_symlink() {
                 out.push((path, format!("<symlink> {stamp}")));
+            } else if metadata.file_type().is_socket() {
+                // A live session's control socket (ADR-0064): the kernel does not
+                // allow reading one.
+                out.push((path, format!("<socket> {stamp}")));
             } else {
                 out.push((
                     path.clone(),
