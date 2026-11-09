@@ -738,6 +738,10 @@ fn write_loop(slot: &Slot, dir: &SessionsDir) {
     // once and an eviction is not announced on every write.
     let mut reported_warning: Option<String> = None;
     let mut reported_evictions = 0u64;
+    // A write that keeps failing would otherwise say so on every tick, turning
+    // one broken log into a notice storm. Said once, and said again only after a
+    // write has succeeded, so the message means "since the last good write".
+    let mut write_failing = false;
     loop {
         let job = {
             let mut state = slot.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -765,6 +769,10 @@ fn write_loop(slot: &Slot, dir: &SessionsDir) {
         if !skip {
             match dir.write(&snapshot, now_ms()) {
                 Ok(report) => {
+                    if write_failing {
+                        write_failing = false;
+                        tracing::info!("the refusal log is writable again");
+                    }
                     // A newer build's log is reported once, not on every write;
                     // an eviction is reported when the count moves.
                     if let Some(warning) = report.warning
@@ -781,9 +789,19 @@ fn write_loop(slot: &Slot, dir: &SessionsDir) {
                         );
                     }
                 }
-                // A display log that cannot be written is reported and never
-                // fails the launch.
-                Err(error) => tracing::warn!("could not write the refusal log: {error:#}"),
+                // A display log that cannot be written never fails the launch
+                // (AC14); this message is the whole of what says so, so it has to
+                // be actionable and it has to be said once.
+                Err(error) => {
+                    if !write_failing {
+                        write_failing = true;
+                        tracing::warn!(
+                            "could not write the refusal log: {error:#}. This session's refusals \
+                             are not being recorded; they are still listed live by `agent-vm \
+                             access` while the session runs. The next successful write says so."
+                        );
+                    }
+                }
             }
         }
         if !skip {

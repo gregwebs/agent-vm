@@ -154,7 +154,15 @@ others:
 
 13. **Nothing here can fail a launch.** No directory, no lock, no socket path, no
     disk, no follower and no client may turn into a launch failure. Each degrades
-    to a notice and a smaller feature: no log, no live view, or no feed.
+    to a smaller feature, and the wording is exact rather than a promise of "a
+    notice each"; USAGE's "When it degrades" table is the canonical list:
+    - no `.sessions` directory, an over-long socket path and a lock held at start
+      each print one notice on stderr;
+    - a failed write prints one warning on stderr, and another only after a write
+      has succeeded — it does not repeat on every tick;
+    - a log this build cannot use prints one warning, from `agent-vm access`,
+      naming the file. The launcher's reader repairs nothing and says nothing;
+    - a reader that cannot keep up is dropped or resynchronised, silently.
 
 ## The guarantee
 

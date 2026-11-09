@@ -476,6 +476,15 @@ impl Log {
     /// Deterministic: one ordering, computed once, then taken from the front. An
     /// evicted *live* session is restored whole by its owner's next write, which
     /// is why evicting it is safe at all (AC12).
+    ///
+    /// Only a victim that can never come back is counted. Five full live sessions
+    /// do not fit at once, so every write evicts one and its owner's next write
+    /// puts it back: counting those made `evicted_sessions` climb without bound on
+    /// an ordinary project, and the footer — which says a record is *gone* — said
+    /// so about records that were all still there. A session that has not ended may
+    /// still be writing, so its eviction is not counted; the cost is a session
+    /// whose launcher died and whose record was evicted being uncounted, against an
+    /// unbounded overcount on every healthy project.
     fn evict(&mut self, own: &str) -> u64 {
         let mut evicted = 0;
         loop {
@@ -494,8 +503,10 @@ impl Log {
             else {
                 return evicted;
             };
-            self.sessions.remove(victim);
-            evicted += 1;
+            let removed = self.sessions.remove(victim);
+            if removed.ended_ms.is_some() {
+                evicted += 1;
+            }
         }
     }
 

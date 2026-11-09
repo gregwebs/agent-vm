@@ -633,6 +633,9 @@ async fn an_evicted_session_is_reported_in_the_footer() {
     for index in 0..5u8 {
         let id = format!("0000000{index}");
         let mut snapshot = snapshot(&id, NOW - 20_000, Vec::new());
+        // Ended, so the eviction is a record that is gone and is counted; a live
+        // session's eviction is not (its owner writes it back).
+        snapshot.ended_ms = Some(NOW - 10_000);
         snapshot.entries = (0..crate::refusal::MAX_ENTRIES_PER_SESSION)
             .map(|port| {
                 entry(

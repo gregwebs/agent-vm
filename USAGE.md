@@ -3701,11 +3701,23 @@ footer says so instead of inventing a number.
 
 **Where it lives.** `<state root>/<hash>.sessions/`: `refusals.json` (the log)
 and one `<sid>.sock` per running session. The directory is `0700`, the socket
-`0600`, the peer's UID must match yours, and there is no TCP listener. Nothing
-here can fail a launch: a state root that cannot be adopted, a log that cannot be
-locked, a socket path over the platform limit and a stalled reader each cost a
-notice and a smaller feature, never the VM. See
+`0600`, the peer's UID must match yours, and there is no TCP listener. See
 [ADR-0064](docs/adr/0064-read-only-refusal-feed.md).
+
+**When it degrades.** Nothing here can fail a launch, and each failure costs a
+named part of the feature. Precisely what happens:
+
+| What went wrong | What you see, and what you lose |
+|---|---|
+| The `.sessions` directory cannot be created or adopted (not a real directory, another owner, a mode other than `0700`) | One notice naming it. This session has no log and no socket, and `agent-vm access` never lists it. |
+| The socket path is longer than the kernel allows | One notice naming the path. The log still records; you lose the live view, not the record. |
+| Another session holds the log lock when this one starts | One notice. No live view; this session's refusals are still recorded, on a later attempt at the lock. |
+| A write to the log fails (full disk, permissions, a lock held elsewhere) | One warning on stderr, worded as "this session's refusals are not being recorded", and a second one only after a write succeeds again. The live view keeps working for as long as the session runs; whatever was not written is lost when it ends. |
+| The log on disk cannot be used (not a regular file, larger than 2 MiB, not decodable, or below this build's version) | `agent-vm access` prints one warning naming the file and says the sessions it held are not listed. Only a later write from a session replaces a damaged file, keeping the old one as `refusals.json.damaged`. |
+| The log was written by a *newer* agent-vm | One warning; the file is read but never replaced. A newer file whose contents this build cannot fully decode is still recognised as newer, from its version alone, and still never replaced. |
+| A reader cannot keep up | It is dropped, or resynchronised with a whole snapshot. Nobody else is slowed. |
+| The runtime's own log cannot be read for a while | The session's rows stay listed and gain `some refusals were missed (count unknown)`; a late record is never counted twice. |
+| A write evicts sessions to stay in bounds | A footer counts the sessions whose records are **gone**. A live session that is evicted is written back by its owner and is not counted. |
 
 ## Ports & egress
 

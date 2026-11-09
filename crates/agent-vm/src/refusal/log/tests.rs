@@ -197,14 +197,15 @@ fn eviction_is_deterministic_and_counted() {
     );
 
     // Oldest activity first among equals: with the ended sessions gone, the
-    // older live session is the next to go.
+    // older live session is the next to go — and a live one is not counted,
+    // because its owner writes it back.
     let mut log = Log::new(0, Vec::new());
     for (text, at) in [("0000000a", NOW - 9_000), ("0000000b", NOW - 2_000)] {
         let mut live = filled(session(text, true), 1_100, at);
         live.info.started_ms = at;
         log.sessions.push(live);
     }
-    assert_eq!(log.evict("0000000b"), 1);
+    assert_eq!(log.evict("0000000b"), 0, "a live eviction is not a loss");
     assert_eq!(log.sessions.len(), 1);
     assert_eq!(log.sessions[0].info.id.as_str(), "0000000b");
 }
@@ -250,7 +251,13 @@ fn an_evicted_live_session_is_restored_by_its_owner() {
             .any(|s| s.info.id.as_str() == "0000000a"),
         "the older live session was evicted to make room"
     );
-    assert!(log.evicted_sessions > 0);
+    // Not counted: it comes back on its owner's next write, and counting a
+    // restoration as a loss made the counter climb on every single write while
+    // five full live sessions shared a project.
+    assert_eq!(
+        log.evicted_sessions, 0,
+        "a restorable eviction is not a lost record"
+    );
 
     // Its owner's next write puts it back whole, and the list is not truncated.
     dir.write(&ours, NOW).unwrap();
