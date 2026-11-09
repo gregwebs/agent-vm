@@ -41,12 +41,15 @@ pub(crate) const FILE: &str = "allowances.json";
 const VERSION: u32 = 1;
 /// A store bigger than this is not a record table anyone wrote by hand.
 const MAX_BYTES: u64 = 1024 * 1024;
-/// How much of the file the version probe reads from the start.
+/// How much of a file too large to read whole the version probe reads.
 ///
 /// The schema puts `v` first (ADR-0065 P1), so this covers every file this or a
 /// later release writes. It is a bound on *reading*, not on the file: a newer
 /// file bigger than [`MAX_BYTES`] is still `Newer`, because a later release
-/// writing a larger body must not be told to move its file aside as damaged.
+/// writing a larger body must not be told to move its file aside as damaged. A
+/// file that large whose version is not in the first [`VERSION_PROBE_BYTES`] is
+/// classified as damage — the conservative direction, since it applies nothing
+/// either way (see [`leading_version`]).
 const VERSION_PROBE_BYTES: usize = 4096;
 /// The record bound, so one project's view cannot grow without end.
 const MAX_RECORDS: usize = 4096;
