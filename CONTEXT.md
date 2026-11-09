@@ -921,9 +921,29 @@ session and is never persisted.
 
 **Project allowance**: a permanent network allowance (until revoked, no expiry)
 bound to one project's path identity, whatever tool is launched. A moved or
-copied project does not inherit it. Its authorization record is host-controlled
-and unreachable from any guest bind. Host-wide breadth is never granted from a
-live approval.
+copied project does not inherit it. Its authorization record — the **project
+allowance record** — is host-controlled and unreachable from any guest bind.
+Host-wide breadth is never granted from a live approval. See
+[ADR-0065](docs/adr/0065-project-allowance-record.md).
+
+**Project allowance record**: the file one project's allowances are read from:
+`~/.config/agent-vm/allowances.json`, keyed by the full SHA-256 of the project's
+canonical path, with each record's `path` column as that digest's preimage. It is
+machine-written and **read-only in this release** — there is no `record`/`forget`
+verb yet, so it is not hand-edited. It is an **authority** store, so it refuses
+rather than heals: an unusable file is not applied, is named once, and leaves the
+launch with its configured authority. The only launch refusals it adds are the
+guard's — a hard link (`nlink != 1`), or a file the guard cannot inspect.
+
+**Recorded, admissible, applied**: the three levels of "an allowance covers this
+refusal", kept apart everywhere. **Recorded** — a usable record for this project
+names the destination, by a conservative syntactic query (`covers`); the only
+level this release computes or displays. **Admissible** — the runtime's own
+evaluator would admit the flow under a policy containing that record; never
+computed in production, only as a test oracle. **Applied** — this session's
+runtime had the record in force and allowed a matching flow; unknowable until
+PR 2's runtime revisions, which is why `access` says "not confirmed for this
+session". See [ADR-0065](docs/adr/0065-project-allowance-record.md).
 
 **Sandbox refusal**: any refusal the sandbox imposes on the guest and can
 report. Its kinds are **network denial**, **policy lock** (administrator or
