@@ -8,8 +8,8 @@ have landed in the fork: [record egress
 refusals](https://github.com/gregwebs/agent-vm/issues/502) as refusal log out, and
 [replace a running sandbox's network
 policy](https://github.com/gregwebs/agent-vm/issues/503) as policy replace in.
-agent-vm consumed neither until the `vendor/microsandbox` pin moved to fork main
-`e98acf59` (0.7.13); #501 slice 1 adds the first reader of the refusal log.
+agent-vm calls neither; the `vendor/microsandbox` pin (fork main `dee2001c`,
+0.7.13) carries both, and #501 slice 1 adds the first reader of the refusal log.
 
 ## Decision
 

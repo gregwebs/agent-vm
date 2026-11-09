@@ -596,10 +596,11 @@ default/strict invalidation policy and its accepted blind spots.
 
 `./script/check-runtime-provenance.sh` checks both independent Cargo roots (the
 outer workspace and `vendor/microsandbox`) for the official crates.io
-`msb_krun*` cohort: a per-crate version map (0.1.42, with `msb_krun_arch_gen`,
-`msb_krun_cpuid` and `msb_krun_smbios` independently published at 0.1.45 in the
-outer workspace while the vendored lock still pins 0.1.42), and a checksum map
-that must agree wherever the two roots resolve one release. It also checks the
+`msb_krun*` cohort against a pin per root: the release and checksum each lock
+must resolve every crate to. Both roots pin 0.1.42, except `msb_krun_arch_gen`,
+`msb_krun_cpuid` and `msb_krun_smbios`, which are published on their own cadence
+and which only the outer workspace resolves at 0.1.45. Two roots that land on one
+release must also agree on its checksum. It also checks the
 pinned `vendor/libkrunfw` gitlink, firmware version/ABI, and the x86
 source-configuration contract. This
 establishes **source identity**, not an attestation that a given executable came
@@ -2039,7 +2040,7 @@ directories the user never asked for. The state-root precedence is in
 | Omit nodes a fork seed cannot carry (amends ADR-0013/0014) | [ADR-0054](docs/adr/0054-omit-nodes-a-fork-seed-cannot-carry.md) |
 | SecretSpec as a read-only credential source (#202) | [ADR-0055](docs/adr/0055-secretspec-serve-credential-source.md) |
 | macOS keychain item as a second Anthropic host credential location (#492) | [ADR-0056](docs/adr/0056-macos-keychain-as-a-host-credential-location.md) |
-| Live approvals use two generic runtime extension points (proposed, not implemented) | [ADR-0057](docs/adr/0057-live-approvals-use-two-generic-runtime-extension-points.md) |
+| Live approvals use two generic runtime extension points | [ADR-0057](docs/adr/0057-live-approvals-use-two-generic-runtime-extension-points.md) |
 | Antigravity as a fifth credential provider (#507) | [ADR-0058](docs/adr/0058-antigravity-credential-provider.md) |
 | User tool requests as egress authority (partly reverses ADR-0039) | [ADR-0059](docs/adr/0059-user-tool-requests-as-egress-authority.md) |
 | Image network requests reported once per reference, then as changes | [ADR-0060](docs/adr/0060-image-network-requests-reported-once-then-as-changes.md) |
