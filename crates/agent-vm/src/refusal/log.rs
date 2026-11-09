@@ -117,7 +117,7 @@ impl SessionsDir {
         &self.path
     }
 
-    fn record(&self) -> PathBuf {
+    pub(crate) fn record(&self) -> PathBuf {
         self.path.join("refusals.json")
     }
 
@@ -397,6 +397,13 @@ pub(crate) struct Log {
 }
 
 impl Log {
+    /// True when the file was written by a build newer than this one — the only
+    /// reason a log is not writable back. Its rows are read; the file itself is
+    /// never replaced ([`SessionsDir::write`]), so a reader has to say so.
+    pub(crate) fn written_by_a_newer_version(&self) -> bool {
+        !self.writable
+    }
+
     fn empty() -> Self {
         Self {
             evicted_sessions: 0,

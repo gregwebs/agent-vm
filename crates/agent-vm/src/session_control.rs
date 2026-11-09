@@ -929,12 +929,22 @@ pub(crate) async fn discover(dir: &SessionsDir, _now_ms: i64) -> Discovery {
     // gone", and the reading itself repairs nothing (ADR-0064).
     let (logged, evicted_sessions) = match dir.read() {
         Ok(log) => {
+            // A newer build's log is read, and never replaced: the one warning is
+            // the reader's only clue that these rows came from a file this build
+            // may only partly understand (ADR-0064 decision 2).
+            if log.written_by_a_newer_version() {
+                warnings.push(format!(
+                    "the refusal log {} was written by a newer agent-vm; it is read but never \
+                     replaced, so a record this version cannot decode is not shown",
+                    crate::one_line::path(&dir.record())
+                ));
+            }
             if let Some(damage) = &log.damaged {
                 warnings.push(format!(
                     "the refusal log {} could not be used ({damage}); the sessions it held are \
                      not listed here. It is moved to refusals.json.damaged and replaced by the \
                      next session that writes",
-                    crate::one_line::path(dir.path())
+                    crate::one_line::path(&dir.record())
                 ));
             }
             (log.sessions, log.evicted_sessions)

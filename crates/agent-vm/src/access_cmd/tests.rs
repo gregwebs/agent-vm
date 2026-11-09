@@ -659,3 +659,47 @@ async fn an_evicted_session_is_reported_in_the_footer() {
         "{out}"
     );
 }
+
+/// ADR-0064 decision 2 and USAGE's degradation table: a log a *newer* agent-vm
+/// wrote is read, and one warning says so — the reader is otherwise unable to
+/// tell rows this build decoded from records a later shape introduced and this
+/// one dropped.
+#[tokio::test]
+async fn a_newer_version_log_is_read_with_one_warning_and_never_replaced() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = session_dir(root.path());
+    let mut snapshot = snapshot(
+        "0a1b2c3d",
+        NOW - 120_000,
+        vec![entry("aaaaaaa1", address("203.0.113.10", 443), NOW - 1_000)],
+    );
+    snapshot.ended_ms = Some(NOW - 60_000);
+    dir.write(&snapshot, NOW).unwrap();
+
+    // Exactly what a later build's file looks like to this one: the version
+    // alone is newer; the shape is this build's.
+    let record = dir.record();
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+    value["v"] = serde_json::json!(99);
+    let bytes = serde_json::to_vec(&value).unwrap();
+    std::fs::write(&record, &bytes).unwrap();
+
+    let (status, out, err) = run_logged(&dir, table_args()).await;
+    assert_eq!(status, 0);
+    assert!(out.contains("aaaaaaa1"), "the rows are still read: {out}");
+    assert_eq!(
+        err.matches("was written by a newer agent-vm").count(),
+        1,
+        "one warning, naming the file: {err:?}"
+    );
+    assert!(
+        err.contains("refusals.json"),
+        "the warning names the file: {err:?}"
+    );
+    assert_eq!(
+        std::fs::read(&record).unwrap(),
+        bytes,
+        "reading a newer log never replaces it"
+    );
+}
