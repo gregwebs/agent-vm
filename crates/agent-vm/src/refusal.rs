@@ -42,8 +42,20 @@ const MAX_FIELD_BYTES: usize = 32;
 const ID_DOMAIN: &str = "agent-vm/refusal-id/v1";
 
 /// One launch's identity, as the log and the control socket name it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct SessionId(String);
+
+/// Deserialized through [`SessionId::parse`], so the one accepted spelling holds
+/// for a value read from the log and not only for one read from the command line.
+/// `access` prints a session ID, and a forged log must not be able to put terminal
+/// escapes in that column (AC5).
+impl<'de> Deserialize<'de> for SessionId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        SessionId::parse(&text)
+            .ok_or_else(|| serde::de::Error::custom("a session ID is exactly 8 lowercase hex"))
+    }
+}
 
 impl SessionId {
     /// A fresh reservation drawn from the kernel's CSPRNG: 8 lowercase hex.
@@ -271,7 +283,13 @@ impl RefusalEntry {
                 "no grant in this version; relaunch with --allow-egress".to_owned()
             }
             Kind::CredentialRefusal => "can't be allowed here: credential policy".to_owned(),
-            Kind::PolicyLock => format!("can't be allowed: built-in rule {}", self.last_site),
+            // `last_site` is the runtime's wire value as a forged record may
+            // carry it, so it is escaped here, where it becomes text a reader
+            // prints.
+            Kind::PolicyLock => format!(
+                "can't be allowed: built-in rule {}",
+                crate::config::escape_str(&self.last_site)
+            ),
         }
     }
 }

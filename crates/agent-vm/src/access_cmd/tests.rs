@@ -6,7 +6,6 @@
 //! no `run_with_timeout` copy (#514) and no process boundary.
 
 use std::path::Path;
-use std::sync::Arc;
 
 use super::*;
 use crate::refusal::log::SessionsDir;
@@ -189,6 +188,83 @@ async fn guest_names_are_escaped_and_marked() {
     );
 }
 
+/// Every column that can carry text a forged log chose: the ID, the protocol, the
+/// destination, the name source, and the site `reason()` names. Under the guard
+/// only the host user writes these, but the documented upgrade path admits older
+/// launchers that leave `.sessions` writable to their guests (AC5).
+#[tokio::test]
+async fn every_untrusted_cell_is_escaped() {
+    const ESC: char = '\u{1b}';
+    let root = tempfile::tempdir().unwrap();
+    let dir = session_dir(root.path());
+    let mut sneaky = entry(
+        &format!("{ESC}[31mdead"),
+        Destination::Host {
+            protocol: format!("tcp{ESC}[0m"),
+            name: format!("evil{ESC}[2J.example"),
+            port: Some(443),
+        },
+        NOW - 1_000,
+    );
+    // A policy lock names the site it locked, so the reason column carries it.
+    sneaky.key.kind = Kind::PolicyLock;
+    sneaky.last_site = format!("tcp-syn{ESC}[31m");
+    sneaky.name = Some(GuestName {
+        name: format!("evil{ESC}[2J.example"),
+        source: format!("sni{ESC}[0m"),
+        truncated: false,
+    });
+    dir.write(&snapshot("0a1b2c3d", NOW - 5_000, vec![sneaky]), NOW)
+        .unwrap();
+
+    let (status, out, _) = run_logged(&dir, table_args()).await;
+    assert_eq!(status, 0);
+    assert!(
+        !out.contains(ESC),
+        "no raw escape reaches the terminal: {out:?}"
+    );
+    assert!(
+        out.contains("\\x1b"),
+        "the escaped spelling is printed: {out:?}"
+    );
+    assert!(
+        out.contains("can't be allowed: built-in rule tcp-syn\\x1b[31m"),
+        "{out:?}"
+    );
+    assert!(
+        out.contains("tcp\\x1b[0m evil\\x1b[2J.example:443"),
+        "{out:?}"
+    );
+    assert!(
+        out.contains("SNI") || out.contains("sni\\x1b[0m"),
+        "{out:?}"
+    );
+
+    // A session ID read from the log is validated, so a forged one does not even
+    // reach the table.
+    let raw = serde_json::json!({
+        "v": 1,
+        "evicted_sessions": 0,
+        "sessions": [{
+            "info": {"id": format!("{ESC}[31mdead"), "pid": 1, "started_ms": NOW, "socket": true},
+            "rev": 1, "ended_ms": null, "heartbeat_ms": null,
+            "suppressed": 0, "lost": 0, "gap": false, "entries": []
+        }]
+    });
+    std::fs::write(
+        dir.path().join("refusals.json"),
+        serde_json::to_vec(&raw).unwrap(),
+    )
+    .unwrap();
+    let (status, out, err) = run_logged(&dir, table_args()).await;
+    assert_eq!(status, 0);
+    assert!(!out.contains(ESC) && !err.contains(ESC), "{out:?} {err:?}");
+    assert!(
+        err.contains("could not be used"),
+        "a log whose session ID is not one is reported, not shown: {err:?}"
+    );
+}
+
 #[tokio::test]
 async fn window_hides_older_than_24h_unless_all() {
     let root = tempfile::tempdir().unwrap();
@@ -347,11 +423,16 @@ async fn session_labels_match_the_table() {
         live_line.is_none(),
         "the live session refused nothing yet: {out}"
     );
-    // The live session's own row appears once it has an entry; the hung one is
-    // labelled from the socket, not from the log.
+    // The hung session's row is labelled from the socket, not from the log: the
+    // fixture already carries `aaaaaaa9`, so accepting "the entry is somewhere" or
+    // "some row says not responding" let the label regress unseen.
+    let hung_line = out
+        .lines()
+        .find(|line| line.starts_with("aaaaaaa9"))
+        .unwrap_or_else(|| panic!("the hung session's entry has a row: {out}"));
     assert!(
-        out.contains("not responding") || out.contains("aaaaaaa9"),
-        "{out}"
+        hung_line.contains("not responding"),
+        "a bound socket that does not answer is `not responding`: {hung_line}"
     );
     hung.abort();
     responding.finish().await;
@@ -462,16 +543,12 @@ async fn footers_report_suppressed_lost_and_gap_never_as_rows() {
     noisy.lost = 3;
     noisy.gap = true;
     dir.write(&noisy, NOW).unwrap();
-    // An evicted-session count is a footer too.
-    let mut other = snapshot("00000002", NOW - 9_000, Vec::new());
-    other.ended_ms = Some(NOW);
-    dir.write(&other, NOW).unwrap();
     let (status, out, _) = run_logged(&dir, table_args()).await;
     assert_eq!(status, 0);
     assert_eq!(out.matches("aaaaaaa1").count(), 1, "one row: {out}");
     assert!(out.contains("12 refusal(s) were not recorded"), "{out}");
     assert!(
-        out.contains("3 destination(s) past the per-session limit"),
+        out.contains("3 refusal(s) to destinations beyond the per-session limit"),
         "{out}"
     );
     assert!(
@@ -480,5 +557,102 @@ async fn footers_report_suppressed_lost_and_gap_never_as_rows() {
     );
     // None of the three became a row: one row and one header line.
     assert_eq!(out.lines().count(), 1 + 1 + 3, "{out}");
-    let _ = Arc::new(());
+}
+
+/// The counters are properties of a *session*, not of the rows the window happens
+/// to show. A session whose only news is a `suppressed` count, or whose every
+/// entry is older than the window, has nothing to put in the table — and used to
+/// be dropped before the footers and the "K older" count were computed, so its
+/// counters vanished and it was missing from the count.
+#[tokio::test]
+async fn a_session_outside_the_window_still_reports_its_footers_and_its_old_entries() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = session_dir(root.path());
+    // Nothing to show as a row: no entries at all, one suppressed counter. No
+    // socket, but a fresh heartbeat, so the session is live and its record is
+    // kept (an empty socketless session with a stale heartbeat is pruned).
+    let mut counters_only = snapshot("00000002", NOW - 10_000, Vec::new());
+    counters_only.info.socket = false;
+    counters_only.heartbeat_ms = Some(NOW - 1_000);
+    counters_only.suppressed = 5;
+    dir.write(&counters_only, NOW).unwrap();
+    // Nothing recent: every entry is older than the window, and there are two.
+    let mut stale = snapshot(
+        "00000003",
+        NOW - WINDOW_MS - 200_000,
+        vec![
+            entry(
+                "bbbbbbb1",
+                address("203.0.113.11", 443),
+                NOW - WINDOW_MS - 100_000,
+            ),
+            entry(
+                "bbbbbbb2",
+                address("203.0.113.12", 443),
+                NOW - WINDOW_MS - 100_000,
+            ),
+        ],
+    );
+    stale.gap = true;
+    dir.write(&stale, NOW).unwrap();
+
+    let (status, out, _) = run_logged(&dir, table_args()).await;
+    assert_eq!(status, 0);
+    assert!(out.contains("No refusals in the last 24 hours."), "{out}");
+    assert!(
+        out.contains("session 00000002: 5 refusal(s) were not recorded"),
+        "a counter with no row is still reported: {out}"
+    );
+    assert!(
+        out.contains("session 00000003: some refusals were missed"),
+        "{out}"
+    );
+    assert!(
+        out.contains("--all shows the whole log (2 older)"),
+        "a wholly old session is counted, not omitted: {out}"
+    );
+    assert!(!out.contains("bbbbbbb1"), "{out}");
+
+    // ...and `--all` shows them.
+    let (status, out, _) = run_logged(&dir, ALL).await;
+    assert_eq!(status, 0);
+    assert!(
+        out.contains("bbbbbbb1") && out.contains("bbbbbbb2"),
+        "{out}"
+    );
+}
+
+/// The eviction footer needs a log that really evicted something: the count is the
+/// writer's, not the reader's guess.
+#[tokio::test]
+async fn an_evicted_session_is_reported_in_the_footer() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = session_dir(root.path());
+    // Five sessions of `MAX_ENTRIES_PER_SESSION` entries: 2,560 against the
+    // 2,048-entry bound, so a write has to evict.
+    for index in 0..5u8 {
+        let id = format!("0000000{index}");
+        let mut snapshot = snapshot(&id, NOW - 20_000, Vec::new());
+        snapshot.entries = (0..crate::refusal::MAX_ENTRIES_PER_SESSION)
+            .map(|port| {
+                entry(
+                    &format!("{index}{:07x}", port % 0xf00000),
+                    address("203.0.113.10", 1024 + port as u16),
+                    NOW - 1_000,
+                )
+            })
+            .collect();
+        dir.write(&snapshot, NOW).unwrap();
+    }
+    let evicted = dir.read().unwrap().evicted_sessions;
+    assert!(evicted > 0, "the log had to evict: {evicted}");
+
+    let (status, out, _) = run_logged(&dir, table_args()).await;
+    assert_eq!(status, 0);
+    assert!(
+        out.contains(&format!(
+            "{evicted} session(s) were evicted from the refusal log to keep it bounded"
+        )),
+        "{out}"
+    );
 }

@@ -199,10 +199,10 @@ async fn subscribe_handoff_loses_and_repeats_nothing_across_the_window() {
             }
             other => panic!("only snapshots and updates here: {other:?}"),
         };
-        if last.is_some() {
+        if let Some(previous) = last {
             assert_eq!(
                 rev,
-                last.unwrap() + 1,
+                previous + 1,
                 "no revision is skipped across the handoff"
             );
         }

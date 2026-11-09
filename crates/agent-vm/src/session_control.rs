@@ -150,7 +150,13 @@ impl LiveSession {
             match dir.reserve(info.started_ms, info.pid, true, |id| Hidden::bind(&dir, id)) {
                 Ok(Some(reserved)) => reserved,
                 Ok(None) => {
-                    notice("==> Refusals are not recorded: the project's refusal log is busy");
+                    // Only the *live view* is lost: the session keeps its log, and
+                    // the persister below writes through it on its first attempt, so
+                    // "not recorded" would be wrong.
+                    notice(
+                        "==> Refusals are not served live: another session holds this project's \
+                     refusal log lock. They are still recorded once the lock is free.",
+                    );
                     return Self::with_dir(
                         &dir,
                         SessionInfo {
@@ -834,6 +840,9 @@ pub(crate) struct Discovery {
     pub(crate) live: Vec<SessionSnapshot>,
     pub(crate) logged: Vec<SessionSnapshot>,
     pub(crate) unresponsive: Vec<SessionId>,
+    /// Every session the log has had to evict, ever. Read once, here, so a caller
+    /// prints one number instead of re-reading the log it just read.
+    pub(crate) evicted_sessions: u64,
     pub(crate) warnings: Vec<String>,
 }
 
@@ -914,17 +923,32 @@ pub(crate) async fn discover(dir: &SessionsDir, _now_ms: i64) -> Discovery {
     // Every logged session is kept, including one whose socket was just stale:
     // that is exactly the `ended (unclean)` case, and dropping it here would hide
     // the record that says the session ran at all.
-    let logged = match dir.read() {
-        Ok(log) => log.sessions,
+    //
+    // A record this build cannot use is reported, not silently replaced: it is
+    // the reader's only chance to tell "nothing was refused" from "the records are
+    // gone", and the reading itself repairs nothing (ADR-0064).
+    let (logged, evicted_sessions) = match dir.read() {
+        Ok(log) => {
+            if let Some(damage) = &log.damaged {
+                warnings.push(format!(
+                    "the refusal log {} could not be used ({damage}); the sessions it held are \
+                     not listed here. It is moved to refusals.json.damaged and replaced by the \
+                     next session that writes",
+                    crate::one_line::path(dir.path())
+                ));
+            }
+            (log.sessions, log.evicted_sessions)
+        }
         Err(error) => {
             warnings.push(format!("could not read the refusal log: {error:#}"));
-            Vec::new()
+            (Vec::new(), 0)
         }
     };
     Discovery {
         live,
         logged,
         unresponsive,
+        evicted_sessions,
         warnings,
     }
 }

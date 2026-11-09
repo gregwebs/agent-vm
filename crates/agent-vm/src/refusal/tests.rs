@@ -634,6 +634,18 @@ fn session_ids_are_eight_lowercase_hex_and_parse_strictly() {
     for rejected in ["", "1234567", "123456789", "3F9A12C4", "3f9a12cg", "../x"] {
         assert_eq!(SessionId::parse(rejected), None, "{rejected}");
     }
+    // The strictness survives a round trip through a document: a value read from
+    // a log is validated on the way in, because `access` prints it.
+    let id = SessionId::generate();
+    let round_tripped: SessionId =
+        serde_json::from_str(&serde_json::to_string(&id).unwrap()).unwrap();
+    assert_eq!(round_tripped, id);
+    for rejected in ["\"3F9A12C4\"", "\"3f9a12cg\"", "\"\\u001b[31mabcdef0\""] {
+        assert!(
+            serde_json::from_str::<SessionId>(rejected).is_err(),
+            "{rejected} decoded"
+        );
+    }
 }
 
 proptest::proptest! {

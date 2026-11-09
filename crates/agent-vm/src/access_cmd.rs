@@ -81,6 +81,7 @@ pub(crate) async fn run_in(
             live: Vec::new(),
             logged: Vec::new(),
             unresponsive: Vec::new(),
+            evicted_sessions: 0,
             warnings: Vec::new(),
         },
     };
@@ -130,9 +131,11 @@ pub(crate) async fn run_in(
         // A named session is shown whole: `--session` is a question about one
         // session, not a window over it.
         sessions.retain(|row| row.snapshot.info.id == *wanted);
-    } else {
-        sessions.retain(|row| session_visible(row, now_ms, args.all));
     }
+    // The window selects *entries*, never sessions. A session with only counters
+    // to report — `suppressed`, `lost`, or a gap — has no row at all, and dropping
+    // it here would drop its footer with it; and a session whose every entry is
+    // old still owns those entries, so it has to be counted as "K older".
 
     let window = now_ms - WINDOW_MS;
     let mut entries: Vec<(Row, RefusalEntry)> = Vec::new();
@@ -158,11 +161,13 @@ pub(crate) async fn run_in(
 
     if entries.is_empty() {
         writeln!(out, "No refusals in the last 24 hours.").context("writing the empty report")?;
-        print_footers(out, &sessions, dir, args, 0)?;
+        // `older` is not zero here: a session whose every entry is outside the
+        // window is exactly the case with no rows and a count to report.
+        print_footers(out, &sessions, &discovery, args, older)?;
         return Ok(0);
     }
     print_table(out, &entries)?;
-    print_footers(out, &sessions, dir, args, older)?;
+    print_footers(out, &sessions, &discovery, args, older)?;
     Ok(0)
 }
 
@@ -199,24 +204,21 @@ fn label(
     "ended (unclean)"
 }
 
-/// Whether any of a session's entries falls inside the window.
-fn session_visible(row: &Row, now_ms: i64, all: bool) -> bool {
-    if all {
-        return true;
-    }
-    let window = now_ms - WINDOW_MS;
-    row.snapshot
-        .entries
-        .iter()
-        .any(|entry| entry.last_ms >= window)
-}
-
+/// The table, with every cell escaped where it is built.
+///
+/// Each *field* is escaped at the point it enters a cell rather than the finished
+/// cell being escaped: the columns are joined by the `·` separator and padded to a
+/// width, and escaping the whole cell would turn that separator into a byte
+/// escape and break the alignment. Only the host user writes these values under
+/// the guard, but the documented upgrade path admits launchers that leave
+/// `.sessions` writable to their guests, so a forged record must not be able to
+/// put terminal escapes on the user's terminal (AC5).
 fn print_table(out: &mut impl std::io::Write, entries: &[(Row, RefusalEntry)]) -> Result<()> {
     let rows: Vec<[String; 7]> = entries
         .iter()
         .map(|(row, entry)| {
             [
-                entry.id.clone(),
+                escape(&entry.id),
                 entry.key.kind.label().to_owned(),
                 destination(entry),
                 entry.count.to_string(),
@@ -270,7 +272,7 @@ fn destination(entry: &RefusalEntry) -> String {
     let evidence = |name: &crate::refusal::GuestName| {
         format!(
             "({}, guest-supplied){}",
-            source_label(&name.source),
+            escape(source_label(&name.source)),
             if name.truncated {
                 " [name truncated]"
             } else {
@@ -280,7 +282,7 @@ fn destination(entry: &RefusalEntry) -> String {
     };
     match &entry.key.destination {
         Destination::DnsName { name } => {
-            let mut text = format!("dns {}", crate::config::escape_str(name));
+            let mut text = format!("dns {}", escape(name));
             if let Some(name) = &entry.name {
                 text.push_str(&format!(" {}", evidence(name)));
             }
@@ -291,19 +293,17 @@ fn destination(entry: &RefusalEntry) -> String {
             name,
             port,
         } => {
-            let target = match port {
-                Some(port) => format!("{name}:{port}"),
-                None => name.clone(),
+            // The name is guest text and the protocol is the runtime's, so they
+            // are escaped separately: the `:port` between them is this table's.
+            let mut text = match port {
+                Some(port) => format!("{} {}:{port}", escape(protocol), escape(name)),
+                None => format!("{} {}", escape(protocol), escape(name)),
             };
-            let mut text = format!("{protocol} {}", crate::config::escape_str(&target));
             if let Some(evidence_name) = &entry.name {
                 // The destination already names it; only a *different* spelling
                 // the guest used is worth printing.
                 if !evidence_name.name.eq_ignore_ascii_case(name) {
-                    text.push_str(&format!(
-                        " {}",
-                        crate::config::escape_str(&evidence_name.name)
-                    ));
+                    text.push_str(&format!(" {}", escape(&evidence_name.name)));
                 }
                 text.push_str(&format!(" {}", evidence(evidence_name)));
             }
@@ -319,11 +319,11 @@ fn destination(entry: &RefusalEntry) -> String {
                 (None, Some(port)) => format!("?{port}"),
                 (None, None) => "?".to_owned(),
             };
-            let mut text = format!("{protocol} {target}");
+            let mut text = format!("{} {target}", escape(protocol));
             if let Some(evidence_name) = &entry.name {
                 text.push_str(&format!(
                     " · {} {}",
-                    crate::config::escape_str(&evidence_name.name),
+                    escape(&evidence_name.name),
                     evidence(evidence_name)
                 ));
             }
@@ -332,7 +332,13 @@ fn destination(entry: &RefusalEntry) -> String {
     }
 }
 
-/// The runtime's `name_source` wire value, in the table's own words.
+/// Untrusted text, rendered so no terminal control byte can reach the screen.
+fn escape(text: &str) -> String {
+    crate::config::escape_str(text)
+}
+
+/// The runtime's `name_source` wire value, in the table's own words. An unknown
+/// value is the runtime's own text, so it is escaped by the caller.
 fn source_label(source: &str) -> &str {
     match source {
         "dns-cache" => "DNS cache",
@@ -380,26 +386,28 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 fn print_footers(
     out: &mut impl std::io::Write,
     sessions: &[Row],
-    dir: Option<&SessionsDir>,
+    discovery: &crate::session_control::Discovery,
     args: &Args,
     older: usize,
 ) -> Result<()> {
     for row in sessions {
         let snapshot = &row.snapshot;
+        let id = crate::config::escape_str(snapshot.info.id.as_str());
         if snapshot.suppressed > 0 {
             writeln!(
                 out,
-                "session {}: {} refusal(s) were not recorded by the runtime (suppressed)",
-                snapshot.info.id.as_str(),
+                "session {id}: {} refusal(s) were not recorded by the runtime (suppressed)",
                 snapshot.suppressed
             )
             .context("writing the suppressed footer")?;
         }
         if snapshot.lost > 0 {
+            // One `lost` per refusal that could not be kept, which is one per
+            // destination past the per-session limit; the footer says which.
             writeln!(
                 out,
-                "session {}: {} destination(s) past the per-session limit were dropped (lost)",
-                snapshot.info.id.as_str(),
+                "session {id}: {} refusal(s) to destinations beyond the per-session limit were \
+                 dropped (lost)",
                 snapshot.lost
             )
             .context("writing the lost footer")?;
@@ -407,20 +415,16 @@ fn print_footers(
         if snapshot.gap {
             writeln!(
                 out,
-                "session {}: some refusals were missed (count unknown)",
-                snapshot.info.id.as_str()
+                "session {id}: some refusals were missed (count unknown)"
             )
             .context("writing the gap footer")?;
         }
     }
-    if let Some(dir) = dir
-        && let Ok(log) = dir.read()
-        && log.evicted_sessions > 0
-    {
+    if discovery.evicted_sessions > 0 {
         writeln!(
             out,
             "{} session(s) were evicted from the refusal log to keep it bounded",
-            log.evicted_sessions
+            discovery.evicted_sessions
         )
         .context("writing the eviction footer")?;
     }
