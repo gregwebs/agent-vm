@@ -848,11 +848,35 @@ impl ChildGuard {
     ///
     /// Never skipped because the leader already exited: a leader can exit while
     /// a helper it spawned holds a pipe, a credential or an open request.
-    /// Test-only: `kill`, reporting whether the group is gone afterwards.
+    ///
+    /// Test-only: `kill`, then wait — within [`REAP_CEILING`] — for `ESRCH` to
+    /// establish that the group is gone.
+    ///
+    /// One probe is not enough. `kill` reaps the leader, but the fixture leader
+    /// forks its `sleep`, and that member's zombie — we are not its parent, so
+    /// we cannot reap it — keeps `kill(-pgid, 0)` from answering `ESRCH` until
+    /// its own reaper gets to it. Measured in a container, that window is under
+    /// a millisecond; on a loaded runner it stretched far enough to fail these
+    /// tests on two of the last ten `main` runs. The wait gets the same
+    /// [`REAP_CEILING`] allowance `kill` gives the leader.
     #[cfg(test)]
     fn kill_group_once(&mut self) -> bool {
         self.kill();
-        self.group_is_gone()
+        self.wait_until_group_gone(REAP_CEILING)
+    }
+
+    #[cfg(test)]
+    fn wait_until_group_gone(&self, ceiling: Duration) -> bool {
+        let start = Instant::now();
+        loop {
+            if self.group_is_gone() {
+                return true;
+            }
+            if start.elapsed() >= ceiling {
+                return false;
+            }
+            std::thread::sleep(REAP_POLL);
+        }
     }
 
     fn kill(&mut self) {
@@ -983,7 +1007,18 @@ mod guard_tests {
         assert!(guard.kill_group_once());
         assert!(guard.signalled, "the entitlement was spent");
         assert!(guard.leader_reaped, "the leader is reaped after the signal");
-        assert!(guard.disarmed, "an emptied group is disarmed");
+        // Asserted no further: the disarm is `kill`'s own probe, which may land
+        // while the forked `sleep` is still a zombie, and production does not
+        // promise otherwise. `the_guard_disarms_only_on_esrch` pins the
+        // transition itself, without a process to race.
+    }
+
+    #[test]
+    fn the_wait_for_an_emptied_group_expires_without_claiming_one() {
+        let guard = ChildGuard::new(grouped("sleep 30"));
+        // Nothing was signalled, so the group is still there: the wait must
+        // report that, not call an unsignalled group cleaned up.
+        assert!(!guard.wait_until_group_gone(Duration::from_millis(50)));
     }
 
     #[test]
