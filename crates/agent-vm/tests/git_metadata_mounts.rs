@@ -1842,6 +1842,17 @@ fn metadata_under_a_guest_tmpfs_prefix_is_refused_before_launch_state() {
             "the canonical spelling binds read-only: {canonical_stderr}"
         );
         assert!(canonical_stderr.contains(NOTICE_RO), "{canonical_stderr}");
+        // The bind's own line: host and guest are the same path, so there is no
+        // arrow to read (#551). The config above already proves they are equal.
+        let mounting = canonical_stderr
+            .lines()
+            .find(|line| line.starts_with("==> Mounting ") && line.contains(&canonical_metadata))
+            .unwrap_or_else(|| panic!("no mount notice: {canonical_stderr}"));
+        assert_eq!(
+            mounting,
+            format!("==> Mounting {canonical_metadata} (read-only)"),
+            "a bind at its own path needs no arrow: {canonical_stderr}"
+        );
     }
 }
 
@@ -1887,11 +1898,22 @@ fn equivalent_declarations_merge_and_different_ones_are_refused() {
     let out = h.launch(&["--mount", &format!("{common}:ro")], "shell", &[]);
     let (config, stderr) = reached_builder(&out);
     assert_eq!(automatic_binds(&h, &config), vec![common_bind(&repo, true)]);
-    let mounting = stderr
+    let mounting: Vec<&str> = stderr
         .lines()
         .filter(|line| line.starts_with("==> Mounting ") && line.contains(&common))
-        .count();
-    assert_eq!(mounting, 1, "the merged bind is announced once: {stderr}");
+        .collect();
+    assert_eq!(
+        mounting.len(),
+        1,
+        "the merged bind is announced once: {stderr}"
+    );
+    // The declared spelling is the canonical path, so the two sides are one
+    // path: no arrow to read (#551).
+    assert_eq!(
+        mounting[0],
+        format!("==> Mounting {common} (read-only)"),
+        "a bind at its own path needs no arrow: {stderr}"
+    );
 
     // (b) A config `mounts` entry keeps its own origin, so the file is still
     //     reported.

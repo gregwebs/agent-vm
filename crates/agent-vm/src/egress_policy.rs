@@ -307,6 +307,11 @@ pub(crate) struct EgressAuthority {
     allowances: Vec<EgressAllowance>,
     hostnames: Vec<HostnameAllowance>,
     provenance: Option<Provenance>,
+    /// Whether this launch's own command line supplied any egress flag or entry.
+    /// The provenance notice claims a merge only when there is something to
+    /// merge; nothing on the command line means the persisted grants alone are in
+    /// force, so naming them and no flags is the whole truth (#551).
+    cli_contributed: bool,
     /// This launch's CLI entries after resolution, kept so a notice can attribute
     /// a hostname to `--allow-egress via tool:NAME` (or `set:NAME`) even with no
     /// user table.
@@ -337,6 +342,14 @@ impl EgressAuthority {
         // Entry-syntax errors first, then resolution errors (R14, A19): every
         // text is classified before any name is looked up, so a malformed entry
         // at position 2 is reported even when position 1 is an unknown tool.
+        //
+        // Read here, before `cli` is shadowed by the resolved entries below: an
+        // explicit `false` flag is a contribution too (it overrides a persisted
+        // boolean), so presence, not truth, is what the notice reports.
+        let cli_contributed = cli.internet.is_some()
+            || cli.lan.is_some()
+            || cli.host.is_some()
+            || !cli.allowances.is_empty();
         let mut entries = Vec::with_capacity(cli.allowances.len());
         for (i, text) in cli.allowances.iter().enumerate() {
             entries.push(
@@ -388,6 +401,7 @@ impl EgressAuthority {
             allowances,
             hostnames,
             provenance,
+            cli_contributed,
             cli,
         })
     }
@@ -527,11 +541,18 @@ impl EgressAuthority {
     }
     pub(crate) fn write_notices(&self, output: &mut impl std::io::Write) -> std::io::Result<()> {
         if let Some(p) = &self.provenance {
-            writeln!(
-                output,
-                "==> Egress authority: persisted grants from \"{}\" [network] merged with this launch's flags (flags override persisted booleans and add allowances; nothing is saved)",
-                crate::one_line::path(&p.file)
-            )?;
+            let file = crate::one_line::path(&p.file);
+            if self.cli_contributed {
+                writeln!(
+                    output,
+                    "==> Egress authority: persisted grants from \"{file}\" [network] merged with this launch's flags (flags override persisted booleans and add allowances; nothing is saved)"
+                )?;
+            } else {
+                writeln!(
+                    output,
+                    "==> Egress authority: persisted grants from \"{file}\""
+                )?;
+            }
         }
         if self.allowances.is_empty()
             && !self.has_hostnames()
@@ -1001,7 +1022,8 @@ mod tests {
     #[test]
     fn notices_with_user_table_show_provenance() {
         use crate::user_network::SavedGroups;
-        const HEADER: &str = "==> Egress authority: persisted grants from \"/home/a/.config/agent-vm/config.toml\" [network] merged with this launch's flags (flags override persisted booleans and add allowances; nothing is saved)\n";
+        const MERGED: &str = "==> Egress authority: persisted grants from \"/home/a/.config/agent-vm/config.toml\" [network] merged with this launch's flags (flags override persisted booleans and add allowances; nothing is saved)\n";
+        const PERSISTED_ONLY: &str = "==> Egress authority: persisted grants from \"/home/a/.config/agent-vm/config.toml\"\n";
         const TLS: &str = "==> TLS interception: ports 443 — global to every destination (TLS ClientHello with SNI required, UDP dropped, sandbox CA must be trusted). A tcp://HOST:PORT entry widens every bare hostname to PORT.\n";
         let saved = SavedGroups {
             lan: Some(true),
@@ -1024,7 +1046,8 @@ mod tests {
             let authority = resolve_saved(saved, &["10.0.0.5", "api.example.com"], cli);
             let mut out = Vec::new();
             authority.write_notices(&mut out).unwrap();
-            let mut expected = HEADER.to_owned();
+            // Row 1 names no flag, so the header claims no merge.
+            let mut expected = if row == 1 { PERSISTED_ONLY } else { MERGED }.to_owned();
             if row == 3 {
                 expected.push_str("==> Egress policy: allowing 10.0.0.5/32 (persisted grants and --allow-egress)\n==> Egress policy: allowing 192.168.1.0/24 (--allow-egress)\n==> Egress policy: --allow-internet-egress enabled (public internet; does not itself grant LAN or host)\n");
             } else {
@@ -1059,7 +1082,7 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             format!(
-                "{HEADER}==> Egress policy: --allow-internet-egress enabled (public internet; does not itself grant LAN or host)\n==> Egress policy: persisted grant allow_host = true (host.microsandbox.internal → host 127.0.0.1 reachable; includes the host DNS resolver)\n==> Egress DNS: arbitrary-name DNS queries authorized via --allow-internet-egress and persisted grant allow_host (resolver/rebind/platform constraints still apply)\n"
+                "{MERGED}==> Egress policy: --allow-internet-egress enabled (public internet; does not itself grant LAN or host)\n==> Egress policy: persisted grant allow_host = true (host.microsandbox.internal → host 127.0.0.1 reachable; includes the host DNS resolver)\n==> Egress DNS: arbitrary-name DNS queries authorized via --allow-internet-egress and persisted grant allow_host (resolver/rebind/platform constraints still apply)\n"
             )
         );
         let split = resolve_saved(
@@ -1075,7 +1098,7 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             format!(
-                "{HEADER}==> Egress policy: allowing TLS to api.example.com on ports 443, 8443 (persisted grants and --allow-egress)\n{SHARED_TLS_ONLY}\n==> TLS interception: ports 443, 8443 — global to every destination (TLS ClientHello with SNI required, UDP dropped, sandbox CA must be trusted). A tcp://HOST:PORT entry widens every bare hostname to PORT.\n==> Egress DNS: only allowed hostnames resolve (others NXDOMAIN when forwarder is available; private answers need --allow-lan or a port-less numeric allowance)\n"
+                "{MERGED}==> Egress policy: allowing TLS to api.example.com on ports 443, 8443 (persisted grants and --allow-egress)\n{SHARED_TLS_ONLY}\n==> TLS interception: ports 443, 8443 — global to every destination (TLS ClientHello with SNI required, UDP dropped, sandbox CA must be trusted). A tcp://HOST:PORT entry widens every bare hostname to PORT.\n==> Egress DNS: only allowed hostnames resolve (others NXDOMAIN when forwarder is available; private answers need --allow-lan or a port-less numeric allowance)\n"
             )
         );
     }
@@ -1109,9 +1132,7 @@ mod tests {
             let header = text.lines().next().unwrap_or_default();
             assert_eq!(
                 header,
-                format!(
-                    "==> Egress authority: persisted grants from \"{expected}\" [network] merged with this launch's flags (flags override persisted booleans and add allowances; nothing is saved)"
-                )
+                format!("==> Egress authority: persisted grants from \"{expected}\"")
             );
             assert!(!header.contains("\\xd0"), "byte-escaped: {header}");
         }
@@ -1122,7 +1143,8 @@ mod tests {
     #[test]
     fn hostname_notices_group_by_effective_ports_and_sources() {
         use crate::user_network::SavedGroups;
-        const HEADER: &str = "==> Egress authority: persisted grants from \"/home/a/.config/agent-vm/config.toml\" [network] merged with this launch's flags (flags override persisted booleans and add allowances; nothing is saved)\n";
+        const MERGED: &str = "==> Egress authority: persisted grants from \"/home/a/.config/agent-vm/config.toml\" [network] merged with this launch's flags (flags override persisted booleans and add allowances; nothing is saved)\n";
+        const PERSISTED_ONLY: &str = "==> Egress authority: persisted grants from \"/home/a/.config/agent-vm/config.toml\"\n";
         for (saved, cli, ports, hostnames) in [
             (
                 &[
@@ -1175,10 +1197,16 @@ mod tests {
             );
             let mut out = Vec::new();
             authority.write_notices(&mut out).unwrap();
+            // A row with no CLI entry names no flag, so its header claims no merge.
+            let header = if cli.is_empty() {
+                PERSISTED_ONLY
+            } else {
+                MERGED
+            };
             assert_eq!(
                 String::from_utf8(out).unwrap(),
                 format!(
-                    "{HEADER}{hostnames}{SHARED_TLS_ONLY}\n==> TLS interception: ports {ports} — global to every destination (TLS ClientHello with SNI required, UDP dropped, sandbox CA must be trusted). A tcp://HOST:PORT entry widens every bare hostname to PORT.\n==> Egress DNS: only allowed hostnames resolve (others NXDOMAIN when forwarder is available; private answers need --allow-lan or a port-less numeric allowance)\n"
+                    "{header}{hostnames}{SHARED_TLS_ONLY}\n==> TLS interception: ports {ports} — global to every destination (TLS ClientHello with SNI required, UDP dropped, sandbox CA must be trusted). A tcp://HOST:PORT entry widens every bare hostname to PORT.\n==> Egress DNS: only allowed hostnames resolve (others NXDOMAIN when forwarder is available; private answers need --allow-lan or a port-less numeric allowance)\n"
                 )
             );
         }

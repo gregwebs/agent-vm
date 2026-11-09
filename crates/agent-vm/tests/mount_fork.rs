@@ -505,6 +505,29 @@ fn absent_state_root_supports_directory_fork_seed_and_reuse() {
         reused_stderr.contains("[debug] sandbox config JSON:"),
         "{reused_stderr}"
     );
+
+    // The notice is the bind that actually reached the config: the guest path
+    // plus the content-addressed copy, never that copy read as a source (#551).
+    for stderr in [&seeded_stderr, &reused_stderr] {
+        let bound = bind_mounts(&debug_config_json(stderr))
+            .into_iter()
+            .find(|(_, guest, _)| guest == "/guest")
+            .map(|(host, _, _)| host)
+            .unwrap_or_else(|| panic!("no bind at /guest: {stderr}"));
+        assert!(
+            bound.ends_with("/data"),
+            "a fork binds its stored copy: {bound}"
+        );
+        let mounting = stderr
+            .lines()
+            .find(|line| line.starts_with("==> Mounting ") && line.contains("/guest"))
+            .unwrap_or_else(|| panic!("no fork mount notice: {stderr}"));
+        assert_eq!(
+            mounting,
+            format!("==> Mounting /guest (fork stored at {bound})"),
+            "the notice names the guest path and the very copy that is bound"
+        );
+    }
 }
 
 #[test]

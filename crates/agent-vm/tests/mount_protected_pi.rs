@@ -525,7 +525,7 @@ fn unset_home_with_a_mount_uses_the_account_record() {
 
 /// The other half of MF1: with `$HOME` unset the account record still supplies
 /// the route set, so a bind of an ancestor of *that* home is refused (or
-/// advised) rather than silently greeted with `==> Booting sandbox`.
+/// advised) rather than silently greeted with `==> Boot image`.
 ///
 /// `/` is an ancestor of every home, so this pins the fix without knowing the
 /// machine's account record: it is exactly the case the old code failed open

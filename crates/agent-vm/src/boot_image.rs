@@ -388,10 +388,7 @@ pub(crate) struct ImageLabel {
 
 impl fmt::Display for ImageLabel {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.origin {
-            Some(origin) => write!(formatter, "{} (from {})", self.text, origin),
-            None => formatter.write_str(&self.text),
-        }
+        formatter.write_str(&self.describe(None))
     }
 }
 
@@ -419,6 +416,30 @@ impl ImageLabel {
     /// tier — without the `(from …)` origin.
     pub(crate) fn text(&self) -> &str {
         &self.text
+    }
+
+    /// The label with one further fact sharing the origin's parentheses, or
+    /// owning them alone: `ref (from command line; 2048 MiB, 2 vCPU)` and
+    /// `ref (2048 MiB, 2 vCPU)`. One parenthetical group per line, so neither
+    /// the origin nor the fact is silently dropped when both are shown.
+    pub(crate) fn with_detail(&self, detail: &str) -> String {
+        self.describe(Some(detail))
+    }
+
+    fn describe(&self, detail: Option<&str>) -> String {
+        let origin = self
+            .origin
+            .as_deref()
+            .map(|origin| format!("from {origin}"));
+        let facts: Vec<String> = origin
+            .into_iter()
+            .chain(detail.map(str::to_owned))
+            .collect();
+        if facts.is_empty() {
+            self.text.clone()
+        } else {
+            format!("{} ({})", self.text, facts.join("; "))
+        }
     }
 
     /// A plain explicit label, for unit tests that exercise a caller's message
@@ -1509,6 +1530,29 @@ mod tests {
         let escaped = ImageLabel::for_result_reference("example.com/team/bad\u{1b}[31m:dev");
         assert!(!escaped.text().contains('\u{1b}'));
         assert!(escaped.text().contains("\\x1b"), "{}", escaped.text());
+    }
+
+    /// `with_detail` shares the origin's parentheses and owns them when there is
+    /// no origin, so one launch line can carry both the selection and the
+    /// sizing it boots with (#551).
+    #[test]
+    fn a_label_detail_shares_the_origins_parentheses() {
+        let explicit = ImageLabel {
+            text: "example/app:dev".to_string(),
+            origin: Some("command line".to_string()),
+            redacted: false,
+        };
+        assert_eq!(
+            explicit.with_detail("2048 MiB, 2 vCPU"),
+            "example/app:dev (from command line; 2048 MiB, 2 vCPU)"
+        );
+        assert_eq!(explicit.to_string(), "example/app:dev (from command line)");
+        let default = ImageLabel::for_tests("the default boot image");
+        assert_eq!(
+            default.with_detail("2048 MiB, 2 vCPU"),
+            "the default boot image (2048 MiB, 2 vCPU)"
+        );
+        assert_eq!(default.to_string(), "the default boot image");
     }
 
     #[test]

@@ -165,6 +165,19 @@ fn launch_banner(session: &ProjectSession) -> String {
     )
 }
 
+/// `==> Boot image: example/app:dev (from command line; 2048 MiB, 2 vCPU)`
+///
+/// The one line a launch says about what it is about to boot: the selection with
+/// its origin (or the fixed default-tier label) and the sizing, in a single
+/// parenthetical group. Any layer download announces itself in the pull progress
+/// display below, so this line no longer guesses at one.
+fn boot_notice(label: &crate::boot_image::ImageLabel, memory_mib: u32, cpus: u8) -> String {
+    format!(
+        "==> Boot image: {}",
+        label.with_detail(&format!("{memory_mib} MiB, {cpus} vCPU"))
+    )
+}
+
 /// `==> GitHub repo scope (2): a/b, c/d` or
 /// `==> GitHub repo scope: <none> (no api.github.com access)`
 fn repo_scope_notice(allowed: &[String]) -> String {
@@ -339,7 +352,10 @@ fn pi_home_host_root<'a>(
         .iter()
         .find(|volume| volume.guest == pi_home_guest)
         .and_then(|volume| match &volume.source {
-            mount::PreparedVolumeSource::WritableBind(host) => Some(host.as_path()),
+            // A fork of the guest Pi home is writable, so it *is* that home (the
+            // copy the guest writes credentials into).
+            mount::PreparedVolumeSource::WritableBind(host)
+            | mount::PreparedVolumeSource::Fork(host) => Some(host.as_path()),
             mount::PreparedVolumeSource::ReadOnlyBind(_) => None,
         })
 }
@@ -1049,10 +1065,12 @@ pub(crate) async fn launch(
     // context; the findings themselves stay field-only. Advisory: this never
     // denies the launch.
     notices.emit(launch_banner(&session))?;
-    // The selected boot image, once, before the session provisions any state
-    // (D10). `boot` was resolved before the first side effect above; `label`
-    // redacts a default-tier reference.
-    notices.emit(format!("==> Boot image: {label}"))?;
+    // The selected boot image and the size it boots with, once, before the
+    // session provisions any state (D10). One line, not one per fact: the image
+    // name, its origin and the sandbox sizing describe one boot (#551), and a
+    // second line for the sizing only was noise. `boot` was resolved before the
+    // first side effect above; `label` redacts a default-tier reference.
+    notices.emit(boot_notice(&label, memory_mib, cpus))?;
     let pi_report = crate::pi_credential_inspection::inspect_project(&session.state_dir);
     if let Some(warning) = pi_report.launch_warning() {
         notices.emit(warning)?;
@@ -1415,23 +1433,15 @@ pub(crate) async fn launch(
             .to_str()
             .context("--mount guest path must be UTF-8")?
             .to_owned();
+        notices.emit(volume.mount_notice())?;
         match &volume.source {
-            mount::PreparedVolumeSource::WritableBind(host) => {
-                notices.emit(format!(
-                    "==> Mounting {} -> {}",
-                    one_line::path(host),
-                    one_line::path(&guest)
-                ))?;
+            mount::PreparedVolumeSource::WritableBind(host)
+            | mount::PreparedVolumeSource::Fork(host) => {
                 let host = host.clone();
                 builder =
                     builder.volume(guest_str, move |m| m.bind(host).follow_root_symlinks(true));
             }
             mount::PreparedVolumeSource::ReadOnlyBind(host) => {
-                notices.emit(format!(
-                    "==> Mounting {} -> {} (read-only)",
-                    one_line::path(host),
-                    one_line::path(&guest)
-                ))?;
                 let host = host.clone();
                 builder = builder.volume(guest_str, move |m| {
                     m.bind(host).follow_root_symlinks(true).readonly()
@@ -1659,10 +1669,6 @@ pub(crate) async fn launch(
     }
 
     let profile = env::var("AGENT_VM_PROFILE").is_ok();
-    notices.emit(format!(
-        "==> Booting sandbox from {} ({memory_mib} MiB, {cpus} vCPU; first run pulls layers, otherwise ~3s)",
-        label.text()
-    ))?;
     let t_create = Instant::now();
     // Keep command debug output adjacent to the config dump. The invocation
     // travels over exec only after boot, so SandboxConfig does not contain it.
@@ -4142,6 +4148,23 @@ mod tests {
             "==> agent-vm-abc-42 in /home/dev/pro\\x0aj (state: /state/a\\x09b)"
         );
         assert!(!banner.contains('\n'), "{banner}");
+    }
+
+    /// One line carries the selection and the sizing; the sizing is not a second
+    /// `==> Booting sandbox` line of its own (#551). The origin's half of the
+    /// line is pinned by `boot_image`'s `with_detail` test.
+    #[test]
+    fn notice_boot_names_the_image_and_the_sizing_once() {
+        let label = crate::boot_image::ImageLabel::for_tests("example/app:dev");
+        assert_eq!(
+            boot_notice(&label, 2048, 2),
+            "==> Boot image: example/app:dev (2048 MiB, 2 vCPU)"
+        );
+        let default = crate::boot_image::ImageLabel::for_tests("the default boot image");
+        assert_eq!(
+            boot_notice(&default, 8192, 8),
+            "==> Boot image: the default boot image (8192 MiB, 8 vCPU)"
+        );
     }
 
     #[test]
