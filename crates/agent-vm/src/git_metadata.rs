@@ -234,7 +234,8 @@ impl GitMetadataReport {
                 .find(|volume| &volume.guest == guest)
                 .map(|volume| match &volume.source {
                     PreparedVolumeSource::ReadOnlyBind(host)
-                    | PreparedVolumeSource::WritableBind(host) => host.clone(),
+                    | PreparedVolumeSource::WritableBind(host)
+                    | PreparedVolumeSource::Fork(host) => host.clone(),
                 });
             if prepared.as_deref() == Some(expected.as_path()) {
                 continue;

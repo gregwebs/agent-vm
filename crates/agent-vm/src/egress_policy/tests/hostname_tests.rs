@@ -201,7 +201,7 @@ fn seven_bare_hostnames_share_one_grant_line_and_one_explanation() {
     assert_eq!(
         String::from_utf8(output).unwrap(),
         format!(
-            "==> Egress authority: persisted grants from \"/home/a/.config/agent-vm/config.toml\" [network] merged with this launch's flags (flags override persisted booleans and add allowances; nothing is saved)\n{grant} (persisted grants)\n{tail}"
+            "==> Egress authority: persisted grants from \"/home/a/.config/agent-vm/config.toml\"\n{grant} (persisted grants)\n{tail}"
         )
     );
     // Without a user table no source suffix appears at all.

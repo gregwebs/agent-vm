@@ -1600,6 +1600,12 @@ bind that stored copy, never synchronize with `HOST`, and print the exact reset
 directory. `:fork:follow-links` materializes link targets into that copy;
 without it nested link text is preserved. `fork` conflicts with `ro` and `rw`.
 
+Every selected extra mount announces itself once. A bind mounted at the path it
+was declared with needs no arrow (`==> Mounting /home/you/.cargo/registry`); a
+remap shows both sides (`==> Mounting /srv/data -> /data (read-only)`); and a
+fork names its stored copy instead of presenting it as a source
+(`==> Mounting /home/you/.pi/agent (fork stored at <state>/forks/<id>/data)`).
+
 A seed copies regular files and directories. A **socket, FIFO or device node**
 in the source is omitted, not copied and not a failure, with a notice like
 `==> Omitted socket dashboard/gateway-9999.sock from the fork of <source>`: a
@@ -3690,8 +3696,17 @@ authority to it does not.
 Notices name the file and each grant's source, for example:
 
 ```text
+==> Egress authority: persisted grants from "/Users/you/.config/agent-vm/config.toml" [network] merged with this launch's flags (flags override persisted booleans and add allowances; nothing is saved)
 ==> Egress policy: allowing 10.0.0.5/32 (persisted grants and --allow-egress)
 ==> Egress policy: --allow-lan=false overrides persisted grant allow_lan = true
+```
+
+That header says `merged with this launch's flags` only when you gave an egress
+flag or `--allow-egress` entry. A launch that gave none prints the file alone,
+the whole claim it can make:
+
+```text
+==> Egress authority: persisted grants from "/Users/you/.config/agent-vm/config.toml"
 ```
 
 Persisted hostname grants with a selected host HTTP proxy refuse **every launch**.

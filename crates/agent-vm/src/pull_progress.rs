@@ -80,9 +80,10 @@
 //! round-trips. The cache hit and the cold pull send identical `Resolving`
 //! events, and the determinism rule forbids guessing with a timer, so there is
 //! no event that separates them; the display would have to paint for both. The
-//! cold path is instead left blank until its first layer or stitch event, and
-//! cushioned by `run.rs`'s "first run pulls layers" line. `agent-vm image
-//! refresh` has no such line and pays the silence.
+//! cold path is instead left blank until its first layer or stitch event; the
+//! launch's own notices (the `==> Boot image` line, mounts, egress) precede
+//! `create`, so that blank window follows whichever one is last. `agent-vm image
+//! refresh` has no such notices and pays the silence.
 //!
 //! `Complete` also tears the display down rather than the channel close doing
 //! it. The SDK holds the progress sender until `create` returns — i.e. through

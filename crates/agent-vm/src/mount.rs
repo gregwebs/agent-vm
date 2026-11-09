@@ -1849,6 +1849,63 @@ pub(crate) fn expand_follow_links(
 mod tests {
     use super::*;
 
+    // ── PreparedVolume::mount_notice ──────────────────────────────
+
+    /// One `==> Mounting …` line per bind: the guest path alone when it is also
+    /// the source, the arrow only when the two differ, and a fork's stored copy
+    /// named as such rather than read as a source the user typed (#551).
+    #[test]
+    fn a_mount_notice_needs_an_arrow_only_for_a_remap() {
+        let volume = |source, guest: &str| PreparedVolume {
+            guest: PathBuf::from(guest),
+            source,
+            node_kind: PreparedNodeKind::Directory,
+            role: VolumeRole::Explicit,
+        };
+        assert_eq!(
+            volume(
+                PreparedVolumeSource::WritableBind(PathBuf::from("/home/a/.cargo")),
+                "/home/a/.cargo"
+            )
+            .mount_notice(),
+            "==> Mounting /home/a/.cargo"
+        );
+        assert_eq!(
+            volume(
+                PreparedVolumeSource::ReadOnlyBind(PathBuf::from("/etc")),
+                "/etc"
+            )
+            .mount_notice(),
+            "==> Mounting /etc (read-only)"
+        );
+        assert_eq!(
+            volume(
+                PreparedVolumeSource::ReadOnlyBind(PathBuf::from("/tmp/source")),
+                "/guest"
+            )
+            .mount_notice(),
+            "==> Mounting /tmp/source -> /guest (read-only)"
+        );
+        assert_eq!(
+            volume(
+                PreparedVolumeSource::Fork(PathBuf::from("/state/forks/abc/data")),
+                "/home/a/.pi/agent"
+            )
+            .mount_notice(),
+            "==> Mounting /home/a/.pi/agent (fork stored at /state/forks/abc/data)"
+        );
+        // Both paths are measured or declared text, so a control byte in either
+        // must not end the line and start a forged `==>` one.
+        assert_eq!(
+            volume(
+                PreparedVolumeSource::WritableBind(PathBuf::from("/host")),
+                "/g\nx"
+            )
+            .mount_notice(),
+            "==> Mounting /host -> /g\\x0ax"
+        );
+    }
+
     // ── parse_extra_mounts ───────────────────────────────────────
 
     #[test]
@@ -3820,6 +3877,12 @@ mod tests {
 pub(crate) enum PreparedVolumeSource {
     WritableBind(PathBuf),
     ReadOnlyBind(PathBuf),
+    /// A `:fork`'s **stored copy** (`<store>/forks/<id>/data`), which is
+    /// writable and is never a path the user named. Its own case, not a flag
+    /// beside `WritableBind`, so a fork cannot be described as an ordinary
+    /// source — or as read-only — by two fields drifting apart, and so every
+    /// consumer that asks about access or provenance must answer for it (#551).
+    Fork(PathBuf),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3840,6 +3903,41 @@ pub(crate) struct PreparedVolume {
     pub(crate) source: PreparedVolumeSource,
     pub(crate) node_kind: PreparedNodeKind,
     pub(crate) role: VolumeRole,
+}
+
+impl PreparedVolume {
+    /// The `==> Mounting …` line for this bind.
+    ///
+    /// A live bind at the path it was declared with needs no arrow; a remap
+    /// names both sides, host first as it is the side the user can go and look
+    /// at. A fork's stored copy is labelled as such rather than shown in the
+    /// source position: the reader asks "what is mounted at ~/.pi", not "which
+    /// content-addressed directory is that".
+    pub(crate) fn mount_notice(&self) -> String {
+        match &self.source {
+            PreparedVolumeSource::Fork(host) => format!(
+                "==> Mounting {} (fork stored at {})",
+                crate::one_line::path(&self.guest),
+                crate::one_line::path(host)
+            ),
+            PreparedVolumeSource::WritableBind(host) => self.bind_notice(host, ""),
+            PreparedVolumeSource::ReadOnlyBind(host) => self.bind_notice(host, " (read-only)"),
+        }
+    }
+
+    /// A live bind, whose two sides are equal only when it is mounted at the path
+    /// it was declared with.
+    fn bind_notice(&self, host: &Path, marker: &str) -> String {
+        let guest = crate::one_line::path(&self.guest);
+        if host == self.guest {
+            format!("==> Mounting {guest}{marker}")
+        } else {
+            format!(
+                "==> Mounting {} -> {guest}{marker}",
+                crate::one_line::path(host)
+            )
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -4218,7 +4316,9 @@ pub(crate) fn prepare(
                 mount.source_spelling.render(declaration)
             );
         }
-        let source = if mount.is_readonly() {
+        let source = if mount.is_fork() {
+            PreparedVolumeSource::Fork(mount.host.clone())
+        } else if mount.is_readonly() {
             PreparedVolumeSource::ReadOnlyBind(mount.host.clone())
         } else {
             PreparedVolumeSource::WritableBind(mount.host.clone())
@@ -4305,7 +4405,7 @@ pub(crate) fn prepare(
                 crate::one_line::path(&mount.guest)
             );
         };
-        volume.source = PreparedVolumeSource::WritableBind(mount.host.clone());
+        volume.source = PreparedVolumeSource::Fork(mount.host.clone());
         let metadata = fs::symlink_metadata(&mount.host).with_context(|| {
             format!(
                 "validating committed fork {}",
@@ -6545,11 +6645,11 @@ mod prepare_tests {
         let first = prepare(first, &context(store.path())).unwrap();
         let second = prepare(second, &context(store.path())).unwrap();
         let first_host = match &first.volumes[0].source {
-            PreparedVolumeSource::WritableBind(path) => path,
+            PreparedVolumeSource::Fork(path) => path,
             _ => panic!("fork is writable"),
         };
         let second_host = match &second.volumes[0].source {
-            PreparedVolumeSource::WritableBind(path) => path,
+            PreparedVolumeSource::Fork(path) => path,
             _ => panic!("fork is writable"),
         };
         assert_eq!(first.volumes[0].guest, PathBuf::from("/guest/path"));
@@ -6569,7 +6669,7 @@ mod prepare_tests {
         )
         .unwrap();
         let data = match &seeded.volumes[0].source {
-            PreparedVolumeSource::WritableBind(path) => path.clone(),
+            PreparedVolumeSource::Fork(path) => path.clone(),
             _ => panic!("fork is writable"),
         };
         fs::remove_dir_all(source.path()).unwrap();
@@ -6579,7 +6679,7 @@ mod prepare_tests {
         )
         .unwrap();
         let reused_data = match &reused.volumes[0].source {
-            PreparedVolumeSource::WritableBind(path) => path,
+            PreparedVolumeSource::Fork(path) => path,
             _ => panic!("fork is writable"),
         };
         assert_eq!(reused_data, &data);
@@ -6641,7 +6741,7 @@ mod prepare_tests {
         )
         .unwrap();
         let data = match &plan.volumes[0].source {
-            PreparedVolumeSource::WritableBind(path) => path.clone(),
+            PreparedVolumeSource::Fork(path) => path.clone(),
             _ => panic!("fork is writable"),
         };
         let final_dir = data.parent().unwrap().to_path_buf();
@@ -7078,7 +7178,7 @@ mod prepare_tests {
             let result = prepare(parse_extra_mounts(&[request]).unwrap(), &context(&store))
                 .expect("waiter must reuse READY");
             let data = match &result.volumes[0].source {
-                PreparedVolumeSource::WritableBind(path) => path,
+                PreparedVolumeSource::Fork(path) => path,
                 _ => panic!("fork is writable"),
             };
             std::fs::write(
@@ -7162,7 +7262,7 @@ mod prepare_tests {
         clear_copy_checkpoint();
 
         let fork_path = match &first_plan.volumes[0].source {
-            PreparedVolumeSource::WritableBind(path) => path.clone(),
+            PreparedVolumeSource::Fork(path) => path.clone(),
             _ => panic!("fork is writable"),
         };
         let waiter = fs::read_to_string(waiter_result).unwrap();
@@ -7223,7 +7323,7 @@ mod prepare_tests {
         )
         .expect("a killed initializer must be retryable");
         let data = match &retry.volumes[0].source {
-            PreparedVolumeSource::WritableBind(path) => path,
+            PreparedVolumeSource::Fork(path) => path,
             _ => panic!("fork is writable"),
         };
         assert_eq!(fs::read_to_string(data.join("kill-here")).unwrap(), "seed");
@@ -7260,7 +7360,7 @@ mod prepare_tests {
         let paths: Vec<_> = plans
             .iter()
             .map(|plan| match &plan.volumes[0].source {
-                PreparedVolumeSource::WritableBind(path) => path.clone(),
+                PreparedVolumeSource::Fork(path) => path.clone(),
                 _ => panic!("fork must be writable"),
             })
             .collect();
@@ -7444,7 +7544,7 @@ mod prepare_tests {
         )
         .unwrap();
         let data = match &plan.volumes[0].source {
-            PreparedVolumeSource::WritableBind(path) => path,
+            PreparedVolumeSource::Fork(path) => path,
             _ => unreachable!(),
         };
         assert_eq!(
@@ -7485,7 +7585,7 @@ mod prepare_tests {
                 &context(store.path()),
             )?;
             let data = match &plan.volumes[0].source {
-                PreparedVolumeSource::WritableBind(path) => path,
+                PreparedVolumeSource::Fork(path) => path,
                 _ => unreachable!(),
             };
             fs::read_to_string(data.join("link")).map_err(Into::into)
@@ -7533,7 +7633,7 @@ mod prepare_tests {
                 .is_none()
         );
         let data = match &plan.volumes[0].source {
-            PreparedVolumeSource::WritableBind(path) => path,
+            PreparedVolumeSource::Fork(path) => path,
             _ => unreachable!(),
         };
         fs::remove_dir_all(data).unwrap();
@@ -7564,7 +7664,7 @@ mod prepare_tests {
         )
         .unwrap();
         let data = match &seeded.volumes[0].source {
-            PreparedVolumeSource::WritableBind(path) => path.clone(),
+            PreparedVolumeSource::Fork(path) => path.clone(),
             _ => panic!("fork must be writable"),
         };
         assert!(fs::symlink_metadata(&data).unwrap().is_dir());
@@ -7575,7 +7675,7 @@ mod prepare_tests {
         )
         .unwrap();
         let reused_data = match &reused.volumes[0].source {
-            PreparedVolumeSource::WritableBind(path) => path,
+            PreparedVolumeSource::Fork(path) => path,
             _ => panic!("fork must be writable"),
         };
         assert_eq!(reused_data, &data);
@@ -7598,7 +7698,7 @@ mod prepare_tests {
 
     fn fork_data(plan: &PreparedMountPlan) -> PathBuf {
         match &plan.volumes[0].source {
-            PreparedVolumeSource::WritableBind(path) => path.clone(),
+            PreparedVolumeSource::Fork(path) => path.clone(),
             other => panic!("fork must be writable, got {other:?}"),
         }
     }

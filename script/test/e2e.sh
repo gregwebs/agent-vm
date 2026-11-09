@@ -450,12 +450,14 @@ assert_single_logs_ref() {
 }
 
 # #258: the boot must select the expected ref, and only it. A fallback or
-# substituted image prints its own "Booting sandbox from <ref>" line, so the
-# single counted line naming `ref` is the acquisition observation, not merely
-# the absence of install/build/pull text.
+# substituted image prints its own "Boot image: <ref>" line, so the single
+# counted line naming `ref` is the acquisition observation, not merely the
+# absence of install/build/pull text. Both boot forms are counted (#551 merged
+# them into one line): a launch that printed the retired `Booting sandbox from`
+# line as well would be two boots' worth of claims, so it must fail here.
 assert_single_boot_ref() {
   local desc="$1" ref="$2" out="$3" boots count status=0
-  boots="$(grep 'Booting sandbox from ' <<<"$out")" || status=$?
+  boots="$(grep -E '^==> (Boot image: |Booting sandbox from )' <<<"$out")" || status=$?
   case "$status" in
     0) ;;
     1)
@@ -473,7 +475,7 @@ assert_single_boot_ref() {
     printf '%s\n' "$boots"
     return 1
   fi
-  if ! grep -qF -- "from $ref " <<<"$boots"; then
+  if ! grep -qF -- "Boot image: $ref " <<<"$boots"; then
     echo "    FAIL: $desc (the boot line does not name $ref)"
     printf '%s\n' "$boots"
     return 1
@@ -1979,7 +1981,6 @@ CONCURRENT_NOTICE_PATTERNS=(
   '^==> GitHub repo scope: .+$'
   '^==> GitHub repo scope [(][0-9]+[)]: .+$'
   '^==> Boot image: .+$'
-  '^==> Booting sandbox from .+$'
   '^==> Project path .+$'
   '^==> --no-git skips .+$'
   '^==> Mounting .+$'
@@ -3062,6 +3063,28 @@ check_harness_negative() {
   done
   if expect_effective_path "oracle-two-lines" "$(path_oracle_row "$accepted")"$'\n'"path=$accepted" >/dev/null 2>&1; then
     echo "    FAIL: PATH oracle accepted two path= lines"
+    result=$((result + 1))
+  fi
+
+  # #551: the boot-line oracle must accept this launcher's one-line form and
+  # reject a capture that also carries the retired `Booting sandbox from` line or
+  # an unexpected ref. The accepted row is production's exact sentence, so a
+  # pattern that stops matching `Boot image: ` (or that counts only one of the
+  # two forms) turns this check red without a VM boot.
+  local boot_ref="localhost:5000/e2e/agent:v1"
+  if ! assert_single_boot_ref "boot-oracle-accepted" "$boot_ref" \
+    "==> Boot image: $boot_ref (from command line; 2048 MiB, 2 vCPU)" >/dev/null 2>&1; then
+    echo "    FAIL: boot oracle rejected the one-line boot notice"
+    result=$((result + 1))
+  fi
+  if assert_single_boot_ref "boot-oracle-two-lines" "$boot_ref" \
+    "==> Boot image: $boot_ref (from command line; 2048 MiB, 2 vCPU)"$'\n'"==> Booting sandbox from $boot_ref (2048 MiB, 2 vCPU)" >/dev/null 2>&1; then
+    echo "    FAIL: boot oracle accepted two boot notices"
+    result=$((result + 1))
+  fi
+  if assert_single_boot_ref "boot-oracle-other-ref" "$boot_ref" \
+    "==> Boot image: localhost:5000/e2e/other:v1 (from command line; 2048 MiB, 2 vCPU)" >/dev/null 2>&1; then
+    echo "    FAIL: boot oracle accepted a substituted image reference"
     result=$((result + 1))
   fi
 
