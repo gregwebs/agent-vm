@@ -411,19 +411,41 @@ fn suffix_components(suffix: &[OsString]) -> Vec<Vec<u8>> {
     suffix.iter().map(|s| s.as_bytes().to_vec()).collect()
 }
 /// The walk's answer as one path: the deepest existing ancestor it reached,
-/// followed by the components that do not exist yet. `resolve` bails on an
-/// unreadable or non-absolute root; the lexical spelling is then the only
-/// answer left, and it is the one the caller typed.
-fn anchored_resolved(cwd: &Path, path: &Path) -> PathBuf {
+/// followed by the components that do not exist yet.
+///
+/// An error rather than a fallback: `resolve` bails on an unreadable or
+/// non-absolute root, and the lexical spelling is then an *unverified* answer —
+/// returning it would let the caller decide a bind is outside `.sessions` on the
+/// strength of a path nothing could check. R1 fails closed the same way
+/// (`measure_store` propagates `resolve`), and R2 guards the same boundary.
+fn anchored_resolved(cwd: &Path, path: &Path) -> Result<PathBuf> {
     let spelled = anchored(cwd, path);
-    let Ok(resolution) = resolve(&spelled, Walk::Authority) else {
-        return spelled;
-    };
+    let resolution = resolve(&spelled, Walk::Authority)?;
     let mut end = resolution.end.0.path;
     for component in resolution.end.1 {
         end.push(component);
     }
-    end
+    Ok(end)
+}
+
+/// Whether any directory on the way to `path` — `path` itself included — has
+/// `identity`, the `(dev, ino)` of this project's `.sessions` directory.
+///
+/// This is the spelling a canonical prefix cannot see: a bind of
+/// `alias/refusals.json` where `alias` *is* `.sessions` under another name. A
+/// component that does not exist yet simply contributes no identity, and one that
+/// cannot be stated contributes none either — the prefix rule is the one that has
+/// to catch that case, and `resolve` has already failed closed on it.
+fn under_identity(path: &Path, identity: Option<(u64, u64)>) -> bool {
+    let Some(identity) = identity else {
+        return false;
+    };
+    path.ancestors().any(|ancestor| {
+        fs::symlink_metadata(ancestor)
+            .ok()
+            .filter(|metadata| metadata.is_dir())
+            .is_some_and(|metadata| (metadata.dev(), metadata.ino()) == identity)
+    })
 }
 
 /// The ADR-0038 authority directory of one `$HOME`: the one store measured
@@ -544,7 +566,7 @@ impl ProtectedConfigDir {
                         .ok()
                         .filter(|m| m.is_dir())
                         .map(|m| (m.dev(), m.ino())),
-                    anchored: anchored_resolved(cwd, &dir.spelled),
+                    anchored: anchored_resolved(cwd, &dir.spelled)?,
                 }),
                 StorePurpose::LaunchAuthority | StorePurpose::RuntimeState => {}
             }
@@ -687,15 +709,21 @@ impl ProtectedConfigDir {
     ///
     /// - the resolved path is `.sessions` or a separator-prefixed descendant;
     /// - the root *is* the directory, by `(dev, ino)` even under another name;
+    /// - an ancestor of the root has that `(dev, ino)`, so the root is inside
+    ///   `.sessions` reached through an alias;
     /// - for a root that does not exist, the anchored lexical path is inside.
-    pub(crate) fn sessions_dir_named_by(&self, host: &Path) -> Option<&Path> {
-        let anchored_host = anchored_resolved(&self.cwd, host);
+    ///
+    /// The two resolved spellings need `resolve`, which fails closed: a path it
+    /// cannot read is an error here, not a bind allowed on an unverified spelling.
+    pub(crate) fn sessions_dir_named_by(&self, host: &Path) -> Result<Option<&Path>> {
+        let anchored_host = anchored_resolved(&self.cwd, host)?;
         let host_bytes = anchored_host.as_os_str().as_bytes();
         let identity = fs::symlink_metadata(&anchored_host)
             .ok()
             .filter(|m| m.is_dir())
             .map(|m| (m.dev(), m.ino()));
-        self.sessions
+        Ok(self
+            .sessions
             .iter()
             .find(|sessions| {
                 let named_by_identity = identity.is_some() && identity == sessions.identity;
@@ -703,16 +731,16 @@ impl ProtectedConfigDir {
                     sessions.anchored.as_os_str().as_bytes(),
                     host_bytes,
                 );
-                named_by_identity || inside
+                named_by_identity || inside || under_identity(&anchored_host, sessions.identity)
             })
-            .map(|sessions| sessions.anchored.as_path())
+            .map(|sessions| sessions.anchored.as_path()))
     }
 
     /// Refuse a core bind, in any mode, that names this project's `.sessions`
     /// directory or anything in it (`R2`, ADR-0064).
     pub(crate) fn check_core_bind_names_sessions(&self, source: &CoreHostSource) -> Result<()> {
         let root = anchored(&self.cwd, &source.path);
-        if let Some(sessions) = self.sessions_dir_named_by(&root) {
+        if let Some(sessions) = self.sessions_dir_named_by(&root)? {
             bail!(
                 "agent-vm's {} \"{}\" is, or lies inside, \"{}\", where agent-vm keeps this \
                  project's refusal records and control socket; the guest could forge or erase \
@@ -734,7 +762,7 @@ impl ProtectedConfigDir {
         spelling: &Spelling,
         host: &Path,
     ) -> Result<()> {
-        let Some(sessions) = self.sessions_dir_named_by(host) else {
+        let Some(sessions) = self.sessions_dir_named_by(host)? else {
             return Ok(());
         };
         // `render_quoted` escapes, so these bytes are never printed raw.
@@ -1491,6 +1519,85 @@ mod tests {
         let beside = t.state.join("ab12cd34ef56.sessions-backup");
         fs::create_dir_all(&beside).unwrap();
         assert!(t.mount(&guard, &beside, true).is_ok());
+    }
+
+    /// R2's three spellings that a plain canonical prefix cannot all see: `..`
+    /// (the resolved path leaves the component behind), a symlink under another
+    /// name (the resolved path is the same entry), and a different letter case
+    /// (the same entry under a name whose bytes differ — only the filesystem knows,
+    /// so the case spelling is asserted only where the platform says it is the same
+    /// directory).
+    #[test]
+    fn r2_catches_dot_dot_symlink_and_case_spellings() {
+        let t = Tree::new();
+        fs::create_dir_all(t.sessions()).unwrap();
+        fs::write(t.sessions().join("refusals.json"), "x").unwrap();
+        fs::create_dir_all(t.msb_home()).unwrap();
+        let guard = t.guard_with(&t.launch_stores());
+
+        // `..`: spelled through a sibling of the store, resolved back into it.
+        let via_dot_dot = t
+            .msb_home()
+            .join("..")
+            .join("ab12cd34ef56.sessions")
+            .join("refusals.json");
+        let message = t
+            .mount(&guard, &via_dot_dot, true)
+            .expect_err("`..` does not leave the store")
+            .to_string();
+        assert!(message.contains("lies inside"), "{message}");
+
+        // A symlink to the store under a name of the guest's choosing.
+        let alias = t.state.join("innocent");
+        std::os::unix::fs::symlink(t.sessions(), &alias).unwrap();
+        let message = t
+            .mount(&guard, &alias.join("refusals.json"), true)
+            .expect_err("an alias of the store is the store")
+            .to_string();
+        assert!(message.contains("lies inside"), "{message}");
+
+        // A different letter case. Both spellings are compared byte-wise by the
+        // prefix rule, so this only fails closed where the platform resolves the
+        // two to one entry — which is exactly the case that must be refused.
+        let cased = t.state.join("AB12CD34EF56.SESSIONS").join("refusals.json");
+        let identity = |path: &Path| fs::metadata(path).ok().map(|m| (m.dev(), m.ino()));
+        if identity(&cased) == identity(&t.sessions().join("refusals.json"))
+            && identity(&cased).is_some()
+        {
+            let message = t
+                .mount(&guard, &cased, true)
+                .expect_err("the same entry under another spelling")
+                .to_string();
+            assert!(message.contains("lies inside"), "{message}");
+        } else {
+            eprintln!("SKIPPED the case spelling: this filesystem is case-sensitive");
+        }
+
+        // A neighbouring directory that is *not* the store stays allowed, so the
+        // three spellings above are not the rule refusing everything.
+        let elsewhere = t.state.join("innocent-2");
+        fs::create_dir_all(&elsewhere).unwrap();
+        assert!(t.mount(&guard, &elsewhere, true).is_ok());
+    }
+
+    /// R2 fails closed. The resolved spelling used to fall back to the lexical one
+    /// when the walk could not answer, which decided "outside `.sessions`" on a
+    /// path nothing had checked; R1 fails closed on the same input, and R2 guards
+    /// the same boundary.
+    #[test]
+    fn r2_fails_closed_when_the_path_cannot_be_resolved() {
+        let t = Tree::new();
+        fs::create_dir_all(t.sessions()).unwrap();
+        let guard = t.guard_with(&t.launch_stores());
+        // A regular file where a directory would have to be: the walk cannot say
+        // what the path resolves to.
+        fs::write(t.state.join("a-file"), "x").unwrap();
+        let unresolvable = t.state.join("a-file").join("refusals.json");
+        let message = t
+            .mount(&guard, &unresolvable, true)
+            .expect_err("an unanswerable path is refused, not allowed")
+            .to_string();
+        assert!(message.contains("cannot determine"), "{message}");
     }
 
     /// D3: a `:ro`/`:fork` bind of a strict ancestor stays exempt from R1, so it
