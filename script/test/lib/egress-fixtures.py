@@ -1489,9 +1489,12 @@ def check_refusal_feed(work: Path, command: Command, session: str, status: int, 
     for row in after_rows.values():
         if label not in row["line"]:
             failures.append(f"row must read {label}: {row['line']!r}")
-    if len(live_rows) != len(after_rows):
-        failures.append(f"the same rows must survive the session: "
-                        f"{len(live_rows)} live, {len(after_rows)} logged")
+    # The *same* entries, not merely as many: an ID is assigned once, stored in
+    # the log and never recomputed (AC2), so a rewritten ID between the live view
+    # and the log would be a bug this count alone would miss.
+    if set(live_rows) != set(after_rows):
+        failures.append(f"the same IDs must survive the session: "
+                        f"{sorted(live_rows)} live, {sorted(after_rows)} logged")
     expected_status = -signal.SIGKILL if command.variant == "kill9" else 0
     if status != expected_status:
         failures.append(f"launch status {status}, expected {expected_status}")
