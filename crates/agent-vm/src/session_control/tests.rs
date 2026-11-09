@@ -741,7 +741,9 @@ async fn dropping_a_session_writes_a_record_that_says_it_ended() {
             .sessions
             .into_iter()
             .find(|session| session.info.id == id)
-            .map(|session| session.ended_ms);
+            // `and_then`, not `map`: a found session with no end is the case
+            // this waits through, and `Some(None)` would look like success.
+            .and_then(|session| session.ended_ms);
         if ended.is_some() {
             break;
         }
