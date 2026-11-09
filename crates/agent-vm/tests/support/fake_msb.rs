@@ -453,7 +453,11 @@ mod tests {
         for (index, character) in fields.char_indices() {
             match character {
                 '(' | '[' | '{' => depth += 1,
-                ')' | ']' | '}' => depth = depth.saturating_sub(1),
+                ')' | ']' | '}' => {
+                    depth = depth
+                        .checked_sub(1)
+                        .expect("the LaunchCapabilities literal is unbalanced")
+                }
                 ',' if depth == 0 => {
                     out.push(&fields[start..index]);
                     start = index + 1;

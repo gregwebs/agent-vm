@@ -8,13 +8,9 @@ import pathlib
 import sys
 import tomllib
 
-COHORT = frozenset((
-    "msb_krun", "msb_krun_arch", "msb_krun_arch_gen", "msb_krun_cpuid",
-    "msb_krun_devices", "msb_krun_hvf", "msb_krun_kernel", "msb_krun_polly",
-    "msb_krun_smbios", "msb_krun_utils", "msb_krun_vmm",
-))
-# The version each cohort crate must resolve to, checked per crate rather than as
-# one number. Most of the cohort ships as a unit at the runtime's release
+# The version(s) each cohort crate may resolve to, checked per crate rather than
+# as one number, and `COHORT` derived from it so the set and the pins cannot
+# drift apart. Most of the cohort ships as a unit at the runtime's release
 # version; `arch_gen`, `cpuid` and `smbios` are published on their own cadence,
 # so the outer workspace resolves 0.1.45 while the vendored lock still pins
 # 0.1.42 — two official crates.io releases of the fork. Naming the accepted set
@@ -33,6 +29,7 @@ VERSIONS: dict[str, frozenset[str]] = {
     "msb_krun_utils": frozenset(("0.1.42",)),
     "msb_krun_vmm": frozenset(("0.1.42",)),
 }
+COHORT = frozenset(VERSIONS)
 FIRMWARE_VERSION = "5.6.1"
 FIRMWARE_ABI = "5"
 REGISTRY_PREFIX = "registry+https://github.com/rust-lang/crates.io-index"
@@ -83,15 +80,15 @@ def compare_locks(
 ) -> None:
     """Check that both Cargo roots resolve each cohort crate to the same release.
 
-    A crate with one accepted version must match exactly, checksum included. A
-    crate with several may differ in version only: when both roots land on the
-    same one, the checksum still proves they read the same published artifact.
+    Two roots that land on one release must agree on its checksum, which is what
+    proves they read the same published artifact. Only a crate with several
+    accepted releases may differ in version: `cohort_packages` has already
+    narrowed each lock to `VERSIONS[name]`, so a differing version is one the map
+    accepts.
     """
     for name, (root_version, root_source, root_checksum) in root.items():
         nested_version, nested_source, nested_checksum = nested[name]
         if root_version != nested_version:
-            # Only a crate with several accepted releases can reach this point:
-            # `cohort_packages` already narrowed each lock to `VERSIONS[name]`.
             continue
         if (root_source, root_checksum) != (nested_source, nested_checksum):
             fail(f"root and nested Cargo locks disagree on {name} source/checksum")
@@ -187,7 +184,7 @@ def main() -> None:
         print(f"runtime provenance: FAIL: {error}", file=sys.stderr)
         sys.exit(1)
     pins = "/".join(sorted({version for versions in VERSIONS.values() for version in versions}))
-    print(f"runtime provenance: root+nested registry cohort {pins}; checksums equal; firmware {args.gitlink[:12]} version {FIRMWARE_VERSION} ABI {FIRMWARE_ABI}")
+    print(f"runtime provenance: root+nested registry cohort {pins}; checksums equal where the version is; firmware {args.gitlink[:12]} version {FIRMWARE_VERSION} ABI {FIRMWARE_ABI}")
 
 
 if __name__ == "__main__":
