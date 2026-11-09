@@ -15,7 +15,6 @@ use microsandbox::logs::{LogCursor, LogEntry, LogSource, LogStreamOptions, LogSt
 use microsandbox_types::Protocol;
 
 use futures::FutureExt as _;
-use futures::StreamExt as _;
 
 use super::*;
 use crate::refusal::log::SessionsDir;
@@ -110,7 +109,14 @@ async fn drive(
     settle: Duration,
 ) -> Option<LogCursor> {
     let (stop, receiver) = watch::channel(false);
-    let task = tokio::spawn(follow(opener, Arc::clone(&live), persist.handle(), hint, receiver, true));
+    let task = tokio::spawn(follow(
+        opener,
+        Arc::clone(&live),
+        persist.handle(),
+        hint,
+        receiver,
+        true,
+    ));
     tokio::time::sleep(settle).await;
     let _ = stop.send(true);
     task.await.expect("the follower task did not panic")
@@ -133,8 +139,14 @@ async fn fake_stream_ingests_and_hints_once() {
     let live = live();
     let hint = Arc::new(Hint::new());
 
-    let cursor = drive(opener, Arc::clone(&live), persist, Arc::clone(&hint), Duration::from_millis(200))
-        .await;
+    let cursor = drive(
+        opener,
+        Arc::clone(&live),
+        persist,
+        Arc::clone(&hint),
+        Duration::from_millis(200),
+    )
+    .await;
 
     let snapshot = live.snapshot();
     assert_eq!(snapshot.entries.len(), 2, "one entry per destination");
@@ -162,7 +174,14 @@ async fn records_before_session_start_are_ignored() {
     let opener = scripted(vec![Ok(entry(stale, 10))]).0;
     let live = live();
     let hint = Arc::new(Hint::new());
-    let cursor = drive(opener, Arc::clone(&live), persist, Arc::clone(&hint), Duration::from_millis(150)).await;
+    let cursor = drive(
+        opener,
+        Arc::clone(&live),
+        persist,
+        Arc::clone(&hint),
+        Duration::from_millis(150),
+    )
+    .await;
     assert!(live.snapshot().entries.is_empty());
     assert_eq!(live.snapshot().rev, 0);
     assert!(!hint.fired(), "no entry, no hint");
@@ -179,7 +198,14 @@ async fn a_generic_error_resumes_from_the_cursor() {
     ]);
     let live = live();
     let hint = Arc::new(Hint::new());
-    drive(opener, Arc::clone(&live), persist, hint, Duration::from_millis(1_600)).await;
+    drive(
+        opener,
+        Arc::clone(&live),
+        persist,
+        hint,
+        Duration::from_millis(1_600),
+    )
+    .await;
 
     let seen = seen.lock().unwrap();
     assert!(seen.len() >= 2, "the stream was reopened");
@@ -212,7 +238,14 @@ async fn gap_only_change_notifies_and_dirties() {
     let live = live();
     let mut updates = live.lock().updates.subscribe();
     let hint = Arc::new(Hint::new());
-    drive(opener, Arc::clone(&live), persist, Arc::clone(&hint), Duration::from_millis(1_600)).await;
+    drive(
+        opener,
+        Arc::clone(&live),
+        persist,
+        Arc::clone(&hint),
+        Duration::from_millis(1_600),
+    )
+    .await;
     assert!(live.snapshot().gap, "the gap is recorded");
     assert!(live.snapshot().entries.is_empty());
     // The gap was published, so a subscriber sees it without re-reading the list.
@@ -235,7 +268,14 @@ async fn open_failure_degrades_without_error() {
     let live = live();
     let hint = Arc::new(Hint::new());
     let (stop, receiver) = watch::channel(false);
-    let task = tokio::spawn(follow(opener, Arc::clone(&live), persist.handle(), hint, receiver, true));
+    let task = tokio::spawn(follow(
+        opener,
+        Arc::clone(&live),
+        persist.handle(),
+        hint,
+        receiver,
+        true,
+    ));
     let cursor = tokio::time::timeout(Duration::from_secs(10), task)
         .await
         .expect("following stops on its own instead of spinning")
@@ -312,7 +352,10 @@ fn final_wait_is_bounded_with_a_held_lock() {
     let started = std::time::Instant::now();
     let finished = wait.wait(Duration::from_millis(200));
     let elapsed = started.elapsed();
-    assert!(!finished, "the write could not land while the lock was held");
+    assert!(
+        !finished,
+        "the write could not land while the lock was held"
+    );
     assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
     drop(held);
 }
@@ -373,7 +416,11 @@ async fn missed_rotation_reopens_without_double_counting() {
     microsandbox::with_backend(Arc::clone(&backend), async {
         std::fs::write(
             logs.join("network.log"),
-            format!("{}\n{}\n", record_line(1, 1001, None), record_line(2, 1002, None)),
+            format!(
+                "{}\n{}\n",
+                record_line(1, 1001, None),
+                record_line(2, 1002, None)
+            ),
         )
         .unwrap();
         let (stop, receiver) = watch::channel(false);
@@ -395,7 +442,11 @@ async fn missed_rotation_reopens_without_double_counting() {
         std::fs::rename(logs.join("network.log"), logs.join("network.log.gone")).unwrap();
         std::fs::write(
             logs.join("network.log"),
-            format!("{}\n{}\n", record_line(3, 1003, None), record_line(4, 1004, None)),
+            format!(
+                "{}\n{}\n",
+                record_line(3, 1003, None),
+                record_line(4, 1004, None)
+            ),
         )
         .unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
@@ -419,10 +470,16 @@ async fn missed_rotation_reopens_without_double_counting() {
             .collect::<Vec<_>>()
     );
     for entry in &snapshot.entries {
-        assert_eq!(entry.count, 1, "a re-read from the beginning must not double count");
+        assert_eq!(
+            entry.count, 1,
+            "a re-read from the beginning must not double count"
+        );
         assert_eq!(entry.key.kind, Kind::NetworkDenial);
     }
-    assert!(snapshot.gap, "the rotation was reported as a gap, not as silence");
+    assert!(
+        snapshot.gap,
+        "the rotation was reported as a gap, not as silence"
+    );
 }
 
 #[tokio::test]
@@ -457,9 +514,18 @@ async fn finish_drains_lines_written_after_the_last_poll() {
             .expect("the follower had read at least one entry");
 
         // The producer wrote two more lines while the follower was stopping.
-        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         use std::io::Write as _;
-        write!(file, "{}\n{}\n", record_line(2, 2002, None), record_line(3, 2003, None)).unwrap();
+        write!(
+            file,
+            "{}\n{}\n",
+            record_line(2, 2002, None),
+            record_line(3, 2003, None)
+        )
+        .unwrap();
         file.sync_all().unwrap();
 
         // `finish`'s drain: the same engine, from the cursor, not following.
@@ -513,7 +579,11 @@ async fn a_line_is_persisted_within_5_s() {
             true,
         ));
         let started = std::time::Instant::now();
-        std::fs::write(logs.join("network.log"), format!("{}\n", record_line(1, 3001, None))).unwrap();
+        std::fs::write(
+            logs.join("network.log"),
+            format!("{}\n", record_line(1, 3001, None)),
+        )
+        .unwrap();
         loop {
             let persisted = dir
                 .read()

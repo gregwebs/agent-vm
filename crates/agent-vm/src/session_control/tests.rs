@@ -14,9 +14,9 @@ use microsandbox_types::Protocol;
 use tokio::sync::watch;
 
 use super::*;
+use crate::refusal::SessionRefusals;
 use crate::refusal::feed::{LiveRefusals, POLL_INTERVAL};
 use crate::refusal::log::SessionsDir;
-use crate::refusal::SessionRefusals;
 
 const SID: &str = "0a1b2c3d";
 const BASE_MS: i64 = 1_760_000_000_000;
@@ -53,7 +53,6 @@ fn session(socket: bool) -> SessionRefusals {
 /// driven directly so a test controls exactly when an update is published.
 struct Harness {
     _root: tempfile::TempDir,
-    dir: SessionsDir,
     live: Arc<LiveRefusals>,
     socket: PathBuf,
     stop: watch::Sender<bool>,
@@ -72,7 +71,6 @@ impl Harness {
         let task = tokio::spawn(serve(listener, Arc::clone(&live), receiver));
         Self {
             _root: root,
-            dir,
             live,
             socket,
             stop,
@@ -86,11 +84,11 @@ impl Harness {
             .offset
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut dirty = false;
-        assert!(
-            self.live.ingest(&record(offset + 1, port), &mut dirty, BASE_MS),
-            "a new destination is a change"
-        );
-        dirty = true;
+        let changed = self
+            .live
+            .ingest(&record(offset + 1, port), &mut dirty, BASE_MS);
+        assert!(changed, "a new destination is a change");
+        assert!(dirty, "a new destination dirties the record");
         self.live.snapshot().rev
     }
 
@@ -189,11 +187,17 @@ async fn a_lagging_subscriber_gets_a_resync_snapshot() {
     }
     let error = updates.try_recv().expect_err("the lag is reported");
     assert!(
-        matches!(error, tokio::sync::broadcast::error::TryRecvError::Lagged(_)),
+        matches!(
+            error,
+            tokio::sync::broadcast::error::TryRecvError::Lagged(_)
+        ),
         "{error}"
     );
     let (fresh, _) = live.subscribe();
-    assert_eq!(fresh.entries.len(), crate::refusal::feed::UPDATE_BUFFER + 20);
+    assert_eq!(
+        fresh.entries.len(),
+        crate::refusal::feed::UPDATE_BUFFER + 20
+    );
     assert_eq!(fresh.rev, live.snapshot().rev);
 }
 
@@ -204,7 +208,10 @@ async fn twelve_subscribers_leave_room_for_list() {
     for _ in 0..MAX_SUBSCRIBERS {
         let mut stream = UnixStream::connect(&harness.socket).await.unwrap();
         send(&mut stream, "{\"v\":1,\"op\":\"subscribe\"}").await;
-        assert!(matches!(next_reply(&mut stream).await, Reply::Snapshot { .. }));
+        assert!(matches!(
+            next_reply(&mut stream).await,
+            Reply::Snapshot { .. }
+        ));
         subscribers.push(stream);
     }
     // Every subscriber slot is taken, and `list` still answers.
@@ -213,9 +220,7 @@ async fn twelve_subscribers_leave_room_for_list() {
         .expect("list is not queued behind the subscribers")
         .expect("list is answered");
     assert_eq!(snapshot.info.id.as_str(), SID);
-    for stream in &mut subscribers {
-        drop(stream);
-    }
+    drop(subscribers);
     harness.shutdown().await;
 }
 
@@ -279,7 +284,10 @@ async fn stale_socket_is_removed_and_reported_ended() {
     }
     let discovery = discover(&dir, BASE_MS).await;
     assert!(discovery.live.is_empty());
-    assert!(!dir.socket_path(&id).exists(), "the stale socket is unlinked");
+    assert!(
+        !dir.socket_path(&id).exists(),
+        "the stale socket is unlinked"
+    );
     assert!(
         discovery.unresponsive.is_empty(),
         "a refused connection is not a hung session: {:?}",
@@ -372,7 +380,10 @@ async fn overlong_path_degrades_with_one_notice() {
         "the socket was not bound, and the launch was not failed"
     );
     assert!(
-        !project.sessions_dir().join(format!("{}.sock", live.id().as_str())).exists(),
+        !project
+            .sessions_dir()
+            .join(format!("{}.sock", live.id().as_str()))
+            .exists(),
         "no socket file was left behind"
     );
     // The log still exists, so `access` will list this session afterwards.
@@ -425,7 +436,10 @@ async fn a_session_with_a_socket_binds_it_at_start_and_unlinks_at_finish() {
         .into_iter()
         .find(|session| session.info.id == *live.id())
         .expect("the session is in the log");
-    assert!(logged.ended_ms.is_some(), "ended is persisted before remove");
+    assert!(
+        logged.ended_ms.is_some(),
+        "ended is persisted before remove"
+    );
     // `finish` is idempotent: a second teardown path cannot move the record.
     live.finish().await;
 }

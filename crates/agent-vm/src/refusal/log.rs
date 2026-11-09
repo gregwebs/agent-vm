@@ -288,10 +288,7 @@ impl SessionsDir {
                 Err(error) if error.kind() == ErrorKind::AddrInUse => continue,
                 Err(error) => {
                     return Err(error).with_context(|| {
-                        format!(
-                            "binding {}",
-                            crate::one_line::path(&self.socket_path(&id))
-                        )
+                        format!("binding {}", crate::one_line::path(&self.socket_path(&id)))
                     });
                 }
             };
@@ -306,11 +303,7 @@ impl SessionsDir {
             let bytes = log.encode()?;
             host_paths::atomic_write(&self.record(), &bytes, 0o600)
                 .with_context(|| format!("writing {}", crate::one_line::path(&self.record())))?;
-            return Ok(Some(Reserved {
-                snapshot,
-                bound,
-                evicted_sessions: log.evicted_sessions,
-            }));
+            return Ok(Some(Reserved { snapshot, bound }));
         }
         bail!("could not reserve a session ID free of a live socket")
     }
@@ -320,7 +313,6 @@ impl SessionsDir {
 pub(crate) struct Reserved<T> {
     pub(crate) snapshot: SessionSnapshot,
     pub(crate) bound: T,
-    pub(crate) evicted_sessions: u64,
 }
 
 /// What one write changed, for the notice the launcher may print.
@@ -337,6 +329,9 @@ pub(crate) struct Log {
 }
 
 impl Log {
+    /// Only the eviction tests build a log without a file: the ordering rule is
+    /// what they are about, and a file would only add I/O.
+    #[cfg(test)]
     fn new(evicted_sessions: u64, sessions: Vec<SessionSnapshot>) -> Self {
         Self {
             evicted_sessions,
@@ -424,7 +419,9 @@ impl Log {
     }
 
     fn encoded_len(&self) -> u64 {
-        self.encode().map(|bytes| bytes.len() as u64).unwrap_or(u64::MAX)
+        self.encode()
+            .map(|bytes| bytes.len() as u64)
+            .unwrap_or(u64::MAX)
     }
 
     fn encode(&self) -> Result<Vec<u8>> {

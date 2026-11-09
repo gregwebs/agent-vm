@@ -705,7 +705,7 @@ impl ProtectedConfigDir {
                 );
                 named_by_identity || inside
             })
-        .map(|sessions| sessions.anchored.as_path())
+            .map(|sessions| sessions.anchored.as_path())
     }
 
     /// Refuse a core bind, in any mode, that names this project's `.sessions`
@@ -747,14 +747,8 @@ impl ProtectedConfigDir {
             crate::one_line::quoted_path(sessions)
         );
     }
-
 }
-fn remedy(
-    bind: CoreBind,
-    root: &Path,
-    purpose: StorePurpose,
-    home: Option<&Path>,
-) -> &'static str {
+fn remedy(bind: CoreBind, root: &Path, purpose: StorePurpose, home: Option<&Path>) -> &'static str {
     // A store that is not the per-`$HOME` authority dir is agent-vm's own state
     // (ADR-0064). There is no narrower project directory to offer when the
     // state root itself sits inside the project, so the remedy is the documented
@@ -1029,7 +1023,8 @@ mod tests {
         let t = Tree::new();
         let other = t.cwd.join("other");
         fs::create_dir(&other).unwrap();
-        let guard = ProtectedConfigDir::measure(&[t.home.clone(), other.clone()], &[], &t.cwd).unwrap();
+        let guard =
+            ProtectedConfigDir::measure(&[t.home.clone(), other.clone()], &[], &t.cwd).unwrap();
         for home in [&t.home, &other] {
             assert!(
                 guard
@@ -1198,7 +1193,8 @@ mod tests {
         let cfg = t.home.join(".config");
         fs::create_dir(&cfg).unwrap();
         fs::set_permissions(&cfg, fs::Permissions::from_mode(0o000)).unwrap();
-        let err = ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &t.cwd).unwrap_err();
+        let err =
+            ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &t.cwd).unwrap_err();
         fs::set_permissions(&cfg, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(err.to_string().contains("cannot determine"));
 
@@ -1209,7 +1205,8 @@ mod tests {
         fs::create_dir_all(&cfg).unwrap();
         fs::write(cfg.join("config.toml"), "# no network\n").unwrap();
         fs::set_permissions(&cfg, fs::Permissions::from_mode(0o000)).unwrap();
-        let err = ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &t.cwd).unwrap_err();
+        let err =
+            ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &t.cwd).unwrap_err();
         fs::set_permissions(&cfg, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(err.to_string().contains("cannot determine"));
         assert!(err.to_string().contains("config.toml"));
@@ -1344,11 +1341,22 @@ mod tests {
         fs::create_dir_all(t.sessions()).unwrap();
         let guard = t.guard_with(&t.launch_stores());
         let message = guard
-            .check_writable_mount(Declaration::Argv, &Spelling::new("/decl"), &t.state, &t.state)
+            .check_writable_mount(
+                Declaration::Argv,
+                &Spelling::new("/decl"),
+                &t.state,
+                &t.state,
+            )
             .unwrap_err()
             .to_string();
-        assert!(message.contains("refusal records and control sockets"), "{message}");
-        assert!(message.contains(&t.sessions().display().to_string()), "{message}");
+        assert!(
+            message.contains("refusal records and control sockets"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&t.sessions().display().to_string()),
+            "{message}"
+        );
         assert!(message.contains(":ro"), "{message}");
     }
 
@@ -1359,7 +1367,12 @@ mod tests {
         fs::create_dir_all(t.msb_home().join("sandboxes/agent-vm-x/logs")).unwrap();
         let guard = t.guard_with(&t.launch_stores());
         let message = guard
-            .check_writable_mount(Declaration::Argv, &Spelling::new("/decl"), &t.msb_home(), &t.msb_home())
+            .check_writable_mount(
+                Declaration::Argv,
+                &Spelling::new("/decl"),
+                &t.msb_home(),
+                &t.msb_home(),
+            )
             .unwrap_err()
             .to_string();
         assert!(message.contains("sandbox runtime"), "{message}");
@@ -1414,10 +1427,18 @@ mod tests {
         assert!(!t.sessions().exists());
         let guard = t.guard_with(&t.launch_stores());
         let message = guard
-            .check_writable_mount(Declaration::Argv, &Spelling::new("/decl"), &t.state, &t.state)
+            .check_writable_mount(
+                Declaration::Argv,
+                &Spelling::new("/decl"),
+                &t.state,
+                &t.state,
+            )
             .unwrap_err()
             .to_string();
-        assert!(message.contains(t.sessions().to_str().unwrap()), "{message}");
+        assert!(
+            message.contains(t.sessions().to_str().unwrap()),
+            "{message}"
+        );
         assert!(message.contains("refusal records"), "{message}");
         // Nor does a missing core bind reach it.
         assert!(
@@ -1440,7 +1461,11 @@ mod tests {
             fs::write(t.sessions().join(name), "x").unwrap();
             for read_only in [false, true] {
                 let message = t
-                    .mount(&t.guard_with(&t.launch_stores()), &t.sessions().join(name), read_only)
+                    .mount(
+                        &t.guard_with(&t.launch_stores()),
+                        &t.sessions().join(name),
+                        read_only,
+                    )
                     .unwrap_err()
                     .to_string();
                 assert!(message.contains("lies inside"), "{message}");
@@ -1456,7 +1481,11 @@ mod tests {
         let t = Tree::new();
         let guard = t.guard_with(&t.launch_stores());
         for inside in [t.sessions(), t.sessions().join("nothing-here.json")] {
-            assert!(t.mount(&guard, &inside, true).is_err(), "{}", inside.display());
+            assert!(
+                t.mount(&guard, &inside, true).is_err(),
+                "{}",
+                inside.display()
+            );
         }
         // A directory whose *name* merely starts with the store's does not.
         let beside = t.state.join("ab12cd34ef56.sessions-backup");
@@ -1473,12 +1502,19 @@ mod tests {
         fs::create_dir_all(t.sessions()).unwrap();
         let guard = t.guard_with(&t.launch_stores());
         for ancestor in [t.state.clone(), t.cwd.clone(), t.home.clone()] {
-            assert!(t.mount(&guard, &ancestor, true).is_ok(), "{}", ancestor.display());
+            assert!(
+                t.mount(&guard, &ancestor, true).is_ok(),
+                "{}",
+                ancestor.display()
+            );
         }
         // The writable spelling of the same ancestor is still R1's refusal...
         assert!(t.mount(&guard, &t.state, false).is_err());
         // ...and readability of the strict ancestor D3 is about is unchanged.
         fs::create_dir_all(t.home.join(".config/agent-vm")).unwrap();
-        assert!(t.mount(&t.guard_with(&t.launch_stores()), &t.home, true).is_ok());
+        assert!(
+            t.mount(&t.guard_with(&t.launch_stores()), &t.home, true)
+                .is_ok()
+        );
     }
 }

@@ -164,6 +164,9 @@ pub(crate) const RESERVED_TOOL_NAMES: &[&str] = &[
     // `tools print` (#510) re-emits the built-in catalog, so the word belongs to
     // the CLI even though no shipped tool is named it.
     "tools",
+    // `access` (ADR-0064) is the one verb that answers what a sandbox refused, so
+    // a tool by that name could not be reached.
+    "access",
     "_intercept-hook",
     // The direct runner (issue #398). Reserved in every config tier, like a
     // built-in: a tool by that name could not be reached, and the runner is

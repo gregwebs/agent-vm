@@ -234,8 +234,7 @@ mod tests {
             ),
         ] {
             let recorder = Recorder::new(stop_fails);
-            let failures =
-                runtime.block_on(cleanup_exec_sandbox_failures(&recorder, mode));
+            let failures = runtime.block_on(cleanup_exec_sandbox_failures(&recorder, mode));
             assert_eq!(
                 recorder.recorded(),
                 expected,

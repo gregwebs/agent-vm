@@ -305,10 +305,7 @@ fn key_bytes_and_id_golden_vectors() {
         // `n` is part of the derivation, so a collision has a second answer.
         assert_ne!(refusal_id(SID, &key, 0), refusal_id(SID, &key, 1));
         // The session is, too: the same destination in two sessions differs.
-        assert_ne!(
-            refusal_id(SID, &key, 0),
-            refusal_id("00000000", &key, 0)
-        );
+        assert_ne!(refusal_id(SID, &key, 0), refusal_id("00000000", &key, 0));
     }
     // The five toy entries, as published in §5.
     let mut session = session();
@@ -383,7 +380,10 @@ fn names_coalesce_case_insensitively() {
             port: Some(443),
         }
     );
-    assert_eq!(snapshot.entries[0].name.as_ref().unwrap().name, "CDN.example");
+    assert_eq!(
+        snapshot.entries[0].name.as_ref().unwrap().name,
+        "CDN.example"
+    );
 }
 
 #[test]
@@ -453,7 +453,12 @@ fn every_refusal_site_has_a_kind() {
     for site in RefusalSite::ALL {
         let kind = classify(site, RefusalLayer::Tenant);
         assert!(
-            [Kind::NetworkDenial, Kind::PolicyLock, Kind::CredentialRefusal].contains(&kind),
+            [
+                Kind::NetworkDenial,
+                Kind::PolicyLock,
+                Kind::CredentialRefusal
+            ]
+            .contains(&kind),
             "{site:?}"
         );
         // The platform floor outranks any site.
@@ -476,7 +481,11 @@ fn every_refusal_site_has_a_kind() {
         classify(RefusalSite::SecretViolation, RefusalLayer::Tenant),
         Kind::CredentialRefusal
     );
-    for site in [RefusalSite::UdpQuic, RefusalSite::TcpDot, RefusalSite::DnsRebind] {
+    for site in [
+        RefusalSite::UdpQuic,
+        RefusalSite::TcpDot,
+        RefusalSite::DnsRebind,
+    ] {
         assert_eq!(classify(site, RefusalLayer::Tenant), Kind::PolicyLock);
     }
 }
@@ -511,7 +520,10 @@ fn the_reason_column_names_the_lock_that_holds() {
         .iter()
         .map(RefusalEntry::reason)
         .collect();
-    assert_eq!(reasons[0], "no grant in this version; relaunch with --allow-egress");
+    assert_eq!(
+        reasons[0],
+        "no grant in this version; relaunch with --allow-egress"
+    );
     assert_eq!(reasons[3], "can't be allowed: platform policy");
 
     // A tenant-layer built-in rule names itself, because "no grant" would be a

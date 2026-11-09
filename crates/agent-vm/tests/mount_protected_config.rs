@@ -681,10 +681,7 @@ fn a_ro_mount_of_the_sessions_dir_is_refused() {
     let stderr = stderr_of(&out);
     assert!(!out.status.success(), "{stderr}");
     assert!(stderr.contains("lies inside"), "{stderr}");
-    assert!(
-        stderr.contains(&sessions.display().to_string()),
-        "{stderr}"
-    );
+    assert!(stderr.contains(&sessions.display().to_string()), "{stderr}");
     // The plan was rejected before any launch state was created.
     assert!(!stderr.contains("[debug] sandbox config JSON:"), "{stderr}");
 }

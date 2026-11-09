@@ -55,8 +55,9 @@ pub(crate) const UPDATE_BUFFER: usize = 256;
 /// The SDK's log stream, restated here because the SDK keeps the alias behind a
 /// private module. A type alias is transparent, so this *is* the SDK's
 /// `LogStream`.
-pub(crate) type LogStream =
-    std::pin::Pin<Box<dyn futures::Stream<Item = microsandbox::MicrosandboxResult<LogEntry>> + Send + 'static>>;
+pub(crate) type LogStream = std::pin::Pin<
+    Box<dyn futures::Stream<Item = microsandbox::MicrosandboxResult<LogEntry>> + Send + 'static>,
+>;
 
 /// Opens one stream over this sandbox's `network.log`.
 ///
@@ -109,7 +110,9 @@ impl LiveRefusals {
         // A follower panic would poison the lock; the entries are still readable
         // and refusing to serve them would turn a display failure into a launch
         // failure, so the guard is taken through the poison.
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub(crate) fn snapshot(&self) -> SessionSnapshot {
@@ -160,7 +163,6 @@ impl LiveRefusals {
         let _ = state.updates.send(update);
         snapshot
     }
-
 }
 
 /// The one hint stderr gets (AC7).
@@ -243,7 +245,14 @@ pub(crate) async fn follow(
         let stream = match open(options(&start)).await {
             Ok(stream) => stream,
             Err(error) => {
-                if !resume_after(&error, &mut start, &mut failures, &mut cursor, &live, &mut dirty) {
+                if !resume_after(
+                    &error,
+                    &mut start,
+                    &mut failures,
+                    &mut cursor,
+                    &live,
+                    &mut dirty,
+                ) {
                     return cursor;
                 }
                 tokio::time::sleep(REOPEN_PAUSE).await;
@@ -534,6 +543,10 @@ impl FinalWait {
 }
 
 fn write_loop(slot: &Slot, dir: &SessionsDir) {
+    // What this thread has already reported, so a newer log's warning is said
+    // once and an eviction is not announced on every write.
+    let mut reported_warning: Option<String> = None;
+    let mut reported_evictions = 0u64;
     loop {
         let job = {
             let mut state = slot.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -558,12 +571,29 @@ fn write_loop(slot: &Slot, dir: &SessionsDir) {
         // replace the final record.
         let skip = snapshot.rev < state.written_rev || state.finished;
         drop(state);
-        if !skip
-            && let Err(error) = dir.write(&snapshot, now_ms())
-        {
-            // A display log that cannot be written is reported once per failed
-            // write to the log stream, and never fails the launch.
-            tracing::warn!("could not write the refusal log: {error:#}");
+        if !skip {
+            match dir.write(&snapshot, now_ms()) {
+                Ok(report) => {
+                    // A newer build's log is reported once, not on every write;
+                    // an eviction is reported when the count moves.
+                    if let Some(warning) = report.warning
+                        && reported_warning.as_deref() != Some(warning.as_str())
+                    {
+                        tracing::warn!("{warning}");
+                        reported_warning = Some(warning);
+                    }
+                    if report.evicted_sessions > reported_evictions {
+                        reported_evictions = report.evicted_sessions;
+                        tracing::info!(
+                            evicted = report.evicted_sessions,
+                            "the refusal log evicted whole sessions to stay bounded"
+                        );
+                    }
+                }
+                // A display log that cannot be written is reported and never
+                // fails the launch.
+                Err(error) => tracing::warn!("could not write the refusal log: {error:#}"),
+            }
         }
         if !skip {
             let mut state = slot.state.lock().unwrap_or_else(|p| p.into_inner());

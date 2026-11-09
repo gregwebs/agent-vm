@@ -24,7 +24,7 @@ use microsandbox::Sandbox;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, Semaphore, watch};
+use tokio::sync::{Semaphore, broadcast, watch};
 use tokio::task::JoinSet;
 
 use crate::refusal::feed::{self, Hint, LiveRefusals, LogStream, Opener, Persister};
@@ -57,7 +57,9 @@ fn notice(message: impl std::fmt::Display) {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// One launch's refusal feed, socket and log.
@@ -66,8 +68,6 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// starting cannot miss a change aimed at it, and torn down from exactly one
 /// place ([`crate::teardown::ExecTeardown::before_remove`]).
 pub(crate) struct LiveSession {
-    /// `None` when the directory could not be adopted.
-    dir: Option<SessionsDir>,
     info: SessionInfo,
     live: Option<Arc<LiveRefusals>>,
     persister: Option<Persister>,
@@ -119,7 +119,13 @@ impl LiveSession {
                  socket path allows. Set a shorter AGENT_VM_STATE_DIR to get live refusals.",
                 crate::one_line::path(&socket)
             ));
-            return Self::with_dir(&dir, SessionInfo { socket: false, ..info });
+            return Self::with_dir(
+                &dir,
+                SessionInfo {
+                    socket: false,
+                    ..info
+                },
+            );
         }
 
         // Binding happens inside the reservation, so a name another session still
@@ -130,13 +136,25 @@ impl LiveSession {
             Ok(Some(reserved)) => reserved,
             Ok(None) => {
                 notice("==> Refusals are not recorded: the project's refusal log is busy");
-                return Self::with_dir(&dir, SessionInfo { socket: false, ..info });
+                return Self::with_dir(
+                    &dir,
+                    SessionInfo {
+                        socket: false,
+                        ..info
+                    },
+                );
             }
             Err(error) => {
                 notice(format!(
                     "==> Refusals are recorded but not served live: {error:#}"
                 ));
-                return Self::with_dir(&dir, SessionInfo { socket: false, ..info });
+                return Self::with_dir(
+                    &dir,
+                    SessionInfo {
+                        socket: false,
+                        ..info
+                    },
+                );
             }
         };
         let bound_socket = dir.socket_path(&reserved.snapshot.info.id);
@@ -145,14 +163,19 @@ impl LiveSession {
                 "==> Refusals are recorded but not served live: {error:#}"
             ));
             let _ = std::fs::remove_file(&bound_socket);
-            return Self::with_dir(&dir, SessionInfo { socket: false, ..info });
+            return Self::with_dir(
+                &dir,
+                SessionInfo {
+                    socket: false,
+                    ..info
+                },
+            );
         }
         let listening = LiveRefusals::new(SessionRefusals::resume(reserved.snapshot.clone()));
         let persister = Persister::new(dir.clone());
         let (stop, receiver) = watch::channel(false);
         let task = tokio::spawn(serve(reserved.bound, Arc::clone(&listening), receiver));
         Self {
-            dir: Some(dir),
             info: reserved.snapshot.info,
             live: Some(listening),
             persister: Some(persister),
@@ -169,7 +192,6 @@ impl LiveSession {
 
     fn degraded(info: SessionInfo) -> Self {
         Self {
-            dir: None,
             info,
             live: None,
             persister: None,
@@ -183,11 +205,14 @@ impl LiveSession {
     /// The log without a socket: the feed still runs, `access` still lists it.
     fn with_dir(dir: &SessionsDir, info: SessionInfo) -> Self {
         let live = LiveRefusals::new(SessionRefusals::new(info.clone()));
+        let persister = Persister::new(dir.clone());
+        // The session's empty record is written now, so `access --session` can
+        // name a session that exists but has refused nothing yet.
+        persister.post(live.snapshot());
         Self {
-            dir: Some(dir.clone()),
             info,
             live: Some(live),
-            persister: Some(Persister::new(dir.clone())),
+            persister: Some(persister),
             open: Mutex::new(None),
             running: Mutex::new(None),
             following: Mutex::new(None),
@@ -195,6 +220,9 @@ impl LiveSession {
         }
     }
 
+    /// The session's own ID. Read by the teardown tests and by any caller that
+    /// needs to name this session before it has refused anything.
+    #[cfg(test)]
     pub(crate) fn id(&self) -> &SessionId {
         &self.info.id
     }
@@ -522,7 +550,13 @@ async fn subscribe_connection(stream: &mut UnixStream, live: &LiveRefusals) {
         return;
     }
     if ended {
-        let _ = write_reply(stream, &Reply::Ended { v: PROTOCOL_VERSION }).await;
+        let _ = write_reply(
+            stream,
+            &Reply::Ended {
+                v: PROTOCOL_VERSION,
+            },
+        )
+        .await;
         return;
     }
     loop {
@@ -556,12 +590,24 @@ async fn subscribe_connection(stream: &mut UnixStream, live: &LiveRefusals) {
                     return;
                 }
                 if ended {
-                    let _ = write_reply(stream, &Reply::Ended { v: PROTOCOL_VERSION }).await;
+                    let _ = write_reply(
+                        stream,
+                        &Reply::Ended {
+                            v: PROTOCOL_VERSION,
+                        },
+                    )
+                    .await;
                     return;
                 }
             }
             Err(broadcast::error::RecvError::Closed) => {
-                let _ = write_reply(stream, &Reply::Ended { v: PROTOCOL_VERSION }).await;
+                let _ = write_reply(
+                    stream,
+                    &Reply::Ended {
+                        v: PROTOCOL_VERSION,
+                    },
+                )
+                .await;
                 return;
             }
         }
@@ -570,19 +616,25 @@ async fn subscribe_connection(stream: &mut UnixStream, live: &LiveRefusals) {
 
 // -- client ----------------------------------------------------------------
 
-/// Subscribe to one session, for a future GUI and for this module's tests.
+/// Subscribe to one session.
+///
+/// `agent-vm access` lists, it does not stream, so nothing in this release calls
+/// this: it is the interface agent-vm#301's GUI is for, and the protocol tests
+/// drive it so it cannot rot.
+#[allow(dead_code)]
 pub(crate) async fn subscribe(path: &Path) -> Result<impl futures::Stream<Item = Result<Reply>>> {
     let stream = UnixStream::connect(path)
         .await
         .with_context(|| format!("connecting to {}", crate::one_line::path(path)))?;
     let mut writer = stream;
     writer
-        .write_all(
-            format!("{{\"v\":{PROTOCOL_VERSION},\"op\":\"subscribe\"}}\n").as_bytes(),
-        )
+        .write_all(format!("{{\"v\":{PROTOCOL_VERSION},\"op\":\"subscribe\"}}\n").as_bytes())
         .await
         .context("sending the subscribe request")?;
-    writer.flush().await.context("sending the subscribe request")?;
+    writer
+        .flush()
+        .await
+        .context("sending the subscribe request")?;
     let lines = BufReader::new(writer).lines();
     Ok(futures::stream::unfold(lines, |mut lines| async move {
         match lines.next_line().await {
@@ -601,7 +653,9 @@ fn parse_reply(line: &str) -> Result<Reply> {
 async fn list(path: &Path) -> Result<SessionSnapshot> {
     let stream = tokio::time::timeout(Duration::from_secs(1), UnixStream::connect(path))
         .await
-        .map_err(|_| anyhow::anyhow!("connecting to {} timed out", crate::one_line::path(path)))??;
+        .map_err(|_| {
+            anyhow::anyhow!("connecting to {} timed out", crate::one_line::path(path))
+        })??;
     let mut reader = BufReader::new(stream);
     reader
         .get_mut()

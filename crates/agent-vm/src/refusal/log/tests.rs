@@ -5,7 +5,7 @@
 //! concurrency row here evidence about the production shape.
 
 use super::*;
-use crate::refusal::{Kind, Destination, EntryKey, RefusalEntry, SessionInfo};
+use crate::refusal::{Destination, EntryKey, Kind, RefusalEntry, SessionInfo};
 
 const HASH: &str = "ab12cd34ef56";
 const NOW: i64 = 1_790_000_000_000;
@@ -130,7 +130,7 @@ fn two_writers_on_independent_descriptors_serialize() {
     for writer in 0..2u8 {
         let dir = dir.clone();
         handles.push(std::thread::spawn(move || {
-            let own = filled(session(&format!("0000000{writer}", ), true), 1, NOW);
+            let own = filled(session(&format!("0000000{writer}",), true), 1, NOW);
             for round in 0..20 {
                 let mut own = own.clone();
                 own.rev = round;
@@ -149,7 +149,6 @@ fn two_writers_on_independent_descriptors_serialize() {
     }
 }
 
-#[test]
 #[test]
 fn eviction_is_deterministic_and_counted() {
     // The ordering rule, over a log built in memory: no file I/O, so the
@@ -246,7 +245,9 @@ fn an_evicted_live_session_is_restored_by_its_owner() {
     }
     let log = dir.read().unwrap();
     assert!(
-        !log.sessions.iter().any(|s| s.info.id.as_str() == "0000000a"),
+        !log.sessions
+            .iter()
+            .any(|s| s.info.id.as_str() == "0000000a"),
         "the older live session was evicted to make room"
     );
     assert!(log.evicted_sessions > 0);
@@ -266,6 +267,7 @@ fn an_evicted_live_session_is_restored_by_its_owner() {
     );
 }
 
+#[test]
 fn serialized_size_never_exceeds_2_mib() {
     let (_root, dir) = dir();
     // The writer's own session is the worst case: 512 entries with maximum-size
@@ -410,8 +412,17 @@ fn a_loose_mode_dir_is_not_adopted() {
     // created by a reader.
     let link = root.path().join("link.sessions");
     std::os::unix::fs::symlink(&tight, &link).unwrap();
-    assert!(SessionsDir::open(&link).unwrap_err().to_string().contains("not a directory"));
-    assert!(SessionsDir::open(&root.path().join("absent.sessions")).unwrap().is_none());
+    assert!(
+        SessionsDir::open(&link)
+            .unwrap_err()
+            .to_string()
+            .contains("not a directory")
+    );
+    assert!(
+        SessionsDir::open(&root.path().join("absent.sessions"))
+            .unwrap()
+            .is_none()
+    );
     assert!(!root.path().join("absent.sessions").exists());
 }
 
@@ -430,10 +441,16 @@ fn prune_drops_history_and_keeps_the_writer() {
     dir.write(&own, NOW).unwrap();
     let log = dir.read().unwrap();
     assert!(
-        log.sessions.iter().all(|s| s.info.id.as_str() != "00000001"),
+        log.sessions
+            .iter()
+            .all(|s| s.info.id.as_str() != "00000001"),
         "an idle session past retention is pruned"
     );
-    assert!(log.sessions.iter().any(|s| s.info.id.as_str() == "00000002"));
+    assert!(
+        log.sessions
+            .iter()
+            .any(|s| s.info.id.as_str() == "00000002")
+    );
 
     // An ended session with no entries is not worth a reader's attention.
     let mut quiet = session("00000003", true);
