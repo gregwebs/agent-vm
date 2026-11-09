@@ -197,7 +197,16 @@ class Contracts(unittest.TestCase):
         anything is seeded."""
         for case, project in ((egress.Case("PA1"), "proj"), (egress.Case("PA1x"), "other")):
             (self.work / project).mkdir(exist_ok=True)
+            # The one call `orchestrate` makes before a PA launch: it seeds and
+            # checks, and it reports a leftover before overwriting one.
+            self.assertEqual(egress.prepare_allowance(self.work, case, "192.168.1.2"), [])
+            egress.remove_allowances(self.work)
             egress.seed_allowances(self.work, case, "192.168.1.2")
+            stale = egress.prepare_allowance(self.work, case, "192.168.1.2")
+            self.assertEqual(len(stale), 1, stale)
+            self.assertIn("left from an earlier case", stale[0])
+            # Reported and re-seeded: the case can still run, and it fails.
+            self.assertEqual(egress.check_allowance_seed(self.work, case, "192.168.1.2"), [])
             store = egress.allowance_store(self.work)
             # Independent of the seeder: the digest of the canonical path's bytes.
             canonical = os.path.realpath(self.work / project)

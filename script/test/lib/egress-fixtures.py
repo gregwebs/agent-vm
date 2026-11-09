@@ -1611,6 +1611,30 @@ def seed_allowances(work: Path, case: Case, lan: str):
     path.chmod(0o600)
 
 
+def prepare_allowance(work: Path, case: Case, lan: str) -> list[str]:
+    """Everything a PA case must do before it launches, in one testable place.
+
+    Returns the failures that must stop the launch. A leftover store is reported
+    and removed rather than overwritten; the seed is then checked against an
+    independent identity. Both steps are the difference between PA1x proving
+    isolation and PA1x passing because it never had a record.
+    """
+    failures: list[str] = []
+    if allowance_present(work):
+        failures.append(
+            "a project allowance record was left from an earlier case; removing it before this case's record")
+        try:
+            allowance_store(work).unlink()
+        except OSError as error:
+            failures.append(f"the leftover record could not be removed: {error}")
+    try:
+        seed_allowances(work, case, lan)
+        failures.extend(check_allowance_seed(work, case, lan))
+    except (OSError, RuntimeError) as error:
+        failures.append(f"the allowance seed failed: {error}")
+    return failures
+
+
 def check_allowance_seed(work: Path, case: Case, lan: str) -> list[str]:
     """The seed, read back and checked against an independent identity.
 
@@ -2129,18 +2153,7 @@ def orchestrate(args) -> int:
             allowance_leaked = allowance_present(work)
             seed_failures: list[str] = []
             if case.case in ALLOWANCE_CASES:
-                if allowance_leaked:
-                    seed_failures.append(
-                        "a project allowance record was left from an earlier case; removing it before this case's record")
-                    try:
-                        allowance_store(work).unlink()
-                    except OSError as error:
-                        seed_failures.append(f"the leftover record could not be removed: {error}")
-                try:
-                    seed_allowances(work, case, args.lan)
-                    seed_failures.extend(check_allowance_seed(work, case, args.lan))
-                except (OSError, RuntimeError) as error:
-                    seed_failures.append(f"the allowance seed failed: {error}")
+                seed_failures = prepare_allowance(work, case, args.lan)
                 if seed_failures:
                     # No launch: without its record PA1 would fail for the wrong
                     # reason and PA1x would pass while proving nothing.
