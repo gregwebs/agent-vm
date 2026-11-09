@@ -427,6 +427,10 @@ CASES = (
     Case("HP6c", flags=("www.github.com", "github.com", "--allow-host")),
     Case("PXH1", flags=("example.com",), guest=False, extras=("HTTPS_PROXY",)),
     Case("CL1"),
+    # ADR-0064: the read-only refusal feed. `kill9` is the same run with the
+    # launcher killed during the guest's sleep, which is the only way to see
+    # `ended (unclean)`: nothing writes the end.
+    Case("RF1"), Case("RF1", "kill9"),
 )
 
 
@@ -529,7 +533,7 @@ class Command:
 
 
 def expected_attempts(case: Case) -> tuple[str, ...]:
-    if case.case in ("NR1", "NR2", "NR3"):
+    if case.case in ("NR1", "NR2", "NR3", "RF1"):
         return ()
     if hostname_tier(case.case):
         return tuple(row[0] for row in hostname_rows(case))
@@ -561,6 +565,9 @@ def expected_attempts(case: Case) -> tuple[str, ...]:
         "V6": ("public-v6-1111", "public-v6-1001"),
         "V6c": ("public-v6-1111", "public-v6-1001"),
         "DNS6c": ("explicit-v6-udp", "explicit-v6-tcp"), "RB1": ("rebind-udp", "rebind-tcp"),
+        # ADR-0064 RF1 asserts on the host-side refusal table, so it declares no
+        # probe attempts of its own.
+        "RF1": (),
     }
     return labels[case.case]
 
@@ -1017,9 +1024,31 @@ class OwnedLaunch:
                     self.errors.append(message)
             self.stop_observing.wait(0.05)
 
+    def _refusal_feed_while_running(self):
+        """Ask the host what the *live* session refused (ADR-0064 RF1)."""
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline and not self.stop_observing.is_set():
+            text = self.log.read_text(errors="replace") if self.log.exists() else ""
+            if "RF1 READY" in text.splitlines():
+                break
+            time.sleep(0.1)
+        else:
+            self.errors.append("RF1 READY never appeared")
+            return
+        try:
+            status, output = refusal_feed_query(self.work, self.command)
+        except (OSError, subprocess.SubprocessError) as error:
+            self.errors.append(f"live access failed: {error}")
+            return
+        (self.work / "RF1-live.txt").write_text(f"status={status}\n{output}")
+
     def run(self):
         monitor = threading.Thread(target=self._monitor)
         monitor.start()
+        witness = None
+        if self.command.case == "RF1":
+            witness = threading.Thread(target=self._refusal_feed_while_running)
+            witness.start()
         helper = _load_owned_launch()
         try:
             self.primary = helper.run_in_owned_group(
@@ -1037,6 +1066,10 @@ class OwnedLaunch:
             self.errors.append(str(error))
         finally:
             self.stop_observing.set()
+            if witness is not None:
+                witness.join(timeout=30)
+                if witness.is_alive():
+                    self.errors.append("live access did not finish within bound")
             monitor.join(timeout=2)
             if monitor.is_alive():
                 self.errors.append("observation did not stop within bound")
@@ -1346,6 +1379,74 @@ def strict_hook_rejected(text: str) -> bool:
     return "CASE HK2 BEGIN" not in text and ".agent-vm.runtime.sh failed (exit 7)" in text
 
 
+RF1_HINT = ("==> The sandbox refused a guest network request; run `agent-vm access` "
+            "to see refusals (shown once per session)")
+
+
+def refusal_feed_query(work: Path, command: Command, timeout: float = 30) -> tuple[int, str]:
+    """`agent-vm access --all` in the launch's own project and environment.
+
+    The command reads the project's refusal log and dials its control sockets, so
+    it must run with the launch's `AGENT_VM_STATE_DIR`, `HOME` and cwd — that is
+    the whole point of the case: a *separate* process, exactly as a user would
+    run it.
+    """
+    argv = (command.argv[0], "access", "--all")
+    done = subprocess.run(argv, env=command.env, cwd=command.cwd, stdin=subprocess.DEVNULL,
+                          capture_output=True, text=True, timeout=timeout)
+    return done.returncode, done.stdout + done.stderr
+
+
+def refusal_feed_rows(text: str) -> dict[str, dict[str, str]]:
+    """Parse the `access` table: ID -> {column: value}.
+
+    The destination column can contain spaces, so the split is by the *known*
+    column count from the right: COUNT, LAST-SEEN, SESSION are single tokens and
+    ACTION is everything after them.
+    """
+    rows: dict[str, dict[str, str]] = {}
+    for line in text.splitlines():
+        # A row starts with the 8-hex ID; the header and the footers do not.
+        match = re.fullmatch(r"([0-9a-f]{8}) .*", line)
+        if match:
+            rows[match.group(1)] = {"id": match.group(1), "line": line}
+    return rows
+
+
+def check_refusal_feed(work: Path, command: Command, status: int, text: str,
+                       live_status: int, live_text: str, after_status: int,
+                       after_text: str) -> list[str]:
+    """ADR-0064 RF1: one live row group, the same IDs afterwards, one hint."""
+    failures: list[str] = []
+    lines = text.splitlines()
+    if sum(1 for line in lines if line == RF1_HINT) != 1:
+        failures.append(f"the hint must appear exactly once: "
+                        f"{sum(1 for line in lines if line == RF1_HINT)}")
+    live_rows = refusal_feed_rows(live_text)
+    after_rows = refusal_feed_rows(after_text)
+    if len(live_rows) < 2:
+        failures.append(f"two live rows expected, saw {sorted(live_rows)}: {live_text!r}")
+    for row in live_rows.values():
+        if " running" not in row["line"] and not row["line"].count("running"):
+            failures.append(f"live row is not running: {row['line']!r}")
+    if live_status != 0 or after_status != 0:
+        failures.append(f"access exited {live_status}/{after_status}")
+    for ident in live_rows:
+        if ident not in after_rows:
+            failures.append(f"ID {ident} is not in the log after the session ended")
+        elif command.variant == "kill9":
+            if "ended (unclean)" not in after_rows[ident]["line"]:
+                failures.append(f"killed session must read ended (unclean): "
+                                f"{after_rows[ident]['line']!r}")
+        elif not re.search(r"ended(?! \()", after_rows[ident]["line"]):
+            failures.append(f"row is not ended: {after_rows[ident]['line']!r}")
+    if "No refusals" in after_text:
+        failures.append("the log is empty after the session ended")
+    if status not in (0, 137, -9) :
+        failures.append(f"launch status {status}")
+    return failures
+
+
 def snapshot_validation(work: Path) -> dict:
     result = {}
     for directory in ("home", "config", "state", "proj"):
@@ -1601,7 +1702,7 @@ def health_command(work: Path) -> Command:
 
 
 def selected_cases(smoke=False):
-    return tuple(case for case in CASES if not smoke or (case.case in ("P0", "LC1", "HC1", "I1", "D1", "L1", "NR1", "NR2", "NR3") and not case.optional))
+    return tuple(case for case in CASES if not smoke or (case.case in ("P0", "LC1", "HC1", "I1", "D1", "L1", "NR1", "NR2", "NR3", "RF1") and not case.optional))
 
 
 def fixture_command(work: Path) -> Command:
@@ -1849,6 +1950,19 @@ def orchestrate(args) -> int:
                 append_owned(work, {"phase": "ingress-driver", "identity": ingress_identity})
             status = owned.run()
             failures = []
+            owned_text = owned.log.read_text(errors="replace") if owned.log.exists() else ""
+            if case.case == "RF1":
+                live_status, live_output = 1, ""
+                if (work / "RF1-live.txt").exists():
+                    recorded = (work / "RF1-live.txt").read_text(errors="replace")
+                    first, _, rest = recorded.partition("\n")
+                    live_status, live_output = int(first.split("=", 1)[1]), rest
+                after_status, after_output = refusal_feed_query(work, command)
+                failures.extend(check_refusal_feed(work, command, status, owned_text,
+                                                   live_status, live_output,
+                                                   after_status, after_output))
+                if owned.errors:
+                    failures.append(f"observation errors: {owned.errors}")
             if ingress is not None:
                 if status:
                     signal_identity(ingress_identity, signal.SIGTERM)

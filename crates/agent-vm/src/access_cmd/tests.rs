@@ -326,11 +326,8 @@ async fn session_labels_match_the_table() {
     let listener = tokio::net::UnixListener::bind(hung_dir.socket_path(&hung_id)).unwrap();
     let hung = tokio::spawn(async move {
         let mut held = Vec::new();
-        loop {
-            match listener.accept().await {
-                Ok((stream, _)) => held.push(stream),
-                Err(_) => break,
-            }
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
         }
     });
     let mut logged = snapshot(

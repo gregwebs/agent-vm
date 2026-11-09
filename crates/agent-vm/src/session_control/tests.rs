@@ -138,7 +138,7 @@ async fn subscribe_handoff_loses_and_repeats_nothing_under_concurrent_ingest() {
     let mut stream = {
         let stream = UnixStream::connect(&harness.socket).await.unwrap();
         let mut stream = stream;
-        send(&mut stream, &format!("{{\"v\":1,\"op\":\"subscribe\"}}")).await;
+        send(&mut stream, "{\"v\":1,\"op\":\"subscribe\"}").await;
         stream
     };
     // The handoff: one snapshot, then every update after it, exactly once.
@@ -150,24 +150,21 @@ async fn subscribe_handoff_loses_and_repeats_nothing_under_concurrent_ingest() {
     // Ingest while the client is reading, so the handoff window is exercised.
     for port in 0..8u16 {
         harness.ingest(2000 + port);
-        loop {
-            let reply = tokio::time::timeout(Duration::from_secs(5), next_reply(&mut stream)).await;
-            let Ok(Reply::Update { update, .. }) = reply else {
-                panic!("an update reply");
-            };
-            assert!(
-                update.rev > last_rev,
-                "no update repeats a revision: {} <= {last_rev}",
-                update.rev
-            );
-            assert_eq!(
-                update.rev,
-                last_rev + 1,
-                "no revision is skipped across the handoff"
-            );
-            last_rev = update.rev;
-            break;
-        }
+        let reply = tokio::time::timeout(Duration::from_secs(5), next_reply(&mut stream)).await;
+        let Ok(Reply::Update { update, .. }) = reply else {
+            panic!("an update reply");
+        };
+        assert!(
+            update.rev > last_rev,
+            "no update repeats a revision: {} <= {last_rev}",
+            update.rev
+        );
+        assert_eq!(
+            update.rev,
+            last_rev + 1,
+            "no revision is skipped across the handoff"
+        );
+        last_rev = update.rev;
     }
     let final_rev = harness.live.snapshot().rev;
     assert_eq!(last_rev, final_rev, "the client ends where the server is");
@@ -321,11 +318,8 @@ async fn discovery_meets_its_deadline_with_a_hung_server() {
     let listener = UnixListener::bind(dir.socket_path(&id)).unwrap();
     let hung = tokio::spawn(async move {
         let mut held = Vec::new();
-        loop {
-            match listener.accept().await {
-                Ok((stream, _)) => held.push(stream),
-                Err(_) => break,
-            }
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
         }
     });
     let started = Instant::now();
