@@ -329,6 +329,62 @@ pub fn output_retrying_busy(mut command: std::process::Command) -> std::process:
 mod tests {
     use super::*;
 
+    /// The one host probe this fixture models: the exact expression the vendored
+    /// `__launch-protocol` handler runs for `nested_virt`, which is discovered on
+    /// the host rather than advertised as a constant.
+    const NESTED_VIRT_PROBE: &str =
+        "Some(microsandbox_runtime::nested_virt_supported().unwrap_or(false))";
+
+    /// The handler wraps that expression across lines, so the comparison ignores
+    /// layout and reads the expression.
+    fn without_whitespace(expression: &str) -> String {
+        expression.split_whitespace().collect()
+    }
+
+    /// Require `value` to be [`NESTED_VIRT_PROBE`] and nothing else.
+    ///
+    /// The fake answers a fixed `false` here, so this oracle guards which
+    /// expression the runtime runs, not what it returns. Merely mentioning the
+    /// probe would also accept `Some(false && …nested_virt_supported()…)`, which
+    /// advertises a hard `false` on a capable host.
+    fn assert_host_probe(name: &str, value: &str) {
+        assert_eq!(
+            without_whitespace(value),
+            NESTED_VIRT_PROBE,
+            "{name} is host-probed by an unreviewed expression: {value}"
+        );
+    }
+
+    #[test]
+    fn host_probe_is_the_reviewed_expression() {
+        assert_host_probe(
+            "nested_virt",
+            "Some(
+                 microsandbox_runtime::nested_virt_supported().unwrap_or(false)
+             )",
+        );
+        // The shape the replaced `contains("nested_virt_supported()")` predicate
+        // accepted: a probe short-circuited to `false` on every host.
+        let broken =
+            "Some(false && microsandbox_runtime::nested_virt_supported().unwrap_or(false))";
+        assert!(
+            std::panic::catch_unwind(|| assert_host_probe("nested_virt", broken)).is_err(),
+            "a probe that advertises a hard `false` must not pass as host-probed"
+        );
+    }
+
+    #[test]
+    fn field_splitter_refuses_a_truncated_literal() {
+        // What an early `})` inside the vendored literal would leave the caller
+        // with: everything after it, including whole capabilities, never read.
+        // The caller cuts at the first `})`, so the splitter is the only place
+        // that can notice.
+        assert!(
+            std::panic::catch_unwind(|| split_fields("nested_virt: Some(match host {")).is_err(),
+            "a literal that does not end at depth 0 must not split into fields"
+        );
+    }
+
     #[test]
     fn every_mode_installs_a_complete_pair() {
         for mode in [Mode::VersionOnly, Mode::StrictAcquisition, Mode::LaunchSeam] {
@@ -405,11 +461,8 @@ mod tests {
                 serde_json::from_str(array).expect("literal protocol array")
             } else if matches!(value, "true" | "false") {
                 serde_json::from_str(value).unwrap()
-            } else if let Some(probe) = value.strip_prefix("Some(") {
-                assert!(
-                    probe.contains("nested_virt_supported()"),
-                    "{name} is host-probed by an unrecognised expression: {value}"
-                );
+            } else if value.starts_with("Some(") {
+                assert_host_probe(name, value);
                 host_probed.push(name);
                 continue;
             } else {
@@ -431,8 +484,10 @@ mod tests {
                 .unwrap();
         for name in host_probed {
             assert!(
-                expected.remove(name).is_some(),
-                "the fake must still advertise {name}"
+                expected
+                    .remove(name)
+                    .is_some_and(|value| value.is_boolean()),
+                "the fake must still advertise {name} as a boolean"
             );
         }
         assert_eq!(
@@ -467,6 +522,14 @@ mod tests {
         }
         out.push(&fields[start..]);
         out.retain(|field| !field.trim().is_empty());
+        // The caller stops at the first `})`, which an unbalanced literal could
+        // match early and hide the fields after it. Requiring depth 0 at the end
+        // turns such a truncation into a failure instead of a shorter, silently
+        // unchecked capability list.
+        assert_eq!(
+            depth, 0,
+            "the LaunchCapabilities literal must end at bracket depth 0"
+        );
         out
     }
 
