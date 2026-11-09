@@ -123,6 +123,19 @@ async fn drive(
     task.await.expect("the follower task did not panic")
 }
 
+/// The scheduling choice, as an assertion rather than a comment: one tick plus
+/// the write has to fit inside AC3's bound with room to spare. A tick of the full
+/// interval makes the bound exactly the interval, so a timer that fires a
+/// sub-millisecond late pushes the post a whole tick past it — which is what the
+/// previous shape did, and why the deadline test alone could not catch it.
+#[test]
+fn the_persistence_tick_leaves_room_inside_the_bound() {
+    assert!(
+        POST_TICK * 2 <= POST_INTERVAL,
+        "a {POST_TICK:?} tick does not leave room inside a {POST_INTERVAL:?} bound"
+    );
+}
+
 #[tokio::test]
 async fn fake_stream_ingests_and_hints_once() {
     let (_root, dir) = dir();
