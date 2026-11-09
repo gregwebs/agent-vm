@@ -82,14 +82,23 @@ Three things had to be settled together, because each constrains the others:
    `Domain`↔name). It errs towards "not recorded" wherever it cannot be exact,
    and every conservative negative below has a named test.
 
-5. **A broken store never fails a launch.** Absent, empty, undecodable, an
-   unknown field, a wrong digest, a duplicate, a directory/FIFO/socket at the
-   name, a symlink, over 1 MiB, an older `v`, a foreign owner, a
-   group/other-writable file or directory, and an unreadable file each produce
-   **one** notice and leave the configured authority in force. A newer `v` is
-   `Newer`, not damage: nothing is applied and `doctor` counts it. A path
-   replaced between `open` and `fstat` is retried (`nlink == 0` is a healthy
+5. **A broken store never fails a launch.** Every state other than *absent*
+   produces **exactly one** notice and leaves the configured authority in force:
+   empty, undecodable, an unknown field, a wrong digest, a duplicate, a
+   directory/FIFO/socket at the name, a symlink, over 1 MiB, an older `v`, a
+   foreign owner, a group/other-writable file or directory, and an unreadable
+   file. An absent file prints **nothing**: there is nothing wrong with it. A
+   newer `v` is `Newer`, not damage: nothing is applied and `doctor` counts it. A
+   path replaced between `open` and `fstat` is retried (`nlink == 0` is a healthy
    rename, never distrust), at most three attempts, then `Unsettled`.
+
+   The classification order is part of the decision, because the remedies
+   differ: the descriptor's link count (a rename), then trust (a file or
+   directory someone else may have written), then the version (a later release's
+   file), then the size (damage this version does not repair), then the strict
+   decode. So an oversized file that is also group-writable is *untrusted*, and
+   an oversized file a later release wrote is *newer* — neither is told to move
+   the file aside as broken.
 
 6. **The guard's one-link check covers the record.** In every measured home
    (ADR-0038 Decision 2), `allowances.json` with `nlink != 1` refuses the
@@ -106,17 +115,34 @@ Three things had to be settled together, because each constrains the others:
    notices, and hands the set to `EgressAuthority::set_recorded`, which replaces
    the recorded set and recomputes `effective = configured ∪ recorded`. Every
    derived view — rules, intercepted ports, the TLS on/off decision, request
-   coverage, notices — reads `effective`, so a recorded entry behaves exactly
-   like the same `--allow-egress` entry.
+   coverage, notices — reads `effective`, so a recorded entry contributes
+   exactly what the same `--allow-egress` entry contributes: the same rule, the
+   same ports, the same TLS decision, and the same notice text up to the
+   provenance tag and the tier grouping that tag drives. One case is a deliberate
+   exception, below: a **recorded hostname** under a host HTTP proxy is skipped
+   with one notice where a *configured* hostname refuses the launch (decision 5
+   requires the launch to survive), and `hostname_authority` reads the configured
+   tiers on purpose.
 
 ## The guarantee
 
 A record reaches the launch of **its own project only**, and only when the file
 and its directory are the user's own, singly named and not group- or
-other-writable. Every derived view of that launch equals the view of a launch
-whose configured set also contained the record. Nothing a guest can write
-decides what a launch allows, and no read path creates, modifies, renames or
-locks anything in the authority directory.
+other-writable. For a configured set `C` and a recorded set `R`, every derived
+view of the launch equals the view of a launch whose configured set was
+`C ∪ R` — the policy, `has_hostnames`, the intercepted ports, `covers_tls` and
+the TLS decision — and the notices are equal up to provenance tags. The one
+exception is a recorded **hostname** under a host HTTP proxy, which is skipped
+with one notice instead of refusing the launch (§ Consequences).
+
+**Nothing a guest can write decides what a launch allows** — within the trust
+model this adopts unchanged from [ADR-0040](0040-config-authority-provenance.md):
+the file and its directory are measured, an immediate parent that is a symlink
+is followed, and no ancestor or ACL protection is claimed. Those limits are
+ADR-0040's, and this ADR neither widens nor strengthens them.
+
+No read path creates, modifies, renames or locks anything in the authority
+directory.
 
 ## Consequences
 
@@ -142,9 +168,12 @@ locks anything in the authority directory.
   claim the query cannot check.
 - **`doctor` reports the store and exits nonzero when it is not in use.** The
   section prints the file's state, this project's records, other projects,
-  orphans (a record whose project path is gone) and uninspectable paths; the
-  failure is returned after every later section has printed, so a broken store
-  costs the exit status, not the report.
+  orphans and uninspectable paths; the failure is returned after every later
+  section has printed, so a broken store costs the exit status, not the report.
+  "Orphaned" means the recorded path no longer reaches a directory: a path
+  replaced by a symlink to a live directory is followed and reported as a
+  project, a dangling link is an orphan, and a path that cannot be inspected at
+  all (a link loop, a permission failure) is `unknown` — never asserted gone.
 - **No writer means no way to create a record in this release.** USAGE says the
   file is machine-written by a later release and must not be edited by hand.
 
@@ -173,9 +202,11 @@ claim more than can be checked syntactically:
   authorizes nothing.
 - **Refuse the launch on any damaged record.** One hand-edit would make agent-vm
   unusable, and the failure would arrive with no way to see what the policy is.
-- **Apply nothing when the file is newer.** A newer file is not broken — and
-  "replace it" is the writer's decision, which PR 2 must make *before* the size
-  and trust classifications can reset it.
+- **Call a newer file damaged, or let a reader replace it.** A newer file is not
+  broken, and telling its author to move it aside invites a downgrade. Applying
+  nothing is the decision (decision 5); *replacing* it is the writer's decision,
+  which PR 2 must make **before** the size and trust classifications can reset
+  it.
 - **Read the store through a lock.** A lock is a write. Readers of an
   atomic-rename store need none, and a read path that creates its own lock would
   let "ask what this project allows" manufacture authority.
@@ -184,18 +215,75 @@ claim more than can be checked syntactically:
 - **Let `access` filter out covered rows.** A refusal stays evidence of what the
   guest attempted; hiding it would make the table disagree with the log.
 
+## Constraints on PR 2
+
+The writer was split out of this slice, not dropped. These are the conditions the
+plan (`implementation-plan.md` §10, revision 2) moved here, recorded with the
+decision so they cannot be lost when the working notes are: the plan-review
+blockers that were answered by deferral are answered *only* by PR 2 meeting
+them.
+
+1. **`record` and `forget` are one read-modify-write under a stable lock.**
+   Idempotent; `allowances.lock` is never unlinked (as `image-pins.lock` is not),
+   with a bounded wait; the replacement is atomic at mode 0600. Cross-project
+   safety is asserted as the **entire** expected key set after concurrent writers
+   on independent descriptors, with a coordinated checkpoint that forces a read
+   *under* the lock, so the test does not rest on stress alone. A valid
+   at-the-limit file returns `Full`. Idempotence is verified by bytes, inode
+   **and** mtime. **An untrusted directory is never written into** — that needs
+   the directory-only proved kernel (`authority_dir_refusal`) this PR does not
+   add.
+2. **A writer decides "may I replace this?" before size or trust can reset it.**
+   It refuses any file whose version it cannot establish as `<= 1`, unless an
+   explicit decision says otherwise. Tests: newer × oversized, newer × untrusted,
+   newer × a changed body, with the bytes and inode checked after each write.
+3. **If PR 2 resets at all, archival is no-clobber.** Collision-safe names (for
+   example `allowances.json.damaged.<ms>.<n>` via `renameat2`/`link`+`unlink`, or
+   a retry on `EEXIST`); archival failures propagate; the new file is validated
+   and encoded **before** any namespace change; a failure after archival is
+   either recovered or documented and tested as its own state. Tests: repeated
+   damage, an occupied backup name, a failed archive, and a failure after
+   archive — each comparing the files and directory entries that existed before
+   the operation.
+4. **"Reset only narrows" must be re-argued, not assumed.** It is false at the
+   sandbox level because of interception framing: an intercepted port routes TCP
+   through the TLS proxy and drops UDP, so removing a hostname record can widen
+   what a guest can reach. Any automatic repair needs a bounded-authority
+   argument relative to the degraded read and the user's fresh operation; it must
+   acknowledge TLS interception and QUIC dropping; it must not be presented as
+   following from [ADR-0047](0047-host-wide-oci-image-approval.md); and it needs
+   operator sign-off, because it is an exception to "authority stores refuse",
+   which the glossary keeps.
+5. **A write preserves every other record's *decoded field values*** — including
+   unparseable destination text and timestamps. It does not preserve raw JSON
+   bytes unless PR 2 designs raw-value retention, and the tests assert whichever
+   guarantee is chosen.
+6. **The writer and the reader share one reopen contract.** This PR's AC7 is the
+   reader's half; PR 2's concurrency test asserts that contract (`Current`, or a
+   counted `Unsettled`), never an unconditional `Current`.
+7. **Intercepted ports are fixed at launch.** PR 2 passes `session ∪ project` to
+   `set_recorded`, and a live set whose `intercepted_ports()` differs from the
+   launch's ports must be refused or deferred. `Coverage` gains `Applied` from
+   `entry.last_revision`. `record` requires a UTF-8 project path.
+
 ## Verification
 
 The schema, the trust matrix, the reopen rule (with a checkpoint between `open`
-and `fstat`), every read state, the two policy-computation views and the notice
-goldens are unit-tested against the runtime's own evaluator as an oracle, with
-`Recorded ⇒ Admissible` as a property over mixed sets and exactness
-(`⇔`) asserted only for address-only sets and DNS queries. The launch path is
+and `fstat`) and every read state are unit-tested as fixed cases. The **coverage
+query** is tested against the runtime's own evaluator as an oracle, with
+`Recorded ⇒ Admissible` as a property over mixed sets and exactness (`⇔`)
+asserted only for address-only sets and DNS queries; the notice goldens are
+fixed strings, not oracle-derived. The launch path is
 proved twice: `network`'s unit tests for the applied policy and TLS decision, and
 a real binary driven to `builder.build()` under `$HOME`/`AGENT_VM_STATE_DIR`
 isolation. The guard has unit cases with an injected `lstat` and CLI cases for a
 hard link; `access` is tested in process and as a process; `doctor`'s section and
 its exit status are tested through the real binary. The end-to-end case
 (`PA1`/`PA1x` in `script/test/lib/egress-fixtures.py`) hands `tcp://{lan}:18080`
-to one project by record and the same record to another project's digest, and
-the boot-free dispatch contracts prove both before any VM boots.
+to one project by record and the same record to another project's digest. The
+boot-free contracts prove that both cases dispatch through every harness layer,
+that `seed_allowances`/`remove_allowances` write and restore the record they
+claim to, that `doctor` reads the seeded record as `PA1`'s own project and as
+another project for `PA1x`, and that a case cannot launch without its seed.
+Whether the record reaches the *fixture* is the boot run, and that is the
+verifier's.

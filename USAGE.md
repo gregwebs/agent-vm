@@ -3751,9 +3751,11 @@ one — never inherits it. Allowances live in one machine-written file,
 ```
 
 **This release only reads it.** There is no `agent-vm access allow`, no `record`
-and no `forget`: a later release writes this file, and hand-editing it is not
-supported. It is an authority store, so it refuses rather than heals — see the
-table below for what an unusable one costs.
+and no `forget`: a later release writes this file, and hand-editing it is
+unsupported. Until then, hand-writing it *is* how a record comes to exist, so
+write it exactly as shown and expect the format to change. It is an authority
+store, so it refuses rather than heals — see the table below for what an
+unusable one costs.
 
 **One record, one grant, one project.** `project` is the full SHA-256 of the
 project's canonical path; `path` is that path and must hash to `project`, or the
@@ -3813,11 +3815,14 @@ naming the file.
 | It is replaced (renamed over) while being read | The reader reopens, up to three attempts in all, and uses the new file. If every attempt sees a file that was replaced, one warning says it "changed while being read" and nothing is applied — that outcome is never reported as damage. |
 | One destination in it no longer parses | One warning naming up to three such destinations (then how many more). **The file's other records still apply.** |
 | `$HOME` is unset | Nothing: no user config is read at all then. `agent-vm doctor` says `not checked`. |
-| `$HOME` is set but empty or relative | One warning; `agent-vm doctor` exits nonzero. |
+| `$HOME` is set but empty or relative | One warning for `access`, and `agent-vm doctor` exits nonzero. A **launch** is refused earlier, before the store is read: it cannot locate the authority home. |
 
 `agent-vm doctor` reports the store under `==> project allowances`: the file's
 state and mode, this project's records, other projects' record counts, and
-**orphans** — records whose project path no longer exists. A damaged, untrusted,
+**orphans** — records whose project path no longer reaches a directory. A path
+replaced by a symlink to a live directory is followed and reported as a project;
+a dangling link is an orphan; a path that cannot be inspected at all (a link
+loop, a permission failure) is `unknown`, not claimed gone. A damaged, untrusted,
 unreadable or replaced file makes `doctor` exit nonzero *after* every later
 section has printed.
 

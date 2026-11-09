@@ -1566,6 +1566,16 @@ def allowance_store(work: Path) -> Path:
     return work / "home/.config/agent-vm/allowances.json"
 
 
+def allowance_present(work: Path) -> bool:
+    """Whether anything carries the store's name, a dangling symlink included.
+
+    `Path.exists()` follows the link, so a leftover record that was replaced by
+    a symlink would read as absent and the case would overwrite the link.
+    """
+    store = allowance_store(work)
+    return store.exists() or store.is_symlink()
+
+
 def seed_allowances(work: Path, case: Case, lan: str):
     """Write the one record each ADR-0065 case launches under.
 
@@ -1574,9 +1584,16 @@ def seed_allowances(work: Path, case: Case, lan: str):
     the record's identity. The digest is over the canonical path, and this work
     directory may sit under `/tmp` (a symlink to `/private/tmp` on macOS), so the
     path is realpath'ed exactly as the launcher canonicalizes it.
+
+    A name already at the store is refused rather than replaced: a record left by
+    an earlier case or a killed run must be *reported*, not silently overwritten
+    and then reported as removed (the bug a reviewer found). `orchestrate`
+    reports and removes one before calling this.
     """
     if case.case not in ALLOWANCE_CASES:
         raise RuntimeError(f"{case.case} has no allowance record")
+    if allowance_present(work):
+        raise RuntimeError(f"a store is already present: {allowance_store(work)}")
     directory = allowance_store(work).parent
     directory.mkdir(parents=True, exist_ok=True)
     directory.chmod(0o700)
@@ -1594,6 +1611,46 @@ def seed_allowances(work: Path, case: Case, lan: str):
     path.chmod(0o600)
 
 
+def check_allowance_seed(work: Path, case: Case, lan: str) -> list[str]:
+    """The seed, read back and checked against an independent identity.
+
+    The boot cases rest on two things a launch cannot re-derive for itself: that
+    the file is *there*, and that its digest is the launcher's own identity for
+    the case's project. A missing or malformed seed makes PA1x — which expects
+    default deny — pass while proving no isolation at all, so this runs before
+    the launch and a failure stops the case.
+    """
+    failures: list[str] = []
+    store = allowance_store(work)
+    try:
+        within(store, work)
+        if store.is_symlink():
+            return [f"the allowance seed is a symlink: {store}"]
+        raw = store.read_bytes()
+        record = json.loads(raw)
+    except (OSError, ValueError, RuntimeError) as error:
+        return [f"the allowance seed is unreadable: {error}"]
+    project = Path(os.path.realpath(work / ("proj" if case.case == "PA1" else "other")))
+    expected = {
+        "v": 1,
+        "records": [{
+            "project": hashlib.sha256(os.fsencode(project)).hexdigest(),
+            "path": str(project),
+            "destination": f"tcp://{lan}:18080",
+            "recorded_ms": 1762680120000,
+        }],
+    }
+    if record != expected:
+        failures.append(f"the allowance seed is not the case's record: {record!r}")
+    mode = store.stat().st_mode & 0o777
+    if mode != 0o600:
+        failures.append(f"the allowance seed is mode {mode:04o}, not 0600")
+    directory_mode = store.parent.stat().st_mode & 0o777
+    if directory_mode != 0o700:
+        failures.append(f"the authority directory is mode {directory_mode:04o}, not 0700")
+    return failures
+
+
 def remove_allowances(work: Path) -> list[str]:
     """Remove the case's record, and report anything of the store's own left.
 
@@ -1608,7 +1665,7 @@ def remove_allowances(work: Path) -> list[str]:
         if path.is_symlink():
             raise RuntimeError("allowance record symlink refused")
         path.unlink(missing_ok=True)
-        if path.exists():
+        if allowance_present(work):
             failures.append(f"allowance record remains: {path}")
         for sibling in sorted(path.parent.glob("allowances.*")):
             failures.append(f"the store left {sibling.name} behind; this release writes no lock")
@@ -2065,10 +2122,32 @@ def orchestrate(args) -> int:
                 prepare_project(work, work / "creds")
                 seed_credentials(work)
             # ADR-0065: the record is per case and per digest, and must not
-            # survive into any other case in this shared `work/home`.
-            allowance_leaked = allowance_store(work).exists()
+            # survive into any other case in this shared `work/home`. A leftover
+            # store is reported for *every* case, the allowance cases included:
+            # seeding over one would otherwise erase the only evidence that an
+            # earlier case leaked.
+            allowance_leaked = allowance_present(work)
+            seed_failures: list[str] = []
             if case.case in ALLOWANCE_CASES:
-                seed_allowances(work, case, args.lan)
+                if allowance_leaked:
+                    seed_failures.append(
+                        "a project allowance record was left from an earlier case; removing it before this case's record")
+                    try:
+                        allowance_store(work).unlink()
+                    except OSError as error:
+                        seed_failures.append(f"the leftover record could not be removed: {error}")
+                try:
+                    seed_allowances(work, case, args.lan)
+                    seed_failures.extend(check_allowance_seed(work, case, args.lan))
+                except (OSError, RuntimeError) as error:
+                    seed_failures.append(f"the allowance seed failed: {error}")
+                if seed_failures:
+                    # No launch: without its record PA1 would fail for the wrong
+                    # reason and PA1x would pass while proving nothing.
+                    seed_failures.extend(remove_allowances(work))
+                    results.append({"case": case, "status": "FAIL", "failures": seed_failures,
+                                    "attempts": []})
+                    continue
             before = snapshot_validation(work) if not case.guest else None
             proxy_before = (work / "fx/receipts.log").read_text() if (work / "fx/receipts.log").exists() else ""
             receipt_offset = len(_receipt_lines(work))
@@ -2187,11 +2266,11 @@ def orchestrate(args) -> int:
             failures.extend(cleanup_launch(owned))
             if case.tool == "egresscreds":
                 failures.extend(remove_credentials(work))
-            if allowance_leaked and case.case not in ALLOWANCE_CASES:
+            if allowance_leaked:
                 failures.append("a project allowance record was left from an earlier case")
             if case.case in ALLOWANCE_CASES:
                 failures.extend(remove_allowances(work))
-            if allowance_store(work).exists():
+            if allowance_present(work):
                 failures.append("project allowance record survived its own case")
             if (work / "config/agent-vm/default-image.json").exists() or (work / "home/.config/agent-vm/default-image.json").exists():
                 failures.append("explicit image adopted default")

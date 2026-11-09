@@ -922,18 +922,25 @@ session and is never persisted.
 **Project allowance**: a permanent network allowance (until revoked, no expiry)
 bound to one project's path identity, whatever tool is launched. A moved or
 copied project does not inherit it. Its authorization record — the **project
-allowance record** — is host-controlled and unreachable from any guest bind.
-Host-wide breadth is never granted from a live approval. See
+allowance record** — is host-controlled and not writable through any guest bind
+(a read-only bind can read it, which is what `m13`/`m14` in
+`tests/mount_protected_config.rs` show). Host-wide breadth is never granted from
+a live approval. See
 [ADR-0065](docs/adr/0065-project-allowance-record.md).
 
 **Project allowance record**: the file one project's allowances are read from:
 `~/.config/agent-vm/allowances.json`, keyed by the full SHA-256 of the project's
 canonical path, with each record's `path` column as that digest's preimage. It is
-machine-written and **read-only in this release** — there is no `record`/`forget`
-verb yet, so it is not hand-edited. It is an **authority** store, so it refuses
-rather than heals: an unusable file is not applied, is named once, and leaves the
-launch with its configured authority. The only launch refusals it adds are the
-guard's — a hard link (`nlink != 1`), or a file the guard cannot inspect.
+**read-only in this release** — a later release writes it, and in 0.7.44 a
+hand-written file is the only way a record exists at all. Hand-editing is
+unsupported and the format may change. It is an **authority** store, so it
+refuses rather than heals: an unusable file is not applied, is named once, and
+leaves the launch with its configured authority. The only launch refusals it adds
+are the guard's — a hard link (`nlink != 1`), or a file the guard cannot inspect.
+`doctor` calls a recorded path **orphaned** when it no longer reaches a
+directory: a path replaced by a symlink to a live directory is followed and
+reported as a project, a dangling link is an orphan, and a path that cannot be
+inspected at all is `unknown`, never asserted gone.
 
 **Recorded, admissible, applied**: the three levels of "an allowance covers this
 refusal", kept apart everywhere. **Recorded** — a usable record for this project

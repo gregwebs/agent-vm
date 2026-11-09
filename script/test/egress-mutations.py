@@ -100,8 +100,43 @@ def mutation_target(path):
     return "agent-vm"
 
 
+def compile_failure(text, package, target):
+    """The compiler's first error for `target`, if the mutant did not build.
+
+    A mutant that cannot compile is a harness defect, never a surviving mutant
+    and never a test's failure: the old `domain-first` row named a field this
+    change had renamed away, so it "failed" every time without exercising
+    anything. This reads cargo's own JSON, so the verdict is about the target
+    the mutation lives in.
+    """
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(message, dict) or message.get("reason") != "compiler-message":
+            continue
+        if message.get("target", {}).get("name") != target:
+            continue
+        if Path(message.get("manifest_path", "")).resolve() != package:
+            continue
+        detail = message.get("message") or {}
+        if detail.get("level") == "error":
+            first = (detail.get("message") or "the mutant does not compile").splitlines()
+            return first[0] if first else "the mutant does not compile"
+    if re.search(r"\berror\[E\d+\]", text):
+        return "the mutant does not compile"
+    return None
+
+
 def outcome(name, command, marker, exit_code, text, package, target):
     """PASS only for a mutation that this run compiled (or verified) and killed."""
+    failure = compile_failure(text, package, target)
+    if failure:
+        return "FAIL", f"the mutant was never compiled: {failure}"
     killed = exit_code != 0 and marker in text
     if name.endswith("-proof"):
         verified = "Checking agent-vm v" in text or "Compiling agent-vm v" in text
@@ -173,7 +208,7 @@ def matrix():
     proxy = rust("hostname_proxy_selection_mirrors_the_host_connector")
     add("domain-all-ports", hostname, "ports: effective.into_iter().map(PortRange::single).collect(),", "ports: vec![],", shape)
     add("domain-any-protocol", hostname, "protocols: vec![Protocol::Tcp],", "protocols: vec![],", shape)
-    add("domain-first", EGRESS, "rules.extend(domain_rules(&self.effective.hostnames, &ports));", "rules.splice(0..0, domain_rules(&self.hostnames, &ports));", shape)
+    add("domain-first", EGRESS, "rules.extend(domain_rules(&self.effective.hostnames, &ports));", "rules.splice(0..0, domain_rules(&self.effective.hostnames, &ports));", shape)
     add("hostname-dns", EGRESS, "rules.extend(domain_rules(&self.effective.hostnames, &ports));", "rules.push(Rule::allow_dns()); rules.extend(domain_rules(&self.effective.hostnames, &ports));", shape)
     add("tls-ports-missing", NETWORK, "Some(ports) => tls.intercepted_ports(ports.clone()),", "Some(_) => tls,", rust("hostname_launch_keeps_strict_and_intercepts_every_domain_port"))
     add("tls-off", NETWORK, "let enable_tls = !publish_ports.is_empty() || hostname_ports.is_some();", "let enable_tls = !publish_ports.is_empty();", rust("hostname_launch_keeps_strict_and_intercepts_every_domain_port"))
