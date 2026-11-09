@@ -2112,7 +2112,7 @@ other links or replace it with a copy. Non-launch verbs still work.
 aliases remain #322/#321. See [ADR-0038](docs/adr/0038-config-dir-exposure-guard.md)
 for the trusted boundary and accepted gaps.
 
-**Two more host-only stores are guarded (0.7.42).** The same rule now covers
+**Two more host-only stores are guarded (0.7.43).** The same rule now covers
 `MSB_HOME` (where the runtime writes every sandbox's refusal log) and this
 project's `<state root>/<hash>.sessions` directory (where `agent-vm access`
 reads them). In addition, a bind **in any mode** — `:ro` and `:fork` included —
@@ -3710,7 +3710,7 @@ named part of the feature. Precisely what happens:
 | What went wrong | What you see, and what you lose |
 |---|---|
 | The `.sessions` directory cannot be created or adopted (not a real directory, another owner, a mode other than `0700`) | One notice naming it. This session has no log and no socket, and `agent-vm access` never lists it. |
-| The socket path is longer than the kernel allows | One notice naming the path. The log still records; you lose the live view, not the record. |
+| The socket path is longer than the kernel allows | The runtime's own control socket path is twelve bytes longer than this one, so a state root deep enough to overflow the launcher's socket is refused before this feature runs, with its own error naming the fix. Should the launcher's socket alone ever be over budget, it prints one notice, keeps recording to the log, and you lose the live view, not the record. |
 | Another session holds the log lock when this one starts | One notice. No live view; this session's refusals are still recorded, on a later attempt at the lock. |
 | A write to the log fails (full disk, permissions, a lock held elsewhere) | One warning on stderr, worded as "this session's refusals are not being recorded", and a second one only after a write succeeds again. The live view keeps working for as long as the session runs; whatever was not written is lost when it ends. |
 | The log on disk cannot be used (not a regular file, larger than 2 MiB, not decodable, or below this build's version) | `agent-vm access` prints one warning naming the file and says the sessions it held are not listed. Only a later write from a session replaces a damaged file, keeping the old one as `refusals.json.damaged`. |

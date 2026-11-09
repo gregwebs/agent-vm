@@ -11,7 +11,7 @@ without changing this guard. Amended by
 or lies inside `.sessions` is refused, because a `:ro` bind of `refusals.json`,
 `refusals.lock` or a socket names one artefact whatever its mode says. Decision 1's
 writable-bind predicates and the `:ro`/`:fork` exemption for *ancestors* stand
-unchanged. Breaking guard release: **0.3.0** (ADR-0064's additions: **0.7.42**).
+unchanged. Breaking guard release: **0.3.0** (ADR-0064's additions: **0.7.43**).
 
 ## Context
 

@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted and implemented in **0.7.42**
+Accepted and implemented in **0.7.43**
 ([#501](https://github.com/gregwebs/agent-vm/issues/501) slice 1). Amends
 [ADR-0038](0038-config-dir-exposure-guard.md): two more host-only stores join the
 measured set, and the `.sessions` directory gains a rule the writable-bind guard
@@ -98,6 +98,15 @@ others:
    session that is still starting cannot miss a change aimed at it
    ([#301](https://github.com/gregwebs/agent-vm/issues/301)). Over the platform's
    `sun_path` budget: one notice, `socket = false`, and the launch continues.
+
+   That branch is defence in depth, not a reachable state today: the runtime's own
+   control socket path (`<msb home>/run/sandboxes/<name>/control.sock`) is twelve
+   bytes longer than this one, and `msb_install::ensure_socket_paths_fit` refuses a
+   launch that overflows it. So a state root deep enough to overflow the launcher's
+   socket has already been refused, with a hard error naming the fix, before this
+   feature runs. AC8's "one notice and the launch continues" therefore holds at the
+   module's own boundary and in its test, not in a launch — recorded here rather than
+   claimed in `USAGE.md`.
 
 8. **Protocol v1 is revisioned NDJSON, and the handoff is race-free.**
    `list` answers with the whole session and closes; `subscribe` answers with a
