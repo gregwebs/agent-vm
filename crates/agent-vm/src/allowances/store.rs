@@ -453,11 +453,12 @@ enum VersionProbe {
 /// one: a file whose version field is reordered, padded beyond
 /// [`VERSION_PROBE_BYTES`], or cut inside the number is [`VersionProbe::Undecided`]
 /// and is classified as damage. That is the conservative direction — damage
-/// applies nothing — and the one honest message the reader has, because the body
-/// was never read. Its cost: an oversized file this build cannot classify (a
-/// `v` this build reads, or one beyond the bound) says "larger than N bytes"
-/// rather than "not a JSON document this build reads". Both write nothing and
-/// both tell the user to move the file aside; only the size claim is certain.
+/// applies nothing — and the only honest message the reader has, because the
+/// body was never read. What the bound costs is a message: an oversized file
+/// whose version is this build's own, or that the bound cannot decide, says
+/// "larger than N bytes" rather than "not a JSON document this build reads".
+/// Both write nothing and both tell the user to move the file aside; the size is
+/// the one claim the reader established.
 fn leading_version(prefix: &[u8]) -> VersionProbe {
     /// Leading JSON whitespace: the only four bytes it can be.
     fn skip_space(mut bytes: &[u8]) -> &[u8] {
