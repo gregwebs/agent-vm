@@ -14465,6 +14465,53 @@ fn project_allowance_degraded_store_warns_once_and_reaches_build() {
                 file
             }),
         ),
+        // The states below were covered only at the reader level before this
+        // row set existed: each one is a *different* `from_read` arm or a
+        // different damage clause, and the fixture beside the broken bytes is a
+        // record this launch must not apply.
+        ("empty file", Box::new(move |h| h.seed_allowances(""))),
+        (
+            "wrong digest",
+            Box::new(move |h| {
+                h.seed_allowances(&allowance_file(&[format!(
+                    r#"{{"project":"{}","path":"{}","destination":"tcp://[203.0.113.10/32]:443","recorded_ms":1}}"#,
+                    allowance_digest(Path::new("/some/other/project")),
+                    h.project_root.display()
+                )]))
+            }),
+        ),
+        (
+            "duplicate key",
+            Box::new(move |h| {
+                let record = good(h);
+                h.seed_allowances(&allowance_file(&[record.clone(), record]))
+            }),
+        ),
+        (
+            "fifo at the name",
+            Box::new(move |h| {
+                use std::ffi::CString;
+                use std::os::unix::ffi::OsStrExt as _;
+                let dir = authority_snapshot::empty_authority_dir(&h.home_root);
+                let file = dir.join("allowances.json");
+                let path = CString::new(file.as_os_str().as_bytes()).unwrap();
+                // SAFETY: `mkfifo` takes a NUL-terminated path and a mode, both valid here.
+                assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+                file
+            }),
+        ),
+        (
+            "group-writable directory",
+            Box::new(move |h| {
+                let file = h.seed_allowances(&allowance_file(&[good(h)]));
+                std::fs::set_permissions(
+                    file.parent().unwrap(),
+                    std::fs::Permissions::from_mode(0o777),
+                )
+                .unwrap();
+                file
+            }),
+        ),
     ];
     for (row, seed) in cases {
         let h = Harness::warm();

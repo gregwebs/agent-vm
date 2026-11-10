@@ -918,6 +918,99 @@ proptest! {
     }
 }
 
+/// The same two claims as the properties above, evaluated over a *whole* finite
+/// slice of the space instead of 96 random draws from it.
+///
+/// The spellings are a closed set, so the properties' real domain is small and
+/// enumerable: every ordered record tuple of length ≤ 2 over [`VOCABULARY`]
+/// against every probe, plus every length-3 tuple over the address-only
+/// spellings against every address probe. That is 81 208 (set, probe) pairs —
+/// exhaustive where a random draw is not — and it is the only test that compares
+/// `covers` with the runtime on *every* two-record interaction rather than the
+/// ones 96 draws happened to hit. Soundness is asserted over all pairs;
+/// exactness only where §5.3 claims it (address-only sets, address entries).
+#[test]
+fn every_small_record_set_agrees_with_the_runtime_where_the_table_claims_it() {
+    let mut sets: Vec<Vec<&'static str>> = vec![Vec::new()];
+    for a in VOCABULARY {
+        sets.push(vec![a]);
+        for b in VOCABULARY {
+            sets.push(vec![a, b]);
+        }
+    }
+    for a in &VOCABULARY[..ADDRESS_VOCABULARY_LEN] {
+        for b in &VOCABULARY[..ADDRESS_VOCABULARY_LEN] {
+            for c in &VOCABULARY[..ADDRESS_VOCABULARY_LEN] {
+                sets.push(vec![a, b, c]);
+            }
+        }
+    }
+    let address_probes: Vec<RefusalEntry> = ADDRESS_PROBES
+        .iter()
+        .map(|probe| address_entry(probe.0, probe.1, probe.2, probe.3))
+        .collect();
+    let other_probes: Vec<RefusalEntry> = HOST_PROBES
+        .iter()
+        .map(|probe| host_entry(probe.0, probe.1, probe.2, "sni"))
+        .chain(DNS_PROBES.iter().map(|name| dns_entry(name, "dns-query")))
+        .collect();
+
+    // Threads, so the exhaustive sweep costs the suite a fraction of a second:
+    // the runtime evaluator builds a policy per probe.
+    let failures = std::sync::Mutex::new(Vec::<String>::new());
+    std::thread::scope(|scope| {
+        for part in sets.chunks(sets.len().div_ceil(8)) {
+            let (address_probes, other_probes, failures) =
+                (&address_probes, &other_probes, &failures);
+            scope.spawn(move || {
+                for records in part {
+                    let address_only = records
+                        .iter()
+                        .all(|record| VOCABULARY[..ADDRESS_VOCABULARY_LEN].contains(record));
+                    for entry in address_probes {
+                        let recorded = covers(records, entry);
+                        let admitted = oracle(entry, records, &[]);
+                        if recorded && !admitted {
+                            failures.lock().unwrap().push(format!(
+                                "{} is recorded under {records:?} but the runtime denies it",
+                                destination_text(entry)
+                            ));
+                        }
+                        if address_only && recorded != admitted {
+                            failures.lock().unwrap().push(format!(
+                                "{}: covers says {recorded}, the runtime says {admitted}, under {records:?}",
+                                destination_text(entry)
+                            ));
+                        }
+                    }
+                    for entry in other_probes {
+                        let recorded = covers(records, entry);
+                        if recorded && !oracle(entry, records, &[]) {
+                            failures.lock().unwrap().push(format!(
+                                "{} is recorded under {records:?} but the runtime denies it",
+                                destination_text(entry)
+                            ));
+                        }
+                    }
+                }
+            });
+        }
+    });
+    let failures = failures.into_inner().unwrap();
+    assert!(
+        failures.is_empty(),
+        "{} disagreement(s) with the runtime, first 8: {:#?}",
+        failures.len(),
+        &failures[..failures.len().min(8)]
+    );
+}
+
+/// A destination for a failure message, rendered the way the table in ADR-0065
+/// §5.3 names it.
+fn destination_text(entry: &RefusalEntry) -> String {
+    format!("{:?}", entry.key.destination)
+}
+
 /// Every conservative negative of ADR-0065 §5.3, each a fixed case: what the
 /// runtime admits, this query deliberately does not claim.
 #[test]

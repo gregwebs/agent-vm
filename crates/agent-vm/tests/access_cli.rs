@@ -321,6 +321,35 @@ fn the_binary_loads_the_store_and_shows_a_recorded_row() {
     assert!(!row.contains("no grant in this version"), "{row}");
 }
 
+/// `access` reads the store for *this* project only: a record under another
+/// project's digest is a row it must not claim, which is what makes a moved or
+/// copied checkout inherit nothing here as well as at launch (ADR-0065 P2).
+#[test]
+fn a_record_for_another_project_claims_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    let (home, authority) = home_with_authority_dir(root.path());
+    let state = root.path().join("state");
+    let project = root.path().join("project");
+    let other = root.path().join("other");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    seed_session_log(&state, &project, now_ms());
+    // The same destination the session was denied, under a *different* project.
+    write_allowances(&authority, &other, "tcp://[203.0.113.10/32]:443");
+
+    let out = run(&home, &state, &project, &["access"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(!stderr.contains("warning:"), "{stderr}");
+    assert!(!stdout.contains("recorded project allowance"), "{stdout}");
+    let row = stdout
+        .lines()
+        .find(|line| line.starts_with("0e7e41fb "))
+        .unwrap_or_else(|| panic!("no row: {stdout}"));
+    assert!(row.contains("no grant in this version"), "{row}");
+}
+
 /// A damaged or untrusted store is one warning on stderr, makes no row claim,
 /// and changes nothing on disk.
 #[test]
