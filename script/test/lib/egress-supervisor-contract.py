@@ -556,6 +556,9 @@ class Contracts(unittest.TestCase):
             "from pathlib import Path\n"
             f"spec = importlib.util.spec_from_file_location('egress_fixtures', {str(MODULE_PATH)!r})\n"
             "module = importlib.util.module_from_spec(spec)\n"
+            # Registration before exec: `@dataclass` resolves its module through
+            # `sys.modules`, and an unregistered module is `None` there on 3.12.
+            "sys.modules[spec.name] = module\n"
             "spec.loader.exec_module(module)\n"
             "def poisoned(host):\n"
             "    raise AssertionError('the fixture bind consulted the resolver for %r' % (host,))\n"
