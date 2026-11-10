@@ -538,6 +538,64 @@ class Contracts(unittest.TestCase):
         secrets.write_bytes(b"secret changed")
         self.assertNotEqual(before, egress.snapshot_validation(self.work))
 
+    def test_fixture_serve_binds_without_the_resolver(self):
+        # `http.server.HTTPServer.server_bind` fills `server_name` from
+        # `socket.getfqdn(host)`. For the wildcard address `_serve_tcp` binds that
+        # is a reverse lookup of `0.0.0.0`, which blocked for **30.089 s** on a
+        # host whose resolver stalls on it -- against the 5 s `serve` allows its
+        # listeners, so the fixture exited with `serve: listeners failed to bind
+        # in time` and every case was NOT RUN. That resolver is *warm* after the
+        # first stall, so a watchdog on the 5 s deadline cannot see the defect on
+        # the machine that just paid for it. Poison the lookup in the fixture's
+        # own process instead, and require the whole `serve` role to bind with it
+        # poisoned: a regression names itself here, on any machine.
+        directory = self.work / "fx-resolver"
+        launcher = self.work / "serve-without-resolver.py"
+        launcher.write_text(
+            "import importlib.util, socket, sys\n"
+            "from pathlib import Path\n"
+            f"spec = importlib.util.spec_from_file_location('egress_fixtures', {str(MODULE_PATH)!r})\n"
+            "module = importlib.util.module_from_spec(spec)\n"
+            # Registration before exec: `@dataclass` resolves its module through
+            # `sys.modules`, and an unregistered module is `None` there on 3.12.
+            "sys.modules[spec.name] = module\n"
+            "spec.loader.exec_module(module)\n"
+            "def poisoned(host):\n"
+            "    raise AssertionError('the fixture bind consulted the resolver for %r' % (host,))\n"
+            "socket.getfqdn = poisoned\n"
+            f"sys.exit(module.serve(Path({str(directory)!r}), True))\n",
+            encoding="utf-8",
+        )
+        log_path = self.work / "fixture-resolver.log"
+        with log_path.open("ab") as log:
+            proc = subprocess.Popen([sys.executable, "-B", str(launcher)], cwd=str(self.work),
+                                    stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                    start_new_session=True)
+        try:
+            # Shorter than the 5 s the fixture allows itself: the claim is that
+            # binding does not wait on the resolver at all, not that it wins a race.
+            deadline = time.monotonic() + 3
+            while not (directory / "ready").exists() and proc.poll() is None:
+                if time.monotonic() > deadline:
+                    break
+                time.sleep(0.02)
+            log_text = log_path.read_text()
+            self.assertTrue((directory / "ready").exists(),
+                            f"`serve` did not become ready with the resolver poisoned: {log_text}")
+            ports = json.loads((directory / "ports.json").read_text())
+            self.assertEqual(len(ports["tcp"]), 2)
+            self.assertEqual(len(ports["udp"]), 2)
+            self.assertIsNone(proc.poll(), log_text)
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
+        self.assertEqual(proc.returncode, 0, log_path.read_text())
+
     def test_host_fixture_health_and_ingress_driver(self):
         directory = self.work / "fx"
         fixture_start = egress.fixture_command(self.work)

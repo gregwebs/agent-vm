@@ -33,6 +33,7 @@ import json
 import os
 import re
 import socket
+import socketserver
 import struct
 import sys
 import threading
@@ -131,13 +132,39 @@ class _ReceiptHTTP(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
 
+class ReceiptHTTPServer(http.server.ThreadingHTTPServer):
+    """A receipt server that binds without a reverse DNS lookup.
+
+    ``http.server.HTTPServer.server_bind`` fills ``server_name`` from
+    ``socket.getfqdn(host)``. For the wildcard address this fixture binds, that
+    is a reverse lookup of ``0.0.0.0``, and a host whose resolver stalls on it
+    pays the stall on startup: **30.089 s measured** here, against the 5 s that
+    ``serve`` gives its listeners before it exits with
+    ``serve: listeners failed to bind in time`` and the harness reports
+    ``host fixtures not ready`` without running a case.
+
+    Nothing reads ``server_name``: ``_ReceiptHTTP`` answers ``GET /r/<ID>`` and
+    ``HEAD``, and takes the peer's address from ``client_address``. So the bind
+    keeps the address it bound in place of a name no fixture uses, and the
+    resolver stays off the path to the readiness marker.
+    """
+
+    def server_bind(self):
+        # Not `super()`: that is `HTTPServer.server_bind`, the reverse lookup this
+        # class exists to skip.
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
+
+
 def _serve_tcp(directory: Path, port: int, ready: list, lock: threading.Lock):
     handler = type(
         f"_ReceiptHTTP{port}",
         (_ReceiptHTTP,),
         {"directory": directory, "port": port},
     )
-    server = http.server.ThreadingHTTPServer(("0.0.0.0", port), handler)
+    server = ReceiptHTTPServer(("0.0.0.0", port), handler)
     handler.port = server.server_address[1]
     with lock:
         ready.append(("tcp", server.server_address[1]))
@@ -2449,7 +2476,7 @@ def self_test() -> int:
             for fixed_port in TCP_RECEIPT_PORTS:
                 handler = type(f"SelfTestHTTP{fixed_port}", (_ReceiptHTTP,),
                                {"directory": directory})
-                server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+                server = ReceiptHTTPServer(("127.0.0.1", 0), handler)
                 handler.port = server.server_address[1]
                 servers.append(server)
                 thread = threading.Thread(target=server.serve_forever, daemon=True)
