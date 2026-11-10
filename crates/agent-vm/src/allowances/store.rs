@@ -109,8 +109,9 @@ pub(super) enum Read {
         records: Vec<StoredRecord>,
         mode: u32,
     },
-    /// A later release's file: decoded as far as possible for `doctor`'s counts
-    /// only, and never applied by anything.
+    /// A later release's file: never applied by anything. `records` is what this
+    /// build could read of it for `doctor`'s counts — nothing at all for a file
+    /// bigger than [`MAX_BYTES`], whose body is not read.
     Newer {
         v: u32,
         records: Vec<StoredRecord>,
@@ -236,23 +237,33 @@ impl Store {
             }
             // A later release's file is classified by what it says it is, not
             // by how big it grew: a newer file bigger than this build reads is
-            // `Newer` (nothing applied, `doctor` counts it), never damage whose
-            // remedy is "move it aside".
+            // `Newer` (nothing applied), never damage whose remedy is "move it
+            // aside".
             if facts.size > MAX_BYTES {
                 let probe = match opened.prefix(VERSION_PROBE_BYTES) {
                     Ok(probe) => probe,
                     Err(error) => return Read::NotUsed(Problem::Unreadable(error_line(&error))),
                 };
-                let Some(v) = leading_version(&probe).filter(|v| *v > VERSION) else {
-                    return Read::NotUsed(Problem::Damaged(Damage::TooLarge));
+                // An oversized file carries no records: its body is not read, so
+                // any count would be a partial count presented as a count. The
+                // version is the only fact a bounded probe can establish.
+                return match leading_version(&probe) {
+                    VersionProbe::Known(v) if v > VERSION => Read::Newer {
+                        v,
+                        records: Vec::new(),
+                    },
+                    VersionProbe::Known(v) if v < VERSION => {
+                        Read::NotUsed(Problem::Damaged(Damage::OlderVersion(v)))
+                    }
+                    // A version this build reads, and a size it does not.
+                    VersionProbe::Known(_) => Read::NotUsed(Problem::Damaged(Damage::TooLarge)),
+                    // The bytes are not this schema's `v` at all: a non-integer
+                    // value, a leading zero, a digit run inside an identifier.
+                    VersionProbe::Malformed => Read::NotUsed(Problem::Damaged(Damage::Undecodable)),
+                    // The prefix does not decide it. Damage either way, and the
+                    // size is the one fact the reader established.
+                    VersionProbe::Undecided => Read::NotUsed(Problem::Damaged(Damage::TooLarge)),
                 };
-                // The records this build can still read, bounded: `doctor`'s
-                // counts only; `from_read` never applies them.
-                let records = opened
-                    .prefix(usize::try_from(MAX_BYTES).unwrap_or(usize::MAX))
-                    .map(|bytes| lenient_records(&bytes))
-                    .unwrap_or_default();
-                return Read::Newer { v, records };
             }
             let bytes = match opened.read_bounded(MAX_BYTES) {
                 Ok(bytes) => bytes,
@@ -411,25 +422,96 @@ fn lenient_records(bytes: &[u8]) -> Vec<StoredRecord> {
     records
 }
 
+/// What a bounded prefix of an oversized file proves about its version.
+#[derive(Debug, PartialEq, Eq)]
+enum VersionProbe {
+    /// A complete, valid JSON integer for the leading `"v"` key, in `u32`.
+    Known(u32),
+    /// The prefix proves the leading `"v"` value is *not* this schema's version:
+    /// a non-integer token (`2.5`), a number that runs into an identifier
+    /// (`2abc`), a leading zero (`02`), or digits that do not fit `u32`.
+    Malformed,
+    /// The prefix does not decide it: no leading `"v"`, or the key, the number
+    /// or its terminating delimiter lies beyond the probe.
+    Undecided,
+}
+
 /// The `v` field of a file too large to decode whole, read from a bounded
 /// prefix.
 ///
-/// The schema puts `v` first (ADR-0065 P1), so this reads only the document's
-/// leading key and its number. Anything else — a reordered key, a prefix cut
-/// before the value — answers `None`, which classifies an oversized file as
-/// damage. That is the conservative direction: it applies nothing either way,
-/// and `doctor` still reports the file.
-fn leading_version(prefix: &[u8]) -> Option<u32> {
-    let text = String::from_utf8_lossy(prefix);
-    let rest = text.trim_start().strip_prefix('{')?;
-    let rest = rest.trim_start().strip_prefix("\"v\"")?;
-    let rest = rest.trim_start().strip_prefix(':')?;
-    let rest = rest.trim_start();
-    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-    if digits == 0 {
-        return None;
+/// # What the bound can and cannot prove
+///
+/// The schema puts `v` first (ADR-0065 P1), so the probe reads only the
+/// document's leading key and its number. It accepts that number only when it
+/// is a *whole, valid* JSON integer followed by the object's structure — the
+/// delimiter after the digits and the `,` or `}` after them — because a digit
+/// run alone is not a version: `"v":10` cut after the `1` would otherwise read
+/// as version 1, and `"v":2.5` or `"v":02` would read as 2. A leading zero is
+/// refused (JSON has no such number), as are digits that do not fit `u32`.
+///
+/// So [`VersionProbe::Known`] is a proof, and everything else is the absence of
+/// one: a file whose version field is reordered, padded beyond
+/// [`VERSION_PROBE_BYTES`], or cut inside the number is [`VersionProbe::Undecided`]
+/// and is classified as damage. That is the conservative direction — damage
+/// applies nothing — and the one honest message the reader has, because the body
+/// was never read. Its cost: an oversized file this build cannot classify (a
+/// `v` this build reads, or one beyond the bound) says "larger than N bytes"
+/// rather than "not a JSON document this build reads". Both write nothing and
+/// both tell the user to move the file aside; only the size claim is certain.
+fn leading_version(prefix: &[u8]) -> VersionProbe {
+    /// Leading JSON whitespace: the only four bytes it can be.
+    fn skip_space(mut bytes: &[u8]) -> &[u8] {
+        while let [b' ' | b'\t' | b'\r' | b'\n', rest @ ..] = bytes {
+            bytes = rest;
+        }
+        bytes
     }
-    rest[..digits].parse().ok()
+    let Some(rest) = skip_space(prefix).strip_prefix(&b"{"[..]) else {
+        return VersionProbe::Undecided;
+    };
+    let Some(rest) = skip_space(rest).strip_prefix(&b"\"v\""[..]) else {
+        return VersionProbe::Undecided;
+    };
+    let Some(rest) = skip_space(rest).strip_prefix(&b":"[..]) else {
+        return VersionProbe::Undecided;
+    };
+    let rest = skip_space(rest);
+    let digits = rest.iter().take_while(|byte| byte.is_ascii_digit()).count();
+    if digits == 0 {
+        // Nothing after the colon inside the probe: it may still be cut.
+        return if rest.is_empty() {
+            VersionProbe::Undecided
+        } else {
+            VersionProbe::Malformed
+        };
+    }
+    let after = &rest[digits..];
+    match after.first() {
+        // The prefix ended inside the digits: their value is unknown.
+        None => return VersionProbe::Undecided,
+        Some(b' ' | b'\t' | b'\r' | b'\n' | b',' | b'}') => {}
+        // `.`, a letter, a non-ASCII byte: not an integer this schema reads.
+        Some(_) => return VersionProbe::Malformed,
+    }
+    if digits > 1 && rest[0] == b'0' {
+        return VersionProbe::Malformed;
+    }
+    // The object's next structural character must be where it belongs, or the
+    // number is not the whole value the document would have (`{"v":2` alone).
+    match skip_space(after).first() {
+        Some(b',' | b'}') => {}
+        // Cut before the delimiter: no proof either way.
+        _ => return VersionProbe::Undecided,
+    }
+    // Every byte is an ASCII digit, so this parse cannot fail on encoding.
+    match std::str::from_utf8(&rest[..digits])
+        .ok()
+        .and_then(|digits| digits.parse::<u32>().ok())
+    {
+        Some(v) => VersionProbe::Known(v),
+        // Digits that do not fit `u32` are not this schema's version either.
+        None => VersionProbe::Malformed,
+    }
 }
 
 /// One line, escaped, for a `Problem::Unreadable`. The message is a measured

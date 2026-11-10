@@ -494,26 +494,175 @@ fn untrusted_beats_damaged_and_newer() {
 
 /// MA7: a newer file is classified by what it says it is, so a later release's
 /// larger body is not called damage and not sent to "move it aside".
+///
+/// An oversized file carries **no records**: its body is not read, so a count
+/// would be a partial count presented as a count. Both shapes of oversized file
+/// prove it — one too large because of its body, one padded after the document —
+/// so nothing here depends on which bytes happen to survive the bound.
 #[test]
-fn oversized_newer_file_is_newer_not_damaged() {
+fn oversized_newer_file_is_newer_and_carries_no_records() {
     let root = tempfile::tempdir().unwrap();
     let dir = authority_dir(root.path());
-    let mut body = format!(r#"{{"v":2,"records":[{}]}}"#, record("/tmp/a", "10.0.0.5"));
-    body.push_str(&" ".repeat(MAX_BYTES as usize + 1 - body.len()));
-    write(&dir, &body);
-    let before = AuthoritySnapshot::take(&dir);
-    let read = store_at(&dir).read();
-    let Read::Newer { v, records } = &read else {
-        panic!(
-            "an oversized newer file is Newer, not {}",
-            damage_name(&read)
-        );
+    // A record whose `path` exceeds the bound: the JSON body itself is too big.
+    let huge_path = format!("/tmp/{}", "a".repeat(MAX_BYTES as usize));
+    let by_body = format!(
+        r#"{{"v":2,"records":[{{"project":"{}","path":"{huge_path}","destination":"10.0.0.5","recorded_ms":0}}]}}"#,
+        digest("/tmp/a")
+    );
+    assert!(by_body.len() as u64 > MAX_BYTES);
+    // And the same document padded after `}`: a body the prefix *could* parse,
+    // which is exactly why the assertion cannot depend on padding.
+    let padded = format!(r#"{{"v":2,"records":[{}]}}"#, record("/tmp/a", "10.0.0.5"));
+    let padded = {
+        let mut padded = padded;
+        padded.push_str(&" ".repeat(MAX_BYTES as usize + 1 - padded.len()));
+        padded
     };
-    assert_eq!(*v, 2);
-    // The records this build can read, for `doctor`'s counts; never applied by
-    // anything (`allowances::tests::newer_is_never_applied`).
-    assert_eq!(records.len(), 1);
-    assert_eq!(AuthoritySnapshot::take(&dir), before);
+    for (row, body) in [("body", by_body), ("padded", padded)] {
+        write(&dir, &body);
+        let before = AuthoritySnapshot::take(&dir);
+        let read = store_at(&dir).read();
+        let Read::Newer { v, records } = &read else {
+            panic!(
+                "{row}: an oversized newer file is Newer, not {}",
+                damage_name(&read)
+            );
+        };
+        assert_eq!(*v, 2, "{row}");
+        assert!(
+            records.is_empty(),
+            "{row}: an oversized file's records are not counted, because its body is not read ({} found)",
+            records.len()
+        );
+        assert_eq!(AuthoritySnapshot::take(&dir), before, "{row}: a read wrote");
+    }
+}
+
+/// The bounded and unbounded paths disagree about nothing the *version* decides.
+///
+/// Every row is the same bytes at both sizes; a padded copy must land in the
+/// same version class as the small one. The mutant this kills is the probe that
+/// accepts any digit run: it reads `2.5`, `2abc` and `02` as version 2.
+#[test]
+fn the_version_probe_agrees_with_the_bounded_classification() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = authority_dir(root.path());
+    // A classification is what the version *decides*: the variant and, where it
+    // carries one, the version. Size is the only thing allowed to differ.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Verdict {
+        Current,
+        Newer(u32),
+        Older(u32),
+        Undecodable,
+        TooLarge,
+    }
+    let verdict = |read: &Read| match read {
+        Read::Current { .. } => Verdict::Current,
+        Read::Newer { v, .. } => Verdict::Newer(*v),
+        Read::NotUsed(Problem::Damaged(Damage::OlderVersion(v))) => Verdict::Older(*v),
+        Read::NotUsed(Problem::Damaged(Damage::Undecodable)) => Verdict::Undecodable,
+        Read::NotUsed(Problem::Damaged(Damage::TooLarge)) => Verdict::TooLarge,
+        other => panic!("unexpected: {}", damage_name(other)),
+    };
+    for (body, small, padded) in [
+        (r#"{"v":2}"#, Verdict::Newer(2), Verdict::Newer(2)),
+        (r#"{"v":0}"#, Verdict::Older(0), Verdict::Older(0)),
+        (
+            r#"{"v":1,"records":[]}"#,
+            Verdict::Current,
+            Verdict::TooLarge,
+        ),
+        (r#"{"v":2.5}"#, Verdict::Undecodable, Verdict::Undecodable),
+        (r#"{"v":2abc}"#, Verdict::Undecodable, Verdict::Undecodable),
+        (r#"{"v":02}"#, Verdict::Undecodable, Verdict::Undecodable),
+    ] {
+        let row = body;
+        write(&dir, body);
+        assert_eq!(verdict(&store_at(&dir).read()), small, "{row}: small");
+        let mut big = body.to_owned();
+        big.push_str(&" ".repeat(MAX_BYTES as usize + 1 - big.len()));
+        write(&dir, &big);
+        assert_eq!(verdict(&store_at(&dir).read()), padded, "{row}: oversized");
+    }
+    // The one case the bound cannot decide, stated rather than hidden: an
+    // unclosed `{"v":2` padded past the bound has a *valid* leading number and
+    // no reader can tell it from `{"v":2,"records":…` without reading the body.
+    // The bounded path says undecodable; the oversized one says too large. Both
+    // apply nothing and both tell the user to move the file aside.
+    write(&dir, r#"{"v":2"#);
+    assert_eq!(
+        verdict(&store_at(&dir).read()),
+        Verdict::Undecodable,
+        "unclosed, small"
+    );
+    let mut unclosed = r#"{"v":2"#.to_owned();
+    unclosed.push_str(&" ".repeat(MAX_BYTES as usize + 1 - unclosed.len()));
+    write(&dir, &unclosed);
+    assert_eq!(
+        verdict(&store_at(&dir).read()),
+        Verdict::TooLarge,
+        "unclosed, oversized: the bound cannot prove the document is a version"
+    );
+}
+
+/// A version cut by the probe's own bound is not invented from the digits that
+/// survived: `{"v":20000000000…}` whose fourth byte is the last one the probe
+/// sees must not read as version 2.
+#[test]
+fn a_version_cut_at_the_probe_boundary_is_not_invented() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = authority_dir(root.path());
+    // Whitespace pushes the value to the boundary: `{"v":` occupies bytes
+    // 4090..4095 and the prefix ends on the `0` of `20000000000`.
+    let lead = " ".repeat(VERSION_PROBE_BYTES - 6);
+    let body = format!("{lead}{{\"v\":20000000000}}");
+    let mut body = body;
+    body.push_str(&" ".repeat(MAX_BYTES as usize + 5 - body.len()));
+    write(&dir, &body);
+    let read = store_at(&dir).read();
+    assert!(
+        !matches!(read, Read::Newer { .. }),
+        "a cut digit run is not a version: {}",
+        damage_name(&read)
+    );
+    assert!(
+        matches!(read, Read::NotUsed(Problem::Damaged(Damage::TooLarge))),
+        "the bound is undecided, and the size is the certain fact: {}",
+        damage_name(&read)
+    );
+}
+
+/// The probe itself, row for row: a valid leading integer is `Known`, a value
+/// the schema could not hold is `Malformed`, and anything the prefix cannot
+/// prove is `Undecided` — never a guess from partial digits.
+#[test]
+fn leading_version_is_a_proof_or_nothing() {
+    let cases: Vec<(&[u8], VersionProbe)> = vec![
+        (br#"{"v":2,"records":[]}"#, VersionProbe::Known(2)),
+        (br#"{"v":2}"#, VersionProbe::Known(2)),
+        (br#"{"v":2 }"#, VersionProbe::Known(2)),
+        (br#"{"v":0}"#, VersionProbe::Known(0)),
+        (br#"  {  "v"  :  10  ,  "#, VersionProbe::Known(10)),
+        // Malformed: not this schema's version.
+        (br#"{"v":2.5}"#, VersionProbe::Malformed),
+        (br#"{"v":2abc}"#, VersionProbe::Malformed),
+        (br#"{"v":02}"#, VersionProbe::Malformed),
+        (br#"{"v":-1}"#, VersionProbe::Malformed),
+        (br#"{"v":20000000000}"#, VersionProbe::Malformed),
+        // Undecided: the prefix proves nothing.
+        (br#"{"v":2"#, VersionProbe::Undecided),
+        (br#"{"v":"#, VersionProbe::Undecided),
+        (br#"{"v"#, VersionProbe::Undecided),
+        (br#"{"records":[],"v":2}"#, VersionProbe::Undecided),
+        (br#"["v"]"#, VersionProbe::Undecided),
+        // A byte where a delimiter must be: not JSON at all, so the bounded
+        // path would call the same file undecodable.
+        (b"{\"v\":2\xff", VersionProbe::Malformed),
+    ];
+    for (prefix, expected) in cases {
+        assert_eq!(leading_version(prefix), expected, "{prefix:?}");
+    }
 }
 
 /// A later release's file is `Newer`, never damage — and its records are read
