@@ -3679,12 +3679,28 @@ socket (a state root too deep for the kernel's socket path limit, or a busy log)
 is still listed from the log while its heartbeat is fresh; one that stopped
 without cleaning up is `ended (unclean)`.
 
-**The action column says why nothing can be done yet.** This release grants
-nothing: it lists refusals and names the reason. `no grant in this version;
-relaunch with --allow-egress` is a network denial an allowance will cover later;
-`can't be allowed: platform policy` is the deployment floor; `can't be allowed
-here: credential policy` is the credential boundary; `can't be allowed: built-in
-rule <site>` is an engine rule no allowance reaches.
+**The action column says why nothing can be done yet, or which record names the
+destination.** This release grants nothing from `access`: it lists refusals and
+names the reason. `no grant in this version; relaunch with --allow-egress` is a
+network denial no record covers; `can't be allowed: platform policy` is the
+deployment floor; `can't be allowed here: credential policy` is the credential
+boundary; `can't be allowed: built-in rule <site>` is an engine rule no allowance
+reaches. When a **project allowance** names the destination, the cell reads:
+
+```text
+recorded project allowance tcp://[203.0.113.10/32]:443 (2025-11-09 09:22Z); not confirmed for this session
+```
+
+That is a claim about a file, not about the session that refused: the record
+exists, for this project, with that destination and that timestamp. **Not
+confirmed for this session** means exactly what it says — the command cannot see
+whether the session that made the refusal had the record in force. It may not
+have: the session may predate the record, the record may have been unusable at
+that launch, a hostname record may have been skipped under a host proxy, the
+guest may have connected without a DNS binding the record could match, or an
+address record may still have been refused on a port another hostname
+intercepts (plain TCP must then be TLS with an SNI). See
+[Project allowances](#project-allowances-the-record).
 
 **Footers, never rows.** A count appears under the table when the runtime decided
 refusals it did not write (`suppressed`), when a session hit its per-session limit
@@ -3720,6 +3736,95 @@ named part of the feature. Precisely what happens:
 | A write evicts sessions to stay in bounds | A footer counts the sessions whose records are **gone**. A live session that is evicted is written back by its owner and is not counted. |
 
 ## Ports & egress
+
+### Project allowances (the record)
+
+A **project allowance** is a grant bound to one project's path identity, not to
+your whole host: another project — including a copy or a moved version of this
+one — never inherits it. Allowances live in one machine-written file,
+`~/.config/agent-vm/allowances.json`:
+
+```json
+{"v":1,"records":[
+ {"project":"<sha256 of the canonical project path>","path":"/Users/u/code/app",
+  "destination":"tcp://[203.0.113.10/32]:443","recorded_ms":1762680120000}]}
+```
+
+**This release only reads it.** There is no `agent-vm access allow`, no `record`
+and no `forget`: a later release writes this file, and hand-editing it is
+unsupported. Until then, hand-writing it *is* how a record comes to exist, so
+write it exactly as shown and expect the format to change. It is an authority
+store, so it refuses rather than heals — see the table below for what an
+unusable one costs.
+
+**One record, one grant, one project.** `project` is the full SHA-256 of the
+project's canonical path; `path` is that path and must hash to `project`, or the
+file is damaged. `destination` uses the same grammar as `--allow-egress`
+(`tcp://IP:PORT`, a CIDR, a bare hostname, `tcp://HOST:PORT`), so a record and a
+flag mean the same thing. Unknown fields are refused: any field a later release
+adds needs a new `v`, so an older agent-vm can never silently ignore one.
+
+**Every usable record joins the next launch of its project**, through the same
+policy computation as a flag, and the launch says so:
+
+```text
+==> Egress authority: 2 project allowance(s) from "/Users/u/.config/agent-vm/allowances.json"
+==> Egress policy: allowing tcp://[203.0.113.10/32]:443 (project allowance)
+==> Egress policy: allowing TLS to api.example.com on ports 443 (project allowance)
+```
+
+The recorded set is replaced whole on every launch; nothing accumulates. A
+recorded entry that duplicates a configured one is one entry with both sources
+named, exactly as a flag that duplicates a persisted grant is.
+
+**A recorded hostname has a configured hostname's global effects.** TLS
+interception is host-wide (ADR-0037): once any hostname allowance is in force,
+its ports are intercepted for *every* destination, so plain TCP to an
+**address** on 443 must be TLS with a matching SNI, and UDP to that port is
+dropped. The `==> TLS interception:` notice says which ports, and it appears
+for a launch whose only hostname came from a record. Prefer
+`tcp://HOST:PORT` records when you mean one port.
+
+**A host HTTP proxy skips hostname records.** The runtime resolves those names
+on the host, so the sandbox never sees an SNI it could verify. A *configured*
+hostname refuses such a launch outright; a **recorded** one is skipped with one
+warning and its address records still apply.
+
+**Two states refuse the launch.** The launch guard measures this file like
+`config.toml` ([ADR-0038](docs/adr/0038-config-dir-exposure-guard.md)): a second
+hard link to it (`nlink != 1`) refuses — another name for it could be written
+inside a guest and removed before the next launch — and so does a file the guard
+cannot inspect at all. Both name the file. Nothing else about the store fails a
+launch.
+
+**When it degrades.** Every other state costs the records and nothing else: the
+launch keeps exactly the authority you configured, and prints **one** warning
+naming the file.
+
+| What went wrong | What you see, and what you lose |
+|---|---|
+| The file is absent | Nothing at all. A launch does not create it. |
+| It is empty, not decodable, has an unknown field, a `path` that does not hash to its `project`, a duplicate (project, destination), a control character in a destination, more than 4096 records, a `v` below 1, or is larger than 1 MiB | One `warning:` naming the file, saying it could not be used and that this version does not repair it — move it aside to start over. No record is applied. |
+| It is a directory, FIFO or socket | The same warning, naming the file. It is never opened. |
+| It is a symlink | One warning: it is untrusted (never "damaged"), because its target may be writable by a guest or a project. |
+| It is owned by another user, or group/other-writable; or its directory is | One warning naming which. Mode `0644` is trusted; `0600` is what agent-vm writes. |
+| It has more than one hard link | The **launch is refused** (E1), naming the file. |
+| The guard cannot inspect it (any error other than "no such file") | The **launch is refused** (E2), naming the file. Not applying it now cannot stop a guest laundering it into the next launch. |
+| It cannot be read (permissions, I/O) | One warning, with the cause. No record is applied. |
+| It was written by a **newer** agent-vm | One warning: nothing from it is applied. `agent-vm doctor` still counts it, and reports the version. |
+| It is replaced (renamed over) while being read | The reader reopens, up to three attempts in all, and uses the new file. If every attempt sees a file that was replaced, one warning says it "changed while being read" and nothing is applied — that outcome is never reported as damage. |
+| One destination in it no longer parses | One warning naming up to three such destinations (then how many more). **The file's other records still apply.** |
+| `$HOME` is unset | Nothing: no user config is read at all then. `agent-vm doctor` says `not checked`. |
+| `$HOME` is set but empty or relative | One warning for `access`, and `agent-vm doctor` exits nonzero. A **launch** is refused earlier, before the store is read: it cannot locate the authority home. |
+
+`agent-vm doctor` reports the store under `==> project allowances`: the file's
+state and mode, this project's records, other projects' record counts, and
+**orphans** — records whose project path no longer reaches a directory. A path
+replaced by a symlink to a live directory is followed and reported as a project;
+a dangling link is an orphan; a path that cannot be inspected at all (a link
+loop, a permission failure) is `unknown`, not claimed gone. A damaged, untrusted,
+unreadable or replaced file makes `doctor` exit nonzero *after* every later
+section has printed.
 
 > **Upgrade note (0.7.31): `tool:PORT` hostnames.** An `allow_egress` entry that
 > starts with `tool:` in any ASCII case — other than a `tool://…` URL, which is

@@ -77,6 +77,8 @@ crates/agent-vm/src/
 ├── image_miss.rs           # registry-failure import hint
 ├── tools_cmd.rs            # tools verb group: `print` the built-in definitions as user TOML
 ├── access_cmd.rs           # the `access` report: select, render and label refusals (ADR-0064)
+├── allowances.rs           # project allowances: the view, `covers`, doctor's section (ADR-0065)
+│   └── store.rs            #   the record's read path: trust, damage, the reopen rule
 ├── refusal.rs              # coalescing, entry keys, kinds, refusal IDs (pure)
 │   ├── log.rs              #   the project refusal log: flock, atomic replace, eviction
 │   └── feed.rs             #   follow network.log, one ordered persister thread, the hint

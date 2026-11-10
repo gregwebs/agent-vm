@@ -274,6 +274,13 @@ fn run_to(
         let (store_section, store_failure) = describe_credential_store(&gather_store());
         write_line(out, &store_section)?;
         write_line(out, "")?;
+        // ADR-0065: this project's recorded allowances, beside the credential
+        // store. Its failure joins the trailing ones, so every later section
+        // still prints (a user whose store is broken still needs the rest).
+        let (allowance_section, allowance_failure) =
+            crate::allowances::doctor_section(project.as_ref().ok());
+        write_line(out, &allowance_section)?;
+        write_line(out, "")?;
         write_line(out, &config_section)?;
         if !launch.is_empty() {
             write_line(out, "")?;
@@ -326,6 +333,9 @@ fn run_to(
             ));
         }
         if let Some(error) = store_failure {
+            return Err(error);
+        }
+        if let Some(error) = allowance_failure {
             return Err(error);
         }
         return Ok(());
@@ -1867,6 +1877,9 @@ host token on the way out. So sign in ON THE HOST (`claude login`,
 Pi guest-managed state is different: a credential created inside the guest
 lives in the project's persistent Pi home and is reported above, not
 substituted.
+
+==> project allowances
+file: <fixture>/home/.config/agent-vm/allowances.json (absent; nothing recorded)
 
 ==> tool configuration
 user:    <fixture>/home/.config/agent-vm/config.toml (absent)

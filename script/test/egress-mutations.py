@@ -100,8 +100,43 @@ def mutation_target(path):
     return "agent-vm"
 
 
+# A whole build failure, as cargo renders it. The rows run with
+# `--message-format=json-render-diagnostics`, which renders diagnostics as *text*
+# (cargo emits no `compiler-message` JSON records in that mode), so the signals
+# below are text: a typed error, or cargo's own summary line.
+BUILD_FAILED = re.compile(r"^error: could not compile ", re.MULTILINE)
+TYPED_ERROR = re.compile(r"\berror\[E\d+\]")
+# The Verus gate's proof-failure summary. It only exists once the crate compiled,
+# so its presence means a failure is a failed *proof*, not a failed build.
+VERUS_SUMMARY = "verification results::"
+
+
+def compile_failure(text):
+    """Why the mutated target did not build, if it did not.
+
+    A mutant that cannot compile is a harness defect, never a surviving mutant
+    and never a test's failure: the old `domain-first` row named a field this
+    change had renamed away, so it "failed" every time without exercising
+    anything. Syntax errors, type errors and name errors all end at cargo's
+    `error: could not compile` line; the typed-error regex catches a compiler
+    message whose summary was elided. A Verus row is the exception that shapes
+    the second rule: a *failed proof* also makes cargo fail, and it reports
+    `verification results:: … N errors` — a line that only exists after the
+    crate compiled.
+    """
+    if TYPED_ERROR.search(text):
+        return TYPED_ERROR.search(text).group(0)
+    match = BUILD_FAILED.search(text)
+    if match and VERUS_SUMMARY not in text:
+        return "cargo could not compile the mutated target"
+    return None
+
+
 def outcome(name, command, marker, exit_code, text, package, target):
     """PASS only for a mutation that this run compiled (or verified) and killed."""
+    failure = compile_failure(text)
+    if failure:
+        return "FAIL", f"the mutant was never compiled: {failure}"
     killed = exit_code != 0 and marker in text
     if name.endswith("-proof"):
         verified = "Checking agent-vm v" in text or "Compiling agent-vm v" in text
@@ -173,8 +208,8 @@ def matrix():
     proxy = rust("hostname_proxy_selection_mirrors_the_host_connector")
     add("domain-all-ports", hostname, "ports: effective.into_iter().map(PortRange::single).collect(),", "ports: vec![],", shape)
     add("domain-any-protocol", hostname, "protocols: vec![Protocol::Tcp],", "protocols: vec![],", shape)
-    add("domain-first", EGRESS, "rules.extend(domain_rules(&self.hostnames, &ports));", "rules.splice(0..0, domain_rules(&self.hostnames, &ports));", shape)
-    add("hostname-dns", EGRESS, "rules.extend(domain_rules(&self.hostnames, &ports));", "rules.push(Rule::allow_dns()); rules.extend(domain_rules(&self.hostnames, &ports));", shape)
+    add("domain-first", EGRESS, "rules.extend(domain_rules(&self.effective.hostnames, &ports));", "rules.splice(0..0, domain_rules(&self.effective.hostnames, &ports));", shape)
+    add("hostname-dns", EGRESS, "rules.extend(domain_rules(&self.effective.hostnames, &ports));", "rules.push(Rule::allow_dns()); rules.extend(domain_rules(&self.effective.hostnames, &ports));", shape)
     add("tls-ports-missing", NETWORK, "Some(ports) => tls.intercepted_ports(ports.clone()),", "Some(_) => tls,", rust("hostname_launch_keeps_strict_and_intercepts_every_domain_port"))
     add("tls-off", NETWORK, "let enable_tls = !publish_ports.is_empty() || hostname_ports.is_some();", "let enable_tls = !publish_ports.is_empty();", rust("hostname_launch_keeps_strict_and_intercepts_every_domain_port"))
     add("bare-port-443-only", hostname, "HostnameScope::InterceptedPorts => ports.to_vec(),", "HostnameScope::InterceptedPorts => { let _ = ports; vec![443] },", shape)
@@ -244,10 +279,10 @@ def matrix():
     g4 = rust("rejected_allowance_is_refused_before_launch_state_is_created", LAUNCH)
     for name, suffix in (("project", ""), ("mounts", ".mounts"), ("secrets", ".secrets")):
         add("preparse-" + name, SRC + "run.rs",
-            "\n    let network_plan = crate::network::Plan::from_args(args.network, user_network, user_tools)?;",
+            "\n    let mut network_plan = crate::network::Plan::from_args(args.network, user_network, user_tools)?;",
             '\n    let early = ProjectSession::for_cwd()?;\n    std::fs::create_dir_all(' +
             ('&early.state_dir' if not suffix else 'early.state_dir.with_extension("' + suffix[1:] + '")') +
-            ')?;\n    let network_plan = crate::network::Plan::from_args(args.network, user_network, user_tools)?;', g4)
+            ')?;\n    let mut network_plan = crate::network::Plan::from_args(args.network, user_network, user_tools)?;', g4)
     add("valid-no-fork", TEST,
         '&["--mount", &mount, "--allow-egress", "api.example.com"],',
         '&["--allow-egress", "api.example.com"],', g4)
@@ -272,6 +307,19 @@ def matrix():
     hooks = ["python3", "script/test/lib/egress-probe-contract.py"]
     add("hook-no-library", FIXTURE, 'EGRESS_PROBE_LIB=1 . ./egress-probe.sh\\n', ':\\n', hooks, "FAILED (")
     add("hook-zero", FIXTURE, 'else "return 7"', 'else "return 0"', hooks, "FAILED (")
+    # ADR-0065's per-case allowance lifecycle: the *call sites* in `orchestrate`,
+    # which the boot-free contract proves by source (its body needs a VM). Each
+    # deletion is one way a case runs without its record (PA1x then passes while
+    # proving nothing) or leaves one behind.
+    add("allowance-seed-dropped", FIXTURE,
+        "                seed_failures = prepare_allowance(work, case, args.lan)\n",
+        "                seed_failures = []\n", host, "FAILED (")
+    add("allowance-restore-dropped", FIXTURE,
+        "            if case.case in ALLOWANCE_CASES:\n                failures.extend(remove_allowances(work))\n",
+        "", host, "FAILED (")
+    add("allowance-final-cleanup-dropped", FIXTURE,
+        "        cleanup_errors.extend(final_cleanup(work))",
+        "        cleanup_errors.extend(remove_credentials(work))", host, "FAILED (")
     # Real timeout/catalog/socket contracts exercise these independent omissions.
     for name, old, new in (
         ("cleanup-no-kill", 'for identity in launch.alive():', 'for identity in []:'),
@@ -615,8 +663,12 @@ def matrix():
         rust("mount_set_expansion_work_boundary"))
     add("mount-sets-budget-off-by-one-proof", sets_source, budget_body, budget_mutant,
         gate, "verification results::")
-    add("descriptor-reopen", SRC + "host_paths.rs", "            after_open();",
-        "            after_open(); drop(fd); let fd = rfs::open(path, OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC, Mode::empty())?;",
+    # The anchor names the *noting-symlink* reader's checkpoint plus the line it
+    # exists for: #557 added a second checkpointed reader, so a bare
+    # `after_open();` is no longer one statement.
+    add("descriptor-reopen", SRC + "host_paths.rs",
+        "            after_open();\n            read_regular_no_follow_fd(fd, path, max).map(|(bytes, facts)| VerifiedRead {",
+        "            after_open(); drop(fd); let fd = rfs::open(path, OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC, Mode::empty())?;\n            read_regular_no_follow_fd(fd, path, max).map(|(bytes, facts)| VerifiedRead {",
         rust("noting_symlink_takes_bytes_and_facts_from_the_opened_descriptor"))
     # The built-in tier's refusals moved into the one routine both non-user tiers
     # share (#396), so the anchor is that routine's network arm — still the exact
@@ -964,7 +1016,13 @@ def main():
             matches = (ROOT / path).read_text().count(old)
             if matches != expected:
                 raise RuntimeError(f"stale or ambiguous mutation anchor: {name}: {matches}, expected {expected}")
-        print(f"PASS: {len(controls)} mutation anchors")
+        # What this proves, and what it does not: every *pre-mutation* string is
+        # present exactly once. A replacement is not compiled here — the
+        # contracts job builds nothing — so a mutant that could not build would
+        # pass this check and be caught only by a real run, which reports it as
+        # "the mutant was never compiled" (see `outcome`). Say so, so the PASS
+        # line cannot be read as "every mutant builds".
+        print(f"PASS: {len(controls)} mutation anchors (find text only; a real run compiles each replacement)")
         return 0
     if args.evidence is None:
         parser.error("--evidence is required unless --check-anchors is used")

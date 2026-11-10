@@ -45,6 +45,10 @@ pub(crate) fn run(args: Args) -> Result<i32> {
     // store another user can write.
     let dir = SessionsDir::open(&session.sessions_dir())
         .with_context(|| format!("reading {}", crate::one_line::path(&session.sessions_dir())))?;
+    // The project's recorded allowances, read once and before the runtime is
+    // built: this command is offline, and a broken store must not stop a user
+    // reading what the sandbox refused (ADR-0065).
+    let allowances = crate::allowances::host_view(&crate::image_pin::ProjectId::of(&project));
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -54,6 +58,7 @@ pub(crate) fn run(args: Args) -> Result<i32> {
     runtime.block_on(run_in(
         dir.as_ref(),
         &args,
+        &allowances,
         crate::refusal::feed::now_ms(),
         &mut out,
         &mut err,
@@ -64,6 +69,7 @@ pub(crate) fn run(args: Args) -> Result<i32> {
 pub(crate) async fn run_in(
     dir: Option<&SessionsDir>,
     args: &Args,
+    allowances: &crate::allowances::ProjectView,
     now_ms: i64,
     out: &mut impl std::io::Write,
     err: &mut impl std::io::Write,
@@ -87,6 +93,12 @@ pub(crate) async fn run_in(
     };
     for warning in &discovery.warnings {
         writeln!(err, "warning: {warning}").context("writing a warning")?;
+    }
+    // One warning for a store that is not in force, with the discovery
+    // warnings: a row that says "not confirmed" must not be the only trace of a
+    // store this build could not read.
+    if let Some(notice) = allowances.notice() {
+        writeln!(err, "warning: {notice}").context("writing the store warning")?;
     }
 
     // Live wins over logged for the same session: the live snapshot is the one
@@ -166,7 +178,7 @@ pub(crate) async fn run_in(
         print_footers(out, &sessions, &discovery, args, older)?;
         return Ok(0);
     }
-    print_table(out, &entries)?;
+    print_table(out, &entries, allowances)?;
     print_footers(out, &sessions, &discovery, args, older)?;
     Ok(0)
 }
@@ -213,7 +225,11 @@ fn label(
 /// the guard, but the documented upgrade path admits launchers that leave
 /// `.sessions` writable to their guests, so a forged record must not be able to
 /// put terminal escapes on the user's terminal (AC5).
-fn print_table(out: &mut impl std::io::Write, entries: &[(Row, RefusalEntry)]) -> Result<()> {
+fn print_table(
+    out: &mut impl std::io::Write,
+    entries: &[(Row, RefusalEntry)],
+    allowances: &crate::allowances::ProjectView,
+) -> Result<()> {
     let rows: Vec<[String; 7]> = entries
         .iter()
         .map(|(row, entry)| {
@@ -224,7 +240,7 @@ fn print_table(out: &mut impl std::io::Write, entries: &[(Row, RefusalEntry)]) -
                 entry.count.to_string(),
                 last_seen(entry.last_ms),
                 row.label.to_owned(),
-                entry.reason(),
+                action(entry, allowances),
             ]
         })
         .collect();
@@ -351,35 +367,25 @@ fn source_label(source: &str) -> &str {
 
 /// UTC, minute precision: a refusal's last sighting does not need seconds.
 fn last_seen(ms: i64) -> String {
-    let seconds = ms.div_euclid(1000);
-    let days = seconds.div_euclid(86_400);
-    let seconds_of_day = seconds.rem_euclid(86_400);
-    let (year, month, day) = civil_from_days(days);
-    let hour = seconds_of_day / 3_600;
-    let minute = (seconds_of_day % 3_600) / 60;
-    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}Z")
+    crate::allowances::recorded_at(ms)
 }
 
-/// Howard Hinnant's `civil_from_days`, so the table needs no calendar crate.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let day_of_era = (z - era * 146_097) as u64;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let mut year = year_of_era as i64 + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let shifted_month = (5 * day_of_year + 2) / 153;
-    let day = (day_of_year - (153 * shifted_month + 2) / 5 + 1) as u32;
-    let month = if shifted_month < 10 {
-        shifted_month + 3
-    } else {
-        shifted_month - 9
-    } as u32;
-    if month <= 2 {
-        year += 1;
+/// §5's ACTION column: why nothing can be done, or which record names this
+/// destination.
+///
+/// A covered row never claims the session applied the record. "Recorded" is a
+/// fact about a file; "applied" is a fact about a runtime, and this command
+/// cannot see the session that made the refusal (ADR-0065 P5).
+fn action(entry: &RefusalEntry, allowances: &crate::allowances::ProjectView) -> String {
+    use crate::allowances::Coverage;
+    match allowances.allowances().covers(entry) {
+        Some(Coverage::Recorded(record)) => format!(
+            "recorded project allowance {} ({}); not confirmed for this session",
+            escape(&record.destination().to_string()),
+            last_seen(record.recorded_ms())
+        ),
+        None => entry.reason(),
     }
-    (year, month, day)
 }
 
 /// The footers: everything the table cannot show as a row (AC6).

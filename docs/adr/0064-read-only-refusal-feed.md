@@ -192,9 +192,10 @@ installs no guard at all.
   is adopted only when it is a real 0700 directory owned by the user.
 - **At most about 3 s** is added to teardown: a 1 s lock wait plus I/O for the
   final write, a 2 s bound on the drain, and 500 ms for open connections.
-- **Entries keep `last_revision`** even though slice 1 decides nothing with it, so
-  coverage filtering ("already covered by an allowance drops out") can be added
-  without a second pass over the runtime's records.
+- **Recorded coverage is [ADR-0065](0065-project-allowance-record.md)'s;
+  applied coverage is PR 2's.** Entries keep `last_revision` even though slice 1
+  decides nothing with it, so PR 2 can decide which rows a session's runtime
+  actually applied without a second pass over the runtime's records.
 - 403s synthesized by `_intercept-hook` are not runtime records and never appear;
   sandboxes created through `agent-vm msb` passthrough are not this launcher's
   sessions; `doctor` reports neither.

@@ -164,7 +164,7 @@ impl EgressAllowance {
             port: trusted_port(layout.port)?,
         })
     }
-    fn rule(&self) -> microsandbox_network::policy::Rule {
+    pub(crate) fn rule(&self) -> microsandbox_network::policy::Rule {
         use microsandbox_network::policy::{Action, Destination, Direction, PortRange, Rule};
         Rule {
             direction: Direction::Egress,
@@ -229,14 +229,19 @@ struct EntrySources {
 struct TierSources<'a> {
     user: EntryOrigin<'a>,
     cli: EntryOrigin<'a>,
+    /// This project's own recorded allowance granted it (ADR-0065). Not an
+    /// `EntryOrigin`: a record names no reference the user selected this launch,
+    /// so there is nothing to attribute beyond the file the header already named.
+    project: bool,
 }
 
 impl TierSources<'_> {
-    /// The parenthesised tag, or `None` when neither tier granted it (which no
-    /// entry in a resolved set can be).
+    /// The parenthesised tag, or `None` when no tier granted it (which no entry
+    /// in a resolved set can be).
     fn tag(&self) -> Option<String> {
         let user = phrase("persisted grants", &self.user);
         let cli = phrase("--allow-egress", &self.cli);
+        let project = self.project.then(|| "project allowance".to_owned());
         // Legacy " and " when no reference is involved; "; " otherwise, because
         // `persisted grants via tool:a and --allow-egress` reads as one list of
         // references rather than two sources. The set kind needs nothing here:
@@ -246,7 +251,7 @@ impl TierSources<'_> {
         } else {
             "; "
         };
-        let mut phrases = [user, cli].into_iter().flatten();
+        let mut phrases = [user, cli, project].into_iter().flatten();
         let first = phrases.next()?;
         Some(phrases.fold(first, |joined, next| joined + joiner + next.as_str()))
     }
@@ -301,11 +306,61 @@ pub(crate) enum HostnameAuthority<'a> {
     },
 }
 
+/// One grant set, in the two shapes the producers take: address allowances and
+/// hostname allowances, each deduplicated in first-seen order.
+///
+/// A named type rather than two adjacent `Vec` fields, because `configured` and
+/// `recorded` are both destinations and the whole merge is "copy one, append the
+/// other"; two unnamed pairs would let a call site append the wrong halves.
+#[derive(Clone, Debug, Default)]
+struct Destinations {
+    addresses: Vec<EgressAllowance>,
+    hostnames: Vec<HostnameAllowance>,
+}
+
+impl Destinations {
+    /// Append one entry, deduplicating by canonical value — the same rule
+    /// `resolve` applies to a launch's own entries.
+    fn push(&mut self, allowance: &Allowance) {
+        match allowance {
+            Allowance::Address(address) if !self.addresses.contains(address) => {
+                self.addresses.push(*address);
+            }
+            Allowance::Hostname(hostname) if !self.hostnames.contains(hostname) => {
+                self.hostnames.push(hostname.clone());
+            }
+            _ => {}
+        }
+    }
+
+    /// [`Self::push`] over a set, in its own order.
+    fn extend_with(&mut self, other: &[Allowance]) {
+        for allowance in other {
+            self.push(allowance);
+        }
+    }
+}
+
+/// The project's recorded allowances in force for this launch, and the file they
+/// came from (ADR-0065). Absent until [`EgressAuthority::set_recorded`], and
+/// absent again if that is called with an empty set.
+#[derive(Debug)]
+struct Recorded {
+    file: std::path::PathBuf,
+    destinations: Vec<Allowance>,
+}
+
 #[derive(Debug)]
 pub(crate) struct EgressAuthority {
     groups: GroupGrants,
-    allowances: Vec<EgressAllowance>,
-    hostnames: Vec<HostnameAllowance>,
+    /// D3's "configured": this launch's flags and the verified user `[network]`,
+    /// fixed by [`Self::resolve`] and never recomputed.
+    configured: Destinations,
+    /// The project's recorded allowances, replaced whole by [`Self::set_recorded`].
+    recorded: Option<Recorded>,
+    /// `configured` ∪ `recorded`: configured first, then recorded in file order.
+    /// Every derived view reads this one field.
+    effective: Destinations,
     provenance: Option<Provenance>,
     /// Whether this launch's own command line supplied any egress flag or entry.
     /// The provenance notice claims a merge only when there is something to
@@ -363,18 +418,13 @@ impl EgressAuthority {
             anyhow::anyhow!("--allow-egress #{}: {}", failure.index + 1, failure.error)
         })?;
         let user_entries = user.as_ref().map(|u| u.allowances.clone());
-        let mut allowances = Vec::new();
-        let mut hostnames = Vec::new();
+        let mut configured = Destinations::default();
         for allowance in user_entries
             .iter()
             .flat_map(ResolvedAllowances::allowances)
             .chain(cli.allowances())
         {
-            match allowance {
-                Allowance::Address(a) if !allowances.contains(a) => allowances.push(*a),
-                Allowance::Hostname(h) if !hostnames.contains(h) => hostnames.push(h.clone()),
-                _ => {}
-            }
+            configured.push(allowance);
         }
         let provenance = user.map(|u| Provenance {
             file: u.file.to_owned(),
@@ -398,12 +448,43 @@ impl EgressAuthority {
                 lan: lan.enabled,
                 host: host.enabled,
             },
-            allowances,
-            hostnames,
+            effective: configured.clone(),
+            configured,
+            recorded: None,
             provenance,
             cli_contributed,
             cli,
         })
+    }
+
+    /// Replace this launch's recorded allowance set and recompute the effective
+    /// one from `configured` (ADR-0065). Never accumulates: a second call is the
+    /// same as calling once with the second set, and an empty set is the same as
+    /// never calling at all.
+    pub(crate) fn set_recorded(&mut self, file: &std::path::Path, recorded: Vec<Allowance>) {
+        let mut effective = self.configured.clone();
+        effective.extend_with(&recorded);
+        self.effective = effective;
+        self.recorded = Some(Recorded {
+            file: file.to_owned(),
+            destinations: recorded,
+        });
+    }
+
+    /// The recorded entries in force, or `None` when there are none: the
+    /// distinction the notices and the source tags key on, so "no records" and
+    /// "never asked" print the same bytes.
+    fn recorded_entries(&self) -> Option<&Recorded> {
+        self.recorded
+            .as_ref()
+            .filter(|recorded| !recorded.destinations.is_empty())
+    }
+
+    /// Whether one effective entry is also a recorded one. Membership by value,
+    /// never by position: the effective lists interleave two tiers.
+    fn is_recorded(&self, allowance: &Allowance) -> bool {
+        self.recorded_entries()
+            .is_some_and(|recorded| recorded.destinations.contains(allowance))
     }
     /// Where the launch's hostname authority comes from, for the ambient-proxy
     /// refusal. `Some` iff some hostname allowance exists.
@@ -413,7 +494,11 @@ impl EgressAuthority {
     /// deleting it would not remove the refusal. The pre-#506 bytes come back
     /// when the filtered list is empty, exactly as when no reference exists.
     pub(crate) fn hostname_authority(&self) -> Option<HostnameAuthority<'_>> {
-        if self.hostnames.is_empty() {
+        // The configured tiers, not `effective`: the only caller is the
+        // ambient-proxy refusal, which runs before `set_recorded` and is about
+        // what the user asked for. A recorded hostname is skipped instead of
+        // refusing (ADR-0065 P6), so it must not decide this.
+        if self.configured.hostnames.is_empty() {
             return None;
         }
         let cli = self.cli.hostname_references().collect::<Vec<_>>();
@@ -444,11 +529,18 @@ impl EgressAuthority {
     }
     #[cfg(test)]
     fn sourced_entries(&self) -> Vec<(String, EntrySources)> {
-        self.allowances
+        self.effective
+            .addresses
             .iter()
             .cloned()
             .map(Allowance::Address)
-            .chain(self.hostnames.iter().cloned().map(Allowance::Hostname))
+            .chain(
+                self.effective
+                    .hostnames
+                    .iter()
+                    .cloned()
+                    .map(Allowance::Hostname),
+            )
             .map(|a| {
                 let entry = EntrySources {
                     user: self
@@ -467,7 +559,9 @@ impl EgressAuthority {
     /// only other reason, so a launch whose authority is plain flags keeps its
     /// byte-identical lines.
     fn shows_sources(&self) -> bool {
-        self.provenance.is_some() || self.cli.references().len() > 0
+        self.provenance.is_some()
+            || self.cli.references().len() > 0
+            || self.recorded_entries().is_some()
     }
     fn tier_sources(&self, allowance: &Allowance) -> TierSources<'_> {
         TierSources {
@@ -478,6 +572,7 @@ impl EgressAuthority {
                     p.user_entries.entry_origin(allowance)
                 }),
             cli: self.cli.entry_origin(allowance),
+            project: self.is_recorded(allowance),
         }
     }
     fn hostname_sources(
@@ -487,6 +582,14 @@ impl EgressAuthority {
         if !self.shows_sources() {
             return None;
         }
+        // A recorded hostname is matched by its Domain, not by its spelling, so
+        // a configured `api.example.com` and a recorded
+        // `tcp://api.example.com:8443` share one rule and one tag (ADR-0065 D4).
+        let project = self.recorded_entries().is_some_and(|recorded| {
+            recorded.destinations.iter().any(|allowance| {
+                matches!(allowance, Allowance::Hostname(hostname) if hostname.domain() == name)
+            })
+        });
         Some(TierSources {
             user: self
                 .provenance
@@ -495,20 +598,22 @@ impl EgressAuthority {
                     p.user_entries.hostname_origin(name)
                 }),
             cli: self.cli.hostname_origin(name),
+            project,
         })
     }
     pub(crate) fn has_hostnames(&self) -> bool {
-        !self.hostnames.is_empty()
+        !self.effective.hostnames.is_empty()
     }
     pub(crate) fn intercepted_ports(&self) -> Option<InterceptedPorts> {
-        InterceptedPorts::for_hostnames(&self.hostnames)
+        InterceptedPorts::for_hostnames(&self.effective.hostnames)
     }
     /// Lookup-free report query; reads authority without granting or resolving.
     pub(crate) fn covers_tls(&self, name: &CanonicalHostname, port: std::num::NonZeroU16) -> bool {
         let public = group_rules(self.groups).public;
         public
             || self.intercepted_ports().is_some_and(|ports| {
-                self.hostnames
+                self.effective
+                    .hostnames
                     .iter()
                     .any(|h| h.grants_tls(name, port, &ports))
             })
@@ -516,7 +621,12 @@ impl EgressAuthority {
     pub(crate) fn policy(&self) -> microsandbox::NetworkPolicy {
         use microsandbox_network::policy::{Action, Destination, DestinationGroup, Rule};
         let emitted = group_rules(self.groups);
-        let mut rules: Vec<Rule> = self.allowances.iter().map(EgressAllowance::rule).collect();
+        let mut rules: Vec<Rule> = self
+            .effective
+            .addresses
+            .iter()
+            .map(EgressAllowance::rule)
+            .collect();
         if emitted.gateway_dns {
             rules.push(Rule::allow_dns());
         }
@@ -530,7 +640,7 @@ impl EgressAuthority {
             }
         }
         if let Some(ports) = self.intercepted_ports() {
-            rules.extend(domain_rules(&self.hostnames, &ports));
+            rules.extend(domain_rules(&self.effective.hostnames, &ports));
         }
         // from_profiles opens DNS for LAN alone; none() also denies ingress.
         microsandbox::NetworkPolicy {
@@ -554,7 +664,17 @@ impl EgressAuthority {
                 )?;
             }
         }
-        if self.allowances.is_empty()
+        if let Some(recorded) = self.recorded_entries() {
+            // One line, before the entries it explains: the file, and how many
+            // of its records are in force for this launch.
+            writeln!(
+                output,
+                "==> Egress authority: {} project allowance(s) from \"{}\"",
+                recorded.destinations.len(),
+                crate::one_line::path(&recorded.file)
+            )?;
+        }
+        if self.effective.addresses.is_empty()
             && !self.has_hostnames()
             && !self.groups.internet
             && !self.groups.lan
@@ -565,7 +685,7 @@ impl EgressAuthority {
                 "==> Egress policy: all guest egress denied (opt in with --allow-internet-egress, --allow-egress, --allow-lan or --allow-host)"
             )?;
         }
-        for allowance in &self.allowances {
+        for allowance in &self.effective.addresses {
             match self
                 .shows_sources()
                 .then(|| self.tier_sources(&Allowance::Address(*allowance)).tag())
@@ -626,7 +746,7 @@ impl EgressAuthority {
                 names: Vec<String>,
             }
             let mut groups: Vec<HostnameNoticeGroup<'_>> = Vec::new();
-            for rule in domain_rules(&self.hostnames, &ports) {
+            for rule in domain_rules(&self.effective.hostnames, &ports) {
                 let microsandbox_network::policy::Destination::Domain(name) = rule.destination
                 else {
                     continue;
@@ -926,7 +1046,7 @@ mod tests {
         // name and the CLI pinned the same name to another port, so both tiers
         // count and the tag names both sources.
         let sources = h
-            .hostname_sources(h.hostnames[0].domain())
+            .hostname_sources(h.effective.hostnames[0].domain())
             .expect("both entries exist, so a tag is rendered");
         assert!(sources.user.direct && sources.cli.direct, "{sources:?}");
         assert!(sources.user.via.is_empty() && sources.cli.via.is_empty());
@@ -1527,7 +1647,8 @@ mod tests {
             ],
         );
         assert_eq!(
-            auth.allowances
+            auth.effective
+                .addresses
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>(),
@@ -1704,7 +1825,7 @@ mod tests {
             IpAddr::V6(v) => v.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
             _ => ip,
         };
-        auth.allowances.iter().any(|a| {
+        auth.effective.addresses.iter().any(|a| {
             a.network.contains(ip)
                 && a.transport.is_none_or(|t| t.protocol() == protocol)
                 && a.port.is_none_or(|p| port == Some(p.get()))
@@ -1798,6 +1919,297 @@ mod tests {
             assert_eq!(String::from_utf8(output).unwrap(), expected);
         }
     }
+    // -----------------------------------------------------------------------
+    // D. The one computation (ADR-0065 P6, R3)
+    // -----------------------------------------------------------------------
+
+    /// The recorded file's path, as every D case spells it.
+    const RECORD_FILE: &str = "/home/a/.config/agent-vm/allowances.json";
+
+    fn allowances(spellings: &[&str]) -> Vec<Allowance> {
+        spellings
+            .iter()
+            .map(|text| Allowance::parse(text).expect(text))
+            .collect()
+    }
+
+    /// One authority's merged recorded set.
+    fn with_recorded(mut authority: EgressAuthority, spellings: &[&str]) -> EgressAuthority {
+        authority.set_recorded(std::path::Path::new(RECORD_FILE), allowances(spellings));
+        authority
+    }
+
+    /// Every derived view, as comparable values. `covers_tls` is asked over a
+    /// name/port grid rather than at one point, because a stale interception
+    /// port is exactly what a one-point check would miss.
+    fn every_view(
+        authority: &EgressAuthority,
+    ) -> (serde_json::Value, bool, Option<Vec<u16>>, Vec<bool>) {
+        let requests = crate::network_requests::NetworkRequests::parse(
+            &[
+                "api.example.com",
+                "api.example.com:8443",
+                "api.example.com:9443",
+                "api.example.com:443",
+                "other.example",
+                "other.example:8443",
+                "git.example",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        (
+            serde_json::to_value(authority.policy()).unwrap(),
+            authority.has_hostnames(),
+            authority.intercepted_ports().map(|ports| ports.to_vec()),
+            requests
+                .iter()
+                .map(|request| authority.covers_tls(request.name(), request.port()))
+                .collect(),
+        )
+    }
+
+    /// The notices with provenance normalised away.
+    ///
+    /// R3 says the notices are equal **up to provenance tags**. Provenance
+    /// reaches the text in three ways, and all three are normalised here:
+    ///
+    /// * the `==> Egress authority: …` headers name the file and the tier;
+    /// * an `allowing …` line ends with the source tag;
+    /// * hostname lines are *grouped* by source, so two names from two tiers
+    ///   print on two lines where one tier prints them on one.
+    ///
+    /// The third is why the hostname lines become a ports→names map rather than
+    /// a string: the claim is that the same names are allowed on the same
+    /// ports, not that provenance-shaped formatting is identical.
+    fn normalised_notices(
+        authority: &EgressAuthority,
+    ) -> (
+        Vec<String>,
+        std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    ) {
+        fn without_tag(line: &str) -> &str {
+            let Some(body) = line.strip_suffix(')') else {
+                return line;
+            };
+            match body.rsplit_once(" (") {
+                Some((head, _)) => head,
+                None => line,
+            }
+        }
+        let mut output = Vec::new();
+        authority.write_notices(&mut output).unwrap();
+        let mut other = Vec::new();
+        let mut hostnames: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        for line in String::from_utf8(output).unwrap().lines() {
+            if line.starts_with("==> Egress authority: ") {
+                continue;
+            }
+            let bare = without_tag(line);
+            let Some(rest) = bare.strip_prefix("==> Egress policy: allowing TLS to ") else {
+                other.push(bare.to_owned());
+                continue;
+            };
+            let Some((names, ports)) = rest.rsplit_once(" on ports ") else {
+                other.push(bare.to_owned());
+                continue;
+            };
+            let group = hostnames.entry(ports.to_owned()).or_default();
+            for name in names.split(", ") {
+                group.insert(name.to_owned());
+            }
+        }
+        (other, hostnames)
+    }
+
+    proptest! {
+        /// R3: `set_recorded(R)` equals resolving `C` with `R` appended as
+        /// `--allow-egress` entries — on the policy, on `has_hostnames`, on the
+        /// intercepted ports, on TLS coverage over a name/port grid, and on the
+        /// notices up to provenance tags.
+        #[test]
+        fn recorded_merge_equals_cli_append_on_every_view(
+            saved in any::<[Option<bool>; 3]>(),
+            flags in any::<[Option<bool>; 3]>(),
+            configured_bits in any::<u8>(),
+            recorded_bits in any::<u8>(),
+        ) {
+            const CONFIGURED: [&str; 4] = [
+                "10.0.0.5/32", "git.example", "tcp://api.example.com:9443", "203.0.113.0/24",
+            ];
+            const RECORDED: [&str; 5] = [
+                "10.0.0.5", "api.example.com", "tcp://api.example.com:8443",
+                "192.168.1.0/24", "other.example",
+            ];
+            let configured: Vec<&str> = CONFIGURED.iter().enumerate()
+                .filter(|(i, _)| configured_bits & (1 << i) != 0).map(|(_, s)| *s).collect();
+            let recorded: Vec<&str> = RECORDED.iter().enumerate()
+                .filter(|(i, _)| recorded_bits & (1 << i) != 0).map(|(_, s)| *s).collect();
+            let merged = with_recorded(
+                resolve_saved(
+                    crate::user_network::SavedGroups { internet: saved[0], lan: saved[1], host: saved[2] },
+                    &configured,
+                    CliEgress { internet: flags[0], lan: flags[1], host: flags[2], allowances: &[] },
+                ),
+                &recorded,
+            );
+            let recorded_as_flags: Vec<String> = recorded.iter().map(|s| (*s).into()).collect();
+            // R3's statement, literally: the *same* saved file and the same
+            // flags, with `R` appended to `C` as `--allow-egress` entries — the
+            // CLI tier, not the user-config tier. Passing them as user entries
+            // would make the equivalent a launch whose `[network]` granted them,
+            // which is a different provenance and a different notice.
+            let equivalent = resolve_saved(
+                crate::user_network::SavedGroups { internet: saved[0], lan: saved[1], host: saved[2] },
+                &configured,
+                CliEgress { internet: flags[0], lan: flags[1], host: flags[2], allowances: &recorded_as_flags },
+            );
+            prop_assert_eq!(every_view(&merged), every_view(&equivalent));
+            prop_assert_eq!(normalised_notices(&merged), normalised_notices(&equivalent));
+        }
+
+        /// `set_recorded` replaces, and never accumulates: a second call is the
+        /// same as one call with the second set, and an empty set is the same as
+        /// never having called.
+        #[test]
+        fn set_recorded_replaces_and_removes(a_bits in any::<u8>(), b_bits in any::<u8>()) {
+            const RECORDED: [&str; 4] = ["10.0.0.5", "api.example.com", "tcp://api.example.com:8443", "other.example"];
+            let pick = |bits: u8| -> Vec<&str> {
+                RECORDED.iter().enumerate().filter(|(i, _)| bits & (1 << i) != 0).map(|(_, s)| *s).collect()
+            };
+            let (a, b) = (pick(a_bits), pick(b_bits));
+            let base = || resolve_saved(Default::default(), &["10.0.0.9"], empty_cli());
+            let replaced = with_recorded(with_recorded(base(), &a), &b);
+            prop_assert_eq!(every_view(&replaced), every_view(&with_recorded(base(), &b)));
+            let cleared = with_recorded(with_recorded(base(), &a), &[]);
+            prop_assert_eq!(every_view(&cleared), every_view(&base()));
+            // And the notices too: an empty set is byte-identical to never set.
+            let mut cleared_notices = Vec::new();
+            cleared.write_notices(&mut cleared_notices).unwrap();
+            let mut plain_notices = Vec::new();
+            base().write_notices(&mut plain_notices).unwrap();
+            prop_assert_eq!(cleared_notices, plain_notices);
+        }
+    }
+
+    /// Removing the only recorded hostname removes its Domain rule, its port
+    /// contribution and TLS interception.
+    #[test]
+    fn removing_the_last_recorded_hostname_removes_interception() {
+        let authority = with_recorded(
+            resolve_saved(Default::default(), &[], empty_cli()),
+            &["api.example.com"],
+        );
+        assert_eq!(
+            authority.intercepted_ports().map(|ports| ports.to_vec()),
+            Some(vec![443])
+        );
+        assert!(
+            serde_json::to_value(authority.policy()).unwrap()["rules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|rule| rule["destination"]["domain"] == "api.example.com")
+        );
+        let mut cleared = authority;
+        cleared.set_recorded(std::path::Path::new(RECORD_FILE), Vec::new());
+        assert!(cleared.intercepted_ports().is_none());
+        assert!(!cleared.has_hostnames());
+        assert!(
+            serde_json::to_value(cleared.policy()).unwrap()["rules"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// An empty recorded set changes no byte of any notice: the pre-#557 output
+    /// is the output, for every combination the existing goldens cover.
+    #[test]
+    fn notices_are_byte_identical_without_records() {
+        for bits in 0..8 {
+            for specs in [&["10.0.0.5"][..], &["10.0.0.5", "api.example.com"][..]] {
+                let plain = authority(grants(bits), specs);
+                let mut expected = Vec::new();
+                plain.write_notices(&mut expected).unwrap();
+                let mut actual = Vec::new();
+                with_recorded(plain, &[])
+                    .write_notices(&mut actual)
+                    .unwrap();
+                assert_eq!(actual, expected, "{bits} {specs:?}");
+            }
+        }
+    }
+
+    /// The notice bytes with a recorded set in force: recorded only, recorded
+    /// plus the same entries configured, and overlapping scopes (which must
+    /// share one Domain rule and one tag).
+    #[test]
+    fn notice_goldens_with_records() {
+        const HEADER: &str = "==> Egress authority: 2 project allowance(s) from \"/home/a/.config/agent-vm/allowances.json\"\n";
+        const TLS_ONLY: &str = "==> Egress policy: hostname allowances are TLS-only (SNI and DNS verified; no plain HTTP)\n";
+        const INTERCEPT: &str = "==> TLS interception: ports 443 — global to every destination (TLS ClientHello with SNI required, UDP dropped, sandbox CA must be trusted). A tcp://HOST:PORT entry widens every bare hostname to PORT.\n";
+        const DNS_ONLY_NAMES: &str = "==> Egress DNS: only allowed hostnames resolve (others NXDOMAIN when forwarder is available; private answers need --allow-lan or a port-less numeric allowance)\n";
+        let recorded = ["tcp://[203.0.113.10/32]:443", "api.example.com"];
+
+        // Recorded only: no persisted header, no flags.
+        let mut out = Vec::new();
+        with_recorded(EgressAuthority::from_cli(empty_cli()).unwrap(), &recorded)
+            .write_notices(&mut out)
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!(
+                "{HEADER}==> Egress policy: allowing tcp://[203.0.113.10/32]:443 (project allowance)\n==> Egress policy: allowing TLS to api.example.com on ports 443 (project allowance)\n{TLS_ONLY}{INTERCEPT}{DNS_ONLY_NAMES}"
+            )
+        );
+
+        // The same entries configured as well as recorded: one line each, and a
+        // tag naming both tiers. The set is identical, so nothing is duplicated.
+        let configured = vec![
+            "tcp://[203.0.113.10/32]:443".to_owned(),
+            "api.example.com".to_owned(),
+        ];
+        let mut out = Vec::new();
+        with_recorded(
+            EgressAuthority::from_cli(CliEgress {
+                allowances: &configured,
+                ..empty_cli()
+            })
+            .unwrap(),
+            &recorded,
+        )
+        .write_notices(&mut out)
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!(
+                "{HEADER}==> Egress policy: allowing tcp://[203.0.113.10/32]:443 (--allow-egress and project allowance)\n==> Egress policy: allowing TLS to api.example.com on ports 443 (--allow-egress and project allowance)\n{TLS_ONLY}{INTERCEPT}{DNS_ONLY_NAMES}"
+            )
+        );
+
+        // Overlapping scopes: a configured bare name and a recorded port-scoped
+        // one are one Domain rule carrying both ports, so one line, one tag, and
+        // interception at both ports globally.
+        let mut out = Vec::new();
+        let overlapping = with_recorded(
+            EgressAuthority::from_cli(CliEgress {
+                allowances: &["api.example.com".to_owned()],
+                ..empty_cli()
+            })
+            .unwrap(),
+            &["tcp://api.example.com:8443"],
+        );
+        overlapping.write_notices(&mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!(
+                "==> Egress authority: 1 project allowance(s) from \"/home/a/.config/agent-vm/allowances.json\"\n==> Egress policy: allowing TLS to api.example.com on ports 443, 8443 (--allow-egress and project allowance)\n{TLS_ONLY}==> TLS interception: ports 443, 8443 — global to every destination (TLS ClientHello with SNI required, UDP dropped, sandbox CA must be trusted). A tcp://HOST:PORT entry widens every bare hostname to PORT.\n{DNS_ONLY_NAMES}"
+            )
+        );
+    }
+
     proptest! {
         #[test]
         fn rejected_errors_are_fixed_text(s in any::<String>()) {
@@ -1829,7 +2241,7 @@ mod tests {
             prop_assert_eq!(policy.default_egress,Action::Deny);
             prop_assert_eq!(policy.default_ingress,Action::Allow);
             prop_assert!(!policy.has_domain_rules());
-            prop_assert_eq!(policy.rules.len(),auth.allowances.len()+2*usize::from(g.internet)+usize::from(g.lan)+usize::from(g.host));
+            prop_assert_eq!(policy.rules.len(),auth.effective.addresses.len()+2*usize::from(g.internet)+usize::from(g.lan)+usize::from(g.host));
             prop_assert!(policy.rules.iter().all(|r| r.direction == Direction::Egress && r.action == Action::Allow));
             differential(&auth);
         }
@@ -2125,6 +2537,7 @@ mod tests {
         );
         assert_eq!(
             authority
+                .effective
                 .hostnames
                 .iter()
                 .map(ToString::to_string)
@@ -2132,7 +2545,7 @@ mod tests {
             ["tcp://api.openai.com:443"]
         );
         let sources = authority
-            .hostname_sources(authority.hostnames[0].domain())
+            .hostname_sources(authority.effective.hostnames[0].domain())
             .unwrap();
         assert!(sources.user.direct, "{sources:?}");
         assert_eq!(

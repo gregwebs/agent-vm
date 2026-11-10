@@ -11,7 +11,12 @@ without changing this guard. Amended by
 or lies inside `.sessions` is refused, because a `:ro` bind of `refusals.json`,
 `refusals.lock` or a socket names one artefact whatever its mode says. Decision 1's
 writable-bind predicates and the `:ro`/`:fork` exemption for *ancestors* stand
-unchanged. Breaking guard release: **0.3.0** (ADR-0064's additions: **0.7.43**).
+unchanged. Amended by
+[ADR-0065](0065-project-allowance-record.md): Decision 2 covers
+`allowances.json` in every measured home, and a file the guard cannot inspect
+(aside from `NotFound`) refuses the launch rather than being left to the reader.
+Breaking guard release: **0.3.0** (ADR-0064's additions: **0.7.43**; ADR-0065's:
+**0.7.44**).
 
 ## Context
 
@@ -128,9 +133,17 @@ about every mountable filesystem. A skipped M11b supplies no refusal evidence.
 A pre-existing second name for `config.toml` can live inside an unrelated
 writable bind. The guest can write-then-unlink (L1), or open-then-unlink-then-write
 (L2); by the next read, the authority file has only one link and appears safe.
-Refuse every launch while a measured regular `config.toml` has `nlink != 1`,
-independent of content. A final-component symlink is not checked as a regular
-file. No contents are read or echoed by this guard.
+Refuse every launch while a measured regular `config.toml` — and, since
+[ADR-0065](0065-project-allowance-record.md), a measured regular
+`allowances.json` — has `nlink != 1`, independent of content. A final-component
+symlink is not checked as a regular file. No contents are read or echoed by this
+guard.
+
+ADR-0065 also makes an *uninspectable* `allowances.json` refuse: any `lstat`
+error other than `NotFound`. Deferring that case to the record's reader would not
+stop the laundering this decision exists to prevent, because not applying the
+file now does not stop a second name being removed before the next launch reads
+it.
 
 While the directory guard holds, an already linked file cannot be laundered
 through a launch by this build. Host-created links mid-session remain trusted.

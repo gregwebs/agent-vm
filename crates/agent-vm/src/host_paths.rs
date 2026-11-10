@@ -228,13 +228,136 @@ pub(crate) fn read_bounded_regular_file_no_follow(
     path: &Path,
     max: u64,
 ) -> Result<(Vec<u8>, HostFileFacts)> {
-    match open_no_follow(path)? {
-        NoFollowOpen::File(fd) => read_regular_no_follow_fd(fd, path, max),
-        NoFollowOpen::Symlink => Err(anyhow!(
-            "{} is a symbolic link; refusing to follow it",
-            path_in_line(path)
-        )),
+    match read_bounded_regular_file_no_follow_checkpointed(path, max, || {})? {
+        NoFollowRead::File(bytes, facts) => Ok((bytes, facts)),
+        NoFollowRead::Symlink => Err(symlink_refusal(path)),
     }
+}
+
+/// How [`read_bounded_regular_file_no_follow_checkpointed`] ended.
+///
+/// A final symlink is a distinct outcome rather than an error, because a caller
+/// that decides *why* it will not use the file (ADR-0065's project allowance
+/// record calls a symlink untrusted, never damaged) cannot recover that from an
+/// `anyhow` chain.
+pub(crate) enum NoFollowRead {
+    File(Vec<u8>, HostFileFacts),
+    Symlink,
+}
+
+/// [`read_bounded_regular_file_no_follow`] with a checkpoint between `open` and
+/// the descriptor's own `fstat`.
+///
+/// The seam exists for one reader-side race: a rename over the path after
+/// `open` leaves a valid descriptor whose `nlink` is 0, which is a healthy
+/// replacement and not distrust (ADR-0065 AC7). A test needs the replacement to
+/// happen at exactly that moment; production passes a no-op, so there is still
+/// one read path.
+pub(crate) fn read_bounded_regular_file_no_follow_checkpointed(
+    path: &Path,
+    max: u64,
+    after_open: impl FnOnce(),
+) -> Result<NoFollowRead> {
+    match open_regular_no_follow_checkpointed(path, after_open)? {
+        Some(file) => {
+            let facts = file.facts();
+            file.read_bounded(max)
+                .map(|bytes| NoFollowRead::File(bytes, facts))
+        }
+        None => Ok(NoFollowRead::Symlink),
+    }
+}
+
+/// An opened regular file with the descriptor's own facts, *before* any size
+/// policy is applied.
+///
+/// The project allowance reader must decide trust and version before it can
+/// decide size: an oversized file that is also group-writable is a write by
+/// someone else, not damage, and an oversized file a later release wrote is
+/// `Newer`, not damage (ADR-0065 AC4). A reader that conflated the three could
+/// only tell them apart by opening the file, which is what this type is for.
+///
+/// The bytes are read with `pread`, so the descriptor is measured once and the
+/// version probe and the body come from the same file even if the name is
+/// replaced underneath.
+pub(crate) struct OpenedRegularFile {
+    file: fs::File,
+    path: PathBuf,
+    facts: HostFileFacts,
+}
+
+impl OpenedRegularFile {
+    pub(crate) fn facts(&self) -> HostFileFacts {
+        self.facts
+    }
+
+    /// Up to `limit` bytes from the start, with no size policy: a truncated
+    /// prefix is a legitimate answer, because reading it is how the version is
+    /// established for a file too large to read whole.
+    pub(crate) fn prefix(&self, limit: usize) -> Result<Vec<u8>> {
+        use std::os::unix::fs::FileExt as _;
+        let want = limit.min(usize::try_from(self.facts.size).unwrap_or(usize::MAX));
+        let mut buffer = vec![0u8; want];
+        let mut read = 0;
+        while read < want {
+            match self.file.read_at(&mut buffer[read..], read as u64) {
+                Ok(0) => break,
+                Ok(count) => read += count,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    return Err(anyhow!(error))
+                        .with_context(|| format!("reading {}", path_in_line(&self.path)));
+                }
+            }
+        }
+        buffer.truncate(read);
+        Ok(buffer)
+    }
+
+    /// The whole file, refusing one larger than `max`.
+    pub(crate) fn read_bounded(self, max: u64) -> Result<Vec<u8>> {
+        let display = path_in_line(&self.path);
+        if self.facts.size > max {
+            return Err(anyhow!("{display} exceeds its size limit"));
+        }
+        let mut data = Vec::with_capacity(usize::try_from(self.facts.size).unwrap_or(0));
+        (&self.file)
+            .take(max + 1)
+            .read_to_end(&mut data)
+            .with_context(|| format!("reading {display}"))?;
+        if data.len() as u64 > max {
+            return Err(anyhow!("{display} exceeds its size limit"));
+        }
+        Ok(data)
+    }
+}
+
+/// [`open_regular_no_follow_checkpointed`]'s success is `None` for a final
+/// symlink, which the caller classifies (ADR-0065: untrusted, never damaged).
+pub(crate) fn open_regular_no_follow_checkpointed(
+    path: &Path,
+    after_open: impl FnOnce(),
+) -> Result<Option<OpenedRegularFile>> {
+    match open_no_follow(path)? {
+        NoFollowOpen::File(fd) => {
+            after_open();
+            let display = path_in_line(path);
+            let facts = descriptor_facts(&fd, &display)?;
+            Ok(Some(OpenedRegularFile {
+                file: fs::File::from(fd),
+                path: path.to_path_buf(),
+                facts,
+            }))
+        }
+        NoFollowOpen::Symlink => Ok(None),
+    }
+}
+
+fn symlink_refusal(path: &Path) -> anyhow::Error {
+    anyhow!(
+        "{} is a symbolic link; refusing to follow it",
+        path_in_line(path)
+    )
 }
 
 enum NoFollowOpen {
@@ -254,26 +377,31 @@ fn open_no_follow(path: &Path) -> Result<NoFollowOpen> {
     }
 }
 
-fn read_regular_no_follow_fd(
-    fd: OwnedFd,
-    path: &Path,
-    max: u64,
-) -> Result<(Vec<u8>, HostFileFacts)> {
-    let display = path_in_line(path);
-    let stat = rfs::fstat(&fd)
+/// The descriptor's own facts, refusing anything that is not a regular file.
+fn descriptor_facts(fd: &OwnedFd, display: &impl std::fmt::Display) -> Result<HostFileFacts> {
+    let stat = rfs::fstat(fd)
         .map_err(|error| anyhow!(error))
         .with_context(|| format!("stating {display}"))?;
-    let facts = HostFileFacts {
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(anyhow!("{display} is not a regular file"));
+    }
+    Ok(HostFileFacts {
         uid: stat.st_uid,
         mode: stat.st_mode,
         size: stat.st_size.max(0) as u64,
         // nlink_t is u16 on macOS, u32 on Linux aarch64, u64 on Linux x86_64.
         #[allow(clippy::useless_conversion)]
         nlink: u64::from(stat.st_nlink),
-    };
-    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
-        return Err(anyhow!("{display} is not a regular file"));
-    }
+    })
+}
+
+fn read_regular_no_follow_fd(
+    fd: OwnedFd,
+    path: &Path,
+    max: u64,
+) -> Result<(Vec<u8>, HostFileFacts)> {
+    let display = path_in_line(path);
+    let facts = descriptor_facts(&fd, &display)?;
     if facts.size > max {
         return Err(anyhow!("{display} exceeds its size limit"));
     }

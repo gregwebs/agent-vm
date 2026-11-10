@@ -685,3 +685,118 @@ fn a_ro_mount_of_the_sessions_dir_is_refused() {
     // The plan was rejected before any launch state was created.
     assert!(!stderr.contains("[debug] sandbox config JSON:"), "{stderr}");
 }
+
+// ---------------------------------------------------------------------------
+// ADR-0065 P7: the one-link check covers `allowances.json`
+// ---------------------------------------------------------------------------
+
+/// A well-formed record for the launch's project, so a refused launch cannot be
+/// explained by a broken store: each row below is about the *guard*.
+fn allowance_store(h: &Harness, destination: &str) -> std::path::PathBuf {
+    use sha2::{Digest as _, Sha256};
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = config_dir(h);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let project = h.project.path().canonicalize().unwrap();
+    let digest: String = Sha256::digest(project.as_os_str().as_encoded_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let file = dir.join("allowances.json");
+    std::fs::write(
+        &file,
+        format!(
+            r#"{{"v":1,"records":[{{"project":"{digest}","path":"{}","destination":"{destination}","recorded_ms":1762680120000}}]}}"#,
+            project.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    file
+}
+
+/// m13 — a writable bind of the authority directory is still refused with the
+/// store present, and the read-only bind is still allowed. A baseline
+/// regression, as the ticket asks: not evidence of record trust.
+#[test]
+fn m13_allowances_present_config_dir_rw_still_refused() {
+    let h = Harness::new();
+    allowance_store(&h, "tcp://[203.0.113.10/32]:443");
+    let dir = h.home_path().join(".config/agent-vm");
+    let parent = dir.parent().unwrap();
+    refused(
+        &h,
+        h.run_shell(&[&parent.display().to_string()]),
+        "read-only (:ro)",
+    );
+    refused(
+        &h,
+        h.run_shell(&[&dir.display().to_string()]),
+        "launch authority",
+    );
+    let text = reached(h.run_shell(&[&format!("{}:/cfg:ro", parent.display())]));
+    assert!(
+        bind_mounts(&debug_config_json(&text))
+            .iter()
+            .any(|(host, guest, ro)| Path::new(host) == parent && guest == "/cfg" && *ro)
+    );
+}
+
+/// m14 — a writable bind of the file itself is refused, because the runtime's
+/// writable file staging is unreachable from agent-vm (issue #113). Baseline.
+#[test]
+fn m14_rw_file_bind_of_allowances_json_refused() {
+    let h = Harness::new();
+    let file = allowance_store(&h, "tcp://[203.0.113.10/32]:443");
+    let out = h.run_shell(&[&format!("{}:/store.json", file.display())]);
+    assert!(!out.status.success(), "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains("a file can only be mounted read-only"),
+        "{}",
+        stderr_of(&out)
+    );
+    // The read-only form is allowed, and the store is still applied: the guard
+    // is about the *name*, not about the store being unusable.
+    let text = reached(h.run_shell(&[&format!("{}:/store.json:ro", file.display())]));
+    assert!(
+        text.contains(
+            "==> Egress policy: allowing tcp://[203.0.113.10/32]:443 (project allowance)"
+        ),
+        "{text}"
+    );
+}
+
+/// m15 — E1: a second hard link to `allowances.json` refuses the launch, naming
+/// *the authority file*; removing the link lets the same topology launch.
+///
+/// The alias lives in the project directory and is also named
+/// `allowances.json`, so a bare name match would pass on either path. The
+/// assertion names the authority path, which only the guard can print.
+#[test]
+fn m15_hard_linked_allowances_json_refuses_launch_then_single_link_control() {
+    let h = Harness::new();
+    let file = allowance_store(&h, "tcp://[203.0.113.10/32]:443");
+    let alias = h.project.path().join("allowances.json");
+    std::fs::hard_link(&file, &alias).unwrap();
+    let out = h.run_shell(&[]);
+    let stderr = stderr_of(&out);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "\"{}\" has 2 hard links",
+            h.home_path()
+                .join(".config/agent-vm/allowances.json")
+                .display()
+        )),
+        "the refusal names the authority file: {stderr}"
+    );
+    assert_no_launch_side_effects(&h, &stderr);
+    std::fs::remove_file(alias).unwrap();
+    let text = reached(h.run_shell(&[]));
+    assert!(
+        text.contains(
+            "==> Egress policy: allowing tcp://[203.0.113.10/32]:443 (project allowance)"
+        ),
+        "{text}"
+    );
+}

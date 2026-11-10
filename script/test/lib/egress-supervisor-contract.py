@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Host-only owned-launch/command controls. No VM or native egress evidence."""
+import hashlib
 import importlib.util
+import inspect
 import json
 import os
 from pathlib import Path
@@ -133,6 +135,17 @@ class Contracts(unittest.TestCase):
                 self.assertNotIn("shell", command.argv)
             self.assertNotIn("-c", command.argv)
             self.assertFalse(case.extras and not case.case.startswith(("PX", "FL")))
+        # ADR-0065: both allowance cases are built with their seed and restore
+        # steps declared and from the launched project, so the harness cannot run
+        # one without its record.
+        for allowance_case in ("PA1", "PA1x"):
+            command = next(c for c in commands if c.case == allowance_case)
+            self.assertTrue(command.setup, allowance_case)
+            self.assertIn("allowance record", command.setup[0])
+            self.assertIn("remove the record", command.setup[0])
+            self.assertEqual(Path(command.cwd), self.work / "proj")
+        self.assertEqual([c.case for c in commands if c.setup],
+                         ["PA1", "PA1x", "CR1c", "CR1"])
         printed = subprocess.check_output([sys.executable, str(MODULE_PATH), "run", "--print-plan",
             "--work", str(self.work), "--binary", str(self.binary), "--lan", "192.168.1.2"], cwd="/")
         plan = [json.loads(line) for line in printed.splitlines()]
@@ -176,6 +189,121 @@ class Contracts(unittest.TestCase):
         status, output = egress.run_admin(self.work, env_command)
         self.assertEqual(status, 0)
         self.assertEqual(dict(line.split("=", 1) for line in output.splitlines()), command.env)
+
+    def test_allowance_seed_and_restore_lifecycle(self):
+        """ADR-0065 AC13: the record each PA case launches under is written,
+        checked and removed by executing the same functions the boot harness
+        calls. The plan's §7.7 lifecycle used to be asserted only as prose in
+        `command.setup[0]`, which `build_command` produces whether or not
+        anything is seeded."""
+        for case, project in ((egress.Case("PA1"), "proj"), (egress.Case("PA1x"), "other")):
+            (self.work / project).mkdir(exist_ok=True)
+            # The one call `orchestrate` makes before a PA launch: it seeds and
+            # checks, and it reports a leftover before overwriting one.
+            self.assertEqual(egress.prepare_allowance(self.work, case, "192.168.1.2"), [])
+            egress.remove_allowances(self.work)
+            egress.seed_allowances(self.work, case, "192.168.1.2")
+            stale = egress.prepare_allowance(self.work, case, "192.168.1.2")
+            self.assertEqual(len(stale), 1, stale)
+            self.assertIn("left from an earlier case", stale[0])
+            # Reported and re-seeded: the case can still run, and it fails.
+            self.assertEqual(egress.check_allowance_seed(self.work, case, "192.168.1.2"), [])
+            store = egress.allowance_store(self.work)
+            # Independent of the seeder: the digest of the canonical path's bytes.
+            canonical = os.path.realpath(self.work / project)
+            record = json.loads(store.read_text())
+            self.assertEqual(record, {"v": 1, "records": [{
+                "project": hashlib.sha256(os.fsencode(canonical)).hexdigest(),
+                "path": canonical,
+                "destination": "tcp://192.168.1.2:18080",
+                "recorded_ms": 1762680120000}]})
+            self.assertEqual(store.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(store.parent.stat().st_mode & 0o777, 0o700)
+            # The pre-launch check accepts the seed it just wrote ...
+            self.assertEqual(egress.check_allowance_seed(self.work, case, "192.168.1.2"), [])
+            # ... and refuses a seed that is missing, malformed, foreign or has
+            # the wrong destination, which is what stops PA1x passing vacuously.
+            original = store.read_text()
+            store.unlink()
+            self.assertTrue(egress.check_allowance_seed(self.work, case, "192.168.1.2"))
+            store.write_text("not json")
+            self.assertTrue(egress.check_allowance_seed(self.work, case, "192.168.1.2"))
+            for wrong in (
+                record["records"][0] | {"project": "0" * 64},
+                record["records"][0] | {"destination": "tcp://192.168.1.9:18080"},
+            ):
+                store.write_text(json.dumps({"v": 1, "records": [wrong]}))
+                store.chmod(0o600)
+                self.assertTrue(egress.check_allowance_seed(self.work, case, "192.168.1.2"))
+            store.write_text(original)
+            store.chmod(0o600)
+            # A second seed over a live record is refused, never a silent
+            # overwrite: the leftover is what `orchestrate` reports.
+            with self.assertRaises(RuntimeError):
+                egress.seed_allowances(self.work, case, "192.168.1.2")
+            # The restore reports nothing left, and nothing of the store's own.
+            self.assertEqual(egress.remove_allowances(self.work), [])
+            self.assertFalse(egress.allowance_store(self.work).exists())
+            self.assertEqual(list(egress.allowance_store(self.work).parent.glob("allowances.*")), [])
+            # A lock or a set-aside left behind *is* reported.
+            egress.seed_allowances(self.work, case, "192.168.1.2")
+            (egress.allowance_store(self.work).parent / "allowances.lock").write_text("")
+            failures = egress.remove_allowances(self.work)
+            self.assertEqual(len(failures), 1, failures)
+            self.assertIn("allowances.lock", failures[0])
+            (egress.allowance_store(self.work).parent / "allowances.lock").unlink()
+            # A dangling symlink at the name is still a leftover, which
+            # `Path.exists()` would have read as absent.
+            egress.allowance_store(self.work).symlink_to(self.work / "gone")
+            self.assertTrue(egress.allowance_present(self.work))
+            self.assertEqual(len(egress.remove_allowances(self.work)), 1)
+            egress.allowance_store(self.work).unlink()
+
+    def test_orchestrate_runs_the_allowance_lifecycle(self):
+        """The *call sites*, not only the helpers.
+
+        `orchestrate` is a whole boot harness, so a boot-free test cannot run its
+        body: what it can prove is that the steps it must perform are the ones it
+        calls — the same shape as the print-plan inventory and the shell guard
+        rail, which are source checks for exactly this reason — and that the
+        run's final cleanup removes a record left by a case that then raised.
+        `egress-mutations.py` carries rows that delete each call to prove this
+        test bites.
+        """
+        source = inspect.getsource(egress.orchestrate)
+        for fragment in (
+            # The seed step, with its guard: `seed_failures.extend(...)` in the
+            # abort branch must not stand in for it.
+            ("if case.case in ALLOWANCE_CASES:\n"
+             "                seed_failures = prepare_allowance(work, case, args.lan)"),
+            # The per-case restore, likewise with its guard.
+            ("if case.case in ALLOWANCE_CASES:\n"
+             "                failures.extend(remove_allowances(work))"),
+            # The run's last cleanup, which is what survives an exception.
+            "cleanup_errors.extend(final_cleanup(work))",
+        ):
+            self.assertIn(fragment, source, f"orchestrate no longer runs: {fragment}")
+
+        case = egress.Case("PA1")
+        (self.work / "proj").mkdir(exist_ok=True)
+        # A case that raises between its seed and its own removal: the final
+        # cleanup still removes the record.
+        self.assertEqual(egress.prepare_allowance(self.work, case, "192.168.1.2"), [])
+        try:
+            raise RuntimeError("a case aborts between its seed and its removal")
+        except RuntimeError:
+            pass
+        finally:
+            self.assertEqual(egress.final_cleanup(self.work), [])
+        self.assertFalse(egress.allowance_present(self.work))
+        # And a lock a case left behind is reported, not swallowed.
+        self.assertEqual(egress.prepare_allowance(self.work, case, "192.168.1.2"), [])
+        lock = egress.allowance_store(self.work).parent / "allowances.lock"
+        lock.write_text("")
+        failures = egress.final_cleanup(self.work)
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("allowances.lock", failures[0])
+        lock.unlink()
 
     def test_required_calibrations_and_links(self):
         # Independent endpoint/protocol inventory: deleting a calibration must

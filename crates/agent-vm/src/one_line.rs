@@ -738,6 +738,12 @@ mod tests {
             4,
             "#419 recorded; test-only module (declared #[cfg(test)] in main.rs)",
         ),
+        (
+            "allowances/tests.rs",
+            1,
+            "#419 recorded; test-only module (declared #[cfg(test)] in allowances.rs); the value \
+             is a store fixture's `path` column, stored and never printed",
+        ),
     ];
 
     /// The class does not stay fixed one producer at a time (#410 missed `run`'s

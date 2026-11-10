@@ -2473,3 +2473,248 @@ fn doctor_names_the_keychain_when_it_wins() {
         "doctor must never print a bearer:\n{stdout}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// ADR-0065: the project allowance store is reported, and its failure exits
+// nonzero only after every later section has printed
+// ---------------------------------------------------------------------------
+
+#[path = "support/authority_snapshot.rs"]
+mod authority_snapshot;
+
+impl Harness {
+    /// Write the store at the modes the launcher writes, and return its path.
+    fn write_allowances(&self, bytes: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = authority_snapshot::empty_authority_dir(&self.home_root);
+        let file = dir.join("allowances.json");
+        std::fs::write(&file, bytes).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        file
+    }
+}
+
+/// A store this build cannot use fails the run — after every section, so the
+/// user still gets the report they ran `doctor` for — and changes nothing.
+#[test]
+fn untrusted_and_unreadable_stores_fail_after_every_section() {
+    use std::os::unix::fs::PermissionsExt as _;
+    // Mode 000 is the unreadable row; as root every mode is readable, so that
+    // row cannot run and is left out rather than passing for the wrong reason.
+    let rows: &[&str] = if unsafe { libc::geteuid() } == 0 {
+        &["group-writable", "damaged", "directory"]
+    } else {
+        &["group-writable", "damaged", "directory", "unreadable"]
+    };
+    for row in rows {
+        let h = Harness::new();
+        let file = h.write_allowances(r#"{"v":1,"records":[]}"#);
+        match *row {
+            "group-writable" => {
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o666)).unwrap()
+            }
+            "damaged" => std::fs::write(&file, b"not json").unwrap(),
+            "unreadable" => {
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap()
+            }
+            _ => {
+                std::fs::remove_file(&file).unwrap();
+                std::fs::create_dir(&file).unwrap();
+            }
+        }
+        let directory = h.home_root.join(".config/agent-vm");
+        let before = authority_snapshot::take(&directory);
+        let out = h.run_doctor();
+        let text = format!("{}{}", stdout_of(&out), stderr_of(&out));
+        assert!(!out.status.success(), "{row}: doctor exited 0: {text}");
+        assert!(text.contains("==> project allowances"), "{row}: {text}");
+        assert!(text.contains("not used: "), "{row}: {text}");
+        assert!(text.contains("allowances.json"), "{row}: {text}");
+        // The trailing failure comes after the last section, which is what makes
+        // it a report rather than an early exit.
+        assert!(
+            text.contains("==> agent-vm doctor: available operations"),
+            "{row}: doctor stopped before its last section: {text}"
+        );
+        assert_eq!(
+            authority_snapshot::take(&directory),
+            before,
+            "{row}: doctor changed the authority directory"
+        );
+    }
+}
+
+/// The digest a record's `project` column carries: the full lowercase hex
+/// SHA-256 of the canonical path's bytes, computed independently of the
+/// launcher.
+fn allowance_digest(path: &Path) -> String {
+    use sha2::{Digest as _, Sha256};
+    Sha256::digest(path.as_os_str().as_encoded_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// A readable store is reported with this project's records and orphans, and a
+/// newer file is reported as not applied — not as a failure.
+#[test]
+fn a_current_and_a_newer_store_are_reported_without_failing() {
+    for (row, version) in [("current", 1u32), ("newer", 2)] {
+        let h = Harness::new();
+        let project = h.project_root.clone();
+        let orphan = h.home_root.join("old-project");
+        h.write_allowances(&format!(
+            r#"{{"v":{version},"records":[
+                {{"project":"{own}","path":"{own_path}","destination":"10.0.0.5","recorded_ms":1762680120000}},
+                {{"project":"{gone}","path":"{gone_path}","destination":"10.0.0.6","recorded_ms":1762680120000}}
+            ]}}"#,
+            own = allowance_digest(&project),
+            own_path = project.display(),
+            gone = allowance_digest(&orphan),
+            gone_path = orphan.display(),
+        ));
+        let out = h.run_doctor();
+        let text = format!("{}{}", stdout_of(&out), stderr_of(&out));
+        assert!(text.contains("==> project allowances"), "{row}: {text}");
+        assert!(text.contains("this project: 1"), "{row}: {text}");
+        assert!(
+            text.contains("10.0.0.5/32  recorded 2025-11-09 09:22Z"),
+            "{row}: {text}"
+        );
+        assert!(text.contains("other projects: 1"), "{row}: {text}");
+        assert!(
+            text.contains("orphaned: 1 project path(s) no longer exist"),
+            "{row}: {text}"
+        );
+        if version == 1 {
+            assert!(out.status.success(), "{row}: {text}");
+            assert!(text.contains("(version 1, mode 0600)"), "{row}: {text}");
+            assert!(!text.contains("newer agent-vm"), "{row}: {text}");
+        } else {
+            assert!(
+                out.status.success(),
+                "a newer store is not a failure: {row}: {text}"
+            );
+            assert!(
+                text.contains("(written by a newer agent-vm, version 2; not applied)"),
+                "{row}: {text}"
+            );
+        }
+    }
+}
+
+/// Run one of the egress harness's own functions in `work`: the boot cases'
+/// records are written by `script/test/lib/egress-fixtures.py`, so the seeder
+/// this test exercises is the one `PA1`/`PA1x` launch under, not a copy of it.
+fn harness_python(work: &Path, body: &str) -> Output {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../script/test/lib/egress-fixtures.py")
+        .canonicalize()
+        .expect("the egress fixtures are in the repository");
+    let program = format!(
+        "import importlib.util, pathlib, sys\n\
+         spec = importlib.util.spec_from_file_location('egress_fixtures', {fixtures:?})\n\
+         fixtures = importlib.util.module_from_spec(spec)\n\
+         sys.modules['egress_fixtures'] = fixtures\n\
+         spec.loader.exec_module(fixtures)\n\
+         work = pathlib.Path({work:?})\n{body}",
+        fixtures = fixtures.to_str().unwrap(),
+        work = work.to_str().unwrap(),
+    );
+    std::process::Command::new("python3")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .args(["-B", "-c", &program])
+        .output()
+        .expect("python3 runs")
+}
+
+/// AC13's boot-free half, executed: the harness's `seed_allowances` writes the
+/// record the *launcher* recognizes for `PA1`'s own project and for `PA1x`'s
+/// different project, and `remove_allowances` restores the tree and reports
+/// nothing left.
+///
+/// `PA1x` is a negative case — it expects default deny — so a seed it never
+/// received would make it pass while proving no isolation at all. Only the
+/// launcher's own identity computation can show the digest agrees, which is why
+/// this runs the real binary rather than comparing digests by hand. The boot
+/// run itself is still the verifier's (there is no VM here).
+#[test]
+fn the_harness_allowance_seed_is_what_doctor_reports() {
+    let root = tempfile::tempdir().unwrap();
+    let work = root.path().canonicalize().unwrap();
+    for name in ["home", "state", "proj"] {
+        std::fs::create_dir(work.join(name)).unwrap();
+    }
+    let fake = fake_msb::write(&work.join("home"));
+    for (case, this_project, other_projects) in [("PA1", 1, 0), ("PA1x", 0, 1)] {
+        let seeded = harness_python(
+            &work,
+            &format!(
+                "case = next(c for c in fixtures.CASES if c.case == {case:?})\n\
+                 fixtures.seed_allowances(work, case, '192.168.1.2')\n"
+            ),
+        );
+        assert!(
+            seeded.status.success(),
+            "{case}: seed failed: {}",
+            String::from_utf8_lossy(&seeded.stderr)
+        );
+        let store = work.join("home/.config/agent-vm/allowances.json");
+        assert!(store.is_file(), "{case}: no record was seeded");
+
+        let out = std::process::Command::new(agent_vm_bin())
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", work.join("home"))
+            .env("AGENT_VM_STATE_DIR", work.join("state"))
+            .env("MSB_PATH", &fake)
+            .current_dir(work.join("proj"))
+            .arg("doctor")
+            .output()
+            .expect("running agent-vm doctor");
+        let text = format!("{}{}", stdout_of(&out), stderr_of(&out));
+        assert!(text.contains("==> project allowances"), "{case}: {text}");
+        assert!(
+            text.contains(&format!("this project: {this_project}")),
+            "{case}: the launcher did not read the seed as this project's: {text}"
+        );
+        assert!(
+            text.contains(&format!("other projects: {other_projects}")),
+            "{case}: {text}"
+        );
+        if this_project == 1 {
+            // The record's canonical spelling, so the assertion is about the
+            // record's *content* and not the digest alone.
+            assert!(
+                text.contains("tcp://[192.168.1.2/32]:18080  recorded "),
+                "{case}: {text}"
+            );
+        } else {
+            // The one record exists, under the other project's path: PA1x
+            // launches where it cannot apply.
+            assert!(
+                text.contains("(1 allowance(s))"),
+                "{case}: the seed is missing, so this negative case proves nothing: {text}"
+            );
+        }
+
+        let removed = harness_python(&work, "print(len(fixtures.remove_allowances(work)))\n");
+        assert!(
+            removed.status.success(),
+            "{case}: restore failed: {}",
+            String::from_utf8_lossy(&removed.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&removed.stdout).trim(),
+            "0",
+            "{case}: remove_allowances reported a leftover"
+        );
+        assert!(!store.exists(), "{case}: the record survived its case");
+        let left: Vec<String> = std::fs::read_dir(work.join("home/.config/agent-vm"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("allowances."))
+            .collect();
+        assert!(left.is_empty(), "{case}: the store left {left:?}");
+    }
+}

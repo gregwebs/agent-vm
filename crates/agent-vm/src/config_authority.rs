@@ -522,7 +522,7 @@ fn measure(read: &VerifiedRead) -> Result<(), Measurement> {
     }
 }
 
-fn raw_mode_u32(mode: rustix::fs::RawMode) -> u32 {
+pub(crate) fn raw_mode_u32(mode: rustix::fs::RawMode) -> u32 {
     // RawMode is u16 on macOS, u32 on Linux.
     #[allow(clippy::useless_conversion)]
     u32::from(mode)
