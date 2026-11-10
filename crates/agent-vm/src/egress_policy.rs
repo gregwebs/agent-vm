@@ -2054,17 +2054,16 @@ mod tests {
                 ),
                 &recorded,
             );
-            let mut equivalent_entries: Vec<String> = configured.iter().map(|s| (*s).into()).collect();
-            equivalent_entries.extend(recorded.iter().map(|s| (*s).into()));
-            // The equivalent launch resolves the *same* saved file and the same
-            // flags, with the recorded entries appended as `--allow-egress`
-            // entries. Resolving it any other way would compare notice lines
-            // that name a grant's *source* ("persisted grant" against
-            // "--allow-host"), which R3 does not equate.
+            let recorded_as_flags: Vec<String> = recorded.iter().map(|s| (*s).into()).collect();
+            // R3's statement, literally: the *same* saved file and the same
+            // flags, with `R` appended to `C` as `--allow-egress` entries — the
+            // CLI tier, not the user-config tier. Passing them as user entries
+            // would make the equivalent a launch whose `[network]` granted them,
+            // which is a different provenance and a different notice.
             let equivalent = resolve_saved(
                 crate::user_network::SavedGroups { internet: saved[0], lan: saved[1], host: saved[2] },
-                &equivalent_entries.iter().map(String::as_str).collect::<Vec<_>>(),
-                CliEgress { internet: flags[0], lan: flags[1], host: flags[2], allowances: &[] },
+                &configured,
+                CliEgress { internet: flags[0], lan: flags[1], host: flags[2], allowances: &recorded_as_flags },
             );
             prop_assert_eq!(every_view(&merged), every_view(&equivalent));
             prop_assert_eq!(normalised_notices(&merged), normalised_notices(&equivalent));

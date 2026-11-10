@@ -1698,6 +1698,18 @@ def remove_allowances(work: Path) -> list[str]:
     return failures
 
 
+def final_cleanup(work: Path) -> list[str]:
+    """The run's last cleanup; called from `orchestrate`'s outer `finally`.
+
+    A case removes its own record before it is scored, but an exception between a
+    PA case's seed and that removal would otherwise leave the file in
+    `work/home` — for a later case in this run to inherit, or for the operator to
+    find. This is what makes the lifecycle survive it: the record is removed
+    even when nothing after the seed runs.
+    """
+    return remove_credentials(work) + remove_allowances(work)
+
+
 def verified_archive(assets: Path) -> Path:
     manifest = repo_root() / "crates/agent-vm/tests/fixtures/standard-release/release.json"
     if (assets / "release.json").read_bytes() != manifest.read_bytes():
@@ -2349,7 +2361,7 @@ def orchestrate(args) -> int:
         print(f"harness: {error}", file=sys.stderr)
     finally:
         cleanup_errors = cleanup_run(work, args.binary, launches, fixture)
-        cleanup_errors.extend(remove_credentials(work))
+        cleanup_errors.extend(final_cleanup(work))
         observed_cases = {(r["case"].case, r["case"].variant) for r in results}
         for case in selected_cases(args.smoke):
             if (case.case, case.variant) not in observed_cases:

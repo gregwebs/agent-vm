@@ -2,6 +2,7 @@
 """Host-only owned-launch/command controls. No VM or native egress evidence."""
 import hashlib
 import importlib.util
+import inspect
 import json
 import os
 from pathlib import Path
@@ -257,6 +258,52 @@ class Contracts(unittest.TestCase):
             self.assertTrue(egress.allowance_present(self.work))
             self.assertEqual(len(egress.remove_allowances(self.work)), 1)
             egress.allowance_store(self.work).unlink()
+
+    def test_orchestrate_runs_the_allowance_lifecycle(self):
+        """The *call sites*, not only the helpers.
+
+        `orchestrate` is a whole boot harness, so a boot-free test cannot run its
+        body: what it can prove is that the steps it must perform are the ones it
+        calls — the same shape as the print-plan inventory and the shell guard
+        rail, which are source checks for exactly this reason — and that the
+        run's final cleanup removes a record left by a case that then raised.
+        `egress-mutations.py` carries rows that delete each call to prove this
+        test bites.
+        """
+        source = inspect.getsource(egress.orchestrate)
+        for fragment in (
+            # The seed step, with its guard: `seed_failures.extend(...)` in the
+            # abort branch must not stand in for it.
+            ("if case.case in ALLOWANCE_CASES:\n"
+             "                seed_failures = prepare_allowance(work, case, args.lan)"),
+            # The per-case restore, likewise with its guard.
+            ("if case.case in ALLOWANCE_CASES:\n"
+             "                failures.extend(remove_allowances(work))"),
+            # The run's last cleanup, which is what survives an exception.
+            "cleanup_errors.extend(final_cleanup(work))",
+        ):
+            self.assertIn(fragment, source, f"orchestrate no longer runs: {fragment}")
+
+        case = egress.Case("PA1")
+        (self.work / "proj").mkdir(exist_ok=True)
+        # A case that raises between its seed and its own removal: the final
+        # cleanup still removes the record.
+        self.assertEqual(egress.prepare_allowance(self.work, case, "192.168.1.2"), [])
+        try:
+            raise RuntimeError("a case aborts between its seed and its removal")
+        except RuntimeError:
+            pass
+        finally:
+            self.assertEqual(egress.final_cleanup(self.work), [])
+        self.assertFalse(egress.allowance_present(self.work))
+        # And a lock a case left behind is reported, not swallowed.
+        self.assertEqual(egress.prepare_allowance(self.work, case, "192.168.1.2"), [])
+        lock = egress.allowance_store(self.work).parent / "allowances.lock"
+        lock.write_text("")
+        failures = egress.final_cleanup(self.work)
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("allowances.lock", failures[0])
+        lock.unlink()
 
     def test_required_calibrations_and_links(self):
         # Independent endpoint/protocol inventory: deleting a calibration must
