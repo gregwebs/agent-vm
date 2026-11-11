@@ -20,13 +20,68 @@ use crate::session::ProjectSession;
 const WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 
 #[derive(ClapArgs)]
+// A report flag beside a verb would be accepted, validated and then dropped: the
+// verbs have their own `--session`, and `--all` means nothing to them (C1). clap
+// refuses the mix instead, with `unexpected argument`.
+#[command(args_conflicts_with_subcommands = true)]
 pub(crate) struct Args {
+    #[command(subcommand)]
+    pub(crate) command: Option<AccessSubcommand>,
     /// Show one session: a live or logged 8-hex session ID
     #[arg(long, value_name = "ID")]
     pub(crate) session: Option<String>,
     /// Show every retained entry, not only the last 24 hours
     #[arg(long)]
     pub(crate) all: bool,
+}
+
+/// `agent-vm access allow|allowances|revoke`.
+///
+/// There is deliberately no `--all-sessions` flag anywhere: every live change is
+/// target-only (D2/D4), and clap refuses one with `unexpected argument`.
+#[derive(clap::Subcommand)]
+pub(crate) enum AccessSubcommand {
+    /// Allow one refused destination in one session (and, with --project, in
+    /// this project from now on)
+    Allow(AllowArgs),
+    /// List recorded project allowances and live session allowances
+    Allowances(AllowancesArgs),
+    /// Revoke an allowance from this session and/or this project
+    Revoke(RevokeArgs),
+}
+
+#[derive(ClapArgs)]
+pub(crate) struct AllowArgs {
+    /// The refusal ID shown in the ID column
+    pub(crate) id: String,
+    /// Also record it for this project, so the next launch starts with it
+    #[arg(long)]
+    pub(crate) project: bool,
+    /// Which session: the only way to choose when the ID alone is ambiguous
+    #[arg(long, value_name = "ID")]
+    pub(crate) session: Option<String>,
+}
+
+#[derive(ClapArgs)]
+pub(crate) struct AllowancesArgs {
+    /// Show only this session's allowances
+    #[arg(long, value_name = "ID")]
+    pub(crate) session: Option<String>,
+}
+
+#[derive(ClapArgs)]
+pub(crate) struct RevokeArgs {
+    /// The allowance to revoke, spelled as agent-vm records it
+    pub(crate) destination: String,
+    /// Remove only the project record
+    #[arg(long, conflicts_with = "session_only")]
+    pub(crate) project: bool,
+    /// Remove only this session's in-memory allowance
+    #[arg(long)]
+    pub(crate) session_only: bool,
+    /// Which session, when more than one is active
+    #[arg(long, value_name = "ID")]
+    pub(crate) session: Option<String>,
 }
 
 /// Run the command, returning the process status.
@@ -57,6 +112,7 @@ pub(crate) fn run(args: Args) -> Result<i32> {
     let mut err = std::io::stderr();
     runtime.block_on(run_in(
         dir.as_ref(),
+        &project,
         &args,
         &allowances,
         crate::refusal::feed::now_ms(),
@@ -68,6 +124,7 @@ pub(crate) fn run(args: Args) -> Result<i32> {
 /// The command's whole decision, with its clock and its sinks injected.
 pub(crate) async fn run_in(
     dir: Option<&SessionsDir>,
+    project: &crate::project::ProjectDir,
     args: &Args,
     allowances: &crate::allowances::ProjectView,
     now_ms: i64,
@@ -87,6 +144,7 @@ pub(crate) async fn run_in(
             live: Vec::new(),
             logged: Vec::new(),
             unresponsive: Vec::new(),
+            live_allowances: Vec::new(),
             evicted_sessions: 0,
             warnings: Vec::new(),
         },
@@ -129,6 +187,18 @@ pub(crate) async fn run_in(
             snapshot: snapshot.clone(),
             label,
         });
+    }
+    match &args.command {
+        Some(AccessSubcommand::Allow(allow)) => {
+            return run_allow(dir, project, allowances, &sessions, allow, out, err).await;
+        }
+        Some(AccessSubcommand::Allowances(list)) => {
+            return run_allowances(allowances, &discovery, &sessions, list, out, err);
+        }
+        Some(AccessSubcommand::Revoke(revoke)) => {
+            return run_revoke(dir, project, allowances, &sessions, revoke, out, err).await;
+        }
+        None => {}
     }
     if let Some(wanted) = &wanted {
         if !sessions.iter().any(|row| row.snapshot.info.id == *wanted) {
@@ -178,7 +248,13 @@ pub(crate) async fn run_in(
         print_footers(out, &sessions, &discovery, args, older)?;
         return Ok(0);
     }
-    print_table(out, &entries, allowances)?;
+    let live: std::collections::BTreeMap<String, crate::allowances::SessionAllowancesSnapshot> =
+        discovery
+            .live_allowances
+            .iter()
+            .map(|(id, snapshot)| (id.as_str().to_owned(), snapshot.clone()))
+            .collect();
+    print_table(out, &entries, allowances, &live)?;
     print_footers(out, &sessions, &discovery, args, older)?;
     Ok(0)
 }
@@ -229,6 +305,7 @@ fn print_table(
     out: &mut impl std::io::Write,
     entries: &[(Row, RefusalEntry)],
     allowances: &crate::allowances::ProjectView,
+    live: &std::collections::BTreeMap<String, crate::allowances::SessionAllowancesSnapshot>,
 ) -> Result<()> {
     let rows: Vec<[String; 7]> = entries
         .iter()
@@ -240,7 +317,7 @@ fn print_table(
                 entry.count.to_string(),
                 last_seen(entry.last_ms),
                 row.label.to_owned(),
-                action(entry, allowances),
+                action(entry, allowances, live.get(row.snapshot.info.id.as_str())),
             ]
         })
         .collect();
@@ -370,15 +447,70 @@ fn last_seen(ms: i64) -> String {
     crate::allowances::recorded_at(ms)
 }
 
-/// §5's ACTION column: why nothing can be done, or which record names this
-/// destination.
+/// ADR-0066 §5's demoted sentence, written once.
 ///
-/// A covered row never claims the session applied the record. "Recorded" is a
-/// fact about a file; "applied" is a fact about a runtime, and this command
-/// cannot see the session that made the refusal (ADR-0065 P5).
-fn action(entry: &RefusalEntry, allowances: &crate::allowances::ProjectView) -> String {
-    use crate::allowances::Coverage;
-    match allowances.allowances().covers(entry) {
+/// It is a contract, not a string: a `--project` grant the runtime applied and the
+/// store could not record must read the same way in the immediate reply and in
+/// every later `access` row, and no copy may quietly drop the "not recorded" fact.
+/// Five copies of it were how the drift started (C-M1).
+fn demoted_sentence(destination: &str, recorded_ms: i64, revision: u64, error: &str) -> String {
+    format!(
+        "applied session allowance {} ({}); applied to this session only (rev {revision}), not recorded for the project: {}",
+        escape(destination),
+        last_seen(recorded_ms),
+        escape(error)
+    )
+}
+
+/// One live entry's STATUS cell, in the same words as [`demoted_sentence`].
+fn live_status(item: &crate::allowances::WireAllowance) -> String {
+    match (item.revision, &item.not_recorded_error) {
+        (Some(revision), Some(error)) => format!(
+            "applied to this session only (rev {revision}), not recorded for the project: {}",
+            escape(error)
+        ),
+        (Some(revision), None) => format!("applied (rev {revision})"),
+        (None, _) => "accepted; applied when the session finishes starting".to_owned(),
+    }
+}
+
+/// §5's ACTION column: why nothing can be done, or which allowance names this
+/// destination and whether this session confirmed it.
+///
+/// "Recorded" is a fact about a file; "applied" is a fact about a runtime. The
+/// live allowance snapshot is the only evidence for the second, so a row with no
+/// snapshot never claims it (ADR-0065 P5).
+fn action(
+    entry: &RefusalEntry,
+    allowances: &crate::allowances::ProjectView,
+    live: Option<&crate::allowances::SessionAllowancesSnapshot>,
+) -> String {
+    use crate::allowances::{AllowanceScope, Coverage};
+    match allowances.covers_in_session(entry, live) {
+        Some(Coverage::Applied {
+            scope,
+            destination,
+            recorded_ms,
+            revision,
+            not_recorded_error: None,
+        }) => format!(
+            "applied {} allowance {} ({}); allowed in this session (rev {revision})",
+            match scope {
+                AllowanceScope::Session => "session",
+                AllowanceScope::Project => "project",
+            },
+            escape(&destination.to_string()),
+            last_seen(recorded_ms),
+        ),
+        // A `--project` grant the runtime applied but the store could not record:
+        // it is in force, and the row must never say it was recorded (Ruling 2).
+        Some(Coverage::Applied {
+            destination,
+            recorded_ms,
+            revision,
+            not_recorded_error: Some(error),
+            ..
+        }) => demoted_sentence(&destination.to_string(), recorded_ms, revision, &error),
         Some(Coverage::Recorded(record)) => format!(
             "recorded project allowance {} ({}); not confirmed for this session",
             escape(&record.destination().to_string()),
@@ -465,5 +597,832 @@ fn print_footers(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// `access allow`, `access allowances`, `access revoke` (PR 2)
+// ---------------------------------------------------------------------------
+
+/// One sibling line: every other session in the project, with its state, and the
+/// fact that a live change is target-only (D2, AC8).
+fn sibling_line(
+    before: bool,
+    sessions: &[Row],
+    target: Option<&SessionId>,
+    action: &str,
+) -> Option<String> {
+    let siblings: Vec<String> = sessions
+        .iter()
+        .filter(|row| target.is_none_or(|target| row.snapshot.info.id != *target))
+        .map(|row| format!("{} ({})", escape(row.snapshot.info.id.as_str()), row.label))
+        .collect();
+    if siblings.is_empty() {
+        return None;
+    }
+    let listed = siblings.join(", ");
+    Some(if before {
+        format!("sibling sessions (not targeted; unchanged until relaunch): {listed}")
+    } else {
+        format!("sibling sessions still unchanged until relaunch ({action}): {listed}")
+    })
+}
+
+fn print_siblings_before(
+    out: &mut impl std::io::Write,
+    sessions: &[Row],
+    target: Option<&SessionId>,
+) -> Result<()> {
+    if let Some(line) = sibling_line(true, sessions, target, "") {
+        writeln!(out, "{line}").context("writing the sibling line")?;
+    }
+    Ok(())
+}
+
+fn print_siblings_after(
+    out: &mut impl std::io::Write,
+    sessions: &[Row],
+    target: Option<&SessionId>,
+    action: &str,
+) -> Result<()> {
+    if let Some(line) = sibling_line(false, sessions, target, action) {
+        writeln!(out, "{line}").context("writing the sibling line")?;
+    }
+    Ok(())
+}
+
+/// The socket path for one session, when the sessions directory exists.
+fn socket_of(dir: Option<&SessionsDir>, id: &SessionId) -> Option<std::path::PathBuf> {
+    dir.map(|dir| dir.socket_path(id))
+}
+
+fn describe_session(id: &SessionId, label: &str) -> String {
+    format!("session {} ({label})", escape(id.as_str()))
+}
+
+/// `(policy revision N)`, or nothing at all when no policy change was made.
+///
+/// A revoke of an entry that was never in force calls no runtime, so it has no
+/// revision to report; claiming one is the overstatement A-m01 names.
+fn revision_clause(revision: Option<u64>) -> String {
+    revision
+        .map(|revision| format!(" (policy revision {revision})"))
+        .unwrap_or_default()
+}
+
+/// `agent-vm access allow <ID> [--project]`.
+async fn run_allow(
+    dir: Option<&SessionsDir>,
+    project: &crate::project::ProjectDir,
+    allowances: &crate::allowances::ProjectView,
+    sessions: &[Row],
+    args: &AllowArgs,
+    out: &mut impl std::io::Write,
+    err: &mut impl std::io::Write,
+) -> Result<i32> {
+    // Every entry, no window: the moment a user needs to allow something is
+    // exactly the moment its refusal may be older than 24 hours (m2).
+    let found = sessions.iter().find_map(|row| {
+        row.snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.id == args.id)
+            .map(|entry| (row.clone(), entry.clone()))
+    });
+    let Some((row, entry)) = found else {
+        writeln!(
+            err,
+            "no refusal {} in this project's running sessions or refusal log",
+            escape(&args.id)
+        )
+        .context("writing the unknown-refusal message")?;
+        return Ok(1);
+    };
+    if let Some(wanted) = &args.session
+        && wanted != row.snapshot.info.id.as_str()
+    {
+        writeln!(
+            err,
+            "refusal {} belongs to {}, not to --session {}",
+            escape(&args.id),
+            escape(row.snapshot.info.id.as_str()),
+            escape(wanted)
+        )
+        .context("writing the session mismatch")?;
+        return Ok(1);
+    }
+    let destination = match crate::allowances::grantable_destination(&entry) {
+        Ok(destination) => destination,
+        Err(reason) => {
+            writeln!(
+                err,
+                "cannot allow {}: {}",
+                escape(&args.id),
+                escape(&reason.line())
+            )
+            .context("writing the refusal reason")?;
+            return Ok(1);
+        }
+    };
+    let scope = if args.project {
+        crate::allowances::GrantScope::Project
+    } else {
+        crate::allowances::GrantScope::Session
+    };
+    let id = row.snapshot.info.id.clone();
+    print_siblings_before(out, sessions, Some(&id))?;
+    let now_ms = crate::refusal::feed::now_ms();
+    let spelled = destination.to_string();
+
+    let code = match row.label {
+        "running" => match socket_of(dir, &id) {
+            Some(path) => match crate::session_control::grant(&path, Some(&spelled), scope).await {
+                Ok(result) => report_grant(out, err, &id, scope, result)?,
+                Err(error) => {
+                    writeln!(
+                        err,
+                        "could not reach {}: {}; nothing was recorded",
+                        describe_session(&id, row.label),
+                        escape(&format!("{error:#}"))
+                    )
+                    .context("writing the socket failure")?;
+                    1
+                }
+            },
+            None => {
+                writeln!(
+                    err,
+                    "{} has no control socket; nothing was recorded",
+                    describe_session(&id, row.label)
+                )
+                .context("writing the no-socket message")?;
+                1
+            }
+        },
+        "ended" | "ended (unclean)" => {
+            if scope == crate::allowances::GrantScope::Session {
+                writeln!(
+                    err,
+                    "{} has ended, so a session-only allowance cannot be recorded; \
+                     relaunch it and allow the destination again",
+                    describe_session(&id, row.label)
+                )
+                .context("writing the ended-session refusal")?;
+                1
+            } else {
+                match allowances.record_async(project, &destination, now_ms).await {
+                    Ok(record) => {
+                        writeln!(
+                            out,
+                            "recorded project allowance {} ({}); the next launch of this project applies it",
+                            escape(&record.destination().to_string()),
+                            last_seen(record.recorded_ms())
+                        )
+                        .context("writing the recorded allowance")?;
+                        0
+                    }
+                    Err(error) => {
+                        writeln!(
+                            err,
+                            "could not record the project allowance: {}",
+                            escape(&error.to_string())
+                        )
+                        .context("writing the store failure")?;
+                        1
+                    }
+                }
+            }
+        }
+        _ => {
+            // `not responding`, `running (no control socket)`: a live session
+            // that cannot confirm must not be reported as if it had.
+            writeln!(
+                err,
+                "{} cannot confirm a live change; nothing was recorded. Relaunch the session \
+                 and allow the destination again",
+                describe_session(&id, row.label)
+            )
+            .context("writing the unresponsive-session message")?;
+            1
+        }
+    };
+    print_siblings_after(
+        out,
+        sessions,
+        Some(&id),
+        if scope == crate::allowances::GrantScope::Session {
+            "running siblings keep refusing until relaunched"
+        } else {
+            "running siblings keep refusing until relaunched; the record reaches them then"
+        },
+    )?;
+    Ok(code)
+}
+
+/// One `GrantResult`, in the user's words, with its exit status.
+fn report_grant(
+    out: &mut impl std::io::Write,
+    err: &mut impl std::io::Write,
+    id: &SessionId,
+    scope: crate::allowances::GrantScope,
+    result: crate::allowances::GrantResult,
+) -> Result<i32> {
+    use crate::allowances::{GrantRefusalReason, GrantResult, NextLaunchReason};
+    match result {
+        GrantResult::Applied {
+            destination,
+            revision,
+            recorded_ms,
+            ..
+        } => {
+            let destination = escape(&destination);
+            match scope {
+                crate::allowances::GrantScope::Session => writeln!(
+                    out,
+                    "allowed {destination} for {} (policy revision {revision})",
+                    describe_session(id, "running")
+                ),
+                crate::allowances::GrantScope::Project => writeln!(
+                    out,
+                    "allowed {destination} for {} (policy revision {revision}) and recorded for this project ({})",
+                    describe_session(id, "running"),
+                    last_seen(recorded_ms)
+                ),
+            }
+            .context("writing the grant reply")?;
+            Ok(0)
+        }
+        GrantResult::AppliedNotRecorded {
+            destination,
+            revision,
+            recorded_ms,
+            message,
+        } => {
+            writeln!(
+                err,
+                "{}",
+                demoted_sentence(&destination, recorded_ms, revision, &message)
+            )
+            .context("writing the demoted grant")?;
+            Ok(1)
+        }
+        GrantResult::NextLaunch {
+            destination,
+            recorded_ms,
+            reason,
+        } => {
+            let destination = escape(&destination);
+            let why = match reason {
+                NextLaunchReason::RuntimeUnsupported => {
+                    "this runtime cannot replace its network policy while it runs"
+                }
+                NextLaunchReason::InterceptedPortsFixedAtLaunch => {
+                    "TLS-intercepted ports are fixed at launch, so this allowance applies at the next launch"
+                }
+            };
+            writeln!(
+                out,
+                "recorded {destination} for this project ({}); {why}",
+                last_seen(recorded_ms)
+            )
+            .context("writing the next-launch sentence")?;
+            Ok(0)
+        }
+        GrantResult::QueuedForBoot {
+            destination, scope, ..
+        } => {
+            // Conditional on purpose: the flush may still fail, and then the
+            // session says so (Ruling 3, N3).
+            let destination = escape(&destination);
+            match scope {
+                crate::allowances::GrantScope::Session => writeln!(
+                    out,
+                    "accepted {destination} for this session; applied when the session finishes starting — confirm with `agent-vm access allowances`"
+                ),
+                crate::allowances::GrantScope::Project => writeln!(
+                    out,
+                    "recorded project allowance {destination} and accepted it for this session; applied when the session finishes starting — confirm with `agent-vm access allowances`"
+                ),
+            }
+            .context("writing the queued grant")?;
+            Ok(0)
+        }
+        GrantResult::Refused { reason } => {
+            let message = match reason {
+                GrantRefusalReason::HostProxyInUse => {
+                    "a host HTTP proxy is in use, so this session cannot intercept hostnames"
+                        .to_owned()
+                }
+                GrantRefusalReason::InterceptedPortsFixedAtLaunch => {
+                    "TLS-intercepted ports are fixed at launch; relaunch with this hostname to intercept it"
+                        .to_owned()
+                }
+                GrantRefusalReason::NotAllowable { message } => message,
+                GrantRefusalReason::RuntimeFailed { message } => {
+                    format!("the runtime could not apply the change: {message}")
+                }
+                GrantRefusalReason::Store { message } => {
+                    format!("the project allowance record was not written: {message}")
+                }
+                GrantRefusalReason::Full { limit } => format!(
+                    "this session already holds {limit} live allowances, the most it can carry; revoke one first"
+                ),
+            };
+            writeln!(err, "refused: {}", escape(&message)).context("writing the grant refusal")?;
+            Ok(1)
+        }
+    }
+}
+
+/// `agent-vm access allowances [--session <SID>]`: the store's records and every
+/// live session's allowances, with each project record's per-session status.
+fn run_allowances(
+    allowances: &crate::allowances::ProjectView,
+    discovery: &crate::session_control::Discovery,
+    sessions: &[Row],
+    args: &AllowancesArgs,
+    out: &mut impl std::io::Write,
+    err: &mut impl std::io::Write,
+) -> Result<i32> {
+    let live = &discovery.live_allowances;
+    let wanted = args.session.as_deref();
+    // A session with an ID this command cannot parse is a real error.
+    if let Some(text) = wanted
+        && SessionId::parse(text).is_none()
+    {
+        writeln!(err, "`--session` takes an 8-hex session ID")
+            .context("writing the argument error")?;
+        return Ok(1);
+    }
+    // One stderr line per session that cannot answer, so a missing row is
+    // explained rather than silently absent (AC9).
+    for id in &discovery.unresponsive {
+        writeln!(
+            err,
+            "warning: session {} is not responding; its live allowances are not shown",
+            escape(id.as_str())
+        )
+        .context("writing the unresponsive warning")?;
+    }
+    for row in sessions {
+        if row.label == "running (no control socket)" {
+            writeln!(
+                err,
+                "warning: session {} has no control socket; its live allowances are not shown",
+                escape(row.snapshot.info.id.as_str())
+            )
+            .context("writing the no-socket warning")?;
+        }
+    }
+
+    let mut rows: Vec<[String; 5]> = Vec::new();
+    let records: Vec<&crate::allowances::ProjectAllowance> =
+        allowances.allowances().entries().iter().collect();
+    let active: Vec<(String, &crate::allowances::SessionAllowancesSnapshot)> = live
+        .iter()
+        .filter(|(id, _)| wanted.is_none_or(|wanted| wanted == id.as_str()))
+        .map(|(id, snapshot)| (id.as_str().to_owned(), snapshot))
+        .collect();
+    // AC9: a session that cannot answer is named in the STATUS cell too, so a row
+    // that reads "not in force" says whether that is a session that has not
+    // adopted it or one this command could not ask. The naming is **per session**
+    // and obeys `--session`: a silence belongs to the session that could not
+    // answer, and lending it to another session's row made that row claim a
+    // session it never asked (D1).
+    let mut silent: Vec<(String, &'static str)> = discovery
+        .unresponsive
+        .iter()
+        .map(|id| (id.as_str().to_owned(), "not responding"))
+        .collect();
+    for row in sessions {
+        if row.label == "running (no control socket)" {
+            silent.push((
+                row.snapshot.info.id.as_str().to_owned(),
+                "has no control socket",
+            ));
+        }
+    }
+    silent.retain(|(id, _)| wanted.is_none_or(|wanted| wanted == id));
+    for record in &records {
+        let destination = record.destination().to_string();
+        // "Not in force" is a fact about a session that answered. With no session
+        // to ask, the row for each of them says so instead of guessing.
+        if active.is_empty() && silent.is_empty() {
+            rows.push([
+                "project".to_owned(),
+                escape(&destination),
+                last_seen(record.recorded_ms()),
+                "-".to_owned(),
+                "not in force until relaunch".to_owned(),
+            ]);
+            continue;
+        }
+        for (id, snapshot) in &active {
+            let applied = snapshot
+                .project
+                .iter()
+                .find(|item| item.destination == destination);
+            let status = match applied {
+                Some(item) => live_status(item),
+                None => "not in force until relaunch".to_owned(),
+            };
+            rows.push([
+                "project".to_owned(),
+                escape(&destination),
+                last_seen(record.recorded_ms()),
+                escape(id),
+                status,
+            ]);
+        }
+    }
+    // A live project entry the store read did not list (a record written by a
+    // launcher after this command read the file) is still a live allowance, so
+    // it is one row rather than a silently missing one.
+    let known: Vec<String> = records
+        .iter()
+        .map(|record| record.destination().to_string())
+        .collect();
+    for (id, snapshot) in &active {
+        for item in &snapshot.project {
+            if known
+                .iter()
+                .any(|destination| destination == &item.destination)
+            {
+                continue;
+            }
+            let status = live_status(item);
+            rows.push([
+                "project".to_owned(),
+                escape(&item.destination),
+                last_seen(item.granted_ms),
+                escape(id),
+                status,
+            ]);
+        }
+    }
+
+    // Session-only rows (including a demoted `--project` grant, which lives in
+    // the session table and says why it is not recorded).
+    for (id, snapshot) in &active {
+        for item in &snapshot.session {
+            let status = live_status(item);
+            rows.push([
+                "session".to_owned(),
+                escape(&item.destination),
+                last_seen(item.granted_ms),
+                escape(id),
+                status,
+            ]);
+        }
+    }
+
+    // One row per (record, session that could not be asked): AC9 asks for the
+    // session to be named *in STATUS*, and this is the only attribution that is
+    // both true and per session — the row's own cell names the row's own session.
+    for (id, state) in &silent {
+        for record in &records {
+            rows.push([
+                "project".to_owned(),
+                escape(&record.destination().to_string()),
+                last_seen(record.recorded_ms()),
+                escape(id),
+                format!("not shown: session {id} {state}"),
+            ]);
+        }
+    }
+
+    if rows.is_empty() {
+        writeln!(out, "No allowances.").context("writing the empty listing")?;
+        return Ok(0);
+    }
+    let headers = ["SCOPE", "DESTINATION", "RECORDED", "SESSION", "STATUS"];
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
+    for row in &rows {
+        for (index, cell) in row.iter().enumerate() {
+            widths[index] = widths[index].max(cell.chars().count());
+        }
+    }
+    let render = |cells: &[String]| -> String {
+        let mut line = String::new();
+        for (index, cell) in cells.iter().enumerate() {
+            if index + 1 == cells.len() {
+                line.push_str(cell);
+            } else {
+                line.push_str(&format!("{:<width$}  ", cell, width = widths[index]));
+            }
+        }
+        line.trim_end().to_owned()
+    };
+    let header_cells: Vec<String> = headers.iter().map(|h| (*h).to_owned()).collect();
+    writeln!(out, "{}", render(&header_cells)).context("writing the allowance header")?;
+    for row in &rows {
+        writeln!(out, "{}", render(row)).context("writing an allowance row")?;
+    }
+    Ok(0)
+}
+
+/// `agent-vm access revoke <DEST> [--project | --session-only] [--session <SID>]`.
+async fn run_revoke(
+    dir: Option<&SessionsDir>,
+    project: &crate::project::ProjectDir,
+    allowances: &crate::allowances::ProjectView,
+    sessions: &[Row],
+    args: &RevokeArgs,
+    out: &mut impl std::io::Write,
+    err: &mut impl std::io::Write,
+) -> Result<i32> {
+    use crate::allowances::RevokeScope;
+    let Ok(destination) = crate::egress_policy::Allowance::parse(&args.destination) else {
+        writeln!(
+            err,
+            "`{}` is not an allowance spelling",
+            escape(&args.destination)
+        )
+        .context("writing the destination error")?;
+        return Ok(1);
+    };
+    let scope = if args.project {
+        RevokeScope::Project
+    } else if args.session_only {
+        RevokeScope::Session
+    } else {
+        RevokeScope::All
+    };
+
+    // The record is deleted **before** a target can be chosen, so an ambiguous
+    // target or a session that cannot confirm cannot keep a durable grant the
+    // user asked to remove (R10, V7).
+    let mut removed = false;
+    if matches!(scope, RevokeScope::Project | RevokeScope::All) {
+        match allowances
+            .forget_async(&crate::image_pin::ProjectId::of(project), &destination)
+            .await
+        {
+            Ok(was_removed) => removed = was_removed,
+            Err(error) => {
+                writeln!(
+                    err,
+                    "could not delete the project record: {}",
+                    escape(&error.to_string())
+                )
+                .context("writing the store failure")?;
+                return Ok(1);
+            }
+        }
+    }
+
+    // The target: the named session, or the one active session, or none.
+    let active: Vec<&Row> = sessions
+        .iter()
+        .filter(|row| {
+            matches!(
+                row.label,
+                "running" | "not responding" | "running (no control socket)"
+            )
+        })
+        .collect();
+    // R11: the sibling line names every other session *before* the change, and it
+    // does not depend on which session is the target — so it is printed before
+    // target selection, which is what the offline path (no active session, only
+    // ended siblings) was missing.
+    let select_record_note = |removed: bool| -> &'static str {
+        match scope {
+            RevokeScope::Session => "",
+            _ if removed => " (the project record was deleted)",
+            _ => " (no project record named it)",
+        }
+    };
+    let target: Option<Row> = match &args.session {
+        Some(text) => match sessions
+            .iter()
+            .find(|row| row.snapshot.info.id.as_str() == text)
+        {
+            Some(row) => Some(row.clone()),
+            None => {
+                print_siblings_before(out, sessions, None)?;
+                writeln!(
+                    err,
+                    "no session {} in this project's running sessions or refusal log{}",
+                    escape(text),
+                    select_record_note(removed)
+                )
+                .context("writing the unknown-session message")?;
+                return Ok(1);
+            }
+        },
+        None if active.len() > 1 => {
+            let named: Vec<String> = active
+                .iter()
+                .map(|row| format!("{} ({})", escape(row.snapshot.info.id.as_str()), row.label))
+                .collect();
+            print_siblings_before(out, sessions, None)?;
+            writeln!(
+                err,
+                "more than one session is active: {}; name one with --session <ID> or stop the others{}",
+                named.join(", "),
+                select_record_note(removed)
+            )
+            .context("writing the ambiguous-target message")?;
+            return Ok(1);
+        }
+        None => active.first().map(|row| (*row).clone()),
+    };
+
+    let target_id = target.as_ref().map(|row| row.snapshot.info.id.clone());
+    print_siblings_before(out, sessions, target_id.as_ref())?;
+
+    let Some(target) = target else {
+        let spelled = escape(&destination.to_string());
+        // The offline answer depends on the scope, because the scopes touch
+        // different things: `--project`/default delete the record, and
+        // `--session-only` never does. Reporting "no record for … the next launch
+        // starts without it" for a `--session-only` revoke claimed a deletion that
+        // did not happen while the record was still on disk and `access` still
+        // rendered it (D2).
+        //
+        // Exit `0` in both cases: for `--project`/default the record is gone, and
+        // for `--session-only` the postcondition the user asked for (no session
+        // holds the allowance) holds trivially with no session running — the same
+        // answer a live session gets for a destination it does not hold. A
+        // non-zero status would tell a script the revoke failed when nothing
+        // failed, and the sentence below says exactly what did and did not change.
+        match scope {
+            RevokeScope::Session => writeln!(
+                out,
+                "no session is active, so {spelled} was not revoked from any session; \
+                 the project record for this project is unchanged"
+            )
+            .context("writing the offline session-only revoke")?,
+            RevokeScope::Project | RevokeScope::All => writeln!(
+                out,
+                "{} {} for this project; no session is active, so the next launch starts without it",
+                if removed { "deleted" } else { "no record for" },
+                spelled
+            )
+            .context("writing the offline revoke")?,
+        }
+        print_siblings_after(out, sessions, None, "no running session was changed")?;
+        return Ok(0);
+    };
+    let id = target.snapshot.info.id.clone();
+    let code;
+    match target.label {
+        "running" => match socket_of(dir, &id) {
+            Some(path) => {
+                match crate::session_control::revoke(&path, &destination.to_string(), scope).await {
+                    Ok(result) => code = report_revoke(out, err, &id, removed, result)?,
+                    Err(error) => {
+                        let record = if removed {
+                            "the project record was deleted, "
+                        } else {
+                            ""
+                        };
+                        writeln!(
+                        err,
+                        "could not reach {}: {}; {record}the session's in-memory allowances are unchanged. Stopping the session is the guaranteed hard cut",
+                        describe_session(&id, target.label),
+                        escape(&format!("{error:#}")),
+                    )
+                    .context("writing the socket failure")?;
+                        code = 1;
+                    }
+                }
+            }
+            None => {
+                let record = if removed {
+                    "the project record was deleted, "
+                } else {
+                    ""
+                };
+                writeln!(
+                    err,
+                    "{} has no control socket; {record}the session's in-memory allowances are unchanged. Stopping the session is the guaranteed hard cut",
+                    describe_session(&id, target.label)
+                )
+                .context("writing the no-socket message")?;
+                code = 1;
+            }
+        },
+        _ => {
+            let record = if removed {
+                "the project record was deleted, "
+            } else {
+                ""
+            };
+            writeln!(
+                err,
+                "{} cannot confirm a live revoke; {record}the session's in-memory allowances are unchanged. Stopping the session is the guaranteed hard cut",
+                describe_session(&id, target.label)
+            )
+            .context("writing the unconfirmed message")?;
+            code = 1;
+        }
+    }
+    print_siblings_after(
+        out,
+        sessions,
+        Some(&id),
+        "running siblings keep allowing it until relaunched",
+    )?;
+    Ok(code)
+}
+
+/// One `RevokeResult`, in the user's words, with its exit status.
+fn report_revoke(
+    out: &mut impl std::io::Write,
+    err: &mut impl std::io::Write,
+    id: &SessionId,
+    removed: bool,
+    result: crate::allowances::RevokeResult,
+) -> Result<i32> {
+    use crate::allowances::RevokeResult;
+    match result {
+        RevokeResult::Revoked {
+            destination,
+            revision,
+            still_effective,
+            ..
+        } => {
+            let destination = escape(&destination);
+            writeln!(
+                out,
+                "revoked {destination} for {}{}{}",
+                describe_session(id, "running"),
+                revision_clause(revision),
+                if removed {
+                    "; the project record was deleted"
+                } else {
+                    ""
+                }
+            )
+            .context("writing the revoke reply")?;
+            if still_effective {
+                writeln!(
+                    out,
+                    "{destination} is still in force from this launch's own --allow-egress or the other scope"
+                )
+                .context("writing the still-effective note")?;
+            }
+            Ok(0)
+        }
+        RevokeResult::NotInSession {
+            destination,
+            scope,
+            revision,
+            still_effective,
+        } => {
+            let destination = escape(&destination);
+            // Not "not in force": the tables hold no allowance for it, but this
+            // launch's own authority may well still allow it, and no runtime call
+            // happened, so nothing is "confirmed" (B01).
+            writeln!(
+                out,
+                "{destination} is not a{} allowance of {}{}{}",
+                match scope {
+                    crate::allowances::RevokeScope::Session => " session",
+                    crate::allowances::RevokeScope::Project => " project",
+                    crate::allowances::RevokeScope::All => " session or project",
+                },
+                describe_session(id, "running"),
+                revision_clause(revision),
+                if removed {
+                    "; the project record was deleted"
+                } else {
+                    ""
+                }
+            )
+            .context("writing the not-in-session reply")?;
+            if still_effective {
+                writeln!(
+                    out,
+                    "{destination} is still allowed by this launch's own --allow-egress or [network] authority, or by the other scope"
+                )
+                .context("writing the still-effective note")?;
+            }
+            Ok(0)
+        }
+        RevokeResult::Unconfirmed {
+            destination,
+            reason,
+            ..
+        } => {
+            let destination = escape(&destination);
+            writeln!(
+                err,
+                "{} could not confirm revoking {destination}: {}{}. Stopping the session is the guaranteed hard cut",
+                describe_session(id, "running"),
+                escape(&reason.line()),
+                if removed {
+                    " (the project record was deleted)"
+                } else {
+                    ""
+                }
+            )
+            .context("writing the unconfirmed revoke")?;
+            Ok(1)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod verifier_probes;

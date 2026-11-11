@@ -1645,6 +1645,85 @@ mod tests {
         }
     }
 
+    /// AC8/D4: there is no `--all-sessions`, and clap rejects it rather than
+    /// silently ignoring a request to broadcast a live change.
+    #[test]
+    fn access_rejects_all_sessions_flag() {
+        let _env = crate::test_env::guard();
+        use clap::Parser as _;
+        for argv in [
+            vec!["agent-vm", "access", "allow", "abcdef01", "--all-sessions"],
+            vec!["agent-vm", "access", "revoke", "10.0.0.5", "--all-sessions"],
+        ] {
+            // The clap layer, because `parse_from` exits the process on a clap
+            // error (that is the released behaviour).
+            let error = Cli::try_parse_from(argv.clone())
+                .err()
+                .unwrap_or_else(|| panic!("{argv:?} must be refused"));
+            // The kind, not a substring: the offending token is quoted in every
+            // clap error, so `text.contains("--all-sessions")` would also pass for
+            // a failure that has nothing to do with the flag (C-m16).
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{argv:?}: {error}"
+            );
+        }
+    }
+
+    /// C1: the report's `--all`/`--session` beside a verb are refused, not
+    /// accepted-and-dropped.
+    ///
+    /// `access --all allow <ID>` used to parse, validate `--session` and then
+    /// return from `run_allow` without either flag being read — a request the tool
+    /// silently did not perform, on an authority verb. clap makes the two shapes
+    /// mutually exclusive, so the mix is an unknown argument.
+    #[test]
+    fn access_report_flags_conflict_with_a_subcommand() {
+        let _env = crate::test_env::guard();
+        use clap::Parser as _;
+        for argv in [
+            vec!["agent-vm", "access", "--all", "allow", "abcdef01"],
+            vec![
+                "agent-vm",
+                "access",
+                "--session",
+                "abcdef01",
+                "allow",
+                "abcdef01",
+            ],
+            vec!["agent-vm", "access", "--all", "revoke", "10.0.0.5"],
+            vec!["agent-vm", "access", "--session", "abcdef01", "allowances"],
+        ] {
+            let error = Cli::try_parse_from(argv.clone())
+                .err()
+                .unwrap_or_else(|| panic!("{argv:?} must be refused"));
+            // clap's own `ArgumentConflict` for the mutually exclusive shape.
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{argv:?}: {error}"
+            );
+        }
+        // The report itself still takes both flags, and the verbs keep their own
+        // `--session` in the subcommand position.
+        for argv in [
+            vec!["agent-vm", "access", "--all"],
+            vec!["agent-vm", "access", "--session", "abcdef01"],
+            vec![
+                "agent-vm",
+                "access",
+                "allow",
+                "abcdef01",
+                "--session",
+                "abcdef01",
+            ],
+            vec!["agent-vm", "access", "allowances", "--session", "abcdef01"],
+        ] {
+            assert!(Cli::try_parse_from(argv.clone()).is_ok(), "{argv:?}");
+        }
+    }
+
     /// A `ConfigReport` loaded from `body` in a throwaway project file. `load`
     /// reads the file eagerly, so the temp dir is gone by the time this
     /// returns.

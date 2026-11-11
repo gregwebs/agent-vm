@@ -768,6 +768,7 @@ _case_dispatch() {
             _case_preflight 0 || return "$PROBE_USAGE" ;;
     esac
     case "$case_id" in
+        PA2) _case_live_allowance "$lan" "$attempt_id"; return $? ;;
         LC1)
             _case_flow 0 tcp "$lan" 18080 lan-tcp80 || return 2
             _case_flow 0 tcp "$lan" 18081 lan-tcp81 || return 2
@@ -1054,6 +1055,70 @@ _case_refusal_feed() {
     sleep "${RF1_SLEEP:-25}"
     echo "RF1 DONE"
     return "$rc"
+}
+
+# ADR-0066 PA2: one live allowance change, observed by the guest without a
+# restart.
+#
+# The guest owns the probes; the host witness (`egress-fixtures.py`) owns the
+# `agent-vm access` work between them. They coordinate in both directions, over
+# the two things the two processes share:
+#
+#   * host -> guest: signal files in the project directory, the one host path
+#     mounted into the guest (`work / "proj"`);
+#   * guest -> host: marker lines below, in the launch log the host follows.
+#
+# Every wait is bounded, so a host command that fails costs one wait rather than
+# the harness's whole deadline. Every probe asserts its own outcome, so a signal
+# that arrives while the policy did not change fails this case instead of
+# passing it: the case's evidence is the *transition*, never the signal.
+#
+# `PA2_WAIT` is the bound in whole seconds (the host witness uses the same 120 s
+# default); `egress-probe-contract.py` drives this function with a stub probe and
+# pre-created signals, so none of the above is asserted only as prose.
+_pa2_wait() {  # FILE SECONDS
+    local file="$1" bound="$2" until
+    until=$(( $(_probe_now) + bound ))
+    while (( $(_probe_now) < until )); do
+        [[ -e "$file" ]] && return 0
+        sleep 0.2
+    done
+    [[ -e "$file" ]]
+}
+
+_case_live_allowance() {  # LAN ATTEMPT_ID
+    local lan="${1:-}" ident="${2:-}" bound="${PA2_WAIT:-120}"
+    if [[ -z "$lan" || -z "$ident" ]]; then
+        echo "PA2 FAIL usage"
+        return "$PROBE_USAGE"
+    fi
+    _case_preflight 0 || return "$PROBE_USAGE"
+    # The refused probe is the default-deny baseline the grant must change.
+    if http_get "$lan" 18080 "$ident-p1"; then
+        echo "PA2 PROBE 1 UNEXPECTEDLY ALLOWED"
+        return "$PROBE_USAGE"
+    fi
+    echo "PA2 PROBE 1 DENIED"
+    if ! _pa2_wait PA2-granted "$bound"; then
+        echo "PA2 FAIL no grant signal within ${bound}s"
+        return "$PROBE_NET"
+    fi
+    # Same address, same port, no restart: only the policy changed.
+    if ! http_get "$lan" 18080 "$ident-p2"; then
+        echo "PA2 PROBE 2 STILL DENIED"
+        return "$PROBE_USAGE"
+    fi
+    echo "PA2 PROBE 2 OK"
+    if ! _pa2_wait PA2-revoked "$bound"; then
+        echo "PA2 FAIL no revoke signal within ${bound}s"
+        return "$PROBE_NET"
+    fi
+    if http_get "$lan" 18080 "$ident-p3"; then
+        echo "PA2 PROBE 3 UNEXPECTEDLY ALLOWED"
+        return "$PROBE_USAGE"
+    fi
+    echo "PA2 PROBE 3 DENIED"
+    echo "PA2 DONE"
 }
 
 dispatch() {

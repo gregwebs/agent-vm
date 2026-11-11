@@ -153,9 +153,24 @@ pub(crate) struct HostnameAllowance {
     // Retain the fallibly parsed SDK value: rule assembly must not reparse or panic.
     domain: DomainName,
 }
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct InterceptedPorts(BTreeSet<NonZeroU16>);
 impl InterceptedPorts {
+    /// Whether every port in `candidate` is also in `launch`.
+    ///
+    /// A live policy swap may only *remove* hostnames: the netstack's TLS
+    /// listener and UDP drop are fixed at launch, so a rule on a port outside the
+    /// launch's set would name a port nothing intercepts (ADR-0065 Constraint 7).
+    /// `None` is the empty set: revoking the last hostname narrows, so it is a
+    /// subset of anything.
+    pub(crate) fn is_subset(candidate: Option<&Self>, launch: Option<&Self>) -> bool {
+        match (candidate, launch) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(candidate), Some(launch)) => candidate.0.is_subset(&launch.0),
+        }
+    }
+
     pub(crate) fn for_hostnames(hostnames: &[HostnameAllowance]) -> Option<Self> {
         if hostnames.is_empty() {
             return None;

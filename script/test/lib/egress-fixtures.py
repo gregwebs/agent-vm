@@ -384,6 +384,12 @@ CASES = (
     # ADR-0065: the same grant, written as a project allowance record instead of
     # a flag — and the same record under another project's digest.
     Case("PA1"), Case("PA1x"),
+    # ADR-0066: the same grant again, but *changed while the guest runs*: refused,
+    # allowed live with `access allow --project`, refused again after a live
+    # `access revoke`. It seeds nothing (the case creates the record itself) and
+    # the host witness in `OwnedLaunch` performs the `access` work between its
+    # probes, so it declares no probe attempts of its own.
+    Case("PA2"),
     Case("UP1", flags=("--allow-egress", "udp://[{lan}/32]:19090")),
     Case("UP2", flags=("--allow-egress", "{lan}:18080")),
     Case("CI1", flags=("--allow-egress", "tcp://[{cidr}]:18080")),
@@ -510,7 +516,7 @@ FLOW_CONTROLS = {"lan-tcp80": "LC1:ipv4:lan-tcp80", "lan-tcp81": "LC1:ipv4:lan-t
 
 
 def control_links(case: Case) -> dict[str, str]:
-    if case.case in ("NR1", "NR2", "NR3"):
+    if case.case in ("NR1", "NR2", "NR3", "PA2"):
         return {}
     links = dict(FLOW_CONTROLS)
     for label, (target_case, target_variant, target) in HOSTNAME_CONTROLS.get(
@@ -563,7 +569,7 @@ class Command:
 
 
 def expected_attempts(case: Case) -> tuple[str, ...]:
-    if case.case in ("NR1", "NR2", "NR3", "RF1"):
+    if case.case in ("NR1", "NR2", "NR3", "RF1", "PA2"):
         return ()
     if hostname_tier(case.case):
         return tuple(row[0] for row in hostname_rows(case))
@@ -598,14 +604,17 @@ def expected_attempts(case: Case) -> tuple[str, ...]:
         "V6c": ("public-v6-1111", "public-v6-1001"),
         "DNS6c": ("explicit-v6-udp", "explicit-v6-tcp"), "RB1": ("rebind-udp", "rebind-tcp"),
         # ADR-0064 RF1 asserts on the host-side refusal table, so it declares no
-        # probe attempts of its own.
+        # probe attempts of its own. PA2 does the same for the reverse reason:
+        # its evidence is the *transition* between three identical probes, checked
+        # by the host witness (`check_live_allowance`), not three more rows here.
         "RF1": (),
+        "PA2": (),
     }
     return labels[case.case]
 
 
 def attempt_expectations(case: Case) -> dict[str, str]:
-    if case.case in ("NR1", "NR2", "NR3"):
+    if case.case in ("NR1", "NR2", "NR3", "PA2"):
         return {}
     if hostname_tier(case.case):
         return {row[0]: row[2] for row in hostname_rows(case)}
@@ -818,6 +827,14 @@ def build_command(case: Case, work: Path, binary: str, lan: str, *, answer="ANSW
     if case.case in ALLOWANCE_CASES:
         setup += ("private project allowance record seeded for this case's project digest; "
                   "remove the record after the launch",)
+    if case.case == "PA2":
+        # No seed: PA2 starts from default deny and writes the record with its own
+        # live `--project` grant, which is the point of the case. What it needs is
+        # the opposite of a seed — an *absent* store and no stale signal files —
+        # and it leaves the writer's never-unlinked `allowances.lock` behind, so
+        # its cleanup is `cleanup_pa2`, not `remove_allowances`.
+        setup += ("no seed: the case records the allowance with its own live grant; "
+                  "remove the record and allowances.lock after the launch",)
     if hostname_tier(case.case):
         protocols = {row[0]: row[1] for row in hostname_rows(case)}
     else:
@@ -1122,12 +1139,137 @@ class OwnedLaunch:
         if self.launcher is not None:
             signal_identity(self.launcher, signal.SIGKILL)
 
+    def _pa2_access(self, argv, timeout: float = 60) -> tuple[int, str]:
+        """One `agent-vm access …` in the launch's own project and environment.
+
+        A separate process, exactly as the user runs it: the case's claim is about
+        the CLI reaching a *running* launcher, so an in-process call would prove
+        nothing.
+        """
+        done = subprocess.run((self.command.argv[0], *argv), env=self.command.env,
+                              cwd=self.command.cwd, stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=timeout)
+        return done.returncode, done.stdout + done.stderr
+
+    def _pa2_wait_marker(self, marker: str) -> bool:
+        deadline = time.monotonic() + PA2_WAIT_SECONDS
+        while time.monotonic() < deadline and not self.stop_observing.is_set():
+            text = self.log.read_text(errors="replace") if self.log.exists() else ""
+            if marker in text.splitlines():
+                return True
+            time.sleep(0.1)
+        return False
+
+    def _pa2_rows(self, session: str) -> dict[str, dict[str, str]]:
+        """The running row for this session's refused probe, once it exists.
+
+        The launch log and the persisted feed are separate: the refusal the guest
+        just caused is visible only after ingestion and persistence, which AC3
+        allows seconds for. Waiting here is what keeps the case about *whether* a
+        live session shows its refusals, not about the first instant it could.
+        """
+        deadline = time.monotonic() + PA2_WAIT_SECONDS
+        while True:
+            status, output = self._pa2_access(("access", "--all", "--session", session))
+            rows = refusal_feed_rows(output)
+            # The label, not the padding: the table pads to its widest cell, and
+            # the row for an answered session is the one that says `running`.
+            running = {key: row for key, row in rows.items()
+                       if f":{PA2_PROBE_PORT}" in row["line"]
+                       and re.search(r"\brunning\b", row["line"])}
+            if running or time.monotonic() >= deadline:
+                return running
+            time.sleep(0.25)
+
+    def _live_allowance_while_running(self):
+        """ADR-0066 PA2: one live grant and one live revoke, driven from the host.
+
+        The guest's three probes are the evidence that a policy change reached the
+        sandbox without a restart; everything here is what a user does with
+        `agent-vm access` while it runs. Each signal file is written whether its
+        step succeeded or not — a failure must reach the guest as a failed probe
+        (bounded, and recorded below) rather than as a stuck harness — and the
+        evidence file is always written, so `check_live_allowance` can report why.
+        """
+        evidence = {"refusal_id": "", "session": "", "destination": "",
+                    "steps": [], "failures": [], "store": ""}
+        failures = evidence["failures"]
+        project = self.work / "proj"
+        granted, revoked = (project / name for name in PA2_SIGNALS)
+
+        def record(step, status, output):
+            evidence["steps"].append({"step": step, "status": status, "output": output})
+
+        try:
+            granted.unlink(missing_ok=True)
+            revoked.unlink(missing_ok=True)
+            if not self._pa2_wait_marker(PA2_MARKERS[0]):
+                failures.append("the guest never reported its first refused probe")
+                return
+            socket_ids = sorted(path.stem for path in self.sessions_dir().glob("*.sock"))
+            if len(socket_ids) != 1:
+                failures.append(f"expected one live session socket, saw {socket_ids}")
+                return
+            session = socket_ids[0]
+            evidence["session"] = session
+            rows = self._pa2_rows(session)
+            if len(rows) != 1:
+                failures.append(f"expected one running row for the refused probe, saw {sorted(rows)}")
+                return
+            evidence["refusal_id"] = next(iter(rows))
+            status, output = self._pa2_access(("access", "allow", evidence["refusal_id"], "--project"))
+            record("allow", status, output)
+            applied = re.search(r"^allowed (\S+) for .*\(policy revision (\d+)\) and recorded for this project",
+                                output, re.M)
+            if status != 0 or applied is None:
+                failures.append(f"the live project grant was not applied: exit {status}: {output!r}")
+            else:
+                evidence["destination"] = applied.group(1)
+                evidence["grant_revision"] = int(applied.group(2))
+                store = allowance_store(self.work)
+                evidence["store"] = store.read_text() if store.exists() else ""
+            granted.touch()
+            if not self._pa2_wait_marker(PA2_MARKERS[1]):
+                failures.append("the guest's second probe was never reported allowed")
+                return
+            if not evidence["destination"]:
+                return
+            for step, argv in (("table", ("access", "--all", "--session", session)),
+                               ("allowances", ("access", "allowances", "--session", session))):
+                status, output = self._pa2_access(argv)
+                record(step, status, output)
+                expected = ("applied project allowance" if step == "table" else "applied (rev")
+                if status != 0 or expected not in output or "(rev 2)" not in output:
+                    failures.append(f"{step} does not report the applied grant at rev 2: "
+                                    f"exit {status}: {output!r}")
+            status, output = self._pa2_access(("access", "revoke", evidence["destination"]))
+            record("revoke", status, output)
+            revoked_re = re.search(r"^revoked (\S+) for .*\(policy revision (\d+)\); the project record was deleted",
+                                   output, re.M)
+            if status != 0 or revoked_re is None:
+                failures.append(f"the live revoke was not applied: exit {status}: {output!r}")
+            else:
+                evidence["revoke_revision"] = int(revoked_re.group(2))
+                store = allowance_store(self.work)
+                evidence["store_after_revoke"] = store.read_text() if store.exists() else ""
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            failures.append(f"the live allowance witness failed: {error}")
+        finally:
+            # Always release the guest, in order: a failure above must cost one
+            # failed probe, never the harness's deadline.
+            granted.touch(exist_ok=True)
+            revoked.touch(exist_ok=True)
+            (self.work / "PA2-witness.json").write_text(json.dumps(evidence, indent=1))
+
     def run(self):
         monitor = threading.Thread(target=self._monitor)
         monitor.start()
         witness = None
         if self.command.case == "RF1":
             witness = threading.Thread(target=self._refusal_feed_while_running)
+            witness.start()
+        elif self.command.case == "PA2":
+            witness = threading.Thread(target=self._live_allowance_while_running)
             witness.start()
         helper = _load_owned_launch()
         try:
@@ -1463,6 +1605,27 @@ RF1_HINT = ("==> The sandbox refused a guest network request; run `agent-vm acce
             "to see refusals (shown once per session)")
 
 
+# ADR-0066 PA2: the live allowance change. The guest probes the fixture LAN's TCP
+# port once per policy state (`_case_live_allowance` in `egress-probe.sh`); the
+# host witness in `OwnedLaunch` does the `agent-vm access` work between probes.
+#
+# The two halves coordinate over exactly two vocabularies, and
+# `egress-probe-contract.py` asserts each one is spelled the same on both sides:
+#
+#   * markers: guest -> host, lines in the launch log the witness follows;
+#   * signals: host -> guest, files in the project directory (`work / "proj"`),
+#     the one host path mounted into the guest.
+#
+# A rename on one side alone would otherwise leave the other waiting for its full
+# bound and fail the case for the wrong reason, which is why the names live here.
+PA2_PROBE_PORT = 18080
+PA2_MARKERS = ("PA2 PROBE 1 DENIED", "PA2 PROBE 2 OK", "PA2 PROBE 3 DENIED", "PA2 DONE")
+PA2_SIGNALS = ("PA2-granted", "PA2-revoked")
+# The same bound as `PA2_WAIT:-120` in the probe script: one number for both
+# halves, so a stuck half fails the case instead of the harness deadline.
+PA2_WAIT_SECONDS = 120
+
+
 def refusal_feed_query(work: Path, command: Command, session: str = "",
                        timeout: float = 30) -> tuple[int, str]:
     """`agent-vm access --all` in the launch's own project and environment.
@@ -1591,6 +1754,11 @@ ALLOWANCE_CASES = ("PA1", "PA1x")
 
 def allowance_store(work: Path) -> Path:
     return work / "home/.config/agent-vm/allowances.json"
+
+
+def allowance_lock(work: Path) -> Path:
+    """The writer's lock, created beside the record and never unlinked."""
+    return work / "home/.config/agent-vm/allowances.lock"
 
 
 def allowance_present(work: Path) -> bool:
@@ -1733,8 +1901,129 @@ def final_cleanup(work: Path) -> list[str]:
     `work/home` — for a later case in this run to inherit, or for the operator to
     find. This is what makes the lifecycle survive it: the record is removed
     even when nothing after the seed runs.
+
+    It is `cleanup_pa2`, not `remove_allowances`, because PA2's writer creates
+    `allowances.lock` and never unlinks it: the run's own lock is cleanup here,
+    while `remove_allowances` keeps reporting one for the read-only PA1/PA1x
+    cases, where a lock would mean something wrote the store.
     """
-    return remove_credentials(work) + remove_allowances(work)
+    return remove_credentials(work) + cleanup_pa2(work)
+
+
+def cleanup_pa2(work: Path) -> list[str]:
+    """Remove what PA2's own writer leaves: the record and its lock.
+
+    The writer creates `allowances.lock` beside the record and never unlinks it
+    (ADR-0065 Constraint 1), so this is the one place a lock is *cleanup* rather
+    than a finding. It stays narrow on purpose: a `.damaged` or other
+    `allowances.*` sibling means the store was refused rather than written, which
+    is a failure and is still reported.
+    """
+    failures: list[str] = []
+    for path in (allowance_store(work), allowance_lock(work)):
+        try:
+            within(path, work)
+            if path.is_symlink():
+                raise RuntimeError(f"allowance {path.name} symlink refused")
+            path.unlink(missing_ok=True)
+            if path.exists():
+                failures.append(f"allowance material remains: {path.name}")
+        except (OSError, RuntimeError) as error:
+            failures.append(str(error))
+    directory = allowance_store(work).parent
+    try:
+        for sibling in sorted(directory.glob("allowances.*")) if directory.exists() else []:
+            failures.append(f"the live-allowance case left {sibling.name} behind")
+    except OSError as error:
+        failures.append(str(error))
+    return failures
+
+
+def prepare_live_allowance(work: Path, case: Case) -> list[str]:
+    """Everything PA2 must do before it launches, in one testable place.
+
+    PA2 is the case that must start where a fresh host starts: with no record
+    (a record would be a seed it never wrote, and would even make the first,
+    supposed-to-be-refused probe pass) and with no signal files (a stale one
+    would make a failed host command look like a completed step, since the guest
+    would stop waiting at once). A leftover is reported before it is removed,
+    exactly as `prepare_allowance` does, because a leak is evidence about an
+    earlier case.
+    """
+    if case.case != "PA2":
+        raise RuntimeError(f"{case.case} is not the live-allowance case")
+    failures: list[str] = []
+    if allowance_present(work) or allowance_lock(work).exists():
+        failures.append("a project allowance store was left from an earlier case; "
+                        "removing it before this case's launch")
+        failures.extend(cleanup_pa2(work))
+    for name in PA2_SIGNALS:
+        path = work / "proj" / name
+        try:
+            within(path, work)
+            if path.is_symlink():
+                raise RuntimeError(f"live-allowance signal {name} is a symlink")
+            path.unlink(missing_ok=True)
+            if path.exists():
+                failures.append(f"the live-allowance signal remains: {name}")
+        except (OSError, RuntimeError) as error:
+            failures.append(str(error))
+    return failures
+
+
+def check_live_allowance(work: Path, ident: str, text: str) -> list[str]:
+    """ADR-0066 PA2: the whole live change, joined from the host's records.
+
+    The guest's three probes and the host's four commands are one claim — a
+    policy change reached a *running* sandbox in both directions — so the verdict
+    joins them: the guest's markers, the witness's steps and revisions, the store
+    the grant wrote and the revoke emptied, and the fixture's receipts (the
+    allowed probe reached it; the refused ones never did).
+    """
+    failures: list[str] = []
+    lines = text.splitlines()
+    for marker in PA2_MARKERS:
+        if marker not in lines:
+            failures.append(f"guest marker missing: {marker}")
+    for line in lines:
+        if line.startswith("PA2 ") and line not in PA2_MARKERS:
+            failures.append(f"guest reported: {line}")
+    try:
+        evidence = json.loads((work / "PA2-witness.json").read_text())
+    except (OSError, ValueError) as error:
+        return failures + [f"the live allowance witness left no evidence: {error}"]
+    failures.extend(evidence.get("failures") or [])
+    steps = {step["step"]: step for step in evidence.get("steps") or []}
+    if sorted(steps) != ["allow", "allowances", "revoke", "table"]:
+        failures.append(f"the witness did not run every step: {sorted(steps)}")
+    if evidence.get("grant_revision") != 2:
+        failures.append(f"the grant did not report revision 2: {evidence.get('grant_revision')}")
+    if evidence.get("revoke_revision") != 3:
+        failures.append(f"the revoke did not report revision 3: {evidence.get('revoke_revision')}")
+    destination = evidence.get("destination") or ""
+    if not destination:
+        failures.append("the witness recorded no applied destination")
+    try:
+        recorded = json.loads(evidence["store"]).get("records") or []
+    except (KeyError, ValueError):
+        failures.append("the grant left no readable allowances.json")
+        recorded = []
+    if len(recorded) != 1 or recorded[0].get("destination") != destination:
+        failures.append(f"the grant recorded something else: {recorded!r}")
+    try:
+        after = json.loads(evidence.get("store_after_revoke") or "{}").get("records") or []
+    except ValueError:
+        failures.append("the store after the revoke is unreadable")
+        after = []
+    if any(row.get("destination") == destination for row in after):
+        failures.append("the revoke left the project record behind")
+    receipts = _receipt_lines(work)
+    if not any(line.split()[-1:] == [f"{ident}-p2"] for line in receipts):
+        failures.append("the allowed probe left no fixture receipt")
+    for probe in ("p1", "p3"):
+        if any(line.split()[-1:] == [f"{ident}-{probe}"] for line in receipts):
+            failures.append(f"refused probe {probe} reached the fixture")
+    return failures
 
 
 def verified_archive(assets: Path) -> Path:
@@ -2200,6 +2489,15 @@ def orchestrate(args) -> int:
                     results.append({"case": case, "status": "FAIL", "failures": seed_failures,
                                     "attempts": []})
                     continue
+            if case.case == "PA2":
+                # The opposite of a seed: PA2 must start with no record and no
+                # stale signals, or its first, supposed-to-be-refused probe would
+                # pass (a record) or its host commands would be skipped (a signal).
+                seed_failures = prepare_live_allowance(work, case)
+                if seed_failures:
+                    results.append({"case": case, "status": "FAIL", "failures": seed_failures,
+                                    "attempts": []})
+                    continue
             before = snapshot_validation(work) if not case.guest else None
             proxy_before = (work / "fx/receipts.log").read_text() if (work / "fx/receipts.log").exists() else ""
             receipt_offset = len(_receipt_lines(work))
@@ -2229,6 +2527,10 @@ def orchestrate(args) -> int:
                 failures.extend(check_refusal_feed(work, command, session, status, owned_text,
                                                    live_status, live_output,
                                                    after_status, after_output))
+                if owned.errors:
+                    failures.append(f"observation errors: {owned.errors}")
+            if case.case == "PA2":
+                failures.extend(check_live_allowance(work, ident, owned_text))
                 if owned.errors:
                     failures.append(f"observation errors: {owned.errors}")
             if ingress is not None:
@@ -2268,7 +2570,7 @@ def orchestrate(args) -> int:
                     failures.append("recovered hook denial marker missing")
                 if case.case == "D1" and ("Egress policy: all guest egress denied" not in text or "DNS: queries denied" not in text):
                     failures.append("default-deny notice missing")
-                if case.case not in ("P0", "CL1", "RF1") and not rows:
+                if case.case not in ("P0", "CL1", "RF1", "PA2") and not rows:
                     failures.append("no attempts observed")
                 failures.extend(check_attempts(work, case, text, rows, receipt_offset))
             else:
@@ -2322,6 +2624,8 @@ def orchestrate(args) -> int:
                 failures.append("a project allowance record was left from an earlier case")
             if case.case in ALLOWANCE_CASES:
                 failures.extend(remove_allowances(work))
+            if case.case == "PA2":
+                failures.extend(cleanup_pa2(work))
             if allowance_present(work):
                 failures.append("project allowance record survived its own case")
             if (work / "config/agent-vm/default-image.json").exists() or (work / "home/.config/agent-vm/default-image.json").exists():

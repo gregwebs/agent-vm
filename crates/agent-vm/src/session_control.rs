@@ -32,9 +32,19 @@ use crate::refusal::log::SessionsDir;
 use crate::refusal::{SessionId, SessionInfo, SessionRefusals, SessionSnapshot, Update};
 use crate::session::ProjectSession;
 
-/// Protocol version. Additive changes keep it; a client that asks for another
-/// version gets `unsupported-version` and the list of versions this build speaks.
-pub(crate) const PROTOCOL_VERSION: u32 = 1;
+/// Protocol version this build *prefers*. Additive changes keep it; a client
+/// that asks for another version gets `unsupported-version` and the list of
+/// versions this build speaks.
+pub(crate) const PROTOCOL_VERSION: u32 = 2;
+/// The version this build's **read** calls ask for: `list` and `subscribe` only,
+/// with `v: 1` replies, so an older server sees byte-identical requests (AC10).
+///
+/// Named for the client's side on purpose: `PROTOCOL_VERSION` is what this build
+/// *prefers* and what a mutation uses, and `SUPPORTED_VERSIONS` is what it
+/// serves — three questions, three names (C-m9).
+pub(crate) const CLIENT_READ_VERSION: u32 = 1;
+/// Every version this build serves. `v: 2` adds `grant`, `revoke`, `allowances`.
+const SUPPORTED_VERSIONS: &[u32] = &[1, 2];
 
 /// A request is one short JSON line. Anything longer is not a request.
 const MAX_REQUEST_BYTES: usize = 4 * 1024;
@@ -47,6 +57,10 @@ const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(2);
 /// out the command a user just ran.
 const MAX_CONNECTIONS: usize = 16;
 const MAX_SUBSCRIBERS: usize = 16 - 4;
+/// The client's deadline for a mutation. `40 s > 30 s runtime deadline
+/// (handshake.rs:27) + 1 s LOCK_WAIT + write slack`: a client timeout shorter
+/// than the runtime's would race a swap that is still going to commit (Ruling 4).
+const MUTATION_TIMEOUT: Duration = Duration::from_secs(40);
 /// How long `finish` waits for open connections after telling them the session
 /// ended, before aborting them.
 const CONNECTION_GRACE: Duration = Duration::from_millis(500);
@@ -75,8 +89,18 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// Constructed before `Sandbox::create` (AC9) so a session that is still
 /// starting cannot miss a change aimed at it, and torn down from exactly one
 /// place ([`crate::teardown::ExecTeardown::before_remove`]).
+/// Explicit setup for [`LiveSession::start`] — no hidden construction and no
+/// production default (Ruling 1, B3, M1).
+pub(crate) struct LiveSetup<'a> {
+    pub(crate) project: &'a crate::project::ProjectDir,
+    pub(crate) store: crate::allowances::StoreHandle,
+    pub(crate) plan: crate::network::LivePolicyPlan,
+}
+
 pub(crate) struct LiveSession {
     info: SessionInfo,
+    /// The live allowance controller: in memory only, owned by this session.
+    allowances: Arc<crate::allowances::LiveAllowances>,
     live: Option<Arc<LiveRefusals>>,
     persister: Option<Persister>,
     /// The one hint this session ever prints (AC7). Shared by the follower and by
@@ -110,7 +134,7 @@ impl LiveSession {
     ///
     /// Never fails: a launch whose refusal record cannot be kept still runs, with
     /// one notice saying what is missing.
-    pub(crate) async fn start(session: &ProjectSession) -> Self {
+    pub(crate) async fn start(session: &ProjectSession, setup: LiveSetup<'_>) -> Self {
         let path = session.sessions_dir();
         let info = SessionInfo {
             id: SessionId::generate(),
@@ -118,11 +142,13 @@ impl LiveSession {
             started_ms: feed::now_ms(),
             socket: false,
         };
+        let allowances =
+            crate::allowances::LiveAllowances::new(setup.project, setup.store, setup.plan);
         let dir = match SessionsDir::open_or_create(&path) {
             Ok(dir) => dir,
             Err(error) => {
                 notice(format!("==> Refusals are not recorded: {error}"));
-                return Self::degraded(info);
+                return Self::degraded(info, allowances);
             }
         };
         let socket = dir.socket_path(&info.id);
@@ -140,6 +166,7 @@ impl LiveSession {
                     socket: false,
                     ..info
                 },
+                allowances,
             );
         }
 
@@ -163,6 +190,7 @@ impl LiveSession {
                             socket: false,
                             ..info
                         },
+                        allowances,
                     );
                 }
                 Err(error) => {
@@ -175,6 +203,7 @@ impl LiveSession {
                             socket: false,
                             ..info
                         },
+                        allowances,
                     );
                 }
             };
@@ -193,15 +222,22 @@ impl LiveSession {
                         socket: false,
                         ..reserved.snapshot.info
                     },
+                    allowances,
                 );
             }
         };
         let listening = LiveRefusals::new(SessionRefusals::resume(reserved.snapshot.clone()));
         let persister = Persister::new(dir.clone());
         let (stop, receiver) = watch::channel(false);
-        let task = tokio::spawn(serve(listener, Arc::clone(&listening), receiver));
+        let task = tokio::spawn(serve(
+            listener,
+            Arc::clone(&listening),
+            Arc::clone(&allowances),
+            receiver,
+        ));
         Self {
             info: reserved.snapshot.info,
+            allowances: Arc::clone(&allowances),
             live: Some(listening),
             persister: Some(persister),
             hint: Arc::new(Hint::new()),
@@ -216,9 +252,10 @@ impl LiveSession {
         }
     }
 
-    fn degraded(info: SessionInfo) -> Self {
+    fn degraded(info: SessionInfo, allowances: Arc<crate::allowances::LiveAllowances>) -> Self {
         Self {
             info,
+            allowances,
             live: None,
             persister: None,
             hint: Arc::new(Hint::new()),
@@ -230,7 +267,11 @@ impl LiveSession {
     }
 
     /// The log without a socket: the feed still runs, `access` still lists it.
-    fn with_dir(dir: &SessionsDir, info: SessionInfo) -> Self {
+    fn with_dir(
+        dir: &SessionsDir,
+        info: SessionInfo,
+        allowances: Arc<crate::allowances::LiveAllowances>,
+    ) -> Self {
         let live = LiveRefusals::new(SessionRefusals::new(info.clone()));
         let persister = Persister::new(dir.clone());
         // The session's empty record is written now, so `access --session` can
@@ -238,6 +279,7 @@ impl LiveSession {
         persister.post(live.snapshot());
         Self {
             info,
+            allowances,
             live: Some(live),
             persister: Some(persister),
             hint: Arc::new(Hint::new()),
@@ -255,12 +297,58 @@ impl LiveSession {
         &self.info.id
     }
 
+    /// Adopt the project allowances the launch actually applied (ADR-0065).
+    ///
+    /// Called once, after `allowances::for_launch` read the store and before
+    /// `follow` attaches the runtime, so a grant that arrived in between is
+    /// re-derived over the post-adoption plan.
+    /// Returns the launch notices the adoption owes: it drops a queued entry only
+    /// in the unreachable case that the post-adoption policy cannot express it.
+    pub(crate) fn adopt_boot_allowances(
+        &self,
+        recorded: &crate::allowances::ProjectView,
+        adopted: &[crate::allowances::ProjectAllowance],
+        plan: crate::network::LivePolicyPlan,
+    ) -> Vec<String> {
+        self.allowances
+            .adopt_boot_allowances(recorded, adopted, plan)
+    }
+
+    /// This session's live allowance controller (the tests' view of it).
+    #[cfg(test)]
+    pub(crate) fn allowances(&self) -> &Arc<crate::allowances::LiveAllowances> {
+        &self.allowances
+    }
+
+    /// This session's live refusal feed, so a test can ingest one refusal and see
+    /// it through the control socket.
+    #[cfg(test)]
+    pub(crate) fn refusals(&self) -> Option<Arc<LiveRefusals>> {
+        self.live.clone()
+    }
+
     /// Start following the sandbox's `network.log`.
     ///
     /// Called right after the sandbox exists: the producer is the runtime, so
     /// following before it has written anything is the only way not to lose the
     /// first refusal.
     pub(crate) fn follow(&self, sandbox: &Sandbox) {
+        // The runtime is attached before the early return below: a session whose
+        // refusal feed is degraded still launched a sandbox, and `access allow`
+        // must still be able to swap its policy.
+        let owner = sandbox.clone();
+        let updater: crate::allowances::PolicyUpdater = Arc::new(move |policy| {
+            let sandbox = owner.clone();
+            Box::pin(async move { sandbox.update_network_policy(policy).await })
+        });
+        if self.allowances.attach_updater(updater) {
+            let allowances = Arc::clone(&self.allowances);
+            tokio::spawn(async move {
+                for warning in allowances.flush_queued().await {
+                    notice(format!("==> {warning}"));
+                }
+            });
+        }
         let (Some(live), Some(persister)) = (self.live.as_ref().cloned(), self.persister.as_ref())
         else {
             return;
@@ -480,11 +568,35 @@ impl Drop for LiveSession {
 
 // -- protocol --------------------------------------------------------------
 
-/// One request line.
+/// The lenient version probe: `{"v":n}` and nothing else examined.
+///
+/// Decoded **before** the strict request so a client asking for a version this
+/// build does not speak — with any extra fields a later version added — is told
+/// `unsupported-version` and the versions that would work, rather than
+/// `bad-request` (m1).
 #[derive(Debug, Deserialize)]
+struct VersionProbe {
+    v: u32,
+}
+
+/// One request line. Strict: an unknown field is a client this build cannot
+/// answer, which is exactly what `deny_unknown_fields` says.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Request {
     v: u32,
     op: String,
+    /// `grant`: the refusal to allow. `revoke`: unused.
+    #[serde(default)]
+    id: Option<String>,
+    /// `grant`/`revoke`: the allowance spelling. The CLI resolves `<ID>` to this
+    /// before sending, so a refusal it cannot grant never reaches the socket.
+    #[serde(default)]
+    destination: Option<String>,
+    /// `grant`: `session` (default) or `project`. `revoke`: `session`,
+    /// `project`, or `all` (default).
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 /// One reply line. `v` is on every variant so a client can refuse a newer
@@ -500,6 +612,21 @@ pub(crate) enum Reply {
     Update { v: u32, update: Update },
     /// The session ended; the server then closes.
     Ended { v: u32 },
+    /// A `grant` answer (`v: 2`).
+    Grant {
+        v: u32,
+        result: crate::allowances::GrantResult,
+    },
+    /// A `revoke` answer (`v: 2`).
+    Revoke {
+        v: u32,
+        result: crate::allowances::RevokeResult,
+    },
+    /// An `allowances` answer (`v: 2`): this session's active allowances.
+    Allowances {
+        v: u32,
+        allowances: crate::allowances::SessionAllowancesSnapshot,
+    },
     /// A request this server cannot answer.
     Error {
         v: u32,
@@ -529,7 +656,12 @@ fn error(code: &str) -> Reply {
 ///
 /// Connections run in a `JoinSet` off the accept loop, so one client that stops
 /// reading cannot stop the next client from connecting.
-async fn serve(listener: UnixListener, live: Arc<LiveRefusals>, mut stop: watch::Receiver<bool>) {
+async fn serve(
+    listener: UnixListener,
+    live: Arc<LiveRefusals>,
+    allowances: Arc<crate::allowances::LiveAllowances>,
+    mut stop: watch::Receiver<bool>,
+) {
     let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let subscribers = Arc::new(Semaphore::new(MAX_SUBSCRIBERS));
     let mut tasks: JoinSet<()> = JoinSet::new();
@@ -552,6 +684,7 @@ async fn serve(listener: UnixListener, live: Arc<LiveRefusals>, mut stop: watch:
                     continue;
                 };
                 let live = Arc::clone(&live);
+                let allowances = Arc::clone(&allowances);
                 let subscribers = Arc::clone(&subscribers);
                 // The session's stop signal reaches the connection, so a
                 // subscriber waiting in `updates.recv()` learns the session ended
@@ -561,7 +694,7 @@ async fn serve(listener: UnixListener, live: Arc<LiveRefusals>, mut stop: watch:
                 let stop = stop.clone();
                 tasks.spawn(async move {
                     let _permit = permit;
-                    handle_connection(stream, live, subscribers, stop).await;
+                    handle_connection(stream, live, allowances, subscribers, stop).await;
                 });
             }
             // Reap finished connections so the set does not grow forever.
@@ -584,6 +717,7 @@ async fn serve(listener: UnixListener, live: Arc<LiveRefusals>, mut stop: watch:
 async fn handle_connection(
     stream: UnixStream,
     live: Arc<LiveRefusals>,
+    allowances: Arc<crate::allowances::LiveAllowances>,
     subscribers: Arc<Semaphore>,
     mut stop: watch::Receiver<bool>,
 ) {
@@ -611,33 +745,97 @@ async fn handle_connection(
         let _ = write_reply(&mut writer, &error("bad-request")).await;
         return;
     }
-    let Ok(request) = serde_json::from_slice::<Request>(&request) else {
+    // Version first, leniently: an unknown version with extra fields is still an
+    // unsupported version, never a malformed request (m1, AC10).
+    let Ok(probe) = serde_json::from_slice::<VersionProbe>(&request) else {
         let _ = write_reply(&mut writer, &error("bad-request")).await;
         return;
     };
-    if request.v != PROTOCOL_VERSION {
+    if !SUPPORTED_VERSIONS.contains(&probe.v) {
         let reply = Reply::Error {
             v: PROTOCOL_VERSION,
             code: "unsupported-version".to_owned(),
-            supported: Some(vec![PROTOCOL_VERSION]),
+            supported: Some(SUPPORTED_VERSIONS.to_vec()),
         };
         let _ = write_reply(&mut writer, &reply).await;
         return;
     }
-    match request.op.as_str() {
-        "list" => {
+    let version = probe.v;
+    let Ok(request) = serde_json::from_slice::<Request>(&request) else {
+        let _ = write_reply(&mut writer, &error("bad-request")).await;
+        return;
+    };
+    if request.v != version {
+        let _ = write_reply(&mut writer, &error("bad-request")).await;
+        return;
+    }
+    match (version, request.op.as_str()) {
+        (1 | 2, "list") => {
             let reply = Reply::Session {
-                v: PROTOCOL_VERSION,
+                v: version,
                 session: live.snapshot(),
             };
             let _ = write_reply(&mut writer, &reply).await;
         }
-        "subscribe" => {
+        (1 | 2, "subscribe") => {
             let Ok(_slot) = Arc::clone(&subscribers).try_acquire_owned() else {
                 let _ = write_reply(&mut writer, &error("too-many-subscribers")).await;
                 return;
             };
-            subscribe_connection(&mut writer, &live, &mut stop).await;
+            subscribe_connection(&mut writer, &live, version, &mut stop).await;
+        }
+        // `v: 2` operations are not part of `v: 1`: a v1 request for one is a
+        // request this version cannot answer, not a mutation to guess at.
+        (1, "grant" | "revoke" | "allowances") => {
+            let _ = write_reply(&mut writer, &error("bad-request")).await;
+        }
+        (2, "grant") => {
+            let scope = match request.scope.as_deref() {
+                None | Some("session") => crate::allowances::GrantScope::Session,
+                Some("project") => crate::allowances::GrantScope::Project,
+                Some(_) => {
+                    let _ = write_reply(&mut writer, &error("bad-request")).await;
+                    return;
+                }
+            };
+            let result = allowances
+                .grant(
+                    &live,
+                    request.id.as_deref(),
+                    request.destination.as_deref(),
+                    scope,
+                    feed::now_ms(),
+                )
+                .await;
+            let _ = write_reply(&mut writer, &Reply::Grant { v: version, result }).await;
+        }
+        (2, "revoke") => {
+            let scope = match request.scope.as_deref() {
+                None | Some("all") => crate::allowances::RevokeScope::All,
+                Some("session") => crate::allowances::RevokeScope::Session,
+                Some("project") => crate::allowances::RevokeScope::Project,
+                Some(_) => {
+                    let _ = write_reply(&mut writer, &error("bad-request")).await;
+                    return;
+                }
+            };
+            let Some(destination) = request
+                .destination
+                .as_deref()
+                .and_then(|text| crate::egress_policy::Allowance::parse(text).ok())
+            else {
+                let _ = write_reply(&mut writer, &error("bad-request")).await;
+                return;
+            };
+            let result = allowances.revoke(&destination, scope).await;
+            let _ = write_reply(&mut writer, &Reply::Revoke { v: version, result }).await;
+        }
+        (2, "allowances") => {
+            let reply = Reply::Allowances {
+                v: version,
+                allowances: allowances.snapshot(),
+            };
+            let _ = write_reply(&mut writer, &reply).await;
         }
         _ => {
             let _ = write_reply(&mut writer, &error("bad-request")).await;
@@ -663,6 +861,7 @@ async fn write_reply(stream: &mut UnixStream, reply: &Reply) -> std::io::Result<
 async fn subscribe_connection(
     stream: &mut UnixStream,
     live: &LiveRefusals,
+    version: u32,
     stop: &mut watch::Receiver<bool>,
 ) {
     // The handoff: snapshot and subscription under one lock, so the client
@@ -672,7 +871,7 @@ async fn subscribe_connection(
     if write_reply(
         stream,
         &Reply::Snapshot {
-            v: PROTOCOL_VERSION,
+            v: version,
             session: snapshot,
         },
     )
@@ -682,13 +881,7 @@ async fn subscribe_connection(
         return;
     }
     if ended {
-        let _ = write_reply(
-            stream,
-            &Reply::Ended {
-                v: PROTOCOL_VERSION,
-            },
-        )
-        .await;
+        let _ = write_reply(stream, &Reply::Ended { v: version }).await;
         return;
     }
     loop {
@@ -707,21 +900,12 @@ async fn subscribe_connection(
             update = updates.recv() => Some(update),
         };
         let Some(received) = received else {
-            let _ = write_reply(
-                stream,
-                &Reply::Ended {
-                    v: PROTOCOL_VERSION,
-                },
-            )
-            .await;
+            let _ = write_reply(stream, &Reply::Ended { v: version }).await;
             return;
         };
         match received {
             Ok(update) => {
-                let reply = Reply::Update {
-                    v: PROTOCOL_VERSION,
-                    update,
-                };
+                let reply = Reply::Update { v: version, update };
                 if write_reply(stream, &reply).await.is_err() {
                     return;
                 }
@@ -736,7 +920,7 @@ async fn subscribe_connection(
                 if write_reply(
                     stream,
                     &Reply::Snapshot {
-                        v: PROTOCOL_VERSION,
+                        v: version,
                         session: snapshot,
                     },
                 )
@@ -746,24 +930,12 @@ async fn subscribe_connection(
                     return;
                 }
                 if ended {
-                    let _ = write_reply(
-                        stream,
-                        &Reply::Ended {
-                            v: PROTOCOL_VERSION,
-                        },
-                    )
-                    .await;
+                    let _ = write_reply(stream, &Reply::Ended { v: version }).await;
                     return;
                 }
             }
             Err(broadcast::error::RecvError::Closed) => {
-                let _ = write_reply(
-                    stream,
-                    &Reply::Ended {
-                        v: PROTOCOL_VERSION,
-                    },
-                )
-                .await;
+                let _ = write_reply(stream, &Reply::Ended { v: version }).await;
                 return;
             }
         }
@@ -784,7 +956,7 @@ pub(crate) async fn subscribe(path: &Path) -> Result<impl futures::Stream<Item =
         .with_context(|| format!("connecting to {}", crate::one_line::path(path)))?;
     let mut writer = stream;
     writer
-        .write_all(format!("{{\"v\":{PROTOCOL_VERSION},\"op\":\"subscribe\"}}\n").as_bytes())
+        .write_all(format!("{{\"v\":{CLIENT_READ_VERSION},\"op\":\"subscribe\"}}\n").as_bytes())
         .await
         .context("sending the subscribe request")?;
     writer
@@ -815,7 +987,7 @@ async fn list(path: &Path) -> Result<SessionSnapshot> {
     let mut reader = BufReader::new(stream);
     reader
         .get_mut()
-        .write_all(format!("{{\"v\":{PROTOCOL_VERSION},\"op\":\"list\"}}\n").as_bytes())
+        .write_all(format!("{{\"v\":{CLIENT_READ_VERSION},\"op\":\"list\"}}\n").as_bytes())
         .await
         .context("sending the list request")?;
     let mut line = String::new();
@@ -832,6 +1004,99 @@ async fn list(path: &Path) -> Result<SessionSnapshot> {
     }
 }
 
+/// Send one `v: 2` request and read its one reply.
+///
+/// The deadline is [`MUTATION_TIMEOUT`] for a mutation and [`EXCHANGE_TIMEOUT`]
+/// for a read: a mutation that times out on the client while the runtime is still
+/// going to commit would leave the CLI's story and the sandbox's policy disagreeing
+/// (Ruling 4, M3).
+async fn exchange(path: &Path, request: serde_json::Value, timeout: Duration) -> Result<Reply> {
+    let stream = tokio::time::timeout(Duration::from_secs(1), UnixStream::connect(path))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("connecting to {} timed out", crate::one_line::path(path))
+        })??;
+    let mut line = serde_json::to_vec(&request).context("encoding the request")?;
+    line.push(b'\n');
+    let mut reader = BufReader::new(stream);
+    reader
+        .get_mut()
+        .write_all(&line)
+        .await
+        .context("sending the request")?;
+    let mut answer = String::new();
+    tokio::time::timeout(timeout, reader.read_line(&mut answer))
+        .await
+        .map_err(|_| anyhow::anyhow!("{} did not answer in time", crate::one_line::path(path)))??;
+    parse_reply(&answer)
+}
+
+/// Ask one session to apply a live grant.
+pub(crate) async fn grant(
+    path: &Path,
+    destination: Option<&str>,
+    scope: crate::allowances::GrantScope,
+) -> Result<crate::allowances::GrantResult> {
+    let request = serde_json::json!({
+        "v": PROTOCOL_VERSION,
+        "op": "grant",
+        "destination": destination,
+        "scope": match scope {
+            crate::allowances::GrantScope::Session => "session",
+            crate::allowances::GrantScope::Project => "project",
+        },
+    });
+    match exchange(path, request, MUTATION_TIMEOUT).await? {
+        Reply::Grant { result, .. } => Ok(result),
+        other => Err(anyhow::anyhow!(
+            "{} answered {} instead of a grant",
+            crate::one_line::path(path),
+            format_args!("{other:?}")
+        )),
+    }
+}
+
+/// Ask one session to revoke a destination.
+pub(crate) async fn revoke(
+    path: &Path,
+    destination: &str,
+    scope: crate::allowances::RevokeScope,
+) -> Result<crate::allowances::RevokeResult> {
+    let request = serde_json::json!({
+        "v": PROTOCOL_VERSION,
+        "op": "revoke",
+        "destination": destination,
+        "scope": match scope {
+            crate::allowances::RevokeScope::All => "all",
+            crate::allowances::RevokeScope::Session => "session",
+            crate::allowances::RevokeScope::Project => "project",
+        },
+    });
+    match exchange(path, request, MUTATION_TIMEOUT).await? {
+        Reply::Revoke { result, .. } => Ok(result),
+        other => Err(anyhow::anyhow!(
+            "{} answered {} instead of a revoke",
+            crate::one_line::path(path),
+            format_args!("{other:?}")
+        )),
+    }
+}
+
+/// Ask one session for its active allowances.
+pub(crate) async fn allowances(
+    path: &Path,
+) -> Result<crate::allowances::SessionAllowancesSnapshot> {
+    let request = serde_json::json!({"v": PROTOCOL_VERSION, "op": "allowances"});
+    match exchange(path, request, EXCHANGE_TIMEOUT).await? {
+        Reply::Allowances { allowances, .. } => Ok(allowances),
+        other => Err(anyhow::anyhow!(
+            "{} answered {} instead of its allowances",
+            crate::one_line::path(path),
+            format_args!("{other:?}")
+        )),
+    }
+}
+
 // -- discovery -------------------------------------------------------------
 
 /// Everything `agent-vm access` can see: the sessions that answered, the ones the
@@ -840,6 +1105,9 @@ pub(crate) struct Discovery {
     pub(crate) live: Vec<SessionSnapshot>,
     pub(crate) logged: Vec<SessionSnapshot>,
     pub(crate) unresponsive: Vec<SessionId>,
+    /// Each live session's active allowances, for the `access allowances` union.
+    /// A session that cannot answer is in `unresponsive`, not here.
+    pub(crate) live_allowances: Vec<(SessionId, crate::allowances::SessionAllowancesSnapshot)>,
     /// Every session the log has had to evict, ever. Read once, here, so a caller
     /// prints one number instead of re-reading the log it just read.
     pub(crate) evicted_sessions: u64,
@@ -852,6 +1120,12 @@ pub(crate) struct Discovery {
 /// `pid_alive` (which always returns false on macOS). A socket that refuses a
 /// connection is a session that ended without cleaning up, so it is removed and
 /// reported as ended from the log.
+///
+/// Cost: two round trips per live session — the `v: 1` `list` and, for v2
+/// sessions, the `allowances` answer — each bounded by `EXCHANGE_TIMEOUT`, and
+/// the pairs run concurrently. A session that answers `list` and then stops
+/// answering costs at most one more `EXCHANGE_TIMEOUT` on this command, and
+/// nothing at all if it refuses the connection.
 pub(crate) async fn discover(dir: &SessionsDir, _now_ms: i64) -> Discovery {
     let mut warnings = Vec::new();
     let mut candidates: Vec<(PathBuf, SessionId)> = Vec::new();
@@ -904,9 +1178,17 @@ pub(crate) async fn discover(dir: &SessionsDir, _now_ms: i64) -> Discovery {
 
     let mut live = Vec::new();
     let mut unresponsive = Vec::new();
+    let mut live_allowances = Vec::new();
     for (path, id, result) in answers {
         match result {
-            Ok(session) => live.push(session),
+            Ok(session) => {
+                // A session that predates `v: 2` answers `unsupported-version`;
+                // that is not a failure to report, it just has no live view.
+                if let Ok(snapshot) = allowances(&path).await {
+                    live_allowances.push((id.clone(), snapshot));
+                }
+                live.push(session);
+            }
             Err(error) => {
                 // A refused connection is a stale socket: unlink it, and let the
                 // log speak for that session. A timeout is a session that is alive
@@ -958,6 +1240,7 @@ pub(crate) async fn discover(dir: &SessionsDir, _now_ms: i64) -> Discovery {
         live,
         logged,
         unresponsive,
+        live_allowances,
         evicted_sessions,
         warnings,
     }

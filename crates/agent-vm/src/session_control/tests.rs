@@ -19,6 +19,26 @@ use crate::refusal::feed::LiveRefusals;
 use crate::refusal::log::SessionsDir;
 
 const SID: &str = "0a1b2c3d";
+
+/// Start a session with an explicit `LiveSetup` over a temporary store. Every
+/// test in this file starts a *real* server; none of them may touch the real
+/// `~/.config/agent-vm`, which is why the store handle is a tempdir.
+async fn start_live(session: &ProjectSession) -> LiveSession {
+    let project = crate::project::ProjectDir::from_path_for_tests(&session.project_dir)
+        .expect("a captured project");
+    let store =
+        crate::allowances::StoreHandle::at_for_tests(&session.project_dir.join("allowances-store"));
+    let plan = crate::network::plan_for_tests(&[], false).live_policy_plan(None);
+    LiveSession::start(
+        session,
+        LiveSetup {
+            project: &project,
+            store,
+            plan,
+        },
+    )
+    .await
+}
 const BASE_MS: i64 = 1_760_000_000_000;
 
 /// A refused `tls-sni` record for `port`, one second after the last.
@@ -54,6 +74,7 @@ fn session(socket: bool) -> SessionRefusals {
 struct Harness {
     _root: tempfile::TempDir,
     live: Arc<LiveRefusals>,
+    allowances: Arc<crate::allowances::LiveAllowances>,
     socket: PathBuf,
     stop: watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
@@ -67,11 +88,22 @@ impl Harness {
         let live = LiveRefusals::new(session(true));
         let socket = dir.socket_path(&SessionId::parse(SID).unwrap());
         let listener = UnixListener::bind(&socket).unwrap();
+        let project = crate::project::ProjectDir::from_path_for_tests(root.path()).unwrap();
+        let store =
+            crate::allowances::StoreHandle::at_for_tests(&root.path().join("allowances-store"));
+        let plan = crate::network::plan_for_tests(&[], false).live_policy_plan(None);
+        let allowances = crate::allowances::LiveAllowances::new(&project, store, plan);
         let (stop, receiver) = watch::channel(false);
-        let task = tokio::spawn(serve(listener, Arc::clone(&live), receiver));
+        let task = tokio::spawn(serve(
+            listener,
+            Arc::clone(&live),
+            Arc::clone(&allowances),
+            receiver,
+        ));
         Self {
             _root: root,
             live,
+            allowances,
             socket,
             stop,
             task,
@@ -329,7 +361,7 @@ async fn unknown_version_gets_unsupported_version() {
             code, supported, ..
         } => {
             assert_eq!(code, "unsupported-version");
-            assert_eq!(supported, Some(vec![PROTOCOL_VERSION]));
+            assert_eq!(supported, Some(vec![1, 2]));
         }
         other => panic!("{other:?}"),
     }
@@ -405,19 +437,71 @@ async fn discovery_meets_its_deadline_with_a_hung_server() {
         }
     });
     let started = Instant::now();
-    let discovery = discover(&dir, BASE_MS).await;
+    let hung_discovery = discover(&dir, BASE_MS).await;
     let elapsed = started.elapsed();
     assert!(
         elapsed < Duration::from_secs(5),
         "discovery has a total deadline: {elapsed:?}"
     );
-    assert_eq!(discovery.unresponsive.len(), 1);
-    assert!(discovery.live.is_empty());
+    assert_eq!(hung_discovery.unresponsive.len(), 1);
+    assert!(hung_discovery.live.is_empty());
     assert!(
         dir.socket_path(&id).exists(),
         "a hung session is reported, not unlinked"
     );
     hung.abort();
+    // A server that answers `list` and then goes silent must not cost a second
+    // open-ended wait: the `allowances` answer is bounded by `EXCHANGE_TIMEOUT`
+    // too, and its absence only means "no live allowances to show".
+    std::fs::remove_file(dir.socket_path(&id)).unwrap();
+    let answering = UnixListener::bind(dir.socket_path(&id)).unwrap();
+    let answering_id = id.as_str().to_owned();
+    let answering = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = answering.accept().await {
+            let mut reader = tokio::io::BufReader::new(stream);
+            let mut line = String::new();
+            use tokio::io::AsyncBufReadExt as _;
+            use tokio::io::AsyncWriteExt as _;
+            let _ = reader.read_line(&mut line).await;
+            if line.contains("\"op\":\"list\"") {
+                // Answer the list, then hold the connection so the next request
+                // never gets an answer.
+                let reply = serde_json::json!({
+                    "reply": "session",
+                    "v": 1,
+                    "session": {
+                        "info": {"id": answering_id, "pid": 1, "started_ms": BASE_MS, "socket": true},
+                        "rev": 1, "ended_ms": null, "heartbeat_ms": null,
+                        "suppressed": 0, "lost": 0, "gap": false, "entries": []
+                    }
+                })
+                .to_string()
+                    + "\n";
+                let mut stream = reader.into_inner();
+                let _ = stream.write_all(reply.as_bytes()).await;
+                held.push(stream);
+            }
+        }
+    });
+    let started = Instant::now();
+    let discovery = discover(&dir, BASE_MS).await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "a silent `allowances` answer has its own bound: {elapsed:?}"
+    );
+    assert_eq!(
+        discovery.live.len(),
+        1,
+        "the list answer is used: {:?}",
+        discovery.warnings
+    );
+    assert!(
+        discovery.live_allowances.is_empty(),
+        "a session with no allowances answer contributes no live allowances"
+    );
+    answering.abort();
 }
 
 #[test]
@@ -450,7 +534,7 @@ async fn overlong_path_degrades_with_one_notice() {
         sandbox_name: "agent-vm-ab12cd34ef56-1".to_owned(),
     };
     std::fs::create_dir_all(project.state_dir.parent().unwrap()).unwrap();
-    let live = LiveSession::start(&project).await;
+    let live = start_live(&project).await;
     assert!(
         !live.info.socket,
         "the socket was not bound, and the launch was not failed"
@@ -484,7 +568,7 @@ async fn a_session_with_a_socket_binds_it_at_start_and_unlinks_at_finish() {
         state_dir: root.path().join("ab12cd34ef56"),
         sandbox_name: "agent-vm-ab12cd34ef56-1".to_owned(),
     };
-    let live = LiveSession::start(&project).await;
+    let live = start_live(&project).await;
     let socket = project
         .sessions_dir()
         .join(format!("{}.sock", live.id().as_str()));
@@ -529,7 +613,7 @@ async fn discovery_sees_a_live_session_and_the_log_beside_it() {
         state_dir: root.path().join("ab12cd34ef56"),
         sandbox_name: "agent-vm-ab12cd34ef56-1".to_owned(),
     };
-    let live = LiveSession::start(&project).await;
+    let live = start_live(&project).await;
     let dir = SessionsDir::open(&project.sessions_dir()).unwrap().unwrap();
     let discovery = discover(&dir, BASE_MS).await;
     assert_eq!(discovery.live.len(), 1);
@@ -550,7 +634,7 @@ async fn dropping_a_session_unlinks_its_socket() {
         sandbox_name: "agent-vm-ab12cd34ef56-1".to_owned(),
     };
     let socket = {
-        let live = LiveSession::start(&project).await;
+        let live = start_live(&project).await;
         let socket = project
             .sessions_dir()
             .join(format!("{}.sock", live.id().as_str()));
@@ -612,7 +696,7 @@ fn project(root: &std::path::Path) -> ProjectSession {
 #[tokio::test]
 async fn finish_tells_a_connected_subscriber_the_session_ended() {
     let root = tempfile::tempdir().unwrap();
-    let live = LiveSession::start(&project(root.path())).await;
+    let live = start_live(&project(root.path())).await;
     let socket = project(root.path())
         .sessions_dir()
         .join(format!("{}.sock", live.id().as_str()));
@@ -662,7 +746,7 @@ async fn finish_tells_a_connected_subscriber_the_session_ended() {
 #[tokio::test]
 async fn the_drain_prints_the_session_s_one_hint() {
     let root = tempfile::tempdir().unwrap();
-    let mut live = LiveSession::start(&project(root.path())).await;
+    let mut live = start_live(&project(root.path())).await;
     let (hint, lines) = Hint::capture();
     live.hint = Arc::new(hint);
     // No `Sandbox` is available here, so the opener the drain shares is set
@@ -694,7 +778,7 @@ async fn dropping_after_a_cancelled_finish_still_unlinks_the_socket() {
     let root = tempfile::tempdir().unwrap();
     let socket;
     {
-        let live = LiveSession::start(&project(root.path())).await;
+        let live = start_live(&project(root.path())).await;
         socket = project(root.path())
             .sessions_dir()
             .join(format!("{}.sock", live.id().as_str()));
@@ -720,7 +804,7 @@ async fn dropping_a_session_writes_a_record_that_says_it_ended() {
     let root = tempfile::tempdir().unwrap();
     let id;
     {
-        let live = LiveSession::start(&project(root.path())).await;
+        let live = start_live(&project(root.path())).await;
         id = live.id().clone();
     }
     let dir = SessionsDir::open(&project(root.path()).sessions_dir())
@@ -819,4 +903,266 @@ async fn a_failed_publish_leaves_no_hidden_name() {
         !Hidden::tmp_path(&dir, &id).exists(),
         "the hidden name is gone"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Group P: protocol v2 and the queued boot window (PR 2)
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::AtomicUsize;
+
+/// A policy updater that counts its calls and confirms the next revision.
+fn counting_updater(calls: Arc<AtomicUsize>) -> crate::allowances::PolicyUpdater {
+    Arc::new(move |_policy| {
+        let calls = Arc::clone(&calls);
+        Box::pin(async move {
+            let previous = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(previous as u64 + 2)
+        })
+    })
+}
+
+/// P1: `v: 1` and `v: 2` coexist; an unknown version is answered with the list of
+/// versions even when it carries extra fields; a `v: 1` mutation is refused; and
+/// discovery keeps `live` and `unresponsive` disjoint.
+#[tokio::test]
+async fn protocol_v1_and_v2_coexist_and_reject_unknown_versions() {
+    let harness = Harness::new().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    harness
+        .allowances
+        .attach_updater(counting_updater(Arc::clone(&calls)));
+
+    // `v: 1` list and subscribe answer with `v: 1`.
+    let mut client = Client::connect(&harness.socket).await;
+    client.send("{\"v\":1,\"op\":\"list\"}").await;
+    match client.reply().await {
+        Reply::Session { v, .. } => assert_eq!(v, 1, "a v1 client sees v1 replies"),
+        other => panic!("{other:?}"),
+    }
+    let mut client = Client::connect(&harness.socket).await;
+    client.send("{\"v\":1,\"op\":\"subscribe\"}").await;
+    match client.reply().await {
+        Reply::Snapshot { v, .. } => assert_eq!(v, 1),
+        other => panic!("{other:?}"),
+    }
+
+    // A `v: 1` mutation does not exist in version 1.
+    let mut client = Client::connect(&harness.socket).await;
+    client
+        .send("{\"v\":1,\"op\":\"grant\",\"destination\":\"tcp://[203.0.113.10/32]:443\"}")
+        .await;
+    match client.reply().await {
+        Reply::Error { code, .. } => assert_eq!(code, "bad-request"),
+        other => panic!("{other:?}"),
+    }
+
+    // An unknown version, with extra fields, is `unsupported-version`, not
+    // `bad-request`: the lenient probe runs first.
+    let mut client = Client::connect(&harness.socket).await;
+    client
+        .send("{\"v\":3,\"op\":\"list\",\"future\":{\"a\":1}}")
+        .await;
+    match client.reply().await {
+        Reply::Error {
+            code, supported, ..
+        } => {
+            assert_eq!(code, "unsupported-version");
+            assert_eq!(supported, Some(vec![1, 2]));
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // `v: 2` list, grant and allowances.
+    let mut client = Client::connect(&harness.socket).await;
+    client.send("{\"v\":2,\"op\":\"list\"}").await;
+    match client.reply().await {
+        Reply::Session { v, .. } => assert_eq!(v, 2),
+        other => panic!("{other:?}"),
+    }
+    let mut client = Client::connect(&harness.socket).await;
+    client
+        .send("{\"v\":2,\"op\":\"grant\",\"destination\":\"tcp://[203.0.113.10/32]:443\",\"scope\":\"session\"}")
+        .await;
+    match client.reply().await {
+        Reply::Grant {
+            v,
+            result:
+                crate::allowances::GrantResult::Applied {
+                    revision, scope, ..
+                },
+        } => {
+            assert_eq!(v, 2);
+            assert_eq!(revision, 2);
+            assert_eq!(scope, crate::allowances::GrantScope::Session);
+        }
+        other => panic!("{other:?}"),
+    }
+    let mut client = Client::connect(&harness.socket).await;
+    client.send("{\"v\":2,\"op\":\"allowances\"}").await;
+    match client.reply().await {
+        Reply::Allowances { v, allowances } => {
+            assert_eq!(v, 2);
+            assert_eq!(allowances.session.len(), 1);
+            assert_eq!(
+                allowances.session[0].destination,
+                "tcp://[203.0.113.10/32]:443"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // Disjoint discovery: bound sockets that answer are `live`; one that does
+    // not is `unresponsive`; only the live ones have a live allowance view.
+    let session = ProjectSession {
+        project_dir: harness._root.path().to_path_buf(),
+        project_hash: "ab12cd34ef56".to_owned(),
+        // `sessions_dir` replaces the state dir's file name, so this puts the
+        // second session's socket in the harness's own `<hash>.sessions`.
+        state_dir: harness._root.path().join("state"),
+        sandbox_name: "agent-vm-ab12cd34ef56-2".to_owned(),
+    };
+    let second = start_live(&session).await;
+    let dir = SessionsDir::open(&harness._root.path().join("ab12cd34ef56.sessions"))
+        .unwrap()
+        .unwrap();
+    let hung_id = SessionId::parse("00000009").unwrap();
+    let listener = UnixListener::bind(dir.socket_path(&hung_id)).unwrap();
+    let held = tokio::spawn(async move {
+        let mut streams = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            streams.push(stream);
+        }
+    });
+    let discovery = discover(&dir, BASE_MS).await;
+    let live_ids: Vec<SessionId> = discovery.live.iter().map(|s| s.info.id.clone()).collect();
+    assert!(
+        live_ids.contains(&SessionId::parse(SID).unwrap()),
+        "{live_ids:?}"
+    );
+    assert!(live_ids.contains(second.id()), "{live_ids:?}");
+    assert_eq!(discovery.unresponsive, vec![hung_id.clone()]);
+    assert!(
+        discovery.live.iter().all(|s| s.info.id != hung_id),
+        "the hung session is never also live"
+    );
+    assert_eq!(discovery.live_allowances.len(), live_ids.len());
+    held.abort();
+    second.finish().await;
+    harness.shutdown().await;
+}
+
+/// P2: a grant before the runtime is attached is queued; the flush either
+/// promotes it or drops it with a notice naming the destination.
+#[tokio::test]
+async fn grant_before_follow_is_queued_for_boot_and_applied_or_dropped_with_notice_on_follow() {
+    // Part A: a queued grant is promoted by the flush.
+    let harness = Harness::new().await;
+    let queued = crate::session_control::grant(
+        &harness.socket,
+        Some("tcp://[203.0.113.10/32]:443"),
+        crate::allowances::GrantScope::Session,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(queued, crate::allowances::GrantResult::QueuedForBoot { .. }),
+        "{queued:?}"
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    assert!(
+        harness
+            .allowances
+            .attach_updater(counting_updater(Arc::clone(&calls))),
+        "the queued grant is waiting"
+    );
+    assert!(harness.allowances.flush_queued().await.is_empty());
+    let snapshot = harness.allowances.snapshot();
+    assert_eq!(snapshot.session.len(), 1);
+    assert_eq!(snapshot.session[0].revision, Some(2));
+
+    // Part B: a failing flush drops both queued tables and names each.
+    let harness = Harness::new().await;
+    crate::session_control::grant(
+        &harness.socket,
+        Some("tcp://[198.51.100.0/24]:443"),
+        crate::allowances::GrantScope::Project,
+    )
+    .await
+    .unwrap();
+    crate::session_control::grant(
+        &harness.socket,
+        Some("tcp://[203.0.113.0/24]:443"),
+        crate::allowances::GrantScope::Session,
+    )
+    .await
+    .unwrap();
+    let failing: crate::allowances::PolicyUpdater = Arc::new(|_policy| {
+        Box::pin(async move { Err(microsandbox::MicrosandboxError::ControlStateChanged) })
+    });
+    assert!(harness.allowances.attach_updater(failing));
+    let warnings = harness.allowances.flush_queued().await;
+    assert_eq!(warnings.len(), 2, "{warnings:?}");
+    assert!(
+        warnings
+            .iter()
+            .any(|line| line.contains("still carries it to the next launch")),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|line| line.contains("no project record was written")),
+        "{warnings:?}"
+    );
+    assert!(harness.allowances.snapshot().session.is_empty());
+    assert!(harness.allowances.snapshot().project.is_empty());
+    harness.shutdown().await;
+}
+
+/// P3: two concurrent identical grants call the runtime once and store one entry.
+#[tokio::test]
+async fn concurrent_grants_on_socket_are_idempotent_first_writer_wins() {
+    let harness = Harness::new().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    harness
+        .allowances
+        .attach_updater(counting_updater(Arc::clone(&calls)));
+    let socket = harness.socket.clone();
+    let first = tokio::spawn(async move {
+        crate::session_control::grant(
+            &socket,
+            Some("tcp://[203.0.113.10/32]:443"),
+            crate::allowances::GrantScope::Session,
+        )
+        .await
+    });
+    let socket = harness.socket.clone();
+    let second = tokio::spawn(async move {
+        crate::session_control::grant(
+            &socket,
+            Some("tcp://[203.0.113.10/32]:443"),
+            crate::allowances::GrantScope::Session,
+        )
+        .await
+    });
+    let (a, b) = (
+        first.await.unwrap().unwrap(),
+        second.await.unwrap().unwrap(),
+    );
+    assert!(
+        matches!(a, crate::allowances::GrantResult::Applied { .. }),
+        "{a:?}"
+    );
+    assert!(
+        matches!(b, crate::allowances::GrantResult::Applied { .. }),
+        "{b:?}"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the duplicate grant did not swap the policy again"
+    );
+    assert_eq!(harness.allowances.snapshot().session.len(), 1);
+    harness.shutdown().await;
 }

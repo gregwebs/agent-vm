@@ -311,35 +311,48 @@ impl Plan {
     /// Adopt this project's recorded allowances into the one policy computation
     /// (ADR-0065 P6). Never fails.
     ///
-    /// The returned [`Some`] is the one notice for the only case a record cannot
-    /// be carried: a hostname while a host HTTP proxy is in use. Every other
-    /// record either joins the authority or never reached here, because the
-    /// facade already refused it.
+    /// Returns the records that actually joined the authority and, when one could
+    /// not, the one notice. A record is skipped only when a hostname meets a host
+    /// HTTP proxy: the runtime resolves those names on the host, so the sandbox
+    /// never sees an SNI it could intercept.
+    ///
+    /// The returned set is what the live controller adopts, rather than the whole
+    /// store: seeding memory with a record the launch skipped would let a
+    /// proxy-skipped hostname look applied and block a live address grant (B1).
     pub(crate) fn adopt_recorded(
         &mut self,
         file: &Path,
         recorded: &crate::allowances::ProjectAllowances,
-    ) -> Option<String> {
-        if recorded.len() == 0 {
-            return None;
-        }
-        let mut applied = Vec::with_capacity(recorded.len());
+    ) -> (Vec<crate::allowances::ProjectAllowance>, Option<String>) {
+        let mut adopted = Vec::with_capacity(recorded.len());
         let mut skipped = 0usize;
-        for destination in recorded.destinations() {
+        for allowance in recorded.entries() {
             if self.host_proxy_used
-                && matches!(destination, crate::egress_policy::Allowance::Hostname(_))
+                && matches!(
+                    allowance.destination(),
+                    crate::egress_policy::Allowance::Hostname(_)
+                )
             {
                 skipped += 1;
                 continue;
             }
-            applied.push(destination.clone());
+            adopted.push(allowance.clone());
         }
-        self.egress.set_recorded(file, applied);
-        (skipped > 0).then(|| {
+        // Called whenever the store held anything, including when every record was
+        // skipped: `set_recorded` is what makes the file the record's provenance, and
+        // a skipped record must still leave the authority's own grants untouched.
+        if recorded.len() > 0 {
+            self.egress.set_recorded(
+                file,
+                adopted.iter().map(|a| a.destination().clone()).collect(),
+            );
+        }
+        let notice = (skipped > 0).then(|| {
             format!(
                 "{skipped} project hostname allowance(s) not applied: a host HTTP proxy resolves those names from the host, so the sandbox cannot intercept them; remove the proxy to apply them"
             )
-        })
+        });
+        (adopted, notice)
     }
 
     pub(crate) fn emit_launch_notices(&self) -> std::io::Result<()> {
@@ -714,6 +727,175 @@ fn connector_would_select(value: &str) -> bool {
     valid_proxy_authority(host_port)
 }
 
+/// The provenance label of a plan captured before the store was read.
+const PRE_ADOPTION_FILE: &str = "<pre-adoption>";
+
+/// A plan for a live-allowance test: an explicit authority and an explicit
+/// host-proxy flag, with no environment lookup, so a developer's proxy settings
+/// cannot change what the test measures.
+#[cfg(test)]
+pub(crate) fn plan_for_tests(allow_egress: &[&str], host_proxy_used: bool) -> Plan {
+    let mut plan = Plan::from_args_with_proxy_lookup(
+        Args {
+            publish: Vec::new(),
+            auto_publish: false,
+            allow_egress: allow_egress.iter().map(|text| (*text).to_owned()).collect(),
+            allow_internet_egress: None,
+            allow_lan: None,
+            allow_host: None,
+        },
+        None,
+        None,
+        |_| None,
+    )
+    .expect("valid test plan");
+    plan.host_proxy_used = host_proxy_used;
+    plan
+}
+
+/// Why a live policy swap is refused rather than applied (ADR-0065 Constraint 7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LivePolicyPrecondition {
+    /// A hostname was included while a host HTTP proxy is in use. The runtime
+    /// resolves those names on the host, so the sandbox never intercepts them.
+    HostProxyInUse,
+    /// The candidate set would add a TLS-intercepted port the launch did not fix.
+    /// `NetworkPolicy` is replaceable live; `tls.intercepted_ports` is not.
+    InterceptedPortsFixedAtLaunch,
+}
+
+impl LivePolicyPrecondition {
+    /// The precondition in the user's words.
+    ///
+    /// A `Debug` rendering is not a sentence: it names an enum variant rather than
+    /// what went wrong, and it is not the one-line escaped text a terminal needs
+    /// (R12). One clause per variant, so a new precondition cannot be rendered by
+    /// accident.
+    pub(crate) fn clause(self) -> &'static str {
+        match self {
+            Self::HostProxyInUse => {
+                "a host HTTP proxy is in use, so a hostname cannot be enforced in this session"
+            }
+            Self::InterceptedPortsFixedAtLaunch => {
+                "the change needs a TLS-intercepted port this launch did not fix"
+            }
+        }
+    }
+}
+
+/// Everything one live policy computation needs, captured at launch.
+///
+/// This is the only place the live allowance writer meets the one policy
+/// computation (D7): `allowances/` never names `EgressAuthority`, and
+/// `egress_policy.rs` never names an allowance type. The clone of the base
+/// authority keeps `configured` fixed, so every derivation starts from this
+/// launch's own grants and adds exactly the set it is handed.
+#[derive(Clone, Debug)]
+pub(crate) struct LivePolicyPlan {
+    egress: crate::egress_policy::EgressAuthority,
+    /// Captured once, at launch, and carried unchanged through every derivation.
+    /// A live swap may narrow within it but never add to it.
+    launch_intercepted_ports: Option<crate::egress_hostname::InterceptedPorts>,
+    host_proxy_used: bool,
+    allowances_file: std::path::PathBuf,
+}
+
+impl Plan {
+    /// Capture this launch's live policy inputs. There is deliberately no
+    /// production `default_deny()`: every caller passes the plan its launch
+    /// resolved, so a test cannot accidentally get a silent empty authority.
+    pub(crate) fn live_policy_plan(&self, allowances_file: Option<&Path>) -> LivePolicyPlan {
+        LivePolicyPlan {
+            egress: self.egress.clone(),
+            launch_intercepted_ports: self.egress.intercepted_ports(),
+            host_proxy_used: self.host_proxy_used,
+            // Before the store is read there is no file, and naming a relative
+            // `allowances.json` would read as one: it is only ever a provenance
+            // label, and adoption replaces it with the real path.
+            allowances_file: allowances_file
+                .map(Path::to_owned)
+                .unwrap_or_else(|| std::path::PathBuf::from(PRE_ADOPTION_FILE)),
+        }
+    }
+}
+
+impl LivePolicyPlan {
+    /// The policy this plan derives with no live additions: the launch's own
+    /// authority, and after boot adoption `configured ∪ adopted`.
+    pub(crate) fn policy(&self) -> microsandbox::NetworkPolicy {
+        self.egress.policy()
+    }
+
+    /// Whether the launch's own configured authority names this allowance. A live
+    /// revoke cannot remove it, so a caller must not claim the destination stopped
+    /// working when this is true.
+    pub(crate) fn is_configured(&self, allowance: &crate::egress_policy::Allowance) -> bool {
+        self.egress.configured_contains(allowance)
+    }
+
+    /// A plan whose launch fixed `port_hostname`'s ports but granted no hostname:
+    /// the shape that makes "revoke the last hostname" observable, because the
+    /// configured set does not put the rule back.
+    #[cfg(test)]
+    pub(crate) fn with_launch_ports_for_tests(
+        allow_egress: &[&str],
+        port_hostname: Option<&str>,
+        host_proxy_used: bool,
+    ) -> LivePolicyPlan {
+        let plan = plan_for_tests(allow_egress, host_proxy_used);
+        let mut live = plan.live_policy_plan(Some(Path::new("/launch/allowances.json")));
+        if let Some(name) = port_hostname {
+            match crate::egress_policy::Allowance::parse(name).unwrap() {
+                crate::egress_policy::Allowance::Hostname(hostname) => {
+                    live.launch_intercepted_ports =
+                        crate::egress_hostname::InterceptedPorts::for_hostnames(&[hostname]);
+                }
+                crate::egress_policy::Allowance::Address(_) => panic!("a hostname, not an address"),
+            }
+        }
+        live
+    }
+
+    /// Derive the policy for one combined allowance set and the plan that
+    /// produced it.
+    ///
+    /// The candidate is built by the launch's own one computation —
+    /// `EgressAuthority::set_recorded` then `EgressAuthority::policy()` — so no
+    /// second copy of rule assembly exists (R3). `launch_intercepted_ports` is
+    /// carried through unchanged, so a later derivation still measures against
+    /// what the netstack fixed at boot.
+    pub(crate) fn derive_for(
+        &self,
+        combined: Vec<crate::egress_policy::Allowance>,
+    ) -> Result<(Self, microsandbox::NetworkPolicy), LivePolicyPrecondition> {
+        if self.host_proxy_used
+            && combined
+                .iter()
+                .any(|a| matches!(a, crate::egress_policy::Allowance::Hostname(_)))
+        {
+            return Err(LivePolicyPrecondition::HostProxyInUse);
+        }
+        let mut candidate = self.egress.clone();
+        candidate.set_recorded(&self.allowances_file, combined);
+        if !crate::egress_hostname::InterceptedPorts::is_subset(
+            candidate.intercepted_ports().as_ref(),
+            self.launch_intercepted_ports.as_ref(),
+        ) {
+            return Err(LivePolicyPrecondition::InterceptedPortsFixedAtLaunch);
+        }
+        let derived_policy = candidate.policy();
+        Ok((
+            Self {
+                egress: candidate,
+                launch_intercepted_ports: self.launch_intercepted_ports.clone(),
+                host_proxy_used: self.host_proxy_used,
+                allowances_file: self.allowances_file.clone(),
+            },
+            derived_policy,
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{
@@ -734,6 +916,105 @@ mod tests {
     }
 
     mod hostname_tests;
+
+    /// The live derivation is the launch's own one computation: the policy it
+    /// derives equals a fresh launch resolved with exactly those entries.
+    #[tokio::test]
+    async fn live_policy_plan_derives_through_the_launch_computation() {
+        let plan = plan(args());
+        let live = plan.live_policy_plan(Some(Path::new(ALLOWANCE_FILE)));
+        let (derived, policy) = live
+            .derive_for(vec![
+                crate::egress_policy::Allowance::parse("tcp://[203.0.113.10/32]:443").unwrap(),
+            ])
+            .expect("an address derives");
+        // The same one computation, spelled directly.
+        let mut authority = crate::egress_policy::EgressAuthority::resolve(
+            crate::egress_policy::CliEgress {
+                internet: None,
+                lan: None,
+                host: None,
+                allowances: &[],
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        authority.set_recorded(
+            Path::new(ALLOWANCE_FILE),
+            vec![crate::egress_policy::Allowance::parse("tcp://[203.0.113.10/32]:443").unwrap()],
+        );
+        assert_eq!(format!("{policy:?}"), format!("{:?}", authority.policy()));
+        // A second derivation still measures against the launch's own ports.
+        let (again, _) = derived
+            .derive_for(vec![
+                crate::egress_policy::Allowance::parse("tcp://[198.51.100.0/24]:8443").unwrap(),
+            ])
+            .expect("a port-8443 address is not intercepted");
+        assert!(again.launch_intercepted_ports.is_none());
+    }
+
+    /// Adding a TLS-intercepted port the launch did not fix is refused, and
+    /// removing the last hostname narrows: the launch's set stays.
+    #[test]
+    fn live_policy_plan_narrows_but_never_adds_intercepted_ports() {
+        // A launch with no hostnames intercepted no port, so any hostname adds one.
+        let plain = plan(args()).live_policy_plan(Some(Path::new(ALLOWANCE_FILE)));
+        assert_eq!(
+            plain
+                .derive_for(vec![
+                    crate::egress_policy::Allowance::parse("api.example.com").unwrap()
+                ])
+                .unwrap_err(),
+            LivePolicyPrecondition::InterceptedPortsFixedAtLaunch
+        );
+
+        // A launch that started with a hostname may keep or remove it, but a new
+        // port (8443) is outside its set.
+        let with_hostname = plan(Args {
+            allow_egress: vec!["api.example.com".to_owned()],
+            ..args()
+        })
+        .live_policy_plan(Some(Path::new(ALLOWANCE_FILE)));
+        let (narrowed, _) = with_hostname.derive_for(Vec::new()).unwrap();
+        assert!(
+            narrowed.launch_intercepted_ports.is_some(),
+            "the launch's ports are carried, not recomputed"
+        );
+        assert_eq!(
+            with_hostname
+                .derive_for(vec![
+                    crate::egress_policy::Allowance::parse("tcp://other.example:8443").unwrap()
+                ])
+                .unwrap_err(),
+            LivePolicyPrecondition::InterceptedPortsFixedAtLaunch
+        );
+    }
+
+    /// Under a host proxy no hostname derives at all, and an address still does.
+    #[test]
+    fn live_policy_plan_refuses_a_hostname_under_a_host_proxy() {
+        let proxied = Plan::from_args_with_proxy_lookup(args(), None, None, |variable| {
+            (variable == "HTTPS_PROXY").then(|| "http://127.0.0.1:9".into())
+        })
+        .unwrap()
+        .live_policy_plan(Some(Path::new(ALLOWANCE_FILE)));
+        assert_eq!(
+            proxied
+                .derive_for(vec![
+                    crate::egress_policy::Allowance::parse("api.example.com").unwrap()
+                ])
+                .unwrap_err(),
+            LivePolicyPrecondition::HostProxyInUse
+        );
+        assert!(
+            proxied
+                .derive_for(vec![
+                    crate::egress_policy::Allowance::parse("tcp://[203.0.113.10/32]:443").unwrap()
+                ])
+                .is_ok()
+        );
+    }
 
     fn plan(input: Args) -> Plan {
         Plan::from_args_with_proxy_lookup(input, None, None, |_| None)
@@ -890,13 +1171,15 @@ mod tests {
     #[tokio::test]
     async fn recorded_address_reaches_the_applied_policy() {
         let mut plan = plan(args());
+        let (adopted, notice) = plan.adopt_recorded(
+            Path::new(ALLOWANCE_FILE),
+            &crate::allowances::ProjectAllowances::for_tests(&["tcp://[203.0.113.10/32]:443"]),
+        );
+        assert_eq!(notice, None, "an address record is never skipped");
         assert_eq!(
-            plan.adopt_recorded(
-                Path::new(ALLOWANCE_FILE),
-                &crate::allowances::ProjectAllowances::for_tests(&["tcp://[203.0.113.10/32]:443"])
-            ),
-            None,
-            "an address record is never skipped"
+            adopted.len(),
+            1,
+            "the adopted set is what the launch applied"
         );
         let network = recorded_network(&plan, "recorded-address").await;
         assert_eq!(
@@ -940,6 +1223,7 @@ mod tests {
                     "api.example.com",
                 ]),
             )
+            .1
             .expect("one notice for the skipped hostname");
         assert!(
             notice.starts_with("1 project hostname allowance(s) not applied: "),
@@ -981,7 +1265,8 @@ mod tests {
             plan.adopt_recorded(
                 Path::new(ALLOWANCE_FILE),
                 &crate::allowances::ProjectAllowances::for_tests(&["api.example.com"])
-            ),
+            )
+            .1,
             None
         );
         let network = recorded_network(&plan, "recorded-hostname").await;
@@ -1034,10 +1319,12 @@ mod tests {
                 .collect();
             let mut merged = plan(args());
             assert_eq!(
-                merged.adopt_recorded(
-                    Path::new(ALLOWANCE_FILE),
-                    &crate::allowances::ProjectAllowances::for_tests(&recorded)
-                ),
+                merged
+                    .adopt_recorded(
+                        Path::new(ALLOWANCE_FILE),
+                        &crate::allowances::ProjectAllowances::for_tests(&recorded)
+                    )
+                    .1,
                 None,
                 "{recorded:?}"
             );

@@ -1055,7 +1055,15 @@ pub(crate) async fn launch(
     // aimed at it (AC9), and every side-effect-free rejection above has already
     // returned. It never fails the launch: a state root that cannot be adopted
     // costs the feed, with one notice, and the VM still boots.
-    let live = crate::session_control::LiveSession::start(&session).await;
+    let live = crate::session_control::LiveSession::start(
+        &session,
+        crate::session_control::LiveSetup {
+            project: &project,
+            store: crate::allowances::host_store_handle(),
+            plan: network_plan.live_policy_plan(None),
+        },
+    )
+    .await;
     // Pre-#96 projects hold a real `<state>/home/.pi` directory that the new
     // compiled link would refuse to replace. Runs before ensure_dirs so the
     // rename lands on a free name, and in BOTH guest modes. It is
@@ -1537,10 +1545,24 @@ pub(crate) async fn launch(
     if let Some(notice) = recorded.notice() {
         notices.emit(format!("warning: {notice}"))?;
     }
-    if let Some(file) = recorded.file()
-        && let Some(notice) = network_plan.adopt_recorded(file, recorded.allowances())
-    {
-        notices.emit(format!("warning: {notice}"))?;
+    let adopted = match recorded.file() {
+        Some(file) => {
+            let (adopted, notice) = network_plan.adopt_recorded(file, recorded.allowances());
+            if let Some(notice) = notice {
+                notices.emit(format!("warning: {notice}"))?;
+            }
+            adopted
+        }
+        None => Vec::new(),
+    };
+    // ADR-0064 AC9: the live controller adopts only what the launch applied, and
+    // it adopts it here — after the store read, before the notices and the policy.
+    for warning in live.adopt_boot_allowances(
+        &recorded,
+        &adopted,
+        network_plan.live_policy_plan(recorded.file()),
+    ) {
+        notices.emit(format!("warning: {warning}"))?;
     }
     network_plan
         .emit_launch_notices()
@@ -4775,12 +4797,13 @@ mod tests {
         // before create (AC9), the feed starts the moment the sandbox does, and
         // nothing between the two removes this session's sandbox without the
         // teardown hook that finishes the feed.
-        let live_start = position("LiveSession::start(&session)");
+        let live_start = position("LiveSession::start(");
         // ADR-0065: the recorded set is read after the socket exists (so the
         // session cannot miss a change aimed at it) and before the notices and
         // the policy, so one computation produces every derived view.
         let recorded = position("crate::allowances::for_launch(&project)");
         let adopt = position(".adopt_recorded(");
+        let adopt_boot = position("live.adopt_boot_allowances(");
         assert!(
             live_start < recorded,
             "the store is read after the control socket exists (ADR-0064 AC9)"
@@ -4788,6 +4811,10 @@ mod tests {
         assert!(
             recorded < adopt && adopt < notices,
             "the recorded set joins the authority before the notices describe it"
+        );
+        assert!(
+            adopt < adopt_boot && adopt_boot < notices,
+            "the live controller adopts after the store read and before the notices"
         );
         let follow = position("live.follow(&sandbox);");
         let log_dir = position("let log_dir = sandbox_log_dir(");

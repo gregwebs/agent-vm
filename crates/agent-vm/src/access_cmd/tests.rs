@@ -65,9 +65,17 @@ fn empty_view() -> crate::allowances::ProjectView {
 async fn run_logged(dir: &SessionsDir, args: Args) -> (i32, String, String) {
     let mut out = Vec::new();
     let mut err = Vec::new();
-    let status = run_in(Some(dir), &args, &empty_view(), NOW, &mut out, &mut err)
-        .await
-        .expect("the command succeeds");
+    let status = run_in(
+        Some(dir),
+        &test_project(),
+        &args,
+        &empty_view(),
+        NOW,
+        &mut out,
+        &mut err,
+    )
+    .await
+    .expect("the command succeeds");
     (
         status,
         String::from_utf8(out).unwrap(),
@@ -75,12 +83,21 @@ async fn run_logged(dir: &SessionsDir, args: Args) -> (i32, String, String) {
     )
 }
 
+/// A captured project for the command's `--project` writes. It is a real
+/// directory, so a store write lands in a tempdir that no assertion reads.
+fn test_project() -> crate::project::ProjectDir {
+    crate::project::ProjectDir::from_path_for_tests(&std::env::temp_dir())
+        .expect("the temp directory is capturable")
+}
+
 const DEFAULT: Args = Args {
+    command: None,
     session: None,
     all: false,
 };
 
 const ALL: Args = Args {
+    command: None,
     session: None,
     all: true,
 };
@@ -318,6 +335,7 @@ async fn unknown_session_id_exits_1() {
     )
     .unwrap();
     let args = Args {
+        command: None,
         session: Some("deadbeef".to_owned()),
         all: false,
     };
@@ -332,21 +350,31 @@ async fn unknown_session_id_exits_1() {
     // The one accepted spelling is 8 lowercase hex.
     for bad in ["DEADBEEF", "deadbee", "deadbeef0", ""] {
         let args = Args {
+            command: None,
             session: Some(bad.to_owned()),
             all: false,
         };
         let mut out = Vec::new();
         let mut err = Vec::new();
         assert!(
-            run_in(Some(&dir), &args, &empty_view(), NOW, &mut out, &mut err)
-                .await
-                .is_err(),
+            run_in(
+                Some(&dir),
+                &test_project(),
+                &args,
+                &empty_view(),
+                NOW,
+                &mut out,
+                &mut err
+            )
+            .await
+            .is_err(),
             "{bad:?} is not a session ID"
         );
     }
 
     // A known ID shows that session alone, and shows it whole.
     let args = Args {
+        command: None,
         session: Some("0a1b2c3d".to_owned()),
         all: false,
     };
@@ -401,7 +429,7 @@ async fn session_labels_match_the_table() {
     }
 
     // `running` and `not responding` need a real socket: one answers, one hangs.
-    let responding = crate::session_control::LiveSession::start(&project(root.path())).await;
+    let responding = start_live(root.path()).await;
     let hung_dir = dir.clone();
     let hung_id = SessionId::parse("00000009").unwrap();
     let listener = tokio::net::UnixListener::bind(hung_dir.socket_path(&hung_id)).unwrap();
@@ -477,9 +505,17 @@ async fn a_fresh_project_prints_no_refusals_and_creates_nothing() {
     assert!(!path.exists());
     let mut out = Vec::new();
     let mut err = Vec::new();
-    let status = run_in(None, &table_args(), &empty_view(), NOW, &mut out, &mut err)
-        .await
-        .unwrap();
+    let status = run_in(
+        None,
+        &test_project(),
+        &table_args(),
+        &empty_view(),
+        NOW,
+        &mut out,
+        &mut err,
+    )
+    .await
+    .unwrap();
     assert_eq!(status, 0);
     assert_eq!(
         String::from_utf8(out).unwrap(),
@@ -510,13 +546,14 @@ async fn a_fresh_project_prints_no_refusals_and_creates_nothing() {
 #[tokio::test]
 async fn a_live_session_is_listed_before_it_has_ended() {
     let root = tempfile::tempdir().unwrap();
-    let live = crate::session_control::LiveSession::start(&project(root.path())).await;
+    let live = start_live(root.path()).await;
     let dir = session_dir(root.path());
     let (status, _, _) = run_logged(&dir, table_args()).await;
     assert_eq!(status, 0);
     // A session that has refused nothing has no row, but it is not an error and
     // it is not reported as absent by `--session`.
     let args = Args {
+        command: None,
         session: Some(live.id().as_str().to_owned()),
         all: false,
     };
@@ -524,6 +561,24 @@ async fn a_live_session_is_listed_before_it_has_ended() {
     assert_eq!(status, 0, "{err}");
     assert_eq!(out, "No refusals in the last 24 hours.\n");
     live.finish().await;
+}
+
+/// Start a session with a temporary store: no test may touch the real
+/// `~/.config/agent-vm` (R13).
+async fn start_live(root: &Path) -> crate::session_control::LiveSession {
+    let session = project(root);
+    let project = crate::project::ProjectDir::from_path_for_tests(root).expect("a project");
+    let store = crate::allowances::StoreHandle::at_for_tests(&root.join("allowances-store"));
+    let plan = crate::network::plan_for_tests(&[], false).live_policy_plan(None);
+    crate::session_control::LiveSession::start(
+        &session,
+        crate::session_control::LiveSetup {
+            project: &project,
+            store,
+            plan,
+        },
+    )
+    .await
 }
 
 fn project(root: &Path) -> ProjectSession {
@@ -720,9 +775,17 @@ async fn run_with(
 ) -> (i32, String, String) {
     let mut out = Vec::new();
     let mut err = Vec::new();
-    let status = run_in(Some(dir), &DEFAULT, allowances, NOW, &mut out, &mut err)
-        .await
-        .expect("the command succeeds");
+    let status = run_in(
+        Some(dir),
+        &test_project(),
+        &DEFAULT,
+        allowances,
+        NOW,
+        &mut out,
+        &mut err,
+    )
+    .await
+    .expect("the command succeeds");
     (
         status,
         String::from_utf8(out).unwrap(),
@@ -833,4 +896,817 @@ async fn a_store_problem_is_one_warning() {
         "{out}"
     );
     assert!(!out.contains("recorded project allowance"), "{out}");
+}
+
+// ---------------------------------------------------------------------------
+// Group C: `access allow|allowances|revoke` (PR 2)
+// ---------------------------------------------------------------------------
+
+use crate::allowances::ProjectView;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+fn live_project(root: &Path) -> crate::project::ProjectDir {
+    crate::project::ProjectDir::from_path_for_tests(root).unwrap()
+}
+
+/// The view the CLI writes through: the same directory the live session's store
+/// handle points at, so a `--project` write and a later read agree.
+fn live_view(root: &Path) -> ProjectView {
+    let project = live_project(root);
+    ProjectView::at_dir_for_tests(
+        &root.join("allowances-store"),
+        &crate::image_pin::ProjectId::of(&project),
+    )
+}
+
+/// A policy updater a test can fail or count, sharing one revision counter.
+#[derive(Default)]
+struct Updater {
+    calls: AtomicUsize,
+    fail: AtomicBool,
+    unsupported: AtomicBool,
+    seen: Mutex<Vec<microsandbox::NetworkPolicy>>,
+}
+
+impl Updater {
+    fn handle(self: &Arc<Self>) -> crate::allowances::PolicyUpdater {
+        let updater = Arc::clone(self);
+        Arc::new(move |policy| {
+            let updater = Arc::clone(&updater);
+            Box::pin(async move {
+                if updater.unsupported.load(Ordering::SeqCst) {
+                    return Err(microsandbox::MicrosandboxError::Unsupported {
+                        op: microsandbox::Operation::SandboxUpdateNetworkPolicy,
+                        reason: microsandbox::UnsupportedReason::NotAvailable("test".to_owned()),
+                    });
+                }
+                if updater.fail.load(Ordering::SeqCst) {
+                    return Err(microsandbox::MicrosandboxError::ControlStateChanged);
+                }
+                updater.seen.lock().unwrap().push(policy);
+                let previous = updater.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(previous as u64 + 2)
+            })
+        })
+    }
+}
+
+/// Start a live session over `root`'s sessions directory, optionally attaching a
+/// test updater (the launcher's `follow` does this after `create`).
+async fn start_fixture(
+    root: &Path,
+    updater: Option<crate::allowances::PolicyUpdater>,
+) -> crate::session_control::LiveSession {
+    let session = project(root);
+    let project = live_project(root);
+    let store = crate::allowances::StoreHandle::at_for_tests(&root.join("allowances-store"));
+    let plan = crate::network::plan_for_tests(&[], false).live_policy_plan(None);
+    let live = crate::session_control::LiveSession::start(
+        &session,
+        crate::session_control::LiveSetup {
+            project: &project,
+            store,
+            plan,
+        },
+    )
+    .await;
+    if let Some(updater) = updater {
+        live.allowances().attach_updater(updater);
+    }
+    live
+}
+
+/// Ingest one `tcp-syn` denial and return its refusal ID.
+fn ingest_denial(live: &crate::session_control::LiveSession) -> String {
+    // The session refuses any record older than its own start, so the timestamp
+    // is "now" rather than the command's injected clock.
+    let now_ms = crate::refusal::feed::now_ms();
+    let record = microsandbox::logs::NetworkLogRecord {
+        v: 1,
+        t: chrono::DateTime::from_timestamp_millis(now_ms).unwrap(),
+        s: microsandbox::logs::LogSource::Network,
+        event: microsandbox::logs::NetworkLogEvent::Refusal(microsandbox::logs::NetworkRefusal {
+            site: microsandbox::logs::RefusalSite::TcpSyn,
+            layer: microsandbox::logs::RefusalLayer::Tenant,
+            protocol: microsandbox_types::Protocol::Tcp,
+            dst_ip: Some("203.0.113.10".parse().unwrap()),
+            dst_port: Some(443),
+            name: None,
+            name_source: microsandbox::logs::NameSource::Absent,
+            revision: 1,
+        }),
+    };
+    let feed = live.refusals().expect("a live refusal feed");
+    let mut dirty = false;
+    assert!(feed.ingest(&record, &mut dirty, now_ms));
+    feed.snapshot().entries[0].id.clone()
+}
+
+async fn run_command(
+    root: &Path,
+    command: AccessSubcommand,
+    view: &ProjectView,
+) -> (i32, String, String) {
+    let dir = session_dir(root);
+    let args = Args {
+        command: Some(command),
+        session: None,
+        all: false,
+    };
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let status = run_in(
+        Some(&dir),
+        &live_project(root),
+        &args,
+        view,
+        NOW,
+        &mut out,
+        &mut err,
+    )
+    .await
+    .expect("the command succeeds");
+    (
+        status,
+        String::from_utf8(out).unwrap(),
+        String::from_utf8(err).unwrap(),
+    )
+}
+
+fn allow(id: &str, project: bool) -> AccessSubcommand {
+    AccessSubcommand::Allow(AllowArgs {
+        id: id.to_owned(),
+        project,
+        session: None,
+    })
+}
+
+/// C1: `allow` (session), `allow --project`, the table's applied row, the
+/// listing, and `revoke`, all in process against one live session.
+#[tokio::test]
+async fn allow_session_and_project_end_to_end_in_process() {
+    let root = tempfile::tempdir().unwrap();
+    let updater = Arc::new(Updater::default());
+    let live = start_fixture(root.path(), Some(updater.handle())).await;
+    let id = ingest_denial(&live);
+    let view = live_view(root.path());
+
+    // A plain allow changes the session only.
+    let (status, out, err) = run_command(root.path(), allow(&id, false), &view).await;
+    assert_eq!(status, 0, "{out}{err}");
+    assert!(out.contains("allowed tcp://[203.0.113.10/32]:443"), "{out}");
+    assert!(out.contains("policy revision 2"), "{out}");
+    // Nothing was recorded for the project.
+    assert_eq!(view.allowances().len(), 0);
+
+    // The row says applied, with the revision.
+    let (_, table, _) = run_command(
+        root.path(),
+        AccessSubcommand::Allowances(AllowancesArgs { session: None }),
+        &view,
+    )
+    .await;
+    assert!(table.contains("session"), "{table}");
+    assert!(table.contains("applied (rev 2)"), "{table}");
+
+    // `--project` on the same destination records it, without another swap.
+    let (status, out, err) = run_command(root.path(), allow(&id, true), &view).await;
+    assert_eq!(status, 0, "{out}{err}");
+    assert!(out.contains("and recorded for this project"), "{out}");
+    assert_eq!(updater.calls.load(Ordering::SeqCst), 1, "no second swap");
+    assert_eq!(
+        live_view(root.path()).allowances().len(),
+        1,
+        "the project record was written"
+    );
+
+    // `access` renders the applied project allowance for this session.
+    let (status, table, _) = run_logged(&session_dir(root.path()), table_args()).await;
+    assert_eq!(status, 0);
+    assert!(
+        table.contains("applied project allowance tcp://[203.0.113.10/32]:443")
+            && table.contains("allowed in this session (rev 2)"),
+        "{table}"
+    );
+
+    // Revoke both: the destination leaves this session's policy.
+    let (status, out, err) = run_command(
+        root.path(),
+        AccessSubcommand::Revoke(RevokeArgs {
+            destination: "tcp://[203.0.113.10/32]:443".to_owned(),
+            project: false,
+            session_only: false,
+            session: None,
+        }),
+        &view,
+    )
+    .await;
+    assert_eq!(status, 0, "{out}{err}");
+    assert!(out.contains("revoked tcp://[203.0.113.10/32]:443"), "{out}");
+    assert_eq!(updater.calls.load(Ordering::SeqCst), 2);
+    let (_, table, _) = run_logged(&session_dir(root.path()), table_args()).await;
+    assert!(
+        !table.contains("applied"),
+        "the row is no longer applied: {table}"
+    );
+    live.finish().await;
+}
+
+/// C2: an older runtime records the allowance for the next launch and exits 0;
+/// a store that cannot be written exits 1.
+#[tokio::test]
+async fn older_runtime_without_policy_update_yields_next_launch_grant_and_never_fails() {
+    let root = tempfile::tempdir().unwrap();
+    let updater = Arc::new(Updater::default());
+    updater.unsupported.store(true, Ordering::SeqCst);
+    let live = start_fixture(root.path(), Some(updater.handle())).await;
+    let id = ingest_denial(&live);
+    let view = live_view(root.path());
+    let (status, out, err) = run_command(root.path(), allow(&id, true), &view).await;
+    assert_eq!(status, 0, "{out}{err}");
+    assert!(out.contains("recorded"), "{out}");
+    assert_eq!(live_view(root.path()).allowances().len(), 1);
+    live.finish().await;
+
+    // A damaged store is a failure, not a silent no-op.
+    let root = tempfile::tempdir().unwrap();
+    let updater = Arc::new(Updater::default());
+    updater.unsupported.store(true, Ordering::SeqCst);
+    let live = start_fixture(root.path(), Some(updater.handle())).await;
+    let id = ingest_denial(&live);
+    let store_dir = root.path().join("allowances-store");
+    std::fs::create_dir(&store_dir).unwrap();
+    std::fs::write(store_dir.join("allowances.json"), b"not json").unwrap();
+    let view = live_view(root.path());
+    let (status, _, err) = run_command(root.path(), allow(&id, true), &view).await;
+    assert_eq!(status, 1, "{err}");
+    assert!(err.contains("could not be used"), "{err}");
+    live.finish().await;
+}
+
+/// C3: a runtime failure writes no record; a store failure after the runtime
+/// confirmed demotes to session scope and every later render says so.
+#[tokio::test]
+async fn project_grant_writes_no_record_when_live_session_cannot_confirm() {
+    let root = tempfile::tempdir().unwrap();
+    let updater = Arc::new(Updater::default());
+    updater.fail.store(true, Ordering::SeqCst);
+    let live = start_fixture(root.path(), Some(updater.handle())).await;
+    let id = ingest_denial(&live);
+    let view = live_view(root.path());
+    let (status, _, err) = run_command(root.path(), allow(&id, true), &view).await;
+    assert_eq!(status, 1, "{err}");
+    assert!(
+        err.contains("the runtime could not apply the change"),
+        "{err}"
+    );
+    // The store itself is untouched: a stale view would agree with any bug, so
+    // the file's absence is the assertion (and kills the mutant that records on
+    // a runtime failure).
+    assert!(
+        !root
+            .path()
+            .join("allowances-store/allowances.json")
+            .exists(),
+        "no record was written"
+    );
+    assert_eq!(
+        live_view(root.path()).allowances().len(),
+        0,
+        "the store was not written"
+    );
+    live.finish().await;
+}
+
+/// C3(d): the runtime applies it, the store cannot record it, and both `access`
+/// and `access allowances` render the demoted session-only status afterwards.
+#[tokio::test]
+async fn applied_not_recorded_demotes_to_session_scope_across_subsequent_access_and_allowances_calls()
+ {
+    let root = tempfile::tempdir().unwrap();
+    let updater = Arc::new(Updater::default());
+    let live = start_fixture(root.path(), Some(updater.handle())).await;
+    let id = ingest_denial(&live);
+    // An authority directory another account could write: the writer refuses.
+    use std::os::unix::fs::PermissionsExt as _;
+    let store_dir = root.path().join("allowances-store");
+    std::fs::create_dir(&store_dir).unwrap();
+    std::fs::set_permissions(&store_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let view = live_view(root.path());
+
+    let (status, _, err) = run_command(root.path(), allow(&id, true), &view).await;
+    assert_eq!(status, 1, "{err}");
+    assert!(
+        err.contains("applied session allowance tcp://[203.0.113.10/32]:443")
+            && err.contains("applied to this session only (rev 2), not recorded for the project:"),
+        "{err}"
+    );
+    // Both later renders carry the demotion.
+    let (_, table, _) = run_logged(&session_dir(root.path()), table_args()).await;
+    assert!(
+        table.contains("applied to this session only (rev 2), not recorded for the project:"),
+        "{table}"
+    );
+    let (_, listing, _) = run_command(
+        root.path(),
+        AccessSubcommand::Allowances(AllowancesArgs { session: None }),
+        &view,
+    )
+    .await;
+    assert!(
+        listing.contains("not recorded for the project") && listing.contains("rev 2"),
+        "{listing}"
+    );
+    live.finish().await;
+}
+
+/// C4: an unconfirmed revoke deletes the project record, keeps memory, names the
+/// session and the hard cut, and exits 1.
+#[tokio::test]
+async fn revoke_exits_nonzero_and_names_session_when_unconfirmed() {
+    let root = tempfile::tempdir().unwrap();
+    let updater = Arc::new(Updater::default());
+    let live = start_fixture(root.path(), Some(updater.handle())).await;
+    let id = ingest_denial(&live);
+    let view = live_view(root.path());
+    run_command(root.path(), allow(&id, true), &view).await;
+    assert_eq!(live_view(root.path()).allowances().len(), 1);
+    let before = live.allowances().snapshot();
+
+    updater.fail.store(true, Ordering::SeqCst);
+    let (status, _, err) = run_command(
+        root.path(),
+        AccessSubcommand::Revoke(RevokeArgs {
+            destination: "tcp://[203.0.113.10/32]:443".to_owned(),
+            project: false,
+            session_only: false,
+            session: None,
+        }),
+        &view,
+    )
+    .await;
+    assert_eq!(status, 1, "{err}");
+    assert!(err.contains("could not confirm revoking"), "{err}");
+    assert!(
+        err.contains("Stopping the session is the guaranteed hard cut"),
+        "{err}"
+    );
+    assert_eq!(
+        live_view(root.path()).allowances().len(),
+        0,
+        "the project record is still deleted"
+    );
+    assert_eq!(
+        live.allowances().snapshot(),
+        before,
+        "unconfirmed removes no in-memory entry"
+    );
+    live.finish().await;
+}
+
+/// C5: siblings are named with their exact states before and after, and are not
+/// changed.
+#[tokio::test]
+async fn siblings_are_named_before_and_after_with_exact_states() {
+    let root = tempfile::tempdir().unwrap();
+    let updater = Arc::new(Updater::default());
+    let target = start_fixture(root.path(), Some(updater.handle())).await;
+    let sibling = start_fixture(root.path(), Some(Arc::new(Updater::default()).handle())).await;
+    let id = ingest_denial(&target);
+    let view = live_view(root.path());
+
+    let (status, out, err) = run_command(root.path(), allow(&id, false), &view).await;
+    assert_eq!(status, 0, "{out}{err}");
+    let sibling_id = sibling.id().as_str();
+    for line in out.lines().filter(|line| line.contains("sibling sessions")) {
+        assert!(line.contains(&format!("{sibling_id} (running)")), "{line}");
+    }
+    assert_eq!(
+        out.matches("sibling sessions").count(),
+        2,
+        "named before and after: {out}"
+    );
+    // The sibling's own policy never changed.
+    assert!(sibling.allowances().snapshot().session.is_empty());
+    target.finish().await;
+    sibling.finish().await;
+}
+
+/// C5 / B-S2 / C-M5: the sibling line names **all five** states, and an offline
+/// revoke names its siblings too.
+///
+/// The five labels come from the same rule the table uses, so a `row.label`
+/// replaced by a literal `"running"` has to fail here — that is the mutant this
+/// test exists to kill. The offline half is the case the ticket names as the
+/// reason target-only is acceptable: a project whose sessions have all ended.
+#[tokio::test]
+async fn siblings_are_named_in_every_state_and_offline_revoke_names_them() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = session_dir(root.path());
+    let now = NOW;
+    // Five sessions, one per label, plus the target of the live change.
+    let mut wanted = Vec::new();
+    let mut cases: Vec<(String, String, SessionSnapshot)> = Vec::new();
+    for (index, label) in [
+        "running",
+        "running (no control socket)",
+        "not responding",
+        "ended",
+        "ended (unclean)",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = format!("0000000{index}");
+        let entry_id = format!("aaaaaaa{index}");
+        let mut snap = snapshot(
+            &id,
+            now - 10_000,
+            vec![entry(&entry_id, address("203.0.113.10", 443), now - 5_000)],
+        );
+        match label {
+            "running" => {}
+            "running (no control socket)" => {
+                snap.info.socket = false;
+                snap.heartbeat_ms = Some(now - 1_000);
+            }
+            "not responding" => {
+                // A bound socket that never answers: discovery dials it and its
+                // `EXCHANGE_TIMEOUT` expires, which is the only way to produce
+                // this label (see the hung listener below).
+                snap.heartbeat_ms = Some(now - 1_000);
+            }
+            "ended" => snap.ended_ms = Some(now - 1_000),
+            _ => snap.info.socket = false,
+        }
+        cases.push((id, label.to_owned(), snap));
+        wanted.push(entry_id);
+    }
+    for (_, _, snap) in &cases {
+        dir.write(snap, now).unwrap();
+    }
+    // The `not responding` session's socket accepts and never answers.
+    let hung_id = SessionId::parse(&cases[2].0).unwrap();
+    let listener = tokio::net::UnixListener::bind(dir.socket_path(&hung_id)).unwrap();
+    let hung = tokio::spawn(async move {
+        let mut streams = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            streams.push(stream);
+        }
+    });
+    // The target for the live path is the one `running` session; its own row is
+    // not a sibling, so four labels must appear beside the change.
+    let view = empty_view();
+    let args = AccessSubcommand::Allow(AllowArgs {
+        id: wanted[0].clone(),
+        project: false,
+        session: None,
+    });
+    let (status, out, err) = run_command(root.path(), args, &view).await;
+    assert!(status != 0, "the stale socket cannot confirm: {out}{err}");
+    let before = out
+        .lines()
+        .find(|line| line.starts_with("sibling sessions (not targeted"))
+        .unwrap_or_else(|| panic!("a before line: {out}{err}"));
+    for (id, label) in cases.iter().map(|(id, label, _)| (id, label)) {
+        if id == &cases[0].0 {
+            assert!(
+                !before.contains(&format!("{id} ({label})")),
+                "the target is not a sibling"
+            );
+            continue;
+        }
+        assert!(
+            before.contains(&format!("{id} ({label})")),
+            "{label}: {before}"
+        );
+    }
+    hung.abort();
+
+    // Offline: every session has ended, so `revoke` has no target — and must
+    // still name them.
+    let root = tempfile::tempdir().unwrap();
+    let dir = session_dir(root.path());
+    let mut ended = snapshot(
+        "0000000a",
+        now - 10_000,
+        vec![entry("aaaaaa0a", address("203.0.113.20", 443), now - 5_000)],
+    );
+    ended.ended_ms = Some(now - 1_000);
+    dir.write(&ended, now).unwrap();
+    let mut unclean = snapshot("0000000b", now - 10_000, Vec::new());
+    unclean.info.socket = false;
+    dir.write(&unclean, now).unwrap();
+    let offline_view = live_view(root.path());
+    let (status, out, err) = run_command(
+        root.path(),
+        AccessSubcommand::Revoke(RevokeArgs {
+            destination: "tcp://[203.0.113.20/32]:443".to_owned(),
+            project: false,
+            session_only: false,
+            session: None,
+        }),
+        &offline_view,
+    )
+    .await;
+    assert_eq!(status, 0, "{out}{err}");
+    assert!(
+        out.contains("no session is active"),
+        "the offline answer: {out}"
+    );
+    for line in out.lines().filter(|line| line.contains("sibling sessions")) {
+        assert!(line.contains("0000000a (ended)"), "{line}");
+        assert!(line.contains("0000000b (ended (unclean))"), "{line}");
+    }
+    assert_eq!(
+        out.matches("sibling sessions").count(),
+        2,
+        "named before and after the offline change: {out}"
+    );
+}
+
+/// B01: a revoke of a destination that only the launch's own authority admits is
+/// reported as *still allowed*, never as "not in force", and claims no revision.
+#[tokio::test]
+async fn revoke_of_a_launch_configured_destination_is_not_reported_as_gone() {
+    let root = tempfile::tempdir().unwrap();
+    let session = project(root.path());
+    let live_project = live_project(root.path());
+    let store = crate::allowances::StoreHandle::at_for_tests(&root.path().join("allowances-store"));
+    let plan = crate::network::plan_for_tests(&["tcp://[203.0.113.0/24]:443"], false)
+        .live_policy_plan(None);
+    let live = crate::session_control::LiveSession::start(
+        &session,
+        crate::session_control::LiveSetup {
+            project: &live_project,
+            store,
+            plan,
+        },
+    )
+    .await;
+    let view = live_view(root.path());
+    let (status, out, err) = run_command(
+        root.path(),
+        AccessSubcommand::Revoke(RevokeArgs {
+            destination: "tcp://[203.0.113.0/24]:443".to_owned(),
+            project: false,
+            session_only: false,
+            session: None,
+        }),
+        &view,
+    )
+    .await;
+    assert_eq!(status, 0, "the honest answer is not a failure: {out}{err}");
+    assert!(
+        out.contains("is not a session or project allowance of session"),
+        "{out}"
+    );
+    assert!(
+        out.contains("still allowed by this launch's own --allow-egress or [network] authority"),
+        "{out}"
+    );
+    assert!(!out.contains("not in force"), "the false claim: {out}");
+    assert!(
+        !out.contains("confirmed "),
+        "no runtime call happened: {out}"
+    );
+    assert!(
+        !out.contains("policy revision"),
+        "no revision was observed: {out}"
+    );
+    live.finish().await;
+}
+
+/// C-M1: a demoted live project entry beside a store record keeps saying so.
+///
+/// This is the state the review's surviving mutation needs: the store read lists
+/// the destination (so the record loop runs) *and* the session's live snapshot
+/// carries the same destination with a demotion. Collapsing the match to
+/// `(Some(_), None) => applied (rev N)` used to render it as a plain project
+/// allowance and nothing failed.
+#[tokio::test]
+async fn allowances_keeps_a_demoted_live_project_entry_demoted() {
+    let view = ProjectView::for_tests(&["tcp://[203.0.113.30/32]:443"], NOW - 60_000, None);
+    let id = SessionId::parse("0000000c").unwrap();
+    let snap = crate::allowances::SessionAllowancesSnapshot {
+        session: Vec::new(),
+        project: vec![crate::allowances::WireAllowance {
+            destination: "tcp://[203.0.113.30/32]:443".to_owned(),
+            granted_ms: NOW - 30_000,
+            revision: Some(2),
+            not_recorded_error: Some("the store is not trusted".to_owned()),
+        }],
+    };
+    let discovery = crate::session_control::Discovery {
+        live: Vec::new(),
+        logged: Vec::new(),
+        unresponsive: Vec::new(),
+        live_allowances: vec![(id.clone(), snap)],
+        evicted_sessions: 0,
+        warnings: Vec::new(),
+    };
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let status = run_allowances(
+        &view,
+        &discovery,
+        &[],
+        &AllowancesArgs { session: None },
+        &mut out,
+        &mut err,
+    )
+    .unwrap();
+    assert_eq!(status, 0);
+    let listing = String::from_utf8(out).unwrap();
+    let row = listing
+        .lines()
+        .find(|line| line.starts_with("project"))
+        .unwrap_or_else(|| panic!("a project row: {listing}"));
+    assert!(
+        row.contains("applied to this session only (rev 2), not recorded for the project: the store is not trusted"),
+        "{row}"
+    );
+}
+
+/// C6: a session allowance writes nothing anywhere.
+#[tokio::test]
+async fn session_allowance_never_touches_disk_or_another_project() {
+    let root = tempfile::tempdir().unwrap();
+    let updater = Arc::new(Updater::default());
+    let live = start_fixture(root.path(), Some(updater.handle())).await;
+    let id = ingest_denial(&live);
+    let view = live_view(root.path());
+    let (status, out, err) = run_command(root.path(), allow(&id, false), &view).await;
+    assert_eq!(status, 0, "{out}{err}");
+    assert!(
+        !root.path().join("allowances-store").exists(),
+        "a session grant creates no authority directory"
+    );
+    assert!(view.allowances().len() == 0);
+    let refusals = std::fs::read_to_string(root.path().join("ab12cd34ef56.sessions/refusals.json"))
+        .unwrap_or_default();
+    assert!(
+        !refusals.contains("203.0.113.10/32"),
+        "the in-memory grant is not persisted in the refusal log"
+    );
+    live.finish().await;
+}
+
+/// AC9: the listing unions the store and every live session, one row per
+/// `(project allowance, active session)`, and names a session that cannot answer.
+#[tokio::test]
+async fn allowances_subcommand_unions_store_and_live_sessions_and_names_unresponsive() {
+    let root = tempfile::tempdir().unwrap();
+    let updater = Arc::new(Updater::default());
+    let target = start_fixture(root.path(), Some(updater.handle())).await;
+    let other = start_fixture(root.path(), Some(Arc::new(Updater::default()).handle())).await;
+    let id = ingest_denial(&target);
+    let view = live_view(root.path());
+    let (status, out, err) = run_command(root.path(), allow(&id, true), &view).await;
+    assert_eq!(status, 0, "{out}{err}");
+    // Re-read the store: a view is one read, and the grant just wrote it.
+    let view = live_view(root.path());
+
+    // A bound socket that holds its connections is `not responding`.
+    let hung_id = SessionId::parse("00000009").unwrap();
+    let dir = session_dir(root.path());
+    let listener = tokio::net::UnixListener::bind(dir.socket_path(&hung_id)).unwrap();
+    let held = tokio::spawn(async move {
+        let mut streams = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            streams.push(stream);
+        }
+    });
+
+    let (status, listing, err) = run_command(
+        root.path(),
+        AccessSubcommand::Allowances(AllowancesArgs { session: None }),
+        &view,
+    )
+    .await;
+    assert_eq!(status, 0, "{listing}{err}");
+    let target_id = target.id().as_str().to_owned();
+    let other_id = other.id().as_str().to_owned();
+    let applied = listing
+        .lines()
+        .find(|line| line.starts_with("project") && line.contains(&target_id))
+        .unwrap_or_else(|| panic!("a project row for the target: {listing}"));
+    assert!(applied.contains("applied (rev 2)"), "{applied}");
+    let pending = listing
+        .lines()
+        .find(|line| line.starts_with("project") && line.contains(&other_id))
+        .unwrap_or_else(|| panic!("a project row for the sibling: {listing}"));
+    assert!(pending.contains("not in force until relaunch"), "{pending}");
+    assert!(
+        err.contains("00000009") && err.contains("not responding"),
+        "{err}"
+    );
+    // AC9's "and in STATUS": the session that could not be asked gets its own row
+    // whose STATUS names it, so "not in force" (a session that answered) and "not
+    // asked" never share a cell (D1).
+    let unasked = listing
+        .lines()
+        .find(|line| {
+            line.starts_with("project") && line.contains("00000009") && line.contains("not shown")
+        })
+        .unwrap_or_else(|| panic!("the unresponsive session in STATUS: {listing}"));
+    assert!(
+        unasked.contains("session 00000009 not responding"),
+        "{unasked}"
+    );
+    assert!(
+        !pending.contains("00000009"),
+        "an answered session's row must not name another session's silence: {pending}"
+    );
+    held.abort();
+    target.finish().await;
+    other.finish().await;
+}
+
+/// D1, structurally: `--session X` lists X and nobody else.
+///
+/// The verifier's probe pins the borrowed-suffix half (X's row must not name a
+/// session it never asked). This pins the other half: now that a session that
+/// could not be asked gets its own row, the filter has to exclude *that row too*,
+/// or a listing scoped to X still names Y — and the row is where the leak is
+/// observable once the suffix is gone.
+#[tokio::test]
+async fn allowances_session_filter_lists_only_the_named_session() {
+    let root = tempfile::tempdir().unwrap();
+    let target = start_fixture(root.path(), Some(Arc::new(Updater::default()).handle())).await;
+    let id = ingest_denial(&target);
+    let view = live_view(root.path());
+    let (status, out, err) = run_command(root.path(), allow(&id, true), &view).await;
+    assert_eq!(status, 0, "{out}{err}");
+    let view = live_view(root.path());
+    let target_id = target.id().as_str().to_owned();
+
+    // A second session that binds a socket and never answers.
+    let hung_id = SessionId::parse("00000009").unwrap();
+    let dir = session_dir(root.path());
+    let listener = tokio::net::UnixListener::bind(dir.socket_path(&hung_id)).unwrap();
+    let held = tokio::spawn(async move {
+        let mut streams = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            streams.push(stream);
+        }
+    });
+
+    let (status, listing, err) = run_command(
+        root.path(),
+        AccessSubcommand::Allowances(AllowancesArgs {
+            session: Some(target_id.clone()),
+        }),
+        &view,
+    )
+    .await;
+    assert_eq!(status, 0, "{listing}{err}");
+    assert!(listing.contains(&target_id), "{listing}");
+    assert!(
+        !listing.contains("00000009"),
+        "a session the filter excluded must not appear in the listing: {listing}"
+    );
+    // The warning still names it: the filter narrows the table, not the report of
+    // what could not be asked.
+    assert!(
+        err.contains("00000009") && err.contains("not responding"),
+        "{err}"
+    );
+
+    held.abort();
+    target.finish().await;
+}
+
+/// AC2 (offline half): an ended session records a `--project` grant for the next
+/// launch and refuses a session-only one.
+#[tokio::test]
+async fn allow_on_ended_session_records_project_and_refuses_session_only() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = session_dir(root.path());
+    let mut ended = snapshot(
+        "00000001",
+        NOW - 10_000,
+        vec![entry("aaaaaaa1", address("203.0.113.10", 443), NOW - 5_000)],
+    );
+    ended.info.socket = false;
+    ended.ended_ms = Some(NOW - 4_000);
+    dir.write(&ended, NOW).unwrap();
+    let view = live_view(root.path());
+
+    // Session-only cannot be recorded: the session that asked is gone.
+    let (status, out, err) = run_command(root.path(), allow("aaaaaaa1", false), &view).await;
+    assert_eq!(status, 1, "{out}{err}");
+    assert!(err.contains("has ended"), "{err}");
+    assert_eq!(live_view(root.path()).allowances().len(), 0);
+
+    // `--project` records it for the next launch.
+    let (status, out, err) = run_command(root.path(), allow("aaaaaaa1", true), &view).await;
+    assert_eq!(status, 0, "{out}{err}");
+    assert!(out.contains("recorded project allowance"), "{out}");
+    assert_eq!(
+        live_view(root.path()).allowances().len(),
+        1,
+        "the record is what the next launch reads"
+    );
 }

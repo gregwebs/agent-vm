@@ -917,7 +917,11 @@ See [ADR-0040](docs/adr/0040-persisted-user-network-authority.md).
 teardown. A relaunch is a new session; there is no resume.
 
 **Session allowance**: a network allowance that lives only as long as its
-session and is never persisted.
+session and is never persisted. It exists only in the launcher's memory
+(`allowances::apply::LiveAllowances`) and vanishes at teardown; `agent-vm access
+allow` without `--project` creates one, and it is never written to
+`allowances.json`, `refusals.json` or any other file. See
+[ADR-0066](docs/adr/0066-live-egress-allowances-and-writer.md).
 
 **Project allowance**: a permanent network allowance (until revoked, no expiry)
 bound to one project's path identity, whatever tool is launched. A moved or
@@ -928,14 +932,28 @@ allowance record** — is host-controlled and not writable through any guest bin
 a live approval. See
 [ADR-0065](docs/adr/0065-project-allowance-record.md).
 
+**Live policy swap**: the one way a running sandbox's policy changes. The
+launcher derives `session ∪ project` through the same `EgressAuthority` the launch
+used (`set_recorded`, then `policy`), requires the candidate's intercepted ports to
+be a **subset** of the launch's (removals narrow; additions are refused or
+deferred), and calls `Sandbox::update_network_policy`, which returns the runtime's
+monotonic revision (boot is 1). Nothing else constructs a rule. See
+[ADR-0066](docs/adr/0066-live-egress-allowances-and-writer.md).
+
+**Configured, recorded, session**: the three sources of one launch's authority.
+**Configured** is `EgressAuthority.configured` — this launch's flags and the
+verified user `[network]`, fixed at `resolve`. **Recorded** is the project
+allowance record, adopted at boot and replaceable live. **Session** is a live
+in-memory grant. No single signature carries two of these senses.
+
 **Project allowance record**: the file one project's allowances are read from:
 `~/.config/agent-vm/allowances.json`, keyed by the full SHA-256 of the project's
 canonical path, with each record's `path` column as that digest's preimage. It is
-**read-only in this release** — a later release writes it, and in 0.7.44 a
-hand-written file is the only way a record exists at all. Hand-editing is
-unsupported and the format may change. It is an **authority** store, so it
-refuses rather than heals: an unusable file is not applied, is named once, and
-leaves the launch with its configured authority. The only launch refusals it adds
+written by `agent-vm access allow --project` and deleted by `agent-vm access
+revoke` in 0.7.45, under `allowances.lock`; the writer refuses to replace a file
+it cannot decode, so a hand-edited or damaged file is never reset. It is an
+**authority** store, so it refuses rather than heals: an unusable file is not
+applied, is named once, and leaves the launch with its configured authority. The only launch refusals it adds
 are the guard's — a hard link (`nlink != 1`), or a file the guard cannot inspect.
 `doctor` calls a recorded path **orphaned** when it no longer reaches a
 directory: a path replaced by a symlink to a live directory is followed and
@@ -948,9 +966,12 @@ names the destination, by a conservative syntactic query (`covers`); the only
 level this release computes or displays. **Admissible** — the runtime's own
 evaluator would admit the flow under a policy containing that record; never
 computed in production, only as a test oracle. **Applied** — this session's
-runtime had the record in force and allowed a matching flow; unknowable until
-PR 2's runtime revisions, which is why `access` says "not confirmed for this
-session". See [ADR-0065](docs/adr/0065-project-allowance-record.md).
+runtime confirmed a policy revision **after** the refusal, so the allowance is in
+force *now* and was not in force when the flow was refused — which is why the flow
+was refused at all. `access` says "allowed in this session (rev N)", and says
+"not confirmed for this session" when no such revision exists. See
+[ADR-0065](docs/adr/0065-project-allowance-record.md) and
+[ADR-0066](docs/adr/0066-live-egress-allowances-and-writer.md).
 
 **Sandbox refusal**: any refusal the sandbox imposes on the guest and can
 report. Its kinds are **network denial**, **policy lock** (administrator or

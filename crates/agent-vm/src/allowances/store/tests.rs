@@ -117,6 +117,13 @@ impl AuthoritySnapshot {
     }
 }
 
+/// One file's facts, for the cases where a write attempt legitimately creates
+/// `allowances.lock`: the store itself must still be byte-, inode- and
+/// mtime-identical.
+fn file_facts(path: &Path) -> EntryFacts {
+    facts(path)
+}
+
 fn facts(path: &Path) -> EntryFacts {
     let metadata = std::fs::symlink_metadata(path).expect("lstat");
     let mut facts = facts_of(&metadata);
@@ -1029,7 +1036,7 @@ fn invalid_home_is_one_notice() {
         "an unset $HOME has no store"
     );
     env.set_var("HOME", "");
-    let error = Store::host().err().expect("an empty $HOME is an error");
+    let error = Store::host().expect_err("an empty $HOME is an error");
     assert_eq!(format!("{error:#}"), "$HOME is set but empty");
     let project = crate::image_pin::ProjectId::of(
         &crate::project::ProjectDir::from_path_for_tests(
@@ -1048,4 +1055,730 @@ fn invalid_home_is_one_notice() {
     let silent = super::super::view(None, None, &project);
     assert!(silent.notice().is_none());
     assert!(silent.file().is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Group W: the writer (ADR-0065 Constraints 1–6)
+// ---------------------------------------------------------------------------
+
+fn allowance(text: &str) -> crate::egress_policy::Allowance {
+    crate::egress_policy::Allowance::parse(text).expect(text)
+}
+
+/// The store's current records as decoded fields, or a panic naming the state.
+fn current(dir: &Path) -> Vec<(String, String, String, i64)> {
+    match store_at(dir).read() {
+        Read::Current { records, .. } => records
+            .iter()
+            .map(|r| {
+                (
+                    r.project.clone(),
+                    r.path.clone(),
+                    r.destination.clone(),
+                    r.recorded_ms,
+                )
+            })
+            .collect(),
+        other => panic!(
+            "expected a current store, got {}",
+            match other {
+                Read::Absent => "absent".to_owned(),
+                Read::Newer { v, .. } => format!("newer {v}"),
+                Read::NotUsed(problem) => format!("not used ({problem:?})"),
+                Read::Current { .. } => unreachable!(),
+            }
+        ),
+    }
+}
+
+/// W1: a repeated `record` and a `forget` of an absent record write nothing, and
+/// a real write updates exactly one row.
+#[test]
+fn record_and_forget_are_idempotent_by_bytes_inode_and_mtime() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = authority_dir(root.path());
+    let store = store_at(&dir);
+    let destination = allowance("tcp://[203.0.113.10/32]:443");
+    let path = "/tmp/w1";
+    let digest = digest(path);
+
+    assert_eq!(
+        store.record(&digest, path, &destination, 1_000).unwrap(),
+        RecordOutcome::Recorded { recorded_ms: 1_000 }
+    );
+    let written = AuthoritySnapshot::take(&dir);
+    // The record's canonical spelling is what is stored.
+    assert_eq!(
+        current(&dir),
+        vec![(
+            digest.clone(),
+            path.to_owned(),
+            "tcp://[203.0.113.10/32]:443".to_owned(),
+            1_000
+        )]
+    );
+
+    // Same project and destination under a non-canonical spelling: the parsed
+    // value decides, so this is still already recorded and nothing is written.
+    assert_eq!(
+        store.record(&digest, path, &destination, 9_999).unwrap(),
+        RecordOutcome::AlreadyRecorded { recorded_ms: 1_000 }
+    );
+    assert_eq!(
+        AuthoritySnapshot::take(&dir),
+        written,
+        "a repeated record leaves bytes, inode and mtime untouched"
+    );
+
+    // Forgetting a destination the store does not hold writes nothing.
+    assert_eq!(
+        store
+            .forget(&digest, &allowance("tcp://[198.51.100.0/24]:443"))
+            .unwrap(),
+        ForgetOutcome::Unchanged
+    );
+    assert_eq!(AuthoritySnapshot::take(&dir), written);
+
+    // A real forget removes exactly that row.
+    assert_eq!(
+        store.forget(&digest, &destination).unwrap(),
+        ForgetOutcome::Removed
+    );
+    assert!(current(&dir).is_empty());
+
+    // Forgetting again is unchanged, and creates nothing new.
+    let after = AuthoritySnapshot::take(&dir);
+    assert_eq!(
+        store.forget(&digest, &destination).unwrap(),
+        ForgetOutcome::Unchanged
+    );
+    assert_eq!(AuthoritySnapshot::take(&dir), after);
+}
+
+/// W2: two writers serialise on one never-unlinked lock, and every key set
+/// survives. The checkpoint makes the contention deterministic: A holds the lock
+/// inside `under_lock` until B has actually been refused once.
+#[test]
+fn concurrent_writers_preserve_entire_cross_project_key_set_under_checkpoint() {
+    use std::sync::{Arc, mpsc};
+
+    let root = tempfile::tempdir().unwrap();
+    let dir = authority_dir(root.path());
+    let store = store_at(&dir);
+
+    // Deterministic contention: A signals that it holds the lock and waits for
+    // B's first refused attempt before writing and releasing.
+    let a = store.clone();
+    let (a_locked, wait_locked) = mpsc::channel();
+    let (b_contended_tx, b_contended) = mpsc::channel();
+    let dir_a = dir.clone();
+    let first = std::thread::spawn(move || {
+        let store = store_at(&dir_a);
+        let _ = &a;
+        store.record_with(
+            &digest("/tmp/a"),
+            "/tmp/a",
+            &allowance("10.0.0.1"),
+            1_000,
+            WriteProbe {
+                euid: current_euid(),
+                on_contention: |_| {},
+                under_lock: || {
+                    a_locked.send(()).unwrap();
+                    // B cannot be refused until A holds the lock, and A holds it
+                    // here, so this wait cannot deadlock.
+                    b_contended
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                },
+                after_open: || {},
+            },
+        )
+    });
+    wait_locked
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    let dir_b = dir.clone();
+    let second = std::thread::spawn(move || {
+        store_at(&dir_b).record_with(
+            &digest("/tmp/b"),
+            "/tmp/b",
+            &allowance("10.0.0.2"),
+            2_000,
+            WriteProbe {
+                euid: current_euid(),
+                on_contention: move |_| {
+                    let _ = b_contended_tx.send(());
+                },
+                under_lock: || {},
+                after_open: || {},
+            },
+        )
+    });
+    assert_eq!(
+        first.join().unwrap().unwrap(),
+        RecordOutcome::Recorded { recorded_ms: 1_000 }
+    );
+    assert_eq!(
+        second.join().unwrap().unwrap(),
+        RecordOutcome::Recorded { recorded_ms: 2_000 }
+    );
+    assert_eq!(current(&dir).len(), 2, "both writers' rows survive");
+
+    // The lock inode is stable across writes: it is never unlinked or replaced.
+    let lock_ino = std::fs::metadata(store.lock_path()).unwrap().ino();
+
+    // The 8 × 8 round: every pair lands exactly once, with its own timestamp.
+    let shared = Arc::new(store.clone());
+    let mut threads = Vec::new();
+    for thread in 0..8 {
+        let store = Arc::clone(&shared);
+        threads.push(std::thread::spawn(move || {
+            for project in 0..8 {
+                let n = thread * 8 + project;
+                let path = format!("/tmp/round/{thread}/{project}");
+                store
+                    .record(
+                        &digest(&path),
+                        &path,
+                        &allowance(&format!("10.{thread}.{project}.1")),
+                        n as i64,
+                    )
+                    .unwrap();
+            }
+        }));
+    }
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    let records = current(&dir);
+    assert_eq!(records.len(), 2 + 64, "no write was lost or duplicated");
+    let mut seen: Vec<(String, String)> = Vec::new();
+    for (project, path, destination, recorded_ms) in &records {
+        assert_eq!(*project, digest(path), "every row keeps its own identity");
+        assert!(
+            seen.iter().all(|(p, d)| p != project || d != destination),
+            "duplicate row {project} {destination}"
+        );
+        assert!(
+            *recorded_ms >= 0
+                && (*recorded_ms < 64 || *recorded_ms == 1_000 || *recorded_ms == 2_000)
+        );
+        seen.push((project.clone(), destination.clone()));
+    }
+    for thread in 0..8 {
+        for project in 0..8 {
+            let path = format!("/tmp/round/{thread}/{project}");
+            let wanted = format!("10.{thread}.{project}.1");
+            assert!(
+                records
+                    .iter()
+                    .any(|(_, p, d, _)| p == &path && d.contains(&wanted)),
+                "the round's key {path} -> {wanted} is present"
+            );
+        }
+    }
+    assert_eq!(
+        std::fs::metadata(store.lock_path()).unwrap().ino(),
+        lock_ino,
+        "allowances.lock is never replaced"
+    );
+}
+
+/// W3: every other record keeps its decoded fields, including a destination this
+/// build cannot parse and one for another project.
+#[test]
+fn write_preserves_other_records_decoded_fields_including_unparseable_destinations() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = authority_dir(root.path());
+    // `not-a-destination` fails `Allowance::parse`, and the reader still accepts
+    // the record: the schema checks the columns, not the grammar.
+    let untouched = [
+        (
+            digest("/tmp/other"),
+            "/tmp/other".to_owned(),
+            "tcp://[198.51.100.9/32]:8443".to_owned(),
+            11,
+        ),
+        (
+            digest("/tmp/w3"),
+            "/tmp/w3".to_owned(),
+            "not-a-destination".to_owned(),
+            22,
+        ),
+        (
+            digest("/tmp/other"),
+            "/tmp/other".to_owned(),
+            "unparseable".to_owned(),
+            33,
+        ),
+    ];
+    let lines: Vec<String> = untouched
+        .iter()
+        .map(|(project, path, destination, recorded_ms)| {
+            format!(
+                r#"{{"project":"{project}","path":"{path}","destination":"{destination}","recorded_ms":{recorded_ms}}}"#
+            )
+        })
+        .collect();
+    write(&dir, &file_of(&lines));
+
+    let store = store_at(&dir);
+    let added = allowance("tcp://[203.0.113.10/32]:443");
+    assert!(matches!(
+        store
+            .record(&digest("/tmp/w3"), "/tmp/w3", &added, 44)
+            .unwrap(),
+        RecordOutcome::Recorded { .. }
+    ));
+    let after = current(&dir);
+    assert_eq!(after.len(), 4);
+    for (project, path, destination, recorded_ms) in &untouched {
+        assert!(
+            after.iter().any(|row| row
+                == &(
+                    project.clone(),
+                    path.clone(),
+                    destination.clone(),
+                    *recorded_ms
+                )),
+            "the untouched row {path} {destination} kept its decoded fields"
+        );
+    }
+    // The new row is last, in file order, with the canonical spelling.
+    assert_eq!(
+        after.last().unwrap(),
+        &(
+            digest("/tmp/w3"),
+            "/tmp/w3".to_owned(),
+            "tcp://[203.0.113.10/32]:443".to_owned(),
+            44
+        )
+    );
+
+    // A forget of the parseable new row changes nothing about the others.
+    assert_eq!(
+        store.forget(&digest("/tmp/w3"), &added).unwrap(),
+        ForgetOutcome::Removed
+    );
+    let after = current(&dir);
+    assert_eq!(after.len(), 3);
+    for (project, path, destination, recorded_ms) in &untouched {
+        assert!(after.iter().any(|row| row
+            == &(
+                project.clone(),
+                path.clone(),
+                destination.clone(),
+                *recorded_ms
+            )));
+    }
+}
+
+/// W4: at either bound the write is refused with `Full` and the file is exactly
+/// as it was.
+#[test]
+fn full_store_at_record_and_byte_limits_leaves_file_untouched() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = authority_dir(root.path());
+    let store = store_at(&dir);
+    let destination = allowance("10.0.0.5");
+
+    // 4,096 records is the largest the reader accepts, so a 4,097th is `Full`.
+    let at_records: Vec<String> = (0..MAX_RECORDS)
+        .map(|n| record(&format!("/tmp/r{n}"), "10.0.0.5"))
+        .collect();
+    write(&dir, &file_of(&at_records));
+    assert_eq!(current(&dir).len(), MAX_RECORDS);
+    let full = file_facts(&dir.join(FILE));
+    assert!(
+        matches!(
+            store.record(&digest("/tmp/one-more"), "/tmp/one-more", &destination, 1),
+            Err(WriteError::Full)
+        ),
+        "a 4,097th record is refused"
+    );
+    assert_eq!(file_facts(&dir.join(FILE)), full);
+
+    // The byte bound: a valid file just under 1 MiB whose next record crosses it.
+    let long = format!("/tmp/{}", "p".repeat(180));
+    let one = record(&format!("{long}0000"), "10.0.0.5");
+    // Half a record of headroom: the fixture is under the bound, and one more
+    // record crosses it.
+    let target = (MAX_BYTES as usize).saturating_sub(one.len() / 2);
+    let count = target / (one.len() + 1);
+    assert!(count < MAX_RECORDS, "the byte bound is reached first");
+    // Every path is the same length, so the encoded size is exactly predictable.
+    let near: Vec<String> = (0..count)
+        .map(|n| record(&format!("{long}{n:04}"), "10.0.0.5"))
+        .collect();
+    let bytes = file_of(&near);
+    assert!(
+        (bytes.len() as u64) < MAX_BYTES,
+        "the fixture is under the byte bound"
+    );
+    write(&dir, &bytes);
+    let near_snapshot = file_facts(&dir.join(FILE));
+    assert!(
+        matches!(
+            store.record(
+                &format!("{long}new-record"),
+                &format!("{long}new-record"),
+                &destination,
+                1
+            ),
+            Err(WriteError::Full)
+        ),
+        "the record that crosses 1 MiB is refused"
+    );
+    assert_eq!(file_facts(&dir.join(FILE)), near_snapshot);
+}
+
+/// W5: an untrusted directory is refused before the lock is even opened, so
+/// neither `allowances.lock` nor `allowances.json` appears.
+#[test]
+fn untrusted_directory_is_never_written_or_locked() {
+    let root = tempfile::tempdir().unwrap();
+    let destination = allowance("10.0.0.5");
+    for mode in [0o777, 0o775, 0o757] {
+        let dir = root.path().join(format!("dir-{mode:o}"));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        let before = AuthoritySnapshot::take(&dir);
+        let store = store_at(&dir);
+        assert!(
+            matches!(
+                store.record("project", "/tmp/w5", &destination, 1),
+                Err(WriteError::Untrusted(_))
+            ),
+            "mode {mode:o} is refused"
+        );
+        assert!(matches!(
+            store.forget("project", &destination),
+            Err(WriteError::Untrusted(_))
+        ));
+        assert_eq!(AuthoritySnapshot::take(&dir), before);
+        assert!(!dir.join(LOCK_FILE).exists(), "mode {mode:o} opens no lock");
+        assert!(!dir.join(FILE).exists(), "mode {mode:o} writes no store");
+    }
+
+    // A foreign owner, expressed through the injected euid.
+    let dir = root.path().join("foreign");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let store = store_at(&dir);
+    assert!(matches!(
+        store.record_with(
+            "project",
+            "/tmp/w5",
+            &destination,
+            1,
+            WriteProbe {
+                euid: current_euid() + 1,
+                on_contention: |_| {},
+                under_lock: || {},
+                after_open: || {},
+            },
+        ),
+        Err(WriteError::Untrusted(AuthorityRefusal::DirOwner))
+    ));
+    assert!(!dir.join(LOCK_FILE).exists());
+
+    // A path that is not a directory at all.
+    let file = root.path().join("not-a-dir");
+    std::fs::write(&file, b"x").unwrap();
+    let store = Store::at(&file);
+    assert!(matches!(
+        store.record("project", "/tmp/w5", &destination, 1),
+        Err(WriteError::Untrusted(AuthorityRefusal::DirNotDirectory))
+    ));
+}
+
+/// W6: a newer, oversized, untrusted or legitimately changed file is never
+/// replaced by `record` or `forget`, and every byte, inode, mode and mtime stays.
+#[test]
+fn writer_refuses_newer_across_oversized_untrusted_and_changed_body() {
+    let root = tempfile::tempdir().unwrap();
+    let destination = allowance("10.0.0.5");
+    let cases: Vec<(&str, Vec<u8>, u32, WriteError)> = vec![
+        (
+            "newer",
+            br#"{"v":2,"records":[],"extra":true}"#.to_vec(),
+            0o600,
+            WriteError::Newer { v: 2 },
+        ),
+        (
+            "newer-oversized",
+            {
+                let mut bytes =
+                    br#"{"v":2,"records":[{"project":"x","path":"/tmp/x","destination":"10.0.0.5","recorded_ms":0}]}"#
+                        .to_vec();
+                bytes.resize(MAX_BYTES as usize + 1, b' ');
+                bytes
+            },
+            0o600,
+            WriteError::Newer { v: 2 },
+        ),
+        (
+            "damaged",
+            br#"{"v":1,"records":[{"project":"broken"}]}"#.to_vec(),
+            0o600,
+            WriteError::Damaged(Damage::Undecodable),
+        ),
+        (
+            "untrusted-file",
+            br#"{"v":2,"records":[]}"#.to_vec(),
+            0o666,
+            WriteError::Untrusted(AuthorityRefusal::FileWritable),
+        ),
+    ];
+    for (label, bytes, mode, expected) in cases {
+        let case_root = root.path().join(label);
+        std::fs::create_dir(&case_root).unwrap();
+        let dir = authority_dir(&case_root);
+        let file = dir.join(FILE);
+        std::fs::write(&file, &bytes).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
+        let before = file_facts(&file);
+        let store = store_at(&dir);
+        let record = store.record(&digest("/tmp/w6"), "/tmp/w6", &destination, 1);
+        assert!(
+            matches!(record, Err(ref e) if std::mem::discriminant(e) == std::mem::discriminant(&expected)),
+            "{label}: {record:?}"
+        );
+        let forget = store.forget(&digest("/tmp/w6"), &destination);
+        assert!(
+            matches!(forget, Err(ref e) if std::mem::discriminant(e) == std::mem::discriminant(&expected)),
+            "{label}: {forget:?}"
+        );
+        assert_eq!(file_facts(&file), before, "{label} is untouched");
+    }
+}
+
+/// W7: repeated writes against a damaged store beside an occupied `.damaged`
+/// sibling change neither file.
+#[test]
+fn writer_refuses_repeated_damage_and_occupied_backup_without_changing_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = authority_dir(root.path());
+    write(&dir, r#"{"v":1,"records":[{"project":"x"}]}"#);
+    std::fs::write(dir.join("allowances.json.damaged"), b"earlier damage").unwrap();
+    let before = (
+        file_facts(&dir.join(FILE)),
+        file_facts(&dir.join("allowances.json.damaged")),
+    );
+    let store = store_at(&dir);
+    let destination = allowance("10.0.0.5");
+    for _ in 0..2 {
+        assert!(matches!(
+            store.record(&digest("/tmp/w7"), "/tmp/w7", &destination, 1),
+            Err(WriteError::Damaged(_))
+        ));
+        assert!(matches!(
+            store.forget(&digest("/tmp/w7"), &destination),
+            Err(WriteError::Damaged(_))
+        ));
+        assert_eq!(
+            (
+                file_facts(&dir.join(FILE)),
+                file_facts(&dir.join("allowances.json.damaged")),
+            ),
+            before
+        );
+    }
+    assert_eq!(
+        std::fs::read(dir.join("allowances.json.damaged")).unwrap(),
+        b"earlier damage"
+    );
+}
+
+/// W8: a write fault leaves the existing store, and no temporary file, behind.
+///
+/// The fault is a read-only directory: `atomic_write` creates its temporary in
+/// the parent, so the operation fails before the rename. Nothing else changes.
+#[test]
+fn atomic_write_fault_leaves_existing_store_and_directory_intact() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = authority_dir(root.path());
+    write(&dir, &file_of(&[record("/tmp/kept", "10.0.0.5")]));
+    // The lock already exists (0600), so a read-only directory lets the lock be
+    // opened and holds the fault for the store's own atomic replace.
+    std::fs::write(dir.join(LOCK_FILE), b"").unwrap();
+    std::fs::set_permissions(dir.join(LOCK_FILE), std::fs::Permissions::from_mode(0o600)).unwrap();
+    let store = store_at(&dir);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let before = AuthoritySnapshot::take(&dir);
+    let result = store.record(&digest("/tmp/w8"), "/tmp/w8", &allowance("10.0.0.6"), 1);
+    assert!(
+        matches!(result, Err(WriteError::Unreadable(_))),
+        "a read-only directory fails the write: {result:?}"
+    );
+    assert_eq!(
+        AuthoritySnapshot::take(&dir),
+        before,
+        "no temp file remains"
+    );
+    // Restore, so the tempdir can be removed.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(current(&dir).len(), 1);
+}
+
+/// W9: a lock-free reader of a store being replaced sees only `Current` or a
+/// counted `Unsettled`, never a wrong `Current`.
+#[test]
+fn concurrent_reader_and_writer_observe_only_current_or_unsettled() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = authority_dir(root.path());
+    let store = store_at(&dir);
+    let destination = allowance("10.0.0.5");
+    assert_eq!(
+        store
+            .record(&digest("/tmp/w9"), "/tmp/w9", &destination, 1)
+            .unwrap(),
+        RecordOutcome::Recorded { recorded_ms: 1 }
+    );
+
+    let writer_dir = dir.clone();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer_stop = std::sync::Arc::clone(&stop);
+    let writer = std::thread::spawn(move || {
+        let store = store_at(&writer_dir);
+        let mut n = 0i64;
+        while !writer_stop.load(std::sync::atomic::Ordering::Relaxed) {
+            let path = format!("/tmp/w9/{n}");
+            store
+                .record(&digest(&path), &path, &destination, n)
+                .unwrap();
+            n += 1;
+            if n > 200 {
+                break;
+            }
+        }
+    });
+    let mut current_seen = 0usize;
+    let mut unsettled_seen = 0usize;
+    let reader = store_at(&dir);
+    for _ in 0..2_000 {
+        match reader.read() {
+            Read::Current { .. } => current_seen += 1,
+            Read::NotUsed(Problem::Unsettled) => unsettled_seen += 1,
+            other => panic!(
+                "a concurrent read is only Current or Unsettled, got {}",
+                match other {
+                    Read::Absent => "Absent",
+                    Read::Newer { .. } => "Newer",
+                    Read::NotUsed(_) => "another Problem",
+                    Read::Current { .. } => unreachable!(),
+                }
+            ),
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.join().unwrap();
+    assert!(current_seen > 0, "the reader did read the store");
+    let _ = unsettled_seen;
+}
+
+/// W10: a project path that is not valid UTF-8 is refused by the writer itself,
+/// before anything is created (R8).
+///
+/// This goes through `Store::record_path`, the entry point both write paths use,
+/// rather than through the gate alone: a test of the gate would stay green if no
+/// caller used it, and the gate cannot be dropped from `record_path` without
+/// changing the type it takes. (`std::fs::canonicalize` refuses a non-UTF-8
+/// component with `EILSEQ` on this host, so a `ProjectDir` carrying one cannot be
+/// captured; the writer's own entry point is where R8's "before locking" clause
+/// lives, and where a path *can* be constructed.)
+#[test]
+fn record_refuses_non_utf8_project_path() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let root = tempfile::tempdir().unwrap();
+    let authority = authority_dir(root.path());
+    let store = store_at(&authority);
+    let before = AuthoritySnapshot::take(&authority);
+    let path = Path::new(OsStr::from_bytes(b"/tmp/proj-\xff\xfe"));
+    assert!(matches!(
+        store.record_path("project", path, &allowance("10.0.0.1"), 1),
+        Err(WriteError::NonUtf8ProjectPath)
+    ));
+    assert_eq!(
+        AuthoritySnapshot::take(&authority),
+        before,
+        "the refusal creates no file and no lock"
+    );
+    assert!(!authority.join(LOCK_FILE).exists(), "no lock was opened");
+    assert!(!authority.join(FILE).exists(), "no store was written");
+    // A UTF-8 path passes the same gate and writes.
+    assert_eq!(
+        store
+            .record_path("project", Path::new("/tmp/ok"), &allowance("10.0.0.1"), 1)
+            .unwrap(),
+        RecordOutcome::Recorded { recorded_ms: 1 }
+    );
+    assert_eq!(
+        utf8_project_path(Path::new("/tmp/ok")).unwrap(),
+        "/tmp/ok",
+        "the gate and the writer agree on what a UTF-8 path is"
+    );
+}
+
+/// A lock the kernel refuses to open is not a busy lock.
+///
+/// `EACCES` (an unwritable directory) and a contended lock have different
+/// remedies — fix the permissions, or wait — so the writer must not report one as
+/// the other. The verifier's end-user matrix showed a `0500` authority directory
+/// answered "the store is busy (opening a coordination lock file: Permission
+/// denied)", which suggests a retry that cannot help.
+#[test]
+fn a_lock_the_host_refuses_to_open_is_not_reported_as_busy() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if current_euid() == 0 {
+        // Root bypasses the permission bits this test relies on.
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let dir = authority_dir(root.path());
+    let store = store_at(&dir);
+    // Readable and searchable for us, but not writable: the record can be read,
+    // the lock cannot be created.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let error = store
+        .record("project", "/tmp/proj", &allowance("10.0.0.9"), 1)
+        .expect_err("an unwritable directory cannot hold a lock");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(matches!(error, WriteError::LockUnopenable(_)), "{error:?}");
+    let line = error.line();
+    assert!(!line.contains("busy"), "{line}");
+    assert!(line.contains("could not be opened"), "{line}");
+    assert!(line.contains("permissions"), "{line}");
+    assert!(!dir.join(LOCK_FILE).exists(), "no lock was created");
+    assert!(!dir.join(FILE).exists(), "no store was written");
+}
+
+/// Plan §6.1's "not a dir" row, for **both** verbs.
+///
+/// `record` and `forget` are one sequence now, but they answer for a store path
+/// whose parent is a regular file before that sequence starts. A `forget` that
+/// said `Ok(Unchanged)` here would tell the caller "no store" about a path that
+/// does hold something; the table says the directory refusal.
+#[test]
+fn a_store_path_below_a_regular_file_is_the_directory_refusal_for_both_verbs() {
+    use crate::config_authority::AuthorityRefusal;
+
+    let root = tempfile::tempdir().unwrap();
+    let parent = root.path().join("not-a-dir");
+    std::fs::write(&parent, b"x").unwrap();
+    let store = Store::at(&parent.join("agent-vm"));
+    let destination = allowance("10.0.0.7");
+    assert!(matches!(
+        store.record("project", "/tmp/proj", &destination, 1),
+        Err(WriteError::Untrusted(AuthorityRefusal::DirNotDirectory))
+    ));
+    assert!(matches!(
+        store.forget("project", &destination),
+        Err(WriteError::Untrusted(AuthorityRefusal::DirNotDirectory))
+    ));
+    assert!(!parent.join("agent-vm").exists(), "nothing was created");
 }
