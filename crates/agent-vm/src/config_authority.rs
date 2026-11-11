@@ -66,6 +66,27 @@ pub open spec fn dir_ok(d: DirFacts, euid: u32) -> bool { d.is_dir && d.uid == e
 pub open spec fn file_ok(f: FileFacts, euid: u32) -> bool { f.uid == euid && !others_may_write(f.mode) && crate::protected_config_dir::authority_file_singly_linked_spec(f.nlink) }
 
 /// Precedence mirrors credential_yaml::load: directory first, then the file.
+///
+/// # Why the directory check is its own kernel
+///
+/// A writer must refuse an untrusted directory *before* it opens the lock file
+/// inside it, and again under that lock (ADR-0065 Constraint 1). Both the launch
+/// guard and the writer ask the same question, so it is spelled once here and
+/// both call it.
+pub fn authority_dir_refusal(dir: DirFacts, euid: u32) -> (r: Option<AuthorityRefusal>)
+    ensures
+        r.is_none() == dir_ok(dir, euid),
+        !dir.is_dir ==> r == Some(AuthorityRefusal::DirNotDirectory),
+        dir.is_dir && dir.uid != euid ==> r == Some(AuthorityRefusal::DirOwner),
+        dir.is_dir && dir.uid == euid && others_may_write(dir.mode) ==> r == Some(AuthorityRefusal::DirWritable),
+{
+    if !dir.is_dir { return Some(AuthorityRefusal::DirNotDirectory); }
+    if dir.uid != euid { return Some(AuthorityRefusal::DirOwner); }
+    if dir.mode & 0o022 != 0 { return Some(AuthorityRefusal::DirWritable); }
+    None
+}
+
+/// Precedence mirrors credential_yaml::load: directory first, then the file.
 pub fn authority_refusal(reached: Reached, dir: DirFacts, euid: u32) -> (r: Option<AuthorityRefusal>)
     ensures
         r.is_none() == (dir_ok(dir, euid) && match reached { Reached::Direct(f) => file_ok(f, euid), Reached::ThroughSymlink => false }),
@@ -80,9 +101,7 @@ pub fn authority_refusal(reached: Reached, dir: DirFacts, euid: u32) -> (r: Opti
                 && (f.uid == euid && !others_may_write(f.mode) && !crate::protected_config_dir::authority_file_singly_linked_spec(f.nlink) ==> r == Some(AuthorityRefusal::FileLinks(f.nlink))),
         },
 {
-    if !dir.is_dir { return Some(AuthorityRefusal::DirNotDirectory); }
-    if dir.uid != euid { return Some(AuthorityRefusal::DirOwner); }
-    if dir.mode & 0o022 != 0 { return Some(AuthorityRefusal::DirWritable); }
+    if let Some(refusal) = authority_dir_refusal(dir, euid) { return Some(refusal); }
     match reached {
         Reached::ThroughSymlink => Some(AuthorityRefusal::ThroughSymlink),
         Reached::Direct(f) => {
@@ -961,6 +980,66 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The writer's directory-only kernel, against its own independent table.
+    ///
+    /// `authority_refusal` delegates to it, so a row that changed here would move
+    /// both callers; the oracle is written out rather than calling `dir_ok`, so a
+    /// table that agrees with itself cannot pass.
+    #[test]
+    fn authority_dir_refusal_table_matches_oracle() {
+        fn dir_oracle(dir: DirFacts, euid: u32) -> Option<AuthorityRefusal> {
+            use AuthorityRefusal::*;
+            if !dir.is_dir {
+                return Some(DirNotDirectory);
+            }
+            if dir.uid != euid {
+                return Some(DirOwner);
+            }
+            if dir.mode & (0o020 | 0o002) != 0 {
+                return Some(DirWritable);
+            }
+            None
+        }
+        for is_dir in [false, true] {
+            for uid in [7, 8] {
+                for mode in [0o700, 0o720, 0o702, 0o770, 0o775, 0o777, 0o600] {
+                    let dir = DirFacts { is_dir, uid, mode };
+                    assert_eq!(
+                        authority_dir_refusal(dir, 7),
+                        dir_oracle(dir, 7),
+                        "is_dir {is_dir}, uid {uid}, mode {mode:o}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The file half is untouched: a trusted directory answers exactly as before,
+    /// and the directory kernel is what decides the directory half.
+    #[test]
+    fn authority_refusal_delegates_the_directory_half() {
+        let trusted = DirFacts {
+            is_dir: true,
+            uid: 7,
+            mode: 0o700,
+        };
+        let file = FileFacts {
+            uid: 7,
+            mode: 0o600,
+            nlink: 1,
+        };
+        assert_eq!(authority_refusal(Reached::Direct(file), trusted, 7), None);
+        let untrusted = DirFacts {
+            is_dir: true,
+            uid: 7,
+            mode: 0o770,
+        };
+        assert_eq!(
+            authority_refusal(Reached::Direct(file), untrusted, 7),
+            Some(AuthorityRefusal::DirWritable)
+        );
     }
 
     #[test]

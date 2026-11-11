@@ -35,12 +35,22 @@
 //! them leaves the launch with its configured authority. The two launch
 //! refusals that exist are the guard's (ADR-0065 E1/E2), not this module's.
 
+mod apply;
 mod store;
+
+/// The live allowance controller: one policy computation, one confirmed swap.
+pub(crate) use apply::{
+    GrantRefusalReason, GrantResult, GrantScope, LiveAllowances, NextLaunchReason, PolicyUpdater,
+    RevokeResult, RevokeScope, SessionAllowancesSnapshot, WireAllowance,
+};
 
 /// The store's file name, spelled once: the guard measures the same file this
 /// module reads, so a rename cannot leave one of them looking at a path that no
 /// longer exists.
 pub(crate) use store::FILE;
+/// The writer's handle, opaque outside this facade: no caller can name a path
+/// into the host configuration directory or inspect a [`store::Store`].
+pub(crate) use store::StoreHandle;
 
 use std::path::{Path, PathBuf};
 
@@ -89,8 +99,18 @@ pub(crate) struct ProjectAllowances {
 }
 
 impl ProjectAllowances {
+    /// Test-only since the live controller adopts whole records; kept as the
+    /// set's own view so a test can name what it holds without reaching into it.
+    #[cfg(test)]
     pub(crate) fn destinations(&self) -> impl Iterator<Item = &Allowance> {
         self.entries.iter().map(ProjectAllowance::destination)
+    }
+
+    /// The whole records, for the live controller's boot adoption: it needs the
+    /// record's timestamp as well as its destination, and only the records this
+    /// launch actually adopted (B1).
+    pub(crate) fn entries(&self) -> &[ProjectAllowance] {
+        &self.entries
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -173,11 +193,101 @@ impl ProjectAllowances {
     }
 }
 
-/// ADR-0065 P5's levels. This release can only know `Recorded`; PR 2 adds
-/// `Applied { record, revision }` from the session's runtime. "Admissible" is
-/// never a variant: it exists only as a test oracle.
+/// ADR-0065 P5's levels, now that a live session can confirm one. "Admissible"
+/// is never a variant: it exists only as a test oracle.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Coverage<'a> {
+    /// A usable record names the destination; this session's runtime has not
+    /// confirmed a post-refusal revision for it.
     Recorded(&'a ProjectAllowance),
+    /// This session's runtime confirmed a revision **after** the refusal, so the
+    /// allowance was in force when the flow was refused.
+    Applied {
+        scope: AllowanceScope,
+        destination: Allowance,
+        recorded_ms: i64,
+        revision: u64,
+        /// Set when a `--project` grant was applied to the live session and then
+        /// demoted to session scope because the store write failed (Ruling 2, N2).
+        not_recorded_error: Option<String>,
+    },
+}
+
+/// One live session's in-memory allowance: a destination and when it was granted.
+/// Never written to disk (R5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SessionAllowance {
+    destination: Allowance,
+    granted_ms: i64,
+}
+
+impl SessionAllowance {
+    pub(crate) fn new(destination: Allowance, granted_ms: i64) -> Self {
+        Self {
+            destination,
+            granted_ms,
+        }
+    }
+
+    pub(crate) fn destination(&self) -> &Allowance {
+        &self.destination
+    }
+
+    pub(crate) fn granted_ms(&self) -> i64 {
+        self.granted_ms
+    }
+}
+
+/// Which table an applied allowance lives in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AllowanceScope {
+    Session,
+    Project,
+}
+
+/// Why a refusal entry cannot become an allowance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CannotAllow {
+    /// Not a tenant network denial: a platform rule or another kind of refusal.
+    NotNetworkDenial(String),
+    /// A hostname the runtime only ever saw through plain HTTP, so no port can
+    /// filter it without also admitting every name on that port.
+    PlainHttpHostname,
+    /// A destination whose site this release will not turn into a rule.
+    SiteNotAllowable { site: String },
+    /// The spelling does not parse as an allowance.
+    InvalidDestination(AllowanceError),
+}
+
+impl CannotAllow {
+    /// One escaped line for a terminal.
+    pub(crate) fn line(&self) -> String {
+        let text = match self {
+            Self::NotNetworkDenial(reason) => {
+                format!("this refusal is not a network denial this command can allow ({reason})")
+            }
+            Self::PlainHttpHostname => {
+                "this hostname was seen over plain HTTP, so an allowance cannot name a port for \
+                 it without allowing every name on that port"
+                    .to_owned()
+            }
+            Self::SiteNotAllowable { site } => {
+                format!(
+                    "this refusal was observed at {site}, which this command cannot turn into an allowance"
+                )
+            }
+            Self::InvalidDestination(error) => {
+                format!("this refusal's destination is not a form agent-vm can allow ({error})")
+            }
+        };
+        crate::one_line::text(&text).to_string()
+    }
+}
+
+impl std::fmt::Display for CannotAllow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.line())
+    }
 }
 
 /// Everything one command learned about the store, ready to render.
@@ -186,12 +296,26 @@ pub(crate) enum Coverage<'a> {
 /// no caller can reveal a store problem twice or in two words.
 #[derive(Debug)]
 pub(crate) struct ProjectView {
+    /// Where a `--project` grant is written. Carried with the view so the file it
+    /// read and the file it writes are one path (Ruling 1, B3).
+    store: StoreHandle,
     file: Option<PathBuf>,
     allowances: ProjectAllowances,
     notice: Option<String>,
 }
 
+/// Resolve the host store handle (`$HOME/.config/agent-vm`) **without** reading
+/// `allowances.json`, so `LiveSession::start` receives it before `for_launch`
+/// reads the file (ADR-0064 AC9, Ruling 1).
+pub(crate) fn host_store_handle() -> StoreHandle {
+    StoreHandle::host()
+}
+
 impl ProjectView {
+    pub(crate) fn store_handle(&self) -> StoreHandle {
+        self.store.clone()
+    }
+
     pub(crate) fn file(&self) -> Option<&Path> {
         self.file.as_deref()
     }
@@ -210,6 +334,7 @@ impl ProjectView {
     #[cfg(test)]
     pub(crate) fn empty() -> Self {
         Self {
+            store: StoreHandle::without_a_store(),
             file: None,
             allowances: ProjectAllowances::default(),
             notice: None,
@@ -225,11 +350,85 @@ impl ProjectView {
             entry.recorded_ms = recorded_ms;
         }
         Self {
+            store: StoreHandle::without_a_store(),
             file: Some(PathBuf::from("/home/a/.config/agent-vm/allowances.json")),
             allowances,
             notice: notice.map(str::to_owned),
         }
     }
+
+    /// Write a `--project` grant on `tokio::task::spawn_blocking` (Ruling 4, M3).
+    ///
+    /// The caller is a launcher or a CLI branch on a Tokio worker, and the store
+    /// write waits on a filesystem lock: holding a worker for that would stall
+    /// every other task on the same runtime.
+    pub(crate) async fn record_async(
+        &self,
+        project: &ProjectDir,
+        destination: &Allowance,
+        recorded_ms: i64,
+    ) -> anyhow::Result<ProjectAllowance> {
+        record(self.store.clone(), project, destination, recorded_ms).await
+    }
+
+    /// Delete a project record on `tokio::task::spawn_blocking`. `Ok(true)` means
+    /// a record was removed.
+    pub(crate) async fn forget_async(
+        &self,
+        project: &ProjectId,
+        destination: &Allowance,
+    ) -> anyhow::Result<bool> {
+        forget(self.store.clone(), project, destination).await
+    }
+
+    /// A view at a temporary directory, with a handle that writes to the same
+    /// place it read: the seam every writer test uses.
+    #[cfg(test)]
+    pub(crate) fn at_dir_for_tests(dir: &Path, project: &ProjectId) -> Self {
+        let store = store::Store::at(dir);
+        let mut view = from_read(store.read(), store.file(), project);
+        view.store = StoreHandle::at_for_tests(dir);
+        view
+    }
+}
+
+/// Store one project allowance, off the runtime's worker threads.
+pub(crate) async fn record(
+    store: StoreHandle,
+    project: &ProjectDir,
+    destination: &Allowance,
+    recorded_ms: i64,
+) -> anyhow::Result<ProjectAllowance> {
+    let id = ProjectId::of(project).as_str().to_owned();
+    // The path, not its text: the writer owns the UTF-8 gate (R8), so a
+    // non-UTF-8 project is refused inside `record_path` before anything is locked.
+    let path = project.path().to_owned();
+    let written = destination.clone();
+    let requested = destination.clone();
+    let outcome =
+        tokio::task::spawn_blocking(move || store.record_path(&id, &path, &written, recorded_ms))
+            .await
+            .map_err(|error| anyhow!("the project allowance write stopped: {error}"))?
+            .map_err(|error| anyhow!("{}", error.line()))?;
+    Ok(ProjectAllowance {
+        destination: requested,
+        recorded_ms: outcome.recorded_ms(),
+    })
+}
+
+/// Delete one project allowance, off the runtime's worker threads.
+pub(crate) async fn forget(
+    store: StoreHandle,
+    project: &ProjectId,
+    destination: &Allowance,
+) -> anyhow::Result<bool> {
+    let id = project.as_str().to_owned();
+    let destination = destination.clone();
+    let outcome = tokio::task::spawn_blocking(move || store.forget(&id, &destination))
+        .await
+        .map_err(|error| anyhow!("the project allowance write stopped: {error}"))?
+        .map_err(|error| anyhow!("{}", error.line()))?;
+    Ok(matches!(outcome, store::ForgetOutcome::Removed))
 }
 
 /// The launch's view: this project's recorded allowances, or why there are none.
@@ -260,6 +459,7 @@ fn view(
         // `$HOME` unset is not a problem to report: no user config is read at
         // all then (ADR-0038), so there is nothing to be wrong with.
         return ProjectView {
+            store: StoreHandle::without_a_store(),
             file: None,
             allowances: ProjectAllowances::default(),
             notice: host_error.map(|error| {
@@ -270,7 +470,9 @@ fn view(
             }),
         };
     };
-    from_read(store.read(), store.file(), project)
+    let mut view = from_read(store.read(), store.file(), project);
+    view.store = StoreHandle::of(store);
+    view
 }
 
 /// The classification turned into a view. Separate from [`view`] so a test can
@@ -297,6 +499,9 @@ fn from_read(read: store::Read, file: PathBuf, project: &ProjectId) -> ProjectVi
         ),
     };
     ProjectView {
+        // Attached by `view`, which holds the store; a test's `from_read` view
+        // writes only through `at_dir_for_tests`.
+        store: StoreHandle::without_a_store(),
         file: Some(file),
         allowances,
         notice,
@@ -504,6 +709,188 @@ fn admits_dns_query(
         rules: rules_of(record, ports),
     };
     policy.evaluate_dns_query(name, Protocol::Udp, 53) == Action::Allow
+}
+
+/// The allowance a refusal entry would become, or why it cannot become one.
+///
+/// This is the one place the two vocabularies meet: the refusal feed's
+/// destination and the grammar's `Allowance`. The result is checked to round-trip
+/// through the same canonical comparison `covers` uses, so a name this command
+/// would grant is a name `covers` can later recognise.
+pub(crate) fn grantable_destination(entry: &RefusalEntry) -> Result<Allowance, CannotAllow> {
+    if entry.layer == "platform" || entry.key.kind != Kind::NetworkDenial {
+        return Err(CannotAllow::NotNetworkDenial(entry.reason()));
+    }
+    match &entry.key.destination {
+        Destination::DnsName { name } => {
+            if entry.last_site != "dns-query" {
+                return Err(CannotAllow::SiteNotAllowable {
+                    site: entry.last_site.clone(),
+                });
+            }
+            let domain: DomainName = name
+                .parse()
+                .map_err(|_| CannotAllow::InvalidDestination(AllowanceError::MalformedAddress))?;
+            let allowance = Allowance::parse(name).map_err(CannotAllow::InvalidDestination)?;
+            if !matches!(&allowance, Allowance::Hostname(hostname) if hostname.domain() == &domain)
+            {
+                return Err(CannotAllow::InvalidDestination(
+                    AllowanceError::MalformedAddress,
+                ));
+            }
+            Ok(allowance)
+        }
+        Destination::Host {
+            protocol,
+            name,
+            port: Some(port),
+        } => {
+            if protocol != "tcp"
+                || !matches!(entry.last_site.as_str(), "tls-sni" | "tcp-hostname")
+                || !entry.name.as_ref().is_some_and(|name| name.source == "sni")
+            {
+                return Err(CannotAllow::PlainHttpHostname);
+            }
+            let spelling = format!("tcp://{name}:{port}");
+            let allowance = Allowance::parse(&spelling).map_err(CannotAllow::InvalidDestination)?;
+            if !matches!(&allowance, Allowance::Hostname(hostname) if hostname.domain().as_str() == name)
+            {
+                return Err(CannotAllow::InvalidDestination(
+                    AllowanceError::MalformedAddress,
+                ));
+            }
+            Ok(allowance)
+        }
+        Destination::Host { .. } => Err(CannotAllow::PlainHttpHostname),
+        Destination::Address {
+            protocol,
+            ip: Some(ip),
+            port,
+        } => {
+            if !matches!(entry.last_site.as_str(), "tcp-syn" | "udp" | "icmp") {
+                return Err(CannotAllow::SiteNotAllowable {
+                    site: entry.last_site.clone(),
+                });
+            }
+            let ip = ip.to_canonical();
+            let prefix = if ip.is_ipv4() { 32 } else { 128 };
+            let spelling = match (protocol.as_str(), port) {
+                ("tcp" | "udp", Some(port)) => format!("{protocol}://[{ip}/{prefix}]:{port}"),
+                ("tcp" | "udp", None) => format!("{protocol}://{ip}/{prefix}"),
+                ("icmpv4" | "icmpv6", None) => format!("{ip}/{prefix}"),
+                _ => {
+                    return Err(CannotAllow::SiteNotAllowable {
+                        site: entry.last_site.clone(),
+                    });
+                }
+            };
+            Allowance::parse(&spelling).map_err(CannotAllow::InvalidDestination)
+        }
+        Destination::Address { ip: None, .. } => Err(CannotAllow::SiteNotAllowable {
+            site: entry.last_site.clone(),
+        }),
+    }
+}
+
+/// Whether one record admits this entry, over an explicit port set.
+///
+/// `covers` computes the port set from the records it holds; a live session must
+/// compute it over every *confirmed* hostname in both tables first (m3), so the
+/// per-record test is separate and takes that set.
+fn entry_admitted_by(
+    record: &ProjectAllowance,
+    entry: &RefusalEntry,
+    ports: Option<&InterceptedPorts>,
+) -> bool {
+    match &entry.key.destination {
+        Destination::DnsName { name } => {
+            if entry.last_site != "dns-query" {
+                return false;
+            }
+            match name.parse::<DomainName>() {
+                Ok(domain) => admits_dns_query(record, &domain, ports),
+                Err(_) => false,
+            }
+        }
+        _ => match probe(entry) {
+            Some(probe) => rules_of(record, ports)
+                .iter()
+                .any(|rule| admits(rule, &probe)),
+            None => false,
+        },
+    }
+}
+
+impl ProjectView {
+    /// ADR-0065 P5's *applied* level: a confirmed live revision, or the recorded
+    /// fallback.
+    ///
+    /// A revision confirms an allowance only when it is **greater than** the
+    /// refusal's own `last_revision`: a record in force at boot (`rev 1`) did not
+    /// apply to a flow the runtime refused at `rev 1`. `None` never confirms.
+    /// The port set is computed over every confirmed hostname in both tables
+    /// before either table is searched (m3), so a hostname confirmed in one table
+    /// makes the other table's rule for the same port work.
+    pub(crate) fn covers_in_session<'a>(
+        &'a self,
+        entry: &RefusalEntry,
+        live: Option<&crate::allowances::apply::SessionAllowancesSnapshot>,
+    ) -> Option<Coverage<'a>> {
+        if entry.key.kind != Kind::NetworkDenial || entry.layer == "platform" {
+            return None;
+        }
+        if let Some(snapshot) = live {
+            let confirmed_hostnames: Vec<HostnameAllowance> = snapshot
+                .project
+                .iter()
+                .chain(snapshot.session.iter())
+                .filter(|item| item.revision.is_some())
+                .filter_map(|item| match Allowance::parse(&item.destination).ok()? {
+                    Allowance::Hostname(hostname) => Some(hostname),
+                    Allowance::Address(_) => None,
+                })
+                .collect();
+            let ports = InterceptedPorts::for_hostnames(&confirmed_hostnames);
+
+            for (scope, item) in snapshot
+                .project
+                .iter()
+                .map(|item| (AllowanceScope::Project, item))
+                .chain(
+                    snapshot
+                        .session
+                        .iter()
+                        .map(|item| (AllowanceScope::Session, item)),
+                )
+            {
+                let Some(revision) = item.revision else {
+                    continue;
+                };
+                // M7: only a revision after the refusal confirms it.
+                let confirmed_after_refusal = revision > entry.last_revision;
+                if !confirmed_after_refusal {
+                    continue;
+                }
+                let Ok(destination) = Allowance::parse(&item.destination) else {
+                    continue;
+                };
+                let record = ProjectAllowance {
+                    destination: destination.clone(),
+                    recorded_ms: item.granted_ms,
+                };
+                if entry_admitted_by(&record, entry, ports.as_ref()) {
+                    return Some(Coverage::Applied {
+                        scope,
+                        destination,
+                        recorded_ms: item.granted_ms,
+                        revision,
+                        not_recorded_error: item.not_recorded_error.clone(),
+                    });
+                }
+            }
+        }
+        self.allowances.covers(entry)
+    }
 }
 
 #[cfg(test)]

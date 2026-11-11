@@ -712,6 +712,11 @@ fn allowance_store(h: &Harness, destination: &str) -> std::path::PathBuf {
     )
     .unwrap();
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    // The writer's lock file exists beside the record on any host that has run
+    // the writer once, so the guard's cases are measured with it present (AC14).
+    let lock = dir.join("allowances.lock");
+    std::fs::write(&lock, b"").unwrap();
+    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600)).unwrap();
     file
 }
 

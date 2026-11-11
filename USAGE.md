@@ -3750,12 +3750,65 @@ one — never inherits it. Allowances live in one machine-written file,
   "destination":"tcp://[203.0.113.10/32]:443","recorded_ms":1762680120000}]}
 ```
 
-**This release only reads it.** There is no `agent-vm access allow`, no `record`
-and no `forget`: a later release writes this file, and hand-editing it is
-unsupported. Until then, hand-writing it *is* how a record comes to exist, so
-write it exactly as shown and expect the format to change. It is an authority
-store, so it refuses rather than heals — see the table below for what an
-unusable one costs.
+**`agent-vm access allow <ID> --project` writes it; `agent-vm access revoke`
+deletes it.** Hand-editing is unsupported and the format may change. The writer is
+one read-modify-write under `~/.config/agent-vm/allowances.lock`, replacing the
+file atomically at mode `0600`, and it **refuses rather than heals**: a file it
+cannot decode (a later version, damage, or content this build must not replace)
+is reported and left byte-identical — never reset, archived or replaced. A store
+whose directory is untrusted, or whose file has a second hard link or is not this
+user's, refuses the write the same way the launch guard refuses it. The first
+`--project` grant on a host creates `~/.config/agent-vm` itself, mode `0700`; every
+read path leaves it exactly as it found it (and does not create it). See the table
+below for what an unusable one costs.
+
+```console
+$ agent-vm access allow 46d712fd --project
+sibling sessions (not targeted; unchanged until relaunch): deadbeef (running)
+allowed tcp://[203.0.113.10/32]:443 for session 0a1b2c3d (running) (policy revision 2) and recorded for this project (2025-10-09 08:53Z)
+sibling sessions still unchanged until relaunch (running siblings keep refusing until relaunched; the record reaches them then): deadbeef (running)
+
+$ agent-vm access revoke tcp://[203.0.113.10/32]:443
+revoked tcp://[203.0.113.10/32]:443 for session 0a1b2c3d (running) (policy revision 3); the project record was deleted
+```
+
+**Every live change is target-only.** `allow` and `revoke` change **one**
+session: the one that refused the ID for `allow`, or the single active session for
+`revoke` (`--session <ID>` when more than one is active). Sibling sessions keep
+their old policy until they relaunch, and the command names each with its state
+(`running`, `running (no control socket)`, `not responding`, `ended`,
+`ended (unclean)`) before and after. There is no `--all-sessions`.
+
+**A live grant cannot add TLS-intercepted ports.** The runtime can replace its
+rule list but not the ports it intercepts, so `access allow` on a hostname whose
+port the launch did not intercept is refused (or, with `--project`, recorded for
+the next launch and reported as such, exit `0`). Removing hostnames — including
+the last one — narrows within the launch's ports and applies immediately.
+
+**`access revoke` promises what it can confirm.** After a successful revoke new
+matching connections are refused; connections already open keep running. If the
+targeted session cannot confirm (it is starting, its runtime is too old, its socket
+does not answer, or it is still applying its boot allowances), the project record is
+still deleted, the session's in-memory allowances are unchanged, the command names
+the session and says that stopping it is the guaranteed hard cut, and it exits `1`.
+A destination no allowance names is reported as *not a session or project allowance
+of this session* — plus, when this launch's own `--allow-egress` or `[network]`
+still admits it, that it is still allowed — and with no policy revision, because
+no swap was made.
+
+**A live `--project` grant is recorded only after the runtime confirms it.** If
+the record cannot be written at that point, the allowance stays in force for this
+session only and every later `access` / `access allowances` call says
+`applied to this session only (rev N), not recorded for the project: <reason>`.
+
+**`session allowances` are memory only.** `agent-vm access allow <ID>` without
+`--project` adds one for this session and records nothing — except on a runtime too
+old to replace its policy while it runs, where it records the next-launch project
+allowance, says so, and exits `0`. `agent-vm access allowances` lists both the
+record and every live session's allowances: a `SCOPE DESTINATION RECORDED SESSION
+STATUS` table with one row per (project allowance, active session), `SESSION = -`
+when no session is live, and a STATUS cell that names a session it could not ask.
+It never revokes and never exits `1` except for an unparsable `--session`.
 
 **One record, one grant, one project.** `project` is the full SHA-256 of the
 project's canonical path; `path` is that path and must hash to `project`, or the

@@ -4,16 +4,16 @@
 
 Accepted and implemented in **0.7.44**
 ([#557](https://github.com/gregwebs/agent-vm/issues/557) slice 2, PR 1, the
-read-only half). This release **reads** the record and never writes it. PR 2
-adds the writer (`record`/`forget` under `allowances.lock`, archival, the
-preservation of other projects' records), protocol v2 on the slice-1 control
-socket, the runtime policy swap, session allowances, and the verbs
-`access allow|allowances|revoke`; those are **not** decided here.
+read-only half). This release **reads** the record and never writes it. The
+writer, protocol v2, the live swap and `access allow|allowances|revoke` landed in
+**0.7.45** and are decided in
+[ADR-0066](0066-live-egress-allowances-and-writer.md); this ADR's constraints on
+it are carried out there.
 
 Amends [ADR-0038](0038-config-dir-exposure-guard.md) (its Decision 2 one-link
 check covers one more file) and annotates
 [ADR-0064](0064-read-only-refusal-feed.md) (recorded coverage is this ADR's;
-applied coverage is PR 2's).
+applied coverage is [ADR-0066](0066-live-egress-allowances-and-writer.md)'s).
 
 ## Context
 

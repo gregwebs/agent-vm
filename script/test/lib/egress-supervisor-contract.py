@@ -145,7 +145,14 @@ class Contracts(unittest.TestCase):
             self.assertIn("remove the record", command.setup[0])
             self.assertEqual(Path(command.cwd), self.work / "proj")
         self.assertEqual([c.case for c in commands if c.setup],
-                         ["PA1", "PA1x", "CR1c", "CR1"])
+                         ["PA1", "PA1x", "PA2", "CR1c", "CR1"])
+        # PA2 declares the *opposite* of a seed: it must start with no store, and
+        # it owns the writer's never-unlinked lock. Its lifecycle is asserted by
+        # `test_live_allowance_case_lifecycle_and_call_sites`.
+        pa2 = next(c for c in commands if c.case == "PA2")
+        self.assertNotIn("PA2", egress.ALLOWANCE_CASES)
+        self.assertIn("no seed", pa2.setup[0])
+        self.assertIn("allowances.lock", pa2.setup[0])
         printed = subprocess.check_output([sys.executable, str(MODULE_PATH), "run", "--print-plan",
             "--work", str(self.work), "--binary", str(self.binary), "--lan", "192.168.1.2"], cwd="/")
         plan = [json.loads(line) for line in printed.splitlines()]
@@ -296,14 +303,148 @@ class Contracts(unittest.TestCase):
         finally:
             self.assertEqual(egress.final_cleanup(self.work), [])
         self.assertFalse(egress.allowance_present(self.work))
-        # And a lock a case left behind is reported, not swallowed.
+        # The writer's lock is the one `allowances.*` name a *run* may own: PA2's
+        # writer creates it and nothing unlinks it (ADR-0065 Constraint 1), so
+        # `final_cleanup` removes it. `remove_allowances`, which runs for the
+        # read-only PA1/PA1x cases, keeps reporting it: there a lock can only mean
+        # something wrote the store.
         self.assertEqual(egress.prepare_allowance(self.work, case, "192.168.1.2"), [])
-        lock = egress.allowance_store(self.work).parent / "allowances.lock"
+        lock = egress.allowance_lock(self.work)
         lock.write_text("")
-        failures = egress.final_cleanup(self.work)
-        self.assertEqual(len(failures), 1, failures)
-        self.assertIn("allowances.lock", failures[0])
-        lock.unlink()
+        self.assertEqual(len(egress.remove_allowances(self.work)), 1, "a lock is a finding for PA1")
+        self.assertEqual(egress.final_cleanup(self.work), [])
+        self.assertFalse(lock.exists())
+        self.assertFalse(egress.allowance_present(self.work))
+        # Any other sibling of the store's own is still a failure: it means the
+        # store was refused or set aside, never written.
+        self.assertEqual(egress.prepare_allowance(self.work, case, "192.168.1.2"), [])
+        sibling = egress.allowance_store(self.work).parent / "allowances.json.damaged"
+        sibling.write_text("")
+        final = egress.final_cleanup(self.work)
+        self.assertEqual(len(final), 1, final)
+        self.assertIn("allowances.json.damaged", final[0])
+        sibling.unlink()
+
+    def test_live_allowance_case_lifecycle_and_call_sites(self):
+        """ADR-0066 PA2: the opposite of a seed, and the writer's own lock.
+
+        PA2's first probe must be *refused*, so a pre-seeded record would make the
+        case pass while proving no live change; a stale signal file would make a
+        failed host command look like a completed step. Its cleanup is
+        `cleanup_pa2` because its own writer leaves `allowances.lock` behind, and
+        the run's last cleanup has to survive a case that raises mid-way.
+        """
+        case = egress.Case("PA2")
+        project = self.work / "proj"
+        project.mkdir(exist_ok=True)
+        self.assertNotIn("PA2", egress.ALLOWANCE_CASES)
+        # A PA2 launch is not gated on a seed: the seeder refuses the case, so a
+        # PA2 case can never be given a record it did not write itself.
+        refused = egress.prepare_allowance(self.work, case, "192.168.1.2")
+        self.assertEqual(len(refused), 1, refused)
+        self.assertIn("PA2 has no allowance record", refused[0])
+        # ... and only PA2 has the live lifecycle.
+        with self.assertRaises(RuntimeError):
+            egress.prepare_live_allowance(self.work, egress.Case("PA1"))
+        # A clean work directory needs nothing, and stale signals are cleared.
+        for name in egress.PA2_SIGNALS:
+            (project / name).write_text("")
+        self.assertEqual(egress.prepare_live_allowance(self.work, case), [])
+        for name in egress.PA2_SIGNALS:
+            self.assertFalse((project / name).exists(), name)
+        # A leftover store is reported *and* removed: the case must run from the
+        # default-deny state, and the leak is evidence about an earlier case.
+        egress.seed_allowances(self.work, egress.Case("PA1"), "192.168.1.2")
+        egress.allowance_lock(self.work).write_text("")
+        stale = egress.prepare_live_allowance(self.work, case)
+        self.assertEqual(len(stale), 1, stale)
+        self.assertIn("left from an earlier case", stale[0])
+        self.assertFalse(egress.allowance_present(self.work))
+        self.assertFalse(egress.allowance_lock(self.work).exists())
+        # `cleanup_pa2` removes the record and the lock, and reports anything else
+        # of the store's own: a set-aside store means the writer refused.
+        egress.seed_allowances(self.work, egress.Case("PA1"), "192.168.1.2")
+        lock = egress.allowance_lock(self.work)
+        lock.write_text("")
+        self.assertEqual(egress.cleanup_pa2(self.work), [])
+        self.assertFalse(egress.allowance_present(self.work))
+        self.assertFalse(lock.exists())
+        self.assertEqual(egress.cleanup_pa2(self.work), [], "cleanup is idempotent")
+        (lock.parent / "allowances.json.damaged").write_text("")
+        self.assertEqual(len(egress.cleanup_pa2(self.work)), 1)
+        (lock.parent / "allowances.json.damaged").unlink()
+        # The *call sites*, not only the helpers: `orchestrate` is a boot harness,
+        # so the boot-free proof is that the steps it must perform are the ones it
+        # calls (the same shape as the PA1/PA1x lifecycle and the print-plan
+        # inventory).
+        source = inspect.getsource(egress.orchestrate)
+        for fragment in (
+            "seed_failures = prepare_live_allowance(work, case)",
+            "failures.extend(check_live_allowance(work, ident, owned_text))",
+            "failures.extend(cleanup_pa2(work))",
+            "cleanup_errors.extend(final_cleanup(work))",
+            "elif self.command.case == \"PA2\":",
+        ):
+            if fragment.startswith("elif self.command"):
+                self.assertIn(fragment, inspect.getsource(egress.OwnedLaunch.run))
+            else:
+                self.assertIn(fragment, source, f"orchestrate no longer runs: {fragment}")
+
+    def test_live_allowance_verdict_bites(self):
+        """The PA2 oracle itself: one valid record passes, every missing fact fails.
+
+        The boot run cannot be repeated on this host, so the part that decides its
+        verdict is held here: a case that lost a marker, a revision, a receipt, or
+        the store's own before/after state must fail, or the boot run would pass
+        on evidence it never had.
+        """
+        work = self.work
+        project = work / "proj"
+        project.mkdir(exist_ok=True)
+        ident = "PA2-ipv4-0"
+        destination = "tcp://192.168.1.2/32:18080"
+        store = json.dumps({"v": 1, "records": [{
+            "project": "0" * 64, "path": str(project),
+            "destination": destination, "recorded_ms": 1762680120000}]})
+        evidence = {
+            "refusal_id": "0e7e41fb", "session": "aaaaaaaa", "destination": destination,
+            "steps": [{"step": step, "status": 0, "output": ""}
+                      for step in ("allow", "table", "allowances", "revoke")],
+            "failures": [], "store": store,
+            "store_after_revoke": json.dumps({"v": 1, "records": []}),
+            "grant_revision": 2, "revoke_revision": 3,
+        }
+        # The case must be declared exactly once, without a probe inventory of its
+        # own: its evidence is the transition, which is what the record above
+        # models. A second declaration would double-run the case.
+        self.assertEqual([c.case for c in egress.CASES].count("PA2"), 1)
+        self.assertEqual(egress.expected_attempts(egress.Case("PA2")), ())
+        text = "\n".join(("CASE PA2 BEGIN", *egress.PA2_MARKERS, "CASE PA2 END")) + "\n"
+        receipts = work / "fx/receipts.log"
+        receipts.parent.mkdir(exist_ok=True)
+        receipts.write_text(f"tcp 18080 127.0.0.1 {ident}-p2\n")
+
+        def verdict(record=None, log=None, receipt_lines=None):
+            (work / "PA2-witness.json").write_text(json.dumps(record or evidence))
+            receipts.write_text(receipt_lines if receipt_lines is not None
+                                else f"tcp 18080 127.0.0.1 {ident}-p2\n")
+            return egress.check_live_allowance(work, ident, text if log is None else log)
+
+        self.assertEqual(verdict(), [])
+        self.assertTrue(verdict(log=text.replace("PA2 PROBE 2 OK\n", "")))
+        self.assertTrue(verdict(log=text + "PA2 PROBE 2 STILL DENIED\n"))
+        self.assertTrue(verdict(record={**evidence, "grant_revision": 1}))
+        self.assertTrue(verdict(record={**evidence, "revoke_revision": 2}))
+        self.assertTrue(verdict(record={**evidence, "failures": ["the grant failed"]}))
+        self.assertTrue(verdict(record={**evidence, "destination": ""}))
+        self.assertTrue(verdict(record={**evidence, "steps": evidence["steps"][:3]}))
+        self.assertTrue(verdict(record={**evidence, "store": "not json"}))
+        self.assertTrue(verdict(record={**evidence, "store_after_revoke": store}))
+        self.assertTrue(verdict(receipt_lines=""))
+        self.assertTrue(verdict(receipt_lines=f"tcp 18080 127.0.0.1 {ident}-p2\n"
+                                              f"tcp 18080 127.0.0.1 {ident}-p1\n"))
+        (work / "PA2-witness.json").unlink()
+        self.assertTrue(egress.check_live_allowance(work, ident, text))
 
     def test_required_calibrations_and_links(self):
         # Independent endpoint/protocol inventory: deleting a calibration must

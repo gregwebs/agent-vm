@@ -16,6 +16,23 @@ import shlex
 import subprocess
 import unittest
 
+_FIXTURES = None
+
+
+def fixtures():
+    """The host harness module, loaded once: PA2's vocabulary lives there."""
+    global _FIXTURES
+    if _FIXTURES is None:
+        path = PROBE.parents[1] / "lib/egress-fixtures.py"
+        spec = importlib.util.spec_from_file_location("pa2_fixtures", path)
+        module = importlib.util.module_from_spec(spec)
+        # Registration before exec: `@dataclass` resolves its module through
+        # `sys.modules`.
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        _FIXTURES = module
+    return _FIXTURES
+
 PROBE = Path(__file__).resolve().parents[1] / "fixtures/egress-probe.sh"
 LAN = "192.168.20.7"
 GW = "100.64.0.1"
@@ -391,6 +408,101 @@ class HostnamePrimitives(unittest.TestCase):
         self.assertIn("--http1.1", result.stdout)
         self.assertIn("--max-time", result.stdout)
         self.assertNotIn("-k", result.stdout.splitlines())
+
+
+def run_live_allowance(work, routes, *, signals=True, bound=60):
+    """Drive the real `PA2` dispatch branch with a scripted probe.
+
+    Only `http_get` is stubbed — the three probes' outcomes *are* the script, so
+    the case's own assertions (refused, allowed, refused) and its ordering are
+    what this exercises. The signal files and the wait bound are real: nothing
+    here stands in for `_pa2_wait`.
+    """
+    for name in fixtures().PA2_SIGNALS:
+        path = work / name
+        if signals:
+            path.write_text("")
+        else:
+            path.unlink(missing_ok=True)
+    (work / "probe-rcs").write_text("".join(f"{rc}\n" for rc in routes))
+    (work / "probe-count").write_text("0\n")
+    script = f"""
+EGRESS_PROBE_LIB=1 . {shlex.quote(str(PROBE))}
+cd {shlex.quote(str(work))}
+gateway() {{ echo {GW}; }}
+http_get() {{
+    local n rc
+    n=$(cat probe-count)
+    n=$(( n + 1 ))
+    echo "$n" > probe-count
+    rc=$(sed -n "${{n}}p" probe-rcs)
+    return "${{rc:-2}}"
+}}
+dispatch PA2 attempt_1 {LAN} ipv4 ""
+"""
+    return subprocess.run([os.environ.get("BASH", "bash"), "-c", script],
+                          capture_output=True, text=True, timeout=bound,
+                          env={**os.environ, "PA2_WAIT": "1"})
+
+
+class LiveAllowanceDispatch(unittest.TestCase):
+    """ADR-0066 PA2: the guest half of the live allowance case.
+
+    The case is the only place a *policy change* is asserted from inside the
+    guest, and it is excluded from `MATRIX` (its three probes share one endpoint
+    with three different outcomes, which a first-match `case` cannot express).
+    These controls replace that coverage: the dispatch, the ordering, the bound,
+    and the vocabulary the host witness must agree with.
+    """
+
+    def test_pa2_is_dispatched_and_probes_in_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_live_allowance(Path(tmp), (1, 0, 1))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual([line for line in result.stdout.splitlines() if line.startswith("PA2")],
+                         list(fixtures().PA2_MARKERS))
+        self.assertIn("CASE PA2 END", result.stdout)
+
+    def test_pa2_cannot_complete_without_its_signals(self):
+        # No host signal ever arrives: the case must fail on its own bounded wait,
+        # not hang the harness and not report the transition it never observed.
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_live_allowance(Path(tmp), (1, 0, 1), signals=False)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("PA2 PROBE 1 DENIED", result.stdout)
+        self.assertIn("PA2 FAIL no grant signal within 1s", result.stdout)
+        self.assertNotIn("PA2 DONE", result.stdout)
+        self.assertNotIn("CASE PA2 END", result.stdout)
+        # ... and it never asked for a second probe.
+        self.assertNotIn("PA2 PROBE 2", result.stdout)
+
+    def test_pa2_fails_on_a_policy_that_did_not_change(self):
+        for routes, marker in (((0, 0, 0), "PA2 PROBE 1 UNEXPECTEDLY ALLOWED"),
+                               ((1, 1, 1), "PA2 PROBE 2 STILL DENIED"),
+                               ((1, 0, 0), "PA2 PROBE 3 UNEXPECTEDLY ALLOWED")):
+            with self.subTest(routes=routes), tempfile.TemporaryDirectory() as tmp:
+                result = run_live_allowance(Path(tmp), routes)
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn(marker, result.stdout.splitlines())
+                self.assertNotIn("PA2 DONE", result.stdout)
+                self.assertNotIn("CASE PA2 END", result.stdout)
+
+    def test_pa2_vocabulary_is_shared_with_the_host_witness(self):
+        module = fixtures()
+        source = PROBE.read_text()
+        for marker in module.PA2_MARKERS:
+            self.assertEqual(source.count(marker), 1, marker)
+        for name in module.PA2_SIGNALS:
+            self.assertEqual(source.count(name), 1, name)
+        # The bound is one number: the probe's default and the witness's deadline.
+        self.assertIn(f"PA2_WAIT:-{module.PA2_WAIT_SECONDS}", source)
+        # A case that is not routed here falls through to `CASE PA2 UNKNOWN`.
+        self.assertIn("PA2) _case_live_allowance", source)
+        self.assertNotIn("PA2", MATRIX)
+        # The host case is declared once, and declares no probe inventory of its
+        # own: its evidence is the transition, checked by `check_live_allowance`.
+        self.assertEqual([case.case for case in module.CASES].count("PA2"), 1)
+        self.assertEqual(module.expected_attempts(module.Case("PA2")), ())
 
 
 if __name__ == "__main__":

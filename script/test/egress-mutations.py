@@ -320,6 +320,20 @@ def matrix():
     add("allowance-final-cleanup-dropped", FIXTURE,
         "        cleanup_errors.extend(final_cleanup(work))",
         "        cleanup_errors.extend(remove_credentials(work))", host, "FAILED (")
+    # ADR-0066 (PA2): the same shape for the live-allowance case, whose evidence is
+    # a *transition*. Dropping any of its three call sites must be caught: without
+    # the pre-launch reset a seeded store makes the first, supposed-to-be-refused
+    # probe pass; without the verdict the case would pass on the guest's markers
+    # alone; without the restore the record and the writer's lock leak.
+    add("live-allowance-reset-dropped", FIXTURE,
+        "                seed_failures = prepare_live_allowance(work, case)\n",
+        "                seed_failures = []\n", host, "FAILED (")
+    add("live-allowance-verdict-dropped", FIXTURE,
+        "                failures.extend(check_live_allowance(work, ident, owned_text))\n",
+        "", host, "FAILED (")
+    add("live-allowance-cleanup-dropped", FIXTURE,
+        "            if case.case == \"PA2\":\n                failures.extend(cleanup_pa2(work))\n",
+        "", host, "FAILED (")
     # Real timeout/catalog/socket contracts exercise these independent omissions.
     for name, old, new in (
         ("cleanup-no-kill", 'for identity in launch.alive():', 'for identity in []:'),
@@ -1000,6 +1014,155 @@ def matrix():
     add("git-enclosing-declaration-shadowed-launch", git_metadata, git_enclosure,
         git_enclosure_mutant,
         rust("an_enclosing_declaration_is_never_shadowed", GIT_MOUNTS))
+
+    # #557 slice 2: the seven critical live-allowance controls. Each anchor is
+    # 4-5 lines of unique context, so `grant`'s and `revoke`'s `Unsupported` arms
+    # can never share one, and each is killed by the test the plan names.
+    apply_rs = SRC + "allowances/apply.rs"
+    allowances_rs = SRC + "allowances.rs"
+    add("live-grant-skips-policy-rederive", NETWORK,
+        """        let derived_policy = candidate.policy();
+        Ok((
+            Self {
+                egress: candidate,""",
+        """        let derived_policy = self.egress.policy();
+        Ok((
+            Self {
+                egress: candidate,""",
+        rust("allowances::tests::live_grant_rederives_through_egress_authority_policy"))
+    add("live-grant-ignores-port-change", NETWORK,
+        """        if !crate::egress_hostname::InterceptedPorts::is_subset(
+            candidate.intercepted_ports().as_ref(),
+            self.launch_intercepted_ports.as_ref(),
+        ) {
+            return Err(LivePolicyPrecondition::InterceptedPortsFixedAtLaunch);""",
+        """        if false && !crate::egress_hostname::InterceptedPorts::is_subset(
+            candidate.intercepted_ports().as_ref(),
+            self.launch_intercepted_ports.as_ref(),
+        ) {
+            return Err(LivePolicyPrecondition::InterceptedPortsFixedAtLaunch);""",
+        rust("allowances::tests::live_grant_refuses_or_defers_when_intercepted_ports_change"))
+    add("revoke-unconfirmed-succeeds", SRC + "access_cmd.rs",
+        """            )
+            .context("writing the unconfirmed revoke")?;
+            Ok(1)
+        }""",
+        """            )
+            .context("writing the unconfirmed revoke")?;
+            Ok(0)
+        }""",
+        rust("access_cmd::tests::revoke_exits_nonzero_and_names_session_when_unconfirmed"))
+    add("grant-failed-writes-project-record", apply_rs,
+        """                let record_on_runtime_failure = false;
+                if record_on_runtime_failure && scope == GrantScope::Project {
+                    let _ = record.record(&destination, now_ms).await;
+""",
+        """                let record_on_runtime_failure = true;
+                if record_on_runtime_failure && scope == GrantScope::Project {
+                    let _ = record.record(&destination, now_ms).await;
+""",
+        rust("access_cmd::tests::project_grant_writes_no_record_when_live_session_cannot_confirm"))
+    add("older-runtime-fails-grant", apply_rs,
+        """            Err(microsandbox::MicrosandboxError::Unsupported { .. }) => {
+                match record.record(&destination, now_ms).await {
+                    Ok(outcome) => GrantResult::NextLaunch {""",
+        """            Err(microsandbox::MicrosandboxError::Unsupported { .. }) if false => {
+                match record.record(&destination, now_ms).await {
+                    Ok(outcome) => GrantResult::NextLaunch {""",
+        rust("access_cmd::tests::older_runtime_without_policy_update_yields_next_launch_grant_and_never_fails"))
+    add("session-allowance-writes-store", apply_rs,
+        """            Ok(revision) => {
+                if scope == GrantScope::Project {
+                    match record.record(&destination, now_ms).await {""",
+        """            Ok(revision) => {
+                if true {
+                    match record.record(&destination, now_ms).await {""",
+        rust("access_cmd::tests::session_allowance_never_touches_disk_or_another_project"))
+    add("applied-coverage-at-or-before-refusal", allowances_rs,
+        """                let Some(revision) = item.revision else {
+                    continue;
+                };
+                // M7: only a revision after the refusal confirms it.
+                let confirmed_after_refusal = revision > entry.last_revision;""",
+        """                let Some(revision) = item.revision else {
+                    continue;
+                };
+                // M7: only a revision after the refusal confirms it.
+                let confirmed_after_refusal = revision >= entry.last_revision;""",
+        rust("allowances::tests::applied_coverage_requires_confirmed_revision_after_last_refusal"))
+    # The four honesty defects the reviews found by hand, now each guarded by the
+    # test that was written for it: a surviving mutant is how they shipped.
+    add("revoke-still-effective-configured", apply_rs,
+        """            let still_effective = snapshot.plan.is_configured(destination)
+                || next_session
+                    .iter()
+                    .chain(next_project.iter())
+                    .any(|entry| entry.destination() == destination);""",
+        """            let still_effective = true;""",
+        rust("allowances::tests::revoke_names_only_what_the_policy_still_allows"))
+    add("queued-project-grant-skips-record", apply_rs,
+        """                (GrantScope::Project, false) => {
+                    self.record_queued_as_project(entry, destination, record)
+                        .await
+                }""",
+        """                (GrantScope::Project, false) => GrantResult::QueuedForBoot {
+                    destination: destination.to_string(),
+                    scope: GrantScope::Project,
+                    recorded_ms: entry.allowance.granted_ms(),
+                },""",
+        rust("allowances::tests::project_grant_over_a_queued_session_entry_records_before_claiming_it"))
+    add("retry-demotion-forgotten", apply_rs,
+        """                        if item.destination() == destination {
+                            item.not_recorded_error = Some(message.clone());
+                        }""",
+        """                        if item.destination() == destination {
+                            item.not_recorded_error = None;
+                        }""",
+        rust("allowances::tests::project_grant_over_a_session_entry_keeps_the_demotion_on_the_entry"))
+    add("live-swap-while-boot-queue-pending", apply_rs,
+        """        let updater = if queued_for_boot { None } else { updater };""",
+        """        let updater = { let _ = queued_for_boot; updater };""",
+        rust("allowances::tests::a_grant_while_the_boot_queue_is_pending_makes_no_swap"))
+    add("adoption-skips-queued-rederive", apply_rs,
+        """            match post_adoption_plan.derive_for(state.combined()) {""",
+        """            match post_adoption_plan.derive_for(Vec::new()) {""",
+        rust("allowances::tests::adopt_boot_allowances_rederives_a_queued_grant_over_the_post_adoption_plan"))
+    add("sibling-label-hardcoded", SRC + "access_cmd.rs",
+        """    let siblings: Vec<String> = sessions
+        .iter()
+        .filter(|row| target.is_none_or(|target| row.snapshot.info.id != *target))
+        .map(|row| format!("{} ({})", escape(row.snapshot.info.id.as_str()), row.label))""",
+        """    let siblings: Vec<String> = sessions
+        .iter()
+        .filter(|row| target.is_none_or(|target| row.snapshot.info.id != *target))
+        .map(|row| format!("{} ({})", escape(row.snapshot.info.id.as_str()), "running"))""",
+        rust("access_cmd::tests::siblings_are_named_in_every_state_and_offline_revoke_names_them"))
+    add("demoted-status-collapsed", SRC + "access_cmd.rs",
+        """        (Some(revision), Some(error)) => format!(
+            "applied to this session only (rev {revision}), not recorded for the project: {}",
+            escape(error)
+        ),""",
+        """        (Some(revision), Some(_error)) => format!("applied (rev {revision})"),""",
+        rust("access_cmd::tests::allowances_keeps_a_demoted_live_project_entry_demoted"))
+    # The two defects the independent verifier found, and the lock wording that
+    # told a user to wait for a permission error. Each is the exact sentence or
+    # filter that was wrong, so the probe that found it is the control's kill.
+    add("allowances-silence-not-per-session", SRC + "access_cmd.rs",
+        """    silent.retain(|(id, _)| wanted.is_none_or(|wanted| wanted == id));""",
+        """    silent.retain(|(_, _)| { let _ = wanted; true });""",
+        rust("access_cmd::tests::allowances_session_filter_lists_only_the_named_session"))
+    add("offline-session-only-claims-the-record", SRC + "access_cmd.rs",
+        '        match scope {\n            RevokeScope::Session => writeln!(\n                out,\n                "no session is active, so {spelled} was not revoked from any session; \\\n                 the project record for this project is unchanged"\n            )\n            .context("writing the offline session-only revoke")?,\n',
+        '        match scope {\n            RevokeScope::Session => writeln!(\n                out,\n                "{} {} for this project; no session is active, so the next launch starts without it",\n                if removed { "deleted" } else { "no record for" },\n                spelled\n            )\n            .context("writing the offline revoke")?,\n',
+        rust("access_cmd::verifier_probes::verifier_revoke_session_only_never_claims_the_record_is_gone"))
+    add("lock-unopenable-reported-as-busy", SRC + "allowances/store.rs",
+        """            Self::LockUnopenable(error) => format!(
+                "the project allowance store's lock file {LOCK_FILE} could not be opened ({error}); nothing was written — waiting will not help, so check that directory's permissions and that {LOCK_FILE} is a regular file this user owns"
+            ),""",
+        """            Self::LockUnopenable(error) => {
+                format!("the project allowance store is busy ({error}); nothing was written")
+            }""",
+        rust("allowances::store::tests::a_lock_the_host_refuses_to_open_is_not_reported_as_busy"))
     return controls
 
 

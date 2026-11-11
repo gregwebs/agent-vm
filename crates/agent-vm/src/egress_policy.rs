@@ -273,7 +273,7 @@ struct GroupOrigin {
     resolved: ResolvedGrant,
     saved: Option<bool>,
 }
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Provenance {
     file: std::path::PathBuf,
     internet: GroupOrigin,
@@ -344,13 +344,13 @@ impl Destinations {
 /// The project's recorded allowances in force for this launch, and the file they
 /// came from (ADR-0065). Absent until [`EgressAuthority::set_recorded`], and
 /// absent again if that is called with an empty set.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Recorded {
     file: std::path::PathBuf,
     destinations: Vec<Allowance>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct EgressAuthority {
     groups: GroupGrants,
     /// D3's "configured": this launch's flags and the verified user `[network]`,
@@ -601,6 +601,16 @@ impl EgressAuthority {
             project,
         })
     }
+    /// Whether this launch's **configured** authority names the allowance: a
+    /// live revoke can remove the project record and the session entry, but never
+    /// what the launch was started with.
+    pub(crate) fn configured_contains(&self, allowance: &Allowance) -> bool {
+        match allowance {
+            Allowance::Address(address) => self.configured.addresses.contains(address),
+            Allowance::Hostname(hostname) => self.configured.hostnames.contains(hostname),
+        }
+    }
+
     pub(crate) fn has_hostnames(&self) -> bool {
         !self.effective.hostnames.is_empty()
     }

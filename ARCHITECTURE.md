@@ -51,7 +51,7 @@ crates/agent-vm/src/
 │                           #   two proved prefix claims, one namespace (ADR-0059, #511)
 │   └── sets.rs             #   the egress-set graph: names, references, cycles, budgeted closures
 ├── dns_name.rs             # shared ASCII DNS label byte kernel (credential + egress)
-├── network.rs              # published ports, proxy notice, launch Plan
+├── network.rs              # published ports, proxy notice, launch Plan, LivePolicyPlan (ADR-0066)
 ├── network_requests.rs     # tool requests: parse, coverage report (never authority)
 ├── mount.rs                # --mount grammar and volume wiring
 ├── config_mounts.rs        # user-tier `mounts` + `[mount_sets]`: schema, `~/` expansion, load-time claim
@@ -76,13 +76,14 @@ crates/agent-vm/src/
 ├── image_publish.rs        # staging, native publication, requested-reference rollback
 ├── image_miss.rs           # registry-failure import hint
 ├── tools_cmd.rs            # tools verb group: `print` the built-in definitions as user TOML
-├── access_cmd.rs           # the `access` report: select, render and label refusals (ADR-0064)
-├── allowances.rs           # project allowances: the view, `covers`, doctor's section (ADR-0065)
-│   └── store.rs            #   the record's read path: trust, damage, the reopen rule
+├── access_cmd.rs           # the `access` report and allow/allowances/revoke (ADR-0064, ADR-0066)
+├── allowances.rs           # project allowances: view, `covers`, `Coverage::Applied`, writer facade (ADR-0065, ADR-0066)
+│   ├── store.rs            #   the record's read path and its lock-bounded, refuse-on-damage writer
+│   └── apply.rs            #   LiveAllowances: session grants, the one-computation swap, queued boot flush
 ├── refusal.rs              # coalescing, entry keys, kinds, refusal IDs (pure)
 │   ├── log.rs              #   the project refusal log: flock, atomic replace, eviction
 │   └── feed.rs             #   follow network.log, one ordered persister thread, the hint
-├── session_control.rs      # the per-session control socket, protocol v1, discovery (ADR-0064)
+├── session_control.rs      # the per-session control socket, protocol v1+v2, discovery (ADR-0064, ADR-0066)
 ├── msb_install.rs          # locate + version-verify the bundled msb; MSB_HOME
 ├── msb_preflight.rs        # fail fast on a forward-migrated msb.db
 ├── doctor.rs               # operator diagnostics and db recovery

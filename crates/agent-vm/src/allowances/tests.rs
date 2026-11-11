@@ -1506,3 +1506,1127 @@ fn doctor_reports_an_uninspectable_project_as_unknown() {
         "{section}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Group L: the live controller, coverage, and grantable destinations (PR 2)
+// ---------------------------------------------------------------------------
+
+use crate::allowances::apply::{
+    GrantResult, GrantScope, LiveAllowances, RevokeResult, RevokeScope, SessionAllowancesSnapshot,
+    UnconfirmedReason, WireAllowance,
+};
+use crate::refusal::feed::LiveRefusals;
+use std::sync::{Arc, Mutex};
+
+/// One project directory a live controller can own.
+fn live_project(name: &str) -> ProjectDir {
+    let dir = scratch().join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    ProjectDir::from_path_for_tests(&dir).unwrap()
+}
+
+/// A `LivePolicyPlan` for an explicit launch authority.
+fn live_plan(allow_egress: &[&str], host_proxy_used: bool) -> crate::network::LivePolicyPlan {
+    crate::network::plan_for_tests(allow_egress, host_proxy_used)
+        .live_policy_plan(Some(Path::new("/home/a/.config/agent-vm/allowances.json")))
+}
+
+/// Every policy handed to the runtime, with a monotonic revision.
+struct Recorder {
+    policies: Mutex<Vec<(NetworkPolicy, u64)>>,
+    fail: std::sync::atomic::AtomicBool,
+    unsupported: Mutex<bool>,
+}
+
+impl Recorder {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            policies: Mutex::new(Vec::new()),
+            fail: std::sync::atomic::AtomicBool::new(false),
+            unsupported: Mutex::new(false),
+        })
+    }
+
+    fn calls(&self) -> usize {
+        self.policies.lock().unwrap().len()
+    }
+
+    fn last(&self) -> Option<(NetworkPolicy, u64)> {
+        self.policies.lock().unwrap().last().cloned()
+    }
+
+    fn updater(self: &Arc<Self>) -> crate::allowances::PolicyUpdater {
+        let recorder = Arc::clone(self);
+        Arc::new(move |policy: NetworkPolicy| {
+            let recorder = Arc::clone(&recorder);
+            Box::pin(async move {
+                if *recorder.unsupported.lock().unwrap() {
+                    return Err(microsandbox::MicrosandboxError::Unsupported {
+                        op: microsandbox::Operation::SandboxUpdateNetworkPolicy,
+                        reason: microsandbox::UnsupportedReason::NotAvailable("test".to_owned()),
+                    });
+                }
+                if recorder.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(microsandbox::MicrosandboxError::ControlStateChanged);
+                }
+                let mut policies = recorder.policies.lock().unwrap();
+                let revision = policies.len() as u64 + 2;
+                policies.push((policy, revision));
+                Ok(revision)
+            })
+        })
+    }
+}
+
+/// A controller over a temporary authority directory, with nothing adopted.
+fn live(
+    project: &ProjectDir,
+    plan: crate::network::LivePolicyPlan,
+) -> (Arc<LiveAllowances>, tempfile::TempDir) {
+    let root = tempfile::tempdir().unwrap();
+    let store = crate::allowances::StoreHandle::at_for_tests(root.path());
+    let controller = LiveAllowances::new(project, store, plan);
+    (controller, root)
+}
+
+fn live_refusals() -> Arc<LiveRefusals> {
+    LiveRefusals::new(crate::refusal::SessionRefusals::new(
+        crate::refusal::SessionInfo {
+            id: crate::refusal::SessionId::parse("0a1b2c3d").unwrap(),
+            pid: 1,
+            started_ms: 0,
+            socket: true,
+        },
+    ))
+}
+
+/// The policy a fresh launch resolved with exactly these entries would produce.
+fn fresh_policy(allow_egress: &[&str], combined: &[&str]) -> NetworkPolicy {
+    let mut authority = crate::egress_policy::EgressAuthority::resolve(
+        crate::egress_policy::CliEgress {
+            internet: None,
+            lan: None,
+            host: None,
+            allowances: &[],
+        },
+        None,
+        None,
+    )
+    .unwrap();
+    // One `set_recorded` with the whole effective set: it replaces, not appends.
+    let mut effective = Vec::new();
+    for text in allow_egress.iter().chain(combined.iter()) {
+        effective.push(Allowance::parse(text).unwrap());
+    }
+    authority.set_recorded(Path::new("/live"), effective);
+    authority.policy()
+}
+
+/// L1: every grantable destination round-trips through `covers`, and the names
+/// this command must refuse are refused.
+#[test]
+fn grantable_destination_round_trips_through_covers() {
+    // Address sites.
+    for (protocol, site, ip, port, spelling) in [
+        (
+            "tcp",
+            "tcp-syn",
+            "203.0.113.10",
+            Some(443),
+            "tcp://[203.0.113.10/32]:443",
+        ),
+        (
+            "udp",
+            "udp",
+            "203.0.113.10",
+            Some(53),
+            "udp://[203.0.113.10/32]:53",
+        ),
+        (
+            "tcp",
+            "tcp-syn",
+            "203.0.113.10",
+            None,
+            "tcp://203.0.113.10/32",
+        ),
+    ] {
+        let entry = address_entry(protocol, ip, port, site);
+        let granted = grantable_destination(&entry).expect(spelling);
+        assert_eq!(granted.to_string(), spelling);
+        assert!(
+            covers(&[spelling], &entry),
+            "{spelling} covers the entry it came from"
+        );
+    }
+
+    // A hostname through TLS/SNI.
+    let sni = host_entry("api.example.com", 443, "tls-sni", "sni");
+    let granted = grantable_destination(&sni).expect("a TLS hostname");
+    assert_eq!(granted.to_string(), "tcp://api.example.com:443");
+    assert!(covers(&["tcp://api.example.com:443"], &sni));
+
+    // A DNS query.
+    let dns = dns_entry("api.example.com", "dns-query");
+    assert_eq!(
+        grantable_destination(&dns).unwrap().to_string(),
+        "api.example.com"
+    );
+    assert!(covers(&["api.example.com"], &dns));
+
+    // Refusals this command must not turn into an allowance.
+    assert!(matches!(
+        grantable_destination(&host_entry("api.example.com", 80, "http-host", "http-host")),
+        Err(CannotAllow::PlainHttpHostname)
+    ));
+    assert!(matches!(
+        grantable_destination(&address_entry(
+            "tcp",
+            "203.0.113.10",
+            Some(443),
+            "dns-query"
+        )),
+        Err(CannotAllow::SiteNotAllowable { .. })
+    ));
+    let mut platform = address_entry("tcp", "203.0.113.10", Some(443), "tcp-syn");
+    platform.layer = "platform".to_owned();
+    assert!(matches!(
+        grantable_destination(&platform),
+        Err(CannotAllow::NotNetworkDenial(_))
+    ));
+    // A non-canonical name is refused rather than granted in a spelling the
+    // recorded query could never recognise.
+    let uppercase = host_entry("API.Example.COM", 443, "tls-sni", "sni");
+    match grantable_destination(&uppercase) {
+        Ok(allowance) => assert!(
+            covers(&[&allowance.to_string()], &uppercase),
+            "a grantable name must round-trip"
+        ),
+        Err(CannotAllow::InvalidDestination(_)) => {}
+        Err(other) => panic!("unexpected refusal {other:?}"),
+    }
+}
+
+/// L2: the policy handed to the runtime is the launch's one computation over
+/// `session ∪ project`, byte for byte.
+#[tokio::test]
+async fn live_grant_rederives_through_egress_authority_policy() {
+    let project = live_project("l2");
+    let (controller, _root) = live(&project, live_plan(&["api.example.com"], false));
+    let recorder = Recorder::new();
+    assert!(!controller.attach_updater(recorder.updater()));
+    let refusals = live_refusals();
+
+    let result = controller
+        .grant(
+            &refusals,
+            None,
+            Some("tcp://[203.0.113.10/32]:443"),
+            GrantScope::Session,
+            1_000,
+        )
+        .await;
+    assert!(
+        matches!(result, GrantResult::Applied { revision: 2, .. }),
+        "{result:?}"
+    );
+    let (policy, revision) = recorder.last().expect("one swap");
+    assert_eq!(revision, 2);
+    let expected = fresh_policy(&["api.example.com"], &["tcp://[203.0.113.10/32]:443"]);
+    assert_eq!(
+        format!("{policy:?}"),
+        format!("{expected:?}"),
+        "one computation produced this policy"
+    );
+}
+
+/// L3: adding a TLS-intercepted port is refused for a session grant and deferred
+/// for a project grant; nothing calls the runtime.
+#[tokio::test]
+async fn live_grant_refuses_or_defers_when_intercepted_ports_change() {
+    let project = live_project("l3");
+    let (controller, root) = live(&project, live_plan(&[], false));
+    let recorder = Recorder::new();
+    controller.attach_updater(recorder.updater());
+    let refusals = live_refusals();
+
+    // A launch that intercepted nothing cannot grant a hostname live.
+    let result = controller
+        .grant(
+            &refusals,
+            None,
+            Some("api.example.com"),
+            GrantScope::Session,
+            1_000,
+        )
+        .await;
+    assert!(
+        matches!(
+            result,
+            GrantResult::Refused {
+                reason: GrantRefusalReason::InterceptedPortsFixedAtLaunch
+            }
+        ),
+        "{result:?}"
+    );
+    assert_eq!(recorder.calls(), 0, "no policy swap for a refused grant");
+
+    // With `--project` the same grant becomes a next-launch record.
+    let result = controller
+        .grant(
+            &refusals,
+            None,
+            Some("api.example.com"),
+            GrantScope::Project,
+            2_000,
+        )
+        .await;
+    assert!(
+        matches!(
+            result,
+            GrantResult::NextLaunch {
+                reason: NextLaunchReason::InterceptedPortsFixedAtLaunch,
+                ..
+            }
+        ),
+        "{result:?}"
+    );
+    assert_eq!(recorder.calls(), 0);
+    let view = ProjectView::at_dir_for_tests(root.path(), &ProjectId::of(&project));
+    assert_eq!(
+        view.allowances()
+            .destinations()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        vec!["api.example.com".to_owned()],
+        "the project record is written for the next launch"
+    );
+}
+
+/// L4: scoped revoke respects the union, and revoking the last *granted*
+/// hostname removes the last Domain rule within the launch's ports.
+#[tokio::test]
+async fn live_revoke_of_last_hostname_stops_connections_within_launch_ports_and_keeps_state_on_failure()
+ {
+    // Part 1: one destination in both tables collapses to one rule; a project
+    // revoke leaves the session entry in force.
+    let project = live_project("l4");
+    let (controller, _root) = live(&project, live_plan(&["api.example.com"], false));
+    let recorder = Recorder::new();
+    controller.attach_updater(recorder.updater());
+    let refusals = live_refusals();
+
+    let session = controller
+        .grant(
+            &refusals,
+            None,
+            Some("api.example.com"),
+            GrantScope::Session,
+            1_000,
+        )
+        .await;
+    assert!(
+        matches!(session, GrantResult::Applied { .. }),
+        "{session:?}"
+    );
+    let project_grant = controller
+        .grant(
+            &refusals,
+            None,
+            Some("api.example.com"),
+            GrantScope::Project,
+            2_000,
+        )
+        .await;
+    assert!(
+        matches!(project_grant, GrantResult::Applied { .. }),
+        "{project_grant:?}"
+    );
+    assert_eq!(
+        recorder.calls(),
+        1,
+        "the duplicate grant did not swap the policy again"
+    );
+
+    let result = controller
+        .revoke(
+            &Allowance::parse("api.example.com").unwrap(),
+            RevokeScope::Project,
+        )
+        .await;
+    match result {
+        RevokeResult::Revoked {
+            still_effective,
+            revision,
+            ..
+        } => {
+            assert!(still_effective, "the session allowance is still in force");
+            // The duplicate project grant took no swap, so this revoke is the
+            // session's second confirmed revision.
+            assert_eq!(revision, Some(3));
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // Part 2: a launch that fixed port 443 for TLS but granted no hostname. A
+    // live grant of one hostname narrows cleanly when it is revoked again: the
+    // derived policy has no Domain rule at all, and the launch's ports are kept.
+    let (controller, _root) = {
+        let project = live_project("l4b");
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::allowances::StoreHandle::at_for_tests(root.path());
+        let plan = crate::network::LivePolicyPlan::with_launch_ports_for_tests(
+            &[],
+            Some("fixed.example"),
+            false,
+        );
+        (LiveAllowances::new(&project, store, plan), root)
+    };
+    let recorder = Recorder::new();
+    controller.attach_updater(recorder.updater());
+    let refusals = live_refusals();
+    let granted = controller
+        .grant(
+            &refusals,
+            None,
+            Some("api.example.com"),
+            GrantScope::Session,
+            4_000,
+        )
+        .await;
+    assert!(
+        matches!(granted, GrantResult::Applied { .. }),
+        "{granted:?}"
+    );
+    let result = controller
+        .revoke(
+            &Allowance::parse("api.example.com").unwrap(),
+            RevokeScope::All,
+        )
+        .await;
+    assert!(
+        matches!(
+            result,
+            RevokeResult::Revoked {
+                still_effective: false,
+                ..
+            }
+        ),
+        "{result:?}"
+    );
+    let (policy, _) = recorder.last().unwrap();
+    let has_domain = policy.rules.iter().any(|rule| {
+        matches!(
+            rule.destination,
+            microsandbox_network::policy::Destination::Domain(_)
+        )
+    });
+    assert!(!has_domain, "no Domain rule remains: {policy:?}");
+
+    // Part 3: a runtime failure keeps every entry.
+    controller
+        .grant(
+            &refusals,
+            None,
+            Some("tcp://[203.0.113.10/32]:443"),
+            GrantScope::Session,
+            5_000,
+        )
+        .await;
+    recorder
+        .fail
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let before = controller.snapshot();
+    let result = controller
+        .revoke(
+            &Allowance::parse("tcp://[203.0.113.10/32]:443").unwrap(),
+            RevokeScope::All,
+        )
+        .await;
+    assert!(
+        matches!(
+            result,
+            RevokeResult::Unconfirmed {
+                reason: UnconfirmedReason::RuntimeFailed { .. },
+                ..
+            }
+        ),
+        "{result:?}"
+    );
+    assert_eq!(controller.snapshot(), before, "memory keeps its entries");
+}
+
+/// L5: `Applied` requires a confirmed revision *after* the refusal, and the port
+/// set is computed over both tables before either is searched.
+#[test]
+fn applied_coverage_requires_confirmed_revision_after_last_refusal() {
+    let project = project_id("l5");
+    let view = ProjectView::for_tests(&[], 0, None);
+    let mut entry = address_entry("tcp", "203.0.113.10", Some(443), "tcp-syn");
+    entry.last_revision = 1;
+
+    let snapshot = |revision: Option<u64>| SessionAllowancesSnapshot {
+        session: vec![WireAllowance {
+            destination: "tcp://[203.0.113.10/32]:443".to_owned(),
+            granted_ms: 5,
+            revision,
+            not_recorded_error: None,
+        }],
+        project: Vec::new(),
+    };
+
+    // A boot revision (`1`) did not apply to a refusal at revision 1.
+    assert!(
+        view.covers_in_session(&entry, Some(&snapshot(Some(1))))
+            .is_none()
+    );
+    // A confirmed later revision does.
+    assert!(matches!(
+        view.covers_in_session(&entry, Some(&snapshot(Some(2)))),
+        Some(Coverage::Applied { revision: 2, .. })
+    ));
+    // A refusal already at the confirmed revision is still only recorded.
+    entry.last_revision = 2;
+    assert!(
+        view.covers_in_session(&entry, Some(&snapshot(Some(2))))
+            .is_none()
+    );
+    // An unconfirmed entry never claims application.
+    entry.last_revision = 1;
+    assert!(
+        view.covers_in_session(&entry, Some(&snapshot(None)))
+            .is_none()
+    );
+
+    // m3: a confirmed hostname in the *session* table supplies the port set for a
+    // hostname rule in the project table, so the cross-revision union is seen.
+    let mut host = host_entry("api.example.com", 8443, "tls-sni", "sni");
+    host.last_revision = 1;
+    let cross = SessionAllowancesSnapshot {
+        project: vec![WireAllowance {
+            destination: "tcp://api.example.com:8443".to_owned(),
+            granted_ms: 3,
+            revision: Some(3),
+            not_recorded_error: None,
+        }],
+        session: vec![WireAllowance {
+            destination: "api.example.com".to_owned(),
+            granted_ms: 4,
+            revision: Some(2),
+            not_recorded_error: None,
+        }],
+    };
+    assert!(matches!(
+        view.covers_in_session(&host, Some(&cross)),
+        Some(Coverage::Applied {
+            scope: AllowanceScope::Project,
+            revision: 3,
+            ..
+        })
+    ));
+    let _ = project;
+}
+
+/// L6: a boot hostname skipped under a host proxy is not in the live tables, so
+/// it stays recorded and never blocks a live address grant.
+#[tokio::test]
+async fn proxy_skipped_boot_hostname_stays_recorded_and_does_not_block_live_address_grants() {
+    let project = live_project("l6");
+    let mut plan = crate::network::plan_for_tests(&[], true);
+    let view = ProjectView::for_tests(&["api.example.com", "tcp://[203.0.113.10/32]:443"], 7, None);
+    let (adopted, notice) = plan.adopt_recorded(view.file().unwrap(), view.allowances());
+    assert!(notice.is_some(), "the skipped hostname has one notice");
+    assert_eq!(adopted.len(), 1, "only the address was adopted");
+
+    let (controller, root) = live(&project, plan.live_policy_plan(view.file()));
+    controller.adopt_boot_allowances(&view, &adopted, plan.live_policy_plan(view.file()));
+    let snapshot = controller.snapshot();
+    assert!(
+        snapshot
+            .project
+            .iter()
+            .all(|item| item.destination != "api.example.com"),
+        "the proxy-skipped hostname is absent: {snapshot:?}"
+    );
+
+    // It stays `Recorded` for the row that names it…
+    let host = host_entry("api.example.com", 443, "tls-sni", "sni");
+    assert!(matches!(
+        view.covers_in_session(&host, Some(&snapshot)),
+        Some(Coverage::Recorded(_))
+    ));
+    // …and does not block a live address grant.
+    let recorder = Recorder::new();
+    controller.attach_updater(recorder.updater());
+    let result = controller
+        .grant(
+            &live_refusals(),
+            None,
+            Some("tcp://[198.51.100.0/24]:443"),
+            GrantScope::Session,
+            1_000,
+        )
+        .await;
+    assert!(matches!(result, GrantResult::Applied { .. }), "{result:?}");
+
+    // B-m4: a live *hostname* grant under a host proxy is refused below
+    // `derive_for`, and refuses without asking the runtime: the mapping from the
+    // precondition to the reply is what a regression would get wrong (turning it
+    // into a next-launch record would write a hostname the proxy cannot honour).
+    let before = recorder.calls();
+    let refused = controller
+        .grant(
+            &live_refusals(),
+            None,
+            Some("other.example"),
+            GrantScope::Project,
+            2_000,
+        )
+        .await;
+    match refused {
+        GrantResult::Refused { reason } => assert!(
+            matches!(
+                reason,
+                crate::allowances::apply::GrantRefusalReason::HostProxyInUse
+            ),
+            "{reason:?}"
+        ),
+        other => panic!("a hostname under a host proxy must be refused: {other:?}"),
+    }
+    assert_eq!(recorder.calls(), before, "no swap was attempted");
+    assert_eq!(
+        ProjectView::at_dir_for_tests(root.path(), &crate::image_pin::ProjectId::of(&project))
+            .allowances()
+            .len(),
+        0,
+        "a refused hostname writes no record"
+    );
+}
+
+/// A queued grant is promoted at `follow`, and a failed flush drops it with a
+/// notice that says whether a project record carries it forward.
+#[tokio::test]
+async fn queued_grants_are_promoted_or_dropped_with_a_notice() {
+    let project = live_project("p2");
+    let (controller, root) = live(&project, live_plan(&[], false));
+    let refusals = live_refusals();
+
+    let queued = controller
+        .grant(
+            &refusals,
+            None,
+            Some("tcp://[203.0.113.10/32]:443"),
+            GrantScope::Project,
+            1_000,
+        )
+        .await;
+    assert!(
+        matches!(
+            queued,
+            GrantResult::QueuedForBoot {
+                scope: GrantScope::Project,
+                ..
+            }
+        ),
+        "{queued:?}"
+    );
+    // The store write happened, because a queued project grant is a record.
+    let view = ProjectView::at_dir_for_tests(root.path(), &ProjectId::of(&project));
+    assert_eq!(view.allowances().len(), 1);
+
+    // Success: the queued entry takes the runtime's revision.
+    let recorder = Recorder::new();
+    assert!(controller.attach_updater(recorder.updater()));
+    assert!(controller.flush_queued().await.is_empty());
+    let snapshot = controller.snapshot();
+    assert_eq!(snapshot.project[0].revision, Some(2));
+
+    // Failure: the queued entry is dropped, and the notice names the record.
+    let (controller, _root) = self::live(&live_project("p2b"), live_plan(&[], false));
+    let refusals = live_refusals();
+    controller
+        .grant(
+            &refusals,
+            None,
+            Some("tcp://[198.51.100.0/24]:443"),
+            GrantScope::Project,
+            2_000,
+        )
+        .await;
+    controller
+        .grant(
+            &refusals,
+            None,
+            Some("tcp://[203.0.113.0/24]:443"),
+            GrantScope::Session,
+            3_000,
+        )
+        .await;
+    let failing = Recorder::new();
+    failing
+        .fail
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(controller.attach_updater(failing.updater()));
+    let warnings = controller.flush_queued().await;
+    assert_eq!(warnings.len(), 2, "{warnings:?}");
+    assert!(
+        warnings
+            .iter()
+            .any(|line| line.contains("still carries it"))
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|line| line.contains("no project record"))
+    );
+    assert!(controller.snapshot().project.is_empty());
+    assert!(controller.snapshot().session.is_empty());
+}
+
+/// A-M01: the whole `NotInSession` branch, for the three states that decide
+/// whether the tool may say a destination is gone.
+///
+/// The honesty claim lives here: `still_effective` must be a fact about the
+/// *policy*, so a destination this launch's own `--allow-egress` admits is still
+/// allowed even though no allowance names it (B01). A mutant that hard-codes
+/// either answer dies on one of these three cases.
+#[tokio::test]
+async fn revoke_names_only_what_the_policy_still_allows() {
+    // (a) Only the launch's own configured authority admits it.
+    let (controller, _root) = live(
+        &live_project("b01a"),
+        live_plan(&["tcp://[203.0.113.7/32]:443"], false),
+    );
+    let configured = Allowance::parse("tcp://[203.0.113.7/32]:443").unwrap();
+    match controller.revoke(&configured, RevokeScope::All).await {
+        RevokeResult::NotInSession {
+            scope,
+            revision,
+            still_effective,
+            ..
+        } => {
+            assert!(
+                still_effective,
+                "the launch's own --allow-egress still admits it"
+            );
+            assert_eq!(scope, RevokeScope::All);
+            assert_eq!(revision, None, "no swap happened, so there is no revision");
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // (b) Only the other scope names it.
+    let (controller, _root) = live(&live_project("b01b"), live_plan(&[], false));
+    let recorder = Recorder::new();
+    controller.attach_updater(recorder.updater());
+    let held = controller
+        .grant(
+            &live_refusals(),
+            None,
+            Some("tcp://[198.51.100.9/32]:443"),
+            GrantScope::Session,
+            1_000,
+        )
+        .await;
+    assert!(matches!(held, GrantResult::Applied { .. }), "{held:?}");
+    let destination = Allowance::parse("tcp://[198.51.100.9/32]:443").unwrap();
+    match controller.revoke(&destination, RevokeScope::Project).await {
+        RevokeResult::NotInSession {
+            scope,
+            revision,
+            still_effective,
+            ..
+        } => {
+            assert!(still_effective, "the session table still holds it");
+            assert_eq!(scope, RevokeScope::Project);
+            assert_eq!(revision, Some(2), "the session has a confirmed revision");
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // (c) Neither table nor the configured authority names it: nothing is in force.
+    let (controller, _root) = live(&live_project("b01c"), live_plan(&[], false));
+    let absent = Allowance::parse("tcp://[192.0.2.44/32]:443").unwrap();
+    match controller.revoke(&absent, RevokeScope::All).await {
+        RevokeResult::NotInSession {
+            revision,
+            still_effective,
+            ..
+        } => {
+            assert!(!still_effective, "nothing admits it");
+            assert_eq!(revision, None);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A-m01: a revoke that never asks the runtime must not report a revision.
+#[tokio::test]
+async fn revoke_of_a_queued_entry_reports_no_revision() {
+    let (controller, _root) = live(&live_project("m01"), live_plan(&[], false));
+    let queued = controller
+        .grant(
+            &live_refusals(),
+            None,
+            Some("tcp://[203.0.113.11/32]:443"),
+            GrantScope::Session,
+            1_000,
+        )
+        .await;
+    assert!(
+        matches!(queued, GrantResult::QueuedForBoot { .. }),
+        "{queued:?}"
+    );
+    let recorder = Recorder::new();
+    controller.attach_updater(recorder.updater());
+    // The entry is still queued: the flush has not run, so nothing is in force.
+    match controller
+        .revoke(
+            &Allowance::parse("tcp://[203.0.113.11/32]:443").unwrap(),
+            RevokeScope::All,
+        )
+        .await
+    {
+        RevokeResult::Revoked { revision, .. } => {
+            assert_eq!(revision, None, "no policy change was made");
+            assert_eq!(recorder.calls(), 0, "the runtime was never asked");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(controller.snapshot().session.is_empty());
+}
+
+/// B02: a `--project` grant that lands on an entry still queued for boot records
+/// the allowance before it claims one, and never claims a record it did not write.
+#[tokio::test]
+async fn project_grant_over_a_queued_session_entry_records_before_claiming_it() {
+    let project = live_project("b02");
+    let (controller, root) = live(&project, live_plan(&[], false));
+    let refusals = live_refusals();
+    let destination = "tcp://[203.0.113.12/32]:443";
+    let queued = controller
+        .grant(
+            &refusals,
+            None,
+            Some(destination),
+            GrantScope::Session,
+            1_000,
+        )
+        .await;
+    assert!(
+        matches!(
+            queued,
+            GrantResult::QueuedForBoot {
+                scope: GrantScope::Session,
+                ..
+            }
+        ),
+        "{queued:?}"
+    );
+
+    let recorded = controller
+        .grant(
+            &refusals,
+            None,
+            Some(destination),
+            GrantScope::Project,
+            2_000,
+        )
+        .await;
+    assert!(
+        matches!(
+            recorded,
+            GrantResult::QueuedForBoot {
+                scope: GrantScope::Project,
+                ..
+            }
+        ),
+        "the reply the CLI renders as `recorded project allowance`: {recorded:?}"
+    );
+    // The claim is true: the record exists, and the entry moved to the table the
+    // flush is about to promote.
+    let view = ProjectView::at_dir_for_tests(root.path(), &ProjectId::of(&project));
+    assert_eq!(view.allowances().len(), 1, "the record the reply promised");
+    let snapshot = controller.snapshot();
+    assert!(snapshot.session.is_empty(), "{snapshot:?}");
+    assert_eq!(snapshot.project.len(), 1, "{snapshot:?}");
+
+    // A store that cannot be written refuses instead, and moves nothing.
+    let (blocked, blocked_root) = live(&live_project("b02b"), live_plan(&[], false));
+    blocked
+        .grant(
+            &refusals,
+            None,
+            Some(destination),
+            GrantScope::Session,
+            1_000,
+        )
+        .await;
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(blocked_root.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+    match blocked
+        .grant(
+            &refusals,
+            None,
+            Some(destination),
+            GrantScope::Project,
+            2_000,
+        )
+        .await
+    {
+        GrantResult::Refused { reason } => assert!(
+            matches!(
+                reason,
+                crate::allowances::apply::GrantRefusalReason::Store { .. }
+            ),
+            "{reason:?}"
+        ),
+        other => panic!("a store it could not write was claimed: {other:?}"),
+    }
+    let snapshot = blocked.snapshot();
+    assert_eq!(snapshot.session.len(), 1, "the session entry is untouched");
+    assert!(
+        snapshot.project.is_empty(),
+        "nothing was claimed as a record"
+    );
+}
+
+/// B03: while the boot queue is pending, a grant is queued instead of swapped,
+/// so no policy carries an entry the flush has not confirmed — and a failed flush
+/// leaves memory matching the runtime, with the accepted policy restored.
+#[tokio::test]
+async fn a_grant_while_the_boot_queue_is_pending_makes_no_swap() {
+    let (controller, _root) = live(&live_project("b03"), live_plan(&[], false));
+    let refusals = live_refusals();
+    controller
+        .grant(
+            &refusals,
+            None,
+            Some("tcp://[203.0.113.13/32]:443"),
+            GrantScope::Session,
+            1_000,
+        )
+        .await;
+    let recorder = Recorder::new();
+    assert!(controller.attach_updater(recorder.updater()));
+    let second = controller
+        .grant(
+            &refusals,
+            None,
+            Some("tcp://[198.51.100.13/32]:443"),
+            GrantScope::Session,
+            2_000,
+        )
+        .await;
+    assert!(
+        matches!(second, GrantResult::QueuedForBoot { .. }),
+        "a swap here would carry the first, unconfirmed entry: {second:?}"
+    );
+    assert_eq!(
+        recorder.calls(),
+        0,
+        "nothing was sent while the queue is pending"
+    );
+
+    // The flush is the only writer of that policy, and its failure drops both
+    // queued entries: after it, memory names nothing the runtime did not receive.
+    recorder
+        .fail
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let warnings = controller.flush_queued().await;
+    assert_eq!(warnings.len(), 2, "{warnings:?}");
+    assert!(
+        controller.snapshot().session.is_empty(),
+        "{:?}",
+        controller.snapshot()
+    );
+    assert!(controller.snapshot().project.is_empty());
+
+    // The restored policy is usable: a later grant derives from it, not from a
+    // plan that still carried the dropped entries.
+    recorder
+        .fail
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let third = controller
+        .grant(
+            &refusals,
+            None,
+            Some("tcp://[192.0.2.13/32]:443"),
+            GrantScope::Session,
+            3_000,
+        )
+        .await;
+    assert!(matches!(third, GrantResult::Applied { .. }), "{third:?}");
+    let (policy, _revision) = recorder.last().unwrap();
+    assert_eq!(
+        format!("{policy:?}"),
+        format!("{:?}", fresh_policy(&[], &["tcp://[192.0.2.13/32]:443"]))
+    );
+}
+
+/// A-M02: a failed record on an already-session-granted destination keeps the
+/// demotion on the entry, so every later render still says no record carries it.
+#[tokio::test]
+async fn project_grant_over_a_session_entry_keeps_the_demotion_on_the_entry() {
+    let project = live_project("m02");
+    let (controller, root) = live(&project, live_plan(&[], false));
+    let refusals = live_refusals();
+    let destination = "tcp://[203.0.113.14/32]:443";
+    let recorder = Recorder::new();
+    controller.attach_updater(recorder.updater());
+    let first = controller
+        .grant(
+            &refusals,
+            None,
+            Some(destination),
+            GrantScope::Session,
+            1_000,
+        )
+        .await;
+    assert!(matches!(first, GrantResult::Applied { .. }), "{first:?}");
+
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+    let failed = controller
+        .grant(
+            &refusals,
+            None,
+            Some(destination),
+            GrantScope::Project,
+            2_000,
+        )
+        .await;
+    assert!(
+        matches!(failed, GrantResult::AppliedNotRecorded { .. }),
+        "{failed:?}"
+    );
+    let snapshot = controller.snapshot();
+    assert_eq!(snapshot.session.len(), 1, "{snapshot:?}");
+    assert!(
+        snapshot.session[0].not_recorded_error.is_some(),
+        "the demotion must survive the reply: {snapshot:?}"
+    );
+    assert!(snapshot.project.is_empty(), "{snapshot:?}");
+}
+
+/// B-S4: the adoption-window re-derivation plan §8.5 P2 Part A asks for.
+///
+/// A grant that arrives between `for_launch` and `adopt_boot_allowances` is queued
+/// on the pre-adoption plan; adoption must re-derive it over the post-adoption one
+/// (`configured ∪ adopted ∪ queued`), promote an adopted record to `rev 1`, and
+/// hand the runtime a policy containing all three.
+#[tokio::test]
+async fn adopt_boot_allowances_rederives_a_queued_grant_over_the_post_adoption_plan() {
+    let project = live_project("s4");
+    let mut launch = crate::network::plan_for_tests(&["api.example.com"], false);
+    let view = ProjectView::for_tests(&["adopted.example"], 1_000, None);
+    let file = Path::new("/home/a/.config/agent-vm/allowances.json");
+    let (adopted, notice) = launch.adopt_recorded(file, view.allowances());
+    assert!(notice.is_none(), "{notice:?}");
+    assert_eq!(adopted.len(), 1);
+
+    let (controller, _root) = live(&project, launch.live_policy_plan(Some(file)));
+    let refusals = live_refusals();
+    // Queued before adoption, on the configured-only plan.
+    let queued = controller
+        .grant(
+            &refusals,
+            None,
+            Some("tcp://[203.0.113.15/32]:443"),
+            GrantScope::Session,
+            2_000,
+        )
+        .await;
+    assert!(
+        matches!(queued, GrantResult::QueuedForBoot { .. }),
+        "{queued:?}"
+    );
+
+    let warnings =
+        controller.adopt_boot_allowances(&view, &adopted, launch.live_policy_plan(Some(file)));
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let snapshot = controller.snapshot();
+    assert_eq!(
+        snapshot.project.len(),
+        1,
+        "the adopted record: {snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.project[0].revision,
+        Some(1),
+        "boot adoption is rev 1"
+    );
+    assert_eq!(
+        snapshot.session.len(),
+        1,
+        "the queued grant survives: {snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.session[0].revision, None,
+        "still queued: {snapshot:?}"
+    );
+
+    let recorder = Recorder::new();
+    controller.attach_updater(recorder.updater());
+    assert!(controller.flush_queued().await.is_empty());
+    let snapshot = controller.snapshot();
+    assert_eq!(snapshot.session[0].revision, Some(2), "{snapshot:?}");
+    assert_eq!(snapshot.project[0].revision, Some(1), "{snapshot:?}");
+    // The policy the runtime received carries configured ∪ adopted ∪ queued.
+    let (policy, _) = recorder.last().unwrap();
+    assert_eq!(
+        format!("{policy:?}"),
+        format!(
+            "{:?}",
+            fresh_policy(
+                &["api.example.com"],
+                &["adopted.example", "tcp://[203.0.113.15/32]:443"]
+            )
+        )
+    );
+}
+
+/// A-m08: the live tables are bounded, and a grant past the bound is refused with
+/// a reason rather than dropped.
+#[tokio::test]
+async fn live_tables_are_bounded_and_refused_with_a_reason() {
+    let (controller, _root) = live(&live_project("m08"), live_plan(&[], false));
+    let refusals = live_refusals();
+    let recorder = Recorder::new();
+    controller.attach_updater(recorder.updater());
+    for index in 0..256u32 {
+        let destination = format!("tcp://[10.{}.{}.1/32]:443", index / 256, index % 256);
+        let result = controller
+            .grant(
+                &refusals,
+                None,
+                Some(&destination),
+                GrantScope::Session,
+                1_000,
+            )
+            .await;
+        assert!(
+            matches!(result, GrantResult::Applied { .. }),
+            "{index}: {result:?}"
+        );
+    }
+    let refused = controller
+        .grant(
+            &refusals,
+            None,
+            Some("tcp://[192.0.2.99/32]:443"),
+            GrantScope::Session,
+            1_000,
+        )
+        .await;
+    match refused {
+        GrantResult::Refused { reason } => assert!(
+            matches!(
+                reason,
+                crate::allowances::apply::GrantRefusalReason::Full { limit: 256 }
+            ),
+            "{reason:?}"
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(recorder.calls(), 256, "the refused grant swapped nothing");
+}
