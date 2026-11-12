@@ -499,6 +499,15 @@ control timeout; the first run pays that build once. `results.json` records each
 control's wall time, and the run prints its total. Concurrent runs are refused
 rather than interleaved.
 
+CI runs only `--check-anchors`, which resolves find text: it proves each
+pre-mutation anchor is present the expected number of times and **never** that a
+replacement compiles. A row whose injection names an API that has since been
+renamed therefore passes CI and controls nothing, reporting "the mutant was
+never compiled" only when someone runs it (#581). Compiling every replacement
+is prohibitive — one `cargo test` per row — so the guard is operational: after
+renaming or moving an API an injection calls, run that row with
+`--only <row> --evidence <fresh dir>` and require a `PASS` line.
+
 On a dedicated native macOS Apple Silicon host, build the debug bundle and
 supply authenticated, verified native v0.1.3 release assets:
 
