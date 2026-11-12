@@ -1527,15 +1527,38 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("timed out"));
         assert!(start.elapsed() >= WRITE_WAIT);
-        assert!(start.elapsed() < WRITE_WAIT + Duration::from_secs(3));
+        // One budget, not two: a run that also spent the pin's share before the
+        // default wait could not finish under twice `WRITE_WAIT`. The margin is
+        // for a stalled runner, not for the property: scheduler delay lands
+        // between the syscalls, never on the deadline that bounds them.
+        assert!(start.elapsed() < WRITE_WAIT + Duration::from_secs(10));
         assert_eq!(std::fs::read(store.record()).unwrap(), before);
         assert!(!store.directory.join(SELECTION_FILE).exists());
         // Failure releases the already-acquired pin EX, not merely default EX.
+        //
+        // Poll to a bound rather than sample once: a descriptor closed on the
+        // failing path can still read as held for a few scheduler ticks after
+        // the call returned, which is why the sibling assertion in
+        // `image_acquire::barrier::tests::a_cancelled_waiter_releases_its_descriptor`
+        // polls the same way. A single sample made this test fail on CI with the
+        // budget met and the record untouched, reporting the pin as contended
+        // (#585). The bound keeps the property: a pin the failed write dropped
+        // only late, or never, still fails here, far inside the 30 s the
+        // transaction could have held it.
         let probe = open_lock(&store.lock_path(), false).unwrap().unwrap();
-        assert_eq!(
-            host_paths::try_flock(&probe, FlockMode::Exclusive).unwrap(),
-            host_paths::FlockAttempt::Acquired
-        );
+        let released = Instant::now() + Duration::from_secs(5);
+        loop {
+            if host_paths::try_flock(&probe, FlockMode::Exclusive).unwrap()
+                == host_paths::FlockAttempt::Acquired
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < released,
+                "the failed write kept the pin EX instead of releasing it"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
     #[test]
     fn pin_only_work_does_not_observe_an_unused_damaged_default() {
