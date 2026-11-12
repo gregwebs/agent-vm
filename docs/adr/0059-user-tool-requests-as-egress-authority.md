@@ -112,9 +112,9 @@ once `validate_tools` has run. Both paths then call the same
 `egress_reference::resolve` — nothing else turns a reference into allowances.
 
 **The namespace is one construction site plus a runtime filter.**
-`UserToolRequests` is built only in `read_file_tier`'s user arm, from that tier's
+`EgressNamespace` is built only in `read_file_tier`'s user arm, from that tier's
 own validated tools, before the cross-tier merge and before the defaults catalog.
-`UserToolRequests::new` then keeps a tool iff its origin is
+`EgressNamespace::new` then keeps a tool iff its origin is
 `ToolOrigin::User(f)` for the file the trust verdict measured — a *runtime*
 check, because two reads of one path carry equal `PathBuf`s and no type can tell
 them apart. Project tools, the built-in catalog and the `shell` fallback are
@@ -192,7 +192,7 @@ no definition is read unverified: names (sorted, reserved, grammar), schema, eve
 entry through the one `AllowanceEntry::parse`, set→set binding and the cycle walk
 all happen after the `[network]` *parse* block and before `validate_tools`;
 `tool:` resolution inside a set and the budgeted closure merge happen inside
-`UserToolRequests::new`, after `validate_tools`. The rule is: references **from
+`EgressNamespace::new`, after `validate_tools`. The rule is: references **from
 outside** the table resolve at use; references **within** it are bound at parse,
 because the cycle walk needs edges.
 

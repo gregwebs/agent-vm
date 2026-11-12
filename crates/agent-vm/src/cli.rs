@@ -285,7 +285,7 @@ pub(crate) enum Dispatch {
         /// The user file's own tools as an egress-reference namespace, captured
         /// the same way (ADR-0059). `None` when there is no user file, which is
         /// why a CLI `tool:NAME` then reports "no user config file was found".
-        user_tools: Option<crate::egress_reference::UserToolRequests>,
+        user_tools: Option<crate::egress_reference::EgressNamespace>,
         /// Verified user `mounts`, captured the same way (ADR-0046). `None` when
         /// the file declared none, so a launch can tell "no declarations" from
         /// "an empty list" — but both select nothing.
@@ -307,7 +307,7 @@ pub(crate) enum Dispatch {
 pub(crate) struct CapturedConfig {
     images: ConfiguredImages,
     user_network: Option<crate::user_network::UserNetwork>,
-    user_tools: Option<crate::egress_reference::UserToolRequests>,
+    user_tools: Option<crate::egress_reference::EgressNamespace>,
     user_mounts: Option<crate::config_mounts::UserMounts>,
 }
 

@@ -287,9 +287,9 @@ kept.
 |---|---|
 | A *successful* verdict exists only if `authority_refusal` passed on some read | **Types**: private fields; only `verify` mints one |
 | The verdict's file is the path of the read it measured | **Types**: set from `read.path()` inside `verify` |
-| A namespace holds only tools whose origin file equals the verdict's file | **Runtime filter** in `egress_reference::UserToolRequests::new` |
-| The tools came from the **same read** (bytes) as the verdict (facts) | **Single construction site only**: `read_file_tier`'s user arm builds both from one `VerifiedRead` and drops it. Two reads of one path carry equal `PathBuf`s, so types cannot tell them apart. This rests on review and on the `UserToolRequests::new` doc comment. |
-| Resolution never re-measures or re-reads | **Structure plus tests.** `UserToolRequests` is owned data and `egress_reference::resolve` does no I/O; the load-then-change tests fail if anyone re-measures or re-reads. Three facts are changed after the load, one per test: the reference's own path (symlink replaced by a regular `0600` file), the file's bytes (requests rewritten), and the directory's mode **in both directions** (private→world-writable must keep resolving; world-writable→private must keep refusing). A re-measure of only the directory is what the last one exists to catch. |
+| A namespace holds only tools whose origin file equals the verdict's file | **Runtime filter** in `egress_reference::EgressNamespace::new` |
+| The tools came from the **same read** (bytes) as the verdict (facts) | **Single construction site only**: `read_file_tier`'s user arm builds both from one `VerifiedRead` and drops it. Two reads of one path carry equal `PathBuf`s, so types cannot tell them apart. This rests on review and on the `EgressNamespace::new` doc comment. |
+| Resolution never re-measures or re-reads | **Structure plus tests.** `EgressNamespace` is owned data and `egress_reference::resolve` does no I/O; the load-then-change tests fail if anyone re-measures or re-reads. Three facts are changed after the load, one per test: the reference's own path (symlink replaced by a regular `0600` file), the file's bytes (requests rewritten), and the directory's mode **in both directions** (private→world-writable must keep resolving; world-writable→private must keep refusing). A re-measure of only the directory is what the last one exists to catch. |
 
 **Persisted references cannot bypass trust.** They exist only inside `[network]`,
 which triggers verification: a file that fails is refused at load, and a file that

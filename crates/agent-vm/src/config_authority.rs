@@ -399,7 +399,7 @@ fn write_refusal(
 ///
 /// The file is stored with the verdict and never supplied separately, so a
 /// verdict for one file cannot be paired with another file's tools:
-/// [`crate::egress_reference::UserToolRequests::new`] keeps only tools whose
+/// [`crate::egress_reference::EgressNamespace::new`] keeps only tools whose
 /// origin file equals [`Self::file`].
 ///
 /// Private fields: only [`verify`] mints one that vouches for anything.

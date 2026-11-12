@@ -108,7 +108,7 @@
 
 use crate::config_authority::{self, AuthorityTriggers};
 use crate::config_mounts::{self, ResolvedMountList, UserMounts};
-use crate::egress_reference::{self, UserToolRequests};
+use crate::egress_reference::{self, EgressNamespace};
 use crate::user_network::{self, UserNetwork};
 
 use crate::network_requests::{NetworkRequests, RequestTier};
@@ -225,7 +225,7 @@ pub(crate) struct ConfigReport {
     user_network: Option<UserNetwork>,
     user_mounts: Option<UserMounts>,
     /// The user file's own tools as an egress-reference namespace (ADR-0059).
-    user_tools: Option<UserToolRequests>,
+    user_tools: Option<EgressNamespace>,
     uses_defaults: bool,
     conflicts: Vec<ConfigConflict>,
 }
@@ -267,7 +267,7 @@ impl ConfigReport {
     /// `None` when there is no user file at all, which is why a reference then
     /// reports "no user config file was found" rather than an unknown name. Read
     /// before `into_launch_catalog` consumes the report, like [`Self::images`].
-    pub(crate) fn user_tool_requests(&self) -> Option<&UserToolRequests> {
+    pub(crate) fn user_tool_requests(&self) -> Option<&EgressNamespace> {
         self.user_tools.as_ref()
     }
 
@@ -1112,7 +1112,7 @@ struct TierContents {
     image: Option<ConfiguredImage>,
     /// The user tier's egress-reference namespace, built from these tools. `None`
     /// for the project tier and for an absent user file.
-    reference_tools: Option<UserToolRequests>,
+    reference_tools: Option<EgressNamespace>,
 }
 
 impl TierContents {
@@ -1327,7 +1327,7 @@ fn read_file_tier(source: TierSource<'_>) -> Result<(TierReport, TierContents)> 
     // (ADR-0059). The project tier gets `None`, so it can never be one.
     let reference_tools = match reference_trust {
         Some(trust) => {
-            let namespace = UserToolRequests::new(trust, &tools, parsed_sets).map_err(|error| {
+            let namespace = EgressNamespace::new(trust, &tools, parsed_sets).map_err(|error| {
                 anyhow!("config: {}: {error}", crate::one_line::quoted_path(path))
             })?;
             Some(namespace)
@@ -9050,7 +9050,7 @@ mod tests {
     #[test]
     fn user_tool_requests_filter_by_origin_and_file() {
         use crate::config_authority::ReferenceTrust;
-        use crate::egress_reference::{AllowanceEntry, EntryError, UserToolRequests, resolve};
+        use crate::egress_reference::{AllowanceEntry, EgressNamespace, EntryError, resolve};
         let file = Path::new("/home/u/.config/agent-vm/config.toml");
         let other = Path::new("/home/u/other.toml");
         // Hand-built `RawTool` values straight into `validate_tools`, which is
@@ -9094,8 +9094,7 @@ mod tests {
             ("another file", &wrong_file),
         ] {
             let namespace =
-                UserToolRequests::new(ReferenceTrust::verified_for_test(file), tools, None)
-                    .unwrap();
+                EgressNamespace::new(ReferenceTrust::verified_for_test(file), tools, None).unwrap();
             let failure = resolve(vec![entry.clone()], Some(&namespace)).unwrap_err();
             assert_eq!(failure.index, 0, "{label} tools");
             assert_eq!(failure.error, EntryError::UnknownTool, "{label} tools");
@@ -9103,7 +9102,7 @@ mod tests {
         // The accepted origin, resolved the same way, and expanded to its own
         // requests: `is_ok` would not show the namespace kept the right tool.
         let namespace =
-            UserToolRequests::new(ReferenceTrust::verified_for_test(file), &right_file, None)
+            EgressNamespace::new(ReferenceTrust::verified_for_test(file), &right_file, None)
                 .unwrap();
         let resolved = resolve(vec![entry], Some(&namespace)).unwrap();
         assert_eq!(

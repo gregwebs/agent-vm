@@ -224,7 +224,7 @@ impl Plan {
     pub(crate) fn from_args(
         args: Args,
         user: Option<&crate::user_network::UserNetwork>,
-        user_tools: Option<&crate::egress_reference::UserToolRequests>,
+        user_tools: Option<&crate::egress_reference::EgressNamespace>,
     ) -> Result<Self> {
         Self::from_args_with_proxy_lookup(args, user, user_tools, |variable| {
             std::env::var(variable).ok()
@@ -234,7 +234,7 @@ impl Plan {
     fn from_args_with_proxy_lookup(
         args: Args,
         user: Option<&crate::user_network::UserNetwork>,
-        user_tools: Option<&crate::egress_reference::UserToolRequests>,
+        user_tools: Option<&crate::egress_reference::EgressNamespace>,
         lookup: impl Fn(&str) -> Option<String>,
     ) -> Result<Self> {
         let publish_ports = parse_publish_args(&args.publish).context("parsing --publish")?;

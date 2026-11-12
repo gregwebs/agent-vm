@@ -822,7 +822,7 @@ pub(crate) async fn launch(
     target: LaunchTarget,
     images: &ConfiguredImages,
     user_network: Option<&crate::user_network::UserNetwork>,
-    user_tools: Option<&crate::egress_reference::UserToolRequests>,
+    user_tools: Option<&crate::egress_reference::EgressNamespace>,
     user_mounts: Option<&crate::config_mounts::UserMounts>,
     credential_preflight: CredentialPreflight,
     args: Args,

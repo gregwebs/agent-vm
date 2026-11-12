@@ -18,10 +18,10 @@
 //! **Scope is one table: the user file's own `[[tools]]`.** Not the project
 //! tier, even when the project's same-named definition is the verb being
 //! launched; not the shipped built-in catalog; not the appended `shell`
-//! fallback (ADR-0059). [`UserToolRequests`] is the whole namespace, built once
-//! in `config::read_file_tier`'s user arm from that tier's validated tools,
-//! *before* the cross-tier merge, and it keeps only tools whose origin file is
-//! the file the trust verdict measured.
+//! fallback (ADR-0059). [`EgressNamespace`] is the whole namespace — that file's
+//! validated tools and its compiled `[egress_sets]` — built once in
+//! `config::read_file_tier`'s user arm, *before* the cross-tier merge, and it
+//! keeps only tools whose origin file is the file the trust verdict measured.
 //!
 //! #511 adds `set:NAME`, a reference to a list the same file declares in its own
 //! `[egress_sets]` table. It is the same kind of thing — a name for allowances
@@ -181,7 +181,7 @@ impl fmt::Display for EgressReference {
 /// One `allow_egress` entry, already classified.
 ///
 /// `Literal` is what the entry always was; `Reference` is resolved later
-/// against [`UserToolRequests`]. Nothing else converts text into an allowance.
+/// against [`EgressNamespace`]. Nothing else converts text into an allowance.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AllowanceEntry {
     Literal(Allowance),
@@ -304,7 +304,8 @@ pub(crate) fn parse_sets(
 
 pub(crate) use sets::{EgressSetError, ParsedEgressSets};
 
-/// The only namespace an egress reference resolves against (ADR-0059).
+/// The only namespace an egress reference resolves against (ADR-0059): one user
+/// file's validated tools and the `[egress_sets]` it compiles.
 ///
 /// Built once, in `config::read_file_tier`'s user arm, from that tier's own
 /// validated tools and its own `[egress_sets]` — before the cross-tier merge,
@@ -315,7 +316,7 @@ pub(crate) use sets::{EgressSetError, ParsedEgressSets};
 /// Owned data: [`resolve`] performs no I/O, so resolution can neither re-read the
 /// file nor re-measure its directory (A31, A32).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct UserToolRequests {
+pub(crate) struct EgressNamespace {
     trust: ReferenceTrust,
     requests: BTreeMap<String, NetworkRequests>,
     /// Every declared set's closure, compiled here and nowhere else.
@@ -326,7 +327,7 @@ pub(crate) struct UserToolRequests {
     sets: Box<sets::EgressSets>,
 }
 
-impl UserToolRequests {
+impl EgressNamespace {
     /// Keep this tier's tools whose origin is the file `trust` measured, and
     /// compile that same file's egress sets against them.
     ///
@@ -376,7 +377,7 @@ impl UserToolRequests {
 /// one entry attributed to all of them.
 pub(crate) fn resolve(
     entries: Vec<AllowanceEntry>,
-    user_tools: Option<&UserToolRequests>,
+    user_tools: Option<&EgressNamespace>,
 ) -> Result<ResolvedAllowances, EntryFailure> {
     let mut resolved = ResolvedAllowances::default();
     for (index, entry) in entries.into_iter().enumerate() {

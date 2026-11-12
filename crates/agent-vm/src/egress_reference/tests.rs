@@ -29,10 +29,7 @@ pub(crate) mod test_support {
     ///
     /// No sets: a `set:` reference against one of these namespaces is `UnknownSet`
     /// by construction, which is what the tool-side tests want.
-    pub(crate) fn user_tools(
-        file: &std::path::Path,
-        tools: &[(&str, &[&str])],
-    ) -> UserToolRequests {
+    pub(crate) fn user_tools(file: &std::path::Path, tools: &[(&str, &[&str])]) -> EgressNamespace {
         user_namespace(file, tools, None)
     }
 
@@ -43,7 +40,7 @@ pub(crate) mod test_support {
         file: &std::path::Path,
         tools: &[(&str, &[&str])],
         egress_sets: Option<&str>,
-    ) -> UserToolRequests {
+    ) -> EgressNamespace {
         let mut requests = BTreeMap::new();
         for (name, raw) in tools {
             let raw: Vec<String> = raw.iter().map(|request| (*request).to_owned()).collect();
@@ -51,7 +48,7 @@ pub(crate) mod test_support {
         }
         let table: toml::Table = egress_sets.unwrap_or_default().parse().expect("test TOML");
         let parsed = sets::parse(&toml::Value::Table(table)).expect("test [egress_sets] is valid");
-        UserToolRequests {
+        EgressNamespace {
             trust: ReferenceTrust::verified_for_test(file),
             sets: Box::new(
                 sets::compile(parsed, |name| tool_expansion(&requests, name))
@@ -76,7 +73,7 @@ pub(crate) mod test_support {
 
     pub(crate) fn resolve_ok(
         texts: &[&str],
-        user_tools: Option<&UserToolRequests>,
+        user_tools: Option<&EgressNamespace>,
     ) -> ResolvedAllowances {
         let entries = texts
             .iter()
@@ -1121,7 +1118,7 @@ fn an_untrusted_verdict_precedes_lookup() {
             subject: crate::config_authority::AuthoritySubject::EgressReference,
         },
     );
-    let namespace = UserToolRequests::new(trust, &[], None).unwrap();
+    let namespace = EgressNamespace::new(trust, &[], None).unwrap();
     let failure = resolve(
         vec![AllowanceEntry::parse(&format!("tool:{SENTINEL}")).unwrap()],
         Some(&namespace),
@@ -1161,7 +1158,7 @@ fn a_set_reference_is_refused_for_an_untrusted_file() {
         .expect("test TOML");
     let parsed = super::sets::parse(&toml::Value::Table(declarations))
         .expect("a literal-only set compiles without the file's tools");
-    let namespace = UserToolRequests::new(trust, &[], Some(parsed)).expect("literal-only set");
+    let namespace = EgressNamespace::new(trust, &[], Some(parsed)).expect("literal-only set");
 
     let failure = resolve(
         vec![AllowanceEntry::parse(&format!("set:{SENTINEL}")).unwrap()],
