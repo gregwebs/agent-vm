@@ -1699,10 +1699,12 @@ break sandbox boot at the runtime handshake with `handshake read id_offset:`.
 Where a provider requires a JWT *shape*, the placeholder is a minimal
 `alg:none` synthetic JWT rather than anything realistic.
 
-Substitution is bound to an **exact host** per credential, so a placeholder
-that reaches any other host is never swapped — and, because microsandbox
-treats a placeholder heading somewhere unexpected as a violation, is blocked
-and logged rather than leaked.
+Substitution is bound to an **exact host** per credential and to headers only,
+so a placeholder that reaches any other host is never swapped. Used *as a
+credential* there — in a header, query string or URL path — microsandbox treats
+it as a violation, blocked and logged rather than leaked; quoted in a request
+body it is forwarded unchanged, since it carries no token
+([#562](https://github.com/gregwebs/agent-vm/issues/562)).
 
 ### Token files live outside the guest bind mount
 
