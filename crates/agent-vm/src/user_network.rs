@@ -14,7 +14,7 @@ use crate::{
     config_authority::AuthorizedConfig,
     egress_policy::UserEgress,
     egress_reference::{
-        AllowanceEntry, EntryError, EntryFailure, ResolvedAllowances, UserToolRequests,
+        AllowanceEntry, EgressNamespace, EntryError, EntryFailure, ResolvedAllowances,
     },
 };
 use std::{
@@ -78,7 +78,7 @@ impl UserNetwork {
         file: impl Into<PathBuf>,
         groups: SavedGroups,
         allowances: &[&str],
-        user_tools: &UserToolRequests,
+        user_tools: &EgressNamespace,
     ) -> Self {
         Self::resolved(file, groups, allowances, Some(user_tools))
     }
@@ -87,7 +87,7 @@ impl UserNetwork {
         file: impl Into<PathBuf>,
         groups: SavedGroups,
         allowances: &[&str],
-        user_tools: Option<&UserToolRequests>,
+        user_tools: Option<&EgressNamespace>,
     ) -> Self {
         let entries = allowances
             .iter()
@@ -192,7 +192,7 @@ pub(crate) struct ParsedUserNetwork {
 impl ParsedUserNetwork {
     pub(crate) fn resolve(
         self,
-        user_tools: &UserToolRequests,
+        user_tools: &EgressNamespace,
     ) -> Result<UserNetwork, UserNetworkError> {
         Ok(UserNetwork {
             file: self.file,
@@ -323,8 +323,8 @@ mod tests {
 
     /// The literal-only namespace every accepting test resolves against: a
     /// literal entry needs no tools, and no test here uses a reference.
-    fn no_tools() -> UserToolRequests {
-        UserToolRequests::new(
+    fn no_tools() -> EgressNamespace {
+        EgressNamespace::new(
             crate::config_authority::ReferenceTrust::verified_for_test(Path::new("user.toml")),
             &[],
             None,
@@ -449,7 +449,7 @@ allow_egress = ["10.0.0.5", "10.0.0.5/32", "API.example.com.", "api.example.com"
     #[test]
     fn set_reference_failures_keep_the_entry_prefix_and_echo_nothing() {
         const SENTINEL: &str = "SENTINEL7";
-        let tools = UserToolRequests::new(
+        let tools = EgressNamespace::new(
             crate::config_authority::ReferenceTrust::verified_for_test(Path::new("user.toml")),
             &[],
             None,
@@ -484,7 +484,7 @@ allow_egress = ["10.0.0.5", "10.0.0.5/32", "API.example.com.", "api.example.com"
     #[test]
     fn reference_failures_keep_the_entry_prefix_and_echo_nothing() {
         const SENTINEL: &str = "sk-live-SENTINEL";
-        let tools = UserToolRequests::new(
+        let tools = EgressNamespace::new(
             crate::config_authority::ReferenceTrust::verified_for_test(Path::new("user.toml")),
             &[],
             None,

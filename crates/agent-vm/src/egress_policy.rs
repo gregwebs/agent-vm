@@ -93,7 +93,7 @@ use crate::egress_hostname::{
     CanonicalHostname, HostnameAllowance, InterceptedPorts, domain_rules,
 };
 use crate::egress_reference::{
-    AllowanceEntry, EgressReference, EntryOrigin, ResolvedAllowances, UserToolRequests, render_list,
+    AllowanceEntry, EgressNamespace, EgressReference, EntryOrigin, ResolvedAllowances, render_list,
 };
 /// Borrowed verified user authority; resolution assembles it without filesystem reads.
 pub(crate) struct UserEgress<'a> {
@@ -380,7 +380,7 @@ impl EgressAuthority {
     pub(crate) fn resolve(
         cli: CliEgress<'_>,
         user: Option<UserEgress<'_>>,
-        user_tools: Option<&UserToolRequests>,
+        user_tools: Option<&EgressNamespace>,
     ) -> anyhow::Result<Self> {
         let internet = resolve_grant(
             CliGrant(cli.internet),
@@ -2274,7 +2274,7 @@ mod tests {
 
     const REFERENCE_USER_FILE: &str = "/home/a/.config/agent-vm/config.toml";
 
-    fn reference_tools(tools: &[(&str, &[&str])]) -> crate::egress_reference::UserToolRequests {
+    fn reference_tools(tools: &[(&str, &[&str])]) -> crate::egress_reference::EgressNamespace {
         crate::egress_reference::test_support::user_tools(
             std::path::Path::new(REFERENCE_USER_FILE),
             tools,
@@ -2285,7 +2285,7 @@ mod tests {
         groups: crate::user_network::SavedGroups,
         entries: &[&str],
         cli: CliEgress<'_>,
-        tools: &crate::egress_reference::UserToolRequests,
+        tools: &crate::egress_reference::EgressNamespace,
     ) -> EgressAuthority {
         let user = crate::user_network::UserNetwork::for_test_with_tools(
             REFERENCE_USER_FILE,
@@ -2296,10 +2296,7 @@ mod tests {
         EgressAuthority::resolve(cli, Some(user.egress()), Some(tools)).unwrap()
     }
 
-    fn cli_refusal_lines(
-        cli: &[&str],
-        tools: &crate::egress_reference::UserToolRequests,
-    ) -> String {
+    fn cli_refusal_lines(cli: &[&str], tools: &crate::egress_reference::EgressNamespace) -> String {
         let allowances: Vec<String> = cli.iter().map(|text| (*text).to_owned()).collect();
         let authority = EgressAuthority::resolve(
             CliEgress {
