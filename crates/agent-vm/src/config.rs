@@ -7353,14 +7353,25 @@ mod tests {
 
     // -- names, commands, providers ---------------------------------------
 
+    /// The *mechanism*: the validator rejects a name taken from the reserved
+    /// set. Because it iterates `RESERVED_TOOL_NAMES` itself it cannot see a
+    /// name *removed* from that list. The list's *contents* are owned by set
+    /// equality with `cli::BUILTIN_SUBCOMMANDS` in
+    /// `cli::tests::every_builtin_subcommand_is_reserved_from_tool_names`.
+    /// Both halves are needed: keep them separate rather than folding one into
+    /// the other.
     #[test]
-    fn every_reserved_name_is_rejected_but_launch_verbs_are_allowed() {
+    fn the_validator_rejects_a_name_from_the_reserved_set() {
         for reserved in RESERVED_TOOL_NAMES {
             let fixture = Fixture::new();
             fixture.user(&one_tool(reserved));
             let error = fixture.load().unwrap_err();
             assert!(format!("{error:#}").contains("reserved"), "{reserved}");
         }
+    }
+
+    #[test]
+    fn launch_verbs_are_allowed_as_tool_names() {
         for allowed in ["claude", "shell", "copilot", "custom", "build"] {
             let fixture = Fixture::new();
             fixture.user(&one_tool(allowed));

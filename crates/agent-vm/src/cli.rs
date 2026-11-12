@@ -1805,6 +1805,11 @@ mod tests {
         // Set equality, not just built-in ⊆ reserved: a reserved name with no
         // built-in would silently forbid a tool name for no reason, which is
         // the other half of the drift this test exists to catch.
+        //
+        // This test owns the *contents* of the reserved set. That the validator
+        // rejects a reserved name is a separate mechanism test,
+        // `config::tests::the_validator_rejects_a_name_from_the_reserved_set`:
+        // it iterates the set, so it cannot see a name removed from it.
         let builtins: std::collections::BTreeSet<&str> =
             BUILTIN_SUBCOMMANDS.iter().copied().collect();
         let reserved: std::collections::BTreeSet<&str> =
