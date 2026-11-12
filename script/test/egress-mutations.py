@@ -1090,6 +1090,23 @@ def matrix():
                 // M7: only a revision after the refusal confirms it.
                 let confirmed_after_refusal = revision >= entry.last_revision;""",
         rust("allowances::tests::applied_coverage_requires_confirmed_revision_after_last_refusal"))
+    # The ports a live derivation hands on are the ones the *launch* fixed, never
+    # a recomputation from the set now in force (#569). Recomputing makes the
+    # last-hostname revoke forget port 443, so the next hostname grant is refused
+    # as needing a relaunch the netstack already paid for.
+    add("live-revoke-recomputes-launch-ports", NETWORK,
+        """        let derived_policy = candidate.policy();
+        Ok((
+            Self {
+                egress: candidate,
+                launch_intercepted_ports: self.launch_intercepted_ports.clone(),""",
+        """        let derived_policy = candidate.policy();
+        let recomputed = candidate.intercepted_ports();
+        Ok((
+            Self {
+                egress: candidate,
+                launch_intercepted_ports: recomputed,""",
+        rust("allowances::tests::live_revoke_of_last_hostname_stops_connections_within_launch_ports_and_keeps_state_on_failure"))
     # The four honesty defects the reviews found by hand, now each guarded by the
     # test that was written for it: a surviving mutant is how they shipped.
     add("revoke-still-effective-configured", apply_rs,
