@@ -1120,9 +1120,10 @@ do it where it can.
 
 CI runs on `pull_request` for every branch under review, on `push` to `main`,
 and on `push` to a branch named `ci/<something>` — the prefix is how you ask for
-a full run before a PR exists. `gh workflow run CI --ref <branch>` does the same
-and works on any name; use it for a one-off, the prefix when you expect to push
-repeatedly.
+a full run before a PR exists. `gh workflow run CI --ref <branch>`, through the
+GitHub App dispatcher ([issue tracker](docs/agents/issue-tracker.md)), does the
+same and works on any name; use it for a one-off, the prefix when you expect to
+push repeatedly.
 
 ```bash
 git switch -c ci/try-new-lint
@@ -1143,9 +1144,9 @@ is `main`-only because nothing in CI consumes `target/release/agent-vm`;
 
 Keep the prefix for pre-PR branches. Opening a PR *from* a `ci/` branch brings
 back exactly the duplicate the prefix exists to avoid — one run for the `push`,
-one for the `pull_request`, same commit. Rename to the PR branch name with
-`gh pr` after opening, or open the PR from a branch without the prefix and use
-`ci/` only for throwaway verification.
+one for the `pull_request`, same commit. Rename to the PR branch name through the
+dispatcher's `gh pr` commands after opening, or open the PR from a branch without
+the prefix and use `ci/` only for throwaway verification.
 
 ## Commit message style
 
