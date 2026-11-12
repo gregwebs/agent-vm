@@ -13,6 +13,9 @@ the end-user reference.
 - [docs/adr/](docs/adr/) — architecture decision records for the
   important technical trade-offs.
 - We use the /verus skill for writing proofs
+- Search tracked content with `git grep -n <pattern>`; a bare `grep -r` from the
+  repository root walks hundreds of GB of `target/` build artifacts, so exclude
+  them: `grep -rn --exclude-dir={target,vendor,.git,node_modules} <pattern>`.
 
 ## Build from source
 
