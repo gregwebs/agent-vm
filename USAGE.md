@@ -2325,7 +2325,7 @@ does not declare, the `persist=` count names the own count in parentheses
 whenever the two differ, e.g. `persist=3 (own 1)`.
 
 Neither provider column shows a custom `credentials.yaml` service:
-`credentials=` lists the four built-in names only, and a custom service is
+`credentials=` lists the five built-in names only, and a custom service is
 resolved from its authorization at launch. A `required: true` authorization
 whose value is missing still refuses that launch, and no row here reports it.
 
@@ -2464,24 +2464,37 @@ network_requests = ["api.example.com"] # optional; destinations the tool expects
   the user already passed the same flag. `doctor` shows only the argument
   **count**, never the values, so a secret accidentally placed here is not
   echoed. Args are not shell-split or expanded.
-- `credentials` — optional; provider **config names**, which differ from
-  the `agent-vm doctor` row labels. Valid: `anthropic`, `openai`,
-  `opencode-static`, `copilot`, `antigravity`. Note `opencode` (the doctor
-  label) is **not** a valid name — use `opencode-static`. This is the
-  **requirement** set: a launch hard-fails before boot when one of them yielded
-  no usable host login. `antigravity` never hard-fails: a host with no Google
-  login simply has no `antigravity/*` models, because that provider is Pi's own
-  (the image-owned `pi-antigravity` extension).
+- `credentials` — optional; the credential names this tool **requests**: a
+  built-in provider **config name**, or a service name authorized in
+  `credentials.yaml`. The built-in names are `anthropic`, `openai`,
+  `opencode-static`, `copilot` and `antigravity`; they differ from the
+  `agent-vm doctor` row labels, so `opencode` (the doctor label) is **not** one
+  of them — use `opencode-static`. This is the **requirement** set; which
+  authority answers a name is a launch decision, not a parse one (#162): a name
+  with a same-named `credentials.yaml` authorization follows that
+  authorization's own `required`, and a name that is neither built-in nor
+  authorized refuses the launch (under `--allow-missing-credentials` it is
+  withheld instead). Otherwise `anthropic` and `copilot` refuse a launch whose
+  host login is unusable, while `openai`, `opencode-static` and `antigravity`
+  launch anyway, signed out or degraded — `antigravity` most visibly by having
+  no `antigravity/*` models, because that provider is Pi's own (the image-owned
+  `pi-antigravity` extension). `agent-vm doctor`'s `credentials=` and
+  `provisions=` columns show the built-in projection only; a custom service
+  never appears there.
 - `tools` — optional; the names of **other tools whose credentials this tool's
   guest should have**. Not provider names. Named tools are *provisioned*, never
-  *required*, so naming a tool you have no host login for degrades silently
-  rather than failing the launch. Every reference — an explicit name or the
-  single entry `"*"` — resolves inside the **same configuration file** as the
-  declaring tool (its *tool reference scope*), including definitions another
-  file hides from the verb list. `"*"` must be the only entry; multiple explicit
-  names are allowed. `*` is not a legal tool `name`. A name declared only in the
-  *other* tier is a hard error, never an opt-in to crossing files. The
-  synthesized `shell` fallback is not a declaration in any file, so
+  *required*: a named tool's own `anthropic`/`copilot` bail is not inherited, so
+  naming a tool you have no host login for degrades rather than failing the
+  launch. Provisioning still resolves every credential name in the closure, so
+  an unauthorized custom service, or a `required: true` authorization the host
+  cannot read, does refuse that launch (see `credentials` above). Every
+  reference — an explicit name or the single entry `"*"` — resolves inside the
+  **same configuration file** as the declaring tool (its *tool reference
+  scope*), including definitions another file hides from the verb list. `"*"`
+  must be the only entry; multiple explicit names are allowed. `*` is not a
+  legal tool `name`. A name declared only in the *other* tier is a hard error,
+  never an opt-in to crossing files. The synthesized `shell` fallback is not a
+  declaration in any file, so
   `tools = ["shell"]` needs a local `shell`.
   **Omitted means `["*"]` for a tool named `shell` and `[]` for every other
   name** — write `tools = []` explicitly to give a `shell` no provisioning at
@@ -3057,7 +3070,7 @@ A launch only captures, injects and proxies the credentials its verb
 **provisions**: its own `credentials`, plus those of every tool it names in
 `tools`, transitively. `agent-vm codex` never captures your Anthropic token;
 `agent-vm claude` never captures your OpenAI one. `agent-vm shell` provisions
-all four, because in the shipped catalog the built-in `shell`'s wildcard closes
+all five, because in the shipped catalog the built-in `shell`'s wildcard closes
 over `default-tools.toml`'s six agents. `agent-vm doctor` prints each verb's
 resolved set as `provisions=…` next to its `credentials=…` requirement set.
 

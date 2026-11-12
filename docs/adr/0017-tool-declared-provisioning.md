@@ -86,9 +86,11 @@ identical to the pre-#82 binary.
   fallback also uses, so the two cannot drift.
 - **`credentials` keeps exactly one extra job: the requirement set.** A launch
   still hard-fails before boot when a required provider yielded no usable
-  credential. Named tools are *provisioned*, never *required* — a tool that
-  connects to another through a bridge pulls in that tool's credential without
-  inheriting its hard bail.
+  credential: the bail is `credential_provider::missing_credential_error`,
+  which only `anthropic` and `copilot` carry, so the other three providers
+  launch signed out or degraded instead. Named tools are *provisioned*, never
+  *required* — a tool that connects to another through a bridge pulls in that
+  tool's credential without inheriting its hard bail.
 - **A direct command has no provisioning decision at all** (amended by #398,
   0.7.3). `agent-vm run PROGRAM` / `agent-vm -- PROGRAM` selects no catalog
   entry, so its requirement set, provisioning set, declared network requests
