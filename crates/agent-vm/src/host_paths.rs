@@ -1666,28 +1666,46 @@ mod tests {
     /// A contention sample taken before the deadline must not justify
     /// `TimedOut`: the holder can release while the first contended attempt is
     /// still the most recent one. The checkpoint holds that attempt open across
-    /// the deadline, then the holder is released, and the waiter must make the
-    /// promised post-deadline attempt and acquire. Finite: every receive has a
-    /// 30 s deadline, so a wrong fix fails rather than hangs.
+    /// the deadline, then the peer releases, and the waiter must make the
+    /// promised post-deadline attempt and acquire.
+    ///
+    /// The peer is a flag the attempt closure consults, not a second descriptor
+    /// this test closes. A child forked by any other test inherits every
+    /// descriptor the process holds, so it keeps the lock alive for the
+    /// microseconds between this process's release and the next attempt —
+    /// measured as 9,604 contended fresh locks in 387,538 attempts under a
+    /// process-spawning load (#413, #496, #516). The single attempt the contract
+    /// promises cannot wait that window out, so asserting on a real release
+    /// makes the outcome a coin flip. The lock the waiter takes is still real.
+    ///
+    /// Finite: every receive has a 30 s deadline, so a wrong fix fails rather
+    /// than hangs.
     #[test]
     fn a_release_that_crosses_the_deadline_is_still_acquired() {
-        use std::sync::mpsc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, mpsc};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("lock");
-        let a = second_handle(&path);
-        rfs::flock(&a, rfs::FlockOperation::NonBlockingLockExclusive).unwrap();
+        let released = Arc::new(AtomicBool::new(false));
         let b = second_handle(&path);
+        let gate = Arc::clone(&released);
         let (contended_tx, contended_rx) = mpsc::channel();
         let (proceed_tx, proceed_rx) = mpsc::channel();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let outcome = flock_within_using(
                 SHORT,
-                || rfs::flock(&b, rfs::FlockOperation::NonBlockingLockExclusive),
+                || {
+                    if gate.load(Ordering::SeqCst) {
+                        rfs::flock(&b, rfs::FlockOperation::NonBlockingLockExclusive)
+                    } else {
+                        Err(Errno::WOULDBLOCK)
+                    }
+                },
                 || {
                     contended_tx.send(()).unwrap();
                     // Keep the first contended attempt as the most recent one
-                    // while the deadline passes, then let the holder release.
+                    // while the deadline passes, then let the peer release.
                     proceed_rx.recv_timeout(Duration::from_secs(30)).unwrap();
                 },
                 |_| {},
@@ -1696,11 +1714,11 @@ mod tests {
             let _ = tx.send((outcome, b));
         });
         contended_rx.recv_timeout(Duration::from_secs(30)).unwrap();
-        // Cross the deadline with the holder still held, then release it. A
-        // pre-deadline sample cannot report `TimedOut` for a lock free at the
-        // deadline.
+        // Cross the deadline with the peer still owning the lock, then release
+        // it. A pre-deadline sample cannot report `TimedOut` for a lock free at
+        // the deadline.
         std::thread::sleep(SHORT + Duration::from_millis(200));
-        drop(a);
+        released.store(true, Ordering::SeqCst);
         proceed_tx.send(()).unwrap();
         let (outcome, b) = rx.recv_timeout(Duration::from_secs(30)).unwrap();
         assert_eq!(outcome, FlockWait::Acquired);
@@ -1790,25 +1808,38 @@ mod tests {
     /// timeout: the observer can hold the waiter across the deadline and the
     /// lock can be released meanwhile, so the promised post-deadline attempt
     /// must still acquire. Entry and cleanup share one absolute outer watchdog.
+    ///
+    /// The peer is a flag the attempt closure consults, not a descriptor this
+    /// test closes, for the reason spelled out on
+    /// `a_release_that_crosses_the_deadline_is_still_acquired`: a single
+    /// post-deadline attempt cannot outlast the fork window that keeps a real
+    /// release invisible (#413, #496, #516).
     #[test]
     fn an_observer_that_crosses_the_deadline_still_acquires_a_released_lock() {
-        use std::sync::mpsc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, mpsc};
         const ACQUISITION_ENTRY_BUDGET: Duration = Duration::from_secs(5);
         const OUTER_WATCHDOG: Duration = Duration::from_secs(30);
         const CHECKPOINT_OVERHEAD: Duration = Duration::from_millis(350);
         let watchdog = Instant::now() + OUTER_WATCHDOG;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("lock");
-        let holder = second_handle(&path);
-        rfs::flock(&holder, rfs::FlockOperation::NonBlockingLockExclusive).unwrap();
+        let released = Arc::new(AtomicBool::new(false));
         let waiter = second_handle(&path);
         let (entered_tx, entered_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
         let (tx, rx) = mpsc::channel();
+        let gate = Arc::clone(&released);
         std::thread::spawn(move || {
             let outcome = flock_within_using(
                 ACQUISITION_ENTRY_BUDGET,
-                || rfs::flock(&waiter, rfs::FlockOperation::NonBlockingLockExclusive),
+                || {
+                    if gate.load(Ordering::SeqCst) {
+                        rfs::flock(&waiter, rfs::FlockOperation::NonBlockingLockExclusive)
+                    } else {
+                        Err(Errno::WOULDBLOCK)
+                    }
+                },
                 // Controlled overhead exceeds the former 200 ms entry window;
                 // this is not a sleep used to guess another thread's ordering.
                 || std::thread::sleep(CHECKPOINT_OVERHEAD),
@@ -1843,7 +1874,7 @@ mod tests {
             "deadline crossing exceeds outer watchdog"
         );
         std::thread::sleep(cross_deadline.saturating_duration_since(Instant::now()));
-        drop(holder);
+        released.store(true, Ordering::SeqCst);
         resume_tx
             .send(())
             .expect("observer resume gate disconnected");
