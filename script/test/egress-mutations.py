@@ -276,11 +276,20 @@ def matrix():
         'let base_ports = intercepted_ports_of(&network)?;\n        network = network.policy(serde_json::from_value(serde_json::json!({"default_egress":"deny","default_ingress":"allow","rules": [\n' +
         ','.join(['{"direction":"egress","destination":{"group":"public"},"protocols":[],"ports":[],"action":"allow"}'] * 4) +
         ']})).unwrap());', rust("credential_overlay_preserves_base_network_plan"))
+    # The three rows below control one property: a rejected allowance is refused
+    # before launch state exists. The injection creates that state just ahead of
+    # the parse that rejects, and it goes through the constructor `launch` itself
+    # calls, so it names exactly the directories the test asserts are absent
+    # instead of restating the hash-to-path rule. #581: an earlier spelling,
+    # `ProjectSession::for_cwd()`, named a constructor that did not exist, so all
+    # three rows reported "the mutant was never compiled" (E0599) and controlled
+    # nothing while `--check-anchors` kept passing it -- that check resolves find
+    # text only and never compiles a replacement.
     g4 = rust("rejected_allowance_is_refused_before_launch_state_is_created", LAUNCH)
     for name, suffix in (("project", ""), ("mounts", ".mounts"), ("secrets", ".secrets")):
         add("preparse-" + name, SRC + "run.rs",
             "\n    let mut network_plan = crate::network::Plan::from_args(args.network, user_network, user_tools)?;",
-            '\n    let early = ProjectSession::for_cwd()?;\n    std::fs::create_dir_all(' +
+            '\n    let early = ProjectSession::for_project(&project)?;\n    std::fs::create_dir_all(' +
             ('&early.state_dir' if not suffix else 'early.state_dir.with_extension("' + suffix[1:] + '")') +
             ')?;\n    let mut network_plan = crate::network::Plan::from_args(args.network, user_network, user_tools)?;', g4)
     add("valid-no-fork", TEST,
