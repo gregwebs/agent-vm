@@ -3,11 +3,12 @@
 //!
 //! Pi (issue #90/#95/#96) keeps imported host credentials **host-side** and
 //! gives the guest placeholders — Pi's mixed credential ownership, an ADR in
-//! another workstream (see #91, still open). A mount that put Pi's real
-//! `~/.pi/agent/auth.json` in front of the guest would defeat that for the one
-//! tool agent-vm is about to launch, so this module owns the whole of "which
-//! host files must never reach the guest, and is this mount one of the ways
-//! they would".
+//! another workstream (#91 is closed for its route, not on merit; #360 adopts
+//! the #164 route for the host Codex credential instead). A mount that put Pi's
+//! real `~/.pi/agent/auth.json` in front of the guest would defeat that for the
+//! one tool agent-vm is about to launch, so this module owns the whole of
+//! "which host files must never reach the guest, and is this mount one of the
+//! ways they would".
 //!
 //! A caller hands in a path or an `fstat` result and gets a verdict; it never
 //! sees `dev`/`ino`, the route set, or Pi's on-disk layout.
@@ -59,7 +60,7 @@ impl ProtectedFile {
 
     /// The single source of truth for these paths. The guest-side Pi scanner
     /// (`#93`) derives `pi/<relative>` from them; a future host-Pi resolver
-    /// (`#91`) should import this table rather than re-spell the paths.
+    /// should import this table rather than re-spell the paths.
     fn home_relative(self) -> &'static str {
         match self {
             Self::PiAuth => ".pi/agent/auth.json",

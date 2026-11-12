@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted. Implementation decision for [agent-vm #90](https://github.com/gregwebs/agent-vm/issues/90). Builds on Pi's mixed credential ownership ([ADR-0011](0011-pi-mixed-credential-ownership.md)); see [#91](https://github.com/gregwebs/agent-vm/issues/91) (still open) — narrows what [ADR-0013](0013-add-forked-mounts.md) and [ADR-0014](0014-narrow-fork-mounts-to-directories.md) left possible, and adds a contract to the surface [ADR-0018](0018-machine-checked-boundary-contracts.md) governs. Blocks [agent-vm #96](https://github.com/gregwebs/agent-vm/issues/96) (`agent-vm pi`).
+Accepted. Implementation decision for [agent-vm #90](https://github.com/gregwebs/agent-vm/issues/90). Builds on Pi's mixed credential ownership ([ADR-0011](0011-pi-mixed-credential-ownership.md)); [#91](https://github.com/gregwebs/agent-vm/issues/91) (Import OpenAI and Codex credentials through host Pi) is **closed for its route, not on merit** — [#360](https://github.com/gregwebs/agent-vm/issues/360) adopts the #164 route for the host Codex credential instead ([ADR-0044](0044-pi-reaches-host-codex-through-an-image-owned-provider.md)). This ADR narrows what [ADR-0013](0013-add-forked-mounts.md) and [ADR-0014](0014-narrow-fork-mounts-to-directories.md) left possible, and adds a contract to the surface [ADR-0018](0018-machine-checked-boundary-contracts.md) governs. Blocks [agent-vm #96](https://github.com/gregwebs/agent-vm/issues/96) (`agent-vm pi`).
 
 ## Context
 
@@ -21,7 +21,7 @@ Two forces decide the shape:
 
 ### The two protected files
 
-`~/.pi/agent/auth.json` (provider credentials) and `~/.pi/agent/models.json` (provider/endpoint configuration). `ProtectedFile::home_relative` is the single place they are spelled; the guest-side Pi scanner (`#93`) derives from that table, and a future host-Pi resolver (`#91`) should import it rather than re-spell them. The path table assumes no `PI_HOME`/XDG override; if a pinned Pi release introduces one, the resolver changes in this one place.
+`~/.pi/agent/auth.json` (provider credentials) and `~/.pi/agent/models.json` (provider/endpoint configuration). `ProtectedFile::home_relative` is the single place they are spelled; the guest-side Pi scanner (`#93`) derives from that table, and a future host-Pi resolver should import it rather than re-spell them. The path table assumes no `PI_HOME`/XDG override; if a pinned Pi release introduces one, the resolver changes in this one place.
 
 ### Detection: identity **and** canonical containment
 
@@ -100,7 +100,7 @@ Verified code calls into, and trusts: all syscalls (`fs::metadata`, `fs::symlink
 
 ## References
 
-- Pi's mixed credential ownership — the host/guest split this protects — is [ADR-0011](0011-pi-mixed-credential-ownership.md); see [#91](https://github.com/gregwebs/agent-vm/issues/91) (still open).
+- Pi's mixed credential ownership — the host/guest split this protects — is [ADR-0011](0011-pi-mixed-credential-ownership.md); see [#91](https://github.com/gregwebs/agent-vm/issues/91), closed for its route, not on merit.
 - [ADR-0013](0013-add-forked-mounts.md), [ADR-0014](0014-narrow-fork-mounts-to-directories.md) — fork identity, store, locking, publication, and the removal of opaque masks.
 - [ADR-0018](0018-machine-checked-boundary-contracts.md) — the `verus!` contract rule, the verified surface, and the trusted-boundary convention.
 - `crates/agent-vm/src/protected_host_files.rs`, `crates/agent-vm/tests/mount_protected_pi.rs`.
