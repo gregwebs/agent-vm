@@ -3076,6 +3076,11 @@ Reads from the host:
 - `gh auth token` (git/gh)
 
 The guest gets placeholder strings; the proxy substitutes on the wire.
+Each built-in secret substitutes in headers only, on its exact hosts. A
+placeholder in a request body — typically a transcript quoting `env` output or
+a guest `auth.json` — reaches any host unchanged: it is a marker, not a token.
+The same placeholder in a header, query string or URL path on a host its secret
+does not allow is refused with `403 Request blocked by secret policy.`
 Real tokens live in `${XDG_STATE_HOME}/agent-vm/<hash>.secrets/` (0700)
 on the host, **outside** the bind mount the guest sees. A SHA-256
 snapshot of the three credential files is taken at launch and

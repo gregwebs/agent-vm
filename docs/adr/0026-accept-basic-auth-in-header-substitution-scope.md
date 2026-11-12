@@ -38,6 +38,17 @@ where a value can go stays the same:
   connection to an allowed host still refuses the placeholder.
 - **Query and body.** Both stay off.
 
+_Amended by [#562](https://github.com/gregwebs/agent-vm/issues/562)._ The fork
+engine now refuses a placeholder only in a header or body location its secret
+substitutes in, and always in the query string, the URL path and streams that
+are not HTTP. This narrows two bullets above. **Hosts:** on a foreign host a
+built-in placeholder in a header (including base64 inside Basic), query string
+or path is still a `block-and-log` violation, but in a request body it is
+forwarded unchanged. **TLS identity:** a plain connection to an allowed host
+still refuses a header, query or path placeholder, but forwards one in a
+request body. Pinned by
+`body_placeholder_is_forwarded_to_any_host_without_its_value`.
+
 The widening therefore adds no new destination for a value. A guest could
 already put the placeholder in any header, including `Authorization: Bearer`,
 on these same hosts and have it substituted. Basic encoding is just another way

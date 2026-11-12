@@ -960,6 +960,66 @@ mod tests {
         );
     }
 
+    /// #562: every built-in secret substitutes in headers only, so its
+    /// placeholder quoted in a request body (a transcript that ran `env` or
+    /// read a guest `auth.json`) reaches any host unchanged and releases no
+    /// value. Used as a credential in a header on a foreign host, it is still
+    /// refused: the fix narrows where a refusal fires, not whether.
+    #[test]
+    fn body_placeholder_is_forwarded_to_any_host_without_its_value() {
+        let (_dir, config, sentinels) = engine_fixture();
+        assert!(!config.secrets.secrets.is_empty());
+        let foreign = "api.deepseek.com";
+        let body: String = sentinels
+            .iter()
+            .map(|(placeholder, _)| format!("{placeholder}\n"))
+            .collect();
+        let mut hosts = vec![foreign];
+        for entry in &config.secrets.secrets {
+            for host in &entry.allowed_hosts {
+                let HostPattern::Exact(host) = host else {
+                    panic!("{} has a non-exact host", entry.env_var);
+                };
+                hosts.push(host);
+            }
+        }
+
+        for host in hosts {
+            let request = format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            for tls_intercepted in [true, false] {
+                let out = engine_outcome(&config, host, tls_intercepted, request.as_bytes())
+                    .unwrap_or_else(|action| {
+                        panic!("body placeholders refused on {host} (tls={tls_intercepted}): {action:?}")
+                    });
+
+                assert_eq!(
+                    out, request,
+                    "{host} (tls={tls_intercepted}) rewrote the request"
+                );
+                for (placeholder, real) in &sentinels {
+                    assert!(
+                        !out.contains(real.as_str()),
+                        "{placeholder}'s value reached {host}"
+                    );
+                }
+            }
+        }
+
+        for (placeholder, _) in &sentinels {
+            let request = format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: {foreign}\r\nAuthorization: Bearer {placeholder}\r\nContent-Length: 2\r\n\r\n{{}}"
+            );
+            assert_eq!(
+                engine_outcome(&config, foreign, true, request.as_bytes()).map(|_| ()),
+                Err(SecretViolationAction::BlockAndLog),
+                "{placeholder} used as a header credential was not refused on {foreign}"
+            );
+        }
+    }
+
     #[test]
     fn captured_providers_register_only_when_provisioned() {
         let creds = CredsState {

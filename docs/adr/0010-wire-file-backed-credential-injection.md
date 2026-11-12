@@ -89,3 +89,10 @@ files block substitution. Buffered OAuth/GitHub API requests are capped at
 2 MiB; smart-HTTP is dispatched from headers and streams its body after policy
 approval. Cross-project refreshes may duplicate CLI work and rely on provider
 CLI locking.
+
+_Amended by [#562](https://github.com/gregwebs/agent-vm/issues/562)._ A
+placeholder the proxy would never substitute — any built-in placeholder in a
+request body — is forwarded unchanged on every host, including when its secret
+file is missing or the connection is not intercepted. A missing, unsafe or
+unreadable file still refuses the placeholder in a header, query string or URL
+path.
