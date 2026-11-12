@@ -833,29 +833,6 @@ impl LivePolicyPlan {
         self.egress.configured_contains(allowance)
     }
 
-    /// A plan whose launch fixed `port_hostname`'s ports but granted no hostname:
-    /// the shape that makes "revoke the last hostname" observable, because the
-    /// configured set does not put the rule back.
-    #[cfg(test)]
-    pub(crate) fn with_launch_ports_for_tests(
-        allow_egress: &[&str],
-        port_hostname: Option<&str>,
-        host_proxy_used: bool,
-    ) -> LivePolicyPlan {
-        let plan = plan_for_tests(allow_egress, host_proxy_used);
-        let mut live = plan.live_policy_plan(Some(Path::new("/launch/allowances.json")));
-        if let Some(name) = port_hostname {
-            match crate::egress_policy::Allowance::parse(name).unwrap() {
-                crate::egress_policy::Allowance::Hostname(hostname) => {
-                    live.launch_intercepted_ports =
-                        crate::egress_hostname::InterceptedPorts::for_hostnames(&[hostname]);
-                }
-                crate::egress_policy::Allowance::Address(_) => panic!("a hostname, not an address"),
-            }
-        }
-        live
-    }
-
     /// Derive the policy for one combined allowance set and the plan that
     /// produced it.
     ///

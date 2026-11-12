@@ -1867,39 +1867,34 @@ async fn live_revoke_of_last_hostname_stops_connections_within_launch_ports_and_
         other => panic!("{other:?}"),
     }
 
-    // Part 2: a launch that fixed port 443 for TLS but granted no hostname. A
-    // live grant of one hostname narrows cleanly when it is revoked again: the
-    // derived policy has no Domain rule at all, and the launch's ports are kept.
+    // Part 2: a launch whose only hostname came from the project record, so
+    // port 443 was fixed by `adopt_recorded` rather than by a configured
+    // hostname — the shape `run.rs` builds. Revoking the record removes the last
+    // Domain rule while the launch's ports are kept: a later hostname grant at
+    // 443 is intercepted already, so it applies without a relaunch.
     let (controller, _root) = {
         let project = live_project("l4b");
         let root = tempfile::tempdir().unwrap();
         let store = crate::allowances::StoreHandle::at_for_tests(root.path());
-        let plan = crate::network::LivePolicyPlan::with_launch_ports_for_tests(
-            &[],
-            Some("fixed.example"),
-            false,
-        );
-        (LiveAllowances::new(&project, store, plan), root)
+        let view = ProjectView::for_tests(&["fixed.example"], 3_000, None);
+        let mut plan = crate::network::plan_for_tests(&[], false);
+        // `run.rs`'s order: the session starts on the pre-adoption plan, the store
+        // joins the authority, then adoption hands over the post-adoption plan.
+        let controller = LiveAllowances::new(&project, store, plan.live_policy_plan(None));
+        let (adopted, notice) = plan.adopt_recorded(view.file().unwrap(), view.allowances());
+        assert!(notice.is_none(), "{notice:?}");
+        assert_eq!(adopted.len(), 1, "the record joined the authority");
+        let warnings =
+            controller.adopt_boot_allowances(&view, &adopted, plan.live_policy_plan(view.file()));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        (controller, root)
     };
     let recorder = Recorder::new();
     controller.attach_updater(recorder.updater());
     let refusals = live_refusals();
-    let granted = controller
-        .grant(
-            &refusals,
-            None,
-            Some("api.example.com"),
-            GrantScope::Session,
-            4_000,
-        )
-        .await;
-    assert!(
-        matches!(granted, GrantResult::Applied { .. }),
-        "{granted:?}"
-    );
     let result = controller
         .revoke(
-            &Allowance::parse("api.example.com").unwrap(),
+            &Allowance::parse("fixed.example").unwrap(),
             RevokeScope::All,
         )
         .await;
@@ -1921,6 +1916,24 @@ async fn live_revoke_of_last_hostname_stops_connections_within_launch_ports_and_
         )
     });
     assert!(!has_domain, "no Domain rule remains: {policy:?}");
+
+    // The launch's ports are the ones the boot plan fixed, not a recomputation
+    // from the set now in force: 443 needs no port the netstack did not already
+    // intercept, so a fresh hostname applies live instead of deferring to the
+    // next launch.
+    let regranted = controller
+        .grant(
+            &refusals,
+            None,
+            Some("api.example.com"),
+            GrantScope::Session,
+            4_000,
+        )
+        .await;
+    assert!(
+        matches!(regranted, GrantResult::Applied { .. }),
+        "the launch's ports are kept: {regranted:?}"
+    );
 
     // Part 3: a runtime failure keeps every entry.
     controller
