@@ -168,6 +168,7 @@ mod tests {
 
     #[test]
     fn local_registries_are_plain_http() {
+        let _guard = crate::test_env::guard();
         assert!(is_plain_http_registry("localhost:5000/standard:test"));
         assert!(is_plain_http_registry("127.0.0.1:5000/x"));
         assert!(is_plain_http_registry("0.0.0.0:8080/x"));
@@ -177,6 +178,7 @@ mod tests {
 
     #[test]
     fn public_registries_are_not_plain_http() {
+        let _guard = crate::test_env::guard();
         assert!(!is_plain_http_registry(
             "ghcr.io/gregwebs/agent-vm-standard:v0.1.3"
         ));
@@ -258,8 +260,12 @@ mod tests {
     /// The exact conjunction behind `.insecure()`, over all four combinations.
     /// A cache-only selection (a launch build) is never plain-HTTP, whatever the
     /// reference looks like.
+    ///
+    /// Takes the env guard for the same reason as its siblings: the predicate
+    /// reads `AGENT_VM_INSECURE_REGISTRY`, which another test in this module sets.
     #[test]
     fn insecure_needs_a_non_cache_only_plain_http_reference() {
+        let _guard = crate::test_env::guard();
         for (cache_only, reference, expected) in [
             (false, "registry.local:5000/app:1", true),
             (false, "ghcr.io/o/app:1", false),
