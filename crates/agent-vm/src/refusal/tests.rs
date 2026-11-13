@@ -60,6 +60,9 @@ fn refusal(
             name: name.map(str::to_owned),
             name_source: source,
             revision,
+            credential: None,
+            location: None,
+            reason: None,
         }),
     }
 }

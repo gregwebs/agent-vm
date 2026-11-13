@@ -995,6 +995,9 @@ fn ingest_denial(live: &crate::session_control::LiveSession) -> String {
             name: None,
             name_source: microsandbox::logs::NameSource::Absent,
             revision: 1,
+            credential: None,
+            location: None,
+            reason: None,
         }),
     };
     let feed = live.refusals().expect("a live refusal feed");
