@@ -36,11 +36,14 @@ fn entry(id: &str, destination: Destination, last_ms: i64) -> RefusalEntry {
         key: EntryKey {
             kind: Kind::NetworkDenial,
             destination,
+            credential: None,
         },
         layer: "tenant".into(),
         last_site: "tcp-syn".into(),
         last_ip: None,
         name: None,
+        last_location: None,
+        last_reason: None,
         last_revision: 1,
         count: 1,
         first_ms: last_ms,
@@ -174,6 +177,127 @@ a00b2078  policy lock     tcp 10.0.0.7:53                                       
     assert!(err.is_empty(), "{err}");
 }
 
+/// A credential-refusal entry: the three facts the runtime stated, and `None`
+/// wherever it stated nothing.
+fn credential_entry(
+    id: &str,
+    destination: Destination,
+    last_ms: i64,
+    credential: Option<&str>,
+    location: Option<&str>,
+    reason: Option<&str>,
+) -> RefusalEntry {
+    RefusalEntry {
+        key: EntryKey {
+            kind: Kind::CredentialRefusal,
+            destination,
+            credential: credential.map(str::to_owned),
+        },
+        last_site: "secret-violation".into(),
+        last_location: location.map(str::to_owned),
+        last_reason: reason.map(str::to_owned),
+        ..entry(id, address("203.0.113.10", 443), last_ms)
+    }
+}
+
+/// What a reader with a hidden 403 needs: which credential was refused, where it
+/// was sent, and why its secret could not serve it.
+#[tokio::test]
+async fn credential_refusal_rows_state_the_credential_the_location_and_the_reason() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = session_dir(root.path());
+    let entries = vec![
+        credential_entry(
+            "1a000001",
+            Destination::Host {
+                protocol: "tcp".into(),
+                name: "api.deepseek.com".into(),
+                port: Some(443),
+            },
+            NOW - 1_000,
+            Some("MSB_AGENT_VM_ANTHROPIC_UNUSED"),
+            Some("header"),
+            Some("host-not-covered"),
+        ),
+        credential_entry(
+            "1a000002",
+            address("203.0.113.11", 443),
+            NOW - 2_000,
+            Some("OPENAI_API_KEY"),
+            Some("query"),
+            Some("credential-unavailable"),
+        ),
+        credential_entry(
+            "1a000003",
+            address("203.0.113.12", 443),
+            NOW - 3_000,
+            Some("OPENAI_API_KEY"),
+            Some("trailer"),
+            Some("destination-unverified"),
+        ),
+    ];
+    dir.write(&snapshot("0a1b2c3d", NOW - 5_000, entries), NOW)
+        .unwrap();
+
+    let (status, out, err) = run_logged(&dir, table_args()).await;
+    assert_eq!(status, 0);
+    assert!(err.is_empty(), "{err}");
+    for expected in [
+        "can't be allowed here: credential policy; MSB_AGENT_VM_ANTHROPIC_UNUSED was sent in a \
+         request header, and its secret does not cover the destination",
+        "can't be allowed here: credential policy; OPENAI_API_KEY was sent in the query string, \
+         and the real value could not be read outside the sandbox",
+        "can't be allowed here: credential policy; OPENAI_API_KEY was sent in a request trailer, \
+         and the destination could not be verified",
+    ] {
+        assert!(out.contains(expected), "missing {expected:?} in:\n{out}");
+    }
+    assert_eq!(out.matches("credential refusal").count(), 3, "{out}");
+}
+
+/// A log written by a build before these fields existed: read and rendered, never
+/// reported as damaged. The row says what the record said, which is nothing about
+/// the credential.
+#[tokio::test]
+async fn a_log_written_before_the_credential_fields_still_renders() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = session_dir(root.path());
+    let raw = serde_json::json!({
+        "v": 1,
+        "evicted_sessions": 0,
+        "sessions": [{
+            "info": {"id": "0a1b2c3d", "pid": 1, "started_ms": NOW - 9_000, "socket": true},
+            "rev": 1, "ended_ms": null, "heartbeat_ms": null,
+            "suppressed": 0, "lost": 0, "gap": false,
+            "entries": [{
+                "id": "1a000001",
+                "key": {"kind": "credential_refusal", "destination": {
+                    "variant": "host", "protocol": "tcp",
+                    "name": "api.deepseek.com", "port": 443}},
+                "layer": "tenant", "last_site": "secret-violation", "last_ip": null,
+                "name": null, "last_revision": 1, "count": 1,
+                "first_ms": NOW - 1_000, "last_ms": NOW - 1_000
+            }]
+        }]
+    });
+    std::fs::write(
+        dir.path().join("refusals.json"),
+        serde_json::to_vec(&raw).unwrap(),
+    )
+    .unwrap();
+
+    let (status, out, err) = run_logged(&dir, table_args()).await;
+    assert_eq!(status, 0);
+    assert!(err.is_empty(), "an old log is not damage: {err}");
+    assert!(
+        out.contains("can't be allowed here: credential policy\n")
+            || out
+                .trim_end()
+                .ends_with("can't be allowed here: credential policy"),
+        "{out}"
+    );
+}
+
 #[tokio::test]
 async fn guest_names_are_escaped_and_marked() {
     let root = tempfile::tempdir().unwrap();
@@ -211,9 +335,10 @@ async fn guest_names_are_escaped_and_marked() {
 }
 
 /// Every column that can carry text a forged log chose: the ID, the protocol, the
-/// destination, the name source, and the site `reason()` names. Under the guard
-/// only the host user writes these, but the documented upgrade path admits older
-/// launchers that leave `.sessions` writable to their guests (AC5).
+/// destination, the name source, the site `reason()` names, and the credential it
+/// names. Under the guard only the host user writes these, but the documented
+/// upgrade path admits older launchers that leave `.sessions` writable to their
+/// guests (AC5).
 #[tokio::test]
 async fn every_untrusted_cell_is_escaped() {
     const ESC: char = '\u{1b}';
@@ -236,8 +361,22 @@ async fn every_untrusted_cell_is_escaped() {
         source: format!("sni{ESC}[0m"),
         truncated: false,
     });
-    dir.write(&snapshot("0a1b2c3d", NOW - 5_000, vec![sneaky]), NOW)
-        .unwrap();
+    // A credential refusal's cell carries the credential the record named, which a
+    // forged record can fill with anything.
+    let forged_credential = format!("evil{ESC}[31mKEY");
+    let credential = credential_entry(
+        "abcdef02",
+        address("203.0.113.10", 443),
+        NOW - 2_000,
+        Some(&forged_credential),
+        Some("header"),
+        Some("host-not-covered"),
+    );
+    dir.write(
+        &snapshot("0a1b2c3d", NOW - 5_000, vec![sneaky, credential]),
+        NOW,
+    )
+    .unwrap();
 
     let (status, out, _) = run_logged(&dir, table_args()).await;
     assert_eq!(status, 0);
@@ -260,6 +399,10 @@ async fn every_untrusted_cell_is_escaped() {
     assert!(
         out.contains("SNI") || out.contains("sni\\x1b[0m"),
         "{out:?}"
+    );
+    assert!(
+        out.contains(&crate::config::escape_str(&forged_credential)),
+        "the credential is escaped like every other untrusted cell: {out:?}"
     );
 
     // A session ID read from the log is validated, so a forged one does not even

@@ -1736,7 +1736,9 @@ Its `403` (`code: secret_policy_denied`) states which credential was refused,
 where the placeholder was sent, the destination and the reason — the engine's
 facts — then agent-vm's one remedy sentence: signing in again inside the sandbox
 will not fix it, so run `agent-vm access` outside the sandbox. The same
-value-free fields reach `network.log`; no message or record carries a value, a
+value-free fields reach `network.log`, and the project refusal log that
+`agent-vm access` prints them from: the credential, where the placeholder was
+sent, and the reason. No message or record carries a value, a
 length, a prefix or a hash.
 
 ### Token files live outside the guest bind mount

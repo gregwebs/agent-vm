@@ -406,6 +406,7 @@ fn entry(
         key: EntryKey {
             kind: Kind::NetworkDenial,
             destination,
+            credential: None,
         },
         layer: layer.to_owned(),
         last_site: site.to_owned(),
@@ -415,6 +416,8 @@ fn entry(
             source: source.to_owned(),
             truncated: false,
         }),
+        last_location: None,
+        last_reason: None,
         last_revision: 1,
         count: 1,
         first_ms: 0,

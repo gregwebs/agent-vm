@@ -204,6 +204,85 @@ fn access_reports_a_logged_session_as_a_user_reads_it() {
     );
 }
 
+/// One logged credential refusal, with the fields PR 3 renders. Written by hand
+/// so the row is asserted as a user reads it through the real binary.
+fn logged_credential_refusal(id: &str, started_ms: i64) -> String {
+    let entry = serde_json::json!({
+        "id": "5ec0de01",
+        "key": {"kind": "credential_refusal", "destination": {
+            "variant": "host", "protocol": "tcp", "name": "api.deepseek.com", "port": 443},
+            "credential": "MSB_AGENT_VM_ANTHROPIC_UNUSED"},
+        "layer": "tenant", "last_site": "secret-violation", "last_ip": null,
+        "name": null, "last_location": "header", "last_reason": "host-not-covered",
+        "last_revision": 1, "count": 1,
+        "first_ms": started_ms + 1_000, "last_ms": started_ms + 1_000
+    });
+    serde_json::json!({
+        "info": {"id": id, "pid": 1, "started_ms": started_ms, "socket": true},
+        "rev": 2,
+        "ended_ms": started_ms + 2_000,
+        "heartbeat_ms": started_ms + 2_000,
+        "suppressed": 0, "lost": 0, "gap": false,
+        "entries": [entry]
+    })
+    .to_string()
+}
+
+/// #562: outside the sandbox, `agent-vm access` says which credential was refused,
+/// where it was sent and why its secret could not serve it.
+#[test]
+fn access_reports_a_credential_refusal_as_a_user_reads_it() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = tempfile::tempdir().unwrap();
+    let home = broken_home(root.path());
+    let state = root.path().join("state");
+    let project = root.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let sessions = state.join(format!("{}.sessions", hash_project(&project)));
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let record = sessions.join("refusals.json");
+    std::fs::write(
+        &record,
+        format!(
+            "{{\"v\":1,\"evicted_sessions\":0,\"sessions\":[{}]}}",
+            logged_credential_refusal("aaaaaaaa", now - 120_000),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let out = run(&home, &state, &project, &["access"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stdout: {stdout}");
+    let row = stdout
+        .lines()
+        .find(|line| line.starts_with("5ec0de01 "))
+        .unwrap_or_else(|| panic!("no row: {stdout}"));
+    assert!(row.contains("credential refusal"), "{row:?}");
+    assert!(
+        row.ends_with(
+            "can't be allowed here: credential policy; MSB_AGENT_VM_ANTHROPIC_UNUSED was sent in \
+             a request header, and its secret does not cover the destination"
+        ),
+        "{row:?}"
+    );
+    let err_text = String::from_utf8_lossy(&out.stderr);
+    assert!(!err_text.contains("could not be used"), "{err_text}");
+
+    // And `allow` cannot turn it into a rule: the message repeats the row's own
+    // reason, so a reader who tried the wrong command learns why it cannot work.
+    let out = run(&home, &state, &project, &["access", "allow", "5ec0de01"]);
+    assert_eq!(out.status.code(), Some(1));
+    let expected = "cannot allow 5ec0de01: this refusal is not a network denial this command can allow (can't be allowed here: credential policy; MSB_AGENT_VM_ANTHROPIC_UNUSED was sent in a request header, and its secret does not cover the destination)";
+    let text = stderr(&out);
+    assert!(text.lines().any(|line| line == expected), "{text}");
+}
+
 // ---------------------------------------------------------------------------
 // ADR-0065: `access` reads the project allowance record
 // ---------------------------------------------------------------------------

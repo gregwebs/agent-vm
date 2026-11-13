@@ -28,6 +28,10 @@ use crate::host_paths::{self, FlockWait};
 
 /// The log's own schema version. A file with a greater one is a newer build's
 /// and is never overwritten: this build cannot know what it would destroy.
+///
+/// An additive field that decodes when absent (an `Option`, or one with
+/// `#[serde(default)]`) does not bump it: an older file still decodes and an older
+/// build still writes it.
 const LOG_VERSION: u32 = 1;
 /// Entry and byte bounds for the whole log (AC12). A session is bounded at
 /// [`MAX_ENTRIES_PER_SESSION`] on its own, so these bound the number of

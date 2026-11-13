@@ -33,11 +33,14 @@ fn entry(id: &str, key: &str, last_ms: i64) -> RefusalEntry {
                 ip: Some("203.0.113.10".parse().unwrap()),
                 port: Some(443),
             },
+            credential: None,
         },
         layer: "tenant".into(),
         last_site: key.to_owned(),
         last_ip: Some("203.0.113.10".parse().unwrap()),
         name: None,
+        last_location: None,
+        last_reason: None,
         last_revision: 1,
         count: 1,
         first_ms: last_ms,
@@ -391,6 +394,52 @@ fn sid_reservation_redraws_on_log_and_socket_collision() {
         dir.socket_path(&free).exists(),
         "the reserved socket is the one bound"
     );
+}
+
+/// A log written before the credential fields existed still loads and is still
+/// written back. The fields are optional on purpose: an absent `Option` decodes as
+/// `None`, and a non-optional one would fail the whole decode — a file this build
+/// cannot decode is one it sets aside.
+#[test]
+fn an_entry_written_before_the_credential_fields_still_loads() {
+    let (_root, dir) = dir();
+    let older = serde_json::json!({
+        "v": 1,
+        "evicted_sessions": 0,
+        "sessions": [{
+            "info": {"id": "0a1b2c3d", "pid": 1, "started_ms": NOW - 1_000, "socket": true},
+            "rev": 1, "ended_ms": null, "heartbeat_ms": null,
+            "suppressed": 0, "lost": 0, "gap": false,
+            "entries": [{
+                "id": "46d712fd",
+                "key": {"kind": "credential_refusal", "destination": {
+                    "variant": "host", "protocol": "tcp",
+                    "name": "api.deepseek.com", "port": 443}},
+                "layer": "tenant", "last_site": "secret-violation", "last_ip": null,
+                "name": null, "last_revision": 1, "count": 1,
+                "first_ms": NOW - 500, "last_ms": NOW - 500
+            }]
+        }]
+    });
+    std::fs::write(dir.record(), serde_json::to_vec(&older).unwrap()).unwrap();
+
+    let log = dir.read().unwrap();
+    assert_eq!(log.damaged, None, "an older entry is not damage");
+    assert_eq!(log.sessions.len(), 1);
+    let entry = &log.sessions[0].entries[0];
+    assert_eq!(entry.key.credential, None);
+    assert_eq!(entry.last_location, None);
+    assert_eq!(entry.last_reason, None);
+
+    // The next write replaces the file rather than archiving it, and keeps the row.
+    let own = filled(session("00000001", true), 1, NOW);
+    let report = dir.write(&own, NOW).unwrap();
+    assert_eq!(report.warning, None, "nothing to repair");
+    assert!(
+        !dir.path().join("refusals.json.damaged").exists(),
+        "an old log is never set aside"
+    );
+    assert_eq!(dir.read().unwrap().sessions.len(), 2);
 }
 
 #[test]

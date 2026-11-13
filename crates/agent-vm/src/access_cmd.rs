@@ -300,7 +300,8 @@ fn label(
 /// escape and break the alignment. Only the host user writes these values under
 /// the guard, but the documented upgrade path admits launchers that leave
 /// `.sessions` writable to their guests, so a forged record must not be able to
-/// put terminal escapes on the user's terminal (AC5).
+/// put terminal escapes on the user's terminal (AC5). A credential refusal's
+/// credential is escaped inside `RefusalEntry::reason` for the same reason.
 fn print_table(
     out: &mut impl std::io::Write,
     entries: &[(Row, RefusalEntry)],

@@ -5,7 +5,7 @@
 //! be able to follow without opening any other file.
 
 use super::*;
-use microsandbox::logs::{LogSource, NetworkSuppressed};
+use microsandbox::logs::{LogSource, NetworkSuppressed, PlaceholderLocation, SecretRefusalReason};
 use microsandbox_types::Protocol;
 
 /// The `NetworkLogRecord` envelope's timestamp type.
@@ -267,7 +267,8 @@ fn toy_records_coalesce_into_the_documented_entries() {
 
 #[test]
 fn key_bytes_and_id_golden_vectors() {
-    let cases: [(&str, EntryKey); 3] = [
+    // (expected bytes, key, how many lines the bytes hold).
+    let cases: [(&str, EntryKey, usize); 4] = [
         (
             "network-denial\naddress\ntcp\n203.0.113.10\n443\n",
             EntryKey {
@@ -277,7 +278,9 @@ fn key_bytes_and_id_golden_vectors() {
                     ip: Some("203.0.113.10".parse().unwrap()),
                     port: Some(443),
                 },
+                credential: None,
             },
+            6,
         ),
         (
             "network-denial\nhost\ntcp\n\n443\ncdn.example",
@@ -288,7 +291,9 @@ fn key_bytes_and_id_golden_vectors() {
                     name: "cdn.example".into(),
                     port: Some(443),
                 },
+                credential: None,
             },
+            6,
         ),
         (
             "network-denial\ndns-name\n\n\n\nblocked.example",
@@ -297,19 +302,57 @@ fn key_bytes_and_id_golden_vectors() {
                 destination: Destination::DnsName {
                     name: "blocked.example".into(),
                 },
+                credential: None,
             },
+            6,
+        ),
+        // Only a credential refusal carries the seventh line, which is what keeps
+        // every ID a log already holds where it is.
+        (
+            "credential-refusal\naddress\ntcp\n203.0.113.10\n443\n\nMSB_AGENT_VM_ANTHROPIC_UNUSED",
+            EntryKey {
+                kind: Kind::CredentialRefusal,
+                destination: Destination::Address {
+                    protocol: "tcp".into(),
+                    ip: Some("203.0.113.10".parse().unwrap()),
+                    port: Some(443),
+                },
+                credential: Some("MSB_AGENT_VM_ANTHROPIC_UNUSED".into()),
+            },
+            7,
         ),
     ];
-    for (expected, key) in cases {
+    for (expected, key, lines) in cases {
         assert_eq!(String::from_utf8(key_bytes(&key)).unwrap(), expected);
-        // An absent field is the empty string, so the field count is constant.
-        assert_eq!(expected.split('\n').count(), 6);
+        // An absent field is the empty string, so the field count is fixed.
+        assert_eq!(expected.split('\n').count(), lines);
         assert_eq!(refusal_id(SID, &key, 0).len(), 8);
         // `n` is part of the derivation, so a collision has a second answer.
         assert_ne!(refusal_id(SID, &key, 0), refusal_id(SID, &key, 1));
         // The session is, too: the same destination in two sessions differs.
         assert_ne!(refusal_id(SID, &key, 0), refusal_id("00000000", &key, 0));
     }
+    // The credential is a coordinate, so it moves the ID: two credentials refused
+    // at one destination are two rows, and a record that named none is a third.
+    let credential_key = |credential: Option<&str>| EntryKey {
+        kind: Kind::CredentialRefusal,
+        destination: Destination::Address {
+            protocol: "tcp".into(),
+            ip: Some("203.0.113.10".parse().unwrap()),
+            port: Some(443),
+        },
+        credential: credential.map(str::to_owned),
+    };
+    let anthropic = refusal_id(
+        SID,
+        &credential_key(Some("MSB_AGENT_VM_ANTHROPIC_UNUSED")),
+        0,
+    );
+    let openai = refusal_id(SID, &credential_key(Some("MSB_AGENT_VM_OPENAI_UNUSED")), 0);
+    let unnamed = refusal_id(SID, &credential_key(None), 0);
+    assert_ne!(anthropic, openai);
+    assert_ne!(anthropic, unnamed);
+    assert_ne!(openai, unnamed);
     // The five toy entries, as published in §5.
     let mut session = session();
     ingest_all(&mut session, &toy_records());
@@ -649,6 +692,391 @@ fn session_ids_are_eight_lowercase_hex_and_parse_strictly() {
             "{rejected} decoded"
         );
     }
+}
+
+/// A `secret-violation` record: the one site that states a credential, a location
+/// and a reason.
+fn secret_violation(
+    offset_secs: i64,
+    credential: Option<&str>,
+    location: Option<PlaceholderLocation>,
+    reason: Option<SecretRefusalReason>,
+    name: Option<&str>,
+) -> NetworkLogRecord {
+    NetworkLogRecord {
+        v: 1,
+        t: at(offset_secs),
+        s: LogSource::Network,
+        event: NetworkLogEvent::Refusal(NetworkRefusal {
+            site: RefusalSite::SecretViolation,
+            layer: RefusalLayer::Tenant,
+            protocol: Protocol::Tcp,
+            dst_ip: Some("203.0.113.10".parse().unwrap()),
+            dst_port: Some(443),
+            name: name.map(str::to_owned),
+            name_source: match name {
+                Some(_) => NameSource::Sni,
+                None => NameSource::Absent,
+            },
+            revision: 2,
+            credential: credential.map(str::to_owned),
+            location,
+            reason,
+        }),
+    }
+}
+
+/// One credential-refusal entry, from one record with the given facts.
+fn one_credential_refusal(
+    credential: Option<&str>,
+    location: Option<PlaceholderLocation>,
+    reason: Option<SecretRefusalReason>,
+) -> RefusalEntry {
+    let mut session = session();
+    session.ingest(&secret_violation(
+        1,
+        credential,
+        location,
+        reason,
+        Some("api.deepseek.com"),
+    ));
+    session.snapshot().entries[0].clone()
+}
+
+/// The record carrying the three fields a `secret-violation` states, for a record
+/// whose own kind has no meaning for them.
+fn with_credential_fields(mut record: NetworkLogRecord) -> NetworkLogRecord {
+    if let NetworkLogEvent::Refusal(refusal) = &mut record.event {
+        refusal.credential = Some("ANTHROPIC_API_KEY".to_owned());
+        refusal.location = Some(PlaceholderLocation::Header);
+        refusal.reason = Some(SecretRefusalReason::HostNotCovered);
+    }
+    record
+}
+
+#[test]
+fn only_a_credential_refusal_stores_the_credential_fields() {
+    // A forged record must not widen a row of another kind with fields that kind
+    // has no meaning for: a `tls-sni` network denial and a platform-floor
+    // `secret-violation` keep none of the three, and their cells are unchanged.
+    let mut session = session();
+    session.ingest(&with_credential_fields(refusal(
+        1,
+        RefusalSite::TlsSni,
+        RefusalLayer::Tenant,
+        Protocol::Tcp,
+        "203.0.113.10",
+        Some(443),
+        Some("api.deepseek.com"),
+        NameSource::Sni,
+        1,
+    )));
+    session.ingest(&with_credential_fields(refusal(
+        2,
+        RefusalSite::SecretViolation,
+        RefusalLayer::Platform,
+        Protocol::Tcp,
+        "203.0.113.10",
+        Some(443),
+        Some("api.deepseek.com"),
+        NameSource::Sni,
+        1,
+    )));
+    let snapshot = session.snapshot();
+    assert_eq!(snapshot.entries.len(), 2);
+    let cells = [
+        "no grant in this version; relaunch with --allow-egress",
+        "can't be allowed: platform policy",
+    ];
+    for (entry, cell) in snapshot.entries.iter().zip(cells) {
+        assert_eq!(entry.key.credential, None);
+        assert_eq!(entry.last_location, None);
+        assert_eq!(entry.last_reason, None);
+        assert_eq!(entry.reason(), cell);
+    }
+}
+
+#[test]
+fn credential_refusals_coalesce_per_credential_not_per_destination() {
+    let mut session = session();
+    let anthropic = secret_violation(
+        1,
+        Some("MSB_AGENT_VM_ANTHROPIC_UNUSED"),
+        Some(PlaceholderLocation::Header),
+        Some(SecretRefusalReason::HostNotCovered),
+        Some("api.deepseek.com"),
+    );
+    let openai = secret_violation(
+        2,
+        Some("MSB_AGENT_VM_OPENAI_UNUSED"),
+        Some(PlaceholderLocation::Header),
+        Some(SecretRefusalReason::HostNotCovered),
+        Some("api.deepseek.com"),
+    );
+    session.ingest(&anthropic);
+    session.ingest(&openai);
+    // One destination, two credentials, two rows: two different remedies.
+    let snapshot = session.snapshot();
+    assert_eq!(snapshot.entries.len(), 2);
+    assert_eq!(snapshot.entries[0].count, 1);
+    assert_eq!(snapshot.entries[1].count, 1);
+    assert_eq!(
+        snapshot.entries[0].key.destination,
+        snapshot.entries[1].key.destination
+    );
+    assert_ne!(snapshot.entries[0].id, snapshot.entries[1].id);
+
+    // The same credential again is the same row.
+    session.ingest(&anthropic);
+    let snapshot = session.snapshot();
+    assert_eq!(snapshot.entries.len(), 2);
+    assert_eq!(snapshot.entries[0].count, 2);
+    assert_eq!(snapshot.entries[1].count, 1);
+
+    // A record that names no credential is a row of its own: it did not say which
+    // one, and a row must not claim it.
+    session.ingest(&secret_violation(
+        3,
+        None,
+        Some(PlaceholderLocation::Header),
+        Some(SecretRefusalReason::HostNotCovered),
+        Some("api.deepseek.com"),
+    ));
+    assert_eq!(session.snapshot().entries.len(), 3);
+}
+
+#[test]
+fn each_refusal_reason_renders_as_words() {
+    let cells = [
+        (
+            SecretRefusalReason::HostNotCovered,
+            PlaceholderLocation::Header,
+            "can't be allowed here: credential policy; ANTHROPIC_API_KEY was sent in a request header, and its secret does not cover the destination",
+        ),
+        (
+            SecretRefusalReason::CredentialUnavailable,
+            PlaceholderLocation::Query,
+            "can't be allowed here: credential policy; ANTHROPIC_API_KEY was sent in the query string, and the real value could not be read outside the sandbox",
+        ),
+        (
+            SecretRefusalReason::DestinationUnverified,
+            PlaceholderLocation::Trailer,
+            "can't be allowed here: credential policy; ANTHROPIC_API_KEY was sent in a request trailer, and the destination could not be verified",
+        ),
+    ];
+    for (reason, location, expected) in cells {
+        let entry = one_credential_refusal(Some("ANTHROPIC_API_KEY"), Some(location), Some(reason));
+        assert_eq!(entry.reason(), expected, "{reason:?}");
+    }
+
+    // The location and the reason are each optional.
+    let no_reason = one_credential_refusal(
+        Some("ANTHROPIC_API_KEY"),
+        Some(PlaceholderLocation::Header),
+        None,
+    );
+    assert_eq!(
+        no_reason.reason(),
+        "can't be allowed here: credential policy; ANTHROPIC_API_KEY was sent in a request header"
+    );
+    let no_location = one_credential_refusal(
+        Some("ANTHROPIC_API_KEY"),
+        None,
+        Some(SecretRefusalReason::HostNotCovered),
+    );
+    assert_eq!(
+        no_location.reason(),
+        "can't be allowed here: credential policy; ANTHROPIC_API_KEY was sent, and its secret does not cover the destination"
+    );
+    // The engine's own 403 says "a credential" when the name would itself carry a
+    // placeholder, and so does this row.
+    let unnamed = one_credential_refusal(
+        None,
+        Some(PlaceholderLocation::Header),
+        Some(SecretRefusalReason::HostNotCovered),
+    );
+    assert_eq!(
+        unnamed.reason(),
+        "can't be allowed here: credential policy; a credential was sent in a request header, and its secret does not cover the destination"
+    );
+}
+
+#[test]
+fn a_record_that_does_not_say_the_fields_renders_without_them() {
+    // O2: a missing field means the record did not say, never that nothing was
+    // refused. The row keeps the bare sentence and claims no cause.
+    let entry = one_credential_refusal(None, None, None);
+    assert_eq!(entry.reason(), "can't be allowed here: credential policy");
+    assert_eq!(entry.key.credential, None);
+    assert_eq!(entry.last_location, None);
+    assert_eq!(entry.last_reason, None);
+
+    // A location this build cannot name adds nothing it cannot put in a sentence.
+    let mut unknown = entry;
+    unknown.last_location = Some("at-the-prompt".into());
+    assert_eq!(unknown.reason(), "can't be allowed here: credential policy");
+}
+
+#[test]
+fn a_reason_a_later_build_wrote_is_displayed_not_dropped() {
+    // A row from a later runtime, or a forged one: the wire value is a string in
+    // the log, so it renders as what the record said instead of costing the file.
+    let entry: RefusalEntry = serde_json::from_value(serde_json::json!({
+        "id": "46d712fd",
+        "key": {
+            "kind": "credential_refusal",
+            "destination": {
+                "variant": "host", "protocol": "tcp",
+                "name": "api.deepseek.com", "port": 443
+            },
+            "credential": "ANTHROPIC_API_KEY"
+        },
+        "layer": "tenant",
+        "last_site": "secret-violation",
+        "last_ip": null,
+        "name": null,
+        "last_location": "header",
+        "last_reason": "some-new-rule",
+        "last_revision": 1,
+        "count": 1,
+        "first_ms": 1,
+        "last_ms": 1
+    }))
+    .expect("a later build's reason is still a row");
+    assert_eq!(
+        entry.reason(),
+        "can't be allowed here: credential policy; ANTHROPIC_API_KEY was sent in a request header, and the runtime reported some-new-rule"
+    );
+}
+
+#[test]
+fn a_later_record_that_says_nothing_keeps_the_earlier_evidence() {
+    let mut session = session();
+    session.ingest(&secret_violation(
+        1,
+        Some("ANTHROPIC_API_KEY"),
+        Some(PlaceholderLocation::Header),
+        Some(SecretRefusalReason::HostNotCovered),
+        Some("api.deepseek.com"),
+    ));
+    // The same destination and credential with no location and no reason: the
+    // same row, and it must not erase what the earlier record stated.
+    session.ingest(&secret_violation(
+        2,
+        Some("ANTHROPIC_API_KEY"),
+        None,
+        None,
+        Some("api.deepseek.com"),
+    ));
+    let snapshot = session.snapshot();
+    assert_eq!(snapshot.entries.len(), 1);
+    let entry = &snapshot.entries[0];
+    assert_eq!(entry.count, 2);
+    assert!(entry.last_location.is_some());
+    assert!(entry.last_reason.is_some());
+    assert_eq!(
+        entry.reason(),
+        "can't be allowed here: credential policy; ANTHROPIC_API_KEY was sent in a request header, and its secret does not cover the destination"
+    );
+}
+
+#[test]
+fn a_later_record_that_states_new_evidence_replaces_the_earlier() {
+    // The row says what is true now: restoring the secret file turns
+    // `credential-unavailable` into `host-not-covered`, and the later record's
+    // location and reason are the ones the cell shows.
+    let mut session = session();
+    session.ingest(&secret_violation(
+        1,
+        Some("ANTHROPIC_API_KEY"),
+        Some(PlaceholderLocation::Query),
+        Some(SecretRefusalReason::CredentialUnavailable),
+        Some("api.deepseek.com"),
+    ));
+    session.ingest(&secret_violation(
+        2,
+        Some("ANTHROPIC_API_KEY"),
+        Some(PlaceholderLocation::Header),
+        Some(SecretRefusalReason::HostNotCovered),
+        Some("api.deepseek.com"),
+    ));
+    let snapshot = session.snapshot();
+    assert_eq!(snapshot.entries.len(), 1);
+    let entry = &snapshot.entries[0];
+    assert_eq!(entry.count, 2);
+    assert_eq!(entry.last_location.as_deref(), Some("header"));
+    assert_eq!(entry.last_reason.as_deref(), Some("host-not-covered"));
+    assert_eq!(
+        entry.reason(),
+        "can't be allowed here: credential policy; ANTHROPIC_API_KEY was sent in a request header, and its secret does not cover the destination"
+    );
+}
+
+#[test]
+fn a_forged_credential_is_escaped_and_cut() {
+    const ESC: char = '\u{1b}';
+    let forged = format!("evil{ESC}[31mX{ESC}[2J\nY");
+    let entry = one_credential_refusal(
+        Some(&forged),
+        Some(PlaceholderLocation::Header),
+        Some(SecretRefusalReason::HostNotCovered),
+    );
+    let cell = entry.reason();
+    assert!(!cell.contains(ESC), "no raw escape reaches the terminal");
+    assert!(!cell.contains('\n'), "no raw newline breaks the row");
+    assert!(
+        cell.contains(&crate::config::escape_str(&forged)),
+        "the escaped spelling is the one every other diagnostic uses: {cell}"
+    );
+
+    // A name past the bound is cut on a character boundary.
+    let overlong = "n".repeat(MAX_NAME_BYTES + 10);
+    let entry = one_credential_refusal(
+        Some(&overlong),
+        Some(PlaceholderLocation::Header),
+        Some(SecretRefusalReason::HostNotCovered),
+    );
+    assert_eq!(
+        entry.key.credential.as_deref().map(str::len),
+        Some(MAX_NAME_BYTES)
+    );
+
+    // Two-byte characters, so the bound lands inside one and the cut has to move
+    // back to the boundary rather than split it.
+    let multibyte = "é".repeat(200);
+    let entry = one_credential_refusal(Some(&multibyte), None, None);
+    let cut = entry.key.credential.as_deref().expect("a named credential");
+    assert!(cut.len() < MAX_NAME_BYTES, "{} bytes", cut.len());
+    assert!(
+        multibyte.is_char_boundary(cut.len()),
+        "the cut split a character"
+    );
+    assert!(multibyte.starts_with(cut));
+}
+
+#[test]
+fn an_entry_with_every_credential_field_fits_two_kibibytes() {
+    // The same worst-case coordinates as `an_entry_serializes_within_two_kibibytes`,
+    // so the two bounds compose: this entry carries every field that test does plus
+    // the three a credential refusal adds.
+    let mut session = session();
+    let mut record = secret_violation(
+        1,
+        Some(&"c".repeat(MAX_NAME_BYTES + 100)),
+        Some(PlaceholderLocation::ChunkMetadata),
+        Some(SecretRefusalReason::DestinationUnverified),
+        Some(&"z".repeat(MAX_NAME_BYTES)),
+    );
+    if let NetworkLogEvent::Refusal(refusal) = &mut record.event {
+        refusal.dst_ip = Some("2001:db8::1".parse().unwrap());
+        refusal.dst_port = Some(65535);
+        refusal.name_source = NameSource::HttpHost;
+        refusal.revision = u64::MAX;
+    }
+    session.ingest(&record);
+    let entry = &session.snapshot().entries[0];
+    let encoded = serde_json::to_vec(entry).unwrap();
+    assert!(encoded.len() <= 2048, "{} bytes", encoded.len());
 }
 
 proptest::proptest! {

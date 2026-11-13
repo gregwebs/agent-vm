@@ -1027,11 +1027,13 @@ _Avoid_: "block" as a noun ("sandbox block"); "denial" for the non-network
 kinds.
 
 **Refusal ID**: the 8-hex ID of one entry in the **project refusal log**,
-derived once from `(session, (kind, destination))` and then stored, never
-recomputed. It coalesces every refusal of that destination in that session, so it
-names a row a reader can quote and a later slice can grant against. The same
-destination in another session gets a different ID; the same ID appearing in two
-sessions is flagged in a footer and never renamed. See
+derived once from the session and the entry's key — the kind, the destination,
+and, for a credential refusal, the credential refused — and then stored, never
+recomputed. It coalesces every refusal of that key in that session — for a
+credential refusal, of that credential at that destination — so it names a row a
+reader can quote and a later slice can grant against. The same destination in
+another session gets a different ID; the same ID appearing in two sessions is
+flagged in a footer and never renamed. See
 [ADR-0064](docs/adr/0064-read-only-refusal-feed.md).
 
 **Project refusal log**: the launcher's own bounded copy of what this project's

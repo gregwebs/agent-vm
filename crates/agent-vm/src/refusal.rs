@@ -1,4 +1,4 @@
-//! What a sandbox refused, coalesced per `(session, destination)`.
+//! What a sandbox refused, coalesced per session and entry key.
 //!
 //! One [`SessionRefusals`] holds one live session's list. It is pure: it takes
 //! decoded runtime records ([`NetworkLogRecord`]) and produces the entries, the
@@ -23,7 +23,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use microsandbox::logs::{
-    NameSource, NetworkLogEvent, NetworkLogRecord, NetworkRefusal, RefusalLayer, RefusalSite,
+    NameSource, NetworkLogEvent, NetworkLogRecord, NetworkRefusal, PlaceholderLocation,
+    RefusalLayer, RefusalSite,
 };
 
 /// At most this many entries per session. A hostile or broken guest can open
@@ -179,11 +180,17 @@ impl Destination {
     }
 }
 
-/// The coalescing key: one entry per kind and destination.
+/// The coalescing key: one entry per kind, destination and — for a credential
+/// refusal — credential. ADR-0064 records why the credential is a coordinate and
+/// what it costs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct EntryKey {
     pub(crate) kind: Kind,
     pub(crate) destination: Destination,
+    /// Set for [`Kind::CredentialRefusal`] and no other kind. Absent in a log
+    /// written before this coordinate existed; decodes as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) credential: Option<String>,
 }
 
 /// The bytes an ID is derived from: one field per line, an absent field empty.
@@ -191,8 +198,12 @@ pub(crate) struct EntryKey {
 /// Canonical in exactly the way the entry is: the same refusal on the same
 /// session always produces the same bytes, whatever spelling the runtime
 /// reported the name in.
+///
+/// The six lines are fixed, and a credential refusal appends the credential as a
+/// seventh. Conditional on purpose: every ID a log already holds was derived from
+/// the six-line form, and no credential-free ID may move.
 pub(crate) fn key_bytes(key: &EntryKey) -> Vec<u8> {
-    [
+    let mut lines = vec![
         key.kind.key_name().to_owned(),
         key.destination.variant_name().to_owned(),
         key.destination.protocol().to_lowercase(),
@@ -205,9 +216,11 @@ pub(crate) fn key_bytes(key: &EntryKey) -> Vec<u8> {
             .map(|port| port.to_string())
             .unwrap_or_default(),
         key.destination.name().to_ascii_lowercase(),
-    ]
-    .join("\n")
-    .into_bytes()
+    ];
+    if key.kind == Kind::CredentialRefusal {
+        lines.push(key.credential.clone().unwrap_or_default());
+    }
+    lines.join("\n").into_bytes()
 }
 
 /// A name the guest supplied, which is therefore text and never a fact.
@@ -259,6 +272,19 @@ pub(crate) struct RefusalEntry {
     /// The address of the latest refusal, when the key does not carry one.
     pub(crate) last_ip: Option<IpAddr>,
     pub(crate) name: Option<GuestName>,
+    /// The runtime's `location` wire value for the latest refusal that stated
+    /// one, so a later record that stayed silent cannot erase it. Absent in an
+    /// older log, on the same terms as [`EntryKey::credential`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_location: Option<String>,
+    /// The runtime's `reason` wire value, on the same terms as
+    /// [`RefusalEntry::last_location`].
+    ///
+    /// Evidence rather than identity, unlike the credential: a reason is a
+    /// diagnosis of the latest attempt, so a row keyed on it would leave two rows
+    /// differing by a cause that has since been fixed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_reason: Option<String>,
     /// The tenant policy revision in force for the latest refusal. Unused in
     /// slice 1 (it decides nothing); kept so coverage filtering can be added
     /// later without re-reading the runtime's log.
@@ -282,7 +308,7 @@ impl RefusalEntry {
             Kind::NetworkDenial => {
                 "no grant in this version; relaunch with --allow-egress".to_owned()
             }
-            Kind::CredentialRefusal => "can't be allowed here: credential policy".to_owned(),
+            Kind::CredentialRefusal => self.credential_policy_reason(),
             // `last_site` is the runtime's wire value as a forged record may
             // carry it, so it is escaped here, where it becomes text a reader
             // prints.
@@ -291,6 +317,65 @@ impl RefusalEntry {
                 crate::config::escape_str(&self.last_site)
             ),
         }
+    }
+
+    /// The credential boundary, then the facts the runtime stated.
+    ///
+    /// A record that states none of them keeps the bare sentence: a missing field
+    /// means the record did not say, never that nothing was refused, so the cell
+    /// never prints "none" and never names a cause it was not given.
+    fn credential_policy_reason(&self) -> String {
+        let mut text = "can't be allowed here: credential policy".to_owned();
+        let credential = self.key.credential.as_deref();
+        let location = self.last_location.as_deref().and_then(location_phrase);
+        if credential.is_none() && location.is_none() && self.last_reason.is_none() {
+            return text;
+        }
+        let subject = match credential {
+            // The name the configuration supplied is still text a record may have
+            // forged, so it is escaped where it becomes something a reader prints.
+            Some(credential) => crate::config::escape_str(credential),
+            // The engine's own 403 says this when the name would itself carry a
+            // placeholder.
+            None => "a credential".to_owned(),
+        };
+        text.push_str(&format!("; {subject} was sent"));
+        if let Some(phrase) = location {
+            text.push_str(&format!(" in {phrase}"));
+        }
+        if let Some(reason) = self.last_reason.as_deref() {
+            text.push_str(&format!(", and {}", reason_clause(reason)));
+        }
+        text
+    }
+}
+
+/// Where the placeholder was found, as the engine's own phrase for its wire value
+/// (`PlaceholderLocation::phrase()`).
+///
+/// The log holds a string, so it is decoded back through the engine's type rather
+/// than copied into a second table here. `None` for a value this build cannot
+/// name — a forged record, or one a later runtime adds — so the cell says nothing
+/// about where instead of pushing text into a phrase it does not fit.
+fn location_phrase(location: &str) -> Option<&'static str> {
+    serde_json::from_value::<PlaceholderLocation>(serde_json::Value::String(location.into()))
+        .ok()
+        .map(PlaceholderLocation::phrase)
+}
+
+/// Why the secret could not serve the request, in words.
+///
+/// "Host" is never the noun: the destination is the API side and this computer is
+/// "outside the sandbox". A value this build cannot name is displayed as what the
+/// runtime said, escaped, because the cell must not invent a cause.
+fn reason_clause(reason: &str) -> String {
+    match reason {
+        "host-not-covered" => "its secret does not cover the destination".to_owned(),
+        "credential-unavailable" => {
+            "the real value could not be read outside the sandbox".to_owned()
+        }
+        "destination-unverified" => "the destination could not be verified".to_owned(),
+        other => format!("the runtime reported {}", crate::config::escape_str(other)),
     }
 }
 
@@ -355,7 +440,10 @@ impl SessionSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Update {
     pub(crate) rev: u64,
-    pub(crate) entry: Option<RefusalEntry>,
+    /// The entry that moved. Boxed so `session_control::Reply::Update` stays the
+    /// size of its other variants (`clippy::large_enum_variant`); serde's `Box` is
+    /// transparent, so the wire form is the entry itself.
+    pub(crate) entry: Option<Box<RefusalEntry>>,
     pub(crate) suppressed: u64,
     pub(crate) lost: u64,
     pub(crate) gap: bool,
@@ -423,9 +511,25 @@ impl SessionRefusals {
     fn ingest_refusal(&mut self, refusal: &NetworkRefusal, at_ms: i64) -> Update {
         let layer = wire(refusal.layer);
         let kind = classify(refusal.site, refusal.layer);
+        // The three refusal facts are set on a `secret-violation` record only, and
+        // they are stored for that kind alone: a forged record must not widen a
+        // row of another kind with fields its kind has no meaning for.
+        let (credential, last_location, last_reason) = match kind {
+            Kind::CredentialRefusal => (
+                refusal
+                    .credential
+                    .as_deref()
+                    .filter(|name| !name.is_empty())
+                    .map(secret_name),
+                refusal.location.map(|location| clip(&wire(location))),
+                refusal.reason.map(|reason| clip(&wire(reason))),
+            ),
+            _ => (None, None, None),
+        };
         let key = EntryKey {
             kind,
             destination: destination(refusal),
+            credential,
         };
         let name = refusal
             .name
@@ -440,6 +544,14 @@ impl SessionRefusals {
             entry.last_site = wire(refusal.site);
             entry.layer = layer;
             entry.last_revision = refusal.revision;
+            // Only a record that stated a field overwrites it: evidence a later
+            // record stayed silent about is still what the runtime last said.
+            if last_location.is_some() {
+                entry.last_location = last_location;
+            }
+            if last_reason.is_some() {
+                entry.last_reason = last_reason;
+            }
             let entry = entry.clone();
             return self.bump(Some(entry));
         }
@@ -457,6 +569,8 @@ impl SessionRefusals {
             last_site: wire(refusal.site),
             last_ip: refusal.dst_ip,
             name,
+            last_location,
+            last_reason,
             last_revision: refusal.revision,
             count: 1,
             first_ms: at_ms,
@@ -513,7 +627,7 @@ impl SessionRefusals {
         self.snapshot.rev = self.snapshot.rev.saturating_add(1);
         Update {
             rev: self.snapshot.rev,
-            entry,
+            entry: entry.map(Box::new),
             suppressed: self.snapshot.suppressed,
             lost: self.snapshot.lost,
             gap: self.snapshot.gap,
@@ -547,6 +661,18 @@ fn wire<T: Serialize>(value: T) -> String {
 
 fn clip(text: &str) -> String {
     text.chars().take(MAX_FIELD_BYTES).collect()
+}
+
+/// The refused secret's name, bounded and cut on a character boundary.
+///
+/// It is a [`String`] field of an entry in a log that is bounded in bytes, so it
+/// needs a bound; [`MAX_NAME_BYTES`] is the one this module already uses for a
+/// name. A longer value is not an environment-variable name, and the reader still
+/// needs no more of it than that to identify the credential. Unlike [`GuestName`]
+/// a cut here is not marked: a built-in name is short, so only a forged log
+/// reaches the cut.
+fn secret_name(name: &str) -> String {
+    name[..floor_char_boundary(name, MAX_NAME_BYTES)].to_owned()
 }
 
 /// The destination an allowance would have to name (§5).
