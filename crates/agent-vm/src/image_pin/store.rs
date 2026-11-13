@@ -2,16 +2,26 @@
 //!
 //! # Why the retained-default module is both a dependency and a caller
 //!
-//! `boot_image::default_selection` owns the fallback's v1 bytes
+//! `boot_image::default_selection` owns the host record's v1 bytes
 //! (`SELECTION_FILE`, `decode_snapshot`, `encode_snapshot`, `snapshot_at`) and
 //! consults this module for the *logical* record, so the two modules name each
 //! other. The cycle is acyclic where it matters: this module calls only the pure
-//! byte-level helpers, never `load`, and `load` is the sole edge back into
-//! `image_pin` — it reaches `Store::observe` and nothing else, so no transaction
-//! can re-enter an observation and no lock is ever taken twice. Putting the
-//! schema here instead would duplicate the fallback's format in the module that
-//! must preserve a user's own bytes; putting the transaction there would move
-//! approval into a module that knows only one tier.
+//! byte-level helpers, never `load`, and `boot_image` reaches this module through
+//! three **observations** — `default_selection::load` → [`Store::load_default`],
+//! `image_pin::load_default_slot` → [`Store::default_slot`], and
+//! `image_pin::observe_defaults` → [`Store::observe_defaults`]. None is a
+//! transaction, and `image_pin` never calls `boot_image`'s selection, so no lock
+//! is taken twice. Putting the schema here instead would duplicate the host
+//! record's format in the module that must preserve a user's own bytes; putting
+//! the transaction there would move approval into a module that knows only one
+//! tier.
+//!
+//! # Why a project default is stored here
+//!
+//! A project's established default (ADR-0067) must be written in the **same**
+//! save as the pin that first approved its content, so its record lives in this
+//! file rather than beside it. Everything else about it — the concepts, the
+//! flows and the host's starting choice — is [`super::project_default`].
 use std::collections::BTreeSet;
 use std::fs::{DirBuilder, File};
 use std::io::ErrorKind;
@@ -21,6 +31,7 @@ use std::time::{Duration, Instant};
 
 use rustix::fs::{FileType, Mode, OFlags};
 
+use super::project_default::{DefaultAdoption, ProjectDefault};
 use super::*;
 use crate::boot_image::default_selection::{self as default, SELECTION_FILE};
 use crate::config;
@@ -63,8 +74,8 @@ mod gate {
         CandidateReady,
         BeforePinLock,
         PinLocked,
-        BeforeIntentSave,
-        IntentSaved,
+        /// Before the single host-record save of a default-tier preparation.
+        BeforeDefaultSave,
         DefaultSaved,
         BeforePinSave,
         PinCommitted,
@@ -78,8 +89,7 @@ mod gate {
                 Self::CandidateReady => "candidate-ready",
                 Self::BeforePinLock => "before-pin-lock",
                 Self::PinLocked => "pin-locked",
-                Self::BeforeIntentSave => "before-intent-save",
-                Self::IntentSaved => "intent-saved",
+                Self::BeforeDefaultSave => "before-default-save",
                 Self::DefaultSaved => "default-saved",
                 Self::BeforePinSave => "before-pin-save",
                 Self::PinCommitted => "pin-committed",
@@ -89,7 +99,7 @@ mod gate {
         /// Only the stages immediately before a real write accept a fault.
         #[cfg(debug_assertions)]
         fn accepts_fault(self) -> bool {
-            matches!(self, Self::BeforeIntentSave | Self::BeforePinSave)
+            matches!(self, Self::BeforeDefaultSave | Self::BeforePinSave)
         }
     }
 
@@ -133,6 +143,20 @@ struct PinFile {
     // No serde default: omission is not the version 1 schema.
     #[serde(deserialize_with = "required_option")]
     pending_default: Option<PendingDefault>,
+    /// Absent in every store 0.7.39–0.7.46 wrote, and that is exact: no project
+    /// had a default of its own then (ADR-0067). Empty and absent are one state,
+    /// so the writer omits it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    defaults: Vec<ProjectDefaultRecord>,
+}
+/// One project's established default. Strict like every other record: the
+/// project is a scope this module could have produced, and the image is a
+/// canonical reference that states its digest.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectDefaultRecord {
+    project: String,
+    image: String,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -193,12 +217,36 @@ impl PinRecord {
     }
 }
 
+impl ProjectDefaultRecord {
+    fn validated(&self) -> Result<ProjectDefault> {
+        let project = ProjectId::parse(&self.project).map_err(|()| corrupt())?;
+        let reference = CanonicalOciReference::parse(&self.image).map_err(|_| corrupt())?;
+        // A tag, a non-canonical spelling or an unparseable digest is damage on
+        // every read path, exactly like a pin's fields.
+        if !source_within_limit(self.image.len())
+            || reference.whole() != self.image
+            || reference.digest().is_none()
+            || ImmutableImageRef::parse(&self.image).is_err()
+        {
+            return Err(corrupt());
+        }
+        ProjectDefault::from_canonical(project, reference).map_err(|_| corrupt())
+    }
+    fn of(default: &ProjectDefault) -> Self {
+        Self {
+            project: default.project().as_str().to_owned(),
+            image: default.reference().whole(),
+        }
+    }
+}
+
 impl PinFile {
     fn empty() -> Self {
         Self {
             version: STORE_VERSION,
             pins: Vec::new(),
             pending_default: None,
+            defaults: Vec::new(),
         }
     }
     fn decode(bytes: &[u8]) -> Result<Self> {
@@ -221,10 +269,14 @@ impl PinFile {
         Ok(file)
     }
     fn validate(&self) -> Result<()> {
-        if !pin_count_within_limit(self.pins.len()) {
+        if !pin_count_within_limit(self.pins.len()) || !pin_count_within_limit(self.defaults.len())
+        {
             return Err(corrupt());
         }
         let mut keys = BTreeSet::new();
+        let mut projects = BTreeSet::new();
+        // One uniqueness fact covers both record kinds: a pin is unique by its
+        // whole key, a project default by its project.
         let mut unique = true;
         for record in &self.pins {
             record.validated()?;
@@ -235,6 +287,10 @@ impl PinFile {
                 record.platform.architecture.clone(),
                 record.platform.variant.clone(),
             ));
+        }
+        for record in &self.defaults {
+            record.validated()?;
+            unique &= projects.insert(record.project.clone());
         }
         if !schema_is_acceptable(self.version, unique) {
             return Err(corrupt());
@@ -253,7 +309,8 @@ impl PinFile {
         // restore a backup that does not exist. The byte bound is checked after
         // serializing, because that is where the size is known. Decoding keeps
         // `corrupt()` for an over-bound file on disk: there it *is* damage.
-        if !pin_count_within_limit(self.pins.len()) {
+        if !pin_count_within_limit(self.pins.len()) || !pin_count_within_limit(self.defaults.len())
+        {
             return Err(full());
         }
         self.validate()?;
@@ -271,6 +328,22 @@ impl PinFile {
             }
         }
         Ok(None)
+    }
+    fn project_default(&self, project: &ProjectId) -> Result<Option<ProjectDefault>> {
+        for record in &self.defaults {
+            let default = record.validated()?;
+            if default.project() == project {
+                return Ok(Some(default));
+            }
+        }
+        Ok(None)
+    }
+    /// Insert or replace this project's record; callers decide write-once vs
+    /// compare-and-swap, so this makes no policy decision of its own.
+    fn set_project_default(&mut self, default: ProjectDefault) {
+        self.defaults
+            .retain(|record| record.project != default.project().as_str());
+        self.defaults.push(ProjectDefaultRecord::of(&default));
     }
 }
 
@@ -316,6 +389,37 @@ fn recovery_required() -> anyhow::Error {
     )
 }
 
+/// Whether an observation needs the host record, and why.
+///
+/// The record's own journal (`pending_default`) is always read, whichever
+/// variant applies: it is a fact of the pin store, not of the caller's question.
+enum HostRead<'a> {
+    /// `doctor`, set-default's health check, `load_default`.
+    Always,
+    /// Pin lookups: the host record matters only to validate a pending journal.
+    Never,
+    /// Default-slot selection: read the host only when the project has none.
+    UnlessEstablished(&'a ProjectId),
+}
+
+impl HostRead<'_> {
+    fn reads_host(&self, file: &PinFile) -> Result<bool> {
+        Ok(match self {
+            Self::Always => true,
+            Self::Never => file.pending_default.is_some(),
+            Self::UnlessEstablished(project) => {
+                file.pending_default.is_some() || file.project_default(project)?.is_none()
+            }
+        })
+    }
+
+    /// With no store on disk no project can be established, so a slot
+    /// observation reads the host exactly as `Always` would.
+    fn reads_host_without_store(&self) -> bool {
+        !matches!(self, Self::Never)
+    }
+}
+
 pub(super) struct Store {
     directory: PathBuf,
 }
@@ -348,26 +452,41 @@ impl Store {
     /// A missing lock is rechecked AFTER the legacy snapshot. A newly created
     /// lock forces retry under SH, within the original observation deadline.
     fn observe(&self) -> Result<(PinFile, Option<Vec<u8>>)> {
-        self.observe_slot(true)
+        let (file, host) = self.observe_slot_independently(HostRead::Always)?;
+        Ok((file, host?))
     }
-    fn observe_slot(&self, observe_default: bool) -> Result<(PinFile, Option<Vec<u8>>)> {
+    fn observe_slot(&self, host: HostRead<'_>) -> Result<(PinFile, Option<Vec<u8>>)> {
+        let (file, host) = self.observe_slot_independently(host)?;
+        Ok((file, host?))
+    }
+    /// One shared-lock snapshot, with the host record's failure kept apart from
+    /// the pin file that was read beside it: `doctor` reports both records, and a
+    /// damaged host record must not hide a project default that decoded fine.
+    /// Only the store read itself (lock, record, journal) fails the whole
+    /// observation.
+    fn observe_slot_independently(
+        &self,
+        host: HostRead<'_>,
+    ) -> Result<(PinFile, Result<Option<Vec<u8>>>)> {
         let deadline = Instant::now() + READ_WAIT;
         loop {
             if let Some(lock) = open_lock(&self.lock_path(), false)? {
                 wait(&lock, FlockMode::Shared, deadline, &mut false)?;
                 let file = self.read()?.unwrap_or_else(PinFile::empty);
-                let physical = if observe_default || file.pending_default.is_some() {
-                    default::snapshot_at(&self.directory)?
+                let physical = if host.reads_host(&file)? {
+                    default::snapshot_at(&self.directory)
                 } else {
-                    None
+                    Ok(None)
                 };
-                let logical = logical_default(&file, physical)?;
+                let logical = physical.and_then(|physical| logical_default(&file, physical));
                 return Ok((file, logical));
             }
-            let physical = if observe_default {
-                default::snapshot_at(&self.directory)?
+            // No store exists, so no project can have an established default
+            // and the host record is the only record there is.
+            let physical = if host.reads_host_without_store() {
+                default::snapshot_at(&self.directory)
             } else {
-                None
+                Ok(None)
             };
             let record_present = exists(&self.record())?;
             if exists(&self.lock_path())? {
@@ -383,7 +502,47 @@ impl Store {
         }
     }
     pub(super) fn lookup(&self, key: &PinKey) -> Result<Option<ApprovedPin>> {
-        self.observe_slot(false)?.0.lookup(key)
+        self.observe_slot(HostRead::Never)?.0.lookup(key)
+    }
+    /// The default slot as one project's selection reads it.
+    ///
+    /// The project's own default wins, and only then is the host record read —
+    /// under the same shared-lock hold, so a concurrent writer cannot pair one
+    /// project read with a different host read. A damaged host record therefore
+    /// does not break an established project's selection.
+    pub(super) fn default_slot(&self, project: &ProjectId) -> Result<DefaultSlot> {
+        let (file, logical) = self.observe_slot(HostRead::UnlessEstablished(project))?;
+        match file.project_default(project)? {
+            Some(default) => Ok(DefaultSlot::Project {
+                reference: default.immutable()?,
+                file: self.record(),
+            }),
+            None => Ok(DefaultSlot::Host(
+                logical
+                    .as_deref()
+                    .map(default::decode_snapshot)
+                    .transpose()?,
+            )),
+        }
+    }
+    /// Both default records from one shared-lock read, for `doctor`.
+    ///
+    /// The two rows are returned independently: a host record that cannot be
+    /// read or decoded must not erase a project default that did (R10), and a
+    /// project record that fails still leaves the host row truthful.
+    pub(super) fn observe_defaults(&self, project: Option<&ProjectId>) -> Result<ObservedDefaults> {
+        let (file, host) = self.observe_slot_independently(HostRead::Always)?;
+        Ok(ObservedDefaults {
+            project: match project {
+                Some(project) => file
+                    .project_default(project)
+                    .and_then(|default| default.map(|default| default.immutable()).transpose()),
+                None => Ok(None),
+            },
+            host: host
+                .and_then(|logical| logical.as_deref().map(default::decode_snapshot).transpose()),
+            file: self.record(),
+        })
     }
     /// Validate the logical retained default — the pin store, any pending
     /// journal pair and the physical record — without writing anything.
@@ -458,11 +617,11 @@ impl Store {
         approval: &Approval,
         action: DefaultAction,
     ) -> Result<Committed> {
-        if let DefaultAction::Adopt(reference) = &action {
+        if let Some(reference) = action.retained_reference() {
             self.adoption_binds(&candidate.key, reference)?;
         }
-        let touch_default = !matches!(action, DefaultAction::None);
-        let (old, _locks) = self.begin(touch_default)?;
+        let touch_host = action.initializes_host();
+        let (old, _locks) = self.begin(touch_host)?;
         let current = old.lookup(&candidate.key)?;
         if approval.key != candidate.key || approval.candidate != candidate.digest {
             return Err(anyhow!("image approval does not bind this candidate"));
@@ -518,89 +677,213 @@ impl Store {
             new.pins = kept;
             new.pins.push(PinRecord::of(&pin));
         }
-        let final_bytes = new.encode()?; // Check ALL future writes before intent.
-        let previous = if touch_default {
-            default::snapshot_at(&self.directory)?
-        } else {
-            None
-        };
-        let (proposed, retained) = match action {
-            DefaultAction::None => (None, DefaultChange::Unchanged),
-            DefaultAction::Adopt(reference) if previous.is_none() => (
-                Some(default::encode_snapshot(&reference)?),
-                DefaultChange::Initialized,
-            ),
-            DefaultAction::Adopt(_) => (None, DefaultChange::Unchanged),
-            DefaultAction::Set => {
-                let retained = if previous.is_none() {
-                    DefaultChange::Initialized
-                } else {
-                    DefaultChange::Replaced
-                };
-                (
-                    Some(default::encode_snapshot(&pin.immutable_reference()?)?),
-                    retained,
-                )
-            }
-        };
-        // A semantically identical fallback preserves exact existing bytes.
-        let (proposed, retained) = match proposed {
-            Some(bytes) if fallback_bytes_differ(&previous, &bytes)? => (Some(bytes), retained),
-            _ => (None, DefaultChange::Unchanged),
-        };
-        if let Some(proposed) = proposed {
-            let pending = PendingDefault {
-                previous: previous
-                    .map(String::from_utf8)
-                    .transpose()
-                    .map_err(|_| corrupt())?,
-                proposed: String::from_utf8(proposed).map_err(|_| corrupt())?,
-            };
-            self.publish_default(&old, &final_bytes, pending, atomic_save)?;
-        } else if decision != CommitDecision::AlreadyApproved {
+        let project_default = Self::establish_in(&mut new, &old, &candidate.key.project, &action)?;
+        let final_bytes = new.encode()?; // every future byte checked before the first write
+        // Host first: "host seeded, project not yet established" is a state the
+        // next default-tier use completes (ADR-0067 narrows ADR-0047's
+        // failed-operation guarantee to allow exactly this).
+        self.seed_host_if_absent(&action)?;
+        if decision != CommitDecision::AlreadyApproved
+            || project_default != ProjectDefaultChange::Unchanged
+        {
             gate::checkpoint(gate::Stage::BeforePinSave)?;
             self.save(&final_bytes)?;
-            gate::checkpoint(gate::Stage::PinCommitted)?;
-        } else {
-            gate::checkpoint(gate::Stage::PinCommitted)?;
         }
+        gate::checkpoint(gate::Stage::PinCommitted)?;
         Ok(Committed {
-            approval: approval_change(decision),
-            retained_default: retained,
             pin,
+            project_default,
         })
     }
 
-    /// Retain the default tier's own immutable selection when no fallback exists,
-    /// regardless of the approval for its key.
+    /// The write-once establishment that belongs with **every** successful
+    /// default-tier preparation, not only a first pin.
     ///
-    /// Write-once: a default-tier launch whose key was already pinned (an
-    /// explicit `image refresh` establishes one without adopting) still
-    /// initializes an absent fallback, and an existing fallback is never
-    /// replaced here — only `image set-default` does that.
-    pub(super) fn adopt_default_if_absent(
+    /// A default-tier selection whose key is already approved (an explicit
+    /// `image refresh` pins without establishing) still establishes the project,
+    /// while an established project is left byte-for-byte alone and takes no
+    /// exclusive lock.
+    pub(super) fn establish_default_if_absent(
         &self,
         key: &PinKey,
-        reference: &ImmutableImageRef,
-    ) -> Result<DefaultChange> {
-        self.adoption_binds(key, reference)?;
-        // Warm launches must not recover an interrupted writer's journal or
-        // create locks. Only an absent fallback needs the write transaction.
-        if default::snapshot_at(&self.directory)?.is_some() {
-            return Ok(DefaultChange::Unchanged);
-        }
-        let (old, _locks) = self.begin(true)?;
-        if default::snapshot_at(&self.directory)?.is_some() {
-            return Ok(DefaultChange::Unchanged);
-        }
-        let final_bytes = old.clone().encode()?;
-        let pending = PendingDefault {
-            previous: None,
-            proposed: String::from_utf8(default::encode_snapshot(reference)?)
-                .map_err(|_| corrupt())?,
+        action: &DefaultAction,
+    ) -> Result<ProjectDefaultChange> {
+        let Some(reference) = action.retained_reference() else {
+            return Ok(ProjectDefaultChange::Unchanged);
         };
-        self.publish_default(&old, &final_bytes, pending, atomic_save)?;
-        Ok(DefaultChange::Initialized)
+        self.adoption_binds(key, reference)?;
+        // A warm launch of an established project must not create locks or
+        // recover an interrupted writer's journal.
+        let (file, _logical) = self.observe_slot(HostRead::Never)?;
+        let established = file.project_default(&key.project)?.is_some();
+        let host_present =
+            !action.initializes_host() || default::snapshot_at(&self.directory)?.is_some();
+        if established && host_present {
+            return Ok(ProjectDefaultChange::Unchanged);
+        }
+        let (old, _locks) = self.begin(action.initializes_host())?;
+        let mut new = old.clone();
+        let change = Self::establish_in(&mut new, &old, &key.project, action)?;
+        let final_bytes = new.encode()?;
+        self.seed_host_if_absent(action)?;
+        if change != ProjectDefaultChange::Unchanged {
+            gate::checkpoint(gate::Stage::BeforePinSave)?;
+            self.save(&final_bytes)?;
+            gate::checkpoint(gate::Stage::PinCommitted)?;
+        }
+        Ok(change)
+    }
+
+    /// R7's transaction: one project's established default moves to the host
+    /// record, and the host reference's pin is inserted if it is absent.
+    ///
+    /// Both records live in this one file, so the compare-and-swap on the
+    /// project's default and the pin's first-pin decision are one save.
+    pub(super) fn adopt(
+        &self,
+        candidate: &ValidatedCandidate,
+        adoption: &DefaultAdoption,
+    ) -> Result<Committed> {
+        adoption.binds(candidate)?;
+        let (old, _locks) = self.begin(false)?;
+        if old.project_default(adoption.expected().project())?.as_ref() != Some(adoption.expected())
+        {
+            return Err(anyhow!(
+                "image approval is stale; retry the explicit operation"
+            ));
+        }
+        // The proposed key is immutable, so the proved decision has only three
+        // legitimate outcomes: a first pin, the same digest, or integrity
+        // failure. Reuse it with first-pin facts.
+        let current = old.lookup(&candidate.key)?;
+        let decision = commit_decision(CommitFacts {
+            current_present: current.is_some(),
+            expected_present: false,
+            candidate_equal: current
+                .as_ref()
+                .is_some_and(|pin| pin.digest == candidate.digest),
+            predecessor_matches: false,
+            mutable_source: candidate.key.reference.digest().is_none(),
+            consent: false,
+        });
+        let pin = match decision {
+            CommitDecision::AlreadyApproved => current.ok_or_else(failure)?,
+            CommitDecision::Insert => ApprovedPin {
+                key: candidate.key.clone(),
+                digest: candidate.digest.clone(),
+                revision: PinRevision(1),
+            },
+            _ => return Err(immutable_integrity_failure()),
+        };
+        let mut new = old.clone();
+        if decision == CommitDecision::Insert {
+            new.pins.push(PinRecord::of(&pin));
+        }
+        new.set_project_default(ProjectDefault::new(
+            adoption.expected().project(),
+            adoption.proposed(),
+        )?);
+        let bytes = new.encode()?;
+        gate::checkpoint(gate::Stage::BeforePinSave)?;
+        self.save(&bytes)?;
+        gate::checkpoint(gate::Stage::PinCommitted)?;
+        Ok(Committed {
+            pin,
+            project_default: ProjectDefaultChange::Adopted,
+        })
+    }
+
+    /// `image set-default`: replace only the host's starting choice.
+    ///
+    /// Writes no pin and no project default. Reports whether the invoking
+    /// project already boots the new host child, measured under the same pin
+    /// lock as the write.
+    pub(super) fn set_host_default(
+        &self,
+        retained: &ImmutableImageRef,
+        project: &ProjectId,
+    ) -> Result<HostDefaultSet> {
+        // pin EX then default EX, and this is also where a leftover S1 journal
+        // is recovered before the new bytes are measured.
+        let (file, _locks) = self.begin(true)?;
+        let previous = default::snapshot_at(&self.directory)?;
+        let proposed = default::encode_snapshot(retained)?;
+        let retained_default = if fallback_bytes_differ(&previous, &proposed)? {
+            gate::checkpoint(gate::Stage::BeforeDefaultSave)?;
+            atomic_save(&self.directory.join(SELECTION_FILE), &proposed)?;
+            gate::checkpoint(gate::Stage::DefaultSaved)?;
+            if previous.is_none() {
+                DefaultChange::Initialized
+            } else {
+                DefaultChange::Replaced
+            }
+        } else {
+            DefaultChange::Unchanged
+        };
+        let this_project = match file.project_default(project)? {
+            None => InvokingProject::NotEstablished,
+            Some(own) => {
+                // The content this project boots: its approved child, else the
+                // digest it states (only a hand-edited store has no pin).
+                // A stored project default is always a canonical OCI reference,
+                // so an unusable one is damage rather than a user-input error.
+                let target = OciTarget::parse(own.immutable()?.as_str()).map_err(|_| corrupt())?;
+                let key = PinKey::new(project, &target)?;
+                let boots = match file.lookup(&key)? {
+                    Some(pin) => pin.digest,
+                    None => own.stated_digest(),
+                };
+                // R5 asks whether this project already boots the retained child:
+                // the content, never which repository serves it. A mirror of the
+                // same manifest is the same content.
+                if boots == stated_digest(retained)? {
+                    InvokingProject::AlreadyUses
+                } else {
+                    InvokingProject::KeepsItsOwn
+                }
+            }
+        };
+        Ok(HostDefaultSet {
+            retained_default,
+            this_project,
+        })
+    }
+
+    /// Insert this project's default iff the action establishes and the project
+    /// has none; `SeedHostOnly` and `None` never establish. Shared by `commit`
+    /// and [`Self::establish_default_if_absent`] so the two cannot diverge.
+    fn establish_in(
+        new: &mut PinFile,
+        old: &PinFile,
+        project: &ProjectId,
+        action: &DefaultAction,
+    ) -> Result<ProjectDefaultChange> {
+        let DefaultAction::Establish { reference, .. } = action else {
+            return Ok(ProjectDefaultChange::Unchanged);
+        };
+        if old.project_default(project)?.is_some() {
+            return Ok(ProjectDefaultChange::Unchanged);
+        }
+        new.set_project_default(ProjectDefault::new(project, reference)?);
+        Ok(ProjectDefaultChange::Established)
+    }
+
+    /// Initialize an absent host record with the measured recommendation. Only a
+    /// selection that *was* the initial recommendation (or an unreadable-config
+    /// recommendation, which establishes nothing) reaches this.
+    fn seed_host_if_absent(&self, action: &DefaultAction) -> Result<()> {
+        if !action.initializes_host() {
+            return Ok(());
+        }
+        let reference = action.retained_reference().ok_or_else(failure)?;
+        if default::snapshot_at(&self.directory)?.is_some() {
+            return Ok(());
+        }
+        let bytes = default::encode_snapshot(reference)?;
+        gate::checkpoint(gate::Stage::BeforeDefaultSave)?;
+        atomic_save(&self.directory.join(SELECTION_FILE), &bytes)?;
+        gate::checkpoint(gate::Stage::DefaultSaved)?;
+        Ok(())
     }
 
     /// Adoption only ever binds the validated source of the key it was resolved
@@ -615,38 +898,7 @@ impl Store {
         }
         Ok(())
     }
-    /// The three real writes, with a narrow I/O seam for fault controls. The
-    /// encoder has checked the complete future state before the first write.
-    fn publish_default(
-        &self,
-        old: &PinFile,
-        final_bytes: &[u8],
-        pending: PendingDefault,
-        mut save: impl FnMut(&Path, &[u8]) -> Result<()>,
-    ) -> Result<()> {
-        let mut intent = old.clone();
-        intent.pending_default = Some(pending.clone());
-        let intent_bytes = intent.encode()?;
-        gate::checkpoint(gate::Stage::BeforeIntentSave)?;
-        save(&self.record(), &intent_bytes)?;
-        gate::checkpoint(gate::Stage::IntentSaved)?;
-        let result = save(
-            &self.directory.join(SELECTION_FILE),
-            pending.proposed.as_bytes(),
-        )
-        .and_then(|()| {
-            gate::checkpoint(gate::Stage::DefaultSaved)?;
-            gate::checkpoint(gate::Stage::BeforePinSave)?;
-            save(&self.record(), final_bytes)
-        })
-        .and_then(|()| gate::checkpoint(gate::Stage::PinCommitted));
-        if let Err(error) = result {
-            self.recover_using(&mut intent, &mut save)
-                .map_err(|_| recovery_required())?;
-            return Err(error);
-        }
-        Ok(())
-    }
+
     fn write_default(&self, bytes: Option<&[u8]>) -> Result<()> {
         let path = self.directory.join(SELECTION_FILE);
         if let Some(bytes) = bytes {
@@ -701,20 +953,17 @@ fn fallback_bytes_differ(previous: &Option<Vec<u8>>, proposed: &[u8]) -> Result<
     };
     let previous = default::decode_snapshot(previous)?;
     let proposed = default::decode_snapshot(proposed)?;
-    let canonical = |reference: &ImmutableImageRef| {
-        CanonicalOciReference::parse(reference.as_str()).map_err(|_| corrupt())
-    };
-    Ok(canonical(&previous)? != canonical(&proposed)?)
+    Ok(!same_canonical(previous.as_str(), proposed.as_str())?)
 }
 
-/// The approval decision the compare-and-swap reached, as the caller reports it.
-fn approval_change(decision: CommitDecision) -> ApprovalChange {
-    match decision {
-        CommitDecision::AlreadyApproved => ApprovalChange::Unchanged,
-        CommitDecision::Insert => ApprovalChange::FirstPin,
-        CommitDecision::Replace => ApprovalChange::Replaced,
-        CommitDecision::Conflict => ApprovalChange::Unchanged,
-    }
+/// The digest one immutable reference states: the content half of R5's "already
+/// uses it". `ImmutableImageRef::parse` already required a digest, so a reference
+/// that states none is damage.
+fn stated_digest(reference: &ImmutableImageRef) -> Result<ManifestDigest> {
+    CanonicalOciReference::parse(reference.as_str())
+        .ok()
+        .and_then(|canonical| canonical.digest().cloned())
+        .ok_or_else(corrupt)
 }
 
 /// The exclusive locks one mutation holds; dropping them ends the transaction.
@@ -723,12 +972,10 @@ struct Locks {
     _default: Option<File>,
 }
 
-/// What one host transaction changed, reported per record so a matching pin
-/// with a moved fallback is not reported as "nothing changed".
+/// What one host transaction left behind in the pin store.
 pub(super) struct Committed {
     pub(super) pin: ApprovedPin,
-    pub(super) approval: ApprovalChange,
-    pub(super) retained_default: DefaultChange,
+    pub(super) project_default: ProjectDefaultChange,
 }
 
 fn logical_default(file: &PinFile, physical: Option<Vec<u8>>) -> Result<Option<Vec<u8>>> {
@@ -799,6 +1046,7 @@ fn wait(lock: &File, mode: FlockMode, deadline: Instant, noticed: &mut bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::image_pin::project_default::HostRetention;
     use std::os::unix::fs::PermissionsExt;
 
     /// The rows here assert the committed pin; the reported change set is
@@ -861,6 +1109,7 @@ mod tests {
                 revision: PinRevision(1),
             })],
             pending_default: None,
+            defaults: Vec::new(),
         }
     }
     fn install(store: &Store, file: &PinFile) {
@@ -877,6 +1126,159 @@ mod tests {
     }
     fn replacement(candidate: &ValidatedCandidate, expected: ApprovedPin) -> Approval {
         Approval::replacement(candidate, expected)
+    }
+    /// `repo@<child>`: the immutable spelling of one measured content.
+    fn child(byte: char) -> ImmutableImageRef {
+        ImmutableImageRef::parse(&format!(
+            "docker.io/library/alpine@sha256:{}",
+            byte.to_string().repeat(64)
+        ))
+        .unwrap()
+    }
+    /// A default-tier selection of one canonical repository pinned by digest,
+    /// and the candidate its acquisition measured (`child`).
+    fn selected_in(project: &ProjectId, byte: char) -> (ValidatedCandidate, ImmutableImageRef) {
+        let reference = child(byte);
+        let mut c = candidate_in(project, byte);
+        c.key.reference = CanonicalOciReference::parse(reference.as_str()).unwrap();
+        (c, reference)
+    }
+    fn selected(byte: char) -> (ValidatedCandidate, ImmutableImageRef) {
+        selected_in(&project(), byte)
+    }
+    fn establish(reference: &ImmutableImageRef, host: HostRetention) -> DefaultAction {
+        DefaultAction::Establish {
+            reference: reference.clone(),
+            host,
+        }
+    }
+    fn defaults_of(store: &Store) -> Vec<ProjectDefault> {
+        store
+            .read()
+            .unwrap()
+            .unwrap()
+            .defaults
+            .iter()
+            .map(|record| record.validated().unwrap())
+            .collect()
+    }
+    fn host_default(store: &Store) -> Option<Vec<u8>> {
+        default::snapshot_at(&store.directory).unwrap()
+    }
+    /// The host record's logical reference, compared as a reference so the
+    /// encoder's exact bytes are not the subject of these rows.
+    fn host_reference(store: &Store) -> Option<String> {
+        host_default(store).map(|bytes| {
+            default::decode_snapshot(&bytes)
+                .unwrap()
+                .as_str()
+                .to_owned()
+        })
+    }
+
+    /// Test 1: the bytes 0.7.39–0.7.46 wrote decode as "no project has an
+    /// established default", and re-encoding them omits the field.
+    #[test]
+    fn an_s1_store_decodes_with_no_project_defaults_and_re_encodes_without_the_field() {
+        let s1 = br#"{"version":2,"pins":[],"pending_default":null}"#.to_vec();
+        let decoded = PinFile::decode(&s1).unwrap();
+        assert!(decoded.defaults.is_empty());
+        assert_eq!(decoded.encode().unwrap(), s1);
+        let (_dir, store) = paths();
+        install(&store, &decoded);
+        let file = store.read().unwrap().unwrap();
+        assert!(file.project_default(&project()).unwrap().is_none());
+        assert!(matches!(
+            store.default_slot(&project()).unwrap(),
+            DefaultSlot::Host(_)
+        ));
+    }
+
+    /// Test 2: the new records are strict on every read path, and growth past
+    /// their bound is a full store rather than damage.
+    #[test]
+    fn project_default_records_are_strict() {
+        let valid = child('a');
+        let value: serde_json::Value = serde_json::from_slice(&file().encode().unwrap()).unwrap();
+        let record = |image: serde_json::Value, project: serde_json::Value| {
+            let mut v = value.clone();
+            v["defaults"] = serde_json::json!([{"project": project, "image": image}]);
+            serde_json::to_vec(&v).unwrap()
+        };
+        let mut cases = vec![
+            record(serde_json::json!(valid.as_str()), serde_json::json!("")),
+            record(
+                serde_json::json!(valid.as_str()),
+                serde_json::json!("a".repeat(63)),
+            ),
+            record(
+                serde_json::json!(valid.as_str()),
+                serde_json::json!("A".repeat(64)),
+            ),
+            // A tag is never a project default.
+            record(
+                serde_json::json!("docker.io/library/alpine:latest"),
+                serde_json::json!("a".repeat(64)),
+            ),
+            // Nor is a non-canonical spelling or a short digest.
+            record(
+                serde_json::json!(format!("alpine@sha256:{}", "a".repeat(64))),
+                serde_json::json!("a".repeat(64)),
+            ),
+            record(
+                serde_json::json!("docker.io/library/alpine@sha256:00ff"),
+                serde_json::json!("a".repeat(64)),
+            ),
+            record(
+                serde_json::json!("/rootfs"),
+                serde_json::json!("a".repeat(64)),
+            ),
+        ];
+        // An unknown field inside a record, `null`, and a duplicate project.
+        let mut unknown = value.clone();
+        unknown["defaults"] = serde_json::json!([{
+            "project": "a".repeat(64),
+            "image": valid.as_str(),
+            "extra": 1
+        }]);
+        cases.push(serde_json::to_vec(&unknown).unwrap());
+        let mut null = value.clone();
+        null["defaults"] = serde_json::json!(null);
+        cases.push(serde_json::to_vec(&null).unwrap());
+        let mut duplicate = value.clone();
+        let entry = serde_json::json!({"project": "a".repeat(64), "image": valid.as_str()});
+        duplicate["defaults"] = serde_json::json!([entry, entry]);
+        cases.push(serde_json::to_vec(&duplicate).unwrap());
+        for (i, bytes) in cases.iter().enumerate() {
+            let error = PinFile::decode(bytes)
+                .err()
+                .unwrap_or_else(|| panic!("accepted project-default corruption case {i}"));
+            assert_eq!(format!("{error:#}"), error.to_string());
+            assert!(!error.to_string().contains("alpine"));
+        }
+        assert!(
+            PinFile::decode(&record(
+                serde_json::json!(valid.as_str()),
+                serde_json::json!("a".repeat(64))
+            ))
+            .is_ok()
+        );
+
+        // 4097 records decode as damage, and growing to them is a full store.
+        let mut f = file();
+        f.defaults = (0..4096)
+            .map(|i| ProjectDefaultRecord {
+                project: format!("{i:064x}"),
+                image: valid.as_str().to_string(),
+            })
+            .collect();
+        let bytes = f.encode().unwrap();
+        assert!(PinFile::decode(&bytes).is_ok());
+        f.defaults.push(ProjectDefaultRecord {
+            project: "f".repeat(64),
+            image: valid.as_str().to_string(),
+        });
+        assert!(f.encode().is_err());
     }
 
     #[test]
@@ -1116,7 +1518,7 @@ mod tests {
         let old = store.lookup(&a.key).unwrap().unwrap();
         assert!(
             store
-                .commit_pin(&b, &replacement(&b, old), DefaultAction::Set)
+                .commit_pin(&b, &replacement(&b, old), DefaultAction::None)
                 .is_err()
         );
         assert!(store.read().unwrap().unwrap().pending_default.is_none());
@@ -1186,46 +1588,103 @@ mod tests {
         }
     }
 
+    /// Test 6: `image set-default` writes only the host record, keeps an
+    /// equivalent spelling byte-for-byte, and reports what the invoking project
+    /// boots from the same under-lock read.
     #[test]
-    fn default_transaction_preintent_and_after_commit_preserve_exact_bytes() {
+    fn set_host_default_writes_only_the_host_record() {
         let (_dir, store) = paths();
         let a = candidate('a');
-        let b = candidate('b');
-        let old = store
+        store
             .commit_pin(&a, &Approval::initial(&a), DefaultAction::None)
             .unwrap();
-        let previous = String::from_utf8(default_bytes('a'))
-            .unwrap()
-            .replace("docker.io/library/alpine", "alpine")
-            .into_bytes();
-        store.write_default(Some(&previous)).unwrap();
-        // Same digest default must preserve formatting and legacy spelling.
-        store
-            .commit_pin(&a, &Approval::initial(&a), DefaultAction::Set)
-            .unwrap();
-        assert_eq!(
-            default::snapshot_at(&store.directory).unwrap().unwrap(),
-            previous
-        );
-        // A stale failure has no intent and does not move the fallback.
+        let pins = std::fs::read(store.record()).unwrap();
+        let outcome = store.set_host_default(&child('b'), &project()).unwrap();
+        assert_eq!(outcome.retained_default, DefaultChange::Initialized);
+        assert_eq!(outcome.this_project, InvokingProject::NotEstablished);
         assert!(
-            store
-                .commit_pin(&b, &Approval::initial(&b), DefaultAction::Set)
-                .is_err()
+            store.read().unwrap().unwrap().pending_default.is_none(),
+            "AC12: set-default's host save commits no journal"
         );
         assert_eq!(
-            default::snapshot_at(&store.directory).unwrap().unwrap(),
-            previous
+            std::fs::read(store.record()).unwrap(),
+            pins,
+            "no pin written"
         );
-        let new = store
-            .commit_pin(&b, &replacement(&b, old), DefaultAction::Set)
+        assert_eq!(host_reference(&store).unwrap(), child('b').as_str());
+
+        // An established project that boots other content keeps its own default,
+        // and nothing about the project's record changes.
+        let (selected_a, reference_a) = selected('a');
+        store
+            .commit(
+                &selected_a,
+                &Approval::initial(&selected_a),
+                establish(&reference_a, HostRetention::Keep),
+            )
             .unwrap();
-        assert_eq!(new.digest, b.digest);
-        assert!(store.read().unwrap().unwrap().pending_default.is_none());
+        let pins = std::fs::read(store.record()).unwrap();
+        let outcome = store.set_host_default(&child('c'), &project()).unwrap();
+        assert_eq!(outcome.retained_default, DefaultChange::Replaced);
+        assert_eq!(outcome.this_project, InvokingProject::KeepsItsOwn);
+        assert_eq!(std::fs::read(store.record()).unwrap(), pins);
+        assert_eq!(host_reference(&store).unwrap(), child('c').as_str());
         assert_eq!(
-            store.load_default().unwrap().unwrap().as_str(),
-            b.key.reference.with_digest(&b.digest).unwrap().whole()
+            defaults_of(&store)[0].reference().whole(),
+            reference_a.as_str()
         );
+
+        // An index default whose approved child is the new host child already
+        // uses it, even though it boots a different reference.
+        let other_project = ProjectId::for_tests('b');
+        let (index, reference_index) = selected_in(&other_project, 'd');
+        store
+            .commit(
+                &index,
+                &Approval::initial(&index),
+                establish(&reference_index, HostRetention::Keep),
+            )
+            .unwrap();
+        let outcome = store.set_host_default(&child('d'), &other_project).unwrap();
+        assert_eq!(outcome.this_project, InvokingProject::AlreadyUses);
+
+        // The same booted child served by another repository is still "already
+        // uses it" (R5): the disposition compares content, not repository
+        // identity, so a mirror of the manifest does not read as different
+        // content.
+        let mirrored_project = ProjectId::for_tests('c');
+        let elsewhere =
+            ImmutableImageRef::parse(&format!("ghcr.io/example/mirror@sha256:{}", "e".repeat(64)))
+                .unwrap();
+        let mut mirrored = candidate_in(&mirrored_project, 'e');
+        mirrored.key.reference = CanonicalOciReference::parse(elsewhere.as_str()).unwrap();
+        store
+            .commit(
+                &mirrored,
+                &Approval::initial(&mirrored),
+                establish(&elsewhere, HostRetention::Keep),
+            )
+            .unwrap();
+        let outcome = store
+            .set_host_default(&child('e'), &mirrored_project)
+            .unwrap();
+        assert_eq!(
+            outcome.this_project,
+            InvokingProject::AlreadyUses,
+            "same content in another repository already boots"
+        );
+
+        // A semantically identical record preserves the user's exact bytes,
+        // including a legacy spelling.
+        let hand = format!(
+            "{{ \"image\": \"alpine@sha256:{}\", \"version\": 1 }}\n",
+            "c".repeat(64)
+        )
+        .into_bytes();
+        std::fs::write(store.directory.join(SELECTION_FILE), &hand).unwrap();
+        let outcome = store.set_host_default(&child('c'), &project()).unwrap();
+        assert_eq!(outcome.retained_default, DefaultChange::Unchanged);
+        assert_eq!(host_default(&store).unwrap(), hand);
         for path in [
             store.record(),
             store.lock_path(),
@@ -1237,6 +1696,30 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    /// Test 7: a leftover S1 journal is recovered by the next write, so
+    /// set-default's host save never stacks on an unrecovered transaction.
+    #[test]
+    fn set_host_default_recovers_an_s1_journal_before_writing() {
+        let (_dir, store) = paths();
+        let previous = default_bytes('a');
+        let proposed = String::from_utf8(default_bytes('b')).unwrap();
+        let mut f = file();
+        f.pending_default = Some(PendingDefault {
+            previous: Some(String::from_utf8(previous.clone()).unwrap()),
+            proposed: proposed.clone(),
+        });
+        install(&store, &f);
+        // An interrupted 0.7.46 run: the pin store names the old bytes, the host
+        // record already holds the proposed ones.
+        store.write_default(Some(proposed.as_bytes())).unwrap();
+        assert_eq!(store.observe().unwrap().1.unwrap(), previous);
+
+        let outcome = store.set_host_default(&child('c'), &project()).unwrap();
+        assert_eq!(outcome.retained_default, DefaultChange::Replaced);
+        assert!(store.read().unwrap().unwrap().pending_default.is_none());
+        assert_eq!(host_reference(&store).unwrap(), child('c').as_str());
     }
 
     #[test]
@@ -1330,51 +1813,37 @@ mod tests {
             assert!(!store.record().exists());
         }
     }
+    /// Test 11: a journal 0.7.39–0.7.46 wrote is still the authority. A restore
+    /// that cannot be written demands recovery and keeps the journal; a later
+    /// write recovers it.
     #[test]
     fn journal_real_write_failures_roll_back_or_require_recovery() {
-        for failed_write in [1, 2, 3] {
-            for fail_restore in [false, true] {
-                let (_dir, store) = paths();
-                let old = file();
-                install(&store, &old);
-                let previous = default_bytes('a');
-                store.write_default(Some(&previous)).unwrap();
-                let old_bytes = std::fs::read(store.record()).unwrap();
-                let mut new = old.clone();
-                new.pins[0].manifest_digest = candidate('b').digest.as_str().into();
-                new.pins[0].revision = 2;
-                let pending = PendingDefault {
-                    previous: Some(String::from_utf8(previous.clone()).unwrap()),
-                    proposed: String::from_utf8(default_bytes('b')).unwrap(),
-                };
-                let mut writes = 0;
-                let error = store
-                    .publish_default(&old, &new.encode().unwrap(), pending, |path, bytes| {
-                        writes += 1;
-                        if writes == failed_write || (fail_restore && writes > failed_write) {
-                            return Err(failure());
-                        }
-                        atomic_save(path, bytes)
-                    })
-                    .unwrap_err();
-                if fail_restore && failed_write > 1 {
-                    assert!(error.to_string().contains("requires recovery"));
-                    assert!(store.read().unwrap().unwrap().pending_default.is_some());
-                    // Logical old remains observable without clearing intent.
-                    assert_eq!(store.observe().unwrap().1.unwrap(), previous);
-                    let a = candidate('a');
-                    store
-                        .commit_pin(&a, &Approval::initial(&a), DefaultAction::None)
-                        .unwrap();
-                }
-                assert!(store.read().unwrap().unwrap().pending_default.is_none());
-                assert_eq!(
-                    default::snapshot_at(&store.directory).unwrap().unwrap(),
-                    previous
-                );
-                assert_eq!(std::fs::read(store.record()).unwrap(), old_bytes);
-            }
-        }
+        let (_dir, store) = paths();
+        let previous = default_bytes('a');
+        let proposed = String::from_utf8(default_bytes('b')).unwrap();
+        let mut f = file();
+        f.pending_default = Some(PendingDefault {
+            previous: Some(String::from_utf8(previous.clone()).unwrap()),
+            proposed: proposed.clone(),
+        });
+        install(&store, &f);
+        // Interrupted after the host save.
+        store.write_default(Some(proposed.as_bytes())).unwrap();
+        let mut file = store.read().unwrap().unwrap();
+        let error = store
+            .recover_using(&mut file, &mut |_path, _bytes| Err(failure()))
+            .unwrap_err();
+        assert!(error.to_string().contains("requires recovery"), "{error}");
+        assert!(store.read().unwrap().unwrap().pending_default.is_some());
+        // The logical old bytes stay observable without clearing the intent.
+        assert_eq!(store.observe().unwrap().1.unwrap(), previous);
+
+        let a = candidate('a');
+        store
+            .commit_pin(&a, &Approval::initial(&a), DefaultAction::None)
+            .unwrap();
+        assert!(store.read().unwrap().unwrap().pending_default.is_none());
+        assert_eq!(host_default(&store).unwrap(), previous);
     }
 
     #[test]
@@ -1403,91 +1872,171 @@ mod tests {
         });
     }
 
+    /// Test 3 + 4: one save carries the first pin and the project's default,
+    /// keyed by the *selected* reference; a recommendation selection also seeds
+    /// an absent host record first.
     #[test]
-    fn automatic_adoption_binds_original_immutable_source() {
+    fn a_first_default_pin_establishes_the_project_in_one_save() {
+        for host in [HostRetention::Keep, HostRetention::InitializeIfAbsent] {
+            let (_dir, store) = paths();
+            let (c, reference) = selected('a');
+            let committed = store
+                .commit(&c, &Approval::initial(&c), establish(&reference, host))
+                .unwrap();
+            assert_eq!(committed.project_default, ProjectDefaultChange::Established);
+            let file = store.read().unwrap().unwrap();
+            assert_eq!(file.pins.len(), 1);
+            assert_eq!(file.defaults.len(), 1);
+            assert_eq!(file.defaults[0].image, reference.as_str());
+            assert_eq!(file.defaults[0].project, project().as_str());
+            assert!(file.pending_default.is_none());
+            assert_eq!(
+                host_default(&store).is_some(),
+                host == HostRetention::InitializeIfAbsent
+            );
+        }
+    }
+
+    /// Test 4: host-first ordering. The recommendation initializes an absent
+    /// host record, and a project default never does.
+    #[test]
+    fn the_recommendation_seeds_an_absent_host_record_first() {
         let (_dir, store) = paths();
-        let mut c = candidate('b');
-        let original = default_bytes('a');
-        let source = default::decode_snapshot(&original).unwrap();
-        c.key.reference = CanonicalOciReference::parse(source.as_str()).unwrap();
-        // Index A→host child B: retain A verbatim, pin B separately.
+        let (c, reference) = selected('a');
         store
-            .commit_pin(
+            .commit(
                 &c,
                 &Approval::initial(&c),
-                DefaultAction::Adopt(source.clone()),
+                establish(&reference, HostRetention::InitializeIfAbsent),
             )
             .unwrap();
-        assert_eq!(store.load_default().unwrap().unwrap(), source);
-        let before = default::snapshot_at(&store.directory).unwrap();
-        let unrelated = default::decode_snapshot(&default_bytes('c')).unwrap();
+        assert_eq!(host_reference(&store).unwrap(), child('a').as_str());
+
+        // A selection read from an existing host record leaves those bytes alone.
+        let other = ProjectId::for_tests('b');
+        let (d, reference_d) = selected_in(&other, 'f');
+        let host_bytes = host_default(&store).unwrap();
+        store
+            .commit(
+                &d,
+                &Approval::initial(&d),
+                establish(&reference_d, HostRetention::Keep),
+            )
+            .unwrap();
+        assert_eq!(host_default(&store).unwrap(), host_bytes);
+    }
+
+    /// Test 5: write-once per project. A second establishment in the same
+    /// project never moves it; another project establishes independently.
+    #[test]
+    fn establishment_is_write_once_and_per_project() {
+        let (_dir, store) = paths();
+        let (a, reference_a) = selected('a');
+        store
+            .commit(
+                &a,
+                &Approval::initial(&a),
+                establish(&reference_a, HostRetention::Keep),
+            )
+            .unwrap();
+        let (b, reference_b) = selected('b');
+        let committed = store
+            .commit(
+                &b,
+                &Approval::initial(&b),
+                establish(&reference_b, HostRetention::Keep),
+            )
+            .unwrap();
+        assert_eq!(committed.project_default, ProjectDefaultChange::Unchanged);
+        assert_eq!(
+            defaults_of(&store)[0].reference().whole(),
+            reference_a.as_str()
+        );
+
+        let other = ProjectId::for_tests('b');
+        let (d, reference_d) = selected_in(&other, 'f');
+        store
+            .commit(
+                &d,
+                &Approval::initial(&d),
+                establish(&reference_d, HostRetention::Keep),
+            )
+            .unwrap();
+        let defaults = defaults_of(&store);
+        assert_eq!(defaults.len(), 2);
+        assert_eq!(
+            defaults
+                .iter()
+                .find(|default| default.project() == &other)
+                .unwrap()
+                .reference()
+                .whole(),
+            reference_d.as_str()
+        );
+    }
+
+    /// The warm path shares that write-once rule without creating locks when the
+    /// project is already established.
+    #[test]
+    fn warm_establishment_validates_the_record_without_creating_locks() {
+        let (_dir, store) = paths();
+        let (c, reference) = selected('a');
+        store
+            .commit(
+                &c,
+                &Approval::initial(&c),
+                establish(&reference, HostRetention::Keep),
+            )
+            .unwrap();
+        let record = store.record();
+        let pins = std::fs::read(&record).unwrap();
+        let bars = std::fs::read(store.lock_path()).unwrap();
+        assert_eq!(
+            store
+                .establish_default_if_absent(&c.key, &establish(&reference, HostRetention::Keep))
+                .unwrap(),
+            ProjectDefaultChange::Unchanged
+        );
+        assert_eq!(std::fs::read(&record).unwrap(), pins);
+        assert_eq!(std::fs::read(store.lock_path()).unwrap(), bars);
+        // A reference that does not bind this key's own source is refused.
+        let unrelated = child('b');
         assert!(
             store
-                .commit_pin(&c, &Approval::initial(&c), DefaultAction::Adopt(unrelated))
+                .establish_default_if_absent(&c.key, &establish(&unrelated, HostRetention::Keep))
                 .is_err()
         );
-        assert_eq!(default::snapshot_at(&store.directory).unwrap(), before);
-    }
-    #[test]
-    fn warm_adoption_validates_the_record_without_creating_locks() {
-        let (_dir, store) = paths();
-        let mut c = candidate('a');
-        let retained = default::decode_snapshot(&default_bytes('a')).unwrap();
-        c.key.reference = CanonicalOciReference::parse(retained.as_str()).unwrap();
-        std::fs::create_dir_all(&store.directory).unwrap();
-        let record = store.directory.join(SELECTION_FILE);
-        std::fs::write(&record, default_bytes('a')).unwrap();
-        assert_eq!(
-            store.adopt_default_if_absent(&c.key, &retained).unwrap(),
-            DefaultChange::Unchanged
-        );
-        std::fs::write(&record, b"corrupt").unwrap();
-        assert!(store.adopt_default_if_absent(&c.key, &retained).is_err());
-        assert!(!store.lock_path().exists());
-        assert!(!store.directory.join(DEFAULT_LOCK_FILE).exists());
-        assert!(!store.record().exists());
+        assert_eq!(std::fs::read(&record).unwrap(), pins);
     }
 
     #[test]
-    fn matching_pin_reports_a_replaced_fallback() {
+    fn write_once_establishment_initializes_an_absent_host_record_only() {
         let (_dir, store) = paths();
-        let c = candidate('a');
-        store
-            .commit_pin(&c, &Approval::initial(&c), DefaultAction::None)
-            .unwrap();
-        std::fs::write(store.directory.join(SELECTION_FILE), default_bytes('b')).unwrap();
-        let before = std::fs::read(store.record()).unwrap();
-        let committed = store
-            .commit(&c, &Approval::initial(&c), DefaultAction::Set)
-            .unwrap();
-        assert_eq!(committed.approval, ApprovalChange::Unchanged);
-        assert_eq!(committed.retained_default, DefaultChange::Replaced);
-        assert_eq!(std::fs::read(store.record()).unwrap(), before);
-        assert_eq!(
-            store.load_default().unwrap().unwrap(),
-            committed.pin.immutable_reference().unwrap()
-        );
-    }
-
-    #[test]
-    fn write_once_adoption_initializes_an_absent_fallback_only() {
-        let (_dir, store) = paths();
-        let mut c = candidate('b');
-        let retained = default::decode_snapshot(&default_bytes('a')).unwrap();
-        c.key.reference = CanonicalOciReference::parse(retained.as_str()).unwrap();
-        // An existing approval is no obstacle: retention is a separate record.
+        let (c, reference) = selected('a');
+        // An existing approval is no obstacle: the project default is a
+        // separate record in the same file.
         store
             .commit_pin(&c, &Approval::initial(&c), DefaultAction::None)
             .unwrap();
         assert_eq!(
-            store.adopt_default_if_absent(&c.key, &retained).unwrap(),
-            DefaultChange::Initialized
+            store
+                .establish_default_if_absent(
+                    &c.key,
+                    &establish(&reference, HostRetention::InitializeIfAbsent)
+                )
+                .unwrap(),
+            ProjectDefaultChange::Established
         );
-        assert_eq!(store.load_default().unwrap().unwrap(), retained);
+        assert_eq!(host_reference(&store).unwrap(), child('a').as_str());
         let bytes = std::fs::read(store.directory.join(SELECTION_FILE)).unwrap();
         assert_eq!(
-            store.adopt_default_if_absent(&c.key, &retained).unwrap(),
-            DefaultChange::Unchanged
+            store
+                .establish_default_if_absent(
+                    &c.key,
+                    &establish(&reference, HostRetention::InitializeIfAbsent)
+                )
+                .unwrap(),
+            ProjectDefaultChange::Unchanged
         );
         assert_eq!(
             std::fs::read(store.directory.join(SELECTION_FILE)).unwrap(),
@@ -1495,12 +2044,127 @@ mod tests {
         );
         // A record that does not name this key's own source is refused rather
         // than retained: it would authorize content nothing measured.
-        let unrelated = default::decode_snapshot(&default_bytes('c')).unwrap();
-        assert!(store.adopt_default_if_absent(&c.key, &unrelated).is_err());
+        let unrelated = child('c');
+        assert!(
+            store
+                .establish_default_if_absent(
+                    &c.key,
+                    &establish(&unrelated, HostRetention::InitializeIfAbsent)
+                )
+                .is_err()
+        );
         assert_eq!(
             std::fs::read(store.directory.join(SELECTION_FILE)).unwrap(),
             bytes
         );
+    }
+
+    /// Test 8: adoption is a compare-and-swap on the project default that was
+    /// read, and the host reference's pin enters in the same save.
+    #[test]
+    fn adoption_is_a_compare_and_swap_on_the_read_default() {
+        let (_dir, store) = paths();
+        let (a, reference_a) = selected('a');
+        store
+            .commit(
+                &a,
+                &Approval::initial(&a),
+                establish(&reference_a, HostRetention::Keep),
+            )
+            .unwrap();
+        let expected = store
+            .read()
+            .unwrap()
+            .unwrap()
+            .project_default(&project())
+            .unwrap()
+            .unwrap();
+        let (host, reference_host) = selected('b');
+        let adoption = DefaultAdoption::new(expected.clone(), reference_host.clone(), &host);
+        let committed = store.adopt(&host, &adoption).unwrap();
+        assert_eq!(committed.project_default, ProjectDefaultChange::Adopted);
+        let file = store.read().unwrap().unwrap();
+        assert_eq!(file.defaults[0].image, reference_host.as_str());
+        assert!(file.lookup(&host.key).unwrap().is_some());
+        assert!(
+            file.pending_default.is_none(),
+            "AC12: adoption commits no journal"
+        );
+        let bytes = std::fs::read(store.record()).unwrap();
+
+        // A second adoption against the default that was read is stale: the
+        // candidate binds, but the project's default moved.
+        drop(host);
+        let (host, _) = selected('b');
+        let stale = DefaultAdoption::new(expected, reference_host.clone(), &host);
+        let error = store
+            .adopt(&host, &stale)
+            .err()
+            .expect("a stale adoption is refused");
+        assert!(
+            error
+                .to_string()
+                .contains("image approval is stale; retry the explicit operation"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(store.record()).unwrap(), bytes);
+    }
+
+    /// Test 9: the host reference is immutable, so adopting different content
+    /// for the same reference is an integrity failure, not a replacement.
+    #[test]
+    fn adoption_of_an_immutable_key_never_replaces_another_digest() {
+        let (_dir, store) = paths();
+        let (a, reference_a) = selected('a');
+        let expected = ProjectDefault::new(&project(), &reference_a).unwrap();
+        let mut f = PinFile::empty();
+        // The established default, already approved at other content for its
+        // own immutable key. Only a hand edit (or a registry serving different
+        // bytes for one digest) can produce this.
+        f.pins.push(PinRecord::of(&ApprovedPin {
+            key: a.key.clone(),
+            digest: ManifestDigest::parse(&format!("sha256:{}", "c".repeat(64))).unwrap(),
+            revision: PinRevision(1),
+        }));
+        f.set_project_default(expected.clone());
+        install(&store, &f);
+        let bytes = std::fs::read(store.record()).unwrap();
+        let mut proposed_candidate = candidate('b');
+        proposed_candidate.key.reference =
+            CanonicalOciReference::parse(reference_a.as_str()).unwrap();
+        let adoption = DefaultAdoption::new(expected, reference_a.clone(), &proposed_candidate);
+        let error = store
+            .adopt(&proposed_candidate, &adoption)
+            .err()
+            .expect("an immutable key never replaces");
+        assert!(error.to_string().contains("integrity failure"), "{error}");
+        assert_eq!(std::fs::read(store.record()).unwrap(), bytes);
+    }
+
+    /// Test 10: an established project's slot never reads the host record, so a
+    /// damaged one does not break its selection.
+    #[test]
+    fn the_default_slot_ignores_the_host_record_for_an_established_project() {
+        let (_dir, store) = paths();
+        let (a, reference_a) = selected('a');
+        store
+            .commit(
+                &a,
+                &Approval::initial(&a),
+                establish(&reference_a, HostRetention::Keep),
+            )
+            .unwrap();
+        std::fs::write(store.directory.join(SELECTION_FILE), b"damaged host record").unwrap();
+        match store.default_slot(&project()).unwrap() {
+            DefaultSlot::Project { reference, file } => {
+                assert_eq!(reference.as_str(), reference_a.as_str());
+                assert_eq!(file, store.record());
+            }
+            DefaultSlot::Host(_) => panic!("an established project selects its own default"),
+        }
+        // A project without one still reads — and refuses — the damaged host
+        // record: damage is never absence.
+        assert!(store.default_slot(&ProjectId::for_tests('b')).is_err());
     }
 
     #[test]
@@ -1522,9 +2186,8 @@ mod tests {
         )
         .unwrap();
         let start = Instant::now();
-        let error = store
-            .commit_pin(&a, &Approval::initial(&a), DefaultAction::Set)
-            .unwrap_err();
+        // set-default takes pin EX then default EX, the one path that needs both.
+        let error = store.set_host_default(&child('b'), &project()).unwrap_err();
         assert!(error.to_string().contains("timed out"));
         assert!(start.elapsed() >= WRITE_WAIT);
         // One budget, not two: a run that also spent the pin's share before the
@@ -1670,9 +2333,7 @@ mod tests {
             store
                 .commit_pin(&a, &Approval::initial(&a), DefaultAction::None)
                 .unwrap_err(),
-            store
-                .commit_pin(&a, &Approval::initial(&a), DefaultAction::Set)
-                .unwrap_err(),
+            store.set_host_default(&child('b'), &project()).unwrap_err(),
             store.load_default().unwrap_err(),
         ] {
             let text = format!("{error:#}");

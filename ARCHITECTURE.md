@@ -60,12 +60,13 @@ crates/agent-vm/src/
 ├── config_authority.rs     # ADR-0040 verified read: one gate for [network], mounts,
 │                           #   mount_sets and egress_sets (four presence triggers)
 ├── boot_image.rs           # the one boot-image selection seam (CLI/env/config/default)
-│   ├── default_selection.rs#   journal-aware logical default read (bounded shared lock)
+│   ├── default_selection.rs#   journal-aware host starting choice (bounded shared lock)
 │   └── upgrade.rs          #   set-default command shape: explicit typed target
 ├── project.rs              # the one project capture (canonical cwd → session + approval scope)
-├── image_pin.rs            # project-scoped OCI approval: prepare before create, explicit update
-│   ├── store.rs            #   strict HOME pin store, CAS kernel, journaled default transaction
-│   └── approval.rs         #   candidate-scoped terminal consent (--yes or a real TTY)
+├── image_pin.rs            # project-scoped OCI approval: prepare before create, explicit refresh
+│   ├── project_default.rs  #   a project's own default and the host starting choice
+│   ├── store.rs            #   strict HOME pin store, CAS kernel, project defaults, S1 journal recovery
+│   └── approval.rs         #   renders and mints explicit-command consent (nothing is asked)
 ├── image_acquire.rs        # shared boot-free acquisition: canonical target, validated token, barrier
 │   ├── reference.rs        #   the one canonical OCI target (cache/acquisition key)
 │   ├── receipt.rs          #   cache-only validated-content receipt (never approval)
@@ -1111,31 +1112,41 @@ selected image verbatim (see
 ```text
 [CLI/env/config tiers] ─┐
                         ├─► boot_image::select ─► image_pin::prepare_selected ─► SandboxBuilder.image(repo@child)
-[retained default] ─────┘       (lazy, fallible)               │                              │
-   │  user/project config wins over it; an absent              │  no pin: acquire source      │ create (IfMissing)
-   │  record falls back to the recommendation                  │  validate · commit first pin  ▼
-   ▼                                                           │  with pin: consume child    guest
-$HOME/.config/agent-vm/default-image.json ◄───────────────────┴─ (default-tier first pin only,
-   (digest-only fallback, #392)                                    after acquisition success)
-$HOME/.config/agent-vm/image-pins.json ◄───────────── project approval, every OCI source
-$HOME/.config/agent-vm/image-pins.lock
+[project default] ──────┤       (lazy, fallible)               │                              │
+[retained default] ─────┘                                      │  no pin: acquire source      │ create (IfMissing)
+   │  a higher tier wins over them; the host record            │  validate · commit first pin ▼
+   │  is read only when the project has no default             │  with pin: consume child    guest
+   ▼                                                           │
+$HOME/.config/agent-vm/image-pins.json ◄───────────────────────┴─ project approval (every OCI source)
+   (project defaults, #541)                                       + the project's own default,
+$HOME/.config/agent-vm/image-pins.lock                             one save after acquisition
+$HOME/.config/agent-vm/default-image.json ◄── image set-default, and a first pin whose
+   (digest-only starting choice, #392)          selection was the recommendation
+                                                (the host starting choice)
+   (digest-only starting choice, #392)
 ```
 
-The **saved selection is not the image cache.** The record names exact content;
-msb owns the bytes and may refetch a missing layer. It is also not a project or
-launcher-version artifact: it lives with the user-scoped settings, so a new
-project, a cleared cache or a new `AGENT_VM_STATE_DIR` leaves it alone. Reading
-it is lazy and read-only, which is why `help` and `doctor` touch nothing;
-automatic adoption happens only after a default-tier image is actually acquired,
-and it happens for every successful default-tier preparation — not only a first
-pin — while staying write-once, so an existing record is never moved by a launch.
+The **saved selection is not the image cache.** A record names exact content; msb
+owns the bytes and may refetch a missing layer. The records are not project or
+launcher-version artifacts: they live with the user-scoped settings, so a new
+project, a cleared cache or a new `AGENT_VM_STATE_DIR` leaves them alone. Reading
+them is lazy and read-only, which is why `help`, `image show` and `doctor` may
+touch nothing. The default slot is, in order, the **project's own default**, the
+host's **retained default**, and the initial recommendation; the host record is
+read only when the project has none, so a damaged host record cannot break an
+established project. A project establishes its default write-once on its first
+successful default-tier preparation, after the image was acquired, in the same
+save as its first pin. Launch and `setup` never move an established default;
+`image set-default` writes only the host record, and only an explicit
+`image refresh` may adopt a different host record (ADR-0067).
 
 **Approval is not cache evidence either.** Every OCI selection — from any tier —
 is keyed by **`(project, canonical reference, host Linux platform)`** in
 `image-pins.json`. A launch or setup consumes the approved host child and never
-resolves the selected tag; only `image refresh` and `image set-default`
-re-resolve and ask, and `image build`/`image import` approve the result reference
-they just published without asking (#391). The *file* is host-managed and shared
+resolves the selected tag; only `image refresh` re-resolves and approves
+(asking nothing), `image set-default` resolves its target and approves nothing,
+and `image build`/`image import` approve the result reference they just published
+without asking (#391). The *file* is host-managed and shared
 by every project, but each record is scoped to the **project** the command
 captured, so one project's approval is never another's. Neither the state root
 nor the cache is a scope: the store holds no cache path, timestamp or launcher
@@ -1160,13 +1171,11 @@ Explicit `image set-default` adds a separate edge:
 image set-default --image REF
   → canonical typed target (ambient selection ignored)
   → healthy pin/default snapshot → resolve current registry content ONCE
-  → validated candidate → approval (first/unchanged: none; changed: prompt or --yes)
-  → revalidate the frozen candidate under a fresh shared barrier
-  → shared cache barrier → pin EX → default EX (journaled transaction)
-      atomic pin store {old pins, pending_default}
-      atomic default    {approved host child}
-      atomic pin store {new pins, no intent}          ← commit
+  → validated candidate (no approval is written; nothing is asked)
+  → shared cache barrier → pin EX → default EX (recovers a leftover S1 journal)
+      atomic default {approved host child}             ← commit, one save
   → release; completion output is best-effort
+  → the notice says whether this project keeps its own default
 ```
 
 One resolution per invocation: `AcquireMode::ResolveCurrent` preserves the
@@ -1175,29 +1184,32 @@ resolved twice and no duplicate derived pull is needed. The returned host
 manifest digest, not an index digest or moving tag, is retained. Native auth/TLS, OCI integrity,
 materialization and cache I/O are trusted runtime operations. The small platform
 conjunction is proved; JSON decoding and platform comparisons are trusted.
-Acquisition, the prompt and revalidation run outside the HOME locks. The host
-transaction is a compare-and-swap on the revision and digest that were
-displayed: same-pin replacement preserves bytes, a peer that moved the pin first
-makes this operation fail, and automatic adoption stays insert-if-absent.
-Interruption before the final pin write leaves the old pins plus a bounded
-`pending_default` intent; the next mutating image command restores the old
-logical default (idempotently) before doing its own work. Readers never recover,
-clear or write: they observe the old logical state. No fsync/power-loss guarantee
-is claimed, and older binaries do not participate in the journal. Old cache
-artifacts and active sessions are never removed by set-default. See
+Acquisition and revalidation run outside the HOME locks. The pin transaction is a
+compare-and-swap on the revision and digest that were displayed: same-pin
+replacement preserves bytes, a peer that moved the pin first makes this
+operation fail, and establishment stays insert-if-absent. A store 0.7.39–0.7.46
+left with a `pending_default` intent is recovered by the next write before it
+does its own work; readers never recover, clear or write, and observe the old
+logical state. 0.7.47 writes no intent (ADR-0067). No fsync/power-loss guarantee
+is claimed. Old cache artifacts and active sessions are never removed by
+set-default. See
 [USAGE](USAGE.md#project-scoped-approval-of-oci-image-content) for the operational details.
 
-`image refresh` acquires without launching or replacing a retained record;
-only a successful default-tier acquisition may initialize an absent record:
+`image refresh` acquires without launching, and running it is its own consent:
 
 ```text
-image refresh [--image REF] [--yes]
-  → the same boot_image selector and broken-config recovery
-  → image_pin::update(Refresh) → resolve current registry content once
-      → candidate approval (first/unchanged: none; changed: prompt or --yes)
-      → revalidate the frozen candidate under a fresh shared barrier
-      → journaled pin/default transaction (future launches consume the child)
-  → a default-tier preparation also retains an absent record (write-once)
+image refresh [--image REF]
+  → the same boot_image selector; a bare refresh with an unreadable
+    tool configuration fails, --image/env still warn and work
+  → image_pin::refresh(boot, adoption offer)
+      → established project and a different host record: adopt it
+          resolve the host record once → render old/new digests if they differ
+          → revalidate the frozen candidate → one save: host pin + defaults[P]
+      → otherwise: resolve current registry content once
+          → candidate approval (first/unchanged: none; changed: rendered, then committed)
+          → revalidate the frozen candidate under a fresh shared barrier
+          → pin/default transaction (future launches consume the child)
+  → a default-tier preparation establishes an absent project default (write-once)
   → completion notice (best-effort; no policy work after commit)
 ```
 
@@ -1305,7 +1317,7 @@ suggests deleting HOME approval records, a store acquisition does not touch.
 ### Project-scoped approval: store, candidate and journal
 
 `image_pin` is the only module that answers "may this content be consumed?".
-It owns two small HOME files, separate from the retained-default record:
+It owns two small HOME files, separate from the host's retained record:
 
 ```json
 {"version":2,
@@ -1313,8 +1325,16 @@ It owns two small HOME files, separate from the retained-default record:
            "reference":"docker.io/library/alpine:latest",
            "platform":{"os":"linux","architecture":"arm64","variant":null},
            "manifest_digest":"sha256:<64 hex>","revision":1}],
- "pending_default":null}
+ "pending_default":null,
+ "defaults":[{"project":"<64 hex>",
+              "image":"docker.io/library/alpine@sha256:<64 hex>"}]}
 ```
+
+`defaults` is optional and is omitted when empty, so a store 0.7.39–0.7.46 wrote
+decodes as "no project has an established default" and re-encodes to the same
+bytes. Each record names one project and one canonical reference that states its
+digest; projects are unique and are bounded at 4096 records, independently of
+the pin bound (both are also subject to the 4 MiB file-size bound).
 
 `image-pins.json` is strict version-2 JSON: unknown, duplicate or missing fields,
 duplicate (project, reference, platform) keys, unsupported versions, a `project`
@@ -1338,19 +1358,17 @@ command's working directory once, at its entry point, and every consumer borrows
 that `ProjectDir`: session state takes its 12-hex prefix, approvals take the full
 digest as `ProjectId`. A second capture is a visible edit, because
 `ProjectDir::capture` is a clippy `disallowed-methods` entry allowed only at the
-eight entry points.
+ten entry points (launch, `setup`, `image refresh`, `image set-default`, `image
+build`, `image import`, `image show`, `doctor`, `clipboard` and `access`).
 
 **Candidate-scoped consent.** `ValidatedCandidate` can only be minted from a
 complete native acquisition; `Approval` binds that candidate's digest and the
-predecessor revision/digest that were displayed. The prompt renders the escaped
-source, the platform and both full digests, defaults to No, reads one bounded
-line and never reprompts. `--yes` skips the read but not the rendering. Both
-stdin and stderr must be terminals for an interactive replacement; otherwise the
-operation refuses with status 1 without reading stdin. The mutation is a pure
-decision on one measured under-lock snapshot (`insert only if expected and
-current are absent`, `replace only for a mutable source with consent and a
-matching predecessor`), so a concurrent writer cannot be overwritten and
-`--yes` cannot authorize a different predecessor.
+predecessor revision/digest that were displayed. The explicit command is the
+consent: it renders the escaped source (or the default tier's fixed label), the
+platform and both full digests before the commit, and nothing is read. The
+mutation is a pure decision on one measured under-lock snapshot (`insert only if
+expected and current are absent`, `replace only for a mutable source with a
+matching predecessor`), so a concurrent writer cannot be overwritten.
 
 **Approval equivalence is guest content, not index identity.** Two manifests are
 the same approval when their verified config digest and ordered layer diff IDs
@@ -1359,25 +1377,30 @@ unrelated platforms, therefore keeps the stored identity and revision; new guest
 content needs a replacement approval. An immutable source that resolves to
 different content is an integrity failure with no approval path.
 
-**Why two files and a journal, rather than one record.** `set-default` updates
-both the approval and the retained fallback. Writing either first and failing the
-second would return an error with changed state, and rollback can itself fail. A
-bounded `pending_default` intent (`previous`/`proposed` exact v1 bytes, each
-≤16 KiB) records the logical pair across three atomic writes; a failure before
-the final commit restores the previous fallback bytes (or their absence), and a
-failed restoration leaves the old pins plus the intent authoritative as a
-recovery-required error rather than a false "nothing changed". Recovery is
-idempotent, verifies the physical fallback equals the intended side of the pair,
-and only the next *write* performs it: an explicit image command, or a launch or
-`setup` that has to record a first pin or retain an absent fallback. Readers —
+**Why two files, and why no journal any more.** 0.7.39–0.7.46 needed a bounded
+`pending_default` intent because `set-default` updated both a pin and the host
+record, and writing either first and failing the second would return an error
+with changed state. 0.7.47 removed every such pair (ADR-0067): `set-default`
+writes only the host record (one atomic save), a project default and its first
+pin are one file, and the only two-file write left is a recommendation-sourced
+first default-tier use, which writes the host record **first** and the pin store
+second. No invariant ties those halves together, so a failure between them leaves
+the host starting choice initialized with measured content and the project
+unestablished; the next default-tier use completes it. That narrows the
+failed-operation guarantee this journal existed for.
+
+The reader stays, because version 2 *means* "a non-null `pending_default` names
+the logical default as `previous`": dropping it would misread a 0.7.46 store
+mid-recovery. Recovery is idempotent, verifies the physical fallback equals the
+intended side of the pair, and only the next *write* performs it. Readers —
 launch of an approved selection, `image show`, `doctor`, import's
 post-publication inspection — never recover, clear intent or create the lock;
-they take the shared lock (2 s) and
-observe the old logical state or the complete new one. A damaged store is never
-treated as absent: re-pinning would authorize content nobody approved. Moving
-it aside is a deliberate approval reset, never cache repair. This journal is
-specifically for failed-operation preservation; it is not a durability claim
-against power loss, and older binaries do not know about it.
+they take the shared lock (2 s) and observe the old logical state or the complete
+new one. A damaged store is never treated as absent: re-pinning would authorize
+content nobody approved. Moving it aside is a deliberate approval reset, never
+cache repair. The journal is not a durability claim against power loss, and older
+binaries do not know about it. A release that bumps the store version may drop
+the reader.
 
 **What stays outside approval.** The cache receipt is cache evidence: it proves
 which child a digest-stated source was validated against and repairs metadata an

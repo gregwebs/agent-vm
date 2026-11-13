@@ -18,26 +18,32 @@
 //! The **catalog is deliberately not an input**: changing the
 //! runtime tool declaration must never change the image (issue #259).
 //!
-//! # The default slot: a recommendation, then a retained selection
+//! # The default slot: a project default, then the host's starting choice
 //!
-//! The last slot is not a compiled-in string. It is a persisted, user-scoped
-//! **retained default** ([`default_selection`]) with a fallback: an **absent**
-//! record is offered the **initial recommendation**, and only a launch that
-//! actually *acquires* that reference's content records it. A record that
-//! exists but is unreadable, non-regular or invalid is a **hard error**, never a
-//! reset to the recommendation (that would silently discard the user's choice).
+//! The last slot is not a compiled-in string. In order it is the **project's own
+//! default** (recorded with that project's approvals, ADR-0067), then the host's
+//! **retained default** ([`default_selection`]), then the compiled-in **initial
+//! recommendation**. A project's default is established write-once by its first
+//! successful default-tier preparation, from whichever of the other two it
+//! selected; only an explicit `image refresh` moves it afterwards. A host record
+//! that is absent is offered the recommendation, and only a preparation that
+//! actually *acquires* that reference's content records it. A record that exists
+//! but is unreadable, non-regular or invalid is a **hard error**, never a reset
+//! (that would silently discard the user's choice).
+//!
 //! Two consequences are deliberate and load-bearing (#261):
 //!
 //! * selection is lazy and read-only — `help` and a launch that a higher source
-//!   wins evaluate no record and write nothing; `doctor` reads the record once,
-//!   *observationally*, to report it (it still creates nothing);
-//! * a failed initial acquisition leaves the record **absent**, so a later,
+//!   wins evaluate no record and write nothing; `doctor` reads the records once,
+//!   *observationally*, to report them (it still creates nothing);
+//! * a failed initial acquisition leaves the host record **absent**, so a later,
 //!   compatible recommendation (e.g. a future multiarch release) can rescue the
 //!   user instead of stranding them on bytes their host cannot boot.
 //!
-//! Explicit set-default acquisition can replace the retained fallback after
-//! native success and host-platform validation; ordinary adoption stays
-//! write-once. Neither path changes overrides or running sessions.
+//! `image set-default` replaces only the host's starting choice, after native
+//! success and host-platform validation; [`adoption_offer`] is the one place an
+//! explicit refresh offers that choice to an established project. Neither path
+//! changes overrides or running sessions.
 //!
 //! # The default tier is not display data
 //!
@@ -78,6 +84,7 @@ use anyhow::{Result, bail};
 use vstd::prelude::*;
 
 use crate::config::ConfiguredImages;
+use crate::project::ProjectDir;
 
 pub(crate) mod default_selection;
 pub(crate) mod upgrade;
@@ -213,6 +220,9 @@ pub(crate) enum ImageSource {
     UserConfig(PathBuf),
     /// `image` in `<cwd>/.agent-vm/config.toml`.
     ProjectConfig(PathBuf),
+    /// This project's established default, recorded in the approval store at
+    /// this path (ADR-0067).
+    ProjectDefault(PathBuf),
     /// The retained default record at this path.
     RetainedDefault(PathBuf),
     /// The compiled-in recommendation offered on a host with no record yet.
@@ -236,14 +246,59 @@ impl ImageSource {
             ImageSource::ProjectConfig(file) => {
                 format!("project config {}", crate::one_line::path(file))
             }
-            // Both default-tier origins stay indistinguishable here: this
+            // All three default-tier origins stay indistinguishable here: this
             // description is ordinary diagnostic/logging text. Only
             // [`inspect_selection`] discloses which origin won.
-            ImageSource::RetainedDefault(_) | ImageSource::InitialRecommendation => {
-                "default".to_string()
-            }
+            ImageSource::ProjectDefault(_)
+            | ImageSource::RetainedDefault(_)
+            | ImageSource::InitialRecommendation => "default".to_string(),
         }
     }
+}
+
+/// The configured image tiers as this command read them (ADR-0067).
+///
+/// Which tiers to select from and whether the command's whole configuration was
+/// readable are two facts, not one: `setup` reads a report whose *catalog* could
+/// not be built, so it still selects from the readable image tiers while R3
+/// withholds establishment from that selection. Naming the three states keeps a
+/// caller from pairing readable tiers with a readable configuration by accident.
+#[derive(Clone, Copy)]
+pub(crate) enum ConfiguredTiers<'a> {
+    Read(&'a ConfiguredImages),
+    /// Tiers read from a report whose tool configuration could not be built
+    /// (`Catalog::Broken`). Selection is unchanged; it establishes nothing.
+    ReadFromBrokenCatalog(&'a ConfiguredImages),
+    Unreadable,
+}
+
+impl<'a> ConfiguredTiers<'a> {
+    /// The configured tiers, when the command read any.
+    fn images(self) -> Option<&'a ConfiguredImages> {
+        match self {
+            Self::Read(images) | Self::ReadFromBrokenCatalog(images) => Some(images),
+            Self::Unreadable => None,
+        }
+    }
+
+    /// Whether a selection made from these tiers may establish a project
+    /// default. R3 keys on `Catalog::Broken`: readable image tiers inside a
+    /// configuration that could not be built are still a provisional selection.
+    fn configuration(self) -> ConfigurationRead {
+        match self {
+            Self::Read(_) => ConfigurationRead::Read,
+            Self::ReadFromBrokenCatalog(_) | Self::Unreadable => ConfigurationRead::Unreadable,
+        }
+    }
+}
+
+/// Carried by every [`BootImage`]: whether the selection was made with the
+/// configured tiers read. [`Self::Unreadable`] forbids establishing a project
+/// default from the selection; it changes nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConfigurationRead {
+    Read,
+    Unreadable,
 }
 
 /// The image selected for one session.
@@ -251,15 +306,18 @@ impl ImageSource {
 pub(crate) struct BootImage {
     reference: ImageRef,
     source: ImageSource,
+    configuration: ConfigurationRead,
 }
 
 impl BootImage {
     /// A launch build's selection. Only `run::launch` constructs one: no other
-    /// verb has `--dockerfile`.
+    /// verb has `--dockerfile`, and a launch dispatches only with a readable
+    /// catalog.
     pub(crate) fn launch_build(reference: ImageRef, dockerfile: PathBuf) -> Self {
         Self {
             reference,
             source: ImageSource::LaunchBuild(dockerfile),
+            configuration: ConfigurationRead::Read,
         }
     }
 
@@ -271,6 +329,11 @@ impl BootImage {
         &self.source
     }
 
+    /// Whether the configured tiers could be read when this was selected.
+    pub(crate) fn configuration(&self) -> ConfigurationRead {
+        self.configuration
+    }
+
     /// True when no user source chose the image.
     ///
     /// The trusted adapter around [`default_source_is_default`]: the exhaustive
@@ -280,11 +343,18 @@ impl BootImage {
     /// won, its path, and how it renders stay outside the proof.
     pub(crate) fn is_default(&self) -> bool {
         let facts = match &self.source {
+            ImageSource::ProjectDefault(_) => DefaultSourceFacts {
+                project: true,
+                retained: false,
+                initial: false,
+            },
             ImageSource::RetainedDefault(_) => DefaultSourceFacts {
+                project: false,
                 retained: true,
                 initial: false,
             },
             ImageSource::InitialRecommendation => DefaultSourceFacts {
+                project: false,
                 retained: false,
                 initial: true,
             },
@@ -293,6 +363,7 @@ impl BootImage {
             | ImageSource::UserConfig(_)
             | ImageSource::ProjectConfig(_)
             | ImageSource::LaunchBuild(_) => DefaultSourceFacts {
+                project: false,
                 retained: false,
                 initial: false,
             },
@@ -629,56 +700,87 @@ pub(crate) fn read_env_override() -> EnvOverride {
 }
 
 /// The sole selection owner: first present source wins. Fallible because the
-/// default slot's retained record is host state that can be corrupt, and a
-/// fallback to the initial recommendation can itself be malformed. The default
-/// slot is read lazily: [`select_with`] evaluates its thunk only when every
-/// higher slot is absent, so `--image`/env/user/project never touch the record.
+/// default slot's records are host state that can be corrupt, and a fallback to
+/// the initial recommendation can itself be malformed. The default slot is read
+/// lazily: [`select_with`] evaluates its thunk only when every higher slot is
+/// absent, so `--image`/env/user/project never touch a record.
 pub(crate) fn select(
     requested: Option<ImageOverride>,
-    configured: &ConfiguredImages,
+    tiers: ConfiguredTiers<'_>,
+    project: &ProjectDir,
 ) -> Result<BootImage> {
-    select_with(requested, configured, default_slot)
+    select_with(requested, tiers, || default_slot(Ok(project)))
 }
 
 /// [`select`] with the default slot supplied as a thunk, so the precedence
 /// table is testable without touching host state. The thunk runs only on the
 /// last branch; every higher-precedence branch returns `Ok` without calling it.
 /// It yields the reference **and** its origin together, so no caller has to
-/// re-read the record to learn which default origin won.
+/// re-read a record to learn which default origin won.
+///
+/// The configuration fact is stamped onto every value: a selection made while
+/// the configured tiers were unreadable can never establish a project default
+/// (R3), and that must not depend on each caller remembering it.
 fn select_with(
     requested: Option<ImageOverride>,
-    configured: &ConfiguredImages,
+    tiers: ConfiguredTiers<'_>,
     default: impl FnOnce() -> Result<BootImage>,
 ) -> Result<BootImage> {
+    let configuration = tiers.configuration();
+    let selected = |reference: ImageRef, source: ImageSource| BootImage {
+        reference,
+        source,
+        configuration,
+    };
     if let Some(requested) = requested {
-        return Ok(BootImage {
-            reference: requested.reference,
-            source: requested.source.into(),
-        });
+        return Ok(selected(requested.reference, requested.source.into()));
     }
-    if let Some(image) = configured.user() {
-        return Ok(BootImage {
-            reference: image.reference().clone(),
-            source: ImageSource::UserConfig(image.file().to_path_buf()),
-        });
-    }
-    if let Some(image) = configured.project() {
-        return Ok(BootImage {
-            reference: image.reference().clone(),
-            source: ImageSource::ProjectConfig(image.file().to_path_buf()),
-        });
+    if let Some(configured) = tiers.images() {
+        if let Some(image) = configured.user() {
+            return Ok(selected(
+                image.reference().clone(),
+                ImageSource::UserConfig(image.file().to_path_buf()),
+            ));
+        }
+        if let Some(image) = configured.project() {
+            return Ok(selected(
+                image.reference().clone(),
+                ImageSource::ProjectConfig(image.file().to_path_buf()),
+            ));
+        }
     }
     // The default tier's reference must not reach lower-level (dependency)
     // tracing; arm the process-level guard before any acquisition.
     crate::image_log_guard::activate();
-    default()
+    let mut boot = default()?;
+    boot.configuration = configuration;
+    Ok(boot)
 }
 
-/// The default slot: the retained selection when a record exists, otherwise the
-/// initial recommendation. Read-only — neither branch writes, so an absent
-/// record stays absent until a launch acquires content.
-fn default_slot() -> Result<BootImage> {
-    observe_default().selected_image()
+/// The default slot: this project's own default, else the host record, else the
+/// initial recommendation. Read-only — no branch writes, so an absent record
+/// stays absent until a default-tier preparation acquires content.
+///
+/// The project is a `Result` so a caller that could not capture it still
+/// reports a *higher* explicit source; the fixed capture error surfaces only
+/// when the default tier is actually reached.
+fn default_slot(project: Result<&ProjectDir, &anyhow::Error>) -> Result<BootImage> {
+    let project = project.map_err(|error| {
+        anyhow::anyhow!(
+            "the project directory could not be determined, so its default boot image cannot \
+             be selected: {error:#}"
+        )
+    })?;
+    match crate::image_pin::load_default_slot(project)? {
+        crate::image_pin::DefaultSlot::Project { reference, file } => Ok(BootImage {
+            reference: reference.into_image_ref(),
+            source: ImageSource::ProjectDefault(file),
+            configuration: ConfigurationRead::Read,
+        }),
+        crate::image_pin::DefaultSlot::Host(host) => {
+            observe_default_from(Ok(host)).selected_image()
+        }
+    }
 }
 
 /// The selection a launch *here* would make from the ambient environment:
@@ -689,7 +791,10 @@ fn default_slot() -> Result<BootImage> {
 /// precedence table and environment rule instead of parsing the report text.
 /// Read-only, like the selector it wraps; the default slot is still read only
 /// when every higher source is absent.
-pub(crate) fn ambient_selection(configured: &ConfiguredImages) -> Result<BootImage> {
+pub(crate) fn ambient_selection(
+    configured: &ConfiguredImages,
+    project: Result<&ProjectDir, &anyhow::Error>,
+) -> Result<BootImage> {
     let requested = match read_env_override() {
         EnvOverride::Unset => None,
         EnvOverride::Present(override_) => Some(override_),
@@ -698,7 +803,9 @@ pub(crate) fn ambient_selection(configured: &ConfiguredImages) -> Result<BootIma
              a Unicode value is required"
         ),
     };
-    select(requested, configured)
+    select_with(requested, ConfiguredTiers::Read(configured), || {
+        default_slot(project)
+    })
 }
 
 /// The explicit inspection report for `image show`.
@@ -712,8 +819,11 @@ pub(crate) fn ambient_selection(configured: &ConfiguredImages) -> Result<BootIma
 /// fallback branch, so a damaged record that a higher source overrides is never
 /// read, reported or repaired. Read-only: no directory, lock, record, cache or
 /// runtime state is created, and nothing is acquired.
-pub(crate) fn inspect_selection(configured: &ConfiguredImages) -> Result<String> {
-    render_inspection(&ambient_selection(configured)?)
+pub(crate) fn inspect_selection(
+    configured: &ConfiguredImages,
+    project: &Result<ProjectDir>,
+) -> Result<String> {
+    render_inspection(&ambient_selection(configured, project.as_ref())?)
 }
 
 /// The inspection report's fixed source label and the winning file, if any.
@@ -726,6 +836,7 @@ fn inspection_provenance(source: &ImageSource) -> Result<(&'static str, Option<&
         ImageSource::Environment => Ok(("AGENT_VM_IMAGE_TAG", None)),
         ImageSource::UserConfig(file) => Ok(("user config", Some(file))),
         ImageSource::ProjectConfig(file) => Ok(("project config", Some(file))),
+        ImageSource::ProjectDefault(file) => Ok(("project default", Some(file))),
         ImageSource::RetainedDefault(file) => Ok(("retained default", Some(file))),
         ImageSource::InitialRecommendation => Ok(("initial recommendation", None)),
         // `image show` takes no `--image`, so this interface cannot produce a
@@ -754,6 +865,43 @@ fn render_inspection(selected: &BootImage) -> Result<String> {
         report.push_str(&format!("File: {}\n", crate::one_line::path(file)));
     }
     Ok(report)
+}
+
+/// The host's retained default, offered to an established project by an
+/// explicit refresh (ADR-0067). Constructed only by [`adoption_offer`].
+pub(crate) struct AdoptionOffer(BootImage);
+
+impl AdoptionOffer {
+    pub(crate) fn image(&self) -> &BootImage {
+        &self.0
+    }
+}
+
+impl fmt::Debug for AdoptionOffer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AdoptionOffer(<redacted>)")
+    }
+}
+
+/// The host record as an offer to move `selected`, which is this project's own
+/// default, or nothing.
+///
+/// `None` unless `selected` is the project's own default and the host keeps a
+/// record: the initial recommendation initializes a host, it never moves a
+/// project (D4). A damaged record is an error here, before any registry request.
+pub(crate) fn adoption_offer(selected: &BootImage) -> Result<Option<AdoptionOffer>> {
+    if !matches!(selected.source(), ImageSource::ProjectDefault(_)) {
+        return Ok(None);
+    }
+    match observe_default() {
+        DefaultObservation::Retained { reference, path } => Ok(Some(AdoptionOffer(BootImage {
+            reference: reference.into_image_ref(),
+            source: ImageSource::RetainedDefault(path),
+            configuration: selected.configuration(),
+        }))),
+        DefaultObservation::Uninitialized { .. } => Ok(None),
+        DefaultObservation::Unavailable { message } => Err(anyhow::anyhow!(message)),
+    }
 }
 
 /// One read-only snapshot of the default slot, for diagnostics.
@@ -812,12 +960,14 @@ impl DefaultObservation {
             Self::Retained { reference, path } => Ok(BootImage {
                 reference: reference.clone().into_image_ref(),
                 source: ImageSource::RetainedDefault(path.clone()),
+                configuration: ConfigurationRead::Read,
             }),
             // The record's prospective path is not this selection's provenance:
             // nothing was read from it, so no file is disclosed.
             Self::Uninitialized { recommendation, .. } => Ok(BootImage {
                 reference: recommendation.clone().into_image_ref(),
                 source: ImageSource::InitialRecommendation,
+                configuration: ConfigurationRead::Read,
             }),
             // The store's diagnostic is already safe (fixed reason plus escaped
             // path); re-wrapping it without a source chain keeps it that way.
@@ -826,17 +976,74 @@ impl DefaultObservation {
     }
 }
 
+/// This project's own default, as `doctor` reports it.
+///
+/// `Debug` redacts like [`DefaultObservation`]: it too can be printed.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum ProjectDefaultObservation {
+    Established {
+        reference: ImmutableImageRef,
+        path: PathBuf,
+    },
+    NotEstablished,
+    /// The command could not capture its project.
+    Unknown,
+    Unavailable {
+        message: String,
+    },
+}
+
+impl fmt::Debug for ProjectDefaultObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Established { path, .. } => formatter
+                .debug_struct("Established")
+                .field("reference", &"<redacted reference>")
+                .field("path", path)
+                .finish(),
+            Self::NotEstablished => formatter.write_str("NotEstablished"),
+            Self::Unknown => formatter.write_str("Unknown"),
+            Self::Unavailable { message } => formatter
+                .debug_struct("Unavailable")
+                .field("message", message)
+                .finish(),
+        }
+    }
+}
+
+impl ProjectDefaultObservation {
+    fn selected_image(&self) -> Option<Result<BootImage>> {
+        match self {
+            Self::Established { reference, path } => Some(Ok(BootImage {
+                reference: reference.clone().into_image_ref(),
+                source: ImageSource::ProjectDefault(path.clone()),
+                configuration: ConfigurationRead::Read,
+            })),
+            Self::Unknown => Some(Err(anyhow::anyhow!(
+                "the project directory could not be determined, so its default boot image \
+                 cannot be selected"
+            ))),
+            Self::NotEstablished | Self::Unavailable { .. } => None,
+        }
+    }
+}
+
 /// One read-only snapshot of the default slot: record path, the single content
 /// read, and — only when no record exists — the recommendation.
 fn observe_default() -> DefaultObservation {
-    let snapshot = default_selection::record_path()
-        .and_then(|path| default_selection::load().map(|selection| (path, selection)));
-    match snapshot {
-        Ok((path, Some(retained))) => DefaultObservation::Retained {
+    observe_default_from(default_selection::load())
+}
+
+/// Map one host-record read into the observation, so the host-only path, the
+/// slot path and `doctor` report errors and the recommendation identically.
+fn observe_default_from(loaded: Result<Option<ImmutableImageRef>>) -> DefaultObservation {
+    let path = default_selection::record_path();
+    match (path, loaded) {
+        (Ok(path), Ok(Some(retained))) => DefaultObservation::Retained {
             reference: retained,
             path,
         },
-        Ok((path, None)) => match default_selection::initial_recommendation() {
+        (Ok(path), Ok(None)) => match default_selection::initial_recommendation() {
             Ok(recommendation) => DefaultObservation::Uninitialized {
                 recommendation,
                 path,
@@ -848,30 +1055,71 @@ fn observe_default() -> DefaultObservation {
                 message: format!("{error:#}"),
             },
         },
-        Err(error) => DefaultObservation::Unavailable {
+        (Err(error), _) | (_, Err(error)) => DefaultObservation::Unavailable {
             message: format!("{error:#}"),
         },
     }
 }
 
-/// The default slot's state plus the effective selection, from one snapshot.
+/// The default records plus the effective selection, from one snapshot.
 #[derive(Debug)]
 pub(crate) struct BootImageObservation {
     pub(crate) default: DefaultObservation,
+    pub(crate) project_default: ProjectDefaultObservation,
     pub(crate) selected: Result<BootImage>,
 }
 
 /// Observe selection without mutating anything: no directory, no lock, no
-/// record. The default slot is *always* read here, so `doctor` diagnoses a
+/// record. The default records are *always* read here, so `doctor` diagnoses a
 /// damaged default even when a higher source wins the launch; `image show`
 /// calls [`select`] instead and reads that slot only when it must.
 pub(crate) fn observe(
     requested: Option<ImageOverride>,
-    configured: &ConfiguredImages,
+    tiers: ConfiguredTiers<'_>,
+    project: Option<&ProjectDir>,
 ) -> BootImageObservation {
-    let default = observe_default();
-    let selected = select_with(requested, configured, || default.selected_image());
-    BootImageObservation { default, selected }
+    let observed = crate::image_pin::observe_defaults(project);
+    let (default, project_default) = match observed {
+        Ok(observed) => (
+            observe_default_from(observed.host),
+            project.map_or(ProjectDefaultObservation::Unknown, |_| {
+                match &observed.project {
+                    Ok(Some(reference)) => ProjectDefaultObservation::Established {
+                        reference: reference.clone(),
+                        path: observed.file.clone(),
+                    },
+                    Ok(None) => ProjectDefaultObservation::NotEstablished,
+                    // A project record that does not decode is this project's
+                    // damage; the host row was read independently.
+                    Err(error) => ProjectDefaultObservation::Unavailable {
+                        message: format!("{error:#}"),
+                    },
+                }
+            }),
+        ),
+        // One read serves both rows, and a store that cannot be read at all is
+        // reported by each, so no row can claim a state the other contradicts.
+        Err(error) => {
+            let message = format!("{error:#}");
+            (
+                DefaultObservation::Unavailable {
+                    message: message.clone(),
+                },
+                ProjectDefaultObservation::Unavailable { message },
+            )
+        }
+    };
+    let selected = select_with(requested, tiers, || {
+        match project_default.selected_image() {
+            Some(selected) => selected,
+            None => default.selected_image(),
+        }
+    });
+    BootImageObservation {
+        default,
+        project_default,
+        selected,
+    }
 }
 
 verus! {
@@ -936,28 +1184,29 @@ pub(crate) fn immutable_image_is_acceptable(facts: ImmutableImageFacts) -> (acce
     facts.config_acceptable && facts.has_digest
 }
 
-/// The two already-measured facts [`BootImage::is_default`] decides on: which
+/// The three already-measured facts [`BootImage::is_default`] decides on: which
 /// default-tier origin won. Named fields rather than adjacent `bool`
 /// parameters, so an argument swap cannot invert a redaction decision.
 pub(crate) struct DefaultSourceFacts {
+    pub(crate) project: bool,
     pub(crate) retained: bool,
     pub(crate) initial: bool,
 }
 
 /// The default-tier classification decision, contracted (ADR-0018):
-/// **iff** the winning origin is the retained record or the initial
-/// recommendation is the selection the default tier owns — the fact that makes
-/// [`BootImage::label`] redact, adoption eligible and dependency tracing
-/// guarded. Total over all four Boolean combinations.
+/// **iff** the winning origin is the project's own default, the host's retained
+/// record or the initial recommendation is the selection the default tier owns —
+/// the fact that makes [`BootImage::label`] redact, establishment eligible and
+/// dependency tracing guarded. Total over all eight Boolean combinations.
 ///
 /// The trusted adapter, [`BootImage::is_default`], measures the source enum into
 /// these facts; that measurement, which source won, its path and every
-/// redaction/adoption/tracing caller are outside this contract.
+/// redaction/establishment/tracing caller are outside this contract.
 pub(crate) fn default_source_is_default(facts: DefaultSourceFacts) -> (is_default: bool)
     ensures
-        is_default == (facts.retained || facts.initial),
+        is_default == (facts.project || facts.retained || facts.initial),
 {
-    facts.retained || facts.initial
+    facts.project || facts.retained || facts.initial
 }
 
 } // verus!
@@ -1042,14 +1291,16 @@ mod tests {
                 project: project.map(|r| ConfiguredImage::for_test(r, "/p/.agent-vm/config.toml")),
             });
             let requested = requested_source.map(|s| override_for(expected, s));
-            let boot = select_with(requested, &configured, || {
+            let boot = select_with(requested, ConfiguredTiers::Read(&configured), || {
                 Ok(BootImage {
                     reference: ImageRef::from_override("localhost:1/d:latest".to_string()).unwrap(),
                     source: ImageSource::InitialRecommendation,
+                    configuration: ConfigurationRead::Read,
                 })
             })
             .unwrap();
             assert_eq!(boot.reference().as_str(), expected);
+            assert_eq!(boot.configuration(), ConfigurationRead::Read);
             match source {
                 SourceCase::CommandLine => assert_eq!(boot.source(), &ImageSource::CommandLine),
                 SourceCase::Environment => assert_eq!(boot.source(), &ImageSource::Environment),
@@ -1062,6 +1313,37 @@ mod tests {
         }
     }
 
+    /// An unreadable configuration knows no user or project tier: a requested
+    /// override still wins, and otherwise the default slot runs and the
+    /// selection is marked provisional so nothing establishes a project default
+    /// from it (R3).
+    #[test]
+    fn an_unreadable_configuration_selects_only_the_override_or_the_default() {
+        let selected = || {
+            Ok(BootImage {
+                reference: ImageRef::from_override("localhost:1/d:latest".to_string()).unwrap(),
+                source: ImageSource::InitialRecommendation,
+                configuration: ConfigurationRead::Read,
+            })
+        };
+        let boot = select_with(
+            Some(override_for(
+                "localhost:1/c:latest",
+                OverrideSource::CommandLine,
+            )),
+            ConfiguredTiers::Unreadable,
+            selected,
+        )
+        .unwrap();
+        assert_eq!(boot.reference().as_str(), "localhost:1/c:latest");
+        assert_eq!(boot.source(), &ImageSource::CommandLine);
+        assert_eq!(boot.configuration(), ConfigurationRead::Unreadable);
+        let boot = select_with(None, ConfiguredTiers::Unreadable, selected).unwrap();
+        assert_eq!(boot.reference().as_str(), "localhost:1/d:latest");
+        assert!(boot.is_default());
+        assert_eq!(boot.configuration(), ConfigurationRead::Unreadable);
+    }
+
     enum SourceCase {
         CommandLine,
         Environment,
@@ -1071,22 +1353,30 @@ mod tests {
     }
 
     /// ADR-0018's erased check of the contracted default-tier classifier. The
-    /// expected rows are literal, not derived from the kernel, and all four
+    /// expected rows are literal, not derived from the kernel, and all eight
     /// Boolean combinations are exercised because the contract is total.
     #[test]
     fn default_source_classification_matches_truth_table() {
         let cases = [
-            (false, false, false),
-            (false, true, true),
-            (true, false, true),
-            (true, true, true),
+            (false, false, false, false),
+            (false, false, true, true),
+            (false, true, false, true),
+            (false, true, true, true),
+            (true, false, false, true),
+            (true, false, true, true),
+            (true, true, false, true),
+            (true, true, true, true),
         ];
-        for (retained, initial, expected) in cases {
-            let facts = DefaultSourceFacts { retained, initial };
+        for (project, retained, initial, expected) in cases {
+            let facts = DefaultSourceFacts {
+                project,
+                retained,
+                initial,
+            };
             assert_eq!(
                 default_source_is_default(facts),
                 expected,
-                "retained={retained} initial={initial}"
+                "project={project} retained={retained} initial={initial}"
             );
         }
     }
@@ -1356,6 +1646,12 @@ mod tests {
     /// `ConfiguredImages`/`ConfiguredImage` need a public path to file for the
     /// Seed the physical retained-default record the coordinated reader observes,
     /// so these selection tests need no approval store of their own.
+    /// The selection tests need only a stable project identity: none of them
+    /// writes an approval store, and a higher tier or the host record answers.
+    fn project() -> ProjectDir {
+        ProjectDir::from_path_for_tests(&std::env::current_dir().unwrap()).unwrap()
+    }
+
     fn retain(home: &Path, reference: &str) {
         let directory = home.join(crate::config::USER_CONFIG_DIR_RELATIVE);
         std::fs::create_dir_all(&directory).unwrap();
@@ -1372,7 +1668,12 @@ mod tests {
     /// doctor section: the source must name the declaring file.
     #[test]
     fn user_tier_names_its_file_in_the_source() {
-        let boot = select(None, &configured_user("localhost:1/u:latest")).unwrap();
+        let boot = select(
+            None,
+            ConfiguredTiers::Read(&configured_user("localhost:1/u:latest")),
+            &project(),
+        )
+        .unwrap();
         assert_eq!(
             boot.source().describe(),
             "user config /home/u/.config/agent-vm/config.toml"
@@ -1412,7 +1713,7 @@ mod tests {
             user: None,
             project: Some(ConfiguredImage::for_test("localhost:1/p:latest", file)),
         });
-        let boot = select(None, &images).unwrap();
+        let boot = select(None, ConfiguredTiers::Read(&images), &project()).unwrap();
 
         let report = render_inspection(&boot).unwrap();
 
@@ -1443,7 +1744,7 @@ mod tests {
             user: None,
             project: None,
         });
-        let boot = select(None, &empty).unwrap();
+        let boot = select(None, ConfiguredTiers::Read(&empty), &project()).unwrap();
         assert_eq!(
             boot.reference().as_str(),
             A,
@@ -1485,7 +1786,7 @@ mod tests {
             user: None,
             project: None,
         });
-        let boot = select(None, &empty).unwrap();
+        let boot = select(None, ConfiguredTiers::Read(&empty), &project()).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1514,7 +1815,12 @@ mod tests {
             project: None,
         });
         let requested = override_for("bad\u{1b}[31mref", OverrideSource::CommandLine);
-        let boot = select(Some(requested), &configured).unwrap();
+        let boot = select(
+            Some(requested),
+            ConfiguredTiers::Read(&configured),
+            &project(),
+        )
+        .unwrap();
         assert!(!boot.to_string().contains('\u{1b}'), "{boot}");
     }
 
@@ -1597,6 +1903,7 @@ mod tests {
         let normal = BootImage {
             reference,
             source: ImageSource::CommandLine,
+            configuration: ConfigurationRead::Read,
         };
         assert_eq!(
             normal.contract_display(),

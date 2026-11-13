@@ -274,6 +274,11 @@ pub(crate) enum Dispatch {
         /// consumed to build the catalog. Carried to `image refresh`/`setup`/`image show`
         /// so they can select the same image a launch would.
         images: ConfiguredImages,
+        /// Whether those tiers were actually read. A configuration that could not
+        /// be loaded leaves them empty and this `false`, which is what forbids
+        /// establishing a project default from the resulting selection (R3); a
+        /// *catalog* that could not be built still carries readable tiers.
+        images_read: bool,
     },
     // Large launch-side values are boxed to keep dispatch compact.
     Launch {
@@ -306,6 +311,7 @@ pub(crate) enum Dispatch {
 /// point; type safety is not the reason.
 pub(crate) struct CapturedConfig {
     images: ConfiguredImages,
+    images_read: bool,
     user_network: Option<crate::user_network::UserNetwork>,
     user_tools: Option<crate::egress_reference::EgressNamespace>,
     user_mounts: Option<crate::config_mounts::UserMounts>,
@@ -406,6 +412,7 @@ where
                     Catalog::Ready(catalog),
                     CapturedConfig {
                         images,
+                        images_read: true,
                         user_network,
                         user_tools,
                         user_mounts,
@@ -415,6 +422,7 @@ where
                     Catalog::Broken(error),
                     CapturedConfig {
                         images,
+                        images_read: true,
                         user_network: None,
                         user_tools: None,
                         user_mounts: None,
@@ -428,6 +436,7 @@ where
             Catalog::Broken(error),
             CapturedConfig {
                 images: ConfiguredImages::default(),
+                images_read: false,
                 user_network: None,
                 user_tools: None,
                 user_mounts: None,
@@ -591,6 +600,7 @@ where
                         cmd,
                         catalog: Catalog::Ready(catalog),
                         images: captured.images,
+                        images_read: captured.images_read,
                     })
                 }
             }
@@ -608,6 +618,7 @@ where
                         cmd: cli.cmd,
                         catalog: Catalog::Broken(config_error),
                         images: captured.images,
+                        images_read: captured.images_read,
                     })
                 }
                 Err(_) => Err(config_error_with_hint(&config_error, name)),
@@ -3666,7 +3677,6 @@ mod tests {
                 "localhost:1/a:tag",
             ],
             vec!["agent-vm", "image", "refresh"],
-            vec!["agent-vm", "image", "refresh", "--yes"],
             vec!["agent-vm", "image", "refresh", "--help"],
             vec!["agent-vm", "help", "image", "refresh"],
         ] {
@@ -3688,6 +3698,17 @@ mod tests {
                 "refresh",
             ],
             vec!["agent-vm", "image", "refresh", "--dockerfile", "x"],
+            // No verb has `--yes` any more (B4): the explicit command is the
+            // consent, so the flag is an ordinary usage error, not a shim.
+            vec!["agent-vm", "image", "refresh", "--yes"],
+            vec![
+                "agent-vm",
+                "image",
+                "set-default",
+                "--image",
+                "localhost:1/a:tag",
+                "--yes",
+            ],
         ] {
             let error = build_command(&Catalog::Ready(default_catalog()))
                 .try_get_matches_from(args.clone())

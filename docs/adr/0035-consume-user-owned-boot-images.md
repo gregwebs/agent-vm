@@ -25,6 +25,10 @@ Amended in **0.7.35** by [ADR-0061](0061-explicit-launch-builds.md) (#527): an
 explicit `--dockerfile FILE` launch builds that Dockerfile and boots the result,
 with no pin. The launcher still builds nothing implicitly — no environment
 variable, config key or catalog field can start a build.
+Amended in **0.7.47** by [ADR-0067](0067-project-default-boot-image.md): an
+established **project** keeps its own default; `image set-default` changes only
+the host's starting choice; `image refresh` asks nothing, and `--yes` is removed
+from both verbs.
 
 ## Context
 

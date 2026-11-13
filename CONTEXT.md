@@ -517,12 +517,18 @@ guest; tool declarations do not install that software.
 
 Explicit native acquisition of the selected OCI image reference into the
 **image cache**, checking whether the registry now serves different content,
-without booting a guest. It is one of the two operations allowed to re-resolve a
-mutable source; a changed **image pin** requires an **image approval** (the
-terminal prompt or `--yes`). Configuration is unchanged: a refresh never changes
-which reference is selected. A default-tier refresh keeps the existing
-exception — a successful acquisition of an **absent** retained default
-initializes it (success-before-adoption); it never replaces an existing record.
+without booting a guest. It is the operation that re-resolves a mutable source,
+and running it is the **image approval** its own change needs: a changed **image
+pin** is replaced by the refresh itself, with the old and new digests rendered,
+and nothing is asked. `image set-default` resolves its target but approves
+nothing. Configuration is unchanged, but a default-tier refresh can still change
+which reference the project **selects**: it establishes an absent **project**
+default (success-before-establishment), and in a project that already has one it
+adopts the host's existing **retained default boot image**, moving the project's
+default reference to it. A tool configuration that
+cannot be read makes a bare refresh fail; `--image` and
+`AGENT_VM_IMAGE_TAG` still work, because they never select through the default
+tier.
 
 ## Image cache
 
@@ -544,10 +550,20 @@ _Avoid_: "local images" without saying which store.
 ## Default boot image
 
 The **boot image** a session boots when neither the command line, nor the
-environment, nor the user config, nor the project config selects another: the
-**retained default boot image** when this host has one, otherwise the
-launcher's **initial recommendation**. A user can select a custom boot image
-instead.
+environment, nor the user config, nor the project config selects another. An
+established **project** keeps its default independently of later changes to the
+host's **retained default boot image**.
+
+A project establishes its default on its first successful default-tier
+preparation — a launch, `setup` or `image refresh` — from the retained default,
+or from the **initial recommendation** when the host has none. It is recorded
+with the project's approvals in `image-pins.json`, so establishing it and its
+first pin are one save. Only an explicit `image refresh` moves it, and only to
+the host's existing retained default; running that command is the **image
+approval** for the move. Nothing establishes a default from a selection made
+while the tool configuration was unreadable: that selection is provisional. See
+[USAGE.md#project-default-boot-images](USAGE.md#project-default-boot-images) and
+[ADR-0067](docs/adr/0067-project-default-boot-image.md).
 
 ## Boot image contract
 
@@ -609,19 +625,21 @@ _Avoid_: "workspace", "repo" (both are other things), "current directory"
 
 ## Retained default boot image
 
-The digest-pinned image a host keeps as its default after acquiring it, in the
-user-scoped `$HOME/.config/agent-vm/default-image.json`. A *bookmark* naming
-exact content, not a download cache: it is independent of the msb image cache,
-`AGENT_VM_STATE_DIR` and any project, and it is written **only after** the image
-was acquired (success-before-adoption). Automatic initialization is
-insert-if-absent, so no failed or concurrent first launch overwrites it. The
-default tier also has an **image pin**, so warm launches consume the approved
-child without registry contact. A **deliberate `image set-default`** is
-successful native acquisition, candidate approval and a journaled transaction
-that replaces this retained fallback and its pin in the invoking **project**
-together; it affects future default-image sessions only. The record holds a digest only — no source
-tag, platform or tool metadata — so a bare `image refresh` reacquires that
-digest rather than following a tag (issue #392). See
+The host's retained choice of exact image content, used to initialize a
+**project**'s **default boot image** when that project has none. Changing this
+host choice does not replace an established project's default.
+
+It lives in the user-scoped `$HOME/.config/agent-vm/default-image.json` as a
+digest-pinned bookmark, not a download cache: it is independent of the msb image
+cache, `AGENT_VM_STATE_DIR` and any project, and it is written **only after** the
+image was acquired (success-before-adoption). Automatic initialization is
+insert-if-absent and happens only for the **initial recommendation**, so no
+failed or concurrent first launch overwrites it and no project's own default
+re-seeds it. A **deliberate `image set-default`** acquires its target once and
+stores the validated host child here; it writes no **image pin**, in any
+project. The record holds a digest only — no source tag, platform or tool
+metadata — so a refresh reacquires that digest rather than following a tag
+(issue #392). See
 [USAGE.md#explicitly-setting-the-default](USAGE.md#explicitly-setting-the-default)
 and [ADR-0047](docs/adr/0047-host-wide-oci-image-approval.md).
 Distinguished from the **initial recommendation** below. See
@@ -637,10 +655,11 @@ host-platform manifest **child** digest and a monotonic revision. Stored in the
 user-scoped `$HOME/.config/agent-vm/image-pins.json` (with `image-pins.lock`),
 host-managed and independent of the **image cache**, `AGENT_VM_STATE_DIR`,
 repository files and the **retained default boot image**. A launch or `setup`
-consumes `repo@child`, never the selected tag or index. Only `image refresh` and
-`image set-default` re-resolve a source and request an **image approval**;
-`image build` and `image import` approve their own result reference without
-asking. Each of those reads and writes only the invoking project's records:
+consumes `repo@child`, never the selected tag or index. Only `image refresh`
+re-resolves a source and approves what it resolves; `image set-default` resolves
+its target but approves nothing; `image build` and `image import` approve their
+own result reference. Each of those reads and writes only the invoking project's
+records:
 approval changes in one project never change another project's approved content,
 while cached bytes stay shared. Local rootfs/disk launches and **launch builds**
 are never pinned.
@@ -654,38 +673,38 @@ entry" (cache evidence is not approval); "host-wide approval" (per project since
 Content acquired and validated by a native operation but **not yet approved**:
 the resolved host-platform child plus the measured guest content identity
 (verified config digest and ordered layer diff IDs). A candidate exists only
-long enough to be approved or declined, and it is frozen before any replacement
-prompt, so a registry moving during the decision cannot substitute content.
+long enough to be approved, and it is frozen once resolved, so a registry moving
+before the commit cannot substitute content.
 
 _Avoid_: "pending image"; "download" (a candidate is validated, not merely
 fetched).
 
 ## Image approval
 
-The deliberate, candidate-scoped replacement of an **image pin**: the escaped
-source, platform and full old/new digests are shown, the default answer is No,
-and `--yes` (only on `image refresh` / `image set-default`) pre-authorizes
-exactly that resolved candidate. Distinct from **credential authorization**
-(which host credential may be injected) and from cache repair. On `image
-refresh` and `image set-default`, a changed pin without `--yes` and without a
-terminal on stdin and stderr is refused (status 1) without reading input; a first
-pin or an unchanged digest needs no approval on any surface. An explicit `image build` or
-`image import` is the third consent surface and the only one that replaces an
-approval without a prompt *or* `--yes`: it approves exactly the result
-reference it published, at the content it published, and the change is rendered
-on stderr before it is committed. An immutable source that resolves to
+The candidate-scoped replacement of an **image pin** by the explicit command
+that causes it — `image refresh`, `image build` or `image import`. The command is
+itself the consent: the escaped source (or the default tier's fixed label), the
+platform and the full old and new digests are rendered on stderr before the
+commit, and nothing is asked or read. A first pin or an unchanged digest renders
+nothing. Distinct from **credential authorization** (which host credential may
+be injected) and from cache repair. An immutable source that resolves to
 different content is an integrity failure, never an approvable change.
 
-_Avoid_: "confirmation prompt" (it is a recorded host decision); "update check"
-(there is no launch-time probe); "cache approval".
+To keep an approval, do not run `image refresh` for that reference, or select it
+by digest.
+
+_Avoid_: "confirmation prompt" (nothing is asked); "update check" (there is no
+launch-time probe); "cache approval".
 
 ## Initial recommendation
 
-The immutable `@sha256:…` reference a launcher offers when no retained default
-exists yet, compiled into the binary (the released v0.1.3 multiarch index; a
-launcher release may change it). Reading it never writes; only a successful acquisition adopts it. A
-release that changes this value changes what a *new* host is offered, never an
-existing retained default. _Avoid_: default image (unqualified), tag default.
+The immutable `@sha256:…` reference a launcher offers when neither the project
+nor the host has a default, compiled into the binary (the released v0.1.3
+multiarch index; a launcher release may change it). Reading it never writes; only
+a successful acquisition initializes the host record with it. A release that
+changes this value changes what a *new* host is offered, never an existing
+retained default or an established project's default. _Avoid_: default image
+(unqualified), tag default.
 
 ## Standard image
 

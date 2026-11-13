@@ -286,8 +286,12 @@ fn run_to(
             write_line(out, "")?;
             write_line(out, &describe_launch_view(&launch))?;
         }
-        let (boot_image_section, boot_image_failure, selection) =
-            describe_boot_image(images.as_ref(), &env_slot);
+        let (boot_image_section, boot_image_failure, selection) = describe_boot_image(
+            images.as_ref(),
+            catalog.is_some(),
+            &env_slot,
+            project.as_ref().ok(),
+        );
         write_line(out, "")?;
         write_line(out, &boot_image_section)?;
         // ADR-0060's section: the current picture from the cache, without
@@ -1200,7 +1204,9 @@ fn describe_tier(tier: &TierReport) -> String {
 /// renders every tier row and a clear error; the caller exits nonzero.
 fn describe_boot_image(
     images: Option<&ConfiguredImages>,
+    catalog_built: bool,
     env: &boot_image::EnvOverride,
+    project: Option<&ProjectDir>,
 ) -> (String, Option<anyhow::Error>, Option<boot_image::BootImage>) {
     let mut out = String::from("==> boot image\n");
     let env_override = match env {
@@ -1225,12 +1231,19 @@ fn describe_boot_image(
             return (out, None, None);
         }
     };
-    // An unreadable config leaves the tiers unknown, but the default slot is
-    // still readable, so `doctor` reports it with the *same* selector an empty
-    // config would use rather than inventing a second resolution path.
-    let configured = images.cloned().unwrap_or_default();
-    let observation = boot_image::observe(env_override, &configured);
+    // An unreadable config leaves the tiers unknown, but the default records are
+    // still readable, so `doctor` reports them with the *same* selector an empty
+    // config would use rather than inventing a second resolution path. The
+    // selection such a catalog produces is provisional: nothing may establish a
+    // project default from it (R3).
+    let tiers = match images {
+        Some(images) if catalog_built => boot_image::ConfiguredTiers::Read(images),
+        Some(images) => boot_image::ConfiguredTiers::ReadFromBrokenCatalog(images),
+        None => boot_image::ConfiguredTiers::Unreadable,
+    };
+    let observation = boot_image::observe(env_override, tiers, project);
     let default_row = describe_default_observation(&observation.default);
+    let project_default_row = describe_project_default_observation(&observation.project_default);
     // A user scope that cannot be *located* (`$HOME` unset, empty or relative)
     // is already reported by the config section as an unavailable user tier;
     // it is not a damaged record, so on its own it does not fail the
@@ -1239,8 +1252,16 @@ fn describe_boot_image(
     // `AGENT_VM_IMAGE_TAG` cannot mask the damage (the override still wins the
     // launch; the diagnosis still fails).
     let scope_locatable = matches!(crate::config::host_home_dir(), Ok(Some(_)));
-    let failure = match &observation.default {
-        boot_image::DefaultObservation::Unavailable { message } if scope_locatable => {
+    let failure = match (&observation.default, &observation.project_default) {
+        // The host record is unused by an established project, so its damage is
+        // reported by its own row and this diagnosis; the project's own record
+        // failing is likewise a nonzero exit. Both arms carry the same guard: an
+        // authority that cannot be *located* is the config section's finding,
+        // never a second, boot-image damage diagnosis.
+        (boot_image::DefaultObservation::Unavailable { message }, _) if scope_locatable => {
+            Some(anyhow::anyhow!(message.clone()))
+        }
+        (_, boot_image::ProjectDefaultObservation::Unavailable { message }) if scope_locatable => {
             Some(anyhow::anyhow!(message.clone()))
         }
         _ => None,
@@ -1248,7 +1269,8 @@ fn describe_boot_image(
     let Some(images) = images else {
         // The config could not be read, so the tiers are unknown.
         out.push_str("unknown (configuration could not be read)\n");
-        out.push_str(&format!("default: {default_row}"));
+        out.push_str(&format!("default: {default_row}\n"));
+        out.push_str(&format!("project default: {project_default_row}"));
         return (out, failure, None);
     };
     out.push_str(&format!(
@@ -1264,13 +1286,23 @@ fn describe_boot_image(
         out.push_str(&format!("project: {project}\n"));
     }
     out.push_str(&format!("default: {default_row}\n"));
+    out.push_str(&format!("project default: {project_default_row}\n"));
     // Doctor accepts no `--image`, so the selected row excludes the command
     // line: it is the env slot, then config, then the default slot. When the
-    // default slot won, the selected row reuses the *safe* default label rather
-    // than rendering its reference.
+    // default slot won, the selected row reuses that record's *safe* label
+    // rather than rendering its reference.
     match &observation.selected {
         Ok(selected) if selected.is_default() => {
-            out.push_str(&format!("selected (without --image): {default_row}"));
+            // The project default gets its own label so the two default rows stay
+            // distinguishable: the host row says what is retained, this one says
+            // which record the selection read.
+            let row = match selected.source() {
+                boot_image::ImageSource::ProjectDefault(path) => {
+                    format!("project default [{}]", crate::one_line::path(path))
+                }
+                _ => default_row.clone(),
+            };
+            out.push_str(&format!("selected (without --image): {row}"));
         }
         Ok(selected) => out.push_str(&format!(
             "selected (without --image): {} (from {})",
@@ -1300,6 +1332,24 @@ fn describe_default_observation(observation: &boot_image::DefaultObservation) ->
         boot_image::DefaultObservation::Unavailable { message } => {
             format!("error: {message}")
         }
+    }
+}
+
+/// The `project default:` row: whether this project has its own default, where
+/// it is recorded, and never its reference.
+fn describe_project_default_observation(
+    observation: &boot_image::ProjectDefaultObservation,
+) -> String {
+    use boot_image::ProjectDefaultObservation as Observation;
+    match observation {
+        Observation::Established { path, .. } => {
+            format!("established [{}]", crate::one_line::path(path))
+        }
+        Observation::NotEstablished => {
+            "not established (the next eligible default-tier use records it)".into()
+        }
+        Observation::Unknown => "unknown (the project directory could not be captured)".into(),
+        Observation::Unavailable { message } => format!("error: {message}"),
     }
 }
 
@@ -1902,6 +1952,7 @@ AGENT_VM_IMAGE_TAG: <unset>
 user:    none
 project: none
 default: not selected; initial recommendation [<fixture>/home/.config/agent-vm/default-image.json]
+project default: not established (the next eligible default-tier use records it)
 selected (without --image): not selected; initial recommendation [<fixture>/home/.config/agent-vm/default-image.json]
 
 ==> image network requests

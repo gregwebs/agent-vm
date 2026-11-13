@@ -1023,6 +1023,44 @@ fn s3_project_config_is_the_last_explicit_source() {
     assert_eq!(fixture.snapshot(), before);
 }
 
+/// AC10 (#541): once a project has established its own default, `image show`
+/// reports that record and the store it lives in.
+#[test]
+fn s4b_project_default_is_disclosed_with_the_pin_store_file() {
+    use sha2::{Digest as _, Sha256};
+    let fixture = Fixture::new();
+    let mut hasher = Sha256::new();
+    hasher.update(
+        fixture
+            .project
+            .canonicalize()
+            .unwrap()
+            .as_os_str()
+            .as_bytes(),
+    );
+    let project: String = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let pins = fixture.home.join(".config/agent-vm/image-pins.json");
+    let store = format!(
+        "{{\"version\":2,\"pins\":[],\"pending_default\":null,\
+         \"defaults\":[{{\"project\":\"{project}\",\"image\":\"{RETAINED_A}\"}}]}}"
+    );
+    fixture.write_file(&pins, store);
+    fixture.write_file(&pins.with_extension("lock"), "");
+    let before = fixture.snapshot();
+
+    let output = fixture.show();
+
+    assert_success(
+        &output,
+        &expected(RETAINED_A, "project default", Some(&pins)),
+    );
+    assert_eq!(fixture.snapshot(), before, "nothing is written");
+}
+
 #[test]
 fn s4_retained_default_is_disclosed_with_its_exact_file() {
     let fixture = Fixture::new();

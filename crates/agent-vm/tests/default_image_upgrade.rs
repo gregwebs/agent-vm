@@ -143,26 +143,19 @@ impl Harness {
     fn set_default(&self, target: &str) -> Output {
         self.run(&["image", "set-default", "--image", target])
     }
-    /// `image set-default --yes`: the pre-authorization a *replacement* of an
-    /// established approval needs when no terminal is attached.
-    fn set_default_yes(&self, target: &str) -> Output {
-        self.run(&["image", "set-default", "--image", target, "--yes"])
-    }
-    /// `image refresh [--image REF]`: native acquisition only, no VM.
+    /// `image refresh [--image REF]`: native acquisition only, no VM. The
+    /// explicit command is its own consent (#541), so there is no `--yes`.
     fn refresh(&self, target: Option<&str>) -> Output {
         match target {
             Some(target) => self.run(&["image", "refresh", "--image", target]),
             None => self.run(&["image", "refresh"]),
         }
     }
-    /// `image refresh --yes` for a reference this home already approved at
-    /// different content: a first pin needs no such consent, so only rows that
-    /// expect a *replacement* may use this.
-    fn refresh_yes(&self, target: Option<&str>) -> Output {
-        match target {
-            Some(target) => self.run(&["image", "refresh", "--image", target, "--yes"]),
-            None => self.run(&["image", "refresh", "--yes"]),
-        }
+    /// A pin for `target` **and** a host record naming it: S1's two set-default
+    /// side effects, as the two explicit commands that write them now (#541).
+    fn pin_and_set_default(&self, target: &str) {
+        success(&self.refresh(Some(target)));
+        success(&self.set_default(target));
     }
     fn record(&self) -> PathBuf {
         self.home.join(".config/agent-vm/default-image.json")
@@ -264,9 +257,23 @@ fn complete(cache: &GlobalCache, pin: &str) {
 /// Derive inventory from independently parsed baseline metadata and descriptor
 /// extent references, never from a post-failure pull result. Full bytes are
 /// hashed: structurally valid replacement EROFS is still a failure.
+/// The approval store's bytes, with absence told apart from every other state.
+///
+/// Only `NotFound` is absence: `Some(vec![])` — a zero-byte or otherwise damaged
+/// store — differs from it, and any other read error fails the row instead of
+/// reading as absence. `image set-default` writes no approval (#541), so a row
+/// whose subject is not the store legitimately snapshots `None`.
+fn pin_store_bytes(home: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    match fs::read(home.join(".config/agent-vm/image-pins.json")) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 struct Snapshot {
     record: Vec<u8>,
-    pins: Vec<u8>,
+    pins: Option<Vec<u8>>,
     files: BTreeMap<PathBuf, (u64, String)>,
 }
 impl Snapshot {
@@ -275,15 +282,16 @@ impl Snapshot {
         let (metadata, others) = artifact_paths(&cache, pin, &image.written);
         Self {
             record: fs::read(h.record()).unwrap(),
-            pins: fs::read(h.home.join(".config/agent-vm/image-pins.json")).unwrap(),
+            pins: pin_store_bytes(&h.home).expect("the approval store could not be read"),
             files: hash_paths(std::iter::once(metadata).chain(others)),
         }
     }
     fn unchanged(&self, h: &Harness, pin: &str) {
         assert_eq!(fs::read(h.record()).unwrap(), self.record);
         assert_eq!(
-            fs::read(h.home.join(".config/agent-vm/image-pins.json")).unwrap(),
-            self.pins
+            pin_store_bytes(&h.home).expect("the approval store could not be read"),
+            self.pins,
+            "the approval authority must keep its exact bytes or stay absent"
         );
         self.artifacts_unchanged(h, pin);
     }
@@ -292,6 +300,38 @@ impl Snapshot {
         complete(&h.cache(), pin);
         h.no_fallback();
     }
+}
+
+/// The snapshot oracle's own controls: absence, an empty store, a missing store
+/// and an unreadable one are four different answers, so no row can pass by
+/// turning one into another. `Some(vec![])` must differ from `None`, and a read
+/// error must be a failure rather than absence.
+#[test]
+fn the_authority_snapshot_tells_absence_from_an_empty_or_unreadable_store() {
+    let home = tempfile::tempdir().unwrap();
+    let store = home.path().join(".config/agent-vm/image-pins.json");
+    fs::create_dir_all(store.parent().unwrap()).unwrap();
+
+    let absent = pin_store_bytes(home.path()).unwrap();
+    assert_eq!(absent, None, "no store is absence");
+    fs::write(&store, b"").unwrap();
+    let empty = pin_store_bytes(home.path()).unwrap();
+    assert_eq!(empty, Some(Vec::new()));
+    assert_ne!(empty, absent, "an empty store is not the absence of one");
+
+    fs::remove_file(&store).unwrap();
+    let missing = pin_store_bytes(home.path()).unwrap();
+    assert_eq!(missing, None);
+    assert_ne!(
+        missing, empty,
+        "a store that disappeared is a change from an empty one"
+    );
+
+    fs::create_dir(&store).unwrap();
+    assert!(
+        pin_store_bytes(home.path()).is_err(),
+        "a path that cannot be read as a store fails the row, it is not absence"
+    );
 }
 
 /// The same inventory for a reference that has **no** retained record (an
@@ -329,7 +369,7 @@ fn cached_manifest_digest(cache: &GlobalCache, reference: &str) -> String {
 }
 
 #[test]
-fn explicit_tag_and_index_set_default_populate_pin_and_preserve_old_artifacts() {
+fn explicit_tag_and_index_set_default_replace_the_host_record_and_preserve_old_artifacts() {
     let h = Harness::new();
     let server = Server::new();
     let a = h.image(&ArchiveSpec::default());
@@ -350,9 +390,9 @@ fn explicit_tag_and_index_set_default_populate_pin_and_preserve_old_artifacts() 
     complete(&h.cache(), &pin_a);
     let snapshot = Snapshot::take(&h, &pin_a, &a);
     let pin_b = server.image("private-repo", "moving", &b);
-    // A moves to B: a replacement of the established approval, so this row
-    // pre-authorizes exactly the candidate it is about to resolve.
-    success(&h.set_default_yes(&tag));
+    // The tag moves A -> B. This row is about the host record: set-default
+    // replaces it with the validated B child and writes no approval (#541, R5).
+    success(&h.set_default(&tag));
     assert_eq!(h.selected(), pin_b);
     complete(&h.cache(), &pin_b);
     // Compare the A inventory while permitting the intended record change.
@@ -386,7 +426,9 @@ fn every_native_failure_preserves_a_record_metadata_and_artifact_hashes() {
     let server = Server::new();
     let a = h.image(&ArchiveSpec::default());
     let pin_a = server.image("images", "a", &a);
-    success(&h.set_default(&pin_a));
+    // The subject is an existing approval to preserve; seed it explicitly now
+    // that `set-default` writes no pin (R5).
+    h.pin_and_set_default(&pin_a);
     for spec in [
         ArchiveSpec {
             marker: "foreign-direct".into(),
@@ -545,12 +587,21 @@ fn actual_usage_health_and_config_boundaries_do_not_choose_set_default_target() 
         assert!(!h.record().exists());
         assert_eq!(server.count(), 0);
     }
-    // `--yes` is accepted (and is the only pre-authorization this verb has); an
-    // unreachable target then fails at acquisition, not at parsing.
-    let out = h.run(&["image", "set-default", "--image", "a:tag", "--yes"]);
-    assert_ne!(out.status.code(), Some(2), "`--yes` must parse");
-    assert_eq!(out.status.code(), Some(1));
-    assert!(!h.record().exists());
+    // No verb has `--yes` any more: the explicit command is the consent, so the
+    // flag is an ordinary usage error and nothing is acquired (B4, #541).
+    for args in [
+        vec!["image", "set-default", "--image", "a:tag", "--yes"],
+        vec!["image", "refresh", "--yes"],
+    ] {
+        let out = h.run(&args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("unexpected argument '--yes'"),
+            "{args:?}"
+        );
+        assert!(!h.record().exists());
+        assert_eq!(server.count(), 0, "{args:?}");
+    }
     let user = h.home.join(".config/agent-vm/config.toml");
     fs::create_dir_all(user.parent().unwrap()).unwrap();
     fs::write(&user, "broken = [").unwrap();
@@ -949,8 +1000,8 @@ fn old_artifact_hash_oracle_detects_a_structurally_valid_overwrite() {
 
 /// R3/R10: an unchanged refresh reuses cached layer bytes; re-resolving a moving
 /// tag lands the new manifest under the same cache key, keeps the old content
-/// intact, and — because it replaces the established approval — needs the
-/// command's own `--yes`.
+/// intact, and — because it replaces the established approval — renders the
+/// change. Invoking the explicit command is the consent (#541, R6).
 #[test]
 fn refresh_reacquires_a_moving_tag_without_destroying_cached_artifacts() {
     let h = Harness::new();
@@ -990,7 +1041,7 @@ fn refresh_reacquires_a_moving_tag_without_destroying_cached_artifacts() {
     // artifacts byte-identical, and mark the acquired digest.
     let _pin_b = server.image("images", "mutable", &b);
     let before_move = server.requests().len();
-    success(&h.refresh_yes(Some(&tag)));
+    success(&h.refresh(Some(&tag)));
     assert_eq!(
         cached_manifest_digest(&h.cache(), &tag),
         b.written.manifest_digest
@@ -1735,13 +1786,13 @@ impl Coordinated {
         guard_path(&self.h.cache(), &self.tag)
     }
 
-    /// A contending refresh of the same tag. A peer here re-resolves to
-    /// different content, so it carries the command's own `--yes`.
+    /// A contending refresh of the same tag. The explicit refresh is its own
+    /// consent, so it carries no flag (#541).
     fn spawn(&self, gate: &AcquisitionGate) -> Peer {
         Peer::spawn(
             self.h.command(),
             gate,
-            &["image", "refresh", "--image", &self.tag, "--yes"],
+            &["image", "refresh", "--image", &self.tag],
         )
     }
 }
@@ -2840,8 +2891,26 @@ fn refresh_selection_and_broken_config_recovery_acquire_only_the_winning_tier() 
             command.args(["--image", &tiers["cli"].0]);
         }
         let out = bounded(&mut command);
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        if row.name == "broken-default" {
+            // R8/B9: a bare refresh refuses the default-tier fall-through, so
+            // nothing is acquired, approved or written.
+            assert_eq!(out.status.code(), Some(1), "{stdout}");
+            assert!(
+                String::from_utf8_lossy(&out.stderr)
+                    .contains("does not fall back to the default boot image"),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(server.count(), 0, "no registry request");
+            assert_eq!(
+                fs::read(h.record()).unwrap(),
+                record_before.clone().unwrap()
+            );
+            assert!(!h.home.join(".config/agent-vm/image-pins.json").exists());
+            continue;
+        }
         success(&out);
-        let stdout = String::from_utf8_lossy(&out.stdout);
         assert_eq!(
             stdout.contains("configured image settings could not be read"),
             row.broken,
@@ -3851,7 +3920,9 @@ fn failed_candidates_preserve_approval_hashes_and_fresh_cli_preparation() {
         let a = h.image(&ArchiveSpec::default());
         let pin_a = server.image("images", "preserve", &a);
         let tag = format!("{}/images:preserve", server.host);
-        success(&h.set_default(&tag));
+        // S1's set-default wrote this project's pin itself; the fixture needs
+        // both records, so it refreshes and then sets the starting choice (#541).
+        h.pin_and_set_default(&tag);
         let before = Snapshot::take(&h, &pin_a, &a);
         let spec = match failure {
             "invalid-layer" => ArchiveSpec {
@@ -3945,7 +4016,7 @@ fn failed_candidates_preserve_approval_hashes_and_fresh_cli_preparation() {
             }
             _ => {}
         }
-        let out = h.set_default_yes(&tag);
+        let out = h.set_default(&tag);
         assert_eq!(
             out.status.code(),
             Some(1),
@@ -4014,8 +4085,8 @@ fn update_and_import_leave_project_persist_and_runtime_state_unchanged() {
     for operation in ["refresh", "set-default", "import"] {
         let archive = h.root.path().join("state-b.tar");
         let args = match operation {
-            "refresh" => vec!["image", "refresh", "--image", &tag, "--yes"],
-            "set-default" => vec!["image", "set-default", "--image", &tag, "--yes"],
+            "refresh" => vec!["image", "refresh", "--image", &tag],
+            "set-default" => vec!["image", "set-default", "--image", &tag],
             _ => vec![
                 "image",
                 "import",

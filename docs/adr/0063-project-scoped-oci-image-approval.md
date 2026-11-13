@@ -9,6 +9,15 @@ to a **project**, and the store format is version 2. Later slices of #532
 (S2 project defaults, S3 active image set, S4 refresh over the active set, S5
 build inputs) are not decided here.
 
+**S2 implemented by [ADR-0067](0067-project-default-boot-image.md) (0.7.47):**
+Decision 7 is superseded — `image set-default` no longer pins and no longer
+changes any project's default, because each project now has its own (stored in
+the same version-2 file, whose `defaults` field ADR-0067 adds). Decision 2's
+entry points are now launch, `setup`, `image refresh`, `image set-default`,
+`image build`, `image import`, `image show`, `doctor`, `clipboard` and `access`
+(`access` was missing from this list since S1). Decision 6: refresh renders
+"in this project" but no longer asks (ADR-0067).
+
 **Superseded in part** by #532's review round 4 (recorded there as
 _Supersedance — the upgrade blocks stop reconstructing authority_). Decision 5's
 clause that the procedure "finishes an interrupted `set-default` as the old

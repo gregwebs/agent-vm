@@ -1,19 +1,22 @@
 //! Deliberate acquisition of one explicit target and publication of it as the
-//! user-owned default. The acquisition path, the candidate approval and both
-//! records belong to [`crate::image_pin`]: this module owns only the command's
-//! argument shape and the words it prints.
+//! host's **starting choice**. The acquisition path, the approval authority and
+//! both records belong to [`crate::image_pin`]: this module owns only the
+//! command's argument shape and the words it prints.
 //!
 //! The target is required and typed (`--image REF`), so no ambient selection,
 //! image override, broken catalog or current recommendation can choose it. The
-//! same pin that a launch would consume is approved here, and the retained
-//! fallback then stores the approved host child — never the source tag (#392).
+//! host record then stores the validated host child — never the source tag
+//! (#392) — and this command writes no approval at all (ADR-0067), so it cannot
+//! change what an **established** project boots, including the invoking one. An
+//! unestablished project has no default of its own, so the host record is still
+//! its starting choice and its next default-tier use boots and establishes it.
 
 use std::io::Write;
 use std::str::FromStr;
 
 use super::ImageRef;
 use crate::image_acquire::{OciTarget, OciTargetError};
-use crate::image_pin::{ApprovalMode, ExplicitOperation, UpdateOutcome};
+use crate::image_pin::{DefaultChange, HostDefaultSet, InvokingProject};
 use crate::project::ProjectDir;
 use anyhow::Result;
 
@@ -28,14 +31,11 @@ const INVALID_REFERENCE_REASON: &str =
 
 #[derive(clap::Args)]
 pub(crate) struct Args {
-    /// OCI image to acquire and retain for future default-image sessions.
+    /// OCI image to acquire and retain as the starting default for projects that
+    /// have none yet; established projects keep their own (run `agent-vm image
+    /// refresh` in one to adopt it).
     #[arg(long = "image", value_name = "REF", value_parser = SetDefaultTargetParser)]
     target: SetDefaultTarget,
-
-    /// Replace an existing approval without asking. Exactly the resolved
-    /// candidate is authorized; a first pin or an unchanged one never asks.
-    #[arg(long)]
-    yes: bool,
 }
 
 #[derive(Clone)]
@@ -105,58 +105,79 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     let project = ProjectDir::capture()?;
     crate::msb_preflight::ensure_db_not_ahead().await?;
     crate::image_log_guard::activate();
-    let outcome = crate::image_pin::update(
-        ExplicitOperation::SetDefault(&args.target.0),
-        &project,
-        ApprovalMode::of_flag(args.yes),
-    )
-    .await?;
+    let outcome = crate::image_pin::set_default(&args.target.0, &project).await?;
     let notice = notice(outcome);
-    // Publication already committed: output failure cannot turn success into error.
+    // The host record is already committed: output failure cannot turn success
+    // into error.
     let _ = writeln!(std::io::stderr(), "{notice}");
     Ok(())
 }
 
-/// What the user is told. The retained fallback is reported independently of the
-/// approval: a matching pin that still moved the fallback is a change, and
-/// saying "already selected" after moving it would be false.
-fn notice(outcome: UpdateOutcome) -> &'static str {
-    if outcome.changed_anything() {
-        "Default boot image selected for future default-image sessions; image overrides and running sessions are unchanged."
-    } else {
-        "Default boot image is already selected; image overrides and running sessions are unchanged."
-    }
+/// What the user is told: the host's starting choice first, then what this
+/// project is doing about it. Two sentences on purpose — the host change and the
+/// invoking project's disposition are separate facts, and a command whose whole
+/// point is that it does not move an established project must say whether it
+/// applies here.
+fn notice(outcome: HostDefaultSet) -> String {
+    let retained = match outcome.retained_default {
+        DefaultChange::Unchanged => {
+            "Default boot image is already selected for projects that have none yet; \
+             established projects, image overrides and running sessions are unchanged."
+        }
+        DefaultChange::Initialized | DefaultChange::Replaced => {
+            "Default boot image selected for projects that have none yet; established \
+             projects, image overrides and running sessions are unchanged."
+        }
+    };
+    let this_project = match outcome.this_project {
+        InvokingProject::NotEstablished => {
+            "This project has no default boot image yet, so its next default-image session \
+             starts from this one."
+        }
+        InvokingProject::AlreadyUses => "This project already uses it.",
+        InvokingProject::KeepsItsOwn => {
+            "This project keeps its own default boot image; run `agent-vm image refresh` here \
+             to adopt this one."
+        }
+    };
+    format!("{retained} {this_project}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::boot_image::ImmutableImageRef;
-    use crate::image_pin::{ApprovalChange, DefaultChange};
 
+    /// The 3x3 notice table: only a host record that did not change says
+    /// "already selected", and only a project that keeps its own default names
+    /// the command that adopts the new one.
     #[test]
-    fn a_moved_fallback_is_never_reported_as_already_selected() {
-        for approval in [
-            ApprovalChange::FirstPin,
-            ApprovalChange::Unchanged,
-            ApprovalChange::Replaced,
+    fn the_notice_states_the_host_choice_then_the_invoking_project() {
+        for retained_default in [
+            DefaultChange::Unchanged,
+            DefaultChange::Initialized,
+            DefaultChange::Replaced,
         ] {
-            for retained_default in [
-                DefaultChange::Unchanged,
-                DefaultChange::Initialized,
-                DefaultChange::Replaced,
+            for this_project in [
+                InvokingProject::NotEstablished,
+                InvokingProject::AlreadyUses,
+                InvokingProject::KeepsItsOwn,
             ] {
-                let text = notice(UpdateOutcome {
-                    approval,
+                let text = notice(HostDefaultSet {
                     retained_default,
+                    this_project,
                 });
-                let changed = approval != ApprovalChange::Unchanged
-                    || retained_default != DefaultChange::Unchanged;
                 assert_eq!(
                     text.contains("already selected"),
-                    !changed,
-                    "{approval:?}/{retained_default:?}: {text}"
+                    retained_default == DefaultChange::Unchanged,
+                    "{retained_default:?}/{this_project:?}: {text}"
                 );
+                assert_eq!(
+                    text.contains("agent-vm image refresh"),
+                    this_project == InvokingProject::KeepsItsOwn,
+                    "{retained_default:?}/{this_project:?}: {text}"
+                );
+                assert!(text.ends_with('.'), "the notice is two sentences: {text}");
             }
         }
     }

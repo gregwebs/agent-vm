@@ -237,6 +237,7 @@ fn run_dispatch(dispatch: Dispatch) -> Result<()> {
         cmd: Cmd::Image(args),
         catalog,
         images,
+        images_read: _,
     } = &dispatch
         && args.is_show()
     {
@@ -339,7 +340,8 @@ fn run_dispatch(dispatch: Dispatch) -> Result<()> {
                 cmd: Cmd::Setup(args),
                 catalog,
                 images,
-            } => setup::run(args, catalog, images).await,
+                images_read,
+            } => setup::run(args, catalog, images, images_read).await,
             // The image group: `refresh` acquires natively and `set-default`
             // retains explicitly (both carry the original catalog/images, so
             // their documented broken-config recovery is preserved), while
@@ -349,6 +351,7 @@ fn run_dispatch(dispatch: Dispatch) -> Result<()> {
                 cmd: Cmd::Image(args),
                 catalog,
                 images,
+                images_read: _,
             } => exit_with(image_cmd::run(args, catalog, images).await?),
             Dispatch::Builtin {
                 cmd: Cmd::Clipboard(args),
