@@ -49,6 +49,18 @@ still refuses a header, query or path placeholder, but forwards one in a
 request body. Pinned by
 `body_placeholder_is_forwarded_to_any_host_without_its_value`.
 
+A later fork change (gregwebs/microsandbox#117) makes a credential refusal
+explain itself. Its `403` (`code: secret_policy_denied`) states which credential
+was refused — its environment variable, or "a credential" when that name would
+itself carry a placeholder — where the placeholder was sent, the destination and
+the reason: the engine's facts. The same value-free fields reach `network.log`.
+agent-vm then appends one remedy sentence verbatim, for every reason: signing in
+again inside the sandbox will not fix it, so run `agent-vm access` outside the
+sandbox. agent-vm supplies that sentence once, in `credential_injection::Plan`;
+the engine owns the facts. agent-vm's sentence is pinned by
+`the_credential_policy_remedy_reaches_the_launch_config` and the launch goldens,
+the facts by the engine's `crates/network/tests/secret_deny_response.rs`.
+
 The widening therefore adds no new destination for a value. A guest could
 already put the placeholder in any header, including `Authorization: Bearer`,
 on these same hosts and have it substituted. Basic encoding is just another way

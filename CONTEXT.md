@@ -288,6 +288,31 @@ the built-in providers' structurally valid JWT placeholders.
 _Avoid_: "placeholder" unqualified, which in this repo also means those built-in
 provider placeholders and the `!command` credential sentinels.
 
+## Provider placeholder
+
+The non-secret stand-in for a built-in credential provider's secret that the
+guest's environment and credential files carry (e.g. the value of
+`MSB_AGENT_VM_ANTHROPIC_UNUSED`). The real value replaces it outside the
+sandbox, in request headers only, for that provider's own destinations. In a
+request body it is a marker and passes through unchanged. Sent in a header,
+query string or request line where its secret cannot serve it, it causes a
+**credential refusal**.
+
+_Avoid_: "placeholder" unqualified (see **Sentinel**); "fake token".
+
+## Credential refusal
+
+The sandbox's refusal of a request that carries a placeholder its secret cannot
+serve: the destination is not covered, the destination could not be verified, or
+the sandbox could not read the real value. Any built-in secret's placeholder can
+cause one, the GitHub token's as much as a credential provider's. Its `403`
+(`code: secret_policy_denied`) states the credential, where the placeholder was
+sent, the destination and the reason (the engine's facts), then agent-vm's
+remedy: signing in again inside the sandbox will not fix it, so run
+`agent-vm access` outside the sandbox.
+
+_Avoid_: "secret violation", which is the proxy's own error wording.
+
 ## Secret store
 
 agent-vm's own namespace in the **host OS credential store** (macOS Keychain,
