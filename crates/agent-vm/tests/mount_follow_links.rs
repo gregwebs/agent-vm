@@ -324,6 +324,59 @@ fn follow_links_discovers_transitive_targets_readonly() {
 }
 
 #[test]
+fn mount_notices_are_bounded_and_point_at_msb_inspect() {
+    let h = Harness::new();
+    let home = h.home_path();
+
+    // One `==> Mounting` line per discovered target, so ten targets plus the
+    // HOST bind exceed the launch's eight-line report budget (mount.rs
+    // `MAX_MOUNT_NOTICES`).
+    let host_mount = home.join("links");
+    std::fs::create_dir_all(&host_mount).unwrap();
+    let mut targets = Vec::new();
+    for i in 0..10 {
+        let target = home.join(format!("target-{i}"));
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, host_mount.join(format!("link-{i}"))).unwrap();
+        targets.push(target);
+    }
+
+    let mount_arg = format!("{}:ro:follow-links", host_mount.display());
+    let out = h.run_shell(&[&mount_arg]);
+    let err = stderr_of(&out);
+
+    let mounting = err
+        .lines()
+        .filter(|line| line.starts_with("==> Mounting "))
+        .count();
+    assert_eq!(mounting, 8, "the notice budget is eight lines:\n{err}");
+    let summary: Vec<&str> = err
+        .lines()
+        .filter(|line| line.contains("more mounts not shown"))
+        .collect();
+    assert_eq!(summary.len(), 1, "one summary line:\n{err}");
+    assert!(
+        summary[0].starts_with(
+            "==>   … and 3 more mounts not shown (view all: agent-vm msb inspect agent-vm-"
+        ),
+        "the summary names the read-everything command: {}",
+        summary[0]
+    );
+
+    // The cap is a report cap, not a mount cap: every discovered target still
+    // reaches the sandbox configuration, which `msb inspect` reads back.
+    let config = debug_config_json(&err);
+    let mounts = bind_mounts(&config);
+    for target in &targets {
+        let target = target.to_str().unwrap();
+        assert!(
+            mounts.iter().any(|(host, _, _)| host == target),
+            "{target} must still be mounted: {mounts:?}"
+        );
+    }
+}
+
+#[test]
 fn follow_links_binds_target_at_the_literal_path_the_guest_will_readlink() {
     let h = Harness::new();
     let home = h.home_path();
