@@ -1198,6 +1198,28 @@ fn assert_tool_dependent_content(tool: &str, config: &serde_json::Value) {
             "{tool}'s intercept object must be the inactive serde default body"
         );
     }
+
+    // #562: the remedy must reach the config the runtime reads. Spelled out:
+    // this crate has no library. `dsh` registers no secret.
+    let remedy = concat!(
+        "This is agent-vm credential policy: signing in again inside the sandbox will not fix it. ",
+        "Run `agent-vm access` outside the sandbox."
+    );
+    assert_eq!(
+        config["network"]["http"]["secret_deny_message"].as_str(),
+        (tool != "dsh").then_some(remedy),
+        "the credential-policy remedy must reach the launch config ({tool})"
+    );
+    assert_eq!(
+        config["network"]["http"]["deny_response"],
+        serde_json::json!(true),
+        "no 403 reaches the guest unless the refusal is answered ({tool})"
+    );
+    assert_eq!(
+        config["network"]["http"]["deny_response_format"],
+        serde_json::json!("json"),
+        "no credential 403 is sent without a JSON deny response ({tool})"
+    );
 }
 
 // -- #161: credentials.yaml -------------------------------------------------
