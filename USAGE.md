@@ -3091,9 +3091,23 @@ Reads from the host:
 The guest gets placeholder strings; the proxy substitutes on the wire.
 Each built-in secret substitutes in headers only, on its exact hosts. A
 placeholder in a request body — typically a transcript quoting `env` output or
-a guest `auth.json` — reaches any host unchanged: it is a marker, not a token.
-The same placeholder in a header, query string or URL path on a host its secret
-does not allow is refused with `403 Request blocked by secret policy.`
+a guest `auth.json` — reaches any destination unchanged: it is a marker, not a
+token. The same placeholder in a header, query string or request line is refused
+when its secret cannot serve the request: the destination is not covered, the
+destination could not be verified, or the sandbox could not read the real value.
+The refusal is a `403` whose `code` is `secret_policy_denied`. Its `message`
+names the refused credential, where the placeholder was sent, the destination and
+the reason (with the destinations the secret does cover, when the destination is
+not one), then agent-vm's remedy: signing in again inside the sandbox will not
+fix it; run `agent-vm access` outside the sandbox. The facts sentence for the
+Anthropic placeholder, in a header sent to `api.deepseek.com`:
+
+> Blocked: MSB_AGENT_VM_ANTHROPIC_UNUSED was sent in a request header to
+> api.deepseek.com; it is substituted only for api.anthropic.com,
+> platform.claude.com and mcp-proxy.anthropic.com.
+
+See [Troubleshooting](#troubleshooting) for an agent that shows only
+`Failed to authenticate. API Error: 403`.
 Real tokens live in `${XDG_STATE_HOME}/agent-vm/<hash>.secrets/` (0700)
 on the host, **outside** the bind mount the guest sees. A SHA-256
 snapshot of the three credential files is taken at launch and
@@ -4592,6 +4606,13 @@ with launch flags as described in [Persisted grants](#persisted-grants-user-conf
 
 ## Troubleshooting
 
+- **`Request blocked by secret policy` / `secret_policy_denied` /
+  `Failed to authenticate. API Error: 403`** — the sandbox refused a placeholder
+  its secret cannot serve: the destination is not covered or could not be
+  verified, or the real value could not be read. It is agent-vm credential
+  policy: signing in again inside the sandbox will not fix it. Run `agent-vm
+  access` outside the sandbox. This row is the last resort for a harness that
+  hides the 403 message and shows only the generic authentication error.
 - **Could not find its bundled `msb` binary after copying:** copy the whole
   bundle (`bin/agent-vm`, `bin/msb`, `lib/libkrunfw.5.dylib` on macOS), or
   build the opt-in single binary with `./script/build/macos.sh --single-binary`.
