@@ -702,6 +702,19 @@ fn a_missing_home_reports_an_unavailable_user_tier() {
         stdout.contains("<no HOME; user tier unavailable>"),
         "{stdout}"
     );
+    // An unlocatable authority is already this report's config finding. It must
+    // not become a second, boot-image damage diagnosis: the run still fails, but
+    // through the credential store, and no row or trailing error calls the
+    // missing `$HOME` damaged pin authority (ADR-0067, R10).
+    let stderr = stderr_of(&out);
+    assert!(
+        !stderr.contains("image pin authority"),
+        "a missing $HOME is not damaged pin authority: {stderr}"
+    );
+    assert!(
+        stderr.contains("credential store check failed"),
+        "the run still fails, for the reason it actually has: {stderr}"
+    );
 }
 
 #[test]

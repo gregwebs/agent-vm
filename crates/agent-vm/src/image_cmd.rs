@@ -6,10 +6,10 @@
 //! here would select, so it is dispatched before runtime discovery and setup
 //! (see `main`). `refresh` acquires bytes natively and never boots. `build`/
 //! `import` are the explicit user-owned publication verbs from ADR-0043; only
-//! they may invoke Docker. They are also the only verbs that approve a
-//! **replacement** without either a prompt or `--yes`: each approves exactly
-//! its own result reference (#391). `import` additionally *observes* the
-//! selection after publishing (#385) — it never changes it.
+//! they may invoke Docker. `refresh`, `build` and `import` are each their own
+//! consent and none asks (#391, ADR-0067): each approves exactly what it
+//! resolved or published. `import` additionally *observes* the selection after
+//! publishing (#385) — it never changes it.
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Args as ClapArgs, Subcommand};
@@ -70,11 +70,12 @@ pub(crate) enum ImageCmd {
     Show,
     /// Acquire the selected OCI image into the image cache without booting a VM.
     ///
-    /// Re-resolves the reference and reuses valid cached layers; it creates no
-    /// sandbox, temporary disk or running guest, and never changes an existing
-    /// retained default.
+    /// Re-resolves the reference, approves what it resolves for this project
+    /// without asking, and may adopt the host's default boot image in a project
+    /// that has its own; it never boots.
     Refresh(crate::pull::Args),
-    /// Acquire an OCI image and retain it as the default for future sessions.
+    /// Acquire an OCI image and make it the starting default for projects that
+    /// have none yet. Established projects keep their own default.
     ///
     /// The target is required and explicit: an ambient launch image, an image
     /// option outside this subcommand, a broken catalog or the current
@@ -105,7 +106,13 @@ pub(crate) fn preflight(args: &Args) -> Result<()> {
 /// reference is never logged.
 pub(crate) fn show(configured: &ConfiguredImages) -> Result<()> {
     use std::io::Write as _;
-    let report = crate::boot_image::inspect_selection(configured)?;
+    // The tenth capture site (ADR-0063 Decision 2): selection needs to know
+    // which project's default it would read. Held as data so a higher explicit
+    // source still prints when the cwd cannot be captured; the capture creates
+    // nothing, so the read-only, offline contract holds.
+    #[allow(clippy::disallowed_methods)] // one capture per command: every consumer borrows it.
+    let project = crate::project::ProjectDir::capture();
+    let report = crate::boot_image::inspect_selection(configured, &project)?;
     std::io::stdout()
         .lock()
         .write_all(report.as_bytes())
@@ -118,8 +125,9 @@ pub(crate) async fn run(args: Args, catalog: Catalog, images: ConfiguredImages) 
         // the early dispatch was bypassed, which is a wiring error, not input.
         ImageCmd::Show => bail!("image show must be dispatched before runtime setup"),
         ImageCmd::Refresh(args) => {
-            // Refresh forwards the *original* carried configuration so its
-            // documented broken-config recovery still applies.
+            // Refresh forwards the *original* carried configuration so its own
+            // broken-config rules apply: an explicit `--image`/env still works,
+            // a bare refresh refuses the default-tier fall-through (R8).
             crate::pull::run(args, catalog, images).await?;
             Ok(0)
         }
@@ -134,7 +142,7 @@ pub(crate) async fn run(args: Args, catalog: Catalog, images: ConfiguredImages) 
             // catalog exposes its tiers, a broken one is reported to import as
             // a failure it tolerates after a successful publication. Refresh and
             // set-default above never see this derived value, so neither
-            // silently loses broken-config recovery.
+            // silently changes how it reads a broken configuration.
             let configured = match &catalog {
                 Catalog::Ready(_) => Ok(&images),
                 Catalog::Broken(error) => Err(anyhow::anyhow!("{error:#}")),

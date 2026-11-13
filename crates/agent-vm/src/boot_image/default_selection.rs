@@ -15,15 +15,17 @@
 //!
 //! # Why this module only encodes, decodes and snapshots now
 //!
-//! The record's *decisions* belong to the project approval authority: the first pin
-//! and the fallback are committed as one journaled transaction
-//! ([`crate::image_pin`]), because a fallback can only be retained for content
-//! that was measured and approved. So the mutators that used to live here are
-//! gone, and what remains is the byte-level schema: [`decode_snapshot`],
-//! [`encode_snapshot`], [`snapshot_at`] and [`load`], which is a read of the
-//! logical record through that authority. Keeping the encoding here is what lets
-//! the pin store preserve a user's own formatting and a legacy spelling without
-//! a second schema.
+//! The record's *decisions* belong to the project approval authority
+//! ([`crate::image_pin`]): a default can only be retained for content that was
+//! measured and approved. `image set-default` makes the one host save; a
+//! selection that was the initial recommendation lets the first pin write the
+//! host record **before** the pin store, which is the narrowed ADR-0047
+//! guarantee; and every other default-tier preparation only reads the record. So
+//! the mutators that used to live here are gone, and what remains is the
+//! byte-level schema: [`decode_snapshot`], [`encode_snapshot`], [`snapshot_at`]
+//! and [`load`], which is a read of the logical record through that authority.
+//! Keeping the encoding here is what lets the pin store preserve a user's own
+//! formatting and a legacy spelling without a second schema.
 //!
 //! # Failure and atomicity contract
 //!
@@ -33,8 +35,9 @@
 //! either no file or a complete one — never an empty "already selected" file.
 //! That primitive does not `fsync`, so this module promises the repository's
 //! existing trusted-host interruption atomicity, not power-loss durability. The
-//! pin store's `pending_default` journal is what makes the *pair* of records
-//! survive an interruption.
+//! pin store's `pending_default` journal, which an interrupted S1 operation may
+//! have left, is still authoritative for observation and is recovered by the
+//! next write; no operation writes a new one (R9).
 //!
 //! # Diagnostic safety
 //!

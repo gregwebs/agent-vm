@@ -5519,9 +5519,14 @@ fn image_refresh_help_describes_acquisition_not_booting() {
         }
     }
     let set_default = stdout_of(&harness.builtin(&["image", "set-default", "--help"], &[]));
+    // B1: the help now says whose default the command changes (#541).
     assert!(
-        set_default.contains("OCI image to acquire and retain for future default-image sessions"),
-        "set-default's own help must not change:\n{set_default}"
+        set_default.contains("starting default for projects that have none yet"),
+        "set-default's help states the host starting choice:\n{set_default}"
+    );
+    assert!(
+        set_default.contains("established projects keep their own"),
+        "set-default's help names the established-project rule:\n{set_default}"
     );
     assert!(
         !set_default.contains("instead of the configured selection"),
@@ -5565,9 +5570,10 @@ fn refresh_and_setup_reject_removed_composition_flags_as_usage_errors() {
         for argv in [
             vec!["--layer", "/tmp/x"],
             vec!["--base-image", "x"],
-            // `--yes` is a nested consent flag of the two explicit update verbs;
-            // `setup` still has none, and the old global `-y` remains gone.
-            // (`image refresh --yes` is asserted below as an accepted parse.)
+            // `--yes` is removed from the two explicit update verbs, so passing
+            // it is a nested usage error there; `setup` has none, and the old
+            // global `-y` remains gone. (`image refresh --yes` is asserted below
+            // as rejected.)
             vec!["-y"],
         ] {
             if verb_name(verb) == "setup" && argv == ["-y"] {
@@ -5591,14 +5597,27 @@ fn refresh_and_setup_reject_removed_composition_flags_as_usage_errors() {
             );
         }
     }
-    // The nested consent flag: `image refresh --yes` parses (asserted through
-    // `--help`, so no registry work happens); `setup --yes` does not.
+    // No verb has `--yes` any more (B4): the explicit command is the consent,
+    // so both removed flags are ordinary usage errors.
     let harness = Harness::new();
-    let accepted = harness.builtin(&["image", "refresh", "--yes", "--help"], &[]);
-    assert_eq!(accepted.status.code(), Some(0), "{}", stderr_of(&accepted));
-    assert!(stdout_of(&accepted).contains("--yes"));
-    let refused = harness.builtin(&["setup", "--yes"], &[]);
-    assert_eq!(refused.status.code(), Some(2), "{}", stderr_of(&refused));
+    for argv in [
+        vec!["image", "refresh", "--yes"],
+        vec!["image", "set-default", "--image", CLI_REF, "--yes"],
+        vec!["setup", "--yes"],
+    ] {
+        let refused = harness.builtin(&argv, &[]);
+        assert_eq!(
+            refused.status.code(),
+            Some(2),
+            "{argv:?}: {}",
+            stderr_of(&refused)
+        );
+        assert!(
+            stderr_of(&refused).contains("unexpected argument"),
+            "{argv:?}: {}",
+            stderr_of(&refused)
+        );
+    }
 }
 
 /// Every token after the verb is forwarded verbatim (ADR-0042).
@@ -5708,6 +5727,20 @@ fn broken_config_pull_and_setup_explain_the_image_fallback() {
             let verb = verb_name(verb);
             let stderr = stderr_of(&out);
             let stdout = stdout_of(&out);
+            if verb == "image refresh" && cli.is_none() && env.is_none() {
+                // R8/B9 (#541): a bare refresh refuses the default-tier
+                // fall-through, so nothing is acquired or approved.
+                assert_eq!(out.status.code(), Some(1), "{verb}: {stderr}");
+                assert!(
+                    stderr.contains("does not fall back to the default boot image"),
+                    "{verb}: {stderr}"
+                );
+                assert!(
+                    !harness.selection_exists() && !harness.pins_exists(),
+                    "{verb} must write nothing"
+                );
+                continue;
+            }
             assert!(
                 stdout.contains("configured image settings could not be read"),
                 "{verb} must warn about the unreadable image config:\n{stdout}\n{stderr}"
@@ -5718,11 +5751,20 @@ fn broken_config_pull_and_setup_explain_the_image_fallback() {
                 !stdout.contains(USER_REF) && !stdout.contains(PROJECT_REF),
                 "{verb} must not fabricate a configured image:\n{stdout}"
             );
+            if verb == "setup" {
+                // R3 (#541): a setup made while the configuration is unreadable
+                // never establishes the project's default.
+                assert!(
+                    !harness.defaults_record_exists(),
+                    "{verb} must not establish a project default:\n{stdout}"
+                );
+            }
         }
     }
 
-    // A dangling `tools` reference is a catalog error, but a readable `image`
-    // must survive for refresh/setup/doctor.
+    // A dangling `tools` reference is a catalog error. A readable `image` still
+    // survives for setup and doctor; a bare refresh refuses, because its tool
+    // configuration could not be read (R8, #541).
     let harness = Harness::new();
     harness.write_project(&format!(
         "image = \"{PROJECT_REF}\"\n[[tools]]\nname = \"t\"\ncommand = \"t\"\ntools = [\"nope\"]\n"
@@ -5730,6 +5772,14 @@ fn broken_config_pull_and_setup_explain_the_image_fallback() {
     for verb in ACQUISITION_VERBS {
         let out = harness.builtin(verb, &[("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref())]);
         let stderr = stderr_of(&out);
+        if verb_name(verb) == "image refresh" {
+            assert_eq!(out.status.code(), Some(1), "{stderr}");
+            assert!(
+                stderr.contains("does not fall back to the default boot image"),
+                "{stderr}"
+            );
+            continue;
+        }
         check_pull_acquisition(&stderr, PROJECT_REF)
             .unwrap_or_else(|problem| panic!("{}: {problem}\n{stderr}", verb_name(verb)));
     }
@@ -6062,6 +6112,33 @@ impl Harness {
         std::fs::read(self.selection_record()).ok()
     }
 
+    /// The pin store under this harness's isolated `$HOME`.
+    fn pins_record(&self) -> PathBuf {
+        self.home_root.join(".config/agent-vm/image-pins.json")
+    }
+
+    fn pins_exists(&self) -> bool {
+        self.pins_record().exists()
+    }
+
+    fn selection_exists(&self) -> bool {
+        self.selection_record().exists()
+    }
+
+    /// Whether the store records any project default (R3's binding rule).
+    fn defaults_record_exists(&self) -> bool {
+        std::fs::read(self.pins_record())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|store| {
+                store
+                    .get("defaults")
+                    .and_then(|defaults| defaults.as_array())
+                    .map(|defaults| !defaults.is_empty())
+            })
+            .unwrap_or(false)
+    }
+
     fn assert_no_selection(&self, context: &str) {
         assert!(
             self.selection_bytes().is_none(),
@@ -6366,9 +6443,16 @@ fn a_retained_selection_survives_a_changed_recommendation() {
             doctor.contains("default: retained default ["),
             "doctor must report the retained selection safely:\n{doctor}"
         );
+        // #541 (R10, B8): the launch established this project's own default from
+        // the retained record before it failed at create, and `doctor` reports
+        // the project-aware selection with its own label.
         assert!(
-            doctor.contains("selected (without --image): retained default ["),
-            "doctor must select the retained image safely:\n{doctor}"
+            doctor.contains("selected (without --image): project default ["),
+            "doctor must select the project default safely:\n{doctor}"
+        );
+        assert!(
+            doctor.contains("project default: established ["),
+            "doctor must report the project default row:\n{doctor}"
         );
         assert!(
             !doctor.contains(default_ref()) && !doctor.contains(recommendation_b()),

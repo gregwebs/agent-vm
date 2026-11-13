@@ -154,13 +154,13 @@ impl Harness {
 
     fn refresh(&self, reference: &str) -> Output {
         let mut command = self.command();
-        command.args(["image", "refresh", "--image", reference, "--yes"]);
+        command.args(["image", "refresh", "--image", reference]);
         bounded(command)
     }
 
     fn set_default(&self, reference: &str) -> Output {
         let mut command = self.command();
-        command.args(["image", "set-default", "--image", reference, "--yes"]);
+        command.args(["image", "set-default", "--image", reference]);
         bounded(command)
     }
 

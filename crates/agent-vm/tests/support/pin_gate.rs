@@ -43,11 +43,10 @@ pub enum PinStage {
     BeforePinLock,
     /// Holding the exclusive pin-store lock, before rereading.
     PinLocked,
-    /// About to write the journal intent.
-    BeforeIntentSave,
-    /// The journal intent is durable (atomic rename returned).
-    IntentSaved,
-    /// The default record was written inside the transaction.
+    /// About to write the single host-record save of a default-tier
+    /// preparation.
+    BeforeDefaultSave,
+    /// The host record was written inside the transaction.
     DefaultSaved,
     /// About to write the final pin store (or its recovery form).
     BeforePinSave,
@@ -62,8 +61,7 @@ impl PinStage {
             Self::CandidateReady => "candidate-ready",
             Self::BeforePinLock => "before-pin-lock",
             Self::PinLocked => "pin-locked",
-            Self::BeforeIntentSave => "before-intent-save",
-            Self::IntentSaved => "intent-saved",
+            Self::BeforeDefaultSave => "before-default-save",
             Self::DefaultSaved => "default-saved",
             Self::BeforePinSave => "before-pin-save",
             Self::PinCommitted => "pin-committed",
@@ -76,8 +74,7 @@ impl PinStage {
             Self::CandidateReady,
             Self::BeforePinLock,
             Self::PinLocked,
-            Self::BeforeIntentSave,
-            Self::IntentSaved,
+            Self::BeforeDefaultSave,
             Self::DefaultSaved,
             Self::BeforePinSave,
             Self::PinCommitted,

@@ -15,6 +15,16 @@ body below is the historical decision.
 Follow-up #392 (default source-reference retention) is deliberately not decided
 here; the boundary below records what stays open.
 
+Amended by [ADR-0067](0067-project-default-boot-image.md) (0.7.47):
+`image set-default` writes no pin; the `pending_default` journal is no longer
+written (an existing one is still honored and recovered); the failed-operation
+guarantee is narrowed — a failed recommendation-sourced first launch may leave
+the host starting choice initialized with measured content; the retained record
+is a starting choice for projects without a default; `image refresh` is its own
+consent and asks nothing, and `--yes` is removed from both update verbs. The
+*Candidate-scoped consent* paragraph's prompt and `--yes` sentences are
+historical (the frozen candidate and the compare-and-swap stand).
+
 ## Context
 
 ADR-0035 pinned only the **retained default**. A config, environment or CLI

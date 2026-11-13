@@ -6,7 +6,7 @@
 //! approval made in one project never changes what another project boots, while
 //! cached bytes stay shared. Everything a launch or a
 //! setup boots from a registry goes through [`prepare_selected`], every
-//! deliberate re-resolution goes through [`update`], and an explicit
+//! deliberate re-resolution goes through [`refresh`], and an explicit
 //! build/import approves its own published result through [`approve_published`]
 //! (#391): there is one ordinary preparation and one explicit approval path, so
 //! no consumer can quietly acquire content the others would refuse.
@@ -24,8 +24,9 @@
 //!
 //! The pin store's exclusive lock covers one bounded read-modify-write of a
 //! small user record. Acquisition happens under the cache publication barrier
-//! instead, and the replacement prompt asks a human with no lock held. See
-//! [`store`] for the schema and the three-write default transaction.
+//! instead, and nothing ever reads a terminal: the explicit command is the
+//! consent (ADR-0067). See [`store`] for the schema and [`project_default`] for
+//! the per-project default and the host's starting choice.
 //!
 //! # What a local path is here
 //!
@@ -48,7 +49,9 @@ use microsandbox_image::Platform;
 use serde::{Deserialize, Serialize};
 use vstd::prelude::*;
 
-use crate::boot_image::{BootImage, ImageLabel, ImageRef, ImageSource, ImmutableImageRef};
+use crate::boot_image::{
+    AdoptionOffer, BootImage, ImageLabel, ImageRef, ImageSource, ImmutableImageRef,
+};
 use crate::config;
 use crate::image_acquire::{
     self, AcquireError, AcquireMode, ContentIdentity, OciTarget, OciTargetError,
@@ -58,10 +61,15 @@ pub(crate) use crate::image_acquire::{CanonicalOciReference, ValidatedDigest as 
 use crate::project::ProjectDir;
 
 mod approval;
+mod project_default;
 mod publication;
 mod store;
 mod unpinned;
 
+pub(crate) use project_default::{
+    DefaultSlot, HostDefaultSet, InvokingProject, ObservedDefaults, ProjectDefaultChange,
+    load_default_slot, observe_defaults, set_default,
+};
 pub(crate) use publication::{approve_published, publication_preflight};
 pub(crate) use unpinned::{BuiltImage, prepare_unpinned, read_back_unpinned};
 
@@ -261,7 +269,8 @@ impl ValidatedCandidate {
     }
 }
 
-/// Candidate-scoped consent; only [`approval::approve`] mints a replacement.
+/// Candidate-scoped consent; only [`approval::approve_refresh`] and
+/// [`approval::approve_publication`] mint a replacement.
 /// No disk string or standalone boolean can authorize a candidate.
 struct Approval {
     key: PinKey,
@@ -302,7 +311,8 @@ impl Approval {
         }
     }
 
-    /// A candidate a human or `--yes` authorized exactly as displayed.
+    /// A candidate the explicit command authorized, after its change of approved
+    /// content was rendered successfully.
     fn replacement(candidate: &ValidatedCandidate, expected: ApprovedPin) -> Self {
         Self {
             key: candidate.key.clone(),
@@ -330,62 +340,39 @@ impl Approval {
 
 pub(crate) enum DefaultAction {
     None,
-    /// Retain the default tier's own immutable selection on a *first* pin.
-    Adopt(ImmutableImageRef),
-    /// Store the approved host child as the retained default.
-    Set,
+    /// Record the default tier's own immutable selection as this project's
+    /// default when it has none (write-once, ADR-0067).
+    Establish {
+        reference: ImmutableImageRef,
+        host: project_default::HostRetention,
+    },
+    /// A recommendation selected while the configuration was unreadable:
+    /// initialize an absent host record (R4) but establish nothing (R3).
+    SeedHostOnly {
+        reference: ImmutableImageRef,
+    },
 }
 
-/// How a changed approval may be authorized.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ApprovalMode {
-    /// Ask on a real terminal; refuse otherwise.
-    Ask,
-    /// The operation's own `--yes` pre-authorizes exactly the resolved candidate.
-    Yes,
-}
-
-impl ApprovalMode {
-    /// The one reading of a command's `--yes`: it pre-authorizes exactly the
-    /// candidate that command resolves, and nothing else.
-    pub(crate) fn of_flag(yes: bool) -> Self {
-        if yes { Self::Yes } else { Self::Ask }
+impl DefaultAction {
+    /// The reference this action may record as the project's default or seed
+    /// the host record with.
+    fn retained_reference(&self) -> Option<&ImmutableImageRef> {
+        match self {
+            Self::None => None,
+            Self::Establish { reference, .. } | Self::SeedHostOnly { reference } => Some(reference),
+        }
     }
-}
 
-/// The deliberate operations that are allowed to re-resolve a source.
-pub(crate) enum ExplicitOperation<'a> {
-    Refresh(&'a BootImage),
-    SetDefault(&'a ImageRef),
-}
-
-/// What a completed [`update`] changed, reported per record: a matching approval
-/// with a different retained fallback is still a change the user must be told
-/// about, so the two decisions are never collapsed into one word.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct UpdateOutcome {
-    pub(crate) approval: ApprovalChange,
-    pub(crate) retained_default: DefaultChange,
-}
-
-impl UpdateOutcome {
-    /// True when the command changed either record.
-    pub(crate) fn changed_anything(&self) -> bool {
-        self.approval != ApprovalChange::Unchanged
-            || self.retained_default != DefaultChange::Unchanged
+    /// Whether this action may initialize an absent host record (R4).
+    fn initializes_host(&self) -> bool {
+        matches!(
+            self,
+            Self::Establish {
+                host: project_default::HostRetention::InitializeIfAbsent,
+                ..
+            } | Self::SeedHostOnly { .. }
+        )
     }
-}
-
-/// What one transaction did to the project's approval for the operated key.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ApprovalChange {
-    /// The first approval for this key.
-    FirstPin,
-    /// Already approved at this content (possibly under another digest
-    /// algorithm); the stored identity and revision are unchanged.
-    Unchanged,
-    /// A different approved candidate replaced the previous one.
-    Replaced,
 }
 
 /// What one transaction did to the retained fallback.
@@ -550,7 +537,7 @@ pub(crate) async fn prepare_selected(
         return prepare_first_pin(boot, &target, &key, &selection, &label).await;
     };
     let prepared = approved_preparation(&current, &label, Rendering::Selection).await?;
-    retain_default(boot, &current)?;
+    project_default::establish_default(boot, &current)?;
     let approved = current.immutable_reference()?;
     Ok(PreparedSelection::immutable_content(
         &approved, selection, prepared,
@@ -580,7 +567,7 @@ async fn prepare_first_pin(
     .await?;
     let candidate = ValidatedCandidate::from_image(prepared.image(), &key.project)?;
     store::candidate_ready()?;
-    let action = adoption(boot)?;
+    let action = project_default::establishment(boot)?;
     match commit(&candidate, &Approval::initial(&candidate), action) {
         Ok(committed) => {
             let approved = committed.pin.immutable_reference()?;
@@ -640,47 +627,31 @@ async fn approved_preparation(
     Ok(prepared)
 }
 
-/// The default-tier's own immutable selection, when this boot image is the
-/// default tier (the retained record or the initial recommendation).
-/// Acquisition success, not create success, retains it.
-fn adoption(boot: &BootImage) -> Result<DefaultAction> {
-    if !boot.is_default() {
-        return Ok(DefaultAction::None);
-    }
-    let reference = ImmutableImageRef::parse(boot.reference().as_str()).map_err(|reason| {
-        anyhow!("the selected default boot image cannot be retained: {reason}")
-    })?;
-    Ok(DefaultAction::Adopt(reference))
-}
-
-/// The write-once retention that belongs with **every** successful default-tier
-/// preparation, not only a first pin.
-///
-/// A default-tier selection whose key is already approved (an explicit
-/// `image refresh` pins without adopting) still initializes an absent fallback,
-/// while an existing fallback is left byte-for-byte alone. Adoption failure is a
-/// launch failure: the record is part of what a default-tier launch promises.
-fn retain_default(boot: &BootImage, pin: &ApprovedPin) -> Result<()> {
-    if let DefaultAction::Adopt(reference) = adoption(boot)? {
-        store::Store::host()?.adopt_default_if_absent(&pin.key, &reference)?;
-    }
-    Ok(())
-}
-
 /// One explicit re-resolution plus the candidate-scoped approval it needs, in
 /// `project`.
 ///
-/// The source is resolved exactly once. The frozen candidate is revalidated
-/// under a fresh shared barrier after any human wait, and the host transaction
-/// then compares and swaps against the revision and digest that were displayed.
-/// A decline, a refusal without a terminal, an interruption or a failed
-/// acquisition leaves the previous approval and default logically unchanged.
-pub(crate) async fn update(
-    operation: ExplicitOperation<'_>,
+/// Running `image refresh` is the consent for every change it makes (ADR-0067):
+/// a first pin, a replaced approval for a moved mutable source, or adoption of
+/// the host default. The source is resolved exactly once, the change is rendered
+/// before it is committed, and the host transaction then compares and swaps
+/// against the revision and digest that were displayed. A failed render, a
+/// failed acquisition, a concurrent writer or an immutable reference that
+/// resolved to different content leaves the previous approval and default
+/// logically unchanged.
+pub(crate) async fn refresh(
+    boot: &BootImage,
+    offer: Option<AdoptionOffer>,
     project: &ProjectDir,
-    mode: ApprovalMode,
-) -> Result<UpdateOutcome> {
-    let plan = Plan::resolve(operation)?;
+) -> Result<ProjectDefaultChange> {
+    if let Some(host) = &offer {
+        if !matches!(boot.source(), ImageSource::ProjectDefault(_)) {
+            bail!("internal error: an adoption offer needs an established project default");
+        }
+        if !same_canonical(host.image().reference().as_str(), boot.reference().as_str())? {
+            return project_default::adopt_host_default(boot, host, project).await;
+        }
+    }
+    let plan = Plan::for_refresh(boot)?;
     let key = PinKey::new(&ProjectId::of(project), &plan.target)?;
     let current = lookup(&key)?;
     if !matches!(plan.default_action, DefaultAction::None) {
@@ -706,7 +677,8 @@ pub(crate) async fn update(
             } else if key.is_immutable() {
                 return Err(immutable_integrity_failure());
             } else {
-                approval::approve(
+                // The explicit refresh is the consent: render, then mint.
+                approval::approve_refresh(
                     &candidate,
                     pin.clone(),
                     &approval::ApprovalRequest {
@@ -715,65 +687,56 @@ pub(crate) async fn update(
                         old: &pin.digest,
                         new: &candidate.digest,
                     },
-                    mode,
                 )?
             }
         }
     };
-    // Revalidate only the frozen candidate: a mutable source that moved while
-    // the prompt was open must not be resolved a second time, and the bytes
-    // this approval names are the bytes the transaction commits.
+    // Revalidate only the frozen candidate: a mutable source that moved after it
+    // was resolved must not be resolved a second time, and the bytes this
+    // approval names are the bytes the transaction commits.
     drop(prepared);
     revalidate_frozen(&candidate, &plan.label, plan.rendering).await?;
     let action = plan.default_action;
     let committed = commit(&candidate, &approval, action)?;
-    Ok(UpdateOutcome {
-        approval: committed.approval,
-        retained_default: committed.retained_default,
-    })
+    Ok(committed.project_default)
+}
+
+/// Whether two references name the same canonical content: one spelling of the
+/// "is this the same record?" question every default comparison asks.
+fn same_canonical(left: &str, right: &str) -> Result<bool> {
+    let canonical = |text: &str| {
+        CanonicalOciReference::parse(text)
+            .map_err(|_| anyhow!("the default boot image reference is not canonical"))
+    };
+    Ok(canonical(left)? == canonical(right)?)
 }
 
 /// Everything one explicit operation decided before any I/O, resolved once.
 struct Plan {
     target: OciTarget,
     label: ImageLabel,
-    /// The prompt's source rendering: the escaped selection, or the fixed
-    /// default-tier label rather than a record-sourced reference.
+    /// The render's source: the escaped selection, or the fixed default-tier
+    /// label rather than a record-sourced reference.
     source: String,
     rendering: Rendering,
     default_action: DefaultAction,
 }
 
 impl Plan {
-    fn resolve(operation: ExplicitOperation<'_>) -> Result<Self> {
-        match operation {
-            ExplicitOperation::Refresh(boot) => {
-                let label = boot.label();
-                let source = if label.is_redacted() {
-                    label.text().to_owned()
-                } else {
-                    config::escape_str(boot.reference().as_str())
-                };
-                Ok(Self {
-                    target: oci_target(boot.reference().as_str())?,
-                    default_action: adoption(boot)?,
-                    rendering: Rendering::Selection,
-                    label,
-                    source,
-                })
-            }
-            ExplicitOperation::SetDefault(reference) => Ok(Self {
-                target: oci_target(reference.as_str())?,
-                label: ImageLabel::for_default_upgrade(),
-                source: config::escape_str(reference.as_str()),
-                // `set-default` never discloses its typed target on failure and
-                // always states the retained-default guarantee.
-                rendering: Rendering::Explicit,
-                // The explicit target replaces the fallback even on a first pin;
-                // its own approval is still established separately.
-                default_action: DefaultAction::Set,
-            }),
-        }
+    fn for_refresh(boot: &BootImage) -> Result<Self> {
+        let label = boot.label();
+        let source = if label.is_redacted() {
+            label.text().to_owned()
+        } else {
+            config::escape_str(boot.reference().as_str())
+        };
+        Ok(Self {
+            target: oci_target(boot.reference().as_str())?,
+            default_action: project_default::establishment(boot)?,
+            rendering: Rendering::Selection,
+            label,
+            source,
+        })
     }
 }
 
@@ -1007,7 +970,10 @@ redacted_debug!(
     ValidatedCandidate,
     Approval,
     DefaultAction,
-    ExplicitOperation<'_>,
+    project_default::ProjectDefault,
+    project_default::DefaultSlot,
+    project_default::ObservedDefaults,
+    project_default::DefaultAdoption,
     PreparedSelection
 );
 
@@ -1408,12 +1374,6 @@ mod tests {
         assert!(!text.contains("image import"), "{text}");
     }
 
-    #[test]
-    fn approval_modes_come_from_one_yes_reading() {
-        assert_eq!(ApprovalMode::of_flag(true), ApprovalMode::Yes);
-        assert_eq!(ApprovalMode::of_flag(false), ApprovalMode::Ask);
-    }
-
     /// A build/import read-back renders the explicit chain and never the import
     /// hint: the command *is* the import. Differential, so dropping the arm is
     /// visible rather than silently equal.
@@ -1471,7 +1431,6 @@ mod tests {
         assert!(block.contains("fn commit_decision"));
         assert!(block.contains("fn store_bytes_within_limit"));
         assert!(block.contains("fn content_is_equivalent"));
-        assert!(include_str!("image_pin/approval.rs").contains("fn prompt_is_permitted"));
         assert!(include_str!("../Cargo.toml").contains("[package.metadata.verus]"));
     }
 }

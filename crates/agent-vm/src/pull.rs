@@ -9,23 +9,29 @@
 //!
 //! This is the explicit operation that *checks for movement*: it re-resolves the
 //! selected source even when the cache is warm, then hands the validated
-//! candidate to the project's approval authority ([`crate::image_pin::update`]). A
-//! replaced approval needs the user's consent — this command's own `--yes`, or a
-//! default-No prompt on a terminal — and a decline, an interruption or any
-//! acquisition/publication failure leaves the previous approval and default
-//! logically unchanged. Nothing about a project or a running guest changes.
+//! candidate to the project's approval authority
+//! ([`crate::image_pin::refresh`]). Running this command is the consent for
+//! every change it makes (ADR-0067): a first pin, a replaced approval for a moved
+//! mutable source, or adoption of the host's retained default. Nothing is asked
+//! and no input is read, on a terminal or not; every change of approved content
+//! is rendered on stderr before it is committed, and any failure leaves the
+//! previous approval and default logically unchanged.
 //!
-//! Retention is a *separate* decision the same authority makes: a default-tier
-//! refresh may initialize an absent retained default from acquisition success
-//! alone, and neither `--image`, env nor a config tier ever replaces one.
+//! Two default decisions belong to the same authority: a default-tier refresh
+//! establishes an absent **project** default from acquisition success alone, and
+//! in a project that already has one it *adopts* the host's existing retained
+//! default. A bare refresh with a tool configuration that cannot be read is an
+//! error, because falling through to the default tier would establish a project
+//! default from a state the user never chose; `--image`/`AGENT_VM_IMAGE_TAG`
+//! still work, since they select the explicit tier and can establish nothing.
 
 use anyhow::{Result, anyhow};
 use clap::Args as ClapArgs;
 
-use crate::boot_image;
+use crate::boot_image::{self, ConfiguredTiers};
 use crate::config::{Catalog, ConfiguredImages};
 use crate::image_acquire::{OciTarget, OciTargetError};
-use crate::image_pin::{ApprovalMode, ExplicitOperation};
+use crate::image_pin::ProjectDefaultChange;
 use crate::project::ProjectDir;
 
 /// The fixed refusal for a refresh target that is a local rootfs or disk path.
@@ -55,43 +61,52 @@ pub struct Args {
     /// boot image" in USAGE.md.
     #[command(flatten)]
     pub(crate) image: boot_image::ImageArgs,
-
-    /// Replace an existing approval without asking. Exactly the resolved
-    /// candidate is authorized; a first pin or an unchanged one never asks.
-    #[arg(long)]
-    pub(crate) yes: bool,
 }
 
 pub async fn run(args: Args, catalog: Catalog, images: ConfiguredImages) -> Result<()> {
     #[allow(clippy::disallowed_methods)] // one capture per command: every consumer borrows it.
     let project = ProjectDir::capture()?;
+    let requested = args.image.requested()?;
+    // R8's refusal is decided from input alone, so it comes before the
+    // microsandbox preflight below: a rejected bare refresh must not create the
+    // shared runtime state (`$HOME/.agent-vm-msb`) on its way out.
+    let tiers = match &catalog {
+        Catalog::Ready(_) => ConfiguredTiers::Read(&images),
+        // `--image`/env select the explicit tier, so they can establish nothing.
+        Catalog::Broken(error) if requested.is_some() => {
+            println!(
+                "==> WARNING: configured image settings could not be read: {error:#}; \
+                 using --image/AGENT_VM_IMAGE_TAG"
+            );
+            ConfiguredTiers::Unreadable
+        }
+        // A bare refresh would fall through to the default tier and could
+        // establish a project default from a transient state (R3, R8).
+        Catalog::Broken(error) => {
+            return Err(anyhow!(
+                "configured image settings could not be read: {error:#}; image refresh does \
+                 not fall back to the default boot image while the configuration is \
+                 unreadable, so nothing was acquired or approved; fix it (agent-vm doctor \
+                 reports what is wrong) or pass --image REF"
+            ));
+        }
+    };
     // The native pull still reaches the shared microsandbox state (its cache and
     // registry configuration), so it can hit the same forward-migrated-DB crash
     // as the boot path. See src/msb_preflight.rs and issue #30.
     crate::msb_preflight::ensure_db_not_ahead().await?;
-
-    // A broken config leaves the configured image tiers unknown (D7): warn and
-    // fall through to `--image`/env or the default boot image, so refresh still
-    // recovers.
-    if let Catalog::Broken(error) = &catalog {
-        println!(
-            "==> WARNING: configured image settings could not be read: {error:#}; \
-             falling back to --image/AGENT_VM_IMAGE_TAG or the default boot image"
-        );
-    }
-    let boot = boot_image::select(args.image.requested()?, &images)?;
+    let boot = boot_image::select(requested, tiers, &project)?;
+    let offer = boot_image::adoption_offer(&boot)?;
     let label = boot.label();
     println!("==> {label} is the image this configuration boots from");
     // The explicit refresh resolves the current source even when the cache is
     // warm, then approves (or reports) exactly what it resolved. It never boots
     // anything, and it holds no cache barrier and no host lock by the time it
     // returns.
-    crate::image_pin::update(
-        ExplicitOperation::Refresh(&boot),
-        &project,
-        ApprovalMode::of_flag(args.yes),
-    )
-    .await?;
+    let change = crate::image_pin::refresh(&boot, offer, &project).await?;
+    if change == ProjectDefaultChange::Adopted {
+        println!("==> this project now uses the host's default boot image");
+    }
     println!(
         "==> {} acquired into the microsandbox image cache",
         label.text()
@@ -227,7 +242,6 @@ mod tests {
                 value.map(str::to_string),
                 value.map(|_| OverrideSource::CommandLine),
             ),
-            yes: false,
         }
     }
 

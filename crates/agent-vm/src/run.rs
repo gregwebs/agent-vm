@@ -867,7 +867,11 @@ pub(crate) async fn launch(
     let cpus = args.cpus;
     let boot = match &launch_build {
         Some(build) => build.boot_image(),
-        None => boot_image::select(requested, images)?,
+        None => boot_image::select(
+            requested,
+            boot_image::ConfiguredTiers::Read(images),
+            &project,
+        )?,
     };
     // `--no-config-mounts` is read once, here, because the network plan below
     // moves one of `args`' fields out: the policy is a plain `Copy` decision

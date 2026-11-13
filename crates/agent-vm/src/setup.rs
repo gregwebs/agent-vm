@@ -139,7 +139,12 @@ fn verification_targets(catalog: &LaunchCatalog) -> Vec<VerifyTarget> {
     targets
 }
 
-pub async fn run(args: Args, catalog: Catalog, images: ConfiguredImages) -> Result<()> {
+pub async fn run(
+    args: Args,
+    catalog: Catalog,
+    images: ConfiguredImages,
+    images_read: bool,
+) -> Result<()> {
     #[allow(clippy::disallowed_methods)] // one capture per command: every consumer borrows it.
     let project = ProjectDir::capture()?;
     // setup also reaches connect_and_migrate (via Sandbox::builder/build and
@@ -153,6 +158,20 @@ pub async fn run(args: Args, catalog: Catalog, images: ConfiguredImages) -> Resu
     // default tools (which cannot themselves be broken: a missing default entry
     // is already a hard error) and reports that the configured image could not
     // be read, using `--image`/env or the default boot image (D7).
+    // A configuration that could not be *loaded* leaves the configured tiers
+    // unknown, so the default-tier selection below is provisional and
+    // establishes nothing (R3). A catalog that could not be built still carries
+    // readable tiers, so this selection is unchanged — but it is equally
+    // provisional: R3 names `Catalog::Broken`, not just an unreadable TOML, so a
+    // broken catalog withholds establishment too.
+    let tiers = if images_read {
+        match &catalog {
+            Catalog::Ready(_) => boot_image::ConfiguredTiers::Read(&images),
+            Catalog::Broken(_) => boot_image::ConfiguredTiers::ReadFromBrokenCatalog(&images),
+        }
+    } else {
+        boot_image::ConfiguredTiers::Unreadable
+    };
     let verify_catalog = match catalog {
         Catalog::Ready(catalog) => catalog,
         Catalog::Broken(error) => {
@@ -170,7 +189,7 @@ pub async fn run(args: Args, catalog: Catalog, images: ConfiguredImages) -> Resu
     };
 
     // The one image selection for this session (D1), shared with launch/refresh.
-    let boot = boot_image::select(args.image.requested()?, &images)?;
+    let boot = boot_image::select(args.image.requested()?, tiers, &project)?;
     let label = boot.label();
     let image = boot.reference().as_str().to_string();
 

@@ -213,7 +213,8 @@ pub(crate) async fn run(args: Args, configured: Result<&ConfiguredImages>) -> Re
     // work would change diagnostics this command already had. The observation
     // is advisory — a broken configuration must not turn a committed
     // publication into a failure, and this command changes no selection.
-    let selection = configured.and_then(crate::boot_image::ambient_selection);
+    let selection = configured
+        .and_then(|configured| crate::boot_image::ambient_selection(configured, Ok(&project)));
     if let Some(notice) = completion_notice(&tag, selection) {
         // Best-effort completion notice on stdout: stderr is for errors and
         // Docker's own output. A failed write is not a failed import.

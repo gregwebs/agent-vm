@@ -6956,6 +6956,13 @@ custom_image_default_upgrade() {
       assert_eq 'live A process identity unchanged' "$identity" "$(cat "$live/identity")" || result=1
       grep -q '^stamp=absent$' "$live/status" || result=1
       assert_no_host_calls || result=1
+      # #541 B1: this project is established at A, so set-default changes only
+      # the host's starting choice; an explicit refresh adopts B.
+      retained_launch upgrade-kept-a "$proj" --no-git hello-258 || result=1
+      require_launch_ok upgrade-kept-a || result=1
+      grep -q '^stamp=absent$' "$WORK/upgrade-kept-a.out" || result=1
+      retained_launch upgrade-adopt "$proj" image refresh || result=1
+      require_launch_ok upgrade-adopt || result=1
       retained_launch upgrade-new-b "$proj" --no-git hello-258 || result=1
       require_launch_ok upgrade-new-b || result=1
       grep -q '^stamp=present$' "$WORK/upgrade-new-b.out" || result=1
@@ -7330,24 +7337,6 @@ pins_stamp() {
   grep '^stamp=' "$WORK/$1.out" || true
 }
 
-# One PTY replacement attempt in `proj`: stdin is piped into `script`, which
-# gives the child a real terminal on both ends. The answer text is the input.
-pins_pty_update() {
-  local name="$1" proj="$2" input="$3"
-  shift 3
-  rm -f "$WORK/$name.pty"
-  local status=0
-  printf '%s' "$input" | (cd "$proj" && /usr/bin/script -q "$WORK/$name.pty" \
-    "${PINS_ENV[@]}" "${OFFLINE_ENV[@]}" "$PINS_BIN" "$@") \
-    >"$WORK/$name.out" 2>&1 || status=$?
-  PIN_PTY_STATUS=$status
-  tr -d '\r' <"$WORK/$name.pty" >"$WORK/$name.pty.txt" 2>/dev/null || true
-}
-
-pins_pty_text() {
-  cat "$WORK/$1.pty.txt" 2>/dev/null || true
-}
-
 pins_live_advanced() {
   local dir="$1" pid="$2" old_tick="$3" deadline=$(( $(date +%s) + 15 ))
   while [ "$(date +%s)" -lt "$deadline" ] && kill -0 "$pid" 2>/dev/null; do
@@ -7523,6 +7512,29 @@ custom_image_host_pins() {
     result=1
   fi
 
+  # ---- establish this project at A on the default tier (#541 B1) ----
+  # B1 needs a project that already booted the default tier. Every launch of
+  # `$proj` above named `--image`, which never establishes, so make A the host's
+  # starting choice and let one bare launch establish this project at it. The
+  # tag still serves A here; the record is written from the host's digest form.
+  pins_env "$WORK/pins-home" "$WORK/pins-state"
+  pins_avm "$proj" image set-default --image "$tag" >"$WORK/pins-establish-host.out" 2>&1 || {
+    echo "    FAIL: could not make A the host's starting choice"
+    cat "$WORK/pins-establish-host.out"
+    result=1
+  }
+  pins_launch pins-establish "$proj" hello-258 || result=1
+  require_launch_ok pins-establish || result=1
+  assert_eq "the establishing default-tier launch boots A" "stamp=absent" \
+    "$(pins_stamp pins-establish)" || result=1
+  if ! jq -e --arg p "$proj_id" --arg ref "$ref_a" \
+    '[.defaults[] | select(.project == $p)] | length == 1 and .[0].image == $ref' \
+    "$(pins_store)" >/dev/null 2>&1; then
+    echo "    FAIL: the default-tier launch did not establish this project at A"
+    cat "$(pins_store)" 2>/dev/null || true
+    result=1
+  fi
+
   # ---- an archive alias over the pinned tag does not switch the guest (#391) ----
   # The archive carries the pinned tag as one of its own names (a Docker-save
   # RepoTag), while the command names a *different* result reference. Only the
@@ -7677,38 +7689,16 @@ custom_image_host_pins() {
       "$default_snapshot" "$(cat "$(pins_record)")" || result=1
   fi
 
-  # ---- decline, fail, approve; the live A guest is untouched ----
+  # ---- fail, then replace; the live A guest is untouched ----
   pins_env "$WORK/pins-home" "$WORK/pins-state"
   pin_snapshot="$(cat "$(pins_store)")"
-  pins_pty_update pins-decline "$proj" $'n\n' image refresh --image "$tag"
-  assert_eq "a declined replacement exits nonzero" "1" "$PIN_PTY_STATUS" || result=1
-  assert_match "decline prompt names the escaped source and its platform" \
-    "Replace the approved image for localhost:$port/$repo:pin \\(linux/$host_arch\\)" \
-    "$(pins_pty_text pins-decline)" || result=1
-  assert_match "decline prompt shows the full old digest" "old: $digest_a" \
-    "$(pins_pty_text pins-decline)" || result=1
-  assert_match "decline prompt shows the full new digest" "new: $digest_b" \
-    "$(pins_pty_text pins-decline)" || result=1
-  assert_eq "declining leaves the approval unchanged" "$pin_snapshot" "$(cat "$(pins_store)")" || result=1
-  pins_pty_update pins-decline-empty "$proj" $'\n' image refresh --image "$tag"
-  assert_eq "an empty answer exits nonzero" "1" "$PIN_PTY_STATUS" || result=1
-  assert_match "empty answer still renders the full old digest" "old: $digest_a" \
-    "$(pins_pty_text pins-decline-empty)" || result=1
-  assert_match "empty answer still renders the full new digest" "new: $digest_b" \
-    "$(pins_pty_text pins-decline-empty)" || result=1
-  assert_eq "empty input declines and leaves the approval unchanged" "$pin_snapshot" \
-    "$(cat "$(pins_store)")" || result=1
-  if [ "$live_pid" -gt 0 ]; then
-    kill -0 "$live_pid" 2>/dev/null || { echo "    FAIL: the live A guest died"; result=1; }
-    pins_live_advanced "$live" "$live_pid" "$tick" || result=1
-  fi
-  # A candidate that cannot be validated keeps A, even with --yes.
+  # A candidate that cannot be validated keeps A. There is no `--yes` any more
+  # (#541 B4): running the refresh is the consent.
   pins_push_unbootable_candidate "$port" "$repo" pin || {
     echo "    FAIL: could not publish an unbootable candidate"
     result=1
   }
-  pins_env "$WORK/pins-home" "$WORK/pins-state"
-  pins_avm "$proj" image refresh --image "$tag" --yes >"$WORK/pins-broken.out" 2>&1 && {
+  pins_avm "$proj" image refresh --image "$tag" >"$WORK/pins-broken.out" 2>&1 && {
     echo "    FAIL: a broken candidate must fail the approved refresh"
     result=1
   }
@@ -7716,16 +7706,30 @@ custom_image_host_pins() {
     "$(cat "$(pins_store)")" || result=1
   pins_launch pins-after-failure "$proj" --image "$tag" hello-258 || result=1
   require_launch_ok pins-after-failure || result=1
-  assert_eq "A still boots after declined/failed candidates" "stamp=absent" \
+  assert_eq "A still boots after a failed candidate" "stamp=absent" \
     "$(pins_stamp pins-after-failure)" || result=1
-  # Approve B explicitly.
+  if [ "$live_pid" -gt 0 ]; then
+    kill -0 "$live_pid" 2>/dev/null || { echo "    FAIL: the live A guest died"; result=1; }
+    pins_live_advanced "$live" "$live_pid" "$tick" || result=1
+  fi
+  # Replace A with B. Running the refresh is the consent (#541 B3): the change
+  # is rendered and nothing is asked, on a terminal or not.
   docker tag "$CUSTOM_STAMP" "$tag" || result=1
   docker push "$tag" >/dev/null || result=1
-  pins_avm "$proj" image refresh --image "$tag" --yes >"$WORK/pins-approve.out" 2>&1 || {
-    echo "    FAIL: approving the resolved candidate failed"
+  pins_avm "$proj" image refresh --image "$tag" >"$WORK/pins-approve.out" 2>&1 || {
+    echo "    FAIL: the prompt-free refresh failed"
     cat "$WORK/pins-approve.out"
     result=1
   }
+  assert_match "the refresh states the change without asking" \
+    "Replacing the approved image for localhost:$port/$repo:pin \\(linux/$host_arch\\) in this project:" \
+    "$(cat "$WORK/pins-approve.out")" || result=1
+  assert_match "the render shows the full old digest" "old: $digest_a" \
+    "$(cat "$WORK/pins-approve.out")" || result=1
+  assert_match "the render shows the full new digest" "new: $digest_b" \
+    "$(cat "$WORK/pins-approve.out")" || result=1
+  assert_no_match "no question is asked" "\[y/N\]" \
+    "$(cat "$WORK/pins-approve.out")" || result=1
   # A replacement appends the record (`store.rs` keeps the others, then pushes),
   # and the live guest's own project holds its own record for this reference, so
   # select by project and reference.
@@ -7784,7 +7788,7 @@ custom_image_host_pins() {
 
   # set-default: the explicit target ignores ambient selection, stores the
   # approved host child, and future precedence is unchanged.
-  pins_avm "$proj" image set-default --image "$tag" --yes >"$WORK/pins-set-default.out" 2>&1 || {
+  pins_avm "$proj" image set-default --image "$tag" >"$WORK/pins-set-default.out" 2>&1 || {
     echo "    FAIL: set-default of the approved target failed"
     cat "$WORK/pins-set-default.out"
     result=1
@@ -7794,17 +7798,39 @@ custom_image_host_pins() {
     cat "$(pins_record)" 2>/dev/null || true
     result=1
   fi
+  # #541 B1: this project already booted the default tier (established at A), so
+  # set-default changes only the host's starting choice. An explicit refresh in
+  # the project is what adopts B.
+  pins_launch pins-default-kept "$proj" hello-258 || result=1
+  require_launch_ok pins-default-kept || result=1
+  assert_eq "an established project keeps its own default after set-default" \
+    "stamp=absent" "$(pins_stamp pins-default-kept)" || result=1
+  pins_avm "$proj" image refresh >"$WORK/pins-adopt.out" 2>&1 || {
+    echo "    FAIL: the adopting refresh failed"
+    cat "$WORK/pins-adopt.out"
+    result=1
+  }
+  assert_match "the adopting refresh renders the change" \
+    "Adopting the host's default boot image" "$(cat "$WORK/pins-adopt.out")" || result=1
+  if ! jq -e --arg p "$proj_id" --arg ref "$ref_b" \
+    '[.defaults[] | select(.project == $p)] | length == 1 and .[0].image == $ref' \
+    "$(pins_store)" >/dev/null 2>&1; then
+    echo "    FAIL: the adopting refresh did not move this project's default to B"
+    cat "$(pins_store)" 2>/dev/null || true
+    result=1
+  fi
   pins_launch pins-default-b "$proj" hello-258 || result=1
   require_launch_ok pins-default-b || result=1
-  assert_eq "the retained fallback boots B" "stamp=present" "$(pins_stamp pins-default-b)" || result=1
+  assert_eq "after the adopting refresh the project boots B" "stamp=present" \
+    "$(pins_stamp pins-default-b)" || result=1
   pins_launch pins-override-a "$proj" --image "$ref_a" hello-258 || result=1
   require_launch_ok pins-override-a || result=1
   assert_eq "an explicit override still outranks the fallback" "stamp=absent" \
     "$(pins_stamp pins-override-a)" || result=1
-  # A live guest keeps running across the tag move, both decline paths and B's
-  # approval: its PID, the identity its own rootfs resolves, and the booted image
-  # stamp must all be unchanged, which is what "changed pins affect future
-  # launches only" means.
+  # A live guest keeps running across the tag move, the explicit update commands
+  # and B's approval: its PID, the identity its own rootfs resolves, and the
+  # booted image stamp must all be unchanged, which is what "changed pins affect
+  # future launches only" means.
   if [ "$live_pid" -gt 0 ]; then
     kill -0 "$live_pid" 2>/dev/null || { echo "    FAIL: the live A guest died"; result=1; }
     pins_live_advanced "$live" "$live_pid" "$tick" || result=1

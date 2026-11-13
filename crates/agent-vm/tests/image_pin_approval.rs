@@ -6,9 +6,9 @@
 //! *measured content*, not a successful boot, so a deliberate create failure is
 //! the boundary these tests order against.
 //!
-//! The approval prompt rows run under a real pseudo-terminal (`support::pty`)
-//! because the program requires both stdin and stderr to be terminals: a piped
-//! run must refuse rather than answer for a human.
+//! The prompt-free rows run under a real pseudo-terminal (`support::pty`) as
+//! well as on a pipe: `image refresh` and `image set-default` never ask and
+//! never read stdin (#541), so a PTY row proves that nothing waits for input.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
@@ -34,10 +34,6 @@ use oci_registry::{Image, Server};
 use pin_gate::{PinGate, PinPeer, PinStage, Reply};
 use pty::{Action, Pty};
 use sha2::{Digest as _, Sha256};
-
-/// The prompt the approval path waits for. Asserted as a literal so a wording
-/// change fails here rather than silently moving the expectation.
-const PROMPT: &[u8] = b"Approve this exact image change? [y/N] ";
 
 struct Harness {
     root: tempfile::TempDir,
@@ -118,13 +114,20 @@ impl Harness {
         bounded(command)
     }
 
-    fn refresh(&self, reference: &str, yes: bool) -> Output {
+    fn refresh(&self, reference: &str) -> Output {
         let mut command = self.command();
         command.args(["image", "refresh", "--image", reference]);
-        if yes {
-            command.arg("--yes");
-        }
         bounded(command)
+    }
+
+    /// A pin for `reference` **and** a host record naming it: the fixture S1's
+    /// `set-default` used to leave behind, now two explicit commands.
+    fn pin_and_set_default(&self, reference: &str) {
+        assert!(self.refresh(reference).status.success(), "pin the tag");
+        assert!(
+            set_default(self, reference).status.success(),
+            "set the host record"
+        );
     }
 
     fn image(&self, spec: &ArchiveSpec) -> Image {
@@ -166,6 +169,70 @@ impl Harness {
 
     fn pinned_digest_for(&self, reference: &str) -> Option<String> {
         self.pin_for(reference).map(|(digest, _)| digest)
+    }
+
+    /// The project's established default, as the store records it.
+    fn default_record_in(&self, project: &Path) -> Option<serde_json::Value> {
+        let id = project_id(project);
+        self.pins_value()?["defaults"]
+            .as_array()?
+            .iter()
+            .find(|record| record["project"] == id.as_str())
+            .cloned()
+    }
+
+    /// The host's retained record, decoded.
+    fn host_record(&self) -> Option<serde_json::Value> {
+        serde_json::from_slice(
+            &fs::read(self.home.join(".config/agent-vm/default-image.json")).ok()?,
+        )
+        .ok()
+    }
+
+    /// The immutable digest one default-tier launch re-acquires from an empty
+    /// cache: the strongest observable proof of *which* approved content the
+    /// redacted default tier selected.
+    fn reacquired_digest(&self, server: &Server) -> String {
+        self.reacquired_digest_in(&self.project, &self.state, server)
+    }
+
+    fn reacquired_digest_in(&self, project: &Path, state: &Path, server: &Server) -> String {
+        fs::remove_dir_all(self.cache()).expect("the preparation cached its content");
+        let before = server.requests().len();
+        let mut command = self.command_in(project, state);
+        command.args(["shell", "--", "true"]);
+        let out = bounded(command);
+        assert!(!out.status.success(), "the fake runtime cannot boot");
+        let digests: Vec<String> = server.requests()[before..]
+            .iter()
+            .filter_map(|(_, path)| path.rsplit_once("/manifests/"))
+            .map(|(_, digest)| digest.to_owned())
+            .filter(|digest| digest.starts_with("sha"))
+            .collect();
+        assert_eq!(digests.len(), 1, "one approved digest: {digests:?}");
+        digests.into_iter().next().unwrap()
+    }
+
+    /// A default-tier launch: no `--image`, so the default slot decides.
+    fn launch_default(&self) -> Output {
+        let mut command = self.command();
+        command.args(["shell", "--", "true"]);
+        bounded(command)
+    }
+
+    /// A default-tier launch whose initial recommendation is `reference`.
+    fn launch_on_recommendation(&self, reference: &str) -> Output {
+        let mut command = self.command();
+        command
+            .env("AGENT_VM_TEST_DEFAULT_IMAGE", reference)
+            .args(["shell", "--", "true"]);
+        bounded(command)
+    }
+
+    fn refresh_default(&self) -> Output {
+        let mut command = self.command();
+        command.arg("image").arg("refresh");
+        bounded(command)
     }
 
     fn approval_records(&self) -> usize {
@@ -283,10 +350,16 @@ fn project_id(dir: &Path) -> String {
         .collect()
 }
 
-fn bounded(mut command: Command) -> Output {
+fn bounded(command: Command) -> Output {
+    bounded_with_stderr(command, std::process::Stdio::piped())
+}
+
+/// [`bounded`] with the child's stderr supplied by the caller, for the rows that
+/// prove what an unwritable stderr does to a render.
+fn bounded_with_stderr(mut command: Command, stderr: std::process::Stdio) -> Output {
     let child = command
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(stderr)
         .spawn()
         .expect("run the compiled CLI");
     let id = child.id();
@@ -321,6 +394,17 @@ fn stderr(out: &Output) -> String {
 
 fn stdout_of(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// The manifest digests the registry was asked for from request `from` on.
+/// Filtering manifest paths keeps the oracle about resolution rather than about
+/// every blob or API probe the client happens to make.
+fn manifests_requested_since(server: &Server, from: usize) -> Vec<String> {
+    server.requests()[from..]
+        .iter()
+        .filter_map(|(_, path)| path.rsplit_once("/manifests/"))
+        .map(|(_, digest)| digest.to_owned())
+        .collect()
 }
 
 /// The digest half of a `repo@digest` identity, as the store records it.
@@ -614,130 +698,147 @@ fn local_path_launch_is_unpinned_and_ignores_a_corrupt_store() {
     );
 }
 
-/// The full approval matrix for `image refresh`, through a real terminal.
-fn approval_case(action: Action<'_>, expected_pin: PinChoice, label: &str) {
+/// `image refresh` never asks: it replaces a moved mutable tag on a pipe and on
+/// a terminal alike, renders both digests, and reads no stdin (R6, B3).
+#[test]
+fn refresh_replaces_a_moved_tag_without_asking_on_a_pipe_or_a_terminal() {
     let h = Harness::new(Mode::StrictAcquisition);
     let server = Server::new();
     let a = h.image(&ArchiveSpec::default());
+    let tag = format!("{}/images:approve", server.host);
+    let pin_a = server.image("images", "approve", &a);
+    assert!(h.refresh(&tag).status.success(), "first pin");
     let b = h.image(&ArchiveSpec {
         marker: "approval-b".into(),
         ..Default::default()
     });
-    let pin_a = server.image("images", "approve", &a);
-    let tag = format!("{}/images:approve", server.host);
-    assert!(h.refresh(&tag, false).status.success(), "first pin");
     let pin_b = server.image("images", "approve", &b);
+    assert_ne!(pin_a, pin_b);
+
+    // A pipe holding a decline: nothing may read it, and the refresh replaces.
+    let piped = with_unread_stdin(command_with_refresh(&h, &tag), b"n\n");
+    assert!(piped.0.status.success(), "{}", stderr(&piped.0));
+    assert_eq!(piped.1, b"n\n", "stdin must be left unread");
+    assert_no_question(&stderr(&piped.0));
+    let text = stderr(&piped.0);
+    assert!(
+        text.contains("Replacing the approved image for") && text.contains(" in this project:"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("old: {}", digest_of(&pin_a))),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("new: {}", digest_of(&pin_b))),
+        "{text}"
+    );
+    assert_eq!(h.pinned_digest(), digest_of(&pin_b));
+    assert_eq!(
+        h.pin_for(&tag).unwrap().1,
+        2,
+        "a replacement bumps revision"
+    );
+
+    // The same refresh on a real terminal exits without any input being typed.
+    // Its own A->B fixture: the pipe row already installed B, so a shared
+    // registry would leave the terminal row re-verifying an unchanged pin — the
+    // one path that never renders a replacement.
+    let h = Harness::new(Mode::StrictAcquisition);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let tag = format!("{}/images:terminal", server.host);
+    let pin_a = server.image("images", "terminal", &a);
+    assert!(h.refresh(&tag).status.success(), "first pin");
+    let b = h.image(&ArchiveSpec {
+        marker: "approval-terminal-b".into(),
+        ..Default::default()
+    });
+    let pin_b = server.image("images", "terminal", &b);
     assert_ne!(pin_a, pin_b);
 
     let mut command = h.command();
     command.args(["image", "refresh", "--image", &tag]);
-    let mut terminal = Pty::spawn(&mut command, PROMPT).expect("open a pseudo-terminal");
+    let mut terminal = Pty::spawn(&mut command, b"Replacing the approved image for")
+        .expect("open a pseudo-terminal");
     let (status, out) = terminal
-        .drive(&action, Duration::from_secs(60))
-        .expect("drive the approval prompt");
-    let text = String::from_utf8_lossy(&out);
-    match expected_pin {
-        PinChoice::Approved(()) => {
-            assert!(status.success(), "{label}: {text}");
-            assert!(text.contains("Replace the approved image for"), "{text}");
-            assert!(text.contains("  old: sha256:"), "{text}");
-            assert!(text.contains("  new: sha256:"), "{text}");
-        }
-        PinChoice::Declined => {
-            // A refused answer exits 1; a signal that interrupts the prompt
-            // terminates the process without publishing anything.
-            assert!(
-                !status.success(),
-                "{label}: a declined or interrupted approval must fail: {text}"
-            );
-            assert!(
-                !text.contains("acquired into the microsandbox image cache"),
-                "{text}"
-            );
-        }
-    }
-    let expected = if expected_pin == PinChoice::Approved(()) {
-        pin_b.rsplit_once('@').unwrap().1
-    } else {
-        pin_a.rsplit_once('@').unwrap().1
-    };
+        .drive(&Action::Write(b""), Duration::from_secs(60))
+        .expect("wait for the refresh to exit");
+    // `Pty::drive` only waits for its marker; it does not require it before the
+    // child exits, so the replacement itself is asserted here.
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(status.success(), "{text}");
+    assert!(
+        text.contains("Replacing the approved image for") && text.contains(" in this project:"),
+        "the terminal row renders the replacement: {text}"
+    );
+    assert!(
+        text.contains(&format!("old: {}", digest_of(&pin_a))),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("new: {}", digest_of(&pin_b))),
+        "{text}"
+    );
+    assert_no_question(&text);
     assert_eq!(
-        h.pinned_digest(),
-        expected,
-        "{label}: pin unchanged/updated"
+        h.pin_for(&tag),
+        Some((digest_of(&pin_b), 2)),
+        "the terminal replaced it at revision 2"
     );
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum PinChoice {
-    Approved(()),
-    Declined,
+/// The exact command shape the pipe row needs: no stdin configured here, so the
+/// helper can install its own recording pipe.
+fn command_with_refresh(h: &Harness, tag: &str) -> Command {
+    let mut command = h.command();
+    command.args(["image", "refresh", "--image", tag]);
+    command
 }
 
-#[test]
-fn approval_prompt_yes_replaces_the_pin() {
-    approval_case(Action::Write(b"y\n"), PinChoice::Approved(()), "y");
-    approval_case(Action::Write(b"  YES  \n"), PinChoice::Approved(()), "YES");
+fn assert_no_question(text: &str) {
+    assert!(!text.contains("[y/N]"), "no question is asked: {text}");
+    assert!(!text.contains('?'), "no question is asked: {text}");
+    assert!(!text.contains("Approve this"), "no prompt: {text}");
 }
 
+/// A non-interactive refresh replaces the approval and reads no stdin; an
+/// unchanged one renders nothing (R6, B3).
 #[test]
-fn approval_prompt_no_empty_and_eof_decline() {
-    approval_case(Action::Write(b"n\n"), PinChoice::Declined, "n");
-    approval_case(Action::Write(b"\n"), PinChoice::Declined, "empty");
-    // Ctrl-D on a canonical line is EOF with no answer.
-    approval_case(Action::Write(b"\x04"), PinChoice::Declined, "ctrl-d");
-    approval_case(
-        Action::Write(b"yes please\n"),
-        PinChoice::Declined,
-        "invalid",
-    );
-}
-
-#[test]
-fn approval_prompt_interruption_declines() {
-    approval_case(Action::Signal(libc::SIGINT), PinChoice::Declined, "sigint");
-    approval_case(
-        Action::Signal(libc::SIGTERM),
-        PinChoice::Declined,
-        "sigterm",
-    );
-}
-
-/// `--yes` authorizes only the resolved candidate, and a piped run without it
-/// refuses with actionable guidance instead of consuming stdin.
-#[test]
-fn noninteractive_refresh_refuses_and_yes_preauthorizes() {
+fn noninteractive_refresh_replaces_and_reads_no_stdin() {
     let h = Harness::new(Mode::StrictAcquisition);
     let server = Server::new();
     let a = h.image(&ArchiveSpec::default());
     let pin_a = server.image("images", "piped", &a);
     let tag = format!("{}/images:piped", server.host);
-    assert!(h.refresh(&tag, false).status.success());
+    assert!(h.refresh(&tag).status.success());
     let b = h.image(&ArchiveSpec {
         marker: "piped-b".into(),
         ..Default::default()
     });
     let pin_b = server.image("images", "piped", &b);
 
-    let refused = h.refresh(&tag, false);
-    assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
-    let text = stderr(&refused);
-    assert!(text.contains("--yes"), "{text}");
-    assert!(text.contains("image refresh --yes"), "{text}");
+    let (replaced, left) = with_unread_stdin(command_with_refresh(&h, &tag), b"n\n");
+    assert!(replaced.status.success(), "{}", stderr(&replaced));
+    assert_eq!(left, b"n\n", "stdin must be left unread");
+    let text = stderr(&replaced);
+    assert!(text.contains("Replacing the approved image for"), "{text}");
     assert!(
-        text.contains("image set-default --image REF --yes"),
+        text.contains(&format!("old: {}", digest_of(&pin_a))),
         "{text}"
     );
-    assert_eq!(h.pinned_digest(), pin_a.rsplit_once('@').unwrap().1);
-
-    let approved = h.refresh(&tag, true);
-    assert!(approved.status.success(), "{}", stderr(&approved));
-    assert_eq!(h.pinned_digest(), pin_b.rsplit_once('@').unwrap().1);
-    // An unchanged refresh never asks again, with or without `--yes`.
-    let unchanged = h.refresh(&tag, false);
-    assert!(unchanged.status.success(), "{}", stderr(&unchanged));
     assert!(
-        !stderr(&unchanged).contains("Approve"),
+        text.contains(&format!("new: {}", digest_of(&pin_b))),
+        "{text}"
+    );
+    assert_eq!(h.pinned_digest(), digest_of(&pin_b));
+
+    // An unchanged refresh renders nothing: there is nothing to consent to.
+    let (unchanged, left) = with_unread_stdin(command_with_refresh(&h, &tag), b"y\n");
+    assert!(unchanged.status.success(), "{}", stderr(&unchanged));
+    assert_eq!(left, b"y\n");
+    assert!(
+        !stderr(&unchanged).contains("old:"),
         "{}",
         stderr(&unchanged)
     );
@@ -948,7 +1049,7 @@ fn a_concurrent_refresh_wins_and_the_import_reports_a_stale_approval() {
     });
     let pin_a = server.image("images", "stale", &a);
     let tag = format!("{}/images:stale", server.host);
-    assert!(h.refresh(&tag, false).status.success(), "first pin");
+    assert!(h.refresh(&tag).status.success(), "first pin");
     assert_eq!(
         h.pinned_digest_for(&tag),
         Some(digest_of(&pin_a)),
@@ -994,7 +1095,7 @@ fn a_concurrent_refresh_wins_and_the_import_reports_a_stale_approval() {
 
     // The winner: a refresh that replaces A with C while this import waits.
     let pin_c = server.image("images", "stale", &c);
-    let refreshed = h.refresh(&tag, true);
+    let refreshed = h.refresh(&tag);
     assert_eq!(refreshed.status.code(), Some(0), "{}", stderr(&refreshed));
     assert_eq!(h.pinned_digest_for(&tag), Some(digest_of(&pin_c)));
 
@@ -1648,7 +1749,7 @@ fn projects_keep_independent_approvals_for_one_tag() {
     });
     let child_c = server.image("images", "split", &c);
     let mut command = h.command_in(&p2, p2_state.path());
-    command.args(["image", "refresh", "--image", &tag, "--yes"]);
+    command.args(["image", "refresh", "--image", &tag]);
     let refreshed = bounded(command);
     assert!(refreshed.status.success(), "{}", stderr(&refreshed));
     assert_eq!(
@@ -1666,11 +1767,11 @@ fn projects_keep_independent_approvals_for_one_tag() {
     assert_eq!(server.count(), before, "P1 still boots A, offline");
 }
 
-/// Spec R4 through the prompt path: declining a replacement in P1 leaves every
-/// other project's record untouched (it guards the prompt's key, not only the
-/// `--yes` path's).
+/// Spec R4/R6: a refresh in P1 replaces only P1's record. There is no decline
+/// any more — the explicit command is the consent — so this row proves the
+/// scope of the change, not the scope of a consent.
 #[test]
-fn a_declined_refresh_in_one_project_cannot_touch_another() {
+fn a_refresh_in_one_project_cannot_touch_another() {
     let h = Harness::new(Mode::StrictAcquisition);
     let server = Server::new();
     let tag = format!("{}/images:decline", server.host);
@@ -1687,27 +1788,27 @@ fn a_declined_refresh_in_one_project_cannot_touch_another() {
     let mut command = h.command_in(&p2, p2_state.path());
     command.args(["--image", &tag, "shell", "--", "true"]);
     assert_eq!(sdk_image(&bounded(command)), child_a);
-    let p1_record = h.record_in(&h.project, &tag).unwrap();
     let p2_record = h.record_in(&p2, &tag).unwrap();
     assert_eq!(p2_record["manifest_digest"], digest_of(&child_a));
 
-    // Move the tag, then decline the replacement in P1.
+    // Move the tag, then refresh in P1.
     let b = h.image(&ArchiveSpec {
         marker: "decline-b".into(),
         ..Default::default()
     });
-    server.image("images", "decline", &b);
-    let mut command = h.command();
-    command.args(["image", "refresh", "--image", &tag]);
-    let mut terminal = Pty::spawn(&mut command, PROMPT).expect("open a pseudo-terminal");
-    let (status, out) = terminal
-        .drive(&Action::Write(b"n\n"), Duration::from_secs(60))
-        .expect("drive the approval prompt");
-    let text = String::from_utf8_lossy(&out);
-    assert!(!status.success(), "a declined approval fails: {text}");
-    assert!(text.contains("Replace the approved image for"), "{text}");
-    assert_eq!(h.record_in(&h.project, &tag).unwrap(), p1_record);
-    assert_eq!(h.record_in(&p2, &tag).unwrap(), p2_record);
+    let child_b = server.image("images", "decline", &b);
+    let refreshed = h.refresh(&tag);
+    assert!(refreshed.status.success(), "{}", stderr(&refreshed));
+    assert_eq!(
+        h.pin_in(&h.project, &tag),
+        Some((digest_of(&child_b), 2)),
+        "P1 replaces its own approval"
+    );
+    assert_eq!(
+        h.record_in(&p2, &tag).unwrap(),
+        p2_record,
+        "P2's record is byte-identical"
+    );
 }
 
 /// AC3: a symlink alias is the same project (one record, no registry request on
@@ -1934,7 +2035,7 @@ fn doctor_reports_each_projects_own_approved_content() {
     let b = labelled(&h, "doctor-b", "b.example");
     server.image("images", "doctor-scope", &b);
     let mut command = h.command_in(&p2, &h.state);
-    command.args(["image", "refresh", "--image", &tag, "--yes"]);
+    command.args(["image", "refresh", "--image", &tag]);
     let out = bounded(command);
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(h.pin_in(&p2, &tag).unwrap().1, 1, "P2's own first approval");
@@ -2010,8 +2111,9 @@ fn seed_store(h: &Harness, bytes: &[u8]) {
 /// AC5: a valid, lock-accompanied version-1 store refuses every OCI command
 /// with the legacy error — before any registry request, cache publication,
 /// Docker run or SDK create — and no approval-authority file is created or
-/// changed. `--yes` changes nothing, a local path still reaches the runtime,
-/// and once the store is archived the next launch makes a first pin.
+/// changed. `--yes` is a usage error now (AC13, covered by
+/// `the_yes_flag_is_removed_from_both_verbs`), a local path still reaches the
+/// runtime, and once the store is archived the next launch makes a first pin.
 #[test]
 fn a_legacy_host_wide_store_is_refused_until_upgraded() {
     let h = Harness::new(Mode::LaunchSeam);
@@ -2047,16 +2149,8 @@ fn a_legacy_host_wide_store_is_refused_until_upgraded() {
     outputs.push(("setup", run(&["setup", "--image", &tag, "--no-verify"])));
     outputs.push(("refresh", run(&["image", "refresh", "--image", &tag])));
     outputs.push((
-        "refresh --yes",
-        run(&["image", "refresh", "--image", &tag, "--yes"]),
-    ));
-    outputs.push((
         "set-default",
         run(&["image", "set-default", "--image", &tag]),
-    ));
-    outputs.push((
-        "set-default --yes",
-        run(&["image", "set-default", "--image", &tag, "--yes"]),
     ));
     outputs.push(("build", run(&["image", "build", "--tag", &tag])));
     outputs.push((
@@ -2152,7 +2246,7 @@ fn a_malformed_project_scope_is_damage_not_legacy() {
     let tag = format!("{}/images:malformed", server.host);
     let image = h.image(&ArchiveSpec::default());
     server.image("images", "malformed", &image);
-    let out = h.refresh(&tag, false);
+    let out = h.refresh(&tag);
     assert!(out.status.success(), "{}", stderr(&out));
 
     let mut store: serde_json::Value =
@@ -2285,7 +2379,7 @@ fn a_foreign_platform_record_is_preserved_not_borrowed() {
     let a = h.image(&ArchiveSpec::default());
     let child_a = server.image("images", "platform", &a);
     let tag = format!("{}/images:platform", server.host);
-    assert!(h.refresh(&tag, false).status.success());
+    assert!(h.refresh(&tag).status.success());
     let mut store: serde_json::Value =
         serde_json::from_slice(&fs::read(h.pins()).unwrap()).unwrap();
     let arch = if image_archive::host_arch() == "arm64" {
@@ -2320,74 +2414,98 @@ fn a_foreign_platform_record_is_preserved_not_borrowed() {
     assert_eq!(server.count(), start);
 }
 
+/// R6/D5: the candidate is resolved once and frozen. The tag moves while the
+/// command is paused at `candidate-ready`; the commit names the content that was
+/// resolved, and the next warm launch boots it offline.
+///
+/// For `set-default` this also proves R5: one tag-manifest request, a host record
+/// naming the resolved child, and no pin store at all.
 #[test]
-fn approval_freezes_b_when_the_displayed_tag_moves_to_c() {
+fn a_resolved_candidate_is_frozen_for_refresh_and_set_default() {
     for verb in ["refresh", "set-default"] {
         let h = Harness::new(Mode::LaunchSeam);
         let server = Server::new();
         let a = h.image(&ArchiveSpec::default());
         server.image("images", "frozen", &a);
         let tag = format!("{}/images:frozen", server.host);
-        let mut cmd = h.command();
-        cmd.args(["image", "set-default", "--image", &tag]);
-        assert!(bounded(cmd).status.success());
+        if verb == "refresh" {
+            // A refresh needs an approval to replace; the fixture is a refresh.
+            assert!(h.refresh(&tag).status.success());
+        }
         let b = h.image(&ArchiveSpec {
             marker: "frozen-b".into(),
             ..Default::default()
         });
         let child_b = server.image("images", "frozen", &b);
-        let start = server.count();
-        let mut cmd = h.command();
-        cmd.args(["image", verb, "--image", &tag]);
-        let mut terminal = Pty::spawn(&mut cmd, PROMPT).unwrap();
-        let shown = terminal.wait_for_prompt(Duration::from_secs(60)).unwrap();
-        let shown = String::from_utf8_lossy(&shown);
-        assert!(shown.contains(&a.written.manifest_digest), "{shown}");
-        assert!(shown.contains(&b.written.manifest_digest), "{shown}");
+        let start = server.requests().len();
+        let mut gate = PinGate::new(h.root.path());
+        let peer = PinPeer::spawn(h.command(), &gate, &["image", verb, "--image", &tag]);
+        gate.expect(PinStage::CandidateReady).reply(Reply::Continue);
+        // The tag moves to C after the command resolved B.
         let c = h.image(&ArchiveSpec {
             marker: "frozen-c".into(),
             ..Default::default()
         });
         server.image("images", "frozen", &c);
-        let after_display = server.count();
-        terminal.write_all(b"yes\n");
-        let mut output = Vec::new();
-        let status = terminal
-            .wait_for_exit(&mut output, Duration::from_secs(60))
-            .unwrap();
-        assert!(status.success(), "{}", String::from_utf8_lossy(&output));
-        assert_eq!(h.pinned_digest(), b.written.manifest_digest);
-        assert_eq!(
-            server.count(),
-            after_display,
-            "approval must not resolve the tag twice"
-        );
+        let after_resolve = server.requests().len();
+        // A refresh commits a pin; set-default commits only the host record.
+        let stages: &[PinStage] = if verb == "refresh" {
+            &[
+                PinStage::BeforePinLock,
+                PinStage::PinLocked,
+                PinStage::BeforePinSave,
+                PinStage::PinCommitted,
+            ]
+        } else {
+            &[
+                PinStage::BeforePinLock,
+                PinStage::PinLocked,
+                PinStage::BeforeDefaultSave,
+                PinStage::DefaultSaved,
+            ]
+        };
+        for stage in stages {
+            gate.expect(*stage).reply(Reply::Continue);
+        }
+        let out = peer.wait();
+        assert!(out.status.success(), "{verb}: {}", stderr(&out));
         assert_eq!(
             server.requests()[start..]
                 .iter()
-                .filter(|(_, p)| p == "/v2/images/manifests/frozen")
+                .filter(|(_, path)| path == "/v2/images/manifests/frozen")
                 .count(),
-            1
+            1,
+            "{verb} must request the tag manifest once"
         );
-        assert_eq!(sdk_image(&h.launch(&tag)), child_b);
-        assert_eq!(
-            server.count(),
-            after_display,
-            "future warm launch consumes B offline"
-        );
-        if verb == "set-default" {
+        if verb == "refresh" {
+            assert_eq!(h.pinned_digest(), digest_of(&child_b));
+            assert_eq!(
+                sdk_image(&h.launch(&tag)),
+                child_b,
+                "the frozen candidate is what the warm launch boots"
+            );
+            assert_eq!(
+                server.count(),
+                after_resolve,
+                "the warm launch consumes B offline"
+            );
+        } else {
             let default: serde_json::Value = serde_json::from_slice(
                 &fs::read(h.home.join(".config/agent-vm/default-image.json")).unwrap(),
             )
             .unwrap();
             assert_eq!(default, serde_json::json!({"version":1,"image":child_b}));
+            assert!(
+                !h.pins().exists(),
+                "set-default writes no approval in any project"
+            );
         }
     }
 }
 
 fn set_default(h: &Harness, tag: &str) -> Output {
     let mut cmd = h.command();
-    cmd.args(["image", "set-default", "--image", tag, "--yes"]);
+    cmd.args(["image", "set-default", "--image", tag]);
     bounded(cmd)
 }
 
@@ -2395,15 +2513,21 @@ fn read_json(path: &Path) -> serde_json::Value {
     serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
 }
 
+/// R9/D2: no operation writes a journal, and no S1 journal is written either.
+///
+/// (a) `image set-default` has one host-record save. An interruption before it
+/// leaves the old record, after it the new one, and no approval either way.
+/// (b) A recommendation-sourced first default-tier launch writes the host record
+/// **first** and the pin store second, which is the narrowed ADR-0047 guarantee.
 #[test]
 fn interrupted_pin_transactions_keep_old_logical_state_and_recover() {
+    // (a) set-default's single host save.
     for stop in [
         PinStage::CandidateReady,
-        PinStage::BeforeIntentSave,
-        PinStage::IntentSaved,
+        PinStage::BeforePinLock,
+        PinStage::PinLocked,
+        PinStage::BeforeDefaultSave,
         PinStage::DefaultSaved,
-        PinStage::BeforePinSave,
-        PinStage::PinCommitted,
     ] {
         let h = Harness::new(Mode::LaunchSeam);
         let server = Server::new();
@@ -2411,7 +2535,6 @@ fn interrupted_pin_transactions_keep_old_logical_state_and_recover() {
         let child_a = server.image("images", "journal", &a);
         let tag = format!("{}/images:journal", server.host);
         assert!(set_default(&h, &tag).status.success());
-        let old = fs::read(h.pins()).unwrap();
         let default = h.home.join(".config/agent-vm/default-image.json");
         let old_default = fs::read(&default).unwrap();
         let b = h.image(&ArchiveSpec {
@@ -2420,130 +2543,206 @@ fn interrupted_pin_transactions_keep_old_logical_state_and_recover() {
         });
         let child_b = server.image("images", "journal", &b);
         let mut gate = PinGate::new(h.root.path());
-        let peer = pin_gate::PinPeer::spawn(
-            h.command(),
-            &gate,
-            &["image", "set-default", "--image", &tag, "--yes"],
-        );
+        let peer = pin_peer(&h, &gate, &["image", "set-default", "--image", &tag]);
         for stage in [
             PinStage::CandidateReady,
             PinStage::BeforePinLock,
             PinStage::PinLocked,
-            PinStage::BeforeIntentSave,
-            PinStage::IntentSaved,
+            PinStage::BeforeDefaultSave,
             PinStage::DefaultSaved,
-            PinStage::BeforePinSave,
-            PinStage::PinCommitted,
         ] {
             let checkpoint = gate.expect(stage);
             if stage == stop {
-                // PinPeer's Drop kills/reaps before the blocked connection is
-                // closed: no child can run through the intended interruption.
                 drop(peer);
                 drop(checkpoint);
                 break;
             }
             checkpoint.reply(Reply::Continue);
         }
-        let committed = stop == PinStage::PinCommitted;
-        let expected = if committed { &child_b } else { &child_a };
-        let physical_pins = fs::read(h.pins()).unwrap();
+        let written = stop == PinStage::DefaultSaved;
+        let expected = if written { &child_b } else { &child_a };
         let physical_default = fs::read(&default).unwrap();
+        if written {
+            assert_eq!(
+                read_json(&default),
+                serde_json::json!({"version":1,"image":expected})
+            );
+        } else {
+            assert_eq!(physical_default, old_default);
+        }
+        assert!(
+            !h.pins().exists(),
+            "set-default commits no approval in any project"
+        );
         let mut cmd = h.command();
         cmd.args(["image", "show"]);
         let show = bounded(cmd);
-        assert!(show.status.success(), "{:?}: {}", stop, stderr(&show));
+        assert!(show.status.success(), "{stop:?}: {}", stderr(&show));
         assert!(
-            String::from_utf8_lossy(&show.stdout).contains(expected),
-            "{}",
-            String::from_utf8_lossy(&show.stdout)
+            stdout_of(&show).contains(expected),
+            "{stop:?}: {}",
+            stdout_of(&show)
         );
         let mut cmd = h.command();
         cmd.arg("doctor");
         let doctor = bounded(cmd);
         assert!(doctor.status.success(), "{}", stderr(&doctor));
         assert!(
-            String::from_utf8_lossy(&doctor.stdout).contains("default: retained default"),
+            stdout_of(&doctor).contains("default: retained default"),
             "{}",
-            String::from_utf8_lossy(&doctor.stdout)
+            stdout_of(&doctor)
         );
-        assert_eq!(
-            fs::read(h.pins()).unwrap(),
-            physical_pins,
-            "observers must not recover"
-        );
+        // An observation never repairs: bytes are exactly what the interruption
+        // left, and there is no journal to recover.
         assert_eq!(fs::read(&default).unwrap(), physical_default);
-        if matches!(stop, PinStage::CandidateReady | PinStage::BeforeIntentSave) {
-            assert_eq!(physical_pins, old);
-            assert_eq!(physical_default, old_default);
-        }
-        // A mutator using a different source recovers without approving B for
-        // the original tag. A second invocation proves recovery is idempotent.
-        if !committed {
-            for _ in 0..2 {
-                assert!(h.refresh(&child_a, false).status.success());
-                assert_eq!(fs::read(&default).unwrap(), old_default);
-                assert!(read_json(&h.pins())["pending_default"].is_null());
-            }
-        }
-        let start = server.count();
-        assert_eq!(sdk_image(&h.launch(&tag)), *expected);
-        assert_eq!(server.count(), start);
+        assert!(!h.pins().exists());
     }
-}
 
-/// A failure at either real write point leaves A and the previous fallback.
-///
-/// The seam is the atomic save as a whole, so a rename fault is indistinguishable
-/// from an earlier save failure and there is no separate row for it: one injected
-/// pre-write failure per write point is what this control can actually prove.
-#[test]
-fn pin_save_faults_preserve_approved_a_and_default() {
-    for stage in [PinStage::BeforeIntentSave, PinStage::BeforePinSave] {
+    // (b) A recommendation first launch: host record first, then the pin store.
+    for stop in [
+        PinStage::CandidateReady,
+        PinStage::BeforePinLock,
+        PinStage::PinLocked,
+        PinStage::BeforeDefaultSave,
+        PinStage::DefaultSaved,
+        PinStage::BeforePinSave,
+        PinStage::PinCommitted,
+    ] {
         let h = Harness::new(Mode::LaunchSeam);
         let server = Server::new();
         let a = h.image(&ArchiveSpec::default());
-        let child_a = server.image("images", "fault", &a);
-        let tag = format!("{}/images:fault", server.host);
-        assert!(set_default(&h, &tag).status.success());
-        let old = fs::read(h.pins()).unwrap();
-        let default = h.home.join(".config/agent-vm/default-image.json");
-        let old_default = fs::read(&default).unwrap();
-        let b = h.image(&ArchiveSpec {
-            marker: "fault-b".into(),
-            ..Default::default()
-        });
-        server.image("images", "fault", &b);
+        let child_a = server.image("images", "recommend", &a);
+        let mut command = h.command();
+        command
+            .env("AGENT_VM_TEST_DEFAULT_IMAGE", &child_a)
+            .args(["shell", "--", "true"]);
         let mut gate = PinGate::new(h.root.path());
-        let peer = pin_gate::PinPeer::spawn(
-            h.command(),
-            &gate,
-            &["image", "set-default", "--image", &tag, "--yes"],
-        );
-        for next in [
+        let peer = pin_gate::PinPeer::spawn(command, &gate, &[]);
+        for stage in [
             PinStage::CandidateReady,
             PinStage::BeforePinLock,
             PinStage::PinLocked,
-            PinStage::BeforeIntentSave,
-            PinStage::IntentSaved,
+            PinStage::BeforeDefaultSave,
             PinStage::DefaultSaved,
             PinStage::BeforePinSave,
+            PinStage::PinCommitted,
         ] {
-            let checkpoint = gate.expect(next);
-            if next == stage {
-                checkpoint.reply(Reply::FailBeforeSave);
+            let checkpoint = gate.expect(stage);
+            if stage == stop {
+                drop(peer);
+                drop(checkpoint);
                 break;
             }
             checkpoint.reply(Reply::Continue);
         }
-        let out = peer.wait();
-        assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
-        assert_eq!(fs::read(h.pins()).unwrap(), old);
-        assert_eq!(fs::read(&default).unwrap(), old_default);
-        let start = server.count();
-        assert_eq!(sdk_image(&h.launch(&tag)), child_a);
-        assert_eq!(server.count(), start);
+        let default = h.home.join(".config/agent-vm/default-image.json");
+        let host_written = matches!(
+            stop,
+            PinStage::DefaultSaved | PinStage::BeforePinSave | PinStage::PinCommitted
+        );
+        assert_eq!(
+            fs::read(&default).is_ok(),
+            host_written,
+            "{stop:?}: the host record is written before the pin store"
+        );
+        if host_written {
+            assert_eq!(
+                read_json(&default),
+                serde_json::json!({"version":1,"image":child_a})
+            );
+        }
+        if stop == PinStage::PinCommitted {
+            let store = read_json(&h.pins());
+            assert_eq!(store["pins"].as_array().unwrap().len(), 1);
+            assert_eq!(store["defaults"].as_array().unwrap().len(), 1);
+            assert!(store["pending_default"].is_null(), "no journal is written");
+        } else {
+            assert!(
+                !h.pins().exists(),
+                "{stop:?}: an interruption before the pin save leaves no store"
+            );
+        }
     }
+}
+
+/// One gated set-default peer.
+fn pin_peer(h: &Harness, gate: &PinGate, args: &[&str]) -> PinPeer {
+    let mut command = h.command();
+    command.args(args);
+    pin_gate::PinPeer::spawn(command, gate, &[])
+}
+
+/// R6/D5 (fault row): a failed first default-tier launch may leave the host
+/// starting choice initialized with measured content — the narrowed ADR-0047
+/// guarantee — and never a project default without its pin.
+#[test]
+fn a_failed_first_default_pin_may_leave_the_host_starting_choice_initialized() {
+    // A fault before the host save writes nothing at all.
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let child_a = server.image("images", "fault", &a);
+    let default = h.home.join(".config/agent-vm/default-image.json");
+    let mut gate = PinGate::new(h.root.path());
+    let peer = pin_peer_recommendation(&h, &gate, &child_a);
+    for stage in [
+        PinStage::CandidateReady,
+        PinStage::BeforePinLock,
+        PinStage::PinLocked,
+    ] {
+        gate.expect(stage).reply(Reply::Continue);
+    }
+    gate.expect(PinStage::BeforeDefaultSave)
+        .reply(Reply::FailBeforeSave);
+    let out = peer.wait();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(!default.exists(), "nothing is written");
+    assert!(!h.pins().exists(), "nothing is written");
+
+    // A fault at the pin save leaves the host record initialized with the
+    // measured recommendation, and the next launch completes establishment from
+    // it without any registry request beyond the cache.
+    let mut gate = PinGate::new(h.root.path());
+    let peer = pin_peer_recommendation(&h, &gate, &child_a);
+    for stage in [
+        PinStage::CandidateReady,
+        PinStage::BeforePinLock,
+        PinStage::PinLocked,
+        PinStage::BeforeDefaultSave,
+        PinStage::DefaultSaved,
+    ] {
+        gate.expect(stage).reply(Reply::Continue);
+    }
+    gate.expect(PinStage::BeforePinSave)
+        .reply(Reply::FailBeforeSave);
+    let out = peer.wait();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(
+        read_json(&default),
+        serde_json::json!({"version":1,"image":child_a}),
+        "the host starting choice holds measured content"
+    );
+    assert!(!h.pins().exists(), "the pin store was never written");
+
+    // The next default-tier use establishes from the host record, cache-first.
+    let before = server.count();
+    let mut command = h.command();
+    command.args(["shell", "--", "true"]);
+    let relaunch = bounded(command);
+    assert!(!relaunch.status.success(), "the fake runtime cannot boot");
+    assert_eq!(server.count(), before, "the cache answers the relaunch");
+    let store = read_json(&h.pins());
+    assert_eq!(store["pins"].as_array().unwrap().len(), 1);
+    assert_eq!(store["defaults"][0]["image"], child_a.as_str());
+}
+
+/// A launch of the debug-only initial recommendation, and nothing else.
+fn pin_peer_recommendation(h: &Harness, gate: &PinGate, recommendation: &str) -> PinPeer {
+    let mut command = h.command();
+    command
+        .env("AGENT_VM_TEST_DEFAULT_IMAGE", recommendation)
+        .args(["shell", "--", "true"]);
+    pin_gate::PinPeer::spawn(command, gate, &[])
 }
 
 #[test]
@@ -2554,7 +2753,7 @@ fn alternate_manifest_algorithms_keep_equivalent_approval_bytes() {
         let a = h.image(&ArchiveSpec::default());
         let child = server.image("images", "equivalent", &a);
         let tag = format!("{}/images:equivalent", server.host);
-        assert!(h.refresh(&tag, false).status.success());
+        assert!(h.refresh(&tag).status.success());
         let old = fs::read(h.pins()).unwrap();
         let manifest = &a.blobs[&a.written.manifest_digest];
         let digest = oci_registry::digest_hex(algorithm, manifest);
@@ -2565,7 +2764,7 @@ fn alternate_manifest_algorithms_keep_equivalent_approval_bytes() {
             "application/vnd.oci.image.manifest.v1+json",
             &digest,
         );
-        let out = h.refresh(&tag, false);
+        let out = h.refresh(&tag);
         assert!(out.status.success(), "{}", stderr(&out));
         assert!(!stderr(&out).contains("Approve"));
         assert_eq!(
@@ -2587,7 +2786,9 @@ fn held_authority_lock_bounds_reads_and_mutation_waits() {
     let a = h.image(&ArchiveSpec::default());
     server.image("images", "lock", &a);
     let tag = format!("{}/images:lock", server.host);
-    assert!(set_default(&h, &tag).status.success());
+    // The row reads both records, so the fixture must create both: S1's
+    // set-default used to write the pin itself (fixture-only change, #541).
+    h.pin_and_set_default(&tag);
     let old = fs::read(h.pins()).unwrap();
     let default = h.home.join(".config/agent-vm/default-image.json");
     let old_default = fs::read(&default).unwrap();
@@ -2626,7 +2827,7 @@ fn held_authority_lock_bounds_reads_and_mutation_waits() {
     assert_eq!(fs::read(default).unwrap(), old_default);
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
     assert!(
-        h.refresh(&tag, false).status.success(),
+        h.refresh(&tag).status.success(),
         "timeout must release all locks"
     );
 }
@@ -2639,7 +2840,7 @@ fn unwritable_authority_preserves_a_with_a_root_safe_fault_control() {
     let a = h.image(&ArchiveSpec::default());
     let child_a = server.image("images", "permission", &a);
     let tag = format!("{}/images:permission", server.host);
-    assert!(set_default(&h, &tag).status.success());
+    h.pin_and_set_default(&tag);
     let old = fs::read(h.pins()).unwrap();
     let b = h.image(&ArchiveSpec {
         marker: "permission-b".into(),
@@ -2647,11 +2848,7 @@ fn unwritable_authority_preserves_a_with_a_root_safe_fault_control() {
     });
     server.image("images", "permission", &b);
     let mut gate = PinGate::new(h.root.path());
-    let peer = pin_gate::PinPeer::spawn(
-        h.command(),
-        &gate,
-        &["image", "refresh", "--image", &tag, "--yes"],
-    );
+    let peer = pin_gate::PinPeer::spawn(h.command(), &gate, &["image", "refresh", "--image", &tag]);
     for stage in [
         PinStage::CandidateReady,
         PinStage::BeforePinLock,
@@ -2684,81 +2881,242 @@ fn unwritable_authority_preserves_a_with_a_root_safe_fault_control() {
     assert_eq!(server.count(), start);
 }
 
+/// R7 fault row: adoption is one compare-and-swap save. A failure before that
+/// save leaves the old store bytes, the old project default and no `(P, H)`
+/// approval, and the project still boots D.
+#[test]
+fn a_failed_adoption_save_keeps_the_project_default() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let child_d = server.image("images", "adopt-fault", &a);
+    // D: the project's own established default.
+    assert!(!h.launch_on_recommendation(&child_d).status.success());
+    assert_eq!(h.default_record_in(&h.project).unwrap()["image"], child_d);
+    // H: a different retained host record for the same repository.
+    let b = h.image(&ArchiveSpec {
+        marker: "adopt-fault-b".into(),
+        ..Default::default()
+    });
+    let child_h = server.image("images", "adopt-fault", &b);
+    let tag = format!("{}/images:adopt-fault", server.host);
+    let set = set_default(&h, &tag);
+    assert!(set.status.success(), "{}", stderr(&set));
+    assert_eq!(h.host_record().unwrap()["image"], child_h);
+    assert_eq!(
+        h.default_record_in(&h.project).unwrap()["image"],
+        child_d,
+        "set-default moves no project default"
+    );
+    let old = fs::read(h.pins()).unwrap();
+
+    // The bare refresh adopts H, but its one save is refused.
+    let mut gate = PinGate::new(h.root.path());
+    let peer = pin_gate::PinPeer::spawn(h.command(), &gate, &["image", "refresh"]);
+    for stage in [
+        PinStage::CandidateReady,
+        PinStage::BeforePinLock,
+        PinStage::PinLocked,
+    ] {
+        gate.expect(stage).reply(Reply::Continue);
+    }
+    gate.expect(PinStage::BeforePinSave)
+        .reply(Reply::FailBeforeSave);
+    let out = peer.wait();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(
+        fs::read(h.pins()).unwrap(),
+        old,
+        "the refused adoption left the store byte-identical"
+    );
+    assert_eq!(
+        h.default_record_in(&h.project).unwrap()["image"],
+        child_d,
+        "defaults[P] is still D"
+    );
+    assert!(
+        h.pin_in(&h.project, &child_h).is_none(),
+        "no (P, H) approval was inserted"
+    );
+    assert_eq!(
+        h.reacquired_digest(&server),
+        digest_of(&child_d),
+        "the next launch still boots D"
+    );
+}
+
+/// Run `args` in the harness with the child's stderr connected to a Unix socket
+/// whose peer is gone, so every write to stderr fails (`EPIPE`). A closed
+/// standard descriptor is not the same experiment: the runtime repairs a missing
+/// stderr, so that control succeeded. The debug-config dump is off: this row is
+/// about the render, not about unrelated output.
+fn with_unwritable_stderr(h: &Harness, args: &[&str]) -> Output {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    let (writer, reader) = UnixStream::pair().expect("create the socket pair");
+    drop(reader);
+    let mut command = h.command();
+    command.env_remove("AGENT_VM_DEBUG_CONFIG").args(args);
+    let writer: OwnedFd = writer.into();
+    bounded_with_stderr(command, std::process::Stdio::from(writer))
+}
+
+/// R6: a render that cannot be written commits nothing. Two real render paths —
+/// a moved mutable tag and an adoption whose content differs — are made to fail
+/// their stderr write, and each leaves the authority byte-identical.
+#[test]
+fn an_unwritable_stderr_commits_no_replacement_and_no_adoption() {
+    // A replacement: the tag moves A -> B and the render cannot be written.
+    let h = Harness::new(Mode::StrictAcquisition);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let child_a = server.image("images", "render", &a);
+    let tag = format!("{}/images:render", server.host);
+    assert!(h.refresh(&tag).status.success());
+    let pins = fs::read(h.pins()).unwrap();
+    let b = h.image(&ArchiveSpec {
+        marker: "render-b".into(),
+        ..Default::default()
+    });
+    let child_b = server.image("images", "render", &b);
+    assert_ne!(child_a, child_b);
+
+    let out = with_unwritable_stderr(&h, &["image", "refresh", "--image", &tag]);
+    assert_eq!(out.status.code(), Some(1), "the render failure is fatal");
+    assert_eq!(
+        fs::read(h.pins()).unwrap(),
+        pins,
+        "no replacement was committed"
+    );
+    assert_eq!(
+        h.pin_in(&h.project, &tag),
+        Some((digest_of(&child_a), 1)),
+        "the old approval is intact at its old revision"
+    );
+
+    // An adoption: the host record names different content, and its render
+    // cannot be written either.
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let child_d = server.image("images", "render-adopt", &a);
+    assert!(!h.launch_on_recommendation(&child_d).status.success());
+    let b = h.image(&ArchiveSpec {
+        marker: "render-adopt-b".into(),
+        ..Default::default()
+    });
+    let child_h = server.image("images", "render-adopt", &b);
+    let tag = format!("{}/images:render-adopt", server.host);
+    assert!(set_default(&h, &tag).status.success());
+    let pins = fs::read(h.pins()).unwrap();
+
+    let out = with_unwritable_stderr(&h, &["image", "refresh"]);
+    assert_eq!(out.status.code(), Some(1), "the render failure is fatal");
+    assert_eq!(
+        fs::read(h.pins()).unwrap(),
+        pins,
+        "no adoption was committed"
+    );
+    assert_eq!(
+        h.default_record_in(&h.project).unwrap()["image"],
+        child_d,
+        "the project default is untouched"
+    );
+    assert!(
+        h.pin_in(&h.project, &child_h).is_none(),
+        "no approval was recorded for the host reference"
+    );
+}
+
+/// R9: a journal 0.7.39–0.7.46 left is still authoritative. An unwritable
+/// directory makes the next write demand recovery, observation keeps returning
+/// the journal's `previous` bytes, and the write recovers once it can.
 #[test]
 fn failed_default_restore_requires_recovery_without_losing_old_approval() {
     use std::os::unix::fs::PermissionsExt;
-    if unsafe { libc::geteuid() } == 0 {
-        // Root bypasses directory EACCES. CLI pre-write controls still execute;
-        // store::tests::journal_real_write_failures_roll_back_or_require_recovery
-        // supplies the deterministic failed-restore adapter case on CI root.
-        eprintln!("root: CLI pre-write fault control, not a genuine EACCES restore failure");
-        pin_save_faults_preserve_approved_a_and_default();
-        return;
-    }
     let h = Harness::new(Mode::LaunchSeam);
     let server = Server::new();
     let a = h.image(&ArchiveSpec::default());
     let child_a = server.image("images", "restore", &a);
     let tag = format!("{}/images:restore", server.host);
-    assert!(set_default(&h, &tag).status.success());
-    let old = fs::read(h.pins()).unwrap();
+    // An approval to keep across the recovery.
+    assert!(h.refresh(&tag).status.success());
     let default = h.home.join(".config/agent-vm/default-image.json");
-    let old_default = fs::read(&default).unwrap();
-    let b = h.image(&ArchiveSpec {
-        marker: "restore-b".into(),
-        ..Default::default()
-    });
-    server.image("images", "restore", &b);
-    let mut gate = PinGate::new(h.root.path());
-    let peer = pin_gate::PinPeer::spawn(
-        h.command(),
-        &gate,
-        &["image", "set-default", "--image", &tag, "--yes"],
+    let old_default = format!("{{ \"image\": \"{child_a}\", \"version\": 1 }}\n");
+    fs::write(&default, &old_default).unwrap();
+    // Seed the interrupted state: the journal names the old bytes, the host
+    // record already holds the proposed ones.
+    let proposed = format!(
+        "{{ \"image\": \"{}@sha256:{}\", \"version\": 1 }}\n",
+        server.host,
+        "b".repeat(64)
     );
-    for stage in [
-        PinStage::CandidateReady,
-        PinStage::BeforePinLock,
-        PinStage::PinLocked,
-        PinStage::BeforeIntentSave,
-        PinStage::IntentSaved,
-        PinStage::DefaultSaved,
-    ] {
-        gate.expect(stage).reply(Reply::Continue);
-    }
-    let save = gate.expect(PinStage::BeforePinSave);
+    let mut store = read_json(&h.pins());
+    store["pending_default"] = serde_json::json!({
+        "previous": old_default,
+        "proposed": proposed,
+    });
+    fs::write(h.pins(), serde_json::to_vec(&store).unwrap()).unwrap();
+    fs::write(&default, &proposed).unwrap();
+    // A real 0.7.39–0.7.46 store always has this lock; without it the next
+    // transaction would fail while creating it, not in the recovery itself.
+    fs::write(config_dir(&h).join("default-image.lock"), b"").unwrap();
+    let seeded = fs::read(h.pins()).unwrap();
+
+    // Observation honors the journal and never repairs it.
+    let mut cmd = h.command();
+    cmd.args(["image", "show"]);
+    let show = bounded(cmd);
+    assert!(show.status.success(), "{}", stderr(&show));
+    assert!(stdout_of(&show).contains(&child_a), "{}", stdout_of(&show));
+    let mut cmd = h.command();
+    cmd.arg("doctor");
+    let doctor = bounded(cmd);
+    assert!(doctor.status.success(), "{}", stderr(&doctor));
+    assert!(
+        stdout_of(&doctor).contains("default: retained default ["),
+        "the journal's previous bytes stay authoritative: {}",
+        stdout_of(&doctor)
+    );
+    assert_eq!(fs::read(h.pins()).unwrap(), seeded);
+
+    // An unwritable directory makes the next write demand recovery. Root
+    // bypasses directory EACCES, so on root this row stops after the
+    // observation assertions above; the deterministic failed-restore adapter
+    // case is `image_pin::store`'s `journal_real_write_failures...` test.
     let directory = h.pins().parent().unwrap().to_owned();
     let permissions = fs::metadata(&directory).unwrap().permissions();
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("root: observation and recovery rows only, not a genuine EACCES restore failure");
+        assert!(h.refresh(&child_a).status.success());
+        assert!(read_json(&h.pins())["pending_default"].is_null());
+        assert_eq!(fs::read(&default).unwrap(), old_default.as_bytes());
+        return;
+    }
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o500)).unwrap();
-    save.reply(Reply::Continue);
-    let out = peer.wait();
+    let mut cmd = h.command();
+    cmd.args(["image", "refresh", "--image", &child_a]);
+    let out = bounded(cmd);
     fs::set_permissions(&directory, permissions).unwrap();
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     assert!(
         stderr(&out).contains("requires recovery"),
         "{}",
         stderr(&out)
     );
     let pending = fs::read(h.pins()).unwrap();
-    let physical_default = fs::read(&default).unwrap();
-    assert_ne!(physical_default, old_default);
     assert!(!read_json(&h.pins())["pending_default"].is_null());
     let mut cmd = h.command();
     cmd.args(["image", "show"]);
     let out = bounded(cmd);
     assert!(out.status.success(), "{}", stderr(&out));
-    assert!(String::from_utf8_lossy(&out.stdout).contains(&child_a));
+    assert!(stdout_of(&out).contains(&child_a));
     assert_eq!(fs::read(h.pins()).unwrap(), pending);
-    assert_eq!(fs::read(&default).unwrap(), physical_default);
-    // Pinned refresh A recovers but does not replace the original source key.
-    assert!(h.refresh(&child_a, false).status.success());
-    assert_eq!(fs::read(&default).unwrap(), old_default);
-    let old: serde_json::Value = serde_json::from_slice(&old).unwrap();
-    assert!(
-        read_json(&h.pins())["pins"]
-            .as_array()
-            .unwrap()
-            .contains(&old["pins"][0])
-    );
+
+    // Writable again: the next write recovers the journal and keeps the pin.
+    assert!(h.refresh(&child_a).status.success());
+    assert!(read_json(&h.pins())["pending_default"].is_null());
+    assert_eq!(fs::read(&default).unwrap(), old_default.as_bytes());
     let start = server.count();
     assert_eq!(sdk_image(&h.launch(&tag)), child_a);
     assert_eq!(server.count(), start);
@@ -2789,13 +3147,13 @@ fn native_index_ignores_attestation_platformless_and_foreign_entries() {
     index["manifests"] = serde_json::json!([attestation, platformless, foreign, host]);
     server.index("images", "filtered", serde_json::to_vec(&index).unwrap());
     let source = format!("{}/images:filtered", server.host);
-    assert!(h.refresh(&source, false).status.success());
+    assert!(h.refresh(&source).status.success());
     assert_eq!(h.pinned_digest(), a.written.manifest_digest);
     assert_eq!(sdk_image(&h.launch(&source)), child);
     let old = fs::read(h.pins()).unwrap();
     index["manifests"][2]["digest"] = format!("sha256:{}", "d".repeat(64)).into();
     server.index("images", "filtered", serde_json::to_vec(&index).unwrap());
-    let out = h.refresh(&source, false);
+    let out = h.refresh(&source);
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(!stderr(&out).contains("Approve"));
     assert_eq!(
@@ -2823,7 +3181,7 @@ fn unapproved_legacy_index_requires_its_immutable_source_proof() {
     let a = h.image(&ArchiveSpec::default());
     let child = server.image("images", "legacy-child", &a);
     let source = server.index("images", "legacy-index", a.index.clone());
-    assert!(h.refresh(&source, false).status.success());
+    assert!(h.refresh(&source).status.success());
     // Simulate a pre-approval cache, not an approval minted from disk strings.
     // Removing authority is a deliberate reset inside this test-owned HOME.
     fs::remove_file(h.pins()).unwrap();
@@ -2865,83 +3223,113 @@ fn retained_default(h: &Harness) -> Option<Vec<u8>> {
     fs::read(h.home.join(".config/agent-vm/default-image.json")).ok()
 }
 
-/// `set-default` reports the fallback it initialized even when the approval for
-/// the same key already existed, and says "already selected" only when neither
-/// record moved.
+/// The set-default notice states the host choice, then what the invoking project
+/// does about it, and only the host record can move (R5, B10).
 #[test]
-fn set_default_reports_the_fallback_it_initializes() {
+fn set_default_reports_the_host_choice_and_this_project() {
     let h = Harness::new(Mode::LaunchSeam);
     let server = Server::new();
     let a = h.image(&ArchiveSpec::default());
     let child = server.image("images", "select", &a);
     let tag = format!("{}/images:select", server.host);
-    // An explicit refresh approves the tag's content without retaining it.
-    assert!(h.refresh(&tag, false).status.success());
-    assert_eq!(retained_default(&h), None, "a refesh never adopts");
-    let pins = fs::read(h.pins()).unwrap();
+    let default = h.home.join(".config/agent-vm/default-image.json");
 
     let first = set_default(&h, &tag);
     assert!(first.status.success(), "{}", stderr(&first));
+    let text = stderr(&first);
     assert!(
-        !stderr(&first).contains("already selected"),
-        "the fallback moved, so nothing was already selected: {}",
-        stderr(&first)
+        text.contains("selected for projects that have none yet"),
+        "{text}"
     );
     assert!(
-        stderr(&first).contains("selected for future default-image sessions"),
-        "{}",
-        stderr(&first)
+        text.contains("This project has no default boot image yet"),
+        "{text}"
     );
-    let retained: serde_json::Value =
-        serde_json::from_slice(&retained_default(&h).expect("the fallback is initialized"))
-            .unwrap();
-    assert_eq!(retained, serde_json::json!({"version": 1, "image": child}));
-    // The approval itself was equivalent, so its bytes are untouched.
-    assert_eq!(fs::read(h.pins()).unwrap(), pins);
+    assert!(
+        !text.contains("already selected"),
+        "the host record moved: {text}"
+    );
+    let retained = fs::read(&default).unwrap();
+    assert_eq!(
+        read_json(&default),
+        serde_json::json!({"version": 1, "image": child})
+    );
+    assert!(
+        !h.pins().exists(),
+        "set-default writes no approval in any project"
+    );
 
-    let retained_bytes = retained_default(&h).expect("the fallback stays");
     // Repeating the same command moves nothing and says so.
     let again = set_default(&h, &tag);
     assert!(again.status.success(), "{}", stderr(&again));
     assert!(
-        stderr(&again).contains("already selected"),
+        stderr(&again).contains("already selected for projects that have none yet"),
         "{}",
         stderr(&again)
     );
-    assert_eq!(fs::read(h.pins()).unwrap(), pins);
-    assert_eq!(retained_default(&h).unwrap(), retained_bytes);
+    assert_eq!(fs::read(&default).unwrap(), retained);
 
+    // A record someone moved aside is replaced with the validated child again.
     let other = serde_json::json!({
         "version": 1,
         "image": format!("{}/images@sha256:{}", server.host, "b".repeat(64))
     });
-    fs::write(
-        h.home.join(".config/agent-vm/default-image.json"),
-        serde_json::to_vec(&other).unwrap(),
-    )
-    .unwrap();
+    fs::write(&default, serde_json::to_vec(&other).unwrap()).unwrap();
     let replaced = set_default(&h, &tag);
     assert!(replaced.status.success(), "{}", stderr(&replaced));
     assert!(!stderr(&replaced).contains("already selected"));
-    assert!(stderr(&replaced).contains("selected for future default-image sessions"));
-    assert_eq!(retained_default(&h).unwrap(), retained_bytes);
-    assert_eq!(fs::read(h.pins()).unwrap(), pins);
+    assert!(stderr(&replaced).contains("selected for projects that have none yet"));
+    assert_eq!(fs::read(&default).unwrap(), retained);
+    assert!(!h.pins().exists());
 }
 
-/// A default-tier launch retains its own immutable selection even when the
-/// approval for that key already exists: retention is write-once and
-/// independent of the pin, and a launch that finds a retained fallback leaves
-/// its bytes alone.
+/// R5: "already uses it" compares the content this project boots, not the
+/// repository that serves it. The same manifest published under another
+/// repository is the same content, so the notice does not ask the user to adopt
+/// what they already run.
 #[test]
-fn default_tier_launch_adopts_an_absent_fallback_with_an_existing_pin() {
+fn set_default_reports_an_identical_child_served_elsewhere_as_already_used() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let child = server.image("images", "mirror", &a);
+    let mirrored = server.image("mirror", "mirror", &a);
+    assert_eq!(
+        digest_of(&child),
+        digest_of(&mirrored),
+        "the fixture serves one manifest under two repositories"
+    );
+    // The project establishes at the mirrored repository's reference.
+    assert!(!h.launch_on_recommendation(&mirrored).status.success());
+    assert_eq!(h.default_record_in(&h.project).unwrap()["image"], mirrored);
+
+    let out = set_default(&h, &child);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("This project already uses it."),
+        "the same booted child in another repository is already used: {}",
+        stderr(&out)
+    );
+    assert_eq!(
+        h.default_record_in(&h.project).unwrap()["image"],
+        mirrored,
+        "the project keeps its own reference"
+    );
+}
+
+/// R3/R4: a recommendation launch establishes the project default and seeds the
+/// host record, without rewriting the approval it already had.
+#[test]
+fn a_recommendation_launch_establishes_the_project_and_seeds_the_host() {
     let h = Harness::new(Mode::LaunchSeam);
     let server = Server::new();
     let a = h.image(&ArchiveSpec::default());
     let child = server.image("images", "adopt", &a);
-    // The same key is pinned by an explicit operation, which never adopts.
-    assert!(h.refresh(&child, false).status.success());
+    // The same key is pinned by an explicit operation, which never establishes.
+    assert!(h.refresh(&child).status.success());
     assert_eq!(retained_default(&h), None);
-    let pins = fs::read(h.pins()).unwrap();
+    let pins = read_json(&h.pins());
+    let project = project_id(&h.project);
 
     let requests = server.count();
     let mut command = h.command();
@@ -2950,10 +3338,6 @@ fn default_tier_launch_adopts_an_absent_fallback_with_an_existing_pin() {
         .args(["shell", "--", "true"]);
     let cold = bounded(command);
     assert!(!cold.status.success(), "the fake runtime cannot boot");
-    // The default tier is redacted, so the launch is proved by its own output
-    // reaching the create with the approved content cached and no registry
-    // request at all. (The fake runtime cannot accept the launch contract, so
-    // every create here fails deliberately.)
     assert!(
         stderr(&cold).contains("<redacted"),
         "the default tier's label never names its reference: {}",
@@ -2964,38 +3348,50 @@ fn default_tier_launch_adopts_an_absent_fallback_with_an_existing_pin() {
         requests,
         "an approved digest is consumed offline"
     );
-    let retained: serde_json::Value = serde_json::from_slice(
-        &retained_default(&h).expect("a default-tier launch retains its selection"),
-    )
-    .unwrap();
-    assert_eq!(retained, serde_json::json!({"version": 1, "image": child}));
     assert_eq!(
-        fs::read(h.pins()).unwrap(),
-        pins,
-        "an existing approval is not rewritten to retain the fallback"
+        read_json(&h.home.join(".config/agent-vm/default-image.json")),
+        serde_json::json!({"version": 1, "image": child}),
+        "the recommendation initializes the host starting choice"
     );
+    let store = read_json(&h.pins());
+    assert_eq!(store["pins"], pins["pins"], "the approval is unchanged");
+    assert_eq!(
+        store["defaults"],
+        serde_json::json!([{"project": project, "image": child}]),
+        "the project default is the selected reference"
+    );
+    assert!(store["pending_default"].is_null());
 
-    // Write-once: the record is already there, so the next launch cannot move it.
+    // Write-once: a warm relaunch of the same default changes neither record.
+    // The host record has its own writer, so checking only the pin store would
+    // not cover it.
     let retained_bytes = retained_default(&h).unwrap();
+    let before = fs::read(h.pins()).unwrap();
     let mut command = h.command();
     command
         .env("AGENT_VM_TEST_DEFAULT_IMAGE", &child)
         .args(["shell", "--", "true"]);
     let warm = bounded(command);
     assert!(!warm.status.success());
-    assert_eq!(retained_default(&h).unwrap(), retained_bytes);
-    assert_eq!(fs::read(h.pins()).unwrap(), pins);
+    assert_eq!(
+        retained_default(&h).unwrap(),
+        retained_bytes,
+        "the host record is write-once across a warm relaunch"
+    );
+    assert_eq!(fs::read(h.pins()).unwrap(), before);
 }
 
-/// An interrupted writer is observed, never recovered, by an approved warm
-/// default launch. A missing gate socket makes *any* transaction stage fail.
+/// An interrupted writer is observed, never recovered, by an established warm
+/// default launch: nothing it may write is missing, so it takes no lock. A
+/// missing gate socket would fail any transaction stage.
 #[test]
-fn warm_default_launch_leaves_pending_intent_and_takes_no_pin_lock() {
+fn an_established_warm_launch_takes_no_lock_and_leaves_the_journal() {
     let h = Harness::new(Mode::LaunchSeam);
     let server = Server::new();
     let a = h.image(&ArchiveSpec::default());
     let child = server.image("images", "warm-default", &a);
-    assert!(h.refresh(&child, false).status.success());
+    assert!(h.refresh(&child).status.success());
+    let project = project_id(&h.project);
     let default = h.home.join(".config/agent-vm/default-image.json");
     let retained = serde_json::json!({"version": 1, "image": child}).to_string();
     fs::write(&default, &retained).unwrap();
@@ -3006,6 +3402,7 @@ fn warm_default_launch_leaves_pending_intent_and_takes_no_pin_lock() {
             "{}/images@sha256:{}", server.host, "b".repeat(64)
         )}).to_string()
     });
+    record["defaults"] = serde_json::json!([{"project": project, "image": child}]);
     fs::write(h.pins(), serde_json::to_vec(&record).unwrap()).unwrap();
     let pending = fs::read(h.pins()).unwrap();
     for gate_enabled in [true, false] {
@@ -3027,7 +3424,61 @@ fn warm_default_launch_leaves_pending_intent_and_takes_no_pin_lock() {
     }
 }
 
-// ------------------------------------------------------------ set-default UI
+/// An *unestablished* warm default launch does reach the transaction: with the
+/// absent gate socket it fails at the pin lock, and without the gate it recovers
+/// the S1 journal and establishes the project.
+#[test]
+fn an_unestablished_warm_launch_recovers_the_journal_and_establishes() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let child = server.image("images", "warm-new", &a);
+    assert!(h.refresh(&child).status.success());
+    let project = project_id(&h.project);
+    let default = h.home.join(".config/agent-vm/default-image.json");
+    let retained = serde_json::json!({"version": 1, "image": child}).to_string();
+    fs::write(&default, &retained).unwrap();
+    let mut record = read_json(&h.pins());
+    record["pending_default"] = serde_json::json!({
+        "previous": retained,
+        "proposed": serde_json::json!({"version": 1, "image": format!(
+            "{}/images@sha256:{}", server.host, "b".repeat(64)
+        )}).to_string()
+    });
+    fs::write(h.pins(), serde_json::to_vec(&record).unwrap()).unwrap();
+
+    // Gated at an absent socket: the transaction fails before it writes.
+    let mut command = h.command();
+    command
+        .env("AGENT_VM_TEST_PIN_GATE", h.root.path().join("absent.sock"))
+        .args(["shell", "--", "true"]);
+    let seeded = fs::read(h.pins()).unwrap();
+    let out = bounded(command);
+    assert!(!out.status.success());
+    assert_eq!(
+        fs::read(h.pins()).unwrap(),
+        seeded,
+        "the transaction stopped before it wrote anything"
+    );
+
+    // Without the gate the journal is recovered and the project established.
+    // The launch must select through the default tier, so no `--image` is given:
+    // the host record now holds the approved child.
+    let mut command = h.command();
+    command.args(["shell", "--", "true"]);
+    let out = bounded(command);
+    assert!(!out.status.success(), "the fake runtime cannot boot");
+    let store = read_json(&h.pins());
+    assert!(
+        store["pending_default"].is_null(),
+        "the journal is recovered"
+    );
+    assert_eq!(
+        store["defaults"],
+        serde_json::json!([{"project": project, "image": child}])
+    );
+    assert_eq!(fs::read_to_string(&default).unwrap(), retained);
+}
 
 /// A second state root is a second cache: these rows need two real processes
 /// whose only shared state is the host approval store.
@@ -3038,77 +3489,54 @@ fn state_root() -> tempfile::TempDir {
         .unwrap()
 }
 
-/// `image set-default` asks exactly like `image refresh`: `n`, an empty answer
-/// and EOF all leave both records untouched, and a nonterminal run refuses
-/// without consuming stdin.
+/// `image set-default` never reads stdin and approves nothing: on a terminal and
+/// on a pipe holding `y`, it exits 0 and writes only the host record (R5).
 #[test]
-fn set_default_prompt_declines_and_refuses_without_reading_stdin() {
-    for (label, action) in [
-        ("n", Action::Write(b"n\n")),
-        ("empty", Action::Write(b"\n")),
-        ("ctrl-d", Action::Write(b"\x04")),
-        ("invalid", Action::Write(b"yeah\n")),
-    ] {
-        let h = Harness::new(Mode::StrictAcquisition);
-        let server = Server::new();
-        let a = h.image(&ArchiveSpec::default());
-        server.image("images", "sd", &a);
-        let tag = format!("{}/images:sd", server.host);
-        assert!(set_default(&h, &tag).status.success());
-        let pins = fs::read(h.pins()).unwrap();
-        let retained = retained_default(&h).expect("set-default retains its child");
-        let b = h.image(&ArchiveSpec {
-            marker: format!("sd-b-{label}"),
-            ..Default::default()
-        });
-        let child_b = server.image("images", "sd", &b);
-
-        let mut command = h.command();
-        command.args(["image", "set-default", "--image", &tag]);
-        let mut terminal = Pty::spawn(&mut command, PROMPT).expect("open a pseudo-terminal");
-        let (status, out) = terminal
-            .drive(&action, Duration::from_secs(60))
-            .expect("drive the approval prompt");
-        let text = String::from_utf8_lossy(&out);
-        assert!(!status.success(), "{label}: {text}");
-        assert!(text.contains("Replace the approved image for"), "{text}");
-        assert!(
-            text.contains(&format!("new: {}", child_b.rsplit_once('@').unwrap().1)),
-            "{text}"
-        );
-        assert_eq!(fs::read(h.pins()).unwrap(), pins, "{label}");
-        assert_eq!(retained_default(&h).unwrap(), retained, "{label}");
-    }
-
-    // No terminal: refuse with status 1 before reading one byte of stdin.
+fn set_default_never_reads_stdin_and_approves_nothing() {
+    // A real terminal, with no answer typed: the command exits by itself.
     let h = Harness::new(Mode::StrictAcquisition);
     let server = Server::new();
     let a = h.image(&ArchiveSpec::default());
     server.image("images", "sd", &a);
     let tag = format!("{}/images:sd", server.host);
-    assert!(set_default(&h, &tag).status.success());
-    let pins = fs::read(h.pins()).unwrap();
-    let retained = retained_default(&h).unwrap();
+    let mut command = h.command();
+    command.args(["image", "set-default", "--image", &tag]);
+    let mut terminal =
+        Pty::spawn(&mut command, b"Default boot image selected").expect("open a pseudo-terminal");
+    let (status, out) = terminal
+        .drive(&Action::Write(b""), Duration::from_secs(60))
+        .expect("wait for the command to exit");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(status.success(), "{text}");
+    assert_no_question(&text);
+    assert!(
+        !h.pins().exists(),
+        "set-default approves nothing, so it creates no pin store"
+    );
+    let first = read_json(&h.home.join(".config/agent-vm/default-image.json"));
+
+    // A pipe holding an answer: nothing reads it.
     let b = h.image(&ArchiveSpec {
         marker: "sd-b-pipe".into(),
         ..Default::default()
     });
-    server.image("images", "sd", &b);
+    let child_b = server.image("images", "sd", &b);
     let mut command = h.command();
     command.args(["image", "set-default", "--image", &tag]);
     let (out, unread) = with_unread_stdin(command, b"y\n");
-    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
-    assert!(stderr(&out).contains("--yes"), "{}", stderr(&out));
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(unread, b"y\n", "stdin must be left unread");
+    assert!(!h.pins().exists());
+    let second = read_json(&h.home.join(".config/agent-vm/default-image.json"));
+    assert_ne!(first, second);
+    assert_eq!(second, serde_json::json!({"version": 1, "image": child_b}));
     assert_eq!(
-        unread, b"y\n",
-        "a nonterminal refusal must not consume stdin"
+        h.pin_for(&tag),
+        None,
+        "no approval exists for the typed tag"
     );
-    assert_eq!(fs::read(h.pins()).unwrap(), pins);
-    assert_eq!(retained_default(&h).unwrap(), retained);
 }
 
-/// Run `command` with a pipe on stdin that already holds `input` and cannot be
-/// read again, then report whatever the child left unread.
 fn with_unread_stdin(mut command: Command, input: &'static [u8]) -> (Output, Vec<u8>) {
     use std::io::{Read as _, Write as _};
     use std::os::fd::FromRawFd as _;
@@ -3223,9 +3651,8 @@ fn two_processes_racing_the_first_pin_commit_one_approval() {
     assert_eq!(store["pins"][0]["revision"], 1);
 }
 
-/// A peer that commits the same candidate first makes this operation report
-/// "already selected", never "the first pin": the approval it found equivalent
-/// is the record both processes measured.
+/// Two peers set the same host child: the winner writes the record, the loser
+/// reports "already selected". Neither writes an approval (R5, D2).
 #[test]
 fn a_peer_committing_the_same_candidate_is_reported_as_unchanged() {
     let h = Harness::new(Mode::LaunchSeam);
@@ -3240,20 +3667,15 @@ fn a_peer_committing_the_same_candidate_is_reported_as_unchanged() {
     let mut loser_gate = PinGate::new(h.root.path());
     let peer = |gate: &PinGate, state: &Path| {
         let mut command = h.command();
-        command.env("AGENT_VM_STATE_DIR", state).args([
-            "image",
-            "set-default",
-            "--image",
-            &tag,
-            "--yes",
-        ]);
+        command
+            .env("AGENT_VM_STATE_DIR", state)
+            .args(["image", "set-default", "--image", &tag]);
         pin_gate::PinPeer::spawn(command, gate, &[])
     };
 
-    // The loser reads an absent approval and freezes its candidate first.
+    // The loser resolves first; the winner takes the lock before it does.
     let loser = peer(&loser_gate, loser_state.path());
     let loser_ready = loser_gate.expect(PinStage::CandidateReady);
-    // The winner then takes the lock before committing anything.
     let winner = peer(&winner_gate, winner_state.path());
     winner_gate
         .expect(PinStage::CandidateReady)
@@ -3269,45 +3691,1210 @@ fn a_peer_committing_the_same_candidate_is_reported_as_unchanged() {
         .reply(Reply::Continue);
 
     locked.reply(Reply::Continue);
-    for stage in [
-        PinStage::BeforeIntentSave,
-        PinStage::IntentSaved,
-        PinStage::DefaultSaved,
-        PinStage::BeforePinSave,
-        PinStage::PinCommitted,
-    ] {
+    for stage in [PinStage::BeforeDefaultSave, PinStage::DefaultSaved] {
         winner_gate.expect(stage).reply(Reply::Continue);
     }
     let winner_out = winner.wait();
     assert!(winner_out.status.success(), "{}", stderr(&winner_out));
     assert!(
-        stderr(&winner_out).contains("selected for future default-image sessions"),
+        stderr(&winner_out).contains("selected for projects that have none yet"),
         "{}",
         stderr(&winner_out)
     );
 
-    // The peer's equivalent candidate writes nothing.
-    let pins = fs::read(h.pins()).unwrap();
+    // The peer finds the same child already selected and writes nothing.
     let retained = retained_default(&h).expect("the winner retained its child");
+    assert_eq!(
+        read_json(&h.home.join(".config/agent-vm/default-image.json"))["image"],
+        child
+    );
     loser_gate
         .expect(PinStage::PinLocked)
-        .reply(Reply::Continue);
-    loser_gate
-        .expect(PinStage::PinCommitted)
         .reply(Reply::Continue);
     let loser_out = loser.wait();
     assert!(loser_out.status.success(), "{}", stderr(&loser_out));
     assert!(
         stderr(&loser_out).contains("already selected"),
-        "a peer's identical candidate is not a first pin: {}",
+        "a peer's identical candidate is not a false change: {}",
         stderr(&loser_out)
     );
-    assert_eq!(fs::read(h.pins()).unwrap(), pins);
     assert_eq!(retained_default(&h).unwrap(), retained);
-    let store: serde_json::Value = serde_json::from_slice(&pins).unwrap();
-    assert_eq!(store["pins"][0]["revision"], 1);
-    assert_eq!(
-        store["pins"][0]["manifest_digest"],
-        child.rsplit_once('@').unwrap().1
+    assert!(
+        !h.pins().exists(),
+        "set-default writes no approval in any project"
     );
+}
+
+// ------------------------------------------------ project defaults (#541, S2)
+
+/// AC1/AC2: `set-default` in an established project changes only the host's
+/// starting choice; that project keeps its own default, and a fresh project
+/// starts from the new one.
+#[test]
+fn set_default_never_changes_an_established_project() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let child_a = server.image("images", "est", &a);
+    let b = h.image(&ArchiveSpec {
+        marker: "est-b".into(),
+        ..Default::default()
+    });
+    let child_b = server.image("images", "est", &b);
+    let tag_b = format!("{}/images:est", server.host);
+
+    // P establishes its own default from the initial recommendation.
+    let first = h.launch_on_recommendation(&child_a);
+    assert!(!first.status.success(), "the fake runtime cannot boot");
+    assert_eq!(
+        h.default_record_in(&h.project).unwrap()["image"],
+        child_a,
+        "the first default-tier use establishes P's default"
+    );
+
+    let pins = fs::read(h.pins()).unwrap();
+    let out = set_default(&h, &tag_b);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stderr(&out);
+    assert!(
+        text.contains("This project keeps its own default boot image"),
+        "{text}"
+    );
+    assert!(text.contains("agent-vm image refresh"), "{text}");
+    assert_eq!(
+        fs::read(h.pins()).unwrap(),
+        pins,
+        "set-default writes no approval and no project default"
+    );
+    assert_eq!(
+        h.host_record().unwrap()["image"],
+        child_b,
+        "the host record names the new starting choice"
+    );
+
+    // P's next launch boots A, and its selection re-acquires A's approved
+    // digest and nothing else.
+    assert_eq!(
+        h.reacquired_digest(&server),
+        digest_of(&child_a),
+        "P keeps its own default"
+    );
+
+    // A fresh project Q starts from the new host choice and establishes it.
+    let q = h.project_at("fresh-q");
+    let mut command = h.command_in(&q, &h.state);
+    command.args(["shell", "--", "true"]);
+    let q_out = bounded(command);
+    assert!(!q_out.status.success());
+    assert_eq!(
+        h.default_record_in(&q).unwrap()["image"],
+        child_b,
+        "Q starts from the host choice"
+    );
+    assert_eq!(
+        h.reacquired_digest_in(&q, &h.state, &server),
+        digest_of(&child_b),
+        "Q boots the content the host choice names"
+    );
+}
+
+/// AC3: an unestablished project takes the host choice as its starting point.
+#[test]
+fn set_default_is_the_starting_choice_of_an_unestablished_project() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let child_a = server.image("images", "start", &a);
+    let tag = format!("{}/images:start", server.host);
+
+    let out = set_default(&h, &tag);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("This project has no default boot image yet"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(
+        !h.pins().exists(),
+        "set-default writes no approval in this project either"
+    );
+    assert_eq!(
+        h.reacquired_digest(&server),
+        digest_of(&child_a),
+        "the project starts from it"
+    );
+    assert_eq!(h.default_record_in(&h.project).unwrap()["image"], child_a);
+}
+
+/// AC4: a bare refresh in an established project adopts the host's existing
+/// default, renders the change, asks nothing, and reads no stdin.
+#[test]
+fn refresh_adopts_the_host_default_without_asking_or_reading_stdin() {
+    let h = Harness::new(Mode::StrictAcquisition);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let child_a = server.image("images", "adopt", &a);
+    let b = h.image(&ArchiveSpec {
+        marker: "adopt-b".into(),
+        ..Default::default()
+    });
+    let child_b = server.image("images", "adopt", &b);
+    let tag = format!("{}/images:adopt", server.host);
+
+    assert!(!h.launch_on_recommendation(&child_a).status.success());
+    assert!(set_default(&h, &tag).status.success());
+
+    let mut command = h.command();
+    command.arg("image").arg("refresh");
+    let (out, unread) = with_unread_stdin(command, b"n\n");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(unread, b"n\n", "stdin must be left unread");
+    let text = stderr(&out);
+    assert!(
+        text.contains("Adopting the host's default boot image"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("old: {}", digest_of(&child_a))),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("new: {}", digest_of(&child_b))),
+        "{text}"
+    );
+    assert_no_question(&text);
+    assert!(
+        stdout_of(&out).contains("==> this project now uses the host's default boot image"),
+        "{}",
+        stdout_of(&out)
+    );
+    assert_eq!(h.default_record_in(&h.project).unwrap()["image"], child_b);
+    assert_eq!(
+        h.pin_in(&h.project, &child_b).map(|(digest, _)| digest),
+        Some(digest_of(&child_b)),
+        "the host reference's approval is inserted"
+    );
+
+    // The next launch boots B, and adoption left it approved and cached.
+    let before = server.count();
+    let launch = h.launch_default();
+    assert!(!launch.status.success(), "the fake runtime cannot boot");
+    assert_eq!(
+        server.count(),
+        before,
+        "adoption left B approved and cached"
+    );
+    assert_eq!(h.reacquired_digest(&server), digest_of(&child_b));
+}
+
+/// AC5: adoption in P never touches another established project.
+#[test]
+fn refresh_adoption_changes_only_this_project() {
+    let h = Harness::new(Mode::StrictAcquisition);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let child_a = server.image("images", "scope", &a);
+    let b = h.image(&ArchiveSpec {
+        marker: "scope-b".into(),
+        ..Default::default()
+    });
+    let child_b = server.image("images", "scope", &b);
+    let tag = format!("{}/images:scope", server.host);
+    let q = h.project_at("scope-q");
+
+    assert!(!h.launch_on_recommendation(&child_a).status.success());
+    let mut command = h.command_in(&q, &h.state);
+    command
+        .env("AGENT_VM_TEST_DEFAULT_IMAGE", &child_a)
+        .args(["shell", "--", "true"]);
+    let q_first = bounded(command);
+    assert!(!q_first.status.success(), "the fake runtime cannot boot");
+    assert_eq!(h.default_record_in(&q).unwrap()["image"], child_a);
+    let q_record = h.record_in(&q, &child_a).unwrap();
+    assert!(set_default(&h, &tag).status.success());
+
+    assert!(h.refresh_default().status.success());
+    assert_eq!(h.default_record_in(&h.project).unwrap()["image"], child_b);
+    assert_eq!(
+        h.default_record_in(&q).unwrap()["image"],
+        child_a,
+        "Q's default is untouched"
+    );
+    assert_eq!(
+        h.record_in(&q, &child_a).unwrap(),
+        q_record,
+        "Q's approval record is byte-identical"
+    );
+    // Q's selection still names A's approved digest.
+    fs::remove_dir_all(h.cache()).unwrap();
+    let before = server.requests().len();
+    let mut command = h.command_in(&q, &h.state);
+    command.args(["shell", "--", "true"]);
+    let q_out = bounded(command);
+    assert!(!q_out.status.success());
+    let digests: Vec<String> = server.requests()[before..]
+        .iter()
+        .filter_map(|(_, path)| path.rsplit_once("/manifests/"))
+        .map(|(_, digest)| digest.to_owned())
+        .filter(|digest| digest.starts_with("sha"))
+        .collect();
+    assert_eq!(digests, vec![digest_of(&child_a)], "Q still boots A");
+}
+
+/// AC6: a host record equal to the project's default is re-verified, renders
+/// nothing, and changes no bytes.
+#[test]
+fn refresh_with_an_unchanged_host_default_changes_nothing() {
+    let h = Harness::new(Mode::StrictAcquisition);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let child_a = server.image("images", "same", &a);
+    assert!(!h.launch_on_recommendation(&child_a).status.success());
+    // The host record now names the project's own default.
+    assert_eq!(h.host_record().unwrap()["image"], child_a);
+    let pins = fs::read(h.pins()).unwrap();
+
+    // AC6's other half: the refresh re-verifies the project's own default. Byte
+    // preservation alone would also pass for a refresh that never asked anyone.
+    let before = server.count();
+    let out = h.refresh_default();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        !stderr(&out).contains("Adopting"),
+        "nothing changed, so nothing is adopted: {}",
+        stderr(&out)
+    );
+    assert_eq!(
+        manifests_requested_since(&server, before),
+        vec![digest_of(&child_a)],
+        "the project's own default is re-verified exactly once"
+    );
+    assert_eq!(fs::read(h.pins()).unwrap(), pins);
+    assert_eq!(h.default_record_in(&h.project).unwrap()["image"], child_a);
+}
+
+/// AC7: an index default whose approved child already is the host record's
+/// digest adopts without a digest render.
+#[test]
+fn refresh_adopts_an_equal_digest_host_default_without_a_render() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let child = server.image("images", "index", &a);
+    let index = server.index("images", "index", a.index.clone());
+    let launch = h.launch_on_recommendation(&index);
+    assert!(!launch.status.success(), "{}", stderr(&launch));
+    assert_eq!(
+        h.default_record_in(&h.project).unwrap()["image"],
+        index,
+        "the index reference is the project default: {}",
+        stderr(&launch)
+    );
+    assert_eq!(h.pin_in(&h.project, &index).unwrap().0, digest_of(&child));
+
+    let out = set_default(&h, &child);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let refresh = h.refresh_default();
+    assert!(refresh.status.success(), "{}", stderr(&refresh));
+    assert!(
+        !stderr(&refresh).contains("old:"),
+        "equal digests render nothing: {}",
+        stderr(&refresh)
+    );
+    assert_eq!(h.default_record_in(&h.project).unwrap()["image"], child);
+    assert_eq!(
+        h.pin_in(&h.project, &child).map(|(digest, _)| digest),
+        Some(digest_of(&child)),
+        "the host reference's approval is inserted at the same child"
+    );
+}
+
+/// R7: a hand-edited store can hold a project default with no approval for it.
+/// The adoption render then shows the digest the record states — without
+/// re-resolving the old default — and inserts the host reference's approval.
+#[test]
+fn an_adoption_of_a_hand_edited_default_renders_its_stated_digest() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let child_i = server.image("images", "hand-edited", &a);
+    assert!(!h.launch_on_recommendation(&child_i).status.success());
+    // Hand edit: the default record stays, its approval does not.
+    let mut store = read_json(&h.pins());
+    store["pins"] = serde_json::json!([]);
+    fs::write(h.pins(), serde_json::to_vec(&store).unwrap()).unwrap();
+    // A host record naming different content.
+    let b = h.image(&ArchiveSpec {
+        marker: "hand-edited-b".into(),
+        ..Default::default()
+    });
+    let child_h = server.image("images", "hand-edited", &b);
+    let tag = format!("{}/images:hand-edited", server.host);
+    let set = set_default(&h, &tag);
+    assert!(set.status.success(), "{}", stderr(&set));
+    assert_ne!(child_i, child_h);
+    let before = server.count();
+
+    let out = h.refresh_default();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stderr(&out);
+    assert!(
+        text.contains("Adopting the host's default boot image"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("old: {}", digest_of(&child_i))),
+        "the record's stated digest is the old content: {text}"
+    );
+    assert!(
+        text.contains(&format!("new: {}", digest_of(&child_h))),
+        "{text}"
+    );
+    assert!(
+        !server.requests()[before..]
+            .iter()
+            .any(|(_, path)| path.contains(&digest_of(&child_i))),
+        "the old default is not re-resolved to render its own digest"
+    );
+    assert_eq!(
+        h.default_record_in(&h.project).unwrap()["image"],
+        child_h,
+        "the project adopts the host's default"
+    );
+    assert_eq!(
+        h.pin_in(&h.project, &child_h),
+        Some((digest_of(&child_h), 1)),
+        "the host reference's approval is inserted"
+    );
+}
+
+/// AC8: an S1 store upgrades without a reset. The first default-tier use
+/// establishes the project from the host record it already followed.
+#[test]
+fn an_s1_store_upgrades_without_a_reset() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let child = server.image("images", "upgrade", &a);
+    // Warm the cache and learn the pin record's exact shape.
+    assert!(h.refresh(&child).status.success());
+    // Rewrite the store exactly as 0.7.39–0.7.46 writes it: no `defaults`.
+    let mut store = read_json(&h.pins());
+    store.as_object_mut().unwrap().remove("defaults");
+    fs::write(h.pins(), serde_json::to_vec(&store).unwrap()).unwrap();
+    fs::write(
+        h.home.join(".config/agent-vm/default-image.json"),
+        serde_json::to_vec(&serde_json::json!({"version":1,"image":child})).unwrap(),
+    )
+    .unwrap();
+    let before = server.count();
+
+    let launch = h.launch_default();
+    assert!(!launch.status.success(), "the fake runtime cannot boot");
+    assert!(
+        stderr(&launch).contains("<redacted"),
+        "the default tier stays redacted: {}",
+        stderr(&launch)
+    );
+    assert_eq!(
+        server.count(),
+        before,
+        "it boots the content it booted, offline"
+    );
+    let store = read_json(&h.pins());
+    assert_eq!(
+        store["defaults"],
+        serde_json::json!([{"project": project_id(&h.project), "image": child}]),
+        "the store gains the project's default"
+    );
+    assert_eq!(store["pins"].as_array().unwrap().len(), 1, "no reset");
+}
+
+/// AC11: a damaged host record does not break an established project. Launch,
+/// setup and `image show` succeed; `doctor` reports it and exits nonzero;
+/// refresh fails before any registry request and writes nothing.
+#[test]
+fn a_damaged_host_record_fails_only_doctor_and_refresh_in_an_established_project() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let child = server.image("images", "damaged", &a);
+    assert!(!h.launch_on_recommendation(&child).status.success());
+    fs::write(
+        h.home.join(".config/agent-vm/default-image.json"),
+        b"not a record",
+    )
+    .unwrap();
+    let pins = fs::read(h.pins()).unwrap();
+
+    let before = server.count();
+    let launch = h.launch_default();
+    assert!(
+        !stderr(&launch).contains("boot-image selection"),
+        "the project default is enough: {}",
+        stderr(&launch)
+    );
+    assert_eq!(server.count(), before, "and needs no registry request");
+
+    // A default-tier setup: the project's own default is enough, so the damaged
+    // host record is never read.
+    let mut command = h.command();
+    command.args(["setup", "--no-verify"]);
+    let setup = bounded(command);
+    assert!(setup.status.success(), "{}", stderr(&setup));
+    assert!(
+        !stderr(&setup).contains("boot-image selection"),
+        "{}",
+        stderr(&setup)
+    );
+
+    let mut command = h.command();
+    command.args(["image", "show"]);
+    let show = bounded(command);
+    assert!(show.status.success(), "{}", stderr(&show));
+    assert!(
+        stdout_of(&show).contains("Source: project default"),
+        "{}",
+        stdout_of(&show)
+    );
+
+    let mut command = h.command();
+    command.arg("doctor");
+    let doctor = bounded(command);
+    assert!(!doctor.status.success(), "{}", stdout_of(&doctor));
+    let text = stdout_of(&doctor);
+    assert!(
+        text.contains("default: error:"),
+        "the host row reports the damage: {text}"
+    );
+    // The project's own default and the project-aware selection are unaffected
+    // by host-only damage (R10): neither row may repeat the host error.
+    let project_row = text
+        .lines()
+        .find(|line| line.starts_with("project default: "))
+        .unwrap_or_else(|| panic!("no project default row: {text}"));
+    assert_eq!(
+        project_row,
+        format!("project default: established [{}]", h.pins().display()),
+        "{text}"
+    );
+    let selected_row = text
+        .lines()
+        .find(|line| line.starts_with("selected (without --image): "))
+        .unwrap_or_else(|| panic!("no selected row: {text}"));
+    assert_eq!(
+        selected_row,
+        format!(
+            "selected (without --image): project default [{}]",
+            h.pins().display()
+        ),
+        "{text}"
+    );
+    assert!(
+        !project_row.contains("error:") && !selected_row.contains("error:"),
+        "host-only damage must not fail the project rows: {text}"
+    );
+
+    let before = server.count();
+    let refresh = h.refresh_default();
+    assert_eq!(refresh.status.code(), Some(1), "{}", stderr(&refresh));
+    assert_eq!(server.count(), before, "no registry request");
+    assert_eq!(fs::read(h.pins()).unwrap(), pins);
+    assert_eq!(
+        fs::read(h.home.join(".config/agent-vm/default-image.json")).unwrap(),
+        b"not a record"
+    );
+}
+
+/// An authority that cannot be *located* is exempt from the boot-image
+/// diagnosis, but a store that exists and does not decode is not (R10): the
+/// exemption covers `$HOME` being unset, never damage.
+#[test]
+fn a_damaged_pin_store_fails_doctor_at_a_locatable_home() {
+    let h = Harness::new(Mode::LaunchSeam);
+    fs::create_dir_all(h.home.join(".config/agent-vm")).unwrap();
+    fs::write(h.pins(), b"not json").unwrap();
+
+    let mut command = h.command();
+    command.arg("doctor");
+    let out = bounded(command);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stdout_of(&out).contains("project default: error:"),
+        "{}",
+        stdout_of(&out)
+    );
+    assert!(
+        stderr(&out).contains("image pin authority"),
+        "the store's damage is the reported failure: {}",
+        stderr(&out)
+    );
+}
+
+/// AC13: neither update verb has `--yes`; it is an ordinary usage error.
+#[test]
+fn the_yes_flag_is_removed_from_both_verbs() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    for args in [
+        vec!["image", "refresh", "--yes"],
+        vec![
+            "image",
+            "set-default",
+            "--image",
+            "localhost:1/a:tag",
+            "--yes",
+        ],
+    ] {
+        let mut command = h.command();
+        command.args(&args);
+        let out = bounded(command);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("unexpected argument '--yes'"),
+            "{args:?}: {}",
+            stderr(&out)
+        );
+        assert!(
+            !h.home.join(".config/agent-vm").exists(),
+            "{args:?} must create nothing"
+        );
+    }
+    assert_eq!(server.count(), 0, "no registry request");
+    for verb in [
+        ["image", "refresh", "--help"],
+        ["image", "set-default", "--help"],
+    ] {
+        let mut command = h.command();
+        command.args(verb);
+        let out = bounded(command);
+        assert!(out.status.success());
+        assert!(
+            !stdout_of(&out).contains("--yes"),
+            "{verb:?} must not document --yes"
+        );
+    }
+}
+
+/// AC14: with no host record, a bare refresh re-verifies the project's own
+/// default and never moves it, even when the recommendation changed.
+#[test]
+fn without_a_host_record_refresh_reverifies_the_project_default() {
+    let h = Harness::new(Mode::StrictAcquisition);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let child_a = server.image("images", "nohost", &a);
+    let b = h.image(&ArchiveSpec {
+        marker: "nohost-b".into(),
+        ..Default::default()
+    });
+    let child_b = server.image("images", "nohost", &b);
+    assert!(!h.launch_on_recommendation(&child_a).status.success());
+    let host = h.home.join(".config/agent-vm/default-image.json");
+    fs::remove_file(&host).unwrap();
+    let pins = fs::read(h.pins()).unwrap();
+
+    let before = server.count();
+    let mut command = h.command();
+    command
+        .env("AGENT_VM_TEST_DEFAULT_IMAGE", &child_b)
+        .arg("image")
+        .arg("refresh");
+    let out = bounded(command);
+    assert!(out.status.success(), "{}", stderr(&out));
+    // AC14's other half: A is re-verified, not merely left alone.
+    assert_eq!(
+        manifests_requested_since(&server, before),
+        vec![digest_of(&child_a)],
+        "the project default is re-verified exactly once"
+    );
+    assert!(
+        !stderr(&out).contains(&child_b),
+        "the recommendation is never selected for an established project: {}",
+        stderr(&out)
+    );
+    assert!(!host.exists(), "no host record is written");
+    assert_eq!(h.default_record_in(&h.project).unwrap()["image"], child_a);
+    assert_eq!(
+        fs::read(h.pins()).unwrap(),
+        pins,
+        "the approval is re-verified, not rewritten"
+    );
+    assert!(
+        !server
+            .requests()
+            .iter()
+            .any(|(_, path)| path.contains(&digest_of(&child_b))),
+        "the recommendation is never requested"
+    );
+}
+
+/// R3/R4: a bare refresh is a default-tier preparation too, so in a project with
+/// no established default it establishes one — from the host record, or from the
+/// recommendation, which it also seeds into the host record.
+#[test]
+fn a_bare_refresh_establishes_an_unestablished_project() {
+    // (a) An approval and a retained host record, no project default: the bare
+    // refresh establishes the host-selected immutable reference.
+    let h = Harness::new(Mode::StrictAcquisition);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let child = server.image("images", "refresh-establishes", &a);
+    h.pin_and_set_default(&child);
+    assert!(
+        h.default_record_in(&h.project).is_none(),
+        "the fixture starts unestablished"
+    );
+    let out = h.refresh_default();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        h.default_record_in(&h.project).unwrap()["image"],
+        child,
+        "the bare refresh establishes the host-selected reference"
+    );
+    assert_eq!(
+        h.host_record().unwrap()["image"],
+        child,
+        "a host-sourced selection never rewrites the host record"
+    );
+
+    // (b) No host record: the recommendation seeds the host record and the
+    // project default in one preparation.
+    let h = Harness::new(Mode::StrictAcquisition);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let child = server.image("images", "refresh-seeds", &a);
+    let mut command = h.command();
+    command
+        .env("AGENT_VM_TEST_DEFAULT_IMAGE", &child)
+        .arg("image")
+        .arg("refresh");
+    let out = bounded(command);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        h.default_record_in(&h.project).unwrap()["image"],
+        child,
+        "the bare refresh establishes the recommendation it selected"
+    );
+    assert_eq!(
+        h.host_record().unwrap()["image"],
+        child,
+        "R4: a recommendation selection still initializes the host record"
+    );
+}
+
+/// AC15: a bare refresh with an unreadable configuration refuses the
+/// default-tier fall-through; `--image` and `AGENT_VM_IMAGE_TAG` still work and
+/// establish nothing.
+#[test]
+fn a_bare_refresh_refuses_an_unreadable_config_but_an_explicit_one_works() {
+    for tier in ["project", "user"] {
+        for variant in ["bare", "cli", "env"] {
+            let h = Harness::new(Mode::StrictAcquisition);
+            let server = Server::new();
+            let a = h.image(&ArchiveSpec::default());
+            let child = server.image("images", "broken", &a);
+            let reference = format!("{}/images:broken", server.host);
+            let broken = h.home.join(".config/agent-vm/config.toml");
+            fs::create_dir_all(broken.parent().unwrap()).unwrap();
+            let config = "not toml [[[";
+            match tier {
+                "project" => {
+                    let dir = h.project.join(".agent-vm");
+                    fs::create_dir_all(&dir).unwrap();
+                    fs::write(dir.join("config.toml"), config).unwrap();
+                }
+                _ => fs::write(&broken, config).unwrap(),
+            }
+            let default = h.home.join(".config/agent-vm/default-image.json");
+
+            let out = match variant {
+                "bare" => h.refresh_default(),
+                "cli" => h.refresh(&reference),
+                _ => {
+                    let mut command = h.command();
+                    command
+                        .env("AGENT_VM_IMAGE_TAG", &reference)
+                        .arg("image")
+                        .arg("refresh");
+                    bounded(command)
+                }
+            };
+            let text = stderr(&out);
+            match variant {
+                "bare" => {
+                    assert_eq!(out.status.code(), Some(1), "{tier}/{variant}: {text}");
+                    assert!(
+                        text.contains("does not fall back to the default boot image"),
+                        "{tier}/{variant}: {text}"
+                    );
+                    assert_eq!(server.count(), 0, "{tier}/{variant}: no request");
+                    assert!(!h.pins().exists(), "{tier}/{variant}: no pin store");
+                    assert!(!default.exists(), "{tier}/{variant}: no host record");
+                    // The refusal needs no microsandbox state either: it is
+                    // decided from input alone, before the preflight.
+                    for created in [".agent-vm-msb", ".microsandbox"] {
+                        assert!(
+                            !h.home.join(created).exists(),
+                            "{tier}/{variant}: a refused refresh created {created}"
+                        );
+                    }
+                }
+                _ => {
+                    assert!(
+                        out.status.success(),
+                        "{tier}/{variant}: {:?}\nSTDOUT:\n{}\nSTDERR:\n{text}",
+                        out.status.code(),
+                        stdout_of(&out)
+                    );
+                    assert!(
+                        stdout_of(&out).contains("configured image settings could not be read"),
+                        "{tier}/{variant}: {}",
+                        stdout_of(&out)
+                    );
+                    assert_eq!(
+                        h.pin_in(&h.project, &reference).map(|(digest, _)| digest),
+                        Some(digest_of(&child)),
+                        "{tier}/{variant}: REF is approved for this project"
+                    );
+                    assert!(
+                        h.default_record_in(&h.project).is_none(),
+                        "{tier}/{variant}: an unreadable configuration establishes nothing"
+                    );
+                    assert!(!default.exists(), "{tier}/{variant}: no host record");
+                }
+            }
+        }
+    }
+}
+
+/// AC18: an unreadable configuration never establishes a project default, by
+/// any default-tier preparation, and host initialization still happens.
+///
+/// Two shapes of "unreadable", because R3 names `Catalog::Broken`: TOML that
+/// cannot be parsed, and readable TOML whose catalog cannot be built (a `tools`
+/// entry naming an undeclared tool). The second still carries readable image
+/// tiers, so `setup` selects exactly as before — only establishment is withheld.
+#[test]
+fn an_unreadable_config_never_establishes_a_project_default() {
+    let fixtures = [
+        ("unparsable", "not toml [[["),
+        (
+            "dangling-tools",
+            "[[tools]]\nname = \"t\"\ncommand = \"t\"\ntools = [\"missing\"]\n",
+        ),
+    ];
+    for (shape, config_text) in fixtures {
+        // With a host record: setup falls through, prepares, may first-pin, and
+        // writes no project default. A launch after the fix establishes it.
+        let h = Harness::new(Mode::LaunchSeam);
+        let server = Server::new();
+        let a = h.image(&ArchiveSpec::default());
+        let child = server.image("images", &format!("broken-setup-{shape}"), &a);
+        assert!(set_default(&h, &child).status.success());
+        let config = h.project.join(".agent-vm");
+        fs::create_dir_all(&config).unwrap();
+        fs::write(config.join("config.toml"), config_text).unwrap();
+        let setup = {
+            let mut command = h.command();
+            command.args(["setup", "--no-verify"]);
+            bounded(command)
+        };
+        assert!(setup.status.success(), "{shape}: {}", stderr(&setup));
+        assert!(
+            stdout_of(&setup).contains("could not be read"),
+            "{shape}: setup still warns and falls through: {}",
+            stdout_of(&setup)
+        );
+        assert_eq!(
+            h.host_record().unwrap()["image"],
+            child,
+            "{shape}: setup prepares the host record's content"
+        );
+        assert_eq!(
+            h.pin_in(&h.project, &child).map(|(digest, _)| digest),
+            Some(digest_of(&child)),
+            "{shape}: the preparation first-pins the selected content"
+        );
+        assert!(
+            h.default_record_in(&h.project).is_none(),
+            "{shape}: an unreadable configuration establishes nothing"
+        );
+        fs::remove_file(config.join("config.toml")).unwrap();
+        let launch = h.launch_default();
+        assert!(!launch.status.success(), "the fake runtime cannot boot");
+        assert_eq!(
+            h.default_record_in(&h.project).unwrap()["image"],
+            child,
+            "{shape}: the next readable default-tier use establishes the project"
+        );
+
+        // With no host record: setup still initializes it from the
+        // recommendation, and still writes no project default. A later readable
+        // default-tier use establishes from the host record it seeded.
+        let h = Harness::new(Mode::LaunchSeam);
+        let server = Server::new();
+        let a = h.image(&ArchiveSpec::default());
+        let child = server.image("images", &format!("broken-fresh-{shape}"), &a);
+        let config = h.project.join(".agent-vm");
+        fs::create_dir_all(&config).unwrap();
+        fs::write(config.join("config.toml"), config_text).unwrap();
+        let mut command = h.command();
+        command
+            .env("AGENT_VM_TEST_DEFAULT_IMAGE", &child)
+            .args(["setup", "--no-verify"]);
+        let setup = bounded(command);
+        assert!(setup.status.success(), "{shape}: {}", stderr(&setup));
+        assert_eq!(
+            h.host_record().unwrap()["image"],
+            child,
+            "{shape}: R4: the recommendation still initializes an absent host record"
+        );
+        assert!(
+            h.default_record_in(&h.project).is_none(),
+            "{shape}: a setup made while the configuration is unreadable establishes nothing"
+        );
+        fs::remove_file(config.join("config.toml")).unwrap();
+        let launch = h.launch_default();
+        assert!(!launch.status.success(), "the fake runtime cannot boot");
+        assert_eq!(
+            h.default_record_in(&h.project).unwrap()["image"],
+            child,
+            "{shape}: the next readable use establishes from the seeded host record"
+        );
+    }
+}
+
+/// B2's documented replacement: in an established project whose default
+/// differs from the host record, an explicit `--image <its own default>`
+/// re-verifies that reference and does not adopt.
+#[test]
+fn an_explicit_refresh_reverifies_the_project_default_without_adopting() {
+    let h = Harness::new(Mode::StrictAcquisition);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let child_a = server.image("images", "explicit", &a);
+    let b = h.image(&ArchiveSpec {
+        marker: "explicit-b".into(),
+        ..Default::default()
+    });
+    let child_b = server.image("images", "explicit", &b);
+    let tag = format!("{}/images:explicit", server.host);
+
+    assert!(!h.launch_on_recommendation(&child_a).status.success());
+    assert_eq!(h.default_record_in(&h.project).unwrap()["image"], child_a);
+    assert!(set_default(&h, &tag).status.success());
+    assert_eq!(h.host_record().unwrap()["image"], child_b);
+
+    let pins = fs::read(h.pins()).unwrap();
+    let before = server.count();
+    let out = h.refresh(&child_a);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        !stderr(&out).contains("Adopting"),
+        "an explicit refresh adopts nothing: {}",
+        stderr(&out)
+    );
+    assert!(
+        !stdout_of(&out).contains("this project now uses the host's default boot image"),
+        "no adoption notice: {}",
+        stdout_of(&out)
+    );
+    assert_eq!(
+        manifests_requested_since(&server, before),
+        vec![digest_of(&child_a)],
+        "only the named reference is resolved"
+    );
+    assert_eq!(h.default_record_in(&h.project).unwrap()["image"], child_a);
+    assert_eq!(
+        h.pin_for(&child_b),
+        None,
+        "the host's reference is not approved"
+    );
+    assert_eq!(fs::read(h.pins()).unwrap(), pins, "the store is unchanged");
+
+    // The bare refresh still adopts: the explicit form is the opt-out.
+    let adopt = h.refresh_default();
+    assert!(adopt.status.success(), "{}", stderr(&adopt));
+    assert_eq!(h.default_record_in(&h.project).unwrap()["image"], child_b);
+}
+
+/// R3: establishment belongs to the default tier. An explicit `--image`
+/// refresh approves its target for the project and establishes nothing, even
+/// when the project has no default yet.
+#[test]
+fn an_explicit_refresh_establishes_nothing() {
+    let h = Harness::new(Mode::StrictAcquisition);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let child_a = server.image("images", "explicit-establish-a", &a);
+    let b = h.image(&ArchiveSpec {
+        marker: "explicit-establish-b".into(),
+        ..Default::default()
+    });
+    let child_b = server.image("images", "explicit-establish-b", &b);
+    let tag = format!("{}/images:explicit-establish-a", server.host);
+    assert!(set_default(&h, &tag).status.success());
+    assert_eq!(h.host_record().unwrap()["image"], child_a);
+
+    let out = h.refresh(&child_b);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        h.pin_in(&h.project, &child_b).map(|(digest, _)| digest),
+        Some(digest_of(&child_b)),
+        "the explicit refresh approves its target"
+    );
+    assert!(
+        h.default_record_in(&h.project).is_none(),
+        "an explicit refresh establishes nothing"
+    );
+    assert_eq!(
+        h.host_record().unwrap()["image"],
+        child_a,
+        "and writes no host record"
+    );
+
+    // The default tier still starts from the host record, and establishes it.
+    assert_eq!(
+        h.reacquired_digest(&server),
+        digest_of(&child_a),
+        "the default tier selects the host record, not the explicit approval"
+    );
+    assert_eq!(h.default_record_in(&h.project).unwrap()["image"], child_a);
+    assert_eq!(
+        h.pin_in(&h.project, &child_b).map(|(digest, _)| digest),
+        Some(digest_of(&child_b)),
+        "the explicit approval is still there"
+    );
+}
+
+/// B6: an S1 store (no `defaults`) does not establish a project on read. Until
+/// its first default-tier use, the project still follows the host record, so a
+/// `set-default` in that window changes what it boots.
+#[test]
+fn an_s1_store_follows_the_host_record_until_its_first_default_tier_use() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let child_a = server.image("images", "window", &a);
+    let b = h.image(&ArchiveSpec {
+        marker: "window-b".into(),
+        ..Default::default()
+    });
+    let child_b = server.image("images", "window", &b);
+    let tag = format!("{}/images:window", server.host);
+
+    // The state 0.7.39-0.7.46 leaves: an approval and a host record, no
+    // `defaults`.
+    assert!(h.refresh(&child_a).status.success());
+    let mut store = read_json(&h.pins());
+    store.as_object_mut().unwrap().remove("defaults");
+    fs::write(h.pins(), serde_json::to_vec(&store).unwrap()).unwrap();
+    fs::write(
+        h.home.join(".config/agent-vm/default-image.json"),
+        serde_json::to_vec(&serde_json::json!({"version": 1, "image": child_a})).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        h.default_record_in(&h.project).is_none(),
+        "nothing reads the store into an established default"
+    );
+
+    assert!(set_default(&h, &tag).status.success());
+    assert_eq!(h.host_record().unwrap()["image"], child_b);
+    assert_eq!(
+        h.reacquired_digest(&server),
+        digest_of(&child_b),
+        "the window's set-default changes what it boots"
+    );
+    assert_eq!(
+        h.default_record_in(&h.project).unwrap()["image"],
+        child_b,
+        "the first default-tier use establishes the host choice it selected"
+    );
+}
+
+/// B7: the first default-tier use of a project writes the store, so a launch
+/// that 0.7.46 ran read-only now fails when `$HOME/.config/agent-vm` is not
+/// writable.
+#[test]
+fn an_unwritable_store_fails_the_launch_that_must_establish() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let child = server.image("images", "establish-write", &a);
+    let tag = format!("{}/images:establish-write", server.host);
+
+    // A warm approval and a host record, but no project default yet.
+    assert!(h.refresh(&child).status.success());
+    assert!(set_default(&h, &tag).status.success());
+    assert!(h.default_record_in(&h.project).is_none());
+
+    let directory = h.pins().parent().unwrap().to_owned();
+    let permissions = fs::metadata(&directory).unwrap().permissions();
+    if unsafe { libc::geteuid() } == 0 {
+        // Root bypasses directory EACCES; the injected-fault form of this row is
+        // `a_failed_first_default_pin_may_leave_the_host_starting_choice_initialized`.
+        eprintln!("root: EACCES half skipped, the gate fault row covers the failure");
+        return;
+    }
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o500)).unwrap();
+    let out = h.launch_default();
+    fs::set_permissions(&directory, permissions).unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("image pin authority"),
+        "the failure names the store: {}",
+        stderr(&out)
+    );
+    assert!(
+        h.default_record_in(&h.project).is_none(),
+        "a refused establishment writes no default"
+    );
+
+    // Writability restored: the next launch establishes, and boots the content
+    // that was already approved.
+    let before = server.count();
+    let again = h.launch_default();
+    assert!(!again.status.success(), "the fake runtime cannot boot");
+    assert_eq!(server.count(), before, "the approval is warm");
+    assert_eq!(
+        h.default_record_in(&h.project).unwrap()["image"],
+        child,
+        "the next launch establishes the host choice"
+    );
+}
+
+/// R6 on a terminal: a bare refresh that adopts reads no input and asks
+/// nothing, so the terminal is never a prompt surface.
+#[test]
+fn refresh_adoption_never_reads_a_terminal() {
+    let h = Harness::new(Mode::StrictAcquisition);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let child_a = server.image("images", "pty-adopt", &a);
+    let b = h.image(&ArchiveSpec {
+        marker: "pty-adopt-b".into(),
+        ..Default::default()
+    });
+    let child_b = server.image("images", "pty-adopt", &b);
+    let tag = format!("{}/images:pty-adopt", server.host);
+    assert!(!h.launch_on_recommendation(&child_a).status.success());
+    assert!(set_default(&h, &tag).status.success());
+
+    let mut command = h.command();
+    command.arg("image").arg("refresh");
+    let mut terminal = Pty::spawn(&mut command, b"Adopting the host's default boot image")
+        .expect("open a pseudo-terminal");
+    let (status, out) = terminal
+        .drive(&Action::Write(b""), Duration::from_secs(60))
+        .expect("wait for the refresh to exit");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(status.success(), "{text}");
+    assert!(
+        text.contains("Adopting the host's default boot image"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("old: {}", digest_of(&child_a)))
+            && text.contains(&format!("new: {}", digest_of(&child_b))),
+        "{text}"
+    );
+    assert_no_question(&text);
+    assert_eq!(h.default_record_in(&h.project).unwrap()["image"], child_b);
+    assert_eq!(
+        h.pin_in(&h.project, &child_b),
+        Some((digest_of(&child_b), 1)),
+        "the terminal adoption inserts the host reference's approval"
+    );
+}
+
+/// R10: observing an unestablished project writes nothing at all.
+#[test]
+fn doctor_and_show_in_an_unestablished_project_write_nothing() {
+    let h = Harness::new(Mode::LaunchSeam);
+    for verb in [vec!["image", "show"], vec!["doctor"]] {
+        let mut command = h.command();
+        command.args(&verb);
+        let out = bounded(command);
+        assert!(out.status.success(), "{verb:?}: {}", stderr(&out));
+        assert!(
+            !h.home.join(".config/agent-vm").exists(),
+            "{verb:?} must create nothing"
+        );
+    }
+}
+
+/// The §5 race: two first default-tier launches selecting different starting
+/// choices keep the first committer's default, and each still boots the content
+/// it approved this once.
+#[test]
+fn concurrent_first_launches_across_a_set_default_keep_the_first_project_default() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let child_a = server.image("images", "race", &a);
+    let b = h.image(&ArchiveSpec {
+        marker: "race-b".into(),
+        ..Default::default()
+    });
+    let child_b = server.image("images", "race", &b);
+
+    let mut first_gate = PinGate::new(h.root.path());
+    let mut second_gate = PinGate::new(h.root.path());
+    let mut first = h.command();
+    first
+        .env("AGENT_VM_TEST_DEFAULT_IMAGE", &child_a)
+        .args(["shell", "--", "true"]);
+    let peer_a = pin_gate::PinPeer::spawn(first, &first_gate, &[]);
+    let ready_a = first_gate.expect(PinStage::CandidateReady);
+    // The host choice moves to B between the two selections.
+    assert!(set_default(&h, &child_b).status.success());
+    let mut second = h.command();
+    second.args(["shell", "--", "true"]);
+    let peer_b = pin_gate::PinPeer::spawn(second, &second_gate, &[]);
+    let ready_b = second_gate.expect(PinStage::CandidateReady);
+
+    // A commits first: its selection becomes the project's default.
+    ready_a.reply(Reply::Continue);
+    for stage in [
+        PinStage::BeforePinLock,
+        PinStage::PinLocked,
+        PinStage::BeforePinSave,
+        PinStage::PinCommitted,
+    ] {
+        first_gate.expect(stage).reply(Reply::Continue);
+    }
+    ready_b.reply(Reply::Continue);
+    for stage in [
+        PinStage::BeforePinLock,
+        PinStage::PinLocked,
+        PinStage::BeforePinSave,
+        PinStage::PinCommitted,
+    ] {
+        second_gate.expect(stage).reply(Reply::Continue);
+    }
+    let out_a = peer_a.wait();
+    let out_b = peer_b.wait();
+    assert!(!out_a.status.success());
+    assert!(!out_b.status.success());
+    assert_eq!(
+        h.pin_in(&h.project, &child_a).map(|(digest, _)| digest),
+        Some(digest_of(&child_a)),
+        "the first peer approved A"
+    );
+    assert_eq!(
+        h.pin_in(&h.project, &child_b).map(|(digest, _)| digest),
+        Some(digest_of(&child_b)),
+        "the second peer still approved B for the launch it made"
+    );
+    assert_eq!(
+        h.default_record_in(&h.project).unwrap()["image"],
+        child_a,
+        "write-once: the first committer's reference stands"
+    );
+    let store = read_json(&h.pins());
+    assert_eq!(store["pins"].as_array().unwrap().len(), 2);
+    assert!(store["pending_default"].is_null(), "no journal is written");
 }

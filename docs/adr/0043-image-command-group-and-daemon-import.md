@@ -12,6 +12,10 @@ Amended in **0.7.34** by #391: an explicit build/import approves its own result
 reference, prompt-free. Amended in **0.7.35** by [ADR-0061](0061-explicit-launch-builds.md)
 (#527): a launch may build, but only for an explicit `--dockerfile FILE`, and
 that build publishes through this same module without approving anything.
+Amended in **0.7.47** by [ADR-0067](0067-project-default-boot-image.md): `--yes`
+is removed from both update verbs, and an explicit `image refresh` is now also
+its own consent, so build, import **and** refresh approve a replacement without
+a prompt. The "Nested `--yes`" decision below is historical.
 
 ## Context
 
