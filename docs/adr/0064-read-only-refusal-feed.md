@@ -231,3 +231,16 @@ guard has unit and CLI cases. The end-to-end case (`RF1` in
 `script/test/lib/egress-fixtures.py`) runs a default-deny guest, checks the live
 rows and the hint during the run, checks the same IDs afterwards as `ended`, and
 repeats with `kill -9` for `ended (unclean)`.
+
+_Amended by [#562](https://github.com/gregwebs/agent-vm/issues/562)._ A credential
+refusal's key is `(kind, destination, credential)`: two credentials refused at one
+destination are two rows with two different remedies, and a record that does not
+name the credential keeps a row of its own rather than being merged into a named
+one. The ID derivation appends the credential as a seventh line for that kind
+only, so no ID a log already holds for a network denial or a policy lock moves.
+IDs already stored keep their value, since none is recomputed; the seventh line
+only affects credential refusals this build records. The `location` and `reason` a
+record states are evidence for the latest sighting, like `site`. All three fields
+are optional and `v` stays 1: a log written before them is read and rendered
+unchanged, and an older build reading a newer log drops the fields on its next
+write rather than refusing the file.

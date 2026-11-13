@@ -3769,18 +3769,20 @@ ID        KIND            DESTINATION                                           
 a00b2078  policy lock     tcp 10.0.0.7:53                                                     1      2025-10-09 08:49Z  ended            can't be allowed: platform policy
 ```
 
-**Refusals coalesce.** One row is one destination in one session. The
-destination is what an allowance would have to name, so a name the guest supplied
-over TLS SNI or an HTTP `Host` is the destination, with the address kept as
-evidence; a DNS answer the guest's own resolver produced is evidence, and the
-address is the destination; a name the guest asked the resolver for is the
-destination. Every guest-supplied name is marked and escaped — it is text, never
-a fact.
+**Refusals coalesce.** One row is one destination in one session, and one row per
+credential for a credential refusal: two credentials refused at the same
+destination have two remedies, so they never share a row. The destination is what
+an allowance would have to name, so a name the guest supplied over TLS SNI or an
+HTTP `Host` is the destination, with the address kept as evidence; a DNS answer
+the guest's own resolver produced is evidence, and the address is the destination;
+a name the guest asked the resolver for is the destination. Every guest-supplied
+name is marked and escaped — it is text, never a fact.
 
-**The ID is stable.** Eight hex digits, derived once from the session and the
-destination, stored in the log and never recomputed, so a row you copied from a
-run is the same row after the session ends. The same ID appearing in two sessions
-is flagged in a footer and never renamed.
+**The ID is stable.** Eight hex digits, derived once from the session, the
+destination and — for a credential refusal — the credential, stored in the log and
+never recomputed, so a row you copied from a run is the same row after the session
+ends. The same ID appearing in two sessions is flagged in a footer and never
+renamed.
 
 **The session column** is one of `running`, `running (no control socket)`,
 `ended`, `ended (unclean)` or `not responding`. A session that bound no control
@@ -3794,7 +3796,19 @@ names the reason. `no grant in this version; relaunch with --allow-egress` is a
 network denial no record covers; `can't be allowed: platform policy` is the
 deployment floor; `can't be allowed here: credential policy` is the credential
 boundary; `can't be allowed: built-in rule <site>` is an engine rule no allowance
-reaches. When a **project allowance** names the destination, the cell reads:
+reaches. A credential refusal goes on to state the credential, where the
+placeholder was sent and why its secret could not serve it:
+
+```text
+can't be allowed here: credential policy; MSB_AGENT_VM_ANTHROPIC_UNUSED was sent in a request header, and its secret does not cover the destination
+```
+
+A record that does not name the credential says "a credential"; one that does not
+say where or why leaves that part out, and a record that says none of them keeps
+the bare sentence: a missing field means the record did not say, never that
+nothing was refused.
+
+When a **project allowance** names the destination, the cell reads:
 
 ```text
 recorded project allowance tcp://[203.0.113.10/32]:443 (2025-11-09 09:22Z); not confirmed for this session
@@ -4688,8 +4702,10 @@ with launch flags as described in [Persisted grants](#persisted-grants-user-conf
   its secret cannot serve: the destination is not covered or could not be
   verified, or the real value could not be read. It is agent-vm credential
   policy: signing in again inside the sandbox will not fix it. Run `agent-vm
-  access` outside the sandbox. This row is the last resort for a harness that
-  hides the 403 message and shows only the generic authentication error.
+  access` outside the sandbox: its `credential refusal` row states which
+  credential was refused, where in the request it was sent, and why its secret
+  could not serve it. This entry is the last resort for a harness that hides the
+  403 message and shows only the generic authentication error.
 - **Could not find its bundled `msb` binary after copying:** copy the whole
   bundle (`bin/agent-vm`, `bin/msb`, `lib/libkrunfw.5.dylib` on macOS), or
   build the opt-in single binary with `./script/build/macos.sh --single-binary`.
