@@ -1906,6 +1906,111 @@ mod tests {
         );
     }
 
+    // ── PreparedMountPlan::mount_notices ─────────────────────────
+
+    #[test]
+    fn mount_notices_are_bounded_and_the_rest_point_at_msb_inspect() {
+        let plan = |count: usize| PreparedMountPlan {
+            volumes: (0..count)
+                .map(|i| PreparedVolume {
+                    guest: PathBuf::from(format!("/g{i}")),
+                    source: PreparedVolumeSource::ReadOnlyBind(PathBuf::from(format!("/h{i}"))),
+                    node_kind: PreparedNodeKind::Directory,
+                    role: VolumeRole::Followed,
+                })
+                .collect(),
+            repo_scan_roots: Vec::new(),
+            notices: Vec::new(),
+        };
+
+        assert!(plan(0).mount_notices("agent-vm-abc-42").is_empty());
+
+        // At the cap there is nothing to hide, so no summary and no hint.
+        let notices = plan(MAX_MOUNT_NOTICES).mount_notices("agent-vm-abc-42");
+        assert_eq!(notices.len(), MAX_MOUNT_NOTICES);
+        assert!(notices.iter().all(|line| line.starts_with("==> Mounting ")));
+
+        let notices = plan(MAX_MOUNT_NOTICES + 1).mount_notices("agent-vm-abc-42");
+        assert_eq!(notices.len(), MAX_MOUNT_NOTICES + 1);
+        assert_eq!(
+            notices[MAX_MOUNT_NOTICES],
+            "==>   … and 1 more mount not shown (view all: agent-vm msb inspect agent-vm-abc-42)"
+        );
+
+        let notices = plan(MAX_MOUNT_NOTICES + 3).mount_notices("agent-vm-abc-42");
+        assert_eq!(notices.len(), MAX_MOUNT_NOTICES + 1);
+        assert_eq!(
+            notices[MAX_MOUNT_NOTICES],
+            "==>   … and 3 more mounts not shown (view all: agent-vm msb inspect agent-vm-abc-42)"
+        );
+
+        // The name is generated (`agent-vm-<hash>-<pid>`), but the notice is
+        // still built through the one-line policy so no future source of it can
+        // end the line and forge a second notice.
+        let notices = plan(MAX_MOUNT_NOTICES + 2).mount_notices("agent-vm-a\n==> forged");
+        assert_eq!(
+            notices[MAX_MOUNT_NOTICES],
+            "==>   … and 2 more mounts not shown (view all: agent-vm msb inspect \
+             agent-vm-a\\x0a==> forged)"
+        );
+    }
+
+    #[test]
+    fn mount_notices_show_forks_first_then_declarations_then_followed() {
+        let followed = |i: usize| PreparedVolume {
+            guest: PathBuf::from(format!("/followed-{i}")),
+            source: PreparedVolumeSource::ReadOnlyBind(PathBuf::from(format!("/target-{i}"))),
+            node_kind: PreparedNodeKind::Directory,
+            role: VolumeRole::Followed,
+        };
+        let declared = |i: usize| PreparedVolume {
+            guest: PathBuf::from(format!("/declared-{i}")),
+            source: PreparedVolumeSource::ReadOnlyBind(PathBuf::from(format!("/source-{i}"))),
+            node_kind: PreparedNodeKind::Directory,
+            role: VolumeRole::Explicit,
+        };
+
+        // The followed tail comes first in mount order and the fork last: the
+        // report still has to lead with the fork, then the declaration, and
+        // spend what is left on the followed targets.
+        let mut volumes: Vec<PreparedVolume> = (0..MAX_MOUNT_NOTICES).map(followed).collect();
+        volumes.push(declared(0));
+        volumes.push(PreparedVolume {
+            guest: PathBuf::from("/forked"),
+            source: PreparedVolumeSource::Fork(PathBuf::from("/store/forks/abc/data")),
+            node_kind: PreparedNodeKind::Directory,
+            role: VolumeRole::Explicit,
+        });
+        let plan = PreparedMountPlan {
+            volumes,
+            repo_scan_roots: Vec::new(),
+            notices: Vec::new(),
+        };
+
+        let notices = plan.mount_notices("agent-vm-abc-42");
+        assert_eq!(notices.len(), MAX_MOUNT_NOTICES + 1);
+        assert_eq!(
+            notices[0],
+            "==> Mounting /forked (fork stored at /store/forks/abc/data)"
+        );
+        assert_eq!(
+            notices[1],
+            "==> Mounting /source-0 -> /declared-0 (read-only)"
+        );
+        for (i, notice) in notices[2..MAX_MOUNT_NOTICES].iter().enumerate() {
+            assert_eq!(
+                *notice,
+                format!("==> Mounting /target-{i} -> /followed-{i} (read-only)")
+            );
+        }
+        // 8 followed + 1 declared + 1 fork, eight shown: the last two followed
+        // targets are the ones held back.
+        assert_eq!(
+            notices[MAX_MOUNT_NOTICES],
+            "==>   … and 2 more mounts not shown (view all: agent-vm msb inspect agent-vm-abc-42)"
+        );
+    }
+
     // ── parse_extra_mounts ───────────────────────────────────────
 
     #[test]
@@ -3950,6 +4055,54 @@ pub(crate) struct PreparedMountPlan {
     pub(crate) volumes: Vec<PreparedVolume>,
     pub(crate) repo_scan_roots: Vec<RepoScanRoot>,
     pub(crate) notices: Vec<String>,
+}
+
+/// How many `==> Mounting …` lines a launch prints before summarizing the rest.
+///
+/// A `:follow-links` bind announces one line per discovered target, and the
+/// host tree bounds that count rather than agent-vm. Eight matches the cap
+/// `network_requests` already puts on its own per-entry report, and the report
+/// spends those lines on the mounts a reader cannot infer from elsewhere: a
+/// fork first, then the declarations, then the followed targets.
+const MAX_MOUNT_NOTICES: usize = 8;
+
+impl PreparedMountPlan {
+    /// This launch's mount announcements, bounded to [`MAX_MOUNT_NOTICES`].
+    ///
+    /// Startup output has to stay readable when `:follow-links` discovers a
+    /// long tail, so the rest is summarized (with the way to read it in full:
+    /// `msb inspect`). The lines that survive lead with forks, whose stored
+    /// copy the declaration does not show, then the other declarations, and
+    /// spend what is left on followed targets. Order is stable within each
+    /// group, and only this report is reordered: the mounts themselves keep
+    /// their original order.
+    pub(crate) fn mount_notices(&self, sandbox_name: &str) -> Vec<String> {
+        // Larger key = shown later when the list is cut.
+        fn priority(volume: &PreparedVolume) -> u8 {
+            match (&volume.source, volume.role) {
+                (PreparedVolumeSource::Fork(_), _) => 0,
+                (_, VolumeRole::Explicit) => 1,
+                (_, VolumeRole::Followed) => 2,
+            }
+        }
+        let mut ordered: Vec<&PreparedVolume> = self.volumes.iter().collect();
+        ordered.sort_by_key(|volume| priority(volume));
+        let mut notices: Vec<String> = ordered
+            .into_iter()
+            .take(MAX_MOUNT_NOTICES)
+            .map(PreparedVolume::mount_notice)
+            .collect();
+        let hidden = self.volumes.len().saturating_sub(notices.len());
+        if hidden > 0 {
+            let noun = if hidden == 1 { "mount" } else { "mounts" };
+            notices.push(format!(
+                "==>   … and {hidden} more {noun} not shown (view all: agent-vm msb inspect \
+                 {})",
+                crate::one_line::text(sandbox_name)
+            ));
+        }
+        notices
+    }
 }
 
 #[derive(Debug)]

@@ -1602,11 +1602,16 @@ bind that stored copy, never synchronize with `HOST`, and print the exact reset
 directory. `:fork:follow-links` materializes link targets into that copy;
 without it nested link text is preserved. `fork` conflicts with `ro` and `rw`.
 
-Every selected extra mount announces itself once. A bind mounted at the path it
-was declared with needs no arrow (`==> Mounting /home/you/.cargo/registry`); a
-remap shows both sides (`==> Mounting /srv/data -> /data (read-only)`); and a
+Every selected extra mount is announced, up to eight: a bind mounted at the path
+it was declared with needs no arrow (`==> Mounting /home/you/.cargo/registry`);
+a remap shows both sides (`==> Mounting /srv/data -> /data (read-only)`); and a
 fork names its stored copy instead of presenting it as a source
 (`==> Mounting /home/you/.pi/agent (fork stored at <state>/forks/<id>/data)`).
+`:follow-links` announces each discovered target too, so the list can be long;
+startup then summarizes the rest instead of printing it, and
+`agent-vm msb inspect <sandbox>` reports the sandbox's complete configuration.
+Forks are named first and followed targets last, so a long discovery tail is
+what gets summarized.
 
 A seed copies regular files and directories. A **socket, FIFO or device node**
 in the source is omitted, not copied and not a failure, with a notice like

@@ -1442,13 +1442,15 @@ pub(crate) async fn launch(
     // same one-line policy costs nothing for the declared case — an ordinary
     // path is byte-identical — and cannot forge a line in either.
     let mut extra_mount_mkdirs: Vec<String> = Vec::new();
+    for notice in mount_plan.mount_notices(&session.sandbox_name) {
+        notices.emit(notice)?;
+    }
     for volume in &mount_plan.volumes {
         let guest = volume.guest.clone();
         let guest_str = guest
             .to_str()
             .context("--mount guest path must be UTF-8")?
             .to_owned();
-        notices.emit(volume.mount_notice())?;
         match &volume.source {
             mount::PreparedVolumeSource::WritableBind(host)
             | mount::PreparedVolumeSource::Fork(host) => {

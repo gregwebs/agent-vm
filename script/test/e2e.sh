@@ -1992,6 +1992,7 @@ CONCURRENT_NOTICE_PATTERNS=(
   '^==> Tool network requests .+$'
   '^==>   (unmet|to grant): .+$'
   '^==>   … and [0-9]+ more not shown$'
+  '^==>   … and [0-9]+ more mounts? not shown [(]view all: agent-vm msb inspect .+[)]$'
   '^==> WARNING: potentially sensitive guest-managed Pi credentials .+$'
   '^==> Running .+ in sandbox [(]no TTY; streaming output[)]$'
   '^==> Stopping sandbox$'
