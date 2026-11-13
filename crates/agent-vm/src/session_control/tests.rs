@@ -56,6 +56,9 @@ fn record(offset_secs: i64, port: u16) -> NetworkLogRecord {
             name: None,
             name_source: microsandbox::logs::NameSource::Absent,
             revision: 1,
+            credential: None,
+            location: None,
+            reason: None,
         }),
     }
 }

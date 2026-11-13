@@ -1706,6 +1706,16 @@ it as a violation, blocked and logged rather than leaked; quoted in a request
 body it is forwarded unchanged, since it carries no token
 ([#562](https://github.com/gregwebs/agent-vm/issues/562)).
 
+A request that carries a placeholder anywhere but its body is a **credential
+refusal** when its secret cannot serve it: the destination is not covered, the
+destination could not be verified, or the sandbox could not read the real value.
+Its `403` (`code: secret_policy_denied`) states which credential was refused,
+where the placeholder was sent, the destination and the reason — the engine's
+facts — then agent-vm's one remedy sentence: signing in again inside the sandbox
+will not fix it, so run `agent-vm access` outside the sandbox. The same
+value-free fields reach `network.log`; no message or record carries a value, a
+length, a prefix or a hash.
+
 ### Token files live outside the guest bind mount
 
 The per-project `state_dir` is bind-mounted into the guest as a single mount,

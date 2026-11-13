@@ -186,7 +186,8 @@
     "trust_host_cas": false,
     "http": {
       "deny_response": true,
-      "deny_response_format": "json"
+      "deny_response_format": "json",
+      "secret_deny_message": "This is agent-vm credential policy: signing in again inside the sandbox will not fix it. Run `agent-vm access` outside the sandbox."
     }
   },
   "init": null,

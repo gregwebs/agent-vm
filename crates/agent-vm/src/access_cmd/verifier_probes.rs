@@ -379,6 +379,9 @@ async fn parked_refusal(live: &LiveSession, ip: &str, port: u16) -> String {
             name: None,
             name_source: microsandbox::logs::NameSource::Absent,
             revision: 1,
+            credential: None,
+            location: None,
+            reason: None,
         }),
     };
     let feed = live.refusals().expect("a live refusal feed");

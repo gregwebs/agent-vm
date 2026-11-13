@@ -13,6 +13,13 @@ const MAX_BUFFERED_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 const API_METHODS: [&str; 5] = ["GET", "POST", "PATCH", "PUT", "DELETE"];
 const SMART_HTTP_METHODS: [&str; 2] = ["GET", "POST"];
 
+/// agent-vm's remedy for every credential refusal (#562). The engine prepends
+/// its facts sentence, so this states only the fix.
+pub(crate) const SECRET_DENY_MESSAGE: &str = concat!(
+    "This is agent-vm credential policy: signing in again inside the sandbox will not fix it. ",
+    "Run `agent-vm access` outside the sandbox."
+);
+
 pub(crate) struct Inputs<'a> {
     pub creds: &'a CredsState,
     pub state_dir: &'a Path,
@@ -226,6 +233,9 @@ impl Plan {
     }
 
     fn configure_network(self, mut network: NetworkBuilder) -> Result<NetworkBuilder> {
+        // Past the empty-plan guard: a launch with no credential has no
+        // credential refusal.
+        network = network.http(|http| http.secret_deny_message(SECRET_DENY_MESSAGE));
         // Interception is decided **per port** (#175's fail-closed rule): the
         // runtime refuses a credential whose origin port is not in
         // `tls.intercepted_ports`. The base config's own list (default `[443]`)
@@ -397,6 +407,40 @@ mod tests {
             .expect("a valid base network")
             .build()
             .unwrap()
+    }
+
+    /// #562: the remedy reaches the launch config the runtime reads.
+    #[test]
+    fn the_credential_policy_remedy_reaches_the_launch_config() {
+        let creds = CredsState {
+            anthropic_token_file: Some(path("anthropic")),
+            ..CredsState::default()
+        };
+        let config = network(
+            Plan::new(
+                path("agent-vm"),
+                inputs(&creds, ProviderSet::new([CredentialProvider::Anthropic])),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            config.http.secret_deny_message.as_deref(),
+            Some(SECRET_DENY_MESSAGE),
+            "the remedy never reached the launch config"
+        );
+    }
+
+    /// A launch that registers no credential can answer no credential refusal.
+    #[test]
+    fn a_launch_that_registers_nothing_configures_no_secret_remedy() {
+        let config = network(
+            Plan::new(
+                path("agent-vm"),
+                inputs(&CredsState::default(), ProviderSet::default()),
+            )
+            .unwrap(),
+        );
+        assert_eq!(config.http.secret_deny_message, None);
     }
 
     /// #161 ownership: `assemble_guest_env` does not consult the legacy
