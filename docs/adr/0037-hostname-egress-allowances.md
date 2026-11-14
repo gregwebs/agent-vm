@@ -83,11 +83,12 @@ gets `PORT`, and several entries for one host union. Credential-only ports never
 widen hostname rules — credentials authorize substitution, not connections
 (ADR-0036). The consequence is **cross-host widening**: adding
 `tcp://git.corp.example:8443` widens every bare hostname to 8443 and makes 8443
-TLS-only for **every** destination. `tcp://host:80` is accepted, and its notice
-and documentation state that port 80 then becomes TLS-only for every
-destination. The launch notice groups names that share identical effective ports
-and hostname sources onto one line, still showing every name's effective ports;
-the canonical rendering contract is
+TLS-only for **every** destination. `tcp://host:80` is accepted, and the
+documentation states that port 80 then becomes TLS-only for every destination
+([ADR-0040](0040-persisted-user-network-authority.md) later dropped the notice
+that said so at launch). The launch notice groups names that share identical
+effective ports and hostname sources onto one line, still showing every name's
+effective ports; the canonical rendering contract is
 [USAGE](../../USAGE.md#hostname-allowance-grammar).
 
 ### DNS

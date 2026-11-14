@@ -1269,10 +1269,6 @@ mod tests {
             ),
             "{notices}"
         );
-        assert!(
-            notices.contains("==> TLS interception: ports 443 — global to every destination"),
-            "{notices}"
-        );
     }
 
     /// R3's TLS enablement, through the *applied* plan rather than the

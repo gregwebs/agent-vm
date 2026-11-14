@@ -180,6 +180,18 @@ of a name's entries, the `(persisted grants)` / `(--allow-egress)` /
 and the notices describe exactly the same rules. The rendering contract is
 [USAGE](../../USAGE.md#hostname-allowance-grammar).
 
+## Amendment: three launch lines removed
+
+A hostname launch no longer prints the TLS-only clause, the `==> TLS
+interception: ports …` line, or the "only allowed hostnames resolve" DNS line.
+The first two restated a rule ADR-0037 already fixes for every launch; the third
+stated the default. Notices now say only what this launch changes: which names
+are allowed, on which ports, from which source — plus the DNS line a group grant
+adds, because that one changes name resolution. No rule, port or enforcement
+changed, and the `allowing TLS to …` lines still name their effective ports. The
+facts the removed lines carried are in
+[USAGE](../../USAGE.md#hostname-allowance-grammar).
+
 ## Amendment: mounts share the verified read (ADR-0046)
 
 #394 adds a second authority-bearing user field, a top-level `mounts` list

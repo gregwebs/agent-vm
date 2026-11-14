@@ -4085,8 +4085,7 @@ named, exactly as a flag that duplicates a persisted grant is.
 interception is host-wide (ADR-0037): once any hostname allowance is in force,
 its ports are intercepted for *every* destination, so plain TCP to an
 **address** on 443 must be TLS with a matching SNI, and UDP to that port is
-dropped. The `==> TLS interception:` notice says which ports, and it appears
-for a launch whose only hostname came from a record. Prefer
+dropped. A record therefore behaves exactly like a configured name. Prefer
 `tcp://HOST:PORT` records when you mean one port.
 
 **A host HTTP proxy skips hostname records.** The runtime resolves those names
@@ -4312,12 +4311,10 @@ Ports 53 and 853 (the DNS dispatch ports) and `udp://HOST` are refused; UDP can
 only be allowed by an explicit IP/CIDR permission.
 
 **Startup notices group names.** Names whose complete effective port set and
-grant source are identical share one line, in first-seen order, followed once by
-the TLS-only security clause:
+grant source are identical share one line, in first-seen order:
 
 ```text
 ==> Egress policy: allowing TLS to api.example.com, api.anthropic.com on ports 443 (persisted grants)
-==> Egress policy: hostname allowances are TLS-only (SNI and DNS verified; no plain HTTP)
 ```
 
 The source tag names the sources that list the hostname, not proof that each one

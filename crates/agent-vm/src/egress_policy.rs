@@ -748,8 +748,8 @@ impl EgressAuthority {
         }
         if let Some(ports) = self.intercepted_ports() {
             // Display only: names sharing a complete effective port vector and
-            // hostname sources share one line, so the TLS-only clause is stated
-            // once instead of once per name. Rules stay per name (`policy`).
+            // hostname sources share one line instead of one line per name.
+            // Rules stay per name (`policy`).
             struct HostnameNoticeGroup<'a> {
                 ports: Vec<u16>,
                 sources: Option<TierSources<'a>>,
@@ -796,22 +796,6 @@ impl EgressAuthority {
                     )?,
                 }
             }
-            if !groups.is_empty() {
-                writeln!(
-                    output,
-                    "==> Egress policy: hostname allowances are TLS-only (SNI and DNS verified; no plain HTTP)"
-                )?;
-            }
-            let effective = ports
-                .to_vec()
-                .iter()
-                .map(u16::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            writeln!(
-                output,
-                "==> TLS interception: ports {effective} — global to every destination (TLS ClientHello with SNI required, UDP dropped, sandbox CA must be trusted). A tcp://HOST:PORT entry widens every bare hostname to PORT."
-            )?;
         }
         let source = if let Some(p) = &self.provenance {
             let label = |origin: GroupOrigin, setting: &str, flag: &str| {
@@ -845,21 +829,20 @@ impl EgressAuthority {
                 (false, false) => None,
             }
         };
+        // A hostname-only launch authorizes exactly the allowed names
+        // (ADR-0037) and prints nothing here.
         if let Some(source) = source {
             writeln!(
                 output,
                 "==> Egress DNS: arbitrary-name DNS queries authorized via {source} (resolver/rebind/platform constraints still apply)"
             )
-        } else if self.has_hostnames() {
-            writeln!(
-                output,
-                "==> Egress DNS: only allowed hostnames resolve (others NXDOMAIN when forwarder is available; private answers need --allow-lan or a port-less numeric allowance)"
-            )
-        } else {
+        } else if !self.has_hostnames() {
             writeln!(
                 output,
                 "==> Egress DNS: queries denied (NXDOMAIN when forwarder is available; use IP or hostname allowances)"
             )
+        } else {
+            Ok(())
         }
     }
 }
@@ -890,10 +873,6 @@ mod tests {
             allowances: &[],
         }
     }
-    // Printed once per launch, after every hostname grant line: the clause is
-    // about hostname allowances, not about numeric or group grants.
-    const SHARED_TLS_ONLY: &str =
-        "==> Egress policy: hostname allowances are TLS-only (SNI and DNS verified; no plain HTTP)";
     // Independent: the expected source and permission are enumerated, not derived by resolve.
     #[test]
     fn resolve_grant_matches_the_nine_row_table() {
@@ -1154,7 +1133,6 @@ mod tests {
         use crate::user_network::SavedGroups;
         const MERGED: &str = "==> Egress authority: persisted grants from \"/home/a/.config/agent-vm/config.toml\" [network] merged with this launch's flags (flags override persisted booleans and add allowances; nothing is saved)\n";
         const PERSISTED_ONLY: &str = "==> Egress authority: persisted grants from \"/home/a/.config/agent-vm/config.toml\"\n";
-        const TLS: &str = "==> TLS interception: ports 443 — global to every destination (TLS ClientHello with SNI required, UDP dropped, sandbox CA must be trusted). A tcp://HOST:PORT entry widens every bare hostname to PORT.\n";
         let saved = SavedGroups {
             lan: Some(true),
             ..Default::default()
@@ -1189,11 +1167,9 @@ mod tests {
                 expected.push_str("==> Egress policy: persisted grant allow_lan = true (Private RFC1918 + 100.64/10 + fc00::/7 reachable; does not itself enable DNS)\n");
             }
             expected.push_str("==> Egress policy: allowing TLS to api.example.com on ports 443 (persisted grants)\n");
-            expected.push_str(SHARED_TLS_ONLY);
-            expected.push('\n');
-            expected.push_str(TLS);
-            expected.push_str(if row == 3 { "==> Egress DNS: arbitrary-name DNS queries authorized via --allow-internet-egress (resolver/rebind/platform constraints still apply)\n" }
-                else { "==> Egress DNS: only allowed hostnames resolve (others NXDOMAIN when forwarder is available; private answers need --allow-lan or a port-less numeric allowance)\n" });
+            if row == 3 {
+                expected.push_str("==> Egress DNS: arbitrary-name DNS queries authorized via --allow-internet-egress (resolver/rebind/platform constraints still apply)\n");
+            }
             assert_eq!(String::from_utf8(out).unwrap(), expected);
         }
         let mixed = resolve_saved(
@@ -1228,7 +1204,7 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             format!(
-                "{MERGED}==> Egress policy: allowing TLS to api.example.com on ports 443, 8443 (persisted grants and --allow-egress)\n{SHARED_TLS_ONLY}\n==> TLS interception: ports 443, 8443 — global to every destination (TLS ClientHello with SNI required, UDP dropped, sandbox CA must be trusted). A tcp://HOST:PORT entry widens every bare hostname to PORT.\n==> Egress DNS: only allowed hostnames resolve (others NXDOMAIN when forwarder is available; private answers need --allow-lan or a port-less numeric allowance)\n"
+                "{MERGED}==> Egress policy: allowing TLS to api.example.com on ports 443, 8443 (persisted grants and --allow-egress)\n"
             )
         );
     }
@@ -1275,7 +1251,7 @@ mod tests {
         use crate::user_network::SavedGroups;
         const MERGED: &str = "==> Egress authority: persisted grants from \"/home/a/.config/agent-vm/config.toml\" [network] merged with this launch's flags (flags override persisted booleans and add allowances; nothing is saved)\n";
         const PERSISTED_ONLY: &str = "==> Egress authority: persisted grants from \"/home/a/.config/agent-vm/config.toml\"\n";
-        for (saved, cli, ports, hostnames) in [
+        for (saved, cli, hostnames) in [
             (
                 &[
                     "b.example.com",
@@ -1284,25 +1260,21 @@ mod tests {
                     "both.example.com",
                 ][..],
                 &["both.example.com", "c.example.com"][..],
-                "443, 8443",
                 "==> Egress policy: allowing TLS to b.example.com, a.example.com on ports 443, 8443 (persisted grants)\n==> Egress policy: allowing TLS to p.example on ports 8443 (persisted grants)\n==> Egress policy: allowing TLS to both.example.com on ports 443, 8443 (persisted grants and --allow-egress)\n==> Egress policy: allowing TLS to c.example.com on ports 443, 8443 (--allow-egress)\n",
             ),
             (
                 &["tcp://n.example:8443", "tcp://m.example:9443"][..],
                 &[][..],
-                "443, 8443, 9443",
                 "==> Egress policy: allowing TLS to n.example on ports 8443 (persisted grants)\n==> Egress policy: allowing TLS to m.example on ports 9443 (persisted grants)\n",
             ),
             (
                 &["api.example.com"][..],
                 &["tcp://api.example.com:443"][..],
-                "443",
                 "==> Egress policy: allowing TLS to api.example.com on ports 443 (persisted grants and --allow-egress)\n",
             ),
             (
                 &[][..],
                 &["api.example.com"][..],
-                "443",
                 "==> Egress policy: allowing TLS to api.example.com on ports 443 (--allow-egress)\n",
             ),
             (
@@ -1312,7 +1284,6 @@ mod tests {
                     "tcp://API.example.com:8443",
                 ][..],
                 &[][..],
-                "443, 8443",
                 "==> Egress policy: allowing TLS to api.example.com on ports 443, 8443 (persisted grants)\n",
             ),
         ] {
@@ -1335,9 +1306,7 @@ mod tests {
             };
             assert_eq!(
                 String::from_utf8(out).unwrap(),
-                format!(
-                    "{header}{hostnames}{SHARED_TLS_ONLY}\n==> TLS interception: ports {ports} — global to every destination (TLS ClientHello with SNI required, UDP dropped, sandbox CA must be trusted). A tcp://HOST:PORT entry widens every bare hostname to PORT.\n==> Egress DNS: only allowed hostnames resolve (others NXDOMAIN when forwarder is available; private answers need --allow-lan or a port-less numeric allowance)\n"
-                )
+                format!("{header}{hostnames}")
             );
         }
     }
@@ -2158,9 +2127,6 @@ mod tests {
     #[test]
     fn notice_goldens_with_records() {
         const HEADER: &str = "==> Egress authority: 2 project allowance(s) from \"/home/a/.config/agent-vm/allowances.json\"\n";
-        const TLS_ONLY: &str = "==> Egress policy: hostname allowances are TLS-only (SNI and DNS verified; no plain HTTP)\n";
-        const INTERCEPT: &str = "==> TLS interception: ports 443 — global to every destination (TLS ClientHello with SNI required, UDP dropped, sandbox CA must be trusted). A tcp://HOST:PORT entry widens every bare hostname to PORT.\n";
-        const DNS_ONLY_NAMES: &str = "==> Egress DNS: only allowed hostnames resolve (others NXDOMAIN when forwarder is available; private answers need --allow-lan or a port-less numeric allowance)\n";
         let recorded = ["tcp://[203.0.113.10/32]:443", "api.example.com"];
 
         // Recorded only: no persisted header, no flags.
@@ -2171,7 +2137,7 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             format!(
-                "{HEADER}==> Egress policy: allowing tcp://[203.0.113.10/32]:443 (project allowance)\n==> Egress policy: allowing TLS to api.example.com on ports 443 (project allowance)\n{TLS_ONLY}{INTERCEPT}{DNS_ONLY_NAMES}"
+                "{HEADER}==> Egress policy: allowing tcp://[203.0.113.10/32]:443 (project allowance)\n==> Egress policy: allowing TLS to api.example.com on ports 443 (project allowance)\n"
             )
         );
 
@@ -2195,13 +2161,12 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             format!(
-                "{HEADER}==> Egress policy: allowing tcp://[203.0.113.10/32]:443 (--allow-egress and project allowance)\n==> Egress policy: allowing TLS to api.example.com on ports 443 (--allow-egress and project allowance)\n{TLS_ONLY}{INTERCEPT}{DNS_ONLY_NAMES}"
+                "{HEADER}==> Egress policy: allowing tcp://[203.0.113.10/32]:443 (--allow-egress and project allowance)\n==> Egress policy: allowing TLS to api.example.com on ports 443 (--allow-egress and project allowance)\n"
             )
         );
 
         // Overlapping scopes: a configured bare name and a recorded port-scoped
-        // one are one Domain rule carrying both ports, so one line, one tag, and
-        // interception at both ports globally.
+        // one are one Domain rule carrying both ports, so one line and one tag.
         let mut out = Vec::new();
         let overlapping = with_recorded(
             EgressAuthority::from_cli(CliEgress {
@@ -2214,9 +2179,7 @@ mod tests {
         overlapping.write_notices(&mut out).unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            format!(
-                "==> Egress authority: 1 project allowance(s) from \"/home/a/.config/agent-vm/allowances.json\"\n==> Egress policy: allowing TLS to api.example.com on ports 443, 8443 (--allow-egress and project allowance)\n{TLS_ONLY}==> TLS interception: ports 443, 8443 — global to every destination (TLS ClientHello with SNI required, UDP dropped, sandbox CA must be trusted). A tcp://HOST:PORT entry widens every bare hostname to PORT.\n{DNS_ONLY_NAMES}"
-            )
+            "==> Egress authority: 1 project allowance(s) from \"/home/a/.config/agent-vm/allowances.json\"\n==> Egress policy: allowing TLS to api.example.com on ports 443, 8443 (--allow-egress and project allowance)\n"
         );
     }
 
@@ -2510,10 +2473,7 @@ mod tests {
         let text = cli_refusal_lines(&["api.example.com"], &tools);
         assert_eq!(
             text,
-            "==> Egress policy: allowing TLS to api.example.com on ports 443\n\
-             ==> Egress policy: hostname allowances are TLS-only (SNI and DNS verified; no plain HTTP)\n\
-             ==> TLS interception: ports 443 — global to every destination (TLS ClientHello with SNI required, UDP dropped, sandbox CA must be trusted). A tcp://HOST:PORT entry widens every bare hostname to PORT.\n\
-             ==> Egress DNS: only allowed hostnames resolve (others NXDOMAIN when forwarder is available; private answers need --allow-lan or a port-less numeric allowance)\n"
+            "==> Egress policy: allowing TLS to api.example.com on ports 443\n"
         );
     }
 
