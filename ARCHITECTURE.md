@@ -65,7 +65,10 @@ crates/agent-vm/src/
 ├── project.rs              # the one project capture (canonical cwd → session + approval scope)
 ├── image_pin.rs            # project-scoped OCI approval: prepare before create, explicit refresh
 │   ├── project_default.rs  #   a project's own default and the host starting choice
-│   ├── store.rs            #   strict HOME pin store, CAS kernel, project defaults, S1 journal recovery
+│   ├── store.rs            #   strict HOME pin store, CAS kernel, roles/scopes, sequence, defaults, S1 recovery
+│   ├── active.rs           #   held roles, scope resolution, the knowledge/retirement and allocation kernels
+│   ├── completion.rs       #   typed committed-success reports and the fixed post-commit warnings
+│   ├── publication.rs      #   build/import result approval and its Output claim
 │   └── approval.rs         #   renders and mints explicit-command consent (nothing is asked)
 ├── image_acquire.rs        # shared boot-free acquisition: canonical target, validated token, barrier
 │   ├── reference.rs        #   the one canonical OCI target (cache/acquisition key)
@@ -1324,26 +1327,52 @@ It owns two small HOME files, separate from the host's retained record:
  "pins":[{"project":"<64 hex>",
            "reference":"docker.io/library/alpine:latest",
            "platform":{"os":"linux","architecture":"arm64","variant":null},
-           "manifest_digest":"sha256:<64 hex>","revision":1}],
+           "manifest_digest":"sha256:<64 hex>","revision":8,"roles":"boot"},
+          {"project":"<64 hex>",
+           "reference":"docker.io/library/app@sha256:<64 hex>",
+           "platform":{"os":"linux","architecture":"arm64","variant":null},
+           "manifest_digest":"sha256:<64 hex>","revision":11,"roles":"output"}],
  "pending_default":null,
  "defaults":[{"project":"<64 hex>",
-              "image":"docker.io/library/alpine@sha256:<64 hex>"}]}
+              "image":"docker.io/library/alpine@sha256:<64 hex>"}],
+ "scopes":[{"project":"<64 hex>",
+            "platform":{"os":"linux","architecture":"arm64","variant":null},
+            "resolved":"boot-and-output"}],
+ "sequence":12}
 ```
 
-`defaults` is optional and is omitted when empty, so a store 0.7.39–0.7.46 wrote
-decodes as "no project has an established default" and re-encodes to the same
-bytes. Each record names one project and one canonical reference that states its
-digest; projects are unique and are bounded at 4096 records, independently of
-the pin bound (both are also subject to the 4 MiB file-size bound).
+`defaults`, `scopes`, per-pin `roles` and `sequence` are all optional and omitted
+when unused, so a store 0.7.39–0.7.49 wrote decodes as "no project has an
+established default and both roles are unknown" and re-encodes to the same bytes
+until a real save adds the new state (ADR-0068). Each record names one project
+and one canonical reference that states its digest; projects are unique and are
+bounded at 4096 records, scopes at 4096, independently of the pin bound (all are
+also subject to the 4 MiB file-size bound).
+
+**Three facts, not one.** A pin's `roles` say which single-holder slots it
+currently fills; a scope's `resolved` says which slots have ever been claimed
+there; `sequence` says which atomic pin-store write allocated an approval token.
+An empty `roles` is *unclaimed*, not "known absent", and only the scope join can
+turn it into absence. A claim resolves its slot for the whole scope, makes its
+target the sole holder, and retires exactly the records whose both roles are now
+known absent. Refresh keeps roles and resolution; it never claims or retires.
+Retirement creates fresh cache-first authority rather than restoring the old
+approval. Inside one HOME-wide sequence, insertion and content replacement use
+the reserved next allocation as the approval revision; role/default-only saves
+advance the sequence and keep every existing token.
 
 `image-pins.json` is strict version-2 JSON: unknown, duplicate or missing fields,
 duplicate (project, reference, platform) keys, unsupported versions, a `project`
 that is not 64 lowercase hex characters, invalid/zero/overflow revisions,
 non-canonical spellings, non-regular/symlink/oversized files and trailing bytes
-are closed corruption errors. Only `ENOENT` means "absent". Bounds are 4 MiB,
-4096 pins and 4096 source bytes, checked on read and before every write; reaching
-_either_ growth limit at commit — records or bytes — is a *full* store, not
-damage, because the file on disk is still well-formed. A version-1 store is
+are closed corruption errors, as are null/empty/unknown role or resolution
+masks, duplicate scopes, a holder whose scope is unresolved, a resolved role
+without exactly one holder, roles/scopes without a sequence, and a sequence
+below a live revision. Only `ENOENT` means "absent". Bounds are 4 MiB, 4096
+pins, 4096 project defaults, 4096 scopes and 4096 source bytes, checked on read
+and on the final proposed state before every write; reaching _either_ growth
+limit at commit — records or bytes — is a *full* store, not damage, because the
+file on disk is still well-formed. A version-1 store is
 recognized by a lenient version probe and refused with its own error naming the
 USAGE upgrade section: it is never read, rewritten, moved or recovered, and no
 approval-authority file is created first. `image-pins.lock` is a stable private
@@ -1369,6 +1398,17 @@ platform and both full digests before the commit, and nothing is read. The
 mutation is a pure decision on one measured under-lock snapshot (`insert only if
 expected and current are absent`, `replace only for a mutable source with a
 matching predecessor`), so a concurrent writer cannot be overwritten.
+
+**Committed success is typed.** `store` returns `CommitOutcome::Committed` with
+a `Completion { value, report }` or the one typed `Conflict`; only a first-pin
+preparation may re-read a winner after a conflict, never after an arbitrary I/O,
+full or sequence-exhausted error. The post-rename debug checkpoint is converted
+into `CommitReport::CheckpointUnavailable`, and `image_pin::completion` turns
+that and a failed completion notice into fixed, reference-free success warnings
+with exit 0. Pre-commit failures keep the ordinary "approval was not updated"
+context. `image show` and `doctor` keep their existing output and read-only
+behaviour over the new schema; an active-role listing/summary is a follow-up
+(plan §6.4), and S4/S5 remain separate.
 
 **Approval equivalence is guest content, not index identity.** Two manifests are
 the same approval when their verified config digest and ordered layer diff IDs

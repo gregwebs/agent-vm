@@ -14,6 +14,11 @@ a starting choice; the prompt and `--yes` are removed) and
 consent, so build, import **and** refresh approve a replacement prompt-free).
 Requires the store format of ADR-0063 (version 2).
 
+[ADR-0068](0068-active-image-set.md) adds role/resolution metadata and a global
+write sequence without changing selection or establishment eligibility.
+Warm/equal approvals may require metadata-only writes. Default adoption is not a
+Boot preparation.
+
 ## Context
 
 Two questions have two different records in `$HOME/.config/agent-vm/`:

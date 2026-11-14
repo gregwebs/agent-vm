@@ -92,6 +92,27 @@ Additional [ADR-0059](0059-user-tool-requests-as-egress-authority.md) and
 | `egress_reference::set_reference_claim` | the same adapter's `set:` arm: `str::as_bytes`, the `&text[4..]` name slice, the **reused** `config_mounts::mount_set_name_bytes` rule and the error mapping |
 | `egress_reference::sets::egress_set_expansion_work_allowed` | `sets::ExpansionWork::admit`: the counter, the pre-increment check and the charge-before-probe order in `compile` |
 
+Additional [ADR-0068](0068-active-image-set.md) pairs:
+
+| decision (proved kernel) | trusted adapter |
+|---|---|
+| `image_pin::active::claim_knowledge` | `apply_claim`: mask→knowledge mapping, the record walk and the foreign-scope filter; `knowledge(resolved, held)` builds prior facts from the scope join |
+| `image_pin::active::may_retire` | the same walk's deletion decision; retirement is iff both roles are `Absent`, so an unknown role protects a record |
+| `image_pin::active::checked_next_sequence` | `PinFile::effective_sequence` (the max-legacy-revision fold), `reserve_write` and `seal_write` (persisted high-water, final-state validation) |
+| `image_pin::mask_is_acceptable` | `ScopeRecord::validated`'s nonempty `resolved` check. It decides only "a present mask names at least one role": `RoleMask`'s own deserializer already rejects null, empty and unknown spellings, so this adapter is the *writer*-side guard (a proposed state built from `RoleMask::EMPTY`), not coverage of the decoders |
+
+The knowledge table cannot substitute for the relational scope join or for CAS
+allocation/propagation tests: the proved decision is over measured
+`KnowledgeFacts`, while `PinFile::validate_roles`, `plan_claim`/`apply_claim`,
+the sealing helper and the `ApprovedPin` tuple comparison are the trusted
+adapters. Named tests: `knowledge_transition_matches_36_literal_rows`,
+`retirement_requires_both_known_absent`,
+`checked_next_sequence_exhausts_without_wrapping`,
+`legacy_boot_survives_output_claim_and_displacement`,
+`legacy_output_survives_boot_claim_and_displacement`,
+`warm_claim_rejects_new_lifetime_same_digest`, the four `AC11` capacity fixtures,
+and `recovery_allocates_and_preserves_roles`.
+
 Two kernels in that table are **reused rather than restated**, which is the point
 of naming them here: `mount_set_name_bytes` already proves the accepted name byte
 shape for `[mount_sets]`, so an egress-set name is accepted iff a mount-set name
@@ -119,7 +140,11 @@ the same measurement. **Measured for #535: 251 verified, 0 errors** (216 before 
 `resolve_components`, `worktree_verdict`, `metadata_placement`, `worktree_coverage`,
 `declaration_enclosure`), their `spec`/exec helpers, and nine verified
 structs/enums (`PlacementFacts` gained the `contains_checkout` fact, and
-`EnclosureFacts`/`Enclosure` are new). **Measured for #505: 213 verified, 0 errors** (206 before it): the
+`EnclosureFacts`/`Enclosure` are new). **Measured for #542: 260 verified, 0 errors** (255 before it): the five
+ADR-0068 kernels (`Role::bit`, `may_retire`, `claim_knowledge`,
+`checked_next_sequence`, `mask_is_acceptable`) and their verified
+structs/enums (`KnowledgeFacts`, `ClaimFacts`, `SequenceReservation`).
+**Measured for #505: 213 verified, 0 errors** (206 before it): the
 three constants (`MAX_REQUEST_LABELS`, `MAX_BASELINE_REFERENCES`, `MAX_BASELINE_BYTES`), the
 three spec/exec pairs and one verified `struct` (`RequestLabelFacts`) — seven items where the
 plan predicted six, because a `verus!` struct is a verified item like a `const`. The same

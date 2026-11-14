@@ -295,6 +295,26 @@ impl Snapshot {
         );
         self.artifacts_unchanged(h, pin);
     }
+    /// A successful warm preparation may add held roles, scope resolution and a
+    /// write sequence to the store (ADR-0068), but it must not change any
+    /// approval's content or its global token.
+    fn approvals_unchanged(&self, h: &Harness) {
+        let content = |bytes: Option<Vec<u8>>| -> Vec<(serde_json::Value, serde_json::Value)> {
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes.expect("the store exists")).unwrap();
+            value["pins"]
+                .as_array()
+                .expect("pins")
+                .iter()
+                .map(|pin| (pin["manifest_digest"].clone(), pin["revision"].clone()))
+                .collect()
+        };
+        assert_eq!(
+            content(pin_store_bytes(&h.home).expect("the approval store could not be read")),
+            content(self.pins.clone()),
+            "the approval content and token are unchanged"
+        );
+    }
     fn artifacts_unchanged(&self, h: &Harness, pin: &str) {
         assert_inventory_unchanged(&self.files);
         complete(&h.cache(), pin);
@@ -4043,7 +4063,8 @@ fn failed_candidates_preserve_approval_hashes_and_fresh_cli_preparation() {
             start,
             "{failure}: old A was not usable offline"
         );
-        before.unchanged(&h, &pin_a);
+        before.approvals_unchanged(&h);
+        before.artifacts_unchanged(&h, &pin_a);
     }
 }
 

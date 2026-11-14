@@ -20,8 +20,8 @@ use anyhow::{Result, anyhow, bail};
 use super::approval;
 use super::store::{self, Store};
 use super::{
-    ApprovedPin, BootImage, CanonicalOciReference, DefaultAction, DefaultChange, ImageLabel,
-    ImageRef, ImageSource, ImmutableImageRef, ManifestDigest, PinKey, ProjectId, Rendering,
+    BootImage, CanonicalOciReference, DefaultAction, DefaultChange, ImageLabel, ImageRef,
+    ImageSource, ImmutableImageRef, ManifestDigest, PinKey, ProjectId, Rendering,
     ValidatedCandidate, acquire_or_render, immutable_reference, oci_target, revalidate_frozen,
 };
 use crate::boot_image::{AdoptionOffer, ConfigurationRead};
@@ -220,17 +220,6 @@ pub(super) fn establishment(boot: &BootImage) -> Result<DefaultAction> {
     })
 }
 
-/// The write-once establishment that belongs with every successful default-tier
-/// preparation whose selection was the default tier.
-///
-/// A warm launch whose key is already pinned still establishes the project; an
-/// established project writes nothing and takes no exclusive lock.
-pub(super) fn establish_default(boot: &BootImage, pin: &ApprovedPin) -> Result<()> {
-    let action = establishment(boot)?;
-    Store::host()?.establish_default_if_absent(&pin.key, &action)?;
-    Ok(())
-}
-
 /// R7: move an established project's default to the host record. Invoking
 /// refresh is the consent; the change is rendered when its content differs.
 pub(super) async fn adopt_host_default(
@@ -264,8 +253,9 @@ pub(super) async fn adopt_host_default(
     let adoption = approval::adopt(expected, proposed, &candidate, &old)?;
     drop(prepared);
     revalidate_frozen(&candidate, &label, Rendering::Selection).await?;
-    let committed = Store::host()?.adopt(&candidate, &adoption)?;
-    Ok(committed.project_default)
+    let completion = Store::host()?.adopt(&candidate, &adoption)?;
+    super::completion::finish_preparation(completion.report);
+    Ok(completion.value.project_default)
 }
 
 /// `image set-default`: measure the typed target and make its host child the

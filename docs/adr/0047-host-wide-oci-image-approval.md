@@ -2,6 +2,14 @@
 
 ## Status
 
+[ADR-0068](0068-active-image-set.md) (0.7.51, #542) adds the active image set:
+output membership is atomic with the named-result approval, archive aliases still
+confer no authority (an alias can, however, supply a *retired* reference's next
+pin cache-first), approval revisions are global write-sequence tokens rather
+than per-key +1, and a committed publication whose checkpoint or notice cannot be
+reported finishes successfully with a warning instead of "approval was not
+updated".
+
 Accepted. Implements [agent-vm #390](https://github.com/gregwebs/agent-vm/issues/390)
 and completes the model begun in
 [ADR-0035](0035-consume-user-owned-boot-images.md) (whose retained-default

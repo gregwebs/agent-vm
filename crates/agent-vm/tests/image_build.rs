@@ -3463,7 +3463,7 @@ fn archive_aliases_never_create_or_replace_a_pin() {
     let published = metadata(&harness.cache_dir(), "a-target:dev").manifest_digest;
     assert_eq!(
         pin_for(&harness, "docker.io/library/a-target:dev"),
-        Some((published, 1))
+        Some((published, 2))
     );
     assert_eq!(
         pin_records(&harness).len(),
@@ -3701,6 +3701,9 @@ fn approval_moves_only_the_result_record() {
             serde_json::from_slice(&pins(&harness).unwrap()).unwrap();
         let mut foreign = store["pins"][0].clone();
         foreign["platform"] = foreign_platform.clone();
+        // A hand-inserted foreign-platform record holds no role: its scope has no
+        // resolution record, and a holder without a resolved scope is damage.
+        foreign.as_object_mut().unwrap().remove("roles");
         store["pins"].as_array_mut().unwrap().push(foreign.clone());
         // ...and for the operated result key itself, so a regression that deletes
         // every platform of the approved reference is caught here.
@@ -3747,8 +3750,8 @@ fn approval_moves_only_the_result_record() {
         );
         assert_eq!(
             host_record(&harness, "docker.io/library/t:dev")["revision"],
-            1,
-            "at revision one"
+            2,
+            "at the HOME-wide next allocation (the seed build took 1)"
         );
         // AC8's sibling case must also cover *replacement*, not just insertion:
         // different bytes under the same reference. A defect that deletes every
@@ -3771,8 +3774,8 @@ fn approval_moves_only_the_result_record() {
         );
         assert_eq!(
             host_record(&harness, "docker.io/library/t:dev")["revision"],
-            2,
-            "a replacement moves the operated record to revision two"
+            3,
+            "a replacement draws the next allocation, not current + 1"
         );
         let t2 = image_archive::write(
             &harness.home.join("t2.tar"),
@@ -3798,10 +3801,15 @@ fn approval_moves_only_the_result_record() {
                 })
                 .cloned()
         };
-        assert_eq!(
-            find("docker.io/library/other:keep", false),
-            Some(u_record.clone())
-        );
+        // U shares the operated project/platform scope, so the new Output holder
+        // moves the slot off it. Its approval content and token are untouched,
+        // and unknown Boot still protects it from retirement.
+        let u_now = find("docker.io/library/other:keep", false).expect("U survives");
+        // The whole record, minus the role slot the shared scope moved off it: U
+        // legitimately loses Output, so `roles` is the only field that changed.
+        let mut u_expected = u_record.clone();
+        u_expected.as_object_mut().unwrap().remove("roles");
+        assert_eq!(u_now, u_expected, "U's record is otherwise byte for byte");
         assert_eq!(
             find("docker.io/library/other:keep", true),
             Some(foreign.clone()),
@@ -3819,7 +3827,7 @@ fn approval_moves_only_the_result_record() {
         );
         assert_eq!(
             find("docker.io/library/t:dev", false).expect("the build's own record")["revision"],
-            2,
+            3,
             "and it is still the replacement, not a fresh first pin"
         );
         assert_eq!(

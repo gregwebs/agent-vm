@@ -7359,7 +7359,7 @@ custom_image_host_pins() {
   local proj live out reads_before reads_after deadline target ready=0
   local live_pid=0 identity="" tick="" rootid="" tag_before digest_before b_before
   local cold_state default_home default_state rootfs pin_snapshot default_snapshot docker_host
-  local pins_revision_before explicit_snapshot proj_id live_id iso_proj iso_state iso_id proj_record_before
+  local pins_sequence_before explicit_snapshot proj_id live_id iso_proj iso_state iso_id proj_record_before
   # The group's own precondition is Apple Silicon, so the measured host platform
   # these pins are keyed by is exactly linux/arm64.
   local host_arch="arm64"
@@ -7538,8 +7538,24 @@ custom_image_host_pins() {
   # ---- an archive alias over the pinned tag does not switch the guest (#391) ----
   # The archive carries the pinned tag as one of its own names (a Docker-save
   # RepoTag), while the command names a *different* result reference. Only the
-  # named result reference is approved, so the pinned tag's record is untouched.
+  # named result reference is approved. This is the **retained** case: the tag
+  # holds Boot, so the import's first Output claim cannot retire it. A tag that
+  # holds no role would instead be retired by that claim (ADR-0068 R2); that
+  # outcome is the hermetic `archive_alias_after_retirement_supplies_the_next_pin`
+  # regression, not this native row.
   pins_env "$WORK/pins-home" "$WORK/pins-state"
+  # The establishing default-tier launch above moved Boot to the default's
+  # digest-spelled $ref_a key, which left the tag unheld (and protected only by
+  # the still-unknown Output). Launch the tag to make it the Boot holder; $ref_a
+  # is then unheld, and this import's Output claim retires it.
+  pins_launch pins-alias-boot "$proj" --image "$tag" hello-258 || result=1
+  require_launch_ok pins-alias-boot || result=1
+  assert_eq "the tag boots A before the alias import" "stamp=absent" \
+    "$(pins_stamp pins-alias-boot)" || result=1
+  assert_eq "the tag holds Boot before the alias import" "boot" \
+    "$(jq -r --arg r "$tag" --arg p "$proj_id" \
+      '.pins[] | select(.project == $p and .reference == $r) | .roles' \
+      "$(pins_store)")" || result=1
   pin_snapshot="$(cat "$(pins_store)")"
   docker tag "$CUSTOM_STAMP" "$tag" || result=1
   DOCKER_HOST="$docker_host" DOCKER_CONFIG="$PINS_HOME/docker" \
@@ -7550,19 +7566,46 @@ custom_image_host_pins() {
     cat "$WORK/pins-import.out"
     result=1
   }
-  if ! jq -e --arg r "$tag" --arg p "$proj_id" \
-    '.pins[] | select(.project == $p and .reference == $r)' \
-    <<<"$pin_snapshot" >/dev/null 2>&1; then
-    echo "    FAIL: the pinned tag had no record before the alias import"
-    result=1
-  fi
+  # The Boot holder is retained byte-for-byte: a record that held a role cannot
+  # be retired by this claim.
   assert_eq "an archive alias leaves the pinned tag's approval unchanged" \
     "$(jq -c --arg r "$tag" --arg p "$proj_id" '.pins[] | select(.project == $p and .reference == $r)' <<<"$pin_snapshot")" \
     "$(jq -c --arg r "$tag" --arg p "$proj_id" '.pins[] | select(.project == $p and .reference == $r)' "$(pins_store)")" || result=1
+  assert_eq "the retained tag still holds Boot" "boot" \
+    "$(jq -r --arg r "$tag" --arg p "$proj_id" \
+      '.pins[] | select(.project == $p and .reference == $r) | .roles' \
+      "$(pins_store)")" || result=1
+  # The named result reference is the Output holder, and the scope now resolves
+  # both slots.
+  assert_eq "the named result reference holds Output" "output" \
+    "$(jq -r --arg r "localhost:$port/$repo:alias-result" --arg p "$proj_id" \
+      '.pins[] | select(.project == $p and .reference == $r) | .roles' \
+      "$(pins_store)")" || result=1
+  if ! jq -e --arg p "$proj_id" \
+    '[.scopes[] | select(.project == $p)] | length == 1
+     and .[0].resolved == "boot-and-output"' \
+    "$(pins_store)" >/dev/null 2>&1; then
+    echo "    FAIL: the alias import did not resolve both scope slots"
+    cat "$(pins_store)" 2>/dev/null || true
+    result=1
+  fi
+  # Exactly two records in this project: the retained Boot holder and the named
+  # result. That is the retired default key ($ref_a, which held no role) and no
+  # record for any name the archive itself carries.
+  assert_eq "the alias import retires only the unheld default key" \
+    "localhost:$port/$repo:alias-result $tag" \
+    "$(jq -r --arg p "$proj_id" \
+      '[.pins[] | select(.project == $p) | .reference] | sort | join(" ")' \
+      "$(pins_store)")" || result=1
+  # A warm launch of the retained tag boots the unchanged guest A and needs no
+  # registry read.
+  reads_before="$(registry_read_count "$container")" || result=1
   pins_launch pins-after-import "$proj" --image "$tag" hello-258 || result=1
   require_launch_ok pins-after-import || result=1
   assert_eq "an archive alias cannot swap the pinned guest" "stamp=absent" \
     "$(pins_stamp pins-after-import)" || result=1
+  reads_after="$(registry_read_count "$container")" || result=1
+  assert_eq "the retained tag costs no registry read" "$reads_before" "$reads_after" || result=1
 
   # ---- a live A guest keeps running while the tag moves and nothing probes it ----
   # The live guest runs in its own project, so approve A *there* first — and
@@ -7856,13 +7899,31 @@ custom_image_host_pins() {
     "$(grep '^plain=' <<<"$out")" || result=1
 
   # ---- an explicit import of the pinned tag moves the guest (#391) ----
-  # $tag is approved at B. Importing A's bytes under $tag is the command naming
-  # the result reference, so it approves that reference: no prompt, old/new on
-  # stderr, revision +1, and the next launch boots A with no registry read.
+  # The default-tier launches above moved Boot to the project default's
+  # digest-spelled keys, so with Output resolved the tag's record was retired
+  # (ADR-0068 R2: a known-inactive approval is not retained). Approve the tag
+  # again by launching it — a fresh cache-first pin at the tag's current B — so
+  # the import below has a predecessor to render.
   pins_env "$WORK/pins-home" "$WORK/pins-state"
-  pin_snapshot="$(cat "$(pins_store)")"
-  pins_revision_before="$(jq -r --arg r "$tag" --arg p "$proj_id" \
-    '.pins[] | select(.project == $p and .reference == $r) | .revision' "$(pins_store)")" || result=1
+  pins_launch pins-tag-repin "$proj" --image "$tag" hello-258 || result=1
+  require_launch_ok pins-tag-repin || result=1
+  assert_eq "the fresh tag pin boots the current B" "stamp=present" \
+    "$(pins_stamp pins-tag-repin)" || result=1
+  assert_eq "the tag holds Boot before the explicit import" "boot" \
+    "$(jq -r --arg r "$tag" --arg p "$proj_id" \
+      '.pins[] | select(.project == $p and .reference == $r) | .roles' \
+      "$(pins_store)")" || result=1
+  # No publication has run since the alias import created `alias-result`, and
+  # refresh/adoption/bare/override launches move Boot only: it is still this
+  # project's Output holder, which is what a record holding a role must survive.
+  assert_eq "the alias result still holds Output before this import" "output" \
+    "$(jq -r --arg r "localhost:$port/$repo:alias-result" --arg p "$proj_id" \
+      '.pins[] | select(.project == $p and .reference == $r) | .roles' \
+      "$(pins_store)")" || result=1
+  tag_old_rev="$(jq -r --arg r "$tag" --arg p "$proj_id" \
+    '.pins[] | select(.project == $p and .reference == $r) | .revision' \
+    "$(pins_store)")" || result=1
+  pins_sequence_before="$(jq -r '(.sequence // ([.pins[].revision] | max // 0))' "$(pins_store)")" || result=1
   DOCKER_HOST="$docker_host" DOCKER_CONFIG="$PINS_HOME/docker" \
     pins_avm "$proj" image import --docker "$CUSTOM_MARKER" --tag "$tag" \
     >"$WORK/pins-explicit-import.out" 2>&1 || {
@@ -7885,11 +7946,32 @@ custom_image_host_pins() {
     cat "$(pins_store)" 2>/dev/null || true
     result=1
   fi
-  assert_eq "the explicit import bumps the revision by one" \
-    "$(( pins_revision_before + 1 ))" \
+  # The import claims Output for the tag: one record that keeps Boot, the next
+  # global allocation, and never the previously observed token.
+  assert_eq "the explicit import draws the next global allocation" \
+    "$(( pins_sequence_before + 1 ))" \
     "$(jq -r --arg r "$tag" --arg p "$proj_id" \
       '.pins[] | select(.project == $p and .reference == $r) | .revision' \
       "$(pins_store)")" || result=1
+  if ! jq -e --arg r "$tag" --arg p "$proj_id" \
+    '[.pins[] | select(.project == $p and .reference == $r)] | length == 1
+     and .[0].roles == "boot-and-output"' "$(pins_store)" >/dev/null 2>&1; then
+    echo "    FAIL: the imported tag is not the single both-roles holder"
+    cat "$(pins_store)" 2>/dev/null || true
+    result=1
+  fi
+  assert_eq "the tag's new approval did not reuse the previous token" "no" \
+    "$([ "$tag_old_rev" = "$(jq -r --arg r "$tag" --arg p "$proj_id" \
+      '.pins[] | select(.project == $p and .reference == $r) | .revision' \
+      "$(pins_store)")" ] && echo yes || echo no)" || result=1
+  # This import *is* the intervening Output claim: the slot moved to $tag, so the
+  # displaced `alias-result` holds no role and is both known-absent now.
+  if jq -e --arg r "localhost:$port/$repo:alias-result" --arg p "$proj_id" \
+    '.pins[] | select(.project == $p and .reference == $r)' \
+    "$(pins_store)" >/dev/null 2>&1; then
+    echo "    FAIL: the displaced alias result record was not retired by this import"
+    result=1
+  fi
   reads_before="$(registry_read_count "$container")" || result=1
   pins_launch pins-explicit-import "$proj" --image "$tag" hello-258 || result=1
   require_launch_ok pins-explicit-import || result=1

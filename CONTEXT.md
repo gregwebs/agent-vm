@@ -530,6 +530,12 @@ cannot be read makes a bare refresh fail; `--image` and
 `AGENT_VM_IMAGE_TAG` still work, because they never select through the default
 tier.
 
+Until #543, refresh targets its current single selection, not the whole
+**active image set**. It preserves role knowledge and creates new approvals
+without claiming a role. Unresolved roles protect those approvals until the
+scope's corresponding first claim; with both roles resolved, a subsequent
+successful claim can retire an inactive approval.
+
 ## Image cache
 
 agent-vm's own microsandbox image cache (the ambient backend's cache dir,
@@ -589,7 +595,9 @@ builds an image; nothing else a launch reads can. See
 [ADR-0035](docs/adr/0035-consume-user-owned-boot-images.md). Winning is not
 authorization: every OCI source is recorded as an **image pin**, and a launch
 consumes the approved child digest. Precedence only chooses which pin's source
-is looked up. Local paths and launch builds remain unpinned.
+is looked up. Local paths and launch builds remain unpinned. Selection is
+recomputed per invocation; recorded use in the **active image set** is not
+another selection tier or an edit of the **default boot image**.
 
 ## Launch build
 
@@ -667,6 +675,37 @@ are never pinned.
 _Avoid_: "lock file"; "tag pin" (a pin names a child digest, not a tag); "cache
 entry" (cache evidence is not approval); "host-wide approval" (per project since
 [ADR-0063](docs/adr/0063-project-scoped-oci-image-approval.md)).
+
+An **image pin** remains while a role holds it or an unresolved role can still
+need it. Both known-absent roles justify retirement. A first claim of one role
+does not resolve the other. Its revision is an opaque approval token; role-only
+bookkeeping does not replace approved content or that token.
+
+## Active image set
+
+A **project**'s last successfully acquired OCI boot selection plus the output
+reference of its latest successful `image build` or `image import`, not a history
+of earlier selections or publications. Shared references remain needed while any
+active role needs them. The boot selection is the last OCI selection a launch or
+`setup` successfully acquired, including a one-off override, not the ambient
+next-launch selection. Roles are per Linux platform. There is no build-input
+role: tracking literal build inputs (#544) and Dockerfile dependencies (#545) is
+deferred and adds no placeholder here.
+
+A role is **unresolved** in a project/platform scope until that single-holder
+slot is first claimed. A successful claim resolves that role for every record in
+the scope, not just its target. A record can hold one role while its other role
+remains unknown. **Unclaimed** means it holds no known role, not that both roles
+are known-absent. Only both known-absent roles justify retirement; uncertainty
+can retain approvals beyond the two known holders until the missing role is
+claimed once. Refresh does not claim roles.
+
+Retirement discards approval authority, not shared cached bytes. Later use
+acquires the source under the ordinary cache-first policy; the old approval is
+not restored, although the digest may be the same.
+
+_Avoid_: approval history; running-session set; cache inventory.
+See [ADR-0068](docs/adr/0068-active-image-set.md).
 
 ## Image candidate
 
