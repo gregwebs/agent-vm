@@ -33,11 +33,9 @@ use crate::egress_policy::Allowance;
 use crate::image_pin::ProjectId;
 use crate::network::{LivePolicyPlan, LivePolicyPrecondition};
 use crate::project::ProjectDir;
-use crate::refusal::RefusalEntry;
-use crate::refusal::feed::LiveRefusals;
 
 use super::store::{RecordOutcome, StoreHandle};
-use super::{ProjectAllowance, ProjectView, SessionAllowance, grantable_destination};
+use super::{ProjectAllowance, ProjectView, SessionAllowance};
 
 /// The runtime's policy-replacement call, as the launcher holds it.
 pub(crate) type PolicyUpdater = Arc<
@@ -145,8 +143,7 @@ pub(crate) enum NextLaunchReason {
 pub(crate) enum GrantRefusalReason {
     HostProxyInUse,
     InterceptedPortsFixedAtLaunch,
-    /// The named refusal does not exist in this session, or cannot become an
-    /// allowance.
+    /// The request names no destination, or its spelling is not an allowance.
     NotAllowable {
         message: String,
     },
@@ -591,18 +588,28 @@ impl LiveAllowances {
     /// Grant one destination, to this session and optionally the project.
     pub(crate) async fn grant(
         &self,
-        live_refusals: &LiveRefusals,
-        id: Option<&str>,
         destination: Option<&str>,
         scope: GrantScope,
         now_ms: i64,
     ) -> GrantResult {
         let _op = self.op_lock.lock().await;
-        let entry = match resolve_entry(live_refusals, id, destination) {
-            Ok(entry) => entry,
-            Err(reason) => return GrantResult::Refused { reason },
+        let Some(text) = destination else {
+            return GrantResult::Refused {
+                reason: GrantRefusalReason::NotAllowable {
+                    message: "the request names no destination".to_owned(),
+                },
+            };
         };
-        let destination = entry;
+        let destination = match Allowance::parse(text) {
+            Ok(destination) => destination,
+            Err(error) => {
+                return GrantResult::Refused {
+                    reason: GrantRefusalReason::NotAllowable {
+                        message: format!("{error}"),
+                    },
+                };
+            }
+        };
 
         let (record, already, held) = {
             let state = lock(&self.state);
@@ -1211,37 +1218,4 @@ impl LiveAllowances {
         state.policy = policy;
         state.queued_for_boot = true;
     }
-}
-
-/// Resolve the destination one `grant` request names.
-///
-/// The CLI normally resolves `<ID>` itself and sends the spelling, so a refusal
-/// it cannot grant never reaches the socket. A request that names only the ID is
-/// answered here from the session's own live feed, through the same
-/// [`grantable_destination`] gate.
-fn resolve_entry(
-    live_refusals: &LiveRefusals,
-    id: Option<&str>,
-    destination: Option<&str>,
-) -> Result<Allowance, GrantRefusalReason> {
-    if let Some(text) = destination {
-        return Allowance::parse(text).map_err(|error| GrantRefusalReason::NotAllowable {
-            message: format!("{error}"),
-        });
-    }
-    let Some(id) = id else {
-        return Err(GrantRefusalReason::NotAllowable {
-            message: "the request names neither a refusal ID nor a destination".to_owned(),
-        });
-    };
-    let snapshot = live_refusals.snapshot();
-    let entry: Option<&RefusalEntry> = snapshot.entries.iter().find(|entry| entry.id == id);
-    let Some(entry) = entry else {
-        return Err(GrantRefusalReason::NotAllowable {
-            message: format!("no refusal {id} in this session"),
-        });
-    };
-    grantable_destination(entry).map_err(|error| GrantRefusalReason::NotAllowable {
-        message: error.line(),
-    })
 }

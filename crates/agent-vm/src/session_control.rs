@@ -591,11 +591,8 @@ struct VersionProbe {
 struct Request {
     v: u32,
     op: String,
-    /// `grant`: the refusal to allow. `revoke`: unused.
-    #[serde(default)]
-    id: Option<String>,
-    /// `grant`/`revoke`: the allowance spelling. The CLI resolves `<ID>` to this
-    /// before sending, so a refusal it cannot grant never reaches the socket.
+    /// `grant`/`revoke`: the allowance spelling. A `grant` that names none is
+    /// refused.
     #[serde(default)]
     destination: Option<String>,
     /// `grant`: `session` (default) or `project`. `revoke`: `session`,
@@ -804,13 +801,7 @@ async fn handle_connection(
                 }
             };
             let result = allowances
-                .grant(
-                    &live,
-                    request.id.as_deref(),
-                    request.destination.as_deref(),
-                    scope,
-                    feed::now_ms(),
-                )
+                .grant(request.destination.as_deref(), scope, feed::now_ms())
                 .await;
             let _ = write_reply(&mut writer, &Reply::Grant { v: version, result }).await;
         }
