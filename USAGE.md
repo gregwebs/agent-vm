@@ -2482,7 +2482,7 @@ one status row before the tool configuration:
 
 ```text
 credential store: not probed (0 tracked names)
-credential store: reachable
+credential store: reachable (read-only check)
 credential store: unavailable (<fixed failure advice>)
 credential store: not probed (inventory unavailable)
 ```
@@ -2492,9 +2492,12 @@ native lookup runs, and store health remains unknown. Otherwise doctor makes one
 reserved-account lookup, regardless of the number of tracked names, without
 reading user credentials, taking an inventory lock or creating files. A pending
 read emits one warning after about 2s and is abandoned after about 5s, even on a
-terminal (plus scheduler/output overhead). Reachable does **not** mean writable,
-unlocked, or that every item is accessible. An inventory error adds an escaped
-recovery diagnostic. See [ADR-0024](docs/adr/0024-host-secret-inventory.md#amendment-credential-store-diagnostics-agent-vm-379)
+terminal (plus scheduler/output overhead). `reachable (read-only check)` says
+only that this lookup answered: it does **not** mean writable, unlocked, or that
+every item is accessible. A write-testing probe is deliberately not run, not even
+by default — it would create and destroy a synthetic store item, which `doctor`
+never does, and could prompt — so the row names the check that ran instead. An
+inventory error adds an escaped recovery diagnostic. See [ADR-0024](docs/adr/0024-host-secret-inventory.md#amendment-credential-store-diagnostics-agent-vm-379)
 for the store boundary and platform limitations.
 
 The reserved account is never written by agent-vm and cannot be selected through
