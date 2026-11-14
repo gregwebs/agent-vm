@@ -583,6 +583,15 @@ struct SlotState {
     final_offered: bool,
     /// Set when the final snapshot has been written (or failed).
     finished: bool,
+    /// Test-only: the writer takes no job while this is set, so a test can put
+    /// a job in the slot and know it is still there when `Drop` runs. See
+    /// [`PersistHandle::hold_writer`].
+    #[cfg(test)]
+    holding: bool,
+    /// Test-only: the writer is parked at [`SlotState::holding`], having taken
+    /// nothing since.
+    #[cfg(test)]
+    held: bool,
 }
 
 enum Job {
@@ -608,6 +617,10 @@ impl Persister {
                 stopping: false,
                 final_offered: false,
                 finished: false,
+                #[cfg(test)]
+                holding: false,
+                #[cfg(test)]
+                held: false,
             }),
             wake: Condvar::new(),
         });
@@ -688,16 +701,62 @@ impl PersistHandle {
     }
 }
 
+#[cfg(test)]
+impl PersistHandle {
+    /// Park the writer before it takes its next job, and wait until it is there.
+    ///
+    /// A test that holds the log's lock only blocks a *write*, and a blocked
+    /// write gives up after `log::LOCK_WAIT`; a second later there is nothing
+    /// deterministic about what is pending. A parked thread is: it takes nothing
+    /// until [`PersistHandle::release_writer`], so the job a test posts next is
+    /// provably still pending at [`Persister::drop`]. `limit` only bounds a
+    /// hang, so a `false` says the thread took a job or never started.
+    pub(crate) fn hold_writer(&self, limit: Duration) -> bool {
+        let deadline = std::time::Instant::now() + limit;
+        let mut state = self.lock();
+        state.holding = true;
+        self.slot.wake.notify_all();
+        while !state.held {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (next, _) = self
+                .slot
+                .wake
+                .wait_timeout(state, deadline - now)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = next;
+        }
+        true
+    }
+
+    /// Let the parked writer take the next job.
+    pub(crate) fn release_writer(&self) {
+        let mut state = self.lock();
+        state.holding = false;
+        drop(state);
+        self.slot.wake.notify_all();
+    }
+}
+
 impl Drop for Persister {
     /// Nonblocking on purpose: a teardown must not wait for a disk. The thread
     /// is detached; a write in flight finishes on its own.
     ///
-    /// A pending *final* job is kept. `LiveSession::drop` may not block, so the
-    /// detached thread is the only writer left for the record that says the
-    /// session ended; discarding the job here lost that record whenever the
-    /// thread had not already taken it, which is a race the dropper wins on a
-    /// loaded machine (#572). A pending snapshot is still dropped: the final job
-    /// is the newer one, and a teardown has no reader left to serve.
+    /// A pending *final* job is kept, so the thread still has it to write after
+    /// this returns. `LiveSession::drop` may not block, so the detached thread is
+    /// the only writer left for the record that says the session ended, and
+    /// discarding the job here lost that record whenever the thread had not
+    /// already taken it — a race the dropper wins on a loaded machine (#572). A
+    /// pending snapshot is still dropped: the final job is the newer one, and a
+    /// teardown has no reader left to serve.
+    ///
+    /// Keeping it makes the record possible, not certain. It is written on the
+    /// thread's next iteration, and only if the process is still alive then, the
+    /// thread exists (`new` silently keeps none when the spawn fails), and the
+    /// write succeeds. Best effort is all a teardown that may not block can
+    /// promise.
     fn drop(&mut self) {
         let mut state = self.lock();
         state.stopping = true;
@@ -752,6 +811,17 @@ fn write_loop(slot: &Slot, dir: &SessionsDir) {
         let job = {
             let mut state = slot.state.lock().unwrap_or_else(|p| p.into_inner());
             loop {
+                // Test-only: take nothing while a test holds the writer, so
+                // what it posted is still pending when it drops the persister.
+                #[cfg(test)]
+                {
+                    while state.holding {
+                        state.held = true;
+                        slot.wake.notify_all();
+                        state = slot.wake.wait(state).unwrap_or_else(|p| p.into_inner());
+                    }
+                    state.held = false;
+                }
                 if let Some(job) = state.pending.take() {
                     break Some(job);
                 }

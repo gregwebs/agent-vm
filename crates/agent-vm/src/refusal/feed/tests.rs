@@ -557,19 +557,28 @@ fn drop_does_not_block() {
 /// block, so after it returns the detached thread is the only writer left for the
 /// record that says the session ended, and discarding the job here lost that
 /// record whenever the thread had not been scheduled yet (#572).
+///
+/// The writer is parked rather than blocked on the log's lock, because the lock
+/// only blocks a write and a blocked write gives up after `LOCK_WAIT`: a job that
+/// is pending a second from now is not a job that is pending at `Drop`. Parked,
+/// the thread takes nothing until the gate opens, so the final posted below is in
+/// the slot when `Drop` runs — on every run, and under any scheduler.
+///
+/// The write that follows is the same best effort as production's: it lands
+/// because this process is alive to let the thread run, not because `Drop` owes
+/// it.
 #[test]
 fn a_pending_final_survives_the_persister_s_own_drop() {
     let (_root, dir) = dir();
-    // Hold the log's lock so the writer is busy with the first job and the final
-    // is still only pending when the persister is dropped.
-    let held = crate::host_paths::open_lock_file(&dir.path().join("refusals.lock")).unwrap();
-    crate::host_paths::flock_exclusive(&held).unwrap();
     let persist = Persister::new(dir.clone());
-    persist.post(snapshot(0, false));
-    std::thread::sleep(Duration::from_millis(100));
+    let handle = persist.handle();
+    assert!(
+        handle.hold_writer(FINAL_WAIT),
+        "the writer took a job instead of parking, so nothing here is ordered"
+    );
     let wait = persist.post_final(snapshot(1, true));
     drop(persist);
-    drop(held);
+    handle.release_writer();
 
     assert!(
         wait.wait(FINAL_WAIT),
