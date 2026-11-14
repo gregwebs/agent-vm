@@ -167,7 +167,10 @@ fn describe_credential_store(report: &Result<Availability>) -> (String, Option<a
             false
         }
         Ok(Availability::Reachable) => {
-            section.push_str("reachable");
+            // A bare `reachable` read as "secrets work" on a host where every
+            // write failed with -60008 errSecWritePermErr, so the row names the
+            // check that ran (#381).
+            section.push_str("reachable (read-only check)");
             false
         }
         Ok(Availability::Unavailable(failure)) => {
@@ -1590,7 +1593,11 @@ mod tests {
                 "not probed (0 tracked names)",
                 false,
             ),
-            (Availability::Reachable, "reachable", false),
+            (
+                Availability::Reachable,
+                "reachable (read-only check)",
+                false,
+            ),
         ] {
             let (text, error) = describe_credential_store(&Ok(outcome));
             assert_eq!(
