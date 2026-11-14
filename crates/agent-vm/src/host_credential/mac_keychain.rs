@@ -98,7 +98,7 @@ pub(super) fn read(service: &'static str, budget: ReadBudget) -> Option<Candidat
         other => (Some(account), other),
     };
     let outcome = match found {
-        Lookup::Found(bytes) => super::parse_anthropic(&bytes),
+        Lookup::Found(bytes) => parsed_item(&bytes),
         Lookup::Absent => return None,
         Lookup::Failed(failure) => Err(Unusable::KeychainUnreadable(failure)),
     };
@@ -173,6 +173,63 @@ fn without_presentation_newline(mut bytes: Vec<u8>) -> Vec<u8> {
         bytes.pop();
     }
     bytes
+}
+
+/// What one looked-up item says.
+///
+/// `-w` prints the item's own data only while every byte is printable ASCII;
+/// any other byte makes it print a hex encoding of the whole item instead
+/// (ADR-0056's measured contract), and one trailing newline is enough. A
+/// credential JSON that gains such a byte would therefore be ineligible for
+/// good, so a failed parse gets one decode and one retry (#497).
+///
+/// One decode is the whole policy, because one decode settles the question.
+/// Plaintext can never be mistaken for hex (`{` is not a hex digit), so a
+/// document that parsed is never touched, and hex of hex decodes to hex, not
+/// JSON, so decoding again could only manufacture a credential out of an item
+/// that holds none. The decoded buffer is at most half the item, so the item
+/// cap still bounds it.
+fn parsed_item(bytes: &[u8]) -> Result<super::Parsed, Unusable> {
+    let outcome = super::parse_anthropic(bytes);
+    if outcome.is_ok() {
+        return outcome;
+    }
+    match hex_decoded(bytes) {
+        // The decoded parse's own outcome is the one that survives a second
+        // failure, including its reason: it describes the item rather than the
+        // presentation, so a hex-encoded non-credential reads as `missing
+        // claudeAiOauth` instead of "not valid JSON". Its variant is the one the
+        // file location reports for the same document (`HostCredentialMalformed`
+        // when the decoded bytes are not JSON, `MissingBearer` when they are JSON
+        // without a bearer), so no variant is added. The reason carries only
+        // serde's own error text, exactly like the file location's, so the
+        // no-token-bytes rule is unchanged.
+        Some(decoded) => super::parse_anthropic(&decoded),
+        None => outcome,
+    }
+}
+
+/// The item's bytes when `-w` presented them as hex: non-empty, even length,
+/// every byte a hex digit. Anything else is `None`, so an odd length, a stray
+/// digit or a plaintext JSON document keeps the ordinary outcome.
+fn hex_decoded(bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut decoded = Vec::with_capacity(bytes.len() / 2);
+    for &[high, low] in bytes.as_chunks::<2>().0 {
+        decoded.push(hex_digit(high)? << 4 | hex_digit(low)?);
+    }
+    Some(decoded)
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -334,6 +391,134 @@ mod tests {
         // the item's own byte.
         let inner = fake_security(dir.path(), "printf '%s\\n' 'IT\nEM'");
         assert_eq!(found(raw_lookup(&inner, None)), b"IT\nEM");
+    }
+
+    fn hex_encoded(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// What the adapter makes of a fake `security` whose `-w` output is
+    /// `presented`: the same lookup, trim and parse the reader performs.
+    fn outcome_of(dir: &Path, presented: &str) -> Result<Parsed, Unusable> {
+        let script = fake_security(dir, &format!("printf '%s\\n' '{presented}'"));
+        parsed_item(&found(raw_lookup(&script, None)))
+    }
+
+    /// The canary the fake `security` presented, through the parser: `Parsed` has
+    /// no `Debug`, so no assertion may print it.
+    fn token(outcome: Result<Parsed, Unusable>) -> (String, Option<i64>) {
+        match outcome {
+            Ok(parsed) => (parsed.access_token, parsed.expires_at_ms),
+            Err(other) => panic!("expected an eligible item, got {other}"),
+        }
+    }
+
+    /// The reason an ineligible item carries, without touching `Parsed`.
+    fn malformed_reason(outcome: Result<Parsed, Unusable>) -> String {
+        match outcome {
+            Err(Unusable::HostCredentialMalformed { why }) => why,
+            Err(other) => panic!("expected a malformed item, got {other}"),
+            Ok(parsed) => panic!(
+                "expected a malformed item; got {} bytes of a token",
+                parsed.access_token.len()
+            ),
+        }
+    }
+
+    /// #497: `security -w` hex-encodes an item whose data is not printable ASCII
+    /// (one extra byte is enough), so the whole adapter is exercised here — seam,
+    /// trim, decode — and the item must become a selectable credential again.
+    #[test]
+    fn a_hex_encoded_item_is_a_selectable_credential() {
+        let mut env = crate::test_env::guard();
+        let dir = tempfile::tempdir().unwrap();
+        env.set_var("USER", "agentvm-test-user");
+        let json = blob("HEX_KEYCHAIN_TOKEN", Some(1_700_000_000_000));
+        let presented = hex_encoded(json.as_bytes());
+        let script = fake_security(dir.path(), &format!("printf '%s\\n' '{presented}'"));
+        env.set_var("AGENT_VM_TEST_SECURITY", &script);
+
+        let candidate =
+            read("Claude Code-credentials", ReadBudget::Launch).expect("the item exists");
+        assert_eq!(
+            token(credential(Some(candidate))),
+            ("HEX_KEYCHAIN_TOKEN".into(), Some(1_700_000_000_000))
+        );
+    }
+
+    /// #497: the same encoding in uppercase digits is the same item, so it must
+    /// decode the same way.
+    #[test]
+    fn uppercase_hex_is_decoded() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = blob("UPPER_HEX_TOKEN", Some(1_700_000_000_000));
+        let presented = hex_encoded(json.as_bytes()).to_uppercase();
+
+        assert_eq!(
+            token(outcome_of(dir.path(), &presented)),
+            ("UPPER_HEX_TOKEN".into(), Some(1_700_000_000_000))
+        );
+    }
+
+    /// #497: the decode is a fallback, not a detour. A document that parses is
+    /// the credential, untouched.
+    #[test]
+    fn plaintext_json_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = blob("PLAINTEXT_TOKEN", Some(1_700_000_000_000));
+        assert_eq!(
+            token(outcome_of(dir.path(), &json)),
+            ("PLAINTEXT_TOKEN".into(), Some(1_700_000_000_000))
+        );
+    }
+
+    /// #497: a hex-shaped item that is not a credential stays ineligible, and
+    /// the surviving reason is the decoded parse's — it describes the item, so
+    /// `doctor` does not call a hex-encoded non-credential invalid JSON.
+    #[test]
+    fn hex_of_a_non_credential_stays_ineligible() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_credential = hex_encoded(br#"{"hello":true}"#);
+        assert_eq!(
+            malformed_reason(outcome_of(dir.path(), &not_a_credential)),
+            "missing claudeAiOauth (API-key-only login?)"
+        );
+
+        assert!(matches!(
+            outcome_of(dir.path(), "deadbeef"),
+            Err(Unusable::HostCredentialMalformed { .. })
+        ));
+    }
+
+    /// #497: only a non-empty, even-length, all-hex presentation is `-w`'s hex
+    /// form. Everything else keeps the ordinary ineligible outcome.
+    #[test]
+    fn odd_length_and_non_hex_presentations_stay_ineligible() {
+        let dir = tempfile::tempdir().unwrap();
+        for presented in ["abc", "hello world", "{not json"] {
+            assert!(
+                matches!(
+                    outcome_of(dir.path(), presented),
+                    Err(Unusable::HostCredentialMalformed { .. })
+                ),
+                "{presented:?} must not become a credential"
+            );
+        }
+    }
+
+    /// #497: exactly one decode. Hex of hex is itself a valid hex presentation,
+    /// so a decoder that ran again on its own output would find the JSON inside;
+    /// the policy is that an item holding hex instead of a credential is not a
+    /// credential.
+    #[test]
+    fn a_hex_shaped_item_is_decoded_only_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = blob("TWICE_ENCODED_TOKEN", Some(1_700_000_000_000));
+        let twice = hex_encoded(hex_encoded(json.as_bytes()).as_bytes());
+        assert!(
+            malformed_reason(outcome_of(dir.path(), &twice)).starts_with("not valid JSON: "),
+            "the decoded bytes are hex digits, not JSON"
+        );
     }
 
     /// F04: the 1 MiB cap is on the *item*. `security -w` adds a newline of
@@ -643,6 +828,21 @@ mod tests {
             }
         };
 
+        // The reader under test, reached through `cfg(test)`'s program seam: the
+        // wrapper's only job is to append the disposable keychain path, so the
+        // argv the reader builds stays the production shape. Created here because
+        // cases 3, 7 and 8 read through it.
+        let wrapper = dir.path().join("security");
+        std::fs::write(
+            &wrapper,
+            format!("#!/bin/sh\nexec {SECURITY_BIN} \"$@\" '{keychain_path}'\n"),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        env.set_var("AGENT_VM_TEST_SECURITY", &wrapper);
+        env.set_var("USER", "agentvm-test-user");
+
         // 1. Written as plaintext, read back as exactly the data plus the one
         //    newline `-w` appends.
         let plaintext_service = unique("plaintext");
@@ -669,10 +869,10 @@ mod tests {
 
         // 3. The one contract surprise this test exists to pin: `-w` prints the
         //    item **hex-encoded** when its data is not printable ASCII (a
-        //    trailing `\n` alone is enough), so such an item can never be read
-        //    as JSON. That is a safe failure — the candidate is ineligible and
-        //    the file location decides — not a silent misread, and Claude Code's
-        //    credential JSON is printable.
+        //    trailing `\n` alone is enough), so the raw output is never the JSON.
+        //    The adapter recognises that presentation and decodes it exactly once
+        //    (#497), so the item is selectable again — and Claude Code's real item
+        //    gains one non-ASCII byte without taking the whole location down.
         let nonprintable_service = unique("nonprintable");
         let nonprintable_hex: String = format!("{DATA}\n")
             .bytes()
@@ -693,6 +893,21 @@ mod tests {
             format!("{nonprintable_hex}\n"),
             "`security -w` hex-encodes data that is not printable ASCII"
         );
+        let nonprintable_candidate = read(
+            Box::leak(nonprintable_service.clone().into_boxed_str()),
+            ReadBudget::Launch,
+        )
+        .expect("the disposable keychain holds this item");
+        match nonprintable_candidate.outcome {
+            Ok(parsed) => {
+                assert_eq!(
+                    parsed.access_token, "CONTRACT-CANARY",
+                    "the non-printable item's canary must survive the decode"
+                );
+                assert_eq!(parsed.expires_at_ms, Some(1_700_000_000_000));
+            }
+            Err(unusable) => panic!("a hex-encoded item must parse, got {unusable}"),
+        }
 
         // 4. Two items under one service are told apart by account, so the
         //    account-qualified query is doing real work.
@@ -754,16 +969,6 @@ mod tests {
         //    explicit keychain appended by the seam's wrapper, yields exactly the
         //    item's bytes (one presentation newline removed) and a parseable
         //    credential.
-        let wrapper = dir.path().join("security");
-        std::fs::write(
-            &wrapper,
-            format!("#!/bin/sh\nexec {SECURITY_BIN} \"$@\" '{keychain_path}'\n"),
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
-        env.set_var("AGENT_VM_TEST_SECURITY", &wrapper);
-        env.set_var("USER", "agentvm-test-user");
         let candidate = read(
             Box::leak(plaintext_service.clone().into_boxed_str()),
             ReadBudget::Launch,
@@ -787,17 +992,27 @@ mod tests {
             Err(unusable) => panic!("the item must parse, got {unusable}"),
         }
 
-        // 8. A hex-encoded (non-printable) item is *ineligible* through the real
-        //    reader too: it does not become a credential, it does not panic, and
-        //    its message carries no item bytes.
-        let leaked_service: &'static str = Box::leak(nonprintable_service.clone().into_boxed_str());
-        let nonprintable_candidate =
-            read(leaked_service, ReadBudget::Launch).expect("the item exists");
-        match nonprintable_candidate.outcome {
-            Err(Unusable::HostCredentialMalformed { .. }) => {}
+        // 8. A hex-shaped item that is not a credential stays ineligible through
+        //    the real reader: one decode turns `deadbeef` into four bytes of
+        //    nothing, so it is neither a credential nor a panic, and the reason
+        //    carries no item bytes.
+        let shaped_service = unique("hex-shaped");
+        add("agentvm-test-user", &shaped_service, &["-w", "deadbeef"]);
+        let shaped_candidate = read(
+            Box::leak(shaped_service.clone().into_boxed_str()),
+            ReadBudget::Launch,
+        )
+        .expect("the disposable keychain holds this item");
+        match shaped_candidate.outcome {
+            Err(Unusable::HostCredentialMalformed { why }) => {
+                assert!(
+                    !why.contains("deadbeef"),
+                    "the reason must carry no item bytes"
+                );
+            }
             Err(other) => panic!("expected a malformed item, got {other}"),
             Ok(parsed) => panic!(
-                "a hex-encoded item must not parse; got {} bytes of a token",
+                "a hex-shaped non-credential must not parse; got {} bytes of a token",
                 parsed.access_token.len()
             ),
         }
