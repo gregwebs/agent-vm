@@ -272,6 +272,11 @@ impl CannotAllow {
                     .to_owned()
             }
             Self::SiteNotAllowable { site } => {
+                // The site is the runtime's wire value as a forged record may
+                // carry it, so it is escaped here, at the one place the variant
+                // becomes text — the same policy `RefusalEntry::reason()` uses.
+                // The caller prints this line as it is (#598).
+                let site = crate::config::escape_str(site);
                 format!(
                     "this refusal was observed at {site}, which this command cannot turn into an allowance"
                 )
