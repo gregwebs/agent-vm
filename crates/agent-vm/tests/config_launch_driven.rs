@@ -7560,9 +7560,7 @@ fn requests_runtime_input_noninterference() {
                 let notices: Vec<String> = stderr
                     .lines()
                     .filter(|l| {
-                        l.starts_with("==> Egress policy:")
-                            || l.starts_with("==> TLS interception:")
-                            || l.starts_with("==> Egress DNS:")
+                        l.starts_with("==> Egress policy:") || l.starts_with("==> Egress DNS:")
                     })
                     .map(str::to_owned)
                     .collect();
@@ -7702,14 +7700,13 @@ fn user_network_table_reaches_the_sandbox_policy() {
         "allowing 10.0.0.0/24 (persisted grants)",
         "allowing tcp://[192.168.10.0/24]:22 (persisted grants)",
         "==> Egress policy: allowing TLS to api.example.com on ports 443 (persisted grants)",
-        "==> Egress policy: hostname allowances are TLS-only (SNI and DNS verified; no plain HTTP)",
     ] {
         assert!(stderr.contains(text), "{stderr}");
     }
 }
 
-/// One grouped grant line for seven persisted hostnames, one shared security
-/// clause, and unchanged rules: detects per-name repetition returning.
+/// One grouped grant line for seven persisted hostnames, and unchanged rules:
+/// detects per-name repetition returning.
 #[test]
 fn grouped_hostname_egress_notices_preserve_policy_and_saved_config() {
     const NAMES: [&str; 7] = [
@@ -7770,13 +7767,6 @@ fn grouped_hostname_egress_notices_preserve_policy_and_saved_config() {
     assert_eq!(
         stderr.matches("==> Egress policy: allowing TLS to").count(),
         1
-    );
-    assert_eq!(
-        stderr
-            .matches("==> Egress policy: hostname allowances are TLS-only (SNI and DNS verified; no plain HTTP)")
-            .count(),
-        1,
-        "{stderr}"
     );
     assert_eq!(std::fs::read(&file).unwrap(), bytes);
     assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), mtime);
@@ -8335,10 +8325,8 @@ fn shipped_default_network_requests_default_deny() {
             for notice in ["==> Egress policy:", "==> Egress DNS:"] {
                 assert!(text.find(notice).unwrap() < report, "{text}");
             }
-            for notice in ["==> TLS interception:", "==> Guest egress proxy:"] {
-                if let Some(pos) = text.find(notice) {
-                    assert!(pos < report, "{text}");
-                }
+            if let Some(pos) = text.find("==> Guest egress proxy:") {
+                assert!(pos < report, "{text}");
             }
             assert!(report < text.find(CONFIG_MARKER).unwrap());
         }
@@ -8458,9 +8446,7 @@ fn shipped_default_network_requests_noninterference() {
             let notices: Vec<_> = text
                 .lines()
                 .filter(|line| {
-                    line.starts_with("==> Egress policy:")
-                        || line.starts_with("==> Egress DNS:")
-                        || line.starts_with("==> TLS interception:")
+                    line.starts_with("==> Egress policy:") || line.starts_with("==> Egress DNS:")
                 })
                 .map(str::to_owned)
                 .collect();
