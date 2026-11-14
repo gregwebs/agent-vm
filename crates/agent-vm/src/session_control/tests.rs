@@ -1077,6 +1077,69 @@ async fn protocol_v1_and_v2_coexist_and_reject_unknown_versions() {
     harness.shutdown().await;
 }
 
+/// P1b: a `v: 2` grant names a destination. One that names none is a refusal in
+/// the grant vocabulary, so the reply shape a client already handles is unchanged.
+#[tokio::test]
+async fn a_grant_that_names_no_destination_is_refused() {
+    let harness = Harness::new().await;
+    let mut client = Client::connect(&harness.socket).await;
+    client.send("{\"v\":2,\"op\":\"grant\"}").await;
+    match client.reply().await {
+        Reply::Grant {
+            v,
+            result: crate::allowances::GrantResult::Refused { reason },
+        } => {
+            assert_eq!(v, 2);
+            assert_eq!(
+                reason,
+                crate::allowances::GrantRefusalReason::NotAllowable {
+                    message: "the request names no destination".to_owned()
+                }
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    harness.shutdown().await;
+}
+
+/// #570 retired the refusal-ID form of `grant`: the v2 request names a
+/// destination and nothing else. `Request` denies unknown fields, so a client
+/// built against the old shape is refused as `bad-request` **before** any
+/// mutation — including when it also sends a valid destination, which is the
+/// case that would otherwise slip through and apply a grant.
+#[tokio::test]
+async fn a_grant_that_still_sends_a_refusal_id_is_refused_before_any_mutation() {
+    let harness = Harness::new().await;
+    let destination = "tcp://[203.0.113.10/32]:443";
+    for line in [
+        "{\"v\":2,\"op\":\"grant\",\"id\":\"ab12cd34ef56\"}".to_owned(),
+        format!(
+            "{{\"v\":2,\"op\":\"grant\",\"id\":\"ab12cd34ef56\",\"destination\":\"{destination}\"}}"
+        ),
+    ] {
+        let mut client = Client::connect(&harness.socket).await;
+        client.send(&line).await;
+        match client.reply().await {
+            Reply::Error { code, .. } => assert_eq!(code, "bad-request", "{line}"),
+            other => panic!("{line}: {other:?}"),
+        }
+    }
+    // The refused field was not silently ignored: nothing was granted.
+    let mut client = Client::connect(&harness.socket).await;
+    client.send("{\"v\":2,\"op\":\"allowances\"}").await;
+    match client.reply().await {
+        Reply::Allowances { allowances, .. } => assert!(
+            allowances
+                .session
+                .iter()
+                .all(|entry| entry.destination != destination),
+            "a refused request still granted {destination}"
+        ),
+        other => panic!("{other:?}"),
+    }
+    harness.shutdown().await;
+}
+
 /// P2: a grant before the runtime is attached is queued; the flush either
 /// promotes it or drops it with a notice naming the destination.
 #[tokio::test]
