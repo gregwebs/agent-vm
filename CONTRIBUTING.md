@@ -302,9 +302,12 @@ AGENT_VM_RELEASE_BIN=/absolute/release/bin/agent-vm \
 The group pins the vendored runtime this checkout built —
 `vendor/microsandbox/build/{msb,agentd,libkrunfw.5.dylib}` — so every selected
 row, the boot-free `harness-negative` one included, needs those files on disk. A
-signed bundle is not one of them, and `--dev` alone does not produce them: it
-writes `build/msb-dev` and `target/macos-dev/`, while only the release build
-writes `build/msb`. Build release, then dev, before the first custom-image run:
+signed bundle is not one of them. `--dev` publishes the same runtime as
+`build/msb-dev` and `target/macos-dev/`, so a dev-only worktree can run the group:
+the script takes `build/msb` when it exists and otherwise `build/msb-dev`, and
+says which one it bound. The release launcher rows still need a release build
+(`AGENT_VM_RELEASE_BIN`, default `target/macos/bin/agent-vm`) and refuse to skip
+without one, so build release and then dev before a run that selects them:
 
 ```bash
 ./script/build/macos.sh         # writes build/{msb,agentd,libkrunfw.5.dylib}
@@ -320,7 +323,7 @@ about the invocation has to hide the caller's terminal — the script detaches e
 driver process itself.
 
 `AGENT_VM_BIN`/`AGENT_VM_DEV_BIN` name that debug launcher, which every ordinary
-row runs against the release-built runtime; `AGENT_VM_RELEASE_BIN` (default
+row runs against the vendored runtime; `AGENT_VM_RELEASE_BIN` (default
 `target/macos/bin/agent-vm`) is the release launcher the retained-default,
 upgrade and host-pin rows run and refuse to skip. `AGENT_VM_E2E_ONLY_ROWS` takes
 exact `run_check` names, space separated. An unmatched name now **fails the run**
