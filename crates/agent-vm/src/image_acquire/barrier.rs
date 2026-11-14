@@ -26,6 +26,7 @@
 //! release it. One reference-free notice after a second of observed contention
 //! keeps a long wait from looking like a hang; the total remains unlimited.
 
+use std::io::Write as _;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -124,8 +125,12 @@ impl PublicationBarrier {
                 }
             }
             if !noticed && started.elapsed() >= NOTICE_AFTER {
+                // Non-consent notice, best effort: losing the text of a
+                // contention notice must not fail the publication it describes.
                 noticed = true;
-                eprintln!("{CONTENTION_NOTICE}");
+                let _ = writeln!(std::io::stderr(), "{CONTENTION_NOTICE}");
+                super::gate::checkpoint(super::gate::Stage::PublicationNoticeAttempted)
+                    .map_err(BarrierError::Wait)?;
             }
             // Cancellation-safe: dropping this future drops `file` and the
             // descriptor, so no orphan task can take the lock later.

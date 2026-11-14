@@ -441,6 +441,16 @@ impl fmt::Debug for BootImage {
     }
 }
 
+/// [`ImageLabel::for_refresh_holder`]'s input: the three spellings a held mask
+/// can have. A distinct type so the label is chosen by an exhaustive match on
+/// the **roles held**, never from a stored or computed string.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HolderRoles {
+    Boot,
+    Output,
+    BootAndOutput,
+}
+
 /// [`BootImage::label`]'s result: the safe text plus whether the underlying
 /// reference was redacted. Callers that build sanitized diagnostics (the debug
 /// config dump, progress rendering, acquisition-error chains) use `redacted` to
@@ -480,6 +490,24 @@ impl ImageLabel {
             text: crate::config::escape_str(reference),
             origin: None,
             redacted: false,
+        }
+    }
+
+    /// The fixed label for a recorded Boot/Output holder refreshed because it is
+    /// in use. Redacted on purpose: the report names the **role**, not a stored
+    /// reference, so no record-sourced reference can reach stdout, stderr, a
+    /// trace or an error chain (a deferred inventory, #609, is where references
+    /// are disclosed).
+    pub(crate) fn for_refresh_holder(roles: HolderRoles) -> Self {
+        let text = match roles {
+            HolderRoles::Boot => "the recorded boot image",
+            HolderRoles::Output => "the latest output image",
+            HolderRoles::BootAndOutput => "the recorded boot/output image",
+        };
+        Self {
+            text: text.to_string(),
+            origin: None,
+            redacted: true,
         }
     }
 
@@ -581,8 +609,13 @@ impl From<OverrideSource> for ImageSource {
     }
 }
 
-/// The `--image` argument, flattened into `run::Args`, `pull::Args` and
-/// `setup::Args` so the flag, its env binding and its help text exist once.
+/// The launch/setup `--image` argument, flattened into `run::Args` and
+/// `setup::Args` so the flag, its env binding and its help text exist once and
+/// every *selector* agrees.
+///
+/// `image refresh` deliberately does not flatten this type: its `--image` is a
+/// filter over the in-use set, not a boot selection, and its ambient input is
+/// the environment read independently (see [`crate::pull::Args`]).
 #[derive(clap::Args, Debug, Default)]
 pub(crate) struct ImageArgs {
     /// Boot this image instead of the configured one.

@@ -27,6 +27,12 @@ use std::time::Duration;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcquisitionStage {
     PublicationContended,
+    /// The one-time publication-contention notice was *attempted* while the
+    /// exclusive publication lock was still held by a peer.
+    PublicationNoticeAttempted,
+    /// The one-time reference-contention notice was attempted on the source
+    /// guard's contended path.
+    ReferenceNoticeAttempted,
     BeforeLock,
     LockContended,
     Snapshot,
@@ -45,6 +51,8 @@ impl AcquisitionStage {
     fn wire(self) -> &'static str {
         match self {
             Self::PublicationContended => "publication-contended",
+            Self::PublicationNoticeAttempted => "publication-notice-attempted",
+            Self::ReferenceNoticeAttempted => "reference-notice-attempted",
             Self::BeforeLock => "before-lock",
             Self::LockContended => "lock-contended",
             Self::Snapshot => "snapshot",
@@ -63,6 +71,8 @@ impl AcquisitionStage {
     fn parse(text: &str) -> Option<Self> {
         [
             Self::PublicationContended,
+            Self::PublicationNoticeAttempted,
+            Self::ReferenceNoticeAttempted,
             Self::BeforeLock,
             Self::LockContended,
             Self::Snapshot,
@@ -218,6 +228,21 @@ impl AcquisitionGate {
             checkpoint.reply(GateReply::Continue);
         }
         panic!("`{}` never arrived", stage.wire());
+    }
+
+    /// Receive the next checkpoint, if one arrives within the bound.
+    ///
+    /// For a pump that must answer an unknown sequence of checkpoints (a whole
+    /// acquisition) and single out one of them. `None` means the gate went quiet
+    /// for [`BOUND`] or the child closed it.
+    pub fn next(&mut self) -> Option<(AcquisitionStage, Checkpoint)> {
+        let stream = self.received.recv_timeout(BOUND).ok()?;
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().expect("clone the gate stream"))
+            .read_line(&mut line)
+            .ok()?;
+        let observed = AcquisitionStage::parse(line.trim())?;
+        Some((observed, Checkpoint { stream }))
     }
 
     /// Assert that no further checkpoint is pending within `within`. Used to

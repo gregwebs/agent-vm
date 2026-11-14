@@ -15,6 +15,9 @@ its named-result approval; revisions are global tokens; post-commit reporting
 issues are success warnings, not "approval was not updated"). Adds contracts to
 [ADR-0018](0018-machine-checked-boundary-contracts.md).
 
+S4 targeting/reporting is implemented in **0.7.55** (#543), slice S4 of #532;
+D10 supersedes D6's single-selection/arbitrary-target behavior.
+
 ## Context
 
 S1 made approvals per project. S2 made the default image per project. Neither
@@ -106,13 +109,12 @@ rollback after rename is promised.
 
 ### D6. Refresh preserves knowledge
 
-Refresh/adoption keeps the S2 target selection, prompt-free consent, rendering,
-frozen candidate, CAS and establishment/adoption. It never claims or resolves a
-role and never retires. A new refresh record holds no role; an unresolved slot
+Refresh follows D10's in-use worklist, preserving S2 prompt-free consent, frozen
+candidates, CAS and eligible default actions. It never claims or resolves a role
+and never retires. A new refresh record holds no role; an unresolved slot
 protects it until that slot's first claim. With both slots resolved it is
 known-inactive and the next successful claim in the scope can retire it. Default
 adoption moves the bookmark; the launch records the newly acquired boot choice.
-Active-membership iteration awaits #543.
 
 ### D7. Retirement creates fresh authority, not restored bytes
 
@@ -147,9 +149,52 @@ the existing shared 4 MiB encoded file; references keep the 4096-byte limit.
 Final state is checked after justified retirement. Because unresolved roles
 protect records, S3 does **not** bound a project to two retained pins: until both
 slots resolve, first-use-only histories can accumulate; after both resolve,
-claims retire known-inactive records, and refresh can add inactive ones pending
-the next claim. Full or byte-exceeding proposed saves fail closed as `full()`;
+claims retire known-inactive records, and refresh can add unheld
+ambient/adoption pins pending the next claim. Full or byte-exceeding proposed saves fail closed as `full()`;
 unresolved records are never evicted.
+
+### D10. Refresh the invocation's in-use references independently
+
+`image refresh` refreshes exactly the invocation's in-use OCI references for the
+canonical captured command directory and the measured host Linux platform. One
+read-only scope snapshot (one `observe_slot(HostRead::Never)`) is taken before any
+registry work; the whole file is still decoded and validated, so a malformed
+foreign role join is damage rather than something to filter away. The worklist
+is frozen from that snapshot plus one ambient decision:
+
+- the ambient next-launch operation (env > user > project > default), even when
+  no approval exists for it, and
+- every record holding a Boot/Output role in exactly this project/platform scope,
+
+deduplicated by canonical reference. Cache aliases, foreign scopes and
+uncertainty-retained no-role approvals are excluded. The worklist is not a role
+claim or lease.
+
+On default adoption the ambient operation acquires H instead of unheld D
+(ADR-0067 D7); held D remains an independent target and H is deduplicated if
+already held. `--image REF` filters the original ambient-reference/held-reference
+union and never grants adoption or establishment; a nonmember is refused before
+any registry request, naming no value. `AGENT_VM_IMAGE_TAG` is the ambient
+selection, not a filter; an empty value is unset and a non-Unicode value is a
+typed failure.
+
+An unfiltered selection/offer/initial-health error refuses before freeze, registry
+work or writes; it is not a failed-key placeholder. After freeze, each operation
+resolves its source once, renders any replacement, revalidates only its frozen
+child and commits through the existing CAS with `RoleClaim::Keep` and its own
+atomic save: failure preserves only that transaction, successful siblings remain
+and may change effective defaults/content, and exit 1 can accompany a committed
+adoption. ADR-0067 D9's host-first recommendation seed remains the sole
+host-authority exception. Adoption carries H's snapshot observation to the
+existing CAS: an observed but vanished H is stale, genuinely absent H permits
+Insert, and live equal content reconciles under S3. No tracked-input role exists
+in S4.
+
+Reporting is one ordered row per operation plus a summary on stdout, with fixed
+role/default labels and full digests; a closed report sink is a bounded warning,
+never a failed approval, while a consent render failure remains precommit-fatal
+for its own operation with an operation-scoped reason. USAGE's "Refreshing
+in-use images" is the user-facing contract.
 
 ## Serialized shape
 
@@ -198,7 +243,7 @@ re-encoded without the new fields until a real save.
 | preceding | publish Z | X deleted | The missing slot resolved. |
 | both resolved; X both | publish Y | X Boot; Y Output | Shared Boot protects X. |
 | preceding | prepare Y | Y both; X deleted | X lost its last role. |
-| both resolved; B Boot/O Output | refresh U | U unheld | Refresh claims and prunes nothing. |
+| both resolved; B Boot/O Output | `AGENT_VM_IMAGE_TAG=U` refresh | U unheld | Refresh claims and prunes nothing; a `--image U` refresh would be refused as a nonmember. |
 | preceding | prepare B | B Boot; U deleted | A same-target claim retires known-inactive records. |
 
 ## Alternatives rejected
@@ -237,7 +282,7 @@ re-encoded without the new fields until a real save.
   `none`/`boot+output` (both unknown) or `boot+output`/`none`. They are never
   collapsed into one `unclaimed` label, and `UNRESOLVED` is joined from the scope
   even for a record that holds a role. That listing is not implemented here.
-- S4 (#543) refresh-over-the-active-set, S5a (#544) pinned build inputs and S5b
+- S5a (#544) pinned build inputs and S5b
   (#545) Dockerfile coverage remain separate; no placeholders are added.
 
 ## Verification
@@ -270,3 +315,12 @@ the spec's: AC21 scopes the publication ABA to changed content, and AC22 makes
 warm verification revision-exact. So an equal-digest publication is
 byte-identical to one that started after that state existed — which is also why
 it is not a lifetime-exact freshness promise.
+
+S4 adds the refresh worklist proof obligations: the `refresh_member` kernel is
+machine-checked (ADR-0018) over its facts, and the adapters — the strict read-only
+scope snapshot, canonical reference equality, the exact project/platform/variant
+scope and the held mask — have concrete tests, including an unheld ambient
+selection, a retained-but-unheld exclusion and both foreign-scope controls. The
+named membership, adoption-substitution, observed-H retirement, absent-H insert,
+damaged-selection refusal, partial-progress and closed-pipe CLI rows are listed in
+the S4 plan (§7).

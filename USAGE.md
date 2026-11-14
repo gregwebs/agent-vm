@@ -71,10 +71,11 @@ image build --tag REF [OPTIONS] [CONTEXT]
                                     explicitly build + import a user Dockerfile
 image import (--docker REF [--tag REF] | --input FILE --tag REF)
                                     import a finished image into agent-vm's cache
-image refresh [--image REF]        acquire and approve the selected OCI image for
-                                    this project (asks nothing), without booting a
-                                    VM; in a project with its own default, adopt
-                                    the host's default
+image refresh [--image REF]        refresh the ambient boot operation and recorded
+                                    boot/output holders (host adoption substitutes
+                                    for an unheld default), or one in-use REF;
+                                    approve without asking, without booting;
+                                    retain partial successes
 image set-default --image REF      set the host's starting default for projects
                                     that have none
 tools print [NAME...]               print the built-in tool definitions (all, or
@@ -119,16 +120,80 @@ verb is forwarded to the tool verbatim (and a built-in verb rejects it). There
 is no compatibility alias for a flag agent-vm no longer has: before the verb it
 is an unknown option, after it the tool sees it.
 
-`image refresh` is **boot-free native acquisition**: it resolves the selected
-reference (or `--image REF`), checks its current manifest, reuses unchanged
-cached layers, and publishes a complete host-Linux cache entry using the
-ambient microsandbox cache with native registry auth, trust and managed HTTP
-policy. It creates no sandbox, boots no guest and touches no project or running
-guest. Selection, precedence and recovery are unchanged. Every OCI selection
-is also a **project-scoped image approval** (next section); refresh is one of the
-two explicit operations allowed to re-resolve a source and ask for consent. A
-launch never checks a tag for movement: there is no launch-time update check,
-flag, environment variable, banner or marker.
+`image refresh` is **boot-free native acquisition** of this project's in-use OCI
+references on the host platform. Without `--image`, it refreshes the ambient
+boot operation and every recorded boot/output holder; repeated acquired
+references run once. When adopting host default H, the ambient operation
+acquires H instead of unheld project default D; D is not re-resolved. A
+still-held D is refreshed independently. `--image REF` refreshes one member of
+the ambient-reference/held-reference set without changing boot selection or
+adopting a default. `AGENT_VM_IMAGE_TAG` chooses the ambient boot reference, not
+a refresh filter. Refresh resolves each source, reuses unchanged cached layers
+and approves its validated host child without asking or reading stdin. It
+creates no sandbox and boots no guest. Launches never check tags for movement.
+Local rootfs/disk targets remain refused; launch them with
+`agent-vm --image PATH <tool>` instead.
+
+### Refreshing in-use images
+
+Every refresh invocation freezes its worklist before any registry request: the
+ambient next-launch operation plus every record holding the Boot or Output role
+in this project on this host platform, deduplicated by canonical reference. A
+retained approval holding no role is not a target just because it is retained.
+The ambient operation runs first, the rest follow in canonical reference order.
+Each operation resolves its own source once, renders its own change, and saves
+its own approval: there is no batch transaction.
+
+One result row is printed per planned operation, then a summary:
+
+```text
+==> refresh [1/2] registry.example/app:dev (linux/arm64): changed sha256:OLD -> sha256:NEW; default=unchanged
+==> refresh [2/2] the latest output image (linux/arm64): unchanged sha256:DIGEST; default=unchanged
+==> image refresh: 2 succeeded, 0 failed
+```
+
+Rows use the escaped reference for an explicit target, the fixed
+`the default boot image` label for the ambient default-tier operation, and the
+fixed role labels `the recorded boot image`, `the latest output image` or `the
+recorded boot/output image` for holders. Digests are always full
+`algorithm:hex`. Exit status is 0 when every planned operation succeeded, 1 when
+any failed or the command refused before the worklist, and 2 for a usage error.
+
+Successful approvals remain committed if another operation fails; refresh does
+not roll the batch back. Failure preserves only that operation's approval, roles
+and project-default transaction, not the whole invocation's effective boot
+choice or content. A successful sibling can change that state: exit 1 can
+accompany a committed adoption of H followed by failure refreshing held D, or a
+failed adoption followed by successful independent refresh of still-selected D.
+The sole documented host-authority exception is ADR-0067 D9: a
+recommendation-sourced first operation writes the measured host seed before its
+pin save, so that seed may remain if the pin save fails; the operation's project
+default, approval and roles stay unchanged. A default-selection, adoption-offer
+or initial-health failure before the worklist is frozen refuses the unfiltered
+command before registry requests or authority writes, with no per-target rows; a
+filtered held reference needs no host-default read. "Nothing was acquired or
+approved" is a pre-worklist refusal, never a batch-failure promise. A
+build/import failure still preserves the previous active output set.
+
+To acquire and approve a reference not yet in use, run
+`agent-vm setup --image REF --no-verify`; this records a Boot use. Explicit
+`image build` and `image import` approve and record their own output. Build
+inputs are not tracked yet (#544/#545).
+
+A closed report sink does not turn completed approvals into failures: the rows
+that could not be written are lost and one fixed warning is attempted. A consent
+render that cannot be written still refuses its own operation before any save,
+with `the image approval change for this refresh operation could not be shown;
+this operation committed no approval or project-default change` — even when a
+sibling already committed. Publication diagnostics are unchanged.
+
+`--image REF` targets only references currently in use by this project on the
+host platform; a reference outside that set is refused before any registry
+request (status 1), naming no value:
+
+```text
+`agent-vm image refresh --image REF` targets only references currently in use by this project on the host platform; the requested reference is not in that set. To acquire and approve a new boot reference, run `agent-vm setup --image REF --no-verify`; `image build` and `image import` approve their own output references. Nothing was acquired or approved.
+```
 
 `image set-default` is the renamed deliberate default operation (below), with
 the same acquisition-before-publication safety. Refresh and set-default accept
@@ -139,6 +204,9 @@ image (local-path launches are still fine), while its optional verification
 guest is separate and unchanged. A bare `image refresh` with no override still
 reacquires your retained digest, not the tag it was originally selected from.
 
+Bare `image refresh` performs the ambient boot operation plus recorded
+boot/output holders, with the adoption substitution described above; its
+`--image` is a target filter, not a selection override.
 `agent-vm setup` acquires the selected image and, unless `--no-verify` is given,
 boots a throwaway sandbox and verifies **every tool your configuration
 declares** by running its `command` with `--version` (a direct argv exec,
@@ -283,8 +351,8 @@ What this buys:
   loses it; justified active-set retirement, moving `HOME` or resetting the
   store removes approval authority.
 - **Retained approvals do not move during launch/setup.** `agent-vm image
-  refresh` re-resolves and approves its selection; `image set-default` resolves
-  its target only. Retired references have no approval and use the cache-first
+  refresh` re-resolves and approves its in-use targets; `image set-default`
+  resolves its target only. Retired references have no approval and use the cache-first
   first-pin path; on a cache miss launch/setup can therefore resolve changed
   registry content.
 - **Host checks are not guest compatibility.** Platform, manifest and digest
@@ -327,7 +395,8 @@ Metadata-only changes preserve that approval's revision; old revisions remain
 valid. Retiring and reapproving identical content does not authorize a stale
 operation against its earlier approval.
 
-A first pin or an unchanged digest prints nothing and needs no consent. To avoid
+A first pin or an unchanged digest has no precommit replacement render; refresh
+still prints its result row. Invoking refresh is its consent. To avoid
 replacing an approval's content, do not run `image refresh` for that reference,
 or select it by digest (`repo@sha256:…`), which is an integrity failure if it
 ever resolves to different content. That preserves the content, not the record:
@@ -363,25 +432,49 @@ image overrides and running sessions are unchanged. This project keeps its own
 default boot image; run `agent-vm image refresh` here to adopt this one.
 
 $ agent-vm image refresh                                 # in project P
-==> the default boot image is the image this configuration boots from
 Adopting the host's default boot image (linux/arm64) in this project:
   old: sha256:<the digest P boots>
   new: sha256:<the digest the host record names>
 ==> this project now uses the host's default boot image
-==> the default boot image acquired into the microsandbox image cache
+==> refresh [1/1] the default boot image (linux/arm64): approved none -> sha256:<new>; default=adopted sha256:<old> -> sha256:<new>
+==> image refresh: 1 succeeded, 0 failed
 ```
 
 - A refresh adopts only a host record that **exists**. With none, it re-verifies
-  the project's own default and changes nothing, so a launcher upgrade whose
-  initial recommendation changed never moves a project default.
-- A host record that names the project's own default changes nothing and prints
-  no digests.
-- To re-verify the project's own default rather than adopt the host's, pass it
-  explicitly: `agent-vm image refresh --image "$(agent-vm image show | sed -n 's/^Image: //p')"`.
+  the project's own default and adopts no bookmark, so a launcher upgrade whose
+  initial recommendation changed never moves a project default. Its ordinary
+  result rows still print full digests, and independently held Boot/Output
+  references are still refreshed.
+- A host record that names the project's own default adopts no bookmark and
+  renders no adoption notice. The row still prints the verified digest, and
+  independently held references still refresh.
+- Only the bare ambient default-tier operation establishes or adopts a project
+  default. Adoption supersedes unheld D without re-resolving it; a still-held
+  previous default is refreshed independently. An explicit filter, even equal to
+  the default, never establishes or adopts. Outcome preservation and exit status
+  follow [Refreshing in-use images](#refreshing-in-use-images), not an
+  invocation-wide promise to keep the previous default on failure.
+- To re-verify a project default, make it the ambient selection
+  (`AGENT_VM_IMAGE_TAG="$(agent-vm image show | sed -n 's/^Image: //p')" agent-vm
+  image refresh`); typing it as `--image` only works while it is also the
+  ambient selection or a recorded holder.
 - A bare `image refresh` whose tool configuration cannot be read **fails**
   (status 1) instead of falling through to the default tier, because that fall
-  through could establish a default the project never chose. `--image REF` and
-  `AGENT_VM_IMAGE_TAG` still work and approve that reference for the project.
+  through could establish a default the project never chose:
+
+  ```text
+  configured image settings could not be read; image refresh does not fall back to the default boot image while the configuration is unreadable, so nothing was acquired or approved; fix it (agent-vm doctor reports what is wrong), set AGENT_VM_IMAGE_TAG to the intended boot reference, or pass --image REF for a recorded in-use reference
+  ```
+
+  Two recoveries still work, and each warns once and establishes/adopts
+  nothing: `AGENT_VM_IMAGE_TAG` naming the intended boot reference, or
+  `--image REF` for a recorded holder. A readable `image` field inside an
+  otherwise broken catalog is not membership evidence; an arbitrary `--image`
+  value stays refused.
+
+  ```text
+  ==> WARNING: configured image settings could not be read; refreshing only references proven in use, without establishing or adopting a project default
+  ```
 - A `setup` whose tool configuration cannot be read still warns and falls back,
   but it does not establish the project's default; the next default-tier use
   with a readable configuration does.
@@ -444,12 +537,14 @@ approval's revision. The global high-water survives retirement. Old stores are
 read without migration; the next real save allocates above their highest live
 revision and persists the sequence. Sequence exhaustion fails closed.
 
-Until #543, refresh keeps its current single-selection behavior, never claims
-a boot/output role, and preserves existing role knowledge. An inactive new
-refresh approval is protected by any unresolved role. Once both slots are
-resolved, it is known-inactive and can be retired by the next successful claim
-in that scope. Refresh itself performs no retirement. Default adoption changes
-the bookmark; launch/setup subsequently records the newly acquired boot choice.
+Refresh includes the ambient boot operation and recorded boot/output holders,
+without claiming a role, resolving a slot or retiring an approval. A no-role
+historical approval is not a refresh target merely because it is retained.
+Default adoption substitutes H for unheld D; a held D remains a target. Adoption
+moves the bookmark; launch/setup subsequently records the newly acquired Boot
+choice. An inactive new refresh approval is protected by any unresolved role.
+Once both slots are resolved, it is known-inactive and can be retired by the
+next successful claim in that scope. Refresh itself performs no retirement.
 
 Only the two current holders remain immediately after a claim with both roles
 resolved. This is not a universal two-record bound: unresolved approvals and
@@ -462,9 +557,26 @@ listing is a follow-up, not a command introduced by this release.
 
 See [ADR-0068](docs/adr/0068-active-image-set.md).
 
+#### Behavior changes in 0.7.55
+
+No reset or migration is needed. `image refresh` now refreshes the invocation's
+in-use references instead of one selection. See
+[Refreshing in-use images](#refreshing-in-use-images) for the contract.
+
+| Change | What changed |
+|---|---|
+| membership | A bare refresh refreshes the ambient boot operation plus every recorded Boot/Output holder in this project on this host platform. Retained approvals holding no role are no longer targets. |
+| adoption substitution | An ambient default-tier operation that adopts host default H acquires H instead of the unheld project default D; D is not re-resolved. A still-held D is refreshed independently. |
+| `--image` | `--image REF` is a **filter** over the ambient-reference/held-reference set, never a selection override, and it never establishes or adopts a default. A reference outside that set is refused (status 1) before any registry request; use `agent-vm setup --image REF --no-verify` to acquire a new boot reference. |
+| environment | `AGENT_VM_IMAGE_TAG` is read independently of `--image`; it chooses the ambient boot reference and does not narrow the worklist. An empty value is unset; a non-Unicode value is status 1 with a typed diagnostic. |
+| partial progress | Each operation is its own atomic save. A failure preserves only that operation's approval, roles and project-default transaction; later operations still run and the exit status is 1. Pre-worklist refusals report nothing per target. |
+| reporting | One result row per planned operation (`==> refresh [i/n] … ; default=…`) plus a summary, on stdout. A closed output sink warns once instead of failing a committed approval; a failed consent render still refuses its own operation with an operation-scoped reason. |
+| broken config | A bare refresh with an unreadable configuration still refuses, but the allowed recoveries are now narrower: a known `AGENT_VM_IMAGE_TAG` selection, or `--image REF` for a recorded holder. An arbitrary typed reference is refused. |
+
 #### Behavior changes in 0.7.51
 
-No reset or migration is needed. These are the user-visible changes:
+Historical (superseded by 0.7.55 above where they differ). No reset or
+migration is needed. These were the user-visible changes:
 
 | Change | What changed |
 |---|---|
@@ -483,14 +595,14 @@ replacement command or its new output:
 | # | Change | Replacement command or new output |
 |---|---|---|
 | B1 | `image set-default --image B` followed by a launch in an **established** project boots that project's own default, not B. Before, every project moved to B. | Run `agent-vm image refresh` in that project to adopt B. The set-default notice names this command when the invoking project keeps its own default. Also stated in `image set-default --help`. |
-| B2 | A bare `image refresh` in an established project whose default differs from the host record **adopts** the host record. Before, a default-tier refresh only re-verified its digest. | To re-verify only the project's own default, pass it explicitly: `agent-vm image refresh --image <ref>`, with `<ref>` the `Image:` line of `agent-vm image show`. |
+| B2 | A bare `image refresh` in an established project whose default differs from the host record **adopts** the host record. Before, a default-tier refresh only re-verified its digest. | Still valid in 0.7.55 when the reference is ambient or held: pass it with `AGENT_VM_IMAGE_TAG=<ref> agent-vm image refresh`, with `<ref>` the `Image:` line of `agent-vm image show`. |
 | B3 | `image refresh` never asks. A moved mutable tag's approval is replaced without a prompt, even without a terminal, and stdin is never read. Before, a terminal prompt was required, and a non-terminal run failed with status 1. The render text changes from `Replace the approved image for … in this project?` plus `Approve this exact image change? [y/N]` to `Replacing the approved image for … in this project:` (old/new digests unchanged). | To keep an approval, do not run `image refresh` for that reference, or select it by digest (`repo@sha256:…`). |
 | B4 | `--yes` is removed from `image refresh` and `image set-default`. Passing it exits 2 (`unexpected argument`). | Drop the flag. Both verbs now do what `--yes` did, without it. |
-| B5 | `image set-default` no longer approves its typed tag in the invoking project. A later `--image repo:b` launch in that project first-pins the tag (cache-first) instead of consuming an approval set-default made. | `agent-vm image refresh --image repo:b` approves the tag's current content for the project. |
+| B5 | `image set-default` no longer approves its typed tag in the invoking project. A later `--image repo:b` launch in that project first-pins the tag (cache-first) instead of consuming an approval set-default made. | **Superseded in 0.7.55:** use `agent-vm setup --image repo:b --no-verify` to acquire and approve a new boot reference; it claims Boot without editing configuration. |
 | B6 | After upgrading, a project that has not yet booted the default tier is not established. Until its first default-tier launch, `setup` or `image refresh`, it follows the host record, so a `set-default` in that window changes what it boots (as before). | Launch it, or run `agent-vm image refresh` in it, before changing the host default. |
 | B7 | The first default-tier use of each project writes `image-pins.json` (to record its default), even when its approval is already warm. A launch that 0.7.46 ran read-only now fails if the store is unwritable, or reports a full store when it is at its bounds (4096 records, 4 MiB). | Keep `$HOME/.config/agent-vm/` writable. For a full store, see "Damaged or reset approvals". |
 | B8 | `image show` may print `Source: project default` with `File: $HOME/.config/agent-vm/image-pins.json`. `doctor` prints a new `project default:` row, and its `selected (without --image):` row may read `project default [<path>]`. | New output; parsers must accept the new label and row. |
-| B9 | A bare `image refresh` (no `--image`, no `AGENT_VM_IMAGE_TAG`) with a tool configuration that cannot be read fails (status 1) with a fixed error. Before, it warned and fell back to the default boot image. With `--image REF` or `AGENT_VM_IMAGE_TAG` it still warns and works. `setup` still warns and falls back, but a `setup` made while the configuration is unreadable no longer establishes the project's default; the next default-tier use with a readable configuration does. | Fix the configuration (`agent-vm doctor` reports what is wrong), or pass `--image REF`. |
+| B9 | A bare `image refresh` (no `--image`, no `AGENT_VM_IMAGE_TAG`) with a tool configuration that cannot be read fails (status 1) with a fixed error. Before, it warned and fell back to the default boot image. With `--image REF` or `AGENT_VM_IMAGE_TAG` it still warns and works. `setup` still warns and falls back, but a `setup` made while the configuration is unreadable no longer establishes the project's default; the next default-tier use with a readable configuration does. | Fix the configuration (`agent-vm doctor` reports what is wrong), or set `AGENT_VM_IMAGE_TAG` to the intended boot reference. **Superseded in 0.7.55:** an arbitrary `--image REF` is refused — see [Refreshing in-use images](#refreshing-in-use-images). |
 | B10 | New notices: `image set-default` prints two sentences (host starting choice, then the invoking project). An adopting refresh prints `==> this project now uses the host's default boot image` on stdout. | New output. |
 
 #### If an approved image is reported unavailable

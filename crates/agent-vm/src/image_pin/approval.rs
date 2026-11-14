@@ -63,9 +63,35 @@ pub(super) fn approve_refresh(
 ) -> Result<Approval> {
     std::io::stderr()
         .write_all(request.render().as_bytes())
-        .map_err(|_| render_failed())?;
+        .map_err(|_| refresh_render_failed())?;
     Ok(Approval::replacement(candidate, expected))
 }
+
+/// A refresh consent render that could not be written.
+///
+/// Its text is **operation-scoped** and names no reference, because a refresh
+/// invocation may still commit other operations: the batch-wide “nothing was
+/// approved” wording would be false the moment a sibling succeeded. It is also
+/// never chained as a cause: the legacy message must not reappear through
+/// `{error:#}` in a report row. Only refresh replacement/adoption renders use
+/// this; publication keeps its own diagnostic.
+#[derive(Debug)]
+pub(super) struct RefreshRenderFailed;
+
+impl std::fmt::Display for RefreshRenderFailed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(REFRESH_RENDER_FAILED_REASON)
+    }
+}
+
+impl std::error::Error for RefreshRenderFailed {}
+
+fn refresh_render_failed() -> anyhow::Error {
+    anyhow!(RefreshRenderFailed)
+}
+
+/// The exact operation-scoped reason a refresh render failure reports.
+pub(crate) const REFRESH_RENDER_FAILED_REASON: &str = "the image approval change for this refresh operation could not be shown; this operation committed no approval or project-default change";
 
 /// Consent to move one project's established default to the host's retained
 /// default (R7), rendered when the content differs.
@@ -78,14 +104,20 @@ pub(super) fn adopt(
     proposed: ImmutableImageRef,
     candidate: &ValidatedCandidate,
     old: &ManifestDigest,
+    observed_host: Option<ApprovedPin>,
 ) -> Result<DefaultAdoption> {
     if old != &candidate.digest {
         let render = adoption_render(&HostLinuxPlatform::host(), old, &candidate.digest);
         std::io::stderr()
             .write_all(render.as_bytes())
-            .map_err(|_| render_failed())?;
+            .map_err(|_| refresh_render_failed())?;
     }
-    Ok(DefaultAdoption::new(expected, proposed, candidate))
+    Ok(DefaultAdoption::new(
+        expected,
+        proposed,
+        candidate,
+        observed_host,
+    ))
 }
 
 /// Full digests, the approval key's platform, and no source: an adoption's

@@ -42,21 +42,6 @@ impl Args {
             | ImageCmd::SetDefault(_) => Ok(()),
         }
     }
-
-    /// Bind `refresh`'s own `--image` to clap's value source.
-    ///
-    /// Only `refresh` carries a launch-image selection, and only its *own*
-    /// subcommand matches are authoritative. Reconciling against the group or
-    /// top-level matches would lose the origin and the empty-environment rule
-    /// (issue #189), silently turning `AGENT_VM_IMAGE_TAG=` into a present value
-    /// or a typed flag into an environment one.
-    pub(crate) fn reconcile_image_args(&mut self, image_matches: &clap::ArgMatches) {
-        if let ImageCmd::Refresh(args) = &mut self.cmd
-            && let Some(refresh) = image_matches.subcommand_matches("refresh")
-        {
-            args.image.reconcile(refresh);
-        }
-    }
 }
 
 #[derive(Subcommand)]
@@ -68,11 +53,10 @@ pub(crate) enum ImageCmd {
     /// override. Read-only and offline: no cached image, Docker, msb, registry
     /// or runtime is consulted, and nothing is built, imported or booted.
     Show,
-    /// Acquire the selected OCI image into the image cache without booting a VM.
-    ///
-    /// Re-resolves the reference, approves what it resolves for this project
-    /// without asking, and may adopt the host's default boot image in a project
-    /// that has its own; it never boots.
+    #[command(
+        about = "Refresh this project's in-use OCI references without booting a VM",
+        long_about = "Re-resolve and approve the ambient boot operation and all recorded boot/output holders without asking. When adopting the host default, that operation acquires it instead of the old unheld project default; a held old default is refreshed independently. Use --image REF to refresh one in-use reference without changing selection or adopting a default. Keep successful approvals if another target fails; exit 1 if any target fails."
+    )]
     Refresh(crate::pull::Args),
     /// Acquire an OCI image and make it the starting default for projects that
     /// have none yet. Established projects keep their own default.
@@ -126,10 +110,9 @@ pub(crate) async fn run(args: Args, catalog: Catalog, images: ConfiguredImages) 
         ImageCmd::Show => bail!("image show must be dispatched before runtime setup"),
         ImageCmd::Refresh(args) => {
             // Refresh forwards the *original* carried configuration so its own
-            // broken-config rules apply: an explicit `--image`/env still works,
-            // a bare refresh refuses the default-tier fall-through (R8).
-            crate::pull::run(args, catalog, images).await?;
-            Ok(0)
+            // broken-config rules apply: a known ambient selection or a proven
+            // in-use target can recover, a bare refresh cannot (R8).
+            crate::pull::run(args, catalog, images).await
         }
         ImageCmd::SetDefault(args) => {
             crate::boot_image::upgrade::run(args).await?;

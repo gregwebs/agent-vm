@@ -151,10 +151,25 @@ impl Harness {
             None => self.run(&["image", "refresh"]),
         }
     }
+    /// A bare refresh whose ambient selection is `target`: the seeding shape
+    /// that approves a reference **without** claiming a role.
+    ///
+    /// `--image` is a target filter over references already in use (ADR-0068
+    /// D10), so a fixture that needs a first approval no launch/import recorded
+    /// must make its reference the ambient next-launch selection.
+    fn refresh_as_ambient(&self, target: &str) -> Output {
+        let mut cmd = self.command();
+        cmd.env("AGENT_VM_IMAGE_TAG", target)
+            .args(["image", "refresh"]);
+        bounded(&mut cmd)
+    }
+    fn approve_ambient_fixture(&self, target: &str) {
+        success(&self.refresh_as_ambient(target));
+    }
     /// A pin for `target` **and** a host record naming it: S1's two set-default
     /// side effects, as the two explicit commands that write them now (#541).
     fn pin_and_set_default(&self, target: &str) {
-        success(&self.refresh(Some(target)));
+        self.approve_ambient_fixture(target);
         success(&self.set_default(target));
     }
     fn record(&self) -> PathBuf {
@@ -200,12 +215,18 @@ fn collect_bounded(child: std::process::Child) -> Output {
     result
         .expect("native CLI exceeded 60s; inspect read-only keyring / managed-policy prerequisites")
 }
-fn success(out: &Output) {
-    assert!(
-        out.status.success(),
-        "{}",
+/// Everything one refresh delivered. A per-operation failure is a result row on
+/// stdout (ADR-0068 D10), so an oracle about the *reason* must read both sinks;
+/// reading stderr alone would pass on an empty string.
+fn delivered(out: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
-    );
+    )
+}
+fn success(out: &Output) {
+    assert!(out.status.success(), "{}", delivered(out));
 }
 /// R9: every path under the isolated state root **except** the native image
 /// cache, with file sizes. A boot-free acquisition must not add sandbox
@@ -1033,7 +1054,7 @@ fn refresh_reacquires_a_moving_tag_without_destroying_cached_artifacts() {
     });
     let tag = format!("{}/images:mutable", server.host);
     let _pin_a = server.image("images", "mutable", &a);
-    success(&h.refresh(Some(&tag)));
+    success(&h.refresh_as_ambient(&tag));
     assert_eq!(
         cached_manifest_digest(&h.cache(), &tag),
         a.written.manifest_digest
@@ -1044,7 +1065,7 @@ fn refresh_reacquires_a_moving_tag_without_destroying_cached_artifacts() {
     // A same-content refresh re-resolves the manifest but downloads no layer
     // blob and rewrites no layer bytes.
     let before = server.requests().len();
-    success(&h.refresh(Some(&tag)));
+    success(&h.refresh_as_ambient(&tag));
     old.unchanged();
     let layer_paths: Vec<String> = server.requests()[before..]
         .iter()
@@ -1061,7 +1082,7 @@ fn refresh_reacquires_a_moving_tag_without_destroying_cached_artifacts() {
     // artifacts byte-identical, and mark the acquired digest.
     let _pin_b = server.image("images", "mutable", &b);
     let before_move = server.requests().len();
-    success(&h.refresh(Some(&tag)));
+    success(&h.refresh_as_ambient(&tag));
     assert_eq!(
         cached_manifest_digest(&h.cache(), &tag),
         b.written.manifest_digest
@@ -1077,7 +1098,7 @@ fn refresh_reacquires_a_moving_tag_without_destroying_cached_artifacts() {
     old.unchanged();
     // R9: a further refresh allocates no runtime guest state outside the cache.
     let state = non_cache_state(&h);
-    success(&h.refresh(Some(&tag)));
+    success(&h.refresh_as_ambient(&tag));
     assert_eq!(
         non_cache_state(&h),
         state,
@@ -1193,7 +1214,7 @@ fn refresh_refuses_local_targets_before_any_state() {
     for target in ["/private/tmp/rootfs", "./rootfs"] {
         let home = tree_snapshot(&h.home);
         let state = tree_snapshot(&h.state);
-        let out = h.refresh(Some(target));
+        let out = h.refresh_as_ambient(target);
         assert_eq!(out.status.code(), Some(1), "{target}");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
@@ -1310,7 +1331,7 @@ fn refresh_same_tag_failure(mode: RefreshFailure, retained: bool) {
     let tag = format!("{}/images:refresh-target", server.host);
     let tag_route = "/v2/images/manifests/refresh-target".to_string();
     server.image("images", "refresh-target", &a);
-    success(&h.refresh(Some(&tag)));
+    success(&h.refresh_as_ambient(&tag));
     complete(&h.cache(), &tag);
 
     // Ambient selection baselines: an explicit refresh may not rewrite them.
@@ -1348,7 +1369,8 @@ fn refresh_same_tag_failure(mode: RefreshFailure, retained: bool) {
             let ready = server.stall_blob(&format!("/v2/images/blobs/{}", b.written.layer_digest));
             let mut child = h
                 .command()
-                .args(["image", "refresh", "--image", &tag])
+                .env("AGENT_VM_IMAGE_TAG", &tag)
+                .args(["image", "refresh"])
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn()
@@ -1364,20 +1386,20 @@ fn refresh_same_tag_failure(mode: RefreshFailure, retained: bool) {
             server.release_blob();
             let out = collect_bounded(child);
             assert_eq!(server.errors(), Vec::<String>::new(), "{context}");
+            let text = delivered(&out);
             assert!(
-                String::from_utf8_lossy(&out.stderr).contains("error decoding response body"),
-                "{context}: a truncated body must surface as a native stream error"
+                text.contains("error decoding response body"),
+                "{context}: a truncated body must surface as a native stream error: {text}"
             );
             assert!(
                 !out.status.success(),
-                "{context}: a truncated blob stream must fail:\n{}",
-                String::from_utf8_lossy(&out.stderr)
+                "{context}: a truncated blob stream must fail:\n{text}"
             );
         }
         RefreshFailure::RefusedRegistry => {
             drop(server);
-            let out = h.refresh(Some(&tag));
-            let stderr = String::from_utf8_lossy(&out.stderr);
+            let out = h.refresh_as_ambient(&tag);
+            let stderr = delivered(&out);
             assert!(
                 !out.status.success(),
                 "{context}: an unreachable registry must fail:\n{stderr}"
@@ -1393,13 +1415,12 @@ fn refresh_same_tag_failure(mode: RefreshFailure, retained: bool) {
             server.deny_manifest(&tag_route);
             let denied_before = server.denied_requests().len();
             let requests_before = server.count();
-            let out = h.refresh(Some(&tag));
+            let out = h.refresh_as_ambient(&tag);
+            let stderr = delivered(&out);
             assert!(
                 !out.status.success(),
-                "{context}: a denied manifest must fail:\n{}",
-                String::from_utf8_lossy(&out.stderr)
+                "{context}: a denied manifest must fail:\n{stderr}"
             );
-            let stderr = String::from_utf8_lossy(&out.stderr);
             assert!(
                 stderr.contains("Not authorized") && stderr.contains(&tag_route),
                 "{context}: the failure must name the denied manifest: {stderr}"
@@ -1454,8 +1475,8 @@ fn refresh_same_tag_failure(mode: RefreshFailure, retained: bool) {
             } else {
                 server.image("images", "refresh-target", &bad);
             }
-            let out = h.refresh(Some(&tag));
-            let stderr = String::from_utf8_lossy(&out.stderr);
+            let out = h.refresh_as_ambient(&tag);
+            let stderr = delivered(&out);
             assert!(
                 !out.status.success(),
                 "{context}: the invalid re-point must fail:\n{stderr}"
@@ -1539,7 +1560,7 @@ fn refresh_killed_during_download_preserves_cached_a_and_releases_the_guard() {
         let a = h.image(&ArchiveSpec::default());
         let tag = format!("{}/images:refresh-target", server.host);
         server.image("images", "refresh-target", &a);
-        success(&h.refresh(Some(&tag)));
+        success(&h.refresh_as_ambient(&tag));
         let fallback = retained.then(|| {
             let d = h.image(&ArchiveSpec {
                 marker: "s2-kill-retained".into(),
@@ -1562,7 +1583,8 @@ fn refresh_killed_during_download_preserves_cached_a_and_releases_the_guard() {
         let ready = server.stall_blob(&format!("/v2/images/blobs/{}", b.written.layer_digest));
         let mut child = h
             .command()
-            .args(["image", "refresh", "--image", &tag])
+            .env("AGENT_VM_IMAGE_TAG", &tag)
+            .args(["image", "refresh"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -1610,7 +1632,7 @@ fn bare_refresh_failure_preserves_the_default_tier_key() {
             ));
             assert_eq!(h.selected(), pin);
         } else {
-            success(&h.refresh(Some(&pin)));
+            success(&h.refresh_as_ambient(&pin));
             assert!(!h.record().exists());
         }
         complete(&h.cache(), &pin);
@@ -1683,7 +1705,7 @@ fn refresh_resolves_an_immutable_index_to_the_host_child_without_retaining_m() {
         "the fixture must be a real index"
     );
 
-    success(&h.refresh(Some(&index_pin)));
+    success(&h.refresh_as_ambient(&index_pin));
     // Requested key I: complete metadata naming the resolved host child M.
     assert_eq!(cached_manifest_digest(&h.cache(), &index_pin), child_digest);
     let metadata: serde_json::Value = serde_json::from_slice(
@@ -1770,7 +1792,7 @@ impl Coordinated {
         let a = h.image(&ArchiveSpec::default());
         let tag = format!("{}/images:coordinated", server.host);
         server.image("images", "coordinated", &a);
-        success(&h.refresh(Some(&tag)));
+        success(&h.refresh_as_ambient(&tag));
         complete(&h.cache(), &tag);
         (Self { h, server, tag }, a)
     }
@@ -1809,11 +1831,11 @@ impl Coordinated {
     /// A contending refresh of the same tag. The explicit refresh is its own
     /// consent, so it carries no flag (#541).
     fn spawn(&self, gate: &AcquisitionGate) -> Peer {
-        Peer::spawn(
-            self.h.command(),
-            gate,
-            &["image", "refresh", "--image", &self.tag],
-        )
+        // The reference is this invocation's ambient selection: `--image` may
+        // only filter a reference already in use (ADR-0068 D10).
+        let mut command = self.h.command();
+        command.env("AGENT_VM_IMAGE_TAG", &self.tag);
+        Peer::spawn(command, gate, &["image", "refresh"])
     }
 }
 
@@ -1960,7 +1982,7 @@ fn coordination_postvalidation_failure_restores_the_winners_bytes() {
         assert_guard_held(&c.guard());
         restored.reply(GateReply::Continue);
         let out = q.wait();
-        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stderr = delivered(&out);
         assert!(!out.status.success(), "{initial}: Q must fail:\n{stderr}");
         assert!(
             stderr.contains("restored") && stderr.contains("platform"),
@@ -2139,7 +2161,7 @@ fn coordination_restore_failure_reports_both_stages_and_recovers() {
         gate.expect(AcquisitionStage::BeforeRestore)
             .reply(GateReply::FailRestore);
         let out = q.wait();
-        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stderr = delivered(&out);
         assert!(!out.status.success(), "the restore failure must fail Q");
         assert!(
             stderr.contains("platform")
@@ -2158,7 +2180,7 @@ fn coordination_restore_failure_reports_both_stages_and_recovers() {
         assert!(!c.h.record().exists());
         // Recovery: the tag serves B again and a clean acquisition succeeds.
         c.server.image("images", "coordinated", &b);
-        let recovered = c.h.refresh(Some(&c.tag));
+        let recovered = c.h.refresh_as_ambient(&c.tag);
         success(&recovered);
         assert_eq!(
             cached_manifest_digest(&c.h.cache(), &c.tag),
@@ -2245,7 +2267,7 @@ fn coordination_guard_scope_is_one_reference_in_the_actual_cache() {
     let unrelated_pin = c.server.image("images", "unrelated", &unrelated);
     // One successful acquisition must progress while T is locked. Do not hide
     // transport/acquisition failures with a retry: they need their own diagnosis.
-    success(&c.h.refresh(Some(&unrelated_pin)));
+    success(&c.h.refresh_as_ambient(&unrelated_pin));
     complete(&c.h.cache(), &unrelated_pin);
     assert_guard_held(&guard);
 
@@ -2282,8 +2304,9 @@ fn coordination_guard_scope_is_one_reference_in_the_actual_cache() {
     let mut p_cmd = first.command();
     p_cmd
         .env("AGENT_VM_SHARE_MSB_CACHE", "1")
-        .env("AGENT_VM_MSB_CACHE_DIR", &shared);
-    let p = Peer::spawn(p_cmd, &gate, &["image", "refresh", "--image", &tag]);
+        .env("AGENT_VM_MSB_CACHE_DIR", &shared)
+        .env("AGENT_VM_IMAGE_TAG", &tag);
+    let p = Peer::spawn(p_cmd, &gate, &["image", "refresh"]);
     gate.expect(AcquisitionStage::BeforeLock)
         .reply(GateReply::Continue);
     let p_snapshot = gate.expect(AcquisitionStage::Snapshot);
@@ -2291,8 +2314,9 @@ fn coordination_guard_scope_is_one_reference_in_the_actual_cache() {
     let mut q_cmd = second.command();
     q_cmd
         .env("AGENT_VM_SHARE_MSB_CACHE", "1")
-        .env("AGENT_VM_MSB_CACHE_DIR", &shared);
-    let q = Peer::spawn(q_cmd, &gate, &["image", "refresh", "--image", &tag]);
+        .env("AGENT_VM_MSB_CACHE_DIR", &shared)
+        .env("AGENT_VM_IMAGE_TAG", &tag);
+    let q = Peer::spawn(q_cmd, &gate, &["image", "refresh"]);
     gate.expect(AcquisitionStage::BeforeLock)
         .reply(GateReply::Continue);
     gate.expect(AcquisitionStage::LockContended)
@@ -2339,7 +2363,7 @@ fn refresh_reports_real_guard_contention_once_and_releases_into_success() {
     server.image("images", "guard-notice", &a);
 
     // Silent immediate acquisition: no contention, so no notice.
-    let immediate = h.refresh(Some(&tag));
+    let immediate = h.refresh_as_ambient(&tag);
     success(&immediate);
     let immediate_stderr = String::from_utf8_lossy(&immediate.stderr);
     assert!(
@@ -2363,7 +2387,8 @@ fn refresh_reports_real_guard_contention_once_and_releases_into_success() {
 
     let mut command = h.command();
     command
-        .args(["image", "refresh", "--image", &tag])
+        .env("AGENT_VM_IMAGE_TAG", &tag)
+        .args(["image", "refresh"])
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     let mut child = command.spawn().expect("spawn the contending refresh");
@@ -2446,8 +2471,8 @@ fn refresh_reports_real_guard_contention_once_and_releases_into_success() {
     let other = format!("{}/images:guard-unopenable", server.host);
     let unopenable = guard_path(&cache, &other);
     fs::create_dir_all(&unopenable).unwrap();
-    let out = h.refresh(Some(&other));
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let out = h.refresh_as_ambient(&other);
+    let stderr = delivered(&out);
     assert!(!out.status.success(), "{stderr}");
     assert!(
         stderr.contains("opening the image-cache coordination lock failed"),
@@ -2636,7 +2661,10 @@ fn postvalidation_faults_keep_explicit_causes_and_redact_default_operations() {
         let mut command = h.command();
         command.env("AGENT_VM_DEBUG_CONFIG", "1");
         let args = match operation {
-            "explicit-refresh" => vec!["image", "refresh", "--image", pin.as_str()],
+            "explicit-refresh" => {
+                command.env("AGENT_VM_IMAGE_TAG", &pin);
+                vec!["image", "refresh"]
+            }
             "default-refresh" => {
                 command.env("AGENT_VM_TEST_DEFAULT_IMAGE", &pin);
                 vec!["image", "refresh"]
@@ -2912,6 +2940,27 @@ fn refresh_selection_and_broken_config_recovery_acquire_only_the_winning_tier() 
         }
         let out = bounded(&mut command);
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        if row.cli {
+            // ADR-0068 D10: `--image` filters the ambient-reference/held-reference
+            // union; it never selects a boot image and cannot approve a reference
+            // nothing uses. Refresh's target eligibility is therefore separate
+            // from the selection precedence the other rows prove.
+            assert_eq!(out.status.code(), Some(1), "{}: {stdout}", row.name);
+            assert!(
+                String::from_utf8_lossy(&out.stderr)
+                    .contains("targets only references currently in use"),
+                "{}: {}",
+                row.name,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(server.count(), 0, "{}: no registry request", row.name);
+            assert!(
+                !h.home.join(".config/agent-vm/image-pins.json").exists(),
+                "{}: no authority write",
+                row.name
+            );
+            continue;
+        }
         if row.name == "broken-default" {
             // R8/B9: a bare refresh refuses the default-tier fall-through, so
             // nothing is acquired, approved or written.
@@ -2987,13 +3036,15 @@ fn refresh_rejects_complete_cache_result_identity_disagreement_and_restores_meta
     let tag = format!("{}/images:identity", server.host);
     server.image("images", "identity", &a);
     let pin_b = server.image("images", "b", &b);
-    success(&h.refresh(Some(&tag)));
-    success(&h.refresh(Some(&pin_b)));
+    success(&h.refresh_as_ambient(&tag));
+    success(&h.refresh_as_ambient(&pin_b));
     let cache = h.cache();
     let metadata = cache.image_metadata_path(&tag.parse::<Reference>().unwrap());
     let prior = fs::read(&metadata).unwrap();
     let mut gate = AcquisitionGate::new(h.root.path());
-    let peer = Peer::spawn(h.command(), &gate, &["image", "refresh", "--image", &tag]);
+    let mut command = h.command();
+    command.env("AGENT_VM_IMAGE_TAG", &tag);
+    let peer = Peer::spawn(command, &gate, &["image", "refresh"]);
     gate.expect(AcquisitionStage::BeforeLock)
         .reply(GateReply::Continue);
     gate.expect(AcquisitionStage::Snapshot)
@@ -3019,7 +3070,7 @@ fn refresh_rejects_complete_cache_result_identity_disagreement_and_restores_meta
     restored.reply(GateReply::Continue);
     let out = peer.wait();
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("identity"));
+    assert!(delivered(&out).contains("identity"));
     assert!(!h.record().exists());
     complete(&cache, &tag);
     h.no_fallback();
@@ -3127,7 +3178,7 @@ fn validated_token_separates_source_and_acquired_identity() {
     let a = h.image(&ArchiveSpec::default());
     let tag = format!("{}/images:opaque", server.host);
     server.image("images", "opaque", &a);
-    success(&h.refresh(Some(&tag)));
+    success(&h.refresh_as_ambient(&tag));
     let found = receipts(&h);
     assert_eq!(found.len(), 1, "one acquisition, one receipt: {found:?}");
     let receipt = &found[0].1;
@@ -3148,7 +3199,7 @@ fn validated_token_separates_source_and_acquired_identity() {
     // The positive control for the same policy: an immutable source does record
     // its association, because only that is ever consulted.
     let pin = format!("{}/images@{}", server.host, a.written.manifest_digest);
-    success(&h.refresh(Some(&pin)));
+    success(&h.refresh_as_ambient(&pin));
     let bound = receipts(&h)
         .into_iter()
         .map(|(_, value)| value)
@@ -3180,7 +3231,7 @@ fn a_full_binding_set_keeps_the_acquisition_successful() {
     let first = server.index_under_algorithm("images", "bound-one", &index_bytes, "sha256");
     let second = server.index_under_algorithm("images", "bound-two", &index_bytes, "sha384");
     assert_ne!(first, second);
-    success(&h.refresh(Some(&first)));
+    success(&h.refresh_as_ambient(&first));
     let (path, receipt) = receipts(&h)
         .into_iter()
         .find(|(_, value)| value["acquired_reference"] == child.as_str())
@@ -3206,7 +3257,7 @@ fn a_full_binding_set_keeps_the_acquisition_successful() {
     fs::write(&path, &bytes).unwrap();
 
     let requests_before = server.count();
-    success(&h.refresh(Some(&second)));
+    success(&h.refresh_as_ambient(&second));
     assert!(
         server.requests()[requests_before..]
             .iter()
@@ -3246,7 +3297,7 @@ fn direct_manifest_acquisition_binds_each_digest_algorithm() {
         server.image("images", "algo", &a);
         let manifest = &a.blobs[&a.written.manifest_digest];
         let pin = server.put_manifest_under_algorithm("images", manifest, algorithm);
-        success(&h.refresh(Some(&pin)));
+        success(&h.refresh_as_ambient(&pin));
         let digest = pin.rsplit('@').next().unwrap().to_owned();
         assert_eq!(cached_manifest_digest(&h.cache(), &pin), digest);
         // The canonical repo@digest entry is complete and preserves the
@@ -3282,7 +3333,7 @@ fn index_acquisition_preserves_the_immutable_source_binding() {
         let index_pin = server.index_under_algorithm("images", "indexed", &bytes, algorithm);
         let index_digest = index_pin.rsplit('@').next().unwrap().to_owned();
         assert_ne!(index_digest, a.written.manifest_digest);
-        success(&h.refresh(Some(&index_pin)));
+        success(&h.refresh_as_ambient(&index_pin));
         // The *source* key keeps the resolved child; the canonical child key is
         // complete under its own digest.
         assert_eq!(
@@ -3328,7 +3379,7 @@ fn lying_header_and_body_are_integrity_failures() {
         &claimed,
     );
     let pin = format!("{}/images@{claimed}", server.host);
-    let out = h.refresh(Some(&pin));
+    let out = h.refresh_as_ambient(&pin);
     assert!(
         !out.status.success(),
         "a lying digest header must fail:\n{}",
@@ -3355,7 +3406,7 @@ fn receipt_is_cache_only_and_alias_overwrite_is_repaired() {
     let a = h.image(&ArchiveSpec::default());
     let tag = format!("{}/images:receipt", server.host);
     server.image("images", "receipt", &a);
-    success(&h.refresh(Some(&tag)));
+    success(&h.refresh_as_ambient(&tag));
     let canonical = format!("{}/images@{}", server.host, a.written.manifest_digest);
     let found = receipts(&h);
     assert_eq!(found.len(), 1, "one acquisition, one receipt: {found:?}");
@@ -3411,8 +3462,19 @@ fn receipt_is_cache_only_and_alias_overwrite_is_repaired() {
             .all(|(_, value)| value["acquired_reference"] != canonical),
         "no receipt for A may remain; the import's own receipt describes B"
     );
+    // A cache repair is a property of the shared cache, not of one project, so it
+    // runs in a project that holds only this approval: the project above also
+    // records an Output holder whose reference came from a local archive and has
+    // no registry route to refresh from.
+    let repair_project = h.root.path().join("receipt-repair");
+    fs::create_dir_all(&repair_project).unwrap();
     let requests_before = server.count();
-    success(&h.refresh(Some(&canonical)));
+    let mut repair = h.command();
+    repair
+        .current_dir(&repair_project)
+        .env("AGENT_VM_IMAGE_TAG", &canonical)
+        .args(["image", "refresh"]);
+    success(&bounded(&mut repair));
     assert!(
         server.requests()[requests_before..]
             .iter()
@@ -3451,17 +3513,15 @@ fn gate_io_failure_is_a_failure_not_a_skip() {
     let missing = h.root.path().join("no-such-gate.sock");
     let mut cmd = h.command();
     cmd.env("AGENT_VM_TEST_ACQUIRE_GATE", &missing)
-        .args(["image", "refresh", "--image", &tag]);
+        .env("AGENT_VM_IMAGE_TAG", &tag)
+        .args(["image", "refresh"]);
     let out = bounded(&mut cmd);
     assert!(
         !out.status.success(),
         "a missing gate listener must fail the acquisition"
     );
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("test gate failed"),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let text = delivered(&out);
+    assert!(text.contains("test gate failed"), "{text}");
     assert_eq!(
         server.count(),
         0,
@@ -3491,7 +3551,7 @@ fn only_mutating_verbs_create_the_pin_store_and_the_gate_control_is_bounded() {
     let before = fs::read(&pins).ok();
     success(&h.run(&["image", "show"]));
     assert_eq!(fs::read(&pins).ok(), before);
-    success(&h.refresh(Some(&tag)));
+    success(&h.refresh_as_ambient(&tag));
     let approved = fs::read_to_string(&pins).expect("refresh approved the acquired content");
     let value: serde_json::Value = serde_json::from_str(&approved).unwrap();
     assert_eq!(value["version"], 2);
@@ -3671,7 +3731,7 @@ fn alternate_algorithm_headers_do_not_substitute_content_or_identity() {
             }
         }
         let pin = format!("{}/images@{requested}", server.host);
-        success(&h.refresh(Some(&pin)));
+        success(&h.refresh_as_ambient(&pin));
         // Whatever digest the header reports, the bytes behind the requested
         // key are the requested ones, and the receipt binds the requested
         // immutable source to that acquired content.
@@ -3729,7 +3789,7 @@ fn alternate_algorithm_headers_do_not_substitute_content_or_identity() {
         }
     }
     let pin = format!("{}/images@{requested}", server.host);
-    let out = h.refresh(Some(&pin));
+    let out = h.refresh_as_ambient(&pin);
     assert!(
         !out.status.success(),
         "a header naming different bytes must not authorize them:\n{}",
@@ -3786,7 +3846,7 @@ fn index_child_may_cross_digest_algorithms() {
     index["manifests"][0]["size"] = serde_json::Value::from(manifest.len() as u64);
     let index_bytes = serde_json::to_vec(&index).unwrap();
     let index_pin = server.index_under_algorithm("images", "cross", &index_bytes, "sha256");
-    success(&h.refresh(Some(&index_pin)));
+    success(&h.refresh_as_ambient(&index_pin));
     assert_eq!(
         cached_manifest_digest(&h.cache(), &index_pin),
         child,
@@ -3862,7 +3922,7 @@ fn lying_child_and_lying_config_are_integrity_failures() {
         "the oracle must observe publication at the descriptor child key"
     );
     fs::remove_file(&descriptor_key).unwrap();
-    let out = h.refresh(Some(&index_pin));
+    let out = h.refresh_as_ambient(&index_pin);
     assert!(
         !out.status.success(),
         "a child that does not hash to its descriptor must fail:\n{}",
@@ -3898,7 +3958,7 @@ fn lying_child_and_lying_config_are_integrity_failures() {
         "application/octet-stream",
         &config_digest,
     );
-    let out = h.refresh(Some(&pin));
+    let out = h.refresh_as_ambient(&pin);
     assert!(
         !out.status.success(),
         "a config that does not hash to its descriptor must fail:\n{}",
@@ -4105,8 +4165,13 @@ fn update_and_import_leave_project_persist_and_runtime_state_unchanged() {
     server.image("images", "state", &b);
     for operation in ["refresh", "set-default", "import"] {
         let archive = h.root.path().join("state-b.tar");
+        let mut command = h.command();
+        command.current_dir(&project);
         let args = match operation {
-            "refresh" => vec!["image", "refresh", "--image", &tag],
+            "refresh" => {
+                command.env("AGENT_VM_IMAGE_TAG", &tag);
+                vec!["image", "refresh"]
+            }
             "set-default" => vec!["image", "set-default", "--image", &tag],
             _ => vec![
                 "image",
@@ -4117,7 +4182,7 @@ fn update_and_import_leave_project_persist_and_runtime_state_unchanged() {
                 &tag,
             ],
         };
-        let out = bounded(h.command().current_dir(&project).args(args));
+        let out = bounded(command.args(args));
         success(&out);
         for (path, snapshot) in &snapshots {
             assert_eq!(&tree_snapshot(path), snapshot);
