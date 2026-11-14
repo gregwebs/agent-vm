@@ -981,10 +981,10 @@ fn describe_launch_view(view: &LaunchView) -> String {
     let mut out = String::from("==> credentials.yaml (launch credentials)\n");
     // Both carry text from `credential_yaml`, which interpolates the measured
     // `$HOME/.config/agent-vm/credentials.yaml` (its mode warning is
-    // `{path} is group- or other-readable…`), so they are escaped at the print
-    // site. A launch that requests a credential emits the same notes through
-    // `run`'s notice channel, which still writes them raw — the launch surface's
-    // version of this bug, filed as #416 rather than fixed here.
+    // `{path} is group- or other-readable…`), so they are escaped here: a report
+    // body is assembled in one `String` and has no sink to escape for it. A launch
+    // that requests a credential emits the same notes through `run`'s notice
+    // channel, where `LaunchNotices::emit` escapes them (#416).
     for note in &view.notes {
         out.push_str(&format!("warning: {}\n", crate::one_line::text(note)));
     }
