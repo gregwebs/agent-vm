@@ -40,6 +40,11 @@
 //! names no service), so a name is echoed only on the successful paths the user
 //! already knows about.
 //!
+//! Since #172 `set` and `rm` also warn, once, when the name looks like a
+//! credential: the warning describes the shape and the exposure and never the
+//! name, so it adds no echo of its own. It is advisory — the naming policy is
+//! unchanged — and `ls` stays silent because a listing would repeat it per row.
+//!
 //! # Service names are case-folded
 //!
 //! `ServiceName::parse` ASCII-lowercases the name, so `Anthropic`,
@@ -131,6 +136,23 @@ const SERVICE_HEADER: &str = "SERVICE";
 const STORAGE_HEADER: &str = "STORAGE";
 const COLUMN_GAP: usize = 2;
 
+/// Shown by `set` and `rm` when [`ServiceName::looks_like_a_credential`] fires
+/// (agent-vm #172).
+///
+/// It never repeats the name. The name may *be* the credential, and this line
+/// would then re-expose it in exactly the terminal capture and support logs the
+/// line is warning about — the rule `secret_cli`'s
+/// `failures_do_not_echo_a_key_shaped_name` pins for every other diagnostic
+/// here. Nothing in it is measured or user-supplied, so it needs no escaping.
+///
+/// Advisory, not a gate: the verb proceeds afterwards, and the cost of a false
+/// positive is this one line.
+const CREDENTIAL_SHAPED_NAME_WARNING: &str = "warning: this SERVICE looks like a credential, not \
+     a service name; agent-vm will use it as a name anyway. A name is public-to-output metadata: \
+     `secret ls` prints it, the names-only inventory records it, and the shell history and process \
+     argument list already hold it. Treat a value typed in the name slot as exposed and rotate it. \
+     The name is deliberately not repeated here";
+
 #[derive(clap::Args)]
 pub(crate) struct Args {
     #[command(subcommand)]
@@ -151,6 +173,13 @@ pub(crate) enum Op {
         /// The value is never an argument: pipe it on stdin
         /// (`printf '%s' "$KEY" | agent-vm secret set SERVICE`) or omit it here
         /// for a hidden interactive prompt.
+        ///
+        /// A name that looks like a credential (a known key prefix, or one long
+        /// mixed token) gets a warning, never a refusal. The name is
+        /// public-to-output metadata — `ls` prints it, the names-only inventory
+        /// records it, and the shell history and process argument list already
+        /// hold it — so a value typed here should be treated as exposed and
+        /// rotated.
         service: String,
 
         // --- refusal surface: declared so we can give a GOOD error, ---
@@ -228,6 +257,9 @@ fn set<B: KeychainBackend>(
     // Validate the name *before* reading the value, so `agent-vm secret set
     // BadName` fails before any store access and before any prompt.
     let service = ServiceName::parse(service)?;
+    // Before the value is read and before any store access, so the warning
+    // precedes both the success line and a later failure (#172).
+    warn_if_credential_shaped(&service);
     // The value is read before the store lock is taken, so a hidden prompt
     // never blocks holding the inventory lock.
     let value = read_secret_value(std::io::stdin().is_terminal())?;
@@ -259,6 +291,7 @@ fn list<B: KeychainBackend>(store: &SecretStore<B>) -> Result<i32> {
 
 fn remove<B: KeychainBackend>(store: &SecretStore<B>, service: &str) -> Result<()> {
     let service = ServiceName::parse(service)?;
+    warn_if_credential_shaped(&service);
     match store.remove(&service)? {
         RemoveOutcome::Removed => {
             eprintln!("removed the stored value for '{service}'");
@@ -276,6 +309,18 @@ fn reject_argv_value(rejected_positional: &[String], rejected_token: Option<&str
         return Err(anyhow!(SECRET_VALUE_ON_ARGV));
     }
     Ok(())
+}
+
+/// [`CREDENTIAL_SHAPED_NAME_WARNING`], on stderr, once per command.
+///
+/// `emit_notice_line` rather than `eprintln!`: a closed stderr must not abort a
+/// verb that is still safe to run, which is the same reason the store's own
+/// notices go through it. `ls` deliberately does not warn — it lists names by
+/// design and would repeat the line per row.
+fn warn_if_credential_shaped(service: &ServiceName) {
+    if service.looks_like_a_credential() {
+        crate::secret_store::emit_notice_line(CREDENTIAL_SHAPED_NAME_WARNING);
+    }
 }
 
 /// `ls` exits non-zero iff some row could not be probed. An **empty** inventory

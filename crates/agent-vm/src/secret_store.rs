@@ -470,6 +470,26 @@ const SERVICE_NAME_RULE: &str = "'SERVICE' must be 1-64 characters from [a-zA-Z0
                                  supplied name does not match and is not shown here, in case a \
                                  secret value was typed in its place";
 
+/// Prefixes of well-known credential formats, **already folded**, because the
+/// comparison is against a canonical [`ServiceName`] and the format itself is
+/// case-insensitive for this purpose (`AIza…` folds to `aiza…`). The list is
+/// the one agreed on (agent-vm #172): a known prefix is a cheap, high
+/// confidence signal, and a format missing here is covered only by the shape
+/// rule in [`ServiceName::looks_like_a_credential`].
+const CREDENTIAL_NAME_PREFIXES: [&str; 13] = [
+    "sk-", "sk_", "ghp_", "gho_", "ghs_", "xoxa-", "xoxb-", "xoxp-", "xoxr-", "xoxs-", "gloas-",
+    "aiza", "akia",
+];
+
+/// A key-like token is at least this long. Service names are words joined by
+/// `.`, `-` and `_`; a 32-byte run of name characters is long enough that a
+/// human-chosen service name is the less likely explanation (#172).
+const KEY_SHAPED_MIN_LEN: usize = 32;
+
+/// …and mixes at least this many distinct characters, so a padded or repeated
+/// name (`aaaa…a1`) is not read as a random token.
+const KEY_SHAPED_MIN_DISTINCT: usize = 12;
+
 impl ServiceName {
     /// The trusted adapter around the proved [`service_name_is_valid_bytes`]
     /// and [`service_name_canonical_bytes`]: the `&str` → bytes measurement and
@@ -491,6 +511,45 @@ impl ServiceName {
 
     pub(crate) fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Whether the name *looks like* a credential rather than a service name
+    /// (agent-vm #172).
+    ///
+    /// Advisory only — the caller warns and proceeds — so a **false positive
+    /// costs one stderr line**, while a false negative leaves exactly the
+    /// exposure #160 already documented. That asymmetry is why the rule is a
+    /// known key prefix or one long mixed token rather than an entropy
+    /// estimate: refusing, or guessing harder, would block a legitimate name
+    /// and change #160's naming decision.
+    ///
+    /// The name is canonical, so a prefix is matched in its folded spelling.
+    pub(crate) fn looks_like_a_credential(&self) -> bool {
+        let name = self.0.as_str();
+        if CREDENTIAL_NAME_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        {
+            return true;
+        }
+        if name.len() < KEY_SHAPED_MIN_LEN {
+            return false;
+        }
+        let bytes = name.as_bytes();
+        let mut digits = 0;
+        let mut letters = 0;
+        let mut distinct = 0;
+        for (index, byte) in bytes.iter().enumerate() {
+            if byte.is_ascii_digit() {
+                digits += 1;
+            } else if byte.is_ascii_alphabetic() {
+                letters += 1;
+            }
+            if !bytes[..index].contains(byte) {
+                distinct += 1;
+            }
+        }
+        digits > 0 && letters > 0 && distinct >= KEY_SHAPED_MIN_DISTINCT
     }
 }
 
@@ -4062,6 +4121,80 @@ mod tests {
         let parsed = ServiceName::parse("sk-ant-API03-AbCdEf")
             .expect("a key-shaped name is a valid name under O1");
         assert_eq!(parsed.as_str(), "sk-ant-api03-abcdef");
+    }
+
+    /// #172's detector, as a table rather than prose.
+    ///
+    /// **Positive** entries are the agreed prefixes in a realistic spelling —
+    /// the uppercase ones also pin that detection runs on the canonical name —
+    /// and the long-token shape rule, including a 64-character hex digest. A
+    /// digest in the name slot is far likelier a leaked digest than a service
+    /// name, and the cost of that guess is one warning line.
+    ///
+    /// **Negative** entries are ordinary names plus the edges of both rules: a
+    /// 31-character mixed token (one byte under the length floor), a 32-byte
+    /// name whose character variety is a false hit (`aaa…1`), a long
+    /// letters-only name (no digit), a long digits-only name (no letter), and
+    /// `sky-…`, which must not read as the `sk-` prefix. Widening either
+    /// threshold has to restate why these stay quiet.
+    #[test]
+    fn credential_shaped_names_follow_the_documented_table() {
+        let positives = [
+            // Prefixes, spelled the way users and their tools write them.
+            "sk-ant-api03-AbCdEf",
+            "sk_live_AbC123",
+            "ghp_AbCdEf0123456789",
+            "gho_AbCdEf0123456789",
+            "ghs_AbCdEf0123456789",
+            "xoxb-1234-5678-AbCdEf",
+            "xoxp-1234-5678-AbCdEf",
+            "gloas-AbCdEf0123456789",
+            "AIzaSyDabcdef0123456789",
+            "AKIAIOSFODNN7EXAMPLE",
+            // The long-token shape rule: 32 bytes, digits and letters, wide
+            // character variety, in both spellings because folding precedes
+            // detection.
+            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+            "A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6",
+            // A 64-character hex digest: a deliberate positive (see above).
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            // The documented false positive: a human, dotted name that reaches
+            // the length floor and mixes digits with enough distinct characters.
+            // It warns, and that is the accepted cost of the shape rule.
+            "com.example.team-service-v2-prod",
+        ];
+        for raw in positives {
+            let name = ServiceName::parse(raw).unwrap_or_else(|error| panic!("{raw}: {error:#}"));
+            assert!(
+                name.looks_like_a_credential(),
+                "{raw} should look credential-shaped, canonical {}",
+                name.as_str()
+            );
+        }
+
+        let negatives = [
+            "anthropic",
+            "openai",
+            "my-key",
+            "A1",
+            "team.service_1",
+            "sky-services",
+            // One byte under the length floor, same variety as the positive.
+            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d",
+            // At the floor, but a human name, not a random token.
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1",
+            // Letters only, and digits only: no mixing, so no token.
+            "abcdefghijklmnopqrstuvwxyzabcdefghijkl",
+            "1111111111111111111111111111111111111111",
+        ];
+        for raw in negatives {
+            let name = ServiceName::parse(raw).unwrap_or_else(|error| panic!("{raw}: {error:#}"));
+            assert!(
+                !name.looks_like_a_credential(),
+                "{raw} should stay quiet, canonical {}",
+                name.as_str()
+            );
+        }
     }
 
     /// O1: case folding is the identity rule, so three spellings are one entry

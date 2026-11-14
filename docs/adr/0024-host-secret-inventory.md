@@ -115,8 +115,8 @@ guest-visible disclosure: the *value* is still never taken from argv, but the
 name is user-controlled metadata printed by design (`ls` writes it to stdout,
 `set`/`rm` to stderr) and written to the 0600 inventory, so it also reaches
 anything that captures that terminal output or the inventory file. A key typed
-in the name slot should be treated as exposed; a future ticket could warn when a
-name looks like a credential.
+in the name slot should be treated as exposed; #172's amendment below adds an
+advisory warning for a name that looks like a credential.
 
 ### D4 — `set` writes the inventory first, then the value
 
@@ -521,3 +521,47 @@ A spinner or an updating terminal line was rejected for the same reason as the
 read notice: the line must reach a piped or logged command as plainly as an
 interactive one. Bounding or cancelling the *holder* when the notice fires was
 rejected because an abandoned mutation can still commit (#251, #291).
+
+## Amendment: a credential-shaped name warns (agent-vm #172)
+
+D3 recorded the trade-off and left it open: under the accepted alphabet a
+realistic API key is a valid service name, so a value typed in the name slot is
+accepted, folded, printed and inventoried, and a future ticket could warn when a
+name looks like a credential. [#172](https://github.com/gregwebs/agent-vm/issues/172)
+takes **option 1: warn only**. Nothing in D3 moves — no refusal, no confirmation
+prompt, no change to the naming rule — so a name that matches is still stored,
+listed and removed exactly as before.
+
+`ServiceName::looks_like_a_credential` is the one predicate, in the module that
+owns `ServiceName`, and both verbs call it. It fires on either of two rules:
+
+- a **known key prefix** in its folded spelling — `sk-`, `sk_`, `ghp_`, `gho_`,
+  `ghs_`, `xoxa-`/`xoxb-`/`xoxp-`/`xoxr-`/`xoxs-`, `gloas-`, `AIza`, `AKIA`. A prefix is a cheap,
+  high-confidence signal; a format missing from the list falls through to the
+  second rule, and the list is the one agreed on the issue rather than an
+  attempt at a complete catalogue.
+- a **long mixed token**: at least 32 bytes, at least one digit, at least one
+  letter, and at least 12 distinct characters. Service names are words joined by
+  `.`, `-` and `_`; a 32-byte run that varied is more likely a token than a name,
+  and the distinct-character floor keeps a padded name (`aaa…a1`) out.
+
+The asymmetry decides the design: a false positive costs one stderr line, a
+false negative leaves the exposure D3 already documented, so the rule is
+deliberately loose and is not an entropy estimate. A 64-character hex digest and
+a long dotted name such as `com.example.team-service-v2-prod` do warn; both are
+accepted costs, pinned in `secret_store`'s `credential_shaped_names_follow_the_documented_table`.
+
+The warning is emitted once per command, **before** the operation, so it
+precedes both the success line and any failure, and it goes to stderr through
+`emit_notice_line` (a closed stderr must not abort a verb that is still safe to
+run). It **never repeats the name**: the name may itself be the credential, and
+a warning that echoed it would re-expose it in exactly the terminal capture and
+support logs it is warning about — the same rule that keeps `set`/`rm` failure
+text silent (`secret_cli`'s `failures_do_not_echo_a_key_shaped_name`). The line
+says the name is public-to-output metadata — printed by `ls`, recorded in the
+names-only inventory, held in shell history and argv — and that a value typed in
+the name slot should be treated as exposed and rotated.
+
+`secret ls` deliberately does not warn: it renders names by design and would
+repeat the line per row, which is noise rather than a decision point. Its output
+staying names-only is D1's guarantee, unchanged.

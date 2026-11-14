@@ -3443,9 +3443,20 @@ agent-vm secret rm anthropic
   a superset of the characters real API keys use. If you accidentally type a key
   in the `SERVICE` position, agent-vm will *accept* it as a name and print it —
   argv, shell history and listings are all on the record. A key typed on the
-  command line should be treated as exposed. (agent-vm does not try to guess
-  which names “look like” credentials: that would reject valid names, so the
-  responsibility stays with the operator.)
+  command line should be treated as exposed.
+- **A credential-shaped name warns, and is still accepted.** `set` and `rm`
+  print one warning line on stderr when `SERVICE` has a known key prefix
+  (`sk-`, `sk_`, `ghp_`, `gho_`, `ghs_`, `xoxa-`/`xoxb-`/`xoxp-`/`xoxr-`/
+  `xoxs-`, `gloas-`, `AIza`, `AKIA`) or is a single long token (32+ characters
+  mixing digits, letters and
+  at least twelve distinct characters). It is a **warning, never a refusal**:
+  the naming rule is unchanged, and a false positive costs one line. The warning
+  describes the shape and does not repeat the name — the name may *be* the
+  value, so repeating it would re-expose it in terminal capture and support
+  logs. `secret ls` does not warn: it lists names by design and would repeat the
+  line per row. A name is public-to-output metadata in every other respect too:
+  it lands in this listing, in the names-only inventory, in your shell history
+  and in the process argument list.
 - **Names are case-folded to ASCII lowercase.** A name is 1-64 characters from
   `[a-zA-Z0-9._-]`, starting with a letter or digit; letters are folded, so
   `Anthropic`, `ANTHROPIC` and `anthropic` are the **same** credential (keychain

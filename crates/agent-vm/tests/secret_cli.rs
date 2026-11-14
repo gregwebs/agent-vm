@@ -674,6 +674,158 @@ fn the_service_name_length_boundary_is_enforced_end_to_end() {
     );
 }
 
+/// The issue #172 warning's stable sentence. The assertions below key on this
+/// substring rather than the full wording, so the line can be reworded without
+/// rewriting the tests.
+const CREDENTIAL_SHAPED_WARNING: &str = "looks like a credential";
+
+/// Assert `out` carries exactly one credential-shaped-name warning, on stderr,
+/// and that the line does not repeat the name in either spelling. The line may
+/// *be* the credential, so a warning that echoed it would re-expose it in the
+/// terminal capture and support logs it warns about.
+fn assert_one_credential_warning(out: &Output, name: &str) {
+    let stderr = stderr_of(out);
+    let warnings: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.contains(CREDENTIAL_SHAPED_WARNING))
+        .collect();
+    assert_eq!(
+        warnings.len(),
+        1,
+        "exactly one warning per command for {name:?}: {stderr}"
+    );
+    let warning = warnings[0];
+    assert!(warning.starts_with("warning: "), "{warning}");
+    for spelling in [name.to_owned(), name.to_ascii_lowercase()] {
+        assert!(
+            !warning.contains(&spelling),
+            "the warning repeated {spelling:?}: {warning}"
+        );
+    }
+    assert!(
+        !stdout_of(out).contains(CREDENTIAL_SHAPED_WARNING),
+        "the warning belongs on stderr: {}",
+        stdout_of(out)
+    );
+}
+
+/// Assert the warning came first in `out`'s stderr, before `later` — the
+/// success line or the failure — so it is never buried after the operation it
+/// is about, and that it is the only warning.
+fn assert_warning_precedes(out: &Output, name: &str, later: &str) {
+    let stderr = stderr_of(out);
+    let warning_at = stderr
+        .find(CREDENTIAL_SHAPED_WARNING)
+        .unwrap_or_else(|| panic!("no warning for {name:?}: {stderr}"));
+    let later_at = stderr
+        .find(later)
+        .unwrap_or_else(|| panic!("no {later:?} for {name:?}: {stderr}"));
+    assert!(
+        warning_at < later_at,
+        "the warning must precede {later:?} for {name:?}: {stderr}"
+    );
+    assert_one_credential_warning(out, name);
+}
+
+/// #172 — a credential-shaped name warns on `set` and on `rm`, once per
+/// command, on stderr, and never repeats the name. The naming policy is
+/// unchanged: the verb still runs.
+#[test]
+fn a_credential_shaped_name_warns_on_set_and_rm_without_being_echoed() {
+    let harness = Harness::new();
+    let positives = [
+        "sk-ant-API03-AbCdEf",
+        "ghp_AbCdEf0123456789",
+        "xoxb-1234-5678-AbCdEf",
+        "AIzaSyDabcdef0123456789",
+        "AKIAIOSFODNN7EXAMPLE",
+        "A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6",
+    ];
+    for typed in positives {
+        let folded = typed.to_ascii_lowercase();
+
+        // A failed `set` (no value supplied): the warning, then the unchanged
+        // failure, and nothing echoes the name.
+        let out = harness.run(&["secret", "set", typed]);
+        assert!(!out.status.success(), "{typed}: there is no value");
+        let stderr = stderr_of(&out);
+        let warning_at = stderr
+            .find(CREDENTIAL_SHAPED_WARNING)
+            .unwrap_or_else(|| panic!("{typed}: no warning: {stderr}"));
+        let failure_at = stderr
+            .find("no value was supplied")
+            .unwrap_or_else(|| panic!("{typed}: no failure: {stderr}"));
+        assert!(warning_at < failure_at, "{typed}: {stderr}");
+        assert_one_credential_warning(&out, typed);
+        assert!(
+            !both_streams(&out).contains(typed) && !both_streams(&out).contains(&folded),
+            "{typed}: a failed set echoed the name: {}",
+            both_streams(&out)
+        );
+
+        // A successful `set` through the recording backend, which stands in for
+        // the keychain success line ("stored a value for '…'", which echoes the
+        // name by design — O1). Only the warning must not.
+        let out = harness.run_recording_piped(&["secret", "set", typed], b"v");
+        assert!(out.status.success(), "{typed}: {}", stderr_of(&out));
+        assert_warning_precedes(&out, typed, "the test recording backend is active");
+
+        // `rm` of the name just stored: success, warning first.
+        let out = harness.run_recording(&["secret", "rm", typed]);
+        assert!(out.status.success(), "{typed}: {}", stderr_of(&out));
+        assert_warning_precedes(&out, typed, "removed the stored value");
+
+        // `rm` of a name with nothing stored: warning, then the unchanged
+        // failure that does not name it.
+        let out = harness.run_recording(&["secret", "rm", typed]);
+        assert!(
+            !out.status.success(),
+            "{typed}: nothing is stored any more: {}",
+            stderr_of(&out)
+        );
+        assert_warning_precedes(&out, typed, "no agent-vm secret is stored under that name");
+        assert!(
+            !both_streams(&out).contains(&folded),
+            "{typed}: a failed rm echoed the name: {}",
+            both_streams(&out)
+        );
+    }
+}
+
+/// #172's negative half, end to end: ordinary service names — including the
+/// edges of the detector — produce no warning on `set` or on `rm`.
+#[test]
+fn an_ordinary_service_name_does_not_warn() {
+    let harness = Harness::new();
+    let negatives = [
+        "anthropic".to_owned(),
+        "openai".to_owned(),
+        "my-key".to_owned(),
+        "A1".to_owned(),
+        "team.service_1".to_owned(),
+        "sky-services".to_owned(),
+        "a".repeat(31),
+        "internalbillingnamingconventionservice".to_owned(),
+    ];
+    for name in negatives {
+        let out = harness.run_recording_piped(&["secret", "set", &name], b"v");
+        assert!(out.status.success(), "{name}: {}", stderr_of(&out));
+        assert!(
+            !both_streams(&out).contains(CREDENTIAL_SHAPED_WARNING),
+            "{name} warned: {}",
+            both_streams(&out)
+        );
+
+        let out = harness.run_recording(&["secret", "rm", &name]);
+        assert!(out.status.success(), "{name}: {}", stderr_of(&out));
+        assert!(
+            !both_streams(&out).contains(CREDENTIAL_SHAPED_WARNING),
+            "{name} warned on rm: {}",
+            both_streams(&out)
+        );
+    }
+}
+
 /// The documented O1 consequence, pinned end to end: a key-shaped name is a
 /// valid *name*, so `set` succeeds, `ls` prints the folded name, and the 0600
 /// inventory records it — while the value itself is nowhere on disk or in
