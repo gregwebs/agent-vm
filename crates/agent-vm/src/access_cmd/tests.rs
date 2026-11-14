@@ -430,6 +430,43 @@ async fn every_untrusted_cell_is_escaped() {
     );
 }
 
+/// #598: `reason()` escapes the untrusted text it names exactly once, and both
+/// surfaces print that text, so `access allow`'s error and the table's ACTION
+/// cell must show the record's bytes alike. A backslash is the discriminating
+/// byte: escaping it again is visible, while a control byte's `\xNN` only gains a
+/// doubled backslash.
+#[tokio::test]
+async fn a_forged_reason_is_escaped_once_in_the_error_and_the_table() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = session_dir(root.path());
+    let mut forged = entry("abcdef01", address("203.0.113.10", 443), NOW - 1_000);
+    forged.key.kind = Kind::PolicyLock;
+    // Only a forged log can put a backslash in a site: a decoded record carries a
+    // wire token, and `reason()` escapes whatever a forged one holds.
+    forged.last_site = r"a\b".to_owned();
+    dir.write(&snapshot("0a1b2c3d", NOW - 5_000, vec![forged]), NOW)
+        .unwrap();
+
+    let (status, table, _) = run_logged(&dir, table_args()).await;
+    assert_eq!(status, 0);
+    let (status, _, error) =
+        run_command(root.path(), allow("abcdef01", false), &empty_view()).await;
+    assert_eq!(status, 1, "{error}");
+
+    // The reason starts at the same words on both surfaces and ends the line in
+    // the table, the parentheses in the error.
+    let reason_in = |text: &str| {
+        let start = text
+            .find("can't be allowed: ")
+            .unwrap_or_else(|| panic!("the reason is printed: {text:?}"));
+        text[start..].trim_end_matches([')', '\n']).to_owned()
+    };
+    let in_table = reason_in(&table);
+    let in_error = reason_in(&error);
+    assert_eq!(in_error, in_table, "one refusal, one spelling");
+    assert_eq!(in_table, r"can't be allowed: built-in rule a\\b");
+}
+
 #[tokio::test]
 async fn window_hides_older_than_24h_unless_all() {
     let root = tempfile::tempdir().unwrap();
