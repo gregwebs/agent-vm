@@ -3731,6 +3731,19 @@ impl AgentShellLine<'_> {
         )
     }
 
+    /// The catalog-tool guard; [`Self::program_guard`] documents its placement,
+    /// lookup and diagnostic. Clearing the hash is the first line deliberately,
+    /// as in [`Self::direct_guard`]: `type -P` answers from the hash table
+    /// without consulting `PATH`, and the seed/project hooks run before this
+    /// guard, so a hook that hashed a pathname and then moved, removed or
+    /// `hash -p`-overrode it would otherwise look missing although the effective
+    /// `PATH` has the program (#405). Nothing between the clear and `exec`
+    /// repopulates the table (the lookup is a command substitution and only
+    /// builtins run after it), so one clear also keeps `exec`'s own search on the
+    /// same `PATH`. `|| builtin :` discards `hash -r`'s one failure mode — a
+    /// hook's `set +h`, where the table is ignored anyway — because a hook's
+    /// `set -e` would otherwise abort with a bare status 1 and no catalog
+    /// diagnostic.
     fn image_contract_guard(&self) -> String {
         let command = guest_script_word(self.command);
         let message = guest_script_word(&image_contract::missing_program_message(
@@ -3738,7 +3751,8 @@ impl AgentShellLine<'_> {
             self.command,
         ));
         format!(
-            "_avm_command={command}\n\
+            "builtin hash -r 2>/dev/null || builtin :\n\
+             _avm_command={command}\n\
              _avm_external=\n\
              case \"$_avm_command\" in\n\
              \t*/*) _avm_external=$_avm_command ;;\n\
@@ -3748,7 +3762,6 @@ impl AgentShellLine<'_> {
              \tprintf '%s\\n' {message} >&2\n\
              \texit {exit}\n\
              fi\n\
-             builtin hash -r\n\
              unset _avm_command _avm_external",
             exit = image_contract::MISSING_PROGRAM_EXIT,
         )
@@ -5603,6 +5616,20 @@ mod tests {
         prefix: &str,
         extra_env: &[(&str, &str)],
     ) -> std::process::Output {
+        run_guard_tail_with("/bin/bash", command, args, path, prefix, extra_env)
+    }
+
+    /// [`run_guard_tail`] with the shell named: the guest's bash is whatever the
+    /// image ships (bash 3.2 included), and `type -P`/`hash -r` are builtins
+    /// whose behaviour the guard depends on.
+    fn run_guard_tail_with(
+        bash: &str,
+        command: &str,
+        args: &[String],
+        path: Option<&str>,
+        prefix: &str,
+        extra_env: &[(&str, &str)],
+    ) -> std::process::Output {
         let line = AgentShellLine {
             guard: ProgramGuard::ImageContract,
             project_guest_path: "/work/proj",
@@ -5615,7 +5642,7 @@ mod tests {
         // with no separator (`exec_line` opens with `; `), so a newline here would
         // put `;` at the start of a line and make bash reject the script.
         let tail = format!("{prefix}\n{}{}", line.program_guard(), line.exec_line());
-        let mut process = std::process::Command::new("/bin/bash");
+        let mut process = std::process::Command::new(bash);
         process.arg("-c").arg(tail);
         match path {
             Some(value) => {
@@ -5628,7 +5655,7 @@ mod tests {
         for (key, value) in extra_env {
             process.env(key, value);
         }
-        process.output().expect("/bin/bash runs")
+        process.output().expect("the shell runs")
     }
 
     /// The guard must actually `exec` the selected program: a sentinel, the
@@ -5807,6 +5834,132 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         assert_eq!(String::from_utf8_lossy(&out.stdout), "NEW\n");
+    }
+
+    /// #405: a hook that hashes a pathname and then moves it must not decide the
+    /// catalog tool's resolution. `type -P` answers from the hash table, so the
+    /// lookup has to be preceded by a clear; the program's own status and output
+    /// prove which pathname ran. Without the clear the lookup returns the stale
+    /// pathname, fails the existence check and the launch dies with the contract
+    /// diagnostic instead of running the tool the `PATH` has.
+    #[test]
+    fn image_contract_guard_ignores_a_hook_left_stale_hash_after_a_move() {
+        // The hook hash-populating command must exit 0: a hook may run under
+        // `set -e`, and this control is about the hash, not about errexit.
+        const EARLIER: &str = "#!/bin/sh\nprintf 'EARLIER\\n'\n";
+        const LATER: &str = "#!/bin/sh\nprintf 'LATER\\n'\nexit 23\n";
+        for bash in host_bashes() {
+            let dir = tempfile::tempdir().unwrap();
+            let earlier = dir.path().join("earlier");
+            let later = dir.path().join("later");
+            std::fs::create_dir_all(&earlier).unwrap();
+            std::fs::create_dir_all(&later).unwrap();
+            write_executable(&earlier.join("moved-405"), EARLIER);
+            write_executable(&later.join("moved-405"), LATER);
+            // Run the tool (hashing its first `PATH` match) and then move it
+            // aside, with no further `PATH` assignment to empty the table
+            // behind the hook's back.
+            let prefix = format!(
+                "moved-405 >/dev/null\nmv {source} {destination}\n",
+                source = guest_script_word(earlier.join("moved-405").to_str().unwrap()),
+                destination = guest_script_word(later.join("moved-405.aside").to_str().unwrap()),
+            );
+            let path = format!("{}:{}:/usr/bin:/bin", earlier.display(), later.display());
+            let out = run_guard_tail_with(bash, "moved-405", &[], Some(&path), &prefix, &[]);
+            assert_eq!(out.status.code(), Some(23), "{bash}: {out:?}");
+            assert_eq!(out.stdout, b"LATER\n", "{bash}: {out:?}");
+            assert!(out.stderr.is_empty(), "{bash}: {out:?}");
+        }
+    }
+
+    /// #405, directory half of the same control: a hook replaces the hashed
+    /// pathname with a directory. `type -P` skips a directory `PATH` entry, so a
+    /// cleared lookup reaches the later real file; the stale entry would fail the
+    /// guard's regular-file check even though the tool is on the `PATH`. With no
+    /// later copy the same clear still reports the contract diagnostic.
+    #[test]
+    fn image_contract_guard_ignores_a_hook_left_stale_hash_when_the_program_becomes_a_directory() {
+        for bash in host_bashes() {
+            let dir = tempfile::tempdir().unwrap();
+            let earlier = dir.path().join("earlier");
+            let later = dir.path().join("later");
+            std::fs::create_dir_all(&earlier).unwrap();
+            std::fs::create_dir_all(&later).unwrap();
+            write_executable(
+                &earlier.join("replaced-405"),
+                "#!/bin/sh\nprintf 'EARLIER\\n'\n",
+            );
+            write_executable(
+                &later.join("replaced-405"),
+                "#!/bin/sh\nprintf 'LATER\\n'\nexit 23\n",
+            );
+            let replaced = earlier.join("replaced-405");
+            let prefix = format!(
+                "replaced-405 >/dev/null\nrm {path}\nmkdir {path}\n",
+                path = guest_script_word(replaced.to_str().unwrap()),
+            );
+            let path = format!("{}:{}:/usr/bin:/bin", earlier.display(), later.display());
+            let out = run_guard_tail_with(bash, "replaced-405", &[], Some(&path), &prefix, &[]);
+            assert_eq!(out.status.code(), Some(23), "{bash}: {out:?}");
+            assert_eq!(out.stdout, b"LATER\n", "{bash}: {out:?}");
+            assert!(out.stderr.is_empty(), "{bash}: {out:?}");
+        }
+
+        // No later copy: the clear makes the guard's own PATH search report the
+        // absence, with the catalog contract text and status unchanged.
+        for bash in host_bashes() {
+            let missing = tempfile::tempdir().unwrap();
+            let bin = missing.path().join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            write_executable(&bin.join("absent-405"), "#!/bin/sh\nprintf 'EARLIER\\n'\n");
+            let prefix = format!(
+                "absent-405 >/dev/null\nrm {path}\n",
+                path = guest_script_word(bin.join("absent-405").to_str().unwrap()),
+            );
+            let path = format!("{}:/usr/bin:/bin", bin.display());
+            let out = run_guard_tail_with(bash, "absent-405", &[], Some(&path), &prefix, &[]);
+            assert_eq!(
+                out.status.code(),
+                Some(i32::from(image_contract::MISSING_PROGRAM_EXIT)),
+                "{bash}: {out:?}"
+            );
+            assert!(out.stdout.is_empty(), "{bash}: {out:?}");
+            let stderr = String::from_utf8(out.stderr).unwrap();
+            assert!(
+                stderr.contains("has no runnable external program `absent-405`"),
+                "{bash}: {stderr}"
+            );
+        }
+    }
+
+    /// #405: a hook may disable hashing under `set -e`. A bare `hash -r` then
+    /// fails with status 1, `set -e` aborts the whole bootstrap and nothing execs
+    /// — with a `hash: hashing disabled` line instead of the tool's output. The
+    /// guard's clear discards that one failure mode, so the tool still runs.
+    #[test]
+    fn image_contract_guard_tolerates_a_hook_disabling_hashing_under_errexit() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_executable(
+            &bin.join("nohash-405"),
+            "#!/bin/sh\nprintf 'external\\n'\nexit 23\n",
+        );
+        for bash in host_bashes() {
+            let out = run_guard_tail_with(
+                bash,
+                "nohash-405",
+                &[],
+                Some(bin.to_str().unwrap()),
+                "set -e\nset +h\n",
+                &[],
+            );
+            assert_eq!(out.status.code(), Some(23), "{bash}: {out:?}");
+            assert_eq!(out.stdout, b"external\n", "{bash}: {out:?}");
+            let stderr = String::from_utf8(out.stderr).unwrap();
+            assert!(!stderr.contains("hashing disabled"), "{bash}: {stderr}");
+            assert!(stderr.is_empty(), "{bash}: {stderr}");
+        }
     }
 
     /// The teardown combination rule: the primary contract diagnostic survives,
@@ -9715,6 +9868,15 @@ options ndots:2 timeout:1";
     /// compared byte-for-byte against main `8b00b54`'s rendering, so they
     /// certify the line this branch actually replaces, not only the original
     /// base.
+    ///
+    /// `#405` deliberately moved the `ImageContract` guard's `hash -r` from
+    /// after its lookup to the first line of the guard, so the literal below is
+    /// **no longer** the base rendering: it differs from `78b8536` by exactly
+    /// that move (one added clear line, one removed line), because a hook's stale
+    /// hash entry otherwise decided the catalog tool's resolution. Every other
+    /// byte — strip, seed text, redirect, hook, lookup, checks, diagnostic and
+    /// `exec` — is still pinned to the base, and the direct-attach literal is
+    /// untouched by #405.
     const LEGACY_IMAGE_CONTRACT: &str = r#"sed -i '/^nameserver .*:/d' /etc/resolv.conf 2>/dev/null || true
 for _h in /opt/agent-vm/seed.d/*; do [ -x "$_h" ] && "$_h"; done
 [ -x /opt/agent-vm/seed-claude-plugins.sh ] && /opt/agent-vm/seed-claude-plugins.sh; true
@@ -9724,6 +9886,7 @@ if [ -f "$_hook" ]; then
 	echo "==> sourcing $_hook" >&2
 	cd '/work/proj' && . "$_hook" || { rc=$?; echo "==> .agent-vm.runtime.sh failed (exit $rc)" >&2; exit $rc; }
 fi
+builtin hash -r 2>/dev/null || builtin :
 _avm_command='cat'
 _avm_external=
 case "$_avm_command" in
@@ -9734,7 +9897,6 @@ if [ -z "$_avm_external" ] || [ ! -f "$_avm_external" ] || [ ! -x "$_avm_externa
 	printf '%s\n' 'agent-vm: boot image stub-image has no runnable external program `cat` on the guest PATH or at the configured path. agent-vm does not install software: add it to the image or select an image that provides it (USAGE.md#boot-image-contract).' >&2
 	exit 127
 fi
-builtin hash -r
 unset _avm_command _avm_external; exec -- 'cat'"#;
     const LEGACY_DIRECT_ATTACH: &str = r#"sed -i '/^nameserver .*:/d' /etc/resolv.conf 2>/dev/null || true
 for _h in /opt/agent-vm/seed.d/*; do [ -x "$_h" ] && "$_h"; done
