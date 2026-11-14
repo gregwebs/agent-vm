@@ -3737,13 +3737,16 @@ impl AgentShellLine<'_> {
     /// without consulting `PATH`, and the seed/project hooks run before this
     /// guard, so a hook that hashed a pathname and then moved, removed or
     /// `hash -p`-overrode it would otherwise look missing although the effective
-    /// `PATH` has the program (#405). Nothing between the clear and `exec`
-    /// repopulates the table (the lookup is a command substitution and only
-    /// builtins run after it), so one clear also keeps `exec`'s own search on the
-    /// same `PATH`. `|| builtin :` discards `hash -r`'s one failure mode — a
-    /// hook's `set +h`, where the table is ignored anyway — because a hook's
-    /// `set -e` would otherwise abort with a bare status 1 and no catalog
-    /// diagnostic.
+    /// `PATH` has the program (#405). Nothing the guard runs itself repopulates
+    /// the table — the lookup is a command substitution and only builtins follow
+    /// — but a hook's `DEBUG` trap runs between the guard's own commands: one
+    /// that fires after the lookup can `hash -p` the looked-up name and make
+    /// `exec` run a pathname the checks never saw, so the clear is repeated after
+    /// the checks. A trap can fire between that last clear and `exec` too, where
+    /// code the hook can run substitutes a program regardless. `|| builtin :`
+    /// discards `hash -r`'s one failure mode — a hook's `set +h`, where the table
+    /// is ignored anyway — because a hook's `set -e` would otherwise abort with a
+    /// bare status 1 and no catalog diagnostic.
     fn image_contract_guard(&self) -> String {
         let command = guest_script_word(self.command);
         let message = guest_script_word(&image_contract::missing_program_message(
@@ -3762,6 +3765,7 @@ impl AgentShellLine<'_> {
              \tprintf '%s\\n' {message} >&2\n\
              \texit {exit}\n\
              fi\n\
+             builtin hash -r 2>/dev/null || builtin :\n\
              unset _avm_command _avm_external",
             exit = image_contract::MISSING_PROGRAM_EXIT,
         )
@@ -6023,6 +6027,48 @@ mod tests {
                 rendered.ends_with("(full logs: /logs/session)"),
                 "got: {rendered}"
             );
+        }
+    }
+
+    /// #405: a hook may install a `DEBUG` trap, and bash runs it between the
+    /// guard's own commands. A trap that `hash -p`s the looked-up name right
+    /// before the checks leaves them verifying one pathname while `exec` runs
+    /// the trap's other program, so the launch reports a status the checked
+    /// program never produced. The clear after the checks discards that entry and
+    /// `exec` searches the `PATH` the checks just verified.
+    #[test]
+    fn image_contract_guard_clears_a_hash_a_hook_debug_trap_repopulates() {
+        const CHECKED: &str = "#!/bin/sh\nprintf 'CHECKED\\n'\nexit 23\n";
+        const WRONG: &str = "#!/bin/sh\nprintf 'WRONG\\n'\nexit 7\n";
+        for bash in host_bashes() {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = dir.path().join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            write_executable(&bin.join("checked-405"), CHECKED);
+            let wrong = dir.path().join("wrong-405");
+            write_executable(&wrong, WRONG);
+            // The trap fires on the guard's own check command: the lookup has
+            // already resolved `checked-405` and the checks have not run yet.
+            // `hash -p` is the hook's way in — it names a pathname the guard
+            // never looked up.
+            let prefix = "__avm_hook_trap() {\n\
+                          \tcase \"$BASH_COMMAND\" in\n\
+                          \t'[ -z \"$_avm_external\" ]'*) builtin hash -p \"$AVM_HOOK_WRONG\" checked-405 ;;\n\
+                          \tesac\n\
+                          }\n\
+                          trap __avm_hook_trap DEBUG\n";
+            let path = format!("{}:/usr/bin:/bin", bin.display());
+            let out = run_guard_tail_with(
+                bash,
+                "checked-405",
+                &[],
+                Some(&path),
+                prefix,
+                &[("AVM_HOOK_WRONG", wrong.to_str().unwrap())],
+            );
+            assert_eq!(out.status.code(), Some(23), "{bash}: {out:?}");
+            assert_eq!(out.stdout, b"CHECKED\n", "{bash}: {out:?}");
+            assert!(out.stderr.is_empty(), "{bash}: {out:?}");
         }
     }
 
@@ -9853,9 +9899,10 @@ options ndots:2 timeout:1";
         }
     }
 
-    /// B1: the legacy bootstrap is byte-identical to `main`, measured as the
-    /// **whole** rendered line rather than a prefix: the point of the oracle is
-    /// that no byte of an existing shell, tool or direct-attach launch moved
+    /// B1: the legacy bootstrap is byte-identical to `main` apart from the one
+    /// deliberate `#405` change enumerated below, measured as the **whole**
+    /// rendered line rather than a prefix: the point of the oracle is that no
+    /// other byte of an existing shell, tool or direct-attach launch moved
     /// (#399 review non-blocking 4).
     ///
     /// Provenance: these two literals are `AgentShellLine::render()`'s output at
@@ -9864,19 +9911,31 @@ options ndots:2 timeout:1";
     /// (`Direct` + `DiscardWhenNotTerminal`). `#399` changed neither the strip,
     /// the seed text, the redirect, the hook, the guard nor the `exec` for
     /// those shapes; `git diff 78b8536 -- crates/agent-vm/src/run.rs` shows only
-    /// additive `GuestInput` plumbing outside them. The literals were also
+    /// additive `GuestInput` plumbing outside them. Both literals were also
     /// compared byte-for-byte against main `8b00b54`'s rendering, so they
-    /// certify the line this branch actually replaces, not only the original
-    /// base.
+    /// certified the line this branch actually replaces, not only the original
+    /// base. `#405` changes the `ImageContract` line on purpose (below), so from
+    /// here only the direct-attach literal still equals that main rendering.
     ///
-    /// `#405` deliberately moved the `ImageContract` guard's `hash -r` from
-    /// after its lookup to the first line of the guard, so the literal below is
-    /// **no longer** the base rendering: it differs from `78b8536` by exactly
-    /// that move (one added clear line, one removed line), because a hook's stale
-    /// hash entry otherwise decided the catalog tool's resolution. Every other
-    /// byte — strip, seed text, redirect, hook, lookup, checks, diagnostic and
-    /// `exec` — is still pinned to the base, and the direct-attach literal is
-    /// untouched by #405.
+    /// `#405` deliberately changed the `ImageContract` guard's clear twice over,
+    /// so the literal below is **no longer** the base rendering:
+    ///
+    /// - the clear moved from after the guard's lookup to its first line, because
+    ///   a hook's stale hash entry otherwise decided the catalog tool's
+    ///   resolution, and it also runs again after the checks, because a hook's
+    ///   `DEBUG` trap can repopulate the table between the guard's own commands
+    ///   and make `exec` run a pathname the checks never saw. That entry sits
+    ///   where the base's single clear sat, so the literal shows the clear twice;
+    /// - both clears are `builtin hash -r 2>/dev/null || builtin :` instead of the
+    ///   base's bare `builtin hash -r`. This changes behaviour on purpose: with
+    ///   hashing disabled (`set +h`) under `set -e`, the bare form exited 1 with
+    ///   `hash: hashing disabled` and no catalog diagnostic.
+    ///
+    /// Everything else is the base's bytes: strip, seed text, redirect, hook,
+    /// lookup, checks, diagnostic and `exec`, on both literals. The whole line is
+    /// compared byte-for-byte, so the number of clear lines and their exact text
+    /// are pinned too, not only the guard around them. The direct-attach literal
+    /// is untouched by #405 and is still `78b8536`'s line exactly.
     const LEGACY_IMAGE_CONTRACT: &str = r#"sed -i '/^nameserver .*:/d' /etc/resolv.conf 2>/dev/null || true
 for _h in /opt/agent-vm/seed.d/*; do [ -x "$_h" ] && "$_h"; done
 [ -x /opt/agent-vm/seed-claude-plugins.sh ] && /opt/agent-vm/seed-claude-plugins.sh; true
@@ -9897,6 +9956,7 @@ if [ -z "$_avm_external" ] || [ ! -f "$_avm_external" ] || [ ! -x "$_avm_externa
 	printf '%s\n' 'agent-vm: boot image stub-image has no runnable external program `cat` on the guest PATH or at the configured path. agent-vm does not install software: add it to the image or select an image that provides it (USAGE.md#boot-image-contract).' >&2
 	exit 127
 fi
+builtin hash -r 2>/dev/null || builtin :
 unset _avm_command _avm_external; exec -- 'cat'"#;
     const LEGACY_DIRECT_ATTACH: &str = r#"sed -i '/^nameserver .*:/d' /etc/resolv.conf 2>/dev/null || true
 for _h in /opt/agent-vm/seed.d/*; do [ -x "$_h" ] && "$_h"; done
