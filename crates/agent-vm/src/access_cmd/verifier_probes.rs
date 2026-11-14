@@ -18,7 +18,6 @@ use crate::allowances::{
     GrantResult, GrantScope, ProjectView, RevokeResult, RevokeScope, StoreHandle,
 };
 use crate::refusal::SessionId;
-use crate::refusal::feed::LiveRefusals;
 use crate::refusal::log::SessionsDir;
 use crate::session::ProjectSession;
 use crate::session_control::{LiveSession, LiveSetup};
@@ -79,14 +78,10 @@ fn store_dir(root: &Path) -> PathBuf {
 
 /// Start the launcher's own controller, as `run::launch` does, with a launch
 /// whose configured authority is `allow_egress`.
-async fn start(
-    root: &Path,
-    allow_egress: &[&str],
-    store: StoreHandle,
-) -> (LiveSession, Arc<LiveRefusals>) {
+async fn start(root: &Path, allow_egress: &[&str], store: StoreHandle) -> LiveSession {
     let project = project_dir(root);
     let plan = crate::network::plan_for_tests(allow_egress, false).live_policy_plan(None);
-    let live = LiveSession::start(
+    LiveSession::start(
         &project_session(root),
         LiveSetup {
             project: &project,
@@ -94,9 +89,7 @@ async fn start(
             plan,
         },
     )
-    .await;
-    let refusals = live.refusals().expect("a live refusal feed");
-    (live, refusals)
+    .await
 }
 
 fn allowance(text: &str) -> crate::egress_policy::Allowance {
@@ -195,7 +188,7 @@ async fn run(
 async fn verifier_blocker1_revoke_names_the_launch_authority_it_cannot_remove() {
     let root = tempfile::tempdir().unwrap();
     // The launch grants the whole /24; no allowance entry names the destination.
-    let (live, _) = start(
+    let live = start(
         root.path(),
         &["tcp://[203.0.113.0/24]:443"],
         StoreHandle::at_for_tests(&store_dir(root.path())),
@@ -232,7 +225,7 @@ async fn verifier_blocker1_revoke_names_the_launch_authority_it_cannot_remove() 
 #[tokio::test]
 async fn verifier_blocker2_project_grant_over_a_queued_session_entry_records_it() {
     let root = tempfile::tempdir().unwrap();
-    let (live, refusals) = start(
+    let live = start(
         root.path(),
         &[],
         StoreHandle::at_for_tests(&store_dir(root.path())),
@@ -241,13 +234,7 @@ async fn verifier_blocker2_project_grant_over_a_queued_session_entry_records_it(
     let controller = live.allowances();
     // Queued for boot: no updater is attached yet.
     let first = controller
-        .grant(
-            &refusals,
-            None,
-            Some(DESTINATION),
-            GrantScope::Session,
-            1_000,
-        )
+        .grant(Some(DESTINATION), GrantScope::Session, 1_000)
         .await;
     assert!(
         matches!(first, GrantResult::QueuedForBoot { .. }),
@@ -260,13 +247,7 @@ async fn verifier_blocker2_project_grant_over_a_queued_session_entry_records_it(
 
     // The same destination asked for as a project grant, still before `follow`.
     let second = controller
-        .grant(
-            &refusals,
-            None,
-            Some(DESTINATION),
-            GrantScope::Project,
-            2_000,
-        )
+        .grant(Some(DESTINATION), GrantScope::Project, 2_000)
         .await;
     match &second {
         GrantResult::QueuedForBoot { scope, .. } => assert_eq!(
@@ -291,26 +272,14 @@ async fn verifier_blocker2_a_refusing_store_never_claims_recorded() {
     let dir = store_dir(root.path());
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
-    let (live, refusals) = start(root.path(), &[], StoreHandle::at_for_tests(&dir)).await;
+    let live = start(root.path(), &[], StoreHandle::at_for_tests(&dir)).await;
     let controller = live.allowances();
     controller
-        .grant(
-            &refusals,
-            None,
-            Some(DESTINATION),
-            GrantScope::Session,
-            1_000,
-        )
+        .grant(Some(DESTINATION), GrantScope::Session, 1_000)
         .await;
 
     let result = controller
-        .grant(
-            &refusals,
-            None,
-            Some(DESTINATION),
-            GrantScope::Project,
-            2_000,
-        )
+        .grant(Some(DESTINATION), GrantScope::Project, 2_000)
         .await;
     assert!(
         matches!(result, GrantResult::Refused { .. }),
@@ -332,7 +301,7 @@ async fn verifier_blocker2_a_refusing_store_never_claims_recorded() {
 #[tokio::test]
 async fn verifier_blocker2_the_users_sentence_matches_the_store() {
     let root = tempfile::tempdir().unwrap();
-    let (live, _) = start(
+    let live = start(
         root.path(),
         &[],
         StoreHandle::at_for_tests(&store_dir(root.path())),
@@ -398,7 +367,7 @@ async fn parked_refusal(live: &LiveSession, ip: &str, port: u16) -> String {
 #[tokio::test]
 async fn verifier_blocker3_a_swap_while_the_boot_queue_is_pending_makes_no_call() {
     let root = tempfile::tempdir().unwrap();
-    let (live, refusals) = start(
+    let live = start(
         root.path(),
         &[],
         StoreHandle::at_for_tests(&store_dir(root.path())),
@@ -407,13 +376,7 @@ async fn verifier_blocker3_a_swap_while_the_boot_queue_is_pending_makes_no_call(
     let controller = live.allowances();
     // Queued before `follow`.
     controller
-        .grant(
-            &refusals,
-            None,
-            Some(DESTINATION),
-            GrantScope::Session,
-            1_000,
-        )
+        .grant(Some(DESTINATION), GrantScope::Session, 1_000)
         .await;
 
     let recorder = Arc::new(Recorder::default());
@@ -425,13 +388,7 @@ async fn verifier_blocker3_a_swap_while_the_boot_queue_is_pending_makes_no_call(
     // A second grant in the pending window must queue, not swap: a swap here
     // would carry the unconfirmed entry.
     let queued = controller
-        .grant(
-            &refusals,
-            None,
-            Some(SESSION_ONLY),
-            GrantScope::Session,
-            2_000,
-        )
+        .grant(Some(SESSION_ONLY), GrantScope::Session, 2_000)
         .await;
     assert!(
         matches!(queued, GrantResult::QueuedForBoot { .. }),
@@ -457,7 +414,7 @@ async fn verifier_blocker3_a_swap_while_the_boot_queue_is_pending_makes_no_call(
 #[tokio::test]
 async fn verifier_blocker3_a_failed_flush_keeps_what_the_runtime_accepted() {
     let root = tempfile::tempdir().unwrap();
-    let (live, refusals) = start(
+    let live = start(
         root.path(),
         &[],
         StoreHandle::at_for_tests(&store_dir(root.path())),
@@ -479,13 +436,7 @@ async fn verifier_blocker3_a_failed_flush_keeps_what_the_runtime_accepted() {
     let _ = &project;
     // And a grant that cannot be in the boot policy.
     controller
-        .grant(
-            &refusals,
-            None,
-            Some(DESTINATION),
-            GrantScope::Session,
-            1_000,
-        )
+        .grant(Some(DESTINATION), GrantScope::Session, 1_000)
         .await;
 
     let recorder = Arc::new(Recorder::default());
@@ -536,7 +487,7 @@ async fn verifier_blocker3_a_failed_flush_keeps_what_the_runtime_accepted() {
 async fn verifier_allowances_session_filter_never_names_another_session() {
     use std::os::unix::net::UnixListener;
     let root = tempfile::tempdir().unwrap();
-    let (live, _) = start(
+    let live = start(
         root.path(),
         &[],
         StoreHandle::at_for_tests(&store_dir(root.path())),
@@ -625,7 +576,7 @@ fn cidr_rules(policy: &microsandbox::NetworkPolicy, cidr: &str) -> usize {
 #[tokio::test]
 async fn verifier_ac5_union_collapses_and_a_project_revoke_leaves_the_session_allowance() {
     let root = tempfile::tempdir().unwrap();
-    let (live, _) = start(
+    let live = start(
         root.path(),
         &[],
         StoreHandle::at_for_tests(&store_dir(root.path())),
@@ -718,7 +669,7 @@ async fn verifier_ac5_union_collapses_and_a_project_revoke_leaves_the_session_al
 #[tokio::test]
 async fn verifier_ac7_an_older_runtime_records_and_never_fails() {
     let root = tempfile::tempdir().unwrap();
-    let (live, _) = start(
+    let live = start(
         root.path(),
         &[],
         StoreHandle::at_for_tests(&store_dir(root.path())),
@@ -772,7 +723,7 @@ async fn verifier_ac13_a_refused_record_demotes_and_says_so_everywhere() {
     let dir = store_dir(root.path());
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
-    let (live, _) = start(root.path(), &[], StoreHandle::at_for_tests(&dir)).await;
+    let live = start(root.path(), &[], StoreHandle::at_for_tests(&dir)).await;
     let recorder = Arc::new(Recorder::default());
     live.allowances().attach_updater(recorder.handle());
     let id = parked_refusal(&live, "203.0.113.10", 443).await;
@@ -833,7 +784,7 @@ async fn verifier_ac13_a_refused_record_demotes_and_says_so_everywhere() {
 async fn verifier_ac3_an_unfixed_intercepted_port_is_refused_or_deferred() {
     let root = tempfile::tempdir().unwrap();
     // The launch fixed port 443 by granting one hostname; 8443 is not in it.
-    let (live, refusals) = start(
+    let live = start(
         root.path(),
         &["api.example.com"],
         StoreHandle::at_for_tests(&store_dir(root.path())),
@@ -845,13 +796,7 @@ async fn verifier_ac3_an_unfixed_intercepted_port_is_refused_or_deferred() {
     let destination = "tcp://other.example:8443";
 
     let refused = controller
-        .grant(
-            &refusals,
-            None,
-            Some(destination),
-            GrantScope::Session,
-            1_000,
-        )
+        .grant(Some(destination), GrantScope::Session, 1_000)
         .await;
     assert!(
         matches!(refused, GrantResult::Refused { .. }),
@@ -860,13 +805,7 @@ async fn verifier_ac3_an_unfixed_intercepted_port_is_refused_or_deferred() {
     assert_eq!(recorder.calls(), 0, "no swap was attempted");
 
     let deferred = controller
-        .grant(
-            &refusals,
-            None,
-            Some(destination),
-            GrantScope::Project,
-            2_000,
-        )
+        .grant(Some(destination), GrantScope::Project, 2_000)
         .await;
     assert!(
         matches!(deferred, GrantResult::NextLaunch { .. }),
@@ -881,7 +820,7 @@ async fn verifier_ac3_an_unfixed_intercepted_port_is_refused_or_deferred() {
 #[tokio::test]
 async fn verifier_ac4_a_queued_grant_does_not_promise_an_outcome() {
     let root = tempfile::tempdir().unwrap();
-    let (live, _) = start(
+    let live = start(
         root.path(),
         &[],
         StoreHandle::at_for_tests(&store_dir(root.path())),
@@ -965,7 +904,7 @@ async fn verifier_revoke_session_only_never_claims_the_record_is_gone() {
 #[tokio::test]
 async fn verifier_ac13_a_failed_runtime_writes_no_record() {
     let root = tempfile::tempdir().unwrap();
-    let (live, _) = start(
+    let live = start(
         root.path(),
         &[],
         StoreHandle::at_for_tests(&store_dir(root.path())),

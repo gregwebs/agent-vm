@@ -1518,7 +1518,6 @@ use crate::allowances::apply::{
     GrantResult, GrantScope, LiveAllowances, RevokeResult, RevokeScope, SessionAllowancesSnapshot,
     UnconfirmedReason, WireAllowance,
 };
-use crate::refusal::feed::LiveRefusals;
 use std::sync::{Arc, Mutex};
 
 /// One project directory a live controller can own.
@@ -1590,17 +1589,6 @@ fn live(
     let store = crate::allowances::StoreHandle::at_for_tests(root.path());
     let controller = LiveAllowances::new(project, store, plan);
     (controller, root)
-}
-
-fn live_refusals() -> Arc<LiveRefusals> {
-    LiveRefusals::new(crate::refusal::SessionRefusals::new(
-        crate::refusal::SessionInfo {
-            id: crate::refusal::SessionId::parse("0a1b2c3d").unwrap(),
-            pid: 1,
-            started_ms: 0,
-            socket: true,
-        },
-    ))
 }
 
 /// The policy a fresh launch resolved with exactly these entries would produce.
@@ -1733,12 +1721,9 @@ async fn live_grant_rederives_through_egress_authority_policy() {
     let (controller, _root) = live(&project, live_plan(&["api.example.com"], false));
     let recorder = Recorder::new();
     assert!(!controller.attach_updater(recorder.updater()));
-    let refusals = live_refusals();
 
     let result = controller
         .grant(
-            &refusals,
-            None,
             Some("tcp://[203.0.113.10/32]:443"),
             GrantScope::Session,
             1_000,
@@ -1766,17 +1751,10 @@ async fn live_grant_refuses_or_defers_when_intercepted_ports_change() {
     let (controller, root) = live(&project, live_plan(&[], false));
     let recorder = Recorder::new();
     controller.attach_updater(recorder.updater());
-    let refusals = live_refusals();
 
     // A launch that intercepted nothing cannot grant a hostname live.
     let result = controller
-        .grant(
-            &refusals,
-            None,
-            Some("api.example.com"),
-            GrantScope::Session,
-            1_000,
-        )
+        .grant(Some("api.example.com"), GrantScope::Session, 1_000)
         .await;
     assert!(
         matches!(
@@ -1791,13 +1769,7 @@ async fn live_grant_refuses_or_defers_when_intercepted_ports_change() {
 
     // With `--project` the same grant becomes a next-launch record.
     let result = controller
-        .grant(
-            &refusals,
-            None,
-            Some("api.example.com"),
-            GrantScope::Project,
-            2_000,
-        )
+        .grant(Some("api.example.com"), GrantScope::Project, 2_000)
         .await;
     assert!(
         matches!(
@@ -1832,29 +1804,16 @@ async fn live_revoke_of_last_hostname_stops_connections_within_launch_ports_and_
     let (controller, _root) = live(&project, live_plan(&["api.example.com"], false));
     let recorder = Recorder::new();
     controller.attach_updater(recorder.updater());
-    let refusals = live_refusals();
 
     let session = controller
-        .grant(
-            &refusals,
-            None,
-            Some("api.example.com"),
-            GrantScope::Session,
-            1_000,
-        )
+        .grant(Some("api.example.com"), GrantScope::Session, 1_000)
         .await;
     assert!(
         matches!(session, GrantResult::Applied { .. }),
         "{session:?}"
     );
     let project_grant = controller
-        .grant(
-            &refusals,
-            None,
-            Some("api.example.com"),
-            GrantScope::Project,
-            2_000,
-        )
+        .grant(Some("api.example.com"), GrantScope::Project, 2_000)
         .await;
     assert!(
         matches!(project_grant, GrantResult::Applied { .. }),
@@ -1910,7 +1869,6 @@ async fn live_revoke_of_last_hostname_stops_connections_within_launch_ports_and_
     };
     let recorder = Recorder::new();
     controller.attach_updater(recorder.updater());
-    let refusals = live_refusals();
     let result = controller
         .revoke(
             &Allowance::parse("fixed.example").unwrap(),
@@ -1941,13 +1899,7 @@ async fn live_revoke_of_last_hostname_stops_connections_within_launch_ports_and_
     // intercept, so a fresh hostname applies live instead of deferring to the
     // next launch.
     let regranted = controller
-        .grant(
-            &refusals,
-            None,
-            Some("api.example.com"),
-            GrantScope::Session,
-            4_000,
-        )
+        .grant(Some("api.example.com"), GrantScope::Session, 4_000)
         .await;
     assert!(
         matches!(regranted, GrantResult::Applied { .. }),
@@ -1957,8 +1909,6 @@ async fn live_revoke_of_last_hostname_stops_connections_within_launch_ports_and_
     // Part 3: a runtime failure keeps every entry.
     controller
         .grant(
-            &refusals,
-            None,
             Some("tcp://[203.0.113.10/32]:443"),
             GrantScope::Session,
             5_000,
@@ -2091,8 +2041,6 @@ async fn proxy_skipped_boot_hostname_stays_recorded_and_does_not_block_live_addr
     controller.attach_updater(recorder.updater());
     let result = controller
         .grant(
-            &live_refusals(),
-            None,
             Some("tcp://[198.51.100.0/24]:443"),
             GrantScope::Session,
             1_000,
@@ -2106,13 +2054,7 @@ async fn proxy_skipped_boot_hostname_stays_recorded_and_does_not_block_live_addr
     // into a next-launch record would write a hostname the proxy cannot honour).
     let before = recorder.calls();
     let refused = controller
-        .grant(
-            &live_refusals(),
-            None,
-            Some("other.example"),
-            GrantScope::Project,
-            2_000,
-        )
+        .grant(Some("other.example"), GrantScope::Project, 2_000)
         .await;
     match refused {
         GrantResult::Refused { reason } => assert!(
@@ -2140,12 +2082,9 @@ async fn proxy_skipped_boot_hostname_stays_recorded_and_does_not_block_live_addr
 async fn queued_grants_are_promoted_or_dropped_with_a_notice() {
     let project = live_project("p2");
     let (controller, root) = live(&project, live_plan(&[], false));
-    let refusals = live_refusals();
 
     let queued = controller
         .grant(
-            &refusals,
-            None,
             Some("tcp://[203.0.113.10/32]:443"),
             GrantScope::Project,
             1_000,
@@ -2174,11 +2113,8 @@ async fn queued_grants_are_promoted_or_dropped_with_a_notice() {
 
     // Failure: the queued entry is dropped, and the notice names the record.
     let (controller, _root) = self::live(&live_project("p2b"), live_plan(&[], false));
-    let refusals = live_refusals();
     controller
         .grant(
-            &refusals,
-            None,
             Some("tcp://[198.51.100.0/24]:443"),
             GrantScope::Project,
             2_000,
@@ -2186,8 +2122,6 @@ async fn queued_grants_are_promoted_or_dropped_with_a_notice() {
         .await;
     controller
         .grant(
-            &refusals,
-            None,
             Some("tcp://[203.0.113.0/24]:443"),
             GrantScope::Session,
             3_000,
@@ -2252,8 +2186,6 @@ async fn revoke_names_only_what_the_policy_still_allows() {
     controller.attach_updater(recorder.updater());
     let held = controller
         .grant(
-            &live_refusals(),
-            None,
             Some("tcp://[198.51.100.9/32]:443"),
             GrantScope::Session,
             1_000,
@@ -2297,8 +2229,6 @@ async fn revoke_of_a_queued_entry_reports_no_revision() {
     let (controller, _root) = live(&live_project("m01"), live_plan(&[], false));
     let queued = controller
         .grant(
-            &live_refusals(),
-            None,
             Some("tcp://[203.0.113.11/32]:443"),
             GrantScope::Session,
             1_000,
@@ -2333,16 +2263,9 @@ async fn revoke_of_a_queued_entry_reports_no_revision() {
 async fn project_grant_over_a_queued_session_entry_records_before_claiming_it() {
     let project = live_project("b02");
     let (controller, root) = live(&project, live_plan(&[], false));
-    let refusals = live_refusals();
     let destination = "tcp://[203.0.113.12/32]:443";
     let queued = controller
-        .grant(
-            &refusals,
-            None,
-            Some(destination),
-            GrantScope::Session,
-            1_000,
-        )
+        .grant(Some(destination), GrantScope::Session, 1_000)
         .await;
     assert!(
         matches!(
@@ -2356,13 +2279,7 @@ async fn project_grant_over_a_queued_session_entry_records_before_claiming_it() 
     );
 
     let recorded = controller
-        .grant(
-            &refusals,
-            None,
-            Some(destination),
-            GrantScope::Project,
-            2_000,
-        )
+        .grant(Some(destination), GrantScope::Project, 2_000)
         .await;
     assert!(
         matches!(
@@ -2385,24 +2302,12 @@ async fn project_grant_over_a_queued_session_entry_records_before_claiming_it() 
     // A store that cannot be written refuses instead, and moves nothing.
     let (blocked, blocked_root) = live(&live_project("b02b"), live_plan(&[], false));
     blocked
-        .grant(
-            &refusals,
-            None,
-            Some(destination),
-            GrantScope::Session,
-            1_000,
-        )
+        .grant(Some(destination), GrantScope::Session, 1_000)
         .await;
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::set_permissions(blocked_root.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
     match blocked
-        .grant(
-            &refusals,
-            None,
-            Some(destination),
-            GrantScope::Project,
-            2_000,
-        )
+        .grant(Some(destination), GrantScope::Project, 2_000)
         .await
     {
         GrantResult::Refused { reason } => assert!(
@@ -2428,11 +2333,8 @@ async fn project_grant_over_a_queued_session_entry_records_before_claiming_it() 
 #[tokio::test]
 async fn a_grant_while_the_boot_queue_is_pending_makes_no_swap() {
     let (controller, _root) = live(&live_project("b03"), live_plan(&[], false));
-    let refusals = live_refusals();
     controller
         .grant(
-            &refusals,
-            None,
             Some("tcp://[203.0.113.13/32]:443"),
             GrantScope::Session,
             1_000,
@@ -2442,8 +2344,6 @@ async fn a_grant_while_the_boot_queue_is_pending_makes_no_swap() {
     assert!(controller.attach_updater(recorder.updater()));
     let second = controller
         .grant(
-            &refusals,
-            None,
             Some("tcp://[198.51.100.13/32]:443"),
             GrantScope::Session,
             2_000,
@@ -2480,8 +2380,6 @@ async fn a_grant_while_the_boot_queue_is_pending_makes_no_swap() {
         .store(false, std::sync::atomic::Ordering::SeqCst);
     let third = controller
         .grant(
-            &refusals,
-            None,
             Some("tcp://[192.0.2.13/32]:443"),
             GrantScope::Session,
             3_000,
@@ -2501,31 +2399,18 @@ async fn a_grant_while_the_boot_queue_is_pending_makes_no_swap() {
 async fn project_grant_over_a_session_entry_keeps_the_demotion_on_the_entry() {
     let project = live_project("m02");
     let (controller, root) = live(&project, live_plan(&[], false));
-    let refusals = live_refusals();
     let destination = "tcp://[203.0.113.14/32]:443";
     let recorder = Recorder::new();
     controller.attach_updater(recorder.updater());
     let first = controller
-        .grant(
-            &refusals,
-            None,
-            Some(destination),
-            GrantScope::Session,
-            1_000,
-        )
+        .grant(Some(destination), GrantScope::Session, 1_000)
         .await;
     assert!(matches!(first, GrantResult::Applied { .. }), "{first:?}");
 
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
     let failed = controller
-        .grant(
-            &refusals,
-            None,
-            Some(destination),
-            GrantScope::Project,
-            2_000,
-        )
+        .grant(Some(destination), GrantScope::Project, 2_000)
         .await;
     assert!(
         matches!(failed, GrantResult::AppliedNotRecorded { .. }),
@@ -2557,12 +2442,9 @@ async fn adopt_boot_allowances_rederives_a_queued_grant_over_the_post_adoption_p
     assert_eq!(adopted.len(), 1);
 
     let (controller, _root) = live(&project, launch.live_policy_plan(Some(file)));
-    let refusals = live_refusals();
     // Queued before adoption, on the configured-only plan.
     let queued = controller
         .grant(
-            &refusals,
-            None,
             Some("tcp://[203.0.113.15/32]:443"),
             GrantScope::Session,
             2_000,
@@ -2622,19 +2504,12 @@ async fn adopt_boot_allowances_rederives_a_queued_grant_over_the_post_adoption_p
 #[tokio::test]
 async fn live_tables_are_bounded_and_refused_with_a_reason() {
     let (controller, _root) = live(&live_project("m08"), live_plan(&[], false));
-    let refusals = live_refusals();
     let recorder = Recorder::new();
     controller.attach_updater(recorder.updater());
     for index in 0..256u32 {
         let destination = format!("tcp://[10.{}.{}.1/32]:443", index / 256, index % 256);
         let result = controller
-            .grant(
-                &refusals,
-                None,
-                Some(&destination),
-                GrantScope::Session,
-                1_000,
-            )
+            .grant(Some(&destination), GrantScope::Session, 1_000)
             .await;
         assert!(
             matches!(result, GrantResult::Applied { .. }),
@@ -2643,8 +2518,6 @@ async fn live_tables_are_bounded_and_refused_with_a_reason() {
     }
     let refused = controller
         .grant(
-            &refusals,
-            None,
             Some("tcp://[192.0.2.99/32]:443"),
             GrantScope::Session,
             1_000,

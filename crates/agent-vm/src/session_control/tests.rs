@@ -1077,6 +1077,31 @@ async fn protocol_v1_and_v2_coexist_and_reject_unknown_versions() {
     harness.shutdown().await;
 }
 
+/// P1b: a `v: 2` grant names a destination. One that names none is a refusal in
+/// the grant vocabulary, so the reply shape a client already handles is unchanged.
+#[tokio::test]
+async fn a_grant_that_names_no_destination_is_refused() {
+    let harness = Harness::new().await;
+    let mut client = Client::connect(&harness.socket).await;
+    client.send("{\"v\":2,\"op\":\"grant\"}").await;
+    match client.reply().await {
+        Reply::Grant {
+            v,
+            result: crate::allowances::GrantResult::Refused { reason },
+        } => {
+            assert_eq!(v, 2);
+            assert_eq!(
+                reason,
+                crate::allowances::GrantRefusalReason::NotAllowable {
+                    message: "the request names no destination".to_owned()
+                }
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    harness.shutdown().await;
+}
+
 /// P2: a grant before the runtime is attached is queued; the flush either
 /// promotes it or drops it with a notice naming the destination.
 #[tokio::test]
