@@ -1709,6 +1709,22 @@ fn grantable_destination_round_trips_through_covers() {
     }
 }
 
+/// #598: `site` is the one untrusted field a `CannotAllow` line names, and
+/// `access allow` prints that line as it is, so the variant escapes it once — the
+/// same policy `RefusalEntry::reason()` uses for the site it names.
+#[test]
+fn a_forged_site_is_escaped_once_in_the_refusal_line() {
+    let line = CannotAllow::SiteNotAllowable {
+        site: r"a\b".to_owned(),
+    }
+    .line();
+    assert!(
+        line.contains(r"at a\\b, which"),
+        "the site's backslash is doubled once: {line}"
+    );
+    assert!(!line.contains(r"a\\\\b"), "not twice: {line}");
+}
+
 /// L2: the policy handed to the runtime is the launch's one computation over
 /// `session ∪ project`, byte for byte.
 #[tokio::test]

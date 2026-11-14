@@ -716,7 +716,11 @@ async fn run_allow(
                 err,
                 "cannot allow {}: {}",
                 escape(&args.id),
-                escape(&reason.line())
+                // `reason()` already escaped every untrusted part it names, and
+                // `line()` only guarantees one line (#598). Escaping the composed
+                // line again doubles each backslash, so the same refusal would
+                // read differently here than in the table's ACTION cell.
+                reason.line()
             )
             .context("writing the refusal reason")?;
             return Ok(1);
