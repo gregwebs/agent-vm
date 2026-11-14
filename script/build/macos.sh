@@ -38,21 +38,6 @@ run_rust_tool() {
     RUSTUP_AUTO_INSTALL=0 rustup run "$RUST_TOOLCHAIN" "$@"
 }
 
-# Prints wall-clock time for one build stage to stderr without altering its
-# output or exit status. Temporary instrumentation for diagnosing where
-# ./script/build/macos.sh spends time on a no-op rerun; not meant to stay
-# long-term once the slow stage is identified.
-stage() {
-    local name="$1" start end elapsed
-    shift
-    start="$(date +%s)"
-    echo "==> [timing] start: $name" >&2
-    "$@"
-    end="$(date +%s)"
-    elapsed=$((end - start))
-    echo "==> [timing] done: $name (${elapsed}s)" >&2
-}
-
 rust_toolchain_error() {
     local tool="$1"
 
@@ -221,21 +206,39 @@ firmware_gitlink() {
 }
 
 require_clean_firmware_source() {
-    local firmware_source=vendor/microsandbox/vendor/libkrunfw
-    [[ "$(git -C "$firmware_source" rev-parse HEAD)" == "$(firmware_gitlink)" ]] || {
+    local firmware_source=vendor/microsandbox/vendor/libkrunfw head status
+
+    head="$(git -C "$firmware_source" rev-parse HEAD)" || {
+        echo "error: cannot read the nested libkrunfw commit; run git submodule update --init --recursive" >&2
+        exit 1
+    }
+    [[ "$head" == "$(firmware_gitlink)" ]] || {
         echo "error: nested libkrunfw checkout does not match its gitlink; run git submodule update --init --recursive" >&2
         exit 1
     }
-    [[ -z "$(git -C "$firmware_source" status --porcelain --untracked-files=normal)" ]] || {
+    # A failing status probe prints nothing, and "nothing" must not read as clean.
+    status="$(git -C "$firmware_source" status --porcelain --untracked-files=normal)" || {
+        echo "error: cannot read the nested libkrunfw status; restore it before building or reusing firmware" >&2
+        exit 1
+    }
+    [[ -z "$status" ]] || {
         echo "error: nested libkrunfw source is dirty; restore it before building or reusing firmware" >&2
         exit 1
     }
 }
 
 firmware_artifact_is_valid() {
-    local path="$1" archs
+    local path="$1" archs kind
 
-    file "$path" >&2
+    # `file` names the Mach-O flavour: an arm64 *executable* is not a firmware
+    # library, and the shared store hands this function artifacts no build of
+    # this checkout produced.
+    kind="$(file "$path" 2>/dev/null)" || return 1
+    case "$kind" in
+        *"shared library"*) ;;
+        *) return 1 ;;
+    esac
+    printf '%s\n' "$kind" >&2
     archs="$(lipo -archs "$path")" || return 1
     [[ "$archs" == arm64 ]] || return 1
     otool -L "$path" >/dev/null
@@ -250,27 +253,100 @@ require_valid_firmware_artifact() {
     }
 }
 
+# Where a firmware dylib for one pinned source is kept for every checkout on this
+# host. The artifact and its stamp live inside the checkout, so reuse was
+# per-worktree: a second checkout of the same pin paid the whole Docker kernel
+# build again (983 s of a 1297 s cold build here). The stamp that already guards
+# the local artifact names this entry, so a sibling worktree copies instead of
+# rebuilding.
+#
+# The root matches host_paths::cache_root: an absolute $XDG_CACHE_HOME, else
+# $HOME/.cache. Neither usable means no shared cache -- a slow build, never a
+# wrong one.
+shared_firmware_path() {
+    local gitlink="$1" root="${XDG_CACHE_HOME:-}"
+
+    if [[ "$root" != /* ]]; then
+        root="${HOME:-}"
+        [[ "$root" == /* ]] || return 1
+        root="$root/.cache"
+    fi
+    printf '%s\n' "$root/agent-vm/firmware/libkrunfw-5-$gitlink.dylib"
+}
+
+# The path names the pinned source, so a hit still has to be a loadable arm64
+# dylib before it is allowed to become this checkout's artifact: a truncated or
+# hand-copied file rebuilds.
+shared_firmware_is_reusable() {
+    local path="$1"
+
+    [[ -n "$path" && -f "$path" ]] || return 1
+    firmware_artifact_is_valid "$path" >/dev/null 2>&1
+}
+
+# Best-effort by design: a cache that cannot be written costs the next worktree a
+# rebuild, never this build, so nothing here may fail a build that already
+# produced a verified artifact. Every failure says so, because silence here looks
+# like a cache that is simply not helping.
+#
+# The staged copy is uniquely named: concurrent checkouts of one pin publish the
+# same entry, and a shared staging name would let one rename another's
+# half-written file into place.
+publish_shared_firmware() {
+    local artifact="$1" gitlink="$2" entry dir staged
+
+    entry="$(shared_firmware_path "$gitlink")" || return 0
+    dir="${entry%/*}"
+    mkdir -p "$dir" 2>/dev/null || {
+        echo "warning: cannot create the shared firmware cache $dir; the next worktree rebuilds" >&2
+        return 0
+    }
+    staged="$(mktemp "$dir/.libkrunfw.XXXXXX" 2>/dev/null)" || {
+        echo "warning: cannot stage a copy in the shared firmware cache $dir; the next worktree rebuilds" >&2
+        return 0
+    }
+    if ! install -m 0644 "$artifact" "$staged" 2>/dev/null; then
+        rm -f "$staged" || true
+        echo "warning: cannot write the shared firmware cache $entry; the next worktree rebuilds" >&2
+        return 0
+    fi
+    if ! mv -f "$staged" "$entry" 2>/dev/null; then
+        rm -f "$staged" || true
+        echo "warning: cannot publish the shared firmware cache $entry; the next worktree rebuilds" >&2
+    fi
+    return 0
+}
+
 build_firmware_if_missing() {
     local firmware=vendor/microsandbox/build/libkrunfw.5.dylib
     local stamp="${firmware}.source-sha"
     local source_firmware=vendor/microsandbox/vendor/libkrunfw/libkrunfw.5.dylib
     local staged_firmware="${firmware}.next"
     local staged_stamp="${stamp}.next"
-    local gitlink expected_stamp
+    local gitlink expected_stamp shared_firmware=''
 
     require_clean_firmware_source
     gitlink="$(firmware_gitlink)"
     expected_stamp="$gitlink"
     if [[ "${MSB_FORCE_FIRMWARE_REBUILD:-}" != 1 && -f "$firmware" && -f "$stamp" && "$(cat "$stamp")" == "$expected_stamp" ]]; then
         if firmware_artifact_is_valid "$firmware" >/dev/null 2>&1; then
+            # Seed the shared copy from a checkout that already has one, so the
+            # store converges without a second build anywhere.
+            shared_firmware="$(shared_firmware_path "$expected_stamp")" || shared_firmware=''
+            shared_firmware_is_reusable "$shared_firmware" ||
+                publish_shared_firmware "$firmware" "$expected_stamp"
             return
         fi
         echo "==> Rebuilding invalid cached vendored firmware"
-    else
-        echo "==> Building vendored firmware from pinned source"
+    fi
+    # A shared entry becomes this checkout's artifact by a copy, so it is keyed and
+    # validated exactly like the local one. Force mode ignores it too.
+    if [[ "${MSB_FORCE_FIRMWARE_REBUILD:-}" != 1 ]]; then
+        shared_firmware="$(shared_firmware_path "$expected_stamp")" || shared_firmware=''
     fi
 
     (
+        local built
         # shellcheck disable=SC2317,SC2329 # This cleanup is invoked by the EXIT trap below.
         cleanup_firmware_staging() {
             rm -f "$staged_firmware" "$staged_stamp"
@@ -278,21 +354,37 @@ build_firmware_if_missing() {
         trap cleanup_firmware_staging EXIT
 
         rm -f "$staged_firmware" "$staged_stamp"
-        (
-            cd vendor/microsandbox/vendor/libkrunfw
-            export LIBKRUNFW_BUILD_BACKEND=docker
-	    #if which container >/dev/null ; then
-	    #    echo "==> Building with container"
-	    #    export LIBKRUNFW_BUILD_BACKEND=container
-	    #    export LIBKRUNFW_BUILD_DNS=1.1.1.1
-	    #fi
-	    ./build_in_docker.sh
-            cc -fPIC -DABI_VERSION=5 -shared -o libkrunfw.5.dylib kernel.c
-        )
-        mkdir -p vendor/microsandbox/build
-        install -m 0644 "$source_firmware" "$staged_firmware"
+        built=1
+        if shared_firmware_is_reusable "$shared_firmware"; then
+            echo "==> Reusing shared vendored firmware for $expected_stamp from $shared_firmware"
+            install -m 0644 "$shared_firmware" "$staged_firmware"
+            built=0
+        else
+            echo "==> Building vendored firmware from pinned source"
+            (
+                cd vendor/microsandbox/vendor/libkrunfw
+                export LIBKRUNFW_BUILD_BACKEND=docker
+                ./build_in_docker.sh
+                cc -fPIC -DABI_VERSION=5 -shared -o libkrunfw.5.dylib kernel.c
+            )
+            mkdir -p vendor/microsandbox/build
+            install -m 0644 "$source_firmware" "$staged_firmware"
+        fi
         require_valid_firmware_artifact "$staged_firmware"
+        # A build can run for 16 minutes, which is long enough for the pin to move
+        # under it. This artifact may stand for $expected_stamp locally and in
+        # every other checkout, so prove the source is still that pin first.
+        require_clean_firmware_source
+        gitlink="$(firmware_gitlink)"
+        [[ "$gitlink" == "$expected_stamp" ]] || {
+            echo "error: the nested libkrunfw gitlink changed during the build; nothing was published" >&2
+            exit 1
+        }
         printf '%s\n' "$expected_stamp" >"$staged_stamp"
+        # A copy taken from the store must not be written back to it.
+        if ((built)); then
+            publish_shared_firmware "$staged_firmware" "$expected_stamp"
+        fi
         mv -f "$staged_firmware" "$firmware"
         mv -f "$staged_stamp" "$stamp"
         trap - EXIT
@@ -302,9 +394,9 @@ build_firmware_if_missing() {
 build_microsandbox_runtime() {
     local dev="$1"
     echo "==> Building vendored microsandbox runtime"
-    stage build_agentd build_agentd
-    stage build_and_sign_msb build_and_sign_msb "$dev"
-    stage build_firmware_if_missing build_firmware_if_missing
+    build_agentd
+    build_and_sign_msb "$dev"
+    build_firmware_if_missing
 }
 
 require_build_outputs() {
@@ -535,21 +627,16 @@ main() {
         exit 2
     fi
 
-    local script_start
-    script_start="$(date +%s)"
-
-    stage preflight preflight
-    stage build_microsandbox_runtime build_microsandbox_runtime "$dev"
-    stage require_build_outputs require_build_outputs "$dev"
+    preflight
+    build_microsandbox_runtime "$dev"
+    require_build_outputs "$dev"
     if [[ "$single" == true ]]; then
-        stage build_single_binary_agent_vm build_single_binary_agent_vm
-        stage publish_single_binary publish_single_binary
+        build_single_binary_agent_vm
+        publish_single_binary
     else
-        stage build_agent_vm build_agent_vm "$dev"
-        stage publish_bundle publish_bundle "$dev"
+        build_agent_vm "$dev"
+        publish_bundle "$dev"
     fi
-
-    echo "==> [timing] total: $(( $(date +%s) - script_start ))s" >&2
 }
 
 main "$@"

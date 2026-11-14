@@ -47,7 +47,9 @@ target/macos/
     └── libkrunfw.5.dylib
 ```
 
-Re-running `./script/build/macos.sh` is safe. It retains Cargo and Docker incremental output and atomically replaces the verified bundle files without requiring manual copying, signing, or environment setup. Firmware reuse also requires a clean recursive checkout, a validated dylib, and a matching `vendor/microsandbox/build/libkrunfw.5.dylib.source-sha` value for the nested firmware gitlink; a missing, stale, dirty, invalid, or force-rebuild (`MSB_FORCE_FIRMWARE_REBUILD=1`) case rebuilds into staged files and publishes the dylib before its matching stamp. The stamp guards this local cache only; it is not release provenance. The macOS workflow does not require `just`.
+Re-running `./script/build/macos.sh` is safe. It retains Cargo and Docker incremental output and atomically replaces the verified bundle files without requiring manual copying, signing, or environment setup. Firmware reuse also requires a clean recursive checkout, a validated dylib, and a matching `vendor/microsandbox/build/libkrunfw.5.dylib.source-sha` value for the nested firmware gitlink; a missing, stale, dirty, invalid, or force-rebuild (`MSB_FORCE_FIRMWARE_REBUILD=1`) case rebuilds into staged files and publishes the dylib before its matching stamp. The stamp is the identity of the firmware source, not release provenance.
+
+That identity also names a **shared** copy, `$XDG_CACHE_HOME/agent-vm/firmware/libkrunfw-5-<gitlink>.dylib` (or `$HOME/.cache/agent-vm/firmware/…`), which every checkout of the same pin on the host reads and a successful build writes. The Docker kernel build is the expensive stage — 983 s of a 1297 s first build in a fresh worktree here — and it builds the same *source*, so a second worktree, or one that lost its stamp, copies instead of rebuilding. The gitlink identifies the source only: the build also takes `fedora:latest`, its package mirrors, and the host `cc`, so a hit is not a bit-for-bit reproduction of what a build today would produce. A missing, unreadable, non-arm64, non-dylib, or non-loadable entry falls back to a build; a cache that cannot be written warns and does not fail the build; a build with no usable cache root still succeeds. The store is trusted local input on that basis — the key names the source, and nothing verifies who wrote the entry — so it is not provenance and nothing outside this machine should be seeded from it. Once a copy exists, the checkout's own artifact and stamp are indistinguishable from a locally built pair, so nothing downstream can tell the difference. The macOS workflow does not require `just`.
 
 ## Build a single binary
 
@@ -114,6 +116,12 @@ The dev bundle is for local iteration only: it is unstripped, unoptimized,
 and meaningfully larger and slower at runtime than the release bundle.
 Never ship or benchmark from `target/macos-dev/`; use the default
 `./script/build/macos.sh` (no `--dev`) for that.
+
+Because `--dev` must not overwrite the release artifact, it publishes the
+vendored runtime as `vendor/microsandbox/build/msb-dev`. `script/test/e2e.sh`
+takes `build/msb` when it exists and otherwise `build/msb-dev`, saying which one
+it bound, so a dev-only worktree can run the e2e group without symlinking a debug
+runtime into the release name.
 
 ## Import and boot a local image without a registry
 

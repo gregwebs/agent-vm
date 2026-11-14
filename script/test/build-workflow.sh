@@ -12,6 +12,12 @@ TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/agent-vm-build-workflow.XXXXXX")"
 TEST_ROOT="$(cd "$TEST_ROOT" && pwd)"
 trap 'rm -rf "$TEST_ROOT"' EXIT
 
+# Every fixture build runs with a private HOME, so the shared firmware store (see
+# "Firmware reuse" below) is private to this run: the tests assert both a hit and
+# a miss, and a real ~/.cache would leak state between runs.
+FIXTURE_HOME="$TEST_ROOT/home"
+mkdir -p "$FIXTURE_HOME"
+
 fail() {
     echo "FAIL: $*" >&2
     exit 1
@@ -47,6 +53,18 @@ assert_mode() {
     [[ "$actual" == "$expected" ]] || fail "$path mode was $actual, expected $expected"
 }
 
+# BSD stat spells the inode query `-f %i` and GNU spells it `-c %i`, and on Linux
+# the BSD form exits 1 *after* writing a whole filesystem dump to stdout -- so the
+# probe has to be an `if`, not an `||`, or the dump is what gets compared.
+file_inode() {
+    local inode
+    if inode="$(stat -f '%i' "$1" 2>/dev/null)"; then
+        printf '%s\n' "$inode"
+    else
+        stat -c '%i' "$1"
+    fi
+}
+
 make_tool() {
     local path="$1" body="$2"
     printf '#!/bin/bash\nset -euo pipefail\n%s\n' "$body" >"$path"
@@ -72,7 +90,7 @@ printf '%s\n' 'firmware docker build' >>"$FAKE_LOG"
 SH
     chmod +x "$fixture/vendor/microsandbox/vendor/libkrunfw/build_in_docker.sh"
     ln -s /bin/bash "$fakebin/bash"
-    for tool in mkdir rm mv cp cat chmod touch awk date cmp; do
+    for tool in mkdir rm mv cp cat chmod touch awk date cmp mktemp; do
         ln -s "$(command -v "$tool")" "$fakebin/$tool"
     done
 
@@ -188,7 +206,22 @@ elif [[ "${1:-}" == -d ]]; then
     printf "%s\n" "<plist><dict/></plist>"
 fi'
     make_tool "$fakebin/xcode-select" '[[ "${FAKE_XCODE_MISSING:-}" != 1 ]]'
-    make_tool "$fakebin/file" 'printf "%s: Mach-O 64-bit executable arm64\n" "$1"'
+    # `file` is the only probe that distinguishes a firmware dylib from an arm64
+    # executable, so it has to answer both, and to answer per path: a test can make
+    # just the shared-store copy look like an executable.
+    make_tool "$fakebin/file" '
+kind=shared
+if [[ "${FAKE_FILE_KIND:-}" == executable ]]; then kind=executable; fi
+if [[ -n "${FAKE_FILE_PATH_KIND:-}" ]]; then
+    case "$1" in
+        *"${FAKE_FILE_PATH_KIND%%:*}"*) kind="${FAKE_FILE_PATH_KIND#*:}" ;;
+    esac
+fi
+if [[ "$kind" == executable ]]; then
+    printf "%s: Mach-O 64-bit executable arm64\n" "$1"
+else
+    printf "%s: Mach-O 64-bit dynamically linked shared library arm64\n" "$1"
+fi'
     make_tool "$fakebin/lipo" '
 [[ "${1:-}" == -archs ]] || exit 2
 case "${FAKE_BAD_ARCH_PATH:-}" in
@@ -232,7 +265,10 @@ printf "%s\n" firmware >"$out"'
 case "${3:-}" in
     ls-tree) printf "%s\\n" "160000 commit ${FAKE_FIRMWARE_SHA:-c51f0146f9fe836e4fe1bf2c061c70bedfad058c} vendor/libkrunfw" ;;
     rev-parse) printf "%s\\n" "${FAKE_FIRMWARE_HEAD:-c51f0146f9fe836e4fe1bf2c061c70bedfad058c}" ;;
-    status) [[ "${FAKE_FIRMWARE_DIRTY:-}" != 1 ]] || printf "%s\\n" " M kernel.c" ;;
+    status)
+        [[ "${FAKE_FIRMWARE_STATUS_FAIL:-}" != 1 ]] || exit 1
+        [[ "${FAKE_FIRMWARE_DIRTY:-}" != 1 ]] || printf "%s\\n" " M kernel.c"
+        ;;
     *) exit 3 ;;
 esac'
 
@@ -264,7 +300,9 @@ run_fixture_script() {
     (
         cd "$TEST_ROOT"
         set +u
-        /usr/bin/env "${env_args[@]}" PATH="$fakebin" FAKE_LOG="$fixture/calls.log" \
+        # HOME first so a test can override it with `env HOME= ...`.
+        /usr/bin/env HOME="$FIXTURE_HOME" XDG_CACHE_HOME= "${env_args[@]}" PATH="$fakebin" \
+            FAKE_LOG="$fixture/calls.log" \
             "$fixture/$script" "${script_args[@]}"
     )
 }
@@ -332,38 +370,115 @@ if [[ -s "$fixture/calls.log" ]]; then
     case "$calls" in *"firmware docker build"*) fail "existing firmware was rebuilt" ;; esac
 fi
 
-# Firmware reuse is tied to the clean nested-source gitlink, not merely a
-# file left in build/. Missing stamps, a changed gitlink, force mode, and an
-# invalid cache all rebuild; a dirty source refuses rather than stamping an
-# artifact whose source identity cannot be claimed.
-[[ "$(cat "$fixture/vendor/microsandbox/build/libkrunfw.5.dylib.source-sha")" == c51f0146f9fe836e4fe1bf2c061c70bedfad058c ]]
+# Firmware reuse is tied to the clean nested-source gitlink, not merely a file
+# left in build/. The same identity keys the shared store every checkout on the
+# host reads, so a build publishes what it made and a checkout that lost its own
+# copy takes that one back instead of rebuilding. Without it, the second worktree
+# of a pin paid the whole Docker kernel build again (983 s of a 1297 s cold build).
+SHARED_FIRMWARE="$FIXTURE_HOME/.cache/agent-vm/firmware/libkrunfw-5-c51f0146f9fe836e4fe1bf2c061c70bedfad058c.dylib"
+FIRMWARE_STAMP="c51f0146f9fe836e4fe1bf2c061c70bedfad058c"
+firmware_built() {
+    case "$(cat "$1/calls.log")" in
+        *"firmware docker build"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+[[ -f "$SHARED_FIRMWARE" ]] || fail "the build did not publish the shared firmware store"
+[[ "$(cat "$SHARED_FIRMWARE")" == firmware ]]
+[[ "$(cat "$fixture/vendor/microsandbox/build/libkrunfw.5.dylib.source-sha")" == "$FIRMWARE_STAMP" ]]
 rm "$fixture/vendor/microsandbox/build/libkrunfw.5.dylib.source-sha"
 : >"$fixture/calls.log"
 run_build "$fixture" "$fakebin"
-assert_file_contains "$fixture/calls.log" "firmware docker build"
+if firmware_built "$fixture"; then
+    fail "a dropped stamp rebuilt firmware instead of restoring it from the shared store"
+fi
+[[ "$(cat "$fixture/vendor/microsandbox/build/libkrunfw.5.dylib.source-sha")" == "$FIRMWARE_STAMP" ]]
+
+# The case this exists for: a second checkout of the same pin copies the
+# published artifact, stamp included, and never runs the Docker build. A copy
+# taken from the store is not written back, so the entry keeps its identity.
+make_fixture second-worktree
+shared_inode="$(file_inode "$SHARED_FIRMWARE")"
 : >"$fixture/calls.log"
-run_build "$fixture" "$fakebin" env MSB_FORCE_FIRMWARE_REBUILD=1
-assert_file_contains "$fixture/calls.log" "firmware docker build"
+run_build "$fixture" "$fakebin"
+if firmware_built "$fixture"; then
+    fail "a sibling checkout rebuilt firmware the shared store already had"
+fi
+[[ "$(cat "$fixture/vendor/microsandbox/build/libkrunfw.5.dylib")" == firmware ]]
+[[ "$(cat "$fixture/vendor/microsandbox/build/libkrunfw.5.dylib.source-sha")" == "$FIRMWARE_STAMP" ]]
+[[ "$(file_inode "$SHARED_FIRMWARE")" == "$shared_inode" ]] ||
+    fail "a shared-cache hit rewrote the entry it copied"
+
+# A changed gitlink is a different key: build, never borrow a neighbour's bytes,
+# and a dirty or unreadable source refuses rather than claiming an identity it
+# cannot verify.
 : >"$fixture/calls.log"
 run_build "$fixture" "$fakebin" env FAKE_FIRMWARE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa FAKE_FIRMWARE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-assert_file_contains "$fixture/calls.log" "firmware docker build"
+firmware_built "$fixture" || fail "a changed gitlink reused another pin's firmware"
 expect_build_failure "nested libkrunfw source is dirty" "$fixture" "$fakebin" env FAKE_FIRMWARE_DIRTY=1
-: >"$fixture/calls.log"
-printf '%s\n' c51f0146f9fe836e4fe1bf2c061c70bedfad058c >"$fixture/vendor/microsandbox/build/libkrunfw.5.dylib.source-sha"
-rm -f "$fixture/calls.log.otool-invalid-once"
-run_build "$fixture" "$fakebin" env FAKE_OTOOL_INVALID_ONCE=1
-assert_file_contains "$fixture/calls.log" "firmware docker build"
+expect_build_failure "cannot read the nested libkrunfw status" "$fixture" "$fakebin" env FAKE_FIRMWARE_STATUS_FAIL=1
 
-# A rejected forced-rebuild candidate must not replace or leave a reusable
-# source-stamped firmware cache entry.
+# Force mode rebuilds even when the local artifact matches, or the check would
+# only prove that a stale stamp is stale. Start from a matching pair by building
+# with the store emptied (removing only the local artifact would be restored).
+rm -f "$fixture/vendor/microsandbox/build/libkrunfw.5.dylib"*
+rm -f "$SHARED_FIRMWARE"
+: >"$fixture/calls.log"
+run_build "$fixture" "$fakebin"
+firmware_built "$fixture" || fail "a build with neither copy did not build the firmware"
+[[ "$(cat "$fixture/vendor/microsandbox/build/libkrunfw.5.dylib.source-sha")" == "$FIRMWARE_STAMP" ]]
+: >"$fixture/calls.log"
+run_build "$fixture" "$fakebin"
+if firmware_built "$fixture"; then fail "a matching local artifact was rebuilt"; fi
+: >"$fixture/calls.log"
+run_build "$fixture" "$fakebin" env MSB_FORCE_FIRMWARE_REBUILD=1
+firmware_built "$fixture" || fail "forced rebuild reused a matching local artifact"
+
+# An entry that is not a loadable arm64 dylib -- wrong architecture, or an
+# executable at the firmware key -- is rebuilt and replaced; a local artifact that
+# is no longer loadable is restored from the store instead.
+rm -f "$fixture/vendor/microsandbox/build/libkrunfw.5.dylib"*
+printf 'truncated\n' >"$SHARED_FIRMWARE"
+: >"$fixture/calls.log"
+run_build "$fixture" "$fakebin" env FAKE_BAD_ARCH_PATH=firmware/libkrunfw-5-
+firmware_built "$fixture" || fail "an invalid shared firmware entry was reused"
+[[ "$(cat "$SHARED_FIRMWARE")" == firmware ]]
+rm -f "$fixture/vendor/microsandbox/build/libkrunfw.5.dylib"*
+printf 'executable\n' >"$SHARED_FIRMWARE"
+: >"$fixture/calls.log"
+run_build "$fixture" "$fakebin" env FAKE_FILE_PATH_KIND=firmware/libkrunfw-5-:executable
+firmware_built "$fixture" || fail "an executable in the shared store stood in for the firmware"
+[[ "$(cat "$SHARED_FIRMWARE")" == firmware ]]
+rm -f "$fixture/calls.log.otool-invalid-once"
+: >"$fixture/calls.log"
+run_build "$fixture" "$fakebin" env FAKE_OTOOL_INVALID_ONCE=1
+if firmware_built "$fixture"; then
+    fail "a local artifact that no longer loads rebuilt instead of restoring from the store"
+fi
+rm -f "$SHARED_FIRMWARE"
+rm -f "$fixture/calls.log.otool-invalid-once"
+: >"$fixture/calls.log"
+run_build "$fixture" "$fakebin" env FAKE_OTOOL_INVALID_ONCE=1
+firmware_built "$fixture" || fail "an invalid local artifact with no shared copy was reused"
+
+# A rejected forced-rebuild candidate must not replace the local artifact or the
+# shared entry it would have published to.
 printf published-firmware >"$fixture/vendor/microsandbox/build/libkrunfw.5.dylib"
-printf '%s\n' c51f0146f9fe836e4fe1bf2c061c70bedfad058c >"$fixture/vendor/microsandbox/build/libkrunfw.5.dylib.source-sha"
+printf '%s\n' "$FIRMWARE_STAMP" >"$fixture/vendor/microsandbox/build/libkrunfw.5.dylib.source-sha"
 expect_build_failure "arm64-only loadable macOS dynamic library" "$fixture" "$fakebin" env \
     MSB_FORCE_FIRMWARE_REBUILD=1 FAKE_BAD_ARCH_PATH=libkrunfw.5.dylib.next
 [[ "$(cat "$fixture/vendor/microsandbox/build/libkrunfw.5.dylib")" == published-firmware ]]
-[[ "$(cat "$fixture/vendor/microsandbox/build/libkrunfw.5.dylib.source-sha")" == c51f0146f9fe836e4fe1bf2c061c70bedfad058c ]]
+[[ "$(cat "$fixture/vendor/microsandbox/build/libkrunfw.5.dylib.source-sha")" == "$FIRMWARE_STAMP" ]]
+[[ "$(cat "$SHARED_FIRMWARE")" == firmware ]]
 [[ ! -e "$fixture/vendor/microsandbox/build/libkrunfw.5.dylib.next" ]]
 [[ ! -e "$fixture/vendor/microsandbox/build/libkrunfw.5.dylib.source-sha.next" ]]
+[[ ! -e "$SHARED_FIRMWARE.next" ]]
+
+# No usable cache root is a slow build, never a wrong one.
+rm -f "$fixture/vendor/microsandbox/build/libkrunfw.5.dylib"*
+: >"$fixture/calls.log"
+run_build "$fixture" "$fakebin" env HOME= XDG_CACHE_HOME=
+firmware_built "$fixture" || fail "a build without a cache root reused something"
 
 # --dev builds unoptimized binaries into a separate bundle dir and never
 # touches the release bundle already published above.
