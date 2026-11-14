@@ -19,6 +19,20 @@
 //! value handed to the SDK is unchanged — only the rendered JSON differs.
 //!
 //! Neither dump includes registry credentials or cache configuration.
+//!
+//! # Control characters
+//!
+//! Both records are printed as a delimited block rather than a single line — the
+//! launch path's through `launch_notice::LaunchNotices::emit_block`, the native
+//! one directly — because pretty JSON is the readable form and it is what a test
+//! parses back. Its *values* are measured though — a project or bind path can hold
+//! any byte — and `serde_json` escapes the C0 range only, so DEL and the C1 range
+//! (U+0085, a line break to some readers) would reach the terminal raw. Every
+//! record therefore renders through `dump_line`, which spells those characters as
+//! JSON `\uXXXX` escapes: the block's structure stays the launcher's, its values
+//! stay one line each, and the record still parses.
+
+use std::fmt::Write as _;
 
 use anyhow::Result;
 
@@ -39,16 +53,18 @@ pub(crate) fn sandbox_config(
     if std::env::var("AGENT_VM_DEBUG_CONFIG").is_err() {
         return Ok(None);
     }
-    if redact_image {
+    // Serializing `config` directly in the unredacted case, rather than through a
+    // `Value`, keeps its field order.
+    let json = if redact_image {
         let mut value = serde_json::to_value(config)?;
         if let Some(reference) = value.pointer_mut("/image/Oci/reference") {
             *reference = serde_json::Value::String(REDACTED_REFERENCE.to_string());
         }
-        let json = serde_json::to_string_pretty(&value)?;
-        return Ok(Some(format!("[debug] sandbox config JSON: {json}")));
-    }
-    let json = serde_json::to_string_pretty(config)?;
-    Ok(Some(format!("[debug] sandbox config JSON: {json}")))
+        serde_json::to_string_pretty(&value)?
+    } else {
+        serde_json::to_string_pretty(config)?
+    };
+    Ok(Some(dump_line("[debug] sandbox config JSON: ", &json)))
 }
 
 /// The `[debug] native image acquisition JSON: ` line for one
@@ -83,8 +99,71 @@ pub(crate) fn native_acquisition(
             "arch": platform.arch.to_string(),
         },
     });
-    Ok(Some(format!(
-        "[debug] native image acquisition JSON: {}",
-        serde_json::to_string_pretty(&record)?
+    Ok(Some(dump_line(
+        "[debug] native image acquisition JSON: ",
+        &serde_json::to_string_pretty(&record)?,
     )))
+}
+
+/// The emitted record: `prefix` and its pretty JSON, with every control character
+/// `serde_json` leaves raw spelled as a JSON `\uXXXX` escape.
+///
+/// `serde_json` escapes the C0 range (`\n` as `\\n`, a tab as `\\t`) and stops
+/// there, so DEL and the C1 range survive into the dump as the bytes a terminal
+/// acts on. They can only occur inside a string literal — the structure this
+/// walks is otherwise ASCII — so replacing them with `\uXXXX` keeps the record
+/// valid JSON, keeps its indentation and line breaks, and tells the reader which
+/// bytes the value actually held.
+fn dump_line(prefix: &str, json: &str) -> String {
+    let mut out = String::with_capacity(prefix.len() + json.len());
+    out.push_str(prefix);
+    for character in json.chars() {
+        match character {
+            '\u{7f}'..='\u{9f}' => {
+                let _ = write!(out, "\\u{:04x}", character as u32);
+            }
+            printable_or_newline => out.push(printable_or_newline),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #416 review: the block door's contract is that its *structure* is the
+    /// launcher's, so a measured value inside it must be neutralized by the block's
+    /// own renderer. `serde_json` leaves DEL and the C1 range raw, and a bind path
+    /// can hold either, so both are escaped here — spelled, not dropped.
+    #[test]
+    fn a_measured_value_cannot_smuggle_a_control_byte_into_the_record() {
+        let host = "/home/dev/proj\u{85}nel\u{7f}del";
+        let record = serde_json::json!({
+            "kind": "sandbox-config",
+            "mounts": [{ "host": host, "guest": "/workspace" }],
+        });
+        let json = serde_json::to_string_pretty(&record).expect("rendering the record");
+        let line = dump_line("[debug] sandbox config JSON: ", &json);
+
+        assert!(
+            line.contains(r"proj\u0085nel\u007fdel"),
+            "the measured bytes are spelled: {line}"
+        );
+        assert!(
+            !line.contains('\u{85}') && !line.contains('\u{7f}'),
+            "nothing a terminal acts on survives: {line}"
+        );
+
+        // Still the block it was: pretty, indented, one value per line.
+        let body = line
+            .strip_prefix("[debug] sandbox config JSON: ")
+            .expect("the record's prefix");
+        assert!(body.contains("\n  \"mounts\": [\n"), "body: {body}");
+        assert!(body.ends_with('}'), "body: {body}");
+
+        // And still JSON, holding the value the path actually was.
+        let parsed: serde_json::Value = serde_json::from_str(body).expect("the dump still parses");
+        assert_eq!(parsed["mounts"][0]["host"], host);
+    }
 }

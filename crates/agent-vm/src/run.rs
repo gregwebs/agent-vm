@@ -1092,7 +1092,8 @@ pub(crate) async fn launch(
     notices.emit(boot_notice(&label, memory_mib, cpus))?;
     let pi_report = crate::pi_credential_inspection::inspect_project(&session.state_dir);
     if let Some(warning) = pi_report.launch_warning() {
-        notices.emit(warning)?;
+        // A block, not a line: the findings are meant as an indented list.
+        notices.emit_block(warning)?;
     }
     session.ensure_dirs(&home_links)?;
     if !root_mode {
@@ -1727,7 +1728,10 @@ pub(crate) async fn launch(
     let inner_argv = invocation.argv();
     let config = builder.build().await.context("preparing sandbox config")?;
     if let Some(dump) = crate::debug_config::sandbox_config(&config, label.is_redacted())? {
-        notices.emit(dump)?;
+        // Pretty JSON: a block by intent. What is measured inside it — the project
+        // and bind paths — is escaped into JSON `\uXXXX` by the record's own
+        // renderer, so this block's lines are still the launcher's.
+        notices.emit_block(dump)?;
         // No trailing space when the argv is empty (codex/opencode), so the
         // line is exactly the guest command line an integration test asserts.
         let guest_command = if inner_argv.is_empty() {
@@ -4192,7 +4196,7 @@ mod tests {
 
     #[test]
     fn notice_write_failure_propagates_a_multi_line_pi_warning() {
-        // The launch warning is a multi-line string carried by one `emit`.
+        // The launch warning is a multi-line block carried by one `emit_block`.
         // Its write failure must be the same contextual `Result`, not a panic
         // (the EPIPE/`head` case behind issue #70).
         let log = Rc::new(RefCell::new(Vec::new()));
@@ -4202,7 +4206,7 @@ mod tests {
         };
         let mut notices = LaunchNotices::new(output);
         let error = notices
-            .emit("==> WARNING: potentially sensitive\n    auth.json: provider=anthropic")
+            .emit_block("==> WARNING: potentially sensitive\n    auth.json: provider=anthropic")
             .expect_err("write failure must propagate");
         let chain = format!("{error:#}");
         assert!(
@@ -4210,6 +4214,77 @@ mod tests {
             "chain: {chain}"
         );
         assert!(chain.contains("broken output"), "chain: {chain}");
+    }
+
+    /// #416: a note's bytes are measured, so a newline in one used to end the
+    /// notice early — everything after it read as another notice line of its own,
+    /// and a CR rewound over the text already printed. The sink escapes instead, so
+    /// the notice stays one line whatever the note carries.
+    #[test]
+    fn a_note_cannot_forge_or_rewind_a_notice_line() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let output = ScriptedOutput {
+            log: log.clone(),
+            fault: Fault::None,
+        };
+        let mut notices = LaunchNotices::new(output);
+        notices
+            .emit("warning: /home/ok\n==> Credentials: <none>\r/home/ok is group-readable")
+            .expect("scripted success");
+        assert_eq!(
+            folded_notice_log(&log.borrow()),
+            vec![NoticeIo::Wrote(
+                "warning: /home/ok\\x0a==> Credentials: <none>\\x0d/home/ok is \
+                 group-readable\n"
+                    .to_string()
+            )],
+            "one line, its control bytes escaped rather than acted on"
+        );
+    }
+
+    /// The escape is applied by the sink, so a producer that already rendered its
+    /// text through `one_line` (as `credential_yaml` does) must not be escaped
+    /// twice: `one_line`'s output holds no control byte, so `emit` is an identity
+    /// over it.
+    #[test]
+    fn text_already_rendered_by_one_line_is_not_escaped_twice() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let output = ScriptedOutput {
+            log: log.clone(),
+            fault: Fault::None,
+        };
+        let mut notices = LaunchNotices::new(output);
+        let note = format!(
+            "warning: {} is group-readable",
+            crate::one_line::path(Path::new("/home/a\nb"))
+        );
+        notices.emit(&note).expect("scripted success");
+        assert_eq!(
+            folded_notice_log(&log.borrow()),
+            vec![NoticeIo::Wrote(note + "\n")],
+        );
+    }
+
+    /// Several lines are the launcher's decision, taken through its own door. The Pi
+    /// credential warning's findings are meant as a list, so it keeps its shape.
+    #[test]
+    fn a_block_notice_keeps_the_lines_the_launcher_meant() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let output = ScriptedOutput {
+            log: log.clone(),
+            fault: Fault::None,
+        };
+        let mut notices = LaunchNotices::new(output);
+        notices
+            .emit_block("==> WARNING: potentially sensitive\n    auth.json: provider=anthropic")
+            .expect("scripted success");
+        assert_eq!(
+            folded_notice_log(&log.borrow()),
+            vec![NoticeIo::Wrote(
+                "==> WARNING: potentially sensitive\n    auth.json: provider=anthropic\n"
+                    .to_string()
+            )],
+        );
     }
 
     #[test]

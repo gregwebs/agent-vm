@@ -25,6 +25,12 @@
 //! (with the ticket that recorded it), so no module can grow a new site and no
 //! converted module can regress.
 //!
+//! The launch notice channel renders the **whole message** rather than one path:
+//! `launch_notice::LaunchNotices::emit` applies [`text`] to every notice at the
+//! sink (#416), so a warning whose note carries a newline cannot forge a line even
+//! when its producer interpolated one raw. A notice the launcher means as several
+//! lines takes that sink's `emit_block` instead.
+//!
 //! The exceptions are *declaration* sentences: a message that attributes a config
 //! entry — `mounts[N] in "<file>"`, a claim conflict, a mount's own host path
 //! (`mount::Declaration`'s `host_path`, `fork_root`, `node_kind`,
@@ -256,6 +262,22 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// `launch_notice` escapes at the sink (#416), over text a producer may already
+    /// have rendered here (#419). That cannot double-escape only because the output
+    /// holds nothing left to escape: printable input characters, and ASCII `\xNN`
+    /// spellings. Stated as a test because the safety of that layering rests on it.
+    #[test]
+    fn rendering_is_idempotent() {
+        for rendered in [
+            text("ok\nFORGED\rok\u{1b}[31m"),
+            path(&PathBuf::from("/home/a\nb")),
+            text("café\u{9b}"),
+        ] {
+            let once = rendered.to_string();
+            assert_eq!(text(&once).to_string(), once);
         }
     }
 
