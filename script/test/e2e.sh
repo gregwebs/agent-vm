@@ -308,6 +308,14 @@ CUSTOM_CREDENTIAL_REFRESH='sk-ant-synthetic-e2e-258-refresh'
 # bundle-only installation needs `vendor/microsandbox` built first.
 CUSTOM_RUNTIME_DIR="$REPO_ROOT/vendor/microsandbox/build"
 CUSTOM_MSB="$CUSTOM_RUNTIME_DIR/msb"
+# `--dev` publishes the same build under `msb-dev` so a dev bundle can never
+# overwrite the release artifact, so a worktree built only with `--dev` has no
+# `msb`. Take the dev runtime instead of demanding a hand-made symlink: the
+# receipt hashes and names whichever binary ran, and this line says which.
+if [ ! -f "$CUSTOM_MSB" ] && [ -f "$CUSTOM_RUNTIME_DIR/msb-dev" ]; then
+  CUSTOM_MSB="$CUSTOM_RUNTIME_DIR/msb-dev"
+  echo "e2e: using the dev vendored runtime $CUSTOM_MSB (no build/msb; ./script/build/macos.sh --dev publishes msb-dev)" >&2
+fi
 CUSTOM_AGENTD="$CUSTOM_RUNTIME_DIR/agentd"
 CUSTOM_LIBKRUNFW="$CUSTOM_RUNTIME_DIR/libkrunfw.5.dylib"
 for pinned in "$CUSTOM_MSB" "$CUSTOM_AGENTD" "$CUSTOM_LIBKRUNFW"; do
