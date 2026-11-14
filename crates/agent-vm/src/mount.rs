@@ -4105,6 +4105,58 @@ impl PreparedMountPlan {
     }
 }
 
+/// How many lines of one preparation notice class a launch prints before
+/// summarizing the rest.
+///
+/// Two classes grow with the host tree rather than with anything agent-vm
+/// bounds: the special nodes a fork seed omits (ADR-0054) and the warnings a
+/// `:follow-links` walk reports (`skipping …` and `not mirroring symlink …`
+/// alike). Eight keeps them at the same scale as [`MAX_MOUNT_NOTICES`], and the
+/// count is the launch's, not a producer's: two forks print one cap and one
+/// summary between them, not one apiece. The Pi credential omissions are *not*
+/// one of these classes: there are a handful, each is its own decision, and
+/// each must be named.
+const MAX_NOTICES_PER_CLASS: usize = 8;
+
+/// The line that stands in for the tail of a capped notice class: how many were
+/// suppressed, of what, and what the cap did not change.
+///
+/// Unlike `mount_notices`, the tail cannot point at `agent-vm msb inspect`: a
+/// suppressed mount line describes a mount the guest has, while a suppressed
+/// preparation notice is a report that is stored nowhere, so there is nothing
+/// to read back. The summary therefore names the class it hid and leaves the
+/// mounts out of it.
+fn capped_notice_summary(hidden: usize, nouns: (&str, &str), why: &str) -> String {
+    let noun = if hidden == 1 { nouns.0 } else { nouns.1 };
+    format!("==>   … and {hidden} more {noun} not shown ({why})")
+}
+
+/// The `:follow-links` warnings, capped to [`MAX_NOTICES_PER_CLASS`].
+///
+/// The walk reports every one as data so tests can assert on its text; how many
+/// of those lines a launch prints is this function's decision, and the tail
+/// keeps its discovery order. Both shapes are one class here — a `skipping …`
+/// line and a `not mirroring symlink …` one are both the walk saying what it
+/// could not use — so the summary must not claim more than it hides: the
+/// warning text, never a mount. A non-directory symlink and its target arrive
+/// through the source bind, and an unreadable directory is still under one.
+fn skip_notices(warnings: Vec<String>) -> Vec<String> {
+    let mut notices: Vec<String> = warnings
+        .into_iter()
+        .map(|warning| format!("==> {warning}"))
+        .collect();
+    let hidden = notices.len().saturating_sub(MAX_NOTICES_PER_CLASS);
+    if hidden > 0 {
+        notices.truncate(MAX_NOTICES_PER_CLASS);
+        notices.push(capped_notice_summary(
+            hidden,
+            ("follow-links warning", "follow-links warnings"),
+            "the walk still ran and its binds are unchanged; only these warning lines are hidden",
+        ));
+    }
+    notices
+}
+
 #[derive(Debug)]
 pub(crate) struct MountContext {
     pub(crate) mount_store: PathBuf,
@@ -4560,7 +4612,7 @@ pub(crate) fn prepare(
         &origins,
     )?);
     sync_fork_representations(&unique, &mut expanded)?;
-    notices.extend(warnings.into_iter().map(|warning| format!("==> {warning}")));
+    notices.extend(skip_notices(warnings));
 
     // Fork initialization changes only the explicit source path. Discovery
     // was already complete (forks do not produce live followed binds), so
@@ -5196,6 +5248,13 @@ pub(crate) fn prepare_forks(
     origins: &DeclaredOrigins,
 ) -> Result<Vec<String>> {
     let mut notices = Vec::new();
+    // The special-node cap is the launch's, so these outlive the loop: two
+    // forks of eight sockets each are sixteen lines of one class in one
+    // report, and a per-fork cap would print eight lines and a summary for
+    // each fork. Only the count is shared; each kept line still names the fork
+    // it came from.
+    let mut special_nodes = 0usize;
+    let mut suppressed_special_nodes = 0usize;
     for mount in mounts.iter_mut().filter(|mount| mount.is_fork()) {
         let declaration = declaration_origin(mount, origins);
         let id = fork_id(mount, IDENTITY_VERSION);
@@ -5258,7 +5317,17 @@ pub(crate) fn prepare_forks(
                     mount.source_spelling.render(declaration)
                 )
             })?;
+        // Only the special nodes are capped: a seed can leave out one per node
+        // in the source tree, while the Pi credential lines beside them are a
+        // handful of deliberate decisions and must each stay named.
         for (relative, omitted) in &report.omitted {
+            if matches!(omitted, OmittedNode::Special(_)) {
+                special_nodes += 1;
+                if special_nodes > MAX_NOTICES_PER_CLASS {
+                    suppressed_special_nodes += 1;
+                    continue;
+                }
+            }
             notices.push(format!(
                 "==> Omitted {} {} from the fork of {}",
                 omitted.description(),
@@ -5303,6 +5372,14 @@ pub(crate) fn prepare_forks(
             mount.source_spelling.render(declaration),
             crate::one_line::path(&mount.host),
             crate::one_line::path(&final_dir)
+        ));
+    }
+    if suppressed_special_nodes > 0 {
+        notices.push(capped_notice_summary(
+            suppressed_special_nodes,
+            ("special node", "special nodes"),
+            "a socket, FIFO or device node is never copied into a fork, so it cannot be reached \
+             in the guest",
         ));
     }
     Ok(notices)
@@ -10409,6 +10486,432 @@ mod prepare_tests {
                 .iter()
                 .any(|notice| notice.contains("Omitted FIFO node")),
             "{:?}",
+            plan.notices
+        );
+    }
+
+    // ── capped preparation notices (issue #595) ─────────────────────
+
+    /// Both capped classes keep the order they were discovered in and spend the
+    /// summary on the count. Pinned on the helper with a synthetic list: no real
+    /// walk orders its `read_dir` entries, so only this can prove the tail is
+    /// what gets dropped and the prefix is not reordered.
+    #[test]
+    fn skip_notices_keep_the_first_eight_in_order_and_count_the_rest() {
+        let warnings = |count: usize| -> Vec<String> {
+            (0..count)
+                .map(|i| format!("skipping dangling symlink /h/link-{i}"))
+                .collect()
+        };
+        let kept = |notices: &[String]| -> Vec<String> {
+            notices
+                .iter()
+                .filter(|notice| notice.starts_with("==> skipping "))
+                .cloned()
+                .collect()
+        };
+
+        // Below and at the cap: every line as reported, and no summary.
+        for count in [0, 1, MAX_NOTICES_PER_CLASS] {
+            let notices = skip_notices(warnings(count));
+            assert_eq!(
+                kept(&notices),
+                warnings(count)
+                    .into_iter()
+                    .map(|warning| format!("==> {warning}"))
+                    .collect::<Vec<String>>(),
+                "count={count}"
+            );
+        }
+
+        let notices = skip_notices(warnings(MAX_NOTICES_PER_CLASS + 1));
+        assert_eq!(notices.len(), MAX_NOTICES_PER_CLASS + 1);
+        assert_eq!(
+            notices[MAX_NOTICES_PER_CLASS],
+            "==>   … and 1 more follow-links warning not shown (the walk still ran and its binds \
+             are unchanged; only these warning lines are hidden)"
+        );
+        assert_eq!(kept(&notices).len(), MAX_NOTICES_PER_CLASS);
+
+        let notices = skip_notices(warnings(MAX_NOTICES_PER_CLASS + 3));
+        assert_eq!(notices.len(), MAX_NOTICES_PER_CLASS + 1);
+        assert_eq!(
+            notices[MAX_NOTICES_PER_CLASS],
+            "==>   … and 3 more follow-links warnings not shown (the walk still ran and its binds \
+             are unchanged; only these warning lines are hidden)"
+        );
+        assert_eq!(kept(&notices).len(), MAX_NOTICES_PER_CLASS);
+    }
+
+    /// A seed omits one line per special node, and how many there are is the
+    /// host tree's decision. At the cap every node is still named and there is
+    /// no summary; one past it the same lines survive and the count is singular.
+    #[test]
+    fn fork_special_node_omissions_are_bounded_with_a_counted_summary() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap();
+        let fork = |sockets: usize| {
+            let source = home.join(format!("tree-{sockets}"));
+            fs::create_dir(&source).unwrap();
+            fs::write(source.join("kept"), "seed").unwrap();
+            for i in 0..sockets {
+                bind_socket(&source.join(format!("gone-{i}.sock")));
+            }
+            let store = tempfile::tempdir().unwrap();
+            let plan = prepare(
+                parse_extra_mounts(&[format!("{}:/guest:fork", source.display())]).unwrap(),
+                &context_with_home(store.path(), home.clone()),
+            )
+            .unwrap();
+            assert!(fork_data(&plan).join("kept").is_file());
+            (source, plan)
+        };
+        let named = |plan: &PreparedMountPlan| -> Vec<String> {
+            plan.notices
+                .iter()
+                .filter(|notice| notice.starts_with("==> Omitted socket "))
+                .cloned()
+                .collect()
+        };
+
+        // Exactly the cap: every node named, and no summary line at all.
+        let (source, plan) = fork(MAX_NOTICES_PER_CLASS);
+        let omitted = named(&plan);
+        assert_eq!(omitted.len(), MAX_NOTICES_PER_CLASS);
+        for notice in &omitted {
+            assert!(
+                notice.ends_with(&format!(" from the fork of {}", source.display())),
+                "{notice}"
+            );
+        }
+        assert!(
+            !plan
+                .notices
+                .iter()
+                .any(|notice| notice.contains("not shown")),
+            "no summary at the cap: {:?}",
+            plan.notices
+        );
+
+        // One past it: the same lines, then the singular summary, which is the
+        // launch's and so comes after the fork's own initialization notice.
+        let (source, plan) = fork(MAX_NOTICES_PER_CLASS + 1);
+        assert_eq!(named(&plan).len(), MAX_NOTICES_PER_CLASS);
+        let summary = plan
+            .notices
+            .iter()
+            .position(|notice| notice.contains("not shown"))
+            .expect("a counted summary");
+        assert_eq!(
+            plan.notices[summary],
+            "==>   … and 1 more special node not shown (a socket, FIFO or device node is never \
+             copied into a fork, so it cannot be reached in the guest)"
+        );
+        assert!(
+            plan.notices[..summary]
+                .iter()
+                .any(|notice| notice.starts_with("==> Initialized fork ")),
+            "the summary is launch-wide, so it follows every fork's own lines: {:?}",
+            plan.notices
+        );
+        assert_eq!(
+            summary,
+            plan.notices.len() - 1,
+            "one summary closes the omission block: {:?}",
+            plan.notices
+        );
+        assert!(
+            plan.notices[..summary]
+                .iter()
+                .filter(|notice| notice.starts_with("==> Omitted socket "))
+                .all(|notice| notice.ends_with(&format!(" from the fork of {}", source.display()))),
+            "every kept line names its own fork: {:?}",
+            plan.notices
+        );
+    }
+
+    /// The cap is the launch's, not the fork's: two forks that between them
+    /// leave out more special nodes than the cap print the first eight lines of
+    /// the launch, in the order the copier found them and each under its own
+    /// fork, then one summary counting both.
+    #[test]
+    fn two_forks_share_one_special_node_cap_and_one_summary() {
+        let _checkpoint_guard = COPY_CHECKPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap();
+        let first = home.join("tree-first");
+        let second = home.join("tree-second");
+        for source in [&first, &second] {
+            fs::create_dir(source).unwrap();
+            fs::write(source.join("kept"), "seed").unwrap();
+            for i in 0..MAX_NOTICES_PER_CLASS {
+                bind_socket(&source.join(format!("gone-{i}.sock")));
+            }
+        }
+
+        // `read_dir` order is the filesystem's, so the copier's own hook reports
+        // it and the kept prefix can be compared line for line.
+        let walked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = std::sync::Arc::clone(&walked);
+        let _hook = CopyCheckpointGuard::arm(
+            &first,
+            Box::new(move |path| record.lock().unwrap().push(path.to_path_buf())),
+        );
+
+        let store = tempfile::tempdir().unwrap();
+        let plan = prepare(
+            parse_extra_mounts(&[
+                format!("{}:/first:fork", first.display()),
+                format!("{}:/second:fork", second.display()),
+            ])
+            .unwrap(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap();
+
+        let named: Vec<String> = plan
+            .notices
+            .iter()
+            .filter(|notice| notice.starts_with("==> Omitted socket "))
+            .cloned()
+            .collect();
+        let walked = walked.lock().unwrap().clone();
+        let expected: Vec<String> = walked
+            .iter()
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "sock")
+            })
+            .take(MAX_NOTICES_PER_CLASS)
+            .map(|path| {
+                format!(
+                    "==> Omitted socket {} from the fork of {}",
+                    path.display(),
+                    first.display()
+                )
+            })
+            .collect();
+        assert_eq!(
+            named, expected,
+            "the kept lines are the first eight the copier walked, in that order"
+        );
+        assert!(
+            !plan
+                .notices
+                .iter()
+                .any(|notice| notice.contains(&format!("from the fork of {}", second.display()))),
+            "the second fork's lines are all past the cap: {:?}",
+            plan.notices
+        );
+        assert_eq!(
+            plan.notices
+                .iter()
+                .filter(|notice| notice.contains("not shown"))
+                .cloned()
+                .collect::<Vec<String>>(),
+            [
+                "==>   … and 8 more special nodes not shown (a socket, FIFO or device node is \
+              never copied into a fork, so it cannot be reached in the guest)"
+                    .to_string()
+            ],
+            "one summary counts both forks: {:?}",
+            plan.notices
+        );
+    }
+
+    /// The Pi credential lines share the copier's `omitted` list but not its
+    /// cap: they are a handful of deliberate decisions, and a source full of
+    /// sockets must not push them out of the report.
+    #[test]
+    fn pi_credential_omissions_stay_individual_past_the_special_node_cap() {
+        let (_home, home) = pi_home();
+        fs::create_dir_all(home.join(".pi/dashboard")).unwrap();
+        for i in 0..MAX_NOTICES_PER_CLASS + 2 {
+            bind_socket(&home.join(format!(".pi/dashboard/{i}.sock")));
+        }
+        let store = tempfile::tempdir().unwrap();
+        let plan = prepare(
+            parse_extra_mounts(&[format!("{}:/pi:fork", home.join(".pi").display())]).unwrap(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap();
+
+        let sockets = plan
+            .notices
+            .iter()
+            .filter(|notice| notice.starts_with("==> Omitted socket "))
+            .count();
+        assert_eq!(sockets, MAX_NOTICES_PER_CLASS);
+        assert!(
+            plan.notices
+                .iter()
+                .any(|notice| notice.contains("2 more special nodes not shown")),
+            "{:?}",
+            plan.notices
+        );
+        for named in [
+            "==> Omitted host Pi credential file agent/auth.json",
+            "==> Omitted host Pi provider-configuration file agent/models.json",
+        ] {
+            assert_eq!(
+                plan.notices
+                    .iter()
+                    .filter(|notice| notice.starts_with(named))
+                    .count(),
+                1,
+                "{named}: {:?}",
+                plan.notices
+            );
+        }
+    }
+
+    /// A `:follow-links` walk warns once per unusable link, and how many there
+    /// are is the host tree's decision. At the cap every warning prints and
+    /// there is no summary; one past it the same lines survive and the count is
+    /// singular.
+    #[test]
+    fn follow_links_skips_are_bounded_with_a_counted_summary() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap();
+        let walk = |links: usize| {
+            let source = home.join(format!("tree-{links}"));
+            fs::create_dir(&source).unwrap();
+            fs::write(source.join("kept"), "seed").unwrap();
+            for i in 0..links {
+                std::os::unix::fs::symlink(
+                    home.join(format!("missing-{i}")),
+                    source.join(format!("dangling-{i}")),
+                )
+                .unwrap();
+            }
+            let store = tempfile::tempdir().unwrap();
+            let plan = prepare(
+                parse_extra_mounts(&[format!("{}:/guest:follow-links", source.display())]).unwrap(),
+                &context_with_home(store.path(), home.clone()),
+            )
+            .unwrap();
+            // The mount itself still reaches the guest: this is a report cap.
+            assert!(
+                plan.volumes
+                    .iter()
+                    .any(|volume| volume.guest == Path::new("/guest"))
+            );
+            plan.notices
+        };
+        let skipped = |notices: &[String]| -> Vec<String> {
+            notices
+                .iter()
+                .filter(|notice| notice.starts_with("==> skipping "))
+                .cloned()
+                .collect()
+        };
+        let summaries = |notices: &[String]| -> Vec<String> {
+            notices
+                .iter()
+                .filter(|notice| notice.contains("not shown"))
+                .cloned()
+                .collect()
+        };
+
+        // Exactly the cap: the walk's own lines, and no summary.
+        let notices = walk(MAX_NOTICES_PER_CLASS);
+        let kept = skipped(&notices);
+        assert_eq!(kept.len(), MAX_NOTICES_PER_CLASS);
+        for notice in &kept {
+            assert!(
+                notice.starts_with("==> skipping dangling symlink ")
+                    && notice.contains(&format!("tree-{MAX_NOTICES_PER_CLASS}/dangling-")),
+                "{notice}"
+            );
+        }
+        assert!(
+            summaries(&notices).is_empty(),
+            "no summary at the cap: {notices:?}"
+        );
+
+        // One past it: the first eight, then the singular count. It names only
+        // warning lines: the walk ran and the binds stand either way.
+        let notices = walk(MAX_NOTICES_PER_CLASS + 1);
+        assert_eq!(skipped(&notices).len(), MAX_NOTICES_PER_CLASS);
+        assert_eq!(
+            summaries(&notices),
+            [
+                "==>   … and 1 more follow-links warning not shown (the walk still ran and its \
+              binds are unchanged; only these warning lines are hidden)"
+                    .to_string()
+            ]
+        );
+    }
+
+    /// The warnings are one launch-wide class, whatever the number of binds:
+    /// two broken trees that between them produce more than the cap print the
+    /// launch's first eight — the first bind's, then the head of the second's —
+    /// and one count of what both hid.
+    #[test]
+    fn two_follow_links_binds_share_one_skip_cap_and_one_summary() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap();
+        let broken = |name: &str| {
+            let source = home.join(name);
+            fs::create_dir(&source).unwrap();
+            fs::write(source.join("kept"), "seed").unwrap();
+            // Fewer than the cap each, so both binds reach the printed list.
+            for i in 0..5 {
+                std::os::unix::fs::symlink(
+                    home.join(format!("missing-{name}-{i}")),
+                    source.join(format!("dangling-{i}")),
+                )
+                .unwrap();
+            }
+            source
+        };
+        let first = broken("tree-first");
+        let second = broken("tree-second");
+        let store = tempfile::tempdir().unwrap();
+        let plan = prepare(
+            parse_extra_mounts(&[
+                format!("{}:/first:follow-links", first.display()),
+                format!("{}:/second:follow-links", second.display()),
+            ])
+            .unwrap(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap();
+
+        let skipped: Vec<&String> = plan
+            .notices
+            .iter()
+            .filter(|notice| notice.starts_with("==> skipping "))
+            .collect();
+        assert_eq!(skipped.len(), MAX_NOTICES_PER_CLASS);
+        // Discovery order across binds: every warning of the first walk is
+        // inside the cap, so the second bind contributes only the remainder.
+        assert!(
+            skipped[..5]
+                .iter()
+                .all(|notice| notice.contains("tree-first/dangling-")),
+            "{skipped:?}"
+        );
+        assert!(
+            skipped[5..]
+                .iter()
+                .all(|notice| notice.contains("tree-second/dangling-")),
+            "{skipped:?}"
+        );
+        assert_eq!(
+            plan.notices
+                .iter()
+                .filter(|notice| notice.contains("not shown"))
+                .cloned()
+                .collect::<Vec<String>>(),
+            [
+                "==>   … and 2 more follow-links warnings not shown (the walk still ran and its \
+              binds are unchanged; only these warning lines are hidden)"
+                    .to_string()
+            ],
+            "one summary counts both binds: {:?}",
             plan.notices
         );
     }
