@@ -2408,15 +2408,58 @@ require_object_id() {
   return 1
 }
 
+# One probe binary's `--version` as a receipt fragment: the printable line and
+# the sha256 of the exact stdout bytes it came from (#457). Those bytes are the
+# identity because the operator's provenance oracle
+# (script/test/lib/build-provenance.py::parse_version) matches the newline-
+# terminated text, while `version=[...]` only ever showed a `$(...)` capture,
+# which strips the newline and so cannot be compared with the oracle at all.
+#
+# stdout is captured to a file and stderr apart from it. A nonzero exit, any
+# stderr byte, or stdout that is not one newline-terminated line means there is
+# no identity: a warning folded into `version` (the old `2>&1`) would have
+# become part of the recorded identity, and multi-line stdout could forge the
+# following evidence lines. The rejected probe prints what it saw to the row log,
+# which is where stderr belongs, and the caller publishes no receipt.
+stdin_version_receipt() {
+  local what="$1" bin="$2"
+  (
+    local probe status=0 version version_hex
+    probe="$(mktemp "$WORK/identity-version.XXXXXX")" || {
+      echo "    evidence: could not create a capture file for $what --version" >&2
+      exit 1
+    }
+    trap 'rm -f "$probe" "$probe.err"' EXIT
+    "$bin" --version >"$probe" 2>"$probe.err" || status=$?
+    if [ "$status" -ne 0 ]; then
+      echo "    evidence: $what --version exited $status; its output stays diagnostics:" >&2
+      cat "$probe.err" >&2
+      exit 1
+    fi
+    if [ -s "$probe.err" ]; then
+      echo "    evidence: $what --version wrote to stderr; stderr is diagnostics, not identity:" >&2
+      cat "$probe.err" >&2
+      exit 1
+    fi
+    version="$(cat "$probe")" || exit 1
+    printf '%s\n' "$version" | cmp -s - "$probe" || {
+      echo "    evidence: $what --version did not print one newline-terminated line" >&2
+      exit 1
+    }
+    version_hex="$(shasum -a 256 "$probe" | cut -d' ' -f1)" || exit 1
+    printf 'version=[%s] version_hex=%s' "$version" "$version_hex"
+  )
+}
+
 stdin_identity_init() {
   [ -z "$STDIN_EVIDENCE_READY" ] || return 0
-  local cand_sha version head runtime_source firmware_source firmware_gitlink
-  local runtime_msb runtime_agentd runtime_fw msb_version
+  local cand_sha version_receipt msb_receipt head runtime_source firmware_source firmware_gitlink
+  local runtime_msb runtime_agentd runtime_fw
   # The rows call this under `if`/`||`, where implicit errexit is ineffective, so
   # every probe carries its own `|| return 1` and its value is validated rather
   # than interpolated. An empty or `unknown` answer is a failed probe (#399 review).
   cand_sha="$(shasum -a 256 "$AGENT_VM" | cut -d' ' -f1)" || return 1
-  version="$("$AGENT_VM" --version 2>&1)" || return 1
+  version_receipt="$(stdin_version_receipt "the candidate launcher" "$AGENT_VM")" || return 1
   head="$(git -C "$REPO_ROOT" rev-parse HEAD)" || return 1
   runtime_source="$(git -C "$REPO_ROOT/vendor/microsandbox" rev-parse --verify HEAD)" || return 1
   firmware_source="$(cat "$CUSTOM_RUNTIME_DIR/libkrunfw.5.dylib.source-sha")" || return 1
@@ -2428,12 +2471,12 @@ stdin_identity_init() {
     echo "    evidence: firmware source $firmware_source is not the pinned runtime gitlink $firmware_gitlink" >&2
     return 1
   }
-  STDIN_EVIDENCE_CANDIDATE="path=$AGENT_VM version=[$version] sha256=$cand_sha commit=$head"
+  STDIN_EVIDENCE_CANDIDATE="path=$AGENT_VM $version_receipt sha256=$cand_sha commit=$head"
   runtime_msb="$(shasum -a 256 "$CUSTOM_MSB" | cut -d' ' -f1)" || return 1
   runtime_agentd="$(shasum -a 256 "$CUSTOM_AGENTD" | cut -d' ' -f1)" || return 1
   runtime_fw="$(shasum -a 256 "$CUSTOM_LIBKRUNFW" | cut -d' ' -f1)" || return 1
-  msb_version="$("$CUSTOM_MSB" --version 2>&1)" || return 1
-  STDIN_EVIDENCE_RUNTIME="msb_path=$CUSTOM_MSB (pinned) sha256=$runtime_msb version=[$msb_version]; agentd=embedded in the pinned msb (MSB_AGENTD_PATH cleared; the bundle ships $CUSTOM_AGENTD sha256=$runtime_agentd); libkrunfw_path=$CUSTOM_LIBKRUNFW (pinned) sha256=$runtime_fw; microsandbox=$runtime_source; firmware-source=$firmware_source (the pinned vendor/libkrunfw gitlink)"
+  msb_receipt="$(stdin_version_receipt "the pinned msb" "$CUSTOM_MSB")" || return 1
+  STDIN_EVIDENCE_RUNTIME="msb_path=$CUSTOM_MSB (pinned) sha256=$runtime_msb $msb_receipt; agentd=embedded in the pinned msb (MSB_AGENTD_PATH cleared; the bundle ships $CUSTOM_AGENTD sha256=$runtime_agentd); libkrunfw_path=$CUSTOM_LIBKRUNFW (pinned) sha256=$runtime_fw; microsandbox=$runtime_source; firmware-source=$firmware_source (the pinned vendor/libkrunfw gitlink)"
   STDIN_EVIDENCE_READY=1
 }
 
@@ -4578,6 +4621,12 @@ LAUNCH
   # keeps the real git. A rejected probe must leave READY unset and publish no
   # runtime receipt, because a later successful assignment would otherwise hide
   # the failure under the conditional call the rows use.
+  #
+  # #457: the version half of both receipts is pinned here too. An identity now
+  # needs one newline-terminated line on stdout, empty stderr and exit 0, so the
+  # old `/usr/bin/true` stand-in could only ever prove rejection. The fakes below
+  # answer like a launcher and a pinned msb, and FAKE_<ID>_STDERR /
+  # FAKE_<ID>_STATUS make the same script a noisy or failing probe.
   ctl_before="$result"
   local identity_dir="$probe_dir/stdin-identity"
   local identity_stamp="$identity_dir/libkrunfw.5.dylib.source-sha"
@@ -4587,10 +4636,56 @@ LAUNCH
   local stub_gitlink="160000 commit $stub_stamp"$'\t'"vendor/libkrunfw"
   mkdir -p "$identity_dir" || result=$((result + 1))
 
+  write_fake_version_probe() {
+    local path="$1" id="$2" version="$3"
+    {
+      printf '#!/bin/sh\n'
+      printf 'printf "%%s\\n" %q\n' "$version"
+      printf '[ -z "${%s_STDERR:-}" ] || printf "%%s\\n" "$%s_STDERR" >&2\n' "$id" "$id"
+      printf 'exit "${%s_STATUS:-0}"\n' "$id"
+    } >"$path" || return 1
+    chmod 755 "$path"
+  }
+  local fake_launcher="$identity_dir/agent-vm"
+  local fake_msb="$identity_dir/msb"
+  local fake_version="agent-vm 0.7.16 ($stub_head)"
+  local fake_msb_version="msb 0.7.16"
+  local fake_decoy="warning: a decoy on stderr"
+  local fake_version_hex fake_msb_version_hex
+  write_fake_version_probe "$fake_launcher" FAKE_LAUNCHER "$fake_version" ||
+    result=$((result + 1))
+  write_fake_version_probe "$fake_msb" FAKE_MSB "$fake_msb_version" ||
+    result=$((result + 1))
+  fake_version_hex="$(printf '%s\n' "$fake_version" | shasum -a 256 | cut -d' ' -f1)" ||
+    result=$((result + 1))
+  fake_msb_version_hex="$(printf '%s\n' "$fake_msb_version" | shasum -a 256 | cut -d' ' -f1)" ||
+    result=$((result + 1))
+
   # Args: want (ok|fail), runtime HEAD (`fail`/`empty`/id), ls-tree line
-  # (`fail`/`empty`/line), firmware stamp (id or `missing`/`unreadable`/`empty`).
+  # (`fail`/`empty`/line), firmware stamp (id or `missing`/`unreadable`/`empty`),
+  # candidate probe (ok/fail/noisy), pinned msb probe (ok/fail/noisy).
   stdin_identity_probe() {
-    local want="$1" stub_rt="$2" stub_tree="$3" stamp_mode="$4" accepted
+    local want="$1" stub_rt="$2" stub_tree="$3" stamp_mode="$4"
+    local launcher_mode="${5:-ok}" msb_mode="${6:-ok}" accepted
+    local launcher_status=0 launcher_stderr="" msb_status=0 msb_stderr=""
+    case "$launcher_mode" in
+    ok) ;;
+    fail) launcher_status=37 ;;
+    noisy) launcher_stderr="$fake_decoy" ;;
+    *)
+      echo "    FAIL: unknown launcher probe mode $launcher_mode"
+      return 1
+      ;;
+    esac
+    case "$msb_mode" in
+    ok) ;;
+    fail) msb_status=37 ;;
+    noisy) msb_stderr="$fake_decoy" ;;
+    *)
+      echo "    FAIL: unknown msb probe mode $msb_mode"
+      return 1
+      ;;
+    esac
     rm -rf "$identity_stamp"
     case "$stamp_mode" in
     missing) ;;
@@ -4602,11 +4697,13 @@ LAUNCH
       STDIN_EVIDENCE_CANDIDATE=""
       STDIN_EVIDENCE_RUNTIME=""
       STDIN_EVIDENCE_READY=""
-      AGENT_VM=/usr/bin/true
+      AGENT_VM="$fake_launcher"
       CUSTOM_RUNTIME_DIR="$identity_dir"
-      CUSTOM_MSB=/usr/bin/true
+      CUSTOM_MSB="$fake_msb"
       CUSTOM_AGENTD=/usr/bin/true
       CUSTOM_LIBKRUNFW=/usr/bin/true
+      export FAKE_LAUNCHER_STATUS="$launcher_status" FAKE_LAUNCHER_STDERR="$launcher_stderr"
+      export FAKE_MSB_STATUS="$msb_status" FAKE_MSB_STDERR="$msb_stderr"
       # shellcheck disable=SC2317,SC2329  # invoked indirectly by stdin_identity_init;
       # 0.9 (the Ubuntu CI version) reports the body as unreachable instead.
       git() {
@@ -4628,10 +4725,22 @@ LAUNCH
       [ "$accepted" = "$want" ] || return 1
       if [ "$want" = ok ]; then
         [ "$STDIN_EVIDENCE_READY" = 1 ] || return 1
-        case "$STDIN_EVIDENCE_RUNTIME" in
-        *"microsandbox=$stub_runtime"*"firmware-source=$stub_stamp"*) return 0 ;;
+        # #457: both version halves are exact -- the printable line is the fake's
+        # stdout line and version_hex is the sha256 of those raw bytes (trailing
+        # newline included). The stderr decoy appears in neither receipt, because
+        # the noisy probe is a rejected identity below, not a filtered one.
+        case "$STDIN_EVIDENCE_CANDIDATE" in
+        *"version=[$fake_version] version_hex=$fake_version_hex"*) ;;
+        *) return 1 ;;
         esac
-        return 1
+        case "$STDIN_EVIDENCE_RUNTIME" in
+        *"version=[$fake_msb_version] version_hex=$fake_msb_version_hex"*"microsandbox=$stub_runtime"*"firmware-source=$stub_stamp"*) ;;
+        *) return 1 ;;
+        esac
+        case "$STDIN_EVIDENCE_CANDIDATE$STDIN_EVIDENCE_RUNTIME" in
+        *"$fake_decoy"*) return 1 ;;
+        esac
+        return 0
       fi
       [ -z "$STDIN_EVIDENCE_READY" ] && [ -z "$STDIN_EVIDENCE_RUNTIME" ]
     )
@@ -4674,6 +4783,14 @@ LAUNCH
     "$stub_runtime" "160000 commit nope"$'\t'"vendor/libkrunfw" "$stub_stamp"
   stdin_identity_must_reject "a firmware gitlink for another path" \
     "$stub_runtime" "160000 commit $stub_stamp"$'\t'"vendor/other" "$stub_stamp"
+  stdin_identity_must_reject "a candidate --version that exits nonzero" \
+    "$stub_runtime" "$stub_gitlink" "$stub_stamp" fail
+  stdin_identity_must_reject "a candidate --version that writes stderr" \
+    "$stub_runtime" "$stub_gitlink" "$stub_stamp" noisy
+  stdin_identity_must_reject "a pinned msb --version that exits nonzero" \
+    "$stub_runtime" "$stub_gitlink" "$stub_stamp" ok fail
+  stdin_identity_must_reject "a pinned msb --version that writes stderr" \
+    "$stub_runtime" "$stub_gitlink" "$stub_stamp" ok noisy
   control_report "h24 stdin-identity-receipts" "$ctl_before"
 
 
