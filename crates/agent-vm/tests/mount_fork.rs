@@ -523,14 +523,26 @@ fn absent_state_root_supports_directory_fork_seed_and_reuse() {
             bound.ends_with("/data"),
             "a fork binds its stored copy: {bound}"
         );
-        let mounting = stderr
+        // One message per fork mount, and it is the lifecycle line: the fork and
+        // the directory to delete to reset it.
+        let fork_line = stderr
             .lines()
-            .find(|line| line.starts_with("==> Mounting ") && line.contains("/guest"))
-            .unwrap_or_else(|| panic!("no fork mount notice: {stderr}"));
-        assert_eq!(
-            mounting,
-            format!("==> Mounting /guest (fork stored at {bound})"),
-            "the notice names the guest path and the very copy that is bound"
+            .find(|line| {
+                line.starts_with("==> Initialized fork ") || line.starts_with("==> Reusing fork ")
+            })
+            .unwrap_or_else(|| panic!("no fork lifecycle notice: {stderr}"));
+        let reset_dir = Path::new(&bound)
+            .parent()
+            .expect("a fork binds its data dir");
+        assert!(
+            fork_line.contains(&format!("delete {} to reset", reset_dir.display())),
+            "the notice names the reset directory: {fork_line}"
+        );
+        assert!(
+            stderr
+                .lines()
+                .all(|line| !(line.starts_with("==> Mounting ") && line.contains("/guest"))),
+            "a fork gets no second, bind-shaped line: {stderr}"
         );
     }
 }

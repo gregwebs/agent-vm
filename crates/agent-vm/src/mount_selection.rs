@@ -30,7 +30,7 @@
 
 use crate::{
     config_mounts::{MountSelector, MountSetName, ResolvedMountList, UserMounts, parse_selector},
-    mount::{HostSyntax, MountRequest, MountRequests},
+    mount::{HostSyntax, MountOrigin, MountRequest, MountRequests},
 };
 use anyhow::{Result, anyhow};
 use std::{
@@ -77,12 +77,18 @@ impl ConfigMountPolicy {
     }
 }
 
-/// The launch's complete declaration list plus what the notice and the error
-/// context need to say about the config half.
+/// The launch's complete declaration list plus what the mount section's header
+/// and the error context need to say about the config half.
 #[derive(Debug)]
 pub(crate) struct Selection {
     requests: MountRequests,
     config: ConfigUse,
+    /// The header of the launch's one `==> Mounts:` section.
+    ///
+    /// Built here because this is the only place that knows what was selected
+    /// and from which file; the section prints it with the prepared plan's own
+    /// bind count, so neither half can describe a launch the other did not see.
+    sources: crate::mount_section::MountSources,
     /// The verified file that supplied at least one nonempty explicitly selected
     /// set, if any. Kept apart from [`ConfigUse`] because `--no-config-mounts` does
     /// *not* suppress that contribution, so a sentence about "skipped" mounts must
@@ -109,14 +115,15 @@ pub(crate) struct AutomaticMounts<'a> {
 
 /// What one launch did with the user config's automatic mount inputs.
 ///
-/// `Selected` and `Skipped` carry the file and the count so the notice can name
-/// both without re-reading the report; `NotDeclared` is "the file selects nothing
-/// automatically", which is deliberately distinct from a present-but-empty list
-/// (the authority rule turns on presence, the notice on declarations). A file that
-/// declares only `[mount_sets]` is `NotDeclared` *for the automatic notice*: it
-/// selected no access, so there is nothing to report and nothing to skip. A file
-/// whose only selection is a tool's own list is **not** `NotDeclared` — that is
-/// access, and the opt-out has to be able to say it skipped it.
+/// `Selected` and `Skipped` carry the file and the count so the section's header
+/// and the error context can name both without re-reading the report;
+/// `NotDeclared` is "the file selects nothing automatically", which is
+/// deliberately distinct from a present-but-empty list (the authority rule turns
+/// on presence, the header on declarations). A file that declares only
+/// `[mount_sets]` is `NotDeclared` *for the automatic header*: it selected no
+/// access, so there is nothing to report and nothing to skip. A file whose only
+/// selection is a tool's own list is **not** `NotDeclared` — that is access, and
+/// the opt-out has to be able to say it skipped it.
 #[derive(Debug)]
 enum ConfigUse {
     NotDeclared,
@@ -195,18 +202,24 @@ pub(crate) fn select(
             Err(error) => return Err(error.into_cli(entry).context("parsing --mount")),
         }
     }
+    let sources = crate::mount_section::MountSources::new(
+        config_file(&config),
+        contributing_sets(&requests),
+        !cli.is_empty(),
+        skipped_count(&config),
+    );
     Ok(Selection {
         requests: MountRequests::new(requests),
         config,
+        sources,
         explicit_sets,
     })
 }
 
 /// How many *distinct guest paths* the two automatic inputs select.
 ///
-/// The same number the notice must print, computed without materializing either
-/// list: an opt-out launch prints the count of what it skipped, and it must not
-/// pay a payload clone to do so. Membership is plain normalized-guest-path
+/// The number the opt-out's `skipped N` reports, computed without materializing
+/// either list: it must not pay a payload clone to say what it withheld. Membership is plain normalized-guest-path
 /// equality — a decision *equivalence* question is `claim`'s, and answering it
 /// here would be a second policy. A set-only file contributes nothing, because its
 /// definitions select nothing.
@@ -221,6 +234,45 @@ fn automatic_unique_guest_count(user: Option<&UserMounts>, tool: &ResolvedMountL
     }
     guests.extend(tool.requests().map(|request| request.mount.guest.as_path()));
     guests.len()
+}
+
+/// The verified file the mount section names, when the config contributed or
+/// withheld declarations.
+fn config_file(config: &ConfigUse) -> Option<PathBuf> {
+    match config {
+        ConfigUse::NotDeclared => None,
+        ConfigUse::Selected { file, .. } | ConfigUse::Skipped { file, .. } => Some(file.clone()),
+    }
+}
+
+/// The `[mount_sets]` names that supplied at least one of this launch's
+/// declarations, first-seen order, deduplicated.
+///
+/// Read off the declarations' own origins: a traversal that recorded the names
+/// each list *used* would be a second expansion, and a set reached through
+/// another one (`pi-agent = ["agent", …]`) already names itself on its own
+/// leaves. A declaration written straight into the defaults list or a tool list
+/// has no name here, which is what makes the header's `set`/`sets` suffix
+/// truthful rather than a list of everything the file defines.
+fn contributing_sets(requests: &[MountRequest]) -> Vec<String> {
+    let mut sets: Vec<String> = Vec::new();
+    for request in requests {
+        if let MountOrigin::UserSet { set, .. } = &request.origin
+            && !sets.iter().any(|seen| seen == &**set)
+        {
+            sets.push(set.to_string());
+        }
+    }
+    sets
+}
+
+/// What `--no-config-mounts` withheld, when it withheld anything: an empty
+/// automatic list printed no count before this change either.
+fn skipped_count(config: &ConfigUse) -> Option<usize> {
+    match config {
+        ConfigUse::Skipped { count, .. } if *count > 0 => Some(*count),
+        _ => None,
+    }
 }
 
 /// The automatic declarations in selection order: defaults first, then the tool
@@ -281,38 +333,12 @@ impl Selection {
         mem::take(&mut self.requests)
     }
 
-    /// One line naming the file and how many declarations it contributed.
+    /// The header input for the launch's one `==> Mounts:` section.
     ///
-    /// The count is the number of distinct guest paths across the defaults and the
-    /// launched tool's own plus inherited list, so a tool-only file reports its
-    /// access and an opt-out reports what it skipped. `None` when there is nothing
-    /// to report: no automatic input at all, an empty one, or a sets-only file.
-    /// list, or a sets-only file (whose definitions select nothing). A launch with
-    /// nothing automatic from the config must not print a "0" row on every run. A
-    /// non-empty defaults list the opt-out skipped still reports, as `skipped N` —
-    /// that is the one case where the reader has to be told the file declared
-    /// mounts and this launch ignored them, and it deliberately does not mention
-    /// named sets, which the opt-out does not affect.
-    pub(crate) fn notice(&self) -> Option<String> {
-        let (file, count, skipped) = match &self.config {
-            ConfigUse::NotDeclared => return None,
-            ConfigUse::Selected { file, count } => (file, *count, false),
-            ConfigUse::Skipped { file, count } => (file, *count, true),
-        };
-        if count == 0 {
-            return None;
-        }
-        Some(if skipped {
-            format!(
-                "==> Config mounts: skipped {count} from {} (--no-config-mounts)",
-                crate::one_line::quoted_path(file)
-            )
-        } else {
-            format!(
-                "==> Config mounts: {count} from {}",
-                crate::one_line::quoted_path(file)
-            )
-        })
+    /// Distinct from the count in [`Selection::preparation_context`]: this names
+    /// sources, while the prepared plan supplies the number of binds they became.
+    pub(crate) fn sources(&self) -> &crate::mount_section::MountSources {
+        &self.sources
     }
 
     /// The `mount::prepare` error context.
@@ -626,11 +652,12 @@ mod tests {
         );
     }
 
-    /// The notice counts *distinct normalized guest paths* across both automatic
-    /// inputs, so an identical declaration selected twice is one mount, and a
-    /// tool-only file still reports what it selected.
+    /// The header names the file, and the *skipped* count is distinct normalized
+    /// guest paths across both automatic inputs: an identical declaration
+    /// selected twice is one mount, and a tool-only file still reports what the
+    /// opt-out withheld.
     #[test]
-    fn combined_automatic_notice_counts_unique_guests() {
+    fn the_header_names_config_provenance_and_the_skipped_count() {
         // The same declaration in both the defaults list and the tool list.
         let document = "mounts = [\"/a:/g:ro\"]\n                        [[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = [\"/a:/g//./:ro\", \"/b:/h:ro\"]\n";
         let (user, tool) = pair(document);
@@ -644,9 +671,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            selection.notice(),
+            selection.sources().header(2),
             Some(format!(
-                "==> Config mounts: 2 from {}",
+                "==> Mounts: 2 (config {})",
                 crate::one_line::quoted_path(user.file())
             ))
         );
@@ -660,26 +687,26 @@ mod tests {
                 &[],
             )
             .unwrap()
-            .notice(),
+            .sources()
+            .header(0),
             Some(format!(
-                "==> Config mounts: skipped 2 from {} (--no-config-mounts)",
+                "==> Mounts: skipped 2 from {} (--no-config-mounts)",
                 crate::one_line::quoted_path(user.file())
             ))
         );
 
-        // Defaults only: the historical bytes, unchanged.
+        // Defaults only: the file alone, no set to name.
         let user = user_mounts(&["~/ref:ro"]);
         let selection = select(automatic(Some(&user)), ConfigMountPolicy::Apply, &[]).unwrap();
         assert_eq!(
-            selection.notice(),
+            selection.sources().header(1),
             Some(format!(
-                "==> Config mounts: 1 from {}",
+                "==> Mounts: 1 (config {})",
                 crate::one_line::quoted_path(user.file())
             ))
         );
 
-        // A tool-only file selects access, so it is neither silent nor reported as
-        // a defaults list it does not have.
+        // A tool-only file selects access, so it is named too.
         let document =
             "mounts = []\n[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = [\"/o:/o:ro\"]\n";
         let (user, tool) = pair(document);
@@ -693,9 +720,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            selection.notice(),
+            selection.sources().header(1),
             Some(format!(
-                "==> Config mounts: 1 from {}",
+                "==> Mounts: 1 (config {})",
                 crate::one_line::quoted_path(user.file())
             ))
         );
@@ -714,7 +741,8 @@ mod tests {
                 &[],
             )
             .unwrap()
-            .notice(),
+            .sources()
+            .header(0),
             None
         );
     }
@@ -815,64 +843,47 @@ mod tests {
         );
     }
 
-    /// Both lines, and silence when the file contributes nothing.
+    /// Silence when the file contributes nothing, and the plain count when it does.
     #[test]
-    fn notice_names_the_file_and_the_skipped_count() {
+    fn the_header_is_silent_unless_the_file_contributes() {
         let empty = user_mounts(&[]);
         let sets_only = user_mounts_from("[mount_sets]\na = [\"/h/x:/x:ro\"]\n");
-        assert_eq!(
-            select(automatic(None), ConfigMountPolicy::Apply, &[])
-                .unwrap()
-                .notice(),
-            None
-        );
-        // A sets-only file is not "skipped": the opt-out does not affect it, and
-        // its definitions select nothing automatically.
-        assert_eq!(
-            select(
-                automatic(Some(&sets_only)),
-                ConfigMountPolicy::Suppress,
-                &[]
-            )
-            .unwrap()
-            .notice(),
-            None
-        );
-        assert_eq!(
-            select(automatic(Some(&sets_only)), ConfigMountPolicy::Apply, &[])
-                .unwrap()
-                .notice(),
-            None
-        );
-        assert_eq!(
-            select(automatic(Some(&empty)), ConfigMountPolicy::Apply, &[])
-                .unwrap()
-                .notice(),
-            None
-        );
-        assert_eq!(
-            select(automatic(Some(&empty)), ConfigMountPolicy::Suppress, &[])
-                .unwrap()
-                .notice(),
-            None
-        );
+        for (mounts, policy) in [
+            (None, ConfigMountPolicy::Apply),
+            // A sets-only file is not "skipped": the opt-out does not affect it,
+            // and its definitions select nothing automatically.
+            (Some(&sets_only), ConfigMountPolicy::Suppress),
+            (Some(&sets_only), ConfigMountPolicy::Apply),
+            (Some(&empty), ConfigMountPolicy::Apply),
+            (Some(&empty), ConfigMountPolicy::Suppress),
+        ] {
+            assert_eq!(
+                select(automatic(mounts), policy, &[])
+                    .unwrap()
+                    .sources()
+                    .header(0),
+                None
+            );
+        }
 
         let user = user_mounts(&["~/ref:ro", "/srv/data:/data:rw"]);
         assert_eq!(
             select(automatic(Some(&user)), ConfigMountPolicy::Apply, &[])
                 .unwrap()
-                .notice(),
+                .sources()
+                .header(2),
             Some(format!(
-                "==> Config mounts: 2 from {}",
+                "==> Mounts: 2 (config {})",
                 crate::one_line::quoted_path(user.file())
             ))
         );
         assert_eq!(
             select(automatic(Some(&user)), ConfigMountPolicy::Suppress, &[])
                 .unwrap()
-                .notice(),
+                .sources()
+                .header(0),
             Some(format!(
-                "==> Config mounts: skipped 2 from {} (--no-config-mounts)",
+                "==> Mounts: skipped 2 from {} (--no-config-mounts)",
                 crate::one_line::quoted_path(user.file())
             ))
         );

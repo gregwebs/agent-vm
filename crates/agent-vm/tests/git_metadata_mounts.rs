@@ -2053,7 +2053,7 @@ fn equivalent_declarations_merge_and_different_ones_are_refused() {
     let (config, stderr) = reached_builder(&out);
     assert_eq!(automatic_binds(&h, &config), vec![common_bind(&repo, true)]);
     assert!(
-        stderr.contains("==> Config mounts: 1 from "),
+        stderr.contains("==> Mounts: 1 (config \""),
         "the config origin is kept: {stderr}"
     );
 
@@ -2185,7 +2185,7 @@ fn an_enclosing_declaration_is_never_shadowed() {
     let (config, stderr) = reached_builder(&out);
     assert!(no_metadata_bind(&config), "(b) {stderr}");
     assert!(
-        stderr.contains("==> Config mounts: 1 from "),
+        stderr.contains("==> Mounts: 1 (config \""),
         "(b) the config origin is still reported: {stderr}"
     );
     assert!(

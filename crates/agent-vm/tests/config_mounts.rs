@@ -827,7 +827,7 @@ fn empty_mounts_still_requires_a_verified_file() {
         "an empty list is authority that passes: {stderr}"
     );
     assert!(
-        !stderr.contains("==> Config mounts:"),
+        !stderr.contains("==> Mounts:"),
         "an empty selection must not print a count-of-zero notice: {stderr}"
     );
     let with_empty = sorted_binds(&debug_config_json(&stderr));
@@ -959,7 +959,7 @@ fn unsafe_user_mounts_are_refused_before_launch_state() {
                 "{shape}: the declared mount must be applied: {binds:?}"
             );
             assert!(
-                stderr.contains(&format!("==> Config mounts: 1 from \"{}\"", file.display())),
+                stderr.contains(&format!("==> Mounts: 1 (config \"{}\"", file.display())),
                 "{shape}: {stderr}"
             );
         } else {
@@ -1072,10 +1072,11 @@ fn symlinked_user_config_without_mounts_still_launches() {
 // Selection: both declaration sources, dedup, normalized guest collisions
 // ---------------------------------------------------------------------------
 
-/// A `mounts` notice naming this harness's user file.
+/// The `==> Mounts:` header for a launch whose declared mounts are `count` binds
+/// of this harness's user file.
 fn config_notice(h: &Harness, count: usize) -> String {
     format!(
-        "==> Config mounts: {count} from \"{}\"",
+        "==> Mounts: {count} (config \"{}\"",
         h.user_config().display()
     )
 }
@@ -1123,8 +1124,8 @@ fn config_and_cli_mounts_are_both_applied() {
         "the CLI mount must be writable at its guest: {binds:?}"
     );
     assert!(
-        stderr.contains(&config_notice(&h, 1)),
-        "the notice must count only the config half: {stderr}"
+        stderr.contains(&config_notice(&h, 2)),
+        "the section counts both declared halves: {stderr}"
     );
 }
 
@@ -1905,7 +1906,7 @@ fn opt_out_removes_a_config_mounts_github_scope() {
         "a suppressed config mount must not widen the allow-list: {stderr}"
     );
     assert!(
-        stderr.contains("==> Config mounts: skipped 1 from"),
+        stderr.contains("skipped 1 from"),
         "the launch must say the declaration was skipped: {stderr}"
     );
 }
@@ -2285,7 +2286,7 @@ fn opt_out_ignores_an_unused_missing_config_source() {
     );
     assert!(
         stderr.contains(&format!(
-            "==> Config mounts: skipped 1 from \"{}\" (--no-config-mounts)",
+            "==> Mounts: skipped 1 from \"{}\" (--no-config-mounts)",
             h.user_config().display()
         )),
         "{stderr}"
@@ -2334,7 +2335,7 @@ fn opt_out_keeps_cli_core_and_persisted_paths() {
     let stderr = stderr_of(&out);
     assert!(
         stderr.contains(&format!(
-            "==> Config mounts: skipped 1 from \"{}\" (--no-config-mounts)",
+            "==> Mounts: 1 (config \"{}\": 1 skipped by --no-config-mounts; --mount)",
             h.user_config().display()
         )),
         "{stderr}"
@@ -2820,7 +2821,7 @@ fn named_mount_sets_definitions_alone_select_nothing() {
         "a sets-only file must still launch: {declared}"
     );
     assert!(
-        !declared.contains("==> Config mounts:"),
+        !declared.contains("==> Mounts:"),
         "definitions select nothing, so there is no count to report: {declared}"
     );
     let with_sets = sorted_binds(&debug_config_json(&declared));
@@ -2900,7 +2901,7 @@ fn named_mount_sets_opt_out_keeps_an_explicit_selection() {
         );
     }
     assert!(
-        stderr.contains("skipped 1 from"),
+        stderr.contains("1 skipped by --no-config-mounts"),
         "the skipped defaults are still reported: {stderr}"
     );
     // The context says which half the opt-out skips, and never claims it removes
@@ -3507,7 +3508,7 @@ fn named_mount_sets_scan_repos_like_their_direct_twin() {
         "the same bytes select the set without the opt-out: {unsuppressed}"
     );
     assert!(
-        unsuppressed.contains("==> Config mounts: 1 from"),
+        unsuppressed.contains("==> Mounts: 1 (config \""),
         "the defaults entry is what selects it: {unsuppressed}"
     );
     let suppressed = stderr_of(&h.launch(&["--no-config-mounts"], "shell", &[]));
@@ -3674,7 +3675,7 @@ fn named_mount_sets_are_never_inferred_from_tool_names() {
         "launching a tool must not select a set named after it: {unsolicited:?}"
     );
     assert!(
-        !inferred.contains("==> Config mounts:"),
+        !inferred.contains("==> Mounts:"),
         "definitions alone report no config selection: {inferred}"
     );
 
@@ -4135,7 +4136,7 @@ fn tool_list_mixes_set_and_direct_and_merges_with_defaults() {
     // Distinct guest paths across both inputs: 2 defaults (one of them the
     // duplicate) + 3 tool-facet entries (one of them the duplicate again).
     assert!(
-        stderr.contains("==> Config mounts: 4 from"),
+        stderr.contains("==> Mounts: 4 (config \""),
         "the notice counts distinct guest paths, not occurrences: {stderr}"
     );
 }
@@ -4579,7 +4580,7 @@ fn opt_out_removes_defaults_own_and_inherited_mounts_but_keeps_cli() {
     // The notice names what it skipped, and the count covers both automatic inputs.
     let stderr = stderr_of(&h.launch(&["--no-config-mounts"], "t", &[]));
     assert!(
-        stderr.contains("==> Config mounts: skipped 3 from"),
+        stderr.contains("skipped 3 from"),
         "the skipped count covers defaults and the tool facet: {stderr}"
     );
     // An explicit direct path and an explicit set still apply.

@@ -329,8 +329,8 @@ fn mount_notices_are_bounded_and_point_at_msb_inspect() {
     let home = h.home_path();
 
     // One `==> Mounting` line per discovered target, so ten targets plus the
-    // HOST bind exceed the launch's eight-line report budget (mount.rs
-    // `MAX_MOUNT_NOTICES`).
+    // HOST bind exceed the launch's three-line report budget
+    // (`mount_section::MAX_LISTED_MOUNTS`).
     let host_mount = home.join("links");
     std::fs::create_dir_all(&host_mount).unwrap();
     let mut targets = Vec::new();
@@ -345,22 +345,26 @@ fn mount_notices_are_bounded_and_point_at_msb_inspect() {
     let out = h.run_shell(&[&mount_arg]);
     let err = stderr_of(&out);
 
+    // Past the cap nothing is listed at all: the pointer replaces the list rather
+    // than following a truncated one.
     let mounting = err
         .lines()
         .filter(|line| line.starts_with("==> Mounting "))
         .count();
-    assert_eq!(mounting, 8, "the notice budget is eight lines:\n{err}");
+    assert_eq!(mounting, 0, "no partial list:\n{err}");
     let summary: Vec<&str> = err
         .lines()
-        .filter(|line| line.contains("more mounts not shown"))
+        .filter(|line| line.contains("mounts: agent-vm msb inspect "))
         .collect();
-    assert_eq!(summary.len(), 1, "one summary line:\n{err}");
+    assert_eq!(summary.len(), 1, "one pointer line:\n{err}");
     assert!(
-        summary[0].starts_with(
-            "==>   … and 3 more mounts not shown (view all: agent-vm msb inspect agent-vm-"
-        ),
-        "the summary names the read-everything command: {}",
+        summary[0].starts_with("==>   view all 11 mounts: agent-vm msb inspect agent-vm-"),
+        "the pointer names every mount and the read-everything command: {}",
         summary[0]
+    );
+    assert!(
+        err.contains("==> Mounts: 11 (--mount)"),
+        "the header counts the declarations' binds: {err}"
     );
 
     // The cap is a report cap, not a mount cap: every discovered target still

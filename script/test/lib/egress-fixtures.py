@@ -1543,7 +1543,7 @@ def check_default_request_diagnostics(case: Case, status: int, text: str) -> lis
         if start < 0 or lines[start:start + len(expected)] != expected:
             failures.append("default-request block is not contiguous")
         for i, line in enumerate(lines):
-            if line.startswith(("==> Egress policy:", "==> Egress DNS:", "==> Guest egress proxy:", "==> TLS interception:")) and i > start:
+            if line.startswith(("==> Egress policy:", "==> Egress DNS:", "==> Guest egress proxy:")) and i > start:
                 failures.append("network notice after request report")
     return failures
 

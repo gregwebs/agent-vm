@@ -1773,16 +1773,30 @@ bind that stored copy, never synchronize with `HOST`, and print the exact reset
 directory. `:fork:follow-links` materializes link targets into that copy;
 without it nested link text is preserved. `fork` conflicts with `ro` and `rw`.
 
-Every selected extra mount is announced, up to eight: a bind mounted at the path
-it was declared with needs no arrow (`==> Mounting /home/you/.cargo/registry`);
-a remap shows both sides (`==> Mounting /srv/data -> /data (read-only)`); and a
-fork names its stored copy instead of presenting it as a source
-(`==> Mounting /home/you/.pi/agent (fork stored at <state>/forks/<id>/data)`).
-`:follow-links` announces each discovered target too, so the list can be long;
-startup then summarizes the rest instead of printing it, and
-`agent-vm msb inspect <sandbox>` reports the sandbox's complete configuration.
-Forks are named first and followed targets last, so a long discovery tail is
-what gets summarized.
+Startup prints **one mount section**: a `==> Mounts:` header naming how many
+host paths this launch exposes beyond the binds every launch has, where they came
+from, then the mounts themselves, then preparation's notices. Up to three mounts
+are named individually — a bind mounted at the path it was declared with needs no
+arrow (`==> Mounting /home/you/.cargo/registry`), and a remap shows both sides
+(`==> Mounting /srv/data -> /data (read-only)`). Past three nothing is listed:
+the header keeps the sources and one pointer replaces the list, because
+`:follow-links` announces each discovered target and the host tree bounds that
+count:
+
+```text
+==> Mounts: 4 (config "/Users/you/.config/agent-vm/config.toml", set rust)
+==>   view all 4 mounts: agent-vm msb inspect agent-vm-abc-42
+```
+
+A **fork** always gets its own line either way, because its stored copy is not
+derivable from the declaration: `==> Initialized fork <source> -> <state>/forks/<id>/data`
+on the first launch and
+`==> Reusing fork <guest>: delete <state>/forks/<id> to reset` on later ones.
+Delete the directory the line names, not the `data` bind inside it: the
+directory also holds the manifest that marks the copy READY. That one line is the
+fork's whole report — there is no second, bind-shaped line for it. Declarations
+are named before the targets a `:follow-links` walk discovered, so a long
+discovery tail is what the pointer replaces.
 
 A seed copies regular files and directories. A **socket, FIFO or device node**
 in the source is omitted, not copied and not a failure, with a notice like
@@ -1962,16 +1976,23 @@ recent `[table]` header, so write it **before the first one**:
 | `[mount_sets.foo]` (nested table) | refused: a set's value must be an array of declarations or set names |
 | `mount_sets = []` or any non-table | `mount_sets: must be a table of named arrays of mount declarations` |
 
-A launch that selected config mounts prints one line, naming the file and how
-many declarations it contributed:
+The `==> Mounts:` header names the file, and the `[mount_sets]` names that
+actually supplied one of this launch's declarations:
 
 ```text
-==> Config mounts: 2 from "/Users/you/.config/agent-vm/config.toml"
-==> Config mounts: skipped 2 from "/Users/you/.config/agent-vm/config.toml" (--no-config-mounts)
+==> Mounts: 3 (config "/Users/you/.config/agent-vm/config.toml", set pi-agent)
+==> Mounts: 5 (config "/Users/you/.config/agent-vm/config.toml", sets rust, agent; --mount)
+==> Mounts: skipped 2 from "/Users/you/.config/agent-vm/config.toml" (--no-config-mounts)
 ```
 
-Expect no such line when the list is empty or absent, or when a skipped list was
-empty: there is nothing to report.
+The count is binds, not declarations: two entries at one guest path are one
+mount. A set is named when one of its own entries reached the guest, so a nested
+set names itself rather than only the set that referenced it, and a declaration
+written straight into the defaults list or a tool list has no set to name.
+`--no-config-mounts` withholds a non-empty automatic selection and reports it as
+`skipped N` — its own sentence when nothing else is mounted, or inside the
+header when `--mount` still mounts something. Expect no section at all when
+there is nothing to report: no declared mount, nothing withheld.
 
 > **Added in 0.7.4.** ADR-0046 records why the file-trust rule, the merge rule
 > and the preflight order are what they are. Named mount sets arrived in 0.7.13
@@ -2057,7 +2078,7 @@ regardless.
 
 **Declarations are inert; selection is what mounts.** A `[mount_sets]` table (an
 empty one included) and an empty set select nothing, and a sets-only file prints
-no `==> Config mounts:` line. Repeated paths, a set named twice and a shared
+no `==> Mounts:` section. Repeated paths, a set named twice and a shared
 nested set all deduplicate to one bind per declaration. Differing declarations at
 one guest path are refused in every combination — default versus set, set versus
 set, and `--mount` versus a selected set, in either order — with both declared
