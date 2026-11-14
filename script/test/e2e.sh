@@ -7204,23 +7204,11 @@ custom_image_default_upgrade() {
 
 # ------------- project-scoped image pins (#390, #532) in one HOST file ---
 
-PINS_HOME=""
-PINS_STATE=""
-PINS_BIN=""
-PINS_ENV=()
-PINS_OBSERVER_PID=""
-
-# Every command here runs under one private HOME/state pair, with the inherited
-# image/cache overrides cleared and the host decoys first on PATH.
-pins_env() {
-  local home="$1" state="$2"
-  PINS_HOME="$home"
-  PINS_STATE="$state"
-  PINS_ENV=(env
-    -u AGENT_VM_IMAGE_TAG -u AGENT_VM_ROOT -u AGENT_VM_SHARE_MSB_CACHE
-    -u AGENT_VM_MSB_CACHE_DIR -u MSB_CONFIG_PATH -u AGENT_VM_TEST_DEFAULT_IMAGE
-    HOME="$home" AGENT_VM_STATE_DIR="$state")
-}
+# The pins environment and its two command wrappers live in a lib so the
+# boot-free contract (script/test/e2e-image-pins-contract.sh) exercises the same
+# code this native harness runs (#543, #455's pattern).
+# shellcheck source=script/test/lib/e2e-image-pins.sh
+. "$REPO_ROOT/script/test/lib/e2e-image-pins.sh"
 
 pins_launch() {
   local name="$1" proj="$2"
@@ -7229,15 +7217,6 @@ pins_launch() {
     "${PINS_ENV[@]}" "${OFFLINE_ENV[@]}" \
     XDG_CONFIG_HOME="$WORK/offline-config" PATH="$SHIM_DIR:/usr/bin:/bin" \
     HOST_SHIM_LOG="$HOST_SHIM_LOG" "$PINS_BIN" "$@"
-}
-
-# Every explicit verb runs in the project whose approval it must read or write:
-# a project is the command's working directory, so a verb run from the script's
-# own cwd would act on a different project's records.
-pins_avm() {
-  local proj="$1"
-  shift
-  (cd "$proj" && "${PINS_ENV[@]}" "$PINS_BIN" "$@")
 }
 
 pins_store() {
@@ -7740,7 +7719,10 @@ custom_image_host_pins() {
   # cache-first from the alias import above, which published B under this tag, so
   # the approval is what makes the guest boot A rather than a cache accident.
   live_id="$(pins_project_id "$live")"
-  pins_avm "$live" image refresh --image "$tag" >"$WORK/pins-live-pin.out" 2>&1 || {
+  # `--image` is a target filter over references already in use (#543), so this
+  # first approval supplies the tag as the ambient selection through the shared
+  # helper (which places the assignment after `PINS_ENV`'s `-u` options).
+  pins_avm_ambient "$live" "$tag" image refresh >"$WORK/pins-live-pin.out" 2>&1 || {
     echo "    FAIL: could not approve A for the tag in the live guest's project"
     cat "$WORK/pins-live-pin.out"
     result=1

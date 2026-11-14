@@ -19,6 +19,13 @@ write sequence without changing selection or establishment eligibility.
 Warm/equal approvals may require metadata-only writes. Default adoption is not a
 Boot preparation.
 
+S4 (#543), implemented in 0.7.55, changes targeting/reporting per ADR-0068 D10.
+Bare refresh performs the ambient operation plus held references; `--image`
+filters the ambient-reference/held-reference set. D7's adoption supersedes
+unheld D as before; held D is now refreshed independently. Consent and eligible
+default establishment/adoption remain in force. The failed-operation guarantee
+is per operation (D6, D9), not batch-wide.
+
 ## Context
 
 Two questions have two different records in `$HOME/.config/agent-vm/`:
@@ -75,7 +82,8 @@ Establishing and its first pin are **one** save, because both records live in
 the same file. Launch and `setup` never move an established default; nothing
 establishes one from a selection made while the tool configuration was
 unreadable, because the configured tiers are then unknown and the selection is
-provisional.
+provisional. In a multi-target refresh, only the unfiltered ambient default-tier
+acquisition can establish; another target's success cannot establish instead.
 
 **4. The host record is initialized only from the initial recommendation.** A
 selection that came from the host record or from the project's own default never
@@ -103,24 +111,45 @@ is given up: the user can no longer refuse at the terminal. The digests are stil
 shown; keeping an approval now means not refreshing that reference, or selecting
 it by digest.
 
+Refresh authorizes each target's own frozen candidate; successful target
+approvals remain committed when another target fails. A precommit
+rendering/acquisition/CAS/save failure preserves only that operation's approval,
+roles and project-default transaction. A completed sibling may change the
+effective default or content, and is not undone; exit 1 does not imply the
+previous default/content was preserved for the whole invocation. D9 is the
+documented host-first recommendation-seed exception. Prompt-free consent, no
+stdin, frozen candidates and integrity checks remain unchanged.
+
 **7. Adoption on an explicit refresh, only from an existing record.** In a
 project whose selection is its established default D:
 
 | Host record | Result |
 |---|---|
-| exists, names a different reference H | refresh resolves H once, approves its content for this project (a first pin, or the same digest), and moves `defaults[P]` from D to H, in one compare-and-swap save. Old/new digests are rendered when they differ. D is not re-resolved. |
-| exists, names D | today's refresh of D; nothing else changes. |
-| absent | today's refresh of D; nothing else changes. The initial recommendation never moves an established project, so a launcher upgrade never does. |
-| damaged | refresh fails before any registry request, and nothing is written. |
+| exists, names a different reference H | refresh resolves H once, approves its content for this project (a first pin, or the same digest), and moves `defaults[P]` from D to H, in one compare-and-swap save. Old/new digests are rendered when they differ. D is not re-resolved merely for adoption: H supersedes the ambient operation for unheld D. If D holds an active role, S4 refreshes D as an independent target after adoption; a failure there does not undo adoption. H is acquired once even when already held. No other adoption policy changes. |
+| exists, names D | today's refresh of D: no bookmark change and no adoption render. The operation still reports a row with its digest, and independently held Boot/Output references are refreshed as their own targets. |
+| absent | today's refresh of D: no bookmark change and no adoption render. The operation still reports a row with its digest, and independently held references are refreshed as their own targets. The initial recommendation never moves an established project, so a launcher upgrade never does. |
+| damaged | An unfiltered refresh refuses the command before worklist freeze, any registry request or authority write, whether `default_slot` cannot select a BootImage or an established D's `adoption_offer` fails. It emits no target rows/summary and does not attempt holders. A filtered held reference is permitted without reading the host default. There is no fabricated “refused” target. |
+
+Failure preserves the failed operation's transaction, not the batch's effective
+state. Adoption of H can succeed before held D fails (exit 1, project default H);
+adoption can fail before held D independently succeeds (exit 1, bookmark D
+unchanged by adoption). Sibling successes remain.
 
 Adoption never touches another project's records. The offer is a *selection*
 fact, so the selector computes it and the approval authority decides and writes.
+Adoption carries H's observation from the frozen worklist into the same save: an
+observed H that vanished is stale rather than reinserted, a genuinely absent H
+may be inserted, and live equal content reconciles under ADR-0068.
 
 **8. A bare refresh with an unreadable configuration is an error.** Falling
 through to the default tier would establish a project default from a state the
-user never chose. `image refresh --image REF` and an
-`AGENT_VM_IMAGE_TAG`-selected refresh still work (they warn): they never select
-through the default tier, so they establish nothing.
+user never chose. Unreadable configuration with no known env selection or
+explicit held target is an error; refresh never fabricates a default-tier
+fallback. `AGENT_VM_IMAGE_TAG` supplies a known ambient selection, not a target
+filter. An explicit `--image REF` can refresh a recorded holder, not approve an
+arbitrary new reference. These recovery forms warn and establish/adopt nothing.
+Default-slot/offer errors for an unfiltered command remain the pre-freeze refusal
+in D7; partial progress starts after a valid freeze.
 
 **9. The `pending_default` journal is no longer written, and still read.** It
 made a pin and the host record all-or-nothing. Nothing pairs them any more:
@@ -141,6 +170,12 @@ default as `previous`"; dropping it would misread a 0.7.39–0.7.46 store
 mid-recovery. It is the format's existing meaning, not a compatibility layer; a
 release that bumps the store version may drop it.
 
+In S4 the failed-operation guarantee is per operation. After a
+recommendation-sourced first operation seeds the host, its later pin-save failure
+may leave that host seed initialized; its approval, roles and project default
+remain unchanged. Successful sibling operations keep their own effects. This is
+the existing narrowed guarantee, not a batch rollback.
+
 **10. Concepts get their own module.** The project-default concepts and flows
 live in `image_pin/project_default.rs`, a child of the approval authority, which
 gains only the schema and transactions that must share a save with the pins.
@@ -155,10 +190,15 @@ gains only the schema and transactions that must share a save with the pins.
   its starting choice and its next default-tier use boots and establishes it
   (B6; AC3).
 - A bare `image refresh` in an established project adopts the host record (B2).
-  Re-verifying the project's own default is `image refresh --image <its ref>`.
+  Re-verifying an in-use default is
+  `AGENT_VM_IMAGE_TAG=<its ref> agent-vm image refresh`.
+- S4 (#543) makes refresh cover the ambient operation plus held references, so a
+  failed held-D refresh can accompany a successful adoption, and vice versa
+  (exit 1). Use `agent-vm setup --image repo:b --no-verify` to acquire and
+  approve a new boot reference (B5 superseded).
 - Refresh never asks (B3), and `--yes` is removed from both verbs (B4).
 - `image set-default` no longer approves its typed tag in the invoking project
-  (B5); `agent-vm image refresh --image repo:b` does that.
+  (B5); `agent-vm setup --image repo:b --no-verify` does that.
 - A project that has not yet booted the default tier is not established, so a
   `set-default` still changes its starting choice (B6).
 - The first default-tier use of each project writes `image-pins.json`, so a
@@ -193,7 +233,7 @@ gains only the schema and transactions that must share a save with the pins.
 | Offer the initial recommendation for adoption when the host has no record | A launcher upgrade alone would then move established projects. |
 | Refresh re-resolves D before offering adoption | Strands a project whose old default vanished upstream. |
 | Let a broken-config refresh fall through to the default tier | Permanently establishes the project from a transient state. |
-| Refuse every refresh with an unreadable configuration, including `--image`/env | They never select through the default tier, so refusing them only removes a working recovery path. |
+| Refuse every refresh with an unreadable configuration, including env/held targets | A known env selection and a recorded holder never select through the default tier, so refusing them only removes a working recovery path. An arbitrary `--image` value is refused (S4). |
 | Let `setup` (or any preparation) establish from an unreadable configuration | The same permanent-establishment hazard. |
 | Withhold host-record initialization too while the configuration is unreadable | The host record only ever receives the recommendation, which cannot capture the transient state. |
 | Retain the source tag (#392) | Not required by #532; adoption-on-refresh covers the need. |

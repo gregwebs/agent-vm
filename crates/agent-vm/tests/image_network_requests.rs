@@ -158,6 +158,17 @@ impl Harness {
         bounded(command)
     }
 
+    /// A bare refresh whose ambient selection is `reference`: the shape that
+    /// re-resolves a reference the store records but no live role holds, because
+    /// `--image` only filters references already in use (ADR-0068 D10).
+    fn refresh_as_ambient(&self, reference: &str) -> Output {
+        let mut command = self.command();
+        command
+            .env("AGENT_VM_IMAGE_TAG", reference)
+            .args(["image", "refresh"]);
+        bounded(command)
+    }
+
     fn set_default(&self, reference: &str) -> Output {
         let mut command = self.command();
         command.args(["image", "set-default", "--image", reference]);
@@ -1741,7 +1752,8 @@ fn a22iii_two_references_do_not_share_a_recorded_set() {
 
     let x2 = h.labeled("a22iii-x2", &[("agent.codex", "a.example,b.example")]);
     server.image("images", "x", &x2);
-    assert!(h.refresh(&xt).status.success());
+    let moved = h.refresh_as_ambient(&xt);
+    assert!(moved.status.success(), "{}", stderr(&moved));
     let covered = h.launch_granted(&xt, &["b.example"]);
     assert!(!covered.status.success());
     assert!(image_lines(&covered).is_empty());

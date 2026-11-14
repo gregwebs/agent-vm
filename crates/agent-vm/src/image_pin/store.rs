@@ -24,7 +24,7 @@
 //! flows and the host's starting choice — is [`super::project_default`].
 use std::collections::BTreeSet;
 use std::fs::{DirBuilder, File};
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write as _};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -84,6 +84,10 @@ mod gate {
         DefaultSaved,
         BeforePinSave,
         PinCommitted,
+        /// Emitted immediately after the one-time authority-lock wait notice was
+        /// *attempted*, so a test can prove the write happened while it still
+        /// held the real pin lock. Carries no reference, path, digest or consent.
+        AuthorityNoticeAttempted,
     }
 
     impl Stage {
@@ -98,6 +102,7 @@ mod gate {
                 Self::DefaultSaved => "default-saved",
                 Self::BeforePinSave => "before-pin-save",
                 Self::PinCommitted => "pin-committed",
+                Self::AuthorityNoticeAttempted => "authority-notice-attempted",
             }
         }
 
@@ -691,10 +696,14 @@ fn legacy() -> anyhow::Error {
     )
 }
 fn full() -> anyhow::Error {
+    // Update-local on purpose: a refresh may commit earlier operations and then
+    // fail this one, so a batch-wide "nothing was approved" claim would be false.
+    // The wording is accurate for every caller (launch, setup, publication and
+    // refresh) because each of them is refused this one save.
     anyhow!(
         "image pin authority at $HOME/.config/agent-vm/image-pins.json holds the maximum \
-         number of approvals it can store (the record or byte bound), so nothing was approved; \
-         archive it to reset approvals"
+         number of approvals it can store (the record or byte bound); this proposed pin-store \
+         update was not committed; archive it to reset approvals"
     )
 }
 fn failure() -> anyhow::Error {
@@ -827,6 +836,33 @@ impl Store {
     }
     pub(super) fn lookup(&self, key: &PinKey) -> Result<Option<ApprovedPin>> {
         self.observe_slot(HostRead::Never)?.0.lookup(key)
+    }
+
+    /// The one read-only snapshot a refresh invocation freezes its worklist
+    /// from: every record in exactly this project/host-platform scope, with its
+    /// held roles.
+    ///
+    /// One `observe_slot(HostRead::Never)` decodes and validates the entire
+    /// authority, so foreign records are still *checked* (a malformed foreign
+    /// role join is damage) without being projected. Nothing is created,
+    /// recovered or rewritten, and a healthy unrelated host record is not read.
+    pub(super) fn refresh_scope(&self, scope: &ScopeKey) -> Result<RefreshScopeSnapshot> {
+        let (file, _host) = self.observe_slot(HostRead::Never)?;
+        let mut pins = Vec::new();
+        for record in &file.pins {
+            let pin = record.validated()?;
+            if pin.key.scope() != *scope {
+                continue;
+            }
+            pins.push(ScopedRefreshPin {
+                pin,
+                held: record.held(),
+            });
+        }
+        Ok(RefreshScopeSnapshot {
+            scope: scope.clone(),
+            pins,
+        })
     }
     /// Whether the whole work of a warm Boot claim — resolution, holder move,
     /// justified cleanup and default establishment — is already done. A complete
@@ -1005,6 +1041,7 @@ impl Store {
         };
         let mut new = old.clone();
         let mut reserved = None;
+        let previous = current.clone();
         let pin = match decision {
             CommitDecision::AlreadyApproved => current.ok_or_else(failure)?,
             CommitDecision::Insert | CommitDecision::Replace => {
@@ -1053,6 +1090,7 @@ impl Store {
             value: Committed {
                 pin,
                 project_default,
+                previous,
             },
             report,
         })))
@@ -1140,19 +1178,26 @@ impl Store {
             ));
         }
         // The proposed key is immutable, so the proved decision has only three
-        // legitimate outcomes: a first pin, the same digest, or integrity
-        // failure. Reuse it with first-pin facts.
+        // legitimate outcomes: a first pin, the same digest, or a conflict that
+        // is either a stale observation or an integrity failure. The
+        // observation — not a fresh read — is what the CAS compares, so a peer
+        // that retired H cannot have it silently reinserted.
         let current = old.lookup(&candidate.key)?;
+        let expected = adoption.observed_host();
+        let predecessor_matches = current.as_ref() == expected;
         let decision = commit_decision(CommitFacts {
             current_present: current.is_some(),
-            expected_present: false,
+            expected_present: expected.is_some(),
             candidate_equal: current
                 .as_ref()
                 .is_some_and(|pin| pin.digest == candidate.digest),
-            predecessor_matches: false,
-            mutable_source: candidate.key.reference.digest().is_none(),
+            predecessor_matches,
+            // H is an immutable retained reference: it never becomes a
+            // replacement, so no consent can authorize different content.
+            mutable_source: false,
             consent: false,
         });
+        let previous = current.clone();
         let mut new = old.clone();
         let pin = match decision {
             CommitDecision::AlreadyApproved => current.ok_or_else(failure)?,
@@ -1168,7 +1213,27 @@ impl Store {
                 new.upsert_approval(&pin)?;
                 pin
             }
-            _ => return Err(immutable_integrity_failure()),
+            // Fail closed: an immutable retained reference is never replaced.
+            CommitDecision::Replace => {
+                return Err(anyhow!(
+                    "image approval is stale; retry the explicit operation"
+                ));
+            }
+            CommitDecision::Conflict => {
+                // Any observed H that no longer matches live state — changed or
+                // vanished — is a stale observation: retrying the explicit
+                // operation is the only correct next step, and a vanished H is
+                // never reinserted. What remains is a live H that *does* match
+                // the observation, where unequal immutable content can only be
+                // the existing integrity failure (an equal live candidate
+                // reconciles above, whatever its revision).
+                if expected.is_some() && current.as_ref() != expected {
+                    return Err(anyhow!(
+                        "image approval is stale; retry the explicit operation"
+                    ));
+                }
+                return Err(immutable_integrity_failure());
+            }
         };
         new.set_project_default(ProjectDefault::new(
             adoption.expected().project(),
@@ -1184,6 +1249,7 @@ impl Store {
             value: Committed {
                 pin,
                 project_default: ProjectDefaultChange::Adopted,
+                previous,
             },
             report,
         })
@@ -1377,6 +1443,82 @@ struct Locks {
 pub(super) struct Committed {
     pub(super) pin: ApprovedPin,
     pub(super) project_default: ProjectDefaultChange,
+    /// The approval measured **under the transaction's lock, before any
+    /// mutation**: the only honest predecessor for a reported delta. A peer's
+    /// reconcile therefore reports as `Unchanged`, and a metadata-only save
+    /// cannot look like a replacement.
+    pub(super) previous: Option<ApprovedPin>,
+}
+
+/// One record of a frozen refresh scope: its approval and the roles it holds.
+/// `held: None` is a retained-but-unheld approval, which is evidence but not
+/// membership.
+pub(super) struct ScopedRefreshPin {
+    pub(super) pin: ApprovedPin,
+    pub(super) held: Option<HeldRoles>,
+}
+
+/// The strict, read-only scope projection a refresh worklist is planned from.
+/// The scope key stays private so a snapshot cannot be reused for another
+/// project or platform.
+pub(crate) struct RefreshScopeSnapshot {
+    scope: ScopeKey,
+    pins: Vec<ScopedRefreshPin>,
+}
+
+impl RefreshScopeSnapshot {
+    /// A literal scope for unit tests of the membership adapter, so a planner
+    /// test needs no `$HOME` and no file.
+    #[cfg(test)]
+    pub(super) fn for_tests(
+        project: &ProjectId,
+        platform: HostLinuxPlatform,
+        pins: Vec<(ApprovedPin, Option<HeldRoles>)>,
+    ) -> Self {
+        Self {
+            scope: ScopeKey::of(project.clone(), platform),
+            pins: pins
+                .into_iter()
+                .map(|(pin, held)| ScopedRefreshPin { pin, held })
+                .collect(),
+        }
+    }
+
+    /// Every record in the frozen scope, in file order. The worklist decides
+    /// ordering; this is evidence, not a plan.
+    pub(super) fn pins(&self) -> &[ScopedRefreshPin] {
+        &self.pins
+    }
+
+    /// The observed predecessor for one key, if the scope holds a record for it.
+    pub(super) fn predecessor(&self, key: &PinKey) -> Option<ApprovedPin> {
+        self.pins
+            .iter()
+            .find(|record| &record.pin.key == key)
+            .map(|record| record.pin.clone())
+    }
+
+    /// Whether this exact scope holds a role for `target`. Membership evidence
+    /// only: it reads no default record and performs no I/O.
+    pub(crate) fn has_held_target(&self, target: &OciTarget) -> bool {
+        self.pins
+            .iter()
+            .any(|record| record.held.is_some() && &record.pin.key.reference == target.canonical())
+    }
+
+    /// This snapshot may only plan for the project and host platform it was
+    /// taken for; anything else would silently mix two scopes.
+    pub(super) fn covers(&self, project: &ProjectId, platform: &HostLinuxPlatform) -> bool {
+        self.covers_project(project) && self.covers_platform(platform)
+    }
+
+    pub(super) fn covers_project(&self, project: &ProjectId) -> bool {
+        self.scope.project() == project
+    }
+
+    pub(super) fn covers_platform(&self, platform: &HostLinuxPlatform) -> bool {
+        self.scope.platform() == platform
+    }
 }
 
 /// Every dimension one pin transaction can change. `needs_save` is their
@@ -1454,16 +1596,30 @@ fn wait(lock: &File, mode: FlockMode, deadline: Instant, noticed: &mut bool) -> 
         return Err(anyhow!("image pin authority lock timed out"));
     }
     let start = Instant::now();
+    // The checkpoint seam cannot fail the wait from inside its callback, so its
+    // error is captured here and returned once `flock_within` has unwound.
+    let mut gate_error: Option<anyhow::Error> = None;
     let result = host_paths::flock_within(lock, mode, remaining, |_| {
         if matches!(mode, FlockMode::Exclusive)
             && !*noticed
             && start.elapsed() + WRITE_WAIT.saturating_sub(remaining) >= Duration::from_secs(1)
         {
-            eprintln!("Waiting for another agent-vm image approval operation...");
+            // Best effort: a closed stderr must not turn a contended lock into a
+            // failure of the operation that is waiting for it.
+            let _ = writeln!(
+                std::io::stderr(),
+                "Waiting for another agent-vm image approval operation..."
+            );
             *noticed = true;
+            if gate_error.is_none() {
+                gate_error = gate::checkpoint(gate::Stage::AuthorityNoticeAttempted).err();
+            }
         }
     })
     .map_err(|_| failure())?;
+    if let Some(error) = gate_error {
+        return Err(error);
+    }
     if result == FlockWait::TimedOut {
         return Err(anyhow!("image pin authority lock timed out"));
     }
@@ -2580,7 +2736,9 @@ mod tests {
             .unwrap();
         let (host, reference_host) = selected('b');
         let sequence_before = store.read().unwrap().unwrap().sequence;
-        let adoption = DefaultAdoption::new(expected.clone(), reference_host.clone(), &host);
+        // H was genuinely absent from this project's pins, so the frozen
+        // observation is `None`.
+        let adoption = DefaultAdoption::new(expected.clone(), reference_host.clone(), &host, None);
         let committed = store.adopt(&host, &adoption).unwrap();
         assert_eq!(
             committed.value.project_default,
@@ -2609,7 +2767,7 @@ mod tests {
         // candidate binds, but the project's default moved.
         drop(host);
         let (host, _) = selected('b');
-        let stale = DefaultAdoption::new(expected, reference_host.clone(), &host);
+        let stale = DefaultAdoption::new(expected, reference_host.clone(), &host, None);
         let error = store
             .adopt(&host, &stale)
             .err()
@@ -2634,18 +2792,24 @@ mod tests {
         // The established default, already approved at other content for its
         // own immutable key. Only a hand edit (or a registry serving different
         // bytes for one digest) can produce this.
-        f.pins.push(PinRecord::of(&ApprovedPin {
+        let live = ApprovedPin {
             key: a.key.clone(),
             digest: ManifestDigest::parse(&format!("sha256:{}", "c".repeat(64))).unwrap(),
             revision: PinRevision(1),
-        }));
+        };
+        f.pins.push(PinRecord::of(&live));
         f.set_project_default(expected.clone());
         install(&store, &f);
         let bytes = std::fs::read(store.record()).unwrap();
         let mut proposed_candidate = candidate('b');
         proposed_candidate.key.reference =
             CanonicalOciReference::parse(reference_a.as_str()).unwrap();
-        let adoption = DefaultAdoption::new(expected, reference_a.clone(), &proposed_candidate);
+        let adoption = DefaultAdoption::new(
+            expected,
+            reference_a.clone(),
+            &proposed_candidate,
+            Some(live),
+        );
         let error = store
             .adopt(&proposed_candidate, &adoption)
             .err()
@@ -2913,6 +3077,144 @@ mod tests {
             "{error}"
         );
         assert_eq!(std::fs::read(store.record()).unwrap(), before);
+    }
+
+    /// The byte bound is reachable by a **later replacement**: a save that lands
+    /// exactly on the bound is followed by one whose longer revision digits cross
+    /// it. This is the store-level counterpart of the CLI partial-progress rows,
+    /// measured at the encoder so it needs no cache, registry or subprocess.
+    ///
+    /// The two adds are what a refresh does: each replacement rewrites only its
+    /// own record's digest and takes the next global token, so the file grows by
+    /// the digits the token gains and nothing else.
+    #[test]
+    fn a_later_replacement_crosses_the_byte_bound() {
+        const FIRST_REF: &str = "example.com/x:tag";
+        const SECOND_REF: &str = "example.com/z:tag";
+        // One short of the token digit boundary: the first save's revision gains
+        // 17 digits, the second save's revision gains 18 and the sequence one.
+        const SEQUENCE: u64 = 999_999_999_999_999_998;
+        let project = project();
+        let variant = Some("v".repeat(64));
+        let mut pins = vec![
+            pin_record(&project, FIRST_REF, 'a', 1, None),
+            pin_record(&project, SECOND_REF, 'c', 1, None),
+        ];
+        // Pads hold Boot with a matching scope record: scopes add the bytes that
+        // make 4 MiB reachable while every array stays inside its record cap.
+        let mut scopes = Vec::new();
+        // One wide reference and one wide default image, parsed once: the pads
+        // differ only by project (the key includes it), so reusing the spellings
+        // keeps the fixture's own construction cheap.
+        let wide_reference = reference_of_length(270);
+        for index in 0..4094u32 {
+            let mut record = pin_record(
+                &project_at(index),
+                "example.com/y:tag",
+                'b',
+                1,
+                Some(RoleMask::BOOT),
+            );
+            record.reference = wide_reference.clone();
+            record.platform.variant = variant.clone();
+            pins.push(record);
+            scopes.push(scope_record_with(
+                &project_at(index),
+                RoleMask::BOOT,
+                variant.clone(),
+            ));
+        }
+        let mut file = PinFile {
+            version: STORE_VERSION,
+            pins,
+            pending_default: None,
+            defaults: {
+                let wide_image = digest_reference_of_length(270);
+                (0..4096u32)
+                    .map(|index| ProjectDefaultRecord {
+                        project: format!("{index:064x}"),
+                        image: wide_image.clone(),
+                    })
+                    .collect()
+            },
+            scopes,
+            sequence: Some(SEQUENCE),
+        };
+        // Size without validating (the maximal shape may exceed the bound), then
+        // shorten references — one encoded byte each — to 17 bytes below it, so
+        // the first replacement lands exactly on the bound.
+        let target = MAX_BYTES as usize - 17;
+        let mut excess = serde_json::to_vec(&file).unwrap().len() - target;
+        assert!(excess > 0, "the maximal fixture must exceed {target} bytes");
+        for record in file.pins.iter_mut().skip(2) {
+            if excess == 0 {
+                break;
+            }
+            let take = excess.min(record.reference.len() - FIRST_REF.len());
+            record.reference = reference_of_length(record.reference.len() - take);
+            excess -= take;
+        }
+        for record in file.defaults.iter_mut() {
+            if excess == 0 {
+                break;
+            }
+            let take = excess.min(record.image.len() - 89);
+            record.image = digest_reference_of_length(record.image.len() - take);
+            excess -= take;
+        }
+        assert_eq!(excess, 0, "the references have enough slack");
+
+        // The first replacement: its record and the sequence take the next token.
+        // Measured, not validated: the *next* step's validation covers the same
+        // shape, so a second 4 MiB validation would only cost time.
+        let mut after_first = file.clone();
+        after_first.pins[0].manifest_digest = candidate_at(&project, FIRST_REF, 'b')
+            .digest
+            .as_str()
+            .to_owned();
+        after_first.pins[0].revision = SEQUENCE + 1;
+        after_first.sequence = Some(SEQUENCE + 1);
+        assert_eq!(
+            serde_json::to_vec(&after_first).unwrap().len(),
+            MAX_BYTES as usize,
+            "the first save lands exactly on the byte bound"
+        );
+
+        // The second replacement gains one more token digit than the sequence
+        // does, so its encoded file is larger than the bound: `full()`, with the
+        // update-local wording and nothing that denies the earlier commit. This
+        // single encode validates the whole 4 MiB shape first (it passes — the
+        // error below is the bound, not damage) and then refuses the bound.
+        let mut after_second = after_first.clone();
+        after_second.pins[1].manifest_digest = candidate_at(&project, SECOND_REF, 'd')
+            .digest
+            .as_str()
+            .to_owned();
+        after_second.pins[1].revision = SEQUENCE + 2;
+        after_second.sequence = Some(SEQUENCE + 2);
+        let error = after_second
+            .encode()
+            .expect_err("the later replacement crosses the byte bound");
+        full_error(&error);
+        assert!(
+            error
+                .to_string()
+                .contains("this proposed pin-store update was not committed"),
+            "{error}"
+        );
+        assert!(
+            !error.to_string().contains("nothing was approved"),
+            "the capacity text must stay update-local: {error}"
+        );
+        // A refused encode writes nothing by construction; the store-level
+        // invariance of a capacity failure beside a committed sibling is what the
+        // CLI rows assert (`refresh_late_sequence_exhaustion_keeps_the_earlier_commit`
+        // compares the file byte for byte), so no second 4 MiB store read here.
+        assert_eq!(
+            after_second.pins[1].manifest_digest,
+            candidate_at(&project, SECOND_REF, 'd').digest.as_str(),
+            "the refused state names the replacement, never a saved one"
+        );
     }
 
     /// Spec R9 for the *other* growth limit: `encode` reports a full store for
@@ -4315,5 +4617,232 @@ mod tests {
         assert_eq!(resolved_of(&after, &project), Some(RoleMask::BOOT));
         assert_eq!(after.sequence, Some(2));
         assert!(after.encode().unwrap().len() < MAX_BYTES as usize);
+    }
+
+    /// The strict refresh snapshot: only this project's exact host platform and
+    /// variant are projected, the whole file is still validated (a malformed
+    /// foreign role join is damage), and taking one reads without creating,
+    /// rewriting or recovering anything.
+    #[test]
+    fn refresh_scope_snapshot_is_strict_read_only_and_scoped() {
+        let (_dir, store) = paths();
+        let scope = project().clone();
+        let host = HostLinuxPlatform::host();
+
+        // A missing authority is an empty snapshot and stays missing.
+        let empty = store
+            .refresh_scope(&ScopeKey::of(scope.clone(), host.clone()))
+            .unwrap();
+        assert!(empty.pins().is_empty());
+        assert!(!store.record().exists(), "a snapshot creates no authority");
+        assert!(!store.lock_path().exists(), "a snapshot creates no lock");
+
+        // Two projects, two platforms, one variant difference, all in one file.
+        let (mine, mine_ref) = selected('a');
+        let (other_project, other_ref) = selected_in(&ProjectId::for_tests('b'), 'b');
+        let mut foreign_platform = candidate('c');
+        let mut variant = HostLinuxPlatform::host();
+        variant.variant = Some("v8".to_owned());
+        foreign_platform.key.platform = variant.clone();
+        let mut f = PinFile::empty();
+        f.pins.push(PinRecord {
+            roles: Some(RoleMask::BOOT),
+            ..PinRecord::of(&ApprovedPin {
+                key: mine.key.clone(),
+                digest: mine.digest.clone(),
+                revision: PinRevision(1),
+            })
+        });
+        f.scopes.push(ScopeRecord {
+            project: scope.as_str().to_owned(),
+            platform: host.clone(),
+            resolved: RoleMask::BOOT,
+        });
+        f.sequence = Some(3);
+        f.pins.push(PinRecord::of(&ApprovedPin {
+            key: other_project.key.clone(),
+            digest: other_project.digest.clone(),
+            revision: PinRevision(2),
+        }));
+        f.pins.push(PinRecord::of(&ApprovedPin {
+            key: foreign_platform.key.clone(),
+            digest: foreign_platform.digest.clone(),
+            revision: PinRevision(3),
+        }));
+        install(&store, &f);
+        let bytes = std::fs::read(store.record()).unwrap();
+
+        let snapshot = store
+            .refresh_scope(&ScopeKey::of(scope.clone(), host.clone()))
+            .unwrap();
+        assert_eq!(snapshot.pins().len(), 1, "only this project/platform");
+        assert_eq!(snapshot.pins()[0].pin.key.reference, mine.key.reference);
+        assert_eq!(
+            snapshot.pins()[0].held.map(HeldRoles::mask),
+            Some(RoleMask::BOOT)
+        );
+        assert!(snapshot.has_held_target(&OciTarget::parse(mine_ref.as_str()).unwrap()));
+        assert!(snapshot.covers_project(&scope));
+        assert!(snapshot.covers_platform(&host));
+        assert!(!snapshot.covers_platform(&variant));
+        assert_eq!(snapshot.predecessor(&mine.key).unwrap().digest, mine.digest);
+        assert!(
+            snapshot.predecessor(&other_project.key).is_none(),
+            "a foreign project's record is never projected"
+        );
+        assert!(
+            !snapshot.has_held_target(&OciTarget::parse(other_ref.as_str()).unwrap()),
+            "a foreign project's holder is not this scope's membership"
+        );
+        assert_eq!(
+            std::fs::read(store.record()).unwrap(),
+            bytes,
+            "the snapshot never rewrites the authority"
+        );
+
+        // A malformed *foreign* role join is still damage: the whole authority is
+        // decoded and validated before anything is projected.
+        let mut damaged = f.clone();
+        damaged.pins[1].roles = Some(RoleMask::BOOT);
+        // Written as raw bytes: `encode` itself would refuse the damaged state.
+        std::fs::write(store.record(), serde_json::to_vec(&damaged).unwrap()).unwrap();
+        assert!(
+            store.refresh_scope(&ScopeKey::of(scope, host)).is_err(),
+            "a foreign record with a role outside its resolution is damage"
+        );
+    }
+
+    /// The adoption decision matrix over the observed H tuple the frozen worklist
+    /// carried: absent-then-absent inserts, an observed-but-vanished H is stale,
+    /// a changed live H with a matching observation is an integrity failure, and
+    /// a live equal candidate reconciles regardless of its revision.
+    #[test]
+    fn adoption_uses_the_observed_host_predecessor() {
+        /// What H's record looks like under the pin lock when the save runs.
+        #[derive(Clone, Copy, Debug)]
+        enum Live {
+            /// H was genuinely absent at planning and is still absent.
+            Absent,
+            /// H holds the candidate digest at an older revision.
+            CandidateOlderRevision,
+            /// H holds the candidate digest at the observed revision.
+            CandidateSameRevision,
+            /// H holds a different digest.
+            DifferentDigest,
+        }
+        /// What the frozen worklist observed for H.
+        #[derive(Clone, Copy, Debug)]
+        enum Observed {
+            Absent,
+            Candidate,
+        }
+
+        let rows = [
+            (Live::Absent, Observed::Absent, "insert"),
+            (Live::Absent, Observed::Candidate, "stale"),
+            (Live::CandidateSameRevision, Observed::Candidate, "already"),
+            (Live::CandidateOlderRevision, Observed::Candidate, "already"),
+            (Live::CandidateSameRevision, Observed::Absent, "already"),
+            // A changed live H is a stale observation, not an integrity
+            // failure: the frozen predecessor no longer exists.
+            (Live::DifferentDigest, Observed::Candidate, "stale"),
+            // A matching live observation whose immutable content differs can
+            // only be an integrity failure (the identity itself moved).
+            (Live::DifferentDigest, Observed::Absent, "integrity"),
+        ];
+        for (live, observed, expected) in rows {
+            let (_dir, store) = paths();
+            let (host, reference_host) = selected('b');
+            let expected_default = ProjectDefault::new(&project(), &reference_host).unwrap();
+            let observed_pin = ApprovedPin {
+                key: host.key.clone(),
+                digest: host.digest.clone(),
+                revision: PinRevision(2),
+            };
+            let mut f = PinFile::empty();
+            f.set_project_default(expected_default.clone());
+            let live_pin = match live {
+                Live::Absent | Live::DifferentDigest => None,
+                Live::CandidateOlderRevision => Some(ApprovedPin {
+                    revision: PinRevision(1),
+                    ..observed_pin.clone()
+                }),
+                Live::CandidateSameRevision => Some(observed_pin.clone()),
+            };
+            match (live, live_pin) {
+                (_, Some(pin)) => f.pins.push(PinRecord::of(&pin)),
+                (Live::DifferentDigest, None) => f.pins.push(PinRecord::of(&ApprovedPin {
+                    key: host.key.clone(),
+                    digest: ManifestDigest::parse(&format!("sha256:{}", "c".repeat(64))).unwrap(),
+                    revision: PinRevision(1),
+                })),
+                _ => {}
+            }
+            f.sequence = Some(2);
+            install(&store, &f);
+            let bytes = std::fs::read(store.record()).unwrap();
+
+            let observation = match observed {
+                Observed::Absent => None,
+                Observed::Candidate => Some(observed_pin.clone()),
+            };
+            let adoption = DefaultAdoption::new(
+                expected_default.clone(),
+                reference_host.clone(),
+                &host,
+                observation,
+            );
+            let outcome = store.adopt(&host, &adoption);
+            match expected {
+                "insert" => {
+                    let committed = outcome.expect("a genuinely absent H may be inserted");
+                    assert_eq!(
+                        committed.value.project_default,
+                        ProjectDefaultChange::Adopted
+                    );
+                    assert!(committed.value.previous.is_none(), "{live:?}/{observed:?}");
+                    let file = store.read().unwrap().unwrap();
+                    assert!(file.lookup(&host.key).unwrap().is_some());
+                    assert_eq!(file.defaults[0].image, reference_host.as_str());
+                }
+                "already" => {
+                    let committed = outcome.expect("a live equal candidate reconciles");
+                    assert_eq!(
+                        committed.value.pin.digest, host.digest,
+                        "the live tuple is kept: {live:?}/{observed:?}"
+                    );
+                    assert_eq!(
+                        committed.value.project_default,
+                        ProjectDefaultChange::Adopted
+                    );
+                }
+                "stale" => {
+                    let error = outcome.err().expect("an observed H that vanished is stale");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("image approval is stale; retry the explicit operation"),
+                        "{error}"
+                    );
+                    assert_eq!(
+                        std::fs::read(store.record()).unwrap(),
+                        bytes,
+                        "a stale adoption writes nothing"
+                    );
+                }
+                "integrity" => {
+                    let error = outcome
+                        .err()
+                        .expect("a different immutable digest is an integrity failure");
+                    assert!(error.to_string().contains("integrity failure"), "{error}");
+                    assert_eq!(
+                        std::fs::read(store.record()).unwrap(),
+                        bytes,
+                        "an integrity failure writes nothing"
+                    );
+                }
+                other => panic!("unexpected row {other}"),
+            }
+        }
     }
 }

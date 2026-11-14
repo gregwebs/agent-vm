@@ -52,6 +52,9 @@ pub enum PinStage {
     BeforePinSave,
     /// The transaction committed.
     PinCommitted,
+    /// The one-time authority-lock wait notice was *attempted* while still
+    /// contending for the exclusive pin lock. Emitted after the attempted write.
+    AuthorityNoticeAttempted,
 }
 
 impl PinStage {
@@ -65,6 +68,7 @@ impl PinStage {
             Self::DefaultSaved => "default-saved",
             Self::BeforePinSave => "before-pin-save",
             Self::PinCommitted => "pin-committed",
+            Self::AuthorityNoticeAttempted => "authority-notice-attempted",
         }
     }
 
@@ -78,6 +82,7 @@ impl PinStage {
             Self::DefaultSaved,
             Self::BeforePinSave,
             Self::PinCommitted,
+            Self::AuthorityNoticeAttempted,
         ]
         .into_iter()
         .find(|stage| stage.wire() == text)
@@ -170,6 +175,46 @@ impl PinGate {
     /// Point `command` at this gate.
     pub fn attach(&self, command: &mut Command) {
         command.env("AGENT_VM_TEST_PIN_GATE", &self.path);
+    }
+
+    /// Receive the next checkpoint, if one arrives within the bound.
+    ///
+    /// For a pump that must answer an unknown sequence (a whole multi-target
+    /// invocation) and single out one stage. `None` means the gate went quiet for
+    /// [`BOUND`] or the child closed it.
+    pub fn next(&mut self) -> Option<(PinStage, PinCheckpoint)> {
+        let stream = self.received.recv_timeout(BOUND).ok()?;
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().expect("clone the pin gate stream"))
+            .read_line(&mut line)
+            .ok()?;
+        let observed = PinStage::parse(line.trim())?;
+        Some((observed, PinCheckpoint { stream }))
+    }
+
+    /// Like [`Self::expect`], but a gate that goes silent is returned as a reason
+    /// instead of panicking, so a caller can pair the missing stage with the
+    /// child's own exit status (a panic) and prove the failure is causal.
+    pub fn try_expect(&mut self, stage: PinStage) -> Result<PinCheckpoint, String> {
+        let stream = match self.received.recv_timeout(BOUND) {
+            Ok(stream) => stream,
+            Err(error) => return Err(format!("no `{}` checkpoint arrived: {error}", stage.wire())),
+        };
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().expect("clone the pin gate stream"))
+            .read_line(&mut line)
+            .expect("read the pin checkpoint line");
+        let observed = line.trim();
+        let observed =
+            PinStage::parse(observed).unwrap_or_else(|| panic!("malformed pin stage {observed:?}"));
+        assert_eq!(
+            observed,
+            stage,
+            "expected the `{}` pin checkpoint, got `{}`",
+            stage.wire(),
+            observed.wire()
+        );
+        Ok(PinCheckpoint { stream })
     }
 
     /// Block until the child reports `stage`, then return the paused checkpoint.

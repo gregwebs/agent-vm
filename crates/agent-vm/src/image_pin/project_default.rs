@@ -18,10 +18,11 @@ use std::path::PathBuf;
 use anyhow::{Result, anyhow, bail};
 
 use super::approval;
+use super::refresh::{ApprovalDelta, RefreshSuccess};
 use super::store::{self, Store};
 use super::{
-    BootImage, CanonicalOciReference, DefaultAction, DefaultChange, ImageLabel, ImageRef,
-    ImageSource, ImmutableImageRef, ManifestDigest, PinKey, ProjectId, Rendering,
+    ApprovedPin, BootImage, CanonicalOciReference, DefaultAction, DefaultChange, ImageLabel,
+    ImageRef, ImageSource, ImmutableImageRef, ManifestDigest, PinKey, ProjectId, Rendering,
     ValidatedCandidate, acquire_or_render, immutable_reference, oci_target, revalidate_frozen,
 };
 use crate::boot_image::{AdoptionOffer, ConfigurationRead};
@@ -151,6 +152,11 @@ pub(crate) struct DefaultAdoption {
     expected: ProjectDefault,
     proposed: ImmutableImageRef,
     candidate: ManifestDigest,
+    /// H as the frozen worklist observed it: `Some(tuple)` or `None` for a
+    /// genuinely absent key. Carried through the render and the frozen
+    /// revalidation into the one save so an observed-and-retired H cannot be
+    /// reinserted as a fresh pin (ADR-0068 D10).
+    observed_host: Option<ApprovedPin>,
 }
 
 impl DefaultAdoption {
@@ -158,16 +164,20 @@ impl DefaultAdoption {
         expected: ProjectDefault,
         proposed: ImmutableImageRef,
         candidate: &ValidatedCandidate,
+        observed_host: Option<ApprovedPin>,
     ) -> Self {
         Self {
             expected,
             proposed,
             candidate: candidate.digest.clone(),
+            observed_host,
         }
     }
 
     /// The consent must name one project, the host's current reference, and the
     /// candidate's digest exactly: the same binding a replacement approval has.
+    /// The observation must name the same key it was taken for, or the store
+    /// would compare an unrelated record.
     pub(super) fn binds(&self, candidate: &ValidatedCandidate) -> Result<()> {
         let proposed = CanonicalOciReference::parse(self.proposed.as_str())
             .map_err(|_| anyhow!("default adoption does not bind the validated reference"))?;
@@ -176,6 +186,13 @@ impl DefaultAdoption {
             || self.candidate != candidate.digest
         {
             bail!("default adoption does not bind the validated source");
+        }
+        if self
+            .observed_host
+            .as_ref()
+            .is_some_and(|observed| observed.key != candidate.key)
+        {
+            bail!("default adoption predecessor does not bind the validated source");
         }
         Ok(())
     }
@@ -188,6 +205,11 @@ impl DefaultAdoption {
 
     pub(super) fn proposed(&self) -> &ImmutableImageRef {
         &self.proposed
+    }
+
+    /// The observed H tuple this adoption was frozen against, if any.
+    pub(super) fn observed_host(&self) -> Option<&ApprovedPin> {
+        self.observed_host.as_ref()
     }
 }
 
@@ -222,11 +244,16 @@ pub(super) fn establishment(boot: &BootImage) -> Result<DefaultAction> {
 
 /// R7: move an established project's default to the host record. Invoking
 /// refresh is the consent; the change is rendered when its content differs.
+///
+/// `observed_host` is H as the frozen worklist saw it, **not** a fresh read: a
+/// peer that retired H between freeze and this save must make the transaction
+/// stale rather than resurrect it.
 pub(super) async fn adopt_host_default(
     established: &BootImage,
     offer: &AdoptionOffer,
+    observed_host: Option<ApprovedPin>,
     project: &ProjectDir,
-) -> Result<ProjectDefaultChange> {
+) -> Result<RefreshSuccess> {
     let id = ProjectId::of(project);
     let expected = ProjectDefault::new(&id, &immutable(established)?)?;
     let host = offer.image();
@@ -250,12 +277,17 @@ pub(super) async fn adopt_host_default(
     let candidate = ValidatedCandidate::from_image(prepared.image(), &id)?;
     store::candidate_ready()?;
     let old = current.map_or_else(|| expected.stated_digest(), |pin| pin.digest);
-    let adoption = approval::adopt(expected, proposed, &candidate, &old)?;
+    let adoption = approval::adopt(expected, proposed, &candidate, &old, observed_host)?;
     drop(prepared);
     revalidate_frozen(&candidate, &label, Rendering::Selection).await?;
     let completion = Store::host()?.adopt(&candidate, &adoption)?;
     super::completion::finish_preparation(completion.report);
-    Ok(completion.value.project_default)
+    let committed = &completion.value;
+    Ok(RefreshSuccess {
+        approval: ApprovalDelta::of(committed.previous.as_ref(), &committed.pin),
+        project_default: committed.project_default,
+        adopted: Some((old, candidate.digest.clone())),
+    })
 }
 
 /// `image set-default`: measure the typed target and make its host child the

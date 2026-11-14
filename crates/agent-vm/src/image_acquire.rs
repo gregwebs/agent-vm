@@ -132,6 +132,7 @@ use microsandbox_image::{
     Reference, Registry,
 };
 use rustix::fs::{FileType, Mode, OFlags};
+use std::io::Write as _;
 use std::path::Path;
 use vstd::prelude::*;
 
@@ -1384,7 +1385,9 @@ impl NativeAcquisition {
         if let Some(dump) = crate::debug_config::native_acquisition(reference, &options, label)
             .map_err(AcquireError::DebugConfig)?
         {
-            eprintln!("{dump}");
+            // A debug dump is not consent and not a failure signal: a closed
+            // stderr loses the dump rather than the acquisition.
+            let _ = writeln!(std::io::stderr(), "{dump}");
         }
         let (progress, task) = registry.pull_with_progress(reference, &options);
         let reference_label = label.is_redacted().then(|| label.text().to_string());
@@ -1508,8 +1511,18 @@ impl ReferenceGuard {
                 FlockAttempt::Contended => {}
             }
             if !noticed && started.elapsed() >= GUARD_NOTICE_AFTER {
+                // Non-consent notice, best effort: a closed stderr must not turn
+                // a contended acquisition into a failure.
                 noticed = true;
-                eprintln!("{GUARD_CONTENTION_NOTICE}");
+                let _ = writeln!(std::io::stderr(), "{GUARD_CONTENTION_NOTICE}");
+                // Reported only for the source guard, so the derived canonical
+                // guard keeps its quiet stage sequence; the checkpoint comes
+                // after the attempted write, so a test can prove the write was
+                // really attempted under contention.
+                if report {
+                    gate::checkpoint(gate::Stage::ReferenceNoticeAttempted)
+                        .map_err(AcquireError::TestGate)?;
+                }
             }
             tokio::time::sleep(GUARD_POLL_INTERVAL).await;
         }
@@ -1647,6 +1660,13 @@ mod gate {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) enum Stage {
         PublicationContended,
+        /// Emitted immediately after the one-time publication-contention notice
+        /// was *attempted*, so a test can prove the write happened while the
+        /// real publication lock was still held by a peer.
+        PublicationNoticeAttempted,
+        /// Emitted immediately after the one-time reference-contention notice
+        /// was attempted on the source guard's contended path.
+        ReferenceNoticeAttempted,
         BeforeLock,
         LockContended,
         Snapshot,
@@ -1675,6 +1695,8 @@ mod gate {
         fn wire(self) -> &'static str {
             match self {
                 Self::PublicationContended => "publication-contended",
+                Self::PublicationNoticeAttempted => "publication-notice-attempted",
+                Self::ReferenceNoticeAttempted => "reference-notice-attempted",
                 Self::BeforeLock => "before-lock",
                 Self::LockContended => "lock-contended",
                 Self::Snapshot => "snapshot",

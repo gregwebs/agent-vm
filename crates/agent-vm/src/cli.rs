@@ -705,10 +705,10 @@ fn direct_dispatch(
 fn reconcile_image_args(sub: &clap::ArgMatches, cmd: &mut Cmd) {
     match cmd {
         Cmd::Setup(args) => args.image.reconcile(sub),
-        // Only `image refresh` carries a launch-image selection, and its flag
-        // lives on the subcommand: reconciling against these group matches would
-        // lose the value's origin and the empty-env rule (issue #189).
-        Cmd::Image(args) => args.reconcile_image_args(sub),
+        // `image refresh`'s `--image` is a target filter with no clap env
+        // binding, and it is captured independently of clap by `pull::Args`;
+        // there is no shared launch-image argument to reconcile here.
+        Cmd::Image(_) => {}
         // `build`'s and `import`'s `--tag` is a result reference in msb's cache,
         // not a launch image selection, and `show` reads `AGENT_VM_IMAGE_TAG`
         // itself through `boot_image` (where empty-is-unset and non-Unicode
@@ -753,7 +753,7 @@ pub(crate) fn build_command(catalog: &Catalog) -> clap::Command {
     // Registered for every catalog state and before the catalog verbs: the
     // direct route must exist even when the config is broken (its own dispatch
     // reports the config failure as 125), and a tool can never share the name.
-    let mut command = refresh_image_help(Cli::command()).subcommand(direct_run_subcommand());
+    let mut command = Cli::command().subcommand(direct_run_subcommand());
     match catalog {
         Catalog::Ready(catalog) => {
             for entry in catalog.as_slice() {
@@ -777,49 +777,6 @@ pub(crate) fn build_command(catalog: &Catalog) -> clap::Command {
     command
         .after_help(short.clone())
         .after_long_help(format!("{short}\n\n{}", run::LAUNCH_OPTIONS_LONG_HELP))
-}
-
-/// The refresh subcommand's own `--image` help.
-///
-/// `image refresh` flattens the launch-image argument type so its precedence,
-/// environment binding and empty-env rule stay shared with launch. That type's
-/// help says it *boots* the image, which is exactly what refresh does not do. The
-/// flag keeps its id, value source and reconciliation; only its rendered help
-/// differs.
-const REFRESH_IMAGE_HELP: &str = "OCI image to acquire instead of the configured selection";
-
-const REFRESH_IMAGE_LONG_HELP: &str = "OCI image to acquire into the image cache instead of the configured selection.\n\nPrecedence: this flag (or `AGENT_VM_IMAGE_TAG`), then the user config `image`, then the project config `image`, then the default boot image. See USAGE.md → \"Selecting the boot image\".";
-
-fn refresh_image_help(mut command: clap::Command) -> clap::Command {
-    // Mutating the `image` subcommand in place, rather than through
-    // `Command::mut_subcommand` on the top-level command: that API removes the
-    // subcommand and pushes it back last, which would silently reorder the
-    // user-facing `--help` verb list (a pinned contract). The nested mutation
-    // is safe because it only reorders `image`'s own children.
-    let Some(index) = command
-        .get_subcommands()
-        .position(|subcommand| subcommand.get_name() == "image")
-    else {
-        return command;
-    };
-    let image = std::mem::take(
-        command
-            .get_subcommands_mut()
-            .nth(index)
-            .expect("the image subcommand was just found"),
-    );
-    let image = image.mut_subcommand("refresh", |refresh| {
-        refresh.mut_arg("image", |arg| {
-            arg.help(REFRESH_IMAGE_HELP)
-                .long_help(REFRESH_IMAGE_LONG_HELP)
-                .help_heading("Image")
-        })
-    });
-    *command
-        .get_subcommands_mut()
-        .nth(index)
-        .expect("the image subcommand slot is stable") = image;
-    command
 }
 
 /// Format the deferred config error as the primary message, appending clap's
@@ -1985,24 +1942,27 @@ mod tests {
 
     // -- image argument: typed beats env, empty env is unset --------------
 
-    /// The single `--image`/`AGENT_VM_IMAGE_TAG` precedence table, driven
-    /// through [`parse_from`] — the seam that can see clap's `ValueSource` — so a
-    /// future refactor that stops reconciling fails here. The environment is
-    /// pinned under [`crate::test_env::guard`] so the process-wide variable
-    /// cannot race a parallel test.
+    /// The single `--image`/`AGENT_VM_IMAGE_TAG` separation table, driven
+    /// through [`parse_from`] — the seam that can see clap's `ValueSource`.
+    ///
+    /// `image refresh`'s `--image` is a target filter; its ambient input is the
+    /// environment, captured independently. A typed flag therefore never masks
+    /// the ambient selection, and an empty environment value is unset.
     #[test]
-    fn an_empty_environment_image_tag_is_unset_and_a_typed_flag_wins() {
+    fn refresh_target_args_do_not_bind_the_image_environment() {
         struct Case {
             env: Option<&'static str>,
             argv: &'static [&'static str],
-            expected: Option<(&'static str, OverrideSource)>,
+            filter: Option<&'static str>,
+            ambient: Option<&'static str>,
         }
         impl std::fmt::Debug for Case {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 f.debug_struct("Case")
                     .field("env", &self.env)
                     .field("argv", &self.argv)
-                    .field("expected", &self.expected.map(|(reference, _)| reference))
+                    .field("filter", &self.filter)
+                    .field("ambient", &self.ambient)
                     .finish()
             }
         }
@@ -2010,35 +1970,40 @@ mod tests {
             Case {
                 env: Some("env:1"),
                 argv: &[],
-                expected: Some(("env:1", OverrideSource::Environment)),
+                filter: None,
+                ambient: Some("env:1"),
             },
+            // A typed filter does not mask the ambient selection.
             Case {
                 env: Some("env:1"),
                 argv: &["--image", "cli:1"],
-                expected: Some(("cli:1", OverrideSource::CommandLine)),
+                filter: Some("cli:1"),
+                ambient: Some("env:1"),
+            },
+            Case {
+                env: Some("cli:1"),
+                argv: &["--image", "cli:1"],
+                filter: Some("cli:1"),
+                ambient: Some("cli:1"),
             },
             // An empty environment value is unset, not an empty reference.
             Case {
                 env: Some(""),
                 argv: &[],
-                expected: None,
+                filter: None,
+                ambient: None,
             },
-            // An empty env does not mask a typed flag.
             Case {
                 env: Some(""),
                 argv: &["--image", "cli:1"],
-                expected: Some(("cli:1", OverrideSource::CommandLine)),
-            },
-            // Whitespace is *present*, not unset (never trimmed).
-            Case {
-                env: Some(" "),
-                argv: &[],
-                expected: Some((" ", OverrideSource::Environment)),
+                filter: Some("cli:1"),
+                ambient: None,
             },
             Case {
                 env: None,
                 argv: &[],
-                expected: None,
+                filter: None,
+                ambient: None,
             },
         ];
 
@@ -2052,31 +2017,62 @@ mod tests {
             argv.extend_from_slice(case.argv);
             let dispatch = parse_from(argv, Ok(report_from("tools = []\n")))
                 .unwrap_or_else(|error| panic!("case {case:?} must parse: {error}"));
-            let requested = match dispatch {
+            let (filter, ambient) = match dispatch {
                 Dispatch::Builtin {
                     cmd:
                         Cmd::Image(crate::image_cmd::Args {
                             cmd: crate::image_cmd::ImageCmd::Refresh(args),
                         }),
                     ..
-                } => args.image.requested().expect("a valid override or none"),
+                } => (
+                    args.filter().expect("a valid filter or none"),
+                    args.ambient_override().expect("a usable ambient input"),
+                ),
                 _ => panic!("image refresh must dispatch as a built-in"),
             };
-            match case.expected {
-                Some((reference, source)) => {
-                    let override_ = requested.expect("an override is present");
-                    assert_eq!(override_.reference().as_str(), reference);
-                    assert_eq!(override_.source(), source);
-                }
-                None => assert!(requested.is_none(), "empty env must be unset"),
-            }
+            assert_eq!(
+                filter.map(|target| target.canonical().whole()),
+                case.filter.map(canonical_text),
+                "{case:?}"
+            );
+            assert_eq!(
+                ambient.map(|override_| override_.reference().as_str().to_owned()),
+                case.ambient.map(str::to_owned),
+                "{case:?}"
+            );
         }
+        env.remove_var("AGENT_VM_IMAGE_TAG");
     }
 
-    /// Every dispatch arm that carries the image argument runs the same
-    /// reconciliation. The launch arm, the ready-catalog built-in arm (`image refresh`,
-    /// `setup`) and the broken-config built-in arm each call it separately, so
-    /// dropping any one of them would bring the bug back silently.
+    /// A non-Unicode `AGENT_VM_IMAGE_TAG` is a typed failure of refresh's own
+    /// ambient input, not clap's env parsing: the exact text is the one the
+    /// launch selector already reports.
+    #[test]
+    fn a_refresh_ambient_input_must_be_unicode() {
+        let args = crate::pull::Args::for_test(None, crate::boot_image::EnvOverride::Invalid);
+        let error = args
+            .ambient_override()
+            .expect_err("invalid env is not absent");
+        assert_eq!(error.to_string(), crate::pull::ENV_NOT_UNICODE_REASON);
+        // A typed filter is independent of that ambient failure.
+        let args =
+            crate::pull::Args::for_test(Some("cli:1"), crate::boot_image::EnvOverride::Invalid);
+        assert!(args.filter().is_ok());
+        assert!(args.ambient_override().is_err());
+    }
+
+    /// The full canonical spelling of a reference, as a filter stores it.
+    fn canonical_text(reference: &str) -> String {
+        crate::image_acquire::OciTarget::parse(reference)
+            .expect("the fixture reference is valid")
+            .canonical()
+            .whole()
+    }
+
+    /// Every dispatch arm that carries the image argument decides its own
+    /// inputs. The launch arm and `setup` reconcile clap's value source; the two
+    /// `image refresh` arms carry an independent filter plus the captured
+    /// ambient environment, so a typed flag there does not mask the env.
     #[test]
     fn every_dispatch_arm_reconciles_the_image_arg() {
         let mut env = crate::test_env::guard();
@@ -2114,9 +2110,7 @@ mod tests {
             Dispatch::Builtin { .. } => panic!("shell is a launch verb"),
         }
 
-        // The ready-catalog built-in arm, and the deferred-config-error arm:
-        // `image refresh`'s flag lives on the refresh subcommand, so these also
-        // prove the nested reconciliation runs.
+        // The ready-catalog built-in arm, and the deferred-config-error arm.
         for argv in [
             vec!["agent-vm", "image", "refresh", "--image", "cli:1"],
             vec!["agent-vm", "setup", "--image", "cli:1"],
@@ -2128,25 +2122,43 @@ mod tests {
             ] {
                 let dispatch = parse_from(argv.clone(), catalog)
                     .unwrap_or_else(|error| panic!("{verb} must parse: {error}"));
-                let requested = match dispatch {
+                match dispatch {
                     Dispatch::Builtin {
                         cmd:
                             Cmd::Image(crate::image_cmd::Args {
                                 cmd: crate::image_cmd::ImageCmd::Refresh(args),
                             }),
                         ..
-                    } => args.image.requested().unwrap(),
+                    } => {
+                        // The typed filter is the target ...
+                        assert_eq!(
+                            args.filter()
+                                .expect("a valid filter")
+                                .expect("present")
+                                .canonical()
+                                .whole(),
+                            canonical_text("cli:1"),
+                            "{verb}"
+                        );
+                        // ... and the environment is still the ambient
+                        // selection, which the filter must not mask.
+                        let ambient = args.ambient_override().unwrap().expect("present");
+                        assert_eq!(ambient.reference().as_str(), "env:1", "{verb}");
+                        assert_eq!(ambient.source(), OverrideSource::Environment, "{verb}");
+                    }
                     Dispatch::Builtin {
                         cmd: Cmd::Setup(args),
                         ..
-                    } => args.image.requested().unwrap(),
+                    } => {
+                        let requested = args.image.requested().unwrap().expect("present");
+                        assert_eq!(requested.reference().as_str(), "cli:1", "{verb}");
+                        assert_eq!(requested.source(), OverrideSource::CommandLine, "{verb}");
+                    }
                     _ => panic!("{verb} must dispatch as a built-in"),
-                };
-                let requested = requested.expect("present");
-                assert_eq!(requested.reference().as_str(), "cli:1", "{verb}");
-                assert_eq!(requested.source(), OverrideSource::CommandLine, "{verb}");
+                }
             }
         }
+        env.remove_var("AGENT_VM_IMAGE_TAG");
     }
 
     #[test]

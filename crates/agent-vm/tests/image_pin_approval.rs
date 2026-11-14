@@ -34,7 +34,7 @@ use acquisition_gate::{AcquisitionGate, AcquisitionStage, GateReply};
 use fake_msb::{FakeMsb, Mode};
 use image_archive::{ArchiveSpec, LayerContent, PlatformSpec};
 use oci_registry::{Image, Server};
-use pin_gate::{PinGate, PinPeer, PinStage, Reply};
+use pin_gate::{PinCheckpoint, PinGate, PinPeer, PinStage, Reply};
 use pty::{Action, Pty};
 use sha2::{Digest as _, Sha256};
 
@@ -123,10 +123,45 @@ impl Harness {
         bounded(command)
     }
 
+    /// A bare refresh whose ambient selection is `reference`: the seeding shape
+    /// that approves a reference **without** claiming a role.
+    ///
+    /// This is not a convenience wrapper for `--image`: `--image` is a target
+    /// filter over references already in use, so it can only refresh one. A
+    /// fixture that needs a first approval the CLI would not consider in use
+    /// must make its reference the ambient next-launch selection.
+    fn refresh_as_ambient(&self, reference: &str) -> Output {
+        let mut command = self.command();
+        command
+            .env("AGENT_VM_IMAGE_TAG", reference)
+            .args(["image", "refresh"]);
+        bounded(command)
+    }
+
+    /// [`Self::refresh_as_ambient`] rooted at another project/state root.
+    fn refresh_as_ambient_in(&self, project: &Path, state: &Path, reference: &str) -> Output {
+        let mut command = self.command_in(project, state);
+        command
+            .env("AGENT_VM_IMAGE_TAG", reference)
+            .args(["image", "refresh"]);
+        bounded(command)
+    }
+
+    /// Approve `reference` for this project without claiming Boot or Output.
+    fn approve_ambient_fixture(&self, reference: &str) {
+        let out = self.refresh_as_ambient(reference);
+        assert!(
+            out.status.success(),
+            "approve {reference} as the ambient selection: {}{}",
+            stdout_of(&out),
+            stderr(&out)
+        );
+    }
+
     /// A pin for `reference` **and** a host record naming it: the fixture S1's
     /// `set-default` used to leave behind, now two explicit commands.
     fn pin_and_set_default(&self, reference: &str) {
-        assert!(self.refresh(reference).status.success(), "pin the tag");
+        self.approve_ambient_fixture(reference);
         assert!(
             set_default(self, reference).status.success(),
             "set the host record"
@@ -710,7 +745,7 @@ fn refresh_replaces_a_moved_tag_without_asking_on_a_pipe_or_a_terminal() {
     let a = h.image(&ArchiveSpec::default());
     let tag = format!("{}/images:approve", server.host);
     let pin_a = server.image("images", "approve", &a);
-    assert!(h.refresh(&tag).status.success(), "first pin");
+    assert!(h.refresh_as_ambient(&tag).status.success(), "first pin");
     let b = h.image(&ArchiveSpec {
         marker: "approval-b".into(),
         ..Default::default()
@@ -752,7 +787,7 @@ fn refresh_replaces_a_moved_tag_without_asking_on_a_pipe_or_a_terminal() {
     let a = h.image(&ArchiveSpec::default());
     let tag = format!("{}/images:terminal", server.host);
     let pin_a = server.image("images", "terminal", &a);
-    assert!(h.refresh(&tag).status.success(), "first pin");
+    assert!(h.refresh_as_ambient(&tag).status.success(), "first pin");
     let b = h.image(&ArchiveSpec {
         marker: "approval-terminal-b".into(),
         ..Default::default()
@@ -761,7 +796,9 @@ fn refresh_replaces_a_moved_tag_without_asking_on_a_pipe_or_a_terminal() {
     assert_ne!(pin_a, pin_b);
 
     let mut command = h.command();
-    command.args(["image", "refresh", "--image", &tag]);
+    command
+        .env("AGENT_VM_IMAGE_TAG", &tag)
+        .args(["image", "refresh"]);
     let mut terminal = Pty::spawn(&mut command, b"Replacing the approved image for")
         .expect("open a pseudo-terminal");
     let (status, out) = terminal
@@ -791,11 +828,26 @@ fn refresh_replaces_a_moved_tag_without_asking_on_a_pipe_or_a_terminal() {
     );
 }
 
+/// A bare `image refresh` command whose ambient selection is `reference`, for a
+/// fixture that gates or peers a refresh of a reference it has not recorded a
+/// role for.
+fn refresh_as_ambient_command(h: &Harness, reference: &str) -> Command {
+    let mut command = h.command();
+    command
+        .env("AGENT_VM_IMAGE_TAG", reference)
+        .args(["image", "refresh"]);
+    command
+}
+
 /// The exact command shape the pipe row needs: no stdin configured here, so the
 /// helper can install its own recording pipe.
 fn command_with_refresh(h: &Harness, tag: &str) -> Command {
     let mut command = h.command();
-    command.args(["image", "refresh", "--image", tag]);
+    // The tag is the ambient selection: `--image` may only refresh a reference
+    // already in use, and here the row is about the reference being re-resolved.
+    command
+        .env("AGENT_VM_IMAGE_TAG", tag)
+        .args(["image", "refresh"]);
     command
 }
 
@@ -814,7 +866,7 @@ fn noninteractive_refresh_replaces_and_reads_no_stdin() {
     let a = h.image(&ArchiveSpec::default());
     let pin_a = server.image("images", "piped", &a);
     let tag = format!("{}/images:piped", server.host);
-    assert!(h.refresh(&tag).status.success());
+    assert!(h.refresh_as_ambient(&tag).status.success());
     let b = h.image(&ArchiveSpec {
         marker: "piped-b".into(),
         ..Default::default()
@@ -1053,7 +1105,7 @@ fn a_concurrent_refresh_wins_and_the_import_reports_a_stale_approval() {
     });
     let pin_a = server.image("images", "stale", &a);
     let tag = format!("{}/images:stale", server.host);
-    assert!(h.refresh(&tag).status.success(), "first pin");
+    assert!(h.refresh_as_ambient(&tag).status.success(), "first pin");
     assert_eq!(
         h.pinned_digest_for(&tag),
         Some(digest_of(&pin_a)),
@@ -1099,7 +1151,7 @@ fn a_concurrent_refresh_wins_and_the_import_reports_a_stale_approval() {
 
     // The winner: a refresh that replaces A with C while this import waits.
     let pin_c = server.image("images", "stale", &c);
-    let refreshed = h.refresh(&tag);
+    let refreshed = h.refresh_as_ambient(&tag);
     assert_eq!(refreshed.status.code(), Some(0), "{}", stderr(&refreshed));
     assert_eq!(h.pinned_digest_for(&tag), Some(digest_of(&pin_c)));
 
@@ -2044,9 +2096,7 @@ fn doctor_reports_each_projects_own_approved_content() {
     let p2 = h.project_at("doctor-project");
     let b = labelled(&h, "doctor-b", "b.example");
     server.image("images", "doctor-scope", &b);
-    let mut command = h.command_in(&p2, &h.state);
-    command.args(["image", "refresh", "--image", &tag]);
-    let out = bounded(command);
+    let out = h.refresh_as_ambient_in(&p2, &h.state, &tag);
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(
         h.pin_in(&p2, &tag).unwrap().1,
@@ -2260,7 +2310,7 @@ fn a_malformed_project_scope_is_damage_not_legacy() {
     let tag = format!("{}/images:malformed", server.host);
     let image = h.image(&ArchiveSpec::default());
     server.image("images", "malformed", &image);
-    let out = h.refresh(&tag);
+    let out = h.refresh_as_ambient(&tag);
     assert!(out.status.success(), "{}", stderr(&out));
 
     let mut store: serde_json::Value =
@@ -2393,7 +2443,7 @@ fn a_foreign_platform_record_is_preserved_not_borrowed() {
     let a = h.image(&ArchiveSpec::default());
     let child_a = server.image("images", "platform", &a);
     let tag = format!("{}/images:platform", server.host);
-    assert!(h.refresh(&tag).status.success());
+    assert!(h.refresh_as_ambient(&tag).status.success());
     let mut store: serde_json::Value =
         serde_json::from_slice(&fs::read(h.pins()).unwrap()).unwrap();
     let arch = if image_archive::host_arch() == "arm64" {
@@ -2444,7 +2494,7 @@ fn a_resolved_candidate_is_frozen_for_refresh_and_set_default() {
         let tag = format!("{}/images:frozen", server.host);
         if verb == "refresh" {
             // A refresh needs an approval to replace; the fixture is a refresh.
-            assert!(h.refresh(&tag).status.success());
+            assert!(h.refresh_as_ambient(&tag).status.success());
         }
         let b = h.image(&ArchiveSpec {
             marker: "frozen-b".into(),
@@ -2453,7 +2503,17 @@ fn a_resolved_candidate_is_frozen_for_refresh_and_set_default() {
         let child_b = server.image("images", "frozen", &b);
         let start = server.requests().len();
         let mut gate = PinGate::new(h.root.path());
-        let peer = PinPeer::spawn(h.command(), &gate, &["image", verb, "--image", &tag]);
+        let mut command = h.command();
+        if verb == "refresh" {
+            // The fixture's tag must be the ambient selection to be in use.
+            command
+                .env("AGENT_VM_IMAGE_TAG", &tag)
+                .arg("image")
+                .arg("refresh");
+        } else {
+            command.args(["image", verb, "--image", &tag]);
+        }
+        let peer = PinPeer::spawn(command, &gate, &[]);
         gate.expect(PinStage::CandidateReady).reply(Reply::Continue);
         // The tag moves to C after the command resolved B.
         let c = h.image(&ArchiveSpec {
@@ -2767,7 +2827,7 @@ fn alternate_manifest_algorithms_keep_equivalent_approval_bytes() {
         let a = h.image(&ArchiveSpec::default());
         let child = server.image("images", "equivalent", &a);
         let tag = format!("{}/images:equivalent", server.host);
-        assert!(h.refresh(&tag).status.success());
+        assert!(h.refresh_as_ambient(&tag).status.success());
         let old = fs::read(h.pins()).unwrap();
         let manifest = &a.blobs[&a.written.manifest_digest];
         let digest = oci_registry::digest_hex(algorithm, manifest);
@@ -2778,7 +2838,7 @@ fn alternate_manifest_algorithms_keep_equivalent_approval_bytes() {
             "application/vnd.oci.image.manifest.v1+json",
             &digest,
         );
-        let out = h.refresh(&tag);
+        let out = h.refresh_as_ambient(&tag);
         assert!(out.status.success(), "{}", stderr(&out));
         assert!(!stderr(&out).contains("Approve"));
         assert_eq!(
@@ -2812,7 +2872,7 @@ fn held_authority_lock_bounds_reads_and_mutation_waits() {
         .open(h.pins().with_extension("lock"))
         .unwrap();
     let mut gate = PinGate::new(h.root.path());
-    let peer = pin_gate::PinPeer::spawn(h.command(), &gate, &["image", "refresh", "--image", &tag]);
+    let peer = pin_gate::PinPeer::spawn(refresh_as_ambient_command(&h, &tag), &gate, &[]);
     let start = std::time::Instant::now();
     gate.expect(PinStage::CandidateReady).reply(Reply::Continue);
     let before_lock = gate.expect(PinStage::BeforePinLock);
@@ -2833,6 +2893,10 @@ fn held_authority_lock_bounds_reads_and_mutation_waits() {
         assert!(read_start.elapsed() >= Duration::from_secs(2));
         assert!(read_start.elapsed() < Duration::from_secs(8));
     }
+    // The one-time wait notice is attempted at the normal one-second threshold,
+    // while this test still holds the real exclusive pin lock.
+    gate.expect(PinStage::AuthorityNoticeAttempted)
+        .reply(Reply::Continue);
     let out = peer.wait();
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     assert!(start.elapsed() >= Duration::from_secs(30));
@@ -2841,7 +2905,7 @@ fn held_authority_lock_bounds_reads_and_mutation_waits() {
     assert_eq!(fs::read(default).unwrap(), old_default);
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
     assert!(
-        h.refresh(&tag).status.success(),
+        h.refresh_as_ambient(&tag).status.success(),
         "timeout must release all locks"
     );
 }
@@ -2862,7 +2926,7 @@ fn unwritable_authority_preserves_a_with_a_root_safe_fault_control() {
     });
     server.image("images", "permission", &b);
     let mut gate = PinGate::new(h.root.path());
-    let peer = pin_gate::PinPeer::spawn(h.command(), &gate, &["image", "refresh", "--image", &tag]);
+    let peer = pin_gate::PinPeer::spawn(refresh_as_ambient_command(&h, &tag), &gate, &[]);
     for stage in [
         PinStage::CandidateReady,
         PinStage::BeforePinLock,
@@ -2936,8 +3000,36 @@ fn a_failed_adoption_save_keeps_the_project_default() {
     }
     gate.expect(PinStage::BeforePinSave)
         .reply(Reply::FailBeforeSave);
+    // D still holds Boot, so S4 refreshes it independently after the failed
+    // adoption: the old default was re-resolved once and is unchanged, which
+    // needs no save and therefore no `BeforePinSave`.
+    for stage in [
+        PinStage::CandidateReady,
+        PinStage::BeforePinLock,
+        PinStage::PinLocked,
+    ] {
+        gate.expect(stage).reply(Reply::Continue);
+    }
     let out = peer.wait();
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let text = stdout_of(&out);
+    assert!(
+        text.contains("refresh [1/2]") && text.contains("failed"),
+        "the adoption failure is a row: {text}"
+    );
+    assert!(
+        text.contains("refresh [2/2]")
+            && !text.contains("refresh [2/2] the default boot image (linux/arm64): failed"),
+        "the still-held old default is refreshed independently: {text}"
+    );
+    assert!(
+        text.contains("==> image refresh: 1 succeeded, 1 failed"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("nothing was acquired or approved"),
+        "a post-freeze failure is not a batch-wide refusal: {text}"
+    );
     assert_eq!(
         fs::read(h.pins()).unwrap(),
         old,
@@ -2986,7 +3078,7 @@ fn an_unwritable_stderr_commits_no_replacement_and_no_adoption() {
     let a = h.image(&ArchiveSpec::default());
     let child_a = server.image("images", "render", &a);
     let tag = format!("{}/images:render", server.host);
-    assert!(h.refresh(&tag).status.success());
+    assert!(h.refresh_as_ambient(&tag).status.success());
     let pins = fs::read(h.pins()).unwrap();
     let b = h.image(&ArchiveSpec {
         marker: "render-b".into(),
@@ -3054,7 +3146,7 @@ fn failed_default_restore_requires_recovery_without_losing_old_approval() {
     let child_a = server.image("images", "restore", &a);
     let tag = format!("{}/images:restore", server.host);
     // An approval to keep across the recovery.
-    assert!(h.refresh(&tag).status.success());
+    assert!(h.refresh_as_ambient(&tag).status.success());
     let default = h.home.join(".config/agent-vm/default-image.json");
     let old_default = format!("{{ \"image\": \"{child_a}\", \"version\": 1 }}\n");
     fs::write(&default, &old_default).unwrap();
@@ -3102,7 +3194,7 @@ fn failed_default_restore_requires_recovery_without_losing_old_approval() {
     let permissions = fs::metadata(&directory).unwrap().permissions();
     if unsafe { libc::geteuid() } == 0 {
         eprintln!("root: observation and recovery rows only, not a genuine EACCES restore failure");
-        assert!(h.refresh(&child_a).status.success());
+        assert!(h.refresh_as_ambient(&child_a).status.success());
         assert!(read_json(&h.pins())["pending_default"].is_null());
         assert_eq!(fs::read(&default).unwrap(), old_default.as_bytes());
         return;
@@ -3113,10 +3205,11 @@ fn failed_default_restore_requires_recovery_without_losing_old_approval() {
     let out = bounded(cmd);
     fs::set_permissions(&directory, permissions).unwrap();
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    // S4 reports per-operation failures as rows, so the reason is on stdout.
     assert!(
-        stderr(&out).contains("requires recovery"),
+        stdout_of(&out).contains("requires recovery"),
         "{}",
-        stderr(&out)
+        stdout_of(&out)
     );
     let pending = fs::read(h.pins()).unwrap();
     assert!(!read_json(&h.pins())["pending_default"].is_null());
@@ -3128,7 +3221,7 @@ fn failed_default_restore_requires_recovery_without_losing_old_approval() {
     assert_eq!(fs::read(h.pins()).unwrap(), pending);
 
     // Writable again: the next write recovers the journal and keeps the pin.
-    assert!(h.refresh(&child_a).status.success());
+    assert!(h.refresh_as_ambient(&child_a).status.success());
     assert!(read_json(&h.pins())["pending_default"].is_null());
     assert_eq!(fs::read(&default).unwrap(), old_default.as_bytes());
     let start = server.count();
@@ -3161,13 +3254,13 @@ fn native_index_ignores_attestation_platformless_and_foreign_entries() {
     index["manifests"] = serde_json::json!([attestation, platformless, foreign, host]);
     server.index("images", "filtered", serde_json::to_vec(&index).unwrap());
     let source = format!("{}/images:filtered", server.host);
-    assert!(h.refresh(&source).status.success());
+    assert!(h.refresh_as_ambient(&source).status.success());
     assert_eq!(h.pinned_digest(), a.written.manifest_digest);
     assert_eq!(sdk_image(&h.launch(&source)), child);
     let old = fs::read(h.pins()).unwrap();
     index["manifests"][2]["digest"] = format!("sha256:{}", "d".repeat(64)).into();
     server.index("images", "filtered", serde_json::to_vec(&index).unwrap());
-    let out = h.refresh(&source);
+    let out = h.refresh_as_ambient(&source);
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(!stderr(&out).contains("Approve"));
     assert_eq!(
@@ -3195,7 +3288,7 @@ fn unapproved_legacy_index_requires_its_immutable_source_proof() {
     let a = h.image(&ArchiveSpec::default());
     let child = server.image("images", "legacy-child", &a);
     let source = server.index("images", "legacy-index", a.index.clone());
-    assert!(h.refresh(&source).status.success());
+    assert!(h.refresh_as_ambient(&source).status.success());
     // Simulate a pre-approval cache, not an approval minted from disk strings.
     // Removing authority is a deliberate reset inside this test-owned HOME.
     fs::remove_file(h.pins()).unwrap();
@@ -3340,7 +3433,7 @@ fn a_recommendation_launch_establishes_the_project_and_seeds_the_host() {
     let a = h.image(&ArchiveSpec::default());
     let child = server.image("images", "adopt", &a);
     // The same key is pinned by an explicit operation, which never establishes.
-    assert!(h.refresh(&child).status.success());
+    assert!(h.refresh_as_ambient(&child).status.success());
     assert_eq!(retained_default(&h), None);
     let pins = read_json(&h.pins());
     let project = project_id(&h.project);
@@ -3424,7 +3517,7 @@ fn an_established_warm_launch_takes_no_lock_and_leaves_the_journal() {
     let server = Server::new();
     let a = h.image(&ArchiveSpec::default());
     let child = server.image("images", "warm-default", &a);
-    assert!(h.refresh(&child).status.success());
+    assert!(h.refresh_as_ambient(&child).status.success());
     // A first real preparation records Boot for that key and resolves the
     // scope; only then is the following default-tier launch a complete no-op
     // that needs no exclusive lock. Merely adding `roles` by hand would be an
@@ -3472,7 +3565,7 @@ fn an_unestablished_warm_launch_recovers_the_journal_and_establishes() {
     let server = Server::new();
     let a = h.image(&ArchiveSpec::default());
     let child = server.image("images", "warm-new", &a);
-    assert!(h.refresh(&child).status.success());
+    assert!(h.refresh_as_ambient(&child).status.success());
     let project = project_id(&h.project);
     let default = h.home.join(".config/agent-vm/default-image.json");
     let retained = serde_json::json!({"version": 1, "image": child}).to_string();
@@ -4119,7 +4212,7 @@ fn an_s1_store_upgrades_without_a_reset() {
     let a = h.image(&ArchiveSpec::default());
     let child = server.image("images", "upgrade", &a);
     // Warm the cache and learn the pin record's exact shape.
-    assert!(h.refresh(&child).status.success());
+    assert!(h.refresh_as_ambient(&child).status.success());
     // Rewrite the store exactly as 0.7.39–0.7.46 writes it: no `defaults`.
     let mut store = read_json(&h.pins());
     store.as_object_mut().unwrap().remove("defaults");
@@ -4425,18 +4518,31 @@ fn a_bare_refresh_establishes_an_unestablished_project() {
     );
 }
 
-/// AC15: a bare refresh with an unreadable configuration refuses the
-/// default-tier fall-through; `--image` and `AGENT_VM_IMAGE_TAG` still work and
-/// establish nothing.
+/// AC12/AC6: a bare refresh with an unreadable configuration refuses the
+/// default-tier fall-through. A **proven** in-use reference still recovers —
+/// the environment's ambient selection, or a recorded holder passed with
+/// `--image` — and either form establishes nothing. An arbitrary `--image` value
+/// is refused like any other nonmember, before any registry request.
 #[test]
-fn a_bare_refresh_refuses_an_unreadable_config_but_an_explicit_one_works() {
+fn a_bare_refresh_refuses_an_unreadable_config_but_a_proven_target_works() {
     for tier in ["project", "user"] {
-        for variant in ["bare", "cli", "env"] {
+        for variant in ["bare", "cli", "cli-held", "env"] {
             let h = Harness::new(Mode::StrictAcquisition);
             let server = Server::new();
             let a = h.image(&ArchiveSpec::default());
             let child = server.image("images", "broken", &a);
             let reference = format!("{}/images:broken", server.host);
+            // A `cli-held` target must be recorded **before** the configuration
+            // breaks: recovery is evidence from the healthy store.
+            if variant == "cli-held" {
+                let out = h.import(&a.written.path, &reference);
+                assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+                assert_eq!(
+                    h.record_in(&h.project, &reference).unwrap()["roles"],
+                    "output",
+                    "the recovery target is a genuine holder"
+                );
+            }
             let broken = h.home.join(".config/agent-vm/config.toml");
             fs::create_dir_all(broken.parent().unwrap()).unwrap();
             let config = "not toml [[[";
@@ -4449,10 +4555,12 @@ fn a_bare_refresh_refuses_an_unreadable_config_but_an_explicit_one_works() {
                 _ => fs::write(&broken, config).unwrap(),
             }
             let default = h.home.join(".config/agent-vm/default-image.json");
+            let requests_before = server.count();
+            let pins_before = fs::read(h.pins()).ok();
 
             let out = match variant {
                 "bare" => h.refresh_default(),
-                "cli" => h.refresh(&reference),
+                "cli" | "cli-held" => h.refresh(&reference),
                 _ => {
                     let mut command = h.command();
                     command
@@ -4464,14 +4572,31 @@ fn a_bare_refresh_refuses_an_unreadable_config_but_an_explicit_one_works() {
             };
             let text = stderr(&out);
             match variant {
-                "bare" => {
+                "bare" | "cli" => {
                     assert_eq!(out.status.code(), Some(1), "{tier}/{variant}: {text}");
-                    assert!(
-                        text.contains("does not fall back to the default boot image"),
-                        "{tier}/{variant}: {text}"
+                    if variant == "bare" {
+                        assert!(
+                            text.contains("does not fall back to the default boot image"),
+                            "{tier}/{variant}: {text}"
+                        );
+                    } else {
+                        // An arbitrary typed target is not in use, and an
+                        // unreadable configuration cannot prove it is.
+                        assert!(
+                            text.contains("targets only references currently in use"),
+                            "{tier}/{variant}: {text}"
+                        );
+                    }
+                    assert_eq!(
+                        server.count(),
+                        requests_before,
+                        "{tier}/{variant}: no request"
                     );
-                    assert_eq!(server.count(), 0, "{tier}/{variant}: no request");
-                    assert!(!h.pins().exists(), "{tier}/{variant}: no pin store");
+                    assert_eq!(
+                        fs::read(h.pins()).ok(),
+                        pins_before,
+                        "{tier}/{variant}: no authority write"
+                    );
                     assert!(!default.exists(), "{tier}/{variant}: no host record");
                     // The refusal needs no microsandbox state either: it is
                     // decided from input alone, before the preflight.
@@ -4489,9 +4614,12 @@ fn a_bare_refresh_refuses_an_unreadable_config_but_an_explicit_one_works() {
                         out.status.code(),
                         stdout_of(&out)
                     );
-                    assert!(
-                        stdout_of(&out).contains("configured image settings could not be read"),
-                        "{tier}/{variant}: {}",
+                    assert_eq!(
+                        stdout_of(&out)
+                            .matches("configured image settings could not be read")
+                            .count(),
+                        1,
+                        "{tier}/{variant}: the warning is emitted exactly once: {}",
                         stdout_of(&out)
                     );
                     assert_eq!(
@@ -4694,7 +4822,7 @@ fn an_explicit_refresh_establishes_nothing() {
     assert!(set_default(&h, &tag).status.success());
     assert_eq!(h.host_record().unwrap()["image"], child_a);
 
-    let out = h.refresh(&child_b);
+    let out = h.refresh_as_ambient(&child_b);
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(
         h.pin_in(&h.project, &child_b).map(|(digest, _)| digest),
@@ -4743,7 +4871,7 @@ fn an_s1_store_follows_the_host_record_until_its_first_default_tier_use() {
 
     // The state 0.7.39-0.7.46 leaves: an approval and a host record, no
     // `defaults`.
-    assert!(h.refresh(&child_a).status.success());
+    assert!(h.refresh_as_ambient(&child_a).status.success());
     let mut store = read_json(&h.pins());
     store.as_object_mut().unwrap().remove("defaults");
     fs::write(h.pins(), serde_json::to_vec(&store).unwrap()).unwrap();
@@ -4784,7 +4912,7 @@ fn an_unwritable_store_fails_the_launch_that_must_establish() {
     let tag = format!("{}/images:establish-write", server.host);
 
     // A warm approval and a host record, but no project default yet.
-    assert!(h.refresh(&child).status.success());
+    assert!(h.refresh_as_ambient(&child).status.success());
     assert!(set_default(&h, &tag).status.success());
     assert!(h.default_record_in(&h.project).is_none());
 
@@ -5157,9 +5285,7 @@ fn retired_return_uses_changed_warm_cache_not_old_approval() {
         "warm A is still approved"
     );
     let p2 = h.project_at("return-project");
-    let mut command = h.command_in(&p2, &h.state);
-    command.args(["image", "refresh", "--image", &x_tag]);
-    let refreshed = bounded(command);
+    let refreshed = h.refresh_as_ambient_in(&p2, &h.state, &x_tag);
     assert!(refreshed.status.success(), "{}", stderr(&refreshed));
     assert_eq!(
         digests_requested_since(&server, 0),
@@ -5425,9 +5551,14 @@ fn peer_import(h: &Harness, state: &Path, archive: &Path, tag: &str) -> Output {
     bounded(command)
 }
 
+/// A deliberate no-role reinsertion by a peer: the reference is the peer's
+/// ambient selection, because a filter may only refresh a reference already in
+/// use and a retired key holds no role.
 fn peer_refresh(h: &Harness, state: &Path, reference: &str) -> Output {
     let mut command = h.command_in(&h.project, state);
-    command.args(["image", "refresh", "--image", reference]);
+    command
+        .env("AGENT_VM_IMAGE_TAG", reference)
+        .args(["image", "refresh"]);
     bounded(command)
 }
 
@@ -5449,10 +5580,16 @@ fn failed_boot_acquisition_or_claim_save_keeps_authority() {
     let h = Harness::new(Mode::LaunchSeam);
     let server = Server::new();
     // Output resolved to O first, so a Boot claim is allowed to retire.
-    let o = archive_at(&h, "claim-fault-o.tar", "claim-fault-o");
+    let o = h.image(&ArchiveSpec {
+        marker: "claim-fault-o".into(),
+        ..Default::default()
+    });
     let o_tag = format!("{}/images:o", server.host);
-    let out = h.import(&o.path, &o_tag);
+    let out = h.import(&o.written.path, &o_tag);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    // The ambient approval below also covers this Output holder, so its
+    // reference resolves to the identical content.
+    server.image("images", "o", &o);
     // X holds Boot.
     let x = h.image(&ArchiveSpec {
         marker: "claim-fault-x".into(),
@@ -5469,7 +5606,7 @@ fn failed_boot_acquisition_or_claim_save_keeps_authority() {
     });
     let y_child = server.image("images", "y", &y);
     let y_tag = format!("{}/images:y", server.host);
-    assert!(h.refresh(&y_tag).status.success());
+    assert!(h.refresh_as_ambient(&y_tag).status.success());
     assert!(
         h.record_in(&h.project, &y_tag)
             .unwrap()
@@ -5881,9 +6018,12 @@ fn refresh_cas_rejects_retire_reinsert_same_digest_lifetime() {
     // Peers retire X: Output to O, then Boot to Y. Both slots are then resolved
     // and X holds neither, so the store retires it.
     let peer_state = peer_state("abr");
-    let o = archive_at(&h, "aba-refresh-o.tar", "aba-refresh-o");
+    let o = h.image(&ArchiveSpec {
+        marker: "aba-refresh-o".into(),
+        ..Default::default()
+    });
     let o_tag = format!("{}/images:o", server.host);
-    let out = peer_import(&h, peer_state.path(), &o.path, &o_tag);
+    let out = peer_import(&h, peer_state.path(), &o.written.path, &o_tag);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     let y = h.image(&ArchiveSpec {
         marker: "aba-refresh-y".into(),
@@ -5893,11 +6033,17 @@ fn refresh_cas_rejects_retire_reinsert_same_digest_lifetime() {
     let y_tag = format!("{}/images:y", server.host);
     assert!(!peer_launch(&h, peer_state.path(), &y_tag).status.success());
     assert!(h.pin_for(&x_tag).is_none(), "X is retired");
-    // Reinsert A: the registry serves A again and refresh claims no role.
+    // Reinsert A: the registry serves A again and refresh claims no role. The
+    // peer's ambient refresh also covers its other holders, so the imported
+    // Output reference is served with the identical content.
     server.image("images", "x", &a);
+    server.image("images", "o", &o);
+    let reinserted_out = peer_refresh(&h, peer_state.path(), &x_tag);
     assert!(
-        peer_refresh(&h, peer_state.path(), &x_tag).status.success(),
-        "the peer reinserts A"
+        reinserted_out.status.success(),
+        "the peer reinserts A: {}{}",
+        stdout_of(&reinserted_out),
+        stderr(&reinserted_out)
     );
     let (reinserted_digest, reinserted) = h.pin_for(&x_tag).expect("the peer reinserted X");
     assert_eq!(reinserted_digest, a_digest);
@@ -5911,8 +6057,9 @@ fn refresh_cas_rejects_retire_reinsert_same_digest_lifetime() {
     let out = loser.wait();
     assert!(!out.status.success());
     assert!(
-        stderr(&out).contains("stale"),
-        "the frozen predecessor no longer exists: {}",
+        stdout_of(&out).contains("stale"),
+        "the frozen predecessor no longer exists: {}{}",
+        stdout_of(&out),
         stderr(&out)
     );
     assert_eq!(
@@ -5968,9 +6115,12 @@ fn publication_cas_rejects_retire_reinsert_same_digest_lifetime() {
     let locked = gate.expect(PinStage::BeforePinLock);
 
     let peer_state = peer_state("abp");
-    let o = archive_at(&h, "aba-pub-o.tar", "aba-pub-o");
+    let o = h.image(&ArchiveSpec {
+        marker: "aba-pub-o".into(),
+        ..Default::default()
+    });
     let o_tag = format!("{}/images:o", server.host);
-    let out = peer_import(&h, peer_state.path(), &o.path, &o_tag);
+    let out = peer_import(&h, peer_state.path(), &o.written.path, &o_tag);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     let y = h.image(&ArchiveSpec {
         marker: "aba-pub-y".into(),
@@ -5981,7 +6131,16 @@ fn publication_cas_rejects_retire_reinsert_same_digest_lifetime() {
     assert!(!peer_launch(&h, peer_state.path(), &y_tag).status.success());
     assert!(h.pin_for(&x_tag).is_none(), "X is retired");
     // The registry still serves A under X's tag; a refresh reinserts it unheld.
-    assert!(peer_refresh(&h, peer_state.path(), &x_tag).status.success());
+    // The peer's ambient refresh covers its other holders too, so the imported
+    // Output reference is served with the identical content.
+    server.image("images", "o", &o);
+    let reinserted_out = peer_refresh(&h, peer_state.path(), &x_tag);
+    assert!(
+        reinserted_out.status.success(),
+        "reinsert A: {}{}",
+        stdout_of(&reinserted_out),
+        stderr(&reinserted_out)
+    );
     let (reinserted_digest, reinserted) = h.pin_for(&x_tag).expect("the peer reinserted X");
     assert_eq!(reinserted_digest, a_digest);
     assert!(reinserted > a_revision);
@@ -6220,9 +6379,13 @@ fn equal_content_role_only_save_fault_preserves_the_active_set() {
     let out = h.import(&image.written.path, &x_tag);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert_eq!(h.pin_for(&x_tag).unwrap().0, digest);
+    // X's own reference is served with the identical content, so the ambient
+    // seed refresh below also resolves X unchanged instead of failing on an
+    // archive-only reference.
+    server.image("images", "x", &image);
     // Y is approved at the same content but holds no role (refresh claims none).
     server.image("images", "y", &image);
-    assert!(h.refresh(&y_tag).status.success());
+    assert!(h.refresh_as_ambient(&y_tag).status.success());
     assert_eq!(h.pin_for(&y_tag).unwrap().0, digest);
     assert!(
         h.record_in(&h.project, &y_tag)
@@ -7007,4 +7170,3756 @@ fn publication_at_the_pin_count_bound_fails_closed() {
         h.pins_value().unwrap()["pins"].as_array().unwrap().len(),
         4096
     );
+}
+
+// ---------------------------------------------------------------------------
+// S4 (#543): refresh the invocation's in-use references (ADR-0068 D10).
+// ---------------------------------------------------------------------------
+
+/// How many times the registry was asked for the manifest spelled `name` (a tag
+/// or a digest), so "one source resolution per target" is measured rather than
+/// inferred.
+fn manifest_requests(server: &Server, from: usize, name: &str) -> usize {
+    manifests_requested_since(server, from)
+        .iter()
+        .filter(|reference| reference.as_str() == name)
+        .count()
+}
+
+/// The `roles` value of one record, or `None` when it holds none.
+fn roles_of(h: &Harness, project: &Path, reference: &str) -> Option<String> {
+    h.record_in(project, reference)
+        .and_then(|record| record.get("roles").cloned())
+        .map(|roles| roles.as_str().unwrap_or_default().to_owned())
+}
+
+/// One refresh's result rows and summary, without the adoption notice (each row
+/// that must see the notice asserts it directly).
+fn rows_of(out: &Output) -> Vec<String> {
+    stdout_of(out)
+        .lines()
+        .filter(|line| !line.contains("now uses the host's default boot image"))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The literal, value-free nonmember refusal this command must print.
+const NOT_A_MEMBER: &str = "`agent-vm image refresh --image REF` targets only references currently in use by this project on the host platform; the requested reference is not in that set. To acquire and approve a new boot reference, run `agent-vm setup --image REF --no-verify`; `image build` and `image import` approve their own output references. Nothing was acquired or approved.";
+
+/// AC1: a bare refresh moves the recorded Boot holder, reports the unchanged
+/// Output holder, resolves each source once, and neither creates a sandbox nor
+/// runs Docker. Every role, scope and default is preserved.
+#[test]
+fn bare_refresh_reports_moving_boot_and_unchanged_output() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let boot_tag = format!("{}/images:ac1boot", server.host);
+    let boot_a = server.image("images", "ac1boot", &a);
+    assert!(!h.launch(&boot_tag).status.success(), "the create fails");
+    assert_eq!(roles_of(&h, &h.project, &boot_tag).as_deref(), Some("boot"));
+
+    let o = h.image(&ArchiveSpec {
+        marker: "ac1-output".into(),
+        ..Default::default()
+    });
+    let output_tag = format!("{}/images:ac1output", server.host);
+    let output_o = server.image("images", "ac1output", &o);
+    let out = h.import(&o.written.path, &output_tag);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(
+        roles_of(&h, &h.project, &output_tag).as_deref(),
+        Some("output")
+    );
+    let output_record = h.record_in(&h.project, &output_tag).unwrap();
+
+    // Both sources move upstream; both are served again.
+    let b = h.image(&ArchiveSpec {
+        marker: "ac1-boot-b".into(),
+        ..Default::default()
+    });
+    let boot_b = server.image("images", "ac1boot", &b);
+    assert_ne!(boot_a, boot_b);
+    let creates = create_invocations(&h);
+    let scope_records = h.pins_value().unwrap()["scopes"].clone();
+    let requests_before = server.count();
+    // The Docker probe is armed for the refresh: the fake records a `buildx
+    // build` in this marker file, and the calibration below proves it does.
+    let marker = h.root.path().join("ac1-docker-ran");
+    let _ = fs::remove_file(&marker);
+    assert!(!marker.exists(), "the marker starts absent");
+    let mut refresh_command = h.command();
+    refresh_command
+        .env("FAKE_DOCKER_MARKER", &marker)
+        .env("AGENT_VM_IMAGE_TAG", &boot_tag)
+        .args(["image", "refresh"]);
+    let refresh = bounded(refresh_command);
+    assert!(!marker.exists(), "a refresh never runs Docker");
+    assert_eq!(refresh.status.code(), Some(0), "{}", stderr(&refresh));
+    let text = stdout_of(&refresh);
+
+    // Exactly two rows in worklist order: the ambient operation, then the
+    // Output holder by canonical reference.
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 3, "{text}");
+    assert!(
+        lines[0].starts_with(&format!("==> refresh [1/2] {boot_tag} (linux/")),
+        "{text}"
+    );
+    assert!(
+        lines[0].contains(&format!(
+            "changed {} -> {}; default=unchanged",
+            digest_of(&boot_a),
+            digest_of(&boot_b)
+        )),
+        "{text}"
+    );
+    assert!(
+        lines[1].starts_with("==> refresh [2/2] the latest output image (linux/"),
+        "{text}"
+    );
+    assert!(
+        lines[1].contains(&format!(
+            "unchanged {}; default=unchanged",
+            digest_of(&output_o)
+        )),
+        "{text}"
+    );
+    assert_eq!(lines[2], "==> image refresh: 2 succeeded, 0 failed");
+
+    // The approvals are exactly what the rows say.
+    assert_eq!(
+        h.pin_in(&h.project, &boot_tag).map(|(digest, _)| digest),
+        Some(digest_of(&boot_b))
+    );
+    assert_eq!(h.record_in(&h.project, &output_tag), Some(output_record));
+    assert_eq!(
+        roles_of(&h, &h.project, &boot_tag).as_deref(),
+        Some("boot"),
+        "refresh claims no role"
+    );
+    assert_eq!(
+        h.pins_value().unwrap()["scopes"].clone(),
+        scope_records,
+        "role knowledge is untouched"
+    );
+    assert!(
+        h.default_record_in(&h.project).is_none(),
+        "the explicit tiers establish no project default"
+    );
+    assert!(h.host_record().is_none(), "and write no host record");
+
+    // One resolution of each source; the unchanged holder re-downloads no layer.
+    assert_eq!(manifest_requests(&server, requests_before, "ac1boot"), 1);
+    assert_eq!(manifest_requests(&server, requests_before, "ac1output"), 1);
+    let blob_requests: Vec<_> = server.requests()[requests_before..]
+        .iter()
+        .filter(|(_, path)| path.contains("/blobs/"))
+        .cloned()
+        .collect();
+    assert!(
+        blob_requests
+            .iter()
+            .all(|(_, path)| !path.contains(&o.written.layer_digest)),
+        "the unchanged Output holder must not be re-downloaded: {blob_requests:?}"
+    );
+    assert!(
+        server.count() > requests_before,
+        "the refresh must really have talked to the registry"
+    );
+    assert_eq!(
+        create_invocations(&h),
+        creates,
+        "a refresh never creates a sandbox: {}",
+        h.msb_invocations()
+    );
+    // Calibrate the probe: a real build with the same marker must record its
+    // Docker invocation, so the refresh's silence above is evidence.
+    let build_archive = h.image(&ArchiveSpec {
+        marker: "ac1-docker-build".into(),
+        ..Default::default()
+    });
+    let build_tag = format!("{}/images:ac1docker", server.host);
+    let mut build = h.command();
+    build
+        .env("FAKE_DOCKER_ARCHIVE", &build_archive.written.path)
+        .env("FAKE_DOCKER_MARKER", &marker)
+        .args(["image", "build", "--tag", &build_tag]);
+    let built = bounded(build);
+    assert_eq!(built.status.code(), Some(0), "{}", stderr(&built));
+    assert!(
+        marker.exists(),
+        "the Docker probe must observe a real build invocation"
+    );
+}
+
+/// AC2: bare refresh includes an ambient selection that has never been prepared
+/// since the upgrade, refreshes a different recorded Boot and Output holder, and
+/// excludes a historical unheld approval. A project with no record at all is the
+/// first-use control.
+#[test]
+fn bare_refresh_includes_a_selection_never_prepared_since_upgrade() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let c = h.image(&ArchiveSpec {
+        marker: "ac2-c".into(),
+        ..Default::default()
+    });
+    let c_tag = format!("{}/images:ac2c", server.host);
+    let c_child = server.image("images", "ac2c", &c);
+    let b = h.image(&ArchiveSpec {
+        marker: "ac2-b".into(),
+        ..Default::default()
+    });
+    let b_tag = format!("{}/images:ac2b", server.host);
+    server.image("images", "ac2b", &b);
+    assert!(!h.launch(&b_tag).status.success());
+    let o = h.image(&ArchiveSpec {
+        marker: "ac2-o".into(),
+        ..Default::default()
+    });
+    let o_tag = format!("{}/images:ac2o", server.host);
+    server.image("images", "ac2o", &o);
+    let imported = h.import(&o.written.path, &o_tag);
+    assert_eq!(imported.status.code(), Some(0), "{}", stderr(&imported));
+    // A historical approval for U that no live role holds.
+    let u = h.image(&ArchiveSpec {
+        marker: "ac2-u".into(),
+        ..Default::default()
+    });
+    let u_tag = format!("{}/images:ac2u", server.host);
+    server.image("images", "ac2u", &u);
+    h.approve_ambient_fixture(&u_tag);
+    assert_eq!(roles_of(&h, &h.project, &u_tag), None, "U holds no role");
+    let u_record = h.record_in(&h.project, &u_tag).unwrap();
+
+    let before = server.count();
+    let scopes_before = h.pins_value().unwrap()["scopes"].clone();
+    let refresh = h.refresh_as_ambient(&c_tag);
+    assert_eq!(refresh.status.code(), Some(0), "{}", stderr(&refresh));
+    let text = stdout_of(&refresh);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 4, "{text}");
+    assert!(
+        lines[0].starts_with(&format!("==> refresh [1/3] {c_tag} (linux/"))
+            && lines[0].contains("approved none ->"),
+        "the never-prepared ambient selection comes first: {text}"
+    );
+    assert!(
+        lines[0].contains("default=unchanged"),
+        "an env selection establishes nothing: {text}"
+    );
+    assert!(
+        lines[1].starts_with("==> refresh [2/3] the recorded boot image (linux/"),
+        "{text}"
+    );
+    assert!(
+        lines[2].starts_with("==> refresh [3/3] the latest output image (linux/"),
+        "{text}"
+    );
+    assert_eq!(lines[3], "==> image refresh: 3 succeeded, 0 failed");
+    // C is approved as a new, unheld record; the historical U is untouched.
+    assert_eq!(
+        h.pin_in(&h.project, &c_tag).map(|(digest, _)| digest),
+        Some(digest_of(&c_child))
+    );
+    assert_eq!(roles_of(&h, &h.project, &c_tag), None);
+    assert_eq!(h.record_in(&h.project, &u_tag), Some(u_record));
+    assert_eq!(
+        manifest_requests(&server, before, "ac2u"),
+        0,
+        "U is not refreshed"
+    );
+    assert_eq!(
+        h.pins_value().unwrap()["scopes"].clone(),
+        scopes_before,
+        "refresh resolves no scope and claims no role"
+    );
+    // First-use control: no record at all, one ambient selection, one target.
+    let fresh = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let only = fresh.image(&ArchiveSpec {
+        marker: "ac2-only".into(),
+        ..Default::default()
+    });
+    let only_tag = format!("{}/images:ac2only", server.host);
+    let child = server.image("images", "ac2only", &only);
+    let refresh = fresh.refresh_as_ambient(&only_tag);
+    assert_eq!(refresh.status.code(), Some(0), "{}", stderr(&refresh));
+    let text = stdout_of(&refresh);
+    assert_eq!(text.lines().count(), 2, "{text}");
+    assert!(text.contains("==> refresh [1/1]"), "{text}");
+    assert_eq!(
+        fresh.pin_in(&fresh.project, &only_tag).map(|(d, _)| d),
+        Some(digest_of(&child))
+    );
+    assert_eq!(roles_of(&fresh, &fresh.project, &only_tag), None);
+}
+
+/// AC3: only this project's exact host platform (and variant) qualifies; a
+/// foreign project, a foreign architecture and a foreign variant are untouched,
+/// and the registry sees only the planned reference.
+#[test]
+fn bare_refresh_leaves_foreign_authority_unchanged() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let tag = format!("{}/images:ac3", server.host);
+    let child_a = server.image("images", "ac3", &a);
+    let p2 = h.project_at("ac3-other-project");
+    let peer = peer_state("ac3");
+    assert!(
+        h.refresh_as_ambient_in(&p2, peer.path(), &tag)
+            .status
+            .success(),
+        "the other project approves the same tag"
+    );
+    let foreign_project_record = h.record_in(&p2, &tag).unwrap();
+    h.approve_ambient_fixture(&tag);
+    let mine = h.record_in(&h.project, &tag).unwrap();
+    assert_eq!(mine["manifest_digest"], digest_of(&child_a));
+
+    // Two literal foreign-platform records for this same project: another
+    // architecture, and a variant of this architecture.
+    let arch = if image_archive::host_arch() == "arm64" {
+        "amd64"
+    } else {
+        "arm64"
+    };
+    let mut store: serde_json::Value =
+        serde_json::from_slice(&fs::read(h.pins()).unwrap()).unwrap();
+    let mut foreign_platform = mine.clone();
+    foreign_platform["platform"]["architecture"] = arch.into();
+    foreign_platform["manifest_digest"] = format!("sha256:{}", "c".repeat(64)).into();
+    foreign_platform["revision"] = 1.into();
+    let mut foreign_variant = mine.clone();
+    foreign_variant["platform"]["variant"] = "v8".into();
+    foreign_variant["manifest_digest"] = format!("sha256:{}", "d".repeat(64)).into();
+    foreign_variant["revision"] = 1.into();
+    store["pins"]
+        .as_array_mut()
+        .unwrap()
+        .extend([foreign_platform.clone(), foreign_variant.clone()]);
+    fs::write(h.pins(), serde_json::to_vec(&store).unwrap()).unwrap();
+    let before: serde_json::Value = serde_json::from_slice(&fs::read(h.pins()).unwrap()).unwrap();
+
+    // Move the tag and refresh in this project only.
+    let b = h.image(&ArchiveSpec {
+        marker: "ac3-b".into(),
+        ..Default::default()
+    });
+    let child_b = server.image("images", "ac3", &b);
+    let requests_before = server.count();
+    let refresh = h.refresh_as_ambient(&tag);
+    assert_eq!(refresh.status.code(), Some(0), "{}", stderr(&refresh));
+
+    let after: serde_json::Value = serde_json::from_slice(&fs::read(h.pins()).unwrap()).unwrap();
+    let record_for = |value: &serde_json::Value, project: &str, digest: &str| {
+        value["pins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["project"] == project && record["manifest_digest"] == digest)
+            .cloned()
+    };
+    // The invoking project's host-platform record moved.
+    assert_eq!(
+        h.pin_in(&h.project, &tag).map(|(digest, _)| digest),
+        Some(digest_of(&child_b))
+    );
+    // The foreign project, architecture and variant records are byte-identical.
+    for record in [&foreign_project_record, &foreign_platform, &foreign_variant] {
+        let project = record["project"].as_str().unwrap();
+        let digest = record["manifest_digest"].as_str().unwrap();
+        assert_eq!(
+            record_for(&before, project, digest),
+            record_for(&after, project, digest),
+            "a foreign record changed: {record}"
+        );
+    }
+    assert_eq!(
+        before["scopes"], after["scopes"],
+        "no scope was resolved or rewritten"
+    );
+    assert_eq!(before["defaults"], after["defaults"], "no default moved");
+    // The registry saw the planned reference only.
+    let requested = manifests_requested_since(&server, requests_before);
+    assert_eq!(requested, vec!["ac3".to_owned()], "{requested:?}");
+}
+
+/// AC4: `--image O` refreshes only the in-use Output reference. The ambient
+/// selection, the configuration, defaults, roles, the host record and
+/// `image show` are all unchanged, and a reference that is both Boot and Output
+/// holder is one target.
+#[test]
+fn targeted_refresh_updates_only_the_in_use_target() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec {
+        marker: "ac4-boot".into(),
+        ..Default::default()
+    });
+    let boot_tag = format!("{}/images:ac4boot", server.host);
+    server.image("images", "ac4boot", &a);
+    // A configured (not default-tier) Boot selection.
+    let dir = h.project.join(".agent-vm");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("config.toml"), format!("image = {boot_tag:?}\n")).unwrap();
+    assert!(!h.launch_default().status.success(), "the create fails");
+    assert_eq!(roles_of(&h, &h.project, &boot_tag).as_deref(), Some("boot"));
+
+    let o = h.image(&ArchiveSpec {
+        marker: "ac4-output".into(),
+        ..Default::default()
+    });
+    let output_tag = format!("{}/images:ac4output", server.host);
+    let output_o = server.image("images", "ac4output", &o);
+    let out = h.import(&o.written.path, &output_tag);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let config_bytes = fs::read(dir.join("config.toml")).unwrap();
+    let boot_record = h.record_in(&h.project, &boot_tag).unwrap();
+    let show_before = {
+        let mut cmd = h.command();
+        cmd.args(["image", "show"]);
+        bounded(cmd)
+    };
+    assert!(show_before.status.success());
+
+    // Both sources move upstream.
+    let b = h.image(&ArchiveSpec {
+        marker: "ac4-boot-b".into(),
+        ..Default::default()
+    });
+    server.image("images", "ac4boot", &b);
+    let o1 = h.image(&ArchiveSpec {
+        marker: "ac4-output-o1".into(),
+        ..Default::default()
+    });
+    let output_o1 = server.image("images", "ac4output", &o1);
+    assert_ne!(output_o, output_o1);
+
+    let requests_before = server.count();
+    let refresh = h.refresh(&output_tag);
+    assert_eq!(refresh.status.code(), Some(0), "{}", stderr(&refresh));
+    let text = stdout_of(&refresh);
+    assert!(text.contains("==> refresh [1/1]"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "changed {} -> {}; default=unchanged",
+            digest_of(&output_o),
+            digest_of(&output_o1)
+        )),
+        "{text}"
+    );
+    // Only the targeted reference was resolved.
+    assert_eq!(
+        manifests_requested_since(&server, requests_before),
+        vec!["ac4output".to_owned()]
+    );
+    // The ambient Boot holder, its record, the config and `image show` are
+    // exactly as they were; no host record or default appeared.
+    assert_eq!(
+        h.record_in(&h.project, &boot_tag),
+        Some(boot_record),
+        "the Boot holder is not a target of a filter"
+    );
+    assert_eq!(fs::read(dir.join("config.toml")).unwrap(), config_bytes);
+    assert!(h.host_record().is_none());
+    assert!(h.default_record_in(&h.project).is_none());
+    let show_after = {
+        let mut cmd = h.command();
+        cmd.args(["image", "show"]);
+        bounded(cmd)
+    };
+    assert_eq!(stdout_of(&show_after), stdout_of(&show_before));
+    assert_eq!(
+        roles_of(&h, &h.project, &output_tag).as_deref(),
+        Some("output")
+    );
+
+    // A reference that is both Boot and Output holder is one target.
+    let shared = h.image(&ArchiveSpec {
+        marker: "ac4-shared".into(),
+        ..Default::default()
+    });
+    let shared_tag = format!("{}/images:ac4shared", server.host);
+    let shared_a = server.image("images", "ac4shared", &shared);
+    assert!(!h.launch(&shared_tag).status.success());
+    let reimport = h.import(&shared.written.path, &shared_tag);
+    assert_eq!(reimport.status.code(), Some(0), "{}", stderr(&reimport));
+    assert_eq!(
+        roles_of(&h, &h.project, &shared_tag).as_deref(),
+        Some("boot-and-output")
+    );
+    let shared_b = h.image(&ArchiveSpec {
+        marker: "ac4-shared-b".into(),
+        ..Default::default()
+    });
+    let shared_child_b = server.image("images", "ac4shared", &shared_b);
+    let requests_before = server.count();
+    let refresh = h.refresh(&shared_tag);
+    assert_eq!(refresh.status.code(), Some(0), "{}", stderr(&refresh));
+    let text = stdout_of(&refresh);
+    assert!(
+        text.contains("==> refresh [1/1]") && !text.contains("[2/1]"),
+        "a shared key is one target: {text}"
+    );
+    assert_eq!(
+        manifest_requests(&server, requests_before, "ac4shared"),
+        1,
+        "{text}"
+    );
+    assert_eq!(
+        h.pin_in(&h.project, &shared_tag).map(|(digest, _)| digest),
+        Some(digest_of(&shared_child_b))
+    );
+    assert_eq!(
+        roles_of(&h, &h.project, &shared_tag).as_deref(),
+        Some("boot-and-output"),
+        "refresh preserves both held roles"
+    );
+    assert!(server.count() > requests_before);
+    let _ = shared_a;
+}
+
+/// AC5: a `--image` value that is not in use is refused with the exact
+/// value-free text, exit 1, no registry request and no authority write. A
+/// never-used reference, a retained unheld one and a foreign-project one are all
+/// nonmembers; a held one is the positive control.
+#[test]
+fn targeted_refresh_refuses_nonmembers_without_acquiring() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let fresh = h.image(&ArchiveSpec {
+        marker: "ac5-fresh".into(),
+        ..Default::default()
+    });
+    let fresh_tag = format!("{}/images:ac5fresh", server.host);
+    server.image("images", "ac5fresh", &fresh);
+
+    // (1) Never used anywhere: nothing can prove it is in use.
+    let out = h.refresh(&fresh_tag);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(stderr(&out).trim(), format!("Error: {NOT_A_MEMBER}"));
+    assert!(!h.pins().exists(), "a refused refresh writes nothing");
+
+    // (2) Retained but unheld: retention alone is not membership.
+    h.approve_ambient_fixture(&fresh_tag);
+    let retained = fs::read(h.pins()).unwrap();
+    let requests_before = server.count();
+    let out = h.refresh(&fresh_tag);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(stderr(&out).trim(), format!("Error: {NOT_A_MEMBER}"));
+    assert_eq!(fs::read(h.pins()).unwrap(), retained, "no authority write");
+    assert_eq!(server.count(), requests_before, "no registry request");
+
+    // (3) A reference that only another project holds: a **different** fresh
+    // reference with no record here at all, genuinely claimed as Boot there.
+    let foreign = h.image(&ArchiveSpec {
+        marker: "ac5-foreign".into(),
+        ..Default::default()
+    });
+    let foreign_tag = format!("{}/images:ac5foreign", server.host);
+    server.image("images", "ac5foreign", &foreign);
+    let p2 = h.project_at("ac5-other-project");
+    let peer = peer_state("ac5");
+    let mut setup = h.command_in(&p2, peer.path());
+    setup.args(["setup", "--image", &foreign_tag, "--no-verify"]);
+    let setup = bounded(setup);
+    assert_eq!(setup.status.code(), Some(0), "{}", stderr(&setup));
+    assert_eq!(
+        roles_of(&h, &p2, &foreign_tag).as_deref(),
+        Some("boot"),
+        "the other project really holds it"
+    );
+    assert!(
+        h.record_in(&h.project, &foreign_tag).is_none(),
+        "this project has no record for it at all"
+    );
+    let before = fs::read(h.pins()).unwrap();
+    let requests_before = server.count();
+    let out = h.refresh(&foreign_tag);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(stderr(&out).trim(), format!("Error: {NOT_A_MEMBER}"));
+    assert_eq!(fs::read(h.pins()).unwrap(), before);
+    assert_eq!(server.count(), requests_before);
+    assert_eq!(
+        roles_of(&h, &p2, &foreign_tag).as_deref(),
+        Some("boot"),
+        "the other project's holder is untouched"
+    );
+
+    // (4) Positive control: a recorded holder is a member.
+    let o = h.image(&ArchiveSpec {
+        marker: "ac5-output".into(),
+        ..Default::default()
+    });
+    let output_tag = format!("{}/images:ac5output", server.host);
+    let child = server.image("images", "ac5output", &o);
+    let imported = h.import(&o.written.path, &output_tag);
+    assert_eq!(imported.status.code(), Some(0), "{}", stderr(&imported));
+    let out = h.refresh(&output_tag);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(
+        h.pin_in(&h.project, &output_tag).map(|(digest, _)| digest),
+        Some(digest_of(&child))
+    );
+}
+
+/// AC6: `AGENT_VM_IMAGE_TAG` chooses the ambient boot reference and never
+/// restricts the worklist; `--image` narrows it; an empty value falls through to
+/// the configured tier; the same target through both inputs is one operation.
+#[test]
+fn refresh_env_selects_ambient_without_filtering_the_worklist() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    // Configured (not default-tier) Boot selection B.
+    let b = h.image(&ArchiveSpec {
+        marker: "ac6-b".into(),
+        ..Default::default()
+    });
+    let boot_tag = format!("{}/images:ac6boot", server.host);
+    let boot_b = server.image("images", "ac6boot", &b);
+    let dir = h.project.join(".agent-vm");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("config.toml"), format!("image = {boot_tag:?}\n")).unwrap();
+    assert!(!h.launch_default().status.success());
+    assert_eq!(roles_of(&h, &h.project, &boot_tag).as_deref(), Some("boot"));
+    // Output holder O.
+    let o = h.image(&ArchiveSpec {
+        marker: "ac6-o".into(),
+        ..Default::default()
+    });
+    let output_tag = format!("{}/images:ac6output", server.host);
+    server.image("images", "ac6output", &o);
+    assert_eq!(
+        h.import(&o.written.path, &output_tag).status.code(),
+        Some(0)
+    );
+    // Env-selected C.
+    let c = h.image(&ArchiveSpec {
+        marker: "ac6-c".into(),
+        ..Default::default()
+    });
+    let env_tag = format!("{}/images:ac6env", server.host);
+    server.image("images", "ac6env", &c);
+
+    // (1) Env C is the ambient operation; the recorded Boot B and Output O are
+    // still refreshed.
+    let requests_before = server.count();
+    let refresh = h.refresh_as_ambient(&env_tag);
+    assert_eq!(refresh.status.code(), Some(0), "{}", stderr(&refresh));
+    let text = stdout_of(&refresh);
+    assert_eq!(text.lines().count(), 4, "{text}");
+    assert!(
+        text.lines()
+            .next()
+            .unwrap()
+            .contains(&format!("[1/3] {env_tag}")),
+        "the env-selected reference is the ambient operation: {text}"
+    );
+    assert_eq!(manifest_requests(&server, requests_before, "ac6env"), 1);
+    assert_eq!(manifest_requests(&server, requests_before, "ac6boot"), 1);
+    assert_eq!(manifest_requests(&server, requests_before, "ac6output"), 1);
+
+    // (2) A typed output filter narrows to one target even though env selects C;
+    // the env selection does not mask or expand the filter.
+    let o1 = h.image(&ArchiveSpec {
+        marker: "ac6-o1".into(),
+        ..Default::default()
+    });
+    let output_o1 = server.image("images", "ac6output", &o1);
+    let mut command = h.command();
+    command
+        .env("AGENT_VM_IMAGE_TAG", &env_tag)
+        .args(["image", "refresh", "--image", &output_tag]);
+    let filtered = bounded(command);
+    assert_eq!(filtered.status.code(), Some(0), "{}", stderr(&filtered));
+    let text = stdout_of(&filtered);
+    assert_eq!(text.lines().count(), 2, "{text}");
+    assert!(text.contains("==> refresh [1/1]"), "{text}");
+    assert!(
+        text.contains(&digest_of(&output_o1)),
+        "the typed filter refreshed its own target: {text}"
+    );
+
+    // (3) An empty env value is unset, so the configured tier selects B.
+    let b1 = h.image(&ArchiveSpec {
+        marker: "ac6-b1".into(),
+        ..Default::default()
+    });
+    let boot_b1 = server.image("images", "ac6boot", &b1);
+    let requests_before = server.count();
+    let mut command = h.command();
+    command
+        .env("AGENT_VM_IMAGE_TAG", "")
+        .args(["image", "refresh"]);
+    let empty = bounded(command);
+    assert_eq!(empty.status.code(), Some(0), "{}", stderr(&empty));
+    let text = stdout_of(&empty);
+    assert!(
+        text.lines()
+            .next()
+            .unwrap()
+            .starts_with(&format!("==> refresh [1/2] {boot_tag} (linux/")),
+        "an empty env falls through to the configured selection: {text}"
+    );
+    assert!(
+        text.contains(&digest_of(&boot_b1)),
+        "the configured tier's moved content was refreshed: {text}"
+    );
+    assert_eq!(manifest_requests(&server, requests_before, "ac6env"), 0);
+
+    // (4) The same reference through env and `--image` is one operation.
+    let requests_before = server.count();
+    let mut command = h.command();
+    command
+        .env("AGENT_VM_IMAGE_TAG", &env_tag)
+        .args(["image", "refresh", "--image", &env_tag]);
+    let same = bounded(command);
+    assert_eq!(same.status.code(), Some(0), "{}", stderr(&same));
+    let text = stdout_of(&same);
+    assert!(text.contains("==> refresh [1/1]"), "{text}");
+    assert_eq!(manifest_requests(&server, requests_before, "ac6env"), 1);
+    let _ = (boot_b, o);
+}
+
+/// Two independent references with their own recorded roles, both served by the
+/// registry: the fixture the partial-progress and contention rows order against.
+struct TwoReferences {
+    boot_tag: String,
+    boot_child: String,
+    output_tag: String,
+    output_child: String,
+}
+
+impl TwoReferences {
+    /// Resolve Output first (so a later Boot claim may retire), then Boot: the
+    /// result is one Boot holder and one Output holder in this project, with
+    /// both sources served from the registry.
+    fn create(h: &Harness, server: &Server, prefix: &str) -> Self {
+        let o = h.image(&ArchiveSpec {
+            marker: format!("{prefix}-output"),
+            ..Default::default()
+        });
+        let output_tag = format!("{}/images:{prefix}out", server.host);
+        let output_child = server.image("images", &format!("{prefix}out"), &o);
+        let imported = h.import(&o.written.path, &output_tag);
+        assert_eq!(imported.status.code(), Some(0), "{}", stderr(&imported));
+
+        let b = h.image(&ArchiveSpec {
+            marker: format!("{prefix}-boot"),
+            ..Default::default()
+        });
+        let boot_tag = format!("{}/images:{prefix}boot", server.host);
+        let boot_child = server.image("images", &format!("{prefix}boot"), &b);
+        assert!(!h.launch(&boot_tag).status.success());
+        assert_eq!(roles_of(h, &h.project, &boot_tag).as_deref(), Some("boot"));
+        assert_eq!(
+            roles_of(h, &h.project, &output_tag).as_deref(),
+            Some("output")
+        );
+        Self {
+            boot_tag,
+            boot_child,
+            output_tag,
+            output_child,
+        }
+    }
+
+    /// Move both sources upstream and return their new children.
+    fn move_both(&self, server: &Server, prefix: &str) -> (String, String) {
+        let boot = self.move_boot(server, prefix);
+        let output = self.move_output(server, prefix);
+        (boot, output)
+    }
+
+    fn move_boot(&self, server: &Server, prefix: &str) -> String {
+        let b1 = Image::from_archive(
+            &std::env::temp_dir().join(format!("{prefix}-boot-b1.tar")),
+            &ArchiveSpec {
+                marker: format!("{prefix}-boot-b1"),
+                ..Default::default()
+            },
+        );
+        let boot_b1 = server.image("images", &format!("{prefix}boot"), &b1);
+        assert_ne!(boot_b1, self.boot_child);
+        boot_b1
+    }
+
+    fn move_output(&self, server: &Server, prefix: &str) -> String {
+        let o1 = Image::from_archive(
+            &std::env::temp_dir().join(format!("{prefix}-output-o1.tar")),
+            &ArchiveSpec {
+                marker: format!("{prefix}-output-o1"),
+                ..Default::default()
+            },
+        );
+        let output_o1 = server.image("images", &format!("{prefix}out"), &o1);
+        assert_ne!(output_o1, self.output_child);
+        output_o1
+    }
+}
+
+/// AC7 schedule A: a failed first target does not suppress a later commit. The
+/// first target's save is refused, then the second target really commits; only
+/// that commit's bytes survive and the failed record is untouched.
+#[test]
+fn refresh_partial_progress_survives_failure_in_either_order() {
+    // ---- schedule A: fail target 1, then commit target 2 ----
+    {
+        let h = Harness::new(Mode::LaunchSeam);
+        let server = Server::new();
+        let fixture = TwoReferences::create(&h, &server, "ac7a");
+        let (boot_b1, output_o1) = fixture.move_both(&server, "ac7a");
+        let boot_record = h.record_in(&h.project, &fixture.boot_tag).unwrap();
+        let config_dir_before = fs::read(config_dir(&h).join("image-pins.json")).unwrap();
+        let host_before = fs::read(h.home.join(".config/agent-vm/default-image.json")).ok();
+        let requests_before = server.count();
+
+        let mut gate = PinGate::new(h.root.path());
+        let mut command = refresh_as_ambient_command(&h, &fixture.boot_tag);
+        gate.attach(&mut command);
+        let mut child = command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn the gated refresh");
+        // Target 1 (Boot): fail its save, never committing it.
+        for stage in [
+            PinStage::CandidateReady,
+            PinStage::BeforePinLock,
+            PinStage::PinLocked,
+        ] {
+            expect_stage(&mut gate, stage, &mut child).reply(Reply::Continue);
+        }
+        expect_stage(&mut gate, PinStage::BeforePinSave, &mut child).reply(Reply::FailBeforeSave);
+        // Target 2 (Output) then runs: the next stage must be its candidate, so a
+        // committed target 1 would be a scheduling failure, not a silent pass.
+        for stage in [
+            PinStage::CandidateReady,
+            PinStage::BeforePinLock,
+            PinStage::PinLocked,
+            PinStage::BeforePinSave,
+        ] {
+            expect_stage(&mut gate, stage, &mut child).reply(Reply::Continue);
+        }
+        let committed = expect_stage(&mut gate, PinStage::PinCommitted, &mut child);
+        let snapshot = fs::read(h.pins()).unwrap();
+        committed.reply(Reply::Continue);
+        drop(gate);
+        let out = child.wait_with_output().expect("collect the refresh");
+
+        assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+        let text = stdout_of(&out);
+        assert!(
+            text.lines()
+                .next()
+                .unwrap()
+                .starts_with(&format!("==> refresh [1/2] {} (linux/", fixture.boot_tag))
+                && text.lines().next().unwrap().contains("failed"),
+            "{text}"
+        );
+        assert!(
+            text.lines()
+                .nth(1)
+                .unwrap()
+                .starts_with("==> refresh [2/2] the latest output image (linux/")
+                && text.lines().nth(1).unwrap().contains(&format!(
+                    "changed {} -> {}; default=unchanged",
+                    digest_of(&fixture.output_child),
+                    digest_of(&output_o1)
+                )),
+            "{text}"
+        );
+        assert_eq!(
+            text.lines().nth(2).unwrap(),
+            "==> image refresh: 1 succeeded, 1 failed"
+        );
+        // Only target 2's commit survives, byte for byte.
+        assert_eq!(fs::read(h.pins()).unwrap(), snapshot);
+        assert_eq!(
+            h.record_in(&h.project, &fixture.boot_tag),
+            Some(boot_record),
+            "the failed target's record and roles are unchanged"
+        );
+        assert_eq!(
+            h.pin_in(&h.project, &fixture.output_tag)
+                .map(|(digest, _)| digest),
+            Some(digest_of(&output_o1)),
+            "the successful target really committed"
+        );
+        assert!(h.host_record().is_none());
+        assert_eq!(
+            fs::read(config_dir(&h).join("image-pins.json")).unwrap(),
+            snapshot,
+            "final authority equals the captured postcommit snapshot"
+        );
+        assert!(
+            config_dir_before.len() != snapshot.len() || config_dir_before != snapshot,
+            "the fixture must really have changed something"
+        );
+        assert_eq!(host_before, None);
+        assert_eq!(manifest_requests(&server, requests_before, "ac7aboot"), 1);
+        assert_eq!(manifest_requests(&server, requests_before, "ac7aout"), 1);
+        let _ = boot_b1;
+    }
+
+    // ---- schedule B: commit target 1, then fail target 2 ----
+    {
+        let h = Harness::new(Mode::LaunchSeam);
+        let server = Server::new();
+        let fixture = TwoReferences::create(&h, &server, "ac7b");
+        let (boot_b1, _output_o1) = fixture.move_both(&server, "ac7b");
+        let output_record = h.record_in(&h.project, &fixture.output_tag).unwrap();
+        let requests_before = server.count();
+
+        let mut gate = PinGate::new(h.root.path());
+        let mut command = refresh_as_ambient_command(&h, &fixture.boot_tag);
+        gate.attach(&mut command);
+        let mut child = command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn the gated refresh");
+        for stage in [
+            PinStage::CandidateReady,
+            PinStage::BeforePinLock,
+            PinStage::PinLocked,
+            PinStage::BeforePinSave,
+        ] {
+            expect_stage(&mut gate, stage, &mut child).reply(Reply::Continue);
+        }
+        let committed = expect_stage(&mut gate, PinStage::PinCommitted, &mut child);
+        let boot_snapshot = fs::read(h.pins()).unwrap();
+        assert_eq!(
+            h.pin_in(&h.project, &fixture.boot_tag)
+                .map(|(digest, _)| digest),
+            Some(digest_of(&boot_b1)),
+            "the first target committed before its checkpoint"
+        );
+        committed.reply(Reply::Continue);
+        // Target 2's save is refused; it must never report a commit.
+        for stage in [
+            PinStage::CandidateReady,
+            PinStage::BeforePinLock,
+            PinStage::PinLocked,
+        ] {
+            expect_stage(&mut gate, stage, &mut child).reply(Reply::Continue);
+        }
+        expect_stage(&mut gate, PinStage::BeforePinSave, &mut child).reply(Reply::FailBeforeSave);
+        drop(gate);
+        let out = child.wait_with_output().expect("collect the refresh");
+
+        assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+        let text = stdout_of(&out);
+        assert!(
+            text.lines().next().unwrap().contains(&format!(
+                "changed {} -> {}",
+                digest_of(&fixture.boot_child),
+                digest_of(&boot_b1)
+            )),
+            "{text}"
+        );
+        assert!(
+            text.lines()
+                .nth(1)
+                .unwrap()
+                .starts_with("==> refresh [2/2] the latest output image (linux/")
+                && text.lines().nth(1).unwrap().contains("failed"),
+            "{text}"
+        );
+        assert_eq!(
+            text.lines().nth(2).unwrap(),
+            "==> image refresh: 1 succeeded, 1 failed"
+        );
+        // The successful first commit is intact and the failed second target's
+        // record is untouched.
+        assert_eq!(fs::read(h.pins()).unwrap(), boot_snapshot);
+        assert_eq!(
+            h.record_in(&h.project, &fixture.output_tag),
+            Some(output_record)
+        );
+        assert!(h.host_record().is_none());
+        assert_eq!(manifest_requests(&server, requests_before, "ac7bboot"), 1);
+        assert_eq!(manifest_requests(&server, requests_before, "ac7bout"), 1);
+    }
+}
+
+/// AC8: only the bare ambient default-tier target establishes a project default.
+/// A failed ambient target cannot be replaced by a successful Output target, an
+/// explicit filter never establishes, and the ADR-0067 D9 recommendation seed may
+/// survive its own failed pin save while the project stays unestablished.
+#[test]
+fn refresh_establishment_belongs_only_to_the_ambient_default_target() {
+    // (1) Success: the ambient default acquires and establishes in one save, with
+    // the Output holder refreshed independently and the suffix stated.
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let d = h.image(&ArchiveSpec {
+        marker: "ac8-default".into(),
+        ..Default::default()
+    });
+    let recommended = server.image("images", "ac8default", &d);
+    let o = h.image(&ArchiveSpec {
+        marker: "ac8-output".into(),
+        ..Default::default()
+    });
+    let output_tag = format!("{}/images:ac8output", server.host);
+    server.image("images", "ac8output", &o);
+    assert_eq!(
+        h.import(&o.written.path, &output_tag).status.code(),
+        Some(0)
+    );
+    let mut command = h.command();
+    command
+        .env("AGENT_VM_TEST_DEFAULT_IMAGE", &recommended)
+        .args(["image", "refresh"]);
+    let out = bounded(command);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let text = stdout_of(&out);
+    assert!(
+        text.lines().next().unwrap().contains("default=established"),
+        "{text}"
+    );
+    assert!(
+        h.default_record_in(&h.project).unwrap()["image"]
+            == serde_json::Value::String(recommended.clone()),
+        "the default tier established its own default"
+    );
+    assert_eq!(
+        h.pin_in(&h.project, &recommended).map(|(digest, _)| digest),
+        Some(digest_of(&recommended))
+    );
+
+    // (2) Failure: the ambient default's save is refused while Output succeeds;
+    // nothing establishes and the failed default keeps no approval.
+    let failed = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let d = failed.image(&ArchiveSpec {
+        marker: "ac8-fail".into(),
+        ..Default::default()
+    });
+    let recommended = server.image("images", "ac8fail", &d);
+    let o = failed.image(&ArchiveSpec {
+        marker: "ac8-fail-output".into(),
+        ..Default::default()
+    });
+    let output_tag = format!("{}/images:ac8failout", server.host);
+    server.image("images", "ac8failout", &o);
+    assert_eq!(
+        failed.import(&o.written.path, &output_tag).status.code(),
+        Some(0)
+    );
+    let mut gate = PinGate::new(failed.root.path());
+    let mut command = failed.command();
+    command
+        .env("AGENT_VM_TEST_DEFAULT_IMAGE", &recommended)
+        .args(["image", "refresh"]);
+    gate.attach(&mut command);
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the gated refresh");
+    for stage in [
+        PinStage::CandidateReady,
+        PinStage::BeforePinLock,
+        PinStage::PinLocked,
+        PinStage::BeforeDefaultSave,
+        PinStage::DefaultSaved,
+    ] {
+        expect_stage(&mut gate, stage, &mut child).reply(Reply::Continue);
+    }
+    expect_stage(&mut gate, PinStage::BeforePinSave, &mut child).reply(Reply::FailBeforeSave);
+    for stage in [
+        PinStage::CandidateReady,
+        PinStage::BeforePinLock,
+        PinStage::PinLocked,
+    ] {
+        expect_stage(&mut gate, stage, &mut child).reply(Reply::Continue);
+    }
+    drop(gate);
+    let out = child.wait_with_output().expect("collect the refresh");
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let text = stdout_of(&out);
+    assert!(
+        text.contains("==> image refresh: 1 succeeded, 1 failed"),
+        "{text}"
+    );
+    assert!(
+        failed.default_record_in(&failed.project).is_none(),
+        "a successful Output target cannot establish in the default's place: {text}"
+    );
+    assert!(
+        failed.pin_in(&failed.project, &recommended).is_none(),
+        "the failed default target kept no approval"
+    );
+    // D9: the recommendation seed was written before the failed pin save.
+    assert_eq!(
+        failed.host_record().unwrap()["image"],
+        serde_json::Value::String(recommended.clone()),
+        "the documented host-first seed survives its own failed pin save"
+    );
+    assert!(roles_of(&failed, &failed.project, &output_tag).as_deref() == Some("output"));
+
+    // (3) An explicit filter never establishes, even when it equals the ambient
+    // default: the `--image` value is refreshed as content only.
+    let explicit = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let d = explicit.image(&ArchiveSpec {
+        marker: "ac8-explicit".into(),
+        ..Default::default()
+    });
+    let recommended = server.image("images", "ac8explicit", &d);
+    let mut command = explicit.command();
+    command
+        .env("AGENT_VM_TEST_DEFAULT_IMAGE", &recommended)
+        .args(["image", "refresh", "--image", &recommended]);
+    let out = bounded(command);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(
+        stdout_of(&out).contains("default=unchanged"),
+        "{}",
+        stdout_of(&out)
+    );
+    assert!(
+        explicit.default_record_in(&explicit.project).is_none(),
+        "explicit --image, even equal to the default, establishes nothing"
+    );
+    assert!(explicit.host_record().is_none(), "and seeds no host record");
+}
+
+/// Establish this project's default from the initial recommendation without
+/// claiming any role, and return the recommended (immutable) child.
+fn establish_default_unheld(h: &Harness, server: &Server, prefix: &str) -> String {
+    let d = h.image(&ArchiveSpec {
+        marker: format!("{prefix}-d"),
+        ..Default::default()
+    });
+    let recommended = server.image("images", &format!("{prefix}d"), &d);
+    let mut command = h.command();
+    command
+        .env("AGENT_VM_TEST_DEFAULT_IMAGE", &recommended)
+        .args(["image", "refresh"]);
+    let out = bounded(command);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(
+        h.default_record_in(&h.project).unwrap()["image"],
+        serde_json::Value::String(recommended.clone())
+    );
+    assert_eq!(
+        roles_of(h, &h.project, &recommended),
+        None,
+        "no role claimed"
+    );
+    recommended
+}
+
+/// The digest-spelled manifest route for an immutable child reference.
+fn digest_route(child: &str) -> String {
+    format!("/v2/images/manifests/{}", digest_of(child))
+}
+
+/// AC9: adoption supersedes an unheld project default without acquiring it: H is
+/// acquired once, D gets no registry request at all, and the bookmark moves.
+#[test]
+fn refresh_adoption_supersedes_an_unheld_default_without_acquiring_it() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let default_child = establish_default_unheld(&h, &server, "ac9super");
+    let h_image = h.image(&ArchiveSpec {
+        marker: "ac9super-h".into(),
+        ..Default::default()
+    });
+    let host_tag = format!("{}/images:ac9superh", server.host);
+    let host_child = server.image("images", "ac9superh", &h_image);
+    assert!(set_default(&h, &host_tag).status.success());
+    assert_eq!(
+        h.host_record().unwrap()["image"],
+        serde_json::Value::String(host_child.clone())
+    );
+
+    // D's registry route disappears: a refresh of D would now fail, so a passing
+    // run proves D was not attempted.
+    server.remove(&digest_route(&default_child));
+    let requests_before = server.count();
+    let host_before = fs::read(h.home.join(".config/agent-vm/default-image.json")).unwrap();
+    let out = h.refresh_default();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let text = stdout_of(&out);
+    let rows = rows_of(&out);
+    assert_eq!(rows.len(), 2, "{text}");
+    assert!(
+        rows[0].starts_with("==> refresh [1/1] the default boot image (linux/"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "approved none -> {}; default=adopted {} -> {}",
+            digest_of(&host_child),
+            digest_of(&default_child),
+            digest_of(&host_child)
+        )),
+        "{text}"
+    );
+    assert_eq!(rows[1], "==> image refresh: 1 succeeded, 0 failed");
+    assert!(
+        text.lines().next().unwrap() == "==> this project now uses the host's default boot image",
+        "the adoption notice precedes the row: {text}"
+    );
+    // The bookmark moved, H is unheld, and D was never resolved.
+    assert_eq!(
+        h.default_record_in(&h.project).unwrap()["image"],
+        serde_json::Value::String(host_child.clone())
+    );
+    assert_eq!(roles_of(&h, &h.project, &host_child), None);
+    assert_eq!(
+        manifest_requests(&server, requests_before, &digest_of(&default_child)),
+        0,
+        "unheld D is not re-resolved"
+    );
+    assert_eq!(
+        manifest_requests(&server, requests_before, &digest_of(&host_child)),
+        1,
+        "H is resolved once"
+    );
+    assert_eq!(
+        fs::read(h.home.join(".config/agent-vm/default-image.json")).unwrap(),
+        host_before,
+        "adoption never replaces the host record"
+    );
+}
+
+/// AC9: H is deduplicated with a holder, a held old default is refreshed
+/// independently after adoption, and all roles survive.
+#[test]
+fn refresh_adoption_deduplicates_the_offer_and_preserves_old_holders() {
+    // (a) Held D and a different H: Adopt(H) then Content(D).
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let default_child = establish_default_unheld(&h, &server, "ac9held");
+    assert!(!h.launch(&default_child).status.success());
+    assert_eq!(
+        roles_of(&h, &h.project, &default_child).as_deref(),
+        Some("boot"),
+        "D is held"
+    );
+    let h_image = h.image(&ArchiveSpec {
+        marker: "ac9held-h".into(),
+        ..Default::default()
+    });
+    let host_tag = format!("{}/images:ac9heldh", server.host);
+    let host_child = server.image("images", "ac9heldh", &h_image);
+    assert!(set_default(&h, &host_tag).status.success());
+    let scopes_before = h.pins_value().unwrap()["scopes"].clone();
+    let requests_before = server.count();
+
+    let out = h.refresh_default();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let text = stdout_of(&out);
+    let rows = rows_of(&out);
+    assert_eq!(rows.len(), 3, "{text}");
+    assert!(
+        rows[0].contains(&format!(
+            "default=adopted {} -> {}",
+            digest_of(&default_child),
+            digest_of(&host_child)
+        )),
+        "{text}"
+    );
+    assert!(
+        rows[1].starts_with("==> refresh [2/2] the recorded boot image (linux/"),
+        "the still-held old default is refreshed independently: {text}"
+    );
+    assert!(rows[1].contains("unchanged"), "{text}");
+    assert_eq!(
+        manifest_requests(&server, requests_before, &digest_of(&host_child)),
+        1
+    );
+    assert_eq!(
+        manifest_requests(&server, requests_before, &digest_of(&default_child)),
+        1
+    );
+    assert_eq!(
+        h.default_record_in(&h.project).unwrap()["image"],
+        serde_json::Value::String(host_child.clone())
+    );
+    assert_eq!(
+        roles_of(&h, &h.project, &default_child).as_deref(),
+        Some("boot"),
+        "the old holder keeps its role"
+    );
+    assert_eq!(roles_of(&h, &h.project, &host_child), None);
+    assert_eq!(h.pins_value().unwrap()["scopes"].clone(), scopes_before);
+
+    // (b) H is already the Boot holder and D is unheld: one Adopt target for H
+    // (never a second Content one), plus the independent Output holder.
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let default_child = establish_default_unheld(&h, &server, "ac9dedupe");
+    let h_image = h.image(&ArchiveSpec {
+        marker: "ac9dedupe-h".into(),
+        ..Default::default()
+    });
+    let host_tag = format!("{}/images:ac9dedupeh", server.host);
+    let host_child = server.image("images", "ac9dedupeh", &h_image);
+    assert!(set_default(&h, &host_tag).status.success());
+    let mut setup_command = h.command();
+    // H is the immutable reference the host record names, so the Boot claim must
+    // be made for exactly that key (the adoption target's key).
+    setup_command.args(["setup", "--image", &host_child, "--no-verify"]);
+    let setup = bounded(setup_command);
+    assert_eq!(setup.status.code(), Some(0), "{}", stderr(&setup));
+    assert_eq!(
+        roles_of(&h, &h.project, &host_child).as_deref(),
+        Some("boot"),
+        "H holds Boot"
+    );
+    let o = h.image(&ArchiveSpec {
+        marker: "ac9dedupe-o".into(),
+        ..Default::default()
+    });
+    let output_tag = format!("{}/images:ac9dedupeo", server.host);
+    let output_child = server.image("images", "ac9dedupeo", &o);
+    assert_eq!(
+        h.import(&o.written.path, &output_tag).status.code(),
+        Some(0)
+    );
+
+    let requests_before = server.count();
+    let out = h.refresh_default();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let text = stdout_of(&out);
+    let rows = rows_of(&out);
+    assert_eq!(rows.len(), 3, "two operations: {text}");
+    assert!(
+        rows[0].contains("[1/2] the default boot image"),
+        "H is the ambient operation: {text}"
+    );
+    assert!(
+        rows[1].starts_with("==> refresh [2/2] the latest output image (linux/")
+            && rows[1].contains(&digest_of(&output_child)),
+        "{text}"
+    );
+    // H is acquired once, not once as adoption plus once as holder.
+    assert_eq!(
+        manifest_requests(&server, requests_before, &digest_of(&host_child)),
+        1,
+        "{text}"
+    );
+    assert_eq!(
+        roles_of(&h, &h.project, &host_child).as_deref(),
+        Some("boot"),
+        "H keeps its Boot role"
+    );
+    assert_eq!(
+        h.default_record_in(&h.project).unwrap()["image"],
+        serde_json::Value::String(host_child.clone())
+    );
+    assert_eq!(
+        roles_of(&h, &h.project, &output_tag).as_deref(),
+        Some("output")
+    );
+    // The Output claim resolved the second slot, so S3's retirement rule removes
+    // the now-provably-unused old default; refresh itself never retires.
+    assert!(
+        h.pin_in(&h.project, &default_child).is_none(),
+        "the unheld old default was retired by the Output claim, not by refresh"
+    );
+}
+
+/// AC9/AC14: a successful adoption is not undone by a later failure on the old
+/// default, and exit 1 can therefore accompany a moved project default.
+#[test]
+fn refresh_adoption_success_survives_held_default_failure() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let default_child = establish_default_unheld(&h, &server, "ac9after");
+    assert!(!h.launch(&default_child).status.success());
+    assert_eq!(
+        roles_of(&h, &h.project, &default_child).as_deref(),
+        Some("boot")
+    );
+    let h_image = h.image(&ArchiveSpec {
+        marker: "ac9after-h".into(),
+        ..Default::default()
+    });
+    let host_tag = format!("{}/images:ac9afterh", server.host);
+    let host_child = server.image("images", "ac9afterh", &h_image);
+    assert!(set_default(&h, &host_tag).status.success());
+    let host_before = fs::read(h.home.join(".config/agent-vm/default-image.json")).unwrap();
+    // The old default's route now fails, so its own refresh must fail.
+    server.deny_manifest(&digest_route(&default_child));
+
+    let mut gate = PinGate::new(h.root.path());
+    let mut command = h.command();
+    command.args(["image", "refresh"]);
+    gate.attach(&mut command);
+    let child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the gated refresh");
+    for stage in [
+        PinStage::CandidateReady,
+        PinStage::BeforePinLock,
+        PinStage::PinLocked,
+        PinStage::BeforePinSave,
+    ] {
+        gate.expect(stage).reply(Reply::Continue);
+    }
+    let committed = gate.expect(PinStage::PinCommitted);
+    let adoption_snapshot = fs::read(h.pins()).unwrap();
+    assert_eq!(
+        h.default_record_in(&h.project).unwrap()["image"],
+        serde_json::Value::String(host_child.clone()),
+        "the adoption committed before its checkpoint"
+    );
+    committed.reply(Reply::Continue);
+    drop(gate);
+    let out = child.wait_with_output().expect("collect the refresh");
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let text = stdout_of(&out);
+    let rows = rows_of(&out);
+    assert!(
+        rows[0].contains("[1/2] the default boot image")
+            && rows[0].contains(&format!(
+                "default=adopted {} -> {}",
+                digest_of(&default_child),
+                digest_of(&host_child)
+            )),
+        "{text}"
+    );
+    assert!(
+        rows[1].starts_with("==> refresh [2/2] the recorded boot image (linux/")
+            && rows[1].contains("failed"),
+        "{text}"
+    );
+    assert_eq!(rows[2], "==> image refresh: 1 succeeded, 1 failed");
+    assert_eq!(
+        fs::read(h.pins()).unwrap(),
+        adoption_snapshot,
+        "the failed old-default target changed nothing"
+    );
+    assert_eq!(
+        h.default_record_in(&h.project).unwrap()["image"],
+        serde_json::Value::String(host_child.clone()),
+        "the project default stays H"
+    );
+    assert_eq!(
+        fs::read(h.home.join(".config/agent-vm/default-image.json")).unwrap(),
+        host_before,
+        "the host record is untouched"
+    );
+}
+
+/// AC9/AC14: a failed adoption does not suppress a later, independent success of
+/// the still-selected held default, which stays the project default.
+#[test]
+fn refresh_adoption_failure_allows_held_default_success() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let d = h.image(&ArchiveSpec {
+        marker: "ac9fails-d".into(),
+        ..Default::default()
+    });
+    let default_child = server.image("images", "ac9failsd", &d);
+    // A default-tier launch establishes D *and* claims its Boot role.
+    assert!(!h.launch_on_recommendation(&default_child).status.success());
+    assert_eq!(
+        h.default_record_in(&h.project).unwrap()["image"],
+        serde_json::Value::String(default_child.clone())
+    );
+    assert_eq!(
+        roles_of(&h, &h.project, &default_child).as_deref(),
+        Some("boot")
+    );
+    let h_image = h.image(&ArchiveSpec {
+        marker: "ac9fails-h".into(),
+        ..Default::default()
+    });
+    let host_tag = format!("{}/images:ac9failsh", server.host);
+    let host_child = server.image("images", "ac9failsh", &h_image);
+    assert!(set_default(&h, &host_tag).status.success());
+
+    let mut gate = PinGate::new(h.root.path());
+    let mut command = h.command();
+    command.args(["image", "refresh"]);
+    gate.attach(&mut command);
+    let child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the gated refresh");
+    for stage in [
+        PinStage::CandidateReady,
+        PinStage::BeforePinLock,
+        PinStage::PinLocked,
+    ] {
+        gate.expect(stage).reply(Reply::Continue);
+    }
+    gate.expect(PinStage::BeforePinSave)
+        .reply(Reply::FailBeforeSave);
+    // D then resolves its own approved child and confirms it unchanged.
+    for stage in [
+        PinStage::CandidateReady,
+        PinStage::BeforePinLock,
+        PinStage::PinLocked,
+    ] {
+        gate.expect(stage).reply(Reply::Continue);
+    }
+    drop(gate);
+    let out = child.wait_with_output().expect("collect the refresh");
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let text = stdout_of(&out);
+    let rows = rows_of(&out);
+    assert!(
+        rows[0].contains("[1/2] the default boot image") && rows[0].contains("failed"),
+        "{text}"
+    );
+    assert!(
+        rows[1].starts_with("==> refresh [2/2] the recorded boot image (linux/")
+            && rows[1].contains(&format!("unchanged {}", digest_of(&default_child))),
+        "{text}"
+    );
+    assert_eq!(rows[2], "==> image refresh: 1 succeeded, 1 failed");
+    assert!(
+        h.pin_in(&h.project, &host_child).is_none(),
+        "the refused adoption inserted no H approval"
+    );
+    assert_eq!(
+        h.default_record_in(&h.project).unwrap()["image"],
+        serde_json::Value::String(default_child.clone()),
+        "the bookmark is still D"
+    );
+    assert_eq!(
+        roles_of(&h, &h.project, &default_child).as_deref(),
+        Some("boot")
+    );
+}
+
+/// The exact command-level error a malformed host record produces.
+fn damaged_host_error(h: &Harness) -> String {
+    format!(
+        "boot-image selection {} is not a valid version 1 digest record; restore the intended \
+         digest record from backup, or deliberately move it aside to reinitialize from the \
+         current recommendation",
+        h.home.join(".config/agent-vm/default-image.json").display()
+    )
+}
+
+/// AC9/AC12: with an established default, a malformed host record refuses the
+/// whole unfiltered command before any registry request or write, prints no
+/// target rows, and a filtered held reference still works.
+#[test]
+fn unfiltered_refresh_refuses_a_damaged_host_with_established_default() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let d = h.image(&ArchiveSpec {
+        marker: "ac12est-d".into(),
+        ..Default::default()
+    });
+    let default_child = server.image("images", "ac12estd", &d);
+    assert!(!h.launch_on_recommendation(&default_child).status.success());
+    let o = h.image(&ArchiveSpec {
+        marker: "ac12est-o".into(),
+        ..Default::default()
+    });
+    let output_tag = format!("{}/images:ac12estout", server.host);
+    let output_child = server.image("images", "ac12estout", &o);
+    assert_eq!(
+        h.import(&o.written.path, &output_tag).status.code(),
+        Some(0)
+    );
+    let o1 = h.image(&ArchiveSpec {
+        marker: "ac12est-o1".into(),
+        ..Default::default()
+    });
+    let output_o1 = server.image("images", "ac12estout", &o1);
+
+    let host_path = h.home.join(".config/agent-vm/default-image.json");
+    fs::write(&host_path, b"not a digest record\n").unwrap();
+    let snapshot = |h: &Harness| {
+        (
+            fs::read(h.pins()).unwrap(),
+            fs::read(h.home.join(".config/agent-vm/default-image.json")).unwrap(),
+            fs::read(h.home.join(".config/agent-vm/config.toml")).ok(),
+        )
+    };
+    let before = snapshot(&h);
+    let requests_before = server.count();
+    let out = h.refresh_default();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(
+        stderr(&out).trim(),
+        format!("Error: {}", damaged_host_error(&h))
+    );
+    assert_eq!(
+        stdout_of(&out),
+        "",
+        "a pre-freeze refusal prints no target rows or summary"
+    );
+    assert_eq!(
+        server.count(),
+        requests_before,
+        "no registry request at all"
+    );
+    assert_eq!(snapshot(&h), before, "no authority, host or config write");
+
+    // A filtered held Output needs no host-default read and still refreshes.
+    let out = h.refresh(&output_tag);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(
+        stdout_of(&out).contains(&format!(
+            "changed {} -> {}",
+            digest_of(&output_child),
+            digest_of(&output_o1)
+        )),
+        "{}",
+        stdout_of(&out)
+    );
+    assert_eq!(
+        fs::read(&host_path).unwrap(),
+        b"not a digest record\n",
+        "the filtered refresh left the damaged host record alone"
+    );
+    let _ = output_child;
+}
+
+/// AC9/AC12: with no project default the malformed host record refuses the
+/// unfiltered command before a BootImage exists; a filtered held reference still
+/// works without a default or host read.
+#[test]
+fn unfiltered_refresh_refuses_a_damaged_host_without_project_default() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let o = h.image(&ArchiveSpec {
+        marker: "ac12unest-o".into(),
+        ..Default::default()
+    });
+    let output_tag = format!("{}/images:ac12unestout", server.host);
+    let output_child = server.image("images", "ac12unestout", &o);
+    assert_eq!(
+        h.import(&o.written.path, &output_tag).status.code(),
+        Some(0)
+    );
+    let o1 = h.image(&ArchiveSpec {
+        marker: "ac12unest-o1".into(),
+        ..Default::default()
+    });
+    let output_o1 = server.image("images", "ac12unestout", &o1);
+    assert!(h.default_record_in(&h.project).is_none());
+
+    let host_path = h.home.join(".config/agent-vm/default-image.json");
+    fs::write(&host_path, b"{ not even json }\n").unwrap();
+    let pins_before = fs::read(h.pins()).unwrap();
+    let requests_before = server.count();
+    let out = h.refresh_default();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(
+        stderr(&out).trim(),
+        format!("Error: {}", damaged_host_error(&h))
+    );
+    assert_eq!(stdout_of(&out), "", "no fabricated ambient target");
+    assert_eq!(
+        server.count(),
+        requests_before,
+        "Output is not attempted either"
+    );
+    assert_eq!(fs::read(h.pins()).unwrap(), pins_before);
+    assert!(h.default_record_in(&h.project).is_none());
+
+    let out = h.refresh(&output_tag);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(
+        stdout_of(&out).contains(&digest_of(&output_o1)),
+        "{}",
+        stdout_of(&out)
+    );
+    assert_eq!(fs::read(&host_path).unwrap(), b"{ not even json }\n");
+    let _ = output_child;
+}
+
+/// AC7/AC9: a post-freeze acquisition failure is an operation row, not a
+/// command-level refusal: the independent recorded Output commits, the failing
+/// transaction is unchanged, and the status is 1.
+#[test]
+fn refresh_default_failures_do_not_block_recorded_output() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let d = h.image(&ArchiveSpec {
+        marker: "ac7fail-d".into(),
+        ..Default::default()
+    });
+    let default_child = server.image("images", "ac7faild", &d);
+    assert!(!h.launch_on_recommendation(&default_child).status.success());
+    let o = h.image(&ArchiveSpec {
+        marker: "ac7fail-o".into(),
+        ..Default::default()
+    });
+    let output_tag = format!("{}/images:ac7failout", server.host);
+    let output_child = server.image("images", "ac7failout", &o);
+    assert_eq!(
+        h.import(&o.written.path, &output_tag).status.code(),
+        Some(0)
+    );
+    let o1 = h.image(&ArchiveSpec {
+        marker: "ac7fail-o1".into(),
+        ..Default::default()
+    });
+    let output_o1 = server.image("images", "ac7failout", &o1);
+    let default_record = h.record_in(&h.project, &default_child).unwrap();
+    let default_bytes = fs::read(h.pins()).unwrap();
+
+    // The ambient operation's own source becomes unavailable after the freeze.
+    server.remove(&digest_route(&default_child));
+    let out = h.refresh_default();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let text = stdout_of(&out);
+    assert_eq!(text.lines().count(), 3, "{text}");
+    assert!(
+        text.lines()
+            .next()
+            .unwrap()
+            .starts_with("==> refresh [1/2] the default boot image (linux/")
+            && text.lines().next().unwrap().contains("failed"),
+        "{text}"
+    );
+    assert!(
+        text.lines()
+            .nth(1)
+            .unwrap()
+            .starts_with("==> refresh [2/2] the latest output image (linux/")
+            && text.lines().nth(1).unwrap().contains(&format!(
+                "changed {} -> {}",
+                digest_of(&output_child),
+                digest_of(&output_o1)
+            )),
+        "{text}"
+    );
+    assert_eq!(
+        text.lines().nth(2).unwrap(),
+        "==> image refresh: 1 succeeded, 1 failed"
+    );
+    assert_eq!(
+        h.record_in(&h.project, &default_child),
+        Some(default_record),
+        "the failing operation's approval and roles are unchanged"
+    );
+    assert_eq!(
+        h.pin_in(&h.project, &output_tag).map(|(digest, _)| digest),
+        Some(digest_of(&output_o1)),
+        "the sibling really committed"
+    );
+    assert_ne!(fs::read(h.pins()).unwrap(), default_bytes);
+    assert!(h.host_record().is_some(), "the host record is unchanged");
+}
+
+/// AC10: an observed H that a peer retires before the adoption's save is stale:
+/// it is never reinserted, the bookmark does not move, and the unrelated sibling
+/// still commits.
+#[test]
+fn refresh_adoption_rejects_a_retired_observed_host_pin() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let default_child = establish_default_unheld(&h, &server, "ac10ret");
+    // H is this project's Boot holder, at its immutable key.
+    let h_image = h.image(&ArchiveSpec {
+        marker: "ac10ret-h".into(),
+        ..Default::default()
+    });
+    let host_tag = format!("{}/images:ac10reth", server.host);
+    let host_child = server.image("images", "ac10reth", &h_image);
+    let mut setup = h.command();
+    setup.args(["setup", "--image", &host_child, "--no-verify"]);
+    assert_eq!(bounded(setup).status.code(), Some(0));
+    assert_eq!(
+        roles_of(&h, &h.project, &host_child).as_deref(),
+        Some("boot")
+    );
+    // The host bookmark names H, so the ambient operation is an adoption of it.
+    assert!(set_default(&h, &host_tag).status.success());
+    assert_eq!(
+        h.host_record().unwrap()["image"],
+        serde_json::Value::String(host_child.clone())
+    );
+    // O is an unrelated Output holder that will move.
+    let o = h.image(&ArchiveSpec {
+        marker: "ac10ret-o".into(),
+        ..Default::default()
+    });
+    let output_tag = format!("{}/images:ac10retout", server.host);
+    let output_child = server.image("images", "ac10retout", &o);
+    assert_eq!(
+        h.import(&o.written.path, &output_tag).status.code(),
+        Some(0)
+    );
+    let o1 = h.image(&ArchiveSpec {
+        marker: "ac10ret-o1".into(),
+        ..Default::default()
+    });
+    let output_o1 = server.image("images", "ac10retout", &o1);
+
+    let mut gate = PinGate::new(h.root.path());
+    let mut command = h.command();
+    command.args(["image", "refresh"]);
+    gate.attach(&mut command);
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the gated refresh");
+    expect_stage(&mut gate, PinStage::CandidateReady, &mut child).reply(Reply::Continue);
+    let before_lock = expect_stage(&mut gate, PinStage::BeforePinLock, &mut child);
+
+    // The peer claims Boot for a new reference R, which retires H (converted to no
+    // net change: Output is resolved, so both of H's slots are known-absent).
+    let r = h.image(&ArchiveSpec {
+        marker: "ac10ret-r".into(),
+        ..Default::default()
+    });
+    let r_tag = format!("{}/images:ac10retr", server.host);
+    server.image("images", "ac10retr", &r);
+    let mut peer = h.command_in(&h.project, &h.state);
+    peer.args(["setup", "--image", &r_tag, "--no-verify"]);
+    let peer_out = bounded(peer);
+    assert_eq!(peer_out.status.code(), Some(0), "{}", stderr(&peer_out));
+    assert!(
+        h.pin_in(&h.project, &host_child).is_none(),
+        "the peer retired H"
+    );
+    assert_eq!(roles_of(&h, &h.project, &r_tag).as_deref(), Some("boot"));
+    assert_eq!(
+        h.default_record_in(&h.project).unwrap()["image"],
+        serde_json::Value::String(default_child.clone()),
+        "the peer moved no bookmark"
+    );
+    let peer_bytes = fs::read(h.pins()).unwrap();
+
+    before_lock.reply(Reply::Continue);
+    // H vanished: the adoption takes its lock, decides stale, and writes nothing.
+    expect_stage(&mut gate, PinStage::PinLocked, &mut child).reply(Reply::Continue);
+    // The sibling Output target then runs from its own frozen candidate.
+    expect_stage(&mut gate, PinStage::CandidateReady, &mut child).reply(Reply::Continue);
+    let sibling_lock = expect_stage(&mut gate, PinStage::BeforePinLock, &mut child);
+    assert_eq!(
+        fs::read(h.pins()).unwrap(),
+        peer_bytes,
+        "the stale adoption changed nothing before the sibling ran"
+    );
+    sibling_lock.reply(Reply::Continue);
+    for stage in [
+        PinStage::PinLocked,
+        PinStage::BeforePinSave,
+        PinStage::PinCommitted,
+    ] {
+        expect_stage(&mut gate, stage, &mut child).reply(Reply::Continue);
+    }
+    drop(gate);
+    let out = child.wait_with_output().expect("collect the refresh");
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let text = stdout_of(&out);
+    let rows = rows_of(&out);
+    assert!(
+        rows[0].contains("[1/2] the default boot image")
+            && rows[0].contains("failed")
+            && rows[0].contains("image approval is stale; retry the explicit operation"),
+        "{text}"
+    );
+    assert!(
+        rows[1].starts_with("==> refresh [2/2] the latest output image (linux/")
+            && rows[1].contains(&format!(
+                "changed {} -> {}",
+                digest_of(&output_child),
+                digest_of(&output_o1)
+            )),
+        "{text}"
+    );
+    assert_eq!(rows[2], "==> image refresh: 1 succeeded, 1 failed");
+    // H is still absent, the peer's R records survive, and the bookmark is D.
+    assert!(
+        h.pin_in(&h.project, &host_child).is_none(),
+        "no resurrection"
+    );
+    assert_eq!(roles_of(&h, &h.project, &r_tag).as_deref(), Some("boot"));
+    assert_eq!(
+        h.default_record_in(&h.project).unwrap()["image"],
+        serde_json::Value::String(default_child.clone())
+    );
+    assert_eq!(
+        h.pin_in(&h.project, &output_tag).map(|(digest, _)| digest),
+        Some(digest_of(&output_o1))
+    );
+    assert_eq!(
+        h.host_record().unwrap()["image"],
+        serde_json::Value::String(host_child.clone()),
+        "the host record is never rewritten by adoption"
+    );
+}
+
+/// AC10: a genuinely absent H is inserted (never treated as a retired one), the
+/// bookmark moves in the same save, and an unrelated peer change is preserved.
+#[test]
+fn refresh_adoption_inserts_a_genuinely_absent_host_pin() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let default_child = establish_default_unheld(&h, &server, "ac10ins");
+    let h_image = h.image(&ArchiveSpec {
+        marker: "ac10ins-h".into(),
+        ..Default::default()
+    });
+    let host_tag = format!("{}/images:ac10insh", server.host);
+    let host_child = server.image("images", "ac10insh", &h_image);
+    assert!(set_default(&h, &host_tag).status.success());
+    assert!(
+        h.pin_in(&h.project, &host_child).is_none(),
+        "H was never pinned"
+    );
+    let o = h.image(&ArchiveSpec {
+        marker: "ac10ins-o".into(),
+        ..Default::default()
+    });
+    let output_tag = format!("{}/images:ac10insout", server.host);
+    server.image("images", "ac10insout", &o);
+    assert_eq!(
+        h.import(&o.written.path, &output_tag).status.code(),
+        Some(0)
+    );
+    let o1 = h.image(&ArchiveSpec {
+        marker: "ac10ins-o1".into(),
+        ..Default::default()
+    });
+    let output_o1 = server.image("images", "ac10insout", &o1);
+
+    let mut gate = PinGate::new(h.root.path());
+    let mut command = h.command();
+    command.args(["image", "refresh"]);
+    gate.attach(&mut command);
+    let child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the gated refresh");
+    gate.expect(PinStage::CandidateReady).reply(Reply::Continue);
+    let before_lock = gate.expect(PinStage::BeforePinLock);
+
+    // A peer changes an unrelated scope: another project sharing this HOME.
+    let p2 = h.project_at("ac10ins-other-project");
+    let peer = peer_state("ac10ins");
+    assert!(
+        h.refresh_as_ambient_in(&p2, peer.path(), &host_tag)
+            .status
+            .success(),
+        "the peer approves the same reference for its own project"
+    );
+    let peer_record = h.record_in(&p2, &host_tag).unwrap();
+    assert!(
+        h.pin_in(&h.project, &host_child).is_none(),
+        "the peer left H absent here"
+    );
+    assert_eq!(
+        h.default_record_in(&h.project).unwrap()["image"],
+        serde_json::Value::String(default_child.clone())
+    );
+
+    before_lock.reply(Reply::Continue);
+    for stage in [
+        PinStage::PinLocked,
+        PinStage::BeforePinSave,
+        PinStage::PinCommitted,
+    ] {
+        gate.expect(stage).reply(Reply::Continue);
+    }
+    // The independent Output target then commits.
+    for stage in [
+        PinStage::CandidateReady,
+        PinStage::BeforePinLock,
+        PinStage::PinLocked,
+        PinStage::BeforePinSave,
+        PinStage::PinCommitted,
+    ] {
+        gate.expect(stage).reply(Reply::Continue);
+    }
+    drop(gate);
+    let out = child.wait_with_output().expect("collect the refresh");
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let text = stdout_of(&out);
+    let rows = rows_of(&out);
+    assert_eq!(rows.len(), 3, "{text}");
+    assert!(
+        rows[0].contains(&format!(
+            "approved none -> {}; default=adopted {} -> {}",
+            digest_of(&host_child),
+            digest_of(&default_child),
+            digest_of(&host_child)
+        )),
+        "{text}"
+    );
+    // H is inserted unheld, the bookmark moved, and the peer's record is intact.
+    assert_eq!(
+        h.pin_in(&h.project, &host_child).map(|(d, _)| d),
+        Some(digest_of(&host_child))
+    );
+    assert_eq!(roles_of(&h, &h.project, &host_child), None, "H is unheld");
+    assert_eq!(
+        h.default_record_in(&h.project).unwrap()["image"],
+        serde_json::Value::String(host_child.clone())
+    );
+    assert_eq!(h.record_in(&p2, &host_tag), Some(peer_record));
+    assert_eq!(
+        h.pin_in(&h.project, &output_tag).map(|(d, _)| d),
+        Some(digest_of(&output_o1))
+    );
+}
+
+/// AC10: each target freezes its own candidate. Repointing a source again after
+/// it was resolved cannot change either approval, and each tag is resolved once.
+#[test]
+fn multi_refresh_freezes_each_candidate_independently() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let fixture = TwoReferences::create(&h, &server, "ac10fr");
+    let (boot_b1, output_o1) = fixture.move_both(&server, "ac10fr");
+    let requests_before = server.count();
+
+    let mut gate = PinGate::new(h.root.path());
+    let mut command = refresh_as_ambient_command(&h, &fixture.boot_tag);
+    gate.attach(&mut command);
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the gated refresh");
+    // Target 1 has resolved B1 and is still paused there; move the tag to B2
+    // **before** releasing it, so the frozen candidate is what commits.
+    let first_candidate = expect_stage(&mut gate, PinStage::CandidateReady, &mut child);
+    let b2 = h.image(&ArchiveSpec {
+        marker: "ac10fr-boot-b2".into(),
+        ..Default::default()
+    });
+    let boot_b2 = server.image("images", "ac10frboot", &b2);
+    assert_ne!(boot_b2, boot_b1, "the second movement must differ");
+    first_candidate.reply(Reply::Continue);
+    for stage in [
+        PinStage::BeforePinLock,
+        PinStage::PinLocked,
+        PinStage::BeforePinSave,
+        PinStage::PinCommitted,
+    ] {
+        expect_stage(&mut gate, stage, &mut child).reply(Reply::Continue);
+    }
+    // The same for the second target.
+    let second_candidate = expect_stage(&mut gate, PinStage::CandidateReady, &mut child);
+    let o2 = h.image(&ArchiveSpec {
+        marker: "ac10fr-output-o2".into(),
+        ..Default::default()
+    });
+    let output_o2 = server.image("images", "ac10frout", &o2);
+    assert_ne!(output_o2, output_o1, "the second movement must differ");
+    second_candidate.reply(Reply::Continue);
+    for stage in [
+        PinStage::BeforePinLock,
+        PinStage::PinLocked,
+        PinStage::BeforePinSave,
+        PinStage::PinCommitted,
+    ] {
+        expect_stage(&mut gate, stage, &mut child).reply(Reply::Continue);
+    }
+    drop(gate);
+    let out = child.wait_with_output().expect("collect the refresh");
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(
+        h.pin_in(&h.project, &fixture.boot_tag)
+            .map(|(digest, _)| digest),
+        Some(digest_of(&boot_b1)),
+        "the first resolved child is what commits"
+    );
+    assert_eq!(
+        h.pin_in(&h.project, &fixture.output_tag)
+            .map(|(digest, _)| digest),
+        Some(digest_of(&output_o1)),
+        "the second resolved child is what commits"
+    );
+    // One mutable-source resolve per target, and none after the candidate froze.
+    assert_eq!(manifest_requests(&server, requests_before, "ac10frboot"), 1);
+    assert_eq!(manifest_requests(&server, requests_before, "ac10frout"), 1);
+}
+
+/// AC10: a stale target does not cancel its siblings. The peer's retire/reinsert
+/// of the first key is preserved, the second target commits, and the stale one
+/// is never resurrected.
+#[test]
+fn multi_refresh_stale_target_does_not_cancel_other_targets() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let fixture = TwoReferences::create(&h, &server, "ac10st");
+    let _boot_b1 = fixture.move_boot(&server, "ac10st");
+
+    let mut gate = PinGate::new(h.root.path());
+    let mut command = refresh_as_ambient_command(&h, &fixture.boot_tag);
+    gate.attach(&mut command);
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the gated refresh");
+    expect_stage(&mut gate, PinStage::CandidateReady, &mut child).reply(Reply::Continue);
+    let first_lock = expect_stage(&mut gate, PinStage::BeforePinLock, &mut child);
+
+    // The peer claims Boot for R (retiring B) and reinserts B unheld: the frozen
+    // predecessor no longer exists, and a fresh token proves it is a new lifetime.
+    let r = h.image(&ArchiveSpec {
+        marker: "ac10st-r".into(),
+        ..Default::default()
+    });
+    let r_tag = format!("{}/images:ac10str", server.host);
+    server.image("images", "ac10str", &r);
+    let mut peer = h.command_in(&h.project, &h.state);
+    peer.args(["setup", "--image", &r_tag, "--no-verify"]);
+    assert_eq!(bounded(peer).status.code(), Some(0));
+    assert!(h.pin_in(&h.project, &fixture.boot_tag).is_none());
+    // The reinsertion carries different content again, so the frozen candidate is
+    // not the live one: that is what makes this target stale rather than an
+    // equal-live reconciliation.
+    let b2 = h.image(&ArchiveSpec {
+        marker: "ac10st-boot-b2".into(),
+        ..Default::default()
+    });
+    server.image("images", "ac10stboot", &b2);
+    let reinsert = h.refresh_as_ambient_in(&h.project, &h.state, &fixture.boot_tag);
+    assert!(
+        reinsert.status.success(),
+        "the peer reinserts B: {}{}",
+        stdout_of(&reinsert),
+        stderr(&reinsert)
+    );
+    let reinserted = h.pin_in(&h.project, &fixture.boot_tag).unwrap();
+    // Output moves only now: the peer's own refresh above covered this holder, so
+    // moving it earlier would leave this target with nothing to commit.
+    let output_o1 = fixture.move_output(&server, "ac10st");
+    let peer_bytes = fs::read(h.pins()).unwrap();
+
+    first_lock.reply(Reply::Continue);
+    // The stale target takes its lock, decides stale, and writes nothing.
+    expect_stage(&mut gate, PinStage::PinLocked, &mut child).reply(Reply::Continue);
+    // Target 2 (Output) still runs: its own predecessor is live.
+    expect_stage(&mut gate, PinStage::CandidateReady, &mut child).reply(Reply::Continue);
+    let second_lock = expect_stage(&mut gate, PinStage::BeforePinLock, &mut child);
+    assert_eq!(
+        fs::read(h.pins()).unwrap(),
+        peer_bytes,
+        "the stale first target changed nothing"
+    );
+    second_lock.reply(Reply::Continue);
+    for stage in [
+        PinStage::PinLocked,
+        PinStage::BeforePinSave,
+        PinStage::PinCommitted,
+    ] {
+        expect_stage(&mut gate, stage, &mut child).reply(Reply::Continue);
+    }
+    drop(gate);
+    let out = child.wait_with_output().expect("collect the refresh");
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let text = stdout_of(&out);
+    let rows = rows_of(&out);
+    assert!(
+        rows[0].contains("[1/2]") && rows[0].contains("failed") && rows[0].contains("stale"),
+        "{text}"
+    );
+    assert!(
+        rows[1].starts_with("==> refresh [2/2] the latest output image (linux/")
+            && rows[1].contains(&digest_of(&output_o1)),
+        "{text}"
+    );
+    assert_eq!(rows[2], "==> image refresh: 1 succeeded, 1 failed");
+    // The peer's reinserted record survives untouched, and the sibling committed.
+    assert_eq!(
+        h.pin_in(&h.project, &fixture.boot_tag),
+        Some(reinserted),
+        "the peer's B record is preserved, not resurrected from the frozen tuple"
+    );
+    assert_eq!(
+        h.pin_in(&h.project, &fixture.output_tag).map(|(d, _)| d),
+        Some(digest_of(&output_o1))
+    );
+    assert_eq!(roles_of(&h, &h.project, &r_tag).as_deref(), Some("boot"));
+}
+
+/// AC11: an immutable source whose content moved is a failed target with an
+/// integrity reason — not a skip, not a success, and not an approvable
+/// replacement. Its approval and default stay exact while a sibling commits.
+#[test]
+fn multi_refresh_immutable_integrity_failure_is_not_a_skip() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec {
+        marker: "ac11-a".into(),
+        ..Default::default()
+    });
+    server.image("images", "ac11childa", &a);
+    // X is an immutable index approved at its resolved host child A.
+    let index_pin = server.index("images", "ac11x", a.index.clone());
+    let index_digest = digest_of(&index_pin);
+    let x_route = format!("/v2/images/manifests/{index_digest}");
+    h.approve_ambient_fixture(&index_pin);
+    let x_record = h.record_in(&h.project, &index_pin).unwrap();
+    let x_digest = x_record["manifest_digest"].as_str().unwrap().to_owned();
+
+    // A sibling Output holder that really moves.
+    let o = h.image(&ArchiveSpec {
+        marker: "ac11-o".into(),
+        ..Default::default()
+    });
+    let output_tag = format!("{}/images:ac11out", server.host);
+    let output_child = server.image("images", "ac11out", &o);
+    assert_eq!(
+        h.import(&o.written.path, &output_tag).status.code(),
+        Some(0)
+    );
+    let o1 = h.image(&ArchiveSpec {
+        marker: "ac11-o1".into(),
+        ..Default::default()
+    });
+    let output_o1 = server.image("images", "ac11out", &o1);
+
+    // The immutable index now resolves to genuinely different host content, while
+    // the registry keeps serving it under X's own digest.
+    let b = h.image(&ArchiveSpec {
+        marker: "ac11-b".into(),
+        ..Default::default()
+    });
+    server.image("images", "ac11childb", &b);
+    server.put_with_header(
+        &x_route,
+        &b.index,
+        "application/vnd.oci.image.index.v1+json",
+        &index_digest,
+    );
+    let defaults_before = h.default_record_in(&h.project);
+    let host_before = h.host_record();
+
+    let out = h.refresh_as_ambient(&index_pin);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let text = stdout_of(&out);
+    let rows = rows_of(&out);
+    assert!(
+        rows[0].contains("[1/2]")
+            && rows[0].contains("failed")
+            && rows[0].contains("Invalid digest"),
+        "the immutable movement is an integrity failure, not a skip: {text}"
+    );
+    assert!(
+        !rows[0].contains("unchanged"),
+        "an integrity failure is never reported as unchanged: {text}"
+    );
+    assert!(
+        rows[1].contains(&format!(
+            "changed {} -> {}",
+            digest_of(&output_child),
+            digest_of(&output_o1)
+        )),
+        "the sibling still commits: {text}"
+    );
+    assert_eq!(rows[2], "==> image refresh: 1 succeeded, 1 failed");
+    // X's authority is exactly as it was.
+    let x_after = h.record_in(&h.project, &index_pin).unwrap();
+    assert_eq!(x_after, x_record, "the immutable approval is unchanged");
+    assert_eq!(
+        x_after["manifest_digest"],
+        serde_json::Value::String(x_digest)
+    );
+    assert_eq!(h.default_record_in(&h.project), defaults_before);
+    assert_eq!(h.host_record(), host_before);
+    assert_eq!(
+        h.pin_in(&h.project, &output_tag).map(|(d, _)| d),
+        Some(digest_of(&output_o1))
+    );
+}
+
+/// AC12: a damaged authority prevents every registry request and every write,
+/// for a bare command and a filtered one alike, and prints no success summary.
+#[test]
+fn refresh_damaged_authority_fails_before_any_registry_request() {
+    // Four kinds of damage, each with a readable ambient selection and an
+    // apparent Output target available.
+    #[derive(Debug)]
+    enum Damage {
+        BrokenJson,
+        ForeignRoleJoin,
+        MissingLock,
+        UnknownVersion,
+    }
+    for damage in [
+        Damage::BrokenJson,
+        Damage::ForeignRoleJoin,
+        Damage::MissingLock,
+        Damage::UnknownVersion,
+    ] {
+        let h = Harness::new(Mode::LaunchSeam);
+        let server = Server::new();
+        let c = h.image(&ArchiveSpec {
+            marker: "ac12ambient".into(),
+            ..Default::default()
+        });
+        let ambient_tag = format!("{}/images:ac12ambient", server.host);
+        server.image("images", "ac12ambient", &c);
+        let o = h.image(&ArchiveSpec {
+            marker: "ac12output".into(),
+            ..Default::default()
+        });
+        let output_tag = format!("{}/images:ac12output", server.host);
+        server.image("images", "ac12output", &o);
+        assert_eq!(
+            h.import(&o.written.path, &output_tag).status.code(),
+            Some(0)
+        );
+
+        // The four kinds take different decoder paths but share one **generic**
+        // damage diagnostic by contract, so the oracle is its exact text rather
+        // than a per-kind message (there is no per-kind wording to assert).
+        const DAMAGED: &str = "image pin authority at $HOME/.config/agent-vm/image-pins.json is damaged; restore its intended records from backup or deliberately move it aside to reset approvals";
+        match damage {
+            Damage::BrokenJson => fs::write(h.pins(), b"{ this is not json").unwrap(),
+            Damage::ForeignRoleJoin => {
+                // A role held with no scope resolution is damage, even when the
+                // record belongs to another project.
+                let mut store: serde_json::Value =
+                    serde_json::from_slice(&fs::read(h.pins()).unwrap()).unwrap();
+                store["pins"].as_array_mut().unwrap().push(serde_json::json!({
+                    "project": project_id(&h.project_at("ac12-foreign")),
+                    "reference": "example.com/team/foreign:tag",
+                    "platform": {"os": "linux", "architecture": image_archive::host_arch(), "variant": null},
+                    "manifest_digest": format!("sha256:{}", "e".repeat(64)),
+                    "revision": 1,
+                    "roles": "boot"
+                }));
+                fs::write(h.pins(), serde_json::to_vec(&store).unwrap()).unwrap();
+            }
+            Damage::MissingLock => {
+                fs::remove_file(h.pins().with_extension("lock")).unwrap();
+            }
+            Damage::UnknownVersion => {
+                let mut store: serde_json::Value =
+                    serde_json::from_slice(&fs::read(h.pins()).unwrap()).unwrap();
+                store["version"] = 3.into();
+                fs::write(h.pins(), serde_json::to_vec(&store).unwrap()).unwrap();
+            }
+        }
+        let damaged = fs::read(h.pins()).unwrap();
+        let requests_before = server.count();
+
+        for (label, command) in [("bare", None), ("filtered", Some(&output_tag))] {
+            let mut cmd = h.command();
+            cmd.env("AGENT_VM_IMAGE_TAG", &ambient_tag);
+            match command {
+                None => cmd.args(["image", "refresh"]),
+                Some(target) => cmd.args(["image", "refresh", "--image", target]),
+            };
+            let out = bounded(cmd);
+            assert_eq!(out.status.code(), Some(1), "{label}: {}", stderr(&out));
+            assert_eq!(
+                stderr(&out).trim(),
+                format!("Error: {DAMAGED}"),
+                "{label}: the {damage:?} damage is refused with the exact generic text"
+            );
+            assert!(
+                !stdout_of(&out).contains("==> image refresh:"),
+                "{label}: no summary pretends work happened: {}",
+                stdout_of(&out)
+            );
+            assert_eq!(server.count(), requests_before, "{label}: no request");
+            assert_eq!(fs::read(h.pins()).unwrap(), damaged, "{label}: no write");
+        }
+    }
+}
+
+// ---------------------------------------------------------------- pipe control
+
+/// One socket end the test keeps, so a child's sink can be closed at a chosen
+/// moment rather than before it starts. A `UnixStream` pair (not a pipe) is the
+/// mechanism the existing render-failure rows prove fails a write once the peer
+/// is gone.
+struct Sink {
+    reader: std::os::unix::net::UnixStream,
+}
+
+impl Sink {
+    /// A fresh pair; the returned `Stdio` is the child's write end.
+    fn new() -> (Self, std::process::Stdio) {
+        use std::os::fd::OwnedFd;
+        let (reader, writer) =
+            std::os::unix::net::UnixStream::pair().expect("create the socket pair");
+        let writer: OwnedFd = writer.into();
+        (Self { reader }, std::process::Stdio::from(writer))
+    }
+
+    /// Read whatever is buffered right now, without blocking.
+    fn drain(&mut self) -> String {
+        use std::io::Read as _;
+        self.reader
+            .set_nonblocking(true)
+            .expect("nonblocking sink read");
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match self.reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => out.extend_from_slice(&buf[..read]),
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+}
+
+/// Answer every pin checkpoint with `Continue` until `until` arrives, then hand
+/// that paused checkpoint to the test and keep answering the rest.
+fn pump_pin_gate(mut gate: PinGate, until: PinStage) -> std::sync::mpsc::Receiver<PinCheckpoint> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    // Detached on purpose: the pump ends by itself once the child stops
+    // checkpointing (the gate goes quiet), and joining it would add that
+    // quiet-period to every row.
+    std::thread::spawn(move || {
+        let mut delivered = false;
+        while let Some((stage, checkpoint)) = gate.next() {
+            if !delivered && stage == until {
+                delivered = true;
+                if sender.send(checkpoint).is_err() {
+                    return;
+                }
+                continue;
+            }
+            checkpoint.reply(Reply::Continue);
+        }
+    });
+    receiver
+}
+
+/// AC13: two moving targets read no stdin, on a pipe that holds a decline and on
+/// a real terminal; no prompt token appears and `--yes` stays a usage error.
+#[test]
+fn multi_refresh_never_reads_pipe_or_terminal_input() {
+    // A pipe holding a decline: nothing may read it.
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let fixture = TwoReferences::create(&h, &server, "ac13pipe");
+    let (boot_b1, output_o1) = fixture.move_both(&server, "ac13pipe");
+    let (out, unread) =
+        with_unread_stdin(refresh_as_ambient_command(&h, &fixture.boot_tag), b"n\n");
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(unread, b"n\n", "stdin must be left unread");
+    assert_no_question(&stdout_of(&out));
+    assert_no_question(&stderr(&out));
+    assert_eq!(
+        h.pin_in(&h.project, &fixture.boot_tag).map(|(d, _)| d),
+        Some(digest_of(&boot_b1))
+    );
+    assert_eq!(
+        h.pin_in(&h.project, &fixture.output_tag).map(|(d, _)| d),
+        Some(digest_of(&output_o1))
+    );
+
+    // A real terminal: it exits without a single keystroke.
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let fixture = TwoReferences::create(&h, &server, "ac13pty");
+    let (boot_b1, output_o1) = fixture.move_both(&server, "ac13pty");
+    let mut command = refresh_as_ambient_command(&h, &fixture.boot_tag);
+    let mut terminal = Pty::spawn(&mut command, b"refresh").expect("open a pseudo-terminal");
+    let (status, out) = terminal
+        .drive(&Action::Write(b""), Duration::from_secs(60))
+        .expect("wait for the refresh to exit");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(status.success(), "{text}");
+    assert_no_question(&text);
+    assert_eq!(
+        h.pin_in(&h.project, &fixture.boot_tag).map(|(d, _)| d),
+        Some(digest_of(&boot_b1)),
+        "{text}"
+    );
+    assert_eq!(
+        h.pin_in(&h.project, &fixture.output_tag).map(|(d, _)| d),
+        Some(digest_of(&output_o1))
+    );
+
+    // No `--yes`: this command never asks, so the flag cannot exist.
+    let mut command = h.command();
+    command.args(["image", "refresh", "--yes"]);
+    let out = bounded(command);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+}
+
+/// AC13: a consent render that cannot be written fails only its own operation.
+/// A changed Boot render fails, the unchanged Output holder still reports, and
+/// nothing is committed.
+#[test]
+fn multi_refresh_render_failure_preserves_that_target_only() {
+    let h = Harness::new(Mode::StrictAcquisition);
+    let server = Server::new();
+    let fixture = TwoReferences::create(&h, &server, "ac13rend");
+    // Only Boot moves: Output stays unchanged and needs no render.
+    let boot_b1 = fixture.move_boot(&server, "ac13rend");
+    let before = fs::read(h.pins()).unwrap();
+
+    let mut command = refresh_as_ambient_command(&h, &fixture.boot_tag);
+    command.env_remove("AGENT_VM_DEBUG_CONFIG");
+    let out = {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        let (writer, reader) = UnixStream::pair().expect("create the socket pair");
+        drop(reader);
+        let writer: OwnedFd = writer.into();
+        bounded_with_stderr(command, std::process::Stdio::from(writer))
+    };
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let text = stdout_of(&out);
+    let rows = rows_of(&out);
+    assert!(
+        rows[0].contains("[1/2]")
+            && rows[0].contains("failed")
+            && rows[0].contains(
+                "the image approval change for this refresh operation could not be shown; this \
+             operation committed no approval or project-default change"
+            ),
+        "{text}"
+    );
+    assert!(
+        rows[1].starts_with("==> refresh [2/2] the latest output image (linux/")
+            && rows[1].contains(&format!("unchanged {}", digest_of(&fixture.output_child))),
+        "the unrelated unchanged target still reports: {text}"
+    );
+    assert_eq!(rows[2], "==> image refresh: 1 succeeded, 1 failed");
+    // Nothing was committed for either operation.
+    assert_eq!(fs::read(h.pins()).unwrap(), before);
+    assert_ne!(
+        h.pin_in(&h.project, &fixture.boot_tag).map(|(d, _)| d),
+        Some(digest_of(&boot_b1))
+    );
+    let delivered = format!("{}{}", text, stderr(&out));
+    assert!(
+        !delivered.contains("nothing was approved")
+            && !delivered.contains("nothing was acquired or approved"),
+        "a per-operation render failure is not a batch-wide claim: {delivered}"
+    );
+}
+
+/// AC13/AC14: a later consent-render failure is reported only for its own
+/// operation, after an earlier target really committed. The batch keeps the
+/// commit, exits 1, and never claims "nothing was approved".
+#[test]
+fn multi_refresh_later_render_failure_reports_only_that_operation() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let fixture = TwoReferences::create(&h, &server, "ac13later");
+    let (boot_b1, output_o1) = fixture.move_both(&server, "ac13later");
+    assert_ne!(
+        fixture.output_child, output_o1,
+        "the fixture must move Output"
+    );
+    let output_record = h.record_in(&h.project, &fixture.output_tag).unwrap();
+
+    let (mut stderr_sink, child_stderr) = Sink::new();
+    let mut gate = PinGate::new(h.root.path());
+    let mut command = refresh_as_ambient_command(&h, &fixture.boot_tag);
+    gate.attach(&mut command);
+    let child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(child_stderr)
+        .spawn()
+        .expect("spawn the gated refresh");
+    // B's replacement render (precommit) is on stderr; its commit is real.
+    for stage in [
+        PinStage::CandidateReady,
+        PinStage::BeforePinLock,
+        PinStage::PinLocked,
+        PinStage::BeforePinSave,
+    ] {
+        gate.expect(stage).reply(Reply::Continue);
+    }
+    let committed = gate.expect(PinStage::PinCommitted);
+    let boot_snapshot = fs::read(h.pins()).unwrap();
+    let render_bytes = stderr_sink.drain();
+    assert!(
+        render_bytes.contains("Replacing the approved image for"),
+        "the first target's render must have been written before it committed: {render_bytes}"
+    );
+    // Close the only stderr reader before the second target's render, then let the
+    // first target's commit checkpoint go.
+    drop(stderr_sink);
+    committed.reply(Reply::Continue);
+    // The second target's candidate is resolved, then its render fails, so there
+    // is no pin lock or save for it; the gate stays open until the child exits.
+    gate.expect(PinStage::CandidateReady).reply(Reply::Continue);
+    let out = child.wait_with_output().expect("collect the refresh");
+    drop(gate);
+    assert_eq!(out.status.code(), Some(1), "{render_bytes}");
+    let text = stdout_of(&out);
+    let rows = rows_of(&out);
+    assert_eq!(rows.len(), 3, "{text}");
+    assert!(
+        rows[0].contains("[1/2]") && rows[0].contains("changed"),
+        "{text}"
+    );
+    assert!(
+        rows[1].starts_with("==> refresh [2/2] the latest output image (linux/")
+            && rows[1].contains("failed")
+            && rows[1].contains(
+                "the image approval change for this refresh operation could not be shown; this \
+                 operation committed no approval or project-default change"
+            ),
+        "{text}"
+    );
+    assert_eq!(rows[2], "==> image refresh: 1 succeeded, 1 failed");
+    // The first commit is intact; the second operation committed nothing.
+    assert_eq!(fs::read(h.pins()).unwrap(), boot_snapshot);
+    assert_eq!(
+        h.pin_in(&h.project, &fixture.boot_tag).map(|(d, _)| d),
+        Some(digest_of(&boot_b1))
+    );
+    assert_eq!(
+        h.record_in(&h.project, &fixture.output_tag),
+        Some(output_record)
+    );
+    let delivered = format!("{}{}", text, stderr(&out));
+    for blanket in ["nothing was approved", "nothing was acquired or approved"] {
+        assert!(
+            !delivered.to_lowercase().contains(&blanket.to_lowercase()),
+            "a committed sibling forbids the blanket claim: {delivered}"
+        );
+    }
+}
+
+/// The reference guard's real path inside the native cache, for holding it from
+/// the test process.
+fn reference_guard(h: &Harness, reference: &str) -> PathBuf {
+    acquisition_gate::guard_path(
+        &microsandbox_image::GlobalCache::new(&h.cache()).unwrap(),
+        reference,
+    )
+}
+
+/// Hold one reference's guard exclusively from this process.
+fn hold_reference_guard(h: &Harness, reference: &str) -> fs::File {
+    let path = reference_guard(h, reference);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .expect("open the guard");
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .expect("this test must take the guard");
+    file
+}
+
+/// Hold the native cache's real publication barrier exclusively from this
+/// process, the mode an archive publisher takes.
+fn hold_publication_barrier(h: &Harness) -> fs::File {
+    let cache = h.cache();
+    fs::create_dir_all(&cache).unwrap();
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(cache.join(".agent-vm-publication.lock"))
+        .expect("open the publication lock");
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .expect("this test must take the publication barrier");
+    file
+}
+
+/// Hold the pin store's stable exclusive lock from this process.
+fn hold_authority_lock(h: &Harness) -> fs::File {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(h.pins().with_extension("lock"))
+        .expect("open the pin lock");
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .expect("this test must take the pin lock");
+    file
+}
+
+/// AC14: after a real commit, losing stderr under a later reference/publication
+/// contention cannot panic or stop the remaining operation. The notice write is
+/// attempted while the lock is still held, and the unchanged holder still
+/// completes with a truthful status.
+#[test]
+fn multi_refresh_closed_stderr_contention_preserves_progress() {
+    /// Which real lock the later acquisition is made to contend on.
+    #[derive(Clone, Copy, Debug)]
+    enum Contention {
+        Reference,
+        Publication,
+    }
+    for (contention, denied) in [
+        (Contention::Reference, false),
+        (Contention::Reference, true),
+        (Contention::Publication, false),
+        (Contention::Publication, true),
+    ] {
+        let h = Harness::new(Mode::LaunchSeam);
+        let server = Server::new();
+        let prefix = match contention {
+            Contention::Reference => "ac14ref",
+            Contention::Publication => "ac14pub",
+        };
+        let fixture = TwoReferences::create(&h, &server, prefix);
+        // Only Boot moves: the Output holder stays unchanged unless this leg
+        // denies it, so the success and truthful-failure controls share a shape.
+        let boot_b1 = fixture.move_boot(&server, prefix);
+        let (mut sink, child_stderr) = Sink::new();
+        let acquisition = AcquisitionGate::new(h.root.path());
+        let pin_gate = PinGate::new(h.root.path());
+        let mut command = refresh_as_ambient_command(&h, &fixture.boot_tag);
+        pin_gate.attach(&mut command);
+        acquisition.attach(&mut command);
+        // Both gates are pumped: the first target's commit checkpoint and the
+        // later target's contention notice are singled out, everything else is
+        // acknowledged so an unknown schedule cannot hide a hang.
+        let committed = pump_pin_gate(pin_gate, PinStage::PinCommitted);
+        let notice = pump_acquisition_gate(
+            acquisition,
+            match contention {
+                Contention::Reference => AcquisitionStage::ReferenceNoticeAttempted,
+                Contention::Publication => AcquisitionStage::PublicationNoticeAttempted,
+            },
+        );
+        let mut child = command
+            .stdout(std::process::Stdio::piped())
+            .stderr(child_stderr)
+            .spawn()
+            .expect("spawn the gated refresh");
+        // The first target really commits, and its render reached stderr.
+        let committed = committed
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the first target must reach its commit checkpoint");
+        let boot_snapshot = fs::read(h.pins()).unwrap();
+        assert!(
+            sink.drain().contains("Replacing the approved image for"),
+            "the first target's render must be written before it commits"
+        );
+        // The later acquisition is made to contend on a real lock, and only now
+        // does the test drop its stderr reader and let target 1 go.
+        let guard = match contention {
+            Contention::Reference => hold_reference_guard(&h, &fixture.output_tag),
+            Contention::Publication => hold_publication_barrier(&h),
+        };
+        if denied {
+            server.deny_manifest(&format!("/v2/images/manifests/{prefix}out"));
+        }
+        drop(sink);
+        committed.reply(Reply::Continue);
+        // The contention notice is attempted while the lock is still held. If it
+        // never arrives, the child's own exit status and stderr are collected so
+        // the evidence is causal (the notice write panicked) rather than "the gate
+        // went quiet".
+        let paused = match notice.recv_timeout(Duration::from_secs(60)) {
+            Ok(paused) => paused,
+            Err(error) => {
+                // Bounded: a child still running after this poll is a scheduling
+                // failure, not a caught mutant, and must fail rather than hang.
+                let Some(code) = child_exit_within(&mut child, Duration::from_secs(10)) else {
+                    panic!(
+                        "the {contention:?} notice was never attempted ({error}) and the child \
+                         was still running after 10 s: that is a scheduling failure, not a \
+                         caught mutant"
+                    );
+                };
+                let text = exited_child_output(&mut child);
+                // A child that panicked on the notice write exits 101; that is the
+                // causal evidence (its message cannot reach a closed stderr).
+                assert_eq!(
+                    code,
+                    Some(101),
+                    "the {contention:?} notice must be attempted while the lock is held; the \
+                     child exited with {code:?} and output: {text}{error}"
+                );
+                panic!(
+                    "the {contention:?} contention notice was never attempted ({error}); child \
+                     exited Some(101) (panic on the notice write); output: {text}"
+                );
+            }
+        };
+        assert_eq!(
+            unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&guard), libc::LOCK_UN) },
+            0
+        );
+        paused.reply(GateReply::Continue);
+        let out = child.wait_with_output().expect("collect the refresh");
+        let text = stdout_of(&out);
+        let rows = rows_of(&out);
+        if denied {
+            assert_eq!(out.status.code(), Some(1), "{text}");
+            assert_eq!(rows.len(), 3, "{text}");
+            assert!(rows[0].contains("changed"), "{text}");
+            assert!(
+                rows[1].starts_with("==> refresh [2/2] the latest output image (linux/")
+                    && rows[1].contains("failed"),
+                "a real failure is still reported after lost stderr: {text}"
+            );
+            assert_eq!(rows[2], "==> image refresh: 1 succeeded, 1 failed");
+        } else {
+            assert_eq!(out.status.code(), Some(0), "{text}");
+            assert_eq!(rows.len(), 3, "{text}");
+            assert!(rows[0].contains(&digest_of(&boot_b1)), "{text}");
+            assert!(
+                rows[1].starts_with("==> refresh [2/2] the latest output image (linux/")
+                    && rows[1].contains(&format!("unchanged {}", digest_of(&fixture.output_child))),
+                "{text}"
+            );
+            assert_eq!(rows[2], "==> image refresh: 2 succeeded, 0 failed");
+        }
+        // The first target's commit is byte-identical, and the whole file is that
+        // snapshot: the later operation saved nothing.
+        assert_eq!(fs::read(h.pins()).unwrap(), boot_snapshot);
+        assert_eq!(
+            h.pin_in(&h.project, &fixture.boot_tag).map(|(d, _)| d),
+            Some(digest_of(&boot_b1))
+        );
+        assert!(out.status.code() != Some(101), "no panic status");
+        assert!(
+            manifest_requests(&server, 0, &format!("{prefix}out")) > 0,
+            "the later target really ran"
+        );
+    }
+}
+
+/// AC14: after a real commit, losing stderr while a later target waits for the
+/// **authority** lock cannot panic or stop it: the notice write is attempted
+/// under real contention, and the operation still commits or fails truthfully.
+#[test]
+fn multi_refresh_closed_stderr_authority_contention_preserves_progress() {
+    for fail_save in [false, true] {
+        let h = Harness::new(Mode::LaunchSeam);
+        let server = Server::new();
+        let fixture = TwoReferences::create(&h, &server, "ac14auth");
+        let boot_b1 = fixture.move_boot(&server, "ac14auth");
+        if fail_save {
+            fixture.move_output(&server, "ac14auth");
+        }
+        let (mut sink, child_stderr) = Sink::new();
+        let mut gate = PinGate::new(h.root.path());
+        let mut command = refresh_as_ambient_command(&h, &fixture.boot_tag);
+        gate.attach(&mut command);
+        let mut child = command
+            .stdout(std::process::Stdio::piped())
+            .stderr(child_stderr)
+            .spawn()
+            .expect("spawn the gated refresh");
+        for stage in [
+            PinStage::CandidateReady,
+            PinStage::BeforePinLock,
+            PinStage::PinLocked,
+            PinStage::BeforePinSave,
+        ] {
+            expect_stage(&mut gate, stage, &mut child).reply(Reply::Continue);
+        }
+        let committed = expect_stage(&mut gate, PinStage::PinCommitted, &mut child);
+        let boot_snapshot = fs::read(h.pins()).unwrap();
+        assert!(
+            sink.drain().contains("Replacing the approved image for"),
+            "the first target's render must be written before stderr closes"
+        );
+        committed.reply(Reply::Continue);
+
+        // Target 2's candidate is ready and it has not taken the pin lock yet.
+        expect_stage(&mut gate, PinStage::CandidateReady, &mut child).reply(Reply::Continue);
+        let before_lock = expect_stage(&mut gate, PinStage::BeforePinLock, &mut child);
+        // The parent takes the real stable pin EX, then closes stderr.
+        let authority = hold_authority_lock(&h);
+        drop(sink);
+        before_lock.reply(Reply::Continue);
+        // The one-time wait notice is attempted at its normal threshold; release
+        // the lock only after that attempt.
+        expect_stage(&mut gate, PinStage::AuthorityNoticeAttempted, &mut child)
+            .reply(Reply::Continue);
+        assert_eq!(
+            unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&authority), libc::LOCK_UN) },
+            0
+        );
+        expect_stage(&mut gate, PinStage::PinLocked, &mut child).reply(Reply::Continue);
+        if fail_save {
+            expect_stage(&mut gate, PinStage::BeforePinSave, &mut child)
+                .reply(Reply::FailBeforeSave);
+        }
+        let out = child.wait_with_output().expect("collect the refresh");
+        drop(gate);
+        let text = stdout_of(&out);
+        let rows = rows_of(&out);
+        if fail_save {
+            assert_eq!(out.status.code(), Some(1), "{text}");
+            assert_eq!(rows.len(), 3, "{text}");
+            assert!(rows[0].contains("changed"), "{text}");
+            assert!(
+                rows[1].contains("failed"),
+                "the real authority failure is reported: {text}"
+            );
+            assert_eq!(rows[2], "==> image refresh: 1 succeeded, 1 failed");
+        } else {
+            assert_eq!(out.status.code(), Some(0), "{text}");
+            assert_eq!(rows.len(), 3, "{text}");
+            assert!(
+                rows[1].contains(&format!("unchanged {}", digest_of(&fixture.output_child))),
+                "{text}"
+            );
+            assert_eq!(rows[2], "==> image refresh: 2 succeeded, 0 failed");
+        }
+        assert_eq!(fs::read(h.pins()).unwrap(), boot_snapshot);
+        assert_eq!(
+            h.pin_in(&h.project, &fixture.boot_tag).map(|(d, _)| d),
+            Some(digest_of(&boot_b1))
+        );
+        assert_ne!(out.status.code(), Some(101), "no panic status");
+    }
+}
+
+/// AC14: losing **stdout** after a commit is a bounded warning, not a failed
+/// approval: the later target still resolves, renders on stderr and commits.
+#[test]
+fn multi_refresh_closed_stdout_preserves_progress() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let fixture = TwoReferences::create(&h, &server, "ac14out");
+    let (boot_b1, output_o1) = fixture.move_both(&server, "ac14out");
+
+    let (stdout_sink, child_stdout) = Sink::new();
+    let mut gate = PinGate::new(h.root.path());
+    let mut command = refresh_as_ambient_command(&h, &fixture.boot_tag);
+    gate.attach(&mut command);
+    let mut child = command
+        .stdout(child_stdout)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the gated refresh");
+    for stage in [
+        PinStage::CandidateReady,
+        PinStage::BeforePinLock,
+        PinStage::PinLocked,
+        PinStage::BeforePinSave,
+    ] {
+        expect_stage(&mut gate, stage, &mut child).reply(Reply::Continue);
+    }
+    let committed = expect_stage(&mut gate, PinStage::PinCommitted, &mut child);
+    // The first commit is real; only then does stdout go away.
+    assert_eq!(
+        h.pin_in(&h.project, &fixture.boot_tag).map(|(d, _)| d),
+        Some(digest_of(&boot_b1))
+    );
+    drop(stdout_sink);
+    committed.reply(Reply::Continue);
+    // The later target still renders (stderr is open) and commits.
+    for stage in [
+        PinStage::CandidateReady,
+        PinStage::BeforePinLock,
+        PinStage::PinLocked,
+        PinStage::BeforePinSave,
+        PinStage::PinCommitted,
+    ] {
+        expect_stage(&mut gate, stage, &mut child).reply(Reply::Continue);
+    }
+    drop(gate);
+    let out = child.wait_with_output().expect("collect the refresh");
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let text = stderr(&out);
+    assert_eq!(
+        text.matches("warning: image refresh outcomes could not all be written; completed approvals remain committed; do not retry it as a failed approval").count(),
+        1,
+        "exactly one bounded warning: {text}"
+    );
+    assert!(
+        text.contains("Replacing the approved image for"),
+        "the later consent render still happened: {text}"
+    );
+    assert_eq!(
+        h.pin_in(&h.project, &fixture.boot_tag).map(|(d, _)| d),
+        Some(digest_of(&boot_b1))
+    );
+    assert_eq!(
+        h.pin_in(&h.project, &fixture.output_tag).map(|(d, _)| d),
+        Some(digest_of(&output_o1)),
+        "the later target committed despite lost stdout"
+    );
+    assert!(!text.contains("nothing was approved"), "{text}");
+}
+
+/// AC14: a peer that commits the same candidate makes this operation `unchanged`,
+/// with the live digest kept and no new token; the sibling still succeeds.
+#[test]
+fn multi_refresh_same_candidate_peer_reports_unchanged() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let fixture = TwoReferences::create(&h, &server, "ac14peer");
+    let boot_b1 = fixture.move_boot(&server, "ac14peer");
+
+    let mut gate = PinGate::new(h.root.path());
+    let mut command = refresh_as_ambient_command(&h, &fixture.boot_tag);
+    gate.attach(&mut command);
+    let child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the gated refresh");
+    gate.expect(PinStage::CandidateReady).reply(Reply::Continue);
+    let before_lock = gate.expect(PinStage::BeforePinLock);
+    // A peer in the same project approves exactly this candidate in its own cache.
+    let peer = peer_state("ac14peer");
+    let approved = h.refresh_as_ambient_in(&h.project, peer.path(), &fixture.boot_tag);
+    assert!(
+        approved.status.success(),
+        "the peer approves B1: {}{}",
+        stdout_of(&approved),
+        stderr(&approved)
+    );
+    let peer_tuple = h.pin_in(&h.project, &fixture.boot_tag).unwrap();
+    assert_eq!(peer_tuple.0, digest_of(&boot_b1));
+    // The sibling moves only now, so it has real work left.
+    let output_o1 = fixture.move_output(&server, "ac14peer");
+
+    before_lock.reply(Reply::Continue);
+    // This operation reconciles on the live pin: `PinLocked` then no save for it.
+    gate.expect(PinStage::PinLocked).reply(Reply::Continue);
+    for stage in [
+        PinStage::CandidateReady,
+        PinStage::BeforePinLock,
+        PinStage::PinLocked,
+        PinStage::BeforePinSave,
+        PinStage::PinCommitted,
+    ] {
+        gate.expect(stage).reply(Reply::Continue);
+    }
+    drop(gate);
+    let out = child.wait_with_output().expect("collect the refresh");
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let text = stdout_of(&out);
+    let rows = rows_of(&out);
+    assert!(
+        rows[0].contains(&format!("unchanged {}", digest_of(&boot_b1))),
+        "a peer's identical candidate is reported unchanged: {text}"
+    );
+    assert_eq!(
+        h.pin_in(&h.project, &fixture.boot_tag),
+        Some(peer_tuple),
+        "the live tuple and its token are kept"
+    );
+    assert_eq!(
+        h.pin_in(&h.project, &fixture.output_tag).map(|(d, _)| d),
+        Some(digest_of(&output_o1))
+    );
+}
+
+/// AC14: a record-sourced reference never reaches the report, progress text, the
+/// debug-config copy, traces or an error chain; an explicit target may show its
+/// own escaped reference.
+#[test]
+fn multi_refresh_redacts_record_sourced_references() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    // A private default (host + project) and a private holder, both served.
+    let d = h.image(&ArchiveSpec {
+        marker: "ac14priv-d".into(),
+        ..Default::default()
+    });
+    let default_child = server.image("private-default", "edge", &d);
+    let mut establish = h.command();
+    establish
+        .env("AGENT_VM_TEST_DEFAULT_IMAGE", &default_child)
+        .args(["image", "refresh"]);
+    assert_eq!(bounded(establish).status.code(), Some(0));
+    assert!(
+        default_child.contains("private-default"),
+        "the fixture reference carries the sentinel"
+    );
+    let o = h.image(&ArchiveSpec {
+        marker: "ac14priv-o".into(),
+        ..Default::default()
+    });
+    let holder_tag = format!("{}/private-holder:edge", server.host);
+    let holder_child = server.image("private-holder", "edge", &o);
+    assert_eq!(
+        h.import(&o.written.path, &holder_tag).status.code(),
+        Some(0)
+    );
+    // Move both, so the report has changed/unchanged rows to leak through.
+    let d1 = h.image(&ArchiveSpec {
+        marker: "ac14priv-d1".into(),
+        ..Default::default()
+    });
+    server.image("private-default", "edge", &d1);
+    let o1 = h.image(&ArchiveSpec {
+        marker: "ac14priv-o1".into(),
+        ..Default::default()
+    });
+    server.image("private-holder", "edge", &o1);
+
+    // Success leg with the debug dump and dependency tracing enabled.
+    let mut command = h.command();
+    command
+        .env("AGENT_VM_DEBUG_CONFIG", "1")
+        .env("RUST_LOG", "trace")
+        .args(["image", "refresh"]);
+    let out = bounded(command);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let delivered = format!("{}{}", stdout_of(&out), stderr(&out));
+    assert!(
+        delivered.contains("the default boot image")
+            && delivered.contains("the latest output image"),
+        "the fixed labels carry the report: {delivered}"
+    );
+    for sentinel in ["private-default", "private-holder"] {
+        assert!(
+            !delivered.contains(sentinel),
+            "a record-sourced reference leaked ({sentinel}): {delivered}"
+        );
+    }
+
+    // An explicit filter is allowed to show its own escaped reference (before the
+    // route is denied below).
+    let mut command = h.command();
+    command.args(["image", "refresh", "--image", &holder_tag]);
+    let out = bounded(command);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(
+        stdout_of(&out).contains(&holder_tag),
+        "an explicit target may name itself: {}",
+        stdout_of(&out)
+    );
+
+    // Failure leg: the holder's route is denied, and its reason must stay
+    // reference-free while the fixed label identifies it.
+    server.deny_manifest("/v2/private-holder/manifests/edge");
+    let o2 = h.image(&ArchiveSpec {
+        marker: "ac14priv-o2".into(),
+        ..Default::default()
+    });
+    server.image("private-holder", "edge", &o2);
+    let mut command = h.command();
+    command
+        .env("AGENT_VM_DEBUG_CONFIG", "1")
+        .env("RUST_LOG", "trace")
+        .args(["image", "refresh"]);
+    let out = bounded(command);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let delivered = format!("{}{}", stdout_of(&out), stderr(&out));
+    assert!(delivered.contains("the latest output image"), "{delivered}");
+    for sentinel in ["private-default", "private-holder"] {
+        assert!(
+            !delivered.contains(sentinel),
+            "a failed row leaked a record-sourced reference ({sentinel}): {delivered}"
+        );
+    }
+
+    let _ = holder_child;
+}
+
+/// AC15: killing the process during a later target's download keeps the earlier
+/// commit: no rollback, no partial second approval, free locks, and a retry works.
+#[test]
+fn multi_refresh_kill_during_later_download_keeps_earlier_commit() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let fixture = TwoReferences::create(&h, &server, "ac15kill");
+    let boot_b1 = fixture.move_boot(&server, "ac15kill");
+    let o1 = h.image(&ArchiveSpec {
+        marker: "ac15kill-output-o1".into(),
+        ..Default::default()
+    });
+    let output_o1 = server.image("images", "ac15killout", &o1);
+    let output_record = h.record_in(&h.project, &fixture.output_tag).unwrap();
+    let stall = server.stall_blob(&format!("/v2/images/blobs/{}", o1.written.layer_digest));
+
+    let mut gate = PinGate::new(h.root.path());
+    let mut command = refresh_as_ambient_command(&h, &fixture.boot_tag);
+    gate.attach(&mut command);
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the gated refresh");
+    for stage in [
+        PinStage::CandidateReady,
+        PinStage::BeforePinLock,
+        PinStage::PinLocked,
+        PinStage::BeforePinSave,
+    ] {
+        gate.expect(stage).reply(Reply::Continue);
+    }
+    let committed = gate.expect(PinStage::PinCommitted);
+    let snapshot = fs::read(h.pins()).unwrap();
+    committed.reply(Reply::Continue);
+    drop(gate);
+    // The second target starts its download and stalls on a blob.
+    stall
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the stalled blob handshake must arrive");
+    child.kill().expect("kill the refresh mid-download");
+    let _ = child.wait();
+    server.release_blob();
+
+    // No rollback: the first commit is intact and the second approval untouched.
+    assert_eq!(fs::read(h.pins()).unwrap(), snapshot);
+    assert_eq!(
+        h.pin_in(&h.project, &fixture.boot_tag).map(|(d, _)| d),
+        Some(digest_of(&boot_b1))
+    );
+    assert_eq!(
+        h.record_in(&h.project, &fixture.output_tag),
+        Some(output_record)
+    );
+    // The killed process left no lock behind: an independent acquisition of the
+    // same reference succeeds.
+    acquisition_gate::assert_guard_free(&reference_guard(&h, &fixture.output_tag));
+    let retry = h.refresh(&fixture.output_tag);
+    assert_eq!(retry.status.code(), Some(0), "{}", stderr(&retry));
+    assert_eq!(
+        h.pin_in(&h.project, &fixture.output_tag).map(|(d, _)| d),
+        Some(digest_of(&output_o1))
+    );
+}
+
+/// Answer every acquisition checkpoint with `Continue` until `until` arrives,
+/// then hand that paused checkpoint to the test and keep answering the rest.
+///
+/// The acquisition gate is sequential, so a whole acquisition under it must be
+/// pumped; this is the bounded helper the closed-sink schedules need.
+fn pump_acquisition_gate(
+    mut gate: AcquisitionGate,
+    until: AcquisitionStage,
+) -> std::sync::mpsc::Receiver<acquisition_gate::Checkpoint> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    // Detached for the same reason as `pump_pin_gate`.
+    std::thread::spawn(move || {
+        let mut delivered = false;
+        while let Some((stage, checkpoint)) = gate.next() {
+            if !delivered && stage == until {
+                delivered = true;
+                if sender.send(checkpoint).is_err() {
+                    return;
+                }
+                continue;
+            }
+            checkpoint.reply(GateReply::Continue);
+        }
+    });
+    receiver
+}
+
+/// The store's record bound: one save that would add a record fails as full.
+const STORE_PIN_BOUND: usize = 4096;
+
+/// The fixture store's text with exactly `total_pins` pins and an optional write
+/// sequence.
+///
+/// The pads are the **smallest** valid foreign records on purpose: this fixture
+/// exists to reach the *record* bound, so it stays a few hundred kilobytes and
+/// validates quickly (unlike byte-bound filler, which needs thousands of maximal
+/// records).
+fn store_padded_to_pin_count(h: &Harness, total_pins: usize, sequence: Option<u64>) -> String {
+    let original = fs::read_to_string(h.pins()).expect("the fixture store");
+    let mut store: serde_json::Value = serde_json::from_str(&original).expect("valid store");
+    if let Some(sequence) = sequence {
+        store["sequence"] = serde_json::json!(sequence);
+    }
+    let mut pins: Vec<serde_json::Value> = store["pins"].as_array().expect("pins").clone();
+    let arch = image_archive::host_arch();
+    while pins.len() < total_pins {
+        let index = pins.len();
+        pins.push(serde_json::json!({
+            "project": format!("{:064x}", index + 1),
+            "reference": format!("example.com/pad{}:tag", index + 1),
+            "platform": {"os": "linux", "architecture": arch, "variant": null},
+            "manifest_digest": format!("sha256:{}", "e".repeat(64)),
+            "revision": 1,
+        }));
+    }
+    store["pins"] = serde_json::json!(pins);
+    String::from_utf8(serde_json::to_vec(&store).expect("serialize")).unwrap()
+}
+
+/// A1: a capacity failure is an operation row with update-local wording, and an
+/// independent sibling still commits. Cheap and deterministic: the store is at
+/// the **record** bound and the ambient target is the insertion that crosses it.
+#[test]
+fn refresh_capacity_failure_is_an_operation_row_and_siblings_continue() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let fixture = TwoReferences::create(&h, &server, "ac1cap");
+    // The Output holder has real work to commit after the capacity failure.
+    let output_o1 = fixture.move_output(&server, "ac1cap");
+    // The ambient selection is a reference this project has never pinned, so its
+    // save is an insertion — the one growth a refresh can make.
+    let ambient = h.image(&ArchiveSpec {
+        marker: "ac1cap-ambient".into(),
+        ..Default::default()
+    });
+    let ambient_tag = format!("{}/images:ac1capamb", server.host);
+    server.image("images", "ac1capamb", &ambient);
+
+    let pad = store_padded_to_pin_count(&h, STORE_PIN_BOUND, None);
+    let pinned_before = serde_json::from_str::<serde_json::Value>(&pad).unwrap()["pins"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert_eq!(
+        pinned_before, STORE_PIN_BOUND,
+        "the fixture is at the bound"
+    );
+    seed_store(&h, pad.as_bytes());
+
+    let out = h.refresh_as_ambient(&ambient_tag);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let text = stdout_of(&out);
+    let rows = rows_of(&out);
+    // Ambient insertion, then the two recorded holders in canonical order.
+    assert_eq!(rows.len(), 4, "{text}");
+    assert!(
+        rows[0].starts_with(&format!("==> refresh [1/3] {ambient_tag} (linux/"))
+            && rows[0].contains("failed")
+            && rows[0].contains("holds the maximum number of approvals")
+            && rows[0].contains("this proposed pin-store update was not committed"),
+        "a capacity failure is an operation row with update-local wording: {text}"
+    );
+    assert!(
+        rows[1].starts_with("==> refresh [2/3] the recorded boot image (linux/"),
+        "{text}"
+    );
+    assert!(
+        rows[2].starts_with("==> refresh [3/3] the latest output image (linux/"),
+        "{text}"
+    );
+    assert!(
+        rows[2].contains(&format!(
+            "changed {} -> {}",
+            digest_of(&fixture.output_child),
+            digest_of(&output_o1)
+        )),
+        "{text}"
+    );
+    assert_eq!(rows[3], "==> image refresh: 2 succeeded, 1 failed");
+    // Neither stream claims nothing was approved, and the sibling's commit is real.
+    let delivered = format!("{}{}", text, stderr(&out));
+    for blanket in ["nothing was approved", "nothing was acquired or approved"] {
+        assert!(
+            !delivered.to_lowercase().contains(blanket),
+            "the blanket claim {blanket:?} must not appear: {delivered}"
+        );
+    }
+    assert_eq!(
+        h.pin_in(&h.project, &fixture.output_tag).map(|(d, _)| d),
+        Some(digest_of(&output_o1))
+    );
+    assert!(
+        h.pin_in(&h.project, &ambient_tag).is_none(),
+        "the refused insertion added no record"
+    );
+    assert_eq!(
+        h.pins_value().unwrap()["pins"].as_array().unwrap().len(),
+        STORE_PIN_BOUND,
+        "the refused insertion left the record count alone"
+    );
+}
+
+/// A1: a success-first batch keeps its commit when a later save fails. Cheap and
+/// deterministic: the write sequence is one short of exhaustion, so the first
+/// target's save consumes the last token and the second target's save fails
+/// update-locally before it writes.
+#[test]
+fn refresh_late_sequence_exhaustion_keeps_the_earlier_commit() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let fixture = TwoReferences::create(&h, &server, "ac1seq");
+    let (boot_b1, output_o1) = fixture.move_both(&server, "ac1seq");
+    let output_record = h.record_in(&h.project, &fixture.output_tag).unwrap();
+    // One token left: the first target takes it, the second finds none.
+    // Exactly the fixture's two pins: this leg is about the write sequence, not
+    // the record bound.
+    let existing = h.pins_value().unwrap()["pins"].as_array().unwrap().len();
+    let pad = store_padded_to_pin_count(&h, existing, Some(u64::MAX - 1));
+    seed_store(&h, pad.as_bytes());
+
+    let mut gate = PinGate::new(h.root.path());
+    let mut command = refresh_as_ambient_command(&h, &fixture.boot_tag);
+    gate.attach(&mut command);
+    let child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the gated refresh");
+    for stage in [
+        PinStage::CandidateReady,
+        PinStage::BeforePinLock,
+        PinStage::PinLocked,
+        PinStage::BeforePinSave,
+    ] {
+        gate.expect(stage).reply(Reply::Continue);
+    }
+    let committed = gate.expect(PinStage::PinCommitted);
+    let snapshot = fs::read(h.pins()).unwrap();
+    assert_eq!(
+        h.pin_in(&h.project, &fixture.boot_tag).map(|(d, _)| d),
+        Some(digest_of(&boot_b1)),
+        "the first target really committed"
+    );
+    // Let the first target finish, then require the second to be refused before
+    // any write: no `BeforePinSave`, no second commit.
+    committed.reply(Reply::Continue);
+    for stage in [
+        PinStage::CandidateReady,
+        PinStage::BeforePinLock,
+        PinStage::PinLocked,
+    ] {
+        gate.expect(stage).reply(Reply::Continue);
+    }
+    drop(gate);
+    let out = child.wait_with_output().expect("collect the refresh");
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let text = stdout_of(&out);
+    let rows = rows_of(&out);
+    assert_eq!(rows.len(), 3, "{text}");
+    assert!(
+        rows[0].contains(&format!(
+            "changed {} -> {}",
+            digest_of(&fixture.boot_child),
+            digest_of(&boot_b1)
+        )),
+        "{text}"
+    );
+    assert!(
+        rows[1].starts_with("==> refresh [2/2] the latest output image (linux/")
+            && rows[1].contains("failed")
+            && rows[1].contains("this proposed pin-store update was not committed"),
+        "the later save failure is update-local: {text}"
+    );
+    assert_eq!(rows[2], "==> image refresh: 1 succeeded, 1 failed");
+    let delivered = format!("{}{}", text, stderr(&out));
+    for blanket in ["nothing was approved", "nothing was acquired or approved"] {
+        assert!(
+            !delivered.to_lowercase().contains(blanket),
+            "the blanket claim {blanket:?} must not appear: {delivered}"
+        );
+    }
+    // The earlier commit survives exactly; the refused target changed nothing.
+    assert_eq!(fs::read(h.pins()).unwrap(), snapshot);
+    assert_eq!(
+        h.pin_in(&h.project, &fixture.boot_tag).map(|(d, _)| d),
+        Some(digest_of(&boot_b1))
+    );
+    assert_eq!(
+        h.record_in(&h.project, &fixture.output_tag),
+        Some(output_record)
+    );
+    assert_ne!(digest_of(&output_o1), digest_of(&fixture.output_child));
+}
+
+/// A2: a *changed* observed H (not a vanished one) is a stale observation, the
+/// bookmark does not move, and the unrelated sibling still commits. Integrity
+/// failure is reserved for a live H that matches the observation.
+#[test]
+fn refresh_adoption_changed_observed_host_is_stale_and_siblings_continue() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let default_child = establish_default_unheld(&h, &server, "ac10chg");
+    // H is this project's Boot holder at its immutable key, and the bookmark.
+    let h_image = h.image(&ArchiveSpec {
+        marker: "ac10chg-h".into(),
+        ..Default::default()
+    });
+    let host_tag = format!("{}/images:ac10chgh", server.host);
+    let host_child = server.image("images", "ac10chgh", &h_image);
+    let mut setup = h.command();
+    setup.args(["setup", "--image", &host_child, "--no-verify"]);
+    assert_eq!(bounded(setup).status.code(), Some(0));
+    assert!(set_default(&h, &host_tag).status.success());
+    // An unrelated Output holder that moves, so the sibling has work to commit.
+    let o = h.image(&ArchiveSpec {
+        marker: "ac10chg-o".into(),
+        ..Default::default()
+    });
+    let output_tag = format!("{}/images:ac10chgout", server.host);
+    let output_child = server.image("images", "ac10chgout", &o);
+    assert_eq!(
+        h.import(&o.written.path, &output_tag).status.code(),
+        Some(0)
+    );
+    let o1 = h.image(&ArchiveSpec {
+        marker: "ac10chg-o1".into(),
+        ..Default::default()
+    });
+    let output_o1 = server.image("images", "ac10chgout", &o1);
+
+    let mut gate = PinGate::new(h.root.path());
+    let mut command = h.command();
+    command.args(["image", "refresh"]);
+    gate.attach(&mut command);
+    let child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the gated refresh");
+    gate.expect(PinStage::CandidateReady).reply(Reply::Continue);
+    let before_lock = gate.expect(PinStage::BeforePinLock);
+    // A peer rewrites H's approval to different content: the observation is now
+    // changed rather than absent, and both are stale.
+    let mut store: serde_json::Value =
+        serde_json::from_slice(&fs::read(h.pins()).unwrap()).unwrap();
+    let changed = format!("sha256:{}", "d".repeat(64));
+    for record in store["pins"].as_array_mut().unwrap() {
+        if record["manifest_digest"]
+            .as_str()
+            .is_some_and(|digest| digest == digest_of(&host_child))
+        {
+            record["manifest_digest"] = serde_json::Value::String(changed.clone());
+        }
+    }
+    fs::write(h.pins(), serde_json::to_vec(&store).unwrap()).unwrap();
+    let peer_bytes = fs::read(h.pins()).unwrap();
+    assert_eq!(
+        h.default_record_in(&h.project).unwrap()["image"],
+        serde_json::Value::String(default_child.clone()),
+        "the peer moved no bookmark"
+    );
+
+    before_lock.reply(Reply::Continue);
+    // The stale adoption takes its lock, decides stale and writes nothing; the
+    // next stage is the sibling's candidate, never H's save.
+    gate.expect(PinStage::PinLocked).reply(Reply::Continue);
+    gate.expect(PinStage::CandidateReady).reply(Reply::Continue);
+    let sibling_lock = gate.expect(PinStage::BeforePinLock);
+    assert_eq!(
+        fs::read(h.pins()).unwrap(),
+        peer_bytes,
+        "the stale adoption changed nothing"
+    );
+    sibling_lock.reply(Reply::Continue);
+    for stage in [
+        PinStage::PinLocked,
+        PinStage::BeforePinSave,
+        PinStage::PinCommitted,
+    ] {
+        gate.expect(stage).reply(Reply::Continue);
+    }
+    drop(gate);
+    let out = child.wait_with_output().expect("collect the refresh");
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let text = stdout_of(&out);
+    let rows = rows_of(&out);
+    assert!(
+        rows[0].contains("[1/2]")
+            && rows[0].contains("failed")
+            && rows[0].contains("image approval is stale; retry the explicit operation"),
+        "a changed observation is stale, not an integrity failure: {text}"
+    );
+    assert!(
+        !rows[0].contains("integrity"),
+        "integrity is reserved for matching live content: {text}"
+    );
+    assert!(
+        rows[1].starts_with("==> refresh [2/2] the latest output image (linux/")
+            && rows[1].contains(&format!(
+                "changed {} -> {}",
+                digest_of(&output_child),
+                digest_of(&output_o1)
+            )),
+        "{text}"
+    );
+    assert_eq!(rows[2], "==> image refresh: 1 succeeded, 1 failed");
+    assert_eq!(
+        h.default_record_in(&h.project).unwrap()["image"],
+        serde_json::Value::String(default_child.clone()),
+        "the bookmark did not move"
+    );
+    assert_eq!(
+        h.pin_in(&h.project, &output_tag).map(|(d, _)| d),
+        Some(digest_of(&output_o1))
+    );
+}
+
+/// The uppercase-hex spelling of a `repo@algorithm:hex` reference: an accepted
+/// alias that canonicalizes to the same key.
+fn uppercase_hex(reference: &str) -> String {
+    let (head, hex) = reference.rsplit_once(':').expect("repo@algorithm:hex");
+    format!("{head}:{}", hex.to_ascii_uppercase())
+}
+
+/// AC3: two spellings of one canonical key are one key — through a `--image`
+/// filter and through a bare refresh's deduplication.
+#[test]
+fn refresh_deduplicates_canonical_alias_spellings() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let image = h.image(&ArchiveSpec {
+        marker: "ac3alias".into(),
+        ..Default::default()
+    });
+    let canonical = server.image("images", "ac3alias", &image);
+    // A genuine Boot holder, so the alias spelling has membership evidence to
+    // match: the key is canonical identity, not the caller's spelling.
+    let mut setup = h.command();
+    setup.args(["setup", "--image", &canonical, "--no-verify"]);
+    let setup = bounded(setup);
+    assert_eq!(setup.status.code(), Some(0), "{}", stderr(&setup));
+    assert_eq!(h.records_in(&h.project), 1);
+    let alias = uppercase_hex(&canonical);
+    assert_ne!(alias, canonical, "the fixture must use another spelling");
+
+    // The alias spelling is a member of the canonical key's record.
+    let requests_before = server.count();
+    let out = h.refresh(&alias);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let text = stdout_of(&out);
+    assert_eq!(text.lines().count(), 2, "{text}");
+    assert!(
+        text.contains(&canonical),
+        "the row names the canonical spelling: {text}"
+    );
+    assert_eq!(
+        manifest_requests(&server, requests_before, &digest_of(&canonical)),
+        1
+    );
+    assert_eq!(h.records_in(&h.project), 1, "one record, not two");
+
+    // A bare refresh with the alias as the ambient selection also dedupes to the
+    // same single key.
+    let requests_before = server.count();
+    let out = h.refresh_as_ambient(&alias);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let text = stdout_of(&out);
+    assert_eq!(text.lines().count(), 2, "one target only: {text}");
+    assert_eq!(
+        manifest_requests(&server, requests_before, &digest_of(&canonical)),
+        1
+    );
+    assert_eq!(h.records_in(&h.project), 1);
+}
+
+/// AC5/AC6: malformed, empty and non-Unicode inputs are refused value-free
+/// **before any state exists** — process-level, not only at the preflight unit.
+#[test]
+fn refresh_input_refusals_precede_any_state() {
+    for malformed in ["Foo/Bar:tag", "repo:bad tag", "repo@sha256:short", ""] {
+        let h = Harness::new(Mode::StrictAcquisition);
+        let out = h.refresh(malformed);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{malformed:?}: {}",
+            stderr(&out)
+        );
+        let text = stderr(&out);
+        assert!(
+            text.contains("must not be empty")
+                || text.contains("needs a valid OCI image reference"),
+            "{malformed:?}: {text}"
+        );
+        if !malformed.is_empty() {
+            assert!(
+                !text.contains(malformed),
+                "the rejected value is never echoed: {text}"
+            );
+        }
+        for created in [".agent-vm-msb", ".microsandbox"] {
+            assert!(
+                !h.home.join(created).exists(),
+                "{malformed:?}: a refused refresh created {created}"
+            );
+        }
+        assert!(
+            !h.pins().exists(),
+            "{malformed:?}: no authority was created"
+        );
+    }
+
+    // A present but non-Unicode environment value is a typed refusal, also
+    // before any state.
+    use std::os::unix::ffi::OsStrExt as _;
+    let h = Harness::new(Mode::StrictAcquisition);
+    let mut command = h.command();
+    command
+        .env("AGENT_VM_IMAGE_TAG", std::ffi::OsStr::from_bytes(b"\xff"))
+        .args(["image", "refresh"]);
+    let out = bounded(command);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains(
+            "AGENT_VM_IMAGE_TAG is set but is not usable as an image override; a Unicode value is \
+             required"
+        ),
+        "{}",
+        stderr(&out)
+    );
+    for created in [".agent-vm-msb", ".microsandbox"] {
+        assert!(
+            !h.home.join(created).exists(),
+            "a refused refresh created {created}"
+        );
+    }
+    assert!(!h.pins().exists(), "no authority was created");
+}
+
+/// Poll for a child to exit within `within`: `Some(code)` once it has, `None`
+/// while it is still running. Never blocks past the bound, so a stuck child fails
+/// a test instead of hanging CI.
+fn child_exit_within(child: &mut std::process::Child, within: Duration) -> Option<Option<i32>> {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Some(status.code());
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The output of a child that has already exited, read through its remaining pipe
+/// ends (they EOF once it is gone, so this cannot block).
+fn exited_child_output(child: &mut std::process::Child) -> String {
+    use std::io::Read as _;
+    let mut text = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        let _ = stdout.read_to_string(&mut text);
+    }
+    if let Some(mut stderr) = child.stderr.take() {
+        let _ = stderr.read_to_string(&mut text);
+    }
+    text
+}
+
+/// A gated stage expectation that refuses to look like a schedule hang: if the
+/// stage never arrives, the child's own exit status must show a panic (101). A
+/// child still running at the deadline is a scheduling failure, not a caught
+/// mutant, and fails with that distinction spelled out.
+fn expect_stage(
+    gate: &mut PinGate,
+    stage: PinStage,
+    child: &mut std::process::Child,
+) -> PinCheckpoint {
+    match gate.try_expect(stage) {
+        Ok(checkpoint) => checkpoint,
+        Err(why) => {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut code = None;
+            while std::time::Instant::now() < deadline {
+                if let Ok(Some(status)) = child.try_wait() {
+                    code = status.code();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            // The child finishing is the causal evidence: the mutant ended the
+            // batch early (a panic is 101, a mutant that aborts the batch is 1).
+            // A child still running at the deadline is a scheduling failure.
+            assert!(
+                code.is_some(),
+                "stage {stage:?} never arrived ({why}) and the child was still running after \
+                 10s: that is a scheduling failure, not a caught mutant."
+            );
+            panic!("stage {stage:?} never arrived ({why}); child exited {code:?}");
+        }
+    }
 }

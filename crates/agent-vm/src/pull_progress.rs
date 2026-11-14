@@ -119,10 +119,21 @@ pub async fn render(mut handle: PullProgressHandle, reference_label: Option<Stri
 /// that abort the task on an error path are intentionally tearing it
 /// down. Use this from every `agent-vm` command that spawns `render`.
 pub async fn await_render(handle: tokio::task::JoinHandle<()>) {
+    await_render_with(handle, &mut std::io::stderr()).await
+}
+
+/// [`await_render`] with the notification sink supplied.
+///
+/// A failed render task is diagnostic output, not the operation's outcome: a
+/// closed stderr loses the warning rather than panicking a committed command or
+/// aborting a batch that still has operations left.
+async fn await_render_with(handle: tokio::task::JoinHandle<()>, sink: &mut impl std::io::Write) {
     match handle.await {
         Ok(()) => {}
         Err(e) if e.is_cancelled() => {}
-        Err(e) => eprintln!("warn: progress render task failed: {e}"),
+        Err(e) => {
+            let _ = writeln!(sink, "warn: progress render task failed: {e}");
+        }
     }
 }
 
@@ -475,7 +486,7 @@ mod tests {
 
     use indicatif::{ProgressDrawTarget, TermLike};
 
-    use super::PullProgressDisplay;
+    use super::{PullProgressDisplay, await_render_with};
     use microsandbox::sandbox::PullProgress;
 
     /// A terminal that keeps what it was told to draw, so "the user saw this"
@@ -713,5 +724,194 @@ mod tests {
             "drew {} unnamed rows",
             live.layer_bars.len()
         );
+    }
+
+    /// A sink that can be closed, recording every byte it accepted.
+    struct Sink {
+        writable: bool,
+        written: String,
+    }
+
+    impl Sink {
+        fn open() -> Self {
+            Self {
+                writable: true,
+                written: String::new(),
+            }
+        }
+        fn closed() -> Self {
+            Self {
+                writable: false,
+                written: String::new(),
+            }
+        }
+    }
+
+    impl std::io::Write for Sink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if !self.writable {
+                return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+            }
+            self.written.push_str(&String::from_utf8_lossy(bytes));
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The private child mode the subprocess leg re-enters this exact test under.
+    const CHILD_MODE: &str = "AGENT_VM_TEST_AWAIT_RENDER_CHILD";
+
+    /// The subprocess leg: this executable re-enters this test with a **closed
+    /// stderr**, a failed render task, and the production [`super::await_render`]
+    /// wrapper. It prints READY, waits for the parent's GO, then calls the real
+    /// wrapper and prints DONE.
+    ///
+    /// A wrapper-only `eprintln!` mutant panics here, because the parent closed
+    /// the only stderr reader: the helper may stay correct and the mutant must
+    /// still die.
+    #[tokio::test]
+    async fn await_render_closed_sink_subprocess() {
+        if std::env::var(CHILD_MODE).is_err() {
+            return;
+        }
+        use std::io::{BufRead as _, Write as _};
+        let handle = failed_task().await;
+        println!("READY");
+        std::io::stdout().flush().expect("flush READY");
+        let mut go = String::new();
+        std::io::stdin().lock().read_line(&mut go).expect("read GO");
+        super::await_render(handle).await;
+        println!("DONE");
+        std::io::stdout().flush().expect("flush DONE");
+    }
+
+    /// The parent half of the subprocess leg: a closed stderr pipe, a failed
+    /// render task, and the **production** [`super::await_render`] wrapper in a
+    /// real child process. The wrapper must return, print DONE and exit 0; a
+    /// wrapper-only `eprintln!` dies here even though the injected-sink helper
+    /// above stays correct.
+    #[test]
+    fn await_render_closed_sink_production_wrapper_subprocess() {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        if std::env::var(CHILD_MODE).is_ok() {
+            return;
+        }
+        let exe = std::env::current_exe().expect("locate the test executable");
+        let mut child = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "pull_progress::tests::await_render_closed_sink_subprocess",
+                "--nocapture",
+            ])
+            .env(CHILD_MODE, "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn the closed-sink child");
+        let stdout = child.stdout.take().expect("child stdout");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { return };
+                if sender.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+        let wait_for = |expected: &str| {
+            loop {
+                match receiver.recv_timeout(Duration::from_secs(30)) {
+                    Ok(line) if line.contains(expected) => return,
+                    Ok(_) => {}
+                    Err(error) => panic!("no {expected} from the child: {error}"),
+                }
+            }
+        };
+        wait_for("READY");
+        // The parent owns the only stderr reader: dropping it closes the pipe, so
+        // the wrapper's notification write cannot succeed.
+        drop(child.stderr.take());
+        {
+            let mut stdin = child.stdin.take().expect("child stdin");
+            stdin.write_all(b"go\n").expect("send GO");
+            stdin.flush().expect("flush GO");
+        }
+        // The child must *say* DONE after the wrapper returns, and a child that
+        // panicked in the wrapper exits 101 — both are required, because silence
+        // alone could be a schedule. Poll the exit first so a stuck child fails
+        // instead of hanging.
+        let mut done = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            match receiver.recv_timeout(Duration::from_millis(200)) {
+                Ok(line) if line.contains("DONE") => {
+                    done = true;
+                    break;
+                }
+                Ok(line) => panic!("the child printed {line:?} where DONE was required"),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if let Ok(Some(_)) = child.try_wait() {
+                        break;
+                    }
+                }
+                Err(error) => panic!("the child's output channel closed before DONE: {error}"),
+            }
+        }
+        if !done {
+            let status = child.try_wait().expect("poll the child");
+            panic!(
+                "no DONE from the child; it exited with {:?} — the production wrapper must \
+                 return on a closed sink (the child then prints DONE and exits 0), and a \
+                 still-running child is a scheduling failure, not a caught mutant",
+                status.and_then(|status| status.code())
+            );
+        }
+        let status = child.wait().expect("wait for the child");
+        let _ = reader.join();
+        assert!(
+            status.success(),
+            "the production wrapper must survive a closed sink: {status}"
+        );
+    }
+
+    /// Wait for a task that has already panicked, so the join itself reports the
+    /// failure (and the panic hook has already run).
+    async fn failed_task() -> tokio::task::JoinHandle<()> {
+        let handle = tokio::spawn(async { panic!("render template exploded") });
+        while !handle.is_finished() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        handle
+    }
+
+    /// A failed render task is diagnostic output only: a closed sink loses the
+    /// warning, an open one gets it exactly once, and a happy or cancelled task
+    /// says nothing at all.
+    #[tokio::test]
+    async fn await_render_closed_sink_is_nonfatal() {
+        // A real failed JoinHandle with a closed sink: awaiting returns.
+        let mut closed = Sink::closed();
+        await_render_with(failed_task().await, &mut closed).await;
+        assert_eq!(closed.written, "");
+
+        // The same failure on an open sink emits the existing warning once.
+        let mut open = Sink::open();
+        await_render_with(failed_task().await, &mut open).await;
+        assert!(
+            open.written
+                .starts_with("warn: progress render task failed: ")
+        );
+        assert_eq!(open.written.matches("warn:").count(), 1, "{}", open.written);
+
+        // A happy task and a cancelled one are silent.
+        let mut sinks = Sink::open();
+        await_render_with(tokio::spawn(async {}), &mut sinks).await;
+        let cancelled = tokio::spawn(async { std::future::pending::<()>().await });
+        cancelled.abort();
+        await_render_with(cancelled, &mut sinks).await;
+        assert_eq!(sinks.written, "");
     }
 }

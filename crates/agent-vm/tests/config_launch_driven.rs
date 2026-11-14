@@ -457,6 +457,17 @@ impl Harness {
         cmd.args(args);
         run_with_timeout(cmd, Duration::from_secs(60))
     }
+    /// A bare `image refresh` whose ambient selection is `reference`.
+    ///
+    /// The seeding shape for a fixture whose reference no launch/import has
+    /// recorded: `--image` is a target filter over references already in use
+    /// (ADR-0068 D10), so it cannot approve an arbitrary one.
+    fn refresh_as_ambient_shared(&self, cache: &Path, reference: &str) -> Output {
+        let mut cmd = self.shared_command(cache);
+        cmd.env("AGENT_VM_IMAGE_TAG", reference)
+            .args(["image", "refresh"]);
+        run_with_timeout(cmd, Duration::from_secs(60))
+    }
 
     fn image(&self, spec: &image_archive::ArchiveSpec) -> oci_registry::Image {
         let path = self.home_root.join(format!("{}.tar", spec.marker));
@@ -4481,6 +4492,13 @@ fn verb_name(argv: &[&str]) -> String {
     argv.join(" ")
 }
 
+/// Everything one command delivered. A per-operation refresh failure is a result
+/// row on stdout (ADR-0068 D10), so an oracle about the failure *reason* must
+/// read both sinks.
+fn delivered(out: &Output) -> String {
+    format!("{}{}", stdout_of(out), stderr_of(out))
+}
+
 /// The two tiers' `image` settings (and, when `declares_tool`, the project's
 /// `probe` tool). Named fields rather than two adjacent `Option<&str>`
 /// parameters, so a user/project swap cannot compile
@@ -4883,21 +4901,62 @@ fn image_precedence_at_every_cli_boundary() {
                 "{} ({verb}): the bogus image must fail, stderr:\n{stderr}",
                 row.name
             );
-            if row.expected == default_ref() {
-                let safe = if verb == "image refresh" {
-                    "==> the default boot image is the image this configuration boots from"
-                } else {
-                    "==> Acquiring the default boot image into the microsandbox image cache"
-                };
+            if verb == "image refresh" && row.env == Some(" ") {
+                // A present-but-unusable ambient value fails the input-only
+                // preflight, before any membership or registry question: the
+                // whitespace is never trimmed into `unset`.
+                assert_eq!(out.status.code(), Some(1), "{} ({verb})", row.name);
                 assert!(
-                    stdout.contains(safe),
-                    "{} ({verb}): default notice missing:\n{stdout}",
+                    stderr.contains("needs a valid OCI image reference"),
+                    "{} ({verb}): {stderr}",
                     row.name
                 );
-            } else if verb == "image refresh" {
+                assert_eq!(
+                    harness.decoy_log(&decoys),
+                    "",
+                    "{} ({verb}): no builder calls",
+                    row.name
+                );
+                continue;
+            }
+            if verb == "image refresh" && row.cli.is_some() {
+                // ADR-0068 D10: refresh's `--image` filters the ambient-reference
+                // /held-reference union, so a fresh typed reference is refused
+                // before any registry work. The selection precedence rows above
+                // and below still prove launch/setup semantics.
+                assert_eq!(out.status.code(), Some(1), "{} ({verb})", row.name);
                 assert!(
-                    stdout.contains(&format!("==> {} (from {}", row.expected, row.source)),
-                    "{} ({verb}): selection notice missing:\n{stdout}",
+                    stderr.contains("targets only references currently in use"),
+                    "{} ({verb}): {stderr}",
+                    row.name
+                );
+                assert_eq!(
+                    harness.decoy_log(&decoys),
+                    "",
+                    "{} ({verb}): no builder calls",
+                    row.name
+                );
+                continue;
+            }
+            if verb == "image refresh" {
+                // One result row per planned operation, labelled by the ambient
+                // operation's own (redacted) label.
+                let label = if row.expected == default_ref() {
+                    "the default boot image".to_owned()
+                } else {
+                    row.expected.to_owned()
+                };
+                assert!(
+                    stdout.contains(&format!("==> refresh [1/1] {label} (linux/")),
+                    "{} ({verb}): result row missing:\n{stdout}",
+                    row.name
+                );
+            } else if row.expected == default_ref() {
+                assert!(
+                    stdout.contains(
+                        "==> Acquiring the default boot image into the microsandbox image cache"
+                    ),
+                    "{} ({verb}): default notice missing:\n{stdout}",
                     row.name
                 );
             } else {
@@ -5475,14 +5534,18 @@ fn help_doctor_pull_setup_and_launch_agree_on_image_selection() {
     }
 }
 
-/// S3: `image refresh` is a boot-free acquisition verb, so its `--image` help
-/// must describe acquisition. The flattened `boot_image::ImageArgs` help wins
-/// unless the refresh subcommand overrides it, so both help spellings are
-/// pinned here, together with the `set-default` control that keeps its own
-/// acquisition wording.
+/// S4: `image refresh` is a boot-free, in-use-target verb. Its own argument
+/// metadata (not the launch `ImageArgs`) owns `--image`'s help, and both the
+/// flag help and the subcommand help must state the operation/holder contract,
+/// the unheld-default adoption substitution and the filter/refusal rule. The
+/// `set-default` control keeps its own acquisition wording.
 #[test]
-fn image_refresh_help_describes_acquisition_not_booting() {
+fn image_refresh_help_describes_in_use_targets_not_booting() {
     let harness = Harness::new();
+    const SHORT: &str = "Refresh one in-use OCI reference without changing boot selection";
+    const REFRESH_SHORT: &str = "Refresh this project's in-use OCI references without booting a VM";
+    const REFRESH_LONG: &str = "Re-resolve and approve the ambient boot operation and all recorded boot/output holders without asking. When adopting the host default, that operation acquires it instead of the old unheld project default; a held old default is refreshed independently. Use --image REF to refresh one in-use reference without changing selection or adopting a default. Keep successful approvals if another target fails; exit 1 if any target fails.";
+    const FLAG_LONG: &str = "Refresh one OCI reference currently in use by this project on the host platform, without changing boot selection or adopting a default.\n\nWithout --image, refresh the ambient boot operation and all recorded boot/output holders. When adopting the host default, that operation supersedes the old unheld project default; a held old default is refreshed independently. AGENT_VM_IMAGE_TAG selects the ambient boot reference; it does not restrict the refresh to one target. An empty value counts as unset. A reference outside this set is refused; use setup --image REF --no-verify to acquire a new boot reference. See USAGE.md → \"Refreshing in-use images\".";
     for args in [
         vec!["image", "refresh", "-h"],
         vec!["image", "refresh", "--help"],
@@ -5495,31 +5558,40 @@ fn image_refresh_help_describes_acquisition_not_booting() {
             "{args:?} must exit 0:\n{text}\n{}",
             stderr_of(&out)
         );
-        assert!(
-            text.contains("OCI image to acquire"),
-            "{args:?} must describe acquisition:\n{text}"
-        );
-        assert!(
-            text.contains("instead of the configured selection"),
-            "{args:?} must distinguish the refresh override:\n{text}"
-        );
+        // Help output wraps at the terminal width, so the pinned text is
+        // compared with runs of whitespace collapsed.
+        let flat = flatten(&text);
         assert!(
             !text.contains("Boot this image"),
             "{args:?} must not describe refresh as a launch:\n{text}"
         );
-        if args.contains(&"--help") || args[0] == "help" {
+        assert!(
+            !text.contains("instead of the configured selection"),
+            "{args:?} must not promise a selection override:\n{text}"
+        );
+        let long = args.contains(&"--help") || args[0] == "help";
+        if long {
             assert!(
-                text.contains("OCI image to acquire into the image cache"),
-                "{args:?} must use the refresh-specific long help:\n{text}"
+                flat.contains(&flatten(FLAG_LONG)),
+                "{args:?} must carry the exact long flag help:\n{text}"
             );
             assert!(
-                text.contains("Precedence: this flag (or `AGENT_VM_IMAGE_TAG`)"),
-                "{args:?} must retain the precedence text:\n{text}"
+                flat.contains(&flatten(REFRESH_LONG)),
+                "{args:?} must carry the exact refresh subcommand help:\n{text}"
+            );
+        } else {
+            assert!(
+                flat.contains(&flatten(SHORT)),
+                "{args:?} must carry the exact short flag help:\n{text}"
+            );
+            assert!(
+                flat.contains(&flatten(REFRESH_SHORT)),
+                "{args:?} must carry the exact refresh short help:\n{text}"
             );
         }
     }
     let set_default = stdout_of(&harness.builtin(&["image", "set-default", "--help"], &[]));
-    // B1: the help now says whose default the command changes (#541).
+    // B1: the help says whose default the command changes (#541).
     assert!(
         set_default.contains("starting default for projects that have none yet"),
         "set-default's help states the host starting choice:\n{set_default}"
@@ -5532,6 +5604,25 @@ fn image_refresh_help_describes_acquisition_not_booting() {
         !set_default.contains("instead of the configured selection"),
         "set-default must not inherit refresh's override wording:\n{set_default}"
     );
+}
+
+/// Collapse every whitespace run to one space, so a pinned help sentence can be
+/// compared with output clap wrapped at the current terminal width.
+fn flatten(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Run one of [`ACQUISITION_VERBS`] so that it really acquires `reference`:
+/// `setup` takes `--image`, while `image refresh` needs the reference to be its
+/// ambient selection because `--image` only filters references already in use.
+fn acquisition_row(harness: &Harness, verb: &[&str], reference: &str) -> Output {
+    if verb_name(verb) == "image refresh" {
+        harness.builtin(verb, &[("AGENT_VM_IMAGE_TAG", reference)])
+    } else {
+        let mut argv = verb.to_vec();
+        argv.extend_from_slice(&["--image", reference]);
+        harness.builtin(&argv, &[])
+    }
 }
 
 /// `doctor` reports the boot image but has no `--image` of its own: a launch's
@@ -5719,7 +5810,15 @@ fn broken_config_pull_and_setup_explain_the_image_fallback() {
                 envs.push(("AGENT_VM_IMAGE_TAG", env));
             }
             let mut args: Vec<&str> = verb.to_vec();
-            if let Some(cli) = cli {
+            if verb_name(verb) == "image refresh" {
+                // Refresh's `--image` is a target filter, and a fresh reference
+                // in a broken catalog has no membership evidence. The same
+                // reference is supplied as the ambient selection instead, which
+                // is the allowed broken-configuration recovery.
+                if let Some(cli) = cli {
+                    envs.push(("AGENT_VM_IMAGE_TAG", cli));
+                }
+            } else if let Some(cli) = cli {
                 args.push("--image");
                 args.push(cli);
             }
@@ -6002,13 +6101,22 @@ fn run_builtin_acquisition(row: &Precedence, verb: &[&str]) -> Result<String, St
         cmd.env("AGENT_VM_IMAGE_TAG", env);
     }
     let mut argv = verb.to_vec();
+    let refresh = verb_name(verb) == "image refresh";
     if let Some(cli) = row.cli {
-        argv.push("--image");
-        argv.push(cli);
+        if refresh {
+            // Refresh has no selection override: its `--image` is a target
+            // filter, so the same reference is supplied as the ambient
+            // selection and the unfiltered acquisition is proven to be the
+            // selected one.
+            cmd.env("AGENT_VM_IMAGE_TAG", cli);
+        } else {
+            argv.push("--image");
+            argv.push(cli);
+        }
     }
     let verb = verb_name(verb);
     let out = Harness::run_on(cmd, &argv);
-    let stderr = stderr_of(&out);
+    let stderr = delivered(&out);
     if out.status.success() {
         return Err(format!("{verb} unexpectedly succeeded:\n{stderr}"));
     }
@@ -6794,7 +6902,7 @@ fn a_default_tier_reference_is_redacted_across_output() {
     let combined = format!("{}{}", stdout_of(&refresh), stderr_of(&refresh));
     assert!(!combined.contains("agent-vm image import") && !combined.contains("hint:"));
     assert!(
-        combined.contains("the default boot image is the image this configuration boots from"),
+        combined.contains("==> refresh [1/1] the default boot image (linux/"),
         "refresh must name the default safely:\n{combined}"
     );
     assert!(
@@ -8956,11 +9064,9 @@ fn refresh_and_setup_give_the_same_hint() {
     let harness = Harness::new();
     harness.write_project(PROBE_TOOL);
     for verb in ACQUISITION_VERBS {
-        let mut argv = verb.to_vec();
-        argv.extend_from_slice(&["--image", CLI_REF]);
-        let out = harness.builtin(&argv, &[]);
+        let out = acquisition_row(&harness, verb, CLI_REF);
         let verb = verb_name(verb);
-        let stderr = stderr_of(&out);
+        let stderr = delivered(&out);
         assert!(!out.status.success(), "{stderr}");
         // The registry chain stays beneath the hint: the two must not trade
         // places (the shared `pull.rs` path, story 14).
@@ -8996,11 +9102,9 @@ fn a_digest_pinned_registry_miss_has_no_hint() {
     // The same suppression at the shared refresh/setup call site (`pull.rs`),
     // not only at launch: a digest there is equally not an import target.
     for verb in ACQUISITION_VERBS {
-        let mut argv = verb.to_vec();
-        argv.extend_from_slice(&["--image", &raw]);
-        let out = harness.builtin(&argv, &[]);
+        let out = acquisition_row(&harness, verb, &raw);
         let verb = verb_name(verb);
-        let stderr = stderr_of(&out);
+        let stderr = delivered(&out);
         assert!(!out.status.success(), "{verb}: {stderr}");
         assert!(stderr.contains("registry error"), "{verb}: {stderr}");
         assert!(!stderr.contains("hint:"), "{verb}: {stderr}");
@@ -9132,7 +9236,7 @@ fn unrelated_stall_does_not_block_a_warm_launch() {
     let y_tag = format!("{}/repo:y", server.host);
     server.image("repo", "y", &y_image);
     status_ok(
-        &x.run_shared(cache, &["image", "refresh", "--image", &y_tag]),
+        &x.refresh_as_ambient_shared(cache, &y_tag),
         "warming Y in the shared cache",
     );
 
@@ -9154,9 +9258,15 @@ fn unrelated_stall_does_not_block_a_warm_launch() {
 
     // Cold X stalls mid-blob, holding the shared barrier.
     let ready = server.stall_blob(&format!("/v2/repo/blobs/{}", x_image.written.layer_digest));
+    // A bare refresh also covers this project's recorded holders; the row needs
+    // exactly one stalled acquisition, so it runs where only X is in use.
+    let stalled_project = x.project_root.join("stalled-refresh");
+    std::fs::create_dir_all(&stalled_project).unwrap();
     let mut x_cmd = x.shared_command(cache);
     x_cmd
-        .args(["image", "refresh", "--image", &x_tag])
+        .current_dir(&stalled_project)
+        .env("AGENT_VM_IMAGE_TAG", &x_tag)
+        .args(["image", "refresh"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let x_child = x_cmd.spawn().expect("spawn the stalled acquisition");
@@ -9250,10 +9360,7 @@ fn archive_publication_cannot_cross_validated_sdk_consumption() {
     });
     let tag = format!("{}/repo:tag", server.host);
     server.image("repo", "tag", &a);
-    status_ok(
-        &h.run_shared(cache, &["image", "refresh", "--image", &tag]),
-        "warming A",
-    );
+    status_ok(&h.refresh_as_ambient_shared(cache, &tag), "warming A");
     let mut h = h;
     h.use_launch_runtime();
     let a_digest = a.written.manifest_digest.clone();
@@ -9385,8 +9492,16 @@ fn archive_publication_cannot_cross_validated_sdk_consumption() {
     // its first cache read (no acquisition checkpoint at all).
     let held = hold_exclusive_publication(cache);
     let mut gate = AcquisitionGate::new(h._home.path());
+    // A bare refresh also covers this project's recorded holders, so the barrier
+    // row runs where only the ambient selection is in use: one acquisition, the
+    // schedule this test orders against.
+    let blocked_project = h.project_root.join("blocked-refresh");
+    std::fs::create_dir_all(&blocked_project).unwrap();
     let mut blocked_cmd = h.shared_command(cache);
-    blocked_cmd.args(["image", "refresh", "--image", &tag]);
+    blocked_cmd
+        .current_dir(&blocked_project)
+        .env("AGENT_VM_IMAGE_TAG", &tag)
+        .args(["image", "refresh"]);
     let blocked = Peer::spawn(blocked_cmd, &gate, &[]);
     let waiting = gate.expect(AcquisitionStage::PublicationContended);
     // The real shared attempt contended while our independent exclusive fd holds.
@@ -9444,7 +9559,7 @@ fn an_old_spelling_warm_cache_launch_is_registry_free() {
         };
         assert_ne!(old_source, source);
         status_ok(
-            &seed.run_shared(cache, &["image", "refresh", "--image", &source]),
+            &seed.refresh_as_ambient_shared(cache, &source),
             "warming canonical source",
         );
         let canonical_path = cache_metadata(cache, &source);
@@ -9550,11 +9665,11 @@ fn a_concurrent_tag_move_is_not_reverted_by_a_warm_launch() {
     server.image("repo", "moved", &b);
     assert_ne!(a.written.manifest_digest, b.written.manifest_digest);
     status_ok(
-        &h.run_shared(cache, &["image", "refresh", "--image", &tag]),
+        &h.refresh_as_ambient_shared(cache, &tag),
         "warming A under the tag",
     );
     status_ok(
-        &h.run_shared(cache, &["image", "refresh", "--image", &moved]),
+        &h.refresh_as_ambient_shared(cache, &moved),
         "warming B under another tag",
     );
     assert_eq!(
@@ -9669,11 +9784,11 @@ fn an_old_spelling_migration_keeps_a_concurrent_publication() {
         server.image("repo", "old", &a);
         server.image("repo", "moved", &b);
         status_ok(
-            &seed.run_shared(cache, &["image", "refresh", "--image", &source]),
+            &seed.refresh_as_ambient_shared(cache, &source),
             "warming the canonical source",
         );
         status_ok(
-            &seed.run_shared(cache, &["image", "refresh", "--image", &moved]),
+            &seed.refresh_as_ambient_shared(cache, &moved),
             "warming another tag",
         );
         let old_source = source.replace("localhost", "LOCALHOST");
@@ -9793,7 +9908,7 @@ fn a_warm_digest_launch_repairs_nothing() {
     let a = h.image(&image_archive::ArchiveSpec::default());
     let pin = server.image("repo", "digest", &a);
     status_ok(
-        &h.run_shared(cache, &["image", "refresh", "--image", &pin]),
+        &h.refresh_as_ambient_shared(cache, &pin),
         "warming the immutable digest",
     );
     let metadata_path = cache_metadata(cache, &pin);
@@ -9870,7 +9985,7 @@ fn a_warm_index_launch_without_a_receipt_consumes_the_child() {
         "the stated index digest must be the envelope, not the child"
     );
     status_ok(
-        &h.run_shared(cache, &["image", "refresh", "--image", &index]),
+        &h.refresh_as_ambient_shared(cache, &index),
         "establishing the index association",
     );
     let receipts = cache.join("agent-vm-content-metadata");
@@ -9959,7 +10074,7 @@ fn an_incomplete_digest_entry_reports_completeness() {
     let a = h.image(&image_archive::ArchiveSpec::default());
     let pin = server.image("repo", "gapped", &a);
     status_ok(
-        &h.run_shared(cache, &["image", "refresh", "--image", &pin]),
+        &h.refresh_as_ambient_shared(cache, &pin),
         "warming the immutable digest",
     );
     drop_materialized_content(cache, &a.written.manifest_digest);
@@ -10021,7 +10136,7 @@ fn multiple_sources_of_one_child_remain_launchable_offline() {
         // offline, with no intervening refresh that could recreate its binding.
         for source in sources {
             status_ok(
-                &h.run_shared(cache, &["image", "refresh", "--image", source]),
+                &h.refresh_as_ambient_shared(cache, source),
                 "acquiring another source of C",
             );
         }
@@ -10098,7 +10213,7 @@ fn a_receipt_for_another_identity_fails_the_launch_closed() {
     assert_ne!(x_child, y_child);
     for index in [&x_index, &y_index] {
         status_ok(
-            &h.run_shared(cache, &["image", "refresh", "--image", index]),
+            &h.refresh_as_ambient_shared(cache, index),
             "warming an index association",
         );
     }

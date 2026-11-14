@@ -75,6 +75,10 @@ if [[ "$guard_only" == false ]]; then
     # reads, and that a failed observation never reads as an empty cache. Cheap
     # and boot-free, so it sits with #455's contract above.
     bash "$REPO_ROOT/script/test/reclaim-docker-cache-contract.sh"
+    # #543: the pins environment and its one ambient-override call site are
+    # boot-free contract material, so they are checked here before the released
+    # image control (which can hang for the pre-existing #479 reason).
+    bash "$REPO_ROOT/script/test/e2e-image-pins-contract.sh"
     bash "$REPO_ROOT/script/test/e2e-release-contract.sh"
     bash "$REPO_ROOT/script/test/egress-default-deny-contract.sh"
     bash "$REPO_ROOT/script/test/config-dir-guard-contract.sh"
@@ -120,6 +124,8 @@ syntax_check=(
     script/test/chrome-example-contract.sh
     script/test/chrome-example-contract-test.sh
     script/test/e2e-release-contract.sh
+    script/test/e2e-image-pins-contract.sh
+    script/test/lib/e2e-image-pins.sh
     script/test/e2e-image-cleanup-contract.sh
     script/test/reclaim-docker-cache.sh
     script/test/reclaim-docker-cache-contract.sh
@@ -178,6 +184,8 @@ shellcheck_files=(
     script/test/chrome-example-contract.sh
     script/test/chrome-example-contract-test.sh
     script/test/e2e-release-contract.sh
+    script/test/e2e-image-pins-contract.sh
+    script/test/lib/e2e-image-pins.sh
     script/test/e2e-image-cleanup-contract.sh
     script/test/reclaim-docker-cache.sh
     script/test/reclaim-docker-cache-contract.sh
@@ -236,6 +244,10 @@ assert_listed 'bash -n' 'script/test/persisted-network-live.sh' "${syntax_check[
 assert_listed 'shellcheck' 'script/test/persisted-network-live.sh' "${shellcheck_files[@]}"
 assert_listed 'bash -n' 'script/test/persisted-network-contract.sh' "${syntax_check[@]}"
 assert_listed 'shellcheck' 'script/test/persisted-network-contract.sh' "${shellcheck_files[@]}"
+assert_listed 'bash -n' 'script/test/e2e-image-pins-contract.sh' "${syntax_check[@]}"
+assert_listed 'shellcheck' 'script/test/e2e-image-pins-contract.sh' "${shellcheck_files[@]}"
+assert_listed 'bash -n' 'script/test/lib/e2e-image-pins.sh' "${syntax_check[@]}"
+assert_listed 'shellcheck' 'script/test/lib/e2e-image-pins.sh' "${shellcheck_files[@]}"
 assert_listed 'bash -n' 'script/test/build-provenance-contract.sh' "${syntax_check[@]}"
 assert_listed 'shellcheck' 'script/test/build-provenance-contract.sh' "${shellcheck_files[@]}"
 assert_listed 'bash -n' 'script/test/lib/persisted-network.sh' "${syntax_check[@]}"

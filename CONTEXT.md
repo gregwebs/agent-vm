@@ -525,26 +525,23 @@ guest; tool declarations do not install that software.
 
 ## Image refresh
 
-Explicit native acquisition of the selected OCI image reference into the
-**image cache**, checking whether the registry now serves different content,
-without booting a guest. It is the operation that re-resolves a mutable source,
-and running it is the **image approval** its own change needs: a changed **image
-pin** is replaced by the refresh itself, with the old and new digests rendered,
-and nothing is asked. `image set-default` resolves its target but approves
-nothing. Configuration is unchanged, but a default-tier refresh can still change
-which reference the project **selects**: it establishes an absent **project**
-default (success-before-establishment), and in a project that already has one it
-adopts the host's existing **retained default boot image**, moving the project's
-default reference to it. A tool configuration that
-cannot be read makes a bare refresh fail; `--image` and
-`AGENT_VM_IMAGE_TAG` still work, because they never select through the default
-tier.
+Explicit native reacquisition and candidate-scoped approval of a project's
+in-use OCI references, without booting a guest. Its worklist contains the
+ambient boot operation and recorded active-role holders on the host platform.
+A **target filter** narrows the ambient-reference/held-reference set; it does
+not select a boot image. An unheld historical pin is not a target merely because
+uncertainty preserves it. The invocation is consent: nothing is asked or read.
 
-Until #543, refresh targets its current single selection, not the whole
-**active image set**. It preserves role knowledge and creates new approvals
-without claiming a role. Unresolved roles protect those approvals until the
-scope's corresponding first claim; with both roles resolved, a subsequent
-successful claim can retire an inactive approval.
+Only the unfiltered ambient default-tier operation may establish or adopt.
+Adoption acquires H instead of unheld D; held D is refreshed independently. The
+bookmark moves, not the recorded Boot holder. An unfiltered default
+selection/offer error refuses the command before freeze; unreadable configuration
+cannot fabricate a selection. After freeze, failures preserve only their own
+transactions; successful siblings remain and may change effective defaults or
+content even with exit 1. The ADR-0067 D9 recommendation-host-seed exception
+remains. Refresh preserves role knowledge and claims no role; new approvals it
+creates are unheld and are protected by unresolved roles until the scope's
+corresponding first claim.
 
 ## Image cache
 
@@ -668,13 +665,13 @@ entry, default config, pinned layer.
 
 One **project**-scoped approval record: the **project** identifier, the canonical
 OCI reference and the measured host Linux platform
-(`linux/<arch>[/<variant>]`) of the **boot image**, mapped to the approved
+(`linux/<arch>[/<variant>]`) of that reference, mapped to the approved
 host-platform manifest **child** digest and a monotonic revision. Stored in the
 user-scoped `$HOME/.config/agent-vm/image-pins.json` (with `image-pins.lock`),
 host-managed and independent of the **image cache**, `AGENT_VM_STATE_DIR`,
 repository files and the **retained default boot image**. A launch or `setup`
 consumes `repo@child`, never the selected tag or index. Only `image refresh`
-re-resolves a source and approves what it resolves; `image set-default` resolves
+re-resolves an in-use source and approves what it resolves; `image set-default` resolves
 its target but approves nothing; `image build` and `image import` approve their
 own result reference. Each of those reads and writes only the invoking project's
 records:
@@ -700,7 +697,9 @@ active role needs them. The boot selection is the last OCI selection a launch or
 `setup` successfully acquired, including a one-off override, not the ambient
 next-launch selection. Roles are per Linux platform. There is no build-input
 role: tracking literal build inputs (#544) and Dockerfile dependencies (#545) is
-deferred and adds no placeholder here.
+deferred and adds no placeholder here. The **image refresh** worklist also
+includes the ambient operation before a recorded role, with ADR-0067 D7's
+unheld-D adoption substitution; refresh claims no role.
 
 A role is **unresolved** in a project/platform scope until that single-holder
 slot is first claimed. A successful claim resolves that role for every record in
@@ -734,8 +733,8 @@ The candidate-scoped replacement of an **image pin** by the explicit command
 that causes it — `image refresh`, `image build` or `image import`. The command is
 itself the consent: the escaped source (or the default tier's fixed label), the
 platform and the full old and new digests are rendered on stderr before the
-commit, and nothing is asked or read. A first pin or an unchanged digest renders
-nothing. Distinct from **credential authorization** (which host credential may
+commit, and nothing is asked or read. A first pin or an unchanged digest has no
+replacement-consent render; the explicit command may still report its outcome. Distinct from **credential authorization** (which host credential may
 be injected) and from cache repair. An immutable source that resolves to
 different content is an integrity failure, never an approvable change.
 

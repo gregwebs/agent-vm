@@ -49,10 +49,7 @@ use microsandbox_image::Platform;
 use serde::{Deserialize, Serialize};
 use vstd::prelude::*;
 
-use crate::boot_image::{
-    AdoptionOffer, BootImage, ImageLabel, ImageRef, ImageSource, ImmutableImageRef,
-};
-use crate::config;
+use crate::boot_image::{BootImage, ImageLabel, ImageRef, ImageSource, ImmutableImageRef};
 use crate::image_acquire::{
     self, AcquireError, AcquireMode, ContentIdentity, OciTarget, OciTargetError,
     PreparedNativeImage, ValidatedImage,
@@ -65,6 +62,7 @@ mod approval;
 mod completion;
 mod project_default;
 mod publication;
+mod refresh;
 mod store;
 mod unpinned;
 
@@ -75,6 +73,11 @@ pub(crate) use project_default::{
     load_default_slot, observe_defaults, set_default,
 };
 pub(crate) use publication::{approve_published, publication_preflight};
+pub(crate) use refresh::{
+    AmbientRefresh, ApprovalDelta, NOT_A_MEMBER_REASON, RefreshRequest, RefreshSuccess,
+    plan_refresh, refresh_target,
+};
+pub(crate) use store::RefreshScopeSnapshot;
 pub(crate) use unpinned::{BuiltImage, prepare_unpinned, read_back_unpinned};
 
 // `Option` normally accepts missing fields in serde. Version 1 requires the
@@ -649,126 +652,24 @@ async fn approved_preparation(
     Ok(prepared)
 }
 
-/// One explicit re-resolution plus the candidate-scoped approval it needs, in
-/// `project`.
+/// The strict, read-only authority snapshot one `image refresh` invocation
+/// freezes its worklist from: every record in exactly this project's
+/// host-platform scope, with the roles it holds.
 ///
-/// Running `image refresh` is the consent for every change it makes (ADR-0067):
-/// a first pin, a replaced approval for a moved mutable source, or adoption of
-/// the host default. The source is resolved exactly once, the change is rendered
-/// before it is committed, and the host transaction then compares and swaps
-/// against the revision and digest that were displayed. A failed render, a
-/// failed acquisition, a concurrent writer or an immutable reference that
-/// resolved to different content leaves the previous approval and default
-/// logically unchanged.
-pub(crate) async fn refresh(
-    boot: &BootImage,
-    offer: Option<AdoptionOffer>,
-    project: &ProjectDir,
-) -> Result<ProjectDefaultChange> {
-    if let Some(host) = &offer {
-        if !matches!(boot.source(), ImageSource::ProjectDefault(_)) {
-            bail!("internal error: an adoption offer needs an established project default");
-        }
-        if !same_canonical(host.image().reference().as_str(), boot.reference().as_str())? {
-            return project_default::adopt_host_default(boot, host, project).await;
-        }
-    }
-    let plan = Plan::for_refresh(boot)?;
-    let key = PinKey::new(&ProjectId::of(project), &plan.target)?;
-    let current = lookup(&key)?;
-    if !matches!(plan.default_action, DefaultAction::None) {
-        // A damaged fallback is a hard error before any registry request: a
-        // corrupt record is never "absent" and must not be re-pinned.
-        store::Store::host()?.default_health()?;
-    }
-    let prepared = acquire_or_render(
-        &plan.target,
-        &plan.label,
-        plan.rendering,
-        AcquireMode::ResolveCurrent,
-    )
-    .await?;
-    let candidate = ValidatedCandidate::from_image(prepared.image(), &key.project)?;
-    store::candidate_ready()?;
-    let approval = match &current {
-        None => Approval::initial(&candidate),
-        Some(pin) if pin.digest == candidate.digest => Approval::equivalent(pin, &candidate),
-        Some(pin) => {
-            if same_guest_content(pin, &candidate, &plan.label, plan.rendering).await? {
-                Approval::equivalent(pin, &candidate)
-            } else if key.is_immutable() {
-                return Err(immutable_integrity_failure());
-            } else {
-                // The explicit refresh is the consent: render, then mint.
-                approval::approve_refresh(
-                    &candidate,
-                    pin.clone(),
-                    &approval::ApprovalRequest {
-                        source: &plan.source,
-                        platform: &key.platform,
-                        old: &pin.digest,
-                        new: &candidate.digest,
-                    },
-                )?
-            }
-        }
-    };
-    // Revalidate only the frozen candidate: a mutable source that moved after it
-    // was resolved must not be resolved a second time, and the bytes this
-    // approval names are the bytes the transaction commits.
-    drop(prepared);
-    revalidate_frozen(&candidate, &plan.label, plan.rendering).await?;
-    let action = plan.default_action;
-    // Refresh preserves scope resolution and every holder: it approves content,
-    // never a role (ADR-0068 R7).
-    match commit(&candidate, &approval, action, RoleClaim::Keep)? {
-        store::CommitOutcome::Committed(completion) => {
-            completion::finish_preparation(completion.report);
-            Ok(completion.value.project_default)
-        }
-        store::CommitOutcome::Conflict => Err(anyhow!(
-            "image approval is stale; retry the explicit operation"
-        )),
-    }
+/// One shared-lock read. Nothing is created, recovered or rewritten, and the
+/// whole file is still decoded and validated, so a damaged foreign role join is
+/// refused here rather than filtered away.
+pub(crate) fn observe_refresh_scope(project: &ProjectDir) -> Result<RefreshScopeSnapshot> {
+    let scope = ScopeKey::of(ProjectId::of(project), HostLinuxPlatform::host());
+    store::Store::host()?.refresh_scope(&scope)
 }
 
-/// Whether two references name the same canonical content: one spelling of the
-/// "is this the same record?" question every default comparison asks.
 fn same_canonical(left: &str, right: &str) -> Result<bool> {
     let canonical = |text: &str| {
         CanonicalOciReference::parse(text)
             .map_err(|_| anyhow!("the default boot image reference is not canonical"))
     };
     Ok(canonical(left)? == canonical(right)?)
-}
-
-/// Everything one explicit operation decided before any I/O, resolved once.
-struct Plan {
-    target: OciTarget,
-    label: ImageLabel,
-    /// The render's source: the escaped selection, or the fixed default-tier
-    /// label rather than a record-sourced reference.
-    source: String,
-    rendering: Rendering,
-    default_action: DefaultAction,
-}
-
-impl Plan {
-    fn for_refresh(boot: &BootImage) -> Result<Self> {
-        let label = boot.label();
-        let source = if label.is_redacted() {
-            label.text().to_owned()
-        } else {
-            config::escape_str(boot.reference().as_str())
-        };
-        Ok(Self {
-            target: oci_target(boot.reference().as_str())?,
-            default_action: project_default::establishment(boot)?,
-            rendering: Rendering::Selection,
-            label,
-            source,
-        })
-    }
 }
 
 fn oci_target(text: &str) -> Result<OciTarget> {
