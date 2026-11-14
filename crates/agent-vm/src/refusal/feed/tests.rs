@@ -552,6 +552,48 @@ fn drop_does_not_block() {
     let _ = crate::host_paths::try_flock(&held, crate::host_paths::FlockMode::Exclusive);
 }
 
+/// `Drop` refusing a pending snapshot is the point — a teardown has no reader
+/// left — but a pending *final* job must survive it. `LiveSession::drop` may not
+/// block, so after it returns the detached thread is the only writer left for the
+/// record that says the session ended, and discarding the job here lost that
+/// record whenever the thread had not been scheduled yet (#572).
+///
+/// The writer is parked rather than blocked on the log's lock, because the lock
+/// only blocks a write and a blocked write gives up after `LOCK_WAIT`: a job that
+/// is pending a second from now is not a job that is pending at `Drop`. Parked,
+/// the thread takes nothing until the gate opens, so the final posted below is in
+/// the slot when `Drop` runs — on every run, and under any scheduler.
+///
+/// The write that follows is the same best effort as production's: it lands
+/// because this process is alive to let the thread run, not because `Drop` owes
+/// it.
+#[test]
+fn a_pending_final_survives_the_persister_s_own_drop() {
+    let (_root, dir) = dir();
+    let persist = Persister::new(dir.clone());
+    let handle = persist.handle();
+    assert!(
+        handle.hold_writer(FINAL_WAIT),
+        "the writer took a job instead of parking, so nothing here is ordered"
+    );
+    let wait = persist.post_final(snapshot(1, true));
+    drop(persist);
+    handle.release_writer();
+
+    assert!(
+        wait.wait(FINAL_WAIT),
+        "the detached writer still owed the final record after `Drop`"
+    );
+    let log = dir.read().unwrap();
+    let mine = log
+        .sessions
+        .iter()
+        .find(|session| session.info.id.as_str() == SID)
+        .expect("written");
+    assert_eq!(mine.rev, 1, "the final snapshot is what was written");
+    assert!(mine.ended_ms.is_some(), "the record says the session ended");
+}
+
 #[test]
 fn final_wait_is_bounded_with_a_held_lock() {
     let (_root, dir) = dir();

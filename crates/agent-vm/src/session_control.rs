@@ -549,6 +549,11 @@ impl Drop for LiveSession {
             // The final record, so a launch that never reaches a teardown still
             // leaves one that says the session ended. Not waited for: `Drop` may
             // not block, and a `finish` that already wrote it makes this a no-op.
+            // The job outlives this line: `Persister`'s own `Drop` keeps a
+            // pending final, so the detached writer can still write it (#572).
+            // Best effort, not a guarantee: the record lands only if that thread
+            // exists (a failed spawn is silent), is scheduled before the process
+            // exits, and its write succeeds. Nothing here waits for any of it.
             drop(persister.post_final(live.ended(feed::now_ms())));
         }
         if let Some(following) = lock(&self.following).take() {

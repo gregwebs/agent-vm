@@ -801,7 +801,17 @@ async fn dropping_after_a_cancelled_finish_still_unlinks_the_socket() {
 }
 
 /// A launch that errors before `create` never reaches a teardown, so `Drop` is
-/// the only writer left. The record it leaves must still say the session ended.
+/// the only writer left for the record that says the session ended.
+///
+/// That record is best effort, and stays so: `Drop` may not block, so it offers
+/// the final job and discards the `FinalWait` it gets back, and the
+/// `agent-vm-refusal-log` writer writes it on its next iteration. It lands only
+/// if that thread was spawned (a failed spawn is silent), scheduled while the
+/// process is still alive, and its write succeeds; a launch that exits before the
+/// thread runs leaves none, and nothing here can order that. What this asserts is
+/// the part that is owed — the job survives `Drop`, so a process alive long
+/// enough, as this one is, gets the record. A record that never comes while it is
+/// alive is the regression below (#572, #588).
 #[tokio::test]
 async fn dropping_a_session_writes_a_record_that_says_it_ended() {
     let root = tempfile::tempdir().unwrap();
@@ -813,23 +823,35 @@ async fn dropping_a_session_writes_a_record_that_says_it_ended() {
     let dir = SessionsDir::open(&project(root.path()).sessions_dir())
         .unwrap()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // 15 s of slack for a detached thread's first scheduling, not a write
+    // guarantee. The work is bounded — the log's own `LOCK_WAIT` (1 s) plus the
+    // write — and measures 30–50 ms idle and oversubscribed alike; the rest is
+    // for the case that is not measurable, which is what the old 5 s assumed
+    // away. The bound only bounds a hang.
+    let bound = Duration::from_secs(15);
+    let started = Instant::now();
     loop {
-        let ended = dir
+        let found = dir
             .read()
             .unwrap()
             .sessions
             .into_iter()
-            .find(|session| session.info.id == id)
-            // `and_then`, not `map`: a found session with no end is the case
-            // this waits through, and `Some(None)` would look like success.
-            .and_then(|session| session.ended_ms);
-        if ended.is_some() {
+            .find(|session| session.info.id == id);
+        // `and_then`, not `map`: a found session with no end is the case this
+        // waits through, and `Some(None)` would look like success.
+        if found
+            .as_ref()
+            .and_then(|session| session.ended_ms)
+            .is_some()
+        {
             break;
         }
         assert!(
-            Instant::now() < deadline,
-            "`Drop` offered no final record: {ended:?}"
+            started.elapsed() < bound,
+            "`Drop` left no final record for session {} after {:?}: expected the \
+             session in the log with `ended_ms` set, read {found:?}",
+            id.as_str(),
+            started.elapsed()
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
