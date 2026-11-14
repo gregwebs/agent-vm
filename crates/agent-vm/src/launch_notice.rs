@@ -11,9 +11,9 @@
 //! measured byte — `$HOME`, a directory entry, a git identity — end the line early
 //! and forge another `==> ` notice (#416). A notice the launcher *means* as several
 //! lines is the exception and says so, through [`LaunchNotices::emit_block`].
-//! [`LaunchNotices::emit_detached`] is not escaped, because both of its callers
-//! write framing control bytes of their own (a `\r` that reclaims a line the guest
-//! is mid-way through).
+//! [`LaunchNotices::emit_detached`] is not escaped, because one of its callers
+//! writes framing control bytes of its own (a `\r` that reclaims a line the guest
+//! is mid-way through); its messages are escaped, or control-free, at their source.
 
 use anyhow::{Context, Result};
 
@@ -89,10 +89,13 @@ impl<W: std::io::Write> LaunchNotices<W> {
     /// Deliver a notice the launcher deliberately renders as several lines.
     ///
     /// [`Self::emit`]'s escape cannot tell a forged line from a block the launcher
-    /// meant, so they are separate doors: every line written here is the launcher's
-    /// own, and no measured text may reach it. (The two callers are the Pi
-    /// credential warning, whose findings are meant as an indented list, and the
-    /// `AGENT_VM_DEBUG_CONFIG` dump.)
+    /// meant, so they are separate doors. What this one guarantees is the
+    /// *structure* alone: every line the reader sees is one the launcher wrote.
+    /// A measured value inside the block keeps that shape only if the block's own
+    /// renderer escapes it, which is why the `AGENT_VM_DEBUG_CONFIG` record spells
+    /// its control bytes as JSON escapes (`debug_config::dump_line`) — a project or
+    /// bind path inside that JSON is measured. Passing a note in here escapes
+    /// nothing.
     pub(crate) fn emit_block(&mut self, message: impl std::fmt::Display) -> Result<()> {
         self.write_notice(&message.to_string())
     }
@@ -123,9 +126,12 @@ impl<W: NoticeSink> LaunchNotices<W> {
     /// the launch ended. Unlike [`Self::emit`] this one flushes: it may be the last
     /// writer before the process exits, and a sink other than stderr may buffer.
     ///
-    /// Also unlike [`Self::emit`] it does not escape: both callers hand it the
-    /// launcher's own framing, `\r` included, so there is no measured byte here to
-    /// neutralize.
+    /// Also unlike [`Self::emit`] it does not escape, because one caller writes
+    /// framing bytes on purpose: the refusal hint wraps itself in `\r` to reclaim a
+    /// line the guest is mid-way through. That leaves the messages to their
+    /// producers — `session_control`'s are its own prose with error chains and
+    /// queued-allowance warnings interpolated, which today are escaped or
+    /// control-free at their source, not here.
     pub(crate) fn emit_detached(&self, message: impl std::fmt::Display) -> NoticeDelivery {
         let mut line = message.to_string();
         line.push('\n');

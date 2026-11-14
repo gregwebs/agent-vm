@@ -1728,7 +1728,9 @@ pub(crate) async fn launch(
     let inner_argv = invocation.argv();
     let config = builder.build().await.context("preparing sandbox config")?;
     if let Some(dump) = crate::debug_config::sandbox_config(&config, label.is_redacted())? {
-        // Pretty JSON: a block by intent, and not a line to escape.
+        // Pretty JSON: a block by intent. What is measured inside it — the project
+        // and bind paths — is escaped into JSON `\uXXXX` by the record's own
+        // renderer, so this block's lines are still the launcher's.
         notices.emit_block(dump)?;
         // No trailing space when the argv is empty (codex/opencode), so the
         // line is exactly the guest command line an integration test asserts.
