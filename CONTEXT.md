@@ -337,8 +337,18 @@ its use, and deleting the inventory loses only the listing, never a stored
 value. Its scope is user-scoped rather than state-scoped because the secret
 store it describes is host-wide.
 
+A **service name is public-to-output metadata**, not a secret: `ls` prints it,
+`set`/`rm` echo it on success, this inventory records it, and the shell history
+and process argument list already hold it. Under the accepted alphabet a
+realistic API key is a valid name, so since
+[#172](https://github.com/gregwebs/agent-vm/issues/172) `set` and `rm` warn once
+— without repeating the name — when a name looks like a credential (a known key
+prefix, or one long mixed token). The warning is advisory: the naming policy is
+unchanged, and `ls` stays silent because a listing would repeat it per row.
+
 _Avoid_: "credential list", "allowlist", or any wording that reads as
-permission.
+permission; and reading the credential-shaped-name warning as a refusal or as
+clearance.
 
 ## Credential provider
 

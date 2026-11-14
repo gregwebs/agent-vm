@@ -287,6 +287,16 @@ agent-vm secret rm anthropic
   hidden interactive input or piped stdin without requiring a `--stdin` flag.
 - Do not accept `--token` or a positional secret value. Shell history and process
   argument exposure are reasons to reject that interface, not merely warn.
+- A `SERVICE` that looks like a credential yields **one advisory warning on
+  stderr**, on `set` and on `rm`, before the operation: a known key prefix
+  (`sk-`, `sk_`, `ghp_`, `gho_`, `ghs_`, `xoxa-`/`xoxb-`/`xoxp-`/`xoxr-`/
+  `xoxs-`, `gloas-`, `AIza`, `AKIA`) or a single long mixed token. It never refuses, never prompts and never
+  changes the naming rule, and it never repeats the name — the name may be the
+  value, so echoing it would re-expose it in terminal capture and support logs.
+  The warning states that a name is public-to-output metadata (it appears in
+  `secret ls`, in the names-only inventory, in shell history and in process
+  argv) and that a value typed in the name slot should be treated as exposed.
+  `ls` does not warn: it lists names by design and would repeat the line per row.
 - `ls` reports names/storage status, never secret values or partial values.
 - `rm SERVICE` removes the stored value; authorization is managed in YAML.
 - Storing a value does not authorize credential usage or rewrite policy.
@@ -318,6 +328,8 @@ agent-vm secret rm anthropic
 9. Existing egress behavior is unchanged, and `permissions.network` is rejected.
 10. Secret entry supports prompt/stdin, rejects argument-based values, and lists
     no secret bytes. Keychain unavailability never creates plaintext storage.
+    A credential-shaped service name is warned about, never refused, and the
+    warning does not echo it; the listing (`ls`) remains names-and-status only.
 
 ## Follow-ups, not part of this effort
 
