@@ -552,6 +552,39 @@ fn drop_does_not_block() {
     let _ = crate::host_paths::try_flock(&held, crate::host_paths::FlockMode::Exclusive);
 }
 
+/// `Drop` refusing a pending snapshot is the point — a teardown has no reader
+/// left — but a pending *final* job must survive it. `LiveSession::drop` may not
+/// block, so after it returns the detached thread is the only writer left for the
+/// record that says the session ended, and discarding the job here lost that
+/// record whenever the thread had not been scheduled yet (#572).
+#[test]
+fn a_pending_final_survives_the_persister_s_own_drop() {
+    let (_root, dir) = dir();
+    // Hold the log's lock so the writer is busy with the first job and the final
+    // is still only pending when the persister is dropped.
+    let held = crate::host_paths::open_lock_file(&dir.path().join("refusals.lock")).unwrap();
+    crate::host_paths::flock_exclusive(&held).unwrap();
+    let persist = Persister::new(dir.clone());
+    persist.post(snapshot(0, false));
+    std::thread::sleep(Duration::from_millis(100));
+    let wait = persist.post_final(snapshot(1, true));
+    drop(persist);
+    drop(held);
+
+    assert!(
+        wait.wait(FINAL_WAIT),
+        "the detached writer still owed the final record after `Drop`"
+    );
+    let log = dir.read().unwrap();
+    let mine = log
+        .sessions
+        .iter()
+        .find(|session| session.info.id.as_str() == SID)
+        .expect("written");
+    assert_eq!(mine.rev, 1, "the final snapshot is what was written");
+    assert!(mine.ended_ms.is_some(), "the record says the session ended");
+}
+
 #[test]
 fn final_wait_is_bounded_with_a_held_lock() {
     let (_root, dir) = dir();

@@ -690,12 +690,20 @@ impl PersistHandle {
 
 impl Drop for Persister {
     /// Nonblocking on purpose: a teardown must not wait for a disk. The thread
-    /// is detached; a write in flight finishes on its own, and one that has not
-    /// started is dropped with the process.
+    /// is detached; a write in flight finishes on its own.
+    ///
+    /// A pending *final* job is kept. `LiveSession::drop` may not block, so the
+    /// detached thread is the only writer left for the record that says the
+    /// session ended; discarding the job here lost that record whenever the
+    /// thread had not already taken it, which is a race the dropper wins on a
+    /// loaded machine (#572). A pending snapshot is still dropped: the final job
+    /// is the newer one, and a teardown has no reader left to serve.
     fn drop(&mut self) {
         let mut state = self.lock();
         state.stopping = true;
-        state.pending = None;
+        if !matches!(state.pending, Some(Job::Final(_))) {
+            state.pending = None;
+        }
         drop(state);
         self.slot.wake.notify_all();
         drop(self.thread.take());
