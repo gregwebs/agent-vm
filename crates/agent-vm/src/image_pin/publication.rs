@@ -47,10 +47,15 @@ pub(crate) fn publication_preflight(
     Ok(PublicationScope { key })
 }
 
+/// Approve the published result and claim Output for it.
+///
+/// The returned report covers only **post-rename** reporting; a `?` here is a
+/// precommit failure, which is why the ordinary "approval was not updated"
+/// context still wraps it.
 pub(crate) async fn approve_published(
     published: &Published,
     scope: &PublicationScope,
-) -> Result<()> {
+) -> Result<CommitReport> {
     let label = ImageLabel::for_result_reference(&published.target().canonical().whole());
     approve(published, &label, scope)
         .await
@@ -61,7 +66,7 @@ async fn approve(
     published: &Published,
     label: &ImageLabel,
     scope: &PublicationScope,
-) -> Result<()> {
+) -> Result<CommitReport> {
     store::published_ready()?;
     let prepared = acquire_or_render(
         published.target(),
@@ -94,9 +99,22 @@ async fn approve(
     // Committed under the read-back's shared barrier, like a launch's first pin:
     // no exclusive publisher can intervene. A concurrent refresh (also shared)
     // may move the alias; the frozen `repo@digest` candidate and the CAS cover it.
-    commit(&candidate, &approval, DefaultAction::None)?;
+    // Build and import share one Output slot and never select Boot.
+    let report = match commit(
+        &candidate,
+        &approval,
+        DefaultAction::None,
+        RoleClaim::Claim(Role::Output),
+    )? {
+        store::CommitOutcome::Committed(completion) => completion.report,
+        store::CommitOutcome::Conflict => {
+            return Err(anyhow!(
+                "image approval is stale; retry the explicit operation"
+            ));
+        }
+    };
     drop(prepared);
-    Ok(())
+    Ok(report)
 }
 
 /// Cache-only equivalence: an approved digest whose content is not in this cache

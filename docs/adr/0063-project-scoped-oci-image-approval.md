@@ -120,9 +120,14 @@ tested archive/reset rather than an inheritance or a compatibility layer.
   approval for the same reference is never consulted or borrowed, so with one
   shared cache a new project reuses whatever the cache alias holds at that
   moment — resolution afresh, not inherited approval.
-- **Approvals accumulate per project** until S3 introduces in-use tracking. The
-  4096-record bound still applies to the whole file, and reaching it at commit
-  is reported as a full store (archive it to reset), not as damage.
+- **Superseded by [ADR-0068](0068-active-image-set.md) (0.7.51, #542/S3):**
+  known boot/output roles are single-holder slots. A pin retires only when both
+  roles are known-absent; unresolved roles can protect records beyond the two
+  holders until each role is first claimed in its project/platform scope. Claims
+  then retire known-inactive records; refresh itself does not. The 4096-pin limit
+  remains, with independent 4096-default/4096-scope limits and shared 4 MiB
+  bytes. Unresolved approvals are never evicted to make room; full saves fail
+  closed.
 - **Rollback is possible but bounded**: the archived version-1 pair restores the
   old binary, at the cost of discarding approvals made since the upgrade.
 - A version-1-pin-aware binary meeting a version-2 store reports it as damaged

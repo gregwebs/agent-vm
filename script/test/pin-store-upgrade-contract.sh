@@ -236,6 +236,25 @@ DA='{"version":1,"image":"r.example/a@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 DB='{"version":1,"image":"r.example/b@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}'
 DC='{"version":1,"image":"r.example/c@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}'
 V2='{"version":2,"pins":[],"pending_default":null}'
+# A 0.7.51 store: roles, scope resolution and a global write sequence. The S1
+# upgrade block must refuse it untouched, exactly like any other non-v1 store:
+# the shell cannot reconstruct scope/approval authority, and this store needs no
+# upgrade at all.
+V2_ROLES="$(jq -n --arg platform "$(jq -nc '{os:"linux",architecture:"arm64",variant:null}')" '
+  {version:2,
+   pins:[{project:("a"*64),
+          reference:"r.example/x:1",
+          platform:($platform|fromjson),
+          manifest_digest:("sha256:" + ("1"*64)),
+          revision:8, roles:"boot"},
+         {project:("a"*64),
+          reference:"r.example/y:1",
+          platform:($platform|fromjson),
+          manifest_digest:("sha256:" + ("2"*64)),
+          revision:3}],
+   pending_default:null,
+   scopes:[{project:("a"*64), platform:($platform|fromjson), resolved:"boot"}],
+   sequence:8}' | jq -c .)"
 # The two journal shapes an interrupted `image set-default` leaves, with the
 # trailing newline the old writer stored.
 JOURNAL_PREV="$(jq -n --arg a "$DA"$'\n' --arg b "$DB"$'\n' '{previous:$a,proposed:$b}')"
@@ -278,6 +297,13 @@ check "no default record: upgrade succeeds and creates none" 'run "$h" upgrade &
 h=$(fixture v2-store null "$DA")
 printf '%s\n' "$V2" >"$(cfg "$h")/image-pins.json"
 check "a version 2 store is refused" '! run "$h" upgrade && said "not a version 1 store" && [ "$(pins "$h")" = "$V2" ]'
+h=$(fixture v2-roles null "$DA")
+printf '%s\n' "$V2_ROLES" >"$(cfg "$h")/image-pins.json"
+check "a version 2 store with roles/scopes/sequence is refused untouched" '! run "$h" upgrade && said "not a version 1 store" && [ "$(pins "$h")" = "$V2_ROLES" ] && no_archive "$h"'
+h=$(fixture v2-unknown-role null "$DA")
+printf '%s\n' "$V2_ROLES" | jq -c '.pins[1].revision = 3' >"$(cfg "$h")/image-pins.json"
+unknown=$(pins "$h")
+check "an unknown-role pin in a version 2 store is refused untouched" '! run "$h" upgrade && said "not a version 1 store" && [ "$(pins "$h")" = "$unknown" ]'
 h=$(fixture not-an-object null "$DA")
 printf 'null\n' >"$(cfg "$h")/image-pins.json"
 check "a store that is not an object is refused" '! run "$h" upgrade && said "not a version 1 store" && [ "$(pins "$h")" = "null" ]'

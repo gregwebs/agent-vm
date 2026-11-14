@@ -279,11 +279,14 @@ What this buys:
 - **Clearing cache cannot upgrade content.** With the cache or state root
   gone, the approved digest is reacquired from its registry. If that content is
   unavailable the launch fails; it never falls back to whatever the tag serves
-  now. The approval lives outside every cache and state root, so only moving
-  `HOME` or deleting the store loses it.
-- **Only two verbs check for movement.** `agent-vm image refresh` re-resolves
-  and approves its selection; `agent-vm image set-default` resolves its target
-  only. No launch, setup or background probe does either.
+  now. The approval lives outside every cache and state root: cache clearing never
+  loses it; justified active-set retirement, moving `HOME` or resetting the
+  store removes approval authority.
+- **Retained approvals do not move during launch/setup.** `agent-vm image
+  refresh` re-resolves and approves its selection; `image set-default` resolves
+  its target only. Retired references have no approval and use the cache-first
+  first-pin path; on a cache miss launch/setup can therefore resolve changed
+  registry content.
 - **Host checks are not guest compatibility.** Platform, manifest and digest
   validation say which bytes are approved; they do not promise the applications
   inside them work. That remains the [boot image contract](#boot-image-contract).
@@ -317,12 +320,19 @@ registry that moves again before the commit cannot substitute content. The
 approval binds that candidate's digest plus the pin revision and digest that were
 displayed; a concurrent writer that moved the pin first fails the
 compare-and-swap and asks you to retry, rather than silently authorizing the
-wrong predecessor.
+wrong predecessor. An approval's revision is an opaque global allocation, used
+with its key and digest for predecessor checks. Insertions and replacements draw
+from the persisted HOME-wide write sequence, not current revision + 1.
+Metadata-only changes preserve that approval's revision; old revisions remain
+valid. Retiring and reapproving identical content does not authorize a stale
+operation against its earlier approval.
 
-A first pin or an unchanged digest prints nothing and needs no consent. To keep
-an approval, do not run `image refresh` for that reference, or select it by
-digest (`repo@sha256:…`), which is an integrity failure if it ever resolves to
-different content.
+A first pin or an unchanged digest prints nothing and needs no consent. To avoid
+replacing an approval's content, do not run `image refresh` for that reference,
+or select it by digest (`repo@sha256:…`), which is an integrity failure if it
+ever resolves to different content. That preserves the content, not the record:
+once both slots are resolved in a scope, any successful claim there retires the
+approvals that hold no role (see [Active image set](#active-image-set)).
 
 `image build` and `image import` work the same way, and are the verbs that
 approve the bytes they were asked to publish: they render the old/new digests,
@@ -383,6 +393,87 @@ Adopting the host's default boot image (linux/arm64) in this project:
   it already followed, so it boots the content it booted before.
 
 See [ADR-0067](docs/adr/0067-project-default-boot-image.md).
+
+#### Active image set
+
+A project's **active image set** holds its last successfully acquired OCI
+launch/setup selection plus the output of its latest successful `image build`
+or `image import`. Build and import share one output slot and never claim the
+boot role; a later launch of the same mutable reference still boots whatever
+content that reference is then approved for. Roles are tracked per Linux
+platform; config and project-default bookmarks are separate.
+
+A one-off `--image X` switches the recorded boot selection only after X is
+acquired and the authority save succeeds, before SDK create. Later create or
+guest-verification failure does not undo that acquisition. Failed acquisition
+or save leaves the previous roles. Local-rootfs/disk and `--dockerfile` launch
+builds stay unpinned and leave the last OCI roles untouched.
+
+**Unknown is not absent.** A scope's boot role is unresolved until its first
+successful launch/setup claim; its output role is unresolved until its first
+successful build/import claim. Each first claim resolves that single-holder
+slot for the whole project/platform scope. Claiming an old approval as output
+does not prove it was not the old boot selection, or vice versa. A pin can be
+removed only when both roles are known not to need it. A displaced approval
+protected by an unresolved role survives until that role is claimed once in
+the scope; it need not itself be that claim's target. A fresh scope used only
+for one kind of operation can therefore still accumulate protected approvals.
+
+A successful build/import replaces the output role atomically with its
+approval and justified retirement. A command that reports failure preserves
+the previous output set, even if cache publication already occurred. Once the
+authority rename commits, the command succeeded: failure to report a test
+checkpoint or completion notice produces a success warning when possible,
+**exit status 0**, and no rollback. Do not retry that warning as a failed
+publication. A killed process may provide no status; inspect authority rather
+than assume it rolled back. Archive aliases get no role; external build-input
+tracking remains deferred (#544/#545).
+
+Retirement removes approval authority, not shared cached bytes. Returning
+acquires and validates the selected source cache-first, or resolves its
+current registry content on a cache miss. **The old approval is not restored.**
+The new acquisition may supply the same digest or different content, including
+newer mutable-tag content without refresh. A retained approval still consumes
+only its approved child, offline when cached and by child digest after cache loss.
+
+Revisions are opaque **global approval tokens**, allocated from the pin store's
+monotonic write sequence, not per-reference replacement counts. A new approval
+need not start at 1 or increase by exactly 1; other approvals and metadata saves
+can intervene. Equal/equivalent content and role-only saves keep an existing
+approval's revision. The global high-water survives retirement. Old stores are
+read without migration; the next real save allocates above their highest live
+revision and persists the sequence. Sequence exhaustion fails closed.
+
+Until #543, refresh keeps its current single-selection behavior, never claims
+a boot/output role, and preserves existing role knowledge. An inactive new
+refresh approval is protected by any unresolved role. Once both slots are
+resolved, it is known-inactive and can be retired by the next successful claim
+in that scope. Refresh itself performs no retirement. Default adoption changes
+the bookmark; launch/setup subsequently records the newly acquired boot choice.
+
+Only the two current holders remain immediately after a claim with both roles
+resolved. This is not a universal two-record bound: unresolved approvals and
+refresh-created inactive records can still fill the store. No approval is
+evicted to make room and no reset/migration is required.
+
+`image show` still reports the ambient next-launch selection, not recorded use;
+`doctor` keeps its existing selection/default diagnostics. A role/uncertainty
+listing is a follow-up, not a command introduced by this release.
+
+See [ADR-0068](docs/adr/0068-active-image-set.md).
+
+#### Behavior changes in 0.7.51
+
+No reset or migration is needed. These are the user-visible changes:
+
+| Change | What changed |
+|---|---|
+| retirement | Known role switches retire references only when both roles are known-absent. A legacy approval claimed as output retains unknown boot protection until a successful boot claim in that scope, and vice versa. |
+| growth | Until both role slots have been claimed once, retained approvals can exceed the two current holders. After both resolve, claims retire known-inactive records; refresh can add inactive approvals pending the next claim. |
+| return | Returning to a retired reference creates fresh cache-first approval authority, not restoration of its former approval; content may be identical. Select a digest for immutable identity. |
+| revisions | Revision values now draw from one global write sequence, rather than per-key 1, 2, 3. Treat them as opaque tokens. Metadata-only saves advance the sequence without replacing existing approval tokens. |
+| writes | First warm claims, scope resolution and justified cleanup now need `image-pins.json` writable. Complete no-op use remains read-only. Old files need no reset. |
+| reporting | A committed build/import exits 0 even when its completion notice or postcommit test checkpoint cannot be reported. The success warning is not a failed publication. |
 
 #### Behavior changes in 0.7.47
 
@@ -753,12 +844,18 @@ Approving the image published as docker.io/library/app:dev (linux/arm64) for thi
 A first approval shows `old: none`. Republishing content that is already
 approved — the same digest, or the same verified config and ordered layer diff
 IDs under another manifest digest — neither rewrites the approval nor renders an
-approval change. Both verbs still print their usual completion sentence on
+approval change. Unchanged content renders no digest change and keeps its
+approval revision. A build/import can still save role/resolution/retirement
+changes and advance the store sequence. Cache aliases never approve content. Both verbs still print their usual completion sentence on
 stdout.
 
 Names the archive itself carries are published to the cache but **never**
-approved: an alias over a reference you approved earlier leaves that approval
-exactly where it was. Neither verb moves a retained default or a project default
+approved: an alias creates no approval, and it replaces none. That is not a
+promise that an earlier approval of the named reference survives — once both
+slots are resolved, any successful claim retires an approval that holds no role,
+and the alias this import published is then what that reference's next pin
+acquires cache-first (a changed valid cache alias can supply different content;
+no historical approval is restored). Neither verb moves a retained default or a project default
 — the recovery of an interrupted run of 0.7.46 or earlier is the one exception,
 below — and a default-tier launch keeps booting its own digest (issue #392).
 
@@ -772,9 +869,11 @@ booting the content approved for it before. A daemon-only image may not be
 available from a registry, so it cannot be registry-refreshed; the import itself
 is the supported way to get it into the cache.
 
-The store holds at most 4096 approvals of at most 4096 source bytes each, and
-the record may not exceed 4 MiB; exceeding a bound is a schema error, not a
-partial load.
+At most 4096 pins, independently 4096 project defaults and 4096 scope records,
+share a 4 MiB encoded-file budget, including role, resolution and sequence
+metadata. Sources retain the 4096-byte bound. Count and bytes are checked after
+justified retirement. No unresolved pin is evicted. A proposed oversized save is
+full; an oversized file on disk is damage.
 
 ### Inspecting the selected boot image
 

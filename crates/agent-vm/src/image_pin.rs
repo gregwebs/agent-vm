@@ -60,12 +60,16 @@ use crate::image_acquire::{
 pub(crate) use crate::image_acquire::{CanonicalOciReference, ValidatedDigest as ManifestDigest};
 use crate::project::ProjectDir;
 
+mod active;
 mod approval;
+mod completion;
 mod project_default;
 mod publication;
 mod store;
 mod unpinned;
 
+use active::{Role, RoleClaim, ScopeKey};
+pub(crate) use completion::{CommitReport, finish_publication};
 pub(crate) use project_default::{
     DefaultSlot, HostDefaultSet, InvokingProject, ObservedDefaults, ProjectDefaultChange,
     load_default_slot, observe_defaults, set_default,
@@ -215,6 +219,11 @@ impl PinKey {
     /// legitimately resolve to different content.
     fn is_immutable(&self) -> bool {
         self.reference.digest().is_some()
+    }
+
+    /// The scope whose Boot/Output slots this key's successful claims resolve.
+    fn scope(&self) -> ScopeKey {
+        ScopeKey::of(self.project.clone(), self.platform.clone())
     }
 }
 
@@ -537,7 +546,10 @@ pub(crate) async fn prepare_selected(
         return prepare_first_pin(boot, &target, &key, &selection, &label).await;
     };
     let prepared = approved_preparation(&current, &label, Rendering::Selection).await?;
-    project_default::establish_default(boot, &current)?;
+    // Acquisition and validation succeeded, so this warm use is an affirmative
+    // Boot claim (plus any eligible S2 default work). Reporting issues after the
+    // commit are consumed here, not returned as a failed preparation.
+    record_prepared(boot, &current)?;
     let approved = current.immutable_reference()?;
     Ok(PreparedSelection::immutable_content(
         &approved, selection, prepared,
@@ -568,24 +580,31 @@ async fn prepare_first_pin(
     let candidate = ValidatedCandidate::from_image(prepared.image(), &key.project)?;
     store::candidate_ready()?;
     let action = project_default::establishment(boot)?;
-    match commit(&candidate, &Approval::initial(&candidate), action) {
-        Ok(committed) => {
-            let approved = committed.pin.immutable_reference()?;
+    match commit(
+        &candidate,
+        &Approval::initial(&candidate),
+        action,
+        RoleClaim::Claim(Role::Boot),
+    ) {
+        Ok(store::CommitOutcome::Committed(completion)) => {
+            completion::finish_preparation(completion.report);
+            let approved = completion.value.pin.immutable_reference()?;
             Ok(PreparedSelection::immutable_content(
                 &approved,
                 selection.to_owned(),
                 prepared,
             ))
         }
-        Err(error) => {
+        Ok(store::CommitOutcome::Conflict) => {
             // A peer may have committed a different candidate while this
-            // preparation was acquiring. That record stands; this launch either
-            // consumes the winner's frozen digest or fails before create.
+            // preparation was acquiring. Only a typed conflict may re-read a
+            // winner; an I/O, full or exhausted error never does.
             let winner = lookup(key)?;
             match winner {
                 Some(pin) if pin.digest != candidate.digest => {
                     drop(prepared);
                     let prepared = approved_preparation(&pin, label, Rendering::Selection).await?;
+                    record_prepared(boot, &pin)?;
                     let approved = pin.immutable_reference()?;
                     Ok(PreparedSelection::immutable_content(
                         &approved,
@@ -593,9 +612,12 @@ async fn prepare_first_pin(
                         prepared,
                     ))
                 }
-                _ => Err(error),
+                _ => Err(anyhow!(
+                    "image approval is stale; retry the explicit operation"
+                )),
             }
         }
+        Err(error) => Err(error),
     }
 }
 
@@ -697,8 +719,17 @@ pub(crate) async fn refresh(
     drop(prepared);
     revalidate_frozen(&candidate, &plan.label, plan.rendering).await?;
     let action = plan.default_action;
-    let committed = commit(&candidate, &approval, action)?;
-    Ok(committed.project_default)
+    // Refresh preserves scope resolution and every holder: it approves content,
+    // never a role (ADR-0068 R7).
+    match commit(&candidate, &approval, action, RoleClaim::Keep)? {
+        store::CommitOutcome::Committed(completion) => {
+            completion::finish_preparation(completion.report);
+            Ok(completion.value.project_default)
+        }
+        store::CommitOutcome::Conflict => Err(anyhow!(
+            "image approval is stale; retry the explicit operation"
+        )),
+    }
 }
 
 /// Whether two references name the same canonical content: one spelling of the
@@ -891,8 +922,18 @@ fn commit(
     candidate: &ValidatedCandidate,
     approval: &Approval,
     action: DefaultAction,
-) -> Result<store::Committed> {
-    store::Store::host()?.commit(candidate, approval, action)
+    claim: RoleClaim,
+) -> Result<store::CommitOutcome> {
+    store::Store::host()?.commit(candidate, approval, action, claim)
+}
+
+/// Record a successful warm preparation: claim Boot for exactly the approval
+/// this preparation consumed, and do any eligible default work in the same save.
+fn record_prepared(boot: &BootImage, consumed: &ApprovedPin) -> Result<()> {
+    let action = project_default::establishment(boot)?;
+    let completion = store::Store::host()?.claim_selected(consumed, &action)?;
+    completion::finish_preparation(completion.report);
+    Ok(())
 }
 
 /// What the image cache holds for the content a launch of `boot` would boot
@@ -1070,6 +1111,11 @@ fn pin_fields_are_acceptable(facts: PinFieldFacts) -> (ok: bool)
 fn schema_is_acceptable(version: u32, keys_unique: bool) -> (ok: bool)
     ensures ok == (version == 2 && keys_unique),
 { version == 2 && keys_unique }
+/// A stored `roles`/`resolved` mask must name at least one role: omission is how
+/// "holds none" / "resolves none" is spelled, so an empty present value is damage.
+fn mask_is_acceptable(nonempty: bool) -> (ok: bool)
+    ensures ok == nonempty,
+{ nonempty }
 /// The measured facts of an approval-equivalence comparison. Named fields rather
 /// than adjacent booleans, so an argument swap cannot invert the decision.
 struct ContentFacts {
@@ -1431,6 +1477,16 @@ mod tests {
         assert!(block.contains("fn commit_decision"));
         assert!(block.contains("fn store_bytes_within_limit"));
         assert!(block.contains("fn content_is_equivalent"));
+        assert!(block.contains("fn mask_is_acceptable"));
+        // ADR-0068's kernels are proved too, not only this file's.
+        let active = include_str!("image_pin/active.rs");
+        for kernel in [
+            "fn may_retire",
+            "fn claim_knowledge",
+            "fn checked_next_sequence",
+        ] {
+            assert!(active.contains(kernel), "{kernel}");
+        }
         assert!(include_str!("../Cargo.toml").contains("[package.metadata.verus]"));
     }
 }

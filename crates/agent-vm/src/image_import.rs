@@ -207,7 +207,7 @@ pub(crate) async fn run(args: Args, configured: Result<&ConfiguredImages>) -> Re
     // The command that supplied the bytes is the consent (#391). The read-back
     // runs only now, after `publish`'s exclusive barrier is released.
     #[allow(clippy::disallowed_methods)] // `image import` names the result it approves (#391).
-    crate::image_pin::approve_published(&published, &scope).await?;
+    let report = crate::image_pin::approve_published(&published, &scope).await?;
     // Observed only now, after publication: the selector's default tier arms a
     // process-global dependency-log guard, so running it before the native
     // work would change diagnostics this command already had. The observation
@@ -215,12 +215,13 @@ pub(crate) async fn run(args: Args, configured: Result<&ConfiguredImages>) -> Re
     // publication into a failure, and this command changes no selection.
     let selection = configured
         .and_then(|configured| crate::boot_image::ambient_selection(configured, Ok(&project)));
-    if let Some(notice) = completion_notice(&tag, selection) {
-        // Best-effort completion notice on stdout: stderr is for errors and
-        // Docker's own output. A failed write is not a failed import.
-        let _ = writeln!(std::io::stdout(), "{notice}");
-    }
-    Ok(0)
+    // The advisory selection above may itself fail; it is converted into the
+    // completion text and never into an operation error. A committed import
+    // exits 0 even when that notice cannot be written.
+    Ok(crate::image_pin::finish_publication(
+        report,
+        completion_notice(&tag, selection),
+    ))
 }
 
 /// The completion sentence, or nothing when the configuration already selects

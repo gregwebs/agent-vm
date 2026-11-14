@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
 
+#[path = "support/acquisition_gate.rs"]
+mod acquisition_gate;
 #[path = "support/fake_msb.rs"]
 mod fake_msb;
 #[path = "support/image_archive.rs"]
@@ -28,6 +30,7 @@ mod pin_gate;
 mod pty;
 mod support;
 
+use acquisition_gate::{AcquisitionGate, AcquisitionStage, GateReply};
 use fake_msb::{FakeMsb, Mode};
 use image_archive::{ArchiveSpec, LayerContent, PlatformSpec};
 use oci_registry::{Image, Server};
@@ -988,7 +991,7 @@ fn explicit_import_then_rebuild_move_what_a_launch_boots() {
     let b = archive_at(&h, "b.tar", "B");
     let c = archive_at(&h, "c.tar", "C");
 
-    // 1. Import A: revision 1.
+    // 1. Import A: the first write allocates sequence 1 and approves A/r1.
     let out = h.import(&a.path, &tag);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert_eq!(stdout_of(&out), import_notice(&tag));
@@ -1000,23 +1003,24 @@ fn explicit_import_then_rebuild_move_what_a_launch_boots() {
         format!("{}/images@{}", server.host, a.manifest_digest)
     );
 
-    // 2. Import B: revision 2, rendered against A.
+    // 2. Import B: the launch above claimed Boot (sequence 2), so this
+    // replacement draws the next global allocation, revision 3.
     let out = h.import(&b.path, &tag);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert_eq!(stdout_of(&out), import_notice(&tag));
     assert_render(&stderr(&out), &tag, &a.manifest_digest, &b.manifest_digest);
-    assert_eq!(h.pin_for(&tag), Some((b.manifest_digest.clone(), 2)));
+    assert_eq!(h.pin_for(&tag), Some((b.manifest_digest.clone(), 3)));
     assert_eq!(
         sdk_image(&h.launch(&tag)),
         format!("{}/images@{}", server.host, b.manifest_digest)
     );
 
-    // 3. A rebuild under the same tag: revision 3, rendered against B.
+    // 3. A rebuild under the same tag: the next allocation, revision 4.
     let out = h.build(&c.path, &tag);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert_eq!(stdout_of(&out), build_notice(&tag));
     assert_render(&stderr(&out), &tag, &b.manifest_digest, &c.manifest_digest);
-    assert_eq!(h.pin_for(&tag), Some((c.manifest_digest.clone(), 3)));
+    assert_eq!(h.pin_for(&tag), Some((c.manifest_digest.clone(), 4)));
     assert_eq!(
         sdk_image(&h.launch(&tag)),
         format!("{}/images@{}", server.host, c.manifest_digest)
@@ -1028,7 +1032,7 @@ fn explicit_import_then_rebuild_move_what_a_launch_boots() {
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert_eq!(fs::read(h.pins()).unwrap(), approved);
     assert!(!stderr(&out).contains("Approving"), "{}", stderr(&out));
-    assert_eq!(h.pin_for(&tag), Some((c.manifest_digest.clone(), 3)));
+    assert_eq!(h.pin_for(&tag), Some((c.manifest_digest.clone(), 4)));
 
     // The tag was never fetched: every launch was served from the cache.
     assert_eq!(server.count(), 0, "{:?}", server.requests());
@@ -1267,6 +1271,12 @@ fn an_archive_alias_of_the_approved_digest_is_repaired_on_launch() {
     let approved_path = cache_metadata_path(&h, &approved_key);
     let approved_bytes = fs::read(&approved_path).unwrap();
 
+    // 1b. Prepare A before the unrelated publication: Boot is now actively held,
+    // so this row's subject (the receipt repair) is independent of the
+    // unknown-role retention of AC19. It also allocates sequence 2.
+    let prepared = h.launch(&tag);
+    assert_eq!(sdk_image(&prepared), approved_key, "{}", stderr(&prepared));
+
     // 2. Import B under a *different* result reference, spelling the approved
     //    digest as an archive-carried name. The loader publishes that name, so
     //    A's child key now describes B.
@@ -1286,8 +1296,8 @@ fn an_archive_alias_of_the_approved_digest_is_repaired_on_launch() {
     let (_, b_digest) = image_archive::docker_save_manifest("repair-b");
     assert_eq!(
         h.pin_for(&other),
-        Some((b_digest.clone(), 1)),
-        "the reference the command named is approved at the fixture's own manifest"
+        Some((b_digest.clone(), 3)),
+        "the reference the command named is approved at its global allocation"
     );
     assert_eq!(
         published_metadata(&cache_metadata_path(&h, &other))["manifest_digest"],
@@ -1328,7 +1338,7 @@ fn an_archive_alias_of_the_approved_digest_is_repaired_on_launch() {
         "the repair restores the approved key byte for byte"
     );
     // 4. B's own result reference stays at B.
-    assert_eq!(h.pin_for(&other), Some((b_digest, 1)));
+    assert_eq!(h.pin_for(&other), Some((b_digest, 3)));
 }
 
 /// D10 / G4: an alias-carrying publication whose *own* approval fails at the save
@@ -1516,8 +1526,8 @@ fn a_receiptless_legacy_pin_survives_an_archive_alias_of_its_digest() {
     let (_, b_digest) = image_archive::docker_save_manifest("legacy-b");
     assert_eq!(
         h.pin_for(&other),
-        Some((b_digest.clone(), 1)),
-        "the alias import approves its own result at the fixture's synthesized manifest"
+        Some((b_digest.clone(), 2)),
+        "the alias import approves its own result at its global allocation"
     );
     let overwritten: serde_json::Value =
         serde_json::from_slice(&fs::read(&approved_path).unwrap()).unwrap();
@@ -1728,8 +1738,8 @@ fn projects_keep_independent_approvals_for_one_tag() {
     );
     assert_eq!(
         h.pin_in(&p2, &tag),
-        Some((digest_of(&child_b), 1)),
-        "P2's own first pin, at revision 1"
+        Some((digest_of(&child_b), 2)),
+        "P2's own first pin draws the HOME-wide next allocation"
     );
 
     // A warm P1 launch boots A with no registry request at all.
@@ -1754,8 +1764,8 @@ fn projects_keep_independent_approvals_for_one_tag() {
     assert!(refreshed.status.success(), "{}", stderr(&refreshed));
     assert_eq!(
         h.pin_in(&p2, &tag),
-        Some((digest_of(&child_c), 2)),
-        "only P2's record is replaced, at revision 2"
+        Some((digest_of(&child_c), 3)),
+        "only P2's record is replaced, at its next global allocation"
     );
     assert_eq!(
         h.record_in(&h.project, &tag).unwrap(),
@@ -1801,8 +1811,8 @@ fn a_refresh_in_one_project_cannot_touch_another() {
     assert!(refreshed.status.success(), "{}", stderr(&refreshed));
     assert_eq!(
         h.pin_in(&h.project, &tag),
-        Some((digest_of(&child_b), 2)),
-        "P1 replaces its own approval"
+        Some((digest_of(&child_b), 3)),
+        "P1 replaces its own approval at the next global allocation"
     );
     assert_eq!(
         h.record_in(&p2, &tag).unwrap(),
@@ -1855,8 +1865,8 @@ fn a_symlink_alias_shares_a_project_and_a_subdirectory_does_not() {
     assert_eq!(h.records_in(&sub), 1, "the subdirectory pins separately");
     assert_eq!(
         h.pin_in(&sub, &tag),
-        Some((digest_of(&child_a), 1)),
-        "a subdirectory's own first pin"
+        Some((digest_of(&child_a), 2)),
+        "a subdirectory's own first pin draws the next global allocation"
     );
 }
 
@@ -1946,8 +1956,8 @@ fn an_import_approves_only_its_own_project() {
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(
         h.pin_in(&h.project, &tag),
-        Some((new.manifest_digest.clone(), 1)),
-        "P1 approves its own result at revision 1"
+        Some((new.manifest_digest.clone(), 2)),
+        "P1 approves its own result at the next global allocation"
     );
     assert_eq!(
         h.record_in(&p2, &tag).unwrap(),
@@ -1988,8 +1998,8 @@ fn a_build_approves_only_its_own_project() {
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(
         h.pin_in(&h.project, &tag),
-        Some((new.manifest_digest.clone(), 1)),
-        "P1 approves its own build result at revision 1"
+        Some((new.manifest_digest.clone(), 2)),
+        "P1 approves its own build result at the next global allocation"
     );
     assert_eq!(
         h.record_in(&p2, &tag).unwrap(),
@@ -2038,7 +2048,11 @@ fn doctor_reports_each_projects_own_approved_content() {
     command.args(["image", "refresh", "--image", &tag]);
     let out = bounded(command);
     assert!(out.status.success(), "{}", stderr(&out));
-    assert_eq!(h.pin_in(&p2, &tag).unwrap().1, 1, "P2's own first approval");
+    assert_eq!(
+        h.pin_in(&p2, &tag).unwrap().1,
+        2,
+        "P2's own first approval draws the HOME-wide next allocation"
+    );
 
     let doctor_in = |project: &Path| {
         let mut command = h.command_in(project, &h.state);
@@ -3354,7 +3368,27 @@ fn a_recommendation_launch_establishes_the_project_and_seeds_the_host() {
         "the recommendation initializes the host starting choice"
     );
     let store = read_json(&h.pins());
-    assert_eq!(store["pins"], pins["pins"], "the approval is unchanged");
+    // The approval's content and token are unchanged; the Boot claim this
+    // preparation records legitimately adds roles/scope/sequence (ADR-0068).
+    let approval_content =
+        |store: &serde_json::Value| -> Vec<(serde_json::Value, serde_json::Value)> {
+            store["pins"]
+                .as_array()
+                .expect("pins")
+                .iter()
+                .map(|pin| (pin["manifest_digest"].clone(), pin["revision"].clone()))
+                .collect()
+        };
+    assert_eq!(
+        approval_content(&store),
+        approval_content(&pins),
+        "the approval content and token are unchanged"
+    );
+    assert_eq!(
+        store["pins"][0]["roles"],
+        serde_json::json!("boot"),
+        "the default-tier preparation claims Boot"
+    );
     assert_eq!(
         store["defaults"],
         serde_json::json!([{"project": project, "image": child}]),
@@ -3391,6 +3425,11 @@ fn an_established_warm_launch_takes_no_lock_and_leaves_the_journal() {
     let a = h.image(&ArchiveSpec::default());
     let child = server.image("images", "warm-default", &a);
     assert!(h.refresh(&child).status.success());
+    // A first real preparation records Boot for that key and resolves the
+    // scope; only then is the following default-tier launch a complete no-op
+    // that needs no exclusive lock. Merely adding `roles` by hand would be an
+    // invalid store (a holder without a resolved scope).
+    assert!(!h.launch(&child).status.success());
     let project = project_id(&h.project);
     let default = h.home.join(".config/agent-vm/default-image.json");
     let retained = serde_json::json!({"version": 1, "image": child}).to_string();
@@ -4022,6 +4061,9 @@ fn an_adoption_of_a_hand_edited_default_renders_its_stated_digest() {
     // Hand edit: the default record stays, its approval does not.
     let mut store = read_json(&h.pins());
     store["pins"] = serde_json::json!([]);
+    // A hand edit must also drop the scope knowledge that went with the pin: a
+    // resolved slot with no holder is damage, not "no approvals".
+    store["scopes"] = serde_json::json!([]);
     fs::write(h.pins(), serde_json::to_vec(&store).unwrap()).unwrap();
     // A host record naming different content.
     let b = h.image(&ArchiveSpec {
@@ -4063,8 +4105,8 @@ fn an_adoption_of_a_hand_edited_default_renders_its_stated_digest() {
     );
     assert_eq!(
         h.pin_in(&h.project, &child_h),
-        Some((digest_of(&child_h), 1)),
-        "the host reference's approval is inserted"
+        Some((digest_of(&child_h), 2)),
+        "the host reference's approval is inserted at the next allocation"
     );
 }
 
@@ -4516,6 +4558,21 @@ fn an_unreadable_config_never_establishes_a_project_default() {
             Some(digest_of(&child)),
             "{shape}: the preparation first-pins the selected content"
         );
+        assert_eq!(
+            h.record_in(&h.project, &child).unwrap()["roles"],
+            "boot",
+            "{shape}: the broken-catalog preparation records Boot (AC16)"
+        );
+        assert_eq!(
+            h.pins_value().unwrap()["scopes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|scope| scope["project"] == project_id(&h.project).as_str())
+                .unwrap()["resolved"],
+            "boot",
+            "{shape}: the Boot slot is resolved"
+        );
         assert!(
             h.default_record_in(&h.project).is_none(),
             "{shape}: an unreadable configuration establishes nothing"
@@ -4805,7 +4862,7 @@ fn refresh_adoption_never_reads_a_terminal() {
     assert_eq!(h.default_record_in(&h.project).unwrap()["image"], child_b);
     assert_eq!(
         h.pin_in(&h.project, &child_b),
-        Some((digest_of(&child_b), 1)),
+        Some((digest_of(&child_b), 2)),
         "the terminal adoption inserts the host reference's approval"
     );
 }
@@ -4897,4 +4954,2057 @@ fn concurrent_first_launches_across_a_set_default_keep_the_first_project_default
     let store = read_json(&h.pins());
     assert_eq!(store["pins"].as_array().unwrap().len(), 2);
     assert!(store["pending_default"].is_null(), "no journal is written");
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0068: the active image set at the CLI boundary.
+// ---------------------------------------------------------------------------
+
+/// AC2/AC15: a one-off override switches the recorded Boot selection only after
+/// it was acquired, before SDK create; the displaced X retires because Output
+/// was already resolved. `image show` still reports the ambient selection.
+#[test]
+fn one_off_boot_switch_retires_after_acquisition_before_create() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let o = archive_at(&h, "switch-o.tar", "switch-o");
+    let o_tag = format!("{}/images:o", server.host);
+    let x_tag = format!("{}/images:x", server.host);
+    let y_tag = format!("{}/images:y", server.host);
+    let x = h.image(&ArchiveSpec {
+        marker: "switch-x".into(),
+        ..Default::default()
+    });
+    server.image("images", "x", &x);
+    let y = h.image(&ArchiveSpec {
+        marker: "switch-y".into(),
+        ..Default::default()
+    });
+    let y_child = server.image("images", "y", &y);
+
+    // Resolve Output first: a Boot-only switch may retire only when both slots
+    // are known.
+    let out = h.import(&o.path, &o_tag);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(!h.launch(&x_tag).status.success());
+    assert_eq!(h.record_in(&h.project, &x_tag).unwrap()["roles"], "boot");
+
+    // The one-off override: acquisition succeeds and is recorded even though the
+    // SDK create afterwards fails (the fake runtime cannot boot).
+    let out = h.launch(&y_tag);
+    assert!(!out.status.success(), "the fake runtime cannot boot");
+    assert_eq!(
+        sdk_image(&out),
+        y_child,
+        "the acquired Y is what create gets"
+    );
+    assert!(
+        h.pin_for(&x_tag).is_none(),
+        "X is retired: Boot moved and Output was resolved elsewhere"
+    );
+    assert_eq!(h.record_in(&h.project, &y_tag).unwrap()["roles"], "boot");
+    assert_eq!(h.record_in(&h.project, &o_tag).unwrap()["roles"], "output");
+    assert!(
+        h.pins_value().unwrap()["sequence"].as_u64().unwrap() >= 3,
+        "the save persisted a global sequence"
+    );
+
+    // B7/AC15: show reports the ambient selection, never the recorded Boot.
+    let mut command = h.command();
+    command
+        .env("AGENT_VM_IMAGE_TAG", &x_tag)
+        .arg("image")
+        .arg("show");
+    let shown = bounded(command);
+    assert_eq!(shown.status.code(), Some(0), "{}", stderr(&shown));
+    assert!(
+        stdout_of(&shown).contains(&x_tag),
+        "show keeps its ambient meaning: {}",
+        stdout_of(&shown)
+    );
+}
+
+/// S1/R8: an archive alias over a reference you approved earlier does not keep
+/// that approval alive — but it can supply that reference's **next** pin,
+/// cache-first. This is the documented outcome (USAGE, ADR-0043/0047) and the
+/// hermetic twin of the native alias row.
+#[test]
+fn archive_alias_after_retirement_supplies_the_next_pin() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec {
+        marker: "alias-a".into(),
+        ..Default::default()
+    });
+    let child_a = server.image("images", "x", &a);
+    let tag = format!("{}/images:x", server.host);
+    assert!(!h.launch(&tag).status.success());
+    assert_eq!(sdk_image(&h.launch(&tag)), child_a);
+    let (a_digest, a_revision) = h.pin_for(&tag).expect("X is approved at A");
+    assert_eq!(h.record_in(&h.project, &tag).unwrap()["roles"], "boot");
+
+    // Boot moves to Y: X holds no role now, but its Output is still unknown, so
+    // the store retains it (R2).
+    let y = h.image(&ArchiveSpec {
+        marker: "alias-y".into(),
+        ..Default::default()
+    });
+    server.image("images", "y", &y);
+    let y_tag = format!("{}/images:y", server.host);
+    assert!(!h.launch(&y_tag).status.success());
+    assert!(h.pin_for(&tag).is_some(), "?Output protects the unheld X");
+    assert!(
+        h.record_in(&h.project, &tag)
+            .unwrap()
+            .get("roles")
+            .is_none()
+    );
+
+    // An archive whose own names include X's tag, imported under a *different*
+    // result reference. Only the named result is approved, but claiming Output
+    // resolves the scope's Output slot, so the unheld X is now both known-absent
+    // and retires in that same save.
+    let other = format!("{}/images:other", server.host);
+    let save = image_archive::write_docker_save(
+        &h.root.path().join("alias.tar"),
+        &[image_archive::DockerSaveImage {
+            marker: "alias-evil".into(),
+            repo_tags: Some(vec![tag.clone()]),
+        }],
+    );
+    let out = h.import(&save[0].path, &other);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(
+        h.pin_for(&tag).is_none(),
+        "an unheld, both-known-absent approval is not retained"
+    );
+    assert_eq!(h.record_in(&h.project, &other).unwrap()["roles"], "output");
+    let mut references: Vec<String> = h.pins_value().unwrap()["pins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|record| record["project"] == project_id(&h.project).as_str())
+        .map(|record| record["reference"].as_str().unwrap().to_owned())
+        .collect();
+    references.sort();
+    assert_eq!(
+        references,
+        vec![other.clone(), y_tag.clone()],
+        "no archive-carried name became a record"
+    );
+
+    // The return is a first pin, so it acquires cache-first: the alias this
+    // import published supplies the archive's own content, and no historical
+    // approval is restored (R8/B4).
+    let (archive_digest, _) = h
+        .pin_in(&h.project, &other)
+        .expect("the named result was approved");
+    let before = server.count();
+    let back = h.launch(&tag);
+    assert!(!back.status.success());
+    let sdk = sdk_image(&back);
+    assert_eq!(
+        digest_of(&sdk),
+        archive_digest,
+        "the alias supplies the archive's own content: {sdk}"
+    );
+    assert_eq!(server.count(), before, "cache-first: no registry request");
+    let (digest, revision) = h
+        .pin_for(&tag)
+        .expect("the return approves fresh authority");
+    assert_eq!(digest, archive_digest);
+    assert_ne!(digest, a_digest, "the old approval is not restored");
+    assert!(revision > a_revision, "a fresh global allocation");
+    assert_eq!(h.record_in(&h.project, &tag).unwrap()["roles"], "boot");
+}
+
+/// AC7 (warm changed alias): a retired X is not restored from its old approval;
+/// returning resolves the cache-first source, which now holds newer B.
+#[test]
+fn retired_return_uses_changed_warm_cache_not_old_approval() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let o = archive_at(&h, "return-o.tar", "return-o");
+    let o_tag = format!("{}/images:o", server.host);
+    let x_tag = format!("{}/images:x", server.host);
+    let y_tag = format!("{}/images:y", server.host);
+    assert_eq!(
+        h.import(&o.path, &o_tag).status.code(),
+        Some(0),
+        "resolve Output first"
+    );
+
+    let a = h.image(&ArchiveSpec {
+        marker: "return-a".into(),
+        ..Default::default()
+    });
+    let a_child = server.image("images", "x", &a);
+    assert!(!h.launch(&x_tag).status.success());
+    assert_eq!(sdk_image(&h.launch(&x_tag)), a_child);
+    let (a_digest, a_revision) = h.pin_for(&x_tag).expect("X is approved at A");
+
+    // The registry now serves B under X's tag. A second project shares the HOME
+    // and cache but not the approval; its refresh re-establishes X's cache
+    // entry at B.
+    let b = h.image(&ArchiveSpec {
+        marker: "return-b".into(),
+        ..Default::default()
+    });
+    let b_child = server.image("images", "x", &b);
+    assert_eq!(
+        sdk_image(&h.launch(&x_tag)),
+        a_child,
+        "warm A is still approved"
+    );
+    let p2 = h.project_at("return-project");
+    let mut command = h.command_in(&p2, &h.state);
+    command.args(["image", "refresh", "--image", &x_tag]);
+    let refreshed = bounded(command);
+    assert!(refreshed.status.success(), "{}", stderr(&refreshed));
+    assert_eq!(
+        digests_requested_since(&server, 0),
+        Vec::<String>::new(),
+        "no digest-addressed manifest was requested: both acquisitions were cache hits"
+    );
+
+    // Retire X in P1: Boot moves to Y while Output is already resolved.
+    let y = h.image(&ArchiveSpec {
+        marker: "return-y".into(),
+        ..Default::default()
+    });
+    server.image("images", "y", &y);
+    let switched = h.launch(&y_tag);
+    assert!(!switched.status.success());
+    assert!(
+        h.pin_in(&h.project, &x_tag).is_none(),
+        "X is absent before the return: {}",
+        stderr(&switched)
+    );
+
+    // Returning to X acquires and validates the selected source cache-first: the
+    // cache now holds B, and no historical A approval is restored.
+    let sequence = h.pins_value().unwrap()["sequence"].as_u64().unwrap();
+    let network = server.count();
+    let back = h.launch(&x_tag);
+    assert!(!back.status.success());
+    assert_eq!(sdk_image(&back), b_child, "the return boots B, not A");
+    assert_eq!(server.count(), network, "the return is served by the cache");
+    assert!(
+        !stderr(&back).contains("old: "),
+        "a first pin renders no old -> new change: {}",
+        stderr(&back)
+    );
+    let (digest, revision) = h
+        .pin_in(&h.project, &x_tag)
+        .expect("the return approves fresh authority");
+    assert_eq!(digest, digest_of(&b_child));
+    assert_ne!(digest, a_digest, "the old approval is not restored");
+    assert_eq!(
+        revision,
+        sequence + 1,
+        "the return draws the next global allocation, not a per-key +1"
+    );
+    assert_ne!(revision, a_revision);
+}
+
+/// The digests the registry served as manifest requests since `from`.
+fn digests_requested_since(server: &Server, from: usize) -> Vec<String> {
+    server.requests()[from..]
+        .iter()
+        .filter_map(|(_, path)| path.rsplit_once("/manifests/"))
+        .map(|(_, reference)| reference.to_owned())
+        .filter(|reference| reference.starts_with("sha"))
+        .collect()
+}
+
+/// AC18: once the rename committed, its checkpoint failing to report is a
+/// success warning — exit 0, exact committed bytes, no failed-publication text.
+#[test]
+fn publication_after_rename_gate_disconnect_is_success() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let a = archive_at(&h, "gate-a.tar", "gate-a");
+    let tag = "example.com/team/gate:dev";
+    // The same import with no gate at all: the only committed-bytes baseline
+    // that is not derived from this implementation's own proposal.
+    let baseline = gate_free_import(&h, &a.path, tag);
+    let _ = fs::remove_dir_all(config_dir(&h));
+    let mut gate = PinGate::new(h.root.path());
+    let mut command = h.command();
+    gate.attach(&mut command);
+    let child = command
+        .stdin(std::process::Stdio::null())
+        .args([
+            "image",
+            "import",
+            "--input",
+            a.path.to_str().unwrap(),
+            "--tag",
+            tag,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the gated import");
+    gate.expect(PinStage::Published).reply(Reply::Continue);
+    gate.expect(PinStage::CandidateReady).reply(Reply::Continue);
+    gate.expect(PinStage::BeforePinLock).reply(Reply::Continue);
+    gate.expect(PinStage::PinLocked).reply(Reply::Continue);
+    gate.expect(PinStage::BeforePinSave).reply(Reply::Continue);
+    // The rename has happened; closing the gate without a reply is the report
+    // failure this row is about.
+    drop(gate.expect(PinStage::PinCommitted));
+    let out = child.wait_with_output().expect("collect the import");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a committed publication reports success: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        text.contains(
+            "warning: image publication succeeded and active image state was committed, but the \
+             post-commit test checkpoint could not be reported; do not retry it as a failed \
+             publication"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("approval was not updated"), "{text}");
+    assert!(!text.contains("nothing was approved"), "{text}");
+    // The proposed authority is exactly what was committed: byte-identical to
+    // the gate-free run of the same import.
+    assert_eq!(
+        fs::read(h.pins()).unwrap(),
+        baseline,
+        "the committed bytes are the gate-free baseline's"
+    );
+    assert_eq!(
+        h.pin_for(tag),
+        Some((a.manifest_digest.clone(), 1)),
+        "the committed approval is on disk"
+    );
+}
+
+/// A stdout whose read end is already closed: every write fails with `EPIPE`.
+fn closed_stdout_pipe() -> fs::File {
+    use std::os::fd::FromRawFd as _;
+    let mut fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "create a pipe");
+    assert_eq!(unsafe { libc::close(fds[0]) }, 0, "close the read end");
+    unsafe { fs::File::from_raw_fd(fds[1]) }
+}
+
+/// AC18: a completion notice that cannot be written does not change the exit
+/// status or the committed authority, and warns with the notice-specific text.
+#[test]
+fn publication_after_rename_notice_epipe_is_success() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let a = archive_at(&h, "epipe-a.tar", "epipe-a");
+    let tag = "example.com/team/epipe:dev";
+    let baseline = gate_free_import(&h, &a.path, tag);
+    let _ = fs::remove_dir_all(config_dir(&h));
+    let mut command = h.command();
+    let child = command
+        .stdin(std::process::Stdio::null())
+        .args([
+            "image",
+            "import",
+            "--input",
+            a.path.to_str().unwrap(),
+            "--tag",
+            tag,
+        ])
+        .stdout(std::process::Stdio::from(closed_stdout_pipe()))
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the import");
+    let out = child.wait_with_output().expect("collect the import");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a committed publication exits 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        text.contains(
+            "warning: image publication succeeded and active image state was committed, but its \
+             completion notice could not be written; do not retry it as a failed publication"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("approval was not updated"), "{text}");
+    assert_eq!(
+        fs::read(h.pins()).unwrap(),
+        baseline,
+        "a failed notice does not change one committed byte"
+    );
+    assert_eq!(h.pin_for(tag), Some((a.manifest_digest.clone(), 1)));
+}
+
+/// AC13/AC19: a literal old-v2 record is claimed once (role, scope, sequence in
+/// one save), keeps its approval token, and the next complete no-op writes
+/// nothing and takes no gate stage.
+#[test]
+fn warm_old_pin_claims_once_then_noops() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec {
+        marker: "old-claim-a".into(),
+        ..Default::default()
+    });
+    let child = server.image("images", "old", &a);
+    let tag = format!("{}/images:old", server.host);
+    assert!(!h.launch(&tag).status.success());
+    assert_eq!(sdk_image(&h.launch(&tag)), child);
+
+    // Literal 0.7.49 shape: no roles, no scopes, no sequence.
+    let mut store = h.pins_value().unwrap();
+    for record in store["pins"].as_array_mut().unwrap() {
+        record.as_object_mut().unwrap().remove("roles");
+        record["revision"] = serde_json::json!(7);
+    }
+    store.as_object_mut().unwrap().remove("scopes");
+    store.as_object_mut().unwrap().remove("sequence");
+    seed_store(&h, &serde_json::to_vec(&store).unwrap());
+    let old = fs::read(h.pins()).unwrap();
+
+    // The first warm claim writes the role/scope/sequence in one save, keeping
+    // the approval's content and token.
+    let out = h.launch(&tag);
+    assert!(!out.status.success());
+    assert_eq!(sdk_image(&out), child);
+    let claimed: serde_json::Value = serde_json::from_slice(&fs::read(h.pins()).unwrap()).unwrap();
+    assert_eq!(claimed["pins"][0]["roles"], "boot");
+    assert_eq!(claimed["pins"][0]["revision"], 7);
+    assert_eq!(claimed["scopes"][0]["resolved"], "boot");
+    assert_eq!(claimed["sequence"], serde_json::json!(8));
+    assert_ne!(fs::read(h.pins()).unwrap(), old);
+
+    // A complete no-op: byte-identical, and no pin stage (a gate socket that does
+    // not exist would fail any stage).
+    let bytes = fs::read(h.pins()).unwrap();
+    let mut command = h.command();
+    command
+        .env("AGENT_VM_TEST_PIN_GATE", h.root.path().join("absent.sock"))
+        .args(["--image", &tag, "shell", "--", "true"]);
+    let network = server.count();
+    let out = bounded(command);
+    assert!(!out.status.success(), "the fake runtime cannot boot");
+    assert_eq!(sdk_image(&out), child);
+    assert_eq!(fs::read(h.pins()).unwrap(), bytes);
+    assert_eq!(server.count(), network, "a no-op makes no registry request");
+}
+
+// ---------------------------------------------------------------------------
+// The gated safety paths: first-pin failure, pre-lock ABA, claim-save faults.
+// ---------------------------------------------------------------------------
+
+/// A peer command in `state`, rooted at the launching project: the ABA schedules
+/// run their peers on a separate state/cache root that shares only this HOME, so
+/// the paused operation's shared cache barrier cannot block them (plan §8).
+/// A peer's own state/cache root, short enough for the runtime's 103-byte
+/// control-socket path limit (`target/tmp/<test>/…` is not).
+fn peer_state(name: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("avp{name}-"))
+        .tempdir_in("/tmp")
+        .expect("a short peer state root")
+}
+
+fn peer_import(h: &Harness, state: &Path, archive: &Path, tag: &str) -> Output {
+    let mut command = h.command_in(&h.project, state);
+    command.stdin(std::process::Stdio::null()).args([
+        "image",
+        "import",
+        "--input",
+        archive.to_str().unwrap(),
+        "--tag",
+        tag,
+    ]);
+    bounded(command)
+}
+
+fn peer_refresh(h: &Harness, state: &Path, reference: &str) -> Output {
+    let mut command = h.command_in(&h.project, state);
+    command.args(["image", "refresh", "--image", reference]);
+    bounded(command)
+}
+
+fn peer_launch(h: &Harness, state: &Path, reference: &str) -> Output {
+    let mut command = h.command_in(&h.project, state);
+    command.args(["--image", reference, "shell", "--", "true"]);
+    bounded(command)
+}
+
+/// AC3: a failed acquisition and a failed Boot-claim save both preserve the exact
+/// old authority — roles, scope resolution and `sequence` — and never reach SDK
+/// create.
+///
+/// The warm half is `claim_selected`'s save path, which no earlier fault row
+/// reaches: `unwritable_authority_…` faults a refresh, and the first-pin rows
+/// fault `commit`.
+#[test]
+fn failed_boot_acquisition_or_claim_save_keeps_authority() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    // Output resolved to O first, so a Boot claim is allowed to retire.
+    let o = archive_at(&h, "claim-fault-o.tar", "claim-fault-o");
+    let o_tag = format!("{}/images:o", server.host);
+    let out = h.import(&o.path, &o_tag);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    // X holds Boot.
+    let x = h.image(&ArchiveSpec {
+        marker: "claim-fault-x".into(),
+        ..Default::default()
+    });
+    server.image("images", "x", &x);
+    let x_tag = format!("{}/images:x", server.host);
+    assert!(!h.launch(&x_tag).status.success());
+    // Y is approved but holds no role: a refresh claims none (R7), so the warm
+    // claim below is a real change.
+    let y = h.image(&ArchiveSpec {
+        marker: "claim-fault-y".into(),
+        ..Default::default()
+    });
+    let y_child = server.image("images", "y", &y);
+    let y_tag = format!("{}/images:y", server.host);
+    assert!(h.refresh(&y_tag).status.success());
+    assert!(
+        h.record_in(&h.project, &y_tag)
+            .unwrap()
+            .get("roles")
+            .is_none(),
+        "refresh claims no role"
+    );
+
+    let before = fs::read(h.pins()).unwrap();
+    let creates = create_invocations(&h);
+    let authority =
+        || -> serde_json::Value { serde_json::from_slice(&fs::read(h.pins()).unwrap()).unwrap() };
+    let old = authority();
+    assert_eq!(
+        old["sequence"],
+        serde_json::json!(3),
+        "import, X claim, Y refresh"
+    );
+    let record = |value: &serde_json::Value, reference: &str| -> serde_json::Value {
+        value["pins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["reference"] == reference)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    };
+
+    // (a) Acquisition failure for a never-approved reference: the selected source
+    // cannot be acquired, so nothing may be claimed.
+    let missing = format!("{}/images:absent", server.host);
+    let out = h.launch(&missing);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        !stderr(&out).contains("stale"),
+        "an acquisition failure is not a stale approval: {}",
+        stderr(&out)
+    );
+    assert_eq!(create_invocations(&h), creates, "no SDK create");
+    assert_eq!(fs::read(h.pins()).unwrap(), before, "exact old bytes");
+
+    // (b) The warm Boot claim for the approved-but-unheld Y cannot save.
+    let mut gate = PinGate::new(h.root.path());
+    let peer = PinPeer::spawn(
+        h.command(),
+        &gate,
+        &["--image", &y_tag, "shell", "--", "true"],
+    );
+    gate.expect(PinStage::BeforePinLock).reply(Reply::Continue);
+    gate.expect(PinStage::PinLocked).reply(Reply::Continue);
+    gate.expect(PinStage::BeforePinSave)
+        .reply(Reply::FailBeforeSave);
+    // A suppressed fault would save (and only then block on the next checkpoint):
+    // assert the state oracles before collecting the child, so a wrong
+    // implementation fails here rather than on a gate read timeout.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline && fs::read(h.pins()).unwrap() == before {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(
+        fs::read(h.pins()).unwrap(),
+        before,
+        "exact old bytes, sequence included"
+    );
+    assert_eq!(create_invocations(&h), creates, "no SDK create");
+    let out = peer.wait();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("could not be accessed or saved"),
+        "the failure must name the authority save: {}",
+        stderr(&out)
+    );
+    assert!(!stderr(&out).contains("stale"), "{}", stderr(&out));
+
+    // (c) The same fault on the first-pin path: a never-approved Z.
+    let z = h.image(&ArchiveSpec {
+        marker: "claim-fault-z".into(),
+        ..Default::default()
+    });
+    server.image("images", "z", &z);
+    let z_tag = format!("{}/images:z", server.host);
+    let mut gate = PinGate::new(h.root.path());
+    let peer = PinPeer::spawn(
+        h.command(),
+        &gate,
+        &["--image", &z_tag, "shell", "--", "true"],
+    );
+    gate.expect(PinStage::CandidateReady).reply(Reply::Continue);
+    gate.expect(PinStage::BeforePinLock).reply(Reply::Continue);
+    gate.expect(PinStage::PinLocked).reply(Reply::Continue);
+    gate.expect(PinStage::BeforePinSave)
+        .reply(Reply::FailBeforeSave);
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline && fs::read(h.pins()).unwrap() == before {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(fs::read(h.pins()).unwrap(), before, "exact old bytes");
+    assert_eq!(create_invocations(&h), creates, "no SDK create");
+    let out = peer.wait();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("could not be accessed or saved"),
+        "{}",
+        stderr(&out)
+    );
+
+    // The whole-bytes comparisons above include these, named for the reader.
+    let old = authority();
+    assert_eq!(record(&old, &x_tag)["roles"], "boot");
+    assert_eq!(record(&old, &o_tag)["roles"], "output");
+    assert!(
+        record(&old, &y_tag).get("roles").is_none(),
+        "Y never held a role"
+    );
+    assert_eq!(old["scopes"][0]["resolved"], "boot-and-output");
+    assert_eq!(old["sequence"], serde_json::json!(3));
+    let _ = y_child;
+}
+
+/// AC10: a first pin whose lock cannot be opened before the CAS decision fails —
+/// it may never fall back to the different winner a peer committed meanwhile.
+///
+/// The fault must precede `commit_decision`: with the peer's record present the
+/// decision is already `Conflict`, so a `BeforePinSave` fault would never fire.
+/// The stable lock is therefore made readable but not writable (mode 0400), which
+/// breaks `begin`'s RDWR open while `lookup`'s RDONLY open still succeeds — so a
+/// fallback would find the peer's winner. Root bypasses file permissions, so
+/// there the gate closes at `BeforePinLock` instead: still before the decision,
+/// and still with a readable store for a fallback to find.
+#[test]
+fn first_pin_io_failure_never_becomes_winner_success() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec {
+        marker: "io-fault-a".into(),
+        ..Default::default()
+    });
+    let a_child = server.image("images", "io", &a);
+    let tag = format!("{}/images:io", server.host);
+
+    let mut gate = PinGate::new(h.root.path());
+    let loser = PinPeer::spawn(
+        h.command(),
+        &gate,
+        &["--image", &tag, "shell", "--", "true"],
+    );
+    let ready = gate.expect(PinStage::CandidateReady);
+
+    // The registry now serves B for the same key, and a peer in its own
+    // state/cache root (so it cannot contend with the paused acquisition)
+    // first-pins it in this same project: this is the winner a fallback would
+    // boot. Its Boot claim also makes the loser's later warm claim a no-op, so
+    // a fallback would succeed rather than fail again.
+    let b = h.image(&ArchiveSpec {
+        marker: "io-fault-b".into(),
+        ..Default::default()
+    });
+    let b_child = server.image("images", "io", &b);
+    assert_ne!(digest_of(&a_child), digest_of(&b_child));
+    let peer_state = peer_state("iof");
+    let out = peer_launch(&h, peer_state.path(), &tag);
+    assert!(!out.status.success(), "the fake runtime cannot boot");
+    let (winner, _) = h.pin_for(&tag).expect("the peer committed a winner");
+    assert_eq!(winner, digest_of(&b_child), "the winner is the peer's B");
+    let winner_bytes = fs::read(h.pins()).unwrap();
+    let creates = create_invocations(&h);
+
+    let root = unsafe { libc::geteuid() } == 0;
+    let lock = config_dir(&h).join("image-pins.lock");
+    let permissions = fs::metadata(&lock).unwrap().permissions();
+    if !root {
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o400)).unwrap();
+    }
+    ready.reply(Reply::Continue);
+    let checkpoint = gate.expect(PinStage::BeforePinLock);
+    if root {
+        drop(checkpoint);
+    } else {
+        checkpoint.reply(Reply::Continue);
+    }
+    let out = loser.wait();
+    fs::set_permissions(&lock, permissions).unwrap();
+
+    let text = stderr(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert_eq!(
+        create_invocations(&h),
+        creates,
+        "a failed first pin must not reach SDK create: {text}"
+    );
+    assert!(
+        !text.contains("stale"),
+        "an I/O failure is not a stale approval: {text}"
+    );
+    let diagnostic = if root {
+        "image pin gate closed without a reply"
+    } else {
+        "could not be accessed or saved"
+    };
+    assert!(
+        text.contains(diagnostic),
+        "the failure must name the save, not a winner: {text}"
+    );
+    assert_eq!(
+        fs::read(h.pins()).unwrap(),
+        winner_bytes,
+        "the winner's authority is byte-identical"
+    );
+    assert_eq!(
+        h.pin_for(&tag),
+        Some((digest_of(&b_child), 1)),
+        "the peer's first pin is the only allocation"
+    );
+}
+
+/// AC22: a needed warm Boot claim paused before the pin lock loses to peers that
+/// retire X and reinsert the same digest under a new allocation — stale, no
+/// create, exact peer bytes.
+///
+/// The consumed tuple is what distinguishes the second lifetime; a caller that
+/// re-read the tuple instead of passing the consumed one accepts the new one.
+#[test]
+fn warm_claim_rejects_retire_reinsert_same_digest_lifetime() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    // X holds Output (an import claims it) at digest A; Boot is still unknown.
+    let a = archive_at(&h, "aba-warm-a.tar", "aba-warm-a");
+    let x_tag = format!("{}/images:x", server.host);
+    let o = archive_at(&h, "aba-warm-o.tar", "aba-warm-o");
+    let o_tag = format!("{}/images:o", server.host);
+    let out = h.import(&a.path, &x_tag);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let (a_digest, a_revision) = h.pin_for(&x_tag).expect("X holds Output at A");
+    // Y holds Boot, so X is not retired while it holds Output.
+    let y = h.image(&ArchiveSpec {
+        marker: "aba-warm-y".into(),
+        ..Default::default()
+    });
+    server.image("images", "y", &y);
+    let y_tag = format!("{}/images:y", server.host);
+    assert!(!h.launch(&y_tag).status.success());
+    assert_eq!(h.record_in(&h.project, &y_tag).unwrap()["roles"], "boot");
+
+    // The suspended warm claim: X holds Output, so claiming Boot is a real change
+    // and reaches the exclusive transaction.
+    let mut gate = PinGate::new(h.root.path());
+    let loser = PinPeer::spawn(
+        h.command(),
+        &gate,
+        &["--image", &x_tag, "shell", "--", "true"],
+    );
+    let locked = gate.expect(PinStage::BeforePinLock);
+
+    // Peers, on their own state/cache root: take Output away (retiring X), then
+    // reinsert the same digest with the next global allocation.
+    let peer_state = peer_state("abw");
+    let out = peer_import(&h, peer_state.path(), &o.path, &o_tag);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(
+        h.pin_for(&x_tag).is_none(),
+        "X is retired by the peer's Output claim"
+    );
+    let out = peer_import(&h, peer_state.path(), &a.path, &x_tag);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let (reinserted_digest, reinserted) = h.pin_for(&x_tag).expect("the peer reinserted X");
+    assert_eq!(reinserted_digest, a_digest, "the same digest comes back");
+    assert!(
+        reinserted > a_revision,
+        "a new global allocation: {reinserted} > {a_revision}"
+    );
+    let peer_bytes = fs::read(h.pins()).unwrap();
+    let creates = create_invocations(&h);
+
+    locked.reply(Reply::Continue);
+    // The stale decision happens under the lock and before any save: the last
+    // stage is `PinLocked`, never `BeforePinSave`.
+    gate.expect(PinStage::PinLocked).reply(Reply::Continue);
+    let out = loser.wait();
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("stale"),
+        "the second lifetime must not satisfy the old tuple: {}",
+        stderr(&out)
+    );
+    assert_eq!(
+        create_invocations(&h),
+        creates,
+        "a stale claim must not reach SDK create"
+    );
+    assert_eq!(
+        fs::read(h.pins()).unwrap(),
+        peer_bytes,
+        "the peer's authority is byte-identical"
+    );
+    assert_eq!(h.pin_for(&x_tag), Some((a_digest, reinserted)));
+    assert_eq!(
+        h.record_in(&h.project, &y_tag).unwrap()["roles"],
+        "boot",
+        "the peer's Boot holder is untouched"
+    );
+}
+
+/// AC22 (caller seam): the approval a warm preparation consumed **is** the
+/// predecessor its Boot claim presents.
+///
+/// Peers retire X and reinsert the same digest while the approved content is
+/// being acquired — after the tuple was read, before the claim is made — so the
+/// claim is stale and no create happens. A caller that re-read the tuple at that
+/// point would claim the reinserted lifetime instead.
+#[test]
+fn warm_claim_presents_the_consumed_tuple_after_a_reinsert() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let a = archive_at(&h, "seam-a.tar", "seam-a");
+    let x_tag = format!("{}/images:x", server.host);
+    let o = archive_at(&h, "seam-o.tar", "seam-o");
+    let o_tag = format!("{}/images:o", server.host);
+    let out = h.import(&a.path, &x_tag);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let (a_digest, a_revision) = h.pin_for(&x_tag).expect("X holds Output at A");
+    let y = h.image(&ArchiveSpec {
+        marker: "seam-y".into(),
+        ..Default::default()
+    });
+    server.image("images", "y", &y);
+    let y_tag = format!("{}/images:y", server.host);
+    assert!(!h.launch(&y_tag).status.success());
+
+    // The tuple is read before the approved content is acquired: pause there,
+    // with the fine-grained observation stages enabled so the pause is a real
+    // cache hit rather than a guess.
+    let mut gate = AcquisitionGate::new(h.root.path());
+    let mut command = h.command();
+    command.env("AGENT_VM_TEST_ACQUIRE_GATE_DETAIL", "1");
+    let loser =
+        acquisition_gate::Peer::spawn(command, &gate, &["--image", &x_tag, "shell", "--", "true"]);
+    let hit = gate.expect_eventually(AcquisitionStage::CacheHit);
+
+    let peer_state = peer_state("seam");
+    let out = peer_import(&h, peer_state.path(), &o.path, &o_tag);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(h.pin_for(&x_tag).is_none(), "X is retired");
+    let out = peer_import(&h, peer_state.path(), &a.path, &x_tag);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let (reinserted_digest, reinserted) = h.pin_for(&x_tag).expect("X is reinserted");
+    assert_eq!(reinserted_digest, a_digest);
+    assert!(reinserted > a_revision);
+    let peer_bytes = fs::read(h.pins()).unwrap();
+    let creates = create_invocations(&h);
+
+    hit.reply(GateReply::Continue);
+    // A claim that presented the reinserted lifetime would write the store and
+    // then reach SDK create. Assert those two oracles *before* collecting the
+    // child, so a wrong implementation fails here instead of on a read timeout.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline
+        && create_invocations(&h) == creates
+        && fs::read(h.pins()).unwrap() == peer_bytes
+    {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(
+        create_invocations(&h),
+        creates,
+        "the claim must not present the reinserted lifetime"
+    );
+    assert_eq!(
+        fs::read(h.pins()).unwrap(),
+        peer_bytes,
+        "the peer's authority is byte-identical"
+    );
+    let out = loser.wait();
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("stale"), "{}", stderr(&out));
+}
+
+/// AC21 (refresh): a changed-content refresh frozen against X=A pauses before the
+/// pin lock; peers retire X and reinsert A; resuming is stale with no B commit and
+/// exact peer bytes.
+///
+/// A per-key or reset-to-1 allocator reissues A's old token, which matches the
+/// frozen predecessor and commits B here.
+#[test]
+fn refresh_cas_rejects_retire_reinsert_same_digest_lifetime() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec {
+        marker: "aba-refresh-a".into(),
+        ..Default::default()
+    });
+    let a_child = server.image("images", "x", &a);
+    let x_tag = format!("{}/images:x", server.host);
+    assert!(!h.launch(&x_tag).status.success());
+    let (a_digest, a_revision) = h.pin_for(&x_tag).expect("X holds Boot at A");
+    assert_eq!(a_digest, digest_of(&a_child));
+    // The tag now serves B, so the refresh freezes and renders A -> B.
+    let b = h.image(&ArchiveSpec {
+        marker: "aba-refresh-b".into(),
+        ..Default::default()
+    });
+    let b_child = server.image("images", "x", &b);
+    assert_ne!(digest_of(&b_child), a_digest);
+
+    let mut gate = PinGate::new(h.root.path());
+    let loser = PinPeer::spawn(h.command(), &gate, &["image", "refresh", "--image", &x_tag]);
+    gate.expect(PinStage::CandidateReady).reply(Reply::Continue);
+    let locked = gate.expect(PinStage::BeforePinLock);
+
+    // Peers retire X: Output to O, then Boot to Y. Both slots are then resolved
+    // and X holds neither, so the store retires it.
+    let peer_state = peer_state("abr");
+    let o = archive_at(&h, "aba-refresh-o.tar", "aba-refresh-o");
+    let o_tag = format!("{}/images:o", server.host);
+    let out = peer_import(&h, peer_state.path(), &o.path, &o_tag);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let y = h.image(&ArchiveSpec {
+        marker: "aba-refresh-y".into(),
+        ..Default::default()
+    });
+    server.image("images", "y", &y);
+    let y_tag = format!("{}/images:y", server.host);
+    assert!(!peer_launch(&h, peer_state.path(), &y_tag).status.success());
+    assert!(h.pin_for(&x_tag).is_none(), "X is retired");
+    // Reinsert A: the registry serves A again and refresh claims no role.
+    server.image("images", "x", &a);
+    assert!(
+        peer_refresh(&h, peer_state.path(), &x_tag).status.success(),
+        "the peer reinserts A"
+    );
+    let (reinserted_digest, reinserted) = h.pin_for(&x_tag).expect("the peer reinserted X");
+    assert_eq!(reinserted_digest, a_digest);
+    assert!(reinserted > a_revision);
+    let peer_bytes = fs::read(h.pins()).unwrap();
+
+    locked.reply(Reply::Continue);
+    // The stale decision happens under the lock and before any save: the last
+    // stage is `PinLocked`, never `BeforePinSave`.
+    gate.expect(PinStage::PinLocked).reply(Reply::Continue);
+    let out = loser.wait();
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("stale"),
+        "the frozen predecessor no longer exists: {}",
+        stderr(&out)
+    );
+    assert_eq!(
+        fs::read(h.pins()).unwrap(),
+        peer_bytes,
+        "no B approval and no default change were committed"
+    );
+    assert!(
+        h.pins_value().unwrap()["pins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|record| record["manifest_digest"] != digest_of(&b_child)),
+        "B is never committed"
+    );
+    assert_eq!(h.pin_for(&x_tag), Some((a_digest, reinserted)));
+}
+
+/// AC21 (publication): the same frozen-predecessor schedule for an explicit
+/// import of B under X's key. The publication's Output claim resumes after peers
+/// retired and reinserted X: stale, no B approval, no Output move, exact bytes.
+#[test]
+fn publication_cas_rejects_retire_reinsert_same_digest_lifetime() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec {
+        marker: "aba-pub-a".into(),
+        ..Default::default()
+    });
+    let a_child = server.image("images", "x", &a);
+    let x_tag = format!("{}/images:x", server.host);
+    assert!(!h.launch(&x_tag).status.success());
+    let (a_digest, a_revision) = h.pin_for(&x_tag).expect("X holds Boot at A");
+    assert_eq!(a_digest, digest_of(&a_child));
+
+    // The publication publishes B and freezes its rendered predecessor A.
+    let b = archive_at(&h, "aba-pub-b.tar", "aba-pub-b");
+    let mut gate = PinGate::new(h.root.path());
+    let loser = PinPeer::spawn(
+        h.command(),
+        &gate,
+        &[
+            "image",
+            "import",
+            "--input",
+            b.path.to_str().unwrap(),
+            "--tag",
+            &x_tag,
+        ],
+    );
+    gate.expect(PinStage::Published).reply(Reply::Continue);
+    gate.expect(PinStage::CandidateReady).reply(Reply::Continue);
+    let locked = gate.expect(PinStage::BeforePinLock);
+
+    let peer_state = peer_state("abp");
+    let o = archive_at(&h, "aba-pub-o.tar", "aba-pub-o");
+    let o_tag = format!("{}/images:o", server.host);
+    let out = peer_import(&h, peer_state.path(), &o.path, &o_tag);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let y = h.image(&ArchiveSpec {
+        marker: "aba-pub-y".into(),
+        ..Default::default()
+    });
+    server.image("images", "y", &y);
+    let y_tag = format!("{}/images:y", server.host);
+    assert!(!peer_launch(&h, peer_state.path(), &y_tag).status.success());
+    assert!(h.pin_for(&x_tag).is_none(), "X is retired");
+    // The registry still serves A under X's tag; a refresh reinserts it unheld.
+    assert!(peer_refresh(&h, peer_state.path(), &x_tag).status.success());
+    let (reinserted_digest, reinserted) = h.pin_for(&x_tag).expect("the peer reinserted X");
+    assert_eq!(reinserted_digest, a_digest);
+    assert!(reinserted > a_revision);
+    let peer_bytes = fs::read(h.pins()).unwrap();
+
+    locked.reply(Reply::Continue);
+    // The stale decision happens under the lock and before any save: the last
+    // stage is `PinLocked`, never `BeforePinSave`.
+    gate.expect(PinStage::PinLocked).reply(Reply::Continue);
+    let out = loser.wait();
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("stale"),
+        "the publication's predecessor no longer exists: {}",
+        stderr(&out)
+    );
+    assert_eq!(
+        fs::read(h.pins()).unwrap(),
+        peer_bytes,
+        "no B approval and no Output move were committed"
+    );
+    assert!(
+        h.pins_value().unwrap()["pins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|record| record["manifest_digest"] != b.manifest_digest.as_str()),
+        "the published B is never approved"
+    );
+    assert_eq!(h.pin_for(&x_tag), Some((a_digest, reinserted)));
+}
+
+// ---------------------------------------------------------------------------
+// The remaining acceptance-criterion fixtures (AC2, 5, 6, 7, 8, 13, 14, 19, 20).
+// ---------------------------------------------------------------------------
+
+/// Run one import with no gate at all: the only committed-bytes baseline that is
+/// not derived from the implementation's own proposal.
+fn gate_free_import(h: &Harness, archive: &Path, tag: &str) -> Vec<u8> {
+    let _ = fs::remove_dir_all(config_dir(h));
+    let out = h.import(archive, tag);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    fs::read(h.pins()).unwrap()
+}
+
+/// AC2: `setup` prepares X then Y with Output already resolved to a control O, so
+/// X retires; without that Output resolution the same switch must protect X.
+#[test]
+fn setup_transitions_switch_boot_and_keep_an_unknown_output_control() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let o = archive_at(&h, "ac2-o.tar", "ac2-o");
+    let o_tag = format!("{}/images:o", server.host);
+    let out = h.import(&o.path, &o_tag);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let x = h.image(&ArchiveSpec {
+        marker: "ac2-x".into(),
+        ..Default::default()
+    });
+    let x_tag = format!("{}/images:x", server.host);
+    server.image("images", "x", &x);
+    let y = h.image(&ArchiveSpec {
+        marker: "ac2-y".into(),
+        ..Default::default()
+    });
+    let y_tag = format!("{}/images:y", server.host);
+    server.image("images", "y", &y);
+
+    let setup = |reference: &str| {
+        let mut command = h.command();
+        command.args(["setup", "--image", reference, "--no-verify"]);
+        bounded(command)
+    };
+    let first = setup(&x_tag);
+    assert_eq!(
+        h.record_in(&h.project, &x_tag).unwrap()["roles"],
+        "boot",
+        "{}",
+        stderr(&first)
+    );
+    let second = setup(&y_tag);
+    assert_eq!(
+        h.record_in(&h.project, &y_tag).unwrap()["roles"],
+        "boot",
+        "{}",
+        stderr(&second)
+    );
+    assert!(
+        h.pin_for(&x_tag).is_none(),
+        "X retires: Boot moved and Output was resolved elsewhere"
+    );
+    assert_eq!(h.record_in(&h.project, &o_tag).unwrap()["roles"], "output");
+
+    // The control: the same switch order with Output unresolved must keep X, and
+    // both references are in a fresh project so the first scope starts clean.
+    let control = h.project_at("ac2-control");
+    let control_state = h.root.path().join("ac2-state");
+    fs::create_dir_all(&control_state).unwrap();
+    let setup_in = |reference: &str| {
+        let mut command = h.command_in(&control, &control_state);
+        command.args(["setup", "--image", reference, "--no-verify"]);
+        bounded(command)
+    };
+    let out = setup_in(&x_tag);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "setup records before it returns: {}",
+        stderr(&out)
+    );
+    let switched = setup_in(&y_tag);
+    let control_record = h
+        .record_in(&control, &x_tag)
+        .expect("?Output protects the displaced X");
+    assert!(
+        control_record.get("roles").is_none(),
+        "X holds no role but is retained: {control_record}"
+    );
+    assert_eq!(
+        h.record_in(&control, &y_tag).unwrap()["roles"],
+        "boot",
+        "{}",
+        stderr(&switched)
+    );
+    assert_eq!(
+        h.pins_value().unwrap()["scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|scope| scope["project"] == project_id(&control).as_str())
+            .unwrap()["resolved"],
+        "boot",
+        "the control scope resolves Boot only"
+    );
+}
+
+/// AC5: with Boot held by a distinct B, build X → import Y → build Z retires each
+/// displaced output; B and the defaults are untouched; an archive alias gets no
+/// role.
+#[test]
+fn build_and_import_share_one_output_after_scope_resolution() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let b = h.image(&ArchiveSpec {
+        marker: "ac5-b".into(),
+        ..Default::default()
+    });
+    let b_tag = format!("{}/images:b", server.host);
+    let b_child = server.image("images", "b", &b);
+    assert!(!h.launch(&b_tag).status.success());
+    assert_eq!(h.pin_in(&h.project, &b_tag).unwrap().0, digest_of(&b_child));
+    let b_record = h.record_in(&h.project, &b_tag).unwrap();
+
+    let outputs = |h: &Harness| -> Vec<(String, String)> {
+        h.pins_value().unwrap()["pins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|record| record["project"] == project_id(&h.project).as_str())
+            .filter_map(|record| {
+                record.get("roles").map(|roles| {
+                    (
+                        record["reference"].as_str().unwrap().to_owned(),
+                        roles.as_str().unwrap().to_owned(),
+                    )
+                })
+            })
+            .collect()
+    };
+
+    let x_archive = h.image(&ArchiveSpec {
+        marker: "ac5-x".into(),
+        ..Default::default()
+    });
+    let x_tag = format!("{}/images:x", server.host);
+    let built = h.build(&x_archive.written.path, &x_tag);
+    assert_eq!(built.status.code(), Some(0), "{}", stderr(&built));
+    assert_eq!(h.record_in(&h.project, &x_tag).unwrap()["roles"], "output");
+
+    let y = archive_at(&h, "ac5-y.tar", "ac5-y");
+    let y_tag = format!("{}/images:y", server.host);
+    let imported = h.import(&y.path, &y_tag);
+    assert_eq!(imported.status.code(), Some(0), "{}", stderr(&imported));
+    assert!(
+        h.pin_for(&x_tag).is_none(),
+        "the displaced sole output X retires"
+    );
+    assert_eq!(h.record_in(&h.project, &y_tag).unwrap()["roles"], "output");
+
+    let z_archive = h.image(&ArchiveSpec {
+        marker: "ac5-z".into(),
+        ..Default::default()
+    });
+    let z_tag = format!("{}/images:z", server.host);
+    let built = h.build(&z_archive.written.path, &z_tag);
+    assert_eq!(built.status.code(), Some(0), "{}", stderr(&built));
+    assert!(
+        h.pin_for(&y_tag).is_none(),
+        "the displaced output Y retires: each one is a sole output"
+    );
+    assert_eq!(h.record_in(&h.project, &z_tag).unwrap()["roles"], "output");
+    // Boot and the defaults are untouched by publications.
+    assert_eq!(h.record_in(&h.project, &b_tag).unwrap(), b_record);
+    assert!(
+        h.default_record_in(&h.project).is_none(),
+        "an explicit build/import establishes no project default"
+    );
+    // An archive-carried name gets no role.
+    assert_eq!(
+        outputs(&h)
+            .into_iter()
+            .filter(|(_, roles)| roles != "none")
+            .collect::<Vec<_>>()
+            .len(),
+        2,
+        "one Boot holder and one Output holder"
+    );
+}
+
+/// AC6: an equal-content, role-only save fault (content unchanged, only Output
+/// moves) preserves the exact old active set and sequence.
+#[test]
+fn equal_content_role_only_save_fault_preserves_the_active_set() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    // The same content reachable two ways: a registry image and its own archive.
+    let spec = ArchiveSpec {
+        marker: "ac6".into(),
+        ..Default::default()
+    };
+    let image = h.image(&spec);
+    let digest = image.written.manifest_digest.clone();
+    let x_tag = format!("{}/images:x", server.host);
+    let y_tag = format!("{}/images:y", server.host);
+    // X holds Output at that digest.
+    let out = h.import(&image.written.path, &x_tag);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(h.pin_for(&x_tag).unwrap().0, digest);
+    // Y is approved at the same content but holds no role (refresh claims none).
+    server.image("images", "y", &image);
+    assert!(h.refresh(&y_tag).status.success());
+    assert_eq!(h.pin_for(&y_tag).unwrap().0, digest);
+    assert!(
+        h.record_in(&h.project, &y_tag)
+            .unwrap()
+            .get("roles")
+            .is_none()
+    );
+
+    let before = fs::read(h.pins()).unwrap();
+    let sequence = h.pins_value().unwrap()["sequence"].as_u64();
+    // Re-importing the identical content under Y needs a save *only* because the
+    // Output role moves: the approval content and token do not change.
+    let mut gate = PinGate::new(h.root.path());
+    let peer = PinPeer::spawn(
+        h.command(),
+        &gate,
+        &[
+            "image",
+            "import",
+            "--input",
+            image.written.path.to_str().unwrap(),
+            "--tag",
+            &y_tag,
+        ],
+    );
+    gate.expect(PinStage::Published).reply(Reply::Continue);
+    gate.expect(PinStage::CandidateReady).reply(Reply::Continue);
+    gate.expect(PinStage::BeforePinLock).reply(Reply::Continue);
+    gate.expect(PinStage::PinLocked).reply(Reply::Continue);
+    gate.expect(PinStage::BeforePinSave)
+        .reply(Reply::FailBeforeSave);
+    let out = peer.wait();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("approval was not updated"),
+        "a precommit publication failure keeps its context: {}",
+        stderr(&out)
+    );
+    assert_eq!(
+        fs::read(h.pins()).unwrap(),
+        before,
+        "roles, resolution and sequence are unchanged"
+    );
+    assert_eq!(h.pins_value().unwrap()["sequence"].as_u64(), sequence);
+    assert_eq!(h.record_in(&h.project, &x_tag).unwrap()["roles"], "output");
+    assert!(
+        h.record_in(&h.project, &y_tag)
+            .unwrap()
+            .get("roles")
+            .is_none()
+    );
+}
+
+/// AC7 (cold C): a retired X re-resolved from a cleared owned cache requests its
+/// mutable source, never the retired child, and approves the new content C.
+#[test]
+fn retired_return_resolves_current_source_from_cold_cache() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let o = archive_at(&h, "ac7c-o.tar", "ac7c-o");
+    let o_tag = format!("{}/images:o", server.host);
+    assert_eq!(h.import(&o.path, &o_tag).status.code(), Some(0));
+    let a = h.image(&ArchiveSpec {
+        marker: "ac7c-a".into(),
+        ..Default::default()
+    });
+    let a_child = server.image("images", "x", &a);
+    let x_tag = format!("{}/images:x", server.host);
+    assert!(!h.launch(&x_tag).status.success());
+    let (a_digest, a_revision) = h.pin_for(&x_tag).unwrap();
+    // Retire X: Boot moves to Y while Output is resolved.
+    let y = h.image(&ArchiveSpec {
+        marker: "ac7c-y".into(),
+        ..Default::default()
+    });
+    server.image("images", "y", &y);
+    let y_tag = format!("{}/images:y", server.host);
+    assert!(!h.launch(&y_tag).status.success());
+    assert!(h.pin_for(&x_tag).is_none(), "X is absent before the return");
+
+    // The tag now serves C, and only this fixture's cache is cleared: the return
+    // must resolve the source, not the retired child.
+    let c = h.image(&ArchiveSpec {
+        marker: "ac7c-c".into(),
+        ..Default::default()
+    });
+    let c_child = server.image("images", "x", &c);
+    fs::remove_dir_all(h.cache()).unwrap();
+    let before = server.count();
+    let sequence = h.pins_value().unwrap()["sequence"].as_u64().unwrap();
+    let back = h.launch(&x_tag);
+    assert!(!back.status.success());
+    assert_eq!(
+        sdk_image(&back),
+        c_child,
+        "the return boots the new content C"
+    );
+    assert!(
+        !stderr(&back).contains("old: "),
+        "a fresh pin renders no old -> new replacement: {}",
+        stderr(&back)
+    );
+    let since = &server.requests()[before..];
+    assert!(
+        since
+            .iter()
+            .any(|(_, path)| path == "/v2/images/manifests/x"),
+        "the source is resolved: {since:?}"
+    );
+    assert!(
+        !since
+            .iter()
+            .any(|(_, path)| path == &format!("/v2/images/manifests/{}", digest_of(&a_child))),
+        "the retired child is never re-resolved: {since:?}"
+    );
+    let (digest, revision) = h
+        .pin_for(&x_tag)
+        .expect("the return approves fresh authority");
+    assert_eq!(digest, digest_of(&c_child));
+    assert_ne!(digest, a_digest);
+    assert_eq!(
+        revision,
+        sequence + 1,
+        "a fresh global allocation, not a restored token"
+    );
+    assert_ne!(revision, a_revision);
+}
+
+/// AC7 (same A): a retired X whose cached content is unchanged is approved again
+/// under a fresh global allocation — the old approval is not restored, but the
+/// digest may legitimately be the same.
+#[test]
+fn retired_return_can_approve_the_same_cached_digest() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let o = archive_at(&h, "ac7a-o.tar", "ac7a-o");
+    let o_tag = format!("{}/images:o", server.host);
+    assert_eq!(h.import(&o.path, &o_tag).status.code(), Some(0));
+    let a = h.image(&ArchiveSpec {
+        marker: "ac7a-a".into(),
+        ..Default::default()
+    });
+    let a_child = server.image("images", "x", &a);
+    let x_tag = format!("{}/images:x", server.host);
+    assert!(!h.launch(&x_tag).status.success());
+    let (a_digest, a_revision) = h.pin_for(&x_tag).unwrap();
+    let a_record = h.record_in(&h.project, &x_tag).unwrap();
+    let y = h.image(&ArchiveSpec {
+        marker: "ac7a-y".into(),
+        ..Default::default()
+    });
+    server.image("images", "y", &y);
+    let y_tag = format!("{}/images:y", server.host);
+    assert!(!h.launch(&y_tag).status.success());
+    assert!(h.pin_for(&x_tag).is_none(), "X is absent before the return");
+    // The registry serves the same A again.
+    // The content is still cached, and the registry now serves *nothing* for this
+    // reference: a return that needed the network would fail.
+    server.remove("/v2/images/manifests/x");
+    server.remove(&format!("/v2/images/manifests/{}", digest_of(&a_child)));
+    let before = server.count();
+    let sequence = h.pins_value().unwrap()["sequence"].as_u64().unwrap();
+    let back = h.launch(&x_tag);
+    assert!(!back.status.success(), "the fake runtime cannot boot");
+    assert_eq!(
+        sdk_image(&back),
+        a_child,
+        "the cached content comes back without the registry"
+    );
+    assert_eq!(
+        server.count(),
+        before,
+        "offline: no registry request at all"
+    );
+    assert!(
+        !stderr(&back).contains("old: "),
+        "a fresh pin renders no old -> new replacement: {}",
+        stderr(&back)
+    );
+    let (digest, revision) = h.pin_for(&x_tag).expect("fresh authority, not a restore");
+    assert_eq!(digest, a_digest, "the digest may be unchanged (R8)");
+    assert_eq!(
+        revision,
+        sequence + 1,
+        "a reapproval draws the next global allocation"
+    );
+    assert_ne!(revision, a_revision);
+    let record = h.record_in(&h.project, &x_tag).unwrap();
+    assert_ne!(record, a_record, "the old approval is not restored");
+    assert_eq!(record["roles"], "boot");
+}
+
+/// AC8: a record retained only by its unresolved Output survives a tag move and a
+/// cache loss: warm offline use consumes A, and a cold return requests the
+/// approved child A, never the mutable tag.
+#[test]
+fn retained_child_is_used_after_tag_move_and_cache_loss() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec {
+        marker: "ac8-a".into(),
+        ..Default::default()
+    });
+    let a_child = server.image("images", "x", &a);
+    let a_digest = digest_of(&a_child);
+    let x_tag = format!("{}/images:x", server.host);
+    assert!(!h.launch(&x_tag).status.success());
+    // Boot moves away while Output is unresolved: X is retained, holding nothing.
+    let y = h.image(&ArchiveSpec {
+        marker: "ac8-y".into(),
+        ..Default::default()
+    });
+    server.image("images", "y", &y);
+    let y_tag = format!("{}/images:y", server.host);
+    assert!(!h.launch(&y_tag).status.success());
+    let retained = h
+        .record_in(&h.project, &x_tag)
+        .expect("?Output protects the record");
+    assert!(retained.get("roles").is_none());
+    assert_eq!(retained["manifest_digest"], a_digest);
+
+    // The tag moves to B and only the owned cache is cleared.
+    let b = h.image(&ArchiveSpec {
+        marker: "ac8-b".into(),
+        ..Default::default()
+    });
+    let b_child = server.image("images", "x", &b);
+    fs::remove_dir_all(h.cache()).unwrap();
+    let before = server.count();
+    let again = h.launch(&x_tag);
+    assert!(!again.status.success());
+    assert_eq!(
+        sdk_image(&again),
+        a_child,
+        "the approved child A is requested"
+    );
+    assert_ne!(sdk_image(&again), b_child);
+    let since = &server.requests()[before..];
+    assert!(
+        since
+            .iter()
+            .any(|(_, path)| path == &format!("/v2/images/manifests/{a_digest}")),
+        "the approved digest is requested: {since:?}"
+    );
+    assert!(
+        !since
+            .iter()
+            .any(|(_, path)| path == "/v2/images/manifests/x"),
+        "the mutable tag is never requested: {since:?}"
+    );
+    assert_eq!(
+        h.record_in(&h.project, &x_tag).unwrap()["manifest_digest"],
+        a_digest,
+        "no replacement approval is minted for a tag move"
+    );
+    // A warm offline use also still consumes A.
+    let offline = h.launch(&x_tag);
+    assert!(!offline.status.success());
+    assert_eq!(sdk_image(&offline), a_child);
+}
+
+/// AC13: the first warm claim of a legacy record writes role/scope/sequence and
+/// recovers the pending journal in that same save — recovery never happens on an
+/// observation or a complete no-op.
+#[test]
+fn first_warm_claim_writes_roles_and_recovers_the_journal() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec {
+        marker: "ac13-a".into(),
+        ..Default::default()
+    });
+    let child = server.image("images", "ac13", &a);
+    let tag = format!("{}/images:ac13", server.host);
+    assert!(!h.launch(&tag).status.success());
+
+    // Literal 0.7.49 pin shape with an S1 journal: the host record holds the
+    // *proposed* bytes, and recovery must restore `previous`.
+    let mut store = h.pins_value().unwrap();
+    for record in store["pins"].as_array_mut().unwrap() {
+        record.as_object_mut().unwrap().remove("roles");
+        record["revision"] = serde_json::json!(7);
+    }
+    store.as_object_mut().unwrap().remove("scopes");
+    store.as_object_mut().unwrap().remove("sequence");
+    let previous = serde_json::json!({"version": 1, "image": child}).to_string();
+    let proposed = serde_json::json!({
+        "version": 1,
+        "image": format!("{}/images@sha256:{}", server.host, "c".repeat(64))
+    })
+    .to_string();
+    store["pending_default"] = serde_json::json!({
+        "previous": previous,
+        "proposed": proposed
+    });
+    seed_store(&h, &serde_json::to_vec(&store).unwrap());
+    let host_record = h.home.join(".config/agent-vm/default-image.json");
+    fs::write(&host_record, &proposed).unwrap();
+
+    let out = h.launch(&tag);
+    assert!(!out.status.success(), "the fake runtime cannot boot");
+    assert_eq!(sdk_image(&out), child);
+    let claimed = read_json(&h.pins());
+    assert_eq!(claimed["pins"][0]["roles"], "boot");
+    assert_eq!(claimed["pins"][0]["revision"], 7);
+    assert_eq!(claimed["scopes"][0]["resolved"], "boot");
+    // R9: clearing the journal is itself a pin save, so it allocates 8 and the
+    // claim that follows allocates 9.
+    assert_eq!(claimed["sequence"], serde_json::json!(9));
+    assert!(
+        claimed["pending_default"].is_null(),
+        "the journal was cleared"
+    );
+    assert_eq!(
+        fs::read_to_string(&host_record).unwrap(),
+        previous,
+        "recovery restored the previous host record"
+    );
+}
+
+/// AC14: `image show` and `doctor` read every new store state, write nothing and
+/// leak no reference.
+#[test]
+fn show_and_doctor_read_every_new_state_without_writing() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let project = project_id(&h.project);
+    let platform = |variant: Option<&str>| serde_json::json!({"os": "linux", "architecture": image_archive::host_arch(), "variant": variant});
+    let pin = |reference: &str, digest: &str, roles: Option<&str>| {
+        let mut record = serde_json::json!({
+            "project": project,
+            "reference": reference,
+            "platform": platform(None),
+            "manifest_digest": digest,
+            "revision": 1,
+        });
+        if let Some(roles) = roles {
+            record["roles"] = serde_json::json!(roles);
+        }
+        record
+    };
+    let scope = |resolved: &str| {
+        serde_json::json!({
+            "project": project,
+            "platform": platform(None),
+            "resolved": resolved,
+        })
+    };
+    let a = format!("sha256:{}", "a".repeat(64));
+    let b = format!("sha256:{}", "b".repeat(64));
+    // Partial resolution, fully resolved, protected no-role, and a known-inactive
+    // refresh record.
+    let states = [
+        (
+            "partial",
+            vec![pin("example.com/x:tag", &a, Some("boot"))],
+            vec![scope("boot")],
+        ),
+        (
+            "resolved",
+            vec![
+                pin("example.com/x:tag", &a, Some("boot")),
+                pin("example.com/o:tag", &b, Some("output")),
+            ],
+            vec![scope("boot-and-output")],
+        ),
+        (
+            "protected-no-role",
+            vec![
+                pin("example.com/k:tag", &b, Some("boot")),
+                pin("example.com/x:tag", &a, None),
+            ],
+            vec![scope("boot")],
+        ),
+        (
+            "known-inactive-refresh",
+            vec![
+                pin("example.com/x:tag", &a, Some("boot")),
+                pin("example.com/o:tag", &b, Some("output")),
+                pin("example.com/v:tag", &b, None),
+            ],
+            vec![scope("boot-and-output")],
+        ),
+    ];
+    for (name, pins, scopes) in states {
+        let store = serde_json::json!({
+            "version": 2,
+            "pins": pins,
+            "pending_default": null,
+            "scopes": scopes,
+            "sequence": 1,
+        });
+        let bytes = serde_json::to_vec(&store).unwrap();
+        seed_store(&h, &bytes);
+        for verb in [vec!["image", "show"], vec!["doctor"]] {
+            let mut command = h.command();
+            command.args(&verb);
+            let out = bounded(command);
+            assert!(out.status.success(), "{name} {verb:?}: {}", stderr(&out));
+            assert_eq!(
+                fs::read(h.pins()).unwrap(),
+                bytes,
+                "{name} {verb:?} wrote the store"
+            );
+            assert!(
+                !stdout_of(&out).contains("example.com") && !stderr(&out).contains("example.com"),
+                "{name} {verb:?} leaked a reference: {}{}",
+                stdout_of(&out),
+                stderr(&out)
+            );
+        }
+    }
+}
+
+/// AC19: a literal old-v2 last-boot record is claimed as Output only, displaced,
+/// and then still supplies its approved child after the tag moves and the owned
+/// cache is cleared.
+#[test]
+fn legacy_boot_survives_output_then_child_acquisition() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec {
+        marker: "ac19-a".into(),
+        ..Default::default()
+    });
+    let a_child = server.image("images", "x", &a);
+    let a_digest = digest_of(&a_child);
+    let x_tag = format!("{}/images:x", server.host);
+    assert!(!h.launch(&x_tag).status.success());
+    // Literal old shape: no roles/scopes/sequence, revision 7.
+    let mut store = h.pins_value().unwrap();
+    for record in store["pins"].as_array_mut().unwrap() {
+        record.as_object_mut().unwrap().remove("roles");
+        record["revision"] = serde_json::json!(7);
+    }
+    store.as_object_mut().unwrap().remove("scopes");
+    store.as_object_mut().unwrap().remove("sequence");
+    seed_store(&h, &serde_json::to_vec(&store).unwrap());
+    let old_record = read_json(&h.pins())["pins"][0].clone();
+
+    // An unchanged build/import of X is an Output claim only: Boot stays unknown.
+    let out = h.import(&a.written.path, &x_tag);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let claimed = read_json(&h.pins());
+    assert_eq!(claimed["pins"][0]["roles"], "output");
+    assert_eq!(claimed["pins"][0]["revision"], 7);
+    assert_eq!(claimed["scopes"][0]["resolved"], "output");
+    // A different output displaces the slot; ?Boot keeps X.
+    let y = archive_at(&h, "ac19-y.tar", "ac19-y");
+    let y_tag = format!("{}/images:y", server.host);
+    assert_eq!(h.import(&y.path, &y_tag).status.code(), Some(0));
+    let displaced = read_json(&h.pins());
+    let mut expected = old_record.clone();
+    expected["roles"] = serde_json::json!("output");
+    let x_record = displaced["pins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["reference"] == x_tag)
+        .expect("X survives: Boot is unknown");
+    assert_eq!(x_record["manifest_digest"], old_record["manifest_digest"]);
+    assert_eq!(x_record["revision"], 7);
+    assert!(
+        x_record.get("roles").is_none(),
+        "the Output role moved away"
+    );
+
+    // Move the tag to B and clear only the owned cache: the return requests the
+    // approved child A, never the tag.
+    let b = h.image(&ArchiveSpec {
+        marker: "ac19-b".into(),
+        ..Default::default()
+    });
+    server.image("images", "x", &b);
+    fs::remove_dir_all(h.cache()).unwrap();
+    let before = server.count();
+    let back = h.launch(&x_tag);
+    assert!(!back.status.success());
+    assert_eq!(
+        sdk_image(&back),
+        a_child,
+        "the SDK gets the approved child A"
+    );
+    let since = &server.requests()[before..];
+    assert!(
+        since
+            .iter()
+            .any(|(_, path)| path == &format!("/v2/images/manifests/{a_digest}")),
+        "the approved digest is requested: {since:?}"
+    );
+    assert!(
+        !since
+            .iter()
+            .any(|(_, path)| path == "/v2/images/manifests/x"),
+        "the moved tag is never requested: {since:?}"
+    );
+    assert_eq!(
+        h.pin_for(&x_tag).unwrap().0,
+        a_digest,
+        "no replacement approval is minted"
+    );
+    assert!(!stdout_of(&back).contains("old:"));
+}
+
+/// AC20: the symmetric literal old-v2 last-output record is claimed as Boot only,
+/// displaced, and still supplies its approved child after a tag move.
+#[test]
+fn legacy_output_survives_boot_then_child_acquisition() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec {
+        marker: "ac20-a".into(),
+        ..Default::default()
+    });
+    let a_child = server.image("images", "x", &a);
+    let a_digest = digest_of(&a_child);
+    let x_tag = format!("{}/images:x", server.host);
+    assert!(!h.launch(&x_tag).status.success());
+    let mut store = h.pins_value().unwrap();
+    for record in store["pins"].as_array_mut().unwrap() {
+        record.as_object_mut().unwrap().remove("roles");
+        record["revision"] = serde_json::json!(7);
+    }
+    store.as_object_mut().unwrap().remove("scopes");
+    store.as_object_mut().unwrap().remove("sequence");
+    seed_store(&h, &serde_json::to_vec(&store).unwrap());
+
+    // A successful launch/setup of X is a Boot claim only: Output stays unknown,
+    // so no build/import may pre-resolve it.
+    assert!(!h.launch(&x_tag).status.success());
+    let claimed = read_json(&h.pins());
+    assert_eq!(claimed["pins"][0]["roles"], "boot");
+    assert_eq!(claimed["pins"][0]["revision"], 7);
+    assert_eq!(claimed["scopes"][0]["resolved"], "boot");
+    assert_eq!(
+        h.pins_value().unwrap()["pins"].as_array().unwrap().len(),
+        1,
+        "no Output claim ran"
+    );
+    // A different Boot selection displaces it; ?Output keeps X.
+    let y = h.image(&ArchiveSpec {
+        marker: "ac20-y".into(),
+        ..Default::default()
+    });
+    server.image("images", "y", &y);
+    let y_tag = format!("{}/images:y", server.host);
+    assert!(!h.launch(&y_tag).status.success());
+    let record = h.record_in(&h.project, &x_tag).expect("?Output protects X");
+    assert!(record.get("roles").is_none());
+    assert_eq!(record["manifest_digest"], a_digest);
+    assert_eq!(record["revision"], 7);
+
+    let b = h.image(&ArchiveSpec {
+        marker: "ac20-b".into(),
+        ..Default::default()
+    });
+    server.image("images", "x", &b);
+    fs::remove_dir_all(h.cache()).unwrap();
+    let before = server.count();
+    let back = h.launch(&x_tag);
+    assert!(!back.status.success());
+    assert_eq!(sdk_image(&back), a_child);
+    let since = &server.requests()[before..];
+    assert!(
+        since
+            .iter()
+            .any(|(_, path)| path == &format!("/v2/images/manifests/{a_digest}")),
+        "the approved digest is requested: {since:?}"
+    );
+    assert!(
+        !since
+            .iter()
+            .any(|(_, path)| path == "/v2/images/manifests/x"),
+        "the moved tag is never requested: {since:?}"
+    );
+}
+
+/// AC18: killing the publication before and after the atomic rename leaves the
+/// old and the new authority respectively, and a killed process is never claimed
+/// to have produced an exit status.
+#[test]
+fn publication_kill_before_and_after_commit_has_expected_state() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let b = archive_at(&h, "kill-b.tar", "kill-b");
+    let a = archive_at(&h, "kill-a.tar", "kill-a");
+    let tag = "example.com/team/kill:dev";
+    // Old authority: an earlier publication of the other content under the same
+    // result reference.
+    let out = h.import(&b.path, tag);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let old = fs::read(h.pins()).unwrap();
+    assert_eq!(h.pin_for(tag).unwrap().0, b.manifest_digest);
+
+    let import = |gate: &PinGate| {
+        PinPeer::spawn(
+            h.command(),
+            gate,
+            &[
+                "image",
+                "import",
+                "--input",
+                a.path.to_str().unwrap(),
+                "--tag",
+                tag,
+            ],
+        )
+    };
+    // Before the rename: the child is blocked at the save, so the old authority
+    // is what survives its death.
+    let mut gate = PinGate::new(h.root.path());
+    let peer = import(&gate);
+    gate.expect(PinStage::Published).reply(Reply::Continue);
+    gate.expect(PinStage::CandidateReady).reply(Reply::Continue);
+    gate.expect(PinStage::BeforePinLock).reply(Reply::Continue);
+    gate.expect(PinStage::PinLocked).reply(Reply::Continue);
+    let blocked = gate.expect(PinStage::BeforePinSave);
+    let killed = peer.kill_and_collect();
+    drop(blocked);
+    assert!(
+        killed.status.code().is_none(),
+        "a killed process has no exit status: {killed:?}"
+    );
+    assert_eq!(
+        fs::read(h.pins()).unwrap(),
+        old,
+        "before the rename the old authority stays"
+    );
+
+    // The same operation run to completion defines the new authority.
+    let out = h.import(&a.path, tag);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let new = fs::read(h.pins()).unwrap();
+    assert_eq!(h.pin_for(tag).unwrap().0, a.manifest_digest);
+    assert_ne!(new, old);
+
+    // After the rename: the child is blocked at the commit checkpoint, i.e. the
+    // rename already happened, and its death leaves exactly those bytes.
+    seed_store(&h, &old);
+    let mut gate = PinGate::new(h.root.path());
+    let peer = import(&gate);
+    gate.expect(PinStage::Published).reply(Reply::Continue);
+    gate.expect(PinStage::CandidateReady).reply(Reply::Continue);
+    gate.expect(PinStage::BeforePinLock).reply(Reply::Continue);
+    gate.expect(PinStage::PinLocked).reply(Reply::Continue);
+    gate.expect(PinStage::BeforePinSave).reply(Reply::Continue);
+    let blocked = gate.expect(PinStage::PinCommitted);
+    let killed = peer.kill_and_collect();
+    drop(blocked);
+    assert!(
+        killed.status.code().is_none(),
+        "a killed process has no exit status: {killed:?}"
+    );
+    assert_eq!(
+        fs::read(h.pins()).unwrap(),
+        new,
+        "after the rename the committed authority stays"
+    );
+}
+
+/// AC16: a launch build approves nothing, so it leaves an existing approval — and
+/// a damaged store — byte-for-byte unchanged, and it reaches the SDK either way.
+#[test]
+fn a_launch_build_leaves_existing_or_corrupt_authority_bytes_unchanged() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec {
+        marker: "ac16-a".into(),
+        ..Default::default()
+    });
+    server.image("images", "ac16", &a);
+    let tag = format!("{}/images:ac16", server.host);
+    assert!(!h.launch(&tag).status.success());
+    let authority = fs::read(h.pins()).unwrap();
+    assert_eq!(h.record_in(&h.project, &tag).unwrap()["roles"], "boot");
+    fs::write(h.project.join("Dockerfile"), "FROM scratch\n").unwrap();
+    let archive = archive_at(&h, "ac16-build.tar", "ac16-build");
+
+    let build = || {
+        let mut command = h.command();
+        command.env("FAKE_DOCKER_ARCHIVE", &archive.path).args([
+            "--dockerfile",
+            "Dockerfile",
+            "--",
+            "true",
+        ]);
+        bounded(command)
+    };
+    let built = build();
+    assert!(
+        stderr(&built).contains("[debug] sandbox config JSON:"),
+        "the launch build reached the SDK: {}",
+        stderr(&built)
+    );
+    assert!(
+        !stderr(&built).contains("image pin authority"),
+        "a launch build never reads the approval store: {}",
+        stderr(&built)
+    );
+    assert_eq!(
+        fs::read(h.pins()).unwrap(),
+        authority,
+        "existing roles, resolution and sequence are untouched"
+    );
+
+    // A damaged store must not be read, repaired or rewritten either.
+    fs::write(h.pins(), b"not-json\n").unwrap();
+    let built = build();
+    assert!(
+        stderr(&built).contains("[debug] sandbox config JSON:"),
+        "a damaged store does not stop a launch build: {}",
+        stderr(&built)
+    );
+    assert_eq!(
+        fs::read(h.pins()).unwrap(),
+        b"not-json\n",
+        "a launch build neither repairs nor rewrites a damaged store"
+    );
+}
+
+/// AC11a through the compiled CLI: at the 4096-pin bound, a publication that
+/// cannot retire the Boot holder is refused as full — never damage — and the
+/// old authority stays byte-identical. The store-level row proves the claim
+/// plan; this one proves the command boundary a user actually sees.
+#[test]
+fn publication_at_the_pin_count_bound_fails_closed() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let x = archive_at(&h, "bound-x.tar", "bound-x");
+    let y = archive_at(&h, "bound-y.tar", "bound-y");
+    let x_tag = "example.com/team/bound:x";
+    let y_tag = "example.com/team/bound:y";
+    let project = project_id(&h.project);
+    let platform = serde_json::json!({
+        "os": "linux",
+        "architecture": image_archive::host_arch(),
+        "variant": null,
+    });
+    let mut pins = vec![serde_json::json!({
+        "project": project,
+        "reference": x_tag,
+        "platform": platform,
+        "manifest_digest": x.manifest_digest,
+        "revision": 1,
+        "roles": "boot-and-output",
+    })];
+    for index in 0..4095u32 {
+        pins.push(serde_json::json!({
+            "project": format!("{index:064x}"),
+            "reference": format!("example.com/foreign{index}:tag"),
+            "platform": platform,
+            "manifest_digest": format!("sha256:{}", "b".repeat(64)),
+            "revision": 1,
+        }));
+    }
+    let store = serde_json::json!({
+        "version": 2,
+        "pins": pins,
+        "pending_default": null,
+        "scopes": [{"project": project, "platform": platform, "resolved": "boot-and-output"}],
+        "sequence": 1,
+    });
+    seed_store(&h, &serde_json::to_vec(&store).unwrap());
+    assert_eq!(
+        h.pins_value().unwrap()["pins"].as_array().unwrap().len(),
+        4096
+    );
+    let before = fs::read(h.pins()).unwrap();
+
+    let out = h.import(&y.path, y_tag);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("maximum number of approvals"),
+        "a full store is reported as full: {}",
+        stderr(&out)
+    );
+    assert!(!stderr(&out).contains("damaged"), "{}", stderr(&out));
+    assert_eq!(
+        fs::read(h.pins()).unwrap(),
+        before,
+        "a refused publication commits not one byte"
+    );
+    assert!(h.pin_for(y_tag).is_none(), "no Y record was inserted");
+    assert_eq!(
+        h.pins_value().unwrap()["pins"].as_array().unwrap().len(),
+        4096
+    );
 }

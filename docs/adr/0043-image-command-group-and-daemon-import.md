@@ -2,6 +2,14 @@
 
 ## Status
 
+[ADR-0068](0068-active-image-set.md) (0.7.51, #542) adds the active image set:
+output membership is atomic with the named-result approval, archive aliases still
+confer no authority (an alias can, however, supply a *retired* reference's next
+pin cache-first), approval revisions are global write-sequence tokens rather
+than per-key +1, and a committed publication whose checkpoint or notice cannot be
+reported finishes successfully with a warning instead of "approval was not
+updated".
+
 Accepted. Breaking in **0.5.0**. Amends ADR-0035's explicit build/import
 decision (#260); implements #359. Amended in **0.6.9** by #385 (defaulted
 import tag, selection-aware import completion). Amended in **0.7.0** by #389:
@@ -65,7 +73,9 @@ Docker daemon / archive → image import ─────────────
   `--yes`: the command that supplied the bytes is the consent. The change is
   rendered on stderr before it is committed, and an unchanged approval is
   neither rewritten nor rendered. Archive-carried aliases are published to the
-  cache but never approved, and neither verb adopts or moves the retained
+  cache but never approved — and never replace an approval, though they do not
+  keep one alive either: a retired reference's next pin can acquire from the
+  alias cache-first (ADR-0068) — and neither verb adopts or moves the retained
   default (the store's own journal recovery of an interrupted run — which any
   explicit image write performs — is the one write that may, and it adopts
   nothing). The approval runs after the

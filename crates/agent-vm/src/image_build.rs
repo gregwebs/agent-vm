@@ -150,14 +150,14 @@ pub(crate) async fn run(args: Args) -> Result<i32> {
     // runs only now, after `publish`'s exclusive barrier is released.
     #[allow(clippy::disallowed_methods)]
     // `image build --tag` names the result it approves (#391).
-    crate::image_pin::approve_published(&published, &scope).await?;
+    let report = crate::image_pin::approve_published(&published, &scope).await?;
+    // Committed. The completion notice and its own I/O are reporting, not part
+    // of the commit: the command exits 0 either way.
     let shown = args.tag.shell_arg();
     let shell_note = crate::shell::note_parenthetical(&[&shown]);
-    let _ = writeln!(
-        std::io::stdout(),
-        "Imported build result as {shown}; launch it with `--image {shown}`{shell_note}"
-    );
-    Ok(0)
+    let notice =
+        format!("Imported build result as {shown}; launch it with `--image {shown}`{shell_note}");
+    Ok(crate::image_pin::finish_publication(report, Some(notice)))
 }
 
 /// Run `docker buildx build …` with `archive` as stdout and stderr inherited.

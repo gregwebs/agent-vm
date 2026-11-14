@@ -31,6 +31,11 @@ use std::time::{Duration, Instant};
 
 use rustix::fs::{FileType, Mode, OFlags};
 
+use super::active::{
+    Change, ClaimFacts, ClaimPlan, HeldRoles, ResolvedRoles, Role, RoleClaim, RoleMask, ScopeKey,
+    after_role, checked_next_sequence, claim_knowledge, knowledge, may_retire,
+};
+use super::completion::{CommitReport, Completion};
 use super::project_default::{DefaultAdoption, ProjectDefault};
 use super::*;
 use crate::boot_image::default_selection::{self as default, SELECTION_FILE};
@@ -148,6 +153,32 @@ struct PinFile {
     /// so the writer omits it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     defaults: Vec<ProjectDefaultRecord>,
+    /// Which single-holder slots each project/platform scope has resolved
+    /// (ADR-0068). A missing record means **both roles unknown**, not absent, so
+    /// omission is safe for every store written before 0.7.51.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    scopes: Vec<ScopeRecord>,
+    /// The HOME-wide write sequence: the high-water mark of allocated approval
+    /// revisions. It survives deletion of the records it was allocated for, so a
+    /// reinsertion cannot reuse a retired approval's token. Optional in the same
+    /// lazy way: absent until a real save after 0.7.51.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "active::present_sequence"
+    )]
+    sequence: Option<u64>,
+}
+
+/// One project on one measured platform, and the roles a successful claim has
+/// resolved there. Its `resolved` mask is required and nonempty: a record that
+/// resolves nothing should have been omitted instead.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScopeRecord {
+    project: String,
+    platform: HostLinuxPlatform,
+    resolved: RoleMask,
 }
 /// One project's established default. Strict like every other record: the
 /// project is a scope this module could have produced, and the image is a
@@ -166,6 +197,15 @@ struct PinRecord {
     platform: HostLinuxPlatform,
     manifest_digest: String,
     revision: u64,
+    /// The single-holder slots this approval currently fills. Omitted means it
+    /// holds none, which is **not** the same as "both roles known absent": only
+    /// the scope's resolution can say that.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "active::present_mask"
+    )]
+    roles: Option<RoleMask>,
 }
 /// Lenient on purpose: it reads only `version`, so a legacy file is recognized
 /// even though version 2's strict schema rejects it.
@@ -213,7 +253,15 @@ impl PinRecord {
             platform: pin.key.platform.clone(),
             manifest_digest: pin.digest.as_str().to_owned(),
             revision: pin.revision.0,
+            roles: None,
         }
+    }
+    /// The held roles, if any. A record can only carry a nonempty mask.
+    fn held(&self) -> Option<HeldRoles> {
+        self.roles.and_then(HeldRoles::new)
+    }
+    fn set_roles(&mut self, roles: Option<HeldRoles>) {
+        self.roles = roles.map(HeldRoles::mask);
     }
 }
 
@@ -240,6 +288,65 @@ impl ProjectDefaultRecord {
     }
 }
 
+/// A comparable scope identity: project plus measured platform. The pin records,
+/// the scope records and the runtime `ScopeKey` all build this one shape, so the
+/// three readers of a scope cannot disagree about what it is.
+type ScopeIdentity = (String, String, String, Option<String>);
+
+fn scope_identity(project: &str, platform: &HostLinuxPlatform) -> ScopeIdentity {
+    (
+        project.to_owned(),
+        platform.os.clone(),
+        platform.architecture.clone(),
+        platform.variant.clone(),
+    )
+}
+
+impl ScopeKey {
+    fn identity(&self) -> ScopeIdentity {
+        scope_identity(self.project().as_str(), self.platform())
+    }
+}
+
+/// How many records hold each role in one scope. Addressed by `Role`, so no
+/// reader depends on a mask's bit order or on an array's literal order.
+#[derive(Clone, Copy, Default)]
+struct HolderCounts {
+    boot: usize,
+    output: usize,
+}
+
+impl HolderCounts {
+    fn of(&self, role: Role) -> usize {
+        match role {
+            Role::Boot => self.boot,
+            Role::Output => self.output,
+        }
+    }
+    fn of_mut(&mut self, role: Role) -> &mut usize {
+        match role {
+            Role::Boot => &mut self.boot,
+            Role::Output => &mut self.output,
+        }
+    }
+}
+
+impl ScopeRecord {
+    fn validated(&self) -> Result<()> {
+        ProjectId::parse(&self.project).map_err(|()| corrupt())?;
+        if !self.platform.valid() || !mask_is_acceptable(!self.resolved.is_empty()) {
+            return Err(corrupt());
+        }
+        Ok(())
+    }
+    fn matches(&self, scope: &ScopeKey) -> bool {
+        self.project == scope.project().as_str() && self.platform == *scope.platform()
+    }
+    fn identity(&self) -> ScopeIdentity {
+        scope_identity(&self.project, &self.platform)
+    }
+}
+
 impl PinFile {
     fn empty() -> Self {
         Self {
@@ -247,6 +354,8 @@ impl PinFile {
             pins: Vec::new(),
             pending_default: None,
             defaults: Vec::new(),
+            scopes: Vec::new(),
+            sequence: None,
         }
     }
     fn decode(bytes: &[u8]) -> Result<Self> {
@@ -269,32 +378,39 @@ impl PinFile {
         Ok(file)
     }
     fn validate(&self) -> Result<()> {
-        if !pin_count_within_limit(self.pins.len()) || !pin_count_within_limit(self.defaults.len())
+        if !pin_count_within_limit(self.pins.len())
+            || !pin_count_within_limit(self.defaults.len())
+            || !pin_count_within_limit(self.scopes.len())
         {
             return Err(corrupt());
         }
         let mut keys = BTreeSet::new();
         let mut projects = BTreeSet::new();
-        // One uniqueness fact covers both record kinds: a pin is unique by its
-        // whole key, a project default by its project.
+        let mut scopes = BTreeSet::new();
+        // One uniqueness fact covers all three record kinds: a pin is unique by
+        // its whole key, a project default by its project, a scope by its
+        // project and platform.
         let mut unique = true;
+        let mut pins = Vec::with_capacity(self.pins.len());
         for record in &self.pins {
-            record.validated()?;
+            pins.push(record.validated()?);
             unique &= keys.insert((
-                record.project.clone(),
+                scope_identity(&record.project, &record.platform),
                 record.reference.clone(),
-                record.platform.os.clone(),
-                record.platform.architecture.clone(),
-                record.platform.variant.clone(),
             ));
         }
         for record in &self.defaults {
             record.validated()?;
             unique &= projects.insert(record.project.clone());
         }
+        for record in &self.scopes {
+            record.validated()?;
+            unique &= scopes.insert(record.identity());
+        }
         if !schema_is_acceptable(self.version, unique) {
             return Err(corrupt());
         }
+        self.validate_roles(&pins)?;
         if let Some(pending) = &self.pending_default {
             if let Some(previous) = &pending.previous {
                 default::decode_snapshot(previous.as_bytes()).map_err(|_| corrupt())?;
@@ -345,6 +461,209 @@ impl PinFile {
             .retain(|record| record.project != default.project().as_str());
         self.defaults.push(ProjectDefaultRecord::of(&default));
     }
+
+    /// The relational half of the schema: roles and scopes are validated on
+    /// every read, never only by the writers that produced them.
+    ///
+    /// `pins` are the already-validated records, in file order. One pass builds
+    /// the join both ways — a held role needs its scope resolved, and a resolved
+    /// role needs exactly one holder — so a 4096-record read stays linear-ish.
+    fn validate_roles(&self, pins: &[ApprovedPin]) -> Result<()> {
+        let any_roles = self.pins.iter().any(|record| record.roles.is_some());
+        // Any role or scope knowledge needs the sequence that allocated the
+        // revisions beside it; a file with neither is an untouched old file.
+        if (any_roles || !self.scopes.is_empty()) && self.sequence.is_none() {
+            return Err(corrupt());
+        }
+        if let Some(sequence) = self.sequence {
+            // The high-water mark must cover every live token. Old files with
+            // duplicate per-key revisions stay valid: the check is a maximum.
+            let live_max = self
+                .pins
+                .iter()
+                .map(|record| record.revision)
+                .max()
+                .unwrap_or(0);
+            if sequence == 0 || sequence < live_max {
+                return Err(corrupt());
+            }
+        }
+        let resolved: std::collections::BTreeMap<_, _> = self
+            .scopes
+            .iter()
+            .map(|record| (record.identity(), record.resolved))
+            .collect();
+        let mut holders: std::collections::BTreeMap<ScopeIdentity, HolderCounts> =
+            std::collections::BTreeMap::new();
+        for (record, pin) in self.pins.iter().zip(pins) {
+            let Some(held) = record.held() else {
+                continue;
+            };
+            let key = pin.key.scope().identity();
+            let Some(bits) = resolved.get(&key) else {
+                return Err(corrupt());
+            };
+            if !bits.covers(held.mask()) {
+                return Err(corrupt());
+            }
+            let counts = holders.entry(key).or_default();
+            for role in [Role::Boot, Role::Output] {
+                if held.contains(role) {
+                    *counts.of_mut(role) += 1;
+                }
+            }
+        }
+        for record in &self.scopes {
+            let counts = holders.get(&record.identity()).copied().unwrap_or_default();
+            for role in [Role::Boot, Role::Output] {
+                if record.resolved.contains(role) && counts.of(role) != 1 {
+                    return Err(corrupt());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn resolved_in(&self, scope: &ScopeKey) -> Option<ResolvedRoles> {
+        self.scopes
+            .iter()
+            .find(|record| record.matches(scope))
+            .and_then(|record| ResolvedRoles::new(record.resolved))
+    }
+
+    fn set_resolved(&mut self, scope: &ScopeKey, resolved: ResolvedRoles) {
+        if let Some(record) = self.scopes.iter_mut().find(|record| record.matches(scope)) {
+            record.resolved = resolved.mask();
+            return;
+        }
+        self.scopes.push(ScopeRecord {
+            project: scope.project().as_str().to_owned(),
+            platform: scope.platform().clone(),
+            resolved: resolved.mask(),
+        });
+    }
+
+    /// The plan a successful claim of `role` on `key` will apply. Built from one
+    /// validated snapshot; the target may not be inserted yet.
+    fn plan_claim(&self, key: &PinKey, role: Role) -> Result<ClaimPlan> {
+        let scope = key.scope();
+        let prior = self
+            .resolved_in(&scope)
+            .map(ResolvedRoles::mask)
+            .unwrap_or(RoleMask::EMPTY);
+        let resolved = prior.with(role);
+        Ok(ClaimPlan::of(scope, key.clone(), role, prior, resolved))
+    }
+
+    /// Apply a claim: resolve its slot for the whole scope, make the target its
+    /// sole holder, and retire exactly the records whose **both** roles are now
+    /// known absent. The other role's resolution and holder are preserved, as is
+    /// every record in a foreign scope or platform.
+    fn apply_claim(&mut self, plan: &ClaimPlan) -> Result<Change> {
+        let mut changed = false;
+        if self.resolved_in(plan.scope()).map(ResolvedRoles::mask) != Some(plan.resolved()) {
+            let resolved = ResolvedRoles::new(plan.resolved()).ok_or_else(corrupt)?;
+            self.set_resolved(plan.scope(), resolved);
+            changed = true;
+        }
+        let mut kept = Vec::with_capacity(self.pins.len());
+        for mut record in std::mem::take(&mut self.pins) {
+            let pin = record.validated()?;
+            if pin.key.scope() != *plan.scope() {
+                kept.push(record);
+                continue;
+            }
+            let held = record.held();
+            let target = &pin.key == plan.target();
+            // The proved kernel decides both questions: what each slot's
+            // knowledge becomes, and whether that licenses retirement. The
+            // trusted adapter only maps masks to knowledge and back.
+            let prior = knowledge(plan.prior(), held);
+            let after = claim_knowledge(ClaimFacts {
+                boot: prior.boot,
+                output: prior.output,
+                claimed: plan.role(),
+                target,
+            });
+            let next = after_role(after, held, plan.role());
+            if next != held {
+                record.set_roles(next);
+                changed = true;
+            }
+            if may_retire(after) {
+                changed = true;
+                continue;
+            }
+            kept.push(record);
+        }
+        self.pins = kept;
+        Ok(if changed {
+            Change::Changed
+        } else {
+            Change::Unchanged
+        })
+    }
+
+    /// Replace an approval's content fields, preserving its held roles and its
+    /// position. A new record starts holding nothing: membership is decided by
+    /// the claim this transaction applies, never by insertion.
+    fn upsert_approval(&mut self, pin: &ApprovedPin) -> Result<Change> {
+        for record in &mut self.pins {
+            if record.validated()?.key != pin.key {
+                continue;
+            }
+            if record.manifest_digest == pin.digest.as_str() && record.revision == pin.revision.0 {
+                return Ok(Change::Unchanged);
+            }
+            record.manifest_digest = pin.digest.as_str().to_owned();
+            record.revision = pin.revision.0;
+            return Ok(Change::Changed);
+        }
+        self.pins.push(PinRecord::of(pin));
+        Ok(Change::Changed)
+    }
+
+    /// The read-only effective high-water mark: the persisted sequence, else the
+    /// highest live legacy revision (0 when there are none).
+    fn effective_sequence(&self) -> u64 {
+        self.sequence.unwrap_or_else(|| {
+            self.pins
+                .iter()
+                .map(|record| record.revision)
+                .max()
+                .unwrap_or(0)
+        })
+    }
+
+    /// Reserve the next global allocation. Tentative until a successful rename:
+    /// a no-op or failed save persists nothing.
+    fn reserve_write(&self) -> Result<u64> {
+        let reservation = checked_next_sequence(self.effective_sequence());
+        if !reservation.reserved {
+            return Err(sequence_exhausted());
+        }
+        Ok(reservation.next)
+    }
+
+    /// Seal this proposed state with its write sequence and encode its final
+    /// bytes: counts, relational facts and the 4 MiB budget are all checked
+    /// here, after justified retirement, before any write.
+    fn seal_write(&mut self, old: &PinFile, reserved: Option<u64>) -> Result<Vec<u8>> {
+        let next = match reserved {
+            Some(next) => {
+                if next != old.reserve_write()? {
+                    return Err(anyhow!(
+                        "internal error: the reserved pin write sequence does not match the \
+                         state being sealed"
+                    ));
+                }
+                next
+            }
+            None => old.reserve_write()?,
+        };
+        self.sequence = Some(next);
+        self.encode()
+    }
 }
 
 /// Report that a result reference is published and the exclusive publication
@@ -381,6 +700,11 @@ fn full() -> anyhow::Error {
 fn failure() -> anyhow::Error {
     anyhow!(
         "image pin authority at $HOME/.config/agent-vm/image-pins.json could not be accessed or saved"
+    )
+}
+fn sequence_exhausted() -> anyhow::Error {
+    anyhow!(
+        "image pin write sequence is exhausted; this proposed pin-store update was not committed"
     )
 }
 fn recovery_required() -> anyhow::Error {
@@ -504,6 +828,34 @@ impl Store {
     pub(super) fn lookup(&self, key: &PinKey) -> Result<Option<ApprovedPin>> {
         self.observe_slot(HostRead::Never)?.0.lookup(key)
     }
+    /// Whether the whole work of a warm Boot claim — resolution, holder move,
+    /// justified cleanup and default establishment — is already done. A complete
+    /// no-op must not take the exclusive lock, recover a journal or allocate.
+    fn claim_is_noop(
+        &self,
+        file: &PinFile,
+        consumed: &ApprovedPin,
+        action: &DefaultAction,
+    ) -> Result<bool> {
+        if file.lookup(&consumed.key)?.as_ref() != Some(consumed) {
+            return Ok(false);
+        }
+        let plan = file.plan_claim(&consumed.key, Role::Boot)?;
+        let mut trial = file.clone();
+        if trial.apply_claim(&plan)? != Change::Unchanged {
+            return Ok(false);
+        }
+        let default_done = match action.retained_reference() {
+            None => true,
+            Some(_) => {
+                trial.project_default(&consumed.key.project)?.is_some()
+                    && (!action.initializes_host()
+                        || default::snapshot_at(&self.directory)?.is_some())
+            }
+        };
+        Ok(default_done)
+    }
+
     /// The default slot as one project's selection reads it.
     ///
     /// The project's own default wins, and only then is the host record read —
@@ -611,17 +963,25 @@ impl Store {
         ))
     }
 
+    /// One ordinary approval transaction: insert, replace or confirm the
+    /// candidate, then apply the caller's role claim and any eligible default
+    /// work in the **same** atomic save.
+    ///
+    /// Returns a typed conflict (a concurrent writer won) apart from a genuine
+    /// failure: only a first-pin preparation may re-read a winner after a
+    /// conflict, and it may never do so for an arbitrary I/O, full or
+    /// sequence-exhausted error.
     pub(super) fn commit(
         &self,
         candidate: &ValidatedCandidate,
         approval: &Approval,
         action: DefaultAction,
-    ) -> Result<Committed> {
+        claim: RoleClaim,
+    ) -> Result<CommitOutcome> {
         if let Some(reference) = action.retained_reference() {
             self.adoption_binds(&candidate.key, reference)?;
         }
-        let touch_host = action.initializes_host();
-        let (old, _locks) = self.begin(touch_host)?;
+        let (old, _locks) = self.begin(action.initializes_host())?;
         let current = old.lookup(&candidate.key)?;
         if approval.key != candidate.key || approval.candidate != candidate.digest {
             return Err(anyhow!("image approval does not bind this candidate"));
@@ -638,100 +998,127 @@ impl Store {
             consent: approval.is_replacement(),
         };
         let decision = commit_decision(facts);
+        // Built from the under-lock snapshot, before the target may be inserted.
+        let claim_plan = match claim {
+            RoleClaim::Keep => None,
+            RoleClaim::Claim(role) => Some(old.plan_claim(&candidate.key, role)?),
+        };
+        let mut new = old.clone();
+        let mut reserved = None;
         let pin = match decision {
             CommitDecision::AlreadyApproved => current.ok_or_else(failure)?,
-            CommitDecision::Insert => ApprovedPin {
-                key: candidate.key.clone(),
-                digest: candidate.digest.clone(),
-                revision: PinRevision(1),
-            },
-            CommitDecision::Replace => ApprovedPin {
-                key: candidate.key.clone(),
-                digest: candidate.digest.clone(),
-                revision: PinRevision(
-                    current
-                        .as_ref()
-                        .ok_or_else(failure)?
-                        .revision
-                        .0
-                        .checked_add(1)
-                        .ok_or_else(|| anyhow!("image pin revision is exhausted"))?,
-                ),
-            },
-            CommitDecision::Conflict => {
-                return Err(anyhow!(
-                    "image approval is stale; retry the explicit operation"
-                ));
+            CommitDecision::Insert | CommitDecision::Replace => {
+                let next = old.reserve_write()?;
+                let pin = ApprovedPin {
+                    key: candidate.key.clone(),
+                    digest: candidate.digest.clone(),
+                    revision: PinRevision(next),
+                };
+                new.upsert_approval(&pin)?;
+                reserved = Some(next);
+                pin
             }
+            CommitDecision::Conflict => return Ok(CommitOutcome::Conflict),
         };
-        let mut new = old.clone();
-        if decision != CommitDecision::AlreadyApproved {
-            // A record that cannot be re-validated is a hard error, not
-            // something to drop from the next write.
-            let mut kept = Vec::with_capacity(new.pins.len());
-            for record in &new.pins {
-                if record.validated()?.key != pin.key {
-                    kept.push(record.clone());
-                }
-            }
-            new.pins = kept;
-            new.pins.push(PinRecord::of(&pin));
-        }
+        let membership = match &claim_plan {
+            Some(plan) => new.apply_claim(plan)?,
+            None => Change::Unchanged,
+        };
         let project_default = Self::establish_in(&mut new, &old, &candidate.key.project, &action)?;
-        let final_bytes = new.encode()?; // every future byte checked before the first write
-        // Host first: "host seeded, project not yet established" is a state the
-        // next default-tier use completes (ADR-0067 narrows ADR-0047's
-        // failed-operation guarantee to allow exactly this).
-        self.seed_host_if_absent(&action)?;
-        if decision != CommitDecision::AlreadyApproved
-            || project_default != ProjectDefaultChange::Unchanged
-        {
+        let status = Status {
+            approval: if decision == CommitDecision::AlreadyApproved {
+                Change::Unchanged
+            } else {
+                Change::Changed
+            },
+            membership,
+            project_default,
+        };
+        let report = if status.needs_save() {
+            let final_bytes = new.seal_write(&old, reserved)?;
+            // Host first: "host seeded, project not yet established" is a state
+            // the next default-tier use completes (ADR-0067 narrows ADR-0047's
+            // failed-operation guarantee to allow exactly this).
+            self.seed_host_if_absent(&action)?;
             gate::checkpoint(gate::Stage::BeforePinSave)?;
             self.save(&final_bytes)?;
-        }
-        gate::checkpoint(gate::Stage::PinCommitted)?;
-        Ok(Committed {
-            pin,
-            project_default,
-        })
+            self.committed_report()
+        } else {
+            // A complete no-op may still have S2 host-only work, but allocates no
+            // sequence and rewrites no approval bytes.
+            self.seed_host_if_absent(&action)?;
+            CommitReport::Complete
+        };
+        Ok(CommitOutcome::Committed(Box::new(Completion {
+            value: Committed {
+                pin,
+                project_default,
+            },
+            report,
+        })))
     }
 
-    /// The write-once establishment that belongs with **every** successful
-    /// default-tier preparation, not only a first pin.
+    /// The post-rename checkpoint is a *report*, not part of the commit: the
+    /// rename already succeeded, so its failure must not become an error.
+    fn committed_report(&self) -> CommitReport {
+        match gate::checkpoint(gate::Stage::PinCommitted) {
+            Ok(()) => CommitReport::Complete,
+            Err(_) => CommitReport::CheckpointUnavailable,
+        }
+    }
+
+    /// Record that a **warm** preparation successfully acquired and validated
+    /// exactly `consumed`: claim Boot for it and do the eligible default work.
     ///
-    /// A default-tier selection whose key is already approved (an explicit
-    /// `image refresh` pins without establishing) still establishes the project,
-    /// while an established project is left byte-for-byte alone and takes no
-    /// exclusive lock.
-    pub(super) fn establish_default_if_absent(
+    /// The consumed approval is the whole predecessor: if a peer retired and
+    /// reinserted the same digest with a new global token, the tuple differs and
+    /// this is stale, never a silent acceptance of a different lifetime.
+    pub(super) fn claim_selected(
         &self,
-        key: &PinKey,
+        consumed: &ApprovedPin,
         action: &DefaultAction,
-    ) -> Result<ProjectDefaultChange> {
-        let Some(reference) = action.retained_reference() else {
-            return Ok(ProjectDefaultChange::Unchanged);
-        };
-        self.adoption_binds(key, reference)?;
-        // A warm launch of an established project must not create locks or
-        // recover an interrupted writer's journal.
-        let (file, _logical) = self.observe_slot(HostRead::Never)?;
-        let established = file.project_default(&key.project)?.is_some();
-        let host_present =
-            !action.initializes_host() || default::snapshot_at(&self.directory)?.is_some();
-        if established && host_present {
-            return Ok(ProjectDefaultChange::Unchanged);
+    ) -> Result<Completion<ProjectDefaultChange>> {
+        if let Some(reference) = action.retained_reference() {
+            self.adoption_binds(&consumed.key, reference)?;
+        }
+        // A complete no-op takes no exclusive lock, recovers no journal and
+        // allocates no sequence.
+        let (snapshot, _logical) = self.observe_slot(HostRead::Never)?;
+        if self.claim_is_noop(&snapshot, consumed, action)? {
+            return Ok(Completion {
+                value: ProjectDefaultChange::Unchanged,
+                report: CommitReport::Complete,
+            });
         }
         let (old, _locks) = self.begin(action.initializes_host())?;
+        if old.lookup(&consumed.key)?.as_ref() != Some(consumed) {
+            return Err(anyhow!(
+                "image approval is stale; retry the explicit operation"
+            ));
+        }
+        let plan = old.plan_claim(&consumed.key, Role::Boot)?;
         let mut new = old.clone();
-        let change = Self::establish_in(&mut new, &old, &key.project, action)?;
-        let final_bytes = new.encode()?;
-        self.seed_host_if_absent(action)?;
-        if change != ProjectDefaultChange::Unchanged {
+        let membership = new.apply_claim(&plan)?;
+        let change = Self::establish_in(&mut new, &old, &consumed.key.project, action)?;
+        let status = Status {
+            approval: Change::Unchanged,
+            membership,
+            project_default: change,
+        };
+        let report = if status.needs_save() {
+            let final_bytes = new.seal_write(&old, None)?;
+            self.seed_host_if_absent(action)?;
             gate::checkpoint(gate::Stage::BeforePinSave)?;
             self.save(&final_bytes)?;
-            gate::checkpoint(gate::Stage::PinCommitted)?;
-        }
-        Ok(change)
+            self.committed_report()
+        } else {
+            self.seed_host_if_absent(action)?;
+            CommitReport::Complete
+        };
+        Ok(Completion {
+            value: change,
+            report,
+        })
     }
 
     /// R7's transaction: one project's established default moves to the host
@@ -743,7 +1130,7 @@ impl Store {
         &self,
         candidate: &ValidatedCandidate,
         adoption: &DefaultAdoption,
-    ) -> Result<Committed> {
+    ) -> Result<Completion<Committed>> {
         adoption.binds(candidate)?;
         let (old, _locks) = self.begin(false)?;
         if old.project_default(adoption.expected().project())?.as_ref() != Some(adoption.expected())
@@ -766,30 +1153,39 @@ impl Store {
             mutable_source: candidate.key.reference.digest().is_none(),
             consent: false,
         });
+        let mut new = old.clone();
         let pin = match decision {
             CommitDecision::AlreadyApproved => current.ok_or_else(failure)?,
-            CommitDecision::Insert => ApprovedPin {
-                key: candidate.key.clone(),
-                digest: candidate.digest.clone(),
-                revision: PinRevision(1),
-            },
+            CommitDecision::Insert => {
+                let next = old.reserve_write()?;
+                let pin = ApprovedPin {
+                    key: candidate.key.clone(),
+                    digest: candidate.digest.clone(),
+                    revision: PinRevision(next),
+                };
+                // Adoption is not a successful launch: a new record holds no
+                // role, and its scope is untouched.
+                new.upsert_approval(&pin)?;
+                pin
+            }
             _ => return Err(immutable_integrity_failure()),
         };
-        let mut new = old.clone();
-        if decision == CommitDecision::Insert {
-            new.pins.push(PinRecord::of(&pin));
-        }
         new.set_project_default(ProjectDefault::new(
             adoption.expected().project(),
             adoption.proposed(),
         )?);
-        let bytes = new.encode()?;
+        // Adoption changes a bookmark; it advances the write sequence but keeps
+        // every existing approval token.
+        let bytes = new.seal_write(&old, None)?;
         gate::checkpoint(gate::Stage::BeforePinSave)?;
         self.save(&bytes)?;
-        gate::checkpoint(gate::Stage::PinCommitted)?;
-        Ok(Committed {
-            pin,
-            project_default: ProjectDefaultChange::Adopted,
+        let report = self.committed_report();
+        Ok(Completion {
+            value: Committed {
+                pin,
+                project_default: ProjectDefaultChange::Adopted,
+            },
+            report,
         })
     }
 
@@ -851,7 +1247,7 @@ impl Store {
 
     /// Insert this project's default iff the action establishes and the project
     /// has none; `SeedHostOnly` and `None` never establish. Shared by `commit`
-    /// and [`Self::establish_default_if_absent`] so the two cannot diverge.
+    /// and `claim_selected` so the two cannot diverge.
     fn establish_in(
         new: &mut PinFile,
         old: &PinFile,
@@ -924,15 +1320,20 @@ impl Store {
         if let Some(pending) = &file.pending_default {
             logical_default(file, default::snapshot_at(&self.directory)?)
                 .map_err(|_| recovery_required())?;
+            // Seal the cleared state (and its write sequence) **before** the
+            // physical host restoration: a sequence/bound failure must leave
+            // every byte alone rather than half-recover. Roles are not touched
+            // by recovery.
+            let mut recovered = file.clone();
+            recovered.pending_default = None;
+            let recovered_bytes = recovered.seal_write(file, None)?;
             if let Some(previous) = &pending.previous {
                 save(&self.directory.join(SELECTION_FILE), previous.as_bytes())
                     .map_err(|_| recovery_required())?;
             } else {
                 self.write_default(None).map_err(|_| recovery_required())?;
             }
-            let mut recovered = file.clone();
-            recovered.pending_default = None;
-            save(&self.record(), &recovered.encode()?).map_err(|_| recovery_required())?;
+            save(&self.record(), &recovered_bytes).map_err(|_| recovery_required())?;
             *file = recovered;
         }
         Ok(())
@@ -976,6 +1377,32 @@ struct Locks {
 pub(super) struct Committed {
     pub(super) pin: ApprovedPin,
     pub(super) project_default: ProjectDefaultChange,
+}
+
+/// Every dimension one pin transaction can change. `needs_save` is their
+/// disjunction, so a role-only or default-only write cannot be mistaken for a
+/// no-op and a complete no-op cannot be mistaken for work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Status {
+    approval: Change,
+    membership: Change,
+    project_default: ProjectDefaultChange,
+}
+
+impl Status {
+    fn needs_save(&self) -> bool {
+        self.approval == Change::Changed
+            || self.membership == Change::Changed
+            || self.project_default != ProjectDefaultChange::Unchanged
+    }
+}
+
+/// The two outcomes of an approval CAS: a committed transaction (with its
+/// post-commit report) or a concurrent writer's conflict.
+pub(super) enum CommitOutcome {
+    /// Boxed because a committed value is much larger than the bare conflict.
+    Committed(Box<Completion<Committed>>),
+    Conflict,
 }
 
 fn logical_default(file: &PinFile, physical: Option<Vec<u8>>) -> Result<Option<Vec<u8>>> {
@@ -1051,15 +1478,58 @@ mod tests {
 
     /// The rows here assert the committed pin; the reported change set is
     /// covered by the CLI rows that print it.
+    /// Existing rows assert approval content and byte isolation, not membership:
+    /// `Keep` is their explicit claim, and every real save still advances the
+    /// global sequence. Rows about roles/each claim build one explicitly.
     impl Store {
+        fn commit_with(
+            &self,
+            candidate: &ValidatedCandidate,
+            approval: &Approval,
+            action: DefaultAction,
+        ) -> Result<Committed> {
+            self.commit_outcome(candidate, approval, action, RoleClaim::Keep)
+        }
+        fn commit_outcome(
+            &self,
+            candidate: &ValidatedCandidate,
+            approval: &Approval,
+            action: DefaultAction,
+            claim: RoleClaim,
+        ) -> Result<Committed> {
+            match self.commit(candidate, approval, action, claim)? {
+                CommitOutcome::Committed(completion) => Ok(completion.value),
+                CommitOutcome::Conflict => Err(anyhow!(
+                    "image approval is stale; retry the explicit operation"
+                )),
+            }
+        }
         fn commit_pin(
             &self,
             candidate: &ValidatedCandidate,
             approval: &Approval,
             action: DefaultAction,
         ) -> Result<ApprovedPin> {
-            self.commit(candidate, approval, action)
+            self.commit_with(candidate, approval, action)
                 .map(|committed| committed.pin)
+        }
+        fn claim_pin(
+            &self,
+            candidate: &ValidatedCandidate,
+            approval: &Approval,
+            action: DefaultAction,
+            role: Role,
+        ) -> Result<ApprovedPin> {
+            self.commit_outcome(candidate, approval, action, RoleClaim::Claim(role))
+                .map(|committed| committed.pin)
+        }
+        fn claim_selected_change(
+            &self,
+            consumed: &ApprovedPin,
+            action: &DefaultAction,
+        ) -> Result<ProjectDefaultChange> {
+            self.claim_selected(consumed, action)
+                .map(|completion| completion.value)
         }
     }
 
@@ -1110,6 +1580,8 @@ mod tests {
             })],
             pending_default: None,
             defaults: Vec::new(),
+            scopes: Vec::new(),
+            sequence: None,
         }
     }
     fn install(store: &Store, file: &PinFile) {
@@ -1512,15 +1984,30 @@ mod tests {
                 .commit_pin(&b, &approve_b, DefaultAction::None)
                 .is_err()
         );
+        // Allocation exhaustion is its own outcome: a real save at the
+        // sequence's maximum fails as exhausted, never as damage or full.
         let mut exhausted = store.read().unwrap().unwrap();
-        exhausted.pins[0].revision = u64::MAX;
+        exhausted.sequence = Some(u64::MAX);
         store.save(&exhausted.encode().unwrap()).unwrap();
         let old = store.lookup(&a.key).unwrap().unwrap();
+        let before = std::fs::read(store.record()).unwrap();
+        let error = store
+            .commit_pin(&b, &replacement(&b, old), DefaultAction::None)
+            .unwrap_err();
         assert!(
-            store
-                .commit_pin(&b, &replacement(&b, old), DefaultAction::None)
-                .is_err()
+            error.to_string().contains("sequence is exhausted"),
+            "{error}"
         );
+        assert_eq!(std::fs::read(store.record()).unwrap(), before);
+        // A true no-op still succeeds at the maximum: it allocates nothing.
+        let a_pin = store.lookup(&a.key).unwrap().unwrap();
+        assert_eq!(
+            store
+                .commit_pin(&a, &Approval::initial(&a), DefaultAction::None)
+                .unwrap(),
+            a_pin
+        );
+        assert_eq!(std::fs::read(store.record()).unwrap(), before);
         assert!(store.read().unwrap().unwrap().pending_default.is_none());
         assert!(!store.directory.join(SELECTION_FILE).exists());
     }
@@ -1617,7 +2104,7 @@ mod tests {
         // and nothing about the project's record changes.
         let (selected_a, reference_a) = selected('a');
         store
-            .commit(
+            .commit_with(
                 &selected_a,
                 &Approval::initial(&selected_a),
                 establish(&reference_a, HostRetention::Keep),
@@ -1639,7 +2126,7 @@ mod tests {
         let other_project = ProjectId::for_tests('b');
         let (index, reference_index) = selected_in(&other_project, 'd');
         store
-            .commit(
+            .commit_with(
                 &index,
                 &Approval::initial(&index),
                 establish(&reference_index, HostRetention::Keep),
@@ -1659,7 +2146,7 @@ mod tests {
         let mut mirrored = candidate_in(&mirrored_project, 'e');
         mirrored.key.reference = CanonicalOciReference::parse(elsewhere.as_str()).unwrap();
         store
-            .commit(
+            .commit_with(
                 &mirrored,
                 &Approval::initial(&mirrored),
                 establish(&elsewhere, HostRetention::Keep),
@@ -1881,7 +2368,7 @@ mod tests {
             let (_dir, store) = paths();
             let (c, reference) = selected('a');
             let committed = store
-                .commit(&c, &Approval::initial(&c), establish(&reference, host))
+                .commit_with(&c, &Approval::initial(&c), establish(&reference, host))
                 .unwrap();
             assert_eq!(committed.project_default, ProjectDefaultChange::Established);
             let file = store.read().unwrap().unwrap();
@@ -1904,7 +2391,7 @@ mod tests {
         let (_dir, store) = paths();
         let (c, reference) = selected('a');
         store
-            .commit(
+            .commit_with(
                 &c,
                 &Approval::initial(&c),
                 establish(&reference, HostRetention::InitializeIfAbsent),
@@ -1917,7 +2404,7 @@ mod tests {
         let (d, reference_d) = selected_in(&other, 'f');
         let host_bytes = host_default(&store).unwrap();
         store
-            .commit(
+            .commit_with(
                 &d,
                 &Approval::initial(&d),
                 establish(&reference_d, HostRetention::Keep),
@@ -1933,7 +2420,7 @@ mod tests {
         let (_dir, store) = paths();
         let (a, reference_a) = selected('a');
         store
-            .commit(
+            .commit_with(
                 &a,
                 &Approval::initial(&a),
                 establish(&reference_a, HostRetention::Keep),
@@ -1941,7 +2428,7 @@ mod tests {
             .unwrap();
         let (b, reference_b) = selected('b');
         let committed = store
-            .commit(
+            .commit_with(
                 &b,
                 &Approval::initial(&b),
                 establish(&reference_b, HostRetention::Keep),
@@ -1956,7 +2443,7 @@ mod tests {
         let other = ProjectId::for_tests('b');
         let (d, reference_d) = selected_in(&other, 'f');
         store
-            .commit(
+            .commit_with(
                 &d,
                 &Approval::initial(&d),
                 establish(&reference_d, HostRetention::Keep),
@@ -1982,18 +2469,28 @@ mod tests {
         let (_dir, store) = paths();
         let (c, reference) = selected('a');
         store
-            .commit(
+            .commit_with(
                 &c,
                 &Approval::initial(&c),
                 establish(&reference, HostRetention::Keep),
             )
             .unwrap();
         let record = store.record();
-        let pins = std::fs::read(&record).unwrap();
-        let bars = std::fs::read(store.lock_path()).unwrap();
+        let pin = store.lookup(&c.key).unwrap().unwrap();
+        // The first warm claim records Boot (and resolves the scope); only after
+        // that whole claim/default work is done is there a no-op to observe.
         assert_eq!(
             store
-                .establish_default_if_absent(&c.key, &establish(&reference, HostRetention::Keep))
+                .claim_selected_change(&pin, &establish(&reference, HostRetention::Keep))
+                .unwrap(),
+            ProjectDefaultChange::Unchanged
+        );
+        let pins = std::fs::read(&record).unwrap();
+        let bars = std::fs::read(store.lock_path()).unwrap();
+        let pin = store.lookup(&c.key).unwrap().unwrap();
+        assert_eq!(
+            store
+                .claim_selected_change(&pin, &establish(&reference, HostRetention::Keep))
                 .unwrap(),
             ProjectDefaultChange::Unchanged
         );
@@ -2003,7 +2500,7 @@ mod tests {
         let unrelated = child('b');
         assert!(
             store
-                .establish_default_if_absent(&c.key, &establish(&unrelated, HostRetention::Keep))
+                .claim_selected_change(&pin, &establish(&unrelated, HostRetention::Keep))
                 .is_err()
         );
         assert_eq!(std::fs::read(&record).unwrap(), pins);
@@ -2018,10 +2515,11 @@ mod tests {
         store
             .commit_pin(&c, &Approval::initial(&c), DefaultAction::None)
             .unwrap();
+        let pin = store.lookup(&c.key).unwrap().unwrap();
         assert_eq!(
             store
-                .establish_default_if_absent(
-                    &c.key,
+                .claim_selected_change(
+                    &pin,
                     &establish(&reference, HostRetention::InitializeIfAbsent)
                 )
                 .unwrap(),
@@ -2029,10 +2527,11 @@ mod tests {
         );
         assert_eq!(host_reference(&store).unwrap(), child('a').as_str());
         let bytes = std::fs::read(store.directory.join(SELECTION_FILE)).unwrap();
+        let pin = store.lookup(&c.key).unwrap().unwrap();
         assert_eq!(
             store
-                .establish_default_if_absent(
-                    &c.key,
+                .claim_selected_change(
+                    &pin,
                     &establish(&reference, HostRetention::InitializeIfAbsent)
                 )
                 .unwrap(),
@@ -2047,8 +2546,8 @@ mod tests {
         let unrelated = child('c');
         assert!(
             store
-                .establish_default_if_absent(
-                    &c.key,
+                .claim_selected_change(
+                    &pin,
                     &establish(&unrelated, HostRetention::InitializeIfAbsent)
                 )
                 .is_err()
@@ -2066,7 +2565,7 @@ mod tests {
         let (_dir, store) = paths();
         let (a, reference_a) = selected('a');
         store
-            .commit(
+            .commit_with(
                 &a,
                 &Approval::initial(&a),
                 establish(&reference_a, HostRetention::Keep),
@@ -2080,12 +2579,26 @@ mod tests {
             .unwrap()
             .unwrap();
         let (host, reference_host) = selected('b');
+        let sequence_before = store.read().unwrap().unwrap().sequence;
         let adoption = DefaultAdoption::new(expected.clone(), reference_host.clone(), &host);
         let committed = store.adopt(&host, &adoption).unwrap();
-        assert_eq!(committed.project_default, ProjectDefaultChange::Adopted);
+        assert_eq!(
+            committed.value.project_default,
+            ProjectDefaultChange::Adopted
+        );
         let file = store.read().unwrap().unwrap();
         assert_eq!(file.defaults[0].image, reference_host.as_str());
         assert!(file.lookup(&host.key).unwrap().is_some());
+        // ADR-0068 R7: adoption is not a successful launch, so the new record
+        // holds no role; the save advances the sequence but keeps the approval
+        // token it allocated.
+        let inserted = file
+            .pins
+            .iter()
+            .find(|record| record.validated().unwrap().key == host.key)
+            .expect("the host reference's approval exists");
+        assert_eq!(inserted.roles, None, "adoption claims no Boot");
+        assert!(file.sequence.unwrap() > sequence_before.unwrap());
         assert!(
             file.pending_default.is_none(),
             "AC12: adoption commits no journal"
@@ -2148,7 +2661,7 @@ mod tests {
         let (_dir, store) = paths();
         let (a, reference_a) = selected('a');
         store
-            .commit(
+            .commit_with(
                 &a,
                 &Approval::initial(&a),
                 establish(&reference_a, HostRetention::Keep),
@@ -2260,9 +2773,11 @@ mod tests {
         let second = store
             .commit_pin(&b, &Approval::initial(&b), DefaultAction::None)
             .unwrap();
+        // One HOME-wide sequence: the two independent inserts allocate 1 then 2,
+        // not a per-key reset to 1.
         assert_eq!(
             (first.revision, second.revision),
-            (PinRevision(1), PinRevision(1))
+            (PinRevision(1), PinRevision(2))
         );
         assert_eq!(store.read().unwrap().unwrap().pins.len(), 2);
         assert_eq!(store.lookup(&a.key).unwrap().unwrap().digest, a.digest);
@@ -2309,7 +2824,9 @@ mod tests {
         let replaced = store
             .commit_pin(&b, &replacement(&b, first), DefaultAction::None)
             .unwrap();
-        assert_eq!(replaced.revision, PinRevision(2));
+        // The other project's insert allocated 1, A's insert 2, the equal
+        // re-resolution nothing, and this replacement 3.
+        assert_eq!(replaced.revision, PinRevision(3));
         assert_eq!(record_of(&other_project), untouched, "after a replacement");
         assert_eq!(
             store.lookup(&other.key).unwrap().unwrap().digest,
@@ -2417,7 +2934,10 @@ mod tests {
         let mut f = file();
         let mut template = f.pins[0].clone();
         template.platform.variant = Some("v".repeat(64));
-        template.revision = u64::MAX;
+        // A pins-only capacity control: revisions below exhaustion, so growth is
+        // refused for count, not for the write sequence (whose exhaustion has its
+        // own test in `cas_insert_same_candidate_stale_revision_and_aba`).
+        template.revision = 4096;
         f.pins = (0..4096)
             .map(|i| {
                 let mut record = template.clone();
@@ -2498,5 +3018,1302 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // ADR-0068: held roles, scope resolution, retirement and the global
+    // write sequence.
+    // ---------------------------------------------------------------------
+
+    /// A key on the fixture's own canonical source spelling, distinct per test
+    /// reference so two records can share one project/platform scope.
+    fn candidate_at(project: &ProjectId, reference: &str, byte: char) -> ValidatedCandidate {
+        let mut c = candidate_in(project, byte);
+        c.key.reference = CanonicalOciReference::parse(reference).unwrap();
+        c
+    }
+    fn scope_of(project: &ProjectId) -> ScopeKey {
+        candidate_in(project, 'a').key.scope()
+    }
+    fn scope_record(project: &ProjectId, resolved: RoleMask) -> ScopeRecord {
+        ScopeRecord {
+            project: project.as_str().to_owned(),
+            platform: HostLinuxPlatform::for_tests(),
+            resolved,
+        }
+    }
+    fn scope_record_with(
+        project: &ProjectId,
+        resolved: RoleMask,
+        variant: Option<String>,
+    ) -> ScopeRecord {
+        let mut platform = HostLinuxPlatform::for_tests();
+        platform.variant = variant;
+        ScopeRecord {
+            project: project.as_str().to_owned(),
+            platform,
+            resolved,
+        }
+    }
+    fn pin_record(
+        project: &ProjectId,
+        reference: &str,
+        byte: char,
+        revision: u64,
+        roles: Option<RoleMask>,
+    ) -> PinRecord {
+        let c = candidate_at(project, reference, byte);
+        PinRecord {
+            project: project.as_str().to_owned(),
+            reference: reference.to_owned(),
+            platform: HostLinuxPlatform::for_tests(),
+            manifest_digest: c.digest.as_str().to_owned(),
+            revision,
+            roles,
+        }
+    }
+    /// The literal 0.7.49 record shape: no `roles`, no `scopes`, no `sequence`.
+    /// Built as JSON so the fixture cannot acquire a field a new writer adds.
+    fn old_v2_record(
+        project: &ProjectId,
+        reference: &str,
+        byte: char,
+        revision: u64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "project": project.as_str(),
+            "reference": reference,
+            "platform": serde_json::to_value(HostLinuxPlatform::for_tests()).unwrap(),
+            "manifest_digest": format!("sha256:{}", byte.to_string().repeat(64)),
+            "revision": revision,
+        })
+    }
+    fn old_v2_bytes(pins: Vec<serde_json::Value>) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "version": 2,
+            "pins": pins,
+            "pending_default": null,
+        }))
+        .unwrap()
+    }
+    /// Install exact bytes with the stable lock a real store always has.
+    fn install_raw(store: &Store, bytes: &[u8]) {
+        std::fs::create_dir_all(&store.directory).unwrap();
+        open_lock(&store.lock_path(), true).unwrap();
+        std::fs::write(store.record(), bytes).unwrap();
+    }
+    fn pin_json(file: &PinFile, reference: &str) -> Option<serde_json::Value> {
+        file.pins
+            .iter()
+            .find(|record| record.reference == reference)
+            .map(|record| serde_json::to_value(record).unwrap())
+    }
+    fn roles_of(file: &PinFile, reference: &str) -> Option<RoleMask> {
+        file.pins
+            .iter()
+            .find(|record| record.reference == reference)
+            .and_then(|record| record.roles)
+    }
+    fn resolved_of(file: &PinFile, project: &ProjectId) -> Option<RoleMask> {
+        file.resolved_in(&scope_of(project))
+            .map(ResolvedRoles::mask)
+    }
+
+    /// AC1/AC12: untouched old bytes decode as "both roles unknown" without any
+    /// write, and re-encoding them omits every new field.
+    #[test]
+    fn old_v2_decodes_with_no_scope_knowledge() {
+        let bytes = old_v2_bytes(vec![old_v2_record(&project(), SOURCE, 'a', 7)]);
+        let file = PinFile::decode(&bytes).unwrap();
+        assert!(file.scopes.is_empty());
+        assert_eq!(file.sequence, None);
+        assert_eq!(file.effective_sequence(), 7);
+        assert_eq!(file.pins[0].roles, None);
+        assert!(file.resolved_in(&scope_of(&project())).is_none());
+        assert_eq!(file.encode().unwrap(), bytes);
+        let (_dir, store) = paths();
+        install_raw(&store, &bytes);
+        assert_eq!(
+            store.lookup(&candidate('a').key).unwrap().unwrap().revision,
+            PinRevision(7)
+        );
+        assert_eq!(
+            std::fs::read(store.record()).unwrap(),
+            bytes,
+            "a read writes nothing"
+        );
+    }
+
+    /// AC12: every new relational fact is validated on read, and the messages
+    /// never leak a reference.
+    #[test]
+    fn strict_role_and_scope_decode() {
+        let project = project();
+        let valid = PinFile {
+            version: STORE_VERSION,
+            pins: vec![
+                pin_record(&project, "example.com/x:tag", 'a', 1, Some(RoleMask::BOOT)),
+                pin_record(
+                    &project,
+                    "example.com/o:tag",
+                    'b',
+                    2,
+                    Some(RoleMask::OUTPUT),
+                ),
+            ],
+            pending_default: None,
+            defaults: Vec::new(),
+            scopes: vec![scope_record(&project, RoleMask::BOOT_AND_OUTPUT)],
+            sequence: Some(2),
+        };
+        let bytes = valid.encode().unwrap();
+        assert!(PinFile::decode(&bytes).is_ok());
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let mutate = |f: &dyn Fn(&mut serde_json::Value)| {
+            let mut v = value.clone();
+            f(&mut v);
+            serde_json::to_vec(&v).unwrap()
+        };
+        let mut cases = vec![
+            // Present null / empty / unknown masks are damage, not "none".
+            mutate(&|v| v["pins"][0]["roles"] = serde_json::json!(null)),
+            mutate(&|v| v["pins"][0]["roles"] = serde_json::json!("")),
+            mutate(&|v| v["pins"][0]["roles"] = serde_json::json!("boot+output")),
+            mutate(&|v| v["scopes"][0]["resolved"] = serde_json::json!("")),
+            mutate(&|v| v["scopes"][0]["resolved"] = serde_json::json!(null)),
+            // Duplicate scope key.
+            mutate(&|v| {
+                let entry = v["scopes"][0].clone();
+                v["scopes"].as_array_mut().unwrap().push(entry);
+            }),
+            // A holder whose scope resolves nothing (no scope record at all).
+            mutate(&|v| v["scopes"] = serde_json::json!([])),
+            // A resolved slot with no holder.
+            mutate(&|v| v["pins"][1]["roles"] = serde_json::json!(null)),
+            // A resolved role with two holders, while every other slot keeps
+            // its holder: the rejection cannot be "Output lost its only holder".
+            mutate(&|v| {
+                let mut duplicate = v["pins"][0].clone();
+                duplicate["reference"] = serde_json::json!("example.com/y:tag");
+                duplicate["revision"] = serde_json::json!(3);
+                v["pins"].as_array_mut().unwrap().push(duplicate);
+                v["sequence"] = serde_json::json!(3);
+            }),
+            // Any roles/scopes require a sequence.
+            mutate(&|v| {
+                v.as_object_mut().unwrap().remove("sequence");
+            }),
+            // A present sequence must be positive and cover live revisions.
+            mutate(&|v| v["sequence"] = serde_json::json!(0)),
+            mutate(&|v| v["sequence"] = serde_json::json!(1)),
+        ];
+        // Old files with no roles/scopes may omit the sequence even with
+        // duplicate per-key revisions: that is a legacy maximum, not damage.
+        let old = old_v2_bytes(vec![
+            old_v2_record(&project, "example.com/a:tag", 'a', 1),
+            old_v2_record(&project, "example.com/b:tag", 'b', 1),
+        ]);
+        assert!(PinFile::decode(&old).is_ok());
+        // Duplicate keys and a scope-record unknown field cannot be expressed as
+        // a `Value`, so the byte-level cases use the raw text the decoder sees.
+        let raw = std::str::from_utf8(&bytes).unwrap().to_owned();
+        let duplicate = |needle: &str, replacement: &str| -> Vec<u8> {
+            let once = raw.replacen(needle, replacement, 1);
+            assert_ne!(once, raw, "the fixture must contain {needle}");
+            once.into_bytes()
+        };
+        cases.push(duplicate(
+            "\"roles\":\"boot\"",
+            "\"roles\":\"boot\",\"roles\":\"boot\"",
+        ));
+        cases.push(duplicate(
+            "\"resolved\":\"boot-and-output\"",
+            "\"resolved\":\"boot-and-output\",\"resolved\":\"boot\"",
+        ));
+        cases.push(duplicate("\"sequence\":2", "\"sequence\":2,\"sequence\":2"));
+        cases.push(duplicate(
+            "\"resolved\":\"boot-and-output\"",
+            "\"resolved\":\"boot-and-output\",\"extra\":1",
+        ));
+        for (i, bytes) in cases.drain(..).enumerate() {
+            let error = PinFile::decode(&bytes)
+                .err()
+                .unwrap_or_else(|| panic!("accepted role/scope corruption case {i}"));
+            assert!(!error.to_string().contains("example.com"), "{error}");
+            assert!(!error.to_string().contains("sha256"), "{error}");
+        }
+        // Cross-scope controls are accepted: two projects, two platforms, each
+        // with its own single holder.
+        let other = ProjectId::for_tests('b');
+        let mut foreign = HostLinuxPlatform::for_tests();
+        foreign.architecture = if foreign.architecture == "amd64" {
+            "arm64"
+        } else {
+            "amd64"
+        }
+        .into();
+        let cross = PinFile {
+            version: STORE_VERSION,
+            pins: vec![
+                pin_record(&project, "example.com/x:tag", 'a', 1, Some(RoleMask::BOOT)),
+                PinRecord {
+                    platform: foreign.clone(),
+                    ..pin_record(&project, "example.com/x:tag", 'a', 2, Some(RoleMask::BOOT))
+                },
+                pin_record(&other, "example.com/x:tag", 'a', 3, Some(RoleMask::OUTPUT)),
+            ],
+            pending_default: None,
+            defaults: Vec::new(),
+            scopes: vec![
+                scope_record(&project, RoleMask::BOOT),
+                ScopeRecord {
+                    project: project.as_str().to_owned(),
+                    platform: foreign,
+                    resolved: RoleMask::BOOT,
+                },
+                scope_record(&other, RoleMask::OUTPUT),
+            ],
+            sequence: Some(3),
+        };
+        assert!(PinFile::decode(&cross.encode().unwrap()).is_ok());
+    }
+
+    /// AC2/AC4/AC5: with both slots resolved, a claim leaves exactly the two
+    /// holders; a shared record survives until neither role holds it.
+    #[test]
+    fn both_roles_resolved_claim_leaves_only_holders() {
+        let project = project();
+        let x_ref = "example.com/x:tag";
+        let y_ref = "example.com/y:tag";
+        let file = PinFile {
+            version: STORE_VERSION,
+            pins: vec![
+                pin_record(&project, x_ref, 'a', 1, Some(RoleMask::BOOT_AND_OUTPUT)),
+                pin_record(&project, y_ref, 'b', 2, None),
+            ],
+            pending_default: None,
+            defaults: Vec::new(),
+            scopes: vec![scope_record(&project, RoleMask::BOOT_AND_OUTPUT)],
+            sequence: Some(2),
+        };
+        let (_dir, store) = paths();
+        install(&store, &file);
+        // Y claims Boot: X keeps Output, so it stays.
+        let y = candidate_at(&project, y_ref, 'b');
+        store
+            .claim_pin(&y, &Approval::initial(&y), DefaultAction::None, Role::Boot)
+            .unwrap();
+        let after = store.read().unwrap().unwrap();
+        assert_eq!(roles_of(&after, x_ref), Some(RoleMask::OUTPUT));
+        assert_eq!(roles_of(&after, y_ref), Some(RoleMask::BOOT));
+        assert_eq!(after.pins.len(), 2);
+        assert_eq!(after.sequence, Some(3));
+        // Surviving content, not only masks: X's whole record except its roles is
+        // the one that was installed, and Y's carries its own digest/token.
+        let mut x_expected = pin_json(&file, x_ref).unwrap();
+        x_expected["roles"] = serde_json::json!("output");
+        assert_eq!(pin_json(&after, x_ref), Some(x_expected));
+        let mut y_expected = pin_json(&file, y_ref).unwrap();
+        y_expected["roles"] = serde_json::json!("boot");
+        assert_eq!(
+            pin_json(&after, y_ref),
+            Some(y_expected),
+            "a metadata-only claim keeps Y's approval token"
+        );
+        // Y then claims Output: X loses its last role while the scope is fully
+        // resolved, so it is both known-absent and retires.
+        store
+            .claim_pin(
+                &y,
+                &Approval::initial(&y),
+                DefaultAction::None,
+                Role::Output,
+            )
+            .unwrap();
+        let after = store.read().unwrap().unwrap();
+        assert_eq!(after.pins.len(), 1);
+        assert!(pin_json(&after, x_ref).is_none());
+        assert_eq!(roles_of(&after, y_ref), Some(RoleMask::BOOT_AND_OUTPUT));
+        // The reverse switch order: Output first, then Boot.
+        install(&store, &file);
+        assert!(pin_json(&store.read().unwrap().unwrap(), x_ref).is_some());
+        store
+            .claim_pin(
+                &y,
+                &Approval::initial(&y),
+                DefaultAction::None,
+                Role::Output,
+            )
+            .unwrap();
+        let after = store.read().unwrap().unwrap();
+        assert_eq!(roles_of(&after, x_ref), Some(RoleMask::BOOT));
+        assert_eq!(roles_of(&after, y_ref), Some(RoleMask::OUTPUT));
+        assert_eq!(after.pins.len(), 2, "X keeps Boot, so it stays");
+        store
+            .claim_pin(&y, &Approval::initial(&y), DefaultAction::None, Role::Boot)
+            .unwrap();
+        let after = store.read().unwrap().unwrap();
+        assert_eq!(after.pins.len(), 1);
+        assert!(
+            pin_json(&after, x_ref).is_none(),
+            "X retires on the second claim"
+        );
+        assert_eq!(roles_of(&after, y_ref), Some(RoleMask::BOOT_AND_OUTPUT));
+
+        // Foreign project/platform records are never touched. The foreign record
+        // shares the operated reference *text* but carries its own content and
+        // token, so comparing it whole proves the identity join rather than a
+        // content coincidence (`'d'`, revision 4, versus the local `'a'`, r5).
+        let other = ProjectId::for_tests('b');
+        let mut mixed = after.clone();
+        mixed
+            .pins
+            .push(pin_record(&other, "example.com/x:tag", 'd', 4, None));
+        mixed.pins.push(pin_record(&project, x_ref, 'a', 5, None));
+        mixed.sequence = Some(5);
+        install(&store, &mixed);
+        let before = std::fs::read(store.record()).unwrap();
+        let x = candidate_at(&project, x_ref, 'a');
+        store
+            .claim_pin(&x, &Approval::initial(&x), DefaultAction::None, Role::Boot)
+            .unwrap();
+        let after = store.read().unwrap().unwrap();
+        assert!(pin_json(&after, "example.com/x:tag").is_some());
+        // The foreign record is compared whole — project, reference, platform,
+        // digest and token — not by its revision alone.
+        let foreign = |file: &PinFile| -> Option<serde_json::Value> {
+            file.pins
+                .iter()
+                .find(|record| record.project == other.as_str())
+                .map(|record| serde_json::to_value(record).unwrap())
+        };
+        let before_foreign = foreign(&mixed).expect("the fixture's foreign record");
+        let local = mixed
+            .pins
+            .iter()
+            .find(|record| record.project == project.as_str() && record.reference == x_ref)
+            .expect("the operated local record");
+        assert_eq!(
+            before_foreign["manifest_digest"],
+            serde_json::json!(format!("sha256:{}", "d".repeat(64))),
+            "the foreign record carries its own content"
+        );
+        assert_eq!(
+            local.manifest_digest,
+            format!("sha256:{}", "a".repeat(64)),
+            "the operated record carries the claim's content"
+        );
+        assert_ne!(
+            before_foreign["manifest_digest"],
+            serde_json::json!(local.manifest_digest),
+            "the two records differ in content and token, not only in project"
+        );
+        assert_ne!(
+            before_foreign["revision"],
+            serde_json::json!(local.revision)
+        );
+        assert_eq!(
+            foreign(&after),
+            Some(before_foreign),
+            "the foreign record is untouched"
+        );
+        assert_ne!(std::fs::read(store.record()).unwrap(), before);
+    }
+
+    /// AC9: a refresh-created record in an unresolved scope is protected by
+    /// that role; once both slots resolve, the next successful claim retires it.
+    #[test]
+    fn refresh_created_unknown_role_survives_until_scope_resolution() {
+        let project = project();
+        let (_dir, store) = paths();
+        // Refresh inserts an unheld record (Keep) in a fresh scope.
+        let u = candidate_at(&project, "example.com/u:tag", 'a');
+        store
+            .commit_pin(&u, &Approval::initial(&u), DefaultAction::None)
+            .unwrap();
+        let file = store.read().unwrap().unwrap();
+        assert_eq!(roles_of(&file, "example.com/u:tag"), None);
+        assert_eq!(resolved_of(&file, &project), None);
+        // Output resolution alone cannot justify deleting it: Boot is unknown.
+        let p = candidate_at(&project, "example.com/p:tag", 'b');
+        store
+            .claim_pin(
+                &p,
+                &Approval::initial(&p),
+                DefaultAction::None,
+                Role::Output,
+            )
+            .unwrap();
+        let file = store.read().unwrap().unwrap();
+        assert!(
+            pin_json(&file, "example.com/u:tag").is_some(),
+            "?Boot protects it"
+        );
+        assert_eq!(resolved_of(&file, &project), Some(RoleMask::OUTPUT));
+        // Claiming Boot on a third record resolves the missing slot; U is now
+        // both known-absent and retires.
+        let q = candidate_at(&project, "example.com/q:tag", 'c');
+        store
+            .claim_pin(&q, &Approval::initial(&q), DefaultAction::None, Role::Boot)
+            .unwrap();
+        let file = store.read().unwrap().unwrap();
+        assert!(pin_json(&file, "example.com/u:tag").is_none());
+        assert_eq!(roles_of(&file, "example.com/q:tag"), Some(RoleMask::BOOT));
+        assert_eq!(roles_of(&file, "example.com/p:tag"), Some(RoleMask::OUTPUT));
+    }
+
+    /// AC9: refresh itself never retires; with both slots already resolved, the
+    /// next successful claim — even on the same target — cleans it up.
+    #[test]
+    fn refresh_after_resolution_waits_for_next_claim() {
+        let project = project();
+        let b_ref = "example.com/b:tag";
+        let o_ref = "example.com/o:tag";
+        let file = PinFile {
+            version: STORE_VERSION,
+            pins: vec![
+                pin_record(&project, b_ref, 'a', 1, Some(RoleMask::BOOT)),
+                pin_record(&project, o_ref, 'b', 2, Some(RoleMask::OUTPUT)),
+            ],
+            pending_default: None,
+            defaults: Vec::new(),
+            scopes: vec![scope_record(&project, RoleMask::BOOT_AND_OUTPUT)],
+            sequence: Some(2),
+        };
+        let (_dir, store) = paths();
+        install(&store, &file);
+        let v = candidate_at(&project, "example.com/v:tag", 'c');
+        store
+            .commit_pin(&v, &Approval::initial(&v), DefaultAction::None)
+            .unwrap();
+        let after = store.read().unwrap().unwrap();
+        assert!(
+            pin_json(&after, "example.com/v:tag").is_some(),
+            "refresh prunes nothing"
+        );
+        assert_eq!(after.pins.len(), 3);
+        assert_eq!(
+            roles_of(&after, "example.com/v:tag"),
+            None,
+            "refresh claims no role for the record it inserts"
+        );
+        assert_eq!(
+            resolved_of(&after, &project),
+            Some(RoleMask::BOOT_AND_OUTPUT),
+            "refresh changes no resolution"
+        );
+        // A successful same-target Boot claim retires the known-inactive V.
+        let b = candidate_at(&project, b_ref, 'a');
+        store
+            .claim_pin(&b, &Approval::initial(&b), DefaultAction::None, Role::Boot)
+            .unwrap();
+        let after = store.read().unwrap().unwrap();
+        assert!(pin_json(&after, "example.com/v:tag").is_none());
+        assert_eq!(roles_of(&after, b_ref), Some(RoleMask::BOOT));
+        assert_eq!(roles_of(&after, o_ref), Some(RoleMask::OUTPUT));
+    }
+
+    /// AC19 at the store: a legacy record claimed as Output keeps its unknown
+    /// Boot — and its exact bytes — through displacement, until Boot is claimed.
+    #[test]
+    fn legacy_boot_survives_output_claim_and_displacement() {
+        let project = project();
+        let x_ref = "example.com/x:tag";
+        let bytes = old_v2_bytes(vec![old_v2_record(&project, x_ref, 'a', 7)]);
+        let (_dir, store) = paths();
+        install_raw(&store, &bytes);
+        let x = candidate_at(&project, x_ref, 'a');
+        // A successful unchanged build/import of X is an Output claim.
+        store
+            .claim_pin(
+                &x,
+                &Approval::initial(&x),
+                DefaultAction::None,
+                Role::Output,
+            )
+            .unwrap();
+        let file = store.read().unwrap().unwrap();
+        assert_eq!(roles_of(&file, x_ref), Some(RoleMask::OUTPUT));
+        assert_eq!(resolved_of(&file, &project), Some(RoleMask::OUTPUT));
+        // AC1's envelope: the version stays 2 and the save persists the
+        // allocated sequence (the legacy maximum was 7).
+        assert_eq!(file.version, STORE_VERSION);
+        assert_eq!(file.sequence, Some(8));
+        // Publishing a different reference takes the sole Output slot.
+        let y = candidate_at(&project, "example.com/y:tag", 'b');
+        store
+            .claim_pin(
+                &y,
+                &Approval::initial(&y),
+                DefaultAction::None,
+                Role::Output,
+            )
+            .unwrap();
+        let file = store.read().unwrap().unwrap();
+        assert_eq!(
+            pin_json(&file, x_ref),
+            Some(old_v2_record(&project, x_ref, 'a', 7))
+        );
+        assert_eq!(
+            file.lookup(&x.key).unwrap().unwrap().revision,
+            PinRevision(7)
+        );
+        // Only a Boot claim in the same scope proves it absent and retires it.
+        let z = candidate_at(&project, "example.com/z:tag", 'c');
+        store
+            .claim_pin(&z, &Approval::initial(&z), DefaultAction::None, Role::Boot)
+            .unwrap();
+        let file = store.read().unwrap().unwrap();
+        assert!(pin_json(&file, x_ref).is_none());
+        assert_eq!(roles_of(&file, "example.com/y:tag"), Some(RoleMask::OUTPUT));
+        assert_eq!(roles_of(&file, "example.com/z:tag"), Some(RoleMask::BOOT));
+    }
+
+    /// AC20 at the store: the symmetric legacy record claimed as Boot keeps its
+    /// unknown Output through displacement until Output is claimed.
+    #[test]
+    fn legacy_output_survives_boot_claim_and_displacement() {
+        let project = project();
+        let x_ref = "example.com/x:tag";
+        let bytes = old_v2_bytes(vec![old_v2_record(&project, x_ref, 'a', 7)]);
+        let (_dir, store) = paths();
+        install_raw(&store, &bytes);
+        let x = candidate_at(&project, x_ref, 'a');
+        // A successful launch/setup of X is a Boot claim (warm claim path).
+        let consumed = store.lookup(&x.key).unwrap().unwrap();
+        store
+            .claim_selected(&consumed, &DefaultAction::None)
+            .unwrap();
+        let file = store.read().unwrap().unwrap();
+        assert_eq!(roles_of(&file, x_ref), Some(RoleMask::BOOT));
+        assert_eq!(resolved_of(&file, &project), Some(RoleMask::BOOT));
+        // A different Boot selection moves the slot; ?Output protects X.
+        let y = candidate_at(&project, "example.com/y:tag", 'b');
+        store
+            .claim_pin(&y, &Approval::initial(&y), DefaultAction::None, Role::Boot)
+            .unwrap();
+        let file = store.read().unwrap().unwrap();
+        assert_eq!(
+            pin_json(&file, x_ref),
+            Some(old_v2_record(&project, x_ref, 'a', 7))
+        );
+        // Resolving Output elsewhere retires it.
+        let z = candidate_at(&project, "example.com/z:tag", 'c');
+        store
+            .claim_pin(
+                &z,
+                &Approval::initial(&z),
+                DefaultAction::None,
+                Role::Output,
+            )
+            .unwrap();
+        let file = store.read().unwrap().unwrap();
+        assert!(pin_json(&file, x_ref).is_none());
+        assert_eq!(roles_of(&file, "example.com/y:tag"), Some(RoleMask::BOOT));
+        assert_eq!(roles_of(&file, "example.com/z:tag"), Some(RoleMask::OUTPUT));
+    }
+
+    /// AC21/AC22: a new global allocation defeats same-digest retire/reinsert
+    /// ABA. The consumed tuple carries the old lifetime's token.
+    #[test]
+    fn warm_claim_rejects_new_lifetime_same_digest() {
+        let project = project();
+        let x_ref = "example.com/x:tag";
+        let bytes = old_v2_bytes(vec![
+            old_v2_record(&project, x_ref, 'a', 1),
+            old_v2_record(&project, "example.com/b:tag", 'b', 2),
+        ]);
+        let (_dir, store) = paths();
+        install_raw(&store, &bytes);
+        let x = candidate_at(&project, x_ref, 'a');
+        let consumed = store.lookup(&x.key).unwrap().unwrap();
+        assert_eq!(consumed.revision, PinRevision(1));
+        // Peers resolve both slots, retiring X, then reinsert the same digest.
+        let y = candidate_at(&project, "example.com/y:tag", 'c');
+        store
+            .claim_pin(
+                &y,
+                &Approval::initial(&y),
+                DefaultAction::None,
+                Role::Output,
+            )
+            .unwrap();
+        let z = candidate_at(&project, "example.com/z:tag", 'd');
+        store
+            .claim_pin(&z, &Approval::initial(&z), DefaultAction::None, Role::Boot)
+            .unwrap();
+        assert!(store.lookup(&x.key).unwrap().is_none(), "X is absent");
+        let x = candidate_at(&project, x_ref, 'a');
+        store
+            .commit_pin(&x, &Approval::initial(&x), DefaultAction::None)
+            .unwrap();
+        let reinserted = store.lookup(&x.key).unwrap().unwrap();
+        assert_ne!(reinserted.revision, PinRevision(1), "no lifetime reuse");
+        assert!(reinserted.revision.0 > 1);
+        // The suspended operation's predecessor is now stale.
+        let before = std::fs::read(store.record()).unwrap();
+        let error = match store.claim_selected(&consumed, &DefaultAction::None) {
+            Err(error) => error,
+            Ok(_) => panic!("a reinserted lifetime must not satisfy the old tuple"),
+        };
+        assert!(error.to_string().contains("stale"), "{error}");
+        assert_eq!(std::fs::read(store.record()).unwrap(), before);
+    }
+
+    /// S5/§1 C3/C4: the equal-digest publication decision is pinned, not
+    /// incidental.
+    ///
+    /// C3: a publication that read X=A/r1 and rendered `equivalent` from it
+    /// resumes *after* peers retired X and reinserted the same digest under a new
+    /// global token. `commit_decision` reconciles on the digest, so it claims
+    /// Output on the **live** lifetime: it commits, its bytes equal those of a
+    /// publication that started after the reinsert, and the live token is
+    /// untouched. C4: with the record absent the same observed predecessor is
+    /// stale — an equal digest never resurrects a retired lifetime.
+    #[test]
+    fn equal_digest_publication_claims_the_live_lifetime() {
+        let project = project();
+        let x_ref = "example.com/x:tag";
+        let o_ref = "example.com/o:tag";
+        let z_ref = "example.com/z:tag";
+        let start = PinFile {
+            version: STORE_VERSION,
+            pins: vec![
+                pin_record(&project, x_ref, 'a', 1, Some(RoleMask::BOOT)),
+                pin_record(&project, o_ref, 'b', 2, Some(RoleMask::OUTPUT)),
+                pin_record(&project, z_ref, 'c', 3, None),
+            ],
+            pending_default: None,
+            defaults: Vec::new(),
+            scopes: vec![scope_record(&project, RoleMask::BOOT_AND_OUTPUT)],
+            sequence: Some(3),
+        };
+        let x = candidate_at(&project, x_ref, 'a');
+        // The suspended publication read X=A/r1 and rendered `equivalent` from it.
+        let (_observed_dir, observed) = paths();
+        install(&observed, &start);
+        let observed_tuple = observed.lookup(&x.key).unwrap().unwrap();
+        assert_eq!(observed_tuple.revision, PinRevision(1));
+        let approval = Approval::equivalent(&observed_tuple, &x);
+
+        // Peers retire X with a metadata-only Boot claim on the existing, unheld Z
+        // (which allocates no revision), then reinsert the same digest A.
+        let z_pin = observed
+            .lookup(&candidate_at(&project, z_ref, 'c').key)
+            .unwrap()
+            .unwrap();
+        observed
+            .claim_selected(&z_pin, &DefaultAction::None)
+            .unwrap();
+        assert!(observed.lookup(&x.key).unwrap().is_none(), "X is retired");
+        observed
+            .commit_pin(&x, &Approval::initial(&x), DefaultAction::None)
+            .unwrap();
+        let reinserted = observed.lookup(&x.key).unwrap().unwrap();
+        assert_eq!(
+            reinserted.revision,
+            PinRevision(5),
+            "a new global allocation"
+        );
+        assert_ne!(reinserted.revision, observed_tuple.revision);
+        let peer_bytes = std::fs::read(observed.record()).unwrap();
+
+        // C3: the suspended publication's predecessor no longer exists, but its
+        // candidate equals the live digest, so it commits on that live lifetime.
+        observed
+            .claim_pin(&x, &approval, DefaultAction::None, Role::Output)
+            .unwrap();
+        let after_observed = std::fs::read(observed.record()).unwrap();
+
+        // C3b/control: the same publication started *after* the reinsert, i.e.
+        // with the reinserted tuple as its observed predecessor.
+        let (_fresh_dir, fresh) = paths();
+        install_raw(&fresh, &peer_bytes);
+        let fresh_tuple = fresh.lookup(&x.key).unwrap().unwrap();
+        assert_eq!(fresh_tuple, reinserted);
+        fresh
+            .claim_pin(
+                &x,
+                &Approval::equivalent(&fresh_tuple, &x),
+                DefaultAction::None,
+                Role::Output,
+            )
+            .unwrap();
+        assert_eq!(
+            std::fs::read(fresh.record()).unwrap(),
+            after_observed,
+            "the reconciled publication equals a later-started publication"
+        );
+        let after = observed.read().unwrap().unwrap();
+        let x_after = after.lookup(&x.key).unwrap().unwrap();
+        assert_eq!(
+            x_after.revision,
+            PinRevision(5),
+            "the live lifetime's token is not reallocated"
+        );
+        assert_eq!(x_after.digest, x.digest);
+        assert_eq!(roles_of(&after, x_ref), Some(RoleMask::OUTPUT));
+        assert_eq!(
+            roles_of(&after, z_ref),
+            Some(RoleMask::BOOT),
+            "Boot stays with the peer's holder"
+        );
+        assert!(
+            after
+                .lookup(&candidate_at(&project, o_ref, 'b').key)
+                .unwrap()
+                .is_none(),
+            "the displaced Output holder retires"
+        );
+        assert_eq!(after.sequence, Some(6));
+
+        // C4: the same digest with the record absent is stale, not a resurrection.
+        let (_absent_dir, absent) = paths();
+        install(
+            &absent,
+            &PinFile {
+                pins: vec![pin_record(&project, o_ref, 'b', 2, Some(RoleMask::OUTPUT))],
+                scopes: vec![scope_record(&project, RoleMask::OUTPUT)],
+                sequence: Some(2),
+                ..start.clone()
+            },
+        );
+        let before = std::fs::read(absent.record()).unwrap();
+        let error = absent
+            .claim_pin(&x, &approval, DefaultAction::None, Role::Output)
+            .unwrap_err();
+        assert!(error.to_string().contains("stale"), "{error}");
+        assert_eq!(
+            std::fs::read(absent.record()).unwrap(),
+            before,
+            "no record is recreated"
+        );
+    }
+
+    /// AC21/AC22: the retired record holds the **high-water** revision and is
+    /// retired by a metadata-only claim that allocates no revision, so an
+    /// allocator reading the live maximum instead of the persisted sequence would
+    /// reissue the retired token and accept the old lifetime.
+    #[test]
+    fn high_water_retired_record_reinserts_above_it() {
+        let project = project();
+        let x_ref = "example.com/x:tag";
+        let file = PinFile {
+            version: STORE_VERSION,
+            pins: vec![
+                pin_record(&project, x_ref, 'a', 5, Some(RoleMask::BOOT)),
+                pin_record(
+                    &project,
+                    "example.com/o:tag",
+                    'b',
+                    3,
+                    Some(RoleMask::OUTPUT),
+                ),
+                pin_record(&project, "example.com/z:tag", 'c', 4, None),
+            ],
+            pending_default: None,
+            defaults: Vec::new(),
+            scopes: vec![scope_record(&project, RoleMask::BOOT_AND_OUTPUT)],
+            sequence: Some(5),
+        };
+        let (_dir, store) = paths();
+        install(&store, &file);
+        let x = candidate_at(&project, x_ref, 'a');
+        let consumed = store.lookup(&x.key).unwrap().unwrap();
+        assert_eq!(consumed.revision, PinRevision(5), "X holds the high-water");
+        // A metadata-only Boot claim on the existing, unheld Z retires X: no
+        // revision is allocated for Z, so the live maximum drops below X's token.
+        let z = store
+            .lookup(&candidate_at(&project, "example.com/z:tag", 'c').key)
+            .unwrap()
+            .unwrap();
+        store.claim_selected(&z, &DefaultAction::None).unwrap();
+        let retired = store.read().unwrap().unwrap();
+        assert!(retired.lookup(&x.key).unwrap().is_none(), "X is retired");
+        assert_eq!(retired.sequence, Some(6));
+        let live_max = retired
+            .pins
+            .iter()
+            .map(|record| record.revision)
+            .max()
+            .unwrap();
+        assert!(
+            live_max < consumed.revision.0,
+            "the high-water outlived the record: {live_max} < {}",
+            consumed.revision.0
+        );
+        // Reinserting the same digest draws a token above the retired one.
+        store
+            .commit_pin(&x, &Approval::initial(&x), DefaultAction::None)
+            .unwrap();
+        let reinserted = store.lookup(&x.key).unwrap().unwrap();
+        assert_eq!(
+            reinserted.revision,
+            PinRevision(7),
+            "the persisted sequence, not the live maximum, allocates"
+        );
+        // The suspended operation's predecessor is stale, with the peer bytes
+        // untouched.
+        let before = std::fs::read(store.record()).unwrap();
+        let error = match store.claim_selected(&consumed, &DefaultAction::None) {
+            Err(error) => error,
+            Ok(_) => panic!("the retired lifetime still satisfies the old tuple"),
+        };
+        assert!(error.to_string().contains("stale"), "{error}");
+        assert_eq!(std::fs::read(store.record()).unwrap(), before);
+    }
+
+    /// AC23: every real save advances the global sequence; metadata-only saves
+    /// keep approval tokens; no-ops persist nothing.
+    #[test]
+    fn sequence_allocates_across_keys_and_metadata_saves() {
+        let project = project();
+        let (_dir, store) = paths();
+        let a = candidate_at(&project, "example.com/a:tag", 'a');
+        let first = store
+            .claim_pin(
+                &a,
+                &Approval::initial(&a),
+                DefaultAction::None,
+                Role::Output,
+            )
+            .unwrap();
+        assert_eq!(first.revision, PinRevision(1));
+        assert_eq!(store.read().unwrap().unwrap().sequence, Some(1));
+        // A content replacement on another key draws the next allocation.
+        let b = candidate_at(&project, "example.com/b:tag", 'b');
+        let b_pin = store
+            .commit_pin(&b, &Approval::initial(&b), DefaultAction::None)
+            .unwrap();
+        assert_eq!(b_pin.revision, PinRevision(2));
+        // A metadata-only Boot claim advances the sequence but not the token.
+        // B was inserted unheld in a scope that already resolved Output, so
+        // resolving Boot retires it as known-inactive: its allocation (2) stays
+        // consumed, which is exactly why the high-water must persist.
+        let a = store.lookup(&a.key).unwrap().unwrap();
+        store.claim_selected(&a, &DefaultAction::None).unwrap();
+        let file = store.read().unwrap().unwrap();
+        assert_eq!(file.sequence, Some(3));
+        assert_eq!(
+            file.lookup(&a.key).unwrap().unwrap().revision,
+            PinRevision(1)
+        );
+        assert!(file.lookup(&b.key).unwrap().is_none());
+        assert_eq!(file.pins.len(), 1);
+        // A complete no-op consumes no allocation and writes nothing.
+        let bytes = std::fs::read(store.record()).unwrap();
+        let a = store.lookup(&a.key).unwrap().unwrap();
+        store.claim_selected(&a, &DefaultAction::None).unwrap();
+        assert_eq!(std::fs::read(store.record()).unwrap(), bytes);
+        // A failed save consumes nothing either.
+        let mut over = store.read().unwrap().unwrap();
+        over.sequence = Some(u64::MAX);
+        store.save(&over.encode().unwrap()).unwrap();
+        let exhausted = std::fs::read(store.record()).unwrap();
+        let c = candidate_at(&project, "example.com/c:tag", 'c');
+        assert!(
+            store
+                .commit_pin(&c, &Approval::initial(&c), DefaultAction::None)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(store.record()).unwrap(), exhausted);
+    }
+
+    /// AC12/R9: the effective high-water of an old file is its highest live
+    /// revision, read without a write; the next real save allocates above it.
+    #[test]
+    fn missing_sequence_uses_max_live_revision_without_write() {
+        let project = project();
+        let bytes = old_v2_bytes(vec![
+            old_v2_record(&project, "example.com/a:tag", 'a', 2),
+            old_v2_record(&project, "example.com/b:tag", 'b', 7),
+        ]);
+        let (_dir, store) = paths();
+        install_raw(&store, &bytes);
+        let file = store.read().unwrap().unwrap();
+        assert_eq!(file.sequence, None);
+        assert_eq!(file.effective_sequence(), 7);
+        assert_eq!(std::fs::read(store.record()).unwrap(), bytes);
+        let c = candidate_at(&project, "example.com/c:tag", 'c');
+        let pin = store
+            .commit_pin(&c, &Approval::initial(&c), DefaultAction::None)
+            .unwrap();
+        assert_eq!(pin.revision, PinRevision(8));
+        assert_eq!(store.read().unwrap().unwrap().sequence, Some(8));
+    }
+
+    /// AC17/AC23: mutating recovery preserves roles and resolution, allocates a
+    /// sequence, and only then rewrites the host record.
+    #[test]
+    fn recovery_allocates_and_preserves_roles() {
+        let project = project();
+        let x_ref = "example.com/x:tag";
+        let previous = String::from_utf8(default_bytes('a')).unwrap();
+        let proposed = String::from_utf8(default_bytes('b')).unwrap();
+        let file = PinFile {
+            version: STORE_VERSION,
+            pins: vec![pin_record(&project, x_ref, 'a', 1, Some(RoleMask::BOOT))],
+            pending_default: Some(PendingDefault {
+                previous: Some(previous.clone()),
+                proposed: proposed.clone(),
+            }),
+            defaults: Vec::new(),
+            scopes: vec![scope_record(&project, RoleMask::BOOT)],
+            sequence: Some(1),
+        };
+        let (_dir, store) = paths();
+        install(&store, &file);
+        std::fs::write(store.directory.join(SELECTION_FILE), &proposed).unwrap();
+        // Any mutating begin recovers first.
+        let c = candidate_at(&project, "example.com/c:tag", 'c');
+        store
+            .commit_pin(&c, &Approval::initial(&c), DefaultAction::None)
+            .unwrap();
+        let after = store.read().unwrap().unwrap();
+        assert!(after.pending_default.is_none());
+        assert_eq!(
+            std::fs::read_to_string(store.directory.join(SELECTION_FILE)).unwrap(),
+            previous
+        );
+        assert_eq!(roles_of(&after, x_ref), Some(RoleMask::BOOT));
+        assert_eq!(resolved_of(&after, &project), Some(RoleMask::BOOT));
+        // Recovery allocated one sequence; the following insert another.
+        assert_eq!(after.sequence, Some(3));
+        assert_eq!(
+            after
+                .lookup(&candidate_at(&project, "example.com/c:tag", 'c').key)
+                .unwrap()
+                .unwrap()
+                .revision,
+            PinRevision(3)
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // AC11a-d: four independent capacity fixtures. Count, bytes, scopes and
+    // sequence are different budgets; no fixture stands in for another.
+    // ---------------------------------------------------------------------
+
+    fn project_at(index: u32) -> ProjectId {
+        ProjectId::parse(&format!("{index:064x}")).expect("a formatted project id")
+    }
+    fn foreign_pin(index: u32, roles: Option<RoleMask>) -> PinRecord {
+        pin_record(&project_at(index), "example.com/foreign:tag", 'b', 1, roles)
+    }
+    fn full_error(error: &anyhow::Error) {
+        let message = error.to_string();
+        assert!(message.contains("maximum number of approvals"), "{message}");
+        assert!(!message.contains("damaged"), "{message}");
+    }
+
+    /// AC11a: 4096 pins where X holds both slots. A new publication keeps X's
+    /// Boot, so it cannot retire and the final 4097th record is refused as full.
+    #[test]
+    fn full_count_output_also_boot_cannot_retire() {
+        let project = project();
+        let x_ref = "example.com/x:tag";
+        let mut pins = vec![pin_record(
+            &project,
+            x_ref,
+            'a',
+            1,
+            Some(RoleMask::BOOT_AND_OUTPUT),
+        )];
+        pins.extend((0..4095).map(|index| foreign_pin(index, None)));
+        let file = PinFile {
+            version: STORE_VERSION,
+            pins,
+            pending_default: None,
+            defaults: Vec::new(),
+            scopes: vec![scope_record(&project, RoleMask::BOOT_AND_OUTPUT)],
+            sequence: Some(1),
+        };
+        let bytes = file.encode().unwrap();
+        assert!(bytes.len() < MAX_BYTES as usize);
+        let (_dir, store) = paths();
+        install_raw(&store, &bytes);
+        let y = candidate_at(&project, "example.com/y:tag", 'c');
+        let error = store
+            .claim_pin(
+                &y,
+                &Approval::initial(&y),
+                DefaultAction::None,
+                Role::Output,
+            )
+            .unwrap_err();
+        full_error(&error);
+        assert_eq!(std::fs::read(store.record()).unwrap(), bytes);
+        let after = store.read().unwrap().unwrap();
+        assert_eq!(after.pins.len(), 4096);
+        assert!(
+            after.lookup(&y.key).unwrap().is_none(),
+            "no Y pin was written"
+        );
+        assert_eq!(roles_of(&after, x_ref), Some(RoleMask::BOOT_AND_OUTPUT));
+    }
+
+    /// AC11b: the same full count, but X is only the Output holder, so a new
+    /// publication retires it and the final state is exactly 4096 pins.
+    #[test]
+    fn final_state_retirement_at_full_count_succeeds() {
+        let project = project();
+        let b_ref = "example.com/b:tag";
+        let x_ref = "example.com/x:tag";
+        let mut pins = vec![
+            pin_record(&project, b_ref, 'a', 1, Some(RoleMask::BOOT)),
+            pin_record(&project, x_ref, 'b', 2, Some(RoleMask::OUTPUT)),
+        ];
+        pins.extend((0..4094).map(|index| foreign_pin(index, None)));
+        let file = PinFile {
+            version: STORE_VERSION,
+            pins,
+            pending_default: None,
+            defaults: Vec::new(),
+            scopes: vec![scope_record(&project, RoleMask::BOOT_AND_OUTPUT)],
+            sequence: Some(2),
+        };
+        let bytes = file.encode().unwrap();
+        assert!(bytes.len() < MAX_BYTES as usize);
+        let (_dir, store) = paths();
+        install_raw(&store, &bytes);
+        let y = candidate_at(&project, "example.com/y:tag", 'c');
+        store
+            .claim_pin(
+                &y,
+                &Approval::initial(&y),
+                DefaultAction::None,
+                Role::Output,
+            )
+            .unwrap();
+        let after = store.read().unwrap().unwrap();
+        let x = candidate_at(&project, x_ref, 'b');
+        assert_eq!(after.pins.len(), 4096);
+        assert!(after.lookup(&x.key).unwrap().is_none(), "X retired");
+        assert_eq!(roles_of(&after, b_ref), Some(RoleMask::BOOT));
+        assert_eq!(
+            roles_of(&after, "example.com/y:tag"),
+            Some(RoleMask::OUTPUT)
+        );
+        assert_eq!(after.sequence, Some(3));
+        // The Boot holder's approval tuple is untouched.
+        assert_eq!(
+            after
+                .lookup(&candidate_at(&project, b_ref, 'a').key)
+                .unwrap()
+                .unwrap()
+                .revision,
+            PinRevision(1)
+        );
+    }
+
+    /// AC11c: a valid store at 4 MiB - 1 where a metadata-only Output claim adds
+    /// holder/resolution bytes. The proposed final state is full, not damage,
+    /// and the old bytes stay.
+    #[test]
+    fn metadata_role_resolution_exceeds_shared_byte_bound() {
+        const DEFAULT_IMAGE_MIN: usize = 89; // docker.io/library/alpine@sha256:<64>
+        let project = project();
+        let x_ref = "example.com/x:tag";
+        let revision = 999_999_999_999_999_999u64;
+        let mut pins = vec![pin_record(
+            &project,
+            x_ref,
+            'a',
+            revision,
+            Some(RoleMask::BOOT),
+        )];
+        let variant = Some("v".repeat(64));
+        // The target's own platform stays native: `candidate_at` builds its key
+        // from the measured host platform (no variant), so a variant-bearing
+        // target would be *inserted* as a second record instead of claimed. The
+        // variant padding therefore lives on the foreign records only, which is
+        // how this fixture reaches the metadata-only path at all.
+        let mut scopes = vec![scope_record(&project, RoleMask::BOOT)];
+        // Start from the largest legal encoding: a 270-byte reference, a 64-byte
+        // variant and an 18-digit token per pin, and a 270-byte digest reference
+        // per default. Then shorten references by the exact excess, because a
+        // reference byte is one encoded byte (no escaping).
+        for index in 0..4094u32 {
+            let p = project_at(index);
+            let mut record =
+                pin_record(&p, "example.com/y:tag", 'b', revision, Some(RoleMask::BOOT));
+            record.reference = reference_of_length(270);
+            record.platform.variant = variant.clone();
+            pins.push(record);
+            scopes.push(scope_record_with(&p, RoleMask::BOOT, variant.clone()));
+        }
+        let defaults = (0..4096u32)
+            .map(|index| ProjectDefaultRecord {
+                project: format!("{index:064x}"),
+                image: digest_reference_of_length(270),
+            })
+            .collect();
+        let mut file = PinFile {
+            version: STORE_VERSION,
+            pins,
+            pending_default: None,
+            defaults,
+            scopes,
+            sequence: Some(revision),
+        };
+        assert_eq!(file.pins.len(), 4095);
+        assert_eq!(file.defaults.len(), 4096);
+        assert_eq!(file.scopes.len(), 4095);
+        let target = MAX_BYTES as usize - 1;
+        // Measured without the bound check: the maximal shape may exceed it.
+        let base = serde_json::to_vec(&file).unwrap().len();
+        assert!(
+            base >= target,
+            "the fixture must reach the byte bound: only {base} of {target} bytes"
+        );
+        let mut excess = base - target;
+        // The target's own reference stays fixed: it is the claim's key.
+        for record in file.pins.iter_mut().skip(1) {
+            if excess == 0 {
+                break;
+            }
+            let floor = "example.com/x:tag".len();
+            let take = excess.min(record.reference.len() - floor);
+            record.reference = reference_of_length(record.reference.len() - take);
+            excess -= take;
+        }
+        for record in file.defaults.iter_mut() {
+            if excess == 0 {
+                break;
+            }
+            let take = excess.min(record.image.len() - DEFAULT_IMAGE_MIN);
+            record.image = digest_reference_of_length(record.image.len() - take);
+            excess -= take;
+        }
+        assert_eq!(excess, 0, "references alone have enough slack");
+        let bytes = file.encode().expect("the fixture reaches the byte bound");
+        assert_eq!(bytes.len(), target, "the builder reaches 4 MiB - 1 exactly");
+        let (_dir, store) = paths();
+        install_raw(&store, &bytes);
+        assert!(
+            store.read().unwrap().is_some(),
+            "the real decoder accepts it"
+        );
+        let x = candidate_at(&project, x_ref, 'a');
+        // The claim's key *is* the existing record's key: this row is a
+        // metadata-only claim, never an insertion.
+        assert!(
+            store.lookup(&x.key).unwrap().is_some(),
+            "the claim targets the existing Boot holder"
+        );
+        // Only the three metadata fields this claim writes add bytes: the pin's
+        // roles, the scope's resolution and the sequence's nineteenth digit.
+        let mut proposed = file.clone();
+        proposed.pins[0].roles = Some(RoleMask::BOOT_AND_OUTPUT);
+        proposed.scopes[0].resolved = RoleMask::BOOT_AND_OUTPUT;
+        proposed.sequence = Some(revision + 1);
+        let proposed_len = serde_json::to_vec(&proposed).unwrap().len();
+        // The pin's `roles` and the scope's `resolved` both grow from `boot` to
+        // `boot-and-output`, and the sequence gains its nineteenth digit.
+        let metadata_bytes = ("boot-and-output".len() - "boot".len()) * 2 + 1;
+        assert_eq!(
+            proposed_len,
+            bytes.len() + metadata_bytes,
+            "the claim adds role, resolution and sequence bytes and nothing else"
+        );
+        assert!(
+            proposed_len > MAX_BYTES as usize,
+            "the metadata alone crosses the shared byte bound: {proposed_len}"
+        );
+        let error = store
+            .claim_pin(
+                &x,
+                &Approval::initial(&x),
+                DefaultAction::None,
+                Role::Output,
+            )
+            .unwrap_err();
+        full_error(&error);
+        assert_eq!(std::fs::read(store.record()).unwrap(), bytes);
+        let after = store.read().unwrap().unwrap();
+        assert_eq!(after.pins.len(), 4095, "no record was inserted");
+        assert_eq!(roles_of(&after, x_ref), Some(RoleMask::BOOT));
+        assert_eq!(after.scopes[0].resolved, RoleMask::BOOT);
+        assert_eq!(after.scopes.len(), 4095);
+    }
+
+    /// A canonical `repo@sha256:…` of exactly `len` bytes.
+    fn digest_reference_of_length(len: usize) -> String {
+        let name_len = len - "example.com/".len() - "@sha256:".len() - 64;
+        let reference = format!(
+            "example.com/{}@sha256:{}",
+            "a".repeat(name_len),
+            "0".repeat(64)
+        );
+        assert_eq!(reference.len(), len);
+        CanonicalOciReference::parse(&reference).expect("a legal digest reference");
+        reference
+    }
+
+    /// A canonical reference of exactly `len` bytes, built from legal 50-byte
+    /// path components so the parser's own rules are never bypassed.
+    fn reference_of_length(len: usize) -> String {
+        let name_len = len - "example.com/".len() - ":tag".len();
+        let reference = format!("example.com/{}:tag", path_components(name_len));
+        assert_eq!(reference.len(), len);
+        reference
+    }
+    /// A repository path of exactly `len` bytes in 50-byte components. Many
+    /// short components keep the OCI parser's own matching cheap; the fixture
+    /// still never bypasses its grammar.
+    fn path_components(name_len: usize) -> String {
+        let mut name = String::new();
+        while name.len() < name_len {
+            if !name.is_empty() {
+                name.push('/');
+            }
+            let take = (name_len - name.len()).min(50);
+            name.push_str(&"a".repeat(take));
+        }
+        name
+    }
+
+    /// AC11d: 4096 small old-v2 records with both roles unresolved. A metadata
+    /// claim on an existing target adds a role/scope/sequence but no pin, keeps
+    /// every approval tuple and leaves Output unknown.
+    #[test]
+    fn full_count_metadata_only_first_claim_succeeds() {
+        let project = project();
+        let x_ref = "example.com/x:tag";
+        let mut pins = vec![old_v2_record(&project, x_ref, 'a', 1)];
+        for index in 0..4095u32 {
+            pins.push(old_v2_record(
+                &project_at(index),
+                "example.com/y:tag",
+                'b',
+                1,
+            ));
+        }
+        let bytes = old_v2_bytes(pins.clone());
+        let (_dir, store) = paths();
+        install_raw(&store, &bytes);
+        let tuples = |file: &PinFile| -> Vec<(String, u64)> {
+            let mut tuples: Vec<_> = file
+                .pins
+                .iter()
+                .map(|record| (record.manifest_digest.clone(), record.revision))
+                .collect();
+            tuples.sort();
+            tuples
+        };
+        let before = store.read().unwrap().unwrap();
+        assert_eq!(before.pins.len(), 4096);
+        assert_eq!(before.effective_sequence(), 1);
+        let x = candidate_at(&project, x_ref, 'a');
+        store
+            .claim_pin(&x, &Approval::initial(&x), DefaultAction::None, Role::Boot)
+            .unwrap();
+        let after = store.read().unwrap().unwrap();
+        assert_eq!(after.pins.len(), 4096, "no new pin was inserted");
+        assert_eq!(tuples(&after), tuples(&before));
+        assert_eq!(roles_of(&after, x_ref), Some(RoleMask::BOOT));
+        assert_eq!(resolved_of(&after, &project), Some(RoleMask::BOOT));
+        assert_eq!(after.sequence, Some(2));
+        assert!(after.encode().unwrap().len() < MAX_BYTES as usize);
     }
 }
