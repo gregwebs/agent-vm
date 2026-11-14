@@ -51,6 +51,7 @@ mod launch_build;
 mod launch_notice;
 mod launch_target;
 mod mount;
+mod mount_section;
 mod mount_selection;
 mod msb_cmd;
 mod msb_install;

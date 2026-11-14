@@ -399,3 +399,23 @@ this ADR's #394 facts; the candidate, runtime, image and evidence-directory
 receipts are in
 [ADR-0048's native evidence](0048-named-mount-sets-and-tier-local-tool-references.md#396-tool-mount-rows-cmt1t11-a-separate-later-run).
 Linux/amd64 remains outstanding.
+
+## Amendment: one mount section
+
+Decision 6's notice half is display only, and it changed: a launch prints one
+`==> Mounts:` section instead of a config count line near the banner, per-bind
+lines later and a fork's lifecycle line in between. The header carries the count
+and provenance (the file, the `[mount_sets]` names that supplied a declaration,
+`--mount`, and what `--no-config-mounts` withheld); up to three binds are named
+individually, and past three one pointer (`agent-vm msb inspect`) replaces the
+list. A fork always prints its lifecycle line, and only that one — the stored
+copy it names is not derivable from the declaration, while a second,
+bind-shaped line for the same fork was the redundancy the grouping removed.
+
+What did not change: selection, claiming, preflight order, trust, the merge
+rule, fork identity, and every load-time refusal. A sets-only file still prints
+no section, and the opt-out's `skipped N` count is still the distinct guest paths
+of the automatic inputs. Set names are read off the declarations' own
+`MountOrigin::UserSet` origins rather than a second expansion, so a nested set
+names itself and the name a list used to reach it is not reported. The rendering
+contract is [USAGE](../../USAGE.md#config-mounts-user-config).

@@ -1984,15 +1984,14 @@ CONCURRENT_NOTICE_PATTERNS=(
   '^==> Project path .+$'
   '^==> --no-git skips .+$'
   '^==> Mounting .+$'
-  '^==> Config mounts: .+$'
+  '^==> Mounts: .+$'
+  '^==>   view all [0-9]+ mounts: agent-vm msb inspect .+$'
   '^==> Egress authority: .+$'
   '^==> Egress policy: .+$'
-  '^==> TLS interception: .+$'
   '^==> Egress DNS: .+$'
   '^==> Tool network requests .+$'
   '^==>   (unmet|to grant): .+$'
   '^==>   … and [0-9]+ more not shown$'
-  '^==>   … and [0-9]+ more mounts? not shown [(]view all: agent-vm msb inspect .+[)]$'
   '^==> WARNING: potentially sensitive guest-managed Pi credentials .+$'
   '^==> Running .+ in sandbox [(]no TTY; streaming output[)]$'
   '^==> Stopping sandbox$'
@@ -2086,7 +2085,7 @@ assert_concurrent_stderr() {
   # Only 0xF1 may be non-ASCII: remove it, then nothing above 0x7F may remain —
   # except the launcher's own notice punctuation (`…`, `—`, `→`) on lines the
   # notice oracle below accepts. Without that allowance this rule rejected a
-  # valid `TLS interception: … — global` notice before the notice check ran, so
+  # valid punctuation notice before the notice check ran, so
   # the punctuation allowance lived only inside `notice_bytes_clean` while the
   # whole-stream rule refused the same bytes (#399 review 3, observation 3).
   # `notice_punctuation_bytes` is line-scoped: punctuation on any line that is
@@ -3790,15 +3789,15 @@ check_harness_negative() {
     echo "    FAIL: the notice byte rule rejected the launcher's own ellipsis notice"
     result=$((result + 1))
   fi
-  if ! notice_bytes_clean "==> TLS interception: ports 443 $(printf '\342\200\224') global"; then
-    echo "    FAIL: the notice byte rule rejected the launcher's own em-dash notice"
+  if ! notice_bytes_clean "==> Egress policy: --allow-host enabled (host.microsandbox.internal $(printf '\342\206\222') host 127.0.0.1 reachable)"; then
+    echo "    FAIL: the notice byte rule rejected the launcher's own arrow notice"
     result=$((result + 1))
   fi
   # A full stderr stream: exactly `oracle_bytes` guest bytes plus the two
   # punctuation notices the launcher really emits. It must pass end to end.
   {
     printf '==>   %s and 3 more not shown\n' "$(printf '\342\200\246')" >&2
-    printf '==> TLS interception: ports 443 %s global\n' "$(printf '\342\200\224')" >&2
+    printf '==> Egress policy: --allow-host enabled (host.microsandbox.internal %s host 127.0.0.1 reachable)\n' "$(printf '\342\206\222')" >&2
     head -c "$oracle_bytes" /dev/zero | LC_ALL=C tr '\0' '\361' >&2
   } 2>"$WORK/probe-punct.err" >/dev/null || result=$((result + 1))
   if ! assert_concurrent_stderr "probe-punct" "$WORK/probe-punct.err" "$oracle_bytes" \
@@ -3807,8 +3806,8 @@ check_harness_negative() {
     assert_concurrent_stderr "probe-punct" "$WORK/probe-punct.err" "$oracle_bytes" || true
     result=$((result + 1))
   fi
-  # ...and the allowance is notice-scoped: the same em dash on a line that is
-  # not an accepted notice is still a stray byte.
+  # ...and the allowance is notice-scoped: the same arrow on a line that is not
+  # an accepted notice is still a stray byte.
   {
     printf 'guest %s output\n' "$(printf '\342\200\224')" >&2
     head -c "$oracle_bytes" /dev/zero | LC_ALL=C tr '\0' '\361' >&2

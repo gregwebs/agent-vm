@@ -587,7 +587,7 @@ def main():
         record("CM-N1", "CM-N1 read=seed-ro write=denied", guest_line(l1, "CM-N1"))
         record("CM-N2", "CM-N2 wrote", guest_line(l1, "CM-N2"))
         record("CM-N3a", "CM-N3a read=seed-fork wrote", guest_line(l1, "CM-N3a"))
-        if "==> Config mounts: 3 from" not in l1:
+        if "==> Mounts: 3 (config \"" not in l1:
             raise AssertionError("L1: the selected notice did not name the three declarations")
         # Host oracles, read only after the launch's cleanup proved absence.
         # The expected value is the retained pre-launch observation, so the row
@@ -625,7 +625,7 @@ def main():
         # ---- L3: the opt-out removes every config mount ----------------------
         l3 = launch("L3", "n4", ("--no-config-mounts",))
         record("CM-N4", "CM-N4 ro=absent rw=absent fork=absent project=present", guest_line(l3, "CM-N4"))
-        if "==> Config mounts: skipped 3 from" not in l3:
+        if "==> Mounts: skipped 3 from" not in l3:
             raise AssertionError("CM-N4: the skipped notice did not name the three declarations")
         cleanup(launches[2], "L3")
 
@@ -734,7 +734,7 @@ def main():
         record("CM-T1",
                "CM-T1 agent=absent skills=absent readonly=absent pi=absent project=present",
                guest_line(t1, "CM-T1"))
-        if "==> Config mounts:" in t1:
+        if "==> Mounts:" in t1:
             raise AssertionError("CM-T1: the plain tool selected no mount, so no notice is due")
         cleanup(launches[-1], "T1")
         # The generic `.pi` guest-home link exists without the fork; what must be
@@ -821,7 +821,7 @@ def main():
                    "CM-T8 agent=absent skills=absent readonly=absent pi=absent "
                    "shell-own=absent default=absent project=present",
                    guest_line(text, "CM-T8"))
-            if "==> Config mounts: skipped" not in text:
+            if "==> Mounts: skipped" not in text:
                 raise AssertionError(f"{row}: the opt-out left no skipped notice")
             cleanup(launches[-1], row)
 

@@ -1191,20 +1191,19 @@ pub(crate) async fn launch(
     // complete mount plan before it creates fork state, scans repositories,
     // snapshots credentials, or hands anything to the sandbox builder.
     //
-    // The config half is named first: a reader must be able to tell which host
-    // paths this launch exposed *because of the file* before any per-mount
-    // notice describes them. Both lines print after the banner, so a rejected
-    // topology still emits nothing.
-    if let Some(notice) = selection.notice() {
-        notices.emit(notice)?;
-    }
-    // After the config line, so a reader meets the file's declarations before the
-    // launch's own, and before `prepare`'s notices.
+    // The worktree note introduces the two binds it added, so it precedes the
+    // mount section that lists them.
     if let Some(notice) = git_report.notice() {
         notices.emit(notice)?;
     }
-    for notice in &mount_plan.notices {
-        notices.emit(notice)?;
+    // One section, in one place: the header names what this launch exposes beyond
+    // the binds every launch has and where it came from, then either the binds or
+    // the pointer that reads the complete plan back, then preparation's own
+    // notices. Printed after the banner, so a rejected topology still emits
+    // nothing.
+    for line in crate::mount_section::lines(selection.sources(), &mount_plan, &session.sandbox_name)
+    {
+        notices.emit(line)?;
     }
 
     // Phase 6: build the per-launch GitHub repo allow-list from the
@@ -1447,9 +1446,6 @@ pub(crate) async fn launch(
     // same one-line policy costs nothing for the declared case — an ordinary
     // path is byte-identical — and cannot forge a line in either.
     let mut extra_mount_mkdirs: Vec<String> = Vec::new();
-    for notice in mount_plan.mount_notices(&session.sandbox_name) {
-        notices.emit(notice)?;
-    }
     for volume in &mount_plan.volumes {
         let guest = volume.guest.clone();
         let guest_str = guest

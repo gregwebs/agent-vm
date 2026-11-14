@@ -1851,9 +1851,10 @@ mod tests {
 
     // ── PreparedVolume::mount_notice ──────────────────────────────
 
-    /// One `==> Mounting …` line per bind: the guest path alone when it is also
-    /// the source, the arrow only when the two differ, and a fork's stored copy
-    /// named as such rather than read as a source the user typed (#551).
+    /// One `==> Mounting …` line per live bind: the guest path alone when it is
+    /// also the source, the arrow only when the two differ. A fork has no line
+    /// here — its lifecycle notice is the one message it gets, and it is the one
+    /// that names the stored copy and the reset directory.
     #[test]
     fn a_mount_notice_needs_an_arrow_only_for_a_remap() {
         let volume = |source, guest: &str| PreparedVolume {
@@ -1868,7 +1869,7 @@ mod tests {
                 "/home/a/.cargo"
             )
             .mount_notice(),
-            "==> Mounting /home/a/.cargo"
+            Some("==> Mounting /home/a/.cargo".to_string())
         );
         assert_eq!(
             volume(
@@ -1876,7 +1877,7 @@ mod tests {
                 "/etc"
             )
             .mount_notice(),
-            "==> Mounting /etc (read-only)"
+            Some("==> Mounting /etc (read-only)".to_string())
         );
         assert_eq!(
             volume(
@@ -1884,15 +1885,17 @@ mod tests {
                 "/guest"
             )
             .mount_notice(),
-            "==> Mounting /tmp/source -> /guest (read-only)"
+            Some("==> Mounting /tmp/source -> /guest (read-only)".to_string())
         );
+        // A fork's stored copy is not the declaration, so the bind line would
+        // read as a source the user typed; `prepare_forks` names it instead.
         assert_eq!(
             volume(
                 PreparedVolumeSource::Fork(PathBuf::from("/state/forks/abc/data")),
                 "/home/a/.pi/agent"
             )
             .mount_notice(),
-            "==> Mounting /home/a/.pi/agent (fork stored at /state/forks/abc/data)"
+            None
         );
         // Both paths are measured or declared text, so a control byte in either
         // must not end the line and start a forged `==>` one.
@@ -1902,112 +1905,7 @@ mod tests {
                 "/g\nx"
             )
             .mount_notice(),
-            "==> Mounting /host -> /g\\x0ax"
-        );
-    }
-
-    // ── PreparedMountPlan::mount_notices ─────────────────────────
-
-    #[test]
-    fn mount_notices_are_bounded_and_the_rest_point_at_msb_inspect() {
-        let plan = |count: usize| PreparedMountPlan {
-            volumes: (0..count)
-                .map(|i| PreparedVolume {
-                    guest: PathBuf::from(format!("/g{i}")),
-                    source: PreparedVolumeSource::ReadOnlyBind(PathBuf::from(format!("/h{i}"))),
-                    node_kind: PreparedNodeKind::Directory,
-                    role: VolumeRole::Followed,
-                })
-                .collect(),
-            repo_scan_roots: Vec::new(),
-            notices: Vec::new(),
-        };
-
-        assert!(plan(0).mount_notices("agent-vm-abc-42").is_empty());
-
-        // At the cap there is nothing to hide, so no summary and no hint.
-        let notices = plan(MAX_MOUNT_NOTICES).mount_notices("agent-vm-abc-42");
-        assert_eq!(notices.len(), MAX_MOUNT_NOTICES);
-        assert!(notices.iter().all(|line| line.starts_with("==> Mounting ")));
-
-        let notices = plan(MAX_MOUNT_NOTICES + 1).mount_notices("agent-vm-abc-42");
-        assert_eq!(notices.len(), MAX_MOUNT_NOTICES + 1);
-        assert_eq!(
-            notices[MAX_MOUNT_NOTICES],
-            "==>   … and 1 more mount not shown (view all: agent-vm msb inspect agent-vm-abc-42)"
-        );
-
-        let notices = plan(MAX_MOUNT_NOTICES + 3).mount_notices("agent-vm-abc-42");
-        assert_eq!(notices.len(), MAX_MOUNT_NOTICES + 1);
-        assert_eq!(
-            notices[MAX_MOUNT_NOTICES],
-            "==>   … and 3 more mounts not shown (view all: agent-vm msb inspect agent-vm-abc-42)"
-        );
-
-        // The name is generated (`agent-vm-<hash>-<pid>`), but the notice is
-        // still built through the one-line policy so no future source of it can
-        // end the line and forge a second notice.
-        let notices = plan(MAX_MOUNT_NOTICES + 2).mount_notices("agent-vm-a\n==> forged");
-        assert_eq!(
-            notices[MAX_MOUNT_NOTICES],
-            "==>   … and 2 more mounts not shown (view all: agent-vm msb inspect \
-             agent-vm-a\\x0a==> forged)"
-        );
-    }
-
-    #[test]
-    fn mount_notices_show_forks_first_then_declarations_then_followed() {
-        let followed = |i: usize| PreparedVolume {
-            guest: PathBuf::from(format!("/followed-{i}")),
-            source: PreparedVolumeSource::ReadOnlyBind(PathBuf::from(format!("/target-{i}"))),
-            node_kind: PreparedNodeKind::Directory,
-            role: VolumeRole::Followed,
-        };
-        let declared = |i: usize| PreparedVolume {
-            guest: PathBuf::from(format!("/declared-{i}")),
-            source: PreparedVolumeSource::ReadOnlyBind(PathBuf::from(format!("/source-{i}"))),
-            node_kind: PreparedNodeKind::Directory,
-            role: VolumeRole::Explicit,
-        };
-
-        // The followed tail comes first in mount order and the fork last: the
-        // report still has to lead with the fork, then the declaration, and
-        // spend what is left on the followed targets.
-        let mut volumes: Vec<PreparedVolume> = (0..MAX_MOUNT_NOTICES).map(followed).collect();
-        volumes.push(declared(0));
-        volumes.push(PreparedVolume {
-            guest: PathBuf::from("/forked"),
-            source: PreparedVolumeSource::Fork(PathBuf::from("/store/forks/abc/data")),
-            node_kind: PreparedNodeKind::Directory,
-            role: VolumeRole::Explicit,
-        });
-        let plan = PreparedMountPlan {
-            volumes,
-            repo_scan_roots: Vec::new(),
-            notices: Vec::new(),
-        };
-
-        let notices = plan.mount_notices("agent-vm-abc-42");
-        assert_eq!(notices.len(), MAX_MOUNT_NOTICES + 1);
-        assert_eq!(
-            notices[0],
-            "==> Mounting /forked (fork stored at /store/forks/abc/data)"
-        );
-        assert_eq!(
-            notices[1],
-            "==> Mounting /source-0 -> /declared-0 (read-only)"
-        );
-        for (i, notice) in notices[2..MAX_MOUNT_NOTICES].iter().enumerate() {
-            assert_eq!(
-                *notice,
-                format!("==> Mounting /target-{i} -> /followed-{i} (read-only)")
-            );
-        }
-        // 8 followed + 1 declared + 1 fork, eight shown: the last two followed
-        // targets are the ones held back.
-        assert_eq!(
-            notices[MAX_MOUNT_NOTICES],
-            "==>   … and 2 more mounts not shown (view all: agent-vm msb inspect agent-vm-abc-42)"
+            Some("==> Mounting /host -> /g\\x0ax".to_string())
         );
     }
 
@@ -4011,22 +3909,21 @@ pub(crate) struct PreparedVolume {
 }
 
 impl PreparedVolume {
-    /// The `==> Mounting …` line for this bind.
+    /// The `==> Mounting …` line for this bind, or `None` for a fork.
     ///
     /// A live bind at the path it was declared with needs no arrow; a remap
     /// names both sides, host first as it is the side the user can go and look
-    /// at. A fork's stored copy is labelled as such rather than shown in the
-    /// source position: the reader asks "what is mounted at ~/.pi", not "which
-    /// content-addressed directory is that".
-    pub(crate) fn mount_notice(&self) -> String {
+    /// at. A fork has no line here: its stored copy is not the declaration, and
+    /// its one message is the lifecycle notice `prepare_forks` records
+    /// (`Initialized fork …` / `Reusing fork …`), which carries the guest path,
+    /// the stored copy and the reset directory together.
+    pub(crate) fn mount_notice(&self) -> Option<String> {
         match &self.source {
-            PreparedVolumeSource::Fork(host) => format!(
-                "==> Mounting {} (fork stored at {})",
-                crate::one_line::path(&self.guest),
-                crate::one_line::path(host)
-            ),
-            PreparedVolumeSource::WritableBind(host) => self.bind_notice(host, ""),
-            PreparedVolumeSource::ReadOnlyBind(host) => self.bind_notice(host, " (read-only)"),
+            PreparedVolumeSource::Fork(_) => None,
+            PreparedVolumeSource::WritableBind(host) => Some(self.bind_notice(host, "")),
+            PreparedVolumeSource::ReadOnlyBind(host) => {
+                Some(self.bind_notice(host, " (read-only)"))
+            }
         }
     }
 
@@ -4057,61 +3954,14 @@ pub(crate) struct PreparedMountPlan {
     pub(crate) notices: Vec<String>,
 }
 
-/// How many `==> Mounting …` lines a launch prints before summarizing the rest.
-///
-/// A `:follow-links` bind announces one line per discovered target, and the
-/// host tree bounds that count rather than agent-vm. Eight matches the cap
-/// `network_requests` already puts on its own per-entry report, and the report
-/// spends those lines on the mounts a reader cannot infer from elsewhere: a
-/// fork first, then the declarations, then the followed targets.
-const MAX_MOUNT_NOTICES: usize = 8;
-
-impl PreparedMountPlan {
-    /// This launch's mount announcements, bounded to [`MAX_MOUNT_NOTICES`].
-    ///
-    /// Startup output has to stay readable when `:follow-links` discovers a
-    /// long tail, so the rest is summarized (with the way to read it in full:
-    /// `msb inspect`). The lines that survive lead with forks, whose stored
-    /// copy the declaration does not show, then the other declarations, and
-    /// spend what is left on followed targets. Order is stable within each
-    /// group, and only this report is reordered: the mounts themselves keep
-    /// their original order.
-    pub(crate) fn mount_notices(&self, sandbox_name: &str) -> Vec<String> {
-        // Larger key = shown later when the list is cut.
-        fn priority(volume: &PreparedVolume) -> u8 {
-            match (&volume.source, volume.role) {
-                (PreparedVolumeSource::Fork(_), _) => 0,
-                (_, VolumeRole::Explicit) => 1,
-                (_, VolumeRole::Followed) => 2,
-            }
-        }
-        let mut ordered: Vec<&PreparedVolume> = self.volumes.iter().collect();
-        ordered.sort_by_key(|volume| priority(volume));
-        let mut notices: Vec<String> = ordered
-            .into_iter()
-            .take(MAX_MOUNT_NOTICES)
-            .map(PreparedVolume::mount_notice)
-            .collect();
-        let hidden = self.volumes.len().saturating_sub(notices.len());
-        if hidden > 0 {
-            let noun = if hidden == 1 { "mount" } else { "mounts" };
-            notices.push(format!(
-                "==>   … and {hidden} more {noun} not shown (view all: agent-vm msb inspect \
-                 {})",
-                crate::one_line::text(sandbox_name)
-            ));
-        }
-        notices
-    }
-}
-
 /// How many lines of one preparation notice class a launch prints before
 /// summarizing the rest.
 ///
 /// Two classes grow with the host tree rather than with anything agent-vm
 /// bounds: the special nodes a fork seed omits (ADR-0054) and the warnings a
 /// `:follow-links` walk reports (`skipping …` and `not mirroring symlink …`
-/// alike). Eight keeps them at the same scale as [`MAX_MOUNT_NOTICES`], and the
+/// alike). Eight keeps them at the same scale as the mount list
+/// (`mount_section::MAX_LISTED_MOUNTS`), and the
 /// count is the launch's, not a producer's: two forks print one cap and one
 /// summary between them, not one apiece. The Pi credential omissions are *not*
 /// one of these classes: there are a handful, each is its own decision, and
@@ -4121,11 +3971,11 @@ const MAX_NOTICES_PER_CLASS: usize = 8;
 /// The line that stands in for the tail of a capped notice class: how many were
 /// suppressed, of what, and what the cap did not change.
 ///
-/// Unlike `mount_notices`, the tail cannot point at `agent-vm msb inspect`: a
-/// suppressed mount line describes a mount the guest has, while a suppressed
-/// preparation notice is a report that is stored nowhere, so there is nothing
-/// to read back. The summary therefore names the class it hid and leaves the
-/// mounts out of it.
+/// Unlike the mount section's summary, the tail cannot point at `agent-vm msb
+/// inspect`: a suppressed mount line describes a mount the guest has, while a
+/// suppressed preparation notice is a report that is stored nowhere, so there is
+/// nothing to read back. The summary therefore names the class it hid and leaves
+/// the mounts out of it.
 fn capped_notice_summary(hidden: usize, nouns: (&str, &str), why: &str) -> String {
     let noun = if hidden == 1 { nouns.0 } else { nouns.1 };
     format!("==>   … and {hidden} more {noun} not shown ({why})")
@@ -5266,9 +5116,15 @@ pub(crate) fn prepare_forks(
         if final_dir_exists(&final_dir)? {
             let kind = validate_ready(&final_dir, mount, &id)?;
             mount.host = final_dir.join("data");
+            // The guest path is what the reader is looking for; the stored copy
+            // alone names no place they asked for. The reset directory is the
+            // fork's own entry, not the `data` bind inside it: removing `data`
+            // leaves a manifest that still says READY, which is the corrupt-fork
+            // refusal, so the line names the directory instead of relying on the
+            // reader deriving its parent.
             notices.push(format!(
-                "==> Reusing fork at {} (reset: {})",
-                crate::one_line::path(&mount.host),
+                "==> Reusing fork {}: delete {} to reset",
+                crate::one_line::path(&mount.guest),
                 crate::one_line::path(&final_dir)
             ));
             let _ = kind;
@@ -5368,7 +5224,7 @@ pub(crate) fn prepare_forks(
         }
         mount.host = final_dir.join("data");
         notices.push(format!(
-            "==> Initialized fork {} -> {} (reset: {})",
+            "==> Initialized fork {} -> {}; delete {} to reset",
             mount.source_spelling.render(declaration),
             crate::one_line::path(&mount.host),
             crate::one_line::path(&final_dir)
@@ -8125,7 +7981,7 @@ mod prepare_tests {
         assert_eq!(
             initialized,
             &format!(
-                "==> Initialized fork {spelling} -> {} (reset: {})",
+                "==> Initialized fork {spelling} -> {}; delete {} to reset",
                 fork_dir.join("data").display(),
                 fork_dir.display()
             )
@@ -8780,7 +8636,7 @@ mod prepare_tests {
             .notices
             .iter()
             .chain(reused.notices.iter())
-            .filter(|notice| notice.contains("fork at") || notice.contains("Initialized fork"))
+            .filter(|notice| notice.contains("Reusing fork") || notice.contains("Initialized fork"))
             .collect::<Vec<_>>();
         assert_eq!(notices.len(), 2, "both fork notices: {:?}", notices);
         for notice in notices {
