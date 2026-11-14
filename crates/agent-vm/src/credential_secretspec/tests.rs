@@ -191,9 +191,11 @@ fn scripted(chunks: Vec<Vec<u8>>) -> Scripted {
     }
 }
 
-/// One `resolver.get` over `session`, with short bounds.
+/// One `resolver.get` over `session`, with bounds that only bound a hang: every
+/// caller asserts an answer, so a loaded machine must not be able to turn one
+/// into `Unresponsive`.
 fn get(session: &mut Session) -> Exchange {
-    session.get(&name("ALPHA_KEY"), &Bounds::short(), &service())
+    session.get(&name("ALPHA_KEY"), &Bounds::hang_ceiling(), &service())
 }
 
 fn resolved(exchange: Exchange) -> (Resolved, Keep) {
@@ -487,7 +489,7 @@ fn a_hung_request_times_out_sends_rpc_cancel_and_ends_the_session() {
 #[test]
 fn a_client_prompt_is_refused_with_method_not_found_and_the_read_continues() {
     let mut fake = started(json!({"secrets": {"ALPHA_KEY": "prompt"}}));
-    let bounds = Bounds::short();
+    let bounds = Bounds::hang_ceiling();
     let (resolved_value, keep) =
         resolved(fake.session.get(&name("ALPHA_KEY"), &bounds, &service()));
     // The prompt is refused with -32601 and the get's own answer still decides.
@@ -864,7 +866,9 @@ fn negotiated_limits_are_accepted_and_enforced() {
     // An outgoing frame above the negotiated limit is refused before a byte is
     // written.
     let long = SecretspecName::parse(&"N".repeat(4096)).expect("a long but valid name");
-    let outcome = negotiated.session.get(&long, &Bounds::short(), &service());
+    let outcome = negotiated
+        .session
+        .get(&long, &Bounds::hang_ceiling(), &service());
     assert!(matches!(resolved(outcome).0, Resolved::InvalidValue(_)));
 
     // Refused before any `resolver.get`: out-of-range, zero in-flight, absent
@@ -1329,7 +1333,7 @@ fn a_missing_or_non_executable_path_is_executable_missing() {
     assert_eq!(
         Session::start(
             &key_at(&dir.path().join("absent"), dir.path()),
-            &Bounds::short()
+            &Bounds::hang_ceiling()
         )
         .err()
         .expect("absent"),
@@ -1337,7 +1341,7 @@ fn a_missing_or_non_executable_path_is_executable_missing() {
     );
     // A directory.
     assert_eq!(
-        Session::start(&key_at(dir.path(), dir.path()), &Bounds::short())
+        Session::start(&key_at(dir.path(), dir.path()), &Bounds::hang_ceiling())
             .err()
             .expect("directory"),
         SecretspecFailure::ExecutableMissing
@@ -1347,7 +1351,7 @@ fn a_missing_or_non_executable_path_is_executable_missing() {
     std::fs::write(&plain, "#!/bin/sh\nexit 0\n").unwrap();
     std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
     assert_eq!(
-        Session::start(&key_at(&plain, dir.path()), &Bounds::short())
+        Session::start(&key_at(&plain, dir.path()), &Bounds::hang_ceiling())
             .err()
             .expect("not executable"),
         SecretspecFailure::ExecutableMissing
@@ -1362,7 +1366,7 @@ fn a_group_or_world_writable_executable_is_untrusted() {
         std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
         assert_eq!(
-            Session::start(&key_at(&path, dir.path()), &Bounds::short())
+            Session::start(&key_at(&path, dir.path()), &Bounds::hang_ceiling())
                 .err()
                 .expect("writable"),
             SecretspecFailure::ExecutableUntrusted,
@@ -1403,7 +1407,7 @@ fn a_foreign_owned_but_non_writable_executable_is_accepted() {
     // It reaches the spawn (and fails there as a handshake, not a trust check):
     // the trust half accepted the symlinked, foreign-mode target.
     assert!(matches!(
-        Session::start(&key, &Bounds::short()),
+        Session::start(&key, &Bounds::hang_ceiling()),
         Err(SecretspecFailure::StartupFailed)
     ));
 }
@@ -1412,7 +1416,7 @@ fn a_foreign_owned_but_non_writable_executable_is_accepted() {
 fn an_executable_that_exits_before_the_handshake_is_startup_failed() {
     let (dir, path) = script("exit 2");
     assert_eq!(
-        Session::start(&key_at(&path, dir.path()), &Bounds::short())
+        Session::start(&key_at(&path, dir.path()), &Bounds::hang_ceiling())
             .err()
             .expect("exit 2"),
         SecretspecFailure::StartupFailed
@@ -1420,7 +1424,7 @@ fn an_executable_that_exits_before_the_handshake_is_startup_failed() {
     // The same shape with a clean exit: stdout closes before any frame.
     let (dir2, path2) = script("exec cat >/dev/null");
     assert_eq!(
-        Session::start(&key_at(&path2, dir2.path()), &Bounds::short())
+        Session::start(&key_at(&path2, dir2.path()), &Bounds::hang_ceiling())
             .err()
             .expect("closed stdout"),
         SecretspecFailure::StartupFailed
@@ -1478,7 +1482,7 @@ fn the_child_gets_exact_argv_root_cwd_and_no_secretspec_variables() {
     let mut guard = crate::test_env::guard();
     guard.set_var("SECRETSPEC_FILE", "/tmp/decoy.toml");
     guard.set_var("SECRETSPEC_PROVIDER", "env");
-    let failure = Session::start(&key_at(&path, dir.path()), &Bounds::short())
+    let failure = Session::start(&key_at(&path, dir.path()), &Bounds::hang_ceiling())
         .err()
         .expect("the fixture exits before a handshake");
     assert_eq!(failure, SecretspecFailure::StartupFailed);
@@ -1513,7 +1517,7 @@ fn a_canary_on_the_child_stderr_reaches_no_agent_vm_output() {
     // restore leaves it installed — outlives the test that started it.
     if std::env::var_os(STDERR_CHILD_ENV).is_some() {
         let (dir, path) = script("echo 'sk-CANARY-202-stderr' >&2\nexit 1");
-        let failure = Session::start(&key_at(&path, dir.path()), &Bounds::short())
+        let failure = Session::start(&key_at(&path, dir.path()), &Bounds::hang_ceiling())
             .err()
             .expect("the fixture exits before a handshake");
         assert_eq!(failure, SecretspecFailure::StartupFailed);
@@ -1656,8 +1660,8 @@ printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id"
 exit 0"#,
         pidfile = text(&pidfile)
     ));
-    let mut session =
-        Session::start(&key_at(&path, dir.path()), &Bounds::short()).expect("the shell handshakes");
+    let mut session = Session::start(&key_at(&path, dir.path()), &Bounds::hang_ceiling())
+        .expect("the shell handshakes");
     assert!(matches!(resolved(get(&mut session)).0, Resolved::Missing));
     session.shutdown();
     let helper = read_pid(&pidfile);
@@ -1878,7 +1882,7 @@ fn sessions_start_lazily_and_are_shared_per_session_key() {
         SecretspecSource::select_with(
             &requested(&["gamma"]),
             &set,
-            super::session::Bounds::short()
+            super::session::Bounds::test_full()
         )
         .is_none()
     );

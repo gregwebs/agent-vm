@@ -95,6 +95,20 @@ impl Bounds {
         }
     }
 
+    /// The bounds a test needs when its oracle is not timing: a child that
+    /// exits at once, or an answer, decides the outcome, so the startup
+    /// allowance only bounds a hang. `short()` cannot serve here — 500 ms of
+    /// startup turns a scheduler-starved spawn into `HandshakeTimedOut` and the
+    /// test then asserts the wrong failure kind — and it must not be widened,
+    /// because the tests that assert a timeout depend on it.
+    #[cfg(test)]
+    pub(super) fn hang_ceiling() -> Self {
+        Self {
+            startup: Duration::from_secs(20),
+            ..Self::test_full()
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn short() -> Self {
         Self {
