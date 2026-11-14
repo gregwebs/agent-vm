@@ -210,6 +210,11 @@ pub(crate) enum Op {
 /// store. An error (rather than a status) is reserved for a verb that could not
 /// produce a listing at all.
 pub(crate) fn run(args: Args) -> Result<i32> {
+    // First, before the store is built and before a refused argument shape can
+    // exit: the warning is about the name the user typed, so an unusable `$HOME`
+    // or an extra value argument must not suppress it (#172 review). Once per
+    // command, so the handlers below never warn again.
+    warn_if_credential_shaped(&args.op);
     // A debug-only test seam: `tests/secret_pty.rs` points this at a recording
     // backend so it can assert the exact bytes the hidden reader delivered
     // without touching a real credential store (review finding N3). Compiled out
@@ -252,14 +257,12 @@ fn set<B: KeychainBackend>(
     rejected_token: Option<&str>,
 ) -> Result<()> {
     // Refuse first: the cheapest check, and it must not depend on anything that
-    // touches the value.
+    // touches the value. The warning for a credential-shaped name has already
+    // gone out (`run`), so a refusal does not hide it.
     reject_argv_value(rejected_positional, rejected_token)?;
     // Validate the name *before* reading the value, so `agent-vm secret set
     // BadName` fails before any store access and before any prompt.
     let service = ServiceName::parse(service)?;
-    // Before the value is read and before any store access, so the warning
-    // precedes both the success line and a later failure (#172).
-    warn_if_credential_shaped(&service);
     // The value is read before the store lock is taken, so a hidden prompt
     // never blocks holding the inventory lock.
     let value = read_secret_value(std::io::stdin().is_terminal())?;
@@ -291,7 +294,6 @@ fn list<B: KeychainBackend>(store: &SecretStore<B>) -> Result<i32> {
 
 fn remove<B: KeychainBackend>(store: &SecretStore<B>, service: &str) -> Result<()> {
     let service = ServiceName::parse(service)?;
-    warn_if_credential_shaped(&service);
     match store.remove(&service)? {
         RemoveOutcome::Removed => {
             eprintln!("removed the stored value for '{service}'");
@@ -311,14 +313,27 @@ fn reject_argv_value(rejected_positional: &[String], rejected_token: Option<&str
     Ok(())
 }
 
-/// [`CREDENTIAL_SHAPED_NAME_WARNING`], on stderr, once per command.
+/// [`CREDENTIAL_SHAPED_NAME_WARNING`] for the verb's name, on stderr, once per
+/// command.
+///
+/// Called from [`run`] before the store is built and before any argument
+/// refusal, so neither an unusable `$HOME` nor an extra value argument can
+/// suppress it. A name that does not parse is skipped here: it is refused later
+/// with its own message, and there is no canonical name to judge.
 ///
 /// `emit_notice_line` rather than `eprintln!`: a closed stderr must not abort a
 /// verb that is still safe to run, which is the same reason the store's own
 /// notices go through it. `ls` deliberately does not warn — it lists names by
 /// design and would repeat the line per row.
-fn warn_if_credential_shaped(service: &ServiceName) {
-    if service.looks_like_a_credential() {
+fn warn_if_credential_shaped(op: &Op) {
+    let raw = match op {
+        Op::Set { service, .. } => service,
+        Op::Rm { service } => service,
+        Op::Ls => return,
+    };
+    if let Ok(service) = ServiceName::parse(raw)
+        && service.looks_like_a_credential()
+    {
         crate::secret_store::emit_notice_line(CREDENTIAL_SHAPED_NAME_WARNING);
     }
 }

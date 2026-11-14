@@ -4133,10 +4133,11 @@ mod tests {
     ///
     /// **Negative** entries are ordinary names plus the edges of both rules: a
     /// 31-character mixed token (one byte under the length floor), a 32-byte
-    /// name whose character variety is a false hit (`aaa…1`), a long
-    /// letters-only name (no digit), a long digits-only name (no letter), and
-    /// `sky-…`, which must not read as the `sk-` prefix. Widening either
-    /// threshold has to restate why these stay quiet.
+    /// name whose character variety is a false hit (`aaa…1`), a name one
+    /// distinct character under the variety floor, a long letters-only name (no
+    /// digit), a long digits-only name (no letter), and `sky-…`, which must not
+    /// read as the `sk-` prefix. Widening either threshold has to restate why
+    /// these stay quiet.
     #[test]
     fn credential_shaped_names_follow_the_documented_table() {
         let positives = [
@@ -4146,8 +4147,11 @@ mod tests {
             "ghp_AbCdEf0123456789",
             "gho_AbCdEf0123456789",
             "ghs_AbCdEf0123456789",
+            "xoxa-1234-5678-AbCdEf",
             "xoxb-1234-5678-AbCdEf",
             "xoxp-1234-5678-AbCdEf",
+            "xoxr-1234-5678-AbCdEf",
+            "xoxs-1234-5678-AbCdEf",
             "gloas-AbCdEf0123456789",
             "AIzaSyDabcdef0123456789",
             "AKIAIOSFODNN7EXAMPLE",
@@ -4158,6 +4162,12 @@ mod tests {
             "A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6",
             // A 64-character hex digest: a deliberate positive (see above).
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            // The distinct-character boundary, exactly: 12 distinct canonical
+            // characters is a token, 11 is not. Both spellings are exercised so
+            // the mixed-case raw form (21 distinct characters) pins that the
+            // count runs on the *canonical* name, not what the user typed.
+            "abcdefghijk1abcdefghijk1abcdefghijk1",
+            "AbCdEfGhIjK1AbCdEfGhIjK1AbCdEfGhIjK1",
             // The documented false positive: a human, dotted name that reaches
             // the length floor and mixes digits with enough distinct characters.
             // It warns, and that is the accepted cost of the shape rule.
@@ -4183,6 +4193,10 @@ mod tests {
             "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d",
             // At the floor, but a human name, not a random token.
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1",
+            // Exactly one distinct character short of the boundary: 11 in the
+            // canonical spelling (21 in the typed one), so it stays quiet.
+            "abcdefghij1abcdefghij1abcdefghij1",
+            "AbCdEfGhIj1AbCdEfGhIj1AbCdEfGhIj1",
             // Letters only, and digits only: no mixing, so no token.
             "abcdefghijklmnopqrstuvwxyzabcdefghijkl",
             "1111111111111111111111111111111111111111",

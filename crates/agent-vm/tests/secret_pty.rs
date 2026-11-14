@@ -215,9 +215,12 @@ fn paste_at_the_value_length_boundary_is_accepted_then_rejected() {
 
 /// Finding 3 — the hidden prompt names no service, so a key accidentally typed
 /// in the name slot is not printed before the value is entered, and an aborted
-/// read does not echo it in either the typed or the case-folded spelling.
+/// read does not echo it in either the typed or the case-folded spelling. #172's
+/// warning for that same name is advisory, so it must come first, once, and
+/// still never print the name.
 #[test]
 fn the_hidden_prompt_does_not_repeat_a_key_shaped_name() {
+    const WARNING: &str = "looks like a credential";
     let typed = "sk-ant-API03-AbCdEf";
     let canonical = typed.to_ascii_lowercase();
     let home = tempfile::tempdir().unwrap();
@@ -229,9 +232,18 @@ fn the_hidden_prompt_does_not_repeat_a_key_shaped_name() {
         .expect("drive the pty");
     let text = String::from_utf8_lossy(&output);
     assert_ne!(status.code(), Some(0), "a cancelled read must fail: {text}");
+    let prompt = String::from_utf8_lossy(PROMPT).into_owned();
+    let prompt_at = text
+        .find(&prompt)
+        .unwrap_or_else(|| panic!("the prompt must still appear: {text}"));
+    assert_eq!(
+        text.matches(WARNING).count(),
+        1,
+        "exactly one warning, and it precedes the aborted prompt: {text}"
+    );
     assert!(
-        text.contains("(input is hidden)"),
-        "the prompt must still appear: {text}"
+        text.find(WARNING).unwrap_or(usize::MAX) < prompt_at,
+        "the warning must precede the prompt: {text}"
     );
     assert!(!text.contains(typed), "the typed name was echoed: {text}");
     assert!(

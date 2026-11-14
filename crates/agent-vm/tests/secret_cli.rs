@@ -848,6 +848,13 @@ fn a_key_shaped_name_is_accepted_and_listed_folded() {
         "{}",
         stdout_of(&listed)
     );
+    // `ls` lists names by design: it must not repeat #172's warning per row,
+    // even for a row whose name is exactly the credential-shaped one.
+    assert!(
+        !both_streams(&listed).contains(CREDENTIAL_SHAPED_WARNING),
+        "`ls` warned about a listed name: {}",
+        both_streams(&listed)
+    );
 
     let inventory =
         std::fs::read_to_string(harness.config_dir().join("secret-inventory.json")).unwrap();
