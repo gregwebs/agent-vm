@@ -1697,6 +1697,12 @@ copy does have to open and cannot — an unreadable regular file or directory �
 still a refusal. The fork **root** is still directory-only, and `:exclude=REL`
 stays silent because an excluded node is never inspected at all.
 
+At most eight such omission lines are printed; a source with more (a live Pi's
+`~/.pi` after a long session) ends the list with
+`==>   … and N more special nodes not shown (a socket, FIFO or device node is
+never copied into a fork, so it cannot be reached in the guest)`. Omitted Pi
+credential files are never summarized: there are a handful and each is printed.
+
 Repeat `:exclude=REL`, for example
 `--mount /host:/guest:fork:exclude=credentials.json:exclude=cache`. `REL` is a
 nonempty normal relative path: it cannot contain `:`, control characters, `.`,
@@ -2282,7 +2288,10 @@ and a copy you made yourself.
 `follow-links` (unchanged) walks `HOST` on the host and bind-mounts each
 resolved directory target at its real absolute path, so links that leave
 `HOST` resolve in the guest. A resolved target outside `$HOME` is a hard
-error; a symlink to a file or a dangling symlink is skipped with a warning.
+error; a symlink to a file or a dangling symlink is skipped with a warning. At
+most eight skip lines are printed; a broken tree with more ends the list with
+`==>   … and N more follow-links skips not shown (what was skipped is not
+mounted, so it cannot be reached in the guest)`.
 `follow-links` implies `:ro`.
 
 Tool arguments go to the tool verbatim: `agent-vm claude -p "say hi"`;

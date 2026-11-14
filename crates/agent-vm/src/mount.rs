@@ -4105,6 +4105,51 @@ impl PreparedMountPlan {
     }
 }
 
+/// How many lines of one preparation notice class a launch prints before
+/// summarizing the rest.
+///
+/// Two classes grow with the host tree rather than with anything agent-vm
+/// bounds: the special nodes a fork seed omits (ADR-0054) and the links and
+/// entries a `:follow-links` walk skips. Eight keeps them at the same scale as
+/// [`MAX_MOUNT_NOTICES`], so one launch's report reads as a whole. The Pi
+/// credential omissions are *not* one of these classes: there are a handful,
+/// each is its own decision, and each must be named.
+const MAX_NOTICES_PER_CLASS: usize = 8;
+
+/// The line that stands in for the tail of a capped notice class: how many were
+/// suppressed, of what, and what that means for the guest.
+///
+/// Unlike `mount_notices`, the tail cannot point at `agent-vm msb inspect`: a
+/// suppressed mount line describes a mount that exists, but an omitted node or
+/// skipped link is absent from the guest, so what was reported here cannot be
+/// read back anywhere and the summary has to say what was lost.
+fn capped_notice_summary(hidden: usize, nouns: (&str, &str), why: &str) -> String {
+    let noun = if hidden == 1 { nouns.0 } else { nouns.1 };
+    format!("==>   … and {hidden} more {noun} not shown ({why})")
+}
+
+/// The `:follow-links` skips, capped to [`MAX_NOTICES_PER_CLASS`].
+///
+/// The walk reports every skip as data so tests can assert on its text; how
+/// many of those lines a launch prints is this function's decision, and the
+/// skipped tail keeps its discovery order.
+fn skip_notices(warnings: Vec<String>) -> Vec<String> {
+    let mut notices: Vec<String> = warnings
+        .into_iter()
+        .map(|warning| format!("==> {warning}"))
+        .collect();
+    let hidden = notices.len().saturating_sub(MAX_NOTICES_PER_CLASS);
+    if hidden > 0 {
+        notices.truncate(MAX_NOTICES_PER_CLASS);
+        notices.push(capped_notice_summary(
+            hidden,
+            ("follow-links skip", "follow-links skips"),
+            "what was skipped is not mounted, so it cannot be reached in the guest",
+        ));
+    }
+    notices
+}
+
 #[derive(Debug)]
 pub(crate) struct MountContext {
     pub(crate) mount_store: PathBuf,
@@ -4560,7 +4605,7 @@ pub(crate) fn prepare(
         &origins,
     )?);
     sync_fork_representations(&unique, &mut expanded)?;
-    notices.extend(warnings.into_iter().map(|warning| format!("==> {warning}")));
+    notices.extend(skip_notices(warnings));
 
     // Fork initialization changes only the explicit source path. Discovery
     // was already complete (forks do not produce live followed binds), so
@@ -5258,12 +5303,32 @@ pub(crate) fn prepare_forks(
                     mount.source_spelling.render(declaration)
                 )
             })?;
+        // Only the special nodes are capped: a seed can leave out one per node
+        // in the source tree, while the Pi credential lines beside them are a
+        // handful of deliberate decisions and must each stay named.
+        let mut special_lines = 0usize;
+        let mut suppressed = 0usize;
         for (relative, omitted) in &report.omitted {
+            if matches!(omitted, OmittedNode::Special(_)) {
+                special_lines += 1;
+                if special_lines > MAX_NOTICES_PER_CLASS {
+                    suppressed += 1;
+                    continue;
+                }
+            }
             notices.push(format!(
                 "==> Omitted {} {} from the fork of {}",
                 omitted.description(),
                 crate::one_line::path(relative),
                 mount.source_spelling.render(declaration)
+            ));
+        }
+        if suppressed > 0 {
+            notices.push(capped_notice_summary(
+                suppressed,
+                ("special node", "special nodes"),
+                "a socket, FIFO or device node is never copied into a fork, so it cannot be \
+                 reached in the guest",
             ));
         }
         // The manifest records the spelling's exact bytes: it is fork identity,
@@ -10410,6 +10475,262 @@ mod prepare_tests {
                 .any(|notice| notice.contains("Omitted FIFO node")),
             "{:?}",
             plan.notices
+        );
+    }
+
+    // ── capped preparation notices (issue #595) ─────────────────────
+
+    /// Both capped classes keep the order they were discovered in and spend the
+    /// summary on the count. Pinned on the helper with a synthetic list: no real
+    /// walk orders its `read_dir` entries, so only this can prove the tail is
+    /// what gets dropped and the prefix is not reordered.
+    #[test]
+    fn skip_notices_keep_the_first_eight_in_order_and_count_the_rest() {
+        let warnings = |count: usize| -> Vec<String> {
+            (0..count)
+                .map(|i| format!("skipping dangling symlink /h/link-{i}"))
+                .collect()
+        };
+        let kept = |notices: &[String]| -> Vec<String> {
+            notices
+                .iter()
+                .filter(|notice| notice.starts_with("==> skipping "))
+                .cloned()
+                .collect()
+        };
+
+        // Below and at the cap: every line as reported, and no summary.
+        for count in [0, 1, MAX_NOTICES_PER_CLASS] {
+            let notices = skip_notices(warnings(count));
+            assert_eq!(
+                kept(&notices),
+                warnings(count)
+                    .into_iter()
+                    .map(|warning| format!("==> {warning}"))
+                    .collect::<Vec<String>>(),
+                "count={count}"
+            );
+        }
+
+        let notices = skip_notices(warnings(MAX_NOTICES_PER_CLASS + 1));
+        assert_eq!(notices.len(), MAX_NOTICES_PER_CLASS + 1);
+        assert_eq!(
+            notices[MAX_NOTICES_PER_CLASS],
+            "==>   … and 1 more follow-links skip not shown (what was skipped is not mounted, so \
+             it cannot be reached in the guest)"
+        );
+        assert_eq!(kept(&notices).len(), MAX_NOTICES_PER_CLASS);
+
+        let notices = skip_notices(warnings(MAX_NOTICES_PER_CLASS + 3));
+        assert_eq!(notices.len(), MAX_NOTICES_PER_CLASS + 1);
+        assert_eq!(
+            notices[MAX_NOTICES_PER_CLASS],
+            "==>   … and 3 more follow-links skips not shown (what was skipped is not mounted, so \
+             it cannot be reached in the guest)"
+        );
+        assert_eq!(kept(&notices).len(), MAX_NOTICES_PER_CLASS);
+    }
+
+    /// A seed omits one line per special node, and how many there are is the
+    /// host tree's decision. Above the cap the surviving lines keep their order
+    /// and one summary states how many nodes the guest will not have; at or
+    /// below it nothing changes.
+    #[test]
+    fn fork_special_node_omissions_are_bounded_with_a_counted_summary() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap();
+        let fork = |sockets: usize| {
+            let source = home.join(format!("tree-{sockets}"));
+            fs::create_dir(&source).unwrap();
+            fs::write(source.join("kept"), "seed").unwrap();
+            for i in 0..sockets {
+                bind_socket(&source.join(format!("gone-{i}.sock")));
+            }
+            let store = tempfile::tempdir().unwrap();
+            let plan = prepare(
+                parse_extra_mounts(&[format!("{}:/guest:fork", source.display())]).unwrap(),
+                &context_with_home(store.path(), home.clone()),
+            )
+            .unwrap();
+            assert!(fork_data(&plan).join("kept").is_file());
+            (source, plan)
+        };
+
+        // Below the cap: every node named, and no summary line at all.
+        let (source, plan) = fork(2);
+        let omitted: Vec<&String> = plan
+            .notices
+            .iter()
+            .filter(|notice| notice.starts_with("==> Omitted socket "))
+            .collect();
+        assert_eq!(omitted.len(), 2);
+        for notice in omitted {
+            assert!(
+                notice.ends_with(&format!(" from the fork of {}", source.display())),
+                "{notice}"
+            );
+        }
+        assert!(
+            !plan
+                .notices
+                .iter()
+                .any(|notice| notice.contains("not shown")),
+            "no summary below the cap: {:?}",
+            plan.notices
+        );
+
+        // Above it: eight named nodes, then one summary, then the fork's own
+        // initialization notice.
+        let (source, plan) = fork(MAX_NOTICES_PER_CLASS + 2);
+        let omitted: Vec<&String> = plan
+            .notices
+            .iter()
+            .filter(|notice| notice.starts_with("==> Omitted socket "))
+            .collect();
+        assert_eq!(omitted.len(), MAX_NOTICES_PER_CLASS);
+        for notice in omitted {
+            assert!(
+                notice.ends_with(&format!(" from the fork of {}", source.display())),
+                "{notice}"
+            );
+        }
+        let summary = plan
+            .notices
+            .iter()
+            .position(|notice| notice.contains("special node"))
+            .expect("a counted summary");
+        assert_eq!(
+            plan.notices[summary],
+            "==>   … and 2 more special nodes not shown (a socket, FIFO or device node is never \
+             copied into a fork, so it cannot be reached in the guest)"
+        );
+        assert!(
+            plan.notices[summary + 1].starts_with("==> Initialized fork "),
+            "the summary ends the omission block: {:?}",
+            plan.notices
+        );
+    }
+
+    /// The Pi credential lines share the copier's `omitted` list but not its
+    /// cap: they are a handful of deliberate decisions, and a source full of
+    /// sockets must not push them out of the report.
+    #[test]
+    fn pi_credential_omissions_stay_individual_past_the_special_node_cap() {
+        let (_home, home) = pi_home();
+        fs::create_dir_all(home.join(".pi/dashboard")).unwrap();
+        for i in 0..MAX_NOTICES_PER_CLASS + 2 {
+            bind_socket(&home.join(format!(".pi/dashboard/{i}.sock")));
+        }
+        let store = tempfile::tempdir().unwrap();
+        let plan = prepare(
+            parse_extra_mounts(&[format!("{}:/pi:fork", home.join(".pi").display())]).unwrap(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap();
+
+        let sockets = plan
+            .notices
+            .iter()
+            .filter(|notice| notice.starts_with("==> Omitted socket "))
+            .count();
+        assert_eq!(sockets, MAX_NOTICES_PER_CLASS);
+        assert!(
+            plan.notices
+                .iter()
+                .any(|notice| notice.contains("2 more special nodes not shown")),
+            "{:?}",
+            plan.notices
+        );
+        for named in [
+            "==> Omitted host Pi credential file agent/auth.json",
+            "==> Omitted host Pi provider-configuration file agent/models.json",
+        ] {
+            assert_eq!(
+                plan.notices
+                    .iter()
+                    .filter(|notice| notice.starts_with(named))
+                    .count(),
+                1,
+                "{named}: {:?}",
+                plan.notices
+            );
+        }
+    }
+
+    /// A `:follow-links` walk skips one line per unusable link, and how many
+    /// there are is the host tree's decision. Above the cap the report keeps the
+    /// first eight and counts the rest; at or below it the lines are unchanged.
+    #[test]
+    fn follow_links_skips_are_bounded_with_a_counted_summary() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap();
+        let walk = |links: usize| {
+            let source = home.join(format!("tree-{links}"));
+            fs::create_dir(&source).unwrap();
+            fs::write(source.join("kept"), "seed").unwrap();
+            for i in 0..links {
+                std::os::unix::fs::symlink(
+                    home.join(format!("missing-{i}")),
+                    source.join(format!("dangling-{i}")),
+                )
+                .unwrap();
+            }
+            let store = tempfile::tempdir().unwrap();
+            let plan = prepare(
+                parse_extra_mounts(&[format!("{}:/guest:follow-links", source.display())]).unwrap(),
+                &context_with_home(store.path(), home.clone()),
+            )
+            .unwrap();
+            // The mount itself still reaches the guest: this is a report cap.
+            assert!(
+                plan.volumes
+                    .iter()
+                    .any(|volume| volume.guest == Path::new("/guest"))
+            );
+            plan.notices
+        };
+
+        // Below the cap: the walk's own line, and no summary.
+        let notices = walk(2);
+        let skipped: Vec<&String> = notices
+            .iter()
+            .filter(|notice| notice.starts_with("==> skipping "))
+            .collect();
+        assert_eq!(skipped.len(), 2);
+        for notice in skipped {
+            assert!(
+                notice.starts_with("==> skipping dangling symlink ")
+                    && notice.contains("tree-2/dangling-"),
+                "{notice}"
+            );
+        }
+        assert!(
+            !notices.iter().any(|notice| notice.contains("not shown")),
+            "no summary below the cap: {notices:?}"
+        );
+
+        // Above it: eight skips, then the count. The dangling links are absent
+        // from the guest, so the summary says so instead of pointing at a
+        // command that would list them.
+        let notices = walk(MAX_NOTICES_PER_CLASS + 2);
+        assert_eq!(
+            notices
+                .iter()
+                .filter(|notice| notice.starts_with("==> skipping "))
+                .count(),
+            MAX_NOTICES_PER_CLASS
+        );
+        assert_eq!(
+            notices
+                .iter()
+                .filter(|notice| notice.contains("not shown"))
+                .cloned()
+                .collect::<Vec<String>>(),
+            [
+                "==>   … and 2 more follow-links skips not shown (what was skipped is not \
+                 mounted, so it cannot be reached in the guest)"
+                    .to_string()
+            ]
         );
     }
 
