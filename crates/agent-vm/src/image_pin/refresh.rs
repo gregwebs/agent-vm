@@ -1,9 +1,9 @@
-//! Which in-use OCI references one `image refresh` invocation refreshes, and
+//! Which in-use OCI references one `image pull` invocation pulls, and
 //! how each one is approved (ADR-0068 D10).
 //!
 //! # Why a frozen worklist, not a loop over "the selection"
 //!
-//! `image refresh` had one selected image before S4. Now it has the invocation's
+//! `image pull` had one selected image before S4. Now it has the invocation's
 //! in-use set for **this** project on **this** host platform: the ambient
 //! next-launch operation (the image a launch here would boot) plus every record
 //! holding a Boot/Output role, deduplicated by canonical reference. The set is
@@ -55,7 +55,7 @@ use crate::project::ProjectDir;
 /// It names the command shape and a placeholder, never the requested value: the
 /// rejected text is user input. The last sentence belongs to a *pre-worklist*
 /// refusal only — no operation ran, so nothing was acquired or approved.
-pub(crate) const NOT_A_MEMBER_REASON: &str = "`agent-vm image refresh --image REF` targets only references currently in use by \
+pub(crate) const NOT_A_MEMBER_REASON: &str = "`agent-vm image pull --image REF` targets only references currently in use by \
      this project on the host platform; the requested reference is not in that set. To acquire and \
      approve a new boot reference, run `agent-vm setup --image REF --no-verify`; `image build` and \
      `image import` approve their own output references. Nothing was acquired or approved.";

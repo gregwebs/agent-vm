@@ -1161,7 +1161,7 @@ pub(crate) async fn launch(
     // launch (with PullPolicy::Never for launch builds, which never contact a
     // registry). There is no launch-time registry probe of any kind: a warm launch
     // must not query a mutable tag, and checking for movement is the explicit
-    // `agent-vm image refresh` operation's job.
+    // `agent-vm image pull` operation's job.
 
     // Snapshot host credentials into per-project token files and place
     // placeholder credentials.json files where the in-VM agents will
@@ -1663,7 +1663,7 @@ pub(crate) async fn launch(
             None => {
                 // Only a local rootfs/disk selection reaches this: an OCI
                 // selection's environment always comes from the preparation, so
-                // there is nothing to cache and no `image refresh` to suggest —
+                // there is nothing to cache and no `image pull` to suggest —
                 // that command acquires OCI references and always refuses the
                 // user's own image.
                 anyhow::bail!(

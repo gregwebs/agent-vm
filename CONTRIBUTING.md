@@ -360,7 +360,7 @@ native logs. Guest `--network none` is not proof of host-offline acquisition.
 
 `tests/default_image_upgrade.rs` exercises the actual CLI and native registry
 against genuine OCI bytes on a bound loopback listener, without Docker or a VM.
-It covers both boot-free paths — `image refresh` (selection, A→B tag movement,
+It covers both boot-free paths — `image pull` (selection, A→B tag movement,
 layer reuse, first-pin and default adoption, candidate approval, and the
 two-process same-cache/same-reference coordination schedules) and
 `image set-default` (explicit target, approved host child, retained record) —
@@ -371,7 +371,7 @@ store through the compiled CLI with isolated HOME/state/cwd and Docker config
 read-only OS keyring lookup, and machine-wide managed policy still applies.
 Require a noninteractive credential environment with no matching loopback
 credential and absent/compatible managed policy; never modify host keyring items
-or policy for tests. Refresh asks nothing: `tests/image_pin_approval.rs` has a
+or policy for tests. A pull asks nothing: `tests/image_pin_approval.rs` has a
 PTY row and a piped row proving that no question is shown and stdin is never
 read, with every child wait bounded at 60s. Failure
 preservation hashes old metadata and referenced EROFS/fsmeta/VMDK artifacts
@@ -457,7 +457,7 @@ approval naming the selected reference and the measured `linux/arm64` platform;
 observe guest A and zero registry requests on a warm launch that inherits the
 removed advisory variable; reacquire A by digest into a fresh independent
 state/cache and confirm neither record's bytes changed; fail a candidate and still
-boot A; replace A with B by running the refresh (the prompt-free consent, #541)
+boot A; replace A with B by running the pull (the prompt-free consent, #541)
 and boot B; show that an
 import alias over the pinned tag cannot move the guest; and then show that an
 explicit `image import --docker … --tag $tag` of the pinned tag *does* move it —
@@ -964,7 +964,7 @@ process-global filter once the default tier is selected and suppresses every
 non-`agent_vm` event for the rest of that invocation. Explicit-source
 invocations keep dependency logging unchanged. The CLI regression
 (`a_default_tier_invocation_suppresses_dependency_image_tracing`) asserts a
-default-tier `RUST_LOG=trace image refresh` leaks no repository marker and includes a
+default-tier `RUST_LOG=trace image pull` leaks no repository marker and includes a
 positive explicit-source control.
 
 The host approval store is a third seam, and since #532 it is **per project**
@@ -973,14 +973,14 @@ wants a pre-approved host writes `$HOME/.config/agent-vm/image-pins.json` (stric
 version 2, one entry per project + canonical reference + platform) through the
 compiled CLI or by copying CLI-produced bytes; a hand-built store must satisfy
 the same strict schema, or the test is asserting corruption, not approval. An
-explicit command (`image refresh`, `set-default`, `build`, `import`, `setup`)
+explicit command (`image pull`, `set-default`, `build`, `import`, `setup`)
 must run in the same directory as the launch it asserts on: the project is the
 command's cwd, and a different cwd is a different project's approval. A
 version-1 store is refused outright, so an old fixture proves the legacy
 refusal, not approval. Pin lookups take a shared lock
 and create nothing, so an absent store is a legal read-only state; mutations
 create the directory and lock. A changed pin is replaced by the explicit
-command that caused it — `image refresh`, `image build` or `image import` — which
+command that caused it — `image pull`, `image build` or `image import` — which
 asks nothing and reads no stdin (#391, #541). `image set-default` approves
 nothing at all. Native cache/receipt bytes are never approval, and a test must
 not delete approvals to work around a cache problem.
@@ -1076,8 +1076,8 @@ while ordinary `setup` intentionally creates a verification guest.
 | `cargo test -p agent-vm` (per shard: `script/test/ci-test-shard.sh`) | yes (`ci.yml`, 3 shard jobs) | `#[ignore]`d e2e excluded; the shard runner deals the integration test targets and gives the unit tests and doctests to the lightest shard |
 | `cargo check --release -p agent-vm --tests` | yes (`ci.yml`) | type-check only; pins that the release test profile still compiles under the test cfg, since CI's run is the debug profile |
 | `script/test/e2e.sh` | **no** | native installed registry/archive joins; custom/all additionally require Apple Silicon and Docker; `custom-image` includes the always-run host-pin A/B rows |
-| `cargo test --test image_pin_approval` | yes (`cargo test -p agent-vm`) | boot-free compiled-CLI approval matrix: prompt-free refresh on a terminal and a pipe, removed `--yes`, frozen candidate, CAS/stale revision, S1 journal recovery, project-default establishment and refresh adoption, cache-loss digest reacquisition, build/import result approval, the active image set (one-off Boot switching and retirement, a warm changed-alias return after retirement, a literal old-v2 claim then a byte-identical no-op, and committed-success warnings for an unreported checkpoint or notice). No VM evidence |
-| `cargo test --bin agent-vm -- image_pin::active image_pin::store` | yes | kernels and store: 36-row knowledge/9-pair retirement tables, strict role/scope decode, legacy Boot/Output retention, refresh-uncertainty and same-target cleanup, global allocation/exhaustion/recovery, retire-reinsert ABA, and the four independent count/byte/scope capacity fixtures. No VM evidence |
+| `cargo test --test image_pin_approval` | yes (`cargo test -p agent-vm`) | boot-free compiled-CLI approval matrix: prompt-free pull on a terminal and a pipe, removed `--yes`, frozen candidate, CAS/stale revision, S1 journal recovery, project-default establishment and pull adoption, cache-loss digest reacquisition, build/import result approval, the active image set (one-off Boot switching and retirement, a warm changed-alias return after retirement, a literal old-v2 claim then a byte-identical no-op, and committed-success warnings for an unreported checkpoint or notice). No VM evidence |
+| `cargo test --bin agent-vm -- image_pin::active image_pin::store` | yes | kernels and store: 36-row knowledge/9-pair retirement tables, strict role/scope decode, legacy Boot/Output retention, pull-uncertainty and same-target cleanup, global allocation/exhaustion/recovery, retire-reinsert ABA, and the four independent count/byte/scope capacity fixtures. No VM evidence |
 | `cargo test … -- --ignored` | **no** | keychain round-trip; operator opt-in, never ordinary CI |
 | `AGENT_VM_E2E_SECRETSPEC=/opt/homebrew/bin/secretspec cargo test -p agent-vm --test config_launch_driven a_real_secretspec_serve_round_trip -- --ignored --exact` | **no** | the real `secretspec` binary as-is (no chmod/chown/copy/reinstall); isolated `HOME`, a manifest inside the test harness's own `TempDir`, and — for every command the test runs itself — a cleared environment repopulated with only `HOME`, `PATH=/usr/bin:/bin` and `XDG_{CONFIG,DATA,STATE,CACHE}_HOME` under that `HOME`, so a developer's `SECRETSPEC_*`, `XDG_*` and real audit store are never consulted; absent the variable the test refuses to run rather than auto-detecting an install |
 | `script/test/single-binary-contract.sh` | yes (`ci.yml`) | fake payload; lone copy, reuse, concurrency, tamper, unwritable, rejected-launch state, and `image show` unpacking nothing (C12); the only `embedded-runtime` clippy pass, which is what lints the payload build module |

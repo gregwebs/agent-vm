@@ -20,6 +20,8 @@ closure** (#396). Canonical guidance is
 recorded separately below; the #394 native pass is not retroactive evidence for
 them, and Linux/amd64 native coverage remains outstanding.
 
+`image refresh` was renamed `image pull` in 0.7.57 (#617, [ADR-0043](0043-image-command-group-and-daemon-import.md)); this record keeps the name it was decided under.
+
 ## Context
 
 ADR-0040 made one user-tier field authoritative: `[network]`. A user asked for

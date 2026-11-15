@@ -143,12 +143,12 @@ impl Harness {
     fn set_default(&self, target: &str) -> Output {
         self.run(&["image", "set-default", "--image", target])
     }
-    /// `image refresh [--image REF]`: native acquisition only, no VM. The
+    /// `image pull [--image REF]`: native acquisition only, no VM. The
     /// explicit command is its own consent (#541), so there is no `--yes`.
     fn refresh(&self, target: Option<&str>) -> Output {
         match target {
-            Some(target) => self.run(&["image", "refresh", "--image", target]),
-            None => self.run(&["image", "refresh"]),
+            Some(target) => self.run(&["image", "pull", "--image", target]),
+            None => self.run(&["image", "pull"]),
         }
     }
     /// A bare refresh whose ambient selection is `target`: the seeding shape
@@ -160,7 +160,7 @@ impl Harness {
     fn refresh_as_ambient(&self, target: &str) -> Output {
         let mut cmd = self.command();
         cmd.env("AGENT_VM_IMAGE_TAG", target)
-            .args(["image", "refresh"]);
+            .args(["image", "pull"]);
         bounded(&mut cmd)
     }
     fn approve_ambient_fixture(&self, target: &str) {
@@ -632,7 +632,7 @@ fn actual_usage_health_and_config_boundaries_do_not_choose_set_default_target() 
     // flag is an ordinary usage error and nothing is acquired (B4, #541).
     for args in [
         vec!["image", "set-default", "--image", "a:tag", "--yes"],
-        vec!["image", "refresh", "--yes"],
+        vec!["image", "pull", "--yes"],
     ] {
         let out = h.run(&args);
         assert_eq!(out.status.code(), Some(2), "{args:?}");
@@ -1037,7 +1037,7 @@ fn old_artifact_hash_oracle_detects_a_structurally_valid_overwrite() {
     before.artifacts_unchanged(&h, &pin_a);
 }
 
-// -- `image refresh`: boot-free native acquisition -------------------------
+// -- `image pull`: boot-free native acquisition -------------------------
 
 /// R3/R10: an unchanged refresh reuses cached layer bytes; re-resolving a moving
 /// tag lands the new manifest under the same cache key, keeps the old content
@@ -1121,7 +1121,7 @@ fn bare_refresh_adopts_the_recommendation_only_after_success() {
     let failed = bounded(
         h.command()
             .env("AGENT_VM_TEST_DEFAULT_IMAGE", &absent)
-            .args(["image", "refresh"]),
+            .args(["image", "pull"]),
     );
     assert!(!failed.status.success(), "an absent manifest must fail");
     assert!(
@@ -1137,7 +1137,7 @@ fn bare_refresh_adopts_the_recommendation_only_after_success() {
     success(&bounded(
         h.command()
             .env("AGENT_VM_TEST_DEFAULT_IMAGE", &pin)
-            .args(["image", "refresh"]),
+            .args(["image", "pull"]),
     ));
     assert_eq!(h.selected(), pin);
     let record = fs::read(h.record()).unwrap();
@@ -1235,7 +1235,7 @@ fn refresh_refuses_local_targets_before_any_state() {
     let out = bounded(
         h.command()
             .env("AGENT_VM_IMAGE_TAG", "../rootfs")
-            .args(["image", "refresh"]),
+            .args(["image", "pull"]),
     );
     assert_eq!(out.status.code(), Some(1));
     assert!(!h.record().exists());
@@ -1320,7 +1320,7 @@ const REFRESH_FAILURES: [RefreshFailure; 7] = [
     RefreshFailure::RefusedRegistry,
 ];
 
-/// One genuine same-tag failure for `image refresh`, then every preservation
+/// One genuine same-tag failure for `image pull`, then every preservation
 /// oracle. A fresh registry/server per row keeps the denial and drop rows from
 /// affecting each other.
 fn refresh_same_tag_failure(mode: RefreshFailure, retained: bool) {
@@ -1370,7 +1370,7 @@ fn refresh_same_tag_failure(mode: RefreshFailure, retained: bool) {
             let mut child = h
                 .command()
                 .env("AGENT_VM_IMAGE_TAG", &tag)
-                .args(["image", "refresh"])
+                .args(["image", "pull"])
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn()
@@ -1584,7 +1584,7 @@ fn refresh_killed_during_download_preserves_cached_a_and_releases_the_guard() {
         let mut child = h
             .command()
             .env("AGENT_VM_IMAGE_TAG", &tag)
-            .args(["image", "refresh"])
+            .args(["image", "pull"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -1628,7 +1628,7 @@ fn bare_refresh_failure_preserves_the_default_tier_key() {
             success(&bounded(
                 h.command()
                     .env("AGENT_VM_TEST_DEFAULT_IMAGE", &pin)
-                    .args(["image", "refresh"]),
+                    .args(["image", "pull"]),
             ));
             assert_eq!(h.selected(), pin);
         } else {
@@ -1645,7 +1645,7 @@ fn bare_refresh_failure_preserves_the_default_tier_key() {
         let out = bounded(
             h.command()
                 .env("AGENT_VM_TEST_DEFAULT_IMAGE", &pin)
-                .args(["image", "refresh"]),
+                .args(["image", "pull"]),
         );
         assert!(
             !out.status.success(),
@@ -1735,7 +1735,7 @@ fn refresh_resolves_an_immutable_index_to_the_host_child_without_retaining_m() {
         fresh
             .command()
             .env("AGENT_VM_TEST_DEFAULT_IMAGE", &index_pin)
-            .args(["image", "refresh"]),
+            .args(["image", "pull"]),
     ));
     assert_eq!(fresh.selected(), index_pin);
     assert_ne!(fresh.selected(), child_pin);
@@ -1752,7 +1752,7 @@ fn refresh_resolves_an_immutable_index_to_the_host_child_without_retaining_m() {
         fresh
             .command()
             .env("AGENT_VM_TEST_DEFAULT_IMAGE", &index_j)
-            .args(["image", "refresh"]),
+            .args(["image", "pull"]),
     ));
     assert_eq!(fs::read(fresh.record()).unwrap(), record);
     assert_eq!(
@@ -1835,7 +1835,7 @@ impl Coordinated {
         // only filter a reference already in use (ADR-0068 D10).
         let mut command = self.h.command();
         command.env("AGENT_VM_IMAGE_TAG", &self.tag);
-        Peer::spawn(command, gate, &["image", "refresh"])
+        Peer::spawn(command, gate, &["image", "pull"])
     }
 }
 
@@ -2206,7 +2206,7 @@ fn coordination_restore_failure_reports_both_stages_and_recovers() {
     let mut gate = AcquisitionGate::new(h.root.path());
     let mut command = h.command();
     command.env("AGENT_VM_TEST_DEFAULT_IMAGE", &private);
-    let q = Peer::spawn(command, &gate, &["image", "refresh"]);
+    let q = Peer::spawn(command, &gate, &["image", "pull"]);
     gate.expect(AcquisitionStage::BeforeLock)
         .reply(GateReply::Continue);
     gate.expect(AcquisitionStage::Snapshot)
@@ -2306,7 +2306,7 @@ fn coordination_guard_scope_is_one_reference_in_the_actual_cache() {
         .env("AGENT_VM_SHARE_MSB_CACHE", "1")
         .env("AGENT_VM_MSB_CACHE_DIR", &shared)
         .env("AGENT_VM_IMAGE_TAG", &tag);
-    let p = Peer::spawn(p_cmd, &gate, &["image", "refresh"]);
+    let p = Peer::spawn(p_cmd, &gate, &["image", "pull"]);
     gate.expect(AcquisitionStage::BeforeLock)
         .reply(GateReply::Continue);
     let p_snapshot = gate.expect(AcquisitionStage::Snapshot);
@@ -2316,7 +2316,7 @@ fn coordination_guard_scope_is_one_reference_in_the_actual_cache() {
         .env("AGENT_VM_SHARE_MSB_CACHE", "1")
         .env("AGENT_VM_MSB_CACHE_DIR", &shared)
         .env("AGENT_VM_IMAGE_TAG", &tag);
-    let q = Peer::spawn(q_cmd, &gate, &["image", "refresh"]);
+    let q = Peer::spawn(q_cmd, &gate, &["image", "pull"]);
     gate.expect(AcquisitionStage::BeforeLock)
         .reply(GateReply::Continue);
     gate.expect(AcquisitionStage::LockContended)
@@ -2388,7 +2388,7 @@ fn refresh_reports_real_guard_contention_once_and_releases_into_success() {
     let mut command = h.command();
     command
         .env("AGENT_VM_IMAGE_TAG", &tag)
-        .args(["image", "refresh"])
+        .args(["image", "pull"])
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     let mut child = command.spawn().expect("spawn the contending refresh");
@@ -2663,11 +2663,11 @@ fn postvalidation_faults_keep_explicit_causes_and_redact_default_operations() {
         let args = match operation {
             "explicit-refresh" => {
                 command.env("AGENT_VM_IMAGE_TAG", &pin);
-                vec!["image", "refresh"]
+                vec!["image", "pull"]
             }
             "default-refresh" => {
                 command.env("AGENT_VM_TEST_DEFAULT_IMAGE", &pin);
-                vec!["image", "refresh"]
+                vec!["image", "pull"]
             }
             _ => vec!["image", "set-default", "--image", pin.as_str()],
         };
@@ -2928,7 +2928,7 @@ fn refresh_selection_and_broken_config_recovery_acquire_only_the_winning_tier() 
         command
             .current_dir(&project)
             .env("AGENT_VM_TEST_DEFAULT_IMAGE", &tiers["recommendation"].0)
-            .args(["image", "refresh"]);
+            .args(["image", "pull"]);
         if let Some(env) = row.env {
             command.env(
                 "AGENT_VM_IMAGE_TAG",
@@ -3044,7 +3044,7 @@ fn refresh_rejects_complete_cache_result_identity_disagreement_and_restores_meta
     let mut gate = AcquisitionGate::new(h.root.path());
     let mut command = h.command();
     command.env("AGENT_VM_IMAGE_TAG", &tag);
-    let peer = Peer::spawn(command, &gate, &["image", "refresh"]);
+    let peer = Peer::spawn(command, &gate, &["image", "pull"]);
     gate.expect(AcquisitionStage::BeforeLock)
         .reply(GateReply::Continue);
     gate.expect(AcquisitionStage::Snapshot)
@@ -3078,7 +3078,7 @@ fn refresh_rejects_complete_cache_result_identity_disagreement_and_restores_meta
 
 /// Retention publication and advisory marker writes have different policies:
 /// a failed record lock fails refresh; a failed marker write only warns.
-/// A default-tier `image refresh` initializes the retained default from
+/// A default-tier `image pull` initializes the retained default from
 /// acquisition success alone — not from a launch — and does it inside the same
 /// transaction as the first pin. A default slot that cannot be written fails the
 /// whole operation: no approval, no record.
@@ -3091,7 +3091,7 @@ fn default_refresh_adopts_from_acquisition_success_in_one_transaction() {
     let out = bounded(
         h.command()
             .env("AGENT_VM_TEST_DEFAULT_IMAGE", &pin)
-            .args(["image", "refresh"]),
+            .args(["image", "pull"]),
     );
     success(&out);
     complete(&h.cache(), &pin);
@@ -3113,7 +3113,7 @@ fn default_refresh_adopts_from_acquisition_success_in_one_transaction() {
     let out = bounded(
         h.command()
             .env("AGENT_VM_TEST_DEFAULT_IMAGE", &pin)
-            .args(["image", "refresh"]),
+            .args(["image", "pull"]),
     );
     assert_eq!(out.status.code(), Some(1));
     assert!(!h.record().exists());
@@ -3473,7 +3473,7 @@ fn receipt_is_cache_only_and_alias_overwrite_is_repaired() {
     repair
         .current_dir(&repair_project)
         .env("AGENT_VM_IMAGE_TAG", &canonical)
-        .args(["image", "refresh"]);
+        .args(["image", "pull"]);
     success(&bounded(&mut repair));
     assert!(
         server.requests()[requests_before..]
@@ -3514,7 +3514,7 @@ fn gate_io_failure_is_a_failure_not_a_skip() {
     let mut cmd = h.command();
     cmd.env("AGENT_VM_TEST_ACQUIRE_GATE", &missing)
         .env("AGENT_VM_IMAGE_TAG", &tag)
-        .args(["image", "refresh"]);
+        .args(["image", "pull"]);
     let out = bounded(&mut cmd);
     assert!(
         !out.status.success(),
@@ -4163,14 +4163,14 @@ fn update_and_import_leave_project_persist_and_runtime_state_unchanged() {
         ..Default::default()
     });
     server.image("images", "state", &b);
-    for operation in ["refresh", "set-default", "import"] {
+    for operation in ["pull", "set-default", "import"] {
         let archive = h.root.path().join("state-b.tar");
         let mut command = h.command();
         command.current_dir(&project);
         let args = match operation {
-            "refresh" => {
+            "pull" => {
                 command.env("AGENT_VM_IMAGE_TAG", &tag);
-                vec!["image", "refresh"]
+                vec!["image", "pull"]
             }
             "set-default" => vec!["image", "set-default", "--image", &tag],
             _ => vec![

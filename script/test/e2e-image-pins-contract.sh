@@ -65,7 +65,7 @@ PINS_BIN="$FAKE_BIN"
 export AGENT_VM_IMAGE_TAG="inherited-sentinel:1"
 pins_env "$HOME_DIR" "$STATE_DIR"
 reset_record
-pins_avm "$PROJECT" image refresh || fail "pins_avm exited nonzero"
+pins_avm "$PROJECT" image pull || fail "pins_avm exited nonzero"
 record="$(last_record)"
 grep -qx 'tag=<unset>' <<<"$record" || fail "the default helper leaked an inherited AGENT_VM_IMAGE_TAG:
 $record"
@@ -75,14 +75,14 @@ grep -qx "state=$STATE_DIR" <<<"$record" || fail "the default helper lost the st
 $record"
 grep -qx "cwd=$PROJECT_REAL" <<<"$record" || fail "the default helper ran outside the project:
 $record"
-grep -qx 'argv=image|refresh|' <<<"$record" || fail "the default helper changed argv:
+grep -qx 'argv=image|pull|' <<<"$record" || fail "the default helper changed argv:
 $record"
 
 # --- pins_ambient_override_reaches_the_actual_child ----------------------------
 # The ambient helper's value reaches the actual child, and does not leak into a
 # later default command.
 reset_record
-pins_avm_ambient "$PROJECT" "registry.example:5000/native:fixture" image refresh ||
+pins_avm_ambient "$PROJECT" "registry.example:5000/native:fixture" image pull ||
     fail "pins_avm_ambient exited nonzero"
 record="$(last_record)"
 grep -qx 'tag=registry.example:5000/native:fixture' <<<"$record" ||
@@ -90,13 +90,13 @@ grep -qx 'tag=registry.example:5000/native:fixture' <<<"$record" ||
 $record"
 grep -qx "cwd=$PROJECT_REAL" <<<"$record" || fail "the ambient helper ran outside the project:
 $record"
-grep -qx 'argv=image|refresh|' <<<"$record" || fail "the ambient helper changed argv:
+grep -qx 'argv=image|pull|' <<<"$record" || fail "the ambient helper changed argv:
 $record"
 
 # A following default command still sees the override cleared: the ambient
 # helper must not leak its value into `PINS_ENV` or the caller's environment.
 reset_record
-pins_avm "$PROJECT" image refresh || fail "the follow-up pins_avm exited nonzero"
+pins_avm "$PROJECT" image pull || fail "the follow-up pins_avm exited nonzero"
 record="$(last_record)"
 grep -qx 'tag=<unset>' <<<"$record" || fail "the ambient override leaked into a later command:
 $record"
@@ -133,11 +133,11 @@ end = ends[0]
 calls = [
     (index, line.strip())
     for index, line in enumerate(lines[start + 1 : end], start=start + 1)
-    if "image refresh" in line
+    if "image pull" in line
 ]
-expected = 'pins_avm_ambient "$live" "$tag" image refresh >"$WORK/pins-live-pin.out" 2>&1 || {'
+expected = 'pins_avm_ambient "$live" "$tag" image pull >"$WORK/pins-live-pin.out" 2>&1 || {'
 if len(calls) != 1:
-    sys.exit(f"FAIL: expected exactly one live-seed refresh call, found {calls}")
+    sys.exit(f"FAIL: expected exactly one live-seed pull call, found {calls}")
 if calls[0][1] != expected:
     sys.exit(
         "FAIL: the live-seed dispatch must be the ambient helper form "

@@ -154,7 +154,7 @@ impl Harness {
 
     fn refresh(&self, reference: &str) -> Output {
         let mut command = self.command();
-        command.args(["image", "refresh", "--image", reference]);
+        command.args(["image", "pull", "--image", reference]);
         bounded(command)
     }
 
@@ -165,7 +165,7 @@ impl Harness {
         let mut command = self.command();
         command
             .env("AGENT_VM_IMAGE_TAG", reference)
-            .args(["image", "refresh"]);
+            .args(["image", "pull"]);
         bounded(command)
     }
 
@@ -642,7 +642,7 @@ fn a2_a_second_launch_is_silent_and_a_moved_tag_needs_a_refresh() {
     );
 
     // Moving the tag does not change what the warm approved launch boots, so the
-    // report stays silent until `image refresh` moves the approval.
+    // report stays silent until `image pull` moves the approval.
     let moved = h.labeled("a2-b", &[("agent.codex", "api.openai.com,b.example")]);
     server.image("images", "a2", &moved);
     let warm = h.launch(&tag);

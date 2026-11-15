@@ -22,6 +22,8 @@ allowances on intercepted ports and amends this ADR where noted. See
 [Ports & egress](../../USAGE.md#ports--egress) for the CLI grammar and DNS table;
 [CONTEXT.md](../../CONTEXT.md#egress-authority) defines the terms.
 
+`image refresh` was renamed `image pull` in 0.7.57 (#617, [ADR-0043](0043-image-command-group-and-daemon-import.md)); this record keeps the name it was decided under.
+
 ## Decision
 
 Build every tool-launch policy explicitly: default egress Deny, ingress Allow,

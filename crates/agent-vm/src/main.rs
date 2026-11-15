@@ -357,7 +357,7 @@ fn run_dispatch(dispatch: Dispatch) -> Result<()> {
                 images,
                 images_read,
             } => setup::run(args, catalog, images, images_read).await,
-            // The image group: `refresh` acquires natively and `set-default`
+            // The image group: `pull` acquires natively and `set-default`
             // retains explicitly (both carry the original catalog/images, so
             // their documented broken-config recovery is preserved), while
             // `build`/`import` are the explicit user-owned publication verbs

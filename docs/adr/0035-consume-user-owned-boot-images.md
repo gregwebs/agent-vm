@@ -30,6 +30,8 @@ established **project** keeps its own default; `image set-default` changes only
 the host's starting choice; `image refresh` asks nothing, and `--yes` is removed
 from both verbs.
 
+`image refresh` was renamed `image pull` in 0.7.57 (#617, [ADR-0043](0043-image-command-group-and-daemon-import.md)); this record keeps the name it was decided under.
+
 ## Context
 
 The image a session boots was a **consequence of the tool catalog**. Whenever a

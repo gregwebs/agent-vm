@@ -26,6 +26,8 @@ no longer validate a store or a default against the old reader's grammar. The
 reason and the replacement are recorded under Decision 5; the rest of the
 decision stands.
 
+`image refresh` was renamed `image pull` in 0.7.57 (#617, [ADR-0043](0043-image-command-group-and-daemon-import.md)); this record keeps the name it was decided under.
+
 ## Context
 
 ADR-0047 made one host-wide table answer "may this content be consumed?": the

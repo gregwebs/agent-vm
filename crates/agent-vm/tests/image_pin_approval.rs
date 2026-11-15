@@ -7,7 +7,7 @@
 //! the boundary these tests order against.
 //!
 //! The prompt-free rows run under a real pseudo-terminal (`support::pty`) as
-//! well as on a pipe: `image refresh` and `image set-default` never ask and
+//! well as on a pipe: `image pull` and `image set-default` never ask and
 //! never read stdin (#541), so a PTY row proves that nothing waits for input.
 
 use std::fs;
@@ -119,7 +119,7 @@ impl Harness {
 
     fn refresh(&self, reference: &str) -> Output {
         let mut command = self.command();
-        command.args(["image", "refresh", "--image", reference]);
+        command.args(["image", "pull", "--image", reference]);
         bounded(command)
     }
 
@@ -134,7 +134,7 @@ impl Harness {
         let mut command = self.command();
         command
             .env("AGENT_VM_IMAGE_TAG", reference)
-            .args(["image", "refresh"]);
+            .args(["image", "pull"]);
         bounded(command)
     }
 
@@ -143,7 +143,7 @@ impl Harness {
         let mut command = self.command_in(project, state);
         command
             .env("AGENT_VM_IMAGE_TAG", reference)
-            .args(["image", "refresh"]);
+            .args(["image", "pull"]);
         bounded(command)
     }
 
@@ -269,7 +269,7 @@ impl Harness {
 
     fn refresh_default(&self) -> Output {
         let mut command = self.command();
-        command.arg("image").arg("refresh");
+        command.arg("image").arg("pull");
         bounded(command)
     }
 
@@ -736,7 +736,7 @@ fn local_path_launch_is_unpinned_and_ignores_a_corrupt_store() {
     );
 }
 
-/// `image refresh` never asks: it replaces a moved mutable tag on a pipe and on
+/// `image pull` never asks: it replaces a moved mutable tag on a pipe and on
 /// a terminal alike, renders both digests, and reads no stdin (R6, B3).
 #[test]
 fn refresh_replaces_a_moved_tag_without_asking_on_a_pipe_or_a_terminal() {
@@ -798,7 +798,7 @@ fn refresh_replaces_a_moved_tag_without_asking_on_a_pipe_or_a_terminal() {
     let mut command = h.command();
     command
         .env("AGENT_VM_IMAGE_TAG", &tag)
-        .args(["image", "refresh"]);
+        .args(["image", "pull"]);
     let mut terminal = Pty::spawn(&mut command, b"Replacing the approved image for")
         .expect("open a pseudo-terminal");
     let (status, out) = terminal
@@ -828,14 +828,14 @@ fn refresh_replaces_a_moved_tag_without_asking_on_a_pipe_or_a_terminal() {
     );
 }
 
-/// A bare `image refresh` command whose ambient selection is `reference`, for a
+/// A bare `image pull` command whose ambient selection is `reference`, for a
 /// fixture that gates or peers a refresh of a reference it has not recorded a
 /// role for.
 fn refresh_as_ambient_command(h: &Harness, reference: &str) -> Command {
     let mut command = h.command();
     command
         .env("AGENT_VM_IMAGE_TAG", reference)
-        .args(["image", "refresh"]);
+        .args(["image", "pull"]);
     command
 }
 
@@ -847,7 +847,7 @@ fn command_with_refresh(h: &Harness, tag: &str) -> Command {
     // already in use, and here the row is about the reference being re-resolved.
     command
         .env("AGENT_VM_IMAGE_TAG", tag)
-        .args(["image", "refresh"]);
+        .args(["image", "pull"]);
     command
 }
 
@@ -1090,7 +1090,7 @@ fn explicit_import_then_rebuild_move_what_a_launch_boots() {
     assert_eq!(server.count(), 0, "{:?}", server.requests());
 }
 
-/// AC9/AC10: a concurrent `image refresh` that commits between this import's
+/// AC9/AC10: a concurrent `image pull` that commits between this import's
 /// observation and its commit wins, and the import reports a stale approval.
 /// The render is already on stderr at the checkpoint that precedes the commit,
 /// and the store is still on the previous digest at that instant.
@@ -1811,7 +1811,7 @@ fn projects_keep_independent_approvals_for_one_tag() {
     });
     let child_c = server.image("images", "split", &c);
     let mut command = h.command_in(&p2, p2_state.path());
-    command.args(["image", "refresh", "--image", &tag]);
+    command.args(["image", "pull", "--image", &tag]);
     let refreshed = bounded(command);
     assert!(refreshed.status.success(), "{}", stderr(&refreshed));
     assert_eq!(
@@ -2211,7 +2211,7 @@ fn a_legacy_host_wide_store_is_refused_until_upgraded() {
     };
     outputs.push(("launch", run(&["--image", &tag, "shell", "--", "true"])));
     outputs.push(("setup", run(&["setup", "--image", &tag, "--no-verify"])));
-    outputs.push(("refresh", run(&["image", "refresh", "--image", &tag])));
+    outputs.push(("pull", run(&["image", "pull", "--image", &tag])));
     outputs.push((
         "set-default",
         run(&["image", "set-default", "--image", &tag]),
@@ -2486,13 +2486,13 @@ fn a_foreign_platform_record_is_preserved_not_borrowed() {
 /// naming the resolved child, and no pin store at all.
 #[test]
 fn a_resolved_candidate_is_frozen_for_refresh_and_set_default() {
-    for verb in ["refresh", "set-default"] {
+    for verb in ["pull", "set-default"] {
         let h = Harness::new(Mode::LaunchSeam);
         let server = Server::new();
         let a = h.image(&ArchiveSpec::default());
         server.image("images", "frozen", &a);
         let tag = format!("{}/images:frozen", server.host);
-        if verb == "refresh" {
+        if verb == "pull" {
             // A refresh needs an approval to replace; the fixture is a refresh.
             assert!(h.refresh_as_ambient(&tag).status.success());
         }
@@ -2504,12 +2504,12 @@ fn a_resolved_candidate_is_frozen_for_refresh_and_set_default() {
         let start = server.requests().len();
         let mut gate = PinGate::new(h.root.path());
         let mut command = h.command();
-        if verb == "refresh" {
+        if verb == "pull" {
             // The fixture's tag must be the ambient selection to be in use.
             command
                 .env("AGENT_VM_IMAGE_TAG", &tag)
                 .arg("image")
-                .arg("refresh");
+                .arg("pull");
         } else {
             command.args(["image", verb, "--image", &tag]);
         }
@@ -2523,7 +2523,7 @@ fn a_resolved_candidate_is_frozen_for_refresh_and_set_default() {
         server.image("images", "frozen", &c);
         let after_resolve = server.requests().len();
         // A refresh commits a pin; set-default commits only the host record.
-        let stages: &[PinStage] = if verb == "refresh" {
+        let stages: &[PinStage] = if verb == "pull" {
             &[
                 PinStage::BeforePinLock,
                 PinStage::PinLocked,
@@ -2551,7 +2551,7 @@ fn a_resolved_candidate_is_frozen_for_refresh_and_set_default() {
             1,
             "{verb} must request the tag manifest once"
         );
-        if verb == "refresh" {
+        if verb == "pull" {
             assert_eq!(h.pinned_digest(), digest_of(&child_b));
             assert_eq!(
                 sdk_image(&h.launch(&tag)),
@@ -2990,7 +2990,7 @@ fn a_failed_adoption_save_keeps_the_project_default() {
 
     // The bare refresh adopts H, but its one save is refused.
     let mut gate = PinGate::new(h.root.path());
-    let peer = pin_gate::PinPeer::spawn(h.command(), &gate, &["image", "refresh"]);
+    let peer = pin_gate::PinPeer::spawn(h.command(), &gate, &["image", "pull"]);
     for stage in [
         PinStage::CandidateReady,
         PinStage::BeforePinLock,
@@ -3014,16 +3014,16 @@ fn a_failed_adoption_save_keeps_the_project_default() {
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     let text = stdout_of(&out);
     assert!(
-        text.contains("refresh [1/2]") && text.contains("failed"),
+        text.contains("pull [1/2]") && text.contains("failed"),
         "the adoption failure is a row: {text}"
     );
     assert!(
-        text.contains("refresh [2/2]")
-            && !text.contains("refresh [2/2] the default boot image (linux/arm64): failed"),
-        "the still-held old default is refreshed independently: {text}"
+        text.contains("pull [2/2]")
+            && !text.contains("pull [2/2] the default boot image (linux/arm64): failed"),
+        "the still-held old default is pulled independently: {text}"
     );
     assert!(
-        text.contains("==> image refresh: 1 succeeded, 1 failed"),
+        text.contains("==> image pull: 1 succeeded, 1 failed"),
         "{text}"
     );
     assert!(
@@ -3087,7 +3087,7 @@ fn an_unwritable_stderr_commits_no_replacement_and_no_adoption() {
     let child_b = server.image("images", "render", &b);
     assert_ne!(child_a, child_b);
 
-    let out = with_unwritable_stderr(&h, &["image", "refresh", "--image", &tag]);
+    let out = with_unwritable_stderr(&h, &["image", "pull", "--image", &tag]);
     assert_eq!(out.status.code(), Some(1), "the render failure is fatal");
     assert_eq!(
         fs::read(h.pins()).unwrap(),
@@ -3116,7 +3116,7 @@ fn an_unwritable_stderr_commits_no_replacement_and_no_adoption() {
     assert!(set_default(&h, &tag).status.success());
     let pins = fs::read(h.pins()).unwrap();
 
-    let out = with_unwritable_stderr(&h, &["image", "refresh"]);
+    let out = with_unwritable_stderr(&h, &["image", "pull"]);
     assert_eq!(out.status.code(), Some(1), "the render failure is fatal");
     assert_eq!(
         fs::read(h.pins()).unwrap(),
@@ -3201,7 +3201,7 @@ fn failed_default_restore_requires_recovery_without_losing_old_approval() {
     }
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o500)).unwrap();
     let mut cmd = h.command();
-    cmd.args(["image", "refresh", "--image", &child_a]);
+    cmd.args(["image", "pull", "--image", &child_a]);
     let out = bounded(cmd);
     fs::set_permissions(&directory, permissions).unwrap();
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
@@ -3892,7 +3892,7 @@ fn set_default_never_changes_an_established_project() {
         text.contains("This project keeps its own default boot image"),
         "{text}"
     );
-    assert!(text.contains("agent-vm image refresh"), "{text}");
+    assert!(text.contains("agent-vm image pull"), "{text}");
     assert_eq!(
         fs::read(h.pins()).unwrap(),
         pins,
@@ -3977,7 +3977,7 @@ fn refresh_adopts_the_host_default_without_asking_or_reading_stdin() {
     assert!(set_default(&h, &tag).status.success());
 
     let mut command = h.command();
-    command.arg("image").arg("refresh");
+    command.arg("image").arg("pull");
     let (out, unread) = with_unread_stdin(command, b"n\n");
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(unread, b"n\n", "stdin must be left unread");
@@ -4407,7 +4407,7 @@ fn the_yes_flag_is_removed_from_both_verbs() {
     let h = Harness::new(Mode::LaunchSeam);
     let server = Server::new();
     for args in [
-        vec!["image", "refresh", "--yes"],
+        vec!["image", "pull", "--yes"],
         vec![
             "image",
             "set-default",
@@ -4432,7 +4432,7 @@ fn the_yes_flag_is_removed_from_both_verbs() {
     }
     assert_eq!(server.count(), 0, "no registry request");
     for verb in [
-        ["image", "refresh", "--help"],
+        ["image", "pull", "--help"],
         ["image", "set-default", "--help"],
     ] {
         let mut command = h.command();
@@ -4444,6 +4444,46 @@ fn the_yes_flag_is_removed_from_both_verbs() {
             "{verb:?} must not document --yes"
         );
     }
+}
+
+/// #617: `image refresh` was renamed `image pull` with no alias (ADR-0043).
+/// Each refused argv names a reference that `image pull` would acquire from
+/// this loopback registry, so zero requests proves nothing was acquired; the
+/// control proves the registry is reachable.
+#[test]
+fn the_old_refresh_spelling_is_a_usage_error_that_touches_nothing() {
+    let h = Harness::new(Mode::StrictAcquisition);
+    let server = Server::new();
+    server.image("images", "renamed", &h.image(&ArchiveSpec::default()));
+    let tag = format!("{}/images:renamed", server.host);
+    for args in [
+        vec!["image", "refresh"],
+        vec!["image", "refresh", "--image", tag.as_str()],
+        vec!["image", "refresh", "--help"],
+        vec!["help", "image", "refresh"],
+    ] {
+        let mut command = h.command();
+        command.env("AGENT_VM_IMAGE_TAG", &tag).args(&args);
+        let out = bounded(command);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {}", stderr(&out));
+        assert!(out.stdout.is_empty(), "{args:?} prints no help or rows");
+        assert_eq!(server.count(), 0, "{args:?}: no registry request");
+        assert!(!h.pins().exists(), "{args:?} writes no image pin");
+        assert!(
+            !h.home.join(".config/agent-vm").exists(),
+            "{args:?} creates no approval or default record"
+        );
+    }
+
+    // Positive control: the renamed verb, same ambient reference, fresh harness.
+    let control = Harness::new(Mode::StrictAcquisition);
+    let out = control.refresh_as_ambient(&tag);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(server.count() > 0, "`image pull` reaches this registry");
+    assert!(
+        control.pins().exists(),
+        "`image pull` approves what it pulled"
+    );
 }
 
 /// AC14: with no host record, a bare refresh re-verifies the project's own
@@ -4469,7 +4509,7 @@ fn without_a_host_record_refresh_reverifies_the_project_default() {
     command
         .env("AGENT_VM_TEST_DEFAULT_IMAGE", &child_b)
         .arg("image")
-        .arg("refresh");
+        .arg("pull");
     let out = bounded(command);
     assert!(out.status.success(), "{}", stderr(&out));
     // AC14's other half: A is re-verified, not merely left alone.
@@ -4538,7 +4578,7 @@ fn a_bare_refresh_establishes_an_unestablished_project() {
     command
         .env("AGENT_VM_TEST_DEFAULT_IMAGE", &child)
         .arg("image")
-        .arg("refresh");
+        .arg("pull");
     let out = bounded(command);
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(
@@ -4601,7 +4641,7 @@ fn a_bare_refresh_refuses_an_unreadable_config_but_a_proven_target_works() {
                     command
                         .env("AGENT_VM_IMAGE_TAG", &reference)
                         .arg("image")
-                        .arg("refresh");
+                        .arg("pull");
                     bounded(command)
                 }
             };
@@ -5004,7 +5044,7 @@ fn refresh_adoption_never_reads_a_terminal() {
     assert!(set_default(&h, &tag).status.success());
 
     let mut command = h.command();
-    command.arg("image").arg("refresh");
+    command.arg("image").arg("pull");
     let mut terminal = Pty::spawn(&mut command, b"Adopting the host's default boot image")
         .expect("open a pseudo-terminal");
     let (status, out) = terminal
@@ -5593,7 +5633,7 @@ fn peer_refresh(h: &Harness, state: &Path, reference: &str) -> Output {
     let mut command = h.command_in(&h.project, state);
     command
         .env("AGENT_VM_IMAGE_TAG", reference)
-        .args(["image", "refresh"]);
+        .args(["image", "pull"]);
     bounded(command)
 }
 
@@ -6046,7 +6086,7 @@ fn refresh_cas_rejects_retire_reinsert_same_digest_lifetime() {
     assert_ne!(digest_of(&b_child), a_digest);
 
     let mut gate = PinGate::new(h.root.path());
-    let loser = PinPeer::spawn(h.command(), &gate, &["image", "refresh", "--image", &x_tag]);
+    let loser = PinPeer::spawn(h.command(), &gate, &["image", "pull", "--image", &x_tag]);
     gate.expect(PinStage::CandidateReady).reply(Reply::Continue);
     let locked = gate.expect(PinStage::BeforePinLock);
 
@@ -7227,7 +7267,7 @@ fn rows_of(out: &Output) -> Vec<String> {
 }
 
 /// The literal, value-free nonmember refusal this command must print.
-const NOT_A_MEMBER: &str = "`agent-vm image refresh --image REF` targets only references currently in use by this project on the host platform; the requested reference is not in that set. To acquire and approve a new boot reference, run `agent-vm setup --image REF --no-verify`; `image build` and `image import` approve their own output references. Nothing was acquired or approved.";
+const NOT_A_MEMBER: &str = "`agent-vm image pull --image REF` targets only references currently in use by this project on the host platform; the requested reference is not in that set. To acquire and approve a new boot reference, run `agent-vm setup --image REF --no-verify`; `image build` and `image import` approve their own output references. Nothing was acquired or approved.";
 
 /// AC1: a bare refresh moves the recorded Boot holder, reports the unchanged
 /// Output holder, resolves each source once, and neither creates a sandbox nor
@@ -7275,7 +7315,7 @@ fn bare_refresh_reports_moving_boot_and_unchanged_output() {
     refresh_command
         .env("FAKE_DOCKER_MARKER", &marker)
         .env("AGENT_VM_IMAGE_TAG", &boot_tag)
-        .args(["image", "refresh"]);
+        .args(["image", "pull"]);
     let refresh = bounded(refresh_command);
     assert!(!marker.exists(), "a refresh never runs Docker");
     assert_eq!(refresh.status.code(), Some(0), "{}", stderr(&refresh));
@@ -7286,7 +7326,7 @@ fn bare_refresh_reports_moving_boot_and_unchanged_output() {
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 3, "{text}");
     assert!(
-        lines[0].starts_with(&format!("==> refresh [1/2] {boot_tag} (linux/")),
+        lines[0].starts_with(&format!("==> pull [1/2] {boot_tag} (linux/")),
         "{text}"
     );
     assert!(
@@ -7298,7 +7338,7 @@ fn bare_refresh_reports_moving_boot_and_unchanged_output() {
         "{text}"
     );
     assert!(
-        lines[1].starts_with("==> refresh [2/2] the latest output image (linux/"),
+        lines[1].starts_with("==> pull [2/2] the latest output image (linux/"),
         "{text}"
     );
     assert!(
@@ -7308,7 +7348,7 @@ fn bare_refresh_reports_moving_boot_and_unchanged_output() {
         )),
         "{text}"
     );
-    assert_eq!(lines[2], "==> image refresh: 2 succeeded, 0 failed");
+    assert_eq!(lines[2], "==> image pull: 2 succeeded, 0 failed");
 
     // The approvals are exactly what the rows say.
     assert_eq!(
@@ -7424,7 +7464,7 @@ fn bare_refresh_includes_a_selection_never_prepared_since_upgrade() {
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 4, "{text}");
     assert!(
-        lines[0].starts_with(&format!("==> refresh [1/3] {c_tag} (linux/"))
+        lines[0].starts_with(&format!("==> pull [1/3] {c_tag} (linux/"))
             && lines[0].contains("approved none ->"),
         "the never-prepared ambient selection comes first: {text}"
     );
@@ -7433,14 +7473,14 @@ fn bare_refresh_includes_a_selection_never_prepared_since_upgrade() {
         "an env selection establishes nothing: {text}"
     );
     assert!(
-        lines[1].starts_with("==> refresh [2/3] the recorded boot image (linux/"),
+        lines[1].starts_with("==> pull [2/3] the recorded boot image (linux/"),
         "{text}"
     );
     assert!(
-        lines[2].starts_with("==> refresh [3/3] the latest output image (linux/"),
+        lines[2].starts_with("==> pull [3/3] the latest output image (linux/"),
         "{text}"
     );
-    assert_eq!(lines[3], "==> image refresh: 3 succeeded, 0 failed");
+    assert_eq!(lines[3], "==> image pull: 3 succeeded, 0 failed");
     // C is approved as a new, unheld record; the historical U is untouched.
     assert_eq!(
         h.pin_in(&h.project, &c_tag).map(|(digest, _)| digest),
@@ -7471,7 +7511,7 @@ fn bare_refresh_includes_a_selection_never_prepared_since_upgrade() {
     assert_eq!(refresh.status.code(), Some(0), "{}", stderr(&refresh));
     let text = stdout_of(&refresh);
     assert_eq!(text.lines().count(), 2, "{text}");
-    assert!(text.contains("==> refresh [1/1]"), "{text}");
+    assert!(text.contains("==> pull [1/1]"), "{text}");
     assert_eq!(
         fresh.pin_in(&fresh.project, &only_tag).map(|(d, _)| d),
         Some(digest_of(&child))
@@ -7625,7 +7665,7 @@ fn targeted_refresh_updates_only_the_in_use_target() {
     let refresh = h.refresh(&output_tag);
     assert_eq!(refresh.status.code(), Some(0), "{}", stderr(&refresh));
     let text = stdout_of(&refresh);
-    assert!(text.contains("==> refresh [1/1]"), "{text}");
+    assert!(text.contains("==> pull [1/1]"), "{text}");
     assert!(
         text.contains(&format!(
             "changed {} -> {}; default=unchanged",
@@ -7684,7 +7724,7 @@ fn targeted_refresh_updates_only_the_in_use_target() {
     assert_eq!(refresh.status.code(), Some(0), "{}", stderr(&refresh));
     let text = stdout_of(&refresh);
     assert!(
-        text.contains("==> refresh [1/1]") && !text.contains("[2/1]"),
+        text.contains("==> pull [1/1]") && !text.contains("[2/1]"),
         "a shared key is one target: {text}"
     );
     assert_eq!(
@@ -7855,12 +7895,12 @@ fn refresh_env_selects_ambient_without_filtering_the_worklist() {
     let mut command = h.command();
     command
         .env("AGENT_VM_IMAGE_TAG", &env_tag)
-        .args(["image", "refresh", "--image", &output_tag]);
+        .args(["image", "pull", "--image", &output_tag]);
     let filtered = bounded(command);
     assert_eq!(filtered.status.code(), Some(0), "{}", stderr(&filtered));
     let text = stdout_of(&filtered);
     assert_eq!(text.lines().count(), 2, "{text}");
-    assert!(text.contains("==> refresh [1/1]"), "{text}");
+    assert!(text.contains("==> pull [1/1]"), "{text}");
     assert!(
         text.contains(&digest_of(&output_o1)),
         "the typed filter refreshed its own target: {text}"
@@ -7876,7 +7916,7 @@ fn refresh_env_selects_ambient_without_filtering_the_worklist() {
     let mut command = h.command();
     command
         .env("AGENT_VM_IMAGE_TAG", "")
-        .args(["image", "refresh"]);
+        .args(["image", "pull"]);
     let empty = bounded(command);
     assert_eq!(empty.status.code(), Some(0), "{}", stderr(&empty));
     let text = stdout_of(&empty);
@@ -7884,7 +7924,7 @@ fn refresh_env_selects_ambient_without_filtering_the_worklist() {
         text.lines()
             .next()
             .unwrap()
-            .starts_with(&format!("==> refresh [1/2] {boot_tag} (linux/")),
+            .starts_with(&format!("==> pull [1/2] {boot_tag} (linux/")),
         "an empty env falls through to the configured selection: {text}"
     );
     assert!(
@@ -7898,11 +7938,11 @@ fn refresh_env_selects_ambient_without_filtering_the_worklist() {
     let mut command = h.command();
     command
         .env("AGENT_VM_IMAGE_TAG", &env_tag)
-        .args(["image", "refresh", "--image", &env_tag]);
+        .args(["image", "pull", "--image", &env_tag]);
     let same = bounded(command);
     assert_eq!(same.status.code(), Some(0), "{}", stderr(&same));
     let text = stdout_of(&same);
-    assert!(text.contains("==> refresh [1/1]"), "{text}");
+    assert!(text.contains("==> pull [1/1]"), "{text}");
     assert_eq!(manifest_requests(&server, requests_before, "ac6env"), 1);
     let _ = (boot_b, o);
 }
@@ -8039,7 +8079,7 @@ fn refresh_partial_progress_survives_failure_in_either_order() {
             text.lines()
                 .next()
                 .unwrap()
-                .starts_with(&format!("==> refresh [1/2] {} (linux/", fixture.boot_tag))
+                .starts_with(&format!("==> pull [1/2] {} (linux/", fixture.boot_tag))
                 && text.lines().next().unwrap().contains("failed"),
             "{text}"
         );
@@ -8047,7 +8087,7 @@ fn refresh_partial_progress_survives_failure_in_either_order() {
             text.lines()
                 .nth(1)
                 .unwrap()
-                .starts_with("==> refresh [2/2] the latest output image (linux/")
+                .starts_with("==> pull [2/2] the latest output image (linux/")
                 && text.lines().nth(1).unwrap().contains(&format!(
                     "changed {} -> {}; default=unchanged",
                     digest_of(&fixture.output_child),
@@ -8057,7 +8097,7 @@ fn refresh_partial_progress_survives_failure_in_either_order() {
         );
         assert_eq!(
             text.lines().nth(2).unwrap(),
-            "==> image refresh: 1 succeeded, 1 failed"
+            "==> image pull: 1 succeeded, 1 failed"
         );
         // Only target 2's commit survives, byte for byte.
         assert_eq!(fs::read(h.pins()).unwrap(), snapshot);
@@ -8148,13 +8188,13 @@ fn refresh_partial_progress_survives_failure_in_either_order() {
             text.lines()
                 .nth(1)
                 .unwrap()
-                .starts_with("==> refresh [2/2] the latest output image (linux/")
+                .starts_with("==> pull [2/2] the latest output image (linux/")
                 && text.lines().nth(1).unwrap().contains("failed"),
             "{text}"
         );
         assert_eq!(
             text.lines().nth(2).unwrap(),
-            "==> image refresh: 1 succeeded, 1 failed"
+            "==> image pull: 1 succeeded, 1 failed"
         );
         // The successful first commit is intact and the failed second target's
         // record is untouched.
@@ -8197,7 +8237,7 @@ fn refresh_establishment_belongs_only_to_the_ambient_default_target() {
     let mut command = h.command();
     command
         .env("AGENT_VM_TEST_DEFAULT_IMAGE", &recommended)
-        .args(["image", "refresh"]);
+        .args(["image", "pull"]);
     let out = bounded(command);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     let text = stdout_of(&out);
@@ -8238,7 +8278,7 @@ fn refresh_establishment_belongs_only_to_the_ambient_default_target() {
     let mut command = failed.command();
     command
         .env("AGENT_VM_TEST_DEFAULT_IMAGE", &recommended)
-        .args(["image", "refresh"]);
+        .args(["image", "pull"]);
     gate.attach(&mut command);
     let mut child = command
         .stdout(std::process::Stdio::piped())
@@ -8267,7 +8307,7 @@ fn refresh_establishment_belongs_only_to_the_ambient_default_target() {
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     let text = stdout_of(&out);
     assert!(
-        text.contains("==> image refresh: 1 succeeded, 1 failed"),
+        text.contains("==> image pull: 1 succeeded, 1 failed"),
         "{text}"
     );
     assert!(
@@ -8298,7 +8338,7 @@ fn refresh_establishment_belongs_only_to_the_ambient_default_target() {
     let mut command = explicit.command();
     command
         .env("AGENT_VM_TEST_DEFAULT_IMAGE", &recommended)
-        .args(["image", "refresh", "--image", &recommended]);
+        .args(["image", "pull", "--image", &recommended]);
     let out = bounded(command);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert!(
@@ -8324,7 +8364,7 @@ fn establish_default_unheld(h: &Harness, server: &Server, prefix: &str) -> Strin
     let mut command = h.command();
     command
         .env("AGENT_VM_TEST_DEFAULT_IMAGE", &recommended)
-        .args(["image", "refresh"]);
+        .args(["image", "pull"]);
     let out = bounded(command);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert_eq!(
@@ -8374,7 +8414,7 @@ fn refresh_adoption_supersedes_an_unheld_default_without_acquiring_it() {
     let rows = rows_of(&out);
     assert_eq!(rows.len(), 2, "{text}");
     assert!(
-        rows[0].starts_with("==> refresh [1/1] the default boot image (linux/"),
+        rows[0].starts_with("==> pull [1/1] the default boot image (linux/"),
         "{text}"
     );
     assert!(
@@ -8386,7 +8426,7 @@ fn refresh_adoption_supersedes_an_unheld_default_without_acquiring_it() {
         )),
         "{text}"
     );
-    assert_eq!(rows[1], "==> image refresh: 1 succeeded, 0 failed");
+    assert_eq!(rows[1], "==> image pull: 1 succeeded, 0 failed");
     assert!(
         text.lines().next().unwrap() == "==> this project now uses the host's default boot image",
         "the adoption notice precedes the row: {text}"
@@ -8452,7 +8492,7 @@ fn refresh_adoption_deduplicates_the_offer_and_preserves_old_holders() {
         "{text}"
     );
     assert!(
-        rows[1].starts_with("==> refresh [2/2] the recorded boot image (linux/"),
+        rows[1].starts_with("==> pull [2/2] the recorded boot image (linux/"),
         "the still-held old default is refreshed independently: {text}"
     );
     assert!(rows[1].contains("unchanged"), "{text}");
@@ -8521,7 +8561,7 @@ fn refresh_adoption_deduplicates_the_offer_and_preserves_old_holders() {
         "H is the ambient operation: {text}"
     );
     assert!(
-        rows[1].starts_with("==> refresh [2/2] the latest output image (linux/")
+        rows[1].starts_with("==> pull [2/2] the latest output image (linux/")
             && rows[1].contains(&digest_of(&output_child)),
         "{text}"
     );
@@ -8577,7 +8617,7 @@ fn refresh_adoption_success_survives_held_default_failure() {
 
     let mut gate = PinGate::new(h.root.path());
     let mut command = h.command();
-    command.args(["image", "refresh"]);
+    command.args(["image", "pull"]);
     gate.attach(&mut command);
     let child = command
         .stdout(std::process::Stdio::piped())
@@ -8615,11 +8655,11 @@ fn refresh_adoption_success_survives_held_default_failure() {
         "{text}"
     );
     assert!(
-        rows[1].starts_with("==> refresh [2/2] the recorded boot image (linux/")
+        rows[1].starts_with("==> pull [2/2] the recorded boot image (linux/")
             && rows[1].contains("failed"),
         "{text}"
     );
-    assert_eq!(rows[2], "==> image refresh: 1 succeeded, 1 failed");
+    assert_eq!(rows[2], "==> image pull: 1 succeeded, 1 failed");
     assert_eq!(
         fs::read(h.pins()).unwrap(),
         adoption_snapshot,
@@ -8668,7 +8708,7 @@ fn refresh_adoption_failure_allows_held_default_success() {
 
     let mut gate = PinGate::new(h.root.path());
     let mut command = h.command();
-    command.args(["image", "refresh"]);
+    command.args(["image", "pull"]);
     gate.attach(&mut command);
     let child = command
         .stdout(std::process::Stdio::piped())
@@ -8702,11 +8742,11 @@ fn refresh_adoption_failure_allows_held_default_success() {
         "{text}"
     );
     assert!(
-        rows[1].starts_with("==> refresh [2/2] the recorded boot image (linux/")
+        rows[1].starts_with("==> pull [2/2] the recorded boot image (linux/")
             && rows[1].contains(&format!("unchanged {}", digest_of(&default_child))),
         "{text}"
     );
-    assert_eq!(rows[2], "==> image refresh: 1 succeeded, 1 failed");
+    assert_eq!(rows[2], "==> image pull: 1 succeeded, 1 failed");
     assert!(
         h.pin_in(&h.project, &host_child).is_none(),
         "the refused adoption inserted no H approval"
@@ -8905,7 +8945,7 @@ fn refresh_default_failures_do_not_block_recorded_output() {
         text.lines()
             .next()
             .unwrap()
-            .starts_with("==> refresh [1/2] the default boot image (linux/")
+            .starts_with("==> pull [1/2] the default boot image (linux/")
             && text.lines().next().unwrap().contains("failed"),
         "{text}"
     );
@@ -8913,7 +8953,7 @@ fn refresh_default_failures_do_not_block_recorded_output() {
         text.lines()
             .nth(1)
             .unwrap()
-            .starts_with("==> refresh [2/2] the latest output image (linux/")
+            .starts_with("==> pull [2/2] the latest output image (linux/")
             && text.lines().nth(1).unwrap().contains(&format!(
                 "changed {} -> {}",
                 digest_of(&output_child),
@@ -8923,7 +8963,7 @@ fn refresh_default_failures_do_not_block_recorded_output() {
     );
     assert_eq!(
         text.lines().nth(2).unwrap(),
-        "==> image refresh: 1 succeeded, 1 failed"
+        "==> image pull: 1 succeeded, 1 failed"
     );
     assert_eq!(
         h.record_in(&h.project, &default_child),
@@ -8986,7 +9026,7 @@ fn refresh_adoption_rejects_a_retired_observed_host_pin() {
 
     let mut gate = PinGate::new(h.root.path());
     let mut command = h.command();
-    command.args(["image", "refresh"]);
+    command.args(["image", "pull"]);
     gate.attach(&mut command);
     let mut child = command
         .stdout(std::process::Stdio::piped())
@@ -9051,7 +9091,7 @@ fn refresh_adoption_rejects_a_retired_observed_host_pin() {
         "{text}"
     );
     assert!(
-        rows[1].starts_with("==> refresh [2/2] the latest output image (linux/")
+        rows[1].starts_with("==> pull [2/2] the latest output image (linux/")
             && rows[1].contains(&format!(
                 "changed {} -> {}",
                 digest_of(&output_child),
@@ -9059,7 +9099,7 @@ fn refresh_adoption_rejects_a_retired_observed_host_pin() {
             )),
         "{text}"
     );
-    assert_eq!(rows[2], "==> image refresh: 1 succeeded, 1 failed");
+    assert_eq!(rows[2], "==> image pull: 1 succeeded, 1 failed");
     // H is still absent, the peer's R records survive, and the bookmark is D.
     assert!(
         h.pin_in(&h.project, &host_child).is_none(),
@@ -9117,7 +9157,7 @@ fn refresh_adoption_inserts_a_genuinely_absent_host_pin() {
 
     let mut gate = PinGate::new(h.root.path());
     let mut command = h.command();
-    command.args(["image", "refresh"]);
+    command.args(["image", "pull"]);
     gate.attach(&mut command);
     let child = command
         .stdout(std::process::Stdio::piped())
@@ -9352,11 +9392,11 @@ fn multi_refresh_stale_target_does_not_cancel_other_targets() {
         "{text}"
     );
     assert!(
-        rows[1].starts_with("==> refresh [2/2] the latest output image (linux/")
+        rows[1].starts_with("==> pull [2/2] the latest output image (linux/")
             && rows[1].contains(&digest_of(&output_o1)),
         "{text}"
     );
-    assert_eq!(rows[2], "==> image refresh: 1 succeeded, 1 failed");
+    assert_eq!(rows[2], "==> image pull: 1 succeeded, 1 failed");
     // The peer's reinserted record survives untouched, and the sibling committed.
     assert_eq!(
         h.pin_in(&h.project, &fixture.boot_tag),
@@ -9445,7 +9485,7 @@ fn multi_refresh_immutable_integrity_failure_is_not_a_skip() {
         )),
         "the sibling still commits: {text}"
     );
-    assert_eq!(rows[2], "==> image refresh: 1 succeeded, 1 failed");
+    assert_eq!(rows[2], "==> image pull: 1 succeeded, 1 failed");
     // X's authority is exactly as it was.
     let x_after = h.record_in(&h.project, &index_pin).unwrap();
     assert_eq!(x_after, x_record, "the immutable approval is unchanged");
@@ -9537,8 +9577,8 @@ fn refresh_damaged_authority_fails_before_any_registry_request() {
             let mut cmd = h.command();
             cmd.env("AGENT_VM_IMAGE_TAG", &ambient_tag);
             match command {
-                None => cmd.args(["image", "refresh"]),
-                Some(target) => cmd.args(["image", "refresh", "--image", target]),
+                None => cmd.args(["image", "pull"]),
+                Some(target) => cmd.args(["image", "pull", "--image", target]),
             };
             let out = bounded(cmd);
             assert_eq!(out.status.code(), Some(1), "{label}: {}", stderr(&out));
@@ -9548,7 +9588,7 @@ fn refresh_damaged_authority_fails_before_any_registry_request() {
                 "{label}: the {damage:?} damage is refused with the exact generic text"
             );
             assert!(
-                !stdout_of(&out).contains("==> image refresh:"),
+                !stdout_of(&out).contains("==> image pull:"),
                 "{label}: no summary pretends work happened: {}",
                 stdout_of(&out)
             );
@@ -9668,7 +9708,7 @@ fn multi_refresh_never_reads_pipe_or_terminal_input() {
 
     // No `--yes`: this command never asks, so the flag cannot exist.
     let mut command = h.command();
-    command.args(["image", "refresh", "--yes"]);
+    command.args(["image", "pull", "--yes"]);
     let out = bounded(command);
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
 }
@@ -9702,17 +9742,17 @@ fn multi_refresh_render_failure_preserves_that_target_only() {
         rows[0].contains("[1/2]")
             && rows[0].contains("failed")
             && rows[0].contains(
-                "the image approval change for this refresh operation could not be shown; this \
+                "the image approval change for this pull operation could not be shown; this \
              operation committed no approval or project-default change"
             ),
         "{text}"
     );
     assert!(
-        rows[1].starts_with("==> refresh [2/2] the latest output image (linux/")
+        rows[1].starts_with("==> pull [2/2] the latest output image (linux/")
             && rows[1].contains(&format!("unchanged {}", digest_of(&fixture.output_child))),
         "the unrelated unchanged target still reports: {text}"
     );
-    assert_eq!(rows[2], "==> image refresh: 1 succeeded, 1 failed");
+    assert_eq!(rows[2], "==> image pull: 1 succeeded, 1 failed");
     // Nothing was committed for either operation.
     assert_eq!(fs::read(h.pins()).unwrap(), before);
     assert_ne!(
@@ -9785,15 +9825,15 @@ fn multi_refresh_later_render_failure_reports_only_that_operation() {
         "{text}"
     );
     assert!(
-        rows[1].starts_with("==> refresh [2/2] the latest output image (linux/")
+        rows[1].starts_with("==> pull [2/2] the latest output image (linux/")
             && rows[1].contains("failed")
             && rows[1].contains(
-                "the image approval change for this refresh operation could not be shown; this \
+                "the image approval change for this pull operation could not be shown; this \
                  operation committed no approval or project-default change"
             ),
         "{text}"
     );
-    assert_eq!(rows[2], "==> image refresh: 1 succeeded, 1 failed");
+    assert_eq!(rows[2], "==> image pull: 1 succeeded, 1 failed");
     // The first commit is intact; the second operation committed nothing.
     assert_eq!(fs::read(h.pins()).unwrap(), boot_snapshot);
     assert_eq!(
@@ -9981,21 +10021,21 @@ fn multi_refresh_closed_stderr_contention_preserves_progress() {
             assert_eq!(rows.len(), 3, "{text}");
             assert!(rows[0].contains("changed"), "{text}");
             assert!(
-                rows[1].starts_with("==> refresh [2/2] the latest output image (linux/")
+                rows[1].starts_with("==> pull [2/2] the latest output image (linux/")
                     && rows[1].contains("failed"),
                 "a real failure is still reported after lost stderr: {text}"
             );
-            assert_eq!(rows[2], "==> image refresh: 1 succeeded, 1 failed");
+            assert_eq!(rows[2], "==> image pull: 1 succeeded, 1 failed");
         } else {
             assert_eq!(out.status.code(), Some(0), "{text}");
             assert_eq!(rows.len(), 3, "{text}");
             assert!(rows[0].contains(&digest_of(&boot_b1)), "{text}");
             assert!(
-                rows[1].starts_with("==> refresh [2/2] the latest output image (linux/")
+                rows[1].starts_with("==> pull [2/2] the latest output image (linux/")
                     && rows[1].contains(&format!("unchanged {}", digest_of(&fixture.output_child))),
                 "{text}"
             );
-            assert_eq!(rows[2], "==> image refresh: 2 succeeded, 0 failed");
+            assert_eq!(rows[2], "==> image pull: 2 succeeded, 0 failed");
         }
         // The first target's commit is byte-identical, and the whole file is that
         // snapshot: the later operation saved nothing.
@@ -10082,7 +10122,7 @@ fn multi_refresh_closed_stderr_authority_contention_preserves_progress() {
                 rows[1].contains("failed"),
                 "the real authority failure is reported: {text}"
             );
-            assert_eq!(rows[2], "==> image refresh: 1 succeeded, 1 failed");
+            assert_eq!(rows[2], "==> image pull: 1 succeeded, 1 failed");
         } else {
             assert_eq!(out.status.code(), Some(0), "{text}");
             assert_eq!(rows.len(), 3, "{text}");
@@ -10090,7 +10130,7 @@ fn multi_refresh_closed_stderr_authority_contention_preserves_progress() {
                 rows[1].contains(&format!("unchanged {}", digest_of(&fixture.output_child))),
                 "{text}"
             );
-            assert_eq!(rows[2], "==> image refresh: 2 succeeded, 0 failed");
+            assert_eq!(rows[2], "==> image pull: 2 succeeded, 0 failed");
         }
         assert_eq!(fs::read(h.pins()).unwrap(), boot_snapshot);
         assert_eq!(
@@ -10150,7 +10190,7 @@ fn multi_refresh_closed_stdout_preserves_progress() {
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     let text = stderr(&out);
     assert_eq!(
-        text.matches("warning: image refresh outcomes could not all be written; completed approvals remain committed; do not retry it as a failed approval").count(),
+        text.matches("warning: image pull outcomes could not all be written; completed approvals remain committed; do not retry it as a failed approval").count(),
         1,
         "exactly one bounded warning: {text}"
     );
@@ -10251,7 +10291,7 @@ fn multi_refresh_redacts_record_sourced_references() {
     let mut establish = h.command();
     establish
         .env("AGENT_VM_TEST_DEFAULT_IMAGE", &default_child)
-        .args(["image", "refresh"]);
+        .args(["image", "pull"]);
     assert_eq!(bounded(establish).status.code(), Some(0));
     assert!(
         default_child.contains("private-default"),
@@ -10284,7 +10324,7 @@ fn multi_refresh_redacts_record_sourced_references() {
     command
         .env("AGENT_VM_DEBUG_CONFIG", "1")
         .env("RUST_LOG", "trace")
-        .args(["image", "refresh"]);
+        .args(["image", "pull"]);
     let out = bounded(command);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     let delivered = format!("{}{}", stdout_of(&out), stderr(&out));
@@ -10303,7 +10343,7 @@ fn multi_refresh_redacts_record_sourced_references() {
     // An explicit filter is allowed to show its own escaped reference (before the
     // route is denied below).
     let mut command = h.command();
-    command.args(["image", "refresh", "--image", &holder_tag]);
+    command.args(["image", "pull", "--image", &holder_tag]);
     let out = bounded(command);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert!(
@@ -10324,7 +10364,7 @@ fn multi_refresh_redacts_record_sourced_references() {
     command
         .env("AGENT_VM_DEBUG_CONFIG", "1")
         .env("RUST_LOG", "trace")
-        .args(["image", "refresh"]);
+        .args(["image", "pull"]);
     let out = bounded(command);
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     let delivered = format!("{}{}", stdout_of(&out), stderr(&out));
@@ -10500,18 +10540,18 @@ fn refresh_capacity_failure_is_an_operation_row_and_siblings_continue() {
     // Ambient insertion, then the two recorded holders in canonical order.
     assert_eq!(rows.len(), 4, "{text}");
     assert!(
-        rows[0].starts_with(&format!("==> refresh [1/3] {ambient_tag} (linux/"))
+        rows[0].starts_with(&format!("==> pull [1/3] {ambient_tag} (linux/"))
             && rows[0].contains("failed")
             && rows[0].contains("holds the maximum number of approvals")
             && rows[0].contains("this proposed pin-store update was not committed"),
         "a capacity failure is an operation row with update-local wording: {text}"
     );
     assert!(
-        rows[1].starts_with("==> refresh [2/3] the recorded boot image (linux/"),
+        rows[1].starts_with("==> pull [2/3] the recorded boot image (linux/"),
         "{text}"
     );
     assert!(
-        rows[2].starts_with("==> refresh [3/3] the latest output image (linux/"),
+        rows[2].starts_with("==> pull [3/3] the latest output image (linux/"),
         "{text}"
     );
     assert!(
@@ -10522,7 +10562,7 @@ fn refresh_capacity_failure_is_an_operation_row_and_siblings_continue() {
         )),
         "{text}"
     );
-    assert_eq!(rows[3], "==> image refresh: 2 succeeded, 1 failed");
+    assert_eq!(rows[3], "==> image pull: 2 succeeded, 1 failed");
     // Neither stream claims nothing was approved, and the sibling's commit is real.
     let delivered = format!("{}{}", text, stderr(&out));
     for blanket in ["nothing was approved", "nothing was acquired or approved"] {
@@ -10612,12 +10652,12 @@ fn refresh_late_sequence_exhaustion_keeps_the_earlier_commit() {
         "{text}"
     );
     assert!(
-        rows[1].starts_with("==> refresh [2/2] the latest output image (linux/")
+        rows[1].starts_with("==> pull [2/2] the latest output image (linux/")
             && rows[1].contains("failed")
             && rows[1].contains("this proposed pin-store update was not committed"),
         "the later save failure is update-local: {text}"
     );
-    assert_eq!(rows[2], "==> image refresh: 1 succeeded, 1 failed");
+    assert_eq!(rows[2], "==> image pull: 1 succeeded, 1 failed");
     let delivered = format!("{}{}", text, stderr(&out));
     for blanket in ["nothing was approved", "nothing was acquired or approved"] {
         assert!(
@@ -10676,7 +10716,7 @@ fn refresh_adoption_changed_observed_host_is_stale_and_siblings_continue() {
 
     let mut gate = PinGate::new(h.root.path());
     let mut command = h.command();
-    command.args(["image", "refresh"]);
+    command.args(["image", "pull"]);
     gate.attach(&mut command);
     let child = command
         .stdout(std::process::Stdio::piped())
@@ -10741,7 +10781,7 @@ fn refresh_adoption_changed_observed_host_is_stale_and_siblings_continue() {
         "integrity is reserved for matching live content: {text}"
     );
     assert!(
-        rows[1].starts_with("==> refresh [2/2] the latest output image (linux/")
+        rows[1].starts_with("==> pull [2/2] the latest output image (linux/")
             && rows[1].contains(&format!(
                 "changed {} -> {}",
                 digest_of(&output_child),
@@ -10749,7 +10789,7 @@ fn refresh_adoption_changed_observed_host_is_stale_and_siblings_continue() {
             )),
         "{text}"
     );
-    assert_eq!(rows[2], "==> image refresh: 1 succeeded, 1 failed");
+    assert_eq!(rows[2], "==> image pull: 1 succeeded, 1 failed");
     assert_eq!(
         h.default_record_in(&h.project).unwrap()["image"],
         serde_json::Value::String(default_child.clone()),
@@ -10863,7 +10903,7 @@ fn refresh_input_refusals_precede_any_state() {
     let mut command = h.command();
     command
         .env("AGENT_VM_IMAGE_TAG", std::ffi::OsStr::from_bytes(b"\xff"))
-        .args(["image", "refresh"]);
+        .args(["image", "pull"]);
     let out = bounded(command);
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     assert!(

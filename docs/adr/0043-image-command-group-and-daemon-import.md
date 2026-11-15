@@ -23,7 +23,10 @@ that build publishes through this same module without approving anything.
 Amended in **0.7.47** by [ADR-0067](0067-project-default-boot-image.md): `--yes`
 is removed from both update verbs, and an explicit `image refresh` is now also
 its own consent, so build, import **and** refresh approve a replacement without
-a prompt. The "Nested `--yes`" decision below is historical.
+a prompt. The "Nested `--yes`" decision below is historical. Amended in
+**0.7.57** by #617: `image refresh` is renamed `image pull`, with no alias. A
+pull still contacts the registry; an imported, registry-less reference needs no
+pull.
 
 ## Context
 
@@ -53,7 +56,7 @@ Docker daemon / archive → image import ─────────────
   stages privately and calls native `load_archive`.
 - No `build` alias (ADR-0035's no-shim decision and ADR-0042's single surface).
   `image` is reserved; `build` is available to configured tools.
-- Launch/`image refresh`/setup registry failures for explicit mutable tags get a text-only
+- Launch/`image pull`/setup registry failures for explicit mutable tags get a text-only
   import hint, with the original error chain retained. Digests and redacted
   defaults get no hint. No launch runs Docker or falls back to import, except the
   explicit `--dockerfile` launch build of
@@ -162,7 +165,7 @@ From #391, a rebuild or re-import under an approved result reference switches th
 next launch of that reference to the new bytes, with no prompt and no registry
 request. Importing over an *alias* does not: an archive-supplied name never
 approves anything, so a reference approved earlier keeps its digest until that
-reference is itself published or refreshed. A daemon-only image therefore needs
-no `image refresh` to become launchable — importing it under the reference you
+reference is itself published or pulled. A daemon-only image therefore needs
+no `image pull` to become launchable — importing it under the reference you
 will select is enough. The multi-alias rollback limitation above still applies
 to the cache, not to approval.
