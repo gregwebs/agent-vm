@@ -225,6 +225,21 @@ fn run_dispatch(dispatch: Dispatch) -> Result<()> {
         return tools_cmd::run(args);
     }
 
+    // `image pins` lists this project's approvals (ADR-0068). It has its own
+    // branch rather than joining `show` below: approvals do not depend on the
+    // carried catalog or configuration, so a broken configuration (which `show`
+    // refuses) must not take the listing down. Destructuring neither `catalog`
+    // nor `images` is what states that: the parse-time `config::load` still runs
+    // to define the verbs, and its failure is carried as data nothing here reads.
+    if let Dispatch::Builtin {
+        cmd: Cmd::Image(args),
+        ..
+    } = &dispatch
+        && args.is_pins()
+    {
+        return image_cmd::pins();
+    }
+
     // `image show` reports the selection a launch *here* would make (#373). It
     // is a read-only, offline observation, so it returns before the MSB
     // prologue, the embedded-runtime extraction and the Tokio runtime: it must
@@ -256,7 +271,6 @@ fn run_dispatch(dispatch: Dispatch) -> Result<()> {
     {
         image_cmd::preflight(args)?;
     }
-
     // Capture while no child has inherited selected values and removal cannot
     // race a Tokio worker's environment read (#163).
     let credential_preflight = match &dispatch {

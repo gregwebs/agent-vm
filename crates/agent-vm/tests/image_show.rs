@@ -204,6 +204,40 @@ const CALIBRATION_ARG: &str = "--calibration";
 const CALIBRATION_ATTEMPTS: usize = 10;
 const CALIBRATION_RETRY_DELAY: Duration = Duration::from_millis(1);
 
+/// How long the harness waits for a free executable inode: a total attempt
+/// count and the sleep between attempts.
+///
+/// Two callers need different bounds for the same `ETXTBSY` rule. A decoy is
+/// written and executed by this thread alone, so its window is a scheduling
+/// tick; a copied launcher's window is the duration of a concurrent `fs::copy`
+/// (see [`retry_executable_file_busy`]), which is why that one gets the larger
+/// budget — still about a second in total, so a genuine problem fails fast.
+#[derive(Clone, Copy, Debug)]
+struct RetryBound {
+    attempts: usize,
+    delay: Duration,
+}
+
+impl RetryBound {
+    /// [`CALIBRATION_ATTEMPTS`] launches, [`CALIBRATION_RETRY_DELAY`] apart.
+    const DECOY: Self = Self {
+        attempts: CALIBRATION_ATTEMPTS,
+        delay: CALIBRATION_RETRY_DELAY,
+    };
+    /// Spawning a binary this process just copied: 20 attempts 50 ms apart, at
+    /// most about one second.
+    const COPIED_BINARY: Self = Self {
+        attempts: 20,
+        delay: Duration::from_millis(50),
+    };
+
+    /// The whole wait this bound allows, for the diagnostics and for the
+    /// property row that pins "about a second, never a hang".
+    fn total(&self) -> Duration {
+        self.delay * u32::try_from(self.attempts.saturating_sub(1)).unwrap_or(u32::MAX)
+    }
+}
+
 /// The final launch error and the number of launches the bound allowed; the
 /// count separates an exhaustion from an error that was never retried.
 #[derive(Debug)]
@@ -228,20 +262,54 @@ impl AttemptFailure {
             self.error.raw_os_error()
         )
     }
+
+    /// [`Self::message`] for a spawn that is not a decoy launch: the program is
+    /// named, and a busy inode is spelled out as `ETXTBSY` with its measurable
+    /// cause, so the next CI failure is diagnosable from the panic alone.
+    fn spawn_message(&self, program: &Path) -> String {
+        let busy = if self.error.raw_os_error() == Some(libc::ETXTBSY) {
+            " (ETXTBSY: another live process still held this executable open for writing \
+             — typically a concurrent fs::copy of the same file)"
+                .to_string()
+        } else {
+            String::new()
+        };
+        format!(
+            "spawning {} failed after {} attempt(s): {}{busy} (kind {:?}, errno {:?})",
+            program.display(),
+            self.attempts,
+            self.error,
+            self.error.kind(),
+            self.error.raw_os_error()
+        )
+    }
 }
 
-/// Retry only a busy executable inode, and only within the measured bound.
+/// Retry only a busy executable inode, and only within the caller's bound.
 ///
 /// Linux refuses `execve` with `ETXTBSY` while any process still holds a
-/// writable reference to the file. The fixture writes, chmods and immediately
-/// executes each decoy, and parallel Linux stress reproduced both the busy
-/// launch and the lost marker, which is what the bound removes. The hosted CI
-/// errno and the owner of any competing writable reference were never
-/// measured, so this explains a plausible failure mode rather than proving the
-/// CI failure's cause. Every other launch error (missing interpreter,
+/// writable reference to the file. Two fixtures here reach that state, for the
+/// same reason: they write or copy an executable and then run it, while other
+/// threads in this process are spawning children. A `fork` copies every open
+/// descriptor, so a child forked by *another* thread inherits this thread's
+/// writable copy target and keeps the inode busy until that child exits.
+///
+/// That cause is measured, not inferred: CI job 132672811199 (PR #625, commit
+/// a04c140c) failed the copied-binary row with
+/// `spawn agent-vm: Os { code: 26, kind: ExecutableFileBusy }` at
+/// `image_show.rs:509` while a concurrent `fs::copy` of the same path was in
+/// flight. Before that measurement the decoy half had only a local stress
+/// matrix — 291 of 10,000 parallel fixtures losing a marker without the retry,
+/// none with it — as its explanation.
+///
+/// The bound is a wait for a transient inode, not a promise that every
+/// competing writer releases it: [`RetryBound::total`] caps the wait at about a
+/// second for a copied binary, and an exhausted bound fails with the concrete
+/// errno and programme. Every other launch error (missing interpreter,
 /// permission, ...) is final, as is any child that did run: retrying those
 /// would hide a broken fixture.
 fn retry_executable_file_busy<T>(
+    bound: RetryBound,
     mut attempt: impl FnMut() -> io::Result<T>,
 ) -> Result<T, AttemptFailure> {
     let mut attempts = 0;
@@ -250,10 +318,9 @@ fn retry_executable_file_busy<T>(
         match attempt() {
             Ok(value) => return Ok(value),
             Err(error)
-                if error.raw_os_error() == Some(libc::ETXTBSY)
-                    && attempts < CALIBRATION_ATTEMPTS =>
+                if error.raw_os_error() == Some(libc::ETXTBSY) && attempts < bound.attempts =>
             {
-                std::thread::sleep(CALIBRATION_RETRY_DELAY);
+                std::thread::sleep(bound.delay);
             }
             Err(error) => return Err(AttemptFailure { error, attempts }),
         }
@@ -269,7 +336,7 @@ fn run_decoy(path: &Path) -> io::Result<Output> {
 
 /// Execute a freshly written decoy directly, capturing its status and output.
 fn launch_decoy(path: &Path) -> Result<Output, AttemptFailure> {
-    retry_executable_file_busy(|| run_decoy(path))
+    retry_executable_file_busy(RetryBound::DECOY, || run_decoy(path))
 }
 
 /// The exact bytes the decoy's `printf '%s %s\n' "$0" "$*"` appends. The
@@ -500,13 +567,21 @@ impl Fixture {
 
     /// Bounded: a wedged child (a FIFO read, a synchronous registry fetch) is a
     /// failure of the case, never a hung suite.
+    ///
+    /// The spawn itself goes through the busy-inode retry, because a row may
+    /// execute a binary this test just copied: another thread's `fs::copy`
+    /// target is inherited by any child forked meanwhile, and Linux then refuses
+    /// the exec with `ETXTBSY` (see [`retry_executable_file_busy`]).
     fn run(&self, mut command: Command) -> Output {
-        let mut child = command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn agent-vm");
+        let program = PathBuf::from(command.get_program());
+        let mut child = retry_executable_file_busy(RetryBound::COPIED_BINARY, || {
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+        })
+        .unwrap_or_else(|failure| panic!("{}", failure.spawn_message(&program)));
         let deadline = Instant::now() + TIMEOUT;
         loop {
             if child.try_wait().expect("poll child").is_some() {
@@ -619,7 +694,7 @@ fn calibration_recovers_after_the_writable_reference_is_released() {
             .expect("hold a writable reference"),
     );
     let mut busy_prefix = Vec::new();
-    let output = retry_executable_file_busy(|| {
+    let output = retry_executable_file_busy(RetryBound::DECOY, || {
         let outcome = run_decoy(&decoy);
         if let Err(error) = &outcome {
             busy_prefix.push(error.raw_os_error());
@@ -698,7 +773,7 @@ fn calibration_rejects_an_executed_decoy_that_could_not_log() {
 
     let mut launches = 0;
     let mut busy_prefix = Vec::new();
-    let output = retry_executable_file_busy(|| {
+    let output = retry_executable_file_busy(RetryBound::DECOY, || {
         launches += 1;
         let outcome = run_decoy(&decoy);
         if let Err(error) = &outcome {
@@ -756,7 +831,7 @@ fn non_retryable_launch_errors_are_reported_immediately() {
         (&not_executable, libc::EACCES),
     ] {
         let mut errnos = Vec::new();
-        let failure = retry_executable_file_busy(|| {
+        let failure = retry_executable_file_busy(RetryBound::DECOY, || {
             let outcome = run_decoy(path);
             if let Err(error) = &outcome {
                 errnos.push(error.raw_os_error());
@@ -821,7 +896,7 @@ fn calibration_log_requires_the_exact_invocation_lines() {
 #[test]
 fn retry_policy_is_bounded_and_waits_between_attempts() {
     let mut launches = Vec::new();
-    let failure = retry_executable_file_busy::<()>(|| {
+    let failure = retry_executable_file_busy::<()>(RetryBound::DECOY, || {
         launches.push(Instant::now());
         Err(io::Error::from_raw_os_error(libc::ETXTBSY))
     })
@@ -842,13 +917,87 @@ fn retry_policy_is_bounded_and_waits_between_attempts() {
     );
 }
 
+/// Both bounds are policies, not patience: each retries inside its own
+/// allowance, succeeds on its last allowed attempt, fails on exactly the one
+/// after it, and the copied-binary wait stays about a second — so a genuine
+/// problem is never disguised as a slow recovery.
+#[test]
+fn every_retry_bound_covers_its_attempts_and_fails_after_them() {
+    for bound in [RetryBound::DECOY, RetryBound::COPIED_BINARY] {
+        let mut launches = 0;
+        let marker = retry_executable_file_busy(bound, || {
+            launches += 1;
+            if launches < bound.attempts {
+                Err(io::Error::from_raw_os_error(libc::ETXTBSY))
+            } else {
+                Ok("the last allowed attempt")
+            }
+        })
+        .expect("the last attempt inside the bound must be made");
+        assert_eq!(marker, "the last allowed attempt", "{bound:?}");
+        assert_eq!(launches, bound.attempts, "{bound:?}");
+
+        let mut launches = 0;
+        let started = Instant::now();
+        let failure = retry_executable_file_busy::<()>(bound, || {
+            launches += 1;
+            Err(io::Error::from_raw_os_error(libc::ETXTBSY))
+        })
+        .expect_err("a permanently busy inode exhausts the bound");
+        let elapsed = started.elapsed();
+        assert_eq!(launches, bound.attempts, "{bound:?}");
+        assert_eq!(failure.attempts, bound.attempts, "{bound:?}");
+        assert_eq!(failure.error.raw_os_error(), Some(libc::ETXTBSY));
+        assert!(
+            elapsed >= bound.total(),
+            "{bound:?} must wait between attempts: {elapsed:?}"
+        );
+        assert!(
+            elapsed < bound.total() + Duration::from_secs(1),
+            "{bound:?} is a wait, not a hang: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "{bound:?} must fail fast, about a second at most: {elapsed:?}"
+        );
+    }
+}
+
+/// The spawn diagnostic names the programme and the busy inode, so the next CI
+/// failure is diagnosable from the panic alone; a non-busy errno is never
+/// dressed up as one.
+#[test]
+fn the_spawn_diagnostic_names_the_busy_program() {
+    let failure = retry_executable_file_busy::<()>(RetryBound::DECOY, || {
+        Err(io::Error::from_raw_os_error(libc::ETXTBSY))
+    })
+    .expect_err("a permanently busy inode exhausts the bound");
+    let message = failure.spawn_message(Path::new("/tmp/agent-vm-copy"));
+    assert!(message.contains("/tmp/agent-vm-copy"), "{message}");
+    assert!(message.contains("ETXTBSY"), "{message}");
+    assert!(message.contains("fs::copy"), "{message}");
+    assert!(
+        message.contains(&format!("after {CALIBRATION_ATTEMPTS} attempt")),
+        "{message}"
+    );
+
+    let failure = retry_executable_file_busy::<()>(RetryBound::DECOY, || {
+        Err(io::Error::from_raw_os_error(libc::ENOENT))
+    })
+    .expect_err("a missing programme is final");
+    let message = failure.spawn_message(Path::new("/tmp/missing"));
+    assert!(!message.contains("ETXTBSY"), "{message}");
+    assert!(message.contains("os error 2"), "{message}");
+    assert!(message.contains("/tmp/missing"), "{message}");
+}
+
 /// A busy prefix may precede a final error, but the final error itself must end
 /// the sequence: retrying it would hide a broken fixture as a timing problem.
 #[test]
 fn a_terminal_error_after_a_busy_prefix_is_never_retried() {
     for terminal in [libc::ENOENT, libc::EACCES] {
         let mut launches = 0;
-        let failure = retry_executable_file_busy::<()>(|| {
+        let failure = retry_executable_file_busy::<()>(RetryBound::DECOY, || {
             launches += 1;
             Err(io::Error::from_raw_os_error(if launches < 3 {
                 libc::ETXTBSY
@@ -869,7 +1018,7 @@ fn a_terminal_error_after_a_busy_prefix_is_never_retried() {
 #[test]
 fn an_executed_child_after_a_busy_prefix_is_never_relaunched() {
     let mut launches = 0;
-    let marker = retry_executable_file_busy(|| {
+    let marker = retry_executable_file_busy(RetryBound::DECOY, || {
         launches += 1;
         if launches < CALIBRATION_ATTEMPTS {
             Err(io::Error::from_raw_os_error(libc::ETXTBSY))
@@ -1956,5 +2105,165 @@ fn s24_provenance_paths_follow_discovery() {
     assert_success(
         &output,
         &expected(PRODUCTION_RECOMMENDATION, "initial recommendation", None),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// S23 (#609): the pins listing, in the same boot-free harness as show.
+// ---------------------------------------------------------------------------
+
+/// clap wraps its help text; comparing normalized whitespace keeps the exact
+/// metadata sentence under test without pinning terminal width.
+fn normalize(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+const PINS_SHORT_ABOUT: &str = "List this project's approved OCI images and recorded roles";
+const PINS_LONG_ABOUT: &str = "List this project's image approvals across all platforms, including full references, child digests, revision tokens, held roles and unresolved slots. Read-only and offline: no configuration, runtime or cache is required, and nothing is created. This explicit listing may disclose private references.";
+const PINS_HEADER: &str = "REFERENCE\tPLATFORM\tDIGEST\tREVISION\tROLES\tUNRESOLVED\n";
+
+/// AC7/AC9: an absolute non-UTF-8 HOME is located, so the listing is a normal
+/// success and doctor escapes the path's invalid byte instead of refusing it.
+#[test]
+fn pins_accepts_absolute_non_utf8_home_and_doctor_escapes_path() {
+    // APFS/HFS+ and ext4 accept non-UTF-8 names; if the filesystem refuses,
+    // s14 above still covers the byte-level path policy.
+    let mut name = b"h\xffome".to_vec();
+    name.push(b'1');
+    let Some(fixture) =
+        Fixture::try_with_dir_names(&OsString::from_vec(name), OsStr::new("project"))
+    else {
+        eprintln!("SKIPPED: this filesystem refuses a non-UTF-8 directory name");
+        return;
+    };
+    assert!(fixture.home.is_absolute(), "HOME must be absolute");
+    let store = fixture.home.join(".config/agent-vm/image-pins.json");
+    let before = fixture.snapshot();
+
+    let listing = fixture.run(fixture.command(&["image", "pins"]));
+    assert_eq!(
+        listing.status.code(),
+        Some(0),
+        "an absolute non-UTF-8 HOME is a located authority: {}",
+        stderr(&listing)
+    );
+    assert_eq!(stdout(&listing), PINS_HEADER, "only the header");
+    assert_eq!(stderr(&listing), "", "a successful listing is silent");
+    assert!(!store.exists(), "the listing creates no authority");
+
+    let doctor = fixture.run(fixture.command(&["doctor"]));
+    assert_eq!(
+        doctor.status.code(),
+        Some(0),
+        "a located non-UTF-8 HOME is not a failure: {}",
+        stderr(&doctor)
+    );
+    let text = stdout(&doctor);
+    let row = text
+        .lines()
+        .find(|line| line.starts_with("active images: "))
+        .unwrap_or_else(|| panic!("no active row:\n{text}"));
+    assert_eq!(
+        row,
+        format!(
+            "active images: boot=not recorded, output=not recorded, unclaimed=0 [{}]",
+            one_line(store.as_os_str())
+        ),
+        "the row is one line with the file policy"
+    );
+    assert!(row.contains("\\xff"), "the invalid byte is escaped: {row}");
+    assert!(
+        !row.contains('\u{fffd}'),
+        "an invalid byte must not become U+FFFD: {row}"
+    );
+    assert!(!store.exists(), "doctor creates no authority");
+    assert_eq!(fixture.snapshot(), before, "neither verb writes anything");
+    fixture.assert_no_trap_calls();
+}
+
+/// AC8: help is offline, advertises exactly the new verb's metadata, and offers
+/// no launch, JSON or filter flags.
+#[test]
+fn pins_help_is_offline_and_describes_disclosure() {
+    let fixture = Fixture::new();
+    // A broken configuration must not take help down with it.
+    fixture.write_user_config("image = \"not a reference\"\n");
+    let before = fixture.snapshot();
+    for argv in [
+        vec!["image", "pins", "-h"],
+        vec!["image", "pins", "--help"],
+        vec!["help", "image", "pins"],
+        vec!["image", "--help"],
+    ] {
+        let output = fixture.run(fixture.command(&argv));
+        assert!(
+            output.status.success(),
+            "`{argv:?}` must print help: {}",
+            stderr(&output)
+        );
+        assert_eq!(stderr(&output), "", "`{argv:?}` is silent on stderr");
+        let text = normalize(&stdout(&output));
+        // clap prints `about` for `-h` and `long_about` for `--help`; the image
+        // group lists each verb by its short about.
+        let pins_help = argv.contains(&"pins");
+        let long = pins_help && (argv.contains(&"--help") || argv[0] == "help");
+        let expected = if long {
+            PINS_LONG_ABOUT
+        } else {
+            PINS_SHORT_ABOUT
+        };
+        assert!(
+            text.contains(&normalize(expected)),
+            "`{argv:?}` must carry its documented description:\n{text}"
+        );
+        if argv.contains(&"pins") {
+            for absent in ["--json", "--image", "--filter", "--refresh"] {
+                assert!(
+                    !text.contains(absent),
+                    "`{argv:?}` must not advertise {absent}:\n{text}"
+                );
+            }
+        }
+    }
+    assert_eq!(fixture.snapshot(), before, "help creates nothing");
+    fixture.assert_no_trap_calls();
+}
+
+/// AC9: the listing consults no runtime and creates nothing, even from a copied
+/// binary with an empty PATH.
+#[test]
+fn pins_creates_nothing_and_invokes_no_runtime() {
+    let fixture = Fixture::new();
+    let before = fixture.snapshot();
+    let output = fixture.run(fixture.command(&["image", "pins"]));
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(stdout(&output), PINS_HEADER);
+    assert_eq!(stderr(&output), "");
+    assert_eq!(fixture.snapshot(), before, "the listing writes nothing");
+    fixture.assert_no_trap_calls();
+
+    // The same verb from a copied binary whose PATH holds no runtime at all.
+    let copy = fixture.root.join("agent-vm-pins-copy");
+    fs::copy(agent_vm_bin(), &copy).expect("copy the binary");
+    let empty_path = fixture.root.join("empty-path");
+    fs::create_dir_all(&empty_path).unwrap();
+    let mut command = Command::new(&copy);
+    command
+        .env_clear()
+        .env("PATH", &empty_path)
+        .env("HOME", &fixture.home)
+        .env("TMPDIR", &fixture.tmp)
+        .env("AGENT_VM_STATE_DIR", &fixture.state)
+        .env("XDG_CACHE_HOME", &fixture.cache)
+        .current_dir(&fixture.project)
+        .args(["image", "pins"]);
+    let output = fixture.run(command);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(stdout(&output), PINS_HEADER);
+    assert_eq!(stderr(&output), "");
+    assert_eq!(
+        fixture.snapshot(),
+        before,
+        "no runtime, cache or config state appears"
     );
 }

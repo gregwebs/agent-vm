@@ -478,6 +478,28 @@ fn assert_report_with_config_error(h: &Harness) {
         stdout.contains("error: config:"),
         "config failure should be the section body: {stdout}"
     );
+    // The active row does not depend on the configuration, so it is available in
+    // every broken-config branch: exactly one, immediately after
+    // `project default:`, with no concatenation and no blank line between them.
+    let lines: Vec<&str> = stdout.lines().collect();
+    let rows: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|line| line.starts_with("active images: "))
+        .collect();
+    assert_eq!(rows.len(), 1, "exactly one active row: {stdout}");
+    let at = lines
+        .iter()
+        .position(|line| line.starts_with("active images: "))
+        .expect("the row exists");
+    assert!(
+        lines[at - 1].starts_with("project default: "),
+        "the row follows `project default:`: {stdout}"
+    );
+    assert!(
+        rows[0].starts_with("active images: boot=not recorded, output=not recorded, unclaimed=0 ["),
+        "an absent store reports zero counts: {stdout}"
+    );
 }
 
 #[test]
@@ -710,6 +732,33 @@ fn a_missing_home_reports_an_unavailable_user_tier() {
     assert!(
         !stderr.contains("image pin authority"),
         "a missing $HOME is not damaged pin authority: {stderr}"
+    );
+    // The row still renders, with the safe access message and no path suffix:
+    // an authority that could not be located is not a damaged one.
+    let lines: Vec<&str> = stdout.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| line.starts_with("active images: "))
+        .unwrap_or_else(|| panic!("no active row: {stdout}"));
+    assert_eq!(
+        lines[at],
+        "active images: error: image pin authority at $HOME/.config/agent-vm/image-pins.json could not be accessed or saved",
+        "unlocatable authority is the access failure, never zero counts or unknown"
+    );
+    assert!(
+        lines[at - 1].starts_with("project default: "),
+        "the row follows `project default:`: {stdout}"
+    );
+    assert!(!lines[at].contains('['), "no path suffix: {}", lines[at]);
+    assert!(
+        !h.home_root
+            .join(".config/agent-vm/image-pins.json")
+            .exists()
+            && !h
+                .home_root
+                .join(".config/agent-vm/image-pins.lock")
+                .exists(),
+        "an unlocatable authority creates nothing"
     );
     assert!(
         stderr.contains("credential store check failed"),

@@ -1205,6 +1205,10 @@ fn describe_tier(tier: &TierReport) -> String {
 /// row and `selected (without --image)` row cannot disagree across a concurrent
 /// adoption, and nothing is created, locked or repaired. A damaged default still
 /// renders every tier row and a clear error; the caller exits nonzero.
+///
+/// The `active images:` row reads its own snapshot, not that one: it reports the
+/// pin authority's recorded roles, which are independent of the selection's
+/// default observations, so neither can make the other stale.
 fn describe_boot_image(
     images: Option<&ConfiguredImages>,
     catalog_built: bool,
@@ -1212,6 +1216,8 @@ fn describe_boot_image(
     project: Option<&ProjectDir>,
 ) -> (String, Option<anyhow::Error>, Option<boot_image::BootImage>) {
     let mut out = String::from("==> boot image\n");
+    let (active_row, active_failure) =
+        describe_active_images_observation(&crate::image_pin::observe_active_images(project));
     let env_override = match env {
         boot_image::EnvOverride::Present(override_) => {
             out.push_str(&format!(
@@ -1227,10 +1233,15 @@ fn describe_boot_image(
         boot_image::EnvOverride::Invalid => {
             // Never print a fictional selection from an override doctor could
             // not read: say the value is present and unreadable, and stop. The
-            // caller exits nonzero after this section.
+            // caller exits nonzero after this section. This branch is the one
+            // place with no `project default:` row to anchor to, so the active
+            // row follows the environment line directly — and its own failure is
+            // discarded: the environment refusal is the diagnostic that must
+            // own stderr at the caller.
             out.push_str(
                 "AGENT_VM_IMAGE_TAG: <present but not valid Unicode; refusing to select>\n",
             );
+            out.push_str(&active_row);
             return (out, None, None);
         }
     };
@@ -1273,8 +1284,11 @@ fn describe_boot_image(
         // The config could not be read, so the tiers are unknown.
         out.push_str("unknown (configuration could not be read)\n");
         out.push_str(&format!("default: {default_row}\n"));
-        out.push_str(&format!("project default: {project_default_row}"));
-        return (out, failure, None);
+        out.push_str(&format!("project default: {project_default_row}\n"));
+        // The row stays available here: recorded roles do not depend on the
+        // configuration, and the caller's `write_line` owns the final LF.
+        out.push_str(&active_row);
+        return (out, failure.or(active_failure), None);
     };
     out.push_str(&format!(
         "user:    {}\n",
@@ -1290,6 +1304,8 @@ fn describe_boot_image(
     }
     out.push_str(&format!("default: {default_row}\n"));
     out.push_str(&format!("project default: {project_default_row}\n"));
+    out.push_str(&active_row);
+    out.push('\n');
     // Doctor accepts no `--image`, so the selected row excludes the command
     // line: it is the env slot, then config, then the default slot. When the
     // default slot won, the selected row reuses that record's *safe* label
@@ -1315,7 +1331,51 @@ fn describe_boot_image(
         Err(error) => out.push_str(&format!("selected (without --image): error: {error:#}")),
     }
     let selection = observation.selected.as_ref().ok().cloned();
-    (out, failure, selection)
+    (out, failure.or(active_failure), selection)
+}
+
+/// The `active images:` row: the host platform's recorded roles and its
+/// unclaimed count, or one of the two safe non-answers.
+///
+/// Its input carries no reference, digest or revision, so the row cannot leak
+/// one. Only located authority damage becomes a failure: an unlocatable `$HOME`
+/// is already the config section's finding, and an uncapturable project is the
+/// documented `unknown` state — neither is a second diagnosis of a file that was
+/// never read.
+fn describe_active_images_observation(
+    observation: &crate::image_pin::ActiveImagesObservation,
+) -> (String, Option<anyhow::Error>) {
+    use crate::image_pin::ActiveImagesObservation as Observation;
+    match observation {
+        Observation::Available(active) => (
+            format!(
+                "active images: boot={}, output={}, unclaimed={} [{}]",
+                presence(active.boot_recorded),
+                presence(active.output_recorded),
+                active.unclaimed,
+                crate::one_line::path(&active.path),
+            ),
+            None,
+        ),
+        Observation::ProjectUnknown => (
+            "active images: unknown (the project directory could not be captured)".to_string(),
+            None,
+        ),
+        Observation::Unavailable {
+            message,
+            authority_located,
+        } => (
+            format!("active images: error: {message}"),
+            authority_located.then(|| anyhow::anyhow!(message.to_string())),
+        ),
+    }
+}
+
+/// Role presence: `recorded` iff a matching record's knowledge is Present. It
+/// never says `not recorded` means resolved-absent — the row reports presence,
+/// not the scope's resolution.
+fn presence(recorded: bool) -> &'static str {
+    if recorded { "recorded" } else { "not recorded" }
 }
 
 /// The `default:` row: which immutable image this host retains, the offered
@@ -1585,6 +1645,140 @@ fn render(outcome: &ResetOutcome) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -------------------------------------------------------------------------
+    // The `active images:` row (#609)
+    // -------------------------------------------------------------------------
+
+    use crate::image_pin::{ActiveImages, ActiveImagesObservation};
+
+    /// The documented `one_line::path` policy, reimplemented here so the
+    /// expected row never comes from the production renderer: valid UTF-8 keeps
+    /// its printable characters (controls become `\xNN`), and each byte of an
+    /// invalid sequence becomes `\xNN`.
+    fn one_line(bytes: &[u8]) -> String {
+        let mut out = String::new();
+        let push = |text: &str, out: &mut String| {
+            for character in text.chars() {
+                if character.is_control() {
+                    out.push_str(&format!("\\x{:02x}", character as u32));
+                } else {
+                    out.push(character);
+                }
+            }
+        };
+        let mut rest = bytes;
+        loop {
+            match std::str::from_utf8(rest) {
+                Ok(text) => {
+                    push(text, &mut out);
+                    return out;
+                }
+                Err(error) => {
+                    let (valid, after) = rest.split_at(error.valid_up_to());
+                    push(std::str::from_utf8(valid).unwrap(), &mut out);
+                    let invalid = error.error_len().unwrap_or(after.len());
+                    for byte in &after[..invalid] {
+                        out.push_str(&format!("\\x{byte:02x}"));
+                    }
+                    rest = &after[invalid..];
+                }
+            }
+        }
+    }
+
+    fn available(path: &Path, boot: bool, output: bool, unclaimed: usize) -> ActiveImages {
+        ActiveImages {
+            path: path.to_owned(),
+            boot_recorded: boot,
+            output_recorded: output,
+            unclaimed,
+        }
+    }
+
+    /// AC7: the two non-answers are exact and carry no path; only located damage
+    /// is a diagnostic failure.
+    #[test]
+    fn active_images_row_formats_unknown_and_error_states() {
+        let (row, failure) =
+            describe_active_images_observation(&ActiveImagesObservation::ProjectUnknown);
+        assert_eq!(
+            row,
+            "active images: unknown (the project directory could not be captured)"
+        );
+        assert!(failure.is_none(), "unknown is not a failure");
+        assert!(!row.contains('['), "no path suffix on unknown: {row}");
+
+        let message = crate::one_line::text("image pin authority is damaged");
+        for (located, fails) in [(true, true), (false, false)] {
+            let (row, failure) =
+                describe_active_images_observation(&ActiveImagesObservation::Unavailable {
+                    message: message.clone(),
+                    authority_located: located,
+                });
+            assert_eq!(row, "active images: error: image pin authority is damaged");
+            assert!(!row.contains('['), "no path suffix on error: {row}");
+            match (fails, failure) {
+                (true, Some(error)) => assert_eq!(error.to_string(), message.to_string()),
+                (false, None) => {}
+                (_, other) => panic!("located={located}: {other:?}"),
+            }
+        }
+
+        // A store message that carried a control byte cannot forge a row: the
+        // seam escapes it once, when the Line is built.
+        let hostile = crate::one_line::text("two\nlines\u{1b}[31m");
+        let (row, _) = describe_active_images_observation(&ActiveImagesObservation::Unavailable {
+            message: hostile,
+            authority_located: false,
+        });
+        assert_eq!(row.matches('\n').count(), 0, "{row:?}");
+        assert!(!row.contains('\u{1b}'), "{row:?}");
+        assert!(row.contains("two\\x0alines"), "{row:?}");
+    }
+
+    /// AC9: every presence pair and both count extremes render exactly, with the
+    /// measured path under the one-line policy — non-ASCII readable, controls and
+    /// invalid bytes escaped.
+    #[test]
+    fn active_images_path_is_one_line_and_keeps_unicode() {
+        let raw = b"/home/boger/\xd0\xb4\xd0\xbe\xd0\xbc/ne\nw\t\x1b/\xfftail/.config/agent-vm/image-pins.json".to_vec();
+        let path = {
+            use std::os::unix::ffi::OsStringExt as _;
+            PathBuf::from(std::ffi::OsString::from_vec(raw.clone()))
+        };
+        assert!(
+            std::str::from_utf8(&raw).is_err(),
+            "the fixture must carry an invalid byte"
+        );
+        for (boot, output) in [(false, false), (true, false), (false, true), (true, true)] {
+            for unclaimed in [0, 2] {
+                let (row, failure) = describe_active_images_observation(
+                    &ActiveImagesObservation::Available(available(&path, boot, output, unclaimed)),
+                );
+                assert!(failure.is_none());
+                assert_eq!(
+                    row,
+                    format!(
+                        "active images: boot={}, output={}, unclaimed={} [{}]",
+                        if boot { "recorded" } else { "not recorded" },
+                        if output { "recorded" } else { "not recorded" },
+                        unclaimed,
+                        one_line(&raw),
+                    )
+                );
+                assert_eq!(row.matches('\n').count(), 0, "{row:?}");
+                assert!(!row.contains('\u{1b}') && !row.contains('\t'), "{row:?}");
+                assert!(row.contains("дом"), "valid Unicode stays readable: {row}");
+                assert!(row.contains("\\xff"), "the invalid byte is escaped: {row}");
+                assert!(
+                    !row.contains('\u{fffd}'),
+                    "an invalid byte must not become U+FFFD: {row}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn credential_store_rows_match_all_outcomes() {
         for (outcome, row, fails) in [
@@ -1960,6 +2154,7 @@ user:    none
 project: none
 default: not selected; initial recommendation [<fixture>/home/.config/agent-vm/default-image.json]
 project default: not established (the next eligible default-tier use records it)
+active images: boot=not recorded, output=not recorded, unclaimed=0 [<fixture>/home/.config/agent-vm/image-pins.json]
 selected (without --image): not selected; initial recommendation [<fixture>/home/.config/agent-vm/default-image.json]
 
 ==> image network requests

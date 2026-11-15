@@ -4293,6 +4293,29 @@ fn a_damaged_host_record_fails_only_doctor_and_refresh_in_an_established_project
         stdout_of(&show)
     );
 
+    // The two read-only surfaces do not read the host record at all: the listing
+    // is the pin file's records, and the active row counts them.
+    let mut command = h.command();
+    command.args(["image", "pins"]);
+    let listing = bounded(command);
+    assert!(
+        listing.status.success(),
+        "a damaged host record cannot fail the listing: {}",
+        stderr(&listing)
+    );
+    assert_eq!(stderr(&listing), "");
+    let (digest, revision) = h.pin_for(&child).expect("the launch recorded the child");
+    assert_eq!(digest, digest_of(&child));
+    // Built from the fixture's own inputs, independently of the renderer.
+    assert_eq!(
+        stdout_of(&listing),
+        format!(
+            "REFERENCE\tPLATFORM\tDIGEST\tREVISION\tROLES\tUNRESOLVED\n\
+             {child}\tlinux/{}\t{digest}\t{revision}\tboot\toutput\n",
+            image_archive::host_arch(),
+        )
+    );
+
     let mut command = h.command();
     command.arg("doctor");
     let doctor = bounded(command);
@@ -4301,6 +4324,18 @@ fn a_damaged_host_record_fails_only_doctor_and_refresh_in_an_established_project
     assert!(
         text.contains("default: error:"),
         "the host row reports the damage: {text}"
+    );
+    assert_active_row(
+        &text,
+        &format!(
+            "active images: boot=recorded, output=not recorded, unclaimed=0 [{}]",
+            h.pins().display()
+        ),
+    );
+    assert_eq!(
+        doctor.status.code(),
+        Some(1),
+        "host-record damage still fails doctor: {text}"
     );
     // The project's own default and the project-aware selection are unaffected
     // by host-only damage (R10): neither row may repeat the host error.
@@ -6712,29 +6747,15 @@ fn first_warm_claim_writes_roles_and_recovers_the_journal() {
 fn show_and_doctor_read_every_new_state_without_writing() {
     let h = Harness::new(Mode::LaunchSeam);
     let project = project_id(&h.project);
-    let platform = |variant: Option<&str>| serde_json::json!({"os": "linux", "architecture": image_archive::host_arch(), "variant": variant});
+    // The shared file helpers, so this row and the #609 presentation rows build
+    // their stores the same way.
+    let platform = host_platform_json();
     let pin = |reference: &str, digest: &str, roles: Option<&str>| {
-        let mut record = serde_json::json!({
-            "project": project,
-            "reference": reference,
-            "platform": platform(None),
-            "manifest_digest": digest,
-            "revision": 1,
-        });
-        if let Some(roles) = roles {
-            record["roles"] = serde_json::json!(roles);
-        }
-        record
+        pin_json(&project, reference, &platform, digest, 1, roles)
     };
-    let scope = |resolved: &str| {
-        serde_json::json!({
-            "project": project,
-            "platform": platform(None),
-            "resolved": resolved,
-        })
-    };
-    let a = format!("sha256:{}", "a".repeat(64));
-    let b = format!("sha256:{}", "b".repeat(64));
+    let scope = |resolved: &str| scope_json(&project, &platform, resolved);
+    let a = digest('a');
+    let b = digest('b');
     // Partial resolution, fully resolved, protected no-role, and a known-inactive
     // refresh record.
     let states = [
@@ -6779,15 +6800,17 @@ fn show_and_doctor_read_every_new_state_without_writing() {
         });
         let bytes = serde_json::to_vec(&store).unwrap();
         seed_store(&h, &bytes);
+        let before = store_snapshot(&h);
+        assert_eq!(before.0.as_deref(), Some(bytes.as_slice()));
         for verb in [vec!["image", "show"], vec!["doctor"]] {
             let mut command = h.command();
             command.args(&verb);
             let out = bounded(command);
             assert!(out.status.success(), "{name} {verb:?}: {}", stderr(&out));
             assert_eq!(
-                fs::read(h.pins()).unwrap(),
-                bytes,
-                "{name} {verb:?} wrote the store"
+                store_snapshot(&h),
+                before,
+                "{name} {verb:?} wrote the store or its coordination file"
             );
             assert!(
                 !stdout_of(&out).contains("example.com") && !stderr(&out).contains("example.com"),
@@ -10922,4 +10945,1576 @@ fn expect_stage(
             panic!("stage {stage:?} never arrived ({why}); child exited {code:?}");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// #609: the two read-only projections — `image pins` and the active row.
+//
+// Every fixture below writes the store bytes directly. Presentation is not an
+// acquisition, so a synthetic store needs no registry, archive or runtime, and
+// the expected TSV/row text is built from the fixture's own inputs rather than
+// from the renderer under test.
+// ---------------------------------------------------------------------------
+
+/// The documented header, pinned independently of the production renderer.
+const PINS_HEADER: &str = "REFERENCE\tPLATFORM\tDIGEST\tREVISION\tROLES\tUNRESOLVED\n";
+
+/// N1's literal access message. Spelled out here so an oracle built from the
+/// production constructor cannot pass after the two messages are swapped.
+const N1_ACCESS: &str =
+    "image pin authority at $HOME/.config/agent-vm/image-pins.json could not be accessed or saved";
+
+/// The store-owned damaged-authority text, pinned here rather than obtained from
+/// the production constructor, so an oracle cannot agree with a swapped message.
+const CORRUPT_MESSAGE: &str = "image pin authority at $HOME/.config/agent-vm/image-pins.json is damaged; restore its intended records from backup or deliberately move it aside to reset approvals";
+
+/// The literal v1 refusal, likewise pinned.
+const N1_V1: &str = "image pin authority at $HOME/.config/agent-vm/image-pins.json uses the host-wide version 1 format, which this agent-vm no longer reads: approvals are now per project. Archiving it resets approvals, and mutable tags may then resolve to newer content; see \"Upgrading from host-wide approvals\" in USAGE.md";
+
+/// The architecture this host is *not*, so a foreign record can never be this
+/// host's by accident.
+fn foreign_arch() -> &'static str {
+    if image_archive::host_arch() == "amd64" {
+        "arm64"
+    } else {
+        "amd64"
+    }
+}
+
+fn platform_json(architecture: &str, variant: Option<&str>) -> serde_json::Value {
+    serde_json::json!({"os": "linux", "architecture": architecture, "variant": variant})
+}
+
+fn host_platform_json() -> serde_json::Value {
+    platform_json(image_archive::host_arch(), None)
+}
+
+fn host_platform() -> String {
+    format!("linux/{}", image_archive::host_arch())
+}
+
+fn digest(byte: char) -> String {
+    format!("sha256:{}", byte.to_string().repeat(64))
+}
+
+/// One pin. `roles: None` omits the field, which is the "holds nothing" state —
+/// not a stored empty mask.
+fn pin_json(
+    project: &str,
+    reference: &str,
+    platform: &serde_json::Value,
+    digest: &str,
+    revision: u64,
+    roles: Option<&str>,
+) -> serde_json::Value {
+    let mut record = serde_json::json!({
+        "project": project,
+        "reference": reference,
+        "platform": platform,
+        "manifest_digest": digest,
+        "revision": revision,
+    });
+    if let Some(roles) = roles {
+        record["roles"] = serde_json::json!(roles);
+    }
+    record
+}
+
+fn scope_json(project: &str, platform: &serde_json::Value, resolved: &str) -> serde_json::Value {
+    serde_json::json!({"project": project, "platform": platform, "resolved": resolved})
+}
+
+/// Exact v2 bytes: only the fields the fixture means to have. `sequence: None`
+/// is the pre-0.7.51 file, which carried no roles, scopes or write sequence.
+fn store_bytes(
+    pins: Vec<serde_json::Value>,
+    scopes: Vec<serde_json::Value>,
+    sequence: Option<u64>,
+) -> Vec<u8> {
+    let mut store = serde_json::json!({
+        "version": 2,
+        "pins": pins,
+        "pending_default": serde_json::Value::Null,
+    });
+    if !scopes.is_empty() {
+        store["scopes"] = serde_json::json!(scopes);
+    }
+    if let Some(sequence) = sequence {
+        store["sequence"] = serde_json::json!(sequence);
+    }
+    serde_json::to_vec(&store).unwrap()
+}
+
+/// One expected listing row, assembled from the fixture's own inputs.
+fn pins_row(
+    reference: &str,
+    platform: &str,
+    digest: &str,
+    revision: u64,
+    roles: &str,
+    unresolved: &str,
+) -> String {
+    format!("{reference}\t{platform}\t{digest}\t{revision}\t{roles}\t{unresolved}\n")
+}
+
+/// The exact listing: the documented header plus the fixture's own rows.
+fn expected_listing(rows: &[String]) -> String {
+    let mut text = String::from(PINS_HEADER);
+    for row in rows {
+        text.push_str(row);
+    }
+    text
+}
+
+/// Every `active images:` row of one report. There must be exactly one, and its
+/// bytes must match: the rest of doctor has unrelated sections.
+#[track_caller]
+fn assert_active_row(stdout: &str, expected: &str) {
+    let rows: Vec<&str> = stdout
+        .lines()
+        .filter(|line| line.starts_with("active images: "))
+        .collect();
+    assert_eq!(rows, [expected], "exactly one active row:\n{stdout}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| line.starts_with("active images: "))
+        .expect("the row was found above");
+    assert!(
+        lines[at - 1].starts_with("project default: "),
+        "the row follows `project default:` immediately:\n{stdout}"
+    );
+    if let Some(selected) = lines
+        .iter()
+        .position(|line| line.starts_with("selected (without --image): "))
+    {
+        assert!(
+            at < selected,
+            "the row precedes `selected (without --image):`:\n{stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("==> agent-vm doctor: available operations"),
+        "later sections still print:\n{stdout}"
+    );
+}
+
+/// The `==> boot image` section: its heading plus every row up to the next blank
+/// line. The rest of the report has unrelated sections and unrelated `user:`
+/// rows, so placement assertions stay inside this one.
+fn boot_image_section(stdout: &str) -> Vec<&str> {
+    let mut lines = stdout.lines();
+    let start = lines
+        .by_ref()
+        .position(|line| line == "==> boot image")
+        .unwrap_or_else(|| panic!("no boot-image section:\n{stdout}"));
+    stdout
+        .lines()
+        .skip(start)
+        .take_while(|line| !line.is_empty())
+        .collect()
+}
+
+/// Every entry of the authority directory as type, mode, inode, size and content
+/// hash for regular files, and as its target for a symlink. A special store path
+/// is compared by metadata only, never by reading it: a FIFO has no bytes to read
+/// and would block. Content is included because an in-place rewrite preserves the
+/// mode and the inode, so identity alone would not detect changed bytes.
+fn authority_inventory(h: &Harness) -> std::collections::BTreeMap<String, String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut entries = std::collections::BTreeMap::new();
+    let directory = config_dir(h);
+    let Ok(read) = fs::read_dir(&directory) else {
+        return entries;
+    };
+    for entry in read {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        let file_type = metadata.file_type();
+        let description = if file_type.is_symlink() {
+            format!(
+                "symlink {:o} {} {:?}",
+                metadata.mode(),
+                metadata.ino(),
+                fs::read_link(&path).unwrap()
+            )
+        } else if file_type.is_dir() {
+            format!("dir {:o} {}", metadata.mode(), metadata.ino())
+        } else if file_type.is_file() {
+            // Content as well as identity: an in-place rewrite keeps the mode and
+            // the inode, so those alone would not prove the bytes are unchanged.
+            let mut hasher = Sha256::new();
+            hasher.update(fs::read(&path).unwrap());
+            let content: String = hasher
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            format!(
+                "file {:o} {} {} {content}",
+                metadata.mode(),
+                metadata.ino(),
+                metadata.len()
+            )
+        } else {
+            // A FIFO, socket or device is described by metadata only: opening one
+            // is what the product promises not to do, and a read would block.
+            format!("special {:o} {}", metadata.mode(), metadata.ino())
+        };
+        entries.insert(
+            entry.file_name().to_string_lossy().into_owned(),
+            description,
+        );
+    }
+    entries
+}
+
+/// The store's exact bytes and the coordination file's inode and mode. A read is
+/// allowed to move atime, so it is excluded; `None` means the path is absent.
+fn store_snapshot(h: &Harness) -> (Option<Vec<u8>>, Option<(u64, u32)>) {
+    use std::os::unix::fs::MetadataExt as _;
+    (
+        fs::read(h.pins()).ok(),
+        fs::symlink_metadata(config_dir(h).join("image-pins.lock"))
+            .ok()
+            .map(|metadata| (metadata.ino(), metadata.mode())),
+    )
+}
+
+impl Harness {
+    fn pins_listing(&self) -> Output {
+        self.pins_listing_in(&self.project, &self.state)
+    }
+
+    fn pins_listing_in(&self, project: &Path, state: &Path) -> Output {
+        let mut command = self.command_in(project, state);
+        command.args(["image", "pins"]);
+        bounded(command)
+    }
+
+    fn doctor(&self) -> Output {
+        self.doctor_in(&self.project, &self.state)
+    }
+
+    fn doctor_in(&self, project: &Path, state: &Path) -> Output {
+        let mut command = self.command_in(project, state);
+        command.arg("doctor");
+        bounded(command)
+    }
+
+    /// The exact `active images:` row this fixture must render, path included.
+    fn active_row(&self, boot: &str, output: &str, unclaimed: usize) -> String {
+        format!(
+            "active images: boot={boot}, output={output}, unclaimed={unclaimed} [{}]",
+            self.pins().display()
+        )
+    }
+}
+
+/// AC1/AC7: an absent store and a literal empty v2 store both list only the
+/// header and report a zero-count row, and neither is created or rewritten.
+#[test]
+fn pins_and_doctor_fresh_and_empty_stores_are_read_only() {
+    let h = Harness::new(Mode::LaunchSeam);
+    assert!(
+        !config_dir(&h).exists(),
+        "the fixture starts without authority"
+    );
+
+    let listing = h.pins_listing();
+    assert_eq!(listing.status.code(), Some(0), "{}", stderr(&listing));
+    assert_eq!(stdout_of(&listing), PINS_HEADER);
+    assert_eq!(stderr(&listing), "");
+    assert!(!config_dir(&h).exists(), "a listing creates no authority");
+
+    let doctor = h.doctor();
+    assert_eq!(doctor.status.code(), Some(0), "{}", stdout_of(&doctor));
+    assert_active_row(
+        &stdout_of(&doctor),
+        &h.active_row("not recorded", "not recorded", 0),
+    );
+    assert!(
+        !config_dir(&h).exists(),
+        "the active row needs no authority to exist"
+    );
+
+    // The literal empty v2 file: version, pins and pending_default only.
+    let empty = br#"{"version":2,"pins":[],"pending_default":null}"#.to_vec();
+    seed_store(&h, &empty);
+    let before = store_snapshot(&h);
+    let listing = h.pins_listing();
+    assert_eq!(listing.status.code(), Some(0), "{}", stderr(&listing));
+    assert_eq!(stdout_of(&listing), PINS_HEADER);
+    assert_eq!(stderr(&listing), "");
+    let doctor = h.doctor();
+    assert_eq!(doctor.status.code(), Some(0), "{}", stdout_of(&doctor));
+    assert_active_row(
+        &stdout_of(&doctor),
+        &h.active_row("not recorded", "not recorded", 0),
+    );
+    assert_eq!(store_snapshot(&h), before, "neither verb writes authority");
+}
+
+/// AC1/R4/D2: only a *present* authority needs its regular coordination file. A
+/// stale directory, symlink or FIFO left at the lock path beside **no** record is
+/// not damage: the projection is the same empty listing and zero-count row an
+/// absent store produces, and nothing is created, replaced or repaired.
+#[test]
+fn pins_absent_record_with_a_stale_nonregular_lock_is_an_empty_listing() {
+    for kind in ["symlink", "directory", "fifo"] {
+        let h = Harness::new(Mode::LaunchSeam);
+        let lock = config_dir(&h).join("image-pins.lock");
+        let target = config_dir(&h).join("lock-target");
+        fs::create_dir_all(config_dir(&h)).unwrap();
+        match kind {
+            "symlink" => std::os::unix::fs::symlink(&target, &lock).unwrap(),
+            "directory" => fs::create_dir(&lock).unwrap(),
+            _ => {
+                let path = std::ffi::CString::new(lock.as_os_str().as_encoded_bytes()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+            }
+        }
+        let before = authority_inventory(&h);
+
+        let listing = h.pins_listing();
+        assert_eq!(
+            listing.status.code(),
+            Some(0),
+            "an absent store needs no lock ({kind}): {}",
+            stderr(&listing)
+        );
+        assert_eq!(stdout_of(&listing), PINS_HEADER, "{kind}");
+        assert_eq!(stderr(&listing), "", "{kind} is silent on success");
+        assert!(!h.pins().exists(), "{kind}: the record stays absent");
+
+        // Doctor's *active* row is the absent-store row. Its default rows read
+        // the same directory through the locked path, so they still report the
+        // bad lock and the command still exits 1; that is pre-existing behaviour
+        // for an unusable coordination file, not this row's finding.
+        let doctor = h.doctor();
+        assert_active_row(
+            &stdout_of(&doctor),
+            &h.active_row("not recorded", "not recorded", 0),
+        );
+        assert!(!h.pins().exists(), "{kind}: doctor creates no record");
+        assert_eq!(
+            authority_inventory(&h),
+            before,
+            "{kind}: neither verb replaces, repairs or removes the lock"
+        );
+        assert!(!target.exists(), "{kind}: the symlink target stays absent");
+    }
+}
+
+/// AC2: legacy uncertainty is rendered, never collapsed. A no-role record in an
+/// unresolved scope is `none` with both slots unresolved; once a slot resolves
+/// (with its own holder elsewhere in the scope) only the other stays unresolved.
+#[test]
+fn pins_and_doctor_preserve_legacy_uncertainty() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let project = project_id(&h.project);
+
+    // (a) The literal pre-roles v2 record: no roles, no scopes, no sequence.
+    let legacy = store_bytes(
+        vec![serde_json::json!({
+            "project": project,
+            "reference": "example.com/x:tag",
+            "platform": host_platform_json(),
+            "manifest_digest": digest('a'),
+            "revision": 7,
+        })],
+        Vec::new(),
+        None,
+    );
+    seed_store(&h, &legacy);
+    let before = store_snapshot(&h);
+    let listing = h.pins_listing();
+    assert_eq!(listing.status.code(), Some(0), "{}", stderr(&listing));
+    assert_eq!(
+        stdout_of(&listing),
+        expected_listing(&[pins_row(
+            "example.com/x:tag",
+            &host_platform(),
+            &digest('a'),
+            7,
+            "none",
+            "boot+output"
+        )])
+    );
+    assert_eq!(stderr(&listing), "");
+    let doctor = h.doctor();
+    assert_eq!(doctor.status.code(), Some(0), "{}", stdout_of(&doctor));
+    assert_active_row(
+        &stdout_of(&doctor),
+        &h.active_row("not recorded", "not recorded", 1),
+    );
+    assert_eq!(store_snapshot(&h), before, "omitted fields stay omitted");
+
+    // (b) Boot resolved, held by another record: the old row keeps `output`
+    // unresolved and is still counted as unclaimed, never as safe to retire.
+    let boot_resolved = store_bytes(
+        vec![
+            pin_json(
+                &project,
+                "example.com/k:tag",
+                &host_platform_json(),
+                &digest('b'),
+                1,
+                Some("boot"),
+            ),
+            pin_json(
+                &project,
+                "example.com/x:tag",
+                &host_platform_json(),
+                &digest('a'),
+                2,
+                None,
+            ),
+        ],
+        vec![scope_json(&project, &host_platform_json(), "boot")],
+        Some(2),
+    );
+    seed_store(&h, &boot_resolved);
+    let before = store_snapshot(&h);
+    let listing = h.pins_listing();
+    assert_eq!(listing.status.code(), Some(0), "{}", stderr(&listing));
+    assert_eq!(
+        stdout_of(&listing),
+        expected_listing(&[
+            pins_row(
+                "example.com/k:tag",
+                &host_platform(),
+                &digest('b'),
+                1,
+                "boot",
+                "output"
+            ),
+            pins_row(
+                "example.com/x:tag",
+                &host_platform(),
+                &digest('a'),
+                2,
+                "none",
+                "output"
+            ),
+        ])
+    );
+    let doctor = h.doctor();
+    assert_eq!(doctor.status.code(), Some(0), "{}", stdout_of(&doctor));
+    assert_active_row(
+        &stdout_of(&doctor),
+        &h.active_row("recorded", "not recorded", 1),
+    );
+    assert_eq!(store_snapshot(&h), before);
+
+    // (c) The symmetric case: Output resolved and held elsewhere.
+    let output_resolved = store_bytes(
+        vec![
+            pin_json(
+                &project,
+                "example.com/o:tag",
+                &host_platform_json(),
+                &digest('c'),
+                1,
+                Some("output"),
+            ),
+            pin_json(
+                &project,
+                "example.com/x:tag",
+                &host_platform_json(),
+                &digest('a'),
+                2,
+                None,
+            ),
+        ],
+        vec![scope_json(&project, &host_platform_json(), "output")],
+        Some(2),
+    );
+    seed_store(&h, &output_resolved);
+    let before = store_snapshot(&h);
+    let listing = h.pins_listing();
+    assert_eq!(
+        stdout_of(&listing),
+        expected_listing(&[
+            pins_row(
+                "example.com/o:tag",
+                &host_platform(),
+                &digest('c'),
+                1,
+                "output",
+                "boot"
+            ),
+            pins_row(
+                "example.com/x:tag",
+                &host_platform(),
+                &digest('a'),
+                2,
+                "none",
+                "boot"
+            ),
+        ])
+    );
+    let doctor = h.doctor();
+    assert_eq!(doctor.status.code(), Some(0), "{}", stdout_of(&doctor));
+    assert_active_row(
+        &stdout_of(&doctor),
+        &h.active_row("not recorded", "recorded", 1),
+    );
+    assert_eq!(store_snapshot(&h), before);
+}
+
+/// AC3: one record holding both roles, one known-inactive refresh record. The
+/// listing prints the record's own revision (not the file's sequence), and
+/// doctor counts only the unheld record as unclaimed.
+#[test]
+fn pins_and_doctor_render_shared_roles_and_known_inactive() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let project = project_id(&h.project);
+    let bytes = store_bytes(
+        vec![
+            pin_json(
+                &project,
+                "example.com/x:tag",
+                &host_platform_json(),
+                &digest('a'),
+                7,
+                Some("boot-and-output"),
+            ),
+            pin_json(
+                &project,
+                "example.com/v:tag",
+                &host_platform_json(),
+                &digest('b'),
+                11,
+                None,
+            ),
+        ],
+        vec![scope_json(
+            &project,
+            &host_platform_json(),
+            "boot-and-output",
+        )],
+        Some(19),
+    );
+    seed_store(&h, &bytes);
+    let before = store_snapshot(&h);
+
+    let listing = h.pins_listing();
+    assert_eq!(listing.status.code(), Some(0), "{}", stderr(&listing));
+    assert_eq!(stderr(&listing), "");
+    assert_eq!(
+        stdout_of(&listing),
+        expected_listing(&[
+            pins_row(
+                "example.com/v:tag",
+                &host_platform(),
+                &digest('b'),
+                11,
+                "none",
+                "none"
+            ),
+            pins_row(
+                "example.com/x:tag",
+                &host_platform(),
+                &digest('a'),
+                7,
+                "boot+output",
+                "none"
+            ),
+        ]),
+        "the stored sequence 19 is never substituted for a record's revision"
+    );
+
+    let doctor = h.doctor();
+    assert_eq!(doctor.status.code(), Some(0), "{}", stdout_of(&doctor));
+    assert_active_row(
+        &stdout_of(&doctor),
+        &h.active_row("recorded", "recorded", 1),
+    );
+    assert_eq!(store_snapshot(&h), before);
+}
+
+/// AC4/AC7: the listing is every platform of this project; the row counts only
+/// the measured host platform. The fixture's foreign Output holder and foreign
+/// unclaimed record make a wrong filter change Output and unclaimed, not just
+/// some other field.
+#[test]
+fn pins_lists_all_platforms_but_doctor_counts_only_host() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let project = project_id(&h.project);
+    let other_project = h.project_at("other");
+    let other_id = project_id(&other_project);
+    let host = host_platform_json();
+    let foreign = platform_json(foreign_arch(), None);
+    let variant = platform_json(image_archive::host_arch(), Some("v8"));
+
+    // Shuffled on purpose: order is the listing's, not the file's.
+    let bytes = store_bytes(
+        vec![
+            pin_json(
+                &project,
+                "example.com/q:tag",
+                &foreign,
+                &digest('e'),
+                5,
+                Some("boot"),
+            ),
+            pin_json(&project, "example.com/n:tag", &host, &digest('b'), 2, None),
+            pin_json(
+                &project,
+                "example.com/p:tag",
+                &variant,
+                &digest('d'),
+                4,
+                None,
+            ),
+            pin_json(
+                &project,
+                "example.com/m:tag",
+                &host,
+                &digest('a'),
+                1,
+                Some("boot"),
+            ),
+            pin_json(
+                &other_id,
+                "example.com/zzz-private:tag",
+                &host,
+                &digest('f'),
+                6,
+                Some("boot"),
+            ),
+            pin_json(
+                &project,
+                "example.com/o:tag",
+                &foreign,
+                &digest('c'),
+                3,
+                Some("output"),
+            ),
+            // One reference on three platforms: the listing keeps every row, and
+            // the order inside the reference is the rendered platform's bytes.
+            pin_json(
+                &project,
+                "example.com/shared:tag",
+                &variant,
+                &digest('3'),
+                9,
+                None,
+            ),
+            pin_json(
+                &project,
+                "example.com/shared:tag",
+                &host,
+                &digest('1'),
+                7,
+                None,
+            ),
+            pin_json(
+                &project,
+                "example.com/shared:tag",
+                &foreign,
+                &digest('2'),
+                8,
+                None,
+            ),
+        ],
+        vec![
+            scope_json(&project, &host, "boot"),
+            scope_json(&project, &foreign, "boot-and-output"),
+            scope_json(&other_id, &host, "boot"),
+        ],
+        Some(9),
+    );
+    seed_store(&h, &bytes);
+    let before = store_snapshot(&h);
+
+    let listing = h.pins_listing();
+    assert_eq!(listing.status.code(), Some(0), "{}", stderr(&listing));
+    let foreign_platform = format!("linux/{}", foreign_arch());
+    let variant_platform = format!("linux/{}/v8", image_archive::host_arch());
+    // The same reference on three platforms, in raw rendered-platform order and
+    // each with its own digest and knowledge: host = Boot resolved, foreign = both
+    // resolved, variant = no scope at all.
+    let mut shared = [
+        (
+            host_platform(),
+            pins_row(
+                "example.com/shared:tag",
+                &host_platform(),
+                &digest('1'),
+                7,
+                "none",
+                "output",
+            ),
+        ),
+        (
+            foreign_platform.clone(),
+            pins_row(
+                "example.com/shared:tag",
+                &foreign_platform,
+                &digest('2'),
+                8,
+                "none",
+                "none",
+            ),
+        ),
+        (
+            variant_platform.clone(),
+            pins_row(
+                "example.com/shared:tag",
+                &variant_platform,
+                &digest('3'),
+                9,
+                "none",
+                "boot+output",
+            ),
+        ),
+    ];
+    shared.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+    let shared_rows: Vec<String> = shared.into_iter().map(|(_, row)| row).collect();
+    assert_eq!(
+        stdout_of(&listing),
+        expected_listing(&[
+            pins_row(
+                "example.com/m:tag",
+                &host_platform(),
+                &digest('a'),
+                1,
+                "boot",
+                "output"
+            ),
+            pins_row(
+                "example.com/n:tag",
+                &host_platform(),
+                &digest('b'),
+                2,
+                "none",
+                "output"
+            ),
+            pins_row(
+                "example.com/o:tag",
+                &foreign_platform,
+                &digest('c'),
+                3,
+                "output",
+                "none"
+            ),
+            pins_row(
+                "example.com/p:tag",
+                &variant_platform,
+                &digest('d'),
+                4,
+                "none",
+                "boot+output"
+            ),
+            pins_row(
+                "example.com/q:tag",
+                &foreign_platform,
+                &digest('e'),
+                5,
+                "boot",
+                "none"
+            ),
+            shared_rows[0].clone(),
+            shared_rows[1].clone(),
+            shared_rows[2].clone(),
+        ]),
+        "another project's approval never appears"
+    );
+
+    let doctor = h.doctor();
+    assert_eq!(doctor.status.code(), Some(0), "{}", stdout_of(&doctor));
+    assert!(
+        !stdout_of(&doctor).contains("zzz-private"),
+        "the row carries no reference: {}",
+        stdout_of(&doctor)
+    );
+    // Host: `n` and `example.com/shared:tag` are unclaimed; the two foreign
+    // `shared` rows and the foreign Output holder never contribute.
+    assert_active_row(
+        &stdout_of(&doctor),
+        &h.active_row("recorded", "not recorded", 2),
+    );
+    assert_eq!(store_snapshot(&h), before);
+
+    // From a project with no approvals: header only, zero counts.
+    let empty = h.project_at("empty");
+    let state = h.project_at("empty-state");
+    let listing = h.pins_listing_in(&empty, &state);
+    assert_eq!(stdout_of(&listing), PINS_HEADER);
+    assert_eq!(listing.status.code(), Some(0), "{}", stderr(&listing));
+    let doctor = h.doctor_in(&empty, &state);
+    assert_eq!(doctor.status.code(), Some(0), "{}", stdout_of(&doctor));
+    assert_eq!(
+        stdout_of(&doctor)
+            .lines()
+            .filter(|line| line.starts_with("active images: "))
+            .collect::<Vec<_>>(),
+        [format!(
+            "active images: boot=not recorded, output=not recorded, unclaimed=0 [{}]",
+            h.pins().display()
+        )]
+    );
+    assert_eq!(store_snapshot(&h), before);
+}
+
+/// AC5: every damaged authority fails both surfaces safely. The sentinel proves
+/// no offending byte, reference or digest reaches either stream.
+#[test]
+fn pins_and_doctor_reject_damaged_authority_without_disclosure() {
+    const SENTINEL: &str = "PRIVATE-SENTINEL";
+    let h = Harness::new(Mode::LaunchSeam);
+    let project = project_id(&h.project);
+    let host = host_platform_json();
+    let valid_record = serde_json::json!({
+        "project": project,
+        "reference": format!("secret.example/{SENTINEL}:1"),
+        "platform": host,
+        "manifest_digest": digest('a'),
+        "revision": 1,
+    });
+    let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+        (
+            "broken json",
+            format!("{{\"pins\": [\"{SENTINEL}\"]").into_bytes(),
+            CORRUPT_MESSAGE,
+        ),
+        (
+            "duplicate key",
+            store_bytes(
+                vec![
+                    valid_record.clone(),
+                    pin_json(&project, &format!("secret.example/{SENTINEL}:1"), &host, &digest('b'), 2, None),
+                ],
+                Vec::new(),
+                None,
+            ),
+            CORRUPT_MESSAGE,
+        ),
+        (
+            "roles with no scope",
+            store_bytes(
+                vec![pin_json(&project, &format!("secret.example/{SENTINEL}:1"), &host, &digest('a'), 1, Some("boot"))],
+                Vec::new(),
+                Some(1),
+            ),
+            CORRUPT_MESSAGE,
+        ),
+        (
+            "explicit null role",
+            format!(
+                "{{\"version\":2,\"pins\":[{{\"project\":\"{project}\",\"reference\":\"secret.example/{SENTINEL}:1\",\"platform\":{host},\"manifest_digest\":\"{}\",\"revision\":1,\"roles\":null}}],\"pending_default\":null,\"sequence\":1}}",
+                digest('a')
+            )
+            .into_bytes(),
+            CORRUPT_MESSAGE,
+        ),
+        (
+            "explicit empty role",
+            format!(
+                "{{\"version\":2,\"pins\":[{{\"project\":\"{project}\",\"reference\":\"secret.example/{SENTINEL}:1\",\"platform\":{host},\"manifest_digest\":\"{}\",\"revision\":1,\"roles\":\"\"}}],\"pending_default\":null,\"sequence\":1}}",
+                digest('a')
+            )
+            .into_bytes(),
+            CORRUPT_MESSAGE,
+        ),
+        (
+            "wrong version",
+            format!(
+                "{{\"version\":3,\"pins\":[],\"pending_default\":null,\"junk\":\"{SENTINEL}\"}}"
+            )
+            .into_bytes(),
+            CORRUPT_MESSAGE,
+        ),
+        (
+            "version 1",
+            legacy_store(),
+            N1_V1,
+        ),
+        (
+            "oversized",
+            vec![b' '; 4 * 1024 * 1024 + 1],
+            CORRUPT_MESSAGE,
+        ),
+        (
+            "malformed foreign record",
+            store_bytes(
+                vec![
+                    pin_json(&project, &format!("secret.example/{SENTINEL}:1"), &host, &digest('a'), 1, None),
+                    pin_json(&project_id(&h.project_at("other")), "not a reference", &host, &digest('b'), 2, None),
+                ],
+                Vec::new(),
+                None,
+            ),
+            CORRUPT_MESSAGE,
+        ),
+    ];
+    for (label, bytes, expected) in cases {
+        seed_store(&h, &bytes);
+        let before = store_snapshot(&h);
+        let listing = h.pins_listing();
+        assert_eq!(
+            listing.status.code(),
+            Some(1),
+            "{label}: {}",
+            stderr(&listing)
+        );
+        assert_eq!(stdout_of(&listing), "", "{label} prints no listing");
+        let message = stderr(&listing);
+        assert_eq!(
+            message,
+            format!("Error: {expected}\n"),
+            "{label}: the store-owned message itself, exactly"
+        );
+        for leaked in [SENTINEL, "secret.example", "sha256:"] {
+            assert!(
+                !message.contains(leaked),
+                "{label} leaks {leaked}: {message}"
+            );
+        }
+        let doctor = h.doctor();
+        assert_eq!(
+            doctor.status.code(),
+            Some(1),
+            "{label}: {}",
+            stdout_of(&doctor)
+        );
+        let stdout = stdout_of(&doctor);
+        let rows: Vec<&str> = stdout
+            .lines()
+            .filter(|line| line.starts_with("active images: "))
+            .collect();
+        assert_eq!(rows.len(), 1, "{label}: exactly one row: {stdout}");
+        assert_eq!(
+            rows[0],
+            format!("active images: error: {expected}"),
+            "{label}: the store-owned message itself, exactly"
+        );
+        assert!(
+            stdout.contains("==> agent-vm doctor: available operations"),
+            "{label}: later sections still print"
+        );
+        for leaked in [SENTINEL, "secret.example", "sha256:"] {
+            assert!(
+                !stdout.contains(leaked) && !stderr(&doctor).contains(leaked),
+                "{label} leaks {leaked}: {stdout}{}",
+                stderr(&doctor)
+            );
+        }
+        assert_eq!(store_snapshot(&h), before, "{label} is not repaired");
+    }
+
+    // A store path that is not a regular file: the bounded no-follow reader
+    // refuses it, and a FIFO cannot hang the harness.
+    for kind in ["symlink", "directory", "fifo"] {
+        let h = Harness::new(Mode::LaunchSeam);
+        seed_store(&h, b"{}");
+        fs::remove_file(h.pins()).unwrap();
+        let target = config_dir(&h).join("real-store.json");
+        match kind {
+            "symlink" => {
+                fs::write(&target, b"{}").unwrap();
+                std::os::unix::fs::symlink(&target, h.pins()).unwrap();
+            }
+            "directory" => fs::create_dir(h.pins()).unwrap(),
+            _ => {
+                let path = std::ffi::CString::new(h.pins().as_os_str().as_encoded_bytes()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+            }
+        }
+        let before = authority_inventory(&h);
+        let listing = h.pins_listing();
+        assert_eq!(
+            listing.status.code(),
+            Some(1),
+            "{kind}: {}",
+            stderr(&listing)
+        );
+        assert_eq!(stdout_of(&listing), "", "{kind} prints no listing");
+        assert_eq!(
+            stderr(&listing),
+            format!("Error: {CORRUPT_MESSAGE}\n"),
+            "{kind}: the store-owned message itself, exactly"
+        );
+        let doctor = h.doctor();
+        assert_eq!(
+            doctor.status.code(),
+            Some(1),
+            "{kind}: {}",
+            stdout_of(&doctor)
+        );
+        assert_active_row(
+            &stdout_of(&doctor),
+            &format!("active images: error: {CORRUPT_MESSAGE}"),
+        );
+        assert_eq!(
+            authority_inventory(&h),
+            before,
+            "{kind}: neither verb rewrites the special store path, the lock or              the symlink target"
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&target).is_ok(),
+            kind == "symlink"
+        );
+    }
+}
+
+/// AC5/AC9 N1: a directory coordination file must fail *access* before the
+/// record is read, so a malformed or v1 record never supplies the message.
+#[test]
+fn pins_directory_lock_errors_precede_malformed_or_v1_record() {
+    for bytes in [b"not json".to_vec(), legacy_store()] {
+        let h = Harness::new(Mode::LaunchSeam);
+        fs::create_dir_all(config_dir(&h)).unwrap();
+        fs::write(h.pins(), &bytes).unwrap();
+        fs::create_dir(config_dir(&h).join("image-pins.lock")).unwrap();
+        let before = store_snapshot(&h);
+
+        let listing = h.pins_listing();
+        assert_eq!(listing.status.code(), Some(1), "{}", stderr(&listing));
+        assert_eq!(stdout_of(&listing), "");
+        assert_eq!(stderr(&listing), format!("Error: {N1_ACCESS}\n"));
+        for absent in ["damaged", "version 1 format"] {
+            assert!(
+                !stderr(&listing).contains(absent),
+                "the shape check precedes the read: {}",
+                stderr(&listing)
+            );
+        }
+        assert_eq!(store_snapshot(&h), before);
+    }
+    assert!(!N1_V1.is_empty());
+}
+
+/// AC5/AC8: a record without its stable lock is damage on both surfaces, and a
+/// usage error is decided before any read — even with a damaged store.
+#[test]
+fn pins_missing_lock_is_damage_and_usage_precedes_read() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let project = project_id(&h.project);
+    let bytes = store_bytes(
+        vec![pin_json(
+            &project,
+            "example.com/x:tag",
+            &host_platform_json(),
+            &digest('a'),
+            1,
+            Some("boot"),
+        )],
+        vec![scope_json(&project, &host_platform_json(), "boot")],
+        Some(1),
+    );
+    seed_store(&h, &bytes);
+    fs::remove_file(config_dir(&h).join("image-pins.lock")).unwrap();
+    let before = store_snapshot(&h);
+
+    let listing = h.pins_listing();
+    assert_eq!(listing.status.code(), Some(1), "{}", stderr(&listing));
+    assert_eq!(stdout_of(&listing), "");
+    assert!(stderr(&listing).contains("damaged"), "{}", stderr(&listing));
+    let doctor = h.doctor();
+    assert_eq!(doctor.status.code(), Some(1), "{}", stdout_of(&doctor));
+    assert!(
+        stdout_of(&doctor).contains("active images: error: image pin authority"),
+        "{}",
+        stdout_of(&doctor)
+    );
+
+    for args in [
+        vec!["image", "pins", "extra"],
+        vec!["image", "pins", "--json"],
+        vec!["image", "pins", "--yes"],
+        vec!["image", "pins", "--image", "x:1"],
+        vec!["--image", "x:1", "image", "pins"],
+    ] {
+        let mut command = h.command();
+        command.args(&args);
+        let out = bounded(command);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {}", stderr(&out));
+        assert_eq!(stdout_of(&out), "", "{args:?} prints nothing");
+    }
+    assert_eq!(store_snapshot(&h), before, "a missing lock stays missing");
+}
+
+/// AC6: the listing needs no configuration and the row survives a broken one.
+#[test]
+fn pins_ignores_broken_config_and_doctor_still_counts() {
+    // (label, user config, project config, project config is a directory)
+    for (label, user_config, project_config, project_directory) in [
+        (
+            "syntax-invalid user config",
+            Some("broken = = toml\n"),
+            None,
+            false,
+        ),
+        (
+            "syntax-invalid project config",
+            None,
+            Some("this is not = = toml\n"),
+            false,
+        ),
+        ("config path is a directory", None, None, true),
+        (
+            "broken catalog with a usable image",
+            None,
+            Some(
+                "image = \"127.0.0.1:1/project:dev\"\n[[tools]]\nname = \"t\"\ncommand = \"t\"\ntools = [\"missing\"]\n",
+            ),
+            false,
+        ),
+    ] {
+        let h = Harness::new(Mode::LaunchSeam);
+        if let Some(config) = user_config {
+            fs::create_dir_all(config_dir(&h)).unwrap();
+            fs::write(config_dir(&h).join("config.toml"), config).unwrap();
+        }
+        let project_config_path = h.project.join(".agent-vm/config.toml");
+        if project_directory {
+            fs::create_dir_all(&project_config_path).unwrap();
+        } else if let Some(config) = project_config {
+            fs::create_dir_all(project_config_path.parent().unwrap()).unwrap();
+            fs::write(&project_config_path, config).unwrap();
+        }
+        let project = project_id(&h.project);
+        let host = host_platform_json();
+        let bytes = store_bytes(
+            vec![pin_json(
+                &project,
+                "example.com/x:tag",
+                &host,
+                &digest('a'),
+                1,
+                Some("boot"),
+            )],
+            vec![scope_json(&project, &host, "boot")],
+            Some(1),
+        );
+        seed_store(&h, &bytes);
+        let before = store_snapshot(&h);
+
+        let listing = h.pins_listing();
+        assert_eq!(
+            listing.status.code(),
+            Some(0),
+            "{label}: {}",
+            stderr(&listing)
+        );
+        assert_eq!(stderr(&listing), "", "{label}");
+        assert_eq!(
+            stdout_of(&listing),
+            expected_listing(&[pins_row(
+                "example.com/x:tag",
+                &host_platform(),
+                &digest('a'),
+                1,
+                "boot",
+                "output"
+            )]),
+            "{label}"
+        );
+
+        let doctor = h.doctor();
+        assert_eq!(
+            doctor.status.code(),
+            Some(1),
+            "{label}: {}",
+            stdout_of(&doctor)
+        );
+        assert_active_row(
+            &stdout_of(&doctor),
+            &h.active_row("recorded", "not recorded", 0),
+        );
+        // The two configuration branches are distinct, and the row appears in
+        // both: an unreadable configuration says so, a readable image with a
+        // broken catalog still renders the tier rows.
+        let stdout = stdout_of(&doctor);
+        let broken_catalog = label == "broken catalog with a usable image";
+        assert_eq!(
+            stdout.contains("unknown (configuration could not be read)"),
+            !broken_catalog,
+            "{label} must take its own configuration branch:\n{stdout}"
+        );
+        assert_eq!(
+            stdout.contains("user:    "),
+            broken_catalog,
+            "{label} must render the tier rows only when they are readable:\n{stdout}"
+        );
+        assert_eq!(store_snapshot(&h), before, "{label}");
+    }
+}
+
+/// AC7/AC8: a location failure is status 1 with no listing; a usage error is
+/// status 2 before anything is read.
+#[test]
+fn pins_location_and_argument_failures_have_exact_statuses() {
+    let h = Harness::new(Mode::LaunchSeam);
+    for home in ["", "relative/home"] {
+        let mut command = h.command();
+        command.env("HOME", home);
+        command.args(["image", "pins"]);
+        let out = bounded(command);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "HOME={home:?}: {}",
+            stderr(&out)
+        );
+        assert_eq!(stdout_of(&out), "");
+        assert!(
+            stderr(&out).contains("could not be accessed or saved"),
+            "HOME={home:?}: {}",
+            stderr(&out)
+        );
+        // Doctor reports the same unlocatable authority as a safe error row —
+        // never zero counts and never `unknown (the project could not be
+        // captured)` — with no path suffix and no added failure.
+        let mut command = h.command();
+        command.env("HOME", home).arg("doctor");
+        let doctor = bounded(command);
+        let stdout = stdout_of(&doctor);
+        let lines: Vec<&str> = stdout.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| line.starts_with("active images: "))
+            .unwrap_or_else(|| panic!("HOME={home:?}: no active row:\n{stdout}"));
+        assert_eq!(
+            lines[at],
+            "active images: error: image pin authority at $HOME/.config/agent-vm/image-pins.json could not be accessed or saved",
+            "HOME={home:?}"
+        );
+        assert!(!lines[at].contains('['), "HOME={home:?}: no path suffix");
+        assert!(
+            !stderr(&doctor).contains("image pin authority"),
+            "HOME={home:?}: an unlocatable store adds no failure: {}",
+            stderr(&doctor)
+        );
+    }
+    let mut command = h.command();
+    command.env_remove("HOME");
+    command.args(["image", "pins"]);
+    let out = bounded(command);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(stdout_of(&out), "");
+    assert!(stderr(&out).contains("could not be accessed or saved"));
+
+    assert!(
+        !config_dir(&h).exists(),
+        "no failing location case creates authority"
+    );
+}
+
+/// AC9: only stdout discloses. Trace logging and the debug dump must not carry
+/// the stored reference or digest, and the row cannot either.
+#[test]
+fn pins_discloses_only_stdout_and_doctor_row_is_redacted() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let project = project_id(&h.project);
+    // A canonical reference: OCI repository names are lowercase, so a
+    // sentinel that could not be stored would fail the file instead.
+    let reference = "private.example/secret-ref:1";
+    let stored = digest('d');
+    let bytes = store_bytes(
+        vec![pin_json(
+            &project,
+            reference,
+            &host_platform_json(),
+            &stored,
+            3,
+            Some("boot"),
+        )],
+        vec![scope_json(&project, &host_platform_json(), "boot")],
+        Some(3),
+    );
+    seed_store(&h, &bytes);
+    let before = store_snapshot(&h);
+
+    let mut command = h.command();
+    command
+        .env("RUST_LOG", "trace")
+        .env("AGENT_VM_DEBUG_CONFIG", "1")
+        .args(["image", "pins"]);
+    let out = bounded(command);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let tsv = expected_listing(&[pins_row(
+        reference,
+        &host_platform(),
+        &stored,
+        3,
+        "boot",
+        "output",
+    )]);
+    assert_eq!(stdout_of(&out), tsv);
+    // The seeded values themselves, not a different sentinel: this is the one
+    // surface allowed to print them, and nothing else may.
+    for leak in [reference, stored.as_str()] {
+        assert!(
+            !stderr(&out).contains(leak),
+            "listing stderr leaks {leak}: {}",
+            stderr(&out)
+        );
+        let beyond_the_listing = stdout_of(&out).replace(&tsv, "");
+        assert!(
+            !beyond_the_listing.contains(leak),
+            "the listing repeats {leak} outside its one TSV block: {beyond_the_listing:?}"
+        );
+    }
+
+    let mut command = h.command();
+    command
+        .env("RUST_LOG", "trace")
+        .env("AGENT_VM_DEBUG_CONFIG", "1")
+        .arg("doctor");
+    let doctor = bounded(command);
+    assert_eq!(doctor.status.code(), Some(0), "{}", stderr(&doctor));
+    for leak in [reference, stored.as_str()] {
+        assert!(
+            !stdout_of(&doctor).contains(leak),
+            "the report leaks {leak}: {}",
+            stdout_of(&doctor)
+        );
+        assert!(
+            !stderr(&doctor).contains(leak),
+            "doctor stderr leaks {leak}: {}",
+            stderr(&doctor)
+        );
+    }
+    assert_active_row(
+        &stdout_of(&doctor),
+        &h.active_row("recorded", "not recorded", 0),
+    );
+    assert_eq!(store_snapshot(&h), before);
+}
+
+/// AC6/AC9: the invalid-environment branch renders the row directly after its
+/// refusal, invents no default/selected rows, and leaves the environment
+/// diagnostic as the single stderr failure — even when the store is damaged.
+#[test]
+fn doctor_invalid_environment_still_reports_active_images() {
+    let invalid = || {
+        use std::os::unix::ffi::OsStringExt as _;
+        std::ffi::OsString::from_vec(b"not-\xff-utf8".to_vec())
+    };
+    let expected_stderr = "Error: AGENT_VM_IMAGE_TAG is set but is not valid Unicode; doctor cannot report a selected image\n";
+
+    // (a) Healthy store: the available row.
+    let h = Harness::new(Mode::LaunchSeam);
+    let project = project_id(&h.project);
+    let bytes = store_bytes(
+        vec![pin_json(
+            &project,
+            "example.com/x:tag",
+            &host_platform_json(),
+            &digest('a'),
+            1,
+            Some("boot"),
+        )],
+        vec![scope_json(&project, &host_platform_json(), "boot")],
+        Some(1),
+    );
+    seed_store(&h, &bytes);
+    let before = store_snapshot(&h);
+    let mut command = h.command();
+    command.env("AGENT_VM_IMAGE_TAG", invalid()).arg("doctor");
+    let doctor = bounded(command);
+    assert_eq!(doctor.status.code(), Some(1), "{}", stdout_of(&doctor));
+    assert_eq!(stderr(&doctor), expected_stderr);
+    let stdout = stdout_of(&doctor);
+    let lines: Vec<&str> = stdout.lines().collect();
+    let refusal = lines
+        .iter()
+        .position(|line| {
+            *line == "AGENT_VM_IMAGE_TAG: <present but not valid Unicode; refusing to select>"
+        })
+        .unwrap_or_else(|| panic!("no refusal line:\n{stdout}"));
+    assert_eq!(
+        lines[refusal - 1],
+        "==> boot image",
+        "the refusal owns its section:\n{stdout}"
+    );
+    assert_eq!(
+        Some(lines[refusal + 1]),
+        Some(h.active_row("recorded", "not recorded", 0).as_str()),
+        "the row follows the refusal immediately:\n{stdout}"
+    );
+    assert_eq!(
+        boot_image_section(&stdout),
+        [
+            "==> boot image",
+            "AGENT_VM_IMAGE_TAG: <present but not valid Unicode; refusing to select>",
+            h.active_row("recorded", "not recorded", 0).as_str(),
+        ],
+        "no user/project/default/selected row is invented:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("==> agent-vm doctor: available operations"),
+        "later sections still print:\n{stdout}"
+    );
+    assert_eq!(store_snapshot(&h), before);
+
+    // (b) Damaged located store: the row reports it, the refusal still owns
+    // stderr, and the status is unchanged.
+    let h = Harness::new(Mode::LaunchSeam);
+    fs::create_dir_all(config_dir(&h)).unwrap();
+    fs::write(h.pins(), b"not json").unwrap();
+    fs::write(config_dir(&h).join("image-pins.lock"), b"").unwrap();
+    let before = store_snapshot(&h);
+    let mut command = h.command();
+    command.env("AGENT_VM_IMAGE_TAG", invalid()).arg("doctor");
+    let doctor = bounded(command);
+    assert_eq!(doctor.status.code(), Some(1), "{}", stdout_of(&doctor));
+    assert_eq!(
+        stderr(&doctor),
+        expected_stderr,
+        "the environment refusal keeps stderr precedence"
+    );
+    let stdout = stdout_of(&doctor);
+    let lines: Vec<&str> = stdout.lines().collect();
+    let refusal = lines
+        .iter()
+        .position(|line| {
+            *line == "AGENT_VM_IMAGE_TAG: <present but not valid Unicode; refusing to select>"
+        })
+        .unwrap_or_else(|| panic!("no refusal line:\n{stdout}"));
+    assert_eq!(
+        Some(lines[refusal + 1]),
+        Some(
+            "active images: error: image pin authority at $HOME/.config/agent-vm/image-pins.json is damaged; restore its intended records from backup or deliberately move it aside to reset approvals"
+        ),
+        "{stdout}"
+    );
+    let section = boot_image_section(&stdout);
+    assert!(
+        stdout.contains("==> agent-vm doctor: available operations"),
+        "later sections still print:\n{stdout}"
+    );
+    assert_eq!(
+        section.len(),
+        3,
+        "the section ends after the row:\n{stdout}"
+    );
+    assert!(
+        !section
+            .iter()
+            .any(|line| line.starts_with("selected (without --image):")),
+        "{stdout}"
+    );
+    assert_eq!(store_snapshot(&h), before);
+}
+
+/// AC10: `image show` keeps reporting the ambient selection, not what was
+/// recorded, before and after the listing exists.
+#[test]
+fn image_show_still_reports_ambient_not_recorded_boot() {
+    let h = Harness::new(Mode::LaunchSeam);
+    let server = Server::new();
+    let image = h.image(&ArchiveSpec::default());
+    let recorded = server.image("images", "recorded", &image);
+    let launch = h.launch(&recorded);
+    assert!(!launch.status.success(), "the fake runtime cannot boot");
+    assert_eq!(
+        h.pin_for(&recorded).map(|(digest, _)| digest),
+        Some(digest_of(&recorded)),
+        "the launch recorded the immutable selection"
+    );
+
+    let ambient = "127.0.0.1:1/ambient:dev";
+    let expected = format!("Image: {ambient}\nSource: AGENT_VM_IMAGE_TAG\n");
+    let show = |h: &Harness| {
+        let mut command = h.command();
+        command
+            .env("AGENT_VM_IMAGE_TAG", ambient)
+            .args(["image", "show"]);
+        bounded(command)
+    };
+    let first = show(&h);
+    assert_eq!(first.status.code(), Some(0), "{}", stderr(&first));
+    assert_eq!(stderr(&first), "", "a successful show is silent");
+    assert_eq!(stdout_of(&first), expected);
+
+    let before = store_snapshot(&h);
+    let listing = h.pins_listing();
+    assert_eq!(listing.status.code(), Some(0), "{}", stderr(&listing));
+    assert_eq!(
+        stdout_of(&listing),
+        expected_listing(&[pins_row(
+            &recorded,
+            &host_platform(),
+            &digest_of(&recorded),
+            1,
+            "boot",
+            "output"
+        )]),
+        "the listing shows the approval history, not the ambient selection"
+    );
+    assert!(!stdout_of(&listing).contains(ambient));
+    let doctor = h.doctor();
+    assert_eq!(doctor.status.code(), Some(0), "{}", stdout_of(&doctor));
+
+    let second = show(&h);
+    assert_eq!(
+        second.status.code(),
+        Some(0),
+        "the report and the status are unchanged: {}",
+        stderr(&second)
+    );
+    assert_eq!(stderr(&second), "", "a successful show is silent");
+    assert_eq!(stdout_of(&second), expected, "show's report is unchanged");
+    assert_eq!(store_snapshot(&h), before, "neither verb writes the store");
+}
+
+/// AC11: the documented example is the shipped bytes.
+#[test]
+fn pins_usage_example_matches_literal_output() {
+    const SAMPLE: &str = "registry.example/team/app:dev\tlinux/arm64\tsha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t7\tboot\toutput\n";
+    let h = Harness::new(Mode::LaunchSeam);
+    let project = project_id(&h.project);
+    // The documented platform verbatim, even on a host that is not arm64: the
+    // listing is platform-complete, so the sample is a valid store everywhere.
+    let arm64 = platform_json("arm64", None);
+    let bytes = store_bytes(
+        vec![pin_json(
+            &project,
+            "registry.example/team/app:dev",
+            &arm64,
+            &digest('a'),
+            7,
+            Some("boot"),
+        )],
+        vec![scope_json(&project, &arm64, "boot")],
+        Some(7),
+    );
+    seed_store(&h, &bytes);
+    let before = store_snapshot(&h);
+    let listing = h.pins_listing();
+    assert_eq!(listing.status.code(), Some(0), "{}", stderr(&listing));
+    assert_eq!(stdout_of(&listing), format!("{PINS_HEADER}{SAMPLE}"));
+
+    // The USAGE console example, extracted by its command line rather than
+    // retyped, must be those same bytes: a byte slice up to the closing fence, so
+    // no line-ending normalization can hide a difference.
+    let usage = include_str!("../../../USAGE.md");
+    let section = usage
+        .split_once("### Inspecting approved images")
+        .expect("USAGE has the shipped section")
+        .1;
+    let after_command = section
+        .split_once("$ agent-vm image pins\n")
+        .expect("the section shows one pins invocation")
+        .1;
+    let (documented, _) = after_command
+        .split_once("```")
+        .expect("the console block is closed");
+    assert_eq!(
+        documented.as_bytes(),
+        format!("{PINS_HEADER}{SAMPLE}").as_bytes(),
+        "the shipped block is exactly the header and the one sample row"
+    );
+    assert_eq!(
+        stdout_of(&listing).as_bytes(),
+        documented.as_bytes(),
+        "and the command prints those bytes unchanged"
+    );
+    assert_eq!(store_snapshot(&h), before);
 }
