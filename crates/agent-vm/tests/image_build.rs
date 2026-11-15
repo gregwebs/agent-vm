@@ -301,6 +301,16 @@ fn code_of(output: &Output) -> i32 {
         .unwrap_or_else(|| panic!("agent-vm died by signal: {:?}", output.status))
 }
 
+/// Every value following a `--build-context` flag, in Docker-call order. The
+/// whole sequence is the oracle: a presence-only `windows(2)` check cannot see
+/// an extra pair or a deduplicated one.
+fn build_context_values(argv: &[OsString]) -> Vec<OsString> {
+    argv.windows(2)
+        .filter(|window| window[0] == "--build-context")
+        .map(|window| window[1].clone())
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Cache observation
 // ---------------------------------------------------------------------------
@@ -494,6 +504,18 @@ fn optional_arguments_reach_docker_verbatim() {
         "FROM_ENV",
         "--build-arg",
         "META=$(echo pwned); ' \" #",
+        "--build-context",
+        "bin=ctx dir",
+        "--build-context",
+        "y=a=b",
+        "--build-context",
+        "alpine=docker-image://alpine:3.20",
+        "--build-context",
+        "meta=$(echo pwned); ' \" #",
+        "--build-context",
+        "x=a",
+        "--build-context",
+        "x=b",
         "--target",
         "stage",
         "--builder",
@@ -530,10 +552,42 @@ fn optional_arguments_reach_docker_verbatim() {
     assert!(rendered.contains(&"--pull".to_string()));
     assert!(rendered.contains(&"--no-cache".to_string()));
     assert_eq!(rendered.last().unwrap(), "ctx with spaces");
+    assert_eq!(
+        build_context_values(argv),
+        vec![
+            OsString::from("bin=ctx dir"),
+            OsString::from("y=a=b"),
+            OsString::from("alpine=docker-image://alpine:3.20"),
+            OsString::from("meta=$(echo pwned); ' \" #"),
+            OsString::from("x=a"),
+            OsString::from("x=b"),
+        ],
+        "the typed sequence, forwarded once each and in order: {rendered:?}"
+    );
+
+    // C4 (`.work/627/code-review.md`): the flag must not suppress publication.
+    // Deliberately independent of the byte/order oracle above: one Docker call,
+    // the printed notice names the result, the cache holds the replayed
+    // archive's metadata, and the build approved it.
+    assert_eq!(harness.docker_calls().len(), 1, "exactly one Docker call");
+    assert_eq!(
+        stdout_of(&output),
+        "Imported build result as app:dev; launch it with `--image app:dev`\n",
+        "the printed result names the imported reference"
+    );
+    let meta = metadata(&harness.cache_dir(), "app:dev");
+    assert_eq!(meta.manifest_digest, written.manifest_digest);
+    assert_eq!(meta.config_digest, written.config_digest);
+    assert_eq!(
+        pin_for(&harness, "docker.io/library/app:dev"),
+        Some((written.manifest_digest.clone(), 1)),
+        "the flagged build records its own approval"
+    );
+    assert_eq!(pin_records(&harness).len(), 1);
 }
 
 #[test]
-fn non_utf8_context_file_and_build_arg_are_forwarded() {
+fn non_utf8_context_file_build_arg_and_build_context_are_forwarded() {
     let mut harness = Harness::new();
     let spec = ArchiveSpec::default();
     let path = harness.home.join("a.tar");
@@ -548,6 +602,7 @@ fn non_utf8_context_file_and_build_arg_are_forwarded() {
         bytes.push(0x80);
         OsString::from_vec(bytes)
     };
+    let weird_context = OsString::from_vec(b"bin\x80=dir-\x81".to_vec());
 
     let argv: Vec<OsString> = vec![
         OsString::from("image"),
@@ -558,6 +613,8 @@ fn non_utf8_context_file_and_build_arg_are_forwarded() {
         weird_file.clone(),
         OsString::from("--build-arg"),
         weird_arg.clone(),
+        OsString::from("--build-context"),
+        weird_context.clone(),
         weird_name.clone(),
     ];
     let output = harness.run_os(&argv);
@@ -566,7 +623,74 @@ fn non_utf8_context_file_and_build_arg_are_forwarded() {
     let argv = &harness.docker_calls()[0];
     assert!(argv.windows(2).any(|w| w[1] == weird_file));
     assert!(argv.windows(2).any(|w| w[1] == weird_arg));
+    assert_eq!(build_context_values(argv), vec![weird_context]);
     assert_eq!(argv.last().unwrap(), &weird_name);
+}
+
+#[test]
+fn first_equals_oracle_edge_rows_reach_docker_untrimmed() {
+    // C8.1 (`.work/627/code-review.md`). The split is at the FIRST `=`: a
+    // last-separator implementation would accept `=a=b` (it would read NAME
+    // `=a`) and reject `a==` (it would read an empty PATH). Whitespace is an
+    // ordinary byte, so `" = "` is accepted — "whitespace-only halves" are not
+    // empty — and reaches Docker exactly, untrimmed.
+    let accepted: [&[u8]; 4] = [b"a==", b"a=b=", b" = ", b" n = p "];
+    let mut harness = Harness::new();
+    let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+    harness.replay(&written);
+    for (index, raw) in accepted.iter().enumerate() {
+        let value = OsString::from_vec(raw.to_vec());
+        let output = harness.run_os(&[
+            "image".into(),
+            "build".into(),
+            "--tag".into(),
+            "app:dev".into(),
+            "--build-context".into(),
+            value.clone(),
+        ]);
+        assert_eq!(code_of(&output), 0, "{raw:?}: {}", stderr_of(&output));
+        let calls = harness.docker_calls();
+        assert_eq!(calls.len(), index + 1, "{raw:?}: one call per build");
+        assert_eq!(
+            build_context_values(&calls[index]),
+            vec![value],
+            "{raw:?} must reach Docker byte for byte"
+        );
+    }
+
+    // The attached spelling carries non-UTF-8 bytes the same way the separate
+    // one does (AC3): the separator the parser splits at is ASCII.
+    let mut attached = b"--build-context=bin".to_vec();
+    attached.push(0x80);
+    attached.extend_from_slice(b"=dir-\x81");
+    let expected = OsString::from_vec(b"bin\x80=dir-\x81".to_vec());
+    let output = harness.run_os(&[
+        "image".into(),
+        "build".into(),
+        "--tag".into(),
+        "app:dev".into(),
+        OsString::from_vec(attached),
+    ]);
+    assert_eq!(code_of(&output), 0, "{}", stderr_of(&output));
+    assert_eq!(
+        build_context_values(&harness.docker_calls()[4]),
+        vec![expected]
+    );
+
+    // Rejected by the same measurement: an empty NAME, an empty PATH, and an
+    // empty raw value.
+    let rejected = Harness::new();
+    for (raw, reason) in [
+        ("=a=b", "NAME is empty; expected NAME=PATH"),
+        ("= ", "NAME is empty; expected NAME=PATH"),
+        (" =", "PATH is empty; expected NAME=PATH"),
+        ("", "expected NAME=PATH"),
+    ] {
+        let output = rejected.run(&["image", "build", "--tag", "a:1", "--build-context", raw]);
+        assert_eq!(code_of(&output), 2, "{raw:?}: {}", stderr_of(&output));
+        assert!(stderr_of(&output).contains(reason), "{raw:?}");
+        assert!(!rejected.docker_log.exists(), "docker ran for {raw:?}");
+    }
 }
 
 #[test]
@@ -727,6 +851,290 @@ fn out_of_surface_options_are_usage_errors() {
         );
         assert!(!harness.docker_log.exists(), "docker ran for {argv:?}");
     }
+}
+
+#[test]
+fn malformed_build_context_is_a_usage_error_before_docker() {
+    let harness = Harness::new();
+    let state_before = snapshot(&harness.state);
+    let pins_before = pins(&harness);
+    for (raw, reason) in [
+        ("x", "expected NAME=PATH"),
+        ("=p", "NAME is empty; expected NAME=PATH"),
+        ("=", "NAME is empty; expected NAME=PATH"),
+        ("n=", "PATH is empty; expected NAME=PATH"),
+    ] {
+        let output = harness.run(&["image", "build", "--tag", "app:dev", "--build-context", raw]);
+        assert_eq!(code_of(&output), 2, "{raw}: {}", stderr_of(&output));
+        let text = stderr_of(&output);
+        assert!(
+            text.contains("--build-context <NAME=PATH>"),
+            "{raw}: {text}"
+        );
+        assert!(text.contains(reason), "{raw}: {text}");
+    }
+    assert!(
+        !harness.docker_log.exists(),
+        "a shape error must not run Docker"
+    );
+    // Nothing was staged, imported or approved.
+    assert_eq!(snapshot(&harness.state), state_before);
+    assert_eq!(pins(&harness), pins_before);
+}
+
+#[test]
+fn hyphen_leading_build_context_needs_the_attached_spelling() {
+    // C6 (`.work/627/code-review.md`): clap reads a separate value that begins
+    // with `-` as an option, so only the attached spelling reaches the parser.
+    // USAGE states this; both spellings are pinned here.
+    let mut harness = Harness::new();
+    let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+    harness.replay(&written);
+    let output = harness.run(&[
+        "image",
+        "build",
+        "--tag",
+        "app:dev",
+        "--build-context=-bad=.",
+    ]);
+    assert_eq!(code_of(&output), 0, "{}", stderr_of(&output));
+    assert_eq!(
+        build_context_values(&harness.docker_calls()[0]),
+        vec![OsString::from("-bad=.")],
+        "the attached spelling is accepted and forwarded"
+    );
+    assert_eq!(
+        metadata(&harness.cache_dir(), "app:dev").manifest_digest,
+        written.manifest_digest
+    );
+
+    // The separate spelling is the option parser's rejection, before Docker.
+    let rejected = Harness::new();
+    let output = rejected.run(&[
+        "image",
+        "build",
+        "--tag",
+        "app:dev",
+        "--build-context",
+        "-bad=.",
+    ]);
+    assert_eq!(code_of(&output), 2, "{}", stderr_of(&output));
+    let text = stderr_of(&output);
+    assert!(text.contains("unexpected argument"), "{text}");
+    assert!(
+        !rejected.docker_log.exists(),
+        "docker ran for the rejected row"
+    );
+}
+
+#[test]
+fn launch_route_rejects_build_context_in_the_binary() {
+    // The launch build has no build options (ADR-0061), and a route that cannot
+    // forward the flag must reject it rather than accept and drop it. Rejection
+    // is clap's, so it is proven through the compiled binary: in-process,
+    // `parse_from` hands a non-direct error to `error.exit()`, which would end
+    // the test binary instead of failing one test.
+    for broken in [false, true] {
+        let harness = Harness::new();
+        if broken {
+            let config_dir = harness.home.join(".config/agent-vm");
+            fs::create_dir_all(&config_dir).unwrap();
+            fs::write(config_dir.join("config.toml"), "not valid toml = =\n").unwrap();
+        }
+        for argv in [
+            vec![
+                "--dockerfile",
+                "Dockerfile",
+                "--build-context",
+                "x=.",
+                "shell",
+            ],
+            vec!["--dockerfile", "Dockerfile", "--build-context=x=.", "shell"],
+            vec![
+                "--dockerfile",
+                "Dockerfile",
+                "--build-context",
+                "x=.",
+                "--",
+                "true",
+            ],
+            vec![
+                "--dockerfile",
+                "Dockerfile",
+                "--build-context=x=.",
+                "--",
+                "true",
+            ],
+            vec![
+                "--dockerfile",
+                "Dockerfile",
+                "--build-context",
+                "x=.",
+                "run",
+                "p",
+            ],
+            vec![
+                "--dockerfile",
+                "Dockerfile",
+                "--build-context=x=.",
+                "run",
+                "p",
+            ],
+        ] {
+            let output = harness.run(&argv);
+            assert_eq!(
+                code_of(&output),
+                2,
+                "{argv:?} broken={broken}: {}",
+                stderr_of(&output)
+            );
+            let text = stderr_of(&output);
+            assert!(text.contains("--build-context"), "{argv:?}: {text}");
+            assert!(!harness.docker_log.exists(), "docker ran for {argv:?}");
+        }
+    }
+}
+
+#[test]
+fn scrub_witness_parse_errors_take_precedence_and_are_value_free() {
+    // C1 (`.work/627/code-review.md`; `spec.md` supersedance R2/R6). A parse
+    // error on an argv that carries a `secret` witness is replaced wholesale by
+    // that routine's fixed, value-free text: status 1 on a non-direct route and
+    // none of the flag's own message. The rank is pre-existing and generic (the
+    // scrub selects by error *kind*), so this test pins the priority and the
+    // value-freeness rather than re-deciding them.
+    //
+    // The oracle is independent of the implementation: a sentinel value that the
+    // flag itself rejects must appear in no stream, so an error path that echoed
+    // the rejected token, or any argv value, fails here.
+    const SENTINEL: &str = "sentinel-627-value";
+    let control = Harness::new();
+    let output = control.run(&["image", "build", "--tag", "a:1", "--bogus-token", "secret"]);
+    assert_eq!(code_of(&output), 1, "{}", stderr_of(&output));
+    let control_text = stderr_of(&output);
+    assert!(
+        control_text.contains("could not parse its arguments"),
+        "{control_text}"
+    );
+    assert!(!control.docker_log.exists());
+
+    for argv in [
+        vec![
+            "image",
+            "build",
+            "--tag",
+            "a:1",
+            "--build-context",
+            "secret",
+        ],
+        vec![
+            "image",
+            "build",
+            "--tag",
+            "a:1",
+            "--build-arg",
+            "secret",
+            "--build-context",
+            SENTINEL,
+        ],
+        vec![
+            "--dockerfile",
+            "Dockerfile",
+            "--build-context",
+            "x=.",
+            "run",
+            "secret",
+        ],
+        vec![
+            "--dockerfile",
+            "Dockerfile",
+            "--build-context",
+            SENTINEL,
+            "run",
+            "secret",
+        ],
+    ] {
+        let harness = Harness::new();
+        let output = harness.run(&argv);
+        assert_eq!(code_of(&output), 1, "{argv:?}: {}", stderr_of(&output));
+        let text = stderr_of(&output);
+        assert_eq!(
+            text, control_text,
+            "{argv:?} must keep the scrub's fixed text"
+        );
+        assert!(
+            text.contains("could not parse its arguments"),
+            "{argv:?}: {text}"
+        );
+        // Value-free: neither the rejected value nor any other argv value leaks
+        // into either stream, and the flag's own message never appears.
+        for stream in [&text, &stdout_of(&output)] {
+            assert!(!stream.contains(SENTINEL), "{argv:?}: {stream}");
+            assert!(!stream.contains("a:1"), "{argv:?}: {stream}");
+            assert!(!stream.contains("Dockerfile"), "{argv:?}: {stream}");
+            assert!(!stream.contains("--build-context"), "{argv:?}: {stream}");
+            assert!(!stream.contains("NAME=PATH"), "{argv:?}: {stream}");
+        }
+        assert!(!harness.docker_log.exists(), "docker ran for {argv:?}");
+        assert!(pins(&harness).is_none(), "approved for {argv:?}");
+        assert!(manifests_json(&harness).is_empty(), "imported for {argv:?}");
+    }
+
+    // The other witness is a clap usage error rather than an ordinary one
+    // (`spec.md` supersedance table), so the image-import form keeps status 2
+    // and is equally value-free.
+    let harness = Harness::new();
+    let output = harness.run(&[
+        "image",
+        "build",
+        "--tag",
+        "a:1",
+        "--build-context",
+        SENTINEL,
+        "image",
+        "import",
+    ]);
+    assert_eq!(code_of(&output), 2, "{}", stderr_of(&output));
+    let text = stderr_of(&output);
+    assert!(text.contains("agent-vm image import"), "{text}");
+    assert!(!text.contains(SENTINEL), "{text}");
+    assert!(!text.contains("NAME=PATH"), "{text}");
+    assert!(!harness.docker_log.exists());
+    assert!(pins(&harness).is_none());
+    assert!(manifests_json(&harness).is_empty());
+}
+
+#[test]
+fn malformed_build_context_precedes_a_damaged_pin_store_and_all_io() {
+    // C8.2 (`.work/627/code-review.md`). The shape error is clap's, raised while
+    // parsing: a damaged approval store — which a valid invocation reports
+    // first — cannot pre-empt it, and no staging directory or `msb` call may
+    // exist.
+    let harness = Harness::new();
+    damage_store(&harness);
+    let damaged = fs::read(pins_path(&harness)).unwrap();
+    let output = harness.run(&[
+        "image",
+        "build",
+        "--tag",
+        "app:dev",
+        "--build-context",
+        "n=",
+    ]);
+    assert_eq!(code_of(&output), 2, "{}", stderr_of(&output));
+    let text = stderr_of(&output);
+    assert!(text.contains("PATH is empty; expected NAME=PATH"), "{text}");
+    assert!(
+        !text.contains("is damaged"),
+        "the shape error comes before the store is read: {text}"
+    );
+    assert!(!harness.docker_log.exists(), "docker ran");
+    assert!(harness.msb_invocations().is_empty(), "msb ran");
+    assert!(
+        !harness.msb_home().exists(),
+        "no staging or cache directory may be created"
+    );
+    assert_eq!(fs::read(pins_path(&harness)).unwrap(), damaged);
 }
 
 #[test]
@@ -1065,6 +1473,8 @@ fn builder_nonzero_exit_fails_without_importing_and_keeps_old_result() {
         "app:dev",
         "--build-arg",
         "SECRET=leak-me",
+        "--build-context",
+        "bin=.",
     ]);
     assert_eq!(code_of(&output), 23, "the builder's code is propagated");
     let text = stderr_of(&output);
@@ -1081,6 +1491,38 @@ fn builder_nonzero_exit_fails_without_importing_and_keeps_old_result() {
     );
     assert_eq!(snapshot(&harness.home.join(".config")), before);
     assert_eq!(snapshot(&harness.metadata_snapshot_root()), cache_before);
+}
+
+#[test]
+fn build_context_path_sentinel_is_not_leaked_and_nothing_is_imported() {
+    // C8.3 (`.work/627/code-review.md`). PATH is Docker's and can name a
+    // sensitive host directory: agent-vm's own failure text names the command,
+    // never an argv value, and a failed export imports nothing.
+    const SENTINEL: &str = "CONTEXT-PATH-SENTINEL-627";
+    let mut harness = Harness::new();
+    harness.docker_exit(23);
+    let output = harness.run(&[
+        "image",
+        "build",
+        "--tag",
+        "app:dev",
+        "--build-context",
+        "bin=/host/very/secret/CONTEXT-PATH-SENTINEL-627",
+        ".",
+    ]);
+    assert_eq!(code_of(&output), 23);
+    let text = stderr_of(&output);
+    assert!(text.contains("docker buildx build failed"), "{text}");
+    assert!(
+        !text.contains(SENTINEL),
+        "the context path is echoed: {text}"
+    );
+    assert!(!stdout_of(&output).contains(SENTINEL));
+    assert!(
+        !has_metadata(&harness.cache_dir(), "app:dev"),
+        "a failed export imports nothing"
+    );
+    assert!(pins(&harness).is_none(), "nothing may be approved");
 }
 
 #[test]
