@@ -214,6 +214,33 @@ jobs:
       - name: Run macOS build script workflow tests
         run: bash script/test/build-workflow.sh
 
+  # The real `/usr/bin/security` contract for the keychain host credential
+  # location (#497, ADR-0056). Its own job because it needs a Rust toolchain and a
+  # real build, while `macos-build-script` stays toolchain-free; the test itself is
+  # isolated to a disposable keychain in a temp dir, so a shared runner is fine.
+  macos-keychain-contract:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1 (2026-08-05)
+        with:
+          toolchain: "1.98.1"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-all-crates: "true"
+          cache-workspace-crates: "true"
+
+      - name: Real `security` contract (disposable keychain)
+        run: bash script/test/keychain-contract.sh
+
   # The single check to require on a branch. Every leg above is independent, so
   # this job only aggregates them — and it keeps the name the pre-split workflow
   # used, so a branch protection rule that names it needs no change. `always()`
@@ -221,7 +248,7 @@ jobs:
   # skipped, and a skipped required check never turns red).
   build-and-test:
     if: always()
-    needs: [contracts, test, lint, macos-build-script]
+    needs: [contracts, test, lint, macos-build-script, macos-keychain-contract]
     runs-on: ubuntu-latest
     steps:
       - name: Fail when a leg did not pass

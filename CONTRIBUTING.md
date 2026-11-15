@@ -901,16 +901,30 @@ exported `AGENT_VM_IMAGE_TAG` is the same class of trap: it acts as `--image`
 whenever the typed flag is omitted, outranking any configured `image`, so a
 “default config” check silently boots the wrong image. The harness clears it.)
 
-#### The `#[ignore]`d keychain test
+#### The `#[ignore]`d keychain tests
 
-One `#[ignore]`d test remains: `secret_store::tests::system_keychain_round_trip`
-writes and removes one synthetic item in the host OS credential store, so it is
-operator opt-in, never CI:
+Two `#[ignore]`d tests remain, both opt-in.
+
+`secret_store::tests::system_keychain_round_trip` writes and removes one
+synthetic item in the host OS credential store, so it is operator opt-in, never
+CI:
 
 ```bash
 cargo test -p agent-vm --bin agent-vm secret_store::tests::system_keychain_round_trip \
   -- --ignored --exact --test-threads=1
 ```
+
+`host_credential::mac_keychain::tests::real_security_contract_in_a_disposable_keychain`
+pins the measured `/usr/bin/security` contract ([ADR-0056](docs/adr/0056-macos-keychain-as-a-host-credential-location.md))
+against a disposable keychain in a temp dir. One command from a checkout:
+
+```bash
+bash script/test/keychain-contract.sh
+```
+
+The script refuses on a non-Darwin host and needs no arguments; CI runs it in the
+`macos-keychain-contract` job. Nothing it prints can be a credential: the
+fixtures are canaries.
 
 There is no `--lib` target, so `--bin agent-vm` is required.
 
@@ -1010,6 +1024,11 @@ login item out of the suite:
   launch path the test asserts. Such a harness must use
   `support::path_without_host_keychain()`.
 
+The only test that spends the real `/usr/bin/security` is the opt-in contract
+test, and it never addresses the real item: it creates its own keychain in a
+temp dir, names it explicitly on every operation, and deletes it (see
+`script/test/keychain-contract.sh` above).
+
 Check it on a Mac that holds a real item by shadowing `security` for the whole
 suite and looking for any invocation that had no `$HOME`:
 
@@ -1079,6 +1098,7 @@ while ordinary `setup` intentionally creates a verification guest.
 | `cargo test --test image_pin_approval` | yes (`cargo test -p agent-vm`) | boot-free compiled-CLI approval matrix: prompt-free pull on a terminal and a pipe, removed `--yes`, frozen candidate, CAS/stale revision, S1 journal recovery, project-default establishment and pull adoption, cache-loss digest reacquisition, build/import result approval, the active image set (one-off Boot switching and retirement, a warm changed-alias return after retirement, a literal old-v2 claim then a byte-identical no-op, and committed-success warnings for an unreported checkpoint or notice). No VM evidence |
 | `cargo test --bin agent-vm -- image_pin::active image_pin::store` | yes | kernels and store: 36-row knowledge/9-pair retirement tables, strict role/scope decode, legacy Boot/Output retention, pull-uncertainty and same-target cleanup, global allocation/exhaustion/recovery, retire-reinsert ABA, and the four independent count/byte/scope capacity fixtures. No VM evidence |
 | `cargo test … -- --ignored` | **no** | keychain round-trip; operator opt-in, never ordinary CI |
+| `script/test/keychain-contract.sh` | yes (`macos-keychain-contract` job) | the opt-in `#[ignore]`d test against the real `/usr/bin/security`, isolated to a disposable keychain in a temp dir; canaries only |
 | `AGENT_VM_E2E_SECRETSPEC=/opt/homebrew/bin/secretspec cargo test -p agent-vm --test config_launch_driven a_real_secretspec_serve_round_trip -- --ignored --exact` | **no** | the real `secretspec` binary as-is (no chmod/chown/copy/reinstall); isolated `HOME`, a manifest inside the test harness's own `TempDir`, and — for every command the test runs itself — a cleared environment repopulated with only `HOME`, `PATH=/usr/bin:/bin` and `XDG_{CONFIG,DATA,STATE,CACHE}_HOME` under that `HOME`, so a developer's `SECRETSPEC_*`, `XDG_*` and real audit store are never consulted; absent the variable the test refuses to run rather than auto-detecting an install |
 | `script/test/single-binary-contract.sh` | yes (`ci.yml`) | fake payload; lone copy, reuse, concurrency, tamper, unwritable, rejected-launch state, and `image show` unpacking nothing (C12); the only `embedded-runtime` clippy pass, which is what lints the payload build module |
 | `cargo test --test image_show` | yes (`cargo test -p agent-vm`) | boot-free black-box `image show` matrix: precedence, provenance, damaged/unused fallback, escaping, help/argument surface, and no runtime/cache/state/network observation. No VM evidence |
@@ -1151,7 +1171,9 @@ A `main` push is never cancelled, so every landed commit keeps its own run.
 One job is one sum of its steps, so `ci.yml`'s legs run as separate jobs:
 `contracts` (the pre-build gate), `test` (one job per shard), `lint` (fmt,
 clippy, the single-binary contract and, on a `main` push only, the release
-build) and `macos-build-script`. `build-and-test` aggregates them and is the
+build), `macos-build-script` (toolchain-free, fake-tool build-script tests) and
+`macos-keychain-contract` (the real-`security` keychain contract). `build-and-test`
+aggregates them and is the
 one check to require on a branch; it fails if any leg did. The release build
 is `main`-only because nothing in CI consumes `target/release/agent-vm`;
 `cargo check --release --tests` still runs on every commit.

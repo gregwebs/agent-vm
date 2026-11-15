@@ -3,7 +3,10 @@
 ## Status
 
 Accepted. Implementation decision for [agent-vm
-#492](https://github.com/gregwebs/agent-vm/issues/492). Amends nothing: the host-only
+#492](https://github.com/gregwebs/agent-vm/issues/492). Amended by
+[#497](https://github.com/gregwebs/agent-vm/issues/497): the adapter decodes the
+hex presentation `-w` falls back to (*One decode is the whole policy*), and the
+real-binary contract now runs in macOS CI. Amends nothing: the host-only
 token file and its per-connection re-read ([ADR-0010](0010-wire-file-backed-credential-injection.md))
 are unchanged, and the foreign item is **never** addressed through agent-vm's own
 secret store ([ADR-0024](0024-host-secret-inventory.md)).
@@ -95,6 +98,7 @@ shadow `PATH` can already edit the host credential file directly.
 | stderr | drained to a sink, never logged, never in an error | same |
 | child environment | `host_cli`'s allow-list: cleared, then `HOME`/`PATH`/`USER`/`LOGNAME`/`TMPDIR`/locale/proxy vars | same |
 | trailing byte | at most one `\n` removed — the presentation byte `security -w` adds | same |
+| hex presentation | one decode, only after a failed parse, on a non-empty even-length all-hex string (so at most the item cap, and at most half of it decoded) | same |
 
 A timeout, a non-zero exit other than "item not found", a malformed blob or an
 oversize makes the keychain candidate **ineligible** — never an error that fails
@@ -128,22 +132,51 @@ treated the same way, so `doctor` stays byte-identical on a host without the ite
 
 ### The measured `security` contract
 
-Established by an opt-in test against the real `/usr/bin/security` in a
-**disposable** keychain (never the login keychain, never the default search list,
-never the real item):
+Established by a test against the real `/usr/bin/security` in a **disposable**
+keychain (never the login keychain, never the default search list, never the real
+item). It runs in the `macos-keychain-contract` CI job
+(`script/test/keychain-contract.sh`) and stays opt-in locally: the test is
+`#[ignore]`d and only runs with `AGENT_VM_REAL_KEYCHAIN_CONTRACT=1`.
 
 | Fact | Measured behaviour |
 |---|---|
 | Read shape | `security find-generic-password -a <acct> -w -s "<service>"`; the keychain is a positional argument on this macOS, which is how the contract test isolates itself |
 | `-w` output | the item's data followed by exactly one `\n` |
 | Writes | plaintext (`-w <data>`) and hex (`-X <hex>`, the option Claude Code passes through `security -i`) both round-trip to the intended bytes |
-| `-w` and non-printable data | **hex-encodes** the data — a trailing `\n`, or any byte outside printable ASCII, is enough. Claude Code's credential JSON is printable, so this only makes a non-JSON item *ineligible* (the file location decides); it never becomes a silently misread credential |
+| `-w` and non-printable data | **hex-encodes** the data — a trailing `\n`, or any byte outside printable ASCII, is enough. The adapter recognises that presentation and decodes it exactly once ([#497](https://github.com/gregwebs/agent-vm/issues/497)), so a credential JSON that gains one such byte stays selectable |
 | Missing item, or an item under a different account | exit status **44** |
 | Bare query | finds an item when exactly one matches; with several matches the order is not specified, which is why the bare query is only a retry for a miss |
 
 That hex behaviour is also why the "one newline retained" rule is stated as a
 byte-level rule for the adapter: data the CLI would present as plaintext never
 ends in a newline, because such data is presented as hex instead.
+
+### One decode is the whole policy
+
+`security -w` is the only writer of the hex presentation, so the decode lives in
+the adapter: try the JSON parse first and, only when it fails on a non-empty,
+even-length, all-hex-digit string, decode **once** and parse again (#497). The
+file location gains no decode path, gains no second parser, and the failure
+vocabulary is unchanged.
+
+One decode settles the question, which is why there is no nesting and no
+recursive retry:
+
+- Plaintext can never arrive as hex — `{` is not a hex digit — so a document
+  that parsed is never decoded, and the two presentations cannot be confused.
+- A second decode could only re-decode a decoded buffer, and hex of hex decodes
+  to hex, not JSON, so it could only manufacture a credential out of an item
+  that holds none. An item whose data is hex-shaped but not a credential
+  (`deadbeef`) therefore stays ineligible.
+- The bound does not change: the decode runs on at most the already-capped
+  buffer, and produces at most half of it.
+
+A double failure stays an ineligible candidate with
+`Unusable::HostCredentialMalformed`, and the reason that survives is the
+**decoded** parse's. It describes the item rather than the presentation — a
+hex-encoded non-credential reads as `missing claudeAiOauth`, not as "not valid
+JSON" — and it carries only serde's own error text, the same shape the file
+location already renders, so no item bytes reach `doctor`, a log or an error.
 
 ### Account precedence
 
