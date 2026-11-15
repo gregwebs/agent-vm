@@ -9,7 +9,7 @@
 //!
 //! # Three consent surfaces, one rendering rule
 //!
-//! The explicit commands `image refresh`, `image build` and `image import` are
+//! The explicit commands `image pull`, `image build` and `image import` are
 //! the consent (ADR-0043, ADR-0067): running the command *is* the request, so
 //! nothing is asked and no input is read, on a terminal or not. Each still
 //! renders the change before it is committed — a user who ran the command can
@@ -90,8 +90,8 @@ fn refresh_render_failed() -> anyhow::Error {
     anyhow!(RefreshRenderFailed)
 }
 
-/// The exact operation-scoped reason a refresh render failure reports.
-pub(crate) const REFRESH_RENDER_FAILED_REASON: &str = "the image approval change for this refresh operation could not be shown; this operation committed no approval or project-default change";
+/// The exact operation-scoped reason a pull render failure reports.
+pub(crate) const REFRESH_RENDER_FAILED_REASON: &str = "the image approval change for this pull operation could not be shown; this operation committed no approval or project-default change";
 
 /// Consent to move one project's established default to the host's retained
 /// default (R7), rendered when the content differs.

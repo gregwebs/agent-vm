@@ -6,6 +6,8 @@ Accepted for [#305](https://github.com/gregwebs/agent-vm/issues/305), the author
 half of #302 A2. Builds on the shipped [ADR-0038](0038-config-dir-exposure-guard.md)
 guard; amends ADR-0036, ADR-0038 and ADR-0018. Additive release: **0.3.2**.
 
+`image refresh` was renamed `image pull` in 0.7.57 (#617, [ADR-0043](0043-image-command-group-and-daemon-import.md)); this record keeps the name it was decided under.
+
 ## Context
 
 A guest in project P1 can plant a user-owned `0644` file for project P2. Owner

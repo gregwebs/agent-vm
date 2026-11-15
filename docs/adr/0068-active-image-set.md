@@ -20,6 +20,8 @@ D10 supersedes D6's single-selection/arbitrary-target behavior.
 
 S4b presentation is implemented in 0.7.56 (#609).
 
+`image refresh` was renamed `image pull` in 0.7.57 (#617, [ADR-0043](0043-image-command-group-and-daemon-import.md)); this record keeps the name it was decided under.
+
 ## Context
 
 S1 made approvals per project. S2 made the default image per project. Neither

@@ -30,7 +30,7 @@ Written before the route: `agent-vm --mount ~/ref pi`, or `agent-vm --mount
 tool verbs and the [direct command](#direct-command) runner (including its
 top-level `--` spelling). Built-in verbs (`setup`, `doctor`, …) take their own
 flags after the verb and accept no launch options. Nested image operations take
-flags after the subcommand: `agent-vm image refresh --image REF`.
+flags after the subcommand: `agent-vm image pull --image REF`.
 
 ## Tool argument
 
@@ -523,7 +523,7 @@ The finished image selected for a guest session, independently of **tool**
 declarations and how the image was built. It contains the software used in the
 guest; tool declarations do not install that software.
 
-## Image refresh
+## Image pull
 
 Explicit native reacquisition and candidate-scoped approval of a project's
 in-use OCI references, without booting a guest. Its worklist contains the
@@ -533,15 +533,18 @@ not select a boot image. An unheld historical pin is not a target merely because
 uncertainty preserves it. The invocation is consent: nothing is asked or read.
 
 Only the unfiltered ambient default-tier operation may establish or adopt.
-Adoption acquires H instead of unheld D; held D is refreshed independently. The
+Adoption acquires H instead of unheld D; held D is pulled independently. The
 bookmark moves, not the recorded Boot holder. An unfiltered default
 selection/offer error refuses the command before freeze; unreadable configuration
 cannot fabricate a selection. After freeze, failures preserve only their own
 transactions; successful siblings remain and may change effective defaults or
 content even with exit 1. The ADR-0067 D9 recommendation-host-seed exception
-remains. Refresh preserves role knowledge and claims no role; new approvals it
+remains. A pull preserves role knowledge and claims no role; new approvals it
 creates are unheld and are protected by unresolved roles until the scope's
 corresponding first claim.
+
+_Avoid_: "image refresh" (the name before 0.7.56); "docker pull" (the Docker
+daemon is never read).
 
 ## Image cache
 
@@ -568,10 +571,10 @@ established **project** keeps its default independently of later changes to the
 host's **retained default boot image**.
 
 A project establishes its default on its first successful default-tier
-preparation — a launch, `setup` or `image refresh` — from the retained default,
+preparation — a launch, `setup` or `image pull` — from the retained default,
 or from the **initial recommendation** when the host has none. It is recorded
 with the project's approvals in `image-pins.json`, so establishing it and its
-first pin are one save. Only an explicit `image refresh` moves it, and only to
+first pin are one save. Only an explicit `image pull` moves it, and only to
 the host's existing retained default; running that command is the **image
 approval** for the move. Nothing establishes a default from a selection made
 while the tool configuration was unreadable: that selection is provisional. See
@@ -653,7 +656,7 @@ failed or concurrent first launch overwrites it and no project's own default
 re-seeds it. A **deliberate `image set-default`** acquires its target once and
 stores the validated host child here; it writes no **image pin**, in any
 project. The record holds a digest only — no source tag, platform or tool
-metadata — so a refresh reacquires that digest rather than following a tag
+metadata — so a pull reacquires that digest rather than following a tag
 (issue #392). See
 [USAGE.md#explicitly-setting-the-default](USAGE.md#explicitly-setting-the-default)
 and [ADR-0047](docs/adr/0047-host-wide-oci-image-approval.md).
@@ -670,7 +673,7 @@ host-platform manifest **child** digest and a monotonic revision. Stored in the
 user-scoped `$HOME/.config/agent-vm/image-pins.json` (with `image-pins.lock`),
 host-managed and independent of the **image cache**, `AGENT_VM_STATE_DIR`,
 repository files and the **retained default boot image**. A launch or `setup`
-consumes `repo@child`, never the selected tag or index. Only `image refresh`
+consumes `repo@child`, never the selected tag or index. Only `image pull`
 re-resolves an in-use source and approves what it resolves; `image set-default` resolves
 its target but approves nothing; `image build` and `image import` approve their
 own result reference. Each of those reads and writes only the invoking project's
@@ -697,9 +700,9 @@ active role needs them. The boot selection is the last OCI selection a launch or
 `setup` successfully acquired, including a one-off override, not the ambient
 next-launch selection. Roles are per Linux platform. There is no build-input
 role: tracking literal build inputs (#544) and Dockerfile dependencies (#545) is
-deferred and adds no placeholder here. The **image refresh** worklist also
+deferred and adds no placeholder here. The **image pull** worklist also
 includes the ambient operation before a recorded role, with ADR-0067 D7's
-unheld-D adoption substitution; refresh claims no role.
+unheld-D adoption substitution; a pull claims no role.
 
 A role is **unresolved** in a project/platform scope until that single-holder
 slot is first claimed. A successful claim resolves that role for every record in
@@ -707,7 +710,7 @@ the scope, not just its target. A record can hold one role while its other role
 remains unknown. **Unclaimed** means it holds no known role, not that both roles
 are known-absent. Only both known-absent roles justify retirement; uncertainty
 can retain approvals beyond the two known holders until the missing role is
-claimed once. Refresh does not claim roles.
+claimed once. A pull does not claim roles.
 
 Retirement discards approval authority, not shared cached bytes. Later use
 acquires the source under the ordinary cache-first policy; the old approval is
@@ -730,7 +733,7 @@ fetched).
 ## Image approval
 
 The candidate-scoped replacement of an **image pin** by the explicit command
-that causes it — `image refresh`, `image build` or `image import`. The command is
+that causes it — `image pull`, `image build` or `image import`. The command is
 itself the consent: the escaped source (or the default tier's fixed label), the
 platform and the full old and new digests are rendered on stderr before the
 commit, and nothing is asked or read. A first pin or an unchanged digest has no
@@ -738,7 +741,7 @@ replacement-consent render; the explicit command may still report its outcome. D
 be injected) and from cache repair. An immutable source that resolves to
 different content is an integrity failure, never an approvable change.
 
-To keep an approval, do not run `image refresh` for that reference, or select it
+To keep an approval, do not run `image pull` for that reference, or select it
 by digest.
 
 _Avoid_: "confirmation prompt" (nothing is asked); "update check" (there is no

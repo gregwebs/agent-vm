@@ -80,7 +80,7 @@ git submodule update --init --recursive vendor/microsandbox
 cargo build --release
 
 # Acquire the selected OCI image; optionally verify it in a guest
-agent-vm image refresh    # acquisition only, no guest
+agent-vm image pull       # acquisition only, no guest
 agent-vm setup            # acquisition plus boot/tool verification
 
 cd ~/your-project

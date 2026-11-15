@@ -41,7 +41,7 @@ pins_avm() {
 
 # The same command with one reference as the **ambient selection**.
 #
-# `image refresh --image REF` is a target filter over references already in use
+# `image pull --image REF` is a target filter over references already in use
 # (#543), so a first approval has to supply the reference as
 # `AGENT_VM_IMAGE_TAG`. The assignment is an environment argument **after** every
 # `-u` option in `PINS_ENV`: a shell prefix assignment would be erased by those

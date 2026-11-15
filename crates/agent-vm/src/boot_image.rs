@@ -10,7 +10,7 @@
 //!   > --image > AGENT_VM_IMAGE_TAG (empty = unset) > user image > project image > default
 //! ```
 //!
-//! — so `run`, `image refresh`, `setup`, `doctor`, `image show` and import's completion
+//! — so `run`, `image pull`, `setup`, `doctor`, `image show` and import's completion
 //! check cannot disagree about which image a session boots. `run::launch` resolves
 //! `--dockerfile` first because only a launch has the flag; when it is present the
 //! lower tiers are ignored, and a typed `--image` beside it is an explicit conflict
@@ -25,7 +25,7 @@
 //! **retained default** ([`default_selection`]), then the compiled-in **initial
 //! recommendation**. A project's default is established write-once by its first
 //! successful default-tier preparation, from whichever of the other two it
-//! selected; only an explicit `image refresh` moves it afterwards. A host record
+//! selected; only an explicit `image pull` moves it afterwards. A host record
 //! that is absent is offered the recommendation, and only a preparation that
 //! actually *acquires* that reference's content records it. A record that exists
 //! but is unreadable, non-regular or invalid is a **hard error**, never a reset
@@ -613,7 +613,7 @@ impl From<OverrideSource> for ImageSource {
 /// `setup::Args` so the flag, its env binding and its help text exist once and
 /// every *selector* agrees.
 ///
-/// `image refresh` deliberately does not flatten this type: its `--image` is a
+/// `image pull` deliberately does not flatten this type: its `--image` is a
 /// filter over the in-use set, not a boot selection, and its ambient input is
 /// the environment read independently (see [`crate::pull::Args`]).
 #[derive(clap::Args, Debug, Default)]

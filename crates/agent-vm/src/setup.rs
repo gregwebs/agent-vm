@@ -188,7 +188,7 @@ pub async fn run(
         }
     };
 
-    // The one image selection for this session (D1), shared with launch/refresh.
+    // The one image selection for this session (D1), shared with launch/pull.
     let boot = boot_image::select(args.image.requested()?, tiers, &project)?;
     let label = boot.label();
     let image = boot.reference().as_str().to_string();
@@ -196,7 +196,7 @@ pub async fn run(
     // Documented OCI-only setup policy, checked *before* the native acquisition
     // so a rejected local target causes no registry request, sandbox, marker or
     // adoption. Setup may already have created runtime state by now; only
-    // `image refresh` promises pre-prologue rejection.
+    // `image pull` promises pre-prologue rejection.
     OciTarget::parse(&image).map_err(target_error)?;
 
     // The verification scope is the resolved configuration's *declarations*,
@@ -508,7 +508,7 @@ fn report(
     bail!(
         "{verbs}: command {command} is {because} — this configuration boots {}. \
          agent-vm does not install tools; add the program to your image or change the \
-         tool's command, refresh a newer tag (`agent-vm image refresh`), or report at \
+         tool's command, pull a newer tag (`agent-vm image pull`), or report at \
          https://github.com/wirenboard/agent-vm/issues",
         label.text()
     )

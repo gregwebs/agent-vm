@@ -26,6 +26,8 @@ unheld D as before; held D is now refreshed independently. Consent and eligible
 default establishment/adoption remain in force. The failed-operation guarantee
 is per operation (D6, D9), not batch-wide.
 
+`image refresh` was renamed `image pull` in 0.7.57 (#617, [ADR-0043](0043-image-command-group-and-daemon-import.md)); this record keeps the name it was decided under.
+
 ## Context
 
 Two questions have two different records in `$HOME/.config/agent-vm/`:

@@ -33,6 +33,8 @@ consent and asks nothing, and `--yes` is removed from both update verbs. The
 *Candidate-scoped consent* paragraph's prompt and `--yes` sentences are
 historical (the frozen candidate and the compare-and-swap stand).
 
+`image refresh` was renamed `image pull` in 0.7.57 (#617, [ADR-0043](0043-image-command-group-and-daemon-import.md)); this record keeps the name it was decided under.
+
 ## Context
 
 ADR-0035 pinned only the **retained default**. A config, environment or CLI

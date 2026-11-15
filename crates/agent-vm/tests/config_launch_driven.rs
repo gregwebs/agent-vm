@@ -457,7 +457,7 @@ impl Harness {
         cmd.args(args);
         run_with_timeout(cmd, Duration::from_secs(60))
     }
-    /// A bare `image refresh` whose ambient selection is `reference`.
+    /// A bare `image pull` whose ambient selection is `reference`.
     ///
     /// The seeding shape for a fixture whose reference no launch/import has
     /// recorded: `--image` is a target filter over references already in use
@@ -465,7 +465,7 @@ impl Harness {
     fn refresh_as_ambient_shared(&self, cache: &Path, reference: &str) -> Output {
         let mut cmd = self.shared_command(cache);
         cmd.env("AGENT_VM_IMAGE_TAG", reference)
-            .args(["image", "refresh"]);
+            .args(["image", "pull"]);
         run_with_timeout(cmd, Duration::from_secs(60))
     }
 
@@ -4483,9 +4483,9 @@ fn observable_reference(expected: &str) -> &str {
     }
 }
 
-/// The two acquisition verbs as argv prefixes: boot-free `image refresh` and
+/// The two acquisition verbs as argv prefixes: boot-free `image pull` and
 /// `setup`'s initial acquisition step (#389).
-const ACQUISITION_VERBS: [&[&str]; 2] = [&["image", "refresh"], &["setup"]];
+const ACQUISITION_VERBS: [&[&str]; 2] = [&["image", "pull"], &["setup"]];
 
 /// One argv prefix as a printable verb name, for assertion messages.
 fn verb_name(argv: &[&str]) -> String {
@@ -4631,7 +4631,7 @@ fn acquisition_config_oracle_rejects_notice_only_and_wrong_reference() {
     let harness = Harness::new();
     harness.write_project(&format!("image = \"{PROJECT_REF}\"\n"));
     let out = harness.builtin(
-        &["image", "refresh"],
+        &["image", "pull"],
         &[("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref())],
     );
     let stderr = stderr_of(&out);
@@ -4870,7 +4870,7 @@ fn image_precedence_at_every_cli_boundary() {
             row.name
         );
 
-        // --- image refresh and setup (initial acquisition) ---
+        // --- image pull and setup (initial acquisition) ---
         for verb in ACQUISITION_VERBS {
             let harness = Harness::warm();
             write_image_tiers(
@@ -4901,7 +4901,7 @@ fn image_precedence_at_every_cli_boundary() {
                 "{} ({verb}): the bogus image must fail, stderr:\n{stderr}",
                 row.name
             );
-            if verb == "image refresh" && row.env == Some(" ") {
+            if verb == "image pull" && row.env == Some(" ") {
                 // A present-but-unusable ambient value fails the input-only
                 // preflight, before any membership or registry question: the
                 // whitespace is never trimmed into `unset`.
@@ -4919,7 +4919,7 @@ fn image_precedence_at_every_cli_boundary() {
                 );
                 continue;
             }
-            if verb == "image refresh" && row.cli.is_some() {
+            if verb == "image pull" && row.cli.is_some() {
                 // ADR-0068 D10: refresh's `--image` filters the ambient-reference
                 // /held-reference union, so a fresh typed reference is refused
                 // before any registry work. The selection precedence rows above
@@ -4938,7 +4938,7 @@ fn image_precedence_at_every_cli_boundary() {
                 );
                 continue;
             }
-            if verb == "image refresh" {
+            if verb == "image pull" {
                 // One result row per planned operation, labelled by the ambient
                 // operation's own (redacted) label.
                 let label = if row.expected == default_ref() {
@@ -4947,7 +4947,7 @@ fn image_precedence_at_every_cli_boundary() {
                     row.expected.to_owned()
                 };
                 assert!(
-                    stdout.contains(&format!("==> refresh [1/1] {label} (linux/")),
+                    stdout.contains(&format!("==> pull [1/1] {label} (linux/")),
                     "{} ({verb}): result row missing:\n{stdout}",
                     row.name
                 );
@@ -5074,7 +5074,7 @@ fn image_whitespace_and_empty_values_do_not_fall_through() {
             "{present:?}: no builder calls"
         );
 
-        // image refresh and setup treat it the same way.
+        // image pull and setup treat it the same way.
         for verb in ACQUISITION_VERBS {
             let harness = Harness::new();
             write_image_tiers(
@@ -5505,8 +5505,8 @@ fn help_doctor_pull_setup_and_launch_agree_on_image_selection() {
     let mut paths: Vec<(&str, Output)> = vec![
         ("--help", harness.builtin(&["--help"], &[])),
         (
-            "image refresh --help",
-            harness.builtin(&["image", "refresh", "--help"], &[]),
+            "image pull --help",
+            harness.builtin(&["image", "pull", "--help"], &[]),
         ),
         ("setup --help", harness.builtin(&["setup", "--help"], &[])),
     ];
@@ -5534,22 +5534,22 @@ fn help_doctor_pull_setup_and_launch_agree_on_image_selection() {
     }
 }
 
-/// S4: `image refresh` is a boot-free, in-use-target verb. Its own argument
+/// S4: `image pull` is a boot-free, in-use-target verb. Its own argument
 /// metadata (not the launch `ImageArgs`) owns `--image`'s help, and both the
 /// flag help and the subcommand help must state the operation/holder contract,
 /// the unheld-default adoption substitution and the filter/refusal rule. The
 /// `set-default` control keeps its own acquisition wording.
 #[test]
-fn image_refresh_help_describes_in_use_targets_not_booting() {
+fn image_pull_help_describes_in_use_targets_not_booting() {
     let harness = Harness::new();
-    const SHORT: &str = "Refresh one in-use OCI reference without changing boot selection";
-    const REFRESH_SHORT: &str = "Refresh this project's in-use OCI references without booting a VM";
-    const REFRESH_LONG: &str = "Re-resolve and approve the ambient boot operation and all recorded boot/output holders without asking. When adopting the host default, that operation acquires it instead of the old unheld project default; a held old default is refreshed independently. Use --image REF to refresh one in-use reference without changing selection or adopting a default. Keep successful approvals if another target fails; exit 1 if any target fails.";
-    const FLAG_LONG: &str = "Refresh one OCI reference currently in use by this project on the host platform, without changing boot selection or adopting a default.\n\nWithout --image, refresh the ambient boot operation and all recorded boot/output holders. When adopting the host default, that operation supersedes the old unheld project default; a held old default is refreshed independently. AGENT_VM_IMAGE_TAG selects the ambient boot reference; it does not restrict the refresh to one target. An empty value counts as unset. A reference outside this set is refused; use setup --image REF --no-verify to acquire a new boot reference. See USAGE.md → \"Refreshing in-use images\".";
+    const SHORT: &str = "Pull one in-use OCI reference without changing boot selection";
+    const PULL_SHORT: &str = "Pull this project's in-use OCI references without booting a VM";
+    const PULL_LONG: &str = "Re-resolve and approve the ambient boot operation and all recorded boot/output holders without asking. When adopting the host default, that operation acquires it instead of the old unheld project default; a held old default is pulled independently. Use --image REF to pull one in-use reference without changing selection or adopting a default. Keep successful approvals if another target fails; exit 1 if any target fails.";
+    const FLAG_LONG: &str = "Pull one OCI reference currently in use by this project on the host platform, without changing boot selection or adopting a default.\n\nWithout --image, pull the ambient boot operation and all recorded boot/output holders. When adopting the host default, that operation supersedes the old unheld project default; a held old default is pulled independently. AGENT_VM_IMAGE_TAG selects the ambient boot reference; it does not restrict the pull to one target. An empty value counts as unset. A reference outside this set is refused; use setup --image REF --no-verify to acquire a new boot reference. See USAGE.md → \"Pulling in-use images\".";
     for args in [
-        vec!["image", "refresh", "-h"],
-        vec!["image", "refresh", "--help"],
-        vec!["help", "image", "refresh"],
+        vec!["image", "pull", "-h"],
+        vec!["image", "pull", "--help"],
+        vec!["help", "image", "pull"],
     ] {
         let out = harness.builtin(&args, &[]);
         let text = stdout_of(&out);
@@ -5563,7 +5563,7 @@ fn image_refresh_help_describes_in_use_targets_not_booting() {
         let flat = flatten(&text);
         assert!(
             !text.contains("Boot this image"),
-            "{args:?} must not describe refresh as a launch:\n{text}"
+            "{args:?} must not describe pull as a launch:\n{text}"
         );
         assert!(
             !text.contains("instead of the configured selection"),
@@ -5576,8 +5576,8 @@ fn image_refresh_help_describes_in_use_targets_not_booting() {
                 "{args:?} must carry the exact long flag help:\n{text}"
             );
             assert!(
-                flat.contains(&flatten(REFRESH_LONG)),
-                "{args:?} must carry the exact refresh subcommand help:\n{text}"
+                flat.contains(&flatten(PULL_LONG)),
+                "{args:?} must carry the exact pull subcommand help:\n{text}"
             );
         } else {
             assert!(
@@ -5585,10 +5585,18 @@ fn image_refresh_help_describes_in_use_targets_not_booting() {
                 "{args:?} must carry the exact short flag help:\n{text}"
             );
             assert!(
-                flat.contains(&flatten(REFRESH_SHORT)),
-                "{args:?} must carry the exact refresh short help:\n{text}"
+                flat.contains(&flatten(PULL_SHORT)),
+                "{args:?} must carry the exact pull short help:\n{text}"
             );
         }
+    }
+    // #617: no surface of the verb itself may still say "refresh". The rename
+    // removed the old spelling rather than aliasing it, so help that still
+    // mentioned it would be the only surviving trace.
+    let image_group_help = stdout_of(&harness.builtin(&["image", "--help"], &[]));
+    let pull_help = stdout_of(&harness.builtin(&["image", "pull", "--help"], &[]));
+    for text in [&image_group_help, &pull_help] {
+        assert!(!text.to_lowercase().contains("refresh"), "{text}");
     }
     let set_default = stdout_of(&harness.builtin(&["image", "set-default", "--help"], &[]));
     // B1: the help says whose default the command changes (#541).
@@ -5602,7 +5610,7 @@ fn image_refresh_help_describes_in_use_targets_not_booting() {
     );
     assert!(
         !set_default.contains("instead of the configured selection"),
-        "set-default must not inherit refresh's override wording:\n{set_default}"
+        "set-default must not inherit pull's override wording:\n{set_default}"
     );
 }
 
@@ -5613,10 +5621,10 @@ fn flatten(text: &str) -> String {
 }
 
 /// Run one of [`ACQUISITION_VERBS`] so that it really acquires `reference`:
-/// `setup` takes `--image`, while `image refresh` needs the reference to be its
+/// `setup` takes `--image`, while `image pull` needs the reference to be its
 /// ambient selection because `--image` only filters references already in use.
 fn acquisition_row(harness: &Harness, verb: &[&str], reference: &str) -> Output {
-    if verb_name(verb) == "image refresh" {
+    if verb_name(verb) == "image pull" {
         harness.builtin(verb, &[("AGENT_VM_IMAGE_TAG", reference)])
     } else {
         let mut argv = verb.to_vec();
@@ -5655,7 +5663,7 @@ fn doctor_does_not_accept_an_image_flag() {
 
 #[test]
 fn refresh_and_setup_reject_removed_composition_flags_as_usage_errors() {
-    // `image refresh`/`setup` have no trailing positional, so every removed
+    // `image pull`/`setup` have no trailing positional, so every removed
     // composition flag is an ordinary clap usage error (exit 2) on both verbs.
     for verb in ACQUISITION_VERBS {
         for argv in [
@@ -5663,7 +5671,7 @@ fn refresh_and_setup_reject_removed_composition_flags_as_usage_errors() {
             vec!["--base-image", "x"],
             // `--yes` is removed from the two explicit update verbs, so passing
             // it is a nested usage error there; `setup` has none, and the old
-            // global `-y` remains gone. (`image refresh --yes` is asserted below
+            // global `-y` remains gone. (`image pull --yes` is asserted below
             // as rejected.)
             vec!["-y"],
         ] {
@@ -5692,7 +5700,7 @@ fn refresh_and_setup_reject_removed_composition_flags_as_usage_errors() {
     // so both removed flags are ordinary usage errors.
     let harness = Harness::new();
     for argv in [
-        vec!["image", "refresh", "--yes"],
+        vec!["image", "pull", "--yes"],
         vec!["image", "set-default", "--image", CLI_REF, "--yes"],
         vec!["setup", "--yes"],
     ] {
@@ -5810,7 +5818,7 @@ fn broken_config_pull_and_setup_explain_the_image_fallback() {
                 envs.push(("AGENT_VM_IMAGE_TAG", env));
             }
             let mut args: Vec<&str> = verb.to_vec();
-            if verb_name(verb) == "image refresh" {
+            if verb_name(verb) == "image pull" {
                 // Refresh's `--image` is a target filter, and a fresh reference
                 // in a broken catalog has no membership evidence. The same
                 // reference is supplied as the ambient selection instead, which
@@ -5826,7 +5834,7 @@ fn broken_config_pull_and_setup_explain_the_image_fallback() {
             let verb = verb_name(verb);
             let stderr = stderr_of(&out);
             let stdout = stdout_of(&out);
-            if verb == "image refresh" && cli.is_none() && env.is_none() {
+            if verb == "image pull" && cli.is_none() && env.is_none() {
                 // R8/B9 (#541): a bare refresh refuses the default-tier
                 // fall-through, so nothing is acquired or approved.
                 assert_eq!(out.status.code(), Some(1), "{verb}: {stderr}");
@@ -5871,7 +5879,7 @@ fn broken_config_pull_and_setup_explain_the_image_fallback() {
     for verb in ACQUISITION_VERBS {
         let out = harness.builtin(verb, &[("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref())]);
         let stderr = stderr_of(&out);
-        if verb_name(verb) == "image refresh" {
+        if verb_name(verb) == "image pull" {
             assert_eq!(out.status.code(), Some(1), "{stderr}");
             assert!(
                 stderr.contains("does not fall back to the default boot image"),
@@ -6101,7 +6109,7 @@ fn run_builtin_acquisition(row: &Precedence, verb: &[&str]) -> Result<String, St
         cmd.env("AGENT_VM_IMAGE_TAG", env);
     }
     let mut argv = verb.to_vec();
-    let refresh = verb_name(verb) == "image refresh";
+    let refresh = verb_name(verb) == "image pull";
     if let Some(cli) = row.cli {
         if refresh {
             // Refresh has no selection override: its `--image` is a target
@@ -6131,8 +6139,8 @@ fn run_builtin_acquisition(row: &Precedence, verb: &[&str]) -> Result<String, St
 #[test]
 fn refresh_uses_the_actual_selected_reference() {
     for row in precedence_rows() {
-        run_builtin_acquisition(&row, &["image", "refresh"])
-            .unwrap_or_else(|problem| panic!("{} (image refresh): {problem}", row.name));
+        run_builtin_acquisition(&row, &["image", "pull"])
+            .unwrap_or_else(|problem| panic!("{} (image pull): {problem}", row.name));
     }
 }
 
@@ -6154,7 +6162,7 @@ fn a_non_unicode_image_override_fails_every_verb_that_reads_it() {
     use std::os::unix::ffi::OsStrExt;
     for verb in [
         &["doctor"][..],
-        &["image", "refresh"][..],
+        &["image", "pull"][..],
         &["setup"][..],
         &["shell"][..],
     ] {
@@ -6324,16 +6332,12 @@ fn setup_refuses_local_cli_env_targets_either_way() {
 fn malformed_oci_references_are_refused_value_free_while_local_paths_keep_their_advice() {
     const MALFORMED: [&str; 3] = ["Foo/Bar:tag", "repo:bad tag", "repo@sha256:short"];
     for raw in MALFORMED {
-        // `image refresh`, CLI and env overrides.
+        // `image pull`, CLI and env overrides.
         for (source, argv, envs) in [
-            (
-                "refresh cli",
-                vec!["image", "refresh", "--image", raw],
-                vec![],
-            ),
+            ("refresh cli", vec!["image", "pull", "--image", raw], vec![]),
             (
                 "refresh env",
-                vec!["image", "refresh"],
+                vec!["image", "pull"],
                 vec![("AGENT_VM_IMAGE_TAG", raw)],
             ),
         ] {
@@ -6342,7 +6346,7 @@ fn malformed_oci_references_are_refused_value_free_while_local_paths_keep_their_
             let stderr = stderr_of(&out);
             assert!(!out.status.success(), "{source}: {stderr}");
             assert!(
-                stderr.contains("`agent-vm image refresh` needs a valid OCI image reference"),
+                stderr.contains("`agent-vm image pull` needs a valid OCI image reference"),
                 "{source} {raw:?}: the invalid-reference wording must be used:\n{stderr}"
             );
             assert!(
@@ -6413,7 +6417,7 @@ fn malformed_oci_references_are_refused_value_free_while_local_paths_keep_their_
     // Local-path controls: the same verbs keep the local-launch advice and do
     // not claim the text was a malformed reference.
     let harness = Harness::new();
-    let out = harness.builtin(&["image", "refresh", "--image", "../rootfs"], &[]);
+    let out = harness.builtin(&["image", "pull", "--image", "../rootfs"], &[]);
     let stderr = stderr_of(&out);
     assert!(stderr.contains("agent-vm --image PATH <tool>"), "{stderr}");
     assert!(
@@ -6463,9 +6467,9 @@ fn diagnostics_and_help_never_create_a_selection() {
     for args in [
         vec!["--help"],
         vec!["help", "shell"],
-        vec!["image", "refresh", "--help"],
+        vec!["image", "pull", "--help"],
         vec!["image", "set-default", "--help"],
-        vec!["help", "image", "refresh"],
+        vec!["help", "image", "pull"],
         vec!["help", "image", "set-default"],
     ] {
         let out = harness.builtin(&args, &envs);
@@ -6488,7 +6492,7 @@ fn a_failed_initial_acquisition_leaves_the_selection_absent() {
     // record, so a later compatible recommendation can still rescue the user.
     for (verb, argv) in [
         ("probe", vec!["probe"]),
-        ("image refresh", vec!["image", "refresh"]),
+        ("image pull", vec!["image", "pull"]),
         ("setup", vec!["setup"]),
     ] {
         let harness = Harness::new();
@@ -6789,7 +6793,7 @@ fn a_default_tier_invocation_suppresses_dependency_image_tracing() {
     let mut cmd = harness.base_command();
     cmd.env("RUST_LOG", "trace")
         .env("AGENT_VM_TEST_DEFAULT_IMAGE", recommendation_b());
-    let out = Harness::run_on(cmd, &["image", "refresh"]);
+    let out = Harness::run_on(cmd, &["image", "pull"]);
     assert!(
         !out.status.success(),
         "the bogus retained ref must fail the refresh"
@@ -6815,7 +6819,7 @@ fn a_default_tier_invocation_suppresses_dependency_image_tracing() {
     let mut cmd = explicit.base_command();
     cmd.env("RUST_LOG", "trace")
         .env("AGENT_VM_IMAGE_TAG", "localhost:1/cli-explicit:latest");
-    let out = Harness::run_on(cmd, &["image", "refresh"]);
+    let out = Harness::run_on(cmd, &["image", "pull"]);
     assert!(
         !out.status.success(),
         "the explicit bogus ref must fail too"
@@ -6892,17 +6896,17 @@ fn a_default_tier_reference_is_redacted_across_output() {
     );
     assert_eq!(harness.selection_bytes().unwrap(), before);
 
-    // `image refresh` writes its selection notice to stdout and the dump/error
+    // `image pull` writes its selection notice to stdout and the dump/error
     // to stderr.
     let refresh = harness.builtin(
-        &["image", "refresh"],
+        &["image", "pull"],
         &[("AGENT_VM_TEST_DEFAULT_IMAGE", recommendation_b())],
     );
     assert!(!refresh.status.success());
     let combined = format!("{}{}", stdout_of(&refresh), stderr_of(&refresh));
     assert!(!combined.contains("agent-vm image import") && !combined.contains("hint:"));
     assert!(
-        combined.contains("==> refresh [1/1] the default boot image (linux/"),
+        combined.contains("==> pull [1/1] the default boot image (linux/"),
         "refresh must name the default safely:\n{combined}"
     );
     assert!(
@@ -8725,7 +8729,7 @@ fn an_env_source_with_sentinel_false_fails_closed_on_unreadable_image_metadata_w
         "the OCI control must still suggest refresh: {rendered}"
     );
 
-    // S4: `image refresh` acquires OCI references only, so recommending it for
+    // S4: `image pull` acquires OCI references only, so recommending it for
     // a local rootfs/disk launch names a command that always refuses the
     // user's own image. The refusal and the `sentinelEnv: true` alternative
     // stay; the refresh suggestion does not. Both selection sources are pinned.
@@ -8745,7 +8749,7 @@ fn an_env_source_with_sentinel_false_fails_closed_on_unreadable_image_metadata_w
             "{source}: the alternative must be offered: {rendered}"
         );
         assert!(
-            !rendered.contains("agent-vm image refresh"),
+            !rendered.contains("agent-vm image pull"),
             "{source}: a local launch must not recommend refresh: {rendered}"
         );
         assert!(!rendered.contains(canary), "{source}: {rendered}");
@@ -8973,7 +8977,7 @@ fn a_launch_option_before_a_builtin_is_a_usage_error() {
     let harness = Harness::new();
     for (argv, option) in [
         (vec!["--mount", "/x", "doctor"], "--mount"),
-        (vec!["--image", CLI_REF, "image", "refresh"], "--image"),
+        (vec!["--image", CLI_REF, "image", "pull"], "--image"),
         (vec!["--image", CLI_REF, "setup"], "--image"),
     ] {
         let out = harness.builtin(&argv, &[]);
@@ -9266,7 +9270,7 @@ fn unrelated_stall_does_not_block_a_warm_launch() {
     x_cmd
         .current_dir(&stalled_project)
         .env("AGENT_VM_IMAGE_TAG", &x_tag)
-        .args(["image", "refresh"])
+        .args(["image", "pull"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let x_child = x_cmd.spawn().expect("spawn the stalled acquisition");
@@ -9501,7 +9505,7 @@ fn archive_publication_cannot_cross_validated_sdk_consumption() {
     blocked_cmd
         .current_dir(&blocked_project)
         .env("AGENT_VM_IMAGE_TAG", &tag)
-        .args(["image", "refresh"]);
+        .args(["image", "pull"]);
     let blocked = Peer::spawn(blocked_cmd, &gate, &[]);
     let waiting = gate.expect(AcquisitionStage::PublicationContended);
     // The real shared attempt contended while our independent exclusive fd holds.
@@ -9639,7 +9643,7 @@ fn an_old_spelling_warm_cache_launch_is_registry_free() {
 }
 
 /// A warm tag hit must not republish the tag key from metadata it read before a
-/// concurrent `image refresh` moved the tag.
+/// concurrent `image pull` moved the tag.
 ///
 /// Both live exactly once in the window between the launcher's validated read and
 /// its return, and both hold the barrier shared, so nothing else excludes them.
@@ -9691,7 +9695,7 @@ fn a_concurrent_tag_move_is_not_reverted_by_a_warm_launch() {
         a.written.manifest_digest,
         "the parked launcher must have read A"
     );
-    // The tag moves to B exactly as a concurrent `image refresh` would leave it.
+    // The tag moves to B exactly as a concurrent `image pull` would leave it.
     let moved_bytes = std::fs::read(cache_metadata(cache, &moved)).unwrap();
     std::fs::write(cache_metadata(cache, &tag), &moved_bytes).unwrap();
     validated.reply(GateReply::Continue);

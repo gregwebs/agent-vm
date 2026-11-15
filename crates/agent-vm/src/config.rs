@@ -917,7 +917,7 @@ impl ConfiguredImage {
     }
 }
 
-/// Both tiers' `image` settings. `Default` (neither set) is also what `image refresh`
+/// Both tiers' `image` settings. `Default` (neither set) is also what `image pull`
 /// and `setup` use when the configuration could not be read at all: the
 /// configured tiers are then unknown, and the recovery builtins fall back to
 /// `--image`/env or the default boot image.

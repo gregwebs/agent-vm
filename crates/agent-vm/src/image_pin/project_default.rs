@@ -5,7 +5,7 @@
 //! with that project's approvals in `image-pins.json`, so establishing it and
 //! its first pin are one atomic save. The host record in `default-image.json`
 //! stops being every project's default: it is only the starting choice a project
-//! adopts when it establishes its own, and the one an explicit `image refresh`
+//! adopts when it establishes its own, and the one an explicit `image pull`
 //! may move an established project to.
 //!
 //! These are decisions of the one approval authority ([`crate::image_pin`]), and
@@ -218,7 +218,7 @@ impl DefaultAdoption {
 /// The match is exhaustive on purpose: a new [`ImageSource`] must decide here,
 /// not default. The one place a selection becomes a `DefaultAction`, so R3's
 /// rule that a selection made while the configuration was unreadable establishes
-/// nothing holds for `setup`, launch and `image refresh` by construction.
+/// nothing holds for `setup`, launch and `image pull` by construction.
 pub(super) fn establishment(boot: &BootImage) -> Result<DefaultAction> {
     let host = match boot.source() {
         ImageSource::RetainedDefault(_) => HostRetention::Keep,

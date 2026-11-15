@@ -1,4 +1,4 @@
-//! `agent-vm image refresh` — re-resolve and approve the OCI references this
+//! `agent-vm image pull` — re-resolve and approve the OCI references this
 //! project is actually using, without booting anything.
 //!
 //! Acquisition is native ([`crate::image_acquire`]): `Registry` with
@@ -7,7 +7,7 @@
 //! sandbox, VM, temporary disk, Docker or alternate download backend is
 //! involved, and nothing about a project or a running guest changes.
 //!
-//! # What is refreshed
+//! # What is pulled
 //!
 //! The worklist is the invocation's in-use set for this project on this host
 //! platform (ADR-0068 D10): the ambient next-launch operation plus every record
@@ -17,7 +17,7 @@
 //! reports what each operation committed.
 //!
 //! `--image REF` **filters** that set. It is not a boot-selection override and it
-//! never establishes or adopts a default, so refreshing a reference can no
+//! never establishes or adopts a default, so pulling a reference can no
 //! longer approve an arbitrary new one: `setup --image REF --no-verify` acquires
 //! a new boot reference, and build/import approve their own output.
 //! `AGENT_VM_IMAGE_TAG` stays an ambient boot-selection input — it chooses the
@@ -47,28 +47,28 @@ use crate::image_pin::{
 };
 use crate::project::ProjectDir;
 
-/// The fixed refusal for a refresh target that is a local rootfs or disk path.
+/// The fixed refusal for a pull target that is a local rootfs or disk path.
 /// Names no value: the rejected text is user input.
-pub(crate) const TARGET_REASON: &str = "`agent-vm image refresh` acquires OCI image references (tag or digest) only; \
+pub(crate) const TARGET_REASON: &str = "`agent-vm image pull` acquires OCI image references (tag or digest) only; \
      it never boots, formats or reads a local rootfs — launch a local rootfs or disk image with \
      agent-vm --image PATH <tool> instead";
 
 /// The fixed refusal for a target that is not a usable OCI reference at all.
 /// A malformed reference is not a local path, so it must not be told how to
 /// launch one; the value itself is never echoed.
-pub(crate) const INVALID_REFERENCE_REASON: &str = "`agent-vm image refresh` needs a valid OCI image reference, \
+pub(crate) const INVALID_REFERENCE_REASON: &str = "`agent-vm image pull` needs a valid OCI image reference, \
      e.g. ghcr.io/owner/name:tag or repo@sha256:…";
 
-/// The fixed refusal for a bare refresh whose configuration could not be read
+/// The fixed refusal for a bare pull whose configuration could not be read
 /// and which has no known ambient selection to fall back on.
-pub(crate) const BROKEN_CONFIG_REASON: &str = "configured image settings could not be read; image refresh does not fall back to the \
+pub(crate) const BROKEN_CONFIG_REASON: &str = "configured image settings could not be read; image pull does not fall back to the \
      default boot image while the configuration is unreadable, so nothing was acquired or \
      approved; fix it (agent-vm doctor reports what is wrong), set AGENT_VM_IMAGE_TAG to the \
      intended boot reference, or pass --image REF for a recorded in-use reference";
 
 /// The one warning an allowed broken-configuration recovery prints, before any
 /// result row.
-pub(crate) const BROKEN_CONFIG_WARNING: &str = "==> WARNING: configured image settings could not be read; refreshing only references \
+pub(crate) const BROKEN_CONFIG_WARNING: &str = "==> WARNING: configured image settings could not be read; pulling only references \
      proven in use, without establishing or adopting a project default";
 
 /// The exact text the loader reports for a non-Unicode `AGENT_VM_IMAGE_TAG`.
@@ -76,7 +76,7 @@ pub(crate) const ENV_NOT_UNICODE_REASON: &str = "AGENT_VM_IMAGE_TAG is set but i
      a Unicode value is required";
 
 /// The one postcommit warning a report-sink failure attempts.
-pub(crate) const REPORT_SINK_WARNING: &str = "warning: image refresh outcomes could not all be written; completed \
+pub(crate) const REPORT_SINK_WARNING: &str = "warning: image pull outcomes could not all be written; completed \
      approvals remain committed; do not retry it as a failed approval";
 
 /// Render this command's value-free refusal for a rejected target.
@@ -89,12 +89,12 @@ pub(crate) fn target_error(error: OciTargetError) -> anyhow::Error {
 
 #[derive(ClapArgs)]
 pub struct Args {
-    /// Refresh one in-use OCI reference without changing boot selection.
+    /// Pull one in-use OCI reference without changing boot selection.
     #[arg(
         long = "image",
         value_name = "REF",
         help_heading = "Image",
-        long_help = "Refresh one OCI reference currently in use by this project on the host platform, without changing boot selection or adopting a default.\n\nWithout --image, refresh the ambient boot operation and all recorded boot/output holders. When adopting the host default, that operation supersedes the old unheld project default; a held old default is refreshed independently. AGENT_VM_IMAGE_TAG selects the ambient boot reference; it does not restrict the refresh to one target. An empty value counts as unset. A reference outside this set is refused; use setup --image REF --no-verify to acquire a new boot reference. See USAGE.md \u{2192} \"Refreshing in-use images\"."
+        long_help = "Pull one OCI reference currently in use by this project on the host platform, without changing boot selection or adopting a default.\n\nWithout --image, pull the ambient boot operation and all recorded boot/output holders. When adopting the host default, that operation supersedes the old unheld project default; a held old default is pulled independently. AGENT_VM_IMAGE_TAG selects the ambient boot reference; it does not restrict the pull to one target. An empty value counts as unset. A reference outside this set is refused; use setup --image REF --no-verify to acquire a new boot reference. See USAGE.md \u{2192} \"Pulling in-use images\"."
     )]
     image: Option<String>,
 
@@ -254,7 +254,7 @@ fn ambient_selection(
             ConfiguredTiers::Unreadable
         }
         // Without a known ambient selection nothing can qualify a target. A bare
-        // refresh refuses the command; a filtered one is refused as a nonmember
+        // pull refuses the command; a filtered one is refused as a nonmember
         // by the planner without inventing a selection.
         Catalog::Broken(_) if filter.is_some() => {
             return Ok(AmbientRefresh::Unavailable(anyhow!(
@@ -320,7 +320,7 @@ impl Report {
         self.write(
             sinks,
             &format!(
-                "==> refresh [{}/{}] {} ({}): {outcome}; {default}",
+                "==> pull [{}/{}] {} ({}): {outcome}; {default}",
                 row.position,
                 row.total,
                 row.label.text(),
@@ -334,7 +334,7 @@ impl Report {
         self.write(
             sinks,
             &format!(
-                "==> refresh [{}/{}] {} ({}): failed {reason}",
+                "==> pull [{}/{}] {} ({}): failed {reason}",
                 row.position,
                 row.total,
                 row.label.text(),
@@ -346,7 +346,7 @@ impl Report {
     fn summary(&mut self, sinks: &mut Sinks<'_>, ok: usize, failed: usize) {
         self.write(
             sinks,
-            &format!("==> image refresh: {ok} succeeded, {failed} failed"),
+            &format!("==> image pull: {ok} succeeded, {failed} failed"),
         );
     }
 
@@ -360,7 +360,7 @@ impl Report {
     }
 }
 
-/// Reject an unusable refresh target from input alone.
+/// Reject an unusable pull target from input alone.
 ///
 /// Runs before `main`'s MSB prologue, so a CLI/env local rootfs or disk target
 /// cannot create state, read configuration again, select a fallback or stat the
@@ -537,7 +537,7 @@ mod tests {
     /// explicit escaped label and every fixed holder label, a newline-bearing
     /// error escaped onto one line, the platform variant, and the summary.
     #[test]
-    fn refresh_report_format_covers_all_outcomes() {
+    fn pull_report_format_covers_all_outcomes() {
         use crate::image_pin::ApprovalDelta;
         use boot_image::ImageLabel;
 
@@ -625,19 +625,19 @@ mod tests {
         assert_eq!(
             stdout.written,
             concat!(
-                "==> refresh [1/5] example.com/team/app:dev (linux/arm64/v8): approved none -> sha384:",
+                "==> pull [1/5] example.com/team/app:dev (linux/arm64/v8): approved none -> sha384:",
                 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; default=established\n",
-                "==> refresh [2/5] the latest output image (linux/arm64): changed sha256:",
+                "==> pull [2/5] the latest output image (linux/arm64): changed sha256:",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -> sha384:",
                 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; default=unchanged\n",
                 "==> this project now uses the host's default boot image\n",
-                "==> refresh [3/5] the default boot image (linux/arm64): unchanged sha256:",
+                "==> pull [3/5] the default boot image (linux/arm64): unchanged sha256:",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; default=adopted sha256:",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -> sha384:",
                 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
-                "==> refresh [4/5] the latest output image (linux/arm64): failed line one\\x0aline two\n",
-                "==> refresh [5/5] the default boot image (linux/arm64): failed pulling the default boot image failed\n",
-                "==> image refresh: 3 succeeded, 2 failed\n",
+                "==> pull [4/5] the latest output image (linux/arm64): failed line one\\x0aline two\n",
+                "==> pull [5/5] the default boot image (linux/arm64): failed pulling the default boot image failed\n",
+                "==> image pull: 3 succeeded, 2 failed\n",
             )
         );
         assert_eq!(stderr.written, "");
@@ -647,7 +647,7 @@ mod tests {
     /// never a panic: the next operation still runs and the exit status follows
     /// the operations alone.
     #[test]
-    fn refresh_report_sink_failure_keeps_committed_success() {
+    fn pull_report_sink_failure_keeps_committed_success() {
         use crate::image_pin::ApprovalDelta;
 
         let mut report = Report::default();

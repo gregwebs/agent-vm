@@ -33,7 +33,7 @@ const INVALID_REFERENCE_REASON: &str =
 pub(crate) struct Args {
     /// OCI image to acquire and retain as the starting default for projects that
     /// have none yet; established projects keep their own (run `agent-vm image
-    /// refresh` in one to adopt it).
+    /// pull` in one to adopt it).
     #[arg(long = "image", value_name = "REF", value_parser = SetDefaultTargetParser)]
     target: SetDefaultTarget,
 }
@@ -136,7 +136,7 @@ fn notice(outcome: HostDefaultSet) -> String {
         }
         InvokingProject::AlreadyUses => "This project already uses it.",
         InvokingProject::KeepsItsOwn => {
-            "This project keeps its own default boot image; run `agent-vm image refresh` here \
+            "This project keeps its own default boot image; run `agent-vm image pull` here \
              to adopt this one."
         }
     };
@@ -173,7 +173,7 @@ mod tests {
                     "{retained_default:?}/{this_project:?}: {text}"
                 );
                 assert_eq!(
-                    text.contains("agent-vm image refresh"),
+                    text.contains("agent-vm image pull"),
                     this_project == InvokingProject::KeepsItsOwn,
                     "{retained_default:?}/{this_project:?}: {text}"
                 );
