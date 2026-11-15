@@ -1,6 +1,6 @@
 //! Shared native acquisition of one OCI reference into microsandbox's cache.
 //!
-//! The selection verbs that need bytes (`image refresh`, `setup`'s pull step and
+//! The selection verbs that need bytes (`image pull`, `setup`'s pull step and
 //! `image set-default`) differ in *policy* — which reference to acquire, what to
 //! do on success, how much of a failure may be rendered — but not in *how* bytes
 //! arrive. This module owns that one path.
@@ -83,7 +83,7 @@
 //!
 //! A canonical-source cache hit never rewrites the source key (tag, index or
 //! stated digest): it already holds a validated entry, and rewriting a *tag* from
-//! metadata read moments earlier would revert a concurrent `image refresh` that
+//! metadata read moments earlier would revert a concurrent `image pull` that
 //! moved the tag. Only the pre-canonical compatibility path republishes the
 //! canonical source key, and then only after re-checking under that key's guard
 //! that it is still absent. The acquired child key stays content-addressed, so
@@ -427,7 +427,7 @@ impl CachedEntryError {
     fn describe(self) -> &'static str {
         match self {
             Self::Conflict => {
-                "the cached image contradicts its preserved content identity; repair or remove the cache entry (for example with `agent-vm image refresh`) before launching"
+                "the cached image contradicts its preserved content identity; repair or remove the cache entry (for example with `agent-vm image pull`) before launching"
             }
         }
     }
@@ -914,7 +914,7 @@ impl NativeAcquisition {
     ///
     /// A canonical hit never rewrites that key: the entry is already there and
     /// validated, and rewriting a *tag* from metadata read moments earlier would
-    /// revert a concurrent `image refresh` that moved the tag. The pre-canonical
+    /// revert a concurrent `image pull` that moved the tag. The pre-canonical
     /// path exists to make the old spelling unnecessary again, so it does publish
     /// the canonical key — but only while that key is still absent.
     async fn lookup(
@@ -1025,7 +1025,7 @@ impl NativeAcquisition {
     /// but only while that key is still absent.
     ///
     /// Absence is re-checked under the canonical key's own guard because a
-    /// concurrent `image refresh` of a moving tag may have published it in the
+    /// concurrent `image pull` of a moving tag may have published it in the
     /// gap since this lookup missed it. Overwriting that publication with
     /// metadata read before it would silently revert the tag, so a peer's entry is
     /// kept and used when it validates this selection; an entry that cannot back

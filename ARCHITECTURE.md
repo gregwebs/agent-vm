@@ -63,7 +63,7 @@ crates/agent-vm/src/
 │   ├── default_selection.rs#   journal-aware host starting choice (bounded shared lock)
 │   └── upgrade.rs          #   set-default command shape: explicit typed target
 ├── project.rs              # the one project capture (canonical cwd → session + approval scope)
-├── image_pin.rs            # project-scoped OCI approval: prepare before create, explicit refresh
+├── image_pin.rs            # project-scoped OCI approval: prepare before create, explicit pull
 │   ├── project_default.rs  #   a project's own default and the host starting choice
 │   ├── store.rs            #   strict HOME pin store, CAS kernel, roles/scopes, sequence, defaults, S1 recovery
 │   ├── active.rs           #   held roles, scope resolution, the knowledge/retirement and allocation kernels
@@ -75,7 +75,7 @@ crates/agent-vm/src/
 │   ├── receipt.rs          #   cache-only validated-content receipt (never approval)
 │   └── barrier.rs          #   shared/exclusive cache publication flock
 ├── image_build.rs          # explicit user Dockerfile export
-├── image_cmd.rs            # image verb group: read-only `show`, `refresh`, `set-default`, build/import
+├── image_cmd.rs            # image verb group: read-only `show`, `pull`, `set-default`, build/import
 ├── image_import.rs         # daemon/archive import
 ├── image_publish.rs        # staging, native publication, requested-reference rollback
 ├── image_miss.rs           # registry-failure import hint
@@ -1141,12 +1141,12 @@ established project. A project establishes its default write-once on its first
 successful default-tier preparation, after the image was acquired, in the same
 save as its first pin. Launch and `setup` never move an established default;
 `image set-default` writes only the host record, and only an explicit
-`image refresh` may adopt a different host record (ADR-0067).
+`image pull` may adopt a different host record (ADR-0067).
 
 **Approval is not cache evidence either.** Every OCI selection — from any tier —
 is keyed by **`(project, canonical reference, host Linux platform)`** in
 `image-pins.json`. A launch or setup consumes the approved host child and never
-resolves the selected tag; only `image refresh` re-resolves and approves
+resolves the selected tag; only `image pull` re-resolves and approves
 (asking nothing), `image set-default` resolves its target and approves nothing,
 and `image build`/`image import` approve the result reference they just published
 without asking (#391). The *file* is host-managed and shared
@@ -1202,11 +1202,11 @@ is claimed. Old cache artifacts and active sessions are never removed by
 set-default. See
 [USAGE](USAGE.md#project-scoped-approval-of-oci-image-content) for the operational details.
 
-`image refresh` acquires without launching, and running it is its own consent:
+`image pull` acquires without launching, and running it is its own consent:
 
 ```text
-image refresh [--image REF]
-  → the same boot_image selector; a bare refresh with an unreadable
+image pull [--image REF]
+  → the same boot_image selector; a bare pull with an unreadable
     tool configuration fails, --image/env still warn and work
   → image_pin::refresh(boot, adoption offer)
       → established project and a different host record: adopt it
@@ -1222,9 +1222,9 @@ image refresh [--image REF]
 
 No sandbox, guest disk, VM execution, Docker/buildx, curl/wget or alternate
 download backend is on this path; a nonbootable OCI image with the right host
-platform refreshes successfully. Layer reuse is native: an unchanged manifest
+platform pulls successfully. Layer reuse is native: an unchanged manifest
 downloads no layer blob and never deletes old artifacts to force freshness.
-Refresh is not a launch-time probe and records no marker: a launch makes no
+A pull is not a launch-time probe and records no marker: a launch makes no
 registry request for content it has already approved.
 
 ### Canonical target, validated token, cache-only receipt
@@ -1266,12 +1266,12 @@ which then reacquires the selection's **stated digest** — never its tag — so
 unusable entry can neither be booted nor used to re-resolve mutable content. The
 one closed failure is an entry that contradicts its preserved receipt, because
 relaxing that would boot content nothing measured. Every OCI consumer — launch,
-setup, refresh, set-default — shares this path, so none can quietly consume
+setup, pull, set-default — shares this path, so none can quietly consume
 unapproved content.
 
 A canonical-source cache hit never rewrites the source key: the entry is already
 there and validated, and rewriting a *tag* from metadata read moments earlier
-would revert a concurrent `image refresh` that moved the tag. A canonical miss
+would revert a concurrent `image pull` that moved the tag. A canonical miss
 *(a first pin)* also tries the *original* (pre-canonical) spelling once, so a
 cache an older launcher wrote under `registry-1.docker.io/...` or an uppercase
 digest hex is reused: its validated metadata is republished under the acquired
@@ -1359,7 +1359,7 @@ there; `sequence` says which atomic pin-store write allocated an approval token.
 An empty `roles` is *unclaimed*, not "known absent", and only the scope join can
 turn it into absence. A claim resolves its slot for the whole scope, makes its
 target the sole holder, and retires exactly the records whose both roles are now
-known absent. Refresh keeps roles and resolution; it never claims or retires.
+known absent. A pull keeps roles and resolution; it never claims or retires.
 Retirement creates fresh cache-first authority rather than restoring the old
 approval. Inside one HOME-wide sequence, insertion and content replacement use
 the reserved next allocation as the approval revision; role/default-only saves
@@ -1391,7 +1391,7 @@ command's working directory once, at its entry point, and every consumer borrows
 that `ProjectDir`: session state takes its 12-hex prefix, approvals take the full
 digest as `ProjectId`. A second capture is a visible edit, because
 `ProjectDir::capture` is a clippy `disallowed-methods` entry allowed only at the
-eleven entry points (launch, `setup`, `image refresh`, `image set-default`,
+eleven entry points (launch, `setup`, `image pull`, `image set-default`,
 `image build`, `image import`, `image show`, `image pins`, `doctor`, `clipboard`
 and `access`).
 
@@ -1479,7 +1479,7 @@ scope that amends it.
 `<actual backend cache>/.agent-vm-publication.lock` is one stable `flock`:
 
 - **shared** for acquisition/validation, canonical metadata and receipt writes,
-  launch and setup through the SDK's cache consumption, and explicit refresh;
+  launch and setup through the SDK's cache consumption, and an explicit pull;
 - **exclusive** for archive publication (import/build) from the requested-alias
   snapshot through the loader or its rollback;
 - the publication's read-back is a **shared** holder taken after the exclusive
@@ -1511,7 +1511,7 @@ lock acquisition, not end-to-end cache preparation.
 
 The reference guard is a persistent sibling of the native reference metadata in
 the **actual backend cache**, keyed by the canonical reference. It serializes
-only callers of this helper — refresh, setup's acquisition, set-default — even
+only callers of this helper — pull, setup's acquisition, set-default — even
 across state roots or `HOME`, and covers snapshot → native pull → validation →
 rollback. Unmodified `msb pull`, direct SDK clients, cache deletion/GC and older
 launchers do **not** take it; the barrier is what excludes archive publication

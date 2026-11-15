@@ -7081,11 +7081,11 @@ custom_image_default_upgrade() {
       grep -q '^stamp=absent$' "$live/status" || result=1
       assert_no_host_calls || result=1
       # #541 B1: this project is established at A, so set-default changes only
-      # the host's starting choice; an explicit refresh adopts B.
+      # the host's starting choice; an explicit pull adopts B.
       retained_launch upgrade-kept-a "$proj" --no-git hello-258 || result=1
       require_launch_ok upgrade-kept-a || result=1
       grep -q '^stamp=absent$' "$WORK/upgrade-kept-a.out" || result=1
-      retained_launch upgrade-adopt "$proj" image refresh || result=1
+      retained_launch upgrade-adopt "$proj" image pull || result=1
       require_launch_ok upgrade-adopt || result=1
       retained_launch upgrade-new-b "$proj" --no-git hello-258 || result=1
       require_launch_ok upgrade-new-b || result=1
@@ -7722,7 +7722,7 @@ custom_image_host_pins() {
   # `--image` is a target filter over references already in use (#543), so this
   # first approval supplies the tag as the ambient selection through the shared
   # helper (which places the assignment after `PINS_ENV`'s `-u` options).
-  pins_avm_ambient "$live" "$tag" image refresh >"$WORK/pins-live-pin.out" 2>&1 || {
+  pins_avm_ambient "$live" "$tag" image pull >"$WORK/pins-live-pin.out" 2>&1 || {
     echo "    FAIL: could not approve A for the tag in the live guest's project"
     cat "$WORK/pins-live-pin.out"
     result=1
@@ -7842,13 +7842,13 @@ custom_image_host_pins() {
   pins_env "$WORK/pins-home" "$WORK/pins-state"
   pin_snapshot="$(cat "$(pins_store)")"
   # A candidate that cannot be validated keeps A. There is no `--yes` any more
-  # (#541 B4): running the refresh is the consent.
+  # (#541 B4): running the pull is the consent.
   pins_push_unbootable_candidate "$port" "$repo" pin || {
     echo "    FAIL: could not publish an unbootable candidate"
     result=1
   }
-  pins_avm "$proj" image refresh --image "$tag" >"$WORK/pins-broken.out" 2>&1 && {
-    echo "    FAIL: a broken candidate must fail the approved refresh"
+  pins_avm "$proj" image pull --image "$tag" >"$WORK/pins-broken.out" 2>&1 && {
+    echo "    FAIL: a broken candidate must fail the approved pull"
     result=1
   }
   assert_eq "a failed candidate leaves the approval unchanged" "$pin_snapshot" \
@@ -7861,16 +7861,16 @@ custom_image_host_pins() {
     kill -0 "$live_pid" 2>/dev/null || { echo "    FAIL: the live A guest died"; result=1; }
     pins_live_advanced "$live" "$live_pid" "$tick" || result=1
   fi
-  # Replace A with B. Running the refresh is the consent (#541 B3): the change
+  # Replace A with B. Running the pull is the consent (#541 B3): the change
   # is rendered and nothing is asked, on a terminal or not.
   docker tag "$CUSTOM_STAMP" "$tag" || result=1
   docker push "$tag" >/dev/null || result=1
-  pins_avm "$proj" image refresh --image "$tag" >"$WORK/pins-approve.out" 2>&1 || {
-    echo "    FAIL: the prompt-free refresh failed"
+  pins_avm "$proj" image pull --image "$tag" >"$WORK/pins-approve.out" 2>&1 || {
+    echo "    FAIL: the prompt-free pull failed"
     cat "$WORK/pins-approve.out"
     result=1
   }
-  assert_match "the refresh states the change without asking" \
+  assert_match "the pull states the change without asking" \
     "Replacing the approved image for localhost:$port/$repo:pin \\(linux/$host_arch\\) in this project:" \
     "$(cat "$WORK/pins-approve.out")" || result=1
   assert_match "the render shows the full old digest" "old: $digest_a" \
@@ -7948,29 +7948,29 @@ custom_image_host_pins() {
     result=1
   fi
   # #541 B1: this project already booted the default tier (established at A), so
-  # set-default changes only the host's starting choice. An explicit refresh in
+  # set-default changes only the host's starting choice. An explicit pull in
   # the project is what adopts B.
   pins_launch pins-default-kept "$proj" hello-258 || result=1
   require_launch_ok pins-default-kept || result=1
   assert_eq "an established project keeps its own default after set-default" \
     "stamp=absent" "$(pins_stamp pins-default-kept)" || result=1
-  pins_avm "$proj" image refresh >"$WORK/pins-adopt.out" 2>&1 || {
-    echo "    FAIL: the adopting refresh failed"
+  pins_avm "$proj" image pull >"$WORK/pins-adopt.out" 2>&1 || {
+    echo "    FAIL: the adopting pull failed"
     cat "$WORK/pins-adopt.out"
     result=1
   }
-  assert_match "the adopting refresh renders the change" \
+  assert_match "the adopting pull renders the change" \
     "Adopting the host's default boot image" "$(cat "$WORK/pins-adopt.out")" || result=1
   if ! jq -e --arg p "$proj_id" --arg ref "$ref_b" \
     '[.defaults[] | select(.project == $p)] | length == 1 and .[0].image == $ref' \
     "$(pins_store)" >/dev/null 2>&1; then
-    echo "    FAIL: the adopting refresh did not move this project's default to B"
+    echo "    FAIL: the adopting pull did not move this project's default to B"
     cat "$(pins_store)" 2>/dev/null || true
     result=1
   fi
   pins_launch pins-default-b "$proj" hello-258 || result=1
   require_launch_ok pins-default-b || result=1
-  assert_eq "after the adopting refresh the project boots B" "stamp=present" \
+  assert_eq "after the adopting pull the project boots B" "stamp=present" \
     "$(pins_stamp pins-default-b)" || result=1
   pins_launch pins-override-a "$proj" --image "$ref_a" hello-258 || result=1
   require_launch_ok pins-override-a || result=1
@@ -8020,7 +8020,7 @@ custom_image_host_pins() {
       '.pins[] | select(.project == $p and .reference == $r) | .roles' \
       "$(pins_store)")" || result=1
   # No publication has run since the alias import created `alias-result`, and
-  # refresh/adoption/bare/override launches move Boot only: it is still this
+  # pull/adoption/bare/override launches move Boot only: it is still this
   # project's Output holder, which is what a record holding a role must survive.
   assert_eq "the alias result still holds Output before this import" "output" \
     "$(jq -r --arg r "localhost:$port/$repo:alias-result" --arg p "$proj_id" \

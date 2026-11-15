@@ -48,7 +48,7 @@
 //!
 //! Nor does a reveal mean a refresh draws: a pull that misses the image-metadata
 //! cache — `PullPolicy::Always`, which is what the native acquisition uses
-//! (`image_acquire.rs`, `AcquireMode::ResolveCurrent`: `image refresh`, `setup`'s
+//! (`image_acquire.rs`, `AcquireMode::ResolveCurrent`: `image pull`, `setup`'s
 //! pull step, `image set-default`), or metadata that is missing or incomplete —
 //! resolves over the network and then enters the layer pipeline only if some
 //! artifact is actually missing (`materialize_layer_stage`,

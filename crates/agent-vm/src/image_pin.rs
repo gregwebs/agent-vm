@@ -659,7 +659,7 @@ async fn approved_preparation(
     Ok(prepared)
 }
 
-/// The strict, read-only authority snapshot one `image refresh` invocation
+/// The strict, read-only authority snapshot one `image pull` invocation
 /// freezes its worklist from: every record in exactly this project's
 /// host-platform scope, with the roles it holds.
 ///

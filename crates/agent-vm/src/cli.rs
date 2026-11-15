@@ -271,7 +271,7 @@ pub(crate) enum Dispatch {
         cmd: Cmd,
         catalog: Catalog,
         /// Both config tiers' `image` settings, read before the report was
-        /// consumed to build the catalog. Carried to `image refresh`/`setup`/`image show`
+        /// consumed to build the catalog. Carried to `image pull`/`setup`/`image show`
         /// so they can select the same image a launch would.
         images: ConfiguredImages,
         /// Whether those tiers were actually read. A configuration that could not
@@ -705,7 +705,7 @@ fn direct_dispatch(
 fn reconcile_image_args(sub: &clap::ArgMatches, cmd: &mut Cmd) {
     match cmd {
         Cmd::Setup(args) => args.image.reconcile(sub),
-        // `image refresh`'s `--image` is a target filter with no clap env
+        // `image pull`'s `--image` is a target filter with no clap env
         // binding, and it is captured independently of clap by `pull::Args`;
         // there is no shared launch-image argument to reconcile here.
         Cmd::Image(_) => {}
@@ -1128,7 +1128,7 @@ fn launch_options() -> Vec<clap::Arg> {
 }
 
 /// Remove only the top-level launch options' env bindings. Built-in
-/// subcommands keep their own bindings (notably image refresh/setup's --image).
+/// subcommands keep their own bindings (notably image pull/setup's --image).
 fn command_without_launch_env(command: &clap::Command) -> clap::Command {
     let launch = launch_options();
     command.clone().mut_args(|arg| {
@@ -1945,11 +1945,11 @@ mod tests {
     /// The single `--image`/`AGENT_VM_IMAGE_TAG` separation table, driven
     /// through [`parse_from`] — the seam that can see clap's `ValueSource`.
     ///
-    /// `image refresh`'s `--image` is a target filter; its ambient input is the
+    /// `image pull`'s `--image` is a target filter; its ambient input is the
     /// environment, captured independently. A typed flag therefore never masks
     /// the ambient selection, and an empty environment value is unset.
     #[test]
-    fn refresh_target_args_do_not_bind_the_image_environment() {
+    fn pull_target_args_do_not_bind_the_image_environment() {
         struct Case {
             env: Option<&'static str>,
             argv: &'static [&'static str],
@@ -2013,7 +2013,7 @@ mod tests {
                 Some(value) => env.set_var("AGENT_VM_IMAGE_TAG", value),
                 None => env.remove_var("AGENT_VM_IMAGE_TAG"),
             }
-            let mut argv = vec!["agent-vm", "image", "refresh"];
+            let mut argv = vec!["agent-vm", "image", "pull"];
             argv.extend_from_slice(case.argv);
             let dispatch = parse_from(argv, Ok(report_from("tools = []\n")))
                 .unwrap_or_else(|error| panic!("case {case:?} must parse: {error}"));
@@ -2021,14 +2021,14 @@ mod tests {
                 Dispatch::Builtin {
                     cmd:
                         Cmd::Image(crate::image_cmd::Args {
-                            cmd: crate::image_cmd::ImageCmd::Refresh(args),
+                            cmd: crate::image_cmd::ImageCmd::Pull(args),
                         }),
                     ..
                 } => (
                     args.filter().expect("a valid filter or none"),
                     args.ambient_override().expect("a usable ambient input"),
                 ),
-                _ => panic!("image refresh must dispatch as a built-in"),
+                _ => panic!("image pull must dispatch as a built-in"),
             };
             assert_eq!(
                 filter.map(|target| target.canonical().whole()),
@@ -2044,11 +2044,11 @@ mod tests {
         env.remove_var("AGENT_VM_IMAGE_TAG");
     }
 
-    /// A non-Unicode `AGENT_VM_IMAGE_TAG` is a typed failure of refresh's own
+    /// A non-Unicode `AGENT_VM_IMAGE_TAG` is a typed failure of pull's own
     /// ambient input, not clap's env parsing: the exact text is the one the
     /// launch selector already reports.
     #[test]
-    fn a_refresh_ambient_input_must_be_unicode() {
+    fn a_pull_ambient_input_must_be_unicode() {
         let args = crate::pull::Args::for_test(None, crate::boot_image::EnvOverride::Invalid);
         let error = args
             .ambient_override()
@@ -2071,7 +2071,7 @@ mod tests {
 
     /// Every dispatch arm that carries the image argument decides its own
     /// inputs. The launch arm and `setup` reconcile clap's value source; the two
-    /// `image refresh` arms carry an independent filter plus the captured
+    /// `image pull` arms carry an independent filter plus the captured
     /// ambient environment, so a typed flag there does not mask the env.
     #[test]
     fn every_dispatch_arm_reconciles_the_image_arg() {
@@ -2112,7 +2112,7 @@ mod tests {
 
         // The ready-catalog built-in arm, and the deferred-config-error arm.
         for argv in [
-            vec!["agent-vm", "image", "refresh", "--image", "cli:1"],
+            vec!["agent-vm", "image", "pull", "--image", "cli:1"],
             vec!["agent-vm", "setup", "--image", "cli:1"],
         ] {
             let verb = argv[1];
@@ -2126,7 +2126,7 @@ mod tests {
                     Dispatch::Builtin {
                         cmd:
                             Cmd::Image(crate::image_cmd::Args {
-                                cmd: crate::image_cmd::ImageCmd::Refresh(args),
+                                cmd: crate::image_cmd::ImageCmd::Pull(args),
                             }),
                         ..
                     } => {
@@ -3659,7 +3659,7 @@ mod tests {
         for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
             env.remove_var(name);
         }
-        for name in ["pull", "upgrade"] {
+        for name in ["pull", "upgrade", "refresh"] {
             let config = format!("[[tools]]\nname = {name:?}\ncommand = \"probe\"\n");
             let (_, forwarded) = launch_of(
                 parse_from(
@@ -3677,20 +3677,14 @@ mod tests {
     }
 
     #[test]
-    fn image_refresh_takes_its_own_flag_and_removed_verbs_are_not_aliases() {
+    fn image_pull_takes_its_own_flag_and_removed_verbs_are_not_aliases() {
         let mut env = crate::test_env::guard();
         env.remove_var("AGENT_VM_IMAGE_TAG");
         for args in [
-            vec![
-                "agent-vm",
-                "image",
-                "refresh",
-                "--image",
-                "localhost:1/a:tag",
-            ],
-            vec!["agent-vm", "image", "refresh"],
-            vec!["agent-vm", "image", "refresh", "--help"],
-            vec!["agent-vm", "help", "image", "refresh"],
+            vec!["agent-vm", "image", "pull", "--image", "localhost:1/a:tag"],
+            vec!["agent-vm", "image", "pull"],
+            vec!["agent-vm", "image", "pull", "--help"],
+            vec!["agent-vm", "help", "image", "pull"],
         ] {
             // Help short-circuits as a zero-exit `Err`, so only a non-zero exit
             // is a parse failure here.
@@ -3702,17 +3696,11 @@ mod tests {
         }
         for args in [
             // The launch option must not be accepted on the group.
-            vec![
-                "agent-vm",
-                "image",
-                "--image",
-                "localhost:1/a:tag",
-                "refresh",
-            ],
-            vec!["agent-vm", "image", "refresh", "--dockerfile", "x"],
+            vec!["agent-vm", "image", "--image", "localhost:1/a:tag", "pull"],
+            vec!["agent-vm", "image", "pull", "--dockerfile", "x"],
             // No verb has `--yes` any more (B4): the explicit command is the
             // consent, so the flag is an ordinary usage error, not a shim.
-            vec!["agent-vm", "image", "refresh", "--yes"],
+            vec!["agent-vm", "image", "pull", "--yes"],
             vec![
                 "agent-vm",
                 "image",
@@ -3727,12 +3715,24 @@ mod tests {
                 .unwrap_err();
             assert_eq!(error.exit_code(), 2, "{args:?}");
         }
-        // Removed built-ins leave no alias and no hidden route.
+        // Removed built-ins leave no alias and no hidden route. `image refresh`
+        // joined them in #617: clap's usage error is the only response, even
+        // for `--help`, so no old script can acquire, approve or record.
         for args in [
             vec!["agent-vm", "pull"],
             vec!["agent-vm", "upgrade"],
             vec!["agent-vm", "help", "pull"],
             vec!["agent-vm", "help", "upgrade"],
+            vec!["agent-vm", "image", "refresh"],
+            vec![
+                "agent-vm",
+                "image",
+                "refresh",
+                "--image",
+                "localhost:1/a:tag",
+            ],
+            vec!["agent-vm", "image", "refresh", "--help"],
+            vec!["agent-vm", "help", "image", "refresh"],
         ] {
             let error = build_command(&Catalog::Ready(default_catalog()))
                 .try_get_matches_from(args.clone())

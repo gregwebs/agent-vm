@@ -6,9 +6,9 @@
 //! here would select, so it is dispatched before runtime discovery and setup
 //! (see `main`). `pins` is the other read-only inspection verb: it reports the
 //! approvals this project already holds, across platforms, and needs no
-//! configuration, catalog, runtime or cache either. `refresh` acquires bytes
+//! configuration, catalog, runtime or cache either. `pull` acquires bytes
 //! natively and never boots. `build`/`import` are the explicit user-owned
-//! publication verbs from ADR-0043; only they may invoke Docker. `refresh`,
+//! publication verbs from ADR-0043; only they may invoke Docker. `pull`,
 //! `build` and `import` are each their own consent and none asks (#391,
 //! ADR-0067): each approves exactly what it resolved or published. `import`
 //! additionally *observes* the selection after publishing (#385) — it never
@@ -49,7 +49,7 @@ impl Args {
             ImageCmd::Show
             | ImageCmd::Pins
             | ImageCmd::Build(_)
-            | ImageCmd::Refresh(_)
+            | ImageCmd::Pull(_)
             | ImageCmd::SetDefault(_) => Ok(()),
         }
     }
@@ -70,10 +70,10 @@ pub(crate) enum ImageCmd {
     )]
     Pins,
     #[command(
-        about = "Refresh this project's in-use OCI references without booting a VM",
-        long_about = "Re-resolve and approve the ambient boot operation and all recorded boot/output holders without asking. When adopting the host default, that operation acquires it instead of the old unheld project default; a held old default is refreshed independently. Use --image REF to refresh one in-use reference without changing selection or adopting a default. Keep successful approvals if another target fails; exit 1 if any target fails."
+        about = "Pull this project's in-use OCI references without booting a VM",
+        long_about = "Re-resolve and approve the ambient boot operation and all recorded boot/output holders without asking. When adopting the host default, that operation acquires it instead of the old unheld project default; a held old default is pulled independently. Use --image REF to pull one in-use reference without changing selection or adopting a default. Keep successful approvals if another target fails; exit 1 if any target fails."
     )]
-    Refresh(crate::pull::Args),
+    Pull(crate::pull::Args),
     /// Acquire an OCI image and make it the starting default for projects that
     /// have none yet. Established projects keep their own default.
     ///
@@ -94,7 +94,7 @@ pub(crate) enum ImageCmd {
 pub(crate) fn preflight(args: &Args) -> Result<()> {
     match &args.cmd {
         ImageCmd::Show | ImageCmd::Pins | ImageCmd::Build(_) | ImageCmd::SetDefault(_) => Ok(()),
-        ImageCmd::Refresh(args) => crate::pull::preflight(args),
+        ImageCmd::Pull(args) => crate::pull::preflight(args),
         ImageCmd::Import(args) => crate::image_import::preflight(args),
     }
 }
@@ -147,10 +147,10 @@ pub(crate) async fn run(args: Args, catalog: Catalog, images: ConfiguredImages) 
         // Same wiring rule, and the stronger reason: a runtime path would also
         // create the state this listing promises not to create.
         ImageCmd::Pins => bail!("image pins must be dispatched before runtime setup"),
-        ImageCmd::Refresh(args) => {
-            // Refresh forwards the *original* carried configuration so its own
+        ImageCmd::Pull(args) => {
+            // Pull forwards the *original* carried configuration so its own
             // broken-config rules apply: a known ambient selection or a proven
-            // in-use target can recover, a bare refresh cannot (R8).
+            // in-use target can recover, a bare pull cannot (R8).
             crate::pull::run(args, catalog, images).await
         }
         ImageCmd::SetDefault(args) => {
@@ -162,7 +162,7 @@ pub(crate) async fn run(args: Args, catalog: Catalog, images: ConfiguredImages) 
             // Only import observes the selection after publishing, and it must
             // keep its existing behaviour for each catalog state: a ready
             // catalog exposes its tiers, a broken one is reported to import as
-            // a failure it tolerates after a successful publication. Refresh and
+            // a failure it tolerates after a successful publication. Pull and
             // set-default above never see this derived value, so neither
             // silently changes how it reads a broken configuration.
             let configured = match &catalog {
