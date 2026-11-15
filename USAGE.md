@@ -1348,8 +1348,9 @@ The bounded option surface is:
 
 ```text
 agent-vm image build --tag REF [-f|--file DOCKERFILE]
-  [--build-arg KEY[=VALUE]]... [--target STAGE] [--builder NAME]
-  [--pull] [--no-cache] [--progress MODE] [CONTEXT]
+  [--build-arg KEY[=VALUE]]... [--build-context NAME=PATH]...
+  [--target STAGE] [--builder NAME] [--pull] [--no-cache]
+  [--progress MODE] [CONTEXT]
 ```
 
 `--tag`/`-t` is required: a mutable OCI reference, not a digest or local path.
@@ -1361,6 +1362,28 @@ build argument is an ordinary user Dockerfile choice. Platform is always host
 Linux architecture, with one anonymous OCI output and attestations disabled.
 Unsupported buildx flags, including `--platform`, `--output`, `--load` and
 `--push`, are usage errors; use an external build for other controls.
+
+`--build-context NAME=PATH` gives the Dockerfile a named context to read with
+`FROM NAME`, `COPY --from=NAME` or `RUN --mount=from=NAME` — typically a local
+directory, such as a binary you cross-compiled on the host:
+`--build-context helper-bin=./out/linux-arm64`. Repeat it for more. A value
+with no `=`, or an empty NAME or PATH, is a usage error; every accepted value
+reaches Docker byte for byte, with no trimming. A value that begins with `-`
+must use the attached spelling (`--build-context=-name=path`): written
+separately (`--build-context -name=path`) the option parser reads it as a flag
+and rejects the line. Docker owns the rest: NAME is an image-style name it
+normalizes, PATH may also be `docker-image://`, `oci-layout://` or a Git/HTTPS
+URL, and a relative PATH is resolved from your current directory. agent-vm
+forwards every pair and never drops one, but it does not read the Dockerfile:
+Docker rejects a missing or non-directory **local** PATH, yet silently ignores a
+context no instruction names, and a repeated NAME keeps its last value. Whether
+a given builder or Dockerfile frontend can read a named context is Docker's own
+capability negotiation; if Docker reports a failure there — an unsupported
+frontend included — agent-vm surfaces it and imports nothing.
+
+One inherited diagnostic rule in this section: a parse error on a command line
+that also carries a scrub witness (`secret`, `image import`) keeps that
+routine's value-free text and status, instead of the flag's own message.
 
 An OCI-capable builder is required. Classic Docker image-store drivers may
 reject OCI export. An isolated `docker-container` builder can export OCI but
@@ -1479,10 +1502,15 @@ Ordinary return paths clean only this invocation's staging; interruption may
 leave staging, but never imports before exporter success.
 
 Host builds are **not credential-shielded guest execution**: trust the
-Dockerfile/context/builder. Docker inherits ordinary host environment,
-credentials and stdin; agent-vm does not invoke runtime credential capture or
-provisioning. Avoid sensitive build CLI values: build's ordinary clap usage
-errors can echo rejected values; only import gets value-free parse errors.
+Dockerfile, the context and the local directories you name with
+`--build-context` (BuildKit may upload a named local context's contents to the
+builder you select, as it may the main context), and the builder. Docker
+inherits ordinary host environment, credentials and stdin; agent-vm does not
+invoke runtime credential capture or provisioning. Avoid sensitive build CLI
+values: build's ordinary clap usage errors can echo rejected values, and the
+general scrub does not cover an ordinary `image build` line that carries no
+scrub witness; only import, and the witness cases named above, get value-free
+parse errors.
 
 #### Launch builds (`--dockerfile`)
 
@@ -1534,10 +1562,11 @@ build can leave that copy behind.
 
 What a launch build deliberately cannot do:
 
-- **No build options.** No `--build-arg`, `--target`, `--builder`, `--no-cache`,
-  `--progress` or `--pull`; use `agent-vm image build` (which accepts them) plus
-  `--image`, or an ordinary `docker buildx build` you run yourself. Docker still
-  honours `BUILDX_BUILDER` and `DOCKER_HOST` from your environment, so a builder
+- **No build options.** No `--build-arg`, `--build-context`, `--target`,
+  `--builder`, `--no-cache`, `--progress` or `--pull`; use
+  `agent-vm image build` (which accepts them) plus `--image`, or an ordinary
+  `docker buildx build` you run yourself. Docker still honours `BUILDX_BUILDER`
+  and `DOCKER_HOST` from your environment, so a builder
   chosen that way applies to every launch build you run.
 - **No reusable name and no pruning.** Superseded launch-build content stays in
   the cache, exactly as `image build` output does; only the current digest of a

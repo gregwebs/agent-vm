@@ -3567,6 +3567,7 @@ mod tests {
                 "{help}"
             );
             assert!(help.contains("--build-arg"), "{help}");
+            assert!(help.contains("--build-context <NAME=PATH>"), "{help}");
             let mut import = command
                 .find_subcommand("image")
                 .unwrap()
@@ -4306,6 +4307,90 @@ mod tests {
                 Err(anyhow!("broken catalog")),
             ));
             assert_eq!(error.exit_code(), 2);
+        }
+    }
+
+    #[test]
+    fn launch_routes_reject_build_context() {
+        let _env = clear_launch_env();
+        // `--build-context` belongs to `image build` (ADR-0061). Before the
+        // verb it is an unknown launch option; after the program boundary it is
+        // a literal guest argument. The end-of-process behaviour of each
+        // rejecting spelling (status 2, no Docker) is pinned by the
+        // compiled-binary matrix in `tests/image_build.rs`: `parse_from` hands a
+        // non-direct clap error to `error.exit()`, which would end the test
+        // binary. Here the same command tree is parsed directly, which returns
+        // the identical error, and the route hint proves it is never
+        // reclassified as a direct-launch failure.
+        let broken_catalog = || Catalog::Broken(anyhow!("config: broken on purpose"));
+        for catalog in [
+            Catalog::Ready(report_from(MYTOOL).into_launch_catalog().unwrap()),
+            broken_catalog(),
+        ] {
+            for argv in [
+                vec![
+                    "agent-vm",
+                    "--dockerfile",
+                    "Dockerfile",
+                    "--build-context",
+                    "x=.",
+                    "shell",
+                ],
+                vec![
+                    "agent-vm",
+                    "--dockerfile",
+                    "Dockerfile",
+                    "--build-context=x=.",
+                    "shell",
+                ],
+                vec![
+                    "agent-vm",
+                    "--dockerfile",
+                    "Dockerfile",
+                    "--build-context",
+                    "x=.",
+                    "--",
+                    "true",
+                ],
+                vec![
+                    "agent-vm",
+                    "--dockerfile",
+                    "Dockerfile",
+                    "--build-context",
+                    "x=.",
+                    "run",
+                    "true",
+                ],
+            ] {
+                let argv = argv_of(&argv);
+                let error = build_command(&catalog)
+                    .try_get_matches_from(&argv)
+                    .expect_err("not a launch option");
+                assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+                assert_eq!(error.exit_code(), 2, "{argv:?}");
+                assert!(error.to_string().contains("--build-context"), "{argv:?}");
+                // Never a direct route: the flag before the verb stays clap's
+                // own usage error, not a 125 launcher failure.
+                assert_eq!(launch_route_hint(&argv), LaunchRouteHint::Other);
+            }
+        }
+        // Past the program boundary the same tokens are literal guest argv.
+        let (_, tool_args) = launch_of(
+            parse_from(
+                argv_of(&["agent-vm", "shell", "--build-context", "x=."]),
+                Ok(report_from(MYTOOL)),
+            )
+            .expect("the flag is a tool argument after the verb"),
+        );
+        assert_eq!(tool_args, ["--build-context", "x=."]);
+        for tokens in [
+            vec!["agent-vm", "run", "true", "--build-context", "x=."],
+            vec!["agent-vm", "--", "true", "--build-context", "x=."],
+        ] {
+            let (invocation, argv) =
+                direct_of(parse_from(argv_of(&tokens), Ok(report_from(MYTOOL))).unwrap());
+            assert_eq!(invocation.program(), "true", "{tokens:?}");
+            assert_eq!(argv, ["--build-context", "x=."], "{tokens:?}");
         }
     }
 

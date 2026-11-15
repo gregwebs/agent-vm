@@ -28,12 +28,15 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io::Write as _;
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use crate::image_publish::{ImageTarget, PublishPurpose, ResultReference};
 use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
+use clap::builder::TypedValueParser as _;
+use vstd::prelude::*;
 
 use crate::config::escape_str;
 
@@ -78,6 +81,15 @@ pub(crate) struct BuildOptions {
     #[arg(long = "build-arg", value_name = "KEY[=VALUE]")]
     pub(crate) build_args: Vec<OsString>,
 
+    /// Add a named build context (`NAME=PATH`) the Dockerfile can read with
+    /// `FROM`, `COPY --from` or `RUN --mount=from`; passed verbatim to Docker.
+    #[arg(
+        long = "build-context",
+        value_name = "NAME=PATH",
+        value_parser = clap::builder::OsStringValueParser::new().try_map(BuildContext::parse)
+    )]
+    pub(crate) build_contexts: Vec<BuildContext>,
+
     /// Build only up to this Dockerfile stage.
     #[arg(long, value_name = "STAGE")]
     pub(crate) target: Option<OsString>,
@@ -98,6 +110,94 @@ pub(crate) struct BuildOptions {
     #[arg(long, value_name = "MODE")]
     pub(crate) progress: Option<OsString>,
 }
+
+/// One `--build-context NAME=PATH` value, accepted only in that shape.
+///
+/// agent-vm checks just the shape it documents — a `=` with something on both
+/// sides — because a value without one can only ever be a Docker error. NAME's
+/// grammar (an image reference Docker normalizes, so `alpine` and
+/// `docker.io/library/alpine` are one name) and PATH's forms (a local
+/// directory, `docker-image://`, `oci-layout://`, a URL) stay Docker's: a copy
+/// of either would be a second grammar that drifts. The original bytes are
+/// kept, so non-UTF-8 values reach Docker as `--build-arg` values do.
+///
+/// Every accepted value is forwarded; agent-vm does not read the Dockerfile to
+/// prove it is used. BuildKit silently ignores an unreferenced context, and
+/// deciding "referenced" means Docker's whole Dockerfile and frontend grammar.
+#[derive(Clone, Debug)]
+pub(crate) struct BuildContext(OsString);
+
+impl BuildContext {
+    /// The measurement half of the contracted decision (ADR-0018): the first
+    /// `=` — Docker splits there too, and a reference cannot hold one, so any
+    /// later `=` belongs to PATH — reduced to the three facts the kernel reads.
+    fn parse(raw: OsString) -> std::result::Result<Self, BuildContextError> {
+        let bytes = raw.as_bytes();
+        let separator = bytes.iter().position(|&byte| byte == b'=');
+        let facts = BuildContextFacts {
+            has_separator: separator.is_some(),
+            name_nonempty: separator.is_some_and(|index| index > 0),
+            path_nonempty: separator.is_some_and(|index| index + 1 < bytes.len()),
+        };
+        if build_context_is_acceptable(facts) {
+            return Ok(Self(raw));
+        }
+        // The rejection *reason* is a diagnostic derived from the same
+        // measurement, not a second boundary decision.
+        Err(match separator {
+            None => BuildContextError::MissingSeparator,
+            Some(0) => BuildContextError::EmptyName,
+            Some(_) => BuildContextError::EmptyPath,
+        })
+    }
+
+    fn as_os_str(&self) -> &OsStr {
+        &self.0
+    }
+}
+
+/// Why a `--build-context` value is not `NAME=PATH`. Names no value: clap
+/// already renders the rejected token beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuildContextError {
+    MissingSeparator,
+    EmptyName,
+    EmptyPath,
+}
+
+impl std::fmt::Display for BuildContextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::MissingSeparator => "expected NAME=PATH",
+            Self::EmptyName => "NAME is empty; expected NAME=PATH",
+            Self::EmptyPath => "PATH is empty; expected NAME=PATH",
+        })
+    }
+}
+
+impl std::error::Error for BuildContextError {}
+
+verus! {
+
+/// The three already-measured facts the `--build-context` decision reads. Named
+/// fields rather than adjacent `bool` parameters, so an argument swap cannot
+/// invert the decision.
+pub(crate) struct BuildContextFacts {
+    pub(crate) has_separator: bool,
+    pub(crate) name_nonempty: bool,
+    pub(crate) path_nonempty: bool,
+}
+
+/// The `NAME=PATH` acceptance decision, contracted (ADR-0018): accept **iff**
+/// there is a `=` with at least one byte on each side. Docker's context-name
+/// grammar, PATH's forms and what the build does with an accepted value are not
+/// re-decided here; `build_command` passes the original bytes.
+pub(crate) fn build_context_is_acceptable(facts: BuildContextFacts) -> (accepted: bool)
+    ensures
+        accepted == (facts.has_separator && facts.name_nonempty && facts.path_nonempty),
+{ facts.has_separator && facts.name_nonempty && facts.path_nonempty }
+
+} // verus!
 
 /// Docker's inputs for one anonymous host-platform OCI export.
 pub(crate) struct DockerBuild<'a> {
@@ -197,6 +297,11 @@ fn build_command(build: &DockerBuild<'_>) -> tokio::process::Command {
     for build_arg in &build.options.build_args {
         command.arg("--build-arg").arg(build_arg);
     }
+    for build_context in &build.options.build_contexts {
+        command
+            .arg("--build-context")
+            .arg(build_context.as_os_str());
+    }
     if let Some(target) = &build.options.target {
         command.arg("--target").arg(target);
     }
@@ -237,6 +342,7 @@ fn host_linux_platform() -> String {
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::os::unix::ffi::OsStringExt as _;
 
     #[derive(Parser)]
     struct TestCli {
@@ -262,6 +368,7 @@ mod tests {
         assert_eq!(args.context, OsString::from("."));
         assert!(args.dockerfile.is_none());
         assert!(args.options.build_args.is_empty());
+        assert!(args.options.build_contexts.is_empty());
         assert!(args.options.target.is_none());
         assert!(args.options.builder.is_none());
         assert!(!args.options.pull);
@@ -291,6 +398,16 @@ mod tests {
             .as_std()
             .get_args()
             .map(|arg| arg.to_os_string())
+            .collect()
+    }
+
+    /// Every value following a `--build-context` flag, in argv order. The whole
+    /// sequence is the oracle: a presence-only check cannot see an extra pair
+    /// or a deduplicated one.
+    fn build_context_values(argv: &[OsString]) -> Vec<OsString> {
+        argv.windows(2)
+            .filter(|window| window[0] == "--build-context")
+            .map(|window| window[1].clone())
             .collect()
     }
 
@@ -352,6 +469,20 @@ mod tests {
             "B=",
             "--build-arg",
             "C=a=b",
+            "--build-context",
+            "bin=out dir",
+            "--build-context",
+            "y=a=b",
+            "--build-context",
+            "alpine=docker-image://alpine:3.20",
+            "--build-context",
+            "x=a",
+            "--build-context",
+            "x=b",
+            "--build-context",
+            "alpine=a",
+            "--build-context",
+            "docker.io/library/alpine:latest=b",
             "--target",
             "stage",
             "--builder",
@@ -382,6 +513,20 @@ mod tests {
         assert!(rendered.windows(2).any(|w| w == ["--build-arg", "B="]));
         assert!(rendered.windows(2).any(|w| w == ["--build-arg", "C=a=b"]));
         assert!(rendered.windows(2).any(|w| w == ["--target", "stage"]));
+        let argv = argv_of(&build_command(&build));
+        assert_eq!(
+            build_context_values(&argv),
+            vec![
+                OsString::from("bin=out dir"),
+                OsString::from("y=a=b"),
+                OsString::from("alpine=docker-image://alpine:3.20"),
+                OsString::from("x=a"),
+                OsString::from("x=b"),
+                OsString::from("alpine=a"),
+                OsString::from("docker.io/library/alpine:latest=b"),
+            ],
+            "the typed sequence, forwarded once each and in order: {rendered:?}"
+        );
         assert!(rendered.contains(&"--pull".to_string()));
         assert!(rendered.contains(&"--no-cache".to_string()));
         assert!(rendered.windows(2).any(|w| w == ["--progress", "plain"]));
@@ -421,12 +566,122 @@ mod tests {
             Some("/abs/Dockerfile")
         );
         assert_eq!(rendered.last().map(String::as_str), Some("/abs"));
-        assert!(
-            !rendered.iter().any(|arg| arg == "-t"
-                || arg == "--tag"
-                || arg == "--builder"
-                || arg == "--progress")
-        );
+        assert!(!rendered.iter().any(|arg| arg == "-t"
+            || arg == "--tag"
+            || arg == "--builder"
+            || arg == "--build-context"
+            || arg == "--progress"));
+    }
+
+    // -- build contexts ----------------------------------------------------
+
+    #[test]
+    fn build_context_needs_a_name_and_a_path() {
+        for (raw, reason) in [
+            ("x", "expected NAME=PATH"),
+            ("=p", "NAME is empty; expected NAME=PATH"),
+            ("=", "NAME is empty; expected NAME=PATH"),
+            ("n=", "PATH is empty; expected NAME=PATH"),
+        ] {
+            let error = match parse(&["t", "--tag", "a:1", "--build-context", raw]) {
+                Ok(_) => panic!("{raw} must be a usage error"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{raw}"
+            );
+            assert_eq!(error.exit_code(), 2, "{raw}");
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains("--build-context <NAME=PATH>"),
+                "{raw}: {rendered}"
+            );
+            assert!(rendered.contains(reason), "{raw}: {rendered}");
+        }
+        // A second `=` belongs to PATH, and a one-byte PATH is enough.
+        for raw in ["a=b", "y==", "a==b"] {
+            let args = parse(&["t", "--tag", "a:1", "--build-context", raw])
+                .unwrap_or_else(|error| panic!("{raw} must be accepted: {error}"));
+            assert_eq!(args.options.build_contexts.len(), 1, "{raw}");
+        }
+    }
+
+    #[test]
+    fn build_context_decision_table() {
+        // The erased kernel over all eight fact rows: acceptance is exactly the
+        // conjunction, so no row can lean on Docker's name or path grammar.
+        for bits in 0..8 {
+            let facts = BuildContextFacts {
+                has_separator: bits & 1 != 0,
+                name_nonempty: bits & 2 != 0,
+                path_nonempty: bits & 4 != 0,
+            };
+            assert_eq!(
+                build_context_is_acceptable(facts),
+                bits == 7,
+                "row {bits:03b}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_context_bytes_reach_docker_unjudged() {
+        for raw in [
+            OsString::from_vec(b"n\x80=p\x81".to_vec()),
+            OsString::from("Bad Name=."),
+        ] {
+            let args = TestCli::try_parse_from([
+                OsString::from("t"),
+                OsString::from("--tag"),
+                OsString::from("a:1"),
+                OsString::from("--build-context"),
+                raw.clone(),
+            ])
+            .unwrap_or_else(|error| panic!("{raw:?} must be accepted: {error}"))
+            .args;
+            let build = docker_build_from_args(&args);
+            let argv = argv_of(&build_command(&build));
+            assert_eq!(
+                build_context_values(&argv),
+                vec![raw],
+                "the identical bytes reach Docker"
+            );
+        }
+    }
+
+    #[test]
+    fn usage_names_every_build_option() {
+        use clap::CommandFactory as _;
+        #[derive(Parser)]
+        struct OptionsCli {
+            #[command(flatten)]
+            options: BuildOptions,
+        }
+        // USAGE.md is the canonical option surface (ADR-0035), and the
+        // launch-build section enumerates what it lacks; both must name every flag.
+        let usage = include_str!("../../../USAGE.md");
+        let after = |marker: &str| &usage[usage.find(marker).expect(marker)..];
+        let synopsis = {
+            let block = after("The bounded option surface is:");
+            &block[..block.find("\n```\n").expect("synopsis fence")]
+        };
+        let launch = {
+            let block = after("- **No build options.**");
+            &block[..block.find(';').expect("launch list end")]
+        };
+        for long in OptionsCli::command()
+            .get_arguments()
+            .filter_map(clap::Arg::get_long)
+        {
+            let flag = format!("--{long}");
+            assert!(synopsis.contains(&flag), "USAGE synopsis lacks {flag}");
+            assert!(
+                launch.contains(&format!("`{flag}`")),
+                "launch-build list lacks {flag}"
+            );
+        }
     }
 
     #[test]
