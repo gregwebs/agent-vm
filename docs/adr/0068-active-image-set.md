@@ -18,6 +18,8 @@ issues are success warnings, not "approval was not updated"). Adds contracts to
 S4 targeting/reporting is implemented in **0.7.55** (#543), slice S4 of #532;
 D10 supersedes D6's single-selection/arbitrary-target behavior.
 
+S4b presentation is implemented in 0.7.56 (#609).
+
 ## Context
 
 S1 made approvals per project. S2 made the default image per project. Neither
@@ -271,17 +273,35 @@ re-encoded without the new fields until a real save.
   longer hold, and gaps are expected because metadata saves allocate too.
 - A committed build/import may warn about unreported checkpoint/notice but still
   exits 0; the warning must not be retried as a failed publication.
-- `image show` keeps reporting the ambient selection and `doctor` keeps its
-  existing rows. An `image pins` listing and an active-images doctor row are a
-  **follow-up PR** against this complete store; the core store does not depend on
-  that presentation. Its contract is one tab-separated row per record
-  (`REFERENCE`, `PLATFORM`, `DIGEST`, `REVISION`, `ROLES`, `UNRESOLVED`):
-  `ROLES` lists held roles and `UNRESOLVED` lists the scope roles not yet
-  resolved, each spelled exactly `boot`, `output`, `boot+output` or `none`, so a
-  record can show `output`/`boot`, `none`/`boot` (protected by unknown Boot),
-  `none`/`boot+output` (both unknown) or `boot+output`/`none`. They are never
-  collapsed into one `unclaimed` label, and `UNRESOLVED` is joined from the scope
-  even for a record that holds a role. That listing is not implemented here.
+- `image show` continues to report the ambient next-launch selection, not
+  the last acquisition. In 0.7.56, `image pins` is the explicit offline,
+  read-only private-reference disclosure surface: one tab-separated row per
+  invoking-project approval, across all platforms, sorted by canonical
+  reference bytes then rendered platform bytes. Its header is `REFERENCE`,
+  `PLATFORM`, `DIGEST`, `REVISION`, `ROLES`, `UNRESOLVED`; fields are separated
+  by TAB and rows by LF. Digest and revision are the approved full child and
+  its global token. ROLES projects Present knowledge; UNRESOLVED projects
+  Unknown knowledge from the scope join, in boot/output order. Each column
+  uses `boot`, `output`, `boot+output` or `none`, not the stored mask spelling.
+  Legacy records with no held role display `none` with unresolved slots,
+  never "unclaimed, safe to drop". Unclaimed means neither role is Present;
+  retirement still requires both Absent. Missing/empty state prints the
+  header only; unavailable/damaged state prints no listing and exits 1;
+  extra arguments exit 2. The existing regular coordination file is required
+  for a present authority but is never opened, locked or created by this
+  projection. No schema change or migration is introduced. Doctor adds one
+  count-only, reference/digest-free `active images:` row after `project
+  default:` on the host platform: recorded/not-recorded Boot and Output,
+  unclaimed count and escaped store path. It reports safe error/unknown
+  states even when configuration is broken; located authority damage fails
+  the diagnostic. The invalid-environment early return has no project-default
+  row and prints active images directly after its environment refusal; it
+  returns no active failure on that branch so the unchanged invalid-env
+  diagnostic keeps stderr precedence and exit 1, including with damaged
+  authority. Absolute non-UTF-8 HOME remains supported by the existing path
+  policy. Host-default-only damage does not prevent the listing or the
+  available active-images row. See USAGE's "Inspecting approved
+  images" for the literal output and escaping contract.
 - S5a (#544) pinned build inputs and S5b
   (#545) Dockerfile coverage remain separate; no placeholders are added.
 

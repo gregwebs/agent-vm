@@ -67,6 +67,8 @@ run PROGRAM [ARG...]                run a guest executable directly; no catalog
 -- PROGRAM [ARG...]                 the same, spelled with the top-level separator
 image show                          print the boot image a launch here would
                                     select, with its source (read-only, offline)
+image pins                          list this project's approved images and
+                                    recorded roles (read-only, offline)
 image build --tag REF [OPTIONS] [CONTEXT]
                                     explicitly build + import a user Dockerfile
 image import (--docker REF [--tag REF] | --input FILE --tag REF)
@@ -551,9 +553,10 @@ resolved. This is not a universal two-record bound: unresolved approvals and
 refresh-created inactive records can still fill the store. No approval is
 evicted to make room and no reset/migration is required.
 
-`image show` still reports the ambient next-launch selection, not recorded use;
-`doctor` keeps its existing selection/default diagnostics. A role/uncertainty
-listing is a follow-up, not a command introduced by this release.
+`image show` reports the ambient next-launch selection, not recorded use.
+`image pins` lists this project's approvals and role uncertainty across all
+platforms; `doctor` adds a host-platform active-images summary. See
+[Inspecting approved images](#inspecting-approved-images).
 
 See [ADR-0068](docs/adr/0068-active-image-set.md).
 
@@ -601,7 +604,7 @@ replacement command or its new output:
 | B5 | `image set-default` no longer approves its typed tag in the invoking project. A later `--image repo:b` launch in that project first-pins the tag (cache-first) instead of consuming an approval set-default made. | **Superseded in 0.7.55:** use `agent-vm setup --image repo:b --no-verify` to acquire and approve a new boot reference; it claims Boot without editing configuration. |
 | B6 | After upgrading, a project that has not yet booted the default tier is not established. Until its first default-tier launch, `setup` or `image refresh`, it follows the host record, so a `set-default` in that window changes what it boots (as before). | Launch it, or run `agent-vm image refresh` in it, before changing the host default. |
 | B7 | The first default-tier use of each project writes `image-pins.json` (to record its default), even when its approval is already warm. A launch that 0.7.46 ran read-only now fails if the store is unwritable, or reports a full store when it is at its bounds (4096 records, 4 MiB). | Keep `$HOME/.config/agent-vm/` writable. For a full store, see "Damaged or reset approvals". |
-| B8 | `image show` may print `Source: project default` with `File: $HOME/.config/agent-vm/image-pins.json`. `doctor` prints a new `project default:` row, and its `selected (without --image):` row may read `project default [<path>]`. | New output; parsers must accept the new label and row. |
+| B8 | `image show` may print `Source: project default` with `File: $HOME/.config/agent-vm/image-pins.json`. `doctor` prints a new `project default:` row, and its `selected (without --image):` row may read `project default [<path>]`. | New output; parsers must accept the new label and row. In 0.7.56, `doctor` also adds the `active images:` row and `image pins` lists this project's approvals; see [Inspecting approved images](#inspecting-approved-images). |
 | B9 | A bare `image refresh` (no `--image`, no `AGENT_VM_IMAGE_TAG`) with a tool configuration that cannot be read fails (status 1) with a fixed error. Before, it warned and fell back to the default boot image. With `--image REF` or `AGENT_VM_IMAGE_TAG` it still warns and works. `setup` still warns and falls back, but a `setup` made while the configuration is unreadable no longer establishes the project's default; the next default-tier use with a readable configuration does. | Fix the configuration (`agent-vm doctor` reports what is wrong), or set `AGENT_VM_IMAGE_TAG` to the intended boot reference. **Superseded in 0.7.55:** an arbitrary `--image REF` is refused — see [Refreshing in-use images](#refreshing-in-use-images). |
 | B10 | New notices: `image set-default` prints two sentences (host starting choice, then the invoking project). An adopting refresh prints `==> this project now uses the host's default boot image` on stdout. | New output. |
 
@@ -1041,12 +1044,75 @@ fallback is actually needed: a valid environment/user/project image succeeds
 without reading it. `agent-vm doctor` remains the verb that reports such state
 without failing early.
 
-Unlike every other output, `image show` deliberately reveals the full
-reference, including a private retained default — that is what asking for the
-selection means. Its own logs stay silent, and `doctor`, launch notices, the
-`AGENT_VM_DEBUG_CONFIG` dump and acquisition errors keep redacting as before.
-Log output captured while running a successful `agent-vm image show` can
-therefore contain a private registry name.
+Unlike every other output, the two explicit inspection surfaces —
+[`image show`](#inspecting-the-selected-boot-image) and
+[`image pins`](#inspecting-approved-images) — deliberately reveal what they were
+asked for, including private registry names and digests. Their own logs stay
+silent, and `doctor`, launch notices, the `AGENT_VM_DEBUG_CONFIG` dump and
+acquisition errors keep redacting as before. Log output captured while running a
+successful `agent-vm image show` or `agent-vm image pins` can therefore contain a
+private registry name; only their stdout does.
+
+### Inspecting approved images
+
+`agent-vm image pins` lists the invoking project's approvals across all
+platforms, independently of configuration or the next-launch selection:
+
+```console
+$ agent-vm image pins
+REFERENCE	PLATFORM	DIGEST	REVISION	ROLES	UNRESOLVED
+registry.example/team/app:dev	linux/arm64	sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa	7	boot	output
+```
+
+Output is tab-separated, sorted by canonical reference then rendered
+platform, with one approval per row. DIGEST is the full approved child
+digest; REVISION is its opaque global approval token, not a replacement
+count. ROLES and UNRESOLVED each use `boot`, `output`, `boot+output` or
+`none`, joined in boot/output order. A legacy approval can show `none` with
+`boot+output` unresolved, or with one slot unresolved after the other slot
+was claimed. **No held role does not mean safe to drop.** Only both
+known-absent roles justify retirement; listing changes nothing.
+
+References and rendered platforms are terminal-escaped: backslashes are
+doubled, double quotes escaped, and control/non-ASCII bytes printed as
+`\xNN`. The header and every row end with a newline. An absent/empty store,
+or a project with no approvals, prints just the header and exits 0. A damaged,
+unreadable or unavailable authority prints no listing, explains the failure
+safely on stderr and exits 1. A present store missing its regular stable
+coordination file is damaged; inspection never creates it. Absolute non-UTF-8
+HOME paths are supported; doctor escapes invalid path bytes as `\xNN`.
+Unset, empty or relative HOME cannot locate approvals and makes listing exit 1.
+Extra arguments exit 2. Only `-h`/`--help` is accepted; there are no
+filtering/JSON options.
+
+This is a deliberate private-reference disclosure surface. Its stdout may
+contain private registry names; its diagnostic logs never include the
+listing. It is offline, needs no healthy configuration, runtime or cache,
+and creates no file, directory or lock. It reports recorded approvals, not
+availability, running guests or the source a new launch would select;
+`image show` retains that last meaning unchanged.
+
+In the boot-image section, `doctor` reports this project's host platform only:
+
+```text
+active images: boot=recorded, output=not recorded, unclaimed=2 [<pin-store path>]
+```
+
+The expanded pin-store path is escaped for one terminal line, preserving
+printable non-ASCII. The row contains counts/role presence, no reference or
+digest. `not recorded` does not assert a slot is resolved. Unclaimed counts
+every approval holding neither role, including approvals protected by an
+unknown slot. A fresh/empty store reports both roles not recorded and zero
+unclaimed, with the same path suffix. Store failure prints
+`active images: error: <safe message>`; an uncapturable project prints
+`active images: unknown (the project directory could not be captured)`.
+Neither error nor unknown has a path suffix. Located authority damage makes
+doctor exit nonzero; an unlocatable store adds no failure beyond doctor's
+existing diagnostics. With invalid-Unicode AGENT_VM_IMAGE_TAG, the row still
+renders, but the existing environment refusal remains the single trailing
+diagnostic (exit 1), even when the active row reports store damage. The row
+is available even with broken configuration. Host-default-only damage does
+not prevent listing approvals or rendering this available active-images row.
 
 ### The retained default
 
@@ -1128,10 +1194,10 @@ untrusted, user-writable file whose reference may name a private registry), so
 notices, `agent-vm doctor`, the opt-in `AGENT_VM_DEBUG_CONFIG` dump and
 acquisition errors name `the default boot image` and redact its reference rather
 than echoing it. Your own `--image`/`AGENT_VM_IMAGE_TAG`/config `image` values
-are unaffected: they are your inputs, and they are still shown. The one
-deliberate exception is [`agent-vm image show`](#inspecting-the-selected-boot-image),
-which prints the reference because you asked for the selection. It is strictly
-observational — it creates nothing. If the record is
+are unaffected: they are your inputs, and they are still shown. The deliberate exceptions are the two explicit inspection surfaces,
+[`agent-vm image show`](#inspecting-the-selected-boot-image) and
+[`agent-vm image pins`](#inspecting-approved-images), which print what you asked
+for. Both are strictly observational — they create nothing. If the record is
 corrupt, unreadable (a symlink, FIFO, directory, oversized or non-UTF-8 file)
 or names a non-digest reference, every verb that needs the default fails and
 names the escaped path with a fixed reason; nothing is auto-reset. To recover,
@@ -2706,6 +2772,10 @@ computed. An absent inventory is a successful not-probed result. An uncomputable
 errors retain precedence over store health failures; output I/O failures take
 precedence over deferred diagnostics. Reset skips inventory discovery/loading and
 native availability entirely, even with broken configuration or inventory.
+Located damage to the image-approval store also fails ordinary doctor, even when a
+valid selected image would otherwise win; the documented exception is the
+invalid-Unicode `AGENT_VM_IMAGE_TAG` branch, whose environment refusal stays the
+single trailing diagnostic. An unlocatable `$HOME` adds no failure of its own.
 
 The report is advisory, not enforcement: it neither blocks a launch nor promises
 that a host substitution exists. Your decision whether to remove or rotate a
@@ -2943,6 +3013,13 @@ for every launch deb.debian.org
 for codex api.openai.com
 requests never grant access; a launch reports those its grants do not cover, once per image reference, then as changes
 ```
+
+The boot-image section also prints one `active images:` row, immediately after
+`project default:` and before `selected (without --image):` when that row exists:
+this project's recorded roles and unclaimed count on the host platform, with the
+expanded pin-store path and no reference or digest. It is available even when the
+configuration cannot be read. [Inspecting approved images](#inspecting-approved-images)
+has the exact form, the `error:`/`unknown` states and the status rules.
 
 The `==> image network requests` section is the same image selection's declared
 [image and agent requests](#image-network-requests), read straight from the image

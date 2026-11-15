@@ -36,6 +36,7 @@ use super::active::{
     after_role, checked_next_sequence, claim_knowledge, knowledge, may_retire,
 };
 use super::completion::{CommitReport, Completion};
+use super::presentation::{ObservedPin, ProjectPinsSnapshot};
 use super::project_default::{DefaultAdoption, ProjectDefault};
 use super::*;
 use crate::boot_image::default_selection::{self as default, SELECTION_FILE};
@@ -821,21 +822,105 @@ impl Store {
             } else {
                 Ok(None)
             };
-            let record_present = exists(&self.record())?;
             if exists(&self.lock_path())? {
                 if Instant::now() >= deadline {
                     return Err(anyhow!("image pin observation timed out"));
                 }
                 continue;
             }
-            if record_present {
-                return Err(corrupt());
-            }
+            // One statement of the authority rule, shared with `begin` and the
+            // lock-free projection: a record without its stable lock is damage.
+            self.require_lock_present_for_record()?;
             return Ok((PinFile::empty(), physical));
         }
     }
     pub(super) fn lookup(&self, key: &PinKey) -> Result<Option<ApprovedPin>> {
         self.observe_slot(HostRead::Never)?.0.lookup(key)
+    }
+
+    /// The read-only projection of one project's approvals, for the explicit
+    /// listing and `doctor`'s count-only row (ADR-0068).
+    ///
+    /// A **snapshot, not a transaction**: the coordination-file metadata and the
+    /// record bytes are read without acquiring the lock, so an exclusive writer
+    /// never delays an inspection and the two reads need not be contemporaneous.
+    /// The bytes themselves come from one complete atomic save. Whole-file
+    /// validation precedes projection, so a malformed foreign record is damage
+    /// rather than something to filter away, and nothing is created, repaired or
+    /// written.
+    ///
+    /// The order is the observer's effective one: existence, then lock shape for
+    /// a *present* authority, then the record. `open_lock` reaches the shape
+    /// failure first on the two locked paths; this path states it explicitly
+    /// because it never opens the file.
+    ///
+    /// Only a present authority needs its regular coordination file (R4/AC1,
+    /// D2): a directory, symlink or FIFO left at the lock path beside **no**
+    /// record is not damage, because an absent store is a successful empty
+    /// listing and nothing here creates the file it would then have to be.
+    pub(super) fn project_pins(&self, project: &ProjectId) -> Result<ProjectPinsSnapshot> {
+        if self.require_lock_present_for_record()? {
+            self.require_lock_metadata_is_regular()?;
+        }
+        let file = self.read()?.unwrap_or_else(PinFile::empty);
+        let mut pins = Vec::new();
+        for record in &file.pins {
+            let pin = record.validated()?;
+            if pin.key.project != *project {
+                continue;
+            }
+            // A missing scope record is both roles *unknown*; the join supplies
+            // Present/Absent/Unknown, so this projection never infers a role from
+            // selection, order or a default.
+            let resolved = file
+                .resolved_in(&pin.key.scope())
+                .map(ResolvedRoles::mask)
+                .unwrap_or(RoleMask::EMPTY);
+            pins.push(ObservedPin {
+                knowledge: knowledge(resolved, record.held()),
+                pin,
+            });
+        }
+        Ok(ProjectPinsSnapshot {
+            path: self.record(),
+            pins,
+        })
+    }
+
+    /// ADR-0063 Decision 3's existence rule, stated once for all three readers:
+    /// a present record without its stable coordination file is damage. Metadata
+    /// only — an absent record short-circuits before any lock lookup, and this
+    /// never opens, creates or locks anything, so a lockless authority is refused
+    /// rather than silently adopted by a new writer.
+    ///
+    /// Returns whether the record exists, which is the one fact that decides
+    /// whether a coordination file is required at all: the two transaction paths
+    /// ignore it because a write always creates the lock, and
+    /// [`Self::project_pins`] uses it to scope the shape rule to a present
+    /// authority.
+    ///
+    /// A present non-regular lock still *exists*, so its shape is deliberately
+    /// not this helper's question: `open_lock` answers that for the two locked
+    /// paths, and [`Self::require_lock_metadata_is_regular`] for the lock-free
+    /// one.
+    fn require_lock_present_for_record(&self) -> Result<bool> {
+        let record_present = exists(&self.record())?;
+        if record_present && !exists(&self.lock_path())? {
+            return Err(corrupt());
+        }
+        Ok(record_present)
+    }
+
+    /// The shape half of the same authority rule, for the lock-free projection
+    /// only. `open_lock` reports a non-regular coordination file as the access
+    /// failure before either transaction path reads a record, so this keeps the
+    /// inspection's classification identical without touching their order.
+    fn require_lock_metadata_is_regular(&self) -> Result<()> {
+        lock_shape(
+            std::fs::symlink_metadata(self.lock_path())
+                .map(|metadata| metadata.file_type())
+                .map_err(|error| error.kind()),
+        )
     }
 
     /// The one read-only snapshot a refresh invocation freezes its worklist
@@ -958,9 +1043,7 @@ impl Store {
         // Only a lockless legacy store observes this order (it used to report
         // the legacy error here and now reports damage, as a version-1 binary
         // already did for it).
-        if exists(&self.record())? && !exists(&self.lock_path())? {
-            return Err(corrupt());
-        }
+        self.require_lock_present_for_record()?;
         let preread = self.read()?;
         if touch_default
             || preread
@@ -1569,6 +1652,22 @@ fn exists(path: &Path) -> Result<bool> {
         Err(_) => Err(failure()),
     }
 }
+
+/// The measured shape of a coordination file, classified apart from the syscall
+/// so every branch is testable on a host that does not enforce permissions.
+///
+/// A missing lock is `Ok` here: the *existence* rule owns that case and has
+/// already run. Everything present but not a regular file is the same access
+/// failure `open_lock` reports, never `corrupt()` — a store present with an
+/// unusable lock is not the same damage as a store present with no lock.
+fn lock_shape(shape: std::result::Result<std::fs::FileType, ErrorKind>) -> Result<()> {
+    match shape {
+        Ok(kind) if kind.is_file() => Ok(()),
+        Ok(_) => Err(failure()),
+        Err(ErrorKind::NotFound) => Ok(()),
+        Err(_) => Err(failure()),
+    }
+}
 fn open_lock(path: &Path, create: bool) -> Result<Option<File>> {
     let flags = if create {
         OFlags::RDWR | OFlags::CREATE
@@ -1628,6 +1727,7 @@ fn wait(lock: &File, mode: FlockMode, deadline: Instant, noticed: &mut bool) -> 
 
 #[cfg(test)]
 mod tests {
+    use super::active::RoleKnowledge;
     use super::*;
     use crate::image_pin::project_default::HostRetention;
     use std::os::unix::fs::PermissionsExt;
@@ -4844,5 +4944,360 @@ mod tests {
                 other => panic!("unexpected row {other}"),
             }
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // ADR-0068 / #609: the two read-only projections of the authority.
+    // ---------------------------------------------------------------------
+
+    /// The messages are literals here, not `corrupt()`/`failure()`/`legacy()`
+    /// calls: an oracle built from the production constructor would pass even if
+    /// the two were swapped (plan §7's N1 literals).
+    const N1_DAMAGED: &str = "image pin authority at $HOME/.config/agent-vm/image-pins.json is damaged; restore its intended records from backup or deliberately move it aside to reset approvals";
+    const N1_ACCESS: &str = "image pin authority at $HOME/.config/agent-vm/image-pins.json could not be accessed or saved";
+    const N1_V1: &str = "image pin authority at $HOME/.config/agent-vm/image-pins.json uses the host-wide version 1 format, which this agent-vm no longer reads: approvals are now per project. Archiving it resets approvals, and mutable tags may then resolve to newer content; see \"Upgrading from host-wide approvals\" in USAGE.md";
+    const N1_MALFORMED: &[u8] = b"not json";
+
+    /// `project_pins` returns a snapshot type without `Debug` on purpose, so
+    /// `unwrap_err` is unavailable: extract the message without printing the
+    /// value that must never be printable.
+    #[track_caller]
+    fn pins_error(store: &Store, project: &ProjectId) -> String {
+        match store.project_pins(project) {
+            Ok(_) => panic!("the projection must fail here"),
+            Err(error) => error.to_string(),
+        }
+    }
+    const N1_V1_BYTES: &[u8] = br#"{"version":1,"pins":[],"pending_default":null}"#;
+
+    /// A lock that exists but is not the regular file the protocol requires.
+    fn nonregular_lock(store: &Store, kind: &str, target: &Path) {
+        std::fs::create_dir_all(&store.directory).unwrap();
+        match kind {
+            "symlink" => std::os::unix::fs::symlink(target, store.lock_path()).unwrap(),
+            "directory" => std::fs::create_dir(store.lock_path()).unwrap(),
+            "fifo" => fifo(&store.lock_path()),
+            other => panic!("unexpected lock shape {other}"),
+        }
+    }
+
+    /// The metadata the no-write oracle compares: type, mode and inode, plus a
+    /// symlink's target. A read is allowed to touch atime, so it is excluded.
+    fn shape(path: &Path) -> (u32, u32, u64, Option<PathBuf>) {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = std::fs::symlink_metadata(path).unwrap();
+        (
+            metadata.mode(),
+            u32::from(metadata.file_type().is_symlink()),
+            metadata.ino(),
+            std::fs::read_link(path).ok(),
+        )
+    }
+
+    /// One directory listing, sorted: the inventory a projection must not change.
+    fn inventory(directory: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// AC5: both helpers classify without I/O beyond `symlink_metadata`, and the
+    /// existence rule deliberately does *not* decide lock shape.
+    #[test]
+    fn presentation_lock_helpers_classify_without_io_side_effects() {
+        // (record present, lock shape, the helper's answer) — a present
+        // non-regular lock still exists, so the shape is not this helper's
+        // question, and its returned "record present" fact is what scopes the
+        // shape rule to a present authority.
+        for (record, lock, ok) in [
+            (false, None, true),
+            (false, Some("directory"), true),
+            (true, None, false),
+            (true, Some("regular"), true),
+            (true, Some("directory"), true),
+            (true, Some("symlink"), true),
+            (true, Some("fifo"), true),
+        ] {
+            let (dir, store) = paths();
+            std::fs::create_dir_all(&store.directory).unwrap();
+            if record {
+                std::fs::write(store.record(), file().encode().unwrap()).unwrap();
+            }
+            match lock {
+                None => {}
+                Some("regular") => {
+                    std::fs::write(store.lock_path(), b"").unwrap();
+                }
+                Some(kind) => nonregular_lock(&store, kind, &dir.path().join("absent")),
+            }
+            let before = inventory(&store.directory);
+            let lock_before = std::fs::symlink_metadata(store.lock_path())
+                .ok()
+                .map(|_| shape(&store.lock_path()));
+            let outcome = store.require_lock_present_for_record();
+            match (ok, outcome) {
+                (true, Ok(present)) => assert_eq!(present, record, "record={record} lock={lock:?}"),
+                (false, Err(error)) => assert_eq!(error.to_string(), N1_DAMAGED),
+                (_, other) => panic!("record={record} lock={lock:?}: {other:?}"),
+            }
+            assert_eq!(
+                inventory(&store.directory),
+                before,
+                "a metadata-only check creates nothing"
+            );
+            assert_eq!(
+                std::fs::symlink_metadata(store.lock_path())
+                    .ok()
+                    .map(|_| shape(&store.lock_path())),
+                lock_before,
+                "a metadata-only check leaves the lock as it found it"
+            );
+        }
+
+        // The shape mapping, including the branches a privileged test host
+        // cannot reach through the filesystem at all.
+        let (_dir, store) = paths();
+        std::fs::create_dir_all(&store.directory).unwrap();
+        std::fs::write(store.lock_path(), b"").unwrap();
+        let file_type = std::fs::symlink_metadata(store.lock_path())
+            .unwrap()
+            .file_type();
+        assert!(lock_shape(Ok(file_type)).is_ok());
+        let (other_dir, other_store) = paths();
+        nonregular_lock(&other_store, "directory", &other_dir.path().join("absent"));
+        let directory = std::fs::symlink_metadata(other_store.lock_path())
+            .unwrap()
+            .file_type();
+        assert_eq!(
+            lock_shape(Ok(directory)).unwrap_err().to_string(),
+            N1_ACCESS
+        );
+        assert!(lock_shape(Err(ErrorKind::NotFound)).is_ok());
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidInput,
+            ErrorKind::Other,
+        ] {
+            assert_eq!(
+                lock_shape(Err(kind)).unwrap_err().to_string(),
+                N1_ACCESS,
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// AC5/N1: the shared existence rule must not reorder either transaction
+    /// path. `begin` keeps read-before-shape (so malformed bytes and a v1 file
+    /// keep their own messages), while the observer's `open_lock` fails the
+    /// relationship first.
+    #[test]
+    fn presentation_diagnostic_order_is_preserved_for_begin_and_observe() {
+        for (bytes, begin_message) in [(N1_MALFORMED, N1_DAMAGED), (N1_V1_BYTES, N1_V1)] {
+            let (dir, store) = paths();
+            std::fs::create_dir_all(&store.directory).unwrap();
+            std::fs::write(store.record(), bytes).unwrap();
+            nonregular_lock(&store, "directory", &dir.path().join("absent"));
+            let lock_before = shape(&store.lock_path());
+
+            let error = store
+                .begin(false)
+                .err()
+                .expect("a directory lock must fail the transaction");
+            assert_eq!(error.to_string(), begin_message);
+
+            let error = store
+                .observe_slot_independently(HostRead::Never)
+                .err()
+                .expect("the observer fails access before it reads");
+            assert_eq!(error.to_string(), N1_ACCESS);
+
+            assert_eq!(std::fs::read(store.record()).unwrap(), bytes);
+            assert_eq!(shape(&store.lock_path()), lock_before);
+            assert!(
+                store.lock_path().is_dir(),
+                "no path replaces the coordination file"
+            );
+        }
+    }
+
+    /// AC5: the lock-free projection refuses a lockless authority with the damage
+    /// message, and an unusable lock with the access message — never the other
+    /// way round, which is what reading before the shape check would produce.
+    #[test]
+    fn presentation_snapshot_rejects_missing_or_nonregular_lock_without_creating_it() {
+        let (_dir, store) = paths();
+        let fixture = file();
+        install(&store, &fixture);
+        let bytes = std::fs::read(store.record()).unwrap();
+        std::fs::remove_file(store.lock_path()).unwrap();
+
+        assert_eq!(pins_error(&store, &project()), N1_DAMAGED);
+        assert!(
+            !store.lock_path().exists(),
+            "a failed projection creates no lock"
+        );
+        assert_eq!(std::fs::read(store.record()).unwrap(), bytes);
+
+        for (kind, target) in [
+            ("symlink", Some("absent")),
+            ("directory", None),
+            ("fifo", None),
+        ] {
+            let (dir, store) = paths();
+            install(&store, &fixture);
+            std::fs::remove_file(store.lock_path()).unwrap();
+            let target = target.map(|name| dir.path().join(name));
+            match &target {
+                Some(target) => nonregular_lock(&store, kind, target),
+                None => nonregular_lock(&store, kind, &dir.path().join("absent")),
+            }
+            let lock_before = shape(&store.lock_path());
+            assert_eq!(pins_error(&store, &project()), N1_ACCESS, "{kind}");
+            assert_eq!(std::fs::read(store.record()).unwrap(), bytes, "{kind}");
+            assert_eq!(shape(&store.lock_path()), lock_before, "{kind}");
+            if let Some(target) = target {
+                assert!(!target.exists(), "{kind} target untouched");
+            }
+        }
+
+        // An absent record needs no coordination file at all: a stale
+        // non-regular path there is not damage, and the projection is the same
+        // empty snapshot an absent store produces (R4/AC1, D2).
+        for kind in ["symlink", "directory", "fifo"] {
+            let (dir, store) = paths();
+            nonregular_lock(&store, kind, &dir.path().join("absent"));
+            let lock_before = shape(&store.lock_path());
+            let snapshot = store
+                .project_pins(&project())
+                .unwrap_or_else(|error| panic!("{kind}: {error}"));
+            assert!(snapshot.pins.is_empty(), "{kind}");
+            assert_eq!(snapshot.path, store.record(), "{kind}");
+            assert!(
+                !store.record().exists(),
+                "{kind}: a projection never creates the record"
+            );
+            assert_eq!(shape(&store.lock_path()), lock_before, "{kind}");
+        }
+
+        // A present directory lock plus malformed bytes: the shape check runs
+        // *before* the record read, so this is the access failure rather than
+        // the damage the bytes would report.
+        let (dir, store) = paths();
+        std::fs::create_dir_all(&store.directory).unwrap();
+        std::fs::write(store.record(), N1_MALFORMED).unwrap();
+        nonregular_lock(&store, "directory", &dir.path().join("absent"));
+        assert_eq!(pins_error(&store, &project()), N1_ACCESS);
+    }
+
+    /// AC9: the projection is a snapshot. An exclusive holder of the authority
+    /// lock must not delay it — a call that went through `observe_slot` would
+    /// wait `READ_WAIT` and fail instead of returning this snapshot.
+    ///
+    /// The wait is bounded externally and measured: a projection that blocks,
+    /// or that merely pauses long enough to look lock-free in a final state,
+    /// fails here instead of hanging the suite or passing on success alone.
+    #[test]
+    fn presentation_snapshot_does_not_wait_for_authority_lock() {
+        const WAIT_BOUND: Duration = Duration::from_secs(10);
+        const ELAPSED_BOUND: Duration = Duration::from_secs(5);
+        let (_dir, store) = paths();
+        let mut fixture = file();
+        fixture.scopes = vec![scope_record(&project(), RoleMask::BOOT)];
+        fixture.pins[0].set_roles(Some(HeldRoles::new(RoleMask::BOOT).unwrap()));
+        fixture.sequence = Some(1);
+        install(&store, &fixture);
+        let bytes = std::fs::read(store.record()).unwrap();
+        let lock_before = shape(&store.lock_path());
+
+        let held = open_lock(&store.lock_path(), false).unwrap().unwrap();
+        assert_eq!(
+            host_paths::try_flock(&held, FlockMode::Exclusive).unwrap(),
+            host_paths::FlockAttempt::Acquired,
+            "this test must hold the authority EX"
+        );
+
+        // A detached worker, so a projection that blocks forever cannot keep the
+        // test (or the suite) alive: the receive below decides.
+        let directory = store.directory.clone();
+        let project = project();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        let worker = std::thread::spawn(move || {
+            let store = Store { directory };
+            let result = store.project_pins(&project);
+            let _ = sender.send(());
+            result
+        });
+        match receiver.recv_timeout(WAIT_BOUND) {
+            Ok(()) => {}
+            Err(error) => panic!(
+                "the projection did not return within {WAIT_BOUND:?} while an EX was held \
+                 ({error:?}): a lock-free snapshot must not queue behind a writer"
+            ),
+        }
+        let elapsed = started.elapsed();
+        let snapshot = worker
+            .join()
+            .expect("the projection thread must not panic")
+            .expect("a read-only projection does not queue behind a writer");
+        assert!(
+            elapsed < ELAPSED_BOUND,
+            "the projection took {elapsed:?} while an EX was held; a lock-free snapshot reads \
+             metadata and one bounded file, so {ELAPSED_BOUND:?} is already generous"
+        );
+        assert_eq!(snapshot.path, store.record());
+        assert_eq!(snapshot.pins.len(), 1);
+        assert_eq!(snapshot.pins[0].knowledge.boot, RoleKnowledge::Present);
+        assert_eq!(snapshot.pins[0].knowledge.output, RoleKnowledge::Unknown);
+        assert_eq!(std::fs::read(store.record()).unwrap(), bytes);
+        assert_eq!(shape(&store.lock_path()), lock_before);
+    }
+
+    /// AC1/R1: the projection is the whole project across platforms, and a
+    /// foreign project's records never appear.
+    #[test]
+    fn presentation_snapshot_projects_only_the_invoking_project() {
+        let project = project();
+        let other = ProjectId::for_tests('b');
+        let mut fixture = file();
+        fixture.pins = vec![
+            pin_record(
+                &project,
+                "example.com/b:tag",
+                'b',
+                2,
+                Some(RoleMask::OUTPUT),
+            ),
+            pin_record(&other, "example.com/c:tag", 'c', 3, Some(RoleMask::OUTPUT)),
+            pin_record(&project, "example.com/a:tag", 'a', 1, Some(RoleMask::BOOT)),
+        ];
+        // Every resolved role needs exactly one holder in its own scope: the
+        // whole file is validated before this projection filters anything.
+        fixture.scopes = vec![
+            scope_record(&project, RoleMask::BOOT_AND_OUTPUT),
+            scope_record(&other, RoleMask::OUTPUT),
+        ];
+        fixture.sequence = Some(3);
+        let (_dir, store) = paths();
+        install(&store, &fixture);
+
+        let snapshot = store.project_pins(&project).unwrap();
+        let references: Vec<String> = snapshot
+            .pins
+            .iter()
+            .map(|observed| observed.pin.key.reference.whole())
+            .collect();
+        assert_eq!(
+            references,
+            ["example.com/b:tag", "example.com/a:tag"],
+            "file order, project filter: the listing sorts, the store does not"
+        );
+        assert_eq!(snapshot.pins[0].knowledge.boot, RoleKnowledge::Absent);
+        assert_eq!(snapshot.pins[0].knowledge.output, RoleKnowledge::Present);
+        assert_eq!(snapshot.pins[1].knowledge.boot, RoleKnowledge::Present);
+        assert_eq!(snapshot.pins[1].knowledge.output, RoleKnowledge::Absent);
     }
 }

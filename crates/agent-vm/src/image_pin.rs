@@ -60,6 +60,7 @@ use crate::project::ProjectDir;
 mod active;
 mod approval;
 mod completion;
+mod presentation;
 mod project_default;
 mod publication;
 mod refresh;
@@ -68,6 +69,12 @@ mod unpinned;
 
 use active::{Role, RoleClaim, ScopeKey};
 pub(crate) use completion::{CommitReport, finish_publication};
+pub(crate) use presentation::{ActiveImagesObservation, observe_active_images, pins_report};
+// Only `doctor`'s unit tests name the count type directly: the production row
+// reads it through `ActiveImagesObservation`, so an unconditional re-export
+// would be an unused import in every ordinary build.
+#[cfg(test)]
+pub(crate) use presentation::ActiveImages;
 pub(crate) use project_default::{
     DefaultSlot, HostDefaultSet, InvokingProject, ObservedDefaults, ProjectDefaultChange,
     load_default_slot, observe_defaults, set_default,

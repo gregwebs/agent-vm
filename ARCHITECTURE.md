@@ -1156,10 +1156,14 @@ nor the cache is a scope: the store holds no cache path, timestamp or launcher
 version; deleting the cache reacquires the approved digest, and deleting the
 store is a deliberate approval reset. Local rootfs/disk launches bypass this path
 with their text unchanged.
-`agent-vm image show` is the one *disclosure* edge: it returns the selected
-source and its provenance from the same selector (and the same single
+`agent-vm image show` is one of the two *disclosure* edges: it returns the
+selected source and its provenance from the same selector (and the same single
 journal-aware default observation), before runtime discovery, and creates or
-acquires nothing. It does not print the approved child digest.
+acquires nothing. It does not print the approved child digest. The other is
+`agent-vm image pins` (#609), the explicit listing: it projects this project's
+recorded approvals — full references, child digests, revisions, held roles and
+unresolved slots — from one lock-free bounded snapshot, so it discloses private
+references on stdout by design while every diagnostic stays redacted.
 `agent-vm image import` observes the same selector after publishing, but decides
 only whether to print guidance and never discloses the selection (#385).
 
@@ -1387,8 +1391,9 @@ command's working directory once, at its entry point, and every consumer borrows
 that `ProjectDir`: session state takes its 12-hex prefix, approvals take the full
 digest as `ProjectId`. A second capture is a visible edit, because
 `ProjectDir::capture` is a clippy `disallowed-methods` entry allowed only at the
-ten entry points (launch, `setup`, `image refresh`, `image set-default`, `image
-build`, `image import`, `image show`, `doctor`, `clipboard` and `access`).
+eleven entry points (launch, `setup`, `image refresh`, `image set-default`,
+`image build`, `image import`, `image show`, `image pins`, `doctor`, `clipboard`
+and `access`).
 
 **Candidate-scoped consent.** `ValidatedCandidate` can only be minted from a
 complete native acquisition; `Approval` binds that candidate's digest and the
@@ -1407,8 +1412,12 @@ into `CommitReport::CheckpointUnavailable`, and `image_pin::completion` turns
 that and a failed completion notice into fixed, reference-free success warnings
 with exit 0. Pre-commit failures keep the ordinary "approval was not updated"
 context. `image show` and `doctor` keep their existing output and read-only
-behaviour over the new schema; an active-role listing/summary is a follow-up
-(plan §6.4), and S4/S5 remain separate.
+behaviour over the new schema. In 0.7.56 the presentation slice ships (#609):
+`image pins` lists this project's approvals across platforms from one lock-free
+snapshot, and `doctor` adds one host-platform, reference-free `active images:`
+row (recorded roles, unclaimed count, escaped store path). Both read the same
+`active::knowledge` kernel, so neither can disagree with retirement. S4/S5
+remain separate.
 
 **Approval equivalence is guest content, not index identity.** Two manifests are
 the same approval when their verified config digest and ordered layer diff IDs
