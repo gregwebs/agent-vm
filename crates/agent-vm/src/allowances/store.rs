@@ -62,8 +62,10 @@ const MAX_BYTES: u64 = 1024 * 1024;
 /// classified as damage — the conservative direction, since it applies nothing
 /// either way (see [`leading_version`]).
 const VERSION_PROBE_BYTES: usize = 4096;
-/// The record bound, so one project's view cannot grow without end.
-const MAX_RECORDS: usize = 4096;
+/// The record bound, so one project's view cannot grow without end. The live
+/// next-launch set uses the same bound (#501 slice 3 §7.5), so a session cannot
+/// remember more answers than a store could hold.
+pub(crate) const MAX_RECORDS: usize = 4096;
 /// Longer than this is not a canonical allowance spelling.
 const MAX_DESTINATION_BYTES: usize = 512;
 /// Open attempts in all when the descriptor turns out to be unlinked.

@@ -514,6 +514,7 @@ Environment:
   AGENT_VM_PROFILE                      print per-phase boot timings
   AGENT_VM_DEBUG_CONFIG                 dump the SandboxConfig JSON before boot
   AGENT_VM_NO_CHROME_MCP                disable Chrome MCP auto-configuration for Chrome-capable images
+  AGENT_VM_NO_ACCESS_PROMPT             don't ask about refusals in the terminal (1|true|yes|on)
   RUST_LOG                              tracing filter (e.g. agent_vm=debug)";
 
 /// The **launch options**, flattened into the top-level [`crate::cli`] command
@@ -1941,6 +1942,13 @@ pub(crate) async fn launch(
     // A direct launch uses the mode dispatch resolved from its launch options and
     // the host's *stdin and stdout* (issue #400); a legacy launch keeps the
     // pre-existing stdin-only predicate exactly, including not measuring stdout.
+    // #501 slice 3 R3: the prompt-off setting is read **once**, at the launch
+    // boundary, and its typo warning is printed whatever the launch's I/O mode is —
+    // a catalog tool or `-T` launch must not hide the typo.
+    let (access_prompt_setting, access_prompt_warning) = crate::access_prompt::read_setting();
+    if let Some(warning) = access_prompt_warning {
+        let _ = notices.emit(warning);
+    }
     let direct_terminal = invocation.direct_io();
     let exec_io = match direct_terminal {
         Some(crate::direct_terminal::DirectIo::Pty) => ExecIo::Attach,
@@ -2034,7 +2042,9 @@ pub(crate) async fn launch(
         // The session is raced against the sandbox's own lifetime: a runtime
         // that disappears restores the terminal and fails, never fabricating a
         // guest status (#400).
-        match crate::direct_pty::run(handle, sandbox.wait(), &mut supervision).await {
+        let prompt =
+            crate::access_prompt::Source::for_pty_launch(live.prompt_feed(), access_prompt_setting);
+        match crate::direct_pty::run(handle, sandbox.wait(), &mut supervision, prompt).await {
             Ok(end) => end,
             Err(error) => {
                 let primary = exec_failure_primary(
@@ -4829,10 +4839,42 @@ mod tests {
     /// future change to one and not the other would silently document a
     /// truthy set the binary doesn't implement (or vice versa).
     #[test]
+    fn the_prompt_setting_is_read_and_warned_about_for_every_launch() {
+        // Finding 12: the R3 warning must not be reachable only through the PTY
+        // branch. Source-level, like the launch-order characterizations above: the
+        // read and the notice come before the I/O decision, so `-T`, a catalog tool
+        // and `shell` all warn about a typo.
+        let production = include_str!("run.rs")
+            .split_once("#[cfg(test)]")
+            .expect("run.rs has a test module")
+            .0;
+        let read = production
+            .find("access_prompt::read_setting()")
+            .expect("the setting is read at the launch boundary");
+        let notice = production
+            .find("notices.emit(warning)")
+            .expect("its warning is printed");
+        let mode = production
+            .find("let direct_terminal = invocation.direct_io();")
+            .expect("the I/O decision");
+        let pty = production.find("DirectIo::Pty) {").expect("the PTY branch");
+        assert!(read < mode, "the setting is read before the I/O decision");
+        assert!(
+            notice < mode,
+            "the warning is printed before the I/O decision"
+        );
+        assert!(read < pty && notice < pty, "and before the PTY branch");
+    }
+
+    #[test]
     fn environment_help_block_lists_the_shared_truthy_set() {
         let rendered = format!("({})", crate::env_flag::TRUTHY.join("|"));
         let long_help = LAUNCH_OPTIONS_LONG_HELP;
-        for var in ["AGENT_VM_ROOT", "AGENT_VM_INSECURE_REGISTRY"] {
+        for var in [
+            "AGENT_VM_ROOT",
+            "AGENT_VM_INSECURE_REGISTRY",
+            crate::access_prompt::SETTING,
+        ] {
             let line = long_help
                 .lines()
                 .find(|line| line.contains(var))

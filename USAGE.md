@@ -1850,6 +1850,10 @@ agent-vm run npm test >out.log          # auto: redirected stdout streams
 agent-vm run printf '%s\n' --tty -T     # after the program, both are guest argv
 ```
 
+A launch on a terminal is also where the launcher asks about a refused network
+request; see *Answering a refusal in the terminal* under
+[Seeing what the sandbox refused](#seeing-what-the-sandbox-refused).
+
 They are direct-only: `shell` and catalog tools refuse them (status 2) instead of
 changing their own behavior, and the same tokens after a tool verb are forwarded to
 that tool. Under a PTY the guest's stdout and stderr are one merged terminal stream
@@ -2674,6 +2678,7 @@ included, enables it.
 | `AGENT_VM_PROFILE` | print per-phase wall-time (create/run/stop/remove) |
 | `AGENT_VM_DEBUG_CONFIG` | dump the SandboxConfig JSON before boot |
 | `AGENT_VM_NO_CHROME_MCP` | disable Chrome MCP auto-configuration for a Chrome-capable image |
+| `AGENT_VM_NO_ACCESS_PROMPT` | don't ask about refusals in the terminal (accepted: `1`/`true`/`yes`/`on` turns it off; `0`/`false`/`no`/`off` leaves it on. Any other value leaves it on and prints one launch warning) |
 | `AGENT_VM_IMAGE_TAG` | override the OCI image (same as `--image`; outranks any config `image`; an empty value counts as unset) |
 | `AGENT_VM_MEMORY_GIB` / `AGENT_VM_CPUS` | same as `--memory` / `--cpus` |
 | `AGENT_VM_ROOT` | same as `--root` (accepted: `1`/`true`/`yes`/`on`) |
@@ -4234,6 +4239,72 @@ footer says so instead of inventing a number.
 ```text
 ==> The sandbox refused a guest network request; run `agent-vm access` to see refusals (shown once per session)
 ```
+
+On a direct launch whose terminal the launcher relays (`agent-vm run …` /
+`agent-vm -- …` resolved to a terminal), the launcher also asks about the refusal
+in that terminal — see *Answering a refusal in the terminal* below.
+
+### Answering a refusal in the terminal
+
+A **direct command launched on a terminal** gets an in-terminal question about
+each network refusal. The guest keeps running; what waits is its terminal output
+while the question is up.
+
+```text
+agent-vm: the sandbox refused a network request from the guest
+
+  tcp 203.0.113.10:443
+  The guest chose this address.
+  The request has already failed; retry it after allowing.
+  Refused 1 time(s) in session 3f9a12c4.
+
+  s  allow for this session
+  p  allow for this project, now and at every launch
+  d  keep refusing (also Enter or Esc)
+  n  keep refusing, and stop asking about it in this session
+
+  ready for your answer
+refuses in 60 s if unanswered
+```
+
+- **Which launches.** Only `run`/`--` with a terminal on stdin *and* stdout. The
+  catalog tools (`claude`, `pi`, …) and `shell` keep the one hint and
+  `agent-vm access`; so does any launch that streams instead of using a terminal.
+- **The keys.** `s` allows the destination for this session, `p` records it for
+  this project (and applies it now unless the launch could not intercept the
+  port), and `d`, Enter, Esc or Ctrl-C keep refusing. `n` keeps refusing and stops
+  the question for that destination in this session.
+- **The typing guard.** A key counts only when you have stopped typing: the
+  prompt says *stop typing to answer...* until nothing has arrived for 0.7 s, then
+  *ready for your answer*. A multi-byte read (an arrow key, a paste) never
+  answers. Keys typed during the question never reach the guest.
+- **Afterwards.** The guest gets its terminal back — screen, cursor, character
+  set, mouse tracking, bracketed paste, origin mode — and its held output follows
+  in order. An alternate-screen guest is asked to redraw itself.
+- **One at a time.** A second destination refused meanwhile waits; the prompt says
+  `+1 more waiting`. The guest gets the terminal back for at least 2 s between
+  questions, and at most 8 wait (the rest are left to `agent-vm access`).
+- **No answer.** The question is refused 60 s after it appeared.
+- **An answer elsewhere wins.** `agent-vm access allow <ID>` while a question is
+  shown closes it, and a `p` from the prompt can never promote an allowance the
+  CLI already gave.
+- **When it is not shown.** `AGENT_VM_NO_ACCESS_PROMPT=1`, `TERM=dumb`, a
+  redirected stdout, a terminal under 40 × 14, a host HTTP proxy in use, a
+  refusal no allowance can name (a policy lock, a credential refusal, plain HTTP to
+  a hostname), or a guest terminal state the launcher cannot give back exactly (a
+  full reset on the alternate screen, left/right margin mode, an unknown character
+  set, a soft reset over a non-default mode). The hint and `agent-vm access` always
+  remain.
+- **Limits, stated.** An alternate-screen guest's own saved cursor is overwritten
+  by the question's save. A terminal without the alternate screen (GNU screen with
+  its default `altscreen off`) shows — and clears — the question on the main
+  screen; set `altscreen on` or turn the prompt off. A one-character paste is
+  indistinguishable from a keypress. Inside tmux, visibility is tmux's
+  confirmation, not the outer terminal's.
+- **Turning it off.** `AGENT_VM_NO_ACCESS_PROMPT=1`. Any unrecognised value leaves
+  the prompt on and prints one warning naming the accepted values.
+
+See [ADR-0069](docs/adr/0069-in-terminal-access-prompt.md).
 
 **Where it lives.** `<state root>/<hash>.sessions/`: `refusals.json` (the log)
 and one `<sid>.sock` per running session. The directory is `0700`, the socket

@@ -21,6 +21,68 @@
 /// can render the same list the help block must contain.
 pub(crate) const TRUTHY: [&str; 4] = ["1", "true", "yes", "on"];
 
+/// Values that explicitly leave a default-on knob at its default. Beside
+/// [`TRUTHY`] because both are the one dialect this module owns: a value that is
+/// neither turns nothing on and nothing off, which is a typo the caller must be
+/// able to report.
+pub(crate) const FALSY: [&str; 4] = ["0", "false", "no", "off"];
+
+/// One environment value, with the unrecognised case named rather than folded
+/// into "off".
+///
+/// [`is_truthy`] deliberately has no such case: every opt-in it serves fails
+/// closed on a typo. A knob whose *default* is on cannot fail closed without
+/// surprising the operator, so it reads through [`read`] and reports the typo
+/// while keeping the documented default.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FlagValue {
+    /// Not set, or set to a value that is not valid UTF-8.
+    Unset,
+    /// A [`TRUTHY`] value.
+    On,
+    /// A [`FALSY`] value, or the empty string.
+    Off,
+    /// Anything else: the value as it was written (untrimmed, so the warning can
+    /// show what the operator typed).
+    Unrecognized(String),
+}
+
+impl FlagValue {
+    /// Whether this value names a typo.
+    pub(crate) fn unrecognized(&self) -> Option<&str> {
+        match self {
+            Self::Unrecognized(value) => Some(value),
+            _ => None,
+        }
+    }
+}
+
+/// Parse one raw value into the four cases above.
+///
+/// Trimming and ASCII-case folding are the same as [`is_truthy`]'s, so the two
+/// functions cannot disagree about `" ON "`. The empty string is `Off` rather
+/// than unrecognised: an exported-but-empty variable is a shell accident, not a
+/// typo, and it matches [`is_truthy`]'s reading of it.
+pub(crate) fn parse(value: &str) -> FlagValue {
+    let trimmed = value.trim();
+    if TRUTHY.iter().any(|v| trimmed.eq_ignore_ascii_case(v)) {
+        return FlagValue::On;
+    }
+    if trimmed.is_empty() || FALSY.iter().any(|v| trimmed.eq_ignore_ascii_case(v)) {
+        return FlagValue::Off;
+    }
+    FlagValue::Unrecognized(value.to_owned())
+}
+
+/// [`parse`] against the process environment. A value that is not valid UTF-8
+/// reads as `Unset`, like every other reader here.
+pub(crate) fn read(name: &str) -> FlagValue {
+    match std::env::var(name) {
+        Ok(value) => parse(&value),
+        Err(_) => FlagValue::Unset,
+    }
+}
+
 /// Whether a raw environment value enables its knob.
 ///
 /// Empty and any unrecognised string are false. That asymmetry — no error, no
@@ -29,7 +91,7 @@ pub(crate) const TRUTHY: [&str; 4] = ["1", "true", "yes", "on"];
 /// auto-confirm a build, don't probe a registry, don't allow plain HTTP,
 /// don't share the OCI cache), so a typo fails closed. A variable whose
 /// default were "on" must not use this function without first giving the
-/// parser a way to report "unrecognised".
+/// parser a way to report "unrecognised" — [`read`] is that way.
 pub(crate) fn is_truthy(value: &str) -> bool {
     let trimmed = value.trim();
     TRUTHY
@@ -157,6 +219,46 @@ mod tests {
         env.remove_var(VAR);
     }
 
+    /// Every value `read` can see, so the four cases cannot drift apart and the
+    /// typo case cannot silently become "off".
+    #[test]
+    fn read_separates_off_from_unrecognised() {
+        for truthy in ["1", "true", "TRUE", " On ", "yes", "\ttrue\n"] {
+            assert_eq!(parse(truthy), FlagValue::On, "{truthy:?}");
+        }
+        for falsy in ["", "  ", "0", "false", "NO", " off "] {
+            assert_eq!(parse(falsy), FlagValue::Off, "{falsy:?}");
+        }
+        for typo in ["maybe", "ture", "1 1", "yess", "-1"] {
+            assert_eq!(
+                parse(typo),
+                FlagValue::Unrecognized(typo.to_owned()),
+                "{typo:?}"
+            );
+        }
+        // The warning shows what was typed, not a trimmed or folded copy.
+        assert_eq!(
+            parse(" Maybe ").unrecognized(),
+            Some(" Maybe "),
+            "the operator must see their own spelling"
+        );
+    }
+
+    /// [`read`] against the real environment: unset is `Unset`, a non-UTF-8 value
+    /// is `Unset` too, and a typo keeps its bytes for the warning.
+    #[test]
+    fn read_reads_the_process_environment() {
+        const VAR: &str = "AGENT_VM_TEST_ENV_FLAG_READ";
+        let mut env = crate::test_env::guard();
+        assert_eq!(read(VAR), FlagValue::Unset);
+        env.set_var(VAR, "on");
+        assert_eq!(read(VAR), FlagValue::On);
+        env.set_var(VAR, "maybe");
+        assert_eq!(read(VAR), FlagValue::Unrecognized("maybe".to_owned()));
+        env.remove_var(VAR);
+        assert_eq!(read(VAR), FlagValue::Unset);
+    }
+
     /// Doc lockstep, written so it cannot pass vacuously: assert both that
     /// USAGE.md marks exactly the value-parsing vars with `(accepted:` AND that
     /// every one of those rows renders the current `TRUTHY` set.
@@ -171,8 +273,8 @@ mod tests {
             .collect();
         assert_eq!(
             rows.len(),
-            2,
-            "USAGE.md must mark exactly the two value-parsing vars with `(accepted:`, found: {rows:?}"
+            3,
+            "USAGE.md must mark exactly the three value-parsing vars with `(accepted:`, found: {rows:?}"
         );
         for row in rows {
             assert!(

@@ -198,6 +198,27 @@ pub(crate) enum GrantResult {
     },
 }
 
+/// What one refusal's grant can offer, from the same derivation a grant uses
+/// (#501 slice 3 R7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Offer {
+    /// The launch accepts the destination live: `s` and `p` both work.
+    SessionOrProject,
+    /// The launch fixed its TLS-intercepted ports at boot, so only a record for
+    /// the next launch can admit the destination (#491).
+    ProjectNextLaunch,
+}
+
+/// What the access prompt's conditional grant did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PromptGrant {
+    Reached(GrantResult),
+    /// Another surface (a CLI `access allow`, an earlier prompt) answered the
+    /// destination first, under this handler's own operation lock. Nothing was
+    /// granted, so a queued `p` can never promote a CLI `s` (R19).
+    AnsweredElsewhere,
+}
+
 /// Why a revoke could not be confirmed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum UnconfirmedReason {
@@ -358,6 +379,13 @@ struct State {
     queued_for_boot: bool,
     session: Vec<ActiveEntry>,
     project: Vec<ActiveEntry>,
+    /// Every destination a grant in this session recorded for the next launch,
+    /// in canonical spelling. Sticky and never evicted: the session cannot learn
+    /// of a CLI `access revoke --project` (it deletes the store record before it
+    /// reaches the session, C17), and forgetting an answer would re-ask a
+    /// destination the user already allowed. Bounded by the store's own record
+    /// bound, at which point every unheld destination counts as answered.
+    next_launch: Vec<Allowance>,
 }
 
 /// What one `revoke` needs from the state under one lock, so the tables can be
@@ -404,13 +432,24 @@ pub(crate) struct LiveAllowances {
     /// not fixed here.
     op_lock: AsyncMutex<()>,
     state: Mutex<State>,
+    /// A wakeup only: every grant that left an allowance behind sends its
+    /// canonical destination, so the prompt can drop the question it belongs to
+    /// without polling. Correctness is [`LiveAllowances::answered`] and the
+    /// conditional grant, never this channel.
+    answers: tokio::sync::broadcast::Sender<String>,
 }
+
+/// How many answer wakeups a subscriber may fall behind before it is told it
+/// lagged. Small because a lagging subscriber re-checks `answered()` instead.
+const ANSWER_BUFFER: usize = 16;
 
 impl LiveAllowances {
     pub(crate) fn new(project: &ProjectDir, store: StoreHandle, plan: LivePolicyPlan) -> Arc<Self> {
         let base_policy = plan.policy();
+        let (answers, _) = tokio::sync::broadcast::channel(ANSWER_BUFFER);
         Arc::new(Self {
             op_lock: AsyncMutex::new(()),
+            answers,
             state: Mutex::new(State {
                 record: ProjectRecord {
                     store,
@@ -428,6 +467,7 @@ impl LiveAllowances {
                 queued_for_boot: false,
                 session: Vec::new(),
                 project: Vec::new(),
+                next_launch: Vec::new(),
             }),
         })
     }
@@ -605,12 +645,125 @@ impl LiveAllowances {
         now_ms: i64,
     ) -> GrantResult {
         let _op = self.op_lock.lock().await;
-        let entry = match resolve_entry(live_refusals, id, destination) {
+        let destination = match resolve_entry(live_refusals, id, destination) {
             Ok(entry) => entry,
             Err(reason) => return GrantResult::Refused { reason },
         };
-        let destination = entry;
+        self.grant_locked(&destination, scope, now_ms).await
+    }
 
+    /// The access prompt's grant (`agent-vm#501` slice 3 §4.2, R19).
+    ///
+    /// The same handler, with one extra precondition under the same lock: a
+    /// destination another surface already answered is reported, never granted
+    /// again. That is what keeps a prompt `p` queued behind a CLI `s` from
+    /// promoting it to a project record, and it needs no ordering between the two
+    /// because both pass through this lock.
+    pub(crate) async fn grant_unless_answered(
+        &self,
+        live_refusals: &LiveRefusals,
+        id: &str,
+        scope: GrantScope,
+        now_ms: i64,
+    ) -> PromptGrant {
+        let _op = self.op_lock.lock().await;
+        let destination = match resolve_entry(live_refusals, Some(id), None) {
+            Ok(destination) => destination,
+            Err(reason) => return PromptGrant::Reached(GrantResult::Refused { reason }),
+        };
+        if self.answered(&destination) {
+            return PromptGrant::AnsweredElsewhere;
+        }
+        PromptGrant::Reached(self.grant_locked(&destination, scope, now_ms).await)
+    }
+
+    /// Whether this session's live tables hold `destination`, at any scope and
+    /// whether or not the runtime has confirmed it yet. `answered` is built on it;
+    /// the prompt's own postconditions talk in this term.
+    #[allow(dead_code)]
+    pub(crate) fn holds(&self, destination: &Allowance) -> bool {
+        holds_locked(&lock(&self.state), destination)
+    }
+
+    /// R5/R19's "already answered": held now, recorded for the next launch by a
+    /// grant in this session, or the answer set is full.
+    pub(crate) fn answered(&self, destination: &Allowance) -> bool {
+        let state = lock(&self.state);
+        holds_locked(&state, destination)
+            || state.next_launch.contains(destination)
+            || state.next_launch.len() >= super::MAX_RECORDS
+    }
+
+    /// Whether a grant could offer `s` and `p`, or only a next-launch record.
+    ///
+    /// The precondition half of the one derivation and nothing else: no step of
+    /// the policy is built here, so the prompt's offer cannot disagree with what a
+    /// grant would do.
+    pub(crate) fn offer(&self, destination: &Allowance) -> Result<Offer, LivePolicyPrecondition> {
+        let state = lock(&self.state);
+        let mut combined = state.combined();
+        if !combined.contains(destination) {
+            combined.push(destination.clone());
+        }
+        match state.plan.derive_for(combined) {
+            Ok(_) => Ok(Offer::SessionOrProject),
+            Err(LivePolicyPrecondition::InterceptedPortsFixedAtLaunch) => {
+                Ok(Offer::ProjectNextLaunch)
+            }
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Destination spells a grant has left behind, as wakeups. A lagged receiver
+    /// re-checks [`Self::answered`] rather than trusting the channel.
+    pub(crate) fn subscribe_answers(&self) -> tokio::sync::broadcast::Receiver<String> {
+        self.answers.subscribe()
+    }
+
+    /// The grant body, assuming `op_lock` is held: `grant` and
+    /// `grant_unless_answered` are the two entry points, and neither can observe
+    /// the other half-way.
+    async fn grant_locked(
+        &self,
+        destination: &Allowance,
+        scope: GrantScope,
+        now_ms: i64,
+    ) -> GrantResult {
+        let result = self.grant_resolved(destination, scope, now_ms).await;
+        self.announce(&result);
+        result
+    }
+
+    /// Record what a grant left behind for the rest of the session, and wake the
+    /// prompt. Only a `NextLaunch` result adds to the answered set: every other
+    /// result leaves an entry in one of the live tables, which `answered` already
+    /// sees.
+    fn announce(&self, result: &GrantResult) {
+        let Some(destination) = result.allowed() else {
+            return;
+        };
+        if let GrantResult::NextLaunch { .. } = result
+            && let Ok(allowance) = Allowance::parse(destination)
+        {
+            let mut state = lock(&self.state);
+            if !state.next_launch.contains(&allowance)
+                && state.next_launch.len() < super::MAX_RECORDS
+            {
+                state.next_launch.push(allowance);
+            }
+        }
+        // `send` fails only when no prompt is listening; the answer still stands.
+        let _ = self.answers.send(destination.to_owned());
+    }
+
+    /// The grant proper.
+    async fn grant_resolved(
+        &self,
+        destination: &Allowance,
+        scope: GrantScope,
+        now_ms: i64,
+    ) -> GrantResult {
+        let destination = destination.clone();
         let (record, already, held) = {
             let state = lock(&self.state);
             let already = state
@@ -1305,6 +1458,13 @@ impl LiveAllowances {
     }
 }
 
+/// The table half of [`LiveAllowances::holds`], over a state already locked.
+fn holds_locked(state: &State, destination: &Allowance) -> bool {
+    state
+        .entries()
+        .any(|entry| entry.destination() == destination)
+}
+
 /// Resolve the destination one `grant` request names.
 ///
 /// The CLI normally resolves `<ID>` itself and sends the spelling, so a refusal
@@ -1336,4 +1496,174 @@ fn resolve_entry(
     grantable_destination(entry).map_err(|error| GrantRefusalReason::NotAllowable {
         message: error.line(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// The user-facing sentence of one result
+// ---------------------------------------------------------------------------
+
+/// Which stream a rendered line belongs on: a grant's success is the reply, its
+/// refusal is the diagnosis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReportStream {
+    Out,
+    Err,
+}
+
+/// One `GrantResult` as a user reads it: the text, where it goes, and the exit
+/// status the command reports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GrantReport {
+    pub(crate) text: String,
+    pub(crate) stream: ReportStream,
+    pub(crate) code: i32,
+}
+
+/// ADR-0066 §5's demoted sentence, written once.
+///
+/// It is a contract, not a string: a `--project` grant the runtime applied and the
+/// store could not record must read the same way in the immediate reply and in
+/// every later `access` row, and no copy may quietly drop the "not recorded" fact.
+/// Five copies of it were how the drift started (C-M1).
+pub(crate) fn demoted_sentence(
+    destination: &str,
+    recorded_ms: i64,
+    revision: u64,
+    error: &str,
+) -> String {
+    format!(
+        "applied session allowance {} ({}); applied to this session only (rev {revision}), not recorded for the project: {}",
+        crate::config::escape_str(destination),
+        crate::allowances::recorded_at(recorded_ms),
+        crate::config::escape_str(error)
+    )
+}
+
+impl GrantResult {
+    /// The sentence the user reads, in one place for both callers: `agent-vm
+    /// access allow` prints it and the in-terminal prompt draws it, so the two
+    /// surfaces cannot describe one result differently (#501 slice 3 §7.4).
+    ///
+    /// `target` is the already-rendered session ("session 0a1b2c3d (running)").
+    pub(crate) fn report(&self, target: &str, scope: GrantScope) -> GrantReport {
+        let last_seen = |ms: i64| crate::allowances::recorded_at(ms);
+        let escaped = |text: &str| crate::config::escape_str(text);
+        match self {
+            Self::Applied {
+                destination,
+                revision,
+                recorded_ms,
+                ..
+            } => {
+                let destination = escaped(destination);
+                let text = match scope {
+                    GrantScope::Session => {
+                        format!("allowed {destination} for {target} (policy revision {revision})")
+                    }
+                    GrantScope::Project => format!(
+                        "allowed {destination} for {target} (policy revision {revision}) and recorded for this project ({})",
+                        last_seen(*recorded_ms)
+                    ),
+                };
+                GrantReport {
+                    text,
+                    stream: ReportStream::Out,
+                    code: 0,
+                }
+            }
+            Self::AppliedNotRecorded {
+                destination,
+                revision,
+                recorded_ms,
+                message,
+            } => GrantReport {
+                text: demoted_sentence(destination, *recorded_ms, *revision, message),
+                stream: ReportStream::Err,
+                code: 1,
+            },
+            Self::NextLaunch {
+                destination,
+                recorded_ms,
+                reason,
+            } => {
+                let why = match reason {
+                    NextLaunchReason::RuntimeUnsupported => {
+                        "this runtime cannot replace its network policy while it runs"
+                    }
+                    NextLaunchReason::InterceptedPortsFixedAtLaunch => {
+                        "TLS-intercepted ports are fixed at launch, so this allowance applies at the next launch"
+                    }
+                };
+                GrantReport {
+                    text: format!(
+                        "recorded {} for this project ({}); {why}",
+                        escaped(destination),
+                        last_seen(*recorded_ms)
+                    ),
+                    stream: ReportStream::Out,
+                    code: 0,
+                }
+            }
+            Self::QueuedForBoot {
+                destination, scope, ..
+            } => {
+                // Conditional on purpose: the flush may still fail, and then the
+                // session says so (Ruling 3, N3).
+                let destination = escaped(destination);
+                let text = match scope {
+                    GrantScope::Session => format!(
+                        "accepted {destination} for this session; applied when the session finishes starting — confirm with `agent-vm access allowances`"
+                    ),
+                    GrantScope::Project => format!(
+                        "recorded project allowance {destination} and accepted it for this session; applied when the session finishes starting — confirm with `agent-vm access allowances`"
+                    ),
+                };
+                GrantReport {
+                    text,
+                    stream: ReportStream::Out,
+                    code: 0,
+                }
+            }
+            Self::Refused { reason } => {
+                let message = match reason {
+                    GrantRefusalReason::HostProxyInUse => {
+                        "a host HTTP proxy is in use, so this session cannot intercept hostnames"
+                            .to_owned()
+                    }
+                    GrantRefusalReason::InterceptedPortsFixedAtLaunch => {
+                        "TLS-intercepted ports are fixed at launch; relaunch with this hostname to intercept it"
+                            .to_owned()
+                    }
+                    GrantRefusalReason::NotAllowable { message } => message.clone(),
+                    GrantRefusalReason::RuntimeFailed { message } => {
+                        format!("the runtime could not apply the change: {message}")
+                    }
+                    GrantRefusalReason::Store { message } => {
+                        format!("the project allowance record was not written: {message}")
+                    }
+                    GrantRefusalReason::Full { limit } => format!(
+                        "this session already holds {limit} live allowances, the most it can carry; revoke one first"
+                    ),
+                };
+                GrantReport {
+                    text: format!("refused: {}", escaped(&message)),
+                    stream: ReportStream::Err,
+                    code: 1,
+                }
+            }
+        }
+    }
+
+    /// The canonical destination when an allowance now exists or was recorded for
+    /// the next launch; `None` for a refusal. Drives the prompt's undo line and the
+    /// answers wakeup, so neither can name a destination the result did not grant.
+    pub(crate) fn allowed(&self) -> Option<&str> {
+        match self {
+            Self::Applied { destination, .. }
+            | Self::AppliedNotRecorded { destination, .. }
+            | Self::NextLaunch { destination, .. }
+            | Self::QueuedForBoot { destination, .. } => Some(destination),
+            Self::Refused { .. } => None,
+        }
+    }
 }

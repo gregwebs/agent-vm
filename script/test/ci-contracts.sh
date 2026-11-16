@@ -90,6 +90,10 @@ if [[ "$guard_only" == false ]]; then
     bash "$REPO_ROOT/script/test/persisted-network-contract.sh"
     # Mutation anchors must still name lines that exist; otherwise the
     # mutation evidence is stale and only a hand-run would notice (#305 N9).
+    # #501 slice 3: the access prompt's byte frames are checked against a real
+    # emulator, not against the tracker that built them. The script says so loudly
+    # and skips when tmux is not on PATH.
+    bash "$REPO_ROOT/script/test/access-prompt-tmux-oracle.sh"
     python3 "$REPO_ROOT/script/test/egress-mutations.py" --check-anchors
     # #358 moved launch options before the tool verb; the manual migration sweep
     # found the last old-order caller (profiling/) only by reading, so pin it.
@@ -106,6 +110,7 @@ fi
 # script/test/example-layers.sh guards them.
 syntax_check=(
     script/test/ci-test-shard.sh
+    script/test/access-prompt-tmux-oracle.sh
     vendor/microsandbox/vendor/libkrunfw/build_in_docker.sh
     script/check-runtime-provenance.sh
     script/test/runtime-provenance.sh
@@ -166,6 +171,7 @@ syntax_check=(
 # syntax_check rather than a divergence from the criterion above.
 shellcheck_files=(
     script/test/ci-test-shard.sh
+    script/test/access-prompt-tmux-oracle.sh
     vendor/microsandbox/vendor/libkrunfw/build_in_docker.sh
     vendor/microsandbox/vendor/libkrunfw/scripts/test-build-in-docker.sh
     script/check-runtime-provenance.sh

@@ -295,6 +295,92 @@ pub(crate) struct RefusalEntry {
 }
 
 impl RefusalEntry {
+    /// The table's destination cell (#501 slice 3 §7.4).
+    ///
+    /// The destination is what an allowance would have to name, so it comes first
+    /// and the guest's name is evidence after it — never the other way round. A
+    /// name that is already in the destination is not repeated: for a hostname
+    /// destination the evidence contributes only its source.
+    ///
+    /// One renderer for both surfaces: `agent-vm access` prints this cell and the
+    /// in-terminal access prompt names the destination with it, so the prompt
+    /// cannot describe a destination the command would not.
+    pub(crate) fn destination_cell(&self) -> String {
+        let evidence = |name: &GuestName| {
+            format!(
+                "({}, guest-supplied){}",
+                crate::config::escape_str(source_label(&name.source)),
+                if name.truncated {
+                    " [name truncated]"
+                } else {
+                    ""
+                }
+            )
+        };
+        match &self.key.destination {
+            Destination::DnsName { name } => {
+                let mut text = format!("dns {}", crate::config::escape_str(name));
+                if let Some(name) = &self.name {
+                    text.push_str(&format!(" {}", evidence(name)));
+                }
+                text
+            }
+            Destination::Host {
+                protocol,
+                name,
+                port,
+            } => {
+                // The name is guest text and the protocol is the runtime's, so
+                // they are escaped separately: the `:port` between them is this
+                // table's.
+                let mut text = match port {
+                    Some(port) => format!(
+                        "{} {}:{port}",
+                        crate::config::escape_str(protocol),
+                        crate::config::escape_str(name)
+                    ),
+                    None => format!(
+                        "{} {}",
+                        crate::config::escape_str(protocol),
+                        crate::config::escape_str(name)
+                    ),
+                };
+                if let Some(evidence_name) = &self.name {
+                    // The destination already names it; only a *different*
+                    // spelling the guest used is worth printing.
+                    if !evidence_name.name.eq_ignore_ascii_case(name) {
+                        text.push_str(&format!(
+                            " {}",
+                            crate::config::escape_str(&evidence_name.name)
+                        ));
+                    }
+                    text.push_str(&format!(" {}", evidence(evidence_name)));
+                }
+                if let Some(ip) = self.last_ip {
+                    text.push_str(&format!(" · last IP {ip}"));
+                }
+                text
+            }
+            Destination::Address { protocol, ip, port } => {
+                let target = match (ip, port) {
+                    (Some(ip), Some(port)) => format!("{ip}:{port}"),
+                    (Some(ip), None) => ip.to_string(),
+                    (None, Some(port)) => format!("?{port}"),
+                    (None, None) => "?".to_owned(),
+                };
+                let mut text = format!("{} {target}", crate::config::escape_str(protocol));
+                if let Some(evidence_name) = &self.name {
+                    text.push_str(&format!(
+                        " · {} {}",
+                        crate::config::escape_str(&evidence_name.name),
+                        evidence(evidence_name)
+                    ));
+                }
+                text
+            }
+        }
+    }
+
     /// The row's reason: what, if anything, could change this decision.
     ///
     /// The engine's own rules and the platform floor are not egress decisions an
@@ -347,6 +433,18 @@ impl RefusalEntry {
             text.push_str(&format!(", and {}", reason_clause(reason)));
         }
         text
+    }
+}
+
+/// The runtime's `name_source` wire value, in the table's own words. An unknown
+/// value is the runtime's own text, so the caller escapes it.
+fn source_label(source: &str) -> &str {
+    match source {
+        "dns-cache" => "DNS cache",
+        "sni" => "SNI",
+        "http-host" => "HTTP host",
+        "dns-query" => "DNS query",
+        other => other,
     }
 }
 

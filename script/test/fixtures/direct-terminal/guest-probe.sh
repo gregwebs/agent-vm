@@ -14,6 +14,7 @@ set -euo pipefail
 mode="${1:-}"
 case "$mode" in
 identity|argv|input|stream-input|resize|wait|status) ;;
+refuse|refuse-dns|alt|stall|exit-during) ;;
 signal-handle|signal-ignore|signal-unhandled|signal-self-term) ;;
 *)
     echo "guest-probe: unknown mode '${mode}'" >&2
@@ -122,6 +123,186 @@ probe_status() {
     exit "$status"
 }
 
+# ------------------------------------------- the access prompt (#501 slice 3) --
+#
+# Each mode prints a marker the driver can key on and then triggers one network
+# refusal. The trigger is a TCP connect to TEST-NET-3 (203.0.113.10:443), which a
+# default-deny launch refuses; `timeout` bounds it so an erroneously allowed
+# destination fails the row instead of stalling it.
+
+prompt_mode_mix() {
+    # Button-event mouse with SGR encoding, bracketed paste, origin mode with a
+    # scroll region, and a line-drawing character set: everything the prompt must
+    # give back (§10.4).
+    printf '\033[?2004h\033[?1002h\033[?1006h\033[3;20r\033[?6h\033(0'
+}
+
+# The refusal trigger's target and whether this row asks for the AC2 retry. The
+# session/project rows use a *public* address: the sandbox's default-deny policy
+# refuses it first, and after the allowance a retry can actually connect, which
+# TEST-NET-3 could never show. A host without outbound internet cannot pass those
+# rows; the receipt records both statuses so the reason is visible.
+REFUSE_IP="${1:-203.0.113.10}"
+REFUSE_PORT="${2:-443}"
+REFUSE_RETRY="${3:-0}"
+# The forced-end rows send two external SIGINTs; the first is forwarded to this
+# guest, so the guest must survive it (a guest killed by the forwarded signal is a
+# guest exit, not a forced end) and let the second force the launcher.
+REFUSE_IGNORE="${4:-0}"
+if [ "$REFUSE_IGNORE" = ignore ]; then
+    trap '' INT TERM
+fi
+
+# Give the refusal time to reach the launcher's feed before this probe does what
+# the case is about. The feed's ingestion side is the runtime's own 2 s fallback
+# poll (`refusal/feed.rs`: "nothing here can shorten" it), and the rows measured
+# it at 0.02-2.01 s on a real boot (2026-11-15). Without this window a probe that
+# kept writing produced its output *before* the takeover, so the case raced the
+# ingestion instead of testing the prompt: `prompt-deny` saw 38 of its 60 held
+# lines forwarded ahead of the prompt, and a guest that exited immediately after
+# its refused connect was gone before the question could be asked. The window is
+# guest-side silence only; AC1's latency is measured from the connect, not here.
+PROMPT_SETTLE_SECONDS=4
+prompt_settle() {
+    sleep "$PROMPT_SETTLE_SECONDS"
+}
+
+# Hold the session open until the driver releases it, so `access`/`access
+# allowances` are queried while this session is still live (M12/C-F4). A timeout is
+# a failure of the row, not a hang: 15 s bounds it.
+prompt_hold() {
+    echo "HOLD-READY"
+    local released=""
+    released="$(timeout 15 dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n' || true)"
+    echo "HOLD-RELEASED hex=$released"
+}
+
+probe_refuse() {
+    # Raw mode is the mode's own setup, so no terminal echo can satisfy the
+    # `STDIN` oracle: only bytes the launcher actually forwarded can appear.
+    if [ -t 0 ]; then
+        stty raw -echo
+    fi
+    prompt_mode_mix
+    echo "REFUSE-READY"
+    local rc=0
+    timeout 3 bash -c ": </dev/tcp/$REFUSE_IP/$REFUSE_PORT" || rc=$?
+    echo "CONNECT rc=$rc"
+    prompt_settle
+    # Output written while the question is up must arrive after it, in order.
+    local line
+    for line in $(seq 0 59); do
+        echo "LINE $line"
+        sleep 0.05
+    done
+    # What the guest's stdin received: a prompt answer must never be here.
+    local drained
+    drained="$(timeout 1 dd bs=1 count=64 2>/dev/null | od -An -tx1 | tr -d ' \n' || true)"
+    echo "STDIN $drained"
+    if [ "$REFUSE_RETRY" = 1 ]; then
+        # AC2's second half, under the live hold: after the answer, the same connect
+        # must succeed without a restart.
+        local retry=0
+        timeout 3 bash -c ": </dev/tcp/$REFUSE_IP/$REFUSE_PORT" 2>/dev/null || retry=$?
+        echo "RETRY rc=$retry"
+    fi
+    prompt_hold
+    echo "REFUSE-DONE"
+}
+
+probe_refuse_dns() {
+    prompt_mode_mix
+    echo "REFUSE-READY"
+    local rc=0
+    timeout 3 getent hosts blocked.example >/dev/null 2>&1 || rc=$?
+    echo "CONNECT rc=$rc"
+    prompt_settle
+    prompt_hold
+    echo "REFUSE-DONE"
+}
+
+probe_alt() {
+    # `alt ignore` keeps the guest alive through a forwarded SIGINT (the forced rows).
+    if [ "${1:-0}" = ignore ]; then
+        trap '' INT TERM
+    fi
+    printf '\033[?1049h'
+    prompt_mode_mix
+    # A background observer reports every size change, so the nudge's effect is
+    # visible without polling from the driver. Its stdin is redirected explicitly:
+    # POSIX gives an asynchronous list in a non-interactive shell `/dev/null`, and
+    # `stty size` on /dev/null fails silently — the observer reported nothing for the
+    # whole real-boot run and the nudge looked absent (round 5, F4).
+    (
+        last="$(stty size)"
+        while :; do
+            current="$(stty size)"
+            if [ "$current" != "$last" ]; then
+                echo "SIZE $current"
+                last="$current"
+            fi
+            sleep 0.02
+        done
+    ) </dev/tty &
+    echo "REFUSE-READY"
+    local rc=0
+    timeout 3 bash -c ': </dev/tcp/203.0.113.10/443' || rc=$?
+    echo "CONNECT rc=$rc"
+    prompt_settle
+    # The guest stays alive through the leave and the nudge, so the size observer
+    # below sees the redraw a real alternate-screen guest performs. The size read
+    # *after* the takeover is the diagnostic that separates "the nudge never
+    # reached the guest" from "the observer missed a 100 ms change".
+    prompt_hold
+    echo "SIZE-FINAL $(stty size)"
+    echo "REFUSE-DONE"
+}
+
+probe_stall() {
+    prompt_mode_mix
+    echo "REFUSE-READY"
+    # The sequence stalls *before* the refusal reaches the feed, so the launcher must
+    # cut it with `CAN` (AC8). The trigger's own output goes to a file: nothing may
+    # reach the terminal inside the stalled sequence. The sequence is held open for
+    # six seconds, not two: the takeover decision waits for the refusal to reach
+    # the feed (up to ~2 s after the connect), so a two-second stall usually closed
+    # before the decision arrived and the row proved nothing.
+    printf '\033[?20'
+    local result
+    result="$(mktemp "${TMPDIR:-/tmp}/stall.XXXXXX")"
+    (
+        local rc=0
+        timeout 3 bash -c ': </dev/tcp/203.0.113.10/443' >/dev/null 2>&1 || rc=$?
+        printf '%s' "$rc" >"$result"
+    ) &
+    sleep 6
+    # Complete the sequence; the terminal (and the tracker) are at ground again.
+    printf '04h'
+    wait
+    echo "CONNECT rc=$(cat "$result")"
+    rm -f "$result"
+    echo "STALL-DONE"
+}
+
+probe_exit_during() {
+    prompt_mode_mix
+    echo "REFUSE-READY"
+    local rc=0
+    timeout 3 bash -c ': </dev/tcp/203.0.113.10/443' || rc=$?
+    echo "CONNECT rc=$rc"
+    prompt_settle
+    # 300 numbered KiB blocks of held output, then the guest's own status while the
+    # question is up. The numbers let the driver check the payload's order and
+    # completeness, not only a final marker (AC14).
+    local block index
+    block="$(printf 'x%.0s' $(seq 1 1024))"
+    for index in $(seq 0 299); do
+        printf 'BLOCK %s\n%s\n' "$index" "$block"
+    done
+    echo "EXIT-DURING-DONE"
+    exit 7
+}
+
 # -------------------------------------------------- host signal supervision --
 #
 # The guest behaviours a signal row needs. Each one reports SIGNAL-READY
@@ -211,6 +392,11 @@ stream-input) probe_stream_input ;;
 resize) probe_resize ;;
 wait) probe_wait ;;
 status) probe_status "$@" ;;
+refuse) probe_refuse "$@" ;;
+refuse-dns) probe_refuse_dns "$@" ;;
+alt) probe_alt "$@" ;;
+stall) probe_stall ;;
+exit-during) probe_exit_during ;;
 signal-handle) probe_signal_handle "$@" ;;
 signal-ignore) probe_signal_ignore ;;
 signal-unhandled) probe_signal_unhandled ;;

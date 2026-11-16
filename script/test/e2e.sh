@@ -9690,6 +9690,22 @@ custom_image_direct_terminal_disconnect() {
   direct_terminal_row "direct-terminal-disconnect" wait
 }
 
+# #501 slice 3: the in-terminal access prompt. The eleven rows the plan names,
+# plus the three shapes of AC9's "no prompt" — a refused connect prompts and `d`
+# restores; `s` grants for the session; `p` records for the next launch on the
+# #491 case; the guard rejects a key typed too early, a two-byte read and a paste;
+# a CLI `access allow` closes a shown prompt; an alternate-screen guest keeps its
+# screen and is nudged; a stalled sequence is cut with CAN; the guest's exit and a
+# forced end and a runtime loss each end correctly; and the setting, TERM=dumb and
+# a redirected stdout show no prompt at all.
+custom_image_direct_terminal_prompt() {
+  direct_terminal_row "direct-terminal-prompt" \
+    prompt-deny prompt-session prompt-project prompt-project-next prompt-guard \
+    prompt-answered-elsewhere prompt-alt-screen prompt-stall prompt-exit \
+    prompt-forced prompt-forced-alt prompt-runtime-loss prompt-runtime-loss-alt \
+    prompt-off-env prompt-off-dumb prompt-off-redirect
+}
+
 # The same tokens after the command boundary are guest argv.
 custom_image_direct_terminal_argv() {
   direct_terminal_row "direct-terminal-argv" suffix-argv
@@ -9789,6 +9805,7 @@ run_check "custom-image-direct-terminal-resize" custom_image_direct_terminal_res
 run_check "custom-image-direct-terminal-identity" custom_image_direct_terminal_identity
 run_check "custom-image-direct-terminal-statuses" custom_image_direct_terminal_statuses
 run_check "custom-image-direct-terminal-disconnect" custom_image_direct_terminal_disconnect
+run_check "custom-image-direct-terminal-prompt" custom_image_direct_terminal_prompt
 run_check "custom-image-direct-terminal-argv" custom_image_direct_terminal_argv
 run_check "custom-image-direct-terminal-legacy" custom_image_direct_terminal_legacy
 run_check "custom-image-direct-terminal-signal-pty-int" custom_image_direct_terminal_signal_pty_int

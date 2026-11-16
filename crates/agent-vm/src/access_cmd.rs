@@ -13,7 +13,7 @@ use anyhow::{Context as _, Result};
 use clap::Args as ClapArgs;
 
 use crate::refusal::log::{HEARTBEAT_STALE_MS, SessionsDir};
-use crate::refusal::{Destination, RefusalEntry, SessionId, SessionSnapshot};
+use crate::refusal::{RefusalEntry, SessionId, SessionSnapshot};
 use crate::session::ProjectSession;
 
 /// The default window: an entry last seen within this long is shown.
@@ -386,7 +386,7 @@ fn print_table(
             [
                 escape(&entry.id),
                 entry.key.kind.label().to_owned(),
-                destination(entry),
+                entry.destination_cell(),
                 entry.count.to_string(),
                 last_seen(entry.last_ms),
                 row.label.to_owned(),
@@ -407,91 +407,9 @@ fn print_table(
     write_columns(out, &headers, &rows)
 }
 
-/// §6.6's three destination forms.
-///
-/// The destination is what an allowance would have to name, so it comes first and
-/// the guest's name is evidence after it — never the other way round. A name that
-/// is already in the destination is not repeated: for a hostname destination the
-/// evidence contributes only its source.
-fn destination(entry: &RefusalEntry) -> String {
-    let evidence = |name: &crate::refusal::GuestName| {
-        format!(
-            "({}, guest-supplied){}",
-            escape(source_label(&name.source)),
-            if name.truncated {
-                " [name truncated]"
-            } else {
-                ""
-            }
-        )
-    };
-    match &entry.key.destination {
-        Destination::DnsName { name } => {
-            let mut text = format!("dns {}", escape(name));
-            if let Some(name) = &entry.name {
-                text.push_str(&format!(" {}", evidence(name)));
-            }
-            text
-        }
-        Destination::Host {
-            protocol,
-            name,
-            port,
-        } => {
-            // The name is guest text and the protocol is the runtime's, so they
-            // are escaped separately: the `:port` between them is this table's.
-            let mut text = match port {
-                Some(port) => format!("{} {}:{port}", escape(protocol), escape(name)),
-                None => format!("{} {}", escape(protocol), escape(name)),
-            };
-            if let Some(evidence_name) = &entry.name {
-                // The destination already names it; only a *different* spelling
-                // the guest used is worth printing.
-                if !evidence_name.name.eq_ignore_ascii_case(name) {
-                    text.push_str(&format!(" {}", escape(&evidence_name.name)));
-                }
-                text.push_str(&format!(" {}", evidence(evidence_name)));
-            }
-            if let Some(ip) = entry.last_ip {
-                text.push_str(&format!(" · last IP {ip}"));
-            }
-            text
-        }
-        Destination::Address { protocol, ip, port } => {
-            let target = match (ip, port) {
-                (Some(ip), Some(port)) => format!("{ip}:{port}"),
-                (Some(ip), None) => ip.to_string(),
-                (None, Some(port)) => format!("?{port}"),
-                (None, None) => "?".to_owned(),
-            };
-            let mut text = format!("{} {target}", escape(protocol));
-            if let Some(evidence_name) = &entry.name {
-                text.push_str(&format!(
-                    " · {} {}",
-                    escape(&evidence_name.name),
-                    evidence(evidence_name)
-                ));
-            }
-            text
-        }
-    }
-}
-
 /// Untrusted text, rendered so no terminal control byte can reach the screen.
 fn escape(text: &str) -> String {
     crate::config::escape_str(text)
-}
-
-/// The runtime's `name_source` wire value, in the table's own words. An unknown
-/// value is the runtime's own text, so it is escaped by the caller.
-fn source_label(source: &str) -> &str {
-    match source {
-        "dns-cache" => "DNS cache",
-        "sni" => "SNI",
-        "http-host" => "HTTP host",
-        "dns-query" => "DNS query",
-        other => other,
-    }
 }
 
 /// UTC, minute precision: a refusal's last sighting does not need seconds.
@@ -499,22 +417,8 @@ fn last_seen(ms: i64) -> String {
     crate::allowances::recorded_at(ms)
 }
 
-/// ADR-0066 §5's demoted sentence, written once.
-///
-/// It is a contract, not a string: a `--project` grant the runtime applied and the
-/// store could not record must read the same way in the immediate reply and in
-/// every later `access` row, and no copy may quietly drop the "not recorded" fact.
-/// Five copies of it were how the drift started (C-M1).
-fn demoted_sentence(destination: &str, recorded_ms: i64, revision: u64, error: &str) -> String {
-    format!(
-        "applied session allowance {} ({}); applied to this session only (rev {revision}), not recorded for the project: {}",
-        escape(destination),
-        last_seen(recorded_ms),
-        escape(error)
-    )
-}
-
-/// One live entry's STATUS cell, in the same words as [`demoted_sentence`].
+/// One live entry's STATUS cell, in the same words as the shared
+/// [`crate::allowances::demoted_sentence`].
 fn live_status(item: &crate::allowances::WireAllowance) -> String {
     match (item.revision, &item.not_recorded_error) {
         (Some(revision), Some(error)) => format!(
@@ -562,7 +466,12 @@ fn action(
             revision,
             not_recorded_error: Some(error),
             ..
-        }) => demoted_sentence(&destination.to_string(), recorded_ms, revision, &error),
+        }) => crate::allowances::demoted_sentence(
+            &destination.to_string(),
+            recorded_ms,
+            revision,
+            &error,
+        ),
         Some(Coverage::Recorded(record)) => format!(
             "recorded project allowance {} ({}); not confirmed for this session",
             escape(&record.destination().to_string()),
@@ -873,6 +782,10 @@ async fn run_allow(
 }
 
 /// One `GrantResult`, in the user's words, with its exit status.
+///
+/// The words and the stream are [`GrantResult::report`]'s: the in-terminal prompt
+/// draws the same sentence, so neither surface can drift from the other (#501
+/// slice 3 §7.4). This adapter only chooses the writer.
 fn report_grant(
     out: &mut impl std::io::Write,
     err: &mut impl std::io::Write,
@@ -880,111 +793,16 @@ fn report_grant(
     scope: crate::allowances::GrantScope,
     result: crate::allowances::GrantResult,
 ) -> Result<i32> {
-    use crate::allowances::{GrantRefusalReason, GrantResult, NextLaunchReason};
-    match result {
-        GrantResult::Applied {
-            destination,
-            revision,
-            recorded_ms,
-            ..
-        } => {
-            let destination = escape(&destination);
-            match scope {
-                crate::allowances::GrantScope::Session => writeln!(
-                    out,
-                    "allowed {destination} for {} (policy revision {revision})",
-                    describe_session(id, "running")
-                ),
-                crate::allowances::GrantScope::Project => writeln!(
-                    out,
-                    "allowed {destination} for {} (policy revision {revision}) and recorded for this project ({})",
-                    describe_session(id, "running"),
-                    last_seen(recorded_ms)
-                ),
-            }
-            .context("writing the grant reply")?;
-            Ok(0)
+    let report = result.report(&describe_session(id, "running"), scope);
+    match report.stream {
+        crate::allowances::ReportStream::Out => {
+            writeln!(out, "{}", report.text).context("writing the grant reply")?
         }
-        GrantResult::AppliedNotRecorded {
-            destination,
-            revision,
-            recorded_ms,
-            message,
-        } => {
-            writeln!(
-                err,
-                "{}",
-                demoted_sentence(&destination, recorded_ms, revision, &message)
-            )
-            .context("writing the demoted grant")?;
-            Ok(1)
-        }
-        GrantResult::NextLaunch {
-            destination,
-            recorded_ms,
-            reason,
-        } => {
-            let destination = escape(&destination);
-            let why = match reason {
-                NextLaunchReason::RuntimeUnsupported => {
-                    "this runtime cannot replace its network policy while it runs"
-                }
-                NextLaunchReason::InterceptedPortsFixedAtLaunch => {
-                    "TLS-intercepted ports are fixed at launch, so this allowance applies at the next launch"
-                }
-            };
-            writeln!(
-                out,
-                "recorded {destination} for this project ({}); {why}",
-                last_seen(recorded_ms)
-            )
-            .context("writing the next-launch sentence")?;
-            Ok(0)
-        }
-        GrantResult::QueuedForBoot {
-            destination, scope, ..
-        } => {
-            // Conditional on purpose: the flush may still fail, and then the
-            // session says so (Ruling 3, N3).
-            let destination = escape(&destination);
-            match scope {
-                crate::allowances::GrantScope::Session => writeln!(
-                    out,
-                    "accepted {destination} for this session; applied when the session finishes starting — confirm with `agent-vm access allowances`"
-                ),
-                crate::allowances::GrantScope::Project => writeln!(
-                    out,
-                    "recorded project allowance {destination} and accepted it for this session; applied when the session finishes starting — confirm with `agent-vm access allowances`"
-                ),
-            }
-            .context("writing the queued grant")?;
-            Ok(0)
-        }
-        GrantResult::Refused { reason } => {
-            let message = match reason {
-                GrantRefusalReason::HostProxyInUse => {
-                    "a host HTTP proxy is in use, so this session cannot intercept hostnames"
-                        .to_owned()
-                }
-                GrantRefusalReason::InterceptedPortsFixedAtLaunch => {
-                    "TLS-intercepted ports are fixed at launch; relaunch with this hostname to intercept it"
-                        .to_owned()
-                }
-                GrantRefusalReason::NotAllowable { message } => message,
-                GrantRefusalReason::RuntimeFailed { message } => {
-                    format!("the runtime could not apply the change: {message}")
-                }
-                GrantRefusalReason::Store { message } => {
-                    format!("the project allowance record was not written: {message}")
-                }
-                GrantRefusalReason::Full { limit } => format!(
-                    "this session already holds {limit} live allowances, the most it can carry; revoke one first"
-                ),
-            };
-            writeln!(err, "refused: {}", escape(&message)).context("writing the grant refusal")?;
-            Ok(1)
+        crate::allowances::ReportStream::Err => {
+            writeln!(err, "{}", report.text).context("writing the grant refusal")?
         }
     }
+    Ok(report.code)
 }
 
 /// `agent-vm access allowances [--session <SID>]`: the store's records and every

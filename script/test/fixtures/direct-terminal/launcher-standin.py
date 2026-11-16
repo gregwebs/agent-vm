@@ -17,6 +17,7 @@ broken one without a VM, a runtime or an image.
 from __future__ import annotations
 
 import os
+import re
 import select
 import signal
 import subprocess
@@ -25,6 +26,30 @@ import termios
 import time
 
 MODE = os.environ.get("STANDIN_MODE", "ok")
+
+# The prompt controls (#501 slice 3). A stand-in that plays a *correct* prompt must
+# satisfy the driver's oracle; the broken variants must not. These frames are a
+# control's own minimal rendition — the product's frames come from
+# `access_prompt::screen` and are checked by the tmux oracle — so nothing here
+# claims to be the launcher's byte stream.
+PROMPT_ENTER = (
+    b"\x1b[?1049h"
+    b"\x1b[?1003l\x1b[?1002l\x1b[?1001l\x1b[?1000l\x1b[?9l"
+    b"\x1b[?2004l\x1b[?6l\x1b[>0u\x1b[0m\x1b(B\x0f"
+    b"\x1b[H\x1b[2J"
+    b"\x1b[2;1H\x1b[2Kagent-vm: the sandbox refused a network request from the guest"
+    b"\x1b[4;1H\x1b[2K  tcp 203.0.113.10:443"
+    b"\x1b[8;1H\x1b[2K  d  keep refusing (also Enter or Esc)"
+    b"\x1b[11;3H\x1b[2K  stop typing to answer..."
+)
+PROMPT_READY = b"\x1b[11;3H\x1b[2K  ready for your answer\x1b[11;3H\x1b[6n"
+PROMPT_LEAVE = (
+    b"\x1b[0m\x1b[H\x1b[2J\x1b[<u\x1b[?6h\x1b[?1049l"
+)
+# What the guest's modes must get back (the `refuse` probe's prelude).
+PROMPT_MODES_BACK = b"\x1b(0\x1b[?1002h\x1b[?2004h"
+# A redraw the product would never write after the leave: a broken variant's tell.
+PROMPT_REDRAW_AFTER_LEAVE = b"\x1b[11;3H\x1b[2K  ready for your answer"
 
 
 def die(message: str) -> None:
@@ -101,8 +126,136 @@ def forward(sink, *, truncate: int | None = None, hold: bool = False, mangle: bo
     sink.close()
 
 
+def play_prompt_cadence(program: list[str]) -> int:
+    """Play the *launcher's* answer cadence, to exercise the driver's own rules.
+
+    The real launcher sends one cursor-position request, treats a reply that arrives
+    after visibility as typing, redraws the question with "stop typing", and draws
+    "ready" again 0.7 s after the last input. A stand-in that accepted any read as the
+    key (the plain `prompt-ok` mode) cannot catch a driver that answers repeatedly;
+    this mode can (H15).
+    """
+
+    attributes = save_attributes(0)
+    set_raw(0)
+    process = subprocess.Popen(program, stdout=subprocess.PIPE)
+    try:
+        assert process.stdout is not None
+        head = b""
+        while b"REFUSE-READY" not in head:
+            chunk = process.stdout.read(1)
+            if not chunk:
+                die("the probe ended before its readiness")
+            head += chunk
+            os.write(1, head)
+        os.write(1, PROMPT_ENTER + b"\x1b[11;3H\x1b[6n")
+        # The launcher's reply cadence: it answered the one request it sent. A "stop
+        # typing" redraw per read, and "ready" only when exactly **one** reply arrived
+        # inside the window. A driver that answers a request twice (H16: a pump without
+        # the shared driver re-initialises its count) therefore never sees "ready" and
+        # the control fails — that is the class this mode exists to catch.
+        # Count *replies*, not reads: the terminal may coalesce several writes into
+        # one read, and a driver that answers twice must still be caught.
+        replies = 0
+        window = time.monotonic() + 1.0
+        while time.monotonic() < window:
+            readable, _, _ = select.select([0], [], [], 0.05)
+            if not readable:
+                continue
+            raw = os.read(0, 4096)
+            replies += len(re.findall(rb"\x1b\[\d+;\d+R", raw))
+            if replies > 8:
+                break
+            os.write(1, b"\x1b[11;3H\x1b[2K  stop typing to answer...")
+        if replies != 1:
+            # Zero replies (no driver) or more than one (a driver answering twice): leave
+            # the question unanswered, as a real launcher's question would time out.
+            os.write(1, PROMPT_LEAVE)
+            held = b""
+            while True:
+                chunk = process.stdout.read(4096)
+                if not chunk:
+                    break
+                held += chunk
+            os.write(1, held)
+            return process.wait()
+        time.sleep(0.75)
+        os.write(1, b"\x1b[11;3H\x1b[2K  ready for your answer\x1b[11;3H")
+        # Now the answer.
+        readable, _, _ = select.select([0], [], [], 30.0)
+        if not readable:
+            die("the driver never answered")
+        os.read(0, 64)
+        os.write(1, PROMPT_LEAVE)
+        if MODE != "prompt-no-modes":
+            os.write(1, PROMPT_MODES_BACK)
+        held = b""
+        while True:
+            chunk = process.stdout.read(4096)
+            if not chunk:
+                break
+            held += chunk
+        os.write(1, held)
+        return process.wait()
+    finally:
+        restore_attributes(0, attributes)
+
+
+def play_prompt(program: list[str]) -> int:
+    """Play a launcher's takeover over a real `refuse` probe.
+
+    The probe's own prelude and readiness go straight to the terminal (the guest
+    set its modes before the question existed); everything it writes while the
+    question is up is held, then released after the leave, in order.
+    """
+
+    attributes = save_attributes(0)
+    set_raw(0)
+    process = subprocess.Popen(program, stdout=subprocess.PIPE)
+    try:
+        assert process.stdout is not None
+        head = b""
+        # The prelude and REFUSE-READY arrive first and go out untouched.
+        while b"REFUSE-READY" not in head:
+            chunk = process.stdout.read(1)
+            if not chunk:
+                die("the probe ended before its readiness")
+            head += chunk
+            os.write(1, head)
+        os.write(1, PROMPT_ENTER)
+        time.sleep(0.3)
+        os.write(1, PROMPT_READY)
+        # Wait for the answer key, which the driver types at the terminal.
+        select.select([0], [], [], 30.0)
+        os.read(0, 64)
+        os.write(1, PROMPT_LEAVE)
+        if MODE != "prompt-no-modes":
+            os.write(1, PROMPT_MODES_BACK)
+        held = b""
+        while True:
+            chunk = process.stdout.read(4096)
+            if not chunk:
+                break
+            held += chunk
+        if MODE == "prompt-drop-line":
+            # One held line never reaches the terminal: the ordering oracle must
+            # notice the gap.
+            held = re.sub(rb"LINE 17\r?\n", b"", held, count=1)
+        os.write(1, held)
+        if MODE == "prompt-redraw-after-leave":
+            time.sleep(0.1)
+            os.write(1, PROMPT_REDRAW_AFTER_LEAVE)
+        return process.wait()
+    finally:
+        restore_attributes(0, attributes)
+
+
 def main(argv: list[str]) -> int:
     probe_mode, program = split_argv(argv)
+    if MODE == "prompt-cadence" and probe_mode == "refuse":
+        return play_prompt_cadence(program)
+    if MODE.startswith("prompt") and probe_mode == "refuse":
+        return play_prompt(program)
     if MODE == "early-exit":
         # A launcher that dies before any readiness barrier.
         return 0

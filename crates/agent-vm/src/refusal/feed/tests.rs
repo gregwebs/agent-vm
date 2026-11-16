@@ -186,6 +186,44 @@ fn cursor_for(offset: u64) -> LogCursor {
 }
 
 #[tokio::test]
+async fn a_redirected_hint_is_delivered_once_and_its_wait_parks_once_written() {
+    // Finding 5's contract: one fire reaches the relay; `take` is true exactly once;
+    // and once written, waiting on it again parks instead of returning for ever (a
+    // wait that returns for ever is a `select!` branch that is always ready).
+    let hint = Arc::new(Hint::new());
+    let route = hint.redirect();
+    let waiting = tokio::spawn({
+        let route = route.clone();
+        async move { route.fired().await }
+    });
+    hint.fire_for_test();
+    tokio::time::timeout(Duration::from_secs(5), waiting)
+        .await
+        .expect("the wait resolves on the fire")
+        .expect("the task");
+    assert!(route.take(), "the first take owns the bytes");
+    assert!(!route.take(), "the bytes are written once");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), route.fired())
+            .await
+            .is_err(),
+        "after the hint is written its wait must park, not return"
+    );
+    assert!(!route.detach(), "a written hint is not owed to stderr");
+}
+
+#[test]
+fn a_hint_fired_before_it_is_redirected_stays_on_stderr() {
+    let (hint, lines) = Hint::capture();
+    let hint = Arc::new(hint);
+    hint.fire_for_test();
+    let route = hint.redirect();
+    assert!(!route.take(), "an already-fired hint is not rerouted");
+    assert!(!route.detach(), "and the stderr route is not owed anything");
+    assert_eq!(lines.lock().unwrap().len(), 1, "it went to stderr once");
+}
+
+#[tokio::test]
 async fn records_before_session_start_are_ignored() {
     let (_root, dir) = dir();
     let persist = Persister::new(dir.clone());

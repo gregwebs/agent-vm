@@ -34,7 +34,7 @@ STANDIN = HERE.parent / "fixtures" / "direct-terminal" / "launcher-standin.py"
 PROBE = HERE.parent / "fixtures" / "direct-terminal" / "guest-probe.sh"
 
 # A control's whole run, including a deliberately stalled one.
-CONTROL_TIMEOUT = 120.0
+CONTROL_TIMEOUT = 60.0
 # The driver's per-observation deadline under this contract: short, so a
 # "never delivers EOF" control fails quickly instead of burning a minute.
 CONTRACT_MARKER_DEADLINE = "8"
@@ -90,6 +90,10 @@ def run_driver(work: Path, *, case: str, standin_mode: str) -> tuple[bool, dict,
         "run",
         "--evidence",
         str(evidence),
+        # A boot-free control's launcher is a stand-in: it has no session, refusal
+        # log or allowance store, so the driver records `access` as skipped rather
+        # than pretending a real CLI ran.
+        "--standin",
     ]
     try:
         done = subprocess.run(
@@ -457,6 +461,142 @@ def main() -> int:
             "the launcher exited with", case="identity-auto", standin_mode="early-exit")
     control(results, "reject/a terminal left raw fails the restoration check", False,
             "the host terminal was not restored", case="identity-auto", standin_mode="raw-leftover")
+
+    # --- the access prompt's oracle: a correct prompt accepted, broken ones
+    # rejected. The stand-in plays a launcher's takeover over the real probe; what
+    # these prove is the *driver's* oracle, never the product's frames (those are
+    # `access_prompt::screen`'s and the tmux oracle's).
+    control(results, "accept/a correct prompt, answered with d", True,
+            case="prompt-deny", standin_mode="prompt-ok")
+    # The launcher's own cadence: one request, a "stop typing" redraw per read, then
+    # "ready" 0.7 s after the last read. A driver that answers more than once never
+    # sees "ready" (H15).
+    control(results, "accept/a driver that answers once against the launcher's cadence", True,
+            case="prompt-deny", standin_mode="prompt-cadence")
+    control(results, "reject/a leave without the mode re-apply fails", False,
+            "did not re-apply", case="prompt-deny", standin_mode="prompt-no-modes")
+    # The oracle's message changed when it stopped demanding every line after the
+    # leave (a real boot's ingestion forwards some of them before the takeover):
+    # the claim it rejects is the same, and both spellings are accepted so the
+    # control cannot depend on one wording.
+    control(results, "reject/a dropped held line fails the ordering oracle", False,
+            ("once each and in order", "held lines"), case="prompt-deny",
+            standin_mode="prompt-drop-line")
+    control(results, "reject/a redraw after the leave fails", False,
+            "a prompt frame was written after the leave", case="prompt-deny",
+            standin_mode="prompt-redraw-after-leave")
+
+    # --- the access prompt's inventory, on the case table itself -------------
+    driver = driver_module()
+    prompt = driver.PROMPT_CASES
+    check = lambda name, ok, detail="": (
+        results.append((name, ok)),
+        print(f"{'ok  ' if ok else 'FAIL'} {name}" + ("" if ok else ": " + detail)),
+    )
+    required = {
+        "prompt-deny", "prompt-session", "prompt-project", "prompt-project-next",
+        "prompt-guard", "prompt-answered-elsewhere", "prompt-alt-screen",
+        "prompt-stall", "prompt-exit", "prompt-forced", "prompt-forced-alt",
+        "prompt-runtime-loss", "prompt-runtime-loss-alt", "prompt-off-env",
+    }
+    check(
+        "inventory/every prompt row the plan names exists",
+        required <= set(prompt),
+        f"missing={sorted(required - set(prompt))}",
+    )
+    # Every row must assert something about the launcher's own `access` command,
+    # or about an absence: a row that only checked a status would pass on a
+    # launcher that prompted and granted nothing.
+    # Each row must name at least one expectation beyond the exit status: the
+    # `access` command, an absence, or the terminal fact its criterion is about.
+    # A row that only compared a status would pass on a launcher that prompted and
+    # granted nothing.
+    beyond_status = (
+        "access", "off", "lines", "alt", "stall", "forced", "runtime_loss", "guard",
+        "answered_elsewhere", "probe_stdin", "exit", "race_key", "result_says",
+    )
+    check(
+        "inventory/every prompt row states an expectation beyond its status",
+        all(any(spec.get(key) for key in beyond_status) for spec in prompt.values()),
+        f"rows without one={[n for n, s in prompt.items() if not any(s.get(k) for k in beyond_status)]}",
+    )
+    # The deny row is the one that would catch discarded or reordered output: its
+    # own expectation must keep the held-line check.
+    check(
+        "inventory/the deny row asserts the held lines",
+        prompt["prompt-deny"].get("lines") is True,
+        f"prompt-deny={prompt['prompt-deny']}",
+    )
+    # The rows that answer with a key must name one, and the rows that must not
+    # answer must not (their oracle is what the absence proves).
+    check(
+        "inventory/only the answering rows name a key",
+        prompt["prompt-deny"]["answer"] == b"d"
+        and prompt["prompt-session"]["answer"] == b"s"
+        and prompt["prompt-project-next"]["answer"] == b"p"
+        and prompt["prompt-exit"]["answer"] is None
+        and prompt["prompt-forced"]["answer"] is None
+        and prompt["prompt-runtime-loss"]["answer"] is None,
+        "an answer key changed shape",
+    )
+    # AC9's three shapes are all present and each turns the prompt off in its own
+    # way: the setting, TERM, and a redirected stdout.
+    check(
+        "inventory/AC9 has the setting, TERM=dumb and a redirected stdout",
+        prompt["prompt-off-env"]["env"].get("AGENT_VM_NO_ACCESS_PROMPT") == "1"
+        and prompt["prompt-off-dumb"]["env"].get("TERM") == "dumb"
+        and prompt["prompt-off-redirect"].get("stdout") == "file",
+        "one of the three AC9 shapes is missing",
+    )
+
+    check(
+        "inventory/forced and runtime loss cover both screens",
+        all(
+            prompt[f"prompt-{name}-alt"]["probe"][0] == "alt"
+            and (
+                prompt[f"prompt-{name}-alt"].get("forced") is True
+                or prompt[f"prompt-{name}-alt"].get("runtime_loss") is True
+            )
+            for name in ("forced", "runtime-loss")
+        ),
+        "a screen is missing from the forced or runtime-loss rows",
+    )
+    # H12/H14: the probe's arguments must actually reach its mode functions. Grepping
+    # the probe for the word "ignore" proved nothing while the dispatcher called
+    # `probe_alt` with no arguments; the dispatcher lines are read instead.
+    probe_text = (HERE.parent / "fixtures" / "direct-terminal" / "guest-probe.sh").read_text()
+    forwarded = {
+        "refuse": 'refuse) probe_refuse "$@" ;;',
+        "refuse-dns": 'refuse-dns) probe_refuse_dns "$@" ;;',
+        "alt": 'alt) probe_alt "$@" ;;',
+    }
+    check(
+        "inventory/the probe forwards each mode's arguments",
+        all(line in probe_text for line in forwarded.values()),
+        f"missing dispatcher argument forwarding: "
+        f"{[k for k, v in forwarded.items() if v not in probe_text]}",
+    )
+    check(
+        "inventory/the alternate observer reads the real terminal",
+        ") </dev/tty &" in probe_text,
+        "an asynchronous list's stdin is /dev/null, so `stty size` would fail silently",
+    )
+    check(
+        "inventory/the forced rows use a guest that survives the forwarded signal",
+        all(
+            "ignore" in prompt[f"prompt-forced{suffix}"]["probe"]
+            for suffix in ("", "-alt")
+        )
+        and "trap '' INT TERM" in probe_text
+        and 'if [ "${1:-0}" = ignore ]; then' in probe_text,
+        "a guest killed by the forwarded SIGINT is a guest exit, not a forced end",
+    )
+    check(
+        "inventory/AC12's race row sends a key while the CLI grant is in flight",
+        prompt["prompt-answered-elsewhere"].get("race_key") == b"p"
+        and prompt["prompt-answered-elsewhere"].get("access") == "first-answer-wins",
+        "the race row does not exercise the prompt's conditional grant",
+    )
 
     # --- inventory controls: the native matrix must stay discriminating ------
     inventory_controls(results)

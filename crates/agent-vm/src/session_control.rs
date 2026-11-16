@@ -67,7 +67,7 @@ const MAX_SUBSCRIBERS: usize = 16 - 4;
 /// The client's deadline for a mutation. `40 s > 30 s runtime deadline
 /// (handshake.rs:27) + 1 s LOCK_WAIT + write slack`: a client timeout shorter
 /// than the runtime's would race a swap that is still going to commit (Ruling 4).
-const MUTATION_TIMEOUT: Duration = Duration::from_secs(40);
+pub(crate) const MUTATION_TIMEOUT: Duration = Duration::from_secs(40);
 /// How long `finish` waits for open connections after telling them the session
 /// ended, before aborting them.
 const CONNECTION_GRACE: Duration = Duration::from_millis(500);
@@ -311,6 +311,18 @@ impl LiveSession {
     #[cfg(test)]
     pub(crate) fn id(&self) -> &SessionId {
         &self.info.id
+    }
+
+    /// The prompt's view of this session (#501 slice 3), or `None` when the feed is
+    /// degraded: with no live refusals there is nothing to ask about, and R2's "the
+    /// session has a live refusal feed" is exactly this.
+    pub(crate) fn prompt_feed(&self) -> Option<crate::access_prompt::Feed> {
+        Some(crate::access_prompt::Feed {
+            refusals: self.live.clone()?,
+            allowances: Arc::clone(&self.allowances),
+            session: self.info.id.clone(),
+            hint: Arc::clone(&self.hint),
+        })
     }
 
     /// Adopt the project allowances the launch actually applied (ADR-0065).
