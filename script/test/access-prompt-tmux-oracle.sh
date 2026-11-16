@@ -16,6 +16,9 @@ if ! command -v tmux >/dev/null 2>&1; then
     exit 0
 fi
 
-echo "access-prompt tmux oracle: $(tmux -V)"
+echo "access-prompt tmux oracle: $(tmux -V) (fields the server cannot report are named and skipped)"
 cd "$REPO_ROOT"
-exec cargo test -p agent-vm --bin agent-vm access_prompt::tmux_oracle -- --ignored --test-threads=1 "$@"
+# `--nocapture` keeps the oracle's notices in the job log: a tmux that cannot report
+# one of the later format variables says so, with its version, instead of failing.
+exec cargo test -p agent-vm --bin agent-vm access_prompt::tmux_oracle -- \
+    --ignored --nocapture --test-threads=1 "$@"

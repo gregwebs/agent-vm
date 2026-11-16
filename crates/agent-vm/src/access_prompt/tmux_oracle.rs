@@ -9,6 +9,23 @@
 //! control pane compared with a prompted one, and the prefix sweep — both screens,
 //! every byte prefix of the enter and leave frames followed by the host restore.
 //!
+//! # Which tmux this covers, and why the flags are asked for one by one
+//!
+//! Verified against **tmux 3.8** (macOS, the local gate) and against the older tmux
+//! on the CI runner. tmux only gained the `bracket_paste_flag` and
+//! `synchronized_output_flag` format variables in later releases; on an older server
+//! they expand to nothing. The oracle used to ask for all eleven flags in one
+//! positional `#{a},#{b},…` string, so those empty fields made the parse panic
+//! (`flag 6 of "0,0,0,0,0,0,,,1,0,1" is not a number`) and four of the nine cases
+//! failed on CI while passing 9/9 locally. The format now **names** each flag and the
+//! answer is matched **by name**, so a server that does not know a name simply answers
+//! with fewer fields. Which names a server knows is probed once per process; the ones
+//! it cannot report are printed with the tmux version, and only their own assertion is
+//! skipped — every field the server *can* report is compared exactly as before. On
+//! tmux 3.8 nothing is skipped. `AGENT_VM_TMUX_ORACLE_HIDE=bracket_paste_flag,…` makes
+//! a new tmux look like an old one, which is how the fallback is exercised on a 3.8
+//! host; the boot-free tests below cover the CI string's shape exactly.
+//!
 //! # Why a real emulator
 //!
 //! The tracker and the byte builders are written by the same person. The oracle is
@@ -37,6 +54,12 @@ struct Tmux {
     socket: PathBuf,
     fifo: PathBuf,
     sink: Option<std::fs::File>,
+    /// `tmux -V`, for the notice an unreportable field prints.
+    version: String,
+    /// The flags this server cannot report. The support probe runs once per process
+    /// (the binary is the same for every server); this caches the answer for this one.
+    /// Empty on tmux 3.8.
+    unreported: std::sync::OnceLock<Vec<&'static str>>,
 }
 
 impl Tmux {
@@ -61,11 +84,13 @@ impl Tmux {
             "mkfifo: {}",
             std::io::Error::last_os_error()
         );
-        let server = Self {
+        let mut server = Self {
             _dir: dir,
             socket,
             fifo,
             sink: None,
+            version: String::new(),
+            unreported: std::sync::OnceLock::new(),
         };
         // `exec cat <fifo`: cat's stdout is the pane's terminal, so the FIFO's
         // bytes are drawn. Nothing is ever typed into the pane, so no echo.
@@ -78,6 +103,8 @@ impl Tmux {
             "30",
             &format!("exec cat < '{}'", server.fifo.to_string_lossy()),
         ]);
+        let version = server.tmux(&["-V"]);
+        server.version = version.trim().to_owned();
         server
     }
 
@@ -140,31 +167,77 @@ impl Tmux {
     }
 
     /// The flags the frames are supposed to leave alone or restore.
+    ///
+    /// The format names each flag (`#{alternate_on}` and so on) and the names are
+    /// matched on the way back, so a server that does not know a name simply has a
+    /// shorter list: the older tmux on CI has no `bracket_paste_flag` or
+    /// `synchronized_output_flag`. Such a field is reported once, with the version,
+    /// and only its own assertion is skipped; every field the server can report is
+    /// compared exactly. Nothing depends on a field's position.
     fn flags(&self) -> Flags {
-        let format = "#{alternate_on},#{cursor_x},#{cursor_y},#{origin_flag},\
-                      #{mouse_any_flag},#{mouse_button_flag},#{bracket_paste_flag},\
-                      #{synchronized_output_flag},#{wrap_flag},#{insert_flag},#{cursor_flag}";
-        let text = self.tmux(&["display-message", "-p", "-t", "0", format]);
-        let fields: Vec<&str> = text.trim().split(',').collect();
-        assert_eq!(fields.len(), 11, "unexpected flags: {text:?}");
-        let number = |index: usize| {
-            fields[index].parse::<i64>().unwrap_or_else(|_| {
-                panic!("flag {index} of {text:?} is not a number");
-            })
-        };
-        Flags {
-            alternate_on: number(0) != 0,
-            cursor_x: number(1),
-            cursor_y: number(2),
-            origin: number(3) != 0,
-            mouse_any: number(4) != 0,
-            mouse_button: number(5) != 0,
-            bracketed_paste: number(6) != 0,
-            synchronized_output: number(7) != 0,
-            wrap: number(8) != 0,
-            insert: number(9) != 0,
-            cursor_visible: number(10) != 0,
+        let unreported = self.unreported.get_or_init(|| self.detect_unreported());
+        if !unreported.is_empty() {
+            NOTICE.get_or_init(|| {
+                eprintln!(
+                    "tmux oracle: {} cannot report {}; those fields are checked only \
+                     where the server reports them (the macOS tmux 3.8 run checks all)",
+                    self.version,
+                    unreported.join(", ")
+                );
+            });
         }
+        let reported: Vec<&'static str> = FLAGS
+            .iter()
+            .copied()
+            .filter(|name| !unreported.contains(name))
+            .collect();
+        let format = reported
+            .iter()
+            .map(|name| format!("#{{{name}}}"))
+            .collect::<Vec<_>>()
+            .join("\u{1f}");
+        let text = self.display(&format);
+        parse_flags(&reported, &text)
+    }
+
+    /// One `display-message` format, trimmed. An unknown format name expands to
+    /// nothing, which is how support is probed.
+    fn display(&self, format: &str) -> String {
+        self.tmux(&["display-message", "-p", "-t", "0", format])
+            .trim()
+            .to_owned()
+    }
+
+    /// The flag names this server expands to nothing.
+    ///
+    /// `AGENT_VM_TMUX_ORACLE_HIDE` adds names to that set, so the fallback an older
+    /// tmux takes can be exercised on a machine whose tmux is new (the CI runner's
+    /// tmux lacks the two later format variables; a 3.8 host can be made to look the
+    /// same). It is read only in this test module. The probe itself is cached in
+    /// [`REPORTED`] for the whole process: the prefix sweep starts hundreds of
+    /// servers, all against the same binary.
+    fn detect_unreported(&self) -> Vec<&'static str> {
+        let hidden: Vec<String> = std::env::var("AGENT_VM_TMUX_ORACLE_HIDE")
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(|name| name.trim().to_owned())
+                    .filter(|name| !name.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let reported = REPORTED.get_or_init(|| {
+            FLAGS
+                .iter()
+                .copied()
+                .filter(|name| !self.display(&format!("#{{{name}}}")).is_empty())
+                .collect()
+        });
+        FLAGS
+            .iter()
+            .copied()
+            .filter(|name| hidden.iter().any(|hidden| hidden == name) || !reported.contains(name))
+            .collect()
     }
 
     /// The pane's visible text, escapes included.
@@ -180,6 +253,78 @@ impl Tmux {
     }
 }
 
+/// Turn one `display-message` answer into [`Flags`], `name` by `name`.
+///
+/// `reported` is the list the format asked for, in order; a field that is empty or
+/// missing is "not reported" (an older tmux's unknown name expands to nothing), which
+/// leaves the two later fields `None` and the rest at their documented default. A
+/// field that is present but not a number is a real disagreement and panics.
+fn parse_flags(reported: &[&'static str], text: &str) -> Flags {
+    let mut values: Vec<Option<i64>> =
+        text.split('\u{1f}')
+            .map(|field| match field.trim() {
+                "" => None,
+                number => Some(number.parse::<i64>().unwrap_or_else(|_| {
+                    panic!("tmux flag {number:?} in {text:?} is not a number")
+                })),
+            })
+            .collect();
+    if values.len() < reported.len() {
+        values.resize(reported.len(), None);
+    }
+    let mut flags = Flags::default();
+    for name in FLAGS {
+        let Some(value) = reported
+            .iter()
+            .position(|flag| flag == name)
+            .and_then(|index| values[index])
+        else {
+            continue;
+        };
+        match *name {
+            "alternate_on" => flags.alternate_on = value != 0,
+            "cursor_x" => flags.cursor_x = value,
+            "cursor_y" => flags.cursor_y = value,
+            "origin_flag" => flags.origin = value != 0,
+            "mouse_any_flag" => flags.mouse_any = value != 0,
+            "mouse_button_flag" => flags.mouse_button = value != 0,
+            "bracket_paste_flag" => flags.bracketed_paste = Some(value != 0),
+            "synchronized_output_flag" => flags.synchronized_output = Some(value != 0),
+            "wrap_flag" => flags.wrap = value != 0,
+            "insert_flag" => flags.insert = value != 0,
+            "cursor_flag" => flags.cursor_visible = value != 0,
+            other => panic!("unnamed tmux flag {other}"),
+        }
+    }
+    flags
+}
+
+/// The flags the oracle reads, in the order the format asks for them. The name is the
+/// tmux format variable; the value tmux uses when it cannot report it at all (`man
+/// tmux`, `FORMATS`) is `Flags::default`'s: `wrap_flag` on, the rest off.
+/// The flags the *tmux binary on this machine* can report, detected once on the first
+/// server: every oracle case starts its own server and a probe per name per server cost
+/// the prefix sweep minutes, while the binary is the same for all of them.
+static REPORTED: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+
+/// Whether the one notice for the unreportable fields has been printed, so a run of
+/// several servers says it once.
+static NOTICE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+const FLAGS: &[&str] = &[
+    "alternate_on",
+    "cursor_x",
+    "cursor_y",
+    "origin_flag",
+    "mouse_any_flag",
+    "mouse_button_flag",
+    "bracket_paste_flag",
+    "synchronized_output_flag",
+    "wrap_flag",
+    "insert_flag",
+    "cursor_flag",
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Flags {
     alternate_on: bool,
@@ -188,11 +333,31 @@ struct Flags {
     origin: bool,
     mouse_any: bool,
     mouse_button: bool,
-    bracketed_paste: bool,
-    synchronized_output: bool,
+    /// `None` when this tmux cannot report bracketed paste at all.
+    bracketed_paste: Option<bool>,
+    /// `None` when this tmux cannot report synchronized output at all.
+    synchronized_output: Option<bool>,
     wrap: bool,
     insert: bool,
     cursor_visible: bool,
+}
+
+impl Default for Flags {
+    fn default() -> Self {
+        Self {
+            alternate_on: false,
+            cursor_x: 0,
+            cursor_y: 0,
+            origin: false,
+            mouse_any: false,
+            mouse_button: false,
+            bracketed_paste: None,
+            synchronized_output: None,
+            wrap: true,
+            insert: false,
+            cursor_visible: true,
+        }
+    }
 }
 
 impl Flags {
@@ -203,8 +368,10 @@ impl Flags {
             && !self.origin
             && !self.mouse_any
             && !self.mouse_button
-            && !self.bracketed_paste
-            && !self.synchronized_output
+            // `None` is "this tmux cannot report it": not evidence of a mode being on,
+            // and never treated as off either (the assertion is skipped, not passed).
+            && self.bracketed_paste != Some(true)
+            && self.synchronized_output != Some(true)
     }
 }
 
@@ -277,9 +444,15 @@ fn the_guest_terminal_is_given_back_exactly() {
         );
         let during = tmux.flags();
         assert!(!during.mouse_any && !during.mouse_button, "{during:?}");
-        assert!(!during.bracketed_paste, "{during:?}");
+        assert!(
+            during.bracketed_paste != Some(true),
+            "bracketed paste must be off (None = this tmux cannot report it): {during:?}"
+        );
         assert!(!during.origin, "{during:?}");
-        assert!(!during.synchronized_output, "{during:?}");
+        assert!(
+            during.synchronized_output != Some(true),
+            "synchronized output must be ended (None = this tmux cannot report it): {during:?}"
+        );
         // What the prompt must not change.
         assert_eq!(during.wrap, before_flags.wrap, "{during:?}");
         assert_eq!(during.insert, before_flags.insert, "{during:?}");
@@ -554,4 +727,54 @@ fn the_alternate_screen_guest_keeps_its_own_screen() {
 fn nudges_are_only_for_the_alternate_screen() {
     assert!(screen::nudges(Screen::Alternate));
     assert!(!screen::nudges(Screen::Main));
+}
+
+/// The CI runner's tmux (older than 3.8) expands `#{bracket_paste_flag}` and
+/// `#{synchronized_output_flag}` to nothing: its answer was
+/// `"0,0,0,0,0,0,,,1,0,1"`, and the positional parse panicked on the empty field.
+/// Named matching, and "empty means not reported", must give the same nine observed
+/// values and no panic.
+#[test]
+fn a_server_without_the_later_format_variables_reports_none_and_keeps_the_defaults() {
+    let nine: Vec<&'static str> = FLAGS
+        .iter()
+        .copied()
+        .filter(|name| *name != "bracket_paste_flag" && *name != "synchronized_output_flag")
+        .collect();
+    // The values the CI runner reported, in the order of the nine it can answer.
+    let text = ["0", "0", "0", "0", "0", "0", "1", "0", "1"].join("\u{1f}");
+    let flags = parse_flags(&nine, &text);
+    assert_eq!(flags.bracketed_paste, None);
+    assert_eq!(flags.synchronized_output, None);
+    assert!(!flags.alternate_on && !flags.origin && !flags.mouse_any && !flags.mouse_button);
+    assert_eq!((flags.cursor_x, flags.cursor_y), (0, 0));
+    assert!(flags.wrap, "wrap_flag's default when unreported is on");
+    assert!(!flags.insert);
+    assert!(flags.cursor_visible);
+}
+
+/// A field that is reported but empty is tmux's "unset": the documented default
+/// stands (`wrap_flag` on, the rest off), never a panic.
+#[test]
+fn an_empty_reported_field_takes_the_documented_default() {
+    let text = std::iter::repeat_n("", FLAGS.len())
+        .collect::<Vec<_>>()
+        .join("\u{1f}");
+    let flags = parse_flags(FLAGS, &text);
+    assert_eq!(flags.bracketed_paste, None);
+    assert_eq!(flags.synchronized_output, None);
+    assert!(flags.wrap);
+    assert!(flags.cursor_visible);
+    assert!(!flags.insert && !flags.alternate_on && !flags.mouse_any);
+}
+
+/// A field that is present and not a number is a real disagreement with tmux, and it
+/// must still fail loudly rather than be read as a default.
+#[test]
+#[should_panic(expected = "is not a number")]
+fn a_reported_field_that_is_not_a_number_still_fails_loudly() {
+    let _ = parse_flags(
+        FLAGS,
+        "0\u{1f}0\u{1f}x\u{1f}0\u{1f}0\u{1f}0\u{1f}0\u{1f}0\u{1f}1\u{1f}0\u{1f}1",
+    );
 }
