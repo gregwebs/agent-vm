@@ -148,6 +148,7 @@ impl Harness {
 /// what a test of "the subscriber is told the session ended" must not mistake for
 /// behaviour.
 struct Client {
+    path: PathBuf,
     reader: tokio::io::BufReader<UnixStream>,
 }
 
@@ -155,6 +156,7 @@ impl Client {
     async fn connect(path: &std::path::Path) -> Self {
         let stream = UnixStream::connect(path).await.expect("a connection");
         Self {
+            path: path.to_path_buf(),
             reader: tokio::io::BufReader::new(stream),
         }
     }
@@ -175,7 +177,7 @@ impl Client {
         .await
         .expect("a reply within 5 s")
         .expect("a readable reply");
-        (!line.is_empty()).then(|| parse_reply(&line).expect("a decodable reply"))
+        (!line.is_empty()).then(|| parse_reply(&self.path, &line).expect("a decodable reply"))
     }
 
     async fn reply(&mut self) -> Reply {
@@ -1045,14 +1047,13 @@ async fn protocol_v3_serves_egress_and_older_versions_refuse_it() {
     harness.shutdown().await;
 }
 
-/// #631 AC4: a launcher of the previous build answers `unsupported-version`,
-/// which the client turns into "predates `access egress`" rather than an error.
-#[tokio::test]
-async fn egress_client_reports_a_pre_v3_launcher() {
-    let root = tempfile::tempdir().unwrap();
-    let socket = root.path().join("0000abcd.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
-    let served = tokio::spawn(async move {
+/// A socket that answers whatever request it reads with `reply` and closes.
+///
+/// The write's result is ignored on purpose: a client that refuses a reply stops
+/// reading, so the rest of a reply it refused has nowhere to go.
+async fn answer_once(socket: &std::path::Path, reply: Vec<u8>) -> tokio::task::JoinHandle<()> {
+    let listener = UnixListener::bind(socket).unwrap();
+    tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
         let mut reader = tokio::io::BufReader::new(&mut stream);
         let mut line = String::new();
@@ -1060,17 +1061,156 @@ async fn egress_client_reports_a_pre_v3_launcher() {
             .await
             .unwrap();
         drop(reader);
-        tokio::io::AsyncWriteExt::write_all(
-            &mut stream,
-            b"{\"reply\":\"error\",\"v\":2,\"code\":\"unsupported-version\",\"supported\":[1,2]}\n",
-        )
-        .await
-        .unwrap();
-    });
+        let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, &reply).await;
+        let _ = tokio::io::AsyncWriteExt::flush(&mut stream).await;
+    })
+}
+
+/// #631 AC4: a launcher of the previous build answers `unsupported-version`,
+/// which the client turns into "predates `access egress`" rather than an error.
+#[tokio::test]
+async fn egress_client_reports_a_pre_v3_launcher() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("0000abcd.sock");
+    let served = answer_once(
+        &socket,
+        b"{\"reply\":\"error\",\"v\":2,\"code\":\"unsupported-version\",\"supported\":[1,2]}\n"
+            .to_vec(),
+    )
+    .await;
     match egress(&socket).await.unwrap() {
         EgressAnswer::PredatesEgress => {}
         EgressAnswer::Egress(egress) => panic!("{egress:?}"),
+        EgressAnswer::NewerLauncher => panic!("a launcher that speaks v2 is not newer"),
     }
+    served.await.unwrap();
+}
+
+/// #640: `unsupported-version` is split by the `supported` list. Only a maximum
+/// above v3 means the launcher is newer, and nothing the reply *lacks* may be
+/// read that way.
+#[tokio::test]
+async fn egress_client_reads_the_supported_list() {
+    for (reply, newer) in [
+        // A launcher that speaks only versions above this build's v3.
+        (
+            "{\"reply\":\"error\",\"v\":2,\"code\":\"unsupported-version\",\"supported\":[4,5]}\n",
+            true,
+        ),
+        // The pre-v3 shape: no list at all. Older, never newer.
+        (
+            "{\"reply\":\"error\",\"v\":2,\"code\":\"unsupported-version\"}\n",
+            false,
+        ),
+        // An empty list is as uninformative as a missing one.
+        (
+            "{\"reply\":\"error\",\"v\":2,\"code\":\"unsupported-version\",\"supported\":[]}\n",
+            false,
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("0000abcd.sock");
+        let served = answer_once(&socket, reply.as_bytes().to_vec()).await;
+        match egress(&socket).await.unwrap() {
+            EgressAnswer::NewerLauncher => assert!(newer, "read as newer: {reply}"),
+            EgressAnswer::PredatesEgress => assert!(!newer, "read as older: {reply}"),
+            EgressAnswer::Egress(egress) => panic!("{egress:?}"),
+        }
+        served.await.unwrap();
+    }
+}
+
+/// #639: a reply larger than the bound is refused, and the refusal carries none
+/// of it. A same-user launcher must not be able to allocate freely either.
+#[tokio::test]
+async fn an_oversized_reply_is_refused_without_its_content() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("0000abcd.sock");
+    let marker = "OVERSIZED-MARKER";
+    // The marker sits in the `reply` tag, which serde would echo: a reply refused
+    // by size must carry none of it.
+    let mut reply = format!("{{\"reply\":\"{marker}");
+    reply.push_str(&"x".repeat(MAX_REPLY_BYTES));
+    reply.push_str("\",\"v\":1}\n");
+    let served = answer_once(&socket, reply.into_bytes()).await;
+    let error = list(&socket)
+        .await
+        .expect_err("a reply over the bound is refused");
+    let text = format!("{error:#}");
+    assert!(text.contains("larger than"), "{text}");
+    assert!(!text.contains(marker), "the reply is not echoed: {text}");
+    served.await.unwrap();
+}
+
+/// #639: a framing error ends a subscription.
+///
+/// The reviewer's case exactly: an oversized line immediately followed by a
+/// well-formed reply. The rejected line's tail stays in the reader, so a
+/// subscription that read on would hand a *suffix of that line* to the caller as
+/// if it were the next reply — fabricated stream state. One error, then `None`.
+#[tokio::test]
+async fn an_oversized_reply_ends_the_subscription() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("0000abcd.sock");
+    let mut reply = "x".repeat(MAX_REPLY_BYTES);
+    reply.push_str("{\"reply\":\"ended\",\"v\":1}\n");
+    let served = answer_once(&socket, reply.into_bytes()).await;
+    {
+        let stream = subscribe(&socket).await.expect("a subscription");
+        futures::pin_mut!(stream);
+        let error = stream
+            .next()
+            .await
+            .expect("the framing error")
+            .expect_err("the line is over the bound");
+        assert!(format!("{error:#}").contains("larger than"), "{error:#}");
+        assert!(
+            stream.next().await.is_none(),
+            "the subscription ended: no suffix of a rejected line is a reply"
+        );
+    }
+    // The fake launcher's write may still be blocked on a buffer this process is
+    // no longer draining; closing the subscription first is what lets it finish.
+    served.await.unwrap();
+}
+
+/// #639: an undecodable reply is reported by path and a **bounded** cause. The
+/// line itself is never quoted, and the part serde echoes — the unknown `reply`
+/// tag — is cut at [`MAX_CAUSE_BYTES`], so a peer cannot choose how much text it
+/// makes this process print.
+#[tokio::test]
+async fn an_undecodable_reply_is_reported_without_the_echoed_tag() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("0000abcd.sock");
+    let marker = "TAIL-MARKER";
+    // A JSON escape per repetition, so the wire form differs from the tag serde
+    // echoes — which is the tag's own 20,000 ESC bytes, plus a marker at its end.
+    let tag = format!("{}{marker}", "\\u001b".repeat(20_000));
+    let line = format!("{{\"reply\":\"{tag}\",\"v\":3}}");
+    let served = answer_once(&socket, format!("{line}\n").into_bytes()).await;
+    let error = list(&socket)
+        .await
+        .expect_err("an undecodable reply is refused");
+    let text = format!("{error:#}");
+    assert!(
+        text.contains("its launcher answered in a form this agent-vm cannot read ("),
+        "{text}"
+    );
+    assert!(
+        text.contains(&crate::one_line::path(&socket).to_string()),
+        "{text}"
+    );
+    assert!(
+        text.len() <= MAX_CAUSE_BYTES + 3 + crate::one_line::path(&socket).to_string().len() + 128,
+        "{} bytes of message: {text:?}",
+        text.len()
+    );
+    assert!(text.contains("..."), "the cause is marked cut: {text:?}");
+    assert!(
+        !text.contains(marker),
+        "the echoed tag's tail is not printed: {text:?}"
+    );
+    assert!(!text.contains(&line), "the line is not quoted: {text}");
     served.await.unwrap();
 }
 
@@ -1082,7 +1222,9 @@ async fn egress_carries_the_recorded_narrowing() {
     let ask = || async {
         match egress(&harness.socket).await.expect("an egress answer") {
             EgressAnswer::Egress(egress) => egress.narrowing,
-            EgressAnswer::PredatesEgress => panic!("this build speaks v3"),
+            EgressAnswer::PredatesEgress | EgressAnswer::NewerLauncher => {
+                panic!("this build speaks v3")
+            }
         }
     };
     assert_eq!(

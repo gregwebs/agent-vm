@@ -22,7 +22,9 @@ use anyhow::{Context as _, Result};
 use futures::StreamExt as _;
 use microsandbox::Sandbox;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader,
+};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Semaphore, broadcast, watch};
 use tokio::task::JoinSet;
@@ -55,6 +57,16 @@ const SUPPORTED_VERSIONS: &[u32] = &[1, 2, 3];
 
 /// A request is one short JSON line. Anything longer is not a request.
 const MAX_REQUEST_BYTES: usize = 4 * 1024;
+/// The most bytes one reply may occupy.
+///
+/// The bound must exceed anything this build can emit: a reply can carry a
+/// session's 256 live allowances (`allowances::apply::MAX_LIVE_ALLOWANCES`), each
+/// with a destination, a `via` reference and a status, and 256 worst-case entries
+/// at a generous 4 KiB apiece still fit inside 1 MiB. The bound exists for the
+/// opposite case: the socket's peer runs as this user, so without it a hostile
+/// launcher could make every `access` command allocate without limit. A reply
+/// larger than the bound is refused, never echoed.
+const MAX_REPLY_BYTES: usize = 1024 * 1024;
 /// Per-line deadline for a client that connects and then says nothing, and for
 /// one that stops reading. A subscriber that does not read is dropped rather
 /// than allowed to pin a slot.
@@ -1022,18 +1034,121 @@ pub(crate) async fn subscribe(path: &Path) -> Result<impl futures::Stream<Item =
         .flush()
         .await
         .context("sending the subscribe request")?;
-    let lines = BufReader::new(writer).lines();
-    Ok(futures::stream::unfold(lines, |mut lines| async move {
-        match lines.next_line().await {
-            Ok(Some(line)) => Some((parse_reply(&line), lines)),
-            Ok(None) => None,
-            Err(error) => Some((Err(anyhow::Error::new(error)), lines)),
-        }
-    }))
+    let lines = BufReader::new(writer);
+    let path = path.to_path_buf();
+    // `Some` while the stream can still be read, `None` after a framing error:
+    // the reader keeps the bytes of a rejected line that it did not consume, so
+    // a caller that continued could be handed a *suffix* of that line as if it
+    // were the next reply — stream state no launcher ever sent. Ending here is
+    // also why the rejected line is not discarded: discarding would read to the
+    // next newline, and a hostile peer could stream forever.
+    Ok(futures::stream::unfold(
+        Some((path, lines)),
+        |state| async move {
+            let (path, mut lines) = state?;
+            match read_reply_line(&path, &mut lines).await {
+                Ok(Some(line)) => Some((parse_reply(&path, &line), Some((path, lines)))),
+                Ok(None) => None,
+                Err(error) => Some((Err(error), None)),
+            }
+        },
+    ))
 }
 
-fn parse_reply(line: &str) -> Result<Reply> {
-    serde_json::from_str(line).with_context(|| format!("decoding the reply {line:?}"))
+/// Read one `\n`-terminated reply line, stopping at [`MAX_REPLY_BYTES`].
+///
+/// `read_line` grows its buffer to whatever the peer sends; this reads the same
+/// line through `fill_buf`, which cannot. `Read::take` is the other bound, but a
+/// `Take` around the socket counts across every reply of a subscription rather
+/// than one, so the bound lives here instead: a line that would grow past it is
+/// refused, and the bytes it did not take stay in the reader, so a subscription's
+/// next reply is still its next reply. `Ok(None)` is the peer closing without a
+/// reply; an `Err` is a line this build will not finish reading, and the caller
+/// must not read past it (see [`subscribe`]).
+async fn read_reply_line(
+    path: &Path,
+    reader: &mut (impl AsyncBufRead + Unpin),
+) -> Result<Option<String>> {
+    let mut line: Vec<u8> = Vec::new();
+    loop {
+        let available = reader
+            .fill_buf()
+            .await
+            .with_context(|| format!("reading {}'s answer", crate::one_line::path(path)))?;
+        if available.is_empty() {
+            break;
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let end = newline.map_or(available.len(), |index| index + 1);
+        if line.len() + end > MAX_REPLY_BYTES {
+            return Err(anyhow::anyhow!(
+                "{} answered with a reply larger than {MAX_REPLY_BYTES} bytes, which this agent-vm does not read; its content is not shown",
+                crate::one_line::path(path)
+            ));
+        }
+        line.extend_from_slice(&available[..end]);
+        reader.consume(end);
+        if newline.is_some() {
+            break;
+        }
+    }
+    if line.is_empty() {
+        return Ok(None);
+    }
+    String::from_utf8(line)
+        .map(Some)
+        .with_context(|| format!("reading {}'s answer", crate::one_line::path(path)))
+}
+
+/// The reply, or why this build cannot read one.
+///
+/// The line itself is **not** quoted: `access` prints this as one line. What is
+/// left of it is serde's own message, and that message is quoted **bounded** —
+/// serde echoes the offending token verbatim (an unknown `reply` tag arrives as
+/// `unknown variant \`<tag>\``), so a peer chooses how long the cause is. The
+/// terminal escape expands every non-ASCII byte fourfold on top of that, which
+/// is how a reply just under [`MAX_REPLY_BYTES`] once became megabytes of
+/// stderr.
+fn parse_reply(path: &Path, line: &str) -> Result<Reply> {
+    serde_json::from_str(line).map_err(|error| {
+        anyhow::anyhow!(
+            "{} its launcher answered in a form this agent-vm cannot read ({})",
+            crate::one_line::path(path),
+            truncated(&error.to_string(), MAX_CAUSE_BYTES)
+        )
+    })
+}
+
+/// The most bytes of a cause this build echoes.
+///
+/// Serde's message is the one place a peer's own bytes reach the terminal, so this
+/// is the whole budget for them: at most 203 bytes (200 plus `...`) leave here, and
+/// the terminal escape's fourfold expansion makes that 812 at the sink.
+const MAX_CAUSE_BYTES: usize = 200;
+
+/// The first `budget` bytes of `text`, cut on a char boundary and marked with
+/// `...` when anything was dropped.
+fn truncated(text: &str, budget: usize) -> String {
+    if text.len() <= budget {
+        return text.to_owned();
+    }
+    let mut end = budget;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &text[..end])
+}
+
+/// One reply, read under `timeout`.
+async fn read_answer(
+    path: &Path,
+    reader: &mut (impl AsyncBufRead + Unpin),
+    timeout: Duration,
+) -> Result<String> {
+    let reply = tokio::time::timeout(timeout, read_reply_line(path, reader))
+        .await
+        .map_err(|_| anyhow::anyhow!("{} did not answer in time", crate::one_line::path(path)))??;
+    reply.ok_or_else(|| anyhow::anyhow!("{} closed without answering", crate::one_line::path(path)))
 }
 
 /// Ask one session for its snapshot.
@@ -1049,11 +1164,8 @@ async fn list(path: &Path) -> Result<SessionSnapshot> {
         .write_all(format!("{{\"v\":{CLIENT_READ_VERSION},\"op\":\"list\"}}\n").as_bytes())
         .await
         .context("sending the list request")?;
-    let mut line = String::new();
-    tokio::time::timeout(EXCHANGE_TIMEOUT, reader.read_line(&mut line))
-        .await
-        .map_err(|_| anyhow::anyhow!("{} did not answer in time", crate::one_line::path(path)))??;
-    match parse_reply(&line)? {
+    let line = read_answer(path, &mut reader, EXCHANGE_TIMEOUT).await?;
+    match parse_reply(path, &line)? {
         Reply::Session { session, .. } => Ok(session),
         other => Err(anyhow::anyhow!(
             "{} answered {} instead of a session",
@@ -1083,11 +1195,8 @@ async fn exchange(path: &Path, request: serde_json::Value, timeout: Duration) ->
         .write_all(&line)
         .await
         .context("sending the request")?;
-    let mut answer = String::new();
-    tokio::time::timeout(timeout, reader.read_line(&mut answer))
-        .await
-        .map_err(|_| anyhow::anyhow!("{} did not answer in time", crate::one_line::path(path)))??;
-    parse_reply(&answer)
+    let answer = read_answer(path, &mut reader, timeout).await?;
+    parse_reply(path, &answer)
 }
 
 /// Ask one session to apply a live grant.
@@ -1161,6 +1270,23 @@ pub(crate) enum EgressAnswer {
     Egress(crate::effective_egress::EffectiveEgress),
     /// The launcher speaks no `v: 3`: it predates `access egress`.
     PredatesEgress,
+    /// The launcher speaks no `v: 3`, and the highest version it does speak is
+    /// above [`EGRESS_VERSION`]: it is newer than this agent-vm (#640).
+    NewerLauncher,
+}
+
+/// Whether an `unsupported-version` reply's `supported` list peaks above this
+/// build's [`EGRESS_VERSION`].
+///
+/// The rule is the maximum alone: `supported.iter().max() > EGRESS_VERSION`. A
+/// list like `[1, 4]` is newer by that rule, because this build cannot speak the
+/// v4 the launcher is offering. A missing or empty list is the pre-v3 shape — a
+/// launcher that answered before it sent `supported` — so neither is read as
+/// newer.
+fn speaks_past_egress_version(supported: Option<&[u32]>) -> bool {
+    supported
+        .and_then(|versions| versions.iter().copied().max())
+        .is_some_and(|highest| highest > EGRESS_VERSION)
 }
 
 /// Ask one session for its effective egress.
@@ -1168,8 +1294,14 @@ pub(crate) async fn egress(path: &Path) -> Result<EgressAnswer> {
     let request = serde_json::json!({"v": EGRESS_VERSION, "op": "egress"});
     match exchange(path, request, EXCHANGE_TIMEOUT).await? {
         Reply::Egress { egress, .. } => Ok(EgressAnswer::Egress(egress)),
-        Reply::Error { code, .. } if code == "unsupported-version" => {
-            Ok(EgressAnswer::PredatesEgress)
+        Reply::Error {
+            code, supported, ..
+        } if code == "unsupported-version" => {
+            Ok(if speaks_past_egress_version(supported.as_deref()) {
+                EgressAnswer::NewerLauncher
+            } else {
+                EgressAnswer::PredatesEgress
+            })
         }
         other => Err(anyhow::anyhow!(
             "{} answered {} instead of its effective egress",
