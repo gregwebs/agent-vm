@@ -72,8 +72,14 @@ provenance, runs the harness contracts, and syntax-checks (`bash -n`) and lints
 installed (`brew install shellcheck` on macOS, `sudo apt-get install -y
 shellcheck` on Debian/Ubuntu); the full gate also needs the recursive submodule,
 a working Cargo toolchain, and `jq`/`shasum`/`python3` (the boot-free
-released-image controls), while `bash script/test/ci-contracts.sh --guard-only`
-runs just the shell guard and needs none of those.
+released-image controls).
+
+`--guard-only` is not the gate. It runs the shell guard rail alone — no
+provenance, no contracts, and **no mutation-anchor check** (`egress-mutations.py
+--check-anchors`) — so it is green on trees where CI's `contracts` job is red.
+It exists as a test seam for the guard's own tests; use it only when the
+submodule is absent and you know the rest of the gate is not what you are
+checking. Anything destined for `main` runs the whole script.
 
 ### Verifying contracts locally (optional)
 
