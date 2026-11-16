@@ -1081,11 +1081,9 @@ def matrix():
         rust("access_cmd::tests::older_runtime_without_policy_update_yields_next_launch_grant_and_never_fails"))
     add("session-allowance-writes-store", apply_rs,
         """            Ok(revision) => {
-                if scope == GrantScope::Project {
-                    match record.record(&destination, now_ms).await {""",
+                if scope == GrantScope::Project {""",
         """            Ok(revision) => {
-                if true {
-                    match record.record(&destination, now_ms).await {""",
+                if true {""",
         rust("access_cmd::tests::session_allowance_never_touches_disk_or_another_project"))
     add("applied-coverage-at-or-before-refusal", allowances_rs,
         """                let Some(revision) = item.revision else {
@@ -1138,12 +1136,12 @@ def matrix():
                 },""",
         rust("allowances::tests::project_grant_over_a_queued_session_entry_records_before_claiming_it"))
     add("retry-demotion-forgotten", apply_rs,
-        """                        if item.destination() == destination {
-                            item.not_recorded_error = Some(message.clone());
-                        }""",
-        """                        if item.destination() == destination {
-                            item.not_recorded_error = None;
-                        }""",
+        """            if item.destination() == destination {
+                item.not_recorded_error = Some(message.to_owned());
+            }""",
+        """            if item.destination() == destination {
+                item.not_recorded_error = None;
+            }""",
         rust("allowances::tests::project_grant_over_a_session_entry_keeps_the_demotion_on_the_entry"))
     add("live-swap-while-boot-queue-pending", apply_rs,
         """        let updater = if queued_for_boot { None } else { updater };""",
