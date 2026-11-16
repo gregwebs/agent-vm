@@ -1325,6 +1325,93 @@ fn egress_reports_a_pre_v3_launcher_as_not_available() {
     );
 }
 
+/// `access egress` against a running session whose launcher answers `egress`
+/// with `answer`.
+fn egress_against(answer: &str) -> Output {
+    let root = tempfile::tempdir().unwrap();
+    let (home, _authority) = home_with_authority_dir(root.path());
+    let state = root.path().join("state");
+    let project = root.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let now = now_ms();
+    let dir = sessions_dir(&state, &project);
+    write_session_log(&dir, &session_line(SESSION_ID, now, true, false));
+    let mut answers = replies(now, true, false, "", "");
+    answers.egress = answer.to_owned();
+    let fake = FakeSession::start(&dir, SESSION_ID, answers);
+    let out = run(&home, &state, &project, &["access", "egress"]);
+    drop(fake);
+    out
+}
+
+/// #640: a launcher that speaks only versions above this build's is reported as
+/// *newer* — relaunching it with this agent-vm would reproduce nothing.
+#[test]
+fn egress_reports_a_newer_launcher_as_not_available() {
+    let out = egress_against(
+        "{\"reply\":\"error\",\"v\":2,\"code\":\"unsupported-version\",\"supported\":[4,5]}",
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(stdout(&out), "");
+    let text = stderr(&out);
+    assert!(
+        text.contains(&format!(
+            "effective egress is not available for session {SESSION_ID} (running): its launcher is newer than this agent-vm; update this agent-vm to read it"
+        )),
+        "{text}"
+    );
+    assert_eq!(text.lines().count(), 1, "one line: {text}");
+}
+
+/// #640: a reply with no `supported` list is the pre-v3 shape. It is never read
+/// as a newer launcher.
+#[test]
+fn egress_reports_a_launcher_without_a_supported_list_as_pre_v3() {
+    let out = egress_against("{\"reply\":\"error\",\"v\":2,\"code\":\"unsupported-version\"}");
+    assert_eq!(out.status.code(), Some(1));
+    let text = stderr(&out);
+    assert!(text.contains("predates `access egress`"), "{text}");
+    assert!(!text.contains("newer"), "{text}");
+}
+
+/// #639: an oversized reply is refused, and nothing of it reaches the terminal.
+#[test]
+fn egress_reports_an_oversized_reply_without_its_content() {
+    let marker = "OVERSIZED-MARKER";
+    let answer = format!(
+        "{{\"reply\":\"egress\",\"v\":3,\"echo\":\"{marker}\",\"pad\":\"{}\"}}",
+        "x".repeat(1024 * 1024)
+    );
+    let out = egress_against(&answer);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(stdout(&out), "");
+    let text = stderr(&out);
+    assert!(text.contains("larger than"), "{text}");
+    assert!(!text.contains(marker), "the reply is not echoed: {text}");
+    assert_eq!(text.lines().count(), 1, "one line: {text}");
+}
+
+/// #639: the reply is no longer quoted, but serde's own message can still echo a
+/// token from it — an unknown `reply` tag is printed verbatim — so the single
+/// escaping site in `egress.rs` still has work to do, and a control byte in that
+/// tag must not reach the terminal as itself.
+#[test]
+fn egress_escapes_the_token_serde_echoes() {
+    let out = egress_against(
+        // The reply carries a JSON escape, so the tag serde echoes holds a real ESC.
+        "{\"reply\":\"\\u001b[31mfrom-the-future\",\"v\":3}",
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let text = stderr(&out);
+    assert!(
+        text.contains("its launcher answered in a form this agent-vm cannot read"),
+        "{text}"
+    );
+    assert!(!text.contains('\u{1b}'), "a raw ESC byte: {text:?}");
+    assert!(text.contains("\\x1b"), "{text}");
+    assert_eq!(text.lines().count(), 1, "one line: {text}");
+}
+
 /// AC4: a session with no control socket is reported, not guessed at.
 #[test]
 fn egress_reports_a_socketless_session_as_not_available() {

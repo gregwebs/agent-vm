@@ -4405,14 +4405,16 @@ allow-list.
 | `--session` not an 8-hex ID | the argument error | `1` |
 | `--session` names nothing known | the unknown-session error | `1` |
 | The session has ended | it is not running; effective egress exists only while a session runs | `1` |
-| The session has no control socket, is not responding, or its launcher predates `access egress` | one line saying why it is unavailable | `1` |
+| The session has no control socket, is not responding, its launcher predates `access egress`, or its launcher is newer than this agent-vm | one line saying why it is unavailable | `1` |
 | Inside the guest | one line saying to run it on the host | `1` |
 
 **Memory only.** The launcher answers from memory over protocol v3 of the session
 control socket; nothing new is written to disk, here or anywhere (see
 [ADR-0066](docs/adr/0066-live-egress-allowances-and-writer.md)). A session
 started by an older agent-vm reports that its launcher predates `access egress`
-until it is relaunched with this build.
+until it is relaunched with this build; a launcher that speaks only versions
+above this build's is reported as newer, and then this agent-vm is the one to
+update.
 
 ## Ports & egress
 

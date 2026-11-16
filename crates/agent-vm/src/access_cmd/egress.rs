@@ -147,6 +147,10 @@ pub(super) async fn run_egress(
                     "its launcher predates `access egress`; relaunch it with this agent-vm"
                         .to_owned()
                 }
+                Ok(EgressAnswer::NewerLauncher) => {
+                    "its launcher is newer than this agent-vm; update this agent-vm to read it"
+                        .to_owned()
+                }
                 Err(error) => escape(&format!("{error:#}")),
             },
             None => "it has no control socket".to_owned(),
