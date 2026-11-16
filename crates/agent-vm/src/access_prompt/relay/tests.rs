@@ -1730,7 +1730,6 @@ fn a_resize_to_a_tiny_terminal_closes_a_lingering_question() {
     assert_eq!(relay.phase_name(), "restoring");
     // A second takeover, this time answered with a grant, to reach Lingering.
     let released = quiet;
-    let mut relay = relay;
     while let Some(_item) = relay.take_outbound_if(|_| true) {}
     relay.written(g, released);
     relay.handle_deadline(released + RELEASE_GAP);
