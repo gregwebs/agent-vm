@@ -9,7 +9,7 @@ use std::path::Path;
 
 use super::*;
 use crate::refusal::log::SessionsDir;
-use crate::refusal::{EntryKey, GuestName, Kind, RefusalEntry, SessionInfo};
+use crate::refusal::{Destination, EntryKey, GuestName, Kind, RefusalEntry, SessionInfo};
 
 /// 2025-10-09T08:53:20Z.
 const NOW: i64 = 1_760_000_000_000;

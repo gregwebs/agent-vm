@@ -350,4 +350,5 @@ Environment:
   AGENT_VM_DEBUG_CONFIG                 dump the SandboxConfig JSON before boot
   AGENT_VM_NO_CHROME_MCP                disable Chrome MCP auto-configuration for Chrome-capable
   images
+  AGENT_VM_NO_ACCESS_PROMPT             don't ask about refusals in the terminal (1|true|yes|on)
   RUST_LOG                              tracing filter (e.g. agent_vm=debug)

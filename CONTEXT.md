@@ -1077,6 +1077,17 @@ authorizes anything.
 _Avoid_: "block" as a noun ("sandbox block"); "denial" for the non-network
 kinds.
 
+**Access prompt**: the launcher's in-terminal question about one **network
+denial**, shown only on a direct launch whose terminal the launcher relays. It
+holds the guest's terminal stream — output is kept back, keystrokes go to the
+question — and never pauses the VM. A key counts only after the typing guard
+(0.7 s without typing, single-byte reads, after the terminal confirmed the
+prompt). It answers through the same live grant as `agent-vm access allow`, and
+an answer given elsewhere first wins. See
+[ADR-0069](docs/adr/0069-in-terminal-access-prompt.md).
+
+_Avoid_: "block prompt"; "pausing the guest".
+
 **Refusal ID**: the 8-hex ID of one entry in the **project refusal log**,
 derived once from the session and the entry's key — the kind, the destination,
 and, for a credential refusal, the credential refused — and then stored, never

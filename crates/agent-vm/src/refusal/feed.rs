@@ -191,12 +191,108 @@ pub(crate) struct Hint {
     /// Where the line goes. Production is stderr; a test captures it, so the
     /// once-ness can be counted rather than inferred from a flag.
     sink: HintSink,
+    /// The PTY relay a not-yet-fired hint was redirected to (#501 slice 3 R26).
+    ///
+    /// Held and checked under the same lock `fire` uses, so the hint is delivered
+    /// to exactly one of the two surfaces: whichever of `redirect` and `fire` takes
+    /// this lock first decides, and the other observes it.
+    relay: Mutex<Option<Arc<RelayHint>>>,
 }
 
 enum HintSink {
     Stderr,
     #[cfg(test)]
     Capture(Arc<Mutex<Vec<String>>>),
+}
+
+/// The relay's end of a redirected hint.
+///
+/// A redirected hint is *owed* to the relay the moment it fires, and *delivered*
+/// when the relay writes it; [`HintRelay::detach`] is the one other way out, so a
+/// hint still owed at session end goes to stderr exactly as it does today.
+struct RelayHint {
+    fired: AtomicBool,
+    written: AtomicBool,
+    notified: tokio::sync::Notify,
+}
+
+impl RelayHint {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            fired: AtomicBool::new(false),
+            written: AtomicBool::new(false),
+            notified: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn owe(&self) {
+        self.fired.store(true, Ordering::SeqCst);
+        // `notify_waiters` wakes only registered waiters; `fired` re-checks the
+        // flag first, so a waiter that was not yet registered when this ran still
+        // sees the hint on its next poll.
+        self.notified.notify_waiters();
+    }
+}
+
+/// The relay's handle on a hint routed to it. By value, so the route has to be
+/// detached (or the hint delivered) before the handle is dropped.
+#[derive(Clone)]
+pub(crate) struct HintRelay {
+    hint: Arc<Hint>,
+    relay: Arc<RelayHint>,
+}
+
+impl HintRelay {
+    /// Today's bytes for a terminal: `\r`, the line, `\r\n`. Written by the
+    /// relay's own writer, so it can never land inside a guest or prompt sequence.
+    pub(crate) const BYTES: &'static [u8] = {
+        // `HINT` is ASCII, so its length is its byte count.
+        const _: () = assert!(HINT.is_ascii());
+        b"\r==> The sandbox refused a guest network request; run `agent-vm access` to see refusals (shown once per session)\r\n"
+    };
+
+    /// Resolves once, when the hint fires to this relay. Cancel-safe: the flag is
+    /// checked before every wait, so a missed wakeup only costs one poll.
+    ///
+    /// It parks for good once the hint has been written: the flag stays set for the
+    /// session's lifetime, and a wait that returned for ever would keep its
+    /// `select!` branch ready for ever (finding 5).
+    pub(crate) async fn fired(&self) {
+        loop {
+            if self.relay.written.load(Ordering::SeqCst) {
+                return std::future::pending().await;
+            }
+            if self.relay.fired.load(Ordering::SeqCst) {
+                return;
+            }
+            self.relay.notified.notified().await;
+        }
+    }
+
+    /// Take the hint if it is owed and not yet written: `true` means `BYTES` must
+    /// be written exactly once.
+    pub(crate) fn take(&self) -> bool {
+        self.relay.fired.load(Ordering::SeqCst) && !self.relay.written.swap(true, Ordering::SeqCst)
+    }
+
+    /// Give the hint back to stderr. Returns whether a hint fired but was never
+    /// written, which the session epilogue must then print as it does today.
+    pub(crate) fn detach(self) -> bool {
+        {
+            let mut route = self
+                .hint
+                .relay
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if route
+                .as_ref()
+                .is_some_and(|relay| Arc::ptr_eq(relay, &self.relay))
+            {
+                *route = None;
+            }
+        }
+        self.relay.fired.load(Ordering::SeqCst) && !self.relay.written.load(Ordering::SeqCst)
+    }
 }
 
 /// The hint's text. No guest text, because a name the guest chose must never be
@@ -214,6 +310,7 @@ impl Hint {
         Self {
             fired: AtomicBool::new(false),
             sink: HintSink::Stderr,
+            relay: Mutex::new(None),
         }
     }
 
@@ -225,28 +322,52 @@ impl Hint {
             Self {
                 fired: AtomicBool::new(false),
                 sink: HintSink::Capture(Arc::clone(&lines)),
+                relay: Mutex::new(None),
             },
             lines,
         )
     }
 
+    /// Route a not-yet-fired hint to the PTY relay (#501 slice 3 R26).
+    ///
+    /// A hint that already fired stays where it went: stderr. Taking the route
+    /// lock before deciding is what makes "exactly one surface" true rather than
+    /// likely — `fire` decides under the same lock.
+    pub(crate) fn redirect(self: &Arc<Self>) -> HintRelay {
+        let mut route = self
+            .relay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let relay = RelayHint::new();
+        if !self.fired.load(Ordering::SeqCst) {
+            *route = Some(Arc::clone(&relay));
+        }
+        HintRelay {
+            hint: Arc::clone(self),
+            relay,
+        }
+    }
+
     /// Deliver the hint at most once. Detached, so a stalled stderr delays no
     /// teardown; the delivery handle is dropped, so nothing waits for it either.
+    ///
+    /// The route lock is taken before the once-flag, so a hint firing while
+    /// `redirect` runs is either routed or printed, never both and never neither.
     fn fire(&self) {
+        let route = self
+            .relay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if self.fired.swap(true, Ordering::SeqCst) {
             return;
         }
+        if let Some(relay) = route.as_ref() {
+            relay.owe();
+            return;
+        }
+        drop(route);
         match &self.sink {
-            HintSink::Stderr => {
-                let line = if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
-                    // Framed so a line the guest is mid-way through cannot
-                    // swallow it.
-                    format!("\r{HINT}\r")
-                } else {
-                    HINT.to_owned()
-                };
-                drop(crate::launch_notice::LaunchNotices::to_stderr().emit_detached(line));
-            }
+            HintSink::Stderr => write_hint_to_stderr(),
             #[cfg(test)]
             HintSink::Capture(lines) => lines
                 .lock()
@@ -255,10 +376,30 @@ impl Hint {
         }
     }
 
+    /// Fire as the follower would, for a test that drives the relay directly.
+    #[cfg(test)]
+    pub(crate) fn fire_for_test(&self) {
+        self.fire();
+    }
+
     #[cfg(test)]
     fn fired(&self) -> bool {
         self.fired.load(Ordering::SeqCst)
     }
+}
+
+/// The hint, on stderr, in today's bytes.
+///
+/// One function for both stderr paths: the ordinary one and the epilogue's, when a
+/// redirected hint was still owed at session end. Framed on a terminal so a line
+/// the guest is mid-way through cannot swallow it.
+pub(crate) fn write_hint_to_stderr() {
+    let line = if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        format!("\r{HINT}\r")
+    } else {
+        HINT.to_owned()
+    };
+    drop(crate::launch_notice::LaunchNotices::to_stderr().emit_detached(line));
 }
 
 /// The following stream's options: the refusal log source, from the start, live.
