@@ -32,19 +32,26 @@ use crate::refusal::log::SessionsDir;
 use crate::refusal::{SessionId, SessionInfo, SessionRefusals, SessionSnapshot, Update};
 use crate::session::ProjectSession;
 
-/// Protocol version this build *prefers*. Additive changes keep it; a client
-/// that asks for another version gets `unsupported-version` and the list of
-/// versions this build speaks.
+/// The version this build's mutations and `allowances` ask for, and the `v` on
+/// every error reply. Deliberately **not** bumped by `egress` (#631): a CLI
+/// upgraded while a launcher of the previous build runs must still be able to
+/// allow and revoke, and that session outlives the upgrade.
 pub(crate) const PROTOCOL_VERSION: u32 = 2;
 /// The version this build's **read** calls ask for: `list` and `subscribe` only,
 /// with `v: 1` replies, so an older server sees byte-identical requests (AC10).
 ///
-/// Named for the client's side on purpose: `PROTOCOL_VERSION` is what this build
-/// *prefers* and what a mutation uses, and `SUPPORTED_VERSIONS` is what it
-/// serves — three questions, three names (C-m9).
+/// Named for the client's side on purpose: `PROTOCOL_VERSION` is what a mutation
+/// and `allowances` use, `EGRESS_VERSION` is what `egress` uses, and
+/// `SUPPORTED_VERSIONS` is what this build serves — four questions, four names
+/// (C-m9).
 pub(crate) const CLIENT_READ_VERSION: u32 = 1;
-/// Every version this build serves. `v: 2` adds `grant`, `revoke`, `allowances`.
-const SUPPORTED_VERSIONS: &[u32] = &[1, 2];
+/// The only request a client sends at this version. A launcher that predates it
+/// answers `unsupported-version`, which is how `access egress` reports a session
+/// it cannot ask.
+pub(crate) const EGRESS_VERSION: u32 = 3;
+/// Every version this build serves. `v: 2` adds `grant`, `revoke`, `allowances`;
+/// `v: 3` adds `egress`.
+const SUPPORTED_VERSIONS: &[u32] = &[1, 2, 3];
 
 /// A request is one short JSON line. Anything longer is not a request.
 const MAX_REQUEST_BYTES: usize = 4 * 1024;
@@ -114,6 +121,9 @@ pub(crate) struct LiveSession {
     running: Mutex<Option<Running>>,
     following: Mutex<Option<Following>>,
     finished: AtomicBool,
+    /// What narrows this session's egress, recorded once the credential plan
+    /// exists (#631). Empty until then, and the header says `(starting)`.
+    narrowing: Arc<std::sync::OnceLock<crate::effective_egress::EgressNarrowing>>,
 }
 
 /// What a bound socket needs to be served and then closed.
@@ -229,10 +239,13 @@ impl LiveSession {
         let listening = LiveRefusals::new(SessionRefusals::resume(reserved.snapshot.clone()));
         let persister = Persister::new(dir.clone());
         let (stop, receiver) = watch::channel(false);
+        let narrowing: Arc<std::sync::OnceLock<crate::effective_egress::EgressNarrowing>> =
+            Arc::default();
         let task = tokio::spawn(serve(
             listener,
             Arc::clone(&listening),
             Arc::clone(&allowances),
+            Arc::clone(&narrowing),
             receiver,
         ));
         Self {
@@ -249,6 +262,7 @@ impl LiveSession {
             })),
             following: Mutex::new(None),
             finished: AtomicBool::new(false),
+            narrowing,
         }
     }
 
@@ -263,6 +277,7 @@ impl LiveSession {
             running: Mutex::new(None),
             following: Mutex::new(None),
             finished: AtomicBool::new(false),
+            narrowing: Arc::default(),
         }
     }
 
@@ -287,6 +302,7 @@ impl LiveSession {
             running: Mutex::new(None),
             following: Mutex::new(None),
             finished: AtomicBool::new(false),
+            narrowing: Arc::default(),
         }
     }
 
@@ -312,6 +328,13 @@ impl LiveSession {
     ) -> Vec<String> {
         self.allowances
             .adopt_boot_allowances(recorded, adopted, plan)
+    }
+
+    /// Record what narrows this session's egress, once its credential plan
+    /// exists (#631). Set once: the credential plan is built once per launch.
+    pub(crate) fn record_narrowing(&self, narrowing: crate::effective_egress::EgressNarrowing) {
+        let first = self.narrowing.set(narrowing).is_ok();
+        debug_assert!(first, "a launch records its narrowing once");
     }
 
     /// This session's live allowance controller (the tests' view of it).
@@ -632,6 +655,11 @@ pub(crate) enum Reply {
         v: u32,
         allowances: crate::allowances::SessionAllowancesSnapshot,
     },
+    /// An `egress` answer (`v: 3`): this session's effective egress.
+    Egress {
+        v: u32,
+        egress: crate::effective_egress::EffectiveEgress,
+    },
     /// A request this server cannot answer.
     Error {
         v: u32,
@@ -665,6 +693,7 @@ async fn serve(
     listener: UnixListener,
     live: Arc<LiveRefusals>,
     allowances: Arc<crate::allowances::LiveAllowances>,
+    narrowing: Arc<std::sync::OnceLock<crate::effective_egress::EgressNarrowing>>,
     mut stop: watch::Receiver<bool>,
 ) {
     let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
@@ -690,6 +719,7 @@ async fn serve(
                 };
                 let live = Arc::clone(&live);
                 let allowances = Arc::clone(&allowances);
+                let narrowing = Arc::clone(&narrowing);
                 let subscribers = Arc::clone(&subscribers);
                 // The session's stop signal reaches the connection, so a
                 // subscriber waiting in `updates.recv()` learns the session ended
@@ -699,7 +729,7 @@ async fn serve(
                 let stop = stop.clone();
                 tasks.spawn(async move {
                     let _permit = permit;
-                    handle_connection(stream, live, allowances, subscribers, stop).await;
+                    handle_connection(stream, live, allowances, narrowing, subscribers, stop).await;
                 });
             }
             // Reap finished connections so the set does not grow forever.
@@ -723,6 +753,7 @@ async fn handle_connection(
     stream: UnixStream,
     live: Arc<LiveRefusals>,
     allowances: Arc<crate::allowances::LiveAllowances>,
+    narrowing: Arc<std::sync::OnceLock<crate::effective_egress::EgressNarrowing>>,
     subscribers: Arc<Semaphore>,
     mut stop: watch::Receiver<bool>,
 ) {
@@ -775,26 +806,27 @@ async fn handle_connection(
         return;
     }
     match (version, request.op.as_str()) {
-        (1 | 2, "list") => {
+        (1..=3, "list") => {
             let reply = Reply::Session {
                 v: version,
                 session: live.snapshot(),
             };
             let _ = write_reply(&mut writer, &reply).await;
         }
-        (1 | 2, "subscribe") => {
+        (1..=3, "subscribe") => {
             let Ok(_slot) = Arc::clone(&subscribers).try_acquire_owned() else {
                 let _ = write_reply(&mut writer, &error("too-many-subscribers")).await;
                 return;
             };
             subscribe_connection(&mut writer, &live, version, &mut stop).await;
         }
-        // `v: 2` operations are not part of `v: 1`: a v1 request for one is a
-        // request this version cannot answer, not a mutation to guess at.
-        (1, "grant" | "revoke" | "allowances") => {
+        // An operation is part of the version that introduced it and of every
+        // later one, so `v: 1` cannot reach a `v: 2` operation and `v: 2` cannot
+        // reach the `v: 3` one.
+        (1, "grant" | "revoke" | "allowances" | "egress") | (2, "egress") => {
             let _ = write_reply(&mut writer, &error("bad-request")).await;
         }
-        (2, "grant") => {
+        (2 | 3, "grant") => {
             let scope = match request.scope.as_deref() {
                 None | Some("session") => crate::allowances::GrantScope::Session,
                 Some("project") => crate::allowances::GrantScope::Project,
@@ -814,7 +846,7 @@ async fn handle_connection(
                 .await;
             let _ = write_reply(&mut writer, &Reply::Grant { v: version, result }).await;
         }
-        (2, "revoke") => {
+        (2 | 3, "revoke") => {
             let scope = match request.scope.as_deref() {
                 None | Some("all") => crate::allowances::RevokeScope::All,
                 Some("session") => crate::allowances::RevokeScope::Session,
@@ -835,10 +867,20 @@ async fn handle_connection(
             let result = allowances.revoke(&destination, scope).await;
             let _ = write_reply(&mut writer, &Reply::Revoke { v: version, result }).await;
         }
-        (2, "allowances") => {
+        (2 | 3, "allowances") => {
             let reply = Reply::Allowances {
                 v: version,
                 allowances: allowances.snapshot(),
+            };
+            let _ = write_reply(&mut writer, &reply).await;
+        }
+        (3, "egress") => {
+            // Computed per request from memory: session allowances are never
+            // written down (ADR-0066).
+            let narrowing = narrowing.get().cloned().unwrap_or_default();
+            let reply = Reply::Egress {
+                v: version,
+                egress: allowances.effective_egress(narrowing),
             };
             let _ = write_reply(&mut writer, &reply).await;
         }
@@ -1009,7 +1051,7 @@ async fn list(path: &Path) -> Result<SessionSnapshot> {
     }
 }
 
-/// Send one `v: 2` request and read its one reply.
+/// Send one request and read its one reply.
 ///
 /// The deadline is [`MUTATION_TIMEOUT`] for a mutation and [`EXCHANGE_TIMEOUT`]
 /// for a read: a mutation that times out on the client while the runtime is still
@@ -1096,6 +1138,29 @@ pub(crate) async fn allowances(
         Reply::Allowances { allowances, .. } => Ok(allowances),
         other => Err(anyhow::anyhow!(
             "{} answered {} instead of its allowances",
+            crate::one_line::path(path),
+            format_args!("{other:?}")
+        )),
+    }
+}
+
+/// What a session answered to `egress`.
+pub(crate) enum EgressAnswer {
+    Egress(crate::effective_egress::EffectiveEgress),
+    /// The launcher speaks no `v: 3`: it predates `access egress`.
+    PredatesEgress,
+}
+
+/// Ask one session for its effective egress.
+pub(crate) async fn egress(path: &Path) -> Result<EgressAnswer> {
+    let request = serde_json::json!({"v": EGRESS_VERSION, "op": "egress"});
+    match exchange(path, request, EXCHANGE_TIMEOUT).await? {
+        Reply::Egress { egress, .. } => Ok(EgressAnswer::Egress(egress)),
+        Reply::Error { code, .. } if code == "unsupported-version" => {
+            Ok(EgressAnswer::PredatesEgress)
+        }
+        other => Err(anyhow::anyhow!(
+            "{} answered {} instead of its effective egress",
             crate::one_line::path(path),
             format_args!("{other:?}")
         )),

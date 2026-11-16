@@ -21,6 +21,7 @@ mod direct_pty;
 mod direct_terminal;
 mod dns_name;
 mod doctor;
+mod effective_egress;
 mod egress_grammar;
 mod egress_hostname;
 mod egress_policy;

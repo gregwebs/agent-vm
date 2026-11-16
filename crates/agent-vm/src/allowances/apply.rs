@@ -393,8 +393,15 @@ impl State {
 
 /// The live allowance controller one session owns behind an `Arc`.
 pub(crate) struct LiveAllowances {
-    /// Serializes every mutation and the boot flush, so two grants cannot derive
-    /// from the same plan and commit out of order (first writer wins).
+    /// Serializes this launcher's own `grant`, `revoke` and boot flush, so two
+    /// of them cannot derive from the same plan and commit out of order (first
+    /// writer wins).
+    ///
+    /// It does not serialize the project record: `access revoke` deletes that in
+    /// its own process before it asks the launcher to revoke
+    /// (`access_cmd::run_revoke`), so a grant holding this lock can write the
+    /// record after such a delete. That cross-process window predates #631 and is
+    /// not fixed here.
     op_lock: AsyncMutex<()>,
     state: Mutex<State>,
 }
@@ -720,21 +727,24 @@ impl LiveAllowances {
         match updater(policy.clone()).await {
             Ok(revision) => {
                 if scope == GrantScope::Project {
+                    // In force before the record: the runtime has confirmed the
+                    // entry, so `access egress` must answer with it while the
+                    // lock-protected write runs. It stays in the session table
+                    // until a record exists, which is the honest scope R9/AC13
+                    // allows.
+                    self.commit_grant(
+                        GrantScope::Session,
+                        ActiveEntry::confirmed(
+                            SessionAllowance::new(destination.clone(), now_ms),
+                            revision,
+                            None,
+                        ),
+                        next_plan,
+                        policy,
+                    );
                     match record.record(&destination, now_ms).await {
                         Ok(outcome) => {
-                            self.commit_grant(
-                                GrantScope::Project,
-                                ActiveEntry::confirmed(
-                                    SessionAllowance::new(
-                                        destination.clone(),
-                                        outcome.recorded_ms(),
-                                    ),
-                                    revision,
-                                    None,
-                                ),
-                                next_plan,
-                                policy,
-                            );
+                            self.promote_to_project(&destination, outcome.recorded_ms(), revision);
                             GrantResult::Applied {
                                 destination: destination.to_string(),
                                 scope: GrantScope::Project,
@@ -743,18 +753,9 @@ impl LiveAllowances {
                             }
                         }
                         Err(message) => {
-                            // Demote to session scope: the sandbox has it, the
-                            // project does not, and every later render must say so.
-                            self.commit_grant(
-                                GrantScope::Session,
-                                ActiveEntry::confirmed(
-                                    SessionAllowance::new(destination.clone(), now_ms),
-                                    revision,
-                                    Some(message.clone()),
-                                ),
-                                next_plan,
-                                policy,
-                            );
+                            // Demote in place: the sandbox has it, the project
+                            // does not, and every later render must say so.
+                            self.mark_not_recorded(&destination, &message);
                             GrantResult::AppliedNotRecorded {
                                 destination: destination.to_string(),
                                 revision,
@@ -979,6 +980,69 @@ impl LiveAllowances {
         }
     }
 
+    /// This session's effective egress, for the socket's `egress` op (#631).
+    ///
+    /// Once the runtime is attached, applied rows are read from the plan it last
+    /// accepted, with the confirmed entries only, so a queued entry can never
+    /// widen an applied row; queued entries become their own rows, read from the
+    /// pending plan that holds them. Before `follow` attaches the runtime nothing
+    /// is in force, so every row is `queued`.
+    pub(crate) fn effective_egress(
+        &self,
+        narrowing: crate::effective_egress::EgressNarrowing,
+    ) -> crate::effective_egress::EffectiveEgress {
+        use crate::effective_egress::{EffectiveEgress, LiveEntry, LiveScope, RowStatus};
+        let state = lock(&self.state);
+        let attached = state.policy_revision.is_some();
+        // `Some(1)` is the boot-adopted project record, in force since boot; a
+        // live swap always confirms at two or more (`apply.rs` header).
+        let status = |revision: Option<u64>| match (attached, revision) {
+            (false, _) | (true, None) => RowStatus::Queued,
+            (true, Some(1)) => RowStatus::Applied,
+            (true, Some(revision)) => RowStatus::AppliedAt { revision },
+        };
+        let live: Vec<LiveEntry> = state
+            .session
+            .iter()
+            .map(|entry| (LiveScope::Session, entry))
+            .chain(
+                state
+                    .project
+                    .iter()
+                    .map(|entry| (LiveScope::Project, entry)),
+            )
+            .map(|(scope, entry)| LiveEntry {
+                allowance: entry.destination().clone(),
+                scope,
+                status: status(entry.revision),
+            })
+            .collect();
+        let (rows, dns) = if attached {
+            let (queued, confirmed): (Vec<LiveEntry>, Vec<LiveEntry>) = live
+                .into_iter()
+                .partition(|entry| entry.status == RowStatus::Queued);
+            let mut rows = state
+                .attached_plan
+                .egress_rows(&confirmed, RowStatus::Applied);
+            rows.extend(state.plan.live_egress_rows(&queued));
+            // Stable: each section keeps its applied rows' order, with the
+            // section's queued rows after them.
+            rows.sort_by_key(|row| row.destination.section());
+            (rows, state.attached_plan.dns_authorization())
+        } else {
+            (
+                state.plan.egress_rows(&live, RowStatus::Queued),
+                state.base_plan.dns_authorization(),
+            )
+        };
+        EffectiveEgress {
+            policy_revision: state.policy_revision,
+            rows,
+            dns,
+            narrowing,
+        }
+    }
+
     /// Answer a `grant` for a destination this session already holds.
     ///
     /// Two honesty rules live here. A queued entry is not in force, so it is
@@ -1123,14 +1187,7 @@ impl LiveAllowances {
                 // The demotion must outlive the reply: R9/AC13 require *every*
                 // later `access` / `access allowances` render to keep saying the
                 // session holds it and no record does (A-M02).
-                {
-                    let mut state = lock(&self.state);
-                    for item in state.session.iter_mut() {
-                        if item.destination() == destination {
-                            item.not_recorded_error = Some(message.clone());
-                        }
-                    }
-                }
+                self.mark_not_recorded(destination, &message);
                 GrantResult::AppliedNotRecorded {
                     destination: destination.to_string(),
                     revision,
@@ -1191,6 +1248,41 @@ impl LiveAllowances {
             state.policy_revision = revision;
         }
         state.queued_for_boot = state.any_queued();
+    }
+
+    /// Move a confirmed entry from the session table to the project table once
+    /// its record exists.
+    ///
+    /// The plan and policy need no re-derive: the session ∪ project union is
+    /// unchanged, so what the runtime holds is what it held a moment ago.
+    fn promote_to_project(&self, destination: &Allowance, recorded_ms: i64, revision: u64) {
+        let mut state = lock(&self.state);
+        state
+            .session
+            .retain(|item| item.destination() != destination);
+        if !state
+            .project
+            .iter()
+            .any(|item| item.destination() == destination)
+        {
+            state.project.push(ActiveEntry::confirmed(
+                SessionAllowance::new(destination.clone(), recorded_ms),
+                revision,
+                None,
+            ));
+        }
+        state.queued_for_boot = state.any_queued();
+    }
+
+    /// Keep an entry where it is and record why the project has no record of it,
+    /// so no later render claims one (R9/AC13).
+    fn mark_not_recorded(&self, destination: &Allowance, message: &str) {
+        let mut state = lock(&self.state);
+        for item in state.session.iter_mut() {
+            if item.destination() == destination {
+                item.not_recorded_error = Some(message.to_owned());
+            }
+        }
     }
 
     fn queue_grant(

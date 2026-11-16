@@ -833,6 +833,28 @@ impl LivePolicyPlan {
         self.egress.configured_contains(allowance)
     }
 
+    /// This plan's effective destinations, attributed (#631).
+    pub(crate) fn egress_rows(
+        &self,
+        live: &[crate::effective_egress::LiveEntry],
+        configured: crate::effective_egress::RowStatus,
+    ) -> Vec<crate::effective_egress::EgressRow> {
+        self.egress.effective_rows(live, configured)
+    }
+
+    /// Rows for `live` alone, read against this plan's intercepted ports.
+    pub(crate) fn live_egress_rows(
+        &self,
+        live: &[crate::effective_egress::LiveEntry],
+    ) -> Vec<crate::effective_egress::EgressRow> {
+        self.egress.live_rows(live)
+    }
+
+    /// Whether, and by what, this plan authorizes arbitrary-name DNS (#631).
+    pub(crate) fn dns_authorization(&self) -> crate::effective_egress::DnsAuthorization {
+        self.egress.dns_authorization()
+    }
+
     /// Derive the policy for one combined allowance set and the plan that
     /// produced it.
     ///
@@ -1264,9 +1286,8 @@ mod tests {
         assert!(requests.iter().all(|request| plan.covers(request)));
         let notices = notices_of(&plan);
         assert!(
-            notices.contains(
-                "==> Egress policy: allowing TLS to api.example.com on ports 443 (project allowance)"
-            ),
+            notices
+                .contains("==> Egress policy: allowing TLS to api.example.com (project allowance)"),
             "{notices}"
         );
     }

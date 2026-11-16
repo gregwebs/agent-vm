@@ -54,6 +54,7 @@ mod sets;
 use crate::config::{Tool, ToolOrigin, tool_name_rejection};
 use crate::config_authority::{AuthorizedConfig, ReferenceTrust, UntrustedConfig};
 use crate::egress_grammar::AllowanceError;
+use crate::egress_hostname::HostnameAllowance;
 use crate::egress_policy::Allowance;
 use crate::network_requests::NetworkRequests;
 use microsandbox_network::policy::DomainName;
@@ -174,6 +175,17 @@ impl fmt::Display for EgressReference {
         match &self.0 {
             Target::Tool(name) => write!(f, "tool:{name}"),
             Target::Set(name) => write!(f, "set:{}", name.as_str()),
+        }
+    }
+}
+
+impl EgressReference {
+    /// How a collapsed launch line names this reference: a set by its own
+    /// name, a tool with its `tool:` prefix (#631).
+    pub(crate) fn notice_label(&self) -> String {
+        match &self.0 {
+            Target::Tool(name) => format!("tool:{name}"),
+            Target::Set(name) => name.as_str().to_owned(),
         }
     }
 }
@@ -589,13 +601,47 @@ impl ResolvedAllowances {
         self.origin_matching(|candidate| candidate == allowance)
     }
 
-    /// How the allowance(s) for one hostname were reached. Unioned over every
-    /// allowance naming it, because one name may be granted bare and pinned to
-    /// several ports by different entries.
+    /// How the allowance(s) for one hostname were reached: the union of
+    /// [`Self::hostname_grants`], so the notice and a row view derive a name's
+    /// origins from one traversal.
     pub(crate) fn hostname_origin(&self, name: &DomainName) -> EntryOrigin<'_> {
-        self.origin_matching(
-            |candidate| matches!(candidate, Allowance::Hostname(h) if h.domain() == name),
-        )
+        let mut origin = EntryOrigin::default();
+        for (_, grant) in self.hostname_grants(name) {
+            origin.direct |= grant.direct;
+            for reference in grant.via {
+                if !origin.via.contains(&reference) {
+                    origin.via.push(reference);
+                }
+            }
+        }
+        origin
+    }
+
+    /// Each allowance naming `name`, with how this tier reached *that* allowance
+    /// — the per-allowance view `hostname_origin` unions (#631: a row's ports are
+    /// its own grants' ports, because one name may be granted bare and pinned to
+    /// several ports by different entries).
+    pub(crate) fn hostname_grants(
+        &self,
+        name: &DomainName,
+    ) -> Vec<(&HostnameAllowance, EntryOrigin<'_>)> {
+        self.entries
+            .iter()
+            .filter_map(|entry| match &entry.allowance {
+                Allowance::Hostname(hostname) if hostname.domain() == name => Some((
+                    hostname,
+                    EntryOrigin {
+                        direct: entry.direct,
+                        via: entry
+                            .via
+                            .iter()
+                            .map(|index| &self.references[*index].0)
+                            .collect(),
+                    },
+                )),
+                _ => None,
+            })
+            .collect()
     }
 
     fn origin_matching(&self, wanted: impl Fn(&Allowance) -> bool) -> EntryOrigin<'_> {

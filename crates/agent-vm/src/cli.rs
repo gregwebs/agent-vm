@@ -1662,6 +1662,8 @@ mod tests {
             ],
             vec!["agent-vm", "access", "--all", "revoke", "10.0.0.5"],
             vec!["agent-vm", "access", "--session", "abcdef01", "allowances"],
+            vec!["agent-vm", "access", "--all", "egress"],
+            vec!["agent-vm", "access", "--session", "abcdef01", "egress"],
         ] {
             let error = Cli::try_parse_from(argv.clone())
                 .err()
@@ -1687,6 +1689,8 @@ mod tests {
                 "abcdef01",
             ],
             vec!["agent-vm", "access", "allowances", "--session", "abcdef01"],
+            vec!["agent-vm", "access", "egress"],
+            vec!["agent-vm", "access", "egress", "--session", "abcdef01"],
         ] {
             assert!(Cli::try_parse_from(argv.clone()).is_ok(), "{argv:?}");
         }

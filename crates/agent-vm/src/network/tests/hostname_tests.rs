@@ -155,7 +155,7 @@ fn hostname_notice_variants_preserve_launch_order() {
         input.allow_internet_egress = Some(internet);
         input.allow_host = Some(host);
         let output = notice_output(input, |_| None);
-        let hostname = output.find("allowing TLS to build on ports 443").unwrap();
+        let hostname = output.find("allowing TLS to build\n").unwrap();
         let dns = output.find("==> Egress DNS:");
         assert_eq!(
             output.contains("arbitrary-name DNS queries authorized"),

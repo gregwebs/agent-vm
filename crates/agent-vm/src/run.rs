@@ -1605,6 +1605,10 @@ pub(crate) async fn launch(
         },
     )?;
 
+    // Before `apply_to` consumes it: what the credential overlay narrows, for
+    // `access egress` (#631).
+    live.record_narrowing(credential_plan.narrowing());
+
     builder = network_plan.apply_to(builder);
     builder = credential_plan.apply_to(builder)?;
 

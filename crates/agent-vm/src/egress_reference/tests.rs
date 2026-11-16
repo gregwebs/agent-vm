@@ -402,6 +402,14 @@ proptest! {
     }
 }
 
+/// #631: a collapsed notice line names a set by its own name and a tool with
+/// its `tool:` prefix, because `NAME (count)` must not read as an allowance.
+#[test]
+fn notice_labels_drop_only_the_set_prefix() {
+    assert_eq!(set_ref("anthropic").notice_label(), "anthropic");
+    assert_eq!(tool_ref("codex").notice_label(), "tool:codex");
+}
+
 /// A4, R3 and R4: which `set:` text is a reference, which name it holds, and
 /// what a `set:` scheme still is.
 #[test]
@@ -895,6 +903,34 @@ fn resolve_dedupes_and_attributes() {
             .entry_origin(&Allowance::parse("10.0.0.5").unwrap())
             .direct
     );
+}
+
+/// #631: a row's PORTS are its own grants' ports, so one hostname's allowances
+/// are visible one by one instead of unioned away.
+#[test]
+fn hostname_grants_keeps_each_grant_apart() {
+    let tools = user_tools(Path::new(USER_FILE), &[("x", &["a.example:8443"])]);
+    let resolved = resolve_ok(&["a.example", "tool:x"], Some(&tools));
+    let name: DomainName = "a.example".parse().unwrap();
+    let grants = resolved.hostname_grants(&name);
+    assert_eq!(
+        grants.len(),
+        2,
+        "a bare name and a pinned port are two grants"
+    );
+    let bare = grants
+        .iter()
+        .find(|(allowance, _)| allowance.to_string() == "a.example")
+        .expect("the literal entry is one grant");
+    assert!(bare.1.direct);
+    assert!(bare.1.via.is_empty());
+    let pinned = grants
+        .iter()
+        .find(|(allowance, _)| allowance.to_string() == "tcp://a.example:8443")
+        .expect("the reference expansion is the other");
+    assert!(!pinned.1.direct);
+    assert_eq!(pinned.1.via.len(), 1);
+    assert_eq!(pinned.1.via[0].to_string(), "tool:x");
 }
 
 /// A32 (the tool half) and A45: a repeated reference is applied once, and the

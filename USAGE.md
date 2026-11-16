@@ -4255,6 +4255,94 @@ named part of the feature. Precisely what happens:
 | The runtime's own log cannot be read for a while | The session's rows stay listed and gain `some refusals were missed (count unknown)`; a late record is never counted twice. |
 | A write evicts sessions to stay in bounds | A footer counts the sessions whose records are **gone**. A live session that is evicted is written back by its owner and is not counted. |
 
+## Seeing what a session may reach
+
+One session's **effective egress** is what its guest may reach *right now*: the
+authority the launch configured, the project allowances the runtime has applied,
+and the session allowances it holds, as of the runtime's latest confirmed policy
+revision. An allowance that is recorded for the project but not yet applied to
+this session is not effective egress, and credential rules and GitHub repository
+rules only ever narrow it.
+
+`agent-vm access allowances` shows the allowances; `agent-vm access egress` shows
+what they add up to. The answer comes from the running launcher over the
+session's control socket, so there is nothing to read when no session runs.
+
+```bash
+agent-vm access egress                  # the one running session in this project
+agent-vm access egress --session 3f9a12c4
+```
+
+```text
+Session 3f9a12c4 (policy rev 2)
+DESTINATION          PORTS    VIA            SOURCE                   STATUS
+api.anthropic.com    443      set:anthropic  persisted grant          applied
+platform.claude.com  443      set:anthropic  persisted grant          applied
+crates.io            443      set:rust       persisted grant          applied
+api.github.com       443      -              persisted grant          applied
+203.0.113.10/32      tcp:443  -              session allowance        applied (rev 2)
+internet (public)    all      -              --allow-internet-egress  applied
+DNS: any name, via --allow-internet-egress
+Narrowed by: credential rules; GitHub repos gregwebs/agent-vm
+```
+
+**`VIA`** is the egress reference that granted the row, as you wrote it
+(`set:NAME`, `tool:NAME`), or `-` when an entry granted it directly. A nested set
+counts toward the reference you wrote.
+
+**`SOURCE`** is one of `persisted grant` (your `[network]` table, or a group it
+enables), `--allow-egress`, `--allow-internet-egress` / `--allow-lan` /
+`--allow-host`, `project allowance`, `session allowance`.
+
+**`STATUS`** is `applied`; `applied (rev N)` for an allowance a live policy swap
+confirmed at revision `N` (boot is revision 1, so a swapped allowance is 2 or
+more); or `queued` for one accepted before the runtime confirmed it. While the
+header says `(starting)` the runtime is not attached yet and every row is
+`queued`.
+
+**Rows are per source and per destination.** A destination granted by two sources
+gets two rows — revoking the session allowance removes only its own row. Live
+allowances naming one hostname are grouped by confirmation state, never across it:
+`tcp://a.example:443` applied at revision 2 and `tcp://a.example:8443` applied at
+revision 3 are two rows, as are an applied and a queued entry for one name.
+
+**Row order** is hostnames first — rows with a `VIA` grouped by reference in the
+order you wrote them, then the names granted directly — then addresses, then the
+destination groups `internet (public)`, `lan (private)`, `host (loopback)`. A
+disabled group gets no row. **A queued row never widens an applied one**: its
+ports are its own grants' ports.
+
+**Nothing allowed** prints the header and one sentence, and nothing else:
+
+```text
+Session 3f9a12c4 (policy rev 2)
+All guest egress denied.
+```
+
+**The `DNS:` line** repeats the launch's own DNS decision — `DNS: any name, via
+<the grants that authorize it>`, `DNS: allowed hostnames only`, or `DNS: denied`.
+**`Narrowed by:`** appears only when something narrows this session without
+adding to it: `credential rules` when a credential overlay is registered, and
+`GitHub repos <owner/repo, …>` when the GitHub hook was given a repository
+allow-list.
+
+| Situation | What you get | Exit |
+|---|---|---|
+| Exactly one running session | the table | `0` |
+| No session in this project | one line pointing at `agent-vm access allowances` | `0` |
+| More than one | a usage error naming them; pick one with `--session <ID>` | `2` |
+| `--session` not an 8-hex ID | the argument error | `1` |
+| `--session` names nothing known | the unknown-session error | `1` |
+| The session has ended | it is not running; effective egress exists only while a session runs | `1` |
+| The session has no control socket, is not responding, or its launcher predates `access egress` | one line saying why it is unavailable | `1` |
+| Inside the guest | one line saying to run it on the host | `1` |
+
+**Memory only.** The launcher answers from memory over protocol v3 of the session
+control socket; nothing new is written to disk, here or anywhere (see
+[ADR-0066](docs/adr/0066-live-egress-allowances-and-writer.md)). A session
+started by an older agent-vm reports that its launcher predates `access egress`
+until it is relaunched with this build.
+
 ## Ports & egress
 
 ### Project allowances (the record)
@@ -4328,7 +4416,9 @@ allowance, says so, and exits `0`. `agent-vm access allowances` lists both the
 record and every live session's allowances: a `SCOPE DESTINATION RECORDED SESSION
 STATUS` table with one row per (project allowance, active session), `SESSION = -`
 when no session is live, and a STATUS cell that names a session it could not ask.
-It never revokes and never exits `1` except for an unparsable `--session`.
+It never revokes and never exits `1` except for an unparsable `--session`. For
+everything a session may reach — the configured authority as well as these
+allowances — see [Seeing what a session may reach](#seeing-what-a-session-may-reach).
 
 **One record, one grant, one project.** `project` is the full SHA-256 of the
 project's canonical path; `path` is that path and must hash to `project`, or the
@@ -4343,7 +4433,7 @@ policy computation as a flag, and the launch says so:
 ```text
 ==> Egress authority: 2 project allowance(s) from "/Users/u/.config/agent-vm/allowances.json"
 ==> Egress policy: allowing tcp://[203.0.113.10/32]:443 (project allowance)
-==> Egress policy: allowing TLS to api.example.com on ports 443 (project allowance)
+==> Egress policy: allowing TLS to api.example.com (project allowance)
 ```
 
 The recorded set is replaced whole on every launch; nothing accumulates. A
@@ -4579,20 +4669,28 @@ globally, not plain HTTP. Credential-only ports never widen a hostname rule.
 Ports 53 and 853 (the DNS dispatch ports) and `udp://HOST` are refused; UDP can
 only be allowed by an explicit IP/CIDR permission.
 
-**Startup notices group names.** Names whose complete effective port set and
-grant source are identical share one line, in first-seen order:
+**Startup notices collapse names.** One line per (effective port set, set of
+sources), in first-seen order. Each egress reference on the line becomes
+`NAME (count)` — a `set:` by its own name, a `tool:` with its prefix kept — where
+the count is how many distinct names on that line the reference granted. Names no
+reference granted are listed up to three and counted past that. So a launch with
+three references and seven other names prints:
 
 ```text
-==> Egress policy: allowing TLS to api.example.com, api.anthropic.com on ports 443 (persisted grants)
+==> Egress policy: allowing TLS to anthropic (2), openai (3), rust (3), and 7 other hosts
+==> list: agent-vm access egress
 ```
 
-The source tag names the sources that list the hostname, not proof that each one
-grants every displayed port: a persisted bare name plus a CLI `tcp://NAME:PORT`
-for the same name is one `(persisted grants and --allow-egress)` line on the
-union of ports. A launch without a persisted `[network]` table prints no tag at
-all, unless it uses an egress reference. See
+`on ports …` appears only when a port other than 443 is intercepted, and then on
+every hostname line. The tag names the sources that granted the line, joined
+` and `; a line whose only source is your persisted `[network]` table carries no
+tag, and a launch with no sources at all still prints none. `==> list: agent-vm
+access egress` appears once, directly after the hostname lines, only when a line
+hid a name. Address, group, proxy, override and DNS lines are unchanged. See
 [Persisted grants](#persisted-grants-user-config) and
-[Egress references](#egress-references-user-tools).
+[Egress references](#egress-references-user-tools), and
+[Seeing what a session may reach](#seeing-what-a-session-may-reach) for the full
+table behind the pointer.
 
 **Private answers need an extra grant.** A hostname resolving to a private or
 reserved address is not admitted by the hostname rule alone; add `--allow-lan`,
@@ -4711,29 +4809,54 @@ Rules:
 - A project `[network]` table is refused whatever it contains, so `tool:` there
   gains nothing.
 
-Notices name the tier and the reference. A name granted by a reference with no
-literal spelling of its own:
+Notices collapse the reference to `tool:NAME (count)` and name the tier in the
+tag. A name granted by a reference with no literal spelling of its own counts
+under that reference. With `[network] allow_egress = ["tool:fetcher"]` and
+`tool:fetcher` requesting `api.example.com:443` and `git.example.com:8443` (so
+8443 is intercepted), the launch says:
 
 ```text
-==> Egress policy: allowing TLS to api.example.com on ports 443 (persisted grants via tool:fetcher)
-==> Egress policy: allowing TLS to api.example.com on ports 443 (--allow-egress via tool:fetcher)
+==> Egress policy: allowing TLS to tool:fetcher (1) on ports 443
+==> Egress policy: allowing TLS to tool:fetcher (1) on ports 8443
+==> list: agent-vm access egress
 ```
 
-One reference in both tiers, and a literal plus a reference:
+(The `==> Egress authority:` line that names your config file is left out of
+these examples.)
+
+The count is per line: the same reference is two lines here, each saying
+`tool:fetcher (1)`, because the two names sit on different port lines. A line
+whose only source is your persisted `[network]` table carries no tag.
+
+One reference in both tiers is one line per port set, each tagged with both
+tiers:
 
 ```text
-==> Egress policy: allowing TLS to api.example.com on ports 443 (persisted grants via tool:fetcher; --allow-egress via tool:fetcher)
-==> Egress policy: allowing TLS to api.example.com on ports 443 (persisted grants, directly and via tool:fetcher)
+==> Egress policy: allowing TLS to tool:fetcher (1) on ports 443 (persisted grants and --allow-egress)
+==> Egress policy: allowing TLS to tool:fetcher (1) on ports 8443 (persisted grants and --allow-egress)
+==> list: agent-vm access egress
 ```
 
-Several references are listed as `tool:a`, `tool:a and tool:b`, or
-`tool:a, tool:b and tool:c`. A launch whose only hostname authority is a CLI
-reference never says `persisted`.
+And a literal beside a reference keeps its own name; a bare one gets a line of
+its own, because it widens to every intercepted port:
+
+```text
+==> Egress policy: allowing TLS to tool:fetcher (1) on ports 443 (--allow-egress)
+==> Egress policy: allowing TLS to tool:fetcher (1) on ports 8443 (--allow-egress)
+==> Egress policy: allowing TLS to bare.example.com on ports 443, 8443 (--allow-egress)
+==> list: agent-vm access egress
+```
+
+Several references collapse to `tool:a (1), tool:b (1)`. A name covered by a
+reference never counts as a bare name. A launch whose only hostname authority is
+a CLI reference never says `persisted`. Address lines still use the
+`tool:a and tool:b` list grammar; hostname lines do not, because the references
+are already on the line.
 
 The **bare-name widening rule is unchanged**: a bare hostname in the same launch
-still takes every intercepted port. With `tool:fetcher` above plus
-`--allow-egress bare.example.com`, `bare.example.com` gets ports 443 **and**
-8443, because `git.example.com:8443` put 8443 in the launch's intercepted set.
+still takes every intercepted port, as `bare.example.com` does above: it gets 443
+**and** 8443, because `git.example.com:8443` put 8443 in the launch's intercepted
+set.
 
 A persisted reference with a selected host HTTP proxy refuses every launch, and
 the parenthetical names it:
@@ -4858,20 +4981,37 @@ Rules:
 - **A mount set may not be called `egress_sets`**: the six top-level field names
   are reserved set names in both tables.
 
-Notices:
+Notices, for `[network] allow_egress = ["set:agents"]` on the config above:
 
 ```text
 ==> Egress policy: allowing 10.0.0.5/32 (persisted grants via set:agents)
-==> Egress policy: allowing TLS to api.openai.com, api.anthropic.com on ports 443 (persisted grants via set:agents)
-==> Egress policy: allowing TLS to git.corp.example on ports 443, 8443 (persisted grants via set:agents)
-==> Egress policy: allowing TLS to registry.corp.example on ports 8443 (persisted grants via set:agents)
+==> Egress policy: allowing TLS to agents (2) on ports 443
+==> Egress policy: allowing TLS to agents (1) on ports 443, 8443
+==> Egress policy: allowing TLS to agents (1) on ports 8443
+==> list: agent-vm access egress
 ```
 
-A set and a tool granting the same name are listed together, in entry order:
+Every hostname the set granted collapses into the set's own count, on the port
+line it belongs to; a numeric allowance it granted keeps the address line's own
+tag, unchanged. `git.corp.example` is a bare member, so it widens to both
+intercepted ports and is the `443, 8443` line.
+
+A set and a tool granting the same name collapse into one line, in written
+order, and the count of each is the number of names on that line it granted.
+With `[network] allow_egress = ["tool:codex", "set:agents"]` on the same
+config:
 
 ```text
-==> Egress policy: allowing TLS to api.openai.com on ports 443 (persisted grants via tool:codex and set:agents)
+==> Egress policy: allowing 10.0.0.5/32 (persisted grants via set:agents)
+==> Egress policy: allowing TLS to tool:codex (1), agents (2) on ports 443
+==> Egress policy: allowing TLS to agents (1) on ports 443, 8443
+==> Egress policy: allowing TLS to agents (1) on ports 8443
+==> list: agent-vm access egress
 ```
+
+A `set:` reference is named without its prefix — `agents (2)` — because it already
+reads as a name; `tool:` keeps its prefix so it cannot be mistaken for a
+hostname.
 
 `agent-vm doctor` lists each persisted entry-level reference with its flattened
 closure (64 items, then `+N more`):

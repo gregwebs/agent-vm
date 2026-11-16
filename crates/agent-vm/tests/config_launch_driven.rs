@@ -7811,7 +7811,7 @@ fn user_network_table_reaches_the_sandbox_policy() {
         "==> Egress authority: persisted grants from",
         "allowing 10.0.0.0/24 (persisted grants)",
         "allowing tcp://[192.168.10.0/24]:22 (persisted grants)",
-        "==> Egress policy: allowing TLS to api.example.com on ports 443 (persisted grants)",
+        "==> Egress policy: allowing TLS to api.example.com\n",
     ] {
         assert!(stderr.contains(text), "{stderr}");
     }
@@ -7871,11 +7871,12 @@ fn grouped_hostname_egress_notices_preserve_policy_and_saved_config() {
         serde_json::json!([443])
     );
     let stderr = stderr_of(&out);
-    let grant = format!(
-        "==> Egress policy: allowing TLS to {} on ports 443 (persisted grants)",
-        NAMES.join(", ")
+    assert!(
+        stderr.contains(
+            "==> Egress policy: allowing TLS to 7 hosts\n==> list: agent-vm access egress\n"
+        ),
+        "{stderr}"
     );
-    assert!(stderr.contains(&grant), "{stderr}");
     assert_eq!(
         stderr.matches("==> Egress policy: allowing TLS to").count(),
         1
@@ -13628,15 +13629,14 @@ fn persisted_tool_reference_grants_exact_hostnames() {
         serde_json::json!([443, 8443])
     );
     let stderr = stderr_of(&out);
+    // Two lines, because the reference's two requests pin two ports; the count
+    // is per line, so each says 1 (#631).
     assert!(
         stderr.contains(
-            "==> Egress policy: allowing TLS to api.example.com on ports 443 (persisted grants via tool:fetcher)"
-        ),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains(
-            "==> Egress policy: allowing TLS to bare.example.com on ports 443, 8443 (--allow-egress)"
+            "==> Egress policy: allowing TLS to tool:fetcher (1) on ports 443\n\
+             ==> Egress policy: allowing TLS to tool:fetcher (1) on ports 8443\n\
+             ==> Egress policy: allowing TLS to bare.example.com on ports 443, 8443 (--allow-egress)\n\
+             ==> list: agent-vm access egress\n"
         ),
         "{stderr}"
     );
@@ -13905,15 +13905,14 @@ fn direct_routes_expand_a_cli_reference_with_no_user_network_table() {
             "{route}"
         );
         let stderr = stderr_of(out);
+        // The count is per port/source line, not per reference: two lines, one
+        // name each (#631).
         assert!(
             stderr.contains(
-                "==> Egress policy: allowing TLS to api.example.com on ports 443 (--allow-egress via tool:fetcher)"
-            ),
-            "{route}: {stderr}"
-        );
-        assert!(
-            stderr.contains(
-                "==> Egress policy: allowing TLS to bare.example.com on ports 443, 8443 (--allow-egress)"
+                "==> Egress policy: allowing TLS to tool:fetcher (1) on ports 443 (--allow-egress)\n\
+                 ==> Egress policy: allowing TLS to tool:fetcher (1) on ports 8443 (--allow-egress)\n\
+                 ==> Egress policy: allowing TLS to bare.example.com on ports 443, 8443 (--allow-egress)\n\
+                 ==> list: agent-vm access egress\n"
             ),
             "{route}: {stderr}"
         );
@@ -14203,7 +14202,7 @@ fn persisted_set_reference_grants_its_nested_closure() {
     );
     assert!(
         stderr.contains(
-            "==> Egress policy: allowing TLS to api.openai.com, git.corp.example on ports 443 (persisted grants via set:agents)"
+            "==> Egress policy: allowing TLS to agents (2)\n==> list: agent-vm access egress\n"
         ),
         "{stderr}"
     );
@@ -14229,7 +14228,7 @@ fn cli_set_reference_expands_without_a_network_table() {
     let stderr = stderr_of(&out);
     assert!(
         stderr.contains(
-            "==> Egress policy: allowing TLS to api.openai.com on ports 443 (--allow-egress via set:agents)"
+            "==> Egress policy: allowing TLS to agents (1) (--allow-egress)\n==> list: agent-vm access egress\n"
         ),
         "{stderr}"
     );

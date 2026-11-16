@@ -78,6 +78,9 @@ struct Harness {
     _root: tempfile::TempDir,
     live: Arc<LiveRefusals>,
     allowances: Arc<crate::allowances::LiveAllowances>,
+    /// The cell `record_narrowing` would fill, so a test can set it and read the
+    /// answer change.
+    narrowing: Arc<std::sync::OnceLock<crate::effective_egress::EgressNarrowing>>,
     socket: PathBuf,
     stop: watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
@@ -96,17 +99,21 @@ impl Harness {
             crate::allowances::StoreHandle::at_for_tests(&root.path().join("allowances-store"));
         let plan = crate::network::plan_for_tests(&[], false).live_policy_plan(None);
         let allowances = crate::allowances::LiveAllowances::new(&project, store, plan);
+        let narrowing =
+            Arc::<std::sync::OnceLock<crate::effective_egress::EgressNarrowing>>::default();
         let (stop, receiver) = watch::channel(false);
         let task = tokio::spawn(serve(
             listener,
             Arc::clone(&live),
             Arc::clone(&allowances),
+            Arc::clone(&narrowing),
             receiver,
         ));
         Self {
             _root: root,
             live,
             allowances,
+            narrowing,
             socket,
             stop,
             task,
@@ -364,7 +371,7 @@ async fn unknown_version_gets_unsupported_version() {
             code, supported, ..
         } => {
             assert_eq!(code, "unsupported-version");
-            assert_eq!(supported, Some(vec![1, 2]));
+            assert_eq!(supported, Some(vec![1, 2, 3]));
         }
         other => panic!("{other:?}"),
     }
@@ -947,6 +954,158 @@ fn counting_updater(calls: Arc<AtomicUsize>) -> crate::allowances::PolicyUpdater
     })
 }
 
+/// #631: `v: 3` adds exactly one op. `list`, `subscribe`, `grant`, `revoke` and
+/// `allowances` keep working at v3, and neither older version can reach `egress`
+/// — the request must not be guessed at.
+#[tokio::test]
+async fn protocol_v3_serves_egress_and_older_versions_refuse_it() {
+    let harness = Harness::new().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    harness
+        .allowances
+        .attach_updater(counting_updater(Arc::clone(&calls)));
+
+    let mut client = Client::connect(&harness.socket).await;
+    client.send("{\"v\":3,\"op\":\"egress\"}").await;
+    match client.reply().await {
+        Reply::Egress { v, egress } => {
+            assert_eq!(v, 3);
+            assert_eq!(egress.policy_revision, Some(1));
+            assert_eq!(
+                egress.dns,
+                crate::effective_egress::DnsAuthorization::Denied
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+
+    for version in [1, 2] {
+        let mut client = Client::connect(&harness.socket).await;
+        client
+            .send(&format!("{{\"v\":{version},\"op\":\"egress\"}}"))
+            .await;
+        match client.reply().await {
+            Reply::Error { code, .. } => assert_eq!(code, "bad-request", "v{version}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    let mut client = Client::connect(&harness.socket).await;
+    client.send("{\"v\":3,\"op\":\"list\"}").await;
+    match client.reply().await {
+        Reply::Session { v, .. } => assert_eq!(v, 3),
+        other => panic!("{other:?}"),
+    }
+    let mut client = Client::connect(&harness.socket).await;
+    client.send("{\"v\":3,\"op\":\"allowances\"}").await;
+    match client.reply().await {
+        Reply::Allowances { v, allowances } => {
+            assert_eq!(v, 3);
+            assert!(allowances.session.is_empty());
+        }
+        other => panic!("{other:?}"),
+    }
+    let mut client = Client::connect(&harness.socket).await;
+    client
+        .send("{\"v\":3,\"op\":\"grant\",\"destination\":\"tcp://[203.0.113.10/32]:443\",\"scope\":\"session\"}")
+        .await;
+    match client.reply().await {
+        Reply::Grant { v, result } => {
+            assert_eq!(v, 3);
+            assert!(matches!(
+                result,
+                crate::allowances::GrantResult::Applied { revision: 2, .. }
+            ));
+        }
+        other => panic!("{other:?}"),
+    }
+    // `v: 3` also serves `revoke`: the address just granted comes back revoked in
+    // a v3 reply.
+    let mut client = Client::connect(&harness.socket).await;
+    client
+        .send("{\"v\":3,\"op\":\"revoke\",\"destination\":\"tcp://[203.0.113.10/32]:443\",\"scope\":\"session\"}")
+        .await;
+    match client.reply().await {
+        Reply::Revoke { v, result } => {
+            assert_eq!(v, 3);
+            assert!(
+                matches!(result, crate::allowances::RevokeResult::Revoked { .. }),
+                "{result:?}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    // And `subscribe`: the first `session` reply is a v3 one.
+    let mut client = Client::connect(&harness.socket).await;
+    client.send("{\"v\":3,\"op\":\"subscribe\"}").await;
+    match client.reply().await {
+        Reply::Snapshot { v, .. } => assert_eq!(v, 3),
+        other => panic!("{other:?}"),
+    }
+    harness.shutdown().await;
+}
+
+/// #631 AC4: a launcher of the previous build answers `unsupported-version`,
+/// which the client turns into "predates `access egress`" rather than an error.
+#[tokio::test]
+async fn egress_client_reports_a_pre_v3_launcher() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("0000abcd.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let served = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut reader = tokio::io::BufReader::new(&mut stream);
+        let mut line = String::new();
+        tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line)
+            .await
+            .unwrap();
+        drop(reader);
+        tokio::io::AsyncWriteExt::write_all(
+            &mut stream,
+            b"{\"reply\":\"error\",\"v\":2,\"code\":\"unsupported-version\",\"supported\":[1,2]}\n",
+        )
+        .await
+        .unwrap();
+    });
+    match egress(&socket).await.unwrap() {
+        EgressAnswer::PredatesEgress => {}
+        EgressAnswer::Egress(egress) => panic!("{egress:?}"),
+    }
+    served.await.unwrap();
+}
+
+/// #631: the reply carries what the credential overlay narrowed, and nothing
+/// until the launch records it.
+#[tokio::test]
+async fn egress_carries_the_recorded_narrowing() {
+    let harness = Harness::new().await;
+    let ask = || async {
+        match egress(&harness.socket).await.expect("an egress answer") {
+            EgressAnswer::Egress(egress) => egress.narrowing,
+            EgressAnswer::PredatesEgress => panic!("this build speaks v3"),
+        }
+    };
+    assert_eq!(
+        ask().await,
+        crate::effective_egress::EgressNarrowing::default()
+    );
+    harness
+        .narrowing
+        .set(crate::effective_egress::EgressNarrowing {
+            credential_rules: true,
+            github_repos: vec!["owner/repo".to_owned()],
+        })
+        .expect("nothing set it yet");
+    assert_eq!(
+        ask().await,
+        crate::effective_egress::EgressNarrowing {
+            credential_rules: true,
+            github_repos: vec!["owner/repo".to_owned()],
+        }
+    );
+    harness.shutdown().await;
+}
+
 /// P1: `v: 1` and `v: 2` coexist; an unknown version is answered with the list of
 /// versions even when it carries extra fields; a `v: 1` mutation is refused; and
 /// discovery keeps `live` and `unresponsive` disjoint.
@@ -986,14 +1145,14 @@ async fn protocol_v1_and_v2_coexist_and_reject_unknown_versions() {
     // `bad-request`: the lenient probe runs first.
     let mut client = Client::connect(&harness.socket).await;
     client
-        .send("{\"v\":3,\"op\":\"list\",\"future\":{\"a\":1}}")
+        .send("{\"v\":9,\"op\":\"list\",\"future\":{\"a\":1}}")
         .await;
     match client.reply().await {
         Reply::Error {
             code, supported, ..
         } => {
             assert_eq!(code, "unsupported-version");
-            assert_eq!(supported, Some(vec![1, 2]));
+            assert_eq!(supported, Some(vec![1, 2, 3]));
         }
         other => panic!("{other:?}"),
     }
