@@ -74,6 +74,42 @@ INPUT_EXPECTED_HEX = b"A\x1dB".hex()
 
 PROBE_NAME = "guest-probe.sh"
 
+# ------------------------------------------------- the access prompt (#501 s3) --
+
+# The prompt is found by its own text, never by a launcher notice: this line is
+# drawn by the takeover frame itself, so its presence is the takeover's evidence.
+PROMPT_TITLE = "the sandbox refused a network request"
+PROMPT_READY = "ready for your answer"
+# The host restore of the plan's §5.7, byte for byte, as `screen::host_restore`
+# builds it. A forced or lost end must contain it exactly once and end with it
+# (the rows that check it send launcher notices to a file, so the terminal stream
+# ends at the restore).
+HOST_RESTORE = (
+    "\x18\x1b[0m\x1b[<u\x1b[?6l\x1b[r\x1b[?1049l"
+    "\x1b[?1003l\x1b[?1002l\x1b[?1001l\x1b[?1000l\x1b[?9l"
+    "\x1b[?1004l\x1b[?2004l\x1b[?2026l\x1b(B\x1b)B\x0f\x1b[0m"
+)
+# A `refuse` probe prints this many held lines; the deny row requires every one,
+# in order and exactly once, after the leave.
+PROMPT_LINE_COUNT = 60
+# How soon after the guest's *refusal* a prompt must appear. AC1 says 1 s with the
+# writer's queue empty; the stall row is allowed the plan's 1.5 s because its
+# readiness marker precedes the refusal it has to observe.
+#
+# Measured from the guest's `CONNECT rc=` line, not from `REFUSE-READY`: readiness
+# precedes the guest's own spawn (`timeout` + `bash` + the `/dev/tcp` open) by up
+# to ~0.1 s, and the *decision* to take over waits for the refusal to reach the
+# feed, whose ingestion side is the runtime's own 2 s fallback poll
+# (`refusal/feed.rs`: "nothing here can shorten" it). Both intervals are recorded
+# (`appeared_seconds`, `refused_seconds`, `after_refusal_seconds`), so a launcher
+# that really is slow is distinguishable from a slow log; only the interval this
+# slice owns is asserted.
+PROMPT_APPEARS_WITHIN = 1.0
+PROMPT_STALL_WITHIN = 1.5
+# The status row's other face: a redraw after an input (the driver's own
+# cursor-position reply included) puts this back and starts a new quiet window.
+PROMPT_STOP_TYPING = "stop typing to answer"
+
 
 class CaseError(RuntimeError):
     """A case's expectation did not hold. Never a launcher status."""
@@ -587,11 +623,15 @@ class Case:
         probe: list[str],
         assignment: dict,
         route: list[str] | None = None,
+        env: dict | None = None,
     ):
         self.name = name
         self.options = options
         self.probe = probe
         self.assignment = assignment
+        # Per-case environment overrides: the prompt's setting and TERM are the
+        # case's facts, not the operator's.
+        self.env = env or {}
         # A legacy case names its route (`shell …`) instead of the direct
         # `run`/`--` boundary; the direct form is supplied per invocation.
         self.route = route
@@ -744,6 +784,179 @@ PROGRAM_CASES = {
     "status-missing": {"program": ["no-such-program-400"], "expect": 127},
     "status-nonexec": {"program": ["./not-executable"], "expect": 126},
 }
+
+# ------------------------------------- the access prompt: the eleven rows -------
+
+# One row per acceptance criterion the plan assigns to the driver (§10.4). Each
+# names its probe mode, what the driver answers, and what it must observe. The
+# `access` field is the post-launch check against the launcher's own command, and
+# `"none"` means the row proves an absence instead (no allowance, or no prompt).
+#
+# `stderr: "file"` on the forced and runtime-loss rows is deliberate: it keeps the
+# launcher's own notices off the terminal stream, so "the output ends with the host
+# restore" is a statement about the terminal and not about where a notice landed.
+PROMPT_CASES = {
+    # AC1: a refused TCP connect prompts within 1 s; `d` restores; the guest
+    # continues; `access` still lists the refusal.
+    "prompt-deny": {
+        "probe": ["refuse"],
+        "answer": b"d",
+        "expect": 0,
+        "lines": True,
+        "access": "refusal",
+    },
+    # AC2: `s` grants a session allowance, applied with revision >= 2.
+    "prompt-session": {
+        # A public address: refused by default deny, reachable after the allowance.
+        "probe": ["refuse", "1.1.1.1", "443", "1"],
+        "answer": b"s",
+        "expect": 0,
+        "lines": True,
+        "retry_succeeds": True,
+        "access": "session-applied",
+    },
+    # AC3: the #491 case offers only `p`, labelled from the next launch, and only
+    # the record is written.
+    "prompt-project-next": {
+        "probe": ["refuse-dns"],
+        "answer": b"p",
+        "expect": 0,
+        "access": "project-record-only",
+        "offer": "project-only",
+        "result_says": "next launch",
+    },
+    # AC4: a key typed before the guard, later `ss` in one write, then `d`: no
+    # allowance, and the guest's stdin is empty.
+    "prompt-guard": {
+        "probe": ["refuse"],
+        "answer": b"d",
+        "expect": 0,
+        "guard": True,
+        "access": "no-allowance",
+        "probe_stdin": True,
+    },
+    # AC3's other arm: the full offer's `p` applies now and records, which `s` does
+    # not.
+    "prompt-project": {
+        "probe": ["refuse", "1.1.1.1", "443", "1"],
+        "answer": b"p",
+        "expect": 0,
+        "lines": True,
+        "retry_succeeds": True,
+        "access": "project-applied",
+    },
+    # AC12: a CLI `access allow` closes the shown prompt without a key, and a prompt
+    # `p` typed while that grant is in flight must never write a project record.
+    "prompt-answered-elsewhere": {
+        "probe": ["refuse"],
+        "answer": None,
+        "expect": 0,
+        "answered_elsewhere": True,
+        "race_key": b"p",
+        # AC12's original wording assumes the CLI answered first. R19 is first-answer-
+        # wins, and the prompt's `p` is typed while the CLI runs (Popen), so either
+        # surface can win; the row asserts the specified invariant and records which
+        # one did (round 4).
+        "access": "first-answer-wins",
+    },
+    # AC7's alternate-screen half: the leave used DECRC, the final size is the
+    # host's, and the guest was asked to redraw.
+    "prompt-alt-screen": {
+        "probe": ["alt"],
+        "answer": b"d",
+        "expect": 0,
+        "alt": True,
+    },
+    # AC8: after a stalled sequence, CAN then the prompt, by 1.5 s.
+    "prompt-stall": {
+        "probe": ["stall"],
+        "answer": b"d",
+        "expect": 0,
+        "stall": True,
+        "access": "refusal",
+    },
+    # AC13's guest-exit half: unanswered, the guest's own exit ends it, with the
+    # leave before its held output and its own status.
+    "prompt-exit": {
+        "probe": ["exit-during"],
+        "answer": None,
+        "expect": 7,
+        "exit": True,
+    },
+    # AC13's forced half: two external SIGINTs, the host restore exactly once, the
+    # forced status — on both screens.
+    "prompt-forced": {
+        # The guest ignores INT/TERM: the first signal is forwarded, the second must
+        # force the launcher (F2). A guest killed by the first is a guest exit.
+        "probe": ["refuse", "203.0.113.10", "443", "0", "ignore"],
+        "answer": None,
+        "expect": 128 + int(signal.SIGINT),
+        "forced": True,
+        "stderr": "file",
+    },
+    "prompt-forced-alt": {
+        "probe": ["alt", "ignore"],
+        "answer": None,
+        "expect": 128 + int(signal.SIGINT),
+        "forced": True,
+        "stderr": "file",
+    },
+    # AC13's runtime-loss half: the owned runtime is killed while the question is
+    # up; 125, the host restore exactly once — on both screens.
+    "prompt-runtime-loss": {
+        "probe": ["refuse"],
+        "answer": None,
+        "expect": 125,
+        "runtime_loss": True,
+        "stderr": "file",
+    },
+    "prompt-runtime-loss-alt": {
+        "probe": ["alt"],
+        "answer": None,
+        "expect": 125,
+        "runtime_loss": True,
+        "stderr": "file",
+    },
+    # AC9, in its three shapes: the setting off, TERM=dumb, and `-t` with stdout
+    # redirected. No prompt bytes; the hint appears exactly once.
+    "prompt-off-env": {
+        "probe": ["refuse"],
+        "answer": None,
+        "expect": 0,
+        "off": True,
+        "env": {"AGENT_VM_NO_ACCESS_PROMPT": "1"},
+    },
+    "prompt-off-dumb": {
+        "probe": ["refuse"],
+        "answer": None,
+        "expect": 0,
+        "off": True,
+        "env": {"TERM": "dumb"},
+    },
+    "prompt-off-redirect": {
+        "probe": ["refuse"],
+        "answer": None,
+        "expect": 0,
+        "off": True,
+        "options": ["-t"],
+        "stdout": "file",
+    },
+}
+
+# Every prompt row's assignment: the launcher needs a terminal on both stdin and
+# stdout, and the prompt's own eligibility checks they are the same one.
+for _prompt_name, _prompt_spec in PROMPT_CASES.items():
+    _assignment = {"stdin": "tty", "stdout": "tty", "stderr": "tty"}
+    _assignment["stdout"] = _prompt_spec.get("stdout", "tty")
+    _assignment["stderr"] = _prompt_spec.get("stderr", "tty")
+    CASES[_prompt_name] = Case(
+        _prompt_name,
+        _prompt_spec.get("options", []),
+        _prompt_spec["probe"],
+        _assignment,
+        env=_prompt_spec.get("env"),
+    )
+
 
 # ------------------------------------------- host signal supervision: cases ---
 
@@ -995,7 +1208,7 @@ def run_case(case: Case, form: str, ctx: "Context", work: Path, receipt: dict) -
     if spec is not None and spec["behaviour"] == "self-signal":
         probe_extra = allocate_release(case, form, ctx, receipt)
     argv = case_argv(case, Path(args.bin), form, probe_extra)
-    session = Session(argv, ctx.env, Path(args.project))
+    session = Session(argv, {**ctx.env, **case.env}, Path(args.project))
     receipt["argv"] = argv
     receipt["host_ttys"] = {
         "stdin": case.assignment["stdin"] == "tty",
@@ -1037,6 +1250,8 @@ def observe(
     """Drive one case to its verdict and return the launcher's status."""
 
     name = case.name
+    if name in PROMPT_CASES:
+        return observe_prompt(case, form, session, receipt, ctx)
     if name.startswith("identity") or name == "legacy-shell-pty":
         session.pump(
             lambda out: "IDENTITY-DONE" in out,
@@ -1233,6 +1448,712 @@ def observe(
         )
 
     raise CaseError(f"unknown case {name}")
+
+
+# ------------------------------------- the access prompt: observation helpers ---
+
+
+def access_command(ctx: "Context", *arguments: str) -> subprocess.CompletedProcess:
+    """`agent-vm access …` under the case's own state root and project.
+
+    The prompt's grants are the same command's business, so the row asks the
+    launcher's own CLI rather than reading the log format here.
+    """
+
+    return subprocess.run(
+        [ctx.args.bin, "access", *arguments],
+        env=ctx.env,
+        cwd=ctx.args.project,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+def access_output(ctx: "Context", *arguments: str) -> str:
+    done = access_command(ctx, *arguments)
+    return done.stdout + done.stderr
+
+
+def allowance_rows(table: str, destination: str) -> list[dict]:
+    """Rows of `access allowances` whose DESTINATION cell names `destination`.
+
+    The table's columns are SCOPE, DESTINATION, RECORDED, SESSION, STATUS; a row's
+    first cell is its scope, which is what distinguishes a record from a live session
+    allowance.
+    """
+
+    rows = []
+    for line in table.splitlines():
+        if destination not in line or line.lstrip().startswith("SCOPE"):
+            continue
+        fields = line.split()
+        if not fields or fields[0] not in ("session", "project"):
+            continue
+        rows.append(
+            {
+                "scope": fields[0],
+                "status": " ".join(fields[1:]),
+            }
+        )
+    return rows
+
+
+def prompt_destination(spec: dict) -> str:
+    """The destination a prompt case's refusal names, spelled as `access` spells it.
+
+    The inventory passes its own trigger target (`refuse 1.1.1.1 443 1`) so a
+    session or project allowance can be retried against a reachable address; the
+    #491 case's trigger is a DNS name. A table lookup keyed on one hard-coded
+    array made every other case search for a row that could never exist.
+    """
+
+    probe = spec["probe"]
+    if probe[0] == "refuse-dns":
+        return "blocked.example"
+    return probe[1] if len(probe) > 1 else "203.0.113.10"
+
+
+def allowance_destination(table: str, needle: str) -> str | None:
+    """The `access allowances` DESTINATION cell of the row naming `needle`.
+
+    `access revoke` takes the destination *as agent-vm records it*
+    (`tcp://[1.1.1.1/32]:443`), which is not the probe's argument, so the cell is
+    read back rather than reconstructed.
+    """
+
+    for line in table.splitlines():
+        fields = line.split()
+        if len(fields) < 2 or fields[0] not in ("session", "project"):
+            continue
+        if needle in fields[1]:
+            return fields[1]
+    return None
+
+
+def refusal_id(ctx: "Context", destination: str) -> str | None:
+    """The 8-hex ID of the *live* session's refusal row naming `destination`.
+
+    The project's refusal log outlives a launch and every case of a row shares one
+    project, so matching the destination alone can return an *ended* session's row
+    — and `access allow` on that row fails ("has ended"), which the answered-
+    elsewhere row then reported as a product failure. The refusals table's SESSION
+    cell is a *label* (`access_cmd::label`: "running", "running (no control
+    socket)", "not responding", "ended", "ended (unclean)"), never an id, so the
+    live row is the one whose label is not an ended one; the prompt's own text
+    names the session id, but the table does not print it.
+    """
+
+    for line in access_output(ctx).splitlines():
+        if destination not in line or "ended" in line:
+            continue
+        match = re.match(r"\s*([0-9a-f]{8})\b", line)
+        if match:
+            return match.group(1)
+    return None
+
+
+def ready_is_latest(text: str) -> bool:
+    """Whether the prompt's *current* status is "ready for your answer".
+
+    The accumulated text keeps every redraw, so `PROMPT_READY in text` stays true
+    after a later redraw put "stop typing to answer..." back. A key written then
+    is typing inside the guard's quiet window, not an answer: on a real boot
+    `prompt-project-next/separator` answered `p` that way and no record was
+    written (2026-11-15, first e2e attempt).
+    """
+
+    return text.rfind(PROMPT_READY) > text.rfind(PROMPT_STOP_TYPING)
+
+
+def cpr_reply(text: str) -> bytes:
+    """The terminal's answer to the prompt's cursor-position request."""
+
+    moves = re.findall(r"\x1b\[(\d+);3H", text)
+    require(moves, "the prompt asked for a position it never moved to")
+    return f"\x1b[{moves[-1]};3R".encode()
+
+
+class PromptDriver:
+    """How many cursor-position requests have been answered, and when the last was.
+
+    The count must outlive one `pump_prompt` call: a caller that re-pumps would
+    otherwise answer the same request again on every pass, and the quiet-window wait
+    would never end (H13). `limit` is the launcher's own shape: one request per
+    takeover, so exactly one reply is ever written (H15) — a driver that keeps
+    answering manufactures host input that restarts the typing guard for ever.
+    """
+
+    def __init__(self, limit: int = 1) -> None:
+        self.answered = 0
+        self.last_reply = 0.0
+        self.limit = limit
+
+
+def pump_prompt(
+    session: "Session",
+    predicate,
+    what: str,
+    driver: "PromptDriver",
+    deadline: float = MARKER_DEADLINE,
+) -> str:
+    """Read until `predicate` holds, answering the prompt's position requests once.
+
+    A real terminal answers `CSI 6 n`; without an answer the launcher falls back to its
+    1 s margin, which would make every visibility assertion weaker than the product's
+    own. But this must never answer a request that was already answered: every call
+    site shares the case's one `PromptDriver`, whose count is read here **once, above
+    the polling loop** — re-initialising it per iteration wrote one reply every 10 ms
+    for as long as the predicate took, and those replies are host input inside the
+    typing guard's window (H16).
+    """
+
+    limit = min(session.deadline, time.monotonic() + deadline)
+    answered = driver.answered
+    while time.monotonic() < limit:
+        session.poll_once()
+        text = session.launcher_output()
+        requests = text.count("\x1b[6n")
+        # One terminal, one request, one reply: `limit` is 1 for every case.
+        while answered < requests and answered < driver.limit:
+            if session.process is not None and session.process.poll() is not None:
+                break
+            session.write_terminal(cpr_reply(text))
+            answered += 1
+            # When the reply was written: the guard counts input from the read time, so
+            # an answer must not follow one too closely (H13).
+            driver.answered = answered
+            driver.last_reply = time.monotonic()
+        if predicate(text):
+            return text
+        time.sleep(0.01)
+    raise CaseError(f"{what}: not observed within {deadline:.0f}s")
+
+
+def answer_when_ready(session: "Session", label: str, driver: "PromptDriver") -> str:
+    """Pump until the prompt is *stably* ready, then let the caller write its key.
+
+    "Stably" means the ready line is the latest output and no cursor-position reply
+    was written inside the guard's quiet window: a reply after visibility is typing,
+    and a key racing it is typing too. On a real boot the project-next row wrote `p`
+    in the same millisecond as its reply and the question timed out.
+    """
+
+    # One request answered at most, ever: the launcher sends one per takeover and
+    # treats a later reply as typing. Readiness is polled, not slept for, so this is
+    # deterministic: the reply restarts the guard and "ready" is drawn when the
+    # guard's window has passed.
+    pump_prompt(session, ready_is_latest, f"{label}: the ready status", driver=driver)
+    return session.launcher_output()
+
+
+def held_lines_after(text: str, start: int) -> list[int]:
+    """Every `LINE n` the guest printed after `start`, in order."""
+
+    return [int(match.group(1)) for match in re.finditer(r"LINE (\d+)", text[start:])]
+
+
+def require_modes_reapplied(text: str, leave_at: int, first_line_at: int, label: str) -> None:
+    """The guest's modes come back after the leave, in §5.6's order."""
+
+    window = text[leave_at:first_line_at]
+    for sequence, position in (("\x1b(0", "the line-drawing designation"), ("\x1b[?1002h", "button-event mouse"), ("\x1b[?2004h", "bracketed paste")):
+        require(
+            sequence in window,
+            f"{label}: the leave did not re-apply {position}: {window!r}",
+        )
+    require(
+        window.index("\x1b(0") < window.index("\x1b[?1002h") < window.index("\x1b[?2004h"),
+        f"{label}: the modes were re-applied out of order: {window!r}",
+    )
+
+
+def observe_prompt(case: Case, form: str, session: "Session", receipt: dict, ctx: "Context") -> int:
+    """One prompt row: drive the question, answer it, and check the whole aftermath."""
+
+    spec = PROMPT_CASES[case.name]
+    label = f"{case.name}/{form}"
+    # AC1's latency bound is *recorded* here and fails the case at the end, after
+    # every other check has run. A gate at this point hid all the other acceptance
+    # criteria's evidence on a real boot, where the refusal→prompt interval is
+    # bimodal (see `PROMPT_APPEARS_WITHIN`). The case still fails; it just fails
+    # with its whole receipt instead of only the timing line.
+    deferred: list[str] = []
+    receipt["prompt"] = {"probe": spec["probe"], "answer": None if spec["answer"] is None else spec["answer"].decode()}
+    # One driver for the whole case: every pump below shares it, so no call site can
+    # write a reply the launcher did not ask for (H16).
+    driver = PromptDriver(limit=1)
+    session.pump(
+        lambda out: "REFUSE-READY" in out,
+        "the prompt probe's readiness",
+        wait_for=lambda s: s.merged_text(),
+    )
+    if spec.get("off"):
+        # AC9: no prompt bytes anywhere, and the hint exactly once. The probe holds the
+        # session open until released, so the observation is on a live session.
+        # The guest's stdout may be a file (`prompt-off-redirect`), so the hold
+        # marker is read from every channel, not only the launcher's terminal.
+        session.pump(
+            lambda out: "HOLD-READY" in out,
+            f"{label}: the guest's hold",
+            wait_for=lambda s: s.merged_text(),
+        )
+        session.write_terminal(b" ")
+        session.pump(
+            lambda out: "REFUSE-DONE" in out,
+            "the guest's completion",
+            wait_for=lambda s: s.merged_text(),
+        )
+        status = session.wait()
+        terminal = session.launcher_output()
+        require(
+            PROMPT_TITLE not in terminal,
+            f"{label}: a prompt was drawn with it off: {terminal[-800:]!r}",
+        )
+        require(
+            PROMPT_TITLE not in session.guest_stdout_text(),
+            f"{label}: a prompt was drawn into the guest's stdout: {session.guest_stdout_text()[-800:]!r}",
+        )
+        hint = "The sandbox refused a guest network request"
+        require(
+            terminal.count(hint) == 1,
+            f"{label}: the hint must appear exactly once on stderr, saw "
+            f"{terminal.count(hint)}: {terminal[-800:]!r}",
+        )
+        require(status == spec["expect"], f"{label}: status {status}; {terminal[-800:]!r}")
+        return status
+
+    # From the guest's readiness; both halves are recorded so the launcher's own
+    # share is separable from the guest's spawn and the runtime's log ingestion.
+    started = time.monotonic()
+    connect_at: list[float] = []
+
+    def until_prompt(text: str) -> bool:
+        if not connect_at and "CONNECT rc=" in text:
+            connect_at.append(time.monotonic())
+        return PROMPT_TITLE in text
+
+    pump_prompt(session, until_prompt, f"{label}: the prompt", driver)
+    appeared_at = time.monotonic()
+    receipt["prompt"]["appeared_seconds"] = round(appeared_at - started, 3)
+    if connect_at:
+        receipt["prompt"]["refused_seconds"] = round(connect_at[0] - started, 3)
+        receipt["prompt"]["after_refusal_seconds"] = round(appeared_at - connect_at[0], 3)
+    # AC1's latency bound applies to every prompt row, not only the stalled one: a
+    # row that took ten seconds to appear would otherwise pass. The measured
+    # interval is the refusal's own (see `PROMPT_APPEARS_WITHIN`); the stall row's
+    # prompt precedes the guest's report of its refused connect, so there the bound
+    # stays on the total.
+    bound = PROMPT_STALL_WITHIN if spec.get("stall") else PROMPT_APPEARS_WITHIN
+    measured = receipt["prompt"].get("after_refusal_seconds")
+    if measured is None:
+        measured = receipt["prompt"]["appeared_seconds"]
+        receipt["prompt"]["prompt_before_refusal_report"] = True
+    if measured <= bound:
+        receipt["prompt"]["latency_within_bound"] = True
+    else:
+        receipt["prompt"]["latency_within_bound"] = False
+        deferred.append(
+            f"AC1 latency: {measured}s after the guest's refusal "
+            f"({receipt['prompt']['appeared_seconds']}s after its readiness), "
+            f"not within {bound}s"
+        )
+    session_id = re.search(r"session ([0-9a-f]{8})\b", session.launcher_output())
+    if session_id:
+        receipt["prompt"]["session"] = session_id.group(1)
+    if spec.get("stall"):
+        text = session.launcher_output()
+        can_at = text.find("\x18")
+        enter_at = text.find("\x1b[?1049h")
+        require(
+            0 <= can_at < enter_at,
+            f"{label}: a stalled sequence must be cancelled with CAN before the "
+            f"enter frame (can={can_at}, enter={enter_at}): {text[-800:]!r}",
+        )
+    if spec.get("offer") == "project-only":
+        text = pump_prompt(
+            session, ready_is_latest, f"{label}: the ready status", driver
+        )
+        require("from the next launch" in text, f"{label}: the #491 offer is missing: {text[-800:]!r}")
+        require(
+            "  s  allow" not in text,
+            f"{label}: `s` was offered for a destination only a record can admit: {text[-800:]!r}",
+        )
+    if spec.get("guard"):
+        # A key before the guard is typing; a two-byte read is typing; then a
+        # deliberate `d`. Nothing may reach the guest and nothing may be granted.
+        session.write_terminal(b"s")
+        pump_prompt(session, ready_is_latest, f"{label}: the ready status", driver)
+        session.write_terminal(b"ss")
+        answer_when_ready(session, label, driver)
+        session.write_terminal(b"d")
+    elif spec.get("answered_elsewhere"):
+        answer_when_ready(session, label, driver)
+        if not ctx.standin:
+            identifier = refusal_id(ctx, prompt_destination(spec))
+            require(identifier, f"{label}: no refusal row names the destination, so the CLI cannot answer")
+            receipt["prompt"]["answered_elsewhere_id"] = identifier
+            if not spec.get("race_key"):
+                done = access_command(ctx, "allow", identifier)
+                receipt["prompt"]["answered_elsewhere_status"] = done.returncode
+                require(
+                    done.returncode == 0,
+                    f"{label}: `access allow {identifier}` failed ({done.returncode}): {done.stdout}{done.stderr}",
+                )
+            if spec.get("race_key"):
+                # AC12's race: a `p` aimed at the question *while the CLI's session
+                # grant is still running*. The prompt's conditional grant must find the
+                # destination answered under the handler's lock and write no record.
+                # (The old code sent the key only after `access_command` returned, so
+                # the lock never decided anything: M12/C-F4.)
+                racing = subprocess.Popen(
+                    [ctx.args.bin, "access", "allow", identifier],
+                    env=ctx.env,
+                    cwd=ctx.args.project,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                session.write_terminal(spec["race_key"])
+                receipt["prompt"]["race_key"] = spec["race_key"].decode()
+                try:
+                    out, err = racing.communicate(timeout=120)
+                except subprocess.TimeoutExpired:
+                    racing.kill()
+                    out, err = racing.communicate()
+                receipt["prompt"]["race_status"] = racing.returncode
+                require(
+                    racing.returncode == 0,
+                    f"{label}: the racing `access allow {identifier}` failed "
+                    f"({racing.returncode}): {out}{err}",
+                )
+    elif spec.get("forced"):
+        answer_when_ready(session, label, driver)
+        os.kill(session.process.pid, signal.SIGINT)
+        time.sleep(0.3)
+        os.kill(session.process.pid, signal.SIGINT)
+    elif spec.get("runtime_loss"):
+        answer_when_ready(session, label, driver)
+        identity = owned_runtime_identity(session.process.pid, ctx, label)
+        receipt["prompt"]["runtime_pid"] = identity["pid"]
+        runtime_helpers.signal_identity(identity, signal.SIGKILL)
+    elif spec["answer"] is not None:
+        answer_when_ready(session, label, driver)
+        session.write_terminal(spec["answer"])
+    # else: the guest ends the session by itself while the question is up.
+
+    # The `access`/`access allowances` check runs **while the session is live**: a
+    # session allowance exists only in a running session, and the row used to check
+    # after the launcher had exited, so a correct build failed (finding 15, AC2).
+    if spec.get("access") is not None or spec.get("result_says"):
+        pump_prompt(
+            session, lambda out: "\x1b[?1049l" in out, f"{label}: the leave", driver
+        )
+        # A session-scope allowance exists only in a running session, and the probe
+        # holds itself open for exactly this check (M12/C-F4).
+        live_access = spec.get("access") in (
+            "session-applied",
+            "session-applied-no-record",
+            "project-applied",
+            "project-record-only",
+        )
+        if live_access:
+            pump_prompt(
+                session, lambda out: "HOLD-READY" in out, f"{label}: the live hold", driver
+            )
+        require_access(case, form, ctx, receipt, spec)
+        if live_access:
+            session.write_terminal(b" ")
+    elif (
+        spec["probe"][0] in ("refuse", "refuse-dns", "alt")
+        and not spec.get("forced")
+        and not spec.get("runtime_loss")
+    ):
+        # This row holds the probe open for a live check it does not run (the
+        # alternate-screen and stall rows): release it so the row does not wait for the
+        # probe's own 15 s timeout.
+        pump_prompt(
+            session, lambda out: "HOLD-READY" in out, f"{label}: the guest's hold", driver
+        )
+        session.write_terminal(b" ")
+    status = session.wait(120)
+    receipt["launcher_status"] = status
+    text = session.launcher_output()
+    if spec.get("result_says"):
+        require(
+            spec["result_says"] in text,
+            f"{label}: the result sentence must say {spec['result_says']!r}: {text[-1200:]!r}",
+        )
+    require(
+        status == spec["expect"],
+        f"{label}: launcher status {status}, expected {spec['expect']}; "
+        f"terminal tail {text[-1200:]!r}",
+    )
+
+    if spec.get("forced") or spec.get("runtime_loss"):
+        # The terminal stream ends at the host restore, and only one copy of it.
+        require(
+            text.count(HOST_RESTORE) == 1,
+            f"{label}: the host restore must appear exactly once, saw "
+            f"{text.count(HOST_RESTORE)}: {text[-1200:]!r}",
+        )
+        require(
+            text.rstrip().endswith(HOST_RESTORE),
+            f"{label}: the terminal output must end with the host restore: {text[-1200:]!r}",
+        )
+    if spec.get("alt"):
+        require(
+            "\x1b8" in text,
+            f"{label}: an alternate-screen guest is restored with DECRC: {text[-1200:]!r}",
+        )
+        require(
+            "\x1b[?1049l" not in text,
+            f"{label}: ?1049l would drop the guest to the main screen: {text[-1200:]!r}",
+        )
+        leave_at = text.rfind("\x1b8")
+        sizes = [tuple(int(value) for value in match.groups()) for match in re.finditer(r"SIZE (\d+) (\d+)", text)]
+        final_report = re.search(r"SIZE-FINAL (\d+) (\d+)", text)
+        receipt["prompt"]["sizes"] = sizes
+        receipt["prompt"]["final_size_report"] = (
+            (int(final_report.group(1)), int(final_report.group(2))) if final_report else None
+        )
+        after = [match for match in re.finditer(r"SIZE (\d+) (\d+)", text[leave_at:])] if leave_at >= 0 else []
+        require(
+            after,
+            f"{label}: the guest never saw a size change after the leave, so it was not "
+            f"asked to redraw (sizes={sizes}, "
+            f"final={receipt['prompt']['final_size_report']}): {text[-1200:]!r}",
+        )
+        final = (int(after[-1].group(1)), int(after[-1].group(2)))
+        require(
+            final == INITIAL_SIZE,
+            f"{label}: the guest's final size is {final}, not the host's {INITIAL_SIZE}",
+        )
+    if spec.get("lines"):
+        require("\x1b[?1049l" in text, f"{label}: no leave frame: {text[-1200:]!r}")
+        leave_at = text.rfind("\x1b[?1049l")
+        require(
+            "\x1b[?6h" in text[:leave_at],
+            f"{label}: origin mode must be re-set before the screen restore: {text[-1200:]!r}",
+        )
+        # AC6/R8: every LINE the guest wrote arrives exactly once and in order, and
+        # none is written while the takeover holds the terminal. Which lines the
+        # takeover actually *held* depends on how long the refusal took to reach
+        # the feed — the runtime's ingestion poll allows up to 2 s, during which the
+        # guest legitimately keeps writing to a terminal no takeover owns — so the
+        # split point is recorded, not assumed to be zero (a real boot on
+        # 2026-11-15 had lines 0-37 forwarded before the takeover).
+        written = held_lines_after(text, 0)
+        require(
+            written == list(range(PROMPT_LINE_COUNT)),
+            f"{label}: the guest's lines must arrive once each and in order; "
+            f"saw {written[:8]}…{written[-4:] if len(written) > 8 else ''}",
+        )
+        enter_at = text.rfind("\x1b[?1049h", 0, leave_at)
+        in_takeover = [
+            int(match.group(1))
+            for match in re.finditer(r"LINE (\d+)", text[max(enter_at, 0) : leave_at])
+        ]
+        require(
+            not in_takeover,
+            f"{label}: guest output was written during the takeover, not held: "
+            f"{in_takeover[:8]}",
+        )
+        numbers = held_lines_after(text, leave_at)
+        require(
+            numbers,
+            f"{label}: no held line was released after the leave: {text[-800:]!r}",
+        )
+        first_line_at = text.index(f"LINE {numbers[0]}", leave_at)
+        require_modes_reapplied(text, leave_at, first_line_at, label)
+        # No prompt byte may follow the leave: a redraw written after it would be
+        # drawn over the guest.
+        after_leave = text[leave_at:]
+        require(
+            PROMPT_READY not in after_leave and PROMPT_TITLE not in after_leave,
+            f"{label}: a prompt frame was written after the leave: {after_leave[-800:]!r}",
+        )
+        receipt["prompt"]["held_lines"] = len(numbers)
+    connect = re.search(r"CONNECT rc=(\d+)", text)
+    require(connect, f"{label}: the probe never reported its connection result: {text[-1200:]!r}")
+    require(
+        connect.group(1) != "0",
+        f"{label}: the refused connection succeeded (rc=0), so this row is not a refusal",
+    )
+    if spec.get("exit"):
+        require(
+            "EXIT-DURING-DONE" in text,
+            f"{label}: the guest's own completion is missing: {text[-1200:]!r}",
+        )
+        leave_at = text.rfind("\x1b[?1049l")
+        require(
+            leave_at >= 0 and leave_at < text.rindex("EXIT-DURING-DONE"),
+            f"{label}: the prompt's leave must precede the guest's held output: {text[-1200:]!r}",
+        )
+        # AC14: 300 numbered KiB blocks, each once and in order, all after the leave.
+        blocks = [int(match.group(1)) for match in re.finditer(r"BLOCK (\d+)", text)]
+        require(
+            blocks == list(range(300)),
+            f"{label}: the held payload must be complete and in order after the leave; "
+            f"saw {len(blocks)} blocks{blocks[:4]}…",
+        )
+        receipt["prompt"]["held_blocks"] = len(blocks)
+    if spec.get("retry_succeeds"):
+        # AC2: after the answer, the same connect succeeds without a restart.
+        retry = re.search(r"RETRY rc=(\d+)", text)
+        require(retry, f"{label}: the probe never reported its retry: {text[-1200:]!r}")
+        require(
+            retry.group(1) == "0",
+            f"{label}: the guest's retry after the allowance failed (rc={retry.group(1)})",
+        )
+        receipt["prompt"]["retry"] = "succeeded"
+    if spec.get("probe_stdin"):
+        # AC4's claim is that no *prompt input* reaches the guest. The launcher's
+        # own cursor-position reply is not a key: it is written to the terminal
+        # after the enter frame and may be read back after the takeover ends — a
+        # stated restore limit ("a paste or reply split across a takeover's start
+        # or end ... the rest reaches the guest"). On a real boot the driver's own
+        # reply did reach the guest (`1b5b31343b3352`), so the drain is required to
+        # be nothing but CPR replies, which excludes every answer byte and a lone
+        # Esc/CR/LF too.
+        drained = re.search(r"STDIN ([0-9a-f]*)", text)
+        require(drained, f"{label}: the probe never reported its stdin: {text[-1200:]!r}")
+        raw = bytes.fromhex(drained.group(1)) if drained.group(1) else b""
+        require(
+            re.fullmatch(rb"(?:\x1b\[\d+;\d+R)*", raw) is not None,
+            f"{label}: prompt input reached the guest: {drained.group(1)!r}",
+        )
+        receipt["prompt"]["guest_stdin"] = drained.group(1)
+    if deferred:
+        # Everything above has been checked and recorded; the case's verdict is
+        # still a failure, and `deferred` is what makes it one.
+        raise CaseError(f"{label}: " + "; ".join(deferred))
+    return status
+
+
+def require_access(case: Case, form: str, ctx: "Context", receipt: dict, spec: dict) -> None:
+    """The post-launch check against the launcher's own `access` command."""
+
+    label = f"{case.name}/{form}"
+    expected = spec.get("access")
+    if expected is None:
+        return
+    if ctx.standin:
+        # A boot-free control drives a stand-in, which has no session, no refusal
+        # log and no allowance store. The control's claim is about the driver's
+        # byte oracle, so the CLI check is recorded as skipped, not faked.
+        receipt["prompt"]["access"] = "skipped: boot-free control (a stand-in is not the launcher)"
+        return
+    destination = prompt_destination(spec)
+    try:
+        _check_access(ctx, receipt, label, expected, destination, spec)
+    finally:
+        # The project is shared by both forms of a row and by its later cases, and a
+        # project record outlives the launch: one left behind suppresses the next
+        # launch's refusal entirely ("the prompt: not observed"). The checks above
+        # are the evidence; this only leaves the project as it was found.
+        canonical = allowance_destination(access_output(ctx, "allowances"), destination)
+        if canonical:
+            done = access_command(ctx, "revoke", "--project", canonical)
+            receipt["prompt"]["revoked_after_check"] = {
+                "destination": canonical,
+                "status": done.returncode,
+            }
+
+
+def _check_access(
+    ctx: "Context", receipt: dict, label: str, expected: str, destination: str, spec: dict
+) -> None:
+    if expected == "refusal":
+        table = access_output(ctx)
+        require(destination in table, f"{label}: `access` does not list the refusal: {table!r}")
+        receipt["prompt"]["access"] = "listed"
+    elif expected == "session-applied":
+        table = access_output(ctx, "allowances")
+        require(destination in table, f"{label}: `access allowances` never names the destination: {table!r}")
+        require(
+            "applied" in table.lower(),
+            f"{label}: the session allowance is not applied: {table!r}",
+        )
+        revisions = [int(value) for value in re.findall(r"rev(?:ision)? (\d+)", table, re.IGNORECASE)]
+        require(
+            any(revision >= 2 for revision in revisions),
+            f"{label}: no confirmed revision >= 2 in `access allowances`: {table!r}",
+        )
+        receipt["prompt"]["access"] = "session-applied"
+    elif expected in ("project-record", "project-record-only"):
+        # AC3: the record exists; "only" additionally requires that it was not
+        # applied to this session (the #491 case's label promises exactly that).
+        table = access_output(ctx, "allowances")
+        rows = allowance_rows(table, destination)
+        require(rows, f"{label}: `access allowances` never names the record: {table!r}")
+        require(
+            any(row["scope"] == "project" for row in rows),
+            f"{label}: no project record names {destination}: {table!r}",
+        )
+        if expected == "project-record-only":
+            # An *applied* project allowance also has PROJECT scope, so scope alone
+            # cannot tell the two apart (M12/C-F4). The status can: an applied entry
+            # reads `applied (rev N)` (access_cmd.rs:377), a record this session did not
+            # adopt reads `not confirmed for this session` (:425).
+            require(
+                all(row["scope"] != "session" for row in rows),
+                f"{label}: a session allowance was applied although only a record was "
+                f"offered: {table!r}",
+            )
+            require(
+                all("applied (rev" not in row["status"] for row in rows),
+                f"{label}: the project allowance was applied to this session, although "
+                f"the offer promised only a record for the next launch: {table!r}",
+            )
+        receipt["prompt"]["access"] = expected
+    elif expected == "project-applied":
+        table = access_output(ctx, "allowances")
+        rows = allowance_rows(table, destination)
+        require(rows, f"{label}: `access allowances` never names the allowance: {table!r}")
+        require(
+            any(row["scope"] == "project" for row in rows),
+            f"{label}: no project record was written: {table!r}",
+        )
+        require(
+            any(row["scope"] == "session" for row in rows)
+            or any("applied" in row["status"].lower() for row in rows),
+            f"{label}: the project allowance was not applied to this session: {table!r}",
+        )
+        receipt["prompt"]["access"] = "project-applied"
+    elif expected == "first-answer-wins":
+        # R19/R21: the prompt's grant is conditional under the handler's lock, so a
+        # destination the CLI already answered is reported as answered elsewhere and
+        # never promoted. The prompt's `p` is typed while the CLI runs, so *either*
+        # surface may win — the row records which and asserts the invariant (AC12's
+        # "never writes a project record" holds when the CLI wins; round 4).
+        table = access_output(ctx, "allowances")
+        rows = allowance_rows(table, destination)
+        require(rows, f"{label}: `access allowances` never names the allowance: {table!r}")
+        session_won = any(row["scope"] == "session" for row in rows)
+        project_won = any(row["scope"] == "project" for row in rows)
+        require(
+            session_won or project_won,
+            f"{label}: neither surface's allowance is listed: {table!r}",
+        )
+        if session_won:
+            require(
+                not project_won,
+                f"{label}: the CLI answered first, so a prompt `p` must not have "
+                f"written a project record: {table!r}",
+            )
+        receipt["prompt"]["access"] = "first-answer-wins"
+        receipt["prompt"]["race_winner"] = "prompt" if project_won else "cli"
+    elif expected == "no-allowance":
+        table = access_output(ctx, "allowances")
+        require(
+            destination not in table,
+            f"{label}: an allowance was granted for a question that was never answered: {table!r}",
+        )
+        receipt["prompt"]["access"] = "no-allowance"
+    else:  # pragma: no cover - the inventory is fixed
+        raise CaseError(f"{label}: unknown access expectation {expected!r}")
+
 
 
 def observe_disconnect(session: Session, receipt: dict, form: str, ctx: "Context") -> int:
@@ -1833,6 +2754,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--expect-hook", default=None, help="the project hook's export value")
     parser.add_argument("--expect-hook-path", default=None, help="a PATH fragment the hook adds")
     parser.add_argument("--no-ambient-tty-check", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--standin",
+        action="store_true",
+        help="boot-free control: the launcher is a stand-in, so `access` checks are skipped",
+    )
     return parser.parse_args(argv)
 
 
@@ -1846,6 +2772,10 @@ def child_env(args: argparse.Namespace) -> dict:
     env.pop("MSB_HOME", None)
     env["AGENT_VM_IMAGE_TAG"] = args.image
     env.pop("AGENT_VM_NO_CHROME_MCP", None)
+    # #501 slice 3: the prompt is pinned on (or off) by the case, never by the
+    # operator's environment, and TERM is pinned unless a case is *about* TERM.
+    env["TERM"] = "xterm-256color"
+    env.pop("AGENT_VM_NO_ACCESS_PROMPT", None)
     if args.home:
         env["HOME"] = args.home
     return env
@@ -1859,6 +2789,7 @@ class Context:
         self.env = child_env(args)
         self.expect_hook = args.expect_hook
         self.expect_hook_path = args.expect_hook_path
+        self.standin = args.standin
 
 
 def main(argv: list[str]) -> int:

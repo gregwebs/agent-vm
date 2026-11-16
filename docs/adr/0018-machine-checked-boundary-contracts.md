@@ -45,6 +45,10 @@ A pure predicate that cannot be verified usually cannot be verified because it d
 | `http::header_block_end` / `is_token_bytes` / `has_no_crlf` | `Request::parse` — `anyhow` context, `String`/`Vec` assembly, `str::from_utf8` |
 | `dns_name::ldh_host_bytes` / `egress_hostname::egress_hostname_bytes` / `hostname_scope` | `HostnameAllowance::from_target` — ASCII/one-trailing-dot canonicalization, the `host.microsandbox.internal` comparison and `DomainName::from_str`; `domain_rules` unions intercepted ports and emits one `[Tcp]` `Domain` rule per distinct name |
 
+| `access_prompt::guard::answer_of` | `access_prompt::relay::Relay::host_input` — the epoch comparison, `Instant` arithmetic into `quiet_ms`, and the offered-scope lookup. **#501 slice 3's answer decision:** only a single-byte read, started after the prompt's input flush, 0.7 s quiet and not inside a paste can answer, and then only `s`/`p`/`n`/`d`/Enter/Esc/Ctrl-C. Load-bearing because this is the one decision that can grant something by accident. |
+| `access_prompt::guard::may_hold` / `held_after` / `may_queue` | the relay's `Vec` bookkeeping: the hold stays under 256 KiB and one more SDK event (bounded to `4 MiB − 1 KiB` by the negotiated chunk size, cited not proved) cannot overflow it; at most 8 destinations wait. |
+| `access_prompt::vt::next` (with `escape_step` / `ground_step`) | `VtState::advance` — the bounded CSI collector, the designations and shifts, and the `GuestModes` DECSTR/RIS/cursor-save rules. **#501 slice 3's safe-boundary parser:** total over the VT500 subset, and `CAN`/`SUB` return to `Ground` from every state, which is what makes the forced cut mean "the terminal is between sequences now". |
+| `direct_pty::ledger::admit` | `writer_loop` — the lock, the writes, and clearing `owed` only after a complete `Leave` (pinned by the byte-prefix sweep and the tmux oracle, not proved). **#501 slice 3's terminal ownership:** `Data` always while running, `Enter` only when nothing owns the terminal, `Redraw`/`Leave` only for the owning generation, nothing after the writer stops. |
 Additional ADR-0038 decision/adapter pairs:
 
 | decision (proved kernel) | trusted adapter |
@@ -144,6 +148,18 @@ structs/enums (`PlacementFacts` gained the `contains_checkout` fact, and
 ADR-0068 kernels (`Role::bit`, `may_retire`, `claim_knowledge`,
 `checked_next_sequence`, `mask_is_acceptable`) and their verified
 structs/enums (`KnowledgeFacts`, `ClaimFacts`, `SequenceReservation`).
+**Measured for #501 slice 3: 283 verified, 0 errors** (269 after the VT tracker's
+parse kernel alone). The four new kernels are `guard::answer_of`,
+`guard::may_hold`/`held_after`/`may_queue`, `vt::next` (with `escape_step`/
+`ground_step` as its proved mirrors and `run`/`last_ground` as spec functions) and
+`ledger::admit`, with the verified `KeyFacts`/`Answer` and
+`Frame`/`WriterState`/`Admit` enums and the
+`HELD_OUTPUT_BYTES`/`MAX_WAITING`/`TYPING_QUIET_MS`/`MAX_SDK_EVENT_BYTES`
+constants. `access_prompt::last_safe_cut` is deliberately not proved: see
+[ADR-0069](0069-in-terminal-access-prompt.md)'s recorded deviation. The pre-change
+baseline for this branch could not be measured in its worktree, whose vendored
+`microsandbox` submodule is a populated working tree but not an initialised
+submodule checkout, so a second worktree at the base commit does not build.
 **Measured for #505: 213 verified, 0 errors** (206 before it): the
 three constants (`MAX_REQUEST_LABELS`, `MAX_BASELINE_REFERENCES`, `MAX_BASELINE_BYTES`), the
 three spec/exec pairs and one verified `struct` (`RequestLabelFacts`) — seven items where the

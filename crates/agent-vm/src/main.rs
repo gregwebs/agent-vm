@@ -1,6 +1,7 @@
 //! agent-vm — sandboxed microVMs for AI coding agents on microsandbox.
 
 mod access_cmd;
+mod access_prompt;
 mod allowances;
 mod boot_image;
 mod cli;
@@ -1265,7 +1266,8 @@ mod tests {
                     // put the case's own process in the way of the terminal it is
                     // observing.
                     let mut supervision = crate::host_signals::Supervision::legacy();
-                    match crate::direct_pty::run(handle, runtime_wait, &mut supervision).await {
+                    match crate::direct_pty::run(handle, runtime_wait, &mut supervision, None).await
+                    {
                         Ok(end) => Ok(end.exit_status()),
                         Err(error) => {
                             Err(

@@ -38,16 +38,20 @@
 mod apply;
 mod store;
 
+#[cfg(test)]
+pub(crate) use apply::{GrantRefusalReason, NextLaunchReason};
 /// The live allowance controller: one policy computation, one confirmed swap.
 pub(crate) use apply::{
-    GrantRefusalReason, GrantResult, GrantScope, LiveAllowances, NextLaunchReason, PolicyUpdater,
-    RevokeResult, RevokeScope, SessionAllowancesSnapshot, WireAllowance,
+    GrantResult, GrantScope, LiveAllowances, Offer, PolicyUpdater, PromptGrant, ReportStream,
+    RevokeResult, RevokeScope, SessionAllowancesSnapshot, WireAllowance, demoted_sentence,
 };
 
 /// The store's file name, spelled once: the guard measures the same file this
 /// module reads, so a rename cannot leave one of them looking at a path that no
 /// longer exists.
 pub(crate) use store::FILE;
+/// The store's record bound, shared with the live next-launch answer set.
+pub(crate) use store::MAX_RECORDS;
 /// The writer's handle, opaque outside this facade: no caller can name a path
 /// into the host configuration directory or inspect a [`store::Store`].
 pub(crate) use store::StoreHandle;

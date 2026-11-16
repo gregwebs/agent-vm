@@ -2662,3 +2662,136 @@ async fn live_tables_are_bounded_and_refused_with_a_reason() {
     }
     assert_eq!(recorder.calls(), 256, "the refused grant swapped nothing");
 }
+
+// ---------------------------------- R19/AC12: first answer wins, both orders ---
+
+fn refusal_record(ip: &str, port: u16) -> microsandbox::logs::NetworkLogRecord {
+    use microsandbox::logs::{
+        LogSource, NameSource, NetworkLogEvent, NetworkLogRecord, NetworkRefusal, RefusalLayer,
+        RefusalSite,
+    };
+    NetworkLogRecord {
+        v: 1,
+        t: chrono::DateTime::from_timestamp_millis(1_760_000_000_000).unwrap(),
+        s: LogSource::Network,
+        event: NetworkLogEvent::Refusal(NetworkRefusal {
+            site: RefusalSite::TcpSyn,
+            layer: RefusalLayer::Tenant,
+            protocol: microsandbox_types::Protocol::Tcp,
+            dst_ip: Some(ip.parse().unwrap()),
+            dst_port: Some(port),
+            name: None,
+            name_source: NameSource::Absent,
+            revision: 1,
+            credential: None,
+            location: None,
+            reason: None,
+        }),
+    }
+}
+
+/// A live feed holding one address refusal, and the ID it coalesced to.
+fn feed_with_refusal(ip: &str, port: u16) -> (Arc<LiveRefusals>, String) {
+    let refusals = live_refusals();
+    let mut dirty = false;
+    assert!(refusals.ingest(&refusal_record(ip, port), &mut dirty, 1_760_000_000_000));
+    let snapshot = refusals.snapshot();
+    let id = snapshot
+        .entries
+        .first()
+        .expect("the refusal is in the feed")
+        .id
+        .clone();
+    (refusals, id)
+}
+
+#[tokio::test]
+async fn a_prompt_p_after_a_cli_session_grant_is_answered_elsewhere_and_writes_no_record() {
+    // AC12/R19: the CLI answered first, under the handler's lock; the prompt's queued
+    // `p` must not promote it to a project record.
+    let root = tempfile::tempdir().unwrap();
+    let project = crate::project::ProjectDir::from_path_for_tests(root.path()).unwrap();
+    let store = crate::allowances::StoreHandle::at_for_tests(&root.path().join("store"));
+    let plan = crate::network::plan_for_tests(&[], false).live_policy_plan(None);
+    let controller = LiveAllowances::new(&project, store, plan);
+    let (refusals, id) = feed_with_refusal("203.0.113.10", 443);
+    let updater = Arc::new(|policy: microsandbox::NetworkPolicy| {
+        Box::pin(async move {
+            let _ = policy;
+            Ok(2u64)
+        }) as futures::future::BoxFuture<'static, microsandbox::MicrosandboxResult<u64>>
+    });
+    controller.attach_updater(updater);
+    let cli = controller
+        .grant(
+            &refusals,
+            Some(&id),
+            None,
+            crate::allowances::GrantScope::Session,
+            0,
+        )
+        .await;
+    assert!(
+        matches!(cli, crate::allowances::GrantResult::Applied { .. }),
+        "{cli:?}"
+    );
+    let prompt = controller
+        .grant_unless_answered(&refusals, &id, crate::allowances::GrantScope::Project, 0)
+        .await;
+    assert_eq!(prompt, crate::allowances::PromptGrant::AnsweredElsewhere);
+    let store_file = root.path().join("store").join(crate::allowances::FILE);
+    let contents = std::fs::read_to_string(&store_file).unwrap_or_default();
+    assert!(
+        !contents.contains("203.0.113.10"),
+        "the prompt's p must write no record after the CLI answered: {contents:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_cli_session_grant_after_a_prompt_p_keeps_the_prompts_record_and_adds_nothing() {
+    // The other order: the prompt's `p` answered first, so its record stands and the
+    // later CLI session grant reports the existing entry instead of a second swap.
+    // First answer wins is the specification (R19/R21), not a defect (round 4/AC12).
+    let root = tempfile::tempdir().unwrap();
+    let project = crate::project::ProjectDir::from_path_for_tests(root.path()).unwrap();
+    let store = crate::allowances::StoreHandle::at_for_tests(&root.path().join("store"));
+    let plan = crate::network::plan_for_tests(&[], false).live_policy_plan(None);
+    let controller = LiveAllowances::new(&project, store, plan);
+    let (refusals, id) = feed_with_refusal("203.0.113.10", 443);
+    let updater = Arc::new(|policy: microsandbox::NetworkPolicy| {
+        Box::pin(async move {
+            let _ = policy;
+            Ok(2u64)
+        }) as futures::future::BoxFuture<'static, microsandbox::MicrosandboxResult<u64>>
+    });
+    controller.attach_updater(updater);
+    let prompt = controller
+        .grant_unless_answered(&refusals, &id, crate::allowances::GrantScope::Project, 0)
+        .await;
+    assert!(
+        matches!(
+            prompt,
+            crate::allowances::PromptGrant::Reached(crate::allowances::GrantResult::Applied { .. })
+        ),
+        "{prompt:?}"
+    );
+    let cli = controller
+        .grant(
+            &refusals,
+            Some(&id),
+            None,
+            crate::allowances::GrantScope::Session,
+            0,
+        )
+        .await;
+    assert!(
+        matches!(cli, crate::allowances::GrantResult::Applied { .. }),
+        "{cli:?}"
+    );
+    let store_file = root.path().join("store").join(crate::allowances::FILE);
+    let contents = std::fs::read_to_string(&store_file).unwrap_or_default();
+    assert!(
+        contents.contains("203.0.113.10"),
+        "the prompt's own record must stand: {contents:?}"
+    );
+}

@@ -737,7 +737,7 @@ fn signal_case_child() {
                 )
                 .await
             } else {
-                crate::direct_pty::run(handle, runtime_wait, &mut supervision).await
+                crate::direct_pty::run(handle, runtime_wait, &mut supervision, None).await
             }
         }),
     };

@@ -15,7 +15,15 @@ kernel, `config_authority::authority_dir_refusal`), and annotates
 launch; a live change may only narrow) and
 [ADR-0064](0064-read-only-refusal-feed.md) (the applied level is this ADR's).
 
-## Context
+> **Annotated by [ADR-0069](0069-in-terminal-access-prompt.md) (#501 slice 3).** The
+> grant path gains a second in-process caller, `grant_unless_answered`: the same
+> handler under the same operation lock, with one extra precondition — a destination
+> this session already holds or recorded for the next launch is reported as answered
+> elsewhere rather than granted again, so a queued prompt `p` cannot promote a CLI
+> `s`. The handler also broadcasts the canonical destination of every non-refused
+> grant as a wakeup, which the prompt treats only as a hint (correctness is
+> `answered()` and that precondition). `grant`'s own contract is unchanged.
+
 
 ADR-0065 answered *where a project's durable egress authority lives*. It left
 four questions that cannot be answered one at a time:

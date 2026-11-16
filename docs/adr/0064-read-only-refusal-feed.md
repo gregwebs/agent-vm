@@ -10,7 +10,12 @@ cannot express. Grants, revokes, `access allow|allowances|revoke`, `--project`,
 `--all-sessions`, the TTY review mode, the in-terminal prompt, the macOS
 notification helper and connection listing are **not** decided here.
 
-## Context
+> **Annotated by [ADR-0069](0069-in-terminal-access-prompt.md) (#501 slice 3).** The
+> hint's text and its once-per-session rule are unchanged. On a launch whose terminal
+> the launcher relays, the hint is written through that relay's writer (at a safe
+> boundary, never during a takeover) so it cannot land inside a guest or prompt
+> sequence; elsewhere it is the stderr line described here, byte for byte.
+
 
 The runtime records every refused egress decision in
 `<MSB_HOME>/sandboxes/<name>/logs/network.log`: one JSON line per refusal, with
