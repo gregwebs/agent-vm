@@ -1378,8 +1378,9 @@ fn egress_reports_a_launcher_without_a_supported_list_as_pre_v3() {
 #[test]
 fn egress_reports_an_oversized_reply_without_its_content() {
     let marker = "OVERSIZED-MARKER";
+    // The marker sits in the `reply` tag, which serde would echo.
     let answer = format!(
-        "{{\"reply\":\"egress\",\"v\":3,\"echo\":\"{marker}\",\"pad\":\"{}\"}}",
+        "{{\"reply\":\"{marker}{}\",\"v\":3}}",
         "x".repeat(1024 * 1024)
     );
     let out = egress_against(&answer);
@@ -1389,27 +1390,40 @@ fn egress_reports_an_oversized_reply_without_its_content() {
     assert!(text.contains("larger than"), "{text}");
     assert!(!text.contains(marker), "the reply is not echoed: {text}");
     assert_eq!(text.lines().count(), 1, "one line: {text}");
+    assert!(text.len() < 4096, "{} bytes: {text}", text.len());
 }
 
-/// #639: the reply is no longer quoted, but serde's own message can still echo a
-/// token from it — an unknown `reply` tag is printed verbatim — so the single
-/// escaping site in `egress.rs` still has work to do, and a control byte in that
-/// tag must not reach the terminal as itself.
+/// #639: serde's own message still echoes a token from the reply — an unknown
+/// `reply` tag is printed verbatim — so the single escaping site in `egress.rs`
+/// still has work, and the cause is truncated before it gets there. A hostile tag
+/// of 20,000 ESC bytes would be 80 KB once escaped; the budget is 200 bytes of
+/// cause (at most 800 escaped), so the whole line stays far under 4 KB.
 #[test]
-fn egress_escapes_the_token_serde_echoes() {
-    let out = egress_against(
-        // The reply carries a JSON escape, so the tag serde echoes holds a real ESC.
-        "{\"reply\":\"\\u001b[31mfrom-the-future\",\"v\":3}",
+fn egress_bounds_and_escapes_the_token_serde_echoes() {
+    let answer = format!(
+        "{{\"reply\":\"{}TAIL-MARKER\",\"v\":3}}",
+        "\\u001b".repeat(20_000)
     );
+    let out = egress_against(&answer);
     assert_eq!(out.status.code(), Some(1));
+    assert_eq!(stdout(&out), "");
     let text = stderr(&out);
     assert!(
-        text.contains("its launcher answered in a form this agent-vm cannot read"),
+        text.contains("its launcher answered in a form this agent-vm cannot read ("),
         "{text}"
     );
     assert!(!text.contains('\u{1b}'), "a raw ESC byte: {text:?}");
-    assert!(text.contains("\\x1b"), "{text}");
+    assert!(
+        text.contains("\\x1b"),
+        "the token is escaped as itself: {text}"
+    );
+    assert!(
+        !text.contains("TAIL-MARKER"),
+        "the tag's tail is cut: {text}"
+    );
+    assert!(text.contains("..."), "the cut is marked: {text}");
     assert_eq!(text.lines().count(), 1, "one line: {text}");
+    assert!(text.len() < 4096, "{} bytes: {text}", text.len());
 }
 
 /// AC4: a session with no control socket is reported, not guessed at.

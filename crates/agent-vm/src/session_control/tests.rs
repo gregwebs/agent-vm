@@ -1127,9 +1127,11 @@ async fn an_oversized_reply_is_refused_without_its_content() {
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("0000abcd.sock");
     let marker = "OVERSIZED-MARKER";
-    let mut reply = format!("{{\"reply\":\"session\",\"v\":1,\"echo\":\"{marker}\",\"pad\":\"");
+    // The marker sits in the `reply` tag, which serde would echo: a reply refused
+    // by size must carry none of it.
+    let mut reply = format!("{{\"reply\":\"{marker}");
     reply.push_str(&"x".repeat(MAX_REPLY_BYTES));
-    reply.push_str("\"}\n");
+    reply.push_str("\",\"v\":1}\n");
     let served = answer_once(&socket, reply.into_bytes()).await;
     let error = list(&socket)
         .await
@@ -1140,28 +1142,74 @@ async fn an_oversized_reply_is_refused_without_its_content() {
     served.await.unwrap();
 }
 
-/// #639: an undecodable reply is reported by path and serde error only. The line
-/// itself is never quoted — it can be kilobytes long and `access` prints one.
+/// #639: a framing error ends a subscription.
+///
+/// The reviewer's case exactly: an oversized line immediately followed by a
+/// well-formed reply. The rejected line's tail stays in the reader, so a
+/// subscription that read on would hand a *suffix of that line* to the caller as
+/// if it were the next reply — fabricated stream state. One error, then `None`.
 #[tokio::test]
-async fn an_undecodable_reply_does_not_quote_the_line() {
+async fn an_oversized_reply_ends_the_subscription() {
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("0000abcd.sock");
-    let marker = "UNDECODABLE-MARKER";
-    let line = format!("{{\"reply\":\"from-the-future\",\"v\":3,\"echo\":\"{marker}\"}}");
+    let mut reply = "x".repeat(MAX_REPLY_BYTES);
+    reply.push_str("{\"reply\":\"ended\",\"v\":1}\n");
+    let served = answer_once(&socket, reply.into_bytes()).await;
+    {
+        let stream = subscribe(&socket).await.expect("a subscription");
+        futures::pin_mut!(stream);
+        let error = stream
+            .next()
+            .await
+            .expect("the framing error")
+            .expect_err("the line is over the bound");
+        assert!(format!("{error:#}").contains("larger than"), "{error:#}");
+        assert!(
+            stream.next().await.is_none(),
+            "the subscription ended: no suffix of a rejected line is a reply"
+        );
+    }
+    // The fake launcher's write may still be blocked on a buffer this process is
+    // no longer draining; closing the subscription first is what lets it finish.
+    served.await.unwrap();
+}
+
+/// #639: an undecodable reply is reported by path and a **bounded** cause. The
+/// line itself is never quoted, and the part serde echoes — the unknown `reply`
+/// tag — is cut at [`MAX_CAUSE_BYTES`], so a peer cannot choose how much text it
+/// makes this process print.
+#[tokio::test]
+async fn an_undecodable_reply_is_reported_without_the_echoed_tag() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("0000abcd.sock");
+    let marker = "TAIL-MARKER";
+    // A JSON escape per repetition, so the wire form differs from the tag serde
+    // echoes — which is the tag's own 20,000 ESC bytes, plus a marker at its end.
+    let tag = format!("{}{marker}", "\\u001b".repeat(20_000));
+    let line = format!("{{\"reply\":\"{tag}\",\"v\":3}}");
     let served = answer_once(&socket, format!("{line}\n").into_bytes()).await;
     let error = list(&socket)
         .await
         .expect_err("an undecodable reply is refused");
     let text = format!("{error:#}");
     assert!(
-        text.contains("its launcher answered in a form this agent-vm cannot read"),
+        text.contains("its launcher answered in a form this agent-vm cannot read ("),
         "{text}"
     );
     assert!(
         text.contains(&crate::one_line::path(&socket).to_string()),
         "{text}"
     );
-    assert!(!text.contains(marker), "the reply is not echoed: {text}");
+    assert!(
+        text.len() <= MAX_CAUSE_BYTES + 3 + crate::one_line::path(&socket).to_string().len() + 128,
+        "{} bytes of message: {text:?}",
+        text.len()
+    );
+    assert!(text.contains("..."), "the cause is marked cut: {text:?}");
+    assert!(
+        !text.contains(marker),
+        "the echoed tag's tail is not printed: {text:?}"
+    );
     assert!(!text.contains(&line), "the line is not quoted: {text}");
     served.await.unwrap();
 }
