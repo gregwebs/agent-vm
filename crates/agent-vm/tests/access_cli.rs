@@ -613,6 +613,7 @@ mod control_socket {
     pub struct Replies {
         pub list: String,
         pub allowances: String,
+        pub egress: String,
         pub grant: String,
         pub revoke: String,
         /// A project grant's *other* half. The launcher, not the CLI, writes the
@@ -673,6 +674,12 @@ mod control_socket {
 
         /// The one request whose `op` is `op`.
         pub fn request(&self, op: &str) -> String {
+            self.request_at(op, 2)
+        }
+
+        /// The one request whose `op` is `op`, asserting the version it was sent
+        /// at: an op belongs to the version that introduced it (#631).
+        pub fn request_at(&self, op: &str, version: u32) -> String {
             let wanted = format!("\"op\":\"{op}\"");
             let matches: Vec<String> = self
                 .requests()
@@ -681,8 +688,8 @@ mod control_socket {
                 .collect();
             assert_eq!(matches.len(), 1, "{op} requests: {matches:?}");
             assert!(
-                matches[0].contains("\"v\":2"),
-                "a mutation is v2: {}",
+                matches[0].contains(&format!("\"v\":{version}")),
+                "a v{version} request: {}",
                 matches[0]
             );
             matches[0].clone()
@@ -714,6 +721,8 @@ mod control_socket {
             &replies.list
         } else if line.contains("\"op\":\"allowances\"") {
             &replies.allowances
+        } else if line.contains("\"op\":\"egress\"") {
+            &replies.egress
         } else if line.contains("\"op\":\"grant\"") {
             if line.contains("\"scope\":\"project\"")
                 && let Some((file, contents)) = &replies.grant_records
@@ -804,6 +813,8 @@ fn replies(now: i64, socket: bool, ended: bool, grant: &str, revoke: &str) -> Re
         allowances:
             "{\"reply\":\"allowances\",\"v\":2,\"allowances\":{\"session\":[],\"project\":[]}}"
                 .to_owned(),
+        // No answer at all: a session this build cannot ask.
+        egress: String::new(),
         grant: grant.to_owned(),
         revoke: revoke.to_owned(),
         grant_records: None,
@@ -1215,4 +1226,179 @@ fn allowances_lists_project_and_session_entries() {
         .unwrap_or_else(|| panic!("no session row: {text}"));
     assert!(session_row.contains(SESSION_ID), "{session_row}");
     assert!(session_row.contains("applied (rev 2)"), "{session_row}");
+}
+
+// ---------------------------------------------------------------------------
+// `access egress` (#631)
+// ---------------------------------------------------------------------------
+
+/// The Phase 1 wire shape, as a launcher of this build answers it.
+fn egress_reply() -> String {
+    serde_json::json!({
+        "reply": "egress",
+        "v": 3,
+        "egress": {
+            "policy_revision": 2,
+            "rows": [
+                {"destination": {"kind": "hostname", "name": "api.example.com"},
+                 "ports": {"kind": "tls", "ports": [443]},
+                 "via": null,
+                 "source": "allow-egress",
+                 "status": {"kind": "applied"}},
+                {"destination": {"kind": "address", "network": "203.0.113.10/32"},
+                 "ports": {"kind": "address", "transport": "tcp", "port": 443},
+                 "via": null,
+                 "source": "session-allowance",
+                 "status": {"kind": "applied-at", "revision": 2}}
+            ],
+            "dns": {"kind": "allowed-hostnames-only"},
+            "narrowing": {"credential_rules": true, "github_repos": ["gregwebs/agent-vm"]}
+        }
+    })
+    .to_string()
+}
+
+/// AC1 over the process boundary: the CLI asks at v3 and prints the launcher's
+/// own table.
+#[test]
+fn egress_prints_the_launchers_table() {
+    let root = tempfile::tempdir().unwrap();
+    let (home, _authority) = home_with_authority_dir(root.path());
+    let state = root.path().join("state");
+    let project = root.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let now = now_ms();
+    let dir = sessions_dir(&state, &project);
+    write_session_log(&dir, &session_line(SESSION_ID, now, true, false));
+    let mut answers = replies(now, true, false, "", "");
+    answers.egress = egress_reply();
+    let fake = FakeSession::start(&dir, SESSION_ID, answers);
+
+    let out = run(&home, &state, &project, &["access", "egress"]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{text}{}", stderr(&out));
+    assert!(
+        text.starts_with(&format!("Session {SESSION_ID} (policy rev 2)\n")),
+        "{text}"
+    );
+    assert!(text.contains("DESTINATION"), "{text}");
+    assert!(text.contains("api.example.com"), "{text}");
+    assert!(text.contains("203.0.113.10/32"), "{text}");
+    assert!(text.contains("applied (rev 2)"), "{text}");
+    assert!(text.contains("DNS: allowed hostnames only\n"), "{text}");
+    assert!(
+        text.contains("Narrowed by: credential rules; GitHub repos gregwebs/agent-vm\n"),
+        "{text}"
+    );
+    assert!(
+        fake.request_at("egress", 3).contains("\"op\":\"egress\""),
+        "the egress request is v3"
+    );
+}
+
+/// AC4: a launcher that predates v3 answers `unsupported-version`.
+#[test]
+fn egress_reports_a_pre_v3_launcher_as_not_available() {
+    let root = tempfile::tempdir().unwrap();
+    let (home, _authority) = home_with_authority_dir(root.path());
+    let state = root.path().join("state");
+    let project = root.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let now = now_ms();
+    let dir = sessions_dir(&state, &project);
+    write_session_log(&dir, &session_line(SESSION_ID, now, true, false));
+    let mut answers = replies(now, true, false, "", "");
+    answers.egress =
+        "{\"reply\":\"error\",\"v\":2,\"code\":\"unsupported-version\",\"supported\":[1,2]}"
+            .to_owned();
+    let _fake = FakeSession::start(&dir, SESSION_ID, answers);
+
+    let out = run(&home, &state, &project, &["access", "egress"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(stdout(&out), "");
+    let text = stderr(&out);
+    assert!(
+        text.contains(&format!(
+            "effective egress is not available for session {SESSION_ID} (running): its launcher predates `access egress`; relaunch it with this agent-vm"
+        )),
+        "{text}"
+    );
+}
+
+/// AC4: a session with no control socket is reported, not guessed at.
+#[test]
+fn egress_reports_a_socketless_session_as_not_available() {
+    let root = tempfile::tempdir().unwrap();
+    let (home, _authority) = home_with_authority_dir(root.path());
+    let state = root.path().join("state");
+    let project = root.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let now = now_ms();
+    let dir = sessions_dir(&state, &project);
+    write_session_log(&dir, &session_line(SESSION_ID, now, false, false));
+
+    let out = run(&home, &state, &project, &["access", "egress"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(stdout(&out), "");
+    let text = stderr(&out);
+    assert!(
+        text.contains(&format!(
+            "effective egress is not available for session {SESSION_ID} (running (no control socket)): it has no control socket"
+        )),
+        "{text}"
+    );
+}
+
+/// AC3: no session is a pointer line, a success status and no state root.
+#[test]
+fn egress_with_no_session_prints_the_pointer() {
+    let root = tempfile::tempdir().unwrap();
+    let (home, _authority) = home_with_authority_dir(root.path());
+    let state = root.path().join("state");
+    let project = root.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+
+    let out = run(&home, &state, &project, &["access", "egress"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        "No running session in this project; `agent-vm access allowances` lists its recorded project allowances.\n"
+    );
+    assert!(
+        !state
+            .join(format!("{}.sessions", hash_project(&project)))
+            .exists()
+            && !state.exists(),
+        "a read creates no state root: {}",
+        state.display()
+    );
+}
+
+/// AC5: inside the guest the command says where it runs, once.
+#[test]
+fn egress_inside_the_guest_prints_one_host_only_line() {
+    let root = tempfile::tempdir().unwrap();
+    let (home, _authority) = home_with_authority_dir(root.path());
+    let state = root.path().join("state");
+    let project = root.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+
+    let out = Command::new(agent_vm())
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", &home)
+        .env("AGENT_VM_STATE_DIR", &state)
+        .env("MSB_PATH", home.join("no-such-msb"))
+        .env("IS_SANDBOX", "1")
+        .current_dir(&project)
+        .args(["access", "egress"])
+        .output()
+        .expect("running agent-vm");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(stdout(&out), "");
+    assert_eq!(
+        stderr(&out),
+        "agent-vm access egress runs on the host: run it there, in this project's directory\n"
+    );
+    assert!(!state.exists(), "no state root: {}", state.display());
 }

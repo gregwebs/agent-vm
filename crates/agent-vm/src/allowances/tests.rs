@@ -2540,6 +2540,120 @@ async fn project_grant_over_a_session_entry_keeps_the_demotion_on_the_entry() {
     assert!(snapshot.project.is_empty(), "{snapshot:?}");
 }
 
+/// Review finding 2: a `--project` grant the runtime confirmed is in force while
+/// its record is written, so `access egress` answers with it instead of a
+/// revision behind. The window is a held `allowances.lock` — the write's own
+/// wait.
+#[tokio::test]
+async fn a_confirmed_project_grant_is_effective_while_its_record_is_written() {
+    let project = live_project("project-window");
+    let (controller, root) = live(&project, live_plan(&[], false));
+    let refusals = live_refusals();
+    let destination = "tcp://[203.0.113.10/32]:443";
+    let recorder = Recorder::new();
+    controller.attach_updater(recorder.updater());
+
+    // Hold the store's coordination lock: the record write waits on it for at
+    // most LOCK_WAIT, which is the window under test.
+    let lock = crate::host_paths::open_lock_file(&root.path().join(store::LOCK_FILE)).unwrap();
+    assert!(matches!(
+        crate::host_paths::try_flock(&lock, crate::host_paths::FlockMode::Exclusive).unwrap(),
+        crate::host_paths::FlockAttempt::Acquired
+    ));
+
+    let granting = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        let refusals = Arc::clone(&refusals);
+        async move {
+            controller
+                .grant(
+                    &refusals,
+                    None,
+                    Some(destination),
+                    GrantScope::Project,
+                    1_000,
+                )
+                .await
+        }
+    });
+
+    // Poll for the confirmed revision rather than sleeping a fixed time, which
+    // could pass for the wrong reason on a slow machine. The bound is well inside
+    // LOCK_WAIT, so the lock is still ours when the assertions run.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
+    let mut during = controller.effective_egress(Default::default());
+    while during.policy_revision != Some(2) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        during = controller.effective_egress(Default::default());
+    }
+    assert_eq!(
+        during.policy_revision,
+        Some(2),
+        "the runtime confirmed rev 2 while the store write waits: {:?}",
+        table(&during)
+    );
+    assert_eq!(
+        table(&during),
+        vec![(
+            "203.0.113.10/32".to_owned(),
+            "tcp:443".to_owned(),
+            "-".to_owned(),
+            "session allowance".to_owned(),
+            "applied (rev 2)".to_owned()
+        )],
+        "in force with no record yet, so the honest scope is session"
+    );
+    let during_snapshot = controller.snapshot();
+    assert_eq!(during_snapshot.session.len(), 1, "{during_snapshot:?}");
+    assert_eq!(
+        during_snapshot.session[0].revision,
+        Some(2),
+        "{during_snapshot:?}"
+    );
+    assert!(
+        during_snapshot.session[0].not_recorded_error.is_none(),
+        "the write has not failed: {during_snapshot:?}"
+    );
+    assert!(during_snapshot.project.is_empty(), "{during_snapshot:?}");
+
+    // Release before LOCK_WAIT expires: the write succeeds and the entry moves.
+    drop(lock);
+    let result = granting.await.unwrap();
+    assert!(
+        matches!(
+            result,
+            GrantResult::Applied {
+                scope: GrantScope::Project,
+                revision: 2,
+                ..
+            }
+        ),
+        "{result:?}"
+    );
+    let after = controller.effective_egress(Default::default());
+    assert_eq!(
+        table(&after),
+        vec![(
+            "203.0.113.10/32".to_owned(),
+            "tcp:443".to_owned(),
+            "-".to_owned(),
+            "project allowance".to_owned(),
+            "applied (rev 2)".to_owned()
+        )]
+    );
+    let after_snapshot = controller.snapshot();
+    assert!(after_snapshot.session.is_empty(), "{after_snapshot:?}");
+    assert_eq!(after_snapshot.project.len(), 1, "{after_snapshot:?}");
+    assert_eq!(
+        ProjectView::at_dir_for_tests(root.path(), &ProjectId::of(&project))
+            .allowances()
+            .len(),
+        1,
+        "the record the reply promises"
+    );
+    assert_eq!(recorder.calls(), 1, "one swap, before the write");
+}
+
 /// B-S4: the adoption-window re-derivation plan §8.5 P2 Part A asks for.
 ///
 /// A grant that arrives between `for_launch` and `adopt_boot_allowances` is queued
@@ -2661,6 +2775,424 @@ async fn live_tables_are_bounded_and_refused_with_a_reason() {
         other => panic!("{other:?}"),
     }
     assert_eq!(recorder.calls(), 256, "the refused grant swapped nothing");
+}
+
+// ---------------------------------------------------------------------------
+// #631: the effective-egress answer
+// ---------------------------------------------------------------------------
+
+/// One row, spelled the way `access egress` prints it, so a test can compare a
+/// whole table instead of field by field.
+fn row_cells(row: &crate::effective_egress::EgressRow) -> (String, String, String, String, String) {
+    (
+        row.destination.cell(),
+        row.ports.cell(),
+        row.via.clone().unwrap_or_else(|| "-".to_owned()),
+        row.source.cell().to_owned(),
+        row.status.cell(),
+    )
+}
+
+fn table(
+    egress: &crate::effective_egress::EffectiveEgress,
+) -> Vec<(String, String, String, String, String)> {
+    egress.rows.iter().map(row_cells).collect()
+}
+
+/// AC1's status and revision mapping: nothing is in force before the runtime
+/// attaches, a boot-adopted record is `applied` at rev 1, and a live swap is
+/// `applied (rev N)`.
+#[tokio::test]
+async fn effective_egress_marks_status_by_revision() {
+    let project = live_project("ee-status");
+    let mut launch = crate::network::plan_for_tests(&["api.example.com"], false);
+    let view = ProjectView::for_tests(&["tcp://adopted.example:8443"], 1_000, None);
+    let file = Path::new("/home/a/.config/agent-vm/allowances.json");
+    let (adopted, notice) = launch.adopt_recorded(file, view.allowances());
+    assert!(notice.is_none(), "{notice:?}");
+    assert_eq!(adopted.len(), 1);
+
+    let (controller, _root) = live(&project, launch.live_policy_plan(Some(file)));
+    let warnings =
+        controller.adopt_boot_allowances(&view, &adopted, launch.live_policy_plan(Some(file)));
+    assert!(warnings.is_empty(), "{warnings:?}");
+
+    // Before `follow`: starting, and every row queued.
+    let before = controller.effective_egress(Default::default());
+    assert_eq!(before.policy_revision, None);
+    assert!(
+        before
+            .rows
+            .iter()
+            .all(|row| row.status == crate::effective_egress::RowStatus::Queued),
+        "{:?}",
+        table(&before)
+    );
+    assert_eq!(
+        before.dns,
+        crate::effective_egress::DnsAuthorization::AllowedHostnamesOnly
+    );
+
+    let recorder = Recorder::new();
+    controller.attach_updater(recorder.updater());
+    let after = controller.effective_egress(Default::default());
+    assert_eq!(after.policy_revision, Some(1));
+    // Policy order: the configured name first, then the adopted one.
+    assert_eq!(
+        table(&after),
+        vec![
+            (
+                "api.example.com".to_owned(),
+                "443, 8443".to_owned(),
+                "-".to_owned(),
+                "--allow-egress".to_owned(),
+                "applied".to_owned()
+            ),
+            (
+                "adopted.example".to_owned(),
+                "8443".to_owned(),
+                "-".to_owned(),
+                "project allowance".to_owned(),
+                "applied".to_owned()
+            ),
+        ]
+    );
+
+    let granted = controller
+        .grant(
+            &live_refusals(),
+            None,
+            Some("tcp://[203.0.113.10/32]:443"),
+            GrantScope::Session,
+            2_000,
+        )
+        .await;
+    assert!(
+        matches!(granted, GrantResult::Applied { revision: 2, .. }),
+        "{granted:?}"
+    );
+    let after = controller.effective_egress(Default::default());
+    assert_eq!(
+        table(&after).last(),
+        Some(&(
+            "203.0.113.10/32".to_owned(),
+            "tcp:443".to_owned(),
+            "-".to_owned(),
+            "session allowance".to_owned(),
+            "applied (rev 2)".to_owned()
+        ))
+    );
+}
+
+/// Review finding 1: between `attach_updater` and the boot flush, a queued entry
+/// must not widen an applied row's ports, and the flush's outcome moves it.
+#[tokio::test]
+async fn a_queued_hostname_never_widens_an_applied_row() {
+    let project = live_project("ee-queued");
+    let launch =
+        crate::network::plan_for_tests(&["tcp://a.example:443", "tcp://b.example:8443"], false);
+    let (controller, _root) = live(&project, launch.live_policy_plan(None));
+    let queued = controller
+        .grant(
+            &live_refusals(),
+            None,
+            Some("tcp://a.example:8443"),
+            GrantScope::Session,
+            1_000,
+        )
+        .await;
+    assert!(
+        matches!(queued, GrantResult::QueuedForBoot { .. }),
+        "{queued:?}"
+    );
+
+    let recorder = Recorder::new();
+    controller.attach_updater(recorder.updater());
+    let pending = controller.effective_egress(Default::default());
+    assert_eq!(
+        table(&pending),
+        vec![
+            (
+                "a.example".to_owned(),
+                "443".to_owned(),
+                "-".to_owned(),
+                "--allow-egress".to_owned(),
+                "applied".to_owned()
+            ),
+            (
+                "b.example".to_owned(),
+                "8443".to_owned(),
+                "-".to_owned(),
+                "--allow-egress".to_owned(),
+                "applied".to_owned()
+            ),
+            (
+                "a.example".to_owned(),
+                "8443".to_owned(),
+                "-".to_owned(),
+                "session allowance".to_owned(),
+                "queued".to_owned()
+            ),
+        ]
+    );
+
+    // The flush promotes it: a separate row at its own revision, and the
+    // configured row still admits only 443.
+    assert!(controller.flush_queued().await.is_empty());
+    let flushed = controller.effective_egress(Default::default());
+    // Once confirmed, the session row is one of `a.example`'s own rows, so it
+    // sits beside the name it grants rather than after the whole section.
+    assert_eq!(
+        table(&flushed),
+        vec![
+            (
+                "a.example".to_owned(),
+                "443".to_owned(),
+                "-".to_owned(),
+                "--allow-egress".to_owned(),
+                "applied".to_owned()
+            ),
+            (
+                "a.example".to_owned(),
+                "8443".to_owned(),
+                "-".to_owned(),
+                "session allowance".to_owned(),
+                "applied (rev 2)".to_owned()
+            ),
+            (
+                "b.example".to_owned(),
+                "8443".to_owned(),
+                "-".to_owned(),
+                "--allow-egress".to_owned(),
+                "applied".to_owned()
+            ),
+        ]
+    );
+
+    // And a failed flush drops the entry rather than leaving a row claiming it.
+    let project = live_project("ee-queued-fail");
+    let launch =
+        crate::network::plan_for_tests(&["tcp://a.example:443", "tcp://b.example:8443"], false);
+    let (controller, _root) = live(&project, launch.live_policy_plan(None));
+    let queued = controller
+        .grant(
+            &live_refusals(),
+            None,
+            Some("tcp://a.example:8443"),
+            GrantScope::Session,
+            1_000,
+        )
+        .await;
+    assert!(
+        matches!(queued, GrantResult::QueuedForBoot { .. }),
+        "{queued:?}"
+    );
+    let recorder = Recorder::new();
+    recorder
+        .fail
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    controller.attach_updater(recorder.updater());
+    assert_eq!(controller.flush_queued().await.len(), 1, "one drop notice");
+    let failed = controller.effective_egress(Default::default());
+    assert_eq!(failed.policy_revision, Some(1));
+    assert_eq!(
+        table(&failed),
+        vec![
+            (
+                "a.example".to_owned(),
+                "443".to_owned(),
+                "-".to_owned(),
+                "--allow-egress".to_owned(),
+                "applied".to_owned()
+            ),
+            (
+                "b.example".to_owned(),
+                "8443".to_owned(),
+                "-".to_owned(),
+                "--allow-egress".to_owned(),
+                "applied".to_owned()
+            ),
+        ]
+    );
+}
+
+/// AC2 in memory: a grant adds a session row for a destination the launch also
+/// holds, and a revoke removes only that row.
+#[tokio::test]
+async fn effective_egress_tracks_grant_and_revoke() {
+    let project = live_project("ee-grant");
+    let destination = "tcp://[203.0.113.10/32]:443";
+    let (controller, _root) = live(
+        &project,
+        live_plan(&["api.example.com", destination], false),
+    );
+    let recorder = Recorder::new();
+    controller.attach_updater(recorder.updater());
+    let granted = controller
+        .grant(
+            &live_refusals(),
+            None,
+            Some(destination),
+            GrantScope::Session,
+            1_000,
+        )
+        .await;
+    assert!(
+        matches!(granted, GrantResult::Applied { revision: 2, .. }),
+        "{granted:?}"
+    );
+
+    // Two rows per (DESTINATION, SOURCE): the configured grant and the session
+    // allowance, which is what makes the revoke below meaningful.
+    let egress = controller.effective_egress(Default::default());
+    assert_eq!(
+        table(&egress),
+        vec![
+            (
+                "api.example.com".to_owned(),
+                "443".to_owned(),
+                "-".to_owned(),
+                "--allow-egress".to_owned(),
+                "applied".to_owned()
+            ),
+            (
+                "203.0.113.10/32".to_owned(),
+                "tcp:443".to_owned(),
+                "-".to_owned(),
+                "--allow-egress".to_owned(),
+                "applied".to_owned()
+            ),
+            (
+                "203.0.113.10/32".to_owned(),
+                "tcp:443".to_owned(),
+                "-".to_owned(),
+                "session allowance".to_owned(),
+                "applied (rev 2)".to_owned()
+            ),
+        ]
+    );
+    // Revoking the session allowance removes only its row: the configured rows
+    // for the same destination survive.
+    let revoked = controller
+        .revoke(
+            &Allowance::parse(destination).unwrap(),
+            RevokeScope::Session,
+        )
+        .await;
+    assert!(
+        matches!(revoked, RevokeResult::Revoked { .. }),
+        "{revoked:?}"
+    );
+    let egress = controller.effective_egress(Default::default());
+    assert_eq!(
+        table(&egress),
+        vec![
+            (
+                "api.example.com".to_owned(),
+                "443".to_owned(),
+                "-".to_owned(),
+                "--allow-egress".to_owned(),
+                "applied".to_owned()
+            ),
+            (
+                "203.0.113.10/32".to_owned(),
+                "tcp:443".to_owned(),
+                "-".to_owned(),
+                "--allow-egress".to_owned(),
+                "applied".to_owned()
+            ),
+        ]
+    );
+}
+
+/// ADR-0066: answering the question writes nothing.
+///
+/// The store root is the only place this controller can write, so the bytes of
+/// everything under it are the whole promise. A project grant runs first, so the
+/// root really holds the store's files: comparing an empty directory would pass
+/// whatever the read did.
+#[tokio::test]
+async fn effective_egress_writes_nothing() {
+    let project = live_project("ee-disk");
+    let (controller, root) = live(&project, live_plan(&["api.example.com"], false));
+    let recorder = Recorder::new();
+    controller.attach_updater(recorder.updater());
+    let recorded = controller
+        .grant(
+            &live_refusals(),
+            None,
+            Some("tcp://[203.0.113.10/32]:443"),
+            GrantScope::Project,
+            1_000,
+        )
+        .await;
+    assert!(
+        matches!(recorded, GrantResult::Applied { .. }),
+        "{recorded:?}"
+    );
+    assert!(
+        root.path().join(store::FILE).is_file(),
+        "the store files the answer must leave alone"
+    );
+    let before = snapshot_dir(root.path());
+    for _ in 0..3 {
+        let _ = controller.effective_egress(Default::default());
+    }
+    assert_eq!(snapshot_dir(root.path()), before);
+
+    // The comparison above must be able to fail, and in both ways the answer
+    // could hide a write: an entry of its own, and the bytes of one.
+    std::fs::create_dir(root.path().join("witness-dir")).unwrap();
+    assert_ne!(
+        snapshot_dir(root.path()),
+        before,
+        "an empty directory went unseen"
+    );
+    std::fs::remove_dir(root.path().join("witness-dir")).unwrap();
+    let store_file = root.path().join(store::FILE);
+    let bytes = std::fs::read(&store_file).unwrap();
+    std::fs::write(&store_file, b"").unwrap();
+    assert_ne!(
+        snapshot_dir(root.path()),
+        before,
+        "the store's bytes went unseen"
+    );
+    std::fs::write(&store_file, &bytes).unwrap();
+    assert_eq!(snapshot_dir(root.path()), before);
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Snapshot {
+    Directory,
+    File(Vec<u8>),
+}
+
+/// Every entry under `path` (relative to it), directories included, and a
+/// file's bytes, so "nothing was written" also sees an empty directory. No
+/// error is swallowed: a snapshot that cannot be taken is not an empty bytes
+/// value that compares equal to what was there before.
+fn snapshot_dir(path: &Path) -> Vec<(String, Snapshot)> {
+    fn walk(root: &Path, dir: &Path, entries: &mut Vec<(String, Snapshot)>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let target = entry.path();
+            let relative = target
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            if entry.file_type().unwrap().is_dir() {
+                entries.push((relative, Snapshot::Directory));
+                walk(root, &target, entries);
+            } else {
+                entries.push((relative, Snapshot::File(std::fs::read(&target).unwrap())));
+            }
+        }
+    }
+    let mut entries = Vec::new();
+    walk(path, path, &mut entries);
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    entries
 }
 
 // ---------------------------------- R19/AC12: first answer wins, both orders ---

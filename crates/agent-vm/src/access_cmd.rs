@@ -44,8 +44,11 @@ pub(crate) enum AccessSubcommand {
     /// Allow one refused destination in one session (and, with --project, in
     /// this project from now on)
     Allow(AllowArgs),
-    /// List recorded project allowances and live session allowances
+    /// List recorded project allowances and live session allowances (`access
+    /// egress` shows everything a session may reach)
     Allowances(AllowancesArgs),
+    /// Show what one running session's guest may reach now: its effective egress
+    Egress(EgressArgs),
     /// Revoke an allowance from this session and/or this project
     Revoke(RevokeArgs),
 }
@@ -65,6 +68,13 @@ pub(crate) struct AllowArgs {
 #[derive(ClapArgs)]
 pub(crate) struct AllowancesArgs {
     /// Show only this session's allowances
+    #[arg(long, value_name = "ID")]
+    pub(crate) session: Option<String>,
+}
+
+#[derive(ClapArgs)]
+pub(crate) struct EgressArgs {
+    /// Which running session, when more than one is running
     #[arg(long, value_name = "ID")]
     pub(crate) session: Option<String>,
 }
@@ -91,6 +101,13 @@ pub(crate) struct RevokeArgs {
 /// against a real server and a real log, without a second `run_with_timeout`
 /// copy (#514).
 pub(crate) fn run(args: Args) -> Result<i32> {
+    // Before anything reads this project: only the launcher can answer, and a
+    // guest's copy of this binary would otherwise read the guest's own state.
+    if matches!(args.command, Some(AccessSubcommand::Egress(_)))
+        && egress::in_guest(|name| std::env::var(name).ok())
+    {
+        return egress::print_host_only(&mut std::io::stderr());
+    }
     #[allow(clippy::disallowed_methods)] // one capture per command: every consumer borrows it.
     let project = crate::project::ProjectDir::capture()?;
     let session = ProjectSession::for_project(&project)?;
@@ -155,7 +172,15 @@ pub(crate) async fn run_in(
     // One warning for a store that is not in force, with the discovery
     // warnings: a row that says "not confirmed" must not be the only trace of a
     // store this build could not read.
-    if let Some(notice) = allowances.notice() {
+    //
+    // Not for `access egress`: recorded-but-unapplied allowances are not
+    // effective egress, so the warning's subject is outside that command, and
+    // beside a live session its wording contradicts the table (which shows the
+    // boot-adopted rows `applied`). `access allowances` is where it belongs, and
+    // the no-session pointer sends the reader there.
+    if !matches!(args.command, Some(AccessSubcommand::Egress(_)))
+        && let Some(notice) = allowances.notice()
+    {
         writeln!(err, "warning: {notice}").context("writing the store warning")?;
     }
 
@@ -194,6 +219,9 @@ pub(crate) async fn run_in(
         }
         Some(AccessSubcommand::Allowances(list)) => {
             return run_allowances(allowances, &discovery, &sessions, list, out, err);
+        }
+        Some(AccessSubcommand::Egress(egress)) => {
+            return egress::run_egress(dir, &sessions, &discovery, egress, out, err).await;
         }
         Some(AccessSubcommand::Revoke(revoke)) => {
             return run_revoke(dir, project, allowances, &sessions, revoke, out, err).await;
@@ -292,6 +320,50 @@ fn label(
     "ended (unclean)"
 }
 
+/// The labels `access` treats as an active session: one that can be revoked, or
+/// whose effective egress can be asked for. Spelled once, because two commands
+/// must agree on it.
+fn is_active_label(label: &str) -> bool {
+    matches!(
+        label,
+        "running" | "not responding" | "running (no control socket)"
+    )
+}
+
+/// Rows padded to the widest cell, two spaces apart, the last column unpadded.
+///
+/// Cells arrive escaped: padding counts `char`s of the escaped text, so a cell
+/// never widens a column the terminal cannot show.
+fn write_columns(
+    out: &mut impl std::io::Write,
+    headers: &[&str],
+    rows: &[Vec<String>],
+) -> Result<()> {
+    let mut widths: Vec<usize> = headers.iter().map(|header| header.len()).collect();
+    for row in rows {
+        for (index, cell) in row.iter().enumerate() {
+            widths[index] = widths[index].max(cell.chars().count());
+        }
+    }
+    let render = |cells: &[String]| -> String {
+        let mut line = String::new();
+        for (index, cell) in cells.iter().enumerate() {
+            if index + 1 == cells.len() {
+                line.push_str(cell);
+            } else {
+                line.push_str(&format!("{:<width$}  ", cell, width = widths[index]));
+            }
+        }
+        line.trim_end().to_owned()
+    };
+    let header_cells: Vec<String> = headers.iter().map(|header| (*header).to_owned()).collect();
+    writeln!(out, "{}", render(&header_cells)).context("writing the table header")?;
+    for row in rows {
+        writeln!(out, "{}", render(row)).context("writing a table row")?;
+    }
+    Ok(())
+}
+
 /// The table, with every cell escaped where it is built.
 ///
 /// Each *field* is escaped at the point it enters a cell rather than the finished
@@ -331,29 +403,8 @@ fn print_table(
         "SESSION",
         "ACTION",
     ];
-    let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
-    for row in &rows {
-        for (index, cell) in row.iter().enumerate() {
-            widths[index] = widths[index].max(cell.chars().count());
-        }
-    }
-    let render = |cells: &[String]| -> String {
-        let mut line = String::new();
-        for (index, cell) in cells.iter().enumerate() {
-            if index + 1 == cells.len() {
-                line.push_str(cell);
-            } else {
-                line.push_str(&format!("{:<width$}  ", cell, width = widths[index]));
-            }
-        }
-        line.trim_end().to_owned()
-    };
-    let header_cells: Vec<String> = headers.iter().map(|h| (*h).to_owned()).collect();
-    writeln!(out, "{}", render(&header_cells)).context("writing the table header")?;
-    for row in &rows {
-        writeln!(out, "{}", render(row)).context("writing a table row")?;
-    }
-    Ok(())
+    let rows: Vec<Vec<String>> = rows.into_iter().map(|row| row.to_vec()).collect();
+    write_columns(out, &headers, &rows)
 }
 
 /// Untrusted text, rendered so no terminal control byte can reach the screen.
@@ -916,28 +967,8 @@ fn run_allowances(
         return Ok(0);
     }
     let headers = ["SCOPE", "DESTINATION", "RECORDED", "SESSION", "STATUS"];
-    let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
-    for row in &rows {
-        for (index, cell) in row.iter().enumerate() {
-            widths[index] = widths[index].max(cell.chars().count());
-        }
-    }
-    let render = |cells: &[String]| -> String {
-        let mut line = String::new();
-        for (index, cell) in cells.iter().enumerate() {
-            if index + 1 == cells.len() {
-                line.push_str(cell);
-            } else {
-                line.push_str(&format!("{:<width$}  ", cell, width = widths[index]));
-            }
-        }
-        line.trim_end().to_owned()
-    };
-    let header_cells: Vec<String> = headers.iter().map(|h| (*h).to_owned()).collect();
-    writeln!(out, "{}", render(&header_cells)).context("writing the allowance header")?;
-    for row in &rows {
-        writeln!(out, "{}", render(row)).context("writing an allowance row")?;
-    }
+    let rows: Vec<Vec<String>> = rows.into_iter().map(|row| row.to_vec()).collect();
+    write_columns(out, &headers, &rows)?;
     Ok(0)
 }
 
@@ -971,7 +1002,9 @@ async fn run_revoke(
 
     // The record is deleted **before** a target can be chosen, so an ambiguous
     // target or a session that cannot confirm cannot keep a durable grant the
-    // user asked to remove (R10, V7).
+    // user asked to remove (R10, V7). This is about a grant already recorded: a
+    // concurrent grant can still write the record after this delete, because
+    // `LiveAllowances::op_lock` does not cover this store write.
     let mut removed = false;
     if matches!(scope, RevokeScope::Project | RevokeScope::All) {
         match allowances
@@ -994,12 +1027,7 @@ async fn run_revoke(
     // The target: the named session, or the one active session, or none.
     let active: Vec<&Row> = sessions
         .iter()
-        .filter(|row| {
-            matches!(
-                row.label,
-                "running" | "not responding" | "running (no control socket)"
-            )
-        })
+        .filter(|row| is_active_label(row.label))
         .collect();
     // R11: the sibling line names every other session *before* the change, and it
     // does not depend on which session is the target — so it is printed before
@@ -1243,6 +1271,8 @@ fn report_revoke(
         }
     }
 }
+
+mod egress;
 
 #[cfg(test)]
 mod tests;

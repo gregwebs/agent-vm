@@ -181,13 +181,11 @@ fn hostname_notices_show_effective_ports() {
 }
 
 // The literal names and line operators see for the provider set the compact
-// form exists for.
+// form exists for: past three names the count is the whole line.
 #[test]
-fn seven_bare_hostnames_share_one_grant_line() {
-    let grant = format!(
-        "==> Egress policy: allowing TLS to {} on ports 443",
-        SEVEN.join(", ")
-    );
+fn seven_bare_hostnames_collapse_to_a_count_and_a_pointer() {
+    const COLLAPSED: &str = "==> Egress policy: allowing TLS to 7 hosts\n\
+==> list: agent-vm access egress\n";
     let mut output = Vec::new();
     resolve_saved(Default::default(), &SEVEN, empty_cli())
         .write_notices(&mut output)
@@ -195,27 +193,27 @@ fn seven_bare_hostnames_share_one_grant_line() {
     assert_eq!(
         String::from_utf8(output).unwrap(),
         format!(
-            "==> Egress authority: persisted grants from \"/home/a/.config/agent-vm/config.toml\"\n{grant} (persisted grants)\n"
+            "==> Egress authority: persisted grants from \"/home/a/.config/agent-vm/config.toml\"\n{COLLAPSED}"
         )
     );
     // Without a user table no source suffix appears at all.
     let mut output = Vec::new();
     hostname_auth(0, &SEVEN).write_notices(&mut output).unwrap();
-    assert_eq!(String::from_utf8(output).unwrap(), format!("{grant}\n"));
+    assert_eq!(String::from_utf8(output).unwrap(), COLLAPSED);
 }
 
 #[test]
-fn every_name_of_a_large_group_is_printed_once_without_truncation() {
+fn a_large_bare_group_is_counted_not_listed() {
     let names: Vec<String> = (0..9).map(|i| format!("h{i}.example")).collect();
     let specs: Vec<&str> = names.iter().map(String::as_str).collect();
     let mut output = Vec::new();
     hostname_auth(0, &specs).write_notices(&mut output).unwrap();
     let text = String::from_utf8(output).unwrap();
-    assert!(text.starts_with(&format!(
-        "==> Egress policy: allowing TLS to {} on ports 443\n",
-        names.join(", ")
-    )));
-    assert_eq!(text.matches("on ports").count(), 1, "{text}");
+    assert_eq!(
+        text,
+        "==> Egress policy: allowing TLS to 9 hosts\n==> list: agent-vm access egress\n"
+    );
+    assert_eq!(text.matches("on ports").count(), 0, "{text}");
 }
 
 // A writer that fails after a bounded prefix must surface the error from the
@@ -242,7 +240,7 @@ impl std::io::Write for FailAfter {
 #[test]
 fn hostname_notice_write_error_after_the_grant_line_is_returned() {
     const PREFIX: &str = "==> Egress policy: --allow-internet-egress enabled (public internet; does not itself grant LAN or host)\n\
-==> Egress policy: allowing TLS to api.example.com on ports 443\n";
+==> Egress policy: allowing TLS to api.example.com\n";
     let mut writer = FailAfter {
         written: Vec::new(),
         remaining: PREFIX.len(),

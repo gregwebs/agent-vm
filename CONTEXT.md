@@ -1041,6 +1041,15 @@ verified user `[network]`, fixed at `resolve`. **Recorded** is the project
 allowance record, adopted at boot and replaceable live. **Session** is a live
 in-memory grant. No single signature carries two of these senses.
 
+**Effective egress**: what one session's guest may reach right now — its
+configured authority, its applied project allowances and its session
+allowances, as of the runtime's latest confirmed policy revision. A recorded
+allowance not yet applied to the session is not effective egress. Credential
+and GitHub repository rules narrow effective egress; they never add to it.
+`agent-vm access egress` shows it, asked of the launcher over protocol v3;
+nothing about it is stored.
+_Avoid_: "all egress", "allow list".
+
 **Project allowance record**: the file one project's allowances are read from:
 `~/.config/agent-vm/allowances.json`, keyed by the full SHA-256 of the project's
 canonical path, with each record's `path` column as that digest's preimage. It is

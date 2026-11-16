@@ -1362,10 +1362,11 @@ async fn project_grant_writes_no_record_when_live_session_cannot_confirm() {
     live.finish().await;
 }
 
-/// C3(d): the runtime applies it, the store cannot record it, and both `access`
-/// and `access allowances` render the demoted session-only status afterwards.
+/// C3(d): the runtime applies it, the store cannot record it, and `access`,
+/// `access allowances` and `access egress` render the demoted session-only
+/// status afterwards.
 #[tokio::test]
-async fn applied_not_recorded_demotes_to_session_scope_across_subsequent_access_and_allowances_calls()
+async fn applied_not_recorded_demotes_to_session_scope_across_subsequent_access_allowances_and_egress_calls()
  {
     let root = tempfile::tempdir().unwrap();
     let updater = Arc::new(Updater::default());
@@ -1400,6 +1401,20 @@ async fn applied_not_recorded_demotes_to_session_scope_across_subsequent_access_
     assert!(
         listing.contains("not recorded for the project") && listing.contains("rev 2"),
         "{listing}"
+    );
+    // `access egress` keeps the row in the session tier at the revision the
+    // runtime confirmed, never the project tier the record does not carry.
+    let session_id = live.id().as_str().to_owned();
+    let (status, egress, err) = run_command(root.path(), egress_request(None), &view).await;
+    assert_eq!(status, 0, "{err}");
+    assert_eq!(
+        egress,
+        format!(
+            "Session {session_id} (policy rev 2)\n\
+DESTINATION      PORTS    VIA  SOURCE             STATUS\n\
+203.0.113.10/32  tcp:443  -    session allowance  applied (rev 2)\n\
+DNS: denied\n"
+        )
     );
     live.finish().await;
 }
@@ -1892,4 +1907,482 @@ async fn allow_on_ended_session_records_project_and_refuses_session_only() {
         1,
         "the record is what the next launch reads"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Group D: `access egress` (#631)
+// ---------------------------------------------------------------------------
+
+/// `start_fixture` over an explicit launch authority: the egress table reports
+/// the policy, not the refusals.
+async fn start_fixture_plan(
+    root: &Path,
+    allow_egress: &[&str],
+    updater: Option<crate::allowances::PolicyUpdater>,
+) -> crate::session_control::LiveSession {
+    let session = project(root);
+    let project = live_project(root);
+    let store = crate::allowances::StoreHandle::at_for_tests(&root.join("allowances-store"));
+    let plan = crate::network::plan_for_tests(allow_egress, false).live_policy_plan(None);
+    let live = crate::session_control::LiveSession::start(
+        &session,
+        crate::session_control::LiveSetup {
+            project: &project,
+            store,
+            plan,
+        },
+    )
+    .await;
+    if let Some(updater) = updater {
+        live.allowances().attach_updater(updater);
+    }
+    live
+}
+
+fn egress_request(session: Option<&str>) -> AccessSubcommand {
+    AccessSubcommand::Egress(EgressArgs {
+        session: session.map(str::to_owned),
+    })
+}
+
+/// AC1 and AC2: the whole table before the allow, after it, and after the
+/// revoke — byte for byte. A cell in the wrong column or a row out of order must
+/// fail here, because this is the only test of the real controller → socket →
+/// CLI path.
+#[tokio::test]
+async fn egress_end_to_end_allow_then_revoke() {
+    let root = tempfile::tempdir().unwrap();
+    let updater = Arc::new(Updater::default());
+    let live = start_fixture_plan(root.path(), &["api.example.com"], Some(updater.handle())).await;
+    let id = live.id().as_str().to_owned();
+    let view = live_view(root.path());
+
+    let (status, out, err) = run_command(root.path(), egress_request(None), &view).await;
+    assert_eq!(status, 0, "{out}{err}");
+    assert_eq!(
+        out,
+        format!(
+            "Session {id} (policy rev 1)\n\
+DESTINATION      PORTS  VIA  SOURCE          STATUS\n\
+api.example.com  443    -    --allow-egress  applied\n\
+DNS: allowed hostnames only\n"
+        )
+    );
+
+    let denied = ingest_denial(&live);
+    let (status, _, err) = run_command(root.path(), allow(&denied, false), &view).await;
+    assert_eq!(status, 0, "{err}");
+    let (status, out, err) = run_command(root.path(), egress_request(None), &view).await;
+    assert_eq!(status, 0, "{out}{err}");
+    // The new row goes last, in the address section, and the wider cells re-pad
+    // the whole table.
+    assert_eq!(
+        out,
+        format!(
+            "Session {id} (policy rev 2)\n\
+DESTINATION      PORTS    VIA  SOURCE             STATUS\n\
+api.example.com  443      -    --allow-egress     applied\n\
+203.0.113.10/32  tcp:443  -    session allowance  applied (rev 2)\n\
+DNS: allowed hostnames only\n"
+        )
+    );
+
+    let (status, _, err) = run_command(
+        root.path(),
+        AccessSubcommand::Revoke(RevokeArgs {
+            destination: "tcp://[203.0.113.10/32]:443".to_owned(),
+            project: false,
+            session_only: true,
+            session: None,
+        }),
+        &view,
+    )
+    .await;
+    assert_eq!(status, 0, "{err}");
+    let (status, out, err) = run_command(root.path(), egress_request(None), &view).await;
+    assert_eq!(status, 0, "{out}{err}");
+    // Only the session row is gone; the configured row and its padding stay.
+    assert_eq!(
+        out,
+        format!(
+            "Session {id} (policy rev 3)\n\
+DESTINATION      PORTS  VIA  SOURCE          STATUS\n\
+api.example.com  443    -    --allow-egress  applied\n\
+DNS: allowed hostnames only\n"
+        )
+    );
+}
+
+/// Finding 3: `access egress` prints no store warning. Its subject is not
+/// effective egress, and `access allowances` is where it belongs; the pointer
+/// line sends the reader there.
+#[tokio::test]
+async fn egress_prints_no_store_warning_with_no_session() {
+    let root = tempfile::tempdir().unwrap();
+    let view = crate::allowances::ProjectView::for_tests(
+        &[],
+        NOW - 60_000,
+        Some(
+            "project allowances not applied: \"/home/a/.config/agent-vm/allowances.json\" could not be used (not a JSON document this build reads); this version does not repair it — move it aside to start over",
+        ),
+    );
+    let (status, out, err) = run_command(root.path(), egress_request(None), &view).await;
+    assert_eq!(status, 0, "{out}{err}");
+    assert_eq!(
+        out,
+        "No running session in this project; `agent-vm access allowances` lists its recorded project allowances.\n"
+    );
+    assert_eq!(err, "", "the store warning is not this command's");
+}
+
+/// Finding 3, the misleading case: beside a live table, whose boot-adopted rows
+/// say `applied`, a warning saying they were "not applied" contradicts it.
+#[tokio::test]
+async fn egress_prints_no_store_warning_with_a_live_session() {
+    let root = tempfile::tempdir().unwrap();
+    let updater = Arc::new(Updater::default());
+    let live = start_fixture_plan(root.path(), &["api.example.com"], Some(updater.handle())).await;
+    let view = crate::allowances::ProjectView::for_tests(
+        &[],
+        NOW - 60_000,
+        Some(
+            "project allowances not applied: \"/home/a/.config/agent-vm/allowances.json\" could not be used (not a JSON document this build reads); this version does not repair it — move it aside to start over",
+        ),
+    );
+    let (status, out, err) = run_command(root.path(), egress_request(None), &view).await;
+    assert_eq!(status, 0, "{out}{err}");
+    assert!(
+        out.starts_with(&format!("Session {} (policy rev 1)\n", live.id().as_str())),
+        "{out}"
+    );
+    assert!(out.contains("api.example.com"), "{out}");
+    assert!(
+        out.contains(" applied\n"),
+        "the row the warning contradicts: {out}"
+    );
+    assert_eq!(err, "", "no store warning beside the table");
+}
+
+/// AC3: no session is one pointer line and a success status.
+///
+/// "No running session" includes a project whose only session has ended: the
+/// refusal log row is a candidate, but not an active one, so the pointer is the
+/// whole answer. Verified against a real launcher whose session had ended.
+#[tokio::test]
+async fn egress_with_no_session_points_and_exits_0() {
+    let root = tempfile::tempdir().unwrap();
+    let view = live_view(root.path());
+    let (status, out, err) = run_command(root.path(), egress_request(None), &view).await;
+    assert_eq!(status, 0, "{err}");
+    assert_eq!(
+        out,
+        "No running session in this project; `agent-vm access allowances` lists its recorded project allowances.\n"
+    );
+    assert_eq!(err, "");
+
+    // An ended session in the log changes nothing: still the pointer, exit 0.
+    session_dir(root.path())
+        .write(&snapshot("0000000b", NOW - 10 * 60 * 1000, vec![]), NOW)
+        .unwrap();
+    let (status, out, err) = run_command(root.path(), egress_request(None), &view).await;
+    assert_eq!(status, 0, "{err}");
+    assert_eq!(
+        out,
+        "No running session in this project; `agent-vm access allowances` lists its recorded project allowances.\n"
+    );
+    assert_eq!(err, "");
+}
+
+/// AC3: an ambiguous selection is a usage error naming every candidate.
+#[tokio::test]
+async fn egress_with_two_sessions_is_a_usage_error_naming_both() {
+    let root = tempfile::tempdir().unwrap();
+    let first = start_fixture_plan(root.path(), &[], None).await;
+    let second = start_fixture_plan(root.path(), &[], None).await;
+    let view = live_view(root.path());
+    let (status, out, err) = run_command(root.path(), egress_request(None), &view).await;
+    assert_eq!(status, 2, "{out}{err}");
+    assert_eq!(out, "", "nothing on stdout");
+    assert!(err.contains("more than one session is running"), "{err}");
+    for live in [&first, &second] {
+        assert!(err.contains(live.id().as_str()), "{err}");
+    }
+    assert!(err.contains("--session <ID>"), "{err}");
+}
+
+/// AC3's `--session` cases: the ended and the unknown one are refused, the
+/// running one is selected.
+#[tokio::test]
+async fn egress_named_session_selects_it_and_rejects_ended_and_unknown() {
+    let root = tempfile::tempdir().unwrap();
+    let live = start_fixture_plan(root.path(), &["api.example.com"], None).await;
+    let dir = session_dir(root.path());
+    // A logged session with no socket and a stale heartbeat: `ended (unclean)`.
+    dir.write(&snapshot("0000000a", NOW - 10 * 60 * 1000, vec![]), NOW)
+        .unwrap();
+    let view = live_view(root.path());
+    let id = live.id().as_str().to_owned();
+
+    let (status, out, err) = run_command(root.path(), egress_request(Some(&id)), &view).await;
+    assert_eq!(status, 0, "{out}{err}");
+    assert!(out.starts_with(&format!("Session {id} ")), "{out}");
+
+    let (status, out, err) =
+        run_command(root.path(), egress_request(Some("0000000a")), &view).await;
+    assert_eq!(status, 1, "{out}{err}");
+    assert_eq!(out, "");
+    assert!(
+        err.contains("session 0000000a (ended (unclean)) is not running; effective egress exists only while a session runs"),
+        "{err}"
+    );
+
+    let (status, out, err) =
+        run_command(root.path(), egress_request(Some("0000000b")), &view).await;
+    assert_eq!(status, 1, "{out}{err}");
+    assert_eq!(out, "");
+    assert!(
+        err.contains("no session 0000000b in this project's running sessions or refusal log"),
+        "{err}"
+    );
+
+    let (status, _, err) = run_command(root.path(), egress_request(Some("nothex")), &view).await;
+    assert_eq!(status, 1);
+    assert!(
+        err.contains("`--session` takes an 8-hex session ID"),
+        "{err}"
+    );
+}
+
+/// Review finding 3: a socket that accepted and never answered, with no log
+/// record, is a candidate — reported, never silently skipped.
+#[tokio::test]
+async fn egress_counts_a_socket_only_unresponsive_session() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = session_dir(root.path());
+    let hung = SessionId::parse("0000000c").unwrap();
+    let listener = tokio::net::UnixListener::bind(dir.socket_path(&hung)).unwrap();
+    let held = tokio::spawn(async move {
+        let mut streams = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            streams.push(stream);
+        }
+    });
+    let view = live_view(root.path());
+
+    // Alone: reported, not treated as "no session".
+    let (status, out, err) = run_command(root.path(), egress_request(None), &view).await;
+    assert_eq!(status, 1, "{out}{err}");
+    assert_eq!(out, "");
+    assert_eq!(
+        err,
+        "effective egress is not available for session 0000000c (not responding): it is not responding\n"
+    );
+
+    // Beside a healthy session: the selection is ambiguous, and every active
+    // candidate is named with its own label — the log row first, then the
+    // socket-only one. This is the whole line: a wrong label, separator or
+    // order must fail here.
+    let live = start_fixture_plan(root.path(), &[], None).await;
+    let (status, out, err) = run_command(root.path(), egress_request(None), &view).await;
+    assert_eq!(status, 2, "{out}{err}");
+    assert_eq!(out, "");
+    assert_eq!(
+        err,
+        format!(
+            "more than one session is running: {} (running), 0000000c (not responding); name one with --session <ID>\n",
+            live.id().as_str()
+        )
+    );
+
+    // Named: reported not available, never "no session".
+    let (status, out, err) =
+        run_command(root.path(), egress_request(Some("0000000c")), &view).await;
+    assert_eq!(status, 1, "{out}{err}");
+    assert!(
+        err.contains("effective egress is not available for session 0000000c (not responding)"),
+        "{err}"
+    );
+
+    // The other commands are unchanged: the unresponsive warning still prints.
+    let (status, _, err) = run_command(
+        root.path(),
+        AccessSubcommand::Allowances(AllowancesArgs { session: None }),
+        &view,
+    )
+    .await;
+    assert_eq!(status, 0);
+    assert!(
+        err.contains("session 0000000c is not responding; its live allowances are not shown"),
+        "{err}"
+    );
+    held.abort();
+}
+
+/// The Specification's example, byte for byte, plus the two degenerate tables
+/// and escaping of every wire string.
+#[test]
+fn egress_render_golden() {
+    use crate::effective_egress::*;
+    let row = |destination: RowDestination,
+               ports: RowPorts,
+               via: Option<&str>,
+               source: RowSource,
+               status: RowStatus| EgressRow {
+        destination,
+        ports,
+        via: via.map(str::to_owned),
+        source,
+        status,
+    };
+    let egress = EffectiveEgress {
+        policy_revision: Some(2),
+        rows: vec![
+            row(
+                RowDestination::Hostname {
+                    name: "api.anthropic.com".to_owned(),
+                },
+                RowPorts::Tls { ports: vec![443] },
+                Some("set:anthropic"),
+                RowSource::PersistedGrant,
+                RowStatus::Applied,
+            ),
+            row(
+                RowDestination::Hostname {
+                    name: "platform.claude.com".to_owned(),
+                },
+                RowPorts::Tls { ports: vec![443] },
+                Some("set:anthropic"),
+                RowSource::PersistedGrant,
+                RowStatus::Applied,
+            ),
+            row(
+                RowDestination::Hostname {
+                    name: "crates.io".to_owned(),
+                },
+                RowPorts::Tls { ports: vec![443] },
+                Some("set:rust"),
+                RowSource::PersistedGrant,
+                RowStatus::Applied,
+            ),
+            row(
+                RowDestination::Hostname {
+                    name: "api.github.com".to_owned(),
+                },
+                RowPorts::Tls { ports: vec![443] },
+                None,
+                RowSource::PersistedGrant,
+                RowStatus::Applied,
+            ),
+            row(
+                RowDestination::Address {
+                    network: "203.0.113.10/32".to_owned(),
+                },
+                RowPorts::Address {
+                    transport: Some(WireTransport::Tcp),
+                    port: Some(443),
+                },
+                None,
+                RowSource::SessionAllowance,
+                RowStatus::AppliedAt { revision: 2 },
+            ),
+            row(
+                RowDestination::Group {
+                    group: EgressGroup::Internet,
+                },
+                RowPorts::All,
+                None,
+                RowSource::AllowInternetEgress,
+                RowStatus::Applied,
+            ),
+        ],
+        dns: DnsAuthorization::AnyName {
+            via: vec!["--allow-internet-egress".to_owned()],
+        },
+        narrowing: EgressNarrowing {
+            credential_rules: true,
+            github_repos: vec!["gregwebs/agent-vm".to_owned()],
+        },
+    };
+    let id = SessionId::parse("3f9a12c4").unwrap();
+    assert_eq!(
+        egress::render(&id, &egress).unwrap().join("\n"),
+        "Session 3f9a12c4 (policy rev 2)\n\
+DESTINATION          PORTS    VIA            SOURCE                   STATUS\n\
+api.anthropic.com    443      set:anthropic  persisted grant          applied\n\
+platform.claude.com  443      set:anthropic  persisted grant          applied\n\
+crates.io            443      set:rust       persisted grant          applied\n\
+api.github.com       443      -              persisted grant          applied\n\
+203.0.113.10/32      tcp:443  -              session allowance        applied (rev 2)\n\
+internet (public)    all      -              --allow-internet-egress  applied\n\
+DNS: any name, via --allow-internet-egress\n\
+Narrowed by: credential rules; GitHub repos gregwebs/agent-vm"
+    );
+
+    // Starting: no confirmed revision, and nothing narrowing yet.
+    let starting = EffectiveEgress {
+        policy_revision: None,
+        rows: egress.rows.clone(),
+        dns: DnsAuthorization::Denied,
+        narrowing: EgressNarrowing::default(),
+    };
+    let lines = egress::render(&id, &starting).unwrap();
+    assert_eq!(lines[0], "Session 3f9a12c4 (starting)");
+    assert_eq!(lines.last().unwrap(), "DNS: denied");
+
+    // Nothing allowed: header, then exactly one sentence.
+    let nothing = EffectiveEgress {
+        policy_revision: Some(1),
+        rows: Vec::new(),
+        dns: DnsAuthorization::Denied,
+        narrowing: EgressNarrowing::default(),
+    };
+    assert_eq!(
+        egress::render(&id, &nothing).unwrap(),
+        vec![
+            "Session 3f9a12c4 (policy rev 1)".to_owned(),
+            "All guest egress denied.".to_owned(),
+        ]
+    );
+
+    // Every wire string is escaped: repo names come from the project's remotes.
+    let hostile = EffectiveEgress {
+        policy_revision: Some(1),
+        rows: vec![row(
+            RowDestination::Hostname {
+                name: "\u{1b}[31mhost".to_owned(),
+            },
+            RowPorts::Tls { ports: vec![443] },
+            Some("\u{1b}[32mset:x"),
+            RowSource::PersistedGrant,
+            RowStatus::Applied,
+        )],
+        dns: DnsAuthorization::AnyName {
+            via: vec!["\u{1b}[33mflag".to_owned()],
+        },
+        narrowing: EgressNarrowing {
+            credential_rules: true,
+            github_repos: vec!["\u{1b}[34mowner/repo".to_owned()],
+        },
+    };
+    let rendered = egress::render(&id, &hostile).unwrap().join("\n");
+    assert!(!rendered.contains('\u{1b}'), "{rendered}");
+    assert!(rendered.contains("\\x1b[31mhost"), "{rendered}");
+    assert!(rendered.contains("\\x1b[32mset:x"), "{rendered}");
+    assert!(rendered.contains("\\x1b[33mflag"), "{rendered}");
+    assert!(rendered.contains("\\x1b[34mowner/repo"), "{rendered}");
+}
+
+/// The guest marker is the launcher's own, and nothing else.
+#[test]
+fn in_guest_is_exactly_is_sandbox_1() {
+    let lookup = |value: Option<&'static str>| {
+        move |name: &str| {
+            assert_eq!(name, "IS_SANDBOX", "one variable decides this");
+            value.map(str::to_owned)
+        }
+    };
+    assert!(egress::in_guest(lookup(Some("1"))));
+    for value in [None, Some("0"), Some("true"), Some(" 1"), Some("1 ")] {
+        assert!(!egress::in_guest(lookup(value)), "{value:?}");
+    }
 }

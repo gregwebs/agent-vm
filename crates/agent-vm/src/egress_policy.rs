@@ -95,6 +95,9 @@ use crate::egress_hostname::{
 use crate::egress_reference::{
     AllowanceEntry, EgressNamespace, EgressReference, EntryOrigin, ResolvedAllowances, render_list,
 };
+
+mod hostname_notice;
+mod view;
 /// Borrowed verified user authority; resolution assembles it without filesystem reads.
 pub(crate) struct UserEgress<'a> {
     pub(crate) file: &'a std::path::Path,
@@ -575,32 +578,6 @@ impl EgressAuthority {
             project: self.is_recorded(allowance),
         }
     }
-    fn hostname_sources(
-        &self,
-        name: &microsandbox_network::policy::DomainName,
-    ) -> Option<TierSources<'_>> {
-        if !self.shows_sources() {
-            return None;
-        }
-        // A recorded hostname is matched by its Domain, not by its spelling, so
-        // a configured `api.example.com` and a recorded
-        // `tcp://api.example.com:8443` share one rule and one tag (ADR-0065 D4).
-        let project = self.recorded_entries().is_some_and(|recorded| {
-            recorded.destinations.iter().any(|allowance| {
-                matches!(allowance, Allowance::Hostname(hostname) if hostname.domain() == name)
-            })
-        });
-        Some(TierSources {
-            user: self
-                .provenance
-                .as_ref()
-                .map_or_else(EntryOrigin::default, |p| {
-                    p.user_entries.hostname_origin(name)
-                }),
-            cli: self.cli.hostname_origin(name),
-            project,
-        })
-    }
     /// Whether this launch's **configured** authority names the allowance: a
     /// live revoke can remove the project record and the session entry, but never
     /// what the launch was started with.
@@ -746,88 +723,14 @@ impl EgressAuthority {
                 )?;
             }
         }
-        if let Some(ports) = self.intercepted_ports() {
-            // Display only: names sharing a complete effective port vector and
-            // hostname sources share one line instead of one line per name.
-            // Rules stay per name (`policy`).
-            struct HostnameNoticeGroup<'a> {
-                ports: Vec<u16>,
-                sources: Option<TierSources<'a>>,
-                names: Vec<String>,
-            }
-            let mut groups: Vec<HostnameNoticeGroup<'_>> = Vec::new();
-            for rule in domain_rules(&self.effective.hostnames, &ports) {
-                let microsandbox_network::policy::Destination::Domain(name) = rule.destination
-                else {
-                    continue;
-                };
-                let effective: Vec<u16> = rule.ports.iter().map(|p| p.start).collect();
-                let sources = self.hostname_sources(&name);
-                // First-seen lookup in a Vec keeps group and name order the
-                // rule traversal order; hashing would reorder display.
-                match groups
-                    .iter_mut()
-                    .find(|group| group.ports == effective && group.sources == sources)
-                {
-                    Some(group) => group.names.push(name.as_str().to_owned()),
-                    None => groups.push(HostnameNoticeGroup {
-                        ports: effective,
-                        sources,
-                        names: vec![name.as_str().to_owned()],
-                    }),
-                }
-            }
-            for group in &groups {
-                let names = group.names.join(", ");
-                let effective = group
-                    .ports
-                    .iter()
-                    .map(u16::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                match group.sources.as_ref().and_then(TierSources::tag) {
-                    Some(tag) => writeln!(
-                        output,
-                        "==> Egress policy: allowing TLS to {names} on ports {effective} ({tag})"
-                    )?,
-                    None => writeln!(
-                        output,
-                        "==> Egress policy: allowing TLS to {names} on ports {effective}"
-                    )?,
-                }
-            }
-        }
-        let source = if let Some(p) = &self.provenance {
-            let label = |origin: GroupOrigin, setting: &str, flag: &str| {
-                if origin.resolved.source == GrantSource::UserConfig {
-                    format!("persisted grant {setting}")
-                } else {
-                    flag.to_owned()
-                }
-            };
-            let mut sources = Vec::new();
-            if self.groups.internet {
-                sources.push(label(
-                    p.internet,
-                    "allow_internet_egress",
-                    "--allow-internet-egress",
-                ));
-            }
-            if self.groups.host {
-                sources.push(label(p.host, "allow_host", "--allow-host"));
-            }
-            if sources.is_empty() {
-                None
-            } else {
-                Some(sources.join(" and "))
-            }
-        } else {
-            match (self.groups.internet, self.groups.host) {
-                (true, true) => Some("both".to_owned()),
-                (true, false) => Some("--allow-internet-egress".to_owned()),
-                (false, true) => Some("--allow-host".to_owned()),
-                (false, false) => None,
-            }
+        self.write_hostname_notices(output)?;
+        // `both` is this line's own word for "the two flags" and never reaches
+        // `access egress`, whose DNS line names them (#631).
+        let labels = self.dns_grant_labels();
+        let source = match (self.provenance.is_some(), labels.len()) {
+            (_, 0) => None,
+            (false, 2) => Some("both".to_owned()),
+            _ => Some(labels.join(" and ")),
         };
         // A hostname-only launch authorizes exactly the allowed names
         // (ADR-0037) and prints nothing here.
@@ -1034,11 +937,14 @@ mod tests {
         // Attribution is per *name*, not per allowance: the user granted the bare
         // name and the CLI pinned the same name to another port, so both tiers
         // count and the tag names both sources.
-        let sources = h
-            .hostname_sources(h.effective.hostnames[0].domain())
-            .expect("both entries exist, so a tag is rendered");
-        assert!(sources.user.direct && sources.cli.direct, "{sources:?}");
-        assert!(sources.user.via.is_empty() && sources.cli.via.is_empty());
+        let attributions = h.hostname_attributions();
+        assert_eq!(attributions.len(), 1);
+        let attribution = &attributions[0];
+        assert!(
+            attribution.user.direct && attribution.cli.direct,
+            "{attribution:?}"
+        );
+        assert!(attribution.user.via.is_empty() && attribution.cli.via.is_empty());
         let internet = resolve_saved(
             SavedGroups {
                 internet: Some(true),
@@ -1166,7 +1072,7 @@ mod tests {
             } else {
                 expected.push_str("==> Egress policy: persisted grant allow_lan = true (Private RFC1918 + 100.64/10 + fc00::/7 reachable; does not itself enable DNS)\n");
             }
-            expected.push_str("==> Egress policy: allowing TLS to api.example.com on ports 443 (persisted grants)\n");
+            expected.push_str("==> Egress policy: allowing TLS to api.example.com\n");
             if row == 3 {
                 expected.push_str("==> Egress DNS: arbitrary-name DNS queries authorized via --allow-internet-egress (resolver/rebind/platform constraints still apply)\n");
             }
@@ -1260,22 +1166,22 @@ mod tests {
                     "both.example.com",
                 ][..],
                 &["both.example.com", "c.example.com"][..],
-                "==> Egress policy: allowing TLS to b.example.com, a.example.com on ports 443, 8443 (persisted grants)\n==> Egress policy: allowing TLS to p.example on ports 8443 (persisted grants)\n==> Egress policy: allowing TLS to both.example.com on ports 443, 8443 (persisted grants and --allow-egress)\n==> Egress policy: allowing TLS to c.example.com on ports 443, 8443 (--allow-egress)\n",
+                "==> Egress policy: allowing TLS to b.example.com, a.example.com on ports 443, 8443\n==> Egress policy: allowing TLS to p.example on ports 8443\n==> Egress policy: allowing TLS to both.example.com on ports 443, 8443 (persisted grants and --allow-egress)\n==> Egress policy: allowing TLS to c.example.com on ports 443, 8443 (--allow-egress)\n",
             ),
             (
                 &["tcp://n.example:8443", "tcp://m.example:9443"][..],
                 &[][..],
-                "==> Egress policy: allowing TLS to n.example on ports 8443 (persisted grants)\n==> Egress policy: allowing TLS to m.example on ports 9443 (persisted grants)\n",
+                "==> Egress policy: allowing TLS to n.example on ports 8443\n==> Egress policy: allowing TLS to m.example on ports 9443\n",
             ),
             (
                 &["api.example.com"][..],
                 &["tcp://api.example.com:443"][..],
-                "==> Egress policy: allowing TLS to api.example.com on ports 443 (persisted grants and --allow-egress)\n",
+                "==> Egress policy: allowing TLS to api.example.com (persisted grants and --allow-egress)\n",
             ),
             (
                 &[][..],
                 &["api.example.com"][..],
-                "==> Egress policy: allowing TLS to api.example.com on ports 443 (--allow-egress)\n",
+                "==> Egress policy: allowing TLS to api.example.com (--allow-egress)\n",
             ),
             (
                 &[
@@ -1284,7 +1190,7 @@ mod tests {
                     "tcp://API.example.com:8443",
                 ][..],
                 &[][..],
-                "==> Egress policy: allowing TLS to api.example.com on ports 443, 8443 (persisted grants)\n",
+                "==> Egress policy: allowing TLS to api.example.com on ports 443, 8443\n",
             ),
         ] {
             let cli: Vec<String> = cli.iter().map(|entry| (*entry).to_owned()).collect();
@@ -1368,6 +1274,8 @@ mod tests {
     }
 
     mod hostname_tests;
+    mod usage_tests;
+    mod view_tests;
     proptest! {
         #[test]
         fn port_kernel_matches_decimal_oracle(s in "[0-9+\\- a]{0,7}") {
@@ -1961,6 +1869,9 @@ mod tests {
     /// The third is why the hostname lines become a ports→names map rather than
     /// a string: the claim is that the same names are allowed on the same
     /// ports, not that provenance-shaped formatting is identical.
+    ///
+    /// ` on ports …` is printed only when a non-443 port is intercepted (#631),
+    /// so its absence means 443.
     fn normalised_notices(
         authority: &EgressAuthority,
     ) -> (
@@ -1990,9 +1901,9 @@ mod tests {
                 other.push(bare.to_owned());
                 continue;
             };
-            let Some((names, ports)) = rest.rsplit_once(" on ports ") else {
-                other.push(bare.to_owned());
-                continue;
+            let (names, ports) = match rest.rsplit_once(" on ports ") {
+                Some((names, ports)) => (names, ports),
+                None => (rest, "443"),
             };
             let group = hostnames.entry(ports.to_owned()).or_default();
             for name in names.split(", ") {
@@ -2137,7 +2048,7 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             format!(
-                "{HEADER}==> Egress policy: allowing tcp://[203.0.113.10/32]:443 (project allowance)\n==> Egress policy: allowing TLS to api.example.com on ports 443 (project allowance)\n"
+                "{HEADER}==> Egress policy: allowing tcp://[203.0.113.10/32]:443 (project allowance)\n==> Egress policy: allowing TLS to api.example.com (project allowance)\n"
             )
         );
 
@@ -2161,7 +2072,7 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             format!(
-                "{HEADER}==> Egress policy: allowing tcp://[203.0.113.10/32]:443 (--allow-egress and project allowance)\n==> Egress policy: allowing TLS to api.example.com on ports 443 (--allow-egress and project allowance)\n"
+                "{HEADER}==> Egress policy: allowing tcp://[203.0.113.10/32]:443 (--allow-egress and project allowance)\n==> Egress policy: allowing TLS to api.example.com (--allow-egress and project allowance)\n"
             )
         );
 
@@ -2275,8 +2186,9 @@ mod tests {
         String::from_utf8(out).unwrap()
     }
 
-    /// A22: the tag names the tier *and* the reference, in the shared list
-    /// grammar, and keeps every pre-#506 byte when no reference is involved.
+    /// A22: an address line's tag names the tier *and* the reference, in the
+    /// shared list grammar. Since #631 a hostname line's tag names the tiers
+    /// only — the references are on the line itself.
     #[test]
     fn reference_tags_name_the_tier_and_reference() {
         const HEADER: &str = "==> Egress authority: persisted grants from \"/home/a/.config/agent-vm/config.toml\" [network] merged with this launch's flags (flags override persisted booleans and add allowances; nothing is saved)\n";
@@ -2287,24 +2199,19 @@ mod tests {
             resolve_saved_with_tools(Default::default(), &["tool:codex"], empty_cli(), &tools);
         let mut out = Vec::new();
         authority.write_notices(&mut out).unwrap();
-        assert!(String::from_utf8(out).unwrap().contains(
-            "==> Egress policy: allowing TLS to api.openai.com on ports 443 (persisted grants via tool:codex)\n"
-        ));
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "==> Egress authority: persisted grants from \"/home/a/.config/agent-vm/config.toml\"\n==> Egress policy: allowing TLS to tool:codex (1)\n==> list: agent-vm access egress\n"
+        );
 
-        // (ii) a CLI reference with no user table, beside a literal CLI hostname.
+        // (ii) a CLI reference with no user table, beside a literal CLI hostname:
+        // one line, because both names share the port set and the tier.
         let tools = reference_tools(&[("codex", &["auth.openai.com"])]);
         let text = cli_refusal_lines(&["tool:codex", "api.example.com"], &tools);
-        assert!(
-            text.contains(
-                "==> Egress policy: allowing TLS to auth.openai.com on ports 443 (--allow-egress via tool:codex)\n"
-            ),
-            "{text}"
-        );
-        assert!(
-            text.contains(
-                "==> Egress policy: allowing TLS to api.example.com on ports 443 (--allow-egress)\n"
-            ),
-            "{text}"
+        assert_eq!(
+            text,
+            "==> Egress policy: allowing TLS to tool:codex (1), api.example.com (--allow-egress)\n\
+==> list: agent-vm access egress\n"
         );
         assert!(!text.contains("persisted"), "{text}");
 
@@ -2324,9 +2231,11 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(text.starts_with(HEADER), "{text}");
         assert!(
-            text.contains(
-                "==> Egress policy: allowing TLS to api.openai.com on ports 443 (persisted grants via tool:codex; --allow-egress via tool:codex)\n"
-            ),
+            text.contains("==> Egress policy: allowing TLS to tool:codex (1) (persisted grants and --allow-egress)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("==> list: agent-vm access egress\n"),
             "{text}"
         );
 
@@ -2342,19 +2251,14 @@ mod tests {
         authority.write_notices(&mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(
-            text.contains(
-                "==> Egress policy: allowing TLS to api.openai.com on ports 443 (persisted grants, directly and via tool:codex)\n"
-            ),
-            "{text}"
+            text.contains("==> Egress policy: allowing TLS to tool:codex (1)\n"),
+            "a name covered by a reference is never bare: {text}"
         );
 
-        // (v) the two list shapes, over names that only a reference grants.
+        // (v) the count is per reference, over names that only references grant.
         for (names, expected) in [
-            (&["a", "b"][..], "persisted grants via tool:a and tool:b"),
-            (
-                &["a", "b", "c"][..],
-                "persisted grants via tool:a, tool:b and tool:c",
-            ),
+            (&["a", "b"][..], "tool:a (1), tool:b (1)"),
+            (&["a", "b", "c"][..], "tool:a (1), tool:b (1), tool:c (1)"),
         ] {
             let tools: Vec<(&str, &[&str])> = names
                 .iter()
@@ -2369,9 +2273,7 @@ mod tests {
             authority.write_notices(&mut out).unwrap();
             let text = String::from_utf8(out).unwrap();
             assert!(
-                text.contains(&format!(
-                    "==> Egress policy: allowing TLS to shared.example on ports 443 ({expected})\n"
-                )),
+                text.contains(&format!("==> Egress policy: allowing TLS to {expected}\n")),
                 "{text}"
             );
         }
@@ -2403,19 +2305,16 @@ mod tests {
             ),
             "{text}"
         );
-        // A bare literal inside a set is grouped with every other bare name at
-        // the intercepted ports, exactly as a bare `[network]` entry is: a set
-        // member is an allowance, not a second kind of thing.
         assert!(
             text.contains(
-                "==> Egress policy: allowing TLS to api.openai.com, git.corp.example on ports 443 (persisted grants via set:agents)\n"
+                "==> Egress policy: allowing TLS to agents (2)\n==> list: agent-vm access egress\n"
             ),
             "{text}"
         );
         assert!(!text.contains("set:corp"), "a nested set was named: {text}");
 
-        // (ii) a set and a tool granting the same name render in the shared list
-        // grammar, in entry order.
+        // (ii) a set and a tool granting the same name collapse into one line, in
+        // written order.
         let authority = resolve_saved_with_tools(
             Default::default(),
             &["tool:codex", "set:agents"],
@@ -2426,17 +2325,7 @@ mod tests {
         authority.write_notices(&mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(
-            text.contains(
-                "==> Egress policy: allowing TLS to api.openai.com on ports 443 (persisted grants via tool:codex and set:agents)\n"
-            ),
-            "{text}"
-        );
-        // The line no tool grants keeps naming only the set: attribution is per
-        // allowance, not per tier.
-        assert!(
-            text.contains(
-                "==> Egress policy: allowing TLS to git.corp.example on ports 443 (persisted grants via set:agents)\n"
-            ),
+            text.contains("==> Egress policy: allowing TLS to tool:codex (1), agents (2)\n"),
             "{text}"
         );
 
@@ -2461,20 +2350,15 @@ mod tests {
         let tools = reference_tools(&[("codex", &["api.openai.com"])]);
         let text = cli_refusal_lines(&["tool:codex"], &tools);
         assert!(!text.contains("persisted"), "{text}");
-        assert!(
-            text.contains(
-                "==> Egress policy: allowing TLS to api.openai.com on ports 443 (--allow-egress via tool:codex)\n"
-            ),
-            "{text}"
-        );
-        // With no reference, the same launch keeps its pre-#506 bytes: no tag
-        // and no source condition at all.
-        let tools = reference_tools(&[]);
-        let text = cli_refusal_lines(&["api.example.com"], &tools);
         assert_eq!(
             text,
-            "==> Egress policy: allowing TLS to api.example.com on ports 443\n"
+            "==> Egress policy: allowing TLS to tool:codex (1) (--allow-egress)\n\
+==> list: agent-vm access egress\n"
         );
+        // With no reference: no tag, and since nothing collapsed, no pointer.
+        let tools = reference_tools(&[]);
+        let text = cli_refusal_lines(&["api.example.com"], &tools);
+        assert_eq!(text, "==> Egress policy: allowing TLS to api.example.com\n");
     }
 
     /// A34, CLI half: the reference rebinds `tool:8443` to a tool named `8443`.
@@ -2484,7 +2368,7 @@ mod tests {
         let text = cli_refusal_lines(&["tool:8443"], &tools);
         assert!(
             text.contains(
-                "==> Egress policy: allowing TLS to other.example on ports 9443 (--allow-egress via tool:8443)\n"
+                "==> Egress policy: allowing TLS to tool:8443 (1) on ports 9443 (--allow-egress)\n"
             ),
             "{text}"
         );
@@ -2511,12 +2395,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["tcp://api.openai.com:443"]
         );
-        let sources = authority
-            .hostname_sources(authority.effective.hostnames[0].domain())
-            .unwrap();
-        assert!(sources.user.direct, "{sources:?}");
+        let attributions = authority.hostname_attributions();
+        assert_eq!(attributions.len(), 1);
+        let attribution = &attributions[0];
+        assert!(attribution.user.direct, "{attribution:?}");
         assert_eq!(
-            sources
+            attribution
                 .user
                 .via
                 .iter()
@@ -2524,5 +2408,184 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["tool:codex"]
         );
+    }
+
+    // -- #631: the collapsed hostname lines --------------------------------
+
+    /// The ticket's own example: every reference collapses to its own count and
+    /// the bare names beyond three become one phrase.
+    #[test]
+    fn the_ticket_example_collapses_to_one_line_and_a_pointer() {
+        let namespace = crate::egress_reference::test_support::user_namespace(
+            std::path::Path::new(REFERENCE_USER_FILE),
+            &[],
+            Some(
+                "anthropic = [\"api.anthropic.com\", \"platform.claude.com\"]\n\
+                 openai = [\"api.openai.com\", \"auth.openai.com\", \"chatgpt.com\"]\n\
+                 rust = [\"crates.io\", \"static.crates.io\", \"index.crates.io\"]\n",
+            ),
+        );
+        let entries = [
+            "set:anthropic",
+            "set:openai",
+            "set:rust",
+            "b1.example",
+            "b2.example",
+            "b3.example",
+            "b4.example",
+            "b5.example",
+            "b6.example",
+            "b7.example",
+        ];
+        let authority =
+            resolve_saved_with_tools(Default::default(), &entries, empty_cli(), &namespace);
+        let mut out = Vec::new();
+        authority.write_notices(&mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains(
+                "==> Egress policy: allowing TLS to anthropic (2), openai (3), rust (3), and 7 other hosts\n==> list: agent-vm access egress\n"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn three_bare_hosts_are_named_and_four_are_counted() {
+        let three = ["a.example", "b.example", "c.example"];
+        let mut out = Vec::new();
+        resolve_saved(Default::default(), &three, empty_cli())
+            .write_notices(&mut out)
+            .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("==> Egress policy: allowing TLS to a.example, b.example, c.example\n"),
+            "{text}"
+        );
+        assert!(!text.contains("list: agent-vm access egress"), "{text}");
+
+        let four = ["a.example", "b.example", "c.example", "d.example"];
+        let mut out = Vec::new();
+        resolve_saved(Default::default(), &four, empty_cli())
+            .write_notices(&mut out)
+            .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains(
+                "==> Egress policy: allowing TLS to 4 hosts\n==> list: agent-vm access egress\n"
+            ),
+            "{text}"
+        );
+
+        // A line with a reference says `and N other hosts`, and only the bare
+        // names count towards N.
+        let tools = reference_tools(&[("x", &["x.example"])]);
+        let entries = [
+            "tool:x",
+            "b1.example",
+            "b2.example",
+            "b3.example",
+            "b4.example",
+        ];
+        let authority = resolve_saved_with_tools(Default::default(), &entries, empty_cli(), &tools);
+        let mut out = Vec::new();
+        authority.write_notices(&mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("==> Egress policy: allowing TLS to tool:x (1), and 4 other hosts\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_name_in_two_references_counts_toward_each() {
+        let tools = reference_tools(&[("a", &["shared.example"]), ("b", &["shared.example"])]);
+        let authority = resolve_saved_with_tools(
+            Default::default(),
+            &["tool:a", "tool:b"],
+            empty_cli(),
+            &tools,
+        );
+        let mut out = Vec::new();
+        authority.write_notices(&mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("==> Egress policy: allowing TLS to tool:a (1), tool:b (1)\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn ports_are_kept_on_every_line_once_a_non_443_port_is_intercepted() {
+        let mut out = Vec::new();
+        resolve_saved(
+            Default::default(),
+            &["api.example.com", "tcp://git.example.com:8443"],
+            empty_cli(),
+        )
+        .write_notices(&mut out)
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.matches(" on ports ").count(), 2, "{text}");
+        assert!(!text.contains("list: agent-vm access egress"), "{text}");
+    }
+
+    #[test]
+    fn address_and_group_lines_keep_their_tags() {
+        let namespace = crate::egress_reference::test_support::user_namespace(
+            std::path::Path::new(REFERENCE_USER_FILE),
+            &[],
+            Some("agents = [\"10.0.0.5\"]\n"),
+        );
+        let authority = resolve_saved_with_tools(
+            Default::default(),
+            &["set:agents"],
+            CliEgress {
+                internet: Some(true),
+                ..empty_cli()
+            },
+            &namespace,
+        );
+        let mut out = Vec::new();
+        authority.write_notices(&mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains(
+                "==> Egress policy: allowing 10.0.0.5/32 (persisted grants via set:agents)\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "==> Egress policy: --allow-internet-egress enabled (public internet; does not itself grant LAN or host)\n"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_pointer_follows_the_hostname_lines_and_precedes_dns() {
+        let tools = reference_tools(&[("codex", &["api.openai.com"])]);
+        let authority = EgressAuthority::resolve(
+            CliEgress {
+                internet: Some(true),
+                allowances: &["tool:codex".to_owned()],
+                ..empty_cli()
+            },
+            None,
+            Some(&tools),
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        authority.write_notices(&mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let pointer = text
+            .find("==> list: agent-vm access egress\n")
+            .expect("a reference collapsed, so the pointer is printed");
+        let hostname = text
+            .find("==> Egress policy: allowing TLS to ")
+            .expect("one hostname line");
+        let dns = text.find("==> Egress DNS: ").expect("one DNS line");
+        assert!(hostname < pointer && pointer < dns, "{text}");
     }
 }

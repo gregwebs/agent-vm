@@ -58,6 +58,9 @@ const WIRE_ORDER: [WireSlot; 6] = [
 
 pub(crate) struct Plan {
     secrets: Vec<FileSecret>,
+    /// The GitHub hook's repo allow-list, when this launch registered it. It
+    /// narrows egress and never adds to it (#631).
+    github_repos: Vec<String>,
     /// Origin-scoped named-header credentials (#161): a reference the runtime
     /// resolves at spawn, never a value.
     header_credentials: Vec<crate::credential_resolver::ReadyCredential>,
@@ -96,6 +99,7 @@ impl Plan {
 
         let mut secrets = Vec::new();
         let mut routes = Vec::new();
+        let mut github_repos = Vec::new();
         for slot in WIRE_ORDER {
             match slot {
                 WireSlot::Provider(provider) => {
@@ -131,6 +135,10 @@ impl Plan {
                     // gated by `--no-git`, not by the launched tool. Keep its
                     // own block (with its route allow-list) as before.
                     if let Some(path) = &inputs.creds.gh_token_file {
+                        // The repo allow-list narrows only through the routes
+                        // registered here: with no GitHub token there are none,
+                        // so nothing is narrowed.
+                        github_repos = inputs.allowed_repos.to_vec();
                         secrets.push(FileSecret {
                             env_var: "MSB_AGENT_VM_GH_UNUSED".into(),
                             placeholder: secrets::GH_TOKEN_PLACEHOLDER.into(),
@@ -182,6 +190,7 @@ impl Plan {
 
         Ok(Self {
             secrets,
+            github_repos,
             header_credentials: inputs.launch.ready().to_vec(),
             hook_argv,
             routes,
@@ -195,6 +204,15 @@ impl Plan {
     /// registers nothing (#161).
     fn is_empty(&self) -> bool {
         self.secrets.is_empty() && self.header_credentials.is_empty()
+    }
+
+    /// What this plan narrows, for `access egress` (#631). Read before `apply_to`
+    /// consumes the plan.
+    pub(crate) fn narrowing(&self) -> crate::effective_egress::EgressNarrowing {
+        crate::effective_egress::EgressNarrowing {
+            credential_rules: !self.is_empty(),
+            github_repos: self.github_repos.clone(),
+        }
     }
 
     pub(crate) fn apply_to(self, builder: SandboxBuilder) -> Result<SandboxBuilder> {
@@ -687,6 +705,58 @@ mod tests {
             );
         }
         assert_eq!(providers.len(), CredentialProvider::ALL.len());
+    }
+
+    /// #631: the facts `access egress` reports as narrowing. Only a registered
+    /// hook narrows, so a repo list with no GitHub token narrows nothing.
+    #[test]
+    fn narrowing_reports_only_what_this_plan_registered() {
+        let plain = Plan::new(
+            path("agent-vm"),
+            inputs(&CredsState::default(), ProviderSet::default()),
+        )
+        .unwrap();
+        assert_eq!(
+            plain.narrowing(),
+            crate::effective_egress::EgressNarrowing::default()
+        );
+
+        let creds = CredsState {
+            gh_token_file: Some(path("gh")),
+            ..CredsState::default()
+        };
+        let allowed_repos = vec!["owner/one".to_string(), "owner/two".to_string()];
+        let plan = Plan::new(
+            path("agent-vm"),
+            Inputs {
+                creds: &creds,
+                state_dir: Path::new("/state/project"),
+                allowed_repos: &allowed_repos,
+                provisioned: all(),
+                launch: &LaunchCredentials::default(),
+            },
+        )
+        .unwrap();
+        let narrowing = plan.narrowing();
+        assert!(narrowing.credential_rules);
+        assert_eq!(narrowing.github_repos, allowed_repos);
+
+        // Repos but no GitHub token: the hook registers no route, so the
+        // allow-list constrains nothing.
+        let plan = Plan::new(
+            path("agent-vm"),
+            Inputs {
+                creds: &CredsState::default(),
+                state_dir: Path::new("/state/project"),
+                allowed_repos: &allowed_repos,
+                provisioned: all(),
+                launch: &LaunchCredentials::default(),
+            },
+        )
+        .unwrap();
+        let narrowing = plan.narrowing();
+        assert!(!narrowing.credential_rules);
+        assert!(narrowing.github_repos.is_empty());
     }
 
     #[test]

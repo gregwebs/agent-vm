@@ -62,6 +62,14 @@ fn a_report_flag_beside_a_verb_is_refused_by_the_parser() {
             &["access", "--session", "aaaaaaaa", "allowances"],
             "the subcommand 'allowances' cannot be used with '--session <ID>'",
         ),
+        (
+            &["access", "--all", "egress"],
+            "the subcommand 'egress' cannot be used with '--all'",
+        ),
+        (
+            &["access", "--session", "aaaaaaaa", "egress"],
+            "the subcommand 'egress' cannot be used with '--session <ID>'",
+        ),
     ];
     for (args, expected) in cases {
         let out = run(&home, &state, &project, args);
@@ -87,6 +95,8 @@ fn the_report_flags_and_the_verbs_still_parse_on_their_own() {
         &["access", "--session", "deadbeef"][..],
         &["access", "allowances"][..],
         &["access", "allowances", "--session", "deadbeef"][..],
+        &["access", "egress"][..],
+        &["access", "egress", "--session", "deadbeef"][..],
         &[
             "access",
             "revoke",
