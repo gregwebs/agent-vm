@@ -1129,3 +1129,36 @@ egress reference (a request is not an allowance; a reference selects allowances)
 "host allowance" for a hostname grant — the unit is an exact name, not a suffix or a host; "allow list" for the
 whole policy; "network profile" (the runtime's `from_profiles` abstraction,
 deliberately not used for tool launches).
+
+## Sandbox resources
+
+**Resource ceiling**: a **session**'s boot-time maximum vCPU and memory capacity
+(`max_cpus`, `max_memory_mib`), configured by `--cpus` / `AGENT_VM_CPUS`
+(default `2`) and `--memory` / `AGENT_VM_MEMORY_GIB` (default `8` GiB). The
+design lets live resize grow and shrink a running guest's **resource
+commitment** within this ceiling without restarting the VM, and it can never be
+exceeded. Live resize does not run yet: until it ships (#646, #647) a
+**session** stays at its **boot commitment** whatever the ceiling says, so the
+ceiling only reserves capacity.
+
+_Avoid_: calling `--memory` or `--cpus` the initial or fixed allocation — they
+set the ceiling.
+
+**Boot commitment**: the initial online vCPUs and memory (`cpus`, `memory_mib` /
+`boot_mib`) a **session** starts with at VM creation: `min(1, max_cpus)` vCPUs
+and `min(512 MiB, max_memory_mib)` RAM. Because `virtio-mem` plugs and unplugs
+blocks above `boot_mib` (`boot_mib <= target_mib <= max_memory_mib`) and
+`virtio_msb_cpu` scales online vCPUs down to `1`, the boot commitment is also
+the session's lower bound (floor). Both resize devices are attached at creation
+and the **launcher** does not drive them yet (#646, #647), so a **session** does
+not leave its boot commitment. `agent-vm setup`'s verification guest is not
+a tool/command launch and keeps its fixed `1` vCPU / `512 MiB` configuration.
+
+**Resource commitment**: the online vCPU count and usable guest memory target
+(`cpus`, `target_mib`) currently enforced for a running **session** between its
+**boot commitment** and its **resource ceiling**.
+[ADR-0070](docs/adr/0070-dynamic-resource-commitment.md) decides how the launcher
+will adjust it; until #646/#647 it is the boot commitment.
+
+_Avoid_: "reservation" (which in `microsandbox` means the host virtual-address
+aperture `max_memory_mib`).

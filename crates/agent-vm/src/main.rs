@@ -69,6 +69,7 @@ mod protected_host_files;
 mod pull;
 mod pull_progress;
 mod refusal;
+mod resources;
 mod run;
 mod secret;
 mod secret_store;
@@ -340,6 +341,7 @@ fn run_dispatch(dispatch: Dispatch) -> Result<()> {
                 user_network,
                 user_tools,
                 user_mounts,
+                resources,
                 args,
             } => exit_with(
                 run::launch(
@@ -349,6 +351,7 @@ fn run_dispatch(dispatch: Dispatch) -> Result<()> {
                     user_tools.as_ref(),
                     user_mounts.as_ref(),
                     credential_preflight,
+                    resources,
                     *args,
                 )
                 .await?,

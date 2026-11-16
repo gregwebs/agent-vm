@@ -29,13 +29,13 @@ Options:
 
 Sandbox resources:
       --memory <GIB>
-          Sandbox memory, in GiB
+          Maximum sandbox memory, in GiB
 
           [env: AGENT_VM_MEMORY_GIB]
-          [default: 2]
+          [default: 8]
 
       --cpus <N>
-          vCPU count for the sandbox
+          Maximum vCPU count for the sandbox
 
           [env: AGENT_VM_CPUS]
           [default: 2]
@@ -290,7 +290,7 @@ Examples:
   agent-vm -T run build.sh >out.log                force streaming I/O for one
   agent-vm shell <command>                         run one command, then exit
   agent-vm --dockerfile ./Dockerfile shell         build this Dockerfile, then boot it
-  agent-vm --memory 8 --cpus 4 <tool>              a bigger sandbox
+  agent-vm --memory 16 --cpus 4 <tool>             a higher resource ceiling
   agent-vm --mount ~/ref:ro <tool>                 read-only extra mount
   agent-vm --mount /etc/hosts:/host-hosts:ro <tool>
                                                    read-only single-file bind

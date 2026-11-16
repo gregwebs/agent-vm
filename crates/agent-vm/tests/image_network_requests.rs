@@ -390,6 +390,10 @@ fn launch_records(out: &Output) -> Vec<String> {
 /// `launches_before`; and the image report (when there is one) ends before that
 /// record, on the same stream. A launch that skips create, or that invokes the
 /// runtime before printing the report, fails here.
+///
+/// The flag list is the SDK's own seam, so it pins what #645 configures there:
+/// the boot commitment (`--vcpus`, `--memory-mib`) and the **resource ceiling**
+/// it is reserved within (`--max-vcpus`, `--max-memory-mib`, ADR-0070 D1).
 fn assert_sdk_launch(h: &Harness, out: &Output, launches_before: usize) {
     let text = stderr(out);
     let records = launch_records(out);
@@ -415,6 +419,8 @@ fn assert_sdk_launch(h: &Harness, out: &Output, launches_before: usize) {
             "--parent-watch-fd",
             "--vcpus",
             "--memory-mib",
+            "--max-vcpus",
+            "--max-memory-mib",
             "--config-fd",
             "--lifecycle-lock-fd",
         ],
@@ -429,8 +435,10 @@ fn assert_sdk_launch(h: &Harness, out: &Output, launches_before: usize) {
         (2, "--parent-watch-fd"),
         (3, "--vcpus"),
         (4, "--memory-mib"),
-        (5, "--config-fd"),
-        (6, "--lifecycle-lock-fd"),
+        (5, "--max-vcpus"),
+        (6, "--max-memory-mib"),
+        (7, "--config-fd"),
+        (8, "--lifecycle-lock-fd"),
     ] {
         assert!(
             pairs[index].1.parse::<u32>().is_ok(),
@@ -1933,4 +1941,104 @@ fn a24_sixty_four_unrecognized_keys_do_not_hide_a_valid_group() {
         ]
         .concat()
     );
+}
+
+// ---------------------------------------------------------------------------
+// #645 — the geometry the boot notice names is the geometry the runtime gets
+// ---------------------------------------------------------------------------
+
+/// The machine argv's size flags: the boot commitment, then the ceiling.
+///
+/// `max_cpus` is an `Option` because the SDK **omits** `--max-vcpus` when the
+/// CPU ceiling equals the boot commitment (measured on this branch: `--cpus 1`
+/// launches `--vcpus 1 --max-memory-mib 4096` with no `--max-vcpus`). The
+/// absence is meaningful, so the test asserts it rather than skipping the flag.
+fn launch_geometry(out: &Output) -> (u32, u32, Option<u32>, u32) {
+    let records = launch_records(out);
+    assert_eq!(records.len(), 1, "one runtime launch: {records:?}");
+    let argv: Vec<&str> = records[0].split(' ').collect();
+    let value = |flag: &str| -> Option<u32> {
+        let at = argv.iter().position(|token| *token == flag)?;
+        Some(
+            argv[at + 1]
+                .parse()
+                .unwrap_or_else(|_| panic!("{flag} is not a decimal number: {argv:?}")),
+        )
+    };
+    let boot = |flag: &str| -> u32 {
+        value(flag).unwrap_or_else(|| panic!("{flag} missing from {argv:?}"))
+    };
+    (
+        boot("--vcpus"),
+        boot("--memory-mib"),
+        value("--max-vcpus"),
+        boot("--max-memory-mib"),
+    )
+}
+
+/// #645: plan §7.5's numbers, asserted without a VM. For each shape the boot
+/// notice's two axes are exactly the numbers the runtime is invoked with, and a
+/// session boots at its boot commitment whatever the ceiling reserves.
+///
+/// This is the cross-check the separate oracles cannot make: the goldens pin the
+/// `SandboxConfig`, and `assert_sdk_launch` pins the argv's flag list, but only
+/// here are the user-facing notice, the SDK config and the runtime argv held to
+/// one another (a notice that promised a ceiling the launch did not reserve, or
+/// a ceiling that silently became the boot memory, reddens).
+#[test]
+fn a_launch_gives_the_runtime_the_geometry_its_boot_notice_names() {
+    let mut h = Harness::new(Mode::LaunchSeam);
+    h.use_launch_runtime();
+    let server = Server::new();
+    let image = h.labeled("geometry", &[("agent.codex", "api.openai.com")]);
+    server.image("images", "geometry", &image);
+    let tag = format!("{}/images:geometry", server.host);
+
+    // (launch options, boot cpus, boot MiB, max cpus, max MiB, notice detail);
+    // a `None` CPU ceiling is the collapsed axis, which the SDK expresses by
+    // omitting `--max-vcpus`.
+    type Row<'a> = (&'a [&'a str], u32, u32, Option<u32>, u32, &'a str);
+    let rows: [Row; 3] = [
+        (&[], 1, 512, Some(2), 8192, "512..=8192 MiB, 1..=2 vCPU"),
+        (
+            &["--memory", "4", "--cpus", "1"],
+            1,
+            512,
+            None,
+            4096,
+            "512..=4096 MiB, 1 vCPU",
+        ),
+        (
+            &["--memory", "16", "--cpus", "4"],
+            1,
+            512,
+            Some(4),
+            16384,
+            "512..=16384 MiB, 1..=4 vCPU",
+        ),
+    ];
+    for (options, boot_cpus, boot_mib, max_cpus, max_mib, detail) in rows {
+        let launches_before = h.sdk_launch_count();
+        let out = h.launch_with(&tag, "shell", options);
+        // One real runtime launch, whose argv `launch_geometry` parses below.
+        // `assert_sdk_launch` is not reused here: its flag list is the default
+        // geometry's, and a collapsed CPU axis legitimately drops `--max-vcpus`.
+        assert_eq!(
+            h.sdk_launch_count(),
+            launches_before + 1,
+            "{options:?}: exactly one runtime launch: {}",
+            h.invocations()
+        );
+        assert_eq!(
+            launch_geometry(&out),
+            (boot_cpus, boot_mib, max_cpus, max_mib),
+            "{options:?}: the boot commitment and the ceiling the runtime is given: {}",
+            launch_records(&out)[0]
+        );
+        let text = stderr(&out);
+        assert!(
+            text.contains(&format!("; {detail})")),
+            "{options:?}: the notice must name the geometry the launch gave the runtime: {text}"
+        );
+    }
 }

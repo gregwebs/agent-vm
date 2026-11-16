@@ -1519,7 +1519,7 @@ build does both in one command.
 
 ```sh
 agent-vm --dockerfile ./Dockerfile shell
-agent-vm --memory 8 --dockerfile path/to/Dockerfile -- cargo build
+agent-vm --memory 16 --dockerfile path/to/Dockerfile -- cargo build
 ```
 
 It is a launch option, so it goes before the tool verb or the runner, exactly
@@ -1687,8 +1687,8 @@ Available launch options:
 
 | flag | what |
 |---|---|
-| `--memory N` | VM memory GiB (default 2) |
-| `--cpus N` | vCPUs (default 2) |
+| `--memory N` | maximum VM memory in GiB: the resource ceiling (default 8). Boots with 512 MiB |
+| `--cpus N` | maximum vCPUs (default 2). Boots with 1 |
 | `--dockerfile FILE` | build this Dockerfile and boot the result (context is the Dockerfile's parent directory; mutually exclusive with `--image`) |
 | `--image REF` | boot this image instead of the configured one (env `AGENT_VM_IMAGE_TAG`); see [Selecting the boot image](#selecting-the-boot-image) |
 | `--no-git` | skip gh/git auth injection (still respects `--repo`) |
@@ -1701,6 +1701,29 @@ Available launch options:
 | `--root` | run the guest as root (uid 0) instead of the default host user — see [Guest user](#guest-user----root) |
 | `-t`, `--tty` | force a PTY for a **direct** command, even with redirected stdout; requires terminal stdin — see [Direct commands](#direct-commands) |
 | `-T`, `--no-tty` | force streaming I/O for a **direct** command, even from a terminal |
+
+`--memory` and `--cpus` set the **resource ceiling**: the maximum vCPU and
+memory capacity the VM may ever use. Every launch boots at the **boot
+commitment** instead — `1` vCPU and `512 MiB`. `agent-vm setup` verifies the
+runtime with the same `512 MiB` / `1` vCPU shape.
+
+Until live resizing ships (#646, #647), a session runs at its boot commitment,
+512 MiB and 1 vCPU, whatever `--memory` and `--cpus` say. They reserve capacity
+only.
+
+The boot notice prints each axis as `<boot>..=<max>`, or as the single maximum
+when the two are equal:
+
+```
+==> Boot image: the default boot image (512..=8192 MiB, 1..=2 vCPU)
+==> Boot image: example/app:dev (from command line; 512..=4096 MiB, 1 vCPU)
+```
+
+`--memory 0`, `--cpus 0` and a `--memory` whose MiB value overflows `u32` are
+refused before anything runs: no image build, no runtime unpack, no project
+state. Guest `/dev/shm` is a default-sized tmpfs, so it holds half the **boot**
+memory.
+[ADR-0070](docs/adr/0070-dynamic-resource-commitment.md) has the mechanism.
 
 ### Direct commands
 
@@ -5347,9 +5370,13 @@ with launch flags as described in [Persisted grants](#persisted-grants-user-conf
 - **`RegisterNetDevice(IrqsExhausted)` at boot** — device capacity is host
   and runtime dependent. Drop a `--mount` to recover. Linux x86_64 uses a
   split userspace IOAPIC while Apple Silicon uses GIC; do not infer one
-  platform's device limit from another.
+  platform's device limit from another. The default shape also uses one
+  device for memory resizing, and one for CPU resizing when `--cpus` is 2 or
+  more; `--cpus 1` frees the CPU one.
 - **`handshake read id_offset: timed out`** — `free -h`; the VM needs
-  more memory than is available. Try `--memory 1`.
+  more memory than is available. The VM boots with 512 MiB whatever `--memory`
+  says ([ADR-0070](docs/adr/0070-dynamic-resource-commitment.md)), so free host
+  memory.
 - **GitHub 403 from the proxy** — repo isn't in the allow-list.
   Pass `--repo OWNER/NAME` or run from a project with the right
   remote.

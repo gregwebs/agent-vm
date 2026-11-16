@@ -3124,17 +3124,17 @@ check_harness_negative() {
   # two forms) turns this check red without a VM boot.
   local boot_ref="localhost:5000/e2e/agent:v1"
   if ! assert_single_boot_ref "boot-oracle-accepted" "$boot_ref" \
-    "==> Boot image: $boot_ref (from command line; 2048 MiB, 2 vCPU)" >/dev/null 2>&1; then
+    "==> Boot image: $boot_ref (from command line; 512..=8192 MiB, 1..=2 vCPU)" >/dev/null 2>&1; then
     echo "    FAIL: boot oracle rejected the one-line boot notice"
     result=$((result + 1))
   fi
   if assert_single_boot_ref "boot-oracle-two-lines" "$boot_ref" \
-    "==> Boot image: $boot_ref (from command line; 2048 MiB, 2 vCPU)"$'\n'"==> Booting sandbox from $boot_ref (2048 MiB, 2 vCPU)" >/dev/null 2>&1; then
+    "==> Boot image: $boot_ref (from command line; 512..=8192 MiB, 1..=2 vCPU)"$'\n'"==> Booting sandbox from $boot_ref (512..=8192 MiB, 1..=2 vCPU)" >/dev/null 2>&1; then
     echo "    FAIL: boot oracle accepted two boot notices"
     result=$((result + 1))
   fi
   if assert_single_boot_ref "boot-oracle-other-ref" "$boot_ref" \
-    "==> Boot image: localhost:5000/e2e/other:v1 (from command line; 2048 MiB, 2 vCPU)" >/dev/null 2>&1; then
+    "==> Boot image: localhost:5000/e2e/other:v1 (from command line; 512..=8192 MiB, 1..=2 vCPU)" >/dev/null 2>&1; then
     echo "    FAIL: boot oracle accepted a substituted image reference"
     result=$((result + 1))
   fi

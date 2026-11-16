@@ -150,4 +150,21 @@ grep -q '^File: ' "$tmp/c12.out" && fail "C12: an initial recommendation has no 
 [[ ! -e "$home/.cache/agent-vm" ]] || fail "C12: unpacked the embedded runtime"
 [[ -z "$(ls -A "$state")" ]] || fail "C12: created runtime state"
 pass C12
+# #645: a refused resource ceiling is decided while parsing, before the MSB
+# prologue unpacks the embedded runtime (contrast C10, refused inside launch).
+c13() {
+    local name="$1" want="$2" message="$3"; shift 3
+    new_case "c13-$name"
+    local status=0
+    (cd "$tmp/project" && run env GIT_CEILING_DIRECTORIES="$tmp" "$binary" --no-git "$@") \
+        >"$tmp/out" 2>"$tmp/err" || status=$?
+    [[ "$status" == "$want" ]] || fail "C13-$name: expected exit $want, got $status"
+    contains "$message"
+    [[ ! -e "$home/.cache/agent-vm" ]] || fail "C13-$name: unpacked the embedded runtime"
+    [[ -z "$(ls -A "$state")" ]] || fail "C13-$name: created state"
+}
+c13 cpus 1 '--cpus must be at least 1' --cpus 0 shell
+c13 overflow 1 '--memory in GiB overflows u32 MiB' --memory 4194304 shell
+c13 memory 125 '--memory must be at least 1 GiB' --memory 0 -- true
+pass C13
 echo 'single-binary contracts passed'

@@ -7165,6 +7165,220 @@ fn rejected_allowance_is_refused_before_launch_state_is_created() {
     );
 }
 
+/// #645: a resource ceiling that cannot boot is refused *while parsing*, so the
+/// MSB prologue (runtime unpack, `msb --version`) and every launch-side write are
+/// never reached. G4's stronger-probe counterpart: a launch-time refusal logs
+/// `--version`, and this one's log is empty.
+#[test]
+fn a_refused_resource_ceiling_is_refused_before_the_runtime_prologue() {
+    let mount_source = support::project_tempdir();
+    std::fs::write(mount_source.path().join("sentinel"), "seed").unwrap();
+    let mount = format!("{}:/forked:fork", mount_source.path().display());
+
+    // (argv options, environment, exact fixed refusal text)
+    type Case<'a> = (&'a [&'a str], &'a [(&'a str, &'a str)], &'a str);
+    let cases: [Case; 6] = [
+        (&["--memory", "0"], &[], "--memory must be at least 1 GiB"),
+        (&["--cpus", "0"], &[], "--cpus must be at least 1"),
+        (
+            &["--memory", "4194304"],
+            &[],
+            "--memory in GiB overflows u32 MiB",
+        ),
+        (
+            &[],
+            &[("AGENT_VM_MEMORY_GIB", "0")],
+            "--memory must be at least 1 GiB",
+        ),
+        (&[], &[("AGENT_VM_CPUS", "0")], "--cpus must be at least 1"),
+        (
+            &[],
+            &[("AGENT_VM_MEMORY_GIB", "4194304")],
+            "--memory in GiB overflows u32 MiB",
+        ),
+    ];
+
+    for (options, environment, message) in cases {
+        // The tool and `shell` routes answer anyhow's status 1.
+        for tool in ["claude", "shell"] {
+            let harness = Harness::new();
+            let mut argv: Vec<&str> = options.to_vec();
+            argv.extend(["--mount", &mount]);
+            let out = harness.launch_with_env(tool, &argv, environment);
+            let route = format!("{tool} {options:?} {environment:?}");
+            assert_eq!(out.status.code(), Some(1), "{route}: {}", stderr_of(&out));
+            assert_refused_without_launch_state(&harness, &out, &route, message);
+        }
+        // Both direct spellings answer 125 (#398).
+        for form in DIRECT_FORMS {
+            let harness = Harness::new();
+            let mut options_with_mount: Vec<&str> = options.to_vec();
+            options_with_mount.extend(["--mount", &mount]);
+            let out = harness.direct(DirectInvocation {
+                form,
+                options: &options_with_mount,
+                vector: &["claude"],
+                envs: environment,
+            });
+            let route = format!("{form:?} {options:?} {environment:?}");
+            assert_eq!(out.status.code(), Some(125), "{route}: {}", stderr_of(&out));
+            assert_refused_without_launch_state(&harness, &out, &route, message);
+        }
+    }
+
+    // Non-vacuity control: the same route and mount with a valid ceiling reaches
+    // the prologue and publishes the fork. `warm()`'s import already logged
+    // `--version`, and `msb_log` is cumulative, so the assertion is on the part
+    // this launch appended.
+    let control = Harness::warm();
+    let hash = project_hash(&control.project_root);
+    let mounts = control.state_root.join(format!("{hash}.mounts"));
+    assert!(
+        !mounts.exists(),
+        "the control must not have published a fork store before its launch"
+    );
+    let before = control.msb_log();
+    let out = control.launch("claude", &["--memory", "1", "--mount", &mount]);
+    let after = control.msb_log();
+    assert!(
+        after.starts_with(&before),
+        "the msb log is cumulative: {after:?}"
+    );
+    assert!(
+        after[before.len()..].starts_with("--version\n"),
+        "the control launch must reach the MSB prologue, appended {:?}",
+        &after[before.len()..]
+    );
+    assert!(
+        dir_contains(&mounts, "sentinel", "seed"),
+        "the control launch must publish the fork"
+    );
+    assert!(
+        stderr_of(&out).contains(CONFIG_MARKER),
+        "the control must reach builder wiring: {}",
+        stderr_of(&out)
+    );
+}
+
+/// The refusal assertions every route shares: the fixed text, no notice line, and
+/// no MSB or launch-side side effect at all.
+fn assert_refused_without_launch_state(
+    harness: &Harness,
+    out: &Output,
+    route: &str,
+    message: &str,
+) {
+    let stderr = stderr_of(out);
+    assert!(
+        stderr.contains(&format!("Error: {message}")),
+        "{route}: {stderr}"
+    );
+    assert!(
+        !stderr.lines().any(|line| line.starts_with("==> ")),
+        "{route}: a refused launch prints no notice: {stderr}"
+    );
+    assert_eq!(
+        harness.msb_log(),
+        "",
+        "{route}: the refusal must precede the MSB identity probe"
+    );
+    let hash = project_hash(&harness.project_root);
+    for absent in [
+        hash.clone(),
+        format!("{hash}.mounts"),
+        format!("{hash}.secrets"),
+        "msb-home".to_string(),
+    ] {
+        assert!(
+            !harness.state_root.join(&absent).exists(),
+            "{route}: a refused launch must not create {absent}"
+        );
+    }
+    assert!(
+        !harness
+            .home_root
+            .join(".config/agent-vm/image-pins.json")
+            .exists(),
+        "{route}: a refused launch must not record an approval"
+    );
+}
+
+/// #645 AC9: a nondefault ceiling reaches the builder, and the CLI beats the
+/// environment on both options.
+#[test]
+fn a_nondefault_ceiling_reaches_the_builder_and_cli_beats_env() {
+    let harness = Harness::warm();
+    let out = harness.direct(DirectInvocation {
+        form: Form::Separator,
+        options: &[
+            "--image",
+            BOGUS_IMAGE,
+            "--memory",
+            "16",
+            "--cpus",
+            "4",
+            "--no-git",
+        ],
+        vector: &["claude", "--x"],
+        envs: &[("AGENT_VM_CPUS", "0"), ("AGENT_VM_MEMORY_GIB", "0")],
+    });
+    assert_eq!(out.status.code(), Some(125), "{}", stderr_of(&out));
+    let config = normalized_config(&harness, &out);
+    assert_eq!(
+        config["resources"],
+        serde_json::json!({
+            "cpus": 1,
+            "memory_mib": 512,
+            "max_cpus": 4,
+            "max_memory_mib": 16384,
+        })
+    );
+    assert_eq!(
+        config["runtime"]["metrics_sample_interval_ms"],
+        serde_json::json!(200)
+    );
+    assert!(
+        stderr_of(&out).contains("; 512..=16384 MiB, 1..=4 vCPU)"),
+        "{}",
+        stderr_of(&out)
+    );
+}
+
+/// #645: a ceiling that equals the boot commitment on the CPU axis prints one
+/// number, and the booted shape is still one vCPU.
+#[test]
+fn a_single_vcpu_ceiling_boots_one_vcpu_and_collapses_its_axis() {
+    let harness = Harness::warm();
+    let out = harness.launch_argv(
+        "claude",
+        &[
+            "--image",
+            BOGUS_IMAGE,
+            "--memory",
+            "4",
+            "--cpus",
+            "1",
+            "--no-git",
+        ],
+        &[],
+    );
+    let config = normalized_config(&harness, &out);
+    assert_eq!(
+        config["resources"],
+        serde_json::json!({
+            "cpus": 1,
+            "memory_mib": 512,
+            "max_cpus": 1,
+            "max_memory_mib": 4096,
+        })
+    );
+    assert!(
+        stderr_of(&out).contains("; 512..=4096 MiB, 1 vCPU)"),
+        "{}",
+        stderr_of(&out)
+    );
+}
+
 /// G5: a `[network]` table in the project tier is refused with a named
 /// diagnostic that points at the setting and the tier; the project tier can
 /// never grant egress.
@@ -10575,9 +10789,19 @@ fn both_direct_spellings_share_one_observation() {
             "{form:?}"
         );
         assert_eq!(
-            config["resources"]["memory_mib"],
+            config["resources"]["max_memory_mib"],
             serde_json::json!(3 * 1024),
             "{form:?}"
+        );
+        assert_eq!(
+            config["resources"]["memory_mib"],
+            serde_json::json!(512),
+            "{form:?}: --memory sets the ceiling, not the boot commitment"
+        );
+        assert!(
+            stderr_of(&out).contains("; 512..=3072 MiB, 1..=2 vCPU)"),
+            "{form:?}: {}",
+            stderr_of(&out)
         );
         observations.push(observation(&harness, &out));
     }
