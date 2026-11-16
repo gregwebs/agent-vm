@@ -31,6 +31,9 @@ shell guard rail.
   --guard-only  Run only the shell guard rail (bash -n + shellcheck). Test seam
                 for exercising the guard in a worktree without the
                 vendor/microsandbox submodule, which the contract checks need.
+                Not the gate: this skips the runtime provenance checks, every
+                contract, and the mutation-anchor check, so it can be green
+                while the `contracts` CI job is red.
 EOF
 }
 
