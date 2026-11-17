@@ -99,11 +99,13 @@ PROMPT_LINE_COUNT = 60
 # Measured from the guest's `CONNECT rc=` line, not from `REFUSE-READY`: readiness
 # precedes the guest's own spawn (`timeout` + `bash` + the `/dev/tcp` open) by up
 # to ~0.1 s, and the *decision* to take over waits for the refusal to reach the
-# feed, whose ingestion side is the runtime's own 2 s fallback poll
-# (`refusal/feed.rs`: "nothing here can shorten" it). Both intervals are recorded
-# (`appeared_seconds`, `refused_seconds`, `after_refusal_seconds`), so a launcher
-# that really is slow is distinguishable from a slow log; only the interval this
-# slice owns is asserted.
+# feed. The runtime wakes that follower on the append itself (microsandbox #126),
+# so ingestion is milliseconds; its 2 s fallback poll is a net for a notification
+# that never arrived, and a row that lands on the net fails this bound instead of
+# silently measuring it. Both intervals are recorded (`appeared_seconds`,
+# `refused_seconds`, `after_refusal_seconds`), so a launcher that really is slow
+# is distinguishable from a slow log; only the interval this slice owns is
+# asserted.
 PROMPT_APPEARS_WITHIN = 1.0
 PROMPT_STALL_WITHIN = 1.5
 # The status row's other face: a redraw after an input (the driver's own
@@ -1974,12 +1976,22 @@ def observe_prompt(case: Case, form: str, session: "Session", receipt: dict, ctx
             f"{label}: a prompt frame was written after the leave: {after_leave[-800:]!r}",
         )
         receipt["prompt"]["held_lines"] = len(numbers)
+    # The probe's own report of its refused connect. A takeover now starts within
+    # milliseconds of the refusal (microsandbox #126 wakes the runtime's log
+    # follower on the append instead of its 2 s poll), so the report is usually
+    # written while the takeover holds the guest's output — the rows that end with
+    # a leave flush it, and the forced-end and runtime-loss rows, which never
+    # flush a hold, lose it. Those rows prove the refusal by the prompt's own text,
+    # which they already assert, and record whether the report survived.
     connect = re.search(r"CONNECT rc=(\d+)", text)
-    require(connect, f"{label}: the probe never reported its connection result: {text[-1200:]!r}")
-    require(
-        connect.group(1) != "0",
-        f"{label}: the refused connection succeeded (rc=0), so this row is not a refusal",
-    )
+    if spec.get("forced") or spec.get("runtime_loss"):
+        receipt["prompt"]["connect_report"] = None if connect is None else connect.group(1)
+    else:
+        require(connect, f"{label}: the probe never reported its connection result: {text[-1200:]!r}")
+        require(
+            connect.group(1) != "0",
+            f"{label}: the refused connection succeeded (rc=0), so this row is not a refusal",
+        )
     if spec.get("exit"):
         require(
             "EXIT-DURING-DONE" in text,

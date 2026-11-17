@@ -3,7 +3,9 @@
 ## Status
 
 Accepted and implemented in **0.7.57**
-([#501](https://github.com/gregwebs/agent-vm/issues/501) slice 3, reach A).
+([#501](https://github.com/gregwebs/agent-vm/issues/501) slice 3, reach A). AC1's
+latency was re-measured in **0.7.62** after the runtime stopped polling its
+refusal log; see *The latency AC1 measures*.
 
 Amends [ADR-0018](0018-machine-checked-boundary-contracts.md) (four kernels added
 to its tables). Annotates [ADR-0064](0064-read-only-refusal-feed.md) (the hint is
@@ -157,6 +159,42 @@ calls "the same terminal".
 - A late authorised grant can survive a concurrent CLI `access revoke --project`,
   because the CLI deletes the record before the session sees the revoke.
 - Backpressure during the hold needs a guest agent that supports output credit.
+- The question can arrive before the guest has printed its own report of the failed
+  connect, and a takeover that ends without a leave (a forced end, a runtime loss)
+  discards what the guest wrote during the hold, including that report.
+
+### The latency AC1 measures
+
+AC1's "within 1 s of the refused connect" spans four steps: the guest's
+`connect(2)`, the runtime's refusal record, this launcher's feed, and the
+takeover. Only the last two are this slice's, and before
+[microsandbox #126](https://github.com/gregwebs/microsandbox/pull/126) the third
+was not: the runtime woke its `network.log` follower from a 2 s fallback poll,
+because the watch it had registered reported neither appends to an existing file
+nor, on macOS, anything at all. Launches were bimodal — 80 of 126 measured
+launches exceeded 1 s, in two populations of about 0.0–0.5 s and 1.7–2.5 s, while
+the launcher's own share (refusal seen → prompt drawn) was 13–470 ms — and which
+side a launch landed on was random for the same case (#634).
+
+The vendored runtime now wakes that follower on the append itself: a recursive
+watch, kqueue on macOS, with the 2 s interval kept only as a net for a
+notification that never arrives. Re-measured over five rounds of the prompt row
+(160 launches, 130 of which drew a question): the question appears a median of
+16 ms after the probe's readiness marker and at most 19 ms, except the ten
+stall-row launches, which wait for a safe boundary and land in 507–516 ms;
+measured from the guest's own report of its failed connect, where that report
+survives the takeover, ingestion to prompt is 0–16 ms. No launch exceeded AC1's
+second, and no row failed the bound. The question now often arrives *before* the
+guest prints its own `CONNECT rc=`: the refusal is recorded when the runtime
+refuses, and the guest's shell still has to unwind.
+
+AC1 therefore stands as written: it now measures the path this slice owns. A
+notification the watcher misses still costs up to the 2 s net, and that shows up
+as a failed row rather than as a redefined bound. The guarantee needs a runtime
+built from the pin this release carries, and the pin is the only thing that
+carries it: `msb_install` compares the vendored `Cargo.toml` version, which stays
+0.7.13 across this change, so a separately installed 0.7.13 built before the fix
+would satisfy the check and reintroduce the poll.
 
 ### Deliberately rejected
 
@@ -189,3 +227,8 @@ stream at a `last_safe_cut` boundary.
   automated oracle `script/test/access-prompt-tmux-oracle.sh`.
 - ADR-0018 for the kernels, ADR-0064 for the feed and the hint, ADR-0066 for the
   live grant path.
+- `gregwebs/microsandbox#126` for the log-follow wakeup the latency now depends
+  on, and `agent-vm#634` for the measurement that found it.
+- The measurement itself: `script/test/e2e.sh`'s
+  `custom-image-direct-terminal-prompt` row, whose per-case receipts carry
+  `appeared_seconds`, `refused_seconds` and `after_refusal_seconds`.
