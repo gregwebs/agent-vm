@@ -143,24 +143,40 @@ impl Harness {
     /// through the public CLI. Launch preparation has something to approve, so
     /// `builder.build()` and its debug dump are reachable without a registry.
     fn new() -> Self {
-        let h = Self::bare();
-        let archive = h.home.path().join("fixture-boot.tar");
+        let mut h = Self::bare();
+        h.import_fixture_image();
+        h
+    }
+
+    /// [`Self::new`] with `$HOME` created under `/tmp`, for a fixture that must
+    /// bind a UNIX socket inside it: `sun_path` ends at ~104 bytes on Darwin, and
+    /// a deep checkout can spend most of that on `$HOME`'s path alone (#489).
+    /// Only the host location of `$HOME` changes, so the guest sees the topology
+    /// [`Self::new`] presents.
+    fn new_at_short_home() -> Self {
+        let mut h = Self::with_home(tempfile::tempdir_in("/tmp").unwrap());
+        h.import_fixture_image();
+        h
+    }
+
+    fn import_fixture_image(&mut self) {
+        let archive = self.home.path().join("fixture-boot.tar");
         image_archive::write(&archive, &image_archive::ArchiveSpec::default());
         let mut import = Command::new(agent_vm_bin());
         import
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
-            .env("HOME", h.home.path())
-            .env("AGENT_VM_STATE_DIR", h.state.path())
-            .env("MSB_PATH", &h.fake_msb)
-            .current_dir(h.project.path())
+            .env("HOME", self.home.path())
+            .env("AGENT_VM_STATE_DIR", self.state.path())
+            .env("MSB_PATH", &self.fake_msb)
+            .current_dir(self.project.path())
             .args([
                 "image",
                 "import",
                 "--input",
                 archive.to_str().unwrap(),
                 "--tag",
-                &h.image,
+                &self.image,
             ]);
         let out = run_with_timeout(import, Duration::from_secs(60));
         assert!(
@@ -168,9 +184,7 @@ impl Harness {
             "fixture import failed: {}",
             stderr_of(&out)
         );
-        let mut h = h;
-        h.seeded_state = state_entries(&h.state.path().canonicalize().unwrap());
-        h
+        self.seeded_state = state_entries(&self.state.path().canonicalize().unwrap());
     }
 
     /// Seed the same fixture image into another state root (a fresh or
@@ -205,13 +219,20 @@ impl Harness {
     /// A harness with no imported image: for tests whose whole point is that a
     /// rejected launch creates no state.
     fn bare() -> Self {
+        // `$HOME` and the project dir stay on the workspace filesystem: the
+        // project helper fails fast if `CARGO_TARGET_DIR` pushed it under a
+        // guest tmpfs prefix, where the guest would remap it to `/workspace`
+        // and break the assertions about the project's guest path. A fixture
+        // that binds a socket inside `$HOME` wants [`Self::new_at_short_home`]
+        // instead.
+        Self::with_home(tempfile::tempdir_in(support::workspace_tmpdir()).unwrap())
+    }
+
+    /// The isolated dirs and fake `msb` the constructors share; only the host
+    /// location of `$HOME` differs between the constructors that call it.
+    fn with_home(home: tempfile::TempDir) -> Self {
         // The relay socket lives below the state directory, so keep that one
-        // under `/tmp` to stay within Unix's socket-path limit. `$HOME` and the
-        // project dir live on the workspace filesystem instead; the project
-        // helper fails fast if `CARGO_TARGET_DIR` pushed it under a guest tmpfs
-        // prefix, where the guest would remap it to `/workspace` and break the
-        // assertions about the project's guest path.
-        let home = tempfile::tempdir_in(support::workspace_tmpdir()).unwrap();
+        // under `/tmp` to stay within Unix's socket-path limit.
         let state = tempfile::tempdir_in("/tmp").unwrap();
         let project = support::project_tempdir();
         let fake_msb = fake_msb::write(home.path());
@@ -1201,7 +1222,9 @@ fn fork_seed_omission_does_not_block_later_explicit_child_mount() {
 /// socket, and reaches the runtime.
 #[test]
 fn a_fork_seed_omits_a_nested_socket_and_still_launches() {
-    let h = Harness::new();
+    // The socket's path is `sun_path`-bounded, so this fixture's `$HOME` goes
+    // under `/tmp` rather than onto a possibly deep checkout path (#489).
+    let h = Harness::new_at_short_home();
     let source = h.home_path().join("fork-source");
     std::fs::create_dir_all(source.join("dashboard")).unwrap();
     std::fs::write(source.join("kept"), "seed").unwrap();
