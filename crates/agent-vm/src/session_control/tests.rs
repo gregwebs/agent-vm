@@ -1566,3 +1566,402 @@ async fn concurrent_grants_on_socket_are_idempotent_first_writer_wins() {
     assert_eq!(harness.allowances.snapshot().session.len(), 1);
     harness.shutdown().await;
 }
+
+// ------------------------------------------------ ADR-0070 D2 teardown ownership
+
+/// Marks that the monitor task was destroyed, and tells the test.
+struct SetOnDrop(
+    Arc<std::sync::atomic::AtomicBool>,
+    Option<tokio::sync::oneshot::Sender<()>>,
+);
+
+impl Drop for SetOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(sender) = self.1.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+/// A monitor task that runs until it is cancelled, plus the receipt proving it was.
+async fn stalled_monitor() -> (
+    crate::resources::ResourceMonitor,
+    tokio::sync::oneshot::Receiver<()>,
+    Arc<std::sync::atomic::AtomicBool>,
+) {
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (receipt_tx, receipt_rx) = tokio::sync::oneshot::channel();
+    let owned = Arc::clone(&dropped);
+    let task = tokio::spawn(async move {
+        let _receipt = SetOnDrop(owned, Some(receipt_tx));
+        let _ = entered_tx.send(());
+        std::future::pending::<()>().await;
+    });
+    entered_rx.await.expect("the monitor task started");
+    (
+        crate::resources::ResourceMonitor::from_task_for_tests(task),
+        receipt_rx,
+        dropped,
+    )
+}
+
+/// The stub a lifecycle test delegates to: it records the order, refuses to run
+/// before the monitor is joined, and checks the feed closed the socket.
+struct StubTeardown {
+    steps: std::sync::Mutex<Vec<&'static str>>,
+    monitor_dropped: Arc<std::sync::atomic::AtomicBool>,
+    socket: PathBuf,
+    stop_fails: bool,
+    /// A direct `remove` (no before-remove hook) deliberately leaves the feed alone.
+    feed_finishes_first: bool,
+    /// How long `remove` takes; `None` is instantaneous.
+    slow_remove: Option<Duration>,
+}
+
+impl StubTeardown {
+    fn new(
+        monitor_dropped: Arc<std::sync::atomic::AtomicBool>,
+        socket: PathBuf,
+        stop_fails: bool,
+    ) -> Self {
+        Self {
+            steps: std::sync::Mutex::new(Vec::new()),
+            monitor_dropped,
+            socket,
+            stop_fails,
+            feed_finishes_first: true,
+            slow_remove: None,
+        }
+    }
+
+    fn without_before_remove(mut self) -> Self {
+        self.feed_finishes_first = false;
+        self
+    }
+
+    /// For the one test whose join cannot finish: it asserts the *bound*, not the ordering,
+    /// which the three joinable-monitor tests above already pin.
+    /// Make `remove` take real time, to model an operation that needs its full budget.
+    fn with_slow_remove(mut self, delay: Duration) -> Self {
+        self.slow_remove = Some(delay);
+        self
+    }
+
+    fn without_monitor_assertion(self) -> Self {
+        self.monitor_dropped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
+    fn record(&self, step: &'static str) {
+        assert!(
+            self.monitor_dropped
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "{step} ran before the memory monitor was joined"
+        );
+        self.steps.lock().unwrap().push(step);
+    }
+
+    fn steps(&self) -> Vec<&'static str> {
+        self.steps.lock().unwrap().clone()
+    }
+}
+
+impl crate::teardown::ExecTeardown for StubTeardown {
+    async fn stop_and_wait(&self) -> Result<()> {
+        self.record("stop");
+        if self.stop_fails {
+            anyhow::bail!("stop failed");
+        }
+        Ok(())
+    }
+    async fn kill_with_timeout(&self, _timeout: Duration) -> Result<()> {
+        self.record("kill");
+        Ok(())
+    }
+    async fn wait(&self) -> Result<()> {
+        self.record("wait");
+        Ok(())
+    }
+    async fn remove(&self) -> Result<()> {
+        if let Some(delay) = self.slow_remove {
+            tokio::time::sleep(delay).await;
+        }
+        self.record("remove");
+        // The feed's own teardown step unlinks the socket, so this is proof the
+        // before-remove hook ran first rather than a second imitation of it.
+        if self.feed_finishes_first {
+            assert!(
+                !self.socket.exists(),
+                "removal began before the refusal feed finished"
+            );
+        }
+        Ok(())
+    }
+}
+
+fn socket_of(session: &ProjectSession, live: &LiveSession) -> PathBuf {
+    session
+        .sessions_dir()
+        .join(format!("{}.sock", live.id().as_str()))
+}
+
+#[tokio::test]
+async fn memory_monitor_stops_before_ordinary_forced_and_failed_teardown() {
+    use crate::teardown::{TeardownMode, cleanup_exec_sandbox_failures};
+    for (mode, stop_fails, expected) in [
+        (TeardownMode::Ordinary, false, Vec::<&str>::new()),
+        (TeardownMode::Ordinary, true, vec!["stop: stop failed"]),
+        (TeardownMode::Forced, false, Vec::<&str>::new()),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let session = project(root.path());
+        let live = start_live(&session).await;
+        let socket = socket_of(&session, &live);
+        let (monitor, receipt, dropped) = stalled_monitor().await;
+        let stub = StubTeardown::new(Arc::clone(&dropped), socket.clone(), stop_fails);
+        let teardown = LaunchTeardown::new(&stub, &live, monitor);
+        let failures = cleanup_exec_sandbox_failures(&teardown, mode).await;
+        assert_eq!(failures, expected, "{mode:?} stop_fails={stop_fails}");
+        receipt.await.expect("the monitor task was destroyed");
+        let steps = stub.steps();
+        assert_eq!(
+            *steps.last().expect("a teardown step"),
+            "remove",
+            "{mode:?}"
+        );
+        assert!(steps.contains(&"stop") == !matches!(mode, TeardownMode::Forced));
+        assert_eq!(
+            steps.contains(&"kill"),
+            stop_fails || matches!(mode, TeardownMode::Forced)
+        );
+        assert!(
+            !socket.exists(),
+            "{mode:?}: the feed finished before removal"
+        );
+        live.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn memory_monitor_is_joined_even_when_before_remove_is_cancelled() {
+    let root = tempfile::tempdir().unwrap();
+    let session = project(root.path());
+    let live = start_live(&session).await;
+    let socket = socket_of(&session, &live);
+    let (monitor, receipt, dropped) = stalled_monitor().await;
+    let stub =
+        StubTeardown::new(Arc::clone(&dropped), socket.clone(), false).without_before_remove();
+    let teardown = LaunchTeardown::new(&stub, &live, monitor);
+    {
+        // An enclosing teardown timeout cancels the first hook after it requested the
+        // abort; a `take()` based stop would have detached the task here.
+        let stopping = crate::teardown::ExecTeardown::stop_and_wait(&teardown);
+        let mut stopping = std::pin::pin!(stopping);
+        assert!(futures::poll!(&mut stopping).is_pending());
+    }
+    assert!(stub.steps().is_empty(), "no operation ran before removal");
+    {
+        let removing = crate::teardown::ExecTeardown::remove(&teardown);
+        let mut removing = std::pin::pin!(removing);
+        // The retained handle is still being joined, so removal cannot delegate yet.
+        assert!(futures::poll!(&mut removing).is_pending());
+        assert!(stub.steps().is_empty());
+        removing.await.expect("removal after the join");
+    }
+    receipt.await.expect("the monitor task was destroyed");
+    assert_eq!(stub.steps(), vec!["remove"]);
+    // And the defensive path: a fresh teardown joins the monitor before removing.
+    let root = tempfile::tempdir().unwrap();
+    let session = project(root.path());
+    let live = start_live(&session).await;
+    let (monitor, receipt, dropped) = stalled_monitor().await;
+    let socket = socket_of(&session, &live);
+    let stub = StubTeardown::new(Arc::clone(&dropped), socket, false).without_before_remove();
+    let teardown = LaunchTeardown::new(&stub, &live, monitor);
+    crate::teardown::ExecTeardown::remove(&teardown)
+        .await
+        .expect("remove");
+    receipt.await.expect("the monitor task was destroyed");
+    assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    live.finish().await;
+}
+
+#[tokio::test]
+async fn launch_teardown_drop_aborts_memory_monitor_on_early_return() {
+    let root = tempfile::tempdir().unwrap();
+    let session = project(root.path());
+    let live = start_live(&session).await;
+    let socket = socket_of(&session, &live);
+    let (monitor, receipt, dropped) = stalled_monitor().await;
+    let stub = StubTeardown::new(Arc::clone(&dropped), socket.clone(), false);
+    let teardown = LaunchTeardown::new(&stub, &live, monitor);
+    // The early legacy return path: the guard is dropped without any cleanup call.
+    drop(teardown);
+    receipt
+        .await
+        .expect("the aborted monitor task was destroyed");
+    assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    // No teardown ran, so the temporary session is finished here rather than leaked.
+    live.finish().await;
+    assert!(!socket.exists());
+}
+
+/// A blocking task that stays running until the test releases it, so "unjoinable" is a state
+/// the test controls rather than a race against a sleep.
+struct Unjoinable {
+    release: Arc<std::sync::atomic::AtomicBool>,
+    finished: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Unjoinable {
+    fn is_finished(&self) -> bool {
+        self.finished.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Let the blocking task end, so the runtime's shutdown is not held up by it.
+    fn release(&self) {
+        self.release
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..200 {
+            if self.is_finished() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+/// A monitor whose join cannot finish while [`Unjoinable::release`] has not been called.
+///
+/// `abort()` does not interrupt a blocking task that has started, but it *does* cancel one that
+/// has not been scheduled yet — so the handshake comes first and the task then runs until the
+/// test says otherwise. That makes "the join could not finish" deterministic instead of a
+/// margin between two sleeps, and it stands in for the unresponsive task review B2 describes.
+fn unjoinable_monitor() -> (
+    crate::resources::ResourceMonitor,
+    tokio::sync::oneshot::Receiver<()>,
+    Unjoinable,
+) {
+    let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let task_release = Arc::clone(&release);
+    let task_finished = Arc::clone(&finished);
+    let monitor = crate::resources::ResourceMonitor::from_task_for_tests(
+        tokio::task::spawn_blocking(move || {
+            let _ = started_tx.send(());
+            // Bounded as well: a failing assertion must not leave this thread spinning and
+            // hang the test binary's shutdown, so it gives up long after any real cleanup.
+            let give_up = std::time::Instant::now() + Duration::from_secs(60);
+            while !task_release.load(std::sync::atomic::Ordering::SeqCst)
+                && std::time::Instant::now() < give_up
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            task_finished.store(true, std::sync::atomic::Ordering::SeqCst);
+        }),
+    );
+    (monitor, started_rx, Unjoinable { release, finished })
+}
+
+#[test]
+fn the_monitor_join_bound_is_below_every_teardown_budget() {
+    use crate::teardown::{
+        EXEC_KILL_TIMEOUT, EXEC_REAP_TIMEOUT, EXEC_REMOVE_TIMEOUT, EXEC_STOP_TIMEOUT,
+    };
+    // A hook awaits the join *inside* its own budget, so the join must be able to expire well
+    // before the smallest one or it would turn into `remove: timed out` with the VM left
+    // behind (#258).
+    let smallest = EXEC_KILL_TIMEOUT
+        .min(EXEC_REAP_TIMEOUT)
+        .min(EXEC_REMOVE_TIMEOUT)
+        .min(EXEC_STOP_TIMEOUT);
+    assert!(
+        crate::resources::MONITOR_JOIN_TIMEOUT < smallest,
+        "the monitor join bound must stay under the smallest teardown budget"
+    );
+    // The join runs inside each operation's outer deadline, so that deadline is extended by
+    // exactly the join's bound: the operation keeps its whole budget.
+    assert_eq!(
+        crate::teardown::EXEC_MONITOR_JOIN_ALLOWANCE,
+        crate::resources::MONITOR_JOIN_TIMEOUT
+    );
+}
+
+#[tokio::test]
+async fn teardown_join_is_bounded_and_still_removes_the_sandbox() {
+    use crate::teardown::{TeardownMode, cleanup_exec_sandbox_failures};
+    let root = tempfile::tempdir().unwrap();
+    let session = project(root.path());
+    let live = start_live(&session).await;
+    let socket = socket_of(&session, &live);
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let stub =
+        StubTeardown::new(Arc::clone(&dropped), socket.clone(), false).without_monitor_assertion();
+    let (monitor, task_started, unjoinable) = unjoinable_monitor();
+    let teardown = LaunchTeardown::new(&stub, &live, monitor);
+    task_started.await.expect("the blocking task is running");
+
+    // The task cannot finish until the test releases it, so a join that returns *now* can only
+    // have returned on its own deadline. No sleep margin is involved.
+    teardown.stop_resources().await;
+    assert!(
+        !unjoinable.is_finished(),
+        "the join waited for the task instead of expiring on its own deadline"
+    );
+    assert!(
+        stub.steps().is_empty(),
+        "the join alone must not run a teardown operation"
+    );
+
+    // The bounded join left the handle retained, so the hooks still join it before
+    // delegating; and because the join can expire early, the sandbox is still removed and no
+    // step reports a timeout.
+    let failures = cleanup_exec_sandbox_failures(&teardown, TeardownMode::Forced).await;
+    assert!(
+        failures.is_empty(),
+        "a slow join must not become a teardown failure: {failures:?}"
+    );
+    assert_eq!(stub.steps().last(), Some(&"remove"));
+    assert!(!socket.exists());
+    live.finish().await;
+    unjoinable.release();
+}
+
+#[tokio::test]
+async fn a_slow_join_does_not_consume_the_operations_own_budget() {
+    use crate::teardown::{TeardownMode, cleanup_exec_sandbox_failures};
+    // The case the review asks for: an unjoinable monitor plus a `remove` that needs more than
+    // the time left over if the join came out of its budget (`EXEC_REMOVE_TIMEOUT` minus the
+    // join) but less than the budget itself. The deadline must be
+    // `budget + EXEC_MONITOR_JOIN_ALLOWANCE`, or this remove is cut off and the sandbox is
+    // left behind.
+    let root = tempfile::tempdir().unwrap();
+    let session = project(root.path());
+    let live = start_live(&session).await;
+    let socket = socket_of(&session, &live);
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let stub = StubTeardown::new(Arc::clone(&dropped), socket.clone(), false)
+        .without_monitor_assertion()
+        .with_slow_remove(Duration::from_millis(3500));
+    let (monitor, task_started, unjoinable) = unjoinable_monitor();
+    let teardown = LaunchTeardown::new(&stub, &live, monitor);
+    task_started.await.expect("the blocking task is running");
+
+    let failures = cleanup_exec_sandbox_failures(&teardown, TeardownMode::Forced).await;
+    assert!(
+        !unjoinable.is_finished(),
+        "the monitor stayed unjoinable for the whole cleanup, so every step paid the join"
+    );
+    assert!(
+        failures.is_empty(),
+        "the operation must keep its own budget around the join: {failures:?}"
+    );
+    assert_eq!(stub.steps().last(), Some(&"remove"));
+    assert!(!socket.exists());
+    live.finish().await;
+    unjoinable.release();
+}

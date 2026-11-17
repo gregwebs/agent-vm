@@ -63,10 +63,28 @@ impl ExecTeardown for Sandbox {
 /// Bounded teardown deadlines for the exec lifecycle. Named and local: a wedged
 /// VMM must not hang the launcher, and a failed graceful stop must still reap
 /// and remove rather than leaking a hidden VM (#258).
+///
+/// These are the budget each **operation** gets. A teardown value that stops its own
+/// background task first (`LaunchTeardown`) is allowed [`EXEC_MONITOR_JOIN_ALLOWANCE`] on
+/// top, so the join can never eat the operation's deadline and turn a slow join into a
+/// spurious `remove: timed out` with the sandbox left behind.
 pub(crate) const EXEC_STOP_TIMEOUT: Duration = Duration::from_secs(10);
-const EXEC_KILL_TIMEOUT: Duration = Duration::from_secs(5);
-const EXEC_REAP_TIMEOUT: Duration = Duration::from_secs(5);
-const EXEC_REMOVE_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const EXEC_KILL_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const EXEC_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const EXEC_REMOVE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The extra time a step whose implementation first joins a background task may take.
+///
+/// Equal to the join's own bound, so the step still receives its whole budget: the outer
+/// deadline is `budget + this`, and the join cannot exceed it.
+pub(crate) const EXEC_MONITOR_JOIN_ALLOWANCE: Duration = crate::resources::MONITOR_JOIN_TIMEOUT;
+
+/// The deadline for one teardown step: its own budget plus the join allowance.
+fn step_deadline(budget: Duration) -> Duration {
+    budget
+        .checked_add(EXEC_MONITOR_JOIN_ALLOWANCE)
+        .unwrap_or(Duration::MAX)
+}
 
 /// The backstop for [`ExecTeardown::before_remove`], the only teardown step whose
 /// own work has several bounded parts.
@@ -110,7 +128,9 @@ pub(crate) async fn cleanup_exec_sandbox_failures(
     let stopped = match mode {
         TeardownMode::Forced => false,
         TeardownMode::Ordinary => {
-            match tokio::time::timeout(EXEC_STOP_TIMEOUT, teardown.stop_and_wait()).await {
+            match tokio::time::timeout(step_deadline(EXEC_STOP_TIMEOUT), teardown.stop_and_wait())
+                .await
+            {
                 Ok(Ok(_)) => true,
                 Ok(Err(error)) => {
                     failures.push(format!("stop: {error}"));
@@ -128,7 +148,7 @@ pub(crate) async fn cleanup_exec_sandbox_failures(
         // before this kill/reap runs: the outer timeout on `kill_with_timeout`
         // bounds the dispatch itself, not just the kill it performs.
         match tokio::time::timeout(
-            EXEC_KILL_TIMEOUT,
+            step_deadline(EXEC_KILL_TIMEOUT),
             teardown.kill_with_timeout(EXEC_KILL_TIMEOUT),
         )
         .await
@@ -138,7 +158,7 @@ pub(crate) async fn cleanup_exec_sandbox_failures(
             Err(_) => failures.push(format!("kill: timed out after {EXEC_KILL_TIMEOUT:?}")),
         }
         // Reap even if the kill failed, so no wedged process is left owned.
-        match tokio::time::timeout(EXEC_REAP_TIMEOUT, teardown.wait()).await {
+        match tokio::time::timeout(step_deadline(EXEC_REAP_TIMEOUT), teardown.wait()).await {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => failures.push(format!("reap: {error}")),
             Err(_) => failures.push(format!("reap: timed out after {EXEC_REAP_TIMEOUT:?}")),
@@ -151,7 +171,7 @@ pub(crate) async fn cleanup_exec_sandbox_failures(
     // cannot fail a launch (AC14), so the record being late is a lost record and
     // never a refused remove. The remove below still runs, which is the whole
     // point of bounding this step.
-    if tokio::time::timeout(EXEC_RECORD_TIMEOUT, teardown.before_remove())
+    if tokio::time::timeout(step_deadline(EXEC_RECORD_TIMEOUT), teardown.before_remove())
         .await
         .is_err()
     {
@@ -159,7 +179,7 @@ pub(crate) async fn cleanup_exec_sandbox_failures(
             "recording the session's last refusals did not finish within {EXEC_RECORD_TIMEOUT:?}; removing the sandbox anyway"
         );
     }
-    match tokio::time::timeout(EXEC_REMOVE_TIMEOUT, teardown.remove()).await {
+    match tokio::time::timeout(step_deadline(EXEC_REMOVE_TIMEOUT), teardown.remove()).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => failures.push(format!("remove: {error}")),
         Err(_) => failures.push(format!("remove: timed out after {EXEC_REMOVE_TIMEOUT:?}")),
