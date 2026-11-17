@@ -699,6 +699,29 @@ impl Reply {
         line.push(b'\n');
         line
     }
+
+    /// What this reply is, for the one message that says it was not the reply
+    /// that was asked for.
+    ///
+    /// Never its contents: the peer chooses them, and a well-formed `allowances`
+    /// answer to a `list` used to arrive as every entry it held (#649). An
+    /// `error` reply's `code` is the one peer field worth reporting — it says why
+    /// the request was refused — so it is bounded like serde's own message.
+    fn kind(&self) -> String {
+        match self {
+            Reply::Session { .. } => "a session reply".to_owned(),
+            Reply::Snapshot { .. } => "a snapshot reply".to_owned(),
+            Reply::Update { .. } => "an update reply".to_owned(),
+            Reply::Ended { .. } => "an ended reply".to_owned(),
+            Reply::Grant { .. } => "a grant reply".to_owned(),
+            Reply::Revoke { .. } => "a revoke reply".to_owned(),
+            Reply::Allowances { .. } => "an allowances reply".to_owned(),
+            Reply::Egress { .. } => "an egress reply".to_owned(),
+            Reply::Error { code, .. } => {
+                format!("an error reply (code {})", truncated(code, MAX_CAUSE_BYTES))
+            }
+        }
+    }
 }
 
 fn error(code: &str) -> Reply {
@@ -1121,8 +1144,9 @@ fn parse_reply(path: &Path, line: &str) -> Result<Reply> {
 
 /// The most bytes of a cause this build echoes.
 ///
-/// Serde's message is the one place a peer's own bytes reach the terminal, so this
-/// is the whole budget for them: at most 203 bytes (200 plus `...`) leave here, and
+/// A peer's own bytes reach the terminal in two places, and this is the whole
+/// budget for each: serde's message from [`parse_reply`], and an `error` reply's
+/// `code` in [`Reply::kind`]. At most 203 bytes (200 plus `...`) leave here, and
 /// the terminal escape's fourfold expansion makes that 812 at the sink.
 const MAX_CAUSE_BYTES: usize = 200;
 
@@ -1170,7 +1194,7 @@ async fn list(path: &Path) -> Result<SessionSnapshot> {
         other => Err(anyhow::anyhow!(
             "{} answered {} instead of a session",
             crate::one_line::path(path),
-            format_args!("{other:?}")
+            other.kind()
         )),
     }
 }
@@ -1219,7 +1243,7 @@ pub(crate) async fn grant(
         other => Err(anyhow::anyhow!(
             "{} answered {} instead of a grant",
             crate::one_line::path(path),
-            format_args!("{other:?}")
+            other.kind()
         )),
     }
 }
@@ -1245,7 +1269,7 @@ pub(crate) async fn revoke(
         other => Err(anyhow::anyhow!(
             "{} answered {} instead of a revoke",
             crate::one_line::path(path),
-            format_args!("{other:?}")
+            other.kind()
         )),
     }
 }
@@ -1260,7 +1284,7 @@ pub(crate) async fn allowances(
         other => Err(anyhow::anyhow!(
             "{} answered {} instead of its allowances",
             crate::one_line::path(path),
-            format_args!("{other:?}")
+            other.kind()
         )),
     }
 }
@@ -1306,7 +1330,7 @@ pub(crate) async fn egress(path: &Path) -> Result<EgressAnswer> {
         other => Err(anyhow::anyhow!(
             "{} answered {} instead of its effective egress",
             crate::one_line::path(path),
-            format_args!("{other:?}")
+            other.kind()
         )),
     }
 }

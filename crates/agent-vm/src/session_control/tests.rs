@@ -1214,6 +1214,80 @@ async fn an_undecodable_reply_is_reported_without_the_echoed_tag() {
     served.await.unwrap();
 }
 
+/// #649: a reply of the wrong kind is reported by its kind, not its contents.
+///
+/// A peer answering a `list` with 256 allowances used to put every destination on
+/// stderr, and the sink's escape expands what it is given fourfold. The message
+/// names the kind and stays short.
+#[tokio::test]
+async fn a_mismatched_reply_is_reported_by_kind_not_by_its_entries() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("0000abcd.sock");
+    let entries: Vec<String> = (0..256)
+        .map(|n| {
+            format!(
+                "{{\"destination\":\"tcp://[203.0.113.{n}/32]:443\",\"granted_ms\":{n},\"revision\":{n}}}"
+            )
+        })
+        .collect();
+    let reply = format!(
+        "{{\"reply\":\"allowances\",\"v\":2,\"allowances\":{{\"session\":[{}],\"project\":[]}}}}\n",
+        entries.join(",")
+    );
+    let served = answer_once(&socket, reply.into_bytes()).await;
+    let error = list(&socket)
+        .await
+        .expect_err("an allowances reply is not a list answer");
+    let text = format!("{error:#}");
+    // The kind and the path, and no slack for any entry: an exact equality is
+    // what a Debug dump of the reply cannot satisfy.
+    assert_eq!(
+        text,
+        format!(
+            "{} answered an allowances reply instead of a session",
+            crate::one_line::path(&socket)
+        )
+    );
+    served.await.unwrap();
+}
+
+/// #649: the one peer field a mismatch message reports — an `error` reply's
+/// `code` — is cut at [`MAX_CAUSE_BYTES`] and marked.
+#[tokio::test]
+async fn a_mismatched_error_reply_reports_a_bounded_code() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("0000abcd.sock");
+    let marker = "CODE-MARKER";
+    let code = format!("{}{marker}", "c".repeat(20_000));
+    let reply = format!("{{\"reply\":\"error\",\"v\":2,\"code\":\"{code}\"}}\n");
+    let served = answer_once(&socket, reply.into_bytes()).await;
+    let error = list(&socket)
+        .await
+        .expect_err("an error reply is not a list answer");
+    let text = format!("{error:#}");
+    let prefix = format!(
+        "{} answered an error reply (code ",
+        crate::one_line::path(&socket)
+    );
+    assert!(text.starts_with(&prefix), "{text}");
+    assert!(text.contains("..."), "the code is marked cut: {text:?}");
+    assert!(
+        !text.contains(marker),
+        "the code's tail is not printed: {text:?}"
+    );
+    // Exactly the budget, its `...` mark, the closing paren and the fixed tail:
+    // the message cannot grow past [`MAX_CAUSE_BYTES`] however long the peer's
+    // code is.
+    let suffix = ") instead of a session";
+    assert_eq!(
+        text.len(),
+        prefix.len() + MAX_CAUSE_BYTES + 3 + suffix.len(),
+        "{text}"
+    );
+    assert!(text.ends_with(suffix), "{text}");
+    served.await.unwrap();
+}
+
 /// #631: the reply carries what the credential overlay narrowed, and nothing
 /// until the launch records it.
 #[tokio::test]
