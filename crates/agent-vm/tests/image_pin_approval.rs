@@ -9978,33 +9978,31 @@ fn multi_refresh_closed_stderr_contention_preserves_progress() {
         drop(sink);
         committed.reply(Reply::Continue);
         // The contention notice is attempted while the lock is still held. If it
-        // never arrives, the child's own exit status and stderr are collected so
+        // never arrives, the child's own exit status and output are collected so
         // the evidence is causal (the notice write panicked) rather than "the gate
         // went quiet".
-        let paused = match notice.recv_timeout(Duration::from_secs(60)) {
+        let paused = match await_notice(&notice, &mut child) {
             Ok(paused) => paused,
-            Err(error) => {
-                // Bounded: a child still running after this poll is a scheduling
-                // failure, not a caught mutant, and must fail rather than hang.
-                let Some(code) = child_exit_within(&mut child, Duration::from_secs(10)) else {
-                    panic!(
-                        "the {contention:?} notice was never attempted ({error}) and the child \
-                         was still running after 10 s: that is a scheduling failure, not a \
-                         caught mutant"
-                    );
-                };
-                let text = exited_child_output(&mut child);
+            // A child still running is a scheduling failure, not a caught mutant,
+            // and must fail rather than hang.
+            Err(NoticeWait::Running) => panic!(
+                "the {contention:?} notice was never attempted and the child was still running \
+                 after {} s: that is a scheduling failure, not a caught mutant",
+                NOTICE_FALLBACK.as_secs()
+            ),
+            Err(NoticeWait::Exited { code, output }) => {
                 // A child that panicked on the notice write exits 101; that is the
                 // causal evidence (its message cannot reach a closed stderr).
                 assert_eq!(
                     code,
                     Some(101),
                     "the {contention:?} notice must be attempted while the lock is held; the \
-                     child exited with {code:?} and output: {text}{error}"
+                     child exited with {code:?} and output: {output}"
                 );
                 panic!(
-                    "the {contention:?} contention notice was never attempted ({error}); child \
-                     exited Some(101) (panic on the notice write); output: {text}"
+                    "the {contention:?} contention notice was never attempted: the child exited \
+                     Some(101) without reporting it (a panic on the notice write); output: \
+                     {output}"
                 );
             }
         };
@@ -10923,17 +10921,52 @@ fn refresh_input_refusals_precede_any_state() {
     assert!(!h.pins().exists(), "no authority was created");
 }
 
-/// Poll for a child to exit within `within`: `Some(code)` once it has, `None`
-/// while it is still running. Never blocks past the bound, so a stuck child fails
-/// a test instead of hanging CI.
-fn child_exit_within(child: &mut std::process::Child, within: Duration) -> Option<Option<i32>> {
-    let deadline = std::time::Instant::now() + within;
+/// The bound a closed-sink control waits for its notice checkpoint. Only a
+/// genuinely slow schedule reaches it: a child that died ends the wait at once.
+const NOTICE_FALLBACK: Duration = Duration::from_secs(60);
+
+/// Why the notice checkpoint a closed-sink control waits for never arrived.
+enum NoticeWait {
+    /// The child saw the notice write fail, so its exit status is the evidence.
+    Exited { code: Option<i32>, output: String },
+    /// The child is still running: a slow schedule, not a caught mutant.
+    Running,
+}
+
+/// Wait for the notice checkpoint while polling the child.
+///
+/// The channel alone cannot see a dead child: its sender lives in an acquisition
+/// gate pump that stays blocked on a connection the dead child will never open,
+/// so waiting only on the channel burns the whole fallback before the child's own
+/// exit code can be reported (#624).
+fn await_notice(
+    notice: &std::sync::mpsc::Receiver<acquisition_gate::Checkpoint>,
+    child: &mut std::process::Child,
+) -> Result<acquisition_gate::Checkpoint, NoticeWait> {
+    use std::sync::mpsc::TryRecvError;
+
+    let deadline = std::time::Instant::now() + NOTICE_FALLBACK;
     loop {
-        if let Ok(Some(status)) = child.try_wait() {
-            return Some(status.code());
+        // The checkpoint comes first: the child blocks inside the one it reports,
+        // so an entry in the channel is always the earlier event.
+        match notice.try_recv() {
+            Ok(paused) => return Ok(paused),
+            // Nothing buffered: the child's own status decides from here, and a
+            // disconnected pump can send nothing more.
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Err(NoticeWait::Exited {
+                    code: status.code(),
+                    output: exited_child_output(child),
+                });
+            }
+            Ok(None) => {}
+            Err(error) => panic!("poll the refresh child: {error}"),
         }
         if std::time::Instant::now() >= deadline {
-            return None;
+            return Err(NoticeWait::Running);
         }
         std::thread::sleep(Duration::from_millis(20));
     }
