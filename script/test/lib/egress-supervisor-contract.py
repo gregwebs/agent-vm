@@ -123,14 +123,24 @@ class Contracts(unittest.TestCase):
             tool_index = command.argv.index(command.tool)
             self.assertEqual(command.argv[:4], (str(self.binary), "--no-git", "--image", egress.IMAGE))
             self.assertEqual(set(command.env), expected_keys | set(case.extras))
-            self.assertEqual(command.kind == "validation-only", case.case in ("RJ1", "PXH1"))
+            validation_only = command.kind == "validation-only"
+            self.assertEqual(validation_only, case.case in ("RJ1", "PXH1"))
             self.assertNotIn("--", command.argv)
+            tail = command.argv[tool_index + 1:]
             if case.case in ("NR1", "NR2", "NR3"):
                 trailing = ("echo", "AGENT_VM_328_SHELL_STARTED") if case.case == "NR3" else ("--version",)
-                self.assertEqual(command.argv[tool_index + 1:], trailing)
+                self.assertEqual(tail, trailing)
                 self.assertEqual(Path(command.cwd), self.work / "requests")
-            elif case.guest:
-                self.assertEqual(command.argv[tool_index + 1], case.case)
+            else:
+                # A validation-only invocation validates its flags and never
+                # dispatches, so nothing may follow the tool: the case is judged
+                # on the refusal diagnostic alone, which makes a stray positional
+                # there argv nothing else observes (#371). A guest case's tail is
+                # its dispatch, and its head names the case. One comparison covers
+                # both: the whole tail where it must be empty, its head otherwise.
+                observed = tail if validation_only else tail[:1]
+                expected = () if validation_only else (case.case,)
+                self.assertEqual(observed, expected)
             if case.case != "NR3":
                 self.assertNotIn("shell", command.argv)
             self.assertNotIn("-c", command.argv)
