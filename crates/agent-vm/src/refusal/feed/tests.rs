@@ -908,7 +908,8 @@ async fn a_line_reaches_the_log_within_two_seconds_of_ingestion() {
         }
         assert!(
             ingested.duration_since(task_start) <= Duration::from_secs(2),
-            "ingestion itself is bounded by one fallback poll: {:?}",
+            "ingestion exceeded the runtime's fallback poll, the net for a notification \
+             that never arrived: {:?}",
             ingested.duration_since(task_start)
         );
         let _ = stop.send(true);

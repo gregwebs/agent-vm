@@ -28,8 +28,9 @@ use super::SessionSnapshot;
 use super::log::SessionsDir;
 
 /// The longest the log may trail ingestion by while writes succeed (AC3). The
-/// ingestion side of that bound is the runtime's own fallback poll (2 s,
-/// `logs/stream.rs`), which nothing here can shorten.
+/// bound starts at ingestion, not at the guest's refusal: the runtime wakes this
+/// follower on the append itself (microsandbox #126), and keeps its 2 s interval
+/// only as a net for a notification that never arrived.
 pub(crate) const POST_INTERVAL: Duration = Duration::from_secs(2);
 
 /// The persistence tick: the follower posts a dirty snapshot on the first tick

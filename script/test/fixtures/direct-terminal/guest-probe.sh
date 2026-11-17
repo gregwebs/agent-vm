@@ -154,14 +154,17 @@ if [ "$REFUSE_IGNORE" = ignore ]; then
 fi
 
 # Give the refusal time to reach the launcher's feed before this probe does what
-# the case is about. The feed's ingestion side is the runtime's own 2 s fallback
-# poll (`refusal/feed.rs`: "nothing here can shorten" it), and the rows measured
-# it at 0.02-2.01 s on a real boot (2026-11-15). Without this window a probe that
-# kept writing produced its output *before* the takeover, so the case raced the
-# ingestion instead of testing the prompt: `prompt-deny` saw 38 of its 60 held
-# lines forwarded ahead of the prompt, and a guest that exited immediately after
-# its refused connect was gone before the question could be asked. The window is
-# guest-side silence only; AC1's latency is measured from the connect, not here.
+# the case is about. The runtime wakes the follower on the append itself
+# (microsandbox #126), so ingestion is milliseconds; before that fix the rows
+# measured it at 0.02-2.01 s on a real boot (2026-11-15) because the follower
+# fell back to a 2 s poll. Without this window a probe that kept writing produced
+# its output *before* the takeover, so the case raced the ingestion instead of
+# testing the prompt: `prompt-deny` saw 38 of its 60 held lines forwarded ahead of
+# the prompt, and a guest that exited immediately after its refused connect was
+# gone before the question could be asked. The window is guest-side silence only;
+# AC1's latency is measured from the connect, not here. Four seconds, not one:
+# it still has to absorb a notification the watcher missed, which the runtime
+# covers with its 2 s fallback, plus a loaded host.
 PROMPT_SETTLE_SECONDS=4
 prompt_settle() {
     sleep "$PROMPT_SETTLE_SECONDS"
@@ -264,9 +267,10 @@ probe_stall() {
     # The sequence stalls *before* the refusal reaches the feed, so the launcher must
     # cut it with `CAN` (AC8). The trigger's own output goes to a file: nothing may
     # reach the terminal inside the stalled sequence. The sequence is held open for
-    # six seconds, not two: the takeover decision waits for the refusal to reach
-    # the feed (up to ~2 s after the connect), so a two-second stall usually closed
-    # before the decision arrived and the row proved nothing.
+    # six seconds, not two: with the runtime's append notification the decision
+    # arrives milliseconds after the connect, but a notification the watcher misses
+    # is covered by its 2 s fallback, and a two-second stall closed before that
+    # arrived and proved nothing.
     printf '\033[?20'
     local result
     result="$(mktemp "${TMPDIR:-/tmp}/stall.XXXXXX")"
