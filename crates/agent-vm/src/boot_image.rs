@@ -518,8 +518,8 @@ impl ImageLabel {
     }
 
     /// The label with one further fact sharing the origin's parentheses, or
-    /// owning them alone: `ref (from command line; 2048 MiB, 2 vCPU)` and
-    /// `ref (2048 MiB, 2 vCPU)`. One parenthetical group per line, so neither
+    /// owning them alone: `ref (from command line; 512..=8192 MiB, 1..=2 vCPU)` and
+    /// `ref (512..=8192 MiB, 1..=2 vCPU)`. One parenthetical group per line, so neither
     /// the origin nor the fact is silently dropped when both are shown.
     pub(crate) fn with_detail(&self, detail: &str) -> String {
         self.describe(Some(detail))
@@ -1882,14 +1882,14 @@ mod tests {
             redacted: false,
         };
         assert_eq!(
-            explicit.with_detail("2048 MiB, 2 vCPU"),
-            "example/app:dev (from command line; 2048 MiB, 2 vCPU)"
+            explicit.with_detail("512..=8192 MiB, 1..=2 vCPU"),
+            "example/app:dev (from command line; 512..=8192 MiB, 1..=2 vCPU)"
         );
         assert_eq!(explicit.to_string(), "example/app:dev (from command line)");
         let default = ImageLabel::for_tests("the default boot image");
         assert_eq!(
-            default.with_detail("2048 MiB, 2 vCPU"),
-            "the default boot image (2048 MiB, 2 vCPU)"
+            default.with_detail("512..=8192 MiB, 1..=2 vCPU"),
+            "the default boot image (512..=8192 MiB, 1..=2 vCPU)"
         );
         assert_eq!(default.to_string(), "the default boot image");
     }

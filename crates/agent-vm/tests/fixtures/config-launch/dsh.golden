@@ -10,10 +10,10 @@
     }
   },
   "resources": {
-    "cpus": 2,
-    "memory_mib": 2048,
+    "cpus": 1,
+    "memory_mib": 512,
     "max_cpus": 2,
-    "max_memory_mib": 2048
+    "max_memory_mib": 8192
   },
   "runtime": {
     "workdir": "$PROJECT",
@@ -24,7 +24,7 @@
     "hostname": null,
     "user": "$GUEST_UID:$GUEST_GID",
     "log_level": null,
-    "metrics_sample_interval_ms": 1000,
+    "metrics_sample_interval_ms": 200,
     "disable_metrics_sample": false
   },
   "env": [

@@ -295,6 +295,9 @@ pub(crate) enum Dispatch {
         /// the file declared none, so a launch can tell "no declarations" from
         /// "an empty list" — but both select nothing.
         user_mounts: Option<crate::config_mounts::UserMounts>,
+        /// The validated resource ceiling. Refused while parsing, so an unbootable
+        /// shape costs no runtime prologue (#645).
+        resources: crate::resources::ResourceCeiling,
         /// The launch options.
         args: Box<run::Args>,
     },
@@ -568,11 +571,13 @@ where
                         )
                     })?;
                     reject_direct_terminal_options(&mut command, &matches, &args)?;
+                    let resources = args.resource_ceiling()?;
                     Ok(Dispatch::Launch {
                         images: captured.images,
                         user_network: captured.user_network,
                         user_tools: captured.user_tools,
                         user_mounts: captured.user_mounts,
+                        resources,
                         args: Box::new(args),
                         target: LaunchTarget::Tool {
                             entry: Box::new(entry),
@@ -678,6 +683,11 @@ fn direct_dispatch(
                 error,
             ))
         })?;
+    // A ceiling that cannot boot is the user's input error, so it outranks a broken
+    // catalog; the marker keeps a direct launch's 125 (#398) on this parse path.
+    let resources = args
+        .resource_ceiling()
+        .map_err(|error| anyhow::Error::new(crate::launch_target::DirectLaunchFailure(error)))?;
     match catalog {
         Catalog::Broken(config_error) => Err(anyhow::Error::new(
             crate::launch_target::DirectLaunchFailure(config_error),
@@ -691,6 +701,7 @@ fn direct_dispatch(
             user_network: captured.user_network,
             user_tools: captured.user_tools,
             user_mounts: captured.user_mounts,
+            resources,
             args: Box::new(args),
         }),
     }
@@ -4847,5 +4858,194 @@ mod tests {
                 _ => panic!("expected launch"),
             }
         }
+    }
+
+    // -- #645: launch-only resource ceiling ----------------------------------
+
+    /// The four launch routes with the option placement each one needs so that
+    /// `options` reaches `Args` rather than the tool or guest vector, paired with
+    /// whether the route is a direct spelling (and so answers 125).
+    fn launch_route_spellings(options: &[&str]) -> [(Vec<String>, bool); 4] {
+        let lowered = |tail: &[&str], direct: bool| {
+            (
+                options
+                    .iter()
+                    .copied()
+                    .chain(tail.iter().copied())
+                    .map(str::to_string)
+                    .collect(),
+                direct,
+            )
+        };
+        [
+            lowered(&["mytool"], false),
+            lowered(&["shell"], false),
+            lowered(&["run", "p"], true),
+            lowered(&["--", "p"], true),
+        ]
+    }
+
+    fn resources_of(dispatch: Dispatch) -> crate::resources::ResourceCeiling {
+        match dispatch {
+            Dispatch::Launch { resources, .. } => resources,
+            _ => panic!("expected a launch"),
+        }
+    }
+
+    #[test]
+    fn a_refused_resource_ceiling_fails_while_parsing_every_launch_route() {
+        let mut env = clear_launch_env();
+        // (argv options, environment, exact fixed refusal text)
+        type Case<'a> = (&'a [&'a str], &'a [(&'a str, &'a str)], &'a str);
+        let cases: [Case; 6] = [
+            (&["--memory", "0"], &[], "--memory must be at least 1 GiB"),
+            (&["--cpus", "0"], &[], "--cpus must be at least 1"),
+            (
+                &["--memory", "4194304"],
+                &[],
+                "--memory in GiB overflows u32 MiB",
+            ),
+            (
+                &[],
+                &[("AGENT_VM_MEMORY_GIB", "0")],
+                "--memory must be at least 1 GiB",
+            ),
+            (&[], &[("AGENT_VM_CPUS", "0")], "--cpus must be at least 1"),
+            (
+                &[],
+                &[("AGENT_VM_MEMORY_GIB", "4194304")],
+                "--memory in GiB overflows u32 MiB",
+            ),
+        ];
+        for (options, environment, message) in cases {
+            for (route, direct) in launch_route_spellings(options) {
+                let mut tokens = vec!["agent-vm"];
+                tokens.extend(route.iter().map(String::as_str));
+                for (key, value) in environment {
+                    env.set_var(key, value);
+                }
+                let error = parse_from(argv_of(&tokens), Ok(report_from(MYTOOL)))
+                    .err()
+                    .unwrap_or_else(|| panic!("{tokens:?} must be refused"));
+                for (key, _) in environment {
+                    env.remove_var(key);
+                }
+                assert!(
+                    error.downcast_ref::<clap::Error>().is_none(),
+                    "{tokens:?} is not a usage error"
+                );
+                assert_eq!(
+                    error
+                        .downcast_ref::<crate::launch_target::DirectLaunchFailure>()
+                        .is_some(),
+                    direct,
+                    "{tokens:?} carries the 125 marker only on a direct route"
+                );
+                assert_eq!(format!("{error:#}"), message, "{tokens:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_resource_ceiling_is_carried_validated() {
+        let mut env = clear_launch_env();
+        let ceiling = |gib, cpus| {
+            crate::resources::ResourceCeiling::from_launch_options(gib, cpus)
+                .expect("an accepted ceiling")
+        };
+
+        for tokens in [
+            vec!["agent-vm", "mytool"],
+            vec!["agent-vm", "shell"],
+            vec!["agent-vm", "run", "p"],
+            vec!["agent-vm", "--", "p"],
+        ] {
+            let carried =
+                resources_of(parse_from(argv_of(&tokens), Ok(report_from(MYTOOL))).unwrap());
+            assert_eq!(
+                carried,
+                ceiling(8, 2),
+                "{tokens:?} defaults to 8 GiB / 2 vCPU"
+            );
+        }
+
+        env.set_var("AGENT_VM_MEMORY_GIB", "16");
+        env.set_var("AGENT_VM_CPUS", "4");
+        for tokens in [vec!["agent-vm", "mytool"], vec!["agent-vm", "run", "p"]] {
+            let carried =
+                resources_of(parse_from(argv_of(&tokens), Ok(report_from(MYTOOL))).unwrap());
+            assert_eq!(carried, ceiling(16, 4), "{tokens:?} reads the environment");
+        }
+
+        // CLI beats env, per option.
+        env.set_var("AGENT_VM_CPUS", "0");
+        let carried = resources_of(
+            parse_from(
+                argv_of(&["agent-vm", "--cpus", "3", "mytool"]),
+                Ok(report_from(MYTOOL)),
+            )
+            .unwrap(),
+        );
+        assert_eq!(carried, ceiling(16, 3), "--cpus outranks AGENT_VM_CPUS");
+        env.set_var("AGENT_VM_CPUS", "4");
+
+        env.set_var("AGENT_VM_MEMORY_GIB", "0");
+        let carried = resources_of(
+            parse_from(
+                argv_of(&["agent-vm", "--memory", "2", "mytool"]),
+                Ok(report_from(MYTOOL)),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            carried,
+            ceiling(2, 4),
+            "--memory outranks AGENT_VM_MEMORY_GIB"
+        );
+    }
+
+    #[test]
+    fn launch_resource_env_does_not_reach_builtins() {
+        let mut env = clear_launch_env();
+        env.set_var("AGENT_VM_CPUS", "0");
+        env.set_var("AGENT_VM_MEMORY_GIB", "0");
+        for tokens in [
+            vec!["agent-vm", "doctor"],
+            vec!["agent-vm", "setup"],
+            vec!["agent-vm", "image", "show"],
+        ] {
+            assert!(
+                matches!(
+                    parse_from(argv_of(&tokens), Ok(report_from(MYTOOL))).unwrap(),
+                    Dispatch::Builtin { .. }
+                ),
+                "{tokens:?} never reads the launch resource options"
+            );
+        }
+    }
+
+    #[test]
+    fn usage_errors_still_outrank_a_refused_ceiling() {
+        let _env = clear_launch_env();
+        let error = usage_error(parse_from(
+            argv_of(&[
+                "agent-vm",
+                "--memory",
+                "0",
+                "--dockerfile",
+                "D",
+                "--image",
+                "x:1",
+                "shell",
+            ]),
+            Ok(report_from(MYTOOL)),
+        ));
+        assert_eq!(error.exit_code(), 2);
+        assert!(
+            !error
+                .to_string()
+                .contains("--memory must be at least 1 GiB"),
+            "a usage error outranks the ceiling: {error}"
+        );
     }
 }

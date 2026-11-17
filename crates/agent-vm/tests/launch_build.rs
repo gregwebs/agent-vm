@@ -725,6 +725,35 @@ fn memory_overflow_fails_before_docker() {
         "no build notice either:\n{}",
         stderr_of(&out)
     );
+    assert!(
+        !stderr_of(&out).contains("==> Boot image:"),
+        "no boot notice either, so the launch never started:\n{}",
+        stderr_of(&out)
+    );
+}
+
+/// A zero ceiling on either axis is refused while parsing, exactly like the
+/// overflow above: no Docker build, no notice, no runtime prologue.
+#[test]
+fn zero_resource_ceiling_fails_before_docker() {
+    let mut h = Harness::new();
+    h.replay_spec("built.tar", &ArchiveSpec::default());
+
+    for (flag, message) in [
+        ("--memory", "--memory must be at least 1 GiB"),
+        ("--cpus", "--cpus must be at least 1"),
+    ] {
+        let out = h.run(&[flag, "0", "--dockerfile", "Dockerfile", "--", "true"]);
+        assert_eq!(code_of(&out), 125, "{flag}: {}", stderr_of(&out));
+        let stderr = stderr_of(&out);
+        assert!(stderr.contains(message), "{flag}: {stderr}");
+        assert!(
+            h.docker_calls().is_empty(),
+            "{flag}: the build must not run for a CLI rejection"
+        );
+        assert!(!stderr.contains("==> Building"), "{flag}: {stderr}");
+        assert!(!stderr.contains("==> Boot image:"), "{flag}: {stderr}");
+    }
 }
 
 /// A typed `--image` alongside `--dockerfile` is a usage error on both routes.

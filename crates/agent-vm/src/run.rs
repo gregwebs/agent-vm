@@ -165,16 +165,20 @@ fn launch_banner(session: &ProjectSession) -> String {
     )
 }
 
-/// `==> Boot image: example/app:dev (from command line; 2048 MiB, 2 vCPU)`
+/// `==> Boot image: example/app:dev (from command line; 512..=8192 MiB, 1..=2 vCPU)`
 ///
 /// The one line a launch says about what it is about to boot: the selection with
-/// its origin (or the fixed default-tier label) and the sizing, in a single
-/// parenthetical group. Any layer download announces itself in the pull progress
-/// display below, so this line no longer guesses at one.
-fn boot_notice(label: &crate::boot_image::ImageLabel, memory_mib: u32, cpus: u8) -> String {
+/// its origin (or the fixed default-tier label) and the boot commitment and
+/// resource ceiling, in a single parenthetical group. Any layer download
+/// announces itself in the pull progress display below, so this line no longer
+/// guesses at one.
+fn boot_notice(
+    label: &crate::boot_image::ImageLabel,
+    resources: &crate::resources::ResourceCeiling,
+) -> String {
     format!(
         "==> Boot image: {}",
-        label.with_detail(&format!("{memory_mib} MiB, {cpus} vCPU"))
+        label.with_detail(&resources.notice_detail())
     )
 }
 
@@ -456,7 +460,7 @@ Examples:
   agent-vm -T run build.sh >out.log                force streaming I/O for one
   agent-vm shell <command>                         run one command, then exit
   agent-vm --dockerfile ./Dockerfile shell         build this Dockerfile, then boot it
-  agent-vm --memory 8 --cpus 4 <tool>              a bigger sandbox
+  agent-vm --memory 16 --cpus 4 <tool>             a higher resource ceiling
   agent-vm --mount ~/ref:ro <tool>                 read-only extra mount
   agent-vm --mount /etc/hosts:/host-hosts:ro <tool>
                                                    read-only single-file bind
@@ -521,17 +525,17 @@ Environment:
 /// and written before the tool verb.
 #[derive(ClapArgs)]
 pub struct Args {
-    /// Sandbox memory, in GiB.
+    /// Maximum sandbox memory, in GiB.
     #[arg(
         long,
         env = "AGENT_VM_MEMORY_GIB",
-        default_value_t = 2,
+        default_value_t = 8,
         value_name = "GIB",
         help_heading = "Sandbox resources"
     )]
     pub(crate) memory: u32,
 
-    /// vCPU count for the sandbox.
+    /// Maximum vCPU count for the sandbox.
     #[arg(
         long,
         env = "AGENT_VM_CPUS",
@@ -792,6 +796,12 @@ impl Args {
         self.git_mount
     }
 
+    /// The launch's resource ceiling (ADR-0070 D1), decided once while parsing:
+    /// `cli::parse_from` calls this before the MSB prologue can unpack a runtime.
+    pub(crate) fn resource_ceiling(&self) -> Result<crate::resources::ResourceCeiling> {
+        crate::resources::ResourceCeiling::from_launch_options(self.memory, self.cpus)
+    }
+
     /// The terminal preference these flags express.
     ///
     /// Both set is a typed conflict even though clap rejects that argv: an
@@ -819,6 +829,7 @@ impl Args {
 }
 
 /// Lower the selected target once, then retain the shared setup and exec path.
+#[allow(clippy::too_many_arguments)] // eight distinct launch inputs from one Dispatch; grouping them is a separate refactor
 pub(crate) async fn launch(
     target: LaunchTarget,
     images: &ConfiguredImages,
@@ -826,6 +837,7 @@ pub(crate) async fn launch(
     user_tools: Option<&crate::egress_reference::EgressNamespace>,
     user_mounts: Option<&crate::config_mounts::UserMounts>,
     credential_preflight: CredentialPreflight,
+    resources: crate::resources::ResourceCeiling,
     args: Args,
 ) -> Result<i32> {
     #[allow(clippy::disallowed_methods)] // one capture per command: every consumer borrows it.
@@ -858,14 +870,6 @@ pub(crate) async fn launch(
         .launch_build()?
         .map(crate::launch_build::LaunchBuild::resolve)
         .transpose()?;
-    // Pure CLI arithmetic, so it stays on the near side of every side effect:
-    // ADR-0061 §8 puts the build after CLI validation, and `--memory 5000000`
-    // must not cost a multi-minute build before it fails.
-    let memory_mib: u32 = args
-        .memory
-        .checked_mul(1024)
-        .context("--memory in GiB overflows u32 MiB")?;
-    let cpus = args.cpus;
     let boot = match &launch_build {
         Some(build) => build.boot_image(),
         None => boot_image::select(
@@ -1085,12 +1089,13 @@ pub(crate) async fn launch(
     // context; the findings themselves stay field-only. Advisory: this never
     // denies the launch.
     notices.emit(launch_banner(&session))?;
-    // The selected boot image and the size it boots with, once, before the
-    // session provisions any state (D10). One line, not one per fact: the image
-    // name, its origin and the sandbox sizing describe one boot (#551), and a
-    // second line for the sizing only was noise. `boot` was resolved before the
-    // first side effect above; `label` redacts a default-tier reference.
-    notices.emit(boot_notice(&label, memory_mib, cpus))?;
+    // The selected boot image and its boot commitment within the resource
+    // ceiling, once, before the session provisions any state (D10). One line,
+    // not one per fact: the image name, its origin and the sandbox sizing
+    // describe one boot (#551), and a second line for the sizing only was
+    // noise. `boot` was resolved before the first side effect above; `label`
+    // redacts a default-tier reference.
+    notices.emit(boot_notice(&label, &resources))?;
     let pi_report = crate::pi_credential_inspection::inspect_project(&session.state_dir);
     if let Some(warning) = pi_report.launch_warning() {
         // A block, not a line: the findings are meant as an indented list.
@@ -1407,9 +1412,8 @@ pub(crate) async fn launch(
         .root_disk(crate::defaults::WRITABLE_UPPER_MIB)
         .registry(|r| if is_local_registry { r.insecure() } else { r })
         .pull_policy(prepared.pull_policy())
-        .cpus(cpus)
-        .memory(memory_mib)
         .workdir(krun_workdir);
+    builder = resources.apply_to(builder);
     for volume in core_volumes {
         builder = builder.volume(volume.guest_path, |m| m.bind(volume.host_path));
     }
@@ -4337,14 +4341,19 @@ mod tests {
     fn notice_boot_names_the_image_and_the_sizing_once() {
         let label = crate::boot_image::ImageLabel::for_tests("example/app:dev");
         assert_eq!(
-            boot_notice(&label, 2048, 2),
-            "==> Boot image: example/app:dev (2048 MiB, 2 vCPU)"
+            boot_notice(&label, &ceiling(8, 2)),
+            "==> Boot image: example/app:dev (512..=8192 MiB, 1..=2 vCPU)"
         );
         let default = crate::boot_image::ImageLabel::for_tests("the default boot image");
         assert_eq!(
-            boot_notice(&default, 8192, 8),
-            "==> Boot image: the default boot image (8192 MiB, 8 vCPU)"
+            boot_notice(&default, &ceiling(4, 1)),
+            "==> Boot image: the default boot image (512..=4096 MiB, 1 vCPU)"
         );
+    }
+
+    fn ceiling(memory_gib: u32, cpus: u8) -> crate::resources::ResourceCeiling {
+        crate::resources::ResourceCeiling::from_launch_options(memory_gib, cpus)
+            .expect("an accepted ceiling")
     }
 
     #[test]
@@ -10778,7 +10787,6 @@ unset _avm_command _avm_external _avm_lookup_status; exec -- 'cat'"#;
         };
         let requested = position("args.image.requested()?");
         let resolve = position("LaunchBuild::resolve");
-        let memory = position("--memory in GiB overflows u32 MiB");
         let mount_prep = position("mount::prepare(");
         let msb_home = position("ensure_msb_home(");
         let db_ahead = position("ensure_db_not_ahead(");
@@ -10796,11 +10804,6 @@ unset _avm_command _avm_external _avm_lookup_status; exec -- 'cat'"#;
             requested < resolve,
             "requested() must precede LaunchBuild::resolve"
         );
-        assert!(
-            resolve < memory,
-            "resolve must precede the pure --memory arithmetic"
-        );
-        assert!(memory < mount_prep, "memory must precede mount::prepare");
         assert!(
             position("git_metadata::discover(") < mount_prep,
             "Git metadata discovery must precede mount::prepare"

@@ -25,8 +25,8 @@ Options:
   -V, --version  Print version
 
 Sandbox resources:
-      --memory <GIB>  Sandbox memory, in GiB [env: AGENT_VM_MEMORY_GIB] [default: 2]
-      --cpus <N>      vCPU count for the sandbox [env: AGENT_VM_CPUS] [default: 2]
+      --memory <GIB>  Maximum sandbox memory, in GiB [env: AGENT_VM_MEMORY_GIB] [default: 8]
+      --cpus <N>      Maximum vCPU count for the sandbox [env: AGENT_VM_CPUS] [default: 2]
 
 GitHub access:
       --no-git             Don't inject host gh/git credentials into the guest

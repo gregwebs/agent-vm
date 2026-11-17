@@ -44,8 +44,13 @@ conntrack/iptables ~62ms, nf_tables ~3ms). So it's a real but *minor* cost:
 ## Other real levers
 
 - **Guest memory** (real wall-clock, but EPT/page-materialization under nested virt, not
-  struct-page init): create ≈ 1.49s @1G / 1.68–1.92s @2G / 2.9s @4G. Lower the default
-  (`AGENT_VM_MEMORY_GIB`, currently 2) for sessions that don't need 2 GiB (~0.2s+).
+  struct-page init). Measured before ADR-0070, when boot memory equalled
+  `--memory`: create ≈ 1.49s @1G / 1.68–1.92s @2G / 2.9s @4G. Since ADR-0070,
+  every launch boots at the 512 MiB **boot commitment**, whatever its **resource
+  ceiling** (`--memory` / `AGENT_VM_MEMORY_GIB`, default 8 GiB) says. Lowering the
+  ceiling no longer reduces boot RAM; any remaining effect on creation time is
+  unmeasured. Re-measure create at the boot commitment before treating these
+  figures as current.
 - **Chrome-MCP CA `certutil` (~270ms)** stays off the launch critical path: the opt-in
   agent-vm-images `chrome-devtools` example's `agent-vm-chrome-mcp` wrapper imports
   the per-install CA when the MCP starts, rather than synchronously before every
