@@ -95,6 +95,33 @@ def exact(conn, count):
     return data
 
 
+# A cold `node` start plus socket bind on a loaded runner is the slow case, so
+# this budget only fails a listener that never announces itself; a slow machine
+# passes slowly. See #426, #464 and #650.
+READY_BUDGET = 10
+
+
+def await_marker(log, marker, proc, budget):
+    """Wait for `marker` in `log`, bounded by `budget` seconds.
+
+    The failure names what the log holds and whether the listener is still
+    running, so a flake reports its cause instead of a monotonic number.
+    """
+    started = time.monotonic()
+    while True:
+        text = log.read_text()
+        if marker in text:
+            return text
+        elapsed = time.monotonic() - started
+        code = proc.poll()
+        state = "still running" if code is None else f"exited {code}"
+        if code is not None or elapsed > budget:
+            raise AssertionError(
+                f"listener {state} after {elapsed:.1f}s without printing {marker!r} "
+                f"(budget {budget}s); log:\n{text or '<empty>'}")
+        time.sleep(0.02)
+
+
 def dns_reply(query, address=None):
     # Independent wire oracle: preserve ID and question, provide NX or one A RR.
     answer = b"" if address is None else b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 60, 4) + socket.inet_aton(address)
@@ -264,6 +291,34 @@ EOF
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "192.168.20.1")
 
+    def test_readiness_failure_names_the_log_and_the_listener_state(self):
+        # A flake has to report why (#426): the partial log for a listener that
+        # is too slow, and the exit status for one that died without a word.
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "listener.log"
+            with log.open("w") as output:
+                slow = subprocess.Popen([BASH, "-c", "printf 'booting\\n'; sleep 30"],
+                                        stdout=output, stderr=output)
+            try:
+                with self.assertRaises(AssertionError) as caught:
+                    await_marker(log, "INGRESS_READY unique_wire 1\n", slow, 0.3)
+                message = str(caught.exception)
+                self.assertIn("still running", message)
+                self.assertIn("(budget 0.3s)", message)
+                self.assertIn("booting", message)
+            finally:
+                slow.terminate()
+                slow.wait(timeout=2)
+            with log.open("w") as output:
+                dead = subprocess.Popen([BASH, "-c", "echo 'bind: address in use'; exit 3"],
+                                        stdout=output, stderr=output)
+                self.assertEqual(dead.wait(timeout=5), 3)
+            with self.assertRaises(AssertionError) as caught:
+                await_marker(log, "INGRESS_READY unique_wire 1\n", dead, READY_BUDGET)
+            message = str(caught.exception)
+            self.assertIn("exited 3", message)
+            self.assertIn("bind: address in use", message)
+
     def test_listener_python_and_node_with_real_curl_and_reap(self):
         for implementation in ("python3", "node"):
             self.assertIsNotNone(shutil.which(implementation), f"required host-only control: {implementation}")
@@ -279,11 +334,8 @@ EOF
                 with log.open("w") as output:
                     proc = subprocess.Popen([BASH, "-c", f"EGRESS_PROBE_LIB=1 . {shlex.quote(str(PROBE))}\n" + setup + f"\nlisten {port} unique_wire"], stdout=output, stderr=output)
                     try:
-                        deadline = time.monotonic() + 3
-                        while f"INGRESS_READY unique_wire {port}\n" not in log.read_text():
-                            self.assertIsNone(proc.poll(), log.read_text())
-                            self.assertLess(time.monotonic(), deadline, log.read_text())
-                            time.sleep(0.02)
+                        await_marker(log, f"INGRESS_READY unique_wire {port}\n",
+                                     proc, READY_BUDGET)
                         result = subprocess.run(["curl", "--silent", "--show-error", "--noproxy", "*", "--connect-timeout", "2", "--max-time", "3", f"http://127.0.0.1:{port}/"], capture_output=True, timeout=5)
                         self.assertEqual(result.returncode, 0, result.stderr)
                         self.assertEqual(result.stdout, b"ingress unique_wire")
