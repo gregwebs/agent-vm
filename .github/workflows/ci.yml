@@ -276,8 +276,9 @@ jobs:
       # did not fire for a leg that was cancelled before a runner ever picked it
       # up: on #664 and on this change's own run, `macos-keychain-contract` was
       # `cancelled` while this job reported success, so the only required check
-      # went green under a red run. The JSON below is the same data without the
-      # expression's blind spot, and it names the leg.
+      # went green under a red run. The needs context calls that state
+      # `abandoned` -- a fourth value the expression never listed -- and this job
+      # printed it, named both legs and failed, on the same starvation.
       - name: Fail when a leg did not pass
         env:
           # Through the environment, not interpolated into `run`: the needs
