@@ -127,15 +127,35 @@ def _driver_reentrant(scenario, pidfile):
     interrupts unwinds cleanly; one that tears down with a nested blocking
     `Popen.wait` self-deadlocks on the lock. The signal is delivered once the
     scenario has recorded its pids, so the group can also be checked stopped.
+
+    Interrupting *there* needs `waitpid` to be called while the child is still
+    alive, which is not true of every interpreter: from CPython 3.13,
+    `Popen.wait(timeout=...)` first waits on pidfd (Linux) or kqueue
+    (macOS/BSD) and only then takes `_waitpid_lock` to reap a process that has
+    already exited. On such an interpreter this shim would never fire, the
+    driver would sit in its own kqueue wait for the whole hour, and the case
+    would report a teardown deadlock that is really an injection that never
+    happened (#460, #406, #408, #431, #444, #479). The efficient waits are
+    therefore disabled below, so every interpreter takes the polling path this
+    case injects at: `waitpid(WNOHANG)` under `_waitpid_lock`, child alive.
     """
     helper = load_helper()
     pid = pathlib.Path(pidfile)
     real_waitpid = os.waitpid
     fired = []
 
+    # Both names are optional: an interpreter older than the efficient waits
+    # has neither and polls `waitpid` already, which is the path wanted.
+    for efficient_wait in ("_wait_pidfd", "_wait_kqueue"):
+        if hasattr(subprocess.Popen, efficient_wait):
+            setattr(subprocess.Popen, efficient_wait, lambda self, timeout: False)
+
     def injecting_waitpid(wait_pid, flags):
         if not fired and wait_pid != -1 and pid.exists():
             fired.append(True)
+            # Record that the seam was reached, so the case can tell a real
+            # teardown deadlock from a signal this interpreter never received.
+            pid.with_suffix(".fired").write_text("1")
             os.kill(os.getpid(), signal.SIGTERM)
         return real_waitpid(wait_pid, flags)
 
@@ -154,7 +174,33 @@ def _driver_reentrant(scenario, pidfile):
         return 128 + exc.signum
     finally:
         os.waitpid = real_waitpid
+    if not fired:
+        # Unreachable while the polling path is what runs: say so plainly rather
+        # than let a future interpreter turn this seam into a silent no-op.
+        print(
+            "reentrant-sigterm: the injected SIGTERM never fired: this "
+            "interpreter's Popen.wait does not poll waitpid",
+            file=sys.stderr,
+        )
+        return 111
     return 0
+
+
+def kill_recorded_group(pidfile):
+    """SIGKILL whatever the scenario recorded.
+
+    A case that gives up kills its driver, but the driver's owned group is a
+    separate session, so without this the TERM-ignoring scenario and its
+    grandchild sleep on for their full 300 s, outliving the run and holding the
+    gate's output pipe open (#460).
+    """
+    pids = parse_pids(pidfile)
+    if len(pids) != 4:
+        return
+    try:
+        load_helper()._signal_group(pids[2], signal.SIGKILL)
+    except OSError as exc:
+        print(f"could not stop the owned group {pids[2]}: {exc}", file=sys.stderr)
 
 
 def interruption_case(failures, label, signum, expected_rc, scenario, tmp):
@@ -183,6 +229,7 @@ def interruption_case(failures, label, signum, expected_rc, scenario, tmp):
             failures.append(f"{label}: driver did not exit after signal {signum}")
             driver.kill()
             driver.wait()
+            kill_recorded_group(pidfile)
             return
         if rc != expected_rc:
             failures.append(f"{label}: driver exit {rc}, expected {expected_rc}")
@@ -233,7 +280,21 @@ def reentrant_case(failures, scenario, tmp):
             rc = driver.wait(timeout=20)
         except subprocess.TimeoutExpired:
             _report_interruption_hang("reentrant-sigterm", signal.SIGTERM, driver, pidfile)
-            failures.append("reentrant-sigterm: driver did not exit (teardown deadlocked)")
+            # The distinction the six duplicate reports of this failure could not
+            # make: a driver that never received the injected signal did not
+            # deadlock, and must not be reported as if it had.
+            if not pidfile.with_suffix(".fired").exists():
+                failures.append(
+                    "reentrant-sigterm: the injected SIGTERM never fired: this "
+                    "interpreter's Popen.wait does not poll waitpid"
+                )
+            else:
+                failures.append(
+                    "reentrant-sigterm: driver did not exit (teardown deadlocked)"
+                )
+            driver.kill()
+            driver.wait()
+            kill_recorded_group(pidfile)
             return
         if rc != 143:
             failures.append(f"reentrant-sigterm: driver exit {rc}, expected 143")
