@@ -1491,33 +1491,83 @@ fn is_refused(error: &anyhow::Error) -> bool {
         .any(|error| error.kind() == std::io::ErrorKind::ConnectionRefused)
 }
 
-/// The launcher's teardown hook: everything `Sandbox` does, plus the feed.
-pub(crate) struct LaunchTeardown<'a> {
-    sandbox: &'a Sandbox,
+/// The launcher's teardown hook: everything `Sandbox` does, plus the feed and the
+/// memory monitor.
+///
+/// The monitor is owned here rather than by the launch body so that no teardown exit can
+/// reach the sandbox without first cancelling and joining it: the ordinary end, the forced
+/// end (#401) and the failure path all run through
+/// [`crate::teardown::cleanup_exec_sandbox_failures`]. Every lifecycle operation stops the
+/// monitor first, not only `before_remove`, because cleanup stops or kills before that hook
+/// runs — stopping only there would let the monitor resize a VM that is already stopping.
+pub(crate) struct LaunchTeardown<'a, S: crate::teardown::ExecTeardown = Sandbox> {
+    sandbox: &'a S,
     live: &'a LiveSession,
+    resources: crate::resources::ResourceMonitor,
 }
 
-impl<'a> LaunchTeardown<'a> {
-    pub(crate) fn new(sandbox: &'a Sandbox, live: &'a LiveSession) -> Self {
-        Self { sandbox, live }
+impl<'a, S: crate::teardown::ExecTeardown> LaunchTeardown<'a, S> {
+    pub(crate) fn new(
+        sandbox: &'a S,
+        live: &'a LiveSession,
+        resources: crate::resources::ResourceMonitor,
+    ) -> Self {
+        Self {
+            sandbox,
+            live,
+            resources,
+        }
+    }
+
+    /// Idempotent, so an early exit may call it before a teardown hook calls it again.
+    ///
+    /// Bounded by [`crate::resources::MONITOR_JOIN_TIMEOUT`], which is well below every
+    /// teardown step's own budget. The callers put this *inside* their budgets (the stop,
+    /// kill, reap and remove deadlines), so an unbounded join would let a slow one consume
+    /// the operation's deadline and leave the sandbox behind — the #258 class this schedule
+    /// exists to prevent. When the bound expires the task is already aborted and its handle
+    /// is still retained, so the next hook finishes the join; removal is not delayed by a
+    /// task that cannot issue anything new.
+    pub(crate) async fn stop_resources(&self) {
+        let joined = tokio::time::timeout(
+            crate::resources::MONITOR_JOIN_TIMEOUT,
+            self.resources.stop(),
+        )
+        .await;
+        if joined.is_err() {
+            tracing::debug!(
+                target: "agent_vm::resources",
+                event = "monitor_join_error",
+                reason = "the monitor task did not finish within the teardown join bound",
+                timeout_ms = crate::resources::MONITOR_JOIN_TIMEOUT.as_millis() as u64,
+                "leaving the aborted monitor handle for the next teardown hook"
+            );
+        }
     }
 }
 
-impl crate::teardown::ExecTeardown for LaunchTeardown<'_> {
+impl<S: crate::teardown::ExecTeardown> crate::teardown::ExecTeardown for LaunchTeardown<'_, S> {
     async fn stop_and_wait(&self) -> Result<()> {
+        self.stop_resources().await;
         crate::teardown::ExecTeardown::stop_and_wait(self.sandbox).await
     }
     async fn kill_with_timeout(&self, timeout: Duration) -> Result<()> {
+        self.stop_resources().await;
         crate::teardown::ExecTeardown::kill_with_timeout(self.sandbox, timeout).await
     }
     async fn wait(&self) -> Result<()> {
+        self.stop_resources().await;
         crate::teardown::ExecTeardown::wait(self.sandbox).await
     }
     async fn remove(&self) -> Result<()> {
+        // Repeated on purpose: a cancelled or timed-out earlier hook must not leave a
+        // running task behind while the sandbox is being removed.
+        self.stop_resources().await;
         crate::teardown::ExecTeardown::remove(self.sandbox).await
     }
     /// Producer stopped → drain → persist → remove.
     async fn before_remove(&self) {
+        self.stop_resources().await;
         self.live.finish().await;
     }
 }

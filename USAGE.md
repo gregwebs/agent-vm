@@ -1687,8 +1687,8 @@ Available launch options:
 
 | flag | what |
 |---|---|
-| `--memory N` | maximum VM memory in GiB: the resource ceiling (default 8). Boots with 512 MiB |
-| `--cpus N` | maximum vCPUs (default 2). Boots with 1 |
+| `--memory N` | maximum VM memory in GiB: the resource ceiling (default 8). Boots with 512 MiB, then the **memory commitment** follows the guest's use automatically |
+| `--cpus N` | maximum vCPUs (default 2). Boots with 1, and stays at 1 until CPU scaling lands (#647) |
 | `--dockerfile FILE` | build this Dockerfile and boot the result (context is the Dockerfile's parent directory; mutually exclusive with `--image`) |
 | `--image REF` | boot this image instead of the configured one (env `AGENT_VM_IMAGE_TAG`); see [Selecting the boot image](#selecting-the-boot-image) |
 | `--no-git` | skip gh/git auth injection (still respects `--repo`) |
@@ -1707,9 +1707,39 @@ memory capacity the VM may ever use. Every launch boots at the **boot
 commitment** instead — `1` vCPU and `512 MiB`. `agent-vm setup` verifies the
 runtime with the same `512 MiB` / `1` vCPU shape.
 
-Until live resizing ships (#646, #647), a session runs at its boot commitment,
-512 MiB and 1 vCPU, whatever `--memory` and `--cpus` say. They reserve capacity
-only.
+Memory is then a live **memory commitment**. An in-process monitor polls every
+200 ms and moves the target in 128 MiB steps between the 512 MiB floor and the
+`--memory` ceiling, keeping `max(256 MiB, 25% of the guest's used memory)` free:
+
+- **Growth is immediate**, on the first tick that needs it — including while an
+  earlier shrink is still settling.
+- **Reclamation waits.** Shrinking needs 50 consecutive lower-demand ticks (a
+  nominal 10 s) *and* a memory limit that has already converged to the current
+  target, so a busy settle period cannot be mistaken for idleness.
+- **A tick without usable availability holds the commitment.** That covers early
+  boot, an image without `virtio-balloon`, and the brief window after a shrink
+  where the runtime can report more available bytes than the new limit. Missing
+  availability is never substituted with another field.
+- Both the poll period and the dwell are nominal: the interval *requests*
+  samples and guarantees neither the rate nor their freshness. Headroom gives an
+  allocation burst room to land but cannot guarantee it.
+
+Transitions are silent by default: they emit `debug` events under the
+`agent_vm::resources` target, which the launcher's default `warn` filter hides, and
+they never print a notice or fail the session. They are also the only way to see
+what the controller did, so `RUST_LOG=agent_vm::resources=debug` shows them on the
+same stderr stream as the rest of the launcher's tracing — including any failure
+events, which name their stage and cause. A transient metrics or modify failure is
+retired on a later tick by the controller itself and does not end the session;
+repeated identical failures are retried on a bounded backoff rather than every
+tick.
+
+vCPUs stay at the boot commitment: `--cpus` reserves capacity only until CPU
+scaling lands (#647).
+
+The 512 MiB boot applies to a **fresh launch**. A sandbox record retained from an
+earlier session can request a different memory at its next start: a recovery
+reseed (below) persists a next-start memory that survives the launcher.
 
 The boot notice prints each axis as `<boot>..=<max>`, or as the single maximum
 when the two are equal:
@@ -5374,9 +5404,27 @@ with launch flags as described in [Persisted grants](#persisted-grants-user-conf
   device for memory resizing, and one for CPU resizing when `--cpus` is 2 or
   more; `--cpus 1` frees the CPU one.
 - **`handshake read id_offset: timed out`** — `free -h`; the VM needs
-  more memory than is available. The VM boots with 512 MiB whatever `--memory`
-  says ([ADR-0070](docs/adr/0070-dynamic-resource-commitment.md)), so free host
-  memory.
+  more memory than is available. A **fresh launch** boots with 512 MiB whatever
+  `--memory` says ([ADR-0070](docs/adr/0070-dynamic-resource-commitment.md)). The
+  commitment cannot change until the guest reports metrics, so boot always uses the
+  boot memory, and raising `--memory` does not increase initial boot RAM and does
+  not by itself fix a startup shortage — only later growth can. Free host memory.
+- **A retained sandbox boots with more memory than 512 MiB** — the monitor
+  repairs saved configuration when it has to recover from an unknown resize
+  outcome, by persisting a *next-start* memory before it retries live. That write
+  does not expire: if the retry then fails, is rejected or is interrupted, the
+  record's saved memory can stay at that seed (for example 640 MiB) while the live
+  VM stays at 512 MiB, indefinitely, including after the launcher exits.
+  - Restarting **that same retained record** reloads its saved configuration, so
+    it can request the seed at boot and boot above the 512 MiB floor. It is not a
+    fresh launch; a fresh `agent-vm` launch still requests 512 MiB.
+  - On the original still-running VM, a plain live request for the seed value can
+    be an applied no-op with no status, because the saved configuration already
+    says so. That is why the controller reseeds again on the next genuine change
+    rather than trusting the saved value.
+  - Equal demand holds send no builder call at all, so a hold leaves the seed
+    saved. Joining an aborted monitor does not roll a completed write back, and
+    nothing cleans it up automatically.
 - **GitHub 403 from the proxy** — repo isn't in the allow-list.
   Pass `--repo OWNER/NAME` or run from a project with the right
   remote.

@@ -1134,12 +1134,10 @@ deliberately not used for tool launches).
 
 **Resource ceiling**: a **session**'s boot-time maximum vCPU and memory capacity
 (`max_cpus`, `max_memory_mib`), configured by `--cpus` / `AGENT_VM_CPUS`
-(default `2`) and `--memory` / `AGENT_VM_MEMORY_GIB` (default `8` GiB). The
-design lets live resize grow and shrink a running guest's **resource
-commitment** within this ceiling without restarting the VM, and it can never be
-exceeded. Live resize does not run yet: until it ships (#646, #647) a
-**session** stays at its **boot commitment** whatever the ceiling says, so the
-ceiling only reserves capacity.
+(default `2`) and `--memory` / `AGENT_VM_MEMORY_GIB` (default `8` GiB). Live
+resize grows and shrinks a running guest's **resource commitment** within this
+ceiling without restarting the VM, and can never exceed it. Memory moves;
+vCPUs do not yet (#647), so the CPU ceiling only reserves capacity.
 
 _Avoid_: calling `--memory` or `--cpus` the initial or fixed allocation — they
 set the ceiling.
@@ -1149,16 +1147,28 @@ set the ceiling.
 and `min(512 MiB, max_memory_mib)` RAM. Because `virtio-mem` plugs and unplugs
 blocks above `boot_mib` (`boot_mib <= target_mib <= max_memory_mib`) and
 `virtio_msb_cpu` scales online vCPUs down to `1`, the boot commitment is also
-the session's lower bound (floor). Both resize devices are attached at creation
-and the **launcher** does not drive them yet (#646, #647), so a **session** does
-not leave its boot commitment. `agent-vm setup`'s verification guest is not
-a tool/command launch and keeps its fixed `1` vCPU / `512 MiB` configuration.
+the session's lower bound (floor). Both resize devices are attached at creation.
+`agent-vm setup`'s verification guest is not a tool/command launch and keeps its
+fixed `1` vCPU / `512 MiB` configuration.
 
 **Resource commitment**: the online vCPU count and usable guest memory target
 (`cpus`, `target_mib`) currently enforced for a running **session** between its
 **boot commitment** and its **resource ceiling**.
 [ADR-0070](docs/adr/0070-dynamic-resource-commitment.md) decides how the launcher
-will adjust it; until #646/#647 it is the boot commitment.
+adjusts it.
+
+_Avoid_: treating the commitment as the ceiling, or as host memory actually
+resident.
+
+**Memory commitment**: the memory half of a **resource commitment**, which is
+live. An in-process 200 ms monitor reads the guest's limit and available memory
+and moves the target in 128 MiB steps, never below the boot commitment and never
+above the ceiling, keeping `max(256 MiB, 25% of used)` free. Growth is immediate;
+reclamation needs 50 consecutive lower-demand ticks *and* a limit that has
+converged to the target; a tick without usable availability holds the commitment.
+Both the 200 ms period and the resulting 10 s dwell are nominal: the interval
+requests samples and guarantees no rate. The vCPU count stays at its boot
+commitment until #647.
 
 _Avoid_: "reservation" (which in `microsandbox` means the host virtual-address
 aperture `max_memory_mib`).

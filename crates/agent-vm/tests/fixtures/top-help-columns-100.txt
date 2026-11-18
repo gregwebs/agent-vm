@@ -29,13 +29,19 @@ Options:
 
 Sandbox resources:
       --memory <GIB>
-          Maximum sandbox memory, in GiB
+          Maximum sandbox memory, in GiB.
+
+          The session boots at 512 MiB and the live memory commitment then follows the guest's use,
+          in 128 MiB steps, between that floor and this ceiling (ADR-0070). Idle sessions release
+          memory back down.
 
           [env: AGENT_VM_MEMORY_GIB]
           [default: 8]
 
       --cpus <N>
-          Maximum vCPU count for the sandbox
+          Maximum vCPU count for the sandbox.
+
+          This reserves capacity only: a session keeps 1 online vCPU until CPU scaling lands (#647).
 
           [env: AGENT_VM_CPUS]
           [default: 2]

@@ -526,6 +526,10 @@ Environment:
 #[derive(ClapArgs)]
 pub struct Args {
     /// Maximum sandbox memory, in GiB.
+    ///
+    /// The session boots at 512 MiB and the live memory commitment then follows
+    /// the guest's use, in 128 MiB steps, between that floor and this ceiling
+    /// (ADR-0070). Idle sessions release memory back down.
     #[arg(
         long,
         env = "AGENT_VM_MEMORY_GIB",
@@ -536,6 +540,9 @@ pub struct Args {
     pub(crate) memory: u32,
 
     /// Maximum vCPU count for the sandbox.
+    ///
+    /// This reserves capacity only: a session keeps 1 online vCPU until CPU
+    /// scaling lands (#647).
     #[arg(
         long,
         env = "AGENT_VM_CPUS",
@@ -1811,7 +1818,12 @@ pub(crate) async fn launch(
     // argument is `&teardown` so no path can remove the sandbox without first
     // draining and persisting what it refused.
     live.follow(&sandbox);
-    let teardown = crate::session_control::LaunchTeardown::new(&sandbox, &live);
+    // ADR-0070 D2: the monitor is created here, where the sandbox exists and the feed
+    // already follows it, and its ownership is handed to the teardown value in the same
+    // breath. `create` failing above starts no monitor; nothing fallible or awaited may
+    // come between these two calls, or an early return could leave a task unowned.
+    let teardown =
+        crate::session_control::LaunchTeardown::new(&sandbox, &live, resources.monitor(&sandbox));
     // One log location for every failure report below; `finish_failed_exec` is
     // the single owner of the `(full logs: …)` suffix.
     let log_dir = sandbox_log_dir(&session.sandbox_name).display().to_string();
@@ -1852,7 +1864,9 @@ pub(crate) async fn launch(
         // wording, including the log suffix it appends itself. This branch stops
         // without removing, so the sandbox outlives the command: the feed is
         // finished here, or this session's `refusals.json` would trail the guest
-        // until `Drop`.
+        // until `Drop`. The monitor is joined before the direct stop for the same
+        // reason every teardown hook is: it must not resize a stopping VM.
+        teardown.stop_resources().await;
         let _ = sandbox.stop().await;
         live.finish().await;
         return Err(anyhow::anyhow!("{:#}; full logs: {log_dir}", missing()));
@@ -4980,17 +4994,173 @@ mod tests {
         // finishes the feed: a raw `&sandbox` there would remove the VM without
         // draining or persisting what it refused.
         let after_follow = &production[follow..];
-        assert!(
-            !after_follow.contains("\n            &sandbox,"),
-            "a teardown argument after `live.follow` still names `&sandbox`"
+        assert_eq!(
+            teardown_call_sequence(after_follow),
+            Some(expected_teardown_exits()),
+            "every exit after `live.follow` must tear down through the teardown value"
         );
         assert!(
-            !after_follow.contains("finish_failed_exec(&sandbox"),
-            "a failure path after `live.follow` still tears down `&sandbox`"
+            after_follow.contains("crate::session_control::LaunchTeardown::new("),
+            "the teardown value is the sandbox, the feed and the monitor"
+        );
+    }
+
+    /// The teardown calls `source` makes, in order, or `None` if any of them passes the raw
+    /// sandbox.
+    ///
+    /// Whitespace-free, so indentation and a `rustfmt` rewrap give the same answer; and
+    /// per-call rather than "at least one", so deleting one of several exits or reordering
+    /// them changes the answer. Function *definitions* are skipped: their first parameter is
+    /// `teardown: …`, not an argument.
+    fn teardown_call_sequence(source: &str) -> Option<Vec<&'static str>> {
+        const ENTRY_POINTS: [(&str, &str); 3] = [
+            ("cleanup_exec_sandbox(", "cleanup_exec_sandbox"),
+            (
+                "cleanup_exec_sandbox_failures(",
+                "cleanup_exec_sandbox_failures",
+            ),
+            ("finish_failed_exec(", "finish_failed_exec"),
+        ];
+        let compact: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+        let mut calls: Vec<(usize, &'static str)> = Vec::new();
+        let mut all_avoid_sandbox = true;
+        for (entry, name) in ENTRY_POINTS {
+            let mut rest = compact.as_str();
+            let mut base = 0usize;
+            while let Some(at) = rest.find(entry) {
+                let absolute = base + at;
+                let after = &rest[at + entry.len()..];
+                let first_argument = after.split([',', ')']).next().unwrap_or_default();
+                if !first_argument.contains(':') {
+                    calls.push((absolute, name));
+                    all_avoid_sandbox &= !(first_argument.starts_with("&sandbox")
+                        || first_argument.starts_with("sandbox"));
+                }
+                base = absolute + entry.len();
+                rest = after;
+            }
+        }
+        calls.sort_by_key(|(at, _)| *at);
+        all_avoid_sandbox.then(|| calls.into_iter().map(|(_, name)| name).collect())
+    }
+
+    /// The exit schedule `launch` must keep after it owns the teardown value: seven
+    /// `finish_failed_exec` reports, the direct post-boot stop, the two cleanup calls (forced
+    /// and ordinary) and the one report inside `live_launch_result`. Any deletion, addition or
+    /// reorder is a change to which exit tears down what.
+    fn expected_teardown_exits() -> Vec<&'static str> {
+        let mut expected = vec!["finish_failed_exec"; 7];
+        expected.push("cleanup_exec_sandbox");
+        expected.push("cleanup_exec_sandbox_failures");
+        expected.push("cleanup_exec_sandbox_failures");
+        expected.push("finish_failed_exec");
+        expected
+    }
+
+    #[test]
+    fn teardown_calls_are_characterized_per_exit_and_independently_of_layout() {
+        // The oracle for both characterizations below: every layout is the same answer, the
+        // argument spelling is checked, and each call is counted.
+        for source in [
+            "crate::teardown::cleanup_exec_sandbox(&teardown)\n",
+            "cleanup_exec_sandbox_failures(\n    &teardown,\n    mode,\n)\n",
+            "finish_failed_exec(&teardown, error, &log_dir)\n",
+            "cleanup_exec_sandbox(teardown)\n",
+        ] {
+            assert_eq!(
+                teardown_call_sequence(source).map(|calls| calls.len()),
+                Some(1),
+                "{source:?}"
+            );
+        }
+        // Ordered, so a reorder is visible, and every call is present.
+        assert_eq!(
+            teardown_call_sequence(
+                "finish_failed_exec(&teardown, a, b)\n\
+                 cleanup_exec_sandbox(&teardown)\n\
+                 finish_failed_exec(&teardown, c, d)\n"
+            ),
+            Some(vec![
+                "finish_failed_exec",
+                "cleanup_exec_sandbox",
+                "finish_failed_exec"
+            ])
+        );
+        // Any raw sandbox argument fails the whole characterization.
+        for source in [
+            "cleanup_exec_sandbox(&sandbox)\n",
+            "cleanup_exec_sandbox_failures(\n            &sandbox,\n            mode,\n)\n",
+            "finish_failed_exec(sandbox, error, &log_dir)\n",
+        ] {
+            assert_eq!(teardown_call_sequence(source), None, "{source:?}");
+        }
+        // A definition is not a call.
+        assert_eq!(
+            teardown_call_sequence(
+                "async fn finish_failed_exec(teardown: &impl ExecTeardown, error: anyhow::Error)\n"
+            ),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn launch_owns_memory_monitor_after_create_and_stops_legacy_exit() {
+        // ADR-0070 D2's placement, characterized at the same orchestration boundary as
+        // the test above: source text is weaker than behaviour, so this only proves that a
+        // future reorder cannot silently move creation before `create` or leave the task
+        // unowned on any of the exits this source owns.
+        let production = include_str!("run.rs")
+            .split_once("#[cfg(test)]")
+            .expect("run.rs has a test module")
+            .0;
+        let position = |needle| production.find(needle).expect("launch step is present");
+        let create = position("Sandbox::create_with_pull_progress(config)");
+        let created = position("let sandbox = match result {");
+        let follow = position("live.follow(&sandbox);");
+        let owned = position("crate::session_control::LaunchTeardown::new(");
+        let log_dir = position("let log_dir = sandbox_log_dir(");
+        assert!(
+            create < created && created < follow && follow < owned,
+            "the monitor is created with the sandbox the create arm selected"
         );
         assert!(
-            after_follow.contains("LaunchTeardown::new(&sandbox, &live)"),
-            "the teardown value is the sandbox plus the feed"
+            owned < log_dir,
+            "ownership is established before the first fallible post-boot step"
+        );
+        // Nothing may be awaited or fallible between taking the sandbox and handing its
+        // monitor to the teardown value: a `?` there would drop a running task.
+        let between = &production[follow..owned];
+        assert!(
+            !between.contains(".await") && !between.contains('?'),
+            "a fallible or awaited step sits between `live.follow` and monitor ownership"
+        );
+        let owned_source = &production[owned..];
+        let constructor = &owned_source[..owned_source
+            .find(");")
+            .expect("the teardown constructor is a complete call")];
+        assert!(
+            constructor.contains("resources.monitor(&sandbox)"),
+            "the teardown value is built from this launch's ceiling and sandbox"
+        );
+        // Every teardown argument after ownership is the one value that stops the monitor:
+        // a raw `&sandbox` would remove the VM while the controller may still resize it.
+        let after_owned = &production[owned..];
+        assert_eq!(
+            teardown_call_sequence(after_owned),
+            Some(expected_teardown_exits()),
+            "every exit after monitor ownership must tear down through the teardown value"
+        );
+        // The legacy missing-project exit stops the sandbox directly, without removal, so
+        // it joins the monitor first instead of stopping a VM under an active resize.
+        let legacy_stop = after_owned
+            .find("let _ = sandbox.stop().await;")
+            .expect("the legacy missing-project exit still stops directly");
+        let legacy_join = after_owned
+            .find("teardown.stop_resources().await;")
+            .expect("the legacy missing-project exit joins the monitor");
+        assert!(
+            legacy_join < legacy_stop,
+            "the legacy direct stop runs before the monitor is joined"
         );
     }
 
