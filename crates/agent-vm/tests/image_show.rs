@@ -437,6 +437,53 @@ fn calibrate_decoys(decoys: &Path, trap_log: &Path) -> Result<(), String> {
     validate_calibration_log(&calibration, &expected_log)
 }
 
+/// Whether a fixture directory's creation failed because the filesystem refused
+/// the name itself, which is the only error that may stop a row -- and only when
+/// the name is the non-UTF-8 one under test: `EILSEQ` for a name the filesystem
+/// could hold is a real failure, not a missing capability.
+fn refused_name(path: &Path, error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EILSEQ) | Some(libc::EINVAL)
+    ) && path.to_str().is_none()
+}
+
+/// The one reason a row may not build its fixture: the filesystem refused the
+/// name of a non-UTF-8 component.
+struct RefusedName {
+    path: PathBuf,
+    error: io::Error,
+}
+
+impl RefusedName {
+    /// What happened, naming the errno and the directory. The directory is
+    /// rendered with the byte policy the product uses, so the offending byte
+    /// shows as `\xff` instead of becoming U+FFFD.
+    fn reason(&self) -> String {
+        format!(
+            "the filesystem refused {}: {}",
+            one_line(self.path.as_os_str()),
+            self.error
+        )
+    }
+
+    /// Stop the row, or fail it. Linux filesystems accept arbitrary bytes, so a
+    /// refusal there means the row did not run: it fails instead of reporting
+    /// `ok` for work it never did. Elsewhere the skip stays, because the
+    /// capability really is absent -- and it names the errno and the directory,
+    /// though only `--nocapture` shows it (#626).
+    fn skip_or_fail(&self, row: &str) {
+        #[cfg(target_os = "linux")]
+        panic!(
+            "{row}: Linux filesystems accept non-UTF-8 names, so this row must run (put \
+             CARGO_TARGET_TMPDIR on one that does); {}",
+            self.reason()
+        );
+        #[cfg(not(target_os = "linux"))]
+        eprintln!("SKIPPED {row}: {}", self.reason());
+    }
+}
+
 /// One private host: every directory the product might touch, plus the decoy
 /// executables. Nothing under `home`/`project` is pre-created beyond the roots
 /// themselves, so "did it create `.config/agent-vm`?" stays observable.
@@ -460,10 +507,16 @@ impl Fixture {
     /// Names are parameters so a case can put control characters or invalid
     /// bytes in the paths the report must escape.
     fn with_dir_names(home: &OsStr, project: &OsStr) -> Self {
-        Self::try_with_dir_names(home, project).expect("the filesystem accepts these names")
+        Self::try_with_dir_names(home, project)
+            .unwrap_or_else(|refused| panic!("{}", refused.reason()))
     }
 
-    fn try_with_dir_names(home: &OsStr, project: &OsStr) -> Option<Self> {
+    /// Build the fixture, or report the one condition that may legitimately stop
+    /// a row: the filesystem refusing the name of a non-UTF-8 component.
+    ///
+    /// Every other error panics here. The previous `.ok()?` swallowed them all
+    /// and the row reported `ok` for having built no fixture at all (#626).
+    fn try_with_dir_names(home: &OsStr, project: &OsStr) -> Result<Self, RefusedName> {
         let root = support::project_tempdir();
         let root_path = root.path().canonicalize().expect("canonicalize fixture");
         let home = root_path.join(home);
@@ -473,14 +526,23 @@ impl Fixture {
         let tmp = root_path.join("tmp");
         let decoys = root_path.join("decoys");
         for dir in [&home, &project, &tmp, &decoys] {
-            // Only a filesystem that refuses these names (the non-UTF-8 probe)
-            // skips the case. Every later fixture failure is a real failure.
-            fs::create_dir_all(dir).ok()?;
+            if let Err(error) = fs::create_dir_all(dir) {
+                if refused_name(dir, &error) {
+                    return Err(RefusedName {
+                        path: dir.clone(),
+                        error,
+                    });
+                }
+                panic!(
+                    "fixture could not create {}: {error}",
+                    one_line(dir.as_os_str())
+                );
+            }
         }
         let trap_log = decoys.join("invocations.log");
         calibrate_decoys(&decoys, &trap_log).unwrap_or_else(|message| panic!("{message}"));
         fs::remove_file(&trap_log).expect("clear calibration log");
-        Some(Self {
+        Ok(Self {
             _root: root,
             root: root_path,
             home,
@@ -1642,14 +1704,17 @@ fn s14_the_file_line_escapes_control_bytes_and_keeps_the_rest() {
 
 #[test]
 fn s14_an_invalid_utf8_home_path_is_escaped_bytewise() {
-    // APFS/HFS+ and ext4 accept non-UTF-8 names; if the filesystem refuses,
-    // the byte-level policy is still covered by s14 above.
     let mut name = b"h\xffome".to_vec();
     name.push(b'1');
     let home = OsString::from_vec(name);
-    let Some(fixture) = Fixture::try_with_dir_names(&home, OsStr::new("project")) else {
-        eprintln!("SKIPPED: this filesystem refuses a non-UTF-8 directory name");
-        return;
+    let fixture = match Fixture::try_with_dir_names(&home, OsStr::new("project")) {
+        Ok(fixture) => fixture,
+        Err(refused) => {
+            // The byte policy itself is covered without a filesystem row by
+            // `s14_the_file_line_escapes_control_bytes_and_keeps_the_rest`.
+            refused.skip_or_fail("s14_an_invalid_utf8_home_path_is_escaped_bytewise");
+            return;
+        }
     };
     fixture.write_user_image(USER_REF);
     let output = fixture.show();
@@ -1658,6 +1723,13 @@ fn s14_an_invalid_utf8_home_path_is_escaped_bytewise() {
         &expected(USER_REF, "user config", Some(&fixture.user_config())),
     );
     assert!(stdout(&output).contains("\\xff"), "{:?}", stdout(&output));
+    // The evidence this row exists to give, visible under `--nocapture`
+    // (`script/test/non-utf8-home-rows.sh`).
+    eprintln!(
+        "s14: under {} show resolved: {}",
+        one_line(fixture.home.as_os_str()),
+        stdout(&output).trim_end()
+    );
 }
 
 #[test]
@@ -2130,12 +2202,16 @@ fn pins_accepts_absolute_non_utf8_home_and_doctor_escapes_path() {
     // s14 above still covers the byte-level path policy.
     let mut name = b"h\xffome".to_vec();
     name.push(b'1');
-    let Some(fixture) =
-        Fixture::try_with_dir_names(&OsString::from_vec(name), OsStr::new("project"))
-    else {
-        eprintln!("SKIPPED: this filesystem refuses a non-UTF-8 directory name");
-        return;
-    };
+    let fixture =
+        match Fixture::try_with_dir_names(&OsString::from_vec(name), OsStr::new("project")) {
+            Ok(fixture) => fixture,
+            Err(refused) => {
+                // The byte policy itself is covered without a filesystem row by
+                // `s14_the_file_line_escapes_control_bytes_and_keeps_the_rest`.
+                refused.skip_or_fail("pins_accepts_absolute_non_utf8_home_and_doctor_escapes_path");
+                return;
+            }
+        };
     assert!(fixture.home.is_absolute(), "HOME must be absolute");
     let store = fixture.home.join(".config/agent-vm/image-pins.json");
     let before = fixture.snapshot();
@@ -2171,6 +2247,12 @@ fn pins_accepts_absolute_non_utf8_home_and_doctor_escapes_path() {
         ),
         "the row is one line with the file policy"
     );
+    // The evidence this row exists to give, visible under `--nocapture`
+    // (`script/test/non-utf8-home-rows.sh`).
+    eprintln!(
+        "pins: under {} the listing exited 0; doctor row: {row}",
+        one_line(fixture.home.as_os_str())
+    );
     assert!(row.contains("\\xff"), "the invalid byte is escaped: {row}");
     assert!(
         !row.contains('\u{fffd}'),
@@ -2179,6 +2261,59 @@ fn pins_accepts_absolute_non_utf8_home_and_doctor_escapes_path() {
     assert!(!store.exists(), "doctor creates no authority");
     assert_eq!(fixture.snapshot(), before, "neither verb writes anything");
     fixture.assert_no_trap_calls();
+}
+
+/// #626: the narrowing itself. A creation failure is only a missing filesystem
+/// capability when the name is the non-UTF-8 one under test; every other errno,
+/// and any errno raised for a name the filesystem could hold, must fail the row.
+#[test]
+fn only_a_refused_non_utf8_name_may_stop_a_row() {
+    let raw = PathBuf::from(OsString::from_vec(b"/tmp/h\xffome".to_vec()));
+    let printable = PathBuf::from("/tmp/home");
+    for errno in [libc::EILSEQ, libc::EINVAL] {
+        assert!(
+            refused_name(&raw, &io::Error::from_raw_os_error(errno)),
+            "errno {errno} on a non-UTF-8 name is the capability refusal"
+        );
+        assert!(
+            !refused_name(&printable, &io::Error::from_raw_os_error(errno)),
+            "errno {errno} on a printable name is a failure, not a capability"
+        );
+    }
+    for errno in [libc::EACCES, libc::ENOSPC, libc::ENAMETOOLONG, libc::ENOENT] {
+        assert!(
+            !refused_name(&raw, &io::Error::from_raw_os_error(errno)),
+            "errno {errno} is not the name refusal: it must fail the row"
+        );
+    }
+}
+
+/// #626 acceptance: on Linux a refused name fails the row instead of returning
+/// `ok` for work it never did, so a green run cannot mean the row did not
+/// execute. Elsewhere the skip stays, because the capability really is absent.
+#[test]
+fn a_refused_name_fails_the_row_on_linux_and_only_there() {
+    let refused = RefusedName {
+        path: PathBuf::from(OsString::from_vec(b"/tmp/h\xffome".to_vec())),
+        error: io::Error::from_raw_os_error(libc::EILSEQ),
+    };
+    let reason = refused.reason();
+    assert!(
+        reason.contains("h\\xffome") && reason.contains("os error"),
+        "the message names the directory and the errno: {reason}"
+    );
+    // The panic is the assertion, so its hook output is noise here.
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        refused.skip_or_fail("row");
+    }));
+    std::panic::set_hook(hook);
+    if cfg!(target_os = "linux") {
+        assert!(outcome.is_err(), "Linux must fail the row, not skip it");
+    } else {
+        assert!(outcome.is_ok(), "a filesystem without the name skips");
+    }
 }
 
 /// AC8: help is offline, advertises exactly the new verb's metadata, and offers
