@@ -41,8 +41,9 @@ period is the interval plus snapshot time plus scheduling delay. A window whose
 snapshot pairing is skewed reuses the previous CPU reading
 (`crates/runtime/lib/runner/metrics.rs:143-181`). The interval therefore
 *requests* samples and guarantees neither a rate nor freshness. The launch
-requests 200 ms (nominal 5 Hz; the SDK default is 1 s), and its steady-state
-cost is unmeasured.
+requests 200 ms (nominal 5 Hz; the SDK default is 1 s). Shared-host measurements
+found additional idle cost, and the residency walk alone took about 11.5 ms per
+tick for a 1 GiB guest; neither is a general performance guarantee (D4).
 
 ## Decision
 
@@ -93,7 +94,8 @@ definitions; this ADR decides the mechanism.
 
 **Status: memory implemented (#646); CPU pending (#647).** D1.5's interval is
 configured by #645; the monitor's memory half runs today, and the same task will
-carry the CPU half once #654 repairs `cpu_percent`.
+carry the CPU half when #647 is implemented; #654 repaired the runtime's CPU
+pairing at 200 ms.
 
 1. The monitor consumes the samples D1.5 configures.
 2. When `max_cpus > boot_cpus` or `max_memory_mib > boot_memory_mib`, the
@@ -182,22 +184,37 @@ oscillation:
    `cpu_percent <= (C - 1) * 85.0` for **5 consecutive ticks (1 s)**, resetting
    the counter after stepping down.
 
-**Measured on the S1 host (macOS 27.0.0 arm64, Apple M1 Pro, HVF; 2026-11-16):
-this tracking cannot be built on `cpu_percent` as it stands.** The 200 ms
-interval is configured and reaches the runtime correctly (the boot notice and
-the `machine` argv carry the same geometry, verified by the real-VM run), but
-the runtime's sampler publishes **no fresh CPU reading at either interval**.
-With `"log_level": "debug"` in `$MSB_HOME/config.json`, `runtime.log` rejected
-**284 of 284** pairing windows at 200 ms (mean spread 12.3 ms against the 10.7 ms
-allowed) and **13 of 13** at the 1 s default (62.5 ms against 53 ms). Every
-window is skewed, so every published `cpu_percent` is the carried-over reading.
-[#654](https://github.com/gregwebs/agent-vm/issues/654) owns repairing that
-snapshot pairing and is #647's remaining prerequisite: the CPU controller cannot
-be built on this reading, and #646 does not use it at all. S2 consumes only
-`memory_limit_bytes` and `memory_available_bytes`; `cpu_percent` is untouched. The interval is also not free: idle CPU cost measured
-**8.05 % mean** over three 60-sample rounds, against **4.86 %** for `main`'s 1 s
-default — ≈ +3 percentage points, on a shared host, so indicative rather than a
-benchmark.
+**Runtime CPU pairing repaired by
+[#654](https://github.com/gregwebs/agent-vm/issues/654).** The #645 S1 run on
+2026-11-16 (macOS 27.0.0 arm64, Apple M1 Pro, HVF) recorded rejection of **284 of
+284** pairing windows at 200 ms (mean spread 12.3 ms against the 10.7 ms allowed)
+and **13 of 13** at the 1 s default (62.5 ms against 53 ms). Follow-up
+measurements on the same host (2026-11-17/18, `msb 0.7.13`) reproduced a stale
+`0.0 %` at 200 ms while `vcpu_time_ns` advanced at about 80 % of wall time, but
+found **fresh** 1 s readings of 76.3 % at info and 67.4 % at debug, each matching
+its cumulative counter delta — so "no fresh reading at any interval" was not
+universal, and the earlier 1 s rejection came from a different scan width.
+
+The systematic spread was the VMM's host-resident page-map scan, not a scheduling
+floor. `aggregate_snapshot()` runs the walk that `msb_krun_vmm` installs, and that
+walk measured 11.45–11.52 ms on an idle 1 GiB guest (stable to ±0.05 ms across
+ticks) and 12.3 ms with the guest pegged, while the same call with no sampler
+registered is 42 ns (p99 over 200 000 calls). Load barely moved it and removing
+the walk made it 10⁵ cheaper; the bracket contained the scan. The runtime now
+brackets the cheap aggregate read for CPU pairing and takes residency separately,
+so the 5 % guard remains a gross-stall backstop instead of measuring the scan's
+width. That repairs the carried-over reading #645 observed; it removes #654, not
+the outstanding [#647](https://github.com/gregwebs/agent-vm/issues/647) CPU
+controller, and #646 still consumes only `memory_limit_bytes` and
+`memory_available_bytes`. Native verification of the landed fix
+(`vendor/microsandbox` `25c29e17`; 1 GiB / 1 vCPU at 200 ms) published rows whose
+per-row agreement with the counter delta had a median of 0.11–0.16 percentage
+points (max 1.56) across four runs, idle ≈ 0.13 % and busy ≈ 97 %.
+
+The interval is still not free: idle CPU measured **8.05 % mean** over three
+60-sample rounds at 200 ms against **4.86 %** for `main`'s 1 s default — ≈ +3
+percentage points, on a shared host, so indicative rather than a benchmark — and
+the page walk alone costs about 11.5 ms per tick for a 1 GiB guest (D5.5).
 
 ### D5. Observability, failure degradation and boundary contract
 
@@ -320,6 +337,21 @@ benchmark.
    model tests, not by the numeric proof: the seed kernel proves
    numeric safety and distinctness, while provenance, persistence and liveness
    stay trusted.
+5. **CPU sample degradation.** CPU rate math pairs the cumulative vCPU counter with
+   the bracket midpoint of the cheap aggregate read. Residency is a separate
+   observation outside that bracket, still taken off the async workers; paused
+   samples omit residency, and a stopped sandbox keeps publishing its last sample
+   (`ReleaseMode::Stale`), so an absent rate and a measured zero are not the same
+   thing — `0.0` means *no rate was published*, not an idle guest. A genuinely
+   unreliable pairing window still carries the last trustworthy percentage, or
+   publishes zero before any trustworthy rate exists. A published row therefore
+   spans three instants: cumulative counters at the cheap read, residency up to
+   one page walk later, and `sampled_at` at the write. `cpu_percent` describes the
+   interval between two cheap reads and is exact for that interval; the lag
+   between it and `sampled_at` is one walk (≈ 11.5 ms at 1 GiB, up to the walk's
+   duration on a large guest), which #647 must treat as lag rather than bias. The
+   upper-filesystem staleness window shrinks by the same walk. This is a runtime
+   sampling correction, not a shared-memory ABI or a controller policy change.
 
 ## Alternatives rejected
 
@@ -331,8 +363,9 @@ benchmark.
   plugging blocks; 512 MiB provides a safer initial cushion while still saving
   93.75% of the 8 GiB default ceiling when idle.
 - **Polling faster than 200 ms.** Not chosen: no measurement shows a shorter
-  interval is needed for the controller, and its sampler cost is unmeasured.
-  Revisit with data.
+  interval is needed for the controller, and the per-tick residency walk already
+  has measurable cost (D4). Separating that scan's cadence from the CPU rate needs
+  explicit staleness semantics before a faster interval is worth considering.
 - **0.1 fractional vCPU floor.** Rejected: `microsandbox` and `msb_krun` expose
   integer online vCPU counts (`u8 >= 1`), and an idle vCPU in `libkrun` already
   sleeps in `HLT`/`WFI` at ~0% host CPU.
@@ -359,8 +392,10 @@ benchmark.
   no wall-clock latency or OOM-safety property follows from them.
 - **Interim (S2):** memory scales, vCPUs do not. Every session keeps `1` online
   vCPU whatever `--cpus` says, so the CPU ceiling still only reserves capacity
-  until [#647](https://github.com/gregwebs/agent-vm/issues/647), itself blocked on
-  [#654](https://github.com/gregwebs/agent-vm/issues/654).
+  until [#647](https://github.com/gregwebs/agent-vm/issues/647). The runtime
+  pairing prerequisite was repaired by
+  [#654](https://github.com/gregwebs/agent-vm/issues/654); that is not CPU
+  commitment tracking.
 - The monitor is one in-process task per session, owned by the launch's teardown,
   and it holds the only handle that stops it. Teardown stops it before any
   lifecycle operation, so a resize cannot be dispatched against a VM that is
