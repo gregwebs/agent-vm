@@ -121,6 +121,15 @@ jobs:
           timeout --signal=TERM --kill-after=10s 30m \
             bash script/test/ci-test-shard.sh "$SHARD" "$SHARDS"
 
+      # #626: libtest captures a row's stderr, so a row that returned early --
+      # printing `SKIPPED` -- is reported `ok` and the job cannot tell whether it
+      # ran. These two rows now fail rather than skip on Linux; this step puts
+      # their execution, and the path they resolved, in the job log, and fails if
+      # either stops running. One shard pays for the extra link.
+      - name: Prove the non-UTF-8 HOME rows execute
+        if: matrix.shard == 0
+        run: bash script/test/non-utf8-home-rows.sh
+
   # Everything that needs only a debug build of the workspace, plus the one
   # place a real release binary is linked.
   lint:

@@ -166,6 +166,7 @@ syntax_check=(
     script/test/e2e.sh
     script/test/lib/released-image-checks.sh
     script/test/lib/e2e-image-cleanup.sh
+    script/test/non-utf8-home-rows.sh
     "$self_relative"
 )
 
@@ -228,6 +229,7 @@ shellcheck_files=(
     script/test/e2e.sh
     script/test/lib/released-image-checks.sh
     script/test/lib/e2e-image-cleanup.sh
+    script/test/non-utf8-home-rows.sh
     "$self_relative"
 )
 
@@ -261,6 +263,10 @@ assert_listed 'bash -n' 'script/test/persisted-network-contract.sh' "${syntax_ch
 assert_listed 'shellcheck' 'script/test/persisted-network-contract.sh' "${shellcheck_files[@]}"
 assert_listed 'bash -n' 'script/test/e2e-image-pins-contract.sh' "${syntax_check[@]}"
 assert_listed 'shellcheck' 'script/test/e2e-image-pins-contract.sh' "${shellcheck_files[@]}"
+# ci.yml's test job runs this one on shard 0 to prove, uncaptured, that the two
+# non-UTF-8 HOME rows execute (#626).
+assert_listed 'bash -n' 'script/test/non-utf8-home-rows.sh' "${syntax_check[@]}"
+assert_listed 'shellcheck' 'script/test/non-utf8-home-rows.sh' "${shellcheck_files[@]}"
 assert_listed 'bash -n' 'script/test/lib/e2e-image-pins.sh' "${syntax_check[@]}"
 assert_listed 'shellcheck' 'script/test/lib/e2e-image-pins.sh' "${shellcheck_files[@]}"
 assert_listed 'bash -n' 'script/test/build-provenance-contract.sh' "${syntax_check[@]}"
