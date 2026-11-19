@@ -4979,7 +4979,7 @@ fn image_precedence_at_every_cli_boundary() {
                 assert!(
                     stderr.contains("booting verify sandbox")
                         || stderr.contains(
-                            "booting the verification sandbox from the default boot image failed"
+                            "booting the verification sandbox from the default boot image: the registry may be unreachable or the content unavailable"
                         ),
                     "{stderr}"
                 );
@@ -6808,7 +6808,9 @@ fn a_default_tier_invocation_suppresses_dependency_image_tracing() {
         "the debug-config display copy must still be redacted:\n{combined}"
     );
     assert!(
-        combined.contains("pulling the default boot image failed"),
+        combined.contains(
+            "pulling the default boot image: the registry may be unreachable or the content unavailable"
+        ),
         "the failure must stay a fixed stage reason:\n{combined}"
     );
 
@@ -6887,7 +6889,9 @@ fn a_default_tier_reference_is_redacted_across_output() {
     );
     assert!(!stderr.contains(CONFIG_MARKER));
     assert!(
-        stderr.contains("pulling the default boot image failed"),
+        stderr.contains(
+            "pulling the default boot image: the registry may be unreachable or the content unavailable"
+        ),
         "acquisition failure must be a fixed, stage-specific reason:\n{stderr}"
     );
     assert!(

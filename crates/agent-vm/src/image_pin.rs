@@ -761,7 +761,7 @@ async fn acquire_or_render(
 
 /// How an acquisition failure may be rendered for this operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Rendering {
+pub(crate) enum Rendering {
     /// A launch, setup or refresh selection: the label decides.
     Selection,
     /// `image set-default`'s typed target: closed stage text only, plus the
@@ -774,7 +774,7 @@ enum Rendering {
 
 /// Render an acquisition failure for one selection without leaking a redacted
 /// reference, keeping the import hint for a mutable source a user could import.
-fn render_failure(
+pub(crate) fn render_failure(
     label: &ImageLabel,
     rendering: Rendering,
     reference: &str,
