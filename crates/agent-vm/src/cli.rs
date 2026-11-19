@@ -506,6 +506,14 @@ where
                     };
                     return Err(scrubbed);
                 }
+                if let Some(refusal) = numeric_launch_env_refusal(&command, &error, &argv) {
+                    let refusal = if direct_route {
+                        direct_usage_error(error.kind(), refusal)
+                    } else {
+                        command.error(error.kind(), refusal)
+                    };
+                    return Err(anyhow::Error::new(refusal));
+                }
                 // A known-direct route whose separator was refused already has
                 // the real cause: its launch-option prefix. clap reported the
                 // first payload word as an unknown subcommand instead, which
@@ -1138,6 +1146,52 @@ fn launch_options() -> Vec<clap::Arg> {
         .collect()
 }
 
+/// Refuse a numeric launch environment value without echoing it. Image's only
+/// clap-layer parse failure is non-UTF-8 input, whose clap diagnostic is already
+/// value-free; it needs no replacement.
+fn numeric_launch_env_refusal(
+    command: &clap::Command,
+    error: &clap::Error,
+    argv: &[OsString],
+) -> Option<String> {
+    use clap::error::{ContextKind, ContextValue};
+
+    let ContextValue::String(invalid_arg) = error.get(ContextKind::InvalidArg)? else {
+        return None;
+    };
+    let option = launch_options().into_iter().find(|option| {
+        let Some(env) = option.get_env().and_then(|env| env.to_str()) else {
+            return false;
+        };
+        let Some(long) = option.get_long() else {
+            return false;
+        };
+        let Some(value_name) = option.get_value_names().and_then(|names| names.first()) else {
+            return false;
+        };
+        matches!(env, "AGENT_VM_MEMORY_GIB" | "AGENT_VM_CPUS")
+            && invalid_arg == &format!("--{long} <{value_name}>")
+    })?;
+    let env = option.get_env()?.to_str()?;
+    let flag = format!("--{}", option.get_long()?);
+    std::env::var_os(env)?;
+
+    // A repeat of the same clap failure without launch environment bindings
+    // proves the command line supplied it. Any other result could be an
+    // environment-sourced value, so refuse without echoing the value.
+    let repeated = command_without_launch_env(command)
+        .try_get_matches_from(argv)
+        .err()
+        .is_some_and(|retry| {
+            retry.kind() == error.kind()
+                && matches!(
+                    retry.get(ContextKind::InvalidArg),
+                    Some(ContextValue::String(retry_arg)) if retry_arg == invalid_arg
+                )
+        });
+    (!repeated).then(|| format!("refused `{flag}` from `{env}`; its value is not shown"))
+}
+
 /// Remove only the top-level launch options' env bindings. Built-in
 /// subcommands keep their own bindings (notably image pull/setup's --image).
 fn command_without_launch_env(command: &clap::Command) -> clap::Command {
@@ -1515,6 +1569,109 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn malformed_numeric_launch_environment_is_value_free_but_inline_is_clap() {
+        let mut env = crate::test_env::guard();
+        env.remove_var("AGENT_VM_IMAGE_TAG");
+        for (name, flag, value_name) in [
+            ("AGENT_VM_MEMORY_GIB", "--memory", "GIB"),
+            ("AGENT_VM_CPUS", "--cpus", "N"),
+        ] {
+            env.remove_var("AGENT_VM_MEMORY_GIB");
+            env.remove_var("AGENT_VM_CPUS");
+            env.set_var(name, "REDACTION_CANARY");
+            let error = usage_error(parse_from(
+                ["agent-vm", "run", "p"],
+                Ok(report_from(SHELL_ONLY)),
+            ));
+            assert_eq!(error.exit_code(), 2);
+            let text = error.to_string();
+            assert!(text.contains(&format!("`{flag}` from `{name}`")), "{text}");
+            assert!(!text.contains("REDACTION_CANARY"), "{text}");
+            assert!(
+                text.contains("For more information, try '--help'."),
+                "{text}"
+            );
+
+            assert!(matches!(
+                parse_from(["agent-vm", "doctor"], Ok(report_from(SHELL_ONLY))).unwrap(),
+                Dispatch::Builtin { .. }
+            ));
+
+            env.remove_var(name);
+            let error = usage_error(parse_from(
+                ["agent-vm", flag, "REDACTION_CANARY", "run", "p"],
+                Ok(report_from(SHELL_ONLY)),
+            ));
+            assert_eq!(error.exit_code(), 2);
+            let text = error.to_string();
+            assert!(
+                text.contains(&format!(
+                    "invalid value 'REDACTION_CANARY' for '{flag} <{value_name}>'"
+                )),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_launch_env_source_detection_ignores_guest_and_tool_arguments() {
+        let mut env = crate::test_env::guard();
+        env.remove_var("AGENT_VM_CPUS");
+        env.remove_var("AGENT_VM_IMAGE_TAG");
+        env.set_var("AGENT_VM_MEMORY_GIB", "CANARY_ENV");
+
+        let typed = usage_error(parse_from(
+            ["agent-vm", "--memory", "CANARY_TYPED", "run", "p"],
+            Ok(report_from(SHELL_ONLY)),
+        ));
+        let text = typed.to_string();
+        assert!(
+            text.contains("invalid value 'CANARY_TYPED' for '--memory <GIB>'"),
+            "{text}"
+        );
+        assert!(!text.contains("CANARY_ENV"), "{text}");
+
+        for argv in [
+            vec!["agent-vm", "run", "p", "--memory", "4"],
+            vec!["agent-vm", "shell", "--memory", "4"],
+        ] {
+            let error = usage_error(parse_from(argv, Ok(report_from(SHELL_ONLY))));
+            let text = error.to_string();
+            assert!(
+                text.contains("refused `--memory` from `AGENT_VM_MEMORY_GIB`"),
+                "{text}"
+            );
+            assert!(!text.contains("CANARY_ENV"), "{text}");
+        }
+
+        let direct = usage_error(parse_from(
+            ["agent-vm", "run", "p", "--memory", "4"],
+            Ok(report_from(SHELL_ONLY)),
+        ));
+        assert!(direct.to_string().contains(run::DIRECT_USAGE));
+    }
+
+    #[test]
+    fn malformed_image_environment_is_already_value_free() {
+        let mut env = crate::test_env::guard();
+        env.remove_var("AGENT_VM_MEMORY_GIB");
+        env.remove_var("AGENT_VM_CPUS");
+        env.set_var(
+            "AGENT_VM_IMAGE_TAG",
+            std::ffi::OsStr::from_bytes(b"REDACTION_CANARY_\xff"),
+        );
+        let error = usage_error(parse_from(
+            ["agent-vm", "run", "p"],
+            Ok(report_from(SHELL_ONLY)),
+        ));
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidUtf8);
+        assert_eq!(error.exit_code(), 2);
+        let text = error.to_string();
+        assert!(text.contains("invalid UTF-8"), "{text}");
+        assert!(!text.contains("REDACTION_CANARY"), "{text}");
     }
 
     #[test]

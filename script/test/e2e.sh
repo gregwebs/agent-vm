@@ -76,6 +76,7 @@
 # manual; see CONTRIBUTING.md. No debug recommendation seam in released-image.
 
 set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1
 
 CALLER_CWD="$PWD"
 OPERATOR_HOME="$HOME"
