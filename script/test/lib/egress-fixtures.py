@@ -2742,11 +2742,33 @@ def self_test() -> int:
             assert check_default_request_diagnostics(case, 1, text)
             assert check_default_request_diagnostics(case, 0, text.replace("0.87.1", "").replace("AGENT_VM_328_SHELL_STARTED", ""))
             if case.case != "NR3":
-                for old, new in (("built-in defaults", "project config"), ("5", "4"), ("Tool network requests", "missing report")):
+                for old, new in (("built-in defaults", "project config"), ("Tool network requests", "missing report")):
                     mutated = text.replace(old, new)
                     # A no-op mutation would assert nothing; the count check must
                     # actually change the text it then rejects.
                     assert mutated != text, (case.case, old, new)
+                    assert check_default_request_diagnostics(case, 0, mutated)
+                # The header count and the listed names are two sides of one
+                # claim, so they are mutated one at a time. The former global
+                # `5` -> `4` replace moved both digits of `5 of 5` to `4 of 4`
+                # and left the header agreeing with its own list, which pinned
+                # neither side: a report whose count and list disagree passed
+                # no mutant at all.
+                if case.case == "NR1":
+                    for new in (": 4 of 5 not covered", ": 5 of 4 not covered"):
+                        mutated = text.replace(": 5 of 5 not covered", new)
+                        assert mutated != text, (case.case, new)
+                        assert check_default_request_diagnostics(case, 0, mutated)
+                    # Header count intact while one name goes missing: the *last*
+                    # one, which a length-blind (zip or prefix) block comparison
+                    # would wave through.
+                    mutated = text.replace("==>   unmet: platform.claude.com\n", "")
+                    assert mutated != text, "the list mutant must drop a real name"
+                    assert check_default_request_diagnostics(case, 0, mutated)
+                else:
+                    # NR2 reports no list, so its whole report is the header.
+                    mutated = text.replace("all 5 covered", "all 4 covered")
+                    assert mutated != text
                     assert check_default_request_diagnostics(case, 0, mutated)
             if case.case == "NR1":
                 assert check_default_request_diagnostics(case, 0, unmet + deny + "0.87.1\n")
