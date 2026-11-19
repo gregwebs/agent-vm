@@ -18,7 +18,7 @@
 use std::{
     collections::BTreeMap,
     fs,
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::{Command, Output},
     time::Duration,
@@ -31,6 +31,9 @@ use support::run_with_timeout;
 fn agent_vm_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_agent-vm"))
 }
+
+#[path = "support/fixture_executable.rs"]
+mod fixture_executable;
 
 fn stdout_of(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
@@ -97,14 +100,10 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Meta> {
 /// ran, the marker proves it.
 fn write_sentinel(dir: &Path, name: &str) {
     let path = dir.join(name);
-    fs::write(
+    fixture_executable::write_executable(
         &path,
-        format!("#!/bin/sh\nprintf '%s\\n' '{name}' >> \"$SENTINEL_MARKER\"\nexit 1\n"),
-    )
-    .unwrap();
-    let mut perms = fs::metadata(&path).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&path, perms).unwrap();
+        &format!("#!/bin/sh\nprintf '%s\\n' '{name}' >> \"$SENTINEL_MARKER\"\nexit 1\n"),
+    );
 }
 
 /// One hermetic home / state root / project, a private sentinel `PATH`, and a

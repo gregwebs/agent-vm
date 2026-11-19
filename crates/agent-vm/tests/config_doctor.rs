@@ -585,17 +585,10 @@ fn doctor_never_executes_the_command_or_creates_persist_paths() {
     let h = Harness::new();
     let marker = h.project_root.join("EXECUTED");
     let script = h.project_root.join("recorder.sh");
-    std::fs::write(
+    fake_msb::write_executable(
         &script,
-        format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
-    )
-    .unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&script).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script, perms).unwrap();
-    }
+        &format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    );
     h.write_user(&format!(
         "[[tools]]\nname = \"evil\"\ncommand = \"{}\"\npersist = [\"cache/never\"]\n",
         script.display()
@@ -2434,16 +2427,14 @@ fn doctor_reports_tool_mount_errors_with_exact_file_and_field() {
 /// environment, byte for byte.
 #[test]
 fn a_secretspec_sourced_authorization_is_labelled_and_never_spawned() {
-    use std::os::unix::fs::PermissionsExt as _;
     let h = Harness::new();
     h.write_user("[[tools]]\nname = \"t\"\ncommand = \"t\"\ncredentials = [\"my-service\"]\n");
     let marker = h.project_root.join("executable-ran");
     let executable = h.project_root.join("secretspec-fixture");
-    write(
+    fake_msb::write_executable(
         &executable,
         &format!("#!/bin/sh\ntouch {}\nexit 0\n", marker.display()),
     );
-    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
     let manifest = h.project_root.join("secretspec.toml");
     write(&manifest, "[project]\nname = \"x\"\n");
     h.write_credentials(&format!(
@@ -2511,8 +2502,6 @@ fn a_secretspec_sourced_authorization_is_labelled_and_never_spawned() {
 #[cfg(target_os = "macos")]
 #[test]
 fn doctor_names_the_keychain_when_it_wins() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let h = Harness::new();
     let claude = h.home_root.join(".claude");
     std::fs::create_dir_all(&claude).unwrap();
@@ -2534,15 +2523,13 @@ fn doctor_names_the_keychain_when_it_wins() {
     std::fs::create_dir_all(&bin).unwrap();
     let keychain_token = "DOCTOR_KEYCHAIN_CANARY";
     let security = bin.join("security");
-    std::fs::write(
+    fake_msb::write_executable(
         &security,
-        format!(
+        &format!(
             "#!/bin/sh\nprintf '%s\\n' '{{\"claudeAiOauth\":{{\"accessToken\":\"{keychain_token}\",\"expiresAt\":{}}}}}'\n",
             now_ms + 4 * 3_600_000
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let host_path = std::env::var("PATH").unwrap_or_default();
     let out = h
