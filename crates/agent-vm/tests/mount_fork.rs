@@ -1185,6 +1185,11 @@ fn fork_seed_omission_does_not_block_later_explicit_child_mount() {
     // A seed omission removes content only during seeding; it is not a
     // persistent guest access restriction. An explicit child mount at the
     // omitted path is accepted and appears in the config.
+    //
+    // The fixture is spelled from `home.path()` on purpose, while the sibling
+    // tests use `home_path()`: the mount input keeps the caller's spelling and
+    // the expectation is the canonical one (#448), so the launcher's own
+    // canonicalization stays exercised. Do not harmonise the two.
     for file_child in [false, true] {
         let h = Harness::new();
         let source = h.home.path().join("fork-source");
@@ -1203,14 +1208,15 @@ fn fork_seed_omission_does_not_block_later_explicit_child_mount() {
         assert!(stderr_of(&seeded).contains("Initialized fork"));
 
         let child_mount = format!("{}:/fork/omitted:ro", explicit.display());
+        let expected_host = explicit.canonicalize().unwrap().display().to_string();
         let reused = h.run_shell(&[&fork, &child_mount]);
         let stderr = stderr_of(&reused);
         let binds = bind_mounts(&debug_config_json(&stderr));
         assert!(
             binds.iter().any(|(host, guest, readonly)| {
-                host == &explicit.display().to_string() && guest == "/fork/omitted" && *readonly
+                host == &expected_host && guest == "/fork/omitted" && *readonly
             }),
-            "expected the explicit child bind at the omitted seed path (file={file_child}), got: {binds:?}"
+            "expected explicit child bind {expected_host} at the omitted seed path (file={file_child}), got: {binds:?}"
         );
     }
 }
@@ -1967,12 +1973,17 @@ fn tool_mount_parent_child_and_follow_modes_match_cli() {
                     // The discovered target is bound read-only at the literal path
                     // the guest's own `readlink` names — the spelling the CLI rows
                     // pin — not under the fork's guest path.
-                    let linked = child.join("linked").display().to_string();
+                    let linked = child
+                        .join("linked")
+                        .canonicalize()
+                        .unwrap()
+                        .display()
+                        .to_string();
                     assert!(
                         binds.iter().any(|(host, guest, readonly)| *host == linked
                             && *guest == linked
                             && *readonly),
-                        "the followed child target must keep its literal guest path: {binds:?}"
+                        "the followed child target must keep its literal guest path {linked}: {binds:?}"
                     );
                 }
                 assert_eq!(h.fork_dirs().len(), 1, "{binds:?}");
