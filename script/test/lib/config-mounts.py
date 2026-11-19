@@ -21,6 +21,8 @@ import signal
 import subprocess
 import sys
 
+sys.dont_write_bytecode = True
+
 ROOT = Path(__file__).resolve().parents[3]
 SPEC = importlib.util.spec_from_file_location("cm_egress", ROOT / "script/test/lib/egress-fixtures.py")
 EGRESS = importlib.util.module_from_spec(SPEC)
