@@ -8,6 +8,7 @@
 # mount-set rows CM-S1..S4 (#397 / ADR-0048) ride the same launches, bounds and
 # receipts: only the config bytes change between cleanly terminated launches.
 set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1
 
 evidence="${AGENT_VM_CM_EVIDENCE:-$(mktemp -d /tmp/avm-cm-evidence.XXXXXX)}"
 mkdir -p "$evidence"

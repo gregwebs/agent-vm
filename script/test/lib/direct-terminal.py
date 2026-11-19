@@ -49,6 +49,8 @@ import time
 import traceback
 from pathlib import Path
 
+sys.dont_write_bytecode = True
+
 # --------------------------------------------------------------- constants ---
 
 # Deadline for one case's whole interaction. A correct case is a few seconds; the

@@ -60,7 +60,7 @@ fn has_registry_error(error: &anyhow::Error) -> bool {
 
 /// The hint text for one reference.
 ///
-/// The lead line states where the acquisition failed, so the top of the message
+/// The lead line states where the acquisition stopped, so the top of the message
 /// is not `Error: hint: …`; it is not a diagnosis (`image pull` uses
 /// `PullPolicy::Always`, so a cache miss is not implied). The reference is
 /// spelled as one shell word, the same spelling in every line, so the whole hint
@@ -75,7 +75,7 @@ fn render(reference: &ResultReference) -> String {
         .map(|note| format!("The commands above are {note}.\n"))
         .unwrap_or_default();
     format!(
-        "could not acquire {shown} from its registry\n\n\
+        "acquiring {shown} from its registry\n\n\
 hint: an image that exists only in your local Docker daemon is not visible to\n\
 agent-vm until it is imported into agent-vm's own image cache:\n\
 {indent}agent-vm image import --docker {shown} --tag {shown}\n\
@@ -120,7 +120,7 @@ mod tests {
         // Literal, never `render()`: a wording regression in the hint must fail
         // this test, not move its own expectation with it.
         let expected = concat!(
-            "could not acquire my-image:dev from its registry\n\n",
+            "acquiring my-image:dev from its registry\n\n",
             "hint: an image that exists only in your local Docker daemon is not visible to\n",
             "agent-vm until it is imported into agent-vm's own image cache:\n",
             "  agent-vm image import --docker my-image:dev --tag my-image:dev\n",

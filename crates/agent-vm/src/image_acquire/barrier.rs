@@ -58,10 +58,12 @@ impl BarrierError {
     pub(crate) fn message(&self) -> String {
         match self {
             Self::Open(_) => {
-                "opening the image-cache publication lock failed; check the image cache permissions"
+                "opening the image-cache publication lock: check the image cache permissions"
                     .to_string()
             }
-            Self::Wait(_) => "waiting for the image-cache publication lock failed".to_string(),
+            Self::Wait(_) => {
+                "waiting for the image-cache publication lock: unavailable".to_string()
+            }
         }
     }
 

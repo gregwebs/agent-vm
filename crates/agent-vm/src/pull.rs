@@ -618,7 +618,7 @@ mod tests {
                 label: &default,
                 platform: "linux/arm64",
             },
-            &anyhow!("pulling the default boot image failed"),
+            &anyhow!("pulling the default boot image: unavailable"),
         );
         report.summary(&mut sinks, 3, 2);
 
@@ -636,11 +636,126 @@ mod tests {
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -> sha384:",
                 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
                 "==> pull [4/5] the latest output image (linux/arm64): failed line one\\x0aline two\n",
-                "==> pull [5/5] the default boot image (linux/arm64): failed pulling the default boot image failed\n",
+                "==> pull [5/5] the default boot image (linux/arm64): failed pulling the default boot image: unavailable\n",
                 "==> image pull: 3 succeeded, 2 failed\n",
             )
         );
         assert_eq!(stderr.written, "");
+    }
+
+    #[test]
+    fn pull_report_acquisition_errors_have_one_failed_verb() {
+        use crate::image_acquire::{
+            AcquireError, AcquireStage, ReferenceStage, RollbackOutcome, ValidationError,
+        };
+        use crate::image_pin::{Rendering, render_failure};
+
+        let redacted = boot_image::ImageLabel::for_refresh_holder(boot_image::HolderRoles::Boot);
+        let explicit = boot_image::ImageLabel::for_result_reference("example.com/team/app:dev");
+        let reference = "example.com/team/app:dev";
+        let rows = [
+            (
+                &redacted,
+                render_failure(
+                    &redacted,
+                    Rendering::Selection,
+                    reference,
+                    AcquireError::Native {
+                        stage: AcquireStage::Pull,
+                        source: microsandbox_image::ImageError::Io(std::io::Error::other(
+                            "record-sourced native failure",
+                        )),
+                    },
+                ),
+                "==> pull [1/1] the recorded boot image (linux/arm64): failed pulling the recorded boot image: the registry may be unreachable or the content unavailable\n",
+            ),
+            (
+                &explicit,
+                render_failure(
+                    &explicit,
+                    Rendering::Selection,
+                    reference,
+                    AcquireError::Native {
+                        stage: AcquireStage::Pull,
+                        source: microsandbox_image::ImageError::ManifestParse(
+                            "explicit native failure".to_string(),
+                        ),
+                    },
+                ),
+                "==> pull [1/1] example.com/team/app:dev (linux/arm64): failed acquiring the image: manifest parse error: explicit native failure\n",
+            ),
+            (
+                &redacted,
+                render_failure(
+                    &redacted,
+                    Rendering::Selection,
+                    reference,
+                    AcquireError::ReferenceState {
+                        stage: ReferenceStage::Snapshot,
+                        source: anyhow!("record-sourced metadata failure"),
+                    },
+                ),
+                "==> pull [1/1] the recorded boot image (linux/arm64): failed snapshotting cached reference metadata: did not complete\n",
+            ),
+            (
+                &redacted,
+                render_failure(
+                    &redacted,
+                    Rendering::Selection,
+                    reference,
+                    AcquireError::PostValidation {
+                        source: ValidationError::Identity,
+                        rollback: RollbackOutcome::Restored,
+                    },
+                ),
+                "==> pull [1/1] the recorded boot image (linux/arm64): failed image cache post-acquisition validation: the previous reference metadata was restored; retry the image acquisition\n",
+            ),
+            (
+                &explicit,
+                render_failure(
+                    &explicit,
+                    Rendering::Selection,
+                    reference,
+                    AcquireError::Native {
+                        stage: AcquireStage::Pull,
+                        source: microsandbox_image::ImageError::Registry(
+                            std::io::Error::other("explicit registry failure").into(),
+                        ),
+                    },
+                ),
+                concat!(
+                    "==> pull [1/1] example.com/team/app:dev (linux/arm64): failed acquiring example.com/team/app:dev from its registry\\x0a\\x0a",
+                    "hint: an image that exists only in your local Docker daemon is not visible to\\x0a",
+                    "agent-vm until it is imported into agent-vm's own image cache:\\x0a",
+                    "  agent-vm image import --docker example.com/team/app:dev --tag example.com/team/app:dev\\x0a",
+                    "A completed OCI or Docker-save archive works too:\\x0a",
+                    "  agent-vm image import --input <FILE> --tag example.com/team/app:dev\\x0a",
+                    "The imported reference must match the --image value exactly.: acquiring the image: registry error: explicit registry failure: explicit registry failure\n",
+                ),
+            ),
+        ];
+
+        for (label, error, expected) in rows {
+            let mut report = Report::default();
+            let mut stdout = Sink::open();
+            let mut stderr = Sink::open();
+            let mut sinks = Sinks {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+            };
+            report.failed(
+                &mut sinks,
+                &Row {
+                    position: 1,
+                    total: 1,
+                    label,
+                    platform: "linux/arm64",
+                },
+                &error,
+            );
+            assert_eq!(stdout.written, expected);
+            assert_eq!(stderr.written, "");
+        }
     }
 
     /// A closed report sink is a bounded warning, never a target failure and

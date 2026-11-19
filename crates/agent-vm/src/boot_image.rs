@@ -566,7 +566,7 @@ impl ImageLabel {
     pub(crate) fn redact_error(&self, stage: &str, error: anyhow::Error) -> anyhow::Error {
         if self.redacted {
             anyhow::anyhow!(
-                "{stage} {} failed; the registry may be unreachable or the content unavailable",
+                "{stage} {}: the registry may be unreachable or the content unavailable",
                 self.text
             )
         } else {

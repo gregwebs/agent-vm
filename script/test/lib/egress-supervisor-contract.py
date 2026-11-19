@@ -19,6 +19,8 @@ from unittest.mock import patch
 from contextlib import closing
 from dataclasses import replace
 
+sys.dont_write_bytecode = True
+
 MODULE_PATH = Path(__file__).resolve().with_name("egress-fixtures.py")
 spec = importlib.util.spec_from_file_location("egress_fixtures", MODULE_PATH)
 egress = importlib.util.module_from_spec(spec)
