@@ -158,8 +158,8 @@ impl ReceiptError {
         match self {
             Self::TooLarge => "the image cache content receipt exceeds its size limit",
             Self::Corrupt => "the image cache content receipt is corrupt",
-            Self::Io => "reading or writing the image cache content receipt failed",
-            Self::Encode => "encoding the image cache content receipt failed",
+            Self::Io => "reading or writing the image cache content receipt: did not complete",
+            Self::Encode => "encoding the image cache content receipt: did not complete",
             Self::IdentityConflict => "the image cache content receipt has a conflicting identity",
             Self::BindingLimit => {
                 "the image cache content receipt holds more source bindings than its limit allows"
