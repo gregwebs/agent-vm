@@ -1136,8 +1136,8 @@ deliberately not used for tool launches).
 (`max_cpus`, `max_memory_mib`), configured by `--cpus` / `AGENT_VM_CPUS`
 (default `2`) and `--memory` / `AGENT_VM_MEMORY_GIB` (default `8` GiB). Live
 resize grows and shrinks a running guest's **resource commitment** within this
-ceiling without restarting the VM, and can never exceed it. Memory moves;
-vCPUs do not yet (#647), so the CPU ceiling only reserves capacity.
+ceiling without restarting the VM, and can never exceed it. Both axes move:
+memory and vCPUs.
 
 _Avoid_: calling `--memory` or `--cpus` the initial or fixed allocation — they
 set the ceiling.
@@ -1167,8 +1167,19 @@ above the ceiling, keeping `max(256 MiB, 25% of used)` free. Growth is immediate
 reclamation needs 50 consecutive lower-demand ticks *and* a limit that has
 converged to the target; a tick without usable availability holds the commitment.
 Both the 200 ms period and the resulting 10 s dwell are nominal: the interval
-requests samples and guarantees no rate. The vCPU count stays at its boot
-commitment until #647.
+requests samples and guarantees no rate. Both axes are live: see the canonical
+[ADR-0070](docs/adr/0070-dynamic-resource-commitment.md) for the exact policy.
+
+**CPU commitment**: the vCPU half of a **resource commitment**, which is live. The
+same 200 ms monitor grows it by one vCPU on the 10th consecutive **distinct**
+observation at `C x 95%` and shrinks it by one on the 5th at `(C-1) x 85%`, within
+`1..=max_cpus`. A duplicate row is neutral; a gap, an absent or published-zero rate,
+an unusable rate and an unusable lifecycle reset the run — a zero or unusable rate
+resets it on any row, whatever the lifecycle cache's age. The counts are dwell in
+observations, not deadlines. Exactly-zero guests are not reclaimed by demand
+policy, and lifecycle eligibility is checked lazily rather than as a pause fence;
+[ADR-0070](docs/adr/0070-dynamic-resource-commitment.md) D4.1 is the canonical
+statement.
 
 _Avoid_: "reservation" (which in `microsandbox` means the host virtual-address
 aperture `max_memory_mib`).
