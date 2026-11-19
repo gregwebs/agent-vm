@@ -1106,12 +1106,34 @@ fn measured_paths_cannot_forge_a_doctor_section() {
     // emits its mode warning — error text from `credential_yaml` naming the path.
     write(&h.credentials(), ANTHROPIC_AUTHORIZATION);
 
-    assert_only_escaped(h.run_doctor(), &["UNUSABLE - ", "warning: "]);
+    assert_only_escaped(
+        h.run_doctor(),
+        &["UNUSABLE - ", "warning: "],
+        &["FORGED-HOME", "FORGED-PROJECT", "FORGED-STATE"],
+    );
 
     // A credentials file that fails to load: the `error:` channel is the other half
-    // of that section, and names the same path.
+    // of that section, and names the same path. It also withholds the state-derived
+    // rows (#353), so the state root's fragment leaves the report entirely — the cwd
+    // and `$HOME` rows still carry theirs, which is what keeps the escaping
+    // property testable through the error channel.
     h.write_credentials("credentials: [\n");
-    assert_only_escaped(h.run_doctor(), &["error: "]);
+    let stdout = assert_only_escaped(
+        h.run_doctor(),
+        &["error: "],
+        &["FORGED-HOME", "FORGED-PROJECT"],
+    );
+    assert!(
+        !stdout.contains("FORGED-STATE"),
+        "a withheld state path still reached the report:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "MSB_HOME: not shown - credentials.yaml may name XDG_STATE_HOME as an environment \
+             credential source"
+        ),
+        "the withheld row names neither the row nor the variable:\n{stdout}"
+    );
 }
 
 /// The same shape with non-ASCII names: a measured path stays legible, because the
@@ -1860,7 +1882,12 @@ fn the_reset_undo_preserves_non_utf8_path_bytes() {
 
 /// Every line of `doctor`'s output must be doctor's own, so the only place a
 /// forged fragment may appear is inline after an escaped control character.
-fn assert_only_escaped(out: Output, details: &[&str]) {
+///
+/// `forged` lists the fragments the report is expected to carry. A path in a
+/// section the run withholds (#353) is absent from it entirely, so naming that
+/// fragment here would demand a value doctor deliberately no longer prints.
+/// Returns the report, for the assertions a withheld row needs.
+fn assert_only_escaped(out: Output, details: &[&str], forged: &[&str]) -> String {
     let stdout = stdout_of(&out);
     assert_success(&out);
     // The two detail channels print error text that interpolates the same path:
@@ -1876,7 +1903,7 @@ fn assert_only_escaped(out: Output, details: &[&str]) {
             "`{detail}` names the measured path raw: {line:?}"
         );
     }
-    for forged in ["FORGED-HOME", "FORGED-PROJECT", "FORGED-STATE"] {
+    for forged in forged {
         assert!(
             !stdout
                 .lines()
@@ -1888,6 +1915,7 @@ fn assert_only_escaped(out: Output, details: &[&str]) {
             "{forged} should appear inline, escaped:\n{stdout}"
         );
     }
+    stdout
 }
 
 // ---------------------------------------------------------------------------

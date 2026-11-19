@@ -289,9 +289,14 @@ are captured: inert authorizations still change nothing and read nothing.
 launcher's own configuration; the same rule covers every other host variable
 agent-vm reads as configuration, today `XDG_STATE_HOME` and `XDG_CACHE_HOME`
 (`host_paths::LAUNCHER_CONFIG_ENV_NAMES`, the one list that credentials parsing
-consults so a new path read cannot silently reopen the gap). Until #353 removes
-`doctor`'s read of those variables, a value claimed as a credential source would
-otherwise be printed as a state or cache path. Keychain guest names retain their
+consults so a new path read cannot silently reopen the gap). The refusal alone
+does not close the disclosure: `doctor` must still read those variables to
+describe the paths the commands act on. It therefore never prints a path derived
+from one — the row keeps its label, names the variable, and says the value is not
+shown — and it treats both variables as claimed whenever `credentials.yaml` is
+unusable, because a refusal does not say which name it refused (#353). Reading
+them is deliberate: treating a claimed variable as absent would have described
+paths the commands do not use. Keychain guest names retain their
 old rule: the refusal is env-source-only.
 
 Surviving copies additionally include the captured zeroizing bytes for the

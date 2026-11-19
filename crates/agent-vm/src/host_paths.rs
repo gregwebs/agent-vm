@@ -24,6 +24,13 @@ pub(crate) const MAX_GUEST_STATE_FILE_BYTES: u64 = 8 * 1024 * 1024;
 pub(crate) const MAX_HOST_CREDENTIAL_FILE_BYTES: u64 = 1024 * 1024;
 const ATOMIC_WRITE_RETRIES: usize = 16;
 
+/// The variable [`state_root`] reads. Named so the single list of launcher
+/// configuration variables below, and every report that must name the variable
+/// a path derives from (#353), spell it once.
+pub(crate) const STATE_ROOT_ENV_NAME: &str = "XDG_STATE_HOME";
+/// The variable [`cache_root`] reads. See [`STATE_ROOT_ENV_NAME`].
+pub(crate) const CACHE_ROOT_ENV_NAME: &str = "XDG_CACHE_HOME";
+
 /// `$AGENT_VM_STATE_DIR` → `$XDG_STATE_HOME/agent-vm` → `$HOME/.local/state/agent-vm`,
 /// always absolute (#437).
 ///
@@ -51,7 +58,7 @@ const ATOMIC_WRITE_RETRIES: usize = 16;
 pub fn state_root() -> Result<Option<PathBuf>> {
     let (root, ignored) = state_root_from(
         std::env::var_os("AGENT_VM_STATE_DIR").as_deref(),
-        std::env::var_os("XDG_STATE_HOME").as_deref(),
+        std::env::var_os(STATE_ROOT_ENV_NAME).as_deref(),
         std::env::var_os("HOME").as_deref(),
     )?;
     if let (Some(ignored), Some(root)) = (ignored, root.as_deref()) {
@@ -108,7 +115,7 @@ fn state_root_from(
             return Ok((Some(dir.join("agent-vm")), None));
         }
         ignored = Some(IgnoredSource {
-            variable: "XDG_STATE_HOME",
+            variable: STATE_ROOT_ENV_NAME,
             value: dir,
         });
     }
@@ -128,7 +135,7 @@ fn state_root_from(
 pub(crate) fn state_root_overridden() -> bool {
     state_root_overridden_from(
         std::env::var_os("AGENT_VM_STATE_DIR").as_deref(),
-        std::env::var_os("XDG_STATE_HOME").as_deref(),
+        std::env::var_os(STATE_ROOT_ENV_NAME).as_deref(),
     )
 }
 
@@ -143,7 +150,7 @@ fn state_root_overridden_from(
 /// Deliberately ignores AGENT_VM_STATE_DIR and XDG_STATE_HOME.
 pub fn cache_root() -> Option<PathBuf> {
     cache_root_from(
-        std::env::var_os("XDG_CACHE_HOME").as_deref(),
+        std::env::var_os(CACHE_ROOT_ENV_NAME).as_deref(),
         std::env::var_os("HOME").as_deref(),
     )
 }
@@ -162,17 +169,20 @@ fn cache_root_from(xdg_cache_home: Option<&OsStr>, home: Option<&OsStr>) -> Opti
 /// A launch removes a captured env source from its own environment, so claiming
 /// a configuration variable would break the launcher; worse, the diagnostics
 /// that read the variable as a path (`doctor`'s state and cache sections) would
-/// print the credential's value. Issue #353 covers removing that second read;
-/// until it lands, this refusal is what keeps an *accepted* configuration from
-/// disclosing a value. (`XDG_STATE_HOME` and `XDG_CACHE_HOME` below are the ones
-/// read by [`state_root`] and [`cache_root`]; `AGENT_VM_*` is reserved by prefix
-/// and is not repeated here.)
+/// print the credential's value. Both consequences are now closed: this refusal
+/// keeps an *accepted* configuration from disclosing a value (#163), and
+/// `doctor` withholds any path derived from one of these variables instead of
+/// printing it (#353). ([`STATE_ROOT_ENV_NAME`] and [`CACHE_ROOT_ENV_NAME`] below
+/// are the ones read by [`state_root`] and [`cache_root`]; `AGENT_VM_*` is
+/// reserved by prefix and is not repeated here.)
 ///
 /// Kept here, next to the readers, as one list on purpose: a new `var_os` read
 /// added to this module must be added here too, or it silently reopens the
-/// hole. This constant and [`is_launcher_config_env`] are that single source of
-/// truth for credential parsing.
-pub(crate) const LAUNCHER_CONFIG_ENV_NAMES: &[&str] = &["XDG_STATE_HOME", "XDG_CACHE_HOME"];
+/// hole. This constant, [`STATE_ROOT_ENV_NAME`]/[`CACHE_ROOT_ENV_NAME`] (the
+/// names the readers themselves use) and [`is_launcher_config_env`] are that
+/// single source of truth for credential parsing and for the reports that must
+/// name the variable a withheld path derives from.
+pub(crate) const LAUNCHER_CONFIG_ENV_NAMES: &[&str] = &[STATE_ROOT_ENV_NAME, CACHE_ROOT_ENV_NAME];
 
 /// Whether `name` is one of the host variables agent-vm itself reads as
 /// configuration ([`LAUNCHER_CONFIG_ENV_NAMES`], or the `AGENT_VM_` prefix).
