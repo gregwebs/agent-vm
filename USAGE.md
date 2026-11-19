@@ -2627,9 +2627,10 @@ mount read-only or a narrower source, or relocate `AGENT_VM_STATE_DIR` when
 state or guest home exposes authority. Forking a broad home copies everything,
 so prefer a narrower source.
 
-Every launch also refuses a regular `config.toml` with more than one hard link
-(or any link count other than one), even without network settings. Remove the
-other links or replace it with a copy. Non-launch verbs still work.
+Every launch also refuses a regular `config.toml` or `allowances.json` with
+more than one hard link (or any link count other than one), even without network
+settings. Review the file's launch-authorizing contents, then remove its other
+names before launching. Non-launch verbs still work.
 `credentials.yaml` hard links remain #319; runtime races and nested mount
 aliases remain #322/#321. See [ADR-0038](docs/adr/0038-config-dir-exposure-guard.md)
 for the trusted boundary and accepted gaps.
@@ -5416,9 +5417,13 @@ with launch flags as described in [Persisted grants](#persisted-grants-user-conf
   a mode change does not establish authorship. The file and directory must both
   be owned by you.
 - **“has … hard links” / “with … hard links”** — another name for `config.toml`
-  may be guest- or project-writable. Review the `[network]` table before
-  removing links or copying the file. The launch-time check applies regardless
-  of content; `[network]` also invokes the read-time check.
+  or `allowances.json` may be guest- or project-writable. Review `config.toml`'s
+  `[network]`, `[egress_sets]`, `[mount_sets]`, `mounts`, and
+  `[[tools]] network_requests`; review the records in `allowances.json` itself
+  (`agent-vm doctor` does not list a file it refuses). Then remove the other
+  names before launching; find them from the mount point (for example, `$HOME`)
+  with `find "$HOME" -xdev -samefile <file>`. The launch-time check applies
+  regardless of content; any of those fields also invokes the read-time check.
 
 - **`RegisterNetDevice(IrqsExhausted)` at boot** — device capacity is host
   and runtime dependent. Drop a `--mount` to recover. Linux x86_64 uses a

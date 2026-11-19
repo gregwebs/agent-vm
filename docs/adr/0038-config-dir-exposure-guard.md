@@ -192,9 +192,10 @@ formal verification; CI's Verus gate is the contract source of truth.
 0.3.0 deliberately breaks launches from `$HOME`, writable `--mount ~` and
 `--mount ~/.config`, including users with no Pi installation. Run from a
 project, choose read-only, or bind a narrower source; move state with
-`AGENT_VM_STATE_DIR` when necessary. Hard-linked `config.toml` blocks every
-launch until other links are removed or the file is replaced with a copy.
-Non-launch verbs, including doctor, are unaffected.
+`AGENT_VM_STATE_DIR` when necessary. Hard-linked `config.toml` or
+`allowances.json` blocks every launch; review the file's launch-authorizing
+contents, then remove its other names before launching. Non-launch verbs,
+including doctor, are unaffected.
 
 Writable-bind routes to the credentials directory are guarded subject to the
 accepted gaps; credentials file hard links stay open (#319). This guard release
