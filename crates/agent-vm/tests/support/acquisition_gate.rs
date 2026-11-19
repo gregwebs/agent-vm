@@ -236,7 +236,13 @@ impl AcquisitionGate {
     /// acquisition) and single out one of them. `None` means the gate went quiet
     /// for [`BOUND`] or the child closed it.
     pub fn next(&mut self) -> Option<(AcquisitionStage, Checkpoint)> {
-        let stream = self.received.recv_timeout(BOUND).ok()?;
+        self.next_within(BOUND)
+    }
+
+    /// [`Self::next`] with an explicit quiet bound, for a pump that must not
+    /// wait the full [`BOUND`] once the child has stopped asking.
+    pub fn next_within(&mut self, within: Duration) -> Option<(AcquisitionStage, Checkpoint)> {
+        let stream = self.received.recv_timeout(within).ok()?;
         let mut line = String::new();
         BufReader::new(stream.try_clone().expect("clone the gate stream"))
             .read_line(&mut line)
@@ -280,6 +286,16 @@ impl Checkpoint {
     pub fn reply(self, reply: GateReply) {
         let mut stream = self.stream;
         writeln!(stream, "{}", reply.wire()).expect("write the gate reply");
+        stream.flush().expect("flush the gate reply");
+        let _ = stream.shutdown(Shutdown::Both);
+    }
+
+    /// Reply with a token the production gate answers with an acquisition error
+    /// at **any** stage: how a test makes one cache read fail without a
+    /// stage-matched fault. The token must be one the gate does not know.
+    pub fn reply_unexpected(self, token: &str) {
+        let mut stream = self.stream;
+        writeln!(stream, "{token}").expect("write the gate reply");
         stream.flush().expect("flush the gate reply");
         let _ = stream.shutdown(Shutdown::Both);
     }

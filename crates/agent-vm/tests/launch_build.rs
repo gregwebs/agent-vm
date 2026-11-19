@@ -22,6 +22,8 @@ use std::time::{Duration, Instant};
 
 use microsandbox_image::{GlobalCache, Reference};
 
+#[path = "support/acquisition_gate.rs"]
+mod acquisition_gate;
 #[path = "support/fake_docker.rs"]
 mod fake_docker;
 #[path = "support/fake_msb.rs"]
@@ -30,6 +32,7 @@ mod fake_msb;
 mod image_archive;
 mod support;
 
+use acquisition_gate::{AcquisitionGate, AcquisitionStage, GateReply, Peer};
 use image_archive::{ArchiveSpec, LayerContent, Written};
 
 fn agent_vm_bin() -> PathBuf {
@@ -98,9 +101,38 @@ impl Harness {
         self.set("FAKE_DOCKER_EXIT", code.to_string())
     }
 
-    /// Point the fake Docker at `written`'s archive.
+    /// Point the fake Docker at `written`'s archive, and have its probe report the
+    /// manifest digest a real Docker would report for that build (ADR-0071 §5
+    /// P1/P2: the probe's digest is the exported manifest's digest).
     fn replay(&mut self, written: &Written) -> &mut Self {
-        self.set("FAKE_DOCKER_ARCHIVE", written.path.clone())
+        self.set("FAKE_DOCKER_ARCHIVE", written.path.clone());
+        self.set("FAKE_DOCKER_PROBE_DIGEST", written.manifest_digest.clone())
+    }
+
+    /// What the fake probe's `--metadata-file` reports. `None` writes no file at
+    /// all, like a builder whose exporter reports nothing.
+    fn probe_reports(&mut self, digest: Option<&str>) -> &mut Self {
+        match digest {
+            Some(digest) => self.set("FAKE_DOCKER_PROBE_DIGEST", digest),
+            None => {
+                self.extra
+                    .push(("FAKE_DOCKER_PROBE_DIGEST".to_string(), None));
+                self
+            }
+        }
+    }
+
+    /// Turn on `launch_build`'s debug lines: the hit and every fallback are
+    /// specified to state themselves there (Q7, Q10), and nowhere else.
+    fn debug(&mut self) -> &mut Self {
+        self.set("RUST_LOG", "agent_vm::launch_build=debug")
+    }
+
+    /// Drop the harness's `AGENT_VM_DEBUG_CONFIG` opt-in, so stderr holds only
+    /// what a default launch prints.
+    fn default_stderr(&mut self) -> &mut Self {
+        self.extra.push(("AGENT_VM_DEBUG_CONFIG".to_string(), None));
+        self
     }
 
     /// Write a fresh OCI archive with `spec` under the harness's bin dir and
@@ -176,6 +208,11 @@ impl Harness {
         fake_docker::calls(&self.docker_log)
     }
 
+    /// What each Docker invocation read on stdin, in call order.
+    fn docker_stdin(&self) -> Vec<Vec<u8>> {
+        fake_docker::stdin_records(&self.stdin_log)
+    }
+
     fn pins_file(&self) -> PathBuf {
         self.home.join(".config/agent-vm/image-pins.json")
     }
@@ -229,6 +266,73 @@ fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
+/// Whether an invocation is the launch-build **probe**: only it passes a
+/// `--metadata-file` (ADR-0071).
+fn is_probe(call: &[OsString]) -> bool {
+    call.iter().any(|arg| arg == "--metadata-file")
+}
+
+/// A call's argv with its output group removed — `--output <VALUE>`, plus the
+/// probe's `--metadata-file <PATH>` — so a probe and an export compare as the
+/// same command except for where Docker sends the image (R2, Q10).
+fn without_output(call: &[OsString]) -> Vec<OsString> {
+    let at = call
+        .iter()
+        .position(|arg| arg == "--output")
+        .unwrap_or_else(|| panic!("a launch build always names an output: {call:?}"));
+    let end = if call.get(at + 2).is_some_and(|arg| arg == "--metadata-file") {
+        at + 4
+    } else {
+        at + 2
+    };
+    let mut rest = call.to_vec();
+    rest.drain(at..end);
+    rest
+}
+
+/// A probe invocation's `--metadata-file` path.
+fn probe_metadata(call: &[OsString]) -> PathBuf {
+    let at = call
+        .iter()
+        .position(|arg| arg == "--metadata-file")
+        .unwrap_or_else(|| panic!("not a probe invocation: {call:?}"));
+    PathBuf::from(&call[at + 1])
+}
+
+/// Pump the acquisition gate for one whole launch: refuse the first validated
+/// cache read with a reply the gate makes an error, let every other checkpoint
+/// through, and stop when the launch reports that create returned.
+///
+/// Returns whether a cache read was refused. A launch reaches `create-returned`
+/// even when `create` fails, so the pump always terminates with the child.
+fn refuse_the_first_cache_read(gate: &mut AcquisitionGate) -> bool {
+    let mut refused = false;
+    let mut answered = 0usize;
+    while let Some((stage, checkpoint)) = gate.next_within(Duration::from_secs(30)) {
+        answered += 1;
+        assert!(answered < 64, "the launch never stopped asking: {stage:?}");
+        if !refused && stage == AcquisitionStage::CacheValidated {
+            refused = true;
+            // An unknown reply is an acquisition error at any stage: a cache
+            // read that fails, which is the probe problem under test.
+            checkpoint.reply_unexpected("refuse-cache-read");
+        } else {
+            checkpoint.reply(GateReply::Continue);
+        }
+        if refused && stage == AcquisitionStage::CreateReturned {
+            break;
+        }
+    }
+    refused
+}
+
+/// A call's argv as lossy strings, for messages and flag positions.
+fn rendered(call: &[OsString]) -> Vec<String> {
+    call.iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect()
+}
+
 fn stderr_of(output: &Output) -> String {
     text(&output.stderr)
 }
@@ -238,6 +342,34 @@ fn code_of(output: &Output) -> i32 {
         .status
         .code()
         .unwrap_or_else(|| panic!("agent-vm died by signal: {:?}", output.status))
+}
+
+/// Every word the probe's own notices use. A default-stderr line naming any of
+/// them is a probe outcome, which Q7 keeps off that channel.
+const PROBE_WORDS: [&str; 6] = [
+    "launch-build",
+    "probe",
+    "buildx",
+    "metadata",
+    "digest",
+    "cached",
+];
+
+/// Assert `stderr` names nothing from [`PROBE_WORDS`].
+///
+/// The expected stream is not asserted in full: its temp paths, the sandbox
+/// name's process-id suffix and the host-dependent notices (git identity,
+/// credentials) vary per run and per host.
+fn assert_probe_silence(stderr: &str, what: &str) {
+    let lowered = stderr.to_lowercase();
+    let named: Vec<&str> = PROBE_WORDS
+        .into_iter()
+        .filter(|word| lowered.contains(word))
+        .collect();
+    assert!(
+        named.is_empty(),
+        "{what} names {named:?} outside the debug channel:\n{stderr}"
+    );
 }
 
 /// The `SandboxConfig` JSON the launcher dumps right before create.
@@ -308,37 +440,72 @@ fn builds_publishes_and_boots_the_built_digest() {
         "the launch must reach the SDK with a built image:\n{stderr}"
     );
 
-    // Docker saw exactly the owned flag set plus the file and the context.
+    // Docker saw the probe, then the export: the same owned flag set plus the
+    // file and the context, differing only in their output group.
     let calls = h.docker_calls();
-    assert_eq!(calls.len(), 1, "one build per launch: {calls:?}");
-    let argv: Vec<String> = calls[0]
-        .iter()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
-    assert_eq!(&argv[0..2], ["buildx", "build"], "{argv:?}");
-    assert!(
-        !argv.iter().any(|arg| arg == "-t" || arg == "--tag"),
-        "a launch build names no tag of its own: {argv:?}"
+    assert_eq!(
+        calls.len(),
+        2,
+        "a cold launch probes, then exports: {calls:?}"
     );
-    assert!(
-        !argv
+    assert!(is_probe(&calls[0]), "the probe runs first: {calls:?}");
+    assert!(!is_probe(&calls[1]), "the export runs second: {calls:?}");
+    assert_eq!(
+        without_output(&calls[0]),
+        without_output(&calls[1]),
+        "probe and export differ only in where Docker sends the image"
+    );
+    for (index, call) in calls.iter().enumerate() {
+        let argv = rendered(call);
+        assert_eq!(&argv[0..2], ["buildx", "build"], "call {index}: {argv:?}");
+        assert!(
+            !argv.iter().any(|arg| arg == "-t" || arg == "--tag"),
+            "call {index}: a launch build names no tag of its own: {argv:?}"
+        );
+        assert!(
+            !argv
+                .iter()
+                .any(|arg| arg.starts_with("--builder") || arg.starts_with("--progress")),
+            "call {index}: a launch build passes no builder/progress options: {argv:?}"
+        );
+        let file_position = argv
             .iter()
-            .any(|arg| arg.starts_with("--builder") || arg.starts_with("--progress")),
-        "a launch build passes no builder/progress options: {argv:?}"
-    );
-    let file_position = argv
+            .position(|arg| arg == "-f")
+            .unwrap_or_else(|| panic!("call {index}: no -f in {argv:?}"));
+        assert_eq!(
+            PathBuf::from(&argv[file_position + 1]),
+            h.dockerfile().canonicalize().unwrap(),
+            "call {index}: the Dockerfile is passed by absolute path: {argv:?}"
+        );
+        assert_eq!(
+            PathBuf::from(argv.last().unwrap()),
+            h.project.canonicalize().unwrap(),
+            "call {index}: the context is the Dockerfile's own directory: {argv:?}"
+        );
+    }
+    // The probe's own group: no image written anywhere, and one metadata file in
+    // this launch's private staging dir.
+    let probe = rendered(&calls[0]);
+    let output = probe
         .iter()
-        .position(|arg| arg == "-f")
-        .unwrap_or_else(|| panic!("no -f in {argv:?}"));
+        .position(|arg| arg == "--output")
+        .expect("the probe names its output");
     assert_eq!(
-        PathBuf::from(&argv[file_position + 1]),
-        h.dockerfile().canonicalize().unwrap(),
-        "the Dockerfile is passed by absolute path: {argv:?}"
+        probe[output + 1],
+        "type=image,oci-mediatypes=true,store=false",
+        "the probe writes no Docker-store image and reports the OCI digest: {probe:?}"
     );
-    assert_eq!(
-        PathBuf::from(argv.last().unwrap()),
-        h.project.canonicalize().unwrap(),
-        "the context is the Dockerfile's own directory: {argv:?}"
+    let metadata = probe_metadata(&calls[0]);
+    assert_eq!(metadata.file_name().unwrap(), "probe.json");
+    assert!(
+        metadata.starts_with(h.msb_home().join("tmp")),
+        "the probe's metadata lives in the staging root: {}",
+        metadata.display()
+    );
+    assert!(
+        !metadata.exists(),
+        "the staging dir holding the probe's metadata is gone afterwards: {}",
+        metadata.display()
     );
 
     // The archive landed in the cache under the internal tag, at its own digest.
@@ -397,16 +564,15 @@ fn context_is_the_typed_parent() {
     );
 
     let calls = h.docker_calls();
-    assert_eq!(calls.len(), 1, "{calls:?}");
-    let argv: Vec<String> = calls[0]
-        .iter()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
-    assert_eq!(
-        PathBuf::from(argv.last().unwrap()),
-        h.project.canonicalize().unwrap().join("sub"),
-        "the context is the Dockerfile's own directory: {argv:?}"
-    );
+    assert_eq!(calls.len(), 2, "probe + export: {calls:?}");
+    for call in &calls {
+        let argv = rendered(call);
+        assert_eq!(
+            PathBuf::from(argv.last().unwrap()),
+            h.project.canonicalize().unwrap().join("sub"),
+            "the context is the Dockerfile's own directory: {argv:?}"
+        );
+    }
 }
 
 /// `-f` gets the **typed** path and the context its typed parent, even when the
@@ -433,25 +599,24 @@ fn dockerfile_argument_is_the_typed_path_through_a_symlink() {
     // names, which is what canonicalizing here would hand Docker.
     let cwd = h.project.canonicalize().unwrap();
     let calls = h.docker_calls();
-    assert_eq!(calls.len(), 1, "{calls:?}");
-    let argv: Vec<String> = calls[0]
-        .iter()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
-    let file_position = argv
-        .iter()
-        .position(|arg| arg == "-f")
-        .unwrap_or_else(|| panic!("no -f in {argv:?}"));
-    assert_eq!(
-        PathBuf::from(&argv[file_position + 1]),
-        cwd.join("link/Dockerfile"),
-        "the typed path, not the symlink target: {argv:?}"
-    );
-    assert_eq!(
-        PathBuf::from(argv.last().unwrap()),
-        cwd.join("link"),
-        "the context is the typed parent: {argv:?}"
-    );
+    assert_eq!(calls.len(), 2, "probe + export: {calls:?}");
+    for call in &calls {
+        let argv = rendered(call);
+        let file_position = argv
+            .iter()
+            .position(|arg| arg == "-f")
+            .unwrap_or_else(|| panic!("no -f in {argv:?}"));
+        assert_eq!(
+            PathBuf::from(&argv[file_position + 1]),
+            cwd.join("link/Dockerfile"),
+            "the typed path, not the symlink target: {argv:?}"
+        );
+        assert_eq!(
+            PathBuf::from(argv.last().unwrap()),
+            cwd.join("link"),
+            "the context is the typed parent: {argv:?}"
+        );
+    }
 
     // Only the *tag* is hashed from the canonical path, so the same Dockerfile
     // reached two ways is one cache entry.
@@ -518,6 +683,11 @@ fn rebuild_boots_new_content_without_prompt() {
         !h.pins_file().exists(),
         "a rebuild writes no image pin either"
     );
+    assert_eq!(
+        h.docker_calls().len(),
+        4,
+        "two launches, each probe + export"
+    );
 }
 
 /// A well-formed `AGENT_VM_IMAGE_TAG` is ignored rather than conflicting.
@@ -538,11 +708,7 @@ fn env_image_is_ignored() {
         format!("{}@{}", h.internal_repo(), written.manifest_digest),
         "--dockerfile outranks AGENT_VM_IMAGE_TAG"
     );
-    assert_eq!(
-        h.docker_calls().len(),
-        1,
-        "the build still ran exactly once"
-    );
+    assert_eq!(h.docker_calls().len(), 2, "probe + export, once");
 }
 
 /// On a direct route the launcher's stdout carries nothing of Docker's.
@@ -804,10 +970,432 @@ fn docker_never_sees_launcher_stdin() {
         "the fake Docker must have run:\n{}",
         text(&out.stderr)
     );
+    let calls = h.docker_calls();
+    let records = h.docker_stdin();
     assert_eq!(
-        fs::read(&h.stdin_log).unwrap(),
+        calls.len(),
+        2,
+        "a cold launch probes, then exports: {calls:?}"
+    );
+    assert!(is_probe(&calls[0]), "the probe runs first: {calls:?}");
+    assert_eq!(
+        records.len(),
+        calls.len(),
+        "one stdin record per Docker call: {records:?}"
+    );
+    for (index, (call, record)) in calls.iter().zip(&records).enumerate() {
+        assert_eq!(
+            record,
+            b"",
+            "the {} (call {index}) must receive /dev/null, not the launcher's reserved input",
+            if is_probe(call) { "probe" } else { "export" }
+        );
+    }
+
+    // The same launch again is a hit: one more call, and its probe is equally
+    // starved of the launcher's stdin.
+    let mut cmd = h.base_command();
+    cmd.args(["--dockerfile", "Dockerfile", "--", "cat", "-"]);
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn agent-vm");
+    {
+        use std::io::Write as _;
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        stdin.write_all(b"payload\n").expect("write payload");
+    }
+    let out = child.wait_with_output().expect("wait for agent-vm");
+    let calls = h.docker_calls();
+    let records = h.docker_stdin();
+    assert_eq!(calls.len(), 3, "the repeat launch probes once: {calls:?}");
+    assert!(is_probe(&calls[2]), "and that call is the probe");
+    assert_eq!(records.len(), 3, "one stdin record per Docker call");
+    assert_eq!(
+        records[2],
         b"",
-        "Docker must receive /dev/null, not the launcher's reserved input"
+        "the hit's probe must receive /dev/null too:\n{}",
+        text(&out.stderr)
+    );
+}
+
+/// AC1: a repeat launch of an unchanged Dockerfile makes exactly one Docker
+/// call — the probe — and boots the cached `repo@D` with no export, no
+/// publication, no tag move and no pin.
+#[test]
+fn a_repeat_launch_boots_the_cached_result_without_exporting() {
+    let mut h = Harness::new();
+    let written = h.replay_spec("built.tar", &ArchiveSpec::default());
+    h.debug();
+
+    let first = h.run(&["--dockerfile", "Dockerfile", "--", "true"]);
+    assert!(
+        stderr_of(&first).contains("[debug] sandbox config JSON: "),
+        "the cold launch must reach the SDK:\n{}",
+        stderr_of(&first)
+    );
+    let calls = h.docker_calls().len();
+    assert_eq!(calls, 2, "a cold launch probes, then exports");
+
+    let second = h.run(&["--dockerfile", "Dockerfile", "--", "true"]);
+    let stderr = stderr_of(&second);
+    assert!(
+        stderr.contains("[debug] sandbox config JSON: "),
+        "the warm launch must reach the SDK:\n{stderr}"
+    );
+    let all = h.docker_calls();
+    assert_eq!(all.len(), 3, "the warm launch makes one call: {all:?}");
+    assert!(
+        is_probe(&all[2]),
+        "and that call is the probe: {:?}",
+        rendered(&all[2])
+    );
+    assert_eq!(
+        sdk_image(&stderr),
+        format!("{}@{}", h.internal_repo(), written.manifest_digest),
+        "the hit boots the probed digest"
+    );
+    assert_eq!(
+        debug_config_json(&stderr)["pull_policy"],
+        "Never",
+        "and never contacts a registry"
+    );
+    assert!(
+        stderr.contains("==> Boot image: --dockerfile Dockerfile"),
+        "the banner is unchanged by a hit:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("launch-build probe result is cached; skipping the export"),
+        "a hit says so on the debug channel:\n{stderr}"
+    );
+    assert!(
+        !h.pins_file().exists() && !h.home.join(".config/agent-vm").exists(),
+        "a hit writes nothing under ~/.config/agent-vm"
+    );
+    let left = entries(&h.msb_home().join("tmp"));
+    assert!(
+        left.iter().all(|name| !name.starts_with("image-")),
+        "a hit leaves no staging directory: {left:?}"
+    );
+}
+
+/// AC4: A → B → A. The third launch boots A's cached digest, with one call, and
+/// leaves the internal tag naming B (ADR-0071 §2, Q6).
+#[test]
+fn a_reverted_dockerfile_boots_its_cached_digest_and_leaves_the_tag() {
+    let mut h = Harness::new();
+    let a = h.replay_spec(
+        "a.tar",
+        &ArchiveSpec {
+            layer: LayerContent::Valid,
+            marker: "a".to_string(),
+            ..ArchiveSpec::default()
+        },
+    );
+    h.run(&["--dockerfile", "Dockerfile", "--", "true"]);
+    let b = h.replay_spec(
+        "b.tar",
+        &ArchiveSpec {
+            layer: LayerContent::Valid,
+            marker: "b".to_string(),
+            ..ArchiveSpec::default()
+        },
+    );
+    assert_ne!(a.manifest_digest, b.manifest_digest);
+    h.run(&["--dockerfile", "Dockerfile", "--", "true"]);
+    assert_eq!(
+        manifest_digest_of(&h.cache_dir(), &h.internal_tag()).as_deref(),
+        Some(b.manifest_digest.as_str())
+    );
+
+    // Back to A: the bytes from the first launch are still cached.
+    h.replay(&a);
+    let out = h.run(&["--dockerfile", "Dockerfile", "--", "true"]);
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("[debug] sandbox config JSON: "),
+        "the reverted launch must reach the SDK:\n{stderr}"
+    );
+    let calls = h.docker_calls();
+    assert_eq!(
+        calls.len(),
+        5,
+        "probe+export, probe+export, probe: {calls:?}"
+    );
+    assert!(is_probe(&calls[4]), "the last call is the probe");
+    assert_eq!(
+        sdk_image(&stderr),
+        format!("{}@{}", h.internal_repo(), a.manifest_digest),
+        "the reverted launch boots A, not the tag"
+    );
+    assert_eq!(
+        manifest_digest_of(&h.cache_dir(), &h.internal_tag()).as_deref(),
+        Some(b.manifest_digest.as_str()),
+        "a hit leaves the internal tag naming B"
+    );
+}
+
+/// F7: a probe whose digest the export disagrees with can never boot wrong
+/// content: every launch misses, and the debug line names both digests.
+#[test]
+fn a_probe_digest_the_export_disagrees_with_is_logged() {
+    let mut h = Harness::new();
+    let written = h.replay_spec("built.tar", &ArchiveSpec::default());
+    let invented = format!("sha256:{}", "a".repeat(64));
+    h.debug().probe_reports(Some(&invented));
+
+    for launch in 1..=2 {
+        let out = h.run(&["--dockerfile", "Dockerfile", "--", "true"]);
+        let stderr = stderr_of(&out);
+        assert!(
+            stderr.contains("[debug] sandbox config JSON: "),
+            "launch {launch} must reach the SDK:\n{stderr}"
+        );
+        assert_eq!(
+            sdk_image(&stderr),
+            format!("{}@{}", h.internal_repo(), written.manifest_digest),
+            "launch {launch} boots the export's verified digest"
+        );
+        assert!(
+            stderr.contains("launch-build probe and export digests differ"),
+            "launch {launch} names the disagreement:\n{stderr}"
+        );
+        assert!(
+            stderr.contains(&invented) && stderr.contains(&written.manifest_digest),
+            "launch {launch} names both digests:\n{stderr}"
+        );
+    }
+    assert_eq!(
+        h.docker_calls().len(),
+        4,
+        "a disagreement always degrades to probe + export: {:?}",
+        h.docker_calls()
+    );
+}
+
+/// AC5: a probe that reports nothing usable is a probe *problem*, not a build
+/// failure — after a zero exit, agent-vm exports and boots the exported result,
+/// saying so only on the debug channel.
+#[test]
+fn a_probe_without_a_digest_falls_back_to_the_export() {
+    for report in [None, Some("not-a-digest"), Some("sha256:abc")] {
+        let mut h = Harness::new();
+        let written = h.replay_spec("built.tar", &ArchiveSpec::default());
+        h.debug().probe_reports(report);
+
+        for launch in 1..=2 {
+            let out = h.run(&["--dockerfile", "Dockerfile", "--", "true"]);
+            let stderr = stderr_of(&out);
+            assert!(
+                stderr.contains("[debug] sandbox config JSON: "),
+                "launch {launch} with probe report {report:?} must reach the SDK:\n{stderr}"
+            );
+            // The harness fails at the faked runtime, as every row here does; what
+            // matters is that the *build* did not fail (AC5's baseline status).
+            assert_eq!(
+                code_of(&out),
+                125,
+                "launch {launch} fails only at the faked runtime:\n{stderr}"
+            );
+            assert!(
+                !stderr.contains("docker buildx build failed"),
+                "a probe problem is never the build's failure:\n{stderr}"
+            );
+            assert_eq!(
+                sdk_image(&stderr),
+                format!("{}@{}", h.internal_repo(), written.manifest_digest),
+                "launch {launch} boots the exported result"
+            );
+            assert!(
+                stderr.contains("launch-build probe reported no usable digest; exporting"),
+                "launch {launch} says why it exported:\n{stderr}"
+            );
+        }
+        assert_eq!(
+            h.docker_calls().len(),
+            4,
+            "each launch still probes and exports: {:?}",
+            h.docker_calls()
+        );
+    }
+}
+
+/// F6 through the whole launch: a probe cache read that *fails* (not a miss) is
+/// a probe problem, not a failure. The export really runs and the launch boots
+/// the exported result.
+#[test]
+fn a_failed_probe_cache_read_still_exports_and_boots() {
+    let mut h = Harness::new();
+    let written = h.replay_spec("built.tar", &ArchiveSpec::default());
+    h.debug();
+    // Warm the cache, so this launch's probe read finds the digest and can fail
+    // on it instead of missing.
+    h.run(&["--dockerfile", "Dockerfile", "--", "true"]);
+    assert_eq!(h.docker_calls().len(), 2, "probe + export, once");
+
+    let mut gate = AcquisitionGate::new(&h.bin);
+    let mut cmd = h.base_command();
+    // The fine-grained stages, so the refusal lands on the cache read itself.
+    cmd.env("AGENT_VM_TEST_ACQUIRE_GATE_DETAIL", "1");
+    let peer = Peer::spawn(cmd, &gate, &["--dockerfile", "Dockerfile", "--", "true"]);
+    assert!(
+        refuse_the_first_cache_read(&mut gate),
+        "the probe's cache read must reach a validated entry to fail on"
+    );
+    let out = peer.wait();
+
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("[debug] sandbox config JSON: "),
+        "a failed probe cache read must still reach the SDK:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("launch-build probe cache read failed; exporting"),
+        "the fallback says why it exported:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("docker buildx build failed"),
+        "a cache read is never the build's failure:\n{stderr}"
+    );
+    assert_eq!(
+        sdk_image(&stderr),
+        format!("{}@{}", h.internal_repo(), written.manifest_digest),
+        "the launch boots the exported result"
+    );
+    let calls = h.docker_calls();
+    assert_eq!(
+        calls.len(),
+        4,
+        "the warm launch probes, then exports: {calls:?}"
+    );
+    assert!(
+        is_probe(&calls[2]),
+        "the warm launch's first call is its probe"
+    );
+    assert!(
+        !is_probe(&calls[3]),
+        "and the second is the export the failed read fell back to"
+    );
+}
+
+/// R7: after a zero probe exit, metadata that exists but cannot be read falls
+/// back to the export. Silent, apart from the debug line.
+#[test]
+fn an_unreadable_probe_metadata_file_falls_back_to_the_export() {
+    let mut h = Harness::new();
+    let written = h.replay_spec("built.tar", &ArchiveSpec::default());
+    h.debug().set("FAKE_DOCKER_PROBE_METADATA_UNREADABLE", "1");
+
+    let out = h.run(&["--dockerfile", "Dockerfile", "--", "true"]);
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("[debug] sandbox config JSON: "),
+        "an unreadable metadata file must still reach the SDK:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("docker buildx build failed"),
+        "an unreadable metadata file is never the build's failure:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("launch-build probe reported no usable digest; exporting"),
+        "the fallback says why it exported:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("the probe metadata file could not be read"),
+        "and names the unreadable file as the reason:\n{stderr}"
+    );
+    assert_eq!(
+        sdk_image(&stderr),
+        format!("{}@{}", h.internal_repo(), written.manifest_digest),
+        "the launch boots the exported result"
+    );
+    assert_eq!(
+        h.docker_calls().len(),
+        2,
+        "probe + export: {:?}",
+        h.docker_calls()
+    );
+}
+
+/// Q7: nothing about the probe is user-visible. On default stderr a miss, a hit
+/// and a fallback each print none of the probe's lines.
+#[test]
+fn probe_outcomes_are_silent_on_default_stderr() {
+    // A miss: the first launch of new content, which exports. This is the arm
+    // whose only probe notice is "not cached; exporting".
+    let mut hit = Harness::new();
+    hit.default_stderr();
+    hit.replay_spec("built.tar", &ArchiveSpec::default());
+    let out = hit.run(&["--dockerfile", "Dockerfile", "--", "true"]);
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("==> Boot image: --dockerfile Dockerfile"),
+        "the first launch ran:\n{stderr}"
+    );
+    assert_probe_silence(&stderr, "a miss");
+
+    // A hit: the second launch of unchanged content. No debug dump here: the
+    // whole stream is checked, and the dump legitimately spells
+    // `manifest_digest` and `cache`.
+    let out = hit.run(&["--dockerfile", "Dockerfile", "--", "true"]);
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("==> Boot image: --dockerfile Dockerfile"),
+        "the warm launch ran:\n{stderr}"
+    );
+    assert_probe_silence(&stderr, "a hit");
+
+    // A fallback: a probe that reports nothing usable, every launch.
+    let mut fallback = Harness::new();
+    fallback.default_stderr();
+    fallback.replay_spec("built.tar", &ArchiveSpec::default());
+    fallback.probe_reports(None);
+    let out = fallback.run(&["--dockerfile", "Dockerfile", "--", "true"]);
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("==> Boot image: --dockerfile Dockerfile"),
+        "the falling-back launch ran:\n{stderr}"
+    );
+    assert_probe_silence(&stderr, "a fallback");
+}
+
+/// F8: Docker says the build succeeded and the *export* then fails. That is the
+/// launcher's failure, with Docker's own status — the probe is never treated as
+/// the build.
+#[test]
+fn an_export_failure_after_a_probe_is_the_launchers_failure() {
+    let mut h = Harness::new();
+    h.replay_spec("built.tar", &ArchiveSpec::default());
+    // A digest the cache cannot hold, so the probe cannot stand in for the export.
+    h.probe_reports(Some(&format!("sha256:{}", "a".repeat(64))))
+        .set("FAKE_DOCKER_EXPORT_EXIT", "4");
+
+    let out = h.run(&["--dockerfile", "Dockerfile", "--", "true"]);
+    let stderr = stderr_of(&out);
+    assert_eq!(code_of(&out), 125, "{stderr}");
+    assert!(
+        stderr.contains("docker buildx build failed (exit 4)"),
+        "the export's own status is reported:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("[debug] sandbox config JSON: "),
+        "a failed export never reaches the SDK:\n{stderr}"
+    );
+    assert_eq!(
+        h.docker_calls().len(),
+        2,
+        "the probe and the export, and nothing more: {:?}",
+        h.docker_calls()
+    );
+    assert_eq!(
+        manifest_digest_of(&h.cache_dir(), &h.internal_tag()),
+        None,
+        "a failed export publishes nothing, even though the probe reported a digest"
+    );
+    let tmp = h.msb_home().join("tmp");
+    let left = entries(&tmp);
+    assert!(
+        left.iter().all(|name| !name.starts_with("image-")),
+        "a failed export leaves no staging directory: {left:?}"
     );
 }
 
@@ -849,6 +1437,11 @@ fn failed_build_direct_exits_125_before_any_session_state() {
         None,
         "a failed build publishes nothing"
     );
+    assert_eq!(
+        h.docker_calls().len(),
+        1,
+        "the failing probe is the build's failure, and nothing is re-run"
+    );
 }
 
 /// The same failure on the tool route is exit 1, and still no banner.
@@ -869,6 +1462,11 @@ fn failed_build_tool_route_exits_1() {
         !stderr_of(&out).contains("==> Boot image:"),
         "a failed build never reaches the banner:\n{}",
         stderr_of(&out)
+    );
+    assert_eq!(
+        h.docker_calls().len(),
+        1,
+        "the failing probe is the build's failure, and nothing is re-run"
     );
 }
 

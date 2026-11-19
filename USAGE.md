@@ -1527,12 +1527,16 @@ like `--image`. The build context is the Dockerfile's own directory (`./` for a
 Dockerfile in the current directory), and both paths are resolved relative to
 your current directory. There is no separate context argument.
 
-This is the one launch that runs Docker (ADR-0061). Every launch build builds;
-Docker's own BuildKit cache is the only reuse, and agent-vm computes no source
-hash to skip work. The result is published into agent-vm's own image cache under
-an internal name, `agent-vm.invalid/dockerfile/<sha256 of the Dockerfile's
-canonical path>:latest`, and this launch boots exactly the content it just built
-— not whatever that name holds later.
+This is the one launch that runs Docker (ADR-0061, ADR-0071). Every launch
+build builds, and agent-vm computes no source hash to skip work: Docker's own
+BuildKit cache decides what is rebuilt. Docker first reports the built image's
+digest without writing an image anywhere. If agent-vm's image cache already holds
+that exact content for this Dockerfile, the launch boots it without re-sending
+the image. Otherwise Docker exports the image and it is published into agent-vm's
+own image cache under an internal name, `agent-vm.invalid/dockerfile/<sha256 of
+the Dockerfile's canonical path>:latest`. Either way this launch boots exactly
+the content it just built, not whatever that name holds later. A build that
+changed shows Docker's progress twice: the digest run, then the export.
 
 A launch build writes no `image-pins.json` entry and prompts for nothing: typing
 the flag is the consent to build and boot that result, so there is no approval to

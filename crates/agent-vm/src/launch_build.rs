@@ -5,9 +5,16 @@
 //! resolve   d/Dockerfile → /home/u/p/d/Dockerfile (canonical)
 //!           tag = agent-vm.invalid/dockerfile/3f9a…e1:latest   (sha256 of canonical bytes)
 //!           context = /home/u/p/d                           (typed parent, absolute)
-//! docker buildx build -f /home/u/p/d/Dockerfile --platform linux/arm64
-//!           --provenance=false --sbom=false --output type=oci,dest=- /home/u/p/d
-//!           stdin=/dev/null  stdout=MSB_HOME/tmp/image-XXXX/result.tar  stderr=inherit
+//! probe     docker buildx build -f /home/u/p/d/Dockerfile --platform linux/arm64
+//!           --provenance=false --sbom=false
+//!           --output type=image,oci-mediatypes=true,store=false
+//!           --metadata-file MSB_HOME/tmp/image-XXXX/probe.json /home/u/p/d
+//!           stdin=/dev/null  stdout=/dev/null  stderr=inherit    exit≠0 → launcher failure, nothing re-run
+//! reuse     probe.json containerimage.digest = sha256:abcd…
+//!           read repo@sha256:abcd…, CachedOnly (shared barrier, released)
+//!           present → BuiltImage(repo@sha256:abcd…); tag untouched; skip to "==> Boot image"
+//! export    (on a miss) same argv but --output type=oci,dest=-
+//!           stdout=MSB_HOME/tmp/image-XXXX/result.tar
 //! publish   tag → digest sha256:abcd…   (exclusive barrier, then released)
 //! read back tag, CachedOnly, digest must == sha256:abcd…  → BuiltImage(repo@sha256:abcd…)
 //! ==> Boot image: --dockerfile d/Dockerfile
@@ -23,15 +30,16 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::boot_image::BootImage;
 use crate::boot_image::ImageLabel;
-use crate::image_build::{self, BuildOptions, DockerBuild};
-use crate::image_pin::BuiltImage;
+use crate::image_build::{self, BuildOptions, DockerBuild, ProbeRun, ProbeUnreported};
+use crate::image_pin::{BuiltImage, ManifestDigest, ProbedCache};
 use crate::image_publish::{ImageTarget, PublishPurpose, ResultReference};
 use crate::one_line;
 
 const REPOSITORY: &str = "agent-vm.invalid/dockerfile";
 const LAUNCH_BUILD_HINT: &str = "this needs a working Docker with buildx and a builder that \
-supports `--output type=oci` (set `BUILDX_BUILDER` to pick one); for other build options, build \
-with `agent-vm image build` and launch the result with `--image`";
+supports both of this build's outputs: `--output type=image,oci-mediatypes=true,store=false` for the \
+probe and `--output type=oci` for the export (set `BUILDX_BUILDER` to pick one); for other build \
+options, build with `agent-vm image build` and launch the result with `--image`";
 
 /// `--dockerfile` typed alongside a typed `--image`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,32 +123,52 @@ impl LaunchBuild {
         )
     }
 
-    /// Docker → stage → publish → verify. Runs before the banner (ADR-0061 §8).
+    /// Docker could not be run at all.
+    fn running_docker(&self) -> String {
+        format!(
+            "running `docker buildx build` for --dockerfile {}; {LAUNCH_BUILD_HINT}",
+            one_line::path(&self.typed)
+        )
+    }
+
+    /// Docker ran and reported failure. Never followed by an export: Docker's
+    /// verdict is final (ADR-0061 §11, ADR-0071 §5).
+    fn build_failed(&self, exit: i32) -> anyhow::Error {
+        anyhow!(
+            "docker buildx build failed (exit {exit}) for --dockerfile {}; nothing was booted; {LAUNCH_BUILD_HINT}",
+            one_line::path(&self.typed)
+        )
+    }
+
+    /// Probe → (cached: done) → export → publish → verify. Runs before the banner
+    /// (ADR-0061 §8, ADR-0071).
     pub(crate) async fn build(&self, label: &ImageLabel) -> Result<BuiltImage> {
         let target = ImageTarget::resolve().await?;
         let staging = target.stage()?;
-        let exit = image_build::export_archive(
-            &DockerBuild {
-                dockerfile: Some(self.dockerfile.as_os_str()),
-                context: self.context.as_os_str(),
-                options: &BuildOptions::default(),
-            },
-            staging.writer()?,
-            Stdio::null(),
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "running `docker buildx build` for --dockerfile {}; {LAUNCH_BUILD_HINT}",
-                one_line::path(&self.typed)
-            )
-        })?;
+        let options = BuildOptions::default();
+        let docker = DockerBuild {
+            dockerfile: Some(self.dockerfile.as_os_str()),
+            context: self.context.as_os_str(),
+            options: &options,
+        };
+        let reported = match image_build::probe(&docker, &staging.probe_metadata_path())
+            .await
+            .with_context(|| self.running_docker())?
+        {
+            // Docker's verdict is final: a failing step is never re-run (ADR-0071 §5).
+            ProbeRun::Failed(exit) => return Err(self.build_failed(exit)),
+            ProbeRun::Built(reported) => reported,
+        };
+        let probed = match reuse(&self.result, reported, label).await {
+            Reuse::Cached(built) => return Ok(built), // `staging` drops here too (R18)
+            Reuse::Export { probed } => probed,
+        };
+        let exit = image_build::export_archive(&docker, staging.writer()?, Stdio::null())
+            .await
+            .with_context(|| self.running_docker())?;
         if exit != 0 {
             // Never import from a command that reported failure (same rule as `image build`).
-            bail!(
-                "docker buildx build failed (exit {exit}) for --dockerfile {}; nothing was booted; {LAUNCH_BUILD_HINT}",
-                one_line::path(&self.typed)
-            );
+            return Err(self.build_failed(exit));
         }
         let published = target
             .publish(
@@ -155,6 +183,15 @@ impl LaunchBuild {
                     one_line::path(&self.typed)
                 )
             })?;
+        if let Some(probed) = &probed
+            && probed != published.digest()
+        {
+            tracing::debug!(
+                %probed,
+                published = %published.digest(),
+                "launch-build probe and export digests differ"
+            );
+        }
         #[allow(clippy::disallowed_methods)]
         // A launch build boots its own result unpinned; typing --dockerfile is the consent (ADR-0061 §6).
         let built = crate::image_pin::read_back_unpinned(&published, label)
@@ -167,6 +204,60 @@ impl LaunchBuild {
             })?;
         Ok(built)
         // `staging` drops on every return above (success or `?`), removing the temp dir (R18).
+    }
+}
+
+/// What a successful probe lets this launch do (ADR-0071).
+#[derive(Debug)]
+enum Reuse {
+    /// The probed result is already cached: boot it; no export, no publication.
+    Cached(BuiltImage),
+    /// Export and publish (ADR-0061 §7). `probed` is kept only for the debug
+    /// comparison.
+    Export { probed: Option<ManifestDigest> },
+}
+
+/// Decide what a successful probe allows. Never fails: every problem here is a
+/// probe problem, handled by exporting (ADR-0071 §5). Docker's own verdict was
+/// already taken in `LaunchBuild::build`.
+async fn reuse(
+    result: &ResultReference,
+    reported: Result<ManifestDigest, ProbeUnreported>,
+    label: &ImageLabel,
+) -> Reuse {
+    let probed = match reported {
+        Ok(digest) => digest,
+        Err(reason) => {
+            tracing::debug!(%reason, "launch-build probe reported no usable digest; exporting");
+            return Reuse::Export { probed: None };
+        }
+    };
+    #[allow(clippy::disallowed_methods)]
+    // A launch build boots its own probed result unpinned, as it boots its export (ADR-0061 §6, ADR-0071).
+    let cached = crate::image_pin::cached_unpinned(result, &probed, label).await;
+    match cached {
+        Ok(ProbedCache::Cached(built)) => {
+            tracing::debug!(digest = %probed, "launch-build probe result is cached; skipping the export");
+            Reuse::Cached(built)
+        }
+        Ok(ProbedCache::Miss) => {
+            tracing::debug!(digest = %probed, "launch-build probe result is not cached; exporting");
+            Reuse::Export {
+                probed: Some(probed),
+            }
+        }
+        // Handled by exporting: the export path's own reads report a cache that is
+        // really broken.
+        Err(error) => {
+            tracing::debug!(
+                digest = %probed,
+                error = %format_args!("{error:#}"),
+                "launch-build probe cache read failed; exporting"
+            );
+            Reuse::Export {
+                probed: Some(probed),
+            }
+        }
     }
 }
 
@@ -184,8 +275,12 @@ fn internal_reference(canonical: &Path) -> Result<ResultReference> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // the caching seam under test is the ban's target
 mod tests {
     use super::*;
+    use crate::image_publish::test_archive;
+    use crate::image_publish::{ImageTarget, PublishPurpose};
+    use microsandbox::sandbox::PullPolicy;
 
     #[test]
     fn resolve_from_paths_contexts_and_symlinks() {
@@ -308,6 +403,133 @@ mod tests {
             shown.contains("\\x0a"),
             "the newline must render as \\x0a: {shown}"
         );
+    }
+
+    /// A cache holding a fixture archive, isolated from the developer's own.
+    async fn cached_fixture(marker: &str) -> (ImageTarget, ResultReference, String) {
+        let target = ImageTarget::resolve().await.unwrap();
+        let archive_dir = tempfile::tempdir().unwrap();
+        let written = test_archive::write(
+            &archive_dir.path().join("a.tar"),
+            &test_archive::ArchiveSpec {
+                marker: marker.to_string(),
+                ..Default::default()
+            },
+        );
+        let result = internal_reference(Path::new("/p/Dockerfile")).unwrap();
+        let published = target
+            .publish(
+                &written.path,
+                &result,
+                PublishPurpose::LaunchBuild {
+                    typed: Path::new("Dockerfile"),
+                },
+            )
+            .await
+            .unwrap();
+        // The read-back is what preserves `repo@digest` metadata, which is the
+        // only thing a later probe hit can find (ADR-0071 §2).
+        let label = ImageLabel::for_result_reference(result.as_str());
+        crate::image_pin::read_back_unpinned(&published, &label)
+            .await
+            .unwrap();
+        (target, result, written.manifest_digest)
+    }
+
+    /// A hit is `Reuse::Cached`, and what it boots is exactly `repo@D`.
+    #[tokio::test]
+    async fn reuse_boots_a_cached_probe_digest() {
+        let mut env = crate::test_env::guard();
+        let home = tempfile::tempdir().unwrap();
+        env.set_var("HOME", home.path());
+        let msb_home = tempfile::tempdir().unwrap();
+        env.set_var("MSB_HOME", msb_home.path());
+
+        let (_target, result, digest) = cached_fixture("cached").await;
+        let label = ImageLabel::for_result_reference(result.as_str());
+        let probed = ManifestDigest::parse(&digest).unwrap();
+
+        let reused = reuse(&result, Ok(probed.clone()), &label).await;
+        let Reuse::Cached(built) = reused else {
+            panic!("a cached probe digest must be reused, got {reused:?}");
+        };
+        let prepared = crate::image_pin::prepare_unpinned(&built, &label)
+            .await
+            .unwrap();
+        let repo = result.as_str().split(':').next().unwrap();
+        assert_eq!(
+            prepared.sdk_reference(),
+            format!("{repo}@{digest}"),
+            "the hit boots the probed digest itself"
+        );
+        assert_eq!(prepared.pull_policy(), PullPolicy::Never);
+        assert!(prepared.is_cache_only());
+        assert!(!home.path().join(".config").exists());
+    }
+
+    /// A miss is `Reuse::Export`, carrying the digest only for the debug line.
+    #[tokio::test]
+    async fn reuse_exports_an_uncached_digest() {
+        let mut env = crate::test_env::guard();
+        let home = tempfile::tempdir().unwrap();
+        env.set_var("HOME", home.path());
+        let msb_home = tempfile::tempdir().unwrap();
+        env.set_var("MSB_HOME", msb_home.path());
+
+        let result = internal_reference(Path::new("/p/Dockerfile")).unwrap();
+        let label = ImageLabel::for_result_reference(result.as_str());
+        let probed = ManifestDigest::parse(&format!("sha256:{}", "b".repeat(64))).unwrap();
+
+        match reuse(&result, Ok(probed.clone()), &label).await {
+            Reuse::Export {
+                probed: Some(carried),
+            } => assert_eq!(carried, probed),
+            other => panic!("an uncached digest must export, got {other:?}"),
+        }
+    }
+
+    /// A probe problem (here: nothing reported) exports, and carries no digest.
+    #[tokio::test]
+    async fn reuse_exports_when_the_probe_reported_nothing() {
+        let mut env = crate::test_env::guard();
+        let home = tempfile::tempdir().unwrap();
+        env.set_var("HOME", home.path());
+        let msb_home = tempfile::tempdir().unwrap();
+        env.set_var("MSB_HOME", msb_home.path());
+
+        let result = internal_reference(Path::new("/p/Dockerfile")).unwrap();
+        let label = ImageLabel::for_result_reference(result.as_str());
+
+        match reuse(&result, Err(ProbeUnreported::NoDigest), &label).await {
+            Reuse::Export { probed: None } => {}
+            other => panic!("an unreported digest must export, got {other:?}"),
+        }
+    }
+
+    /// A cache that cannot be read exports too: the decision never panics and
+    /// never fails a launch.
+    #[tokio::test]
+    async fn reuse_exports_when_the_cache_cannot_be_read() {
+        let mut env = crate::test_env::guard();
+        let home = tempfile::tempdir().unwrap();
+        env.set_var("HOME", home.path());
+        let msb_home = tempfile::tempdir().unwrap();
+        env.set_var("MSB_HOME", msb_home.path());
+
+        let target = ImageTarget::resolve().await.unwrap();
+        // A cache whose shared barrier cannot be opened. The fault is undone on
+        // drop for the rest of this test binary.
+        let _fault = crate::image_acquire::PublicationLockFault::install(target.cache_dir());
+        let result = internal_reference(Path::new("/p/Dockerfile")).unwrap();
+        let label = ImageLabel::for_result_reference(result.as_str());
+        let probed = ManifestDigest::parse(&format!("sha256:{}", "c".repeat(64))).unwrap();
+
+        match reuse(&result, Ok(probed.clone()), &label).await {
+            Reuse::Export {
+                probed: Some(carried),
+            } => assert_eq!(carried, probed),
+            other => panic!("a broken cache must export, got {other:?}"),
+        }
     }
 
     #[test]
