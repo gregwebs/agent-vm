@@ -123,6 +123,8 @@ syntax_check=(
     script/test/build-workflow.sh
     script/test/keychain-contract.sh
     script/test/single-binary-contract.sh
+    script/test/cpu-commitment-native.sh
+    script/test/cpu-commitment-native-contract.sh
     script/check-rust-toolchain.sh
     script/test/rust-toolchain-consistency.sh
     script/test/fixtures/fake-plutil.sh
@@ -186,6 +188,8 @@ shellcheck_files=(
     script/test/build-workflow.sh
     script/test/keychain-contract.sh
     script/test/single-binary-contract.sh
+    script/test/cpu-commitment-native.sh
+    script/test/cpu-commitment-native-contract.sh
     script/check-rust-toolchain.sh
     script/test/rust-toolchain-consistency.sh
     script/test/fixtures/fake-plutil.sh

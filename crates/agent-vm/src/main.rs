@@ -9,6 +9,8 @@ mod clipboard;
 mod config;
 mod config_authority;
 mod config_mounts;
+#[cfg(test)]
+mod cpu_evidence;
 mod credential_env;
 mod credential_injection;
 mod credential_provider;

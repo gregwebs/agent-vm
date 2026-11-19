@@ -631,7 +631,553 @@ fn memory_recovery_seed(bounds: MemoryBounds, baseline_mib: u32, desired_mib: u3
     None
 }
 
+// ADR-0070 D5 (#647): the CPU axis. `cpu_percent` counts one core per 100 (issue #647
+// S-A/S-B, accepted evidence M2), so saturation of `C` committed vCPUs is measured at
+// `C * 95%` and reclamation at `(C - 1) * 85%`. Both thresholds are compared on
+// conservative integer tenths intervals, never on a rounded float.
+
+/// Saturation of one committed vCPU, in tenths of a percent.
+const CPU_UP_TENTHS_PER_CORE: u32 = 950;
+/// The scale-down threshold of one *released* vCPU, in tenths of a percent.
+const CPU_DOWN_TENTHS_PER_CORE: u32 = 850;
+/// Distinct saturated observations behind one upward step (nominal 2 s at 200 ms).
+const CPU_HIGH_TICKS: u32 = 10;
+/// Distinct low observations behind one downward step (nominal 1 s at 200 ms).
+const CPU_LOW_TICKS: u32 = 5;
+/// `255 CPUs * 100% * 10`: the largest rate any comparison can reach.
+const MAX_CPU_RATE_TENTHS: u32 = 255_000;
+/// `25500.0f32` in IEEE-754 bits — 255 vCPUs under full load, in tenths.
+const CPU_RATE_CAP_BITS: u32 = 0x46c7_3800;
+
+/// The CPU interval a session may move within: `1 ..= max_cpus`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CpuBounds { boot_cpus: u8, max_cpus: u8 }
+
+/// A CPU target and the counts of consecutive higher/lower-demand observations.
+///
+/// [`cpu_tick`] returns a **proposal**; only the driver that decoded a receipt may treat
+/// a target as accepted, so this type never claims a resize happened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CpuState { current_cpus: u8, high_ticks: u32, low_ticks: u32 }
+
+/// A measured rate as the conservative tenths interval `[floor(10r), ceil(10r)]`.
+///
+/// Scaling up uses the lower endpoint and scaling down the upper one, so a reported
+/// `94.999%` cannot round into saturation and `85.001%` cannot round into low load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CpuRate { lower_tenths: u32, upper_tenths: u32 }
+
+spec fn spec_cpu_rate_lo(numerator: int, denominator: int) -> int {
+    if numerator / denominator > MAX_CPU_RATE_TENTHS as int {
+        MAX_CPU_RATE_TENTHS as int
+    } else {
+        numerator / denominator
+    }
+}
+
+spec fn spec_cpu_rate_hi(numerator: int, denominator: int) -> int {
+    let quotient = numerator / denominator;
+    let rounded = if numerator % denominator != 0 { quotient + 1 } else { quotient };
+    if rounded > MAX_CPU_RATE_TENTHS as int { MAX_CPU_RATE_TENTHS as int } else { rounded }
+}
+
+/// Floor and ceiling of an already-scaled ratio, clamped to the largest meaningful rate.
+///
+/// A zero numerator or denominator has no defined rate and is `None` by specification,
+/// not by a division precondition. Every intermediate is widened to `u64`, so the
+/// statements hold for all `u32` inputs.
+fn cpu_rate_tenths(numerator: u32, denominator: u32) -> (r: Option<CpuRate>)
+    ensures
+        match r {
+            Some(rate) => {
+                &&& numerator != 0 && denominator != 0
+                &&& rate.lower_tenths as int == spec_cpu_rate_lo(numerator as int, denominator as int)
+                &&& rate.upper_tenths as int == spec_cpu_rate_hi(numerator as int, denominator as int)
+                &&& 0 <= rate.lower_tenths as int
+                &&& (rate.lower_tenths as int) <= (rate.upper_tenths as int)
+                &&& (rate.upper_tenths as int) <= MAX_CPU_RATE_TENTHS as int
+                &&& (rate.upper_tenths as int) - (rate.lower_tenths as int) <= 1
+                &&& rate.upper_tenths > 0
+            },
+        None => numerator == 0 || denominator == 0,
+    },
+{
+    if numerator == 0 || denominator == 0 {
+        return None;
+    }
+    let quotient = u64::from(numerator) / u64::from(denominator);
+    let remainder = u64::from(numerator) % u64::from(denominator);
+    let rounded = if remainder != 0 { quotient + 1 } else { quotient };
+    let cap = u64::from(MAX_CPU_RATE_TENTHS);
+    proof {
+        assert(quotient as int == (numerator as int) / (denominator as int));
+        assert(remainder as int == (numerator as int) % (denominator as int));
+    }
+    let lower = if quotient > cap { MAX_CPU_RATE_TENTHS } else { quotient as u32 };
+    let upper = if rounded > cap { MAX_CPU_RATE_TENTHS } else { rounded as u32 };
+    proof {
+        assert(0 < numerator as int && 0 < denominator as int);
+        assert(numerator as int / denominator as int >= 0);
+        assert(numerator as int % denominator as int >= 0);
+        if quotient == 0 {
+            // A positive numerator below the denominator leaves its own remainder, so the
+            // ceiling of a sub-unit ratio is one tenth, never zero.
+            vstd::arithmetic::div_mod::lemma_small_div_converse(
+                numerator as int,
+                denominator as int,
+            );
+            assert((numerator as int) < (denominator as int));
+            vstd::arithmetic::div_mod::lemma_small_mod(
+                numerator as nat,
+                denominator as nat,
+            );
+            assert((numerator as int) % (denominator as int) == numerator as int);
+            assert(remainder != 0);
+        }
+    }
+    proof {
+        assert(lower as int == spec_cpu_rate_lo(numerator as int, denominator as int));
+        assert(upper as int == spec_cpu_rate_hi(numerator as int, denominator as int));
+        assert(upper > 0);
+    }
+    Some(CpuRate { lower_tenths: lower, upper_tenths: upper })
+}
+
+spec fn cpu_bits_exp(bits: u32) -> u32 { (bits >> 23) & 0xff }
+
+spec fn cpu_bits_frac(bits: u32) -> u32 { bits & 0x7f_ffff }
+
+/// `150 - exponent`, the right shift that scales the significand to an integer
+/// significand of the value in tenths of a percent. Zero for exponents at or above 150,
+/// which the rational branch never reaches.
+///
+/// `1.0f32` is `0x3f800000`; its value is `significand / 2^23`, and the tenths numerator is
+/// `significand * 10`, so the denominator is `2^(127 + 23 - exponent)`.
+spec fn cpu_bits_shift(bits: u32) -> u32 {
+    if cpu_bits_exp(bits) >= 150 { 0 } else { (150 - cpu_bits_exp(bits) as int) as u32 }
+}
+
+spec fn cpu_bits_significand(bits: u32) -> int {
+    0x800000int + cpu_bits_frac(bits) as int
+}
+
+spec fn cpu_bits_numerator(bits: u32) -> int { cpu_bits_significand(bits) * 10 }
+
+spec fn cpu_bits_denominator(bits: u32) -> int { (1u32 << cpu_bits_shift(bits)) as int }
+
+/// Positive values at or below about 0.1%: subnormals and every normal whose shift is at
+/// least 32. They are a real observation of a small positive rate, not an absence.
+spec fn cpu_bits_tiny(bits: u32) -> bool {
+    cpu_bits_exp(bits) == 0 || cpu_bits_shift(bits) >= 32
+}
+
+/// Sign set (including `-0`), `NaN`/infinity, or `+0`: no rate was measured.
+spec fn cpu_bits_rejected(bits: u32) -> bool {
+    bits >> 31 != 0 || cpu_bits_exp(bits) == 255 || bits == 0
+}
+
+spec fn cpu_rate_from_bits_lo_spec(bits: u32) -> int {
+    if bits >= CPU_RATE_CAP_BITS {
+        MAX_CPU_RATE_TENTHS as int
+    } else if cpu_bits_tiny(bits) {
+        0
+    } else {
+        spec_cpu_rate_lo(cpu_bits_numerator(bits), cpu_bits_denominator(bits))
+    }
+}
+
+spec fn cpu_rate_from_bits_hi_spec(bits: u32) -> int {
+    if bits >= CPU_RATE_CAP_BITS {
+        MAX_CPU_RATE_TENTHS as int
+    } else if cpu_bits_tiny(bits) {
+        1
+    } else {
+        spec_cpu_rate_hi(cpu_bits_numerator(bits), cpu_bits_denominator(bits))
+    }
+}
+
+/// ADR-0070 D5: the proved IEEE-754 bit classification behind [`cpu_rate_of`].
+///
+/// The mapping is the one *specified* in the plan, not merely output bounds: reject the
+/// sign bit, an all-ones exponent and `+0`; saturate at `25500%`; report positive tiny
+/// values as `[0,1]`; otherwise divide the exact significand by the exact power of two.
+/// The meaning of `f32::to_bits` and of the SDK's percentage field stay trusted.
+fn cpu_rate_from_bits(bits: u32) -> (r: Option<CpuRate>)
+    ensures
+        match r {
+            Some(rate) => {
+                &&& !cpu_bits_rejected(bits)
+                &&& rate.lower_tenths as int == cpu_rate_from_bits_lo_spec(bits)
+                &&& rate.upper_tenths as int == cpu_rate_from_bits_hi_spec(bits)
+                &&& 0 <= rate.lower_tenths as int
+                &&& (rate.lower_tenths as int) <= (rate.upper_tenths as int)
+                &&& (rate.upper_tenths as int) <= MAX_CPU_RATE_TENTHS as int
+                &&& (rate.upper_tenths as int) - (rate.lower_tenths as int) <= 1
+                &&& rate.upper_tenths > 0
+            },
+            None => cpu_bits_rejected(bits),
+        },
+        cpu_bits_rejected(bits) ==> match r { None => true, Some(_) => false },
+        (bits >= CPU_RATE_CAP_BITS && !cpu_bits_rejected(bits)) ==> match r {
+            Some(rate) => rate.lower_tenths == MAX_CPU_RATE_TENTHS
+                && rate.upper_tenths == MAX_CPU_RATE_TENTHS,
+            None => false,
+        },
+        (bits < CPU_RATE_CAP_BITS && !cpu_bits_rejected(bits) && cpu_bits_tiny(bits)) ==> match r {
+            Some(rate) => rate.lower_tenths == 0 && rate.upper_tenths == 1,
+            None => false,
+        },
+{
+    let sign = bits >> 31;
+    let exponent = (bits >> 23) & 0xff;
+    if sign != 0 || exponent == 255 || bits == 0 {
+        return None;
+    }
+    proof {
+        assert(exponent == cpu_bits_exp(bits));
+    }
+    if bits >= CPU_RATE_CAP_BITS {
+        return Some(CpuRate {
+            lower_tenths: MAX_CPU_RATE_TENTHS,
+            upper_tenths: MAX_CPU_RATE_TENTHS,
+        });
+    }
+    proof {
+        // A rate below `25500%` has an exponent of at most 141.
+        assert((bits < CPU_RATE_CAP_BITS ==> ((bits >> 23) & 0xff) <= 141u32)) by (bit_vector);
+    }
+    let shift = 150u32.saturating_sub(exponent);
+    proof {
+        assert(shift == cpu_bits_shift(bits));
+    }
+    if shift >= 32 {
+        return Some(CpuRate { lower_tenths: 0, upper_tenths: 1 });
+    }
+    proof {
+        // The early return above is the only reason the shift fits a `u32` shift operand.
+        assert(shift < 32);
+        assert((0x0080_0000u64 + ((bits & 0x7f_ffff) as u64)) <= 0x00ff_ffffu64) by (bit_vector);
+    }
+    let significand: u64 = 0x0080_0000u64 + (bits & 0x7f_ffff) as u64;
+    proof {
+        assert(significand as int == cpu_bits_significand(bits));
+    }
+    proof {
+        assert(((0x0080_0000u64 + ((bits & 0x7f_ffff) as u64)) * 10u64) <= 167772150u64)
+            by (bit_vector);
+    }
+    let numerator: u64 = significand * 10;
+    proof {
+        assert(numerator as int == cpu_bits_numerator(bits));
+    }
+    let numerator = numerator as u32;
+    proof {
+        assert(numerator as int == cpu_bits_numerator(bits));
+        assert(numerator != 0);
+    }
+    proof {
+        assert((shift < 32u32 ==> (1u32 << shift) != 0u32)) by (bit_vector);
+    }
+    let denominator = 1u32 << shift;
+    proof {
+        assert(denominator as int == cpu_bits_denominator(bits));
+        assert(denominator != 0);
+    }
+    cpu_rate_tenths(numerator, denominator)
+}
+
+/// The CPU interval test every accepted, seeded and proposed target goes through.
+spec fn cpu_target_in_bounds_spec(bounds: CpuBounds, target: u8) -> bool {
+    &&& 1 <= bounds.boot_cpus as int
+    &&& (bounds.boot_cpus as int) <= (target as int)
+    &&& (target as int) <= (bounds.max_cpus as int)
+}
+
+fn cpu_target_in_bounds(bounds: CpuBounds, target: u8) -> (accepted: bool)
+    ensures accepted == cpu_target_in_bounds_spec(bounds, target),
+{
+    bounds.boot_cpus >= 1 && bounds.boot_cpus <= target && target <= bounds.max_cpus
+}
+
+spec fn cpu_bounds_valid(bounds: CpuBounds) -> bool {
+    1 <= bounds.boot_cpus as int && (bounds.boot_cpus as int) <= (bounds.max_cpus as int)
+}
+
+/// The baseline the next decision is measured from: the current value clamped into valid
+/// bounds, or the boot commitment when the bounds themselves are malformed.
+spec fn cpu_base(bounds: CpuBounds, state: CpuState) -> int {
+    if !cpu_bounds_valid(bounds) {
+        bounds.boot_cpus as int
+    } else if (state.current_cpus as int) < (bounds.boot_cpus as int) {
+        bounds.boot_cpus as int
+    } else if (state.current_cpus as int) > (bounds.max_cpus as int) {
+        bounds.max_cpus as int
+    } else {
+        state.current_cpus as int
+    }
+}
+
+spec fn cpu_high_run(state: CpuState) -> int {
+    if (state.high_ticks as int) > CPU_HIGH_TICKS as int - 1 {
+        CPU_HIGH_TICKS as int - 1
+    } else {
+        state.high_ticks as int
+    }
+}
+
+spec fn cpu_low_run(state: CpuState) -> int {
+    if (state.low_ticks as int) > CPU_LOW_TICKS as int - 1 {
+        CPU_LOW_TICKS as int - 1
+    } else {
+        state.low_ticks as int
+    }
+}
+
+/// `[lo, hi]` is a real observation only in this shape. An interval that is reversed,
+/// out of range, wider than one tenth, or entirely zero is no observation at all.
+spec fn cpu_rate_usable(rate: CpuRate) -> bool {
+    &&& (rate.lower_tenths as int) >= 0
+    &&& (rate.lower_tenths as int) <= (rate.upper_tenths as int)
+    &&& (rate.upper_tenths as int) <= MAX_CPU_RATE_TENTHS as int
+    &&& (rate.upper_tenths as int) - (rate.lower_tenths as int) <= 1
+    &&& rate.upper_tenths > 0
+}
+
+spec fn cpu_current_outside(bounds: CpuBounds, state: CpuState) -> bool {
+    (state.current_cpus as int) < (bounds.boot_cpus as int)
+        || (state.current_cpus as int) > (bounds.max_cpus as int)
+}
+
+spec fn cpu_high_condition(bounds: CpuBounds, state: CpuState, rate: CpuRate) -> bool {
+    &&& cpu_base(bounds, state) < (bounds.max_cpus as int)
+    &&& (rate.lower_tenths as int) >= (CPU_UP_TENTHS_PER_CORE as int) * cpu_base(bounds, state)
+}
+
+spec fn cpu_low_condition(bounds: CpuBounds, state: CpuState, rate: CpuRate) -> bool {
+    &&& cpu_base(bounds, state) > (bounds.boot_cpus as int)
+    &&& (rate.upper_tenths as int) <= (CPU_DOWN_TENTHS_PER_CORE as int) * (cpu_base(bounds, state) - 1)
+}
+
+spec fn cpu_tick_current_spec(bounds: CpuBounds, state: CpuState, rate: Option<CpuRate>) -> int {
+    if !cpu_bounds_valid(bounds) {
+        bounds.boot_cpus as int
+    } else if cpu_current_outside(bounds, state) {
+        cpu_base(bounds, state)
+    } else {
+        match rate {
+            None => cpu_base(bounds, state),
+            Some(measured) => {
+                if !cpu_rate_usable(measured) {
+                    cpu_base(bounds, state)
+                } else if cpu_high_condition(bounds, state, measured) {
+                    if cpu_high_run(state) < CPU_HIGH_TICKS as int - 1 {
+                        cpu_base(bounds, state)
+                    } else {
+                        cpu_base(bounds, state) + 1
+                    }
+                } else if cpu_low_condition(bounds, state, measured) {
+                    if cpu_low_run(state) < CPU_LOW_TICKS as int - 1 {
+                        cpu_base(bounds, state)
+                    } else {
+                        cpu_base(bounds, state) - 1
+                    }
+                } else {
+                    cpu_base(bounds, state)
+                }
+            },
+        }
+    }
+}
+
+spec fn cpu_tick_high_spec(bounds: CpuBounds, state: CpuState, rate: Option<CpuRate>) -> int {
+    if !cpu_bounds_valid(bounds) {
+        0
+    } else if cpu_current_outside(bounds, state) {
+        0
+    } else {
+        match rate {
+            None => 0,
+            Some(measured) => {
+                if cpu_rate_usable(measured)
+                    && cpu_high_condition(bounds, state, measured)
+                    && cpu_high_run(state) < CPU_HIGH_TICKS as int - 1
+                {
+                    cpu_high_run(state) + 1
+                } else {
+                    0
+                }
+            },
+        }
+    }
+}
+
+spec fn cpu_tick_low_spec(bounds: CpuBounds, state: CpuState, rate: Option<CpuRate>) -> int {
+    if !cpu_bounds_valid(bounds) {
+        0
+    } else if cpu_current_outside(bounds, state) {
+        0
+    } else {
+        match rate {
+            None => 0,
+            Some(measured) => {
+                if cpu_rate_usable(measured)
+                    && !cpu_high_condition(bounds, state, measured)
+                    && cpu_low_condition(bounds, state, measured)
+                    && cpu_low_run(state) < CPU_LOW_TICKS as int - 1
+                {
+                    cpu_low_run(state) + 1
+                } else {
+                    0
+                }
+            },
+        }
+    }
+}
+
+/// ADR-0070 D5: one distinct demand-eligible observation of the CPU hysteresis.
+///
+/// One invocation is one *distinct* observation (S-F): a duplicate poll never calls this
+/// kernel, and an absent or unusable rate calls its reset path. Recovery deliberately does
+/// not call it at all. The ordered rows are the plan's transition table: invalid bounds,
+/// a current value outside the interval, an unusable rate, then the high run, the low run
+/// and finally every floor- or ceiling-inhibited hold.
+fn cpu_tick(bounds: CpuBounds, state: CpuState, rate: Option<CpuRate>) -> (next: CpuState)
+    ensures
+        next.current_cpus as int == cpu_tick_current_spec(bounds, state, rate),
+        next.high_ticks as int == cpu_tick_high_spec(bounds, state, rate),
+        next.low_ticks as int == cpu_tick_low_spec(bounds, state, rate),
+        next.high_ticks <= CPU_HIGH_TICKS - 1,
+        next.low_ticks <= CPU_LOW_TICKS - 1,
+        cpu_bounds_valid(bounds) ==> {
+            &&& (bounds.boot_cpus as int) <= (next.current_cpus as int)
+            &&& (next.current_cpus as int) <= (bounds.max_cpus as int)
+        },
+        cpu_bounds_valid(bounds) ==> (next.high_ticks == 0 || next.low_ticks == 0),
+        (cpu_bounds_valid(bounds) && !cpu_current_outside(bounds, state)) ==> {
+            &&& -1 <= (next.current_cpus as int) - (state.current_cpus as int)
+            &&& (next.current_cpus as int) - (state.current_cpus as int) <= 1
+        },
+{
+    if !(1 <= bounds.boot_cpus && bounds.boot_cpus <= bounds.max_cpus) {
+        return CpuState { current_cpus: bounds.boot_cpus, high_ticks: 0, low_ticks: 0 };
+    }
+    let base = if state.current_cpus < bounds.boot_cpus {
+        bounds.boot_cpus
+    } else if state.current_cpus > bounds.max_cpus {
+        bounds.max_cpus
+    } else {
+        state.current_cpus
+    };
+    proof {
+        assert(base as int == cpu_base(bounds, state));
+        assert(cpu_bounds_valid(bounds));
+    }
+    let hold = CpuState { current_cpus: base, high_ticks: 0, low_ticks: 0 };
+    if state.current_cpus < bounds.boot_cpus || state.current_cpus > bounds.max_cpus {
+        return hold;
+    }
+    let Some(measured) = rate else {
+        return hold;
+    };
+    if !(measured.lower_tenths <= measured.upper_tenths
+        && measured.upper_tenths <= MAX_CPU_RATE_TENTHS
+        && measured.upper_tenths - measured.lower_tenths <= 1
+        && measured.upper_tenths > 0)
+    {
+        return hold;
+    }
+    proof {
+        assert(cpu_rate_usable(measured));
+    }
+    let high = if state.high_ticks > CPU_HIGH_TICKS - 1 { CPU_HIGH_TICKS - 1 } else { state.high_ticks };
+    let low = if state.low_ticks > CPU_LOW_TICKS - 1 { CPU_LOW_TICKS - 1 } else { state.low_ticks };
+    proof {
+        assert(high as int == cpu_high_run(state));
+        assert(low as int == cpu_low_run(state));
+    }
+    let base_cpus = u32::from(base);
+    if base < bounds.max_cpus && measured.lower_tenths >= CPU_UP_TENTHS_PER_CORE * base_cpus {
+        proof {
+            assert(cpu_high_condition(bounds, state, measured));
+            assert(CPU_UP_TENTHS_PER_CORE * base_cpus <= 950 * 255);
+        }
+        if high < CPU_HIGH_TICKS - 1 {
+            return CpuState { current_cpus: base, high_ticks: high + 1, low_ticks: 0 };
+        }
+        return CpuState { current_cpus: base + 1, high_ticks: 0, low_ticks: 0 };
+    }
+    let released_cpus = base_cpus - 1;
+    if base > bounds.boot_cpus && measured.upper_tenths <= CPU_DOWN_TENTHS_PER_CORE * released_cpus {
+        proof {
+            assert(cpu_low_condition(bounds, state, measured));
+            assert(CPU_DOWN_TENTHS_PER_CORE * released_cpus <= 850 * 254);
+        }
+        if low < CPU_LOW_TICKS - 1 {
+            return CpuState { current_cpus: base, high_ticks: 0, low_ticks: low + 1 };
+        }
+        return CpuState { current_cpus: base - 1, high_ticks: 0, low_ticks: 0 };
+    }
+    hold
+}
+
+spec fn cpu_seed_in_range(bounds: CpuBounds, target: u8) -> bool {
+    cpu_target_in_bounds_spec(bounds, target)
+}
+
+spec fn cpu_recovery_seed_spec(bounds: CpuBounds, target_cpus: u8) -> Option<int> {
+    if !cpu_seed_in_range(bounds, target_cpus) {
+        None
+    } else if bounds.boot_cpus != target_cpus {
+        Some(bounds.boot_cpus as int)
+    } else if (bounds.boot_cpus as int) + 1 <= (bounds.max_cpus as int) {
+        Some(bounds.boot_cpus as int + 1)
+    } else {
+        None
+    }
+}
+
+/// The configuration-repair value a Recovering CPU request saves before it live-applies.
+///
+/// `NextStart` cannot change live CPUs, so a seed that differs from the re-confirm target
+/// is enough to make the following live apply a real planned change instead of an
+/// applied-but-statusless equality no-op. The boot value is preferred; at the boot value
+/// the next one up is the only other in-range choice, which is why the two-value interval
+/// `1..=2` works for either target. It is a repair value, never a policy target.
+fn cpu_recovery_seed(bounds: CpuBounds, target_cpus: u8) -> (seed: Option<u8>)
+    ensures
+        match seed {
+            Some(chosen) => {
+                &&& cpu_recovery_seed_spec(bounds, target_cpus) == Some::<int>(chosen as int)
+                &&& cpu_target_in_bounds_spec(bounds, chosen)
+                &&& chosen != target_cpus
+            },
+            None => cpu_recovery_seed_spec(bounds, target_cpus) == None,
+        },
+{
+    if !cpu_target_in_bounds(bounds, target_cpus) {
+        return None;
+    }
+    if bounds.boot_cpus != target_cpus {
+        return Some(bounds.boot_cpus);
+    }
+    if bounds.boot_cpus < bounds.max_cpus {
+        return Some(bounds.boot_cpus + 1);
+    }
+    None
+}
+
 } // verus!
+
+/// Trusted adapter from the SDK's percentage to the proved integer interval.
+///
+/// The SDK field is a non-optional `f32` (`sandbox/metrics.rs:41-45`), so the only
+/// "absence" this seam can express is a value that encodes none — `0.0` with either sign,
+/// a `NaN`, or an infinity. The meaning of the float, its provenance and the delivery of a
+/// genuine observation stay trusted; the bit classification and the arithmetic after it
+/// are proved. `None` therefore means "no usable measurement", never "the guest is idle".
+fn cpu_rate_of(percent: f32) -> Option<CpuRate> {
+    cpu_rate_from_bits(percent.to_bits())
+}
 
 /// How long a teardown hook waits for the monitor to finish after requesting the abort.
 ///
@@ -706,15 +1252,29 @@ impl ResourceCeiling {
         }
     }
 
-    /// Start the in-process memory monitor and hand back the only handle that stops it.
+    fn cpu_bounds(&self) -> CpuBounds {
+        let sizing = self.0;
+        CpuBounds {
+            boot_cpus: sizing.boot_cpus,
+            max_cpus: sizing.max_cpus,
+        }
+    }
+
+    fn resource_bounds(&self) -> ResourceBounds {
+        ResourceBounds {
+            cpu: self.cpu_bounds(),
+            memory: self.memory_bounds(),
+        }
+    }
+
+    /// Start the in-process resource monitor and hand back the only handle that stops it.
     ///
-    /// The CPU axis is deliberately ignored: this task reads memory only (#647 owns the
-    /// CPU controller), so a CPU-only spare capacity still starts it and it simply never
-    /// requests a resize.
+    /// One task owns both axes: one metrics read per tick, one serial apply owner. A session
+    /// with no room on either axis never starts it.
     pub(crate) fn monitor(&self, sandbox: &microsandbox::Sandbox) -> ResourceMonitor {
         let span = tracing::debug_span!(
             target: "agent_vm::resources",
-            "memory_commitment",
+            "resource_commitment",
             sandbox = sandbox.name(),
         );
         if !self.monitor_needed() {
@@ -726,32 +1286,52 @@ impl ResourceCeiling {
                     target: "agent_vm::resources",
                     event = "monitor_disabled",
                     reason = "the sandbox has no local backend, so its metrics cannot be read",
-                    "memory monitor not started"
+                    "resource monitor not started"
                 )
             });
             return ResourceMonitor::idle(span);
         }
-        let bounds = self.memory_bounds();
-        let initial = MemoryControllerState {
-            policy: MemoryState {
-                current_target_mib: bounds.boot_memory_mib,
-                low_ticks: 0,
+        let bounds = self.resource_bounds();
+        let initial = ResourceControllerState {
+            cpu: CpuControllerState {
+                policy: CpuState {
+                    current_cpus: bounds.cpu.boot_cpus,
+                    high_ticks: 0,
+                    low_ticks: 0,
+                },
+                authority: TargetAuthority::Confirmed,
+                last_accepted_cpus: bounds.cpu.boot_cpus,
+                outstanding: None,
+                correction_retry: ResizeRetry::default(),
             },
-            authority: TargetAuthority::Confirmed,
-            last_accepted_target_mib: bounds.boot_memory_mib,
-            retry: MemoryRetry::default(),
+            memory: MemoryControllerState {
+                policy: MemoryState {
+                    current_target_mib: bounds.memory.boot_memory_mib,
+                    low_ticks: 0,
+                },
+                authority: TargetAuthority::Confirmed,
+                last_accepted_target_mib: bounds.memory.boot_memory_mib,
+                retry: MemoryRetry::default(),
+            },
+            cpu_clock: CpuObservationClock::default(),
+            cpu_lifecycle: CpuLifecycleCache::default(),
         };
         let reader = sandbox.clone();
-        let samples = memory_samples(move || {
+        let samples = resource_samples(move || {
             let sandbox = reader.clone();
-            async move { read_memory_sample(&sandbox).await }
+            async move { read_resource_sample(&sandbox).await }
         });
         let modifier = sandbox.clone();
         let resize = move |request| {
             let sandbox = modifier.clone();
-            async move { resize_memory(&sandbox, bounds, request).await }
+            async move { resize_resources(&sandbox, bounds, request).await }
         };
-        let driving = drive_memory(bounds, initial, samples, resize);
+        let prober = sandbox.clone();
+        let probe_lifecycle = move || {
+            let sandbox = prober.clone();
+            async move { read_cpu_lifecycle(&sandbox).await }
+        };
+        let driving = drive_resources(bounds, initial, samples, resize, probe_lifecycle);
         let task = tokio::spawn(
             async move {
                 let _final_state = driving.await;
@@ -845,12 +1425,12 @@ impl MemoryAsk {
     }
 }
 
-/// Damping for an ask that is being repeated without effect.
+/// Damping for an ask that is being repeated without effect, per axis.
 ///
 /// Growth is immediate, so nothing else throttles a repeat: a persistent failure (host out of
 /// memory, a runtime without live resize, a paused sandbox) or an `enforced` target below the
 /// ask would be re-requested every 200 ms, at two SDK applies each. What is damped is the
-/// **nth repeat of one identical ask** ([`MemoryAsk`]):
+/// **nth repeat of one identical ask**:
 ///
 /// - the *first* repeat is always immediate, so one transient failure never slows recovery and
 ///   the plan's no-effect traces keep their next-tick retry;
@@ -864,18 +1444,43 @@ impl MemoryAsk {
 ///
 /// It is shell bookkeeping, not a policy decision: it can only suppress a repeat of an ask
 /// that already made no progress, never a change in what the guest needs.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct MemoryRetry {
+///
+/// The storage is generic so both axes share one implementation. The *identity* each axis
+/// supplies is not shared: memory compares [`MemoryAsk`] (authority-sensitive), while CPU
+/// correction retries compare the stable target only, and CPU demand keeps its own record
+/// ([`CpuOutstandingDemand`]) precisely so a correction can never clear it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ResizeRetry<A: Copy + Eq> {
     /// The ask that last made no progress. Taken, not merely compared, on the next admit, so a
     /// changed ask cannot inherit this count.
-    failed: Option<MemoryAsk>,
+    failed: Option<A>,
     /// How many consecutive attempts at `failed` have made no progress.
     attempts: u32,
     /// Ticks observed since the last attempt at `failed`.
     waited: u32,
 }
 
-impl MemoryRetry {
+impl<A: Copy + Eq> Default for ResizeRetry<A> {
+    fn default() -> Self {
+        Self {
+            failed: None,
+            attempts: 0,
+            waited: 0,
+        }
+    }
+}
+
+impl<A: Copy + Eq> std::fmt::Debug for ResizeRetry<A> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResizeRetry")
+            .field("attempts", &self.attempts)
+            .field("waited", &self.waited)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<A: Copy + Eq> ResizeRetry<A> {
     /// The delay before re-asking the same ask.
     ///
     /// The **first** repeat is never delayed: one transient failure must not slow recovery,
@@ -894,7 +1499,7 @@ impl MemoryRetry {
     ///
     /// A changed ask clears the record and is admitted, so it starts from zero rather than
     /// inheriting the previous ask's count.
-    fn admit(&mut self, ask: MemoryAsk) -> bool {
+    fn admit(&mut self, ask: A) -> bool {
         if self.failed != Some(ask) {
             *self = Self::default();
             return true;
@@ -908,7 +1513,7 @@ impl MemoryRetry {
     }
 
     /// The attempt made no progress: count it, so the next one waits longer.
-    fn damp(&mut self, ask: MemoryAsk) {
+    fn damp(&mut self, ask: A) {
         self.attempts = if self.failed == Some(ask) {
             self.attempts.saturating_add(1)
         } else {
@@ -924,7 +1529,10 @@ impl MemoryRetry {
     }
 }
 
-/// One change the driver asks the SDK adapter for.
+/// Memory's damping record: compared by the authority-sensitive [`MemoryAsk`] identity.
+type MemoryRetry = ResizeRetry<MemoryAsk>;
+
+/// One change the driver asks the SDK adapter for, on either axis.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MemoryResizeRequest {
     baseline_mib: u32,
@@ -934,44 +1542,921 @@ struct MemoryResizeRequest {
 
 /// `Live` sends runtime control; `NextStart` only persists desired configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MemoryApplyMode {
+enum ResourceApplyMode {
     Live,
     NextStart,
 }
 
 /// A resize that did not produce an accepted target, split by what is known about the VM.
 #[derive(Debug)]
-enum MemoryResizeError {
+enum ResourceResizeError {
     /// The apply call returned an error: the live effect is unknown, not absent.
     Modify(anyhow::Error),
     /// The call returned but its receipt was missing or unusable: also unknown.
     Unconfirmed(anyhow::Error),
 }
 
-impl MemoryResizeError {
+impl ResourceResizeError {
     fn event(&self) -> &'static str {
         match self {
-            MemoryResizeError::Modify(_) => "modify_error",
-            MemoryResizeError::Unconfirmed(_) => "unconfirmed_resize_status",
+            ResourceResizeError::Modify(_) => "modify_error",
+            ResourceResizeError::Unconfirmed(_) => "unconfirmed_resize_status",
         }
     }
 
     /// The whole anyhow chain, so the stage context and the underlying cause both appear.
     fn detail(&self) -> String {
         match self {
-            MemoryResizeError::Modify(error) | MemoryResizeError::Unconfirmed(error) => {
+            ResourceResizeError::Modify(error) | ResourceResizeError::Unconfirmed(error) => {
                 format!("{error:#}")
             }
         }
     }
 }
 
-/// ADR-0070 D2/D3: one sample stream through the policy, holding the authority that the
-/// pure kernels cannot see.
+/// Test-only spelling kept so the S2 memory tests read as they did.
+#[cfg(test)]
+type MemoryResizeError = ResourceResizeError;
+
+/// The two-axis interval a session may move within.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResourceBounds {
+    cpu: CpuBounds,
+    memory: MemoryBounds,
+}
+
+/// One change the CPU driver asks the adapter for.
 ///
-/// Errors are handled here and never returned: a metrics gap, a failed apply or an
-/// unusable receipt resets the low run, changes the authority and continues. Returning
-/// the final state is what lets a finite test stream assert the exact outcome.
+/// `recovering` means authority is unknown, so the adapter repairs saved configuration before
+/// it live-applies; `baseline_cpus` is what the driver believes is current, used only to report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CpuResizeRequest {
+    baseline_cpus: u8,
+    target_cpus: u8,
+    recovering: bool,
+}
+
+/// Both axes' requests, so one live apply can carry whichever were admitted this tick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResourceResizeRequest {
+    cpu: Option<CpuResizeRequest>,
+    memory: Option<MemoryResizeRequest>,
+}
+
+/// The fields one SDK apply carries. `None` is "this axis is not in this call".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ResourceTargets {
+    cpus: Option<u8>,
+    memory_mib: Option<u32>,
+}
+
+/// Both axes' outcomes. `None` means **not requested**, never success.
+#[derive(Debug)]
+struct ResourceResizeOutcome {
+    cpu: Option<Result<u8, ResourceResizeError>>,
+    memory: Option<Result<u32, ResourceResizeError>>,
+}
+
+/// Which way an ask moves the commitment, independent of its target number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CpuDirection {
+    Up,
+    Down,
+}
+
+/// What the policy is asking for, as the durable part of an unmet demand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CpuDemand {
+    target_cpus: u8,
+    direction: CpuDirection,
+}
+
+/// A directional demand that has been asked for and not yet observed as progress.
+///
+/// This is deliberately **not** a [`ResizeRetry`]: its identity must survive a corrective
+/// re-confirmation that returns enforcement to the baseline, because the guest still needs the
+/// change. Only a usable receipt that moves enforcement toward the demand from `anchor_cpus`,
+/// or genuinely new demand evidence, may clear it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CpuOutstandingDemand {
+    demand: CpuDemand,
+    /// The accepted commitment when this unmet demand began.
+    anchor_cpus: u8,
+    /// Normal demand attempts that produced no usable progress.
+    no_progress_attempts: u32,
+    /// Original monitor polls observed since the last normal demand attempt.
+    waited_polls: u32,
+}
+
+/// The stable identity of a corrective re-confirmation: its target only.
+///
+/// Deliberately excludes the authority and the observed baseline, so repeated recovery failures
+/// damp one identity instead of restarting the delay whenever a catalog or observation drifts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CpuCorrectionAsk {
+    target_cpus: u8,
+}
+
+/// What the driver knows about the CPU axis between ticks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CpuControllerState {
+    /// The accepted commitment under `Confirmed`; the last accepted value under `Recovering`
+    /// (never a proposed target).
+    policy: CpuState,
+    authority: TargetAuthority,
+    /// Receipt history only: never overwritten by an observation or by `actual`.
+    last_accepted_cpus: u8,
+    outstanding: Option<CpuOutstandingDemand>,
+    correction_retry: ResizeRetry<CpuCorrectionAsk>,
+}
+
+/// Lifecycle eligibility for CPU work, separate from demand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CpuLifecycle {
+    Running,
+    NotRunning,
+    Unavailable,
+}
+
+/// One metrics row as both policies see it: memory fields unchanged, plus the decoded rate and
+/// the row's own timestamp. The reader never awaits a lifecycle query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResourceSample {
+    memory: MemorySample,
+    /// The internal decoded interval, never the SDK's non-optional `f32` field type.
+    cpu_rate: Option<CpuRate>,
+    timestamp: std::time::SystemTime,
+}
+
+/// The nondecreasing-within-epoch high-water mark of row timestamps.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CpuObservationClock {
+    high_water: Option<std::time::SystemTime>,
+    consecutive_regressed_polls: u32,
+}
+
+/// What one original poll's timestamp is relative to the epoch high-water mark.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CpuObservation {
+    Distinct,
+    Duplicate,
+    Regressed,
+    ClockCorrection,
+    Gap,
+}
+
+/// The cached lifecycle answer and when its probe attempt started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CpuLifecycleCache {
+    value: CpuLifecycle,
+    /// Whether a reply has been cached at all. Invalidation clears this but keeps the probe
+    /// start, so it can never become a probe storm.
+    valid: bool,
+    last_probe_started: Option<tokio::time::Instant>,
+}
+
+impl Default for CpuLifecycleCache {
+    fn default() -> Self {
+        Self {
+            value: CpuLifecycle::Unavailable,
+            valid: false,
+            last_probe_started: None,
+        }
+    }
+}
+
+/// Everything the two-axis driver owns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResourceControllerState {
+    cpu: CpuControllerState,
+    memory: MemoryControllerState,
+    cpu_clock: CpuObservationClock,
+    cpu_lifecycle: CpuLifecycleCache,
+}
+
+/// Nominal five ticks at [`METRICS_SAMPLE_INTERVAL`]: how long one lifecycle reply is reused.
+const CPU_LIFECYCLE_TTL: Duration = Duration::from_secs(1);
+/// The bound on one lifecycle query's await, not on metrics or apply I/O.
+const CPU_LIFECYCLE_TIMEOUT: Duration = Duration::from_millis(50);
+/// Consecutive timestamp-below-high-water polls that re-anchor the epoch (20 s nominal).
+const CPU_REGRESSION_STREAK: u32 = 100;
+
+/// The CPU delay before re-asking the same failing identity, in monitor polls.
+///
+/// Same 0/5..50 schedule as memory ([`MEMORY_RETRY_FIRST_TICKS`],
+/// [`MEMORY_RETRY_MAX_TICKS`]); named here so the two axes can diverge only deliberately.
+const CPU_RETRY_FIRST_TICKS: u32 = MEMORY_RETRY_FIRST_TICKS;
+const CPU_RETRY_MAX_TICKS: u32 = MEMORY_RETRY_MAX_TICKS;
+
+/// Classify one original poll's timestamp against the epoch high-water mark (plan §3.2).
+///
+/// The high-water never decreases inside an epoch. The sole exception is the operator-approved
+/// clock correction after [`CPU_REGRESSION_STREAK`] consecutive regressed polls, which re-anchors
+/// to this poll's timestamp and discards the row. An equal timestamp neither advances nor
+/// lowers anything and interrupts the regression streak.
+fn observe_cpu_clock(
+    clock: &mut CpuObservationClock,
+    timestamp: std::time::SystemTime,
+) -> CpuObservation {
+    match clock.high_water {
+        None => {
+            clock.high_water = Some(timestamp);
+            clock.consecutive_regressed_polls = 0;
+            CpuObservation::Distinct
+        }
+        Some(high_water) if timestamp > high_water => {
+            clock.high_water = Some(timestamp);
+            clock.consecutive_regressed_polls = 0;
+            CpuObservation::Distinct
+        }
+        Some(high_water) if timestamp == high_water => {
+            clock.consecutive_regressed_polls = 0;
+            CpuObservation::Duplicate
+        }
+        Some(_) => {
+            clock.consecutive_regressed_polls = clock.consecutive_regressed_polls.saturating_add(1);
+            if clock.consecutive_regressed_polls >= CPU_REGRESSION_STREAK {
+                clock.high_water = Some(timestamp);
+                clock.consecutive_regressed_polls = 0;
+                CpuObservation::ClockCorrection
+            } else {
+                CpuObservation::Regressed
+            }
+        }
+    }
+}
+
+/// A usable measured rate is a real observation of demand: ordered, at most one tenth wide and
+/// strictly positive. Zero/absent encodes no decision (S-B). This is the shell's restatement of
+/// the proved `cpu_rate_usable` predicate over the decoded interval.
+fn measured_rate_is_usable(rate: CpuRate) -> bool {
+    rate.lower_tenths <= rate.upper_tenths
+        && rate.upper_tenths <= MAX_CPU_RATE_TENTHS
+        && rate.upper_tenths - rate.lower_tenths <= 1
+        && rate.upper_tenths > 0
+}
+
+fn cpu_bounds_adjustable(bounds: CpuBounds) -> bool {
+    bounds.boot_cpus < bounds.max_cpus
+}
+
+/// The delay before repeating one CPU identity, from its consecutive no-progress attempts.
+fn cpu_retry_delay(attempts: u32) -> u32 {
+    if attempts <= 1 {
+        return 0;
+    }
+    (attempts - 1)
+        .saturating_mul(CPU_RETRY_FIRST_TICKS)
+        .min(CPU_RETRY_MAX_TICKS)
+}
+
+/// Whether a usable receipt moved enforcement toward (or past) the recorded demand.
+fn cpu_demand_met(demand: CpuOutstandingDemand, enforced_cpus: u8) -> bool {
+    match demand.demand.direction {
+        CpuDirection::Up => enforced_cpus > demand.anchor_cpus,
+        CpuDirection::Down => enforced_cpus < demand.anchor_cpus,
+    }
+}
+
+/// Whether one positive distinct eligible observation still supports a recorded direction.
+///
+/// The kernel holds in four ways: below the growth threshold, at the ceiling, above the shrink
+/// threshold and at the floor. Plan §3.4(b) ends an outstanding demand when the evidence becomes
+/// a deadband or a boundary hold, and keeps it while the same direction continues — including
+/// the retry-gated case, where the kernel proposes the step but the deadline refuses to ask.
+fn cpu_hold_supports(
+    direction: CpuDirection,
+    bounds: CpuBounds,
+    current_cpus: u8,
+    rate: CpuRate,
+) -> bool {
+    match direction {
+        // Growth continues while the conservative lower endpoint still reaches the threshold
+        // and the session still has room above the current commitment.
+        CpuDirection::Up => {
+            current_cpus < bounds.max_cpus
+                && rate.lower_tenths >= CPU_UP_TENTHS_PER_CORE * u32::from(current_cpus)
+        }
+        // Reclamation continues while the upper endpoint still reaches the threshold of the
+        // vCPU about to be released and something above the floor remains to reclaim.
+        CpuDirection::Down => {
+            current_cpus > bounds.boot_cpus
+                && rate.upper_tenths <= CPU_DOWN_TENTHS_PER_CORE * u32::from(current_cpus - 1)
+        }
+    }
+}
+
+/// ADR-0070 D2/D3/D5: one sample stream through both policies, holding the authority, the
+/// observation clock and the lifecycle cache that the pure kernels cannot see.
+///
+/// One task, one read per tick and at most one live apply: the launcher's whole interface stays
+/// [`ResourceCeiling::monitor`]. Errors are handled here and never returned, so a finite test
+/// stream asserts the exact final state.
+///
+/// The tick order is load-bearing:
+/// 1. advance the memory retry, CPU demand and CPU correction clocks once per original poll;
+/// 2. handle a shared absence or lookup error without touching either axis's history;
+/// 3. evaluate memory from the row immediately — it never awaits a lifecycle query;
+/// 4. classify the CPU clock before any lifecycle or demand work;
+/// 5. give an admitted memory request priority over a lifecycle await, and defer CPU;
+/// 6. evaluate CPU demand, or rate-independent corrective confirmation;
+/// 7. await one shared resize, then settle each axis and, separately, outstanding demand.
+async fn drive_resources<S, R, F, L, LF>(
+    bounds: ResourceBounds,
+    state: ResourceControllerState,
+    samples: S,
+    mut resize: R,
+    mut probe_lifecycle: L,
+) -> ResourceControllerState
+where
+    S: futures::Stream<Item = anyhow::Result<Option<ResourceSample>>>,
+    R: FnMut(ResourceResizeRequest) -> F,
+    F: std::future::Future<Output = ResourceResizeOutcome>,
+    L: FnMut() -> LF,
+    LF: std::future::Future<Output = anyhow::Result<CpuLifecycle>>,
+{
+    let mut state = state;
+    let mut samples = std::pin::pin!(samples);
+    while let Some(item) = futures::StreamExt::next(&mut samples).await {
+        // (1) Every item is one monitor poll, whatever it carries: both retry delays and the
+        // demand deadline are measured in opportunities to observe, not wall-clock time.
+        if state.memory.retry.failed.is_some() {
+            state.memory.retry.waited = state.memory.retry.waited.saturating_add(1);
+        }
+        if let Some(outstanding) = state.cpu.outstanding.as_mut() {
+            outstanding.waited_polls = outstanding.waited_polls.saturating_add(1);
+        }
+        if state.cpu.correction_retry.failed.is_some() {
+            state.cpu.correction_retry.waited = state.cpu.correction_retry.waited.saturating_add(1);
+        }
+
+        // (2) One shared read: an absent row or a lookup error is a CPU gap and a memory hold.
+        let sample = match item {
+            Ok(Some(sample)) => sample,
+            Ok(None) => {
+                let observation = CpuObservation::Gap;
+                log_cpu_poll(
+                    observation,
+                    None,
+                    state.cpu_lifecycle,
+                    state.cpu.policy,
+                    state.cpu.outstanding,
+                    false,
+                    None,
+                    false,
+                );
+                tracing::debug!(
+                    target: MONITOR_TARGET,
+                    event = "metrics_missing",
+                    observation = ?observation,
+                    reason = "the metrics catalog has no live row for this sandbox yet",
+                    "resource sample missing"
+                );
+                reset_cpu_evidence(&mut state.cpu);
+                state.cpu_clock.consecutive_regressed_polls = 0;
+                state.memory.policy.low_ticks = 0;
+                continue;
+            }
+            Err(error) => {
+                let observation = CpuObservation::Gap;
+                log_cpu_poll(
+                    observation,
+                    None,
+                    state.cpu_lifecycle,
+                    state.cpu.policy,
+                    state.cpu.outstanding,
+                    false,
+                    None,
+                    false,
+                );
+                tracing::debug!(
+                    target: MONITOR_TARGET,
+                    event = "metrics_error",
+                    observation = ?observation,
+                    error = %format!("{error:#}"),
+                    "resource metrics lookup failed"
+                );
+                reset_cpu_evidence(&mut state.cpu);
+                state.cpu_clock.consecutive_regressed_polls = 0;
+                state.memory.policy.low_ticks = 0;
+                continue;
+            }
+        };
+
+        // (3) Memory first, from this row only. A CPU eligibility wait never delays it.
+        let mut memory_request: Option<MemoryResizeRequest> = None;
+        let mut memory_ask: Option<MemoryAsk> = None;
+        let recovering_memory = state.memory.authority == TargetAuthority::Recovering;
+        let mut memory_rebasable = true;
+        let observed = if recovering_memory {
+            match observed_memory_target(bounds.memory, sample.memory.memory_limit_bytes) {
+                Ok(observed) => Some(observed),
+                Err(error) => {
+                    tracing::debug!(
+                        target: MONITOR_TARGET,
+                        event = "invalid_recovery_limit",
+                        error = %format!("{error:#}"),
+                        last_accepted_target_mib = state.memory.last_accepted_target_mib,
+                        "memory recovery baseline unusable; holding"
+                    );
+                    state.memory.policy =
+                        memory_rebase(bounds.memory, state.memory.policy, true, None);
+                    memory_rebasable = false;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if memory_rebasable {
+            let previous_mib = state.memory.policy.current_target_mib;
+            state.memory.policy = memory_rebase(
+                bounds.memory,
+                state.memory.policy,
+                recovering_memory,
+                observed,
+            );
+            if let Some(observed_mib) = observed
+                && observed_mib != previous_mib
+            {
+                tracing::debug!(
+                    target: MONITOR_TARGET,
+                    event = "memory_reconciled",
+                    observed_limit_mib = observed_mib,
+                    last_accepted_target_mib = state.memory.last_accepted_target_mib,
+                    "recovery baseline moved to the observed live limit"
+                );
+            }
+            let baseline_mib = state.memory.policy.current_target_mib;
+            let proposal = memory_tick(bounds.memory, state.memory.policy, sample.memory);
+            if proposal.current_target_mib == baseline_mib {
+                state.memory.policy.low_ticks = proposal.low_ticks;
+            } else {
+                let request = MemoryResizeRequest {
+                    baseline_mib,
+                    target_mib: proposal.current_target_mib,
+                    recovering: recovering_memory,
+                };
+                let ask = MemoryAsk::of(request);
+                if state.memory.retry.admit(ask) {
+                    memory_request = Some(request);
+                    memory_ask = Some(ask);
+                } else {
+                    // A repeat of an ask that made no progress: hold its dwell unchanged.
+                    state.memory.policy.low_ticks = proposal.low_ticks;
+                }
+            }
+        }
+
+        // (4) The CPU clock is classified before any lifecycle or demand work.
+        let observation = observe_cpu_clock(&mut state.cpu_clock, sample.timestamp);
+        let usable_rate = sample
+            .cpu_rate
+            .filter(|rate| measured_rate_is_usable(*rate));
+        let mut cpu_request: Option<CpuResizeRequest> = None;
+        let mut deferred = false;
+        match observation {
+            CpuObservation::Duplicate => {
+                // Neutral: no count, no dispatch, no probe. Merely expiring the cache changes
+                // nothing; only an unusable rate resets the preserved runs.
+                if usable_rate.is_none() {
+                    reset_cpu_evidence(&mut state.cpu);
+                }
+                tracing::debug!(
+                    target: MONITOR_TARGET,
+                    event = "cpu_duplicate_observation",
+                    high_ticks = state.cpu.policy.high_ticks,
+                    low_ticks = state.cpu.policy.low_ticks,
+                    "duplicate CPU row: no evidence, no call"
+                );
+            }
+            CpuObservation::Regressed => {
+                reset_cpu_evidence(&mut state.cpu);
+                tracing::debug!(
+                    target: MONITOR_TARGET,
+                    event = "cpu_regressed_observation",
+                    consecutive_regressed_polls = state.cpu_clock.consecutive_regressed_polls,
+                    "timestamp below the high-water mark: no evidence, no call"
+                );
+            }
+            CpuObservation::ClockCorrection => {
+                reset_cpu_evidence(&mut state.cpu);
+                state.cpu_lifecycle.valid = false;
+                tracing::debug!(
+                    target: MONITOR_TARGET,
+                    event = "cpu_clock_correction",
+                    "sustained regression re-anchored the epoch and discarded the row"
+                );
+            }
+            CpuObservation::Gap => {}
+            CpuObservation::Distinct => {
+                // (5) Only a distinct row can produce CPU evidence.
+                let adjustable = cpu_bounds_adjustable(bounds.cpu);
+                let needs_lifecycle = adjustable
+                    && match state.cpu.authority {
+                        TargetAuthority::Confirmed => usable_rate.is_some(),
+                        TargetAuthority::Recovering => true,
+                    };
+                if needs_lifecycle && !cpu_lifecycle_fresh(&state.cpu_lifecycle, now_instant()) {
+                    if memory_request.is_some() {
+                        // Memory priority: an urgent growth or reversal is dispatched now, and
+                        // CPU waits for a later poll. Eligibility was unavailable, so its runs
+                        // reset; recovery, demand and deadlines are retained.
+                        deferred = true;
+                        reset_cpu_evidence(&mut state.cpu);
+                        tracing::debug!(
+                            target: MONITOR_TARGET,
+                            event = "cpu_lifecycle_deferred",
+                            reason = "an admitted memory request has dispatch priority",
+                            "CPU deferred instead of probing lifecycle"
+                        );
+                    } else if cpu_probe_allowed(&state.cpu_lifecycle, now_instant()) {
+                        refresh_cpu_lifecycle(
+                            &mut state.cpu_lifecycle,
+                            &mut probe_lifecycle,
+                            now_instant(),
+                        )
+                        .await;
+                    }
+                }
+                let eligible = !deferred
+                    && cpu_lifecycle_fresh(&state.cpu_lifecycle, now_instant())
+                    && state.cpu_lifecycle.value == CpuLifecycle::Running;
+                if !eligible {
+                    // NotRunning, Unavailable, or no decision needed this poll.
+                    reset_cpu_evidence(&mut state.cpu);
+                } else if state.cpu.authority == TargetAuthority::Confirmed {
+                    if let Some(rate) = usable_rate {
+                        let base_cpus = state.cpu.policy.current_cpus;
+                        let proposal = cpu_tick(bounds.cpu, state.cpu.policy, Some(rate));
+                        if proposal.current_cpus == base_cpus {
+                            state.cpu.policy.high_ticks = proposal.high_ticks;
+                            state.cpu.policy.low_ticks = proposal.low_ticks;
+                            // Plan §3.4(b): a deadband or boundary hold on positive distinct
+                            // eligible evidence ends the outstanding demand, while a continuing
+                            // same-direction observation keeps it and its deadline.
+                            if state.cpu.outstanding.is_some_and(|outstanding| {
+                                !cpu_hold_supports(
+                                    outstanding.demand.direction,
+                                    bounds.cpu,
+                                    base_cpus,
+                                    rate,
+                                )
+                            }) {
+                                state.cpu.outstanding = None;
+                            }
+                        } else {
+                            let target_cpus = proposal.current_cpus;
+                            let direction = if target_cpus > base_cpus {
+                                CpuDirection::Up
+                            } else {
+                                CpuDirection::Down
+                            };
+                            let demand = CpuDemand {
+                                target_cpus,
+                                direction,
+                            };
+                            let record = match state.cpu.outstanding {
+                                Some(existing) if existing.demand == demand => existing,
+                                _ => CpuOutstandingDemand {
+                                    demand,
+                                    anchor_cpus: base_cpus,
+                                    no_progress_attempts: 0,
+                                    waited_polls: 0,
+                                },
+                            };
+                            state.cpu.outstanding = Some(record);
+                            if record.waited_polls >= cpu_retry_delay(record.no_progress_attempts) {
+                                state.cpu.policy.high_ticks = 0;
+                                state.cpu.policy.low_ticks = 0;
+                                cpu_request = Some(CpuResizeRequest {
+                                    baseline_cpus: base_cpus,
+                                    target_cpus,
+                                    recovering: false,
+                                });
+                            } else {
+                                // Retain the ready counter so the next distinct observation
+                                // re-proposes after the deadline instead of restarting the run.
+                                state.cpu.policy.high_ticks = if direction == CpuDirection::Up {
+                                    CPU_HIGH_TICKS - 1
+                                } else {
+                                    0
+                                };
+                                state.cpu.policy.low_ticks = if direction == CpuDirection::Down {
+                                    CPU_LOW_TICKS - 1
+                                } else {
+                                    0
+                                };
+                            }
+                        }
+                    } else {
+                        // S-B: a published zero, and any absent or unusable rate, proves no
+                        // demand decision whatever the lifecycle cache's age, so it resets both
+                        // runs instead of leaving a run to survive behind a fresh cache.
+                        reset_cpu_evidence(&mut state.cpu);
+                    }
+                } else {
+                    // (6) Recovering: re-confirm the last accepted commitment at any rate,
+                    // independent of demand and of the demand deadline.
+                    let ask = CpuCorrectionAsk {
+                        target_cpus: state.cpu.last_accepted_cpus,
+                    };
+                    if state.cpu.correction_retry.admit(ask) {
+                        cpu_request = Some(CpuResizeRequest {
+                            baseline_cpus: state.cpu.policy.current_cpus,
+                            target_cpus: ask.target_cpus,
+                            recovering: true,
+                        });
+                    }
+                }
+            }
+        }
+
+        // One record per original poll. Silent at the default filter, and the reason integrated
+        // evidence can attribute a live run to a clock, a lifecycle or a memory deferral.
+        log_cpu_poll(
+            observation,
+            usable_rate,
+            state.cpu_lifecycle,
+            state.cpu.policy,
+            state.cpu.outstanding,
+            memory_request.is_some(),
+            cpu_request,
+            deferred,
+        );
+
+        // (7) One shared operation, or none.
+        if cpu_request.is_none() && memory_request.is_none() {
+            continue;
+        }
+        let request = ResourceResizeRequest {
+            cpu: cpu_request,
+            memory: memory_request,
+        };
+        let outcome = resize(request).await;
+        let any_error =
+            matches!(&outcome.cpu, Some(Err(_))) || matches!(&outcome.memory, Some(Err(_)));
+
+        if let Some(result) = outcome.memory {
+            let memory = request
+                .memory
+                .expect("a memory outcome was only requested with a memory request");
+            let ask = memory_ask.expect("an admitted memory ask was recorded");
+            match result {
+                Ok(accepted) => {
+                    state.memory.policy = MemoryState {
+                        current_target_mib: accepted,
+                        low_ticks: 0,
+                    };
+                    state.memory.authority = TargetAuthority::Confirmed;
+                    state.memory.last_accepted_target_mib = accepted;
+                    if accepted < memory.target_mib {
+                        state.memory.retry.damp(ask);
+                    } else {
+                        state.memory.retry.clear();
+                    }
+                    tracing::debug!(
+                        target: MONITOR_TARGET,
+                        event = "memory_transition",
+                        previous_target_mib = memory.baseline_mib,
+                        requested_target_mib = memory.target_mib,
+                        accepted_target_mib = accepted,
+                        "memory commitment changed"
+                    );
+                }
+                Err(error) => {
+                    state.memory.authority = TargetAuthority::Recovering;
+                    state.memory.policy = MemoryState {
+                        current_target_mib: memory.baseline_mib,
+                        low_ticks: 0,
+                    };
+                    state.memory.retry.damp(ask);
+                    tracing::debug!(
+                        target: MONITOR_TARGET,
+                        event = error.event(),
+                        axis = "memory",
+                        error = %error.detail(),
+                        requested_target_mib = memory.target_mib,
+                        last_accepted_target_mib = state.memory.last_accepted_target_mib,
+                        "memory resize did not report an accepted target"
+                    );
+                }
+            }
+        }
+
+        if let Some(result) = outcome.cpu {
+            let cpu = request
+                .cpu
+                .expect("a CPU outcome was only requested with a CPU request");
+            match result {
+                Ok(accepted) => {
+                    // Progress is measured against the unmet demand's anchor, never against
+                    // the ask or the corrective target.
+                    let progress = state
+                        .cpu
+                        .outstanding
+                        .is_some_and(|demand| cpu_demand_met(demand, accepted));
+                    state.cpu.authority = TargetAuthority::Confirmed;
+                    state.cpu.last_accepted_cpus = accepted;
+                    state.cpu.policy = CpuState {
+                        current_cpus: accepted,
+                        high_ticks: 0,
+                        low_ticks: 0,
+                    };
+                    state.cpu.correction_retry.clear();
+                    if progress {
+                        state.cpu.outstanding = None;
+                    } else if !cpu.recovering
+                        && let Some(outstanding) = state.cpu.outstanding.as_mut()
+                    {
+                        outstanding.no_progress_attempts =
+                            outstanding.no_progress_attempts.saturating_add(1);
+                        outstanding.waited_polls = 0;
+                    }
+                    tracing::debug!(
+                        target: MONITOR_TARGET,
+                        event = "cpu_transition",
+                        axis = "cpu",
+                        previous_cpus = cpu.baseline_cpus,
+                        requested_cpus = cpu.target_cpus,
+                        enforced_cpus = accepted,
+                        recovering = cpu.recovering,
+                        outstanding = state.cpu.outstanding.is_some(),
+                        "CPU commitment confirmed"
+                    );
+                }
+                Err(error) => {
+                    state.cpu.authority = TargetAuthority::Recovering;
+                    state.cpu.policy = CpuState {
+                        current_cpus: cpu.baseline_cpus,
+                        high_ticks: 0,
+                        low_ticks: 0,
+                    };
+                    if cpu.recovering {
+                        state.cpu.correction_retry.damp(CpuCorrectionAsk {
+                            target_cpus: cpu.target_cpus,
+                        });
+                    } else if let Some(outstanding) = state.cpu.outstanding.as_mut() {
+                        outstanding.no_progress_attempts =
+                            outstanding.no_progress_attempts.saturating_add(1);
+                        outstanding.waited_polls = 0;
+                    }
+                    tracing::debug!(
+                        target: MONITOR_TARGET,
+                        event = error.event(),
+                        axis = "cpu",
+                        error = %error.detail(),
+                        requested_cpus = cpu.target_cpus,
+                        last_accepted_cpus = state.cpu.last_accepted_cpus,
+                        "CPU resize did not report an accepted target"
+                    );
+                }
+            }
+        }
+
+        if any_error {
+            // No failure is evidence of "no effect", and a failure may have involved a paused
+            // or recovering runtime. Invalidate the eligibility cache (keeping the probe start,
+            // so this cannot become a probe storm) and require fresh evidence.
+            state.cpu_lifecycle.valid = false;
+            reset_cpu_evidence(&mut state.cpu);
+        }
+    }
+    state
+}
+
+/// One debug record per original poll.
+///
+/// It carries exactly what a live run needs to be attributed after the fact: the clock class,
+/// the decoded rate interval, the cached lifecycle and its age, both runs, the unmet demand's
+/// counters, whether memory was admitted, whether CPU was deferred, and the dispatch decision.
+/// Nothing is emitted at `info` or above, so normal output is unchanged.
+#[allow(clippy::too_many_arguments)]
+fn log_cpu_poll(
+    observation: CpuObservation,
+    rate: Option<CpuRate>,
+    lifecycle: CpuLifecycleCache,
+    counters: CpuState,
+    outstanding: Option<CpuOutstandingDemand>,
+    memory_admitted: bool,
+    cpu_request: Option<CpuResizeRequest>,
+    deferred: bool,
+) {
+    let (lower_tenths, upper_tenths) = match rate {
+        Some(rate) => (rate.lower_tenths, rate.upper_tenths),
+        None => (0, 0),
+    };
+    let cache_age_ms = lifecycle
+        .last_probe_started
+        .map(|started| now_instant().duration_since(started).as_millis() as u64);
+    let (attempts, waited_polls, anchor_cpus, target_cpus) = match outstanding {
+        Some(demand) => (
+            demand.no_progress_attempts,
+            demand.waited_polls,
+            demand.anchor_cpus,
+            demand.demand.target_cpus,
+        ),
+        None => (0, 0, 0, 0),
+    };
+    tracing::debug!(
+        target: MONITOR_TARGET,
+        event = "cpu_poll",
+        clock = ?observation,
+        rate_lower_tenths = lower_tenths,
+        rate_upper_tenths = upper_tenths,
+        lifecycle = ?lifecycle.value,
+        lifecycle_valid = lifecycle.valid,
+        cache_age_ms = cache_age_ms,
+        high_ticks = counters.high_ticks,
+        low_ticks = counters.low_ticks,
+        current_cpus = counters.current_cpus,
+        demand_target_cpus = target_cpus,
+        demand_anchor_cpus = anchor_cpus,
+        demand_attempts = attempts,
+        demand_waited_polls = waited_polls,
+        memory_admitted = memory_admitted,
+        cpu_deferred = deferred,
+        requested_cpus = cpu_request.map(|request| request.target_cpus).unwrap_or(0),
+        recovering_request = cpu_request.map(|request| request.recovering).unwrap_or(false),
+        "cpu poll"
+    );
+}
+
+/// Zero the CPU evidence runs without touching authority, history, demand or deadlines.
+fn reset_cpu_evidence(state: &mut CpuControllerState) {
+    state.policy.high_ticks = 0;
+    state.policy.low_ticks = 0;
+}
+
+fn now_instant() -> tokio::time::Instant {
+    tokio::time::Instant::now()
+}
+
+/// A cached reply is usable only inside its TTL, measured from the **attempt start**.
+fn cpu_lifecycle_fresh(cache: &CpuLifecycleCache, now: tokio::time::Instant) -> bool {
+    cache.valid
+        && cache
+            .last_probe_started
+            .is_some_and(|started| now.duration_since(started) < CPU_LIFECYCLE_TTL)
+}
+
+/// At most one probe attempt per TTL, whatever the cache says.
+fn cpu_probe_allowed(cache: &CpuLifecycleCache, now: tokio::time::Instant) -> bool {
+    cache
+        .last_probe_started
+        .is_none_or(|started| now.duration_since(started) >= CPU_LIFECYCLE_TTL)
+}
+
+/// One bounded lifecycle query, cached from its attempt start — including failures.
+async fn refresh_cpu_lifecycle<L, LF>(
+    cache: &mut CpuLifecycleCache,
+    probe_lifecycle: &mut L,
+    now: tokio::time::Instant,
+) -> CpuLifecycle
+where
+    L: FnMut() -> LF,
+    LF: std::future::Future<Output = anyhow::Result<CpuLifecycle>>,
+{
+    cache.last_probe_started = Some(now);
+    let outcome = tokio::time::timeout(CPU_LIFECYCLE_TIMEOUT, probe_lifecycle()).await;
+    let (value, detail) = match outcome {
+        Ok(Ok(CpuLifecycle::Running)) => (CpuLifecycle::Running, "running"),
+        Ok(Ok(CpuLifecycle::NotRunning)) => (CpuLifecycle::NotRunning, "not_running"),
+        Ok(Ok(CpuLifecycle::Unavailable)) => (CpuLifecycle::Unavailable, "unavailable"),
+        Ok(Err(error)) => {
+            tracing::debug!(
+                target: MONITOR_TARGET,
+                event = "cpu_lifecycle_probe_error",
+                error = %format!("{error:#}"),
+                "the lifecycle probe failed"
+            );
+            (CpuLifecycle::Unavailable, "error")
+        }
+        Err(_) => {
+            tracing::debug!(
+                target: MONITOR_TARGET,
+                event = "cpu_lifecycle_probe_timeout",
+                timeout_ms = CPU_LIFECYCLE_TIMEOUT.as_millis() as u64,
+                "the lifecycle probe exceeded its bound"
+            );
+            (CpuLifecycle::Unavailable, "timeout")
+        }
+    };
+    cache.value = value;
+    cache.valid = true;
+    tracing::debug!(
+        target: MONITOR_TARGET,
+        event = "cpu_lifecycle_probe",
+        result = detail,
+        cache_age_ms = now.elapsed().as_millis() as u64,
+        "lifecycle eligibility refreshed"
+    );
+    value
+}
+
+/// Test-only compatibility adapter: the S2 memory tests drive one axis through the shared
+/// driver with fixed CPU bounds, so no CPU work and no probe is possible.
+#[cfg(test)]
 async fn drive_memory<S, R, F>(
     bounds: MemoryBounds,
     state: MemoryControllerState,
@@ -981,152 +2466,78 @@ async fn drive_memory<S, R, F>(
 where
     S: futures::Stream<Item = anyhow::Result<Option<MemorySample>>>,
     R: FnMut(MemoryResizeRequest) -> F,
-    F: std::future::Future<Output = Result<u32, MemoryResizeError>>,
+    F: std::future::Future<Output = Result<u32, ResourceResizeError>>,
 {
-    let mut state = state;
-    let mut samples = std::pin::pin!(samples);
-    while let Some(item) = futures::StreamExt::next(&mut samples).await {
-        // Every item is one monitor tick, whatever it carries: the re-ask delay is measured
-        // in opportunities to observe, not in wall-clock time. Only a recorded failure has a
-        // delay to measure, so the counter stays at zero otherwise.
-        if state.retry.failed.is_some() {
-            state.retry.waited = state.retry.waited.saturating_add(1);
-        }
-        let sample = match item {
-            Ok(Some(sample)) => sample,
-            Ok(None) => {
-                tracing::debug!(
-                    target: MONITOR_TARGET,
-                    event = "metrics_missing",
-                    reason = "the metrics catalog has no live row for this sandbox yet",
-                    "memory sample missing"
-                );
-                state.policy.low_ticks = 0;
-                continue;
-            }
-            Err(error) => {
-                tracing::debug!(
-                    target: MONITOR_TARGET,
-                    event = "metrics_error",
-                    error = %format!("{error:#}"),
-                    "memory metrics lookup failed"
-                );
-                state.policy.low_ticks = 0;
-                continue;
-            }
-        };
-        let recovering = state.authority == TargetAuthority::Recovering;
-        let observed = if recovering {
-            match observed_memory_target(bounds, sample.memory_limit_bytes) {
-                Ok(observed) => Some(observed),
-                Err(error) => {
-                    tracing::debug!(
-                        target: MONITOR_TARGET,
-                        event = "invalid_recovery_limit",
-                        error = %format!("{error:#}"),
-                        last_accepted_target_mib = state.last_accepted_target_mib,
-                        "recovery baseline unusable; holding"
-                    );
-                    state.policy = memory_rebase(bounds, state.policy, true, None);
-                    continue;
-                }
-            }
-        } else {
-            None
-        };
-        let previous_mib = state.policy.current_target_mib;
-        state.policy = memory_rebase(bounds, state.policy, recovering, observed);
-        if let Some(observed_mib) = observed
-            && observed_mib != previous_mib
-        {
-            tracing::debug!(
-                target: MONITOR_TARGET,
-                event = "memory_reconciled",
-                observed_limit_mib = observed_mib,
-                last_accepted_target_mib = state.last_accepted_target_mib,
-                "recovery baseline moved to the observed live limit"
-            );
-        }
-        let baseline_mib = state.policy.current_target_mib;
-        let proposal = memory_tick(bounds, state.policy, sample);
-        if proposal.current_target_mib == baseline_mib {
-            state.policy.low_ticks = proposal.low_ticks;
-            continue;
-        }
-        let target_mib = proposal.current_target_mib;
-        let request = MemoryResizeRequest {
-            baseline_mib,
-            target_mib,
-            recovering,
-        };
-        // The ask's identity, not just its number: a reversal or a change of authority is a
-        // different ask and goes out at once.
-        let ask = MemoryAsk::of(request);
-        if !state.retry.admit(ask) {
-            // The same ask, too soon after one that made no progress. Holding here changes
-            // nothing else: a different ask is admitted on its own tick.
-            state.policy.low_ticks = proposal.low_ticks;
-            continue;
-        }
-        match resize(request).await {
-            Ok(accepted) => {
-                state.policy = MemoryState {
-                    current_target_mib: accepted,
-                    low_ticks: 0,
-                };
-                state.authority = TargetAuthority::Confirmed;
-                state.last_accepted_target_mib = accepted;
-                if accepted < target_mib {
-                    // `enforced` is the authority even when it is below the ask, but a target
-                    // the runtime reports as accepted and never reaches is not progress:
-                    // re-asking it every tick would be the same storm as a hard failure.
-                    state.retry.damp(ask);
-                } else {
-                    state.retry.clear();
-                }
-                tracing::debug!(
-                    target: MONITOR_TARGET,
-                    event = "memory_transition",
-                    previous_target_mib = baseline_mib,
-                    requested_target_mib = request.target_mib,
-                    accepted_target_mib = accepted,
-                    "memory commitment changed"
-                );
-            }
-            Err(error) => {
-                // An unknown outcome is not an acknowledgment, and it is not a hold: the
-                // next valid sample supplies the baseline, so a partial effect still
-                // recovers instead of starving behind a stale target.
-                state.authority = TargetAuthority::Recovering;
-                state.policy = MemoryState {
-                    current_target_mib: baseline_mib,
-                    low_ticks: 0,
-                };
-                state.retry.damp(ask);
-                tracing::debug!(
-                    target: MONITOR_TARGET,
-                    event = error.event(),
-                    error = %error.detail(),
-                    requested_target_mib = request.target_mib,
-                    last_accepted_target_mib = state.last_accepted_target_mib,
-                    "memory resize did not report an accepted target"
-                );
+    let resource_bounds = ResourceBounds {
+        cpu: CpuBounds {
+            boot_cpus: 1,
+            max_cpus: 1,
+        },
+        memory: bounds,
+    };
+    let initial = ResourceControllerState {
+        cpu: fixed_cpu_controller(),
+        memory: state,
+        cpu_clock: CpuObservationClock::default(),
+        cpu_lifecycle: CpuLifecycleCache::default(),
+    };
+    let mut poll = 0u64;
+    let samples = futures::StreamExt::map(samples, move |item| {
+        poll += 1;
+        item.map(|sample| {
+            sample.map(|memory| ResourceSample {
+                memory,
+                cpu_rate: None,
+                timestamp: std::time::UNIX_EPOCH + Duration::from_secs(poll),
+            })
+        })
+    });
+    let resize = move |request: ResourceResizeRequest| {
+        let memory = request
+            .memory
+            .expect("the memory compatibility adapter only requests memory");
+        let pending = resize(memory);
+        async move {
+            ResourceResizeOutcome {
+                cpu: None,
+                memory: Some(pending.await),
             }
         }
+    };
+    let probe = || async { anyhow::bail!("fixed CPU bounds never require a lifecycle probe") };
+    let final_state = drive_resources(resource_bounds, initial, samples, resize, probe).await;
+    final_state.memory
+}
+
+/// The disabled CPU axis the memory compatibility adapter uses: boot equals ceiling.
+#[cfg(test)]
+fn fixed_cpu_controller() -> CpuControllerState {
+    CpuControllerState {
+        policy: CpuState {
+            current_cpus: 1,
+            high_ticks: 0,
+            low_ticks: 0,
+        },
+        authority: TargetAuthority::Confirmed,
+        last_accepted_cpus: 1,
+        outstanding: None,
+        correction_retry: ResizeRetry::default(),
     }
-    state
 }
 
 /// The production cadence: one read per 200 ms tick, first tick after one interval.
 ///
 /// `MissedTickBehavior::Skip` is load-bearing. `Burst` would manufacture a rapid catch-up
 /// after slow I/O, and 50 such ticks would look like 10 s of lower demand.
-fn memory_samples<R, F>(
+///
+/// The reader returns the row immediately: it never calls or awaits `pause_state()`. Lifecycle
+/// is the driver's lazy concern, and memory dispatch must not wait behind it (N1).
+fn resource_samples<R, F>(
     read: R,
-) -> impl futures::Stream<Item = anyhow::Result<Option<MemorySample>>> + Send
+) -> impl futures::Stream<Item = anyhow::Result<Option<ResourceSample>>> + Send
 where
     R: FnMut() -> F + Send,
-    F: std::future::Future<Output = anyhow::Result<Option<MemorySample>>> + Send,
+    F: std::future::Future<Output = anyhow::Result<Option<ResourceSample>>> + Send,
 {
     let mut ticker = tokio::time::interval_at(
         tokio::time::Instant::now() + METRICS_SAMPLE_INTERVAL,
@@ -1145,24 +2556,55 @@ where
 /// `all_sandbox_metrics_local` runs its own catalog queries per call, which ADR-0070 D1
 /// accepts as the cost of reading through the SDK instead of the registry. No fallback to
 /// `memory_bytes`, host-resident bytes or another API: an absent row is an absent sample.
-async fn read_memory_sample(
+async fn read_resource_sample(
     sandbox: &microsandbox::Sandbox,
-) -> anyhow::Result<Option<MemorySample>> {
+) -> anyhow::Result<Option<ResourceSample>> {
     let Some(local) = sandbox.backend().as_local() else {
         anyhow::bail!("the sandbox has no local backend, so live metrics cannot be read");
     };
     let mut metrics = microsandbox::sandbox::all_sandbox_metrics_local(local).await?;
-    Ok(metrics
-        .remove(sandbox.name())
-        .map(|metrics| memory_sample_of(&metrics)))
+    let Some(metrics) = metrics.remove(sandbox.name()) else {
+        return Ok(None);
+    };
+    Ok(Some(resource_sample_of(&metrics)?))
 }
 
-/// Copy the two fields the policy uses, and nothing that could stand in for them.
-fn memory_sample_of(metrics: &microsandbox::sandbox::SandboxMetrics) -> MemorySample {
-    MemorySample {
-        memory_limit_bytes: metrics.memory_limit_bytes,
-        memory_available_bytes: metrics.memory_available_bytes,
-    }
+/// Copy the fields both policies use, and nothing that could stand in for them.
+///
+/// Memory keeps exactly its two S2 fields. The CPU rate goes through the proved decoder, so the
+/// SDK's non-optional `f32` becomes an internal `Option` interval; a published zero is `None`
+/// because it proves neither absence nor idleness (S-B).
+fn resource_sample_of(
+    metrics: &microsandbox::sandbox::SandboxMetrics,
+) -> anyhow::Result<ResourceSample> {
+    let seconds = u64::try_from(metrics.timestamp.timestamp())
+        .map_err(|_| anyhow::anyhow!("the metrics timestamp precedes the Unix epoch"))?;
+    let timestamp = std::time::UNIX_EPOCH
+        + Duration::from_secs(seconds)
+        + Duration::from_nanos(u64::from(metrics.timestamp.timestamp_subsec_nanos()));
+    Ok(ResourceSample {
+        memory: MemorySample {
+            memory_limit_bytes: metrics.memory_limit_bytes,
+            memory_available_bytes: metrics.memory_available_bytes,
+        },
+        cpu_rate: cpu_rate_of(metrics.cpu_percent),
+        timestamp,
+    })
+}
+
+/// Trusted adapter: one lifecycle query, mapped to eligibility only.
+///
+/// `paused` and `recovery_required` both mean no CPU work; anything the SDK reports as an error
+/// is `Unavailable`. This call takes a lifecycle transition guard and a run-matched control
+/// session (`sandbox/pause.rs:175-223`), so it is not a cheap flag — the driver's cache exists
+/// for that reason.
+async fn read_cpu_lifecycle(sandbox: &microsandbox::Sandbox) -> anyhow::Result<CpuLifecycle> {
+    let state = sandbox.pause_state().await?;
+    Ok(if state.paused || state.recovery_required {
+        CpuLifecycle::NotRunning
+    } else {
+        CpuLifecycle::Running
+    })
 }
 
 /// Trusted decoder: an observed live limit in whole MiB inside the session's interval.
@@ -1246,19 +2688,38 @@ fn status_text_mib(text: &str) -> anyhow::Result<u32> {
     }
 }
 
+/// A `std::error::Error` over one shared `Arc`, so a live failure that affects both axes can be
+/// reported twice without requiring the error itself to be cloneable.
+#[derive(Debug)]
+struct SharedResizeError(std::sync::Arc<anyhow::Error>);
+
+impl std::fmt::Display for SharedResizeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:#}", self.0)
+    }
+}
+
+impl std::error::Error for SharedResizeError {}
+
 /// ADR-0070 D2 with the unknown-outcome amendment: one request through the SDK.
-async fn resize_memory(
+async fn resize_resources(
     sandbox: &microsandbox::Sandbox,
-    bounds: MemoryBounds,
-    request: MemoryResizeRequest,
-) -> Result<u32, MemoryResizeError> {
-    resize_memory_with(bounds, request, |mode, target_mib| {
+    bounds: ResourceBounds,
+    request: ResourceResizeRequest,
+) -> ResourceResizeOutcome {
+    resize_resources_with(bounds, request, |mode, targets| {
         let sandbox = sandbox.clone();
         async move {
-            let builder = sandbox.modify().memory(target_mib);
+            let mut builder = sandbox.modify();
+            if let Some(cpus) = targets.cpus {
+                builder = builder.cpus(cpus);
+            }
+            if let Some(memory_mib) = targets.memory_mib {
+                builder = builder.memory(memory_mib);
+            }
             let builder = match mode {
-                MemoryApplyMode::Live => builder,
-                MemoryApplyMode::NextStart => builder.next_start(),
+                ResourceApplyMode::Live => builder,
+                ResourceApplyMode::NextStart => builder.next_start(),
             };
             builder.apply().await.map_err(anyhow::Error::new)
         }
@@ -1266,66 +2727,334 @@ async fn resize_memory(
     .await
 }
 
-/// The apply seam: a recovering request repairs saved configuration before it moves RAM.
+/// The apply seam: one combined prepare for recovering axes, then one combined live apply.
 ///
-/// A live patch whose desired memory equals the persisted desired memory is classified as
-/// an applied plan with no memory status, so repeating it after a failed persistence can
-/// be a statusless no-op forever. Persisting a distinct `NextStart` seed first makes the
-/// following live apply a real planned change. `NextStart` sends no runtime control, so the
-/// seed never shrinks usable RAM the way a live bounce could.
+/// A live patch whose desired field equals the persisted desired field is classified as an
+/// applied plan with no status for that axis, so repeating it after a failed persistence can be
+/// a statusless no-op forever. Persisting distinct `NextStart` seeds first makes each following
+/// live field a real planned change, and `NextStart` sends no runtime control, so a seed never
+/// bounces live state. Both axes share at most one prepare and one live apply, never per-axis
+/// pairs (S-E).
+///
+/// Preparation is isolated: an axis with no seed, or one whose prepare did not apply cleanly, is
+/// excluded from the live call with its own error and never blocks a healthy neighbour.
+async fn resize_resources_with<A, F>(
+    bounds: ResourceBounds,
+    request: ResourceResizeRequest,
+    mut apply: A,
+) -> ResourceResizeOutcome
+where
+    A: FnMut(ResourceApplyMode, ResourceTargets) -> F,
+    F: std::future::Future<Output = anyhow::Result<microsandbox::sandbox::SandboxModificationPlan>>,
+{
+    let mut outcome = ResourceResizeOutcome {
+        cpu: None,
+        memory: None,
+    };
+
+    // (1) Seeds for the requested recovering axes only.
+    let mut seeds = ResourceTargets::default();
+    let mut cpu_no_seed = None;
+    let mut memory_no_seed = None;
+    if let Some(cpu) = request.cpu
+        && cpu.recovering
+    {
+        match cpu_recovery_seed(bounds.cpu, cpu.target_cpus) {
+            Some(seed) => seeds.cpus = Some(seed),
+            None => {
+                cpu_no_seed = Some(ResourceResizeError::Unconfirmed(anyhow::anyhow!(
+                    "recovery_prepare: no boot-derived seed in {}..={} differs from {}",
+                    bounds.cpu.boot_cpus,
+                    bounds.cpu.max_cpus,
+                    cpu.target_cpus
+                )))
+            }
+        }
+    }
+    if let Some(memory) = request.memory
+        && memory.recovering
+    {
+        match memory_recovery_seed(bounds.memory, memory.baseline_mib, memory.target_mib) {
+            Some(seed) => seeds.memory_mib = Some(seed),
+            None => {
+                memory_no_seed = Some(ResourceResizeError::Unconfirmed(anyhow::anyhow!(
+                    "recovery_prepare: no configuration seed in {}..={} MiB differs from both {} and {}",
+                    bounds.memory.boot_memory_mib,
+                    bounds.memory.max_memory_mib,
+                    memory.baseline_mib,
+                    memory.target_mib
+                )))
+            }
+        }
+    }
+
+    // (2) One combined NextStart apply containing only seed fields.
+    let mut cpu_prepared = false;
+    let mut memory_prepared = false;
+    if seeds.cpus.is_some() || seeds.memory_mib.is_some() {
+        let participants = ResourceTargets {
+            cpus: if seeds.cpus.is_some() {
+                request.cpu.map(|cpu| cpu.target_cpus)
+            } else {
+                None
+            },
+            memory_mib: if seeds.memory_mib.is_some() {
+                request.memory.map(|memory| memory.target_mib)
+            } else {
+                None
+            },
+        };
+        let prepared = apply(ResourceApplyMode::NextStart, seeds).await;
+        let failure = match prepared {
+            Err(error) => {
+                let shared = std::sync::Arc::new(error);
+                Some(ResourceResizeError::Modify(anyhow::Error::new(
+                    SharedResizeError(shared),
+                )))
+            }
+            Ok(plan) if !plan.applied => Some(ResourceResizeError::Unconfirmed(anyhow::anyhow!(
+                "recovery_prepare: the combined seed patch was not applied"
+            ))),
+            Ok(plan) if !plan.resize_status.is_empty() => {
+                Some(ResourceResizeError::Unconfirmed(anyhow::anyhow!(
+                    "recovery_prepare: the combined seed patch reported a live resize status"
+                )))
+            }
+            Ok(_) => None,
+        };
+        match failure {
+            None => {
+                cpu_prepared = participants.cpus.is_some();
+                memory_prepared = participants.memory_mib.is_some();
+            }
+            Some(error) => {
+                // No live seed mutation was intended, but saved values are unknown: stay
+                // Recovering on every participating axis and report the failure once per axis.
+                if let Some(target) = participants.cpus {
+                    outcome.cpu = Some(Err(contextual_prepare_error(&error, target)));
+                }
+                if let Some(_target) = participants.memory_mib {
+                    outcome.memory = Some(Err(contextual_memory_prepare_error(&error)));
+                }
+            }
+        }
+    }
+
+    // (3) One live apply carrying every remaining field.
+    let mut targets = ResourceTargets::default();
+    let mut cpu_participates = false;
+    let mut memory_participates = false;
+    if let Some(cpu) = request.cpu {
+        if !cpu.recovering || cpu_prepared {
+            targets.cpus = Some(cpu.target_cpus);
+            cpu_participates = true;
+        } else if outcome.cpu.is_none() {
+            outcome.cpu = Some(Err(cpu_no_seed.unwrap_or_else(|| {
+                ResourceResizeError::Unconfirmed(anyhow::anyhow!(
+                    "recovery_prepare: the CPU seed was not prepared"
+                ))
+            })));
+        }
+    }
+    if let Some(memory) = request.memory {
+        if !memory.recovering || memory_prepared {
+            targets.memory_mib = Some(memory.target_mib);
+            memory_participates = true;
+        } else if outcome.memory.is_none() {
+            outcome.memory = Some(Err(memory_no_seed.unwrap_or_else(|| {
+                ResourceResizeError::Unconfirmed(anyhow::anyhow!(
+                    "recovery_prepare: the memory seed was not prepared"
+                ))
+            })));
+        }
+    }
+    if !cpu_participates && !memory_participates {
+        return outcome;
+    }
+
+    let plan = apply(ResourceApplyMode::Live, targets).await;
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(error) => {
+            // One shared error, no partial receipt: every live participant has an unknown
+            // outcome, and none may be inferred to be unchanged.
+            let shared = std::sync::Arc::new(error);
+            if cpu_participates {
+                outcome.cpu = Some(Err(ResourceResizeError::Modify(
+                    anyhow::Error::new(SharedResizeError(std::sync::Arc::clone(&shared))).context(
+                        format!(
+                            "live_apply: requesting {} vCPU",
+                            targets.cpus.unwrap_or(bounds.cpu.boot_cpus)
+                        ),
+                    ),
+                )));
+            }
+            if memory_participates {
+                outcome.memory = Some(Err(ResourceResizeError::Modify(
+                    anyhow::Error::new(SharedResizeError(shared)).context(format!(
+                        "live_apply: requesting {} MiB",
+                        targets.memory_mib.unwrap_or(bounds.memory.boot_memory_mib)
+                    )),
+                )));
+            }
+            return outcome;
+        }
+    };
+
+    // (4) Decode each axis independently: one bad receipt must not discard a good one, and
+    // `applied=false` makes every requested receipt unusable.
+    if cpu_participates {
+        let requested_cpus = targets.cpus.unwrap_or(bounds.cpu.boot_cpus);
+        outcome.cpu = Some(
+            accepted_cpu_target(&plan, bounds.cpu, requested_cpus).map_err(|error| {
+                ResourceResizeError::Unconfirmed(error.context(format!(
+                    "live_apply: decoding the status for {requested_cpus} vCPU"
+                )))
+            }),
+        );
+    }
+    if memory_participates {
+        let requested_mib = targets.memory_mib.unwrap_or(bounds.memory.boot_memory_mib);
+        outcome.memory = Some(
+            accepted_memory_target(&plan, bounds.memory).map_err(|error| {
+                ResourceResizeError::Unconfirmed(error.context(format!(
+                    "live_apply: decoding the status for {requested_mib} MiB"
+                )))
+            }),
+        );
+    }
+    outcome
+}
+
+fn contextual_prepare_error(error: &ResourceResizeError, target_cpus: u8) -> ResourceResizeError {
+    ResourceResizeError::Unconfirmed(anyhow::anyhow!(
+        "recovery_prepare: seeding configuration before {target_cpus} vCPU: {}",
+        error.detail()
+    ))
+}
+
+fn contextual_memory_prepare_error(error: &ResourceResizeError) -> ResourceResizeError {
+    ResourceResizeError::Unconfirmed(anyhow::anyhow!(
+        "recovery_prepare: seeding configuration before the memory target: {}",
+        error.detail()
+    ))
+}
+
+/// Trusted decoder for the SDK's enforced CPU target, the only CPU authority there is.
+///
+/// `actual` is diagnostic: a converging guest may lag, and `requested` proves this receipt
+/// belongs to this request, but neither establishes enforcement. No catalog `cpus`, saved
+/// desired value, `cpu_percent` or `nproc` is accepted here.
+fn accepted_cpu_target(
+    plan: &microsandbox::sandbox::SandboxModificationPlan,
+    bounds: CpuBounds,
+    requested_cpus: u8,
+) -> anyhow::Result<u8> {
+    if !plan.applied {
+        anyhow::bail!("the modification plan was not applied");
+    }
+    let mut statuses = plan
+        .resize_status
+        .iter()
+        .filter(|status| status.resource == microsandbox::sandbox::ResourceKind::Cpus);
+    let status = statuses
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("the plan reported no CPU resize status"))?;
+    if statuses.next().is_some() {
+        anyhow::bail!("the plan reported more than one CPU resize status");
+    }
+    match status.state {
+        microsandbox::sandbox::ResourceConvergenceState::Accepted
+        | microsandbox::sandbox::ResourceConvergenceState::Converging
+        | microsandbox::sandbox::ResourceConvergenceState::Applied => {}
+        microsandbox::sandbox::ResourceConvergenceState::GuestRefused => {
+            anyhow::bail!("the guest refused the CPU resize")
+        }
+        microsandbox::sandbox::ResourceConvergenceState::Failed => {
+            anyhow::bail!("the CPU resize failed")
+        }
+    }
+    let requested = cpu_status_count(&status.requested)?;
+    if requested != requested_cpus {
+        anyhow::bail!(
+            "the receipt's requested value {requested} vCPU is not this request's {requested_cpus}"
+        );
+    }
+    let actual = cpu_status_count(&status.actual)?;
+    let enforced = cpu_status_count(&status.enforced)?;
+    if !cpu_target_in_bounds(bounds, actual) {
+        anyhow::bail!(
+            "the actual target {actual} vCPU is outside {}..={}",
+            bounds.boot_cpus,
+            bounds.max_cpus
+        );
+    }
+    if !cpu_target_in_bounds(bounds, enforced) {
+        anyhow::bail!(
+            "the enforced target {enforced} vCPU is outside {}..={}",
+            bounds.boot_cpus,
+            bounds.max_cpus
+        );
+    }
+    tracing::debug!(
+        target: MONITOR_TARGET,
+        event = "cpu_resize_status",
+        requested_cpus = requested,
+        actual_cpus = actual,
+        enforced_cpus = enforced,
+        state = ?status.state,
+        "decoded a CPU resize receipt"
+    );
+    Ok(enforced)
+}
+
+/// Nonempty ASCII decimal digits, checked into `u32` then `u8`. No units, sign or whitespace.
+fn cpu_status_count(text: &str) -> anyhow::Result<u8> {
+    let unsupported = || anyhow::anyhow!("the CPU target {text:?} is not a plain decimal count");
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(unsupported());
+    }
+    let value: u32 = text.parse().map_err(|_| unsupported())?;
+    u8::try_from(value).map_err(|_| anyhow::anyhow!("the CPU target {text:?} exceeds u8"))
+}
+
+/// Test-only compatibility adapter: the S2 memory tests keep their single-axis seam.
+#[cfg(test)]
 async fn resize_memory_with<A, F>(
     bounds: MemoryBounds,
     request: MemoryResizeRequest,
     mut apply: A,
-) -> Result<u32, MemoryResizeError>
+) -> Result<u32, ResourceResizeError>
 where
-    A: FnMut(MemoryApplyMode, u32) -> F,
+    A: FnMut(ResourceApplyMode, u32) -> F,
     F: std::future::Future<Output = anyhow::Result<microsandbox::sandbox::SandboxModificationPlan>>,
 {
-    if request.recovering {
-        let Some(seed_mib) = memory_recovery_seed(bounds, request.baseline_mib, request.target_mib)
-        else {
-            return Err(MemoryResizeError::Unconfirmed(anyhow::anyhow!(
-                "recovery_prepare: no configuration seed in {}..={} MiB differs from both {} and {}",
-                bounds.boot_memory_mib,
-                bounds.max_memory_mib,
-                request.baseline_mib,
-                request.target_mib
-            )));
-        };
-        // An error or a rejected plan may already have persisted the seed: the caller must
-        // stay Recovering rather than assume the saved configuration is unchanged.
-        let prepared = apply(MemoryApplyMode::NextStart, seed_mib)
-            .await
-            .map_err(|error| {
-                MemoryResizeError::Modify(
-                    error.context(format!("recovery_prepare: saving a {seed_mib} MiB seed")),
-                )
-            })?;
-        if !prepared.applied {
-            return Err(MemoryResizeError::Unconfirmed(anyhow::anyhow!(
-                "recovery_prepare: saving a {seed_mib} MiB seed was not applied"
-            )));
-        }
-        if !prepared.resize_status.is_empty() {
-            return Err(MemoryResizeError::Unconfirmed(anyhow::anyhow!(
-                "recovery_prepare: saving a {seed_mib} MiB seed reported a live resize status"
-            )));
-        }
-    }
-    let plan = apply(MemoryApplyMode::Live, request.target_mib)
-        .await
-        .map_err(|error| {
-            MemoryResizeError::Modify(
-                error.context(format!("live_apply: requesting {} MiB", request.target_mib)),
+    let resource_bounds = ResourceBounds {
+        cpu: CpuBounds {
+            boot_cpus: 1,
+            max_cpus: 1,
+        },
+        memory: bounds,
+    };
+    let outcome = resize_resources_with(
+        resource_bounds,
+        ResourceResizeRequest {
+            cpu: None,
+            memory: Some(request),
+        },
+        move |mode, targets| {
+            apply(
+                mode,
+                targets
+                    .memory_mib
+                    .expect("the memory compatibility adapter only sends memory"),
             )
-        })?;
-    accepted_memory_target(&plan, bounds).map_err(|error| {
-        MemoryResizeError::Unconfirmed(error.context(format!(
-            "live_apply: decoding the status for {} MiB",
-            request.target_mib
-        )))
-    })
+        },
+    )
+    .await;
+    outcome
+        .memory
+        .expect("a requested memory axis always has an outcome")
 }
 
 /// The launcher's only handle on the monitor task.
@@ -2268,6 +3997,63 @@ mod tests {
         .await
     }
 
+    /// `count` identical low-usage rows, the shape the memory damping tests need.
+    impl FakeVm {
+        async fn apply(
+            &self,
+            mode: ResourceApplyMode,
+            mib: u32,
+        ) -> anyhow::Result<microsandbox::sandbox::SandboxModificationPlan> {
+            let (outcome, persisted, release) = {
+                let mut state = self.state.lock().unwrap();
+                let outcome = Self::step(&mut state, mode, mib);
+                let persisted = state.prepare_persisted.take();
+                let release = state.prepare_release.take();
+                (outcome, persisted, release)
+            };
+            // Outside the lock: a deterministic window between persisting the seed and
+            // returning the prepare plan.
+            if let Some(sender) = persisted {
+                let _ = sender.send(());
+            }
+            if let Some(release) = release {
+                let _ = release.await;
+            }
+            outcome
+        }
+    }
+
+    /// Drive the production driver *and* the production SDK adapter against the model.
+    async fn drive_fake(
+        bounds: MemoryBounds,
+        from: MemoryControllerState,
+        samples: Vec<anyhow::Result<Option<MemorySample>>>,
+        vm: std::sync::Arc<FakeVm>,
+    ) -> MemoryControllerState {
+        let modifier = std::sync::Arc::clone(&vm);
+        drive_memory(
+            bounds,
+            from,
+            futures::stream::iter(samples),
+            move |request| {
+                let vm = std::sync::Arc::clone(&modifier);
+                async move {
+                    vm.state.lock().unwrap().policy_requests.push(request);
+                    resize_memory_with(bounds, request, move |mode, mib| {
+                        let vm = std::sync::Arc::clone(&vm);
+                        async move { vm.apply(mode, mib).await }
+                    })
+                    .await
+                }
+            },
+        )
+        .await
+    }
+
+    fn lows(count: usize, limit_mib: u64, used_mib: u64) -> Vec<(u64, u64)> {
+        vec![(limit_mib, used_mib); count]
+    }
+
     fn samples_of(rows: &[(u64, u64)]) -> Vec<anyhow::Result<Option<MemorySample>>> {
         rows.iter()
             .map(|(limit, used)| Ok(Some(sample(*limit, *used))))
@@ -2536,7 +4322,7 @@ mod tests {
         actual_mib: u32,
         runtime_target_mib: u32,
         saved_desired_mib: u32,
-        sdk_actions: Vec<(MemoryApplyMode, u32)>,
+        sdk_actions: Vec<(ResourceApplyMode, u32)>,
         control_requests: Vec<u32>,
         policy_requests: Vec<MemoryResizeRequest>,
         live_fault: Option<LiveFault>,
@@ -2582,7 +4368,7 @@ mod tests {
             )
         }
 
-        fn sdk_actions(&self) -> Vec<(MemoryApplyMode, u32)> {
+        fn sdk_actions(&self) -> Vec<(ResourceApplyMode, u32)> {
             self.state.lock().unwrap().sdk_actions.clone()
         }
 
@@ -2603,12 +4389,12 @@ mod tests {
         /// One SDK call against the model, without any await point.
         fn step(
             state: &mut FakeState,
-            mode: MemoryApplyMode,
+            mode: ResourceApplyMode,
             mib: u32,
         ) -> anyhow::Result<microsandbox::sandbox::SandboxModificationPlan> {
             state.sdk_actions.push((mode, mib));
             match mode {
-                MemoryApplyMode::NextStart => {
+                ResourceApplyMode::NextStart => {
                     if state.prepare_fault == Some(PrepareFault::ErrorBeforePersist) {
                         state.prepare_fault = None;
                         return Err(anyhow::anyhow!(
@@ -2634,7 +4420,7 @@ mod tests {
                         None => Ok(modification_plan(true, vec![])),
                     }
                 }
-                MemoryApplyMode::Live => {
+                ResourceApplyMode::Live => {
                     // The SDK's own rule: a patch equal to the saved desired memory plans
                     // no change, so it applies and reports no live status.
                     if state.saved_desired_mib == mib {
@@ -2677,60 +4463,2807 @@ mod tests {
                 }
             }
         }
+    }
 
-        async fn apply(
-            &self,
-            mode: MemoryApplyMode,
-            mib: u32,
-        ) -> anyhow::Result<microsandbox::sandbox::SandboxModificationPlan> {
-            let (outcome, persisted, release) = {
-                let mut state = self.state.lock().unwrap();
-                let outcome = Self::step(&mut state, mode, mib);
-                let persisted = state.prepare_persisted.take();
-                let release = state.prepare_release.take();
-                (outcome, persisted, release)
-            };
-            // Outside the lock: a deterministic window between persisting the seed and
-            // returning the prepare plan.
-            if let Some(sender) = persisted {
-                let _ = sender.send(());
-            }
-            if let Some(release) = release {
-                let _ = release.await;
-            }
-            outcome
+    fn cpu_status(
+        state: microsandbox::sandbox::ResourceConvergenceState,
+        requested: &str,
+        actual: &str,
+        enforced: &str,
+    ) -> microsandbox::sandbox::ResourceResizeStatus {
+        microsandbox::sandbox::ResourceResizeStatus {
+            resource: microsandbox::sandbox::ResourceKind::Cpus,
+            requested: requested.to_string(),
+            actual: actual.to_string(),
+            enforced: enforced.to_string(),
+            state,
         }
     }
 
-    /// Drive the production driver *and* the production SDK adapter against the model.
-    async fn drive_fake(
-        bounds: MemoryBounds,
-        from: MemoryControllerState,
-        samples: Vec<anyhow::Result<Option<MemorySample>>>,
-        vm: std::sync::Arc<FakeVm>,
-    ) -> MemoryControllerState {
-        let modifier = std::sync::Arc::clone(&vm);
-        drive_memory(
+    /// Where a live apply fails, in the pinned SDK's own stage order.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum StageFault {
+        /// No runtime control was sent and nothing persisted.
+        BeforeAny,
+        /// CPU control took effect; its active-config persist failed.
+        AfterCpuControl,
+        /// CPU took effect and persisted; memory was not attempted.
+        AfterCpuPersist,
+        /// Memory control took effect after the CPU stages; its persist failed.
+        AfterMemoryControl,
+        /// Both active writes persisted; the desired write failed.
+        AfterMemoryPersist,
+        /// Everything persisted, and the call still failed.
+        AfterDesiredPersist,
+    }
+
+    /// Corrupt only the *returned* receipt, after every modelled effect has run.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Corrupt {
+        CpuReceipt,
+        MemoryReceipt,
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct FakeResourcesState {
+        desired_cpus: u8,
+        desired_mib: u32,
+        enforced_cpus: u8,
+        runtime_mib: u32,
+        applies: Vec<(ResourceApplyMode, ResourceTargets)>,
+        live_failures: u32,
+        prepare_failure: bool,
+        stage_fault: Option<StageFault>,
+        corrupt: Option<Corrupt>,
+        /// A diagnostic cap: the runtime enforces at most this many CPUs while still
+        /// reporting the requested value as accepted (the under-enforcement the plan models).
+        enforce_cap: u8,
+    }
+
+    /// One stateful SDK model: saved desired per field, runtime enforcement, and the real
+    /// equality rule that a patch equal to saved desired emits no status.
+    struct FakeResources {
+        state: std::sync::Mutex<FakeResourcesState>,
+    }
+
+    impl FakeResources {
+        fn new(cpus: u8, mib: u32) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                state: std::sync::Mutex::new(FakeResourcesState {
+                    desired_cpus: cpus,
+                    desired_mib: mib,
+                    enforced_cpus: cpus,
+                    runtime_mib: mib,
+                    ..FakeResourcesState::default()
+                }),
+            })
+        }
+
+        fn fail_live(&self, times: u32) {
+            self.state.lock().unwrap().live_failures = times;
+        }
+
+        fn cap_enforcement(&self, cpus: u8) {
+            self.state.lock().unwrap().enforce_cap = cpus;
+        }
+
+        fn fail_prepare(&self) {
+            self.state.lock().unwrap().prepare_failure = true;
+        }
+
+        fn fail_at(&self, stage: StageFault) {
+            self.state.lock().unwrap().stage_fault = Some(stage);
+        }
+
+        fn corrupt_receipt(&self, which: Corrupt) {
+            self.state.lock().unwrap().corrupt = Some(which);
+        }
+
+        fn applies(&self) -> Vec<(ResourceApplyMode, ResourceTargets)> {
+            self.state.lock().unwrap().applies.clone()
+        }
+
+        fn enforced(&self) -> (u8, u32) {
+            let state = self.state.lock().unwrap();
+            (state.enforced_cpus, state.runtime_mib)
+        }
+
+        fn desired(&self) -> (u8, u32) {
+            let state = self.state.lock().unwrap();
+            (state.desired_cpus, state.desired_mib)
+        }
+
+        fn apply(
+            &self,
+            mode: ResourceApplyMode,
+            targets: ResourceTargets,
+        ) -> anyhow::Result<microsandbox::sandbox::SandboxModificationPlan> {
+            let mut state = self.state.lock().unwrap();
+            state.applies.push((mode, targets));
+            match mode {
+                ResourceApplyMode::NextStart => {
+                    if state.prepare_failure {
+                        return Err(anyhow::anyhow!("the seed patch was rejected"));
+                    }
+                    if let Some(cpus) = targets.cpus {
+                        state.desired_cpus = cpus;
+                    }
+                    if let Some(mib) = targets.memory_mib {
+                        state.desired_mib = mib;
+                    }
+                    Ok(modification_plan(true, Vec::new()))
+                }
+                ResourceApplyMode::Live => {
+                    if state.live_failures > 0 {
+                        state.live_failures -= 1;
+                        return Err(anyhow::anyhow!(
+                            "the live patch failed before any runtime control request"
+                        ));
+                    }
+                    let stage = state.stage_fault.take();
+                    if stage == Some(StageFault::BeforeAny) {
+                        return Err(anyhow::anyhow!(
+                            "the live patch failed before any runtime control request"
+                        ));
+                    }
+                    let cpu_planned = targets.cpus.is_some_and(|cpus| cpus != state.desired_cpus);
+                    let memory_planned = targets
+                        .memory_mib
+                        .is_some_and(|mib| mib != state.desired_mib);
+                    let mut statuses = Vec::new();
+                    if let Some(cpus) = targets.cpus
+                        && cpu_planned
+                    {
+                        // The requested CPU is written to active/desired config even when the
+                        // enforced value differs, which is the pinned SDK's own behaviour.
+                        let cap = state.enforce_cap;
+                        let enforced = if cap == 0 { cpus } else { cpus.min(cap) };
+                        state.enforced_cpus = enforced;
+                        if stage == Some(StageFault::AfterCpuControl) {
+                            return Err(anyhow::anyhow!(
+                                "the CPU target was accepted and active-config persistence failed"
+                            ));
+                        }
+                        state.desired_cpus = cpus;
+                        statuses.push(cpu_status(
+                            microsandbox::sandbox::ResourceConvergenceState::Accepted,
+                            &cpus.to_string(),
+                            &enforced.to_string(),
+                            &enforced.to_string(),
+                        ));
+                        if stage == Some(StageFault::AfterCpuPersist) {
+                            return Err(anyhow::anyhow!(
+                                "the CPU target persisted and the memory request was not attempted"
+                            ));
+                        }
+                    }
+                    if let Some(mib) = targets.memory_mib
+                        && memory_planned
+                    {
+                        state.runtime_mib = mib;
+                        if stage == Some(StageFault::AfterMemoryControl) {
+                            return Err(anyhow::anyhow!(
+                                "the memory target was accepted and active-config persistence failed"
+                            ));
+                        }
+                        state.desired_mib = mib;
+                        statuses.push(memory_resize_status(
+                            microsandbox::sandbox::ResourceConvergenceState::Applied,
+                            &status_text(mib),
+                            &status_text(mib),
+                            &status_text(mib),
+                        ));
+                        if stage == Some(StageFault::AfterMemoryPersist) {
+                            return Err(anyhow::anyhow!(
+                                "both targets persisted and the desired write failed"
+                            ));
+                        }
+                    }
+                    if stage == Some(StageFault::AfterDesiredPersist) {
+                        return Err(anyhow::anyhow!(
+                            "everything persisted and the call still failed"
+                        ));
+                    }
+                    match state.corrupt.take() {
+                        // A malformed receipt changes only what the controller accepts; the
+                        // modelled effects above stand, exactly as the SDK leaves them.
+                        Some(Corrupt::CpuReceipt) => {
+                            if let Some(status) = statuses.iter_mut().find(|status| {
+                                status.resource == microsandbox::sandbox::ResourceKind::Cpus
+                            }) {
+                                status.enforced = "two".to_string();
+                            }
+                        }
+                        Some(Corrupt::MemoryReceipt) => {
+                            if let Some(status) = statuses.iter_mut().find(|status| {
+                                status.resource == microsandbox::sandbox::ResourceKind::Memory
+                            }) {
+                                status.enforced = "loads".to_string();
+                            }
+                        }
+                        None => {}
+                    }
+                    Ok(modification_plan(true, statuses))
+                }
+            }
+        }
+    }
+
+    fn running_cache() -> CpuLifecycleCache {
+        CpuLifecycleCache {
+            value: CpuLifecycle::Running,
+            valid: true,
+            last_probe_started: Some(tokio::time::Instant::now()),
+        }
+    }
+
+    fn resource_state(cpu_current: u8, memory_current_mib: u32) -> ResourceControllerState {
+        ResourceControllerState {
+            cpu: CpuControllerState {
+                policy: cpu_state(cpu_current, 0, 0),
+                authority: TargetAuthority::Confirmed,
+                last_accepted_cpus: cpu_current,
+                outstanding: None,
+                correction_retry: ResizeRetry::default(),
+            },
+            memory: MemoryControllerState {
+                policy: MemoryState {
+                    current_target_mib: memory_current_mib,
+                    low_ticks: 0,
+                },
+                authority: TargetAuthority::Confirmed,
+                last_accepted_target_mib: memory_current_mib,
+                retry: MemoryRetry::default(),
+            },
+            cpu_clock: CpuObservationClock::default(),
+            cpu_lifecycle: running_cache(),
+        }
+    }
+
+    fn resource_sample(second: u64, percent: f32, limit_mib: u64, used_mib: u64) -> ResourceSample {
+        ResourceSample {
+            memory: sample(limit_mib, used_mib),
+            cpu_rate: cpu_rate_of(percent),
+            timestamp: std::time::UNIX_EPOCH + Duration::from_secs(second),
+        }
+    }
+
+    /// One row per nominal 200 ms poll, so paused time exercises the TTL honestly.
+    fn advancing_samples(
+        samples: Vec<anyhow::Result<Option<ResourceSample>>>,
+    ) -> impl futures::Stream<Item = anyhow::Result<Option<ResourceSample>>> {
+        futures::stream::unfold(samples.into_iter(), |mut items| async move {
+            let item = items.next()?;
+            tokio::time::advance(METRICS_SAMPLE_INTERVAL).await;
+            Some((item, items))
+        })
+    }
+
+    async fn drive_resources_fake<S>(
+        bounds: ResourceBounds,
+        from: ResourceControllerState,
+        samples: S,
+        vm: std::sync::Arc<FakeResources>,
+        lifecycle: CpuLifecycle,
+        probes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> ResourceControllerState
+    where
+        S: futures::Stream<Item = anyhow::Result<Option<ResourceSample>>>,
+    {
+        drive_resources_with_probe(bounds, from, samples, vm, move || {
+            probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move { Ok(lifecycle) }
+        })
+        .await
+    }
+
+    /// The same driver with a scripted lifecycle probe, so a test can count calls, fail them,
+    /// stall them past the 50 ms bound, or answer differently per call.
+    async fn drive_resources_with_probe<S, L, LF>(
+        bounds: ResourceBounds,
+        from: ResourceControllerState,
+        samples: S,
+        vm: std::sync::Arc<FakeResources>,
+        probe: L,
+    ) -> ResourceControllerState
+    where
+        S: futures::Stream<Item = anyhow::Result<Option<ResourceSample>>>,
+        L: FnMut() -> LF,
+        LF: std::future::Future<Output = anyhow::Result<CpuLifecycle>>,
+    {
+        drive_resources(
             bounds,
             from,
-            futures::stream::iter(samples),
-            move |request| {
-                let vm = std::sync::Arc::clone(&modifier);
+            samples,
+            move |request: ResourceResizeRequest| {
+                let vm = std::sync::Arc::clone(&vm);
                 async move {
-                    vm.state.lock().unwrap().policy_requests.push(request);
-                    resize_memory_with(bounds, request, move |mode, mib| {
+                    resize_resources_with(bounds, request, move |mode, targets| {
                         let vm = std::sync::Arc::clone(&vm);
-                        async move { vm.apply(mode, mib).await }
+                        async move { vm.apply(mode, targets) }
                     })
                     .await
                 }
             },
+            probe,
         )
         .await
     }
 
-    fn lows(count: usize, limit_mib: u64, used_mib: u64) -> Vec<(u64, u64)> {
-        vec![(limit_mib, used_mib); count]
+    fn fresh_probes() -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0))
+    }
+
+    fn probe_count(probes: &std::sync::atomic::AtomicUsize) -> usize {
+        probes.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn simultaneous_admitted_targets_take_exactly_one_combined_apply() {
+        tokio::time::pause();
+        let bounds = ResourceBounds {
+            cpu: cpu_bounds(1, 4),
+            memory: bounds(512, 1024),
+        };
+        // CPU is one observation from a step and memory needs growth on the same row.
+        let mut from = resource_state(1, 512);
+        from.cpu.policy.high_ticks = CPU_HIGH_TICKS - 1;
+        let vm = FakeResources::new(1, 512);
+        let probes = fresh_probes();
+        let final_state = drive_resources_fake(
+            bounds,
+            from,
+            futures::stream::iter(vec![Ok(Some(resource_sample(10, 95.0, 512, 512)))]),
+            std::sync::Arc::clone(&vm),
+            CpuLifecycle::Running,
+            std::sync::Arc::clone(&probes),
+        )
+        .await;
+        assert_eq!(
+            vm.applies(),
+            vec![(
+                ResourceApplyMode::Live,
+                ResourceTargets {
+                    cpus: Some(2),
+                    memory_mib: Some(768),
+                },
+            )],
+            "one builder, one live apply, both fields"
+        );
+        assert_eq!(vm.enforced(), (2, 768));
+        assert_eq!(vm.desired(), (2, 768));
+        assert_eq!(final_state.cpu.policy.current_cpus, 2);
+        assert_eq!(final_state.cpu.authority, TargetAuthority::Confirmed);
+        assert_eq!(final_state.memory.policy.current_target_mib, 768);
+        assert_eq!(probe_count(&probes), 0, "a fresh cache needs no probe");
+    }
+
+    #[tokio::test]
+    async fn one_axis_or_neither_dispatches_exactly_once() {
+        tokio::time::pause();
+        let bounds = ResourceBounds {
+            cpu: cpu_bounds(1, 4),
+            memory: bounds(512, 1024),
+        };
+        // CPU only: a completed high run, memory already converged.
+        let vm = FakeResources::new(1, 512);
+        let probes = fresh_probes();
+        let mut from = resource_state(1, 512);
+        from.cpu.policy.high_ticks = CPU_HIGH_TICKS - 1;
+        let final_state = drive_resources_fake(
+            bounds,
+            from,
+            futures::stream::iter(vec![Ok(Some(resource_sample(10, 95.0, 512, 256)))]),
+            std::sync::Arc::clone(&vm),
+            CpuLifecycle::Running,
+            std::sync::Arc::clone(&probes),
+        )
+        .await;
+        assert_eq!(vm.applies().len(), 1);
+        assert_eq!(vm.applies()[0].1.cpus, Some(2));
+        assert_eq!(vm.applies()[0].1.memory_mib, None);
+        assert_eq!(final_state.cpu.policy.current_cpus, 2);
+
+        // Memory only: a growing memory need with CPU in deadband at 2.
+        let vm = FakeResources::new(2, 512);
+        let probes = fresh_probes();
+        let final_state = drive_resources_fake(
+            bounds,
+            resource_state(2, 512),
+            futures::stream::iter(vec![Ok(Some(resource_sample(10, 100.0, 512, 512)))]),
+            std::sync::Arc::clone(&vm),
+            CpuLifecycle::Running,
+            std::sync::Arc::clone(&probes),
+        )
+        .await;
+        assert_eq!(vm.applies().len(), 1);
+        assert_eq!(vm.applies()[0].1.cpus, None);
+        assert_eq!(vm.applies()[0].1.memory_mib, Some(768));
+        assert_eq!(final_state.memory.policy.current_target_mib, 768);
+
+        // Neither: a deadband row with converged memory emits no call at all.
+        let vm = FakeResources::new(2, 512);
+        let probes = fresh_probes();
+        let _final_state = drive_resources_fake(
+            bounds,
+            resource_state(2, 512),
+            futures::stream::iter(vec![Ok(Some(resource_sample(10, 100.0, 512, 256)))]),
+            std::sync::Arc::clone(&vm),
+            CpuLifecycle::Running,
+            std::sync::Arc::clone(&probes),
+        )
+        .await;
+        assert!(vm.applies().is_empty());
+    }
+
+    #[tokio::test]
+    async fn corrective_cpu_recovery_is_rate_independent_and_keeps_outstanding_demand() {
+        tokio::time::pause();
+        let bounds = ResourceBounds {
+            cpu: cpu_bounds(1, 4),
+            memory: bounds(512, 512),
+        };
+        let vm = FakeResources::new(1, 512);
+        vm.fail_live(1);
+        let probes = fresh_probes();
+        let mut from = resource_state(1, 512);
+        from.cpu.policy.high_ticks = CPU_HIGH_TICKS - 1;
+        // The tenth high proposes 2; the live apply fails with an unknown outcome.
+        let final_state = drive_resources_fake(
+            bounds,
+            from,
+            futures::stream::iter(vec![Ok(Some(resource_sample(10, 95.0, 512, 256)))]),
+            std::sync::Arc::clone(&vm),
+            CpuLifecycle::Running,
+            std::sync::Arc::clone(&probes),
+        )
+        .await;
+        assert_eq!(final_state.cpu.authority, TargetAuthority::Recovering);
+        let outstanding = final_state
+            .cpu
+            .outstanding
+            .expect("the unmet upward demand survives the failure");
+        assert_eq!(outstanding.demand.target_cpus, 2);
+        assert_eq!(outstanding.demand.direction, CpuDirection::Up);
+        assert_eq!(outstanding.no_progress_attempts, 1);
+        let after_failure = vm.applies().len();
+
+        // A long run of published zeros: no demand decision, but correction must still land.
+        let zeros: Vec<_> = (11..=310)
+            .map(|second| Ok(Some(resource_sample(second, 0.0, 512, 256))))
+            .collect();
+        let final_state = drive_resources_fake(
+            bounds,
+            final_state,
+            advancing_samples(zeros),
+            std::sync::Arc::clone(&vm),
+            CpuLifecycle::Running,
+            std::sync::Arc::clone(&probes),
+        )
+        .await;
+        let calls = vm.applies();
+        assert!(calls.len() > after_failure, "the correction was attempted");
+        // The first correction attempt is the immediate repeat: a distinct seed, then live 1.
+        assert_eq!(
+            calls[after_failure],
+            (
+                ResourceApplyMode::NextStart,
+                ResourceTargets {
+                    cpus: Some(2),
+                    memory_mib: None,
+                }
+            ),
+            "the boot-derived seed is distinct from the re-confirm target of 1"
+        );
+        assert_eq!(
+            calls[after_failure + 1],
+            (
+                ResourceApplyMode::Live,
+                ResourceTargets {
+                    cpus: Some(1),
+                    memory_mib: None,
+                }
+            )
+        );
+        assert_eq!(vm.enforced(), (1, 512));
+        assert_eq!(final_state.cpu.authority, TargetAuthority::Confirmed);
+        assert_eq!(final_state.cpu.last_accepted_cpus, 1);
+        // The corrective re-confirmation proves no progress toward the unmet Up2 demand.
+        let outstanding = final_state
+            .cpu
+            .outstanding
+            .expect("correction must not clear outstanding demand");
+        assert_eq!(outstanding.demand.target_cpus, 2);
+        assert_eq!(
+            outstanding.no_progress_attempts, 1,
+            "a correction is not a normal no-progress attempt"
+        );
+        // After the successful correction, zero rows are silent: no demand, no more calls.
+        let settled_calls = vm.applies().len();
+        let final_state = drive_resources_fake(
+            bounds,
+            final_state,
+            advancing_samples(
+                (311..=400)
+                    .map(|second| Ok(Some(resource_sample(second, 0.0, 512, 256))))
+                    .collect(),
+            ),
+            std::sync::Arc::clone(&vm),
+            CpuLifecycle::Running,
+            std::sync::Arc::clone(&probes),
+        )
+        .await;
+        assert_eq!(
+            vm.applies().len(),
+            settled_calls,
+            "zero never authorises a decision"
+        );
+        assert_eq!(final_state.cpu.policy.high_ticks, 0);
+        assert_eq!(final_state.cpu.policy.low_ticks, 0);
+    }
+
+    #[test]
+    fn the_epoch_high_water_never_lowers_and_correction_is_explicit() {
+        let second = |value: u64| std::time::UNIX_EPOCH + Duration::from_secs(value);
+        let mut clock = CpuObservationClock::default();
+        assert_eq!(
+            observe_cpu_clock(&mut clock, second(100)),
+            CpuObservation::Distinct
+        );
+        assert_eq!(
+            observe_cpu_clock(&mut clock, second(100)),
+            CpuObservation::Duplicate
+        );
+        assert_eq!(clock.high_water, Some(second(100)));
+        // A100 -> B90 -> identical A100: B resets the streak, replay A is a duplicate.
+        assert_eq!(
+            observe_cpu_clock(&mut clock, second(90)),
+            CpuObservation::Regressed
+        );
+        assert_eq!(
+            observe_cpu_clock(&mut clock, second(100)),
+            CpuObservation::Duplicate
+        );
+        assert_eq!(clock.high_water, Some(second(100)));
+        // 99 regressed polls keep the high-water; the 100th re-anchors and is discarded.
+        for _ in 0..99 {
+            assert_eq!(
+                observe_cpu_clock(&mut clock, second(90)),
+                CpuObservation::Regressed
+            );
+            assert_eq!(clock.high_water, Some(second(100)));
+        }
+        assert_eq!(
+            observe_cpu_clock(&mut clock, second(90)),
+            CpuObservation::ClockCorrection
+        );
+        assert_eq!(clock.high_water, Some(second(90)));
+        assert_eq!(clock.consecutive_regressed_polls, 0);
+        // A genuinely advancing row below the *old* maximum starts the corrected epoch.
+        assert_eq!(
+            observe_cpu_clock(&mut clock, second(95)),
+            CpuObservation::Distinct
+        );
+        assert_eq!(clock.high_water, Some(second(95)));
+        // Equal timestamps interrupt the streak, so alternation cannot force a correction.
+        let mut clock = CpuObservationClock::default();
+        assert_eq!(
+            observe_cpu_clock(&mut clock, second(200)),
+            CpuObservation::Distinct
+        );
+        for _ in 0..1000 {
+            assert_eq!(
+                observe_cpu_clock(&mut clock, second(150)),
+                CpuObservation::Regressed
+            );
+            assert_eq!(
+                observe_cpu_clock(&mut clock, second(200)),
+                CpuObservation::Duplicate
+            );
+        }
+        assert_eq!(clock.high_water, Some(second(200)));
+        // Below the current high-water is still a regression; advancing above it is evidence.
+        assert_eq!(
+            observe_cpu_clock(&mut clock, second(160)),
+            CpuObservation::Regressed
+        );
+        assert_eq!(clock.high_water, Some(second(200)));
+        assert_eq!(
+            observe_cpu_clock(&mut clock, second(210)),
+            CpuObservation::Distinct
+        );
+        assert_eq!(clock.high_water, Some(second(210)));
+    }
+
+    #[tokio::test]
+    async fn a_replayed_row_is_a_duplicate_and_never_dispatches() {
+        tokio::time::pause();
+        let bounds = ResourceBounds {
+            cpu: cpu_bounds(1, 4),
+            memory: bounds(512, 512),
+        };
+        let vm = FakeResources::new(1, 512);
+        let probes = fresh_probes();
+        let samples = futures::stream::iter(vec![
+            Ok(Some(resource_sample(100, 95.0, 512, 256))),
+            Ok(Some(resource_sample(90, 90.0, 512, 256))),
+            Ok(Some(resource_sample(100, 95.0, 512, 256))),
+        ]);
+        let final_state = drive_resources_fake(
+            bounds,
+            resource_state(1, 512),
+            samples,
+            std::sync::Arc::clone(&vm),
+            CpuLifecycle::Running,
+            std::sync::Arc::clone(&probes),
+        )
+        .await;
+        assert!(vm.applies().is_empty(), "one high is not a run");
+        assert_eq!(final_state.cpu.policy.current_cpus, 1);
+        assert_eq!(final_state.cpu.policy.high_ticks, 0);
+        assert_eq!(
+            final_state.cpu_clock.high_water,
+            Some(std::time::UNIX_EPOCH + Duration::from_secs(100))
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_producers_advance_the_dwell_on_distinct_rows_not_polls() {
+        // Plan T16: a 400 ms producer behind the 200 ms reader hands every sampled row to
+        // two polls. Ten *distinct* highs must still take ten distinct rows (20 polls), not
+        // ten polls, and the duplicate must neither count nor reset.
+        tokio::time::pause();
+        let vm = FakeResources::new(1, 512);
+        let mut state = resource_state(1, 512);
+        let mut stamp = 10_000u64;
+        for distinct in 1..=10u64 {
+            state = drive_one_poll(&vm, state, stamp, 95.0).await;
+            state = drive_one_poll(&vm, state, stamp, 95.0).await;
+            if distinct < 10 {
+                assert!(
+                    vm.applies().is_empty(),
+                    "grew after {distinct} distinct highs at a 400 ms producer"
+                );
+                assert_eq!(state.cpu.policy.high_ticks, distinct as u32);
+            }
+            stamp += 400;
+        }
+        assert_eq!(vm.applies().len(), 1, "one grow apply, not two");
+        assert_eq!(vm.enforced().0, 2);
+        assert_eq!(state.cpu.policy.current_cpus, 2);
+        assert_eq!(state.cpu.policy.high_ticks, 0);
+
+        // A 600 ms producer hands each row to three polls: five distinct lows at C=2 shrink
+        // once, on the fifth distinct row, and not before.
+        let vm = FakeResources::new(2, 512);
+        let mut state = resource_state(2, 512);
+        let mut stamp = 10_000u64;
+        for distinct in 1..=5u64 {
+            for _ in 0..3 {
+                state = drive_one_poll(&vm, state, stamp, 85.0).await;
+            }
+            if distinct < 5 {
+                assert!(
+                    vm.applies().is_empty(),
+                    "shrank after {distinct} distinct lows at a 600 ms producer"
+                );
+                assert_eq!(state.cpu.policy.low_ticks, distinct as u32);
+            }
+            stamp += 600;
+        }
+        assert_eq!(vm.applies().len(), 1, "one shrink apply, not two");
+        assert_eq!(vm.enforced().0, 1);
+        assert_eq!(state.cpu.policy.current_cpus, 1);
+        assert_eq!(state.cpu.policy.low_ticks, 0);
+    }
+
+    #[tokio::test]
+    async fn an_admitted_memory_request_never_waits_for_a_lifecycle_probe() {
+        tokio::time::pause();
+        let bounds = ResourceBounds {
+            cpu: cpu_bounds(1, 4),
+            memory: bounds(512, 1024),
+        };
+        let vm = FakeResources::new(1, 512);
+        let probes = fresh_probes();
+        let mut from = resource_state(1, 512);
+        // No cached eligibility: a probe would be needed for CPU.
+        from.cpu_lifecycle = CpuLifecycleCache::default();
+        let final_state = drive_resources_fake(
+            bounds,
+            from,
+            futures::stream::iter(vec![Ok(Some(resource_sample(10, 95.0, 512, 512)))]),
+            std::sync::Arc::clone(&vm),
+            CpuLifecycle::Running,
+            std::sync::Arc::clone(&probes),
+        )
+        .await;
+        // Memory was dispatched alone, and CPU was deferred without a probe.
+        assert_eq!(
+            vm.applies(),
+            vec![(
+                ResourceApplyMode::Live,
+                ResourceTargets {
+                    cpus: None,
+                    memory_mib: Some(768),
+                },
+            )]
+        );
+        assert_eq!(probe_count(&probes), 0, "never on the memory dispatch path");
+        assert_eq!(
+            final_state.cpu.policy.high_ticks, 0,
+            "eligibility was unavailable"
+        );
+
+        // With no admitted memory request, the next distinct row may probe.
+        let final_state = drive_resources_fake(
+            bounds,
+            final_state,
+            futures::stream::iter(vec![Ok(Some(resource_sample(11, 95.0, 768, 256)))]),
+            std::sync::Arc::clone(&vm),
+            CpuLifecycle::Running,
+            std::sync::Arc::clone(&probes),
+        )
+        .await;
+        assert_eq!(probe_count(&probes), 1);
+        assert_eq!(final_state.cpu.policy.high_ticks, 1);
+        assert_eq!(final_state.cpu_lifecycle.value, CpuLifecycle::Running);
+        // The cache is reused inside its TTL: a third row probes nothing.
+        let _final_state = drive_resources_fake(
+            bounds,
+            final_state,
+            futures::stream::iter(vec![Ok(Some(resource_sample(12, 95.0, 768, 256)))]),
+            std::sync::Arc::clone(&vm),
+            CpuLifecycle::Running,
+            std::sync::Arc::clone(&probes),
+        )
+        .await;
+        assert_eq!(probe_count(&probes), 1, "one probe per TTL");
+    }
+
+    #[tokio::test]
+    async fn a_settled_paused_lifecycle_blocks_cpu_without_a_call() {
+        tokio::time::pause();
+        let bounds = ResourceBounds {
+            cpu: cpu_bounds(1, 4),
+            memory: bounds(512, 512),
+        };
+        let vm = FakeResources::new(1, 512);
+        let probes = fresh_probes();
+        let mut from = resource_state(1, 512);
+        from.cpu_lifecycle = CpuLifecycleCache::default();
+        let final_state = drive_resources_fake(
+            bounds,
+            from,
+            advancing_samples(
+                (10..=12)
+                    .map(|second| Ok(Some(resource_sample(second, 95.0, 512, 256))))
+                    .collect(),
+            ),
+            std::sync::Arc::clone(&vm),
+            CpuLifecycle::NotRunning,
+            std::sync::Arc::clone(&probes),
+        )
+        .await;
+        assert!(vm.applies().is_empty(), "no CPU work while not running");
+        assert_eq!(probe_count(&probes), 1, "one probe inside one TTL");
+        assert_eq!(final_state.cpu.policy.high_ticks, 0);
+        assert_eq!(final_state.cpu.policy.current_cpus, 1);
+    }
+
+    // ---- T10/T11: stage faults and malformed-return follow-through ----
+
+    fn combined_request() -> ResourceResizeRequest {
+        ResourceResizeRequest {
+            cpu: Some(CpuResizeRequest {
+                baseline_cpus: 1,
+                target_cpus: 2,
+                recovering: false,
+            }),
+            memory: Some(MemoryResizeRequest {
+                baseline_mib: 512,
+                target_mib: 768,
+                recovering: false,
+            }),
+        }
+    }
+
+    async fn apply_to_fake(
+        bounds: ResourceBounds,
+        request: ResourceResizeRequest,
+        vm: std::sync::Arc<FakeResources>,
+    ) -> ResourceResizeOutcome {
+        resize_resources_with(bounds, request, {
+            let vm = std::sync::Arc::clone(&vm);
+            move |mode, targets| {
+                let vm = std::sync::Arc::clone(&vm);
+                async move { vm.apply(mode, targets) }
+            }
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn every_live_stage_failure_leaves_the_outcome_unknown_for_both_axes() {
+        tokio::time::pause();
+        let bounds = ResourceBounds {
+            cpu: cpu_bounds(1, 4),
+            memory: bounds(512, 1024),
+        };
+        // Stage order is the pinned SDK's: CPU control, CPU persist, memory control, memory
+        // persist, desired persist. Each row is (fault, enforced, desired) after the call.
+        let cases = [
+            (StageFault::BeforeAny, (1, 512), (1, 512)),
+            (StageFault::AfterCpuControl, (2, 512), (1, 512)),
+            (StageFault::AfterCpuPersist, (2, 512), (2, 512)),
+            (StageFault::AfterMemoryControl, (2, 768), (2, 512)),
+            (StageFault::AfterMemoryPersist, (2, 768), (2, 768)),
+            (StageFault::AfterDesiredPersist, (2, 768), (2, 768)),
+        ];
+        for (stage, enforced, desired) in cases {
+            let vm = FakeResources::new(1, 512);
+            vm.fail_at(stage);
+            let outcome =
+                apply_to_fake(bounds, combined_request(), std::sync::Arc::clone(&vm)).await;
+            assert!(
+                outcome.cpu.is_some_and(|result| result.is_err()),
+                "{stage:?}: the CPU outcome must be unknown, never 'no effect'"
+            );
+            assert!(
+                outcome.memory.is_some_and(|result| result.is_err()),
+                "{stage:?}: the memory outcome must be unknown"
+            );
+            assert_eq!(
+                vm.enforced(),
+                enforced,
+                "{stage:?} enforcement after the failure"
+            );
+            assert_eq!(
+                vm.desired(),
+                desired,
+                "{stage:?} saved desired after the failure"
+            );
+            assert_eq!(
+                vm.applies().len(),
+                1,
+                "{stage:?}: one live apply and no prepare for a fresh combined request"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_malformed_receipt_never_discards_the_other_axis() {
+        tokio::time::pause();
+        let bounds = ResourceBounds {
+            cpu: cpu_bounds(1, 4),
+            memory: bounds(512, 1024),
+        };
+        // CPU valid, memory malformed: both effects persist, only CPU is accepted.
+        let vm = FakeResources::new(1, 512);
+        vm.corrupt_receipt(Corrupt::MemoryReceipt);
+        let outcome = apply_to_fake(bounds, combined_request(), std::sync::Arc::clone(&vm)).await;
+        assert_eq!(
+            outcome.cpu.and_then(Result::ok),
+            Some(2),
+            "the valid axis is confirmed"
+        );
+        assert!(
+            outcome.memory.is_some_and(|result| result.is_err()),
+            "the malformed axis is not"
+        );
+        assert_eq!(vm.enforced(), (2, 768), "both modelled effects stand");
+        assert_eq!(vm.desired(), (2, 768));
+
+        // Memory valid, CPU malformed: the inverse, with the same persisted state.
+        let vm = FakeResources::new(1, 512);
+        vm.corrupt_receipt(Corrupt::CpuReceipt);
+        let outcome = apply_to_fake(bounds, combined_request(), std::sync::Arc::clone(&vm)).await;
+        assert!(
+            outcome.cpu.is_some_and(|result| result.is_err()),
+            "the malformed CPU receipt is not authority"
+        );
+        assert_eq!(outcome.memory.and_then(Result::ok), Some(768));
+        assert_eq!(vm.enforced(), (2, 768));
+        assert_eq!(vm.desired(), (2, 768));
+    }
+
+    #[tokio::test]
+    async fn a_malformed_cpu_receipt_recovers_through_policy_and_a_fresh_receipt() {
+        tokio::time::pause();
+        let bounds = ResourceBounds {
+            cpu: cpu_bounds(1, 4),
+            memory: bounds(512, 512),
+        };
+        let vm = FakeResources::new(1, 512);
+        vm.corrupt_receipt(Corrupt::CpuReceipt);
+        let mut from = resource_state(1, 512);
+        from.cpu.policy.high_ticks = CPU_HIGH_TICKS - 1;
+        let state = drive_resources_fake(
+            bounds,
+            from,
+            futures::stream::iter(vec![Ok(Some(resource_sample(10, 95.0, 512, 256)))]),
+            std::sync::Arc::clone(&vm),
+            CpuLifecycle::Running,
+            fresh_probes(),
+        )
+        .await;
+        // The receipt was unusable: Recovering with history only, and the effect persisted.
+        assert_eq!(state.cpu.authority, TargetAuthority::Recovering);
+        assert_eq!(
+            state.cpu.last_accepted_cpus, 1,
+            "observations never become history"
+        );
+        assert_eq!(
+            vm.enforced().0,
+            2,
+            "the malformed receipt did not undo the effect"
+        );
+        // Advance past the invalidation cooldown on a distinct zero row: the correction may
+        // run, and it needs a real receipt of its own.
+        let state = drive_resources_fake(
+            bounds,
+            state,
+            advancing_samples(
+                (11..=16)
+                    .map(|second| Ok(Some(resource_sample(second, 0.0, 512, 256))))
+                    .collect(),
+            ),
+            std::sync::Arc::clone(&vm),
+            CpuLifecycle::Running,
+            fresh_probes(),
+        )
+        .await;
+        assert_eq!(state.cpu.authority, TargetAuthority::Confirmed);
+        assert_eq!(state.cpu.last_accepted_cpus, 1);
+        assert_eq!(
+            vm.enforced().0,
+            1,
+            "the correction re-confirmed the accepted value"
+        );
+        let calls = vm.applies();
+        let tail: Vec<_> = calls[calls.len() - 2..].to_vec();
+        assert_eq!(
+            tail,
+            vec![
+                (
+                    ResourceApplyMode::NextStart,
+                    ResourceTargets {
+                        cpus: Some(2),
+                        memory_mib: None
+                    }
+                ),
+                (
+                    ResourceApplyMode::Live,
+                    ResourceTargets {
+                        cpus: Some(1),
+                        memory_mib: None
+                    }
+                ),
+            ],
+            "a durable seed distinct from the re-confirm target, then the live repair"
+        );
+        assert_eq!(
+            state.cpu.policy.high_ticks, 0,
+            "a fresh dwell is required after recovery"
+        );
+        // The malformed receipt was a normal no-progress attempt, and the corrective
+        // re-confirmation must not erase the unmet demand or its count.
+        let demand = state
+            .cpu
+            .outstanding
+            .expect("the unmet Up2 demand survives recovery");
+        assert_eq!(demand.demand.target_cpus, 2);
+        assert_eq!(demand.no_progress_attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_prepare_suppresses_only_its_own_axis() {
+        tokio::time::pause();
+        let bounds = ResourceBounds {
+            cpu: cpu_bounds(1, 4),
+            memory: bounds(512, 1024),
+        };
+        let vm = FakeResources::new(1, 512);
+        vm.fail_prepare();
+        let outcome = apply_to_fake(
+            bounds,
+            ResourceResizeRequest {
+                cpu: Some(CpuResizeRequest {
+                    baseline_cpus: 1,
+                    target_cpus: 2,
+                    recovering: false,
+                }),
+                memory: Some(MemoryResizeRequest {
+                    baseline_mib: 512,
+                    target_mib: 768,
+                    recovering: true,
+                }),
+            },
+            std::sync::Arc::clone(&vm),
+        )
+        .await;
+        assert!(
+            outcome.cpu.is_some_and(|result| result.is_ok()),
+            "the healthy neighbour still applies"
+        );
+        assert!(
+            outcome.memory.is_some_and(|result| result.is_err()),
+            "the failed prepare suppresses only its own axis"
+        );
+        let applies = vm.applies();
+        assert_eq!(applies.len(), 2, "one prepare, then one live apply");
+        assert_eq!(
+            applies[0],
+            (
+                ResourceApplyMode::NextStart,
+                ResourceTargets {
+                    cpus: None,
+                    memory_mib: Some(640),
+                }
+            ),
+            "the seed carries only the preparing axis"
+        );
+        assert_eq!(
+            applies[1],
+            (
+                ResourceApplyMode::Live,
+                ResourceTargets {
+                    cpus: Some(2),
+                    memory_mib: None,
+                }
+            )
+        );
+        assert_eq!(
+            vm.enforced(),
+            (2, 512),
+            "the memory axis never reached control"
+        );
+    }
+
+    // ---- T7: the CPU receipt decoder's own table ----
+
+    #[test]
+    fn accepted_cpu_target_decodes_only_a_usable_enforced_receipt() {
+        let bounds = cpu_bounds(1, 4);
+        let accepting = |requested: &str, actual: &str, enforced: &str| {
+            modification_plan(
+                true,
+                vec![cpu_status(
+                    microsandbox::sandbox::ResourceConvergenceState::Accepted,
+                    requested,
+                    actual,
+                    enforced,
+                )],
+            )
+        };
+        // M3 as reported: requested 3, guest still converging at 2, enforcement 3.
+        assert_eq!(
+            accepted_cpu_target(&accepting("3", "2", "3"), bounds, 3).ok(),
+            Some(3)
+        );
+        // Enforced is the authority even when it differs from the ask or from actual.
+        assert_eq!(
+            accepted_cpu_target(&accepting("3", "3", "2"), bounds, 3).ok(),
+            Some(2)
+        );
+        for state in [
+            microsandbox::sandbox::ResourceConvergenceState::Accepted,
+            microsandbox::sandbox::ResourceConvergenceState::Converging,
+            microsandbox::sandbox::ResourceConvergenceState::Applied,
+        ] {
+            let plan = modification_plan(true, vec![cpu_status(state, "2", "2", "2")]);
+            assert_eq!(
+                accepted_cpu_target(&plan, bounds, 2).ok(),
+                Some(2),
+                "{state:?}"
+            );
+        }
+        // applied=false makes even a well-formed receipt unusable.
+        assert!(
+            accepted_cpu_target(
+                &modification_plan(
+                    false,
+                    vec![cpu_status(
+                        microsandbox::sandbox::ResourceConvergenceState::Accepted,
+                        "2",
+                        "2",
+                        "2"
+                    )]
+                ),
+                bounds,
+                2
+            )
+            .is_err()
+        );
+        // Missing and duplicated statuses.
+        assert!(accepted_cpu_target(&modification_plan(true, Vec::new()), bounds, 2).is_err());
+        assert!(
+            accepted_cpu_target(
+                &modification_plan(
+                    true,
+                    vec![
+                        cpu_status(
+                            microsandbox::sandbox::ResourceConvergenceState::Accepted,
+                            "2",
+                            "2",
+                            "2"
+                        );
+                        2
+                    ]
+                ),
+                bounds,
+                2
+            )
+            .is_err()
+        );
+        for state in [
+            microsandbox::sandbox::ResourceConvergenceState::GuestRefused,
+            microsandbox::sandbox::ResourceConvergenceState::Failed,
+        ] {
+            let plan = modification_plan(true, vec![cpu_status(state, "2", "2", "2")]);
+            assert!(accepted_cpu_target(&plan, bounds, 2).is_err(), "{state:?}");
+        }
+        // Malformed, mismatched and out-of-range fields. Units, signs, whitespace, fractions,
+        // overflow and an out-of-bounds enforced value are all rejected.
+        for (requested, actual, enforced) in [
+            ("", "2", "2"),
+            ("-2", "2", "2"),
+            ("2.0", "2", "2"),
+            ("2 vCPU", "2", "2"),
+            (" 2", "2", "2"),
+            ("+2", "2", "2"),
+            ("256", "2", "2"),
+            ("99999999999999999999", "2", "2"),
+            ("3", "2", "2"),
+            ("2", "0", "2"),
+            ("2", "5", "2"),
+            ("2", "2", "0"),
+            ("2", "2", "5"),
+        ] {
+            assert!(
+                accepted_cpu_target(&accepting(requested, actual, enforced), bounds, 2).is_err(),
+                "{requested:?}/{actual:?}/{enforced:?}"
+            );
+        }
+        // A memory receipt cannot stand in for a CPU one.
+        let memory_only = modification_plan(
+            true,
+            vec![memory_resize_status(
+                microsandbox::sandbox::ResourceConvergenceState::Applied,
+                "512 MiB",
+                "512 MiB",
+                "512 MiB",
+            )],
+        );
+        assert!(accepted_cpu_target(&memory_only, bounds, 2).is_err());
+        // The two-value interval's upper target is in bounds; five is not.
+        assert!(accepted_cpu_target(&accepting("2", "2", "2"), cpu_bounds(1, 2), 2).is_ok());
+        assert!(accepted_cpu_target(&accepting("2", "2", "2"), cpu_bounds(1, 1), 2).is_err());
+    }
+
+    // ---- T14: the retry schedule itself ----
+
+    #[test]
+    fn the_cpu_retry_schedule_is_exactly_the_declared_one() {
+        // First repeat immediate, then 5, 10, ... capped at 50, saturating for any u32 count.
+        assert_eq!(cpu_retry_delay(0), 0);
+        assert_eq!(cpu_retry_delay(1), 0);
+        for attempts in 2..=11u32 {
+            assert_eq!(cpu_retry_delay(attempts), 5 * (attempts - 1), "{attempts}");
+        }
+        assert_eq!(cpu_retry_delay(12), 50);
+        assert_eq!(cpu_retry_delay(u32::MAX), 50);
+        // The same schedule backs memory's damping, so neither axis can drift alone.
+        let mut retry: ResizeRetry<CpuCorrectionAsk> = ResizeRetry::default();
+        let ask = CpuCorrectionAsk { target_cpus: 2 };
+        for attempt in 0..3u32 {
+            assert!(
+                retry.admit(ask),
+                "attempt {attempt} of a new identity is immediate"
+            );
+            retry.damp(ask);
+            // Every poll ticks the clock: after the delay the same identity is re-admitted.
+            for _ in 0..cpu_retry_delay(attempt + 1) {
+                retry.waited = retry.waited.saturating_add(1);
+            }
+        }
+        // A different target never inherits the count.
+        let other = CpuCorrectionAsk { target_cpus: 3 };
+        retry.damp(ask);
+        assert!(retry.admit(other));
+        assert_eq!(retry.attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn a_failure_after_the_seed_keeps_recovery_and_pacing() {
+        tokio::time::pause();
+        let bounds = ResourceBounds {
+            cpu: cpu_bounds(1, 4),
+            memory: bounds(512, 1024),
+        };
+        let vm = FakeResources::new(1, 512);
+        // A recovering CPU axis with an unmet demand, and a live failure after the seed.
+        let mut from = resource_state(1, 512);
+        from.cpu.authority = TargetAuthority::Recovering;
+        from.cpu.outstanding = Some(CpuOutstandingDemand {
+            demand: CpuDemand {
+                target_cpus: 2,
+                direction: CpuDirection::Up,
+            },
+            anchor_cpus: 1,
+            no_progress_attempts: 1,
+            waited_polls: 0,
+        });
+        vm.fail_live(1);
+        let state = drive_resources_fake(
+            bounds,
+            from,
+            futures::stream::iter(vec![Ok(Some(resource_sample(10, 0.0, 512, 256)))]),
+            std::sync::Arc::clone(&vm),
+            CpuLifecycle::Running,
+            fresh_probes(),
+        )
+        .await;
+        // The seed persisted and the live call failed: desired is the seed, nothing enforced.
+        let applies = vm.applies();
+        assert_eq!(applies[0].0, ResourceApplyMode::NextStart);
+        assert_eq!(vm.enforced(), (1, 512), "no live effect was claimed");
+        assert_eq!(state.cpu.authority, TargetAuthority::Recovering);
+        assert!(
+            state.cpu.correction_retry.failed.is_some(),
+            "the correction is damped"
+        );
+        assert_eq!(state.cpu.policy.high_ticks, 0);
+        assert!(
+            !state.cpu_lifecycle.valid,
+            "the failure invalidated eligibility"
+        );
+        // The demand and its count survive: they are not the correction's to clear.
+        let demand = state.cpu.outstanding.expect("demand survives");
+        assert_eq!(demand.demand.target_cpus, 2);
+        assert_eq!(demand.no_progress_attempts, 1);
+        // Persisted effects are never rolled back by a later failure.
+        assert_eq!(
+            vm.desired().0,
+            2,
+            "the boot-derived seed (boot + 1 for a boot target) remains saved"
+        );
+    }
+
+    // ---- T18: cancellation inside a combined recovery ----
+
+    #[tokio::test]
+    async fn cancelling_during_a_combined_live_apply_leaves_the_seed_and_stops_local_calls() {
+        tokio::time::pause();
+        let bounds = ResourceBounds {
+            cpu: cpu_bounds(1, 4),
+            memory: bounds(512, 1024),
+        };
+        let vm = FakeResources::new(1, 512);
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let entered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let driving = tokio::spawn({
+            let vm = std::sync::Arc::clone(&vm);
+            let gate = std::sync::Arc::clone(&gate);
+            let entered = std::sync::Arc::clone(&entered);
+            async move {
+                resize_resources_with(
+                    bounds,
+                    ResourceResizeRequest {
+                        cpu: Some(CpuResizeRequest {
+                            baseline_cpus: 1,
+                            target_cpus: 2,
+                            recovering: true,
+                        }),
+                        memory: Some(MemoryResizeRequest {
+                            baseline_mib: 512,
+                            target_mib: 768,
+                            recovering: true,
+                        }),
+                    },
+                    move |mode, targets| {
+                        let vm = std::sync::Arc::clone(&vm);
+                        let gate = std::sync::Arc::clone(&gate);
+                        let entered = std::sync::Arc::clone(&entered);
+                        async move {
+                            if mode == ResourceApplyMode::Live {
+                                // Suspend as the live apply is delivered, after the seed
+                                // persisted and before any runtime control.
+                                entered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                gate.notified().await;
+                            }
+                            vm.apply(mode, targets)
+                        }
+                    },
+                )
+                .await
+            }
+        });
+        let waiter = std::sync::Arc::clone(&entered);
+        while waiter.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        // One combined seed, then the live apply is in flight; abort it.
+        driving.abort();
+        assert!(driving.await.unwrap_err().is_cancelled());
+        let after_join = vm.applies().len();
+        assert_eq!(
+            after_join, 1,
+            "the seed went out and the live call never did"
+        );
+        // The seed survived and the live effect was never delivered.
+        assert_eq!(
+            vm.desired(),
+            (1, 640),
+            "the combined seed for both recovering axes is durable"
+        );
+        assert_eq!(vm.enforced(), (1, 512), "the live apply never took effect");
+        // Nothing else may happen after the join, even when time advances.
+        tokio::time::advance(METRICS_SAMPLE_INTERVAL).await;
+        tokio::task::yield_now().await;
+        assert_eq!(vm.applies().len(), after_join);
+    }
+
+    // ---- T15 contention convergence (injected, never native) ----
+
+    /// Drive segments, each 200 ticks at the rate the *current enforced* commitment produces.
+    async fn drive_contention(
+        bounds: ResourceBounds,
+        from: ResourceControllerState,
+        vm: std::sync::Arc<FakeResources>,
+        rate_of: impl Fn(u8) -> f32,
+        seconds_from: u64,
+    ) -> (ResourceControllerState, u64) {
+        let mut state = from;
+        let mut second = seconds_from;
+        for _ in 0..40 {
+            let current = vm.enforced().0;
+            let percent = rate_of(current);
+            let rows: Vec<_> = (0..200)
+                .map(|_| {
+                    second += 1;
+                    Ok(Some(resource_sample(second, percent, 512, 256)))
+                })
+                .collect();
+            state = drive_resources_fake(
+                bounds,
+                state,
+                futures::stream::iter(rows),
+                std::sync::Arc::clone(&vm),
+                CpuLifecycle::Running,
+                fresh_probes(),
+            )
+            .await;
+        }
+        (state, second)
+    }
+
+    fn cpu_only_bounds() -> ResourceBounds {
+        ResourceBounds {
+            cpu: cpu_bounds(1, 4),
+            memory: bounds(512, 512),
+        }
+    }
+
+    #[tokio::test]
+    async fn measured_busy_host_values_reach_stable_equilibria() {
+        tokio::time::pause();
+        // M5's three consecutive default-interval samples, held for 8 000 ticks each.
+        for (measured, expected) in [(53.5f32, 1u8), (108.7, 2), (318.5, 4)] {
+            let vm = FakeResources::new(4, 512);
+            let (state, mut second) = drive_contention(
+                cpu_only_bounds(),
+                resource_state(4, 512),
+                std::sync::Arc::clone(&vm),
+                |_| measured,
+                0,
+            )
+            .await;
+            assert_eq!(
+                vm.enforced().0,
+                expected,
+                "{measured}% settles at {expected}"
+            );
+            assert_eq!(state.cpu.policy.current_cpus, expected);
+            // After convergence there is no alternating up/down dispatch.
+            let before = vm.applies().len();
+            let rows: Vec<_> = (0..200)
+                .map(|_| {
+                    second += 1;
+                    Ok(Some(resource_sample(second, measured, 512, 256)))
+                })
+                .collect();
+            let _state = drive_resources_fake(
+                cpu_only_bounds(),
+                state,
+                futures::stream::iter(rows),
+                std::sync::Arc::clone(&vm),
+                CpuLifecycle::Running,
+                fresh_probes(),
+            )
+            .await;
+            assert_eq!(
+                vm.applies().len(),
+                before,
+                "{measured}% is a stable equilibrium"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn all_core_demand_steps_one_at_a_time_to_the_ceiling() {
+        tokio::time::pause();
+        let vm = FakeResources::new(1, 512);
+        let (state, _) = drive_contention(
+            cpu_only_bounds(),
+            resource_state(1, 512),
+            std::sync::Arc::clone(&vm),
+            |cpus| 100.0 * f32::from(cpus),
+            0,
+        )
+        .await;
+        let sequence: Vec<u8> = vm
+            .applies()
+            .iter()
+            .filter_map(|(mode, targets)| {
+                (*mode == ResourceApplyMode::Live)
+                    .then_some(targets.cpus)
+                    .flatten()
+            })
+            .collect();
+        assert_eq!(
+            sequence,
+            vec![2, 3, 4],
+            "ten distinct observations per step, never a jump"
+        );
+        assert_eq!(state.cpu.policy.current_cpus, 4);
+        assert_eq!(vm.enforced().0, 4);
+    }
+
+    #[tokio::test]
+    async fn severe_contention_settles_where_demand_meets_supply() {
+        tokio::time::pause();
+        // A fixed 53.5% per committed core: from 4 it must reclaim to 2 and hold.
+        let vm = FakeResources::new(4, 512);
+        let (state, _) = drive_contention(
+            cpu_only_bounds(),
+            resource_state(4, 512),
+            std::sync::Arc::clone(&vm),
+            |cpus| 53.5 * f32::from(cpus),
+            0,
+        )
+        .await;
+        assert_eq!(vm.enforced().0, 2);
+        assert_eq!(state.cpu.policy.current_cpus, 2);
+        // From 1 the same model cannot grow: one core at 53.5% is below 95%.
+        let vm = FakeResources::new(1, 512);
+        let (state, _) = drive_contention(
+            cpu_only_bounds(),
+            resource_state(1, 512),
+            std::sync::Arc::clone(&vm),
+            |cpus| 53.5 * f32::from(cpus),
+            0,
+        )
+        .await;
+        assert_eq!(state.cpu.policy.current_cpus, 1);
+        assert!(vm.applies().is_empty());
+    }
+
+    // ---- Unknown outcomes and evidence reset after a failure ----
+    //
+    // These model a *failed or statusless apply* against a fresh cached Running reply. They do
+    // not model a real pause: no oneshot barrier orders a pause, resume, probe reply, prepare or
+    // live delivery, and nothing here observes a paused sandbox. The plan's T17b and T17c
+    // barriers and its observable-pause trace are NOT implemented; see `verifications.md`.
+
+    #[tokio::test]
+    async fn a_failed_apply_after_a_fresh_running_reply_leaves_the_outcome_unknown() {
+        tokio::time::pause();
+        let bounds = cpu_only_bounds();
+        let vm = FakeResources::new(1, 512);
+        let probes = fresh_probes();
+        let mut from = resource_state(1, 512);
+        from.cpu.policy.high_ticks = CPU_HIGH_TICKS - 1;
+        // The cached Running reply is fresh (a pause starts after it), and the live apply fails.
+        vm.fail_live(1);
+        let state = drive_resources_fake(
+            bounds,
+            from,
+            futures::stream::iter(vec![Ok(Some(resource_sample(10, 95.0, 512, 256)))]),
+            std::sync::Arc::clone(&vm),
+            CpuLifecycle::Running,
+            std::sync::Arc::clone(&probes),
+        )
+        .await;
+        // Unknown outcome: Recovering, history retained, evidence reset, cache invalidated.
+        assert_eq!(state.cpu.authority, TargetAuthority::Recovering);
+        assert_eq!(state.cpu.last_accepted_cpus, 1);
+        assert_eq!(state.cpu.policy.high_ticks, 0);
+        assert!(
+            !state.cpu_lifecycle.valid,
+            "no failure is read as 'no effect'"
+        );
+        // Resume alone confirms nothing: a later duplicate neither probes nor corrects.
+        let applied = vm.applies().len();
+        let state = drive_resources_fake(
+            bounds,
+            state,
+            futures::stream::iter(vec![Ok(Some(resource_sample(10, 0.0, 512, 256)))]),
+            std::sync::Arc::clone(&vm),
+            CpuLifecycle::Running,
+            std::sync::Arc::clone(&probes),
+        )
+        .await;
+        assert_eq!(vm.applies().len(), applied);
+        assert_eq!(state.cpu.authority, TargetAuthority::Recovering);
+    }
+
+    #[tokio::test]
+    async fn a_receipt_inside_one_ttl_is_the_only_evidence_of_what_happened() {
+        tokio::time::pause();
+        let bounds = cpu_only_bounds();
+        // Case 1: the receipt is usable. Enforcement is accepted and the runs reset; the cache
+        // is never treated as proof that no pause happened.
+        let vm = FakeResources::new(1, 512);
+        let mut from = resource_state(1, 512);
+        from.cpu.policy.high_ticks = CPU_HIGH_TICKS - 1;
+        let state = drive_resources_fake(
+            bounds,
+            from,
+            futures::stream::iter(vec![Ok(Some(resource_sample(10, 95.0, 512, 256)))]),
+            std::sync::Arc::clone(&vm),
+            CpuLifecycle::Running,
+            fresh_probes(),
+        )
+        .await;
+        assert_eq!(vm.enforced().0, 2);
+        assert_eq!(
+            state.cpu.policy.high_ticks, 0,
+            "pre-pause evidence never continues"
+        );
+        // Case 2: the receipt is not usable. Recovering with evidence reset and no rollback.
+        let vm = FakeResources::new(1, 512);
+        vm.fail_live(1);
+        let mut from = resource_state(1, 512);
+        from.cpu.policy.high_ticks = CPU_HIGH_TICKS - 1;
+        let state = drive_resources_fake(
+            bounds,
+            from,
+            futures::stream::iter(vec![Ok(Some(resource_sample(10, 95.0, 512, 256)))]),
+            std::sync::Arc::clone(&vm),
+            CpuLifecycle::Running,
+            fresh_probes(),
+        )
+        .await;
+        assert_eq!(state.cpu.authority, TargetAuthority::Recovering);
+        assert_eq!(state.cpu.policy.high_ticks, 0);
+        assert_eq!(state.cpu.last_accepted_cpus, 1);
+    }
+
+    // ---- T17a/T16: the lifecycle cache, the probe bound and the observation clock ----
+
+    /// A cached Running reply whose TTL has already elapsed.
+    fn stale_running_cache() -> CpuLifecycleCache {
+        CpuLifecycleCache {
+            value: CpuLifecycle::Running,
+            valid: true,
+            last_probe_started: Some(tokio::time::Instant::now() - Duration::from_secs(2)),
+        }
+    }
+
+    /// The bound on one lifecycle await is 50 ms: a probe that never answers must not stall
+    /// the monitor or admit CPU work. Removing the timeout hangs this trace.
+    #[tokio::test]
+    async fn a_stalled_lifecycle_probe_times_out_without_authorising_cpu_work() {
+        tokio::time::pause();
+        let vm = FakeResources::new(1, 512);
+        let mut from = resource_state(1, 512);
+        from.cpu.policy.high_ticks = CPU_HIGH_TICKS - 1;
+        from.cpu_lifecycle = stale_running_cache();
+        let probes = fresh_probes();
+        let counted = std::sync::Arc::clone(&probes);
+        let driven = drive_resources_with_probe(
+            cpu_only_bounds(),
+            from,
+            advancing_samples(vec![timed_row(10_000, 95.0)]),
+            std::sync::Arc::clone(&vm),
+            move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    std::future::pending::<()>().await;
+                    Ok(CpuLifecycle::Running)
+                }
+            },
+        );
+        let state = tokio::time::timeout(Duration::from_secs(1), driven)
+            .await
+            .expect("the 50 ms probe bound ends the poll");
+        assert_eq!(probe_count(&probes), 1);
+        assert!(vm.applies().is_empty(), "no CPU work without eligibility");
+        assert_eq!(state.cpu.policy.high_ticks, 0);
+        assert_eq!(state.cpu_lifecycle.value, CpuLifecycle::Unavailable);
+        assert!(state.cpu_lifecycle.valid);
+    }
+
+    /// A probe error is `Unavailable`, never `Running`, and never dispatches.
+    #[tokio::test]
+    async fn a_failed_lifecycle_probe_is_unavailable_and_never_running() {
+        tokio::time::pause();
+        let vm = FakeResources::new(1, 512);
+        let mut from = resource_state(1, 512);
+        from.cpu.policy.high_ticks = CPU_HIGH_TICKS - 1;
+        from.cpu_lifecycle = stale_running_cache();
+        let probes = fresh_probes();
+        let counted = std::sync::Arc::clone(&probes);
+        let state = drive_resources_with_probe(
+            cpu_only_bounds(),
+            from,
+            futures::stream::iter(vec![timed_row(10_000, 95.0), timed_row(10_200, 95.0)]),
+            std::sync::Arc::clone(&vm),
+            move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move { Err(anyhow::anyhow!("the sandbox handle is gone")) }
+            },
+        )
+        .await;
+        assert_eq!(probe_count(&probes), 1, "the failed reply is cached");
+        assert!(vm.applies().is_empty());
+        assert_eq!(state.cpu.policy.high_ticks, 0, "both runs stay reset");
+        assert_eq!(state.cpu_lifecycle.value, CpuLifecycle::Unavailable);
+        assert!(state.cpu_lifecycle.valid);
+    }
+
+    /// The cached reply is reused only inside its TTL; a later distinct row re-probes.
+    #[tokio::test]
+    async fn the_lifecycle_reply_is_reprobed_when_its_ttl_expires() {
+        tokio::time::pause();
+        let vm = FakeResources::new(1, 512);
+        let mut from = resource_state(1, 512);
+        from.cpu_lifecycle = stale_running_cache();
+        let probes = fresh_probes();
+        let counted = std::sync::Arc::clone(&probes);
+        let rows: Vec<_> = (0..6u64)
+            .map(|poll| timed_row(10_000 + 200 * poll, 95.0))
+            .collect();
+        let state = drive_resources_with_probe(
+            cpu_only_bounds(),
+            from,
+            advancing_samples(rows),
+            std::sync::Arc::clone(&vm),
+            move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move { Ok(CpuLifecycle::Running) }
+            },
+        )
+        .await;
+        // Five nominal polls fit one TTL, so 1.2 s of rows needs a second probe.
+        assert_eq!(probe_count(&probes), 2);
+        assert_eq!(state.cpu.policy.high_ticks, 6);
+        assert!(vm.applies().is_empty());
+    }
+
+    /// A memory-only `Err` invalidates CPU eligibility and resets its runs, without marking
+    /// the CPU axis Recovering: no CPU attempt was made.
+    #[tokio::test]
+    async fn a_memory_only_error_invalidates_cpu_eligibility() {
+        tokio::time::pause();
+        let bounds = ResourceBounds {
+            cpu: cpu_bounds(1, 4),
+            memory: bounds(512, 1024),
+        };
+        let vm = FakeResources::new(1, 512);
+        vm.fail_live(1);
+        // One row that asks memory to grow *and* carries a usable CPU rate.
+        let row: anyhow::Result<Option<ResourceSample>> = Ok(Some(ResourceSample {
+            memory: sample(512, 400),
+            cpu_rate: cpu_rate_of(95.0),
+            timestamp: std::time::UNIX_EPOCH + Duration::from_millis(10_000),
+        }));
+        let state = drive_resources_fake(
+            bounds,
+            resource_state(1, 512),
+            futures::stream::iter(vec![row]),
+            std::sync::Arc::clone(&vm),
+            CpuLifecycle::Running,
+            fresh_probes(),
+        )
+        .await;
+        assert_eq!(state.memory.authority, TargetAuthority::Recovering);
+        assert_eq!(
+            state.cpu.authority,
+            TargetAuthority::Confirmed,
+            "the CPU axis made no attempt, so it is not Recovering"
+        );
+        assert!(
+            !state.cpu_lifecycle.valid,
+            "a failed apply may have involved a paused runtime"
+        );
+        assert_eq!(state.cpu.policy.high_ticks, 0);
+    }
+
+    /// The 100th consecutive regressed poll re-anchors the epoch, and with it the cache.
+    #[tokio::test]
+    async fn a_clock_correction_invalidates_the_cached_reply() {
+        tokio::time::pause();
+        let vm = FakeResources::new(1, 512);
+        let mut from = resource_state(1, 512);
+        from.cpu.policy.high_ticks = 4;
+        from.cpu_clock.high_water = Some(std::time::UNIX_EPOCH + Duration::from_secs(600));
+        let rows: Vec<_> = (0..100u64).map(|_| timed_row(1_000, 95.0)).collect();
+        let state = drive_resources_fake(
+            cpu_only_bounds(),
+            from,
+            futures::stream::iter(rows),
+            std::sync::Arc::clone(&vm),
+            CpuLifecycle::Running,
+            fresh_probes(),
+        )
+        .await;
+        assert!(
+            !state.cpu_lifecycle.valid,
+            "a clock correction discards the cached reply"
+        );
+        assert_eq!(state.cpu.policy.high_ticks, 0, "and the runs");
+        assert!(vm.applies().is_empty());
+        assert_eq!(
+            state.cpu_clock.high_water,
+            Some(std::time::UNIX_EPOCH + Duration::from_secs(1)),
+            "the epoch re-anchored to the last regressed row"
+        );
+    }
+
+    /// A duplicate is neutral only while its rate is usable; an unusable duplicate resets.
+    #[tokio::test]
+    async fn a_duplicate_with_an_unusable_rate_resets_both_runs() {
+        tokio::time::pause();
+        let vm = FakeResources::new(1, 512);
+        let mut from = resource_state(1, 512);
+        from.cpu.policy.high_ticks = 5;
+        let state = drive_resources_fake(
+            cpu_only_bounds(),
+            from,
+            futures::stream::iter(vec![timed_row(10_000, 95.0), timed_row(10_000, 0.0)]),
+            std::sync::Arc::clone(&vm),
+            CpuLifecycle::Running,
+            fresh_probes(),
+        )
+        .await;
+        assert_eq!(state.cpu.policy.high_ticks, 0);
+        assert!(vm.applies().is_empty());
+    }
+
+    /// An absent row and a lookup error each reset both runs, so neither can grow on the one
+    /// following high.
+    #[tokio::test]
+    async fn an_absent_row_or_lookup_error_resets_both_runs() {
+        tokio::time::pause();
+        let vm = FakeResources::new(1, 512);
+        let mut from = resource_state(1, 512);
+        from.cpu.policy.high_ticks = CPU_HIGH_TICKS - 1;
+        from.cpu_clock.high_water = Some(std::time::UNIX_EPOCH + Duration::from_millis(10_000));
+        // An absent row on its own.
+        let absent = drive_resources_fake(
+            cpu_only_bounds(),
+            from,
+            futures::stream::iter(vec![Ok(None)]),
+            std::sync::Arc::clone(&vm),
+            CpuLifecycle::Running,
+            fresh_probes(),
+        )
+        .await;
+        assert_eq!(absent.cpu.policy.high_ticks, 0, "an absent row resets");
+        // A lookup error on its own.
+        let error = drive_resources_fake(
+            cpu_only_bounds(),
+            from,
+            futures::stream::iter(vec![Err(anyhow::anyhow!(
+                "scripted metrics lookup failure"
+            ))]),
+            std::sync::Arc::clone(&vm),
+            CpuLifecycle::Running,
+            fresh_probes(),
+        )
+        .await;
+        assert_eq!(error.cpu.policy.high_ticks, 0, "a lookup error resets");
+        // And the one following high starts a new run instead of completing the old one.
+        let state = drive_resources_fake(
+            cpu_only_bounds(),
+            from,
+            futures::stream::iter(vec![Ok(None), timed_row(10_200, 95.0)]),
+            std::sync::Arc::clone(&vm),
+            CpuLifecycle::Running,
+            fresh_probes(),
+        )
+        .await;
+        assert!(
+            vm.applies().is_empty(),
+            "a reset nine-observation run cannot grow on one following high"
+        );
+        assert_eq!(
+            state.cpu.policy.high_ticks, 1,
+            "the following high starts over"
+        );
+    }
+
+    /// A duplicate inside a live run neither counts, resets, nor costs a probe.
+    #[tokio::test]
+    async fn a_duplicate_inside_a_live_run_neither_counts_nor_probes() {
+        tokio::time::pause();
+        let vm = FakeResources::new(1, 512);
+        let mut from = resource_state(1, 512);
+        from.cpu_lifecycle = stale_running_cache();
+        let probes = fresh_probes();
+        let counted = std::sync::Arc::clone(&probes);
+        let first = std::sync::Arc::clone(&counted);
+        let probe = move || {
+            first.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move { Ok(CpuLifecycle::Running) }
+        };
+        let rows: Vec<_> = (0..9u64)
+            .map(|poll| timed_row(10_000 + 200 * poll, 95.0))
+            .collect();
+        let state = drive_resources_with_probe(
+            cpu_only_bounds(),
+            from,
+            advancing_samples(rows),
+            std::sync::Arc::clone(&vm),
+            probe,
+        )
+        .await;
+        assert_eq!(state.cpu.policy.high_ticks, 9);
+        let probes_before = probe_count(&probes);
+        // The same timestamp again: a duplicate, and no other change.
+        let state = drive_resources_with_probe(
+            cpu_only_bounds(),
+            state,
+            advancing_samples(vec![timed_row(10_000 + 200 * 8, 95.0)]),
+            std::sync::Arc::clone(&vm),
+            {
+                let second = std::sync::Arc::clone(&counted);
+                move || {
+                    second.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async move { Ok(CpuLifecycle::Running) }
+                }
+            },
+        )
+        .await;
+        assert_eq!(
+            probe_count(&probes),
+            probes_before,
+            "a duplicate costs no probe"
+        );
+        assert_eq!(
+            state.cpu.policy.high_ticks, 9,
+            "and neither counts nor resets"
+        );
+        // The next distinct high completes the dwell.
+        let state = drive_resources_with_probe(
+            cpu_only_bounds(),
+            state,
+            advancing_samples(vec![timed_row(10_000 + 200 * 9, 95.0)]),
+            std::sync::Arc::clone(&vm),
+            {
+                let third = std::sync::Arc::clone(&counted);
+                move || {
+                    third.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async move { Ok(CpuLifecycle::Running) }
+                }
+            },
+        )
+        .await;
+        assert_eq!(state.cpu.policy.current_cpus, 2);
+        assert_eq!(vm.enforced().0, 2);
+    }
+
+    // ---- T14a/T14b: durable demand under capped enforcement, and its restoration ----
+
+    /// One row at a chosen wall-clock instant, with 200 ms of paused time consumed per poll.
+    fn timed_row(millis: u64, percent: f32) -> anyhow::Result<Option<ResourceSample>> {
+        Ok(Some(ResourceSample {
+            memory: sample(512, 256),
+            cpu_rate: cpu_rate_of(percent),
+            timestamp: std::time::UNIX_EPOCH + Duration::from_millis(millis),
+        }))
+    }
+
+    /// Exactly one advancing poll, so a trace can record what each poll did.
+    async fn drive_one_poll(
+        vm: &std::sync::Arc<FakeResources>,
+        state: ResourceControllerState,
+        millis: u64,
+        percent: f32,
+    ) -> ResourceControllerState {
+        drive_resources_fake(
+            cpu_only_bounds(),
+            state,
+            advancing_samples(vec![timed_row(millis, percent)]),
+            std::sync::Arc::clone(vm),
+            CpuLifecycle::Running,
+            fresh_probes(),
+        )
+        .await
+    }
+
+    /// The plan's capped-window call bound: `3 * (ceil(W / 50) + 1)`.
+    fn capped_window_bound(polls: u64) -> usize {
+        (3 * (polls.div_ceil(50) + 1)) as usize
+    }
+
+    #[tokio::test]
+    async fn t14a_capped_under_enforcement_keeps_the_demand_and_paces_every_ask() {
+        tokio::time::pause();
+        let vm = FakeResources::new(1, 512);
+        vm.cap_enforcement(1);
+        let mut from = resource_state(1, 512);
+        from.cpu.policy.high_ticks = CPU_HIGH_TICKS - 1;
+        let mut state = from;
+        // Poll indices of the live growth asks, and of every SDK call.
+        let mut ask_polls: Vec<u64> = Vec::new();
+        let mut call_polls: Vec<u64> = Vec::new();
+        for poll in 0..2_000u64 {
+            let before = vm.applies().len();
+            state = drive_one_poll(&vm, state, 10_000 + 200 * poll, 390.0).await;
+            let after = vm.applies();
+            if after.len() > before {
+                call_polls.push(poll);
+                if after[before..].iter().any(|(mode, targets)| {
+                    *mode == ResourceApplyMode::Live && targets.cpus == Some(2)
+                }) {
+                    ask_polls.push(poll);
+                }
+            }
+            assert!(
+                after.len() - before <= 2,
+                "poll {poll}: at most one prepare and one live call, got {}",
+                after.len() - before
+            );
+        }
+        // The plan's bound counts an overlapping initial correction as well.
+        assert!(
+            !call_polls.is_empty() && call_polls.len() <= capped_window_bound(2_000),
+            "calls {} exceed the capped-window bound {}",
+            call_polls.len(),
+            capped_window_bound(2_000)
+        );
+        // Recurrence: once the no-progress count has saturated the 50-poll delay, no two
+        // normal asks are closer together than the delay itself.
+        assert!(ask_polls.len() >= 5, "asks: {ask_polls:?}");
+        // No ask can precede its own ten-observation dwell...
+        for window in ask_polls.windows(2) {
+            assert!(
+                window[1] - window[0] >= 10,
+                "asks {window:?} are closer than one dwell: {ask_polls:?}"
+            );
+        }
+        // ...and once the delay has saturated at 50 polls, no two normal asks are closer
+        // than the delay. The early asks follow 0/5/10/... as the count climbs.
+        for window in ask_polls.windows(2).filter(|window| window[1] >= 1_000) {
+            assert!(
+                window[1] - window[0] >= 50,
+                "asks {window:?} are closer than the capped delay: {ask_polls:?}"
+            );
+        }
+        // The demand, its identity, its anchor and its history all survive 2 000 capped polls.
+        let demand = state
+            .cpu
+            .outstanding
+            .expect("2 000 capped polls do not clear the demand");
+        assert_eq!(demand.demand.target_cpus, 2);
+        assert_eq!(demand.demand.direction, CpuDirection::Up);
+        assert_eq!(demand.anchor_cpus, 1);
+        assert!(demand.no_progress_attempts >= 5, "{demand:?}");
+        assert_eq!(vm.enforced().0, 1, "enforcement stayed capped");
+        assert_eq!(vm.enforced().1, 512, "the memory axis was never asked");
+    }
+
+    #[tokio::test]
+    async fn t14b_restored_enforcement_at_poll_1500_clears_the_demand_and_resumes_policy() {
+        tokio::time::pause();
+        let vm = FakeResources::new(1, 512);
+        vm.cap_enforcement(1);
+        let mut from = resource_state(1, 512);
+        from.cpu.policy.high_ticks = CPU_HIGH_TICKS - 1;
+        let mut state = from;
+        for poll in 0..1_500u64 {
+            state = drive_one_poll(&vm, state, 10_000 + 200 * poll, 390.0).await;
+        }
+        assert_eq!(vm.enforced().0, 1, "still capped at poll 1500");
+        assert!(
+            state.cpu.outstanding.is_some(),
+            "the capped trace leaves an unmet demand"
+        );
+        // Enforcement becomes available inside the same trace, not in a fresh fake.
+        vm.cap_enforcement(0);
+        let mut cleared_at = None;
+        for poll in 1_500..1_610u64 {
+            let before = vm.applies().len();
+            state = drive_one_poll(&vm, state, 10_000 + 200 * poll, 390.0).await;
+            let applied = vm.applies().len() > before;
+            if applied && state.cpu.outstanding.is_none() {
+                cleared_at = Some(poll - 1_500);
+                break;
+            }
+        }
+        let cleared_after = cleared_at.expect(
+            "a real receipt at the restored enforcement clears the Up2 demand within 110 polls",
+        );
+        assert!(cleared_after < 110, "cleared after {cleared_after} polls");
+        assert_eq!(vm.enforced().0, state.cpu.policy.current_cpus);
+        assert_eq!(state.cpu.policy.current_cpus, 2, "the growth landed");
+        // Normal policy resumes without an external reset: sustained demand grows again.
+        for poll in 1_610..1_625u64 {
+            state = drive_one_poll(&vm, state, 10_000 + 200 * poll, 390.0).await;
+        }
+        assert_eq!(
+            state.cpu.policy.current_cpus, 3,
+            "a fresh ten-observation dwell grows to 3"
+        );
+        assert_eq!(vm.enforced().0, 3);
+    }
+
+    // ---- S-B through the driver: an unusable rate resets a run inside a fresh cache ----
+
+    #[tokio::test]
+    async fn a_published_zero_resets_a_nine_high_run_behind_a_fresh_lifecycle_cache() {
+        tokio::time::pause();
+        let bounds = cpu_only_bounds();
+        let vm = FakeResources::new(1, 512);
+        let mut from = resource_state(1, 512);
+        from.cpu.policy.high_ticks = CPU_HIGH_TICKS - 1;
+        // No time advance: the cached Running reply stays fresh across both rows, which is
+        // exactly the state in which a zero row used to look like a duplicate.
+        let state = drive_resources_fake(
+            bounds,
+            from,
+            futures::stream::iter(vec![
+                Ok(Some(resource_sample(10, 0.0, 512, 256))),
+                Ok(Some(resource_sample(11, 95.0, 512, 256))),
+            ]),
+            std::sync::Arc::clone(&vm),
+            CpuLifecycle::Running,
+            fresh_probes(),
+        )
+        .await;
+        assert!(
+            vm.applies().is_empty(),
+            "the zero reset the nine-observation run, so the 95 % row is its first"
+        );
+        assert_eq!(state.cpu.policy.current_cpus, 1);
+        assert_eq!(state.cpu.policy.high_ticks, 1);
+        assert!(state.cpu.outstanding.is_none());
+    }
+
+    // ---- Plan §3.4(b): a deadband or boundary hold ends the outstanding demand ----
+
+    /// A capped Up 1→2 demand with a chosen failure count and ready run.
+    ///
+    /// Built directly: the record's own pacing is what these tests isolate, not the fake's
+    /// equality behaviour after a persisted-but-under-enforced target.
+    fn capped_up_record(no_progress_attempts: u32, high_ticks: u32) -> ResourceControllerState {
+        let mut state = resource_state(1, 512);
+        state.cpu.policy.high_ticks = high_ticks;
+        state.cpu.outstanding = Some(CpuOutstandingDemand {
+            demand: CpuDemand {
+                target_cpus: 2,
+                direction: CpuDirection::Up,
+            },
+            anchor_cpus: 1,
+            no_progress_attempts,
+            waited_polls: 0,
+        });
+        state
+    }
+
+    fn highs(
+        first_second: u64,
+        count: u64,
+        percent: f32,
+    ) -> Vec<anyhow::Result<Option<ResourceSample>>> {
+        (0..count)
+            .map(|offset| {
+                Ok(Some(resource_sample(
+                    first_second + offset,
+                    percent,
+                    512,
+                    256,
+                )))
+            })
+            .collect()
+    }
+
+    async fn drive_highs(
+        vm: &std::sync::Arc<FakeResources>,
+        state: ResourceControllerState,
+        first_second: u64,
+        count: u64,
+    ) -> ResourceControllerState {
+        drive_rows(vm, state, highs(first_second, count, 95.0)).await
+    }
+
+    async fn drive_rows(
+        vm: &std::sync::Arc<FakeResources>,
+        state: ResourceControllerState,
+        rows: Vec<anyhow::Result<Option<ResourceSample>>>,
+    ) -> ResourceControllerState {
+        drive_resources_fake(
+            cpu_only_bounds(),
+            state,
+            futures::stream::iter(rows),
+            std::sync::Arc::clone(vm),
+            CpuLifecycle::Running,
+            fresh_probes(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_deadband_observation_ends_the_demand_and_the_renewed_dwell_owes_no_deadline() {
+        tokio::time::pause();
+        let vm = FakeResources::new(1, 512);
+        vm.cap_enforcement(1);
+        // One positive eligible deadband row at C=1 (50 % < 95 %): the demand is over.
+        let state = drive_rows(
+            &vm,
+            capped_up_record(2, 0),
+            vec![Ok(Some(resource_sample(10, 50.0, 512, 256)))],
+        )
+        .await;
+        assert!(
+            vm.applies().is_empty(),
+            "a deadband row is never dispatched"
+        );
+        assert!(
+            state.cpu.outstanding.is_none(),
+            "a deadband hold on positive evidence ends the demand"
+        );
+        assert_eq!(
+            state.cpu.policy.low_ticks, 0,
+            "the deadband reset both runs"
+        );
+        // A renewed but incomplete dwell stays silent, and the tenth high starts a *fresh*
+        // demand that is admitted at once instead of waiting for the old deadline.
+        let state = drive_highs(&vm, state, 11, 9).await;
+        assert_eq!(
+            vm.applies().len(),
+            0,
+            "the renewed run is its own ten-observation dwell"
+        );
+        assert_eq!(state.cpu.policy.high_ticks, 9);
+        let state = drive_highs(&vm, state, 21, 1).await;
+        assert_eq!(
+            vm.applies().len(),
+            1,
+            "the tenth high dispatches immediately"
+        );
+        assert_eq!(vm.applies()[0].1.cpus, Some(2));
+        let demand = state.cpu.outstanding.expect("the new ask made no progress");
+        assert_eq!(demand.demand.target_cpus, 2);
+        assert_eq!(
+            demand.no_progress_attempts, 1,
+            "the renewed demand never inherits the old record's attempts"
+        );
+        assert_eq!(demand.waited_polls, 0);
+    }
+
+    #[tokio::test]
+    async fn continuing_highs_retain_the_demand_until_the_ten_observation_dwell() {
+        tokio::time::pause();
+        let vm = FakeResources::new(1, 512);
+        vm.cap_enforcement(1);
+        // Nine highs continue the same direction: the record survives and the run keeps its
+        // ready counter, but nothing is asked before the tenth observation.
+        let state = drive_highs(&vm, capped_up_record(2, 0), 10, 9).await;
+        assert!(vm.applies().is_empty(), "no ask before the tenth high");
+        let demand = state
+            .cpu
+            .outstanding
+            .expect("a continuing direction retains it");
+        assert_eq!(demand.no_progress_attempts, 2);
+        assert_eq!(demand.waited_polls, 9);
+        assert_eq!(state.cpu.policy.high_ticks, 9, "the run keeps counting");
+        // The tenth high proposes, and the five-poll delay has already passed: one ask.
+        let state = drive_highs(&vm, state, 19, 1).await;
+        assert_eq!(vm.applies().len(), 1, "the deadline admits exactly one ask");
+        let demand = state.cpu.outstanding.expect("still unmet");
+        assert_eq!(demand.no_progress_attempts, 3);
+        assert_eq!(demand.waited_polls, 0);
+    }
+
+    #[tokio::test]
+    async fn a_fourth_failure_holds_the_ready_run_until_its_fifteen_poll_deadline() {
+        tokio::time::pause();
+        let vm = FakeResources::new(1, 512);
+        vm.cap_enforcement(1);
+        // Three failures need ten polls and four need fifteen; a ready run re-proposes on
+        // every high, so this is the state in which the delay refuses an ask.
+        let state = drive_highs(&vm, capped_up_record(4, CPU_HIGH_TICKS - 1), 10, 14).await;
+        assert!(
+            vm.applies().is_empty(),
+            "fourteen polls are below the fifteen-poll deadline"
+        );
+        let demand = state.cpu.outstanding.expect("retained across refusals");
+        assert_eq!(demand.no_progress_attempts, 4);
+        assert_eq!(demand.waited_polls, 14);
+        assert_eq!(
+            state.cpu.policy.high_ticks,
+            CPU_HIGH_TICKS - 1,
+            "a refused ask keeps the ready run for the next observation"
+        );
+        let state = drive_highs(&vm, state, 24, 1).await;
+        assert_eq!(vm.applies().len(), 1, "the fifteenth poll admits the ask");
+        assert_eq!(
+            state
+                .cpu
+                .outstanding
+                .map(|demand| demand.no_progress_attempts),
+            Some(5)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_down_supporting_observation_ends_an_up_demand() {
+        tokio::time::pause();
+        let vm = FakeResources::new(2, 512);
+        vm.cap_enforcement(2);
+        let mut from = resource_state(2, 512);
+        from.cpu.policy.high_ticks = CPU_HIGH_TICKS - 1;
+        let state = drive_resources_fake(
+            cpu_only_bounds(),
+            from,
+            futures::stream::iter(vec![Ok(Some(resource_sample(10, 190.0, 512, 256)))]),
+            std::sync::Arc::clone(&vm),
+            CpuLifecycle::Running,
+            fresh_probes(),
+        )
+        .await;
+        assert_eq!(
+            state.cpu.outstanding.map(|demand| demand.demand),
+            Some(CpuDemand {
+                target_cpus: 3,
+                direction: CpuDirection::Up,
+            })
+        );
+        // 80 % at C=2 is below the 85 % reclamation threshold: it supports a downward step, so
+        // it is not evidence for the outstanding upward demand.
+        let state = drive_resources_fake(
+            cpu_only_bounds(),
+            state,
+            futures::stream::iter(vec![Ok(Some(resource_sample(11, 80.0, 512, 256)))]),
+            std::sync::Arc::clone(&vm),
+            CpuLifecycle::Running,
+            fresh_probes(),
+        )
+        .await;
+        assert!(
+            state.cpu.outstanding.is_none(),
+            "the opposite direction ends the demand"
+        );
+        assert_eq!(
+            state.cpu.policy.low_ticks, 1,
+            "the hold kept its downward run"
+        );
+        assert_eq!(vm.applies().len(), 1, "no second ask was made");
+    }
+
+    // ---- #647 CPU kernels: T1-T6 of the implementation plan ----
+
+    fn cpu_bounds(boot_cpus: u8, max_cpus: u8) -> CpuBounds {
+        CpuBounds {
+            boot_cpus,
+            max_cpus,
+        }
+    }
+
+    /// `1..=4 vCPU`: the shape every adjustable production CPU launch has.
+    fn adjustable_cpus() -> CpuBounds {
+        cpu_bounds(1, 4)
+    }
+
+    fn cpu_state(current_cpus: u8, high_ticks: u32, low_ticks: u32) -> CpuState {
+        CpuState {
+            current_cpus,
+            high_ticks,
+            low_ticks,
+        }
+    }
+
+    fn tenths(lower_tenths: u32, upper_tenths: u32) -> CpuRate {
+        CpuRate {
+            lower_tenths,
+            upper_tenths,
+        }
+    }
+
+    /// The production adapter over an SDK-shaped, non-optional percentage.
+    fn rate(percent: f32) -> Option<CpuRate> {
+        cpu_rate_of(percent)
+    }
+
+    /// One distinct demand-eligible observation at the adjustable production bounds.
+    fn tick(state: CpuState, percent: f32) -> CpuState {
+        cpu_tick(adjustable_cpus(), state, rate(percent))
+    }
+
+    fn run_high(state: CpuState, percent: f32, observations: usize) -> CpuState {
+        let mut state = state;
+        for _ in 0..observations {
+            state = tick(state, percent);
+        }
+        state
+    }
+
+    fn run_low(state: CpuState, percent: f32, observations: usize) -> CpuState {
+        run_high(state, percent, observations)
+    }
+
+    /// Independent widened arithmetic: f64 has room for the exact product, so this oracle
+    /// is exact rather than approximate.
+    fn tenths_oracle(value: f32) -> (u32, u32) {
+        if value >= 25500.0 {
+            return (MAX_CPU_RATE_TENTHS, MAX_CPU_RATE_TENTHS);
+        }
+        let exact = f64::from(value) * 10.0;
+        let cap = f64::from(MAX_CPU_RATE_TENTHS);
+        (exact.floor().min(cap) as u32, exact.ceil().min(cap) as u32)
+    }
+
+    #[test]
+    fn cpu_rate_rejects_every_absence_and_non_finite_bit_pattern() {
+        assert_eq!(cpu_rate_from_bits(0), None, "+0 publishes no rate");
+        assert_eq!(cpu_rate_from_bits((-0.0f32).to_bits()), None);
+        assert_eq!(cpu_rate_from_bits((-1.0f32).to_bits()), None);
+        assert_eq!(cpu_rate_from_bits((-0.5f32).to_bits()), None);
+        assert_eq!(cpu_rate_from_bits(f32::NAN.to_bits()), None);
+        assert_eq!(cpu_rate_from_bits((-f32::NAN).to_bits()), None);
+        assert_eq!(cpu_rate_from_bits(f32::INFINITY.to_bits()), None);
+        assert_eq!(cpu_rate_from_bits(f32::NEG_INFINITY.to_bits()), None);
+        assert_eq!(cpu_rate_of(0.0), None);
+        // Positive values are observations, however small: the smallest subnormal and the
+        // smallest normal are both below one tenth, not absent.
+        assert_eq!(cpu_rate_from_bits(1), Some(tenths(0, 1)));
+        assert_eq!(
+            cpu_rate_from_bits(f32::MIN_POSITIVE.to_bits()),
+            Some(tenths(0, 1))
+        );
+        assert_eq!(rate(0.05), Some(tenths(0, 1)));
+    }
+
+    #[test]
+    fn cpu_rate_is_exact_at_both_policy_thresholds() {
+        assert_eq!(rate(85.0), Some(tenths(850, 850)));
+        assert_eq!(rate(95.0), Some(tenths(950, 950)));
+        // The next representable float either side of a threshold must not cross it: scale
+        // up uses the lower endpoint, scale down the upper one.
+        let below_85 = f32::from_bits(85.0f32.to_bits() - 1);
+        let above_85 = f32::from_bits(85.0f32.to_bits() + 1);
+        assert!(below_85 < 85.0 && above_85 > 85.0);
+        let below = rate(below_85).expect("a positive rate");
+        let above = rate(above_85).expect("a positive rate");
+        assert!(below.upper_tenths <= 850);
+        assert_ne!(below, tenths(850, 850));
+        assert!(above.lower_tenths >= 850);
+        assert!(above.upper_tenths > 850);
+        let below_95 = f32::from_bits(95.0f32.to_bits() - 1);
+        let above_95 = f32::from_bits(95.0f32.to_bits() + 1);
+        assert!(below_95 < 95.0 && above_95 > 95.0);
+        assert!(rate(below_95).expect("a rate").lower_tenths < 950);
+        assert!(rate(above_95).expect("a rate").lower_tenths >= 950);
+    }
+
+    #[test]
+    fn cpu_rate_saturates_at_the_largest_realizable_ceiling() {
+        assert_eq!(CPU_RATE_CAP_BITS, 25500.0f32.to_bits());
+        let capped = Some(tenths(MAX_CPU_RATE_TENTHS, MAX_CPU_RATE_TENTHS));
+        assert_eq!(rate(25500.0), capped);
+        assert_eq!(rate(1.0e9), capped);
+        assert_eq!(rate(f32::MAX), capped);
+        let below_cap = f32::from_bits(CPU_RATE_CAP_BITS - 1);
+        assert!(below_cap < 25500.0);
+        let exact = rate(below_cap).expect("a rate");
+        assert_eq!(exact.upper_tenths, MAX_CPU_RATE_TENTHS);
+        assert_eq!(exact.lower_tenths, MAX_CPU_RATE_TENTHS - 1);
+    }
+
+    #[test]
+    fn cpu_rate_conversion_matches_a_widened_float_oracle() {
+        for value in [
+            0.0001f32, 0.001, 0.1, 1.0, 10.0, 33.333, 84.999, 85.0, 94.999, 95.0, 100.0, 199.9,
+            318.5, 1000.0, 25499.9,
+        ] {
+            let (lower, upper) = tenths_oracle(value);
+            assert_eq!(rate(value), Some(tenths(lower, upper)), "{value}");
+        }
+        // A deterministic walk over positive finite encodings, including denormals.
+        let mut bits = 1u32;
+        let mut seen = 0u32;
+        while seen < 20_000 {
+            bits = bits.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let value = f32::from_bits(bits & 0x7fff_ffff);
+            if !(value.is_finite() && value > 0.0) {
+                continue;
+            }
+            seen += 1;
+            let (lower, upper) = tenths_oracle(value);
+            assert_eq!(
+                cpu_rate_of(value),
+                Some(tenths(lower, upper)),
+                "bits {bits:#010x} value {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn cpu_rate_ratio_is_total_over_u32_inputs() {
+        assert_eq!(cpu_rate_tenths(0, 5), None);
+        assert_eq!(cpu_rate_tenths(5, 0), None);
+        assert_eq!(cpu_rate_tenths(0, 0), None);
+        assert_eq!(cpu_rate_tenths(1, u32::MAX), Some(tenths(0, 1)));
+        assert_eq!(
+            cpu_rate_tenths(u32::MAX, 1),
+            Some(tenths(MAX_CPU_RATE_TENTHS, MAX_CPU_RATE_TENTHS))
+        );
+        assert_eq!(cpu_rate_tenths(u32::MAX, u32::MAX), Some(tenths(1, 1)));
+        assert_eq!(cpu_rate_tenths(10, 3), Some(tenths(3, 4)));
+        assert_eq!(cpu_rate_tenths(20, 3), Some(tenths(6, 7)));
+        assert_eq!(cpu_rate_tenths(255_000, 1), Some(tenths(255_000, 255_000)));
+        assert_eq!(cpu_rate_tenths(255_001, 1), Some(tenths(255_000, 255_000)));
+        for numerator in 0..=64u32 {
+            for denominator in 0..=64u32 {
+                match cpu_rate_tenths(numerator, denominator) {
+                    None => assert!(numerator == 0 || denominator == 0),
+                    Some(measured) => {
+                        assert!(numerator != 0 && denominator != 0);
+                        assert!(measured.lower_tenths <= measured.upper_tenths);
+                        assert!(measured.upper_tenths - measured.lower_tenths <= 1);
+                        assert!(measured.upper_tenths > 0);
+                        assert!(measured.upper_tenths <= MAX_CPU_RATE_TENTHS);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ten_distinct_highs_grow_one_cpu_and_clear_both_runs() {
+        let mut state = cpu_state(1, 0, 0);
+        for observation in 1..=9u32 {
+            state = tick(state, 95.0);
+            assert_eq!(state, cpu_state(1, observation, 0));
+        }
+        state = tick(state, 95.0);
+        assert_eq!(state, cpu_state(2, 0, 0));
+        // The next step needs its own ten observations at the new commitment.
+        state = run_high(state, 190.0, 9);
+        assert_eq!(state, cpu_state(2, 9, 0));
+        state = tick(state, 190.0);
+        assert_eq!(state, cpu_state(3, 0, 0));
+    }
+
+    #[test]
+    fn a_rounded_float_cannot_manufacture_a_high_observation() {
+        assert_eq!(rate(94.999), Some(tenths(949, 950)));
+        assert_eq!(run_high(cpu_state(1, 0, 0), 94.999, 20), cpu_state(1, 0, 0));
+        assert_eq!(rate(189.999), Some(tenths(1899, 1900)));
+        assert_eq!(
+            run_high(cpu_state(2, 0, 0), 189.999, 20),
+            cpu_state(2, 0, 0)
+        );
+    }
+
+    #[test]
+    fn interrupted_runs_never_grow() {
+        // Nine highs then a deadband, repeated: the deadband resets the run.
+        let mut state = cpu_state(1, 0, 0);
+        for _ in 0..5 {
+            state = run_high(state, 95.0, 9);
+            assert_eq!(state, cpu_state(1, 9, 0));
+            state = tick(state, 90.0);
+            assert_eq!(state, cpu_state(1, 0, 0));
+        }
+        // A low observation breaks a high run.
+        let state = run_high(cpu_state(2, 0, 0), 190.0, 4);
+        assert_eq!(state, cpu_state(2, 4, 0));
+        let state = tick(state, 85.0);
+        assert_eq!(state, cpu_state(2, 0, 1));
+        // A high observation breaks a low run.
+        let state = tick(cpu_state(3, 0, 0), 170.0);
+        assert_eq!(state, cpu_state(3, 0, 1));
+        let state = run_high(state, 285.0, 1);
+        assert_eq!(state, cpu_state(3, 1, 0));
+    }
+
+    #[test]
+    fn one_busy_core_at_two_or_more_committed_cpus_is_deadband() {
+        let mut state = cpu_state(2, 0, 0);
+        for _ in 0..1000 {
+            state = tick(state, 100.0);
+        }
+        assert_eq!(state, cpu_state(2, 0, 0));
+        let mut state = cpu_state(2, 0, 0);
+        for _ in 0..1000 {
+            state = tick(state, 90.0);
+        }
+        assert_eq!(state, cpu_state(2, 0, 0));
+        let mut state = cpu_state(4, 0, 0);
+        for _ in 0..1000 {
+            state = tick(state, 300.0);
+        }
+        assert_eq!(state, cpu_state(4, 0, 0));
+    }
+
+    #[test]
+    fn five_distinct_lows_shrink_one_cpu_and_the_floor_holds() {
+        let mut state = cpu_state(3, 0, 0);
+        for observation in 1..=4u32 {
+            state = tick(state, 170.0);
+            assert_eq!(state, cpu_state(3, 0, observation));
+        }
+        state = tick(state, 170.0);
+        assert_eq!(state, cpu_state(2, 0, 0));
+        // 85% at C=2 is exactly the released-core threshold.
+        let mut state = cpu_state(2, 0, 0);
+        for observation in 1..=4u32 {
+            state = tick(state, 85.0);
+            assert_eq!(state, cpu_state(2, 0, observation));
+        }
+        state = tick(state, 85.0);
+        assert_eq!(state, cpu_state(1, 0, 0));
+        // The boot commitment is the floor: low demand holds it forever.
+        let mut state = cpu_state(1, 0, 0);
+        for _ in 0..50 {
+            state = tick(state, 1.0);
+        }
+        assert_eq!(state, cpu_state(1, 0, 0));
+    }
+
+    #[test]
+    fn a_rounded_float_cannot_manufacture_a_low_observation() {
+        assert_eq!(rate(170.001), Some(tenths(1700, 1701)));
+        assert_eq!(run_low(cpu_state(3, 0, 0), 170.001, 20), cpu_state(3, 0, 0));
+        assert_eq!(rate(85.001), Some(tenths(850, 851)));
+        assert_eq!(run_low(cpu_state(2, 0, 0), 85.001, 20), cpu_state(2, 0, 0));
+    }
+
+    #[test]
+    fn the_ceiling_holds_saturated_load_without_overflow() {
+        assert_eq!(run_high(cpu_state(4, 0, 0), 400.0, 100), cpu_state(4, 0, 0));
+        // Over-long counters are normalized before any arithmetic, never wrapped.
+        assert_eq!(
+            run_high(cpu_state(4, u32::MAX, u32::MAX), 400.0, 10),
+            cpu_state(4, 0, 0)
+        );
+        assert_eq!(
+            run_low(cpu_state(1, u32::MAX, u32::MAX), 0.5, 10),
+            cpu_state(1, 0, 0)
+        );
+    }
+
+    /// What the runtime publishes after two equal cumulative vCPU-counter reads: a computed
+    /// `0.0`. The registry encodes an absent rate the same way, which is the S-B ambiguity.
+    fn rate_from_vcpu_counters(vcpu_time_ns: u64, elapsed_ns: u64) -> f32 {
+        if elapsed_ns == 0 {
+            return 0.0;
+        }
+        (vcpu_time_ns as f64 / elapsed_ns as f64 * 100.0) as f32
+    }
+
+    #[test]
+    fn published_zero_never_authorises_a_cpu_decision() {
+        let computed_zero = rate_from_vcpu_counters(0, 1_000_000_000);
+        let missing_encoded_zero = 0.0f32;
+        assert_eq!(computed_zero, missing_encoded_zero);
+        assert_eq!(cpu_rate_of(computed_zero), None);
+        assert_eq!(cpu_rate_of(missing_encoded_zero), None);
+        // A thousand advancing zero rows cannot hold a low run, let alone shrink.
+        let mut state = cpu_state(3, 0, 4);
+        for _ in 0..1000 {
+            state = cpu_tick(adjustable_cpus(), state, cpu_rate_of(computed_zero));
+        }
+        assert_eq!(state, cpu_state(3, 0, 0));
+        // The next small positive rate starts a fresh low run from zero.
+        for observation in 1..=4u32 {
+            state = cpu_tick(adjustable_cpus(), state, cpu_rate_of(1.0));
+            assert_eq!(state, cpu_state(3, 0, observation));
+        }
+        state = cpu_tick(adjustable_cpus(), state, cpu_rate_of(1.0));
+        assert_eq!(state, cpu_state(2, 0, 0));
+    }
+
+    #[test]
+    fn an_absent_or_invalid_rate_resets_the_run() {
+        for absent in [
+            None,
+            Some(tenths(500, 600)),
+            Some(tenths(901, 900)),
+            Some(tenths(0, 0)),
+            Some(tenths(0, 255_001)),
+            cpu_rate_of(f32::NAN),
+        ] {
+            let state = cpu_tick(adjustable_cpus(), cpu_state(1, 9, 0), absent);
+            assert_eq!(state, cpu_state(1, 0, 0), "{absent:?}");
+            let state = cpu_tick(adjustable_cpus(), cpu_state(3, 0, 4), absent);
+            assert_eq!(state, cpu_state(3, 0, 0), "{absent:?}");
+        }
+        // A gap before a high means the following high is the first of a new run.
+        let mut state = cpu_state(1, 9, 0);
+        state = cpu_tick(adjustable_cpus(), state, None);
+        state = tick(state, 95.0);
+        assert_eq!(state, cpu_state(1, 1, 0));
+    }
+
+    /// Independently written in widened `i64`: the whole ordered transition table, not the
+    /// production expression.
+    fn cpu_tick_oracle(bounds: CpuBounds, state: CpuState, measured: Option<CpuRate>) -> CpuState {
+        let boot = i64::from(bounds.boot_cpus);
+        let max = i64::from(bounds.max_cpus);
+        if !(1 <= boot && boot <= max) {
+            return cpu_state(bounds.boot_cpus, 0, 0);
+        }
+        let current = i64::from(state.current_cpus);
+        let base = current.max(boot).min(max);
+        let high = i64::from(state.high_ticks).min(9);
+        let low = i64::from(state.low_ticks).min(4);
+        let Some(measured) = measured else {
+            return cpu_state(base as u8, 0, 0);
+        };
+        let lo = i64::from(measured.lower_tenths);
+        let hi = i64::from(measured.upper_tenths);
+        let usable = lo <= hi && hi <= 255_000 && hi - lo <= 1 && hi > 0;
+        if !usable || !(boot <= current && current <= max) {
+            return cpu_state(base as u8, 0, 0);
+        }
+        if base < max && lo >= 950 * base {
+            return if high < 9 {
+                cpu_state(base as u8, (high + 1) as u32, 0)
+            } else {
+                cpu_state((base + 1) as u8, 0, 0)
+            };
+        }
+        if base > boot && hi <= 850 * (base - 1) {
+            return if low < 4 {
+                cpu_state(base as u8, 0, (low + 1) as u32)
+            } else {
+                cpu_state((base - 1) as u8, 0, 0)
+            };
+        }
+        cpu_state(base as u8, 0, 0)
+    }
+
+    #[test]
+    fn cpu_tick_matches_an_independent_widened_table() {
+        // A valid session state and a rate centred on one of the two policy thresholds, so
+        // every row of the transition table is reached. Drawing the endpoints independently
+        // made a usable interval a 2-in-300 000 accident, and random bounds made a valid
+        // state nearly impossible, so the threshold rows were never exercised at all.
+        for_each_case(
+            (
+                (1u8..=4).prop_flat_map(|boot| (Just(boot), boot..=4u8)),
+                0u8..=5,
+                0u32..=12,
+                0u32..=7,
+                0u32..=1,
+                prop_oneof![
+                    3 => Just(0i64),
+                    1 => -2i64..=-1,
+                    1 => 1i64..=2,
+                ],
+                0u32..=4,
+                0u8..=4,
+            ),
+            |(
+                (boot_cpus, max_cpus),
+                current_cpus,
+                high_ticks,
+                low_ticks,
+                which_threshold,
+                offset,
+                width,
+                kind,
+            )| {
+                let bounds = cpu_bounds(boot_cpus, max_cpus);
+                let state = cpu_state(current_cpus, high_ticks, low_ticks);
+                // Thresholds of the state's own commitment, and of the released vCPU below it.
+                let up = i64::from(current_cpus) * i64::from(CPU_UP_TENTHS_PER_CORE);
+                let down =
+                    i64::from(current_cpus.saturating_sub(1)) * i64::from(CPU_DOWN_TENTHS_PER_CORE);
+                let centre = if which_threshold == 0 { up } else { down };
+                let lower_tenths =
+                    (centre + offset).clamp(0, i64::from(MAX_CPU_RATE_TENTHS)) as u32;
+                let measured = match kind {
+                    // Usable when the interval is at most one tenth wide, which most cases
+                    // are; wider ones are an unusable observation.
+                    0..=2 => Some(tenths(lower_tenths, lower_tenths.saturating_add(width))),
+                    // A published zero proves no demand decision.
+                    3 => Some(tenths(0, 0)),
+                    // An absent rate.
+                    _ => None,
+                };
+                let next = cpu_tick(bounds, state, measured);
+                prop_assert_eq!(next, cpu_tick_oracle(bounds, state, measured));
+                prop_assert!(next.high_ticks < CPU_HIGH_TICKS);
+                prop_assert!(next.low_ticks < CPU_LOW_TICKS);
+                if boot_cpus >= 1 && boot_cpus <= max_cpus {
+                    prop_assert!(next.current_cpus >= boot_cpus);
+                    prop_assert!(next.current_cpus <= max_cpus);
+                    prop_assert!(next.high_ticks == 0 || next.low_ticks == 0);
+                    if current_cpus >= boot_cpus && current_cpus <= max_cpus {
+                        let delta = i64::from(next.current_cpus) - i64::from(current_cpus);
+                        prop_assert!((-1..=1).contains(&delta));
+                    }
+                }
+                Ok(())
+            },
+        );
+    }
+
+    fn cpu_seed_oracle(bounds: CpuBounds, target: u8) -> Option<u8> {
+        if bounds.boot_cpus < 1 || bounds.boot_cpus > bounds.max_cpus {
+            return None;
+        }
+        if target < bounds.boot_cpus || target > bounds.max_cpus {
+            return None;
+        }
+        if bounds.boot_cpus != target {
+            return Some(bounds.boot_cpus);
+        }
+        if bounds.boot_cpus < bounds.max_cpus {
+            return Some(bounds.boot_cpus + 1);
+        }
+        None
+    }
+
+    #[test]
+    fn cpu_recovery_seed_is_total_and_complete() {
+        for boot_cpus in 0..=255u8 {
+            for max_cpus in [
+                boot_cpus,
+                boot_cpus.saturating_add(1),
+                boot_cpus.saturating_add(7),
+                255,
+            ] {
+                let bounds = cpu_bounds(boot_cpus, max_cpus);
+                for target in 0..=255u8 {
+                    let seed = cpu_recovery_seed(bounds, target);
+                    assert_eq!(
+                        seed,
+                        cpu_seed_oracle(bounds, target),
+                        "bounds {bounds:?} target {target}"
+                    );
+                    if let Some(chosen) = seed {
+                        assert!(cpu_target_in_bounds(bounds, chosen));
+                        assert_ne!(chosen, target);
+                    }
+                }
+            }
+        }
+        // The declared two-value interval works for either target.
+        assert_eq!(cpu_recovery_seed(cpu_bounds(1, 2), 1), Some(2));
+        assert_eq!(cpu_recovery_seed(cpu_bounds(1, 2), 2), Some(1));
+        assert_eq!(cpu_recovery_seed(cpu_bounds(254, 255), 254), Some(255));
+        // A fixed interval, malformed bounds and an out-of-range target seed nothing.
+        assert_eq!(cpu_recovery_seed(cpu_bounds(3, 3), 3), None);
+        assert_eq!(cpu_recovery_seed(cpu_bounds(1, 1), 1), None);
+        assert_eq!(cpu_recovery_seed(cpu_bounds(0, 4), 0), None);
+        assert_eq!(cpu_recovery_seed(cpu_bounds(3, 2), 3), None);
+        assert_eq!(cpu_recovery_seed(cpu_bounds(1, 4), 0), None);
+        assert_eq!(cpu_recovery_seed(cpu_bounds(1, 4), 5), None);
+    }
+
+    #[test]
+    fn cpu_target_bounds_reject_every_invalid_interval() {
+        for boot_cpus in 0..=255u8 {
+            for max_cpus in [0, boot_cpus, boot_cpus.saturating_add(1), 255] {
+                let bounds = cpu_bounds(boot_cpus, max_cpus);
+                for target in 0..=255u8 {
+                    let expected = boot_cpus >= 1 && boot_cpus <= target && target <= max_cpus;
+                    assert_eq!(
+                        cpu_target_in_bounds(bounds, target),
+                        expected,
+                        "{bounds:?} {target}"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -3141,9 +7674,9 @@ mod tests {
             assert_eq!(
                 vm.sdk_actions(),
                 vec![
-                    (MemoryApplyMode::Live, 512),
-                    (MemoryApplyMode::NextStart, 640),
-                    (MemoryApplyMode::Live, 768),
+                    (ResourceApplyMode::Live, 512),
+                    (ResourceApplyMode::NextStart, 640),
+                    (ResourceApplyMode::Live, 768),
                 ],
                 "{label}: the seed defeats saved-config equality"
             );
@@ -3184,9 +7717,9 @@ mod tests {
         assert_eq!(
             vm.sdk_actions(),
             vec![
-                (MemoryApplyMode::Live, 768),
-                (MemoryApplyMode::NextStart, 640),
-                (MemoryApplyMode::Live, 768),
+                (ResourceApplyMode::Live, 768),
+                (ResourceApplyMode::NextStart, 640),
+                (ResourceApplyMode::Live, 768),
             ]
         );
         assert_eq!(vm.control_requests(), vec![768, 768]);
@@ -3238,7 +7771,7 @@ mod tests {
             std::sync::Arc::clone(&vm),
         )
         .await;
-        assert_eq!(vm.sdk_actions(), vec![(MemoryApplyMode::Live, 768)]);
+        assert_eq!(vm.sdk_actions(), vec![(ResourceApplyMode::Live, 768)]);
         vm.advance_actual(768);
         let state = drive_fake(
             bounds,
@@ -3250,7 +7783,7 @@ mod tests {
         assert_eq!(state.authority, TargetAuthority::Recovering);
         assert_eq!(state.policy, memory_state(768, 0));
         assert_eq!(state.last_accepted_target_mib, 512);
-        assert_eq!(vm.sdk_actions(), vec![(MemoryApplyMode::Live, 768)]);
+        assert_eq!(vm.sdk_actions(), vec![(ResourceApplyMode::Live, 768)]);
         // A genuine change repairs and confirms on the tick that observes it.
         let state = drive_fake(
             bounds,
@@ -3262,9 +7795,9 @@ mod tests {
         assert_eq!(
             vm.sdk_actions(),
             vec![
-                (MemoryApplyMode::Live, 768),
-                (MemoryApplyMode::NextStart, 640),
-                (MemoryApplyMode::Live, 512),
+                (ResourceApplyMode::Live, 768),
+                (ResourceApplyMode::NextStart, 640),
+                (ResourceApplyMode::Live, 512),
             ]
         );
         assert_eq!(state.policy, memory_state(512, 0));
@@ -3310,7 +7843,7 @@ mod tests {
             },
         )
         .await;
-        assert!(matches!(outcome, Err(MemoryResizeError::Unconfirmed(_))));
+        assert!(matches!(outcome, Err(ResourceResizeError::Unconfirmed(_))));
         assert!(vm.sdk_actions().is_empty());
 
         // O896 -> D1024 seeds 512, and the configuration-only patch must not shrink the
@@ -3333,7 +7866,7 @@ mod tests {
         persisted_rx.await.expect("the seed was persisted");
         assert_eq!(
             vm.sdk_actions(),
-            vec![(MemoryApplyMode::NextStart, 512)],
+            vec![(ResourceApplyMode::NextStart, 512)],
             "the seed is the only call so far"
         );
         assert!(
@@ -3350,8 +7883,8 @@ mod tests {
         assert_eq!(
             vm.sdk_actions(),
             vec![
-                (MemoryApplyMode::NextStart, 512),
-                (MemoryApplyMode::Live, 1024),
+                (ResourceApplyMode::NextStart, 512),
+                (ResourceApplyMode::Live, 1024),
             ]
         );
         assert_eq!(vm.control_requests(), vec![1024]);
@@ -3454,8 +7987,8 @@ mod tests {
         assert_eq!(
             vm.sdk_actions(),
             vec![
-                (MemoryApplyMode::NextStart, 640),
-                (MemoryApplyMode::Live, 512),
+                (ResourceApplyMode::NextStart, 640),
+                (ResourceApplyMode::Live, 512),
             ]
         );
         assert_eq!(vm.control_requests(), vec![512]);
@@ -3532,8 +8065,8 @@ mod tests {
         assert_eq!(
             vm.sdk_actions(),
             vec![
-                (MemoryApplyMode::NextStart, 640),
-                (MemoryApplyMode::Live, 512),
+                (ResourceApplyMode::NextStart, 640),
+                (ResourceApplyMode::Live, 512),
             ]
         );
         assert_eq!(vm.control_requests(), vec![512]);
@@ -3595,9 +8128,9 @@ mod tests {
             assert_eq!(
                 vm.sdk_actions(),
                 vec![
-                    (MemoryApplyMode::NextStart, 640),
-                    (MemoryApplyMode::NextStart, 768),
-                    (MemoryApplyMode::Live, 640),
+                    (ResourceApplyMode::NextStart, 640),
+                    (ResourceApplyMode::NextStart, 768),
+                    (ResourceApplyMode::Live, 640),
                 ],
                 "{fault:?}"
             );
@@ -3609,7 +8142,7 @@ mod tests {
         // Negative control: at saved 640 the plain live patch is applied and statusless.
         let vm = FakeVm::new(512, 640);
         let plan = vm
-            .apply(MemoryApplyMode::Live, 640)
+            .apply(ResourceApplyMode::Live, 640)
             .await
             .expect("an applied plan");
         assert!(plan.applied);
@@ -3683,6 +8216,24 @@ mod tests {
         assert_eq!(state.policy, memory_state(768, 0));
         assert_eq!(state.authority, TargetAuthority::Confirmed);
         assert_eq!(state.last_accepted_target_mib, 768);
+    }
+
+    // ------------------------------------------------ monitor logging and lifetime
+
+    struct DropReceipt(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl DropReceipt {
+        fn new(sender: tokio::sync::oneshot::Sender<()>) -> Self {
+            Self(Some(sender))
+        }
+    }
+
+    impl Drop for DropReceipt {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
     }
 
     // ------------------------------------------------ monitor logging and lifetime
@@ -4062,6 +8613,90 @@ mod tests {
         );
     }
 
+    /// Capture one fresh run through the driver into `capture`, at `max_level`.
+    fn start_capture(capture: &Capture, case_id: &'static str, max_level: tracing::Level) {
+        install_capture_subscriber();
+        ACTIVE_CAPTURE.with(|slot| {
+            *slot.borrow_mut() = Some(CaptureState {
+                capture: capture.clone(),
+                max_level,
+                context: ("unit-test-sandbox".to_string(), case_id.to_string()),
+                spans: std::collections::HashMap::new(),
+                stack: Vec::new(),
+                next_span: 1,
+            });
+        });
+    }
+
+    fn stop_capture() {
+        ACTIVE_CAPTURE.with(|slot| *slot.borrow_mut() = None);
+    }
+
+    /// M31: the CPU axis's own records are DEBUG only. A transition raised to `info` would
+    /// reach normal output, so this asserts the event exists and that no monitor record rises
+    /// above DEBUG, under a TRACE capture and again under a WARN filter.
+    #[tokio::test]
+    async fn cpu_evidence_logs_only_at_debug() {
+        tokio::time::pause();
+        for max_level in [tracing::Level::TRACE, tracing::Level::WARN] {
+            let capture = Capture::default();
+            start_capture(&capture, "cpu_transition", max_level);
+            let bounds = cpu_only_bounds();
+            let vm = FakeResources::new(1, 512);
+            let mut from = resource_state(1, 512);
+            from.cpu.policy.high_ticks = CPU_HIGH_TICKS - 1;
+            let span = tracing::debug_span!(
+                target: MONITOR_TARGET,
+                "resource_commitment",
+                sandbox = "unit-test-sandbox",
+                case_id = "cpu_transition",
+            );
+            let driven = drive_resources_fake(
+                bounds,
+                from,
+                futures::stream::iter(vec![Ok(Some(resource_sample(10, 95.0, 512, 256)))]),
+                std::sync::Arc::clone(&vm),
+                CpuLifecycle::Running,
+                fresh_probes(),
+            );
+            let state = tracing::Instrument::instrument(driven, span).await;
+            stop_capture();
+            assert_eq!(
+                state.cpu.policy.current_cpus, 2,
+                "a real transition happened"
+            );
+            let events = capture.events();
+            let monitor: Vec<&CapturedEvent> = events
+                .iter()
+                .filter(|event| event.target == MONITOR_TARGET)
+                .collect();
+            let named: Vec<&str> = monitor
+                .iter()
+                .filter_map(|event| event.fields.get("event").map(String::as_str))
+                .collect();
+            if max_level >= tracing::Level::DEBUG {
+                assert!(
+                    named.contains(&"cpu_transition"),
+                    "the transition is recorded: {named:?}"
+                );
+                assert!(named.contains(&"cpu_poll"), "every poll is recorded");
+                for event in &monitor {
+                    assert_eq!(
+                        event.level,
+                        tracing::Level::DEBUG,
+                        "CPU event {:?} is not DEBUG",
+                        event.fields.get("event")
+                    );
+                }
+            } else {
+                assert!(
+                    monitor.is_empty(),
+                    "no CPU record survives a WARN filter: {named:?}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn each_transient_monitor_error_emits_a_debug_event() {
         let bounds = adjustable();
@@ -4319,7 +8954,7 @@ mod tests {
         tokio::time::pause();
         let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = std::sync::Arc::clone(&reads);
-        let mut stream = std::pin::pin!(memory_samples(move || {
+        let mut stream = std::pin::pin!(resource_samples(move || {
             let counter = std::sync::Arc::clone(&counter);
             let index = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             async move {
@@ -4390,22 +9025,6 @@ mod tests {
         for gib in [1u32, 2, 8] {
             let ceiling = ResourceCeiling::from_launch_options(gib, 1).expect("accepted");
             assert!(ceiling.monitor_needed(), "{gib} GiB");
-        }
-    }
-
-    struct DropReceipt(Option<tokio::sync::oneshot::Sender<()>>);
-
-    impl DropReceipt {
-        fn new(sender: tokio::sync::oneshot::Sender<()>) -> Self {
-            Self(Some(sender))
-        }
-    }
-
-    impl Drop for DropReceipt {
-        fn drop(&mut self) {
-            if let Some(sender) = self.0.take() {
-                let _ = sender.send(());
-            }
         }
     }
 
@@ -4483,7 +9102,7 @@ mod tests {
         drop_rx.await.expect("the monitor's task is destroyed");
         // The deterministic window between persisting the seed and returning the prepare
         // plan: abort cannot roll the configuration write back, and no live seed was sent.
-        assert_eq!(vm.sdk_actions(), vec![(MemoryApplyMode::NextStart, 640)]);
+        assert_eq!(vm.sdk_actions(), vec![(ResourceApplyMode::NextStart, 640)]);
         assert!(vm.control_requests().is_empty());
         assert_eq!(vm.snapshot(), (512, 512, 640));
         drop(release_tx);
@@ -4546,5 +9165,20 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(consumed.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Phase 0 native evidence for #647 (plan P0-A..P0-F). Ignored by default because it
+    /// boots VMs; the only supported entry point is
+    /// `script/test/cpu-commitment-native.sh`, which owns the isolated build, the explicit
+    /// runtime/firmware pair and the retained evidence directory.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "native Phase 0 CPU evidence; run script/test/cpu-commitment-native.sh"]
+    async fn native_cpu_commitment_evidence() {
+        let report = crate::cpu_evidence::native::run().await;
+        assert_eq!(
+            report.verdict, "PASS",
+            "native Phase 0 evidence did not pass: {}",
+            report.detail
+        );
     }
 }

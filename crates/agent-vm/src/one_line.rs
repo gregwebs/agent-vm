@@ -732,6 +732,12 @@ mod tests {
     const BASELINE: &[(&str, usize, &str)] = &[
         ("clipboard.rs", 1, "#419 recorded; conversion unowned"),
         (
+            "cpu_evidence/native.rs",
+            16,
+            "#647 recorded; test-only module (declared #[cfg(test)] in main.rs); evidence-directory, \
+             owned-build and runtime-pair paths in diagnostics",
+        ),
+        (
             "credential_injection.rs",
             1,
             "#419 recorded; conversion unowned",

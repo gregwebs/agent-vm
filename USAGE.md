@@ -1734,8 +1734,31 @@ retired on a later tick by the controller itself and does not end the session;
 repeated identical failures are retried on a bounded backoff rather than every
 tick.
 
-vCPUs stay at the boot commitment: `--cpus` reserves capacity only until CPU
-scaling lands (#647).
+vCPUs scale too, within `1..=--cpus`. The same monitor grows the commitment by one
+vCPU on the **10th consecutive distinct observation** at `C x 95%` and shrinks it by
+one on the 5th at `(C-1) x 85%`. These are dwell in distinct observations, not
+deadlines: a duplicate row neither counts nor resets, so the nominal 2 s / 1 s
+lengthen with a slower publication period, while a gap, an absent or published-zero
+rate, or an unusable lifecycle resets the run. A zero or unusable rate resets it on
+any row (duplicate included) and at any cache age, so a run never survives behind a
+fresh lifecycle reply. A published `0.0` is ambiguous — a
+computed zero delta or the encoding of an absent rate — so it makes no demand
+decision: a guest publishing exactly zero is **not** reclaimed by demand policy,
+while a small positive rate can be. Lifecycle eligibility is a 1 s cache with a
+50 ms query bound, refreshed only when CPU work needs it and never on the memory
+dispatch path; it detects a pause **that a probe observes**, so a pause and resume
+wholly inside one 1 s TTL is undetectable, and it is not a pause fence: a row
+captured before a pause, or a request delivered after it, can race, and the next
+receipt resolves that race (a usable receipt confirms, an error enters Recovering
+with the evidence reset and no rollback claim). The epoch high-water never
+decreases; only 100
+consecutive regressed polls (20 s nominal) re-anchor it, and that re-admits at most
+one previously consumed row per correction streak; it assumes one
+monitor owns the slot, host-UTC samples and corrections coalescing inside that
+window — uptime and vCPU time are not row identities. After an ambiguous outcome
+the controller re-confirms the last accepted CPU from a usable receipt even during
+a run of zero rates, and a retained sandbox record can start at a reseeded vCPU
+count: `1 vCPU` at boot is a fresh-launch guarantee.
 
 The 512 MiB boot applies to a **fresh launch**. A sandbox record retained from an
 earlier session can request a different memory at its next start: a recovery

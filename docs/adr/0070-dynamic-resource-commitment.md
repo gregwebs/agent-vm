@@ -2,11 +2,25 @@
 
 ## Status
 
-Proposed ([#645](https://github.com/gregwebs/agent-vm/issues/645),
+**Accepted and implemented** ([#645](https://github.com/gregwebs/agent-vm/issues/645),
 [#646](https://github.com/gregwebs/agent-vm/issues/646),
-[#647](https://github.com/gregwebs/agent-vm/issues/647)). Amends
+[#647](https://github.com/gregwebs/agent-vm/issues/647)). Both axes are live:
+memory commitment (D3) and CPU commitment (D4). Amends
 [ADR-0018](0018-machine-checked-boundary-contracts.md) (adds the pure
-resource-commitment sizing kernels to the verified surface).
+resource-commitment sizing, memory hysteresis, recovery-baseline, recovery-seed,
+CPU-rate and CPU-policy kernels to the verified surface).
+
+**Native evidence is partial, and says so.** Live memory growth and one live CPU
+step (1→2, from nine distinct highs) were observed on a real VM. A native
+**multi-step** CPU climb or shrink — the `1→2→3→4` and `4→3→2→1` sequences — has
+never been observed: the sustained-demand native runs were interrupted, and the
+calibration gates are recorded INCONCLUSIVE/BLOCKED under S-G. The "host supply"
+explanation for that was **withdrawn** after controlled measurement showed the
+per-row rate both under- and over-reading a pegged vCPU at short intervals, so the
+honest statement is "not observed", not "blocked by the host". The CPU policy's
+evidence for scale-down and for consecutive steps is the deterministic
+injected-observation tests, not a live trial. See `verifications.md` for the
+recorded runs.
 
 ## Context
 
@@ -53,18 +67,16 @@ tick for a 1 GiB guest; neither is a general performance guarantee (D4).
   (`max_cpus`, `max_memory_mib`), set by `--cpus` / `AGENT_VM_CPUS` and
   `--memory` / `AGENT_VM_MEMORY_GIB`. The design lets live resize grow and
   shrink a running guest's **resource commitment** within this ceiling, never
-  beyond it. Memory does this today; the CPU axis still stays at its **boot
-  commitment** and its ceiling only reserves capacity.
+  beyond it. Both steps, memory and vCPU, are live (D3, D4).
 - **Boot commitment**: the initial online vCPUs and memory (`cpus`,
   `memory_mib`) a session starts with at VM creation: `min(1, max_cpus)` vCPUs
   and `min(512 MiB, max_memory_mib)` RAM. Because `virtio-mem` only plugs and
   unplugs blocks above it and `virtio_msb_cpu` scales online vCPUs down to `1`,
-  it is also the session's lower bound. Both devices are attached at creation;
-  the launcher drives the memory one (D2/D3) and not yet the CPU one (#647).
+  it is also the session's lower bound. Both devices are attached at creation
+  and the launcher drives both (D2-D4).
 - **Resource commitment**: the online vCPU count and usable guest memory target
   currently enforced for a running session, between its **boot commitment** and
-  its **resource ceiling**. The memory half is live (D3); the CPU half is the
-  boot commitment until #647.
+  its **resource ceiling**. Both halves are live: memory (D3) and vCPUs (D4).
 
 [CONTEXT.md](../../CONTEXT.md#sandbox-resources) holds the same three
 definitions; this ADR decides the mechanism.
@@ -127,6 +139,23 @@ pairing at 200 ms.
    apply. A changed-target request made while recovering from an unknown outcome
    is at most two serialized applies (D5).
 
+The monitor is one task over **one** metrics read per tick and one serial apply
+owner, not one controller per axis. Memory is evaluated first from the row and
+never awaits a lifecycle query. Simultaneously **admitted** proposals — not
+proposals the driver could make if it waited — are combined into one
+`sandbox.modify()` builder and one live `.apply()` (S-E below); an axis with no
+proposal, an unusable sample or a damped request never blocks the other. A
+recovering axis may additionally need one configuration-only `NextStart` apply, so
+recovery is bounded by at most one prepare plus one live apply per tick. The
+operation is not atomic, and no receipt makes it so.
+
+Both axes damp a repeated failing request on the same schedule: the first repeat
+is immediate, later repeats wait `min(50, 5*(attempts-1))` polls, and a changed
+ask never inherits the count. CPU additionally keeps an **outstanding-demand**
+record that its corrective retry does not touch, so a re-confirmation that
+returns enforcement to the baseline cannot erase the guest's unmet demand or its
+deadline (D4.1).
+
 ### D3. Target-headroom memory tracking
 
 **Status: implemented (#646).**
@@ -169,20 +198,23 @@ plug window:
 
 ### D4. Sustained-saturation CPU tracking
 
-**Status: decided, unimplemented**; delivered by
-[#647](https://github.com/gregwebs/agent-vm/issues/647).
+**Status: implemented** ([#647](https://github.com/gregwebs/agent-vm/issues/647)).
+The two counts, both thresholds and the 200 ms interval are unchanged from the
+decision; the operator superseded "consecutive ticks" with "consecutive **distinct
+observations**" (S-F) because duplicates are routine at this interval.
 
-Because scheduler and timer skew cause a 100%-pegged vCPU to report `95%–100%`
-`cpu_percent` in `msb_krun`, saturation of `C` committed vCPUs is measured at
-`C * 95%`, with a 10%-per-vCPU hysteresis gap on scale-down to prevent
-oscillation:
+Saturation is measured at `C * 95%` — a margin against ordinary measurement noise
+and the guest's own idle work, **not** compensation for a scheduling skew (S-A:
+after the pairing repair, per-row agreement was median 0.11–0.16 percentage
+points, maximum 1.56, across four native runs) — with a 10%-per-vCPU hysteresis
+gap on scale-down to prevent oscillation:
 
 1. **Scale-up (`C -> C + 1`, up to `max_cpus`)**: Requires
-   `cpu_percent >= C * 95.0` for **10 consecutive ticks (2 s)**, resetting the
-   counter after stepping up.
+   `cpu_percent >= C * 95.0` for **10 consecutive distinct observations (nominal
+   2 s)**, resetting the counter after stepping up.
 2. **Scale-down (`C -> C - 1`, down to `1`)**: Requires
-   `cpu_percent <= (C - 1) * 85.0` for **5 consecutive ticks (1 s)**, resetting
-   the counter after stepping down.
+   `cpu_percent <= (C - 1) * 85.0` for **5 consecutive distinct observations
+   (nominal 1 s)**, resetting the counter after stepping down.
 
 **Runtime CPU pairing repaired by
 [#654](https://github.com/gregwebs/agent-vm/issues/654).** The #645 S1 run on
@@ -204,7 +236,7 @@ the walk made it 10⁵ cheaper; the bracket contained the scan. The runtime now
 brackets the cheap aggregate read for CPU pairing and takes residency separately,
 so the 5 % guard remains a gross-stall backstop instead of measuring the scan's
 width. That repairs the carried-over reading #645 observed; it removes #654, not
-the outstanding [#647](https://github.com/gregwebs/agent-vm/issues/647) CPU
+the [#647](https://github.com/gregwebs/agent-vm/issues/647) CPU
 controller, and #646 still consumes only `memory_limit_bytes` and
 `memory_available_bytes`. Native verification of the landed fix
 (`vendor/microsandbox` `25c29e17`; 1 GiB / 1 vCPU at 200 ms) published rows whose
@@ -215,6 +247,79 @@ The interval is still not free: idle CPU measured **8.05 % mean** over three
 60-sample rounds at 200 ms against **4.86 %** for `main`'s 1 s default — ≈ +3
 percentage points, on a shared host, so indicative rather than a benchmark — and
 the page walk alone costs about 11.5 ms per tick for a 1 GiB guest (D5.5).
+
+#### D4.1 Measurement, eligibility and recovery (implemented)
+
+- **Conversion.** A rate is a conservative integer tenths interval
+  `[floor(10r), ceil(10r)]`. Scale-up compares its lower endpoint with
+  `C * 950`, scale-down its upper endpoint with `(C-1) * 850`, so `94.999%` cannot
+  round into saturation and `85.001%` cannot round into low load. The interval is
+  produced by a proved decoder over the raw `f32` bits; the host's floating-point
+  meaning, the SDK percentage units and the delivery of a genuine observation stay
+  trusted.
+- **Distinct observations (S-F).** A **duplicate** row (same runtime timestamp as
+  the epoch high-water) neither counts nor resets a run and never dispatches or
+  probes, even with an expired retry. A **gap** (absent row or lookup error), a
+  usable-but-absent/zero/invalid rate, and an observed non-running or unavailable
+  lifecycle reset both runs. A **regressed** timestamp resets the evidence,
+  increments a regression streak and never lowers the high-water.
+- **Epoch and the one correction.** The high-water never decreases inside an
+  epoch; the sole exception is the operator-approved re-anchor after **100
+  consecutive regressed polls** (20 s nominal), which adopts that poll's timestamp,
+  clears the streak and both runs, invalidates the lifecycle cache and discards
+  the row. Equal timestamps interrupt the streak, so alternating replay cannot
+  force a correction. Re-anchoring can re-admit at most one previously consumed
+  row per correction streak, because re-admission advances the high-water and an
+  equal timestamp is then a duplicate. This assumes one monitor owns the slot, that
+  samples carry host UTC and that corrections coalesce within 20 s; it is bounded
+  replay resistance, not perfect rejection. Uptime and vCPU time are not row
+  identities, and neither is enforcement authority.
+- **The published zero is ambiguous (S-B, corrected).** `0.0` can be a computed
+  zero delta or the registry's encoding of an absent rate, and the SDK field is a
+  non-optional `f32`. It proves neither absence nor idleness: it makes **no demand
+  decision**, resets both runs and holds the commitment, on any row and whatever
+  the lifecycle cache's age. A guest publishing exactly
+  `0.0` therefore cannot be reclaimed by demand policy — idle reclamation at
+  exactly zero is unavailable by design — while a small positive rate can shrink.
+  Corrective recovery is not a demand decision and still proceeds (below).
+- **Lifecycle eligibility (N1).** Demand work needs a usable positive rate on a
+  distinct row; corrective recovery needs only a distinct row. The query is lazy:
+  one bounded `pause_state()` probe (50 ms await bound) at most once per 1 s TTL,
+  measured from attempt start and cached including failures, with zero probes on
+  duplicates, gaps, fixed bounds or rows where CPU needs nothing, and TTL expiry
+  alone never starts one. An admitted memory request has dispatch priority: CPU is
+  deferred and its evidence reset rather than making memory wait. The cache is
+  **not a pause fence**: a pause/resume wholly inside one TTL is undetectable, and
+  a row captured before, or a control request delivered after, a Running reply can
+  still race. The bound is that the next receipt resolves the race — a usable
+  receipt confirms enforcement and resets the runs; an error enters Recovering
+  with its evidence reset and no rollback claim. No failure is ever read as "no
+  effect".
+- **Authority.** Only a usable live receipt's **enforced** value establishes CPU
+  authority. The catalog's `cpus`, the adjacent report value, the saved desired
+  value, `cpu_percent`, guest `nproc` and pause state are never authority. The
+  SDK writes the *requested* CPU into active config even when the receipt's
+  enforced value differs, so active config is not authority either.
+- **Rate-independent corrective recovery.** After an ambiguous outcome the driver
+  re-confirms the last receipt-accepted CPU on the next distinct, running row at
+  **any** rate — including a long run of published zeros — through a durable
+  configuration seed and one live apply, damped by a correction retry whose
+  identity is the target alone. It deliberately does not consult the demand
+  kernel, and it does not clear outstanding demand: only a receipt that moves
+  enforcement toward the demand's anchor, or genuine new demand evidence, does
+  that. Genuine new demand evidence is a changed direction or target, or a
+  continuing same-direction observation — up is still demanded while the
+  conservative lower endpoint reaches `C * 95` below the ceiling, down while the
+  upper endpoint reaches `(C-1) * 85` above the floor. A deadband or boundary hold
+  on a positive distinct eligible observation therefore **ends** the demand and its
+  deadline, while a zero, gap, duplicate, regression, pause, cache invalidation or
+  correction alone never does. A successful correction therefore costs at most one
+  prepare and one live apply and cannot reset the demand's no-progress count or
+  deadline.
+- **Single-step scope.** The proved single-step property covers policy proposals
+  from valid accepted states, not external mutations or ambiguous I/O. Observed
+  `actual` may differ from `requested` without failure: guest convergence is
+  asynchronous and trusted.
 
 ### D5. Observability, failure degradation and boundary contract
 
@@ -260,6 +365,23 @@ the page walk alone costs about 11.5 ms per tick for a 1 GiB guest (D5.5).
      the observed baseline and the desired target, drawn from the three
      candidates at the floor. With aligned, adjustable bounds at most two values
      are excluded, so a seed always exists for every production ceiling.
+   What S3 adds, again verified for **every** input:
+   - `cpu_rate_tenths` — `[min(255000, n/d), min(255000, n/d + (n%d != 0))]`
+     exactly, `None` iff a zero numerator or denominator, every intermediate
+     widened; `hi - lo <= 1` and `hi > 0` for every `u32` pair.
+   - `cpu_rate_from_bits` — the specified IEEE-754 piecewise mapping, not merely
+     bounds: reject sign/`NaN`/infinity/`+0`, saturate at `25500%`, report positive
+     tiny values as `[0,1]`, otherwise divide the exact significand by the exact
+     power of two, with the shift bounds and `×10` overflow-freedom proved.
+   - `cpu_target_in_bounds` — exactly `1 <= boot <= target <= max`.
+   - `cpu_tick` — the complete ordered transition table: invalid bounds, a
+     normalized out-of-interval current, no/invalid rate, the high run at 9,
+     the low run at 4, and every floor- or ceiling-inhibited hold; `high <= 9`,
+     `low <= 4`, at most one nonzero, an in-range result and a one-step move from a
+     valid state.
+   - `cpu_recovery_seed` — in-range and distinct from the re-confirm target,
+     `boot` first and then `boot + 1`, `Some` iff such a value exists, so the
+     two-value `1..=2` interval works for either target.
 4. **Unknown-outcome recovery (operator-authorized amendment to D2/D3).** Neither
    a `modify` error nor an unusable receipt proves the VM was left unchanged: live
    mutation precedes fallible persistence. So:
@@ -333,6 +455,10 @@ the page walk alone costs about 11.5 ms per tick for a 1 GiB guest (D5.5).
      promise. A plain live request equal to the seed can be a statusless no-op, so
      a genuine change reseeds again; a hold never repairs or rolls back
      configuration, and abort/join is not transaction rollback.
+   These rules are memory's; the CPU axis keeps the unknown-outcome rule and its
+   own durable demand separately (D4.1). A change of authority does **not** clear
+   the CPU axis's outstanding demand or its deadline: only progress, or genuinely
+   new demand evidence, does.
    The invariant is enforced by the driver's branch structure and the stateful
    model tests, not by the numeric proof: the seed kernel proves
    numeric safety and distinctness, while provenance, persistence and liveness
@@ -341,15 +467,29 @@ the page walk alone costs about 11.5 ms per tick for a 1 GiB guest (D5.5).
    the bracket midpoint of the cheap aggregate read. Residency is a separate
    observation outside that bracket, still taken off the async workers; paused
    samples omit residency, and a stopped sandbox keeps publishing its last sample
-   (`ReleaseMode::Stale`), so an absent rate and a measured zero are not the same
-   thing — `0.0` means *no rate was published*, not an idle guest. A genuinely
+   (`ReleaseMode::Stale`). A published `0.0` is **ambiguous**, not a distinct
+   third state: the runtime can compute a genuine zero delta, and the registry also
+   encodes an absent rate as zero (S-B). Neither origin proves idleness, so `0.0`
+   makes no demand decision. Exactly-zero guests therefore cannot be reclaimed by
+   demand policy; small positive rates can. A genuinely
    unreliable pairing window still carries the last trustworthy percentage, or
    publishes zero before any trustworthy rate exists. A published row therefore
    spans three instants: cumulative counters at the cheap read, residency up to
    one page walk later, and `sampled_at` at the write. `cpu_percent` describes the
    interval between two cheap reads and is exact for that interval; the lag
    between it and `sampled_at` is one walk (≈ 11.5 ms at 1 GiB, up to the walk's
-   duration on a large guest), which #647 must treat as lag rather than bias. The
+   duration on a large guest), which the CPU controller treats as lag rather than
+   bias.
+
+   Lifecycle eligibility is a separate, lazy observation (D4.1). It is a
+   *detection* mechanism with a stated bound, **not** a pause fence: a pause and
+   resume wholly inside one 1 s TTL is unobservable, and no public check makes row
+   capture, pause, probe reply and apply delivery atomic. A missed pause can only
+   produce an apply that succeeds (a legal modification of a sandbox that is
+   running again) or fails and enters Recovering with its evidence reset; it cannot
+   produce a persistent wrong authority, because no failure is read as "no
+   effect". The same holds for a row captured before a pause and admitted after
+   resume. The
    upper-filesystem staleness window shrinks by the same walk. This is a runtime
    sampling correction, not a shared-memory ABI or a controller policy change.
 
@@ -390,17 +530,34 @@ the page walk alone costs about 11.5 ms per tick for a 1 GiB guest (D5.5).
   after 50 lower-demand ticks plus convergence, 200 ms polling). All of those
   timings are **nominal**: actual sample and monitor timing is not guaranteed, and
   no wall-clock latency or OOM-safety property follows from them.
-- **Interim (S2):** memory scales, vCPUs do not. Every session keeps `1` online
-  vCPU whatever `--cpus` says, so the CPU ceiling still only reserves capacity
-  until [#647](https://github.com/gregwebs/agent-vm/issues/647). The runtime
-  pairing prerequisite was repaired by
-  [#654](https://github.com/gregwebs/agent-vm/issues/654); that is not CPU
-  commitment tracking.
+- **Both axes are live (S3).** Memory follows D3; vCPUs follow D4: one step up on
+  the 10th consecutive distinct observation at `C * 95%`, one step down on the 5th
+  at `(C-1) * 85%`, within `1..=max_cpus`. The 2 s / 1 s figures assume a distinct
+  observation at every nominal 200 ms poll; they are dwell in observations, not
+  deadlines, and lengthen with duplicates or a slower publication period. CPU
+  cannot promise convergence to an arbitrary target: the metric under-reports on a
+  contended host (operator evidence M5/M6) and the accepted policy is to settle at
+  a sustainable commitment rather than compensate. Exactly-zero guests are not
+  reclaimed by demand policy (D4.1).
+- **Native multi-step scaling is unverified.** One live 1→2 step and live memory
+growth were observed natively; a multi-step CPU climb or any native shrink was
+never observed, and no attested integrated run covers the final tree (S-G:
+BLOCKED/INCONCLUSIVE). Sustained demand at short sample intervals also
+both under- and over-reads a pegged vCPU — 87, 93, 82, 120, 106, 106, 100, 51, 97
+percent at capacity 4 and 86, 98, 100, 82, 100 at capacity 1, on the runtime's
+**default** interval — so the per-row rate is noisy independent of capacity.
+That is a runtime measurement concern to report, not a reason to tune 95/85, 10/5
+or the 200 ms cadence. The deterministic injected-observation tests are what
+establish the CPU policy.
 - The monitor is one in-process task per session, owned by the launch's teardown,
   and it holds the only handle that stops it. Teardown stops it before any
   lifecycle operation, so a resize cannot be dispatched against a VM that is
   already stopping; abort/join proves local cessation only, because a delivered
   request is not cancellable and guest convergence continues.
+- Recovery can persist a `NextStart` memory **or CPU** seed that outlives the
+  launcher, so a retained record can also start at a different vCPU count than the
+  fresh-launch boot commitment. The CPU seed is a repair value, never a policy
+  target or a receipt.
 - Recovery can persist a `NextStart` memory seed that outlives the launcher (D5.4),
   so a retained sandbox record may start above 512 MiB. Nothing rolls it back, and
   a plain live request equal to it can be an applied no-op. 512 MiB at boot is a
