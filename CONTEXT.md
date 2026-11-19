@@ -614,15 +614,22 @@ another selection tier or an edit of the **default boot image**.
 A Docker build the **launcher** runs because the user typed `--dockerfile FILE`
 on the command line, never because of an environment variable, a config file or
 the **catalog**. Its context is the Dockerfile's own directory. Every such launch
-builds; Docker's own build cache is the only reuse. The result is published
-into the **image cache** under an internal name derived from the Dockerfile's
-path, and that launch boots exactly the content it just built. Typing the flag is
-the consent, so a launch build writes no **image pin** and needs no **image
-approval**. A build failure is the launcher's own failure, never a guest status.
-For a named, reusable image, use `agent-vm image build` and `--image`.
+builds, and Docker's own build cache decides what is rebuilt. Each distinct
+result is published into the **image cache** under an internal name derived from
+the Dockerfile's path, and that launch boots exactly the content it just built.
+Typing the flag is the consent, so a launch build writes no **image pin** and
+needs no **image approval**. A build failure is the launcher's own failure,
+never a guest status. For a named, reusable image, use `agent-vm image build`
+and `--image`.
+
+Its **launch-build export** is Docker writing the built image out as an OCI
+archive for publication — a transfer distinct from publishing into the **image
+cache**. Its **launch-build probe** is a first Docker run of the same build that
+writes no image anywhere and reports the built manifest digest through a private
+`--metadata-file`.
 
 _Avoid_: "derived image", "project image" (retired terms for automatic builds);
-"auto-build".
+"auto-build"; "re-import" for the launch-build export.
 
 
 ## Project

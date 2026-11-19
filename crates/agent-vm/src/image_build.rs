@@ -24,7 +24,8 @@
 //!
 //! Publication lives in [`crate::image_publish`]; the approval of its result in
 //! [`crate::image_pin::approve_published`]. The launch build
-//! ([`crate::launch_build`]) reuses this export with null stdin.
+//! ([`crate::launch_build`]) reuses this export with null stdin, after its
+//! [`probe`] (ADR-0071).
 
 use std::ffi::{OsStr, OsString};
 use std::io::Write as _;
@@ -39,6 +40,9 @@ use clap::builder::TypedValueParser as _;
 use vstd::prelude::*;
 
 use crate::config::escape_str;
+// One name for Docker's reported manifest digest across the crate: the same type
+// `image_pin` calls `ManifestDigest`.
+use crate::image_acquire::ValidatedDigest as ManifestDigest;
 
 /// The fixed hint appended when Docker itself cannot be run. OCI export support
 /// varies by buildx driver; a classic image-store driver may reject it, while an
@@ -50,6 +54,16 @@ this needs a working Docker with buildx, and a builder that supports `--output \
 type=oci` (select one explicitly with --builder). To use images that only exist \
 in the local Docker daemon, build externally and import them with \
 `agent-vm image import --docker REF --tag REF`";
+
+/// One OCI archive on stdout. `dest=-` avoids CSV quoting problems with commas /
+/// non-UTF-8 staging paths in `type=oci,dest=<path>`.
+const EXPORT_OUTPUT: &str = "type=oci,dest=-";
+
+/// The launch-build probe (ADR-0071). `store=false` with no name writes no
+/// Docker-store image; `oci-mediatypes=true` makes the docker driver report the
+/// OCI manifest digest the export writes (without it, that driver reports a
+/// Docker-format manifest's digest).
+const PROBE_OUTPUT: &str = "type=image,oci-mediatypes=true,store=false";
 
 #[derive(ClapArgs)]
 pub(crate) struct Args {
@@ -206,6 +220,17 @@ pub(crate) struct DockerBuild<'a> {
     pub(crate) options: &'a BuildOptions,
 }
 
+/// Where Docker sends the built image: the only part of the argv the launch-build
+/// probe and the export do not share (ADR-0071 §4).
+#[derive(Clone, Copy)]
+enum Output<'a> {
+    /// One OCI archive on stdout.
+    OciArchive,
+    /// The launch-build probe: no image written anywhere, the manifest digest in
+    /// `metadata`.
+    Probe { metadata: &'a Path },
+}
+
 /// Build the user's Dockerfile and import the result under `--tag`. Returns the
 /// process exit code.
 pub(crate) async fn run(args: Args) -> Result<i32> {
@@ -269,8 +294,49 @@ pub(crate) async fn export_archive(
     archive: std::fs::File,
     stdin: Stdio,
 ) -> std::io::Result<i32> {
-    let stdout = Stdio::from(archive);
-    let status = build_command(build)
+    run_status(
+        build_command(build, Output::OciArchive),
+        stdin,
+        Stdio::from(archive),
+    )
+    .await
+}
+
+/// Run the launch-build probe: the build itself, with no image written anywhere
+/// and Docker's reported manifest digest in `metadata` (ADR-0071). stdin and
+/// stdout are `/dev/null`; stderr is the user's.
+///
+/// A non-zero exit is Docker's verdict on the build and the caller's failure to
+/// report (ADR-0061 §11). Only after a zero exit does the metadata matter.
+pub(crate) async fn probe(build: &DockerBuild<'_>, metadata: &Path) -> std::io::Result<ProbeRun> {
+    let exit = run_status(
+        build_command(build, Output::Probe { metadata }),
+        // ADR-0061 §9: a launch build never consumes the guest's input.
+        Stdio::null(),
+        // The image exporter writes nothing there; the launcher's stdout stays the
+        // guest's (R18).
+        Stdio::null(),
+    )
+    .await?;
+    if exit != 0 {
+        return Ok(ProbeRun::Failed(exit));
+    }
+    let reported = std::fs::read(metadata)
+        .map_err(ProbeUnreported::Unreadable)
+        .and_then(|bytes| reported_digest(&bytes));
+    Ok(ProbeRun::Built(reported))
+}
+
+/// Run `command` with the caller's `stdin`/`stdout` and stderr inherited,
+/// returning Docker's exit status. The probe and the export differ only in the
+/// descriptors and the output group, so neither can drift on how the child is
+/// wired.
+async fn run_status(
+    mut command: tokio::process::Command,
+    stdin: Stdio,
+    stdout: Stdio,
+) -> std::io::Result<i32> {
+    let status = command
         .stdin(stdin)
         .stdout(stdout)
         .stderr(Stdio::inherit())
@@ -279,13 +345,83 @@ pub(crate) async fn export_archive(
     Ok(crate::msb_cmd::exit_code_from_status(status))
 }
 
+/// Docker's verdict on the launch-build probe. A nonzero exit is the build's own
+/// failure (ADR-0061 §11): Docker reports a failing step and a rejected exporter
+/// alike.
+#[derive(Debug)]
+pub(crate) enum ProbeRun {
+    Failed(i32),
+    /// Built; what the metadata said. Only `Ok` can lead to skipping the export.
+    Built(Result<ManifestDigest, ProbeUnreported>),
+}
+
+/// Why a successful probe named no usable digest. Rendered only in a debug line.
+#[derive(Debug)]
+pub(crate) enum ProbeUnreported {
+    /// The metadata file is missing or unreadable.
+    Unreadable(std::io::Error),
+    /// Not JSON, or `containerimage.digest` is not a string.
+    Malformed(serde_json::Error),
+    /// The key is absent.
+    NoDigest,
+    /// [`ManifestDigest::parse`] refused it.
+    InvalidDigest,
+}
+
+impl std::fmt::Display for ProbeUnreported {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreadable(error) => {
+                write!(
+                    formatter,
+                    "the probe metadata file could not be read: {error}"
+                )
+            }
+            Self::Malformed(error) => {
+                write!(
+                    formatter,
+                    "the probe metadata is not the expected build record: {error}"
+                )
+            }
+            Self::NoDigest => {
+                write!(
+                    formatter,
+                    "the probe metadata names no containerimage.digest"
+                )
+            }
+            Self::InvalidDigest => write!(
+                formatter,
+                "the probe metadata's containerimage.digest is not a usable digest"
+            ),
+        }
+    }
+}
+
+/// The one field of Docker's `--metadata-file` this launcher reads. Every other
+/// key (`buildx.build.provenance`, `containerimage.descriptor`, `image.name`) is
+/// ignored by serde's default.
+#[derive(serde::Deserialize)]
+struct ProbeMetadata {
+    #[serde(rename = "containerimage.digest")]
+    digest: Option<String>,
+}
+
+/// The pure half: the digest a probe's metadata bytes report.
+fn reported_digest(metadata: &[u8]) -> Result<ManifestDigest, ProbeUnreported> {
+    let parsed: ProbeMetadata =
+        serde_json::from_slice(metadata).map_err(ProbeUnreported::Malformed)?;
+    let digest = parsed.digest.ok_or(ProbeUnreported::NoDigest)?;
+    ManifestDigest::parse(&digest).map_err(|_| ProbeUnreported::InvalidDigest)
+}
+
 /// `docker buildx build` with agent-vm's bounded option surface plus the flags
 /// that make the output one anonymous host-platform OCI image. Values cross
-/// `Command::arg`, never a shell.
+/// `Command::arg`, never a shell. `output` is the one thing that varies between
+/// the launch-build probe and the export (ADR-0071 §4).
 ///
 /// Deliberately no Docker `-t`: the result reference is supplied only to the
 /// importer's tags, so there is one image and no Docker-store alias.
-fn build_command(build: &DockerBuild<'_>) -> tokio::process::Command {
+fn build_command(build: &DockerBuild<'_>, output: Output<'_>) -> tokio::process::Command {
     let mut command = tokio::process::Command::new("docker");
     command.args(["buildx", "build"]);
     if let Some(builder) = &build.options.builder {
@@ -321,12 +457,22 @@ fn build_command(build: &DockerBuild<'_>) -> tokio::process::Command {
         // an index with auxiliary attestation manifests the importer would have
         // to ignore.
         .arg("--provenance=false")
-        .arg("--sbom=false")
-        // `dest=-` avoids CSV quoting problems with commas / non-UTF-8 staging
-        // paths in `--output type=oci,dest=<path>`.
-        .arg("--output")
-        .arg("type=oci,dest=-")
-        .arg(build.context);
+        .arg("--sbom=false");
+    match output {
+        Output::OciArchive => {
+            command.arg("--output").arg(EXPORT_OUTPUT);
+        }
+        Output::Probe { metadata } => {
+            // `--metadata-file` takes a plain path, so a comma or a non-UTF-8
+            // staging path needs no CSV handling: it is one `OsStr` argument.
+            command
+                .arg("--output")
+                .arg(PROBE_OUTPUT)
+                .arg("--metadata-file")
+                .arg(metadata);
+        }
+    }
+    command.arg(build.context);
     command
 }
 
@@ -423,7 +569,7 @@ mod tests {
     fn owned_output_and_platform_flags_are_always_present() {
         let args = parse(&["t", "--tag", "a:1"]).expect("parses");
         let build = docker_build_from_args(&args);
-        let argv = argv_of(&build_command(&build));
+        let argv = argv_of(&build_command(&build, Output::OciArchive));
         let render = |argv: &[OsString]| {
             argv.iter()
                 .map(|arg| arg.to_string_lossy().into_owned())
@@ -495,7 +641,7 @@ mod tests {
         ])
         .expect("parses");
         let build = docker_build_from_args(&args);
-        let rendered: Vec<String> = argv_of(&build_command(&build))
+        let rendered: Vec<String> = argv_of(&build_command(&build, Output::OciArchive))
             .iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
@@ -513,7 +659,7 @@ mod tests {
         assert!(rendered.windows(2).any(|w| w == ["--build-arg", "B="]));
         assert!(rendered.windows(2).any(|w| w == ["--build-arg", "C=a=b"]));
         assert!(rendered.windows(2).any(|w| w == ["--target", "stage"]));
-        let argv = argv_of(&build_command(&build));
+        let argv = argv_of(&build_command(&build, Output::OciArchive));
         assert_eq!(
             build_context_values(&argv),
             vec![
@@ -537,7 +683,7 @@ mod tests {
     fn no_dockerfile_flag_when_the_option_is_omitted() {
         let args = parse(&["t", "--tag", "a:1"]).expect("parses");
         let build = docker_build_from_args(&args);
-        let rendered: Vec<String> = argv_of(&build_command(&build))
+        let rendered: Vec<String> = argv_of(&build_command(&build, Output::OciArchive))
             .iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
@@ -552,25 +698,247 @@ mod tests {
             context: OsStr::new("/abs"),
             options: &options,
         };
-        let argv = argv_of(&build_command(&build));
-        let rendered: Vec<String> = argv
-            .iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
+        // Both runs of a launch build carry only these, plus their own output group.
+        for argv in [
+            argv_of(&build_command(&build, Output::OciArchive)),
+            argv_of(&build_command(
+                &build,
+                Output::Probe {
+                    metadata: Path::new("/abs/probe.json"),
+                },
+            )),
+        ] {
+            let rendered: Vec<String> = argv
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(rendered[0..2], ["buildx", "build"]);
+            assert_eq!(
+                rendered
+                    .windows(2)
+                    .find(|w| w[0] == "-f")
+                    .map(|w| w[1].as_str()),
+                Some("/abs/Dockerfile")
+            );
+            assert_eq!(rendered.last().map(String::as_str), Some("/abs"));
+            assert!(!rendered.iter().any(|arg| arg == "-t"
+                || arg == "--tag"
+                || arg == "--builder"
+                || arg == "--build-context"
+                || arg == "--progress"));
+        }
+    }
+
+    /// The one contiguous occurrence of `group` in `argv`, as an index.
+    fn group_at(argv: &[OsString], group: &[OsString]) -> usize {
+        let positions: Vec<usize> = (0..=argv.len().saturating_sub(group.len()))
+            .filter(|&index| argv[index..index + group.len()] == *group)
             .collect();
-        assert_eq!(rendered[0..2], ["buildx", "build"]);
         assert_eq!(
-            rendered
-                .windows(2)
-                .find(|w| w[0] == "-f")
-                .map(|w| w[1].as_str()),
-            Some("/abs/Dockerfile")
+            positions.len(),
+            1,
+            "the group {group:?} must occur exactly once in {argv:?}"
         );
-        assert_eq!(rendered.last().map(String::as_str), Some("/abs"));
-        assert!(!rendered.iter().any(|arg| arg == "-t"
-            || arg == "--tag"
-            || arg == "--builder"
-            || arg == "--build-context"
-            || arg == "--progress"));
+        positions[0]
+    }
+
+    /// `argv` with its one `group` removed, plus where the group was.
+    fn without_group(argv: &[OsString], group: &[OsString]) -> (Vec<OsString>, usize) {
+        let index = group_at(argv, group);
+        let mut rest = argv.to_vec();
+        rest.drain(index..index + group.len());
+        (rest, index)
+    }
+
+    fn group(items: &[&str]) -> Vec<OsString> {
+        items.iter().map(OsString::from).collect()
+    }
+
+    /// The launch-build probe and the export differ in exactly one place: the
+    /// output group (R2, Q10, ADR-0071 §4). Every other flag — builder, build
+    /// args, contexts, target, pull, no-cache, progress, platform, provenance,
+    /// SBOM, file, context — is shared because it comes from one function.
+    #[test]
+    fn probe_and_export_differ_only_in_their_output_group() {
+        const METADATA: &str = "/tmp/lb/probe.json";
+        let launch_options = BuildOptions::default();
+        let launch = DockerBuild {
+            dockerfile: Some(OsStr::new("/abs/Dockerfile")),
+            context: OsStr::new("/abs"),
+            options: &launch_options,
+        };
+        let full_args = parse(&[
+            "t",
+            "--tag",
+            "a:1",
+            "-f",
+            "Containerfile",
+            "--build-arg",
+            "A=one two",
+            "--build-context",
+            "bin=out dir",
+            "--target",
+            "stage",
+            "--builder",
+            "mybuilder",
+            "--pull",
+            "--no-cache",
+            "--progress",
+            "plain",
+            "the context",
+        ])
+        .expect("parses");
+        let full = docker_build_from_args(&full_args);
+
+        for (name, build) in [("launch default", &launch), ("every option", &full)] {
+            let export = argv_of(&build_command(build, Output::OciArchive));
+            let probe = argv_of(&build_command(
+                build,
+                Output::Probe {
+                    metadata: Path::new(METADATA),
+                },
+            ));
+            let (export_rest, export_at) =
+                without_group(&export, &group(&["--output", EXPORT_OUTPUT]));
+            let (probe_rest, probe_at) = without_group(
+                &probe,
+                &group(&["--output", PROBE_OUTPUT, "--metadata-file", METADATA]),
+            );
+            assert_eq!(
+                export_rest, probe_rest,
+                "{name}: the two runs share the whole argv apart from their output group"
+            );
+            assert_eq!(
+                export_at, probe_at,
+                "{name}: the output group sits at the same position"
+            );
+            assert_eq!(
+                export_at,
+                export_rest.len() - 1,
+                "{name}: the output group is immediately before the context: {export_rest:?}"
+            );
+        }
+    }
+
+    /// The probe writes no image and hands Docker the metadata path as one whole
+    /// argv element, however odd that path is.
+    #[test]
+    fn probe_output_writes_no_image_and_passes_the_metadata_path_whole() {
+        let options = BuildOptions::default();
+        let build = DockerBuild {
+            dockerfile: Some(OsStr::new("/abs/Dockerfile")),
+            context: OsStr::new("/abs"),
+            options: &options,
+        };
+        for raw in [
+            OsString::from("/m d,ir/probe.json"),
+            OsString::from_vec(b"/m\x80dir/probe.json".to_vec()),
+        ] {
+            let metadata = PathBuf::from(&raw);
+            let argv = argv_of(&build_command(
+                &build,
+                Output::Probe {
+                    metadata: &metadata,
+                },
+            ));
+            let output = vec![
+                OsString::from("--output"),
+                OsString::from(PROBE_OUTPUT),
+                OsString::from("--metadata-file"),
+                raw.clone(),
+            ];
+            let (rest, at) = without_group(&argv, &output);
+            assert_eq!(
+                at,
+                rest.len() - 1,
+                "{raw:?}: the probe group precedes the context"
+            );
+            let rendered: Vec<String> = argv
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            let output_value = &rendered[at + 1];
+            assert!(
+                output_value.contains("store=false"),
+                "{raw:?}: the probe writes no Docker-store image: {output_value}"
+            );
+            assert!(
+                output_value.contains("oci-mediatypes=true"),
+                "{raw:?}: the probe reports the OCI manifest digest: {output_value}"
+            );
+            for absent in ["-t", "--tag", "--load", "--push"] {
+                assert!(
+                    !argv.iter().any(|arg| arg == absent),
+                    "{raw:?}: a probe names no destination ({absent}): {rendered:?}"
+                );
+            }
+            for absent in ["type=docker", "name="] {
+                assert!(
+                    !rendered.iter().any(|arg| arg.contains(absent)),
+                    "{raw:?}: a probe has no {absent}: {rendered:?}"
+                );
+            }
+        }
+    }
+
+    /// Only the documented key counts, and no odd JSON panics.
+    #[test]
+    fn reported_digest_reads_only_containerimage_digest() {
+        let digest = format!("sha256:d435b1ad{}", "0".repeat(56));
+        // A trimmed metadata file of the shape Docker writes: unknown keys are
+        // ignored, including the descriptor's own digest.
+        let colima = format!(
+            r#"{{
+  "buildx.build.provenance": {{"buildType": "https://mobyproject.org/buildkit@v1", "materials": []}},
+  "buildx.build.ref": "colima/colima/abc123",
+  "containerimage.config.digest": "{digest}",
+  "containerimage.descriptor": {{"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": "{digest}", "size": 1583, "platform": {{"architecture": "arm64", "os": "linux"}}}},
+  "containerimage.digest": "{digest}",
+  "image.name": "moby-dangling@{digest}"
+}}"#
+        );
+        assert_eq!(
+            reported_digest(colima.as_bytes()).unwrap().as_str(),
+            digest,
+            "the documented key, whatever else the record holds"
+        );
+
+        // Uppercase hex is folded, as every other digest path does.
+        let upper = format!(
+            "{{\"containerimage.digest\":\"sha256:{}\"}}",
+            "AB".repeat(32)
+        );
+        assert_eq!(
+            reported_digest(upper.as_bytes()).unwrap().as_str(),
+            format!("sha256:{}", "ab".repeat(32))
+        );
+
+        let descriptor_only = format!(
+            "{{\"containerimage.descriptor\":{{\"digest\":\"sha256:{}\"}}}}",
+            "0".repeat(64)
+        );
+        let table: [(&[u8], &str, bool); 6] = [
+            (b"{}", "no digest", false),
+            (descriptor_only.as_bytes(), "descriptor only", false),
+            (b"{\"containerimage.digest\":5}", "not a string", true),
+            (b"[]", "not an object", true),
+            (b"not json", "not JSON", true),
+            (b"", "empty", true),
+        ];
+        for (bytes, why, malformed) in table {
+            match reported_digest(bytes) {
+                Err(ProbeUnreported::NoDigest) if !malformed => {}
+                Err(ProbeUnreported::Malformed(_)) if malformed => {}
+                other => panic!(
+                    "{why}: expected {} , got {other:?}",
+                    if malformed { "Malformed" } else { "NoDigest" }
+                ),
+            }
+        }
+        match reported_digest(b"{\"containerimage.digest\":\"sha256:abc\"}") {
+            Err(ProbeUnreported::InvalidDigest) => {}
+            other => panic!("a malformed digest is its own reason, got {other:?}"),
+        }
     }
 
     // -- build contexts ----------------------------------------------------
@@ -642,7 +1010,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("{raw:?} must be accepted: {error}"))
             .args;
             let build = docker_build_from_args(&args);
-            let argv = argv_of(&build_command(&build));
+            let argv = argv_of(&build_command(&build, Output::OciArchive));
             assert_eq!(
                 build_context_values(&argv),
                 vec![raw],

@@ -40,7 +40,9 @@
 //! the flag is the consent (ADR-0061). It bypasses the pin store completely.
 //! Right after publication the tag is read back cache-only and must match the
 //! loader's reported digest; preparation later reads that immutable `repo@digest`
-//! cache-only under the shared barrier held through create.
+//! cache-only under the shared barrier held through create. When the probe's
+//! digest is already cached, that `repo@digest` is booted without an export or
+//! publication, and the tag is left as is (ADR-0071).
 
 use std::fmt;
 
@@ -85,7 +87,9 @@ pub(crate) use refresh::{
     plan_refresh, refresh_target,
 };
 pub(crate) use store::RefreshScopeSnapshot;
-pub(crate) use unpinned::{BuiltImage, prepare_unpinned, read_back_unpinned};
+pub(crate) use unpinned::{
+    BuiltImage, ProbedCache, cached_unpinned, prepare_unpinned, read_back_unpinned,
+};
 
 // `Option` normally accepts missing fields in serde. Version 1 requires the
 // field even when its value is null; deserialize_with disables that default.

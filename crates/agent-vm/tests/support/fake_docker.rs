@@ -6,9 +6,26 @@
 //! demand. Nothing about the importer is faked: the archive is a real OCI
 //! archive consumed by the real native loader inside the real binary.
 //!
-//! It also records what the launcher gave it on **stdin** when
-//! `FAKE_DOCKER_STDIN_LOG` names a file, which is how a test proves a launch
-//! build does not consume the input meant for the guest.
+//! It also records what the launcher gave **each** invocation on stdin, as one
+//! framed record per call in `FAKE_DOCKER_STDIN_LOG` (read with
+//! [`stdin_records`]), which is how a test proves a launch build does not
+//! consume the input meant for the guest. A cold launch build runs Docker twice,
+//! so a single truncated file could let the second call erase what the first one
+//! read.
+//!
+//! `--metadata-file F` marks the launch-build **probe**: after a successful run
+//! it writes `{"containerimage.digest":"$FAKE_DOCKER_PROBE_DIGEST"}` to F when
+//! that variable is set (and nothing otherwise, like a builder that reports no
+//! digest). `FAKE_DOCKER_EXPORT_EXIT` fails only a non-probe build.
+//!
+//! `FAKE_DOCKER_PROBE_METADATA_UNREADABLE` writes that metadata and then makes it
+//! unreadable, the one probe-metadata problem a fake file can pose and a
+//! malformed one cannot: a file that exists but cannot be opened.
+//!
+//! Deliberate exception to `CODING_STANDARDS.md` ("Bash": `set -euo pipefail`):
+//! this script depends on failing commands *inside* `if`/`&&` tests and on a
+//! `case` fallthrough to report an unexpected subcommand, so `-e`, `-u` and
+//! `pipefail` would each change what it is emulating rather than harden it.
 
 #![allow(dead_code)]
 
@@ -23,7 +40,9 @@ pub fn write(path: &Path) {
 # Fake Docker for agent-vm image build/import and launch-build tests. Records argv
 # NUL-separated, replays a fixture archive, and can fail or die by signal on demand.
 if [ -n "${FAKE_DOCKER_STDIN_LOG:-}" ]; then
-  cat > "$FAKE_DOCKER_STDIN_LOG"
+  # One framed record per call, appended in call order, so a later call cannot
+  # erase what an earlier one read.
+  { printf 'STDIN\0'; cat; printf '\0END\0'; } >> "$FAKE_DOCKER_STDIN_LOG"
 fi
 {
   printf 'CALL\0'
@@ -38,6 +57,15 @@ case "${1:-} ${2:-}" in
     mode=save; out="$4" ;;
   *) printf 'UNEXPECTED\0' >> "${FAKE_DOCKER_LOG:?}"; echo "fake docker: unexpected subcommand" >&2; exit 97 ;;
 esac
+
+metadata=
+if [ "$mode" = build ]; then
+  prev=
+  for a in "$@"; do
+    [ "$prev" = --metadata-file ] && metadata="$a"
+    prev="$a"
+  done
+fi
 
 emit_archive() {
   if [ "$mode" = save ]; then cat "$FAKE_DOCKER_ARCHIVE" > "$out"; else cat "$FAKE_DOCKER_ARCHIVE"; fi
@@ -64,6 +92,20 @@ if [ -n "${FAKE_DOCKER_EXIT:-}" ] && [ "${FAKE_DOCKER_EXIT}" != "0" ]; then
     emit_archive
   fi
   exit "${FAKE_DOCKER_EXIT}"
+fi
+
+if [ -n "$metadata" ]; then
+  # A real Docker writes the probe's metadata only after a successful build.
+  if [ -n "${FAKE_DOCKER_PROBE_DIGEST:-}" ]; then
+    printf '{"containerimage.digest":"%s"}\n' "$FAKE_DOCKER_PROBE_DIGEST" > "$metadata"
+    if [ -n "${FAKE_DOCKER_PROBE_METADATA_UNREADABLE:-}" ]; then
+      # A metadata file this process may not read, so the probe's digest cannot
+      # reach the launcher even though the build succeeded (ADR-0071 §5).
+      chmod 000 "$metadata"
+    fi
+  fi
+elif [ -n "${FAKE_DOCKER_EXPORT_EXIT:-}" ] && [ "${FAKE_DOCKER_EXPORT_EXIT}" != "0" ]; then
+  exit "${FAKE_DOCKER_EXPORT_EXIT}"
 fi
 
 if [ -n "${FAKE_DOCKER_ARCHIVE:-}" ]; then
@@ -94,4 +136,26 @@ pub fn calls(log: &Path) -> Vec<Vec<OsString>> {
     }
     assert!(current.is_none(), "the docker log ended mid-call");
     calls
+}
+
+/// What each fake-Docker invocation read on stdin, in call order (record `i` is
+/// [`calls`]`[i]`'s). Payloads must not contain NUL, the frame separator.
+pub fn stdin_records(log: &Path) -> Vec<Vec<u8>> {
+    const START: &[u8] = b"STDIN\0";
+    const END: &[u8] = b"\0END\0";
+    let bytes = fs::read(log).unwrap_or_default();
+    let mut records = Vec::new();
+    let mut rest = bytes.as_slice();
+    while !rest.is_empty() {
+        rest = rest
+            .strip_prefix(START)
+            .expect("a stdin record starts with STDIN");
+        let end = rest
+            .windows(END.len())
+            .position(|window| window == END)
+            .expect("a stdin record ends with END");
+        records.push(rest[..end].to_vec());
+        rest = &rest[end + END.len()..];
+    }
+    records
 }
