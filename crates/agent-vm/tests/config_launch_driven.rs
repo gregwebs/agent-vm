@@ -70,13 +70,15 @@
 
 use std::{
     collections::BTreeMap,
-    io::{Read, Write as _},
+    io::Read,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 mod support;
+
+use support::{run_with_input, run_with_timeout};
 
 /// A loopback spelling imported only by builder-dependent tests. Cold tests
 /// deliberately leave it absent to exercise acquisition refusal.
@@ -138,58 +140,6 @@ fn write_fake_msb(dir: &Path) -> PathBuf {
     // refuses an `msb` with no adjacent libkrunfw, and a version-only script is
     // not a launch seam.
     fake_msb::install_pair(dir, fake_msb::Mode::LaunchSeam).path
-}
-
-fn run_with_timeout(cmd: Command, timeout: Duration) -> Output {
-    run_with_input(cmd, None, timeout)
-}
-
-/// [`run_with_timeout`], plus optional bytes written to the child's stdin, which
-/// is then closed. One implementation, so the hang bound is the same whether or
-/// not a test speaks to its child; a caller that set its own stdin keeps it.
-fn run_with_input(mut cmd: Command, input: Option<&str>, timeout: Duration) -> Output {
-    if input.is_some() {
-        cmd.stdin(Stdio::piped());
-    }
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn().expect("failed to spawn agent-vm");
-    if let Some(text) = input {
-        // Dropping the pipe closes the child's stdin, so an endpoint that reads
-        // to EOF terminates instead of waiting for a second frame.
-        let mut pipe = child.stdin.take().expect("piped stdin");
-        pipe.write_all(text.as_bytes()).expect("write the frame");
-    }
-    let mut stdout_pipe = child.stdout.take().unwrap();
-    let mut stderr_pipe = child.stderr.take().unwrap();
-    let stdout_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout_pipe.read_to_end(&mut buf);
-        buf
-    });
-    let stderr_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut buf);
-        buf
-    });
-
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("try_wait failed") {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("agent-vm did not exit within {timeout:?} (possible hang)");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-
-    Output {
-        status,
-        stdout: stdout_handle.join().unwrap(),
-        stderr: stderr_handle.join().unwrap(),
-    }
 }
 
 fn assert_cold_preparation_failure(h: &Harness, out: &Output) {

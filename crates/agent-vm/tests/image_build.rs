@@ -41,6 +41,7 @@ mod pin_gate;
 mod support;
 
 use image_archive::{ArchiveSpec, LayerContent, PlatformSpec, Written};
+use support::run_with_timeout;
 
 fn agent_vm_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_agent-vm"))
@@ -248,42 +249,6 @@ exit 91
     );
     fs::write(path, script).expect("write fake msb");
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod fake msb");
-}
-
-/// Run `cmd` to completion, killing it if it exceeds `timeout`. Drains stdout
-/// and stderr on separate threads so a full pipe cannot deadlock the wait.
-fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Output {
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn().expect("spawn agent-vm");
-    let mut stdout_pipe = child.stdout.take().unwrap();
-    let mut stderr_pipe = child.stderr.take().unwrap();
-    let stdout = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        stdout_pipe.read_to_end(&mut buf).expect("drain stdout");
-        buf
-    });
-    let stderr = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        stderr_pipe.read_to_end(&mut buf).expect("drain stderr");
-        buf
-    });
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("try_wait") {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("agent-vm did not exit within {timeout:?}");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    Output {
-        status,
-        stdout: stdout.join().unwrap(),
-        stderr: stderr.join().unwrap(),
-    }
 }
 
 fn stderr_of(output: &Output) -> String {
