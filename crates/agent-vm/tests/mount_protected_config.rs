@@ -418,7 +418,8 @@ fn m8_missing_guest_home_and_state_planting_prevented() {
 /// A relative `AGENT_VM_STATE_DIR` used to be anchored at the launch directory,
 /// so this guard measured the cwd-joined spelling of the state root. The root is
 /// now refused at construction (#437, ADR-0050), before any launch work: the
-/// refusal names the variable and the value, and the guard never runs.
+/// refusal names the variable and never repeats the value, which can be a
+/// credential (#353), and the guard never runs.
 #[test]
 fn m9_relative_state_root_is_refused_before_the_guard() {
     use std::os::unix::fs::symlink;
@@ -454,8 +455,12 @@ fn m9_relative_state_root_is_refused_before_the_guard() {
     );
     let text = stderr_of(&out);
     assert!(text.contains("AGENT_VM_STATE_DIR"), "{text}");
-    assert!(text.contains("../../rel-state"), "{text}");
     assert!(text.contains("not an absolute path"), "{text}");
+    // The value can be a credential, so it is never repeated (#353).
+    assert!(
+        !text.contains("../../rel-state"),
+        "the value leaked:\n{text}"
+    );
     for later in ["guest home bind", "[debug]", "==> "] {
         assert!(
             !text.contains(later),

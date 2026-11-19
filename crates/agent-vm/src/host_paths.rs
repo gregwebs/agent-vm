@@ -30,6 +30,39 @@ const ATOMIC_WRITE_RETRIES: usize = 16;
 pub(crate) const STATE_ROOT_ENV_NAME: &str = "XDG_STATE_HOME";
 /// The variable [`cache_root`] reads. See [`STATE_ROOT_ENV_NAME`].
 pub(crate) const CACHE_ROOT_ENV_NAME: &str = "XDG_CACHE_HOME";
+/// The override [`state_root`] reads first. See [`STATE_ROOT_ENV_NAME`].
+pub(crate) const AGENT_VM_STATE_DIR_ENV_NAME: &str = "AGENT_VM_STATE_DIR";
+
+/// The host variable that supplied a root [`state_root`] or [`cache_root`]
+/// resolved.
+///
+/// A report that would print the path must name this variable instead of the
+/// value whenever the value could be a credential (#353), so the fact is
+/// exposed by the resolver rather than guessed at the reporting site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RootSource {
+    /// `AGENT_VM_STATE_DIR`, agent-vm's own override (state root only).
+    AgentVmStateDir,
+    /// [`STATE_ROOT_ENV_NAME`], when it holds an absolute path (state root only).
+    XdgStateHome,
+    /// [`CACHE_ROOT_ENV_NAME`], when it holds an absolute path (cache root only).
+    XdgCacheHome,
+    /// `$HOME`, the default both roots fall back to.
+    Home,
+}
+
+impl RootSource {
+    /// The variable's *name* — all of it a report may print, because the value
+    /// is what a credential configuration could hold.
+    pub(crate) fn variable(self) -> &'static str {
+        match self {
+            Self::AgentVmStateDir => AGENT_VM_STATE_DIR_ENV_NAME,
+            Self::XdgStateHome => STATE_ROOT_ENV_NAME,
+            Self::XdgCacheHome => CACHE_ROOT_ENV_NAME,
+            Self::Home => "HOME",
+        }
+    }
+}
 
 /// `$AGENT_VM_STATE_DIR` → `$XDG_STATE_HOME/agent-vm` → `$HOME/.local/state/agent-vm`,
 /// always absolute (#437).
@@ -56,8 +89,8 @@ pub(crate) const CACHE_ROOT_ENV_NAME: &str = "XDG_CACHE_HOME";
 /// `None` means only that `$HOME` is unset; an `Err` is a refused value, never a
 /// path this function would use anyway.
 pub fn state_root() -> Result<Option<PathBuf>> {
-    let (root, ignored) = state_root_from(
-        std::env::var_os("AGENT_VM_STATE_DIR").as_deref(),
+    let (root, ignored, _source) = state_root_from(
+        std::env::var_os(AGENT_VM_STATE_DIR_ENV_NAME).as_deref(),
         std::env::var_os(STATE_ROOT_ENV_NAME).as_deref(),
         std::env::var_os("HOME").as_deref(),
     )?;
@@ -67,14 +100,14 @@ pub fn state_root() -> Result<Option<PathBuf>> {
         // best-effort because a closed stderr must not turn a valid fallback into
         // a panic. The notice names the state root, not `MSB_HOME`: on macOS the
         // latter is the short default, and the report of whatever moved names that
-        // path itself.
+        // path itself. The ignored *value* is never repeated — it can be a
+        // credential (#353) — so the variable is the only thing named.
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
             let _ = writeln!(
                 std::io::stderr(),
-                "agent-vm: ignoring {} {} because it is not an absolute path; using the state root {}",
-                ignored.variable,
-                one_line::quoted_path(&ignored.value),
+                "agent-vm: ignoring {ignored} because it is not an absolute path; using the state \
+                 root {}",
                 one_line::path(root),
             );
         });
@@ -82,46 +115,53 @@ pub fn state_root() -> Result<Option<PathBuf>> {
     Ok(root)
 }
 
-/// A state-root source that was skipped, kept as data so the rule is unit
-/// testable without reading the environment or capturing stderr.
-#[derive(Debug, PartialEq, Eq)]
-struct IgnoredSource {
-    variable: &'static str,
-    value: PathBuf,
+/// Which variable supplied [`state_root`]'s path, so a report names that
+/// variable instead of printing a path whose value could be a credential (#353).
+/// A refused `AGENT_VM_STATE_DIR` is the same error [`state_root`] gives: that run
+/// has no root to describe.
+///
+/// The answer comes from [`state_root_from`], the one implementation of the
+/// precedence; like [`state_root_overridden`] this reads the environment again
+/// rather than threading the answer through every caller.
+pub(crate) fn state_root_source() -> Result<RootSource> {
+    Ok(state_root_from(
+        std::env::var_os(AGENT_VM_STATE_DIR_ENV_NAME).as_deref(),
+        std::env::var_os(STATE_ROOT_ENV_NAME).as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )?
+    .2)
 }
 
-/// Pure core of [`state_root`]: the precedence and both relative-value rules,
-/// with the environment already read.
+/// Pure core of [`state_root`]: the precedence, both relative-value rules and
+/// which variable supplied the root, with the environment already read. A
+/// skipped value is reported as its variable's name, never as the value.
 fn state_root_from(
     agent_vm_state_dir: Option<&OsStr>,
     xdg_state_home: Option<&OsStr>,
     home: Option<&OsStr>,
-) -> Result<(Option<PathBuf>, Option<IgnoredSource>)> {
+) -> Result<(Option<PathBuf>, Option<&'static str>, RootSource)> {
     if let Some(dir) = agent_vm_state_dir {
         let dir = PathBuf::from(dir);
         if !dir.is_absolute() {
+            // The value itself is not repeated: it can be a credential (#353).
             return Err(anyhow!(
-                "AGENT_VM_STATE_DIR {} is not an absolute path; set it to an \
-                 absolute directory, or unset it to use the default",
-                one_line::quoted_path(&dir)
+                "{AGENT_VM_STATE_DIR_ENV_NAME} is not an absolute path; set it to an absolute \
+                 directory, or unset it to use the default"
             ));
         }
-        return Ok((Some(dir), None));
+        return Ok((Some(dir), None, RootSource::AgentVmStateDir));
     }
     let mut ignored = None;
     if let Some(dir) = xdg_state_home {
         let dir = PathBuf::from(dir);
         if dir.is_absolute() {
-            return Ok((Some(dir.join("agent-vm")), None));
+            return Ok((Some(dir.join("agent-vm")), None, RootSource::XdgStateHome));
         }
-        ignored = Some(IgnoredSource {
-            variable: STATE_ROOT_ENV_NAME,
-            value: dir,
-        });
+        ignored = Some(STATE_ROOT_ENV_NAME);
     }
     let root =
         crate::config::absolute_home_from(home)?.map(|home| home.join(".local/state/agent-vm"));
-    Ok((root, ignored))
+    Ok((root, ignored, RootSource::Home))
 }
 
 /// Whether [`state_root`] would take its value from an environment override
@@ -134,7 +174,7 @@ fn state_root_from(
 /// substituting the default would hide that.
 pub(crate) fn state_root_overridden() -> bool {
     state_root_overridden_from(
-        std::env::var_os("AGENT_VM_STATE_DIR").as_deref(),
+        std::env::var_os(AGENT_VM_STATE_DIR_ENV_NAME).as_deref(),
         std::env::var_os(STATE_ROOT_ENV_NAME).as_deref(),
     )
 }
@@ -153,14 +193,33 @@ pub fn cache_root() -> Option<PathBuf> {
         std::env::var_os(CACHE_ROOT_ENV_NAME).as_deref(),
         std::env::var_os("HOME").as_deref(),
     )
+    .0
 }
 
-fn cache_root_from(xdg_cache_home: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+/// Which variable supplied [`cache_root`]'s path. See [`state_root_source`].
+pub(crate) fn cache_root_source() -> RootSource {
+    cache_root_from(
+        std::env::var_os(CACHE_ROOT_ENV_NAME).as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+    .1
+}
+
+fn cache_root_from(
+    xdg_cache_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> (Option<PathBuf>, RootSource) {
     if let Some(dir) = xdg_cache_home.filter(|p| Path::new(p).is_absolute()) {
-        return Some(PathBuf::from(dir).join("agent-vm"));
+        return (
+            Some(PathBuf::from(dir).join("agent-vm")),
+            RootSource::XdgCacheHome,
+        );
     }
-    home.filter(|p| Path::new(p).is_absolute())
-        .map(|p| PathBuf::from(p).join(".cache/agent-vm"))
+    (
+        home.filter(|p| Path::new(p).is_absolute())
+            .map(|p| PathBuf::from(p).join(".cache/agent-vm")),
+        RootSource::Home,
+    )
 }
 
 /// Host environment variables this module reads as agent-vm's own
@@ -169,19 +228,25 @@ fn cache_root_from(xdg_cache_home: Option<&OsStr>, home: Option<&OsStr>) -> Opti
 /// A launch removes a captured env source from its own environment, so claiming
 /// a configuration variable would break the launcher; worse, the diagnostics
 /// that read the variable as a path (`doctor`'s state and cache sections) would
-/// print the credential's value. Both consequences are now closed: this refusal
-/// keeps an *accepted* configuration from disclosing a value (#163), and
-/// `doctor` withholds any path derived from one of these variables instead of
-/// printing it (#353). ([`STATE_ROOT_ENV_NAME`] and [`CACHE_ROOT_ENV_NAME`] below
-/// are the ones read by [`state_root`] and [`cache_root`]; `AGENT_VM_*` is
-/// reserved by prefix and is not repeated here.)
+/// print the credential's value. Two rules cover that, and neither covers the
+/// other's half: this list makes an *accepted* configuration refuse the name
+/// (#163), and `doctor` names [`RootSource::variable`] instead of printing a path
+/// whose *actual* source is one of these while `credentials.yaml` is unusable
+/// (#353) — the only state in which a claim can exist, because the parser refuses
+/// these names. A path none of `AGENT_VM_STATE_DIR`, `XDG_STATE_HOME` or
+/// `XDG_CACHE_HOME` supplied is printed as before, which is what keeps a
+/// `$HOME`-derived row byte-identical on an unusable file. One exception is
+/// documented with the report: `doctor --reset-msb-db` names the db it moves,
+/// because withholding it would make the recovery command useless.
 ///
 /// Kept here, next to the readers, as one list on purpose: a new `var_os` read
 /// added to this module must be added here too, or it silently reopens the
 /// hole. This constant, [`STATE_ROOT_ENV_NAME`]/[`CACHE_ROOT_ENV_NAME`] (the
 /// names the readers themselves use) and [`is_launcher_config_env`] are that
 /// single source of truth for credential parsing and for the reports that must
-/// name the variable a withheld path derives from.
+/// name the variable a withheld path derives from. `AGENT_VM_STATE_DIR` is read
+/// as one of those paths but is not repeated here: the `AGENT_VM_` prefix that
+/// [`is_launcher_config_env`] also matches already covers it.
 pub(crate) const LAUNCHER_CONFIG_ENV_NAMES: &[&str] = &[STATE_ROOT_ENV_NAME, CACHE_ROOT_ENV_NAME];
 
 /// Whether `name` is one of the host variables agent-vm itself reads as
@@ -1335,7 +1400,10 @@ mod tests {
     fn cache_root_prefers_absolute_xdg_cache_home() {
         assert_eq!(
             cache_root_from(Some(OsStr::new("/cache")), Some(OsStr::new("/home/u"))),
-            Some(PathBuf::from("/cache/agent-vm"))
+            (
+                Some(PathBuf::from("/cache/agent-vm")),
+                RootSource::XdgCacheHome
+            )
         );
     }
     #[test]
@@ -1343,7 +1411,10 @@ mod tests {
         for xdg in ["", "relative"] {
             assert_eq!(
                 cache_root_from(Some(OsStr::new(xdg)), Some(OsStr::new("/home/u"))),
-                Some(PathBuf::from("/home/u/.cache/agent-vm"))
+                (
+                    Some(PathBuf::from("/home/u/.cache/agent-vm")),
+                    RootSource::Home
+                )
             );
         }
     }
@@ -1351,25 +1422,33 @@ mod tests {
     fn cache_root_falls_back_to_home_dot_cache() {
         assert_eq!(
             cache_root_from(None, Some(OsStr::new("/home/u"))),
-            Some(PathBuf::from("/home/u/.cache/agent-vm"))
+            (
+                Some(PathBuf::from("/home/u/.cache/agent-vm")),
+                RootSource::Home
+            )
         );
     }
     #[test]
     fn cache_root_none_without_usable_home() {
         for home in [None, Some(OsStr::new("")), Some(OsStr::new("relative"))] {
-            assert_eq!(cache_root_from(None, home), None);
+            assert_eq!(
+                cache_root_from(None, home),
+                (None, RootSource::Home),
+                "{home:?}"
+            );
         }
     }
 
     #[test]
     fn state_root_takes_an_absolute_agent_vm_state_dir_verbatim() {
-        let (root, ignored) = state_root_from(
+        let (root, ignored, source) = state_root_from(
             Some(OsStr::new("/state")),
             Some(OsStr::new("/xdg")),
             Some(OsStr::new("/home/u")),
         )
         .unwrap();
         assert_eq!(root, Some(PathBuf::from("/state")));
+        assert_eq!(source, RootSource::AgentVmStateDir);
         // The override wins outright: the lower sources are never consulted, so
         // there is nothing to ignore and nothing to report.
         assert!(ignored.is_none());
@@ -1377,7 +1456,7 @@ mod tests {
 
     #[test]
     fn state_root_refuses_an_empty_or_relative_agent_vm_state_dir() {
-        for value in ["", "state", "./state", "../state"] {
+        for value in ["", "state", "./state", "../state", "sk-ant-api03-CANARY"] {
             let error = state_root_from(
                 Some(OsStr::new(value)),
                 Some(OsStr::new("/xdg")),
@@ -1387,41 +1466,46 @@ mod tests {
             let message = format!("{error}");
             assert!(message.contains("AGENT_VM_STATE_DIR"), "{message}");
             assert!(message.contains("not an absolute path"), "{message}");
-            // The rendered value, so the empty case is checked too: it prints as
-            // `""` and must not silently match every message.
-            assert!(
-                message.contains(&format!("\"{value}\"")),
-                "the value is not named: {message}"
-            );
             assert!(message.contains("unset it"), "no remedy named: {message}");
+            // The value is never repeated: it can be a credential (#353), so
+            // naming it would disclose the thing this refusal exists for.
+            assert!(
+                !message.contains(value) || value.is_empty(),
+                "the refused value is named: {message}"
+            );
+            assert!(!message.contains('"'), "a quoted value leaked: {message}");
         }
     }
 
     #[test]
     fn state_root_prefers_an_absolute_xdg_state_home() {
-        let (root, ignored) =
+        let (root, ignored, source) =
             state_root_from(None, Some(OsStr::new("/xdg")), Some(OsStr::new("/home/u"))).unwrap();
         assert_eq!(root, Some(PathBuf::from("/xdg/agent-vm")));
+        assert_eq!(source, RootSource::XdgStateHome);
         assert!(ignored.is_none());
     }
 
     #[test]
-    fn state_root_ignores_a_relative_xdg_state_home_and_reports_it() {
+    fn state_root_ignores_a_relative_xdg_state_home_and_reports_its_name_only() {
         for value in ["", "xdg-state"] {
-            let (root, ignored) =
+            let (root, ignored, source) =
                 state_root_from(None, Some(OsStr::new(value)), Some(OsStr::new("/home/u")))
                     .unwrap();
             assert_eq!(root, Some(PathBuf::from("/home/u/.local/state/agent-vm")));
-            let ignored = ignored.expect("an ignored value must be reported");
-            assert_eq!(ignored.variable, "XDG_STATE_HOME");
-            assert_eq!(ignored.value, PathBuf::from(value));
+            // The ignored variable is reported by name, and the root it supplied
+            // is `$HOME`'s: nothing that a claim could hold reaches a caller.
+            assert_eq!(ignored, Some("XDG_STATE_HOME"));
+            assert_eq!(source, RootSource::Home);
         }
     }
 
     #[test]
     fn state_root_uses_the_home_default_and_shares_homes_discipline() {
-        let (root, ignored) = state_root_from(None, None, Some(OsStr::new("/home/u"))).unwrap();
+        let (root, ignored, source) =
+            state_root_from(None, None, Some(OsStr::new("/home/u"))).unwrap();
         assert_eq!(root, Some(PathBuf::from("/home/u/.local/state/agent-vm")));
+        assert_eq!(source, RootSource::Home);
         assert!(ignored.is_none());
         for home in ["", "home/u"] {
             let error = state_root_from(None, None, Some(OsStr::new(home)))
@@ -1432,7 +1516,69 @@ mod tests {
 
     #[test]
     fn state_root_is_none_only_when_home_is_unset() {
-        assert_eq!(state_root_from(None, None, None).unwrap(), (None, None));
+        assert_eq!(
+            state_root_from(None, None, None).unwrap(),
+            (None, None, RootSource::Home)
+        );
+    }
+
+    /// The variable a report names is the one that supplied the path, so a
+    /// `$HOME`-derived row is never withheld and a claimed variable is never
+    /// named for a path it did not supply (#353).
+    #[test]
+    fn the_source_names_the_variable_the_root_came_from() {
+        for (agent_vm, xdg, expected) in [
+            (Some("/state"), Some("/xdg"), RootSource::AgentVmStateDir),
+            (None, Some("/xdg"), RootSource::XdgStateHome),
+            (None, Some("xdg"), RootSource::Home),
+            (None, Some(""), RootSource::Home),
+            (None, None, RootSource::Home),
+        ] {
+            let (root, _, source) = state_root_from(
+                agent_vm.map(OsStr::new),
+                xdg.map(OsStr::new),
+                Some(OsStr::new("/home/u")),
+            )
+            .unwrap();
+            assert_eq!(source, expected, "agent_vm={agent_vm:?} xdg={xdg:?}");
+            assert!(root.is_some(), "agent_vm={agent_vm:?} xdg={xdg:?}");
+            // `state_root_overridden_from` is the same rule without the path.
+            assert_eq!(
+                state_root_overridden_from(agent_vm.map(OsStr::new), xdg.map(OsStr::new)),
+                expected != RootSource::Home,
+                "agent_vm={agent_vm:?} xdg={xdg:?}"
+            );
+        }
+
+        // A refused override has no root and no report: `state_root_source`
+        // propagates the same error `state_root` gives, so no path is printed
+        // under a variable it did not supply.
+        assert!(
+            state_root_from(
+                Some(OsStr::new("state")),
+                Some(OsStr::new("/xdg")),
+                Some(OsStr::new("/home/u")),
+            )
+            .is_err()
+        );
+        assert!(state_root_overridden_from(Some(OsStr::new("state")), None));
+    }
+
+    #[test]
+    fn every_source_names_the_variable_it_read() {
+        assert_eq!(RootSource::AgentVmStateDir.variable(), "AGENT_VM_STATE_DIR");
+        assert_eq!(RootSource::XdgStateHome.variable(), STATE_ROOT_ENV_NAME);
+        assert_eq!(RootSource::XdgCacheHome.variable(), CACHE_ROOT_ENV_NAME);
+        assert_eq!(RootSource::Home.variable(), "HOME");
+        // Every source but `$HOME` is one credential parsing must refuse.
+        for source in [
+            RootSource::AgentVmStateDir,
+            RootSource::XdgStateHome,
+            RootSource::XdgCacheHome,
+        ] {
+            assert!(is_launcher_config_env(source.variable()), "{source:?}");
+        }
+        assert!(!is_launcher_config_env(RootSource::Home.variable()));
     }
 
     /// The invariant #437 exists for: no branch can hand out a relative root.
@@ -1443,7 +1589,7 @@ mod tests {
             (None, Some("/xdg"), None),
             (None, None, Some("/home/u")),
         ] {
-            let (root, _) = state_root_from(
+            let (root, _, _) = state_root_from(
                 agent_vm.map(OsStr::new),
                 xdg.map(OsStr::new),
                 home.map(OsStr::new),

@@ -51,7 +51,7 @@ impl ProjectSession {
         let project_dir = project.path().to_owned();
         let project_hash = project.digest_hex()[..12].to_owned();
         // One state-root rule, in `host_paths`: absolute, or an error naming
-        // the value (#437). The hash is over the canonical project dir, so the
+        // the variable (#437). The hash is over the canonical project dir, so the
         // root being absolute is what makes `state_dir` cwd-independent.
         let state_dir = crate::host_paths::state_root()?
             .context("no $HOME set")?
