@@ -162,8 +162,8 @@ jobs:
         continue-on-error: true
         run: cargo fmt --all -- --check
 
-      # Gating lint. `--all-targets` covers the integration tests and both
-      # workspace members, so a lint regression in test-only code fails the
+      # Gating lint. `--all-targets` covers the integration tests and every
+      # workspace member, so a lint regression in test-only code fails the
       # build too. Unlike the format check above, this step is deliberately not
       # `continue-on-error`: it is clean as of this commit and must stay clean.
       - name: Clippy
@@ -232,7 +232,8 @@ jobs:
         run: bash script/test/ci-macos-legs.sh build-script
 
   # The real `/usr/bin/security` contract for the keychain host credential
-  # location (#497, ADR-0056). Its own job because it needs a Rust toolchain and a
+  # location (#497, ADR-0056), plus the harness checks macOS would otherwise
+  # never run (ADR-0072). Its own job because it needs a Rust toolchain and a
   # real build, while `macos-build-script` stays toolchain-free; the test itself is
   # isolated to a disposable keychain in a temp dir, so a shared runner is fine.
   macos-keychain-contract:
@@ -261,6 +262,13 @@ jobs:
 
       - name: Real `security` contract (disposable keychain)
         run: bash script/test/ci-macos-legs.sh keychain-contract
+
+      # ADR-0072 makes the test tooling Rust, so the harness has to build and pass
+      # on macOS too, and not only on the Linux `contracts` job. It rides in this
+      # job because that job already pays for the toolchain and the submodules; a
+      # third macOS job would spend a runner on a 30-second cargo test.
+      - name: Harness checks
+        run: bash script/test/ci-macos-legs.sh harness
 
   # The single check to require on a branch. Every leg above is independent, so
   # this job only aggregates them — and it keeps the name the pre-split workflow

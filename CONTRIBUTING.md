@@ -74,12 +74,19 @@ shellcheck` on Debian/Ubuntu); the full gate also needs the recursive submodule,
 a working Cargo toolchain, and `jq`/`shasum`/`python3` (the boot-free
 released-image controls).
 
-`--guard-only` is not the gate. It runs the shell guard rail alone — no
+`--guard-only` is not the gate. It runs the guard rails alone — no
 provenance, no contracts, and **no mutation-anchor check** (`egress-mutations.py
 --check-anchors`) — so it is green on trees where CI's `contracts` job is red.
-It exists as a test seam for the guard's own tests; use it only when the
+It exists as a test seam for the guards' own tests; use it only when the
 submodule is absent and you know the rest of the gate is not what you are
 checking. Anything destined for `main` runs the whole script.
+
+Test tooling is the `agent-vm-harness` crate (`crates/harness`), not Python:
+see [ADR-0072](docs/adr/0072-no-host-python.md) and
+[its README](crates/harness/README.md). Add a subcommand, build it once with
+`cargo build --locked -p agent-vm-harness --bins`, and call the `harness` binary
+from shell by path. `script/test/no-host-python.sh` fails the gate on new host
+Python.
 
 ### Verifying contracts locally (optional)
 
@@ -1222,7 +1229,9 @@ fails closed rather than silently truncating; pick a shorter override, e.g. `~/.
 
 ## Release / version bump
 
-Every feature PR bumps the workspace version.
+Every PR that changes shipped behavior bumps the workspace version. Internal
+work — test tooling, CI, docs — does not: a version bump in a PR that never
+touches the binary only buys a merge conflict in `Cargo.toml`.
 
 Provider/integration or image-source upgrade checklist:
 - **Default-tool endpoint evidence:** the upgrade author audits exact names,

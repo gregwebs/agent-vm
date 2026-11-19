@@ -35,6 +35,7 @@ the host facts that can change its result.
 
   build-script        script/test/build-workflow.sh (no toolchain needed)
   keychain-contract   script/test/keychain-contract.sh (needs the pinned rustc)
+  harness             the agent-vm-harness crate's checks (needs the pinned rustc)
 
   --receipt FILE      also write the receipt line to FILE
   --compare FILE      diff this run's receipt against the receipt line in FILE
@@ -53,7 +54,7 @@ receipt_file=""
 compare_file=""
 while (($#)); do
     case "$1" in
-        build-script | keychain-contract)
+        build-script | keychain-contract | harness)
             leg="$1"
             shift
             ;;
@@ -124,6 +125,24 @@ if [[ "$pinned_bash_version" != 3.2* ]]; then
 fi
 
 rustc_version=""
+# Both toolchain legs are contracts with compiled code, so the toolchain is part
+# of the input: CI installs rust-toolchain.toml's channel, and a caller's rustup
+# default or override is exactly the kind of difference a green local run would
+# hide.
+require_pinned_rustc() {
+    if ((have_rustup_cargo == 0)); then
+        command -v cargo >/dev/null 2>&1 ||
+            fail "leg $leg builds Rust, so it needs cargo; install the pinned toolchain"
+        pinned_path="$(cd "$(dirname "$(command -v cargo)")" && pwd):$pinned_path"
+    fi
+    local channel
+    channel="$(awk -F'"' '/^channel[[:space:]]*=/ { print $2; exit }' "$REPO_ROOT/rust-toolchain.toml")"
+    [[ -n "$channel" ]] || fail "cannot read the pinned channel from rust-toolchain.toml"
+    rustc_version="$(run_pinned rustc --version | awk '{ print $2 }')"
+    [[ "$rustc_version" == "$channel" ]] ||
+        fail "leg $leg needs rustc $channel (rust-toolchain.toml) but this host resolves $rustc_version"
+}
+
 case "$leg" in
     build-script)
         # No toolchain step in this job: build-workflow.sh fakes rustc, cargo and
@@ -133,21 +152,14 @@ case "$leg" in
     keychain-contract)
         [[ -x /usr/bin/security ]] ||
             fail "the keychain contract executes /usr/bin/security, which this host lacks"
-        if ((have_rustup_cargo == 0)); then
-            command -v cargo >/dev/null 2>&1 ||
-                fail "leg $leg builds the binary, so it needs cargo; install the pinned toolchain"
-            pinned_path="$(cd "$(dirname "$(command -v cargo)")" && pwd):$pinned_path"
-        fi
-        # The leg is a contract with the compiled binary, so the toolchain is part
-        # of the input: CI installs rust-toolchain.toml's channel, and a caller's
-        # rustup default or override is exactly the kind of difference a green
-        # local run would hide.
-        channel="$(awk -F'"' '/^channel[[:space:]]*=/ { print $2; exit }' "$REPO_ROOT/rust-toolchain.toml")"
-        [[ -n "$channel" ]] || fail "cannot read the pinned channel from rust-toolchain.toml"
-        rustc_version="$(run_pinned rustc --version | awk '{ print $2 }')"
-        [[ "$rustc_version" == "$channel" ]] ||
-            fail "leg $leg needs rustc $channel (rust-toolchain.toml) but this host resolves $rustc_version"
+        require_pinned_rustc
         leg_command=("$pinned_bash" "$REPO_ROOT/script/test/keychain-contract.sh")
+        ;;
+    harness)
+        # ADR-0072: the harness is Rust, so it has to build and pass on macOS and
+        # not only on the Linux `contracts` job.
+        require_pinned_rustc
+        leg_command=(cargo test --locked -p agent-vm-harness)
         ;;
 esac
 
