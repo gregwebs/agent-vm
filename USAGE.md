@@ -2756,7 +2756,7 @@ included, enables it.
 | `AGENT_VM_NO_CHROME_MCP` | disable Chrome MCP auto-configuration for a Chrome-capable image |
 | `AGENT_VM_NO_ACCESS_PROMPT` | don't ask about refusals in the terminal (accepted: `1`/`true`/`yes`/`on` turns it off; `0`/`false`/`no`/`off` leaves it on. Any other value leaves it on and prints one launch warning) |
 | `AGENT_VM_IMAGE_TAG` | override the OCI image (same as `--image`; outranks any config `image`; an empty value counts as unset) |
-| `AGENT_VM_MEMORY_GIB` / `AGENT_VM_CPUS` | same as `--memory` / `--cpus` |
+| `AGENT_VM_MEMORY_GIB` / `AGENT_VM_CPUS` | same as `--memory` / `--cpus`; an invalid environment-sourced value is refused without being shown |
 | `AGENT_VM_ROOT` | same as `--root` (accepted: `1`/`true`/`yes`/`on`) |
 
 `AGENT_VM_BASE_IMAGE`, `AGENT_VM_LAYER` and `AGENT_VM_YES` are no longer read.
