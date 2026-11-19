@@ -169,6 +169,7 @@ syntax_check=(
     script/test/lib/released-image-checks.sh
     script/test/lib/e2e-image-cleanup.sh
     script/test/non-utf8-home-rows.sh
+    script/test/ci-macos-legs.sh
     "$self_relative"
 )
 
@@ -234,6 +235,7 @@ shellcheck_files=(
     script/test/lib/released-image-checks.sh
     script/test/lib/e2e-image-cleanup.sh
     script/test/non-utf8-home-rows.sh
+    script/test/ci-macos-legs.sh
     "$self_relative"
 )
 
@@ -255,6 +257,10 @@ assert_listed 'shellcheck' 'script/test/single-binary-contract.sh' "${shellcheck
 # ci.yml's test matrix runs the shard runner, so the shell guard covers it: it
 # decides which test targets each leg executes, so a typo here would run a
 # shard's worth of tests nowhere.
+# ci.yml's two macOS jobs run this one, and it is the only way a developer
+# reproduces those legs: it owns their pinned environment and their receipt.
+assert_listed 'bash -n' 'script/test/ci-macos-legs.sh' "${syntax_check[@]}"
+assert_listed 'shellcheck' 'script/test/ci-macos-legs.sh' "${shellcheck_files[@]}"
 assert_listed 'bash -n' 'script/test/ci-test-shard.sh' "${syntax_check[@]}"
 assert_listed 'shellcheck' 'script/test/ci-test-shard.sh' "${shellcheck_files[@]}"
 # ci.yml's macOS keychain contract job runs this one, and it is the only caller of

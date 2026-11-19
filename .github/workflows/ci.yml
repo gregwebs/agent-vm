@@ -214,14 +214,22 @@ jobs:
   # toolchain install step at all.
   macos-build-script:
     runs-on: macos-latest
+    # Bounds a leg that hangs (this one needs 24s). It does not bound the queue:
+    # a job waiting for a macOS runner is cancelled by the platform at its own
+    # unreported limit (15 minutes once, 21 the next time), with no step having
+    # run. `build-and-test` is what makes that legible, by naming the leg.
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
+      # Through ci-macos-legs.sh, which is also what a developer runs: one
+      # definition of the leg, its pinned environment and its receipt, so local
+      # and CI cannot drift (#662's follow-up).
       - name: Run macOS build script workflow tests
-        run: bash script/test/build-workflow.sh
+        run: bash script/test/ci-macos-legs.sh build-script
 
   # The real `/usr/bin/security` contract for the keychain host credential
   # location (#497, ADR-0056). Its own job because it needs a Rust toolchain and a
@@ -229,6 +237,10 @@ jobs:
   # isolated to a disposable keychain in a temp dir, so a shared runner is fine.
   macos-keychain-contract:
     runs-on: macos-latest
+    # The leg itself is a build plus a 1.4s test, so this bounds a wedged build;
+    # a starved queue is bounded by nothing here and is reported by
+    # `build-and-test`, which names the leg instead of the run.
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -248,7 +260,7 @@ jobs:
           cache-workspace-crates: "true"
 
       - name: Real `security` contract (disposable keychain)
-        run: bash script/test/keychain-contract.sh
+        run: bash script/test/ci-macos-legs.sh keychain-contract
 
   # The single check to require on a branch. Every leg above is independent, so
   # this job only aggregates them — and it keeps the name the pre-split workflow
@@ -260,8 +272,27 @@ jobs:
     needs: [contracts, test, lint, macos-build-script, macos-keychain-contract]
     runs-on: ubuntu-latest
     steps:
+      # No step condition on purpose. `contains(needs.*.result, 'cancelled')`
+      # did not fire for a leg that was cancelled before a runner ever picked it
+      # up: on #664 and on this change's own run, `macos-keychain-contract` was
+      # `cancelled` while this job reported success, so the only required check
+      # went green under a red run. The needs context calls that state
+      # `abandoned` -- a fourth value the expression never listed -- and this job
+      # printed it, named both legs and failed, on the same starvation.
       - name: Fail when a leg did not pass
-        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+        env:
+          # Through the environment, not interpolated into `run`: the needs
+          # payload is JSON and zizmor flags a template in a script body.
+          NEEDS: ${{ toJSON(needs) }}
         run: |
-          echo "::error::a CI leg failed or was skipped (see the jobs above)"
+          # Name every leg and its result, then fail: "a CI leg failed" does not
+          # say whether the leg ran and failed or never got a runner.
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
+          bad="$(jq -r 'to_entries[] | select(.value.result != "success") | .key' <<<"$NEEDS")"
+          if [[ -z "$bad" ]]; then
+            exit 0
+          fi
+          while read -r leg; do
+            echo "::error::leg $leg did not pass"
+          done <<<"$bad"
           exit 1
