@@ -1129,10 +1129,10 @@ fn measured_paths_cannot_forge_a_doctor_section() {
     );
     assert!(
         stdout.contains(
-            "MSB_HOME: not shown - credentials.yaml may name XDG_STATE_HOME as an environment \
+            "MSB_HOME: not shown - credentials.yaml may name AGENT_VM_STATE_DIR as an environment \
              credential source"
         ),
-        "the withheld row names neither the row nor the variable:\n{stdout}"
+        "the withheld row names neither the row nor the variable that supplied it:\n{stdout}"
     );
 }
 
@@ -1624,7 +1624,8 @@ fn the_reset_undo_distinguishes_a_literal_backslash_from_a_control_byte() {
 /// A relative `AGENT_VM_STATE_DIR` used to mean "relative to wherever agent-vm
 /// ran", which left the printed undo correct only in that one directory (#433).
 /// The root is now refused at construction (#437): the operator is told which
-/// value is wrong, and nothing is moved under a root that depends on the cwd.
+/// variable is wrong, and nothing is moved under a root that depends on the cwd.
+/// The value itself is not repeated, because it can be a credential (#353).
 #[test]
 fn a_relative_state_dir_is_refused_before_anything_can_move() {
     let h = Harness::new();
@@ -1651,8 +1652,8 @@ fn a_relative_state_dir_is_refused_before_anything_can_move() {
         "the refusal does not name the variable:\n{stderr}"
     );
     assert!(
-        stderr.contains(&leaf.to_string_lossy().into_owned()),
-        "the refusal does not name the value:\n{stderr}"
+        !stderr.contains(&leaf.to_string_lossy().into_owned()),
+        "the refusal names the value, which can be a credential (#353):\n{stderr}"
     );
     assert!(
         stderr.contains("absolute"),
@@ -1707,7 +1708,8 @@ fn a_relative_xdg_state_home_is_ignored_and_the_fallback_is_used() {
         1,
         "the notice must be said once:\n{stderr}"
     );
-    assert!(stderr.contains("rel-xdg"), "{stderr}");
+    // The value can be a credential, so the notice names the variable only (#353).
+    assert!(!stderr.contains("rel-xdg"), "the value leaked:\n{stderr}");
     assert!(
         stderr.contains(".local/state/agent-vm"),
         "the notice does not name the root it used instead:\n{stderr}"
@@ -1719,6 +1721,40 @@ fn a_relative_xdg_state_home_is_ignored_and_the_fallback_is_used() {
     );
     assert!(!report.contains("ignoring"), "the notice leaked to stdout");
     assert!(!db.exists(), "the db was not moved: {report}");
+}
+
+/// The value a launcher variable holds is never printed, whichever rule it trips:
+/// a relative `XDG_STATE_HOME` is ignored and announced, a relative
+/// `AGENT_VM_STATE_DIR` is refused and ends the run. Both named the value before
+/// #353's review, and a value there can be a credential, so each path is pinned
+/// with a canary on stdout *and* stderr.
+#[test]
+fn a_relative_launcher_value_never_reaches_stdout_or_stderr() {
+    let h = Harness::new();
+    for (variable, canary) in [
+        ("XDG_STATE_HOME", "sk-ant-api03-REL-CANARY"),
+        ("AGENT_VM_STATE_DIR", "sk-AVSDREL-CANARY"),
+    ] {
+        let mut cmd = h.base_command();
+        cmd.env_remove("AGENT_VM_STATE_DIR")
+            .env_remove("XDG_STATE_HOME")
+            .env(variable, canary)
+            .arg("doctor");
+        let out = cmd.output().expect("failed to run agent-vm doctor");
+
+        for text in [stdout_of(&out), stderr_of(&out)] {
+            assert!(
+                !text.contains(canary),
+                "{variable}'s value reached the output:\n{text}"
+            );
+        }
+        // Still named, so the operator knows which variable to change.
+        assert!(
+            stderr_of(&out).contains(variable),
+            "{variable} was not named:\n{}",
+            stderr_of(&out)
+        );
+    }
 }
 
 /// The ordinary report names the same value the reset report moves, so it has

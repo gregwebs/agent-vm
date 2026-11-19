@@ -291,13 +291,19 @@ agent-vm reads as configuration, today `XDG_STATE_HOME` and `XDG_CACHE_HOME`
 (`host_paths::LAUNCHER_CONFIG_ENV_NAMES`, the one list that credentials parsing
 consults so a new path read cannot silently reopen the gap). The refusal alone
 does not close the disclosure: `doctor` must still read those variables to
-describe the paths the commands act on. It therefore never prints a path derived
-from one — the row keeps its label, names the variable, and says the value is not
-shown — and it treats both variables as claimed whenever `credentials.yaml` is
-unusable, because a refusal does not say which name it refused (#353). Reading
-them is deliberate: treating a claimed variable as absent would have described
-paths the commands do not use. Keychain guest names retain their
-old rule: the refusal is env-source-only.
+describe the paths the commands act on. It therefore withholds a row whose path
+was supplied by one of them — the row keeps its label, names the variable that
+actually supplied it, and says the value is not shown — but only while
+`credentials.yaml` is unusable, because a refusal does not say which name it
+refused and a usable file cannot claim one (#163, #353). A path none of
+`AGENT_VM_STATE_DIR`, `XDG_STATE_HOME` or `XDG_CACHE_HOME` supplied (a `$HOME`
+default) is printed as before: withholding it would hide information and protect
+nothing. Reading the variables is deliberate: treating a
+claimed one as absent would have described paths the commands do not use. The
+one exception is `doctor --reset-msb-db`, which names the db directory it moves
+and prints the command to undo it — withholding that path would make the recovery
+command useless, and that branch reads no configuration or credentials at all.
+Keychain guest names retain their old rule: the refusal is env-source-only.
 
 Surviving copies additionally include the captured zeroizing bytes for the
 whole launch. Removal cannot unset the parent shell or erase the original

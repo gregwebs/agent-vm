@@ -109,11 +109,20 @@
 //! The state and cache rows — `MSB_HOME` and its db, the project state directory,
 //! the unpacked embedded runtime — are derived from host variables agent-vm reads
 //! as configuration ([`crate::host_paths::LAUNCHER_CONFIG_ENV_NAMES`]). Such a
-//! variable can hold a secret, so a path derived from one is never printed when
-//! the credential configuration may claim it: the row keeps its label and prints
-//! the variable's name instead of the value (#353). [`PathRows`] is that decision,
-//! and it is taken before the first section is written — an error rendered later
-//! does not undo a value already on the terminal.
+//! variable can hold a secret, so a row whose path was supplied by one is
+//! withheld while `credentials.yaml` is unusable — the only state in which a claim
+//! can exist, because the parser refuses those names: the row keeps its label and
+//! prints *that variable's name* instead of the value (#353).
+//! [`crate::host_paths::RootSource`] is how the report learns which variable
+//! actually supplied each root, so a `$HOME`-derived row is printed exactly as
+//! before; withholding it would hide information and protect nothing. [`PathRows`]
+//! is that decision, and it is taken before the first section is written — an
+//! error rendered later does not undo a value already on the terminal.
+//!
+//! `--reset-msb-db` is the exception: that run names the db directory it moved and
+//! prints a paste-ready `mv`, because withholding the path would make the recovery
+//! command useless. It reads no configuration and no credentials by design, so a
+//! claim cannot have been established in that run.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -131,6 +140,7 @@ use crate::credential_provider::{CredentialProvider, ProviderSet};
 use crate::credential_resolver;
 use crate::credential_yaml::{AuthorizationSet, GuestEnvName, SourceKind, SourceSelection};
 use crate::host_credential::{AnthropicHostRead, ReadBudget, Unusable, read_anthropic};
+use crate::host_paths::RootSource;
 use crate::pi_credential_inspection::{PiCredentialReport, inspect_project};
 use crate::project::ProjectDir;
 use crate::secret_store::{Availability, ServiceName};
@@ -248,13 +258,16 @@ fn run_to(
                 None,
             ),
         };
+        // Which variable supplied each root, so a withheld row names that one
+        // rather than its sibling root's (#353).
+        let roots = ActiveRoots::from_env()?;
         // The authorization file decides two facts, and both must be settled
         // before any path is printed: the launch view reports it, and the path
         // rows withhold whatever a launcher variable it may claim could supply
         // (#353). One read feeds both, so the report cannot print a path the file
         // it also reports as unusable may hold the value of.
         let authorizations = credential_resolver::load_authorizations();
-        let path_rows = PathRows::from_authorizations(&authorizations);
+        let path_rows = PathRows::from_authorizations(&authorizations, roots);
         let launch = gather_launch_view(&authorizations, catalog.as_ref());
         // `doctor` has no `--image`; it reads the env through the same
         // empty-is-unset rule the launch uses, so the two cannot disagree, while
@@ -269,7 +282,7 @@ fn run_to(
                 &msb_home,
                 db_exists,
                 &crate::msb_schema::bundled_schema_version(),
-                path_rows.state,
+                path_rows,
             ),
         )?;
         write_line(out, "")?;
@@ -282,14 +295,14 @@ fn run_to(
                 &describe_embedded_runtime(
                     dir.as_deref(),
                     dir.as_ref().is_some_and(|p| p.exists()),
-                    path_rows.cache,
+                    path_rows,
                 ),
             )?;
             write_line(out, "")?;
         }
         write_line(
             out,
-            &describe_credentials(&gather_credentials(&project), &launch, path_rows.state),
+            &describe_credentials(&gather_credentials(&project), &launch, path_rows),
         )?;
         write_line(out, "")?;
         // Submit preceding sections before a native read can emit its slow notice.
@@ -379,11 +392,11 @@ fn run_to(
     out.flush().context("writing doctor output")
 }
 
-fn describe_embedded_runtime(dir: Option<&Path>, exists: bool, cache_row: PathRow) -> String {
+fn describe_embedded_runtime(dir: Option<&Path>, exists: bool, rows: PathRows) -> String {
     match dir {
         Some(dir) => format!(
             "==> embedded runtime\nunpacked: {} ({})",
-            cache_row.render(dir),
+            rows.cache.render(dir),
             if exists { "present" } else { "absent" }
         ),
         None => "==> embedded runtime\nunpacked: unresolved (set XDG_CACHE_HOME or HOME)".into(),
@@ -404,6 +417,23 @@ enum PathRow {
 }
 
 impl PathRow {
+    /// The row for a path whose root `source` supplied.
+    ///
+    /// Only a launcher configuration variable can be claimed as an environment
+    /// credential source, so only such a source is withheld — and only while the
+    /// authorization file cannot say what it claims. A `$HOME`-derived path is
+    /// printed whatever the file's state: it is the directory `doctor` names
+    /// elsewhere, and withholding it would hide information without protecting
+    /// anything.
+    fn for_root(source: RootSource, unusable: bool) -> Self {
+        let variable = source.variable();
+        if unusable && crate::host_paths::is_launcher_config_env(variable) {
+            Self::Withheld(variable)
+        } else {
+            Self::Shown
+        }
+    }
+
     fn render(self, path: &Path) -> String {
         match self {
             Self::Shown => crate::one_line::path(path).to_string(),
@@ -415,37 +445,71 @@ impl PathRow {
     }
 }
 
-/// The two rows one run prints for a launcher-derived root, kept apart by the
-/// variable each derives from so a renderer cannot take its sibling's decision.
+/// The variable that supplied each root this run describes, read once.
+///
+/// Kept beside [`PathRows`] so a row can be withheld for the variable that
+/// actually supplied *its* path: naming `XDG_STATE_HOME` for a path
+/// `AGENT_VM_STATE_DIR` supplied would send the reader to the wrong variable
+/// (#353).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PathRows {
+struct ActiveRoots {
     /// [`crate::host_paths::state_root`]'s: `MSB_HOME`, its db, and the project
     /// state directory.
-    state: PathRow,
+    state: RootSource,
     /// [`crate::host_paths::cache_root`]'s: the unpacked embedded runtime.
+    cache: RootSource,
+}
+
+impl ActiveRoots {
+    /// Read the variable that supplied each root from the environment, the way
+    /// the resolvers themselves read it — `state_root_source` re-reads rather
+    /// than threading a path out of `msb_install`, the same shape
+    /// `state_root_overridden` already has.
+    ///
+    /// One constructor rather than two field-by-field calls at the run site, so a
+    /// default build can assert *both* answers. Only a bundled build prints the
+    /// cache-derived row, and CI builds none, so wiring the cache row to the
+    /// state root, to a constant or to a `Home`-only resolver used to pass every
+    /// test in the suite — while putting the value back into `unpacked:`, which
+    /// is the leak #353 is about.
+    fn from_env() -> Result<Self> {
+        Ok(Self {
+            state: crate::host_paths::state_root_source()?,
+            cache: crate::host_paths::cache_root_source(),
+        })
+    }
+}
+
+/// The rows one run prints for a launcher-derived root.
+///
+/// One value, and each renderer takes the row it describes from it: a call site
+/// cannot hand a renderer its sibling's decision, and the embedded-runtime row is
+/// chosen by the same tested code whether or not this build bundles a runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PathRows {
+    /// The state-derived rows: `MSB_HOME`, its db, and the project state
+    /// directory.
+    state: PathRow,
+    /// The cache-derived row: the unpacked embedded runtime.
     cache: PathRow,
 }
 
 impl PathRows {
-    /// Both shown — every run whose credential configuration is usable.
+    /// The rows for one run, from the authorization file's usability and the
+    /// variable that actually supplied each root.
     ///
     /// A usable set cannot claim a launcher variable: [`crate::credential_yaml`]
     /// refuses those names as a `source: env` name (#163), so today a claim exists
-    /// only as a *refusal*, and a refusal does not say which name it refused.
-    /// Doctor therefore treats both variables as claimed whenever the file is
-    /// unusable. Refusing to print is the safe direction, and the refusal's own
-    /// error is still rendered in the launch section, so the reader learns why the
-    /// values went away.
-    fn from_authorizations(authorizations: &Result<AuthorizationSet>) -> Self {
-        match authorizations {
-            Ok(_) => Self {
-                state: PathRow::Shown,
-                cache: PathRow::Shown,
-            },
-            Err(_) => Self {
-                state: PathRow::Withheld(crate::host_paths::STATE_ROOT_ENV_NAME),
-                cache: PathRow::Withheld(crate::host_paths::CACHE_ROOT_ENV_NAME),
-            },
+    /// only as a *refusal*, and a refusal does not say which name it refused. An
+    /// unusable file therefore withholds every row a launcher variable supplied,
+    /// and no others. Refusing to print is the safe direction, and the refusal's
+    /// own error is still rendered in the launch section, so the reader learns
+    /// why.
+    fn from_authorizations(authorizations: &Result<AuthorizationSet>, roots: ActiveRoots) -> Self {
+        let unusable = authorizations.is_err();
+        Self {
+            state: PathRow::for_root(roots.state, unusable),
+            cache: PathRow::for_root(roots.cache, unusable),
         }
     }
 }
@@ -463,23 +527,18 @@ impl PathRows {
 /// builds it from `state_root()`, which refuses or ignores a relative value
 /// (#437), so this report needs no resolution of its own (#438). It prints the
 /// value verbatim — no canonicalisation — because it names the directory the
-/// command acts on, not a normalised spelling of it. `state_row` is the one thing
-/// that replaces it: the variable `state_root()` read can hold a credential value,
-/// so a claimed one is named instead (#353).
-fn describe_home(
-    msb_home: &Path,
-    db_exists: bool,
-    bundled_schema: &str,
-    state_row: PathRow,
-) -> String {
+/// command acts on, not a normalised spelling of it. `rows` is the one thing that
+/// replaces it: the variable `state_root()` read can hold a credential value, so a
+/// claimed one is named instead (#353).
+fn describe_home(msb_home: &Path, db_exists: bool, bundled_schema: &str, rows: PathRows) -> String {
     let db_path = msb_home.join("db").join("msb.db");
     format!(
         "==> active microsandbox home\n\
          MSB_HOME: {}\n\
          db:       {} ({})\n\
          this build's bundled schema: {}",
-        state_row.render(msb_home),
-        state_row.render(&db_path),
+        rows.state.render(msb_home),
+        rows.state.render(&db_path),
         if db_exists { "exists" } else { "absent" },
         bundled_schema,
     )
@@ -825,10 +884,10 @@ fn file_row_with_keychain(state: &HostCred, keychain: String, now_ms: i64) -> St
 ///
 /// `launch` supplies the launch-aware disposition of each host file (#178): a
 /// provider some configured launch replaces is annotated so a green/absent row
-/// is never read as "this launch will read this file". `state_row` does the same
-/// job for the project's own state directory, which is derived from a launcher
-/// configuration variable (#353).
-fn describe_credentials(report: &CredReport, launch: &LaunchView, state_row: PathRow) -> String {
+/// is never read as "this launch will read this file". `rows` does the same job
+/// for the project's own state directory, which is derived from a launcher
+/// configuration variable when one supplied the state root (#353).
+fn describe_credentials(report: &CredReport, launch: &LaunchView, rows: PathRows) -> String {
     let mut out = String::from("==> host agent credentials\n");
     let width = report
         .hosts
@@ -870,7 +929,7 @@ fn describe_credentials(report: &CredReport, launch: &LaunchView, state_row: Pat
             out.push_str(&format!(
                 "\n==> this project\ndir:      {}\nstate:    {}\ncaptured: {}\nguest Claude cred file: {}\n",
                 crate::one_line::path(dir),
-                state_row.render(state_dir),
+                rows.state.render(state_dir),
                 if captured.is_empty() {
                     "<none> (nothing to substitute on the wire)".to_string()
                 } else {
@@ -1741,6 +1800,12 @@ fn render(outcome: &ResetOutcome) -> String {
 mod tests {
     use super::*;
 
+    /// Both rows as an unclaimed configuration leaves them.
+    const SHOWN_ROWS: PathRows = PathRows {
+        state: PathRow::Shown,
+        cache: PathRow::Shown,
+    };
+
     // -------------------------------------------------------------------------
     // The `active images:` row (#609)
     // -------------------------------------------------------------------------
@@ -2425,8 +2490,8 @@ credentials:
         assert!(!text.contains("sk-353-CACHE-CANARY"), "{text}");
         // Only a bundled build prints the cache-derived row; where it is absent
         // there is nothing to disclose, and the decision itself is covered by
-        // `only_an_unusable_credential_configuration_withholds_both_rows` and
-        // `the_embedded_runtime_row_withholds_a_claimed_cache_root`.
+        // `a_row_is_withheld_only_when_the_file_is_unusable_and_a_launcher_variable_supplied_it`
+        // and `the_embedded_runtime_row_withholds_a_claimed_cache_root`.
         if crate::embedded_runtime::EMBEDDED.is_some() {
             assert!(
                 text.contains(
@@ -2439,7 +2504,7 @@ credentials:
     }
 
     #[test]
-    fn an_unparseable_credentials_file_withholds_the_same_rows() {
+    fn an_unparseable_credentials_file_with_launcher_roots_withholds_them() {
         let _fixture = RunFixture::with_launcher_variables(
             UNPARSEABLE,
             Path::new("/tmp/sk-353-BROKEN-CANARY"),
@@ -2450,6 +2515,52 @@ credentials:
 
         assert!(!text.contains("sk-353-BROKEN-CANARY"), "{text}");
         assert!(text.contains("MSB_HOME: not shown"), "{text}");
+    }
+
+    /// The other half of the rule: an unusable file with no launcher variable set
+    /// names only `$HOME`-derived paths, which `doctor` prints in a dozen other
+    /// rows. Withholding those would hide information and protect nothing.
+    #[test]
+    fn an_unparseable_credentials_file_with_home_defaults_prints_the_home_paths() {
+        let _fixture = RunFixture::build(UNPARSEABLE, |_, _| {});
+        let msb_home = crate::msb_install::msb_home_dir().unwrap();
+
+        let text = run_ordinary();
+
+        // The whole report, byte for byte, is what an unusable file without a
+        // launcher variable prints — no row is withheld.
+        assert!(!text.contains("not shown - credentials.yaml"), "{text}");
+        assert!(
+            text.contains(&format!("MSB_HOME: {}\n", crate::one_line::path(&msb_home))),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "db:       {}/db/msb.db",
+                crate::one_line::path(&msb_home)
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains("state:    /") && text.contains("dir:      /"),
+            "{text}"
+        );
+    }
+
+    /// A relative `XDG_STATE_HOME` is ignored, so it supplied no path: the row
+    /// shows the `$HOME` default even while the file is unusable, naming no
+    /// variable. The value never prints, at either verbosity (#353).
+    #[test]
+    fn an_ignored_relative_launcher_value_withholds_nothing() {
+        let _fixture = RunFixture::build(UNPARSEABLE, |env, _root| {
+            env.set_var("XDG_STATE_HOME", "sk-353-REL-CANARY");
+        });
+
+        let text = run_ordinary();
+
+        assert!(!text.contains("sk-353-REL-CANARY"), "{text}");
+        assert!(!text.contains("not shown - credentials.yaml"), "{text}");
+        assert!(text.contains("MSB_HOME: /"), "{text}");
     }
 
     #[test]
@@ -2477,54 +2588,181 @@ credentials:
         );
     }
 
-    /// Both rows come from one decision, and only an unusable file makes it.
+    fn roots(state: RootSource, cache: RootSource) -> ActiveRoots {
+        ActiveRoots { state, cache }
+    }
+
+    /// Each root must be wired to the resolver for *its own* variable, and the
+    /// cache-derived row is only ever printed by a bundled build — the one shape
+    /// CI never builds. This is the default build's only view of that wiring
+    /// (#353 follow-up): swapping the two resolvers, hardcoding the state root
+    /// for the cache row, or a `cache_root_source` that answers [`RootSource::Home`]
+    /// all leave every other test in this suite passing while putting a
+    /// `XDG_CACHE_HOME` value back into `unpacked:`.
     #[test]
-    fn only_an_unusable_credential_configuration_withholds_both_rows() {
+    fn each_root_reads_the_variable_that_supplied_it() {
+        let mut env = crate::test_env::guard();
+        let root = tempfile::tempdir().unwrap();
+        let (state, cache) = (root.path().join("state"), root.path().join("cache"));
+        env.remove_var(crate::host_paths::STATE_ROOT_ENV_NAME);
+        env.set_var(crate::host_paths::AGENT_VM_STATE_DIR_ENV_NAME, &state);
+        env.set_var(crate::host_paths::CACHE_ROOT_ENV_NAME, &cache);
+
+        let roots = ActiveRoots::from_env().unwrap();
+
+        assert_eq!(roots.state, RootSource::AgentVmStateDir);
+        assert_eq!(roots.cache, RootSource::XdgCacheHome);
+    }
+
+    /// An authorization file whose load fails — the only state in which a claim
+    /// can exist, since the parser refuses the launcher's own names (#163).
+    fn unusable() -> Result<AuthorizationSet> {
+        Err(anyhow!("credentials.yaml is unusable"))
+    }
+
+    /// One row withheld for `variable`, the other shown, so a renderer's test
+    /// pins which row it reads.
+    fn state_withheld(variable: &'static str) -> PathRows {
+        PathRows {
+            state: PathRow::Withheld(variable),
+            cache: PathRow::Shown,
+        }
+    }
+    fn cache_withheld(variable: &'static str) -> PathRows {
+        PathRows {
+            state: PathRow::Shown,
+            cache: PathRow::Withheld(variable),
+        }
+    }
+
+    /// A row is withheld only when *both* facts hold: the file is unusable, and
+    /// that row's path actually came from a launcher configuration variable
+    /// (#353). Nothing else changes a row, so a claiming-nothing configuration
+    /// prints what it printed before.
+    #[test]
+    fn a_row_is_withheld_only_when_the_file_is_unusable_and_a_launcher_variable_supplied_it() {
+        let usable = Ok(AuthorizationSet::empty());
+        // A usable file cannot claim a launcher variable (#163), so nothing is
+        // withheld whatever supplied the roots.
+        for source in [RootSource::AgentVmStateDir, RootSource::XdgStateHome] {
+            assert_eq!(
+                PathRows::from_authorizations(&usable, roots(source, RootSource::XdgCacheHome)),
+                SHOWN_ROWS,
+                "{source:?}"
+            );
+        }
+
         assert_eq!(
-            PathRows::from_authorizations(&Ok(AuthorizationSet::empty())),
+            PathRows::from_authorizations(
+                &unusable(),
+                roots(RootSource::AgentVmStateDir, RootSource::XdgCacheHome)
+            ),
             PathRows {
-                state: PathRow::Shown,
-                cache: PathRow::Shown,
+                state: PathRow::Withheld(crate::host_paths::AGENT_VM_STATE_DIR_ENV_NAME),
+                cache: PathRow::Withheld(crate::host_paths::CACHE_ROOT_ENV_NAME),
             }
         );
         assert_eq!(
-            PathRows::from_authorizations(&Err(anyhow!("credentials.yaml is unusable"))),
+            PathRows::from_authorizations(
+                &unusable(),
+                roots(RootSource::XdgStateHome, RootSource::Home)
+            ),
             PathRows {
                 state: PathRow::Withheld(crate::host_paths::STATE_ROOT_ENV_NAME),
-                cache: PathRow::Withheld(crate::host_paths::CACHE_ROOT_ENV_NAME),
+                cache: PathRow::Shown,
             }
+        );
+        // No launcher variable supplied either root: both rows print, which is
+        // the case the over-broad first version hid.
+        assert_eq!(
+            PathRows::from_authorizations(&unusable(), roots(RootSource::Home, RootSource::Home)),
+            SHOWN_ROWS
+        );
+    }
+
+    /// `$HOME` is not a name credentials parsing refuses, so a `$HOME`-derived
+    /// path is never withheld — even from an unusable file.
+    #[test]
+    fn a_home_sourced_row_is_never_withheld() {
+        assert_eq!(
+            PathRow::for_root(RootSource::Home, true),
+            PathRow::Shown,
+            "a $HOME-derived path was withheld"
+        );
+        assert_eq!(
+            PathRow::for_root(RootSource::AgentVmStateDir, true),
+            PathRow::Withheld(crate::host_paths::AGENT_VM_STATE_DIR_ENV_NAME)
         );
     }
 
     #[test]
     fn a_withheld_home_row_names_the_variable_and_keeps_the_labels() {
+        for (variable, expected) in [
+            (
+                crate::host_paths::STATE_ROOT_ENV_NAME,
+                "MSB_HOME: not shown - credentials.yaml may name XDG_STATE_HOME",
+            ),
+            (
+                crate::host_paths::AGENT_VM_STATE_DIR_ENV_NAME,
+                "MSB_HOME: not shown - credentials.yaml may name AGENT_VM_STATE_DIR",
+            ),
+        ] {
+            let text = describe_home(
+                Path::new("/state/sk-353-CANARY/msb-home"),
+                true,
+                "m1",
+                state_withheld(variable),
+            );
+
+            assert!(!text.contains("sk-353-CANARY"), "{text}");
+            assert!(text.contains(expected), "{text}");
+            // The existence fact and the schema row are not value-derived.
+            assert!(text.contains("(exists)"), "{text}");
+            assert!(text.contains("this build's bundled schema: m1"), "{text}");
+        }
+    }
+
+    /// The home rows read the *state* row: a withheld cache row must not blank
+    /// them, which is what a shared `PathRows` would allow.
+    #[test]
+    fn the_home_rows_ignore_a_withheld_cache_row() {
         let text = describe_home(
-            Path::new("/state/sk-353-CANARY/msb-home"),
-            true,
+            Path::new("/state/msb-home"),
+            false,
             "m1",
-            PathRow::Withheld(crate::host_paths::STATE_ROOT_ENV_NAME),
+            cache_withheld(crate::host_paths::CACHE_ROOT_ENV_NAME),
         );
 
-        assert!(!text.contains("sk-353-CANARY"), "{text}");
+        assert!(text.contains("MSB_HOME: /state/msb-home\n"), "{text}");
         assert!(
-            text.contains("MSB_HOME: not shown - credentials.yaml may name XDG_STATE_HOME"),
+            text.contains("db:       /state/msb-home/db/msb.db"),
             "{text}"
         );
-        // The existence fact and the schema row are not value-derived.
-        assert!(text.contains("(exists)"), "{text}");
-        assert!(text.contains("this build's bundled schema: m1"), "{text}");
     }
 
     #[test]
     fn the_embedded_runtime_row_withholds_a_claimed_cache_root() {
+        let withheld = "==> embedded runtime\nunpacked: not shown - credentials.yaml may name \
+             XDG_CACHE_HOME as an environment credential source (absent)";
         assert_eq!(
             describe_embedded_runtime(
                 Some(Path::new("/cache/sk-353-CANARY/rt")),
                 false,
-                PathRow::Withheld(crate::host_paths::CACHE_ROOT_ENV_NAME),
+                cache_withheld(crate::host_paths::CACHE_ROOT_ENV_NAME),
             ),
-            "==> embedded runtime\nunpacked: not shown - credentials.yaml may name \
-             XDG_CACHE_HOME as an environment credential source (absent)"
+            withheld
+        );
+        // The same decision reaches this renderer in every build: a withheld
+        // *state* row leaves the cache row shown, so swapping the rows cannot
+        // pass by accident. Only a bundled build prints the section, which is
+        // why the correspondence is pinned here rather than through `run_to`.
+        assert_eq!(
+            describe_embedded_runtime(
+                Some(Path::new("/cache/rt")),
+                false,
+                state_withheld(crate::host_paths::STATE_ROOT_ENV_NAME),
+            ),
+            "==> embedded runtime\nunpacked: /cache/rt (absent)"
         );
     }
 
@@ -2536,7 +2774,7 @@ credentials:
         let text = describe_credentials(
             &r,
             &LaunchView::default(),
-            PathRow::Withheld(crate::host_paths::STATE_ROOT_ENV_NAME),
+            state_withheld(crate::host_paths::STATE_ROOT_ENV_NAME),
         );
 
         assert!(!text.contains("sk-353-CANARY"), "{text}");
@@ -2551,18 +2789,18 @@ credentials:
     #[test]
     fn embedded_runtime_section_reports_path_and_presence() {
         assert_eq!(
-            describe_embedded_runtime(Some(Path::new("/cache/runtime/id")), true, PathRow::Shown),
+            describe_embedded_runtime(Some(Path::new("/cache/runtime/id")), true, SHOWN_ROWS),
             "==> embedded runtime\nunpacked: /cache/runtime/id (present)"
         );
         assert_eq!(
-            describe_embedded_runtime(Some(Path::new("/cache/runtime/id")), false, PathRow::Shown),
+            describe_embedded_runtime(Some(Path::new("/cache/runtime/id")), false, SHOWN_ROWS),
             "==> embedded runtime\nunpacked: /cache/runtime/id (absent)"
         );
     }
     #[test]
     fn embedded_runtime_section_reports_unresolved_root() {
         assert_eq!(
-            describe_embedded_runtime(None, false, PathRow::Shown),
+            describe_embedded_runtime(None, false, SHOWN_ROWS),
             "==> embedded runtime\nunpacked: unresolved (set XDG_CACHE_HOME or HOME)"
         );
     }
@@ -2729,7 +2967,7 @@ credentials:
             Path::new("/state/msb-home"),
             true,
             "m20260824_000001",
-            PathRow::Shown,
+            SHOWN_ROWS,
         );
 
         assert!(text.contains("/state/msb-home"), "{text}");
@@ -2747,7 +2985,7 @@ credentials:
         let text = describe_embedded_runtime(
             Some(Path::new("/cache/rt\nFORGED-RUNTIME")),
             true,
-            PathRow::Shown,
+            SHOWN_ROWS,
         );
 
         assert_eq!(text.lines().count(), 2, "one title, one line: {text:?}");
@@ -2763,7 +3001,7 @@ credentials:
             Path::new("/state/m\nFORGED-HOME"),
             true,
             "m20260824_000001",
-            PathRow::Shown,
+            SHOWN_ROWS,
         );
 
         assert_eq!(
@@ -2952,7 +3190,7 @@ credentials:
     /// `/home/boger/\\xd0\\xbf...`.
     #[test]
     fn a_measured_path_with_non_ascii_is_printed_as_itself() {
-        let text = describe_home(Path::new("/home/boger/проект"), false, "m1", PathRow::Shown);
+        let text = describe_home(Path::new("/home/boger/проект"), false, "m1", SHOWN_ROWS);
 
         assert!(text.contains("/home/boger/проект"), "{text}");
         assert!(!text.contains("\\xd0"), "not byte-escaped: {text}");
@@ -3063,7 +3301,7 @@ credentials:
                 },
             )]),
             &LaunchView::default(),
-            PathRow::Shown,
+            SHOWN_ROWS,
         );
 
         assert!(text.contains("claude  <no $HOME>"), "{text}");
@@ -3083,7 +3321,7 @@ credentials:
                 },
             )]),
             &LaunchView::default(),
-            PathRow::Shown,
+            SHOWN_ROWS,
         );
 
         assert!(
@@ -3122,7 +3360,7 @@ credentials:
                 HostCred::Missing,
             )]),
             &LaunchView::default(),
-            PathRow::Shown,
+            SHOWN_ROWS,
         );
 
         assert!(
@@ -3142,7 +3380,7 @@ credentials:
         project.dir = PathBuf::from("/work/pr\nFORGED-PROJECT");
         project.state_dir = PathBuf::from("/state/st\nFORGED-STATE");
 
-        let text = describe_credentials(&r, &LaunchView::default(), PathRow::Shown);
+        let text = describe_credentials(&r, &LaunchView::default(), SHOWN_ROWS);
 
         assert!(
             !text
@@ -3160,7 +3398,7 @@ credentials:
             Path::new("/state/msb-home"),
             false,
             "m20260824_000001",
-            PathRow::Shown,
+            SHOWN_ROWS,
         );
 
         assert!(text.contains("absent"), "{text}");
@@ -3287,7 +3525,7 @@ credentials:
         // Absent: the fourth one has no file at all.
 
         let report = gather_credentials(&Err(anyhow!("reading current directory: no cwd")));
-        let text = describe_credentials(&report, &LaunchView::default(), PathRow::Shown);
+        let text = describe_credentials(&report, &LaunchView::default(), SHOWN_ROWS);
         let detail = |label: &str| {
             let mut lines = text.lines();
             while let Some(line) = lines.next() {
@@ -3402,7 +3640,7 @@ credentials:
                 .to_string(),
         };
 
-        let text = describe_credentials(&unresolved, &LaunchView::default(), PathRow::Shown);
+        let text = describe_credentials(&unresolved, &LaunchView::default(), SHOWN_ROWS);
 
         assert!(
             text.contains("==> this project: <cwd could not be resolved: "),
@@ -3429,7 +3667,7 @@ credentials:
                 ),
             ]),
             &LaunchView::default(),
-            PathRow::Shown,
+            SHOWN_ROWS,
         );
 
         assert!(text.contains("UNUSABLE - not valid JSON: x"), "{text}");
@@ -3470,7 +3708,7 @@ credentials:
 
     /// The `claude` row's detail cell, trimmed of its label padding.
     fn claude_detail(report: &CredReport) -> String {
-        let text = describe_credentials(report, &LaunchView::default(), PathRow::Shown);
+        let text = describe_credentials(report, &LaunchView::default(), SHOWN_ROWS);
         let mut lines = text.lines();
         while let Some(line) = lines.next() {
             if line.starts_with("claude ") {
@@ -3598,7 +3836,7 @@ credentials:
             }),
             0,
         );
-        let text = describe_credentials(&report, &LaunchView::default(), PathRow::Shown);
+        let text = describe_credentials(&report, &LaunchView::default(), SHOWN_ROWS);
         assert!(!text.contains("\nFORGED"), "{text}");
         assert!(
             !text.lines().any(|line| line.starts_with("FORGED")),
@@ -3717,7 +3955,7 @@ substituted."#;
             let mut report = report(vec![("claude", Some(credentials.clone()), row)]);
             report.now_ms = NOW_MS;
             report.anthropic_keychain = keychain_view(&read);
-            let rendered = describe_credentials(&report, &LaunchView::default(), PathRow::Shown);
+            let rendered = describe_credentials(&report, &LaunchView::default(), SHOWN_ROWS);
 
             let expected = format!(
                 "==> host agent credentials\nclaude  {GOLDEN_HOME}/.claude/.credentials.json\n        {detail}\n\n{GOLDEN_TAIL}"
@@ -3820,7 +4058,7 @@ substituted."#;
         r.project.measured_mut().captured.clear();
         r.project.measured_mut().guest_claude_placeholder = false;
 
-        let text = describe_credentials(&r, &LaunchView::default(), PathRow::Shown);
+        let text = describe_credentials(&r, &LaunchView::default(), SHOWN_ROWS);
 
         assert!(text.contains("ok (expires in 1h00m)"), "{text}");
         assert!(
@@ -4482,7 +4720,7 @@ credentials:
                 ),
             ]),
             &launch,
-            PathRow::Shown,
+            SHOWN_ROWS,
         );
 
         assert!(

@@ -45,8 +45,8 @@ applies it and is what the tests exercise.
 
 | Source | A relative value | Why |
 |---|---|---|
-| `AGENT_VM_STATE_DIR` | error naming the value and the remedy | agent-vm's own override; falling back would move all state somewhere the operator did not ask for, silently |
-| `XDG_STATE_HOME` | ignored; the next source is used, with one stderr notice | the XDG spec says to ignore it; `cache_root_from` already does the same for `XDG_CACHE_HOME` |
+| `AGENT_VM_STATE_DIR` | error naming the variable and the remedy, never the value | agent-vm's own override; falling back would move all state somewhere the operator did not ask for, silently |
+| `XDG_STATE_HOME` | ignored; the next source is used, with one stderr notice naming the variable, not the value | the XDG spec says to ignore it; `cache_root_from` already does the same for `XDG_CACHE_HOME` |
 | `$HOME` (default) | error, via `config::host_home_dir`'s existing discipline | so the documented default is absolute too, not only under a launch |
 
 Consequences of putting it at construction:
@@ -65,10 +65,11 @@ Consequences of putting it at construction:
 - `bin/agent-vm-ccusage`, which resolves the root in shell and claims to mirror
   the launcher, applies the same rules: `$HOME` validated, a relative override
   refused with the remedy, a relative `XDG_STATE_HOME` ignored with one notice
-  naming the value and the root used. It renders an environment value through
-  `printf '%q'`, because a newline in one must not forge a second diagnostic
-  line. `crates/agent-vm/tests/ccusage_wrapper.rs` covers that matrix with a stub
-  `npx` on `PATH`, so no VM or download is involved.
+  naming the root used. It is the one place that still quotes the offending value
+  (through `printf '%q'`, so a newline cannot forge a second diagnostic line);
+  the launcher itself no longer does (#353), and bringing the wrapper in line is a
+  follow-up. `crates/agent-vm/tests/ccusage_wrapper.rs` covers that matrix with a
+  stub `npx` on `PATH`, so no VM or download is involved.
 
 The stderr notice exists because ignoring a value is not a no-op: the state root
 moves. It is one line on stderr, printed once per process and best-effort — a
@@ -76,7 +77,10 @@ closed stderr must not turn a valid fallback into a panic — so no
 machine-readable output gains a line and no failure is invented. It names the
 *state root*, which is the value `XDG_STATE_HOME` contributes to; on macOS
 `MSB_HOME` can be the shorter default instead, and the report of whatever moved
-names that path itself.
+names that path itself. Neither this notice nor the refusal repeats the offending
+*value*: a host variable a credential configuration can name as its environment
+source may hold a secret, so the launcher and `doctor` name only the variable
+(#353).
 
 ## Rejected alternatives
 
@@ -109,7 +113,8 @@ unit test per branch.
 ## Consequences
 
 - A relative `AGENT_VM_STATE_DIR` now fails the launch with a message naming the
-  value; it no longer "works from this directory". Anyone relying on the old
+  variable; it no longer "works from this directory". The value is not repeated,
+  because it can be a credential. Anyone relying on the old
   behaviour sets an absolute path, which CONTRIBUTING.md's example already did.
 - A relative `XDG_STATE_HOME` is ignored where it used to be honoured; the
   stderr notice says so and names the root actually used.

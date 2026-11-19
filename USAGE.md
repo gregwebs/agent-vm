@@ -2813,11 +2813,14 @@ agent-vm doctor
 Prints the active `MSB_HOME` and bundled schema, then every host
 credential source agent-vm reads — present / absent / unusable, plus how
 long the Claude token has left — and which of them were captured for the
-project you run it in. It never prints token bytes. A path derived from a host
-variable agent-vm reads as configuration (`XDG_STATE_HOME`, `XDG_CACHE_HOME`)
-is printed only while the credential configuration does not claim it: otherwise
-the row keeps its label, names the variable, and says the value is not shown,
-because that value could be a credential (#353). This is the first
+project you run it in. It never prints token bytes, and it never repeats the
+value of a launcher variable it refuses or ignores. A row is withheld only
+when `credentials.yaml` is unusable — the only state in which it can claim one of
+those names — and that row's path actually came from `AGENT_VM_STATE_DIR`,
+`XDG_STATE_HOME` or `XDG_CACHE_HOME`: the row keeps its label, names that
+variable, and says the value is not shown (#353). A `$HOME`-derived path prints
+as it always did, and `--reset-msb-db` names the db it moves, because that
+recovery command needs the path. This is the first
 thing to run when an in-VM agent comes up signed out. See
 [Credentials](#credentials).
 
