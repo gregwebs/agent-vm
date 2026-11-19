@@ -40,6 +40,8 @@ import threading
 import time
 from pathlib import Path
 
+sys.dont_write_bytecode = True
+
 READY_NAME = "ready"
 RECEIPTS_NAME = "receipts.log"
 
