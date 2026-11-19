@@ -7,11 +7,12 @@ import shutil
 import socket
 import subprocess
 import sys
-sys.dont_write_bytecode = True
 import signal
 import time
 import tempfile
 import threading
+
+sys.dont_write_bytecode = True
 
 ROOT = Path(__file__).resolve().parents[3]
 

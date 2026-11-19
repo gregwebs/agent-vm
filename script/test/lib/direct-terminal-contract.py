@@ -28,6 +28,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+sys.dont_write_bytecode = True
+
 HERE = Path(__file__).resolve().parent
 DRIVER = HERE / "direct-terminal.py"
 STANDIN = HERE.parent / "fixtures" / "direct-terminal" / "launcher-standin.py"
