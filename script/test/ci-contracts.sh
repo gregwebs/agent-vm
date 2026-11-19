@@ -5,6 +5,7 @@
 # workflow now only invokes it. Runnable from any cwd -- every path is resolved
 # against REPO_ROOT, derived from this script's own location.
 set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1
 
 REPO_ROOT="$(cd "${BASH_SOURCE[0]%/*}/../.." && pwd)"
 

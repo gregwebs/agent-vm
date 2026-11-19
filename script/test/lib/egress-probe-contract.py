@@ -16,6 +16,8 @@ import shlex
 import subprocess
 import unittest
 
+sys.dont_write_bytecode = True
+
 _FIXTURES = None
 
 

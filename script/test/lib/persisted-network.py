@@ -12,6 +12,8 @@ import subprocess
 import sys
 import time
 
+sys.dont_write_bytecode = True
+
 ROOT = Path(__file__).resolve().parents[3]
 SPEC = importlib.util.spec_from_file_location("pn_egress", ROOT / "script/test/lib/egress-fixtures.py")
 EGRESS = importlib.util.module_from_spec(SPEC)
