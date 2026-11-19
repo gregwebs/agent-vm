@@ -609,7 +609,7 @@ impl ProtectedConfigDir {
             for (file, n) in &d.authority_file_links {
                 if !authority_file_singly_linked(*n) {
                     bail!(
-                        "\"{}\" has {n} hard links; agent-vm will not launch while another name for it could be written from a guest and then removed. Remove the other links, or replace the file with a copy.",
+                        "\"{}\" has {n} hard links; agent-vm will not launch while another name for it could be written from a guest and then removed; review the file's launch-authorizing contents, then remove its other names before launching.",
                         crate::one_line::path(file)
                     );
                 }
@@ -934,8 +934,13 @@ mod tests {
             cwd: "/".into(),
         };
         let error = guard.check_authority_links().unwrap_err().to_string();
-        assert!(error.contains("has 2 hard links"), "{error}");
-        assert!(error.contains(crate::allowances::FILE), "{error}");
+        assert_eq!(
+            error,
+            format!(
+                "\"{}\" has 2 hard links; agent-vm will not launch while another name for it could be written from a guest and then removed; review the file's launch-authorizing contents, then remove its other names before launching.",
+                crate::one_line::path(&dir.join(crate::allowances::FILE))
+            )
+        );
         // An uninspectable file refuses, naming it (E2).
         let error = authority_file_links(dir, |path| {
             if path == dir.join("config.toml") {

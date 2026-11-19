@@ -546,15 +546,25 @@ impl AcquireError {
                 "internal error: the acquisition target's registry does not match the opened cache".to_string()
             }
             Self::Native { stage, source } => {
-                format!("{} failed: {}", stage.describe(), native_category(source))
+                format!("{}: {}", stage.describe(), native_category(source))
             }
-            Self::RegistrySettings(_) => "resolving registry trust/auth configuration failed".to_string(),
+            Self::RegistrySettings(_) => {
+                "resolving registry trust/auth configuration: did not complete".to_string()
+            }
             Self::Task(_) => {
-                "the native acquisition task failed, so image publication is uncertain; check the cache and retry the acquisition".to_string()
+                "native acquisition task: image publication is uncertain; check the cache and retry the acquisition".to_string()
             }
-            Self::DebugConfig(_) => "preparing the native acquisition debug record failed".to_string(),
-            Self::TestGate(_) => "native acquisition test gate failed".to_string(),
-            Self::ReferenceState { stage, .. } => format!("{} failed", stage.describe()),
+            Self::DebugConfig(_) => {
+                "preparing the native acquisition debug record: did not complete".to_string()
+            }
+            Self::TestGate(_) => "native acquisition test gate: did not complete".to_string(),
+            Self::ReferenceState { stage, .. } => {
+                let detail = match stage {
+                    ReferenceStage::LockAcquire => "unavailable",
+                    ReferenceStage::LockOpen | ReferenceStage::Snapshot => "did not complete",
+                };
+                format!("{}: {detail}", stage.describe())
+            }
             Self::PostValidation { rollback, .. } => match rollback {
                 RollbackOutcome::Failed(_) => POSTVALIDATION_ROLLBACK_FAILED.to_string(),
                 RollbackOutcome::Restored => POSTVALIDATION_RESTORED.to_string(),
@@ -573,10 +583,10 @@ impl AcquireError {
 }
 
 /// Safe text for a validation failure whose snapshot was restored.
-pub(crate) const POSTVALIDATION_RESTORED: &str = "image cache post-acquisition validation failed and the previous reference metadata was restored; retry the image acquisition";
+pub(crate) const POSTVALIDATION_RESTORED: &str = "image cache post-acquisition validation: the previous reference metadata was restored; retry the image acquisition";
 
 /// Safe text for a validation failure whose restore also failed.
-pub(crate) const POSTVALIDATION_ROLLBACK_FAILED: &str = "image cache post-acquisition validation failed; restoring previous reference metadata also failed; cache recovery is required before relying on this selection; retry image acquisition after resolving the cache error";
+pub(crate) const POSTVALIDATION_ROLLBACK_FAILED: &str = "image cache post-acquisition validation: restoring previous reference metadata also failed; cache recovery is required before relying on this selection; retry image acquisition after resolving the cache error";
 
 impl std::fmt::Display for AcquireError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -598,31 +608,26 @@ impl AcquireError {
     /// use [`AcquireError::redacted_message`] instead.
     pub(crate) fn into_explicit_error(self) -> anyhow::Error {
         match self {
-            Self::Native { stage, source } => {
-                anyhow::Error::new(source).context(format!("{} failed", stage.describe()))
+            Self::Native { stage, source } => anyhow::Error::new(source).context(stage.describe()),
+            Self::RegistrySettings(error) => {
+                anyhow::Error::new(error).context("resolving registry trust/auth configuration")
             }
-            Self::RegistrySettings(error) => anyhow::Error::new(error)
-                .context("resolving registry trust/auth configuration failed"),
-            Self::Task(error) => {
-                anyhow::Error::new(error).context(
-                    "native acquisition task join failed, so image publication is uncertain; check the cache and retry the acquisition",
-                )
-            }
+            Self::Task(error) => anyhow::Error::new(error).context(
+                "native acquisition task join: image publication is uncertain; check the cache and retry the acquisition",
+            ),
             Self::DebugConfig(error) => {
                 error.context("preparing the native acquisition debug record")
             }
-            Self::TestGate(error) => error.context("native acquisition test gate failed"),
-            Self::ReferenceState { stage, source } => {
-                source.context(format!("{} failed", stage.describe()))
-            }
+            Self::TestGate(error) => error.context("native acquisition test gate"),
+            Self::ReferenceState { stage, source } => source.context(stage.describe()),
             Self::PostValidation { source, rollback } => {
                 let validation = match source {
                     ValidationError::Completeness(error) => {
                         error.context("validating the acquired image cache")
                     }
                     ValidationError::Identity => anyhow!(
-                        "validating the acquired image cache failed: immutable identity or \
-                         complete cache unavailable"
+                        "validating the acquired image cache: immutable identity or \
+                         complete cache did not validate"
                     ),
                     ValidationError::Platform(rejection) => anyhow!(rejection.describe()),
                 };
@@ -631,7 +636,7 @@ impl AcquireError {
                         validation.context("previous reference metadata was restored")
                     }
                     RollbackOutcome::Failed(failure) => validation.context(format!(
-                        "restoring previous reference metadata also failed: {failure:#}; cache recovery is required before relying on this selection; retry image acquisition after resolving the cache error"
+                        "post-acquisition validation: restoring previous reference metadata also failed: {failure:#}; cache recovery is required before relying on this selection; retry image acquisition after resolving the cache error"
                     )),
                 }
             }
@@ -657,10 +662,11 @@ impl std::fmt::Display for ValidationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Completeness(_) => {
-                formatter.write_str("complete cache identity unavailable after acquisition")
+                formatter.write_str("complete cache identity did not validate after acquisition")
             }
-            Self::Identity => formatter
-                .write_str("immutable identity or complete cache unavailable after acquisition"),
+            Self::Identity => formatter.write_str(
+                "immutable identity or complete cache identity did not validate after acquisition",
+            ),
             Self::Platform(rejection) => formatter.write_str(rejection.describe()),
         }
     }
@@ -2041,7 +2047,7 @@ mod tests {
             source: ImageError::Io(std::io::Error::other(format!("io for {sentinel}"))),
         }
         .into_explicit_error();
-        assert!(format!("{native:#}").contains("acquiring the image failed"));
+        assert!(format!("{native:#}").contains("acquiring the image:"));
     }
 
     /// T4: a prepublication test-gate failure is its own category, not the
@@ -2052,12 +2058,124 @@ mod tests {
         let gate = AcquireError::TestGate(anyhow!("unexpected acquisition gate reply"));
         assert_eq!(
             gate.redacted_message(),
-            "native acquisition test gate failed"
+            "native acquisition test gate: did not complete"
         );
-        assert!(format!("{gate:#}").contains("native acquisition test gate failed"));
+        assert!(format!("{gate:#}").contains("native acquisition test gate"));
         let debug = AcquireError::DebugConfig(anyhow!("serialize"));
         assert!(debug.redacted_message().contains("debug record"));
         assert_ne!(gate.redacted_message(), debug.redacted_message());
+    }
+
+    #[test]
+    fn acquisition_reason_leads_do_not_repeat_the_row_verb() {
+        fn assert_leading_clause(reason: &str) {
+            let leading = reason.split([':', ';']).next().unwrap();
+            assert!(
+                !leading.contains("failed"),
+                "the row already names the failure: {reason}"
+            );
+        }
+
+        // No wildcard: adding an acquisition variant must choose an explicit
+        // rendering before this sweep can compile.
+        fn explicit_reason(error: AcquireError) -> String {
+            let error = match error {
+                error @ (AcquireError::NonLocalBackend
+                | AcquireError::RegistryMismatch
+                | AcquireError::Native { .. }
+                | AcquireError::RegistrySettings(_)
+                | AcquireError::Task(_)
+                | AcquireError::DebugConfig(_)
+                | AcquireError::TestGate(_)
+                | AcquireError::ReferenceState { .. }
+                | AcquireError::PostValidation { .. }
+                | AcquireError::Barrier(_)
+                | AcquireError::Receipt(_)
+                | AcquireError::CachedEntry(_)
+                | AcquireError::Identity
+                | AcquireError::NotCached) => error,
+            };
+            format!("{:#}", error.into_explicit_error())
+        }
+
+        // No wildcard: a new receipt category must be added to the sweep. The
+        // identity match is the point, so the lint that sees it as redundant
+        // is not welcome here.
+        #[expect(
+            clippy::needless_match,
+            reason = "the identity match is the exhaustiveness check"
+        )]
+        fn receipt_variant(receipt: ReceiptError) -> ReceiptError {
+            match receipt {
+                ReceiptError::TooLarge => ReceiptError::TooLarge,
+                ReceiptError::Corrupt => ReceiptError::Corrupt,
+                ReceiptError::Io => ReceiptError::Io,
+                ReceiptError::Encode => ReceiptError::Encode,
+                ReceiptError::IdentityConflict => ReceiptError::IdentityConflict,
+                ReceiptError::BindingLimit => ReceiptError::BindingLimit,
+            }
+        }
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let join = runtime.block_on(async {
+            tokio::spawn(async { panic!("test task failure") })
+                .await
+                .unwrap_err()
+        });
+        let mut errors = vec![
+            AcquireError::NonLocalBackend,
+            AcquireError::RegistryMismatch,
+            AcquireError::Native {
+                stage: AcquireStage::Pull,
+                source: ImageError::ManifestParse("test".to_string()),
+            },
+            AcquireError::RegistrySettings(MicrosandboxError::InvalidConfig("test".to_string())),
+            AcquireError::Task(join),
+            AcquireError::DebugConfig(anyhow!("test")),
+            AcquireError::TestGate(anyhow!("test")),
+            AcquireError::ReferenceState {
+                stage: ReferenceStage::LockOpen,
+                source: anyhow!("test"),
+            },
+            AcquireError::ReferenceState {
+                stage: ReferenceStage::LockAcquire,
+                source: anyhow!("test"),
+            },
+            AcquireError::ReferenceState {
+                stage: ReferenceStage::Snapshot,
+                source: anyhow!("test"),
+            },
+            AcquireError::PostValidation {
+                source: ValidationError::Identity,
+                rollback: RollbackOutcome::Restored,
+            },
+            AcquireError::PostValidation {
+                source: ValidationError::Identity,
+                rollback: RollbackOutcome::Failed(anyhow!("test")),
+            },
+            AcquireError::Barrier(BarrierError::Open(anyhow!("test"))),
+            AcquireError::Barrier(BarrierError::Wait(anyhow!("test"))),
+            AcquireError::CachedEntry(CachedEntryError::Conflict),
+            AcquireError::Identity,
+            AcquireError::NotCached,
+        ];
+        errors.extend(
+            [
+                ReceiptError::TooLarge,
+                ReceiptError::Corrupt,
+                ReceiptError::Io,
+                ReceiptError::Encode,
+                ReceiptError::IdentityConflict,
+                ReceiptError::BindingLimit,
+            ]
+            .into_iter()
+            .map(receipt_variant)
+            .map(AcquireError::Receipt),
+        );
+        for error in errors {
+            assert_leading_clause(&error.redacted_message());
+            assert_leading_clause(&explicit_reason(error));
+        }
     }
 
     #[test]

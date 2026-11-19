@@ -2475,7 +2475,7 @@ fn refresh_reports_real_guard_contention_once_and_releases_into_success() {
     let stderr = delivered(&out);
     assert!(!out.status.success(), "{stderr}");
     assert!(
-        stderr.contains("opening the image-cache coordination lock failed"),
+        stderr.contains("opening the image-cache coordination lock:"),
         "a hard lock-open error must name its own stage: {stderr}"
     );
     assert!(
@@ -3521,7 +3521,7 @@ fn gate_io_failure_is_a_failure_not_a_skip() {
         "a missing gate listener must fail the acquisition"
     );
     let text = delivered(&out);
-    assert!(text.contains("test gate failed"), "{text}");
+    assert!(text.contains("native acquisition test gate:"), "{text}");
     assert_eq!(
         server.count(),
         0,
