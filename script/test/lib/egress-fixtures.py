@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Host-side fixtures and the bounded launch supervisor for the #302 A1 egress
-harness (``script/test/egress-default-deny.sh``).
+harness, as #692 ported them to ``crates/harness``. This copy is kept under the
+bottom-up rule (ADR-0072) for its last Python consumer, the supervisor controls
+in ``lib/egress-supervisor-contract.py``; ``script/test/egress-default-deny.sh``
+runs ``harness egress-fixtures run`` now, not this file.
 
 Three roles, deliberately in one file so the boot-free contract can exercise
 them without a VM:
@@ -1612,7 +1615,7 @@ RF1_HINT = ("==> The sandbox refused a guest network request; run `agent-vm acce
 # host witness in `OwnedLaunch` does the `agent-vm access` work between probes.
 #
 # The two halves coordinate over exactly two vocabularies, and
-# `egress-probe-contract.py` asserts each one is spelled the same on both sides:
+# `harness egress-probe` asserts each one is spelled the same on both sides:
 #
 #   * markers: guest -> host, lines in the launch log the witness follows;
 #   * signals: host -> guest, files in the project directory (`work / "proj"`),

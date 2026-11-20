@@ -56,6 +56,9 @@ GRAMMAR = SRC + "egress_grammar.rs"
 NETWORK = SRC + "network.rs"
 FIXTURE = "script/test/lib/egress-fixtures.py"
 PROBE = "script/test/fixtures/egress-probe.sh"
+# The harness binary the ported boot-free controls run. Its default is the
+# checkout's own debug build, which `script/test/ci-contracts.sh` exports.
+HARNESS = os.path.join(os.environ.get("HARNESS_BIN_DIR", str(ROOT / "target/debug")), "harness")
 LAUNCH = "config_launch_driven"
 MOUNTS = "config_mounts"
 GIT_MOUNTS = "git_metadata_mounts"
@@ -310,12 +313,20 @@ def matrix():
         ("resolver-calibration", '"HC1": ("host-tcp80", *gateway),\n        "I1": ("public-1111", "public-1001", *gateway, *explicit, "lan-tcp80", "host-tcp80"),', '"HC1": ("host-tcp80", *gateway),\n        "I1": ("public-1111", "public-1001", *gateway, "lan-tcp80", "host-tcp80"),'),
     ):
         add(name, FIXTURE, old, new, host, "FAILED (")
-    wire = ["python3", "script/test/lib/egress-wire-contract.py"]
-    add("dns-short-read", PROBE, 'dd bs=1 count="$frame"', 'dd bs="$frame" count=1', wire, "FAILED (")
-    add("dns-eof", PROBE, 'timeout 3 dd bs=1 count="$frame"', 'timeout 3 cat', wire, "FAILED (")
-    hooks = ["python3", "script/test/lib/egress-probe-contract.py"]
-    add("hook-no-library", FIXTURE, 'EGRESS_PROBE_LIB=1 . ./egress-probe.sh\\n', ':\\n', hooks, "FAILED (")
-    add("hook-zero", FIXTURE, 'else "return 7"', 'else "return 0"', hooks, "FAILED (")
+    # #693: the wire and dispatcher controls are harness checks now. Each runs
+    # with the disposable copy as its repository root, so the mutation it grades is
+    # the copy's own probe library or fixture module, while the harness binary is
+    # the checkout's.
+    probe_controls = [HARNESS, "egress-probe", "--self-test", "--repo-root", "."]
+    add("dns-short-read", PROBE, 'dd bs=1 count="$frame"', 'dd bs="$frame" count=1', probe_controls, "panicked at")
+    add("dns-eof", PROBE, 'timeout 3 dd bs=1 count="$frame"', 'timeout 3 cat', probe_controls, "panicked at")
+    # #693 drops the two hook rows: `write_hook` is `egress_run::write_hook` now,
+    # and the harness binary under test is prebuilt, so a mutation of the Python
+    # copy is invisible to it. Both properties survive as assertions in
+    # `harness egress-probe`'s generated-hook control - no "command not found"
+    # (the sourcing line) and exit 7 for HK2's denial (the strict variant) - and a
+    # mutation row for them needs this script to grade the harness crate, which is
+    # #695's port.
     # ADR-0065's per-case allowance lifecycle: the *call sites* in `orchestrate`,
     # which the boot-free contract proves by source (its body needs a VM). Each
     # deletion is one way a case runs without its record (PA1x then passes while

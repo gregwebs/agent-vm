@@ -24,6 +24,8 @@ mod build_provenance;
 mod config_dir_guard;
 mod cpu_commitment;
 mod detached_run;
+mod egress_default_deny;
+mod egress_probe;
 mod image_pins;
 mod launch_argv_order;
 mod launcher_standin;
@@ -56,6 +58,10 @@ enum Command {
     DetachedRun(detached_run::DetachedRunArgs),
     /// Serve the local egress fixtures, or ask them what they have seen.
     EgressFixtures(egress_fixtures::EgressFixturesArgs),
+    /// Run the boot-free controls for the egress probe library and its driver.
+    EgressProbe(egress_probe::EgressProbeArgs),
+    /// Check the egress default-deny driver's plan inventory and guard rails.
+    EgressDefaultDeny(egress_default_deny::EgressDefaultDenyArgs),
     /// Check the image-pins live-seed helper dispatch.
     ImagePins(image_pins::ImagePinsArgs),
     /// Play a launcher's plumbing for the boot-free direct-terminal controls.
@@ -86,6 +92,8 @@ impl Cli {
             Command::DetachedRun(_) => "detached-run",
             Command::LauncherStandin(_) => "standin",
             Command::EgressFixtures(_) => "egress fixtures",
+            Command::EgressProbe(_) => "egress probe",
+            Command::EgressDefaultDeny(_) => "egress default deny",
         }
     }
 }
@@ -110,6 +118,8 @@ pub fn run(cli: Cli) -> Result<Outcome, String> {
         Command::CpuCommitment(args) => cpu_commitment::run(args).map(Outcome::Report),
         Command::DetachedRun(args) => detached_run::run(args),
         Command::EgressFixtures(args) => egress_fixtures::run(args),
+        Command::EgressProbe(args) => egress_probe::run(args),
+        Command::EgressDefaultDeny(args) => egress_default_deny::run(args),
         Command::ImagePins(args) => image_pins::run(args).map(Outcome::Report),
         Command::LauncherStandin(args) => launcher_standin::run(args),
         Command::LaunchArgvOrder(args) => launch_argv_order::run(args).map(Outcome::Report),

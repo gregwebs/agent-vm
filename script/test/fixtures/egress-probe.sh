@@ -1074,7 +1074,7 @@ _case_refusal_feed() {
 # passing it: the case's evidence is the *transition*, never the signal.
 #
 # `PA2_WAIT` is the bound in whole seconds (the host witness uses the same 120 s
-# default); `egress-probe-contract.py` drives this function with a stub probe and
+# default); `harness egress-probe` drives this function with a stub probe and
 # pre-created signals, so none of the above is asserted only as prose.
 _pa2_wait() {  # FILE SECONDS
     local file="$1" bound="$2" until

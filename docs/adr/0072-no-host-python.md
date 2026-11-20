@@ -52,13 +52,22 @@ Python that runs inside the guest stays, and is on the guard's allowlist:
 In both cases a Rust replacement would need a guest cross-compile target.
 Revisit these if the guest image drops Python.
 
-One open hole, so it is recorded rather than hidden: the boot-free
-`script/test/lib/egress-probe-contract.py` calls `tls_probe`, `opaque_send` and
-`server_first` from `egress-probe.sh` **on the host**, against a local listener,
-and each of those runs `python3`. When that suite becomes a harness check, the
-probe's host half has to become Rust too, or the ported check has to drop the
-host-run rows and leave them to the guest suite. That is the egress tickets'
-problem to settle, and until then no host-only `python3` may hide in that file.
+The one hole this record left open is closed (#693). The boot-free probe
+controls used to call `tls_probe`, `opaque_send`, `server_first`, `listen` and
+`tls_held_two_requests` from `egress-probe.sh` **on the host**, and each of those
+runs `python3`. `harness egress-probe` runs the library's pure-bash primitives
+and its case dispatcher through `bash` — so the guest's own code is still what
+the controls drive — and the rows whose subject is the probe's Python are the
+guest suite's: IN1/IN2 run `listen`, the HN and OP rows run `tls_probe`,
+`opaque_send` and `server_first`, and HP2/HP2c run the held pair. The probe
+file's ten `python3` occurrences are therefore guest code, and no host-only
+`python3` hides in it.
+
+A third allowlisted category is a *name*, not an invocation: a harness check
+that writes a deliberately broken `python3` stub onto a scratch `PATH` to prove a
+preflight refuses an unusable runtime mentions the name without running an
+interpreter. The guard cannot tell that from a call, so such a file carries a
+count, and one more mention — which is what a real call looks like — fails.
 
 Upstream's own Python is out of scope, like the libkrunfw build's `pyelftools`:
 `profiling/*.sh` run libkrunfw's `bin2cbundle.py`, which this repository does not

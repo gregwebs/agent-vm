@@ -22,7 +22,9 @@
 # workload file the driver writes into the guest.
 crates/agent-vm/src/cpu_evidence/native.rs 4
 # The guest half of the egress probe: TLS and socket probes, with a node
-# fallback. Its host-side rows are the open exception ADR-0072 records.
+# fallback. #693 ported its host-side callers — the wire and dispatcher controls
+# run `harness egress-probe` and drive the pure-bash primitives through bash — so
+# what is left is the guest's, and the count stays.
 script/test/fixtures/egress-probe.sh 10
 
 # --- Vendor tooling (libkrunfw bin2cbundle.py), out of scope per #682 -------
@@ -42,14 +44,15 @@ script/test/lib/build-provenance.py
 script/test/released-image-launch.py
 
 # --- Migration debt: egress ------------------------------------------------
+# #693 took the wire and probe contracts off the host: they are `harness
+# egress-probe --self-test` and `harness egress-default-deny` now, so the two
+# `*.py` files and `egress-default-deny.sh`'s Python call are gone. The one
+# remaining call runs #694's supervisor controls.
 script/test/lib/egress-fixtures.py
 script/test/lib/egress-hostname-fixtures.py
-script/test/lib/egress-wire-contract.py
-script/test/lib/egress-probe-contract.py
 script/test/lib/egress-supervisor-contract.py
 script/test/egress-mutations.py
-script/test/egress-default-deny.sh 1
-script/test/egress-default-deny-contract.sh 7
+script/test/egress-default-deny-contract.sh 1
 
 # --- Migration debt: persisted network -------------------------------------
 script/test/lib/persisted-network.py
@@ -75,3 +78,11 @@ script/test/e2e.sh 15
 # terminal contract still needs python3 until #699 ports it; the detach shim it
 # runs is `harness detached-run` now.
 script/test/ci-contracts.sh 2
+
+# --- Fixture stub names, not invocations -----------------------------------
+# This harness check writes a deliberately broken `python3` onto a scratch PATH
+# to prove the probe's preflight refuses an unusable runtime. No interpreter is
+# run: the file *writes* a `#!/bin/sh` stub at that name. The count is what keeps
+# this honest -- a fifth mention in this file, which is what a real call would
+# look like, fails the guard.
+crates/harness/src/egress_probe.rs 4
