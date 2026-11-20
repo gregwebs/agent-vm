@@ -106,6 +106,10 @@ if [[ "$guard_only" == false ]]; then
     bash "$REPO_ROOT/script/test/pin-store-upgrade-contract.sh"
     bash "$REPO_ROOT/script/test/build-provenance-contract.sh"
     bash "$REPO_ROOT/script/test/persisted-network-contract.sh"
+    # VM-free: drives the selector and manifest helpers against a failing fake
+    # `docker`, so it stops before any isolated build. It was in both guard lists
+    # but never executed, which made a contract nobody ran (ADR-0072 port, #686).
+    bash "$REPO_ROOT/script/test/cpu-commitment-native-contract.sh"
     # Mutation anchors must still name lines that exist; otherwise the
     # mutation evidence is stale and only a hand-run would notice (#305 N9).
     # #501 slice 3: the access prompt's byte frames are checked against a real

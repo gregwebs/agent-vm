@@ -34,12 +34,6 @@ profiling/build_variants.sh 1
 # this final caller and then this entry.
 script/test/lib/build-provenance.py
 
-# --- Migration debt: CPU commitment evidence --------------------------------
-script/test/cpu-commitment-manifest.py
-script/test/cpu-commitment-select.py
-script/test/cpu-commitment-native.sh 6
-script/test/cpu-commitment-native-contract.sh 18
-
 # --- Migration debt: released image launch ---------------------------------
 script/test/released-image-launch.py
 script/test/released-image-launch-test.py
