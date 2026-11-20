@@ -1042,10 +1042,33 @@ pub fn program_path() -> String {
     program()
 }
 
+/// The `harness` binary this process's subcommands belong to.
+///
+/// A production process *is* that binary. Under `cargo test` it is the test
+/// harness in `target/debug/deps`, which rejects a shim's or a fixture's
+/// subcommand as an unknown libtest option, so the sibling `target/debug/harness`
+/// is the right answer there: everything that spawns this binary means the real
+/// one.
+pub fn harness_binary() -> std::path::PathBuf {
+    let current = match std::env::current_exe() {
+        Ok(current) => current,
+        Err(_) => return std::path::PathBuf::from("harness"),
+    };
+    if current.file_name().is_some_and(|name| name == "harness") {
+        return current;
+    }
+    if let Some(parent) = current.parent() {
+        for candidate in [parent.join("harness"), parent.join("../harness")] {
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    current
+}
+
 fn program() -> String {
-    std::env::current_exe()
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "harness".to_owned())
+    harness_binary().to_string_lossy().into_owned()
 }
 
 /// The `exec-shim` argv a launch is wrapped in: identity first, stdout and

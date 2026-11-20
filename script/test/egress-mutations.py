@@ -54,7 +54,6 @@ EGRESS = SRC + "egress_policy.rs"
 REFERENCE = SRC + "egress_reference.rs"
 GRAMMAR = SRC + "egress_grammar.rs"
 NETWORK = SRC + "network.rs"
-FIXTURE = "script/test/lib/egress-fixtures.py"
 PROBE = "script/test/fixtures/egress-probe.sh"
 # The harness binary the ported boot-free controls run. Its default is the
 # checkout's own debug build, which `script/test/ci-contracts.sh` exports.
@@ -299,20 +298,6 @@ def matrix():
         '&["--mount", &mount, "--allow-egress", "api.example.com"],',
         '&["--allow-egress", "api.example.com"],', g4)
     add("valid-no-credential", SRC + "run.rs", '.context("snapshotting host credentials")?;', '.context("snapshotting host credentials")?;\n    if let Some(file) = &creds.anthropic_token_file { std::fs::remove_file(file)?; }', g4)
-    host = ["python3", "script/test/lib/egress-supervisor-contract.py"]
-    for name, old, new in (
-        ("shell-argv",
-         '    if case.guest:\n        extra = hostname_extra(case, values, lan2 or DEFAULT_LAN2, hnc_step) if hostname_tier(case.case) else (\n            answer if case.case == "I1a" else rebind if case.case == "RB1" else "")\n        argv.extend((case.case, ident, lan, case.variant, extra))',
-         '    if case.guest:\n        argv[len(flags) + 4] = "shell"\n        extra = hostname_extra(case, values, lan2 or DEFAULT_LAN2, hnc_step) if hostname_tier(case.case) else (\n            answer if case.case == "I1a" else rebind if case.case == "RB1" else "")\n        argv.extend(("-c", case.case, ident, lan, case.variant, extra))'),
-        ("credential-tool", 'argv = [binary, "--no-git", "--image", IMAGE, *flags, case.tool]', 'argv = [binary, "--no-git", "--image", IMAGE, *flags, "egressprobe"]'),
-        ("rejection-guest", 'if case.guest:\n        extra = hostname_extra', 'if case.guest or case.case == "RJ1":\n        extra = hostname_extra'),
-        ("extra-env", 'env = base_environment(work)\n    extras', 'env = base_environment(work)\n    env["MUTANT"] = "1"\n    extras'),
-        ("tcp-calibration", '"LC1": ("lan-tcp80", "lan-tcp81", "lan-udp90", "lan-udp80"),', '"LC1": ("lan-tcp80", "lan-udp90", "lan-udp80"),'),
-        ("udp-calibration", '"LC1": ("lan-tcp80", "lan-tcp81", "lan-udp90", "lan-udp80"),', '"LC1": ("lan-tcp80", "lan-tcp81", "lan-udp90"),'),
-        ("v6-calibration", '"V6c": ("public-v6-1111", "public-v6-1001"),', '"V6c": ("public-v6-1111",),'),
-        ("resolver-calibration", '"HC1": ("host-tcp80", *gateway),\n        "I1": ("public-1111", "public-1001", *gateway, *explicit, "lan-tcp80", "host-tcp80"),', '"HC1": ("host-tcp80", *gateway),\n        "I1": ("public-1111", "public-1001", *gateway, "lan-tcp80", "host-tcp80"),'),
-    ):
-        add(name, FIXTURE, old, new, host, "FAILED (")
     # #693: the wire and dispatcher controls are harness checks now. Each runs
     # with the disposable copy as its repository root, so the mutation it grades is
     # the copy's own probe library or fixture module, while the harness binary is
@@ -327,46 +312,57 @@ def matrix():
     # (the sourcing line) and exit 7 for HK2's denial (the strict variant) - and a
     # mutation row for them needs this script to grade the harness crate, which is
     # #695's port.
-    # ADR-0065's per-case allowance lifecycle: the *call sites* in `orchestrate`,
-    # which the boot-free contract proves by source (its body needs a VM). Each
-    # deletion is one way a case runs without its record (PA1x then passes while
-    # proving nothing) or leaves one behind.
-    add("allowance-seed-dropped", FIXTURE,
-        "                seed_failures = prepare_allowance(work, case, args.lan)\n",
-        "                seed_failures = []\n", host, "FAILED (")
-    add("allowance-restore-dropped", FIXTURE,
-        "            if case.case in ALLOWANCE_CASES:\n                failures.extend(remove_allowances(work))\n",
-        "", host, "FAILED (")
-    add("allowance-final-cleanup-dropped", FIXTURE,
-        "        cleanup_errors.extend(final_cleanup(work))",
-        "        cleanup_errors.extend(remove_credentials(work))", host, "FAILED (")
+    #
+    # #694 takes the supervisor controls off the host the same way:
+    # `harness egress-supervisor --self-test` replaces
+    # `lib/egress-supervisor-contract.py`, and the fake candidate those controls
+    # drive is a mode of the same binary. The call-site rows below are *repointed*,
+    # not dropped: they used to mutate the Python `orchestrate` body and then run
+    # the suite that inspected it, and they now mutate
+    # `crates/harness/src/egress_run.rs` while the control reads that file at run
+    # time, so each row grades the copy's own source with the checkout's prebuilt
+    # binary, exactly as the `egress-probe` rows above do.
+    supervisor = [HARNESS, "egress-supervisor", "--self-test", "--repo-root", "."]
+    run_source = "crates/harness/src/egress_run.rs"
+    # ADR-0065's per-case allowance lifecycle: each deletion is one way a case runs
+    # without its record (PA1x then passes while proving nothing) or leaves one
+    # behind.
+    add("allowance-seed-dropped", run_source,
+        "            let mut failures = prepare_allowance(work, case.case, lan);",
+        "            let mut failures = Vec::new();", supervisor, "panicked at")
+    add("allowance-restore-dropped", run_source,
+        '    if ALLOWANCE_CASES.contains(&case.case) {\n        failures.extend(remove_allowances(work));\n    }',
+        "", supervisor, "panicked at")
+    add("allowance-final-cleanup-dropped", run_source,
+        "    cleanup_errors.extend(final_cleanup(&work));",
+        "    cleanup_errors.extend(remove_credentials(&work));", supervisor, "panicked at")
     # ADR-0066 (PA2): the same shape for the live-allowance case, whose evidence is
     # a *transition*. Dropping any of its three call sites must be caught: without
     # the pre-launch reset a seeded store makes the first, supposed-to-be-refused
     # probe pass; without the verdict the case would pass on the guest's markers
     # alone; without the restore the record and the writer's lock leak.
-    add("live-allowance-reset-dropped", FIXTURE,
-        "                seed_failures = prepare_live_allowance(work, case)\n",
-        "                seed_failures = []\n", host, "FAILED (")
-    add("live-allowance-verdict-dropped", FIXTURE,
-        "                failures.extend(check_live_allowance(work, ident, owned_text))\n",
-        "", host, "FAILED (")
-    add("live-allowance-cleanup-dropped", FIXTURE,
-        "            if case.case == \"PA2\":\n                failures.extend(cleanup_pa2(work))\n",
-        "", host, "FAILED (")
-    # Real timeout/catalog/socket contracts exercise these independent omissions.
-    for name, old, new in (
-        ("cleanup-no-kill", 'for identity in launch.alive():', 'for identity in []:'),
-        ("catalog-unmigrated-mismatch", '            if not observed:', '            if False:'),
-        ("catalog-mismatch-silenced",
-         '            if not columns <= observed:\n                raise RuntimeError(f"private catalog schema mismatch: {table}")',
-         '            if not columns <= observed:\n                return []'),
-        ("cleanup-no-unlink", '                            path.unlink()', '                            pass'),
-        ("cleanup-no-remove", '("remove", ("remove", name), 10)):', '("list", ("list",), 10)):'),
-        ("cleanup-suppress", '    return errors\n\n\ndef cleanup_run', '    return []\n\n\ndef cleanup_run'),
-        ("cleanup-unbounded", 'if deadline is not None:', 'if False and deadline is not None:'),
-    ):
-        add(name, FIXTURE, old, new, host, "FAILED (")
+    add("live-allowance-reset-dropped", run_source,
+        "            let failures = prepare_live_allowance(work, case.case);",
+        "            let failures = Vec::new();", supervisor, "panicked at")
+    add("live-allowance-verdict-dropped", run_source,
+        "        failures.extend(check_live_allowance(work, owned.ident(), &text));",
+        "", supervisor, "panicked at")
+    add("live-allowance-cleanup-dropped", run_source,
+        '    if case.case == "PA2" {\n        failures.extend(cleanup_pa2(work));\n    }',
+        "", supervisor, "panicked at")
+    # #694 drops fifteen rows, because their subjects became Rust *behaviour*
+    # rather than a source a control scans: the eight case-table rows (argv shape,
+    # credential tool, validation-only dispatch, environment, and the four
+    # calibrations) and seven cleanup/catalog rows (identity kill, unmigrated
+    # catalog, schema mismatch, socket unlink, the `remove` verb, a suppressed
+    # cleanup, an ignored deadline). A mutation of the copy's `egress_cases.rs`,
+    # `egress_launch.rs`, `msb_catalog.rs` or `egress_run.rs` is invisible to the
+    # prebuilt harness binary, so no such row here can fail: leaving it would be a
+    # row that cannot bite. The properties survive as assertions in the ported
+    # controls (the case table and its calibrations, the timeout/force-fallback
+    # cleanup, the catalog states, the wedged deadline and the interrupted
+    # launch); what is gone is the proof that they bite. Grading a mutated *crate*
+    # needs this script to build the copy too, which is #695's port.
     guard = SRC + "protected_config_dir.rs"
     guard_tests = rust("protected_config_dir")
     for name, old, new in (

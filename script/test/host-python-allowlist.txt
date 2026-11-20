@@ -46,13 +46,13 @@ script/test/released-image-launch.py
 # --- Migration debt: egress ------------------------------------------------
 # #693 took the wire and probe contracts off the host: they are `harness
 # egress-probe --self-test` and `harness egress-default-deny` now, so the two
-# `*.py` files and `egress-default-deny.sh`'s Python call are gone. The one
-# remaining call runs #694's supervisor controls.
+# `*.py` files and `egress-default-deny.sh`'s Python call are gone. #694 ported
+# the supervisor suite to `harness egress-supervisor --self-test`, which takes
+# `egress-default-deny-contract.sh` to zero `python3` sites. What is left here is
+# the library the other egress suites still import.
 script/test/lib/egress-fixtures.py
 script/test/lib/egress-hostname-fixtures.py
-script/test/lib/egress-supervisor-contract.py
 script/test/egress-mutations.py
-script/test/egress-default-deny-contract.sh 1
 
 # --- Migration debt: persisted network -------------------------------------
 script/test/lib/persisted-network.py
