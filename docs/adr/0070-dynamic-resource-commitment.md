@@ -4,7 +4,8 @@
 
 **Accepted and implemented** ([#645](https://github.com/gregwebs/agent-vm/issues/645),
 [#646](https://github.com/gregwebs/agent-vm/issues/646),
-[#647](https://github.com/gregwebs/agent-vm/issues/647)). Both axes are live:
+[#647](https://github.com/gregwebs/agent-vm/issues/647); D3's cushion amended by
+[#712](https://github.com/gregwebs/agent-vm/issues/712)). Both axes are live:
 memory commitment (D3) and CPU commitment (D4). Amends
 [ADR-0018](0018-machine-checked-boundary-contracts.md) (adds the pure
 resource-commitment sizing, memory hysteresis, recovery-baseline, recovery-seed,
@@ -158,23 +159,31 @@ deadline (D4.1).
 
 ### D3. Target-headroom memory tracking
 
-**Status: implemented (#646).**
+**Status: implemented (#646), amended by
+[#712](https://github.com/gregwebs/agent-vm/issues/712): the cushion is a 2048 MiB
+reserve** (see *The cushion is a reserve* below).
 
 Linux does not pause page faults waiting for `virtio-mem`, so the guest must
-retain enough free plugged headroom to absorb allocations during a 200 ms poll +
-plug window:
+retain enough free plugged headroom to absorb allocations during the whole
+reaction chain: the 200 ms poll that observes the demand, the balloon sample that
+poll reads, the live apply, and the guest's own plug. Demand arrives as a **rate**
+over that chain's *duration*, so the cushion must cover rate × chain — an amount a
+fraction of what is already resident cannot supply (see *The cushion is a reserve*
+below).
 
 1. When `memory_available_bytes` is reported,
    `used_mib = ceil((memory_limit_bytes - memory_available_bytes) / MiB)` — the
    ceiling, not a truncation, so a fraction of a MiB of use cannot hide below the
    headroom:
    ```text
-   headroom_mib = max(256, used_mib / 4)
+   headroom_mib = max(2048, used_mib / 4)
    desired_mib  = clamp(round_up_128_mib(used_mib + headroom_mib), boot_memory_mib, max_memory_mib)
    ```
-   When `used_mib <= 256`, `used_mib + headroom_mib <= 512`, keeping an idle
-   guest at the `512 MiB` floor. Quantization precedes clamping, so an unaligned
-   ceiling or floor is preserved as itself rather than being rounded to a step.
+   Quantization precedes clamping, so an unaligned ceiling or floor is preserved
+   as itself rather than being rounded to a step. `max_memory_mib` still clamps, so
+   a ceiling at or below the reserve holds the commitment at the ceiling from the
+   first usable tick, and a session that has used nothing still commits the reserve
+   (`2048 MiB`) then.
 2. When `memory_available_bytes` is absent **or greater than the reported
    limit** — early boot, a guest without `virtio-balloon`, or the transitional
    window after a shrink — memory commitment is left unchanged for that tick and
@@ -195,6 +204,57 @@ plug window:
 6. The numeric form of all of the above is a Verus kernel (the boundary contract
    in D5); the sampling, the SDK calls and the authority transitions are trusted
    shell with deterministic tests.
+
+#### The cushion is a reserve (amendment)
+
+D3 originally kept `max(256 MiB, 25% of used)` free, which is a *level*: at a
+1.2 GiB build it holds ≈ 300 MiB, so each tick's target moves by only ≈ 1.25×
+that tick's growth in use. Measured by the operator on this stack (2026-11-20,
+macOS 27.2.1 arm64, one vCPU, macOS dev bundle), a guest program that `malloc`s,
+touches every page and holds all of them:
+
+| anon demand | `max(256, used/4)` | `max(2048, used/4)` |
+|---|---|---|
+| 0.31 GiB/s (64 MiB / 200 ms) | survived | survived |
+| 0.63 GiB/s (64 MiB / 100 ms) | OOM-killed at ≈ 2 GiB | survived to 3 GiB |
+| 1.25 GiB/s (64 MiB / 50 ms) | OOM-killed at ≈ 0.5 GiB | survived to 3 GiB |
+| ≈ 4 GiB/s (tight 8 MiB loop) | OOM-killed at ≈ 384 MiB | survived; 2 GiB held in 0.5 s |
+
+Ramps at 2.0–3.1 GiB/s were run only with the reserve, where they also survived.
+
+Provenance: the demand table above, the ramps, the plug latencies below, the
+≈ 2.5 GiB/s absorption calculation and the 3.3/1.3 GiB RSS measurement are operator
+measurements from [#712](https://github.com/gregwebs/agent-vm/issues/712) on the
+2026-11-20 stack named above, not this branch's own evidence. Only the 1.25 GiB/s
+row was re-run on the tree this amendment lands on, recorded in #712's PR body.
+
+The plug is not the limit: a 3.5 GiB target jump reached the guest in ~210 ms and
+a 7.7 GiB one in ~1.1 s. What fails is the *cushion* — the demand inside one
+reaction chain (a 200 ms poll, the balloon sample that poll reads, the apply, the
+plug) exceeds the free memory a level rule keeps, and a level rule cannot buy
+more because it only ever asks for ≈ 25% of what is already resident. A 2048 MiB
+reserve absorbs ≈ 2.5 GiB/s across a 0.8 s chain, with growth landing in time, and
+is clamped by the ceiling. The commitment is not host memory: `virtio-mem`
+allocates on touch and a guest that frees pages returns them, so an unused reserve
+becomes resident only once the guest reaches it. One measurement, anon memory
+touched then freed: 3.3 GiB host RSS while a guest held 3 GiB, 1.3 GiB after —
+nearly free, not free. What the guest actually touches does cost host memory,
+whatever the policy. `used` is the reported limit minus
+`memory_available_bytes`. Clean page cache is reclaimable, so it counts as
+available, and on this stack so does dirty page cache: a guest writing 1.5 GiB
+of file data (`dd if=/dev/zero of=/root/big bs=1M count=1536`, as root) raised
+`Cached` by 1.5 GiB while derived `used` moved 85 → 89 MiB and the target stayed
+at 2176 MiB; a second run of the same 1.5 GiB write sampled 266 MiB of it dirty
+mid-write and ended with `MemAvailable` within 12 MiB of where it started. File
+pages are available to the guest either way. What raises `used` is memory the
+guest cannot hand back — anonymous and shared memory — and boot shows that
+direction: the `Dockerfile.dev` image raises derived use by ≈ 1.66 GiB with no
+user write, taking the target 2176 → 3840 MiB, and the target rejoins the lower
+demand only after the 50-tick dwell. The cache-as-host-cost case is **not
+measured**. The cost is a higher commitment: a session that has used anything
+commits **at least** 2176 MiB (2.125 GiB, ≈ 2.1 GiB), ≈ 72–73% below the 8 GiB
+ceiling — 2176 MiB while use is up to 128 MiB, 2304 MiB (2.25 GiB) at the ≈ 141
+MiB of residual use a settled guest has — rather than the 512 MiB floor.
 
 ### D4. Sustained-saturation CPU tracking
 
@@ -347,7 +407,7 @@ the page walk alone costs about 11.5 ms per tick for a 1 GiB guest (D5.5).
    `boot_memory_mib == min(512, max_memory_mib)`.
    What S2 adds, all verified for **every** `u64`/`u32` input (no `requires`
    narrowing):
-   - `memory_desired_mib` — `clamp(round_up_128(ceil_used + max(256, ceil_used/4)), boot, max)`
+   - `memory_desired_mib` — `clamp(round_up_128(ceil_used + max(2048, ceil_used/4)), boot, max)`
      exactly, with no overflow in any intermediate; in-range results and the
      unclamped case are `128`-aligned, and a clamped endpoint is not forced to be.
    - `memory_tick` — the complete transition table of D3 point 3-5: immediate
@@ -452,9 +512,13 @@ the page walk alone costs about 11.5 ms per tick for a 1 GiB guest (D5.5).
      exits. On the original VM the saved/live divergence is numerically bounded
      but its duration is not; restarting **that retained record** reloads the seed
      and can change its boot floor, so 512 MiB at boot is a *fresh launch*
-     promise. A plain live request equal to the seed can be a statusless no-op, so
-     a genuine change reseeds again; a hold never repairs or rolls back
-     configuration, and abort/join is not transaction rollback.
+     promise. A live request equal to the seed can be a statusless no-op while the
+     saved configuration already holds it, so a genuine change reseeds again; a hold
+     never repairs or rolls back configuration, and abort/join is not transaction
+     rollback. In production that collision is out of reach: `--memory` counts whole
+     GiB with a 2048 MiB reserve, so every live ask is at least 1024 MiB while the
+     candidates are 512, 640 and 768. The candidate sequence remains the kernel's
+     guarantee that a seed differs from both the observed baseline and the target.
    These rules are memory's; the CPU axis keeps the unknown-outcome rule and its
    own durable demand separately (D4.1). A change of authority does **not** clear
    the CPU axis's outstanding demand or its deadline: only progress, or genuinely
@@ -500,8 +564,22 @@ the page walk alone costs about 11.5 ms per tick for a 1 GiB guest (D5.5).
   in-process SDK already owns.
 - **A 256 MiB memory floor.** Rejected: Node.js/agent startup bursts can allocate
   several hundred MiB within a single 200 ms window before `virtio-mem` finishes
-  plugging blocks; 512 MiB provides a safer initial cushion while still saving
-  93.75% of the 8 GiB default ceiling when idle.
+  plugging blocks; 512 MiB provides a safer initial cushion. Boot is 512 MiB,
+  93.75% below the 8 GiB default ceiling; once the D3 monitor settles, a session
+  that has used anything commits at least 2176 MiB (≈ 2.1 GiB), ≈ 72–73% below
+  it.
+- **A 256 MiB / 25%-of-use cushion above the boot floor** (the original D3). Kept
+  the idle commitment at 512 MiB but could not survive a link-class burst; see
+  "The cushion is a reserve". Rejected for OOM safety, not for cost.
+- **A cushion only while the guest is busy** (a reserve that decays once demand
+  stops, or one that applies only above a use threshold). Rejected: the burst it
+  has to survive can *start* the busy period — a cached `cargo build` that only
+  relinks, or the first tool call of a session — and by the time the decayed
+  cushion is refilled the guest is already out of memory.
+- **Jumping to the ceiling instead of adding a reserve.** Rejected: it survives
+  bursts, but a session that alternates work and idleness would plug and unplug
+  the whole ceiling every dwell period. The price of that churn is **not
+  measured**, and the plug is not the limit anyway (see above).
 - **Polling faster than 200 ms.** Not chosen: no measurement shows a shorter
   interval is needed for the controller, and the per-tick residency walk already
   has measurable cost (D4). Separating that scan's cadence from the CPU rate needs
@@ -525,11 +603,19 @@ the page walk alone costs about 11.5 ms per tick for a 1 GiB guest (D5.5).
 
 ## Consequences
 
-- Default launches reserve an 8 GiB / 2 vCPU ceiling and boot at the 512 MiB /
-  1 vCPU boot commitment. Memory then follows D3 (immediate growth, reclamation
-  after 50 lower-demand ticks plus convergence, 200 ms polling). All of those
-  timings are **nominal**: actual sample and monitor timing is not guaranteed, and
-  no wall-clock latency or OOM-safety property follows from them.
+- Default launches set an 8 GiB / 2 vCPU ceiling and boot at the 512 MiB /
+  1 vCPU boot commitment — 93.75% below the ceiling at boot. Memory then follows
+  D3 (immediate growth, reclamation after 50 lower-demand ticks plus convergence,
+  200 ms polling), keeping a 2048 MiB reserve free — so once the monitor settles,
+  a session that has used anything commits **at least** 2176 MiB (2.125 GiB,
+  ≈ 2.1 GiB), ≈ 72–73% below the ceiling rather than at the 512 MiB floor.
+  (2048 MiB / 75% is only the formula's zero-use floor: any use at all, even one
+  byte, puts the target at 2176 MiB, and the ≈ 141 MiB of residual use a settled
+  guest has puts it at 2304 MiB = 2.25 GiB.) All of those timings are
+  **nominal**: actual sample and monitor timing is not guaranteed, and no
+  wall-clock latency or OOM-safety property follows from them. The reserve is
+  what a burst needs inside one reaction chain; it is not a guarantee that a
+  burst cannot outrun the monitor.
 - **Both axes are live (S3).** Memory follows D3; vCPUs follow D4: one step up on
   the 10th consecutive distinct observation at `C * 95%`, one step down on the 5th
   at `(C-1) * 85%`, within `1..=max_cpus`. The 2 s / 1 s figures assume a distinct

@@ -1713,7 +1713,17 @@ runtime with the same `512 MiB` / `1` vCPU shape.
 
 Memory is then a live **memory commitment**. An in-process monitor polls every
 200 ms and moves the target in 128 MiB steps between the 512 MiB floor and the
-`--memory` ceiling, keeping `max(256 MiB, 25% of the guest's used memory)` free:
+`--memory` ceiling, keeping `max(2 GiB, 25% of the guest's used memory)` free. That
+cushion is a reserve, not a margin on use: a compiler or linker faulting pages can
+consume several hundred MiB inside one poll, so a level that tracked use would be
+spent before the next target landed. A session therefore commits at least 2176 MiB
+(2.125 GiB, ≈ 2.1 GiB) once it uses anything at all — ≈ 72–73% below the ceiling, and
+not the 512 MiB floor: 2176 MiB for use up to 128 MiB, 2304 MiB (2.25 GiB) at the
+≈ 141 MiB of residual use a settled guest has. `2048 MiB` alone is only the formula's
+zero-use floor, which no live session reaches. `--memory` clamps the reserve just like
+any other target
+(so at `--memory 1` or `--memory 2` the commitment sits at the ceiling from the
+first usable tick):
 
 - **Growth is immediate**, on the first tick that needs it — including while an
   earlier shrink is still settling.
@@ -1725,8 +1735,10 @@ Memory is then a live **memory commitment**. An in-process monitor polls every
   where the runtime can report more available bytes than the new limit. Missing
   availability is never substituted with another field.
 - Both the poll period and the dwell are nominal: the interval *requests*
-  samples and guarantees neither the rate nor their freshness. Headroom gives an
-  allocation burst room to land but cannot guarantee it.
+  samples and guarantees neither the rate nor their freshness. The reserve gives an
+  allocation burst room to land but cannot guarantee it: a burst that consumes more
+  than the reserve inside one reaction chain (roughly `2 GiB` per `0.8 s`) can
+  still outrun the monitor, and the guest's own OOM killer is what decides then.
 
 Transitions are silent by default: they emit `debug` events under the
 `agent_vm::resources` target, which the launcher's default `warn` filter hides, and
@@ -5457,10 +5469,12 @@ with launch flags as described in [Persisted grants](#persisted-grants-user-conf
   - Restarting **that same retained record** reloads its saved configuration, so
     it can request the seed at boot and boot above the 512 MiB floor. It is not a
     fresh launch; a fresh `agent-vm` launch still requests 512 MiB.
-  - On the original still-running VM, a plain live request for the seed value can
-    be an applied no-op with no status, because the saved configuration already
-    says so. That is why the controller reseeds again on the next genuine change
-    rather than trusting the saved value.
+  - A live request equal to the seed would be an applied no-op with no status,
+    because the saved configuration already says so. That is why the controller
+    reseeds again on the next genuine change rather than trusting the saved value.
+    With the 2048 MiB reserve that request cannot arise: `--memory` counts whole
+    GiB, so every live ask is at least 1024 MiB while the seed candidates are 512,
+    640 and 768.
   - Equal demand holds send no builder call at all, so a hold leaves the seed
     saved. Joining an aborted monitor does not roll a completed write back, and
     nothing cleans it up automatically.

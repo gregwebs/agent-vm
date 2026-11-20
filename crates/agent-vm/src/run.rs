@@ -529,7 +529,10 @@ pub struct Args {
     ///
     /// The session boots at 512 MiB and the live memory commitment then follows
     /// the guest's use, in 128 MiB steps, between that floor and this ceiling
-    /// (ADR-0070). Idle sessions release memory back down.
+    /// (ADR-0070), keeping a 2048 MiB reserve free above use, up to this ceiling. So a
+    /// session that has used anything settles at 2176 MiB (≈ 2.1 GiB) or more rather than
+    /// the floor, and a ceiling at or below the reserve holds the commitment at the
+    /// ceiling from the first usable tick.
     #[arg(
         long,
         env = "AGENT_VM_MEMORY_GIB",

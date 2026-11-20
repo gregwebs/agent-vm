@@ -1175,15 +1175,28 @@ adjusts it.
 _Avoid_: treating the commitment as the ceiling, or as host memory actually
 resident.
 
+**Reaction chain**: the loop from a guest's page fault to free plugged memory it
+can use — the 200 ms poll that observes the demand, the balloon sample that poll
+reads, the live apply, and the guest's own `virtio-mem` plug. Linux does not pause
+page faults waiting for `virtio-mem`, so the **memory commitment**'s reserve has
+to cover demand arriving as a rate across that chain.
+
+_Avoid_: treating the chain as a deadline — its length is nominal.
+
 **Memory commitment**: the memory half of a **resource commitment**, which is
 live. An in-process 200 ms monitor reads the guest's limit and available memory
 and moves the target in 128 MiB steps, never below the boot commitment and never
-above the ceiling, keeping `max(256 MiB, 25% of used)` free. Growth is immediate;
-reclamation needs 50 consecutive lower-demand ticks *and* a limit that has
-converged to the target; a tick without usable availability holds the commitment.
-Both the 200 ms period and the resulting 10 s dwell are nominal: the interval
-requests samples and guarantees no rate. Both axes are live: see the canonical
-[ADR-0070](docs/adr/0070-dynamic-resource-commitment.md) for the exact policy.
+above the ceiling, keeping `max(2 GiB, 25% of used)` free — a reserve of free
+plugged memory covering one **reaction chain**, not a margin on use. Growth is
+immediate; reclamation needs 50 consecutive lower-demand ticks *and* a limit that
+has converged to the target; a tick without usable availability holds the
+commitment. Both the 200 ms period and the resulting 10 s dwell are nominal: the
+interval requests samples and guarantees no rate. Both axes are live: see the
+canonical [ADR-0070](docs/adr/0070-dynamic-resource-commitment.md) for the exact
+policy.
+
+_Avoid_: "reservation" (which in `microsandbox` means the host virtual-address
+aperture `max_memory_mib`), and treating the reserve as a margin on use.
 
 **CPU commitment**: the vCPU half of a **resource commitment**, which is live. The
 same 200 ms monitor grows it by one vCPU on the 10th consecutive **distinct**

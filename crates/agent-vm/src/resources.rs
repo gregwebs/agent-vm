@@ -33,7 +33,14 @@ const BYTES_PER_MIB: u64 = 1024 * 1024;
 /// clamping is deliberate: a ceiling or floor need not be a multiple of the step.
 const MEMORY_STEP_MIB: u64 = 128;
 /// The floor of the free-memory cushion kept above the guest's used MiB.
-const MIN_MEMORY_HEADROOM_MIB: u64 = 256;
+///
+/// A **reserve, not a margin on use**: new memory is usable only after the whole reaction
+/// chain (the poll, the balloon sample it reads, the serialized live apply, the guest's
+/// plug), so the cushion must absorb a burst's *rate* over that chain rather than a fraction
+/// of what is already resident. `max_memory_mib` still clamps it, so a ceiling at or below it
+/// holds the commitment at the ceiling from the first usable tick. Measurements and the
+/// rejected alternatives: ADR-0070 D3, "The cushion is a reserve".
+const MIN_MEMORY_HEADROOM_MIB: u64 = 2048;
 /// 50 ticks at [`METRICS_SAMPLE_INTERVAL`] is a nominal 10 s; the interval requests
 /// samples and guarantees no period.
 const MEMORY_LOW_TICKS: u32 = 50;
@@ -156,7 +163,7 @@ spec fn memory_desired_spec(bounds: MemoryBounds, bytes: int) -> int {
     }
 }
 
-/// `clamp(round_up_128(ceil(used) + max(256, ceil(used)/4)), boot, max)`.
+/// `clamp(round_up_128(ceil(used) + max(MIN_MEMORY_HEADROOM_MIB, ceil(used)/4)), boot, max)`.
 ///
 /// Total over every input: reversed bounds are not a production shape, and returning
 /// `boot` for them keeps the range clauses honest instead of narrowing the domain.
@@ -3188,7 +3195,7 @@ mod tests {
     fn desired_oracle(boot_memory_mib: u32, max_memory_mib: u32, used_bytes: u64) -> u64 {
         let mib = MIB as u128;
         let used_mib = u128::from(used_bytes).div_ceil(mib);
-        let headroom_mib = std::cmp::max(256, used_mib / 4);
+        let headroom_mib = std::cmp::max(2048, used_mib / 4);
         let raw_mib = used_mib + headroom_mib;
         let rounded_mib = raw_mib.div_ceil(128) * 128;
         let clamped = rounded_mib
@@ -3397,42 +3404,48 @@ mod tests {
     // ------------------------------------------------ ADR-0070 D3 pure decisions
 
     #[test]
-    fn idle_memory_stays_at_512_through_256_mib_used() {
-        for used_mib in 0..=256u64 {
-            assert_eq!(
-                memory_desired_mib(adjustable(), used_mib * MIB),
-                512,
-                "used {used_mib} MiB"
-            );
-        }
-        let mut current = memory_state(512, 0);
-        for tick in 0..100 {
-            let next = memory_tick(adjustable(), current, sample(512, 128));
-            assert_eq!(next, memory_state(512, 0), "tick {tick}");
-            current = next;
-        }
+    fn memory_target_keeps_the_reserve_free_above_use() {
+        // The reserve is a fixed amount above use, not a fraction of it: use plus the
+        // reserve, quantized up to the plug step and clamped to the session's interval.
+        assert_eq!(memory_desired_mib(adjustable(), 0), 2048);
+        assert_eq!(memory_desired_mib(adjustable(), 256 * MIB), 2304);
+        assert_eq!(memory_desired_mib(adjustable(), 512 * MIB), 2560);
+        assert_eq!(memory_desired_mib(adjustable(), 1024 * MIB), 3072);
+        assert_eq!(memory_desired_mib(adjustable(), 2048 * MIB), 4096);
+        assert_eq!(memory_desired_mib(adjustable(), 4096 * MIB), 6144);
+        assert_eq!(memory_desired_mib(adjustable(), 6144 * MIB), 8192);
+        // Past the point where the ceiling cannot hold the reserve, it is the ceiling.
+        assert_eq!(memory_desired_mib(adjustable(), 6145 * MIB), 8192);
+        assert_eq!(memory_desired_mib(adjustable(), 8192 * MIB), 8192);
+        // Use/4 only outgrows the reserve above 8 GiB of use.
+        assert_eq!(
+            memory_desired_mib(bounds(512, 32 * 1024), 16 * 1024 * MIB),
+            20 * 1024
+        );
+        // The first tick a real session sees asks for the reserve instead of waiting
+        // for the guest to approach its boot floor.
+        let next = memory_tick(adjustable(), memory_state(512, 0), sample(512, 128));
+        assert_eq!(next, memory_state(2176, 0));
     }
 
     #[test]
     fn partial_mib_use_rounds_up_before_headroom() {
-        assert_eq!(memory_desired_mib(adjustable(), 256 * MIB), 512);
-        assert_eq!(memory_desired_mib(adjustable(), 256 * MIB + 1), 640);
-        assert_eq!(memory_desired_mib(adjustable(), 0), 512);
-        assert_eq!(memory_desired_mib(adjustable(), 1), 512);
-        // The MiB boundary itself cannot move the floor: two whole MiB of use and the
-        // minimum headroom still quantize below the boot commitment.
-        assert_eq!(memory_desired_mib(adjustable(), MIB - 1), 512);
-        assert_eq!(memory_desired_mib(adjustable(), MIB), 512);
-        assert_eq!(memory_desired_mib(adjustable(), MIB + 1), 512);
+        // The MiB ceiling is what the reserve is added to, so a fraction of a MiB of
+        // use cannot hide below it.
+        assert_eq!(memory_desired_mib(adjustable(), 0), 2048);
+        assert_eq!(memory_desired_mib(adjustable(), 1), 2176);
+        assert_eq!(memory_desired_mib(adjustable(), MIB - 1), 2176);
+        assert_eq!(memory_desired_mib(adjustable(), MIB), 2176);
+        assert_eq!(memory_desired_mib(adjustable(), MIB + 1), 2176);
     }
 
     #[test]
     fn memory_targets_quantize_before_clamping() {
-        assert_eq!(memory_desired_mib(adjustable(), 400 * MIB), 768);
-        assert_eq!(memory_desired_mib(adjustable(), 1024 * MIB), 1280);
-        assert_eq!(memory_desired_mib(adjustable(), 2048 * MIB), 2560);
+        assert_eq!(memory_desired_mib(adjustable(), 400 * MIB), 2560);
+        assert_eq!(memory_desired_mib(adjustable(), 1024 * MIB), 3072);
+        assert_eq!(memory_desired_mib(adjustable(), 2048 * MIB), 4096);
         // Clamp after quantizing, so an unaligned endpoint survives as itself.
-        assert_eq!(memory_desired_mib(bounds(600, 8192), 64 * MIB), 600);
+        assert_eq!(memory_desired_mib(bounds(2300, 8192), 0), 2300);
         assert_eq!(memory_desired_mib(bounds(512, 1000), 2048 * MIB), 1000);
     }
 
@@ -3460,7 +3473,11 @@ mod tests {
                 );
             }
         }
-        for (used, expected) in [(0, 512u64), (u64::MAX, 8192), (u32::MAX as u64 * MIB, 8192)] {
+        for (used, expected) in [
+            (0, 2048u64),
+            (u64::MAX, 8192),
+            (u32::MAX as u64 * MIB, 8192),
+        ] {
             assert_eq!(
                 u64::from(memory_desired_mib(adjustable(), used)),
                 expected,
@@ -3485,27 +3502,28 @@ mod tests {
     fn memory_rebase_matches_authority_and_baseline_contract() {
         let standard = adjustable();
         // Confirmed: the accepted baseline is kept, whatever the observation says.
-        for observed in [Some(896), None] {
+        for observed in [Some(2176), None] {
             assert_eq!(
-                memory_rebase(standard, memory_state(1024, 49), false, observed),
-                memory_state(1024, 49),
+                memory_rebase(standard, memory_state(2304, 49), false, observed),
+                memory_state(2304, 49),
                 "confirmed with {observed:?}"
             );
         }
         // Recovering with a changed observation: the observation becomes the baseline
         // and the low run starts over, so the following tick counts 1, not 50.
-        let changed = memory_rebase(standard, memory_state(1024, 49), true, Some(896));
-        assert_eq!(changed, memory_state(896, 0));
+        let changed = memory_rebase(standard, memory_state(2304, 49), true, Some(2176));
+        assert_eq!(changed, memory_state(2176, 0));
         assert_eq!(
-            memory_tick(standard, changed, sample(896, 128)),
-            memory_state(896, 1)
+            memory_tick(standard, changed, sample(2176, 0)),
+            memory_state(2176, 1)
         );
-        // Recovering with the same observation: the low run survives untouched.
-        let stable = memory_rebase(standard, memory_state(1024, 49), true, Some(1024));
-        assert_eq!(stable, memory_state(1024, 49));
+        // Recovering with the same observation: the low run survives untouched, so a
+        // converged limit adopts on that very tick.
+        let stable = memory_rebase(standard, memory_state(2304, 49), true, Some(2304));
+        assert_eq!(stable, memory_state(2304, 49));
         assert_eq!(
-            memory_tick(standard, stable, sample(1024, 128)),
-            memory_state(512, 0)
+            memory_tick(standard, stable, sample(2304, 0)),
+            memory_state(2048, 0)
         );
         // Recovering with no usable observation: baseline kept, run discarded.
         for unusable in [None, Some(511), Some(8193)] {
@@ -3517,16 +3535,16 @@ mod tests {
         }
         // Equal demand or no availability resets the run through the ordinary tick.
         assert_eq!(
-            memory_tick(standard, memory_state(1024, 49), sample(1024, 700)),
-            memory_state(1024, 0)
+            memory_tick(standard, memory_state(2304, 49), sample(2304, 256)),
+            memory_state(2304, 0)
         );
         let quiet = MemorySample {
-            memory_limit_bytes: 1024 * MIB,
+            memory_limit_bytes: 2304 * MIB,
             memory_available_bytes: None,
         };
         assert_eq!(
-            memory_tick(standard, memory_state(1024, 49), quiet),
-            memory_state(1024, 0)
+            memory_tick(standard, memory_state(2304, 49), quiet),
+            memory_state(2304, 0)
         );
         // Extreme and reversed inputs, with independent branch expectations.
         assert_eq!(
@@ -3548,7 +3566,7 @@ mod tests {
         for prior_low in [0u32, 1, 49, 50] {
             assert_eq!(
                 memory_tick(adjustable(), memory_state(512, prior_low), sample(512, 400)),
-                memory_state(768, 0),
+                memory_state(2560, 0),
                 "prior low run {prior_low}"
             );
         }
@@ -3556,73 +3574,73 @@ mod tests {
 
     #[test]
     fn memory_scale_down_requires_50_consecutive_low_ticks() {
-        let mut current = memory_state(1024, 0);
+        let mut current = memory_state(2304, 0);
         for tick in 1..50 {
-            current = memory_tick(adjustable(), current, sample(1024, 128));
-            assert_eq!(current, memory_state(1024, tick), "tick {tick}");
+            current = memory_tick(adjustable(), current, sample(2304, 0));
+            assert_eq!(current, memory_state(2304, tick), "tick {tick}");
         }
         assert_eq!(
-            memory_tick(adjustable(), current, sample(1024, 128)),
-            memory_state(512, 0),
+            memory_tick(adjustable(), current, sample(2304, 0)),
+            memory_state(2048, 0),
             "the 50th consecutive low tick reclaims"
         );
     }
 
     #[test]
     fn memory_scale_down_waits_for_convergence_after_50_ticks() {
-        let mut current = memory_state(1024, 0);
+        let mut current = memory_state(2304, 0);
         for tick in 1..=75u32 {
-            current = memory_tick(adjustable(), current, sample(1536, 128));
+            current = memory_tick(adjustable(), current, sample(2816, 0));
             assert_eq!(
                 current,
-                memory_state(1024, tick.min(50)),
+                memory_state(2304, tick.min(50)),
                 "a limit above the target never converges, tick {tick}"
             );
         }
         // A fractional-byte limit is not convergence either.
         let fractional = MemorySample {
-            memory_limit_bytes: 1024 * MIB + 1,
-            memory_available_bytes: Some((1024 - 128) * MIB),
+            memory_limit_bytes: 2304 * MIB + 1,
+            memory_available_bytes: Some(2304 * MIB),
         };
         assert_eq!(
             memory_tick(adjustable(), current, fractional),
-            memory_state(1024, 50)
+            memory_state(2304, 50)
         );
         assert_eq!(
-            memory_tick(adjustable(), current, sample(1024, 128)),
-            memory_state(512, 0),
+            memory_tick(adjustable(), current, sample(2304, 0)),
+            memory_state(2048, 0),
             "the first converged tick adopts once the run is complete"
         );
     }
 
     #[test]
     fn equal_or_missing_availability_resets_low_ticks() {
-        let mut current = memory_state(1024, 0);
+        let mut current = memory_state(2304, 0);
         for _ in 0..49 {
-            current = memory_tick(adjustable(), current, sample(1024, 128));
+            current = memory_tick(adjustable(), current, sample(2304, 0));
         }
-        assert_eq!(current, memory_state(1024, 49));
+        assert_eq!(current, memory_state(2304, 49));
         // Equal demand resets: the next 49 lows do not reclaim, the 50th does.
-        current = memory_tick(adjustable(), current, sample(1024, 700));
-        assert_eq!(current, memory_state(1024, 0));
+        current = memory_tick(adjustable(), current, sample(2304, 256));
+        assert_eq!(current, memory_state(2304, 0));
         for _ in 0..49 {
-            current = memory_tick(adjustable(), current, sample(1024, 128));
+            current = memory_tick(adjustable(), current, sample(2304, 0));
         }
-        assert_eq!(current, memory_state(1024, 49));
+        assert_eq!(current, memory_state(2304, 49));
         // Missing availability resets the same way.
         let quiet = MemorySample {
-            memory_limit_bytes: 1024 * MIB,
+            memory_limit_bytes: 2304 * MIB,
             memory_available_bytes: None,
         };
         current = memory_tick(adjustable(), current, quiet);
-        assert_eq!(current, memory_state(1024, 0));
+        assert_eq!(current, memory_state(2304, 0));
         for _ in 0..49 {
-            current = memory_tick(adjustable(), current, sample(1024, 128));
+            current = memory_tick(adjustable(), current, sample(2304, 0));
         }
-        assert_eq!(current, memory_state(1024, 49));
+        assert_eq!(current, memory_state(2304, 49));
         assert_eq!(
-            memory_tick(adjustable(), current, sample(1024, 128)),
-            memory_state(512, 0)
+            memory_tick(adjustable(), current, sample(2304, 0)),
+            memory_state(2048, 0)
         );
     }
 
@@ -3643,42 +3661,42 @@ mod tests {
 
     #[test]
     fn urgent_growth_supersedes_unconverged_memory_shrink() {
-        // A confirmed downsize to 512 while the guest still holds 1024: growth is
+        // A confirmed downsize to 2048 while the guest still holds 2304: growth is
         // immediate because the decision baseline is the accepted target, not actual RAM.
-        let accepting = memory_state(1024, 49);
+        let accepting = memory_state(2304, 49);
         assert_eq!(
-            memory_tick(adjustable(), accepting, sample(1024, 800)),
-            memory_state(1152, 0)
+            memory_tick(adjustable(), accepting, sample(2304, 800)),
+            memory_state(2944, 0)
         );
         // And after the shrink is accepted, a high sample from the old limit still grows.
         assert_eq!(
-            memory_tick(adjustable(), memory_state(512, 0), sample(1024, 800)),
-            memory_state(1152, 0)
+            memory_tick(adjustable(), memory_state(2048, 0), sample(2304, 800)),
+            memory_state(2944, 0)
         );
     }
 
     #[test]
     fn changing_low_desired_values_keep_the_low_run() {
-        let mut current = memory_state(1024, 0);
+        let mut current = memory_state(2304, 0);
         for tick in 1..50u32 {
-            // Alternate between two lower desired values: 640 and 512.
-            let used_mib = if tick % 2 == 0 { 400 } else { 128 };
-            current = memory_tick(adjustable(), current, sample(1024, used_mib));
-            assert_eq!(current, memory_state(1024, tick), "tick {tick}");
+            // Alternate between two lower desired values: 2176 and 2048.
+            let used_mib = if tick % 2 == 0 { 128 } else { 0 };
+            current = memory_tick(adjustable(), current, sample(2304, used_mib));
+            assert_eq!(current, memory_state(2304, tick), "tick {tick}");
         }
-        // The 50th adopts the value proposed on that tick (used 128 -> 512), not the first.
+        // The 50th adopts the value proposed on that tick (used 0 -> 2048), not the first.
         assert_eq!(
-            memory_tick(adjustable(), current, sample(1024, 128)),
-            memory_state(512, 0)
+            memory_tick(adjustable(), current, sample(2304, 0)),
+            memory_state(2048, 0)
         );
-        let mut current = memory_state(1024, 0);
+        let mut current = memory_state(2304, 0);
         for tick in 1..50u32 {
-            let used_mib = if tick % 2 == 0 { 128 } else { 400 };
-            current = memory_tick(adjustable(), current, sample(1024, used_mib));
+            let used_mib = if tick % 2 == 0 { 0 } else { 128 };
+            current = memory_tick(adjustable(), current, sample(2304, used_mib));
         }
         assert_eq!(
-            memory_tick(adjustable(), current, sample(1024, 400)),
-            memory_state(768, 0)
+            memory_tick(adjustable(), current, sample(2304, 128)),
+            memory_state(2176, 0)
         );
     }
 
@@ -3735,10 +3753,10 @@ mod tests {
         assert_eq!(
             memory_tick(
                 adjustable(),
-                memory_state(1024, u32::MAX),
-                sample(1024, 128)
+                memory_state(2816, u32::MAX),
+                sample(2816, 128)
             ),
-            memory_state(512, 0)
+            memory_state(2176, 0)
         );
     }
 
@@ -4064,30 +4082,27 @@ mod tests {
     async fn memory_stream_emits_only_confirmed_target_changes() {
         let bounds = adjustable();
         let log = policy_log([
-            ScriptedAnswer::Accept(768),
-            ScriptedAnswer::Accept(512),
-            ScriptedAnswer::Accept(896),
+            ScriptedAnswer::Accept(2560),
+            ScriptedAnswer::Accept(2176),
+            ScriptedAnswer::Accept(2560),
             ScriptedAnswer::Fail,
-            ScriptedAnswer::Accept(1024),
+            ScriptedAnswer::Accept(2816),
         ]);
-        let mut rows = vec![(512u64, 128u64), (512, 400)];
-        rows.extend(std::iter::repeat_n((768, 128), 49));
-        rows.push((1024, 128));
-        rows.push((768, 128));
-        rows.push((768, 600));
+        // Hold, grow, reclaim on the converged 50th low tick, grow again, a growth that
+        // fails with an unknown outcome, then the ask after it.
+        let mut rows = vec![(2304u64, 256u64), (2304, 512)];
+        rows.extend(std::iter::repeat_n((2560, 128), 49));
+        rows.push((2560, 128));
+        rows.push((2176, 512));
+        rows.push((2176, 600));
         let mut stream = samples_of(&rows);
-        stream.push(Ok(Some(MemorySample {
-            memory_limit_bytes: 768 * MIB,
-            memory_available_bytes: None,
-        })));
         stream.push(Err(anyhow::anyhow!("scripted metrics lookup failure")));
-        stream.push(Ok(Some(sample(896, 800))));
-        stream.push(Ok(Some(sample(896, 800))));
-        let mut tail = samples_of(&vec![(1024u64, 768u64); 50]);
+        stream.push(Ok(Some(sample(2560, 896))));
+        let mut tail = samples_of(&vec![(2816u64, 768u64); 50]);
         stream.append(&mut tail);
 
         let final_state =
-            drive_scripted(bounds, confirmed(512, 0), stream, std::rc::Rc::clone(&log)).await;
+            drive_scripted(bounds, confirmed(2304, 0), stream, std::rc::Rc::clone(&log)).await;
 
         let log = log.borrow();
         assert!(
@@ -4099,35 +4114,40 @@ mod tests {
                 .iter()
                 .map(|request| request.target_mib)
                 .collect::<Vec<_>>(),
-            vec![768, 512, 896, 1152, 1152]
+            vec![2560, 2176, 2560, 2688, 2944]
         );
-        // Row 9 requested 1152 and was answered with 1024: the receipt, not the request,
-        // becomes the accepted target.
-        assert_eq!(final_state.policy, memory_state(1024, 0));
+        // The last request asked for 2944 and was answered with 2816: the receipt, not the
+        // request, becomes the accepted target.
+        assert_eq!(final_state.policy, memory_state(2816, 0));
         assert_eq!(final_state.authority, TargetAuthority::Confirmed);
-        assert_eq!(final_state.last_accepted_target_mib, 1024);
+        assert_eq!(final_state.last_accepted_target_mib, 2816);
     }
 
     #[tokio::test]
     async fn demand_above_the_ceiling_stops_at_the_top_without_asking_again() {
-        // A 1 GiB ceiling, the smallest adjustable production launch: the guest climbs to the
-        // top, then keeps using everything it has (availability zero at `limit == max`). The
-        // controller must hold the ceiling rather than ask the runtime for more, and it must
-        // still be able to leave the top afterwards.
-        let ceiling = bounds(512, 1024);
+        // A ceiling just above the reserve, so a step exists between the floor and the top:
+        // the guest climbs to the top, then keeps using everything it has (availability zero
+        // at `limit == max`). The controller must hold the ceiling rather than ask the
+        // runtime for more, and it must still be able to leave the top afterwards.
+        let ceiling = bounds(2304, 2816);
         let log = policy_log([
-            ScriptedAnswer::Accept(768),
-            ScriptedAnswer::Accept(1024),
-            ScriptedAnswer::Accept(512),
+            ScriptedAnswer::Accept(2560),
+            ScriptedAnswer::Accept(2816),
+            ScriptedAnswer::Accept(2304),
         ]);
-        let mut rows = vec![(512u64, 480u64), (768, 700)];
-        rows.extend(std::iter::repeat_n((1024, 1024), 30));
-        rows.extend(lows(49, 1024, 128));
+        let mut rows = vec![(2304u64, 480u64), (2560, 700)];
+        rows.extend(std::iter::repeat_n((2816, 2816), 30));
+        rows.extend(lows(49, 2816, 128));
         let mut stream = samples_of(&rows);
-        stream.push(Ok(Some(sample(1024, 128))));
+        stream.push(Ok(Some(sample(2816, 128))));
 
-        let final_state =
-            drive_scripted(ceiling, confirmed(512, 0), stream, std::rc::Rc::clone(&log)).await;
+        let final_state = drive_scripted(
+            ceiling,
+            confirmed(2304, 0),
+            stream,
+            std::rc::Rc::clone(&log),
+        )
+        .await;
 
         let log = log.borrow();
         assert!(log.answers.is_empty(), "every scripted answer was consumed");
@@ -4136,31 +4156,86 @@ mod tests {
                 .iter()
                 .map(|request| request.target_mib)
                 .collect::<Vec<_>>(),
-            vec![768, 1024, 512],
+            vec![2560, 2816, 2304],
             "one request to reach the ceiling, none while it is exhausted, one to leave"
         );
         // Nothing asked for more than the ceiling, so no request can be clamped or refused.
         assert!(
             log.requests
                 .iter()
-                .all(|request| request.target_mib <= 1024),
+                .all(|request| request.target_mib <= 2816),
             "a request above the ceiling would be a plan the runtime cannot honour"
         );
-        assert_eq!(final_state.policy, memory_state(512, 0));
+        assert_eq!(final_state.policy, memory_state(2304, 0));
         assert_eq!(final_state.authority, TargetAuthority::Confirmed);
         // The same two facts at the decision seam the driver calls: at the top with the guest
         // using all of it, the proposal is the current target and the low run is untouched.
-        let at_top = memory_state(1024, 0);
+        let at_top = memory_state(2816, 0);
         assert_eq!(
-            memory_tick(ceiling, at_top, sample(1024, 1024)),
-            memory_state(1024, 0),
+            memory_tick(ceiling, at_top, sample(2816, 2816)),
+            memory_state(2816, 0),
             "demand above the ceiling proposes nothing above it"
         );
         assert_eq!(
-            memory_desired_mib(ceiling, 1024 * MIB),
-            1024,
+            memory_desired_mib(ceiling, 2816 * MIB),
+            2816,
             "the ceiling is the clamp, not a value above it"
         );
+    }
+
+    #[tokio::test]
+    async fn a_ceiling_at_or_below_the_reserve_holds_the_ceiling() {
+        // `--memory 1` and `--memory 2`, the production shapes whose ceiling cannot hold the
+        // reserve: the first usable tick asks for the ceiling, and no later demand, however
+        // low, ever leaves it.
+        //
+        // Which row separates the rules: the 1024 MiB one, at any reserve below 897 MiB —
+        // `clamp(round_up_128(reserve), 512, 1024)` reaches 1024 from 897 and returns 896 at
+        // 896, so at the old 256 MiB reserve the `desired_mib` assertion above fails before
+        // any driver step could be recorded. The 2048 MiB row separates them only while the
+        // reserve is 1920 MiB or less, because `round_up_128(reserve)` reaches 2048 from
+        // 1921. The 1000 equal-demand rows pin what no other test asserts at a production
+        // shape: that a later, lower demand never leaves the ceiling.
+        for ceiling_mib in [1024u32, 2048] {
+            let ceiling = bounds(512, ceiling_mib);
+            let top = u64::from(ceiling_mib);
+            for used in [0, 1, MIB, 128 * MIB, top * MIB, u64::MAX] {
+                assert_eq!(
+                    memory_desired_mib(ceiling, used),
+                    ceiling_mib,
+                    "{ceiling_mib} MiB ceiling, used {used} bytes"
+                );
+            }
+            let log = policy_log([ScriptedAnswer::Accept(ceiling_mib)]);
+            let mut rows = vec![(512u64, 128u64)];
+            rows.extend(lows(1000, top, 0));
+            let final_state = drive_scripted(
+                ceiling,
+                confirmed(512, 0),
+                samples_of(&rows),
+                std::rc::Rc::clone(&log),
+            )
+            .await;
+            assert_eq!(
+                log.borrow()
+                    .requests
+                    .iter()
+                    .map(|request| request.target_mib)
+                    .collect::<Vec<_>>(),
+                vec![ceiling_mib],
+                "{ceiling_mib} MiB: one ask on the first tick, none after"
+            );
+            assert_eq!(
+                final_state.policy,
+                memory_state(ceiling_mib, 0),
+                "{ceiling_mib} MiB"
+            );
+            assert_eq!(
+                final_state.authority,
+                TargetAuthority::Confirmed,
+                "{ceiling_mib} MiB"
+            );
+        }
     }
 
     #[tokio::test]
@@ -4171,7 +4246,7 @@ mod tests {
         // asserted directly, which is what makes this row discriminate the reset.
         for gap in ["metrics error", "missing slot"] {
             let bounds = adjustable();
-            let log = policy_log([ScriptedAnswer::Accept(512), ScriptedAnswer::Accept(768)]);
+            let log = policy_log([ScriptedAnswer::Accept(2176), ScriptedAnswer::Accept(2560)]);
             let gap_row = || match gap {
                 "metrics error" => Err(anyhow::anyhow!("scripted metrics lookup failure")),
                 _ => Ok(None),
@@ -4182,30 +4257,30 @@ mod tests {
                 async move { drive_scripted(bounds, from, rows, log).await }
             };
 
-            let after_lows = tick(confirmed(1024, 0), samples_of(&lows(49, 1024, 128))).await;
-            assert_eq!(after_lows.policy, memory_state(1024, 49), "{gap}");
+            let after_lows = tick(confirmed(2816, 0), samples_of(&lows(49, 2816, 128))).await;
+            assert_eq!(after_lows.policy, memory_state(2816, 49), "{gap}");
             assert!(log.borrow().requests.is_empty(), "{gap}");
 
             // The gap itself: the target holds, and the run is discarded.
             let after_gap = tick(after_lows, vec![gap_row()]).await;
             assert_eq!(
                 after_gap.policy,
-                memory_state(1024, 0),
+                memory_state(2816, 0),
                 "{gap}: the interrupted run is discarded, not carried"
             );
             assert!(log.borrow().requests.is_empty(), "{gap}");
 
             // 49 more lows must not reclaim: the run restarts from the gap.
-            let after_restart = tick(after_gap, samples_of(&lows(49, 1024, 128))).await;
-            assert_eq!(after_restart.policy, memory_state(1024, 49), "{gap}");
+            let after_restart = tick(after_gap, samples_of(&lows(49, 2816, 128))).await;
+            assert_eq!(after_restart.policy, memory_state(2816, 49), "{gap}");
             assert!(
                 log.borrow().requests.is_empty(),
                 "{gap}: a carried counter would have reclaimed during these 49 ticks"
             );
 
             // The 50th does, then a later growth still succeeds.
-            let mut tail = samples_of(&lows(1, 1024, 128));
-            tail.push(Ok(Some(sample(512, 400))));
+            let mut tail = samples_of(&lows(1, 2816, 128));
+            tail.push(Ok(Some(sample(2304, 400))));
             let final_state = tick(after_restart, tail).await;
 
             let log = log.borrow();
@@ -4215,10 +4290,10 @@ mod tests {
                     .iter()
                     .map(|request| request.target_mib)
                     .collect::<Vec<_>>(),
-                vec![512, 768],
+                vec![2176, 2560],
                 "{gap}: one reclaim after the interrupted run, then a later growth"
             );
-            assert_eq!(final_state.policy, memory_state(768, 0), "{gap}");
+            assert_eq!(final_state.policy, memory_state(2560, 0), "{gap}");
             assert_eq!(final_state.authority, TargetAuthority::Confirmed, "{gap}");
         }
     }
@@ -4226,7 +4301,7 @@ mod tests {
     #[tokio::test]
     async fn modify_errors_keep_the_session_alive_and_retry() {
         // A no-effect growth failure: the next observation rebases and retries the growth.
-        let log = policy_log([ScriptedAnswer::Fail, ScriptedAnswer::Accept(768)]);
+        let log = policy_log([ScriptedAnswer::Fail, ScriptedAnswer::Accept(2560)]);
         let after_error = drive_scripted(
             adjustable(),
             confirmed(512, 0),
@@ -4245,34 +4320,34 @@ mod tests {
         )
         .await;
         assert_eq!(final_state.authority, TargetAuthority::Confirmed);
-        assert_eq!(final_state.policy, memory_state(768, 0));
-        assert_eq!(final_state.last_accepted_target_mib, 768);
+        assert_eq!(final_state.policy, memory_state(2560, 0));
+        assert_eq!(final_state.last_accepted_target_mib, 2560);
         assert_eq!(log.borrow().requests.len(), 2);
 
         // A no-effect downsize failure against a stable observed baseline: the dwell starts
         // over and needs its own 50 ticks.
-        let log = policy_log([ScriptedAnswer::Fail, ScriptedAnswer::Accept(512)]);
+        let log = policy_log([ScriptedAnswer::Fail, ScriptedAnswer::Accept(2176)]);
         let after_error = drive_scripted(
             adjustable(),
-            confirmed(1024, 49),
-            samples_of(&[(1024, 128)]),
+            confirmed(2816, 49),
+            samples_of(&[(2816, 128)]),
             std::rc::Rc::clone(&log),
         )
         .await;
         assert_eq!(after_error.authority, TargetAuthority::Recovering);
-        assert_eq!(after_error.policy, memory_state(1024, 0));
+        assert_eq!(after_error.policy, memory_state(2816, 0));
         let mid = drive_scripted(
             adjustable(),
             after_error,
-            samples_of(&lows(49, 1024, 128)),
+            samples_of(&lows(49, 2816, 128)),
             std::rc::Rc::clone(&log),
         )
         .await;
-        assert_eq!(mid.policy, memory_state(1024, 49));
+        assert_eq!(mid.policy, memory_state(2816, 49));
         assert_eq!(mid.authority, TargetAuthority::Recovering);
-        let rows = vec![Ok(Some(sample(1024, 128)))];
+        let rows = vec![Ok(Some(sample(2816, 128)))];
         let final_state = drive_scripted(adjustable(), mid, rows, std::rc::Rc::clone(&log)).await;
-        assert_eq!(final_state.policy, memory_state(512, 0));
+        assert_eq!(final_state.policy, memory_state(2176, 0));
         assert_eq!(final_state.authority, TargetAuthority::Confirmed);
         assert_eq!(
             log.borrow()
@@ -4280,7 +4355,7 @@ mod tests {
                 .iter()
                 .map(|request| request.target_mib)
                 .collect::<Vec<_>>(),
-            vec![512, 512]
+            vec![2176, 2176]
         );
     }
 
@@ -4803,17 +4878,17 @@ mod tests {
         tokio::time::pause();
         let bounds = ResourceBounds {
             cpu: cpu_bounds(1, 4),
-            memory: bounds(512, 1024),
+            memory: bounds(2304, 2816),
         };
         // CPU is one observation from a step and memory needs growth on the same row.
-        let mut from = resource_state(1, 512);
+        let mut from = resource_state(1, 2304);
         from.cpu.policy.high_ticks = CPU_HIGH_TICKS - 1;
-        let vm = FakeResources::new(1, 512);
+        let vm = FakeResources::new(1, 2304);
         let probes = fresh_probes();
         let final_state = drive_resources_fake(
             bounds,
             from,
-            futures::stream::iter(vec![Ok(Some(resource_sample(10, 95.0, 512, 512)))]),
+            futures::stream::iter(vec![Ok(Some(resource_sample(10, 95.0, 2304, 512)))]),
             std::sync::Arc::clone(&vm),
             CpuLifecycle::Running,
             std::sync::Arc::clone(&probes),
@@ -4825,16 +4900,16 @@ mod tests {
                 ResourceApplyMode::Live,
                 ResourceTargets {
                     cpus: Some(2),
-                    memory_mib: Some(768),
+                    memory_mib: Some(2560),
                 },
             )],
             "one builder, one live apply, both fields"
         );
-        assert_eq!(vm.enforced(), (2, 768));
-        assert_eq!(vm.desired(), (2, 768));
+        assert_eq!(vm.enforced(), (2, 2560));
+        assert_eq!(vm.desired(), (2, 2560));
         assert_eq!(final_state.cpu.policy.current_cpus, 2);
         assert_eq!(final_state.cpu.authority, TargetAuthority::Confirmed);
-        assert_eq!(final_state.memory.policy.current_target_mib, 768);
+        assert_eq!(final_state.memory.policy.current_target_mib, 2560);
         assert_eq!(probe_count(&probes), 0, "a fresh cache needs no probe");
     }
 
@@ -4843,17 +4918,17 @@ mod tests {
         tokio::time::pause();
         let bounds = ResourceBounds {
             cpu: cpu_bounds(1, 4),
-            memory: bounds(512, 1024),
+            memory: bounds(2304, 2816),
         };
         // CPU only: a completed high run, memory already converged.
-        let vm = FakeResources::new(1, 512);
+        let vm = FakeResources::new(1, 2304);
         let probes = fresh_probes();
-        let mut from = resource_state(1, 512);
+        let mut from = resource_state(1, 2304);
         from.cpu.policy.high_ticks = CPU_HIGH_TICKS - 1;
         let final_state = drive_resources_fake(
             bounds,
             from,
-            futures::stream::iter(vec![Ok(Some(resource_sample(10, 95.0, 512, 256)))]),
+            futures::stream::iter(vec![Ok(Some(resource_sample(10, 95.0, 2304, 256)))]),
             std::sync::Arc::clone(&vm),
             CpuLifecycle::Running,
             std::sync::Arc::clone(&probes),
@@ -4865,12 +4940,12 @@ mod tests {
         assert_eq!(final_state.cpu.policy.current_cpus, 2);
 
         // Memory only: a growing memory need with CPU in deadband at 2.
-        let vm = FakeResources::new(2, 512);
+        let vm = FakeResources::new(2, 2304);
         let probes = fresh_probes();
         let final_state = drive_resources_fake(
             bounds,
-            resource_state(2, 512),
-            futures::stream::iter(vec![Ok(Some(resource_sample(10, 100.0, 512, 512)))]),
+            resource_state(2, 2304),
+            futures::stream::iter(vec![Ok(Some(resource_sample(10, 100.0, 2304, 512)))]),
             std::sync::Arc::clone(&vm),
             CpuLifecycle::Running,
             std::sync::Arc::clone(&probes),
@@ -4878,16 +4953,16 @@ mod tests {
         .await;
         assert_eq!(vm.applies().len(), 1);
         assert_eq!(vm.applies()[0].1.cpus, None);
-        assert_eq!(vm.applies()[0].1.memory_mib, Some(768));
-        assert_eq!(final_state.memory.policy.current_target_mib, 768);
+        assert_eq!(vm.applies()[0].1.memory_mib, Some(2560));
+        assert_eq!(final_state.memory.policy.current_target_mib, 2560);
 
         // Neither: a deadband row with converged memory emits no call at all.
-        let vm = FakeResources::new(2, 512);
+        let vm = FakeResources::new(2, 2304);
         let probes = fresh_probes();
         let _final_state = drive_resources_fake(
             bounds,
-            resource_state(2, 512),
-            futures::stream::iter(vec![Ok(Some(resource_sample(10, 100.0, 512, 256)))]),
+            resource_state(2, 2304),
+            futures::stream::iter(vec![Ok(Some(resource_sample(10, 100.0, 2304, 256)))]),
             std::sync::Arc::clone(&vm),
             CpuLifecycle::Running,
             std::sync::Arc::clone(&probes),
@@ -5162,17 +5237,17 @@ mod tests {
         tokio::time::pause();
         let bounds = ResourceBounds {
             cpu: cpu_bounds(1, 4),
-            memory: bounds(512, 1024),
+            memory: bounds(2304, 2816),
         };
-        let vm = FakeResources::new(1, 512);
+        let vm = FakeResources::new(1, 2304);
         let probes = fresh_probes();
-        let mut from = resource_state(1, 512);
+        let mut from = resource_state(1, 2304);
         // No cached eligibility: a probe would be needed for CPU.
         from.cpu_lifecycle = CpuLifecycleCache::default();
         let final_state = drive_resources_fake(
             bounds,
             from,
-            futures::stream::iter(vec![Ok(Some(resource_sample(10, 95.0, 512, 512)))]),
+            futures::stream::iter(vec![Ok(Some(resource_sample(10, 95.0, 2304, 512)))]),
             std::sync::Arc::clone(&vm),
             CpuLifecycle::Running,
             std::sync::Arc::clone(&probes),
@@ -5185,7 +5260,7 @@ mod tests {
                 ResourceApplyMode::Live,
                 ResourceTargets {
                     cpus: None,
-                    memory_mib: Some(768),
+                    memory_mib: Some(2560),
                 },
             )]
         );
@@ -7317,7 +7392,7 @@ mod tests {
             TargetAuthority::Confirmed,
             "a single failure still recovers on its own"
         );
-        assert_eq!(state.policy, memory_state(768, 0));
+        assert_eq!(state.policy, memory_state(2560, 0));
         assert_eq!(vm.policy_requests().len(), 2);
         assert_eq!(vm.control_requests().len(), 1);
 
@@ -7332,7 +7407,7 @@ mod tests {
             std::sync::Arc::clone(&vm),
         )
         .await;
-        assert_eq!(vm.policy_requests(), vec![768, 768]);
+        assert_eq!(vm.policy_requests(), vec![2560, 2560]);
         assert_eq!(state.authority, TargetAuthority::Confirmed);
     }
 
@@ -7345,7 +7420,7 @@ mod tests {
             ScriptedAnswer::Fail,
             ScriptedAnswer::Fail,
             ScriptedAnswer::Fail,
-            ScriptedAnswer::Accept(896),
+            ScriptedAnswer::Accept(2688),
         ]);
         let tick = |from: MemoryControllerState, rows: Vec<(u64, u64)>| {
             let log = std::rc::Rc::clone(&log);
@@ -7370,14 +7445,14 @@ mod tests {
         {
             let log = log.borrow();
             assert_eq!(log.requests.len(), 3, "a changed ask is never delayed");
-            assert_eq!(log.requests[2].target_mib, 896);
+            assert_eq!(log.requests[2].target_mib, 2688);
         }
         assert_eq!(state.retry.attempts, 1, "the new ask starts its own count");
 
         // And its own first repeat is immediate, so the inherited count really is gone.
         let state = tick(state, vec![(768, 600)]).await;
         assert_eq!(log.borrow().requests.len(), 4);
-        assert_eq!(state.policy, memory_state(896, 0));
+        assert_eq!(state.policy, memory_state(2688, 0));
         assert_eq!(state.authority, TargetAuthority::Confirmed);
         assert_eq!(
             state.retry,
@@ -7509,22 +7584,22 @@ mod tests {
         let log = policy_log([
             ScriptedAnswer::Fail,
             ScriptedAnswer::Fail,
-            ScriptedAnswer::Accept(768),
+            ScriptedAnswer::Accept(2560),
         ]);
         let tick = |from: MemoryControllerState, rows: Vec<(u64, u64)>| {
             let log = std::rc::Rc::clone(&log);
             async move { drive_scripted(bounds, from, samples_of(&rows), log).await }
         };
 
-        // Recovering at 1024 with the run complete: 400 MiB of use wants 768, which is down.
-        let state = tick(recovering(1024, 49, 1024), vec![(1024, 400)]).await;
+        // Recovering at 2816 with the run complete: 400 MiB of use wants 2560, which is down.
+        let state = tick(recovering(2816, 49, 2816), vec![(2816, 400)]).await;
         assert_eq!(log.borrow().requests.len(), 1);
         assert_eq!(state.retry.attempts, 1);
         // A failed shrink restarts the dwell, so the same ask is only eligible again after
         // another 50 low ticks.
         let state = {
             let log = std::rc::Rc::clone(&log);
-            drive_scripted(bounds, state, samples_of(&lows(50, 1024, 400)), log).await
+            drive_scripted(bounds, state, samples_of(&lows(50, 2816, 400)), log).await
         };
         {
             let log = log.borrow();
@@ -7533,19 +7608,19 @@ mod tests {
                 2,
                 "the shrink is re-asked after its dwell"
             );
-            assert_eq!(log.requests[1].target_mib, 768);
+            assert_eq!(log.requests[1].target_mib, 2560);
         }
         assert_eq!(state.retry.attempts, 2);
 
-        // The live limit is now 512: the same 768 MiB target is an *up* ask, and it goes out
+        // The live limit is now 2304: the same 2560 MiB target is an *up* ask, and it goes out
         // on this tick rather than waiting out the shrink's backoff.
-        let state = tick(state, vec![(512, 400)]).await;
+        let state = tick(state, vec![(2304, 400)]).await;
         {
             let log = log.borrow();
             assert_eq!(log.requests.len(), 3, "a reversal is never delayed");
-            assert_eq!(log.requests[2].target_mib, 768);
+            assert_eq!(log.requests[2].target_mib, 2560);
         }
-        assert_eq!(state.policy, memory_state(768, 0));
+        assert_eq!(state.policy, memory_state(2560, 0));
         assert_eq!(state.authority, TargetAuthority::Confirmed);
     }
 
@@ -7555,11 +7630,11 @@ mod tests {
         // reports as accepted and never reaches is not progress: re-asking it every tick
         // would be the same storm as a hard failure.
         let bounds = adjustable();
-        // Four short receipts, then a full one: the standing ask is answered with 768 while
-        // the guest asks for 896, and only the last attempt is granted what it asked for.
+        // Four short receipts, then a full one: the standing ask is answered with 2560 while
+        // the guest asks for 2688, and only the last attempt is granted what it asked for.
         let log = policy_log(
-            std::iter::repeat_n(ScriptedAnswer::Accept(768), 4)
-                .chain(std::iter::once(ScriptedAnswer::Accept(896))),
+            std::iter::repeat_n(ScriptedAnswer::Accept(2560), 4)
+                .chain(std::iter::once(ScriptedAnswer::Accept(2688))),
         );
         let requested = |log: &SharedPolicyLog| {
             log.borrow()
@@ -7571,19 +7646,19 @@ mod tests {
 
         let state = drive_scripted(
             bounds,
-            confirmed(512, 0),
-            samples_of(&lows(20, 768, 600)),
+            confirmed(2304, 0),
+            samples_of(&lows(20, 2560, 600)),
             std::rc::Rc::clone(&log),
         )
         .await;
         assert_eq!(
             requested(&log),
-            vec![896, 896, 896, 896],
+            vec![2688, 2688, 2688, 2688],
             "the same short-of-request ask is retried on a bounded schedule, not per tick"
         );
         assert_eq!(state.authority, TargetAuthority::Confirmed);
-        assert_eq!(state.policy, memory_state(768, 0));
-        assert_eq!(state.last_accepted_target_mib, 768);
+        assert_eq!(state.policy, memory_state(2560, 0));
+        assert_eq!(state.last_accepted_target_mib, 2560);
         assert_eq!(
             state.retry.attempts, 4,
             "four no-progress results are recorded, so the next attempt waits"
@@ -7594,22 +7669,22 @@ mod tests {
         let state = drive_scripted(
             bounds,
             state,
-            samples_of(&lows(20, 768, 600)),
+            samples_of(&lows(20, 2560, 600)),
             std::rc::Rc::clone(&log),
         )
         .await;
         assert_eq!(
             requested(&log),
-            vec![896, 896, 896, 896, 896],
+            vec![2688, 2688, 2688, 2688, 2688],
             "the bounded schedule still re-asks, and the last one is the grant"
         );
         assert!(
             log.borrow().answers.is_empty(),
             "every scripted answer was consumed: four short, then one full"
         );
-        assert_eq!(state.policy, memory_state(896, 0), "the grant is adopted");
+        assert_eq!(state.policy, memory_state(2688, 0), "the grant is adopted");
         assert_eq!(state.authority, TargetAuthority::Confirmed);
-        assert_eq!(state.last_accepted_target_mib, 896);
+        assert_eq!(state.last_accepted_target_mib, 2688);
         assert_eq!(
             state.retry,
             MemoryRetry::default(),
@@ -7620,71 +7695,71 @@ mod tests {
     #[tokio::test]
     async fn partially_applied_shrink_recovers_growth_after_persistence_error() {
         for (saved_desired_mib, fault) in [
-            (1024u32, LiveFault::AtPersistence),
-            (768, LiveFault::AtPersistence),
-            (1024, LiveFault::StatuslessReceipt),
+            (2816u32, LiveFault::AtPersistence),
+            (2560, LiveFault::AtPersistence),
+            (2816, LiveFault::StatuslessReceipt),
         ] {
             let label = format!("saved {saved_desired_mib} / {fault:?}");
             // A statusless receipt means both live control and active persistence
             // succeeded, so only the acknowledgment is missing.
             let persisted_mib = match fault {
-                LiveFault::StatuslessReceipt => 512,
+                LiveFault::StatuslessReceipt => 2176,
                 _ => saved_desired_mib,
             };
             let bounds = adjustable();
-            let vm = FakeVm::new(1024, saved_desired_mib);
+            let vm = FakeVm::new(2816, saved_desired_mib);
             vm.with_live_fault(fault);
             // The 50th lower-demand tick requests the shrink; the call fails after the VM
             // already changed, so the request is not an acknowledgment.
             let state = drive_fake(
                 bounds,
-                confirmed(1024, 49),
-                samples_of(&[(1024, 128)]),
+                confirmed(2816, 49),
+                samples_of(&[(2816, 128)]),
                 std::sync::Arc::clone(&vm),
             )
             .await;
-            assert_eq!(vm.policy_requests(), vec![512], "{label}");
-            assert_eq!(vm.snapshot(), (1024, 512, persisted_mib), "{label}");
+            assert_eq!(vm.policy_requests(), vec![2176], "{label}");
+            assert_eq!(vm.snapshot(), (2816, 2176, persisted_mib), "{label}");
             assert_eq!(state.authority, TargetAuthority::Recovering, "{label}");
-            assert_eq!(state.policy, memory_state(1024, 0), "{label}");
-            assert_eq!(state.last_accepted_target_mib, 1024, "{label}");
+            assert_eq!(state.policy, memory_state(2816, 0), "{label}");
+            assert_eq!(state.last_accepted_target_mib, 2816, "{label}");
 
             // An old-limit sample must not clear recovery, and cannot reclaim yet.
             let state = drive_fake(
                 bounds,
                 state,
-                samples_of(&[(1024, 128)]),
+                samples_of(&[(2816, 128)]),
                 std::sync::Arc::clone(&vm),
             )
             .await;
             assert_eq!(state.authority, TargetAuthority::Recovering, "{label}");
-            assert_eq!(vm.policy_requests(), vec![512], "{label}");
+            assert_eq!(vm.policy_requests(), vec![2176], "{label}");
 
-            // The VM really is at 512 and genuinely needs more: the same tick that observes
+            // The VM really is at 2176 and genuinely needs more: the same tick that observes
             // it must repair saved configuration and restore growth.
-            vm.advance_actual(512);
+            vm.advance_actual(2176);
             let state = drive_fake(
                 bounds,
                 state,
-                samples_of(&[(512, 400)]),
+                samples_of(&[(2176, 400)]),
                 std::sync::Arc::clone(&vm),
             )
             .await;
-            assert_eq!(vm.policy_requests(), vec![512, 768], "{label}");
+            assert_eq!(vm.policy_requests(), vec![2176, 2560], "{label}");
             assert_eq!(
                 vm.sdk_actions(),
                 vec![
-                    (ResourceApplyMode::Live, 512),
-                    (ResourceApplyMode::NextStart, 640),
-                    (ResourceApplyMode::Live, 768),
+                    (ResourceApplyMode::Live, 2176),
+                    (ResourceApplyMode::NextStart, 512),
+                    (ResourceApplyMode::Live, 2560),
                 ],
                 "{label}: the seed defeats saved-config equality"
             );
-            assert_eq!(vm.control_requests(), vec![512, 768], "{label}");
-            assert_eq!(vm.snapshot(), (512, 768, 768), "{label}");
-            assert_eq!(state.policy, memory_state(768, 0), "{label}");
+            assert_eq!(vm.control_requests(), vec![2176, 2560], "{label}");
+            assert_eq!(vm.snapshot(), (2176, 2560, 2560), "{label}");
+            assert_eq!(state.policy, memory_state(2560, 0), "{label}");
             assert_eq!(state.authority, TargetAuthority::Confirmed, "{label}");
-            assert_eq!(state.last_accepted_target_mib, 768, "{label}");
+            assert_eq!(state.last_accepted_target_mib, 2560, "{label}");
         }
     }
 
@@ -7700,12 +7775,12 @@ mod tests {
             std::sync::Arc::clone(&vm),
         )
         .await;
-        assert_eq!(vm.policy_requests(), vec![768]);
-        assert_eq!(vm.snapshot(), (512, 768, 768));
+        assert_eq!(vm.policy_requests(), vec![2560]);
+        assert_eq!(vm.snapshot(), (512, 2560, 2560));
         assert_eq!(state.authority, TargetAuthority::Recovering);
         assert_eq!(state.last_accepted_target_mib, 512);
 
-        // Still 512 as far as the guest reports, and still needing 768: a plain repeat of
+        // Still 512 as far as the guest reports, and still needing 2560: a plain repeat of
         // the live patch would be a statusless no-op, so the seed must come first.
         let state = drive_fake(
             bounds,
@@ -7717,48 +7792,48 @@ mod tests {
         assert_eq!(
             vm.sdk_actions(),
             vec![
-                (ResourceApplyMode::Live, 768),
+                (ResourceApplyMode::Live, 2560),
                 (ResourceApplyMode::NextStart, 640),
-                (ResourceApplyMode::Live, 768),
+                (ResourceApplyMode::Live, 2560),
             ]
         );
-        assert_eq!(vm.control_requests(), vec![768, 768]);
-        assert_eq!(state.policy, memory_state(768, 0));
+        assert_eq!(vm.control_requests(), vec![2560, 2560]);
+        assert_eq!(state.policy, memory_state(2560, 0));
         assert_eq!(state.authority, TargetAuthority::Confirmed);
-        assert_eq!(state.last_accepted_target_mib, 768);
+        assert_eq!(state.last_accepted_target_mib, 2560);
 
         // Steady demand at the settled target sends nothing at all.
-        vm.advance_actual(768);
+        vm.advance_actual(2560);
         let state = drive_fake(
             bounds,
             state,
-            samples_of(&lows(1000, 768, 400)),
+            samples_of(&lows(1000, 2560, 400)),
             std::sync::Arc::clone(&vm),
         )
         .await;
         assert_eq!(vm.sdk_actions().len(), 3);
-        assert_eq!(state.policy, memory_state(768, 0));
+        assert_eq!(state.policy, memory_state(2560, 0));
 
         // A later reclamation and a later growth both really control the VM.
         let state = drive_fake(
             bounds,
             state,
-            samples_of(&lows(50, 768, 128)),
+            samples_of(&lows(50, 2560, 128)),
             std::sync::Arc::clone(&vm),
         )
         .await;
-        assert_eq!(state.policy, memory_state(512, 0));
-        assert_eq!(vm.control_requests(), vec![768, 768, 512]);
-        vm.advance_actual(512);
+        assert_eq!(state.policy, memory_state(2176, 0));
+        assert_eq!(vm.control_requests(), vec![2560, 2560, 2176]);
+        vm.advance_actual(2176);
         let state = drive_fake(
             bounds,
             state,
-            samples_of(&[(512, 400)]),
+            samples_of(&[(2176, 400)]),
             std::sync::Arc::clone(&vm),
         )
         .await;
-        assert_eq!(state.policy, memory_state(768, 0));
-        assert_eq!(vm.control_requests(), vec![768, 768, 512, 768]);
+        assert_eq!(state.policy, memory_state(2560, 0));
+        assert_eq!(vm.control_requests(), vec![2560, 2560, 2176, 2560]);
 
         // Companion branch: the published limit converges before the first recovery
         // decision, so there is nothing to repair and nothing to send.
@@ -7771,38 +7846,38 @@ mod tests {
             std::sync::Arc::clone(&vm),
         )
         .await;
-        assert_eq!(vm.sdk_actions(), vec![(ResourceApplyMode::Live, 768)]);
-        vm.advance_actual(768);
+        assert_eq!(vm.sdk_actions(), vec![(ResourceApplyMode::Live, 2560)]);
+        vm.advance_actual(2560);
         let state = drive_fake(
             bounds,
             state,
-            samples_of(&[(768, 400)]),
+            samples_of(&[(2560, 400)]),
             std::sync::Arc::clone(&vm),
         )
         .await;
         assert_eq!(state.authority, TargetAuthority::Recovering);
-        assert_eq!(state.policy, memory_state(768, 0));
+        assert_eq!(state.policy, memory_state(2560, 0));
         assert_eq!(state.last_accepted_target_mib, 512);
-        assert_eq!(vm.sdk_actions(), vec![(ResourceApplyMode::Live, 768)]);
+        assert_eq!(vm.sdk_actions(), vec![(ResourceApplyMode::Live, 2560)]);
         // A genuine change repairs and confirms on the tick that observes it.
         let state = drive_fake(
             bounds,
             state,
-            samples_of(&lows(50, 768, 128)),
+            samples_of(&lows(50, 2560, 128)),
             std::sync::Arc::clone(&vm),
         )
         .await;
         assert_eq!(
             vm.sdk_actions(),
             vec![
-                (ResourceApplyMode::Live, 768),
-                (ResourceApplyMode::NextStart, 640),
-                (ResourceApplyMode::Live, 512),
+                (ResourceApplyMode::Live, 2560),
+                (ResourceApplyMode::NextStart, 512),
+                (ResourceApplyMode::Live, 2176),
             ]
         );
-        assert_eq!(state.policy, memory_state(512, 0));
+        assert_eq!(state.policy, memory_state(2176, 0));
         assert_eq!(state.authority, TargetAuthority::Confirmed);
-        assert_eq!(state.last_accepted_target_mib, 512);
+        assert_eq!(state.last_accepted_target_mib, 2176);
     }
 
     #[tokio::test]
@@ -7846,10 +7921,10 @@ mod tests {
         assert!(matches!(outcome, Err(ResourceResizeError::Unconfirmed(_))));
         assert!(vm.sdk_actions().is_empty());
 
-        // O896 -> D1024 seeds 512, and the configuration-only patch must not shrink the
+        // O2688 -> D2816 seeds 512, and the configuration-only patch must not shrink the
         // running VM: observe the model between persisting and returning.
         let bounds = adjustable();
-        let vm = FakeVm::new(896, 2048);
+        let vm = FakeVm::new(2688, 2816);
         let (persisted_tx, persisted_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         {
@@ -7859,11 +7934,14 @@ mod tests {
         }
         let driver = tokio::spawn(drive_fake(
             bounds,
-            recovering(896, 0, 2048),
-            samples_of(&[(896, 700)]),
+            recovering(2688, 0, 2816),
+            samples_of(&[(2688, 700)]),
             std::sync::Arc::clone(&vm),
         ));
-        persisted_rx.await.expect("the seed was persisted");
+        tokio::time::timeout(std::time::Duration::from_secs(5), persisted_rx)
+            .await
+            .expect("the persisted model must report within 5 s; a hang is a failure")
+            .expect("the seed was persisted");
         assert_eq!(
             vm.sdk_actions(),
             vec![(ResourceApplyMode::NextStart, 512)],
@@ -7875,7 +7953,7 @@ mod tests {
         );
         assert_eq!(
             vm.snapshot(),
-            (896, 896, 512),
+            (2688, 2688, 512),
             "usable memory is unchanged by the seed"
         );
         release_tx.send(()).expect("the prepare plan is awaited");
@@ -7884,12 +7962,12 @@ mod tests {
             vm.sdk_actions(),
             vec![
                 (ResourceApplyMode::NextStart, 512),
-                (ResourceApplyMode::Live, 1024),
+                (ResourceApplyMode::Live, 2816),
             ]
         );
-        assert_eq!(vm.control_requests(), vec![1024]);
+        assert_eq!(vm.control_requests(), vec![2816]);
         assert_eq!(state.authority, TargetAuthority::Confirmed);
-        assert_eq!(state.last_accepted_target_mib, 1024);
+        assert_eq!(state.last_accepted_target_mib, 2816);
 
         // Every failing stage selects Recovering, and a later healthy attempt still works.
         for fault in [
@@ -7898,18 +7976,18 @@ mod tests {
             PrepareFault::NotApplied,
             PrepareFault::LiveStatusReported,
         ] {
-            let vm = FakeVm::new(512, 1024);
+            let vm = FakeVm::new(512, 2816);
             vm.with_prepare_fault(fault);
             let state = drive_fake(
                 bounds,
-                recovering(512, 0, 1024),
+                recovering(512, 0, 2816),
                 samples_of(&[(512, 400)]),
                 std::sync::Arc::clone(&vm),
             )
             .await;
             assert_eq!(state.authority, TargetAuthority::Recovering, "{fault:?}");
             assert_eq!(state.policy, memory_state(512, 0), "{fault:?}");
-            assert_eq!(state.last_accepted_target_mib, 1024, "{fault:?}");
+            assert_eq!(state.last_accepted_target_mib, 2816, "{fault:?}");
             assert!(
                 vm.control_requests().is_empty(),
                 "{fault:?}: a rejected prepare sends no runtime control"
@@ -7922,88 +8000,88 @@ mod tests {
             )
             .await;
             assert_eq!(state.authority, TargetAuthority::Confirmed, "{fault:?}");
-            assert_eq!(state.last_accepted_target_mib, 768, "{fault:?}");
+            assert_eq!(state.last_accepted_target_mib, 2560, "{fault:?}");
         }
         // A live failure after a successful prepare leaves Recovering, not a fake receipt.
-        let vm = FakeVm::new(512, 1024);
+        let vm = FakeVm::new(512, 2816);
         vm.with_live_fault(LiveFault::NoEffect);
         let state = drive_fake(
             bounds,
-            recovering(512, 0, 1024),
+            recovering(512, 0, 2816),
             samples_of(&[(512, 400)]),
             std::sync::Arc::clone(&vm),
         )
         .await;
         assert_eq!(state.authority, TargetAuthority::Recovering);
-        assert_eq!(state.last_accepted_target_mib, 1024);
+        assert_eq!(state.last_accepted_target_mib, 2816);
         assert_eq!(vm.snapshot(), (512, 512, 640));
     }
 
     #[tokio::test]
     async fn recovery_baseline_change_after_49_lows_restarts_dwell() {
         let bounds = adjustable();
-        let vm = FakeVm::new(1024, 2048);
+        let vm = FakeVm::new(2816, 3072);
         let state = drive_fake(
             bounds,
-            recovering(1024, 0, 2048),
-            samples_of(&lows(49, 1024, 128)),
+            recovering(2816, 0, 3072),
+            samples_of(&lows(49, 2816, 128)),
             std::sync::Arc::clone(&vm),
         )
         .await;
-        assert_eq!(state.policy, memory_state(1024, 49));
+        assert_eq!(state.policy, memory_state(2816, 49));
         assert!(vm.policy_requests().is_empty());
 
         // The baseline moves: 49 ticks measured against another commitment are discarded.
         let state = drive_fake(
             bounds,
             state,
-            samples_of(&[(896, 128)]),
+            samples_of(&[(2688, 128)]),
             std::sync::Arc::clone(&vm),
         )
         .await;
-        assert_eq!(state.policy, memory_state(896, 1));
+        assert_eq!(state.policy, memory_state(2688, 1));
         assert_eq!(state.authority, TargetAuthority::Recovering);
-        assert_eq!(state.last_accepted_target_mib, 2048);
+        assert_eq!(state.last_accepted_target_mib, 3072);
         assert!(vm.policy_requests().is_empty());
 
         let state = drive_fake(
             bounds,
             state,
-            samples_of(&lows(48, 896, 128)),
+            samples_of(&lows(48, 2688, 128)),
             std::sync::Arc::clone(&vm),
         )
         .await;
-        assert_eq!(state.policy, memory_state(896, 49));
+        assert_eq!(state.policy, memory_state(2688, 49));
         assert!(vm.sdk_actions().is_empty());
 
         let state = drive_fake(
             bounds,
             state,
-            samples_of(&[(896, 128)]),
+            samples_of(&[(2688, 128)]),
             std::sync::Arc::clone(&vm),
         )
         .await;
-        assert_eq!(vm.policy_requests(), vec![512]);
+        assert_eq!(vm.policy_requests(), vec![2176]);
         assert_eq!(
             vm.sdk_actions(),
             vec![
-                (ResourceApplyMode::NextStart, 640),
-                (ResourceApplyMode::Live, 512),
+                (ResourceApplyMode::NextStart, 512),
+                (ResourceApplyMode::Live, 2176),
             ]
         );
-        assert_eq!(vm.control_requests(), vec![512]);
-        assert_eq!(state.policy, memory_state(512, 0));
+        assert_eq!(vm.control_requests(), vec![2176]);
+        assert_eq!(state.policy, memory_state(2176, 0));
         assert_eq!(state.authority, TargetAuthority::Confirmed);
-        assert_eq!(state.last_accepted_target_mib, 512);
+        assert_eq!(state.last_accepted_target_mib, 2176);
     }
 
     #[tokio::test]
     async fn alternating_recovery_baselines_never_accumulate_lows() {
         let bounds = adjustable();
-        let vm = FakeVm::new(896, 2048);
-        let mut state = recovering(896, 0, 2048);
+        let vm = FakeVm::new(2688, 2816);
+        let mut state = recovering(2688, 0, 2816);
         for observation in 0..1000usize {
-            let limit_mib = if observation % 2 == 0 { 1024 } else { 896 };
+            let limit_mib = if observation % 2 == 0 { 2816 } else { 2688 };
             state = drive_fake(
                 bounds,
                 state,
@@ -8017,7 +8095,7 @@ mod tests {
                 "observation {observation}"
             );
             assert_eq!(state.authority, TargetAuthority::Recovering);
-            assert_eq!(state.last_accepted_target_mib, 2048);
+            assert_eq!(state.last_accepted_target_mib, 2816);
         }
         assert!(vm.policy_requests().is_empty());
         assert!(vm.sdk_actions().is_empty());
@@ -8027,12 +8105,12 @@ mod tests {
     #[tokio::test]
     async fn stabilized_recovery_baseline_completes_exact_remaining_dwell() {
         let bounds = adjustable();
-        let vm = FakeVm::new(896, 2048);
-        // The shared prefix: the alternation above, ending on the 896 baseline with one
+        let vm = FakeVm::new(2688, 2816);
+        // The shared prefix: the alternation above, ending on the 2688 baseline with one
         // low tick counted.
-        let mut state = recovering(896, 0, 2048);
+        let mut state = recovering(2688, 0, 2816);
         for observation in 0..1000usize {
-            let limit_mib = if observation % 2 == 0 { 1024 } else { 896 };
+            let limit_mib = if observation % 2 == 0 { 2816 } else { 2688 };
             state = drive_fake(
                 bounds,
                 state,
@@ -8041,61 +8119,68 @@ mod tests {
             )
             .await;
         }
-        assert_eq!(state.policy, memory_state(896, 1));
+        assert_eq!(state.policy, memory_state(2688, 1));
         for tick in 2..=49u32 {
             state = drive_fake(
                 bounds,
                 state,
-                samples_of(&[(896, 128)]),
+                samples_of(&[(2688, 128)]),
                 std::sync::Arc::clone(&vm),
             )
             .await;
-            assert_eq!(state.policy, memory_state(896, tick), "stable tick {tick}");
+            assert_eq!(state.policy, memory_state(2688, tick), "stable tick {tick}");
             assert!(vm.sdk_actions().is_empty());
-            assert_eq!(state.last_accepted_target_mib, 2048);
+            assert_eq!(state.last_accepted_target_mib, 2816);
         }
         state = drive_fake(
             bounds,
             state,
-            samples_of(&[(896, 128)]),
+            samples_of(&[(2688, 128)]),
             std::sync::Arc::clone(&vm),
         )
         .await;
-        assert_eq!(vm.policy_requests(), vec![512]);
+        assert_eq!(vm.policy_requests(), vec![2176]);
+        // The seed is the first boot-region value that is neither the observed baseline nor
+        // the desired target.
         assert_eq!(
             vm.sdk_actions(),
             vec![
-                (ResourceApplyMode::NextStart, 640),
-                (ResourceApplyMode::Live, 512),
+                (ResourceApplyMode::NextStart, 512),
+                (ResourceApplyMode::Live, 2176),
             ]
         );
-        assert_eq!(vm.control_requests(), vec![512]);
-        assert_eq!(state.policy, memory_state(512, 0));
+        assert_eq!(vm.control_requests(), vec![2176]);
+        assert_eq!(state.policy, memory_state(2176, 0));
         assert_eq!(state.authority, TargetAuthority::Confirmed);
-        assert_eq!(state.last_accepted_target_mib, 512);
+        assert_eq!(state.last_accepted_target_mib, 2176);
     }
 
     #[tokio::test]
     async fn failed_prepare_seed_persists_through_holds_then_genuine_growth() {
+        // With a reserve this large a live ask can never equal the boot-derived seed, so the
+        // statusless no-op the reseed defends against is out of reach here. What this test
+        // still pins is that a failed prepare persists its seed, changes no live memory, and
+        // that a later genuine ask still reaches the live apply. The negative control at the
+        // end states the collision the seed exists for.
         let bounds = adjustable();
         for fault in [
             PrepareFault::ErrorAfterPersist,
             PrepareFault::NotApplied,
             PrepareFault::LiveStatusReported,
         ] {
-            let vm = FakeVm::new(512, 1024);
+            let vm = FakeVm::new(2304, 2816);
             vm.with_prepare_fault(fault);
             let state = drive_fake(
                 bounds,
-                recovering(512, 0, 1024),
-                samples_of(&[(512, 400)]),
+                recovering(2304, 0, 2816),
+                samples_of(&[(2304, 400)]),
                 std::sync::Arc::clone(&vm),
             )
             .await;
             assert_eq!(state.authority, TargetAuthority::Recovering, "{fault:?}");
-            assert_eq!(state.policy, memory_state(512, 0), "{fault:?}");
-            assert_eq!(state.last_accepted_target_mib, 1024, "{fault:?}");
-            assert_eq!(vm.snapshot(), (512, 512, 640), "{fault:?}");
+            assert_eq!(state.policy, memory_state(2304, 0), "{fault:?}");
+            assert_eq!(state.last_accepted_target_mib, 2816, "{fault:?}");
+            assert_eq!(vm.snapshot(), (2304, 2304, 512), "{fault:?}");
             assert!(
                 vm.control_requests().is_empty(),
                 "{fault:?}: the failed prepare sends no runtime control"
@@ -8105,39 +8190,38 @@ mod tests {
             let state = drive_fake(
                 bounds,
                 state,
-                samples_of(&lows(1000, 512, 128)),
+                samples_of(&lows(1000, 2304, 256)),
                 std::sync::Arc::clone(&vm),
             )
             .await;
             assert_eq!(state.authority, TargetAuthority::Recovering, "{fault:?}");
-            assert_eq!(state.policy, memory_state(512, 0), "{fault:?}");
-            assert_eq!(state.last_accepted_target_mib, 1024, "{fault:?}");
-            assert_eq!(vm.snapshot(), (512, 512, 640), "{fault:?}");
+            assert_eq!(state.policy, memory_state(2304, 0), "{fault:?}");
+            assert_eq!(state.last_accepted_target_mib, 2816, "{fault:?}");
+            assert_eq!(vm.snapshot(), (2304, 2304, 512), "{fault:?}");
             assert_eq!(vm.sdk_actions().len(), 1, "{fault:?}");
 
-            // Genuine demand for the value already saved still reseeds, because a plain
-            // live patch equal to the saved seed would be a statusless no-op.
+            // Genuine demand for a changed target still confirms through the live apply.
             let state = drive_fake(
                 bounds,
                 state,
-                samples_of(&[(512, 257)]),
+                samples_of(&[(2304, 600)]),
                 std::sync::Arc::clone(&vm),
             )
             .await;
-            assert_eq!(vm.policy_requests(), vec![768, 640], "{fault:?}");
+            assert_eq!(vm.policy_requests(), vec![2560, 2688], "{fault:?}");
             assert_eq!(
                 vm.sdk_actions(),
                 vec![
-                    (ResourceApplyMode::NextStart, 640),
-                    (ResourceApplyMode::NextStart, 768),
-                    (ResourceApplyMode::Live, 640),
+                    (ResourceApplyMode::NextStart, 512),
+                    (ResourceApplyMode::NextStart, 512),
+                    (ResourceApplyMode::Live, 2688),
                 ],
                 "{fault:?}"
             );
-            assert_eq!(vm.control_requests(), vec![640], "{fault:?}");
-            assert_eq!(state.policy, memory_state(640, 0), "{fault:?}");
+            assert_eq!(vm.control_requests(), vec![2688], "{fault:?}");
+            assert_eq!(state.policy, memory_state(2688, 0), "{fault:?}");
             assert_eq!(state.authority, TargetAuthority::Confirmed, "{fault:?}");
-            assert_eq!(state.last_accepted_target_mib, 640, "{fault:?}");
+            assert_eq!(state.last_accepted_target_mib, 2688, "{fault:?}");
         }
         // Negative control: at saved 640 the plain live patch is applied and statusless.
         let vm = FakeVm::new(512, 640);
@@ -8173,8 +8257,8 @@ mod tests {
 
         // Every unusable observation keeps Recovering with no resize, and a later valid
         // limit restores a reachable growth request.
-        let vm = FakeVm::new(1024, 2048);
-        let mut state = recovering(1024, 0, 2048);
+        let vm = FakeVm::new(2816, 2816);
+        let mut state = recovering(2816, 0, 2816);
         for unusable in [
             Ok(Some(MemorySample {
                 memory_limit_bytes: 1024 * MIB + 1,
@@ -8185,8 +8269,8 @@ mod tests {
         ] {
             state = drive_fake(bounds, state, vec![unusable], std::sync::Arc::clone(&vm)).await;
             assert_eq!(state.authority, TargetAuthority::Recovering);
-            assert_eq!(state.policy, memory_state(1024, 0));
-            assert_eq!(state.last_accepted_target_mib, 2048);
+            assert_eq!(state.policy, memory_state(2816, 0));
+            assert_eq!(state.last_accepted_target_mib, 2816);
             assert!(vm.policy_requests().is_empty());
         }
         // A valid limit with no availability updates the baseline and nothing else.
@@ -8202,7 +8286,7 @@ mod tests {
         .await;
         assert_eq!(state.policy, memory_state(512, 0));
         assert_eq!(state.authority, TargetAuthority::Recovering);
-        assert_eq!(state.last_accepted_target_mib, 2048);
+        assert_eq!(state.last_accepted_target_mib, 2816);
         assert!(vm.policy_requests().is_empty());
         // And then a reachable growth request.
         state = drive_fake(
@@ -8212,10 +8296,10 @@ mod tests {
             std::sync::Arc::clone(&vm),
         )
         .await;
-        assert_eq!(vm.policy_requests(), vec![768]);
-        assert_eq!(state.policy, memory_state(768, 0));
+        assert_eq!(vm.policy_requests(), vec![2560]);
+        assert_eq!(state.policy, memory_state(2560, 0));
         assert_eq!(state.authority, TargetAuthority::Confirmed);
-        assert_eq!(state.last_accepted_target_mib, 768);
+        assert_eq!(state.last_accepted_target_mib, 2560);
     }
 
     // ------------------------------------------------ monitor logging and lifetime
