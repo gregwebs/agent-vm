@@ -12,6 +12,11 @@ REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 SCRIPT_DIR="$REPO_ROOT/script/test"
 FIXTURES="$SCRIPT_DIR/fixtures/config-dir-guard"
 LIVE="$SCRIPT_DIR/config-dir-guard-live.sh"
+harness="${HARNESS_BIN_DIR:-$REPO_ROOT/target/debug}/harness"
+[[ -x "$harness" ]] || {
+    echo "config-dir guard: FAIL: missing harness binary: $harness (run: cargo build --locked -p agent-vm-harness --bins)" >&2
+    exit 1
+}
 
 # shellcheck source=script/test/lib/config-dir-guard.sh
 source "$SCRIPT_DIR/lib/config-dir-guard.sh"
@@ -123,7 +128,7 @@ for snippet in guest-n1a.sh guest-n1b.sh; do
         fail "$snippet did not mutate the original through the link"
     fi
     grep -q '^# planted$' "$orig" || fail "$snippet did not append the planted line"
-    links="$(python3 -c 'import os, sys; print(os.stat(sys.argv[1]).st_nlink)' "$orig")"
+    links="$("$harness" config-dir-guard --hard-link-count "$orig")"
     [[ "$links" == 1 ]] || fail "$snippet left the original hard-linked ($links links)"
 done
 
@@ -172,8 +177,8 @@ suffix_total=$((${#AVM_GUARD_SOCKET_SUFFIX} + AVM_GUARD_SOCKET_HASH_BYTES * 2 + 
 # count its UTF-8 byte length. The control input is genuinely multibyte, so it
 # would catch a character-counting helper under a UTF-8 locale.
 mb_state="/é"
-mb_bytes="$(python3 -c 'import sys; print(len(sys.argv[1].encode()))' "$mb_state")"
-mb_chars="$(python3 -c 'import sys; print(len(sys.argv[1]))' "$mb_state")"
+lengths="$("$harness" config-dir-guard --lengths "$mb_state")"
+read -r mb_bytes mb_chars <<<"$lengths"
 ((mb_bytes != mb_chars)) || fail "multibyte control input is not multibyte"
 (( $(avm_guard_control_socket_len "$mb_state") == mb_bytes + suffix_total )) ||
     fail "socket budget counted characters, not bytes"
@@ -181,8 +186,10 @@ mb_chars="$(python3 -c 'import sys; print(len(sys.argv[1]))' "$mb_state")"
 limit="$(avm_sun_path_usable_len)"
 
 # Boundary controls: exactly the limit fits, one byte more is rejected.
-fit_state="$(python3 -c "print('/' + 'x' * ($limit - $suffix_total - 1))")"
-over_state="$(python3 -c "print('/' + 'x' * ($limit - $suffix_total))")"
+printf -v fit_state '/%*s' "$((limit - suffix_total - 1))" ''
+printf -v over_state '/%*s' "$((limit - suffix_total))" ''
+fit_state="${fit_state// /x}"
+over_state="${over_state// /x}"
 (( $(avm_guard_control_socket_len "$fit_state") == limit )) ||
     fail "fit-boundary arithmetic wrong"
 (( $(avm_guard_control_socket_len "$over_state") == limit + 1 )) ||
@@ -232,47 +239,6 @@ forced_rc=0
 
 bash "$SCRIPT_DIR/ci-contracts.sh" --guard-only
 
-python3 - "$REPO_ROOT" <<'PY'
-from pathlib import Path
-import subprocess
-import sys
-import tempfile
-
-root = Path(sys.argv[1])
-source = (root / "script/test/ci-contracts.sh").read_text()
-files = ("script/test/lib/config-dir-guard.sh",
-         "script/test/config-dir-guard-live.sh",
-         "script/test/config-dir-guard-contract.sh",
-         "script/test/fixtures/config-dir-guard/guest-n1a.sh",
-         "script/test/fixtures/config-dir-guard/guest-n1b.sh",
-         "script/test/fixtures/config-dir-guard/guest-n3.sh",
-         "script/test/fixtures/config-dir-guard/guest-n4.sh",
-         "script/test/fixtures/config-dir-guard/guest-n5.sh",
-         "script/test/fixtures/config-dir-guard/guest-n7.sh")
-run_list = source.split("# --- Shell guard rail", 1)[0]
-assert 'bash "$REPO_ROOT/script/test/config-dir-guard-contract.sh"' in run_list, \
-    "ci-contracts.sh does not invoke the host controls"
-for array, label in (("syntax_check", "bash -n"), ("shellcheck_files", "shellcheck")):
-    for script in files:
-        start = source.index(array + "=(")
-        end = source.index("\n)", start)
-        block = source[start:end]
-        entry = "    " + script + "\n"
-        assert block.count(entry) == 1, (array, script)
-        # Each removal must die for the correct reason: its explicit
-        # assert_listed membership check, not an incidental missing-file error.
-        assert f"assert_listed '{label}' '{script}'" in source, \
-            f"no explicit {label} membership assertion for {script}"
-        mutated = source[:start] + block.replace(entry, "", 1) + source[end:]
-        with tempfile.TemporaryDirectory(prefix="cfg-guard-mutation-") as tmp:
-            path = Path(tmp) / "script/test/ci-contracts.sh"
-            path.parent.mkdir(parents=True)
-            path.write_text(mutated)
-            result = subprocess.run(["bash", str(path), "--guard-only"],
-                                    capture_output=True, text=True, timeout=10)
-            assert result.returncode == 1, result.stdout + result.stderr
-            assert f"({script}) is missing from the {label} guard list" in result.stderr, result.stderr
-        print(f"host-only removal mutation PASS: {array}: {script}")
-PY
+"$harness" config-dir-guard --self-test --repo-root "$REPO_ROOT"
 
 echo 'host-only config-dir guard controls passed (guest snippets + socket budget; no VM run)'

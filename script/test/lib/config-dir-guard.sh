@@ -18,6 +18,8 @@
 AVM_GUARD_SOCKET_SUFFIX="/msb-home/run/sandboxes/"
 AVM_GUARD_SOCKET_HASH_BYTES=12
 AVM_GUARD_SOCKET_LEAF="/control.sock"
+AVM_GUARD_REPO_ROOT="$(cd -- "${BASH_SOURCE[0]%/*}/../../.." && pwd)"
+AVM_GUARD_HARNESS="${HARNESS_BIN_DIR:-$AVM_GUARD_REPO_ROOT/target/debug}/harness"
 
 # macOS sockaddr_un.sun_path is a 104-byte buffer including the NUL; Linux 108.
 avm_sun_path_usable_len() {
@@ -68,10 +70,11 @@ avm_guard_case_variant_is_distinct() {
 # session.rs::hash_path: the first six SHA-256 bytes over the canonical path,
 # as lowercase hex. This is the *project* hash, not the runtime sandbox id.
 avm_guard_project_hash() {
-    python3 - "$1" <<'PY'
-import hashlib, os, sys
-print(hashlib.sha256(os.fsencode(os.path.realpath(sys.argv[1]))).hexdigest()[:12])
-PY
+    [[ -x "$AVM_GUARD_HARNESS" ]] || {
+        echo "config-dir guard: FAIL: missing harness binary: $AVM_GUARD_HARNESS (run: cargo build --locked -p agent-vm-harness --bins)" >&2
+        return 2
+    }
+    "$AVM_GUARD_HARNESS" config-dir-guard --project-hash "$1"
 }
 
 # Prints a directory under $1 whose project hash changes under ASCII
@@ -79,7 +82,7 @@ PY
 #
 # Return codes are distinguished because callers run this under `if`/`||`,
 # where bash disables errexit inside the function and would otherwise swallow a
-# failed mkdir or python invocation:
+# failed mkdir or harness invocation:
 #   0  a distinct-case project was printed
 #   1  every candidate was genuinely letterless (caller prints a skip reason)
 #   2  an unexpected I/O or hash failure (caller must fail, never skip)

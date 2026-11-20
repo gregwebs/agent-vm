@@ -8,6 +8,7 @@
 use clap::{Parser, Subcommand};
 
 mod runtime_provenance;
+mod config_dir_guard;
 
 /// The `harness` commands. A port adds one variant, replacing a Python driver or
 /// a boot-free Python suite.
@@ -22,11 +23,26 @@ pub struct Cli {
 enum Command {
     /// Validate the two Cargo roots and the pinned firmware source.
     RuntimeProvenance(runtime_provenance::RuntimeProvenanceArgs),
+    /// Run configuration-directory guard controls and filesystem queries.
+    ConfigDirGuard(config_dir_guard::ConfigDirGuardArgs),
+}
+
+impl Cli {
+    /// The prefix a failure from this command's own code carries. Only the
+    /// command that ran can label its error: a shared prefix named whichever
+    /// port was written first, which mislabels every later one.
+    pub fn failure_label(&self) -> &'static str {
+        match self.command {
+            Command::RuntimeProvenance(_) => "runtime provenance",
+            Command::ConfigDirGuard(_) => "config-dir guard",
+        }
+    }
 }
 
 pub fn run(cli: Cli) -> Result<String, String> {
     match cli.command {
         Command::RuntimeProvenance(args) => runtime_provenance::run(args),
+        Command::ConfigDirGuard(args) => config_dir_guard::run(args),
     }
 }
 
