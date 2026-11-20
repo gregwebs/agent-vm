@@ -63,13 +63,18 @@ script/test/config-mounts-contract.sh 4
 script/test/config-mounts-live.sh 1
 
 # --- Migration debt: ptys, direct terminal, e2e inline helpers -------------
-script/test/lib/detached-run.py
+# The stand-in's only callers are direct-terminal.py and
+# direct-terminal-contract.py, so it stays until #699 ports them: bottom-up rule.
+# `harness launcher-standin` is its port, and `harness detached-run` replaced
+# lib/detached-run.py, which is gone.
 script/test/fixtures/direct-terminal/launcher-standin.py
 script/test/lib/direct-terminal.py
 script/test/lib/direct-terminal-contract.py
-script/test/e2e.sh 18
-# Runs every suite above, so it names Python until they are ported.
-script/test/ci-contracts.sh 3
+script/test/e2e.sh 15
+# Runs every suite above, so it names Python until they are ported. The direct
+# terminal contract still needs python3 until #699 ports it; the detach shim it
+# runs is `harness detached-run` now.
+script/test/ci-contracts.sh 2
 
 # --- Migration debt: Rust tests that shell out to python -------------------
 crates/agent-vm/tests/config_doctor.rs 3
