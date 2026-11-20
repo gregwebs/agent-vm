@@ -610,7 +610,7 @@ harness source is its own Git top level (so a tarball nested in another
 checkout is refused), records `tracked-status.txt` by direct redirection of
 `git status --porcelain --untracked-files=no --ignore-submodules=untracked`,
 captures the candidate's stdout byte-for-byte into `binary-version.txt` and
-runs `script/test/lib/build-provenance.py`
+runs `harness build-provenance`
 (`binary-version.txt`, full HEAD, `tracked-status.txt`). The checker accepts
 **only** a known full commit equal to HEAD, a self-reported `clean` state, and
 an empty tracked-status file. Dirty, unknown, mismatched or multiline output,
@@ -696,7 +696,7 @@ surfaces as that first launch's own error, with its receipted evidence retained.
 The run asserts provenance before it does any native work: the harness source
 must be its own Git top level, `tracked-status.txt` is captured by direct
 redirection, the candidate's stdout is captured byte-for-byte as
-`binary-version.txt`, and `script/test/lib/build-provenance.py` accepts **only**
+`binary-version.txt`, and `harness build-provenance` accepts **only**
 a known full commit equal to HEAD, a self-reported `clean` state and an empty
 tracked-status file. A rejection retains `provenance-check.txt` and allocates no
 scratch.

@@ -30,19 +30,15 @@ profiling/build_legacy.sh 1
 profiling/build_variants.sh 1
 
 # --- Migration debt: build provenance ---------------------------------------
+# The persisted-network Python controls still import this checker; #696 removes
+# this final caller and then this entry.
 script/test/lib/build-provenance.py
-script/test/build-provenance-contract.sh 1
 
 # --- Migration debt: CPU commitment evidence --------------------------------
 script/test/cpu-commitment-manifest.py
 script/test/cpu-commitment-select.py
 script/test/cpu-commitment-native.sh 6
 script/test/cpu-commitment-native-contract.sh 18
-
-# --- Migration debt: msb-krun compat ---------------------------------------
-crates/msb-krun-compat-evidence/src/lib.rs 3
-script/test/msb-krun-compat.sh 1
-script/test/msb-krun-compat-contract.sh 4
 
 # --- Migration debt: build archive oracle and image pins -------------------
 script/test/fixtures/build-archive-oracle.py
@@ -70,12 +66,11 @@ script/test/lib/persisted-network.py
 script/test/lib/persisted-network-contract.py
 script/test/lib/persisted-network.sh 1
 script/test/persisted-network-contract.sh 1
-script/test/persisted-network-live.sh 1
 
 # --- Migration debt: config mounts ----------------------------------------
 script/test/lib/config-mounts.py
-script/test/config-mounts-contract.sh 5
-script/test/config-mounts-live.sh 2
+script/test/config-mounts-contract.sh 4
+script/test/config-mounts-live.sh 1
 
 # --- Migration debt: ptys, direct terminal, e2e inline helpers -------------
 script/test/lib/detached-run.py

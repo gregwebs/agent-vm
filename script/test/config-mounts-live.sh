@@ -51,6 +51,7 @@ libkrunfw="$bundle/../lib/libkrunfw.5.dylib"
 
 script_dir="$(cd -- "${BASH_SOURCE[0]%/*}" && pwd -P)"
 repo_root="$(cd -- "$script_dir/../.." && pwd -P)"
+harness="${HARNESS_BIN_DIR:-$repo_root/target/debug}/harness"
 
 # Every source-metadata call goes through this one adapter. `-C` does not
 # override an inherited GIT_DIR/GIT_WORK_TREE, so a caller could otherwise route
@@ -118,7 +119,8 @@ shasum -a 256 "$evidence/tree.diff" > "$evidence/tree.diff.sha256" || reject 'tr
 # Direct redirection preserves partial output, trailing blank lines and invalid
 # bytes for the independent checker and failure diagnosis.
 "$AGENT_VM_BIN" --version > "$evidence/binary-version.txt" || reject 'the binary does not report --version'
-if ! python3 "$script_dir/lib/build-provenance.py" \
+[[ -x "$harness" ]] || reject "missing harness binary: $harness (run: cargo build --locked -p agent-vm-harness --bins)"
+if ! "$harness" build-provenance \
     "$evidence/binary-version.txt" "$commit" "$evidence/tracked-status.txt" \
     2>&1 | tee "$evidence/provenance-check.txt"; then
     echo 'Commit current tracked source and rebuild the candidate from it before retrying.' |
