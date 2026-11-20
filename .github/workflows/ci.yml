@@ -238,10 +238,12 @@ jobs:
   # isolated to a disposable keychain in a temp dir, so a shared runner is fine.
   macos-keychain-contract:
     runs-on: macos-latest
-    # The leg itself is a build plus a 1.4s test, so this bounds a wedged build;
-    # a starved queue is bounded by nothing here and is reported by
+    # A cold cache builds the workspace for ~8 minutes before either test runs
+    # (7m17s and 8m37s observed), and the harness step builds on top of it, so
+    # 10 minutes cancelled this leg at 10m12s (#710, #711). This still bounds a
+    # wedged build; a starved queue is bounded by nothing here and is reported by
     # `build-and-test`, which names the leg instead of the run.
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

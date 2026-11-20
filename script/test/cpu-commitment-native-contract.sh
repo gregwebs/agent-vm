@@ -6,7 +6,9 @@
 # These checks never boot a VM and never run the expensive build: they drive the selector and
 # manifest helpers directly and use a failing fake `docker` to prove the wrapper stops before
 # any native invocation or PASS. The actual isolated build and the stale-input build fixture
-# are host-gated in the protocol itself, not mocked here.
+# are host-gated in the protocol itself, not mocked here. The wrapper's first host gate is
+# asserted as this host really answers it; the stages behind it run under a fake `uname` (see
+# step 4), so the Linux gate covers them too.
 #
 # Exit 0 when every fault check produced its required refusal; exit 1 otherwise.
 
@@ -155,9 +157,16 @@ expect_status 3 python3 "$MANIFEST" verify "$WORK/hash-only" "$WORK/msb" "$WORK/
 
 # 4. Wrapper fail-fast: a failing fake docker stops the protocol before any native invocation
 #    and leaves no PASS. Old executables under target/ are irrelevant to the selection.
+#    The wrapper refuses a Linux host before the vendor build, so `uname` reports Darwin for
+#    this run to reach the stages behind that gate -- the same seam
+#    config-mounts-contract.sh uses. The gate itself is then asserted as this host really
+#    answers it, below.
 mkdir -p "$WORK/fakebin"
+REAL_UNAME="$(command -v uname)"
+printf '#!/bin/sh\ncase "$1" in -s) echo Darwin ;; *) exec %s "$@" ;; esac\n' \
+  "$REAL_UNAME" >"$WORK/fakebin/uname"
 printf '#!/bin/sh\necho "fake docker refuses" >&2\nexit 1\n' >"$WORK/fakebin/docker"
-chmod +x "$WORK/fakebin/docker"
+chmod +x "$WORK/fakebin/uname" "$WORK/fakebin/docker"
 set +e
 PATH="$WORK/fakebin:$PATH" bash "$SCRIPT" calibration >"$WORK/script.txt" 2>&1
 STATUS=$?
@@ -180,6 +189,23 @@ grep -Fq 'libkrunfw.5.dylib' "$SCRIPT" || fail "the firmware artifact must be na
 grep -Fq 'UNPROVEN' "$SCRIPT" || fail "the UNPROVEN clean-rebuild label must persist"
 # The failed run's owned build directory is test-created scratch, not operator state.
 rm -rf "$EVID" "$ROOT/target/$(basename "$EVID")"
+
+# The gate the fake `uname` steps past is real on the Linux `contracts` runner: a host with no
+# supplied Linux host refuses before any work, names the block, and still keeps its evidence.
+if [[ "$(uname -s)" == Linux ]]; then
+  set +e
+  bash "$SCRIPT" calibration >"$WORK/host-gate.txt" 2>&1
+  GATE_STATUS=$?
+  set -e
+  [[ $GATE_STATUS -eq 3 ]] || fail "a host with no supplied Linux host must exit 3, got $GATE_STATUS"
+  grep -Fq 'BLOCKED: Linux/KVM' "$WORK/host-gate.txt" || fail "the host gate must name its block"
+  GATE_EVID="$(sed -n 's/.* E=\([^ ]*\).*/\1/p' "$WORK/host-gate.txt" | head -1)"
+  [[ -n "$GATE_EVID" && -d "$GATE_EVID" ]] || fail "the host gate must name its evidence directory"
+  [[ ! -e "$GATE_EVID/evidence/PASS" ]] || fail "a host gate must leave no PASS"
+  grep -Fq 'BLOCKED: Linux/KVM' "$GATE_EVID/evidence/commands.log" ||
+    fail "the host gate must be retained in the evidence log"
+  rm -rf "$GATE_EVID" "$ROOT/target/$(basename "$GATE_EVID")"
+fi
 
 # 5. Errexit inside the protocol subshell (review F2). The wrapper captures the protocol's status
 #    with `set +e`, which also disables errexit for everything the subshell inherits. The subshell
