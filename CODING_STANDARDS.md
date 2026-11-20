@@ -63,6 +63,27 @@ Functions can end up interacting poorly with `set -e`
 
 Write tests for bash code.
 
+## Shell or Rust
+
+Shell is for straightforward automation only (ADR-0072). It may:
+
+* sequence commands and check exit codes;
+* set environment variables and paths;
+* run simple `grep`/`sed`;
+* pull fields out with a `jq` one-liner.
+
+Everything else belongs in Rust, in the `agent-vm-harness` crate:
+
+* PTYs, signals, and timing races;
+* sockets and servers;
+* concurrency;
+* parsing beyond a `jq` one-liner;
+* hashing and building structured data;
+* any function with branching worth testing.
+
+No new `python3` on the host. `script/test/no-host-python.sh` fails the gate on
+it.
+
 # Code Quality Guidelines
 
 ## Documentation

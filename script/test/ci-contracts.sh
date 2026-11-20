@@ -29,12 +29,13 @@ Usage: script/test/ci-contracts.sh [--guard-only]
 Run the CI pre-build gate: runtime source provenance, harness contracts, and the
 shell guard rail.
 
-  --guard-only  Run only the shell guard rail (bash -n + shellcheck). Test seam
-                for exercising the guard in a worktree without the
-                vendor/microsandbox submodule, which the contract checks need.
-                Not the gate: this skips the runtime provenance checks, every
-                contract, and the mutation-anchor check, so it can be green
-                while the `contracts` CI job is red.
+  --guard-only  Run only the shell and host-Python guard rails (bash -n,
+                shellcheck, no-host-python.sh). Test seam for exercising the
+                guards in a worktree without the vendor/microsandbox submodule,
+                which the contract checks need. Not the gate: this skips the
+                runtime provenance checks, every contract, and the
+                mutation-anchor check, so it can be green while the `contracts`
+                CI job is red.
 EOF
 }
 
@@ -48,6 +49,19 @@ if (($#)); then
 fi
 
 if [[ "$guard_only" == false ]]; then
+    # --- Harness tooling (ADR-0072) -----------------------------------------
+    # The shell suites call the `harness` binary by path, so it is built once
+    # here and never through `cargo run`. HARNESS_BIN_DIR is what every caller
+    # reads; cargo itself is asked where the binaries went, because
+    # CARGO_TARGET_DIR and a configured build.target both move them.
+    cargo build --locked --manifest-path "$REPO_ROOT/Cargo.toml" -p agent-vm-harness --bins
+    cargo clippy --locked --manifest-path "$REPO_ROOT/Cargo.toml" \
+        -p agent-vm-harness --all-targets -- -D warnings
+    cargo test --locked --manifest-path "$REPO_ROOT/Cargo.toml" -p agent-vm-harness
+    harness_target="$(cargo metadata --locked --no-deps --format-version 1 |
+        jq -r .target_directory)" || fail 'cannot read the cargo target directory'
+    export HARNESS_BIN_DIR="${HARNESS_BIN_DIR:-$harness_target/debug}"
+
     # --- Runtime source provenance and harness contracts ---------------------
     bash "$REPO_ROOT/script/test/runtime-provenance.sh"
     "$REPO_ROOT/script/check-runtime-provenance.sh"
@@ -114,6 +128,8 @@ fi
 # script/test/example-layers.sh guards them.
 syntax_check=(
     script/test/ci-test-shard.sh
+    script/test/no-host-python.sh
+    script/test/no-host-python-test.sh
     script/test/access-prompt-tmux-oracle.sh
     vendor/microsandbox/vendor/libkrunfw/build_in_docker.sh
     script/check-runtime-provenance.sh
@@ -179,6 +195,8 @@ syntax_check=(
 # syntax_check rather than a divergence from the criterion above.
 shellcheck_files=(
     script/test/ci-test-shard.sh
+    script/test/no-host-python.sh
+    script/test/no-host-python-test.sh
     script/test/access-prompt-tmux-oracle.sh
     vendor/microsandbox/vendor/libkrunfw/build_in_docker.sh
     vendor/microsandbox/vendor/libkrunfw/scripts/test-build-in-docker.sh
@@ -264,6 +282,12 @@ assert_listed 'bash -n' 'script/test/ci-macos-legs.sh' "${syntax_check[@]}"
 assert_listed 'shellcheck' 'script/test/ci-macos-legs.sh' "${shellcheck_files[@]}"
 assert_listed 'bash -n' 'script/test/ci-test-shard.sh' "${syntax_check[@]}"
 assert_listed 'shellcheck' 'script/test/ci-test-shard.sh' "${shellcheck_files[@]}"
+# ADR-0072's guard and its controls decide whether host Python comes back, so
+# neither may drop out of the shell guard that keeps them parseable and linted.
+assert_listed 'bash -n' 'script/test/no-host-python.sh' "${syntax_check[@]}"
+assert_listed 'shellcheck' 'script/test/no-host-python.sh' "${shellcheck_files[@]}"
+assert_listed 'bash -n' 'script/test/no-host-python-test.sh' "${syntax_check[@]}"
+assert_listed 'shellcheck' 'script/test/no-host-python-test.sh' "${shellcheck_files[@]}"
 # ci.yml's macOS keychain contract job runs this one, and it is the only caller of
 # the opt-in `--ignored` test that spends the real `/usr/bin/security`.
 assert_listed 'bash -n' 'script/test/keychain-contract.sh' "${syntax_check[@]}"
@@ -380,8 +404,17 @@ for script_file in "${shellcheck_files[@]}"; do
 done
 shellcheck "${present[@]}" || fail "shellcheck reported findings"
 
+# --- Host Python guard (ADR-0072) --------------------------------------------
+# Boot-free, submodule-free and cheap, so it runs in both modes: a new `python3`
+# call fails the gate the moment it is written, not when it runs. Its own controls
+# run with it, because a guard nobody exercises is a guard that will be switched
+# off. Last, so the shell guard's own self-checks (which a scratch-root copy of
+# this script relies on) always answer first.
+bash "$REPO_ROOT/script/test/no-host-python.sh"
+bash "$REPO_ROOT/script/test/no-host-python-test.sh"
+
 if [[ "$guard_only" == true ]]; then
-    echo "shell guard passed"
+    echo "shell and host-Python guard rails passed"
 else
-    echo "ci provenance/contract checks and shell guard passed"
+    echo "ci provenance/contract checks and guard rails passed"
 fi

@@ -820,6 +820,14 @@ _Avoid_: "verified module" — the unit is the decision, not the module it lives
 in; "contract test" — a test samples the input space, a contract is checked for
 all inputs.
 
+## Harness check
+
+A boot-free check of the test harness's own fixtures, drivers and oracles,
+run without a microVM. It samples inputs; it is not a **boundary contract**.
+
+_Avoid_: "contract", "contract test" — reserved for machine-checked
+properties.
+
 ## Git metadata mount
 
 An additional live mount exposing the per-worktree or shared Git metadata of
