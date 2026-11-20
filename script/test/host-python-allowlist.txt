@@ -34,16 +34,6 @@ profiling/build_variants.sh 1
 # this final caller and then this entry.
 script/test/lib/build-provenance.py
 
-# --- Migration debt: CPU commitment evidence --------------------------------
-script/test/cpu-commitment-manifest.py
-script/test/cpu-commitment-select.py
-script/test/cpu-commitment-native.sh 6
-script/test/cpu-commitment-native-contract.sh 18
-
-# --- Migration debt: build archive oracle and image pins -------------------
-script/test/fixtures/build-archive-oracle.py
-script/test/e2e-image-pins-contract.sh 1
-
 # --- Migration debt: released image launch ---------------------------------
 script/test/released-image-launch.py
 script/test/released-image-launch-test.py
@@ -77,7 +67,7 @@ script/test/lib/detached-run.py
 script/test/fixtures/direct-terminal/launcher-standin.py
 script/test/lib/direct-terminal.py
 script/test/lib/direct-terminal-contract.py
-script/test/e2e.sh 21
+script/test/e2e.sh 18
 # Runs every suite above, so it names Python until they are ported.
 script/test/ci-contracts.sh 3
 

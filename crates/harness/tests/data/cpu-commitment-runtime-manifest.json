@@ -1,0 +1,9 @@
+{
+  "agent_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "clean_firmware_rebuild": "UNPROVEN",
+  "firmware_path": "/private/tmp/cpu-commitment-runtime-manifest-golden/firmware",
+  "firmware_sha256": "c3bf47ea1f4a4a605470313cacb3a44f4a461f68c6faeab07e737610cb5ac835",
+  "msb_path": "/private/tmp/cpu-commitment-runtime-manifest-golden/msb",
+  "msb_sha256": "b59be1bbdb5c6e61f0bf9ad7f02e0c793227a8e3eeaf631d8c6b1eb684759b82",
+  "vendor_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+}

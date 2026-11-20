@@ -160,7 +160,9 @@ fi
 # advertised AGENT_VM_BIN as the debug candidate; both are validated where used.
 AGENT_VM_DEV_BIN="${AGENT_VM_DEV_BIN:-$AGENT_VM}"
 AGENT_VM_RELEASE_BIN="${AGENT_VM_RELEASE_BIN:-$REPO_ROOT/target/macos/bin/agent-vm}"
-
+HARNESS="${HARNESS_BIN_DIR:-$REPO_ROOT/target/debug}/harness"
+[[ -x "$HARNESS" ]] || die "harness not found at $HARNESS; build it with
+  cargo build --locked -p agent-vm-harness --bins"
 
 # Save native connection/plugin configuration before disposable HOME isolation.
 absolute_override() {
@@ -8222,7 +8224,7 @@ explicit_build() {
     "$AGENT_VM" image build --tag "$BUILD_REF" --builder "$BUILDER" \
     --file "$FIXTURE_DIR/Dockerfile" --target "$target" "$FIXTURE_DIR") || return 1
   [ ! -e "$capture.error" ] || return 1
-  python3 "$REPO_ROOT/script/test/fixtures/build-archive-oracle.py" "$capture" > "$capture.report.json" || return 1
+  "$HARNESS" build-archive-oracle "$capture" > "$capture.report.json" || return 1
   [ ! -e "$BUILD_HOME/.config/agent-vm/default-image.json" ] || return 1
   if docker image inspect "$BUILD_REF" >/dev/null 2>&1; then return 1; fi
 }
@@ -8331,7 +8333,7 @@ custom_explicit_build_workflow() {
   source_before="$(shasum -a 256 "$FIXTURE_DIR"/*)" || return 1
   explicit_build build260 marker-free || return 1
   [ "$source_before" = "$(shasum -a 256 "$FIXTURE_DIR"/*)" ] || return 1
-  python3 "$REPO_ROOT/script/test/fixtures/build-archive-oracle.py" --controls "$WORK/build260.oci.tar" || return 1
+  "$HARNESS" build-archive-oracle --controls "$WORK/build260.oci.tar" || return 1
   explicit_boot build260-first absent --no-git --image "$BUILD_REF" shell hello-258 || return 1
   local out
   out="$(launch_output build260-first)" || return 1
@@ -8400,7 +8402,7 @@ custom_explicit_build_workflow() {
     REAL_DOCKER="$REAL_DOCKER" BUILD_CAPTURE="$WORK/rebuild260.oci.tar" PATH="$WORK/build-bin:$PATH" \
     "$AGENT_VM" image build --tag "$BUILD_REF" --builder "$BUILDER" --target stamp-present "$FIXTURE_DIR") || return 1
   [ ! -e "$WORK/rebuild260.oci.tar.error" ] || return 1
-  python3 "$REPO_ROOT/script/test/fixtures/build-archive-oracle.py" "$WORK/rebuild260.oci.tar" > "$WORK/rebuild260.report.json" || return 1
+  "$HARNESS" build-archive-oracle "$WORK/rebuild260.oci.tar" > "$WORK/rebuild260.report.json" || return 1
   # #391: an explicit build approves the result reference it published, so the
   # established pin for `$BUILD_REF` moved to the rebuilt content and this launch
   # boots it. A fresh HOME with no approval sees the same rebuilt content.
