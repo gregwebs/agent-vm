@@ -16,11 +16,12 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
-# Process and signal primitives (setsid, process groups, wait, getpgid/getsid).
-# rustix exposes no signal *handler* registration, so the two `sigaction` calls
-# in `released_image_launch` come from `libc`, the same escape hatch `agent-vm`
-# uses for `waitid` and `kill`. Both are already in the graph.
-rustix = { version = "1.1", features = ["process"] }
+# Process, PTY, terminal-mode and event primitives (setsid, process groups,
+# wait, getpgid/getsid; posix_openpt; tcgetattr/tcsetattr; poll). `rustix`
+# exposes no signal *handler* registration, so the `sigaction` calls in
+# `released_image_launch` and `pty` come from `libc`, the same escape hatch
+# `agent-vm` uses for `waitid` and `kill`. Both are already in the graph.
+rustix = { version = "1.1", features = ["process", "pty", "termios", "event", "pipe"] }
 libc = "0.2"
 serde_json = "1"
 toml = { version = "1", default-features = false, features = ["parse", "serde"] }

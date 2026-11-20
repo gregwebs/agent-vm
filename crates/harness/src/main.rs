@@ -4,13 +4,15 @@ use clap::Parser;
 /// unexpected failure and carries the label of the command that ran, because a
 /// single shared prefix named whichever port was written first and mislabelled
 /// every later one.
-const OWN_VERDICTS: [&str; 6] = [
+const OWN_VERDICTS: [&str; 8] = [
     "provenance: ",
     "usage: ",
     "FAIL: ",
     "select: ",
     "manifest: ",
     "released-image-launch: ",
+    "detached-run: ",
+    "standin: ",
 ];
 
 fn main() {

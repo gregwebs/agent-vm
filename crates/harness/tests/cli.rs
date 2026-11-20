@@ -709,3 +709,117 @@ fn the_binary_canonicalizes_existing_and_absent_paths() {
         format!("{}\n", canonical.join("nested/absent").display())
     );
 }
+
+// --- The detach shim and the launcher stand-in (#698) -----------------------
+
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+#[test]
+fn the_binary_runs_detached_run_controls() {
+    let output = harness(["detached-run".to_owned(), "--self-test".to_owned()]);
+    assert!(
+        output.status.success(),
+        "detached-run controls failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("control output is UTF-8"),
+        "detached-run: OK (a real controlling terminal is removed; the child is a session leader \
+         with /dev/null stdin)\n"
+    );
+}
+
+#[test]
+fn the_binary_runs_launcher_standin_controls() {
+    let output = harness([
+        "launcher-standin".to_owned(),
+        "--self-test".to_owned(),
+        "--repo-root".to_owned(),
+        repo_root().display().to_string(),
+    ]);
+    assert!(
+        output.status.success(),
+        "launcher-standin controls failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("control output is UTF-8"),
+        "launcher-standin: OK (every mode's frames, statuses and terminal transitions)\n"
+    );
+}
+
+/// The shim's interface is a process's status, so the shipped binary is where it
+/// has to hold: the child's code, a signalled child, both channels inherited,
+/// `/dev/null` on stdin, and misuse kept apart from a failing child.
+#[test]
+fn the_binary_detaches_its_program_and_propagates_its_status() {
+    let detached = |script: &str| {
+        harness([
+            "detached-run".to_owned(),
+            "--".to_owned(),
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            script.to_owned(),
+        ])
+    };
+
+    let channels = detached("echo out; echo err >&2; exit 7");
+    assert_eq!(channels.status.code(), Some(7));
+    assert_eq!(
+        String::from_utf8(channels.stdout).expect("the child's stdout is UTF-8"),
+        "out\n"
+    );
+    assert_eq!(
+        String::from_utf8(channels.stderr).expect("the child's stderr is UTF-8"),
+        "err\n"
+    );
+
+    // Python's `sys.exit(subprocess.run(...).returncode)` truncated the negative
+    // signal number to 256 - N.
+    let signalled = detached("kill -TERM $$");
+    assert_eq!(signalled.status.code(), Some(241));
+
+    let stdin = detached("read -r line && echo read || echo eof");
+    assert_eq!(stdin.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(stdin.stdout).expect("the child's stdout is UTF-8"),
+        "eof\n"
+    );
+
+    let misuse = harness(["detached-run".to_owned()]);
+    assert_eq!(misuse.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8(misuse.stderr).expect("the misuse message is UTF-8"),
+        "detached-run: expected a program to run\n"
+    );
+}
+
+/// A launcher stand-in's statuses are its own 64 for misuse, the guest's
+/// otherwise; #699's fixtures read both.
+#[test]
+fn the_binary_keeps_the_launcher_standin_statuses() {
+    let status = harness([
+        "launcher-standin".to_owned(),
+        "--image".to_owned(),
+        "contract-image".to_owned(),
+        "run".to_owned(),
+        "/bin/sh".to_owned(),
+        "-c".to_owned(),
+        "exit 3".to_owned(),
+    ]);
+    assert_eq!(status.status.code(), Some(3));
+
+    let misuse = harness([
+        "launcher-standin".to_owned(),
+        "--image".to_owned(),
+        "contract-image".to_owned(),
+        "run".to_owned(),
+    ]);
+    assert_eq!(misuse.status.code(), Some(64));
+    assert_eq!(
+        String::from_utf8(misuse.stderr).expect("the misuse message is UTF-8"),
+        "standin: no program after the command boundary\n"
+    );
+}

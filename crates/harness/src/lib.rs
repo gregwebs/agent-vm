@@ -12,9 +12,12 @@ mod build_archive_oracle;
 mod build_provenance;
 mod config_dir_guard;
 mod cpu_commitment;
+mod detached_run;
 mod image_pins;
 mod launch_argv_order;
+mod launcher_standin;
 mod msb_krun_compat;
+mod pty;
 mod released_image_launch;
 
 /// The `harness` commands. A port adds one variant, replacing a Python driver or
@@ -38,8 +41,12 @@ enum Command {
     ConfigDirGuard(config_dir_guard::ConfigDirGuardArgs),
     /// Drive Phase 0 CPU-commitment selection and runtime-provenance manifests.
     CpuCommitment(cpu_commitment::CpuCommitmentArgs),
+    /// Run one command in a session with no controlling terminal and no stdin.
+    DetachedRun(detached_run::DetachedRunArgs),
     /// Check the image-pins live-seed helper dispatch.
     ImagePins(image_pins::ImagePinsArgs),
+    /// Play a launcher's plumbing for the boot-free direct-terminal controls.
+    LauncherStandin(launcher_standin::LauncherStandinArgs),
     /// Check that launch options precede tool verbs.
     LaunchArgvOrder(launch_argv_order::LaunchArgvOrderArgs),
     /// Run the msb-krun compatibility timeout driver.
@@ -63,6 +70,8 @@ impl Cli {
             Command::CpuCommitment(_) => "cpu commitment",
             Command::BuildArchiveOracle(_) => "build archive oracle",
             Command::ReleasedImageLaunch(_) => "released-image launch",
+            Command::DetachedRun(_) => "detached-run",
+            Command::LauncherStandin(_) => "standin",
         }
     }
 }
@@ -85,7 +94,9 @@ pub fn run(cli: Cli) -> Result<Outcome, String> {
         Command::BuildProvenance(args) => build_provenance::run(args).map(Outcome::Report),
         Command::ConfigDirGuard(args) => config_dir_guard::run(args).map(Outcome::Report),
         Command::CpuCommitment(args) => cpu_commitment::run(args).map(Outcome::Report),
+        Command::DetachedRun(args) => detached_run::run(args),
         Command::ImagePins(args) => image_pins::run(args).map(Outcome::Report),
+        Command::LauncherStandin(args) => launcher_standin::run(args),
         Command::LaunchArgvOrder(args) => launch_argv_order::run(args).map(Outcome::Report),
         Command::MsbKrunCompat(args) => msb_krun_compat::run(args).map(Outcome::Report),
         Command::ReleasedImageLaunch(args) => released_image_launch::run(args),
@@ -102,7 +113,9 @@ pub fn failure_status(error: &str) -> Option<i32> {
     if error.starts_with("usage: ") {
         return Some(2);
     }
-    cpu_commitment::failure_status(error)
+    detached_run::failure_status(error)
+        .or_else(|| launcher_standin::failure_status(error))
+        .or_else(|| cpu_commitment::failure_status(error))
 }
 
 #[cfg(test)]
