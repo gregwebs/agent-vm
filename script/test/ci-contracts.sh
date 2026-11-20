@@ -115,7 +115,7 @@ if [[ "$guard_only" == false ]]; then
     python3 "$REPO_ROOT/script/test/egress-mutations.py" --check-anchors
     # #358 moved launch options before the tool verb; the manual migration sweep
     # found the last old-order caller (profiling/) only by reading, so pin it.
-    python3 "$REPO_ROOT/script/test/launch-argv-order.py"
+    bash "$REPO_ROOT/script/test/launch-argv-order.sh"
 
 fi
 
@@ -130,6 +130,7 @@ syntax_check=(
     script/test/ci-test-shard.sh
     script/test/no-host-python.sh
     script/test/no-host-python-test.sh
+    script/test/launch-argv-order.sh
     script/test/access-prompt-tmux-oracle.sh
     vendor/microsandbox/vendor/libkrunfw/build_in_docker.sh
     script/check-runtime-provenance.sh
@@ -197,6 +198,7 @@ shellcheck_files=(
     script/test/ci-test-shard.sh
     script/test/no-host-python.sh
     script/test/no-host-python-test.sh
+    script/test/launch-argv-order.sh
     script/test/access-prompt-tmux-oracle.sh
     vendor/microsandbox/vendor/libkrunfw/build_in_docker.sh
     vendor/microsandbox/vendor/libkrunfw/scripts/test-build-in-docker.sh

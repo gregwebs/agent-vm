@@ -1,10 +1,12 @@
 use clap::Parser;
 
 fn main() {
-    match agent_vm_harness::run(agent_vm_harness::Cli::parse()) {
+    let cli = agent_vm_harness::Cli::parse();
+    let label = cli.failure_label();
+    match agent_vm_harness::run(cli) {
         Ok(output) => println!("{output}"),
         Err(error) => {
-            eprintln!("runtime provenance: FAIL: {error}");
+            eprintln!("{label}: FAIL: {error}");
             std::process::exit(1);
         }
     }

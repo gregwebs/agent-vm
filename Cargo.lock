@@ -70,6 +70,7 @@ version = "0.7.77"
 dependencies = [
  "clap",
  "serde_json",
+ "sha2 0.10.9",
  "toml",
 ]
 
