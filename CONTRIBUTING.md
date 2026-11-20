@@ -71,8 +71,8 @@ provenance, runs the harness contracts, and syntax-checks (`bash -n`) and lints
 (`shellcheck`) every script the workflow runs. Run it locally with shellcheck
 installed (`brew install shellcheck` on macOS, `sudo apt-get install -y
 shellcheck` on Debian/Ubuntu); the full gate also needs the recursive submodule,
-a working Cargo toolchain, and `jq`/`shasum`/`python3` (the boot-free
-released-image controls).
+a working Cargo toolchain, and `jq`/`shasum`/`python3` for the suites ADR-0072
+has not ported yet.
 
 `--guard-only` is not the gate. It runs the guard rails alone — no
 provenance, no contracts, and **no mutation-anchor check** (`egress-mutations.py
