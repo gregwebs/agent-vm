@@ -35,11 +35,11 @@ profiling/build_variants.sh 1
 script/test/lib/build-provenance.py
 
 # --- Migration debt: released image launch ---------------------------------
+# The launch helper itself stays until its last importer
+# (script/test/lib/egress-fixtures.py) is ported: bottom-up rule, #692. Its
+# boot-free controls and the three shell callers are harness checks and harness
+# subcommands now, so this is the only file the section still excuses.
 script/test/released-image-launch.py
-script/test/released-image-launch-test.py
-script/test/e2e-release-contract.sh 7
-script/test/e2e-released-image.sh 3
-script/test/lib/released-image-checks.sh 2
 
 # --- Migration debt: egress ------------------------------------------------
 script/test/lib/egress-fixtures.py

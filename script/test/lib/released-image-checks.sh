@@ -6,6 +6,22 @@
 # native path uses, instead of a duplicated copy that could drift. This file is
 # sourced, so it deliberately sets no shell options; callers use `set -euo pipefail`.
 
+# The harness binary (ADR-0072). A caller that already built it exports
+# HARNESS_BIN_DIR; the fallback names the build command rather than falling back
+# to `cargo run`. The canonical-path queries below go through it because GNU and
+# BSD `readlink -f` disagree about a leaf that does not exist, and an absent leaf
+# is exactly what the build-source check compares.
+released_image_harness() {
+    local repo_root harness
+    repo_root="$(cd -- "${BASH_SOURCE[0]%/*}/../../.." && pwd)"
+    harness="${HARNESS_BIN_DIR:-$repo_root/target/debug}/harness"
+    [[ -x "$harness" ]] || {
+        echo "released-image: missing harness binary: $harness (run: cargo build --locked -p agent-vm-harness --bins)" >&2
+        return 1
+    }
+    "$harness" "$@"
+}
+
 # Assert a selection record is byte-identical immediately after a launch that
 # must not rewrite it. The comparison has to run BEFORE any manual
 # overwrite/restore: a regression that rewrote the retained child to the
@@ -38,7 +54,8 @@ released_image_require_absent_build_source() {
         echo "released-image: AGENT_VM_E2E_BUILD_SOURCE_DIR must be an absolute path" >&2
         return 1
     fi
-    canonical="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$declared")"
+    canonical="$(released_image_harness released-image-launch --canonicalize "$declared")" \
+        || return 1
     if [[ -e "$canonical" ]]; then
         echo "released-image: build source still present at $canonical" >&2
         return 1
@@ -79,5 +96,5 @@ released_image_resolve_node() {
             return 1
         fi
     fi
-    python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$node_bin"
+    released_image_harness released-image-launch --canonicalize "$node_bin"
 }

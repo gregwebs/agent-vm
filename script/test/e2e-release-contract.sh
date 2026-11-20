@@ -2,13 +2,21 @@
 # Early dispatch must not silently preflight a builder or skip prerequisites.
 set -euo pipefail
 ROOT="$(cd "${BASH_SOURCE[0]%/*}/../.." && pwd)"
+# The launch helper and its controls are harness subcommands (ADR-0072). Build
+# them once with `cargo build --locked -p agent-vm-harness --bins`; CI exports
+# HARNESS_BIN_DIR after doing so for every shell caller.
+harness="${HARNESS_BIN_DIR:-$ROOT/target/debug}/harness"
+[[ -x "$harness" ]] || {
+    echo "contract: FAIL: missing harness binary: $harness (run: cargo build --locked -p agent-vm-harness --bins)" >&2
+    exit 1
+}
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/av-release-contract.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/bin" "$WORK/tools" "$WORK/home" "$WORK/config"
 # Expose only the released-image gate's declared tool prerequisites to the
 # isolated PATH. Link each file (not its directory), because a directory symlink
 # would also leak unrelated host tools past the builder decoys.
-for tool in jq shasum python3; do
+for tool in jq shasum; do
     command -v "$tool" >/dev/null 2>&1 || { echo "contract test needs $tool on PATH" >&2; exit 1; }
     ln -s "$(command -v "$tool")" "$WORK/tools/$tool"
 done
@@ -81,10 +89,16 @@ fi
 if released_image_require_absent_build_source "relative/source" >/dev/null 2>&1; then
     echo 'F2: relative build source accepted' >&2; exit 1
 fi
-absent_canonical="$(released_image_require_absent_build_source "$WORK/absent-source")" \
+# The absent path is compared against the shell's own oracle, `pwd -P`, through a
+# symlinked parent: that is what proves the predicate resolves the prefix of a
+# path that does not exist, rather than echoing its argument back.
+mkdir -p "$WORK/real-parent"
+ln -s "$WORK/real-parent" "$WORK/link-parent"
+absent_canonical="$(released_image_require_absent_build_source "$WORK/link-parent/absent")" \
     || { echo 'F2: absent build source rejected' >&2; exit 1; }
-[[ "$absent_canonical" == "$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$WORK/absent-source")" ]] \
-    || { echo 'F2: canonical absent path mismatch' >&2; exit 1; }
+expected_absent="$(cd "$WORK/real-parent" && pwd -P)/absent"
+[[ "$absent_canonical" == "$expected_absent" ]] \
+    || { echo "F2: canonical absent path is $absent_canonical, expected $expected_absent" >&2; exit 1; }
 
 # F2 wiring: the dispatch must stop at the source prerequisite before any boot.
 printf '#!/bin/sh\nexit 0\n' > "$WORK/bin/agent-vm"; chmod 755 "$WORK/bin/agent-vm"
@@ -114,7 +128,7 @@ released_image_is_node_candidate "$WORK/nonstd/agent-vm.js" \
 if released_image_is_node_candidate "$WORK/bin/agent-vm"; then
     echo 'F3: native binary misdetected as a Node dispatcher' >&2; exit 1
 fi
-node_canonical="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$WORK/nonstd/bin/node")"
+node_canonical="$(cd "$WORK/nonstd/bin" && pwd -P)/node"
 resolved="$(PATH="$WORK/nonstd/bin:/usr/bin:/bin" released_image_resolve_node "")" \
     || { echo 'F3: non-system node not resolved' >&2; exit 1; }
 [[ "$resolved" == "$node_canonical" ]] || { echo 'F3: resolved node is not canonical' >&2; exit 1; }
@@ -145,7 +159,7 @@ SH
 chmod 755 "$WORK/nonstd/bin/vetted-node"
 : > "$WORK/builder.log"
 status=0
-INHERITED_SECRET=leak python3 -B "$ROOT/script/test/released-image-launch.py" \
+INHERITED_SECRET=leak "$harness" released-image-launch \
     --root "$WORK/r" --shim "$WORK/shim" --log "$WORK/builder.log" \
     --binary "$WORK/nonstd/agent-vm.js" \
     --interpreter "$WORK/nonstd/bin/vetted-node" --timeout 30 --grace 2 \
@@ -167,18 +181,13 @@ if grep -q 'INHERITED_SECRET' "$WORK/dispatch-record"; then
 fi
 [[ ! -s "$WORK/builder.log" ]] || { echo 'F3: dispatched launch invoked a builder' >&2; exit 1; }
 
-# F4: parse both helper files without writing bytecode, keep the tree free of
-# tracked caches, then run the process-group timeout controls.
-ROOT="$ROOT" python3 - <<'PY'
-import ast, os, pathlib
-root = pathlib.Path(os.environ["ROOT"])
-for rel in ("script/test/released-image-launch.py", "script/test/released-image-launch-test.py"):
-    ast.parse((root / rel).read_text())
-PY
+# F4: the launch helper is Rust, so a syntax guard is the compiler's job now;
+# what remains to check is that the tree carries no Python bytecode cache and
+# that the process-group timeout/interruption controls pass.
 if git -C "$ROOT" ls-files | grep -Eq '(^|/)__pycache__/|\.pyc$'; then
     echo 'tracked Python bytecode cache present' >&2; exit 1
 fi
-python3 -B "$ROOT/script/test/released-image-launch-test.py"
+"$harness" released-image-launch --self-test
 
 [[ ! -s "$WORK/docker.log" ]] || { echo 'a decoy builder was invoked' >&2; exit 1; }
 echo 'released-image early-dispatch and boot-free controls passed'
