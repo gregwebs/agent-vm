@@ -121,14 +121,15 @@ fi
 run boundary
 boundary_discovery="$(find "$tmp/evidence/boundary" -name 'boundary-64-discovery.json' -print -quit)"
 [[ -n "$boundary_discovery" ]] || { echo "Darwin boundary did not record discovery" >&2; exit 1; }
-python3 - "$boundary_discovery" <<'PY'
-import json, sys
-with open(sys.argv[1]) as source: result = json.load(source)
-assert result["fdt_delta"] == 64
-assert result["virtio_fs_delta"] == 64
-assert result["cmdline_bytes"] == 202
-assert set(result["selected_mounts"]) == {"/m000", "/m031", "/m063"}
-PY
+jq -e '
+    .fdt_delta == 64 and
+    .virtio_fs_delta == 64 and
+    .cmdline_bytes == 202 and
+    (.selected_mounts | keys == ["/m000", "/m031", "/m063"])
+' "$boundary_discovery" >/dev/null || {
+    echo "Darwin boundary discovery did not contain the expected evidence" >&2
+    exit 1
+}
 if MSB_KRUN_COMPAT_CMDLINE_MOUNTS=64 run boundary >/dev/null 2>&1; then
     echo "Darwin must reject a cmdline profile override" >&2
     exit 1
@@ -173,11 +174,10 @@ fi
 printf 'malformed\r\nCMDLINE_BYTES| 999999999999999999999999999999999999999999999999 \rCMDLINE_BYTES|１_٢𝟛\n' >"$tmp/python-int.log"
 cargo run --locked --quiet --manifest-path "$repo_root/Cargo.toml" -p msb-krun-compat-evidence -- \
     discovery --guest-log "$tmp/python-int.log" --output "$tmp/python-int.json" --expected-mounts 0 --selected-indexes=
-python3 - "$tmp/python-int.json" <<'PY'
-import json, sys
-with open(sys.argv[1]) as source: result = json.load(source)
-assert result["cmdline_bytes"] == 123
-PY
+jq -e '.cmdline_bytes == 123' "$tmp/python-int.json" >/dev/null || {
+    echo "Python-compatible cmdline integer parsing regressed" >&2
+    exit 1
+}
 
 after_boundary="$(find "$tmp/evidence/boundary" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')"
 run boundary
@@ -188,13 +188,18 @@ run boundary
 
 run measure
 observations="$(find "$tmp/evidence/measure" -name observations.json -print -quit)"
-python3 - "$observations" <<'PY'
-import json, sys
-with open(sys.argv[1]) as source: result = json.load(source)
-assert result["discovery_kind"] == "fdt-sysfs"
-assert result["reviewed_profile_candidate"] == {"boundary_mounts": [4, 64], "high_mounts": 112, "stress_mounts": 64}
-assert "cmdline_mounts" not in result["reviewed_profile_candidate"]
-PY
+jq -e '
+    .discovery_kind == "fdt-sysfs" and
+    .reviewed_profile_candidate == {
+        "boundary_mounts": [4, 64],
+        "high_mounts": 112,
+        "stress_mounts": 64
+    } and
+    (.reviewed_profile_candidate | has("cmdline_mounts") | not)
+' "$observations" >/dev/null || {
+    echo "Darwin measurement observations regressed" >&2
+    exit 1
+}
 # A measurement retains a known first failed probe and still tests the frozen high case.
 PATH="$tmp/bin:$PATH" MSB_COMPAT_TEST_LOG="$tmp/invocations.log" MSB_COMPAT_TEST_FAIL_COUNT=8 \
 MSB_BIN="$tmp/bin/msb" MSB_LIBKRUNFW_PATH="$tmp/firmware" MSB_COMPAT_DOCKER_IMAGE=alpine:3.20 \
@@ -202,13 +207,14 @@ MSB_KRUN_COMPAT_EVIDENCE_DIR="$tmp/evidence" MSB_KRUN_MEASURE_REPEATS=1 MSB_KRUN
 "$repo_root/script/test/msb-krun-compat.sh" measure
 failure_observations="$(grep -rl '"first_attempted_failure": 8' "$tmp/evidence/measure")"
 [[ -n "$failure_observations" ]] || { echo "measure did not retain the first failure" >&2; exit 1; }
-python3 - "$failure_observations" <<'PY'
-import json, sys
-with open(sys.argv[1]) as source: result = json.load(source)
-assert result["observed_successful_mounts"] == 4
-assert result["first_attempted_failure"] == 8
-assert "synthetic mount failure" in result["failure_reason"]
-PY
+jq -e '
+    .observed_successful_mounts == 4 and
+    .first_attempted_failure == 8 and
+    (.failure_reason | contains("synthetic mount failure"))
+' "$failure_observations" >/dev/null || {
+    echo "measurement failure observations regressed" >&2
+    exit 1
+}
 
 # Linux remains a distinct profile with four required values and an x86-only cmdline proof.
 grep -q 'Linux KVM profile not calibrated; set:' "$repo_root/script/test/msb-krun-compat.sh"

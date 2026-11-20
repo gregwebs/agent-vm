@@ -13,6 +13,11 @@ readonly DARWIN_HIGH_MOUNTS=112
 readonly DARWIN_STRESS_MOUNTS=64
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+harness="${HARNESS_BIN_DIR:-$repo_root/target/debug}/harness"
+[[ -x "$harness" ]] || {
+    echo "error: missing harness binary: $harness (run: cargo build --locked -p agent-vm-harness --bins)" >&2
+    exit 1
+}
 command -v cargo >/dev/null || { echo "error: Cargo is required for compatibility evidence" >&2; exit 1; }
 compat_evidence() {
     cargo run --locked --quiet --manifest-path "$repo_root/Cargo.toml" -p msb-krun-compat-evidence -- "$@"
@@ -79,19 +84,9 @@ run_msb() {
 run_timeout() {
     local label="$1"
     shift
-    python3 - "$BOOT_TIMEOUT_SECONDS" "$log_dir/$label.out" "$log_dir/$label.err" "$MSB_BIN" "$MSB_LIBKRUNFW_PATH" "$state_dir" -- "$@" <<'PY'
-import os, subprocess, sys
-seconds, out, err, binary, firmware, home = sys.argv[1:7]
-command = sys.argv[8:]
-env = os.environ | {"MSB_HOME": home, "MSB_LIBKRUNFW_PATH": firmware}
-with open(out, "wb") as stdout, open(err, "wb") as stderr:
-    try:
-        sys.exit(subprocess.run([binary, *command], env=env, stdout=stdout, stderr=stderr,
-                                timeout=int(seconds)).returncode)
-    except subprocess.TimeoutExpired:
-        print("compatibility boot timed out", file=sys.stderr)
-        sys.exit(124)
-PY
+    "$harness" msb-krun-compat --timeout-seconds "$BOOT_TIMEOUT_SECONDS" \
+        --stdout "$log_dir/$label.out" --stderr "$log_dir/$label.err" \
+        --binary "$MSB_BIN" --firmware "$MSB_LIBKRUNFW_PATH" --home "$state_dir" -- "$@"
 }
 
 # Loading through the same isolated home removes dependence on another msb cache.
