@@ -823,3 +823,605 @@ fn the_binary_keeps_the_launcher_standin_statuses() {
         "standin: no program after the command boundary\n"
     );
 }
+
+// --- The egress fixtures (#692) ---------------------------------------------
+
+fn egress(arguments: impl IntoIterator<Item = String>) -> Output {
+    let mut argv = vec!["egress-fixtures".to_owned()];
+    argv.extend(arguments);
+    harness(argv)
+}
+
+/// `wait-receipt`'s three statuses are its interface: an egress denial oracle
+/// needs "not yet" (1, only after the whole bound) apart from "never" (2).
+#[test]
+fn the_binary_keeps_the_wait_receipt_statuses() {
+    let scratch = Scratch::new("egress-wait");
+    fs::write(
+        scratch.path.join("receipts.log"),
+        "tcp 18080 127.0.0.1 owned-receipt\n",
+    )
+    .expect("a receipt log");
+    let directory = scratch.path.to_str().expect("a UTF-8 scratch path");
+
+    let seen = egress([
+        "wait-receipt".to_owned(),
+        "--dir".to_owned(),
+        directory.to_owned(),
+        "owned-receipt".to_owned(),
+        "--timeout".to_owned(),
+        "0".to_owned(),
+    ]);
+    assert_eq!(seen.status.code(), Some(0));
+
+    // A prefix of a recorded id is not the id: an ID match that ran on prefixes
+    // would certify a probe that never arrived.
+    let prefix = egress([
+        "wait-receipt".to_owned(),
+        "--dir".to_owned(),
+        directory.to_owned(),
+        "owned".to_owned(),
+        "--timeout".to_owned(),
+        "0".to_owned(),
+    ]);
+    assert_eq!(prefix.status.code(), Some(1));
+
+    let started = std::time::Instant::now();
+    let unseen = egress([
+        "wait-receipt".to_owned(),
+        "--dir".to_owned(),
+        directory.to_owned(),
+        "never-written".to_owned(),
+        "--timeout".to_owned(),
+        "0.3".to_owned(),
+    ]);
+    assert_eq!(unseen.status.code(), Some(1));
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(300),
+        "the absence bound must elapse before 'never' is answered"
+    );
+
+    // An unreadable log is an internal error (2), and says so on stderr.
+    let unreadable = egress([
+        "wait-receipt".to_owned(),
+        "--dir".to_owned(),
+        scratch
+            .path
+            .join("receipts.log")
+            .to_str()
+            .expect("a path")
+            .to_owned(),
+        "owned-receipt".to_owned(),
+        "--timeout".to_owned(),
+        "0".to_owned(),
+    ]);
+    assert_eq!(unreadable.status.code(), Some(2));
+    assert!(
+        String::from_utf8(unreadable.stderr)
+            .expect("a UTF-8 message")
+            .starts_with("wait-receipt: "),
+        "an internal error names itself"
+    );
+
+    // A bound that cannot be waited is misuse, not a wait that fails.
+    let misuse = egress([
+        "wait-receipt".to_owned(),
+        "--dir".to_owned(),
+        directory.to_owned(),
+        "owned-receipt".to_owned(),
+        "--timeout".to_owned(),
+        "-1".to_owned(),
+    ]);
+    assert_eq!(misuse.status.code(), Some(2));
+}
+
+#[test]
+fn the_binary_answers_resolve() {
+    // A literal address needs no resolver, so this control is the same on every
+    // host; the JSON is printed whether or not the address is among them,
+    // because a failing calibration is diagnosed from the answer.
+    let found = egress([
+        "resolve".to_owned(),
+        "127.0.0.1".to_owned(),
+        "127.0.0.1".to_owned(),
+    ]);
+    assert_eq!(found.status.code(), Some(0));
+    let answer: serde_json::Value =
+        serde_json::from_slice(&found.stdout).expect("resolve prints JSON");
+    assert_eq!(answer["name"], json!("127.0.0.1"));
+    assert_eq!(answer["addresses"], json!(["127.0.0.1"]));
+
+    let other = egress([
+        "resolve".to_owned(),
+        "127.0.0.1".to_owned(),
+        "127.0.0.2".to_owned(),
+    ]);
+    assert_eq!(other.status.code(), Some(1));
+    assert!(!other.stdout.is_empty(), "the answer is printed either way");
+}
+
+/// The supervisor's statuses: `ready` only once every listener bound, 0 on
+/// SIGTERM, and `health` 1 as soon as its readiness marker is gone.
+#[test]
+fn the_binary_serves_the_egress_fixtures() {
+    let scratch = Scratch::new("egress-serve");
+    let directory = scratch.path.join("fx");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_harness"))
+        .args([
+            "egress-fixtures",
+            "serve",
+            "--dir",
+            directory.to_str().expect("a UTF-8 scratch path"),
+            "--ephemeral-ports",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the fixture supervisor starts");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !directory.join("ready").is_file() {
+        assert!(
+            child.try_wait().expect("poll the supervisor").is_none(),
+            "the supervisor exited before it was ready"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the supervisor did not become ready"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let ports: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(directory.join("ports.json")).expect("ports.json"),
+    )
+    .expect("ports.json is JSON");
+    for kind in ["tcp", "udp"] {
+        assert_eq!(ports[kind].as_array().map(Vec::len), Some(2), "{kind}");
+        for port in ports[kind].as_array().expect("a list") {
+            let port = port.as_u64().expect("a number");
+            assert!(
+                (1..65535).contains(&port),
+                "{kind} port {port} was not bound"
+            );
+        }
+    }
+    let healthy = egress([
+        "health".to_owned(),
+        "--dir".to_owned(),
+        directory.to_str().expect("a UTF-8 scratch path").to_owned(),
+    ]);
+    assert_eq!(healthy.status.code(), Some(0));
+
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(child.wait().expect("the supervisor exits").code(), Some(0));
+
+    fs::remove_file(directory.join("ready")).expect("remove readiness");
+    let unhealthy = egress([
+        "health".to_owned(),
+        "--dir".to_owned(),
+        directory.to_str().expect("a UTF-8 scratch path").to_owned(),
+    ]);
+    assert_eq!(unhealthy.status.code(), Some(1));
+}
+
+/// An exec shim's status is its candidate's, and its identity receipt exists
+/// before the candidate runs: a launch the candidate refuses can still be
+/// reaped.
+#[test]
+fn the_binary_shims_an_exec_into_an_owned_identity() {
+    let scratch = Scratch::new("egress-shim");
+    let identity = scratch.path.join("id.json");
+    let log = scratch.path.join("shim.log");
+    let status = egress([
+        "exec-shim".to_owned(),
+        "--identity".to_owned(),
+        identity.to_str().expect("a UTF-8 scratch path").to_owned(),
+        "--output".to_owned(),
+        log.to_str().expect("a UTF-8 scratch path").to_owned(),
+        "--environment".to_owned(),
+        "{\"PATH\":\"/usr/bin:/bin\",\"MARK\":\"only-this\"}".to_owned(),
+        "--".to_owned(),
+        "/bin/sh".to_owned(),
+        "-c".to_owned(),
+        "echo \"mark=$MARK home=${HOME-unset}\"; exit 7".to_owned(),
+    ]);
+    assert_eq!(status.status.code(), Some(7));
+    assert_eq!(
+        fs::read_to_string(&log).expect("the shim log"),
+        // The environment is replaced, not extended: an inherited HOME would be
+        // a variable the harness never granted leaking into a deny row.
+        "mark=only-this home=unset\n"
+    );
+    let recorded: serde_json::Value =
+        serde_json::from_slice(&fs::read(&identity).expect("the identity receipt"))
+            .expect("the identity receipt is JSON");
+    assert!(recorded["pid"].as_u64().expect("a pid") > 0);
+    assert_eq!(
+        recorded["start"].as_array().map(Vec::len),
+        Some(2),
+        "the start time is a (seconds, microseconds) pair"
+    );
+    assert!(recorded["pgid"].as_u64().expect("a pgid") > 0);
+}
+
+#[test]
+fn the_binary_runs_the_egress_fixture_controls() {
+    let output = egress(["self-test".to_owned()]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("the control output is UTF-8");
+    for claim in [
+        "host-only SNI parser and opaque recorder controls PASS",
+        "self-test: both TCP, both UDP, CONNECT and full 3s absence OK",
+        "self-test: HN/OP gate and outcome-(d) wording OK",
+    ] {
+        assert!(stdout.contains(claim), "missing claim: {claim}\n{stdout}");
+    }
+}
+
+/// The §6.7 join reads this output: 85 cases and nine administrative objects,
+/// each a JSON object on its own line, and the smoke tier a strict subset.
+#[test]
+fn the_binary_prints_the_whole_case_plan() {
+    let plan = egress([
+        "run".to_owned(),
+        "--print-plan".to_owned(),
+        "--work".to_owned(),
+        "/var/tmp/av302.PLAN".to_owned(),
+        "--binary".to_owned(),
+        "/absolute/bundle/bin/agent-vm".to_owned(),
+        "--lan".to_owned(),
+        "192.168.1.2".to_owned(),
+    ]);
+    assert_eq!(
+        plan.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&plan.stderr)
+    );
+    let rows: Vec<serde_json::Value> = String::from_utf8(plan.stdout)
+        .expect("the plan is UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each line is a JSON object"))
+        .collect();
+    assert_eq!(rows.len(), 94);
+    let cases: Vec<&serde_json::Value> = rows.iter().filter(|row| row["kind"] != "admin").collect();
+    assert_eq!(cases.len(), 85);
+    assert_eq!(
+        rows.iter().filter(|row| row["kind"] == "admin").count(),
+        9,
+        "nine administrative objects"
+    );
+    // Every case row is executable: an argv, a cwd, a supervisor and a shim that
+    // names this binary, so the plan and the supervisor cannot disagree.
+    for row in &cases {
+        assert!(row["argv"].as_array().is_some_and(|argv| !argv.is_empty()));
+        assert!(row["cwd"].as_str().is_some_and(|cwd| !cwd.is_empty()));
+        assert!(
+            row["supervisor"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty())
+        );
+        let shim = row["shim"]["argv"].as_array().expect("a shim argv");
+        assert_eq!(shim[1], "egress-fixtures");
+        assert_eq!(shim[2], "exec-shim");
+    }
+    // The smoke tier is the numeric subset plus RF1's two variants: 11 cases,
+    // the same nine administrative objects.
+    let smoke = egress([
+        "run".to_owned(),
+        "--print-plan".to_owned(),
+        "--smoke".to_owned(),
+        "--work".to_owned(),
+        "/var/tmp/av302.PLAN".to_owned(),
+        "--binary".to_owned(),
+        "/absolute/bundle/bin/agent-vm".to_owned(),
+        "--lan".to_owned(),
+        "192.168.1.2".to_owned(),
+    ]);
+    assert_eq!(smoke.status.code(), Some(0));
+    let smoke: Vec<serde_json::Value> = String::from_utf8(smoke.stdout)
+        .expect("the plan is UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each line is a JSON object"))
+        .collect();
+    assert_eq!(smoke.len(), 20);
+    assert_eq!(
+        smoke.iter().filter(|row| row["kind"] != "admin").count(),
+        11
+    );
+}
+
+/// A run without a candidate, the assets and a fixture LAN is refused *before*
+/// anything is created: a sweep that guessed them would launch something else, and
+/// one that started and then refused would leave a work directory behind.
+#[test]
+fn the_binary_refuses_a_run_without_a_candidate() {
+    let refused = egress(["run".to_owned()]);
+    assert_eq!(refused.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("native run requires absolute AGENT_VM_BIN"),
+        "{stderr}"
+    );
+    assert!(refused.stdout.is_empty(), "no plan is printed");
+    // A relative candidate is refused rather than resolved against the cwd.
+    let relative = egress([
+        "run".to_owned(),
+        "--binary".to_owned(),
+        "target/debug/agent-vm".to_owned(),
+        "--assets".to_owned(),
+        "/tmp/assets".to_owned(),
+        "--lan".to_owned(),
+        "192.168.1.2".to_owned(),
+    ]);
+    assert_eq!(relative.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&relative.stderr)
+            .contains("native run requires absolute AGENT_VM_BIN"),
+        "{}",
+        String::from_utf8_lossy(&relative.stderr)
+    );
+    // And a public fixture LAN is refused: it would dial someone else's host.
+    let public = egress([
+        "run".to_owned(),
+        "--binary".to_owned(),
+        "/absolute/bundle/bin/agent-vm".to_owned(),
+        "--assets".to_owned(),
+        "/tmp/assets".to_owned(),
+        "--lan".to_owned(),
+        "203.0.113.9".to_owned(),
+    ]);
+    assert_eq!(public.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&public.stderr).contains("RFC1918/CGN"),
+        "{}",
+        String::from_utf8_lossy(&public.stderr)
+    );
+}
+
+/// The ingress driver: I1 waits for the guest's readiness line, I2 joins the
+/// published body against the case id.
+///
+/// The driver publishes IN1 on the host port the catalogue gives it (18556), so
+/// the control binds that port itself and answers the two bodies that decide the
+/// verdict.
+#[test]
+fn the_binary_joins_the_ingress_body() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let serve = |body: &'static str| {
+        let listener = TcpListener::bind(("127.0.0.1", 18556))
+            .expect("the IN1 host port 18556 is free for the ingress control");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        })
+    };
+
+    let scratch = Scratch::new("egress-ingress");
+    fs::write(
+        scratch.path.join("IN1.log"),
+        "booting\nINGRESS_READY IN1 8000\n",
+    )
+    .expect("the launch log");
+    // The administrative command runs in the case's project, as every launch
+    // does, so the directory exists before the driver starts.
+    fs::create_dir_all(scratch.path.join("proj")).expect("the project directory");
+    let directory = scratch.path.to_str().expect("a UTF-8 scratch path");
+    let responder = serve("ingress IN1");
+    let matched = egress([
+        "ingress".to_owned(),
+        "--work".to_owned(),
+        directory.to_owned(),
+        "--case".to_owned(),
+        "IN1".to_owned(),
+        "--id".to_owned(),
+        "IN1".to_owned(),
+    ]);
+    assert_eq!(
+        matched.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&matched.stderr)
+    );
+    responder.join().expect("the responder finished");
+    // The administrative command leaves its own receipts, so the join can be read
+    // back instead of inferred from the status alone.
+    let owned = fs::read_to_string(scratch.path.join("owned.jsonl")).expect("the admin receipts");
+    assert!(owned.contains("\"phase\":\"admin\""));
+    assert!(owned.contains("\"phase\":\"admin-result\""));
+
+    // A body that is not exactly the id is a mismatch, not a pass.
+    let scratch = Scratch::new("egress-ingress-wrong");
+    fs::write(
+        scratch.path.join("IN1.log"),
+        "booting\nINGRESS_READY IN1 8000\n",
+    )
+    .expect("the launch log");
+    fs::create_dir_all(scratch.path.join("proj")).expect("the project directory");
+    let directory = scratch.path.to_str().expect("a UTF-8 scratch path");
+    let responder = serve("ingress IN1 ");
+    let mismatched = egress([
+        "ingress".to_owned(),
+        "--work".to_owned(),
+        directory.to_owned(),
+        "--case".to_owned(),
+        "IN1".to_owned(),
+        "--id".to_owned(),
+        "IN1".to_owned(),
+    ]);
+    assert_eq!(mismatched.status.code(), Some(1));
+    responder.join().expect("the responder finished");
+}
+
+/// A candidate that answers the CLI's own `msb list` with an empty catalog and
+/// otherwise prints its environment and exits 7. Through the shipped binary the
+/// shim is the real `exec-shim`, so the status, the environment and the identity
+/// receipt are the ones a launch actually gets.
+fn fake_candidate(work: &Path) -> PathBuf {
+    let path = work.join("fake-agent-vm");
+    fs::write(
+        &path,
+        "#!/bin/sh\n\
+         if [ \"$1\" = msb ] && [ \"$2\" = list ]; then echo '[]'; exit 0; fi\n\
+         env\n\
+         exit 7\n",
+    )
+    .expect("the candidate script");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("an executable script");
+    path
+}
+
+fn launch_work(label: &str) -> Scratch {
+    let scratch = Scratch::new(label);
+    for name in ["proj", "home", "state/msb-home"] {
+        fs::create_dir_all(scratch.path.join(name)).expect("the launch's directories");
+    }
+    scratch
+}
+
+/// The launch supervisor end to end: `exec-shim` writes the identity, replaces
+/// the environment, the candidate's status is the launch's status, and cleanup
+/// leaves a receipt behind.
+#[test]
+fn the_binary_launches_and_cleans_up() {
+    let scratch = launch_work("egress-launch");
+    let candidate = fake_candidate(&scratch.path);
+    let launched = egress([
+        "launch".to_owned(),
+        "--work".to_owned(),
+        scratch.path.to_str().unwrap().to_owned(),
+        "--case".to_owned(),
+        "PX1".to_owned(),
+        "--timeout".to_owned(),
+        "30".to_owned(),
+        "--grace".to_owned(),
+        "5".to_owned(),
+        "--env".to_owned(),
+        "HTTP_PROXY=http://127.0.0.1:18888".to_owned(),
+        "--".to_owned(),
+        candidate.to_str().unwrap().to_owned(),
+    ]);
+    assert_eq!(
+        launched.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&launched.stderr)
+    );
+    let receipts = fs::read_to_string(scratch.path.join("owned.jsonl")).expect("the receipts");
+    for phase in ["prepared", "launcher", "primary", "cleanup"] {
+        assert!(
+            receipts.contains(phase),
+            "missing phase {phase}: {receipts}"
+        );
+    }
+    // The case log is the one the receipt named, and the environment in it is the
+    // private one plus the permitted extra.
+    let log = fs::read_dir(&scratch.path)
+        .expect("the work directory")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.extension().is_some_and(|extension| {
+                extension == "log" && !path.to_string_lossy().contains("admin-")
+            })
+        })
+        .expect("the case log");
+    let text = fs::read_to_string(&log).expect("the case log");
+    assert!(text.contains("HTTP_PROXY=http://127.0.0.1:18888"), "{text}");
+    // The launch canonicalizes its work, so `HOME` is the canonical spelling.
+    let canonical = scratch
+        .path
+        .canonicalize()
+        .expect("the work directory resolves");
+    assert!(
+        text.contains(&format!("HOME={}", canonical.join("home").display())),
+        "the environment is replaced, not extended: {text}"
+    );
+}
+
+/// A catalog that cannot be read is a cleanup failure, not a clean run: the
+/// supervisor's claim is that the catalog is empty of its names, and it has to
+/// be able to read the catalog to make that claim.
+#[test]
+fn a_launch_without_a_readable_catalog_is_not_green() {
+    let scratch = launch_work("egress-launch-catalog");
+    let launched = egress([
+        "launch".to_owned(),
+        "--work".to_owned(),
+        scratch.path.to_str().unwrap().to_owned(),
+        "--case".to_owned(),
+        "LC1".to_owned(),
+        "--timeout".to_owned(),
+        "30".to_owned(),
+        "--grace".to_owned(),
+        "5".to_owned(),
+        "--".to_owned(),
+        // `/bin/true` answers `msb list` with success and no JSON at all.
+        "/bin/true".to_owned(),
+    ]);
+    assert_eq!(
+        launched.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&launched.stderr)
+    );
+}
+
+/// The `--env` extras are whitelisted by case, and a refusal happens before
+/// anything is spawned.
+#[test]
+fn the_binary_refuses_an_unpermitted_launch_extra() {
+    let scratch = launch_work("egress-launch-env");
+    let refused = egress([
+        "launch".to_owned(),
+        "--work".to_owned(),
+        scratch.path.to_str().unwrap().to_owned(),
+        "--case".to_owned(),
+        "LC1".to_owned(),
+        "--env".to_owned(),
+        "HTTP_PROXY=http://127.0.0.1:18888".to_owned(),
+        "--".to_owned(),
+        "/bin/true".to_owned(),
+    ]);
+    assert_eq!(refused.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("launch environment permits only PX/FL extras"),
+        "{stderr}"
+    );
+    assert!(
+        !scratch.path.join("owned.jsonl").exists(),
+        "a refused extra must not leave a receipt behind"
+    );
+    // `--timeout`/`--grace` are validated before the spawn too.
+    let unusable = egress([
+        "launch".to_owned(),
+        "--work".to_owned(),
+        scratch.path.to_str().unwrap().to_owned(),
+        "--case".to_owned(),
+        "LC1".to_owned(),
+        "--timeout".to_owned(),
+        "0".to_owned(),
+        "--".to_owned(),
+        "/bin/true".to_owned(),
+    ]);
+    assert_eq!(
+        unusable.status.code(),
+        Some(2),
+        "a bound that cannot terminate is misuse"
+    );
+}

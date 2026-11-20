@@ -2679,31 +2679,6 @@ fn a_current_and_a_newer_store_are_reported_without_failing() {
     }
 }
 
-/// Run one of the egress harness's own functions in `work`: the boot cases'
-/// records are written by `script/test/lib/egress-fixtures.py`, so the seeder
-/// this test exercises is the one `PA1`/`PA1x` launch under, not a copy of it.
-fn harness_python(work: &Path, body: &str) -> Output {
-    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../script/test/lib/egress-fixtures.py")
-        .canonicalize()
-        .expect("the egress fixtures are in the repository");
-    let program = format!(
-        "import importlib.util, pathlib, sys\n\
-         spec = importlib.util.spec_from_file_location('egress_fixtures', {fixtures:?})\n\
-         fixtures = importlib.util.module_from_spec(spec)\n\
-         sys.modules['egress_fixtures'] = fixtures\n\
-         spec.loader.exec_module(fixtures)\n\
-         work = pathlib.Path({work:?})\n{body}",
-        fixtures = fixtures.to_str().unwrap(),
-        work = work.to_str().unwrap(),
-    );
-    std::process::Command::new("python3")
-        .env("PYTHONDONTWRITEBYTECODE", "1")
-        .args(["-B", "-c", &program])
-        .output()
-        .expect("python3 runs")
-}
-
 /// AC13's boot-free half, executed: the harness's `seed_allowances` writes the
 /// record the *launcher* recognizes for `PA1`'s own project and for `PA1x`'s
 /// different project, and `remove_allowances` restores the tree and reports
@@ -2723,18 +2698,11 @@ fn the_harness_allowance_seed_is_what_doctor_reports() {
     }
     let fake = fake_msb::write(&work.join("home"));
     for (case, this_project, other_projects) in [("PA1", 1, 0), ("PA1x", 0, 1)] {
-        let seeded = harness_python(
-            &work,
-            &format!(
-                "case = next(c for c in fixtures.CASES if c.case == {case:?})\n\
-                 fixtures.seed_allowances(work, case, '192.168.1.2')\n"
-            ),
-        );
-        assert!(
-            seeded.status.success(),
-            "{case}: seed failed: {}",
-            String::from_utf8_lossy(&seeded.stderr)
-        );
+        // The seeder is the harness's own, not a copy of it: the record the boot
+        // cases launch under is the one this test writes.
+        let seeded =
+            agent_vm_harness::egress_allowances::seed_allowances(&work, case, "192.168.1.2");
+        assert!(seeded.is_ok(), "{case}: seed failed: {seeded:?}");
         let store = work.join("home/.config/agent-vm/allowances.json");
         assert!(store.is_file(), "{case}: no record was seeded");
 
@@ -2774,16 +2742,10 @@ fn the_harness_allowance_seed_is_what_doctor_reports() {
             );
         }
 
-        let removed = harness_python(&work, "print(len(fixtures.remove_allowances(work)))\n");
+        let removed = agent_vm_harness::egress_allowances::remove_allowances(&work);
         assert!(
-            removed.status.success(),
-            "{case}: restore failed: {}",
-            String::from_utf8_lossy(&removed.stderr)
-        );
-        assert_eq!(
-            String::from_utf8_lossy(&removed.stdout).trim(),
-            "0",
-            "{case}: remove_allowances reported a leftover"
+            removed.is_empty(),
+            "{case}: remove_allowances reported a leftover: {removed:?}"
         );
         assert!(!store.exists(), "{case}: the record survived its case");
         let left: Vec<String> = std::fs::read_dir(work.join("home/.config/agent-vm"))

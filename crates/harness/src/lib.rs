@@ -8,6 +8,17 @@
 use clap::{Parser, Subcommand};
 
 mod runtime_provenance;
+// The egress fixtures are a library as well as a command: #693-#695 port their
+// Python consumers, and `agent-vm`'s dev-dependency uses the same functions.
+pub mod egress_allowances;
+pub mod egress_cases;
+pub mod egress_fixtures;
+pub mod egress_hostname_fixtures;
+pub mod egress_launch;
+pub mod egress_run;
+pub mod egress_witness;
+pub mod msb_catalog;
+
 mod build_archive_oracle;
 mod build_provenance;
 mod config_dir_guard;
@@ -43,6 +54,8 @@ enum Command {
     CpuCommitment(cpu_commitment::CpuCommitmentArgs),
     /// Run one command in a session with no controlling terminal and no stdin.
     DetachedRun(detached_run::DetachedRunArgs),
+    /// Serve the local egress fixtures, or ask them what they have seen.
+    EgressFixtures(egress_fixtures::EgressFixturesArgs),
     /// Check the image-pins live-seed helper dispatch.
     ImagePins(image_pins::ImagePinsArgs),
     /// Play a launcher's plumbing for the boot-free direct-terminal controls.
@@ -72,6 +85,7 @@ impl Cli {
             Command::ReleasedImageLaunch(_) => "released-image launch",
             Command::DetachedRun(_) => "detached-run",
             Command::LauncherStandin(_) => "standin",
+            Command::EgressFixtures(_) => "egress fixtures",
         }
     }
 }
@@ -95,6 +109,7 @@ pub fn run(cli: Cli) -> Result<Outcome, String> {
         Command::ConfigDirGuard(args) => config_dir_guard::run(args).map(Outcome::Report),
         Command::CpuCommitment(args) => cpu_commitment::run(args).map(Outcome::Report),
         Command::DetachedRun(args) => detached_run::run(args),
+        Command::EgressFixtures(args) => egress_fixtures::run(args),
         Command::ImagePins(args) => image_pins::run(args).map(Outcome::Report),
         Command::LauncherStandin(args) => launcher_standin::run(args),
         Command::LaunchArgvOrder(args) => launch_argv_order::run(args).map(Outcome::Report),
