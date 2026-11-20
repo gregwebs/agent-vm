@@ -2419,7 +2419,7 @@ require_object_id() {
 # One probe binary's `--version` as a receipt fragment: the printable line and
 # the sha256 of the exact stdout bytes it came from (#457). Those bytes are the
 # identity because the operator's provenance oracle
-# (script/test/lib/build-provenance.py::parse_version) matches the newline-
+# (crates/harness/src/build_provenance.rs::parse_version) matches the newline-
 # terminated text, while `version=[...]` only ever showed a `$(...)` capture,
 # which strips the newline and so cannot be compared with the oracle at all.
 #

@@ -695,13 +695,13 @@ mv "$work/bundle/bin/msb.away" "$work/bundle/bin/msb"
 #
 # The refusal must be the *checker's*. Every `reject()` in the wrapper prints
 # `provenance: …` too, so matching that prefix alone would pass on a run where
-# `build-provenance.py` never executed. The fixture reports
+# `harness build-provenance` never executed. The fixture reports
 # `agent-vm 0.0.0 (deadbeef)`, whose revision is not a 40/64-hex commit, so the
 # checker's own reason is this exact sentence.
 provenance_reason='provenance: not one agent-vm version line'
 evidence="$(run_live provenance AGENT_VM_BIN="$work/bundle/bin/agent-vm" AGENT_VM_LIVE_TEST_IMAGE="$digest_image")"
 grep -qF "$provenance_reason" "$work/provenance.log" ||
-    fail 'provenance: the refusal did not come from build-provenance.py'
+    fail 'provenance: the refusal did not come from harness build-provenance'
 [[ -s "$evidence/provenance-check.txt" ]] || fail 'provenance: no retained provenance-check.txt'
 
 # Negative control for that guard, in the style of the ci-contract mutations

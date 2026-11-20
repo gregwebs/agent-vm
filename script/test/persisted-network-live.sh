@@ -15,6 +15,7 @@ if pgrep -x agent-vm >/dev/null || pgrep -x msb >/dev/null; then
 fi
 script_dir="$(cd -- "${BASH_SOURCE[0]%/*}" && pwd -P)"
 repo_root="$(cd -- "$script_dir/../.." && pwd -P)"
+harness="${HARNESS_BIN_DIR:-$repo_root/target/debug}/harness"
 # shellcheck source=script/test/lib/persisted-network.sh
 source "$script_dir/lib/persisted-network.sh"
 # Every stderr oracle is obtained through this shared renderer, never duplicated.
@@ -71,7 +72,8 @@ shasum -a 256 "$evidence/tree.diff" > "$evidence/tree.diff.sha256" || reject 'tr
 # Direct redirection preserves partial output, trailing blank lines and invalid
 # bytes for the independent checker and failure diagnosis.
 "$AGENT_VM_BIN" --version > "$evidence/binary-version.txt" || reject 'the binary does not report --version'
-if ! python3 "$script_dir/lib/build-provenance.py" \
+[[ -x "$harness" ]] || reject "missing harness binary: $harness (run: cargo build --locked -p agent-vm-harness --bins)"
+if ! "$harness" build-provenance \
     "$evidence/binary-version.txt" "$commit" "$evidence/tracked-status.txt" \
     2>&1 | tee "$evidence/provenance-check.txt"; then
     echo 'Commit current tracked source and rebuild the candidate from it before retrying.' |
