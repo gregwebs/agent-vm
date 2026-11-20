@@ -607,7 +607,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use serde_json::{Value, json};
-    use std::{fs, process::Command};
+    use std::fs;
     use tempfile::tempdir;
 
     fn write(path: &Path, contents: impl AsRef<[u8]>) {
@@ -724,68 +724,18 @@ mod tests {
     }
 
     #[test]
-    fn rust_discovery_matches_historical_python_bytes() {
+    fn rust_discovery_matches_historical_python_golden_bytes() {
         let dir = tempdir().unwrap();
         let log = dir.path().join("guest.log");
-        let baseline = dir.path().join("baseline.json");
-        let rust_output = dir.path().join("rust.json");
-        let python_output = dir.path().join("python.json");
-        let reference = dir.path().join("historical.py");
-        write(&baseline, baseline_json());
+        let output = dir.path().join("discovery.json");
+        let baseline = Path::new("tests/fixtures/historical-python-baseline.json");
         write(&log, b"ignored\rFDT|/base|base-reg|base-irq\r\nVIRTIO|virtio-base|base|virtiofs\nFDT|/m000|r\xc3\xa9g|irq\xf0\x9f\x98\x80\rVIRTIO|virtio-new|modalias|virtiofs\nMOUNTINFO|36 25 0:30 / /extra\\040name rw - ext4 ignored rw\nMOUNTINFO|36 25 0:30 / /m000 rw - virtiofs stale rw\nMOUNTINFO|36 25 0:30 / /m000 rw - virtiofs final rw\rCMDLINE_BYTES| \xef\xbc\x91_\xd9\xa2\xf0\x9d\x9f\x9b \nCMDLINE_BYTES|bad\runknown|x|y\nFDT|missing|field");
-        write(
-            &reference,
-            r#"import json, re, sys
-log_path, output_path, expected, selected, baseline_path = sys.argv[1:]
-expected = int(expected)
-selected_indexes = [] if not selected else [int(value) for value in selected.split(',')]
-def unescape_mount(value): return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), value)
-def parse(path):
-    result = {"fdt": [], "virtio": [], "mounts": [], "cmdline_bytes": None}
-    with open(path, encoding="utf-8", errors="replace") as source:
-        for raw in source:
-            line = raw.rstrip("\n")
-            if line.startswith("FDT|"):
-                parts = line.split("|", 3)
-                if len(parts) == 4: result["fdt"].append({"path": parts[1], "reg_hex": parts[2], "interrupts_hex": parts[3]})
-            elif line.startswith("VIRTIO|"):
-                parts = line.split("|", 3)
-                if len(parts) == 4: result["virtio"].append({"device": parts[1], "modalias": parts[2], "driver": parts[3]})
-            elif line.startswith("MOUNTINFO|"):
-                fields = line[len("MOUNTINFO|"):].split()
-                if "-" in fields and len(fields) >= 7:
-                    separator = fields.index("-")
-                    if separator + 2 < len(fields): result["mounts"].append({"mountpoint": unescape_mount(fields[4]), "filesystem": fields[separator + 1], "source": fields[separator + 2], "raw": line[len("MOUNTINFO|"): ]})
-            elif line.startswith("CMDLINE_BYTES|"):
-                try: result["cmdline_bytes"] = int(line.split("|", 1)[1])
-                except ValueError: pass
-    return result
-current = parse(log_path)
-with open(baseline_path, encoding="utf-8") as source: baseline = json.load(source)
-delta_fdt = len(current["fdt"]) - len(baseline["fdt"])
-delta_fs = sum(item["driver"] in {"virtiofs", "virtio_fs"} for item in current["virtio"]) - sum(item["driver"] in {"virtiofs", "virtio_fs"} for item in baseline["virtio"])
-current["baseline"] = baseline_path; current["fdt_delta"] = delta_fdt; current["virtio_fs_delta"] = delta_fs
-if delta_fdt != expected: raise SystemExit("bad fdt")
-if delta_fs != expected: raise SystemExit("bad virtio")
-numbered = {item["mountpoint"]: item for item in current["mounts"]}
-current["selected_mounts"] = {f"/m{index:03d}": numbered[f"/m{index:03d}"] for index in selected_indexes}
-with open(output_path, "x", encoding="utf-8") as output: json.dump(current, output, indent=2, sort_keys=True)
-"#,
-        );
-        write_discovery(discovery_request(&log, &rust_output, &baseline, 1, vec![0])).unwrap();
-        let status = Command::new("python3")
-            .arg(&reference)
-            .arg(&log)
-            .arg(&python_output)
-            .arg("1")
-            .arg("0")
-            .arg(&baseline)
-            .status()
-            .unwrap();
-        assert!(status.success());
+
+        write_discovery(discovery_request(&log, &output, baseline, 1, vec![0])).unwrap();
         assert_eq!(
-            fs::read(&rust_output).unwrap(),
-            fs::read(&python_output).unwrap()
+            fs::read(&output).unwrap(),
+            include_bytes!("../tests/fixtures/historical-python-discovery.json"),
+            "discovery output diverged from the historical Python golden"
         );
     }
 

@@ -1,0 +1,1 @@
+{"fdt":[{"interrupts_hex":"base-irq","path":"/base","reg_hex":"base-reg"}],"virtio":[{"device":"virtio-base","driver":"virtiofs","modalias":"base"}]}
