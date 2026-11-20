@@ -4,24 +4,26 @@ use clap::Parser;
 /// unexpected failure and carries the label of the command that ran, because a
 /// single shared prefix named whichever port was written first and mislabelled
 /// every later one.
-const OWN_VERDICTS: [&str; 5] = [
+const OWN_VERDICTS: [&str; 6] = [
     "provenance: ",
     "usage: ",
     "FAIL: ",
     "select: ",
     "manifest: ",
+    "released-image-launch: ",
 ];
 
 fn main() {
     let cli = agent_vm_harness::Cli::parse();
     let label = cli.failure_label();
     let error = match agent_vm_harness::run(cli) {
-        Ok(output) => {
+        Ok(agent_vm_harness::Outcome::Report(output)) => {
             if !output.is_empty() {
                 println!("{output}");
             }
             return;
         }
+        Ok(agent_vm_harness::Outcome::Exit(status)) => std::process::exit(status),
         Err(error) => error,
     };
     if OWN_VERDICTS.iter().any(|prefix| error.starts_with(prefix)) {

@@ -3,18 +3,23 @@
 # shellcheck disable=SC2016
 set -euo pipefail
 ROOT="$(cd "${BASH_SOURCE[0]%/*}/../.." && pwd)"
+# The launch helper is a harness subcommand (ADR-0072). Build it once with
+# `cargo build --locked -p agent-vm-harness --bins`; CI exports HARNESS_BIN_DIR
+# after doing so for every shell caller.
+harness="${HARNESS_BIN_DIR:-$ROOT/target/debug}/harness"
 # shellcheck source=script/test/lib/released-image-checks.sh
 . "$ROOT/script/test/lib/released-image-checks.sh"
 fail() { echo "released-image: $*" >&2; exit 1; }
+[[ -x "$harness" ]] || fail "missing harness binary: $harness (run: cargo build --locked -p agent-vm-harness --bins)"
 # Gate prerequisites; declared in CONTRIBUTING.md "End-to-end (VM-boot) tests".
-for tool in jq shasum python3; do
+for tool in jq shasum; do
     command -v "$tool" >/dev/null 2>&1 || fail "the released-image join needs $tool on PATH"
 done
 BIN="${AGENT_VM_RELEASE_BIN:?set AGENT_VM_RELEASE_BIN to a relocated installed release}"
 ASSETS="${AGENT_VM_E2E_RELEASE_ASSETS_DIR:?set AGENT_VM_E2E_RELEASE_ASSETS_DIR to verified native assets}"
 OTHER="${AGENT_VM_E2E_OTHER_ASSETS_DIR:?set AGENT_VM_E2E_OTHER_ASSETS_DIR to verified opposite-architecture assets}"
 [[ "$BIN" == /* && -x "$BIN" ]] || fail 'installed candidate must be an absolute executable path'
-BIN="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$BIN")"
+BIN="$("$harness" released-image-launch --canonicalize "$BIN")"
 [[ "$BIN" != "$ROOT/"* ]] || fail 'relocate the complete release bundle outside the source checkout'
 # Source provenance. The operator binds the candidate's ACTUAL build checkout to
 # AGENT_VM_E2E_BUILD_SOURCE_DIR and records that binding alongside the reviewed
@@ -88,7 +93,7 @@ done
 # isolated PATH may not contain an nvm//usr/local Node prefix; the native release
 # is launched directly. Either way the launch runs in its own process group so a
 # timeout or Ctrl-C/SIGTERM stops Node's native descendants too; the 900 s bound
-# is the helper's validated default (see released-image-launch.py).
+# is the helper's validated default.
 NODE_BIN=""
 if released_image_is_node_candidate "$BIN"; then
     NODE_BIN="$(released_image_resolve_node "${AGENT_VM_E2E_NODE:-}")" \
@@ -97,7 +102,7 @@ fi
 launch() {
     local route="$1" name="$2"
     shift 2
-    (cd "$WORK/$route/project" && python3 "$ROOT/script/test/released-image-launch.py" \
+    (cd "$WORK/$route/project" && "$harness" released-image-launch \
         --root "$WORK/$route" --shim "$WORK/shim" --log "$WORK/builder.log" \
         --binary "$BIN" --interpreter "$NODE_BIN" -- "$@") > "$WORK/$name.log" 2>&1
 }

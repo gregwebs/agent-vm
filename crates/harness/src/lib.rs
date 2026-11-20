@@ -15,6 +15,7 @@ mod cpu_commitment;
 mod image_pins;
 mod launch_argv_order;
 mod msb_krun_compat;
+mod released_image_launch;
 
 /// The `harness` commands. A port adds one variant, replacing a Python driver or
 /// a boot-free Python suite.
@@ -43,6 +44,8 @@ enum Command {
     LaunchArgvOrder(launch_argv_order::LaunchArgvOrderArgs),
     /// Run the msb-krun compatibility timeout driver.
     MsbKrunCompat(msb_krun_compat::MsbKrunCompatArgs),
+    /// Launch an installed released-image candidate in an owned, bounded process group.
+    ReleasedImageLaunch(released_image_launch::ReleasedImageLaunchArgs),
 }
 
 impl Cli {
@@ -59,20 +62,33 @@ impl Cli {
             Command::ImagePins(_) => "image pins",
             Command::CpuCommitment(_) => "cpu commitment",
             Command::BuildArchiveOracle(_) => "build archive oracle",
+            Command::ReleasedImageLaunch(_) => "released-image launch",
         }
     }
 }
 
-pub fn run(cli: Cli) -> Result<String, String> {
+/// What the binary does once a command has run.
+///
+/// A launcher's interface is its child's exit status, which is arbitrary, so a
+/// command cannot always report through the text `main` prints for the others.
+pub enum Outcome {
+    /// Print this text, if any, and exit 0.
+    Report(String),
+    /// Exit with this status; the command has already said what it had to say.
+    Exit(i32),
+}
+
+pub fn run(cli: Cli) -> Result<Outcome, String> {
     match cli.command {
-        Command::RuntimeProvenance(args) => runtime_provenance::run(args),
-        Command::BuildArchiveOracle(args) => build_archive_oracle::run(args),
-        Command::BuildProvenance(args) => build_provenance::run(args),
-        Command::ConfigDirGuard(args) => config_dir_guard::run(args),
-        Command::CpuCommitment(args) => cpu_commitment::run(args),
-        Command::ImagePins(args) => image_pins::run(args),
-        Command::LaunchArgvOrder(args) => launch_argv_order::run(args),
-        Command::MsbKrunCompat(args) => msb_krun_compat::run(args),
+        Command::RuntimeProvenance(args) => runtime_provenance::run(args).map(Outcome::Report),
+        Command::BuildArchiveOracle(args) => build_archive_oracle::run(args).map(Outcome::Report),
+        Command::BuildProvenance(args) => build_provenance::run(args).map(Outcome::Report),
+        Command::ConfigDirGuard(args) => config_dir_guard::run(args).map(Outcome::Report),
+        Command::CpuCommitment(args) => cpu_commitment::run(args).map(Outcome::Report),
+        Command::ImagePins(args) => image_pins::run(args).map(Outcome::Report),
+        Command::LaunchArgvOrder(args) => launch_argv_order::run(args).map(Outcome::Report),
+        Command::MsbKrunCompat(args) => msb_krun_compat::run(args).map(Outcome::Report),
+        Command::ReleasedImageLaunch(args) => released_image_launch::run(args),
     }
 }
 
@@ -80,6 +96,12 @@ pub fn run(cli: Cli) -> Result<String, String> {
 /// A port whose callers distinguish an inconclusive verdict from a refusal keeps
 /// the two apart here; everything else exits 1 in `main`.
 pub fn failure_status(error: &str) -> Option<i32> {
+    // Misuse: a refused argument value or a missing one. Clap already exits 2
+    // for what it can reject itself, so a command that validates its own
+    // arguments keeps that status.
+    if error.starts_with("usage: ") {
+        return Some(2);
+    }
     cpu_commitment::failure_status(error)
 }
 
