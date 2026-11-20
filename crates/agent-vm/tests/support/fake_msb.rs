@@ -27,9 +27,11 @@
 
 #![allow(dead_code)]
 
-use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt};
+use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+
+#[path = "fixture_executable.rs"]
+mod fixture_executable;
 
 /// What the vendored runtime prints for `msb --version`. `point_at_msb`
 /// refuses any other version, so this is the one literal to change when the
@@ -69,40 +71,12 @@ pub struct FakeMsb {
 
 /// Write `contents` to `path` as a mode-0755 executable.
 ///
-/// Writes a uniquely named temporary and renames it into place. The rename is
-/// atomic replacement, so a reader never sees a half-written script and a test
-/// can rewrite a running shim without the writer side failing on `ETXTBSY`. It
-/// does not narrow the `execve` race: `ETXTBSY` checks the inode's write count,
-/// and `rename` keeps the inode, so a concurrent `fork` that duplicates the
-/// temporary's write descriptor still blocks an immediate `exec` of `path`.
-/// That race is kernel timing, so a caller that immediately `exec`s the result
-/// retries on `ExecutableFileBusy`.
+/// [`fixture_executable::write_executable`] writes the file from a child
+/// process, so this process never holds a descriptor for it and a sibling
+/// test's `fork` cannot duplicate one into an `exec` of the fixture (issue
+/// #357).
 pub fn write_executable(path: &Path, contents: &str) {
-    let temp = temp_path(path);
-    let result = (|| -> std::io::Result<()> {
-        std::fs::write(&temp, contents)?;
-        let mut perms = std::fs::metadata(&temp)?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&temp, perms)?;
-        std::fs::rename(&temp, path)
-    })();
-    if let Err(error) = result {
-        let _ = std::fs::remove_file(&temp);
-        panic!("write_executable({}) failed: {error}", path.display());
-    }
-}
-
-/// A process-unique sibling of `path`, so parallel tests writing the same
-/// fixture name cannot collide on the temporary.
-fn temp_path(path: &Path) -> PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "fixture".to_owned());
-    name.push_str(&format!(".{}.{unique}.tmp", std::process::id()));
-    path.with_file_name(name)
+    fixture_executable::write_executable(path, contents);
 }
 
 /// Install the complete `msb` + `libkrunfw` pair in `dir` in `mode`.
@@ -304,11 +278,12 @@ pub fn ensure_private_dir(dir: &Path) {
 /// Run a freshly installed fixture, retrying the kernel's `ETXTBSY` race.
 ///
 /// `execve` refuses a file that is still open for writing by any process,
-/// including a write descriptor another thread duplicated across `fork`. The
-/// installer already renames into place, which closes the window for its own
-/// descriptor; this bounds the remaining kernel-timing race instead of turning
-/// a parallel test into an intermittent failure. Every other error is final,
-/// and a retry never masks a fixture that did run.
+/// including a write descriptor another thread duplicated across `fork`.
+/// [`write_executable`] writes from a child process, so these fixtures no
+/// longer carry that descriptor; this bounds whatever kernel-timing race
+/// remains — fixtures written by another program, such as a copied binary —
+/// instead of turning a parallel test into an intermittent failure. Every
+/// other error is final, and a retry never masks a fixture that did run.
 pub fn output_retrying_busy(mut command: std::process::Command) -> std::process::Output {
     const ATTEMPTS: usize = 50;
     const DELAY: std::time::Duration = std::time::Duration::from_millis(10);
