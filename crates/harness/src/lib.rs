@@ -8,6 +8,7 @@
 use clap::{Parser, Subcommand};
 
 mod config_dir_guard;
+mod launch_argv_order;
 
 /// The `harness` commands. A port adds one variant, replacing a Python driver or
 /// a boot-free Python suite.
@@ -22,11 +23,14 @@ pub struct Cli {
 enum Command {
     /// Run configuration-directory guard controls and filesystem queries.
     ConfigDirGuard(config_dir_guard::ConfigDirGuardArgs),
+    /// Check that launch options precede tool verbs.
+    LaunchArgvOrder(launch_argv_order::LaunchArgvOrderArgs),
 }
 
 pub fn run(cli: Cli) -> Result<String, String> {
     match cli.command {
         Command::ConfigDirGuard(args) => config_dir_guard::run(args),
+        Command::LaunchArgvOrder(args) => launch_argv_order::run(args),
     }
 }
 

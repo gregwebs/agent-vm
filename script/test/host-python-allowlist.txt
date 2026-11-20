@@ -44,9 +44,6 @@ script/test/cpu-commitment-select.py
 script/test/cpu-commitment-native.sh 6
 script/test/cpu-commitment-native-contract.sh 18
 
-# --- Migration debt: launch argv order --------------------------------------
-script/test/launch-argv-order.py
-
 # --- Migration debt: msb-krun compat ---------------------------------------
 crates/msb-krun-compat-evidence/src/lib.rs 3
 script/test/msb-krun-compat.sh 1
@@ -92,7 +89,7 @@ script/test/lib/direct-terminal.py
 script/test/lib/direct-terminal-contract.py
 script/test/e2e.sh 21
 # Runs every suite above, so it names Python until they are ported.
-script/test/ci-contracts.sh 4
+script/test/ci-contracts.sh 3
 
 # --- Migration debt: Rust tests that shell out to python -------------------
 crates/agent-vm/tests/config_doctor.rs 3
