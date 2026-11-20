@@ -1,7 +1,11 @@
 use clap::Parser;
 
 fn main() {
-    // Parsing is all this entry point owes until the first port adds a command;
-    // clap exits on `--help`, `--version` and a usage error.
-    let _ = agent_vm_harness::Cli::parse();
+    match agent_vm_harness::run(agent_vm_harness::Cli::parse()) {
+        Ok(output) => println!("{output}"),
+        Err(error) => {
+            eprintln!("runtime provenance: FAIL: {error}");
+            std::process::exit(1);
+        }
+    }
 }

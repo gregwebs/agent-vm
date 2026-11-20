@@ -4,6 +4,11 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
+harness="${HARNESS_BIN_DIR:-$repo_root/target/debug}/harness"
+[[ -x "$harness" ]] || {
+    echo "runtime provenance: FAIL: missing harness binary: $harness (run: cargo build --locked -p agent-vm-harness --bins)" >&2
+    exit 1
+}
 static_only=false
 if (($#)); then
     [[ "$1" == --static && $# -eq 1 ]] || { echo "usage: $0 [--static]" >&2; exit 2; }
@@ -36,4 +41,4 @@ if [[ "$static_only" == false ]]; then
     cargo metadata --locked --format-version 1 --manifest-path vendor/microsandbox/Cargo.toml >"$temp_dir/nested-metadata.json"
     args+=(--root-metadata "$temp_dir/root-metadata.json" --nested-metadata "$temp_dir/nested-metadata.json")
 fi
-python3 script/check-runtime-provenance.py "${args[@]}"
+"$harness" runtime-provenance "${args[@]}"
