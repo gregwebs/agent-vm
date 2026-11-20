@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 
 mod config_dir_guard;
 mod launch_argv_order;
+mod msb_krun_compat;
 
 /// The `harness` commands. A port adds one variant, replacing a Python driver or
 /// a boot-free Python suite.
@@ -25,12 +26,15 @@ enum Command {
     ConfigDirGuard(config_dir_guard::ConfigDirGuardArgs),
     /// Check that launch options precede tool verbs.
     LaunchArgvOrder(launch_argv_order::LaunchArgvOrderArgs),
+    /// Run the msb-krun compatibility timeout driver.
+    MsbKrunCompat(msb_krun_compat::MsbKrunCompatArgs),
 }
 
 pub fn run(cli: Cli) -> Result<String, String> {
     match cli.command {
         Command::ConfigDirGuard(args) => config_dir_guard::run(args),
         Command::LaunchArgvOrder(args) => launch_argv_order::run(args),
+        Command::MsbKrunCompat(args) => msb_krun_compat::run(args),
     }
 }
 
