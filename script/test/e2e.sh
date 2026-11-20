@@ -2904,13 +2904,13 @@ terminal_evidence_root() {
 #
 # The driver refuses to run with one (a copied terminal would make its own PTY
 # observation meaningless), so the wrapper detaches it here instead of requiring
-# an undisclosed invocation environment. `start_new_session` gives the driver its
-# own session with no controlling terminal.
+# an undisclosed invocation environment. The wrapper is `harness detached-run`
+# (#698): a session leader with no controlling terminal and /dev/null stdin.
 terminal_driver() {
   "${CUSTOM_ENV[@]}" PYTHONPATH= \
     DIRECT_TERMINAL_CASE_DEADLINE="${DIRECT_TERMINAL_CASE_DEADLINE:-240}" \
     DIRECT_TERMINAL_MARKER_DEADLINE="${DIRECT_TERMINAL_MARKER_DEADLINE:-60}" \
-    python3 "$REPO_ROOT/script/test/lib/detached-run.py" \
+    "$HARNESS" detached-run \
     python3 "$REPO_ROOT/script/test/lib/direct-terminal.py" "$@"
 }
 
@@ -5049,39 +5049,11 @@ LAUNCH
   # (t2) #400 B1: the wrapper detaches the driver itself. The control runs the
   # production shim inside a *real* controlling terminal, so it proves the shim
   # removes it rather than observing that this harness happened to have none.
+  # `harness detached-run --self-test` is that control (#698): it spawns a
+  # session leader on a PTY, shows /dev/tty is reachable there, and shows it is
+  # unreachable — and stdin at its end of file — in the shim's child.
   ctl_before="$result"
-  if ! timeout 60 python3 - "$REPO_ROOT/script/test/lib/detached-run.py" <<'DETACH'; then
-import os, pty, select, subprocess, sys, time
-
-shim = sys.argv[1]
-probe = ["python3", "-c",
-         "import os\n"
-         "os.close(os.open('/dev/tty', os.O_RDWR | os.O_NOCTTY))\n"]
-pid, master = pty.fork()
-if pid == 0:
-    # This child is a session leader with `master` as its controlling terminal, so
-    # /dev/tty must be reachable here and unreachable in the shim's child.
-    attached = subprocess.run(probe, stdin=subprocess.DEVNULL).returncode == 0
-    detached = subprocess.run([sys.executable, shim, *probe]).returncode
-    os._exit(0 if attached and detached != 0 else 1)
-# Drain the terminal the child writes to: a control that never reads the master can
-# block its own child on a full terminal buffer (this hung a whole run once).
-os.close(0)
-deadline = time.monotonic() + 30
-while time.monotonic() < deadline:
-    ready, _, _ = select.select([master], [], [], 1)
-    if not ready:
-        continue
-    try:
-        chunk = os.read(master, 65536)
-    except OSError:
-        break
-    if not chunk:
-        break
-os.close(master)
-done, status = os.waitpid(pid, 0)
-sys.exit(os.waitstatus_to_exitcode(status))
-DETACH
+  if ! timeout 60 "$HARNESS" detached-run --self-test >/dev/null; then
     echo "    FAIL: the wrapper's detached runner left a controlling terminal in place"
     result=$((result + 1))
   fi

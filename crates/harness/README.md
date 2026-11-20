@@ -11,6 +11,16 @@ Python, so building and testing the repository needs no `python3` on the host.
   run`.
 - **Boot-free checks are `#[test]`s**, run by `script/test/ci-contracts.sh` via
   `cargo test -p agent-vm-harness --locked`.
+- **PTY, terminal-mode and signal primitives live in `src/pty.rs`.** Two drivers
+  run on them now (`detached-run`, `launcher-standin`), and the direct-terminal
+  driver builds on the same interface: open a pseudoterminal, save/raw/restore
+  modes, read with a deadline, relay a signal, spawn detached, and own a child
+  (`OwnedChild`: a bounded wait plus a group stop, so no control can hang a run
+  or leave a session behind). A driver keeps its
+  own process graph and verdict; only the operating-system calls are shared.
+  `pty::raw` is deliberately the launcher's raw mode (four local flags and two
+  control codes), not `cfmakeraw(3)`: clearing `ICRNL` would rewrite every
+  fixture's output.
 
 ## Calling the binary from shell
 

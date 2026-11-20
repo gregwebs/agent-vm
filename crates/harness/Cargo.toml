@@ -6,8 +6,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-# Test tooling only. Not shipped, not published, and deliberately not a
-# dependency of `agent-vm`: it is an independent oracle (ADR-0072).
+# Test tooling only. Not shipped, not published, and deliberately not a runtime
+# dependency of `agent-vm`: it is an independent oracle (ADR-0072). `agent-vm`
+# takes it as a *dev*-dependency, so a test seeds the ADR-0065 allowance record
+# with this crate's writer instead of a copy of it; nothing here reaches the
+# shipped binary.
 publish = false
 
 [[bin]]
@@ -16,18 +19,25 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
-# Process and signal primitives (setsid, process groups, wait, getpgid/getsid).
-# rustix exposes no signal *handler* registration, so the two `sigaction` calls
-# in `released_image_launch` come from `libc`, the same escape hatch `agent-vm`
-# uses for `waitid` and `kill`. Both are already in the graph.
-rustix = { version = "1.1", features = ["process"] }
+# Process, PTY, terminal-mode and event primitives (setsid, process groups,
+# wait, getpgid/getsid; posix_openpt; tcgetattr/tcsetattr; poll). `rustix`
+# exposes no signal *handler* registration, so the `sigaction` calls in
+# `released_image_launch`, `pty` and the egress fixtures come from `libc`, the
+# same escape hatch `agent-vm` uses for `waitid` and `kill`. Both are already in
+# the graph. `net` adds the pre-bind socket the `SO_REUSEADDR` fixtures need
+# (`std::net::TcpListener::bind` sets no option) and the shutdown that wakes a
+# blocking accept; `stdio` adds the `dup2` an exec shim performs.
+rustix = { version = "1.1", features = ["process", "pty", "termios", "event", "pipe", "net", "stdio"] }
 libc = "0.2"
 serde_json = "1"
 toml = { version = "1", default-features = false, features = ["parse", "serde"] }
-sha2 = "0.10"
-tar = "0.4"
-
-[dev-dependencies]
-serde_json = "1"
+# Read-only access to the private msb catalog, for the launch supervisor's
+# observation loop (#692). `rusqlite` 0.32 links the `libsqlite3-sys` 0.30.1 the
+# workspace already builds through sqlx, and declares it exactly as sqlx does --
+# `default-features = false`, no `bundled` -- so there is one `-sys` crate and one
+# SQLite, the system's, not a second copy. ADR-0072 records the choice.
+# `hooks` is what adds `Connection::progress_handler`, the 100-op tick that keeps
+# a pathological catalog query inside the same deadline the Python enforced.
+rusqlite = { version = "0.32", default-features = false, features = ["hooks"] }
 sha2 = "0.10"
 tar = "0.4"

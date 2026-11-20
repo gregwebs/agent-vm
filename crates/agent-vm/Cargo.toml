@@ -154,6 +154,11 @@ tempfile = "3"
 # bind or disk image (`ImageSource::into_rootfs_source`). Already in the graph
 # transitively via the SDK, so this only names it; it adds no compilation.
 microsandbox-utils = { path = "../../vendor/microsandbox/crates/utils" }
+# Dev-dependency only: the harness is an independent oracle (ADR-0072), never a
+# part of the shipped binary. The allowance seed the ADR-0065 boot cases launch
+# under has no writer in this release, so `tests/config_doctor.rs` seeds it with
+# the harness's own `seed_allowances` instead of a copy of it. See #692.
+agent-vm-harness = { path = "../harness" }
 
 # The host OS credential store behind `agent-vm secret` (#160). The vendored
 # SDK already depends on this exact version with these exact per-target
@@ -192,6 +197,11 @@ microsandbox-types = { path = "../../vendor/microsandbox/packages/microsandbox-t
 # new compilation -- it only makes the function nameable. See
 # `tests/config_launch_driven.rs`'s fake-runtime fixture.
 microsandbox-utils = { path = "../../vendor/microsandbox/crates/utils" }
+# Dev-dependency only: the harness is an independent oracle (ADR-0072), never a
+# part of the shipped binary. The allowance seed the ADR-0065 boot cases launch
+# under has no writer in this release, so `tests/config_doctor.rs` seeds it with
+# the harness's own `seed_allowances` instead of a copy of it. See #692.
+agent-vm-harness = { path = "../harness" }
 # Test-only: `tests/support/image_archive.rs` writes a minimal one-image OCI
 # layout archive to feed the real native importer under a fake Docker. Reuses
 # the tar 0.4 already in the graph (via the vendored msb/image crates) rather

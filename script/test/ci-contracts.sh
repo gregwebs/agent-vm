@@ -61,6 +61,9 @@ if [[ "$guard_only" == false ]]; then
     harness_target="$(cargo metadata --locked --no-deps --format-version 1 |
         jq -r .target_directory)" || fail 'cannot read the cargo target directory'
     export HARNESS_BIN_DIR="${HARNESS_BIN_DIR:-$harness_target/debug}"
+    harness="${HARNESS_BIN_DIR:-$REPO_ROOT/target/debug}/harness"
+    [[ -x "$harness" ]] ||
+        fail "harness not found at $harness; run: cargo build --locked -p agent-vm-harness --bins"
 
     # --- Runtime source provenance and harness contracts ---------------------
     bash "$REPO_ROOT/script/test/runtime-provenance.sh"
@@ -81,7 +84,7 @@ if [[ "$guard_only" == false ]]; then
     # exact-byte, resize and restoration oracles reject a broken stand-in, so a
     # later native run's evidence means something. Detached, like the other PTY
     # controls, so no ambient terminal can help a case pass.
-    python3 "$REPO_ROOT/script/test/lib/detached-run.py" \
+    "$harness" detached-run \
       python3 "$REPO_ROOT/script/test/lib/direct-terminal-contract.py"
     # #455's sweep contract is boot-free and cheap, so it goes first: the
     # released-image control below can hang on a host for a pre-existing reason

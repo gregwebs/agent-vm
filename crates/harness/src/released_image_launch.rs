@@ -306,7 +306,7 @@ impl fmt::Display for LaunchError {
 /// Python's `Popen.wait` returned a negative number for a signalled child, and
 /// `sys.exit(-15)` became 241; `128 + N` is what the interruption path already
 /// returns, so a signalled child and a signalled helper agree.
-fn exit_code(status: ExitStatus) -> i32 {
+pub(crate) fn exit_code(status: ExitStatus) -> i32 {
     status
         .code()
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
