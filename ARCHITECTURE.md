@@ -1462,10 +1462,16 @@ nothing). The one approval a publication does cause is separate from it: after
 the exclusive barrier is released, `image_pin::approve_published` reads the
 result reference back from the cache and commits exactly that record (#391).
 Local rootfs/disk launches never enter this module. A **launch build**
-(`--dockerfile`, [ADR-0061](docs/adr/0061-explicit-launch-builds.md)) publishes
-through the same `image_publish` path — one exclusive-barrier `load_archive`
-under `agent-vm.invalid/dockerfile/<sha256 of the canonical Dockerfile
-path>:latest` — then reads that reference back cache-only and boots
+(`--dockerfile`, [ADR-0061](docs/adr/0061-explicit-launch-builds.md)) first runs
+the launch-build probe
+([ADR-0071](docs/adr/0071-launch-builds-skip-an-unchanged-export.md)): the same
+`docker buildx build` with
+`--output type=image,oci-mediatypes=true,store=false --metadata-file`. If
+`repo@<reported digest>` is already cached (a cache-only read under the shared
+barrier), it boots that with no export, publication or tag move. Otherwise it
+publishes through the same `image_publish` path — one exclusive-barrier
+`load_archive` under `agent-vm.invalid/dockerfile/<sha256 of the canonical
+Dockerfile path>:latest` — then reads that reference back cache-only and boots
 `repo@digest` under the shared barrier. It adds no lock edge and no approval:
 nothing is written to the pin store, and the SDK create for it uses
 `PullPolicy::Never`, so the internal name is never resolved as a registry. See
@@ -2139,6 +2145,7 @@ directories the user never asked for. The state-root precedence is in
 | User tool requests as egress authority (partly reverses ADR-0039) | [ADR-0059](docs/adr/0059-user-tool-requests-as-egress-authority.md) |
 | Image network requests reported once per reference, then as changes | [ADR-0060](docs/adr/0060-image-network-requests-reported-once-then-as-changes.md) |
 | Explicit launch builds with `--dockerfile` (amends ADR-0035's "no launch builds an image") | [ADR-0061](docs/adr/0061-explicit-launch-builds.md) |
+| Launch builds skip an unchanged export (amends ADR-0061 §5) | [ADR-0071](docs/adr/0071-launch-builds-skip-an-unchanged-export.md) |
 
 ## Deliberate non-goals
 

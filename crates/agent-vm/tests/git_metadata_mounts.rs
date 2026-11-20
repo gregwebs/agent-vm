@@ -23,12 +23,11 @@
 //! [`refusal_oracle_is_calibrated`].
 
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::os::unix::fs::FileTypeExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 mod support;
 
@@ -37,6 +36,8 @@ mod image_archive;
 
 #[path = "support/fake_msb.rs"]
 mod fake_msb;
+
+use support::run_with_timeout;
 
 /// The `AGENT_VM_DEBUG_CONFIG` marker: printed immediately before the builder's
 /// registry pull, so its presence proves the launch got past every preflight
@@ -60,45 +61,6 @@ const NOTICE_ENCLOSING: &str = "==> Git metadata: linked worktree, reachable thr
 
 fn agent_vm_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_agent-vm"))
-}
-
-/// Run `cmd` to completion, killing it if it does not exit within `timeout`.
-/// Duplicated from `tests/config_mounts.rs` for the reason in this file's module
-/// comment.
-fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Output {
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn().expect("failed to spawn agent-vm");
-    let mut stdout_pipe = child.stdout.take().unwrap();
-    let mut stderr_pipe = child.stderr.take().unwrap();
-    let stdout_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout_pipe.read_to_end(&mut buf);
-        buf
-    });
-    let stderr_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut buf);
-        buf
-    });
-
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("try_wait failed") {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("agent-vm did not exit within {timeout:?} (possible hang)");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-
-    Output {
-        status,
-        stdout: stdout_handle.join().unwrap(),
-        stderr: stderr_handle.join().unwrap(),
-    }
 }
 
 fn stderr_of(out: &Output) -> String {

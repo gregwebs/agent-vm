@@ -6,7 +6,9 @@ Accepted and implemented in **0.7.35**
 ([#527](https://github.com/gregwebs/agent-vm/issues/527)). Amends
 [ADR-0035](0035-consume-user-owned-boot-images.md)'s "no launch builds an image"
 rule and [ADR-0043](0043-image-command-group-and-daemon-import.md)'s command
-group placement.
+group placement. §5 amended in **0.7.73** by
+[ADR-0071](0071-launch-builds-skip-an-unchanged-export.md): a launch build whose
+probed digest is already cached boots it without re-exporting.
 
 ## Context
 
@@ -52,6 +54,9 @@ coupling to catalog declarations.
 5. **Every launch builds.** There is no source hashing and no skipped build;
    BuildKit's own cache is the only reuse. The result is whatever `docker buildx
    build --output type=oci` produced this time.
+
+   _Amended by [ADR-0071](0071-launch-builds-skip-an-unchanged-export.md): every
+   launch still builds, but an unchanged result is not re-exported._
 6. **No image pin and no approval.** A launch build writes nothing under
    `~/.config/agent-vm`: no `image-pins.json` entry, no retained default, no
    approval read. Typing the flag is the consent, for that launch. For a named,

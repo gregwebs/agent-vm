@@ -1,0 +1,102 @@
+# Files the host Python guard (no-host-python.sh) accepts. ADR-0072 requires
+# that building and testing the repository needs no `python3` on the host.
+#
+# Format: a `*.py` file is a bare path; a `*.sh` or `*.rs` file carries the number
+# of Python occurrences it excuses. A count that is too low means a new call got
+# in, and one that is too high means a port left it behind. Both fail, so this is
+# a ledger of debt with a running total, not a per-file veto.
+#
+# Three kinds of entry:
+#
+#   Guest exceptions - Python that runs inside the guest, not on the host.
+#   Permanent, unless the guest image drops Python.
+#
+#   Vendor tooling - upstream's own Python, which this repository does not own.
+#   Out of scope, like the libkrunfw build's pyelftools.
+#
+#   Migration debt - Python still on the host. Each port ticket lowers or deletes
+#   its own numbers.
+
+# --- Guest exceptions -------------------------------------------------------
+# The CPU evidence workload: three guest command strings plus the name of the
+# workload file the driver writes into the guest.
+crates/agent-vm/src/cpu_evidence/native.rs 4
+# The guest half of the egress probe: TLS and socket probes, with a node
+# fallback. Its host-side rows are the open exception ADR-0072 records.
+script/test/fixtures/egress-probe.sh 10
+
+# --- Vendor tooling (libkrunfw bin2cbundle.py), out of scope per #682 -------
+profiling/build_legacy.sh 1
+profiling/build_variants.sh 1
+
+# --- Migration debt: runtime provenance -------------------------------------
+script/check-runtime-provenance.py
+script/check-runtime-provenance.sh 1
+script/test/runtime-provenance.sh 8
+
+# --- Migration debt: build provenance ---------------------------------------
+script/test/lib/build-provenance.py
+script/test/build-provenance-contract.sh 1
+
+# --- Migration debt: CPU commitment evidence --------------------------------
+script/test/cpu-commitment-manifest.py
+script/test/cpu-commitment-select.py
+script/test/cpu-commitment-native.sh 6
+script/test/cpu-commitment-native-contract.sh 18
+
+# --- Migration debt: launch argv order --------------------------------------
+script/test/launch-argv-order.py
+
+# --- Migration debt: msb-krun compat ---------------------------------------
+crates/msb-krun-compat-evidence/src/lib.rs 3
+script/test/msb-krun-compat.sh 1
+script/test/msb-krun-compat-contract.sh 4
+
+# --- Migration debt: config dir guard --------------------------------------
+script/test/config-dir-guard-contract.sh 6
+script/test/lib/config-dir-guard.sh 1
+
+# --- Migration debt: build archive oracle and image pins -------------------
+script/test/fixtures/build-archive-oracle.py
+script/test/e2e-image-pins-contract.sh 1
+
+# --- Migration debt: released image launch ---------------------------------
+script/test/released-image-launch.py
+script/test/released-image-launch-test.py
+script/test/e2e-release-contract.sh 7
+script/test/e2e-released-image.sh 3
+script/test/lib/released-image-checks.sh 2
+
+# --- Migration debt: egress ------------------------------------------------
+script/test/lib/egress-fixtures.py
+script/test/lib/egress-hostname-fixtures.py
+script/test/lib/egress-wire-contract.py
+script/test/lib/egress-probe-contract.py
+script/test/lib/egress-supervisor-contract.py
+script/test/egress-mutations.py
+script/test/egress-default-deny.sh 1
+script/test/egress-default-deny-contract.sh 7
+
+# --- Migration debt: persisted network -------------------------------------
+script/test/lib/persisted-network.py
+script/test/lib/persisted-network-contract.py
+script/test/lib/persisted-network.sh 1
+script/test/persisted-network-contract.sh 1
+script/test/persisted-network-live.sh 1
+
+# --- Migration debt: config mounts ----------------------------------------
+script/test/lib/config-mounts.py
+script/test/config-mounts-contract.sh 5
+script/test/config-mounts-live.sh 2
+
+# --- Migration debt: ptys, direct terminal, e2e inline helpers -------------
+script/test/lib/detached-run.py
+script/test/fixtures/direct-terminal/launcher-standin.py
+script/test/lib/direct-terminal.py
+script/test/lib/direct-terminal-contract.py
+script/test/e2e.sh 21
+# Runs every suite above, so it names Python until they are ported.
+script/test/ci-contracts.sh 4
+
+# --- Migration debt: Rust tests that shell out to python -------------------
+crates/agent-vm/tests/config_doctor.rs 3

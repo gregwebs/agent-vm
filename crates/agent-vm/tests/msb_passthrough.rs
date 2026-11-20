@@ -29,10 +29,9 @@
 //! so no global env mutation or `#[ignore]`/serial gating is needed.
 
 use std::{
-    io::Read,
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
-    time::{Duration, Instant},
+    process::{Command, Output},
+    time::Duration,
 };
 
 fn agent_vm_bin() -> PathBuf {
@@ -84,6 +83,9 @@ const BUNDLED_MIGRATION: &str = "m20260305_000001_create_image_tables";
 
 #[path = "support/fake_msb.rs"]
 mod fake_msb;
+mod support;
+
+use support::run_with_timeout;
 
 /// Write a fake `msb` that:
 /// - answers a bare `--version` (exactly one arg) with the official
@@ -120,45 +122,6 @@ exit "${{FAKE_MSB_EXIT_CODE:-0}}"
         ),
     );
     path
-}
-
-/// Run `child` to completion, killing it if it doesn't exit within
-/// `timeout`. Reads stdout/stderr on separate threads so a full pipe can't
-/// deadlock the wait. Mirrors `msb_cache_share.rs`'s helper of the same name.
-fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Output {
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn().expect("failed to spawn agent-vm");
-    let mut stdout_pipe = child.stdout.take().unwrap();
-    let mut stderr_pipe = child.stderr.take().unwrap();
-    let stdout_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout_pipe.read_to_end(&mut buf);
-        buf
-    });
-    let stderr_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut buf);
-        buf
-    });
-
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("try_wait failed") {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("agent-vm did not exit within {timeout:?} (possible hang)");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-
-    Output {
-        status,
-        stdout: stdout_handle.join().unwrap(),
-        stderr: stderr_handle.join().unwrap(),
-    }
 }
 
 /// One isolated `$HOME` + `AGENT_VM_STATE_DIR` + fake `MSB_PATH`, plus a

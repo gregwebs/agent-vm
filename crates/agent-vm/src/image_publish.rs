@@ -176,7 +176,8 @@ impl ImageTarget {
     ///
     /// The directory is agent-vm's own, not Docker's: `image build` writes the
     /// export through this file, `image import` saves into it, and either way
-    /// the archive is removed with the directory once publication ends.
+    /// the archive is removed with the directory once publication ends. A launch
+    /// build's probe also writes its `--metadata-file` beside the archive.
     pub(crate) fn stage(&self) -> Result<Staging> {
         let root = self.msb_home.join("tmp");
         std::fs::create_dir_all(&root).context("creating image staging root")?;
@@ -378,6 +379,14 @@ impl Staging {
         self.file
             .try_clone()
             .context("duplicating the staged archive handle for Docker's stdout")
+    }
+
+    /// The launch-build probe's `--metadata-file` (ADR-0071): beside the archive,
+    /// so it is as private as the archive and removed with it. Not created here:
+    /// Docker writes it only after a successful build, so its absence means
+    /// exactly that.
+    pub(crate) fn probe_metadata_path(&self) -> PathBuf {
+        self.path.with_file_name("probe.json")
     }
 }
 
@@ -673,9 +682,17 @@ mod publication_tests {
         let metadata = std::fs::metadata(&path).unwrap();
         assert_eq!(metadata.mode() & 0o777, 0o600);
         assert_eq!(metadata.len(), 0);
+        // The launch-build probe's metadata file sits in the same private dir and
+        // is gone with it; Docker creates it, so it does not exist yet.
+        let probe = stage.probe_metadata_path();
+        assert_eq!(probe.parent(), path.parent());
+        assert_eq!(probe.file_name().unwrap(), "probe.json");
+        assert!(!probe.exists(), "Docker writes it only after a build");
         let stage_dir = path.parent().unwrap().to_path_buf();
+        std::fs::write(&probe, b"{}").unwrap();
         drop(stage);
         assert!(!path.exists());
+        assert!(!probe.exists());
         assert!(!stage_dir.exists(), "staging dir must be removed on drop");
     }
 

@@ -1409,6 +1409,47 @@ impl NativeAcquisition {
     }
 }
 
+/// Test-only: make the shared publication barrier impossible to open, so a
+/// cache read fails instead of answering.
+///
+/// [`host_paths::open_lock_file`] requires a regular file, so a directory at the
+/// lock's path is a cache the reader cannot read.
+///
+/// The fault mutates the **process-global** cache directory, so it is only
+/// correct while [`crate::test_env::guard`] is held: every use installs it inside
+/// the guard and drops it before the guard is released, which puts a plain lock
+/// file back. A fault left installed, or one installed outside the guard, would
+/// poison every later test in the same process that shares that cache — the same
+/// class of hidden cross-test coupling that made #677's cache-miss unit test
+/// order-dependent. Nested faults are not supported: the first drop restores the
+/// file.
+#[cfg(test)]
+pub(crate) struct PublicationLockFault {
+    path: std::path::PathBuf,
+}
+
+#[cfg(test)]
+impl PublicationLockFault {
+    pub(crate) fn install(cache_dir: &std::path::Path) -> Self {
+        let path = cache_dir.join(barrier::PUBLICATION_LOCK_FILE);
+        std::fs::remove_file(&path).ok();
+        std::fs::create_dir_all(&path).expect("replace the publication lock with a directory");
+        Self { path }
+    }
+}
+
+#[cfg(test)]
+impl Drop for PublicationLockFault {
+    fn drop(&mut self) {
+        std::fs::remove_dir(&self.path).ok();
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&self.path);
+    }
+}
+
 /// Acquire `target` and return an opaque validated token plus the shared
 /// publication barrier that protected the cache.
 ///

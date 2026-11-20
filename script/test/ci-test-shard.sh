@@ -120,9 +120,9 @@ done
 # The unit tests need no separate target name: `--bin` is the binary's own
 # tests, exactly what `cargo test -p agent-vm` runs first. There are no doctests
 # to run here — the crate is a bin, so `--doc` reports "no library targets
-# found", and `cargo test -p agent-vm` runs none (the only Doc-tests target in
-# the workspace belongs to msb-krun-compat-evidence, which `ci-contracts.sh`
-# tests).
+# found", and `cargo test -p agent-vm` runs none (the workspace's other Doc-tests
+# targets belong to msb-krun-compat-evidence and agent-vm-harness, which
+# `ci-contracts.sh` tests).
 if ((units_shard == shard)); then
     echo "ci-test-shard: the binary's unit tests are shard $shard's"
     cargo test -p agent-vm --bin agent-vm

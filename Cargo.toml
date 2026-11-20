@@ -1,12 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/agent-vm", "crates/msb-krun-compat-evidence"]
+members = ["crates/agent-vm", "crates/harness", "crates/msb-krun-compat-evidence"]
 # microsandbox declares its own workspace under vendor/; keep it separate
 # so Cargo doesn't try to absorb it into ours.
 exclude = ["vendor/microsandbox"]
 
 [workspace.package]
-version = "0.7.75"
+version = "0.7.76"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/wirenboard/agent-vm"
