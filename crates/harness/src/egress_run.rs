@@ -114,6 +114,25 @@ pub struct Fixture {
     start: Option<[u64; 2]>,
 }
 
+impl Fixture {
+    /// Adopt a child the caller started as this run's fixture cluster.
+    ///
+    /// The boot-free controls start the cluster themselves (through
+    /// `fixture_command`) so they can watch it be reaped; the cleanup path is
+    /// the same one, and the start token comes from the identity it is given.
+    pub fn adopt(child: Child, identity: Value) -> Self {
+        let start = identity
+            .get("start")
+            .cloned()
+            .and_then(|start| serde_json::from_value(start).ok());
+        Self {
+            child,
+            identity,
+            start,
+        }
+    }
+}
+
 /// Everything the sweep must hand to its `finally`: the launches it started, the
 /// fixture cluster, and what it managed to decide. `orchestrate` owns the cleanup
 /// so an error anywhere in `sweep` still reaches it.

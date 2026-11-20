@@ -16,6 +16,9 @@ pub mod egress_fixtures;
 pub mod egress_hostname_fixtures;
 pub mod egress_launch;
 pub mod egress_run;
+// The supervisor's controls: a library module as well as a command, because its
+// call-site controls read this crate's source (`--repo-root`).
+pub mod egress_supervisor;
 pub mod egress_witness;
 pub mod msb_catalog;
 
@@ -62,6 +65,8 @@ enum Command {
     EgressProbe(egress_probe::EgressProbeArgs),
     /// Check the egress default-deny driver's plan inventory and guard rails.
     EgressDefaultDeny(egress_default_deny::EgressDefaultDenyArgs),
+    /// Run the boot-free controls for the owned launch supervisor.
+    EgressSupervisor(egress_supervisor::EgressSupervisorArgs),
     /// Check the image-pins live-seed helper dispatch.
     ImagePins(image_pins::ImagePinsArgs),
     /// Play a launcher's plumbing for the boot-free direct-terminal controls.
@@ -94,6 +99,7 @@ impl Cli {
             Command::EgressFixtures(_) => "egress fixtures",
             Command::EgressProbe(_) => "egress probe",
             Command::EgressDefaultDeny(_) => "egress default deny",
+            Command::EgressSupervisor(_) => "egress supervisor",
         }
     }
 }
@@ -120,6 +126,7 @@ pub fn run(cli: Cli) -> Result<Outcome, String> {
         Command::EgressFixtures(args) => egress_fixtures::run(args),
         Command::EgressProbe(args) => egress_probe::run(args),
         Command::EgressDefaultDeny(args) => egress_default_deny::run(args),
+        Command::EgressSupervisor(args) => egress_supervisor::run(args),
         Command::ImagePins(args) => image_pins::run(args).map(Outcome::Report),
         Command::LauncherStandin(args) => launcher_standin::run(args),
         Command::LaunchArgvOrder(args) => launch_argv_order::run(args).map(Outcome::Report),

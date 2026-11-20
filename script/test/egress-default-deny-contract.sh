@@ -24,13 +24,15 @@ trap 'rm -rf -- "$scratch"' EXIT
 # neither mocks of dispatcher routes nor owned-supervisor fakes prove framing.
 "$harness" egress-probe --self-test --repo-root "$REPO_ROOT"
 
-# #694's supervisor controls still run their own Python. Everything above is a
-# harness subcommand.
-python3 "$REPO_ROOT/script/test/lib/egress-supervisor-contract.py"
+# #694's supervisor controls are a harness subcommand too: the plan/recorder join,
+# the ADR-0065/0066 allowance lifecycle at its call sites, and the owned launch's
+# timeout, catalog, socket and cleanup rows. This file's last host interpreter
+# call was here; nothing in it needs one now.
+"$harness" egress-supervisor --self-test --repo-root "$REPO_ROOT"
 
 # Run the actual guard, then remove each required membership independently.
 # Mutated copies live only in owned scratch; the working tree is never edited.
 bash "$REPO_ROOT/script/test/ci-contracts.sh" --guard-only
 "$harness" egress-default-deny --guard-mutations --repo-root "$REPO_ROOT"
 
-echo 'host-only egress default-deny contract passed (six §6.7 items; no VM run)'
+echo 'host-only egress default-deny contract passed (seven §6.7 items; no VM run)'
