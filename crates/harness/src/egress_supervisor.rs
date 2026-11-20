@@ -37,8 +37,8 @@
 //!
 //! The call-site controls read `egress_run.rs` from the repository root at run
 //! time rather than through `include_str!`, because that is what lets
-//! `egress-mutations.py` grade the deletions those rows own against a prebuilt
-//! binary (`--repo-root` points at the mutated copy). The oracle is the fragment
+//! `harness egress-mutations` grade the deletions those rows own against a
+//! prebuilt binary (`--repo-root` points at the mutated copy). The oracle is the fragment
 //! list in the control, never the file it reads.
 
 use std::{
@@ -1073,8 +1073,8 @@ fn the_launcher_runs_the_allowance_lifecycle() -> Result<(), String> {
     control("allowance-sites", |work| {
         // The call sites, not only the helpers: `orchestrate` is a whole boot
         // harness, so the boot-free proof is that the steps it must perform are
-        // the ones it calls. `egress-mutations.py` deletes each call to prove
-        // this control bites.
+        // the ones it calls. `harness egress-mutations` deletes each call to
+        // prove this control bites.
         let run_source = source("crates/harness/src/egress_run.rs")?;
         for fragment in [
             // The seed step, with its guard: the abort branch's recovery call

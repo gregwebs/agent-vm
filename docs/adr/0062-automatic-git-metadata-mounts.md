@@ -253,7 +253,7 @@ Boot-free real-CLI rows `T0`–`T20` in `crates/agent-vm/tests/git_metadata_moun
 `git_metadata_claim_errors_are_pinned` and `git_metadata_binds_are_not_scan_roots`;
 (`T2b`, `T6(c)`, `T12b`, `T12c`, `T14b` cover the checkout-containment, two-bind,
 unmountable-layout, in-project and enclosing-declaration paths);
-mutation controls `git-*` in `script/test/egress-mutations.py` (including
+mutation controls `git-*` in `harness egress-mutations` (including
 `git-checkout-in-common-bound{,-proof,-launch}`); native rows `GM-N1`–`GM-N4` in
 the config-mounts live run — **passed** 2026-11-08 on macOS arm64 with the
 candidate and image pinned in the spec's Testing Decisions; a missing prerequisite

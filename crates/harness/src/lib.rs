@@ -28,6 +28,7 @@ mod config_dir_guard;
 mod cpu_commitment;
 mod detached_run;
 mod egress_default_deny;
+mod egress_mutations;
 mod egress_probe;
 mod image_pins;
 mod launch_argv_order;
@@ -63,6 +64,8 @@ enum Command {
     EgressFixtures(egress_fixtures::EgressFixturesArgs),
     /// Run the boot-free controls for the egress probe library and its driver.
     EgressProbe(egress_probe::EgressProbeArgs),
+    /// Prove the mutation anchors resolve, or run the mutation controls themselves.
+    EgressMutations(egress_mutations::EgressMutationsArgs),
     /// Check the egress default-deny driver's plan inventory and guard rails.
     EgressDefaultDeny(egress_default_deny::EgressDefaultDenyArgs),
     /// Run the boot-free controls for the owned launch supervisor.
@@ -100,6 +103,7 @@ impl Cli {
             Command::EgressProbe(_) => "egress probe",
             Command::EgressDefaultDeny(_) => "egress default deny",
             Command::EgressSupervisor(_) => "egress supervisor",
+            Command::EgressMutations(_) => "egress mutations",
         }
     }
 }
@@ -125,6 +129,7 @@ pub fn run(cli: Cli) -> Result<Outcome, String> {
         Command::DetachedRun(args) => detached_run::run(args),
         Command::EgressFixtures(args) => egress_fixtures::run(args),
         Command::EgressProbe(args) => egress_probe::run(args),
+        Command::EgressMutations(args) => egress_mutations::run(args),
         Command::EgressDefaultDeny(args) => egress_default_deny::run(args),
         Command::EgressSupervisor(args) => egress_supervisor::run(args),
         Command::ImagePins(args) => image_pins::run(args).map(Outcome::Report),
@@ -146,6 +151,7 @@ pub fn failure_status(error: &str) -> Option<i32> {
         return Some(2);
     }
     detached_run::failure_status(error)
+        .or_else(|| egress_mutations::failure_status(error))
         .or_else(|| launcher_standin::failure_status(error))
         .or_else(|| cpu_commitment::failure_status(error))
 }

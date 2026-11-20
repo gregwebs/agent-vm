@@ -75,11 +75,12 @@ a working Cargo toolchain, and `jq`/`shasum`/`python3` for the suites ADR-0072
 has not ported yet.
 
 `--guard-only` is not the gate. It runs the guard rails alone — no
-provenance, no contracts, and **no mutation-anchor check** (`egress-mutations.py
---check-anchors`) — so it is green on trees where CI's `contracts` job is red.
-It exists as a test seam for the guards' own tests; use it only when the
-submodule is absent and you know the rest of the gate is not what you are
-checking. Anything destined for `main` runs the whole script.
+provenance, no contracts, and **no mutation-anchor check**
+(`harness egress-mutations --check-anchors`) — so it is green on trees where
+CI's `contracts` job is red. It exists as a test seam for the guards' own
+tests; use it only when the submodule is absent and you know the rest of the
+gate is not what you are checking. Anything destined for `main` runs the whole
+script.
 
 Test tooling is the `agent-vm-harness` crate (`crates/harness`), not Python:
 see [ADR-0072](docs/adr/0072-no-host-python.md) and
@@ -500,21 +501,38 @@ or a new tracked evidence convention; a blocked row is recorded as
 `script/test/egress-default-deny.sh` is the serial native networking harness;
 `e2e.sh` does not certify networking. Its boot-free companion is
 `bash script/test/egress-default-deny-contract.sh`. Mutation controls run with
-`python3 script/test/egress-mutations.py --evidence /absolute/owned/log-directory`
-(pinned Verus on PATH); only disposable source copies are changed.
+`cargo build --locked -p agent-vm-harness --bins` first, then
+`"${HARNESS_BIN_DIR:-target/debug}/harness" egress-mutations --evidence /absolute/owned/log-directory`
+(pinned Verus on PATH); only disposable source copies are changed. What that run
+proves: every row is a property a control is supposed to notice, the control is
+what fails when the property is broken, and the failure is the control's own
+assertion rather than a compile error, an unmatched test filter, or a timeout.
+
+A row mutates one source file and runs one control. There are four kinds: a
+`cargo test` unit or integration target of the mutated `agent-vm` crate, the
+Verus gate for the 45 `-proof` rows, a prebuilt `harness` control that reads the
+mutated file from the copy at run time (`egress-probe`, `egress-supervisor`),
+and — for the egress code that now lives in `crates/harness` — the copy's own
+rebuilt `harness` binary running one named `--self-test --only` control. That
+last kind is what proves the checks bite: it costs one incremental
+`cargo build -p agent-vm-harness --bins` per row.
 
 The cargo controls build that copy in the harness's own target dir
 (`target/egress-mutations/target`), and the proof controls use `target/verus`,
 which their gate cleans on every run. Every compiling control then removes the
-package's artifacts with `cargo clean -p agent-vm` before it runs: fingerprints
-ignore the copy's path, so a target built elsewhere otherwise looks fresh and
-re-executes a stale binary, letting a mutation confined to a test file
-"survive" (#327). A control whose mutated source cargo reports as fresh, or as
-never compiled, is a **harness** failure rather than a surviving mutant. Both
-target dirs are warmed before the matrix, so a cold dependency build is not a
-control timeout; the first run pays that build once. `results.json` records each
-control's wall time, and the run prints its total. Concurrent runs are refused
-rather than interleaved.
+package's artifacts with `cargo clean -p agent-vm` (or `-p agent-vm-harness`)
+before it runs: fingerprints ignore the copy's path, so a target built elsewhere
+otherwise looks fresh and re-executes a stale binary, letting a mutation
+confined to a test file "survive" (#327). A control whose mutated source cargo
+reports as fresh, or as never compiled, is a **harness** failure rather than a
+surviving mutant. Both target dirs are warmed before the matrix, so a cold
+dependency build is not a control timeout; the first run pays that build once.
+`results.json` records each control's wall time, and the run prints its total.
+Concurrent runs are refused rather than interleaved, and every wait is bounded
+(240 s per row), so a wedged control fails a row instead of hanging the gate.
+
+The copy is the working tree, not just the commit: tracked files plus the
+unignored ones a port has written but not yet staged, with `vendor/` symlinked.
 
 CI runs only `--check-anchors`, which resolves find text: it proves each
 pre-mutation anchor is present the expected number of times and **never** that a
