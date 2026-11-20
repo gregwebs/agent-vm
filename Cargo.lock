@@ -69,6 +69,8 @@ name = "agent-vm-harness"
 version = "0.7.76"
 dependencies = [
  "clap",
+ "serde_json",
+ "toml",
 ]
 
 [[package]]

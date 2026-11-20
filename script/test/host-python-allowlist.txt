@@ -29,11 +29,6 @@ script/test/fixtures/egress-probe.sh 10
 profiling/build_legacy.sh 1
 profiling/build_variants.sh 1
 
-# --- Migration debt: runtime provenance -------------------------------------
-script/check-runtime-provenance.py
-script/check-runtime-provenance.sh 1
-script/test/runtime-provenance.sh 8
-
 # --- Migration debt: build provenance ---------------------------------------
 script/test/lib/build-provenance.py
 script/test/build-provenance-contract.sh 1
