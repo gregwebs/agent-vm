@@ -5,13 +5,30 @@
 //! keeps its own model of every format it reads or writes, and a format change
 //! that breaks it is meant to fail.
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
+
+mod config_dir_guard;
 
 /// The `harness` commands. A port adds one variant, replacing a Python driver or
 /// a boot-free Python suite.
 #[derive(Debug, Parser)]
 #[command(name = "harness", version, about = "Test-harness tooling for agent-vm")]
-pub struct Cli {}
+pub struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Run configuration-directory guard controls and filesystem queries.
+    ConfigDirGuard(config_dir_guard::ConfigDirGuardArgs),
+}
+
+pub fn run(cli: Cli) -> Result<String, String> {
+    match cli.command {
+        Command::ConfigDirGuard(args) => config_dir_guard::run(args),
+    }
+}
 
 #[cfg(test)]
 mod tests {

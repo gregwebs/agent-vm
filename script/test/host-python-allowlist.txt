@@ -52,10 +52,6 @@ crates/msb-krun-compat-evidence/src/lib.rs 3
 script/test/msb-krun-compat.sh 1
 script/test/msb-krun-compat-contract.sh 4
 
-# --- Migration debt: config dir guard --------------------------------------
-script/test/config-dir-guard-contract.sh 6
-script/test/lib/config-dir-guard.sh 1
-
 # --- Migration debt: build archive oracle and image pins -------------------
 script/test/fixtures/build-archive-oracle.py
 script/test/e2e-image-pins-contract.sh 1
