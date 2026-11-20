@@ -1,58 +1,65 @@
-//! The guard against an independently written table (§10.1 `access_prompt/guard`).
+//! The line rules against independently written tables (§10.1 `access_prompt/guard`).
 
 use super::*;
 
-fn facts(chunk_len: usize, byte: u8) -> KeyFacts {
-    KeyFacts {
+fn facts(chunk_len: usize, byte: u8) -> LineFacts {
+    LineFacts {
         chunk_len,
         byte,
         read_after_visible: true,
-        quiet_ms: TYPING_QUIET_MS,
+        continued: false,
         in_paste: false,
-        session_offered: true,
+        too_soon: false,
     }
 }
 
-/// The exhaustive decision table: every byte, every chunk length and quiet time,
-/// inside and outside a paste, with and without `s`, compared against a table
-/// written from the requirement rather than from the implementation.
+/// The exhaustive per-read table: every byte against every read shape, compared
+/// with a table written from the requirement rather than from the implementation.
 #[test]
-fn the_exhaustive_answer_table() {
+fn the_exhaustive_line_step_table() {
     for byte in 0u8..=255 {
-        for chunk_len in [0usize, 1, 2, 5] {
-            for quiet_ms in [0u64, 699, 700, 60_000] {
-                for read_after_visible in [false, true] {
+        for chunk_len in [0usize, 1, 2, 7] {
+            for read_after_visible in [false, true] {
+                for continued in [false, true] {
                     for in_paste in [false, true] {
-                        for session_offered in [false, true] {
-                            let f = KeyFacts {
+                        for too_soon in [false, true] {
+                            let f = LineFacts {
                                 chunk_len,
                                 byte,
                                 read_after_visible,
-                                quiet_ms,
+                                continued,
                                 in_paste,
-                                session_offered,
+                                too_soon,
                             };
-                            let guarding = chunk_len == 1
-                                && read_after_visible
-                                && !in_paste
-                                && quiet_ms >= 700;
-                            let expected = if !guarding {
-                                None
+                            // Only one clean key stroke — a single byte that started after
+                            // the prompt was visible and is neither a sequence's tail nor
+                            // inside a paste — may act on the line.
+                            let clean =
+                                chunk_len == 1 && read_after_visible && !continued && !in_paste;
+                            // The settle window comes first: nothing at all happens while
+                            // the operator may still be typing at the guest.
+                            let expected = if too_soon {
+                                LineStep::Ignore
+                            } else if !clean {
+                                LineStep::Clear
+                            } else if byte == b'\r' || byte == b'\n' {
+                                LineStep::Submit
+                            } else if byte == 0x7f || byte == 0x08 {
+                                LineStep::Erase
+                            } else if byte == 0x1b || byte == 0x03 {
+                                LineStep::Deny
+                            } else if byte.is_ascii_alphabetic() {
+                                LineStep::Typed(byte.to_ascii_lowercase())
                             } else {
-                                match (byte, session_offered) {
-                                    (b's', true) => Some(Answer::Session),
-                                    (b'p', _) => Some(Answer::Project),
-                                    (b'n', _) => Some(Answer::StopAsking),
-                                    (b'd' | b'\r' | b'\n' | 0x1b | 0x03, _) => Some(Answer::Refuse),
-                                    _ => None,
-                                }
+                                // A byte that is not a letter clears the line, so no line
+                                // ever holds something an answer could be spelled around.
+                                LineStep::Clear
                             };
                             assert_eq!(
-                                answer_of(f),
+                                line_step(f),
                                 expected,
-                                "byte {byte:#x} len {chunk_len} quiet {quiet_ms} \
-                                 after_visible {read_after_visible} paste {in_paste} \
-                                 offered {session_offered}"
+                                "byte {byte:#x} len {chunk_len} after_visible {read_after_visible} \
+                             continued {continued} paste {in_paste} too_soon {too_soon}"
                             );
                         }
                     }
@@ -62,33 +69,116 @@ fn the_exhaustive_answer_table() {
     }
 }
 
+/// A letter never answers on its own: it only types. This is the property Enter was
+/// added for, so it is asserted against the table rather than only implied by it.
 #[test]
-fn s_is_not_an_answer_when_it_is_not_offered() {
-    assert_eq!(answer_of(facts(1, b's')), Some(Answer::Session));
-    let mut f = facts(1, b's');
-    f.session_offered = false;
-    assert_eq!(answer_of(f), None, "an unoffered s is typing");
+fn only_enter_submits_and_only_esc_or_ctrl_c_deny() {
+    for byte in 0u8..=255 {
+        if matches!(byte, b'\r' | b'\n' | 0x1b | 0x03) {
+            continue;
+        }
+        let step = line_step(facts(1, byte));
+        assert_ne!(
+            step,
+            LineStep::Submit,
+            "only Enter submits; {byte:#x} submitted the line"
+        );
+        assert_ne!(
+            step,
+            LineStep::Deny,
+            "only Esc and Ctrl-C deny; {byte:#x} denied the question"
+        );
+    }
 }
 
-/// §3.4's timeline, as instants.
+/// Uppercase types the same letter: Enter is the confirmation, not the case.
 #[test]
-fn the_timeline_of_the_typing_guard() {
-    // t=0.30 'l', then 0.05 s later 's': not quiet enough.
-    let mut f = facts(1, b's');
-    f.quiet_ms = 50;
-    assert_eq!(answer_of(f), None);
-    // t=1.05 the guard holds, but the key is 'l'.
-    let mut f = facts(1, b'l');
-    f.quiet_ms = 750;
-    assert_eq!(answer_of(f), None);
-    // "sp" as one read is typing whatever it contains.
-    assert_eq!(answer_of(facts(2, b's')), None);
-    // t=3.00 's', 0.90 s after the last input.
-    let mut f = facts(1, b's');
-    f.quiet_ms = 900;
-    assert_eq!(answer_of(f), Some(Answer::Session));
-    // Uppercase is typing, so Caps Lock cannot allow.
-    assert_eq!(answer_of(facts(1, b'S')), None);
+fn letters_fold_to_lower_case() {
+    for (typed, stored) in [
+        (b'S', b's'),
+        (b'P', b'p'),
+        (b'D', b'd'),
+        (b'N', b'n'),
+        (b'A', b'a'),
+        (b'Z', b'z'),
+        (b's', b's'),
+    ] {
+        assert_eq!(line_step(facts(1, typed)), LineStep::Typed(stored));
+    }
+}
+
+/// The answer table: every accepted spelling, every near miss, and the empty line.
+#[test]
+fn the_answer_table() {
+    use Answer::*;
+    let cases: &[(&[u8], Option<Answer>)] = &[
+        // Enter on its own keeps refusing.
+        (b"", Some(Refuse)),
+        // The four answers, each spelled as a letter and as its word.
+        (b"s", Some(Session)),
+        (b"session", Some(Session)),
+        (b"p", Some(Project)),
+        (b"project", Some(Project)),
+        (b"d", Some(Refuse)),
+        (b"deny", Some(Refuse)),
+        (b"n", Some(StopAsking)),
+        (b"never", Some(StopAsking)),
+        // Near misses do nothing at all.
+        (b"ses", None),
+        (b"sessio", None),
+        (b"sessions", None),
+        (b"projec", None),
+        (b"projects", None),
+        (b"den", None),
+        (b"denys", None),
+        (b"neve", None),
+        (b"neverr", None),
+        (b"ss", None),
+        (b"sd", None),
+        (b" s", None),
+        (b"d ", None),
+        (b"x", None),
+        (b"allow", None),
+    ];
+    for (line, expected) in cases {
+        assert_eq!(
+            answer_of(line, true),
+            *expected,
+            "line {:?}",
+            String::from_utf8_lossy(line)
+        );
+        // Only `s`/`session` depends on what is on offer.
+        let offered = !matches!(expected, Some(Session));
+        assert_eq!(
+            answer_of(line, false),
+            if offered { *expected } else { None },
+            "line {:?} with no session grant on offer",
+            String::from_utf8_lossy(line)
+        );
+    }
+}
+
+/// `s` and `session` do nothing when the session grant is not on offer; the other
+/// three answers are unaffected.
+#[test]
+fn session_words_are_not_answers_when_the_session_grant_is_not_offered() {
+    assert_eq!(answer_of(b"s", false), None);
+    assert_eq!(answer_of(b"session", false), None);
+    assert_eq!(answer_of(b"p", false), Some(Answer::Project));
+    assert_eq!(answer_of(b"project", false), Some(Answer::Project));
+    assert_eq!(answer_of(b"d", false), Some(Answer::Refuse));
+    assert_eq!(answer_of(b"deny", false), Some(Answer::Refuse));
+    assert_eq!(answer_of(b"n", false), Some(Answer::StopAsking));
+    assert_eq!(answer_of(b"never", false), Some(Answer::StopAsking));
+    assert_eq!(answer_of(b"", false), Some(Answer::Refuse));
+}
+
+/// The line never grows past what a word needs, so the input row cannot widen.
+#[test]
+fn the_answer_field_holds_more_than_the_longest_word() {
+    assert_eq!(MAX_ANSWER_CHARS, 8);
+    assert!(MAX_ANSWER_CHARS > "session".len());
+    assert!(MAX_ANSWER_CHARS > "project".len());
 }
 
 #[test]

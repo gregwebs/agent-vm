@@ -4342,7 +4342,8 @@ footer says so instead of inventing a number.
 
 On a direct launch whose terminal the launcher relays (`agent-vm run …` /
 `agent-vm -- …` resolved to a terminal), the launcher also asks about the refusal
-in that terminal — see *Answering a refusal in the terminal* below.
+in that terminal — see *Answering a refusal in the terminal* below. There the
+question is the notice, so this line is not printed as well: one notice, not two.
 
 ### Answering a refusal in the terminal
 
@@ -4353,31 +4354,42 @@ while the question is up.
 ```text
 agent-vm: the sandbox refused a network request from the guest
 
-  tcp 203.0.113.10:443
-  The guest chose this address.
-  The request has already failed; retry it after allowing.
-  Refused 1 time(s) in session 3f9a12c4.
+  dns www.google.com (DNS query, guest-supplied)
+  Refused 2 time(s), session 6580c298.
 
-  s  allow for this session
-  p  allow for this project, now and at every launch
-  d  keep refusing (also Enter or Esc)
-  n  keep refusing, and stop asking about it in this session
+How should this request be treated?
+Type one of the below letters and press enter:
+s_
 
-  ready for your answer
+  s session  allow for this session
+  p project  allow for this project, now and at every launch
+  d deny     keep refusing (also Enter or Esc)
+  n never    keep refusing, and stop asking about it in this session
+
+The request has already failed; retry it after allowing.
 refuses in 60 s if unanswered
 ```
 
 - **Which launches.** Only `run`/`--` with a terminal on stdin *and* stdout. The
   catalog tools (`claude`, `pi`, …) and `shell` keep the one hint and
   `agent-vm access`; so does any launch that streams instead of using a terminal.
-- **The keys.** `s` allows the destination for this session, `p` records it for
-  this project (and applies it now unless the launch could not intercept the
-  port), and `d`, Enter, Esc or Ctrl-C keep refusing. `n` keeps refusing and stops
-  the question for that destination in this session.
-- **The typing guard.** A key counts only when you have stopped typing: the
-  prompt says *stop typing to answer...* until nothing has arrived for 0.7 s, then
-  *ready for your answer*. A multi-byte read (an arrow key, a paste) never
-  answers. Keys typed during the question never reach the guest.
+- **The keys.** Type one of `s`/`session`, `p`/`project`, `d`/`deny` or
+  `n`/`never` on the input line and press **Enter**; the letters are echoed, and
+  Backspace erases. Case does not matter. `s` allows the destination for this
+  session, `p` records it for this project (and applies it now unless the launch
+  could not intercept the port), and `d` keeps refusing. `n` keeps refusing and
+  stops the question for that destination in this session. Enter on an empty line,
+  Esc and Ctrl-C also keep refusing, without the letter first.
+- **Nothing answers by itself.** A letter is never an answer: only Enter submits
+  the line, so a stray keystroke, a terminal's own reply, or a split escape
+  sequence cannot allow anything. What you type is ignored for the first half
+  second, so the tail of a command you were already typing at the guest cannot
+  become an answer. An unrecognised line does nothing at all — the question stays up
+  with what you typed. A byte that is not a letter clears the line, so a line never
+  holds an answer you did not type in one go. A paste, or two letters that arrive in
+  one read, clears it too (the prompt turns bracketed paste off, so the read
+  boundary is the only evidence a paste leaves). Keys typed during the question
+  never reach the guest.
 - **Afterwards.** The guest gets its terminal back — screen, cursor, character
   set, mouse tracking, bracketed paste, origin mode — and its held output follows
   in order. An alternate-screen guest is asked to redraw itself.
@@ -4389,7 +4401,7 @@ refuses in 60 s if unanswered
   shown closes it, and a `p` from the prompt can never promote an allowance the
   CLI already gave.
 - **When it is not shown.** `AGENT_VM_NO_ACCESS_PROMPT=1`, `TERM=dumb`, a
-  redirected stdout, a terminal under 40 × 14, a host HTTP proxy in use, a
+  redirected stdout, a terminal under 40 × 19, a host HTTP proxy in use, a
   refusal no allowance can name (a policy lock, a credential refusal, plain HTTP to
   a hostname), or a guest terminal state the launcher cannot give back exactly (a
   full reset on the alternate screen, left/right margin mode, an unknown character
@@ -4398,9 +4410,8 @@ refuses in 60 s if unanswered
 - **Limits, stated.** An alternate-screen guest's own saved cursor is overwritten
   by the question's save. A terminal without the alternate screen (GNU screen with
   its default `altscreen off`) shows — and clears — the question on the main
-  screen; set `altscreen on` or turn the prompt off. A one-character paste is
-  indistinguishable from a keypress. Inside tmux, visibility is tmux's
-  confirmation, not the outer terminal's.
+  screen; set `altscreen on` or turn the prompt off. Inside tmux, visibility is
+  tmux's confirmation, not the outer terminal's.
 - **Turning it off.** `AGENT_VM_NO_ACCESS_PROMPT=1`. Any unrecognised value leaves
   the prompt on and prints one warning naming the accepted values.
 

@@ -1197,8 +1197,9 @@ enum HostRead {
         /// an epoch at or below the flush that followed visibility can only hold
         /// bytes that arrived before it (R17, B5).
         epoch: u64,
-        /// Sampled just after `read(2)` returned: it can lag the return by scheduling
-        /// delay, which the restore limits state.
+        /// Sampled just after `read(2)` returned: the relay no longer decides anything
+        /// by it, so it exists only for the reader's own contract test.
+        #[allow(dead_code)]
         read_at: std::time::Instant,
     },
     /// Explicit, so a reader that ends for any other reason cannot impersonate
@@ -1221,15 +1222,9 @@ enum HostInput {
 
 fn classify_host_read(message: Option<HostRead>) -> HostInput {
     match message {
-        Some(HostRead::Chunk {
-            bytes,
-            epoch,
-            read_at,
-        }) => HostInput::Forward(access_prompt::relay::HostChunk {
-            bytes,
-            epoch,
-            read_at: tokio::time::Instant::from_std(read_at),
-        }),
+        Some(HostRead::Chunk { bytes, epoch, .. }) => {
+            HostInput::Forward(access_prompt::relay::HostChunk { bytes, epoch })
+        }
         Some(HostRead::Failed(error)) => {
             HostInput::Failed(anyhow::Error::new(error).context("reading host terminal input"))
         }

@@ -470,9 +470,8 @@ def main() -> int:
     # `access_prompt::screen`'s and the tmux oracle's).
     control(results, "accept/a correct prompt, answered with d", True,
             case="prompt-deny", standin_mode="prompt-ok")
-    # The launcher's own cadence: one request, a "stop typing" redraw per read, then
-    # "ready" 0.7 s after the last read. A driver that answers more than once never
-    # sees "ready" (H15).
+    # The launcher's own cadence: exactly one cursor-position reply per question. A
+    # driver that answers more than once never gets to the answer (H15).
     control(results, "accept/a driver that answers once against the launcher's cadence", True,
             case="prompt-deny", standin_mode="prompt-cadence")
     control(results, "reject/a leave without the mode re-apply fails", False,

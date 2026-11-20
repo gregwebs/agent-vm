@@ -276,6 +276,15 @@ impl HintRelay {
         self.relay.fired.load(Ordering::SeqCst) && !self.relay.written.swap(true, Ordering::SeqCst)
     }
 
+    /// The terminal was told by something better than the line — the access
+    /// prompt's own question. Nothing is owed to stderr, and [`Self::fired`] parks
+    /// for good: the claim is unconditional and order-independent, so a hint that
+    /// fires after the claim stays quiet too.
+    pub(crate) fn claim(&self) {
+        self.relay.written.store(true, Ordering::SeqCst);
+        self.relay.notified.notify_waiters();
+    }
+
     /// Give the hint back to stderr. Returns whether a hint fired but was never
     /// written, which the session epilogue must then print as it does today.
     pub(crate) fn detach(self) -> bool {

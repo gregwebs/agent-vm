@@ -7,7 +7,7 @@ use crate::access_prompt::vt::{Charsets, MouseTracking, Screen, VtState};
 fn view() -> View {
     View {
         destination: Cell::from_table("tcp 203.0.113.10:443".to_owned()),
-        guest_named: false,
+        typed: String::new(),
         count: 1,
         session: "3f9a12c4".to_owned(),
         offer: OfferText::SessionOrProject,
@@ -93,7 +93,6 @@ fn every_line_of_an_enter_frame_is_printable_ascii_within_the_width() {
         view(),
         View {
             destination: Cell::from_guest(&("dns ".to_owned() + &"a".repeat(253) + ".example")),
-            guest_named: true,
             ..view()
         },
         View {
@@ -104,7 +103,7 @@ fn every_line_of_an_enter_frame_is_printable_ascii_within_the_width() {
     ] {
         let laid = layout(&view, size).expect("a fitting question");
         let (frame, status_row) = enter(&modes(), &laid, false, true);
-        assert_eq!(status_row as usize, laid.status_row() + 1);
+        assert_eq!(status_row as usize, laid.input_row() + 1);
         for row in &laid.rows {
             assert!(row.is_ascii(), "a row must be printable ASCII: {row:?}");
             assert!(
@@ -131,7 +130,6 @@ fn the_table_s_cell_is_shown_exactly_as_access_prints_it() {
     let laid = layout(
         &View {
             destination: Cell::from_table(cell.clone()),
-            guest_named: true,
             ..view()
         },
         Size { rows: 30, cols: 80 },
@@ -154,7 +152,6 @@ fn a_hostile_destination_is_escaped_and_wrapped_in_full() {
     );
     let view = View {
         destination: Cell::from_guest(&hostile),
-        guest_named: true,
         ..view()
     };
     let size = Size { rows: 60, cols: 60 };
@@ -180,25 +177,32 @@ fn a_hostile_destination_is_escaped_and_wrapped_in_full() {
 }
 
 #[test]
-fn at_exactly_forty_by_fourteen_a_fitting_question_is_complete_and_a_longer_one_declines() {
-    let size = Size { rows: 14, cols: 40 };
-    // The shortest question that fits: the project-only offer saves two rows.
+fn the_minimum_question_fits_at_the_minimum_size_and_one_row_less_declines() {
+    let size = Size {
+        rows: MIN_ROWS,
+        cols: MIN_COLS,
+    };
+    // The full offer at the narrowest width: four key rows, three of them wrapped.
+    let full = layout(&view(), size).expect("the minimum terminal must fit the question");
+    assert!(full.rows.len() <= usize::from(MIN_ROWS));
+    // The project-only offer is the taller one: its single key word-wraps at the
+    // narrowest width, so it needs every row of the minimum terminal.
     let compact = View {
         destination: Cell::from_table("tcp 1.2.3.4:443".to_owned()),
         offer: OfferText::ProjectNextLaunch { port: Some(443) },
         ..view()
     };
-    let laid = layout(&compact, size).expect("40 x 14 must fit the minimum question");
-    assert!(laid.rows.len() <= 14);
-    // The full offer fits this size in its compact form, unclipped.
-    let full = layout(&view(), size).expect("the full question fits compactly");
-    assert!(full.rows.len() <= 14);
+    let laid = layout(&compact, size).expect("40 x MIN_ROWS must fit the minimum question");
+    assert_eq!(
+        full.rows.len().max(laid.rows.len()),
+        usize::from(MIN_ROWS),
+        "MIN_ROWS is the tallest form, so the minimum size is tight"
+    );
     // One that does not fit is declined rather than clipped (R25).
     assert_eq!(
         layout(
             &View {
                 destination: Cell::from_guest(&format!("dns {}.example", "a".repeat(120))),
-                guest_named: true,
                 ..view()
             },
             size
@@ -206,9 +210,27 @@ fn at_exactly_forty_by_fourteen_a_fitting_question_is_complete_and_a_longer_one_
         None,
         "R25: a question that does not fit is declined, never clipped"
     );
-    // One row too short declines even the minimum.
-    assert_eq!(layout(&compact, Size { rows: 13, cols: 40 }), None);
-    assert_eq!(layout(&compact, Size { rows: 14, cols: 39 }), None);
+    // One row too short declines — and one column too narrow does too.
+    assert_eq!(
+        layout(
+            &compact,
+            Size {
+                rows: MIN_ROWS - 1,
+                cols: MIN_COLS
+            }
+        ),
+        None
+    );
+    assert_eq!(
+        layout(
+            &view(),
+            Size {
+                rows: MIN_ROWS,
+                cols: MIN_COLS - 1
+            }
+        ),
+        None
+    );
 }
 
 #[test]
@@ -246,7 +268,7 @@ fn two_destinations_sharing_a_sixty_character_prefix_are_each_shown_in_full() {
 }
 
 #[test]
-fn the_waiting_count_moves_to_its_own_row_when_it_does_not_fit_beside_the_status() {
+fn the_row_under_the_input_carries_the_status_and_the_counts() {
     let size = Size { rows: 30, cols: 40 };
     let laid = layout(
         &View {
@@ -258,16 +280,18 @@ fn the_waiting_count_moves_to_its_own_row_when_it_does_not_fit_beside_the_status
         size,
     )
     .expect("it fits");
-    let count_row = laid
-        .count_row
-        .expect("the count cannot fit beside 40 columns");
-    assert!(count_row < laid.status_row);
-    let count_text: String = laid.rows[count_row..laid.status_row].join("\n");
-    assert!(count_text.contains("+8 more waiting"), "{count_text}");
-    assert!(count_text.contains("+12 more:"), "{count_text}");
-    assert!(count_text.contains("agent-vm"), "{count_text}");
-    assert!(count_text.contains("access"), "{count_text}");
-    for row in &laid.rows[count_row..laid.status_row] {
+    // The row straight after the input row is where the status and the counts live.
+    let status: String = laid.rows[laid.input_row() + 1..]
+        .iter()
+        .take_while(|row| !row.is_empty())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(status.contains("+8 more waiting"), "{status}");
+    assert!(status.contains("+12 more:"), "{status}");
+    assert!(status.contains("agent-vm"), "{status}");
+    assert!(status.contains("access"), "{status}");
+    for row in &laid.rows {
         assert!(
             row.chars().count() <= usize::from(size.cols - 1),
             "{row:?} exceeds the width"
@@ -294,7 +318,7 @@ fn the_enter_frame_saves_before_it_changes_anything() {
 fn the_enter_frame_ends_at_the_visibility_position_and_asks_for_it() {
     let laid = layout(&view(), Size { rows: 30, cols: 80 }).unwrap();
     let (frame, status_row) = enter(&modes(), &laid, false, true);
-    let expected = format!("\x1b[{status_row};3H");
+    let expected = format!("\x1b[{status_row};{}H", laid.cursor_col());
     let tail = &frame[frame.len() - expected.len() - 4..];
     assert!(
         tail.starts_with(expected.as_bytes()),
@@ -486,7 +510,10 @@ fn the_result_frame_replaces_from_the_first_key_row_and_fits_or_shortens() {
     }
     // An oversized result is shortened, never clipped mid-word, and points at the
     // command that has the full answer.
-    let tiny = Size { rows: 14, cols: 40 };
+    let tiny = Size {
+        rows: MIN_ROWS,
+        cols: MIN_COLS,
+    };
     let laid = layout(
         &View {
             offer: OfferText::ProjectNextLaunch { port: Some(443) },
@@ -494,7 +521,7 @@ fn the_result_frame_replaces_from_the_first_key_row_and_fits_or_shortens() {
         },
         tiny,
     )
-    .expect("the minimum question fits 40 x 14");
+    .expect("the minimum question fits the minimum terminal");
     let frame = result(
         &laid,
         &ResultView {
@@ -538,7 +565,10 @@ fn the_result_frame_replaces_from_the_first_key_row_and_fits_or_shortens() {
 fn a_result_too_long_for_the_screen_says_where_the_rest_is() {
     // M11/C-F3: an outcome longer than the terminal keeps the actionable lines and one
     // visible pointer instead of stopping silently.
-    let tiny = Size { rows: 14, cols: 40 };
+    let tiny = Size {
+        rows: MIN_ROWS,
+        cols: MIN_COLS,
+    };
     let laid = layout(
         &View {
             offer: OfferText::ProjectNextLaunch { port: Some(443) },
@@ -546,7 +576,7 @@ fn a_result_too_long_for_the_screen_says_where_the_rest_is() {
         },
         tiny,
     )
-    .expect("the minimum question fits 40 x 14");
+    .expect("the minimum question fits the minimum terminal");
     let long = format!(
         "the project allowance record was not written: {} END-OF-ERROR",
         "a very long diagnostic sentence ".repeat(40)
@@ -568,16 +598,16 @@ fn a_result_too_long_for_the_screen_says_where_the_rest_is() {
     );
     assert_eq!(
         printed_lines(&frame).len(),
-        14,
+        usize::from(MIN_ROWS),
         "the result fills the screen and does not scroll it"
     );
 }
 
 #[test]
-fn the_status_texts_are_the_documented_ones() {
-    assert_eq!(Status::StopTyping.text(), "stop typing to answer...");
-    assert_eq!(Status::Ready.text(), "ready for your answer");
-    assert_eq!(Status::Allowing.text(), "allowing...");
+fn there_is_no_ready_state_and_only_a_grant_has_a_status() {
+    // Answering is a line: the question is always ready, and Enter is what submits it.
+    assert_eq!(Status::Asking.text(), None);
+    assert_eq!(Status::Allowing.text(), Some("allowing..."));
     #[allow(clippy::assertions_on_constants)]
     {
         assert!(
@@ -587,12 +617,59 @@ fn the_status_texts_are_the_documented_ones() {
     }
 }
 
+/// The whole question, exactly as it is drawn: the operator's own rendering, row for
+/// row, with the counts above the input and the failure note below the keys.
+#[test]
+fn the_question_is_the_documented_prompt() {
+    let view = View {
+        destination: Cell::from_table("dns blocked.example (DNS query, guest-supplied)".to_owned()),
+        typed: String::new(),
+        count: 4,
+        session: "3f9a12c4".to_owned(),
+        offer: OfferText::SessionOrProject,
+        waiting: 0,
+        overflow: 0,
+    };
+    let laid = layout(&view, Size { rows: 30, cols: 80 }).expect("it fits");
+    assert_eq!(
+        laid.rows,
+        vec![
+            "agent-vm: the sandbox refused a network request from the guest",
+            "",
+            "  dns blocked.example (DNS query, guest-supplied)",
+            "  Refused 4 time(s), session 3f9a12c4.",
+            "",
+            "How should this request be treated?",
+            "Type one of the below letters and press enter:",
+            "_",
+            "",
+            "  s session  allow for this session",
+            "  p project  allow for this project, now and at every launch",
+            "  d deny     keep refusing (also Enter or Esc)",
+            "  n never    keep refusing, and stop asking about it in this session",
+            "",
+            "The request has already failed; retry it after allowing.",
+            "refuses in 60 s if unanswered",
+        ]
+    );
+    // The line typed so far is echoed in front of the cursor's `_`.
+    let typed = layout(
+        &View {
+            typed: "se".to_owned(),
+            ..view.clone()
+        },
+        Size { rows: 30, cols: 80 },
+    )
+    .expect("it fits");
+    assert_eq!(typed.rows[typed.input_row()], "se_");
+    assert_eq!(typed.cursor_col(), 3);
+}
+
 #[test]
 fn the_enter_frame_contains_the_question_it_was_given() {
     let laid = layout(
         &View {
             destination: Cell::from_guest("dns blocked.example (DNS query, guest-supplied)"),
-            guest_named: true,
             count: 4,
             ..view()
         },
@@ -603,14 +680,14 @@ fn the_enter_frame_contains_the_question_it_was_given() {
     let text = printed_lines(&frame).join("\n");
     assert!(text.contains("the sandbox refused a network request"));
     assert!(text.contains("dns blocked.example (DNS query, guest-supplied)"));
-    assert!(text.contains("supplied by the guest and is not verified"));
-    assert!(text.contains("already failed"));
     assert!(text.contains("Refused 4 time(s), session 3f9a12c4."));
-    assert!(text.contains("s  allow for this session"));
-    assert!(text.contains("p  allow for this project"));
-    assert!(text.contains("d  keep refusing"));
-    assert!(text.contains("n  keep refusing"));
-    assert!(text.contains("stop typing to answer..."));
+    assert!(text.contains("How should this request be treated?"));
+    assert!(text.contains("Type one of the below letters and press enter:"));
+    assert!(text.contains("s session  allow for this session"));
+    assert!(text.contains("p project  allow for this project"));
+    assert!(text.contains("d deny     keep refusing (also Enter or Esc)"));
+    assert!(text.contains("n never    keep refusing"));
+    assert!(text.contains("already failed"));
     assert!(text.contains("refuses in 60 s if unanswered"));
 }
 
@@ -652,4 +729,52 @@ fn wrap_always_consumes_a_byte_and_a_tiny_terminal_cannot_hang_it() {
         printed_lines(&frame).len() <= 2,
         "nothing can be drawn at 2 x 2, and nothing may loop"
     );
+}
+
+// --------------------------------------------- one source of truth for the keys ---
+
+#[test]
+fn every_offered_key_spells_an_answer_the_answer_table_takes() {
+    // Three places name the answers: the proved table, its literals, and the words
+    // the question draws. This holds the drawn keys to the table, both spellings, so a
+    // row cannot offer a word the answer does not take.
+    for key in ALL_KEYS {
+        let by_letter = [key.letter as u8];
+        let by_word = key.word.as_bytes();
+        let expected = match key.letter {
+            's' => super::super::guard::Answer::Session,
+            'p' => super::super::guard::Answer::Project,
+            'd' => super::super::guard::Answer::Refuse,
+            'n' => super::super::guard::Answer::StopAsking,
+            other => panic!("an offered key that answers nothing: {other:?}"),
+        };
+        for spelling in [by_letter.as_slice(), by_word] {
+            assert_eq!(
+                super::super::guard::answer_of(spelling, true),
+                Some(expected),
+                "{:?} must answer {:?}",
+                String::from_utf8_lossy(spelling),
+                expected
+            );
+        }
+    }
+}
+
+#[test]
+fn the_word_column_is_the_widest_offered_word() {
+    // The column is a constant, so it is held to the words it must fit: a longer word
+    // would push its own description out of line.
+    let widest = ALL_KEYS.iter().map(|key| key.word.len()).max().unwrap();
+    assert_eq!(WORD_COLUMN, widest, "the column is the widest word");
+}
+
+#[test]
+fn the_timeout_note_names_the_question_s_timeout() {
+    // The note is drawn from a constant; the relay times the question out from
+    // another. A change to one alone would make the question lie about itself.
+    let expected = format!(
+        "refuses in {} s if unanswered",
+        super::super::relay::PROMPT_TIMEOUT.as_secs()
+    );
+    assert_eq!(TIMEOUT_NOTE, expected);
 }

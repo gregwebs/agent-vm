@@ -251,7 +251,7 @@ pub fn split_target(t: &[u8], whole_address: bool) -> (r: Result<TargetLayout, L
 
 
 #[allow(clippy::manual_range_contains)]
-fn lower_byte(b: u8) -> (r: u8)
+pub(crate) fn lower_byte(b: u8) -> (r: u8)
     ensures r == lower(b),
 {
     if 0x41 <= b && b <= 0x5a { b + 0x20 } else { b }

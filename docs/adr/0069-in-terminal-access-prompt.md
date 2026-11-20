@@ -232,3 +232,133 @@ stream at a `last_safe_cut` boundary.
 - The measurement itself: `script/test/e2e.sh`'s
   `custom-image-direct-terminal-prompt` row, whose per-case receipts carry
   `appeared_seconds`, `refused_seconds` and `after_refusal_seconds`.
+
+## Amendment: Enter submits the answer line (#501 slice 3 follow-up)
+
+**Status.** Accepted and implemented in **0.7.75**. Supersedes *Visibility and the
+typing guard* above; amends the frames and the minimum size. The grant path, the
+hold, the writer, the leave and the reach are unchanged.
+
+### Why
+
+A keystroke was the answer, so the guard had to decide whether a given `read(2)`
+was a human's decision or an accident: a 0.7 s quiet window, a single-byte rule, a
+paste check, a sequence-tail check, and a `stop typing…`/`ready for your answer`
+status pair to tell the operator which state the guard was in. Every one of those
+rules exists to make a *single byte* safe. Requiring **Enter** removes the class
+instead: nothing but Enter submits, so a stray key, a terminal's reply, or a split
+escape sequence cannot allow anything, and the quiet-window machinery is gone.
+
+### The answer line
+
+The input row shows what has been typed and a `_` for the cursor. Letters are
+echoed (folded to lower case), Backspace erases, and Enter submits:
+
+| line | answer |
+|---|---|
+| `s` or `session` | allow for this session |
+| `p` or `project` | allow for this project |
+| `d` or `deny`, or an empty line | keep refusing |
+| `n` or `never` | keep refusing, and stop asking about this destination |
+| anything else | nothing: the question stays up, the line is kept |
+
+Esc and Ctrl-C keep refusing at once. `s`/`session` are not answers when the
+session grant is not on offer (the #491 next-launch offer). The line holds at most
+8 characters, so the input row cannot grow past the narrowest terminal.
+
+### The line's own guard (`guard::line_step`)
+
+Only a single-byte read that started after the prompt's input flush and is neither
+inside a bracketed paste nor the tail of an escape sequence may type, erase, submit
+or deny; **anything else clears the line** and does nothing else. A paste must never
+answer, and the prompt turns bracketed paste off (#494), so the read boundary is the
+only evidence a paste leaves: a pasted line arrives as one multi-byte read. A byte
+that is not a letter also clears, so a line can never hold anything an answer is
+spelled around (`s` then `1` does not submit `s`). The cost, stated: typing fast
+enough that two letters arrive in one read costs a retype, not a decision.
+
+**The settle window.** For `SETTLE_MS` (500 ms) after the question becomes readable
+its input is ignored entirely — not typed, not submitted, not denying. The operator
+may have been typing at the guest when the question appeared, and the tail of that
+typing (`git add -p⏎`, say) must not arrive as a line and an Enter: without the
+window, `p` + Enter would record a permanent project allowance. Reading the question
+always takes longer than 500 ms, so a deliberate answer never notices.
+
+### The frames
+
+The question now reads, with the counts above the input row and the failure note
+below the keys:
+
+```text
+agent-vm: the sandbox refused a network request from the guest
+
+  dns www.google.com (DNS query, guest-supplied)
+  Refused 2 time(s), session 6580c298.
+
+How should this request be treated?
+Type one of the below letters and press enter:
+s_
+
+  s session  allow for this session
+  p project  allow for this project, now and at every launch
+  d deny     keep refusing (also Enter or Esc)
+  n never    keep refusing, and stop asking about it in this session
+
+The request has already failed; retry it after allowing.
+refuses in 60 s if unanswered
+```
+
+The visibility position is the input row, at the column just past the typed line
+(1 for a fresh question), so the cursor-position reply is read off the frame rather
+than assumed. The waiting counts and `allowing...` share the row under the input
+row, which is always drawn, so a status change can no longer add a row. The
+provenance line ("The name was supplied by the guest…" / "The guest chose this
+address.") is dropped: the destination cell already says `guest-supplied`, and
+`agent-vm access` is the place for the rest. The status texts `stop typing to
+answer...` and `ready for your answer` no longer exist.
+
+The question is shorter than revision 1 of this amendment first made it: the status
+row doubles as the blank line under the input row, and there is no blank row above
+the header, so the drawn rows are the operator's exactly. The tallest form is the
+project-only offer at 40 columns, which wraps its one key over three rows:
+`MIN_COLS` stays 40 and `MIN_ROWS` becomes **19**. A terminal below that still keeps
+the hint and `agent-vm access`.
+
+### The hint the question replaces
+
+ADR-0064's once-per-session line is fired when the first refusal is logged and
+routed to the relay, which writes it when the terminal is free — so on an answered
+question it used to arrive *after* the answer:
+
+```text
+allowed www.google.com for session c9837650 (policy revision 2)
+Undo: agent-vm access revoke www.google.com --session-only
+==> The sandbox refused a guest network request; run `agent-vm access` to see refusals (shown once per session)
+```
+
+A notice about a request just allowed. The question says the same thing, better, so
+**answering** it claims the hint (`HintRelay::claim`): the route is marked delivered,
+nothing is queued at the leave, the facade's wait parks, and the epilogue does not
+print what it would otherwise owe. Claiming is unconditional and order-independent,
+so a hint fired *after* the answer stays quiet too — the refusal-feed watcher and
+the hint route race, and one notice is all either order may produce.
+
+Answering, not visibility. A question drawn and withdrawn within milliseconds (a
+one-shot guest that exits straight after its refusal) was never readable, and the
+hint is then the only notice the operator ever gets; claiming at visibility once
+left them with neither. Alongside that, the relay queues the hint only when no
+question is in flight: a hint written while a takeover is being prepared lands on
+the main screen, which the leave restores, so it would read as a second notice under
+the answer.
+
+### Consequences
+
+- **Safer.** No single byte can answer; a paste cannot answer; an unrecognised line
+  does nothing.
+- **One notice.** An answered question is not followed by the once-per-session hint
+  line.
+- **One more keystroke per answer**, and a fast typist whose letters coalesce into
+  one read must retype the line.
+- `answer_of`'s contract is now over the submitted line rather than one byte, and
+  `guard::line_step` is the per-read half; both are proved (`verus`), replacing the
+  old single `answer_of` kernel in ADR-0018.
