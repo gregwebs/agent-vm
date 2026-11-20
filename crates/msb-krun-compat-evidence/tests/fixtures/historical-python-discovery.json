@@ -1,0 +1,58 @@
+{
+  "baseline": "tests/fixtures/historical-python-baseline.json",
+  "cmdline_bytes": 123,
+  "fdt": [
+    {
+      "interrupts_hex": "base-irq",
+      "path": "/base",
+      "reg_hex": "base-reg"
+    },
+    {
+      "interrupts_hex": "irq\ud83d\ude00",
+      "path": "/m000",
+      "reg_hex": "r\u00e9g"
+    }
+  ],
+  "fdt_delta": 1,
+  "mounts": [
+    {
+      "filesystem": "ext4",
+      "mountpoint": "/extra name",
+      "raw": "36 25 0:30 / /extra\\040name rw - ext4 ignored rw",
+      "source": "ignored"
+    },
+    {
+      "filesystem": "virtiofs",
+      "mountpoint": "/m000",
+      "raw": "36 25 0:30 / /m000 rw - virtiofs stale rw",
+      "source": "stale"
+    },
+    {
+      "filesystem": "virtiofs",
+      "mountpoint": "/m000",
+      "raw": "36 25 0:30 / /m000 rw - virtiofs final rw",
+      "source": "final"
+    }
+  ],
+  "selected_mounts": {
+    "/m000": {
+      "filesystem": "virtiofs",
+      "mountpoint": "/m000",
+      "raw": "36 25 0:30 / /m000 rw - virtiofs final rw",
+      "source": "final"
+    }
+  },
+  "virtio": [
+    {
+      "device": "virtio-base",
+      "driver": "virtiofs",
+      "modalias": "base"
+    },
+    {
+      "device": "virtio-new",
+      "driver": "virtiofs",
+      "modalias": "modalias"
+    }
+  ],
+  "virtio_fs_delta": 1
+}
