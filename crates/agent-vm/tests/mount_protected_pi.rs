@@ -11,10 +11,9 @@
 //! or a *pre-create build*, so no VM ever boots.
 
 use std::{
-    io::Read,
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
-    time::{Duration, Instant},
+    process::{Command, Output},
+    time::Duration,
 };
 
 mod support;
@@ -48,43 +47,7 @@ fn agent_vm_bin() -> PathBuf {
 #[path = "support/fake_msb.rs"]
 mod fake_msb;
 
-/// Run `child` to completion, killing it if it doesn't exit within `timeout`.
-/// Reads stdout/stderr on separate threads so a full pipe can't deadlock.
-fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Output {
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn().expect("failed to spawn agent-vm");
-    let mut stdout_pipe = child.stdout.take().unwrap();
-    let mut stderr_pipe = child.stderr.take().unwrap();
-    let stdout_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout_pipe.read_to_end(&mut buf);
-        buf
-    });
-    let stderr_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut buf);
-        buf
-    });
-
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("try_wait failed") {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("agent-vm did not exit within {timeout:?} (possible hang)");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-
-    Output {
-        status,
-        stdout: stdout_handle.join().unwrap(),
-        stderr: stderr_handle.join().unwrap(),
-    }
-}
+use support::run_with_timeout;
 
 /// One isolated `$HOME` + `AGENT_VM_STATE_DIR` + project dir (cwd) + fake
 /// `MSB_PATH`.

@@ -15,10 +15,9 @@
 
 use std::ffi::OsString;
 use std::fs;
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use microsandbox_image::{GlobalCache, Reference};
 
@@ -34,6 +33,7 @@ mod support;
 
 use acquisition_gate::{AcquisitionGate, AcquisitionStage, GateReply, Peer};
 use image_archive::{ArchiveSpec, LayerContent, Written};
+use support::run_with_timeout;
 
 fn agent_vm_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_agent-vm"))
@@ -215,50 +215,6 @@ impl Harness {
 
     fn pins_file(&self) -> PathBuf {
         self.home.join(".config/agent-vm/image-pins.json")
-    }
-}
-
-/// Run `cmd` to completion, killing it if it exceeds `timeout`, draining both
-/// pipes on their own threads so a full one cannot deadlock the wait.
-fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Output {
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn().expect("spawn agent-vm");
-    let mut stdout_pipe = child.stdout.take().unwrap();
-    let mut stderr_pipe = child.stderr.take().unwrap();
-    let stdout = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout_pipe.read_to_end(&mut buf);
-        buf
-    });
-    let stderr = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut buf);
-        buf
-    });
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait().expect("wait for agent-vm") {
-            Some(status) => {
-                let out = stdout.join().expect("stdout thread");
-                let err = stderr.join().expect("stderr thread");
-                return Output {
-                    status,
-                    stdout: out,
-                    stderr: err,
-                };
-            }
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let out = stdout.join().expect("stdout thread");
-                let err = stderr.join().expect("stderr thread");
-                panic!(
-                    "agent-vm exceeded {timeout:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
-                    String::from_utf8_lossy(&out),
-                    String::from_utf8_lossy(&err)
-                );
-            }
-            None => std::thread::sleep(Duration::from_millis(20)),
-        }
     }
 }
 
