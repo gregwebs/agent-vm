@@ -48,6 +48,14 @@ mkdir -p "$E/home" "$E/state" "$E/msb" "$E/evidence" "$BUILD" "$PAIR"
 export CARGO_TARGET_DIR="$BUILD/agent"
 printf '%s\n' "ROOT=$ROOT E=$E BUILD=$BUILD SRC=$SRC PAIR=$PAIR MODE=$MODE" \
   | tee "$E/evidence/paths.txt"
+# ADR-0072: the selection, manifest, snapshot and identity steps are harness
+# subcommands. Built once by the caller; see crates/harness/README.md.
+HARNESS="${HARNESS_BIN_DIR:-$ROOT/target/debug}/harness"
+[[ -x "$HARNESS" ]] || {
+  printf 'INCONCLUSIVE: missing harness binary %s (run: cargo build --locked -p agent-vm-harness --bins)\n' \
+    "$HARNESS" | tee "$E/evidence/status.txt" >&2
+  exit 3
+}
 # Retain outputs, including on failure; nothing under E/BUILD/SRC is auto-deleted.
 exec > >(tee -a "$E/evidence/commands.log") 2>&1
 export PS4='+ ${BASH_SOURCE##*/}:${LINENO}: '
@@ -89,32 +97,7 @@ verify_pin_and_cleanliness() {
 }
 
 snapshot_committed_inputs() {
-  python3 - "$V" "$SRC" >"$E/evidence/build-inputs.jsonl" <<'SNAPSHOT'
-import json, pathlib, subprocess, sys
-
-def git(src, *args):
-    return subprocess.check_output(['git', '-C', str(src), *args])
-
-def snapshot(src, dst, pin):
-    assert git(src, 'rev-parse', 'HEAD').decode().strip() == pin
-    subprocess.run(['git', 'clone', '--no-hardlinks', '--no-checkout',
-                    str(src), str(dst)], check=True)
-    subprocess.run(['git', '-C', str(dst), 'checkout', '--detach', pin], check=True,
-                   stdout=sys.stderr)
-    print(json.dumps({'source': str(src), 'build_source': str(dst), 'commit': pin,
-                      'tree': git(src, 'rev-parse', pin + '^{tree}').decode().strip()}))
-    for entry in git(src, 'ls-tree', '-rz', pin).split(b'\0'):
-        if not entry:
-            continue
-        meta, name = entry.split(b'\t', 1)
-        mode, kind, sha = meta.split()
-        if mode == b'160000':
-            rel = pathlib.Path(name.decode())
-            snapshot(src / rel, dst / rel, sha.decode())
-
-source, target = map(lambda v: pathlib.Path(v).resolve(), sys.argv[1:])
-snapshot(source, target, git(source, 'rev-parse', 'HEAD').decode().strip())
-SNAPSHOT
+  "$HARNESS" cpu-commitment snapshot "$V" "$SRC" >"$E/evidence/build-inputs.jsonl"
   # Generated kernels/bundles and host libraries are never tracked inputs; their absence from
   # the snapshot ledger is asserted rather than assumed.
   if grep -Eq 'kernel\.c|linux-[^"]|libkrunfw[^"]*\.(dylib|so)' "$E/evidence/build-inputs.jsonl"; then
@@ -134,13 +117,8 @@ build_runtime_pair() {
     "$SRC/vendor/libkrunfw/Makefile" >"$E/evidence/firmware-recipe-sha256.txt"
   (cd "$SRC" && JUST_UNSTABLE=1 just build-deps)
   docker image inspect fedora:latest >"$E/evidence/container-after.json"
-  python3 - "$E/evidence/container-before.json" "$E/evidence/container-after.json" <<'IMAGE'
-import json, pathlib, sys
-a, b = [json.loads(pathlib.Path(p).read_text())[0] for p in sys.argv[1:]]
-assert a['Id'] == b['Id'] and a['RepoDigests'] == b['RepoDigests']
-assert a['RepoDigests'], 'INCONCLUSIVE: container provenance unavailable'
-print('container identity: ok')
-IMAGE
+  "$HARNESS" cpu-commitment container-identity \
+    "$E/evidence/container-before.json" "$E/evidence/container-after.json"
   (cd "$SRC" && CARGO_TARGET_DIR="$BUILD/vendor" cargo build --locked --release \
     --no-default-features --features embed-binaries,net,ssh,keyring -p microsandbox-cli)
   cp "$BUILD/vendor/release/msb" "$PAIR/msb"
@@ -156,8 +134,7 @@ IMAGE
 build_test_binary() {
   cargo test --locked -p agent-vm --bin agent-vm --no-run --message-format=json \
     >"$E/evidence/cargo.jsonl"
-  TEST_BIN="$(python3 "$ROOT/script/test/cpu-commitment-select.py" \
-    "$E/evidence/cargo.jsonl" "$CARGO_TARGET_DIR")"
+  TEST_BIN="$("$HARNESS" cpu-commitment select "$E/evidence/cargo.jsonl" "$CARGO_TARGET_DIR")"
   test -x "$TEST_BIN"
   "$TEST_BIN" --list >"$E/evidence/tests.txt"
   grep -Fx 'resources::tests::native_cpu_commitment_evidence: test' "$E/evidence/tests.txt"
@@ -179,17 +156,16 @@ prepare_fresh_runtime_home() {
     printf 'image_acquisition=cache-symlink cache=%s\n' "$cache" \
       >"$E/evidence/cache-source.txt"
   fi
-  python3 "$ROOT/script/test/cpu-commitment-manifest.py" verify \
-    "$E/evidence" "$PAIR/msb" "$FW"
+  "$HARNESS" cpu-commitment manifest verify "$E/evidence" "$PAIR/msb" "$FW"
 }
 
 run_protocol() {
   verify_pin_and_cleanliness
   snapshot_committed_inputs
   build_runtime_pair
-  python3 "$ROOT/script/test/cpu-commitment-manifest.py" write "$E/evidence" \
+  "$HARNESS" cpu-commitment manifest write "$E/evidence" \
     "$PAIR/msb" "$FW" "$(cat "$E/evidence/agent-sha.txt")" "$(cat "$E/evidence/vendor-sha.txt")"
-  python3 "$ROOT/script/test/cpu-commitment-manifest.py" verify "$E/evidence" "$PAIR/msb" "$FW"
+  "$HARNESS" cpu-commitment manifest verify "$E/evidence" "$PAIR/msb" "$FW"
   build_test_binary
   prepare_fresh_runtime_home
   env -i HOME="$E/home" PATH="/opt/homebrew/bin:/usr/bin:/bin" \

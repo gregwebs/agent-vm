@@ -11,6 +11,7 @@ mod runtime_provenance;
 mod build_archive_oracle;
 mod build_provenance;
 mod config_dir_guard;
+mod cpu_commitment;
 mod image_pins;
 mod launch_argv_order;
 mod msb_krun_compat;
@@ -34,6 +35,8 @@ enum Command {
     BuildProvenance(build_provenance::BuildProvenanceArgs),
     /// Run configuration-directory guard controls and filesystem queries.
     ConfigDirGuard(config_dir_guard::ConfigDirGuardArgs),
+    /// Drive Phase 0 CPU-commitment selection and runtime-provenance manifests.
+    CpuCommitment(cpu_commitment::CpuCommitmentArgs),
     /// Check the image-pins live-seed helper dispatch.
     ImagePins(image_pins::ImagePinsArgs),
     /// Check that launch options precede tool verbs.
@@ -54,6 +57,7 @@ impl Cli {
             Command::MsbKrunCompat(_) => "msb-krun compat",
             Command::BuildProvenance(_) => "build provenance",
             Command::ImagePins(_) => "image pins",
+            Command::CpuCommitment(_) => "cpu commitment",
             Command::BuildArchiveOracle(_) => "build archive oracle",
         }
     }
@@ -65,10 +69,18 @@ pub fn run(cli: Cli) -> Result<String, String> {
         Command::BuildArchiveOracle(args) => build_archive_oracle::run(args),
         Command::BuildProvenance(args) => build_provenance::run(args),
         Command::ConfigDirGuard(args) => config_dir_guard::run(args),
+        Command::CpuCommitment(args) => cpu_commitment::run(args),
         Command::ImagePins(args) => image_pins::run(args),
         Command::LaunchArgvOrder(args) => launch_argv_order::run(args),
         Command::MsbKrunCompat(args) => msb_krun_compat::run(args),
     }
+}
+
+/// The exit status a failed command asks for, when it asks for one of its own.
+/// A port whose callers distinguish an inconclusive verdict from a refusal keeps
+/// the two apart here; everything else exits 1 in `main`.
+pub fn failure_status(error: &str) -> Option<i32> {
+    cpu_commitment::failure_status(error)
 }
 
 #[cfg(test)]

@@ -17,8 +17,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 SCRIPT="script/test/cpu-commitment-native.sh"
-SELECT="script/test/cpu-commitment-select.py"
-MANIFEST="script/test/cpu-commitment-manifest.py"
+# The selector and the manifest driver are harness subcommands (ADR-0072). Build
+# them once with `cargo build --locked -p agent-vm-harness --bins`; CI exports
+# HARNESS_BIN_DIR after doing so for every shell caller.
+HARNESS="${HARNESS_BIN_DIR:-$ROOT/target/debug}/harness"
+[[ -x "$HARNESS" ]] || {
+  echo "contract: FAIL: missing harness binary: $HARNESS (run: cargo build --locked -p agent-vm-harness --bins)" >&2
+  exit 1
+}
 WORK="$(mktemp -d /tmp/c647-contract.XXXXXX)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -58,18 +64,7 @@ grep -Fq 'set -euo pipefail' "$SCRIPT" || fail "the wrapper must be fail-fast"
 mkdir -p "$WORK/isolated/deps"
 artifact() {
   # $1 reason, $2 target name, $3 kind, $4 test profile, $5 executable, $6 success
-  python3 - "$@" <<'PY'
-import json, sys
-reason, name, kind, test_profile, executable, success = sys.argv[1:7]
-row = {"reason": reason}
-if reason == "compiler-artifact":
-    row["target"] = {"name": name, "kind": [kind]}
-    row["profile"] = {"test": test_profile == "true"}
-    row["executable"] = executable
-else:
-    row["success"] = success == "true"
-print(json.dumps(row))
-PY
+  "$HARNESS" cpu-commitment cargo-row "$@"
 }
 write_artifact() {
   local path="$1"
@@ -82,12 +77,12 @@ write_artifact "$WORK/isolated/deps/agent_vm-aaaa"
   artifact build-finished agent-vm bin false "" true
   artifact compiler-artifact agent-vm bin true "$WORK/isolated/deps/agent_vm-aaaa" ""
 } >"$WORK/good.jsonl"
-expect_status 0 python3 "$SELECT" "$WORK/good.jsonl" "$WORK/isolated"
+expect_status 0 "$HARNESS" cpu-commitment select "$WORK/good.jsonl" "$WORK/isolated"
 
 {
   artifact build-finished agent-vm bin false "" true
 } >"$WORK/zero.jsonl"
-expect_status 1 python3 "$SELECT" "$WORK/zero.jsonl" "$WORK/isolated"
+expect_status 1 "$HARNESS" cpu-commitment select "$WORK/zero.jsonl" "$WORK/isolated"
 
 write_artifact "$WORK/isolated/deps/agent_vm-bbbb"
 {
@@ -95,65 +90,62 @@ write_artifact "$WORK/isolated/deps/agent_vm-bbbb"
   artifact compiler-artifact agent-vm bin true "$WORK/isolated/deps/agent_vm-aaaa" ""
   artifact compiler-artifact agent-vm bin true "$WORK/isolated/deps/agent_vm-bbbb" ""
 } >"$WORK/two.jsonl"
-expect_status 1 python3 "$SELECT" "$WORK/two.jsonl" "$WORK/isolated"
+expect_status 1 "$HARNESS" cpu-commitment select "$WORK/two.jsonl" "$WORK/isolated"
 
 write_artifact "$WORK/outside-agent_vm"
 {
   artifact build-finished agent-vm bin false "" true
   artifact compiler-artifact agent-vm bin true "$WORK/outside-agent_vm" ""
 } >"$WORK/outside.jsonl"
-expect_status 1 python3 "$SELECT" "$WORK/outside.jsonl" "$WORK/isolated"
+expect_status 1 "$HARNESS" cpu-commitment select "$WORK/outside.jsonl" "$WORK/isolated"
 # A stale executable planted in another target directory is never selected by name search.
 mkdir -p "$WORK/other-target/deps"
 write_artifact "$WORK/other-target/deps/agent_vm-stale"
-expect_status 1 python3 "$SELECT" "$WORK/outside.jsonl" "$WORK/isolated"
+expect_status 1 "$HARNESS" cpu-commitment select "$WORK/outside.jsonl" "$WORK/isolated"
 
 {
   artifact build-finished agent-vm bin false "" true
   artifact compiler-artifact agent-vm bin true "$WORK/isolated/deps/does-not-exist" ""
 } >"$WORK/missing.jsonl"
-expect_status 1 python3 "$SELECT" "$WORK/missing.jsonl" "$WORK/isolated"
+expect_status 1 "$HARNESS" cpu-commitment select "$WORK/missing.jsonl" "$WORK/isolated"
 
 {
   artifact build-finished agent-vm bin false "" false
   artifact compiler-artifact agent-vm bin true "$WORK/isolated/deps/agent_vm-aaaa" ""
 } >"$WORK/failed-build.jsonl"
-expect_status 1 python3 "$SELECT" "$WORK/failed-build.jsonl" "$WORK/isolated"
+expect_status 1 "$HARNESS" cpu-commitment select "$WORK/failed-build.jsonl" "$WORK/isolated"
 
 {
   artifact build-finished agent-vm bin false "" true
   artifact compiler-artifact agent-vm lib false "" ""
 } >"$WORK/lib-only.jsonl"
-expect_status 1 python3 "$SELECT" "$WORK/lib-only.jsonl" "$WORK/isolated"
+expect_status 1 "$HARNESS" cpu-commitment select "$WORK/lib-only.jsonl" "$WORK/isolated"
 
-expect_status 2 python3 "$SELECT" "$WORK/good.jsonl"
+expect_status 2 "$HARNESS" cpu-commitment select "$WORK/good.jsonl"
 
 # 3. Manifest: write/verify, then every missing or mismatched provenance refuses.
 mkdir -p "$WORK/evidence"
 printf 'msb' >"$WORK/msb"
 printf 'firmware' >"$WORK/firmware"
-expect_status 0 python3 "$MANIFEST" write "$WORK/evidence" "$WORK/msb" "$WORK/firmware" \
+expect_status 0 "$HARNESS" cpu-commitment manifest write "$WORK/evidence" "$WORK/msb" "$WORK/firmware" \
   "$(printf 'a%.0s' {1..40})" "$(printf 'b%.0s' {1..40})"
-expect_status 0 python3 "$MANIFEST" verify "$WORK/evidence" "$WORK/msb" "$WORK/firmware"
+expect_status 0 "$HARNESS" cpu-commitment manifest verify "$WORK/evidence" "$WORK/msb" "$WORK/firmware"
 
 cp -r "$WORK/evidence" "$WORK/no-manifest"
 rm "$WORK/no-manifest/runtime-manifest.json"
-expect_status 3 python3 "$MANIFEST" verify "$WORK/no-manifest" "$WORK/msb" "$WORK/firmware"
+expect_status 3 "$HARNESS" cpu-commitment manifest verify "$WORK/no-manifest" "$WORK/msb" "$WORK/firmware"
 
 cp -r "$WORK/evidence" "$WORK/mismatch"
 printf 'firmware-changed' >>"$WORK/mismatch-firmware"
 printf 'firmware' >"$WORK/mismatch-firmware"
-expect_status 3 python3 "$MANIFEST" verify "$WORK/mismatch" "$WORK/msb" "$WORK/mismatch-firmware"
+expect_status 3 "$HARNESS" cpu-commitment manifest verify "$WORK/mismatch" "$WORK/msb" "$WORK/mismatch-firmware"
 
 cp -r "$WORK/evidence" "$WORK/hash-only"
-python3 - "$WORK/hash-only/runtime-manifest.json" <<'PY'
-import json, pathlib, sys
-path = pathlib.Path(sys.argv[1])
-manifest = json.loads(path.read_text())
-manifest["clean_firmware_rebuild"] = "PROVEN"
-path.write_text(json.dumps(manifest))
-PY
-expect_status 3 python3 "$MANIFEST" verify "$WORK/hash-only" "$WORK/msb" "$WORK/firmware"
+# Relabel the one field the verifier pins; the rest of the document is untouched.
+sed 's/"UNPROVEN"/"PROVEN"/' "$WORK/hash-only/runtime-manifest.json" \
+  >"$WORK/hash-only/manifest.tmp"
+mv "$WORK/hash-only/manifest.tmp" "$WORK/hash-only/runtime-manifest.json"
+expect_status 3 "$HARNESS" cpu-commitment manifest verify "$WORK/hash-only" "$WORK/msb" "$WORK/firmware"
 
 # 4. Wrapper fail-fast: a failing fake docker stops the protocol before any native invocation
 #    and leaves no PASS. Old executables under target/ are irrelevant to the selection.
