@@ -75,6 +75,3 @@ script/test/e2e.sh 15
 # terminal contract still needs python3 until #699 ports it; the detach shim it
 # runs is `harness detached-run` now.
 script/test/ci-contracts.sh 2
-
-# --- Migration debt: Rust tests that shell out to python -------------------
-crates/agent-vm/tests/config_doctor.rs 3
