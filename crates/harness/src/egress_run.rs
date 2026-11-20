@@ -441,7 +441,13 @@ fn sweep(work: &Path, request: &RunRequest, lan: &str, state: &mut RunState) -> 
         }
         let ident = format!("{}-{}-{}", case.case, case.variant, state.launches.len());
         if case.case.starts_with("HK") {
-            write_hook(work, &case.case[..3], lan, &format!("{ident}-hook"));
+            write_hook(
+                work,
+                &case.case[..3],
+                lan,
+                &format!("{ident}-hook"),
+                crate::egress_fixtures::TCP_RECEIPT_PORTS[0],
+            );
         }
         let answer = if state.answer.is_empty() {
             "ANSWER_FROM_H1"
@@ -1566,8 +1572,9 @@ pub fn prepare_project(work: &Path, project: &Path) -> Result<(), String> {
 }
 
 /// The HK cases' runtime hook: one probe through the fixture LAN, with the strict
-/// variant's own failure command.
-pub fn write_hook(work: &Path, name: &str, lan: &str, ident: &str) {
+/// variant's own failure command. `port` is the fixture port the hook dials, so a
+/// boot-free control can hand it an ephemeral listener instead of 18080.
+pub fn write_hook(work: &Path, name: &str, lan: &str, ident: &str, port: u16) {
     let project = work.join(name);
     let _ = prepare_project(work, &project);
     let failure = if name == "HK1" {
@@ -1580,7 +1587,7 @@ pub fn write_hook(work: &Path, name: &str, lan: &str, ident: &str) {
     // to quote here.
     let hook = format!(
         "EGRESS_PROBE_LIB=1 . ./egress-probe.sh\n\
-         if http_get {lan} 18080 {ident}; then\n    \
+         if http_get {lan} {port} {ident}; then\n    \
          return 0\n\
          else\n    \
          rc=$?\n    \
@@ -2403,14 +2410,14 @@ CASE LC1 END
         assert!(project.join(".agent-vm/config.toml").exists());
         // The hook is one probe through the LAN with the strict variant's own
         // failure command.
-        write_hook(&work, "HK2", "192.168.1.2", "HK2-ipv4-0-hook");
+        write_hook(&work, "HK2", "192.168.1.2", "HK2-ipv4-0-hook", 18080);
         let hook = fs::read_to_string(work.join("HK2/.agent-vm.runtime.sh")).expect("a hook");
         assert!(
             hook.contains("if http_get 192.168.1.2 18080 HK2-ipv4-0-hook; then"),
             "{hook}"
         );
         assert!(hook.contains("        return 7"), "{hook}");
-        write_hook(&work, "HK1", "192.168.1.2", "HK1-ipv4-0-hook");
+        write_hook(&work, "HK1", "192.168.1.2", "HK1-ipv4-0-hook", 18080);
         let recovered = fs::read_to_string(work.join("HK1/.agent-vm.runtime.sh")).expect("a hook");
         assert!(
             recovered.contains("echo \"HOOK_EGRESS_DENIED\"; return 0"),
