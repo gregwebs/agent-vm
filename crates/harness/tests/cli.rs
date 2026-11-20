@@ -105,6 +105,24 @@ fn the_binary_runs_msb_krun_compat_timeout_controls() {
 }
 
 #[test]
+fn the_binary_runs_build_provenance_controls() {
+    let output = Command::new(env!("CARGO_BIN_EXE_harness"))
+        .args(["build-provenance", "--self-test"])
+        .output()
+        .expect("the harness binary runs build-provenance controls");
+    assert!(
+        output.status.success(),
+        "build-provenance controls failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8(output.stdout)
+            .expect("control output is UTF-8")
+            .ends_with("build-provenance controls passed\n")
+    );
+}
+
+#[test]
 fn the_binary_runs_config_dir_guard_controls() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let output = Command::new(env!("CARGO_BIN_EXE_harness"))

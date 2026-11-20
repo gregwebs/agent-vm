@@ -8,6 +8,7 @@
 use clap::{Parser, Subcommand};
 
 mod runtime_provenance;
+mod build_provenance;
 mod config_dir_guard;
 mod launch_argv_order;
 mod msb_krun_compat;
@@ -25,6 +26,8 @@ pub struct Cli {
 enum Command {
     /// Validate the two Cargo roots and the pinned firmware source.
     RuntimeProvenance(runtime_provenance::RuntimeProvenanceArgs),
+    /// Check a binary's build provenance against independently captured source evidence.
+    BuildProvenance(build_provenance::BuildProvenanceArgs),
     /// Run configuration-directory guard controls and filesystem queries.
     ConfigDirGuard(config_dir_guard::ConfigDirGuardArgs),
     /// Check that launch options precede tool verbs.
@@ -43,6 +46,7 @@ impl Cli {
             Command::ConfigDirGuard(_) => "config-dir guard",
             Command::LaunchArgvOrder(_) => "launch argv order",
             Command::MsbKrunCompat(_) => "msb-krun compat",
+            Command::BuildProvenance(_) => "build provenance",
         }
     }
 }
@@ -50,6 +54,7 @@ impl Cli {
 pub fn run(cli: Cli) -> Result<String, String> {
     match cli.command {
         Command::RuntimeProvenance(args) => runtime_provenance::run(args),
+        Command::BuildProvenance(args) => build_provenance::run(args),
         Command::ConfigDirGuard(args) => config_dir_guard::run(args),
         Command::LaunchArgvOrder(args) => launch_argv_order::run(args),
         Command::MsbKrunCompat(args) => msb_krun_compat::run(args),
