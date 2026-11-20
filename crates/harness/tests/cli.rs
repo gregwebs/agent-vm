@@ -105,6 +105,65 @@ fn the_binary_runs_msb_krun_compat_timeout_controls() {
 }
 
 #[test]
+fn the_binary_runs_build_archive_oracle_controls() {
+    let output = Command::new(env!("CARGO_BIN_EXE_harness"))
+        .args(["build-archive-oracle", "--self-test"])
+        .output()
+        .expect("the harness binary runs build-archive-oracle controls");
+    assert!(
+        output.status.success(),
+        "build-archive-oracle controls failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("control output is UTF-8"),
+        "build archive oracle controls passed\n"
+    );
+}
+
+#[test]
+fn the_binary_checks_image_pins_dispatch() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let output = Command::new(env!("CARGO_BIN_EXE_harness"))
+        .args([
+            "image-pins",
+            "--e2e",
+            repo_root
+                .join("script/test/e2e.sh")
+                .to_str()
+                .expect("workspace path is UTF-8"),
+        ])
+        .output()
+        .expect("the harness binary checks image-pins dispatch");
+    assert!(
+        output.status.success(),
+        "image-pins dispatch check failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("check output is UTF-8"),
+        "live-seed dispatch uses the ambient helper\n"
+    );
+}
+
+#[test]
+fn the_binary_runs_image_pins_controls() {
+    let output = Command::new(env!("CARGO_BIN_EXE_harness"))
+        .args(["image-pins", "--self-test"])
+        .output()
+        .expect("the harness binary runs image-pins controls");
+    assert!(
+        output.status.success(),
+        "image-pins controls failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("control output is UTF-8"),
+        "image pins controls passed\n"
+    );
+}
+
+#[test]
 fn the_binary_runs_build_provenance_controls() {
     let output = Command::new(env!("CARGO_BIN_EXE_harness"))
         .args(["build-provenance", "--self-test"])

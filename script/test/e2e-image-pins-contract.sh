@@ -14,6 +14,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 LIB="$REPO_ROOT/script/test/lib/e2e-image-pins.sh"
 E2E="$REPO_ROOT/script/test/e2e.sh"
+harness="${HARNESS_BIN_DIR:-$REPO_ROOT/target/debug}/harness"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/avpinscontract.XXXXXX")"
 cleanup() { rm -rf "$WORK"; }
@@ -105,52 +106,10 @@ $record"
 unset AGENT_VM_IMAGE_TAG || true
 
 # --- pins_live_seed_dispatch_uses_ambient_helper -------------------------------
-# The production live-seed call site uses the ambient helper.
-# Helpers alone do not certify wiring, so the real script's one live-seed
-# dispatch is checked between two uniquely anchored lines. Missing, duplicated or
-# reordered anchors fail closed; they are never skipped.
-python3 - "$E2E" <<'PY' || exit 1
-import re
-import sys
-
-path = sys.argv[1]
-lines = open(path, encoding="utf-8").read().splitlines()
-anchor = 'live_id="$(pins_project_id "$live")"'
-starts = [index for index, line in enumerate(lines) if line.strip() == anchor]
-if len(starts) != 1:
-    sys.exit(f"FAIL: expected exactly one live-seed anchor, found {len(starts)}")
-start = starts[0]
-window_end = start + 13
-end_anchor = 'if ! jq -e --arg p "$live_id" --arg r "$tag" --arg d "$digest_a" \\'
-ends = [
-    index
-    for index, line in enumerate(lines[start + 1 : window_end], start=start + 1)
-    if line.strip() == end_anchor
-]
-if len(ends) != 1:
-    sys.exit(f"FAIL: expected exactly one jq anchor within 12 lines, found {len(ends)}")
-end = ends[0]
-calls = [
-    (index, line.strip())
-    for index, line in enumerate(lines[start + 1 : end], start=start + 1)
-    if "image pull" in line
-]
-expected = 'pins_avm_ambient "$live" "$tag" image pull >"$WORK/pins-live-pin.out" 2>&1 || {'
-if len(calls) != 1:
-    sys.exit(f"FAIL: expected exactly one live-seed pull call, found {calls}")
-if calls[0][1] != expected:
-    sys.exit(
-        "FAIL: the live-seed dispatch must be the ambient helper form "
-        f"{expected!r}, found {calls[0][1]!r}"
-    )
-close = [
-    index
-    for index, line in enumerate(lines[calls[0][0] + 1 : end], start=calls[0][0] + 1)
-    if line.strip() == "}"
-]
-if not close:
-    sys.exit("FAIL: the live-seed failure block has no closing brace before the jq check")
-PY
+# The production live-seed call site uses the ambient helper. The harness parses
+# the bounded anchor window and has mutation controls for every refusal case.
+[[ -x "$harness" ]] || fail "missing harness binary: $harness (run: cargo build --locked -p agent-vm-harness --bins)"
+"$harness" image-pins --e2e "$E2E" >/dev/null || exit 1
 
 echo "control pins_default_clears_inherited_image_override passed"
 echo "control pins_ambient_override_reaches_the_actual_child passed"
