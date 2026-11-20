@@ -127,11 +127,71 @@ impl Output {
 /// the gate (two tickets in this stack wedged on unbounded waits), and a
 /// fault-injected `sleep 30` must not survive its case.
 pub fn run_bounded(script: &str, env: &[(&str, &str)], bound: Duration) -> Result<Output, String> {
-    // `bash` from `PATH`, as the Python's `shutil.which("bash")` did: the probe
-    // library needs `EPOCHREALTIME`, which macOS's `/bin/bash` 3.2 does not have.
-    let mut command = Command::new("bash");
+    let bash = probe_bash()?;
+    // The library re-executes its workers with `bash` from `PATH`, so the
+    // resolution has to survive the boundary or a case fails inside the worker
+    // as `${line,,}: bad substitution` while the driver is already bash 5.
+    let mut env = env.to_vec();
+    let bash_env = bash.display().to_string();
+    env.push(("EGRESS_PROBE_BASH", bash_env.as_str()));
+    let mut command = Command::new(bash);
     command.arg("-c").arg(script).envs(env.iter().copied());
     run_command_bounded(command, bound)
+}
+
+/// The bash the probe library needs: 5, for `EPOCHREALTIME` and `${x,,}`.
+///
+/// `PATH`'s `bash` is what the Python's `shutil.which("bash")` used, and on
+/// macOS that is `/bin/bash` 3.2, which has neither: a case then fails as a
+/// timeout or a `bad substitution` rather than as the missing requirement it is.
+/// The guest ships bash 5, so the controls resolve one instead of testing the
+/// absence -- `PATH` first, then the Homebrew prefixes -- and refuse with the
+/// requirement named when there is none. `EGRESS_PROBE_BASH` overrides.
+pub fn probe_bash() -> Result<PathBuf, String> {
+    static RESOLVED: std::sync::OnceLock<Result<PathBuf, String>> = std::sync::OnceLock::new();
+    RESOLVED
+        .get_or_init(|| {
+            let mut candidates: Vec<PathBuf> = Vec::new();
+            // An explicit pin is the whole answer: falling back from it would
+            // test a bash nobody asked for.
+            let explicit = std::env::var("EGRESS_PROBE_BASH")
+                .ok()
+                .filter(|value| !value.is_empty());
+            match &explicit {
+                Some(pinned) => candidates.push(PathBuf::from(pinned)),
+                None => {
+                    candidates.push(PathBuf::from("bash"));
+                    for prefix in ["/opt/homebrew/bin/bash", "/usr/local/bin/bash"] {
+                        candidates.push(PathBuf::from(prefix));
+                    }
+                }
+            }
+            for candidate in candidates {
+                let output = Command::new(&candidate)
+                    .args(["-c", "echo ${BASH_VERSINFO[0]}"])
+                    .stdin(Stdio::null())
+                    .output();
+                let Ok(output) = output else { continue };
+                let major = String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .parse::<u32>();
+                if output.status.success() && matches!(major, Ok(major) if major >= 5) {
+                    return Ok(candidate);
+                }
+            }
+            Err(match explicit {
+                Some(pinned) => format!(
+                    "probe controls need bash 5 (EPOCHREALTIME, ${{x,,}}); EGRESS_PROBE_BASH is \
+                     {pinned} and is older"
+                ),
+                None => {
+                    "probe controls need bash 5 (EPOCHREALTIME, ${x,,}) and found none on PATH \
+                         or in the Homebrew prefixes; set EGRESS_PROBE_BASH"
+                        .to_owned()
+                }
+            })
+        })
+        .clone()
 }
 
 pub(crate) fn run_command_bounded(mut command: Command, bound: Duration) -> Result<Output, String> {
@@ -1369,12 +1429,16 @@ fn hook_rows(work: &Path, event: &str, port: u16) -> Result<(), String> {
 }
 
 fn run_in(script: &str, directory: &Path, argument: &str) -> Result<Output, String> {
-    let mut command = Command::new("bash");
+    let bash = probe_bash()?;
+    let bash_env = bash.display().to_string();
+    let mut command = Command::new(bash);
     command
         .arg("-c")
         .arg(script)
         .arg("hook-launch")
         .arg(argument)
+        // The hook runs probe cases, whose workers follow the same resolution.
+        .env("EGRESS_PROBE_BASH", bash_env)
         .current_dir(directory);
     run_command_bounded(command, Duration::from_secs(15))
 }
@@ -1748,15 +1812,33 @@ pub struct EgressProbeArgs {
 mod tests {
     use super::*;
 
+    // These controls assert wall-clock bands while holding a socket open and
+    // sleeping in bash: an accepted run inside 2 s, a deadline inside
+    // (2.5s, 4.5s). Two at once on a busy host turn a correct bound into a
+    // fatal peer error ("early request EOF": the probe's deadline expired
+    // before it finished writing, because the machine was the problem). The
+    // Python suite ran its cases in sequence, so one at a time is what these
+    // rows were written against; without the lock the suite fails at four
+    // threads with either bash 3.2 or bash 5.
+    static WALL_CLOCK: Mutex<()> = Mutex::new(());
+
+    fn wall_clock() -> std::sync::MutexGuard<'static, ()> {
+        WALL_CLOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     // Every control is its own named check, as the Python suite's methods were.
     #[test]
     fn the_http_wire_is_framed_exactly() {
+        let _serial = wall_clock();
         http_fragmentation_exact_body_and_single_connection().expect("http fragmentation");
         http_public_keep_open_and_invalid_lines().expect("http_public");
     }
 
     #[test]
     fn the_udp_and_dns_wires_are_framed_exactly() {
+        let _serial = wall_clock();
         udp_one_socket_wrong_ack_no_ack_and_usage().expect("udp");
         dns_fragmented_keep_open_nx_ok_and_invalid_frames().expect("dns framing");
         dns_query_encoding_and_udp_short_datagram().expect("dns query encoding");
@@ -1764,6 +1846,7 @@ mod tests {
 
     #[test]
     fn every_probe_deadline_bounds_a_withheld_response() {
+        let _serial = wall_clock();
         total_deadlines_withheld_prefix_body_connect_and_write().expect("deadlines");
     }
 
@@ -1803,6 +1886,7 @@ mod tests {
 
     #[test]
     fn the_pa2_signals_and_bound_are_one_vocabulary() {
+        let _serial = wall_clock();
         pa2_vocabulary_is_shared_with_the_host_witness().expect("vocabulary");
         pa2_is_dispatched_and_probes_in_order().expect("dispatch");
         pa2_cannot_complete_without_its_signals().expect("bound");
