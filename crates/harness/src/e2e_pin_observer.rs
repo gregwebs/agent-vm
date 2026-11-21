@@ -148,8 +148,19 @@ fn serve(
             // timeout.
             loop {
                 match listener.accept() {
-                    Ok((connection, _)) => handle(observer, name, connection)?,
+                    // A connection that cannot be served is that client's
+                    // problem: the gate's contract is to answer the launcher,
+                    // and a row has many connections to make. Returning here
+                    // would let one vanished peer, one slow sender or one
+                    // closed read end silence both gates for the rest of the
+                    // run, and every later query would see an empty answer.
+                    Ok((connection, _)) => {
+                        if let Err(error) = handle(observer, name, connection) {
+                            eprintln!("e2e-pin-observer: {error}");
+                        }
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => break,
                     Err(error) => {
                         return Err(format!("cannot accept on the {name} gate: {error}"));
                     }
@@ -161,6 +172,16 @@ fn serve(
 }
 
 fn handle(observer: &Observer, gate: &str, mut connection: UnixStream) -> Result<(), String> {
+    // BSD hands the accepted socket the listener's `O_NONBLOCK` and Linux does
+    // not, so on macOS this is a non-blocking socket that must not be read as a
+    // blocking one: a stage that has not arrived yet would be `EAGAIN` rather
+    // than a wait, and a socket timeout is ignored on a non-blocking socket.
+    // Restoring blocking mode here is what lets `connect_timeout` bound the
+    // read, and it is the difference between a gate that answers a slow sender
+    // and one that dies on it.
+    connection
+        .set_nonblocking(false)
+        .map_err(|error| format!("cannot make the {gate} connection blocking: {error}"))?;
     connection
         .set_read_timeout(Some(observer.connect_timeout))
         .and_then(|()| connection.set_write_timeout(Some(observer.connect_timeout)))
@@ -239,13 +260,16 @@ fn self_test() -> Result<(), String> {
         // Long enough that the released case cannot be the deadline, short enough
         // that the deadline case is a second rather than a minute.
         hold_deadline: Duration::from_millis(1200),
-        connect_timeout: Duration::from_secs(10),
+        // A second bounds a silent client without being tight enough for a
+        // local write that is already buffered when the gate accepts it.
+        connect_timeout: Duration::from_millis(1000),
     };
     let gates = [("pin", listener(&pin)?), ("acquire", listener(&acquire)?)];
     let stop = Arc::new(AtomicBool::new(false));
     let running = Arc::clone(&stop);
     // Held as a plain duration too: the closure below owns the observer.
     let hold_deadline = observer.hold_deadline;
+    let connect_timeout = observer.connect_timeout;
     let server = thread::spawn(move || serve(&observer, &gates, &running));
     wait_for_sockets(&[pin.clone(), acquire.clone()])?;
 
@@ -266,7 +290,8 @@ fn self_test() -> Result<(), String> {
         let release = release.clone();
         move || {
             thread::sleep(Duration::from_millis(150));
-            fs::write(&release, b"go").map_err(|error| error.to_string())
+            fs::write(&release, b"go")
+                .map_err(|error| format!("cannot write {}: {error}", release.display()))
         }
     });
     let started = Instant::now();
@@ -307,10 +332,49 @@ fn self_test() -> Result<(), String> {
         return Err(format!("a non-held pin stage took {:?}", started.elapsed()));
     }
 
+    // A sender that pauses between its two writes is slow, not broken. BSD hands
+    // the accepted socket the listener's non-blocking flag, so the gate's first
+    // read lands before the rest of this line and has to wait for it: read as a
+    // non-blocking socket, that wait is `EAGAIN` and the stage is lost.
+    let mut slow = UnixStream::connect(&pin)
+        .map_err(|error| format!("cannot connect to {}: {error}", pin.display()))?;
+    slow.set_nonblocking(false)
+        .map_err(|error| format!("cannot make the slow client blocking: {error}"))?;
+    slow.write_all(b"pin-sl")
+        .map_err(|error| format!("cannot send the first half of the stage: {error}"))?;
+    thread::sleep(Duration::from_millis(200));
+    slow.write_all(b"ow\n")
+        .map_err(|error| format!("cannot send the second half of the stage: {error}"))?;
+    let mut slow_answer = String::new();
+    slow.read_to_string(&mut slow_answer)
+        .map_err(|error| format!("cannot read the slow sender's answer: {error}"))?;
+    if slow_answer.trim() != "continue" {
+        return Err(format!(
+            "a stage that arrived in two writes was answered {:?}",
+            slow_answer.trim()
+        ));
+    }
+
+    // A client that connects and sends nothing holds the gate until its read
+    // times out, which must cost that client its answer and nothing else: a row
+    // with one rude peer still has to be served.
+    let silent = UnixStream::connect(&acquire)
+        .map_err(|error| format!("cannot connect to {}: {error}", acquire.display()))?;
+    silent
+        .set_nonblocking(false)
+        .map_err(|error| format!("cannot make the silent client blocking: {error}"))?;
+    thread::sleep(connect_timeout + Duration::from_millis(400));
+    if ask(&pin, "pin-requested")? != "continue" {
+        return Err("the gate stopped answering after a client timed out".to_owned());
+    }
+    drop(silent);
+
     let text = fs::read_to_string(&log).map_err(describe)?;
     let expected = "acquire acquire-start\n\
                     pin pin-committed\n\
                     pin pin-committed\n\
+                    pin pin-requested\n\
+                    pin pin-slow\n\
                     pin pin-requested\n";
     if text != expected {
         return Err(format!("the gate log is {text:?}, want {expected:?}"));
@@ -341,7 +405,7 @@ fn ask(path: &Path, stage: &str) -> Result<String, String> {
         .map_err(|error| format!("cannot connect to {}: {error}", path.display()))?;
     connection
         .set_read_timeout(Some(Duration::from_secs(10)))
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("cannot bound {}: {error}", path.display()))?;
     connection
         .write_all(format!("{stage}\n").as_bytes())
         .map_err(|error| format!("cannot send {stage}: {error}"))?;
@@ -349,7 +413,16 @@ fn ask(path: &Path, stage: &str) -> Result<String, String> {
     connection
         .read_to_string(&mut answer)
         .map_err(|error| format!("cannot read the answer to {stage}: {error}"))?;
-    Ok(answer.trim().to_owned())
+    let answer = answer.trim().to_owned();
+    // A closed peer reads as an empty answer, which would otherwise look like a
+    // gate that answered something unexpected.
+    if answer.is_empty() {
+        return Err(format!(
+            "{} closed without answering {stage}",
+            path.display()
+        ));
+    }
+    Ok(answer)
 }
 
 fn describe(error: std::io::Error) -> String {
