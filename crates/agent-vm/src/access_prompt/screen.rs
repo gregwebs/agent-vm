@@ -25,8 +25,11 @@ use super::vt::{Charsets, Gl, RestorableModes, Screen};
 
 /// The narrowest terminal the prompt draws in (R25).
 pub(crate) const MIN_COLS: u16 = 40;
-/// The shortest terminal the prompt draws in (R25).
-pub(crate) const MIN_ROWS: u16 = 14;
+/// The shortest terminal the prompt draws in (R25). The question grew an input row,
+/// a status row and the two-word key column, so the tallest question (the
+/// project-only offer, whose `p` row wraps) needs twenty rows at [`MIN_COLS`]; the
+/// tests hold this to the layout itself.
+pub(crate) const MIN_ROWS: u16 = 19;
 
 /// Whether bracketed paste is on during the prompt. #494 settled **off**; operator
 /// decision D4 proposes on, and would flip this constant and nothing else.
@@ -117,8 +120,8 @@ impl Cell {
 pub(crate) struct View {
     /// The destination cell, as `agent-vm access` prints it.
     pub(crate) destination: Cell,
-    /// Whether the guest supplied the name (chooses the "not verified" sentence).
-    pub(crate) guest_named: bool,
+    /// The line typed so far, already lower-cased letters by [`super::guard`].
+    pub(crate) typed: String,
     pub(crate) count: u64,
     pub(crate) session: String,
     pub(crate) offer: OfferText,
@@ -128,23 +131,73 @@ pub(crate) struct View {
     pub(crate) overflow: u64,
 }
 
-/// The status line, redrawn once per transition (§4.4).
+/// The status the question is showing. There is no "can I answer yet" state: the
+/// line is always open, and Enter is what submits it (§4.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Status {
-    StopTyping,
-    Ready,
+    /// Nothing beyond the question itself.
+    Asking,
+    /// A grant is running.
     Allowing,
 }
 
 impl Status {
-    fn text(self) -> &'static str {
+    fn text(self) -> Option<&'static str> {
         match self {
-            Self::StopTyping => "stop typing to answer...",
-            Self::Ready => "ready for your answer",
-            Self::Allowing => "allowing...",
+            Self::Asking => None,
+            Self::Allowing => Some("allowing..."),
         }
     }
 }
+
+/// The question's own sentence, above the instruction.
+pub(crate) const QUESTION: &str = "How should this request be treated?";
+/// What the input row is for. The operator's line is echoed below it.
+pub(crate) const INSTRUCTION: &str = "Type one of the below letters and press enter:";
+/// The last line of the question: why the request already failed.
+pub(crate) const ALREADY_FAILED: &str = "The request has already failed; retry it after allowing.";
+/// The timeout note, dropped by the compact form.
+pub(crate) const TIMEOUT_NOTE: &str = "refuses in 60 s if unanswered";
+/// One key row: the letter, the word it may be spelled as, and what it does. The
+/// letter and word are the answer itself — a test holds them to
+/// [`super::guard::answer_of`], so the question cannot offer a spelling the answer
+/// does not take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Key {
+    pub(crate) letter: char,
+    pub(crate) word: &'static str,
+    pub(crate) text: &'static str,
+}
+
+/// The column the descriptions line up in: the widest word, so one row's text never
+/// starts left of another's.
+pub(crate) const WORD_COLUMN: usize = 7;
+
+/// The four keys, in the order the question draws them.
+pub(crate) const SESSION_KEY: Key = Key {
+    letter: 's',
+    word: "session",
+    text: "allow for this session",
+};
+pub(crate) const PROJECT_KEY: Key = Key {
+    letter: 'p',
+    word: "project",
+    text: "allow for this project, now and at every launch",
+};
+pub(crate) const DENY_KEY: Key = Key {
+    letter: 'd',
+    word: "deny",
+    text: "keep refusing (also Enter or Esc)",
+};
+pub(crate) const NEVER_KEY: Key = Key {
+    letter: 'n',
+    word: "never",
+    text: "keep refusing, and stop asking about it in this session",
+};
+
+/// Every key either offer can draw, for tests that hold them to the answer table.
+#[cfg(test)]
+pub(crate) const ALL_KEYS: [Key; 4] = [SESSION_KEY, PROJECT_KEY, DENY_KEY, NEVER_KEY];
 
 /// The grant's outcome, as the result frame shows it (§5.5, R20).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -159,23 +212,26 @@ pub(crate) struct ResultView {
     pub(crate) retry: bool,
 }
 
-/// A laid-out question: every row to draw, the status row (the visibility
-/// position), and the row the waiting count went to when it did not fit beside
-/// the status.
+/// A laid-out question: every row to draw, and the input row the cursor sits on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Layout {
     rows: Vec<String>,
-    /// The first key row: the result frame replaces everything from here down.
-    key_row: usize,
-    status_row: usize,
-    count_row: Option<usize>,
+    /// The row (0-based) holding the typed line and its `_`.
+    input_row: usize,
+    /// The column (1-based) the cursor is placed at: just after the typed text.
+    cursor_col: usize,
     size: Size,
 }
 
 impl Layout {
     /// The absolute row (0-based) the visibility position is on.
-    pub(crate) fn status_row(&self) -> usize {
-        self.status_row
+    pub(crate) fn input_row(&self) -> usize {
+        self.input_row
+    }
+
+    /// The 1-based column the cursor is placed on when the question is drawn.
+    pub(crate) fn cursor_col(&self) -> usize {
+        self.cursor_col
     }
 }
 
@@ -259,58 +315,47 @@ fn count_text(view: &View) -> Option<String> {
     }
 }
 
-/// Wrap one key line. The key and its text are separated by two spaces — the
-/// rendering the specification shows — and continuation rows line up under the
-/// text rather than under the key.
-fn wrap_key(key: &str, text: &str, width: usize, rows: &mut Vec<String>) {
-    let first = format!("  {key}  ");
+/// Wrap one key line: the letter, its word, then what it does, with continuation
+/// rows lined up under the text rather than under the letter.
+fn wrap_key(key: Key, text: &str, width: usize, rows: &mut Vec<String>) {
+    let first = format!(
+        "  {} {:<width$}  ",
+        key.letter,
+        key.word,
+        width = WORD_COLUMN
+    );
     let continuation = " ".repeat(first.len());
     wrap(text, width, &first, &continuation, rows);
 }
 
-/// The status row and the waiting count: beside the status when it fits, on its
-/// own row before it otherwise.
-fn push_status(
-    rows: &mut Vec<String>,
-    view: &View,
-    status: Status,
-    width: usize,
-) -> (usize, Option<usize>) {
-    let status_text = status.text();
+/// The row under the input line: the question's own state and what waits behind it.
+/// Always present, so the rows below keep their place whatever the status is.
+fn push_status(rows: &mut Vec<String>, view: &View, status: Status, width: usize) {
+    let mut parts: Vec<&str> = Vec::new();
+    if let Some(text) = status.text() {
+        parts.push(text);
+    }
     let count = count_text(view);
-    match &count {
-        Some(count) if 2 + status_text.len() + 1 + count.len() <= width => {
-            rows.push(format!("  {status_text} {count}"));
-            (rows.len() - 1, None)
-        }
-        Some(count) => {
-            // The count gets its own row(s), wrapped: at 40 columns two counts did
-            // not fit on one row and the row overflowed the terminal (finding 11).
-            let count_row = rows.len();
-            wrap(count, width, "  ", "  ", rows);
-            rows.push(format!("  {status_text}"));
-            (rows.len() - 1, Some(count_row))
-        }
-        None => {
-            rows.push(format!("  {status_text}"));
-            (rows.len() - 1, None)
-        }
+    if let Some(count) = &count {
+        parts.push(count);
+    }
+    if parts.is_empty() {
+        rows.push(String::new());
+    } else {
+        wrap(&parts.join(" "), width, "  ", "  ", rows);
     }
 }
 
-/// One layout attempt. `compact` drops the blank separators and the timeout note,
-/// which is what lets the minimum question fit a 40 × 14 terminal (AC16); at any
-/// larger size the spaced form is used and the question is never clipped either
-/// way.
+/// One layout attempt. `compact` drops the blank separators, the status row and the
+/// timeout note, which is what lets the minimum question fit a narrow terminal
+/// (AC16); at any larger size the spaced form is used and the question is never
+/// clipped either way.
 fn attempt(view: &View, size: Size, compact: bool, status: Status) -> Option<Layout> {
     if size.cols < MIN_COLS || size.rows < MIN_ROWS {
         return None;
     }
     let width = usize::from(size.cols - 1);
     let mut rows: Vec<String> = Vec::new();
-    if !compact {
-        rows.push(String::new());
-    }
     // The header is wrapped, never clipped: at 40 columns it used to read
     // "…refused a network" (finding 11), which is a safety-relevant line.
     wrap(
@@ -324,34 +369,8 @@ fn attempt(view: &View, size: Size, compact: bool, status: Status) -> Option<Lay
         rows.push(String::new());
     }
     wrap_break(view.destination.as_str(), width, "  ", "    ", &mut rows);
-    if view.guest_named {
-        wrap(
-            "The name was supplied by the guest and is not verified.",
-            width,
-            "  ",
-            "  ",
-            &mut rows,
-        );
-    } else {
-        wrap(
-            "The guest chose this address.",
-            width,
-            "  ",
-            "  ",
-            &mut rows,
-        );
-    }
     wrap(
-        "The request has already failed; retry it after allowing.",
-        width,
-        "  ",
-        "  ",
-        &mut rows,
-    );
-    wrap(
-        // "in session" + the full sentence wrapped at 40 columns, which cost a row
-        // the 40 × 14 form cannot spare (AC16). The count and the session ID are
-        // both still named, as R24 requires.
+        // The count and the session ID, both named as R24 requires.
         &format!(
             "Refused {} time(s), session {}.",
             view.count,
@@ -365,16 +384,25 @@ fn attempt(view: &View, size: Size, compact: bool, status: Status) -> Option<Lay
     if !compact {
         rows.push(String::new());
     }
-    let key_row = rows.len();
+    wrap(QUESTION, width, "", "", &mut rows);
+    wrap(INSTRUCTION, width, "", "", &mut rows);
+    // The input row: what has been typed, then the cursor's `_`. It is the row the
+    // visibility position is on, so it is always drawn even when it is empty.
+    let typed = crate::config::escape_str(&view.typed);
+    let cursor_col = typed.len() + 1;
+    rows.push(format!("{typed}_"));
+    let input_row = rows.len() - 1;
+    // The status row is also the blank line the question needs under the input row:
+    // one row, whichever it is showing, so nothing below it moves (R17) and the
+    // question costs no line it does not use. The compact form has no separators at
+    // all, so it keeps the row only when it has something to say.
+    if !compact || status.text().is_some() || count_text(view).is_some() {
+        push_status(&mut rows, view, status, width);
+    }
     match view.offer {
         OfferText::SessionOrProject => {
-            wrap_key("s", "allow for this session", width, &mut rows);
-            wrap_key(
-                "p",
-                "allow for this project, now and at every launch",
-                width,
-                &mut rows,
-            );
+            wrap_key(SESSION_KEY, SESSION_KEY.text, width, &mut rows);
+            wrap_key(PROJECT_KEY, PROJECT_KEY.text, width, &mut rows);
         }
         OfferText::ProjectNextLaunch { port } => {
             let text = match port {
@@ -383,31 +411,25 @@ fn attempt(view: &View, size: Size, compact: bool, status: Status) -> Option<Lay
                 ),
                 None => "allow for this project from the next launch".to_owned(),
             };
-            wrap_key("p", &text, width, &mut rows);
+            wrap_key(PROJECT_KEY, &text, width, &mut rows);
         }
     }
-    wrap_key("d", "keep refusing (also Enter or Esc)", width, &mut rows);
-    wrap_key(
-        "n",
-        "keep refusing, and stop asking about it in this session",
-        width,
-        &mut rows,
-    );
+    wrap_key(DENY_KEY, DENY_KEY.text, width, &mut rows);
+    wrap_key(NEVER_KEY, NEVER_KEY.text, width, &mut rows);
     if !compact {
         rows.push(String::new());
     }
-    let (status_row, count_row) = push_status(&mut rows, view, status, width);
+    wrap(ALREADY_FAILED, width, "", "", &mut rows);
     if !compact {
-        rows.push("refuses in 60 s if unanswered".to_owned());
+        rows.push(TIMEOUT_NOTE.to_owned());
     }
     if rows.len() > usize::from(size.rows) {
         return None;
     }
     Some(Layout {
         rows,
-        key_row,
-        status_row,
-        count_row,
+        input_row,
+        cursor_col,
         size,
     })
 }
@@ -418,11 +440,11 @@ pub(crate) fn layout_with(view: &View, size: Size, status: Status) -> Option<Lay
     attempt(view, size, false, status).or_else(|| attempt(view, size, true, status))
 }
 
-/// The question's first layout: the status starts at "stop typing". Only tests ask
-/// directly now; the relay always names the status (`layout_with`).
+/// The question's first layout. Only tests ask directly now; the relay always names
+/// the status (`layout_with`).
 #[cfg(test)]
 pub(crate) fn layout(view: &View, size: Size) -> Option<Layout> {
-    layout_with(view, size, Status::StopTyping)
+    layout_with(view, size, Status::Asking)
 }
 
 /// The surface the prompt draws on: which screen it saves, and what the status
@@ -485,12 +507,12 @@ pub(crate) fn enter(
         erase_row(&mut builder.0, row);
         builder.print(text);
     }
-    let status_row = layout.status_row + 1;
-    builder.csi(&format!("{status_row};3"), b'H');
+    let input_row = layout.input_row + 1;
+    builder.csi(&format!("{input_row};{}", layout.cursor_col), b'H');
     if ask_position {
         builder.csi("6", b'n');
     }
-    (builder.finish(), status_row as u16)
+    (builder.finish(), input_row as u16)
 }
 
 /// Redraw the whole question, in place: used after a resize, when the rows moved.
@@ -503,7 +525,10 @@ pub(crate) fn redraw(layout: &Layout) -> Vec<u8> {
     for row in layout.rows.len()..usize::from(layout.size.rows) {
         erase_row(&mut builder.0, row);
     }
-    builder.csi(&format!("{};3", layout.status_row + 1), b'H');
+    builder.csi(
+        &format!("{};{}", layout.input_row + 1, layout.cursor_col),
+        b'H',
+    );
     builder.finish()
 }
 
@@ -591,7 +616,7 @@ pub(crate) fn nudges(screen: Screen) -> bool {
     matches!(screen, Screen::Alternate)
 }
 
-/// The result frame: everything from the first key row down is replaced (§5.5).
+/// The result frame: everything from the status row down is replaced (§5.5).
 ///
 /// If it does not fit, it is shortened to the sentence's first line plus a pointer
 /// to `agent-vm access allowances` — that text is informational, not a choice, so

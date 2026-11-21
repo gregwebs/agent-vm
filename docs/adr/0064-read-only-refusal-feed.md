@@ -14,7 +14,10 @@ notification helper and connection listing are **not** decided here.
 > hint's text and its once-per-session rule are unchanged. On a launch whose terminal
 > the launcher relays, the hint is written through that relay's writer (at a safe
 > boundary, never during a takeover) so it cannot land inside a guest or prompt
-> sequence; elsewhere it is the stderr line described here, byte for byte.
+> sequence; elsewhere it is the stderr line described here, byte for byte. An
+> answered question **claims** the hint instead (ADR-0069's amendment): the question
+> is the same notice, so the line is not printed under the answer. A question that
+> was never answered claims nothing, and the line still reaches the operator.
 
 
 The runtime records every refused egress decision in

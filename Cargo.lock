@@ -21,7 +21,7 @@ dependencies = [
 
 [[package]]
 name = "agent-vm"
-version = "0.7.77"
+version = "0.7.78"
 dependencies = [
  "agent-vm-harness",
  "anyhow",
@@ -67,7 +67,7 @@ dependencies = [
 
 [[package]]
 name = "agent-vm-harness"
-version = "0.7.77"
+version = "0.7.78"
 dependencies = [
  "clap",
  "libc",
@@ -3496,7 +3496,7 @@ dependencies = [
 
 [[package]]
 name = "msb-krun-compat-evidence"
-version = "0.7.77"
+version = "0.7.78"
 dependencies = [
  "anyhow",
  "clap",

@@ -3,6 +3,33 @@
 use super::*;
 use crate::allowances::{GrantResult, Offer};
 
+/// The first instant input is accepted: the question has been readable for the
+/// settle window (R17's tail of typing aimed at the guest).
+fn settled(at: Instant) -> Instant {
+    at + super::SETTLE_MS
+}
+
+/// The terminal's reply naming the prompt's visibility position.
+fn reply_to(laid: screen::Layout) -> String {
+    format!("\x1b[{};{}R", laid.input_row() + 1, laid.cursor_col())
+}
+
+/// Type `text` one byte per read, as a terminal delivers it, then press Enter.
+/// `asking` flushed the reader at epoch 1, so every read here starts after it.
+fn typed(relay: &mut Relay, text: &[u8], now: Instant) {
+    let mut epoch = 2;
+    for byte in text {
+        relay.host_input(chunk(&[*byte], epoch), now);
+        epoch += 1;
+    }
+    relay.host_input(chunk(b"\r", epoch), now);
+}
+
+/// One key stroke: a single-byte read after the flush that does not submit.
+fn key(relay: &mut Relay, byte: u8, epoch: u64, now: Instant) {
+    relay.host_input(chunk(&[byte], epoch), now);
+}
+
 fn allowance() -> Allowance {
     Allowance::parse("tcp://[203.0.113.10/32]:443").expect("a canonical allowance")
 }
@@ -12,7 +39,6 @@ fn candidate(destination: &Allowance, count: u64) -> Candidate {
         entry_id: "46d712fd".to_owned(),
         destination: destination.clone(),
         cell: crate::access_prompt::screen::Cell::from_table(format!("tcp {destination}")),
-        guest_named: false,
         count,
         offer: Offer::SessionOrProject,
         port: Some(443),
@@ -52,11 +78,10 @@ fn fire_hint(hint: &std::sync::Arc<crate::refusal::feed::Hint>, relay: &mut Rela
     relay.hint_fired(now);
 }
 
-fn chunk(bytes: &[u8], epoch: u64, read_at: Instant) -> HostChunk {
+fn chunk(bytes: &[u8], epoch: u64) -> HostChunk {
     HostChunk {
         bytes: bytes.to_vec(),
         epoch,
-        read_at,
     }
 }
 
@@ -93,18 +118,20 @@ fn take_steps(items: &[OutputItem]) -> Vec<Step> {
 }
 
 /// Drive to `Asking`: offer, write the enter, confirm visibility with the reply.
+/// Bring the question up, and return the first instant input is accepted: the
+/// question became visible at `now`, so nothing typed before `now + SETTLE_MS` counts.
 fn asking(relay: &mut Relay, now: Instant) -> Instant {
     relay.offer(candidate(&allowance(), 1), now);
     let g = relay.generation();
     relay.written(g, now);
     // The reply names the prompt's status row.
     let laid = screen::layout(&relay.current_view(), relay.size).expect("fits");
-    let reply = format!("\x1b[{};3R", laid.status_row() + 1);
-    relay.host_input(chunk(reply.as_bytes(), 1, now), now);
+    let reply = reply_to(laid);
+    relay.host_input(chunk(reply.as_bytes(), 1), now);
     assert!(relay.wants_input_flush(), "visibility asks for the flush");
     relay.input_flushed(1, now);
     assert_eq!(relay.phase_name(), "asking");
-    now
+    settled(now)
 }
 
 /// The rows a frame would print, splitting on the erase-to-end-of-line each row is
@@ -168,7 +195,7 @@ fn with_no_refusal_output_is_forwarded_frame_for_frame() {
     assert_eq!(relay.phase_name(), "idle");
     assert!(!relay.wants_host_input());
     assert_eq!(
-        relay.host_input(chunk(b"k", 1, now), now),
+        relay.host_input(chunk(b"k", 1), now),
         InputRoute::Guest(b"k".to_vec())
     );
 }
@@ -270,7 +297,7 @@ fn host_input_is_consumed_during_a_takeover_and_held_output_follows_the_leave() 
     relay.written(g, now);
     assert!(relay.wants_host_input());
     assert_eq!(
-        relay.host_input(chunk(b"typed", 1, now), now),
+        relay.host_input(chunk(b"typed", 1), now),
         InputRoute::Consumed
     );
     relay.guest_output(b"held".to_vec(), now);
@@ -294,11 +321,11 @@ fn visibility_is_the_reply_that_names_the_prompt_position_and_nothing_else() {
     let g = relay.generation();
     relay.written(g, now);
     // A report for another position is ordinary input, not a confirmation.
-    relay.host_input(chunk(b"\x1b[1;1R", 1, now), now);
+    relay.host_input(chunk(b"\x1b[1;1R", 1), now);
     assert_eq!(relay.phase_name(), "confirming");
     let laid = screen::layout(&relay.current_view(), relay.size).unwrap();
-    let reply = format!("\x1b[{};3R", laid.status_row() + 1);
-    relay.host_input(chunk(reply.as_bytes(), 2, now), now);
+    let reply = reply_to(laid);
+    relay.host_input(chunk(reply.as_bytes(), 2), now);
     assert_eq!(relay.phase_name(), "asking");
 }
 
@@ -319,20 +346,19 @@ fn without_a_reply_visibility_is_the_write_plus_the_wait_and_the_session_stops_a
     assert!(relay.wants_input_flush());
     relay.input_flushed(9, now + CPR_WAIT);
 
-    // Refuse this one, then answer the next: its enter frame must not ask again.
-    relay.host_input(
-        chunk(b"d", 10, now + CPR_WAIT + Timings::default().typing_quiet),
-        now + CPR_WAIT,
-    );
-    relay.handle_deadline(now + CPR_WAIT + RESULT_LINGER + CPR_WAIT);
+    // Refuse this one, then answer the next: its enter frame must not ask again. The
+    // refusal is typed once the settle window is over.
+    let answer_at = settled(now + CPR_WAIT);
+    relay.host_input(chunk(b"\r", 10), answer_at);
+    relay.handle_deadline(answer_at + RESULT_LINGER + CPR_WAIT);
     for item in frames(&mut relay) {
         let _ = item;
     }
-    relay.written(g, now + CPR_WAIT);
-    relay.handle_deadline(now + CPR_WAIT + RELEASE_GAP + Timings::default().typing_quiet);
+    relay.written(g, answer_at);
+    relay.handle_deadline(settled(now + CPR_WAIT + RELEASE_GAP));
     relay.offer(
         candidate(&allowance(), 1),
-        now + CPR_WAIT + RELEASE_GAP + Timings::default().typing_quiet,
+        settled(now + CPR_WAIT + RELEASE_GAP),
     );
     let next = relay.generation();
     let out = frames(&mut relay);
@@ -371,18 +397,19 @@ fn a_question_whose_enter_was_written_near_the_timeout_is_refused_at_the_timeout
 }
 
 #[test]
-fn an_answer_needs_the_epoch_quiet_and_one_byte() {
+fn an_answer_needs_the_epoch_and_enter() {
     let mut relay = fresh();
     let now = Instant::now();
     let visible = asking(&mut relay, now);
-    let quiet = visible + Timings::default().typing_quiet;
 
-    // Read started before the flush: never an answer, whatever its timestamp.
-    relay.host_input(chunk(b"s", 1, visible), visible);
+    // Read started before the flush: it cannot even type.
+    relay.host_input(chunk(b"s", 1), visible);
+    assert_eq!(relay.answer_line, "");
     assert_eq!(relay.phase_name(), "asking");
 
-    // One byte, quiet, after the flush: an answer.
-    relay.host_input(chunk(b"s", 2, quiet), visible);
+    // A letter typed after the flush is echoed and does nothing else.
+    key(&mut relay, b's', 2, visible);
+    assert_eq!(relay.answer_line, "s");
     let out = frames(&mut relay);
     assert!(
         out.iter().any(|item| matches!(
@@ -392,95 +419,94 @@ fn an_answer_needs_the_epoch_quiet_and_one_byte() {
                 ..
             }
         )),
-        "a redraw says allowing..."
+        "the typed letter is drawn"
     );
-    assert!(
-        out.iter()
-            .any(|item| matches!(item, OutputItem::Takeover { .. }))
-    );
+    assert_eq!(relay.phase_name(), "asking", "a letter alone never answers");
+
+    // Enter submits it.
+    key(&mut relay, b'\r', 3, visible);
     assert_eq!(relay.phase_name(), "granting");
+    let mut grants = 0;
+    while let Some(item) = relay.take_outbound_if(|_| true) {
+        if let Outbound::Grant(grant) = item {
+            assert_eq!(grant.scope, GrantScope::Session);
+            grants += 1;
+        }
+    }
+    assert_eq!(grants, 1);
 }
 
 #[test]
-fn a_lone_escape_refuses_and_a_split_sequence_never_grants() {
-    // Finding 1. A lone Esc is a key the prompt offers (`d`/Enter/Esc refuse), so it
-    // must refuse — and a sequence split across reads must never be read as a
-    // one-byte answer, whatever its final byte is.
+fn a_lone_escape_refuses_and_a_split_sequence_never_types() {
+    // A lone Esc is a key the prompt offers (`d`/Enter/Esc refuse), so it must
+    // refuse — and a sequence split across reads must never be read as a letter.
     let mut relay = fresh();
     let now = Instant::now();
     let visible = asking(&mut relay, now);
-    let quiet = visible + Timings::default().typing_quiet;
-    relay.host_input(chunk(b"\x1b", 2, quiet), visible);
+    key(&mut relay, 0x1b, 2, visible);
     assert_eq!(relay.phase_name(), "restoring", "a lone Esc must refuse");
 
-    // `ESC [` in one read, then `s` (a valid CSI final byte) 10 ms later: never a
-    // grant, and the second read restarts the guard.
+    // `ESC [` in one read, then `s` (a valid CSI final byte): the `s` is the tail of
+    // a sequence, so it clears the line and types nothing.
     let mut relay = fresh();
     let now = Instant::now();
     let visible = asking(&mut relay, now);
-    relay.host_input(
-        chunk(b"\x1b[", 2, visible + Timings::default().typing_quiet),
-        visible,
-    );
-    assert_eq!(
-        relay.phase_name(),
-        "asking",
-        "an unfinished sequence is not an answer"
-    );
-    let ten_ms = visible + Timings::default().typing_quiet + std::time::Duration::from_millis(10);
-    relay.host_input(chunk(b"s", 3, ten_ms), visible);
-    assert_eq!(
-        relay.phase_name(),
-        "asking",
-        "the final byte of a split sequence must not grant"
-    );
-    // And only a later, quiet single read answers.
-    let later = ten_ms + Timings::default().typing_quiet;
-    relay.host_input(chunk(b"s", 4, later), visible);
-    assert_eq!(relay.phase_name(), "granting");
-}
-
-#[test]
-fn a_key_read_before_the_previous_key_but_delivered_late_never_answers() {
-    let mut relay = fresh();
-    let now = Instant::now();
-    let visible = asking(&mut relay, now);
-    // 'l' read at visible+0.5 s (typing), delivered at visible+1.2 s; then 's' read
-    // 0.5 s after 'l' — not quiet by read times even though it arrives later.
-    relay.host_input(
-        chunk(b"l", 2, visible + std::time::Duration::from_millis(500)),
-        visible,
-    );
-    relay.host_input(
-        chunk(b"s", 3, visible + std::time::Duration::from_millis(1000)),
-        visible + std::time::Duration::from_millis(1200),
-    );
-    assert_eq!(relay.phase_name(), "asking", "0.5 s of quiet is not enough");
-    let later = visible + std::time::Duration::from_millis(1700);
-    relay.host_input(chunk(b"s", 4, later), later);
-    assert_eq!(relay.phase_name(), "granting");
-}
-
-#[test]
-fn a_multi_byte_or_pasted_key_never_answers() {
-    let mut relay = fresh();
-    let now = Instant::now();
-    let visible = asking(&mut relay, now);
-    let quiet = visible + Timings::default().typing_quiet;
-    let mut at = quiet;
-    relay.host_input(chunk(b"ss", 2, at), at);
+    relay.host_input(chunk(b"\x1b[", 2), visible);
     assert_eq!(relay.phase_name(), "asking");
-    // A paste payload byte is not an answer.
-    at += std::time::Duration::from_millis(800);
-    relay.host_input(chunk(b"\x1b[200~", 3, at), at);
-    at += std::time::Duration::from_millis(800);
-    relay.host_input(chunk(b"s", 4, at), at);
+    let after = visible + std::time::Duration::from_millis(10);
+    key(&mut relay, b's', 3, after);
+    assert_eq!(
+        relay.answer_line, "",
+        "the final byte of a split sequence must not type"
+    );
+    // Typing it properly does answer: the line needs its own letter and Enter.
+    typed(&mut relay, b"s", after);
+    assert_eq!(relay.phase_name(), "granting");
+}
+
+#[test]
+fn a_read_that_started_before_the_flush_cannot_type_or_submit() {
+    let mut relay = fresh();
+    let now = Instant::now();
+    let visible = asking(&mut relay, now);
+    // Started at epoch 1 (before the flush), delivered later: nothing happens.
+    relay.host_input(chunk(b"s", 1), visible + std::time::Duration::from_secs(1));
+    relay.host_input(chunk(b"\r", 1), visible + std::time::Duration::from_secs(2));
+    assert_eq!(relay.answer_line, "");
+    assert_eq!(relay.phase_name(), "asking");
+    // A read that started after the flush does type.
+    typed(&mut relay, b"s", visible);
+    assert_eq!(relay.phase_name(), "granting");
+}
+
+#[test]
+fn a_multi_byte_or_pasted_read_clears_the_line_and_never_answers() {
+    let mut relay = fresh();
+    let now = Instant::now();
+    let visible = asking(&mut relay, now);
+    let mut at = visible;
+    // Typing, then a burst of two letters in one read: the line is cleared.
+    relay.host_input(chunk(b"ss", 2), at);
+    assert_eq!(relay.answer_line, "", "a multi-byte read clears the line");
+    assert_eq!(relay.phase_name(), "asking");
+
+    // A pasted line, markers and all, never answers — even with Enter in the paste.
+    at += std::time::Duration::from_millis(10);
+    relay.host_input(chunk(b"\x1b[200~", 3), at);
+    at += std::time::Duration::from_millis(10);
+    relay.host_input(chunk(b"s\r", 4), at);
     assert_eq!(relay.phase_name(), "asking", "inside a paste");
-    at += std::time::Duration::from_millis(800);
-    relay.host_input(chunk(b"\x1b[201~", 5, at), at);
-    at += std::time::Duration::from_millis(800);
-    relay.host_input(chunk(b"s", 6, at), at);
-    assert_eq!(relay.phase_name(), "granting", "after the paste ends");
+    assert_eq!(relay.answer_line, "");
+    at += std::time::Duration::from_millis(10);
+    relay.host_input(chunk(b"\x1b[201~", 5), at);
+    at += std::time::Duration::from_millis(10);
+    key(&mut relay, b's', 6, at);
+    assert_eq!(
+        relay.answer_line, "s",
+        "after the paste ends, keys type again"
+    );
+    typed(&mut relay, b"", at);
+    assert_eq!(relay.phase_name(), "granting", "and Enter submits it");
 }
 
 #[test]
@@ -491,8 +517,8 @@ fn s_queues_one_grant_and_the_result_lingers_through_its_own_wakeup() {
     let now = Instant::now();
     let visible = asking(&mut relay, now);
     let g = relay.generation();
-    let quiet = visible + Timings::default().typing_quiet;
-    relay.host_input(chunk(b"s", 2, quiet), quiet);
+    let quiet = settled(visible);
+    typed(&mut relay, b"s", quiet);
     let mut grants = 0;
     while let Some(item) = relay.take_outbound_if(|_| true) {
         if matches!(item, Outbound::Grant(_)) {
@@ -534,33 +560,29 @@ fn s_queues_one_grant_and_the_result_lingers_through_its_own_wakeup() {
 }
 
 #[test]
-fn a_cursor_reply_after_visibility_restarts_the_guard_and_ready_comes_back() {
-    // The driver answers the terminal's request once; that reply is input, so the
-    // guard restarts. Before "ready" has been drawn there is nothing to redraw; the
-    // ready line then arrives one quiet window after the reply. A driver that
-    // answered repeatedly would manufacture input for ever (H15).
+fn a_reply_after_visibility_clears_the_line_and_does_nothing_else() {
+    // The driver answers the terminal's request once; that reply is a multi-byte
+    // read, so it clears the typed line — it can never type, submit or deny.
     let mut relay = fresh();
     let now = Instant::now();
     let visible = asking(&mut relay, now);
     // The enter frame is still queued; clear it so only later frames are examined.
     let _ = frames(&mut relay);
+    key(&mut relay, b's', 2, visible);
+    assert_eq!(relay.answer_line, "s");
     let reply_at = visible + std::time::Duration::from_millis(20);
-    relay.host_input(chunk(b"\x1b[12;3R", 2, reply_at), visible);
+    relay.host_input(chunk(b"\x1b[12;3R", 3), visible);
     assert_eq!(relay.phase_name(), "asking");
+    assert_eq!(relay.answer_line, "", "a reply clears the line");
     assert!(
-        last_redraw(&frames(&mut relay)).is_none(),
-        "nothing is redrawn before the first ready line"
+        last_redraw(&frames(&mut relay)).is_some(),
+        "the cleared line is drawn"
     );
-    let ready = reply_at + Timings::default().typing_quiet;
-    relay.handle_deadline(ready);
-    let out = frames(&mut relay);
-    let text = last_redraw(&out).expect("a ready redraw");
-    assert!(text.contains("ready for your answer"), "{text}");
-    // And a single quiet key now answers.
-    relay.host_input(
-        chunk(b"d", 3, ready + std::time::Duration::from_millis(10)),
-        visible,
-    );
+    // Nothing redraws by itself after that: there is no "ready" state any more.
+    relay.handle_deadline(settled(reply_at));
+    assert!(relay.deadline().is_some_and(|at| at > settled(reply_at)));
+    // And Enter on the now-empty line keeps refusing.
+    key(&mut relay, b'\r', 4, settled(reply_at));
     assert_eq!(relay.phase_name(), "restoring");
 }
 
@@ -643,8 +665,8 @@ fn output_received_while_the_leave_is_unconfirmed_is_forwarded() {
     let mut relay = fresh();
     let now = Instant::now();
     let visible = asking(&mut relay, now);
-    let quiet = visible + Timings::default().typing_quiet;
-    relay.host_input(chunk(b"d", 2, quiet), visible);
+    let quiet = settled(visible);
+    typed(&mut relay, b"d", quiet);
     assert_eq!(relay.phase_name(), "restoring");
     // The leave is queued by the refusal; now drain up to it.
     let mut items = Vec::new();
@@ -679,8 +701,8 @@ fn held_output_advances_the_tracker_so_the_next_prompt_sees_it() {
     let visible = asking(&mut relay, now);
     // The guest goes to the alternate screen during the takeover.
     relay.guest_output(b"\x1b[?1049h".to_vec(), now);
-    let quiet = visible + Timings::default().typing_quiet;
-    relay.host_input(chunk(b"d", 2, quiet), visible);
+    let quiet = settled(visible);
+    typed(&mut relay, b"d", quiet);
     let g = relay.generation();
     while let Some(_item) = relay.take_outbound_if(|_| true) {}
     relay.written(g, quiet);
@@ -839,8 +861,8 @@ fn finish_hands_a_queued_grant_to_the_caller() {
     let mut relay = fresh();
     let now = Instant::now();
     let visible = asking(&mut relay, now);
-    let quiet = visible + Timings::default().typing_quiet;
-    relay.host_input(chunk(b"s", 2, quiet), visible);
+    let quiet = settled(visible);
+    typed(&mut relay, b"s", quiet);
     assert_eq!(relay.phase_name(), "granting");
     // The pump has not taken the grant yet; the guest exits now.
     let (owed, grants) = relay.finish();
@@ -919,16 +941,17 @@ fn a_forced_cut_does_not_queue_the_hint_inside_the_stalled_sequence() {
             screen: Screen::Main
         }]
     );
-    // The hint goes out once the leave is confirmed.
+    // The hint would have gone out at the leave — but the question was up and readable
+    // by then, and the question is the notice, so nothing is queued after the answer.
     let g = relay.generation();
     relay.written(g, now);
     // Visibility, as a terminal gives it, then the refusal key.
     let laid = screen::layout(&relay.current_view(), relay.size).expect("fits");
-    let reply = format!("\x1b[{};3R", laid.status_row() + 1);
-    relay.host_input(chunk(reply.as_bytes(), 1, now), now);
+    let reply = reply_to(laid);
+    relay.host_input(chunk(reply.as_bytes(), 1), now);
     relay.input_flushed(1, now);
-    let quiet = now + Timings::default().typing_quiet;
-    relay.host_input(chunk(b"d", 2, quiet), now);
+    let quiet = settled(now);
+    typed(&mut relay, b"d", quiet);
     assert_eq!(relay.phase_name(), "restoring");
     while let Some(_item) = relay.take_outbound_if(|_| true) {}
     relay.written(g, quiet);
@@ -937,10 +960,12 @@ fn a_forced_cut_does_not_queue_the_hint_inside_the_stalled_sequence() {
         .iter()
         .any(|item| matches!(item, Outbound::Frame(OutputItem::Hint)));
     assert!(
-        queued,
-        "the hint is sent after the leave: {:?}",
+        !queued,
+        "the visible question replaced the hint: {:?}",
         relay.outbound
     );
+    let route = relay.take_hint().expect("a route to hand back");
+    assert!(!route.detach(), "the question delivered the notice");
 }
 
 #[test]
@@ -963,6 +988,92 @@ fn one_fire_queues_exactly_one_hint_and_a_queued_hint_is_owed_to_stderr() {
     assert!(
         hint.detach(),
         "a queued hint that never reached the writer is owed to stderr"
+    );
+}
+
+#[test]
+fn answering_the_question_claims_the_hint_instead_of_printing_it_under_the_answer() {
+    // The operator answered `s`, and the terminal then said "the sandbox refused a
+    // guest network request": a notice about a request that had just been allowed.
+    // The question *is* the notice, so answering claims it. The claim is what makes
+    // this pass: without it, the leave frees the terminal and the hint is queued.
+    let (mut relay, hint, _route) = fresh_routed();
+    let now = Instant::now();
+    let visible = asking(&mut relay, now);
+    // The refusal's own hint arrives while the question is already up, which is the
+    // order that used to print it under the answer.
+    fire_hint(&hint, &mut relay, now);
+    assert!(
+        !relay
+            .outbound
+            .iter()
+            .any(|item| matches!(item, Outbound::Frame(OutputItem::Hint))),
+        "a hint owed while a question is up waits for its answer: {:?}",
+        relay.outbound
+    );
+    typed(&mut relay, b"s", visible);
+    let g = relay.generation();
+    while relay.take_outbound_if(|_| true).is_some() {}
+    relay.written(g, visible + std::time::Duration::from_millis(400));
+    relay.handle_deadline(visible + RESULT_LINGER);
+    while relay.take_outbound_if(|_| true).is_some() {}
+    assert!(
+        !relay
+            .outbound
+            .iter()
+            .any(|item| matches!(item, Outbound::Frame(OutputItem::Hint))),
+        "the answer must not be followed by the hint: {:?}",
+        relay.outbound
+    );
+    let route = relay.take_hint().expect("a route to hand back");
+    assert!(
+        !route.detach(),
+        "a claimed hint is delivered by the question, not by the epilogue"
+    );
+}
+
+#[test]
+fn a_hint_fired_after_the_answer_stays_quiet() {
+    // The refusal feed and the watcher race: the claim is unconditional, so a hint
+    // that fires once the operator has answered is not owed to stderr either.
+    let (mut relay, hint, _route) = fresh_routed();
+    let now = Instant::now();
+    let visible = asking(&mut relay, now);
+    typed(&mut relay, b"d", visible);
+    fire_hint(&hint, &mut relay, now);
+    assert!(
+        !relay
+            .outbound
+            .iter()
+            .any(|item| matches!(item, Outbound::Frame(OutputItem::Hint))),
+        "a claimed hint never queues, even if it fires later: {:?}",
+        relay.outbound
+    );
+    let route = relay.take_hint().expect("a route to hand back");
+    assert!(!route.detach(), "nothing is owed to stderr");
+}
+
+#[test]
+fn a_question_withdrawn_unanswered_leaves_the_hint_to_stderr() {
+    // A question drawn and withdrawn (the guest exited) was never answered, so the
+    // line is the only notice the operator can still read: it must reach the
+    // epilogue, not be claimed by a question nobody could answer.
+    let (mut relay, hint, _route) = fresh_routed();
+    let now = Instant::now();
+    let visible = asking(&mut relay, now);
+    fire_hint(&hint, &mut relay, now);
+    assert_eq!(relay.phase_name(), "asking");
+    relay.input_ended(visible);
+    assert_eq!(relay.phase_name(), "restoring");
+    while relay.take_outbound_if(|_| true).is_some() {}
+    relay.written(relay.generation(), visible);
+    assert!(
+        relay
+            .outbound
+            .iter()
+            .any(|item| matches!(item, Outbound::Frame(OutputItem::Hint))),
+        "an unanswered question does not claim the hint: {:?}",
+        relay.outbound
     );
 }
 
@@ -1016,7 +1127,7 @@ fn a_newer_redraw_replaces_an_unsent_one() {
     let visible = asking(&mut relay, now);
     // Before anything is taken, force two status redraws.
     relay.redraw_status(Status::Allowing);
-    relay.redraw_status(Status::Ready);
+    relay.redraw_status(Status::Asking);
     let mut redraws = 0;
     while let Some(item) = relay.take_outbound_if(|_| true) {
         if matches!(
@@ -1077,7 +1188,7 @@ fn apply_step(relay: &mut Relay, step: u8, now: Instant, entropy: u64) {
             relay.written(g, now);
         }
         4 => {
-            relay.host_input(chunk(b"s", entropy, now), now);
+            relay.host_input(chunk(b"s", entropy), now);
         }
         5 => {
             let g = relay.generation();
@@ -1167,36 +1278,27 @@ proptest::proptest! {
 fn an_unanswered_question_is_refused_sixty_seconds_after_it_became_visible() {
     let mut relay = fresh();
     let now = Instant::now();
-    let visible = asking(&mut relay, now);
+    asking(&mut relay, now);
     assert_eq!(
         relay.deadline(),
-        Some(visible + Timings::default().typing_quiet)
-            .map(|ready| ready.min(visible + PROMPT_TIMEOUT))
+        Some(now + PROMPT_TIMEOUT),
+        "the timeout is the only deadline a visible question has, and it runs from \
+         visibility, not from the settle window"
     );
-    relay.handle_deadline(visible + PROMPT_TIMEOUT);
+    relay.handle_deadline(now + PROMPT_TIMEOUT);
     assert_eq!(relay.phase_name(), "restoring");
 }
 
 #[test]
 fn a_second_destination_draws_the_waiting_count_with_the_current_status() {
     // Finding 10: a queued second destination produced no frame at all, so the
-    // "+N more waiting" the plan promises was never shown; and the redraws that did
-    // happen reset "ready" to "stop typing".
+    // "+N more waiting" the plan promises was never shown.
     let mut relay = fresh();
     let now = Instant::now();
     let visible = asking(&mut relay, now);
-    let quiet = visible + Timings::default().typing_quiet;
-    relay.handle_deadline(quiet); // draws "ready for your answer"
     while let Some(_item) = relay.take_outbound_if(|_| true) {}
-    assert!(matches!(
-        relay.phase,
-        Phase::Asking {
-            ready_shown: true,
-            ..
-        }
-    ));
     let other = Allowance::parse("tcp://[203.0.113.11]:443").unwrap();
-    relay.offer(candidate(&other, 1), quiet);
+    relay.offer(candidate(&other, 1), visible);
     let out = frames(&mut relay);
     let redraw = out
         .iter()
@@ -1210,11 +1312,8 @@ fn a_second_destination_draws_the_waiting_count_with_the_current_status() {
         })
         .expect("a count change must be drawn");
     assert!(redraw.contains("+1 more waiting"), "{redraw}");
-    assert!(
-        redraw.contains("ready for your answer"),
-        "the redraw must keep the status: {redraw}"
-    );
-    assert!(!redraw.contains("stop typing"), "{redraw}");
+    // The waiting count sits under the input row, where the status would be.
+    assert!(redraw.contains("Type one of the below letters"), "{redraw}");
 }
 
 #[test]
@@ -1225,8 +1324,8 @@ fn a_resize_in_lingering_redraws_the_result() {
     let now = Instant::now();
     let visible = asking(&mut relay, now);
     let g = relay.generation();
-    let quiet = visible + Timings::default().typing_quiet;
-    relay.host_input(chunk(b"s", 2, quiet), visible);
+    let quiet = settled(visible);
+    typed(&mut relay, b"s", quiet);
     relay.granted(
         g,
         PromptGrant::Reached(GrantResult::Applied {
@@ -1286,8 +1385,8 @@ fn a_resize_while_confirming_keeps_the_position_the_request_named() {
         "confirming",
         "a confirming resize does not close"
     );
-    let reply = format!("\x1b[{};3R", asked.row);
-    relay.host_input(chunk(reply.as_bytes(), 1, now), now);
+    let reply = format!("\x1b[{};{}R", asked.row, asked.col);
+    relay.host_input(chunk(reply.as_bytes(), 1), now);
     assert_eq!(
         relay.phase_name(),
         "asking",
@@ -1356,8 +1455,8 @@ fn the_release_gap_starts_at_the_leave_s_confirmation() {
     asking(&mut relay, now);
     let other = Allowance::parse("tcp://[203.0.113.11]:443").unwrap();
     relay.offer(candidate(&other, 1), now);
-    let quiet = now + Timings::default().typing_quiet;
-    relay.host_input(chunk(b"d", 2, quiet), now);
+    let quiet = settled(now);
+    typed(&mut relay, b"d", quiet);
     let g = relay.generation();
     relay.handle_deadline(now);
     // Now Restoring (the refusal queued the leave); confirm the leave later.
@@ -1374,20 +1473,19 @@ fn the_release_gap_starts_at_the_leave_s_confirmation() {
 
 #[test]
 fn a_grant_whose_result_no_longer_fits_still_ends_the_takeover() {
-    // M1: at 40 x 14 a grown waiting count made the question unrenderable, so no
-    // result frame was queued, the 1.5 s never started, and the takeover had no
-    // deadline at all — input consumed and guest output held for ever.
+    // M1: no result frame meant no 1.5 s, no deadline, and a takeover that never
+    // ended — input consumed and guest output held for ever.
     let mut relay = Relay::new(
         "3f9a12c4".to_owned(),
-        Size { rows: 14, cols: 40 },
+        Size { rows: 30, cols: 80 },
         Timings::default(),
         None,
     );
     let now = Instant::now();
     let visible = asking(&mut relay, now);
     let g = relay.generation();
-    let quiet = visible + Timings::default().typing_quiet;
-    relay.host_input(chunk(b"s", 2, quiet), visible);
+    let quiet = settled(visible);
+    typed(&mut relay, b"s", quiet);
     assert_eq!(relay.phase_name(), "granting");
     // Eight destinations wait and one overflows while the grant is running.
     for index in 0..9u16 {
@@ -1396,6 +1494,10 @@ fn a_grant_whose_result_no_longer_fits_still_ends_the_takeover() {
         relay.offer(candidate(&destination, 1), now);
     }
     assert_eq!(relay.waiting_len(), 8);
+    // The question can no longer be laid out at all (a terminal below the takeover
+    // minimum): the result must still be drawn, because it is laid out from the
+    // geometry alone.
+    relay.size = Size { rows: 12, cols: 40 };
     relay.granted(
         g,
         PromptGrant::Reached(GrantResult::Applied {
@@ -1410,7 +1512,6 @@ fn a_grant_whose_result_no_longer_fits_still_ends_the_takeover() {
     let deadline = relay
         .deadline()
         .expect("a lingering takeover always has a deadline (M1)");
-    // The result is drawn even though the question no longer fits.
     let out = frames(&mut relay);
     assert!(
         out.iter().any(|item| matches!(
@@ -1427,48 +1528,43 @@ fn a_grant_whose_result_no_longer_fits_still_ends_the_takeover() {
 }
 
 #[test]
-fn every_status_redraw_lays_out_the_whole_question() {
-    // M2: a status-only redraw used the `StopTyping` layout, so at narrow widths it
-    // wrote over the key lines, and a redraw that did not fit was silently skipped
-    // while "ready" was still marked shown.
+fn every_redraw_lays_out_the_whole_question() {
+    // M2: a partial redraw used a layout of its own, so at narrow widths it wrote
+    // over the key lines. Every redraw is a whole layout, and a typed letter is
+    // echoed on the input row with the keys still visible.
     let mut relay = Relay::new(
         "3f9a12c4".to_owned(),
-        Size { rows: 19, cols: 40 },
+        Size {
+            rows: crate::access_prompt::screen::MIN_ROWS,
+            cols: crate::access_prompt::screen::MIN_COLS,
+        },
         Timings::default(),
         None,
     );
     let now = Instant::now();
     let visible = asking(&mut relay, now);
-    let quiet = visible + Timings::default().typing_quiet;
+    let quiet = settled(visible);
     // A second destination: the question now carries a count row.
     let other = Allowance::parse("tcp://[203.0.113.11]:443").unwrap();
     relay.offer(candidate(&other, 1), now);
     while let Some(_item) = relay.take_outbound_if(|_| true) {}
-    // The guard is satisfied: "ready" is drawn.
-    relay.handle_deadline(quiet);
+    // A typed letter is echoed, and the whole question is redrawn around it.
+    relay.host_input(chunk(b"s", 2), visible);
     let out = frames(&mut relay);
-    let rows = last_redraw(&out).expect("a ready redraw");
-    assert!(rows.contains("ready for your answer"), "{rows}");
-    assert!(
-        rows.contains("d  keep refusing"),
-        "the d key line is hidden: {rows}"
-    );
-    assert!(
-        rows.contains("n  keep refusing"),
-        "the n key line is hidden: {rows}"
-    );
+    let rows = last_redraw(&out).expect("the typed letter is drawn");
+    assert!(rows.contains("s_"), "the letter is echoed: {rows}");
+    assert!(rows.contains("d deny"), "the d key line is hidden: {rows}");
+    assert!(rows.contains("n never"), "the n key line is hidden: {rows}");
+    assert!(rows.contains("+1 more waiting"), "{rows}");
     for row in rows.lines() {
         assert!(row.chars().count() <= 39, "{row:?} exceeds 40 columns");
     }
-    // A typed key restarts the guard; the next frame says so on a full layout.
-    relay.host_input(
-        chunk(b"x", 2, quiet + Timings::default().typing_quiet),
-        visible,
-    );
+    // A paste (a multi-byte read) clears the line and is drawn as cleared.
+    relay.host_input(chunk(b"\x1b[200~", 3), quiet);
     let out = frames(&mut relay);
-    let rows = last_redraw(&out).expect("a stop-typing redraw");
-    assert!(rows.contains("stop typing to answer..."), "{rows}");
-    assert!(rows.contains("d  keep refusing"), "{rows}");
+    let rows = last_redraw(&out).expect("the cleared line is drawn");
+    assert!(rows.contains("Type one of the below letters"), "{rows}");
+    assert!(rows.contains("d deny"), "{rows}");
 }
 
 #[test]
@@ -1478,11 +1574,9 @@ fn a_lone_escape_after_an_abandoned_partial_still_refuses() {
     let mut relay = fresh();
     let now = Instant::now();
     let visible = asking(&mut relay, now);
-    let quiet = visible + Timings::default().typing_quiet;
-    relay.host_input(chunk(b"\x1b[", 2, quiet), visible);
+    relay.host_input(chunk(b"\x1b[", 2), visible);
     assert_eq!(relay.phase_name(), "asking");
-    let later = quiet + std::time::Duration::from_secs(1);
-    relay.host_input(chunk(b"\x1b", 3, later), visible);
+    relay.host_input(chunk(b"\x1b", 3), visible);
     assert_eq!(
         relay.phase_name(),
         "restoring",
@@ -1497,17 +1591,15 @@ fn a_split_ss3_sequence_never_grants() {
     let mut relay = fresh();
     let now = Instant::now();
     let visible = asking(&mut relay, now);
-    relay.host_input(
-        chunk(b"\x1bO", 2, visible + Timings::default().typing_quiet),
-        visible,
-    );
-    let later = visible + Timings::default().typing_quiet + std::time::Duration::from_millis(800);
-    relay.host_input(chunk(b"s", 3, later), visible);
-    assert_eq!(
-        relay.phase_name(),
-        "asking",
-        "the SS3 final byte must not grant"
-    );
+    relay.host_input(chunk(b"\x1bO", 2), visible);
+    let later = settled(visible) + std::time::Duration::from_millis(800);
+    // The final byte of the sequence is not one of the operator's keys.
+    relay.host_input(chunk(b"s", 3), visible);
+    assert_eq!(relay.answer_line, "", "the SS3 final byte must not type");
+    assert_eq!(relay.phase_name(), "asking");
+    // Typed properly, the same letter does answer.
+    typed(&mut relay, b"s", later);
+    assert_eq!(relay.phase_name(), "granting");
 }
 
 #[test]
@@ -1552,8 +1644,8 @@ fn a_settling_destination_is_not_asked_again_after_its_late_grant() {
     let now = Instant::now();
     let visible = asking(&mut relay, now);
     let g = relay.generation();
-    let quiet = visible + Timings::default().typing_quiet;
-    relay.host_input(chunk(b"p", 2, quiet), visible);
+    let quiet = settled(visible);
+    typed(&mut relay, b"p", quiet);
     relay.grant_unconfirmed(g, quiet);
     let destination = allowance();
     assert!(relay.settling.contains(&destination));
@@ -1589,8 +1681,8 @@ fn a_grant_waiting_for_its_slot_does_not_block_the_frames_behind_it() {
     let mut relay = fresh();
     let now = Instant::now();
     let visible = asking(&mut relay, now);
-    let quiet = visible + Timings::default().typing_quiet;
-    relay.host_input(chunk(b"s", 2, quiet), visible);
+    let quiet = settled(visible);
+    typed(&mut relay, b"s", quiet);
     let mut order = Vec::new();
     while let Some(item) = relay.take_outbound_if(|head| matches!(head, Outbound::Frame(_))) {
         order.push(match item {
@@ -1611,28 +1703,24 @@ fn a_grant_waiting_for_its_slot_does_not_block_the_frames_behind_it() {
 
 #[test]
 fn an_answer_that_closes_the_question_does_not_grant_or_queue_a_second_leave() {
-    // Round 3, A R2-1/B B1: at 40 x 14 "allowing..." no longer fitted, the redraw
-    // closed the question (queueing the Leave), and `answer` then overwrote the phase
-    // with `Granting`. The Leave's confirmation was dropped, the result discarded, the
-    // next Leave refused by the writer, and the session died with a writer error.
+    // Round 3, A R2-1/B B1: an "allowing..." redraw that no longer fitted closed the
+    // question (queueing the Leave), and `answer` then overwrote the phase with
+    // `Granting`. The Leave's confirmation was dropped, the result discarded, the next
+    // Leave refused by the writer, and the session died with a writer error.
+    //
+    // The status row is always present now, so a status change cannot add a row: the
+    // only way a redraw fails is a terminal below the takeover minimum.
     let mut relay = Relay::new(
         "3f9a12c4".to_owned(),
-        Size { rows: 14, cols: 40 },
+        Size { rows: 30, cols: 80 },
         Timings::default(),
         None,
     );
     let now = Instant::now();
     let visible = asking(&mut relay, now);
-    let quiet = visible + Timings::default().typing_quiet;
-    // The question still fits until the count grows.
-    for index in 0..9u16 {
-        let destination =
-            Allowance::parse(&format!("tcp://[203.0.113.{}]:443", index + 20)).unwrap();
-        relay.offer(candidate(&destination, 1), now);
-    }
-    // The window with the count is what no longer fits: the next status change closes.
-    while let Some(_item) = relay.take_outbound_if(|_| true) {}
-    relay.host_input(chunk(b"s", 2, quiet), visible);
+    let quiet = settled(visible);
+    relay.size = Size { rows: 12, cols: 40 };
+    typed(&mut relay, b"s", quiet);
     assert_eq!(
         relay.phase_name(),
         "restoring",
@@ -1660,7 +1748,7 @@ fn an_answer_that_closes_the_question_does_not_grant_or_queue_a_second_leave() {
                 ..
             }
         )),
-        "no result frame is drawn after the close: {out:?}"
+        "no frame follows the leave: {out:?}"
     );
     // The leave's confirmation ends the takeover normally; no second leave is owed.
     let g = relay.generation();
@@ -1677,8 +1765,8 @@ fn a_refusal_while_the_result_is_up_does_not_extend_the_linger() {
     let now = Instant::now();
     let visible = asking(&mut relay, now);
     let g = relay.generation();
-    let quiet = visible + Timings::default().typing_quiet;
-    relay.host_input(chunk(b"s", 2, quiet), visible);
+    let quiet = settled(visible);
+    typed(&mut relay, b"s", quiet);
     relay.granted(
         g,
         PromptGrant::Reached(GrantResult::Applied {
@@ -1725,8 +1813,8 @@ fn a_resize_to_a_tiny_terminal_closes_a_lingering_question() {
     let now = Instant::now();
     let visible = asking(&mut relay, now);
     let g = relay.generation();
-    let quiet = visible + Timings::default().typing_quiet;
-    relay.host_input(chunk(b"d", 2, quiet), visible);
+    let quiet = settled(visible);
+    typed(&mut relay, b"d", quiet);
     assert_eq!(relay.phase_name(), "restoring");
     // A second takeover, this time answered with a grant, to reach Lingering.
     let released = quiet;
@@ -1736,15 +1824,12 @@ fn a_resize_to_a_tiny_terminal_closes_a_lingering_question() {
     relay.offer(candidate(&allowance(), 1), released + RELEASE_GAP);
     let g = relay.generation();
     relay.written(g, released + RELEASE_GAP);
-    let quiet2 = released + RELEASE_GAP + Timings::default().typing_quiet;
+    let quiet2 = settled(released + RELEASE_GAP);
     let laid = screen::layout(&relay.current_view(), relay.size).expect("fits");
-    let reply = format!("\x1b[{};3R", laid.status_row() + 1);
-    relay.host_input(
-        chunk(reply.as_bytes(), 1, released + RELEASE_GAP),
-        released + RELEASE_GAP,
-    );
+    let reply = reply_to(laid);
+    relay.host_input(chunk(reply.as_bytes(), 1), released + RELEASE_GAP);
     relay.input_flushed(1, released + RELEASE_GAP);
-    relay.host_input(chunk(b"s", 2, quiet2), released + RELEASE_GAP);
+    typed(&mut relay, b"s", quiet2);
     assert_eq!(relay.phase_name(), "granting");
     while let Some(_item) = relay.take_outbound_if(|_| true) {}
     relay.granted(
@@ -1764,4 +1849,143 @@ fn a_resize_to_a_tiny_terminal_closes_a_lingering_question() {
         "restoring",
         "a terminal the result cannot fit must close the question"
     );
+}
+
+// ------------------------------------------------- the line, through the relay ---
+// The proved kernels own the rules; these run them through `host_input` and
+// `edit_line`, the adapter ADR-0018 names, so a rule that is right but wired wrong
+// still fails here.
+
+#[test]
+fn a_word_answers_exactly_as_its_letter_does() {
+    // The two spellings are one answer each, and the question draws words, so a
+    // word typed letter by letter must submit the same thing as the letter.
+    for (word, letter, expected) in [
+        (b"session".as_slice(), b's', "granting"),
+        (b"project".as_slice(), b'p', "granting"),
+        (b"deny".as_slice(), b'd', "restoring"),
+        (b"never".as_slice(), b'n', "restoring"),
+    ] {
+        for keys in [word.to_vec(), vec![letter]] {
+            let mut relay = fresh();
+            let now = Instant::now();
+            let visible = asking(&mut relay, now);
+            typed(&mut relay, &keys, visible);
+            assert_eq!(
+                relay.phase_name(),
+                expected,
+                "{:?} must answer as {:?}",
+                String::from_utf8_lossy(&keys),
+                expected
+            );
+        }
+    }
+}
+
+#[test]
+fn backspace_erases_and_the_line_stops_at_the_cap() {
+    let mut relay = fresh();
+    let now = Instant::now();
+    let visible = asking(&mut relay, now);
+    // `sessionx`, then one Backspace: the line is `session` and answers.
+    for (epoch, byte) in b"sessionx".iter().enumerate() {
+        key(&mut relay, *byte, epoch as u64 + 2, visible);
+    }
+    assert_eq!(relay.answer_line, "sessionx");
+    key(&mut relay, 0x7f, 20, visible);
+    assert_eq!(relay.answer_line, "session");
+    key(&mut relay, b'\r', 22, visible);
+    assert_eq!(relay.phase_name(), "granting", "the erased line answers");
+
+    // Backspace on an empty line does nothing and never redraws.
+    let mut relay = fresh();
+    let now = Instant::now();
+    let visible = asking(&mut relay, now);
+    while relay.take_outbound_if(|_| true).is_some() {}
+    key(&mut relay, 0x7f, 2, visible);
+    assert_eq!(relay.answer_line, "");
+    assert!(
+        relay.outbound.iter().all(|item| !matches!(
+            item,
+            Outbound::Frame(OutputItem::Takeover {
+                step: Step::Redraw,
+                ..
+            })
+        )),
+        "an erase that erases nothing draws nothing"
+    );
+
+    // The cap: the line stops at `MAX_ANSWER_CHARS` and further letters are dropped
+    // rather than growing it.
+    let mut relay = fresh();
+    let now = Instant::now();
+    let visible = asking(&mut relay, now);
+    for epoch in 0..(guard::MAX_ANSWER_CHARS as u64 + 4) {
+        key(&mut relay, b's', epoch + 2, visible);
+    }
+    assert_eq!(relay.answer_line.len(), guard::MAX_ANSWER_CHARS);
+    assert_eq!(relay.phase_name(), "asking", "the line is not an answer");
+}
+
+#[test]
+fn a_line_that_is_not_an_answer_does_nothing_at_all() {
+    let mut relay = fresh();
+    let now = Instant::now();
+    let visible = asking(&mut relay, now);
+    // `sessionx`: nearly an answer, and Enter submits it to nothing.
+    typed(&mut relay, b"sessionx", visible);
+    assert_eq!(
+        relay.phase_name(),
+        "asking",
+        "an unknown line is not an answer"
+    );
+    assert_eq!(relay.answer_line, "sessionx", "the line is still there");
+    // Case is folded, so the operator's capitals still answer.
+    let mut relay = fresh();
+    let now = Instant::now();
+    let visible = asking(&mut relay, now);
+    typed(&mut relay, b"SESSION", visible);
+    assert_eq!(relay.phase_name(), "granting");
+}
+
+#[test]
+fn a_non_letter_clears_the_line_so_a_line_never_holds_one() {
+    // `s` then `1`: the `1` clears, so the line is empty and Enter refuses — it can
+    // never submit the `s` the operator did not mean to offer.
+    let mut relay = fresh();
+    let now = Instant::now();
+    let visible = asking(&mut relay, now);
+    key(&mut relay, b's', 2, visible);
+    assert_eq!(relay.answer_line, "s");
+    key(&mut relay, b'1', 3, visible);
+    assert_eq!(relay.answer_line, "", "a byte that is not a letter clears");
+    key(&mut relay, b'\r', 4, visible);
+    assert_eq!(
+        relay.phase_name(),
+        "restoring",
+        "Enter on the empty line refuses"
+    );
+}
+
+#[test]
+fn nothing_counts_until_the_question_has_been_readable_for_the_settle_window() {
+    // The tail of typing aimed at the guest: a key, a Backspace and an Esc that all
+    // arrive in the first `SETTLE_MS` do nothing at all — the Esc must not even
+    // refuse, because the operator has not read the question yet.
+    let mut relay = fresh();
+    let now = Instant::now();
+    let visible = asking(&mut relay, now);
+    let too_soon = visible - super::SETTLE_MS + std::time::Duration::from_millis(1);
+    for (epoch, byte) in [(2u64, b's'), (3, b'p'), (4, 0x7f), (5, 0x1b), (6, b'\r')] {
+        relay.host_input(chunk(&[byte], epoch), too_soon);
+    }
+    assert_eq!(
+        relay.phase_name(),
+        "asking",
+        "the settle window ignores everything"
+    );
+    assert_eq!(relay.answer_line, "");
+    // One instant later the same bytes are the operator's.
+    key(&mut relay, b's', 7, visible);
+    assert_eq!(relay.answer_line, "s");
 }

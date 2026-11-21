@@ -1104,10 +1104,11 @@ kinds.
 **Access prompt**: the launcher's in-terminal question about one **network
 denial**, shown only on a direct launch whose terminal the launcher relays. It
 holds the guest's terminal stream — output is kept back, keystrokes go to the
-question — and never pauses the VM. A key counts only after the typing guard
-(0.7 s without typing, single-byte reads, after the terminal confirmed the
-prompt). It answers through the same live grant as `agent-vm access allow`, and
-an answer given elsewhere first wins. See
+question — and never pauses the VM. It is answered by typing a letter (or its
+word) and pressing Enter; nothing but Enter submits, the input is ignored for a
+settle window after the question appears, and a read that is not one clean key
+stroke clears the line. It answers through the same live grant as
+`agent-vm access allow`, and an answer given elsewhere first wins. See
 [ADR-0069](docs/adr/0069-in-terminal-access-prompt.md).
 
 _Avoid_: "block prompt"; "pausing the guest".

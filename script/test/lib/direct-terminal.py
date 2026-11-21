@@ -81,7 +81,10 @@ PROBE_NAME = "guest-probe.sh"
 # The prompt is found by its own text, never by a launcher notice: this line is
 # drawn by the takeover frame itself, so its presence is the takeover's evidence.
 PROMPT_TITLE = "the sandbox refused a network request"
-PROMPT_READY = "ready for your answer"
+# The question's own instruction row. Answering is a line now: the operator types a
+# letter (or its word) on the input row and presses Enter, so the launcher draws no
+# "ready" state — the row below is the question's evidence and its input row follows.
+PROMPT_INSTRUCTION = "Type one of the below letters and press enter:"
 # The host restore of the plan's §5.7, byte for byte, as `screen::host_restore`
 # builds it. A forced or lost end must contain it exactly once and end with it
 # (the rows that check it send launcher notices to a file, so the terminal stream
@@ -110,9 +113,6 @@ PROMPT_LINE_COUNT = 60
 # asserted.
 PROMPT_APPEARS_WITHIN = 1.0
 PROMPT_STALL_WITHIN = 1.5
-# The status row's other face: a redraw after an input (the driver's own
-# cursor-position reply included) puts this back and starts a new quiet window.
-PROMPT_STOP_TYPING = "stop typing to answer"
 
 
 class CaseError(RuntimeError):
@@ -1557,40 +1557,45 @@ def refusal_id(ctx: "Context", destination: str) -> str | None:
     return None
 
 
-def ready_is_latest(text: str) -> bool:
-    """Whether the prompt's *current* status is "ready for your answer".
+def question_is_drawn(text: str) -> bool:
+    """Whether the prompt's question is the latest frame drawn.
 
-    The accumulated text keeps every redraw, so `PROMPT_READY in text` stays true
-    after a later redraw put "stop typing to answer..." back. A key written then
-    is typing inside the guard's quiet window, not an answer: on a real boot
-    `prompt-project-next/separator` answered `p` that way and no record was
-    written (2026-11-15, first e2e attempt).
+    The accumulated text keeps every frame, so `PROMPT_TITLE in text` stays true
+    after the leave. The instruction row is drawn by the takeover itself and again
+    by every redraw, so the latest one being present (and no leave after it) means
+    the line is on screen and can be typed.
     """
 
-    return text.rfind(PROMPT_READY) > text.rfind(PROMPT_STOP_TYPING)
+    drawn = text.rfind(PROMPT_INSTRUCTION)
+    return drawn >= 0 and drawn > text.rfind("\x1b[?1049l")
 
 
 def cpr_reply(text: str) -> bytes:
-    """The terminal's answer to the prompt's cursor-position request."""
+    """The terminal's answer to the prompt's cursor-position request.
 
-    moves = re.findall(r"\x1b\[(\d+);3H", text)
+    The request names the input row and the column just past the typed line, so the
+    reply is read off the move rather than assumed: a reply that names another
+    position is host input, not a confirmation.
+    """
+
+    moves = re.findall(r"\x1b\[(\d+);(\d+)H(?=(?:(?!\x1b\[\d+;\d+H).)*\x1b\[6n)", text, re.S)
     require(moves, "the prompt asked for a position it never moved to")
-    return f"\x1b[{moves[-1]};3R".encode()
+    row, col = moves[-1]
+    return f"\x1b[{row};{col}R".encode()
 
 
 class PromptDriver:
     """How many cursor-position requests have been answered, and when the last was.
 
     The count must outlive one `pump_prompt` call: a caller that re-pumps would
-    otherwise answer the same request again on every pass, and the quiet-window wait
-    would never end (H13). `limit` is the launcher's own shape: one request per
-    takeover, so exactly one reply is ever written (H15) — a driver that keeps
-    answering manufactures host input that restarts the typing guard for ever.
+    otherwise answer the same request again on every pass (H13). `limit` is the
+    launcher's own shape: one request per takeover, so exactly one reply is ever
+    written (H15) — extra replies are host input, and a driver that keeps answering
+    keeps a session busy with them.
     """
 
     def __init__(self, limit: int = 1) -> None:
         self.answered = 0
-        self.last_reply = 0.0
         self.limit = limit
 
 
@@ -1608,8 +1613,8 @@ def pump_prompt(
     own. But this must never answer a request that was already answered: every call
     site shares the case's one `PromptDriver`, whose count is read here **once, above
     the polling loop** — re-initialising it per iteration wrote one reply every 10 ms
-    for as long as the predicate took, and those replies are host input inside the
-    typing guard's window (H16).
+    for as long as the predicate took, and those replies are host input the question
+    would have to clear (H16).
     """
 
     limit = min(session.deadline, time.monotonic() + deadline)
@@ -1624,31 +1629,52 @@ def pump_prompt(
                 break
             session.write_terminal(cpr_reply(text))
             answered += 1
-            # When the reply was written: the guard counts input from the read time, so
-            # an answer must not follow one too closely (H13).
             driver.answered = answered
-            driver.last_reply = time.monotonic()
         if predicate(text):
             return text
         time.sleep(0.01)
     raise CaseError(f"{what}: not observed within {deadline:.0f}s")
 
 
-def answer_when_ready(session: "Session", label: str, driver: "PromptDriver") -> str:
-    """Pump until the prompt is *stably* ready, then let the caller write its key.
+#: How long the prompt ignores input after the question becomes readable
+#: (`access_prompt::relay::SETTLE_MS`): the tail of typing aimed at the guest must not
+#: arrive as an answer, so a driver waits it out exactly as a person reading the
+#: question does.
+SETTLE_SECONDS = 0.5
+#: What a driver waits before typing: the settle window plus room for the last read.
+SETTLE_MARGIN = 0.25
 
-    "Stably" means the ready line is the latest output and no cursor-position reply
-    was written inside the guard's quiet window: a reply after visibility is typing,
-    and a key racing it is typing too. On a real boot the project-next row wrote `p`
-    in the same millisecond as its reply and the question timed out.
+
+def settle() -> None:
+    """Wait out the prompt's settle window."""
+
+    time.sleep(SETTLE_SECONDS + SETTLE_MARGIN)
+
+
+def wait_for_question(session: "Session", label: str, driver: "PromptDriver") -> str:
+    """Pump until the question is drawn, answering its one cursor-position request.
+
+    Leaves the question *answerable*: the settle window has passed, so the next
+    keystroke is the operator's.
     """
 
-    # One request answered at most, ever: the launcher sends one per takeover and
-    # treats a later reply as typing. Readiness is polled, not slept for, so this is
-    # deterministic: the reply restarts the guard and "ready" is drawn when the
-    # guard's window has passed.
-    pump_prompt(session, ready_is_latest, f"{label}: the ready status", driver=driver)
+    pump_prompt(session, question_is_drawn, f"{label}: the question", driver=driver)
+    settle()
     return session.launcher_output()
+
+
+def submit(session: "Session", answer: bytes) -> None:
+    """Type the answer one byte at a time, then press Enter.
+
+    The line may only be assembled from single-byte reads (a paste, or a burst that
+    arrives as one read, clears it), so every letter is its own write, as a person's
+    keystrokes are — and a word like `session` is typed the same way.
+    """
+
+    for byte in answer:
+        session.write_terminal(bytes([byte]))
+        time.sleep(0.05)
+    session.write_terminal(b"\r")
 
 
 def held_lines_after(text: str, start: int) -> list[int]:
@@ -1776,23 +1802,23 @@ def observe_prompt(case: Case, form: str, session: "Session", receipt: dict, ctx
         )
     if spec.get("offer") == "project-only":
         text = pump_prompt(
-            session, ready_is_latest, f"{label}: the ready status", driver
+            session, question_is_drawn, f"{label}: the question", driver
         )
         require("from the next launch" in text, f"{label}: the #491 offer is missing: {text[-800:]!r}")
         require(
-            "  s  allow" not in text,
+            "  s session  allow for" not in text,
             f"{label}: `s` was offered for a destination only a record can admit: {text[-800:]!r}",
         )
     if spec.get("guard"):
-        # A key before the guard is typing; a two-byte read is typing; then a
-        # deliberate `d`. Nothing may reach the guest and nothing may be granted.
+        # A letter typed at the guest before the question appeared must not answer it;
+        # a burst that arrives as one read clears the line; then a deliberate `d` and
+        # Enter. Nothing may reach the guest and nothing may be granted.
         session.write_terminal(b"s")
-        pump_prompt(session, ready_is_latest, f"{label}: the ready status", driver)
+        wait_for_question(session, label, driver)
         session.write_terminal(b"ss")
-        answer_when_ready(session, label, driver)
-        session.write_terminal(b"d")
+        submit(session, b"d")
     elif spec.get("answered_elsewhere"):
-        answer_when_ready(session, label, driver)
+        wait_for_question(session, label, driver)
         if not ctx.standin:
             identifier = refusal_id(ctx, prompt_destination(spec))
             require(identifier, f"{label}: no refusal row names the destination, so the CLI cannot answer")
@@ -1818,7 +1844,7 @@ def observe_prompt(case: Case, form: str, session: "Session", receipt: dict, ctx
                     stderr=subprocess.PIPE,
                     text=True,
                 )
-                session.write_terminal(spec["race_key"])
+                submit(session, spec["race_key"])
                 receipt["prompt"]["race_key"] = spec["race_key"].decode()
                 try:
                     out, err = racing.communicate(timeout=120)
@@ -1832,18 +1858,18 @@ def observe_prompt(case: Case, form: str, session: "Session", receipt: dict, ctx
                     f"({racing.returncode}): {out}{err}",
                 )
     elif spec.get("forced"):
-        answer_when_ready(session, label, driver)
+        wait_for_question(session, label, driver)
         os.kill(session.process.pid, signal.SIGINT)
         time.sleep(0.3)
         os.kill(session.process.pid, signal.SIGINT)
     elif spec.get("runtime_loss"):
-        answer_when_ready(session, label, driver)
+        wait_for_question(session, label, driver)
         identity = owned_runtime_identity(session.process.pid, ctx, label)
         receipt["prompt"]["runtime_pid"] = identity["pid"]
         runtime_helpers.signal_identity(identity, signal.SIGKILL)
     elif spec["answer"] is not None:
-        answer_when_ready(session, label, driver)
-        session.write_terminal(spec["answer"])
+        wait_for_question(session, label, driver)
+        submit(session, spec["answer"])
     # else: the guest ends the session by itself while the question is up.
 
     # The `access`/`access allowances` check runs **while the session is live**: a
@@ -1974,7 +2000,7 @@ def observe_prompt(case: Case, form: str, session: "Session", receipt: dict, ctx
         # drawn over the guest.
         after_leave = text[leave_at:]
         require(
-            PROMPT_READY not in after_leave and PROMPT_TITLE not in after_leave,
+            PROMPT_INSTRUCTION not in after_leave and PROMPT_TITLE not in after_leave,
             f"{label}: a prompt frame was written after the leave: {after_leave[-800:]!r}",
         )
         receipt["prompt"]["held_lines"] = len(numbers)

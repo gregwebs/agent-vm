@@ -208,11 +208,6 @@ fn candidate_for(
         // Already escaped to printable ASCII by the table that renders it (R24:
         // the prompt names the destination exactly as `access` does).
         cell: screen::Cell::from_table(entry.destination_cell()),
-        guest_named: entry.name.is_some()
-            || !matches!(
-                entry.key.destination,
-                crate::refusal::Destination::Address { .. }
-            ),
         count: entry.count,
         offer,
         port,

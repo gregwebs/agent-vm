@@ -20,7 +20,10 @@ use microsandbox::sandbox::exec::ExecEvent;
 use microsandbox_types::Protocol;
 
 use super::*;
-use crate::access_prompt::{self, relay::Timings};
+use crate::access_prompt::{
+    self,
+    relay::{CPR_WAIT, SETTLE_MS, Timings},
+};
 use crate::host_signals::{GuestControl, Supervision};
 
 #[derive(Clone)]
@@ -309,23 +312,41 @@ impl Harness {
             .expect("a cursor move");
         let tail = String::from_utf8_lossy(&before[move_at + 2..]);
         let row: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
-        let reply = format!("\x1b[{};3R", row.parse::<u16>().expect("a row"));
+        // The column too: the prompt moves the cursor to the input row, whose column
+        // is one past the line typed so far (1 for a fresh question).
+        let col: String = tail
+            .chars()
+            .skip_while(|c| *c != ';')
+            .skip(1)
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        let reply = format!(
+            "\x1b[{};{}R",
+            row.parse::<u16>().expect("a row"),
+            col.parse::<u16>().expect("a column")
+        );
         self.type_keys(reply.as_bytes());
     }
 
-    /// Answer the prompt, robustly: the confirmation and the key are sent in a
-    /// short loop, because the writer's confirmation of the enter frame is not
-    /// observable from outside the session and a reply that arrives before it is
-    /// (correctly) treated as typing. Repeating both is harmless — a key that does
-    /// not answer is typing — so the loop stops as soon as the leave is written.
+    /// Answer the prompt once, robustly.
+    ///
+    /// The reply to the position request may arrive before the writer confirms the
+    /// enter frame, in which case it is (correctly) read as typing and visibility
+    /// comes from the `CPR_WAIT` fallback instead. Sleeping past both, plus the settle
+    /// window the prompt ignores input for, makes the answer land on a line that is
+    /// certainly open — and a single shot, because repeating the letter would type it
+    /// twice and the line would no longer spell an answer.
     async fn answer_prompt(&mut self, key: u8) -> bool {
-        for _ in 0..40 {
-            self.answer_cpr();
-            // The guard's own 700 ms of quiet (R17) must pass between the reply
-            // (which is typing if it arrives after visibility) and the key.
-            tokio::time::sleep(Duration::from_millis(800)).await;
+        self.answer_cpr();
+        tokio::time::sleep(CPR_WAIT + SETTLE_MS + Duration::from_millis(100)).await;
+        {
+            // The letter and the Enter are separate writes so each arrives as its own
+            // read (a read of several bytes clears the line instead of typing — see
+            // the guard).
             self.type_keys(&[key]);
-            let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            self.type_keys(b"\r");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
             while tokio::time::Instant::now() < deadline {
                 self.pump();
                 // A main-screen guest leaves with `?1049l`; an alternate-screen guest
@@ -517,8 +538,11 @@ async fn output_arriving_while_the_leave_is_unconfirmed_reaches_the_terminal() {
     let held = vec![b'H'; 64 * 1024];
     harness.send(ExecEvent::Stdout(held.clone().into()));
     harness.answer_cpr();
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    // Past the reply, the CPR fallback and the settle window: the line is open.
+    tokio::time::sleep(CPR_WAIT + SETTLE_MS + Duration::from_millis(100)).await;
     harness.type_keys(b"d");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    harness.type_keys(b"\r");
     // The prompt is closing; the leave is queued but the stalled terminal has not
     // accepted it. This frame arrives in exactly that window.
     let late = b"LATE-AFTER-LEAVE".to_vec();
@@ -980,14 +1004,16 @@ async fn p_on_the_project_next_launch_offer_writes_the_record_and_shows_the_resu
     assert!(
         !harness
             .seen
-            .windows(9)
-            .any(|window| window == b"  s  allow"),
+            .windows(24)
+            .any(|window| window == b"  s session  allow for"),
         "`s` must not be offered"
     );
-    // Answer `p` once the guard is satisfied.
+    // Answer `p` (and press Enter) once the question is visible and settled.
     harness.answer_cpr();
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    tokio::time::sleep(CPR_WAIT + SETTLE_MS + Duration::from_millis(100)).await;
     harness.type_keys(b"p");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    harness.type_keys(b"\r");
     assert!(
         harness.wait_for(b"recorded").await,
         "the result sentence must be drawn: {:?}",
@@ -1011,10 +1037,10 @@ async fn p_on_the_project_next_launch_offer_writes_the_record_and_shows_the_resu
 }
 
 #[tokio::test]
-async fn one_cursor_reply_then_a_quiet_key_answers_on_the_real_loop() {
+async fn one_cursor_reply_then_a_typed_line_answers_on_the_real_loop() {
     // The driver's shape: answer the enter frame's request **once**, wait for the
-    // ready line to be the latest status, then type one key. A driver that answered
-    // repeatedly would manufacture host input and the guard would never settle (H15).
+    // question to be drawn, then type the answer and press Enter. A driver that
+    // answered repeatedly would manufacture host input (H15).
     let mut harness = Harness::new();
     let root = tempfile::tempdir().unwrap();
     let source = harness.source(&root);
@@ -1039,30 +1065,25 @@ async fn one_cursor_reply_then_a_quiet_key_answers_on_the_real_loop() {
     harness.refuse();
     assert!(
         harness
-            .wait_for(b"the sandbox refused a network request")
+            .wait_for(b"Type one of the below letters and press enter:")
             .await
     );
-    // Exactly one reply to the one request, as a terminal sends it.
+    // Exactly one reply to the one request, as a terminal sends it. Input is ignored
+    // for the settle window after the question becomes readable.
     harness.answer_cpr();
-    // "ready" must become the latest status within the guard's window.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        harness.pump();
-        let text = String::from_utf8_lossy(&harness.seen).into_owned();
-        let ready = text.rfind("ready for your answer");
-        let stop = text.rfind("stop typing to answer");
-        if ready.is_some() && ready > stop {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the ready line never became the latest status: {:?}",
-            &text[text.len().saturating_sub(400)..]
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    // One quiet key answers.
+    tokio::time::sleep(SETTLE_MS + Duration::from_millis(100)).await;
+    // A letter alone does nothing; the line submits on Enter.
     harness.type_keys(b"d");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    harness.pump();
+    assert!(
+        !harness
+            .seen
+            .windows(8)
+            .any(|window| window == b"\x1b[?1049l"),
+        "a letter alone must not answer the question"
+    );
+    harness.type_keys(b"\r");
     assert!(harness.wait_for(b"\x1b[?1049l").await, "the leave restores");
     harness.send(ExecEvent::Exited { code: 0 });
     let _ = tokio::time::timeout(Duration::from_secs(10), session)
@@ -1071,12 +1092,10 @@ async fn one_cursor_reply_then_a_quiet_key_answers_on_the_real_loop() {
 }
 
 #[tokio::test]
-async fn a_reply_that_arrives_before_the_enter_is_confirmed_still_reaches_ready() {
+async fn a_reply_that_arrives_before_the_enter_is_confirmed_still_reaches_visibility() {
     // The other order a real terminal can produce: the reply is read while the enter
-    // is still unconfirmed, so it is typing (no visibility confirmation yet). The
-    // question must still become visible (the 1 s fallback) and draw "ready" — a
-    // driver that waited for "ready" before answering would deadlock, which is why the
-    // one-shot rule is about *how many* replies, not when the first lands.
+    // is still unconfirmed, so it is not the confirmation. The question must still
+    // become visible (the 1 s fallback), and a typed line then answers.
     let mut harness = Harness::new();
     let root = tempfile::tempdir().unwrap();
     let source = harness.source(&root);
@@ -1113,24 +1132,12 @@ async fn a_reply_that_arrives_before_the_enter_is_confirmed_still_reaches_ready(
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     harness.answer_cpr();
-    // The fallback (1 s) plus the guard (0.7 s) must bring "ready" as the latest line.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
-    loop {
-        harness.pump();
-        let text = String::from_utf8_lossy(&harness.seen).into_owned();
-        let ready = text.rfind("ready for your answer");
-        let stop = text.rfind("stop typing to answer");
-        if ready.is_some() && ready > stop {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the ready line never became the latest status: {:?}",
-            &text[text.len().saturating_sub(400)..]
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    // The 1 s fallback makes the question visible, and the settle window follows it;
+    // the line then answers on Enter.
+    tokio::time::sleep(Duration::from_millis(1500) + SETTLE_MS).await;
     harness.type_keys(b"d");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    harness.type_keys(b"\r");
     assert!(harness.wait_for(b"\x1b[?1049l").await, "the leave restores");
     harness.send(ExecEvent::Exited { code: 0 });
     let _ = tokio::time::timeout(Duration::from_secs(10), session)

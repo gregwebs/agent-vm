@@ -386,7 +386,7 @@ const ALT_PRELUDE: &[u8] = b"\x1b[?1049h\x1b[?2004h\x1b[?1002h\x1b[?6h\x1b(0";
 fn view() -> screen::View {
     screen::View {
         destination: screen::Cell::from_table("tcp 203.0.113.10:443".to_owned()),
-        guest_named: false,
+        typed: "s".to_owned(),
         count: 1,
         session: "3f9a12c4".to_owned(),
         offer: screen::OfferText::SessionOrProject,

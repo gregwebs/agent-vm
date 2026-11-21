@@ -104,7 +104,6 @@ fn the_timings_are_the_documented_ones() {
     assert_eq!(timings.prompt_timeout, relay::PROMPT_TIMEOUT);
     assert_eq!(timings.result_linger, relay::RESULT_LINGER);
     assert_eq!(timings.release_gap, relay::RELEASE_GAP);
-    assert_eq!(timings.typing_quiet.as_millis(), 700);
     assert_eq!(PROMPT_GRANT_WAIT.as_secs(), 40);
     assert_eq!(relay::CUT_DEADLINE.as_millis(), 500);
     assert_eq!(relay::CPR_WAIT.as_secs(), 1);
@@ -191,7 +190,6 @@ fn a_grantable_unanswered_refusal_becomes_a_candidate() {
     );
     assert_eq!(candidate.offer, crate::allowances::Offer::SessionOrProject);
     assert_eq!(candidate.port, Some(443));
-    assert!(!candidate.guest_named, "an address is not a guest name");
     assert_eq!(candidate.cell.as_str(), entry.destination_cell());
 
     // A policy lock, a credential refusal and a plain-HTTP hostname never prompt.
@@ -264,12 +262,11 @@ async fn a_lagged_answers_channel_closes_only_what_was_actually_answered() {
     prompt.written(g, now);
     let laid =
         crate::access_prompt::screen::layout(&prompt.relay.current_view(), size).expect("fits");
-    let reply = format!("\x1b[{};3R", laid.status_row() + 1);
+    let reply = format!("\x1b[{};{}R", laid.input_row() + 1, laid.cursor_col());
     prompt.host_input(
         relay::HostChunk {
             bytes: reply.into_bytes(),
             epoch: 1,
-            read_at: now,
         },
         now,
     );

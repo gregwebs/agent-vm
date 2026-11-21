@@ -45,7 +45,7 @@ A pure predicate that cannot be verified usually cannot be verified because it d
 | `http::header_block_end` / `is_token_bytes` / `has_no_crlf` | `Request::parse` — `anyhow` context, `String`/`Vec` assembly, `str::from_utf8` |
 | `dns_name::ldh_host_bytes` / `egress_hostname::egress_hostname_bytes` / `hostname_scope` | `HostnameAllowance::from_target` — ASCII/one-trailing-dot canonicalization, the `host.microsandbox.internal` comparison and `DomainName::from_str`; `domain_rules` unions intercepted ports and emits one `[Tcp]` `Domain` rule per distinct name |
 
-| `access_prompt::guard::answer_of` | `access_prompt::relay::Relay::host_input` — the epoch comparison, `Instant` arithmetic into `quiet_ms`, and the offered-scope lookup. **#501 slice 3's answer decision:** only a single-byte read, started after the prompt's input flush, 0.7 s quiet and not inside a paste can answer, and then only `s`/`p`/`n`/`d`/Enter/Esc/Ctrl-C. Load-bearing because this is the one decision that can grant something by accident. |
+| `access_prompt::guard::line_step` / `answer_of` | `access_prompt::relay::Relay::host_input` and `Relay::edit_line` — the epoch comparison, the paste/`continued` flags, the line buffer and the offered-scope lookup. **#501 slice 3's answer decision:** only a single-byte read, started after the prompt's input flush and not inside a paste or an escape sequence, may type, erase, submit or deny; anything else clears the line. A submit is Enter, and the line then answers only as `s`/`session`, `p`/`project`, `d`/`deny`, `n`/`never` or empty. Load-bearing because this is the one decision that can grant something by accident. |
 | `access_prompt::guard::may_hold` / `held_after` / `may_queue` | the relay's `Vec` bookkeeping: the hold stays under 256 KiB and one more SDK event (bounded to `4 MiB − 1 KiB` by the negotiated chunk size, cited not proved) cannot overflow it; at most 8 destinations wait. |
 | `access_prompt::vt::next` (with `escape_step` / `ground_step`) | `VtState::advance` — the bounded CSI collector, the designations and shifts, and the `GuestModes` DECSTR/RIS/cursor-save rules. **#501 slice 3's safe-boundary parser:** total over the VT500 subset, and `CAN`/`SUB` return to `Ground` from every state, which is what makes the forced cut mean "the terminal is between sequences now". |
 | `direct_pty::ledger::admit` | `writer_loop` — the lock, the writes, and clearing `owed` only after a complete `Leave` (pinned by the byte-prefix sweep and the tmux oracle, not proved). **#501 slice 3's terminal ownership:** `Data` always while running, `Enter` only when nothing owns the terminal, `Redraw`/`Leave` only for the owning generation, nothing after the writer stops. |
@@ -163,10 +163,12 @@ structs/enums (`KnowledgeFacts`, `ClaimFacts`, `SequenceReservation`).
 parse kernel alone). The four new kernels are `guard::answer_of`,
 `guard::may_hold`/`held_after`/`may_queue`, `vt::next` (with `escape_step`/
 `ground_step` as its proved mirrors and `run`/`last_ground` as spec functions) and
-`ledger::admit`, with the verified `KeyFacts`/`Answer` and
+`ledger::admit`, with the verified `LineFacts`/`Answer` and
 `Frame`/`WriterState`/`Admit` enums and the
-`HELD_OUTPUT_BYTES`/`MAX_WAITING`/`TYPING_QUIET_MS`/`MAX_SDK_EVENT_BYTES`
-constants. `access_prompt::last_safe_cut` is deliberately not proved: see
+`HELD_OUTPUT_BYTES`/`MAX_WAITING`/`MAX_SDK_EVENT_BYTES` constants.
+**Measured for #501 slice 3's answer-line follow-up: 327 verified, 0 errors**
+(283 before it): `guard::line_step` joins `answer_of`, and `KeyFacts` and
+`TYPING_QUIET_MS` are gone with the typing guard. `access_prompt::last_safe_cut` is deliberately not proved: see
 [ADR-0069](0069-in-terminal-access-prompt.md)'s recorded deviation. The pre-change
 baseline for this branch could not be measured in its worktree, whose vendored
 `microsandbox` submodule is a populated working tree but not an initialised

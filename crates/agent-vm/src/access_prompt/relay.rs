@@ -1,5 +1,5 @@
 //! The takeover lifecycle, sans I/O (§6.2): phases, the hold, the queue, the
-//! typing guard's use and the frames it asks the writer to write.
+//! answer line's use and the frames it asks the writer to write.
 //!
 //! Everything here is synchronous and takes an `Instant`, so a test drives exact
 //! timelines and the session loop's branches stay thin. The relay never writes, never
@@ -23,7 +23,7 @@
 //!
 //! Showing the next queued question without releasing the terminal let a
 //! replenished queue hold it indefinitely (the first review's finding 8). Each
-//! question now gets its own takeover, its own typing guard and its own 2 s of
+//! question now gets its own takeover, its own answer line and its own 2 s of
 //! guest time.
 
 use std::collections::VecDeque;
@@ -31,7 +31,7 @@ use std::collections::VecDeque;
 use tokio::time::Instant;
 
 use crate::access_prompt::Size;
-use crate::access_prompt::guard::{self, Answer, KeyFacts};
+use crate::access_prompt::guard::{self, Answer};
 use crate::access_prompt::input::{InputScan, Position};
 use crate::access_prompt::screen::{self, OfferText, ResultView, Status, View};
 use crate::access_prompt::vt::{RestorableModes, Screen, VtState};
@@ -45,7 +45,6 @@ pub(crate) struct Candidate {
     pub(crate) entry_id: String,
     pub(crate) destination: Allowance,
     pub(crate) cell: screen::Cell,
-    pub(crate) guest_named: bool,
     pub(crate) count: u64,
     pub(crate) offer: Offer,
     /// The port the destination names, for the #491 label.
@@ -58,7 +57,6 @@ pub(crate) struct Item {
     pub(crate) entry_id: String,
     pub(crate) destination: Allowance,
     pub(crate) cell: screen::Cell,
-    pub(crate) guest_named: bool,
     pub(crate) count: u64,
     pub(crate) offer: Offer,
     pub(crate) port: Option<u16>,
@@ -70,7 +68,6 @@ impl Item {
             entry_id: candidate.entry_id,
             destination: candidate.destination,
             cell: candidate.cell,
-            guest_named: candidate.guest_named,
             count: candidate.count,
             offer: candidate.offer,
             port: candidate.port,
@@ -80,7 +77,8 @@ impl Item {
     pub(super) fn view(&self, session: &str, waiting: u64, overflow: u64) -> View {
         View {
             destination: self.cell.clone(),
-            guest_named: self.guest_named,
+            // The question's own line, filled in by the relay (`current_view`).
+            typed: String::new(),
             count: self.count,
             session: session.to_owned(),
             offer: match self.offer {
@@ -140,13 +138,13 @@ pub(crate) enum InputRoute {
     Consumed,
 }
 
-/// One host read, with the two stamps the guard needs: `epoch` is taken
-/// **before** `read(2)`, `read_at` after it returns.
+/// One host read, with the stamp the guard needs: `epoch` is taken **before**
+/// `read(2)`, so a read that began after the visibility flush is the only one that
+/// may act on the line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HostChunk {
     pub(crate) bytes: Vec<u8>,
     pub(crate) epoch: u64,
-    pub(crate) read_at: Instant,
 }
 
 /// How long a question waits before it is refused (R18) — and how long an queued
@@ -160,6 +158,11 @@ pub(crate) const RELEASE_GAP: std::time::Duration = std::time::Duration::from_se
 pub(crate) const CUT_DEADLINE: std::time::Duration = std::time::Duration::from_millis(500);
 /// How long the terminal has to confirm it drew the prompt (R17, §4.4).
 pub(crate) const CPR_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+/// How long after the question becomes readable its input is ignored. The operator
+/// may have been typing at the guest when the question appeared; the tail of that
+/// typing must not become an answer, and reading the question always takes longer
+/// than this.
+pub(crate) const SETTLE_MS: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Every duration the relay uses, so a test can shrink them and the production
 /// values live in one value.
@@ -167,7 +170,7 @@ pub(crate) const CPR_WAIT: std::time::Duration = std::time::Duration::from_secs(
 pub(crate) struct Timings {
     pub(crate) cut: std::time::Duration,
     pub(crate) cpr_wait: std::time::Duration,
-    pub(crate) typing_quiet: std::time::Duration,
+    pub(crate) settle: std::time::Duration,
     pub(crate) prompt_timeout: std::time::Duration,
     pub(crate) result_linger: std::time::Duration,
     pub(crate) release_gap: std::time::Duration,
@@ -178,7 +181,7 @@ impl Default for Timings {
         Self {
             cut: CUT_DEADLINE,
             cpr_wait: CPR_WAIT,
-            typing_quiet: std::time::Duration::from_millis(guard::TYPING_QUIET_MS),
+            settle: SETTLE_MS,
             prompt_timeout: PROMPT_TIMEOUT,
             result_linger: RESULT_LINGER,
             release_gap: RELEASE_GAP,
@@ -225,7 +228,6 @@ enum Phase {
         visible_at: Instant,
         /// The reader's read-start counter at the flush that followed visibility.
         visible_epoch: Option<u64>,
-        ready_shown: bool,
     },
     Granting {
         g: u64,
@@ -282,7 +284,9 @@ pub(crate) struct Relay {
     outbound: VecDeque<Outbound>,
     size: Size,
     session: String,
-    last_input: Option<Instant>,
+    /// The line the operator has typed for the question on screen. Enter submits it;
+    /// a read that is not one clean key stroke clears it (see [`super::guard`]).
+    answer_line: String,
     input_open: bool,
     /// §4.4: `false` after one request went unanswered, so the session stops asking.
     cpr_answers: bool,
@@ -344,10 +348,10 @@ impl Relay {
             outbound: VecDeque::new(),
             size,
             session,
-            last_input: None,
+            answer_line: String::new(),
             input_open: true,
             cpr_answers: true,
-            status: Status::StopTyping,
+            status: Status::Asking,
             result: None,
             linger_started: false,
             asked_position: None,
@@ -446,51 +450,41 @@ impl Relay {
             self.become_visible(now);
             return InputRoute::Consumed;
         }
-        // The quiet time is measured against the input *before* this read; every
-        // host read during a takeover then restarts the guard, whatever the scan
-        // made of it (a lone Esc, an arrow key, a paste marker, an unrecognised
-        // sequence). The one exception is the reply that made the prompt visible,
-        // which returned above: it is the terminal's, not the user's (R17).
-        let quiet = match self.phase {
-            Phase::Asking { visible_at, .. } => self.quiet_ms(chunk.read_at, visible_at),
-            _ => 0,
-        };
+        // Answering is a line, not a keystroke: one clean key stroke edits it, Enter
+        // submits it, and anything else clears it (§4.4). Reads that started before
+        // the flush cannot type, submit or deny either — the guard says so, and its
+        // `Clear` is the only thing they can do.
         let answer = match self.phase.clone() {
             Phase::Asking {
                 g,
+                visible_at,
                 visible_epoch,
-                ready_shown,
-                ..
             } => {
-                let answer = guard::answer_of(KeyFacts {
+                let step = guard::line_step(guard::LineFacts {
                     chunk_len: chunk.bytes.len(),
                     byte: chunk.bytes[0],
+                    too_soon: now < visible_at + self.timings.settle,
                     read_after_visible: visible_epoch.is_some_and(|epoch| chunk.epoch > epoch),
-                    quiet_ms: quiet,
                     // A read that continues a sequence from an earlier read is never
-                    // an answer, even when it is the single byte `s`.
-                    in_paste: scan.in_paste || scan.continued,
-                    session_offered: self
-                        .shown
-                        .as_ref()
-                        .is_some_and(|item| item.offer == Offer::SessionOrProject),
+                    // one of the operator's keys, even when it is a single letter.
+                    continued: scan.continued,
+                    in_paste: scan.in_paste,
                 });
-                match answer {
-                    Some(answer) => Some((g, answer)),
-                    None => {
-                        if ready_shown
-                            && self.redraw_status(Status::StopTyping)
-                            && let Phase::Asking { ready_shown, .. } = &mut self.phase
-                        {
-                            *ready_shown = false;
-                        }
-                        None
-                    }
+                self.edit_line(step);
+                match step {
+                    guard::LineStep::Submit => guard::answer_of(
+                        self.answer_line.as_bytes(),
+                        self.shown
+                            .as_ref()
+                            .is_some_and(|item| item.offer == Offer::SessionOrProject),
+                    )
+                    .map(|answer| (g, answer)),
+                    guard::LineStep::Deny => Some((g, Answer::Refuse)),
+                    _ => None,
                 }
             }
             _ => None,
         };
-        self.last_input = Some(chunk.read_at);
         self.unanswered_in_a_row = 0;
         if let Some((g, answer)) = answer {
             self.answer(g, answer);
@@ -505,15 +499,32 @@ impl Relay {
         }
     }
 
-    fn quiet_ms(&self, read_at: Instant, visible_at: Instant) -> u64 {
-        let since = self
-            .last_input
-            .map_or(visible_at, |last| last.max(visible_at));
-        read_at
-            .saturating_duration_since(since)
-            .as_millis()
-            .try_into()
-            .unwrap_or(u64::MAX)
+    /// Apply one read to the typed line, redrawing the input row when the line
+    /// changed. The question itself never closes here: an unrecognised line does
+    /// nothing at all, and Enter on one does nothing either.
+    fn edit_line(&mut self, step: guard::LineStep) {
+        match step {
+            guard::LineStep::Typed(letter) => {
+                if self.answer_line.len() >= guard::MAX_ANSWER_CHARS {
+                    return;
+                }
+                self.answer_line.push(char::from(letter));
+                self.redraw_status(self.status);
+            }
+            guard::LineStep::Erase => {
+                if self.answer_line.pop().is_none() {
+                    return;
+                }
+                self.redraw_status(self.status);
+            }
+            guard::LineStep::Clear => {
+                if !self.answer_line.is_empty() {
+                    self.answer_line.clear();
+                    self.redraw_status(self.status);
+                }
+            }
+            guard::LineStep::Submit | guard::LineStep::Deny | guard::LineStep::Ignore => {}
+        }
     }
 
     fn become_visible(&mut self, now: Instant) {
@@ -533,10 +544,28 @@ impl Relay {
                 g,
                 visible_at: now,
                 visible_epoch: None,
-                ready_shown: false,
             };
+            self.status = Status::Asking;
             self.flush_pending = true;
             self.unanswered_in_a_row = 0;
+        }
+    }
+
+    /// The operator answered the question, which is exactly what the once-per-session
+    /// hint line exists to say. One notice, not two: the question wins, so the hint
+    /// is claimed rather than printed under the answer (an `s` followed by "the
+    /// sandbox refused a guest network request" reads as if the refusal stuck).
+    /// Claiming also tells the facade to stop waiting for a hint that will never
+    /// come, and covers the reverse order — a hint fired after the claim.
+    ///
+    /// Answering, not visibility: a question that is drawn and withdrawn within
+    /// milliseconds (the guest exited) was never readable, and the hint is then the
+    /// only notice the operator ever gets.
+    fn claim_hint(&mut self) {
+        self.hint_done = true;
+        self.hint_pending = false;
+        if let Some(hint) = &self.hint {
+            hint.claim();
         }
     }
 
@@ -544,6 +573,7 @@ impl Relay {
         let Some(item) = self.shown.clone() else {
             return;
         };
+        self.claim_hint();
         match answer {
             Answer::Session | Answer::Project => {
                 let scope = match answer {
@@ -659,7 +689,11 @@ impl Relay {
             return;
         };
         let _ = hint;
-        if !self.phase.owns_terminal() && self.vt.at_safe_boundary() {
+        // Only with no question in flight. A hint written while a takeover is being
+        // prepared lands on the main screen, which the leave restores — so it would
+        // appear *under* the operator's answer, the very thing the claim prevents.
+        // `written` retries this when the leave returns the relay to `Idle`.
+        if matches!(self.phase, Phase::Idle { .. }) && self.vt.at_safe_boundary() {
             // Queue it exactly once, as its own frame. It is marked written only when
             // the writer accepts it; a frame queued and then discarded by a forced
             // end still belongs to stderr, and the epilogue prints it.
@@ -776,11 +810,13 @@ impl Relay {
         {
             return;
         }
-        // The head becomes the question. Whether it can be asked is decided at the
-        // cut, where the tracker has seen everything `Cutting` forwards (R9–R12).
+        // The head becomes the question, with an empty line. Whether it can be asked
+        // is decided at the cut, where the tracker has seen everything `Cutting`
+        // forwards (R9–R12).
         let Some(item) = self.waiting.pop_front() else {
             return;
         };
+        self.answer_line.clear();
         self.generation += 1;
         let g = self.generation;
         self.shown = Some(item);
@@ -793,18 +829,20 @@ impl Relay {
 
     pub(super) fn current_view(&self) -> View {
         let waiting = self.waiting.len() as u64;
-        match &self.shown {
+        let mut view = match &self.shown {
             Some(item) => item.view(&self.session, waiting, self.overflowed.len() as u64),
             None => View {
                 destination: screen::Cell::from_guest(""),
-                guest_named: false,
+                typed: String::new(),
                 count: 0,
                 session: self.session.clone(),
                 offer: OfferText::SessionOrProject,
                 waiting,
                 overflow: self.overflowed.len() as u64,
             },
-        }
+        };
+        view.typed = self.answer_line.clone();
+        view
     }
 
     /// Decline the takeover at the cut: the held bytes are the guest's and go out
@@ -822,7 +860,8 @@ impl Relay {
         self.screen = None;
         self.result = None;
         self.linger_started = false;
-        self.status = Status::StopTyping;
+        self.status = Status::Asking;
+        self.answer_line.clear();
         self.asked_position = None;
         self.phase = Phase::Idle {
             released_at: Some(now),
@@ -855,13 +894,10 @@ impl Relay {
         }
         self.screen = Some(modes);
         let (bytes, _) = screen::enter(&modes, &laid, forced_cut, self.cpr_answers);
-        // A hint that fired as the takeover was wanted goes first (R26) — but never
-        // before a forced cut's `CAN`, which is the byte that ends the guest's stalled
-        // sequence. Queued before it, the hint would be drawn as that sequence's
-        // final bytes and lost; the leave's confirmation sends it (finding 9).
-        if !forced_cut {
-            self.emit_hint_if_due();
-        }
+        // No hint here: one that fired while the takeover was wanted waits for the
+        // question's outcome. Written now it would land on the main screen and be
+        // restored under the answer; if the question is withdrawn unread, the leave's
+        // confirmation sends it (see `claim_hint`).
         self.outbound
             .push_back(Outbound::Frame(OutputItem::Takeover {
                 generation: g,
@@ -872,11 +908,11 @@ impl Relay {
             }));
         self.result = None;
         self.linger_started = false;
-        self.status = Status::StopTyping;
+        self.status = Status::Asking;
         self.asked_position = if self.cpr_answers {
             Some(Position {
-                row: (laid.status_row() + 1) as u16,
-                col: 3,
+                row: (laid.input_row() + 1) as u16,
+                col: laid.cursor_col() as u16,
             })
         } else {
             None
@@ -1072,7 +1108,7 @@ impl Relay {
         }
         self.result = None;
         self.linger_started = false;
-        self.status = Status::StopTyping;
+        self.status = Status::Asking;
         self.asked_position = None;
         self.phase = Phase::Restoring { g };
     }
@@ -1144,36 +1180,13 @@ impl Relay {
             } => Some(
                 (*written_at + self.timings.cpr_wait).min(*queued_at + self.timings.prompt_timeout),
             ),
-            Phase::Asking {
-                visible_at,
-                ready_shown,
-                ..
-            } => {
-                let timeout = *visible_at + self.timings.prompt_timeout;
-                Some(if *ready_shown {
-                    timeout
-                } else {
-                    timeout.min(self.ready_at())
-                })
-            }
+            Phase::Asking { visible_at, .. } => Some(*visible_at + self.timings.prompt_timeout),
             // A `Lingering` whose result frame has not been accepted yet still has the
             // deadline `granted` set; one with none (defensively) fires now.
             Phase::Lingering { until, .. } => Some(until.unwrap_or_else(Instant::now)),
             // `Granting` is bounded by the session loop's slot; `Restoring` by the
             // writer's confirmation.
             _ => None,
-        }
-    }
-
-    fn ready_at(&self) -> Instant {
-        match self.phase {
-            Phase::Asking { visible_at, .. } => {
-                let since = self
-                    .last_input
-                    .map_or(visible_at, |last| last.max(visible_at));
-                since + self.timings.typing_quiet
-            }
-            _ => Instant::now(),
         }
     }
 
@@ -1212,21 +1225,10 @@ impl Relay {
                     self.become_visible(now);
                 }
             }
-            Phase::Asking {
-                visible_at,
-                ready_shown,
-                ..
-            } => {
+            Phase::Asking { visible_at, .. } => {
                 if now >= visible_at + self.timings.prompt_timeout {
                     self.unanswered_in_a_row = self.unanswered_in_a_row.saturating_add(1);
                     self.close(Close::TimedOut);
-                } else if !ready_shown && now >= self.ready_at() {
-                    // Only a *drawn* "ready" counts as shown (M2/N2).
-                    if self.redraw_status(Status::Ready)
-                        && let Phase::Asking { ready_shown, .. } = &mut self.phase
-                    {
-                        *ready_shown = true;
-                    }
                 }
             }
             Phase::Lingering { g, until } if until.is_none_or(|until| now >= until) => {
