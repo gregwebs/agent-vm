@@ -51,23 +51,46 @@ _probe_read_line() {
 # status 124 for a run that hit the deadline, which is what the callers map to a
 # network failure.
 _probe_timeout() {
-    local seconds="$1" rc=0 child watchdog
+    local seconds="$1" rc=0 child watchdog monitor=0
     shift
     if command -v timeout >/dev/null 2>&1; then
         timeout --kill-after=1 "$seconds" "$@"
         return
     fi
+    # Job control stands in for what `timeout` does with the group it puts the
+    # command in: the worker gets a group of its own, so the deadline can signal
+    # its whole subtree. Signalling only the worker left its children running, and
+    # a survivor holds the caller's stdout open -- `_probe_timeout 2 sh -c 'printf
+    # partial; sleep 30' | cat` took 30 s.
+    [[ -o monitor ]] && monitor=1
+    set -m
     # `0<&0` is load-bearing, not decoration: bash gives an asynchronous command
     # /dev/null for stdin unless that command carries an explicit redirection, and
     # this one is a socket read at several call sites. Without it the ack and
     # frame reads see EOF and the wire controls fail with an empty reply.
     "$@" 0<&0 &
     child=$!
-    ( sleep "$seconds"; kill -TERM "$child" 2>/dev/null; sleep 1; kill -KILL "$child" 2>/dev/null ) &
+    (( monitor )) || set +m
+    # The watchdog stays in the *caller's* group, so whoever kills the caller
+    # kills it too; only its own `sleep` needs taking down with it, and it blocks
+    # in `wait` to stay interruptible. A shell blocked in a foreground `sleep`
+    # defers a TERM until that sleep ends, so the old `kill "$watchdog"` left the
+    # sleeper behind -- holding the caller's stdout open for the rest of the
+    # deadline (`_probe_timeout 3 true | cat` took 3014 ms). Its stdio goes to
+    # /dev/null because a watchdog only ever signals.
+    ( sleeper=
+      trap 'kill "$sleeper" 2>/dev/null; exit 0' TERM
+      sleep "$seconds" & sleeper=$!
+      wait "$sleeper" 2>/dev/null
+      kill -TERM -"$child" 2>/dev/null
+      sleep 1 & sleeper=$!
+      wait "$sleeper" 2>/dev/null
+      kill -KILL -"$child" 2>/dev/null ) >/dev/null 2>&1 &
     watchdog=$!
     wait "$child" 2>/dev/null || rc=$?
-    kill "$watchdog" 2>/dev/null
+    kill -TERM "$watchdog" 2>/dev/null
     wait "$watchdog" 2>/dev/null || true
+    (( monitor )) && set -m
     if [[ "$rc" -eq 143 ]]; then
         rc=124
     fi
