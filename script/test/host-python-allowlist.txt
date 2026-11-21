@@ -61,20 +61,15 @@ script/test/lib/egress-hostname-fixtures.py
 # three `python3` sites and the live wrapper's one are gone with the library, so
 # this section has no entry left to keep.
 
-# --- Migration debt: ptys, direct terminal, e2e inline helpers -------------
-# The stand-in's only callers are direct-terminal.py and
-# direct-terminal-contract.py, so it stays until #699 ports them: bottom-up rule.
-# `harness launcher-standin` is its port, and `harness detached-run` replaced
-# lib/detached-run.py, which is gone.
-script/test/fixtures/direct-terminal/launcher-standin.py
-script/test/lib/direct-terminal.py
-script/test/lib/direct-terminal-contract.py
-script/test/e2e.sh 15
-# Runs every suite above, so it names Python until they are ported. The direct
-# terminal contract still needs python3 until #699 ports it; the detach shim it
-# runs is `harness detached-run` now, and the mutation-anchor check it runs is
-# `harness egress-mutations --check-anchors` (#695).
-script/test/ci-contracts.sh 1
+# --- Migration debt: e2e inline helpers -----------------------------------
+# #699 deleted `lib/direct-terminal.py`, `lib/direct-terminal-contract.py` and the
+# Python stand-in it drove: the driver is `harness direct-terminal`, its controls
+# are `harness direct-terminal --self-test`, the stand-in is `harness
+# launcher-standin` (#698), and the detach shim is `harness detached-run`. That is
+# also what took this file's other two callers off Python -- `ci-contracts.sh` runs
+# `detached-run direct-terminal --self-test` now, and the e2e row below is the only
+# one left. What remains here is e2e.sh's own inline helpers, which #700 ports.
+script/test/e2e.sh 14
 
 # --- Fixture stub names, not invocations -----------------------------------
 # This harness check writes a deliberately broken `python3` onto a scratch PATH

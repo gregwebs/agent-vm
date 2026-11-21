@@ -2904,14 +2904,14 @@ terminal_evidence_root() {
 #
 # The driver refuses to run with one (a copied terminal would make its own PTY
 # observation meaningless), so the wrapper detaches it here instead of requiring
-# an undisclosed invocation environment. The wrapper is `harness detached-run`
-# (#698): a session leader with no controlling terminal and /dev/null stdin.
+# an undisclosed invocation environment. Both halves are the same binary now: the
+# wrapper is `harness detached-run` (#698) and the driver is `harness
+# direct-terminal` (#699).
 terminal_driver() {
   "${CUSTOM_ENV[@]}" PYTHONPATH= \
     DIRECT_TERMINAL_CASE_DEADLINE="${DIRECT_TERMINAL_CASE_DEADLINE:-240}" \
     DIRECT_TERMINAL_MARKER_DEADLINE="${DIRECT_TERMINAL_MARKER_DEADLINE:-60}" \
-    "$HARNESS" detached-run \
-    python3 "$REPO_ROOT/script/test/lib/direct-terminal.py" "$@"
+    "$HARNESS" detached-run "$HARNESS" direct-terminal "$@"
 }
 
 # One driver invocation. `case`/`form` name the fixed inventory; the evidence

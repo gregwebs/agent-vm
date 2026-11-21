@@ -29,6 +29,7 @@ mod config_mounts;
 mod config_mounts_controls;
 mod cpu_commitment;
 mod detached_run;
+mod direct_terminal;
 mod egress_default_deny;
 mod egress_mutations;
 mod egress_probe;
@@ -66,6 +67,8 @@ enum Command {
     ConfigMountsControls(config_mounts_controls::ConfigMountsControlsArgs),
     /// Drive Phase 0 CPU-commitment selection and runtime-provenance manifests.
     CpuCommitment(cpu_commitment::CpuCommitmentArgs),
+    /// Run one direct-terminal case against a launcher and write its evidence.
+    DirectTerminal(direct_terminal::DirectTerminalArgs),
     /// Run one command in a session with no controlling terminal and no stdin.
     DetachedRun(detached_run::DetachedRunArgs),
     /// Serve the local egress fixtures, or ask them what they have seen.
@@ -112,6 +115,7 @@ impl Cli {
             Command::BuildArchiveOracle(_) => "build archive oracle",
             Command::ReleasedImageLaunch(_) => "released-image launch",
             Command::DetachedRun(_) => "detached-run",
+            Command::DirectTerminal(_) => "direct-terminal",
             Command::LauncherStandin(_) => "standin",
             Command::EgressFixtures(_) => "egress fixtures",
             Command::EgressProbe(_) => "egress probe",
@@ -147,6 +151,7 @@ pub fn run(cli: Cli) -> Result<Outcome, String> {
         }
         Command::CpuCommitment(args) => cpu_commitment::run(args).map(Outcome::Report),
         Command::DetachedRun(args) => detached_run::run(args),
+        Command::DirectTerminal(args) => direct_terminal::run(args),
         Command::EgressFixtures(args) => egress_fixtures::run(args),
         Command::EgressProbe(args) => egress_probe::run(args),
         Command::EgressMutations(args) => egress_mutations::run(args),
