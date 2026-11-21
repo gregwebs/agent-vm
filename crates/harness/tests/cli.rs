@@ -83,6 +83,57 @@ fn the_binary_runs_runtime_provenance_controls() {
     );
 }
 
+/// The persisted network's host-only probe group is shipped, not a library
+/// detail: `persisted-network-contract.sh` calls this subcommand, and a
+/// misconfigured `[[bin]]` would leave the shell suite calling nothing. The
+/// slower helper and live-shell groups run from that script, not here.
+#[test]
+fn the_binary_runs_the_persisted_network_probe_controls() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let output = Command::new(env!("CARGO_BIN_EXE_harness"))
+        .args([
+            "persisted-network-controls",
+            "--repo-root",
+            repo_root.to_str().expect("workspace path is UTF-8"),
+            "--only",
+            "probe",
+        ])
+        .output()
+        .expect("the harness binary runs the persisted-network probe controls");
+    assert!(
+        output.status.success(),
+        "persisted network probe controls failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("control output is UTF-8");
+    assert!(
+        stdout.ends_with("persisted network host-only controls PASS\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("probe guest PASS"),
+        "the guest probe control did not run: {stdout}"
+    );
+}
+
+/// The rows refuse misuse by name and status, before touching a scratch root:
+/// a driver that started with the wrong arity would look like a failing row.
+#[test]
+fn the_persisted_network_driver_refuses_misuse() {
+    let output = harness([
+        "persisted-network".to_owned(),
+        "--repo-root".to_owned(),
+        "/tmp".to_owned(),
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .starts_with("usage: persisted-network --repo-root DIR ROOT EVIDENCE BINARY IMAGE"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn the_binary_counts_utf8_bytes_and_unicode_scalar_values() {
     let output = Command::new(env!("CARGO_BIN_EXE_harness"))

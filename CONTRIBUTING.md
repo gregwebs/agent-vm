@@ -666,13 +666,14 @@ probe uses `egress-probe.sh::http_get` and serves `/r/marker` with exact
 **PN4-A/B/PN4c must pass or receive a written maintainer waiver before #305
 is complete.** Without that evidence a PR says “Part of #305”, not “Closes #305”.
 
-`bash script/test/persisted-network-contract.sh` dispatches to
-`script/test/lib/persisted-network-contract.py`, which exercises the write/probe
-snippets on a host-only stand-in and joins the shared diagnostic TSV to
-boot-free CLI tests, then runs the **actual** live shell against a harmless
-driver stub to prove acceptance, rejection, receipt-before-allocation, cleanup
-and status propagation (`build-provenance.py` unit controls plus P6–P10). It is
-in `ci-contracts.sh`; it is **not** guest-authorship or native enforcement
+`bash script/test/persisted-network-contract.sh` runs the host-only controls
+(`harness persisted-network-controls`): the write/probe snippets against a
+host-only stand-in, the shared diagnostic TSV held equal to the boot-free
+parser, and the **actual** live shell against a harmless driver stub proving
+acceptance, rejection, receipt-before-allocation, cleanup and status propagation
+(P1–P5 are `harness build-provenance --self-test`; P6–P10 are the live-shell
+group). The native rows are `harness persisted-network`. The script is in
+`ci-contracts.sh`; it is **not** guest-authorship or native enforcement
 evidence. CI checks the live script's syntax/lint only.
 See [ADR-0040](docs/adr/0040-persisted-user-network-authority.md).
 

@@ -36,6 +36,8 @@ mod image_pins;
 mod launch_argv_order;
 mod launcher_standin;
 mod msb_krun_compat;
+mod persisted_network;
+mod persisted_network_controls;
 mod pty;
 mod released_image_launch;
 
@@ -84,6 +86,10 @@ enum Command {
     LaunchArgvOrder(launch_argv_order::LaunchArgvOrderArgs),
     /// Run the msb-krun compatibility timeout driver.
     MsbKrunCompat(msb_krun_compat::MsbKrunCompatArgs),
+    /// Run the persisted-network native rows (the grant, probe and write rows).
+    PersistedNetwork(persisted_network::PersistedNetworkArgs),
+    /// Run the persisted-network host-only controls.
+    PersistedNetworkControls(persisted_network_controls::PersistedNetworkControlsArgs),
     /// Launch an installed released-image candidate in an owned, bounded process group.
     ReleasedImageLaunch(released_image_launch::ReleasedImageLaunchArgs),
 }
@@ -112,6 +118,8 @@ impl Cli {
             Command::EgressDefaultDeny(_) => "egress default deny",
             Command::EgressSupervisor(_) => "egress supervisor",
             Command::EgressMutations(_) => "egress mutations",
+            Command::PersistedNetwork(_) => "persisted network",
+            Command::PersistedNetworkControls(_) => "persisted network controls",
         }
     }
 }
@@ -148,6 +156,10 @@ pub fn run(cli: Cli) -> Result<Outcome, String> {
         Command::LauncherStandin(args) => launcher_standin::run(args),
         Command::LaunchArgvOrder(args) => launch_argv_order::run(args).map(Outcome::Report),
         Command::MsbKrunCompat(args) => msb_krun_compat::run(args).map(Outcome::Report),
+        Command::PersistedNetwork(args) => persisted_network::run(args).map(Outcome::Report),
+        Command::PersistedNetworkControls(args) => {
+            persisted_network_controls::run(args).map(Outcome::Report)
+        }
         Command::ReleasedImageLaunch(args) => released_image_launch::run(args),
     }
 }

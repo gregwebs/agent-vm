@@ -31,11 +31,6 @@ script/test/fixtures/egress-probe.sh 10
 profiling/build_legacy.sh 1
 profiling/build_variants.sh 1
 
-# --- Migration debt: build provenance ---------------------------------------
-# The persisted-network Python controls still import this checker; #696 removes
-# this final caller and then this entry.
-script/test/lib/build-provenance.py
-
 # --- Migration debt: released image launch ---------------------------------
 # The launch helper itself stays until its last importer
 # (script/test/lib/egress-fixtures.py) is ported: bottom-up rule, #692. Its
@@ -55,11 +50,10 @@ script/test/released-image-launch.py
 script/test/lib/egress-fixtures.py
 script/test/lib/egress-hostname-fixtures.py
 
-# --- Migration debt: persisted network -------------------------------------
-script/test/lib/persisted-network.py
-script/test/lib/persisted-network-contract.py
-script/test/lib/persisted-network.sh 1
-script/test/persisted-network-contract.sh 1
+# --- Persisted network: off the host (no entry) ----------------------------
+# #696 ported the rows to `harness persisted-network` and their boot-free half to
+# `harness persisted-network-controls`; the two `.py` files and the contract's
+# `python3` site are gone, so this section has no entry left to keep.
 
 # --- Config mounts: off the host (no entry) --------------------------------
 # #697 ported the last host Python here: the rows are `harness config-mounts`,
