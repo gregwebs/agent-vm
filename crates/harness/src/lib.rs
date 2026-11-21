@@ -29,6 +29,18 @@ mod config_mounts;
 mod config_mounts_controls;
 mod cpu_commitment;
 mod detached_run;
+// `e2e.sh`'s own inline helpers (#700): each one was a `python3` heredoc, and
+// each is a decision or a primitive the shell could only approximate (a JSON
+// prefix, an errno distinction, a byte-exact vector, a FIFO handshake, a socket
+// hold, a hash inventory, a registry push).
+mod e2e_cache_inventory;
+mod e2e_debug_json;
+mod e2e_direct_argv;
+mod e2e_pin_observer;
+mod e2e_registry_push;
+mod e2e_rss_standin;
+mod e2e_state;
+mod e2e_stdin_writer;
 mod egress_default_deny;
 mod egress_mutations;
 mod egress_probe;
@@ -40,6 +52,7 @@ mod persisted_network;
 mod persisted_network_controls;
 mod pty;
 mod released_image_launch;
+mod scratch;
 
 /// The `harness` commands. A port adds one variant, replacing a Python driver or
 /// a boot-free Python suite.
@@ -68,6 +81,22 @@ enum Command {
     CpuCommitment(cpu_commitment::CpuCommitmentArgs),
     /// Run one command in a session with no controlling terminal and no stdin.
     DetachedRun(detached_run::DetachedRunArgs),
+    /// Print the sandbox config a direct launch handed the SDK.
+    E2eDebugJson(e2e_debug_json::E2eDebugJsonArgs),
+    /// Compare a guest argv dump with the exact expected byte vector.
+    E2eDirectArgv(e2e_direct_argv::E2eDirectArgvArgs),
+    /// Observe the launcher's private state root: absent entries, HOME links.
+    E2eState(e2e_state::E2eStateArgs),
+    /// Hold a launch at a named pin stage while a row inspects it.
+    E2ePinObserver(e2e_pin_observer::E2ePinObserverArgs),
+    /// Hash the msb cache artifacts behind one retained image digest.
+    E2eCacheInventory(e2e_cache_inventory::E2eCacheInventoryArgs),
+    /// Publish an unbootable OCI candidate to a local registry.
+    E2eRegistryPush(e2e_registry_push::E2eRegistryPushArgs),
+    /// Buffer or stream stdin while a row measures the RSS of a real process.
+    E2eRssStandin(e2e_rss_standin::E2eRssStandinArgs),
+    /// Own a FIFO's write end for a direct launch's streamed stdin.
+    E2eStdinWriter(e2e_stdin_writer::E2eStdinWriterArgs),
     /// Serve the local egress fixtures, or ask them what they have seen.
     EgressFixtures(egress_fixtures::EgressFixturesArgs),
     /// Run the boot-free controls for the egress probe library and its driver.
@@ -112,6 +141,14 @@ impl Cli {
             Command::BuildArchiveOracle(_) => "build archive oracle",
             Command::ReleasedImageLaunch(_) => "released-image launch",
             Command::DetachedRun(_) => "detached-run",
+            Command::E2eDebugJson(_) => "e2e debug-json",
+            Command::E2eDirectArgv(_) => "e2e direct-argv",
+            Command::E2eState(_) => "e2e state",
+            Command::E2ePinObserver(_) => "e2e pin-observer",
+            Command::E2eCacheInventory(_) => "e2e cache-inventory",
+            Command::E2eRegistryPush(_) => "e2e registry-push",
+            Command::E2eRssStandin(_) => "e2e rss-standin",
+            Command::E2eStdinWriter(_) => "e2e stdin-writer",
             Command::LauncherStandin(_) => "standin",
             Command::EgressFixtures(_) => "egress fixtures",
             Command::EgressProbe(_) => "egress probe",
@@ -147,6 +184,14 @@ pub fn run(cli: Cli) -> Result<Outcome, String> {
         }
         Command::CpuCommitment(args) => cpu_commitment::run(args).map(Outcome::Report),
         Command::DetachedRun(args) => detached_run::run(args),
+        Command::E2eDebugJson(args) => e2e_debug_json::run(args).map(Outcome::Report),
+        Command::E2eDirectArgv(args) => e2e_direct_argv::run(args).map(Outcome::Report),
+        Command::E2eState(args) => e2e_state::run(args).map(Outcome::Report),
+        Command::E2ePinObserver(args) => e2e_pin_observer::run(args),
+        Command::E2eCacheInventory(args) => e2e_cache_inventory::run(args).map(Outcome::Report),
+        Command::E2eRegistryPush(args) => e2e_registry_push::run(args),
+        Command::E2eRssStandin(args) => e2e_rss_standin::run(args),
+        Command::E2eStdinWriter(args) => e2e_stdin_writer::run(args),
         Command::EgressFixtures(args) => egress_fixtures::run(args),
         Command::EgressProbe(args) => egress_probe::run(args),
         Command::EgressMutations(args) => egress_mutations::run(args),
