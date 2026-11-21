@@ -1133,7 +1133,7 @@ _case_refusal_feed() {
 # ADR-0066 PA2: one live allowance change, observed by the guest without a
 # restart.
 #
-# The guest owns the probes; the host witness (`egress-fixtures.py`) owns the
+# The guest owns the probes; the host witness (`harness egress-fixtures`) owns the
 # `agent-vm access` work between them. They coordinate in both directions, over
 # the two things the two processes share:
 #

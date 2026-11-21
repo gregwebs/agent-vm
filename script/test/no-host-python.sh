@@ -6,9 +6,11 @@
 #   * a `python`/`python3` call in a tracked `*.sh` or `*.rs`;
 #   * a reference to a `.py` file from a tracked `*.sh` or `*.rs`, which is how a
 #     script runs a Python program without naming the interpreter;
+#   * a `*.md` line that says the build or tests require host Python;
 #
-# unless host-python-allowlist.txt excuses it. A `.sh`/`.rs` entry carries the
-# number of occurrences it excuses, so the ledger records debt, not a veto: a new
+# unless host-python-allowlist.txt excuses it. The documentation rule has no
+# allowlist: a prerequisite claim is false, not debt. A `.sh`/`.rs` entry carries
+# the number of occurrences it excuses, so the ledger records debt, not a veto: a new
 # call in an already-listed file fails, and so does a count left too high after a
 # port. An entry that excuses nothing fails too.
 #
@@ -47,6 +49,12 @@ word_start='(:-|^|[^-_.[:alnum:]])'
 word_end='([^-_[:alnum:]]|$)'
 call_pattern="$word_start"'python[0-9]*(\.[0-9]+)*'"$word_end"
 py_file_pattern='[[:alnum:]_.-]+\.py'"$word_end"
+# A document must not tell a contributor to put Python on the host. This scan is
+# narrow on purpose: a line needs both a Python name and a requirement verb, and
+# must not negate them ("needs no `python3`" is the true statement this record
+# makes). Historical prose is written in the past tense instead.
+doc_claim='(require[sd]?|requiring|needs?|needing|must have|install(s|ed|ing)?|depend(s|ed|ing)? on|dependency on)[^.]*python[0-9]|python[0-9][^.]*(required|needed|mandatory)'
+doc_negation='(no|not|never|without)[^.]*python[0-9]'
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/av-no-host-python.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
@@ -143,4 +151,23 @@ done <"$WORK/findings"
 
 ((status == 0)) ||
     fail 'the tree needs Python the allowlist does not record (see ADR-0072 and script/test/host-python-allowlist.txt)'
+
+# Documentation is not allowlisted: a prerequisite claim has no debt to excuse,
+# it is simply false once the port is done.
+docs_require=0
+doc_status=0
+git -C "$ROOT" -c color.grep=never grep -n -i -E \
+    -e "$doc_claim" -- '*.md' >"$WORK/docs_raw" 2>"$WORK/err" || doc_status=$?
+((doc_status <= 1)) || {
+    cat "$WORK/err" >&2
+    fail "git grep over documentation failed with status $doc_status"
+}
+grep -viE "$doc_negation" "$WORK/docs_raw" >"$WORK/docs_hits" || true
+if [[ -s "$WORK/docs_hits" ]]; then
+    cat "$WORK/docs_hits" >&2
+    docs_require=1
+fi
+((docs_require == 0)) ||
+    fail 'documentation says the build or tests need host Python (ADR-0072)'
+
 echo 'no host Python outside the allowlist'
