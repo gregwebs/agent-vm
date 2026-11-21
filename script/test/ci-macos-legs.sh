@@ -106,10 +106,35 @@ pinned_bash=/bin/bash
 # shellcheck disable=SC2016 # the expression expands in the child, which is the pinned bash.
 pinned_bash_version="$("$pinned_bash" -c 'echo "${BASH_VERSION%%(*}"')"
 
+# The egress probe's workers need bash 5 (`EPOCHREALTIME`, `${x,,}`), as the
+# guest ships. `/bin/bash` here is 3.2, so the harness leg provides one instead
+# of skipping the probe controls: `probe_bash()` in the harness honours
+# `EGRESS_PROBE_BASH` and refuses anything older.
+bash5_candidate() {
+    local candidate
+    for candidate in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+        [[ -x "$candidate" ]] || continue
+        # shellcheck disable=SC2016 # the expansion is the candidate's, which is the point.
+        if [[ "$("$candidate" -c 'echo "${BASH_VERSINFO[0]}"')" -ge 5 ]]; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+bash5() {
+    bash5_candidate && return 0
+    command -v brew >/dev/null || return 1
+    HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install bash >/dev/null || return 1
+    bash5_candidate
+}
+
 run_pinned() {
     env -i \
         HOME="$home" \
         PATH="$pinned_path" \
+        EGRESS_PROBE_BASH="${EGRESS_PROBE_BASH:-}" \
         TMPDIR=/tmp \
         LC_ALL=C \
         LANG=C \
@@ -159,6 +184,9 @@ case "$leg" in
         # ADR-0072: the harness is Rust, so it has to build and pass on macOS and
         # not only on the Linux `contracts` job.
         require_pinned_rustc
+        EGRESS_PROBE_BASH="$(bash5)" ||
+            fail "the harness leg needs bash 5 for the egress probe controls; none here and brew could not install one"
+        export EGRESS_PROBE_BASH
         leg_command=(cargo test --locked -p agent-vm-harness)
         ;;
 esac

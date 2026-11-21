@@ -44,13 +44,66 @@ _probe_read_line() {
     printf -v "$__var" '%s' "$__line"
 }
 
+# A deadline around one command. GNU `timeout` is the obvious tool and is used
+# where it exists; macOS and most stock images ship none, and this fixture still
+# has to bound a blocked connect or a socket read there. The fallback reproduces
+# `timeout --kill-after=1`: TERM at the deadline, KILL a second later, and
+# status 124 for a run that hit the deadline, which is what the callers map to a
+# network failure.
+_probe_timeout() {
+    local seconds="$1" rc=0 child watchdog monitor=0
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout --kill-after=1 "$seconds" "$@"
+        return
+    fi
+    # Job control stands in for what `timeout` does with the group it puts the
+    # command in: the worker gets a group of its own, so the deadline can signal
+    # its whole subtree. Signalling only the worker left its children running, and
+    # a survivor holds the caller's stdout open -- `_probe_timeout 2 sh -c 'printf
+    # partial; sleep 30' | cat` took 30 s.
+    [[ -o monitor ]] && monitor=1
+    set -m
+    # `0<&0` is load-bearing, not decoration: bash gives an asynchronous command
+    # /dev/null for stdin unless that command carries an explicit redirection, and
+    # this one is a socket read at several call sites. Without it the ack and
+    # frame reads see EOF and the wire controls fail with an empty reply.
+    "$@" 0<&0 &
+    child=$!
+    (( monitor )) || set +m
+    # The watchdog stays in the *caller's* group, so whoever kills the caller
+    # kills it too; only its own `sleep` needs taking down with it, and it blocks
+    # in `wait` to stay interruptible. A shell blocked in a foreground `sleep`
+    # defers a TERM until that sleep ends, so the old `kill "$watchdog"` left the
+    # sleeper behind -- holding the caller's stdout open for the rest of the
+    # deadline (`_probe_timeout 3 true | cat` took 3014 ms). Its stdio goes to
+    # /dev/null because a watchdog only ever signals.
+    ( sleeper=
+      trap 'kill "$sleeper" 2>/dev/null; exit 0' TERM
+      sleep "$seconds" & sleeper=$!
+      wait "$sleeper" 2>/dev/null
+      kill -TERM -"$child" 2>/dev/null
+      sleep 1 & sleeper=$!
+      wait "$sleeper" 2>/dev/null
+      kill -KILL -"$child" 2>/dev/null ) >/dev/null 2>&1 &
+    watchdog=$!
+    wait "$child" 2>/dev/null || rc=$?
+    kill -TERM "$watchdog" 2>/dev/null
+    wait "$watchdog" 2>/dev/null || true
+    (( monitor )) && set -m
+    if [[ "$rc" -eq 143 ]]; then
+        rc=124
+    fi
+    return "$rc"
+}
+
 # The deadline owns the entire worker, including shell socket redirections and
 # builtin writes. Read-only deadlines cannot bound a blocked connect or write.
 _probe_bounded() {
     local seconds="$1" worker="$2" failure="$3" rc=0 definitions
     shift 3
     definitions=$(declare -f)
-    timeout --kill-after=1 "$seconds" bash -c "PROBE_OK=0; PROBE_NET=1; PROBE_USAGE=2
+    _probe_timeout "$seconds" "${EGRESS_PROBE_BASH:-bash}" -c "PROBE_OK=0; PROBE_NET=1; PROBE_USAGE=2
 $definitions
 $worker \"\$@\"" probe-worker "$@" || rc=$?
     case "$rc" in
@@ -179,7 +232,7 @@ udp_send() {
         return "$PROBE_NET"
     }
     local reply
-    reply=$(timeout 3 dd bs=512 count=1 <&4 2>/dev/null)
+    reply=$(_probe_timeout 3 dd bs=512 count=1 <&4 2>/dev/null)
     exec 4<&- 4>&-
     if [[ "$reply" == "ack $id" ]]; then
         echo "UDP_ACK $id"
@@ -285,7 +338,7 @@ _dns_status() {
         printf '%b' "$escapes" >&5 || {
             exec 5<&- 5>&-; rm -f "$rfile"; echo "DNS udp $server $name TIMEOUT"; return "$PROBE_NET";
         }
-        timeout 3 dd bs=4096 count=1 <&5 2>/dev/null >"$rfile"
+        _probe_timeout 3 dd bs=4096 count=1 <&5 2>/dev/null >"$rfile"
         exec 5<&- 5>&-
     elif [[ "$proto" == "tcp" ]]; then
         { exec 6<>"/dev/tcp/$server/$port"; } 2>/dev/null || {
@@ -297,7 +350,7 @@ _dns_status() {
         # bytes; never read until EOF, so a peer that keeps the socket open
         # still completes one frame.
         local prefix
-        prefix=$(timeout 3 dd bs=1 count=2 2>/dev/null <&6 | od -An -tu1 -v)
+        prefix=$(_probe_timeout 3 dd bs=1 count=2 2>/dev/null <&6 | od -An -tu1 -v)
         local -a prefix_bytes
         read -r -a prefix_bytes <<<"$prefix"
         set -- "${prefix_bytes[@]}"
@@ -310,8 +363,17 @@ _dns_status() {
             exec 6<&- 6>&-; rm -f "$rfile"
             echo "DNS tcp $server $name INVALID"; return "$PROBE_NET"
         fi
-        timeout 3 dd bs=1 count="$frame" 2>/dev/null <&6 >"$rfile"
+        # A body cut short by our own deadline is a timeout; one cut short by
+        # the peer closing is an invalid frame. Reading the deadline's status is
+        # what keeps those two apart, and a peer that closes early still fails
+        # as INVALID.
+        local read_rc=0
+        _probe_timeout 3 dd bs=1 count="$frame" 2>/dev/null <&6 >"$rfile" || read_rc=$?
         exec 6<&- 6>&-
+        if (( read_rc == 124 )); then
+            rm -f "$rfile"
+            echo "DNS tcp $server $name TIMEOUT"; return "$PROBE_NET"
+        fi
         local got
         got=$(wc -c <"$rfile")
         if (( got != frame )); then
@@ -428,7 +490,7 @@ listen() {
     fi
     ready="${3:-INGRESS}"
     if command -v python3 >/dev/null 2>&1; then
-        timeout --kill-after=1 15 python3 - "$port" "$id" "$ready" <<'PY'
+        _probe_timeout 15 python3 - "$port" "$id" "$ready" <<'PY'
 import socket, sys
 port, ident, ready = int(sys.argv[1]), sys.argv[2], sys.argv[3]
 srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -447,7 +509,7 @@ PY
         (( rc == 0 )) && return "$PROBE_OK"
         return "$PROBE_NET"
     elif command -v node >/dev/null 2>&1; then
-        timeout --kill-after=1 15 node - "$port" "$id" "$ready" <<'JS'
+        _probe_timeout 15 node - "$port" "$id" "$ready" <<'JS'
 const http = require('http');
 const [port, ident, ready] = process.argv.slice(2);
 const server = http.createServer((req, res) => {
@@ -735,10 +797,21 @@ _hostname_preflight() {
 
 _case_preflight() {
     local cmd
-    for cmd in bash dd od timeout; do
+    # `timeout` is not required: _probe_timeout falls back to a bash watchdog
+    # where the host ships none (macOS), so a probe case is not a coreutils probe.
+    for cmd in bash dd od; do
         command -v "$cmd" >/dev/null || { echo "PREFLIGHT missing=$cmd"; return "$PROBE_USAGE"; }
     done
-    [[ -n "${EPOCHREALTIME:-}" ]] || { echo "PREFLIGHT missing=EPOCHREALTIME"; return "$PROBE_USAGE"; }
+    # Bash 5 for the workers: `EPOCHREALTIME` for the DNS `ms=` field and
+    # `${x,,}` for the header names. macOS's `/bin/bash` is 3.2, so the harness
+    # resolves a newer bash and passes it in `EGRESS_PROBE_BASH`; the check is on
+    # the worker's version, not this shell's.
+    local worker_bash="${EGRESS_PROBE_BASH:-bash}"
+    command -v "$worker_bash" >/dev/null || { echo "PREFLIGHT missing=bash"; return "$PROBE_USAGE"; }
+    # The expansion is the child's, not this shell's -- that is the whole point.
+    # shellcheck disable=SC2016
+    [[ "$("$worker_bash" -c 'echo "${BASH_VERSINFO[0]}"')" -ge 5 ]] ||
+        { echo "PREFLIGHT missing=bash5"; return "$PROBE_USAGE"; }
     _hostname_preflight "${1:-0}" || return "$PROBE_USAGE"
     local gw
     gw=$(gateway) || return "$PROBE_USAGE"
@@ -1049,8 +1122,8 @@ _case_dispatch() {
 # bounded, because a silently dropped SYN must not eat the harness's deadline.
 _case_refusal_feed() {
     local rc=0
-    timeout --kill-after=1 5 bash -c 'exec 3<>/dev/tcp/203.0.113.10/443' || true
-    timeout --kill-after=1 5 getent hosts blocked.example >/dev/null 2>&1 || true
+    _probe_timeout 5 bash -c 'exec 3<>/dev/tcp/203.0.113.10/443' || true
+    _probe_timeout 5 getent hosts blocked.example >/dev/null 2>&1 || true
     echo "RF1 READY"
     sleep "${RF1_SLEEP:-25}"
     echo "RF1 DONE"
