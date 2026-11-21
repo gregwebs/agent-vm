@@ -61,10 +61,11 @@ script/test/lib/persisted-network-contract.py
 script/test/lib/persisted-network.sh 1
 script/test/persisted-network-contract.sh 1
 
-# --- Migration debt: config mounts ----------------------------------------
-script/test/lib/config-mounts.py
-script/test/config-mounts-contract.sh 4
-script/test/config-mounts-live.sh 1
+# --- Config mounts: off the host (no entry) --------------------------------
+# #697 ported the last host Python here: the rows are `harness config-mounts`,
+# their boot-free half is `harness config-mounts-controls`, and the contract's
+# three `python3` sites and the live wrapper's one are gone with the library, so
+# this section has no entry left to keep.
 
 # --- Migration debt: ptys, direct terminal, e2e inline helpers -------------
 # The stand-in's only callers are direct-terminal.py and

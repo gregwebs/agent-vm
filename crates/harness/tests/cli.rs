@@ -244,6 +244,58 @@ fn the_binary_runs_config_dir_guard_controls() {
     );
 }
 
+#[test]
+fn the_binary_runs_config_mounts_controls() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let output = Command::new(env!("CARGO_BIN_EXE_harness"))
+        .args([
+            "config-mounts-controls",
+            "--repo-root",
+            repo_root.to_str().expect("workspace path is UTF-8"),
+        ])
+        .output()
+        .expect("the harness binary runs the config-mounts controls");
+    assert!(
+        output.status.success(),
+        "config mounts controls failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("control output is UTF-8");
+    // Every group ran, not just the cheap one: the receipt's oracle, the GM
+    // dispatch over a real fixture, and the guard-rail mutations.
+    for line in [
+        "config mounts receipt controls passed",
+        "config mounts dispatch controls passed",
+        "config mounts guard removal mutations passed",
+        "config mounts host-only controls PASS",
+    ] {
+        assert!(stdout.contains(line), "missing {line:?} in: {stdout}");
+    }
+}
+
+/// A group selector that matches nothing would report a pass for a group that
+/// never ran, so an unknown `--only` is misuse, not a no-op.
+#[test]
+fn the_binary_refuses_an_unknown_config_mounts_group() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let output = Command::new(env!("CARGO_BIN_EXE_harness"))
+        .args([
+            "config-mounts-controls",
+            "--repo-root",
+            repo_root.to_str().expect("workspace path is UTF-8"),
+            "--only",
+            "receipts",
+        ])
+        .output()
+        .expect("the harness binary runs the config-mounts controls");
+    assert_eq!(output.status.code(), Some(2), "an unknown group is misuse");
+    let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
+    assert!(
+        stderr.contains("--only must be one of receipt, dispatch, guard"),
+        "the refusal must name the groups: {stderr}"
+    );
+}
+
 /// A failed command says which command failed. The shared prefix named whichever
 /// port was written first, which mislabels every later one, so the label comes
 /// from the subcommand that ran.

@@ -25,6 +25,8 @@ pub mod msb_catalog;
 mod build_archive_oracle;
 mod build_provenance;
 mod config_dir_guard;
+mod config_mounts;
+mod config_mounts_controls;
 mod cpu_commitment;
 mod detached_run;
 mod egress_default_deny;
@@ -56,6 +58,10 @@ enum Command {
     BuildProvenance(build_provenance::BuildProvenanceArgs),
     /// Run configuration-directory guard controls and filesystem queries.
     ConfigDirGuard(config_dir_guard::ConfigDirGuardArgs),
+    /// Run the config-mounts native rows: launches, host oracles and their receipt.
+    ConfigMounts(config_mounts::ConfigMountsArgs),
+    /// Run the boot-free controls for the config-mounts rows and their guard entries.
+    ConfigMountsControls(config_mounts_controls::ConfigMountsControlsArgs),
     /// Drive Phase 0 CPU-commitment selection and runtime-provenance manifests.
     CpuCommitment(cpu_commitment::CpuCommitmentArgs),
     /// Run one command in a session with no controlling terminal and no stdin.
@@ -90,6 +96,8 @@ impl Cli {
         match self.command {
             Command::RuntimeProvenance(_) => "runtime provenance",
             Command::ConfigDirGuard(_) => "config-dir guard",
+            Command::ConfigMounts(_) => "config mounts",
+            Command::ConfigMountsControls(_) => "config mounts controls",
             Command::LaunchArgvOrder(_) => "launch argv order",
             Command::MsbKrunCompat(_) => "msb-krun compat",
             Command::BuildProvenance(_) => "build provenance",
@@ -125,6 +133,10 @@ pub fn run(cli: Cli) -> Result<Outcome, String> {
         Command::BuildArchiveOracle(args) => build_archive_oracle::run(args).map(Outcome::Report),
         Command::BuildProvenance(args) => build_provenance::run(args).map(Outcome::Report),
         Command::ConfigDirGuard(args) => config_dir_guard::run(args).map(Outcome::Report),
+        Command::ConfigMounts(args) => config_mounts::run(args),
+        Command::ConfigMountsControls(args) => {
+            config_mounts_controls::run(args).map(Outcome::Report)
+        }
         Command::CpuCommitment(args) => cpu_commitment::run(args).map(Outcome::Report),
         Command::DetachedRun(args) => detached_run::run(args),
         Command::EgressFixtures(args) => egress_fixtures::run(args),
