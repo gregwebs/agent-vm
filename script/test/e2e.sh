@@ -22,7 +22,7 @@
 #   AGENT_VM_E2E_NODE               vetted absolute Node interpreter for an
 #                                   installed npm dispatcher candidate; defaults to
 #                                   `node` resolved from the caller PATH
-# Gate prerequisites: jq, shasum, python3 (and node for an npm dispatcher).
+# Gate prerequisites: jq, shasum (and node for an npm dispatcher).
 #
 # Custom-image inputs:
 #   AGENT_VM_BIN / AGENT_VM_DEV_BIN  validated debug launcher
@@ -76,7 +76,6 @@
 # manual; see CONTRIBUTING.md. No debug recommendation seam in released-image.
 
 set -euo pipefail
-export PYTHONDONTWRITEBYTECODE=1
 
 CALLER_CWD="$PWD"
 OPERATOR_HOME="$HOME"
@@ -1376,41 +1375,11 @@ stdin_writer_start() {
     # that waited for it) forever. `O_NONBLOCK` turns that into ENXIO, retried
     # under a deadline; the first readiness receipt proves the inherited EXIT
     # trap is already gone, which is the ownership protocol bash 3.2 can give
-    # (no BASHPID; #399 F2/N2).
-    exec python3 - "$fifo" "$mode" "$payload" "$ready" "$STDIN_WRITER_TIMEOUT" <<'PY'
-import errno, os, sys, time
-
-fifo, mode, payload, ready, timeout = sys.argv[1:6]
-deadline = time.monotonic() + float(timeout)
-
-with open(ready, "w", encoding="utf-8") as receipt:
-    receipt.write("ready")
-
-fd = None
-while time.monotonic() < deadline:
-    try:
-        fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
-        break
-    except OSError as error:
-        if error.errno != errno.ENXIO:
-            raise
-        time.sleep(0.05)
-
-if fd is None:
-    print("no launcher opened the FIFO's read end", file=sys.stderr)
-    sys.exit(1)
-
-os.set_blocking(fd, True)
-if payload:
-    with os.fdopen(os.dup(fd), "wb", closefd=True) as stream:
-        stream.write(payload.encode())
-
-if mode == "close":
-    os.close(fd)
-else:
-    while True:
-        time.sleep(3600)
-PY
+    # (no BASHPID; #399 F2/N2). `harness e2e-stdin-writer` is that protocol's
+    # blocking half; the mode is still validated here, before anything starts.
+    exec "$HARNESS" e2e-stdin-writer \
+      --fifo "$fifo" --mode "$mode" --payload "$payload" \
+      --ready "$ready" --timeout "$STDIN_WRITER_TIMEOUT"
   ) &
   STDIN_WRITER_PID=$!
   STDIN_WRITER_FIFO="$fifo"
@@ -2580,55 +2549,22 @@ direct_cleanup() {
 }
 
 # Proof that none of the named state entries exists, distinguishing absence from
-# a failed observation: only ENOENT is evidence.
+# a failed observation: only ENOENT is evidence, so a path that exists and a path
+# that could not be looked at are both failures (`harness e2e-state --absent`).
 assert_state_entries_absent() {
   local desc="$1" state="$2"
   shift 2
-  python3 - "$desc" "$state" "$@" <<'ABSENT'
-import os
-import sys
-
-desc, state = sys.argv[1], sys.argv[2]
-failed = False
-for relative in sys.argv[3:]:
-    path = os.path.join(state, relative)
-    try:
-        os.lstat(path)
-    except FileNotFoundError:
-        continue
-    except OSError as error:
-        print(f"    FAIL: {desc}: could not observe {path}: {error}", file=sys.stderr)
-        failed = True
-    else:
-        print(f"    FAIL: {desc}: {path} must not exist", file=sys.stderr)
-        failed = True
-raise SystemExit(1 if failed else 0)
-ABSENT
+  "$HARNESS" e2e-state --state "$state" --desc "$desc" --absent "$@"
 }
 
 # The exact generic guest-HOME furniture: `name<TAB>target`, sorted. Compared as
 # a whole set so an unexpected link (a catalog `persist` declaration, or a
 # provider link this oracle does not know) fails rather than passing as "some
-# path under the state root".
+# path under the state root". The recursive walk and the sort are
+# `harness e2e-state --home-links`; the caller sorts again with `LC_ALL=C sort`,
+# which is what keeps the comparison locale-independent.
 direct_home_links() {
-  python3 - "$1" <<'LINKS'
-import os
-import sys
-
-root = os.path.join(sys.argv[1], "home")
-rows = []
-try:
-    for dirpath, dirnames, filenames in os.walk(root):
-        for name in dirnames + filenames:
-            path = os.path.join(dirpath, name)
-            if os.path.islink(path):
-                rows.append(f"{os.path.relpath(path, root)}\t{os.readlink(path)}")
-except OSError as error:
-    print(f"    FAIL: could not walk {root}: {error}", file=sys.stderr)
-    raise SystemExit(1)
-for row in sorted(rows):
-    print(row)
-LINKS
+  "$HARNESS" e2e-state --state "$1" --home-links
 }
 
 assert_direct_state_furniture() {
@@ -2656,33 +2592,13 @@ assert_direct_state_furniture() {
 
 # The sandbox config the launcher actually handed the SDK, from its own
 # `[debug] sandbox config JSON` record. A missing, unreadable or malformed record
-# is a failure, never an empty observation.
+# is a failure, never an empty observation: the record continues with more log
+# text, so it is a JSON *prefix*, which `harness e2e-debug-json` decodes.
 direct_debug_config() {
   local name="$1"
   [ -r "$WORK/$name.out" ] ||
     { echo "    FAIL: no launcher log for $name"; return 1; }
-  python3 - "$WORK/$name.out" <<'CONFIG'
-import json
-import sys
-
-marker = "[debug] sandbox config JSON: "
-try:
-    with open(sys.argv[1], encoding="utf-8", errors="surrogateescape") as handle:
-        text = handle.read()
-except OSError as error:
-    print(f"    FAIL: could not read {sys.argv[1]}: {error}", file=sys.stderr)
-    raise SystemExit(1)
-index = text.find(marker)
-if index < 0:
-    print("    FAIL: the launch emitted no sandbox config dump", file=sys.stderr)
-    raise SystemExit(1)
-try:
-    config, _ = json.JSONDecoder().raw_decode(text[index + len(marker):].lstrip())
-except ValueError as error:
-    print(f"    FAIL: the sandbox config dump is not JSON: {error}", file=sys.stderr)
-    raise SystemExit(1)
-json.dump(config, sys.stdout)
-CONFIG
+  "$HARNESS" e2e-debug-json --sandbox-config "$WORK/$name.out"
 }
 
 # Default-deny authority with an empty grant, asserted on the config the native
@@ -4000,6 +3916,8 @@ check_harness_negative() {
 set -u
 # The production globals the reapers read; the harness initialises them at the
 # top level, so the child must too (set -u otherwise aborts the trap itself).
+# $HARNESS arrives in the environment: the writer helper is a harness subcommand
+# now, so a child that cannot name the binary would fail instead of starting it.
 STDIN_CAPTURE_PID=""
 STDIN_PRODUCER_PID=""
 STDIN_RSS_PID=""
@@ -4027,6 +3945,7 @@ CHILD
   } >"$trap_work/child.sh" || result=$((result + 1))
   if (
     WORK="$trap_work" OWNED_BUILDER="" STDIN_WRITER_TIMEOUT=30 RSS_SAMPLE_INTERVAL=0.05 \
+      HARNESS="$HARNESS" \
       bash "$trap_work/child.sh" >"$WORK/probe-trap.out" 2>&1
   ); then
     f5_status=0
@@ -4164,40 +4083,23 @@ CHILD
   local buf_base="$WORK/probe-buffer-base.rss" buf_meas="$WORK/probe-buffer-meas.rss"
   local stream_base="$WORK/probe-stream-base.rss" stream_meas="$WORK/probe-stream-meas.rss"
   local buf_base_kib buf_meas_kib stream_base_kib stream_meas_kib buf_growth stream_growth
-  cat >"$WORK/probe-rss-standin.py" <<'STANDIN' || result=$((result + 1))
-import sys, time
-
-mode, limit = sys.argv[1], int(sys.argv[2])
-time.sleep(0.3)  # let the interpreter reach steady state before anything is read
-if mode == "buffer":
-    data = sys.stdin.buffer.read(limit)
-    time.sleep(3)  # keep the whole input live so the sampler must see it
-    sys.stderr.write("buffered=%d\n" % len(data))
-else:
-    total = 0
-    while True:
-        chunk = sys.stdin.buffer.read(1048576)
-        if not chunk:
-            break
-        total += len(chunk)
-        time.sleep(0.01)  # a real transfer takes real time
-    sys.stderr.write("streamed=%d\n" % total)
-STANDIN
-  # The stand-in must be measured as the interpreter, never as the subshell that
-  # is about to `exec` it. The old shape sampled `$!` at once, so a `ps` landing
+  # The stand-in must be measured as the stand-in, never as the subshell that is
+  # about to `exec` it. The old shape sampled `$!` at once, so a `ps` landing
   # before the `exec` recorded a bash footprint, the sampler stopped with
   # `sampling_mismatch=sampled comm changed …`, and the criterion summed the one
   # tiny sample and never consulted the mismatch — which is how a whole-stream
   # buffer could be "accepted" on a bash-sized number (#399 verification 4,
-  # h18). Wait (bounded) for the interpreter's comm to *hold still*, hand that
-  # comm to the sampler so every sample is checked against it, and assert the
-  # receipt before any number is used.
+  # h18). Wait (bounded) for the stand-in's comm to *hold still*, hand that comm
+  # to the sampler so every sample is checked against it, and assert the receipt
+  # before any number is used. `harness e2e-rss-standin` is the stand-in itself,
+  # so the comm that must settle is the harness binary's.
   probe_rss_standin() { # mode bytes out
-    local mode="$1" bytes="$2" out="$3" standin host_comm expected current
+    local mode="$1" bytes="$2" out="$3" standin host_comm standin_comm expected current
     local steps waited=0 streak=0 observed mismatch samples
     host_comm="$(ps -p $$ -o comm= 2>/dev/null)"
+    standin_comm="$(basename "$HARNESS")"
     head -c "$bytes" /dev/zero |
-      ( exec python3 "$WORK/probe-rss-standin.py" "$mode" "$bytes" ) >/dev/null 2>&1 &
+      ( exec "$HARNESS" e2e-rss-standin --mode "$mode" --bytes "$bytes" ) >/dev/null 2>&1 &
     standin=$!
     steps=$((RSS_RECEIPT_WAIT_SECONDS * 50))
     expected=""
@@ -4206,14 +4108,14 @@ STANDIN
       if [ "$current" = "$expected" ] && [ -n "$expected" ]; then
         streak=$((streak + 1))
       else
-        # A first match is not yet an identity: the interpreter can re-exec
-        # itself once at start-up (Homebrew's `python3` becomes the
-        # Python.app binary), so require five unchanged readings.
+        # A first match is not yet an identity: until the subshell's `exec`
+        # lands, `ps` names the shell that is about to become the stand-in, so
+        # require five unchanged readings of the stand-in's own comm.
         expected=""
         streak=0
         if [ -n "$current" ] && [ "$current" != "$host_comm" ]; then
           case "$current" in
-          *[Pp]ython*) expected="$current" ;;
+          *"$standin_comm"*) expected="$current" ;;
           esac
         fi
       fi
@@ -4223,7 +4125,7 @@ STANDIN
     done
     if [ "$streak" -lt 5 ]; then
       if kill -0 "$standin" 2>/dev/null; then
-        echo "    FAIL: control h18 ($mode ${bytes}B): the RSS stand-in PID $standin never settled on the python interpreter (last comm '$current', host shell comm '$host_comm')"
+        echo "    FAIL: control h18 ($mode ${bytes}B): the RSS stand-in PID $standin never settled on the harness $standin_comm (last comm '$current', host shell comm '$host_comm')"
       else
         echo "    FAIL: control h18 ($mode ${bytes}B): the RSS stand-in PID $standin exited before it could be sampled"
       fi
@@ -4292,8 +4194,8 @@ STANDIN
     fi
   fi
   rm -f "$buf_base" "$buf_base.meta" "$buf_meas" "$buf_meas.meta" \
-    "$stream_base" "$stream_base.meta" "$stream_meas" "$stream_meas.meta" \
-    "$WORK/probe-rss-standin.py" || result=$((result + 1))
+    "$stream_base" "$stream_base.meta" "$stream_meas" "$stream_meas.meta" ||
+    result=$((result + 1))
   control_report "h18 launcher-rss-sensitivity" "$ctl_before"
 
 
@@ -4439,12 +4341,13 @@ STANDIN
     rm -f "$fifo" || exit 81
     mkfifo "$fifo" || exit 81
     (
-      exec python3 -c '
-import sys, time
-f = open(sys.argv[1], "rb", buffering=0)
-f.read(4096)
-time.sleep(8)
-' "$fifo"
+      # A reader that takes 4 KiB and then stops reading while keeping the FIFO
+      # open, so the producer's 4 MiB fills the pipe and blocks. `exec 0<` is the
+      # FIFO open (it blocks until the producer arrives) and `sleep` holds it
+      # open; that is all this fixture does, so it needs no interpreter.
+      exec 0<"$fifo"
+      head -c 4096 >/dev/null
+      sleep 8
     ) &
     reader=$!
     for i in $(seq 1 50); do
@@ -6083,55 +5986,13 @@ EOF
 }
 
 # Parse every `[debug] sandbox config JSON:` and `[debug] native image
-# acquisition JSON:` dump from a captured stream as a complete JSON object
-# (python3's decoder), printing one `name<TAB>Oci ref` per dump. A native
-# acquisition has no sandbox name, so its fixed `kind` is the row name. Malformed
-# JSON after a marker is an error, never a dropped dump.
+# acquisition JSON:` dump from a captured stream as a complete JSON object,
+# printing one `name<TAB>Oci ref` per dump. A native acquisition has no sandbox
+# name, so its fixed `kind` is the row name. Malformed JSON after a marker is an
+# error, never a dropped dump; the dumps are JSON *prefixes* of a line, so the
+# decoder is `harness e2e-debug-json --acquisition-dumps`.
 parse_acquisition_dumps() {
-  local file="$1"
-  python3 - "$file" <<'PY'
-import json
-import sys
-
-text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
-markers = {
-    "[debug] sandbox config JSON: ": "sandbox",
-    "[debug] native image acquisition JSON: ": "native",
-}
-decoder = json.JSONDecoder()
-found = []
-for marker, kind in markers.items():
-    index = 0
-    while True:
-        start = text.find(marker, index)
-        if start < 0:
-            break
-        found.append((start, start + len(marker), kind))
-        index = start + len(marker)
-rows = []
-for _, start, kind in sorted(found):
-    while start < len(text) and text[start] in " \t\r\n":
-        start += 1
-    try:
-        obj, end = decoder.raw_decode(text, start)
-    except json.JSONDecodeError as error:
-        print(f"malformed debug JSON: {error}", file=sys.stderr)
-        sys.exit(1)
-    if kind == "native":
-        if obj.get("kind") != "native-image-acquire":
-            print("unexpected native acquisition kind", file=sys.stderr)
-            sys.exit(1)
-        rows.append(f"native-image-acquire\t{obj.get('reference', '<none>')}")
-    else:
-        name = obj.get("name", "<none>")
-        try:
-            ref = obj["image"]["Oci"]["reference"]
-        except (KeyError, TypeError):
-            ref = "<none>"
-        rows.append(f"{name}\t{ref}")
-for row in rows:
-    print(row)
-PY
+  "$HARNESS" e2e-debug-json --acquisition-dumps "$1"
 }
 
 # Require the capture to hold exactly one native acquisition record and one
@@ -6898,45 +6759,13 @@ upgrade_docker() {
 }
 
 # Native metadata is an inventory input, not an unchanged-content oracle. Hash
-# full artifact bytes and VMDK extents independently before a failed upgrade.
-upgrade_cache_snapshot() {
-  python3 - "$RETAINED_STATE/msb-home/cache" "$1" "$2" "$WORK/upgrade-b-manifest.json" <<'PY'
-import hashlib, json, pathlib, re, sys
-cache, ref, output = pathlib.Path(sys.argv[1]), sys.argv[2], pathlib.Path(sys.argv[3])
-digest = ref.split('@', 1)[1]
-paths = set()
-for path in (cache / 'manifests').glob('*.json'):
-    doc = json.loads(path.read_bytes())
-    if doc['manifest_digest'] != digest:
-        continue
-    # Native metadata reserializes the parsed manifest. Verify its semantics
-    # against independently fetched registry bytes, not that serialization hash.
-    fixture = pathlib.Path(sys.argv[4])
-    assert 'sha256:' + hashlib.sha256(fixture.read_bytes()).hexdigest() == digest
-    assert json.loads(doc['raw_manifest_json']) == json.loads(fixture.read_bytes())
-    assert 'sha256:' + hashlib.sha256(doc['raw_config_json'].encode()).hexdigest() == doc['config_digest']
-    config = json.loads(doc['raw_config_json'])
-    assert config['rootfs']['diff_ids'] == [layer['diff_id'] for layer in doc['layers']]
-    paths.add(path)
-    safe = digest.replace(':', '_')
-    paths.add(cache / 'fsmeta' / (safe + '.erofs'))
-    descriptor = cache / 'vmdk' / (safe + '.vmdk')
-    paths.add(descriptor)
-    for line in descriptor.read_text().splitlines():
-        if line.startswith(('RW ', 'RDONLY ')):
-            extent = pathlib.Path(re.search(r'"([^"]+)"', line)[1])
-            paths.add(extent if extent.is_absolute() else descriptor.parent / extent)
-    for layer in doc['layers']:
-        paths.add(cache / 'layers' / (layer['diff_id'].replace(':', '_') + '.erofs'))
-        blob = cache / 'layers' / (layer['digest'].replace(':', '_') + '.tar.gz')
-        if blob.exists(): paths.add(blob)
-assert paths, 'no cached metadata for retained digest'
-inventory = {}
-for path in paths:
-    data = path.read_bytes()
-    inventory[str(path)] = [len(data), hashlib.sha256(data).hexdigest()]
-output.write_text(json.dumps(inventory, sort_keys=True))
-PY
+# every cached artifact and VMDK extent independently before a failed upgrade
+# (`harness e2e-cache-inventory`). The fixture is the manifest the row fetched
+# from the registry for exactly this digest, so the cached metadata must
+# reserialize to *those* bytes, not to whatever the cache happens to hold.
+upgrade_cache_snapshot() { # ref out
+  "$HARNESS" e2e-cache-inventory --cache "$RETAINED_STATE/msb-home/cache" \
+    --ref "$1" --fixture "$WORK/upgrade-b-manifest.json" --out "$2"
 }
 
 # Count manifest/blob access records in one registry log text. Registry v3
@@ -7218,47 +7047,8 @@ pins_registry_count() {
 # stage, replies `continue`, and holds one named pin stage until the release
 # file exists. The log is the ordering oracle.
 pins_observer_body() {
-  python3 - "$@" <<'PY'
-import os, selectors, socket, sys, time
-
-pin_path, acquire_path, log_path, hold, release = sys.argv[1:6]
-
-def listener(path):
-    try:
-        os.unlink(path)
-    except FileNotFoundError:
-        pass
-    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    server.bind(path)
-    server.listen(64)
-    server.setblocking(False)
-    return server
-
-log = open(log_path, "a", buffering=1)
-selector = selectors.DefaultSelector()
-for name, path in (("pin", pin_path), ("acquire", acquire_path)):
-    selector.register(listener(path), selectors.EVENT_READ, name)
-
-while True:
-    for key, _ in selector.select(timeout=1.0):
-        connection, _ = key.fileobj.accept()
-        connection.settimeout(60)
-        data = b""
-        while not data.endswith(b"\n") and len(data) < 4096:
-            chunk = connection.recv(256)
-            if not chunk:
-                break
-            data += chunk
-        stage = data.decode("utf-8", "replace").strip()
-        log.write(f"{key.data} {stage}\n")
-        log.flush()
-        if key.data == "pin" and stage == hold:
-            deadline = time.time() + 90
-            while not os.path.exists(release) and time.time() < deadline:
-                time.sleep(0.05)
-        connection.sendall(b"continue\n")
-        connection.close()
-PY
+  "$HARNESS" e2e-pin-observer --pin "$1" --acquire "$2" --log "$3" \
+    --hold "$4" --release "$5"
 }
 
 start_pin_observer() {
@@ -7285,67 +7075,7 @@ stop_pin_observer() {
 # blobs (which the registry itself rejects on PUT).
 pins_push_unbootable_candidate() {
   local port="$1" repo="$2" tag="$3"
-  python3 - "$port" "$repo" "$tag" <<'PY'
-import hashlib, json, sys, urllib.request
-
-port, repo, tag = sys.argv[1:4]
-base = f"http://127.0.0.1:{port}"
-
-
-def upload(data):
-    request = urllib.request.Request(
-        f"{base}/v2/{repo}/blobs/uploads/", data=b"", method="POST"
-    )
-    location = urllib.request.urlopen(request).headers["Location"]
-    if location.startswith("/"):
-        location = base + location
-    digest = "sha256:" + hashlib.sha256(data).hexdigest()
-    separator = "&" if "?" in location else "?"
-    request = urllib.request.Request(
-        f"{location}{separator}digest={digest}",
-        data=data,
-        method="PUT",
-        headers={"Content-Type": "application/octet-stream"},
-    )
-    urllib.request.urlopen(request).read()
-    return digest, len(data)
-
-
-layer = b"not-a-tarball"
-layer_digest, layer_size = upload(layer)
-config = json.dumps(
-    {
-        "architecture": "arm64",
-        "os": "linux",
-        "rootfs": {"type": "layers", "diff_ids": [layer_digest]},
-        "config": {},
-    }
-).encode()
-config_digest, config_size = upload(config)
-manifest = {
-    "schemaVersion": 2,
-    "mediaType": "application/vnd.oci.image.manifest.v1+json",
-    "config": {
-        "mediaType": "application/vnd.oci.image.config.v1+json",
-        "digest": config_digest,
-        "size": config_size,
-    },
-    "layers": [
-        {
-            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
-            "digest": layer_digest,
-            "size": layer_size,
-        }
-    ],
-}
-request = urllib.request.Request(
-    f"{base}/v2/{repo}/manifests/{tag}",
-    data=json.dumps(manifest).encode(),
-    method="PUT",
-    headers={"Content-Type": "application/vnd.oci.image.manifest.v1+json"},
-)
-urllib.request.urlopen(request).read()
-PY
+  "$HARNESS" e2e-registry-push --port "$port" --repo "$repo" --tag "$tag"
 }
 
 # Snapshot the approval store while a debug launch is held at a pin stage. The
@@ -8448,35 +8178,7 @@ custom_image_direct_both_forms() {
 # an empty argument, spaces, quotes, Unicode, shell metacharacters, a literal
 # `$HOME`, `--help`, a later `--` and duplicates.
 direct_argv_expectation() {
-  python3 - "$1" <<'ARGVCHECK'
-import sys
-
-expected_args = [
-    "",
-    "a b",
-    "q'\"uote",
-    "日本語",
-    "$HOME",
-    "*",
-    ";",
-    "|",
-    "--help",
-    "--",
-    "x",
-    "x",
-    "line\nbreak",
-]
-expected = b"argv-count=%d\n" % len(expected_args)
-for argument in expected_args:
-    expected += argument.encode() + b"\0"
-expected += b"direct-probe-398=ok\n"
-actual = open(sys.argv[1], "rb").read()
-if actual != expected:
-    print("    FAIL: direct argv bytes differ from the exact expected vector")
-    print("    expected:", expected)
-    print("    actual:  ", actual)
-    raise SystemExit(1)
-ARGVCHECK
+  "$HARNESS" e2e-direct-argv --capture "$1"
 }
 
 custom_image_direct_argv() {

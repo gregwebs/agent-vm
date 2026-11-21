@@ -27,7 +27,12 @@ clap = { version = "4.5", features = ["derive"] }
 # the graph. `net` adds the pre-bind socket the `SO_REUSEADDR` fixtures need
 # (`std::net::TcpListener::bind` sets no option) and the shutdown that wakes a
 # blocking accept; `stdio` adds the `dup2` an exec shim performs.
-rustix = { version = "1.1", features = ["process", "pty", "termios", "event", "pipe", "net", "stdio"] }
+# `net` adds the pre-bind socket the `SO_REUSEADDR` fixtures need
+# (`std::net::TcpListener::bind` sets no option) and the shutdown that wakes a
+# blocking accept; `stdio` adds the `dup2` an exec shim performs; `fs` adds the
+# non-blocking FIFO open, the flag update that makes it blocking again, and
+# `mknodat` for the stand-in FIFO an e2e control owns (`e2e_stdin_writer`).
+rustix = { version = "1.1", features = ["process", "pty", "termios", "event", "pipe", "net", "stdio", "fs"] }
 libc = "0.2"
 serde_json = "1"
 toml = { version = "1", default-features = false, features = ["parse", "serde"] }

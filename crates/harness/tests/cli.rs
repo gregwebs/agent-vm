@@ -1575,3 +1575,245 @@ fn the_binary_refuses_mutation_misuse() {
         String::from_utf8_lossy(&unmatched.stderr)
     );
 }
+
+// --- #700: the `e2e.sh` inline helpers -------------------------------------
+
+/// Every `harness e2e-*` control runs through the binary the shell calls. A
+/// missing dispatch arm would exit with a clap error here, not in a native row
+/// nobody can run in CI.
+#[test]
+fn the_binary_runs_the_e2e_controls() {
+    for (command, expected) in [
+        ("e2e-cache-inventory", "e2e cache-inventory controls passed"),
+        ("e2e-debug-json", "e2e debug-json controls passed"),
+        ("e2e-direct-argv", "e2e direct-argv controls passed"),
+        ("e2e-pin-observer", "e2e pin-observer controls passed"),
+        ("e2e-registry-push", "e2e registry-push controls passed"),
+        ("e2e-rss-standin", "e2e rss-standin controls passed"),
+        ("e2e-state", "e2e state controls passed"),
+        ("e2e-stdin-writer", "e2e stdin-writer controls passed"),
+    ] {
+        let output = harness([command.to_owned(), "--self-test".to_owned()]);
+        assert!(
+            output.status.success(),
+            "{command} controls failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("control output is UTF-8"),
+            format!("{expected}\n")
+        );
+    }
+}
+
+/// The state oracle keeps "absent" and "could not observe" apart, which is the
+/// distinction `[ ! -e ]` cannot make.
+#[test]
+fn the_binary_observes_a_state_root() {
+    let scratch = Scratch::new("e2e-state");
+    fs::write(scratch.path.join("provisioned"), b"").expect("write the state entry");
+    fs::create_dir(scratch.path.join("home")).expect("create the guest home");
+
+    let state = scratch.path.to_str().unwrap().to_owned();
+    let absent = harness([
+        "e2e-state".to_owned(),
+        "--state".to_owned(),
+        state.clone(),
+        "--desc".to_owned(),
+        "probe".to_owned(),
+        "--absent".to_owned(),
+        "missing".to_owned(),
+        "also/missing".to_owned(),
+    ]);
+    assert!(absent.status.success());
+    assert_eq!(
+        String::from_utf8(absent.stdout).expect("UTF-8"),
+        "state: 2 entries absent\n"
+    );
+
+    let present = harness([
+        "e2e-state".to_owned(),
+        "--state".to_owned(),
+        state.clone(),
+        "--desc".to_owned(),
+        "probe".to_owned(),
+        "--absent".to_owned(),
+        "provisioned".to_owned(),
+    ]);
+    assert_eq!(present.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&present.stderr).contains("must not exist"),
+        "{}",
+        String::from_utf8_lossy(&present.stderr)
+    );
+
+    let unobservable = harness([
+        "e2e-state".to_owned(),
+        "--state".to_owned(),
+        state,
+        "--desc".to_owned(),
+        "probe".to_owned(),
+        "--absent".to_owned(),
+        "provisioned/child".to_owned(),
+    ]);
+    assert_eq!(unobservable.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&unobservable.stderr).contains("could not observe"),
+        "{}",
+        String::from_utf8_lossy(&unobservable.stderr)
+    );
+}
+
+/// Both launcher-log readers decode one JSON value out of a line that continues
+/// with log text, which is why they are not `jq` one-liners.
+#[test]
+fn the_binary_reads_a_launcher_log() {
+    let scratch = Scratch::new("e2e-debug-json");
+    let log = scratch.path.join("launch.out");
+    fs::write(
+        &log,
+        "==> banner\n[debug] sandbox config JSON: {\"name\": \"probe\", \"image\": {\"Oci\": {\"reference\": \"repo:tag\"}}}\n\
+         [debug] native image acquisition JSON: {\"kind\": \"native-image-acquire\", \"reference\": \"repo@sha256:aa\"}\n",
+    )
+    .expect("write the launcher log");
+    let log = log.to_str().unwrap().to_owned();
+
+    let config = harness([
+        "e2e-debug-json".to_owned(),
+        "--sandbox-config".to_owned(),
+        log.clone(),
+    ]);
+    assert!(config.status.success());
+    assert_eq!(
+        String::from_utf8(config.stdout).expect("UTF-8"),
+        "{\"image\":{\"Oci\":{\"reference\":\"repo:tag\"}},\"name\":\"probe\"}\n"
+    );
+
+    let dumps = harness([
+        "e2e-debug-json".to_owned(),
+        "--acquisition-dumps".to_owned(),
+        log,
+    ]);
+    assert!(dumps.status.success());
+    assert_eq!(
+        String::from_utf8(dumps.stdout).expect("UTF-8"),
+        "probe\trepo:tag\nnative-image-acquire\trepo@sha256:aa\n"
+    );
+
+    let missing = harness([
+        "e2e-debug-json".to_owned(),
+        "--sandbox-config".to_owned(),
+        "/does/not/exist".to_owned(),
+    ]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("could not read"),
+        "{}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+}
+
+/// A held FIFO writer keeps the write end open until it is killed: the guest
+/// sees the payload and *no* EOF while the row holds it. This is the one
+/// behaviour the module's own control cannot cover, because it needs a process to
+/// kill.
+#[test]
+fn the_binary_holds_a_fifo_until_it_is_killed() {
+    use std::io::Read;
+    use std::sync::mpsc::{RecvTimeoutError, channel};
+    use std::time::{Duration, Instant};
+
+    let scratch = Scratch::new("e2e-stdin-writer");
+    let fifo = scratch.path.join("stdin.fifo");
+    let ready = scratch.path.join("stdin.ready");
+    let created = Command::new("mkfifo").arg(&fifo).status();
+    match created {
+        Ok(status) if status.success() => {}
+        _ => panic!("mkfifo is required to control the stdin writer"),
+    }
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_harness"))
+        .args([
+            "e2e-stdin-writer",
+            "--fifo",
+            fifo.to_str().expect("the scratch path is UTF-8"),
+            "--mode",
+            "hold",
+            "--payload",
+            "hello",
+            "--ready",
+            ready.to_str().expect("the scratch path is UTF-8"),
+            "--timeout",
+            "30",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the stdin writer starts");
+
+    // The receipt proves the process reached its open; the reader's own open then
+    // completes the FIFO handshake.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the writer never wrote its readiness receipt"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut reader = fs::File::open(&fifo).expect("open the FIFO for reading");
+    let mut payload = [0_u8; 5];
+    reader.read_exact(&mut payload).expect("read the payload");
+    assert_eq!(&payload, b"hello");
+
+    // `hold` means the guest has not seen EOF: the next read blocks. A thread owns
+    // it so the wait can be bounded, and a signal from it means the stream closed.
+    let (sender, receiver) = channel();
+    let waiting = std::thread::spawn(move || {
+        let mut rest = Vec::new();
+        reader
+            .read_to_end(&mut rest)
+            .expect("read the end of the stream");
+        let _ = sender.send(());
+        rest
+    });
+    match receiver.recv_timeout(Duration::from_millis(300)) {
+        Err(RecvTimeoutError::Timeout) => {}
+        Ok(()) => panic!("a held writer closed the stream"),
+        Err(error) => panic!("the control's reader failed: {error}"),
+    }
+
+    let pid = child.id() as i32;
+    // SAFETY: `pid` is this test's own child and `SIGKILL` takes no payload.
+    let killed = unsafe { libc::kill(pid, libc::SIGKILL) };
+    assert_eq!(killed, 0, "the writer could not be killed");
+    let status = child.wait().expect("reap the writer");
+    assert!(!status.success());
+    receiver
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the killed writer released the stream");
+    let rest = waiting.join().expect("the control's reader finished");
+    assert!(
+        rest.is_empty(),
+        "the held writer delivered more bytes than its payload"
+    );
+}
+
+/// A capture that is not the exact argv vector fails, and says where it diverged.
+#[test]
+fn the_binary_rejects_a_wrong_argv_capture() {
+    let scratch = Scratch::new("e2e-direct-argv");
+    let capture = scratch.path.join("stdout");
+    fs::write(&capture, b"argv-count=13\ndirect-probe-398=ok\n").expect("write the capture");
+    let output = harness([
+        "e2e-direct-argv".to_owned(),
+        "--capture".to_owned(),
+        capture.to_str().unwrap().to_owned(),
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("FAIL: direct argv bytes differ from the exact expected vector"),
+        "{stderr}"
+    );
+}
