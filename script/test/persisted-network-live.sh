@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Native evidence only: dedicated macOS Apple Silicon host, no concurrent VMs.
 set -euo pipefail
-export PYTHONDONTWRITEBYTECODE=1
 : "${AGENT_VM_BIN:?set an absolute native bundle binary}"
 : "${AGENT_VM_LIVE_TEST_IMAGE:?set a verified native image}"
 [[ "$AGENT_VM_BIN" = /* && -x "$AGENT_VM_BIN" ]] ||
