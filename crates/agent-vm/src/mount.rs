@@ -690,7 +690,7 @@ fn fork_root_context(verb: &str, declaration: Declaration<'_>, source: &Path) ->
 // path merge or are refused — so per ADR-0018 they are kernels and every byte
 // outside them is a trusted adapter. A kernel body is written in a shape its
 // `ensures` clause does not use, so a mutation control can name the body alone
-// (see `script/test/egress-mutations.py`); `path_spelling` is the one documented
+// (see `harness egress-mutations`); `path_spelling` is the one documented
 // exception, just below.
 verus! {
 /// Which path spellings a grammar accepts, in either path field.

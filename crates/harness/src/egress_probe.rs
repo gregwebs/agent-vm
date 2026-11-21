@@ -1704,10 +1704,12 @@ pub fn pa2_vocabulary_is_shared_with_the_host_witness() -> Result<(), String> {
 // --- The driver -------------------------------------------------------------
 
 /// Every control, named and separately asserted, in the order the two Python
-/// suites ran them.
-pub fn self_test() -> Result<(), String> {
-    type Control = (&'static str, fn() -> Result<(), String>);
-    let controls: [Control; 17] = [
+/// suites ran them. `only` narrows it to the controls whose name contains one of
+/// its strings, which is how the mutation ledger runs a single named control per
+/// row -- the same shape `egress-supervisor --self-test --only` has.
+pub fn self_test(only: &[String]) -> Result<(), String> {
+    type Named = (&'static str, fn() -> Result<(), String>);
+    let controls: [Named; 17] = [
         (
             "http fragmentation, exact body and single connection",
             http_fragmentation_exact_body_and_single_connection,
@@ -1771,18 +1773,47 @@ pub fn self_test() -> Result<(), String> {
             pa2_vocabulary_is_shared_with_the_host_witness,
         ),
     ];
+    let selected =
+        |name: &str| only.is_empty() || only.iter().any(|wanted| name.contains(wanted.as_str()));
+    if !controls.iter().any(|(name, _)| selected(name))
+        && !PA2_CONTROLS.iter().any(|(name, _)| selected(name))
+    {
+        return Err(format!("usage: --only {only:?} matches no control"));
+    }
     for (name, control) in controls {
+        if !selected(name) {
+            continue;
+        }
         control()?;
         println!("ok: {name}");
     }
-    pa2_is_dispatched_and_probes_in_order()?;
-    println!("ok: PA2 is dispatched and probes in order");
-    pa2_cannot_complete_without_its_signals()?;
-    println!("ok: PA2 cannot complete without its signals");
-    pa2_fails_on_a_policy_that_did_not_change()?;
-    println!("ok: PA2 fails on a policy that did not change");
+    for (name, control) in PA2_CONTROLS {
+        if !selected(name) {
+            continue;
+        }
+        control()?;
+        println!("ok: {name}");
+    }
     Ok(())
 }
+
+/// The three checks that run after the named controls, above, because they own a
+/// sequence rather than one oracle.
+type ProbeControl = (&'static str, fn() -> Result<(), String>);
+const PA2_CONTROLS: [ProbeControl; 3] = [
+    (
+        "PA2 is dispatched and probes in order",
+        pa2_is_dispatched_and_probes_in_order,
+    ),
+    (
+        "PA2 cannot complete without its signals",
+        pa2_cannot_complete_without_its_signals,
+    ),
+    (
+        "PA2 fails on a policy that did not change",
+        pa2_fails_on_a_policy_that_did_not_change,
+    ),
+];
 
 pub fn run(args: EgressProbeArgs) -> Result<crate::Outcome, String> {
     if !args.self_test {
@@ -1791,7 +1822,7 @@ pub fn run(args: EgressProbeArgs) -> Result<crate::Outcome, String> {
     if let Some(root) = args.repo_root {
         set_repo_root(root)?;
     }
-    self_test()?;
+    self_test(&args.only)?;
     Ok(crate::Outcome::Report(
         "egress probe controls passed: the wire primitives, the dispatcher's endpoint matrix and PA2"
             .to_owned(),
@@ -1806,6 +1837,9 @@ pub struct EgressProbeArgs {
     /// Repository root; `CARGO_MANIFEST_DIR/../..` when absent.
     #[arg(long, value_name = "PATH")]
     repo_root: Option<PathBuf>,
+    /// Run only the controls whose name contains this string. Repeatable.
+    #[arg(long, value_name = "NAME")]
+    only: Vec<String>,
 }
 
 #[cfg(test)]

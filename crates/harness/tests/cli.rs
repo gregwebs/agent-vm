@@ -1425,3 +1425,50 @@ fn the_binary_refuses_an_unpermitted_launch_extra() {
         "a bound that cannot terminate is misuse"
     );
 }
+
+/// The mutation anchors CI resolves: every row's find text is present in this
+/// checkout the expected number of times. The count is what `ci-contracts.sh`
+/// prints, so a ledger edit that silently drops a row fails here too.
+#[test]
+fn the_binary_checks_the_mutation_anchors() {
+    let output = harness(["egress-mutations".to_owned(), "--check-anchors".to_owned()]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("the anchor report is UTF-8"),
+        "PASS: 247 mutation anchors (find text only; a real run compiles each replacement)\n"
+    );
+}
+
+/// The refusals are distinguished from a surviving mutant: a missing
+/// `--evidence`, and an `--only` that names no row, are misuse (2), not a FAIL.
+#[test]
+fn the_binary_refuses_mutation_misuse() {
+    let no_evidence = harness(["egress-mutations".to_owned()]);
+    assert_eq!(no_evidence.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&no_evidence.stderr).contains("--evidence is required"),
+        "{}",
+        String::from_utf8_lossy(&no_evidence.stderr)
+    );
+    let unmatched = harness([
+        "egress-mutations".to_owned(),
+        "--only".to_owned(),
+        "no such mutation".to_owned(),
+        "--evidence".to_owned(),
+        env::temp_dir()
+            .join(format!("harness-cli-mutations-{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned(),
+    ]);
+    assert_eq!(unmatched.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&unmatched.stderr).contains("matched no mutation"),
+        "{}",
+        String::from_utf8_lossy(&unmatched.stderr)
+    );
+}

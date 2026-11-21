@@ -119,7 +119,7 @@ if [[ "$guard_only" == false ]]; then
     # emulator, not against the tracker that built them. The script says so loudly
     # and skips when tmux is not on PATH.
     bash "$REPO_ROOT/script/test/access-prompt-tmux-oracle.sh"
-    python3 "$REPO_ROOT/script/test/egress-mutations.py" --check-anchors
+    "$harness" egress-mutations --check-anchors
     # #358 moved launch options before the tool verb; the manual migration sweep
     # found the last old-order caller (profiling/) only by reading, so pin it.
     bash "$REPO_ROOT/script/test/launch-argv-order.sh"

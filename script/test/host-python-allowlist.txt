@@ -48,11 +48,12 @@ script/test/released-image-launch.py
 # egress-probe --self-test` and `harness egress-default-deny` now, so the two
 # `*.py` files and `egress-default-deny.sh`'s Python call are gone. #694 ported
 # the supervisor suite to `harness egress-supervisor --self-test`, which takes
-# `egress-default-deny-contract.sh` to zero `python3` sites. What is left here is
-# the library the other egress suites still import.
+# `egress-default-deny-contract.sh` to zero `python3` sites. #695 ported the
+# mutation runner to `harness egress-mutations`, which took the last host Python
+# out of this section; what is left is the library the other egress suites still
+# import.
 script/test/lib/egress-fixtures.py
 script/test/lib/egress-hostname-fixtures.py
-script/test/egress-mutations.py
 
 # --- Migration debt: persisted network -------------------------------------
 script/test/lib/persisted-network.py
@@ -76,8 +77,9 @@ script/test/lib/direct-terminal-contract.py
 script/test/e2e.sh 15
 # Runs every suite above, so it names Python until they are ported. The direct
 # terminal contract still needs python3 until #699 ports it; the detach shim it
-# runs is `harness detached-run` now.
-script/test/ci-contracts.sh 2
+# runs is `harness detached-run` now, and the mutation-anchor check it runs is
+# `harness egress-mutations --check-anchors` (#695).
+script/test/ci-contracts.sh 1
 
 # --- Fixture stub names, not invocations -----------------------------------
 # This harness check writes a deliberately broken `python3` onto a scratch PATH
