@@ -623,8 +623,8 @@ keeps process, Docker, fixture, and guest-probe orchestration in shell, while
 `crates/msb-krun-compat-evidence` parses and validates host-side evidence and
 writes its JSON records. That evidence crate is a separate small workspace
 member so the contract stays buildable ahead of the vendored `agentd` and the
-agent-vm runtime dependencies; the static Python provenance checker stays
-Cargo-independent for the same reason.
+agent-vm runtime dependencies; the static provenance checker (`crates/harness`)
+stays Cargo-independent for the same reason.
 
 On Apple Silicon macOS/HVF the device-discovery proof uses the flattened device
 tree plus guest sysfs and `virtiofs` mountinfo rather than an x86 command-line

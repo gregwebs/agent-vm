@@ -71,8 +71,7 @@ provenance, runs the harness contracts, and syntax-checks (`bash -n`) and lints
 (`shellcheck`) every script the workflow runs. Run it locally with shellcheck
 installed (`brew install shellcheck` on macOS, `sudo apt-get install -y
 shellcheck` on Debian/Ubuntu); the full gate also needs the recursive submodule,
-a working Cargo toolchain, and `jq`/`shasum`/`python3` for the suites ADR-0072
-has not ported yet.
+a working Cargo toolchain, and `jq`/`shasum` for the contract suites.
 
 `--guard-only` is not the gate. It runs the guard rails alone — no
 provenance, no contracts, and **no mutation-anchor check**
@@ -207,7 +206,7 @@ mode**, and the persisted-network acceptance does not require it.
 
 `bash script/test/build-provenance-contract.sh` drives the real build script in
 owned miniature Cargo/Git workspaces (controls B1–B19; needs the pinned Cargo,
-a working Git and Python). It is in `script/test/ci-contracts.sh`.
+a working Git and the built `harness`). It is in `script/test/ci-contracts.sh`.
 
 ### `CARGO_TARGET_DIR` must not be on a tmpfs prefix
 
@@ -559,11 +558,11 @@ loopback credentials in the OS keyring, a reachable host RFC1918/CGN address,
 and firewall access for TCP 18080/18081, UDP 19090/18080 and proxy 18888.
 Public HTTP/DNS controls must work before a denial is counted. Guest tools are
 checked at preflight; paired IPv6/rebind groups report NOT RUN when unavailable.
-On macOS, firewall access must cover the **host Python interpreter** serving the
-fixtures, not just the launcher. A blocked interpreter can accept a LAN socket
-and then fail with `Socket is not connected`, while loopback controls pass.
-Check the interpreter's incoming-connection status; use an already-allowed
-interpreter on the harness's `PATH` rather than changing operator firewall rules.
+On macOS, firewall access must cover the **`harness` binary** serving the
+fixtures, not just the launcher. A blocked server can accept a LAN socket and
+then fail with `Socket is not connected`, while loopback controls pass. Check
+the binary's incoming-connection status; use a harness path that is already
+allowed rather than changing operator firewall rules.
 Never change operator DNS, firewall, policy or keychain to make a test pass.
 
 The harness creates private HOME/state/cache and retains `summary.tsv`,

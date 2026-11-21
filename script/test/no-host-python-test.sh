@@ -22,6 +22,26 @@ ledger="$tree/script/test/host-python-allowlist.txt"
 }
 echo 'the real checkout is clean'
 
+# The closing ledger (#701) is finite and `.py`-free: five rows, 20 excused
+# occurrences. Assert it, so a future row is a deliberate edit rather than a
+# drift back toward host Python.
+allowlist="$ROOT/script/test/host-python-allowlist.txt"
+rows="$(grep -cvE '^[[:space:]]*(#|$)' "$allowlist")"
+[[ "$rows" == 5 ]] || {
+    echo "FAIL: the ledger has $rows rows, expected 5" >&2
+    exit 1
+}
+if grep -qE '\.py([[:space:]]|$)' "$allowlist"; then
+    echo 'FAIL: the ledger still lists a .py file' >&2
+    exit 1
+fi
+total="$(awk '!/^[[:space:]]*(#|$)/ { n += ($2 == "" ? 1 : $2) } END { print n + 0 }' "$allowlist")"
+[[ "$total" == 20 ]] || {
+    echo "FAIL: the ledger excuses $total occurrences, expected 20" >&2
+    exit 1
+}
+echo 'the ledger has five rows, no .py file and 20 occurrences'
+
 # A miniature checkout. `git add` is enough to make a file tracked, which is all
 # the guard scans; nothing here needs a commit or a git identity.
 mkdir -p "$tree/script/test" "$tree/crates/x/src" "$tree/tools"
@@ -144,6 +164,20 @@ write script/notes.sh \
     'echo run-python3'
 write crates/x/src/notes.rs 'pub fn go() {}' '// python3 used to be here.'
 pass 'a comment, a hostname, a python-named command and PYTHONPATH'
+
+# --- Documentation must not send contributors to a host interpreter -------
+# The retired prerequisite lived in prose, so a document that still requires
+# `python3` must fail the same guard. The second control keeps the true negative
+# statement ("needs no `python3`") from tripping the scan.
+mkdir -p "$tree/docs"
+# shellcheck disable=SC2016 # the doc line is fixture text for the guard to read.
+write docs/setup.md '# Setup' 'Host `python3` is required for the build or tests.'
+reject 'a document that requires host python3' 'docs/setup.md:2' 'documentation says'
+# shellcheck disable=SC2016 # same, for the negative control.
+write docs/setup.md '# Setup' 'Building the repository needs no `python3`.'
+pass 'a document that says python3 is not needed'
+rm -f "$tree/docs/setup.md"
+track
 
 # --- The ledger cannot outlive what it excuses ---------------------------
 set_allow script/exec.sh 1

@@ -2,9 +2,13 @@
 
 ## Status
 
-**Accepted, not yet implemented.** About 14k lines of test tooling are Python
-(21 tracked `.py` files, about 120 inline `python3` calls in shell, and two Rust
-tests that run `python3`). Each is ported one area at a time.
+**Accepted and implemented.** No tracked `.py` file remains; the ledger's five
+rows excuse 20 occurrences, all guest code, upstream `pyelftools` or a stub
+*name* ([#682](https://github.com/gregwebs/agent-vm/issues/682), closed by
+[#701](https://github.com/gregwebs/agent-vm/issues/701)). The starting point was
+about 14k lines of test tooling in Python (21 tracked `.py` files, about 120
+inline `python3` calls in shell, and two Rust tests that run `python3`), ported
+one area at a time.
 
 ## Decision
 
@@ -34,7 +38,9 @@ Everything that is Python today becomes either Rust or shell.
 - **A CI guard keeps Python out.** `script/test/no-host-python.sh` fails on a
   tracked `*.py` file, on a `python` call in a `*.sh` or `*.rs`, and on a
   `*.sh`/`*.rs` that reaches a `.py` file, unless
-  `script/test/host-python-allowlist.txt` excuses it. The ledger records how many
+  `script/test/host-python-allowlist.txt` excuses it. It also fails on a `*.md`
+  line that says the build or tests require host Python; that rule has no
+  allowlist, because a false prerequisite is not debt. The ledger records how many
   occurrences each listed file is allowed, so a new call in an already-listed
   file fails, and an entry that excuses too much or nothing fails as well: the
   list cannot outlive the Python it excuses.
@@ -75,9 +81,10 @@ own.
 
 ## Migration
 
-The port is bottom-up. When a shared Python module is ported, its Python copy
-stays, still on the allowlist, until its last Python caller is ported. There
-is no glue from Python to the new Rust.
+The port was bottom-up: when a shared Python module was ported, its Python copy
+stayed, still on the allowlist, until its last Python caller was ported. There
+was no glue from Python to the new Rust. The last three files were imported only
+by each other, so the closing ticket deleted them together.
 
 ## Considered options
 

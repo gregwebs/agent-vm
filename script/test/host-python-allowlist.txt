@@ -6,6 +6,9 @@
 # in, and one that is too high means a port left it behind. Both fail, so this is
 # a ledger of debt with a running total, not a per-file veto.
 #
+# The closing ledger (#701) has five rows, none a `.py` file, and 20 excused
+# occurrences.
+#
 # Three kinds of entry:
 #
 #   Guest exceptions - Python that runs inside the guest, not on the host.
@@ -14,8 +17,8 @@
 #   Vendor tooling - upstream's own Python, which this repository does not own.
 #   Out of scope, like the libkrunfw build's pyelftools.
 #
-#   Migration debt - Python still on the host. Each port ticket lowers or deletes
-#   its own numbers.
+#   Fixture stub names - a `python3` a harness check writes as a file, never
+#   runs. Its count is what keeps a real call from hiding among the names.
 
 # --- Guest exceptions -------------------------------------------------------
 # The CPU evidence workload: three guest command strings plus the name of the
@@ -30,25 +33,6 @@ script/test/fixtures/egress-probe.sh 10
 # --- Vendor tooling (libkrunfw bin2cbundle.py), out of scope per #682 -------
 profiling/build_legacy.sh 1
 profiling/build_variants.sh 1
-
-# --- Migration debt: released image launch ---------------------------------
-# The launch helper itself stays until its last importer
-# (script/test/lib/egress-fixtures.py) is ported: bottom-up rule, #692. Its
-# boot-free controls and the three shell callers are harness checks and harness
-# subcommands now, so this is the only file the section still excuses.
-script/test/released-image-launch.py
-
-# --- Migration debt: egress ------------------------------------------------
-# #693 took the wire and probe contracts off the host: they are `harness
-# egress-probe --self-test` and `harness egress-default-deny` now, so the two
-# `*.py` files and `egress-default-deny.sh`'s Python call are gone. #694 ported
-# the supervisor suite to `harness egress-supervisor --self-test`, which takes
-# `egress-default-deny-contract.sh` to zero `python3` sites. #695 ported the
-# mutation runner to `harness egress-mutations`, which took the last host Python
-# out of this section; what is left is the library the other egress suites still
-# import.
-script/test/lib/egress-fixtures.py
-script/test/lib/egress-hostname-fixtures.py
 
 # --- Persisted network: off the host (no entry) ----------------------------
 # #696 ported the rows to `harness persisted-network` and their boot-free half to
