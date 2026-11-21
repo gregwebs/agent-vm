@@ -415,6 +415,20 @@ impl OwnedChild {
         self.child.id() as i32
     }
 
+    /// Whether it has exited, without reaping it.
+    ///
+    /// A driver that has to drain a channel while it waits cannot use `finish`:
+    /// that would stop reading until the deadline, and a chatty child would block
+    /// on a full pipe. Asking for the status and reading are two steps here, and
+    /// reaping still happens through `finish` or `stop`.
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        let status = self.child.try_wait()?;
+        if status.is_some() {
+            self.reaped = true;
+        }
+        Ok(status)
+    }
+
     /// Wait for it, and kill it when the deadline passes.
     pub fn finish(&mut self, timeout: Duration) -> io::Result<ExitStatus> {
         let deadline = Instant::now() + timeout;
