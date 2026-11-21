@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Native evidence only: dedicated macOS Apple Silicon host, no concurrent VMs.
 #
-# The rows themselves are script/test/lib/config-mounts.py; this wrapper exists
-# to refuse a host that cannot produce trustworthy evidence *before* allocating
-# native scratch, and to retain the identities a reader needs to decide whether
-# the rows came from the committed candidate (#394 / ADR-0046). The named
+# The rows themselves are `harness config-mounts`: a Rust driver, so this wrapper
+# only refuses a host that cannot produce trustworthy evidence *before*
+# allocating native scratch, and retains the identities a reader needs to decide
+# whether the rows came from the committed candidate (#394 / ADR-0046). The named
 # mount-set rows CM-S1..S4 (#397 / ADR-0048) ride the same launches, bounds and
 # receipts: only the config bytes change between cleanly terminated launches.
 set -euo pipefail
@@ -172,7 +172,7 @@ root="$(cd "$root" && pwd -P)"
     refuse 'AGENT_VM_CM_EVIDENCE must be outside the scratch root'
 # Keep the trapped background PID equal to the driver, not a shell wrapper.
 cm_launch() {
-    exec python3 "$script_dir/lib/config-mounts.py" "$@"
+    exec "$harness" config-mounts --repo-root "$repo_root" "$@"
 }
 cm_launch "$root" "$evidence" "$AGENT_VM_BIN" "$AGENT_VM_LIVE_TEST_IMAGE" "$msb" &
 driver=$!

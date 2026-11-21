@@ -23,6 +23,12 @@ fail() {
     exit 1
 }
 
+# The rows' boot-free half is `harness config-mounts-controls`; a caller that
+# cannot find the binary gets the build command, never a silent fallback.
+harness="${HARNESS_BIN_DIR:-$REPO_ROOT/target/debug}/harness"
+[[ -x "$harness" ]] ||
+    fail "missing harness binary: $harness (run: cargo build --locked -p agent-vm-harness --bins)"
+
 work="$(mktemp -d "${TMPDIR:-/tmp}/avm-cmctl.XXXXXX")"
 # A read-only fixture directory cannot be removed until it is writable again.
 trap 'chmod -R u+w "$work" 2>/dev/null; rm -rf "$work"' EXIT
@@ -602,12 +608,12 @@ rm -f "$common/objects/gm-probe"
 # The native rows' own bookkeeping: a BLOCKED row is never a pass, and the commit
 # oracle rejects an unmoved branch. Boot-free, so this is the only place the
 # decision runs in CI.
-python3 "$SCRIPT_DIR/lib/config-mounts.py" --self-check ||
+"$harness" config-mounts-controls --repo-root "$REPO_ROOT" --only receipt ||
     fail 'the GM row logic self-check failed'
 # And the dispatch itself, over real fixtures and fake launches: `GM-MISSING`
 # blocks all seven rows after one launch, a commit line naming the seed object
 # fails `GM-N2-host`, and a real commit passes.
-python3 "$SCRIPT_DIR/lib/config-mounts.py" --dispatch-check ||
+"$harness" config-mounts-controls --repo-root "$REPO_ROOT" --only dispatch ||
     fail 'the GM dispatch check failed'
 
 echo 'automatic Git metadata probe controls passed (commit positive control, writable negative control, a-w positive control, off present/resolved, alias present/absent, hostile-environment isolation with its leak demonstration, GM row logic self-check, GM dispatch check; no VM; GM-N3 absent is guest-only)'
@@ -746,44 +752,7 @@ done
 echo 'wrapper preflight controls passed (refusals receipted, zero scratch allocated)'
 
 # --- The ci-contracts.sh guard entries are load bearing ----------------------
-python3 - "$REPO_ROOT" <<'PY'
-import subprocess
-import sys
-import tempfile
-from pathlib import Path
-
-root = Path(sys.argv[1])
-source = (root / "script/test/ci-contracts.sh").read_text()
-files = ("script/test/config-mounts-live.sh",
-         "script/test/config-mounts-contract.sh",
-         "script/test/lib/config-mounts.py",
-         "script/test/fixtures/config-mounts/guest-cm-probe.sh")
-# The companion must actually run in CI, not merely be listed.
-run_list = source.split("# --- Shell guard rail", 1)[0]
-assert 'bash "$REPO_ROOT/script/test/config-mounts-contract.sh"' in run_list, \
-    "ci-contracts.sh does not invoke the host controls"
-for array, label in (("syntax_check", "bash -n"), ("shellcheck_files", "shellcheck")):
-    for script in files:
-        if script.endswith(".py"):
-            # shellcheck and bash -n have nothing to say about a Python driver.
-            continue
-        start = source.index(array + "=(")
-        end = source.index("\n)", start)
-        block = source[start:end]
-        entry = "    " + script + "\n"
-        assert block.count(entry) == 1, (array, script)
-        assert f"assert_listed '{label}' '{script}'" in source, \
-            f"no explicit {label} membership assertion for {script}"
-        mutated = source[:start] + block.replace(entry, "", 1) + source[end:]
-        with tempfile.TemporaryDirectory(prefix="cm-control-mutation-") as tmp:
-            path = Path(tmp) / "script/test/ci-contracts.sh"
-            path.parent.mkdir(parents=True)
-            path.write_text(mutated)
-            result = subprocess.run(["bash", str(path), "--guard-only"],
-                                    capture_output=True, text=True, timeout=10)
-            assert result.returncode == 1, result.stdout + result.stderr
-            assert f"({script}) is missing from the {label} guard list" in result.stderr, result.stderr
-        print(f"host-only removal mutation PASS: {array}: {script}")
-PY
+"$harness" config-mounts-controls --repo-root "$REPO_ROOT" --only guard ||
+    fail 'the guard removal mutations failed'
 
 echo 'host-only config-mounts controls passed (probe rows including the named-set rows, preflight refusals, guard entries; no VM run)'

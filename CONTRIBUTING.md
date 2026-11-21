@@ -709,7 +709,7 @@ The retained evidence set is self-identifying: `source.txt`,
 --version`), `host.txt` (`sw_vers`, `uname -a`, `hw.model`/CPU), `image.txt`,
 `image-pins.json` (the launch's own first pin, whose recorded reference and
 manifest digest must **contain** the requested digest — a containment check,
-deliberately not equality; see `script/test/lib/config-mounts.py`),
+deliberately not equality; see `crates/harness/src/config_mounts.rs`),
 `summary.tsv` with a retained expected-versus-actual row per
 row, per-launch logs, `owned.jsonl` and `errors.json`.
 
@@ -749,9 +749,9 @@ row and host oracle is recorded as `BLOCKED: guest image has no git`: a third st
 `summary.tsv` and `totals.json` that is counted in neither `passed` nor `failed`, never a
 pass and never a product failure. The remaining GM launches are skipped, since each would
 measure the same absence. Two boot-free checks keep that logic honest, and
-`config-mounts-contract.sh` runs both: `--self-check` exercises the receipt and the GM-N2
-oracle directly, and `--dispatch-check` drives the **real** GM dispatch over real fixtures and
-fake launches — `GM-MISSING` must block all seven rows after exactly one launch, a `GM-N2`
+`config-mounts-contract.sh` runs both through `harness config-mounts-controls`: `--only
+receipt` exercises the receipt and the GM-N2 oracle directly, and `--only dispatch` drives the
+**real** GM dispatch over real fixtures and fake launches — `GM-MISSING` must block all seven rows after exactly one launch, a `GM-N2`
 line naming the seed object must fail `GM-N2-host`, and a launch that really commits must
 pass.
 
