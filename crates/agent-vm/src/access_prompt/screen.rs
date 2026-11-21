@@ -196,6 +196,7 @@ pub(crate) const NEVER_KEY: Key = Key {
 };
 
 /// Every key either offer can draw, for tests that hold them to the answer table.
+#[cfg(test)]
 pub(crate) const ALL_KEYS: [Key; 4] = [SESSION_KEY, PROJECT_KEY, DENY_KEY, NEVER_KEY];
 
 /// The grant's outcome, as the result frame shows it (§5.5, R20).
@@ -395,9 +396,7 @@ fn attempt(view: &View, size: Size, compact: bool, status: Status) -> Option<Lay
     // one row, whichever it is showing, so nothing below it moves (R17) and the
     // question costs no line it does not use. The compact form has no separators at
     // all, so it keeps the row only when it has something to say.
-    if !compact {
-        push_status(&mut rows, view, status, width);
-    } else if status.text().is_some() || count_text(view).is_some() {
+    if !compact || status.text().is_some() || count_text(view).is_some() {
         push_status(&mut rows, view, status, width);
     }
     match view.offer {

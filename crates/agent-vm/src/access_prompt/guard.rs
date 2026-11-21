@@ -100,6 +100,10 @@ pub open spec fn is_letter(byte: u8) -> bool {
 }
 
 /// [`is_letter`]'s exec form, as `egress_grammar` pairs `lower` with `lower_byte`.
+///
+/// The `<=` spelling (rather than clippy's suggested `(b'a'..=b'z').contains(&byte)`)
+/// is kept so the exec bytes stay syntactically the predicate `is_letter` unfolds to.
+#[allow(clippy::manual_range_contains)]
 pub fn is_letter_byte(byte: u8) -> (r: bool)
     ensures r == is_letter(byte),
 {

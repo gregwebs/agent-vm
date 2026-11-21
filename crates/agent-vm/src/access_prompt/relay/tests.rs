@@ -1574,10 +1574,8 @@ fn a_lone_escape_after_an_abandoned_partial_still_refuses() {
     let mut relay = fresh();
     let now = Instant::now();
     let visible = asking(&mut relay, now);
-    let quiet = settled(visible);
     relay.host_input(chunk(b"\x1b[", 2), visible);
     assert_eq!(relay.phase_name(), "asking");
-    let later = quiet + std::time::Duration::from_secs(1);
     relay.host_input(chunk(b"\x1b", 3), visible);
     assert_eq!(
         relay.phase_name(),
