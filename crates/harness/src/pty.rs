@@ -163,13 +163,25 @@ pub fn is_terminal(fd: impl AsFd) -> bool {
 /// (`EINTR`, which a relayed `SIGWINCH` produces) is retried with the time that
 /// is left, the way CPython's `select` retries it: a resize must not look like
 /// a timeout.
+///
+/// A `timeout` of zero is a *non-blocking poll*: it answers whether data is
+/// queued now and never waits for any to arrive. `direct_terminal`'s drains
+/// rely on that — they read a channel they have just seen readable.
 pub fn wait_readable(fd: impl AsFd, timeout: Duration) -> io::Result<bool> {
     let fd = fd.as_fd();
     let deadline = Instant::now() + timeout;
     loop {
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return Ok(false);
-        };
+        // Saturating, not `checked_duration_since`: a zero timeout must be one
+        // non-blocking `poll`, and by this line `Instant::now()` has already
+        // moved past `deadline`, so "is there time left?" would answer no and
+        // the poll would never happen. How much that costs depends on the
+        // clock's tick, so it is measured rather than assumed: on x86_64 Linux
+        // two consecutive `Instant::now()` calls differ 200,000 times in
+        // 200,000, while on aarch64 Linux and Apple Silicon they land in the
+        // same tick about half the time. `direct_terminal`'s drains therefore
+        // read the terminal on an Apple Silicon host and read nothing at all on
+        // x86_64 CI.
+        let remaining = deadline.saturating_duration_since(Instant::now());
         let mut fds = [PollFd::new(&fd, PollFlags::IN)];
         match poll(&mut fds, Some(&timespec(remaining))) {
             Ok(0) => return Ok(false),
@@ -189,6 +201,8 @@ pub fn wait_readable(fd: impl AsFd, timeout: Duration) -> io::Result<bool> {
 }
 
 /// Read one chunk within `timeout`: `None` when the deadline expired first.
+///
+/// A zero `timeout` reads only what is already queued (see [`wait_readable`]).
 ///
 /// A read of zero bytes is the end of the stream. For a pty master that
 /// includes its hangup: Linux reports the last slave's close as `EIO`, macOS
@@ -599,6 +613,31 @@ mod tests {
             read_chunk(&master, &mut buffer, Duration::from_secs(5))
                 .expect("a hangup is not an error"),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn a_zero_deadline_read_takes_what_is_queued_without_waiting() {
+        // `direct_terminal` drains a channel it has already seen readable with
+        // a zero deadline, so a zero deadline has to be one non-blocking poll.
+        // Reading it as "no time left" reads nothing at all, and whether that
+        // shows depends on the host clock, so it is pinned here where no
+        // clock can hide it.
+        let Pty { master, slave } = Pty::open().expect("open a pseudoterminal");
+        assert_eq!(
+            rustix::io::write(&slave, b"queued\n").expect("write to the slave"),
+            7
+        );
+        let mut buffer = [0u8; 64];
+        let read = read_chunk(&master, &mut buffer, Duration::ZERO)
+            .expect("a queued read is not an error")
+            .expect("a zero deadline reads what is already waiting");
+        // `\n` on the slave is `\r\n` on the master, as in the read above.
+        assert_eq!(&buffer[..read], b"queued\r\n");
+        // And an empty queue is still an answer, not a wait.
+        assert_eq!(
+            read_chunk(&master, &mut buffer, Duration::ZERO).expect("an idle read is not an error"),
+            None
         );
     }
 
