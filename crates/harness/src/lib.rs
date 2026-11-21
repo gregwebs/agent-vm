@@ -29,6 +29,7 @@ mod config_mounts;
 mod config_mounts_controls;
 mod cpu_commitment;
 mod detached_run;
+mod direct_terminal;
 // `e2e.sh`'s own inline helpers (#700): each one was a `python3` heredoc, and
 // each is a decision or a primitive the shell could only approximate (a JSON
 // prefix, an errno distinction, a byte-exact vector, a FIFO handshake, a socket
@@ -79,6 +80,8 @@ enum Command {
     ConfigMountsControls(config_mounts_controls::ConfigMountsControlsArgs),
     /// Drive Phase 0 CPU-commitment selection and runtime-provenance manifests.
     CpuCommitment(cpu_commitment::CpuCommitmentArgs),
+    /// Run one direct-terminal case against a launcher and write its evidence.
+    DirectTerminal(direct_terminal::DirectTerminalArgs),
     /// Run one command in a session with no controlling terminal and no stdin.
     DetachedRun(detached_run::DetachedRunArgs),
     /// Print the sandbox config a direct launch handed the SDK.
@@ -141,6 +144,7 @@ impl Cli {
             Command::BuildArchiveOracle(_) => "build archive oracle",
             Command::ReleasedImageLaunch(_) => "released-image launch",
             Command::DetachedRun(_) => "detached-run",
+            Command::DirectTerminal(_) => "direct-terminal",
             Command::E2eDebugJson(_) => "e2e debug-json",
             Command::E2eDirectArgv(_) => "e2e direct-argv",
             Command::E2eState(_) => "e2e state",
@@ -184,6 +188,7 @@ pub fn run(cli: Cli) -> Result<Outcome, String> {
         }
         Command::CpuCommitment(args) => cpu_commitment::run(args).map(Outcome::Report),
         Command::DetachedRun(args) => detached_run::run(args),
+        Command::DirectTerminal(args) => direct_terminal::run(args),
         Command::E2eDebugJson(args) => e2e_debug_json::run(args).map(Outcome::Report),
         Command::E2eDirectArgv(args) => e2e_direct_argv::run(args).map(Outcome::Report),
         Command::E2eState(args) => e2e_state::run(args).map(Outcome::Report),

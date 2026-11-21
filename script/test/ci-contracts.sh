@@ -81,11 +81,13 @@ if [[ "$guard_only" == false ]]; then
     bash "$REPO_ROOT/script/test/chrome-example-contract.sh"
     bash "$REPO_ROOT/script/test/chrome-example-contract-test.sh"
     # #400's native driver and guest probe: the boot-free controls prove the
-    # exact-byte, resize and restoration oracles reject a broken stand-in, so a
-    # later native run's evidence means something. Detached, like the other PTY
-    # controls, so no ambient terminal can help a case pass.
-    "$harness" detached-run \
-      python3 "$REPO_ROOT/script/test/lib/direct-terminal-contract.py"
+    # exact-byte, resize, restoration, prompt and guest-signal oracles reject a
+    # broken stand-in, so a later native run's evidence means something. Detached,
+    # like the other PTY controls, so no ambient terminal can help a case pass.
+    # `harness direct-terminal` is the whole driver now (#699 deleted the Python
+    # one and its contract script); the stand-in it drives is `harness
+    # launcher-standin` (#698).
+    "$harness" detached-run "$harness" direct-terminal --self-test
     # #455's sweep contract is boot-free and cheap, so it goes first: the
     # released-image control below can hang on a host for a pre-existing reason
     # (its reentrant-sigterm teardown), and then a plain run of this script never
