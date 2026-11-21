@@ -53,38 +53,53 @@ const PROMPT_ENTER: &[u8] = concat!(
     "\x1b[H\x1b[2J",
     "\x1b[2;1H\x1b[2Kagent-vm: the sandbox refused a network request from the guest",
     "\x1b[4;1H\x1b[2K  tcp 203.0.113.10:443",
-    "\x1b[8;1H\x1b[2K  d  keep refusing (also Enter or Esc)",
-    "\x1b[11;3H\x1b[2K  stop typing to answer...",
+    "\x1b[7;1H\x1b[2KHow should this request be treated?",
+    "\x1b[8;1H\x1b[2KType one of the below letters and press enter:",
+    "\x1b[9;1H\x1b[2K_",
+    "\x1b[11;1H\x1b[2K  d deny     keep refusing (also Enter or Esc)",
+    "\x1b[9;1H\x1b[6n",
 )
 .as_bytes();
-const PROMPT_READY: &[u8] = b"\x1b[11;3H\x1b[2K  ready for your answer\x1b[11;3H\x1b[6n";
+/// The question's instruction row: the prompt's evidence, and the row a typed
+/// answer appears under.
+const PROMPT_INSTRUCTION: &[u8] = b"Type one of the below letters and press enter:";
+/// The input row as it is drawn with nothing typed: what a read of the driver's
+/// reply puts back before an answer arrives.
+const PROMPT_INPUT: &[u8] = b"\x1b[9;1H\x1b[2K_";
 const PROMPT_LEAVE: &[u8] = b"\x1b[0m\x1b[H\x1b[2J\x1b[<u\x1b[?6h\x1b[?1049l";
 /// What the guest's modes must get back (the `refuse` probe's prelude).
 const PROMPT_MODES_BACK: &[u8] = b"\x1b(0\x1b[?1002h\x1b[?2004h";
 /// A redraw the product would never write after the leave: a broken variant's tell.
-const PROMPT_REDRAW_AFTER_LEAVE: &[u8] = b"\x1b[11;3H\x1b[2K  ready for your answer";
-/// The per-read redraw of the launcher's own answer cadence.
-const PROMPT_STOP_TYPING: &[u8] = b"\x1b[11;3H\x1b[2K  stop typing to answer...";
-/// The cadence's single cursor-position request, appended to `PROMPT_ENTER`.
-const PROMPT_CURSOR_REQUEST: &[u8] = b"\x1b[11;3H\x1b[6n";
+const PROMPT_REDRAW_AFTER_LEAVE: &[u8] =
+    b"\x1b[8;1H\x1b[2KType one of the below letters and press enter:";
+/// The takeover's single cursor-position request, the enter frame's last bytes.
+const PROMPT_CURSOR_REQUEST: &[u8] = b"\x1b[9;1H\x1b[6n";
 
-/// The reply a terminal sends back for one cursor-position request.
-const PROMPT_ANSWER: &[u8] = b"\x1b[24;80R";
+/// The reply a terminal sends back for the one cursor-position request: the
+/// input row the request moved to, in the reply's own spelling.
+const PROMPT_ANSWER: &[u8] = b"\x1b[9;1R";
 
 /// How long a host read waits before the launcher is declared dead.
 const HOST_READ_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long the launcher waits for the operator's answer key.
+/// How long the launcher waits for the operator's answer line and its Enter.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
-/// The cadence's reply window.
+/// The cadence's reply window: one reply to the one request it sent.
 const CADENCE_WINDOW: Duration = Duration::from_secs(1);
+/// How long the cadence waits for a second reply to that same request, which a
+/// driver answering twice sends at once.
+const CADENCE_SETTLE: Duration = Duration::from_millis(200);
 /// How long a held stream keeps its consumer open.
 const HELD_STREAM: Duration = Duration::from_secs(20);
 /// Bytes per forwarded chunk.
 const CHUNK: usize = 4096;
-/// The cadence stops counting after this many replies; more is already broken.
-const REPLY_LIMIT: usize = 8;
-/// The answer key the driver types.
+/// The answer line the driver types: a letter, then Enter.
 const ANSWER_KEY: &[u8] = b"d";
+const ANSWER_ENTER: &[u8] = b"\r";
+/// How long a control waits for a question the cadence abandoned: the reply
+/// window and its settle, with room for the guest to finish and be released. A
+/// cadence that took two replies as one would still be waiting out its 30 s
+/// answer deadline when this expires.
+const ABANDONED_WITHIN: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Args)]
 pub struct LauncherStandinArgs {
@@ -303,6 +318,14 @@ fn split_argv(argv: &[OsString]) -> Result<(&[OsString], String), String> {
     Ok((program, mode))
 }
 
+/// The input row after a key stroke: what is typed, then the cursor's `_`.
+fn prompt_input(typed: &[u8]) -> Vec<u8> {
+    let mut row = PROMPT_INPUT[..PROMPT_INPUT.len() - 1].to_vec();
+    row.extend_from_slice(typed);
+    row.push(b'_');
+    row
+}
+
 // --- The host terminal ------------------------------------------------------
 
 /// The terminal modes to put back when the launch is over.
@@ -381,15 +404,30 @@ fn read_host(buffer: &mut [u8], timeout: Duration) -> Result<Option<usize>, Stri
         .map_err(|error| die(&format!("cannot read the terminal: {error}")))
 }
 
-/// The operator's answer key, of which the launcher keeps at most 64 bytes.
-fn read_answer() -> Result<(), String> {
-    let mut answer = [0u8; 64];
-    match read_host(&mut answer, ANSWER_TIMEOUT)? {
-        Some(_) => Ok(()),
-        // The Python waited in a blocking read here, so a missing answer hung the
-        // run until the driver's own timeout. A control must fail instead.
-        None => Err(die("the driver never answered")),
+/// Read the typed answer up to its Enter, as a launcher's line reader does.
+///
+/// `prefix` is what this mode already read while it was counting replies: a
+/// letter can arrive before the count is finished, and a line is assembled from
+/// bytes, not from reads. The deadline is bounded so a driver that never answers
+/// fails the control instead of hanging it.
+fn read_answer_line(prefix: &[u8]) -> Result<Vec<u8>, String> {
+    let mut seen = prefix.to_vec();
+    let deadline = Instant::now() + ANSWER_TIMEOUT;
+    let mut buffer = [0u8; 64];
+    while !contains(&seen, b"\r") && !contains(&seen, b"\n") {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(die("the driver never answered"));
+        };
+        match read_host(&mut buffer, remaining)? {
+            // The terminal is gone, so no Enter can arrive on it.
+            Some(0) => return Err(die("the driver never answered")),
+            Some(read) => seen.extend_from_slice(&buffer[..read]),
+            // Nothing within the time that was left: the loop's own deadline turns
+            // that into the failure below rather than a silent read of nothing.
+            None => {}
+        }
     }
+    Ok(seen)
 }
 
 // --- The guest program ------------------------------------------------------
@@ -580,9 +618,10 @@ fn play_prompt(program: &[OsString], mode: Mode) -> Result<Outcome, String> {
     forward_until_ready(&mut out)?;
     write_out(PROMPT_ENTER)?;
     thread::sleep(Duration::from_millis(300));
-    write_out(PROMPT_READY)?;
-    // Wait for the answer key, which the driver types at the terminal.
-    read_answer()?;
+    // Wait for the answer line, which the driver types at the terminal: a letter
+    // (or its word) and then Enter.
+    let line = read_answer_line(b"")?;
+    write_out(&prompt_input(&without_enter(&line)))?;
     write_out(PROMPT_LEAVE)?;
     if !flag.no_modes {
         write_out(PROMPT_MODES_BACK)?;
@@ -607,37 +646,48 @@ fn play_prompt(program: &[OsString], mode: Mode) -> Result<Outcome, String> {
 
 /// Play the *launcher's* answer cadence, to exercise the driver's own rules.
 ///
-/// The real launcher sends one cursor-position request, treats a reply that
-/// arrives after visibility as typing, redraws the question with "stop typing",
-/// and draws "ready" again 0.7 s after the last input. A stand-in that accepted
-/// any read as the key cannot catch a driver that answers repeatedly; this mode
-/// can (H15). A driver that answers a request twice (H16: a pump without the
-/// shared driver re-initialises its count) therefore never sees "ready", and the
-/// control fails — that is the class this mode exists to catch.
+/// The real launcher sends one cursor-position request and treats any later reply
+/// as input. A stand-in that accepted any read as the answer (the plain
+/// `prompt-ok` mode) cannot catch a driver that answers repeatedly; this mode can
+/// (H15). A driver that answers a request twice (H16: a pump without the shared
+/// driver re-initialises its count) sends the second reply at once, and this mode
+/// then leaves the question unanswered — that is the class it exists to catch.
+/// The answer itself is a typed line, and every byte the driver sent before it is
+/// kept, because a letter can arrive while this mode is still counting replies.
 fn play_prompt_cadence(program: &[OsString]) -> Result<Outcome, String> {
     let saved = SavedModes::raw()?;
     let (mut child, mut out) = piped_guest(program)?;
     forward_until_ready(&mut out)?;
     write_out(PROMPT_ENTER)?;
-    write_out(PROMPT_CURSOR_REQUEST)?;
-    // Count *replies*, not reads, and count them per read: the terminal may
-    // coalesce several writes into one read, and the Python never carried a
-    // reply split across two reads either.
+    // Count *replies*, not reads: the terminal may coalesce several writes into
+    // one read, and a driver that answers twice must still be caught. The window
+    // ends at the first reply, because a driver that sends none never will.
+    let mut pending = Vec::new();
     let mut replies = 0;
     let mut buffer = [0u8; CHUNK];
     let window = Instant::now() + CADENCE_WINDOW;
-    while Instant::now() < window {
+    while replies == 0 && Instant::now() < window {
         let Some(read) = read_host(&mut buffer, Duration::from_millis(50))? else {
             continue;
         };
         if read == 0 {
             break;
         }
+        pending.extend_from_slice(&buffer[..read]);
         replies += count_cursor_replies(&buffer[..read]);
-        if replies > REPLY_LIMIT {
+        write_out(PROMPT_INPUT)?;
+    }
+    // A second reply to the same request arrives immediately; give it its moment.
+    let settle = Instant::now() + CADENCE_SETTLE;
+    while Instant::now() < settle {
+        let Some(read) = read_host(&mut buffer, Duration::from_millis(20))? else {
+            continue;
+        };
+        if read == 0 {
             break;
         }
-        write_out(PROMPT_STOP_TYPING)?;
+        pending.extend_from_slice(&buffer[..read]);
+        replies += count_cursor_replies(&buffer[..read]);
     }
     if replies != 1 {
         // Zero replies (no driver) or more than one (a driver answering twice):
@@ -652,10 +702,10 @@ fn play_prompt_cadence(program: &[OsString]) -> Result<Outcome, String> {
         drop(saved);
         return finish(status);
     }
-    thread::sleep(Duration::from_millis(750));
-    write_out(b"\x1b[11;3H\x1b[2K  ready for your answer\x1b[11;3H")?;
-    // Now the answer.
-    read_answer()?;
+    // Now the answer: a letter (or its word), then Enter.
+    let line = read_answer_line(&pending)?;
+    let typed = without_cursor_replies(&without_enter(&line));
+    write_out(&prompt_input(&typed))?;
     write_out(PROMPT_LEAVE)?;
     write_out(PROMPT_MODES_BACK)?;
     let held = release_held(&mut out)?;
@@ -686,34 +736,74 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
+/// The line without its Enter, exactly as Python's `rstrip(b"\r\n")` strips it.
+fn without_enter(line: &[u8]) -> Vec<u8> {
+    let mut end = line.len();
+    while end > 0 && (line[end - 1] == b'\r' || line[end - 1] == b'\n') {
+        end -= 1;
+    }
+    line[..end].to_vec()
+}
+
+/// The line's bytes with every cursor-position reply removed: a reply is the
+/// terminal's, not something the operator typed, so it is not part of the echo.
+fn without_cursor_replies(bytes: &[u8]) -> Vec<u8> {
+    let mut kept = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if let Some(after) = cursor_reply_at(bytes, index) {
+            index = after;
+            continue;
+        }
+        kept.push(bytes[index]);
+        index += 1;
+    }
+    kept
+}
+
+/// Where the `CSI row ; col R` reply starting at `index` ends, if one does.
+fn cursor_reply_at(bytes: &[u8], index: usize) -> Option<usize> {
+    if bytes.get(index) != Some(&0x1b) || bytes.get(index + 1) != Some(&b'[') {
+        return None;
+    }
+    let mut cursor = index + 2;
+    for group in 0..2 {
+        let start = cursor;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+            cursor += 1;
+        }
+        if cursor == start {
+            return None;
+        }
+        if group == 0 {
+            if bytes.get(cursor) != Some(&b';') {
+                return None;
+            }
+            cursor += 1;
+        }
+    }
+    (bytes.get(cursor) == Some(&b'R')).then_some(cursor + 1)
+}
+
+/// How many times `needle` occurs in `haystack`.
+fn count_of(haystack: &[u8], needle: &[u8]) -> usize {
+    haystack
+        .windows(needle.len())
+        .filter(|window| *window == needle)
+        .count()
+}
+
 /// How many `CSI row ; col R` replies one read holds.
 fn count_cursor_replies(bytes: &[u8]) -> usize {
     let mut count = 0;
     let mut index = 0;
     while index + 1 < bytes.len() {
-        if bytes[index] != 0x1b || bytes[index + 1] != b'[' {
-            index += 1;
-            continue;
-        }
-        let mut cursor = index + 2;
-        let mut rows = 0;
-        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
-            cursor += 1;
-            rows += 1;
-        }
-        let mut columns = 0;
-        if rows > 0 && cursor < bytes.len() && bytes[cursor] == b';' {
-            cursor += 1;
-            while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
-                cursor += 1;
-                columns += 1;
+        match cursor_reply_at(bytes, index) {
+            Some(after) => {
+                count += 1;
+                index = after;
             }
-        }
-        if rows > 0 && columns > 0 && cursor < bytes.len() && bytes[cursor] == b'R' {
-            count += 1;
-            index = cursor + 1;
-        } else {
-            index += 1;
+            None => index += 1,
         }
     }
     count
@@ -766,7 +856,7 @@ fn self_test(repo_root: Option<PathBuf>) -> Result<(), String> {
     an_early_exit_reaches_no_readiness(&scratch.path)?;
     a_prompt_takeover_orders_its_frames(&scratch.path)?;
     a_launcher_answer_cadence_answers_once(&scratch.path)?;
-    a_second_reply_never_reads_as_ready(&scratch.path)?;
+    a_second_reply_abandons_the_question(&scratch.path)?;
     no_program_after_the_boundary_is_misuse()?;
     Ok(())
 }
@@ -879,9 +969,22 @@ impl Terminal {
     /// Read until `needle` is in `seen`, which accumulates across calls: a needle
     /// that arrived in an earlier chunk must satisfy the later expectation.
     fn need(&self, seen: &mut Vec<u8>, needle: &[u8], timeout: Duration) -> Result<(), String> {
+        self.need_count(seen, needle, 1, timeout)
+    }
+
+    /// Read until `needle` has been written `times` times, for a needle the
+    /// takeover frame already holds one copy of: the second copy is the redraw a
+    /// later event wrote, and only the count tells them apart.
+    fn need_count(
+        &self,
+        seen: &mut Vec<u8>,
+        needle: &[u8],
+        times: usize,
+        timeout: Duration,
+    ) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
         let mut buffer = [0u8; CHUNK];
-        while !contains(seen, needle) {
+        while count_of(seen, needle) < times {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 return Err(format!(
                     "the stand-in never wrote {:?}: {:?}",
@@ -1184,11 +1287,13 @@ fn a_prompt_takeover_orders_its_frames(scratch: &Path) -> Result<(), String> {
         let mut child = terminal.launch(mode, "refuse/guest-probe.sh", "refuse", "run")?;
         let mut seen = Vec::new();
         terminal.need(&mut seen, b"REFUSE-READY", Duration::from_secs(30))?;
-        terminal.need(&mut seen, b"ready for your answer", Duration::from_secs(30))?;
+        terminal.need(&mut seen, PROMPT_INSTRUCTION, Duration::from_secs(30))?;
         check(mode, contains(&seen, PROMPT_ENTER), || {
             format!("the takeover frame never appeared: {:?}", text(&seen))
         })?;
+        // The answer is a line: a letter, then Enter.
         terminal.write(ANSWER_KEY)?;
+        terminal.write(ANSWER_ENTER)?;
         terminal.need(&mut seen, b"HELD-DONE", Duration::from_secs(30))?;
         terminal.drain(&mut seen, Duration::from_millis(300))?;
         let status = wait_bounded(&mut child, Duration::from_secs(30))?;
@@ -1217,6 +1322,9 @@ fn a_prompt_takeover_orders_its_frames(scratch: &Path) -> Result<(), String> {
         })?;
         check(mode, contains(&seen, b"LINE 18"), || {
             format!("a held line after LINE 17 went missing: {:?}", text(&seen))
+        })?;
+        check(mode, contains(&seen, &prompt_input(ANSWER_KEY)), || {
+            format!("the typed line was not echoed: {:?}", text(&seen))
         })?;
         let leave = seen
             .windows(PROMPT_LEAVE.len())
@@ -1259,7 +1367,7 @@ fn a_prompt_takeover_orders_its_frames(scratch: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// One request, one reply: the cadence must then draw ready and take the answer.
+/// One request, one reply: the cadence must then take the answer line and echo it.
 fn a_launcher_answer_cadence_answers_once(scratch: &Path) -> Result<(), String> {
     let terminal = Terminal::open(scratch)?;
     let mut child = terminal.launch("prompt-cadence", "refuse/guest-probe.sh", "refuse", "run")?;
@@ -1267,13 +1375,11 @@ fn a_launcher_answer_cadence_answers_once(scratch: &Path) -> Result<(), String> 
     terminal.need(&mut seen, b"REFUSE-READY", Duration::from_secs(30))?;
     terminal.need(&mut seen, PROMPT_CURSOR_REQUEST, Duration::from_secs(30))?;
     terminal.write(PROMPT_ANSWER)?;
-    terminal.need(&mut seen, b"ready for your answer", Duration::from_secs(30))?;
-    check(
-        "prompt-cadence",
-        contains(&seen, PROMPT_STOP_TYPING),
-        || format!("no stop-typing redraw in {:?}", text(&seen)),
-    )?;
+    // The one reply puts the empty input row back, and only then may the answer
+    // be typed: a cadence that is still counting has not offered the line yet.
+    terminal.need_count(&mut seen, PROMPT_INPUT, 2, Duration::from_secs(30))?;
     terminal.write(ANSWER_KEY)?;
+    terminal.write(ANSWER_ENTER)?;
     terminal.need(&mut seen, b"HELD-DONE", Duration::from_secs(30))?;
     let status = wait_bounded(&mut child, Duration::from_secs(30))?;
     let seen = text(&seen);
@@ -1281,12 +1387,18 @@ fn a_launcher_answer_cadence_answers_once(scratch: &Path) -> Result<(), String> 
         "prompt-cadence",
         status.code() == Some(9) && seen.contains("HELD-DONE"),
         || format!("status {status}, output {seen:?}"),
+    )?;
+    // The answered line is echoed on the input row, as the product draws it.
+    check(
+        "prompt-cadence",
+        contains(seen.as_bytes(), &prompt_input(ANSWER_KEY)),
+        || format!("the answered line was not echoed: {seen:?}"),
     )
 }
 
-/// Answering the one request twice must never read as ready: the class the
+/// Two replies to the one request must abandon the question: the class the
 /// cadence exists to catch (H16).
-fn a_second_reply_never_reads_as_ready(scratch: &Path) -> Result<(), String> {
+fn a_second_reply_abandons_the_question(scratch: &Path) -> Result<(), String> {
     let terminal = Terminal::open(scratch)?;
     let mut child = terminal.launch("prompt-cadence", "refuse/guest-probe.sh", "refuse", "run")?;
     let mut seen = Vec::new();
@@ -1295,17 +1407,25 @@ fn a_second_reply_never_reads_as_ready(scratch: &Path) -> Result<(), String> {
     // Two replies in one write: the terminal coalesced them, and a driver that
     // answered twice must still be caught.
     terminal.write(&[PROMPT_ANSWER, PROMPT_ANSWER].concat())?;
-    terminal.need(&mut seen, b"HELD-DONE", Duration::from_secs(30))?;
+    // The question is left unanswered, so the leave and the held output arrive
+    // without an answer: a cadence that took the two replies as one would still
+    // be waiting for a line nobody typed when this bound expired.
+    terminal.need(&mut seen, b"HELD-DONE", ABANDONED_WITHIN)?;
     let status = wait_bounded(&mut child, Duration::from_secs(30))?;
     let seen = text(&seen);
-    check(
-        "prompt-cadence",
-        !seen.contains("ready for your answer"),
-        || format!("two replies read as ready: {seen:?}"),
-    )?;
     check("prompt-cadence", status.code() == Some(9), || {
         format!("status {status} instead of the guest's 9")
-    })
+    })?;
+    check(
+        "prompt-cadence",
+        contains(seen.as_bytes(), PROMPT_LEAVE),
+        || format!("the question was never left: {seen:?}"),
+    )?;
+    check(
+        "prompt-cadence",
+        !contains(seen.as_bytes(), &prompt_input(ANSWER_KEY)),
+        || format!("an answered line was echoed with no answer typed: {seen:?}"),
+    )
 }
 
 fn no_program_after_the_boundary_is_misuse() -> Result<(), String> {
@@ -1393,6 +1513,47 @@ mod tests {
         assert_eq!(count_cursor_replies(b"\x1b[24;80"), 0);
         assert_eq!(count_cursor_replies(b"\x1b[;80R"), 0);
         assert_eq!(count_cursor_replies(b"plain"), 0);
+    }
+
+    #[test]
+    fn a_reply_is_not_part_of_the_typed_line() {
+        assert_eq!(
+            without_cursor_replies(b"\x1b[9;1Rd\r"),
+            b"d\r",
+            "the terminal's reply must not be echoed as part of the answer"
+        );
+        assert_eq!(without_cursor_replies(b"session"), b"session");
+        assert_eq!(without_cursor_replies(b"\x1b[9;1"), b"\x1b[9;1");
+    }
+
+    #[test]
+    fn the_enter_comes_off_the_line_and_not_the_letters() {
+        assert_eq!(without_enter(b"d\r\n"), b"d");
+        assert_eq!(without_enter(b"d\r"), b"d");
+        assert_eq!(without_enter(b"deny"), b"deny");
+    }
+
+    #[test]
+    fn the_input_row_echoes_the_typed_line_under_its_cursor() {
+        assert_eq!(prompt_input(b""), PROMPT_INPUT);
+        assert_eq!(prompt_input(b"d"), b"\x1b[9;1H\x1b[2Kd_");
+        assert_eq!(prompt_input(b"session"), b"\x1b[9;1H\x1b[2Ksession_");
+    }
+
+    #[test]
+    fn the_enter_frame_ends_with_its_one_position_request() {
+        assert!(
+            PROMPT_ENTER.ends_with(PROMPT_CURSOR_REQUEST),
+            "the takeover must ask for the input row's position once"
+        );
+        assert_eq!(
+            PROMPT_ENTER
+                .windows(PROMPT_CURSOR_REQUEST.len())
+                .filter(|window| *window == PROMPT_CURSOR_REQUEST)
+                .count(),
+            1,
+            "one takeover, one position request"
+        );
     }
 
     #[test]

@@ -61,25 +61,13 @@ script/test/lib/egress-hostname-fixtures.py
 # three `python3` sites and the live wrapper's one are gone with the library, so
 # this section has no entry left to keep.
 
-# --- Migration debt: ptys, direct terminal, e2e inline helpers -------------
-# The stand-in's only callers are direct-terminal.py and
-# direct-terminal-contract.py, so it stays until #699 ports them: bottom-up rule.
-# `harness launcher-standin` is its port, and `harness detached-run` replaced
-# lib/detached-run.py, which is gone.
-script/test/fixtures/direct-terminal/launcher-standin.py
-script/test/lib/direct-terminal.py
-script/test/lib/direct-terminal-contract.py
-# #700 ported every inline helper to a `harness e2e-*` subcommand: the FIFO
-# writer, the state-root and launcher-log oracles, the RSS stand-in, the cache
-# inventory, the registry push and the pin observer. The one site left is
-# `terminal_driver`'s `lib/direct-terminal.py` call, whose port is PR #728 (#699);
-# when that lands this line goes to zero and the entry is deleted.
-script/test/e2e.sh 1
-# Runs every suite above, so it names Python until they are ported. The direct
-# terminal contract still needs python3 until #699 ports it; the detach shim it
-# runs is `harness detached-run` now, and the mutation-anchor check it runs is
-# `harness egress-mutations --check-anchors` (#695).
-script/test/ci-contracts.sh 1
+# --- Direct terminal: off the host (no entry) ------------------------------
+# #699 ported the last host Python here: the rows are `harness direct-terminal`,
+# their boot-free half is `harness direct-terminal --self-test`, the stand-in is
+# `harness launcher-standin` (#698) and the detach shim is `harness detached-run`.
+# That took `ci-contracts.sh` off `python3` (it runs `detached-run direct-terminal
+# --self-test`) and `e2e.sh`'s `terminal_driver` row with it, so this section has
+# no entry left to keep.
 
 # --- Fixture stub names, not invocations -----------------------------------
 # This harness check writes a deliberately broken `python3` onto a scratch PATH
