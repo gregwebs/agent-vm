@@ -363,8 +363,17 @@ _dns_status() {
             exec 6<&- 6>&-; rm -f "$rfile"
             echo "DNS tcp $server $name INVALID"; return "$PROBE_NET"
         fi
-        _probe_timeout 3 dd bs=1 count="$frame" 2>/dev/null <&6 >"$rfile"
+        # A body cut short by our own deadline is a timeout; one cut short by
+        # the peer closing is an invalid frame. Reading the deadline's status is
+        # what keeps those two apart, and a peer that closes early still fails
+        # as INVALID.
+        local read_rc=0
+        _probe_timeout 3 dd bs=1 count="$frame" 2>/dev/null <&6 >"$rfile" || read_rc=$?
         exec 6<&- 6>&-
+        if (( read_rc == 124 )); then
+            rm -f "$rfile"
+            echo "DNS tcp $server $name TIMEOUT"; return "$PROBE_NET"
+        fi
         local got
         got=$(wc -c <"$rfile")
         if (( got != frame )); then
