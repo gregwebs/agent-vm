@@ -1190,8 +1190,10 @@ fn s1_environment_wins_over_every_other_source() {
     fixture.assert_no_trap_calls();
 }
 
+/// ADR-0074: the project config authorizes the boot image, so it outranks the
+/// `:trust` user image and only its own file is named.
 #[test]
-fn s2_user_config_wins_and_names_only_its_own_file() {
+fn s2_project_config_wins_and_names_only_its_own_file() {
     let fixture = Fixture::new();
     fixture.write_user_image(USER_REF);
     fixture.write_project_image(PROJECT_REF);
@@ -1202,16 +1204,20 @@ fn s2_user_config_wins_and_names_only_its_own_file() {
 
     assert_success(
         &output,
-        &expected(USER_REF, "user config", Some(&fixture.user_config())),
+        &expected(
+            PROJECT_REF,
+            "project config",
+            Some(&fixture.project_config()),
+        ),
     );
-    assert!(!stdout(&output).contains(PROJECT_REF));
+    assert!(!stdout(&output).contains(USER_REF));
     assert!(!stdout(&output).contains("/default-image.json"));
     assert_eq!(fixture.snapshot(), before);
     fixture.assert_no_trap_calls();
 }
 
 #[test]
-fn s3_project_config_is_the_last_explicit_source() {
+fn s3_project_config_wins_over_a_tools_only_user_tier() {
     let fixture = Fixture::new();
     // The user tier is readable but declares tools only: it must not become
     // the provenance of a project image.
@@ -1232,6 +1238,31 @@ fn s3_project_config_is_the_last_explicit_source() {
     );
     assert!(!stdout(&output).contains("/.config/agent-vm/config.toml"));
     assert_eq!(fixture.snapshot(), before);
+}
+
+/// ADR-0074: the `:trust` user image is the fallback when the project config
+/// sets no image of its own.
+#[test]
+fn s3c_user_config_is_the_fallback_when_the_project_sets_no_image() {
+    let fixture = Fixture::new();
+    fixture.write_user_image(USER_REF);
+    // A project config that decides the source list but no image.
+    fixture.write_project_config("sources = [\"home:trust ~/.config/agent-vm/config.toml\"]\n");
+    fixture.write_record_ref(RETAINED_A);
+    let before = fixture.snapshot();
+
+    let output = fixture.show();
+
+    assert_success(
+        &output,
+        &expected(USER_REF, "user config", Some(&fixture.user_config())),
+    );
+    assert_eq!(
+        fixture.snapshot(),
+        before,
+        "show must create and change nothing"
+    );
+    fixture.assert_no_trap_calls();
 }
 
 /// AC10 (#541): once a project has established its own default, `image show`
@@ -1335,7 +1366,11 @@ fn s6_empty_environment_is_unset() {
     let with_config = fixture.show_with_env(&[("AGENT_VM_IMAGE_TAG", "")]);
     assert_success(
         &with_config,
-        &expected(USER_REF, "user config", Some(&fixture.user_config())),
+        &expected(
+            PROJECT_REF,
+            "project config",
+            Some(&fixture.project_config()),
+        ),
     );
 
     fs::remove_file(fixture.user_config()).unwrap();

@@ -1460,6 +1460,7 @@ mod tests {
             ("mounts", "[\"/h/x:/g:ro\"]"),
             ("mount_sets", "{}"),
             ("network", "{}"),
+            ("sources", "[]"),
             ("tools", "[]"),
         ] {
             assert_eq!(

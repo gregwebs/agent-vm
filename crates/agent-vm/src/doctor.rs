@@ -134,7 +134,7 @@ use clap::Args as ClapArgs;
 use crate::boot_image;
 use crate::config::{
     CatalogEntry, ConfigConflict, ConfigReport, ConfiguredImage, ConfiguredImages, LaunchCatalog,
-    TierReport, TierStatus, ToolOrigin,
+    SourcesReport, TierReport, TierStatus, ToolOrigin,
 };
 use crate::credential_provider::{CredentialProvider, ProviderSet};
 use crate::credential_resolver;
@@ -250,27 +250,41 @@ fn run_to(
         // credential report and the launch view are both launch-aware (#178),
         // so they read the same catalog the tool-configuration section
         // renders, and a launch-verb list cannot diverge from `--help`.
-        let (config_section, catalog_failure, catalog, images) = match config {
+        let (config_section, catalog_failure, catalog, images, listed) = match config {
             Ok(report) => {
                 // Capture the readable image tiers before `describe_config`
                 // consumes the report (a catalog-build failure must not erase
                 // a readable image choice).
                 let images = report.images().clone();
+                // Only **explicitly listed** sources may suppress the legacy
+                // notice (ADR-0074 D9); a failed load has no sources at all.
+                let listed: Vec<PathBuf> = report
+                    .sources()
+                    .listed_files()
+                    .into_iter()
+                    .map(Path::to_path_buf)
+                    .collect();
                 let (section, failure, catalog) = describe_config(report);
-                (section, failure, catalog, Some(images))
+                (section, failure, catalog, Some(images), Some(listed))
             }
             Err(error) => (
                 format!("==> tool configuration\nerror: {error:#}"),
                 load_failure,
                 None,
                 None,
+                None,
             ),
         };
         // ADR-0073: an in-repo `.agent-vm/config.toml` is never read, so its
-        // presence is reported rather than silently ignored. Appended after the
-        // section is built so it reads the same whether the configuration loaded
-        // or failed.
-        let legacy = project.as_ref().ok().map(crate::project_config::legacy);
+        // presence is reported rather than silently ignored — unless the project
+        // config sources it, in which case it *is* read (ADR-0074). Appended after
+        // the section is built so it reads the same whether the configuration
+        // loaded or failed.
+        let listed: Vec<&Path> = listed.iter().flatten().map(PathBuf::as_path).collect();
+        let legacy = project
+            .as_ref()
+            .ok()
+            .map(|project| crate::project_config::legacy(project, &listed));
         let config_section = with_legacy_notice(config_section, legacy.as_ref());
         // Which variable supplied each root, so a withheld row names that one
         // rather than its sibling root's (#353).
@@ -1249,6 +1263,7 @@ fn describe_config(report: ConfigReport) -> (String, Option<anyhow::Error>, Opti
         describe_tier(report.user(), "user"),
         describe_tier(report.project(), "project"),
     );
+    let sources = describe_sources(report.sources());
     let resolved_label = if report.uses_defaults() {
         "resolved: built-in defaults; launch-verb order\n"
     } else {
@@ -1265,6 +1280,7 @@ fn describe_config(report: ConfigReport) -> (String, Option<anyhow::Error>, Opti
 
     let mut out = String::from("==> tool configuration\n");
     out.push_str(&tiers);
+    out.push_str(&sources);
     out.push_str(resolved_label);
     let (failure, catalog) = match report.into_launch_catalog() {
         Ok(catalog) => {
@@ -1327,6 +1343,34 @@ fn describe_egress_references(network: &crate::user_network::UserNetwork) -> Str
     out
 }
 
+/// The project config's sources (ADR-0074 R11).
+///
+/// Empty when sourcing was implicit, so a run that declares no `sources` key prints
+/// exactly what #733 printed. Each row uses the same renderer as a tier row, and the
+/// alias is printed raw because the grammar admits no control byte.
+fn describe_sources(sources: &SourcesReport) -> String {
+    use crate::config_sources::{SourceTrust, Sourcing};
+
+    if sources.sourcing() != Sourcing::Listed {
+        return String::new();
+    }
+    if sources.entries().is_empty() {
+        return "sources: none\n".to_string();
+    }
+    let mut out = String::from("sources:\n");
+    for entry in sources.entries() {
+        let label = match entry.trust() {
+            SourceTrust::Trusted => format!("{}:trust", entry.alias()),
+            SourceTrust::Untrusted => entry.alias().to_string(),
+        };
+        out.push_str(&format!(
+            "  {label} {}\n",
+            describe_tier(entry.tier(), &label)
+        ));
+    }
+    out
+}
+
 /// The `warning:` blocks for cross-tier shadows, in project declaration order.
 fn render_conflicts(conflicts: &[ConfigConflict]) -> String {
     let mut out = String::new();
@@ -1366,7 +1410,7 @@ fn with_legacy_notice(mut section: String, legacy: Option<&LegacyProjectConfig>)
             "\nnote: could not check for an in-repo .agent-vm/config.toml at {} ({kind:?}); agent-vm never auto-loads it.",
             crate::one_line::path(path)
         )),
-        Some(LegacyProjectConfig::Absent) | None => {}
+        Some(LegacyProjectConfig::Absent | LegacyProjectConfig::Sourced) | None => {}
     }
     section
 }
@@ -1378,6 +1422,11 @@ fn describe_tier(tier: &TierReport, label: &str) -> String {
         TierStatus::UnavailableHome => format!("<no HOME; {label} tier unavailable>"),
         TierStatus::Absent => format!(
             "{} (absent)",
+            tier.path()
+                .map_or_else(|| crate::one_line::text("<unknown>"), crate::one_line::path)
+        ),
+        TierStatus::NotSourced => format!(
+            "{} (not sourced by the project config)",
             tier.path()
                 .map_or_else(|| crate::one_line::text("<unknown>"), crate::one_line::path)
         ),
@@ -1483,18 +1532,7 @@ fn describe_boot_image(
         out.push_str(&active_row);
         return (out, failure.or(active_failure), None);
     };
-    out.push_str(&format!(
-        "user:    {}\n",
-        describe_configured_image(images.user())
-    ));
-    let project = describe_configured_image(images.project());
-    if images.user().is_some() && images.project().is_some() {
-        out.push_str(&format!(
-            "project: {project}  (overridden by the user image)\n"
-        ));
-    } else {
-        out.push_str(&format!("project: {project}\n"));
-    }
+    out.push_str(&describe_image_tiers(images));
     out.push_str(&format!("default: {default_row}\n"));
     out.push_str(&format!("project default: {project_default_row}\n"));
     out.push_str(&active_row);
@@ -1609,15 +1647,51 @@ fn describe_project_default_observation(
     }
 }
 
-/// `ghcr.io/owner/name:tag [/path/to/config.toml]` or `none`.
+/// The `user:`, `project:` and inert `source …:` rows of the boot-image section.
+///
+/// ADR-0074 R11: the project config (its own `image`, or an `ALIAS:image`
+/// selection) outranks the `:trust` source, so the losing row is the **user** one.
+/// An unselected source image is reported as inert — it exists, changes nothing,
+/// and the row says how to select it.
+fn describe_image_tiers(images: &ConfiguredImages) -> String {
+    let user = describe_configured_image(images.user());
+    let mut out = if images.user().is_some() && images.project().is_some() {
+        format!("user:    {user}  (overridden by the project image)\n")
+    } else {
+        format!("user:    {user}\n")
+    };
+    out.push_str(&format!(
+        "project: {}\n",
+        describe_configured_image(images.project())
+    ));
+    for inert in images.inert() {
+        out.push_str(&format!(
+            "source {alias}: {}  (not selected; the project config selects it with image = \"{alias}:image\")\n",
+            describe_configured_image(Some(inert.image())),
+            alias = inert.alias(),
+        ));
+    }
+    out
+}
+
+/// `ghcr.io/owner/name:tag [/path/to/config.toml]`, or
+/// `ghcr.io/owner/name:tag [ALIAS:image /path/to/source.toml]` for an image the
+/// project config authorized from a source (ADR-0074 R11).
 fn describe_configured_image(image: Option<&ConfiguredImage>) -> String {
     match image {
         None => "none".to_string(),
-        Some(image) => format!(
-            "{} [{}]",
-            crate::config::escape_str(image.reference().as_str()),
-            crate::one_line::path(image.file())
-        ),
+        Some(image) => match image.via() {
+            None => format!(
+                "{} [{}]",
+                crate::config::escape_str(image.reference().as_str()),
+                crate::one_line::path(image.file())
+            ),
+            Some(alias) => format!(
+                "{} [{alias}:image {}]",
+                crate::config::escape_str(image.reference().as_str()),
+                crate::one_line::path(image.file())
+            ),
+        },
     }
 }
 
@@ -1655,6 +1729,9 @@ fn describe_tool(entry: &CatalogEntry) -> String {
         ToolOrigin::BuiltIn => "built-in".to_string(),
         ToolOrigin::User(file) => format!("user:{}", crate::one_line::path(file)),
         ToolOrigin::Project(file) => format!("project:{}", crate::one_line::path(file)),
+        ToolOrigin::Source { alias, file } => {
+            format!("sourced:{alias}:{}", crate::one_line::path(file))
+        }
     };
     // Only surfaced when true, so this field leaves the default-config rows for
     // the six agents exactly as they were (`interactive_shell` is
@@ -4970,5 +5047,196 @@ credentials:
         let row = describe(&user, &project);
         assert!(row.ends_with("; network_requests=sk-test-sensitivevalue"));
         assert_eq!(row.matches("sk-test-sensitivevalue").count(), 1);
+    }
+
+    // -- sources (ADR-0074, V18) -------------------------------------------
+
+    /// A captured host-managed store, so the ADR-0073 route and the ADR-0074
+    /// `:trust` route checks run for real (the `for_test` fixtures are
+    /// `Uncaptured` and would hit E13 on a listed `sources`).
+    struct SourcesDoctor {
+        _root: tempfile::TempDir,
+        home: PathBuf,
+        project: ProjectDir,
+        config: PathBuf,
+    }
+
+    impl SourcesDoctor {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let base = root.path().canonicalize().unwrap();
+            let home = base.join("home");
+            let checkout = base.join("checkout");
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::create_dir_all(&checkout).unwrap();
+            let project = ProjectDir::from_path_for_tests(&checkout).unwrap();
+            let config = crate::project_config::path(&home, &project);
+            Self {
+                _root: root,
+                home,
+                project,
+                config,
+            }
+        }
+
+        fn user_config(&self) -> PathBuf {
+            self.home.join(".config/agent-vm/config.toml")
+        }
+
+        fn repo(&self, relative: &str) -> PathBuf {
+            self.project.path().join(relative)
+        }
+
+        fn write(&self, path: &Path, body: &str) {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+
+        /// Write the project config into a `0700` store directory, then load.
+        fn load(&self, project_body: &str, user_body: &str, repo_body: &str) -> ConfigReport {
+            self.write(&self.user_config(), user_body);
+            self.write(&self.repo(".agent-vm/config.toml"), repo_body);
+            std::fs::create_dir_all(self.config.parent().unwrap()).unwrap();
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(
+                self.config.parent().unwrap(),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            self.write(&self.config, project_body);
+            crate::config::load(&crate::config::ConfigPaths {
+                user: Some(self.user_config()),
+                project: Some(crate::project_config::ProjectTierPaths {
+                    config: self.config.clone(),
+                    route: crate::project_config::RouteAnchor::Captured {
+                        home: self.home.clone(),
+                        root: self.project.path().to_path_buf(),
+                    },
+                }),
+                home: Some(self.home.clone()),
+            })
+            .expect("fixture config loads")
+        }
+    }
+
+    /// V18: `describe_config` renders the source list and the `sourced:` label,
+    /// distinctly from an unsourced user tier and an empty list.
+    #[test]
+    fn v18_describe_config_renders_sources_and_a_not_sourced_user_tier() {
+        let f = SourcesDoctor::new();
+        let report = f.load(
+            "sources = [\"home:trust ~/.config/agent-vm/config.toml\", \"repo ./.agent-vm/config.toml\"]\n",
+            "[[tools]]\nname = \"home-tool\"\ncommand = \"home-tool\"\n",
+            "[[tools]]\nname = \"repo-tool\"\ncommand = \"repo-tool\"\n",
+        );
+        let user = f.user_config();
+        let repo = f.repo(".agent-vm/config.toml");
+        let (text, failure, catalog) = describe_config(report);
+        assert!(failure.is_none(), "{text}");
+        assert!(catalog.is_some());
+        assert!(
+            text.contains(&format!(
+                "sources:\n  home:trust {} (found, 1 tool)\n  repo {} (found, 1 tool)\n",
+                user.display(),
+                repo.display()
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("source=sourced:repo:{}", repo.display())),
+            "{text}"
+        );
+
+        // `sources = []`: nothing is sourced and the user row says so.
+        let f = SourcesDoctor::new();
+        let report = f.load(
+            "sources = []\n",
+            "[[tools]]\nname = \"home-tool\"\ncommand = \"home-tool\"\n",
+            "",
+        );
+        let (text, _, _) = describe_config(report);
+        assert!(text.contains("sources: none\n"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "user:    {} (not sourced by the project config)",
+                f.user_config().display()
+            )),
+            "{text}"
+        );
+    }
+
+    /// V18: the implicit cases are byte-identical where nothing changed, and the
+    /// dual-image row moves the override suffix to the user row (R9).
+    #[test]
+    fn v18_implicit_sourcing_prints_no_sources_block_and_flips_the_override_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("config.toml");
+        std::fs::write(&user, "image = \"localhost:1/u:latest\"\n").unwrap();
+        let report = config_report(Some(&user), &dir.path().join("absent.toml"));
+        let (text, _, _) = describe_config(report);
+        assert!(!text.contains("sources:"), "{text}");
+        assert!(!text.contains("not sourced"), "{text}");
+
+        let images = crate::config::ConfiguredImages::for_test(crate::config::ImageTierFixture {
+            user: Some(crate::config::ConfiguredImage::for_test(
+                "localhost:1/u:latest",
+                PathBuf::from("/h/.config/agent-vm/config.toml"),
+            )),
+            project: Some(crate::config::ConfiguredImage::for_test(
+                "localhost:1/p:latest",
+                PathBuf::from("/h/.config/agent-vm/projects/x/config.toml"),
+            )),
+            ..Default::default()
+        });
+        let rows = describe_image_tiers(&images);
+        assert_eq!(
+            rows,
+            "user:    localhost:1/u:latest [/h/.config/agent-vm/config.toml]  (overridden by the project image)\n\
+             project: localhost:1/p:latest [/h/.config/agent-vm/projects/x/config.toml]\n"
+        );
+
+        // The `ALIAS:image` form names both roles: the alias and the declaring file.
+        let images = crate::config::ConfiguredImages::for_test(crate::config::ImageTierFixture {
+            project: Some(crate::config::ConfiguredImage::for_test_via(
+                "localhost:1/repo:latest",
+                PathBuf::from("/w/app/.agent-vm/config.toml"),
+                "repo",
+            )),
+            inert: vec![crate::config::InertImage::for_test(
+                "localhost:1/team:latest",
+                PathBuf::from("/w/app/team.toml"),
+                "team",
+            )],
+            ..Default::default()
+        });
+        let rows = describe_image_tiers(&images);
+        assert_eq!(
+            rows,
+            "user:    none\n\
+             project: localhost:1/repo:latest [repo:image /w/app/.agent-vm/config.toml]\n\
+             source team: localhost:1/team:latest [/w/app/team.toml]  (not selected; the project config selects it with image = \"team:image\")\n"
+        );
+
+        // A path holding ESC is escaped in every new row.
+        let images = crate::config::ConfiguredImages::for_test(crate::config::ImageTierFixture {
+            inert: vec![crate::config::InertImage::for_test(
+                "localhost:1/team:latest",
+                PathBuf::from("/w/\u{1b}[31m/team.toml"),
+                "team",
+            )],
+            ..Default::default()
+        });
+        let rows = describe_image_tiers(&images);
+        assert!(!rows.contains('\u{1b}'), "{rows}");
+        assert!(rows.contains("\\x1b"), "{rows}");
+
+        // A sourced legacy file adds nothing to the section.
+        assert_eq!(
+            with_legacy_notice(
+                "==> tool configuration\nuser:    x\n".to_string(),
+                Some(&LegacyProjectConfig::Sourced)
+            ),
+            "==> tool configuration\nuser:    x\n"
+        );
     }
 }

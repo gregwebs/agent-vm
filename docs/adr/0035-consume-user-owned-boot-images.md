@@ -13,6 +13,9 @@ Amended for **all-source approval** by [agent-vm
 pinned, a changed pin needs candidate-scoped consent, and launches consume only
 approved child content. That approval is per **project** since #532
 ([ADR-0063](0063-project-scoped-oci-image-approval.md)).
+Amended by [ADR-0074](0074-flat-config-sources.md): the project config `image`
+(its own reference, or an `ALIAS:image` source selection) is preferred over the
+`:trust` user config `image`.
 Supersedes [ADR-0003](0003-project-tooling-layers.md),
 [ADR-0019](0019-tool-free-base-and-per-tool-layers.md) and
 [ADR-0028](0028-explicit-image-flag-beats-the-other-environment-variable.md).
@@ -72,8 +75,10 @@ the contributor gitlink and launcher recommendation, without a runtime source de
   user selected.
 - **One image per session**, chosen independently of the launched tool, by the
   precedence:
-  `--image` > `AGENT_VM_IMAGE_TAG` (empty = unset) > user config `image` >
-  project config `image` > the default boot image. `run`, `image refresh`, `setup` and
+  `--image` > `AGENT_VM_IMAGE_TAG` (empty = unset) > project config `image` >
+  user config `image` > the default boot image.
+  (Reordered by [ADR-0074](0074-flat-config-sources.md): the host-managed project
+  config authorizes the image, and the user image is its fallback.) `run`, `image refresh`, `setup` and
   `doctor` all resolve through one function (`boot_image::select`).
 - **Every OCI selection is host-approved (#390, amended).** Selection precedence
   is unchanged, but winning is not authorization. Each of the six tiers is keyed
@@ -168,9 +173,13 @@ the contributor gitlink and launcher recommendation, without a runtime source de
   mode may be offered later as an alternative to the version probe; it is not
   implemented. `--no-verify` skips the step. Launch still fails for a missing
   program.
-- A project can recommend an image but cannot override the user's selection
+- ~~A project can recommend an image but cannot override the user's selection
   (the user tier outranks the project tier, exactly as it does for tool
-  declarations, ADR-0015). It still cannot bind host paths through `image`.
+  declarations, ADR-0015).~~ **Superseded by
+  [ADR-0074](0074-flat-config-sources.md)** (0.8.1, #734): the project image
+  outranks the user image, because the project config is host-managed (ADR-0073)
+  and `ALIAS:image` is an explicit delegation. The project still cannot bind host
+  paths through `image`.
 - Retained from the abandoned ADR-0034 design: independent image versioning
   and integrity verification principles. Withdrawn by this ADR: same-repository image sources,
   archive-only distribution, a shared launcher composer, and a launcher-fixed
@@ -213,7 +222,10 @@ the contributor gitlink and launcher recommendation, without a runtime source de
   image-selection system and a local-build path on every launch.
 - **Let the project tier outrank the user tier for `image`.** Rejected: a cloned
   repository could then silently replace the user's chosen image, and the
-  tool-config merge already makes the user tier authoritative.
+  tool-config merge already makes the user tier authoritative. **Superseded by
+  [ADR-0074](0074-flat-config-sources.md)** (0.8.1, #734): the premise changed —
+  the project config is host-managed, so the repository no longer chooses, and
+  `ALIAS:image` makes the delegation explicit.
 - **Allow local paths in the config `image`.** Rejected as a sandbox escape: a
   repo-supplied `image = "/"` would boot the host root filesystem.
 - **Keep image-provenance-based `setup` severity.** Rejected: provenance cannot

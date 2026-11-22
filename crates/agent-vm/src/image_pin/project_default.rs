@@ -219,7 +219,7 @@ impl DefaultAdoption {
 /// not default. The one place a selection becomes a `DefaultAction`, so R3's
 /// rule that a selection made while the configuration was unreadable establishes
 /// nothing holds for `setup`, launch and `image pull` by construction.
-pub(super) fn establishment(boot: &BootImage) -> Result<DefaultAction> {
+pub(crate) fn establishment(boot: &BootImage) -> Result<DefaultAction> {
     let host = match boot.source() {
         ImageSource::RetainedDefault(_) => HostRetention::Keep,
         ImageSource::InitialRecommendation => HostRetention::InitializeIfAbsent,
@@ -228,7 +228,8 @@ pub(super) fn establishment(boot: &BootImage) -> Result<DefaultAction> {
         | ImageSource::CommandLine
         | ImageSource::Environment
         | ImageSource::UserConfig(_)
-        | ImageSource::ProjectConfig(_) => return Ok(DefaultAction::None),
+        | ImageSource::ProjectConfig(_)
+        | ImageSource::SourcedConfig { .. } => return Ok(DefaultAction::None),
     };
     let reference = immutable(boot)?;
     // R3's binding rule: a selection made while the configuration was

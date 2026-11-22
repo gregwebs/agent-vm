@@ -9,9 +9,9 @@
 //! working in another project must not change which image a default launch
 //! boots, so the record lives beside the other user-scoped agent-vm settings
 //! (`$HOME/.config/agent-vm/`) and **never** inside project state, the msb home
-//! or `config.toml`. Writing a top-level `image =` into `config.toml` would make
-//! the user tier outrank the project tier, which is a precedence change, not a
-//! retention.
+//! or `config.toml`. Writing a top-level `image =` into `config.toml` would put a
+//! configured tier ahead of this record in the selection order — a precedence
+//! change, not a retention.
 //!
 //! # Why this module only encodes, decodes and snapshots now
 //!

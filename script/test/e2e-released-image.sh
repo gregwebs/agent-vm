@@ -190,14 +190,30 @@ cp "$record" "$WORK/override-record.before"
 cp "$project" "$WORK/project.before"
 launch r project-override --no-git shell bash -c true
 cmp "$project" "$WORK/project.before"
-printf 'image = "invalid.example/unavailable:test"\n' > "$project"
-printf 'image = "av265:override"\n' > "$user"
-cp "$project" "$WORK/project.bad.before"
-cp "$user" "$WORK/user.before"
-launch r user-override --no-git shell bash -c true
-cmp "$project" "$WORK/project.bad.before"
-cmp "$user" "$WORK/user.before"
+# ADR-0074 D5: the project config outranks the `:trust` user image, so the valid
+# reference is the project's and the unusable one is the user's: `user-override`
+# is now `project-over-user`. The launch must succeed on the project reference
+# and leave both files untouched, which is what proves the project won.
+printf 'image = "av265:override"\n' > "$project"
 printf 'image = "invalid.example/unavailable:test"\n' > "$user"
+cp "$project" "$WORK/project.override.before"
+cp "$user" "$WORK/user.override.before"
+launch r project-over-user --no-git shell bash -c true
+cmp "$project" "$WORK/project.override.before"
+cmp "$user" "$WORK/user.override.before"
+# The user image is the fallback when the project config sets no image. An empty
+# project config keeps the implicit `home:trust` source (ADR-0074 D2), so the user
+# file stays read and its image becomes the selected one.
+printf '# no image\n' > "$project"
+printf 'image = "av265:override"\n' > "$user"
+cp "$project" "$WORK/project.no-image.before"
+cp "$user" "$WORK/user.fallback.before"
+launch r user-fallback --no-git shell bash -c true
+cmp "$project" "$WORK/project.no-image.before"
+cmp "$user" "$WORK/user.fallback.before"
+printf 'image = "invalid.example/unavailable:test"\n' > "$project"
+printf 'image = "invalid.example/unavailable:test"\n' > "$user"
+cp "$project" "$WORK/project.bad.before"
 cp "$user" "$WORK/user.bad.before"
 launch r env-override IMAGE_ENV=av265:override --no-git shell bash -c true
 launch r cli-override IMAGE_ENV=invalid.example/unavailable:test --no-git --image av265:override shell bash -c true

@@ -755,8 +755,8 @@ pub struct Args {
     pub(crate) dockerfile: Option<PathBuf>,
 
     /// The image this session boots. See "Selecting the boot image" in
-    /// USAGE.md for the full precedence (flag/env > user config > project
-    /// config > default).
+    /// USAGE.md for the full precedence (flag/env > project config >
+    /// `:trust` user config > default).
     #[command(flatten)]
     pub(crate) image: ImageArgs,
 

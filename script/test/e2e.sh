@@ -183,10 +183,12 @@ OWNED_BUILDER=""
 # `$HOME/.config/agent-vm/projects/<digest>/config.toml`. A candidate that still
 # reads `<project>/.agent-vm/config.toml` would silently fall back to the
 # built-in defaults, so an un-migrated launcher is refused up front rather than
-# passing vacuously. `agent-vm <major>.<minor>.<patch> (...)`: 0.8.0 is the first
-# release with the host-managed tier.
+# passing vacuously. `agent-vm <major>.<minor>.<patch> (...)`: 0.8.1 is the first
+# release with the host-managed tier, flat `sources` (ADR-0074) and the flipped
+# image precedence — an older candidate would fail the flipped rows below
+# misleadingly rather than because it is broken.
 candidate_reads_host_managed_config() {
-  local bin="$1" version major minor
+  local bin="$1" version major minor patch
   version="$("$bin" --version 2>/dev/null | awk 'NR == 1 {print $2}')" || return 1
   case "$version" in
   [0-9]*.[0-9]*.[0-9]*) ;;
@@ -195,7 +197,10 @@ candidate_reads_host_managed_config() {
   major="${version%%.*}"
   minor="${version#*.}"
   minor="${minor%%.*}"
-  [ "$major" -gt 0 ] || { [ "$major" -eq 0 ] && [ "$minor" -ge 8 ]; }
+  patch="${version#*.*.}"
+  patch="${patch%%[!0-9]*}"
+  [ "$major" -gt 0 ] ||
+    { [ "$major" -eq 0 ] && { [ "$minor" -gt 8 ] || { [ "$minor" -eq 8 ] && [ "$patch" -ge 1 ]; }; }; }
 }
 
 [[ -x "$AGENT_VM" ]] || die "launcher not found at $AGENT_VM; build it with
@@ -7024,24 +7029,25 @@ custom_image_default_upgrade() {
   reads_after="$(upgrade_registry_read_count "$container")" || result=1
   upgrade_docker logs "$container" > "$WORK/upgrade-registry-after.log" 2>&1 || result=1
   assert_eq 'warm default makes zero registry reads' "$reads_before" "$reads_after" || result=1
-  # Adjacent override boundaries use guest stamps, not notices. User A must
-  # outrank project B, env B must outrank user A, and CLI B must outrank env A.
-  # The project-only case then repoints the project fixture to A, so project A
-  # must outrank the retained default B: a launcher that ignored project
-  # overrides would fall through to retained B (stamp=present) and fail there.
-  printf 'image = "%s"\n' "$ref_a" > "$RETAINED_HOME/.config/agent-vm/config.toml"
+  # Adjacent override boundaries use guest stamps, not notices. B is the stamped
+  # image (stamp=present) and A the unstamped one (stamp=absent). ADR-0074 makes
+  # the project config outrank the `:trust` user image, so the tiers are seeded
+  # to keep every boundary non-vacuous: user = B, project = A, env = B, CLI = B.
+  # A dropped env check then falls through to project A (stamp=absent), a dropped
+  # project check to user B (stamp=present), and a dropped user fallback below to
+  # the retained default B.
+  printf 'image = "%s"\n' "$ref_b" > "$RETAINED_HOME/.config/agent-vm/config.toml"
   cp "$proj_cfg" "$WORK/upgrade-project-before"
-  { printf 'image = "%s"\n' "$ref_b"; cat "$WORK/upgrade-project-before"; } > "$proj_cfg"
+  { printf 'image = "%s"\n' "$ref_a"; cat "$WORK/upgrade-project-before"; } > "$proj_cfg"
   cp "$proj_cfg" "$WORK/upgrade-project-with-image"
   cp "$RETAINED_HOME/.config/agent-vm/config.toml" "$WORK/upgrade-user-before"
   local tier expected
-  for tier in cli env user; do
+  for tier in cli env project; do
     retained_env
-    expected=stamp=absent
     case "$tier" in
       cli) LAUNCH_ENV+=(AGENT_VM_IMAGE_TAG="$ref_a"); retained_launch "upgrade-$tier" "$proj" --no-git --image "$ref_b" hello-258; expected=stamp=present ;;
       env) LAUNCH_ENV+=(AGENT_VM_IMAGE_TAG="$ref_b"); retained_launch "upgrade-$tier" "$proj" --no-git hello-258; expected=stamp=present ;;
-      user) retained_launch "upgrade-$tier" "$proj" --no-git hello-258 ;;
+      project) retained_launch "upgrade-$tier" "$proj" --no-git hello-258; expected=stamp=absent ;;
     esac
     require_launch_ok "upgrade-$tier" || result=1
     out="$(launch_output "upgrade-$tier")"
@@ -7050,18 +7056,23 @@ custom_image_default_upgrade() {
     cmp "$(retained_record)" "$WORK/upgrade-record-before" || result=1
     cmp "$RETAINED_HOME/.config/agent-vm/config.toml" "$WORK/upgrade-user-before" || result=1
   done
-  # Project-only: remove the user tier and repoint the project fixture to A,
-  # refreshing its expected-byte snapshot before the guest observation.
-  rm "$RETAINED_HOME/.config/agent-vm/config.toml"
-  { printf 'image = "%s"\n' "$ref_a"; cat "$WORK/upgrade-project-before"; } > "$proj_cfg"
-  cp "$proj_cfg" "$WORK/upgrade-project-with-image"
+  # User-only fallback: the project config sources the user file but sets no
+  # image, so the user image A must outrank the retained default B.
+  cp "$WORK/upgrade-project-before" "$proj_cfg"
+  cp "$proj_cfg" "$WORK/upgrade-project-no-image"
+  printf 'image = "%s"\n' "$ref_a" > "$RETAINED_HOME/.config/agent-vm/config.toml"
+  cp "$RETAINED_HOME/.config/agent-vm/config.toml" "$WORK/upgrade-user-a"
   retained_env
-  retained_launch upgrade-project "$proj" --no-git hello-258 || result=1
-  require_launch_ok upgrade-project || result=1
-  out="$(launch_output upgrade-project)"
-  assert_eq 'upgrade override project guest' stamp=absent "$(grep '^stamp=' <<<"$out")" || result=1
-  cmp "$proj_cfg" "$WORK/upgrade-project-with-image" || result=1
+  retained_launch upgrade-user-fallback "$proj" --no-git hello-258 || result=1
+  require_launch_ok upgrade-user-fallback || result=1
+  out="$(launch_output upgrade-user-fallback)"
+  assert_eq 'upgrade user fallback guest' stamp=absent "$(grep '^stamp=' <<<"$out")" || result=1
+  cmp "$proj_cfg" "$WORK/upgrade-project-no-image" || result=1
   cmp "$(retained_record)" "$WORK/upgrade-record-before" || result=1
+  cmp "$RETAINED_HOME/.config/agent-vm/config.toml" "$WORK/upgrade-user-a" || result=1
+  # The offline rows below observe the retained default, which only wins with no
+  # user tier.
+  rm "$RETAINED_HOME/.config/agent-vm/config.toml"
   cp "$WORK/upgrade-project-before" "$proj_cfg"
   upgrade_docker rm -f "$container" >/dev/null || result=1
   retained_env

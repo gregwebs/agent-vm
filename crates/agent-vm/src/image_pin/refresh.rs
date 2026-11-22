@@ -65,7 +65,7 @@ pub(crate) enum AmbientRefresh {
     /// A filtered target is already proven held, so the ambient selection is
     /// irrelevant and the default slot is never read.
     NotNeeded,
-    /// The image a launch here would boot (env > user > project > default).
+    /// The image a launch here would boot (env > project > `:trust` user > default).
     Selected(BootImage),
     /// A filtered target that could not be proven must not invent a selection;
     /// an unfiltered invocation refuses the command with this error instead.

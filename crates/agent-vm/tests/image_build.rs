@@ -3118,10 +3118,22 @@ fn import_compares_the_effective_selection() {
 
 #[test]
 fn import_follows_the_tier_precedence_of_the_selection() {
-    // user differs, project matches: user wins, so the result does not match.
+    // ADR-0074: the project config outranks the `:trust` user image.
+    // user differs, project matches: the project wins, so silent.
     let mut harness = Harness::new();
     harness.write_user_image("app:user");
     let cwd = harness.write_project_image("app:dev");
+    let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+    harness.replay(&written);
+    let out = harness.run_in(&cwd, &["image", "import", "--docker", "app:dev"]);
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert!(stdout_of(&out).is_empty(), "{}", stdout_of(&out));
+
+    // user matches, project differs: the project wins, so the result does not
+    // match and the hint is printed.
+    let mut harness = Harness::new();
+    harness.write_user_image("app:dev");
+    let cwd = harness.write_project_image("app:project");
     let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
     harness.replay(&written);
     let out = harness.run_in(&cwd, &["image", "import", "--docker", "app:dev"]);
@@ -3130,16 +3142,6 @@ fn import_follows_the_tier_precedence_of_the_selection() {
         stdout_of(&out),
         format!("{}{SHOW_HINT}", launch_notice("app:dev"))
     );
-
-    // user matches, project differs: the user tier wins, so silent.
-    let mut harness = Harness::new();
-    harness.write_user_image("app:dev");
-    let cwd = harness.write_project_image("app:project");
-    let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
-    harness.replay(&written);
-    let out = harness.run_in(&cwd, &["image", "import", "--docker", "app:dev"]);
-    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
-    assert!(stdout_of(&out).is_empty(), "{}", stdout_of(&out));
 
     // project only, matching: silent.
     let harness = Harness::new();

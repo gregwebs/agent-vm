@@ -405,6 +405,22 @@ impl OpenedRegularFile {
         }
         Ok(data)
     }
+
+    /// The bytes plus the descriptor's own facts, as one [`VerifiedRead`].
+    ///
+    /// The readings that must measure *before* deciding take this shape: the
+    /// already-open no-follow descriptor supplies both, so there is no second
+    /// path lookup that could observe a different file than the bytes came from.
+    pub(crate) fn into_verified_read(self, max: u64) -> Result<VerifiedRead> {
+        let path = self.path.clone();
+        let final_component = FinalComponent::Regular(self.facts);
+        let bytes = self.read_bounded(max)?;
+        Ok(VerifiedRead {
+            path,
+            bytes,
+            final_component,
+        })
+    }
 }
 
 /// [`open_regular_no_follow_checkpointed`]'s success is `None` for a final
@@ -544,6 +560,21 @@ pub(crate) fn read_bounded_regular_file_noting_symlink(
     max: u64,
 ) -> Result<VerifiedRead> {
     read_bounded_regular_file_noting_symlink_checkpointed(path, max, || {})
+}
+
+/// [`read_bounded_regular_file_noting_symlink`] for a caller that has already
+/// established the final component *is* a symlink and has decided to follow it:
+/// the target is read with a bounded regular read and carries no descriptor facts.
+///
+/// Separated from the sniffing reader so a caller whose decision depends on the
+/// final component (ADR-0040's user tier, ADR-0074's `:trust` source) states that
+/// decision instead of letting a reader re-observe it.
+pub(crate) fn read_bounded_symlink_target(path: &Path, max: u64) -> Result<VerifiedRead> {
+    read_bounded_regular_file(path, max).map(|bytes| VerifiedRead {
+        path: path.to_path_buf(),
+        bytes,
+        final_component: FinalComponent::Symlink,
+    })
 }
 
 // The checkpoint tests replacement without introducing a second production read path.
