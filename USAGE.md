@@ -4265,10 +4265,10 @@ agent-vm access --session 3f9a12c4    # one live or logged session
 ```
 
 ```text
-ID        KIND            DESTINATION                                                         COUNT  LAST-SEEN          SESSION          ACTION
-46d712fd  network denial  tcp 203.0.113.10:443 · api.example.com (DNS cache, guest-supplied)  3      2025-10-09 08:52Z  running          no grant in this version; relaunch with --allow-egress
-88f5da9d  network denial  tcp cdn.example:443 (SNI, guest-supplied) · last IP 198.51.100.8    1      2025-10-09 08:51Z  ended (unclean)  no grant in this version; relaunch with --allow-egress
-a00b2078  policy lock     tcp 10.0.0.7:53                                                     1      2025-10-09 08:49Z  ended            can't be allowed: platform policy
+ID        KIND            DESTINATION                                                         COUNT  FIRST-SEEN         LAST-SEEN          SESSION          ACTION
+46d712fd  network denial  tcp 203.0.113.10:443 · api.example.com (DNS cache, guest-supplied)  3      2025-10-09 08:50Z  2025-10-09 08:52Z  running          run `agent-vm access allow 46d712fd --session 3f9a12c4` (session) or `agent-vm access allow 46d712fd --session 3f9a12c4 --project`
+88f5da9d  network denial  tcp cdn.example:443 (SNI, guest-supplied) · last IP 198.51.100.8    2      2025-10-09 08:51Z  2025-10-09 08:53Z  ended (unclean)  session ended; run `agent-vm access allow 88f5da9d --session 0e0f1011 --project`
+a00b2078  policy lock     tcp 10.0.0.7:53                                                     1      2025-10-09 08:49Z  2025-10-09 08:49Z  ended            can't be allowed: platform policy
 ```
 
 **Refusals coalesce.** One row is one destination in one session, and one row per
@@ -4284,7 +4284,12 @@ name is marked and escaped — it is text, never a fact.
 destination and — for a credential refusal — the credential, stored in the log and
 never recomputed, so a row you copied from a run is the same row after the session
 ends. The same ID appearing in two sessions is flagged in a footer and never
-renamed.
+renamed: an ID is unique within one session, not across them.
+
+**The time columns** are when this destination was first and last refused in that
+session, to the minute. The first sighting survives later ones. Minute precision
+cannot tell 50 attempts in one minute from a single one, so it is `COUNT`, not the
+two columns, that separates a single burst from a refusal that keeps recurring.
 
 **The session column** is one of `running`, `running (no control socket)`,
 `ended`, `ended (unclean)` or `not responding`. A session that bound no control
@@ -4292,14 +4297,38 @@ socket (a state root too deep for the kernel's socket path limit, or a busy log)
 is still listed from the log while its heartbeat is fresh; one that stopped
 without cleaning up is `ended (unclean)`.
 
-**The action column says why nothing can be done yet, or which record names the
-destination.** This release grants nothing from `access`: it lists refusals and
-names the reason. `no grant in this version; relaunch with --allow-egress` is a
-network denial no record covers; `can't be allowed: platform policy` is the
-deployment floor; `can't be allowed here: credential policy` is the credential
-boundary; `can't be allowed: built-in rule <site>` is an engine rule no allowance
-reaches. A credential refusal goes on to state the credential, where the
-placeholder was sent and why its secret could not serve it:
+**The action column names the one command that would change that row's session's
+decision, or which allowance already names it, or why no command can.** A row is
+one destination in one session, and an eight-hex refusal ID is unique only within
+its session (see above), so every command carries `--session`; a bare ID could
+name a row in another session too. On a `running` session the row offers both
+scopes:
+
+```text
+run `agent-vm access allow 46d712fd --session 3f9a12c4` (session) or `agent-vm access allow 46d712fd --session 3f9a12c4 --project`
+```
+
+An **ended** session is offered `--project` only. That writes the record the next
+launch of this project reads, and can never mutate a live session:
+
+```text
+session ended; run `agent-vm access allow 88f5da9d --session 0e0f1011 --project`
+```
+
+A session that cannot confirm a live change (`not responding`, `running (no
+control socket)`) is offered no command, only `session cannot confirm live change;
+relaunch with --allow-egress`. A network denial no allowance can name prints the
+reason rather than a command `access allow` would reject: `this hostname was seen
+over plain HTTP, so an allowance cannot name a port for it without allowing every
+name on that port`, or `this refusal was observed at <site>, which this command
+cannot turn into an allowance`.
+
+**Some refusals can never be allowed**, and each names the boundary that holds it:
+`can't be allowed: platform policy` is the deployment floor; `can't be allowed
+here: credential policy` is the credential boundary; `can't be allowed: built-in
+rule <site>` is an engine rule no allowance reaches. A credential refusal goes on
+to state the credential, where the placeholder was sent and why its secret could
+not serve it:
 
 ```text
 can't be allowed here: credential policy; MSB_AGENT_VM_ANTHROPIC_UNUSED was sent in a request header, and its secret does not cover the destination
@@ -4570,6 +4599,12 @@ session: the one that refused the ID for `allow`, or the single active session f
 their old policy until they relaunch, and the command names each with its state
 (`running`, `running (no control socket)`, `not responding`, `ended`,
 `ended (unclean)`) before and after. There is no `--all-sessions`.
+
+**An ID that names more than one session is refused.** A refusal ID is unique
+within one session, so the same ID can exist in a live session and in the log.
+`allow <ID>` without `--session` exits `1`, names every session that carries it,
+and changes nothing. `--session <ID>` selects the session *before* the ID is
+looked up, so the qualified command acts only on the session it names.
 
 **A live grant cannot add TLS-intercepted ports.** The runtime can replace its
 rule list but not the ports it intercepts, so `access allow` on a hostname whose
