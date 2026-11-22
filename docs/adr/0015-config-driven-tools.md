@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted. Implementation decision for [agent-vm #82](https://github.com/gregwebs/agent-vm/issues/82), the consumption half of epic [#78](https://github.com/gregwebs/agent-vm/issues/78). Extends [ADR-0003](0003-project-tooling-layers.md) (a project's `.agent-vm/` is trusted executable surface) and completes the config work split across #80 (parse/merge/validate, read-only) and #81 (credential providers). Builds on the terms **Tool**, **Credential provider**, and **Tool config tier** in [CONTEXT.md](../../CONTEXT.md). Extended by [ADR-0019](0019-tool-free-base-and-per-tool-layers.md) (`layer` is no longer declarative-only, and `setup`'s severity gains a layer-supplied exception). Amended by [ADR-0035](0035-consume-user-owned-boot-images.md): the `layer` field is removed; a top-level `image` key selects the boot image independently of tools.
+Accepted. Implementation decision for [agent-vm #82](https://github.com/gregwebs/agent-vm/issues/82), the consumption half of epic [#78](https://github.com/gregwebs/agent-vm/issues/78). Extends [ADR-0003](0003-project-tooling-layers.md) (a project's `.agent-vm/` is trusted executable surface) and completes the config work split across #80 (parse/merge/validate, read-only) and #81 (credential providers). Builds on the terms **Tool**, **Credential provider**, and **Tool config tier** in [CONTEXT.md](../../CONTEXT.md). Extended by [ADR-0019](0019-tool-free-base-and-per-tool-layers.md) (`layer` is no longer declarative-only, and `setup`'s severity gains a layer-supplied exception). Amended by [ADR-0035](0035-consume-user-owned-boot-images.md): the `layer` field is removed; a top-level `image` key selects the boot image independently of tools. Amended by [ADR-0073](0073-host-managed-project-config.md): running agent-vm in a directory no longer trusts its `.agent-vm/config.toml` — the project tier is host-managed and the in-repo file is never read.
 
 ## Context
 
@@ -31,6 +31,15 @@ Running `agent-vm` in a directory means trusting that directory's `.agent-vm/`, 
 2. A project-declared tool **must** now ask — through `credentials` or `tools` — for anything it wants provisioned ([ADR-0017](0017-tool-declared-provisioning.md)). `tools` is the *no-bail* way to ask (a named tool is provisioned, never required), so a project tool that names a provider it has no host login for degrades silently instead of failing loudly with e.g. `COPILOT_MISSING`; that is inside ADR-0003's boundary (`.agent-vm/` is trusted executable surface) but is now recorded rather than implicit. Because the wildcard is file-scoped, **a project tool's `credentials` or `tools` cannot widen the user's `shell`** — a project tool's `"*"` closes over its own file only. The change therefore narrows the grant *and* closes the tier-crossing reach; ADR-0003 remains the trust boundary.
 3. `credentials = [...]` is honoured from **both** tiers (D6). Restricting it to the user tier is a recorded Alternative, not taken.
 4. `agent-vm setup` now **executes** each configured tool's `command` (with `--version`) inside the throwaway verify VM ([agent-vm #83](https://github.com/gregwebs/agent-vm/issues/83), amending this ADR). `doctor` deliberately never executes a configured command, and a test pins that. This too is inside ADR-0003's boundary — running in a directory trusts its `.agent-vm/` — but is newly reachable.
+
+**Amended by [ADR-0073](0073-host-managed-project-config.md):** the *config*
+half of that trust is gone. Running agent-vm in a directory no longer trusts its
+`.agent-vm/config.toml`: the project tier is host-managed at
+`~/.config/agent-vm/projects/<project-id>/config.toml` and the in-repo file is
+never read, so a declaration like the `claude` example above must live there
+instead. `.agent-vm/layers/` stays executable surface, so a directory is still
+trusted with what it *builds*; it is no longer trusted with the user's
+configuration.
 
 ## Consequences
 

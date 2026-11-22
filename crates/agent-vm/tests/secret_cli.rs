@@ -12,6 +12,9 @@
 //! `MSB_PATH` is deliberately *not* set: `secret` is dispatched before
 //! `main`'s msb setup, and leaving it unset is what proves that.
 
+#[path = "support/mod.rs"]
+mod support;
+
 use std::{
     io::{Read, Write as _},
     path::{Path, PathBuf},
@@ -148,12 +151,9 @@ impl Harness {
     /// exercised on both.
     fn with_broken_config() -> Self {
         let harness = Self::new();
-        std::fs::create_dir_all(harness.project.path().join(".agent-vm")).unwrap();
-        std::fs::write(
-            harness.project.path().join(".agent-vm/config.toml"),
-            "[[tools]\nnot toml",
-        )
-        .unwrap();
+        let config = support::project_config_path(harness.home.path(), harness.project.path());
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(config, "[[tools]\nnot toml").unwrap();
         harness
     }
 
@@ -317,11 +317,33 @@ fn assert_no_value_leak(out: &Output, value: &str) {
     }
 }
 
+/// Nothing may be stored before a refusal.
+///
+/// The assertion is over every name in the config directory, not over two known
+/// store files: a renamed lock or a new store file must fail it too. `projects/`
+/// is the one exception — the host-managed project tier lives under it
+/// (ADR-0073), so its presence says nothing about a secret having been written.
 fn assert_nothing_stored(harness: &Harness) {
+    let dir = harness.config_dir();
+    let mut unexpected = Vec::new();
+    match std::fs::read_dir(&dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.expect("reading the config directory");
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name != "projects" {
+                    unexpected.push(name);
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("reading {}: {error}", dir.display()),
+    }
+    unexpected.sort();
     assert!(
-        !harness.config_dir().exists(),
-        "no store access may happen before the refusal: {}",
-        harness.config_dir().display()
+        unexpected.is_empty(),
+        "no store access may happen before the refusal: {unexpected:?} in {}",
+        dir.display()
     );
 }
 
@@ -477,7 +499,7 @@ fn a_key_shaped_name_is_accepted_so_the_value_error_fires() {
         // Reading the value failed, so nothing was written and nothing printed
         // the name.
         assert!(!text.contains("sk-ant"), "{text}");
-        assert!(!harness.config_dir().exists());
+        assert_nothing_stored(&harness);
     }
 }
 
@@ -579,7 +601,10 @@ fn a_broken_tool_config_does_not_change_the_secret_outcome() {
 #[test]
 fn the_broken_config_fixture_is_actually_broken() {
     let broken = Harness::with_broken_config();
-    assert!(Path::new(&broken.project.path().join(".agent-vm/config.toml")).is_file());
+    assert!(
+        support::project_config_path(broken.home.path(), broken.project.path()).is_file(),
+        "the broken project config is the host-managed one"
+    );
     let out = broken.run(&["doctor"]);
     // `doctor` reports the broken config rather than silently succeeding with
     // defaults; the shape of that report is doctor.rs's contract, so this only

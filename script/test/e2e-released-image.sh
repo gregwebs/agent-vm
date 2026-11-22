@@ -177,7 +177,10 @@ released_image_assert_record_unchanged "$record" "$WORK/retained.before" retaine
 # Each higher tier wins over an intentionally unusable lower-tier reference;
 # the compatible winner is imported locally, so no alternate pull can mask it.
 launch r override-import msb image load --input "$archive" --tag av265:override
-project="$WORK/r/project/.agent-vm/config.toml"
+# The project tier is host-managed (ADR-0073): the harness computes the digest so
+# this join writes where the candidate reads.
+project="$("$harness" project-config-path --home "$WORK/r/home" --project "$WORK/r/project")"
+mkdir -p "${project%/*}"
 user="$WORK/r/home/.config/agent-vm/config.toml"
 printf 'image = "av265:override"\n' > "$project"
 # A broken retained fallback makes project precedence observable at acquisition,

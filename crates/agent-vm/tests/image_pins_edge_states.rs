@@ -22,6 +22,18 @@ const ACCESS: &str = "image pin authority at $HOME/.config/agent-vm/image-pins.j
 
 /// Run `args` in a directory that is removed before `exec`, so `getcwd` fails.
 fn in_deleted_cwd(bin: &str, args: &str, home: &Path, state: &Path, root: &Path) -> Output {
+    in_deleted_cwd_with(bin, args, home, state, root, &[])
+}
+
+/// [`in_deleted_cwd`] with extra environment for the child.
+fn in_deleted_cwd_with(
+    bin: &str,
+    args: &str,
+    home: &Path,
+    state: &Path,
+    root: &Path,
+    extra: &[(&str, &str)],
+) -> Output {
     let script = format!(
         "d=$(mktemp -d {root}/gone.XXXXXX) || exit 98; cd \"$d\" || exit 98; \
          rmdir \"$d\" || exit 98; exec {bin} {args}",
@@ -29,15 +41,18 @@ fn in_deleted_cwd(bin: &str, args: &str, home: &Path, state: &Path, root: &Path)
         bin = bin,
         args = args,
     );
-    Command::new("/bin/sh")
+    let mut command = Command::new("/bin/sh");
+    command
         .arg("-c")
         .arg(script)
         .env_clear()
         .env("HOME", home)
         .env("AGENT_VM_STATE_DIR", state)
-        .env("PATH", "/usr/bin:/bin")
-        .output()
-        .expect("spawn the shell")
+        .env("PATH", "/usr/bin:/bin");
+    for (key, value) in extra {
+        command.env(key, value);
+    }
+    command.output().expect("spawn the shell")
 }
 
 fn run(bin: &str, args: &[&str], cwd: &Path, home: &Path, state: &Path) -> Output {
@@ -117,6 +132,40 @@ fn a_deleted_working_directory_is_unknown_and_reads_no_store() {
         fs::read(config.join("image-pins.json")).unwrap(),
         damaged,
         "neither verb repairs or rewrites the store"
+    );
+}
+
+/// ADR-0073 D2 wanted `image show` to still print an explicit tag when the
+/// project capture fails. It does not, and never did: a capture failure makes
+/// `main`'s config load fail, and `image show` treats a carried configuration
+/// failure as fatal, because the images it would inspect are the substitutes
+/// `parse_from` invented. This row pins the real contract, so the plan's claim
+/// cannot be re-invented silently.
+#[test]
+fn a_deleted_working_directory_keeps_image_show_fatal_and_printless() {
+    let (root, home, state) = fixture("avm-show-deleted-cwd-");
+    let out = in_deleted_cwd_with(
+        env!("CARGO_BIN_EXE_agent-vm"),
+        "image show",
+        &home,
+        &state,
+        root.path(),
+        &[("AGENT_VM_IMAGE_TAG", "127.0.0.1:1/env:dev")],
+    );
+    assert_eq!(out.status.code(), Some(1), "a capture failure is an error");
+    assert!(
+        out.stdout.is_empty(),
+        "a failed inspection prints no selection: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("reading current directory"),
+        "the diagnostic names the capture: {stderr}"
+    );
+    assert!(
+        !stderr.contains("127.0.0.1:1/env:dev"),
+        "the refused tag is not echoed: {stderr}"
     );
 }
 

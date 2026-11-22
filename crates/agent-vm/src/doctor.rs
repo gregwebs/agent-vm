@@ -143,6 +143,7 @@ use crate::host_credential::{AnthropicHostRead, ReadBudget, Unusable, read_anthr
 use crate::host_paths::RootSource;
 use crate::pi_credential_inspection::{PiCredentialReport, inspect_project};
 use crate::project::ProjectDir;
+use crate::project_config::LegacyProjectConfig;
 use crate::secret_store::{Availability, ServiceName};
 
 #[derive(ClapArgs)]
@@ -164,8 +165,13 @@ enum ResetOutcome {
     NothingToMove { checked: PathBuf },
 }
 
-pub fn run(args: Args) -> Result<()> {
-    run_to(args, &mut std::io::stdout(), gather_credential_store)
+pub fn run(args: Args, project: Result<ProjectDir>) -> Result<()> {
+    run_to(
+        args,
+        project,
+        &mut std::io::stdout(),
+        gather_credential_store,
+    )
 }
 
 fn write_line(out: &mut impl std::io::Write, line: &str) -> Result<()> {
@@ -212,14 +218,13 @@ fn describe_credential_store(report: &Result<Availability>) -> (String, Option<a
 
 fn run_to(
     args: Args,
+    project: Result<ProjectDir>,
     out: &mut impl std::io::Write,
     gather_store: impl FnOnce() -> Result<Availability>,
 ) -> Result<()> {
-    // The one capture for this command. Doctor is a report: an unreadable cwd
-    // is rendered with its cause, never a failed run, so the capture is held as
-    // data rather than `?`-propagated.
-    #[allow(clippy::disallowed_methods)] // one capture per command: every consumer borrows it.
-    let project = ProjectDir::capture();
+    // The capture is the one `main` took at process entry (ADR-0073 D2). Doctor
+    // is a report: an unreadable cwd is rendered with its cause, never a failed
+    // run, so the capture is held as data rather than `?`-propagated.
     let msb_home = crate::msb_install::msb_home_dir()?;
 
     if !args.reset_msb_db {
@@ -230,8 +235,11 @@ fn run_to(
         // section's own body, and the trailing `return Err(...)` still exits
         // nonzero. The reset branch deliberately never reads config: a broken
         // TOML must not block recovering a forward-migrated db.
-        let config =
-            crate::config::ConfigPaths::discover().and_then(|paths| crate::config::load(&paths));
+        let config = project
+            .as_ref()
+            .map_err(|error| anyhow!("{error:#}"))
+            .and_then(crate::config::ConfigPaths::discover)
+            .and_then(|paths| crate::config::load(&paths));
         // A load failure *and* a catalog-build failure (the embedded defaults
         // failing to resolve `shell`) both fail the run; either is rendered in
         // the section. `describe_config` returns the latter so `doctor` cannot
@@ -258,6 +266,12 @@ fn run_to(
                 None,
             ),
         };
+        // ADR-0073: an in-repo `.agent-vm/config.toml` is never read, so its
+        // presence is reported rather than silently ignored. Appended after the
+        // section is built so it reads the same whether the configuration loaded
+        // or failed.
+        let legacy = project.as_ref().ok().map(crate::project_config::legacy);
+        let config_section = with_legacy_notice(config_section, legacy.as_ref());
         // Which variable supplied each root, so a withheld row names that one
         // rather than its sibling root's (#353).
         let roots = ActiveRoots::from_env()?;
@@ -1232,8 +1246,8 @@ fn describe_config(report: ConfigReport) -> (String, Option<anyhow::Error>, Opti
     // by `into_launch_catalog`.
     let tiers = format!(
         "user:    {}\nproject: {}\n",
-        describe_tier(report.user()),
-        describe_tier(report.project()),
+        describe_tier(report.user(), "user"),
+        describe_tier(report.project(), "project"),
     );
     let resolved_label = if report.uses_defaults() {
         "resolved: built-in defaults; launch-verb order\n"
@@ -1334,9 +1348,34 @@ fn render_conflicts(conflicts: &[ConfigConflict]) -> String {
     out
 }
 
-fn describe_tier(tier: &TierReport) -> String {
+/// ADR-0073: an in-repo `.agent-vm/config.toml` is never read, so its presence
+/// is reported rather than silently ignored.
+///
+/// Appended last, so it reads the same whether the configuration loaded or the
+/// section is an `error:` body. `<path>` goes through [`crate::one_line::path`],
+/// like every other measured path, so a directory name holding ESC cannot
+/// rewrite the terminal. The note never changes the exit status.
+fn with_legacy_notice(mut section: String, legacy: Option<&LegacyProjectConfig>) -> String {
+    match legacy {
+        Some(LegacyProjectConfig::Present(path)) => section.push_str(&format!(
+            "\nnote: {} is not auto-loaded; agent-vm never reads an in-repo .agent-vm/config.toml.\n\
+             To use it, review it and source it from this project's config with `agent-vm config edit`.",
+            crate::one_line::path(path)
+        )),
+        Some(LegacyProjectConfig::Unexaminable { path, kind }) => section.push_str(&format!(
+            "\nnote: could not check for an in-repo .agent-vm/config.toml at {} ({kind:?}); agent-vm never auto-loads it.",
+            crate::one_line::path(path)
+        )),
+        Some(LegacyProjectConfig::Absent) | None => {}
+    }
+    section
+}
+
+/// Render one tier row. `label` is the tier's own word, because both tiers are
+/// unavailable for the same reason and the row must say which one is missing.
+fn describe_tier(tier: &TierReport, label: &str) -> String {
     match tier.status() {
-        TierStatus::UnavailableHome => "<no HOME; user tier unavailable>".to_string(),
+        TierStatus::UnavailableHome => format!("<no HOME; {label} tier unavailable>"),
         TierStatus::Absent => format!(
             "{} (absent)",
             tier.path()
@@ -2116,6 +2155,7 @@ mod tests {
                     .unwrap();
             let session = crate::session::ProjectSession::for_project(&project).unwrap();
             text.replace(&session.state_dir.display().to_string(), "<project-state>")
+                .replace(&project.digest_hex(), "<project-id>")
                 .replace(
                     &self
                         .root
@@ -2155,13 +2195,97 @@ mod tests {
         assert_eq!(text.matches("==> credential store\n").count(), 1);
     }
 
+    /// V12: the legacy notice's bytes, for every outcome the probe can report,
+    /// from both a rendered section and an `error:` body.
+    #[test]
+    fn legacy_notice_bytes_are_pinned() {
+        let path = PathBuf::from("/home/u/проект/.agent-vm/config.toml");
+        let present = LegacyProjectConfig::Present(path.clone());
+        let rendered =
+            with_legacy_notice("==> tool configuration\nfiller".to_owned(), Some(&present));
+        assert_eq!(
+            rendered,
+            format!(
+                "==> tool configuration\nfiller\nnote: {} is not auto-loaded; agent-vm never reads an in-repo .agent-vm/config.toml.\nTo use it, review it and source it from this project's config with `agent-vm config edit`.",
+                crate::one_line::path(&path)
+            )
+        );
+        // The same note follows an error body: it must not be swallowed because
+        // the configuration failed.
+        let failed = with_legacy_notice(
+            "==> tool configuration\nerror: boom".to_owned(),
+            Some(&present),
+        );
+        assert!(failed.ends_with(&rendered["==> tool configuration\nfiller".len()..]));
+
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::NotADirectory,
+        ] {
+            let unexaminable = LegacyProjectConfig::Unexaminable {
+                path: path.clone(),
+                kind,
+            };
+            assert_eq!(
+                with_legacy_notice("section".to_owned(), Some(&unexaminable)),
+                format!(
+                    "section\nnote: could not check for an in-repo .agent-vm/config.toml at {} ({kind:?}); agent-vm never auto-loads it.",
+                    crate::one_line::path(&path)
+                )
+            );
+        }
+        for absent in [Some(&LegacyProjectConfig::Absent), None] {
+            assert_eq!(with_legacy_notice("section".to_owned(), absent), "section");
+        }
+    }
+
+    /// V21: `doctor` reads the capture `main` handed it, not a fresh one. A cwd
+    /// renamed after capture must not switch which project's config is rendered.
+    #[test]
+    fn run_to_uses_the_supplied_capture_after_cwd_moves() {
+        let fixture = RunFixture::new();
+        let project = std::env::current_dir().unwrap();
+        let captured = ProjectDir::from_path_for_tests(&project).unwrap();
+        let id_a = captured.digest_hex();
+        // A rename inside the same directory: `getcwd` now spells the new name,
+        // so a second capture would be a different project.
+        let moved = project.with_file_name("project-moved");
+        std::fs::rename(&project, &moved).unwrap();
+        let id_b = crate::project::digest_hex_of(&moved.canonicalize().unwrap());
+        assert_ne!(id_a, id_b);
+        let store = fixture.root.path().join("home/.config/agent-vm/projects");
+        for (id, name) in [(&id_a, "from-a"), (&id_b, "from-b")] {
+            let config = store.join(id).join("config.toml");
+            std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+            std::fs::write(
+                &config,
+                format!("[[tools]]\nname = \"{name}\"\ncommand = \"{name}\"\n"),
+            )
+            .unwrap();
+        }
+
+        let mut out = Vec::new();
+        run_to(ordinary(), Ok(captured), &mut out, || {
+            Ok(Availability::NotProbed)
+        })
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("from-a"), "{text}");
+        assert!(!text.contains("from-b"), "{text}");
+        assert!(
+            text.contains(&id_a),
+            "the rendered project is dir_a: {text}"
+        );
+        assert!(!text.contains(&id_b), "{text}");
+    }
+
     #[test]
     fn run_to_flushes_before_gather_and_after_success() {
         let _fixture = RunFixture::new();
         let mut out = RecordingWriter::default();
         let flushed = out.flushed.clone();
         let submissions = out.submissions.clone();
-        run_to(ordinary(), &mut out, || {
+        run_to(ordinary(), captured(), &mut out, || {
             assert_eq!(flushed.get(), 1);
             let submissions = submissions.borrow();
             let prefix = std::str::from_utf8(&submissions[0]).unwrap();
@@ -2182,7 +2306,10 @@ mod tests {
     fn run_to_keeps_tail_on_unavailable() {
         let _fixture = RunFixture::new();
         let mut successful = Vec::new();
-        run_to(ordinary(), &mut successful, || Ok(Availability::Reachable)).unwrap();
+        run_to(ordinary(), captured(), &mut successful, || {
+            Ok(Availability::Reachable)
+        })
+        .unwrap();
         let successful = std::str::from_utf8(&successful).unwrap();
         let expected_tail = successful.split_once("==> tool configuration\n").unwrap().1;
         for failure in [
@@ -2190,7 +2317,7 @@ mod tests {
             crate::secret_store::KeychainFailure::Unresponsive,
         ] {
             let mut out = RecordingWriter::default();
-            let error = run_to(ordinary(), &mut out, || {
+            let error = run_to(ordinary(), captured(), &mut out, || {
                 Ok(Availability::Unavailable(failure))
             })
             .unwrap_err();
@@ -2216,7 +2343,7 @@ mod tests {
                 fail_flush_at: Some(flush),
                 ..Default::default()
             };
-            let error = run_to(ordinary(), &mut out, || {
+            let error = run_to(ordinary(), captured(), &mut out, || {
                 Ok(Availability::Unavailable(
                     crate::secret_store::KeychainFailure::AccessDenied,
                 ))
@@ -2235,7 +2362,7 @@ mod tests {
             fail_write: true,
             ..Default::default()
         };
-        let error = run_to(ordinary(), &mut out, || {
+        let error = run_to(ordinary(), captured(), &mut out, || {
             panic!("gather after failed output")
         })
         .unwrap_err();
@@ -2257,7 +2384,7 @@ mod tests {
                 write_file(&fixture.root.path().join("state/msb-home/db/msb.db"), b"db");
             }
             let mut out = RecordingWriter::default();
-            run_to(Args { reset_msb_db: true }, &mut out, || {
+            run_to(Args { reset_msb_db: true }, captured(), &mut out, || {
                 panic!("reset discovered inventory")
             })
             .unwrap();
@@ -2274,7 +2401,10 @@ mod tests {
     fn run_to_pins_ordinary_and_reset_bytes() {
         let fixture = RunFixture::new();
         let mut out = Vec::new();
-        run_to(ordinary(), &mut out, || Ok(Availability::NotProbed)).unwrap();
+        run_to(ordinary(), captured(), &mut out, || {
+            Ok(Availability::NotProbed)
+        })
+        .unwrap();
         let actual = fixture.normalize(std::str::from_utf8(&out).unwrap());
         let without_new_section = actual.replace(
             "==> credential store\ncredential store: not probed (0 tracked names)\n\n",
@@ -2322,7 +2452,7 @@ file: <fixture>/home/.config/agent-vm/allowances.json (absent; nothing recorded)
 
 ==> tool configuration
 user:    <fixture>/home/.config/agent-vm/config.toml (absent)
-project: <fixture>/project/.agent-vm/config.toml (absent)
+project: <fixture>/home/.config/agent-vm/projects/<project-id>/config.toml (absent)
 resolved: built-in defaults; launch-verb order
   1. dsh -> "dsh"; args=1; credentials=none; provisions=none; persist=1; source=built-in
   2. pi -> "pi"; args=0; credentials=antigravity; provisions=anthropic,openai,antigravity; persist=0; source=built-in; network_requests=api.anthropic.com,auth.openai.com,chatgpt.com,cloudcode-pa.googleapis.com,daily-cloudcode-pa.googleapis.com,daily-cloudcode-pa.sandbox.googleapis.com,mcp-proxy.anthropic.com,oauth2.googleapis.com,+2 more
@@ -2374,7 +2504,7 @@ not cached; doctor does not acquire images
                 write_file(&fixture.root.path().join("state/msb-home/db/msb.db"), b"db");
             }
             let mut out = Vec::new();
-            run_to(Args { reset_msb_db: true }, &mut out, || {
+            run_to(Args { reset_msb_db: true }, captured(), &mut out, || {
                 panic!("reset gather")
             })
             .unwrap();
@@ -2437,9 +2567,17 @@ credentials:
     /// must withhold the same rows rather than assume they are unclaimed.
     const UNPARSEABLE: &str = "credentials:\n  - service: [unterminated\n";
 
+    /// The capture `main` hands `doctor` for the fixture cwd.
+    fn captured() -> Result<ProjectDir> {
+        ProjectDir::from_path_for_tests(&std::env::current_dir().unwrap())
+    }
+
     fn run_ordinary() -> String {
         let mut out = Vec::new();
-        run_to(ordinary(), &mut out, || Ok(Availability::NotProbed)).unwrap();
+        run_to(ordinary(), captured(), &mut out, || {
+            Ok(Availability::NotProbed)
+        })
+        .unwrap();
         String::from_utf8(out).unwrap()
     }
 
@@ -4073,11 +4211,10 @@ substituted."#;
     /// Build a report by loading real files: config construction is private,
     /// and a real `load` keeps the renderer test free of a duplicate schema.
     fn config_report(user: Option<&Path>, project: &Path) -> crate::config::ConfigReport {
-        crate::config::load(&crate::config::ConfigPaths {
-            user: user.map(Path::to_path_buf),
-            project: project.to_path_buf(),
-            home: None,
-        })
+        crate::config::load(&crate::config::ConfigPaths::for_test(
+            user.map(Path::to_path_buf),
+            project.to_path_buf(),
+        ))
         .expect("fixture config should load")
     }
 

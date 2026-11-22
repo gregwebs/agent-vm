@@ -233,11 +233,11 @@ enum Output<'a> {
 
 /// Build the user's Dockerfile and import the result under `--tag`. Returns the
 /// process exit code.
-pub(crate) async fn run(args: Args) -> Result<i32> {
-    // Captured before the build: this command approves its result under the
-    // project it started in, however Docker changes what `getcwd` reports.
-    #[allow(clippy::disallowed_methods)] // one capture per command: every consumer borrows it.
-    let project = crate::project::ProjectDir::capture()?;
+pub(crate) async fn run(args: Args, project: Result<crate::project::ProjectDir>) -> Result<i32> {
+    // `main`'s one capture (ADR-0073 D5), taken before the build: this command
+    // approves its result under the project it started in, however Docker
+    // changes what `getcwd` reports, and a second read could name a second one.
+    let project = project?;
     let target = ImageTarget::resolve().await?;
     // HOME and a readable pin store are checked before Docker runs or the
     // archive is published (R9): a damaged store must not cost a build.

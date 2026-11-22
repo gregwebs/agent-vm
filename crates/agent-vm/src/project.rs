@@ -48,16 +48,18 @@ use anyhow::{Context, Result, anyhow};
 use sha2::{Digest, Sha256};
 
 /// One capture per command is enforced by lint and review, not by the type:
-/// [`ProjectDir::capture`] is a clippy `disallowed-methods` entry with
-/// statement-level allowances at the command entry points. Not `Clone`, so
-/// consumers borrow the capture rather than copying it.
+/// [`ProjectDir::capture`] is a clippy `disallowed-methods` entry allowed on one
+/// statement in production — `main`'s, whose result every consumer is handed
+/// (ADR-0073 D5). Not `Clone`, so consumers borrow the capture rather than
+/// copying it.
 pub(crate) struct ProjectDir(PathBuf);
 
 impl ProjectDir {
     /// The command's project: `current_dir()` canonicalized.
     ///
-    /// Every command entry point calls this exactly once; the error contexts
-    /// are the ones a launch printed before this module existed.
+    /// Called once per process, by `main`, which passes the result beside
+    /// `Dispatch` to every command that needs it; the error contexts are the
+    /// ones a launch printed before this module existed.
     pub(crate) fn capture() -> Result<Self> {
         let cwd = std::env::current_dir().context("reading current directory")?;
         // `.` resolves from the working directory itself, not from the name the

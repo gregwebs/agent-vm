@@ -1218,12 +1218,9 @@ fn build_ignores_config_the_retained_record_and_image_overrides() {
     fs::create_dir_all(&config_dir).unwrap();
     fs::write(config_dir.join("default-image.json"), b"{ not json").unwrap();
     let project = support::project_tempdir();
-    fs::create_dir_all(project.path().join(".agent-vm")).unwrap();
-    fs::write(
-        project.path().join(".agent-vm/config.toml"),
-        "image = \"localhost:1/project:latest\"\n",
-    )
-    .unwrap();
+    let project_config = support::project_config_path(&harness.home, project.path());
+    fs::create_dir_all(project_config.parent().unwrap()).unwrap();
+    fs::write(&project_config, "image = \"localhost:1/project:latest\"\n").unwrap();
     fs::create_dir_all(project.path().join(".agent-vm/layers")).unwrap();
     fs::write(project.path().join(".agent-vm/layers/POISON"), b"stale").unwrap();
 
@@ -1317,10 +1314,11 @@ fn build_succeeds_despite_a_malformed_tool_config() {
     let user_config = b"image = \"not a valid ref !!\"\n";
     fs::write(config_dir.join("config.toml"), user_config).unwrap();
     let project = support::project_tempdir();
-    fs::create_dir_all(project.path().join(".agent-vm")).unwrap();
+    let project_config_path = support::project_config_path(&harness.home, project.path());
+    fs::create_dir_all(project_config_path.parent().unwrap()).unwrap();
     let project_config =
         b"[[tools]]\nname = \"shell\"\ncommand = \"bash\"\nthis is not valid toml = =\n";
-    fs::write(project.path().join(".agent-vm/config.toml"), project_config).unwrap();
+    fs::write(&project_config_path, project_config).unwrap();
     let mut cmd = harness.base_command();
     cmd.current_dir(project.path());
     cmd.args(["image", "build", "--tag", "app:dev"]);
@@ -1337,7 +1335,7 @@ fn build_succeeds_despite_a_malformed_tool_config() {
         user_config.to_vec()
     );
     assert_eq!(
-        fs::read(project.path().join(".agent-vm/config.toml")).unwrap(),
+        fs::read(&project_config_path).unwrap(),
         project_config.to_vec()
     );
 }
@@ -2596,12 +2594,9 @@ fn build_is_no_longer_a_verb() {
     assert!(stderr_of(&out).contains("unrecognized subcommand 'build'"));
     assert!(harness.docker_calls().is_empty());
     let project = support::project_tempdir();
-    fs::create_dir(project.path().join(".agent-vm")).unwrap();
-    fs::write(
-        project.path().join(".agent-vm/config.toml"),
-        "[[tools]\nbroken",
-    )
-    .unwrap();
+    let project_config = support::project_config_path(&harness.home, project.path());
+    fs::create_dir_all(project_config.parent().unwrap()).unwrap();
+    fs::write(&project_config, "[[tools]\nbroken").unwrap();
     let mut command = harness.base_command();
     command
         .current_dir(project.path())
@@ -2869,7 +2864,7 @@ impl Harness {
     /// A project directory with an isolated cwd, for project-tier cases.
     fn project_dir(&self) -> PathBuf {
         let dir = self.home.join("project");
-        fs::create_dir_all(dir.join(".agent-vm")).unwrap();
+        fs::create_dir_all(&dir).unwrap();
         dir
     }
 
@@ -2882,11 +2877,9 @@ impl Harness {
 
     fn write_project_image(&self, reference: &str) -> PathBuf {
         let dir = self.project_dir();
-        fs::write(
-            dir.join(".agent-vm/config.toml"),
-            format!("image = \"{reference}\"\n"),
-        )
-        .unwrap();
+        let config = support::project_config_path(&self.home, &dir);
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(config, format!("image = \"{reference}\"\n")).unwrap();
         dir
     }
 
@@ -4254,7 +4247,7 @@ fn approval_moves_only_the_result_record() {
         );
         assert_eq!(config_after, config_before);
         assert_eq!(
-            fs::read(project.join(".agent-vm/config.toml")).unwrap(),
+            fs::read(support::project_config_path(&harness.home, &project)).unwrap(),
             b"image = \"app:project\"\n".to_vec(),
             "the project configuration is untouched"
         );

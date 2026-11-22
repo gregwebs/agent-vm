@@ -178,8 +178,11 @@ A launch is one pass, and the ordering is load-bearing:
 ### Tool configuration drives the CLI and the guest-HOME links
 
 `config.rs` reads two ordered **catalogs** — `$HOME/.config/agent-vm/config.toml`
-and `<cwd>/.agent-vm/config.toml` — validates each strictly, and retains every
-definition from both. Whole-definition user-wins precedence (`user`
+and the project's own
+`$HOME/.config/agent-vm/projects/<project-id>/config.toml` (host-managed, never
+the repository's `.agent-vm/config.toml`; see
+[ADR-0073](docs/adr/0073-host-managed-project-config.md)) — validates each
+strictly, and retains every definition from both. Whole-definition user-wins precedence (`user`
 definitions, then project-only names) decides only which names are **launch
 verbs**; it is not a reference namespace. Each launch winner's closure is
 resolved over the definitions that share its **declaring file** (#395), so a

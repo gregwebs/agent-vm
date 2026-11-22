@@ -277,7 +277,7 @@ impl Harness {
     }
 
     fn project_config(&self) -> PathBuf {
-        self.project_root.join(".agent-vm/config.toml")
+        support::project_config_path(&self.home_root, &self.project_root)
     }
 
     fn write_project(&self, contents: &str) {

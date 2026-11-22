@@ -6,6 +6,9 @@
 //! output, must never run a decoy `git`/`msb`/`docker`, and must not create any
 //! state.
 
+#[path = "support/mod.rs"]
+mod support;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -57,9 +60,9 @@ impl Fixture {
             let user = home.join(".config/agent-vm");
             fs::create_dir_all(&user).unwrap();
             fs::write(user.join("config.toml"), "this is = not [ valid toml").unwrap();
-            let project = cwd.join(".agent-vm");
-            fs::create_dir_all(&project).unwrap();
-            fs::write(project.join("config.toml"), "[[tools]\nname").unwrap();
+            let project = support::project_config_path(&home, &cwd);
+            fs::create_dir_all(project.parent().unwrap()).unwrap();
+            fs::write(project, "[[tools]\nname").unwrap();
         }
         let bin = decoy_bin(root.path(), &marker);
         let state = root.path().join("state");

@@ -500,8 +500,15 @@ so `--help`, `doctor` and `run::launch` cannot disagree. One arm of
 
 One of the two ordered, optional config files resolved by `config::load`: the
 **user** tier (`$HOME/.config/agent-vm/config.toml`) or the **project** tier
-(`<cwd>/.agent-vm/config.toml`). Each is parsed and validated independently
-before merging. Their merge is a **union of whole definitions**, not a field
+(`$HOME/.config/agent-vm/projects/<project-id>/config.toml`, keyed by the
+**project**'s full digest). The project tier is **host-managed**: nothing in a
+repository is ever read as config, so `<cwd>/.agent-vm/config.toml` is not
+auto-loaded and `doctor` reports it as ignored. A present project file is
+verified unconditionally — a regular, singly linked, user-owned file reached
+without a final symlink, in a store directory with the same ownership rules and
+no symlinked route — before its bytes are decoded
+([ADR-0073](docs/adr/0073-host-managed-project-config.md)). Each tier is parsed
+and validated independently before merging. Their merge is a **union of whole definitions**, not a field
 overlay: the user tier is authoritative for every name it declares, the
 project tier may only add names, and a differing project declaration yields a
 `doctor` warning (user definition wins). Only when both tiers declare **zero**
@@ -638,12 +645,14 @@ The canonical host working directory of an agent-vm command, not its Git
 repository or build context. Worktrees and subdirectories are distinct projects;
 symlink aliases of the same directory are one project.
 
-The command captures it **once**, at its entry point, and session state and
-**image pins** both consume that one capture: an external `rename` changes what
+The command captures it **once**, at its entry point, and the tool-config
+discovery, session state and **image pins** all consume that one capture: an external `rename` changes what
 the process's working directory is called without any `chdir`, so a second read
 could name a second project mid-command. The identifier stored in approvals is
-the lowercase hex SHA-256 of the captured path's bytes; the 12-hex name of the
-project's state directory under `$AGENT_VM_STATE_DIR` is that digest's prefix.
+the lowercase hex SHA-256 of the captured path's bytes, and the same id names the
+project's config directory under `~/.config/agent-vm/projects/` and its records
+in `image-pins.json`/`allowances.json`; the 12-hex name of the project's state
+directory under `$AGENT_VM_STATE_DIR` is that digest's prefix.
 
 _Avoid_: "workspace", "repo" (both are other things), "current directory"
 (the project is a capture, not an ambient read).
@@ -925,12 +934,18 @@ and [ADR-0017](docs/adr/0017-tool-declared-provisioning.md).
 
 `~/.config/agent-vm`, where `credentials.yaml`, `[network]`, `mounts`,
 `[mount_sets]` and a full tool's own `mounts` authorize launch secrets, egress,
-config mounts, mount sets and tool config mounts respectively. This
+config mounts, mount sets and tool config mounts respectively, and where each
+project's **tool config tier** lives under `projects/<project-id>/`. This
 directory is never
 inside a writable live bind. Protection includes directories its lookup searches
 and prospective directories reached through missing components, measuring raw
-`$HOME` and the account home. Read-only binds and fork copies are exempt.
-See [ADR-0038](docs/adr/0038-config-dir-exposure-guard.md) for the rule and gaps.
+`$HOME` and the account home. Because the project configs sit *inside* the
+directory, `projects/` and every existing project directory are measured as
+stores of their own — so a writable bind of one is refused while a bind strictly
+inside it is not — and every `projects/<project-id>/config.toml` joins the
+one-name (hard link) rule. Read-only binds and fork copies are exempt.
+See [ADR-0038](docs/adr/0038-config-dir-exposure-guard.md) and
+[ADR-0073](docs/adr/0073-host-managed-project-config.md) for the rules and gaps.
 
 _Avoid_: "masked"; "protected host file", which means the Pi files.
 

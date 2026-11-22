@@ -252,7 +252,8 @@ struct MeasuredDir {
     home: Option<PathBuf>,
     purpose: StorePurpose,
     /// Every authority store file the one-link check measures, with its link
-    /// count: `config.toml` and `allowances.json` (ADR-0065 P7).
+    /// count: `config.toml` and `allowances.json` (ADR-0065 P7), or a project
+    /// store's `config.toml` (ADR-0073).
     authority_file_links: Vec<(PathBuf, u64)>,
     ids: Vec<Option<(u64, u64)>>,
     paths: Vec<Vec<u8>>,
@@ -504,6 +505,19 @@ fn measure_authority_store(home: &Path) -> Result<MeasuredDir> {
 /// Both are measured identically because both decide authority, and a second
 /// name for either one is a file a guest could write and then unlink before the
 /// next launch read it.
+fn authority_file_links(
+    spelled: &Path,
+    lstat: impl Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+) -> Result<Vec<(PathBuf, u64)>> {
+    file_links(
+        spelled,
+        &[crate::project_config::CONFIG_FILE, crate::allowances::FILE],
+        lstat,
+    )
+}
+
+/// The one-link measurement over `names` in `dir`, shared by the authority
+/// store's two files and a project store's `config.toml` (ADR-0073).
 ///
 /// Three outcomes per file, and the middle one is this function's whole point:
 /// a regular file records its link count; a missing file and a non-file are
@@ -511,13 +525,14 @@ fn measure_authority_store(home: &Path) -> Result<MeasuredDir> {
 /// other error refuses the launch (ADR-0065 E2). Deferring the uninspectable
 /// case to the reader would be wrong for the reason the check exists: not
 /// applying the file now does not stop laundering into the *next* launch.
-fn authority_file_links(
-    spelled: &Path,
+fn file_links(
+    dir: &Path,
+    names: &[&str],
     lstat: impl Fn(&Path) -> std::io::Result<std::fs::Metadata>,
 ) -> Result<Vec<(PathBuf, u64)>> {
     let mut links = Vec::new();
-    for name in ["config.toml", crate::allowances::FILE] {
-        let file = spelled.join(name);
+    for name in names {
+        let file = dir.join(name);
         match lstat(&file) {
             Ok(m) if m.is_file() => links.push((file, m.nlink())),
             Ok(_) => {}
@@ -526,6 +541,29 @@ fn authority_file_links(
         }
     }
     Ok(links)
+}
+
+/// One project store's `config.toml`, measured like the authority store's files
+/// (ADR-0073).
+///
+/// `lstat(<entry>/config.toml)` answers `NotADirectory` when the entry itself is
+/// not a directory — a regular file, or a symlink to one — and the generic
+/// "cannot determine" context then names only the file under it, which no user
+/// can act on. The refusal stays: an entry the guard cannot classify is exactly
+/// what it must not skip, so the message names the entry and the one remedy.
+fn project_store_file_links(entry: &Path) -> Result<Vec<(PathBuf, u64)>> {
+    file_links(entry, &[crate::project_config::CONFIG_FILE], |path| {
+        fs::symlink_metadata(path)
+    })
+    .map_err(|error| match error.downcast_ref::<std::io::Error>() {
+        Some(e) if e.kind() == std::io::ErrorKind::NotADirectory => anyhow::anyhow!(
+            "cannot determine whether a mount would expose {file}: {entry} is not a directory, \
+             and every entry of the project store is measured; remove it",
+            file = crate::one_line::quoted_path(&entry.join(crate::project_config::CONFIG_FILE)),
+            entry = crate::one_line::quoted_path(entry),
+        ),
+        _ => error,
+    })
 }
 
 /// One additional host-only store (ADR-0064) measured exactly like the
@@ -567,39 +605,150 @@ fn measure_store(spelled: PathBuf, purpose: StorePurpose) -> Result<MeasuredDir>
     })
 }
 
+/// A fail-closed bound on the entries of one `projects/` directory.
+///
+/// The guard measures **every** entry, not only this launch's project (ADR-0038's
+/// cross-project threat), so its cost grows with the directory: 10,000 empty
+/// entries already cost 8 s per launch on a developer laptop. agent-vm creates
+/// one directory per project, so a directory this size is not its own doing, and
+/// there is no safe way to measure part of it: skipping entries is what
+/// launderers a project store into a later launch. Refusing is therefore the same
+/// choice ADR-0065 makes for an uninspectable file, with a message that names the
+/// directory, the bound and the remedy.
+const MAX_PROJECT_STORES: usize = 1024;
+
+/// Stores measured so far, in first-match order, plus the spellings already in
+/// them.
+///
+/// The `BTreeSet` is what keeps the cost of a launch near-linear in the number of
+/// stores: every entry of every `projects/` directory is a candidate, and
+/// rescanning the `Vec` for each one made the guard quadratic in the entry count.
+/// Order stays the `Vec`'s, so a first-match refusal still names the same
+/// directory on every filesystem.
+#[derive(Default)]
+struct MeasuredDirs {
+    dirs: Vec<MeasuredDir>,
+    spelled: std::collections::BTreeSet<PathBuf>,
+}
+
+impl MeasuredDirs {
+    /// Keep `dir` unless its spelling was already measured; reports whether it
+    /// was kept.
+    fn push(&mut self, dir: MeasuredDir) -> bool {
+        if !self.spelled.insert(dir.spelled.clone()) {
+            return false;
+        }
+        self.dirs.push(dir);
+        true
+    }
+}
+
+/// ADR-0073: project configs sit strictly inside the authority directory, where
+/// "is or contains a route" alone allows a writable bind of `projects/` or of one
+/// project's directory (ADR-0038: a bind strictly inside is allowed). Each is
+/// therefore its own measured store: the walk records its routes — through a
+/// symlinked entry, to wherever it points — so such a bind is refused, and its
+/// `config.toml` joins the one-name check.
+///
+/// **Every** existing entry, not only this launch's project: the guard exists so
+/// P1's guest cannot plant P2's authority (ADR-0038's cross-project threat). The
+/// consequence is deliberate and fails closed: even an unrelated project's
+/// uninspectable route or multi-link `config.toml` refuses every launch, because
+/// leaving it unmeasured would launder it into a later one.
+///
+/// A missing entry needs no prospective record: provisioning names are 12-hex
+/// state names or fixed words, which the name rule never equates with a 64-hex
+/// project id, so no core bind can create one.
+fn measure_project_stores(home: &Path) -> Result<Vec<MeasuredDir>> {
+    let projects = crate::project_config::projects_dir(home);
+    let mut dirs = vec![measure_store(
+        projects.clone(),
+        StorePurpose::LaunchAuthority,
+    )?];
+    let entries = match fs::read_dir(&projects) {
+        Ok(entries) => entries,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(dirs);
+        }
+        Err(e) => return Err(e).with_context(|| uncertain(&projects)),
+    };
+    let mut sorted = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| uncertain(&projects))?;
+        if sorted.len() >= MAX_PROJECT_STORES {
+            bail!(
+                "{}: more than {MAX_PROJECT_STORES} entries, and a launch measures every one; \
+                 remove the project directories under it that agent-vm does not use",
+                uncertain(&projects),
+            );
+        }
+        sorted.push(entry);
+    }
+    // Deterministic scan order across filesystems, so a first-match refusal and
+    // a link-count error do not depend on directory hash order.
+    sorted.sort_by_key(|entry| entry.file_name());
+    for entry in sorted {
+        let kind = entry
+            .file_type()
+            .with_context(|| uncertain(&entry.path()))?;
+        if !(kind.is_dir() || kind.is_symlink()) {
+            continue;
+        }
+        let mut dir = measure_store(entry.path(), StorePurpose::LaunchAuthority)?;
+        dir.authority_file_links = project_store_file_links(&dir.spelled)?;
+        dirs.push(dir);
+    }
+    Ok(dirs)
+}
+
 impl ProtectedConfigDir {
-    /// Measure the authority stores (one per `$HOME`) and the extra host-only
-    /// stores this launcher writes refusal artefacts into (ADR-0064).
+    /// Measure the authority stores (one per `$HOME`), the project stores under
+    /// each of them (ADR-0073), and the extra host-only stores this launcher
+    /// writes refusal artefacts into (ADR-0064).
+    ///
+    /// Two passes over `homes` on purpose: every home's top-level
+    /// `~/.config/agent-vm` is measured before *any* project store, so a
+    /// project-store route in a raw `$HOME` cannot outrank the account home's
+    /// authority store in [`Self::decide`]'s first-match scan.
     pub(crate) fn measure(homes: &[PathBuf], stores: &[Store], cwd: &Path) -> Result<Self> {
-        let mut dirs: Vec<MeasuredDir> = Vec::new();
+        let mut dirs = MeasuredDirs::default();
+        let mut unique_homes: Vec<PathBuf> = Vec::new();
         for home in homes {
             let home = anchored(cwd, home);
             let dir = measure_authority_store(&home)?;
-            if dirs.iter().any(|d| d.spelled == dir.spelled) {
-                continue;
+            if dirs.push(dir) {
+                unique_homes.push(home);
             }
-            dirs.push(dir);
+        }
+        for home in &unique_homes {
+            for project_store in measure_project_stores(home)? {
+                dirs.push(project_store);
+            }
         }
         let mut sessions: Vec<SessionsDir> = Vec::new();
         for store in stores {
             let dir = measure_store(anchored(cwd, &store.path), store.purpose)?;
-            if dirs.iter().any(|d| d.spelled == dir.spelled) {
+            let spelled = dir.spelled.clone();
+            if !dirs.push(dir) {
                 continue;
             }
-            match store.purpose {
-                StorePurpose::ProjectSessions => sessions.push(SessionsDir {
-                    identity: fs::symlink_metadata(&dir.spelled)
+            if store.purpose == StorePurpose::ProjectSessions {
+                sessions.push(SessionsDir {
+                    identity: fs::symlink_metadata(&spelled)
                         .ok()
                         .filter(|m| m.is_dir())
                         .map(|m| (m.dev(), m.ino())),
-                    anchored: anchored_resolved(cwd, &dir.spelled)?,
-                }),
-                StorePurpose::LaunchAuthority | StorePurpose::RuntimeState => {}
+                    anchored: anchored_resolved(cwd, &spelled)?,
+                });
             }
-            dirs.push(dir);
         }
         Ok(Self {
-            dirs,
+            dirs: dirs.dirs,
             sessions,
             cwd: cwd.to_path_buf(),
         })
@@ -1142,6 +1291,208 @@ mod tests {
         fs::create_dir(t.home.join(".config")).unwrap();
         assert!(t.check(&t.home.join(".config")).is_err());
     }
+    /// ADR-0073: `projects/` and each project's directory are routes the guard
+    /// measures, while a bind strictly inside one stays allowed — the same rule
+    /// ADR-0038 applies to `~/.config/agent-vm/sub`.
+    #[test]
+    fn project_stores_are_routes_and_their_insides_are_not() {
+        let t = Tree::new();
+        let cfg = t.home.join(".config/agent-vm");
+        let projects = cfg.join("projects");
+        let id = "a".repeat(64);
+        let store = projects.join(&id);
+        fs::create_dir_all(store.join("sub")).unwrap();
+        fs::create_dir_all(cfg.join("sub")).unwrap();
+
+        for refused in [&cfg, &t.home, &projects, &store] {
+            let msg = t.check(refused).unwrap_err().to_string();
+            assert!(
+                msg.contains("is, or contains,"),
+                "{}: {msg}",
+                refused.display()
+            );
+        }
+        // Strictly inside a project's directory: no route is contained.
+        assert!(t.check(&store.join("sub")).is_ok());
+        assert!(t.check(&cfg.join("sub")).is_ok());
+
+        // A symlinked entry records its target, so a bind of that target is
+        // refused however the entry is named.
+        let ext = t.cwd.join("ext");
+        fs::create_dir_all(&ext).unwrap();
+        symlink(&ext, projects.join("b".repeat(64))).unwrap();
+        assert!(t.check(&ext).is_err());
+
+        // A regular file and a dangling symlink under `projects/` are not
+        // stores: they cannot hold a `config.toml`, so they are skipped
+        // deterministically rather than panicking.
+        fs::write(projects.join("c".repeat(64)), "").unwrap();
+        symlink(t.cwd.join("missing"), projects.join("d".repeat(64))).unwrap();
+        assert!(t.guard().check_authority_links().is_ok());
+    }
+
+    /// ADR-0073 R6: only `NotFound` is silence, so an entry under `projects/`
+    /// that is a symlink to a regular file refuses the launch — `lstat` of
+    /// `<entry>/config.toml` answers `NotADirectory`, not `NotFound`.
+    ///
+    /// The refusal must be actionable: the generic "cannot determine" context
+    /// names the unmeasurable `config.toml` path, which no user can act on, so
+    /// the message names the entry itself and the remedy.
+    #[test]
+    fn a_project_store_entry_that_is_not_a_directory_is_refused_by_name() {
+        let t = Tree::new();
+        let projects = t.home.join(".config/agent-vm/projects");
+        fs::create_dir_all(&projects).unwrap();
+        let file = t.cwd.join("not-a-store");
+        fs::write(&file, "").unwrap();
+        let entry = projects.join("e".repeat(64));
+        symlink(&file, &entry).unwrap();
+        let error = ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &t.cwd)
+            .expect_err("a store entry that cannot be measured refuses the launch");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&format!("\"{}\"", entry.display())),
+            "the offending entry must be named: {message}"
+        );
+        assert!(
+            message.contains("not a directory") && message.contains("remove it"),
+            "the refusal must state the fact and the remedy: {message}"
+        );
+    }
+
+    /// The entry bound is fail-closed (see [`MAX_PROJECT_STORES`]): a directory
+    /// too large to measure every entry of refuses the launch, names the bound,
+    /// and names the directory to clean up.
+    #[test]
+    fn too_many_project_store_entries_refuse_the_launch() {
+        let t = Tree::new();
+        let projects = t.home.join(".config/agent-vm/projects");
+        fs::create_dir_all(&projects).unwrap();
+        for n in 0..=MAX_PROJECT_STORES {
+            fs::create_dir(projects.join(format!("{n:064x}"))).unwrap();
+        }
+        let error = ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &t.cwd)
+            .expect_err("an unbounded project store refuses the launch");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&MAX_PROJECT_STORES.to_string())
+                && message.contains(&format!("\"{}\"", projects.display())),
+            "the bound and the directory must be named: {message}"
+        );
+    }
+
+    /// Measuring needs no `projects/` at all, and with only the account home
+    /// known (no raw `$HOME`) the project subtree is still measured.
+    #[test]
+    fn project_stores_measure_without_the_directory_or_a_raw_home() {
+        let t = Tree::new();
+        assert!(t.guard().check_authority_links().is_ok());
+        let cfg = t.home.join(".config/agent-vm");
+        fs::create_dir_all(cfg.join("projects").join("a".repeat(64))).unwrap();
+        let guard =
+            ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &t.cwd).unwrap();
+        assert!(
+            guard
+                .check_core_bind(&CoreHostSource::new(
+                    CoreBind::StateDir,
+                    cfg.join("projects")
+                ))
+                .is_err()
+        );
+    }
+
+    /// Two-pass precedence: a project store reached from a *raw* `$HOME` must
+    /// not answer for the account home's own authority directory, or the refusal
+    /// would name the wrong directory.
+    #[test]
+    fn an_account_home_authority_store_outranks_a_raw_home_project_store() {
+        let t = Tree::new();
+        let cfg = t.home.join(".config/agent-vm");
+        fs::create_dir_all(&cfg).unwrap();
+        let raw = t.cwd.join("raw-home");
+        let raw_projects = raw.join(".config/agent-vm/projects");
+        fs::create_dir_all(&raw_projects).unwrap();
+        // The raw home's project store resolves into the account home's
+        // authority directory, so both stores match a bind of it.
+        symlink(&cfg, raw_projects.join("a".repeat(64))).unwrap();
+        let guard =
+            ProtectedConfigDir::measure(&[raw.clone(), t.home.clone()], &[], &t.cwd).unwrap();
+        let msg = guard
+            .check_core_bind(&CoreHostSource::new(CoreBind::StateDir, cfg.clone()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains(&format!("\"{}\"", cfg.display())),
+            "the account home's authority store must answer first: {msg}"
+        );
+    }
+
+    /// ADR-0038 Decision 2 over every project's `config.toml`, in sorted entry
+    /// order, so the refusal names the same file on every filesystem.
+    #[test]
+    fn a_project_config_with_two_links_refuses_every_launch() {
+        let t = Tree::new();
+        let projects = t.home.join(".config/agent-vm/projects");
+        let first = projects.join("a".repeat(64));
+        let second = projects.join("b".repeat(64));
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let config = first.join("config.toml");
+        fs::write(&config, "").unwrap();
+        let alias = t.cwd.join("alias");
+        fs::hard_link(&config, &alias).unwrap();
+        let msg = t.guard().check_authority_links().unwrap_err().to_string();
+        assert!(
+            msg.contains(&format!("\"{}\" has 2 hard links", config.display())),
+            "{msg}"
+        );
+        fs::remove_file(&alias).unwrap();
+        assert!(t.guard().check_authority_links().is_ok());
+
+        // Another project's file is measured too: the guard exists so P1's guest
+        // cannot plant P2's authority.
+        let other = second.join("config.toml");
+        fs::write(&other, "").unwrap();
+        fs::hard_link(&other, &alias).unwrap();
+        let msg = t.guard().check_authority_links().unwrap_err().to_string();
+        assert!(msg.contains(&format!("\"{}\"", other.display())), "{msg}");
+        fs::remove_file(&alias).unwrap();
+        assert!(t.guard().check_authority_links().is_ok());
+
+        // An uninspectable file fails closed: the reader never gets to classify
+        // it, because not applying it now would launder it into the next launch.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("SKIPPED EACCES: running as root");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&second, fs::Permissions::from_mode(0o000)).unwrap();
+        let err = ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &t.cwd)
+            .unwrap_err()
+            .to_string();
+        fs::set_permissions(&second, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(err.contains("cannot determine"), "{err}");
+    }
+
+    #[test]
+    fn an_unreadable_projects_dir_fails_closed() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("SKIPPED EACCES: running as root");
+            return;
+        }
+        let t = Tree::new();
+        let projects = t.home.join(".config/agent-vm/projects");
+        fs::create_dir_all(&projects).unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&projects, fs::Permissions::from_mode(0o000)).unwrap();
+        let err = ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &t.cwd)
+            .unwrap_err()
+            .to_string();
+        fs::set_permissions(&projects, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(err.contains("cannot determine"), "{err}");
+        assert!(err.contains("projects"), "{err}");
+    }
+
     #[test]
     fn departing_and_dangling_symlinks() {
         let t = Tree::new();

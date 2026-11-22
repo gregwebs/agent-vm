@@ -8,6 +8,12 @@ guard; amends ADR-0036, ADR-0038 and ADR-0018. Additive release: **0.3.2**.
 
 `image refresh` was renamed `image pull` in 0.7.57 (#617, [ADR-0043](0043-image-command-group-and-daemon-import.md)); this record keeps the name it was decided under.
 
+Amended by [ADR-0073](0073-host-managed-project-config.md): the project tier's
+file is measured and refused on any failure, with no presence trigger. Decision
+1's project refusals stand, and the user tier's rules — presence as the trigger,
+a dotfile-symlinked tools-only file still loading, `metadata(parent)` for the
+immediate directory — are unchanged.
+
 ## Context
 
 A guest in project P1 can plant a user-owned `0644` file for project P2. Owner

@@ -179,9 +179,37 @@ OWNED_BUILDER=""
 
 # ----------------------------------------------------------- preconditions --
 
+# #733 (ADR-0073): every fixture below seeds the host-managed project config at
+# `$HOME/.config/agent-vm/projects/<digest>/config.toml`. A candidate that still
+# reads `<project>/.agent-vm/config.toml` would silently fall back to the
+# built-in defaults, so an un-migrated launcher is refused up front rather than
+# passing vacuously. `agent-vm <major>.<minor>.<patch> (...)`: 0.8.0 is the first
+# release with the host-managed tier.
+candidate_reads_host_managed_config() {
+  local bin="$1" version major minor
+  version="$("$bin" --version 2>/dev/null | awk 'NR == 1 {print $2}')" || return 1
+  case "$version" in
+  [0-9]*.[0-9]*.[0-9]*) ;;
+  *) return 1 ;;
+  esac
+  major="${version%%.*}"
+  minor="${version#*.}"
+  minor="${minor%%.*}"
+  [ "$major" -gt 0 ] || { [ "$major" -eq 0 ] && [ "$minor" -ge 8 ]; }
+}
+
 [[ -x "$AGENT_VM" ]] || die "launcher not found at $AGENT_VM; build it with
   ./script/build/macos.sh --dev
 or point AGENT_VM_BIN at one."
+
+# Both launch candidates must be built from this branch, not only the debug one:
+# the retained-default, upgrade and pins rows switch between them under one
+# seeded project store, and a legacy reader would mask an un-migrated candidate.
+for candidate in "$AGENT_VM" "$AGENT_VM_DEV_BIN" "$AGENT_VM_RELEASE_BIN"; do
+  [[ -x "$candidate" ]] || continue
+  candidate_reads_host_managed_config "$candidate" ||
+    die "the launcher at $candidate is older than 0.8.0; it reads <project>/.agent-vm/config.toml instead of the host-managed project config (ADR-0073). Rebuild it from this branch."
+done
 
 command -v docker >/dev/null 2>&1 || die "docker is required but not on PATH"
 docker info >/dev/null 2>&1 || die "the docker daemon is unreachable; start colima or Docker Desktop"
@@ -847,10 +875,33 @@ check_custom_fixtures_imported() {
   done
 }
 
+# Where agent-vm reads a project's host-managed config under a HOME (ADR-0073):
+#   <home>/.config/agent-vm/projects/<sha256 of the canonical project>/config.toml
+# The digest is the harness's job (ADR-0072: hashing belongs in Rust, not in a
+# shell pipeline), and it is an independent oracle for the product's own path.
+host_project_config() {
+  local proj="$1" home="${2:-$CUSTOM_HOME}" cfg
+  mkdir -p "$proj" || return 1
+  cfg="$("$HARNESS" project-config-path --home "$home" --project "$proj")" || return 1
+  [ -n "$cfg" ] || return 1
+  printf '%s\n' "$cfg"
+}
+
+# Write one project-tier config into ``home``'s project store. Every caller must
+# go through this: `<proj>/.agent-vm/config.toml` is no longer read, so a leftover
+# writer would silently test the built-in defaults (ADR-0073).
+write_host_project_config() {
+  local proj="$1" home="${2:-$CUSTOM_HOME}" cfg
+  cfg="$(host_project_config "$proj" "$home")" || return 1
+  mkdir -p "$(dirname "$cfg")" || return 1
+  cat >"$cfg" || return 1
+  printf '%s\n' "$cfg"
+}
+
 write_custom_tools_config() {
-  local dir="$1"
-  mkdir -p "$dir/.agent-vm" || return 1
-  cat >"$dir/.agent-vm/config.toml" <<'EOF' || return 1
+  local dir="$1" home="${2:-$CUSTOM_HOME}"
+  mkdir -p "$dir" || return 1
+  write_host_project_config "$dir" "$home" >/dev/null <<'EOF' || return 1
 [[tools]]
 name = "hello-258"
 command = "hello-258"
@@ -867,8 +918,8 @@ EOF
 # observes the documented guest placeholder. `command = "bash"` + a project
 # script avoids the nested TOML/JSON/shell quoting an inline `-c` would need.
 write_custom_credential_probe() {
-  local dir="$1"
-  mkdir -p "$dir/.agent-vm" || return 1
+  local dir="$1" home="${2:-$CUSTOM_HOME}"
+  mkdir -p "$dir" || return 1
   cat >"$dir/guestprobe.sh" <<'PROBE' || return 1
 #!/bin/sh
 set -eu
@@ -886,7 +937,7 @@ printf 'guest_placeholder_refresh=present\n'
 printf 'credsprobe=ok\n'
 PROBE
   chmod 0755 "$dir/guestprobe.sh" || return 1
-  cat >"$dir/.agent-vm/config.toml" <<'EOF' || return 1
+  write_host_project_config "$dir" "$home" >/dev/null <<'EOF' || return 1
 [[tools]]
 name = "credsprobe"
 command = "bash"
@@ -2473,8 +2524,9 @@ stdin_form_evidence() {
 # A project pinned to one image, for a stdin row.
 stdin_row_project() {
   local name="$1" image="$2" proj="$WORK/$1"
-  mkdir -p "$proj/.agent-vm" || return 1
-  printf 'image = "%s"\n' "$image" >"$proj/.agent-vm/config.toml" || return 1
+  mkdir -p "$proj" || return 1
+  printf 'image = "%s"\n' "$image" |
+    write_host_project_config "$proj" "$CUSTOM_HOME" >/dev/null || return 1
   printf '%s' "$proj"
 }
 
@@ -5365,7 +5417,7 @@ NO_OWNED_STATE='(.mcpServers["chrome-devtools"] // null) == null'
 
 custom_image_integrations() {
   INTEG_PROJ="$(custom_project "custom-integrations")" || return 1
-  cat >>"$INTEG_PROJ/.agent-vm/config.toml" <<'EOF' || return 1
+  cat >>"$(host_project_config "$INTEG_PROJ" "$CUSTOM_HOME")" <<'EOF' || return 1
 
 [[tools]]
 name = "verify-mcp-258"
@@ -5513,7 +5565,7 @@ custom_image_hook_path() {
 printf 'hook-tool-ok uid=%s gid=%s argv=%s env=%s\n' "$(id -u)" "$(id -g)" "$*" "${HOOK_ENV_258:-unset}"
 PROG
   chmod +x "$proj/bin/hook-only-258" || return 1
-  cat >"$proj/.agent-vm/config.toml" <<'EOF' || return 1
+  write_host_project_config "$proj" "$CUSTOM_HOME" >/dev/null <<'EOF' || return 1
 [[tools]]
 name = "hello-258"
 command = "hello-258"
@@ -5540,7 +5592,7 @@ HOOK
   # 127 and the contract diagnostic, never a shell resolution.
   local nopath="custom-hook-nopath" noproj
   noproj="$(custom_project "$nopath")" || return 1
-  cat >"$noproj/.agent-vm/config.toml" <<'EOF' || return 1
+  write_host_project_config "$noproj" "$CUSTOM_HOME" >/dev/null <<'EOF' || return 1
 [[tools]]
 name = "hook-only-258"
 command = "hook-only-258"
@@ -5565,7 +5617,7 @@ HOOK
 printf 'pathname-tool-ok argv1=[%s] argv2=[%s]\n' "$1" "$2"
 PROG
   chmod +x "$pproj/hook dir/tool name" || return 1
-  cat >"$pproj/.agent-vm/config.toml" <<'EOF' || return 1
+  write_host_project_config "$pproj" "$CUSTOM_HOME" >/dev/null <<'EOF' || return 1
 [[tools]]
 name = "pathname-258"
 command = "./hook dir/tool name"
@@ -5885,8 +5937,8 @@ custom_image_nonstandard_cold_warm() {
 custom_image_selected_by_project_config() {
   local name="custom-selected-project" proj out
   proj="$WORK/$name"
-  mkdir -p "$proj/.agent-vm" || return 1
-  cat >"$proj/.agent-vm/config.toml" <<EOF || return 1
+  mkdir -p "$proj" || return 1
+  write_host_project_config "$proj" "$CUSTOM_HOME" >/dev/null <<EOF || return 1
 image = "$CUSTOM_MARKER"
 [[tools]]
 name = "hello-258"
@@ -5907,7 +5959,7 @@ EOF
   mkdir -p "$proj/.agent-vm/layers/10-poison" "$proj/.agent-vm/layer" || return 1
   printf '!! not a dockerfile\n' >"$proj/.agent-vm/layers/10-poison/Dockerfile"
   printf '?? legacy\n' >"$proj/.agent-vm/layer/Dockerfile"
-  cat >"$proj/.agent-vm/config.toml" <<EOF || return 1
+  write_host_project_config "$proj" "$CUSTOM_HOME" >/dev/null <<EOF || return 1
 image = "$CUSTOM_MARKER"
 [[tools]]
 name = "hello-258"
@@ -6085,7 +6137,7 @@ assert_dump() {
 # also runs `custom_image_setup_verification_negative`, reusing its pushed image.
 custom_image_setup_verification_uses_selected_ref() {
   local name="custom-setup-verify" proj="$WORK/custom-setup-verify-proj"
-  mkdir -p "$proj/.agent-vm" || return 1
+  mkdir -p "$proj" || return 1
   local reg="registry:3@sha256:ddf754342cfc8acc51a56d5d0ab6af06826461864460636d8bd5c546dab2a7b8"
   local container port repo selected decoy suffix child acquired result=0
   container="$(docker run -d --rm -p 127.0.0.1::5000 "$reg")" ||
@@ -6131,7 +6183,7 @@ custom_image_setup_verification_uses_selected_ref() {
   # `--version`; the `shell` fallback is not verified. `persist` is what makes the
   # fixture's no-argument mode reach its completion sentinel: the warm launch below
   # asserts a real guest run, not merely a resolved image.
-  cat >"$proj/.agent-vm/config.toml" <<EOF || result=1
+  write_host_project_config "$proj" "$CUSTOM_HOME" >/dev/null <<EOF || result=1
 image = "$selected"
 [[tools]]
 name = "hello-258"
@@ -6214,8 +6266,8 @@ custom_image_setup_verification_negative() {
 
   name="custom-setup-absent"
   proj="$WORK/$name-proj"
-  mkdir -p "$proj/.agent-vm" || return 1
-  cat >"$proj/.agent-vm/config.toml" <<EOF || return 1
+  mkdir -p "$proj" || return 1
+  write_host_project_config "$proj" "$CUSTOM_HOME" >/dev/null <<EOF || return 1
 image = "$selected"
 [[tools]]
 name = "absent-258"
@@ -6240,8 +6292,8 @@ EOF
 
   name="custom-setup-noexec"
   proj="$WORK/$name-proj"
-  mkdir -p "$proj/.agent-vm" || return 1
-  cat >"$proj/.agent-vm/config.toml" <<EOF || return 1
+  mkdir -p "$proj" || return 1
+  write_host_project_config "$proj" "$CUSTOM_HOME" >/dev/null <<EOF || return 1
 image = "$selected"
 [[tools]]
 name = "noexec-258"
@@ -6522,7 +6574,10 @@ custom_image_retained_default() {
   local cold_state="$WORK/rst" empty_state="$WORK/rest"
   local reg="registry:3@sha256:ddf754342cfc8acc51a56d5d0ab6af06826461864460636d8bd5c546dab2a7b8"
 
-  proj="$(custom_project "retained-default")" || return 1
+  # The project tier is seeded into each HOME this check switches to (ADR-0073):
+  # a config under one HOME is invisible under another.
+  proj="$WORK/retained-default"
+  mkdir -p "$proj" || return 1
   # Two explicit, validated candidates: a missing one is a failure, never a
   # silent skip (CONTRIBUTING: native prerequisites are required).
   dev_bin="$AGENT_VM_DEV_BIN"
@@ -6534,6 +6589,16 @@ custom_image_retained_default() {
   if [ ! -x "$rel_bin" ]; then
     echo "    BLOCKER: the release launcher $rel_bin is absent (set AGENT_VM_RELEASE_BIN);"
     echo "             the retained-default check requires a debug *and* a release launcher"
+    return 1
+  fi
+  if ! candidate_reads_host_managed_config "$dev_bin"; then
+    echo "    BLOCKER: the debug candidate $dev_bin is older than 0.8.0 (ADR-0073);"
+    echo "             rebuild it from this branch, or set AGENT_VM_DEV_BIN to one"
+    return 1
+  fi
+  if ! candidate_reads_host_managed_config "$rel_bin"; then
+    echo "    BLOCKER: the release candidate $rel_bin is older than 0.8.0 (ADR-0073);"
+    echo "             rebuild it from this branch, or set AGENT_VM_RELEASE_BIN to one"
     return 1
   fi
   if ! retained_bin_honors_seam "$dev_bin"; then
@@ -6552,6 +6617,7 @@ custom_image_retained_default() {
   RETAINED_HOME="$WORK/rh"
   RETAINED_STATE="$cold_state"
   AGENT_VM_RETAINED_BIN="$dev_bin"
+  write_custom_tools_config "$proj" "$RETAINED_HOME" || return 1
   mkdir -p "$RETAINED_HOME" "$RETAINED_STATE/msb-home" || return 1
   retained_env
   "${LAUNCH_ENV[@]}" "$dev_bin" msb --version >/dev/null 2>&1 ||
@@ -6664,6 +6730,7 @@ custom_image_retained_default() {
   RETAINED_HOME="$fail_home"
   RETAINED_STATE="$fail_state"
   mkdir -p "$fail_home/.config/agent-vm/default-image.lock" "$fail_state/msb-home" || result=1
+  write_custom_tools_config "$proj" "$fail_home" || result=1
   retained_env "$ref_a"
   retained_launch "retained-adopt-fail" "$proj" --no-git hello-258
   if [ "$CAPTURE_STATUS" -eq 0 ]; then
@@ -6830,8 +6897,12 @@ custom_image_default_upgrade() {
     unix://*) ;;
     *) echo '    BLOCKER: #262 fixtures require a local Unix Docker endpoint for credential-isolated publication'; return 1 ;;
   esac
-  proj="$(custom_project upgrade-probe)" || return 1
-  live="$(custom_project upgrade-live)" || return 1
+  proj="$(custom_project upgrade-probe "$RETAINED_HOME")" || return 1
+  live="$(custom_project upgrade-live "$RETAINED_HOME")" || return 1
+  # The project tier now lives in `$RETAINED_HOME`'s project store (ADR-0073), so
+  # every edit, snapshot and restore below names this one file.
+  local proj_cfg
+  proj_cfg="$(host_project_config "$proj" "$RETAINED_HOME")" || return 1
   container="$(upgrade_docker run -d --rm -p 127.0.0.1::5000 "$reg")" || return 1
   port="$(upgrade_docker port "$container" 5000/tcp | head -1 | sed 's/.*://')"
   deadline=$(( $(date +%s) + 30 ))
@@ -6959,9 +7030,9 @@ custom_image_default_upgrade() {
   # must outrank the retained default B: a launcher that ignored project
   # overrides would fall through to retained B (stamp=present) and fail there.
   printf 'image = "%s"\n' "$ref_a" > "$RETAINED_HOME/.config/agent-vm/config.toml"
-  cp "$proj/.agent-vm/config.toml" "$WORK/upgrade-project-before"
-  { printf 'image = "%s"\n' "$ref_b"; cat "$WORK/upgrade-project-before"; } > "$proj/.agent-vm/config.toml"
-  cp "$proj/.agent-vm/config.toml" "$WORK/upgrade-project-with-image"
+  cp "$proj_cfg" "$WORK/upgrade-project-before"
+  { printf 'image = "%s"\n' "$ref_b"; cat "$WORK/upgrade-project-before"; } > "$proj_cfg"
+  cp "$proj_cfg" "$WORK/upgrade-project-with-image"
   cp "$RETAINED_HOME/.config/agent-vm/config.toml" "$WORK/upgrade-user-before"
   local tier expected
   for tier in cli env user; do
@@ -6975,23 +7046,23 @@ custom_image_default_upgrade() {
     require_launch_ok "upgrade-$tier" || result=1
     out="$(launch_output "upgrade-$tier")"
     assert_eq "upgrade override $tier guest" "$expected" "$(grep '^stamp=' <<<"$out")" || result=1
-    cmp "$proj/.agent-vm/config.toml" "$WORK/upgrade-project-with-image" || result=1
+    cmp "$proj_cfg" "$WORK/upgrade-project-with-image" || result=1
     cmp "$(retained_record)" "$WORK/upgrade-record-before" || result=1
     cmp "$RETAINED_HOME/.config/agent-vm/config.toml" "$WORK/upgrade-user-before" || result=1
   done
   # Project-only: remove the user tier and repoint the project fixture to A,
   # refreshing its expected-byte snapshot before the guest observation.
   rm "$RETAINED_HOME/.config/agent-vm/config.toml"
-  { printf 'image = "%s"\n' "$ref_a"; cat "$WORK/upgrade-project-before"; } > "$proj/.agent-vm/config.toml"
-  cp "$proj/.agent-vm/config.toml" "$WORK/upgrade-project-with-image"
+  { printf 'image = "%s"\n' "$ref_a"; cat "$WORK/upgrade-project-before"; } > "$proj_cfg"
+  cp "$proj_cfg" "$WORK/upgrade-project-with-image"
   retained_env
   retained_launch upgrade-project "$proj" --no-git hello-258 || result=1
   require_launch_ok upgrade-project || result=1
   out="$(launch_output upgrade-project)"
   assert_eq 'upgrade override project guest' stamp=absent "$(grep '^stamp=' <<<"$out")" || result=1
-  cmp "$proj/.agent-vm/config.toml" "$WORK/upgrade-project-with-image" || result=1
+  cmp "$proj_cfg" "$WORK/upgrade-project-with-image" || result=1
   cmp "$(retained_record)" "$WORK/upgrade-record-before" || result=1
-  cp "$WORK/upgrade-project-before" "$proj/.agent-vm/config.toml"
+  cp "$WORK/upgrade-project-before" "$proj_cfg"
   upgrade_docker rm -f "$container" >/dev/null || result=1
   retained_env
   retained_launch upgrade-offline-b "$proj" --no-git hello-258 || result=1
@@ -7185,9 +7256,11 @@ custom_image_host_pins() {
     return 1
   }
   PINS_BIN="$AGENT_VM_DEV_BIN"
-  proj="$(custom_project pins-main)" || return 1
-  live="$(custom_project pins-live)" || return 1
+  # `pins_env` first: each project's config must be seeded into the HOME that
+  # reads it (ADR-0073), and this check switches HOMEs several times below.
   pins_env "$WORK/pins-home" "$WORK/pins-state"
+  proj="$(custom_project pins-main "$PINS_HOME")" || return 1
+  live="$(custom_project pins-live "$PINS_HOME")" || return 1
   mkdir -p "$PINS_HOME" "$PINS_STATE/msb-home" || return 1
   "${PINS_ENV[@]}" "$PINS_BIN" msb --version >/dev/null 2>&1 ||
     { echo "    BLOCKER: could not initialize the private state root"; return 1; }
@@ -7292,6 +7365,9 @@ custom_image_host_pins() {
 
   # ---- acquisition and approval survive a failed create ----
   pins_env "$WORK/pkh" "$WORK/pkx"
+  # A new HOME needs its own copy of the project tier, or this row would launch
+  # the built-in defaults instead of the fixture tool.
+  write_custom_tools_config "$proj" "$PINS_HOME" || result=1
   mkdir -p "$PINS_HOME" "$PINS_STATE/msb-home" || result=1
   "${PINS_ENV[@]}" "$PINS_BIN" msb --version >/dev/null 2>&1 || result=1
   start_pin_observer "$WORK/pins-create-gate.log" pin-committed "$WORK/pins-create-release" ||
@@ -7607,7 +7683,7 @@ custom_image_host_pins() {
   # A different project with its own cold state/cache resolves the moved tag
   # afresh: it boots B and records *its own* approval, while the launching
   # project's record stays byte-identical.
-  iso_proj="$(custom_project pins-iso-new-project)" || result=1
+  iso_proj="$(custom_project pins-iso-new-project "$PINS_HOME")" || result=1
   iso_state="$WORK/pis"
   mkdir -p "$iso_state/msb-home" || result=1
   proj_record_before="$(jq -c --arg p "$proj_id" --arg r "$tag" \
@@ -7815,6 +7891,7 @@ custom_image_host_pins() {
   mkdir -p "$rootfs" || result=1
   default_home="$WORK/plh"
   pins_env "$default_home" "$WORK/pins-state"
+  write_custom_tools_config "$proj" "$PINS_HOME" || result=1
   mkdir -p "$PINS_HOME/.config/agent-vm" || result=1
   printf 'not-json\n' >"$(pins_store)" || result=1
   pin_snapshot="$(cat "$(pins_store)")"
@@ -7834,6 +7911,7 @@ custom_image_host_pins() {
   default_state="$WORK/pds"
   mkdir -p "$default_home" "$default_state/msb-home" || result=1
   pins_env "$default_home" "$default_state"
+  write_custom_tools_config "$proj" "$PINS_HOME" || result=1
   observe_launch pins-default-first "$proj" "$WORK/pins-default-first.out" -- \
     "${PINS_ENV[@]}" "${OFFLINE_ENV[@]}" AGENT_VM_TEST_DEFAULT_IMAGE="$ref_b" \
     XDG_CONFIG_HOME="$WORK/offline-config" PATH="$SHIM_DIR:/usr/bin:/bin" \
@@ -8013,8 +8091,8 @@ custom_docker_import_workflow() {
 }
 
 explicit_project() {
-  mkdir -p "$BUILD_PROJECT/.agent-vm" "$BUILD_HOME" || return 1
-  cat > "$BUILD_PROJECT/.agent-vm/config.toml" <<'CONFIG'
+  mkdir -p "$BUILD_PROJECT" "$BUILD_HOME" || return 1
+  write_host_project_config "$BUILD_PROJECT" "$BUILD_HOME" >/dev/null <<'CONFIG' || return 1
 [[tools]]
 name = "shell"
 command = "bash"
@@ -8031,7 +8109,8 @@ custom_explicit_build_workflow() {
   BUILD_SHARE=0 BUILD_CACHE="$WORK/unused-cache"
   BUILD_REF="agent-vm-e2e-260-$RUN_ID:dev"
   explicit_project || return 1
-  local source_before
+  local source_before build_cfg
+  build_cfg="$(host_project_config "$BUILD_PROJECT" "$BUILD_HOME")" || return 1
   source_before="$(shasum -a 256 "$FIXTURE_DIR"/*)" || return 1
   explicit_build build260 marker-free || return 1
   [ "$source_before" = "$(shasum -a 256 "$FIXTURE_DIR"/*)" ] || return 1
@@ -8084,7 +8163,7 @@ custom_explicit_build_workflow() {
   jq -n --arg image "$pin" '{version:1,image:$image}' > "$record" || return 1
   explicit_boot build260-default absent --no-git shell hello-258 || return 1
   cp "$record" "$WORK/record260.before" || return 1
-  cp "$BUILD_PROJECT/.agent-vm/config.toml" "$WORK/config260.before" || return 1
+  cp "$build_cfg" "$WORK/config260.before" || return 1
   [ ! -e "$BUILD_STATE/msb-home/config.json" ] || return 1
   if (cd "$BUILD_PROJECT" && "${BUILD_ENV[@]}" env -u AGENT_VM_IMAGE_TAG -u AGENT_VM_ROOT -u MSB_CONFIG_PATH \
       HOME="$BUILD_HOME" AGENT_VM_STATE_DIR="$BUILD_STATE" \
@@ -8095,7 +8174,7 @@ custom_explicit_build_workflow() {
   explicit_boot build260-failure-result absent --no-git --image "$BUILD_REF" shell hello-258 || return 1
   explicit_boot build260-failure-default absent --no-git shell hello-258 || return 1
   cmp "$record" "$WORK/record260.before" || return 1
-  cmp "$BUILD_PROJECT/.agent-vm/config.toml" "$WORK/config260.before" || return 1
+  cmp "$build_cfg" "$WORK/config260.before" || return 1
   [ ! -e "$BUILD_STATE/msb-home/config.json" ] || return 1
   # Success must replace the mutable result without adopting the replacement.
   (cd "$BUILD_PROJECT" && "${BUILD_ENV[@]}" env -u AGENT_VM_IMAGE_TAG -u AGENT_VM_ROOT -u MSB_CONFIG_PATH \
@@ -8115,7 +8194,7 @@ custom_explicit_build_workflow() {
   BUILD_HOME="$original_home" BUILD_STATE="$original_state" BUILD_PROJECT="$original_project"
   explicit_boot build260-retained absent --no-git shell hello-258 || return 1
   cmp "$record" "$WORK/record260.before" || return 1
-  cmp "$BUILD_PROJECT/.agent-vm/config.toml" "$WORK/config260.before" || return 1
+  cmp "$build_cfg" "$WORK/config260.before" || return 1
   [ ! -e "$BUILD_STATE/msb-home/config.json" ] || return 1
 }
 
@@ -8436,9 +8515,9 @@ custom_image_direct_nonstandard() {
 # config it handed the SDK, and the host state it left behind. The control tool
 # proves the credential really was usable, so "no capture" is not "inert seed".
 write_direct_hostile_config() {
-  local dir="$1"
-  mkdir -p "$dir/.agent-vm" || return 1
-  cat >"$dir/.agent-vm/config.toml" <<'EOF' || return 1
+  local dir="$1" home="${2:-$CUSTOM_HOME}"
+  mkdir -p "$dir" || return 1
+  write_host_project_config "$dir" "$home" >/dev/null <<'EOF' || return 1
 [[tools]]
 name = "direct-probe-398"
 command = "probe-from-catalog"
