@@ -100,7 +100,7 @@ impl Harness {
     }
 
     fn project_config(&self) -> PathBuf {
-        self.project_root.join(".agent-vm/config.toml")
+        support::project_config_path(&self.home_root, &self.project_root)
     }
 
     fn credentials(&self) -> PathBuf {
@@ -680,6 +680,12 @@ fn a_missing_home_reports_an_unavailable_user_tier() {
         stdout.contains("<no HOME; user tier unavailable>"),
         "{stdout}"
     );
+    // R2: the project tier is host-managed, so it is unavailable for the same
+    // reason and its row must say which tier is missing.
+    assert!(
+        stdout.contains("<no HOME; project tier unavailable>"),
+        "{stdout}"
+    );
     // An unlocatable authority is already this report's config finding. It must
     // not become a second, boot-image damage diagnosis: the run still fails, but
     // through the credential store, and no row or trailing error calls the
@@ -724,18 +730,17 @@ fn a_missing_home_reports_an_unavailable_user_tier() {
 
 #[test]
 fn a_special_file_or_control_byte_path_is_rejected_with_an_escaped_reason() {
-    // A project dir whose name carries a newline and an ESC/ANSI sequence,
-    // with `.agent-vm/config.toml` a directory rather than a file.
-    let h = Harness::new();
-    let evil_project = h.project_root.join("proj\n\x1b[31mred");
-    std::fs::create_dir_all(evil_project.join(".agent-vm/config.toml")).unwrap();
+    // A HOME whose name carries a newline and an ESC/ANSI sequence, with the
+    // host-managed project config a directory rather than a file. The measured
+    // path is the one that must be escaped.
+    let h = Harness::in_leaf("home\n\x1b[31mred", "", "");
+    std::fs::create_dir_all(h.project_config()).unwrap();
 
     let out = h
         .base_command()
-        .current_dir(&evil_project)
         .arg("doctor")
         .output()
-        .expect("failed to run agent-vm doctor in an evil project");
+        .expect("failed to run agent-vm doctor with an evil HOME");
 
     assert_failure(&out);
     let stderr = stderr_of(&out);
@@ -745,6 +750,288 @@ fn a_special_file_or_control_byte_path_is_rejected_with_an_escaped_reason() {
         "ESC should be escaped: {stderr:?}"
     );
     assert!(stderr.contains("not a regular file"), "{stderr}");
+}
+
+/// The `==> tool configuration` section, without its trailing blank line.
+fn tool_configuration_section(stdout: &str) -> String {
+    let start = stdout
+        .find("==> tool configuration\n")
+        .unwrap_or_else(|| panic!("no tool configuration section: {stdout}"));
+    let rest = &stdout[start..];
+    let end = rest.find("\n\n==> ").unwrap_or(rest.len());
+    rest[..end].to_owned()
+}
+
+/// The exact R7 bytes for an ignored in-repo config.
+fn legacy_note(path: &Path) -> String {
+    format!(
+        "note: {} is not auto-loaded; agent-vm never reads an in-repo .agent-vm/config.toml.\n\
+         To use it, review it and source it from this project's config with `agent-vm config edit`.",
+        path.display()
+    )
+}
+
+/// AC1/R7: an in-repo `.agent-vm/config.toml` is dead. Its tools never become
+/// verbs, the defaults still resolve, and `doctor` says why.
+#[test]
+fn an_in_repo_project_config_is_never_loaded() {
+    let h = Harness::new();
+    // Create the host project store, empty of `config.toml`. Without it the
+    // ADR-0073 route check short-circuits to `Absent` before the project path is
+    // even inspected, and this test then stays green when discovery is reverted
+    // to the in-repo path — the exact regression it exists to catch (#733).
+    std::fs::create_dir_all(h.project_config().parent().unwrap()).unwrap();
+    write(
+        &h.project_root.join(".agent-vm/config.toml"),
+        "[[tools]]\nname = \"legacy-only\"\ncommand = \"legacy-only\"\n",
+    );
+
+    let out = h.run_doctor();
+    assert_success(&out);
+    let stdout = stdout_of(&out);
+    assert!(!stdout.contains("legacy-only"), "{stdout}");
+    // The store exists but holds nothing: the tier is absent, not skipped.
+    assert!(
+        stdout.contains(&format!(
+            "project: {} (absent)",
+            h.project_config().display()
+        )),
+        "{stdout}"
+    );
+    assert!(stdout.contains("resolved: built-in defaults"), "{stdout}");
+    // Not merely unlisted: no such verb exists.
+    let verb = h
+        .base_command()
+        .arg("legacy-only")
+        .output()
+        .expect("failed to run the refused verb");
+    assert_eq!(verb.status.code(), Some(2), "{}", stderr_of(&verb));
+}
+
+/// AC1/R1: the host-managed path from `support::project_config_path` — computed
+/// independently of the product — is what the product reads.
+#[test]
+fn a_host_managed_project_config_is_loaded_from_the_project_digest_path() {
+    let h = Harness::new();
+    let config = support::project_config_path(&h.home_root, &h.project_root);
+    write(
+        &config,
+        "[[tools]]\nname = \"hosted-258\"\ncommand = \"hosted-258\"\n",
+    );
+
+    let out = h.run_doctor();
+    assert_success(&out);
+    let stdout = stdout_of(&out);
+    assert!(stdout.contains("hosted-258"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("source=project:{}", config.display())),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("project: {} (found, 1 tool)", config.display())),
+        "{stdout}"
+    );
+    // The id is the full 64-hex digest, not the 12-hex state-directory name.
+    let id = config
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(OsStr::to_str)
+        .expect("a hex project id");
+    assert_eq!(id.len(), 64, "{id}");
+    assert!(
+        id.chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        "{id}"
+    );
+}
+
+/// AC2/R3: an absent project tier does not suppress the user tier, and the
+/// project row says so.
+#[test]
+fn an_absent_project_config_keeps_the_user_tier() {
+    let h = Harness::new();
+    h.write_user("[[tools]]\nname = \"user-only\"\ncommand = \"user-only\"\n");
+
+    let out = h.run_doctor();
+    assert_success(&out);
+    let stdout = stdout_of(&out);
+    assert!(stdout.contains("user-only"), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "project: {} (absent)",
+            h.project_config().display()
+        )),
+        "{stdout}"
+    );
+    assert!(stdout.contains("resolved: declared tools"), "{stdout}");
+}
+
+/// AC4/R7: `doctor` reports a legacy in-repo file and never loads it. Five
+/// independent rows, because the notice must survive every report shape.
+#[test]
+fn a_legacy_in_repo_config_gets_a_notice() {
+    // (a1) alone: no other config anywhere.
+    let h = Harness::new();
+    let legacy = h.project_root.join(".agent-vm/config.toml");
+    write(
+        &legacy,
+        "[[tools]]\nname = \"legacy-only\"\ncommand = \"legacy-only\"\n",
+    );
+    let out = h.run_doctor();
+    assert_success(&out);
+    let stdout = stdout_of(&out);
+    assert!(
+        tool_configuration_section(&stdout).ends_with(&legacy_note(&legacy)),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("legacy-only"), "{stdout}");
+
+    // (a2) alongside a valid host-managed project config: the note is still the
+    // last thing the section says.
+    let supported = Harness::new();
+    supported.write_project("[[tools]]\nname = \"hosted\"\ncommand = \"hosted\"\n");
+    write(
+        &supported.project_root.join(".agent-vm/config.toml"),
+        "[image]\nname = \"ignored\"\n",
+    );
+    let out = supported.run_doctor();
+    assert_success(&out);
+    let stdout = stdout_of(&out);
+    assert!(stdout.contains("hosted"), "{stdout}");
+    assert!(
+        tool_configuration_section(&stdout).ends_with(&legacy_note(
+            &supported.project_root.join(".agent-vm/config.toml")
+        )),
+        "{stdout}"
+    );
+
+    // (a3) with no `$HOME` at all: both tiers are unavailable, and the note is
+    // still reported.
+    let no_home = Harness::new();
+    write(
+        &no_home.project_root.join(".agent-vm/config.toml"),
+        "[[tools]]\nname = \"legacy-only\"\n",
+    );
+    let (_stub, path) = support::path_without_host_keychain();
+    let out = no_home
+        .base_command()
+        .env_remove("HOME")
+        .env("PATH", path)
+        .arg("doctor")
+        .output()
+        .expect("failed to run doctor without HOME");
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.contains("<no HOME; project tier unavailable>"),
+        "{stdout}"
+    );
+    assert!(
+        tool_configuration_section(&stdout).ends_with(&legacy_note(
+            &no_home.project_root.join(".agent-vm/config.toml")
+        )),
+        "{stdout}"
+    );
+
+    // (a4) when the configuration fails to load: the section is an `error:` body
+    // and the note still follows it.
+    let broken = Harness::new();
+    broken.write_project("this is not = = toml\n");
+    write(
+        &broken.project_root.join(".agent-vm/config.toml"),
+        "[[tools]]\nname = \"legacy-only\"\n",
+    );
+    let out = broken.run_doctor();
+    assert_failure(&out);
+    let stdout = stdout_of(&out);
+    let section = tool_configuration_section(&stdout);
+    assert!(section.contains("error: "), "{section}");
+    assert!(
+        section.ends_with(&legacy_note(
+            &broken.project_root.join(".agent-vm/config.toml")
+        )),
+        "{section}"
+    );
+
+    // (b) project A's file is not reported when running in project B under the
+    // same HOME: the probe is the captured cwd, not the home.
+    let scoped = Harness::new();
+    let a = scoped.project_root.join("a");
+    let b = scoped.project_root.join("b");
+    std::fs::create_dir_all(a.join(".agent-vm")).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    write(&a.join(".agent-vm/config.toml"), "");
+    let out = scoped
+        .base_command()
+        .current_dir(&b)
+        .arg("doctor")
+        .output()
+        .expect("failed to run doctor in project b");
+    assert_success(&out);
+    assert!(
+        !stdout_of(&out).contains("is not auto-loaded"),
+        "{}",
+        stdout_of(&out)
+    );
+
+    // (c) a regular file where `.agent-vm` should be a directory: the lstat
+    // error is not `NotFound`, so the exact "could not check" note prints and the
+    // exit status is unchanged.
+    let not_a_directory = Harness::new();
+    let dot = not_a_directory.project_root.join(".agent-vm");
+    write(&dot, "not a directory\n");
+    let out = not_a_directory.run_doctor();
+    assert_success(&out);
+    let stdout = stdout_of(&out);
+    assert!(
+        tool_configuration_section(&stdout).ends_with(&format!(
+            "note: could not check for an in-repo .agent-vm/config.toml at {} (NotADirectory); agent-vm never auto-loads it.",
+            dot.join("config.toml").display()
+        )),
+        "{stdout}"
+    );
+
+    // (d) absent when there is no legacy file, and deliberately omitted from the
+    // reset report, which reads no config at all.
+    let clean = Harness::new();
+    let out = clean.run_doctor();
+    assert_success(&out);
+    assert!(
+        !stdout_of(&out).contains("not auto-loaded"),
+        "{}",
+        stdout_of(&out)
+    );
+    // The reset report is asserted byte-for-byte elsewhere; here only that it
+    // carries no note, because it reads no config.
+    let out = clean.run_doctor_reset();
+    assert!(
+        !stdout_of(&out).contains("is not auto-loaded"),
+        "{}",
+        stdout_of(&out)
+    );
+
+    // (e) a cwd holding ESC cannot rewrite the terminal: the note's path is
+    // escaped, and no raw ESC survives anywhere in the report.
+    let escaped = Harness::new();
+    let evil = escaped.project_root.join("proj\n\x1b[31mred");
+    std::fs::create_dir_all(evil.join(".agent-vm")).unwrap();
+    write(&evil.join(".agent-vm/config.toml"), "");
+    let out = escaped
+        .base_command()
+        .current_dir(&evil)
+        .arg("doctor")
+        .output()
+        .expect("failed to run doctor in an evil project");
+    assert_success(&out);
+    let stdout = stdout_of(&out);
+    assert!(!stdout.contains('\x1b'), "raw ESC leaked: {stdout:?}");
+    assert!(
+        stdout.contains("\\x1b"),
+        "ESC should be escaped: {stdout:?}"
+    );
+    assert!(
+        tool_configuration_section(&stdout).contains("is not auto-loaded"),
+        "{stdout}"
+    );
 }
 
 #[test]
@@ -1150,9 +1437,12 @@ fn a_non_ascii_measured_path_is_printed_as_itself() {
             "дом",
         ),
         (
+            // The project tier is host-managed (ADR-0073), so its leaf is the
+            // HOME's non-ASCII component; the project's own leaf is asserted by
+            // the `dir:` row above.
             "the project tier line",
             format!("{} (found", h.project_config().display()),
-            "проект",
+            "дом",
         ),
         (
             "the user image row",
@@ -1162,7 +1452,7 @@ fn a_non_ascii_measured_path_is_printed_as_itself() {
         (
             "the project image row",
             "127.0.0.1:1/project:dev [".to_string(),
-            "проект",
+            "дом",
         ),
         ("the default row", "default: ".to_string(), "дом"),
         (

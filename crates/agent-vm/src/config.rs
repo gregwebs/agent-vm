@@ -12,7 +12,9 @@
 //! # Two ordered catalogs, not an overlay
 //!
 //! The user file (`$HOME/.config/agent-vm/config.toml`) and the project file
-//! (`<cwd>/.agent-vm/config.toml`) are two ordered *catalogs*. The project may
+//! (`$HOME/.config/agent-vm/projects/<project-id>/config.toml`, ADR-0073) are
+//! two ordered *catalogs*. Nothing in a repository is ever read as config:
+//! `<cwd>/.agent-vm/config.toml` is not auto-loaded. The project may
 //! add whole tool definitions the user did not write; a name the user did
 //! write is authoritative and the entire user definition wins (never a
 //! field-by-field merge). Resolved order is user declarations first, then
@@ -105,10 +107,14 @@
 //! holding one may be trusted is [`crate::config_authority`]'s decision, taken
 //! here once per user file from the *presence* of any of those keys, so this
 //! module and [`crate::config_mounts`] only decide *what* a trusted file says.
+//! The project file is nevertheless verified unconditionally via a no-follow
+//! open and store-route check before bytes are read (ADR-0073); it still may
+//! not declare any of them.
 
 use crate::config_authority::{self, AuthorityTriggers};
 use crate::config_mounts::{self, ResolvedMountList, UserMounts};
 use crate::egress_reference::{self, EgressNamespace};
+use crate::host_paths::FinalComponent;
 use crate::user_network::{self, UserNetwork};
 
 use crate::network_requests::{NetworkRequests, RequestTier};
@@ -138,7 +144,6 @@ pub(crate) use builtin_print::builtin_tools_toml;
 const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
 
 const USER_CONFIG_RELATIVE: &str = concat!(".config/agent-vm", "/config.toml");
-const PROJECT_CONFIG_RELATIVE: &str = ".agent-vm/config.toml";
 
 /// The user-scoped agent-vm config directory under `$HOME` — the directory
 /// `USER_CONFIG_RELATIVE` sits in, and the one [`crate::secret_store`] and
@@ -186,12 +191,13 @@ const DEFAULT_TOOLS_TOML: &str = include_str!("default-tools.toml");
 // Public interface
 // ---------------------------------------------------------------------------
 
-/// Where the two config files live. `user` is `None` only when `$HOME` is
-/// unavailable; the project path is always the canonical cwd plus the fixed
-/// relative location (consistent with [`crate::project::ProjectDir::capture`]).
+/// Where the two config files live. Both are `None` only when `$HOME` is
+/// unavailable: the project tier is host-managed under it (ADR-0073), keyed by
+/// the captured project's digest, and never read from the project directory.
+/// Literal `$HOME` spelling is preserved for diagnostics and [`TierReport`].
 pub(crate) struct ConfigPaths {
     pub(crate) user: Option<PathBuf>,
-    pub(crate) project: PathBuf,
+    pub(crate) project: Option<crate::project_config::ProjectTierPaths>,
     /// The `$HOME` [`Self::user`] was derived from: the only base a `~/` in that
     /// file's `mounts` may expand against (ADR-0046). Captured once, with the
     /// path, so a launch cannot read one `config.toml` and expand `~/` against a
@@ -200,17 +206,54 @@ pub(crate) struct ConfigPaths {
 }
 
 impl ConfigPaths {
-    /// The environment adapter: resolve `$HOME` and the canonical cwd.
+    /// The environment adapter: `$HOME`, plus the command's one project capture.
     ///
     /// There is deliberately no `XDG_CONFIG_HOME` or override variable in
     /// this PR — the ticket names the literal `$HOME` location.
-    pub(crate) fn discover() -> Result<Self> {
+    pub(crate) fn discover(project: &crate::project::ProjectDir) -> Result<Self> {
         let home = discover_home()?;
         Ok(Self {
             user: home.as_ref().map(|home| home.join(USER_CONFIG_RELATIVE)),
-            project: discover_project_path()?,
+            project: home
+                .as_ref()
+                .map(|home| crate::project_config::ProjectTierPaths {
+                    config: crate::project_config::path(home, project),
+                    // The route check's anchor, from the same capture as the path:
+                    // a caller can neither check one home and read another nor
+                    // reach a project tier with no root to check against.
+                    route: crate::project_config::RouteAnchor::Captured {
+                        home: home.clone(),
+                        root: project.path().to_path_buf(),
+                    },
+                }),
             home,
         })
+    }
+
+    /// A hand-built pair for this crate's tests, which predate the store: no
+    /// `$HOME`, and a project tier with no captured root
+    /// ([`crate::project_config::RouteAnchor::Uncaptured`]), so the ADR-0073
+    /// store route is not checked. Named rather than a struct literal so the
+    /// skipped check is one visible decision instead of a field a new fixture
+    /// could omit.
+    #[cfg(test)]
+    pub(crate) fn for_test(user: Option<PathBuf>, project: PathBuf) -> Self {
+        Self::for_test_with_home(user, project, None)
+    }
+
+    /// [`Self::for_test`] with the `~/` base some user-tier fixtures expand
+    /// against.
+    #[cfg(test)]
+    pub(crate) fn for_test_with_home(
+        user: Option<PathBuf>,
+        project: PathBuf,
+        home: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            user,
+            project: Some(crate::project_config::ProjectTierPaths::uncaptured(project)),
+            home,
+        }
     }
 }
 
@@ -614,7 +657,7 @@ pub(crate) enum TierStatus {
     Found {
         declared_tools: usize,
     },
-    /// `$HOME` was missing, so the user tier could not be located at all.
+    /// `$HOME` was missing, so this tier could not be located at all.
     UnavailableHome,
 }
 
@@ -1049,25 +1092,16 @@ impl ConfigConflict {
 /// there is no fallback to defaults.
 pub(crate) fn load(paths: &ConfigPaths) -> Result<ConfigReport> {
     let (user, user_contents) = match &paths.user {
-        Some(path) => read_file_tier(TierSource {
-            path,
-            kind: FileTierKind::User,
-            home: paths.home.as_deref(),
-        })?,
-        None => (
-            TierReport {
-                path: None,
-                status: TierStatus::UnavailableHome,
-            },
-            TierContents::empty(),
-        ),
+        Some(path) => read_user_tier(path, paths.home.as_deref())?,
+        None => unavailable_home_tier(),
     };
-    // The project tier can declare no `mounts` (refused), so it has no `~/` base.
-    let (project, project_contents) = read_file_tier(TierSource {
-        path: &paths.project,
-        kind: FileTierKind::Project,
-        home: None,
-    })?;
+    // The project tier is host-managed (ADR-0073) and may declare no `mounts`,
+    // so it has no `~/` base: its own [`ProjectTierPaths`] carries the route
+    // check's anchor instead of borrowing the user tier's.
+    let (project, project_contents) = match &paths.project {
+        Some(project) => read_project_tier(project)?,
+        None => unavailable_home_tier(),
+    };
     let mounts = user_contents.mounts;
 
     let (resolved, uses_defaults, conflicts) =
@@ -1127,6 +1161,9 @@ impl TierContents {
     }
 }
 
+/// Which tier a file is, where provenance matters: a tool declaration keeps the
+/// tier it was written in for diagnostics, conflict warnings and the egress
+/// reference scope's identity.
 #[derive(Clone, Copy)]
 enum FileTierKind {
     User,
@@ -1142,34 +1179,58 @@ impl FileTierKind {
     }
 }
 
-/// One file-backed tier to read: its path, which tier it is, and — for the user
-/// tier — the `$HOME` a `~/` in its `mounts` expands against.
-///
-/// A named bundle rather than three positional arguments, because two of them
-/// would be an `Option<&Path>` the callee could not tell apart from the file it
-/// reads.
-struct TierSource<'a> {
-    path: &'a Path,
-    kind: FileTierKind,
-    home: Option<&'a Path>,
+fn unavailable_home_tier() -> (TierReport, TierContents) {
+    (
+        TierReport {
+            path: None,
+            status: TierStatus::UnavailableHome,
+        },
+        TierContents::empty(),
+    )
 }
 
-/// Read, decode, and validate one file-backed tier. Only a `NotFound` from
-/// the initial `symlink_metadata` means absent; a present-but-dangling
-/// symlink or a file that vanishes before the read is an error, not a quiet
-/// fallback.
-fn read_file_tier(source: TierSource<'_>) -> Result<(TierReport, TierContents)> {
-    let TierSource { path, kind, home } = source;
+fn absent_tier(path: &Path) -> (TierReport, TierContents) {
+    (
+        TierReport {
+            path: Some(path.to_path_buf()),
+            status: TierStatus::Absent,
+        },
+        TierContents::empty(),
+    )
+}
+
+/// Decode and parse one tier's bytes: the half every file tier shares once its
+/// bytes are in hand. Diagnostics never echo a value, and invalid UTF-8 is its
+/// own error (see the module's value-safe rules).
+fn parse_tier(path: &Path, bytes: &[u8]) -> Result<RawConfig> {
+    let text = std::str::from_utf8(bytes).map_err(|_| utf8_error(path))?;
+    toml::from_str(text).map_err(|error| deserialize_error(path, text, &error))
+}
+
+/// What one tier's *measured* read established, before its bytes are
+/// interpreted. The two tiers are measured differently and must not be
+/// confusable, so they are separate arms rather than an `Option` of tokens.
+enum TierAuthority<'a> {
+    /// ADR-0040's verified read: the verdict is unconditional, but the token it
+    /// mints is `Some` only for a file that declares an authority-bearing field.
+    User(config_authority::Verification<'a>),
+    /// ADR-0073: measured unconditionally, and may declare no authority field at
+    /// all — so there is no token to mint.
+    Project,
+}
+
+/// Read, verify, decode, and validate the **user** tier.
+///
+/// Only a `NotFound` from the initial `symlink_metadata` means absent; a
+/// present-but-dangling symlink or a file that vanishes before the read is an
+/// error, not a quiet fallback. A final symlink is followed here (ADR-0040's
+/// dotfile compatibility), and the bytes are read before the verdict: that is
+/// the user tier's shipped rule and it is unchanged.
+fn read_user_tier(path: &Path, home: Option<&Path>) -> Result<(TierReport, TierContents)> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((
-                TierReport {
-                    path: Some(path.to_path_buf()),
-                    status: TierStatus::Absent,
-                },
-                TierContents::empty(),
-            ));
+            return Ok(absent_tier(path));
         }
         Err(error) => return Err(safe_io_error("reading metadata for", path, &error)),
     }
@@ -1178,9 +1239,7 @@ fn read_file_tier(source: TierSource<'_>) -> Result<(TierReport, TierContents)> 
         crate::host_paths::read_bounded_regular_file_noting_symlink(path, MAX_CONFIG_FILE_BYTES)
             .map_err(|error| safe_anyhow_error("reading", path, &error))?;
     let path = read.path();
-    let text = std::str::from_utf8(read.bytes()).map_err(|_| utf8_error(path))?;
-    let raw: RawConfig =
-        toml::from_str(text).map_err(|error| deserialize_error(path, text, &error))?;
+    let raw = parse_tier(path, read.bytes())?;
     // Authority is decided by the *presence* of an authority-bearing field, from
     // the same verified read the bytes came from, before any of it is parsed.
     // Presence, not contents: `mounts = []`, an empty `[network]`, an empty
@@ -1192,6 +1251,119 @@ fn read_file_tier(source: TierSource<'_>) -> Result<(TierReport, TierContents)> 
     // accepted or partially patched tool, so its mount field must not be able to
     // skip the check by making the definition invalid somewhere else.
     let first_tool_mounts = raw.tools.iter().position(|tool| tool.mounts.is_some());
+    let triggers = AuthorityTriggers {
+        network: raw.network.is_some(),
+        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {
+            top_level: raw.mounts.is_some(),
+            tool_field: first_tool_mounts.is_some(),
+        }),
+        mount_sets: raw.mount_sets.is_some(),
+        egress_sets: raw.egress_sets.is_some(),
+    };
+    let verification = config_authority::verify(&read, triggers).map_err(|error| {
+        // A refusal caused by a tool's own field names that field first: the
+        // reader has to find the list they must review, and a file with no
+        // top-level `mounts` has nothing else pointing at it. The numeric site
+        // is echoed, never the tool's name or the list's contents.
+        let pointer = match first_tool_mounts {
+            Some(declaration) if raw.mounts.is_none() => {
+                format!("tools[{declaration}].mounts: ")
+            }
+            _ => String::new(),
+        };
+        anyhow!(
+            "config: {}: {pointer}{error}",
+            crate::one_line::quoted_path(path)
+        )
+    })?;
+    build_tier(
+        path,
+        raw,
+        TierAuthority::User(verification),
+        FileTierKind::User,
+        home,
+    )
+}
+
+/// Read, verify, decode, and validate the **project** tier (ADR-0073).
+///
+/// Deliberately not the user tier's read path:
+///
+/// 1. the store route is checked before anything is opened, so a symlinked
+///    `projects/` or `projects/<id>` — or an ancestor alias into the active
+///    checkout — cannot quietly redirect the read to an in-repo file;
+/// 2. the file is opened without following a final symlink, and the directory
+///    and file facts are measured **before** one byte is read, so untrusted
+///    bytes are never decoded;
+/// 3. the verdict is unconditional: the project tier is the root of a project's
+///    trust, not a file that becomes authority-bearing only when it declares a
+///    field.
+fn read_project_tier(
+    project: &crate::project_config::ProjectTierPaths,
+) -> Result<(TierReport, TierContents)> {
+    // Every store-route outcome is named, including the one that checks nothing
+    // (`Unchecked`, reachable only from a hand-built test tier).
+    match crate::project_config::check_store_route(project)? {
+        crate::project_config::StoreRoute::Absent => return Ok(absent_tier(&project.config)),
+        crate::project_config::StoreRoute::Present
+        | crate::project_config::StoreRoute::Unchecked => {}
+    }
+    let path = project.config.as_path();
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(absent_tier(path));
+        }
+        Err(error) => return Err(safe_io_error("reading metadata for", path, &error)),
+    }
+
+    let opened = crate::host_paths::open_regular_no_follow_checkpointed(path, || {})
+        .map_err(|error| safe_anyhow_error("reading", path, &error))?;
+    let Some(opened) = opened else {
+        // A final symlink: refused from the no-follow open's own verdict, so
+        // the target is never opened or read. `verify_project` refuses
+        // `ThroughSymlink` whenever the directory is acceptable and the
+        // directory error otherwise, so `Ok` here cannot happen; it is still a
+        // load error rather than a panic.
+        return match config_authority::verify_project(path, &FinalComponent::Symlink) {
+            Err(error) => Err(project_tier_error(path, &error)),
+            Ok(()) => Err(anyhow!(
+                "config: {}: config.toml is a symbolic link; agent-vm will not follow it",
+                crate::one_line::quoted_path(path)
+            )),
+        };
+    };
+    let final_component = FinalComponent::Regular(opened.facts());
+    // Measured before its bytes are read, and whatever the file declares.
+    config_authority::verify_project(path, &final_component)
+        .map_err(|error| project_tier_error(path, &error))?;
+    let bytes = opened
+        .read_bounded(MAX_CONFIG_FILE_BYTES)
+        .map_err(|error| safe_anyhow_error("reading", path, &error))?;
+    let raw = parse_tier(path, &bytes)?;
+    build_tier(
+        path,
+        raw,
+        TierAuthority::Project,
+        FileTierKind::Project,
+        None,
+    )
+}
+
+fn project_tier_error(path: &Path, error: &config_authority::UntrustedConfig) -> anyhow::Error {
+    anyhow!("config: {}: {error}", crate::one_line::quoted_path(path))
+}
+
+/// Interpret and validate one tier's parsed bytes, given what its measured read
+/// established. Shared by both tiers so validation, provenance and diagnostics
+/// cannot drift between them.
+fn build_tier(
+    path: &Path,
+    raw: RawConfig,
+    authority: TierAuthority<'_>,
+    kind: FileTierKind,
+    home: Option<&Path>,
+) -> Result<(TierReport, TierContents)> {
     let tool_mount_values: Vec<config_mounts::ToolMountValue<'_>> = raw
         .tools
         .iter()
@@ -1202,41 +1374,16 @@ fn read_file_tier(source: TierSource<'_>) -> Result<(TierReport, TierContents)> 
                 .map(|value| config_mounts::ToolMountValue { declaration, value })
         })
         .collect();
-    let triggers = AuthorityTriggers {
-        network: raw.network.is_some(),
-        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {
-            top_level: raw.mounts.is_some(),
-            tool_field: first_tool_mounts.is_some(),
-        }),
-        mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),
-    };
     let authorized: Option<config_authority::AuthorizedConfig<'_>>;
     let reference_trust: Option<crate::config_authority::ReferenceTrust>;
-    match kind {
-        FileTierKind::User => {
-            let verification = config_authority::verify(&read, triggers).map_err(|error| {
-                // A refusal caused by a tool's own field names that field first: the
-                // reader has to find the list they must review, and a file with no
-                // top-level `mounts` has nothing else pointing at it. The numeric site
-                // is echoed, never the tool's name or the list's contents.
-                let pointer = match first_tool_mounts {
-                    Some(declaration) if raw.mounts.is_none() => {
-                        format!("tools[{declaration}].mounts: ")
-                    }
-                    _ => String::new(),
-                };
-                anyhow!(
-                    "config: {}: {pointer}{error}",
-                    crate::one_line::quoted_path(path)
-                )
-            })?;
+    match authority {
+        TierAuthority::User(verification) => {
             authorized = verification.authorized;
             // The same read's verdict for a CLI egress reference, which argv
             // parsing learns about only after this read is gone (ADR-0059).
             reference_trust = Some(verification.references);
         }
-        FileTierKind::Project => {
+        TierAuthority::Project => {
             refuse_project_authority(&raw, path)?;
             authorized = None;
             reference_trust = None;
@@ -1579,15 +1726,6 @@ pub(crate) fn absolute_home_from(home: Option<&OsStr>) -> Result<Option<PathBuf>
         ));
     }
     Ok(Some(home))
-}
-
-fn discover_project_path() -> Result<PathBuf> {
-    let cwd = std::env::current_dir()
-        .map_err(|error| safe_io_error("resolving current directory", Path::new("."), &error))?;
-    let canonical = cwd
-        .canonicalize()
-        .map_err(|error| safe_io_error("canonicalizing current directory", &cwd, &error))?;
-    Ok(canonical.join(PROJECT_CONFIG_RELATIVE))
 }
 
 // ---------------------------------------------------------------------------
@@ -3861,10 +3999,8 @@ mod tests {
         let user = root.path().join("cfg/config.toml");
         write_file(&user, "mounts = [\"~/ref\", \"/abs/ref\"]\n");
         let project = root.path().join("absent.toml");
-        let with_home = |home: Option<PathBuf>| ConfigPaths {
-            user: Some(user.clone()),
-            project: project.clone(),
-            home,
+        let with_home = |home: Option<PathBuf>| {
+            ConfigPaths::for_test_with_home(Some(user.clone()), project.clone(), home)
         };
 
         // `/h/` keeps its trailing slash (`//`), and the process `HOME` is not
@@ -5278,11 +5414,7 @@ mod tests {
         }
 
         fn paths(&self) -> ConfigPaths {
-            ConfigPaths {
-                user: Some(self.user.clone()),
-                project: self.project.clone(),
-                home: None,
-            }
+            ConfigPaths::for_test(Some(self.user.clone()), self.project.clone())
         }
 
         fn load(&self) -> Result<ConfigReport> {
@@ -5292,11 +5424,11 @@ mod tests {
         /// The same load with a captured `$HOME`, which is what a `~/` mount
         /// spelling expands against (never the process environment).
         fn load_with_home(&self, home: &Path) -> Result<ConfigReport> {
-            load(&ConfigPaths {
-                user: Some(self.user.clone()),
-                project: self.project.clone(),
-                home: Some(home.to_path_buf()),
-            })
+            load(&ConfigPaths::for_test_with_home(
+                Some(self.user.clone()),
+                self.project.clone(),
+                Some(home.to_path_buf()),
+            ))
         }
 
         /// The user config as a same-directory dotfile symlink — the shape a
@@ -6369,11 +6501,7 @@ mod tests {
             &project,
             "[[tools]]\nname = \"t\"\ncommand = \"t\"\ntools = [\"a\\nb\"]\n",
         );
-        let paths = ConfigPaths {
-            user: None,
-            project,
-            home: None,
-        };
+        let paths = ConfigPaths::for_test(None, project);
         let error = format!(
             "{:#}",
             load(&paths).unwrap().into_launch_catalog().unwrap_err()
@@ -8007,12 +8135,7 @@ mod tests {
         let evil = root.path().join("proj\n\x1b[31mred");
         fs::create_dir_all(&evil).unwrap();
         fs::create_dir_all(evil.join(".agent-vm/config.toml")).unwrap();
-        let paths = ConfigPaths {
-            user: None,
-            project: evil.join(".agent-vm/config.toml"),
-
-            home: None,
-        };
+        let paths = ConfigPaths::for_test(None, evil.join(".agent-vm/config.toml"));
         let error = load(&paths).unwrap_err();
         for rendered in [
             format!("{error}"),
@@ -8048,12 +8171,7 @@ mod tests {
             &evil.join(".agent-vm/config.toml"),
             "[[tools]]\nname = \"t\"\ncommand = \"\"\n",
         );
-        let paths = ConfigPaths {
-            user: None,
-            project: evil.join(".agent-vm/config.toml"),
-
-            home: None,
-        };
+        let paths = ConfigPaths::for_test(None, evil.join(".agent-vm/config.toml"));
         let rendered = format!("{:#}", load(&paths).unwrap_err());
         assert!(!rendered.contains('\x1b'), "raw ESC leaked: {rendered:?}");
         assert!(!rendered.contains('\n'), "raw newline leaked: {rendered:?}");
@@ -8145,14 +8263,254 @@ mod tests {
 
     // -- discovery ---------------------------------------------------------
 
+    use crate::test_env;
+
+    /// AC1/R1: the project tier is `$HOME/.config/agent-vm/projects/<64-hex>/
+    /// config.toml`, derived from the command's captured project — and both
+    /// tiers are unavailable without `$HOME`, with no project path at all.
+    ///
+    /// The digest is recomputed here from the canonical path's bytes, so a
+    /// truncated id or a different hash input fails rather than agreeing with
+    /// the product's own helper.
     #[test]
-    fn discover_uses_the_canonical_cwd_and_literal_home_relative_path() {
-        // Discovery reads real env; assert only the composition the code
-        // documents. The env-dependent path is exercised end-to-end by the
-        // subprocess tests.
-        let project = discover_project_path().unwrap();
-        assert!(project.ends_with(PROJECT_CONFIG_RELATIVE));
-        assert!(project.is_absolute());
+    fn discover_places_the_project_tier_under_home_by_project_digest() {
+        use sha2::{Digest as _, Sha256};
+        let mut env = test_env::guard();
+        let home_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        // The *spelled* home, not its canonical form: both tiers keep the literal
+        // `$HOME` spelling in their paths and in diagnostics.
+        let home = home_dir.path().to_path_buf();
+        env.set_var("HOME", &home);
+        let project = crate::project::ProjectDir::from_path_for_tests(project_dir.path()).unwrap();
+        let paths = ConfigPaths::discover(&project).unwrap();
+        assert_eq!(
+            paths.user,
+            Some(home.join(USER_CONFIG_RELATIVE)),
+            "the user tier keeps its literal $HOME location"
+        );
+        let hex: String = Sha256::digest(project.path().as_os_str().as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(hex.len(), 64);
+        let expected = home
+            .join(".config/agent-vm/projects")
+            .join(&hex)
+            .join("config.toml");
+        assert_eq!(
+            paths.project.as_ref().map(|tier| &tier.config),
+            Some(&expected)
+        );
+        assert_eq!(paths.home, Some(home));
+        assert!(
+            matches!(
+                paths.project.as_ref().map(|tier| &tier.route),
+                Some(crate::project_config::RouteAnchor::Captured { root, .. })
+                    if root == project.path()
+            ),
+            "discovery anchors the store route at the captured project root"
+        );
+        // Nothing the discovery produced lives in the project.
+        assert!(
+            !paths
+                .project
+                .as_ref()
+                .unwrap()
+                .config
+                .starts_with(project.path()),
+            "the project tier is host-managed, never in-repo"
+        );
+
+        env.remove_var("HOME");
+        let paths = ConfigPaths::discover(&project).unwrap();
+        assert_eq!(paths.user, None);
+        assert!(paths.project.is_none(), "R2: no HOME means no project tier");
+        assert_eq!(paths.home, None);
+    }
+
+    /// V8: the project tier's read policy, before any byte is decoded.
+    ///
+    /// Every row is a real filesystem shape, and the message is the only way a
+    /// caller learns which check refused: a read that opened first, or a
+    /// followed final symlink, would produce a different sentence (or a UTF-8
+    /// error, or a "not a regular file").
+    #[test]
+    fn project_tier_rejects_symlinks_aliases_and_unsafe_files_before_reading() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        struct Fixture {
+            _root: tempfile::TempDir,
+            home: PathBuf,
+            project: crate::project::ProjectDir,
+            config: PathBuf,
+        }
+        impl Fixture {
+            /// `cwd` is the project by default; a caller may pass `home` itself
+            /// for the legitimate `cwd == $HOME` row.
+            fn new() -> Self {
+                Self::at(false)
+            }
+            fn at(home_is_project: bool) -> Self {
+                let root = tempfile::tempdir().unwrap();
+                let base = root.path().canonicalize().unwrap();
+                let home = base.join("home");
+                let checkout = if home_is_project {
+                    home.clone()
+                } else {
+                    base.join("checkout")
+                };
+                fs::create_dir_all(&home).unwrap();
+                fs::create_dir_all(&checkout).unwrap();
+                let project = crate::project::ProjectDir::from_path_for_tests(&checkout).unwrap();
+                let config = crate::project_config::path(&home, &project);
+                Self {
+                    _root: root,
+                    home,
+                    project,
+                    config,
+                }
+            }
+            fn store(&self) -> &Path {
+                self.config.parent().unwrap()
+            }
+            fn write_store(&self, body: &str) {
+                fs::create_dir_all(self.store()).unwrap();
+                fs::write(&self.config, body).unwrap();
+            }
+            fn load(&self) -> Result<ConfigReport> {
+                load(&ConfigPaths {
+                    user: Some(self.home.join(".config/agent-vm/config.toml")),
+                    project: Some(crate::project_config::ProjectTierPaths {
+                        config: self.config.clone(),
+                        route: crate::project_config::RouteAnchor::Captured {
+                            home: self.home.clone(),
+                            root: self.project.path().to_path_buf(),
+                        },
+                    }),
+                    home: Some(self.home.clone()),
+                })
+            }
+        }
+
+        // (a) A final symlink is refused from the open's own verdict. The target
+        // holds invalid UTF-8 and then a FIFO: either would be observable as a
+        // different error if the target were opened or read.
+        let f = Fixture::new();
+        fs::create_dir_all(f.store()).unwrap();
+        let target = f.home.join("target.toml");
+        fs::write(&target, b"[[tools]]\nname = \xff\n").unwrap();
+        symlink(&target, &f.config).unwrap();
+        let message = f.load().unwrap_err().to_string();
+        assert!(
+            message.contains("reached through a symbolic link"),
+            "{message}"
+        );
+        assert!(message.contains("the project config"), "{message}");
+        fs::remove_file(&f.config).unwrap();
+        let fifo = f.home.join("fifo");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        symlink(&fifo, &f.config).unwrap();
+        assert!(
+            f.load()
+                .unwrap_err()
+                .to_string()
+                .contains("reached through a symbolic link")
+        );
+
+        // (b) A group-writable store directory refuses a tools-only file: the
+        // project tier is measured whatever it declares.
+        let f = Fixture::new();
+        f.write_store("[[tools]]\nname = \"solo\"\ncommand = \"solo\"\n");
+        fs::set_permissions(f.store(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(f.load().is_ok(), "a 0700 store with one link is trusted");
+        fs::set_permissions(f.store(), fs::Permissions::from_mode(0o775)).unwrap();
+        let message = f.load().unwrap_err().to_string();
+        assert!(
+            message.contains("whose directory is group- or other-writable"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&crate::one_line::quoted_path(&f.config).to_string()),
+            "the refusal names the file: {message}"
+        );
+        assert!(message.contains("the project config"), "{message}");
+
+        // (c) `projects/<id>` symlinked into the active checkout: the store route
+        // is refused before `config.toml` is opened.
+        let f = Fixture::new();
+        fs::create_dir_all(f.project.path().join(".agent-vm")).unwrap();
+        fs::write(
+            f.project.path().join(".agent-vm/config.toml"),
+            "[[tools]]\nname = \"smuggled\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(f.store().parent().unwrap()).unwrap();
+        symlink(f.project.path().join(".agent-vm"), f.store()).unwrap();
+        let message = f.load().unwrap_err().to_string();
+        assert!(
+            message.contains("project store directory reached through a symbolic link"),
+            "{message}"
+        );
+
+        // (d) `projects/` symlinked to the checkout, and the whole authority
+        // directory aliased into it.
+        let f = Fixture::new();
+        fs::create_dir_all(f.home.join(".config/agent-vm")).unwrap();
+        symlink(f.project.path(), f.store().parent().unwrap()).unwrap();
+        let message = f.load().unwrap_err().to_string();
+        assert!(
+            message.contains("projects directory reached through a symbolic link"),
+            "{message}"
+        );
+
+        let f = Fixture::new();
+        let evil = f.project.path().join("evil/projects");
+        fs::create_dir_all(&evil).unwrap();
+        fs::create_dir_all(f.home.join(".config")).unwrap();
+        symlink(
+            f.project.path().join("evil"),
+            f.home.join(".config/agent-vm"),
+        )
+        .unwrap();
+        // The store exists and is not itself a symlink: only the ancestor alias
+        // is wrong, which is the row this asserts.
+        fs::create_dir_all(f.store()).unwrap();
+        let message = f.load().unwrap_err().to_string();
+        assert!(
+            message.contains("resolves inside the active project"),
+            "{message}"
+        );
+
+        // (e) Running legitimately with `cwd == $HOME`: the store's canonical
+        // path is under the project, and that is not an alias.
+        let f = Fixture::at(true);
+        f.write_store("[[tools]]\nname = \"hosted\"\ncommand = \"hosted\"\n");
+        fs::set_permissions(f.store(), fs::Permissions::from_mode(0o700)).unwrap();
+        let report = f.load().expect("cwd == $HOME is a legitimate run");
+        assert_eq!(
+            report.project().status(),
+            &TierStatus::Found { declared_tools: 1 }
+        );
+
+        // (f) The user tier keeps ADR-0040's dotfile compatibility: a
+        // tools-only file reached through a symlink still loads.
+        let f = Fixture::new();
+        let user = f.home.join(".config/agent-vm/config.toml");
+        fs::create_dir_all(user.parent().unwrap()).unwrap();
+        fs::write(
+            f.home.join("dotfile.toml"),
+            "[[tools]]\nname = \"dotty\"\ncommand = \"dotty\"\n",
+        )
+        .unwrap();
+        symlink(f.home.join("dotfile.toml"), &user).unwrap();
+        let report = f.load().expect("a tools-only symlinked user file loads");
+        assert_eq!(
+            report.user().status(),
+            &TierStatus::Found { declared_tools: 1 }
+        );
+        assert!(!report.uses_defaults());
     }
 
     // -- properties --------------------------------------------------------

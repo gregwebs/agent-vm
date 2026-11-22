@@ -909,15 +909,36 @@ fn the_plan_and_the_recorder_agree() -> Result<(), String> {
                 "fixture-start"
             ])
         );
-        // Pin the real discovery path (`config.rs`'s PROJECT_CONFIG_RELATIVE): a
-        // bare `.agent-vm.toml` is not read, so every guest launch would fail with
-        // "unrecognized subcommand" while the harness blamed "helper misuse".
+        // Pin the real discovery path (ADR-0073: `<home>/.config/agent-vm/
+        // projects/<digest>/config.toml`). Computed inline, not with the shared
+        // helper, so the fixture writer and this assertion cannot agree on a
+        // wrong hash.
         egress_run::prepare_project(work, &work.join("proj"))?;
+        let canonical = work
+            .join("proj")
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        use sha2::Digest as _;
+        let mut hex = String::with_capacity(64);
+        for byte in sha2::Sha256::digest(std::os::unix::ffi::OsStrExt::as_bytes(
+            canonical.as_os_str(),
+        )) {
+            use std::fmt::Write as _;
+            write!(&mut hex, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        let discovered = work
+            .join("home/.config/agent-vm/projects")
+            .join(hex)
+            .join("config.toml");
         let committed = repo_root().join("script/test/fixtures/egress-config.toml");
         assert_eq!(
-            fs::read(work.join("proj/.agent-vm/config.toml")).map_err(|error| error.to_string())?,
+            fs::read(&discovered).map_err(|error| error.to_string())?,
             fs::read(&committed).map_err(|error| format!("{}: {error}", committed.display()))?,
             "the project config is the committed fixture"
+        );
+        assert!(
+            !work.join("proj/.agent-vm/config.toml").exists(),
+            "an in-repo config is no longer a catalog"
         );
         // A shared command's exec argv and environment against its plan.
         let command = recorder_command(work, &fake);

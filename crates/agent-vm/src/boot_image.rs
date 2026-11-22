@@ -63,9 +63,9 @@
 //! disk image. A config-file `image` is stricter: it must be an OCI reference.
 //! The reason is a security boundary, not a convenience — the SDK treats a
 //! leading `/`, `./`, `../`, `.` or `..` as a **host rootfs bind or disk
-//! image** (`ImageSource::into_rootfs_source`), so a repo-supplied
-//! `.agent-vm/config.toml` with `image = "/"` would otherwise boot the host
-//! root filesystem as a writable guest rootfs. The config acceptance decision is
+//! image** (`ImageSource::into_rootfs_source`), so a config file with
+//! `image = "/"` would otherwise boot the host root filesystem as a writable
+//! guest rootfs. The config acceptance decision is
 //! the contracted [`config_image_is_acceptable`] kernel; the OCI parser, the
 //! SDK's path predicate and the Unicode character measurement are the trusted
 //! adapters that feed it. The command-line/env pass-through has its own, smaller
@@ -218,7 +218,8 @@ pub(crate) enum ImageSource {
     Environment,
     /// `image` in `$HOME/.config/agent-vm/config.toml`.
     UserConfig(PathBuf),
-    /// `image` in `<cwd>/.agent-vm/config.toml`.
+    /// `image` in the project's host-managed config (ADR-0073):
+    /// `$HOME/.config/agent-vm/projects/<project-id>/config.toml`.
     ProjectConfig(PathBuf),
     /// This project's established default, recorded in the approval store at
     /// this path (ADR-0067).

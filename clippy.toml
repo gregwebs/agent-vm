@@ -12,12 +12,13 @@
 # added without a visible, reviewable `#[allow]`.
 #
 # `project::ProjectDir::capture` reads the working directory. A command captures
-# it exactly once, at its entry point, and passes the value to every consumer: an
-# external rename changes what `getcwd` returns without any `chdir`, so a second
-# read could name a second project mid-command and approve content under a path
-# the user never ran in (ADR-0063). Each entry point allows it on its single
-# `let project = ...;` statement, so a second capture in the same function still
-# trips the lint.
+# it exactly once, at its entry point — in production that entry point is `main`,
+# whose capture every command is handed (ADR-0073 D5) — and passes the value to
+# every consumer: an external rename changes what `getcwd` returns without any
+# `chdir`, so a second read could name a second project mid-command and approve
+# content under a path the user never ran in (ADR-0063). `main` allows it on its
+# single `let project = ...;` statement, so a second capture in the same function
+# still trips the lint.
 #
 # `image_pin::publication::approve_published` records an approval of content a
 # command just published. Only the two verbs whose own argument names that

@@ -802,7 +802,7 @@ fn set_default_preserves_all_overrides_and_default_diagnostic_redaction() {
     // Launch cwd must not contain the harness's authority home (ADR-0038).
     let project_dir = h.root.path().join("project");
     fs::create_dir(&project_dir).unwrap();
-    let project = project_dir.join(".agent-vm/config.toml");
+    let project = support::project_config_path(&h.home, &project_dir);
     fs::create_dir_all(user.parent().unwrap()).unwrap();
     fs::create_dir_all(project.parent().unwrap()).unwrap();
     fs::write(&user, "image = \"localhost:1/user:tag\"\n").unwrap();
@@ -1338,7 +1338,11 @@ fn refresh_same_tag_failure(mode: RefreshFailure, retained: bool) {
     let user = h.home.join(".config/agent-vm/config.toml");
     fs::create_dir_all(user.parent().unwrap()).unwrap();
     fs::write(&user, "image = \"localhost:1/user:tag\"\n").unwrap();
-    let project = h.root.path().join("project/.agent-vm/config.toml");
+    // The project store is keyed by the canonical project path (ADR-0073), so
+    // the project directory must exist before its config path is computed.
+    let project_dir = h.root.path().join("project");
+    fs::create_dir(&project_dir).unwrap();
+    let project = support::project_config_path(&h.home, &project_dir);
     fs::create_dir_all(project.parent().unwrap()).unwrap();
     fs::write(&project, "image = \"localhost:1/project:tag\"\n").unwrap();
     let user_bytes = fs::read(&user).unwrap();
@@ -2908,9 +2912,10 @@ fn refresh_selection_and_broken_config_recovery_acquire_only_the_winning_tier() 
             .unwrap();
         }
         if row.project {
-            fs::create_dir(project.join(".agent-vm")).unwrap();
+            let project_config = support::project_config_path(&h.home, &project);
+            fs::create_dir_all(project_config.parent().unwrap()).unwrap();
             fs::write(
-                project.join(".agent-vm/config.toml"),
+                project_config,
                 format!("image = {:?}\n", tiers["project"].0),
             )
             .unwrap();
@@ -4143,12 +4148,9 @@ fn update_and_import_leave_project_persist_and_runtime_state_unchanged() {
         fs::create_dir_all(path).unwrap();
         fs::write(path.join("sentinel"), b"owned persistent A bytes\0\xff").unwrap();
     }
-    fs::create_dir(project.join(".agent-vm")).unwrap();
-    fs::write(
-        project.join(".agent-vm/config.toml"),
-        b"# preserve project config\n",
-    )
-    .unwrap();
+    let project_config = support::project_config_path(&h.home, &project);
+    fs::create_dir_all(project_config.parent().unwrap()).unwrap();
+    fs::write(project_config, b"# preserve project config\n").unwrap();
     let snapshots: Vec<_> = [&project, &persist, &sandbox]
         .map(|p| (p, tree_snapshot(p)))
         .into();

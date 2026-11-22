@@ -849,9 +849,8 @@ pub(crate) async fn launch(
     credential_preflight: CredentialPreflight,
     resources: crate::resources::ResourceCeiling,
     args: Args,
+    project: &ProjectDir,
 ) -> Result<i32> {
-    #[allow(clippy::disallowed_methods)] // one capture per command: every consumer borrows it.
-    let project = ProjectDir::capture()?;
     let (grant, invocation) = target.into_parts();
     // The output policy belongs to the target, not to the sink: a direct launch
     // answers a broken stdout/stderr pipe as its own failure (#398), while a
@@ -885,7 +884,7 @@ pub(crate) async fn launch(
         None => boot_image::select(
             requested,
             boot_image::ConfiguredTiers::Read(images),
-            &project,
+            project,
         )?,
     };
     // `--no-config-mounts` is read once, here, because the network plan below
@@ -943,7 +942,7 @@ pub(crate) async fn launch(
     // `ProtectedHostFiles::require_home` refuses on.
     let mount_home = user::host_home_dir();
 
-    let session = ProjectSession::for_project(&project)?;
+    let session = ProjectSession::for_project(project)?;
     // AC#6 (agent-vm issue #40): fail closed, before touching the
     // filesystem or booting anything, if this sandbox's real agent/control
     // socket paths would overflow the platform's Unix-domain-socket path
@@ -1077,7 +1076,7 @@ pub(crate) async fn launch(
     let live = crate::session_control::LiveSession::start(
         &session,
         crate::session_control::LiveSetup {
-            project: &project,
+            project,
             store: crate::allowances::host_store_handle(),
             plan: network_plan.live_policy_plan(None),
         },
@@ -1392,7 +1391,7 @@ pub(crate) async fn launch(
     // across both create variants.
     let prepared = match &built {
         Some(built) => crate::image_pin::prepare_unpinned(built, &label).await,
-        None => crate::image_pin::prepare_selected(&boot, &project).await,
+        None => crate::image_pin::prepare_selected(&boot, project).await,
     }
     .context("preparing the boot image")?;
     let sdk_image = prepared.sdk_reference().to_owned();
@@ -1559,7 +1558,7 @@ pub(crate) async fn launch(
     // the notices that describe and the policy that enforces the result. Never
     // fails the launch: a store problem is one warning and the configured
     // authority stays exactly as it was.
-    let recorded = crate::allowances::for_launch(&project);
+    let recorded = crate::allowances::for_launch(project);
     if let Some(notice) = recorded.notice() {
         notices.emit(format!("warning: {notice}"))?;
     }
@@ -4002,11 +4001,10 @@ mod tests {
     /// below. Parsed via the same validated path as user input.
     fn default_catalog() -> crate::config::LaunchCatalog {
         let dir = tempfile::tempdir().unwrap();
-        crate::config::load(&crate::config::ConfigPaths {
-            user: Some(dir.path().join("no-user-config.toml")),
-            project: dir.path().join("no-project-config.toml"),
-            home: None,
-        })
+        crate::config::load(&crate::config::ConfigPaths::for_test(
+            Some(dir.path().join("no-user-config.toml")),
+            dir.path().join("no-project-config.toml"),
+        ))
         .expect("the embedded default catalog parses")
         .into_launch_catalog()
         .expect("the default catalog resolves")
@@ -4967,7 +4965,7 @@ mod tests {
         // ADR-0065: the recorded set is read after the socket exists (so the
         // session cannot miss a change aimed at it) and before the notices and
         // the policy, so one computation produces every derived view.
-        let recorded = position("crate::allowances::for_launch(&project)");
+        let recorded = position("crate::allowances::for_launch(project)");
         let adopt = position(".adopt_recorded(");
         let adopt_boot = position("live.adopt_boot_allowances(");
         assert!(
@@ -5244,15 +5242,10 @@ mod tests {
             include_str!("../../../script/test/fixtures/egress-config.toml"),
         )
         .unwrap();
-        let catalog = crate::config::load(&crate::config::ConfigPaths {
-            user: None,
-            project,
-
-            home: None,
-        })
-        .unwrap()
-        .into_launch_catalog()
-        .unwrap();
+        let catalog = crate::config::load(&crate::config::ConfigPaths::for_test(None, project))
+            .unwrap()
+            .into_launch_catalog()
+            .unwrap();
         assert_eq!(
             inner_argv(
                 tool(&catalog, "egressprobe"),

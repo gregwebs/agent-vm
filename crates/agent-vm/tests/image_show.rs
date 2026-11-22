@@ -560,7 +560,7 @@ impl Fixture {
     }
 
     fn project_config(&self) -> PathBuf {
-        self.project.join(".agent-vm/config.toml")
+        support::project_config_path(&self.home, &self.project)
     }
 
     fn record(&self) -> PathBuf {
@@ -2074,12 +2074,12 @@ fn s23_home_discovery_is_safe_and_lazy() {
     let output = fixture.run(command);
     assert_success(&output, &expected(ENV_REF, "AGENT_VM_IMAGE_TAG", None));
 
-    // A project-config winner also needs no default read, so HOME is irrelevant.
+    // R2: the project tier is host-managed, so its winner cannot survive a
+    // missing HOME. First prove it wins with HOME set — otherwise the removal
+    // below could pass merely because nothing was ever configured.
     let fixture = Fixture::new();
     fixture.write_project_image(PROJECT_REF);
-    let mut command = fixture.command(&["image", "show"]);
-    command.env_remove("HOME");
-    let output = fixture.run(command);
+    let output = fixture.show();
     assert_success(
         &output,
         &expected(
@@ -2087,6 +2087,22 @@ fn s23_home_discovery_is_safe_and_lazy() {
             "project config",
             Some(&fixture.project_config()),
         ),
+    );
+    let seeded = fixture.snapshot();
+    let mut command = fixture.command(&["image", "show"]);
+    command.env_remove("HOME");
+    let output = fixture.run(command);
+    let message = assert_failure(&output);
+    assert!(message.contains("HOME"), "{message}");
+    assert!(
+        output.stdout.is_empty(),
+        "a failed selection writes no stdout: {}",
+        stdout(&output)
+    );
+    assert_eq!(
+        seeded,
+        fixture.snapshot(),
+        "an unavailable HOME creates and changes nothing"
     );
 
     // With no higher source the default slot cannot be located: fail with no
@@ -2130,16 +2146,13 @@ fn s24_provenance_paths_follow_discovery() {
     let fixture = Fixture::new();
     let real = fixture.root.join("project-real");
     fs::create_dir(&real).unwrap();
-    fixture.write_file(
-        &real.join(".agent-vm/config.toml"),
-        format!("image = \"{PROJECT_REF}\"\n"),
-    );
+    let canonical = support::project_config_path(&fixture.home, &real);
+    fixture.write_file(&canonical, format!("image = \"{PROJECT_REF}\"\n"));
     let link = fixture.root.join("project-link");
     std::os::unix::fs::symlink(&real, &link).unwrap();
     let mut command = fixture.command(&["image", "show"]);
     command.current_dir(&link);
     let output = fixture.run(command);
-    let canonical = real.canonicalize().unwrap().join(".agent-vm/config.toml");
     assert_success(
         &output,
         &expected(PROJECT_REF, "project config", Some(&canonical)),

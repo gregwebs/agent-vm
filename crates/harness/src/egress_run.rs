@@ -1569,23 +1569,25 @@ fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// A case's project: the probe library and the fixture configuration the guest
-/// reads. The tool catalog is discovered at `<cwd>/.agent-vm/config.toml`
-/// (`config.rs`'s `PROJECT_CONFIG_RELATIVE`), not at a bare `.agent-vm.toml`.
+/// A case's project: the probe library in the project, and the fixture
+/// configuration where the product reads it — `<home>/.config/agent-vm/projects/
+/// <digest>/config.toml`, never `<project>/.agent-vm/config.toml` (ADR-0073).
+///
+/// `work` is the case's work directory, whose `home` the launch environment uses
+/// ([`crate::egress_fixtures::base_environment`]).
 pub fn prepare_project(work: &Path, project: &Path) -> Result<(), String> {
-    let _ = work;
-    fs::create_dir_all(project.join(".agent-vm"))
-        .map_err(|error| format!("{}: {error}", project.display()))?;
+    fs::create_dir_all(project).map_err(|error| format!("{}: {error}", project.display()))?;
+    let config = crate::project_config_path::project_config_path(&work.join("home"), project)?;
+    let parent = config
+        .parent()
+        .ok_or_else(|| format!("{}: no parent directory", config.display()))?;
+    fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
     for (source, destination) in [
-        ("egress-probe.sh", PathBuf::from("egress-probe.sh")),
-        (
-            "egress-config.toml",
-            PathBuf::from(".agent-vm").join("config.toml"),
-        ),
+        ("egress-probe.sh", project.join("egress-probe.sh")),
+        ("egress-config.toml", config),
     ] {
         let from = repo_root().join("script/test/fixtures").join(source);
-        let to = project.join(destination);
-        fs::copy(&from, &to).map_err(|error| format!("{}: {error}", from.display()))?;
+        fs::copy(&from, &destination).map_err(|error| format!("{}: {error}", from.display()))?;
     }
     Ok(())
 }
@@ -2022,6 +2024,27 @@ fn write_summary(
     fs::write(work.join("summary.tsv"), text).map_err(|error| error.to_string())
 }
 
+/// [`crate::project_config_path`]'s answer, recomputed without calling it.
+///
+/// `a_case_project_is_the_probe_library_and_the_discovered_catalog` pairs this
+/// with the shared helper so one wrong hash cannot satisfy both: this inline
+/// calculation is an oracle for the *path*, and the helper is what the fixtures
+/// write.
+#[cfg(test)]
+fn independent_project_config_path(home: &Path, project: &Path) -> PathBuf {
+    use sha2::{Digest as _, Sha256};
+    use std::os::unix::ffi::OsStrExt as _;
+    let canonical = project.canonicalize().expect("canonicalize the project");
+    let mut hex = String::with_capacity(64);
+    for byte in Sha256::digest(canonical.as_os_str().as_bytes()) {
+        use std::fmt::Write as _;
+        write!(&mut hex, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    home.join(".config/agent-vm/projects")
+        .join(hex)
+        .join("config.toml")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2424,9 +2447,45 @@ CASE LC1 END
         let work = scratch("project");
         let project = work.join("proj");
         prepare_project(&work, &project).expect("a project");
-        // The catalog is discovered beside the probe, under `.agent-vm/`.
         assert!(project.join("egress-probe.sh").exists());
-        assert!(project.join(".agent-vm/config.toml").exists());
+        // The catalog is host-managed (ADR-0073). The digest is recomputed here
+        // from the canonical path's bytes, so a wrong id in the product or in
+        // `project_config_path` cannot agree with itself.
+        let expected = independent_project_config_path(&work.join("home"), &project);
+        assert!(
+            expected.exists(),
+            "the catalog belongs at {}",
+            expected.display()
+        );
+        assert!(
+            !project.join(".agent-vm/config.toml").exists(),
+            "an in-repo config is never written any more"
+        );
+        // A real-binary probe: only the product can say it reads the path the
+        // helper computes, so this is what a shared wrong hash cannot satisfy.
+        let binary = repo_root().join("target/debug/agent-vm");
+        if binary.exists() {
+            let output = std::process::Command::new(&binary)
+                .arg("doctor")
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", work.join("home"))
+                .env("AGENT_VM_STATE_DIR", work.join("state"))
+                .current_dir(&project)
+                .output()
+                .expect("run agent-vm doctor");
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            assert!(
+                stdout.contains(&format!("{} (found, 2 tools)", expected.display())),
+                "the product did not read the fixture catalog at {}:\n{stdout}",
+                expected.display()
+            );
+        } else {
+            eprintln!(
+                "SKIPPED real-binary catalog probe: {} is absent (build it with `cargo build -p agent-vm`)",
+                binary.display()
+            );
+        }
         // The hook is one probe through the LAN with the strict variant's own
         // failure command.
         write_hook(&work, "HK2", "192.168.1.2", "HK2-ipv4-0-hook", 18080);

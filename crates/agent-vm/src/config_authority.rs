@@ -46,6 +46,22 @@
 //! for being untrusted, so a tools-only dotfile symlink keeps loading exactly as
 //! before.
 //! The verdict waits, unused, for a CLI reference to consult it.
+//!
+//! # The project config (ADR-0073)
+//!
+//! The host-managed project config is measured on **every** present file, not
+//! by the presence of a field. It is the root of a project's trust — `sources`,
+//! `:trust` and `allow_tools` will all live in it — and it has no
+//! dotfile-symlink compatibility to preserve, so a tools-only planted file is
+//! already the attack.
+//!
+//! [`verify_project`] therefore reuses the same proved [`authority_refusal`]
+//! kernel with `symlink_metadata(parent)`: a symlinked store directory is
+//! refused as `DirNotDirectory` rather than followed. Its [`FinalComponent`]
+//! comes from a no-follow open, so a final symlink is refused without the target
+//! ever being opened or read. What this does *not* claim is unchanged from
+//! ADR-0040: a concurrent host-side swap of a store directory between the route
+//! check and `open` rests on the same stable-route assumption.
 
 use crate::protected_config_dir::authority_file_singly_linked;
 use vstd::prelude::*;
@@ -193,6 +209,10 @@ pub(crate) enum AuthoritySubject {
     /// `network_requests`, so *that* is the field a file is being trusted for.
     /// Not a file field, so [`Self::of`] cannot return it.
     EgressReference,
+    /// ADR-0073: the host-managed project config is verified whatever it
+    /// declares; it is the root of the project's trust, so there is no field
+    /// whose absence makes a symlinked or shared file acceptable.
+    ProjectConfig,
 }
 
 /// `(label, object, without)` per field, in the fixed order sentences name them.
@@ -224,6 +244,7 @@ impl AuthoritySubject {
         match self {
             Self::Fields(fields) => join_phrases(&fields.present(0), " and "),
             Self::EgressReference => "an egress reference".to_owned(),
+            Self::ProjectConfig => "the project config".to_owned(),
         }
     }
 
@@ -232,16 +253,23 @@ impl AuthoritySubject {
         match self {
             Self::Fields(fields) => join_phrases(&fields.present(1), " and "),
             Self::EgressReference => "[[tools]] network_requests".to_owned(),
+            Self::ProjectConfig => "project config".to_owned(),
         }
     }
 
     /// The "a symlinked config without …" aside names the fields, unqualified
     /// by "table"/"list", because it describes the file's compatibility. A file
     /// without `mounts` is *not* safe when it declares `mount_sets`.
-    fn without(self) -> String {
+    ///
+    /// `None` where no compatibility exists: the project tier (ADR-0073) has
+    /// never accepted a symlink and a tools-only one is refused too, so
+    /// claiming "a symlinked config without … still works" there would be
+    /// false.
+    fn without(self) -> Option<String> {
         match self {
-            Self::Fields(fields) => join_phrases(&fields.present(2), " or "),
-            Self::EgressReference => "an egress reference".to_owned(),
+            Self::Fields(fields) => Some(join_phrases(&fields.present(2), " or ")),
+            Self::EgressReference => Some("an egress reference".to_owned()),
+            Self::ProjectConfig => None,
         }
     }
 
@@ -357,11 +385,16 @@ fn write_refusal(
     // the bytes, so none advises making the file trusted before the field has
     // been reviewed.
     match refusal {
-        ThroughSymlink => write!(
-            f,
-            "{label} requires config.toml to be a regular file, but it is reached through a symbolic link; its target may be writable by a guest or project, so review the {object} before trusting the file (a symlinked config without {} still works)",
-            subject.without()
-        ),
+        ThroughSymlink => {
+            let aside = subject
+                .without()
+                .map(|without| format!(" (a symlinked config without {without} still works)"))
+                .unwrap_or_default();
+            write!(
+                f,
+                "{label} requires config.toml to be a regular file, but it is reached through a symbolic link; its target may be writable by a guest or project, so review the {object} before trusting the file{aside}"
+            )
+        }
         FileOwner => write!(
             f,
             "{label} refuses a config.toml owned by another user; review the {object} before trusting the file"
@@ -514,20 +547,37 @@ pub(crate) fn verify<'a>(
 /// ADR-0040's measurements: the immediate directory's `metadata`, the read's own
 /// final-component facts and the effective uid, handed to the proved kernel.
 fn measure(read: &VerifiedRead) -> Result<(), Measurement> {
-    let file = read.path();
+    measure_facts(read.path(), read.final_component(), true)
+}
+
+/// One measurement policy, two tiers.
+///
+/// `follow_parent` is the only difference and it is the whole of ADR-0040's
+/// dotfile compatibility: the user tier follows a symlinked immediate directory,
+/// the project store (ADR-0073) does not, because `projects/<id>` being a
+/// symlink is exactly how a store route could redirect the read elsewhere.
+fn measure_facts(
+    file: &Path,
+    final_component: &FinalComponent,
+    follow_parent: bool,
+) -> Result<(), Measurement> {
     // Separate path observation, not anchored to the read descriptor; ancestors
     // remain trusted (ADR-0040's accepted gap).
     let parent = file
         .parent()
         .ok_or(Measurement::DirUnexaminable(std::io::ErrorKind::NotFound))?;
-    let meta =
-        std::fs::metadata(parent).map_err(|error| Measurement::DirUnexaminable(error.kind()))?;
+    let parent_metadata = if follow_parent {
+        std::fs::metadata(parent)
+    } else {
+        std::fs::symlink_metadata(parent)
+    };
+    let meta = parent_metadata.map_err(|error| Measurement::DirUnexaminable(error.kind()))?;
     let dir = DirFacts {
         is_dir: meta.is_dir(),
         uid: meta.uid(),
         mode: meta.mode(),
     };
-    let reached = match read.final_component() {
+    let reached = match final_component {
         FinalComponent::Symlink => Reached::ThroughSymlink,
         FinalComponent::Regular(f) => Reached::Direct(FileFacts {
             uid: f.uid,
@@ -539,6 +589,22 @@ fn measure(read: &VerifiedRead) -> Result<(), Measurement> {
         Some(refusal) => Err(Measurement::Refused(refusal)),
         None => Ok(()),
     }
+}
+
+/// ADR-0073: the project tier's verification. Reuses the proved
+/// [`authority_refusal`] kernel with `symlink_metadata(parent)` (no parent
+/// symlink following) and no presence trigger. Takes the path and
+/// [`FinalComponent`] from a no-follow open
+/// (`host_paths::open_regular_no_follow_checkpointed`), so a final symlink is
+/// refused without ever opening or reading its target, and no
+/// [`AuthorizedConfig`] is minted because the project tier still parses no
+/// authority-bearing field (`config::refuse_project_authority`).
+pub(crate) fn verify_project(
+    path: &Path,
+    final_component: &FinalComponent,
+) -> Result<(), UntrustedConfig> {
+    measure_facts(path, final_component, false)
+        .map_err(|measurement| measurement.into_untrusted(AuthoritySubject::ProjectConfig))
 }
 
 pub(crate) fn raw_mode_u32(mode: rustix::fs::RawMode) -> u32 {
@@ -575,6 +641,7 @@ mod tests {
             }
         }
         subjects.push(AuthoritySubject::EgressReference);
+        subjects.push(AuthoritySubject::ProjectConfig);
         subjects
     }
 
@@ -589,7 +656,7 @@ mod tests {
     /// itself would accept any wrong wording.
     fn pinned_subject_slots(
         subject: AuthoritySubject,
-    ) -> (&'static str, &'static str, &'static str) {
+    ) -> (&'static str, &'static str, Option<&'static str>) {
         match subject {
             AuthoritySubject::Fields(fields) => match (
                 fields.network,
@@ -597,70 +664,72 @@ mod tests {
                 fields.mount_sets,
                 fields.egress_sets,
             ) {
-                (true, false, false, false) => ("[network]", "[network] table", "[network]"),
-                (false, true, false, false) => ("mounts", "mounts list", "mounts"),
+                (true, false, false, false) => ("[network]", "[network] table", Some("[network]")),
+                (false, true, false, false) => ("mounts", "mounts list", Some("mounts")),
                 (false, false, true, false) => {
-                    ("[mount_sets]", "[mount_sets] table", "[mount_sets]")
+                    ("[mount_sets]", "[mount_sets] table", Some("[mount_sets]"))
                 }
                 (true, true, false, false) => (
                     "[network] and mounts",
                     "[network] table and mounts list",
-                    "[network] or mounts",
+                    Some("[network] or mounts"),
                 ),
                 (true, false, true, false) => (
                     "[network] and [mount_sets]",
                     "[network] table and [mount_sets] table",
-                    "[network] or [mount_sets]",
+                    Some("[network] or [mount_sets]"),
                 ),
                 (false, true, true, false) => (
                     "mounts and [mount_sets]",
                     "mounts list and [mount_sets] table",
-                    "mounts or [mount_sets]",
+                    Some("mounts or [mount_sets]"),
                 ),
                 (true, true, true, false) => (
                     "[network], mounts and [mount_sets]",
                     "[network] table, mounts list and [mount_sets] table",
-                    "[network], mounts or [mount_sets]",
+                    Some("[network], mounts or [mount_sets]"),
                 ),
                 // #511: `[egress_sets]` is the fourth field, so it is last in
                 // every list — including when it is the only one.
-                (false, false, false, true) => {
-                    ("[egress_sets]", "[egress_sets] table", "[egress_sets]")
-                }
+                (false, false, false, true) => (
+                    "[egress_sets]",
+                    "[egress_sets] table",
+                    Some("[egress_sets]"),
+                ),
                 (true, false, false, true) => (
                     "[network] and [egress_sets]",
                     "[network] table and [egress_sets] table",
-                    "[network] or [egress_sets]",
+                    Some("[network] or [egress_sets]"),
                 ),
                 (false, true, false, true) => (
                     "mounts and [egress_sets]",
                     "mounts list and [egress_sets] table",
-                    "mounts or [egress_sets]",
+                    Some("mounts or [egress_sets]"),
                 ),
                 (false, false, true, true) => (
                     "[mount_sets] and [egress_sets]",
                     "[mount_sets] table and [egress_sets] table",
-                    "[mount_sets] or [egress_sets]",
+                    Some("[mount_sets] or [egress_sets]"),
                 ),
                 (true, true, false, true) => (
                     "[network], mounts and [egress_sets]",
                     "[network] table, mounts list and [egress_sets] table",
-                    "[network], mounts or [egress_sets]",
+                    Some("[network], mounts or [egress_sets]"),
                 ),
                 (true, false, true, true) => (
                     "[network], [mount_sets] and [egress_sets]",
                     "[network] table, [mount_sets] table and [egress_sets] table",
-                    "[network], [mount_sets] or [egress_sets]",
+                    Some("[network], [mount_sets] or [egress_sets]"),
                 ),
                 (false, true, true, true) => (
                     "mounts, [mount_sets] and [egress_sets]",
                     "mounts list, [mount_sets] table and [egress_sets] table",
-                    "mounts, [mount_sets] or [egress_sets]",
+                    Some("mounts, [mount_sets] or [egress_sets]"),
                 ),
                 (true, true, true, true) => (
                     "[network], mounts, [mount_sets] and [egress_sets]",
                     "[network] table, mounts list, [mount_sets] table and [egress_sets] table",
-                    "[network], mounts, [mount_sets] or [egress_sets]",
+                    Some("[network], mounts, [mount_sets] or [egress_sets]"),
                 ),
                 (false, false, false, false) => {
                     unreachable!("`of` normalizes the empty trigger set")
@@ -671,8 +740,11 @@ mod tests {
             AuthoritySubject::EgressReference => (
                 "an egress reference",
                 "[[tools]] network_requests",
-                "an egress reference",
+                Some("an egress reference"),
             ),
+            // ADR-0073: no field made the file authority-bearing, so there is
+            // no "without …" compatibility to claim.
+            AuthoritySubject::ProjectConfig => ("the project config", "project config", None),
         }
     }
 
@@ -712,12 +784,17 @@ mod tests {
                 ),
                 true,
             ),
-            ThroughSymlink => (
-                format!(
-                    "{label} requires config.toml to be a regular file, but it is reached through a symbolic link; its target may be writable by a guest or project, so review the {object} before trusting the file (a symlinked config without {without} still works)"
-                ),
-                true,
-            ),
+            ThroughSymlink => {
+                let aside = without
+                    .map(|without| format!(" (a symlinked config without {without} still works)"))
+                    .unwrap_or_default();
+                (
+                    format!(
+                        "{label} requires config.toml to be a regular file, but it is reached through a symbolic link; its target may be writable by a guest or project, so review the {object} before trusting the file{aside}"
+                    ),
+                    true,
+                )
+            }
             FileOwner => (
                 format!(
                     "{label} refuses a config.toml owned by another user; review the {object} before trusting the file"
@@ -908,7 +985,7 @@ mod tests {
         });
         assert_eq!(subject.label(), "[network]");
         assert_eq!(subject.object(), "[network] table");
-        assert_eq!(subject.without(), "[network]");
+        assert_eq!(subject.without(), Some("[network]".to_owned()));
         assert_eq!(
             UntrustedConfig::Refused {
                 refusal: AuthorityRefusal::FileWritable,
@@ -1378,6 +1455,236 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("reached through a symbolic link")
+        );
+    }
+
+    /// The whole-sentence literals for the project-config subject (ADR-0073).
+    ///
+    /// The project tier has no presence trigger, so every sentence here is the
+    /// only thing a user sees when their host-managed file is refused. Written
+    /// out whole so a change to a slot and to the composition cannot cancel.
+    #[test]
+    fn project_config_subject_display_is_byte_identical() {
+        use AuthorityRefusal::*;
+        let subject = AuthoritySubject::ProjectConfig;
+        for (refusal, pinned) in [
+            (
+                DirNotDirectory,
+                "the project config refuses a config.toml whose directory is not a directory",
+            ),
+            (
+                DirOwner,
+                "the project config refuses a config.toml whose directory is owned by another user; review the project config before trusting the file",
+            ),
+            (
+                DirWritable,
+                "the project config refuses a config.toml whose directory is group- or other-writable; a guest or another account may be able to replace the file, so review the project config before trusting it",
+            ),
+            (
+                ThroughSymlink,
+                "the project config requires config.toml to be a regular file, but it is reached through a symbolic link; its target may be writable by a guest or project, so review the project config before trusting the file",
+            ),
+            (
+                FileOwner,
+                "the project config refuses a config.toml owned by another user; review the project config before trusting the file",
+            ),
+            (
+                FileWritable,
+                "the project config refuses a group- or other-writable config.toml; a guest or another account may have written its project config, so review the project config before trusting the file (fixing the mode does not establish authorship)",
+            ),
+            (
+                FileLinks(2),
+                "the project config refuses a config.toml with 2 hard links; another name for it may be guest- or project-writable, so review the project config before trusting the file",
+            ),
+        ] {
+            assert_eq!(
+                UntrustedConfig::Refused { refusal, subject }.to_string(),
+                pinned,
+                "project-config refusal text changed for {refusal:?}"
+            );
+        }
+        let kind = std::io::ErrorKind::PermissionDenied;
+        assert_eq!(
+            UntrustedConfig::DirUnexaminable { kind, subject }.to_string(),
+            "the project config requires examining the config directory, which failed (PermissionDenied)"
+        );
+    }
+
+    /// Opens `path` without following a final symlink, and returns what
+    /// [`verify_project`] decides about the facts that open produced.
+    fn verify_project_at(path: &Path) -> Result<(), UntrustedConfig> {
+        match crate::host_paths::open_regular_no_follow_checkpointed(path, || {})
+            .expect("opening the fixture")
+        {
+            Some(opened) => verify_project(path, &FinalComponent::Regular(opened.facts())),
+            None => verify_project(path, &FinalComponent::Symlink),
+        }
+    }
+
+    /// One mutation per fixture, each on a real file: a defect that skipped a
+    /// check would have to survive the shape it is meant to refuse.
+    #[test]
+    fn verify_project_refuses_every_unsafe_shape_on_real_files() {
+        use AuthorityRefusal::*;
+        let refused = |refusal| {
+            Err(UntrustedConfig::Refused {
+                refusal,
+                subject: AuthoritySubject::ProjectConfig,
+            })
+        };
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+
+        // A final symlink is refused without the target being opened or read.
+        let target = root.path().join("target.toml");
+        fs::write(&target, b"[[tools]]\n").unwrap();
+        let link = root.path().join("config.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(verify_project_at(&link), refused(ThroughSymlink));
+        fs::remove_file(&link).unwrap();
+        // A dangling link is still a symlink, not an absent file.
+        std::os::unix::fs::symlink(root.path().join("missing"), &link).unwrap();
+        assert_eq!(verify_project_at(&link), refused(ThroughSymlink));
+        fs::remove_file(&link).unwrap();
+
+        // A passing file: `0644` in a `0755` directory.
+        let file = root.path().join("config.toml");
+        fs::write(&file, b"[[tools]]\n").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(verify_project_at(&file), Ok(()));
+
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o664)).unwrap();
+        assert_eq!(verify_project_at(&file), refused(FileWritable));
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let second = root.path().join("second.toml");
+        fs::hard_link(&file, &second).unwrap();
+        assert_eq!(verify_project_at(&file), refused(FileLinks(2)));
+        fs::remove_file(&second).unwrap();
+
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o775)).unwrap();
+        assert_eq!(verify_project_at(&file), refused(DirWritable));
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
+
+        // A symlinked immediate directory is not followed: the project store
+        // route must be a real directory.
+        let store_dir = root.path().join("store");
+        fs::create_dir(&store_dir).unwrap();
+        fs::set_permissions(&store_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::copy(&file, store_dir.join("config.toml")).unwrap();
+        fs::set_permissions(
+            store_dir.join("config.toml"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let linked_dir = root.path().join("linked");
+        std::os::unix::fs::symlink(&store_dir, &linked_dir).unwrap();
+        assert_eq!(
+            verify_project_at(&linked_dir.join("config.toml")),
+            refused(DirNotDirectory)
+        );
+    }
+
+    /// The variants a portable fixture cannot produce (foreign ownership,
+    /// an unexaminable directory) still attribute to the project-config subject
+    /// exactly, through the same measurement-to-refusal adapter production uses.
+    #[test]
+    fn verify_project_attributes_every_kernel_refusal_and_dir_error() {
+        use AuthorityRefusal::*;
+        let euid = crate::host_paths::current_euid();
+        let other = euid.wrapping_add(1);
+        let subject = AuthoritySubject::ProjectConfig;
+        let trusted_dir = DirFacts {
+            is_dir: true,
+            uid: euid,
+            mode: 0o700,
+        };
+        let trusted_file = FileFacts {
+            uid: euid,
+            mode: 0o644,
+            nlink: 1,
+        };
+        let cases = [
+            (
+                Reached::Direct(trusted_file),
+                DirFacts {
+                    is_dir: false,
+                    ..trusted_dir
+                },
+                DirNotDirectory,
+            ),
+            (
+                Reached::Direct(trusted_file),
+                DirFacts {
+                    uid: other,
+                    ..trusted_dir
+                },
+                DirOwner,
+            ),
+            (
+                Reached::Direct(FileFacts {
+                    uid: other,
+                    ..trusted_file
+                }),
+                trusted_dir,
+                FileOwner,
+            ),
+        ];
+        for (reached, dir, expected) in cases {
+            let measurement = match authority_refusal(reached, dir, euid) {
+                Some(refusal) => Measurement::Refused(refusal),
+                None => panic!("the kernel accepted an unsafe fixture: {expected:?}"),
+            };
+            assert_eq!(
+                measurement.into_untrusted(subject),
+                UntrustedConfig::Refused {
+                    refusal: expected,
+                    subject,
+                }
+            );
+        }
+        let unexaminable = Measurement::DirUnexaminable(std::io::ErrorKind::PermissionDenied)
+            .into_untrusted(subject);
+        assert_eq!(
+            unexaminable,
+            UntrustedConfig::DirUnexaminable {
+                kind: std::io::ErrorKind::PermissionDenied,
+                subject,
+            }
+        );
+        assert_eq!(
+            unexaminable.to_string(),
+            "the project config requires examining the config directory, which failed (PermissionDenied)"
+        );
+    }
+
+    /// ADR-0040's compatibility rule is the user tier's alone: a tools-only
+    /// project config reached through a symlink is refused, not loaded.
+    #[test]
+    fn verify_project_has_no_presence_exception() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let target = root.path().join("real.toml");
+        fs::write(&target, b"[[tools]]\nname = \"x\"\ncommand = \"true\"\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        let link = root.path().join("config.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let none = AuthorityTriggers {
+            network: false,
+            mounts: false,
+            mount_sets: false,
+            egress_sets: false,
+        };
+        let read = read_bounded_regular_file_noting_symlink(&link, 100).unwrap();
+        let verification = verify(&read, none).expect("the user tier's presence rule is unchanged");
+        assert!(verification.authorized.is_none());
+        assert_eq!(
+            verify_project(&link, &FinalComponent::Symlink),
+            Err(UntrustedConfig::Refused {
+                refusal: AuthorityRefusal::ThroughSymlink,
+                subject: AuthoritySubject::ProjectConfig,
+            })
         );
     }
 

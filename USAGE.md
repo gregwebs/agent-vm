@@ -254,7 +254,8 @@ a runnable executable (a non-executable file or a directory), and present and
 executable but `--version` failed.
 `setup` executes the configured commands inside the
 throwaway VM — the
-same trust as running any agent-vm command in a directory with a `.agent-vm/`.
+same trust as running any agent-vm command in a directory: the commands come
+from your own host-managed config, never from the repository.
 A broken config warns and falls back: verification uses the shipped default
 tools and the image already selected by `--image`/`AGENT_VM_IMAGE_TAG` (or the
 default boot image), so a config typo never blocks the acquire/boot/verify
@@ -305,7 +306,7 @@ catalog never changes it). First present source wins:
 | command line | `--image REF` |
 | environment | `AGENT_VM_IMAGE_TAG=REF` (an empty value counts as unset) |
 | user config | top-level `image = "REF"` in `~/.config/agent-vm/config.toml` |
-| project config | top-level `image = "REF"` in `<cwd>/.agent-vm/config.toml` |
+| project config | top-level `image = "REF"` in `~/.config/agent-vm/projects/<project-id>/config.toml` |
 | default | this project's own default once established (see [Project default boot images](#project-default-boot-images)); before that the host's retained digest (see [The retained default](#the-retained-default)), or the initial recommendation when nothing is retained |
 
 `agent-vm shell`, `agent-vm claude` and `agent-vm mytool` all boot the same
@@ -314,8 +315,8 @@ image. `image pull` acquires that same selection without booting;
 
 **Config-file `image` values are OCI references only.** The runtime treats a
 leading `/`, `./`, `../`, `.` or `..` as a host rootfs bind or disk image, so a
-repository-supplied `.agent-vm/config.toml` with `image = "/"` would boot the
-host root filesystem as a writable guest rootfs. agent-vm refuses such a value
+config file with `image = "/"` would boot the host root filesystem as a
+writable guest rootfs. agent-vm refuses such a value
 with an error naming the file (never echoing the value).
 `--image`/`AGENT_VM_IMAGE_TAG` keep their permissive pass-through, so a local
 rootfs or disk image is still bootable **from the command line**, where you
@@ -1044,7 +1045,7 @@ file-backed source, escaped the same way:
 |---|---|
 | `AGENT_VM_IMAGE_TAG` | — (not a file) |
 | `user config` | `~/.config/agent-vm/config.toml` |
-| `project config` | `<cwd>/.agent-vm/config.toml` |
+| `project config` | `~/.config/agent-vm/projects/<project-id>/config.toml` |
 | `project default` | `$HOME/.config/agent-vm/image-pins.json` |
 | `retained default` | `$HOME/.config/agent-vm/default-image.json` |
 | `initial recommendation` | — (nothing was read) |
@@ -2243,7 +2244,7 @@ distinct mounts.
 Selected config mounts apply to catalog tools (including the shipped ones), your
 own project-defined tools, `shell`, and the [direct](#direct-commands) `run` /
 `--` routes. `setup`'s verification guest ignores them, and `image pull` boots
-no guest. Project (`.agent-vm/config.toml`) and built-in configs may not declare
+no guest. Project and built-in configs may not declare
 `mounts` at all: an empty `mounts = []` is refused there too, because mere
 presence, not non-empty contents, is what asks for authority.
 
@@ -2643,10 +2644,29 @@ mount read-only or a narrower source, or relocate `AGENT_VM_STATE_DIR` when
 state or guest home exposes authority. Forking a broad home copies everything,
 so prefer a narrower source.
 
+**Project configs are protected too (0.8.0).** Each project's config now lives
+*inside* this directory
+(`~/.config/agent-vm/projects/<project-id>/config.toml`), where "a bind strictly
+inside is allowed" would otherwise let a guest write a later launch's project
+config. So `projects/` and **every** project's directory are measured as routes
+of their own: a writable bind of `projects/`, of any `projects/<project-id>`, or
+of the target of a symlinked entry is refused. A bind strictly inside one
+project's directory (say `projects/<project-id>/sub`) is still allowed, and
+`:ro`/`:fork` remain exempt.
+
 Every launch also refuses a regular `config.toml` or `allowances.json` with
 more than one hard link (or any link count other than one), even without network
-settings. Review the file's launch-authorizing contents, then remove its other
-names before launching. Non-launch verbs still work.
+settings — and, since 0.8.0, every measured
+`projects/<project-id>/config.toml`. Review the file's launch-authorizing
+contents, then remove its other names before launching. Non-launch verbs still
+work. Because every project is measured, an unrelated project's uninspectable
+route or hard-linked config also blocks launches: that is deliberate, because
+leaving it unmeasured would launder it into a later launch. An entry under
+`projects/` that is not a directory (a file, or a symlink to one) refuses the
+launch by name — it cannot hold a `config.toml`, and only `NotFound` is silent —
+so remove it. The same holds for a directory too large to measure: more than
+1024 entries refuses the launch, naming the directory, because skipping any of
+them would leave authority unmeasured.
 `credentials.yaml` hard links remain #319; runtime races and nested mount
 aliases remain #322/#321. See [ADR-0038](docs/adr/0038-config-dir-exposure-guard.md)
 for the trusted boundary and accepted gaps.
@@ -2952,21 +2972,67 @@ invocation. `agent-vm doctor` prints exactly what was resolved (and `agent-vm
 --help` shows the same verb list, in the same order). The design rationale is
 in [ADR-0015](docs/adr/0015-config-driven-tools.md).
 
-> Running `agent-vm` in a directory means trusting that directory's
-> `.agent-vm/` — a project config can declare and (where a tool needs them)
-> wire up arbitrary commands and credentials. See ADR-0015's trust-model
-> section.
+> The project tier is **host-managed**: it lives under `$HOME`, not in the
+> repository, and running `agent-vm` in a directory never trusts that
+> directory's `.agent-vm/config.toml`. See
+> [Where the files live](#where-the-files-live) and
+> [ADR-0073](docs/adr/0073-host-managed-project-config.md).
 
 ### Where the files live
 
 | Tier | Path |
 |---|---|
 | user | `$HOME/.config/agent-vm/config.toml` |
-| project | `<project root>/.agent-vm/config.toml` (`<project root>` is the canonical current directory) |
+| project | `$HOME/.config/agent-vm/projects/<project-id>/config.toml` |
 
-Both are optional (an absent file is reported as `absent`; a present but
-empty one as `found, 0 tools`). `$XDG_CONFIG_HOME` and any config-path
+`<project-id>` is the **64-character lowercase hex SHA-256** of the canonical
+project path's bytes — the same id `image-pins.json` and `allowances.json` use,
+so one project has one id across every store. `<project root>` is the canonical
+current directory, so a symlinked cwd names the same project as the real path.
+
+Nothing in a repository is ever read as config: `<project root>/.agent-vm/
+config.toml` is **not** auto-loaded, and no backwards-compatible auto-loading is
+kept (see [Legacy in-repo `.agent-vm/config.toml`](#legacy-in-repo-agent-vmconfigtoml)).
+agent-vm only reads project configs; it creates neither `projects/` nor any file
+in it (writers arrive with the `agent-vm config` subcommand).
+
+Both tiers are optional (an absent file is reported as `absent`; a present but
+empty one as `found, 0 tools`). With no `$HOME` at all, **both** are unavailable
+and `doctor` says so (`<no HOME; user tier unavailable>`,
+`<no HOME; project tier unavailable>`). `$XDG_CONFIG_HOME` and any config-path
 override are deliberately **not** honored.
+
+A present project config is verified **whatever it declares**: a regular file,
+reached directly (never through a final symlink), with one hard link, owned by
+you and not group/other-writable, in a directory (`projects/<project-id>`) with
+the same owner and mode rules. Its store route must be real too: a symlinked
+`projects/` or `projects/<project-id>`, or an ancestor alias that points the
+store inside the project you are launching from, is refused before the file is
+opened. Every refusal names the file. That is stricter than the user tier, whose
+verified read is triggered by the presence of an authority field.
+
+### Legacy in-repo `.agent-vm/config.toml`
+
+If a repository still ships `.agent-vm/config.toml`, agent-vm ignores it and
+`agent-vm doctor` says so at the end of `==> tool configuration`:
+
+```text
+note: /work/repo/.agent-vm/config.toml is not auto-loaded; agent-vm never reads an in-repo .agent-vm/config.toml.
+To use it, review it and source it from this project's config with `agent-vm config edit`.
+```
+
+The note does not change the exit status and appears whether the configuration
+loaded or failed. To migrate today, by hand:
+
+1. review the in-repo file — it may have come from a branch you do not trust;
+2. copy the definitions you want to the path `doctor` prints on its `project:`
+   row (`~/.config/agent-vm/projects/<project-id>/config.toml`, creating the
+   directory);
+3. run `agent-vm doctor` again and confirm the verbs appear.
+
+`agent-vm config edit` arrives in a later change. Until it ships, use the
+printed path directly. A future release will also let a project config *source*
+another file, which is the long-term way to share a team catalog.
 
 ### Schema
 
@@ -3158,7 +3224,7 @@ existing name differs, `doctor` warns once and the user definition wins, e.g.:
 
 ```text
 warning: tool "claude" in /home/alice/.config/agent-vm/config.toml overrides
-         /work/repo/.agent-vm/config.toml; differing fields: command, args
+         /home/alice/.config/agent-vm/projects/<project-id>/config.toml; differing fields: command, args
 ```
 
 `doctor` also prints the selected boot image (excluding `--image`, which it does
@@ -3450,7 +3516,7 @@ catalog, your own `shell` gets the same name-based default but closes over
 **your** file. Add `tools = []` to opt out.
 
 If you declare your own `codex` or `shell` tool in
-`~/.config/agent-vm/config.toml` or `.agent-vm/config.toml`, your definition
+`~/.config/agent-vm/config.toml` or this project's config, your definition
 wins wholesale and does **not** inherit the shipped `env` — add
 `env = { CODEX_HOME = "/agent-vm-state/codex" }` to it, or codex will start in
 the guest as signed out.

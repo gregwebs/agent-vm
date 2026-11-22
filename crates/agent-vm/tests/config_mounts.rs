@@ -228,7 +228,7 @@ impl Harness {
     }
 
     fn project_config(&self) -> PathBuf {
-        self.project_root.join(".agent-vm/config.toml")
+        support::project_config_path(&self.home_root, &self.project_root)
     }
 
     fn write_project(&self, contents: &str) {
@@ -1507,6 +1507,119 @@ fn writable_config_mount_containing_the_config_dir_is_refused() {
         "{stderr}"
     );
     h.assert_refused_before_launch_state(&out, &before, &config_declaration(&h, 0));
+}
+
+/// ADR-0073: `projects/` and each project's directory sit *inside* the authority
+/// directory, where "is or contains a route" alone would allow a writable bind of
+/// them. Each is a measured store of its own, so such a bind is refused; a bind
+/// strictly inside one, or in `:ro`/`:fork` mode, is not.
+#[test]
+fn writable_mounts_of_project_config_dirs_are_refused() {
+    let h = Harness::new();
+    let projects = h.home_root.join(".config/agent-vm/projects");
+    let other = projects.join("a".repeat(64));
+    let sub = other.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(other.join("config.toml"), "[[tools]]\n").unwrap();
+
+    // (1) the whole project store, declared by the user tier.
+    h.write_user("mounts = [\"~/.config/agent-vm/projects:rw\"]\n");
+    let before = h.before();
+    let out = h.launch(&[], "shell", &[]);
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("would let the guest change what"),
+        "{stderr}"
+    );
+    assert!(stderr.contains(&projects.display().to_string()), "{stderr}");
+    h.assert_refused_before_launch_state(&out, &before, &config_declaration(&h, 0));
+
+    // (2) another project's directory, from argv.
+    h.write_user("");
+    let mount = format!("{}:/p", other.display());
+    let before = h.before();
+    let out = h.launch(&["--mount", &mount], "shell", &[]);
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("would let the guest change what"),
+        "{stderr}"
+    );
+    assert!(stderr.contains(&other.display().to_string()), "{stderr}");
+    h.assert_refused_before_launch_state(&out, &before, "would let the guest change what");
+
+    // (3) a writable bind of the *target* of a symlinked project entry: the
+    // entry's route is what makes the target protected.
+    let target = h.home_root.join("elsewhere");
+    std::fs::create_dir(&target).unwrap();
+    std::os::unix::fs::symlink(&target, projects.join("b".repeat(64))).unwrap();
+    let mount = format!("{}:/t", target.display());
+    let before = h.before();
+    let out = h.launch(&["--mount", &mount], "shell", &[]);
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains(&target.display().to_string()), "{stderr}");
+    h.assert_refused_before_launch_state(&out, &before, "would let the guest change what");
+    std::fs::remove_file(projects.join("b".repeat(64))).unwrap();
+
+    // (4) a hard link to *another* project's config refuses the launch through
+    // the one-name rule, which runs after config load and before any boot.
+    let links = other.join("config.toml");
+    let alias = h.home_root.join("alias.toml");
+    std::fs::hard_link(&links, &alias).unwrap();
+    let before = h.before();
+    let out = h.launch(&[], "shell", &[]);
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(&format!("\"{}\" has 2 hard links", links.display())),
+        "{stderr}"
+    );
+    h.assert_refused_before_launch_state(&out, &before, "hard links; agent-vm will not launch");
+    std::fs::remove_file(&alias).unwrap();
+
+    // (5) the allowed twins, verified from the actual mount plan. `:ro` names the
+    // source as the host; a fork is materialised under the state root, so its
+    // guest entry and that origin are what identify it.
+    let mount = format!("{}:/ro:ro", other.display());
+    let stderr = stderr_of(&h.launch(&["--mount", &mount], "shell", &[]));
+    assert!(
+        stderr.contains(CONFIG_MARKER),
+        ":ro must be allowed: {stderr}"
+    );
+    let binds = bind_mounts(&debug_config_json(&stderr));
+    assert!(
+        binds.iter().any(
+            |(host, guest, readonly)| *host == other.display().to_string()
+                && guest == "/ro"
+                && *readonly
+        ),
+        ":ro read-only bind missing from the plan: {binds:?}"
+    );
+    let mount = format!("{}:/fork:fork", other.display());
+    let stderr = stderr_of(&h.launch(&["--mount", &mount], "shell", &[]));
+    assert!(
+        stderr.contains(CONFIG_MARKER),
+        ":fork must be allowed: {stderr}"
+    );
+    let binds = bind_mounts(&debug_config_json(&stderr));
+    assert!(
+        binds
+            .iter()
+            .any(|(host, guest, _)| guest == "/fork" && host.contains(".mounts/forks")),
+        ":fork seeded bind missing from the plan: {binds:?}"
+    );
+    // Strictly inside the project's directory, exactly as `cfg/sub` is today.
+    let mount = format!("{}:/inside", sub.display());
+    let stderr = stderr_of(&h.launch(&["--mount", &mount], "shell", &[]));
+    assert!(
+        stderr.contains(CONFIG_MARKER),
+        "a bind strictly inside a project store must be allowed: {stderr}"
+    );
+    let binds = bind_mounts(&debug_config_json(&stderr));
+    assert!(
+        binds
+            .iter()
+            .any(|(host, _, readonly)| *host == sub.display().to_string() && !*readonly),
+        "the inside bind must be applied writable: {binds:?}"
+    );
 }
 
 /// A config live bind of the host Pi home would expose real credentials.

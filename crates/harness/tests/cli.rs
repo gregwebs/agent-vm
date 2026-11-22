@@ -1576,6 +1576,64 @@ fn the_binary_refuses_mutation_misuse() {
     );
 }
 
+// --- #733: the host-managed project config path ----------------------------
+
+/// `harness project-config-path` is what the shell suites seed, so the binary has
+/// to print exactly the product's path. The expectation is recomputed here from
+/// the canonical path's bytes, independently of the harness module.
+#[test]
+fn the_binary_prints_the_host_managed_project_config_path() {
+    use sha2::{Digest as _, Sha256};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let scratch = Scratch::new("project-config-path");
+    let home = scratch.path.join("home");
+    let project = scratch.path.join("project");
+    fs::create_dir_all(&home).expect("create home");
+    fs::create_dir_all(&project).expect("create the project");
+    let canonical = project.canonicalize().expect("canonicalize the project");
+    let hex: String = Sha256::digest(canonical.as_os_str().as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let expected = home
+        .join(".config/agent-vm/projects")
+        .join(&hex)
+        .join("config.toml");
+
+    let output = harness([
+        "project-config-path".to_owned(),
+        "--home".to_owned(),
+        home.to_string_lossy().into_owned(),
+        "--project".to_owned(),
+        project.to_string_lossy().into_owned(),
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 path"),
+        format!("{}\n", expected.display())
+    );
+
+    // A project that does not exist cannot be hashed: misuse (2), not a FAIL.
+    let missing = harness([
+        "project-config-path".to_owned(),
+        "--home".to_owned(),
+        home.to_string_lossy().into_owned(),
+        "--project".to_owned(),
+        scratch.path.join("missing").to_string_lossy().into_owned(),
+    ]);
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("cannot canonicalize"),
+        "{}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+}
+
 // --- #700: the `e2e.sh` inline helpers -------------------------------------
 
 /// Every `harness e2e-*` control runs through the binary the shell calls. A

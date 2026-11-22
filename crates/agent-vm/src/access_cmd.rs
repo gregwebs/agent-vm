@@ -103,7 +103,7 @@ pub(crate) struct RevokeArgs {
 /// drive the whole command — selection, rendering and exit status — in-process,
 /// against a real server and a real log, without a second `run_with_timeout`
 /// copy (#514).
-pub(crate) fn run(args: Args) -> Result<i32> {
+pub(crate) fn run(args: Args, project: Result<crate::project::ProjectDir>) -> Result<i32> {
     // Before anything reads this project: only the launcher can answer, and a
     // guest's copy of this binary would otherwise read the guest's own state.
     if matches!(args.command, Some(AccessSubcommand::Egress(_)))
@@ -111,8 +111,9 @@ pub(crate) fn run(args: Args) -> Result<i32> {
     {
         return egress::print_host_only(&mut std::io::stderr());
     }
-    #[allow(clippy::disallowed_methods)] // one capture per command: every consumer borrows it.
-    let project = crate::project::ProjectDir::capture()?;
+    // `main`'s one capture (ADR-0073 D5), so this command's notion of the
+    // project cannot differ from the catalog's.
+    let project = project?;
     let session = ProjectSession::for_project(&project)?;
     // `SessionsDir::open` never creates: asking what a project refused must not
     // bring the store that would answer it into existence. A directory that
