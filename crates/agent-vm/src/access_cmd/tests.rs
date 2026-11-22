@@ -167,11 +167,11 @@ async fn table_golden() {
     assert_eq!(
         out,
         "\
-ID        KIND            DESTINATION                                                         COUNT  LAST-SEEN          SESSION          ACTION
-46d712fd  network denial  tcp 203.0.113.10:443 · api.example.com (DNS cache, guest-supplied)  3      2025-10-09 08:52Z  ended (unclean)  no grant in this version; relaunch with --allow-egress
-88f5da9d  network denial  tcp cdn.example:443 (SNI, guest-supplied) · last IP 198.51.100.8    1      2025-10-09 08:51Z  ended (unclean)  no grant in this version; relaunch with --allow-egress
-71aca03c  network denial  dns blocked.example (DNS query, guest-supplied)                     1      2025-10-09 08:50Z  ended (unclean)  no grant in this version; relaunch with --allow-egress
-a00b2078  policy lock     tcp 10.0.0.7:53                                                     1      2025-10-09 08:49Z  ended (unclean)  can't be allowed: platform policy
+ID        KIND            DESTINATION                                                         COUNT  FIRST-SEEN         LAST-SEEN          SESSION          ACTION
+46d712fd  network denial  tcp 203.0.113.10:443 · api.example.com (DNS cache, guest-supplied)  3      2025-10-09 08:52Z  2025-10-09 08:52Z  ended (unclean)  session ended; run `agent-vm access allow 46d712fd --session 0a1b2c3d --project`
+88f5da9d  network denial  tcp cdn.example:443 (SNI, guest-supplied) · last IP 198.51.100.8    1      2025-10-09 08:51Z  2025-10-09 08:51Z  ended (unclean)  this hostname was seen over plain HTTP, so an allowance cannot name a port for it without allowing every name on that port
+71aca03c  network denial  dns blocked.example (DNS query, guest-supplied)                     1      2025-10-09 08:50Z  2025-10-09 08:50Z  ended (unclean)  session ended; run `agent-vm access allow 71aca03c --session 0e0f1011 --project`
+a00b2078  policy lock     tcp 10.0.0.7:53                                                     1      2025-10-09 08:49Z  2025-10-09 08:49Z  ended (unclean)  can't be allowed: platform policy
 "
     );
     assert!(err.is_empty(), "{err}");
@@ -501,6 +501,57 @@ async fn window_hides_older_than_24h_unless_all() {
     assert!(!out.contains("Showing the last 24 hours"), "{out}");
 }
 
+/// The window is about the *last* sighting, and FIRST-SEEN is the first one.
+///
+/// The two are separate fields, so a window that selected on `first_ms` would
+/// hide a refusal still happening now (first seen days ago) and show one that
+/// stopped a day ago (first seen minutes ago as an old log is re-read). Both rows
+/// below sit on opposite sides of the boundary, so the two rules disagree.
+#[tokio::test]
+async fn the_window_selects_on_the_last_sighting_not_the_first() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = session_dir(root.path());
+    // First seen 30 h ago, refused again a minute ago: inside the window.
+    let mut refreshed = entry("aaaaaaa1", address("203.0.113.10", 443), NOW - 60_000);
+    refreshed.first_ms = NOW - 30 * 60 * 60 * 1000;
+    // First seen a minute ago, last refused the day before yesterday: outside.
+    let mut lapsed = entry(
+        "bbbbbbb2",
+        address("203.0.113.11", 443),
+        NOW - WINDOW_MS - 60_000,
+    );
+    lapsed.first_ms = NOW - 60_000;
+    dir.write(
+        &snapshot(
+            "0a1b2c3d",
+            NOW - 30 * 60 * 60 * 1000,
+            vec![refreshed, lapsed],
+        ),
+        NOW,
+    )
+    .unwrap();
+
+    let (status, out, _) = run_logged(&dir, table_args()).await;
+    assert_eq!(status, 0);
+    let row = out
+        .lines()
+        .find(|line| line.starts_with("aaaaaaa1"))
+        .unwrap_or_else(|| panic!("no row: {out}"));
+    assert!(
+        row.contains("2025-10-08 02:53Z  2025-10-09 08:52Z"),
+        "FIRST-SEEN keeps the first sighting, LAST-SEEN the last: {row}"
+    );
+    assert!(!out.contains("bbbbbbb2"), "the window hides it: {out}");
+    assert!(
+        out.contains("Showing the last 24 hours; --all shows the whole log (1 older)"),
+        "{out}"
+    );
+
+    let (status, out, _) = run_logged(&dir, ALL).await;
+    assert_eq!(status, 0);
+    assert!(out.contains("bbbbbbb2"), "--all shows it: {out}");
+}
+
 #[tokio::test]
 async fn unknown_session_id_exits_1() {
     let root = tempfile::tempdir().unwrap();
@@ -669,12 +720,170 @@ async fn a_shared_id_is_flagged_not_renamed() {
     let (status, out, _) = run_logged(&dir, table_args()).await;
     assert_eq!(status, 0);
     // The same ID twice, not renamed...
-    assert_eq!(out.matches("deadbeef").count(), 3, "{out}");
+    assert_eq!(
+        out.lines()
+            .filter(|line| line.starts_with("deadbeef"))
+            .count(),
+        2,
+        "{out}"
+    );
+    // ...each row's command qualifying the ID with its own session, because the
+    // ID alone names both...
+    for session in ["00000001", "00000002"] {
+        assert!(
+            out.contains(&format!(
+                "agent-vm access allow deadbeef --session {session} --project"
+            )),
+            "{out}"
+        );
+    }
     // ...and flagged once.
     assert!(
         out.contains("the same refusal ID appears in more than one session: deadbeef"),
         "{out}"
     );
+}
+
+/// A state that cannot confirm a live change is offered no command at all: a
+/// table that offered one would be promising a mutation `allow` refuses.
+#[tokio::test]
+async fn a_session_that_cannot_be_asked_offers_no_command() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = session_dir(root.path());
+
+    // `running (no control socket)`: alive (a fresh heartbeat), bound no socket.
+    let mut no_socket = snapshot(
+        "00000005",
+        NOW - 10_000,
+        vec![entry("aaaaaaa5", address("203.0.113.15", 443), NOW - 5_000)],
+    );
+    no_socket.info.socket = false;
+    no_socket.heartbeat_ms = Some(NOW - 1_000);
+    dir.write(&no_socket, NOW).unwrap();
+
+    // `not responding`: the socket is bound and never answers.
+    let hung_id = SessionId::parse("00000006").unwrap();
+    let listener = tokio::net::UnixListener::bind(dir.socket_path(&hung_id)).unwrap();
+    let hung = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    let mut logged = snapshot(
+        "00000006",
+        NOW - 10_000,
+        vec![entry("aaaaaaa6", address("203.0.113.16", 443), NOW - 5_000)],
+    );
+    logged.info.socket = true;
+    dir.write(&logged, NOW).unwrap();
+
+    let (status, out, _) = run_logged(&dir, table_args()).await;
+    assert_eq!(status, 0);
+    for (refusal, state) in [
+        ("aaaaaaa5", "running (no control socket)"),
+        ("aaaaaaa6", "not responding"),
+    ] {
+        let row = out
+            .lines()
+            .find(|line| line.starts_with(refusal))
+            .unwrap_or_else(|| panic!("{refusal} has a row: {out}"));
+        assert!(row.contains(state), "{refusal} is {state}: {row}");
+        assert!(
+            row.ends_with("session cannot confirm live change; relaunch with --allow-egress"),
+            "{row}"
+        );
+        assert!(
+            !row.contains("agent-vm access allow"),
+            "a session that cannot confirm offers no command: {row}"
+        );
+    }
+    hung.abort();
+}
+
+/// The two time columns are two fields: a destination refused again keeps its
+/// first sighting, so `FIRST-SEEN` cannot be `LAST-SEEN` rewritten.
+#[tokio::test]
+async fn first_seen_is_its_own_column_and_keeps_the_evidence_markers() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = session_dir(root.path());
+    let mut repeated = entry("46d712fd", address("203.0.113.10", 443), NOW - 60_000);
+    repeated.first_ms = NOW - 600_000;
+    repeated.count = 2;
+    repeated.name = Some(GuestName {
+        name: "api.example.com".into(),
+        source: "dns-cache".into(),
+        truncated: false,
+    });
+    dir.write(&snapshot("00000001", NOW - 700_000, vec![repeated]), NOW)
+        .unwrap();
+
+    let (status, out, _) = run_logged(&dir, table_args()).await;
+    assert_eq!(status, 0);
+    let header = out.lines().next().expect("a header line");
+    assert!(
+        header.find("FIRST-SEEN") < header.find("LAST-SEEN"),
+        "FIRST-SEEN comes before LAST-SEEN: {header}"
+    );
+    let row = out
+        .lines()
+        .find(|line| line.starts_with("46d712fd"))
+        .unwrap_or_else(|| panic!("no row: {out}"));
+    // Cells are two spaces apart and none holds two in a row, so this is the
+    // column split the header describes.
+    let cells: Vec<&str> = row.split("  ").filter(|cell| !cell.is_empty()).collect();
+    assert_eq!(cells.len(), 8, "{row}");
+    assert_eq!(cells[3], "2", "COUNT: {row}");
+    assert_eq!(cells[4], "2025-10-09 08:43Z", "FIRST-SEEN: {row}");
+    assert_eq!(cells[5], "2025-10-09 08:52Z", "LAST-SEEN: {row}");
+    assert!(
+        cells[2].contains("api.example.com (DNS cache, guest-supplied)"),
+        "DESTINATION keeps the evidence markers: {row}"
+    );
+}
+
+/// A refusal ID becomes a command word, so only the 8-hex spelling the feed
+/// assigns may reach the ACTION cell. A log the guest can write must not be able
+/// to make `access` print a command (AC5).
+#[tokio::test]
+async fn a_malformed_refusal_id_never_becomes_a_command() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = session_dir(root.path());
+    let forged = entry("$(id)", address("203.0.113.10", 443), NOW - 60_000);
+    dir.write(&snapshot("00000001", NOW - 300_000, vec![forged]), NOW)
+        .unwrap();
+
+    let (status, out, _) = run_logged(&dir, table_args()).await;
+    assert_eq!(status, 0);
+    assert!(
+        out.contains("cannot build allow command: malformed refusal ID"),
+        "{out}"
+    );
+    // The row is still shown — it is a refusal — but it names no command.
+    let row = out
+        .lines()
+        .find(|line| line.starts_with("$(id)"))
+        .unwrap_or_else(|| panic!("no row: {out}"));
+    assert!(!row.contains("agent-vm access allow"), "{row}");
+    let action = row.split("  ").filter(|cell| !cell.is_empty()).last();
+    assert_eq!(
+        action,
+        Some("cannot build allow command: malformed refusal ID"),
+        "{row}"
+    );
+
+    // Nor does a malformed ID reach the mutation: it is parsed before anything is
+    // looked up, so the same spelling rule decides both what is printed and what
+    // runs.
+    let view = live_view(root.path());
+    let (status, out, err) = run_command(root.path(), allow("$(id)", false), &view).await;
+    assert_eq!(status, 1, "{out}{err}");
+    assert!(err.contains("`<ID>` takes an 8-hex refusal ID"), "{err}");
+    assert!(
+        !err.contains("$(id)"),
+        "an untrusted ID is never echoed: {err}"
+    );
+    assert_eq!(live_view(root.path()).allowances().len(), 0, "no record");
 }
 
 #[tokio::test]
@@ -785,7 +994,13 @@ async fn footers_report_suppressed_lost_and_gap_never_as_rows() {
     dir.write(&noisy, NOW).unwrap();
     let (status, out, _) = run_logged(&dir, table_args()).await;
     assert_eq!(status, 0);
-    assert_eq!(out.matches("aaaaaaa1").count(), 1, "one row: {out}");
+    assert_eq!(
+        out.lines()
+            .filter(|line| line.starts_with("aaaaaaa1"))
+            .count(),
+        1,
+        "one row: {out}"
+    );
     assert!(out.contains("12 refusal(s) were not recorded"), "{out}");
     assert!(
         out.contains("3 refusal(s) to destinations beyond the per-session limit"),
@@ -1033,10 +1248,11 @@ async fn covered_row_says_recorded_not_confirmed() {
         action("88f5da9d"),
         "recorded project allowance cdn.example (2025-10-09 08:52Z); not confirmed for this session"
     );
-    // Slice 1's text, unchanged, for the row no record names.
+    // Slice 1's text is gone: no record names it, so the row offers the one
+    // command that would create one, qualified by its own session.
     assert_eq!(
         action("a00b2078"),
-        "no grant in this version; relaunch with --allow-egress"
+        "session ended; run `agent-vm access allow a00b2078 --session 0a1b2c3d --project`"
     );
     // The claim is about a file, never about the session: the old wording that
     // promised nothing must not survive on a covered row.
@@ -1070,9 +1286,10 @@ async fn a_store_problem_is_one_warning() {
         "{err}"
     );
     assert!(err.contains("allowances.json"), "{err}");
-    // Not covered, so the row says what it said before the store existed.
+    // Not covered, so the row offers the command that would cover it and claims
+    // no record.
     assert!(
-        out.contains("no grant in this version; relaunch with --allow-egress"),
+        out.contains("run `agent-vm access allow 46d712fd --session 0a1b2c3d --project`"),
         "{out}"
     );
     assert!(!out.contains("recorded project allowance"), "{out}");
@@ -1225,6 +1442,14 @@ fn allow(id: &str, project: bool) -> AccessSubcommand {
     })
 }
 
+fn allow_in_session(id: &str, project: bool, session: &str) -> AccessSubcommand {
+    AccessSubcommand::Allow(AllowArgs {
+        id: id.to_owned(),
+        project,
+        session: Some(session.to_owned()),
+    })
+}
+
 /// C1: `allow` (session), `allow --project`, the table's applied row, the
 /// listing, and `revoke`, all in process against one live session.
 #[tokio::test]
@@ -1234,6 +1459,19 @@ async fn allow_session_and_project_end_to_end_in_process() {
     let live = start_fixture(root.path(), Some(updater.handle())).await;
     let id = ingest_denial(&live);
     let view = live_view(root.path());
+
+    // Before any allowance, the refusal's row offers both scopes and names this
+    // session in each command.
+    let sid = live.id().as_str();
+    let (status, table, err) = run_logged(&session_dir(root.path()), table_args()).await;
+    assert_eq!(status, 0, "{err}");
+    assert!(
+        table.contains(&format!(
+            "run `agent-vm access allow {id} --session {sid}` (session) or `agent-vm access \
+             allow {id} --session {sid} --project`"
+        )),
+        "{table}"
+    );
 
     // A plain allow changes the session only.
     let (status, out, err) = run_command(root.path(), allow(&id, false), &view).await;
@@ -1907,6 +2145,290 @@ async fn allow_on_ended_session_records_project_and_refuses_session_only() {
         1,
         "the record is what the next launch reads"
     );
+}
+
+/// B9: the same refusal ID in a live session and in a session that has ended.
+///
+/// An unqualified ID names both, so `allow` must refuse it rather than mutate the
+/// one the listing happened to reach first; a command qualified with the ended
+/// session must write the project record and must not touch the live session.
+#[tokio::test]
+async fn an_ambiguous_refusal_id_is_refused_and_never_targets_the_wrong_session() {
+    let root = tempfile::tempdir().unwrap();
+    let updater = Arc::new(Updater::default());
+    let live = start_fixture(root.path(), Some(updater.handle())).await;
+    let id = ingest_denial(&live);
+    let view = live_view(root.path());
+
+    // An 8-hex ID is unique per *session*, not across sessions.
+    let mut ended = snapshot(
+        "00000002",
+        NOW - 10_000,
+        vec![entry(&id, address("203.0.113.10", 443), NOW - 5_000)],
+    );
+    ended.info.socket = false;
+    ended.ended_ms = Some(NOW - 4_000);
+    session_dir(root.path()).write(&ended, NOW).unwrap();
+
+    // Unqualified: two sessions carry it, so nothing is mutated.
+    let (status, out, err) = run_command(root.path(), allow(&id, true), &view).await;
+    assert_eq!(status, 1, "{out}{err}");
+    assert!(err.contains("more than one session"), "{err}");
+    assert!(err.contains(live.id().as_str()), "{err}");
+    assert!(err.contains("00000002"), "{err}");
+    assert!(err.contains("--session <ID>"), "{err}");
+    assert_eq!(updater.calls.load(Ordering::SeqCst), 0, "no runtime call");
+    assert_eq!(view.allowances().len(), 0, "no record was written");
+    assert!(
+        live.allowances().snapshot().session.is_empty(),
+        "the live session was not mutated"
+    );
+
+    // Qualified with the ended session: the record, and only the record.
+    let (status, out, err) =
+        run_command(root.path(), allow_in_session(&id, true, "00000002"), &view).await;
+    assert_eq!(status, 0, "{out}{err}");
+    assert!(out.contains("recorded project allowance"), "{out}");
+    assert_eq!(live_view(root.path()).allowances().len(), 1);
+    assert!(
+        live.allowances().snapshot().session.is_empty(),
+        "the live session that shares the ID was not mutated"
+    );
+    assert_eq!(
+        updater.calls.load(Ordering::SeqCst),
+        0,
+        "an ended session takes no policy swap"
+    );
+    live.finish().await;
+}
+
+/// An ID copied from another session still says where it lives: filtering by
+/// `--session` first must not hide the answer the ID-only lookup gave.
+#[tokio::test]
+async fn allow_names_the_session_that_holds_a_qualified_id() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = session_dir(root.path());
+    for (session, refusal, started) in [
+        ("00000007", "aaaaaaa7", NOW - 20_000),
+        ("00000008", "aaaaaaa8", NOW - 10_000),
+    ] {
+        let mut ended = snapshot(
+            session,
+            started,
+            vec![entry(refusal, address("203.0.113.10", 443), NOW - 1_000)],
+        );
+        ended.info.socket = false;
+        ended.ended_ms = Some(NOW - 500);
+        dir.write(&ended, NOW).unwrap();
+    }
+    let view = live_view(root.path());
+
+    let (status, out, err) = run_command(
+        root.path(),
+        allow_in_session("aaaaaaa7", true, "00000008"),
+        &view,
+    )
+    .await;
+    assert_eq!(status, 1, "{out}{err}");
+    assert!(
+        err.contains("refusal aaaaaaa7 is not in session 00000008; it is in 00000007 (ended)"),
+        "{err}"
+    );
+    assert_eq!(live_view(root.path()).allowances().len(), 0, "no record");
+}
+
+/// `allow`, `allowances` and `egress` share one `--session` rule
+/// ([`parse_session_flag`]), so all three answer a value that is not an ID with
+/// the same line, before they look anything up, and none of them acts on it.
+///
+/// `revoke` is deliberately absent: it still compares the flag as text and
+/// deletes the project record before it notices, which is a defect of its own
+/// (recorded in the PR 1 verification report, out of this change's scope).
+#[tokio::test]
+async fn the_verbs_that_take_a_session_reject_a_malformed_one_in_the_same_words() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = session_dir(root.path());
+    let mut ended = snapshot(
+        "00000001",
+        NOW - 20_000,
+        vec![entry("aaaaaaa1", address("203.0.113.10", 443), NOW - 1_000)],
+    );
+    ended.info.socket = false;
+    ended.ended_ms = Some(NOW - 500);
+    dir.write(&ended, NOW).unwrap();
+    let view = live_view(root.path());
+
+    let verbs: [(&str, AccessSubcommand); 3] = [
+        (
+            "allow",
+            AccessSubcommand::Allow(AllowArgs {
+                id: "aaaaaaa1".to_owned(),
+                project: true,
+                session: Some("nothex".to_owned()),
+            }),
+        ),
+        (
+            "allowances",
+            AccessSubcommand::Allowances(AllowancesArgs {
+                session: Some("nothex".to_owned()),
+            }),
+        ),
+        ("egress", egress_request(Some("nothex"))),
+    ];
+    for (verb, command) in verbs {
+        let (status, out, err) = run_command(root.path(), command, &view).await;
+        assert_eq!(status, 1, "{verb}: {out}{err}");
+        assert_eq!(err, "`--session` takes an 8-hex session ID\n", "{verb}");
+        // Not the lookup it used to be: a value this command cannot parse names
+        // no session, so it must not be echoed back as one.
+        assert!(!err.contains("is not in session"), "{verb}: {err}");
+        assert_eq!(out, "", "{verb}");
+    }
+    assert_eq!(live_view(root.path()).allowances().len(), 0, "no record");
+}
+
+/// Two entries of one ID cannot be resolved by any flag, so `allow` refuses
+/// them — and a user who already named a session is never told to name one again.
+#[tokio::test]
+async fn a_damaged_log_is_refused_and_never_advises_a_named_session() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = session_dir(root.path());
+    let mut doubled = snapshot(
+        "00000001",
+        NOW - 20_000,
+        vec![
+            entry("deadbeee", address("203.0.113.12", 443), NOW - 1_000),
+            entry("deadbeee", address("203.0.113.13", 443), NOW - 2_000),
+            entry("deadbeef", address("203.0.113.10", 443), NOW - 1_000),
+            entry("deadbeef", address("203.0.113.11", 443), NOW - 2_000),
+        ],
+    );
+    doubled.info.socket = false;
+    doubled.ended_ms = Some(NOW - 500);
+    dir.write(&doubled, NOW).unwrap();
+    let mut other = snapshot(
+        "00000002",
+        NOW - 10_000,
+        vec![entry("deadbeef", address("203.0.113.14", 443), NOW - 1_000)],
+    );
+    other.info.socket = false;
+    other.ended_ms = Some(NOW - 500);
+    dir.write(&other, NOW).unwrap();
+    let view = live_view(root.path());
+
+    // One session records one ID twice: no `--session` can choose between them.
+    let (status, out, err) = run_command(
+        root.path(),
+        allow_in_session("deadbeee", true, "00000001"),
+        &view,
+    )
+    .await;
+    assert_eq!(status, 1, "{out}{err}");
+    assert!(
+        err.contains(
+            "refusal deadbeee appears in more than one entry of 00000001 (ended); the refusal log \
+             is damaged"
+        ),
+        "{err}"
+    );
+    assert!(!err.contains("--session <ID>"), "{err}");
+    assert_eq!(live_view(root.path()).allowances().len(), 0, "no record");
+
+    // Unqualified, the same ID in two sessions is the documented ambiguity.
+    let (status, out, err) = run_command(root.path(), allow("deadbeef", true), &view).await;
+    assert_eq!(status, 1, "{out}{err}");
+    assert!(err.contains("is in more than one session"), "{err}");
+    assert!(err.contains("00000001 (ended)"), "{err}");
+    assert!(err.contains("00000002 (ended)"), "{err}");
+    assert!(err.contains("--session <ID>"), "{err}");
+    assert_eq!(live_view(root.path()).allowances().len(), 0, "no record");
+
+    // Named, and recorded twice in that session while another session carries it
+    // too: the damaged-log answer, taken from the named session's own entries.
+    let (status, out, err) = run_command(
+        root.path(),
+        allow_in_session("deadbeef", true, "00000001"),
+        &view,
+    )
+    .await;
+    assert_eq!(status, 1, "{out}{err}");
+    assert!(
+        err.contains(
+            "refusal deadbeef appears in more than one entry of 00000001 (ended); the refusal log \
+             is damaged"
+        ),
+        "{err}"
+    );
+    assert!(!err.contains("--session <ID>"), "{err}");
+    assert!(!err.contains("00000002"), "{err}");
+    assert_eq!(live_view(root.path()).allowances().len(), 0, "no record");
+}
+
+/// A refusal older than the window is still shown when `--session` names it, and
+/// a session that has ended is offered `--project` only.
+#[tokio::test]
+async fn a_stale_ended_session_is_shown_by_session_and_allows_project_only() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = session_dir(root.path());
+    let idle = 30 * 60 * 60 * 1000;
+    let mut stale = snapshot(
+        "00000004",
+        NOW - idle,
+        vec![entry("aaaaaaa4", address("203.0.113.10", 443), NOW - idle)],
+    );
+    stale.info.socket = false;
+    stale.ended_ms = Some(NOW - idle);
+    dir.write(&stale, NOW).unwrap();
+    let view = live_view(root.path());
+
+    // The default window hides it.
+    let (status, out, _) = run_logged(&dir, table_args()).await;
+    assert_eq!(status, 0);
+    assert!(out.contains("No refusals in the last 24 hours."), "{out}");
+
+    // `--session` is a question about one session, not a window over it.
+    let (status, out, _) = run_logged(
+        &dir,
+        Args {
+            command: None,
+            session: Some("00000004".to_owned()),
+            all: false,
+        },
+    )
+    .await;
+    assert_eq!(status, 0);
+    let row = out
+        .lines()
+        .find(|line| line.starts_with("aaaaaaa4"))
+        .unwrap_or_else(|| panic!("no row: {out}"));
+    assert!(
+        row.contains(
+            "session ended; run `agent-vm access allow aaaaaaa4 --session 00000004 --project`"
+        ),
+        "{row}"
+    );
+
+    // The row's own command, without `--project`, cannot be recorded.
+    let (status, out, err) = run_command(
+        root.path(),
+        allow_in_session("aaaaaaa4", false, "00000004"),
+        &view,
+    )
+    .await;
+    assert_eq!(status, 1, "{out}{err}");
+    assert!(err.contains("has ended"), "{err}");
+    assert_eq!(live_view(root.path()).allowances().len(), 0);
+
+    // With `--project` it records what the next launch reads.
+    let (status, out, err) = run_command(
+        root.path(),
+        allow_in_session("aaaaaaa4", true, "00000004"),
+        &view,
+    )
+    .await;
+    assert_eq!(status, 0, "{out}{err}");
+    assert!(out.contains("recorded project allowance"), "{out}");
+    assert_eq!(live_view(root.path()).allowances().len(), 1);
 }
 
 // ---------------------------------------------------------------------------

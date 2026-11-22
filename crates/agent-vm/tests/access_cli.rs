@@ -397,7 +397,7 @@ fn the_binary_loads_the_store_and_shows_a_recorded_row() {
         ),
         "{row}"
     );
-    assert!(!row.contains("no grant in this version"), "{row}");
+    assert!(!row.contains("agent-vm access allow"), "{row}");
 }
 
 /// `access` reads the store for *this* project only: a record under another
@@ -426,7 +426,14 @@ fn a_record_for_another_project_claims_nothing() {
         .lines()
         .find(|line| line.starts_with("0e7e41fb "))
         .unwrap_or_else(|| panic!("no row: {stdout}"));
-    assert!(row.contains("no grant in this version"), "{row}");
+    // Nothing recorded names it, so the row offers the one command that would:
+    // it is an ended session, so that command is `--project` only.
+    assert!(
+        row.contains(
+            "session ended; run `agent-vm access allow 0e7e41fb --session aaaaaaaa --project`"
+        ),
+        "{row}"
+    );
 }
 
 /// A damaged or untrusted store is one warning on stderr, makes no row claim,
@@ -504,7 +511,7 @@ fn damaged_and_untrusted_stores_warn_and_change_nothing() {
             .find(|line| line.starts_with("0e7e41fb "))
             .unwrap_or_else(|| panic!("{row}: no row: {stdout}"));
         assert!(
-            row_text.contains("no grant in this version"),
+            row_text.contains("agent-vm access allow 0e7e41fb --session aaaaaaaa --project"),
             "{row}: a store this build must not use changed the row: {row_text}"
         );
     }
@@ -532,7 +539,7 @@ fn home_unset_with_state_override_is_silent() {
     assert!(out.status.success(), "{stderr}");
     assert!(!stderr.contains("allowance"), "{stderr}");
     assert!(
-        String::from_utf8_lossy(&out.stdout).contains("no grant in this version"),
+        String::from_utf8_lossy(&out.stdout).contains("agent-vm access allow"),
         "{stderr}"
     );
 }
@@ -1502,4 +1509,380 @@ fn egress_inside_the_guest_prints_one_host_only_line() {
         "agent-vm access egress runs on the host: run it there, in this project's directory\n"
     );
     assert!(!state.exists(), "no state root: {}", state.display());
+}
+
+// ---------------------------------------------------------------------------
+// R10: the ACTION column is an instruction, not prose
+//
+// The literal text the column backticks is what these cases run: split on
+// whitespace (a command that needs quoting is not paste-safe), handed to the
+// binary as argv, and the *next* table has to report what the command said it
+// would do. The fixture holds a live session that shares a refusal ID with an
+// ended one, so an unqualified command has a live session to mutate by mistake.
+// ---------------------------------------------------------------------------
+
+const HOUR_MS: i64 = 3_600_000;
+
+/// One logged session with `(refusal ID, last octet of 203.0.113.x:443)` entries,
+/// each first seen a minute after the session started and last seen a minute
+/// later. `heartbeat_ms` is what separates a socketless session that is
+/// `running (no control socket)` (fresh) from one that is `ended (unclean)`.
+fn session_with(
+    id: &str,
+    started_ms: i64,
+    socket: bool,
+    ended_ms: Option<i64>,
+    heartbeat_ms: Option<i64>,
+    entries: &[(&str, u8)],
+) -> String {
+    let entries: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|(refusal, octet)| {
+            let ip = format!("203.0.113.{octet}");
+            serde_json::json!({
+                "id": refusal,
+                "key": {"kind": "network_denial", "destination": {
+                    "variant": "address", "protocol": "tcp", "ip": ip, "port": 443}},
+                "layer": "tenant", "last_site": "tcp-syn", "last_ip": ip,
+                "name": null, "last_revision": 1, "count": 1,
+                "first_ms": started_ms + 60_000, "last_ms": started_ms + 120_000
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "info": {"id": id, "pid": 1, "started_ms": started_ms, "socket": socket},
+        "rev": 2, "ended_ms": ended_ms, "heartbeat_ms": heartbeat_ms,
+        "suppressed": 0, "lost": 0, "gap": false, "entries": entries
+    })
+    .to_string()
+}
+
+/// Every `agent-vm access allow …` word the ACTION column backticks, in order.
+fn printed_commands(row: &str) -> Vec<String> {
+    row.split('`')
+        .filter(|part| part.starts_with("agent-vm access allow "))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The one row with this refusal ID whose SESSION cell is exactly `state`.
+fn row_with_state<'a>(table: &'a str, refusal: &str, state: &str) -> &'a str {
+    let needle = format!("  {state}  ");
+    let prefix = format!("{refusal} ");
+    let mut rows = table
+        .lines()
+        .filter(|line| line.starts_with(&prefix) && line.contains(&needle));
+    let row = rows
+        .next()
+        .unwrap_or_else(|| panic!("no {refusal} row in state {state}: {table}"));
+    assert!(
+        rows.next().is_none(),
+        "one {refusal} row in {state}: {table}"
+    );
+    row
+}
+
+/// Run one printed command exactly as a user pastes it: whitespace is argv.
+fn run_printed(home: &Path, state: &Path, project: &Path, command: &str) -> Output {
+    for forbidden in ['"', '\'', '`', '$'] {
+        assert!(
+            !command.contains(forbidden),
+            "a command that needs quoting is not paste-safe: {command}"
+        );
+    }
+    let argv: Vec<&str> = command.split_whitespace().collect();
+    assert_eq!(argv[0], "agent-vm", "{command}");
+    run(home, state, project, &argv[1..])
+}
+
+/// Every `grant` request the live socket received: a live mutation, and nothing
+/// else the command sends is one.
+fn grant_requests(fake: &FakeSession) -> Vec<String> {
+    fake.requests()
+        .into_iter()
+        .filter(|line| line.contains("\"op\":\"grant\""))
+        .collect()
+}
+
+/// B9/R10: every command the table prints runs, changes exactly its own row's
+/// session, and the next table reports that change.
+#[test]
+fn the_action_column_command_runs_as_printed_and_the_next_table_reports_it() {
+    let root = tempfile::tempdir().unwrap();
+    let (home, authority) = home_with_authority_dir(root.path());
+    let state = root.path().join("state");
+    let project = root.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let now = now_ms();
+    let dir = sessions_dir(&state, &project);
+
+    // `deadbeef` is in a live session and in one that ended; `abcabcab` is only
+    // in the ended one; `$(id)` is a forged record; `0badf00d` is 30 h old;
+    // `44444444` bound no socket and its feed is still beating.
+    let live = session_with(
+        "11111111",
+        now - 3 * HOUR_MS,
+        true,
+        None,
+        None,
+        &[("deadbeef", 10)],
+    );
+    let ended = session_with(
+        "22222222",
+        now - 4 * HOUR_MS,
+        true,
+        Some(now - HOUR_MS),
+        None,
+        &[("deadbeef", 10), ("abcabcab", 12), ("$(id)", 11)],
+    );
+    let stale = session_with(
+        "33333333",
+        now - 30 * HOUR_MS,
+        false,
+        None,
+        Some(now - 30 * HOUR_MS),
+        &[("0badf00d", 13)],
+    );
+    let socketless = session_with(
+        "44444444",
+        now - 2 * HOUR_MS,
+        false,
+        None,
+        Some(now - 30_000),
+        &[("44aa44aa", 14)],
+    );
+    write_session_log(&dir, &format!("{live},{ended},{stale},{socketless}"));
+    let fake = FakeSession::start(
+        &dir,
+        "11111111",
+        Replies {
+            list: format!("{{\"reply\":\"session\",\"v\":1,\"session\":{live}}}"),
+            allowances: "{\"reply\":\"allowances\",\"v\":2,\"allowances\":{\"session\":[],\
+                         \"project\":[]}}"
+                .to_owned(),
+            egress: String::new(),
+            // Every mutation is refused, so a grant that reaches this socket is
+            // visible both in `requests()` and in the CLI's own failure.
+            grant: "{\"reply\":\"error\",\"v\":2,\"code\":\"probe-refuses-grant\"}".to_owned(),
+            revoke: "{\"reply\":\"error\",\"v\":2,\"code\":\"probe-refuses-revoke\"}".to_owned(),
+            grant_records: None,
+        },
+    );
+
+    let out = run(&home, &state, &project, &["access", "--all"]);
+    let table = stdout(&out);
+    assert!(out.status.success(), "{table}{}", stderr(&out));
+    let header = table.lines().next().expect("a header line");
+    assert!(
+        header.starts_with("ID        KIND            DESTINATION"),
+        "the table keeps its first three columns: {header}"
+    );
+    assert!(
+        header.find("FIRST-SEEN") < header.find("LAST-SEEN"),
+        "FIRST-SEEN comes before LAST-SEEN: {header}"
+    );
+
+    // A live row names both scopes, each qualified by its own session.
+    let live_row = row_with_state(&table, "deadbeef", "running");
+    assert_eq!(
+        printed_commands(live_row),
+        [
+            "agent-vm access allow deadbeef --session 11111111",
+            "agent-vm access allow deadbeef --session 11111111 --project"
+        ],
+        "{live_row}"
+    );
+    // An ended row offers the record only — even though a live session carries
+    // the same ID, and an unqualified `--project` would name both.
+    let ended_row = row_with_state(&table, "deadbeef", "ended");
+    assert_eq!(
+        printed_commands(ended_row),
+        ["agent-vm access allow deadbeef --session 22222222 --project"],
+        "{ended_row}"
+    );
+    let abc_row = row_with_state(&table, "abcabcab", "ended");
+    assert_eq!(
+        printed_commands(abc_row),
+        ["agent-vm access allow abcabcab --session 22222222 --project"],
+        "{abc_row}"
+    );
+
+    // Run the two ended rows' commands as printed.
+    for row in [ended_row, abc_row] {
+        let commands = printed_commands(row);
+        assert_eq!(commands.len(), 1, "one command per ended row: {row}");
+        let command = &commands[0];
+        let out = run_printed(&home, &state, &project, command);
+        let text = stdout(&out);
+        assert!(out.status.success(), "{command}: {text}{}", stderr(&out));
+        assert!(
+            text.contains("recorded project allowance"),
+            "{command}: {text}"
+        );
+    }
+
+    // The 24 h window hides the stale session; `--session` is a question about
+    // one session, not a window over it, so its row and command are still there.
+    let window = stdout(&run(&home, &state, &project, &["access"]));
+    assert!(!window.contains("0badf00d"), "{window}");
+    assert!(
+        window.contains("--all shows the whole log (1 older)"),
+        "{window}"
+    );
+    let stale_table = stdout(&run(
+        &home,
+        &state,
+        &project,
+        &["access", "--session", "33333333"],
+    ));
+    let stale_row = row_with_state(&stale_table, "0badf00d", "ended (unclean)");
+    let stale_command = "agent-vm access allow 0badf00d --session 33333333 --project";
+    assert_eq!(printed_commands(stale_row), [stale_command], "{stale_row}");
+    let out = run_printed(&home, &state, &project, stale_command);
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    // None of those commands may have reached the live session that shares
+    // `deadbeef`: an ended row's command is a record, never a live grant.
+    assert_eq!(
+        grant_requests(&fake).len(),
+        0,
+        "an ended row's command granted live: {:?}",
+        fake.requests()
+    );
+    let records = store_records(&authority.join("allowances.json"));
+    let mut recorded: Vec<String> = records
+        .iter()
+        .filter(|record| record["project"] == digest_of(&project))
+        .map(|record| record["destination"].as_str().unwrap().to_owned())
+        .collect();
+    recorded.sort();
+    assert_eq!(
+        recorded,
+        [
+            "tcp://[203.0.113.10/32]:443",
+            "tcp://[203.0.113.12/32]:443",
+            "tcp://[203.0.113.13/32]:443"
+        ],
+        "{records:?}"
+    );
+
+    // The next table reports the effect the command promised, and stops offering
+    // a command for a row that now has its record.
+    let after = stdout(&run(&home, &state, &project, &["access", "--all"]));
+    for (refusal, octet) in [("deadbeef", 10), ("abcabcab", 12), ("0badf00d", 13)] {
+        let row = row_with_state(
+            &after,
+            refusal,
+            if refusal == "0badf00d" {
+                "ended (unclean)"
+            } else {
+                "ended"
+            },
+        );
+        assert!(
+            row.contains(&format!(
+                "recorded project allowance tcp://[203.0.113.{octet}/32]:443 ("
+            )) && row.ends_with("not confirmed for this session"),
+            "the record the command wrote is what the row reports: {row}"
+        );
+        assert!(printed_commands(row).is_empty(), "{row}");
+    }
+
+    // Both commands the live row prints run as printed, and each reaches the
+    // socket with the scope its own word advertises: `(session)` first, then
+    // `--project` — the exact pair pinned above, so a row that advertised one
+    // scope and sent the other would fail here.
+    let live_commands = printed_commands(live_row);
+    assert_eq!(live_commands.len(), 2, "{live_row}");
+    for command in &live_commands {
+        let out = run_printed(&home, &state, &project, command);
+        assert_eq!(out.status.code(), Some(1), "{command}: {}", stdout(&out));
+        assert!(
+            stderr(&out).contains("nothing was recorded"),
+            "{command}: {}",
+            stderr(&out)
+        );
+    }
+    let grants = grant_requests(&fake);
+    assert_eq!(grants.len(), 2, "{grants:?}");
+    for (grant, scope) in grants.iter().zip(["session", "project"]) {
+        assert!(
+            grant.contains("\"destination\":\"tcp://[203.0.113.10/32]:443\""),
+            "the row's own destination: {grant}"
+        );
+        assert!(
+            grant.contains(&format!("\"scope\":\"{scope}\"")),
+            "{scope} grant: {grant}"
+        );
+    }
+    assert_eq!(
+        store_records(&authority.join("allowances.json")).len(),
+        records.len(),
+        "a refused live grant wrote a record"
+    );
+
+    // A log-controlled ID never becomes a command, and never reaches a message
+    // this command prints.
+    let forged_row = table
+        .lines()
+        .find(|line| line.starts_with("$(id) "))
+        .unwrap_or_else(|| panic!("no forged row: {table}"));
+    assert!(printed_commands(forged_row).is_empty(), "{forged_row}");
+    assert!(
+        forged_row.ends_with("cannot build allow command: malformed refusal ID"),
+        "{forged_row}"
+    );
+    let before = authority_snapshot::take(&authority);
+    let out = run(
+        &home,
+        &state,
+        &project,
+        &["access", "allow", "$(id)", "--project"],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(stderr(&out), "`<ID>` takes an 8-hex refusal ID\n");
+    assert!(!stderr(&out).contains("$(id)"), "the ID is echoed");
+    assert_eq!(
+        authority_snapshot::take(&authority),
+        before,
+        "it wrote the store"
+    );
+
+    // A session that cannot confirm offers no command, and the command the row
+    // would have offered in a live session is refused in the same words.
+    let silent_row = row_with_state(&table, "44aa44aa", "running (no control socket)");
+    assert!(printed_commands(silent_row).is_empty(), "{silent_row}");
+    assert!(
+        silent_row.ends_with("session cannot confirm live change; relaunch with --allow-egress"),
+        "{silent_row}"
+    );
+    assert_eq!(
+        authority_snapshot::take(&authority),
+        before,
+        "a read wrote the store"
+    );
+    let out = run(
+        &home,
+        &state,
+        &project,
+        &[
+            "access",
+            "allow",
+            "44aa44aa",
+            "--session",
+            "44444444",
+            "--project",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains("cannot confirm a live change; nothing was recorded"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(
+        authority_snapshot::take(&authority),
+        before,
+        "it wrote the store"
+    );
 }

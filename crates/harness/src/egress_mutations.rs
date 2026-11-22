@@ -3611,14 +3611,10 @@ fn ledger() -> Vec<Row> {
         Row {
             name: r#"sibling-label-hardcoded"#,
             path: r#"crates/agent-vm/src/access_cmd.rs"#,
-            old: r#"    let siblings: Vec<String> = sessions
-        .iter()
-        .filter(|row| target.is_none_or(|target| row.snapshot.info.id != *target))
-        .map(|row| format!("{} ({})", escape(row.snapshot.info.id.as_str()), row.label))"#,
-            new: r#"    let siblings: Vec<String> = sessions
-        .iter()
-        .filter(|row| target.is_none_or(|target| row.snapshot.info.id != *target))
-        .map(|row| format!("{} ({})", escape(row.snapshot.info.id.as_str()), "running"))"#,
+            old: r#"        escape(row.snapshot.info.id.as_str()),
+        row.state.label()"#,
+            new: r#"        escape(row.snapshot.info.id.as_str()),
+        "running""#,
             run: Run::AgentBin(
                 r#"access_cmd::tests::siblings_are_named_in_every_state_and_offline_revoke_names_them"#,
             ),

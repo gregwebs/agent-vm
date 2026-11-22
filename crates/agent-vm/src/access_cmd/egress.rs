@@ -4,7 +4,10 @@
 
 use anyhow::{Context as _, Result};
 
-use super::{EgressArgs, Row, escape, is_active_label, socket_of, write_columns};
+use super::{
+    EgressArgs, Row, SessionState, escape, parse_session_flag, socket_of, unknown_session,
+    write_columns,
+};
 use crate::effective_egress::EffectiveEgress;
 use crate::refusal::SessionId;
 use crate::refusal::log::SessionsDir;
@@ -34,12 +37,12 @@ pub(super) fn print_host_only(err: &mut impl std::io::Write) -> Result<i32> {
 /// unresponsive socket the log has no record of yet.
 struct Candidate {
     id: SessionId,
-    label: &'static str,
+    state: SessionState,
 }
 
 impl Candidate {
     fn is_active(&self) -> bool {
-        is_active_label(self.label)
+        self.state.is_active()
     }
 }
 
@@ -51,14 +54,14 @@ fn candidates(sessions: &[Row], discovery: &Discovery) -> Vec<Candidate> {
         .iter()
         .map(|row| Candidate {
             id: row.snapshot.info.id.clone(),
-            label: row.label,
+            state: row.state,
         })
         .collect();
     for id in &discovery.unresponsive {
         if !candidates.iter().any(|candidate| &candidate.id == id) {
             candidates.push(Candidate {
                 id: id.clone(),
-                label: "not responding",
+                state: SessionState::NotResponding,
             });
         }
     }
@@ -74,28 +77,22 @@ pub(super) async fn run_egress(
     err: &mut impl std::io::Write,
 ) -> Result<i32> {
     let candidates = candidates(sessions, discovery);
-    let selected = match args.session.as_deref() {
-        Some(text) => {
-            let Some(id) = SessionId::parse(text) else {
-                writeln!(err, "`--session` takes an 8-hex session ID")
-                    .context("writing the argument error")?;
-                return Ok(1);
-            };
-            let Some(candidate) = candidates.iter().find(|candidate| candidate.id == id) else {
-                writeln!(
-                    err,
-                    "no session {} in this project's running sessions or refusal log",
-                    escape(id.as_str())
-                )
-                .context("writing the unknown-session message")?;
-                return Ok(1);
+    let wanted = match parse_session_flag(args.session.as_deref(), err)? {
+        Ok(wanted) => wanted,
+        Err(code) => return Ok(code),
+    };
+    let selected = match &wanted {
+        Some(wanted) => {
+            let Some(candidate) = candidates.iter().find(|candidate| candidate.id == *wanted)
+            else {
+                return unknown_session(err, wanted);
             };
             if !candidate.is_active() {
                 writeln!(
                     err,
                     "session {} ({}) is not running; effective egress exists only while a session runs",
-                    escape(id.as_str()),
-                    candidate.label
+                    escape(wanted.as_str()),
+                    candidate.state.label()
                 )
                 .context("writing the not-running message")?;
                 return Ok(1);
@@ -117,7 +114,11 @@ pub(super) async fn run_egress(
                     let named: Vec<String> = active
                         .iter()
                         .map(|candidate| {
-                            format!("{} ({})", escape(candidate.id.as_str()), candidate.label)
+                            format!(
+                                "{} ({})",
+                                escape(candidate.id.as_str()),
+                                candidate.state.label()
+                            )
                         })
                         .collect();
                     writeln!(
@@ -134,8 +135,8 @@ pub(super) async fn run_egress(
 
     // One reason, so the message's shape cannot vary by which way the answer
     // was unavailable.
-    let reason = match selected.label {
-        "running" => match socket_of(dir, &selected.id) {
+    let reason = match selected.state {
+        SessionState::Running => match socket_of(dir, &selected.id) {
             Some(path) => match crate::session_control::egress(&path).await {
                 Ok(EgressAnswer::Egress(egress)) => {
                     for line in render(&selected.id, &egress)? {
@@ -155,20 +156,21 @@ pub(super) async fn run_egress(
             },
             None => "it has no control socket".to_owned(),
         },
-        "running (no control socket)" => "it has no control socket".to_owned(),
-        "not responding" => "it is not responding".to_owned(),
-        // `access` lists no other active label, so reaching this is a bug in
-        // `is_active_label` or in `label()`, not a session state.
-        other => {
-            debug_assert!(false, "an active label with no message: {other}");
-            "it is not responding".to_owned()
+        SessionState::RunningNoSocket => "it has no control socket".to_owned(),
+        SessionState::NotResponding => "it is not responding".to_owned(),
+        // Only an active state is selected, so an ended one is unreachable:
+        // naming the two here keeps the match exhaustive, so a new state has to
+        // say what its message is instead of inheriting a debug assertion.
+        SessionState::Ended | SessionState::EndedUnclean => {
+            debug_assert!(false, "an ended session has no live egress to ask for");
+            "it is not running".to_owned()
         }
     };
     writeln!(
         err,
         "effective egress is not available for session {} ({}): {reason}",
         escape(selected.id.as_str()),
-        selected.label
+        selected.state.label()
     )
     .context("writing the not-available message")?;
     Ok(1)

@@ -6,14 +6,17 @@
 //! because the moment a user needs it is the moment something else is broken
 //! (AC13).
 //!
-//! Slice 1 grants nothing. Every row says why no action exists yet, rather than
-//! offering one that does not work.
+//! A row's ACTION is the command that would change that row's own session's
+//! decision, or the allowance that already names its destination, or why no
+//! command can. It never names a different session: a refusal ID is unique only
+//! within its session (ADR-0064), so every command carries `--session` and an ID
+//! that is ambiguous across sessions is refused rather than guessed.
 
 use anyhow::{Context as _, Result};
 use clap::Args as ClapArgs;
 
 use crate::refusal::log::{HEARTBEAT_STALE_MS, SessionsDir};
-use crate::refusal::{RefusalEntry, SessionId, SessionSnapshot};
+use crate::refusal::{RefusalEntry, RefusalId, SessionId, SessionSnapshot};
 use crate::session::ProjectSession;
 
 /// The default window: an entry last seen within this long is shown.
@@ -138,6 +141,41 @@ pub(crate) fn run(args: Args) -> Result<i32> {
     ))
 }
 
+/// A subcommand's `--session`, parsed.
+///
+/// `Ok(Ok(None))` is "no `--session`". A value that is not an ID writes the
+/// usage line and answers `Ok(Err(1))`, which the caller returns as its status:
+/// the verbs that take a `--session` say the same thing about a bad one, in the
+/// same words.
+fn parse_session_flag(
+    text: Option<&str>,
+    err: &mut impl std::io::Write,
+) -> Result<std::result::Result<Option<SessionId>, i32>> {
+    let Some(text) = text else {
+        return Ok(Ok(None));
+    };
+    match SessionId::parse(text) {
+        Some(id) => Ok(Ok(Some(id))),
+        None => {
+            writeln!(err, "`--session` takes an 8-hex session ID")
+                .context("writing the argument error")?;
+            Ok(Err(1))
+        }
+    }
+}
+
+/// The one line for a `--session` (or a table lookup) that names no session in
+/// this project, and the status that goes with it.
+fn unknown_session(err: &mut impl std::io::Write, id: &SessionId) -> Result<i32> {
+    writeln!(
+        err,
+        "no session {} in this project's running sessions or refusal log",
+        escape(id.as_str())
+    )
+    .context("writing the unknown-session message")?;
+    Ok(1)
+}
+
 /// The command's whole decision, with its clock and its sinks injected.
 pub(crate) async fn run_in(
     dir: Option<&SessionsDir>,
@@ -148,6 +186,10 @@ pub(crate) async fn run_in(
     out: &mut impl std::io::Write,
     err: &mut impl std::io::Write,
 ) -> Result<i32> {
+    // The report's own `--session` is an argument error, not a usage line: this
+    // command has no subcommand to point at, so it fails like any other bad
+    // argument (`run_allow`, `run_allowances` and `egress` use the shared helper
+    // that writes a line instead).
     let wanted = match args.session.as_deref() {
         Some(text) => Some(
             SessionId::parse(text)
@@ -199,7 +241,7 @@ pub(crate) async fn run_in(
             continue;
         }
         seen.push(id.clone());
-        let label = label(
+        let state = session_state(
             snapshot,
             discovery
                 .live
@@ -210,7 +252,7 @@ pub(crate) async fn run_in(
         );
         sessions.push(Row {
             snapshot: snapshot.clone(),
-            label,
+            state,
         });
     }
     match &args.command {
@@ -230,13 +272,7 @@ pub(crate) async fn run_in(
     }
     if let Some(wanted) = &wanted {
         if !sessions.iter().any(|row| row.snapshot.info.id == *wanted) {
-            writeln!(
-                err,
-                "no session {} in this project's running sessions or refusal log",
-                wanted.as_str()
-            )
-            .context("writing the unknown-session message")?;
-            return Ok(1);
+            return unknown_session(err, wanted);
         }
         // A named session is shown whole: `--session` is a question about one
         // session, not a window over it.
@@ -287,47 +323,104 @@ pub(crate) async fn run_in(
     Ok(0)
 }
 
-/// One session's row group: the snapshot and the label its entries carry.
+/// One session's row group: the snapshot and the state its entries carry.
 #[derive(Clone)]
 struct Row {
     snapshot: SessionSnapshot,
-    label: &'static str,
+    state: SessionState,
+}
+
+/// §5's session column, as a type.
+///
+/// The state owns its own rules — what `allow` may offer it ([`AllowOffer`]),
+/// whether it may still be running — so a call site asks instead of re-deriving
+/// them. Every match that *decides* from a state names all its variants: a state
+/// added here is a compile error there, not a string that silently falls through
+/// to the wrong answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionState {
+    Running,
+    NotResponding,
+    RunningNoSocket,
+    Ended,
+    EndedUnclean,
+}
+
+impl SessionState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::NotResponding => "not responding",
+            Self::RunningNoSocket => "running (no control socket)",
+            Self::Ended => "ended",
+            Self::EndedUnclean => "ended (unclean)",
+        }
+    }
+
+    /// Whether the session may still be running: the states `revoke` and
+    /// `egress` treat as targets. Not the same question as whether it can be
+    /// asked — [`SessionState::allow_offer`] answers that one.
+    fn is_active(self) -> bool {
+        matches!(
+            self,
+            Self::Running | Self::NotResponding | Self::RunningNoSocket
+        )
+    }
+
+    /// What `access allow` can offer a row in this state: which scopes a grant
+    /// can take.
+    ///
+    /// This is the one copy of the rule. The ACTION cell renders its command from
+    /// it and `run_allow` grants only a scope it contains, so the command the
+    /// table prints is the command that runs. Exhaustive on purpose: a new state
+    /// has to say what a grant on it would mean.
+    fn allow_offer(self) -> AllowOffer {
+        match self {
+            Self::Running => AllowOffer::SessionOrProject,
+            Self::Ended | Self::EndedUnclean => AllowOffer::ProjectOnly,
+            Self::NotResponding | Self::RunningNoSocket => AllowOffer::None,
+        }
+    }
+}
+
+/// The scopes `access allow` can offer one row, as [`SessionState::allow_offer`]
+/// answers it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AllowOffer {
+    /// A live session that answers: a session grant, or a project record applied
+    /// now and kept for the next launch.
+    SessionOrProject,
+    /// A finished session: only `--project`, which writes the record the next
+    /// launch reads and can never reach a live socket.
+    ProjectOnly,
+    /// A live session that cannot confirm a live change: nothing.
+    None,
 }
 
 /// §5's session column, one rule.
-fn label(
+fn session_state(
     snapshot: &SessionSnapshot,
     answered: bool,
     unresponsive: bool,
     now_ms: i64,
-) -> &'static str {
+) -> SessionState {
     if answered {
-        return "running";
+        return SessionState::Running;
     }
     if unresponsive {
-        return "not responding";
+        return SessionState::NotResponding;
     }
     if snapshot.ended_ms.is_some() {
-        return "ended";
+        return SessionState::Ended;
     }
     let fresh = snapshot
         .heartbeat_ms
         .is_some_and(|beat| now_ms.saturating_sub(beat) <= HEARTBEAT_STALE_MS);
     if !snapshot.info.socket && fresh {
         // Bound no socket, and the feed is still beating: the session is alive.
-        return "running (no control socket)";
+        return SessionState::RunningNoSocket;
     }
-    "ended (unclean)"
-}
-
-/// The labels `access` treats as an active session: one that can be revoked, or
-/// whose effective egress can be asked for. Spelled once, because two commands
-/// must agree on it.
-fn is_active_label(label: &str) -> bool {
-    matches!(
-        label,
-        "running" | "not responding" | "running (no control socket)"
-    )
+    SessionState::EndedUnclean
 }
 
 /// Rows padded to the widest cell, two spaces apart, the last column unpadded.
@@ -380,7 +473,7 @@ fn print_table(
     allowances: &crate::allowances::ProjectView,
     live: &std::collections::BTreeMap<String, crate::allowances::SessionAllowancesSnapshot>,
 ) -> Result<()> {
-    let rows: Vec<[String; 7]> = entries
+    let rows: Vec<[String; 8]> = entries
         .iter()
         .map(|(row, entry)| {
             [
@@ -388,9 +481,16 @@ fn print_table(
                 entry.key.kind.label().to_owned(),
                 entry.destination_cell(),
                 entry.count.to_string(),
-                last_seen(entry.last_ms),
-                row.label.to_owned(),
-                action(entry, allowances, live.get(row.snapshot.info.id.as_str())),
+                seen_at(entry.first_ms),
+                seen_at(entry.last_ms),
+                row.state.label().to_owned(),
+                action(
+                    entry,
+                    &row.snapshot.info.id,
+                    row.state,
+                    allowances,
+                    live.get(row.snapshot.info.id.as_str()),
+                ),
             ]
         })
         .collect();
@@ -399,6 +499,7 @@ fn print_table(
         "KIND",
         "DESTINATION",
         "COUNT",
+        "FIRST-SEEN",
         "LAST-SEEN",
         "SESSION",
         "ACTION",
@@ -412,8 +513,9 @@ fn escape(text: &str) -> String {
     crate::config::escape_str(text)
 }
 
-/// UTC, minute precision: a refusal's last sighting does not need seconds.
-fn last_seen(ms: i64) -> String {
+/// UTC, minute precision: a refusal's sightings and a record's timestamp do not
+/// need seconds.
+fn seen_at(ms: i64) -> String {
     crate::allowances::recorded_at(ms)
 }
 
@@ -430,14 +532,17 @@ fn live_status(item: &crate::allowances::WireAllowance) -> String {
     }
 }
 
-/// §5's ACTION column: why nothing can be done, or which allowance names this
-/// destination and whether this session confirmed it.
+/// §5's ACTION column: the command that would change this row's own session's
+/// decision, or the allowance that already names its destination, or why nothing
+/// can be done.
 ///
 /// "Recorded" is a fact about a file; "applied" is a fact about a runtime. The
 /// live allowance snapshot is the only evidence for the second, so a row with no
 /// snapshot never claims it (ADR-0065 P5).
 fn action(
     entry: &RefusalEntry,
+    session: &SessionId,
+    state: SessionState,
     allowances: &crate::allowances::ProjectView,
     live: Option<&crate::allowances::SessionAllowancesSnapshot>,
 ) -> String {
@@ -456,7 +561,7 @@ fn action(
                 AllowanceScope::Project => "project",
             },
             escape(&destination.to_string()),
-            last_seen(recorded_ms),
+            seen_at(recorded_ms),
         ),
         // A `--project` grant the runtime applied but the store could not record:
         // it is in force, and the row must never say it was recorded (Ruling 2).
@@ -475,9 +580,52 @@ fn action(
         Some(Coverage::Recorded(record)) => format!(
             "recorded project allowance {} ({}); not confirmed for this session",
             escape(&record.destination().to_string()),
-            last_seen(record.recorded_ms())
+            seen_at(record.recorded_ms())
         ),
-        None => entry.reason(),
+        None => uncovered_action(entry, session, state),
+    }
+}
+
+/// Why no allowance covers this row, and which command would create one.
+///
+/// The command names a session because a refusal ID is unique only within one
+/// (ADR-0064): the same 8 hex can appear in a live session and in the log, and an
+/// unqualified ID would name both. Which scopes the row may be offered is
+/// [`SessionState::allow_offer`]'s answer, and whether a refusal can become an
+/// allowance at all is `grantable_destination`'s: both are the rules `run_allow`
+/// applies, asked rather than copied, so this cell cannot print a command the
+/// command would refuse.
+///
+/// An ID that is not the 8-lowercase-hex spelling the feed assigns is never
+/// interpolated into a command ([`RefusalId`]). The documented upgrade path admits
+/// launchers that leave `.sessions` writable to their guests, so a forged record
+/// must not be able to write a command word (AC5).
+fn uncovered_action(entry: &RefusalEntry, session: &SessionId, state: SessionState) -> String {
+    match crate::allowances::grantable_destination(entry) {
+        Ok(_) => {}
+        // A platform rule or another kind of refusal: the refusal's own sentence
+        // names the boundary that holds it.
+        Err(crate::allowances::CannotAllow::NotNetworkDenial(reason)) => return reason,
+        // A network denial no allowance can name — plain HTTP to a hostname, a
+        // site this release will not turn into a rule — says so instead of
+        // printing a command `access allow` would reject.
+        Err(reason) => return reason.line(),
+    }
+    let Some(id) = RefusalId::parse(&entry.id) else {
+        return "cannot build allow command: malformed refusal ID".to_owned();
+    };
+    let sid = session.as_str();
+    match state.allow_offer() {
+        AllowOffer::SessionOrProject => format!(
+            "run `agent-vm access allow {id} --session {sid}` (session) or `agent-vm access \
+             allow {id} --session {sid} --project`"
+        ),
+        AllowOffer::ProjectOnly => {
+            format!("session ended; run `agent-vm access allow {id} --session {sid} --project`")
+        }
+        AllowOffer::None => {
+            "session cannot confirm live change; relaunch with --allow-egress".to_owned()
+        }
     }
 }
 
@@ -562,6 +710,26 @@ fn print_footers(
 // `access allow`, `access allowances`, `access revoke` (PR 2)
 // ---------------------------------------------------------------------------
 
+/// `SID (state)`, the one way a session is named inside a sentence.
+fn named_session(row: &Row) -> String {
+    format!(
+        "{} ({})",
+        escape(row.snapshot.info.id.as_str()),
+        row.state.label()
+    )
+}
+
+/// Every session in the project that carries refusal `id`, as [`named_session`]
+/// cells: an ID is unique within a session, so this is the list `allow` has to
+/// choose from.
+fn sessions_carrying(sessions: &[Row], id: &str) -> Vec<String> {
+    sessions
+        .iter()
+        .filter(|row| row.snapshot.entries.iter().any(|entry| entry.id == id))
+        .map(named_session)
+        .collect()
+}
+
 /// One sibling line: every other session in the project, with its state, and the
 /// fact that a live change is target-only (D2, AC8).
 fn sibling_line(
@@ -573,7 +741,7 @@ fn sibling_line(
     let siblings: Vec<String> = sessions
         .iter()
         .filter(|row| target.is_none_or(|target| row.snapshot.info.id != *target))
-        .map(|row| format!("{} ({})", escape(row.snapshot.info.id.as_str()), row.label))
+        .map(named_session)
         .collect();
     if siblings.is_empty() {
         return None;
@@ -614,8 +782,8 @@ fn socket_of(dir: Option<&SessionsDir>, id: &SessionId) -> Option<std::path::Pat
     dir.map(|dir| dir.socket_path(id))
 }
 
-fn describe_session(id: &SessionId, label: &str) -> String {
-    format!("session {} ({label})", escape(id.as_str()))
+fn describe_session(id: &SessionId, state: SessionState) -> String {
+    format!("session {} ({})", escape(id.as_str()), state.label())
 }
 
 /// `(policy revision N)`, or nothing at all when no policy change was made.
@@ -628,7 +796,7 @@ fn revision_clause(revision: Option<u64>) -> String {
         .unwrap_or_default()
 }
 
-/// `agent-vm access allow <ID> [--project]`.
+/// `agent-vm access allow <ID> [--project] [--session <SID>]`.
 async fn run_allow(
     dir: Option<&SessionsDir>,
     project: &crate::project::ProjectDir,
@@ -638,44 +806,116 @@ async fn run_allow(
     out: &mut impl std::io::Write,
     err: &mut impl std::io::Write,
 ) -> Result<i32> {
-    // Every entry, no window: the moment a user needs to allow something is
-    // exactly the moment its refusal may be older than 24 hours (m2).
-    let found = sessions.iter().find_map(|row| {
-        row.snapshot
-            .entries
-            .iter()
-            .find(|entry| entry.id == args.id)
-            .map(|entry| (row.clone(), entry.clone()))
-    });
-    let Some((row, entry)) = found else {
-        writeln!(
-            err,
-            "no refusal {} in this project's running sessions or refusal log",
-            escape(&args.id)
-        )
-        .context("writing the unknown-refusal message")?;
+    let wanted = match parse_session_flag(args.session.as_deref(), err)? {
+        Ok(wanted) => wanted,
+        Err(code) => return Ok(code),
+    };
+    // The ID is a value this command acts on, so it is parsed once, here: the
+    // same spelling that let `access` print it as a command word. A log may hold
+    // anything, and a value that is not a refusal ID names no entry.
+    let Some(refusal_id) = RefusalId::parse(&args.id) else {
+        writeln!(err, "`<ID>` takes an 8-hex refusal ID").context("writing the argument error")?;
         return Ok(1);
     };
-    if let Some(wanted) = &args.session
-        && wanted != row.snapshot.info.id.as_str()
-    {
-        writeln!(
-            err,
-            "refusal {} belongs to {}, not to --session {}",
-            escape(&args.id),
-            escape(row.snapshot.info.id.as_str()),
-            escape(wanted)
-        )
-        .context("writing the session mismatch")?;
-        return Ok(1);
+    // `--session` selects the session *before* the ID is looked up. A refusal ID
+    // is unique only within its session (ADR-0064), so a live session and an
+    // ended one can share one; looking the ID up first let `--session` name a
+    // session the mutation then ignored, and let an unqualified ID silently
+    // mutate whichever session happened to be listed first.
+    let candidates: Vec<&Row> = match &wanted {
+        Some(wanted) => {
+            let named: Vec<&Row> = sessions
+                .iter()
+                .filter(|row| row.snapshot.info.id == *wanted)
+                .collect();
+            if named.is_empty() {
+                return unknown_session(err, wanted);
+            }
+            named
+        }
+        None => sessions.iter().collect(),
+    };
+    // Every entry, no window: the moment a user needs to allow something is
+    // exactly the moment its refusal may be older than 24 hours (m2).
+    let mut found: Vec<(&Row, &RefusalEntry)> = Vec::new();
+    for row in &candidates {
+        for entry in &row.snapshot.entries {
+            if entry.id == refusal_id.as_str() {
+                found.push((row, entry));
+            }
+        }
     }
-    let destination = match crate::allowances::grantable_destination(&entry) {
+    let (row, entry) = match found.len() {
+        0 => {
+            // A qualified ID that is not in the named session still says where it
+            // is when the log knows it: that is the answer the ID-only lookup
+            // gave, and the user who copied an ID from another session needs it.
+            let owners = sessions_carrying(sessions, refusal_id.as_str());
+            match &wanted {
+                Some(wanted) if !owners.is_empty() => writeln!(
+                    err,
+                    "refusal {} is not in session {}; it is in {}",
+                    refusal_id,
+                    escape(wanted.as_str()),
+                    owners.join(", ")
+                ),
+                _ => writeln!(
+                    err,
+                    "no refusal {} in this project's running sessions or refusal log",
+                    refusal_id
+                ),
+            }
+            .context("writing the unknown-refusal message")?;
+            return Ok(1);
+        }
+        1 => found[0],
+        _ => {
+            // Nothing is mutated: an ID that names more than one entry names
+            // none of them, and guessing the first is how a live session got a
+            // grant meant for a finished one. The sessions that carry it are
+            // taken from the entries that matched, never from the whole project,
+            // so a user who already named a session can only ever see it alone
+            // here and is never told to name one.
+            let mut owners: Vec<&Row> = Vec::new();
+            for (row, _) in &found {
+                if !owners
+                    .iter()
+                    .any(|owner| owner.snapshot.info.id == row.snapshot.info.id)
+                {
+                    owners.push(row);
+                }
+            }
+            let named: Vec<String> = owners.iter().map(|row| named_session(row)).collect();
+            if owners.len() > 1 {
+                writeln!(
+                    err,
+                    "refusal {} is in more than one session: {}; name one with --session <ID>",
+                    refusal_id,
+                    named.join(", ")
+                )
+            } else {
+                // One log recording an ID twice reaches this even when
+                // `--session` named it: a session's own assignment never repeats
+                // an ID, and no flag can choose between two of its entries.
+                writeln!(
+                    err,
+                    "refusal {} appears in more than one entry of {}; the refusal log is \
+                     damaged",
+                    refusal_id,
+                    named.join(", ")
+                )
+            }
+            .context("writing the ambiguous-refusal message")?;
+            return Ok(1);
+        }
+    };
+    let destination = match crate::allowances::grantable_destination(entry) {
         Ok(destination) => destination,
         Err(reason) => {
             writeln!(
                 err,
                 "cannot allow {}: {}",
-                escape(&args.id),
+                refusal_id,
                 // `reason()` already escaped every untrusted part it names, and
                 // `line()` only guarantees one line (#598). Escaping the composed
                 // line again doubles each backslash, so the same refusal would
@@ -696,15 +936,24 @@ async fn run_allow(
     let now_ms = crate::refusal::feed::now_ms();
     let spelled = destination.to_string();
 
-    let code = match row.label {
-        "running" => match socket_of(dir, &id) {
+    // Which scopes this row's state offers is `SessionState::allow_offer`'s
+    // answer, and this match is the whole of what `allow` accepts: the grant
+    // arms are exactly the scopes the offer contains, and a scope outside it
+    // says why in the row's own state's words.
+    let code = match (row.state.allow_offer(), scope) {
+        // A live session that answers: the runtime applies it now, and a
+        // `--project` grant writes the record as well.
+        (
+            AllowOffer::SessionOrProject,
+            crate::allowances::GrantScope::Session | crate::allowances::GrantScope::Project,
+        ) => match socket_of(dir, &id) {
             Some(path) => match crate::session_control::grant(&path, Some(&spelled), scope).await {
                 Ok(result) => report_grant(out, err, &id, scope, result)?,
                 Err(error) => {
                     writeln!(
                         err,
                         "could not reach {}: {}; nothing was recorded",
-                        describe_session(&id, row.label),
+                        describe_session(&id, row.state),
                         escape(&format!("{error:#}"))
                     )
                     .context("writing the socket failure")?;
@@ -715,54 +964,60 @@ async fn run_allow(
                 writeln!(
                     err,
                     "{} has no control socket; nothing was recorded",
-                    describe_session(&id, row.label)
+                    describe_session(&id, row.state)
                 )
                 .context("writing the no-socket message")?;
                 1
             }
         },
-        "ended" | "ended (unclean)" => {
-            if scope == crate::allowances::GrantScope::Session {
-                writeln!(
-                    err,
-                    "{} has ended, so a session-only allowance cannot be recorded; \
-                     relaunch it and allow the destination again",
-                    describe_session(&id, row.label)
-                )
-                .context("writing the ended-session refusal")?;
-                1
-            } else {
-                match allowances.record_async(project, &destination, now_ms).await {
-                    Ok(record) => {
-                        writeln!(
-                            out,
-                            "recorded project allowance {} ({}); the next launch of this project applies it",
-                            escape(&record.destination().to_string()),
-                            last_seen(record.recorded_ms())
-                        )
-                        .context("writing the recorded allowance")?;
-                        0
-                    }
-                    Err(error) => {
-                        writeln!(
-                            err,
-                            "could not record the project allowance: {}",
-                            escape(&error.to_string())
-                        )
-                        .context("writing the store failure")?;
-                        1
-                    }
+        // A finished session: only the record, which the next launch reads. It
+        // takes no socket call, so an ended row's command cannot mutate a live
+        // session.
+        (AllowOffer::ProjectOnly, crate::allowances::GrantScope::Project) => {
+            match allowances.record_async(project, &destination, now_ms).await {
+                Ok(record) => {
+                    writeln!(
+                        out,
+                        "recorded project allowance {} ({}); the next launch of this project applies it",
+                        escape(&record.destination().to_string()),
+                        seen_at(record.recorded_ms())
+                    )
+                    .context("writing the recorded allowance")?;
+                    0
+                }
+                Err(error) => {
+                    writeln!(
+                        err,
+                        "could not record the project allowance: {}",
+                        escape(&error.to_string())
+                    )
+                    .context("writing the store failure")?;
+                    1
                 }
             }
         }
-        _ => {
+        // The scopes no offer contains.
+        (AllowOffer::ProjectOnly, crate::allowances::GrantScope::Session) => {
+            writeln!(
+                err,
+                "{} has ended, so a session-only allowance cannot be recorded; \
+                 relaunch it and allow the destination again",
+                describe_session(&id, row.state)
+            )
+            .context("writing the ended-session refusal")?;
+            1
+        }
+        (
+            AllowOffer::None,
+            crate::allowances::GrantScope::Session | crate::allowances::GrantScope::Project,
+        ) => {
             // `not responding`, `running (no control socket)`: a live session
             // that cannot confirm must not be reported as if it had.
             writeln!(
                 err,
                 "{} cannot confirm a live change; nothing was recorded. Relaunch the session \
                  and allow the destination again",
-                describe_session(&id, row.label)
+                describe_session(&id, row.state)
             )
             .context("writing the unresponsive-session message")?;
             1
@@ -793,7 +1048,7 @@ fn report_grant(
     scope: crate::allowances::GrantScope,
     result: crate::allowances::GrantResult,
 ) -> Result<i32> {
-    let report = result.report(&describe_session(id, "running"), scope);
+    let report = result.report(&describe_session(id, SessionState::Running), scope);
     match report.stream {
         crate::allowances::ReportStream::Out => {
             writeln!(out, "{}", report.text).context("writing the grant reply")?
@@ -816,15 +1071,12 @@ fn run_allowances(
     err: &mut impl std::io::Write,
 ) -> Result<i32> {
     let live = &discovery.live_allowances;
-    let wanted = args.session.as_deref();
     // A session with an ID this command cannot parse is a real error.
-    if let Some(text) = wanted
-        && SessionId::parse(text).is_none()
-    {
-        writeln!(err, "`--session` takes an 8-hex session ID")
-            .context("writing the argument error")?;
-        return Ok(1);
-    }
+    let wanted = match parse_session_flag(args.session.as_deref(), err)? {
+        Ok(wanted) => wanted,
+        Err(code) => return Ok(code),
+    };
+    let wanted = wanted.as_ref().map(SessionId::as_str);
     // One stderr line per session that cannot answer, so a missing row is
     // explained rather than silently absent (AC9).
     for id in &discovery.unresponsive {
@@ -836,7 +1088,7 @@ fn run_allowances(
         .context("writing the unresponsive warning")?;
     }
     for row in sessions {
-        if row.label == "running (no control socket)" {
+        if row.state == SessionState::RunningNoSocket {
             writeln!(
                 err,
                 "warning: session {} has no control socket; its live allowances are not shown",
@@ -866,7 +1118,7 @@ fn run_allowances(
         .map(|id| (id.as_str().to_owned(), "not responding"))
         .collect();
     for row in sessions {
-        if row.label == "running (no control socket)" {
+        if row.state == SessionState::RunningNoSocket {
             silent.push((
                 row.snapshot.info.id.as_str().to_owned(),
                 "has no control socket",
@@ -882,7 +1134,7 @@ fn run_allowances(
             rows.push([
                 "project".to_owned(),
                 escape(&destination),
-                last_seen(record.recorded_ms()),
+                seen_at(record.recorded_ms()),
                 "-".to_owned(),
                 "not in force until relaunch".to_owned(),
             ]);
@@ -900,7 +1152,7 @@ fn run_allowances(
             rows.push([
                 "project".to_owned(),
                 escape(&destination),
-                last_seen(record.recorded_ms()),
+                seen_at(record.recorded_ms()),
                 escape(id),
                 status,
             ]);
@@ -925,7 +1177,7 @@ fn run_allowances(
             rows.push([
                 "project".to_owned(),
                 escape(&item.destination),
-                last_seen(item.granted_ms),
+                seen_at(item.granted_ms),
                 escape(id),
                 status,
             ]);
@@ -940,7 +1192,7 @@ fn run_allowances(
             rows.push([
                 "session".to_owned(),
                 escape(&item.destination),
-                last_seen(item.granted_ms),
+                seen_at(item.granted_ms),
                 escape(id),
                 status,
             ]);
@@ -955,7 +1207,7 @@ fn run_allowances(
             rows.push([
                 "project".to_owned(),
                 escape(&record.destination().to_string()),
-                last_seen(record.recorded_ms()),
+                seen_at(record.recorded_ms()),
                 escape(id),
                 format!("not shown: session {id} {state}"),
             ]);
@@ -1027,7 +1279,7 @@ async fn run_revoke(
     // The target: the named session, or the one active session, or none.
     let active: Vec<&Row> = sessions
         .iter()
-        .filter(|row| is_active_label(row.label))
+        .filter(|row| row.state.is_active())
         .collect();
     // R11: the sibling line names every other session *before* the change, and it
     // does not depend on which session is the target — so it is printed before
@@ -1059,10 +1311,7 @@ async fn run_revoke(
             }
         },
         None if active.len() > 1 => {
-            let named: Vec<String> = active
-                .iter()
-                .map(|row| format!("{} ({})", escape(row.snapshot.info.id.as_str()), row.label))
-                .collect();
+            let named: Vec<String> = active.iter().map(|row| named_session(row)).collect();
             print_siblings_before(out, sessions, None)?;
             writeln!(
                 err,
@@ -1114,8 +1363,8 @@ async fn run_revoke(
     };
     let id = target.snapshot.info.id.clone();
     let code;
-    match target.label {
-        "running" => match socket_of(dir, &id) {
+    match target.state {
+        SessionState::Running => match socket_of(dir, &id) {
             Some(path) => {
                 match crate::session_control::revoke(&path, &destination.to_string(), scope).await {
                     Ok(result) => code = report_revoke(out, err, &id, removed, result)?,
@@ -1128,7 +1377,7 @@ async fn run_revoke(
                         writeln!(
                         err,
                         "could not reach {}: {}; {record}the session's in-memory allowances are unchanged. Stopping the session is the guaranteed hard cut",
-                        describe_session(&id, target.label),
+                        describe_session(&id, target.state),
                         escape(&format!("{error:#}")),
                     )
                     .context("writing the socket failure")?;
@@ -1145,13 +1394,16 @@ async fn run_revoke(
                 writeln!(
                     err,
                     "{} has no control socket; {record}the session's in-memory allowances are unchanged. Stopping the session is the guaranteed hard cut",
-                    describe_session(&id, target.label)
+                    describe_session(&id, target.state)
                 )
                 .context("writing the no-socket message")?;
                 code = 1;
             }
         },
-        _ => {
+        SessionState::NotResponding
+        | SessionState::RunningNoSocket
+        | SessionState::Ended
+        | SessionState::EndedUnclean => {
             let record = if removed {
                 "the project record was deleted, "
             } else {
@@ -1160,7 +1412,7 @@ async fn run_revoke(
             writeln!(
                 err,
                 "{} cannot confirm a live revoke; {record}the session's in-memory allowances are unchanged. Stopping the session is the guaranteed hard cut",
-                describe_session(&id, target.label)
+                describe_session(&id, target.state)
             )
             .context("writing the unconfirmed message")?;
             code = 1;
@@ -1195,7 +1447,7 @@ fn report_revoke(
             writeln!(
                 out,
                 "revoked {destination} for {}{}{}",
-                describe_session(id, "running"),
+                describe_session(id, SessionState::Running),
                 revision_clause(revision),
                 if removed {
                     "; the project record was deleted"
@@ -1231,7 +1483,7 @@ fn report_revoke(
                     crate::allowances::RevokeScope::Project => " project",
                     crate::allowances::RevokeScope::All => " session or project",
                 },
-                describe_session(id, "running"),
+                describe_session(id, SessionState::Running),
                 revision_clause(revision),
                 if removed {
                     "; the project record was deleted"
@@ -1258,7 +1510,7 @@ fn report_revoke(
             writeln!(
                 err,
                 "{} could not confirm revoking {destination}: {}{}. Stopping the session is the guaranteed hard cut",
-                describe_session(id, "running"),
+                describe_session(id, SessionState::Running),
                 escape(&reason.line()),
                 if removed {
                     " (the project record was deleted)"

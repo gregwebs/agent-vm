@@ -568,7 +568,7 @@ fn the_reason_column_names_the_lock_that_holds() {
         .collect();
     assert_eq!(
         reasons[0],
-        "no grant in this version; relaunch with --allow-egress"
+        "can't be allowed yet: no allowance names this destination"
     );
     assert_eq!(reasons[3], "can't be allowed: platform policy");
 
@@ -694,6 +694,30 @@ fn session_ids_are_eight_lowercase_hex_and_parse_strictly() {
     }
 }
 
+/// A refusal ID is parsed, not checked: only a value the feed could have assigned
+/// becomes a word `access` prints in a command, and a forged row's ID never does.
+#[test]
+fn a_refusal_id_is_parsed_and_renders_plain() {
+    for accepted in [E1, "00000000", "deadbeef"] {
+        let id = RefusalId::parse(accepted).expect("the assigned spelling parses");
+        assert_eq!(id.as_str(), accepted);
+        assert_eq!(id.to_string(), accepted, "the word is the ID itself");
+    }
+    // Everything the log may hold and the feed may not: a shell metacharacter, an
+    // uppercase ID, a wrong length, a terminal escape.
+    for rejected in [
+        "",
+        "1234567",
+        "123456789",
+        "DEADBEEF",
+        "$(id)abcd",
+        "deadbee\u{1b}",
+        "dead beef",
+    ] {
+        assert_eq!(RefusalId::parse(rejected), None, "{rejected:?}");
+    }
+}
+
 /// A `secret-violation` record: the one site that states a credential, a location
 /// and a reason.
 fn secret_violation(
@@ -785,7 +809,7 @@ fn only_a_credential_refusal_stores_the_credential_fields() {
     let snapshot = session.snapshot();
     assert_eq!(snapshot.entries.len(), 2);
     let cells = [
-        "no grant in this version; relaunch with --allow-egress",
+        "can't be allowed yet: no allowance names this destination",
         "can't be allowed: platform policy",
     ];
     for (entry, cell) in snapshot.entries.iter().zip(cells) {

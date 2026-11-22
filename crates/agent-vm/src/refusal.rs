@@ -71,15 +71,56 @@ impl SessionId {
     /// The strict spelling is what makes a session ID safe as a file name and a
     /// socket name: it is also what `discover` filters a directory listing by.
     pub(crate) fn parse(text: &str) -> Option<Self> {
-        (text.len() == 8
-            && text
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
-        .then(|| Self(text.to_owned()))
+        is_hex8(text).then(|| Self(text.to_owned()))
     }
 
     pub(crate) fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// One accepted spelling for an ID, whether it names a session (as
+/// [`SessionId::parse`] accepts) or a refusal entry inside one ([`RefusalId`]).
+///
+/// A refusal ID is the only value in a row that becomes a shell word in the
+/// ACTION cell, and the log it comes from may not be host-only (AC5), so the
+/// renderer asks the same question the session-ID parser does.
+pub(crate) fn is_hex8(text: &str) -> bool {
+    text.len() == 8
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// One refusal's ID: the 8-lowercase-hex spelling [`assign_id`] assigns.
+///
+/// The log this value comes from may not be host-only, and `access` prints it as
+/// one word of a command a human pastes, so it is *parsed* rather than checked:
+/// [`RefusalEntry::id`] stays a `String`, because a damaged log must still be
+/// listed, but a command is built only from a value of this type.
+///
+/// It renders as the plain word, with no [`crate::shell::PastedWord`] encoder:
+/// every byte of the spelling is ASCII alphanumeric, which is inside ADR-0049's
+/// bare set, so the encoder would take its plain branch and print exactly these
+/// bytes. The invariant this type carries *is* "no quoting needed" — a value the
+/// plain branch could not carry is not a `RefusalId`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RefusalId(String);
+
+impl RefusalId {
+    /// Parse the one accepted spelling: exactly 8 lowercase hex digits.
+    pub(crate) fn parse(text: &str) -> Option<Self> {
+        is_hex8(text).then(|| Self(text.to_owned()))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for RefusalId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
     }
 }
 
@@ -391,8 +432,15 @@ impl RefusalEntry {
             return "can't be allowed: platform policy".to_owned();
         }
         match self.key.kind {
+            // Nothing in production renders this arm: `access`'s ACTION cell and
+            // `allowances::grantable_destination` both decide a network denial
+            // before they reach `reason()`, and the cell builds its own
+            // `--session`-qualified command from the row it is printing. The arm
+            // exists because `Kind` is exhaustive, and it states a reason rather
+            // than a command, so it can never offer an ID that `access allow`
+            // would refuse.
             Kind::NetworkDenial => {
-                "no grant in this version; relaunch with --allow-egress".to_owned()
+                "can't be allowed yet: no allowance names this destination".to_owned()
             }
             Kind::CredentialRefusal => self.credential_policy_reason(),
             // `last_site` is the runtime's wire value as a forged record may
