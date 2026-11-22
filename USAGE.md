@@ -305,19 +305,27 @@ catalog never changes it). First present source wins:
 | launch build | `--dockerfile FILE` (builds and boots; cannot be combined with `--image`; outranks `AGENT_VM_IMAGE_TAG`, config `image` and the default) |
 | command line | `--image REF` |
 | environment | `AGENT_VM_IMAGE_TAG=REF` (an empty value counts as unset) |
-| user config | top-level `image = "REF"` in `~/.config/agent-vm/config.toml` |
-| project config | top-level `image = "REF"` in `~/.config/agent-vm/projects/<project-id>/config.toml` |
+| project config | top-level `image = "REF"` in `~/.config/agent-vm/projects/<project-id>/config.toml`, or `image = "ALIAS:image"` naming a [config source](#sources) |
+| user config | top-level `image = "REF"` in `~/.config/agent-vm/config.toml`; used only when the project config sets no image and sources it `:trust`, which is the default |
 | default | this project's own default once established (see [Project default boot images](#project-default-boot-images)); before that the host's retained digest (see [The retained default](#the-retained-default)), or the initial recommendation when nothing is retained |
 
 `agent-vm shell`, `agent-vm claude` and `agent-vm mytool` all boot the same
 image. `image pull` acquires that same selection without booting;
 `setup` acquires it and optionally boots a verification guest.
 
-**Config-file `image` values are OCI references only.** The runtime treats a
+**Config-file `image` values are OCI references** — with one exception, the
+project config's `ALIAS:image` source selection. The runtime treats a
 leading `/`, `./`, `../`, `.` or `..` as a host rootfs bind or disk image, so a
 config file with `image = "/"` would boot the host root filesystem as a
 writable guest rootfs. agent-vm refuses such a value
 with an error naming the file (never echoing the value).
+
+A project image that is exactly `ALIAS:image` is a **source selection**, not an
+OCI reference: it selects the `image` that source declares, and the project config
+authorizes it. An alias the project config does not source is an error rather than
+a pull of `docker.io/library/ALIAS:image`. To use an image that really is tagged
+`image` on Docker Hub, spell it with its registry
+(`image = "docker.io/library/NAME:image"`).
 `--image`/`AGENT_VM_IMAGE_TAG` keep their permissive pass-through, so a local
 rootfs or disk image is still bootable **from the command line**, where you
 typed it.
@@ -3022,17 +3030,101 @@ To use it, review it and source it from this project's config with `agent-vm con
 ```
 
 The note does not change the exit status and appears whether the configuration
-loaded or failed. To migrate today, by hand:
+loaded or failed. It disappears once the project config **sources** the file. To
+migrate today, by hand:
 
 1. review the in-repo file — it may have come from a branch you do not trust;
-2. copy the definitions you want to the path `doctor` prints on its `project:`
-   row (`~/.config/agent-vm/projects/<project-id>/config.toml`, creating the
-   directory);
-3. run `agent-vm doctor` again and confirm the verbs appear.
+2. add to the project config at the path `doctor` prints on its `project:` row
+   (`~/.config/agent-vm/projects/<project-id>/config.toml`, creating the
+   directory):
+
+   ```toml
+   sources = [
+     "home:trust ~/.config/agent-vm/config.toml",
+     "repo ./.agent-vm/config.toml",
+   ]
+   ```
+
+   and `image = "repo:image"` if that file is to choose the boot image;
+3. run `agent-vm doctor` again and confirm the verbs appear and the note is gone.
+
+The sourced file is **unpinned** until content pinning ships: a branch switch
+changes its declarations at the next launch, so only source a file you would
+review on every change.
 
 `agent-vm config edit` arrives in a later change. Until it ships, use the
-printed path directly. A future release will also let a project config *source*
-another file, which is the long-term way to share a team catalog.
+printed path directly. To *share* a team catalog, have the project config
+[source](#sources) it instead of copying definitions.
+
+### Sources
+
+The project config may name other config files with a top-level `sources`
+array. Each entry is `"<alias>[:trust] <path>"`:
+
+```toml
+# PROJECT CONFIG ONLY. Before the first table header.
+sources = [
+  "home:trust ~/.config/agent-vm/config.toml",  # read as the user config
+  "repo ./.agent-vm/config.toml",               # declarations only
+]
+image = "repo:image"                            # authorize the repo's image
+```
+
+- **Alias**: `[a-z][a-z0-9_-]{0,31}`, unique within the list. `doctor` and every
+  diagnostic print it as written.
+- **`:trust`** is accepted only for `~/.config/agent-vm/config.toml` — the one
+  file the ADR-0038 guard protects. Such a source is read exactly like the user
+  config, so it may carry `[network]`, `mounts`, `[mount_sets]` and
+  `[egress_sets]`, and it is the **fallback** for the boot image.
+- **Every other source is declarations only**: it may add `[[tools]]` and declare
+  `image`, and it may not grant network, mounts or mount/egress sets. Its tools
+  join the catalog with `source repo <path>` provenance and are read **unpinned**
+  for now (a later release adds content pinning).
+- **Paths**: `~/REST` is `$HOME/REST`, `/ABS` is used as is, and anything else is
+  relative to the project root. Paths are resolved lexically: `.` segments are
+  dropped, `..` is left for the filesystem to resolve, and nothing is
+  canonicalized. `~` alone and `~user/...` are refused.
+- **The user config must not route into the project.** `:trust` is refused when
+  `~/.config/agent-vm` or `~/.config/agent-vm/config.toml` resolves inside the
+  directory agent-vm runs from: a checkout alias would make repository bytes
+  trusted. A dotfile layout such as `~/.config/agent-vm/config.toml ->
+  ~/dotfiles/config.toml` therefore stops loading when you run from an ancestor of
+  its target (usually `$HOME`) — `doctor` and every launch say so, and the remedy
+  is to run from a project directory outside the target or to replace the link
+  with a regular file.
+- **Unique**: two entries may not share an alias or resolve to the same path, and
+  no entry may name the project config itself.
+- **Flat**: only the project config may declare `sources`. A sourced file that
+  declares it — `sources = []` included — is refused.
+- **An omitted `sources` key** means the single implicit
+  `home:trust ~/.config/agent-vm/config.toml`, i.e. exactly the behaviour before
+  this key existed. `sources = []` sources nothing, so the user config is not
+  read at all.
+- **A missing `:trust` file** is fine (`absent`); a missing untrusted source is an
+  error naming the file and its `sources[N]` entry.
+
+`agent-vm doctor` lists what the project config sources and where the boot image
+came from:
+
+```text
+==> tool configuration
+user:    /home/me/.config/agent-vm/config.toml (found, 2 tools)
+project: /home/me/.config/agent-vm/projects/3f9c…/config.toml (found, 0 tools)
+sources:
+  home:trust /home/me/.config/agent-vm/config.toml (found, 2 tools)
+  repo /work/app/.agent-vm/config.toml (found, 1 tool)
+resolved: declared tools; launch-verb order
+  1. pi -> "pi"; …; source=sourced:repo:/work/app/.agent-vm/config.toml
+…
+==> boot image
+…
+project: ghcr.io/team/app:7 [repo:image /work/app/.agent-vm/config.toml]
+source team: ghcr.io/team/other:1 [/work/app/team.toml]  (not selected; the project config selects it with image = "team:image")
+selected (without --image): ghcr.io/team/app:7 (from repo:image in /work/app/.agent-vm/config.toml)
+```
+
+When the project config sources no `:trust` file, the user row reads
+`(not sourced by the project config)`, and an empty list reads `sources: none`.
 
 ### Schema
 
@@ -3041,7 +3133,11 @@ project tier refuses both. See [Persisted grants](#persisted-grants-user-config)
 and [Config mounts](#config-mounts-user-config).
 
 ```toml
+# PROJECT CONFIG ONLY, and it must come before the first table header:
+# sources = ["home:trust ~/.config/agent-vm/config.toml", "repo ./.agent-vm/config.toml"]
+
 # Top-level, optional: the boot image for every session (an OCI reference).
+# In the project config only, "ALIAS:image" selects a sourced file's image.
 image = "ghcr.io/gregwebs/agent-vm-standard:v0.1.3"
 
 # Optional, USER CONFIG ONLY, and it must come before the first table header:
@@ -3072,6 +3168,8 @@ network_requests = ["api.example.com"] # optional; destinations the tool expects
   the tools: a file that sets only `image` declares zero tools and keeps the
   shipped defaults. Only OCI references are accepted here; a local path is
   rejected (use `--image` for a local rootfs).
+- `sources` — optional top-level array of strings, **project config only** and
+  only before the first `[table]` header. See [Sources](#sources).
 - `mounts` — optional top-level array of strings, **user config only** and only
   before the first `[table]` header: config mounts for every launch, with
   `--mount`'s `HOST[:GUEST][:MODE]...` grammar. The project and built-in tiers

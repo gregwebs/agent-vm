@@ -825,7 +825,7 @@ fn set_default_preserves_all_overrides_and_default_diagnostic_redaction() {
             "localhost:1/cli:tag",
         ),
         (None, Some("localhost:1/env:tag"), "localhost:1/env:tag"),
-        (None, None, "localhost:1/user:tag"),
+        (None, None, "localhost:1/project:tag"),
     ] {
         let mut cmd = h.command();
         cmd.current_dir(&project_dir);
@@ -843,15 +843,16 @@ fn set_default_preserves_all_overrides_and_default_diagnostic_redaction() {
         assert!(text.contains(expected), "{text}");
         assert_eq!(h.selected(), pin);
     }
-    fs::remove_file(&user).unwrap();
+    // The user image is the fallback when the project sets none (ADR-0074).
+    fs::remove_file(&project).unwrap();
     let out = bounded(
         h.command()
             .current_dir(&project_dir)
             .env("AGENT_VM_DEBUG_CONFIG", "1")
             .args(["--no-git", "shell", "bash", "-c", "true"]),
     );
-    assert!(String::from_utf8_lossy(&out.stderr).contains("localhost:1/project:tag"));
-    fs::remove_file(&project).unwrap();
+    assert!(String::from_utf8_lossy(&out.stderr).contains("localhost:1/user:tag"));
+    fs::remove_file(&user).unwrap();
     let count = server.count();
     let out = bounded(
         h.command()
@@ -2770,25 +2771,26 @@ fn refresh_selection_and_broken_config_recovery_acquire_only_the_winning_tier() 
             broken: false,
             expected: "env",
         },
+        // ADR-0074: project > user, so the project tier is the winner here.
         Row {
-            name: "user",
+            name: "project-over-user",
             cli: false,
             env: None,
             user: true,
             project: true,
             retained: false,
             broken: false,
-            expected: "user",
+            expected: "project",
         },
         Row {
-            name: "empty-env-user",
+            name: "empty-env-project-over-user",
             cli: false,
             env: Some(""),
             user: true,
             project: true,
             retained: false,
             broken: false,
-            expected: "user",
+            expected: "project",
         },
         Row {
             name: "project",

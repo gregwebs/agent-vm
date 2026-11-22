@@ -9,6 +9,10 @@ Amends [ADR-0015](0015-config-driven-tools.md),
 [ADR-0040](0040-persisted-user-network-authority.md). Breaking release:
 **0.8.0** — an in-repo `.agent-vm/config.toml` stops loading.
 
+Amended by [ADR-0074](0074-flat-config-sources.md) (#734): the project config may
+source other files; `doctor`'s legacy note is suppressed when the in-repo file is
+sourced.
+
 ## Context
 
 agent-vm merges two TOML **tiers** into one launch catalog. The user tier is
@@ -226,14 +230,15 @@ the commands that treat it as fatal do so exactly as before.
   project and cloning a different repository at the same path inherits that
   path's project config (`projects/<id>/config.toml`) — the same accepted
   property as `image-pins.json` and `allowances.json`. Harmless while the tier
-  only declares tools the user wrote, but it matters once #734's
-  `source repo …:trust` exists: a sourced file is trusted by where the source
-  sits, so #736's pinning must cover the sourced bytes, not just the path.
-- **#734/#735/#736/#737/#738/#739** are not implemented here: `sources`,
-  `:trust`, `allow_tools`, pins/`pins.json`, `image set-default` writing project
-  config, inert sets in sourced files, mount/egress set changes, and the
-  `agent-vm config` subcommand. The legacy note names `agent-vm config edit`
-  before it exists because #733's acceptance criteria require that wording.
+  only declares tools the user wrote. ADR-0074 keeps `:trust` reserved to the
+  user config, so no sourced file inherits authority from *where* it sits; the
+  files an untrusted source contributes are still read unpinned until #736.
+- **#735/#736/#737/#738/#739** are not implemented here: `allow_tools`,
+  pins/`pins.json`, `image set-default` writing project config, inert sets in
+  sourced files, mount/egress set changes, and the `agent-vm config`
+  subcommand. The legacy note names `agent-vm config edit` before it exists
+  because #733's acceptance criteria require that wording. `sources` and
+  `:trust` arrive with #734 (ADR-0074).
 
 ## Alternatives rejected
 

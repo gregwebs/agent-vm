@@ -1034,6 +1034,61 @@ fn a_legacy_in_repo_config_gets_a_notice() {
     );
 }
 
+/// AC6/R12: the in-repo notice is suppressed exactly when the project config
+/// **lists** that file as a source. Two rows, because each alone would pass with
+/// the wrong wiring: the first fails if `doctor` hands `legacy` no list, and the
+/// second fails if it treats every source — including the implicit `home:trust`
+/// default, whose path a symlinked legacy file resolves to — as listed.
+#[test]
+fn only_an_explicitly_sourced_in_repo_config_suppresses_the_legacy_notice() {
+    // (a) listed: the file is read, so there is nothing to warn about, and its
+    // tools arrive with source provenance.
+    let sourced = Harness::new();
+    let legacy = sourced.project_root.join(".agent-vm/config.toml");
+    write(
+        &legacy,
+        "[[tools]]\nname = \"legacy-only\"\ncommand = \"legacy-only\"\n",
+    );
+    sourced.write_user(ONE_TOOL);
+    sourced.write_project(
+        "sources = [\"home:trust ~/.config/agent-vm/config.toml\", \"repo ./.agent-vm/config.toml\"]\n",
+    );
+
+    let out = sourced.run_doctor();
+    assert_success(&out);
+    let stdout = stdout_of(&out);
+    let section = tool_configuration_section(&stdout);
+    assert!(!section.contains("is not auto-loaded"), "{section}");
+    assert!(!section.contains(&legacy_note(&legacy)), "{section}");
+    assert!(
+        section.contains(&format!("source=sourced:repo:{}", legacy.display())),
+        "{section}"
+    );
+    assert!(
+        section.contains(&format!("repo {} (found, 1 tool)", legacy.display())),
+        "{section}"
+    );
+
+    // (b) the same layout with no `sources` key: the implicit `home:trust`
+    // default reads the user config, and the legacy path — here a symlink whose
+    // canonical target *is* that user config — remains unread and unlisted.
+    let implicit = Harness::new();
+    let legacy = implicit.project_root.join(".agent-vm/config.toml");
+    implicit.write_user(ONE_TOOL);
+    implicit.write_project("[[tools]]\nname = \"hosted\"\ncommand = \"hosted\"\n");
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(implicit.user_config(), &legacy).unwrap();
+
+    let out = implicit.run_doctor();
+    assert_success(&out);
+    let stdout = stdout_of(&out);
+    let section = tool_configuration_section(&stdout);
+    assert!(
+        section.ends_with(&legacy_note(&legacy)),
+        "the implicit default must not suppress the notice: {section}"
+    );
+}
+
 #[test]
 fn a_fifo_config_does_not_hang_doctor() {
     let h = Harness::new();

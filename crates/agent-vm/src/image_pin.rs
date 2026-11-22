@@ -77,6 +77,10 @@ pub(crate) use presentation::{ActiveImagesObservation, observe_active_images, pi
 // would be an unused import in every ordinary build.
 #[cfg(test)]
 pub(crate) use presentation::ActiveImages;
+/// The `establishment` decision, for tests outside this module that assert which
+/// image sources may record a project default (ADR-0067 R3, ADR-0074).
+#[cfg(test)]
+pub(crate) use project_default::establishment as establishment_for_tests;
 pub(crate) use project_default::{
     DefaultSlot, HostDefaultSet, InvokingProject, ObservedDefaults, ProjectDefaultChange,
     load_default_slot, observe_defaults, set_default,

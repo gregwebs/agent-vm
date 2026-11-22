@@ -890,7 +890,7 @@ fn unsafe_user_mounts_are_refused_before_launch_state() {
                 "mounts refuses a config.toml with 2 hard links"
             }
             "symlink" => {
-                let target = h.project_root.join("dotfile");
+                let target = h.home_root.join("dotfile");
                 std::fs::rename(&file, &target).unwrap();
                 h.symlink_user_config(&target);
                 "mounts requires config.toml to be a regular file"
@@ -990,7 +990,7 @@ fn symlinked_user_config_directory_with_mounts_is_followed() {
 fn symlinked_user_config_without_mounts_still_launches() {
     let h = Harness::new();
     h.write_user("[[tools]]\nname = \"probe\"\ncommand = \"/bin/probe\"\ncredentials = []\n");
-    let target = h.project_root.join("dotfile");
+    let target = h.home_root.join("dotfile");
     std::fs::rename(h.user_config(), &target).unwrap();
     h.symlink_user_config(&target);
 

@@ -5,8 +5,8 @@
 //! without grepping for string literals across subcommands.
 
 /// The **initial default-image recommendation**: the immutable image agent-vm
-/// offers when no `--image`, `AGENT_VM_IMAGE_TAG`, user config, project config
-/// `image` or retained user selection names another.
+/// offers when no `--image`, `AGENT_VM_IMAGE_TAG`, project config `image`,
+/// `:trust` user config `image` or retained user selection names another.
 ///
 /// It is a *recommendation*, not a selection: the launcher's owned state is the
 /// user-scoped retained record ([`crate::boot_image`]), written only after this
