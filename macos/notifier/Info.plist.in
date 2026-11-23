@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template: script/build/macos.sh substitutes __AGENT_VM_VERSION__ from the
+     workspace version. One CFBundleIdentifier for every copy (dev, release,
+     relocated) so macOS System Settings shows a single "agent-vm" toggle; the
+     click's own userInfo carries the session, so whichever copy LaunchServices
+     launches still opens the clicked session (plan §4.2). -->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>agent-vm</string>
+	<key>CFBundleExecutable</key>
+	<string>AgentVMNotifier</string>
+	<key>CFBundleIdentifier</key>
+	<string>dev.agent-vm.notifier</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>AgentVMNotifier</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>__AGENT_VM_VERSION__</string>
+	<key>CFBundleVersion</key>
+	<string>__AGENT_VM_VERSION__</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>12.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+</dict>
+</plist>

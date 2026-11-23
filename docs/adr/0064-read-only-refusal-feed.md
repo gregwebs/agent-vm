@@ -19,6 +19,11 @@ notification helper and connection listing are **not** decided here.
 > is the same notice, so the line is not printed under the answer. A question that
 > was never answered claims nothing, and the line still reaches the operator.
 
+> **Annotated by [ADR-0073](0073-macos-notification-helper.md) (#501 slice 4).** A
+> second hint — the notifications-off line — rides the same seam, once per session,
+> with its own text: `Hint` carries the line and `HintRelay::bytes()` frames that
+> line rather than one fixed frame. The refusal hint's text and rule are unchanged.
+
 
 The runtime records every refused egress decision in
 `<MSB_HOME>/sandboxes/<name>/logs/network.log`: one JSON line per refusal, with

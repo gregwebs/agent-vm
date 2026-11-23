@@ -359,4 +359,7 @@ Environment:
   AGENT_VM_NO_CHROME_MCP                disable Chrome MCP auto-configuration for Chrome-capable
   images
   AGENT_VM_NO_ACCESS_PROMPT             don't ask about refusals in the terminal (1|true|yes|on)
+  AGENT_VM_NO_NOTIFICATIONS             don't post macOS notifications for refusals (1|true|yes|on)
+  AGENT_VM_NOTIFY_TERMINAL              terminal a notification click opens
+  (terminal|ghostty|wezterm|alacritty)
   RUST_LOG                              tracing filter (e.g. agent_vm=debug)

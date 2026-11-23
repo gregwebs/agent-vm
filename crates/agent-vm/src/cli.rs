@@ -252,6 +252,13 @@ pub(crate) enum Cmd {
     /// response on stdout. Not meant for direct use.
     #[command(name = "_intercept-hook", hide = true)]
     InterceptHook(intercept_hook::Args),
+
+    /// Internal: invoked by the macOS notification helper when a banner is
+    /// clicked. Writes a `.command` script and opens a host terminal running
+    /// `agent-vm access --session <ID>`; it approves nothing. Not meant for
+    /// direct use.
+    #[command(name = "_notify-click", hide = true)]
+    NotifyClick(crate::notify::ClickArgs),
 }
 
 /// What [`parse_from`] decided to do. Built-in verbs keep their derived clap
@@ -349,6 +356,7 @@ pub(crate) const BUILTIN_SUBCOMMANDS: &[&str] = &[
     "tools",
     "access",
     "_intercept-hook",
+    "_notify-click",
     // The direct runner (issue #398) is a fixed launch route, so it is a
     // built-in *name* even though its target is user-supplied argv.
     "run",
@@ -738,7 +746,8 @@ fn reconcile_image_args(sub: &clap::ArgMatches, cmd: &mut Cmd) {
         | Cmd::Secret(_)
         | Cmd::Tools(_)
         | Cmd::Access(_)
-        | Cmd::InterceptHook(_) => {}
+        | Cmd::InterceptHook(_)
+        | Cmd::NotifyClick(_) => {}
     }
 }
 
@@ -1387,7 +1396,8 @@ fn validate_builtin_args(command: &clap::Command, cmd: &Cmd) -> Result<()> {
         | Cmd::Secret(_)
         | Cmd::Tools(_)
         | Cmd::Access(_)
-        | Cmd::InterceptHook(_) => Ok(()),
+        | Cmd::InterceptHook(_)
+        | Cmd::NotifyClick(_) => Ok(()),
     };
     validated.map_err(|error| {
         // The value-free reason is fixed text from the result-reference or
@@ -1955,6 +1965,33 @@ mod tests {
         let reserved: std::collections::BTreeSet<&str> =
             RESERVED_TOOL_NAMES.iter().copied().collect();
         assert_eq!(builtins, reserved);
+    }
+
+    // -- T7b: the hidden click verb is hidden, built-in and reserved -------
+
+    #[test]
+    fn the_notify_click_verb_is_hidden_builtin_and_reserved() {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
+        let catalog = report_from(SHELL_ONLY).into_launch_catalog().unwrap();
+        let mut command = build_command(&Catalog::Ready(catalog));
+        command.build();
+
+        // Hidden: the verb is spawned by the notification helper, so listing it
+        // under `--help` would invite a user to run a click by hand.
+        let verb = command
+            .find_subcommand("_notify-click")
+            .expect("_notify-click is registered");
+        assert!(verb.is_hide_set());
+        assert!(BUILTIN_SUBCOMMANDS.contains(&"_notify-click"));
+        // Reserved: a config tool of that name would be unreachable.
+        assert!(RESERVED_TOOL_NAMES.contains(&"_notify-click"));
+        assert_eq!(
+            crate::config::tool_name_rejection("_notify-click"),
+            Some(crate::config::ToolNameRejection::Reserved)
+        );
     }
 
     // -- T8: a one-tool catalog registers only it plus the shell fallback --
@@ -3286,6 +3323,7 @@ mod tests {
                 "tools",
                 "access",
                 "_intercept-hook",
+                "_notify-click",
                 "run",
                 "shell",
                 "help"

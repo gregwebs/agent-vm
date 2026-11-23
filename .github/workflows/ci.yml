@@ -231,6 +231,13 @@ jobs:
       - name: Run macOS build script workflow tests
         run: bash script/test/ci-macos-legs.sh build-script
 
+      # The notification helper is Swift only, so this needs no Rust toolchain:
+      # it compiles the real source, stamps and lints its `Info.plist`, signs it
+      # ad-hoc and executes `--version`/`--check-bundle` inside a temp bundle
+      # (#501 slice 4). It never touches an installed bundle or LaunchServices.
+      - name: Run the notification helper contract
+        run: bash script/test/ci-macos-legs.sh notifier-contract
+
   # The real `/usr/bin/security` contract for the keychain host credential
   # location (#497, ADR-0056), plus the harness checks macOS would otherwise
   # never run (ADR-0072). Its own job because it needs a Rust toolchain and a

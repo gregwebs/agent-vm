@@ -692,6 +692,9 @@ pub fn base_environment(work: &Path) -> Vec<(String, String)> {
         ("PATH", PathBuf::from("/usr/bin:/bin")),
         ("TERM", PathBuf::from("dumb")),
         ("AGENT_VM_SHARE_MSB_CACHE", PathBuf::from("0")),
+        // No real banner: a desktop run would post one, and the notifications-off
+        // line could then land in exact-byte terminal evidence.
+        ("AGENT_VM_NO_NOTIFICATIONS", PathBuf::from("1")),
     ]
     .into_iter()
     .map(|(name, value)| (name.to_owned(), value.to_string_lossy().into_owned()))
@@ -1709,7 +1712,8 @@ mod tests {
                 "AGENT_VM_STATE_DIR",
                 "PATH",
                 "TERM",
-                "AGENT_VM_SHARE_MSB_CACHE"
+                "AGENT_VM_SHARE_MSB_CACHE",
+                "AGENT_VM_NO_NOTIFICATIONS"
             ]
         );
         assert_eq!(environment[0].1, "/work/home");
@@ -1718,6 +1722,10 @@ mod tests {
         assert_eq!(environment[3].1, "/usr/bin:/bin");
         assert_eq!(environment[4].1, "dumb");
         assert_eq!(environment[5].1, "0");
+        assert_eq!(
+            environment[6].1, "1",
+            "a fixtured launch posts no real banner"
+        );
     }
 
     #[test]

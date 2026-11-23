@@ -190,6 +190,8 @@ impl Harness {
             allowances,
             session: crate::refusal::SessionId::parse("3f9a12c4").unwrap(),
             hint: Arc::new(crate::refusal::feed::Hint::new()),
+            notifications_off: Arc::new(crate::refusal::feed::Hint::notifications_off()),
+            signals: None,
         })
     }
 
@@ -631,6 +633,30 @@ fn the_pump_keeps_a_pending_confirmation_through_a_redraw() {
         !production.contains("slots.takeover_ack = written"),
         "an unconditional assignment drops a pending Enter/Leave confirmation"
     );
+}
+
+#[test]
+fn the_pump_hands_the_prompt_s_signals_on_before_every_wait() {
+    // B1–B3, R12: the pump is the one place the prompt and the session meet, and it
+    // runs before every wait — so draining there is what makes the signal sequencing
+    // complete. Reverting it would leave only the epilogue's drain, i.e. every signal
+    // delivered after its session ended.
+    let source = include_str!("../direct_pty.rs");
+    let production = &source[..source
+        .find("#[cfg(test)]\nmod loop_tests;")
+        .expect("direct_pty.rs has test modules")];
+    let pump = production
+        .split_once("fn pump<T: GuestTerminal>(")
+        .expect("the pump is present")
+        .1;
+    let drain = pump.find("prompt.drain_signals();").expect(
+        "the pump must hand the prompt's signals to the notifier: a drain only in \
+         the epilogue delivers them after the session is over",
+    );
+    let flush = pump
+        .find("if prompt.wants_input_flush()")
+        .expect("the pump flushes the terminal's input");
+    assert!(drain < flush, "the drain comes first, every turn");
 }
 
 #[test]

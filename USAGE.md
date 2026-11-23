@@ -2772,6 +2772,8 @@ included, enables it.
 | `AGENT_VM_DEBUG_CONFIG` | dump the SandboxConfig JSON before boot |
 | `AGENT_VM_NO_CHROME_MCP` | disable Chrome MCP auto-configuration for a Chrome-capable image |
 | `AGENT_VM_NO_ACCESS_PROMPT` | don't ask about refusals in the terminal (accepted: `1`/`true`/`yes`/`on` turns it off; `0`/`false`/`no`/`off` leaves it on. Any other value leaves it on and prints one launch warning) |
+| `AGENT_VM_NO_NOTIFICATIONS` | don't post macOS notifications for refusals (accepted: `1`/`true`/`yes`/`on` turns them off; `0`/`false`/`no`/`off` leaves them on. Any other value leaves them on and prints one launch warning) |
+| `AGENT_VM_NOTIFY_TERMINAL` | terminal a notification click opens: `terminal` (default), `ghostty`, `wezterm` or `alacritty`. Any other value opens Terminal and prints one launch warning |
 | `AGENT_VM_IMAGE_TAG` | override the OCI image (same as `--image`; outranks any config `image`; an empty value counts as unset) |
 | `AGENT_VM_MEMORY_GIB` / `AGENT_VM_CPUS` | same as `--memory` / `--cpus`; an invalid environment-sourced value is refused without being shown |
 | `AGENT_VM_ROOT` | same as `--root` (accepted: `1`/`true`/`yes`/`on`) |
@@ -4465,6 +4467,59 @@ named part of the feature. Precisely what happens:
 | A reader cannot keep up | It is dropped, or resynchronised with a whole snapshot. Nobody else is slowed. |
 | The runtime's own log cannot be read for a while | The session's rows stay listed and gain `some refusals were missed (count unknown)`; a late record is never counted twice. |
 | A write evicts sessions to stay in bounds | A footer counts the sessions whose records are **gone**. A live session that is evicted is written back by its owner and is not counted. |
+
+### Desktop notifications on macOS
+
+On macOS a refusal can also arrive as a Notification Center banner, so it reaches
+you when the terminal does not have your attention.
+
+- **When it posts.** Immediately when no question will ask: a piped `run`, `-T`, a
+  catalog tool (`claude`, `pi`, …), `shell`, an `attach`, a streaming launch,
+  `AGENT_VM_NO_ACCESS_PROMPT=1`, or a refusal no question can ask about (a policy
+  lock, a credential refusal, plain HTTP to a hostname, a host proxy). Otherwise
+  5 s after the question becomes visible, so an answer beats it — and an answer is
+  a letter or word plus Enter, as above. Typing without Enter does not delay the
+  banner; the Enter that follows removes it. A question that cannot be drawn (a
+  terminal below 40 × 19) delays the banner not at all, and one the writer stalls
+  on delays it no longer than 5 s.
+- **One banner per session**, replaced in place and grouped by project. A repeat
+  of something the banner already lists updates it in Notification Center without
+  popping again; a destination it has not listed yet pops. Posts are at most one
+  every 3 s, so a guest retrying a blocked host cannot become a banner storm, and
+  banners are silent: no sound plays, and the permission prompt asks for alerts
+  only.
+- **A click approves nothing.** It opens a terminal in that session's project and
+  state root, runs `agent-vm access --session <ID>` in it, and leaves the shell
+  open for a command you type. A click is a look, never a grant.
+- **A stale click**, on a banner whose session has ended, shows the same report
+  with `ended` and offers only the `--project` command. When the session's final
+  record could not be written it says `no session <ID> in this project's running
+  sessions or refusal log` and opens the shell anyway: then the banner is the only
+  record that the refusal happened.
+- **Which terminal it opens.** `AGENT_VM_NOTIFY_TERMINAL`: `terminal` (the
+  default), `ghostty`, `wezterm` or `alacritty`. Terminal and Ghostty are verified;
+  WezTerm and Alacritty are best-effort. See the
+  [environment knobs](#launch-options).
+- **Turning it off.** `AGENT_VM_NO_NOTIFICATIONS` — the accepted values are in the
+  same [environment table](#launch-options).
+- **When notifications are denied** for agent-vm in System Settings, one line
+  appears once, through the same route as the hint above (after the question's
+  leave, if one is up):
+
+  ```text
+  ==> macOS notifications are off for agent-vm; run `agent-vm access` to see refusals (shown once per session)
+  ```
+
+  Posting stops for that session and no refusal is ever held back for it. The
+  permission prompt itself appears with the first banner, and nothing is owed or
+  lost while it waits.
+- **What other launches get: nothing.** Over SSH, under `sudo` or root, on Linux,
+  and from a `--single-binary` install, no banner is attempted and no warning is
+  printed; the hint and `agent-vm access` remain, exactly as before. A bare
+  `cargo run` is in that group: the helper is only ever found beside
+  `<bundle>/bin/agent-vm`, never borrowed from another build.
+
+See [ADR-0073](docs/adr/0073-macos-notification-helper.md).
 
 ## Seeing what a session may reach
 

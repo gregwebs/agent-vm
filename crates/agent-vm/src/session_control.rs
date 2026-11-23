@@ -127,6 +127,13 @@ pub(crate) struct LiveSession {
     /// teardown — or one the follower already reported, read again by the drain —
     /// print a second line.
     hint: Arc<Hint>,
+    /// The session's second line: macOS notifications are off (#501 slice 4 R6).
+    /// Its own `Hint`, because the two lines are independent facts and answering a
+    /// question claims only the refusal one.
+    notifications_off: Arc<Hint>,
+    /// The notification driver, when this launch started one (R7, S4). One slot, so
+    /// `finish` and `Drop` cannot both close it.
+    notifier: Mutex<Option<crate::notify::NotifierHandle>>,
     /// The opener the follower and the drain share: a `Sandbox` clone behind an
     /// `Arc<dyn Fn>`, so both can hold it.
     open: Mutex<Option<Opener>>,
@@ -266,6 +273,8 @@ impl LiveSession {
             live: Some(listening),
             persister: Some(persister),
             hint: Arc::new(Hint::new()),
+            notifications_off: Arc::new(Hint::notifications_off()),
+            notifier: Mutex::new(None),
             open: Mutex::new(None),
             running: Mutex::new(Some(Running {
                 stop,
@@ -285,6 +294,8 @@ impl LiveSession {
             live: None,
             persister: None,
             hint: Arc::new(Hint::new()),
+            notifications_off: Arc::new(Hint::notifications_off()),
+            notifier: Mutex::new(None),
             open: Mutex::new(None),
             running: Mutex::new(None),
             following: Mutex::new(None),
@@ -310,6 +321,8 @@ impl LiveSession {
             live: Some(live),
             persister: Some(persister),
             hint: Arc::new(Hint::new()),
+            notifications_off: Arc::new(Hint::notifications_off()),
+            notifier: Mutex::new(None),
             open: Mutex::new(None),
             running: Mutex::new(None),
             following: Mutex::new(None),
@@ -334,7 +347,44 @@ impl LiveSession {
             allowances: Arc::clone(&self.allowances),
             session: self.info.id.clone(),
             hint: Arc::clone(&self.hint),
+            notifications_off: Arc::clone(&self.notifications_off),
+            // A launch with no driver gets no sink: the relay still records its
+            // signals and they are dropped at the drain.
+            signals: lock(&self.notifier).as_ref().map(|n| n.signals()),
         })
+    }
+
+    /// This session's ID, for a caller that must name it before it refuses
+    /// anything (the notification helper's click operand).
+    pub(crate) fn session_id(&self) -> &SessionId {
+        &self.info.id
+    }
+
+    /// Start this session's notification driver, or leave the slot empty when this
+    /// launch must not notify (R7, S4).
+    ///
+    /// The driver subscribes to the same three feeds the prompt does — refusals,
+    /// answers and the notifications-off line — so nothing here polls.
+    pub(crate) fn start_notifier(
+        &self,
+        launch: crate::notify::Launch,
+        mode: crate::notify::PromptMode,
+        settings: &crate::notify::Settings,
+    ) {
+        // No live feed means no refusals to speak for: a degraded session cannot
+        // post a banner, and the driver would have nothing to read.
+        let Some(refusals) = self.live.clone() else {
+            return;
+        };
+        let handle = crate::notify::NotifierHandle::start(
+            launch,
+            mode,
+            settings,
+            refusals,
+            Arc::clone(&self.allowances),
+            Arc::clone(&self.notifications_off),
+        );
+        *lock(&self.notifier) = handle;
     }
 
     /// Adopt the project allowances the launch actually applied (ADR-0065).
@@ -421,18 +471,30 @@ impl LiveSession {
         *lock(&self.following) = Some(Following { stop, task });
     }
 
-    /// Stop the producer, drain what it wrote, persist, then close the socket.
+    /// Stop the producer, drain what it wrote, persist, close the socket, then
+    /// finish the notification driver.
     ///
-    /// The order is the point (§6.4): draining before the persist keeps the
-    /// runtime's last writes, and persisting before the broadcast means a reader
-    /// never sees an entry without the `ended` that follows it. Idempotent,
-    /// because teardown can arrive twice.
+    /// The order is the point (§6.4, B5): the mutation gate closes before anything is
+    /// written, draining before the persist keeps the runtime's last writes, and
+    /// persisting before the broadcast means a reader never sees an entry without the
+    /// `ended` that follows it. Closing the socket *before* the notifier's teardown is
+    /// what makes `ended` classification and grant refusal effective immediately, so
+    /// no banner can offer a grant this session would refuse. Idempotent, because
+    /// teardown can arrive twice.
     pub(crate) async fn finish(&self) {
         if self.finished.swap(true, Ordering::SeqCst) {
             return;
         }
+        // 0. Close the mutation gate first (B5, F1). It is taken under the same lock
+        // a grant commits under, so a grant either finished before this line or is
+        // refused after it — and the final record below can then only describe
+        // acceptances the session actually made. The cost of taking the lock is
+        // bounded by an in-flight runtime swap, which is the wait the operator's own
+        // `access allow` already has.
+        self.allowances.end_mutations().await;
         let Some(live) = self.live.clone() else {
             self.close_socket().await;
+            // No feed, so `start_notifier` started nothing.
             return;
         };
         // 1–2. Stop the follower, then drain from its last cursor to end of file.
@@ -454,16 +516,39 @@ impl LiveSession {
         }
         // 3. The final snapshot, written before any reader is told it ended.
         let snapshot = live.ended(feed::now_ms());
+        let mut final_status = crate::notify::FinalWriteStatus::Failed;
         if let Some(persister) = &self.persister {
-            let wait = persister.post_final(snapshot);
+            let wait = persister.post_final(snapshot.clone());
             // Off a worker thread: the wait is a `Condvar`, and blocking a
             // runtime worker for up to `FINAL_WAIT` would stall every other task
             // on it — including the connections `close_socket` is about to tell
             // the session ended.
-            let _ = tokio::task::spawn_blocking(move || wait.wait(feed::FINAL_WAIT)).await;
+            final_status = tokio::task::spawn_blocking(move || wait.wait(feed::FINAL_WAIT))
+                .await
+                .unwrap_or(crate::notify::FinalWriteStatus::Failed);
         }
-        // 4–5. Tell subscribers, close, unlink.
+        // 4–5. Tell subscribers, close, unlink — before any banner claims the
+        // session's end (B5).
         self.close_socket().await;
+        // 6. Reconcile the drained snapshot and, only when the final write
+        // persisted, post it (R9, B5).
+        self.finish_notifier(snapshot, final_status).await;
+    }
+
+    /// Close the notification driver: a final post when the record persisted, then
+    /// `quit`, bounded by the driver's own teardown budget (B5).
+    ///
+    /// The slot is emptied first, so a second teardown (or `Drop`) has nothing left
+    /// to close and no `MutexGuard` is held across the await.
+    async fn finish_notifier(
+        &self,
+        snapshot: crate::refusal::SessionSnapshot,
+        status: crate::notify::FinalWriteStatus,
+    ) {
+        let notifier = lock(&self.notifier).take();
+        if let Some(mut notifier) = notifier {
+            notifier.finish(snapshot, status).await;
+        }
     }
 
     /// One non-following read from `cursor` to the end of the runtime's file.
@@ -590,6 +675,11 @@ impl Drop for LiveSession {
     /// bound, and returning early on the flag leaked it for the rest of the
     /// process's life. The slots are taken out by `finish` as it uses them, so a
     /// completed `finish` leaves nothing for this to repeat.
+    ///
+    /// One thing this path deliberately cannot do: close the mutation gate, because
+    /// that needs the operation lock and `Drop` may not await (F1). It is the
+    /// fallback for a launch that never reached a teardown, and the socket is
+    /// unlinked by the time the record below is posted.
     fn drop(&mut self) {
         self.finished.store(true, Ordering::SeqCst);
         if let (Some(live), Some(persister)) = (&self.live, &self.persister) {
@@ -615,6 +705,10 @@ impl Drop for LiveSession {
             // ENOENT, which is what a session that is gone should answer.
             let _ = std::fs::remove_file(&running.socket);
         }
+        // The driver's own `Drop` sends its non-blocking stop, in a task, because
+        // nothing here may block (F3). Taking the slot first makes the close begin
+        // here rather than in field drop order.
+        drop(lock(&self.notifier).take());
     }
 }
 

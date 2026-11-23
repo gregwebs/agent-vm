@@ -51,7 +51,36 @@ fn fresh() -> Relay {
         Size { rows: 30, cols: 80 },
         Timings::default(),
         None,
+        None,
     )
+}
+
+/// A relay with both lines routed to it, as a PTY launch on a terminal has: the two
+/// routes, the two session `Hint`s and the relay.
+fn fresh_both() -> (
+    Relay,
+    std::sync::Arc<crate::refusal::feed::Hint>,
+    std::sync::Arc<crate::refusal::feed::Hint>,
+) {
+    let hint = std::sync::Arc::new(crate::refusal::feed::Hint::new());
+    let off = std::sync::Arc::new(crate::refusal::feed::Hint::notifications_off());
+    let relay = Relay::new(
+        "3f9a12c4".to_owned(),
+        Size { rows: 30, cols: 80 },
+        Timings::default(),
+        Some(hint.redirect()),
+        Some(off.redirect()),
+    );
+    (relay, hint, off)
+}
+
+/// The bytes one line's frame carries, as the writer would write them.
+fn framed(kind: HintKind) -> Vec<u8> {
+    let line = match kind {
+        HintKind::Refusal => crate::refusal::feed::HINT,
+        HintKind::NotificationsOff => crate::notify::NOTIFICATIONS_OFF,
+    };
+    format!("\r{line}\r\n").into_bytes()
 }
 
 /// A relay with the hint routed to it, as a PTY launch on a terminal has: the
@@ -68,6 +97,7 @@ fn fresh_routed() -> (
         Size { rows: 30, cols: 80 },
         Timings::default(),
         Some(route.clone()),
+        None,
     );
     (relay, hint, route)
 }
@@ -75,7 +105,17 @@ fn fresh_routed() -> (
 /// Fire the session's hint and hand the relay the event, as the facade does.
 fn fire_hint(hint: &std::sync::Arc<crate::refusal::feed::Hint>, relay: &mut Relay, now: Instant) {
     hint.fire_for_test();
-    relay.hint_fired(now);
+    relay.hint_fired(HintKind::Refusal, now);
+}
+
+/// Fire the notifications-off line and hand the relay the event.
+fn fire_notifications_off(
+    off: &std::sync::Arc<crate::refusal::feed::Hint>,
+    relay: &mut Relay,
+    now: Instant,
+) {
+    off.fire_for_test();
+    relay.hint_fired(HintKind::NotificationsOff, now);
 }
 
 fn chunk(bytes: &[u8], epoch: u64) -> HostChunk {
@@ -100,8 +140,8 @@ fn data_of(items: &[OutputItem]) -> Vec<u8> {
         .iter()
         .flat_map(|item| match item {
             OutputItem::Data(bytes) => bytes.clone(),
-            // The hint is its own frame type; its bytes are today's line.
-            OutputItem::Hint => crate::refusal::feed::HintRelay::BYTES.to_vec(),
+            // A line is its own frame type; its bytes are that line's frame.
+            OutputItem::Hint(kind) => framed(*kind),
             OutputItem::Takeover { .. } => Vec::new(),
         })
         .collect()
@@ -882,10 +922,7 @@ fn a_hint_is_written_at_a_safe_boundary_and_never_during_a_takeover() {
     let (mut relay, hint, _route) = fresh_routed();
     fire_hint(&hint, &mut relay, now);
     let out = frames(&mut relay);
-    assert_eq!(
-        data_of(&out),
-        crate::refusal::feed::HintRelay::BYTES.to_vec()
-    );
+    assert_eq!(data_of(&out), framed(HintKind::Refusal));
     // Mid-sequence: held until the boundary.
     let (mut relay, hint, _route) = fresh_routed();
     relay.guest_output(b"\x1b[3".to_vec(), now);
@@ -897,7 +934,7 @@ fn a_hint_is_written_at_a_safe_boundary_and_never_during_a_takeover() {
     let out = frames(&mut relay);
     let data = data_of(&out);
     assert!(
-        data.ends_with(crate::refusal::feed::HintRelay::BYTES),
+        data.ends_with(&framed(HintKind::Refusal)),
         "the hint goes out at the boundary the guest's bytes reached"
     );
     // During a takeover it waits for the leave.
@@ -910,7 +947,7 @@ fn a_hint_is_written_at_a_safe_boundary_and_never_during_a_takeover() {
     assert!(data_of(&out).is_empty(), "never between enter and leave");
     // With no route the relay emits nothing: the hint already went to stderr.
     let mut relay = fresh();
-    relay.hint_fired(now);
+    relay.hint_fired(HintKind::Refusal, now);
     assert!(frames(&mut relay).is_empty());
 }
 
@@ -958,13 +995,15 @@ fn a_forced_cut_does_not_queue_the_hint_inside_the_stalled_sequence() {
     let queued = relay
         .outbound
         .iter()
-        .any(|item| matches!(item, Outbound::Frame(OutputItem::Hint)));
+        .any(|item| matches!(item, Outbound::Frame(OutputItem::Hint(_))));
     assert!(
         !queued,
         "the visible question replaced the hint: {:?}",
         relay.outbound
     );
-    let route = relay.take_hint().expect("a route to hand back");
+    let route = relay
+        .take_hint(HintKind::Refusal)
+        .expect("a route to hand back");
     assert!(!route.detach(), "the question delivered the notice");
 }
 
@@ -981,10 +1020,15 @@ fn one_fire_queues_exactly_one_hint_and_a_queued_hint_is_owed_to_stderr() {
     let queued = relay.outbound.len();
     assert_eq!(queued, 1, "one hint per fire, and one fire per session");
     // Not yet handed over: the epilogue would still print it.
-    relay.hint_fired(now);
+    relay.hint_fired(HintKind::Refusal, now);
     assert_eq!(relay.outbound.len(), 1, "a second fire queues nothing new");
-    assert!(relay.hint_queued, "the bytes are queued, not delivered");
-    let hint = relay.take_hint().expect("a route to hand back");
+    assert!(
+        relay.hints[HintKind::Refusal.index()].queued,
+        "the bytes are queued, not delivered"
+    );
+    let hint = relay
+        .take_hint(HintKind::Refusal)
+        .expect("a route to hand back");
     assert!(
         hint.detach(),
         "a queued hint that never reached the writer is owed to stderr"
@@ -1007,7 +1051,7 @@ fn answering_the_question_claims_the_hint_instead_of_printing_it_under_the_answe
         !relay
             .outbound
             .iter()
-            .any(|item| matches!(item, Outbound::Frame(OutputItem::Hint))),
+            .any(|item| matches!(item, Outbound::Frame(OutputItem::Hint(_)))),
         "a hint owed while a question is up waits for its answer: {:?}",
         relay.outbound
     );
@@ -1021,11 +1065,13 @@ fn answering_the_question_claims_the_hint_instead_of_printing_it_under_the_answe
         !relay
             .outbound
             .iter()
-            .any(|item| matches!(item, Outbound::Frame(OutputItem::Hint))),
+            .any(|item| matches!(item, Outbound::Frame(OutputItem::Hint(_)))),
         "the answer must not be followed by the hint: {:?}",
         relay.outbound
     );
-    let route = relay.take_hint().expect("a route to hand back");
+    let route = relay
+        .take_hint(HintKind::Refusal)
+        .expect("a route to hand back");
     assert!(
         !route.detach(),
         "a claimed hint is delivered by the question, not by the epilogue"
@@ -1045,11 +1091,13 @@ fn a_hint_fired_after_the_answer_stays_quiet() {
         !relay
             .outbound
             .iter()
-            .any(|item| matches!(item, Outbound::Frame(OutputItem::Hint))),
+            .any(|item| matches!(item, Outbound::Frame(OutputItem::Hint(_)))),
         "a claimed hint never queues, even if it fires later: {:?}",
         relay.outbound
     );
-    let route = relay.take_hint().expect("a route to hand back");
+    let route = relay
+        .take_hint(HintKind::Refusal)
+        .expect("a route to hand back");
     assert!(!route.detach(), "nothing is owed to stderr");
 }
 
@@ -1071,7 +1119,7 @@ fn a_question_withdrawn_unanswered_leaves_the_hint_to_stderr() {
         relay
             .outbound
             .iter()
-            .any(|item| matches!(item, Outbound::Frame(OutputItem::Hint))),
+            .any(|item| matches!(item, Outbound::Frame(OutputItem::Hint(_)))),
         "an unanswered question does not claim the hint: {:?}",
         relay.outbound
     );
@@ -1083,7 +1131,7 @@ fn a_guest_frame_identical_to_the_hint_is_not_mistaken_for_it() {
     // same bytes consumed its one-shot claim.
     let (mut relay, hint, _route) = fresh_routed();
     let now = Instant::now();
-    relay.guest_output(crate::refusal::feed::HintRelay::BYTES.to_vec(), now);
+    relay.guest_output(framed(HintKind::Refusal), now);
     fire_hint(&hint, &mut relay, now);
     let first = relay.take_outbound_if(|_| true).expect("the guest frame");
     assert!(
@@ -1091,9 +1139,9 @@ fn a_guest_frame_identical_to_the_hint_is_not_mistaken_for_it() {
         "the guest's frame is data, not the hint: {first:?}"
     );
     let second = relay.take_outbound_if(|_| true).expect("the hint frame");
-    assert!(matches!(second, Outbound::Frame(OutputItem::Hint)));
+    assert!(matches!(second, Outbound::Frame(OutputItem::Hint(_))));
     // Popped but never accepted by the writer: still owed to stderr.
-    let route = relay.take_hint().expect("a route");
+    let route = relay.take_hint(HintKind::Refusal).expect("a route");
     assert!(
         route.detach(),
         "a hint popped but not accepted is still owed to stderr"
@@ -1107,13 +1155,18 @@ fn a_hint_handed_to_the_writer_is_not_printed_again() {
     fire_hint(&hint, &mut relay, now);
     // The pump hands the frame to the writer.
     let taken = relay.take_outbound_if(|_| true).expect("the hint frame");
-    assert!(matches!(taken, Outbound::Frame(OutputItem::Hint)));
-    assert!(!relay.hint_queued, "handed over, so no longer queued");
+    assert!(matches!(taken, Outbound::Frame(OutputItem::Hint(_))));
+    assert!(
+        !relay.hints[HintKind::Refusal.index()].queued,
+        "handed over, so no longer queued"
+    );
     // The pump marks the route written when the writer accepts the bytes (M9); this
     // test has no pump, so it performs that acceptance itself.
-    let route = relay.hint_route().expect("a route");
+    let route = relay.hint_route(HintKind::Refusal).expect("a route");
     assert!(route.take(), "accepting the frame owns the hint");
-    let hint = relay.take_hint().expect("a route to hand back");
+    let hint = relay
+        .take_hint(HintKind::Refusal)
+        .expect("a route to hand back");
     assert!(
         !hint.detach(),
         "a hint the writer accepted is not printed a second time"
@@ -1480,6 +1533,7 @@ fn a_grant_whose_result_no_longer_fits_still_ends_the_takeover() {
         Size { rows: 30, cols: 80 },
         Timings::default(),
         None,
+        None,
     );
     let now = Instant::now();
     let visible = asking(&mut relay, now);
@@ -1539,6 +1593,7 @@ fn every_redraw_lays_out_the_whole_question() {
             cols: crate::access_prompt::screen::MIN_COLS,
         },
         Timings::default(),
+        None,
         None,
     );
     let now = Instant::now();
@@ -1714,6 +1769,7 @@ fn an_answer_that_closes_the_question_does_not_grant_or_queue_a_second_leave() {
         "3f9a12c4".to_owned(),
         Size { rows: 30, cols: 80 },
         Timings::default(),
+        None,
         None,
     );
     let now = Instant::now();
@@ -1988,4 +2044,480 @@ fn nothing_counts_until_the_question_has_been_readable_for_the_settle_window() {
     // One instant later the same bytes are the operator's.
     key(&mut relay, b's', 7, visible);
     assert_eq!(relay.answer_line, "s");
+}
+
+// -- sequenced prompt signals (B1–B3) --------------------------------------
+
+/// The signals one step emitted, drained as the prompt's loop drains them.
+fn drained(relay: &mut Relay) -> Vec<PromptSignal> {
+    relay.drain_signals()
+}
+
+/// The identity a signal carries, so a test can assert the tuple and the variant
+/// separately.
+fn identity(signal: &PromptSignal) -> Option<(&str, u64)> {
+    match signal {
+        PromptSignal::Baselined {
+            entry_id, count, ..
+        }
+        | PromptSignal::Queued {
+            entry_id, count, ..
+        }
+        | PromptSignal::Cutting {
+            entry_id, count, ..
+        }
+        | PromptSignal::Shown {
+            entry_id, count, ..
+        }
+        | PromptSignal::Declined {
+            entry_id, count, ..
+        }
+        | PromptSignal::AlreadyAnswered {
+            entry_id, count, ..
+        }
+        | PromptSignal::Answered {
+            entry_id, count, ..
+        } => Some((entry_id.as_str(), *count)),
+        PromptSignal::InputEnded { .. } => None,
+    }
+}
+
+#[test]
+fn an_offer_is_queued_then_cutting_and_a_visible_question_is_shown() {
+    let now = Instant::now();
+    let mut relay = fresh();
+    relay.offer(candidate(&allowance(), 1), now);
+    let out = drained(&mut relay);
+    assert_eq!(out.len(), 2, "{out:?}");
+    assert!(matches!(out[0], PromptSignal::Queued { .. }), "{out:?}");
+    assert!(matches!(out[1], PromptSignal::Cutting { .. }), "{out:?}");
+    assert_eq!(identity(&out[0]), Some(("46d712fd", 1)));
+    assert_eq!(
+        match &out[0] {
+            PromptSignal::Queued { observed_at, .. } => *observed_at,
+            other => panic!("{other:?}"),
+        },
+        now.into_std(),
+        "every signal carries the instant its transition happened"
+    );
+    // Visibility, as the terminal reports it, is the third.
+    let g = relay.generation();
+    relay.written(g, now);
+    let laid = screen::layout(&relay.current_view(), relay.size).expect("fits");
+    let reply = reply_to(laid);
+    relay.host_input(chunk(reply.as_bytes(), 1), now);
+    let out = drained(&mut relay);
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert!(matches!(out[0], PromptSignal::Shown { .. }), "{out:?}");
+    assert_eq!(identity(&out[0]), Some(("46d712fd", 1)));
+}
+
+#[test]
+fn an_overflowing_offer_is_declined_and_a_suppressed_destination_says_nothing() {
+    let now = Instant::now();
+    let mut relay = fresh();
+    // Hold the terminal with one question so the rest only queue.
+    relay.offer(candidate(&allowance(), 1), now);
+    let g = relay.generation();
+    relay.written(g, now);
+    for index in 0..crate::access_prompt::guard::MAX_WAITING {
+        let destination =
+            Allowance::parse(&format!("tcp://[203.0.113.{}]:443", 20 + index)).unwrap();
+        relay.offer(candidate(&destination, 1), now);
+    }
+    let _ = drained(&mut relay);
+    // One more destination: the queue is full.
+    let overflowed = Allowance::parse("tcp://[203.0.113.99]:443").unwrap();
+    relay.offer(candidate(&overflowed, 3), now);
+    let out = drained(&mut relay);
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert!(matches!(out[0], PromptSignal::Declined { .. }), "{out:?}");
+    assert_eq!(identity(&out[0]), Some(("46d712fd", 3)));
+
+    // A destination the operator answered with `n`: no signal at all, because the
+    // operator asked for silence about it.
+    let suppressed = Allowance::parse("tcp://[203.0.113.98]:443").unwrap();
+    relay.suppressed.push(suppressed.clone());
+    relay.offer(candidate(&suppressed, 1), now);
+    assert!(drained(&mut relay).is_empty());
+}
+
+#[test]
+fn a_settling_destination_and_closed_input_are_declined() {
+    let now = Instant::now();
+    let mut relay = fresh();
+    relay.settle(allowance());
+    relay.offer(candidate(&allowance(), 2), now);
+    let out = drained(&mut relay);
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert!(matches!(out[0], PromptSignal::Declined { .. }), "{out:?}");
+    // Input ended: the queue can never be asked, and the end itself is one signal.
+    let mut relay = fresh();
+    relay.input_ended(now);
+    assert_eq!(identity(&drained(&mut relay)[0]), None);
+    relay.offer(candidate(&allowance(), 1), now);
+    let out = drained(&mut relay);
+    assert!(matches!(out[0], PromptSignal::Declined { .. }), "{out:?}");
+}
+
+#[test]
+fn a_question_that_does_not_fit_is_declined_at_the_cut() {
+    let now = Instant::now();
+    let mut relay = Relay::new(
+        "3f9a12c4".to_owned(),
+        Size {
+            rows: crate::access_prompt::screen::MIN_ROWS - 1,
+            cols: 80,
+        },
+        Timings::default(),
+        None,
+        None,
+    );
+    relay.offer(candidate(&allowance(), 1), now);
+    let out = drained(&mut relay);
+    assert_eq!(out.len(), 3, "{out:?}");
+    assert!(matches!(out[2], PromptSignal::Declined { .. }), "{out:?}");
+    assert_eq!(identity(&out[2]), Some(("46d712fd", 1)));
+    assert_eq!(relay.phase_name(), "idle");
+}
+
+#[test]
+fn a_resize_that_no_longer_fits_declines_the_question() {
+    let now = Instant::now();
+    let mut relay = fresh();
+    let visible = asking(&mut relay, now);
+    let _ = (visible, drained(&mut relay));
+    relay.resized(
+        Size {
+            rows: crate::access_prompt::screen::MIN_ROWS - 1,
+            cols: 40,
+        },
+        now,
+    );
+    let out = drained(&mut relay);
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert!(matches!(out[0], PromptSignal::Declined { .. }), "{out:?}");
+}
+
+#[test]
+fn an_answer_is_answered_and_a_never_is_destination_scoped() {
+    let now = Instant::now();
+    for (line, suppress) in [(b"s", false), (b"p", false), (b"d", false), (b"n", true)] {
+        let mut relay = fresh();
+        let visible = asking(&mut relay, now);
+        let _ = drained(&mut relay);
+        typed(&mut relay, line, settled(visible));
+        let out = drained(&mut relay);
+        assert_eq!(out.len(), 1, "{line:?}: {out:?}");
+        match &out[0] {
+            PromptSignal::Answered {
+                suppress_destination,
+                destination,
+                ..
+            } => {
+                assert_eq!(*suppress_destination, suppress, "{line:?}");
+                assert_eq!(destination.to_string(), "tcp://[203.0.113.10/32]:443");
+            }
+            other => panic!("{line:?}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn typing_backspace_a_clear_and_the_settle_window_emit_nothing() {
+    let now = Instant::now();
+    let mut relay = fresh();
+    let visible = asking(&mut relay, now);
+    let _ = drained(&mut relay);
+    // A letter, a Backspace and a clear, all after the settle window and all short
+    // of Enter.
+    key(&mut relay, b's', 2, visible);
+    key(&mut relay, 0x7f, 3, visible);
+    key(&mut relay, 0x15, 4, visible);
+    assert!(drained(&mut relay).is_empty());
+    // Inside the settle window even Enter is not an answer.
+    let mut relay = fresh();
+    let visible = asking(&mut relay, now);
+    let _ = drained(&mut relay);
+    let too_soon = visible - super::SETTLE_MS + std::time::Duration::from_millis(1);
+    for (epoch, byte) in [(2u64, b's'), (3, b'\r')] {
+        relay.host_input(chunk(&[byte], epoch), too_soon);
+    }
+    assert!(drained(&mut relay).is_empty());
+}
+
+#[test]
+fn an_unrecognised_line_and_an_s_with_no_session_offer_emit_nothing() {
+    let now = Instant::now();
+    let mut relay = fresh();
+    let visible = asking(&mut relay, now);
+    let _ = drained(&mut relay);
+    typed(&mut relay, b"xx", settled(visible));
+    assert!(drained(&mut relay).is_empty(), "not a line the guard knows");
+    // `s` with no session offer: the project-only question offers `p` and `n`.
+    let mut relay = fresh();
+    relay.offer(
+        Candidate {
+            offer: Offer::ProjectNextLaunch,
+            ..candidate(&allowance(), 1)
+        },
+        now,
+    );
+    let g = relay.generation();
+    relay.written(g, now);
+    let laid = screen::layout(&relay.current_view(), relay.size).expect("fits");
+    let reply = reply_to(laid);
+    relay.host_input(chunk(reply.as_bytes(), 1), now);
+    let visible = settled(now);
+    let _ = drained(&mut relay);
+    typed(&mut relay, b"s", visible);
+    assert!(drained(&mut relay).is_empty());
+    assert_eq!(relay.phase_name(), "asking");
+}
+
+#[test]
+fn esc_ctrl_c_and_an_empty_line_are_answers_like_a_denial() {
+    // §0.2: Esc and Ctrl-C are the operator refusing, and Enter on an empty line says
+    // the same. None of them suppresses the destination.
+    let now = Instant::now();
+    for (label, byte) in [("esc", 0x1bu8), ("ctrl-c", 0x03)] {
+        let mut relay = fresh();
+        let visible = asking(&mut relay, now);
+        let _ = drained(&mut relay);
+        key(&mut relay, byte, 2, settled(visible));
+        let out = drained(&mut relay);
+        assert_eq!(out.len(), 1, "{label}: {out:?}");
+        assert!(
+            matches!(
+                &out[0],
+                PromptSignal::Answered {
+                    suppress_destination: false,
+                    ..
+                }
+            ),
+            "{label}: {out:?}"
+        );
+    }
+    // Enter with nothing typed.
+    let mut relay = fresh();
+    let visible = asking(&mut relay, now);
+    let _ = drained(&mut relay);
+    key(&mut relay, b'\r', 2, settled(visible));
+    let out = drained(&mut relay);
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert!(
+        matches!(
+            &out[0],
+            PromptSignal::Answered {
+                suppress_destination: false,
+                ..
+            }
+        ),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn an_answer_that_arrives_while_the_cut_is_stalled_is_already_answered() {
+    // B3's other `AlreadyAnswered`: `drop_shown` while `Cutting`. The question never
+    // became visible and no frame is owed, so the attempt is disposed of as answered
+    // rather than declined.
+    let now = Instant::now();
+    let mut relay = fresh();
+    // A half escape: the cut has no safe boundary, so the offer cannot enter.
+    relay.guest_output(b"\x1b[3".to_vec(), now);
+    let _ = drained(&mut relay);
+    relay.offer(candidate(&allowance(), 1), now);
+    assert_eq!(relay.phase_name(), "cutting");
+    let _ = drained(&mut relay);
+    relay.answered(&allowance(), now);
+    let out = drained(&mut relay);
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert!(
+        matches!(out[0], PromptSignal::AlreadyAnswered { .. }),
+        "{out:?}"
+    );
+    assert_eq!(identity(&out[0]), Some(("46d712fd", 1)));
+    assert_eq!(relay.phase_name(), "idle");
+}
+
+#[test]
+fn a_resize_after_the_answer_does_not_contradict_it() {
+    // F2: host input outranks a resize, so an Enter and a `SIGWINCH` in the same turn
+    // is realistic. The attempt already has its disposition, and a second, opposite
+    // one would tell the coalescer it was both answered and declined.
+    let now = Instant::now();
+    let mut relay = fresh();
+    let visible = asking(&mut relay, now);
+    let _ = drained(&mut relay);
+    typed(&mut relay, b"s", settled(visible));
+    assert!(
+        matches!(drained(&mut relay)[0], PromptSignal::Answered { .. }),
+        "the grant is queued"
+    );
+    relay.resized(Size { rows: 12, cols: 40 }, settled(visible));
+    assert!(
+        drained(&mut relay).is_empty(),
+        "a shrink after the answer says nothing about the attempt"
+    );
+    // And the same after a refusal, which is `Restoring`.
+    let mut relay = fresh();
+    let visible = asking(&mut relay, now);
+    let _ = drained(&mut relay);
+    typed(&mut relay, b"d", settled(visible));
+    assert!(matches!(
+        drained(&mut relay)[0],
+        PromptSignal::Answered { .. }
+    ));
+    relay.resized(Size { rows: 12, cols: 40 }, settled(visible));
+    assert!(drained(&mut relay).is_empty());
+}
+
+#[test]
+fn an_answer_given_elsewhere_is_already_answered() {
+    let now = Instant::now();
+    let mut relay = fresh();
+    let visible = asking(&mut relay, now);
+    let _ = (visible, drained(&mut relay));
+    relay.answered(&allowance(), now);
+    let out = drained(&mut relay);
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert!(
+        matches!(out[0], PromptSignal::AlreadyAnswered { .. }),
+        "{out:?}"
+    );
+    assert_eq!(identity(&out[0]), Some(("46d712fd", 1)));
+}
+
+#[test]
+fn the_facade_s_outcomes_are_distinct_signals() {
+    // B3: "already answered" is a real answer and "cannot be offered" is a
+    // decline; reporting the first as the second told the operator the prompt
+    // could not ask about something it was never going to ask.
+    let now = Instant::now();
+    let mut relay = fresh();
+    relay.already_answered("46d712fd", 4, &allowance(), now);
+    let out = drained(&mut relay);
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert!(
+        matches!(out[0], PromptSignal::AlreadyAnswered { .. }),
+        "{out:?}"
+    );
+    assert_eq!(identity(&out[0]), Some(("46d712fd", 4)));
+    relay.cannot_offer("46d712fd", 5, now);
+    let out = drained(&mut relay);
+    assert!(matches!(out[0], PromptSignal::Declined { .. }), "{out:?}");
+    assert_eq!(identity(&out[0]), Some(("46d712fd", 5)));
+}
+
+#[test]
+fn a_silent_timeout_emits_nothing_and_a_lost_input_ends_the_session_s_prompting() {
+    // 60 s with no answer: the attempt stays unanswered, so the banner stays up and
+    // nothing is signalled.
+    let now = Instant::now();
+    let mut relay = fresh();
+    let visible = asking(&mut relay, now);
+    let _ = (visible, drained(&mut relay));
+    relay.handle_deadline(visible + super::PROMPT_TIMEOUT);
+    assert_eq!(relay.phase_name(), "restoring");
+    assert!(
+        drained(&mut relay).is_empty(),
+        "a timeout is not a disposition"
+    );
+    // Input ending is one signal for the interrupted question and the queue.
+    let mut relay = fresh();
+    let visible = asking(&mut relay, now);
+    let _ = (visible, drained(&mut relay));
+    relay.input_ended(now);
+    let out = drained(&mut relay);
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert!(matches!(out[0], PromptSignal::InputEnded { .. }), "{out:?}");
+}
+
+// -- the two lines on the hint seam (§0.3) --------------------------------
+
+#[test]
+fn claiming_a_question_leaves_the_notifications_off_line_owed() {
+    // Answering tells the operator nothing about notifications, so the second line
+    // is still owed to the seam.
+    let now = Instant::now();
+    let (mut relay, _hint, off) = fresh_both();
+    let visible = asking(&mut relay, now);
+    let _ = drained(&mut relay);
+    fire_notifications_off(&off, &mut relay, now);
+    // The question is answered: that claims ADR-0064's line, and only that line.
+    let g = relay.generation();
+    typed(&mut relay, b"d", settled(visible));
+    while let Some(_item) = relay.take_outbound_if(|_| true) {}
+    relay.written(g, settled(visible));
+    let out = frames(&mut relay);
+    assert_eq!(
+        out,
+        vec![OutputItem::Hint(HintKind::NotificationsOff)],
+        "the second line goes out through the same writer"
+    );
+    let route = relay
+        .take_hint(HintKind::NotificationsOff)
+        .expect("a route to hand back");
+    assert_eq!(route.bytes(), framed(HintKind::NotificationsOff));
+}
+
+#[test]
+fn each_line_is_drained_with_its_own_bytes() {
+    let now = Instant::now();
+    let (mut relay, hint, off) = fresh_both();
+    fire_hint(&hint, &mut relay, now);
+    fire_notifications_off(&off, &mut relay, now);
+    let out = frames(&mut relay);
+    assert_eq!(
+        out,
+        vec![
+            OutputItem::Hint(HintKind::Refusal),
+            OutputItem::Hint(HintKind::NotificationsOff)
+        ]
+    );
+    // The drain's tail keeps each line's *kind*, so the writer resolves that line's
+    // bytes (never one fixed frame, Phase 3's F7) and can mark the line delivered
+    // once it is written. `hint_bytes` is that resolution.
+    let (mut relay, hint, off) = fresh_both();
+    fire_hint(&hint, &mut relay, now);
+    fire_notifications_off(&off, &mut relay, now);
+    assert_eq!(
+        relay.hint_bytes(HintKind::Refusal),
+        Some(framed(HintKind::Refusal))
+    );
+    assert_eq!(
+        relay.hint_bytes(HintKind::NotificationsOff),
+        Some(framed(HintKind::NotificationsOff))
+    );
+    let (owed, _grants) = relay.finish();
+    assert_eq!(
+        owed,
+        vec![
+            OutputItem::Hint(HintKind::Refusal),
+            OutputItem::Hint(HintKind::NotificationsOff),
+        ]
+    );
+}
+
+#[test]
+fn both_lines_are_owed_to_stderr_when_neither_reached_the_writer() {
+    // `Prompt::abandon`'s loop, per kind: at most two lines, each its own.
+    let now = Instant::now();
+    let (mut relay, hint, off) = fresh_both();
+    fire_hint(&hint, &mut relay, now);
+    fire_notifications_off(&off, &mut relay, now);
+    let mut owed = Vec::new();
+    for kind in HintKind::ALL {
+        if let Some(route) = relay.take_hint(kind) {
+            let line = route.line();
+            if route.detach() {
+                owed.push(line);
+            }
+        }
+    }
+    assert_eq!(
+        owed,
+        vec![crate::refusal::feed::HINT, crate::notify::NOTIFICATIONS_OFF]
+    );
 }

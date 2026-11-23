@@ -83,16 +83,19 @@ fn source_built_msb(workspace: &std::path::Path) -> PathBuf {
 }
 
 /// Keep both paths: macOS reports the invoked symlink, Linux resolves it.
+///
+/// `pub(crate)` for [`crate::notify::resolve_notifier`], which must look beside
+/// the *resolved* executable (a sibling bundle) and nothing else.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ExeLocation {
+pub(crate) struct ExeLocation {
     reported: PathBuf,
     resolved: Option<PathBuf>,
 }
 impl ExeLocation {
-    fn from_process() -> Option<Self> {
+    pub(crate) fn from_process() -> Option<Self> {
         std::env::current_exe().ok().map(Self::resolve)
     }
-    fn resolve(reported: PathBuf) -> Self {
+    pub(crate) fn resolve(reported: PathBuf) -> Self {
         let resolved = reported.canonicalize().ok();
         Self { reported, resolved }
     }
@@ -113,7 +116,10 @@ impl ExeLocation {
             .and_then(source_workspace)
             .or_else(|| source_workspace(&self.reported))
     }
-    fn layout_exe(&self) -> &Path {
+    /// The layout path, for [`crate::notify::resolve_notifier`]: the resolved
+    /// executable when there is one, the reported path when `canonicalize`
+    /// failed.
+    pub(crate) fn layout_exe(&self) -> &Path {
         self.resolved.as_deref().unwrap_or(&self.reported)
     }
 }

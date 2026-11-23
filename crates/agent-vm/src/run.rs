@@ -519,6 +519,8 @@ Environment:
   AGENT_VM_DEBUG_CONFIG                 dump the SandboxConfig JSON before boot
   AGENT_VM_NO_CHROME_MCP                disable Chrome MCP auto-configuration for Chrome-capable images
   AGENT_VM_NO_ACCESS_PROMPT             don't ask about refusals in the terminal (1|true|yes|on)
+  AGENT_VM_NO_NOTIFICATIONS             don't post macOS notifications for refusals (1|true|yes|on)
+  AGENT_VM_NOTIFY_TERMINAL              terminal a notification click opens (terminal|ghostty|wezterm|alacritty)
   RUST_LOG                              tracing filter (e.g. agent_vm=debug)";
 
 /// The **launch options**, flattened into the top-level [`crate::cli`] command
@@ -1970,7 +1972,53 @@ pub(crate) async fn launch(
     if let Some(warning) = access_prompt_warning {
         let _ = notices.emit(warning);
     }
+    // #501 slice 4 (§4.4): both notification settings are read at the same boundary
+    // as the prompt's, and their typo warnings go out the same way — before the I/O
+    // decision and before the session starts, so nothing writes inline later (S7).
+    let notify_settings = crate::notify::read_settings();
+    for warning in notify_settings.warnings.clone() {
+        let _ = notices.emit(warning);
+    }
     let direct_terminal = invocation.direct_io();
+    // B8: the prompt trigger is chosen where the launch's I/O mode is known, and
+    // nowhere else. Only a PTY launch whose prompt is eligible (R2) may show a
+    // question, so only that launch lets an attempt wait for the prompt's own
+    // signal; everything else posts on first sight rather than waiting 5 s for a
+    // question that cannot come.
+    let prompt_mode = match direct_terminal {
+        Some(crate::direct_terminal::DirectIo::Pty)
+            if crate::access_prompt::can_prompt(&access_prompt_setting) =>
+        {
+            crate::notify::PromptMode::AfterPromptGrace
+        }
+        _ => crate::notify::PromptMode::Immediate,
+    };
+    // B8: a click hours later must open *this* session's report, so the banner
+    // carries the effective values this launch resolved — the canonical project and
+    // the state root it actually used — rather than re-deriving them then.
+    live.start_notifier(
+        crate::notify::Launch {
+            session: live.session_id().clone(),
+            project: project.path().to_owned(),
+            // `ProjectSession::for_project` resolved this session's directory as
+            // `<state_root>/<project_hash>`, so its parent is the root this launch
+            // actually used: re-reading the environment here could name another one.
+            state_root: session
+                .state_dir
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| session.state_dir.clone()),
+            project_hash: session.project_hash.clone(),
+            project_name: project
+                .path()
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| project.path().to_string_lossy().into_owned()),
+            terminal: notify_settings.terminal,
+        },
+        prompt_mode,
+        &notify_settings,
+    );
     let exec_io = match direct_terminal {
         Some(crate::direct_terminal::DirectIo::Pty) => ExecIo::Attach,
         Some(crate::direct_terminal::DirectIo::Stream) => ExecIo::Stream,
@@ -4900,6 +4948,7 @@ mod tests {
             "AGENT_VM_ROOT",
             "AGENT_VM_INSECURE_REGISTRY",
             crate::access_prompt::SETTING,
+            crate::notify::NO_NOTIFICATIONS_SETTING,
         ] {
             let line = long_help
                 .lines()

@@ -14,6 +14,12 @@ written through the relay's writer) and
 [ADR-0066](0066-live-egress-allowances-and-writer.md) (a second in-process caller
 of the grant path, `grant_unless_answered`, and the answers wakeup).
 
+> **Annotated by [ADR-0073](0073-macos-notification-helper.md) (#501 slice 4).** The
+> relay's transitions also publish sequenced `PromptSignal`s, and a macOS banner's
+> 5 s grace runs from the question becoming visible — so this prompt's submitted-line
+> rule is what decides whether a banner is owed at all. Nothing in this ADR's own
+> behaviour changes.
+
 ## Context
 
 #494 settled the shape of the answer ("hold, don't pause the VM"), #317 the keys

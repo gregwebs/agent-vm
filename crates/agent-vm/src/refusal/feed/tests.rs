@@ -212,6 +212,29 @@ async fn a_redirected_hint_is_delivered_once_and_its_wait_parks_once_written() {
     assert!(!route.detach(), "a written hint is not owed to stderr");
 }
 
+/// Each `Hint` frames its own line. The relay used to frame one fixed constant, so a
+/// redirected notifications-off line would have printed the refusal sentence
+/// (Phase 3's F7).
+#[test]
+fn each_hint_frames_its_own_line() {
+    let refusal = crate::refusal::feed::Hint::new();
+    let refusals = Arc::new(refusal);
+    assert_eq!(
+        refusals.redirect().bytes(),
+        format!("\r{HINT}\r\n").into_bytes()
+    );
+    let off = Arc::new(crate::refusal::feed::Hint::notifications_off());
+    assert_eq!(
+        off.redirect().bytes(),
+        format!("\r{}\r\n", crate::notify::NOTIFICATIONS_OFF).into_bytes()
+    );
+    assert_ne!(
+        crate::notify::NOTIFICATIONS_OFF,
+        HINT,
+        "the two lines are different facts and must differ"
+    );
+}
+
 #[test]
 fn a_hint_fired_before_it_is_redirected_stays_on_stderr() {
     let (hint, lines) = Hint::capture();
@@ -524,7 +547,11 @@ fn an_older_snapshot_never_overwrites_the_final() {
     persist.post(snapshot(1, false));
     persist.post(snapshot(2, false));
     let final_wait = persist.post_final(snapshot(3, true));
-    assert!(final_wait.wait(FINAL_WAIT), "the final write landed");
+    assert_eq!(
+        final_wait.wait(FINAL_WAIT),
+        crate::notify::FinalWriteStatus::Persisted,
+        "the final write landed"
+    );
     // A post after the final one is ignored, however new it claims to be.
     persist.post(snapshot(9, false));
     std::thread::sleep(Duration::from_millis(100));
@@ -560,7 +587,11 @@ fn a_post_cannot_displace_a_pending_final() {
     persist.post(snapshot(2, false));
     std::thread::sleep(Duration::from_millis(50));
     drop(held);
-    assert!(wait.wait(FINAL_WAIT), "the final write landed");
+    assert_eq!(
+        wait.wait(FINAL_WAIT),
+        crate::notify::FinalWriteStatus::Persisted,
+        "the final write landed"
+    );
     let log = dir.read().unwrap();
     let mine = log
         .sessions
@@ -618,8 +649,9 @@ fn a_pending_final_survives_the_persister_s_own_drop() {
     drop(persist);
     handle.release_writer();
 
-    assert!(
+    assert_eq!(
         wait.wait(FINAL_WAIT),
+        crate::notify::FinalWriteStatus::Persisted,
         "the detached writer still owed the final record after `Drop`"
     );
     let log = dir.read().unwrap();
@@ -642,8 +674,9 @@ fn final_wait_is_bounded_with_a_held_lock() {
     let started = std::time::Instant::now();
     let finished = wait.wait(Duration::from_millis(200));
     let elapsed = started.elapsed();
-    assert!(
-        !finished,
+    assert_eq!(
+        finished,
+        crate::notify::FinalWriteStatus::TimedOut,
         "the write could not land while the lock was held"
     );
     assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");

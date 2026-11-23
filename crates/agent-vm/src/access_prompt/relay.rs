@@ -37,6 +37,7 @@ use crate::access_prompt::screen::{self, OfferText, ResultView, Status, View};
 use crate::access_prompt::vt::{RestorableModes, Screen, VtState};
 use crate::allowances::{GrantScope, Offer, PromptGrant};
 use crate::egress_policy::Allowance;
+use crate::notify::PromptSignal;
 
 /// One refusal that may become a question. Built by the facade, which applies
 /// the eligibility rules (R4, R5, R7); the relay only decides *when*.
@@ -100,14 +101,64 @@ pub(crate) struct GrantRequest {
     pub(crate) destination: Allowance,
 }
 
+/// Which of the session's two once-per-session lines a hint frame carries.
+///
+/// Two lines, two kinds, one seam (#501 slice 4 §0.3): the notifications-off line
+/// rides ADR-0064's hint route rather than a frame type of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HintKind {
+    /// ADR-0064's line: the sandbox refused a guest network request.
+    Refusal,
+    /// macOS notifications are off, so a banner cannot carry the same news.
+    NotificationsOff,
+}
+
+impl HintKind {
+    /// Both kinds, in the order [`Relay::hints`] holds them.
+    pub(crate) const ALL: [Self; 2] = [Self::Refusal, Self::NotificationsOff];
+
+    fn index(self) -> usize {
+        match self {
+            Self::Refusal => 0,
+            Self::NotificationsOff => 1,
+        }
+    }
+}
+
+/// One hint's route and delivery state (R26).
+struct HintSlot {
+    /// The session's route for this line, when stderr is the same terminal. The
+    /// relay is what marks the line delivered: it is the only place that knows
+    /// when today's bytes were handed to the writer.
+    route: Option<crate::refusal::feed::HintRelay>,
+    /// Owed to the relay: fired, not yet queued.
+    pending: bool,
+    /// Queued in `outbound`, not yet handed over.
+    queued: bool,
+    /// Emitted (or had no route here), so a later fire adds nothing.
+    done: bool,
+}
+
+impl HintSlot {
+    fn new(route: Option<crate::refusal::feed::HintRelay>) -> Self {
+        Self {
+            route,
+            pending: false,
+            queued: false,
+            done: false,
+        }
+    }
+}
+
 /// One frame for the writer, mapped 1:1 onto its `OutputFrame`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum OutputItem {
     Data(Vec<u8>),
-    /// The session's one-time hint. A distinct frame so nothing has to identify it
-    /// by comparing bytes (a guest frame could be byte-identical), and so the relay
-    /// can mark it delivered only when the writer accepts it (M9/N6).
-    Hint,
+    /// One of the session's two once-per-session lines. A distinct frame so
+    /// nothing has to identify it by comparing bytes (a guest frame could be
+    /// byte-identical), and so the relay can mark it delivered only when the
+    /// writer accepts it (M9/N6).
+    Hint(HintKind),
     Takeover {
         generation: u64,
         step: Step,
@@ -302,17 +353,12 @@ pub(crate) struct Relay {
     /// request named, cost the 1 s fallback and turn cursor-position replies off for
     /// the session (finding 20).
     asked_position: Option<Position>,
-    /// A hint is owed to the relay and must be written at the next safe boundary
-    /// before any prompt frame (R26).
-    hint_pending: bool,
-    /// The session's hint route, when stderr is the same terminal. The relay is what
-    /// marks the hint delivered: it is the only place that knows when today's bytes
-    /// were handed to the writer.
-    hint: Option<crate::refusal::feed::HintRelay>,
-    /// The hint's bytes are queued in `outbound` but have not been handed over.
-    hint_queued: bool,
-    /// The one hint this session gets has been emitted (or had no route here).
-    hint_done: bool,
+    /// The two once-per-session lines, indexed by [`HintKind::index`] (R26).
+    hints: [HintSlot; 2],
+    /// Sequenced prompt lifecycle signals for the notifier (B1–B3). Drained by the
+    /// prompt's loop, so the relay stays synchronous and I/O-free: it records the
+    /// transition, and the loop hands it on with a non-blocking send (R12).
+    signals: Vec<PromptSignal>,
     /// Set when visibility was decided; the loop flushes the terminal's input and
     /// reports the reader's counter before any further input is classified.
     flush_pending: bool,
@@ -326,11 +372,14 @@ pub(crate) struct Relay {
 }
 
 impl Relay {
+    /// A relay over both hint routes: stderr is this terminal, so each line goes
+    /// out through the writer that owns the screen.
     pub(crate) fn new(
         session: String,
         size: Size,
         timings: Timings,
-        hint: Option<crate::refusal::feed::HintRelay>,
+        refusal: Option<crate::refusal::feed::HintRelay>,
+        notifications_off: Option<crate::refusal::feed::HintRelay>,
     ) -> Self {
         Self {
             vt: VtState::new(),
@@ -355,10 +404,8 @@ impl Relay {
             result: None,
             linger_started: false,
             asked_position: None,
-            hint_pending: false,
-            hint,
-            hint_queued: false,
-            hint_done: false,
+            hints: [HintSlot::new(refusal), HintSlot::new(notifications_off)],
+            signals: Vec::new(),
             flush_pending: false,
             grant_scope: None,
             unanswered_in_a_row: 0,
@@ -396,9 +443,36 @@ impl Relay {
             .count()
     }
 
-    /// The hint route, for the pump's delivery wrapper (M9).
-    pub(crate) fn hint_route(&self) -> Option<crate::refusal::feed::HintRelay> {
-        self.hint.clone()
+    /// The hint route for one line, for the pump's delivery wrapper (M9).
+    pub(crate) fn hint_route(&self, kind: HintKind) -> Option<crate::refusal::feed::HintRelay> {
+        self.hints[kind.index()].route.clone()
+    }
+
+    /// The bytes the writer must write for one line, when that line is routed here.
+    pub(crate) fn hint_bytes(&self, kind: HintKind) -> Option<Vec<u8>> {
+        self.hints[kind.index()]
+            .route
+            .as_ref()
+            .map(|hint| hint.bytes())
+    }
+
+    /// Every signal the relay emitted since the last drain, in the order the
+    /// transitions happened. The loop hands them to the notifier and nothing else
+    /// reads them, so a drain that never happens costs notifications, not the
+    /// session.
+    pub(crate) fn drain_signals(&mut self) -> Vec<PromptSignal> {
+        std::mem::take(&mut self.signals)
+    }
+
+    /// `Baselined`: an entry the prompt started with, so it will never ask for
+    /// `<= count` (R6, B1). Named for every entry in the subscription's snapshot,
+    /// not only the ones this launch could ask about.
+    pub(crate) fn baseline(&mut self, entry_id: &str, count: u64, now: Instant) {
+        self.signals.push(PromptSignal::Baselined {
+            entry_id: entry_id.to_owned(),
+            count,
+            observed_at: now.into_std(),
+        });
     }
 
     pub(crate) fn wants_host_input(&self) -> bool {
@@ -487,7 +561,7 @@ impl Relay {
         };
         self.unanswered_in_a_row = 0;
         if let Some((g, answer)) = answer {
-            self.answer(g, answer);
+            self.answer(g, answer, now);
         }
         InputRoute::Consumed
     }
@@ -545,6 +619,15 @@ impl Relay {
                 visible_at: now,
                 visible_epoch: None,
             };
+            // `Shown` is visibility, not the question's existence: the 5 s grace and
+            // the settle window both run from here (B2).
+            if let Some(item) = &self.shown {
+                self.signals.push(PromptSignal::Shown {
+                    entry_id: item.entry_id.clone(),
+                    count: item.count,
+                    observed_at: now.into_std(),
+                });
+            }
             self.status = Status::Asking;
             self.flush_pending = true;
             self.unanswered_in_a_row = 0;
@@ -562,14 +645,47 @@ impl Relay {
     /// milliseconds (the guest exited) was never readable, and the hint is then the
     /// only notice the operator ever gets.
     fn claim_hint(&mut self) {
-        self.hint_done = true;
-        self.hint_pending = false;
-        if let Some(hint) = &self.hint {
+        // Only ADR-0064's line. Answering a question tells the operator nothing
+        // about notifications, so a notifications-off line is still owed.
+        let slot = &mut self.hints[HintKind::Refusal.index()];
+        slot.done = true;
+        slot.pending = false;
+        if let Some(hint) = &slot.route {
             hint.claim();
         }
     }
 
-    fn answer(&mut self, g: u64, answer: Answer) {
+    /// `Declined`: the prompt will not ask this attempt.
+    fn signal_declined(&mut self, entry_id: &str, count: u64, now: Instant) {
+        self.signals.push(PromptSignal::Declined {
+            entry_id: entry_id.to_owned(),
+            count,
+            observed_at: now.into_std(),
+        });
+    }
+
+    /// The same, for the question on screen, when the caller has no identity of its
+    /// own (a decline, a resize).
+    fn signal_declined_shown(&mut self, now: Instant) {
+        if let Some(item) = &self.shown {
+            let (entry_id, count) = (item.entry_id.clone(), item.count);
+            self.signal_declined(&entry_id, count, now);
+        }
+    }
+
+    /// `Answered`: a submitted line, Esc or Ctrl-C. `suppress_destination` is `true`
+    /// only for `n`/`never`, which ends that destination for this session.
+    fn signal_answered(&mut self, item: &Item, suppress_destination: bool, now: Instant) {
+        self.signals.push(PromptSignal::Answered {
+            entry_id: item.entry_id.clone(),
+            count: item.count,
+            destination: item.destination.clone(),
+            suppress_destination,
+            observed_at: now.into_std(),
+        });
+    }
+
+    fn answer(&mut self, g: u64, answer: Answer, now: Instant) {
         let Some(item) = self.shown.clone() else {
             return;
         };
@@ -586,8 +702,16 @@ impl Relay {
                 // (M6). That redraw can also *close* the question (`TooSmall`); if it
                 // did, the answer is dropped: granting into a closing takeover queued a
                 // second Leave the writer refuses, and the session ended with a writer
-                // error (round 3, A R2-1/B B1).
+                // error (round 3, A R2-1/B B1). A dropped answer is a decline, not an
+                // answer (§0.2).
+                //
+                // Unreachable through the public seam, and kept anyway: the status row
+                // is always present, so the only layout that fails is a terminal below
+                // the minimum — and a shrink reaches `resized`, which declines first.
+                // There is deliberately no test for this arm; it is the guard that
+                // keeps a future status row from re-opening the writer-error defect.
                 if !self.redraw_status(Status::Allowing) {
+                    self.signal_declined(&item.entry_id, item.count, now);
                     return;
                 }
                 self.outbound.push_back(Outbound::Grant(GrantRequest {
@@ -595,10 +719,17 @@ impl Relay {
                     scope,
                     destination: item.destination.clone(),
                 }));
+                // Count-scoped and emitted only once the grant is enqueued: it says
+                // the attempt is answered, never that the grant succeeded (B3).
+                self.signal_answered(&item, false, now);
                 self.phase = Phase::Granting { g };
             }
-            Answer::Refuse => self.close(Close::Refused),
+            Answer::Refuse => {
+                self.signal_answered(&item, false, now);
+                self.close(Close::Refused);
+            }
             Answer::StopAsking => {
+                self.signal_answered(&item, true, now);
                 self.suppressed.push(item.destination.clone());
                 self.close(Close::StopAsking);
             }
@@ -678,29 +809,33 @@ impl Relay {
     }
 
     fn emit_hint_if_due(&mut self) {
-        if !self.hint_pending {
-            return;
-        }
-        // No route (stderr is not this terminal): the hint already went to stderr,
-        // so the relay has nothing to do with it.
-        let Some(hint) = &self.hint else {
-            self.hint_pending = false;
-            self.hint_done = true;
-            return;
-        };
-        let _ = hint;
         // Only with no question in flight. A hint written while a takeover is being
         // prepared lands on the main screen, which the leave restores — so it would
         // appear *under* the operator's answer, the very thing the claim prevents.
         // `written` retries this when the leave returns the relay to `Idle`.
-        if matches!(self.phase, Phase::Idle { .. }) && self.vt.at_safe_boundary() {
+        if !matches!(self.phase, Phase::Idle { .. }) || !self.vt.at_safe_boundary() {
+            return;
+        }
+        for kind in HintKind::ALL {
+            let slot = &mut self.hints[kind.index()];
+            if !slot.pending {
+                continue;
+            }
+            // No route (stderr is not this terminal): the line already went to
+            // stderr, so the relay has nothing to do with it.
+            let Some(_) = &slot.route else {
+                slot.pending = false;
+                slot.done = true;
+                continue;
+            };
             // Queue it exactly once, as its own frame. It is marked written only when
-            // the writer accepts it; a frame queued and then discarded by a forced
-            // end still belongs to stderr, and the epilogue prints it.
-            self.outbound.push_back(Outbound::Frame(OutputItem::Hint));
-            self.hint_pending = false;
-            self.hint_queued = true;
-            self.hint_done = true;
+            // the writer accepts it; a frame queued and then discarded by a forced end
+            // still belongs to stderr, and the epilogue prints it.
+            self.outbound
+                .push_back(Outbound::Frame(OutputItem::Hint(kind)));
+            slot.pending = false;
+            slot.queued = true;
+            slot.done = true;
         }
     }
 
@@ -709,9 +844,15 @@ impl Relay {
     /// A refusal worth asking about. The facade already applied R4/R5/R7; this adds
     /// the relay's own state (suppressed, settling) and the queue rules (R22).
     pub(crate) fn offer(&mut self, candidate: Candidate, now: Instant) {
-        if self.suppressed.contains(&candidate.destination)
-            || self.settling.contains(&candidate.destination)
-        {
+        if self.suppressed.contains(&candidate.destination) {
+            // A destination the operator told us to stop asking about: nothing is
+            // asked and nothing is notified, so this attempt has no signal at all.
+            return;
+        }
+        if self.settling.contains(&candidate.destination) || !self.input_open {
+            // R29 / R23: the session will not ask, so say so rather than let the
+            // attempt wait for a question that cannot come.
+            self.signal_declined(&candidate.entry_id, candidate.count, now);
             return;
         }
         if let Some(shown) = &mut self.shown
@@ -730,9 +871,21 @@ impl Relay {
             return;
         }
         if guard::may_queue(self.waiting.len()) {
-            self.waiting.push_back(Item::from_candidate(candidate));
-        } else if !self.overflowed.contains(&candidate.destination) {
-            self.overflowed.push(candidate.destination);
+            let item = Item::from_candidate(candidate);
+            self.signals.push(PromptSignal::Queued {
+                entry_id: item.entry_id.clone(),
+                count: item.count,
+                observed_at: now.into_std(),
+            });
+            self.waiting.push_back(item);
+        } else {
+            // Overflow: the queue is full, so this attempt will not be asked. Said
+            // for every attempt, not only the first one past the cap: each is
+            // declined by its own count (R22).
+            self.signal_declined(&candidate.entry_id, candidate.count, now);
+            if !self.overflowed.contains(&candidate.destination) {
+                self.overflowed.push(candidate.destination);
+            }
         }
         // The count is part of the question (R22): a new waiting destination or a
         // new overflow is drawn, with the status the question is showing.
@@ -742,35 +895,93 @@ impl Relay {
         self.maybe_start(now);
     }
 
+    /// The facade could not turn this refusal into a candidate at all (R4, R5,
+    /// R7): non-grantable, or a host proxy in use. Nothing is asked, so the
+    /// attempt is declined and the banner route may carry it.
+    pub(crate) fn cannot_offer(&mut self, entry_id: &str, count: u64, now: Instant) {
+        self.signal_declined(entry_id, count, now);
+    }
+
     /// An answer given elsewhere reached the relay (a wakeup or a lag case).
     pub(crate) fn answered(&mut self, destination: &Allowance, now: Instant) {
+        self.dispose_answered(destination, now, None);
+    }
+
+    /// The facade's `AlreadyAnswered`: this session answered `destination` before the
+    /// prompt could ask (R5), so the attempt is a real answer, never a decline
+    /// (B3). `entry_id`/`count` are the refusal's, because nothing in the relay may
+    /// know this attempt yet.
+    pub(crate) fn already_answered(
+        &mut self,
+        entry_id: &str,
+        count: u64,
+        destination: &Allowance,
+        now: Instant,
+    ) {
+        self.dispose_answered(destination, now, Some((entry_id.to_owned(), count)));
+    }
+
+    /// Drop `destination` from the queue and, if it is the question on screen, close
+    /// it as answered. `identity` names the attempt when the caller knows it; a
+    /// shown question names itself, and its own count is the truthful one.
+    fn dispose_answered(
+        &mut self,
+        destination: &Allowance,
+        now: Instant,
+        identity: Option<(String, u64)>,
+    ) {
         self.waiting.retain(|item| item.destination != *destination);
         // `settling` is deliberately **not** pruned: R29 says a destination whose
         // grant outlived its wait is not prompted again in this session, even after
         // the late grant lands and its wakeup arrives (M10/N7).
-        let shown_answered = self
+        let shown = self
             .shown
-            .as_ref()
-            .is_some_and(|item| item.destination == *destination);
-        if shown_answered {
-            match self.phase.clone() {
-                // Nothing is queued yet: back to Idle with no frame owed.
-                Phase::Idle { .. } => {}
-                Phase::Cutting { .. } => {
-                    self.drop_shown(now);
-                }
-                Phase::Entering { g, close: None, .. } => {
-                    self.close_phase(Close::AnsweredElsewhere, g)
-                }
-                Phase::Confirming { g, close: None, .. } => {
-                    self.close_phase(Close::AnsweredElsewhere, g)
-                }
-                Phase::Asking { .. } => self.close(Close::AnsweredElsewhere),
-                // `Granting`/`Lingering` show the prompt's own answer; a wakeup
-                // changes nothing (I8, R20).
-                Phase::Granting { .. } | Phase::Lingering { .. } | Phase::Restoring { .. } => {}
-                _ => {}
+            .clone()
+            .filter(|item| item.destination == *destination);
+        let Some(item) = shown else {
+            // Nothing is on screen for this destination: the attempt is disposed of
+            // with the identity the caller carried, and no frame changes.
+            if let Some((entry_id, count)) = identity {
+                self.signals.push(PromptSignal::AlreadyAnswered {
+                    entry_id,
+                    count,
+                    destination: destination.clone(),
+                    observed_at: now.into_std(),
+                });
             }
+            return;
+        };
+        // Only a close the relay actually performs is a signal: `Granting`,
+        // `Lingering` and `Restoring` already show this question's own answer, so a
+        // wakeup changes nothing and says nothing (I8, R20).
+        let closed = match self.phase.clone() {
+            // Nothing is queued yet: back to Idle with no frame owed.
+            Phase::Idle { .. } => false,
+            Phase::Cutting { .. } => {
+                self.drop_shown(now);
+                true
+            }
+            Phase::Entering { g, close: None, .. } => {
+                self.close_phase(Close::AnsweredElsewhere, g);
+                true
+            }
+            Phase::Confirming { g, close: None, .. } => {
+                self.close_phase(Close::AnsweredElsewhere, g);
+                true
+            }
+            Phase::Asking { .. } => {
+                self.close(Close::AnsweredElsewhere);
+                true
+            }
+            _ => false,
+        };
+        if closed {
+            self.signals.push(PromptSignal::AlreadyAnswered {
+                entry_id: item.entry_id,
+                count: item.count,
+                destination: destination.clone(),
+                observed_at: now.into_std(),
+            });
         }
     }
 
@@ -819,6 +1030,13 @@ impl Relay {
         self.answer_line.clear();
         self.generation += 1;
         let g = self.generation;
+        // The backstop starts here: from now on the attempt may sit in `Cutting`
+        // without reaching a safe boundary, and its banner must not wait for one.
+        self.signals.push(PromptSignal::Cutting {
+            entry_id: item.entry_id.clone(),
+            count: item.count,
+            observed_at: now.into_std(),
+        });
         self.shown = Some(item);
         self.phase = Phase::Cutting { g, since: now };
         // A boundary already reached takes over at once.
@@ -848,6 +1066,9 @@ impl Relay {
     /// Decline the takeover at the cut: the held bytes are the guest's and go out
     /// first, in order, then the question is left to `access`.
     fn decline(&mut self, now: Instant) {
+        // The cut could not produce a question: the tracker does not know the
+        // terminal's state, or the question does not fit (R25).
+        self.signal_declined_shown(now);
         for frame in std::mem::take(&mut self.held) {
             self.release(frame);
         }
@@ -1115,7 +1336,7 @@ impl Relay {
 
     /// The terminal was resized. A question that no longer fits is refused (R25); one
     /// that still fits is redrawn at the new size.
-    pub(crate) fn resized(&mut self, size: Size, _now: Instant) {
+    pub(crate) fn resized(&mut self, size: Size, now: Instant) {
         self.size = size;
         if !self.phase.owns_terminal() {
             self.emit_hint_if_due();
@@ -1124,37 +1345,56 @@ impl Relay {
         let view = self.current_view();
         match screen::layout_with(&view, size, self.status) {
             Some(_) => self.redraw_current(),
-            None => self.close(Close::TooSmall),
+            None => {
+                // `Declined` only while the attempt is still unanswered. Host input
+                // outranks a resize, so an Enter and a `SIGWINCH` can arrive in the
+                // same turn; after an answer (`Granting`/`Lingering`) or a close
+                // (`Restoring`) the attempt already has its disposition, and a second,
+                // contradictory one would tell the coalescer both at once.
+                if matches!(
+                    self.phase,
+                    Phase::Entering { .. } | Phase::Confirming { .. } | Phase::Asking { .. }
+                ) {
+                    self.signal_declined_shown(now);
+                }
+                self.close(Close::TooSmall);
+            }
         }
     }
 
     /// Host input ended (terminal EOF/EIO, or the guest closed its input): an open
     /// question is refused and no further prompt is shown (R23).
-    pub(crate) fn input_ended(&mut self, _now: Instant) {
+    pub(crate) fn input_ended(&mut self, now: Instant) {
         self.input_open = false;
         self.waiting.clear();
+        // One signal for both halves: an interrupted question and a queue that will
+        // never be asked are the same loss of the terminal.
+        self.signals.push(PromptSignal::InputEnded {
+            observed_at: now.into_std(),
+        });
         if self.phase.owns_terminal() {
             self.close(Close::InputEnded);
         }
     }
 
-    /// The hint route, cloned for the facade's cancel-safe wait.
-    pub(crate) fn hint_handle(&self) -> Option<crate::refusal::feed::HintRelay> {
-        self.hint.clone()
+    /// The hint route for one line, cloned for the facade's cancel-safe wait.
+    pub(crate) fn hint_handle(&self, kind: HintKind) -> Option<crate::refusal::feed::HintRelay> {
+        self.hints[kind.index()].route.clone()
     }
 
-    /// Give the route back to the epilogue. `detach` then says whether a hint fired
-    /// but never reached the writer, so the epilogue prints exactly that case.
-    pub(crate) fn take_hint(&mut self) -> Option<crate::refusal::feed::HintRelay> {
-        self.hint.take()
+    /// Give one route back to the epilogue. `detach` then says whether that line
+    /// fired but never reached the writer, so the epilogue prints exactly that case.
+    pub(crate) fn take_hint(&mut self, kind: HintKind) -> Option<crate::refusal::feed::HintRelay> {
+        self.hints[kind.index()].route.take()
     }
 
-    /// A hint fired and is owed to the relay (R26).
-    pub(crate) fn hint_fired(&mut self, now: Instant) {
-        if self.hint_done {
+    /// One of the session's lines fired and is owed to the relay (R26).
+    pub(crate) fn hint_fired(&mut self, kind: HintKind, now: Instant) {
+        let slot = &mut self.hints[kind.index()];
+        if slot.done {
             return;
         }
-        self.hint_pending = true;
+        slot.pending = true;
         self.emit_hint_if_due();
         let _ = now;
     }
@@ -1253,8 +1493,8 @@ impl Relay {
                 .all(|item| matches!(item, Outbound::Grant(_)))
         })?;
         let item = self.outbound.remove(index)?;
-        if matches!(&item, Outbound::Frame(OutputItem::Hint)) {
-            self.hint_queued = false;
+        if let Outbound::Frame(OutputItem::Hint(kind)) = &item {
+            self.hints[kind.index()].queued = false;
         }
         Some(item)
     }
@@ -1271,9 +1511,9 @@ impl Relay {
         let mut grants: Vec<GrantRequest> = Vec::new();
         for outbound in std::mem::take(&mut self.outbound) {
             match outbound {
-                Outbound::Frame(OutputItem::Hint) => owed.push(OutputItem::Data(
-                    crate::refusal::feed::HintRelay::BYTES.to_vec(),
-                )),
+                // A queued line keeps its kind through the tail: the writer resolves
+                // that kind's bytes and marks the line delivered once they are
+                // written, so a line the drain wrote is not owed to stderr again.
                 Outbound::Frame(frame) => owed.push(frame),
                 Outbound::Grant(request) => grants.push(request),
                 Outbound::Nudge => {}

@@ -126,6 +126,25 @@ done
 if ((units_shard == shard)); then
     echo "ci-test-shard: the binary's unit tests are shard $shard's"
     cargo test -p agent-vm --bin agent-vm
+
+    # The `#[ignore]` child-process contract drives the production notifier
+    # backend against `harness fake-notifier` over real pipes, so it needs the
+    # harness binary: built here, and located the way `ci-contracts.sh` locates it
+    # (cargo itself is asked, because CARGO_TARGET_DIR and a configured
+    # build.target both move the binaries).
+    echo "ci-test-shard: the notifier child contract (harness fake-notifier)"
+    cargo build --locked -p agent-vm-harness --bins
+    harness_target="$(cargo metadata --locked --no-deps --format-version 1 |
+        jq -r .target_directory)" || {
+        echo "ci-test-shard: cannot read the cargo target directory" >&2
+        exit 1
+    }
+    export HARNESS_BIN_DIR="${HARNESS_BIN_DIR:-$harness_target/debug}"
+    if [[ ! -x "$HARNESS_BIN_DIR/harness" ]]; then
+        echo "ci-test-shard: harness not found at $HARNESS_BIN_DIR/harness" >&2
+        exit 1
+    fi
+    cargo test -p agent-vm --bin agent-vm notify::helper::tests::child_contract -- --ignored
 fi
 
 if ((${#targets[@]} > 0)); then

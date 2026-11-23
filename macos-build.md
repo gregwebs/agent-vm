@@ -44,12 +44,65 @@ target/macos/
 │   ├── agent-vm
 │   └── msb
 └── lib/
+    ├── AgentVMNotifier.app -> .AgentVMNotifier.gen-1.app
+    ├── .AgentVMNotifier.gen-1.app/
     └── libkrunfw.5.dylib
 ```
 
 Re-running `./script/build/macos.sh` is safe. It retains Cargo and Docker incremental output and atomically replaces the verified bundle files without requiring manual copying, signing, or environment setup. Firmware reuse also requires a clean recursive checkout, a validated dylib, and a matching `vendor/microsandbox/build/libkrunfw.5.dylib.source-sha` value for the nested firmware gitlink; a missing, stale, dirty, invalid, or force-rebuild (`MSB_FORCE_FIRMWARE_REBUILD=1`) case rebuilds into staged files and publishes the dylib before its matching stamp. The stamp is the identity of the firmware source, not release provenance.
 
 That identity also names a **shared** copy, `$XDG_CACHE_HOME/agent-vm/firmware/libkrunfw-5-<gitlink>.dylib` (or `$HOME/.cache/agent-vm/firmware/…`), which every checkout of the same pin on the host reads and a successful build writes. The Docker kernel build is the expensive stage — 983 s of a 1297 s first build in a fresh worktree here — and it builds the same *source*, so a second worktree, or one that lost its stamp, copies instead of rebuilding. The gitlink identifies the source only: the build also takes `fedora:latest`, its package mirrors, and the host `cc`, so a hit is not a bit-for-bit reproduction of what a build today would produce. A missing, unreadable, non-arm64, non-dylib, or non-loadable entry falls back to a build; a cache that cannot be written warns and does not fail the build; a build with no usable cache root still succeeds. The store is trusted local input on that basis — the key names the source, and nothing verifies who wrote the entry — so it is not provenance and nothing outside this machine should be seeded from it. Once a copy exists, the checkout's own artifact and stamp are indistinguishable from a locally built pair, so nothing downstream can tell the difference. The macOS workflow does not require `just`.
+
+### The notification helper (`lib/AgentVMNotifier.app`)
+
+The bundle also carries the macOS notification helper: a single-file Swift AppKit
+and `UserNotifications` app, compiled by the build with
+`swiftc -swift-version 5 -O -target arm64-apple-macosx12.0` and ad-hoc signed with
+`codesign --identifier dev.agent-vm.notifier`. **`swiftc` is required to build a
+bundle**, and only a bundle: `preflight_bundle` checks it for the default and
+`--dev` forms, and `--single-binary` neither runs that check nor touches a bundle.
+It comes with the Xcode Command Line Tools the build already needs.
+
+`lib/AgentVMNotifier.app` is a **relative symlink** to this build's versioned
+generation, `lib/.AgentVMNotifier.gen-<n>.app`. A rebuild stages the helper at
+`lib/.AgentVMNotifier.stage.$$`, validates it there (`plutil -lint`, arm64-only,
+`codesign --verify --deep --strict`, `--version`), renames it to the next free
+generation and swaps the symlink with one rename, so the published path never
+points at a directory being replaced. Selection, swap, retirement and registration
+run under a `mkdir` publication lock, so two builds of the same bundle cannot pick
+the same generation. **This is not bundle-wide atomicity**: `agent-vm`, `msb`,
+`libkrunfw.5.dylib` and the helper are renamed one at a time after shared
+pre-commit validation, and an interrupted publish leaves a pair that still speaks
+the helper's versioned protocol rather than a broken session.
+
+Registration is `lsregister -f lib/AgentVMNotifier.app` (overridable with
+`AGENT_VM_BUILD_LSREGISTER`), and it runs **after** the older generations are
+renamed out of their registered paths and before they are deleted. That order is
+measured rather than assumed: with two generations registered, LaunchServices
+launches the **older** one. A registration failure warns and does not fail the
+build — the files are already published, and a pruned generation's record
+disappears from LaunchServices on its own.
+
+Every copy — `target/macos`, `target/macos-dev`, a relocated bundle — shares
+`CFBundleIdentifier = dev.agent-vm.notifier`, so System Settings shows one
+"agent-vm" toggle, and LaunchServices sends a cold click to whichever copy
+registered most recently. The clicked session is still the right one: the banner
+carries its exact `--session`, `--project`, `--state-dir` and `--terminal`. A
+mixture of registered copies can therefore answer with an older *binary*; it never
+opens the wrong session.
+
+Rebuilding a generation keeps the helper's `CFBundleIdentifier` and the same
+`--identifier` in its ad-hoc signature, so macOS is not shown a new app and one
+permission toggle stands for every copy. Whether a given macOS version keeps that
+grant across a rebuild — an ad-hoc signature has no Team ID to anchor a permission
+on — is what desktop gate M7 records; Phase 0 could not answer it headlessly.
+
+Two things this helper deliberately does not do. It posts nothing where there is no
+bundle to post from — over SSH, under `sudo` or root, on Linux, in a
+`--single-binary` install, or a bare `cargo run` with no sibling `lib/` — and it
+never borrows another build's helper, because a launcher paired with a different
+build's callback is worse than no banner. Both cases keep the stderr hint and
+`agent-vm access`.
 
 ## Build a single binary
 
@@ -70,6 +123,10 @@ Old runtimes are not garbage-collected; it is safe to delete this cache when
 no runtime is in use. A later invocation recreates it. See
 [ADR-0041](docs/adr/0041-single-binary-embedded-runtime.md) for integrity policy
 and accepted gaps. This is source-buildable; publication is a follow-up.
+
+A single binary has no `lib/`, so it has no notification helper either: this form
+needs no `swiftc` and gets no macOS banners, keeping the stderr hint and
+`agent-vm access` instead.
 
 ## Fast development build
 
@@ -96,6 +153,8 @@ target/macos-dev/
 │   ├── agent-vm
 │   └── msb
 └── lib/
+    ├── AgentVMNotifier.app -> .AgentVMNotifier.gen-1.app
+    ├── .AgentVMNotifier.gen-1.app/
     └── libkrunfw.5.dylib
 ```
 
@@ -186,7 +245,27 @@ codesign --verify --strict target/macos/bin/msb
 codesign -d --entitlements - --xml target/macos/bin/msb | plutil -p -
 ```
 
-All three `lipo` commands must print only `arm64`. The entitlements must include boolean `true` values for `com.apple.security.hypervisor` and `com.apple.security.cs.disable-library-validation`.
+The notification helper has checks of its own:
+
+```bash
+helper=target/macos/lib/AgentVMNotifier.app/Contents/MacOS/AgentVMNotifier
+"$helper" --version          # agent-vm-notifier <workspace version>
+"$helper" --check-bundle      # one JSON line; "ok": true, and the sibling it would run
+lipo -archs "$helper"         # arm64
+codesign --verify --deep --strict target/macos/lib/AgentVMNotifier.app
+readlink target/macos/lib/AgentVMNotifier.app   # .AgentVMNotifier.gen-<n>.app
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+  -dump | grep -A4 'dev.agent-vm.notifier'
+```
+
+`--version` and `--check-bundle` answer with Foundation alone and never start AppKit,
+so they work on a headless runner. `--check-bundle` prints one JSON line whose
+`ok` is true only when the bundle identifier is `dev.agent-vm.notifier` and an
+executable sibling `bin/agent-vm` exists. `lsregister -dump` shows the **resolved**
+generation path (`.AgentVMNotifier.gen-<n>.app`), not the symlink, which is why the
+build registers again after every publish.
+
+All three `lipo` commands must print only `arm64`, and so must the helper's. The entitlements must include boolean `true` values for `com.apple.security.hypervisor` and `com.apple.security.cs.disable-library-validation`.
 
 Without `--xml`, newer `codesign` versions may print a human-oriented raw `[Dict]` representation that `plutil` cannot parse. The root build script extracts XML to a file before validating the entitlements.
 

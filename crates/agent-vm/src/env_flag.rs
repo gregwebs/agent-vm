@@ -273,8 +273,8 @@ mod tests {
             .collect();
         assert_eq!(
             rows.len(),
-            3,
-            "USAGE.md must mark exactly the three value-parsing vars with `(accepted:`, found: {rows:?}"
+            4,
+            "USAGE.md must mark exactly the four value-parsing vars with `(accepted:`, found: {rows:?}"
         );
         for row in rows {
             assert!(

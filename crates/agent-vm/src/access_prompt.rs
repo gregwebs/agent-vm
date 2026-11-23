@@ -32,7 +32,7 @@ use tokio::time::Instant;
 
 use crate::allowances::LiveAllowances;
 use crate::env_flag::{self, FlagValue};
-use crate::refusal::feed::{Hint, LiveRefusals};
+use crate::refusal::feed::{Hint, HintRelay, LiveRefusals};
 use crate::refusal::{SessionId, Update};
 
 /// The setting that turns the prompt off (R3).
@@ -59,7 +59,15 @@ pub(crate) struct Feed {
     pub(crate) refusals: Arc<LiveRefusals>,
     pub(crate) allowances: Arc<LiveAllowances>,
     pub(crate) session: SessionId,
+    /// ADR-0064's once-per-session line.
     pub(crate) hint: Arc<Hint>,
+    /// The macOS-notifications-off line, which rides the same seam (#501 slice 4
+    /// R6). Its own `Hint`, because answering a question claims the refusal line
+    /// only.
+    pub(crate) notifications_off: Arc<Hint>,
+    /// Where the prompt's sequenced signals go, when this launch started a
+    /// notifier (B1–B3). `None` is every launch that must not notify.
+    pub(crate) signals: Option<crate::notify::SignalSink>,
 }
 
 /// An eligible PTY launch's prompt source (R2).
@@ -77,6 +85,15 @@ pub(crate) fn read_setting() -> (FlagValue, Option<String>) {
     let value = env_flag::read(SETTING);
     let warning = warning_for(&value);
     (value, warning)
+}
+
+/// Whether this launch may show the prompt at all (R2).
+///
+/// The same decision [`Source::for_pty_launch`] makes, exposed so the launch can
+/// also choose the notifier's prompt trigger: a question that will never be asked
+/// must not hold a banner back for the prompt's grace (B8).
+pub(crate) fn can_prompt(setting: &FlagValue) -> bool {
+    eligible(&Facts::measure(setting.clone())).is_ok()
 }
 
 impl Source {
@@ -97,8 +114,7 @@ impl Source {
     /// The source, when this PTY launch may prompt. `setting` is the value
     /// [`read_setting`] already read at the launch boundary (R3: read once).
     pub(crate) fn for_pty_launch(feed: Option<Feed>, setting: FlagValue) -> Option<Self> {
-        let facts = Facts::measure(setting);
-        let eligible = eligible(&facts).is_ok();
+        let eligible = can_prompt(&setting);
         feed.filter(|_| eligible).map(|feed| Self { feed })
     }
 }
@@ -185,25 +201,44 @@ fn same_terminal() -> bool {
     }
 }
 
+/// What one refusal amounts to for the prompt (§7.2's `candidate`).
+///
+/// Four outcomes rather than `Option`: "this session already answered it" is a real
+/// answer and must not be reported as "the prompt could not ask" (B3), so the two
+/// reach the notifier as different signals.
+pub(crate) enum CandidateOutcome {
+    Offer(relay::Candidate),
+    /// R4: `agent-vm access allow <ID>` would refuse it.
+    NotGrantable,
+    /// R5: this session already granted the destination.
+    AlreadyAnswered(crate::egress_policy::Allowance),
+    /// R7: the grant path offers nothing here (a host proxy is in use).
+    Unofferable,
+}
+
 /// One refusal worth asking about (§7.2's `candidate`).
 fn candidate_for(
     entry: &crate::refusal::RefusalEntry,
     allowances: &LiveAllowances,
-) -> Option<relay::Candidate> {
+) -> CandidateOutcome {
     // R4: exactly what `agent-vm access allow <ID>` would accept.
-    let destination = crate::allowances::grantable_destination(entry).ok()?;
+    let Ok(destination) = crate::allowances::grantable_destination(entry) else {
+        return CandidateOutcome::NotGrantable;
+    };
     // R5: never re-ask what this session already answered.
     if allowances.answered(&destination) {
-        return None;
+        return CandidateOutcome::AlreadyAnswered(destination);
     }
     // R5/R7: the same derivation a grant uses; a host proxy in use offers nothing.
-    let offer = allowances.offer(&destination).ok()?;
+    let Ok(offer) = allowances.offer(&destination) else {
+        return CandidateOutcome::Unofferable;
+    };
     let port = match &entry.key.destination {
         crate::refusal::Destination::Address { port, .. }
         | crate::refusal::Destination::Host { port, .. } => *port,
         crate::refusal::Destination::DnsName { .. } => None,
     };
-    Some(relay::Candidate {
+    CandidateOutcome::Offer(relay::Candidate {
         entry_id: entry.id.clone(),
         // Already escaped to printable ASCII by the table that renders it (R24:
         // the prompt names the destination exactly as `access` does).
@@ -233,7 +268,7 @@ pub(crate) struct GrantDone {
 pub(crate) enum FeedEvent {
     Answered(Result<String, broadcast::error::RecvError>),
     Refusal(Result<Update, broadcast::error::RecvError>),
-    Hint,
+    Hint(relay::HintKind),
 }
 
 /// The prompt a PTY session owns. Every method is synchronous except
@@ -251,13 +286,31 @@ pub(crate) struct Prompt {
     refusals_open: bool,
     answers_open: bool,
     /// The hint fires once per session; after that its branch parks, so a routed
-    /// hint can never keep the loop's `select!` ready (finding 5).
-    hint_open: bool,
+    /// hint can never keep the loop's `select!` ready (finding 5). One flag per
+    /// line: the two fire at different times and neither parks the other.
+    refusal_hint_open: bool,
+    notifications_off_open: bool,
+    /// Where the relay's sequenced signals go (B1–B3).
+    signals: Option<crate::notify::SignalSink>,
 }
 
 impl Prompt {
-    /// Subscribe, redirect the hint, and start idle.
+    /// Subscribe, redirect both hints, baseline the snapshot and start idle.
     pub(crate) fn start(feed: Feed, size: Size, timings: relay::Timings) -> Self {
+        Self::build(feed, size, timings, stderr_is_stdout_terminal())
+    }
+
+    /// The same, with both hint routes taken as if stderr were this terminal.
+    ///
+    /// `cargo test` has no terminal on stdout and stderr, so [`Prompt::start`] cannot
+    /// route a hint there. The hint seam's delivery — which line the writer writes
+    /// and whether the eplogue still owes it — is only reachable with a route.
+    #[cfg(test)]
+    pub(crate) fn start_with_routes(feed: Feed, size: Size, timings: relay::Timings) -> Self {
+        Self::build(feed, size, timings, true)
+    }
+
+    fn build(feed: Feed, size: Size, timings: relay::Timings, route_hints: bool) -> Self {
         let (snapshot, refusals) = feed.refusals.subscribe();
         let baseline = snapshot
             .entries
@@ -265,22 +318,80 @@ impl Prompt {
             .map(|entry| (entry.id.clone(), entry.count))
             .collect();
         let answers = feed.allowances.subscribe_answers();
-        // The hint is routed only when stderr is the same terminal the prompt draws
-        // on; elsewhere today's stderr line is already right.
-        let hint = if stderr_is_stdout_terminal() {
-            Some(feed.hint.redirect())
+        // Both lines are routed only when stderr is the same terminal the prompt
+        // draws on; elsewhere today's stderr line is already right.
+        let (hint, notifications_off) = if route_hints {
+            (
+                Some(feed.hint.redirect()),
+                Some(feed.notifications_off.redirect()),
+            )
         } else {
-            None
+            (None, None)
         };
-        Self {
-            relay: relay::Relay::new(feed.session.as_str().to_owned(), size, timings, hint),
+        let signals = feed.signals.clone();
+        let mut prompt = Self {
+            relay: relay::Relay::new(
+                feed.session.as_str().to_owned(),
+                size,
+                timings,
+                hint,
+                notifications_off,
+            ),
             feed,
             refusals,
             answers,
             baseline,
             refusals_open: true,
             answers_open: true,
-            hint_open: true,
+            refusal_hint_open: true,
+            notifications_off_open: true,
+            signals,
+        };
+        // R6/B1: the snapshot is the baseline, so a refusal that existed before this
+        // subscription (a retry of an older entry) can never become a question — or
+        // a banner. Every entry is named, not only the ones the prompt can see.
+        let now = Instant::now();
+        for entry in &snapshot.entries {
+            prompt.relay.baseline(&entry.id, entry.count, now);
+        }
+        prompt
+    }
+
+    /// Fold one refusal in: baseline it, or ask about it.
+    fn consider(&mut self, entry: &crate::refusal::RefusalEntry, now: Instant) {
+        let previous = self.baseline.get(&entry.id).copied().unwrap_or(0);
+        if entry.count <= previous {
+            return;
+        }
+        self.baseline.insert(entry.id.clone(), entry.count);
+        match candidate_for(entry, &self.feed.allowances) {
+            CandidateOutcome::Offer(candidate) => self.relay.offer(candidate, now),
+            // R5: this session already answered the destination, so the attempt is
+            // disposed of as an answer (B3).
+            CandidateOutcome::AlreadyAnswered(destination) => {
+                self.relay
+                    .already_answered(&entry.id, entry.count, &destination, now);
+            }
+            // R4/R7: nothing can be granted here, so nothing is asked.
+            CandidateOutcome::NotGrantable | CandidateOutcome::Unofferable => {
+                self.relay.cannot_offer(&entry.id, entry.count, now);
+            }
+        }
+    }
+
+    /// Hand every signal the relay emitted since the last call to the notifier.
+    ///
+    /// The vector is **always** taken: a launch with no notifier (macOS opt-out,
+    /// Linux, SSH, root, a missing helper) would otherwise keep every transition of
+    /// the whole session, and the prompt never reads them again. The send is
+    /// non-blocking (R12), so no prompt frame waits on a helper.
+    pub(crate) fn drain_signals(&mut self) {
+        let signals = self.relay.drain_signals();
+        let Some(sink) = self.signals.clone() else {
+            return;
+        };
+        for signal in signals {
+            sink.signal(signal);
         }
     }
 
@@ -293,7 +404,6 @@ impl Prompt {
             }
         }
     }
-
     /// The generation of the takeover in progress (0 when idle): a lost grant task
     /// is reported against it.
     pub(crate) fn generation(&self) -> u64 {
@@ -312,15 +422,21 @@ impl Prompt {
     /// Cancel-safe: answers, then refusals, then the hint, each of which consumes
     /// nothing when the future is dropped. Polled at the lowest priority.
     pub(crate) async fn next_feed_event(&mut self) -> FeedEvent {
-        // The hint handle is cloned from the relay so the three waits borrow
+        // The hint handles are cloned from the relay so the four waits borrow
         // disjoint things: a `select!` over `self` twice would not compile, and none
         // of these receivers consumes anything when its future is dropped.
-        let hint = self.relay.hint_handle();
+        let refusal_hint = self.relay.hint_handle(relay::HintKind::Refusal);
+        let notifications_off = self.relay.hint_handle(relay::HintKind::NotificationsOff);
         tokio::select! {
             biased;
             answer = recv_or_park(self.answers_open, &mut self.answers) => FeedEvent::Answered(answer),
             refusal = recv_or_park(self.refusals_open, &mut self.refusals) => FeedEvent::Refusal(refusal),
-            _ = wait_for_hint(if self.hint_open { hint } else { None }) => FeedEvent::Hint,
+            _ = wait_for_hint(if self.refusal_hint_open { refusal_hint } else { None }) => {
+                FeedEvent::Hint(relay::HintKind::Refusal)
+            }
+            _ = wait_for_hint(if self.notifications_off_open { notifications_off } else { None }) => {
+                FeedEvent::Hint(relay::HintKind::NotificationsOff)
+            }
         }
     }
 
@@ -350,13 +466,7 @@ impl Prompt {
             }
             FeedEvent::Refusal(Ok(update)) => {
                 if let Some(entry) = update.entry.as_deref() {
-                    let previous = self.baseline.get(&entry.id).copied().unwrap_or(0);
-                    if entry.count > previous {
-                        self.baseline.insert(entry.id.clone(), entry.count);
-                        if let Some(candidate) = candidate_for(entry, &self.feed.allowances) {
-                            self.relay.offer(candidate, now);
-                        }
-                    }
+                    self.consider(entry, now);
                 }
                 self.trace_phase();
             }
@@ -368,12 +478,7 @@ impl Prompt {
                 // snapshot becomes the baseline.
                 let snapshot = self.feed.refusals.snapshot();
                 for entry in &snapshot.entries {
-                    let previous = self.baseline.get(&entry.id).copied().unwrap_or(0);
-                    if entry.count > previous
-                        && let Some(candidate) = candidate_for(entry, &self.feed.allowances)
-                    {
-                        self.relay.offer(candidate, now);
-                    }
+                    self.consider(entry, now);
                 }
                 self.baseline = snapshot
                     .entries
@@ -382,9 +487,12 @@ impl Prompt {
                     .collect();
                 self.trace_phase();
             }
-            FeedEvent::Hint => {
-                self.hint_open = false;
-                self.relay.hint_fired(now);
+            FeedEvent::Hint(kind) => {
+                match kind {
+                    relay::HintKind::Refusal => self.refusal_hint_open = false,
+                    relay::HintKind::NotificationsOff => self.notifications_off_open = false,
+                }
+                self.relay.hint_fired(kind, now);
             }
         }
     }
@@ -459,10 +567,24 @@ impl Prompt {
         self.relay.take_outbound_if(ready)
     }
 
-    /// The hint route, for the pump's delivery wrapper: the relay marks the hint
-    /// written when the writer accepts its frame (M9).
-    pub(crate) fn hint_route(&self) -> Option<crate::refusal::feed::HintRelay> {
-        self.relay.hint_route()
+    /// The hint route for one line, for the pump's delivery wrapper: the relay marks
+    /// the line written when the writer accepts its frame (M9).
+    pub(crate) fn hint_route(&self, kind: relay::HintKind) -> Option<HintRelay> {
+        self.relay.hint_route(kind)
+    }
+
+    /// The bytes of one line, for the drain's tail: the kind names which line, and
+    /// the route frames it.
+    pub(crate) fn hint_bytes(&self, kind: relay::HintKind) -> Option<Vec<u8>> {
+        self.relay.hint_bytes(kind)
+    }
+
+    /// The writer took one line's bytes and confirmed them: nothing is owed to
+    /// stderr for it, so the epilogue must not print it again.
+    pub(crate) fn hint_delivered(&self, kind: relay::HintKind) {
+        if let Some(hint) = self.relay.hint_route(kind) {
+            let _ = hint.take();
+        }
     }
 
     /// The pump handed one outbound item to the writer. Only a result frame cares:
@@ -517,15 +639,23 @@ impl Prompt {
         owed
     }
 
-    /// Every end, from the epilogue: detach the hint route and return a hint that
-    /// fired but was never written, for stderr. Writes nothing itself.
-    pub(crate) fn abandon(&mut self) -> bool {
-        match self.relay.take_hint() {
-            // The relay marks the hint written the moment it queues today's bytes,
-            // so `detach` is true only for a hint that never reached the writer.
-            Some(hint) => hint.detach(),
-            None => false,
+    /// Every end, from the epilogue: hand on any signal the loop has not drained,
+    /// detach both hint routes and return the lines still owed to stderr (at most
+    /// two, one per kind). Writes nothing itself.
+    pub(crate) fn abandon(&mut self) -> Vec<&'static str> {
+        self.drain_signals();
+        let mut owed = Vec::new();
+        for kind in relay::HintKind::ALL {
+            // The relay marks a line written the moment it queues today's bytes, so
+            // `detach` is true only for a line that never reached the writer.
+            if let Some(hint) = self.relay.take_hint(kind) {
+                let line = hint.line();
+                if hint.detach() {
+                    owed.push(line);
+                }
+            }
         }
+        owed
     }
 
     fn trace_phase(&self) {
