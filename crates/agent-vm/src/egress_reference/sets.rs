@@ -26,7 +26,7 @@ use crate::config_mounts::mount_set_name_bytes;
 use crate::config_mounts::{VisitDecision, VisitState, visit_decision};
 use crate::egress_policy::Allowance;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, HashSet},
     fmt,
 };
 use vstd::prelude::*;
@@ -36,8 +36,8 @@ verus! {
 /// closures (#511 R17).
 ///
 /// A *visit* is one candidate allowance considered while compiling a set's
-/// closure: a literal entry, one allowance of a `tool:` expansion, or one
-/// allowance of a child set's closure. The counter is global and never reset, so
+/// closure: a literal entry, one allowance of a child set's closure, or one
+/// allowance of a `set:NAME` reference's expansion. The counter is global and never reset, so
 /// a crafted table cannot turn load into a hang by fanning out widely; 65,536
 /// admits hundreds of ordinary sets (100 sets of 100 allowances costs 10,000)
 /// while bounding the admitted work to 65,536 hash probes and inserts. The
@@ -101,16 +101,14 @@ impl fmt::Display for InvalidEgressSetName {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct SetId(usize);
 
-/// One entry of one definition, after classification but before tool resolution.
+/// One entry of one definition, after classification.
 ///
-/// `Tool` keeps the name rather than the requests because a `tool:` entry may
-/// only be resolved *after* `validate_tools` has produced the file's tools, which
-/// is later than this parse; `Set` keeps the target's id because the walk needs
-/// edges, and the lookup that produced it is the one that proved the name exists.
+/// `Set` keeps the target's id because the walk needs edges, and the lookup that
+/// produced it is the one that proved the name exists. #735 removed the `Tool`
+/// bound with the `tool:` reference it carried (ADR-0075).
 #[derive(Debug, PartialEq, Eq)]
 enum Bound {
     Literal(Allowance),
-    Tool(String),
     Set(SetId),
 }
 
@@ -297,15 +295,14 @@ pub(super) fn parse(value: &toml::Value) -> Result<ParsedEgressSets, EgressSetEr
             };
             bound.push(match super::AllowanceEntry::parse(text).map_err(site)? {
                 super::AllowanceEntry::Literal(allowance) => Bound::Literal(allowance),
-                super::AllowanceEntry::Reference(reference) => match &reference.0 {
-                    super::Target::Tool(name) => Bound::Tool(name.clone()),
-                    // A forward reference is legal: every name is bound above,
-                    // from the one TOML parse, before any entry is read.
-                    super::Target::Set(name) => match index.get(name) {
+                // A forward reference is legal: every name is bound above, from
+                // the one TOML parse, before any entry is read.
+                super::AllowanceEntry::Reference(reference) => {
+                    match index.get(reference.set_name()) {
                         Some(&target) => Bound::Set(target),
                         None => return Err(site(super::EntryError::UnknownSet)),
-                    },
-                },
+                    }
+                }
             });
         }
         definitions.push(bound);
@@ -372,18 +369,15 @@ fn walk(definitions: &[Vec<Bound>]) -> Result<Vec<SetId>, EgressSetError> {
 /// Compile every declared set's unique closure, dependency-first.
 ///
 /// One counter for the whole file, one hash index per set, and one charge per
-/// *candidate*: a literal entry, each allowance of a tool expansion, and each
-/// allowance of a child's closure. A second `tool:` or `set:` entry in the same
-/// definition is skipped **before** it is charged, because the child's closure is
-/// already unique by value and a second pass could only produce duplicates.
+/// *candidate*: a literal entry, and each allowance of a child's closure. A second
+/// `set:` entry in the same definition is skipped **before** it is charged,
+/// because the child's closure is already unique by value and a second pass could
+/// only produce duplicates.
 ///
 /// Errors stream: sets are compiled in the walk's postorder and entries in
 /// declaration order, so the first failure — an entry error or exhaustion — is the
 /// one reported (R19). No earlier stage is re-ordered to make that nicer.
-pub(super) fn compile(
-    parsed: ParsedEgressSets,
-    tool_expansion: impl Fn(&str) -> Result<Vec<Allowance>, super::EntryError>,
-) -> Result<EgressSets, EgressSetError> {
+pub(super) fn compile(parsed: ParsedEgressSets) -> Result<EgressSets, EgressSetError> {
     let ParsedEgressSets {
         names,
         definitions,
@@ -410,28 +404,13 @@ pub(super) fn compile(
         // its own length before the budget could bound anything.
         let mut seen: HashSet<Allowance> = HashSet::new();
         let mut unique: Vec<Allowance> = Vec::new();
-        // Per set, so a repeated child or tool costs one membership probe rather
-        // than a pass over its closure.
+        // Per set, so a repeated child costs one membership probe rather than a
+        // pass over its closure.
         let mut children: HashSet<SetId> = HashSet::new();
-        let mut tools: BTreeSet<&str> = BTreeSet::new();
-        for (index, entry) in definitions[set.0].iter().enumerate() {
+        for entry in &definitions[set.0] {
             match entry {
                 Bound::Literal(allowance) => {
                     admit_allowance(&mut seen, &mut unique, allowance, &mut work)?;
-                }
-                Bound::Tool(name) => {
-                    if !tools.insert(name.as_str()) {
-                        continue;
-                    }
-                    let expansion =
-                        tool_expansion(name).map_err(|error| EgressSetError::Entry {
-                            definition: set.0,
-                            index,
-                            error,
-                        })?;
-                    for allowance in expansion {
-                        admit_allowance(&mut seen, &mut unique, &allowance, &mut work)?;
-                    }
                 }
                 Bound::Set(child) => {
                     if !children.insert(*child) {

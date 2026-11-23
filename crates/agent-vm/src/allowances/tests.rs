@@ -1614,6 +1614,7 @@ fn fresh_policy(allow_egress: &[&str], combined: &[&str]) -> NetworkPolicy {
         },
         None,
         None,
+        None,
     )
     .unwrap();
     // One `set_recorded` with the whole effective set: it replaces, not appends.

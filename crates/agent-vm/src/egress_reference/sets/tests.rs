@@ -5,9 +5,6 @@
 //! forbidden reach could hide from it.
 
 use super::*;
-use crate::egress_reference::tool_expansion;
-use crate::network_requests::NetworkRequests;
-use std::collections::BTreeMap;
 
 /// One `[egress_sets]` body as a TOML table, i.e. what `RawConfig`'s untyped field
 /// holds.
@@ -20,19 +17,16 @@ fn parse(text: &str) -> Result<ParsedEgressSets, EgressSetError> {
     super::parse(&table(text))
 }
 
-/// Compile one body against tool declarations, through the same expansion the
-/// production callback uses.
-fn compile(text: &str, tools: &[(&str, &[&str])]) -> Result<EgressSets, EgressSetError> {
-    let mut requests: BTreeMap<String, NetworkRequests> = BTreeMap::new();
-    for (name, raw) in tools {
-        let raw: Vec<String> = raw.iter().map(|request| (*request).to_owned()).collect();
-        requests.insert((*name).to_owned(), NetworkRequests::parse(&raw).unwrap());
-    }
-    super::compile(parse(text)?, |name| tool_expansion(&requests, name))
+/// Compile one body, through the production entry point.
+///
+/// #735 removed the tool-expansion callback with the `tool:` reference
+/// (ADR-0075), so a set's closure is literals and other sets only.
+fn compile(text: &str) -> Result<EgressSets, EgressSetError> {
+    super::compile(parse(text)?)
 }
 
-fn load(text: &str, tools: &[(&str, &[&str])]) -> EgressSets {
-    compile(text, tools).unwrap_or_else(|error| panic!("fixture must compile: {error}"))
+fn load(text: &str) -> EgressSets {
+    compile(text).unwrap_or_else(|error| panic!("fixture must compile: {error}"))
 }
 
 fn rendered(sets: &EgressSets, name: &str) -> Vec<String> {
@@ -121,7 +115,7 @@ fn top_level_keys_are_reserved_set_names() {
 #[test]
 fn network_setting_keys_are_ordinary_set_names() {
     for key in crate::user_network::SETTINGS {
-        let sets = load(&format!("{key} = [\"10.0.0.5\"]"), &[]);
+        let sets = load(&format!("{key} = [\"10.0.0.5\"]"));
         assert_eq!(rendered(&sets, key), ["10.0.0.5/32"], "{key}");
     }
 }
@@ -158,7 +152,7 @@ fn invalid_set_names_are_numeric_and_value_free() {
     }
     // A numeric name is a name, not a malformed one: the grammar is character
     // shape only.
-    let sets = load("8443 = [\"10.0.0.1\"]\n0 = []", &[]);
+    let sets = load("8443 = [\"10.0.0.1\"]\n0 = []");
     assert_eq!(rendered(&sets, "8443"), ["10.0.0.1/32"]);
     assert!(rendered(&sets, "0").is_empty());
 }
@@ -240,14 +234,11 @@ fn schema_and_entry_errors_are_named_by_site() {
 /// file does not declare is the unknown-set sentence at the entry's site.
 #[test]
 fn forward_and_nested_references_resolve() {
-    let sets = load("a = [\"set:b\", \"10.0.0.1\"]\nb = [\"10.0.0.2\"]", &[]);
+    let sets = load("a = [\"set:b\", \"10.0.0.1\"]\nb = [\"10.0.0.2\"]");
     assert_eq!(rendered(&sets, "a"), ["10.0.0.2/32", "10.0.0.1/32"]);
     assert_eq!(rendered(&sets, "b"), ["10.0.0.2/32"]);
     // A definition may also name a set declared *later*, and one declared before.
-    let sets = load(
-        "a = [\"set:b\"]\nb = [\"10.0.0.2\", \"set:a2\"]\na2 = [\"10.0.0.3\"]",
-        &[],
-    );
+    let sets = load("a = [\"set:b\"]\nb = [\"10.0.0.2\", \"set:a2\"]\na2 = [\"10.0.0.3\"]");
     assert_eq!(rendered(&sets, "b"), ["10.0.0.2/32", "10.0.0.3/32"]);
     assert_eq!(rendered(&sets, "a"), ["10.0.0.2/32", "10.0.0.3/32"]);
 }
@@ -255,10 +246,8 @@ fn forward_and_nested_references_resolve() {
 /// A17, the chain itself: `a -> b -> c` in reverse declaration order.
 #[test]
 fn a_nested_chain_resolves_forward() {
-    let sets = load(
-        "a = [\"set:b\", \"10.0.0.1\"]\nb = [\"set:c\", \"10.0.0.2\"]\nc = [\"10.0.0.3\"]",
-        &[],
-    );
+    let sets =
+        load("a = [\"set:b\", \"10.0.0.1\"]\nb = [\"set:c\", \"10.0.0.2\"]\nc = [\"10.0.0.3\"]");
     assert_eq!(
         rendered(&sets, "a"),
         ["10.0.0.3/32", "10.0.0.2/32", "10.0.0.1/32"],
@@ -322,7 +311,7 @@ fn cycles_are_refused_by_site() {
         "egress_sets[1][0]: egress-set reference cycle"
     );
     // A diamond is not a cycle: shared structure is what `Skip` means.
-    let sets = load("a = [\"set:c\"]\nb = [\"set:c\"]\nc = [\"10.0.0.1\"]", &[]);
+    let sets = load("a = [\"set:c\"]\nb = [\"set:c\"]\nc = [\"10.0.0.1\"]");
     assert_eq!(rendered(&sets, "a"), ["10.0.0.1/32"]);
     assert_eq!(rendered(&sets, "b"), ["10.0.0.1/32"]);
 }
@@ -347,7 +336,7 @@ fn a_long_chain_loads() {
     let sets = std::thread::Builder::new()
         .stack_size(2 * 1024 * 1024)
         .spawn(move || {
-            let sets = load(&body, &[]);
+            let sets = load(&body);
             assert_eq!(sets.work, DEPTH, "one visit per link in the chain");
             rendered(&sets, "s00000")
         })
@@ -357,26 +346,21 @@ fn a_long_chain_loads() {
     assert_eq!(sets, ["10.0.0.1/32"]);
 }
 
-/// A20: every declaration is compiled, unused ones included, so an unknown tool
+/// A20: every declaration is compiled, unused ones included, so a bad entry
 /// inside a set nothing references still fails the load.
 #[test]
 fn unused_sets_are_compiled() {
-    let error = compile("a = [\"10.0.0.1\"]\nb = []\nzz = [\"tool:nope\"]", &[]).unwrap_err();
+    let error = compile("a = [\"10.0.0.1\"]\nb = []\nzz = [\"tool:nope\"]").unwrap_err();
     assert_eq!(
         error.to_string(),
-        "egress_sets[2][0]: an egress reference must name a tool declared in the user config's own \
-         [[tools]]; built-in and project tools are never used (`agent-vm tools print` prints the \
-         shipped tools to copy there)"
+        "egress_sets[2][0]: port must be a decimal number 1-65535"
     );
-    // The same declaration once the tool exists: the set is unused and grants
-    // nothing, but it compiled.
-    let sets = load(
-        "a = [\"10.0.0.1\"]\nb = []\nzz = [\"tool:nope\"]",
-        &[("nope", &["api.openai.com"])],
-    );
+    // The same entry with a number instead of a name: `tool` is then an ordinary
+    // hostname, so the unused set compiles and grants nothing.
+    let sets = load("a = [\"10.0.0.1\"]\nb = []\nzz = [\"tool:443\"]");
     assert_eq!(rendered(&sets, "a"), ["10.0.0.1/32"]);
     assert!(rendered(&sets, "b").is_empty());
-    assert_eq!(rendered(&sets, "zz"), ["tcp://api.openai.com:443"]);
+    assert_eq!(rendered(&sets, "zz"), ["tcp://tool:443"]);
 }
 
 /// A23: the budget predicate against a table.
@@ -408,47 +392,48 @@ fn egress_set_expansion_work_boundary() {
     for i in 0..255 {
         body.push_str(&format!("b{i:03} = [\"set:a\"]\n"));
     }
-    let sets = load(&body, &[]);
+    let sets = load(&body);
     assert_eq!(sets.work, 65_536);
     assert_eq!(rendered(&sets, "b254").len(), 256);
 
     // One literal more, in the last-sorted definition, is the 65,537th visit.
     body.push_str("c = [\"10.9.9.9\"]\n");
-    assert_eq!(compile(&body, &[]), Err(EgressSetError::ExpansionWorkLimit));
+    assert_eq!(compile(&body), Err(EgressSetError::ExpansionWorkLimit));
     assert_eq!(
-        compile(&body, &[]).unwrap_err().to_string(),
+        compile(&body).unwrap_err().to_string(),
         "egress_sets: expansion work exceeds limit of 65536 allowance visits"
     );
 }
 
-/// A22(ii): a tool expansion is charged per allowance, so the budget can be
-/// straddled from inside one `tool:` entry.
+/// A22(ii): a child's closure is charged per allowance, so the budget can be
+/// straddled by one entry of ten.
 #[test]
-fn egress_set_expansion_work_tool_expansion_straddles_the_budget() {
-    // 256 + 254 * 256 + 246 = 65,526, leaving exactly ten visits.
+fn egress_set_expansion_work_child_straddles_the_budget() {
+    // One charge per candidate allowance: 256 for `a`, 253 children folding all
+    // 256 of `a`'s, 492 for `c`, and `z` folding `w`'s ten — exactly 65,536.
     let mut body = format!("a = [{}]\n", literals(256));
-    for i in 0..254 {
+    for i in 0..253 {
         body.push_str(&format!("b{i:03} = [\"set:a\"]\n"));
     }
-    body.push_str(&format!("c = [{}]\n", literals(246)));
-    body.push_str("z = [\"tool:w\"]\n");
-    let ten: Vec<String> = (0..10).map(|i| format!("h{i}.example")).collect();
-    let ten: Vec<&str> = ten.iter().map(String::as_str).collect();
-    let eleven: Vec<String> = (0..11).map(|i| format!("h{i}.example")).collect();
-    let eleven: Vec<&str> = eleven.iter().map(String::as_str).collect();
+    body.push_str(&format!("c = [{}]\n", literals(492)));
+    body.push_str(&format!("w = [{}]\n", literals(10)));
+    body.push_str("z = [\"set:w\"]\n");
 
-    let sets = load(&body, &[("w", &ten)]);
+    let sets = load(&body);
     assert_eq!(sets.work, 65_536);
     assert_eq!(rendered(&sets, "z").len(), 10);
 
-    assert_eq!(
-        compile(&body, &[("w", &eleven)]),
-        Err(EgressSetError::ExpansionWorkLimit)
+    // One more literal in the child exhausts the budget on the parent's fold.
+    body.push_str("w2 = []\n");
+    let mut over = body.replace(
+        &format!("w = [{}]", literals(10)),
+        &format!("w = [{}]", literals(11)),
     );
+    over.push_str("");
+    assert_eq!(compile(&over), Err(EgressSetError::ExpansionWorkLimit));
 }
 
-/// A24: repeats and empty fan-out are free, and a tool's requests are charged
-/// once each.
+/// A24: repeats and empty fan-out are free.
 #[test]
 fn repeated_references_are_free_and_empty_fanout_costs_nothing() {
     let mut body = String::new();
@@ -459,14 +444,10 @@ fn repeated_references_are_free_and_empty_fanout_costs_nothing() {
     body.push_str(&format!("w = [{}, \"set:e000\"]\n", children.join(", ")));
     body.push_str("r = [\"10.0.0.1\"]\n");
     body.push_str("q = [\"set:r\", \"set:r\", \"set:r\"]\n");
-    body.push_str("p = [\"tool:t\", \"tool:t\"]\n");
-    let sets = load(&body, &[("t", &["a.example", "b.example"])]);
-    // r 1 + q 1 + p 2; the thousand empty children and every repeat cost nothing.
-    assert_eq!(sets.work, 4);
-    assert_eq!(
-        rendered(&sets, "p"),
-        ["tcp://a.example:443", "tcp://b.example:443"]
-    );
+    let sets = load(&body);
+    // r 1 + q 1; the thousand empty children and every repeat cost nothing.
+    assert_eq!(sets.work, 2);
+    assert_eq!(rendered(&sets, "q"), ["10.0.0.1/32"]);
     assert_eq!(rendered(&sets, "w"), Vec::<String>::new());
 }
 
@@ -474,12 +455,10 @@ fn repeated_references_are_free_and_empty_fanout_costs_nothing() {
 #[test]
 fn issue_example_closures() {
     let sets = load(
-        "agents = [\"tool:codex\", \"tool:claude\", \"set:corp\"]\n\
+        "agents = [\"set:codex\", \"set:claude\", \"set:corp\"]\n\
+         codex = [\"tcp://api.openai.com:443\"]\n\
+         claude = [\"tcp://api.anthropic.com:443\"]\n\
          corp = [\"git.corp.example\", \"tcp://registry.corp.example:8443\", \"10.0.0.5\"]",
-        &[
-            ("codex", &["api.openai.com"]),
-            ("claude", &["api.anthropic.com"]),
-        ],
     );
     assert_eq!(
         rendered(&sets, "corp"),
@@ -499,7 +478,9 @@ fn issue_example_closures() {
             "10.0.0.5/32"
         ]
     );
-    assert_eq!(sets.work, 8);
+    // Three `set:` references plus five literals; each reference is one visit and
+    // each child's own literals are folded into the parent's closure.
+    assert_eq!(sets.work, 10);
 }
 
 /// A25(ii): dedup is by canonical allowance value, not by entry text, and the
@@ -508,9 +489,8 @@ fn issue_example_closures() {
 fn canonical_dedup_across_sources_keeps_first_seen_order() {
     let sets = load(
         "m = [\"API.example.com.\", \"api.example.com\", \"10.0.0.5\", \"10.0.0.5/32\", \
-         \"tcp://api.example.com:443\", \"tool:t\", \"set:n\"]\n\
+         \"tcp://api.example.com:443\", \"tcp://api.example.com:443\", \"set:n\"]\n\
          n = [\"tcp://api.example.com:443\", \"10.0.0.5/32\", \"b.example\"]",
-        &[("t", &["api.example.com"])],
     );
     assert_eq!(
         rendered(&sets, "n"),
@@ -525,7 +505,8 @@ fn canonical_dedup_across_sources_keeps_first_seen_order() {
             "b.example"
         ]
     );
-    // n 3, m 5 literal entries + 1 tool allowance + 3 from n.
+    // m's 5 literal entries + 3 from n, and the `set:n` reference itself, whose
+    // own 3 literals are folded again into m.
     assert_eq!(sets.work, 12);
 
     // The canonical value carries the transport and the port: the same endpoint
@@ -539,7 +520,6 @@ fn canonical_dedup_across_sources_keeps_first_seen_order() {
         "p = [\"tcp://10.0.0.5:443\", \"udp://10.0.0.5:443\", \
          \"tcp://api.example.com:8443\", \"tcp://api.example.com:9443\", \
          \"udp://10.0.0.5:443\"]",
-        &[],
     );
     assert_eq!(
         rendered(&sets, "p"),
@@ -553,30 +533,42 @@ fn canonical_dedup_across_sources_keeps_first_seen_order() {
     assert_eq!(sets.work, 5);
 }
 
-/// A26(b): compile errors stream in the walk's postorder, so a sorted-first bad
-/// definition wins over a budget the sorted-last one would exhaust.
+/// A26(b), restated for #735: a `set:` reference is bound during *parse*, so an
+/// unknown set anywhere in the file is reported before any closure is folded —
+/// the budget is the only compile-stage error left, and it is reported for the
+/// first definition that exceeds it.
 #[test]
-fn compile_errors_stream_in_postorder() {
+fn parse_errors_precede_the_budget_and_the_budget_is_first_exceeded_first() {
     let mut exhausting = format!("a = [{}]\n", literals(256));
     for i in 0..255 {
         exhausting.push_str(&format!("b{i:03} = [\"set:a\"]\n"));
     }
     exhausting.push_str("c = [\"10.9.9.9\"]\n");
 
-    let first = format!("0bad = [\"tool:nope\"]\n{exhausting}");
-    let error = compile(&first, &[]).unwrap_err();
+    let first = format!("0bad = [\"set:nope\"]\n{exhausting}");
+    let error = compile(&first).unwrap_err();
     assert_eq!(
         error.to_string(),
-        "egress_sets[0][0]: an egress reference must name a tool declared in the user config's own \
-         [[tools]]; built-in and project tools are never used (`agent-vm tools print` prints the \
-         shipped tools to copy there)"
+        "egress_sets[0][0]: an egress reference must name a set declared in the user \
+         config's own [egress_sets]; project and built-in configs cannot declare sets"
     );
 
-    // `zbad` sorts after `c`, so the budget is exhausted before its unknown tool is
-    // reached: the reverse order, and the reason the promise is "streaming", not
-    // "every syntax error first".
-    let last = format!("{exhausting}zbad = [\"tool:nope\"]\n");
-    assert_eq!(compile(&last, &[]), Err(EgressSetError::ExpansionWorkLimit));
+    // `zbad` sorts last, but parse binds every reference before compile folds any
+    // closure, so the unknown set still wins over the exhaustion `exhausting`
+    // alone produces.
+    let last = format!("{exhausting}zbad = [\"set:nope\"]\n");
+    assert_eq!(
+        compile(&last),
+        Err(EgressSetError::Entry {
+            definition: 257,
+            index: 0,
+            error: crate::egress_reference::EntryError::UnknownSet,
+        })
+    );
+    assert_eq!(
+        compile(&exhausting),
+        Err(EgressSetError::ExpansionWorkLimit)
+    );
 }
 
 /// A36's unit half: no load diagnostic echoes a key, a set name or an entry.
@@ -651,21 +643,17 @@ fn set_errors_never_echo_keys_or_entries() {
         echo(&body, &error.to_string());
     }
 
-    // Compile phase, which is where a tool name could leak: the name is well
-    // formed and simply not declared, so the failure is the compile-side lookup.
+    // Compile phase, which is where a name could leak: the grammar refuses the
+    // text before any name is looked up, and the sentence is fixed.
     let body = format!("a = [\"tool:{SENTINEL}\"]");
-    let error = compile(&body, &[]).unwrap_err();
+    let error = compile(&body).unwrap_err();
     assert_eq!(
         error,
         EgressSetError::Entry {
             definition: 0,
             index: 0,
-            error: EntryError::UnknownTool,
+            error: EntryError::Allowance(crate::egress_grammar::AllowanceError::MalformedPort),
         }
     );
     echo(&body, &error.to_string());
-    // The same declaration compiles once the tool exists, so the sentinel above
-    // was never a syntax question.
-    let sets = load(&body, &[(SENTINEL, &["a.example"])]);
-    assert_eq!(rendered(&sets, "a"), ["tcp://a.example:443"]);
 }

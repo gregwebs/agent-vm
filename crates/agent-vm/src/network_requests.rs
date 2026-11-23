@@ -1,9 +1,13 @@
-//! Non-authoritative tool metadata: parsing and bounded reporting only (ADR-0039).
-//! Requests never flow into policy or provisioning **from here**. The one route
-//! by which a request becomes authority is a user-tier `tool:NAME` egress
-//! reference — or, from 0.7.32, a `set:NAME` whose set names that tool — which
-//! reads the already-parsed set through `egress_reference` (ADR-0059, #511);
-//! this module's data-flow invariant is unchanged.
+//! Tool `network_requests`: parsing and bounded reporting, plus one narrow route
+//! to authority.
+//!
+//! Requests never flow into policy or provisioning **from here**. Since #735
+//! (ADR-0075) the one route by which a declared request becomes authority is the
+//! launched tool's own list, and only when `allow_tools` authorized that tool:
+//! `egress_reference::expand` re-enters the proved grammar to turn each request
+//! into an exact `tcp://HOST:PORT` allowance. The compiled-in defaults and every
+//! direct command keep ADR-0039's non-authoritative reporting, so this module's
+//! data-flow invariant is unchanged.
 use crate::egress_grammar::AllowanceError;
 use crate::egress_hostname::{CanonicalHostname, HostnameScope, PortNot53Or853};
 use crate::egress_policy::Allowance;

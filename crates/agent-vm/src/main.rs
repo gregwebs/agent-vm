@@ -7,6 +7,7 @@ mod boot_image;
 mod cli;
 mod clipboard;
 mod config;
+mod config_allow_tools;
 mod config_authority;
 mod config_mounts;
 mod config_sources;

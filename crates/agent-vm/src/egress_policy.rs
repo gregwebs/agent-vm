@@ -288,25 +288,31 @@ struct Provenance {
 
 /// Which sources carry the launch's hostname authority (ADR-0037 C8 refusal).
 ///
-/// Not `Copy`: each arm names the references that granted the hostnames, and a
-/// copy would make it possible to report one arm while consuming another.
+/// A named struct with three optional slots rather than an enum of combinations:
+/// #735 added a third independent source (an authorized tool's own
+/// `network_requests`) to a pair that was already enumerated three ways, and the
+/// enumeration is what made `SavedAndCli` a variant of its own. `None` for every
+/// slot is unreachable — [`EgressAuthority::hostname_authority`] returns `None`
+/// instead — so a rendered sentence always has something to name.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum HostnameAuthority<'a> {
-    /// Only the launch flags (`--allow-egress`).
-    Cli {
-        references: Vec<&'a EgressReference>,
-    },
-    /// Only the saved user-tier `[network]` table, whose file this is.
-    Saved {
-        file: &'a std::path::Path,
-        references: Vec<&'a EgressReference>,
-    },
-    /// Both the saved table and this launch's flags.
-    SavedAndCli {
-        file: &'a std::path::Path,
-        saved_references: Vec<&'a EgressReference>,
-        cli_references: Vec<&'a EgressReference>,
-    },
+pub(crate) struct HostnameAuthority<'a> {
+    /// The launch's `--allow-egress` references, present iff the command line
+    /// granted any hostname at all: a literal grant keeps its pre-#735 sentence,
+    /// with an empty reference list (#735 review S4).
+    pub(crate) cli: Option<Vec<&'a EgressReference>>,
+    /// The saved `[network]` table's file and its hostname-granting references.
+    pub(crate) saved: Option<(&'a std::path::Path, Vec<&'a EgressReference>)>,
+    /// The authorized tool whose own `network_requests` are in force.
+    pub(crate) tool: Option<&'a str>,
+}
+
+/// One authorized tool's own requests, borrowed for the egress plan (#735).
+///
+/// Named fields rather than two adjacent `&str`/`&NetworkRequests` arguments, so a
+/// call site cannot pair one tool's name with another's requests in a notice.
+pub(crate) struct AuthorizedToolEgress<'a> {
+    pub(crate) tool_name: &'a str,
+    pub(crate) requests: &'a crate::network_requests::NetworkRequests,
 }
 
 /// One grant set, in the two shapes the producers take: address allowances and
@@ -353,6 +359,39 @@ struct Recorded {
     destinations: Vec<Allowance>,
 }
 
+/// An authorized tool's granted hostnames, with the name the notices attribute
+/// them to (#735).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ToolGrants {
+    name: String,
+    hostnames: Vec<HostnameAllowance>,
+}
+
+impl ToolGrants {
+    /// The tool's name, as `access egress` and the notices render it.
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// This tool's own ports for one name, ascending and deduplicated: the row and
+    /// the notice report what *it* granted, never the merged rule's ports (#631).
+    fn ports_for(
+        &self,
+        name: &microsandbox_network::policy::DomainName,
+        intercepted: &crate::egress_hostname::InterceptedPorts,
+    ) -> Vec<u16> {
+        let mut ports: Vec<u16> = self
+            .hostnames
+            .iter()
+            .filter(|hostname| hostname.domain() == name)
+            .flat_map(|hostname| hostname.effective_ports(intercepted))
+            .collect();
+        ports.sort_unstable();
+        ports.dedup();
+        ports
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct EgressAuthority {
     groups: GroupGrants,
@@ -371,19 +410,22 @@ pub(crate) struct EgressAuthority {
     /// force, so naming them and no flags is the whole truth (#551).
     cli_contributed: bool,
     /// This launch's CLI entries after resolution, kept so a notice can attribute
-    /// a hostname to `--allow-egress via tool:NAME` (or `set:NAME`) even with no
-    /// user table.
+    /// a hostname to `--allow-egress via set:NAME` even with no user table.
     cli: ResolvedAllowances,
+    /// The launched authorized tool's own `network_requests`, expanded into exact
+    /// `tcp://HOST:PORT` allowances and already part of `configured` (#735).
+    tool: Option<ToolGrants>,
 }
 impl EgressAuthority {
     #[cfg(test)]
     pub(crate) fn from_cli(input: CliEgress<'_>) -> anyhow::Result<Self> {
-        Self::resolve(input, None, None)
+        Self::resolve(input, None, None, None)
     }
     pub(crate) fn resolve(
         cli: CliEgress<'_>,
         user: Option<UserEgress<'_>>,
-        user_tools: Option<&EgressNamespace>,
+        user_sets: Option<&EgressNamespace>,
+        tool: Option<AuthorizedToolEgress<'_>>,
     ) -> anyhow::Result<Self> {
         let internet = resolve_grant(
             CliGrant(cli.internet),
@@ -417,7 +459,7 @@ impl EgressAuthority {
         }
         // Raised before any launch state, pin or MSB home exists: `run::launch`
         // builds this plan before its first side effect (R16).
-        let cli = crate::egress_reference::resolve(entries, user_tools).map_err(|failure| {
+        let cli = crate::egress_reference::resolve(entries, user_sets).map_err(|failure| {
             anyhow::anyhow!("--allow-egress #{}: {}", failure.index + 1, failure.error)
         })?;
         let user_entries = user.as_ref().map(|u| u.allowances.clone());
@@ -429,6 +471,29 @@ impl EgressAuthority {
         {
             configured.push(allowance);
         }
+        // #735: an authorized tool's own declarations are granted as exact
+        // `tcp://HOST:PORT` allowances, through the one converter that re-enters
+        // `Allowance::parse` (ADR-0018, A37). Never its `tools = [...]` closure:
+        // a helper's requests are its own.
+        let tool = match tool {
+            Some(tool) if !tool.requests.is_empty() => {
+                let expanded = crate::egress_reference::expand(tool.requests)?;
+                for allowance in &expanded {
+                    configured.push(allowance);
+                }
+                Some(ToolGrants {
+                    name: tool.tool_name.to_owned(),
+                    hostnames: expanded
+                        .into_iter()
+                        .filter_map(|allowance| match allowance {
+                            Allowance::Hostname(hostname) => Some(hostname),
+                            Allowance::Address(_) => None,
+                        })
+                        .collect(),
+                })
+            }
+            _ => None,
+        };
         let provenance = user.map(|u| Provenance {
             file: u.file.to_owned(),
             internet: GroupOrigin {
@@ -457,6 +522,7 @@ impl EgressAuthority {
             provenance,
             cli_contributed,
             cli,
+            tool,
         })
     }
 
@@ -505,30 +571,22 @@ impl EgressAuthority {
             return None;
         }
         let cli = self.cli.hostname_references().collect::<Vec<_>>();
-        let Some(provenance) = self.provenance.as_ref() else {
-            return Some(HostnameAuthority::Cli { references: cli });
-        };
-        let saved = provenance
-            .user_entries
-            .hostname_references()
-            .collect::<Vec<_>>();
-        Some(
-            match (
-                provenance.user_entries.has_hostnames(),
-                self.cli.has_hostnames(),
-            ) {
-                (true, true) => HostnameAuthority::SavedAndCli {
-                    file: &provenance.file,
-                    saved_references: saved,
-                    cli_references: cli,
-                },
-                (true, false) => HostnameAuthority::Saved {
-                    file: &provenance.file,
-                    references: saved,
-                },
-                (false, _) => HostnameAuthority::Cli { references: cli },
-            },
-        )
+        let saved = self.provenance.as_ref().and_then(|provenance| {
+            provenance.user_entries.has_hostnames().then(|| {
+                (
+                    provenance.file.as_path(),
+                    provenance
+                        .user_entries
+                        .hostname_references()
+                        .collect::<Vec<_>>(),
+                )
+            })
+        });
+        Some(HostnameAuthority {
+            cli: self.cli.has_hostnames().then_some(cli),
+            saved,
+            tool: self.tool.as_ref().map(|tool| tool.name.as_str()),
+        })
     }
     #[cfg(test)]
     fn sourced_entries(&self) -> Vec<(String, EntrySources)> {
@@ -565,6 +623,13 @@ impl EgressAuthority {
         self.provenance.is_some()
             || self.cli.references().len() > 0
             || self.recorded_entries().is_some()
+            || self.tool.is_some()
+    }
+
+    /// The authorized tool's granted hostnames, if this launch has any: the one
+    /// input `view`'s row builder needs to explain a tool-granted name.
+    fn tool_grants(&self) -> Option<&ToolGrants> {
+        self.tool.as_ref()
     }
     fn tier_sources(&self, allowance: &Allowance) -> TierSources<'_> {
         TierSources {
@@ -766,7 +831,7 @@ mod tests {
             groups,
             entries,
         );
-        EgressAuthority::resolve(cli, Some(user.egress()), None).unwrap()
+        EgressAuthority::resolve(cli, Some(user.egress()), None, None).unwrap()
     }
     fn empty_cli() -> CliEgress<'static> {
         CliEgress {
@@ -1137,7 +1202,7 @@ mod tests {
                 &["10.0.0.5"],
             );
             let authority =
-                EgressAuthority::resolve(empty_cli(), Some(user.egress()), None).unwrap();
+                EgressAuthority::resolve(empty_cli(), Some(user.egress()), None, None).unwrap();
             let mut out = Vec::new();
             authority.write_notices(&mut out).unwrap();
             let text = String::from_utf8(out).unwrap();
@@ -2144,14 +2209,30 @@ mod tests {
         }
     }
 
-    // -- ADR-0059 egress references ---------------------------------------
+    // -- ADR-0059 egress references (ADR-0075: `set:` only) ----------------
 
     const REFERENCE_USER_FILE: &str = "/home/a/.config/agent-vm/config.toml";
 
-    fn reference_tools(tools: &[(&str, &[&str])]) -> crate::egress_reference::EgressNamespace {
-        crate::egress_reference::test_support::user_tools(
+    /// A namespace over one file's `[egress_sets]`, through the real parse and
+    /// compile. #735 removed `tool:NAME`, so every reference-shaped fixture here
+    /// is a set: the reference machinery an assertion names — claiming, ordering,
+    /// attribution, counting, collapsing — is the same machinery.
+    fn reference_sets(sets: &[(&str, &[&str])]) -> crate::egress_reference::EgressNamespace {
+        let body: String = sets
+            .iter()
+            .map(|(name, entries)| {
+                let list = entries
+                    .iter()
+                    .map(|entry| format!("{entry:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{name} = [{list}]\n")
+            })
+            .collect();
+        crate::egress_reference::test_support::user_namespace(
             std::path::Path::new(REFERENCE_USER_FILE),
-            tools,
+            &[],
+            Some(&body),
         )
     }
 
@@ -2159,18 +2240,18 @@ mod tests {
         groups: crate::user_network::SavedGroups,
         entries: &[&str],
         cli: CliEgress<'_>,
-        tools: &crate::egress_reference::EgressNamespace,
+        sets: &crate::egress_reference::EgressNamespace,
     ) -> EgressAuthority {
         let user = crate::user_network::UserNetwork::for_test_with_tools(
             REFERENCE_USER_FILE,
             groups,
             entries,
-            tools,
+            sets,
         );
-        EgressAuthority::resolve(cli, Some(user.egress()), Some(tools)).unwrap()
+        EgressAuthority::resolve(cli, Some(user.egress()), Some(sets), None).unwrap()
     }
 
-    fn cli_refusal_lines(cli: &[&str], tools: &crate::egress_reference::EgressNamespace) -> String {
+    fn cli_refusal_lines(cli: &[&str], sets: &crate::egress_reference::EgressNamespace) -> String {
         let allowances: Vec<String> = cli.iter().map(|text| (*text).to_owned()).collect();
         let authority = EgressAuthority::resolve(
             CliEgress {
@@ -2178,7 +2259,8 @@ mod tests {
                 ..empty_cli()
             },
             None,
-            Some(tools),
+            Some(sets),
+            None,
         )
         .unwrap();
         let mut out = Vec::new();
@@ -2194,44 +2276,44 @@ mod tests {
         const HEADER: &str = "==> Egress authority: persisted grants from \"/home/a/.config/agent-vm/config.toml\" [network] merged with this launch's flags (flags override persisted booleans and add allowances; nothing is saved)\n";
 
         // (i) one persisted reference.
-        let tools = reference_tools(&[("codex", &["api.openai.com"])]);
+        let sets = reference_sets(&[("codex", &["api.openai.com"])]);
         let authority =
-            resolve_saved_with_tools(Default::default(), &["tool:codex"], empty_cli(), &tools);
+            resolve_saved_with_tools(Default::default(), &["set:codex"], empty_cli(), &sets);
         let mut out = Vec::new();
         authority.write_notices(&mut out).unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "==> Egress authority: persisted grants from \"/home/a/.config/agent-vm/config.toml\"\n==> Egress policy: allowing TLS to tool:codex (1)\n==> list: agent-vm access egress\n"
+            "==> Egress authority: persisted grants from \"/home/a/.config/agent-vm/config.toml\"\n==> Egress policy: allowing TLS to codex (1)\n==> list: agent-vm access egress\n"
         );
 
         // (ii) a CLI reference with no user table, beside a literal CLI hostname:
         // one line, because both names share the port set and the tier.
-        let tools = reference_tools(&[("codex", &["auth.openai.com"])]);
-        let text = cli_refusal_lines(&["tool:codex", "api.example.com"], &tools);
+        let sets = reference_sets(&[("codex", &["auth.openai.com"])]);
+        let text = cli_refusal_lines(&["set:codex", "api.example.com"], &sets);
         assert_eq!(
             text,
-            "==> Egress policy: allowing TLS to tool:codex (1), api.example.com (--allow-egress)\n\
+            "==> Egress policy: allowing TLS to codex (1), api.example.com (--allow-egress)\n\
 ==> list: agent-vm access egress\n"
         );
         assert!(!text.contains("persisted"), "{text}");
 
         // (iii) one reference in both tiers.
-        let tools = reference_tools(&[("codex", &["api.openai.com"])]);
+        let sets = reference_sets(&[("codex", &["api.openai.com"])]);
         let authority = resolve_saved_with_tools(
             Default::default(),
-            &["tool:codex"],
+            &["set:codex"],
             CliEgress {
-                allowances: &["tool:codex".into()],
+                allowances: &["set:codex".into()],
                 ..empty_cli()
             },
-            &tools,
+            &sets,
         );
         let mut out = Vec::new();
         authority.write_notices(&mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(text.starts_with(HEADER), "{text}");
         assert!(
-            text.contains("==> Egress policy: allowing TLS to tool:codex (1) (persisted grants and --allow-egress)\n"),
+            text.contains("==> Egress policy: allowing TLS to codex (1) (persisted grants and --allow-egress)\n"),
             "{text}"
         );
         assert!(
@@ -2240,35 +2322,35 @@ mod tests {
         );
 
         // (iv) literal plus reference in one tier.
-        let tools = reference_tools(&[("codex", &["api.openai.com"])]);
+        let sets = reference_sets(&[("codex", &["api.openai.com"])]);
         let authority = resolve_saved_with_tools(
             Default::default(),
-            &["api.openai.com", "tool:codex"],
+            &["literal.example", "set:codex"],
             empty_cli(),
-            &tools,
+            &sets,
         );
         let mut out = Vec::new();
         authority.write_notices(&mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(
-            text.contains("==> Egress policy: allowing TLS to tool:codex (1)\n"),
-            "a name covered by a reference is never bare: {text}"
+            text.contains("==> Egress policy: allowing TLS to codex (1), literal.example\n"),
+            "the reference keeps its count and the bare literal its own name: {text}"
         );
 
         // (v) the count is per reference, over names that only references grant.
         for (names, expected) in [
-            (&["a", "b"][..], "tool:a (1), tool:b (1)"),
-            (&["a", "b", "c"][..], "tool:a (1), tool:b (1), tool:c (1)"),
+            (&["a", "b"][..], "a (1), b (1)"),
+            (&["a", "b", "c"][..], "a (1), b (1), c (1)"),
         ] {
-            let tools: Vec<(&str, &[&str])> = names
+            let sets: Vec<(&str, &[&str])> = names
                 .iter()
                 .map(|name| (*name, &["shared.example"][..]))
                 .collect();
-            let tools = reference_tools(&tools);
-            let entries: Vec<String> = names.iter().map(|name| format!("tool:{name}")).collect();
+            let sets = reference_sets(&sets);
+            let entries: Vec<String> = names.iter().map(|name| format!("set:{name}")).collect();
             let entries: Vec<&str> = entries.iter().map(String::as_str).collect();
             let authority =
-                resolve_saved_with_tools(Default::default(), &entries, empty_cli(), &tools);
+                resolve_saved_with_tools(Default::default(), &entries, empty_cli(), &sets);
             let mut out = Vec::new();
             authority.write_notices(&mut out).unwrap();
             let text = String::from_utf8(out).unwrap();
@@ -2285,9 +2367,9 @@ mod tests {
     fn set_reference_notices_attribute_entry_level_references() {
         let namespace = crate::egress_reference::test_support::user_namespace(
             std::path::Path::new(REFERENCE_USER_FILE),
-            &[("codex", &["api.openai.com"])],
+            &[],
             Some(
-                "agents = [\"tool:codex\", \"set:corp\"]\n\
+                "agents = [\"api.openai.com\", \"set:corp\"]\n\
                  corp = [\"10.0.0.5\", \"git.corp.example\"]\n",
             ),
         );
@@ -2313,11 +2395,20 @@ mod tests {
         );
         assert!(!text.contains("set:corp"), "a nested set was named: {text}");
 
-        // (ii) a set and a tool granting the same name collapse into one line, in
-        // written order.
+        // (ii) two sets granting the same name share one line, in written order:
+        // the shared name counts toward each reference, so the line names both and
+        // the name itself is printed once (as the two counts), never twice.
+        let namespace = crate::egress_reference::test_support::user_namespace(
+            std::path::Path::new(REFERENCE_USER_FILE),
+            &[],
+            Some(
+                "agents = [\"api.openai.com\"]\n\
+                 corp = [\"api.openai.com\", \"git.corp.example\", \"10.0.0.5\"]\n",
+            ),
+        );
         let authority = resolve_saved_with_tools(
             Default::default(),
-            &["tool:codex", "set:agents"],
+            &["set:agents", "set:corp"],
             empty_cli(),
             &namespace,
         );
@@ -2325,7 +2416,26 @@ mod tests {
         authority.write_notices(&mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(
-            text.contains("==> Egress policy: allowing TLS to tool:codex (1), agents (2)\n"),
+            text.contains("==> Egress policy: allowing TLS to agents (1), corp (2)\n"),
+            "{text}"
+        );
+        // One line, so one occurrence of the collapse pointer, and the shared name
+        // is not listed a second time.
+        assert_eq!(text.matches("allowing TLS to").count(), 1, "{text}");
+        assert_eq!(text.matches("api.openai.com").count(), 0, "{text}");
+        // The table still attributes the shared name to both references, which is
+        // what "counts toward each" means.
+        let vias: Vec<String> = authority
+            .effective_rows(&[], crate::effective_egress::RowStatus::Applied)
+            .into_iter()
+            .filter(|row| row.destination.cell() == "api.openai.com")
+            .filter_map(|row| row.via)
+            .collect();
+        assert_eq!(vias, ["set:agents", "set:corp"]);
+        assert!(
+            text.contains(
+                "==> Egress policy: allowing 10.0.0.5/32 (persisted grants via set:corp)\n"
+            ),
             "{text}"
         );
 
@@ -2333,13 +2443,10 @@ mod tests {
         // word anywhere.
         let text = cli_refusal_lines(&["set:agents"], &namespace);
         assert!(
-            text.contains(
-                "==> Egress policy: allowing 10.0.0.5/32 (--allow-egress via set:agents)\n"
-            ),
+            text.contains("==> Egress policy: allowing TLS to agents (1) (--allow-egress)\n"),
             "{text}"
         );
         assert!(!text.contains("persisted"), "{text}");
-        assert!(!text.contains("set:corp"), "{text}");
     }
 
     /// A23: a launch whose only authority is CLI references prints no line
@@ -2347,28 +2454,31 @@ mod tests {
     /// user `[network]` table.
     #[test]
     fn cli_only_references_never_say_persisted() {
-        let tools = reference_tools(&[("codex", &["api.openai.com"])]);
-        let text = cli_refusal_lines(&["tool:codex"], &tools);
+        let sets = reference_sets(&[("codex", &["api.openai.com"])]);
+        let text = cli_refusal_lines(&["set:codex"], &sets);
         assert!(!text.contains("persisted"), "{text}");
         assert_eq!(
             text,
-            "==> Egress policy: allowing TLS to tool:codex (1) (--allow-egress)\n\
+            "==> Egress policy: allowing TLS to codex (1) (--allow-egress)\n\
 ==> list: agent-vm access egress\n"
         );
         // With no reference: no tag, and since nothing collapsed, no pointer.
-        let tools = reference_tools(&[]);
-        let text = cli_refusal_lines(&["api.example.com"], &tools);
+        let sets = reference_sets(&[]);
+        let text = cli_refusal_lines(&["api.example.com"], &sets);
         assert_eq!(text, "==> Egress policy: allowing TLS to api.example.com\n");
     }
 
-    /// A34, CLI half: the reference rebinds `tool:8443` to a tool named `8443`.
+    /// ADR-0075: `tool:NAME` is gone from every egress grammar, so the allowance
+    /// grammar decides — `tool:8443` is the literal `tcp://tool:8443`, and
+    /// `tool:codex` is a port error. The reference *rebinding* this test used to
+    /// pin cannot happen any more; what can is that a numeric name is a set.
     #[test]
-    fn numeric_tool_name_rebinds_a_former_tool_port_hostname_on_the_flag() {
-        let tools = reference_tools(&[("8443", &["other.example:9443"])]);
-        let text = cli_refusal_lines(&["tool:8443"], &tools);
+    fn numeric_name_is_a_set_not_a_port_hostname_on_the_flag() {
+        let sets = reference_sets(&[("8443", &["other.example:9443"])]);
+        let text = cli_refusal_lines(&["set:8443"], &sets);
         assert!(
             text.contains(
-                "==> Egress policy: allowing TLS to tool:8443 (1) on ports 9443 (--allow-egress)\n"
+                "==> Egress policy: allowing TLS to 8443 (1) on ports 9443 (--allow-egress)\n"
             ),
             "{text}"
         );
@@ -2379,12 +2489,12 @@ mod tests {
     /// reached both ways is one entry marked direct and via.
     #[test]
     fn a_duplicate_reference_grants_once_and_keeps_both_attributions() {
-        let tools = reference_tools(&[("codex", &["api.openai.com"])]);
+        let sets = reference_sets(&[("codex", &["tcp://api.openai.com:443"])]);
         let authority = resolve_saved_with_tools(
             Default::default(),
-            &["tool:codex", "tool:codex", "tcp://api.openai.com:443"],
+            &["set:codex", "set:codex", "tcp://api.openai.com:443"],
             empty_cli(),
-            &tools,
+            &sets,
         );
         assert_eq!(
             authority
@@ -2406,7 +2516,7 @@ mod tests {
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>(),
-            ["tool:codex"]
+            ["set:codex"]
         );
     }
 
@@ -2479,38 +2589,34 @@ mod tests {
 
         // A line with a reference says `and N other hosts`, and only the bare
         // names count towards N.
-        let tools = reference_tools(&[("x", &["x.example"])]);
+        let sets = reference_sets(&[("x", &["x.example"])]);
         let entries = [
-            "tool:x",
+            "set:x",
             "b1.example",
             "b2.example",
             "b3.example",
             "b4.example",
         ];
-        let authority = resolve_saved_with_tools(Default::default(), &entries, empty_cli(), &tools);
+        let authority = resolve_saved_with_tools(Default::default(), &entries, empty_cli(), &sets);
         let mut out = Vec::new();
         authority.write_notices(&mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(
-            text.contains("==> Egress policy: allowing TLS to tool:x (1), and 4 other hosts\n"),
+            text.contains("==> Egress policy: allowing TLS to x (1), and 4 other hosts\n"),
             "{text}"
         );
     }
 
     #[test]
     fn a_name_in_two_references_counts_toward_each() {
-        let tools = reference_tools(&[("a", &["shared.example"]), ("b", &["shared.example"])]);
-        let authority = resolve_saved_with_tools(
-            Default::default(),
-            &["tool:a", "tool:b"],
-            empty_cli(),
-            &tools,
-        );
+        let sets = reference_sets(&[("a", &["shared.example"]), ("b", &["shared.example"])]);
+        let authority =
+            resolve_saved_with_tools(Default::default(), &["set:a", "set:b"], empty_cli(), &sets);
         let mut out = Vec::new();
         authority.write_notices(&mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(
-            text.contains("==> Egress policy: allowing TLS to tool:a (1), tool:b (1)\n"),
+            text.contains("==> Egress policy: allowing TLS to a (1), b (1)\n"),
             "{text}"
         );
     }
@@ -2565,15 +2671,16 @@ mod tests {
 
     #[test]
     fn the_pointer_follows_the_hostname_lines_and_precedes_dns() {
-        let tools = reference_tools(&[("codex", &["api.openai.com"])]);
+        let sets = reference_sets(&[("codex", &["api.openai.com"]), ("corp", &["corp.example"])]);
         let authority = EgressAuthority::resolve(
             CliEgress {
                 internet: Some(true),
-                allowances: &["tool:codex".to_owned()],
+                allowances: &["set:corp".to_owned()],
                 ..empty_cli()
             },
             None,
-            Some(&tools),
+            Some(&sets),
+            None,
         )
         .unwrap();
         let mut out = Vec::new();

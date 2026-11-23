@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 18ae0bfc95ba53765d4569c8eac3f79827cd31d5474fc44915ae08a9a923023c # shrinks to creds = [[], []]
+cc 7a953be94a24ff250e02fb9b74f4f6e6f08b46c566dd3d10e596fec26e255d09 # shrinks to user = [GeneratedDefinition { providers: [], edges: [], wildcard: false }], project = [GeneratedDefinition { providers: [], edges: [], wildcard: false }]
+cc 76718adc294dd8ff7e659d2f65dd50db39c25cad842303fb390f619f21986a69 # shrinks to user_names = ["h"], project_names = ["h"]

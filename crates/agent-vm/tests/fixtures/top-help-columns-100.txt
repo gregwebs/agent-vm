@@ -137,7 +137,7 @@ Mounts & ports:
 
       --no-config-mounts
           Skip this launch's automatic config mounts: the top-level `mounts` defaults and the
-          launched tool's own and inherited `mounts` in `~/.config/agent-vm/config.toml`.
+          launched tool's own and inherited `mounts`, from the file that declares it.
 
           Only those automatic selections are skipped: an explicit `--mount` still applies,
           including `--mount NAME`, and credentials, persisted paths, agent-vm's own mounts, and
@@ -217,9 +217,9 @@ Network egress:
 
           Numeric grants are address-wide. Hostname grants are TLS-only, SNI- and DNS-verified, and
           refused with a host HTTP proxy. Bare hostnames use intercepted ports (443 by default). Use
-          brackets for a port on an IPv6 address or CIDR. `tool:NAME` grants a user-config tool's
-          own `network_requests`, each as `tcp://HOST:PORT`; `set:NAME` grants a user-config
-          `[egress_sets]` entry's compiled closure.
+          brackets for a port on an IPv6 address or CIDR. `set:NAME` grants a user-config
+          `[egress_sets]` entry's compiled closure. A tool's own `network_requests` need no
+          reference: authorizing the tool in `allow_tools` grants them for its launches (#735).
 
       --allow-internet-egress[=<BOOL>]
           Allow public internet egress and DNS. Guest egress is denied by default

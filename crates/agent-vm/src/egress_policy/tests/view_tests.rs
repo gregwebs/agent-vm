@@ -116,6 +116,47 @@ fn effective_rows_match_the_ticket_table() {
     );
 }
 
+/// V9, R5: an authorized tool's own requests are their own row — `VIA` names the
+/// tool, `SOURCE` is `authorized tool`, and PORTS are the tool's own (its bare name
+/// is pinned to :443, its ported one to 8443), never the merged rule's union.
+#[test]
+fn authorized_tool_rows_name_the_tool_and_its_own_ports() {
+    let requests = crate::network_requests::NetworkRequests::parse(&[
+        "a.example".to_owned(),
+        "b.example:8443".to_owned(),
+    ])
+    .unwrap();
+    let authority = EgressAuthority::resolve(
+        empty_cli(),
+        None,
+        None,
+        Some(crate::egress_policy::AuthorizedToolEgress {
+            tool_name: "codex",
+            requests: &requests,
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        table_of(&authority.effective_rows(&[], RowStatus::Applied)),
+        vec![
+            (
+                "a.example".to_owned(),
+                "443".to_owned(),
+                "codex".to_owned(),
+                "authorized tool".to_owned(),
+                "applied".to_owned()
+            ),
+            (
+                "b.example".to_owned(),
+                "8443".to_owned(),
+                "codex".to_owned(),
+                "authorized tool".to_owned(),
+                "applied".to_owned()
+            ),
+        ]
+    );
+}
+
 /// A row's PORTS are its own grants' ports, never the domain's merged rule.
 #[test]
 fn a_rows_ports_are_its_own_grants() {
@@ -147,15 +188,15 @@ fn a_rows_ports_are_its_own_grants() {
         ]
     );
     // A reference row lists only what its own expansion grants.
-    let tools = reference_tools(&[("x", &["a.example:8443"])]);
+    let sets = reference_sets(&[("x", &["a.example:8443"])]);
     let authority = resolve_saved_with_tools(
         Default::default(),
         &["a.example"],
         CliEgress {
-            allowances: &["tool:x".into()],
+            allowances: &["set:x".into()],
             ..empty_cli()
         },
-        &tools,
+        &sets,
     );
     // Reference rows come before bare ones, whatever tier granted them.
     assert_eq!(
@@ -164,7 +205,7 @@ fn a_rows_ports_are_its_own_grants() {
             (
                 "a.example".to_owned(),
                 "8443".to_owned(),
-                "tool:x".to_owned(),
+                "set:x".to_owned(),
                 "--allow-egress".to_owned(),
                 "applied".to_owned()
             ),
@@ -288,17 +329,18 @@ fn live_rows_split_by_confirmation_state() {
 fn rows_and_notice_agree_on_every_source() {
     let namespace = crate::egress_reference::test_support::user_namespace(
         std::path::Path::new(REFERENCE_USER_FILE),
-        &[
-            ("codex", &["api.openai.com"]),
-            ("fetcher", &["git.example:8443"]),
-        ],
-        Some("agents = [\"tool:codex\"]\n"),
+        &[],
+        Some(
+            "codex = [\"api.openai.com\"]\n\
+             fetcher = [\"git.example:8443\"]\n\
+             agents = [\"api.openai.com\"]\n",
+        ),
     );
     let mut authority = resolve_saved_with_tools(
         Default::default(),
-        &["tool:codex", "api.github.com", "set:agents"],
+        &["set:codex", "api.github.com", "set:agents"],
         CliEgress {
-            allowances: &["tool:fetcher".into(), "cli.example".into()],
+            allowances: &["set:fetcher".into(), "cli.example".into()],
             ..empty_cli()
         },
         &namespace,

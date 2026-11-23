@@ -151,6 +151,19 @@ fn write(path: &Path, text: &str) {
 }
 
 /// The tool names a printed document declares, in document order.
+/// The `allow_tools` line the printed header tells the reader to add, in the order
+/// the print emits the definitions (#735: a `[[tools]]` block is inert until the
+/// same file lists it).
+fn allow_line(printed: &str) -> String {
+    let names = printed_names(printed);
+    let listed = names
+        .iter()
+        .map(|name| format!("{name:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("allow_tools = [{listed}]\n")
+}
+
 fn printed_names(document: &str) -> Vec<String> {
     let parsed: toml::Table = toml::from_str(document).expect("the output is TOML");
     assert_eq!(
@@ -282,7 +295,9 @@ fn named_tools_print_in_the_requested_order() {
 fn pasted_output_is_the_same_verb_list() {
     let pasted_harness = Harness::new();
     let printed = stdout_of(&pasted_harness.run(&["tools", "print"]));
-    pasted_harness.write_user_config(&printed);
+    // Follow the printed header's own instruction: the top-level `allow_tools`
+    // list must come before the first table header.
+    pasted_harness.write_user_config(&format!("{}{printed}", allow_line(&printed)));
 
     let with_paste = pasted_harness.run(&["-h"]);
     assert_success(&with_paste);
@@ -319,7 +334,11 @@ fn the_documented_edit_keeps_a_config_that_already_says_tools_empty() {
         .filter(|line| line.trim() != "tools = []")
         .map(|line| format!("{line}\n"))
         .collect();
-    std::fs::write(&config, format!("{kept}\n{printed}")).unwrap();
+    std::fs::write(
+        &config,
+        format!("{}{kept}\n{printed}", allow_line(&printed)),
+    )
+    .unwrap();
 
     let merged = harness.run(&["-h"]);
     assert_success(&merged);
@@ -362,8 +381,11 @@ fn appending_the_names_a_config_lacks_keeps_the_tools_it_declares() {
     harness.write_user_config("[[tools]]\nname = \"mine\"\ncommand = \"x\"\n");
 
     let printed = stdout_of(&harness.run(&["tools", "print", "codex"]));
-    let mut document = std::fs::read_to_string(&config).unwrap();
-    document.push_str(&printed);
+    let document = std::fs::read_to_string(&config).unwrap();
+    // `allow_tools` is a top-level key, so it goes above the file's first table
+    // header, not after it — and it must list the file's own tool too, or the
+    // append would silently retire it.
+    let document = format!("allow_tools = [\"mine\", \"codex\"]\n{document}{printed}");
     std::fs::write(&config, document).unwrap();
 
     let listed = harness.run(&["-h"]);
@@ -395,8 +417,8 @@ fn appending_the_names_a_config_lacks_keeps_the_tools_it_declares() {
     );
 
     // The appended block is the shipped definition, not merely a name: `codex`'s
-    // `network_requests` are what a later `allow_egress = ["tool:codex"]` resolves
-    // against the user file, which is the whole reason this command exists (#506).
+    // `network_requests` are what authorizing it grants on launch (#735), which is
+    // the whole reason this command exists (#506).
     let edited = std::fs::read_to_string(&config).unwrap();
     let parsed: toml::Table = toml::from_str(&edited).expect("the appended file is TOML");
     assert_eq!(declared_names(&parsed), ["mine", "codex"]);

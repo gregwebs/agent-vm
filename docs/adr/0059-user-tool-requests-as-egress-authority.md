@@ -8,6 +8,15 @@ Partly reverses [ADR-0039](0039-non-authoritative-tool-network-requests.md)'s
 "requests as authority" rejection; amends
 [ADR-0040](0040-persisted-user-network-authority.md)'s shared verified read.
 
+**Amended by [ADR-0075](0075-explicit-tool-authorization.md): `tool:NAME` is
+removed.** Authorizing a tool through `allow_tools` grants its own
+`network_requests` directly on launch, so the reference form has no remaining job.
+`set:NAME` is unchanged and is now the only egress reference. A persisted
+`tool:codex` entry is an allowance-grammar error (`port must be a decimal number
+1-65535`), and `tool:443` is the literal hostname `tcp://tool:443`. Everything
+below about `set:NAME` — resolution against the user file's own `[egress_sets]`,
+the verified read, entry-level attribution and the closure budget — still holds.
+
 ## Context
 
 Users repeat a tool's `network_requests` by hand in `allow_egress`. ADR-0039

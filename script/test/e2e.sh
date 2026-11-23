@@ -183,10 +183,12 @@ OWNED_BUILDER=""
 # `$HOME/.config/agent-vm/projects/<digest>/config.toml`. A candidate that still
 # reads `<project>/.agent-vm/config.toml` would silently fall back to the
 # built-in defaults, so an un-migrated launcher is refused up front rather than
-# passing vacuously. `agent-vm <major>.<minor>.<patch> (...)`: 0.8.1 is the first
-# release with the host-managed tier, flat `sources` (ADR-0074) and the flipped
-# image precedence — an older candidate would fail the flipped rows below
-# misleadingly rather than because it is broken.
+# passing vacuously. `agent-vm <major>.<minor>.<patch> (...)`:
+# 0.8.1 is the first release with the host-managed tier, flat `sources`
+# (ADR-0074) and the flipped image precedence; 0.8.2 is the first with explicit
+# tool authorization (ADR-0075), so a fixture whose `[[tools]]` block is inert
+# without `allow_tools` would otherwise launch nothing and pass the rows below
+# misleadingly.
 candidate_reads_host_managed_config() {
   local bin="$1" version major minor patch
   version="$("$bin" --version 2>/dev/null | awk 'NR == 1 {print $2}')" || return 1
@@ -200,7 +202,7 @@ candidate_reads_host_managed_config() {
   patch="${version#*.*.}"
   patch="${patch%%[!0-9]*}"
   [ "$major" -gt 0 ] ||
-    { [ "$major" -eq 0 ] && { [ "$minor" -gt 8 ] || { [ "$minor" -eq 8 ] && [ "$patch" -ge 1 ]; }; }; }
+    { [ "$major" -eq 0 ] && { [ "$minor" -gt 8 ] || { [ "$minor" -eq 8 ] && [ "$patch" -ge 2 ]; }; }; }
 }
 
 [[ -x "$AGENT_VM" ]] || die "launcher not found at $AGENT_VM; build it with
@@ -213,7 +215,7 @@ or point AGENT_VM_BIN at one."
 for candidate in "$AGENT_VM" "$AGENT_VM_DEV_BIN" "$AGENT_VM_RELEASE_BIN"; do
   [[ -x "$candidate" ]] || continue
   candidate_reads_host_managed_config "$candidate" ||
-    die "the launcher at $candidate is older than 0.8.0; it reads <project>/.agent-vm/config.toml instead of the host-managed project config (ADR-0073). Rebuild it from this branch."
+    die "the launcher at $candidate is older than 0.8.2; it reads <project>/.agent-vm/config.toml instead of the host-managed project config (ADR-0073) and predates explicit tool authorization (ADR-0075). Rebuild it from this branch."
 done
 
 command -v docker >/dev/null 2>&1 || die "docker is required but not on PATH"
@@ -907,6 +909,8 @@ write_custom_tools_config() {
   local dir="$1" home="${2:-$CUSTOM_HOME}"
   mkdir -p "$dir" || return 1
   write_host_project_config "$dir" "$home" >/dev/null <<'EOF' || return 1
+allow_tools = ["hello-258", "missing-258"]
+
 [[tools]]
 name = "hello-258"
 command = "hello-258"
@@ -943,6 +947,8 @@ printf 'credsprobe=ok\n'
 PROBE
   chmod 0755 "$dir/guestprobe.sh" || return 1
   write_host_project_config "$dir" "$home" >/dev/null <<'EOF' || return 1
+allow_tools = ["credsprobe"]
+
 [[tools]]
 name = "credsprobe"
 command = "bash"
@@ -5421,8 +5427,22 @@ OWNED_STATE='(.mcpServers["chrome-devtools"].command == "/usr/local/bin/agent-vm
 NO_OWNED_STATE='(.mcpServers["chrome-devtools"] // null) == null'
 
 custom_image_integrations() {
-  INTEG_PROJ="$(custom_project "custom-integrations")" || return 1
-  cat >>"$(host_project_config "$INTEG_PROJ" "$CUSTOM_HOME")" <<'EOF' || return 1
+  INTEG_PROJ="$WORK/custom-integrations"
+  mkdir -p "$INTEG_PROJ" || return 1
+  # One write rather than `custom_project` plus an append: `allow_tools` has to
+  # list every name and lives above the first table header, so a block appended
+  # after `[[tools]]` could not carry its own entry.
+  write_host_project_config "$INTEG_PROJ" "$CUSTOM_HOME" >/dev/null <<'EOF' || return 1
+allow_tools = ["hello-258", "missing-258", "verify-mcp-258"]
+
+[[tools]]
+name = "hello-258"
+command = "hello-258"
+persist = [".hello-258.state"]
+
+[[tools]]
+name = "missing-258"
+command = "not-installed-258"
 
 [[tools]]
 name = "verify-mcp-258"
@@ -5571,6 +5591,8 @@ printf 'hook-tool-ok uid=%s gid=%s argv=%s env=%s\n' "$(id -u)" "$(id -g)" "$*" 
 PROG
   chmod +x "$proj/bin/hook-only-258" || return 1
   write_host_project_config "$proj" "$CUSTOM_HOME" >/dev/null <<'EOF' || return 1
+allow_tools = ["hello-258", "hook-only-258"]
+
 [[tools]]
 name = "hello-258"
 command = "hello-258"
@@ -5598,6 +5620,8 @@ HOOK
   local nopath="custom-hook-nopath" noproj
   noproj="$(custom_project "$nopath")" || return 1
   write_host_project_config "$noproj" "$CUSTOM_HOME" >/dev/null <<'EOF' || return 1
+allow_tools = ["hook-only-258"]
+
 [[tools]]
 name = "hook-only-258"
 command = "hook-only-258"
@@ -5623,6 +5647,8 @@ printf 'pathname-tool-ok argv1=[%s] argv2=[%s]\n' "$1" "$2"
 PROG
   chmod +x "$pproj/hook dir/tool name" || return 1
   write_host_project_config "$pproj" "$CUSTOM_HOME" >/dev/null <<'EOF' || return 1
+allow_tools = ["pathname-258"]
+
 [[tools]]
 name = "pathname-258"
 command = "./hook dir/tool name"
@@ -5945,6 +5971,8 @@ custom_image_selected_by_project_config() {
   mkdir -p "$proj" || return 1
   write_host_project_config "$proj" "$CUSTOM_HOME" >/dev/null <<EOF || return 1
 image = "$CUSTOM_MARKER"
+allow_tools = ["hello-258"]
+
 [[tools]]
 name = "hello-258"
 command = "hello-258"
@@ -5966,6 +5994,8 @@ EOF
   printf '?? legacy\n' >"$proj/.agent-vm/layer/Dockerfile"
   write_host_project_config "$proj" "$CUSTOM_HOME" >/dev/null <<EOF || return 1
 image = "$CUSTOM_MARKER"
+allow_tools = ["hello-258", "second-258"]
+
 [[tools]]
 name = "hello-258"
 command = "hello-258"
@@ -6190,6 +6220,8 @@ custom_image_setup_verification_uses_selected_ref() {
   # asserts a real guest run, not merely a resolved image.
   write_host_project_config "$proj" "$CUSTOM_HOME" >/dev/null <<EOF || result=1
 image = "$selected"
+allow_tools = ["hello-258"]
+
 [[tools]]
 name = "hello-258"
 command = "hello-258"
@@ -6274,6 +6306,8 @@ custom_image_setup_verification_negative() {
   mkdir -p "$proj" || return 1
   write_host_project_config "$proj" "$CUSTOM_HOME" >/dev/null <<EOF || return 1
 image = "$selected"
+allow_tools = ["absent-258"]
+
 [[tools]]
 name = "absent-258"
 command = "not-in-this-image-258"
@@ -6300,6 +6334,8 @@ EOF
   mkdir -p "$proj" || return 1
   write_host_project_config "$proj" "$CUSTOM_HOME" >/dev/null <<EOF || return 1
 image = "$selected"
+allow_tools = ["noexec-258"]
+
 [[tools]]
 name = "noexec-258"
 command = "noexec-258"
@@ -6597,12 +6633,12 @@ custom_image_retained_default() {
     return 1
   fi
   if ! candidate_reads_host_managed_config "$dev_bin"; then
-    echo "    BLOCKER: the debug candidate $dev_bin is older than 0.8.0 (ADR-0073);"
+    echo "    BLOCKER: the debug candidate $dev_bin is older than 0.8.2 (ADR-0073, ADR-0075);"
     echo "             rebuild it from this branch, or set AGENT_VM_DEV_BIN to one"
     return 1
   fi
   if ! candidate_reads_host_managed_config "$rel_bin"; then
-    echo "    BLOCKER: the release candidate $rel_bin is older than 0.8.0 (ADR-0073);"
+    echo "    BLOCKER: the release candidate $rel_bin is older than 0.8.2 (ADR-0073, ADR-0075);"
     echo "             rebuild it from this branch, or set AGENT_VM_RELEASE_BIN to one"
     return 1
   fi
@@ -8104,6 +8140,8 @@ custom_docker_import_workflow() {
 explicit_project() {
   mkdir -p "$BUILD_PROJECT" "$BUILD_HOME" || return 1
   write_host_project_config "$BUILD_PROJECT" "$BUILD_HOME" >/dev/null <<'CONFIG' || return 1
+allow_tools = ["shell"]
+
 [[tools]]
 name = "shell"
 command = "bash"
@@ -8528,7 +8566,11 @@ custom_image_direct_nonstandard() {
 write_direct_hostile_config() {
   local dir="$1" home="${2:-$CUSTOM_HOME}"
   mkdir -p "$dir" || return 1
+  # Every block is *authorized* on purpose: the #398 rows prove that a direct
+  # launch ignores an active catalog, so an inert catalog would prove nothing.
   write_host_project_config "$dir" "$home" >/dev/null <<'EOF' || return 1
+allow_tools = ["direct-probe-398", "direct-helper-398", "prov-control", "shell"]
+
 [[tools]]
 name = "direct-probe-398"
 command = "probe-from-catalog"

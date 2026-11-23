@@ -1192,7 +1192,7 @@ fn configured_tool_named_image_is_refused_and_build_is_allowed() {
     assert!(!harness.docker_log.exists());
     fs::write(
         config_dir.join("config.toml"),
-        "[[tools]]\nname = \"build\"\ncommand = \"build\"\n",
+        "allow_tools = [\"build\"]\n[[tools]]\nname = \"build\"\ncommand = \"build\"\n",
     )
     .unwrap();
     let out = harness.run(&["help", "build"]);

@@ -74,10 +74,16 @@ fn select<'a>(tools: &'a [RawTool], names: &[String]) -> Result<Vec<&'a RawTool>
     Ok(selected)
 }
 
-/// The two facts a reader of a pasted block needs and cannot see in the TOML: that
-/// pasting replaced the shipped catalog, and that a `tools` list resolves only
-/// within its own file. Both are also why the source's rationale comments are
-/// pointed at rather than reproduced.
+/// The three facts a reader of a pasted block needs and cannot see in the TOML:
+/// that declaring any `[[tools]]` replaces the shipped catalog, that the
+/// declarations are **inert** until a top-level `allow_tools` lists them (#735),
+/// and that a `tools` list resolves only within its own file. All three are also
+/// why the source's rationale comments are pointed at rather than reproduced.
+///
+/// The output stays *pure* `[[tools]]` blocks, with no `allow_tools` line: the
+/// documented workflow is `agent-vm tools print codex >> config.toml`, and a bare
+/// key appended after a `[[tools]]` header would be scoped into that tool table by
+/// TOML. The comment says what to add and where, above the first header.
 fn header() -> String {
     // The rationale line names no revision: a dirty build's line 1 does name its base
     // commit, but that SHA cannot identify the local modifications the definitions may
@@ -86,6 +92,7 @@ fn header() -> String {
     format!(
         "# Built-in tool definitions of agent-vm {}, printed by `agent-vm tools print`.\n\
          # Declaring any [[tools]] in a config file replaces the whole built-in catalog.\n\
+         # Tools are inert until listed in a top-level allow_tools = [...] before any [[tools]] block.\n\
          # A tool's `tools` list may name only tools declared in the same file.\n\
          # Rationale comments: crates/agent-vm/src/default-tools.toml.\n",
         env!("AGENT_VM_BUILD_VERSION")
@@ -178,6 +185,12 @@ fn toml_key(key: &str) -> String {
     }
 }
 
+/// A TOML basic string, exposed for diagnostics that give the reader something
+/// copyable to paste (the `allow_tools` entry `doctor` recommends).
+pub(crate) fn toml_string(value: &str) -> String {
+    basic_string(value)
+}
+
 /// A TOML basic string. Every character TOML forbids literally (`"`, `\`, and the
 /// control characters, DEL included) is escaped; only TOML 1.0 escapes are used.
 fn basic_string(value: &str) -> String {
@@ -210,12 +223,27 @@ mod tests {
     };
     use proptest::prelude::*;
 
-    /// `text` loaded as the **user** config, the tier a paste lands in, with no
-    /// project file and no `$HOME`/cwd dependence.
+    /// The printed block pasted into a **user** config — the tier a paste lands in,
+    /// with no project file and no `$HOME`/cwd dependence — including the
+    /// `allow_tools` line #735 requires above the first `[[tools]]` header (the
+    /// printer deliberately emits none: `tools print codex >> config.toml` appends
+    /// *after* a header, where a bare key would be scoped into that table).
     fn load_as_user(text: &str) -> crate::config::ConfigReport {
         let dir = tempfile::tempdir().unwrap();
         let user = dir.path().join("config.toml");
-        std::fs::write(&user, text).unwrap();
+        let mut names: Vec<String> = Vec::new();
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("name = ")
+                && let Some(name) = rest
+                    .trim()
+                    .strip_prefix('"')
+                    .and_then(|v| v.strip_suffix('"'))
+            {
+                names.push(format!("{name:?}"));
+            }
+        }
+        let authorized = format!("allow_tools = [{}]\n{text}", names.join(", "));
+        std::fs::write(&user, authorized).unwrap();
         load(&ConfigPaths::for_test(
             Some(user),
             dir.path().join("absent.toml"),
@@ -434,6 +462,8 @@ command = "b"
         format!(
             "# Built-in tool definitions of agent-vm {}, printed by `agent-vm tools print`.\n\
              # Declaring any [[tools]] in a config file replaces the whole built-in catalog.\n\
+             # Tools are inert until listed in a top-level allow_tools = [...] before any \
+             [[tools]] block.\n\
              # A tool's `tools` list may name only tools declared in the same file.\n\
              # Rationale comments: crates/agent-vm/src/default-tools.toml.\n",
             env!("AGENT_VM_BUILD_VERSION")
@@ -451,7 +481,7 @@ command = "b"
     }
 
     #[test]
-    fn the_header_states_the_two_rules_a_reader_needs() {
+    fn the_header_states_the_three_rules_a_reader_needs() {
         assert_eq!(header(), expected_header());
     }
 

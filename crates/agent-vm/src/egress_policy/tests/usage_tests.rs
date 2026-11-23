@@ -25,15 +25,15 @@ fn notice_of(authority: &EgressAuthority) -> String {
 /// USAGE § Egress references: one reference, three tiers.
 #[test]
 fn usage_reference_examples_print_these_bytes() {
-    let tools = reference_tools(&[("fetcher", &["api.example.com:443", "git.example.com:8443"])]);
+    let sets = reference_sets(&[("fetcher", &["api.example.com:443", "git.example.com:8443"])]);
 
-    // (i) `[network] allow_egress = ["tool:fetcher"]`: persisted only, so no tag.
+    // (i) `[network] allow_egress = ["set:fetcher"]`: persisted only, so no tag.
     let persisted =
-        resolve_saved_with_tools(Default::default(), &["tool:fetcher"], empty_cli(), &tools);
+        resolve_saved_with_tools(Default::default(), &["set:fetcher"], empty_cli(), &sets);
     assert_eq!(
         notice_of(&persisted),
-        "==> Egress policy: allowing TLS to tool:fetcher (1) on ports 443\n\
-==> Egress policy: allowing TLS to tool:fetcher (1) on ports 8443\n\
+        "==> Egress policy: allowing TLS to fetcher (1) on ports 443\n\
+==> Egress policy: allowing TLS to fetcher (1) on ports 8443\n\
 ==> list: agent-vm access egress\n"
     );
 
@@ -41,17 +41,17 @@ fn usage_reference_examples_print_these_bytes() {
     // with both tiers.
     let both = resolve_saved_with_tools(
         Default::default(),
-        &["tool:fetcher"],
+        &["set:fetcher"],
         CliEgress {
-            allowances: &["tool:fetcher".into()],
+            allowances: &["set:fetcher".into()],
             ..empty_cli()
         },
-        &tools,
+        &sets,
     );
     assert_eq!(
         notice_of(&both),
-        "==> Egress policy: allowing TLS to tool:fetcher (1) on ports 443 (persisted grants and --allow-egress)\n\
-==> Egress policy: allowing TLS to tool:fetcher (1) on ports 8443 (persisted grants and --allow-egress)\n\
+        "==> Egress policy: allowing TLS to fetcher (1) on ports 443 (persisted grants and --allow-egress)\n\
+==> Egress policy: allowing TLS to fetcher (1) on ports 8443 (persisted grants and --allow-egress)\n\
 ==> list: agent-vm access egress\n"
     );
 
@@ -61,15 +61,15 @@ fn usage_reference_examples_print_these_bytes() {
         Default::default(),
         &[],
         CliEgress {
-            allowances: &["tool:fetcher".into(), "bare.example.com".into()],
+            allowances: &["set:fetcher".into(), "bare.example.com".into()],
             ..empty_cli()
         },
-        &tools,
+        &sets,
     );
     assert_eq!(
         notice_of(&cli),
-        "==> Egress policy: allowing TLS to tool:fetcher (1) on ports 443 (--allow-egress)\n\
-==> Egress policy: allowing TLS to tool:fetcher (1) on ports 8443 (--allow-egress)\n\
+        "==> Egress policy: allowing TLS to fetcher (1) on ports 443 (--allow-egress)\n\
+==> Egress policy: allowing TLS to fetcher (1) on ports 8443 (--allow-egress)\n\
 ==> Egress policy: allowing TLS to bare.example.com on ports 443, 8443 (--allow-egress)\n\
 ==> list: agent-vm access egress\n"
     );
@@ -79,13 +79,10 @@ fn usage_reference_examples_print_these_bytes() {
 fn usage_set_namespace() -> crate::egress_reference::EgressNamespace {
     crate::egress_reference::test_support::user_namespace(
         std::path::Path::new(REFERENCE_USER_FILE),
-        &[
-            ("codex", &["api.openai.com"]),
-            ("claude", &["api.anthropic.com"]),
-        ],
+        &[],
         Some(
             "corp = [\"git.corp.example\", \"tcp://registry.corp.example:8443\", \"10.0.0.5\"]\n\
-             agents = [\"tool:codex\", \"tool:claude\", \"set:corp\"]\n",
+             agents = [\"tcp://api.openai.com:443\", \"tcp://api.anthropic.com:443\", \"set:corp\"]\n",
         ),
     )
 }
@@ -109,20 +106,20 @@ fn usage_set_examples_print_these_bytes() {
 ==> list: agent-vm access egress\n"
     );
 
-    // `[network] allow_egress = ["tool:codex", "set:agents"]`: the name both
-    // granted counts toward each, in written order.
+    // `[network] allow_egress = ["set:corp", "set:agents"]`: a name both sets
+    // grant counts toward each, in written order.
     let cli = resolve_saved_with_tools(
         Default::default(),
-        &["tool:codex", "set:agents"],
+        &["set:corp", "set:agents"],
         empty_cli(),
         &namespace,
     );
     assert_eq!(
         notice_of(&cli),
-        "==> Egress policy: allowing 10.0.0.5/32 (persisted grants via set:agents)\n\
-==> Egress policy: allowing TLS to tool:codex (1), agents (2) on ports 443\n\
-==> Egress policy: allowing TLS to agents (1) on ports 443, 8443\n\
-==> Egress policy: allowing TLS to agents (1) on ports 8443\n\
+        "==> Egress policy: allowing 10.0.0.5/32 (persisted grants via set:corp and set:agents)\n\
+==> Egress policy: allowing TLS to corp (1), agents (1) on ports 443, 8443\n\
+==> Egress policy: allowing TLS to corp (1), agents (1) on ports 8443\n\
+==> Egress policy: allowing TLS to agents (2) on ports 443\n\
 ==> list: agent-vm access egress\n"
     );
 }

@@ -47,8 +47,8 @@ crates/agent-vm/src/
 ├── egress_grammar.rs       # shared scheme/target/port grammar and allowance errors
 ├── egress_policy.rs        # allowance dispatch + launch egress authority (default-deny)
 ├── egress_hostname.rs      # hostname allowance acceptance, port scope, Domain rule assembly
-├── egress_reference.rs     # tool:NAME / set:NAME → user tool requests and set closures;
-│                           #   two proved prefix claims, one namespace (ADR-0059, #511)
+├── egress_reference.rs     # set:NAME → a user `[egress_sets]` closure; one proved
+│                           #   prefix claim, one namespace (ADR-0059, #511, ADR-0075)
 │   └── sets.rs             #   the egress-set graph: names, references, cycles, budgeted closures
 ├── dns_name.rs             # shared ASCII DNS label byte kernel (credential + egress)
 ├── network.rs              # published ports, proxy notice, launch Plan, LivePolicyPlan (ADR-0066)
@@ -117,11 +117,12 @@ A launch is one pass, and the ordering is load-bearing:
 0. `main` discovers and loads the tool config **before** parsing, because the
    resolved catalog determines which subcommands exist. `config::load` retains
    **every** definition from both tiers, records which definitions win their
-   verb (the non-lossy winner IDs, from whole-definition user-wins precedence)
-   together with the cross-tier conflicts, and checks `persist` ownership over
-   all of those winners — but it binds no reference and folds no closure, so a
-   `tools` reference error is not a load error. (An **egress** reference is a
-   different thing: a persisted `tool:NAME` or `set:NAME` in
+   verb (the non-lossy winner IDs, from `allow_tools` authorization — a project
+   entry replacing an inherited `:trust` verb in place) together with the
+   cross-tier conflicts, and checks `persist` ownership over all of those
+   winners — but it binds no reference and folds no closure, so a `tools`
+   reference error is not a load error. (An **egress** reference is a
+   different thing: a persisted `set:NAME` in
    `[network] allow_egress` is resolved during that same load and *is* a load
    error when it cannot be resolved — as is every declared `[egress_sets]`
    definition, referenced or not — while a CLI one is decided in
@@ -184,14 +185,16 @@ the repository's `.agent-vm/config.toml`; see
 sources as ordered **catalogs** — the `:trust` user config
 (`$HOME/.config/agent-vm/config.toml`) and any untrusted sources, which by
 default is the implicit user config ([ADR-0074](docs/adr/0074-flat-config-sources.md))
-— validates each strictly, and retains every definition from all of them. Whole-definition user-wins precedence (`user`
-definitions, then project-only names) decides only which names are **launch
-verbs**; it is not a reference namespace. Each launch winner's closure is
-resolved over the definitions that share its **declaring file** (#395), so a
-project `helper` that names `pi` gets the project's `pi` even when the user's
-`pi` owns the verb — and a name that only another file declares is a config
-error. When both tiers declare zero tools it falls back to the seven
-compiled-in defaults embedded from `default-tools.toml`; the synthesized `shell`
+— validates each strictly, and retains every definition from all of them.
+`allow_tools` decides which definitions are **launch verbs** — the `:trust`
+file's list first, then the project's entries, each one naming an inherited verb
+replacing it in place (ADR-0075) — and it is not a reference namespace. Each
+launch winner's closure is resolved over the definitions that share its
+**declaring file** (#395), so a project `helper` that names `pi` gets the
+project's `pi` whichever file owns the verb — and a name that only another file
+declares is a config error. When no user or project definition exists and
+neither tier writes `allow_tools` it falls back to the seven compiled-in
+defaults embedded from `default-tools.toml`; the synthesized `shell`
 fallback is resolved from a scope holding only that one shipped definition, so
 under a custom catalog it provisions nothing. The resolved catalog is what the
 CLI builds its launch verbs from (#82), and `run::launch` reads back each
@@ -412,10 +415,11 @@ triggers or not, and returns what it measured (`authorized` **and** a
 `ReferenceTrust` carrying the verdict). What a trigger decides is *enforcement*:
 `authorized` is `Some` only when an authority-bearing field is present and the
 file passed, so a tools-only file keeps loading (and keeps working through a
-dotfile symlink) whatever its facts are. The verdict waits, unenforced and
-unused, until a CLI `--allow-egress tool:NAME` or `set:NAME` asks for it at
-launch — a decision that only exists after argv is parsed, which is why it
-cannot be made here.
+dotfile symlink) whatever its facts are. The carried verdict is consulted by name
+resolution alone — a CLI `--allow-egress set:NAME` at launch, or a project
+`allow_tools` entry selecting a `:trust` tool while the same load resolves the
+verb list — so it must travel beside the bytes it measured instead of being
+measured again.
 
 **The persisted guest-HOME collision moved.** A mount that shadows a declared
 `persist` path used to be refused in `run.rs` *after* `prepare` returned — that

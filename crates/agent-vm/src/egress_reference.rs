@@ -1,11 +1,15 @@
-//! ADR-0059: `tool:NAME` egress references, and the one namespace they resolve
-//! against.
+//! ADR-0059/#511/#735: the `set:NAME` egress reference, and the one namespace it
+//! resolves against.
 //!
-//! `tool:NAME` grants that tool's own `network_requests`, each as an exact
-//! `tcp://HOST:PORT` hostname allowance. It is a *reference*, not a grant: the
-//! authority it confers is whatever the user's own `config.toml` file already
-//! declares, so once an entry is written it changes only when that file is
-//! edited, and never because a repository declared something.
+//! `set:NAME` grants a user-config `[egress_sets]` entry's compiled closure. It is
+//! a *reference*, not a grant: the authority it confers is whatever the user's own
+//! `config.toml` already declares, so once an entry is written it changes only
+//! when that file is edited, and never because a repository declared something.
+//!
+//! #735 (ADR-0075) removed the `tool:NAME` reference: a tool's own
+//! `network_requests` are granted when `allow_tools` authorizes it, so nothing
+//! needs to name a tool from an egress list. [`expand`] survives as that one
+//! grant path's converter.
 //!
 //! **That is post-migration behaviour, and the migration is the exception.**
 //! Upgrading *into* 0.7.31 rebinds an existing `tool:P` entry from the hostname
@@ -41,70 +45,42 @@
 //! **Expansion re-enters the grammar.** [`expand`] renders `tcp://HOST:PORT`
 //! and parses it with the same unchanged `Allowance::parse`, so every hostname
 //! allowance in launch policy still passed the proved scheme/target/hostname
-//! kernels; a reference cannot construct an allowance the grammar would refuse.
+//! kernels; nothing can construct an allowance the grammar would refuse. Since
+//! #735 the one caller is an authorized tool's own `network_requests`, which are
+//! granted on launch instead of referenced by name (ADR-0075).
 //!
 //! Parsing and resolution are deliberately two steps. The persisted path must
-//! report a `[network]` *syntax* error before it reports a tool-validation
+//! report a `[network]` *syntax* error before it reports a `[egress_sets]`
 //! error, and a *resolution* error after it — so `user_network` parses entries
 //! where it always parsed them and calls [`resolve`] once, after
 //! `validate_tools`.
 
 mod sets;
 
-use crate::config::{Tool, ToolOrigin, tool_name_rejection};
 use crate::config_authority::{AuthorizedConfig, ReferenceTrust, UntrustedConfig};
 use crate::egress_grammar::AllowanceError;
 use crate::egress_hostname::HostnameAllowance;
 use crate::egress_policy::Allowance;
 use crate::network_requests::NetworkRequests;
 use microsandbox_network::policy::DomainName;
-use std::{collections::BTreeMap, fmt, path::PathBuf};
+use std::{fmt, path::PathBuf};
 use vstd::prelude::*;
 
 verus! {
-/// ADR-0059 R1: `tool:` in any ASCII case, not followed by `//`.
+/// #511 R1: `set:` in any ASCII case, not followed by `//`, because `set://host`
+/// is a scheme the allowance grammar refuses and must keep refusing.
 ///
-/// Reuses the grammar's own case-folding predicate, so "case-insensitive" means
-/// one thing across `tcp:`, `udp:` and `tool:` — and the `//` exclusion mirrors
-/// `tcp_scheme`'s, because `tool://host` is a *scheme* the allowance grammar
-/// refuses and must keep refusing (A4).
-pub open spec fn reference_claim_spec(s: Seq<u8>) -> bool {
-    crate::egress_grammar::ci_prefix(s, seq![0x74u8, 0x6f, 0x6f, 0x6c, 0x3a])
-        && !(s.len() >= 7 && s[5] == 0x2f && s[6] == 0x2f)
-}
-
-/// Which grammar one allowance text is handed to. Exhaustive: no third answer.
-///
-/// The postcondition `claimed ==> len >= 5` is what lets the adapter slice the
-/// name off without a length check of its own: the five claimed bytes are ASCII
-/// by [`reference_claim_spec`], so the slice boundary is a `char` boundary.
-pub fn reference_claim(s: &[u8]) -> (claimed: bool)
-    ensures
-        claimed == reference_claim_spec(s@),
-        claimed ==> s@.len() >= 5,
-{
-    if s.len() < 5 { return false; }
-    // Two explicit cases per letter rather than the grammar's private
-    // `lower_byte`, so no existing verus! item changes visibility or contract.
-    let prefix = (s[0] == 0x74 || s[0] == 0x54) && (s[1] == 0x6f || s[1] == 0x4f)
-        && (s[2] == 0x6f || s[2] == 0x4f) && (s[3] == 0x6c || s[3] == 0x4c)
-        && s[4] == 0x3a;
-    prefix && !(s.len() >= 7 && s[5] == 0x2f && s[6] == 0x2f)
-}
-
-/// #511 R1: `set:` in any ASCII case, not followed by `//` — [`reference_claim`]'s
-/// rule with its own prefix, because `set://host` is a scheme the allowance
-/// grammar refuses and must keep refusing.
-///
-/// The two claims are disjoint by construction (different third byte) and by test
-/// (A3), which is what lets the adapter ask them in either order.
+/// #735 removed the `tool:` claim (ADR-0075): an authorized tool's
+/// `network_requests` are granted on launch, so no egress reference reads
+/// `[[tools]]` any more. `set:` is therefore the only claimed prefix, and every
+/// other text reaches `Allowance::parse` unchanged.
 pub open spec fn set_reference_claim_spec(s: Seq<u8>) -> bool {
     crate::egress_grammar::ci_prefix(s, seq![0x73u8, 0x65, 0x74, 0x3a])
         && !(s.len() >= 6 && s[4] == 0x2f && s[5] == 0x2f)
 }
 
-/// The `set:` half of [`reference_claim`], with the same postcondition: the four
-/// claimed bytes are ASCII, so the adapter may slice the name off unguarded.
+/// The four claimed bytes are ASCII, so the adapter may slice the name off
+/// unguarded.
 pub fn set_reference_claim(s: &[u8]) -> (claimed: bool)
     ensures
         claimed == set_reference_claim_spec(s@),
@@ -117,76 +93,38 @@ pub fn set_reference_claim(s: &[u8]) -> (claimed: bool)
 }
 } // verus!
 
-/// The five claimed bytes: `tool:`, ASCII by the claim.
-const PREFIX_LEN: usize = 5;
-
 /// The four claimed bytes of `set:`, ASCII by the claim.
 const SET_PREFIX_LEN: usize = 4;
 
-const MALFORMED: &str = "an egress reference must be tool:NAME with a valid tool name (no whitespace, control characters or '/', not starting with '-', and not `.`, `..`, `*` or a reserved subcommand name)";
-const UNKNOWN: &str = "an egress reference must name a tool declared in the user config's own [[tools]]; built-in and project tools are never used (`agent-vm tools print` prints the shipped tools to copy there)";
-const NO_REQUESTS: &str = "an egress reference must name a tool that declares network_requests; this tool declares none, so the reference would grant nothing";
-const NO_USER_CONFIG: &str = "an egress reference resolves only against the user config's own [[tools]], and no user config file was found";
-const UNEXPANDABLE: &str = "a declared network request could not be expanded as an exact hostname allowance (internal error; please report it)";
 const MALFORMED_SET: &str = "an egress reference must be set:NAME with a valid egress-set name ([A-Za-z0-9_] first, then [A-Za-z0-9_.-])";
 const UNKNOWN_SET: &str = "an egress reference must name a set declared in the user config's own [egress_sets]; project and built-in configs cannot declare sets";
 const NO_USER_SETS: &str = "an egress reference resolves only against the user config's own [egress_sets], and no user config file was found";
+const UNEXPANDABLE: &str = "a declared network request could not be expanded as an exact hostname allowance (internal error; please report it)";
 
-/// What one reference names, and therefore what resolves it.
-///
-/// Two variants, not a prefix plus a string: the claim decided which namespace
-/// the name belongs to, and a resolver that had to re-derive that from the bytes
-/// could look a set up in the tool map.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Target {
-    Tool(String),
-    Set(sets::EgressSetName),
-}
-
-/// One `tool:NAME` or `set:NAME` reference. The name is byte-exact: the prefix is
+/// One `set:NAME` reference. The name is byte-exact: the prefix is
 /// case-insensitive, the name it holds is not.
 ///
-/// A tool's name is a `String` rather than `config::ToolName` because `ToolName`
-/// has exactly one mint site (`validate_name`, which is where a declaration's
-/// uniqueness is established) and a reference must not become a second way to
-/// hold one. The invariant is equal either way: [`AllowanceEntry::parse`] accepts
-/// the name only through `config::tool_name_rejection`, so it is a name some
-/// `[[tools]]` entry could declare — never empty, and never containing
-/// whitespace or control characters, which is what makes [`Display`] safe to
-/// render. A set's name is minted only by [`sets::EgressSetName::parse`], over
-/// the same rule `[mount_sets]` uses.
+/// A set's name is minted only by [`sets::EgressSetName::parse`], over the same
+/// rule `[mount_sets]` uses, so a reference can only name a set some file could
+/// declare — and [`Display`] is safe to render.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct EgressReference(Target);
+pub(crate) struct EgressReference(sets::EgressSetName);
 
 impl EgressReference {
-    /// The refusal for a launch with no user config file at all, worded for the
-    /// namespace the reference needed. The two differ because the fix differs:
-    /// nothing can hold tools *or* sets, but the reader is told which.
-    fn no_user_config(&self) -> EntryError {
-        match self.0 {
-            Target::Tool(_) => EntryError::NoUserConfig,
-            Target::Set(_) => EntryError::NoUserSets,
-        }
+    /// How a collapsed launch line names this reference: the set's own name (#631).
+    pub(crate) fn notice_label(&self) -> String {
+        self.0.as_str().to_owned()
+    }
+
+    /// The set it names.
+    pub(in crate::egress_reference) fn set_name(&self) -> &sets::EgressSetName {
+        &self.0
     }
 }
 
 impl fmt::Display for EgressReference {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.0 {
-            Target::Tool(name) => write!(f, "tool:{name}"),
-            Target::Set(name) => write!(f, "set:{}", name.as_str()),
-        }
-    }
-}
-
-impl EgressReference {
-    /// How a collapsed launch line names this reference: a set by its own
-    /// name, a tool with its `tool:` prefix (#631).
-    pub(crate) fn notice_label(&self) -> String {
-        match &self.0 {
-            Target::Tool(name) => format!("tool:{name}"),
-            Target::Set(name) => name.as_str().to_owned(),
-        }
+        write!(f, "set:{}", self.0.as_str())
     }
 }
 
@@ -201,13 +139,14 @@ pub(crate) enum AllowanceEntry {
 }
 
 impl AllowanceEntry {
-    /// The trusted `&str` adapter over [`reference_claim`] and
-    /// [`set_reference_claim`] (ADR-0018).
+    /// The trusted `&str` adapter over [`set_reference_claim`] (ADR-0018).
     ///
     /// Claimed text never reaches `Allowance::parse`; unclaimed text is parsed by
     /// it unchanged, so every text whose meaning did not change keeps exactly the
-    /// `Ok` or error it had. That includes `tool:P`/`set:P`-shaped text a kernel
-    /// declines: `set://x.example` is still the scheme error, byte for byte.
+    /// `Ok` or error it had. `set://x.example` is still the scheme error, byte for
+    /// byte, and #735's removal of the `tool:` claim means `tool:NAME` is now
+    /// parsed as an ordinary allowance text: `tool:443` is the hostname `tool` on
+    /// port 443, and `tool:codex` fails as a malformed port.
     pub(crate) fn parse(text: &str) -> Result<Self, EntryError> {
         if set_reference_claim(text.as_bytes()) {
             // R3: the name is accepted iff a mount set could be called it, so a
@@ -217,27 +156,11 @@ impl AllowanceEntry {
                 .ok_or(EntryError::MalformedSetReference)?;
             let name =
                 sets::EgressSetName::parse(name).map_err(|_| EntryError::MalformedSetReference)?;
-            return Ok(Self::Reference(EgressReference(Target::Set(name))));
+            return Ok(Self::Reference(EgressReference(name)));
         }
-        if !reference_claim(text.as_bytes()) {
-            return Allowance::parse(text)
-                .map(Self::Literal)
-                .map_err(EntryError::Allowance);
-        }
-        // Unreachable refusal: the claim guarantees five leading ASCII bytes, so
-        // index 5 is a `char` boundary. Written as a `get` rather than an index
-        // because a panic must not be reachable from user text.
-        let name = text
-            .get(PREFIX_LEN..)
-            .ok_or(EntryError::MalformedReference)?;
-        // R2: the name is accepted iff `[[tools]]` would accept it, so a name no
-        // tool can have is a *syntax* error, never "unknown tool".
-        if tool_name_rejection(name).is_some() {
-            return Err(EntryError::MalformedReference);
-        }
-        Ok(Self::Reference(EgressReference(Target::Tool(
-            name.to_owned(),
-        ))))
+        Allowance::parse(text)
+            .map(Self::Literal)
+            .map_err(EntryError::Allowance)
     }
 }
 
@@ -250,11 +173,7 @@ impl AllowanceEntry {
 pub(crate) enum EntryError {
     /// The unchanged allowance error, rendered by its own `Display`.
     Allowance(AllowanceError),
-    MalformedReference,
     MalformedSetReference,
-    UnknownTool,
-    NoRequests,
-    NoUserConfig,
     /// #511: no set of that name in the user file's own `[egress_sets]`.
     UnknownSet,
     /// #511: there is no user config file, so there are no sets to resolve.
@@ -264,20 +183,15 @@ pub(crate) enum EntryError {
         file: PathBuf,
         refusal: UntrustedConfig,
     },
-    Unexpandable,
 }
 
 impl fmt::Display for EntryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Allowance(error) => error.fmt(f),
-            Self::MalformedReference => f.write_str(MALFORMED),
             Self::MalformedSetReference => f.write_str(MALFORMED_SET),
             Self::UnknownSet => f.write_str(UNKNOWN_SET),
             Self::NoUserSets => f.write_str(NO_USER_SETS),
-            Self::UnknownTool => f.write_str(UNKNOWN),
-            Self::NoRequests => f.write_str(NO_REQUESTS),
-            Self::NoUserConfig => f.write_str(NO_USER_CONFIG),
             Self::Untrusted { file, refusal } => {
                 write!(
                     f,
@@ -285,10 +199,26 @@ impl fmt::Display for EntryError {
                     crate::one_line::quoted_path(file)
                 )
             }
-            Self::Unexpandable => f.write_str(UNEXPANDABLE),
         }
     }
 }
+
+/// Why one `network_requests` entry could not be expanded into an allowance.
+///
+/// A single sentence, because there is a single cause: the grammar proved the
+/// rendered `tcp://HOST:PORT` is not a hostname allowance. A declaration that
+/// cannot be rendered is a programming error in the *validator*, never user
+/// input — `NetworkRequests` already constrained the name and port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExpandRequestError;
+
+impl fmt::Display for ExpandRequestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(UNEXPANDABLE)
+    }
+}
+
+impl std::error::Error for ExpandRequestError {}
 
 /// The zero-based position of the first failing entry, with its reason.
 ///
@@ -316,66 +246,47 @@ pub(crate) fn parse_sets(
 
 pub(crate) use sets::{EgressSetError, ParsedEgressSets};
 
-/// The only namespace an egress reference resolves against (ADR-0059): one user
-/// file's validated tools and the `[egress_sets]` it compiles.
+/// The only namespace an egress reference resolves against (ADR-0059): the
+/// `[egress_sets]` one verified user file compiles.
 ///
-/// Built once, in `config::read_file_tier`'s user arm, from that tier's own
-/// validated tools and its own `[egress_sets]` — before the cross-tier merge,
-/// before the defaults catalog, and from the same read as `trust`. There is no
-/// other constructor outside tests, so no second source of tools *or sets* can
-/// exist, and a set can never be resolved against another file's name.
+/// Built once, in `config::build_tier`'s user arm, from that tier's own
+/// `[egress_sets]` — before the cross-tier merge, before the defaults catalog,
+/// and from the same read as `trust`. There is no other constructor outside
+/// tests, so no second source of sets can exist, and a set can never be resolved
+/// against another file's name.
 ///
 /// Owned data: [`resolve`] performs no I/O, so resolution can neither re-read the
 /// file nor re-measure its directory (A31, A32).
+///
+/// #735 removed the `[[tools]] network_requests` map: a `tool`'s requests are
+/// granted when `allow_tools` authorizes it on launch, not by an egress reference
+/// (ADR-0075). What is left is the set graph and the verdict for it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EgressNamespace {
     trust: ReferenceTrust,
-    requests: BTreeMap<String, NetworkRequests>,
     /// Every declared set's closure, compiled here and nowhere else.
     ///
     /// Boxed because a namespace is carried by `cli::Dispatch`'s launch arm, and
-    /// the graph's three fields would otherwise tip that enum past clippy's
+    /// the graph's two fields would otherwise tip that enum past clippy's
     /// large-variant threshold — the fix belongs here, not in the launch types.
     sets: Box<sets::EgressSets>,
 }
 
 impl EgressNamespace {
-    /// Keep this tier's tools whose origin is the file `trust` measured, and
-    /// compile that same file's egress sets against them.
+    /// Compile one verified file's egress sets.
     ///
-    /// The file comparison is a **runtime** check, not a type-level one, and it
-    /// is load-bearing: two reads of one path carry equal `PathBuf`s, so only the
-    /// single construction site plus this filter keeps a verdict for file A from
-    /// vouching for tools of file B (A13).
-    ///
-    /// Compilation happens here, after `validate_tools`, because a `tool:` entry
-    /// inside a set resolves against validated tools; a set is compiled whether or
-    /// not anything references it, so an unused set cannot smuggle an unknown tool
-    /// past the load.
+    /// A set is compiled whether or not anything references it, so an unused set
+    /// cannot smuggle an unknown reference past the load.
     pub(crate) fn new(
         trust: ReferenceTrust,
-        tools: &[Tool],
         egress_sets: Option<ParsedEgressSets>,
     ) -> Result<Self, EgressSetError> {
-        let file = trust.file();
-        let requests = tools
-            .iter()
-            .filter(|tool| matches!(tool.origin(), ToolOrigin::User(origin) if origin == file))
-            .map(|tool| (tool.name().to_owned(), tool.network_requests().clone()))
-            .collect();
         let sets = match egress_sets {
             None => sets::EgressSets::default(),
-            Some(parsed) => sets::compile(parsed, |name| {
-                // Unreachable in practice — a file that declares `[egress_sets]`
-                // was verified by presence at load — but checked per entry rather
-                // than assumed, so the compile path cannot outlive its verdict.
-                trust.require().map_err(untrusted(&trust))?;
-                tool_expansion(&requests, name)
-            })?,
+            Some(parsed) => sets::compile(parsed)?,
         };
         Ok(Self {
             trust,
-            requests,
             sets: Box::new(sets),
         })
     }
@@ -389,7 +300,7 @@ impl EgressNamespace {
 /// one entry attributed to all of them.
 pub(crate) fn resolve(
     entries: Vec<AllowanceEntry>,
-    user_tools: Option<&EgressNamespace>,
+    user_sets: Option<&EgressNamespace>,
 ) -> Result<ResolvedAllowances, EntryFailure> {
     let mut resolved = ResolvedAllowances::default();
     for (index, entry) in entries.into_iter().enumerate() {
@@ -400,14 +311,10 @@ pub(crate) fn resolve(
                 // R12/R11 before R9 before R10: a reference in an untrusted file
                 // is refused for the file, not for its contents, because the
                 // contents are what the refusal is about.
-                let Some(namespace) = user_tools else {
-                    return Err(fail(reference.no_user_config()));
+                let Some(namespace) = user_sets else {
+                    return Err(fail(EntryError::NoUserSets));
                 };
-                // R21: the file before its contents, for both kinds. A set can
-                // only meet a refused verdict in a file *without* `[egress_sets]`
-                // — presence would have refused the file at load — so the
-                // sentence is the tool one for a case a tool also reaches
-                // (ADR-0059's reachability argument).
+                // R21: the file before its contents.
                 namespace
                     .trust
                     .require()
@@ -419,18 +326,15 @@ pub(crate) fn resolve(
                 if resolved.reference_index(&reference).is_some() {
                     continue;
                 }
-                let expansion = match &reference.0 {
-                    Target::Tool(name) => tool_expansion(&namespace.requests, name),
-                    // R20: the closure the file's own `[egress_sets]` compiled. A
-                    // copy per entry, because the rows are stored by value; the
-                    // repeat skip above is what keeps that one copy per reference.
-                    Target::Set(name) => namespace
-                        .sets
-                        .closure(name)
-                        .map(<[_]>::to_vec)
-                        .ok_or(EntryError::UnknownSet),
-                }
-                .map_err(fail)?;
+                // R20: the closure the file's own `[egress_sets]` compiled. A
+                // copy per entry, because the rows are stored by value; the
+                // repeat skip above is what keeps that one copy per reference.
+                let expansion = namespace
+                    .sets
+                    .closure(reference.set_name())
+                    .map(<[_]>::to_vec)
+                    .ok_or(EntryError::UnknownSet)
+                    .map_err(fail)?;
                 let slot = resolved.push_reference(reference, expansion);
                 // Cloned once per entry, not once per allowance: `insert` mutates
                 // the same struct the expansion is stored in.
@@ -453,33 +357,24 @@ fn untrusted(trust: &ReferenceTrust) -> impl Fn(UntrustedConfig) -> EntryError +
     }
 }
 
-/// One tool's requests, as allowances: unknown, then empty, then expanded.
+/// Render an authorized tool's own declarations as exact allowances.
 ///
-/// The two refusals come first because they are about the *name*, and `expand`
-/// can only fail on a request the file already declared.
-fn tool_expansion(
-    requests: &BTreeMap<String, NetworkRequests>,
-    name: &str,
-) -> Result<Vec<Allowance>, EntryError> {
-    let requests = requests.get(name).ok_or(EntryError::UnknownTool)?;
-    if requests.is_empty() {
-        return Err(EntryError::NoRequests);
-    }
-    expand(requests)
-}
-
 /// Re-enter the proved grammar instead of constructing an allowance directly, so
 /// every hostname allowance in policy passed the scheme, target and hostname
 /// kernels (ADR-0018). The port is always explicit — including 443 — because an
-/// expanded name must be pinned to exactly the port the request declared (R6).
-fn expand(requests: &NetworkRequests) -> Result<Vec<Allowance>, EntryError> {
+/// expanded name must be pinned to exactly the port the request declared: a bare
+/// request grants `tcp://HOST:443` and never widens to another port.
+///
+/// This is the single converter from `network_requests` into egress (ADR-0075),
+/// called by `EgressAuthority::resolve` for a launch of an authorized tool.
+pub(crate) fn expand(requests: &NetworkRequests) -> Result<Vec<Allowance>, ExpandRequestError> {
     requests
         .iter()
         .map(|request| {
             let text = format!("tcp://{}:{}", request.name().as_str(), request.port());
             match Allowance::parse(&text) {
                 Ok(hostname @ Allowance::Hostname(_)) => Ok(hostname),
-                _ => Err(EntryError::Unexpandable),
+                _ => Err(ExpandRequestError),
             }
         })
         .collect()

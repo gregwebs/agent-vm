@@ -99,6 +99,19 @@ const AGENT_SET: &str = "[mount_sets]\nagent = [\"~/cm-tool/agent:/cm/tool/agent
 const TOOL_DEFAULT: &str = "mounts = [\"~/cm-tool/default:/cm/tool/default:ro\"]\n";
 const SHELL_OWN: &str = "mounts = [\"~/cm-tool/shell-own:/cm/tool/shell-own:ro\"]\n";
 
+/// #735: a `[[tools]]` block is inert without an `allow_tools` entry, and every
+/// CM-T row observes mount *selection* through a real launch of a declared verb.
+/// These are user-tier documents, so the names are bare. One list per declared
+/// set: the five agent tools, with the shell (T1–T6, T8–T9) or without it (T7,
+/// whose point is the built-in fallback shell), and T9's tool named like a set.
+const ALLOW_CM: &str = "allow_tools = [\"pi\", \"claude\", \"codex\", \"bridge\", \"plain\"]\n";
+const ALLOW_CM_SHELL: &str =
+    "allow_tools = [\"pi\", \"claude\", \"codex\", \"bridge\", \"plain\", \"shell\"]\n";
+const ALLOW_CM_SHELL_AGENT: &str = "allow_tools = [\"pi\", \"claude\", \"codex\", \"bridge\", \
+     \"plain\", \"shell\", \"agent\"]\n";
+/// T11 declares the Pi lineage only, so only those three are verbs.
+const ALLOW_CM_PI: &str = "allow_tools = [\"pi\", \"claude\", \"codex\"]\n";
+
 fn tool(name: &str, tools: &str, mounts: Option<&str>) -> String {
     let mut body =
         format!("[[tools]]\nname = \"{name}\"\ncommand = \"bash\"\n{PROBE_ARGS}tools = {tools}\n");
@@ -132,13 +145,17 @@ fn tools_base() -> String {
 /// T1-T5: a wildcard shell (its `tools` line is omitted on purpose, which is what
 /// makes it deliberately broad — it inherits every same-tier tool's mounts).
 fn tools_wildcard_shell() -> String {
-    format!("{AGENT_SET}{}{}", tools_base(), shell_tool("", SHELL_OWN))
+    format!(
+        "{ALLOW_CM_SHELL}{AGENT_SET}{}{}",
+        tools_base(),
+        shell_tool("", SHELL_OWN)
+    )
 }
 
 /// T6: the same shell with inheritance switched off, plus a user-wide default.
 fn tools_empty_shell() -> String {
     format!(
-        "{TOOL_DEFAULT}{AGENT_SET}{}{}",
+        "{ALLOW_CM_SHELL}{TOOL_DEFAULT}{AGENT_SET}{}{}",
         tools_base(),
         shell_tool("tools = []\n", SHELL_OWN)
     )
@@ -146,13 +163,23 @@ fn tools_empty_shell() -> String {
 
 /// T7: no declared shell at all, so the built-in fallback runs.
 fn tools_fallback_shell() -> String {
-    format!("{TOOL_DEFAULT}{AGENT_SET}{}", tools_base())
+    format!("{ALLOW_CM}{TOOL_DEFAULT}{AGENT_SET}{}", tools_base())
 }
 
 /// T8-T10: a *wildcard* declared shell, so the opt-out has a non-empty inherited
 /// facet to suppress on the shell route too.
 fn tools_optout() -> String {
     tools_wildcard_shell()
+}
+
+/// T9: the T8 catalog plus a tool named like the set `agent`, authorized so its
+/// own `persist` link is what the row can observe.
+fn tools_set_named_like_a_tool() -> String {
+    format!(
+        "{ALLOW_CM_SHELL_AGENT}{AGENT_SET}{}{}{TOOLS_SAME_NAME_TOOL}",
+        tools_base(),
+        shell_tool("", SHELL_OWN)
+    )
 }
 
 /// A tool named exactly like the set `agent`. Its own leaf and its own `persist`
@@ -166,7 +193,7 @@ const TOOLS_SAME_NAME_TOOL: &str = "[[tools]]\nname = \"agent\"\ncommand = \"bas
 /// nested set, so the *route* is the only difference between the two launches.
 fn tools_default_fork() -> String {
     format!(
-        "mounts = [\"~/.pi:fork\"]\n{}{}{}",
+        "{ALLOW_CM_PI}mounts = [\"~/.pi:fork\"]\n{}{}{}",
         tool("pi", "[\"claude\", \"codex\"]", None),
         tool("claude", "[]", None),
         tool("codex", "[]", None)
@@ -175,7 +202,7 @@ fn tools_default_fork() -> String {
 
 fn tools_nested_set() -> String {
     format!(
-        "[mount_sets]\nouter = [\"inner\"]\ninner = [\"~/.pi:fork\"]\n{}{}{}",
+        "{ALLOW_CM_PI}[mount_sets]\nouter = [\"inner\"]\ninner = [\"~/.pi:fork\"]\n{}{}{}",
         tool("pi", "[\"claude\", \"codex\"]", Some("[\"outer\"]")),
         tool("claude", "[]", None),
         tool("codex", "[]", None)
@@ -1943,7 +1970,7 @@ impl Driver {
         // T9: the explicit set returns exactly the agent topology, including the
         // separate read-only leaf; selecting a set named like a tool provisions no
         // tool, judged by that tool's own `persist` link.
-        self.write_config("T9", &format!("{}{}", tools_optout(), TOOLS_SAME_NAME_TOOL))?;
+        self.write_config("T9", &tools_set_named_like_a_tool())?;
         let t9 = self.launch_tool(
             "T9",
             "tool-set-explicit",
@@ -2203,4 +2230,58 @@ pub fn run(args: ConfigMountsArgs) -> Result<crate::Outcome, String> {
     } else {
         1
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every CM-T document that declares a tool, in the order the rows write
+    /// them.
+    fn documents() -> Vec<(&'static str, String)> {
+        vec![
+            ("T1", tools_wildcard_shell()),
+            ("T6", tools_empty_shell()),
+            ("T7", tools_fallback_shell()),
+            ("T8", tools_optout()),
+            ("T9", tools_set_named_like_a_tool()),
+            ("T11-default", tools_default_fork()),
+            ("T11-set", tools_nested_set()),
+        ]
+    }
+
+    /// #735 B2: `[[tools]]` is inert without an `allow_tools` entry, so an
+    /// un-authorized CM document would launch nothing and its rows would fail (or,
+    /// worse, pass while observing nothing). Parsing the real documents covers
+    /// both halves: the entry is there, and every name it lists is declared.
+    #[test]
+    fn every_cm_document_authorizes_exactly_its_declared_tools() {
+        for (row, document) in documents() {
+            let table: toml::Table = document
+                .parse()
+                .unwrap_or_else(|error| panic!("CM-{row}: the document is not TOML: {error}"));
+            let allowed: Vec<&str> = table
+                .get("allow_tools")
+                .unwrap_or_else(|| panic!("CM-{row}: no top-level allow_tools"))
+                .as_array()
+                .unwrap_or_else(|| panic!("CM-{row}: allow_tools is not an array"))
+                .iter()
+                .map(|entry| entry.as_str().expect("entries are strings"))
+                .collect();
+            let mut declared: Vec<&str> = table
+                .get("tools")
+                .unwrap_or_else(|| panic!("CM-{row}: no tools"))
+                .as_array()
+                .expect("[[tools]] is an array of tables")
+                .iter()
+                .map(|tool| tool["name"].as_str().expect("a tool has a name"))
+                .collect();
+            // Pinned to the declaration order `tools print` would emit, so the
+            // documents stay the shape the rows' notes describe.
+            assert_eq!(allowed, declared, "CM-{row}: allowed versus declared");
+            declared.sort_unstable();
+            declared.dedup();
+            assert_eq!(allowed.len(), declared.len(), "CM-{row}: a name twice");
+        }
+    }
 }

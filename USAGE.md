@@ -96,12 +96,41 @@ access [--session ID] [--all]       show what the project's sandboxes refused,
                                     live and from the project refusal log
 ```
 
-The launch verbs are generated from your tool configuration (see *Tool
-configuration* below). With no config files you get the seven shipped defaults
-`dsh`, `pi`, `codex`, `opencode`, `claude`, `copilot`, `shell`; if your config
-declares only `claude`, then only `agent-vm claude` (plus the built-ins and a
-`shell` fallback) exists. `agent-vm --help` and `agent-vm doctor` always show
-the same list, in the same order.
+The launch verbs are the tools your configuration **authorizes** with
+`allow_tools` (see *Tool configuration* below). With no config files you get the
+seven shipped defaults `dsh`, `pi`, `codex`, `opencode`, `claude`, `copilot`,
+`shell`; if your config authorizes only `claude`, then only `agent-vm claude`
+(plus the built-ins and a `shell` fallback) exists. `agent-vm --help` and
+`agent-vm doctor` always show the same list, in the same order.
+
+### Changed in 0.8.2: `tool:NAME` is gone, and tools need authorization
+
+Two breaking config changes, both from [#735](https://github.com/gregwebs/agent-vm/issues/735).
+
+**1. `tool:NAME` is no longer an egress reference.** Authorizing a tool grants its
+own `network_requests`, so the reference had nothing left to do. `set:NAME` is
+unchanged and is now the only reference.
+
+| before | now |
+|---|---|
+| `allow_egress = ["tool:fetcher"]` | `allow_tools = ["fetcher"]` (+ the `[[tools]]` block) |
+| `--allow-egress tool:fetcher` | launch the authorized tool; it grants its own requests |
+| `[egress_sets] agents = ["tool:fetcher"]` | list the destinations literally, or `allow_tools` the tool |
+| `--allow-egress tool:8443` (a numeric suffix) | unchanged meaning: the literal hostname `tool` on port 8443 |
+
+A persisted `tool:codex` now fails the load with
+`network.allow_egress[0]: port must be a decimal number 1-65535`; a flag entry
+fails before launch with the same reason at its own position. Neither echoes the
+entry, so remove the line the position names and authorize the tool instead.
+
+**2. A `[[tools]]` block is a declaration, not a verb.** Add each tool you launch
+to a top-level `allow_tools = ["…"]` above the first block. A config that
+declares tools without one launches nothing but the `shell` fallback;
+`agent-vm doctor` lists those definitions as inert with the entry to add.
+
+`allow_tools` is authority-bearing (ADR-0040's fifth trigger), so a symlinked or
+group-writable user config that declares it is refused — that is the same rule
+`mounts`, `[network]`, `[mount_sets]` and `[egress_sets]` already had.
 
 ### Changed in 0.7.57: `image refresh` is now `image pull`
 
@@ -3097,7 +3126,10 @@ image = "repo:image"                            # authorize the repo's image
 - **Unique**: two entries may not share an alias or resolve to the same path, and
   no entry may name the project config itself.
 - **Flat**: only the project config may declare `sources`. A sourced file that
-  declares it — `sources = []` included — is refused.
+  declares it — `sources = []` included — is refused. So is a `sources` line
+  written after a table header (`[network]`, `[[tools]]`): TOML scopes it into
+  that table, where nothing reads it, so the refusal names the header and says the
+  line belongs above the first one.
 - **An omitted `sources` key** means the single implicit
   `home:trust ~/.config/agent-vm/config.toml`, i.e. exactly the behaviour before
   this key existed. `sources = []` sources nothing, so the user config is not
@@ -3115,13 +3147,13 @@ project: /home/me/.config/agent-vm/projects/3f9c…/config.toml (found, 0 tools)
 sources:
   home:trust /home/me/.config/agent-vm/config.toml (found, 2 tools)
   repo /work/app/.agent-vm/config.toml (found, 1 tool)
-resolved: declared tools; launch-verb order
+resolved: authorized tools; launch-verb order
   1. pi -> "pi"; …; source=sourced:repo:/work/app/.agent-vm/config.toml
 …
 ==> boot image
 …
 project: ghcr.io/team/app:7 [repo:image /work/app/.agent-vm/config.toml]
-source team: ghcr.io/team/other:1 [/work/app/team.toml]  (not selected; the project config selects it with image = "team:image")
+source team: ghcr.io/team/other:1 [/work/app/team.toml]  (not selected; nothing in the project config authorizes it — to select it, write image = "team:image" in the project config)
 selected (without --image): ghcr.io/team/app:7 (from repo:image in /work/app/.agent-vm/config.toml)
 ```
 
@@ -3142,6 +3174,10 @@ and [Config mounts](#config-mounts-user-config).
 # In the project config only, "ALIAS:image" selects a sourced file's image.
 image = "ghcr.io/gregwebs/agent-vm-standard:v0.1.3"
 
+# Optional, and it must come before the first [[tools]] block: the tools this
+# file authorizes. Declaring a tool does not make it a verb; listing it here does.
+allow_tools = ["mytool"]
+
 # Optional, USER CONFIG ONLY, and it must come before the first table header:
 # mounts = ["~/reference:ro", "~/scratch:/work/scratch:rw"]
 
@@ -3150,7 +3186,7 @@ image = "ghcr.io/gregwebs/agent-vm-standard:v0.1.3"
 # allow_internet_egress = false
 # allow_lan = true
 # allow_host = false
-# allow_egress = ["10.0.0.5", "api.example.com", "tool:mytool"]
+# allow_egress = ["10.0.0.5", "api.example.com", "set:corp"]
 
 [[tools]]
 name = "mytool"                      # required; the `agent-vm <name>` verb
@@ -3161,7 +3197,7 @@ tools = ["claude"]                   # optional; tools to provision (same file, 
 persist = [".cache/mytool"]          # optional; guest-HOME-relative, kept under <state>/persist/
 env = { VAR = "value" }              # optional; guest env pairs for this tool
 interactive_shell = false            # optional; join tool arguments into `-c`
-network_requests = ["api.example.com"] # optional; destinations the tool expects (never grants access)
+network_requests = ["api.example.com"] # optional; granted on launch when this tool is authorized
 ```
 
 - `image` — optional top-level; an OCI image reference selecting the **boot
@@ -3308,23 +3344,30 @@ than 64 declared entries are also hard errors.
 
 ### Merge order and defaults
 
-The user file is authoritative for any tool name it contains; the project
-file may add whole tool definitions the user did not write. This is a union
-of whole definitions, **not** a field-by-field overlay: a repo cannot fill in
-an omitted `persist`, `credentials`, or `tools` on a user-defined tool.
-A project cannot add requests to a user-declared tool: a differing list is a
-`network_requests` conflict, and the user definition wins.
-Resolved order is user declarations first, then project-only declarations (the
-order `--help` and `doctor` both use). The top-level `image` is **not** merged:
-the user tier's `image` wins over the project tier's, and a file that declares
-no tools (for example an image-only file) still keeps the shipped defaults —
-but a project that **declares tools** still replaces the shipped set, exactly
-as before (ADR-0015). When a project declaration of an
-existing name differs, `doctor` warns once and the user definition wins, e.g.:
+Since 0.8.2 the verb list is `allow_tools`, not the declarations: a `[[tools]]`
+block that nothing authorizes is inert data. The verbs are the authorized ones
+in **authorization** order — the `:trust` file's list first, in that file's
+order, then the project's entries in write order, an entry that names an
+inherited verb replacing it in place
+([Tool authorization](#tool-authorization-allow_tools)) — then the `shell`
+fallback. A reversed list such as `["b", "a"]` is legal, and `--help` and
+`doctor` show that order. The merge is a union of whole definitions, **not** a
+field-by-field overlay: a repo cannot fill in an omitted `persist`,
+`credentials`, or `tools` on another file's definition, and a differing
+`network_requests` list is a conflict rather than a merge.
+
+The top-level `image` is **not** merged: the project tier's `image` wins over the
+user tier's. The compiled-in catalog applies only when neither the user nor the
+project config declares a tool or writes `allow_tools`; either one opts out, and
+an image-only file does not.
+
+A project declaration that nothing authorizes never warns. When a project
+authorization replaces an inherited verb with a different definition, `doctor`
+warns once and the project definition is the verb, e.g.:
 
 ```text
-warning: tool "claude" in /home/alice/.config/agent-vm/config.toml overrides
-         /home/alice/.config/agent-vm/projects/<project-id>/config.toml; differing fields: command, args
+warning: tool "claude" in /home/alice/.config/agent-vm/projects/<project-id>/config.toml overrides
+         /home/alice/.config/agent-vm/config.toml; differing fields: command, args
 ```
 
 `doctor` also prints the selected boot image (excluding `--image`, which it does
@@ -3384,11 +3427,14 @@ degraded behaviour:
   `tools` list must still resolve locally. Shadowing a broken definition is not a
   way to ignore it.
 
-A definition that *is* declared locally still supplies its own provisioning even
-when it loses the verb: with a user `pi` and a project `pi`, `agent-vm pi` runs
-yours while a project `helper` that names `pi` gets the project `pi`'s
-credentials and persisted paths. The same holds transitively and for `"*"`, and
-a reference cycle is a fixed point rather than an error.
+A definition that *is* declared locally still supplies its own provisioning to
+everything in its file that reaches it: with a user `pi` and a project `pi`, a
+project `helper` that names `pi` gets the project `pi`'s credentials and
+persisted paths even while the user's `pi` holds the verb. The same holds
+transitively and for `"*"`, and a reference cycle is a fixed point rather than an
+error. Which of the two `pi`s runs is the project's `allow_tools`: authorizing
+the project's one replaces the inherited user verb in place, and leaving it
+unauthorized keeps the user's.
 
 Migration, per file that fails:
 
@@ -3413,9 +3459,9 @@ tools = ["pi"]
 
 Copy the definition you need rather than trimming it: `tools = []` drops the
 credentials and persisted paths the reference was there for. Nothing is merged
-field-by-field, and a name both files declare is still a whole-definition
-conflict — one `doctor` warning, and the user definition keeps the verb — while
-the project's own tools now resolve to the project copy.
+field-by-field, and a name both files declare is two whole definitions: one
+`doctor` warning when the project authorizes its own, nothing when it does not,
+and the project's own tools resolve to the project copy either way.
 
 The same rule applies to the synthesized `shell` fallback: it is a launch
 affordance, not a declaration in your file, so `tools = ["shell"]` needs a local
@@ -3632,18 +3678,27 @@ installed release.
 The output is a **complete `tools` section**, not an increment: it goes where
 your `tools` declarations go, and the rest of your file stays as it is.
 
-For a new config file, this is the whole file:
+Since 0.8.2 a declaration alone launches nothing, so the pasted output also needs
+a top-level `allow_tools` line naming the tools you want. The printed header says
+so. For a new config file, this is the whole file:
 
 ```bash
 mkdir -p ~/.config/agent-vm
-agent-vm tools print > ~/.config/agent-vm/config.toml
+{
+  agent-vm tools print | sed -n 's/^name = "\(.*\)"$/\1/p' \
+    | paste -sd, - | sed 's/^/allow_tools = ["/; s/,/", "/g; s/$/"]/'
+  agent-vm tools print
+} > ~/.config/agent-vm/config.toml
 ```
 
-For an existing file that holds other settings and declares no tools:
+Or write the line by hand — it must come **before the first `[[tools]]` block**:
 
-```bash
-agent-vm tools print >> ~/.config/agent-vm/config.toml
+```toml
+allow_tools = ["dsh", "pi", "codex", "opencode", "claude", "copilot", "shell"]
 ```
+
+For an existing file that holds other settings and declares no tools, the same
+two parts appended in that order (`allow_tools` first).
 
 Use one, not both: `>` writes the whole file, `>>` appends to one already there.
 What an existing `tools` declaration needs first depends on its TOML form. An
@@ -3658,7 +3713,9 @@ output is a complete `tools` section, so a second copy of it is a duplicate-name
 error.
 Existing `[[tools]]` **blocks** are an array of tables, so blocks for names the
 file does not already declare can follow them; a name declared twice is a config
-error, not a TOML one.
+error, not a TOML one. Add the appended names to the file's existing
+`allow_tools` line, and keep the file's own tool listed there too, or the append
+silently retires it.
 
 - Declaring any tool replaces the whole built-in catalog, so the no-argument
   form is the one-paste starting point for a file with no tools of its own. A
@@ -4716,13 +4773,14 @@ DNS: any name, via --allow-internet-egress
 Narrowed by: credential rules; GitHub repos gregwebs/agent-vm
 ```
 
-**`VIA`** is the egress reference that granted the row, as you wrote it
-(`set:NAME`, `tool:NAME`), or `-` when an entry granted it directly. A nested set
-counts toward the reference you wrote.
+**`VIA`** is the source that granted the row: the egress reference you wrote
+(`set:NAME`), the bare name of the authorized tool whose own request granted it,
+or `-` when an entry granted it directly. A nested set counts toward the
+reference you wrote.
 
 **`SOURCE`** is one of `persisted grant` (your `[network]` table, or a group it
-enables), `--allow-egress`, `--allow-internet-egress` / `--allow-lan` /
-`--allow-host`, `project allowance`, `session allowance`.
+enables), `--allow-egress`, `authorized tool`, `--allow-internet-egress` /
+`--allow-lan` / `--allow-host`, `project allowance`, `session allowance`.
 
 **`STATUS`** is `applied`; `applied (rev N)` for an allowance a live policy swap
 confirmed at revision `N` (boot is revision 1, so a swapped allowance is 2 or
@@ -4939,7 +4997,13 @@ section has printed.
 > the entry is an error instead. Texts that were previously invalid (`tool:0`,
 > `tool:0443`, `tool:53`, `tool:65536`) can now resolve too, for a tool of that
 > name. Rewrite such entries as `tcp://tool:P` **before upgrading** to keep the
-> old meaning. See [Egress references](#egress-references-user-tools).
+> old meaning. See [Egress references](#egress-references-user-config).
+>
+> **Reverted in 0.8.2.** `tool:NAME` was removed
+> ([ADR-0075](docs/adr/0075-explicit-tool-authorization.md)), so `tool:P`
+> means the hostname `tool` on port `P` again — exactly the pre-0.7.31 reading,
+> and `tool:NAME` is a port error. Nothing is re-granted silently: an entry naming
+> a tool is now a load error naming its position.
 
 > **Upgrade note (0.7.32): `set:PORT` hostnames.** An `allow_egress` entry that starts with `set:` in any ASCII case — other than a `set://…` URL, which is still refused as an unsupported scheme — is now an **egress set reference**, not an allowance. Before 0.7.32, `set:8443` meant the hostname `set` on port 8443. The texts whose meaning changes are exactly every ASCII-case variant of `set:P` for canonical decimal `P` in 1–65535 except 53 and 853, and texts that were previously invalid (`set:0`, `set:0443`, `set:53`, `set:65536`) can now resolve too.
 > Unlike the `tool:` note above, this one **is fail-closed**: an existing entry names a set, and a file that does not declare one is refused. A trusted user file that declares no `[egress_sets]` refuses the entry as an unknown set; with no user file at all it is "no egress sets"; against an unsafe (symlinked or writable) tools-only file it is the egress-reference refusal. Nothing is silently re-granted — only a later edit that declares a set of that name can grant anything. Rewrite such entries as `tcp://set:P` to keep the old meaning. See [Egress sets](#egress-sets-user-config).
@@ -4996,7 +5060,7 @@ grants back.
 The same numeric and hostname grammar applies; an empty table grants nothing
 but still requires a verified file.
 
-A CLI `--allow-egress tool:NAME` or `--allow-egress set:NAME` needs the same
+A CLI `--allow-egress set:NAME` needs the same
 verified user file, because it resolves against that file's own `[[tools]]` or
 `[egress_sets]`; the entry stays a CLI grant for that launch only. A tools-only
 symlink works without one. See
@@ -5109,10 +5173,10 @@ only be allowed by an explicit IP/CIDR permission.
 
 **Startup notices collapse names.** One line per (effective port set, set of
 sources), in first-seen order. Each egress reference on the line becomes
-`NAME (count)` — a `set:` by its own name, a `tool:` with its prefix kept — where
-the count is how many distinct names on that line the reference granted. Names no
-reference granted are listed up to three and counted past that. So a launch with
-three references and seven other names prints:
+`NAME (count)` — the bare name of the `set:` — where the count is how many
+distinct names on that line the reference granted. Names no reference granted
+are listed up to three and counted past that. So a launch with three references
+and seven other names prints:
 
 ```text
 ==> Egress policy: allowing TLS to anthropic (2), openai (3), rust (3), and 7 other hosts
@@ -5146,172 +5210,121 @@ allowance, or use `--allow-internet-egress`. `NO_PROXY=*` is the only exemption
 (a per-name `NO_PROXY` entry does not lift the refusal). A non-`http` value (for
 example a `socks5://` proxy) is not selected and keeps the existing notice.
 
-### Egress references (user tools)
+### Tool authorization (`allow_tools`)
 
-An `allow_egress` entry may be an **egress reference**: `tool:NAME` grants that
-tool's own `network_requests`, each as an exact `tcp://HOST:PORT` hostname
-allowance. Both forms accept it — persisted `[network] allow_egress` and
-`--allow-egress` — so you do not have to repeat a tool's destinations by hand.
-
-Start by printing the shipped catalog into your own file, because **declaring any
-user tool replaces the whole built-in catalog**. Which command is safe depends on
-what your file already holds; the table is the three cases
-[Printing the built-in tools](#printing-the-built-in-tools) describes in full:
-
-| `~/.config/agent-vm/config.toml` | command |
-|---|---|
-| does not exist (a fresh `$HOME`) | `mkdir -p ~/.config/agent-vm` then `agent-vm tools print > ~/.config/agent-vm/config.toml` |
-| exists, declares no `tools` | `agent-vm tools print >> ~/.config/agent-vm/config.toml` |
-| already declares `[[tools]]` blocks | `agent-vm tools print NAME... >> ~/.config/agent-vm/config.toml` for the names it lacks |
-
-`>` writes the whole file and `>>` appends to one already there; the printed
-output is a complete `tools` section, not an increment. Appending it to a file
-that already carries it — including re-running the onboarding command after an
-upgrade — declares every name twice, and **every** launch then fails with
-`declaration [N] tool "…": duplicate tool name`. A file whose `tools` is an
-empty **assignment** (`tools = []`) needs that line deleted first: TOML rejects
-the whole document otherwise. A *populated* inline array
-(`tools = [{ name = "fetcher", … }]`) is your own definitions, so do not delete
-it: convert each element into a `[[tools]]` block (the same keys, one block per
-element), then append the printed blocks for the names you lack — see
-[Printing the built-in tools](#printing-the-built-in-tools).
-
-Then declare the tool and reference it:
+A `[[tools]]` block **declares**; `allow_tools` **authorizes**. Only an authorized
+tool is an `agent-vm <name>` verb, and authorizing one activates every one of its
+fields: `command`, `args`, `interactive_shell`, `env`, `persist`, `credentials`,
+`mounts` and `network_requests`.
 
 ```toml
+# Top-level, before the first [[tools]] block:
+allow_tools = ["fetcher"]
+
 [[tools]]
 name = "fetcher"
 command = "fetcher"
 network_requests = ["api.example.com", "git.example.com:8443"]
-
-[network]
-allow_egress = ["tool:fetcher"]
 ```
 
-If your file already has a `[network]` table, add `"tool:fetcher"` to its
-`allow_egress` list instead of writing a second `[network]` header: TOML refuses
-a duplicated table, so the example above is the *whole* network section, not an
-addition to one.
+- An unqualified entry (`"fetcher"`) names a `[[tools]]` in the **same file**.
+  A qualified entry (`"repo:fetcher"`) is **project-config only** and names a tool
+  in the source bound to `repo`. `:` may not appear in a tool name.
+- Wildcards are refused: list each tool.
+- In the **project** config, an entry may select a `:trust` file's tool
+  (`"home:fetcher"`), which requires that file to pass ADR-0040's verified read.
+- A `:trust` file's own `allow_tools` is inherited automatically. The project's
+  authorization **replaces** an inherited verb in place, keeping its position in
+  the verb order. Two different origins claiming one verb in the project's own
+  list is an error.
+- A non-`:trust` sourced file may not declare `allow_tools`; the project
+  authorizes its tools. Authorizing one does **not** authorize the tools its own
+  `tools = [...]` reaches — list each of those too.
+- A tool authorized from a sourced file is delegated to that file's unpinned
+  bytes until [#736](https://github.com/gregwebs/agent-vm/issues/736).
 
-`tool:fetcher` grants exactly two allowances, in request order:
+Declaring any tool, or writing `allow_tools` at all, in your user or project
+config opts out of the shipped catalog: nothing else is a verb. A sourced file's
+declarations opt out of nothing. With neither tool nor `allow_tools` in either
+file, the compiled-in defaults apply and `agent-vm pi` / `claude` / `codex` keep
+default-deny egress exactly as before.
+
+**`allow_tools` is authority-bearing.** Like `[network]`, `mounts`,
+`[mount_sets]` and `[egress_sets]`, its *presence* in your user config requires
+that file to pass ADR-0040's verified read — `allow_tools = []` included. A
+symlinked or group-writable user config therefore cannot authorize tools; declare
+them in a regular `0600` file.
+
+#### Losing the launch verb is harmless; check the inert list
+
+An unauthorized tool is inert data, not an error. `agent-vm doctor` lists those
+definitions under `inert tools (declared, not in allow_tools)` with a copyable
+entry each, so a config that forgot one line tells you which line.
+
+#### Authorized tools grant their own `network_requests`
+
+`tool:NAME` **is gone** (see the [migration note](#changed-in-082-toolname-is-gone)).
+An authorized tool's own requests become this launch's exact `tcp://HOST:PORT`
+hostname allowances, with no second declaration:
+
+```toml
+allow_tools = ["fetcher"]
+
+[[tools]]
+name = "fetcher"
+command = "fetcher"
+network_requests = ["api.example.com", "git.example.com:8443"]
+```
+
+`agent-vm fetcher` then grants exactly:
 
 ```text
 tcp://api.example.com:443
 tcp://git.example.com:8443
 ```
 
-How one entry becomes authority:
+and says so, naming the tool that supplied each name:
 
 ```text
-user config.toml
-  [[tools]] fetcher: network_requests = ["api.example.com", "git.example.com:8443"]
-  [network] allow_egress = ["tool:fetcher"]
-                    │
-                    │  reference_claim (proved): is this text `tool:…`?
-                    ▼
-  resolve against THIS file's own [[tools]]
-    never the project tier, never the built-in catalog
-                    │
-                    ▼
-  tcp://api.example.com:443      tcp://git.example.com:8443
-                    │
-                    ▼
-  the same canonical union as hand-written entries
+==> Egress policy: allowing TLS to api.example.com on ports 443 (tool fetcher)
+==> Egress policy: allowing TLS to git.example.com on ports 8443 (tool fetcher)
+==> list: agent-vm access egress
 ```
+
+(An `==> Egress authority:` line naming your config file precedes these; it is
+left out of the examples here and below.)
 
 Rules:
 
-- **Scope is your user file's own `[[tools]]`.** Never the project tier — not
-  even when the project's same-named definition is the verb you launch — and
-  never the shipped catalog or the appended `shell` fallback. Once an entry is
-  written, the authority it confers changes only when *you* edit that file, and
-  never because a repository declared something. **That is the post-migration
-  rule.** Upgrading *into* 0.7.31 is the one step that can change an existing
-  entry's meaning without an edit — see the
-  [upgrade note](#ports--egress) above, which says how to keep `tool:PORT`'s old
-  meaning.
-- **Own requests only**, not the tool's `tools` closure. `tool:shell` does not
-  inherit every tool's requests.
-- **Each request becomes a port-scoped grant**, including 443. An expanded name
-  is never bare, so it does not take the launch's other intercepted ports.
-- The name is byte-exact and the prefix is case-insensitive: `TOOL:fetcher` and
-  `tool:fetcher` are the same reference, `tool:Fetcher` is a different (probably
-  unknown) one. The name must be a valid tool name; anything else is a
-  malformed-reference error, never a tool lookup.
-- An unknown name, or a user tool with no `network_requests`, is an error — a
-  config load error for a persisted entry, and a pre-boot error for a flag. It is
-  never a clap usage error, and it creates no launch state.
-- A **CLI** reference additionally requires the user file to pass ADR-0040's
-  verified read: a tools-only config reached through a symlink still loads and
-  launches, but cannot supply a reference.
-- A project `[network]` table is refused whatever it contains, so `tool:` there
-  gains nothing.
+- **Own requests only**, not the `tools` closure. Authorizing `shell` with
+  `tools = ["*"]` does not inherit another tool's requests.
+- **Each request becomes a pinning grant.** It is expanded to an explicit
+  `tcp://HOST:PORT`, 443 when the request names no port, so no request is ever
+  widened the way a bare `--allow-egress` or persisted name is. Its port does
+  join the launch's intercepted ports, which widens every *other* bare grant to
+  that port.
+- **Only an authorized tool grants.** A compiled-in default's requests stay
+  [non-authoritative metadata](#tool-network-requests) under default-deny, and a
+  **direct** launch (`agent-vm run …` / `agent-vm -- …`) of the very same program
+  and argv gets none of the tool's facets — no grants, no mounts, no env, no
+  persisted paths.
+- A selected host HTTP proxy cannot enforce hostname allowances, so such a launch
+  is refused before launch. The parenthetical names the source, including the
+  authorized tool:
 
-Notices collapse the reference to `tool:NAME (count)` and name the tier in the
-tag. A name granted by a reference with no literal spelling of its own counts
-under that reference. With `[network] allow_egress = ["tool:fetcher"]` and
-`tool:fetcher` requesting `api.example.com:443` and `git.example.com:8443` (so
-8443 is intercepted), the launch says:
+  ```text
+  hostname allowances cannot be enforced through the host HTTP proxy (HTTPS_PROXY/HTTP_PROXY/ALL_PROXY): the proxy resolves the name, so the address scope is not checked; unset the proxy, use an IP/CIDR allowance, or use --allow-internet-egress (authorized tool "fetcher" grants its network_requests for this launch; remove it from allow_tools or drop its requests)
+  ```
 
-```text
-==> Egress policy: allowing TLS to tool:fetcher (1) on ports 443
-==> Egress policy: allowing TLS to tool:fetcher (1) on ports 8443
-==> list: agent-vm access egress
-```
+`agent-vm access egress` shows every granted name, and `--allow-egress` includes
+only the ones a flag added.
 
-(The `==> Egress authority:` line that names your config file is left out of
-these examples.)
+### Egress references (user config)
 
-The count is per line: the same reference is two lines here, each saying
-`tool:fetcher (1)`, because the two names sit on different port lines. A line
-whose only source is your persisted `[network]` table carries no tag.
-
-One reference in both tiers is one line per port set, each tagged with both
-tiers:
-
-```text
-==> Egress policy: allowing TLS to tool:fetcher (1) on ports 443 (persisted grants and --allow-egress)
-==> Egress policy: allowing TLS to tool:fetcher (1) on ports 8443 (persisted grants and --allow-egress)
-==> list: agent-vm access egress
-```
-
-And a literal beside a reference keeps its own name; a bare one gets a line of
-its own, because it widens to every intercepted port:
-
-```text
-==> Egress policy: allowing TLS to tool:fetcher (1) on ports 443 (--allow-egress)
-==> Egress policy: allowing TLS to tool:fetcher (1) on ports 8443 (--allow-egress)
-==> Egress policy: allowing TLS to bare.example.com on ports 443, 8443 (--allow-egress)
-==> list: agent-vm access egress
-```
-
-Several references collapse to `tool:a (1), tool:b (1)`. A name covered by a
-reference never counts as a bare name. A launch whose only hostname authority is
-a CLI reference never says `persisted`. Address lines still use the
-`tool:a and tool:b` list grammar; hostname lines do not, because the references
-are already on the line.
-
-The **bare-name widening rule is unchanged**: a bare hostname in the same launch
-still takes every intercepted port, as `bare.example.com` does above: it gets 443
-**and** 8443, because `git.example.com:8443` put 8443 in the launch's intercepted
-set.
-
-A persisted reference with a selected host HTTP proxy refuses every launch, and
-the parenthetical names it:
-
-```text
-hostname allowances cannot be enforced through the host HTTP proxy (HTTPS_PROXY/HTTP_PROXY/ALL_PROXY): the proxy resolves the name, so the address scope is not checked; unset the proxy, use an IP/CIDR allowance, or use --allow-internet-egress (persisted hostname grants from "/home/u/.config/agent-vm/config.toml" [network], including via tool:fetcher, apply to every launch; remove them there)
-```
-
-`agent-vm doctor` lists every persisted reference and what it grants:
-
-```text
-persisted egress references in "/home/u/.config/agent-vm/config.toml" [network]:
-  tool:fetcher -> tcp://api.example.com:443, tcp://git.example.com:8443
-```
-
-`tool:` inside a `network_requests` entry is not a reference: requests stay
-[non-authoritative metadata](#tool-network-requests). The same holds for `set:`.
+`set:NAME` is now the only egress reference. It grants the compiled closure of a
+user `[egress_sets]` entry — see [Egress sets](#egress-sets-user-config). The
+verified-read requirement, entry-level attribution, the closure budget and the
+"declaring grants nothing" rule are all unchanged.
 
 ### Egress sets (user config)
 
@@ -5333,13 +5346,13 @@ network_requests = ["api.anthropic.com"]
 
 [egress_sets]
 corp   = ["git.corp.example", "tcp://registry.corp.example:8443", "10.0.0.5"]
-agents = ["tool:codex", "tool:claude", "set:corp"]
+agents = ["api.openai.com", "api.anthropic.com", "set:corp"]
 
 [network]
 allow_egress = ["set:agents"]
 ```
 
-`set:agents` grants `agents`' whole closure — the tool requests and the nested
+`set:agents` grants `agents`' whole closure — its own literals and the nested
 set — once, in first-seen order with duplicates removed:
 
 ```text
@@ -5382,20 +5395,20 @@ Rules:
   `[A-Za-z0-9_.-]`. Case is significant, so `Corp` and `corp` are two sets.
   Numeric names (`8443`) are valid names. The `set:` prefix folds case; the name
   does not.
-- **Nesting and forward references.** A set may list literals, `tool:NAME` and
-  `set:NAME`, and may name a set declared before or after it. `tool:NAME` inside
-  a set resolves against **the same file's own `[[tools]]`**, exactly as a
-  `[network]` entry does — never the project tier, never the shipped catalog.
+- **Nesting and forward references.** A set may list literals and `set:NAME`, and
+  may name a set declared before or after it. Each name resolves against **the
+  same file's own `[egress_sets]`** — never the project tier, never the shipped
+  catalog. A tool is not a set member: authorize the tool instead
+  ([`allow_tools`](#tool-authorization-allow_tools)).
 - **Cycles are config errors**, including a cycle in a set nothing references.
   The error names the entry that closes it:
   `egress_sets[1][0]: egress-set reference cycle`.
-- **Every declared set is validated**, used or not: an unknown set, an unknown
-  tool, a malformed allowance or a cycle fails the load wherever it is written,
+- **Every declared set is validated**, used or not: an unknown set, a malformed
+  allowance or a cycle fails the load wherever it is written,
   as `config: "<file>": egress_sets[D][I]: <reason>`.
 - **Expansion is bounded.** Compiling the whole table may charge at most 65,536
-  allowance visits (a literal entry, each allowance of a `tool:` expansion, each
-  allowance of a child set's closure; a repeated `tool:`/`set:` in one set is
-  free). Exhaustion is
+  allowance visits (a literal entry, each allowance of a child set's closure; a
+  repeated `set:` in one set is free). Exhaustion is
   `egress_sets: expansion work exceeds limit of 65536 allowance visits`.
 - **A bare member widens** to every intercepted port, exactly like a bare
   `[network]` entry: `git.corp.example` above takes 443 *and* 8443 because the
@@ -5434,21 +5447,20 @@ line it belongs to; a numeric allowance it granted keeps the address line's own
 tag, unchanged. `git.corp.example` is a bare member, so it widens to both
 intercepted ports and is the `443, 8443` line.
 
-A set and a tool granting the same name collapse into one line, in written
-order, and the count of each is the number of names on that line it granted.
-With `[network] allow_egress = ["tool:codex", "set:agents"]` on the same
-config:
+Two sets granting the same name collapse into one line, in written order, and the
+count of each is the number of names on that line it granted. With
+`[network] allow_egress = ["set:corp", "set:agents"]` on the same config:
 
 ```text
-==> Egress policy: allowing 10.0.0.5/32 (persisted grants via set:agents)
-==> Egress policy: allowing TLS to tool:codex (1), agents (2) on ports 443
-==> Egress policy: allowing TLS to agents (1) on ports 443, 8443
-==> Egress policy: allowing TLS to agents (1) on ports 8443
+==> Egress policy: allowing 10.0.0.5/32 (persisted grants via set:corp and set:agents)
+==> Egress policy: allowing TLS to corp (1), agents (1) on ports 443, 8443
+==> Egress policy: allowing TLS to corp (1), agents (1) on ports 8443
+==> Egress policy: allowing TLS to agents (2) on ports 443
 ==> list: agent-vm access egress
 ```
 
 A `set:` reference is named without its prefix — `agents (2)` — because it already
-reads as a name; `tool:` keeps its prefix so it cannot be mistaken for a
+reads as a name; an authorized tool's grant keeps its own tag, `(tool fetcher)`, so it cannot be mistaken for a
 hostname.
 
 `agent-vm doctor` lists each persisted entry-level reference with its flattened
@@ -5515,11 +5527,13 @@ For already-provisioned Claude auth with no grants, the built-in report lists
 see the [restricted built-in example](docs/default-tool-network-requests.md#restricted-built-in-example)
 and the evidence document for versions, exclusions and maintenance ownership.
 
-Only the launched tool's own `network_requests` are reported. Unmet requests
-are informational; the launch always continues and no authority is added.
-A request never grants access on its own; a `tool:NAME` **egress reference** in
-your own `allow_egress` is what turns one into authority
-([Egress references](#egress-references-user-tools)).
+Only the launched tool's own `network_requests` are reported, and only when that
+tool is a **compiled-in default**. Unmet requests are informational; the launch
+always continues and no authority is added.
+
+An **authorized** tool's requests are granted instead of reported, so it prints no
+report at all — see
+[Authorized tools grant their own `network_requests`](#authorized-tools-grant-their-own-network_requests).
 “Covered” means lookup-free syntactic coverage by public or same-name grants,
 not a connectivity promise.
 

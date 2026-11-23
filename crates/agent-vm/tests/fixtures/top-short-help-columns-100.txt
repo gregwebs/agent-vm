@@ -41,7 +41,7 @@ Mounts & ports:
           Bind an extra host path into the guest, or select a named mount set (repeatable)
       --no-config-mounts
           Skip this launch's automatic config mounts: the top-level `mounts` defaults and the
-          launched tool's own and inherited `mounts` in `~/.config/agent-vm/config.toml`
+          launched tool's own and inherited `mounts`, from the file that declares it
       --git-mount <MODE>
           Automatic Git metadata mounts for a linked worktree rooted at the launch directory: `ro`
           (default), `rw`, or `off` [default: ro] [possible values: ro, rw, off]

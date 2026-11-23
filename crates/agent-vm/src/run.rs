@@ -670,7 +670,7 @@ pub struct Args {
     pub(crate) mount: Vec<String>,
 
     /// Skip this launch's automatic config mounts: the top-level `mounts` defaults and the
-    /// launched tool's own and inherited `mounts` in `~/.config/agent-vm/config.toml`.
+    /// launched tool's own and inherited `mounts`, from the file that declares it.
     ///
     /// Only those automatic selections are skipped: an explicit `--mount` still applies, including
     /// `--mount NAME`, and credentials, persisted paths, agent-vm's own mounts, and every config
@@ -897,7 +897,12 @@ pub(crate) async fn launch(
     // Same reason, one flag earlier in the list: read once, before `args.network`
     // moves, so discovery never re-reads it.
     let git_mount_mode = args.git_mount_mode();
-    let mut network_plan = crate::network::Plan::from_args(args.network, user_network, user_tools)?;
+    let mut network_plan = crate::network::Plan::from_args(
+        args.network,
+        user_network,
+        user_tools,
+        grant.authorized_tool_egress(),
+    )?;
     // The one output policy for this selection: explicit sources render their
     // escaped reference; the default tier renders a fixed label and redacts the
     // reference from every notice, debug dump, progress line and error chain.
@@ -1587,11 +1592,11 @@ pub(crate) async fn launch(
         .emit_launch_notices()
         .context("writing launch networking notices")?;
     // Compare declarations to the authority just printed, before applying it.
-    if let Some(declared) = grant.requests() {
-        for line in network_plan
-            .request_report(&declared.requests, declared.tier)
-            .lines()
-        {
+    // #735: an authorized tool's own requests were already granted as part of this
+    // launch's egress plan, so the ADR-0039 report would contradict it. Only the
+    // compiled-in defaults (non-authoritative) keep it.
+    if let Some((requests, tier)) = grant.tool_egress().and_then(|egress| egress.unmet()) {
+        for line in network_plan.request_report(requests, tier).lines() {
             notices.emit(line)?;
         }
     }
@@ -4973,9 +4978,8 @@ mod tests {
             .expect("run.rs has a test module")
             .0;
         let position = |needle| production.find(needle).expect("launch step is present");
-        let plan = position(
-            "let mut network_plan = crate::network::Plan::from_args(args.network, user_network, user_tools)?;",
-        );
+        let plan = position("let mut network_plan = crate::network::Plan::from_args(");
+        let plan_grant = position("grant.authorized_tool_egress(),\n    )?;");
         let notices = position(".emit_launch_notices()");
         let base_network = position("builder = network_plan.apply_to(builder);");
         let credential_network = position("builder = credential_plan.apply_to(builder)?;");
@@ -4984,6 +4988,9 @@ mod tests {
         assert!(plan < position("mount::prepare("));
         assert!(plan < position("ensure_msb_home("));
         assert!(plan < notices);
+        // #735: the launched tool's authorized egress is part of that same call,
+        // so the plan cannot be built before the grant is read.
+        assert!(plan < plan_grant);
         // Selecting the declaration sources is pure and must stay ahead of the
         // boundary that inspects sources and publishes forks.
         let select = position("mount_selection::select(");
@@ -4996,7 +5003,7 @@ mod tests {
         assert!(select < discover);
         assert!(discover < position("mount::prepare("));
         assert!(discover < position("ensure_msb_home("));
-        let report = position("network_plan\n            .request_report(");
+        let report = position("network_plan.request_report(");
         assert!(notices < report && report < base_network);
         // ADR-0060: the image report sits with the tool report, after the egress
         // notices and before the policy is applied to the builder.

@@ -41,8 +41,10 @@ const MAX_LISTED_MOUNTS: usize = 3;
 /// while the name a tool list used to reach it is not retained.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct MountSources {
-    /// The verified user file that supplied a listed declaration or withheld one.
-    file: Option<PathBuf>,
+    /// The verified file(s) that supplied a listed declaration or withheld one,
+    /// deduplicated in first-seen order: the user defaults file, then the file
+    /// that declared the launched tool's own list when it is distinct (#735).
+    files: Vec<PathBuf>,
     /// Contributing set names, first-seen order, deduplicated.
     sets: Vec<String>,
     /// Whether argv declared at least one mount (a path or a set name).
@@ -53,17 +55,23 @@ pub(crate) struct MountSources {
 
 impl MountSources {
     pub(crate) fn new(
-        file: Option<PathBuf>,
+        files: Vec<PathBuf>,
         sets: Vec<String>,
         cli: bool,
         skipped: Option<usize>,
     ) -> Self {
         Self {
-            file,
+            files,
             sets,
             cli,
             skipped,
         }
+    }
+
+    /// The contributing files through [`one_line::quoted_paths`], the one
+    /// rendering the preparation notice uses too.
+    fn quoted_files(&self) -> String {
+        one_line::quoted_paths(&self.files)
     }
 
     /// The `==> Mounts: …` header, or `None` when the launch declared nothing and
@@ -73,18 +81,18 @@ impl MountSources {
     /// counts from the prepared plan: a set list is a selection, not a count, and
     /// duplicated or nested declarations collapse into one bind.
     pub(crate) fn header(&self, total: usize) -> Option<String> {
-        match (total, self.skipped, &self.file) {
+        match (total, self.skipped, self.files.is_empty()) {
             // Nothing was mounted: the one thing to report is what the opt-out
             // withheld, and a bare "0 mounts" would not say it.
-            (0, Some(skipped), Some(file)) => Some(format!(
+            (0, Some(skipped), false) => Some(format!(
                 "==> Mounts: skipped {skipped} from {} (--no-config-mounts)",
-                one_line::quoted_path(file)
+                self.quoted_files()
             )),
             (0, _, _) => None,
-            (total, skipped, file) => {
+            (total, skipped, no_files) => {
                 let mut provenance: Vec<String> = Vec::new();
-                if let Some(file) = file {
-                    let mut config = format!("config {}", one_line::quoted_path(file));
+                if !no_files {
+                    let mut config = format!("config {}", self.quoted_files());
                     match self.sets.as_slice() {
                         [] => {}
                         [only] => config.push_str(&format!(", set {only}")),
@@ -185,7 +193,7 @@ mod tests {
 
     fn sources(sets: &[&str], cli: bool) -> MountSources {
         MountSources::new(
-            Some(PathBuf::from("/home/a/.config/agent-vm/config.toml")),
+            vec![PathBuf::from("/home/a/.config/agent-vm/config.toml")],
             sets.iter().map(|set| set.to_string()).collect(),
             cli,
             None,
@@ -327,7 +335,7 @@ mod tests {
         );
         assert_eq!(
             lines(
-                &MountSources::new(None, Vec::new(), true, None),
+                &MountSources::new(Vec::new(), Vec::new(), true, None),
                 &plan,
                 "agent-vm-abc-42"
             ),

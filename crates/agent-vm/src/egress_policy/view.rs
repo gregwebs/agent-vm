@@ -26,6 +26,9 @@ pub(super) struct HostnameAttribution<'a> {
     pub(super) cli: EntryOrigin<'a>,
     /// The project record (recorded tier) names this domain.
     pub(super) recorded: bool,
+    /// The launched authorized tool whose own `network_requests` name this
+    /// domain (#735), if any.
+    pub(super) tool: Option<&'a str>,
 }
 
 /// The position of `reference` in the user's written order; a reference the
@@ -79,6 +82,10 @@ impl EgressAuthority {
                     recorded: recorded
                         .as_ref()
                         .is_some_and(|recorded| recorded.contains(&name)),
+                    tool: self
+                        .tool_grants()
+                        .filter(|tool| !tool.ports_for(&name, &ports).is_empty())
+                        .map(|tool| tool.name()),
                     ports: rule.ports.iter().map(|port| port.start).collect(),
                     name,
                 })
@@ -191,6 +198,26 @@ impl EgressAuthority {
                         &mut referenced,
                         &mut bare,
                     );
+                }
+                // #735: an authorized tool's own requests are its own row, with
+                // the tool as the `VIA` cell, so `access egress` explains every
+                // effective hostname (the `debug_assert` below).
+                if let Some(tool) = attribution.tool
+                    && let Some(grants) = self.tool_grants()
+                {
+                    let tool_ports = grants.ports_for(&attribution.name, ports);
+                    if !tool_ports.is_empty() {
+                        explained = true;
+                        bare.push(EgressRow {
+                            destination: RowDestination::Hostname {
+                                name: attribution.name.as_str().to_owned(),
+                            },
+                            ports: RowPorts::Tls { ports: tool_ports },
+                            via: Some(tool.to_owned()),
+                            source: RowSource::AuthorizedTool,
+                            status: configured,
+                        });
+                    }
                 }
                 let live_rows = live_hostname_rows(&attribution.name, live, ports);
                 explained |= !live_rows.is_empty();

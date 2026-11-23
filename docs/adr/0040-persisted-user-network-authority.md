@@ -8,6 +8,13 @@ guard; amends ADR-0036, ADR-0038 and ADR-0018. Additive release: **0.3.2**.
 
 `image refresh` was renamed `image pull` in 0.7.57 (#617, [ADR-0043](0043-image-command-group-and-daemon-import.md)); this record keeps the name it was decided under.
 
+Amended by [ADR-0075](0075-explicit-tool-authorization.md): `allow_tools` is the
+fifth presence trigger, so a user config declaring it must pass the same
+verified read. Its wording is `allow_tools requires config.toml to be a regular
+file, …`, and a project `allow_tools` entry selecting a `:trust` tool consults
+the same read's stored verdict through the `TrustedTool` subject — a second
+*subject*, not a second read.
+
 Amended by [ADR-0073](0073-host-managed-project-config.md): the project tier's
 file is measured and refused on any failure, with no presence trigger. Decision
 1's project refusals stand, and the user tier's rules — presence as the trigger,

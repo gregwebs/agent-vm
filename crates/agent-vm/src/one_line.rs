@@ -194,6 +194,18 @@ pub(crate) fn quoted_path(value: &Path) -> Line {
     Line(format!("\"{}\"", render(bytes_of(value), true)))
 }
 
+/// `"<file1>", "<file2>"` for a list of contributing files: one file renders
+/// byte-identically to the shipped single-file header, and a second is named
+/// beside it. One function, because the mount section's header and the
+/// preparation notice must not spell the same list two ways.
+pub(crate) fn quoted_paths(files: &[std::path::PathBuf]) -> String {
+    files
+        .iter()
+        .map(|file| quoted_path(file).to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

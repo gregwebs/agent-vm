@@ -66,7 +66,9 @@ mod sets;
 
 #[cfg(test)]
 pub(crate) use sets::MAX_MOUNT_SET_EXPANSION_WORK;
-pub(crate) use sets::{MountExpansionWork, UserMounts, merge_tool_mounts};
+pub(crate) use sets::{
+    MountExpansionWork, UserMounts, merge_tool_mounts, parse_declared_tool_mounts,
+};
 // The walk's colour kernel and its two types are the only part of the mount-set
 // graph the egress-set graph reuses (#511): "is this edge a cycle, a descent or
 // shared structure?" is the same question for both, and one proved answer is
@@ -524,8 +526,14 @@ pub(crate) fn from_verified_value(
     authorized: &AuthorizedConfig<'_>,
     values: MountValues<'_>,
     home: Option<&Path>,
+    work: &mut MountExpansionWork,
 ) -> Result<UserMounts, UserMountsError> {
-    UserMounts::parse(authorized.file().to_path_buf(), values, host_syntax(home))
+    UserMounts::parse(
+        authorized.file().to_path_buf(),
+        values,
+        host_syntax(home),
+        work,
+    )
 }
 
 /// [`from_verified_value`], also reporting the leaf visits it admitted — even when
@@ -543,10 +551,21 @@ pub(crate) fn from_verified_value_with_work(
     UserMounts::parse_with_work(authorized.file().to_path_buf(), values, host_syntax(home))
 }
 
+/// [`from_verified_value`] with a counter of its own, for a single-file test that
+/// has no load to continue from (#735, D6).
+#[cfg(test)]
+pub(crate) fn from_verified_value_fresh(
+    authorized: &AuthorizedConfig<'_>,
+    values: MountValues<'_>,
+    home: Option<&Path>,
+) -> Result<UserMounts, UserMountsError> {
+    from_verified_value(authorized, values, home, &mut MountExpansionWork::fresh())
+}
+
 /// The host grammar one verified file's entries are parsed with: `~/` expands
 /// against the `$HOME` its path was discovered from, never a fresh environment
 /// read, and `None` means the host has no UTF-8 home.
-fn host_syntax(home: Option<&Path>) -> HostSyntax<'_> {
+pub(crate) fn host_syntax(home: Option<&Path>) -> HostSyntax<'_> {
     HostSyntax::AbsoluteOrHome {
         home: home.and_then(Path::to_str),
     }
@@ -863,6 +882,7 @@ mod tests {
                 mounts: true,
                 mount_sets: false,
                 egress_sets: false,
+                allow_tools: false,
             },
         )
         .unwrap()
@@ -907,7 +927,7 @@ mod tests {
                 value: &list,
             }];
             (
-                rendered(from_verified_value(
+                rendered(from_verified_value_fresh(
                     authorized,
                     MountValues {
                         defaults: None,
@@ -916,7 +936,7 @@ mod tests {
                     },
                     home,
                 )),
-                rendered(from_verified_value(
+                rendered(from_verified_value_fresh(
                     authorized,
                     MountValues {
                         defaults: None,
@@ -936,7 +956,7 @@ mod tests {
 
     fn parse(text: &str, home: Option<&Path>) -> Result<UserMounts, UserMountsError> {
         with_authorized(|authorized, _| {
-            from_verified_value(
+            from_verified_value_fresh(
                 authorized,
                 MountValues {
                     defaults: Some(&value(text)),
@@ -1473,7 +1493,7 @@ mod tests {
         ] {
             let value = tool_value(text);
             with_authorized(|authorized, _| {
-                let defaults = from_verified_value(
+                let defaults = from_verified_value_fresh(
                     authorized,
                     MountValues {
                         defaults: Some(&value),
@@ -1487,7 +1507,7 @@ mod tests {
                     declaration: 0,
                     value: &value,
                 }];
-                let mut tool_only = from_verified_value(
+                let mut tool_only = from_verified_value_fresh(
                     authorized,
                     MountValues {
                         defaults: None,
@@ -1513,7 +1533,7 @@ mod tests {
         let value = tool_value(r#"["agent:ro"]"#);
         with_authorized(|authorized, _| {
             assert_eq!(
-                from_verified_value(
+                from_verified_value_fresh(
                     authorized,
                     MountValues {
                         defaults: Some(&value),
@@ -1532,7 +1552,7 @@ mod tests {
                 value: &value,
             }];
             assert_eq!(
-                from_verified_value(
+                from_verified_value_fresh(
                     authorized,
                     MountValues {
                         defaults: None,
@@ -1602,7 +1622,7 @@ mod tests {
                     declaration: 1,
                     value: &parsed,
                 }];
-                let error = from_verified_value(
+                let error = from_verified_value_fresh(
                     authorized,
                     MountValues {
                         defaults: None,
@@ -1641,7 +1661,7 @@ mod tests {
     #[test]
     fn the_file_is_the_verified_one() {
         with_authorized(|authorized, file| {
-            let mounts = from_verified_value(
+            let mounts = from_verified_value_fresh(
                 authorized,
                 MountValues {
                     defaults: Some(&value(r#"["/a"]"#)),

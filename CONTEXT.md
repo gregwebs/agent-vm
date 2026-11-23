@@ -453,10 +453,11 @@ one named, deletable one-shot move of a pre-#96 real `<state>/home/.pi` into
 The resolved, validated model of a configuration's declared **tools** — what
 `config::load` produces, as one value so the catalog and a deferred
 configuration error cannot disagree about which state the process is in:
-`Catalog::Ready(LaunchCatalog)` or `Catalog::Broken(err)`. It is built from the
-**tool config tiers** (user, then project), merged as a union of whole
-definitions, and falls back to the compiled-in catalog when both tiers declare
-zero tools. It is **not** the config files themselves.
+`Catalog::Ready(LaunchCatalog)` or `Catalog::Broken(err)`. It retains every
+definition from every **tool config tier** — user, project and each source — as
+a union of whole definitions, and falls back to the compiled-in catalog only when
+neither the user nor the project config declares a tool *and* neither writes
+`allow_tools`. It is **not** the config files themselves.
 
 _Avoid_: bare "catalog" when the distinction matters — say **Launch catalog**
 for the resolved tools plus each one's provisioning set plus the built-in
@@ -476,11 +477,12 @@ It also carries its default `argv`, a list of **credential providers**
 (`credentials`, the requirement set), a list of **available tools** (`tools`,
 driving the provisioning set), extra guest-HOME-relative `persist` paths, a
 guest `env` map, an `interactive_shell` flag, and the **tool config tier** it
-came from. A **full user** tool may also declare `mounts`: those are **Config
-mounts** selected for a launch of that tool, own plus inherited through its
-`tools` closure, and a project or built-in tool may not declare them at all.
-User-config defaults and named **Mount sets** are still selected per launch, and
-either list accepts a set name. See
+came from. A tool may also declare `mounts`: those are **Config mounts** selected
+for a launch of that tool, own plus inherited through its `tools` closure. A user
+tool's list is authority and accepts a **Mount set** name; a project or sourced
+tool's list is legal and inert until **Tool authorization** makes the tool a verb,
+and takes absolute and `~/` paths only; a built-in may not declare one. The
+top-level `mounts` defaults are still selected for every launch. See
 [USAGE.md](USAGE.md#tool-specific-config-mounts).
 
 `env` is published into the guest **before** the launcher's own environment and
@@ -490,11 +492,11 @@ cannot override `PATH`, `IS_SANDBOX` or `LANG`; `HOME`/`USER`/`LOGNAME` are
 
 ### Launch catalog
 
-The verbs a launch actually offers (`config::LaunchCatalog`): the resolved
-merge result, plus the built-in `shell` appended when no declared tool claims
-that name. The catalog resolves each entry's provisioning set before dispatch,
-so `--help`, `doctor` and `run::launch` cannot disagree. One arm of
-**Catalog**.
+The verbs a launch actually offers (`config::LaunchCatalog`): the **authorized**
+definitions in authorization order, plus the built-in `shell` appended when no
+authorized tool claims that name. The catalog resolves each entry's provisioning
+set before dispatch, so `--help`, `doctor` and `run::launch` cannot disagree. One
+arm of **Catalog**.
 
 ### Tool config tier
 
@@ -512,17 +514,24 @@ no symlinked route — before its bytes are decoded
 ([ADR-0073](docs/adr/0073-host-managed-project-config.md)); the `:trust` user
 file's route is checked the same way before it is opened
 ([ADR-0074](docs/adr/0074-flat-config-sources.md)). Each tier is parsed
-and validated independently before merging. Their merge is a **union of whole definitions**, not a field
-overlay: the user tier is authoritative for every name it declares, the
-project side may only add names (and may not declare one name twice), and a
-differing project declaration yields a `doctor` warning (user definition wins).
-Only when every tier declares **zero** tools do the compiled-in defaults apply. The authority-bearing fields are
-`:trust`-tier only: `[network]` ([persisted grant](#egress-authority)), `mounts`
-([config mount](#config-mount)) and `[mount_sets]` ([mount
-set](#mount-set)). A project-side, sourced or built-in declaration of any of them
-is refused, even when empty, because presence is what asks for authority. A
-definition hidden by whole-definition precedence still belongs to its own
-**tool reference scope**, so the rest of its file keeps resolving it.
+and validated independently before merging. Their merge is a **union of whole
+definitions**, not a field overlay, and the verb list is **Tool authorization**
+rather than the declarations: the `:trust` file's own list is inherited, the
+project's entries add verbs, and a project entry naming an inherited verb
+replaces it in place — that project definition is then the verb, and a differing
+replacement yields one `doctor` warning. Two definitions of one name in different
+files therefore coexist legally; only a second authorization of one verb inside
+the project's own list is an error. Only when neither the user nor the project
+config declares a tool *and* neither writes `allow_tools` do the compiled-in
+defaults apply. The authority-bearing fields are `:trust`-tier only: `[network]`
+([persisted grant](#egress-authority)), the top-level `mounts` ([config
+mount](#config-mount)), `[mount_sets]` ([mount set](#mount-set)) and
+`[egress_sets]`. A project-side, sourced or built-in declaration of any of them
+is refused, even when empty, because presence is what asks for authority; a
+project or sourced *tool*'s `mounts` is the one mount field legal there, inert
+until authorized. `allow_tools` is legal in the user and project configs and
+refused in a source or the built-ins. A definition with no verb still belongs to its own **tool
+reference scope**, so the rest of its file keeps resolving it.
 
 A load failure is **deferred**, not fatal at startup: `doctor`, the built-ins,
 and the in-guest `clipboard`/`_intercept-hook` keep working, and a launch verb
@@ -534,12 +543,13 @@ An entry of the project config's top-level `sources` array,
 `"<alias>[:trust] <path>"` ([ADR-0074](docs/adr/0074-flat-config-sources.md)).
 The **alias** is the file's stable name; `:trust` marks the one file read exactly
 like the user config (`$HOME/.config/agent-vm/config.toml`), and everything else
-is **declarations only** — it may add tools and declare an `image`, and cannot
-grant network, mounts or sets. Such a tool still carries the credential, `env`
-and `persist` requests it declares, and — when the user config declares no tools of
-its own — replaces the shipped default verbs, which is why a source is reviewed
-before it is sourced. Sourcing is **flat**: only the project config may
-declare `sources`. An omitted key means the single implicit
+is **declarations only** — it may declare tools and an `image`, and cannot grant
+network, mounts, sets or `allow_tools`. Such a tool still carries the credential,
+`env`, `persist` and `mounts` declarations it makes, and is inert until the
+project config's **Tool authorization** names it, so a sourced file never
+displaces the shipped default verbs; it is reviewed before it is sourced because
+authorizing it activates every one of those fields. Sourcing is **flat**: only
+the project config may declare `sources`. An omitted key means the single implicit
 `home:trust ~/.config/agent-vm/config.toml`. An `image` **declared** by a source
 takes effect only when the project config **authorizes** it with
 `image = "ALIAS:image"`; a user image is the fallback, and every unselected
@@ -886,20 +896,24 @@ mount", which implies lazy shared backing storage.
 
 ## Config mount
 
-A mount declaration the **user** tier selects: an entry of the top-level
-`mounts` defaults, or of a full user `[[tools]]`'s own `mounts`, or a leaf of a
-selected **Mount set**. The defaults apply to every launch; a tool's list applies
-to a launch of that tool, own plus inherited through its `tools` closure. All of
-it is suppressed for one launch by `--no-config-mounts`, which never touches an
-explicit `--mount`. A config mount is parsed, claimed and prepared exactly like a
+A mount declaration a config selects: an entry of the user tier's top-level
+`mounts` defaults, or of a `[[tools]]`'s own `mounts`, or a leaf of a selected
+**Mount set**. The defaults apply to every launch; a user tool's list is authority
+and applies to a launch of that tool, own plus inherited through its `tools`
+closure, while a project or sourced tool's list becomes a config mount only when
+**Tool authorization** makes it a verb. All of it is suppressed for one launch by
+`--no-config-mounts`, which never touches an explicit `--mount`. A config mount is
+parsed, claimed and prepared exactly like a
 `--mount` (same grammar, guest-path rules, merge/refuse rule and protections); it
 differs in path spelling: `~/` in `HOST` or `GUEST` expands to the host `$HOME`
 text (under `--root` too), and no other relative form is accepted. It also
 differs in origin, which diagnostics report as `mounts[N] in
 "<file>"`, `tools[N].mounts[I] in "<file>"` or `mount_sets["NAME"][I] in
-"<file>"`. Its declarations are read only from a **verified file**: the presence
-of any of those fields, not its contents, is what makes the user config
-authority-bearing under ADR-0040's read policy. See
+"<file>"`. Only the user tier's declarations are **authority**: the presence of
+any of those fields, not its contents, is what makes the user config
+authority-bearing under ADR-0040's read policy. A project file is verified
+unconditionally ([ADR-0073](docs/adr/0073-host-managed-project-config.md)), and a
+sourced file's tool mount stays inert until authorized (ADR-0075). See
 [ADR-0046](docs/adr/0046-verified-user-config-mounts.md).
 
 An entry may also be a **Mount set** name, which selects that set's direct
@@ -947,8 +961,8 @@ which its `tools` references resolve — including definitions hidden from
 launch-verb selection by another file. A name that only another file declares is
 a config error, never an opt-in to crossing files. A tool defined in that scope
 supplies its own credentials, requested names, `persist` paths and **Config
-mount** declarations even when it has no verb, and only the **user** tier may
-supply mounts at all; the synthesized fallback `shell` is not a declaration in
+mount** declarations to any authorized tool whose `tools` closure reaches it, verb
+or no verb; the synthesized fallback `shell` is not a declaration in
 any file's scope, so it cannot be named either and inherits nothing. Implemented in #395; see
 [ADR-0048](docs/adr/0048-named-mount-sets-and-tier-local-tool-references.md)
 and [ADR-0017](docs/adr/0017-tool-declared-provisioning.md).
@@ -1013,22 +1027,30 @@ also authorizes DNS for any name. A hostname grant authorizes lookups of its
 own name only, never arbitrary-name DNS. Numeric and LAN-only grants do not
 authorize DNS.
 
-**Network request**: a tool declaration's non-authoritative statement of a TLS
-destination (exact name + port) it expects to contact; reported when unmet,
-never a grant. It becomes authority only when an **Egress reference** selects
-a **user** tool's requests.
+**Tool authorization**: `allow_tools`, a top-level list in the user or project
+config naming the `[[tools]]` declarations that become launch verbs. A
+declaration is inert data; authorizing it activates every one of its fields —
+command, args, `interactive_shell`, env, credentials, `persist`, `mounts` and
+`network_requests` (ADR-0075). A `:trust` file's own list is inherited; the
+project's authorization replaces an inherited verb in place.
+
+**Network request**: a tool declaration's statement of a TLS destination (exact
+name + port) it expects to contact. For an **authorized** tool it is authority:
+the launch grants each as an exact `tcp://HOST:PORT` hostname allowance. For a
+compiled-in default it stays non-authoritative metadata, reported when unmet and
+never a grant. A request is always the tool's *own* — a `tools` closure does not
+fold them.
 
 **Egress reference**: an `allow_egress` entry (persisted or `--allow-egress`)
-that stands for other allowances: `tool:NAME` is that **user**-tier tool's own
-network requests as exact `tcp://HOST:PORT` hostname allowances, and `set:NAME`
-is an **Egress set**. Both resolve against the user file's own `[[tools]]` and
-`[egress_sets]`; built-in and project tools are never resolved, and neither are
-project or built-in sets. `tool:NAME` implemented in #506, `set:NAME` in #511.
+that stands for other allowances. `set:NAME` is an **Egress set**, resolved
+against the user file's own `[egress_sets]`; project and built-in sets are never
+resolved. `set:NAME` implemented in #511. `tool:NAME` existed from #506 and was
+removed by ADR-0075, because authorizing a tool grants its requests directly.
 
 **Egress set**: a named list of allowances and egress references in the
-**user** `[egress_sets]` table, compiled at load into one closure with its
-nested sets and tools. Declaring one grants nothing; only a selecting `set:NAME`
-reference does. Every declared set is validated and compiled, used or not, under
+**user** `[egress_sets]` table, compiled at load into one closure with the sets
+it nests. Declaring one grants nothing; only a selecting `set:NAME` reference
+does. Every declared set is validated and compiled, used or not, under
 one bounded visit budget; a reference cycle is a config error. Notices and
 `doctor` attribute at entry level — the reference the user wrote, never the sets
 it nests (#511).
