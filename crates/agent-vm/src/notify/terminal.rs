@@ -403,7 +403,7 @@ fn dir_refusal(uid: u32, mode: u32, euid: u32) -> Option<&'static str> {
     if uid != euid {
         return Some("it is owned by another user");
     }
-    if mode & 0o7777 != u32::from(SCRIPT_MODE) {
+    if mode & 0o7777 != raw_mode(SCRIPT_MODE) {
         return Some("its mode is not 0700");
     }
     None
@@ -853,13 +853,22 @@ mod tests {
 
     // -- the anchored writer -----------------------------------------------
 
+    /// A project root that does not contain the scratch home.
+    ///
+    /// `std::env::temp_dir()` would not do: on Linux it is `/tmp`, every
+    /// `tempdir()` lives under it, and the inside-the-project refusal would fire
+    /// on a home that is legitimately outside the project.
+    fn outside_project() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
     #[test]
     fn a_new_script_is_created_0700_under_home_with_a_fresh_name() {
         let home = tempfile::tempdir().unwrap();
         let first =
-            write_click_script(home.path(), Path::new("/tmp"), &session(), "one\n").unwrap();
+            write_click_script(home.path(), outside_project().path(), &session(), "one\n").unwrap();
         let second =
-            write_click_script(home.path(), Path::new("/tmp"), &session(), "two\n").unwrap();
+            write_click_script(home.path(), outside_project().path(), &session(), "two\n").unwrap();
 
         assert_eq!(first.parent().unwrap(), click_dir(home.path()));
         let name = first.file_name().unwrap().to_string_lossy().into_owned();
@@ -930,8 +939,8 @@ mod tests {
         let elsewhere = tempfile::tempdir().unwrap();
         symlink(elsewhere.path(), home.path().join(".cache")).unwrap();
 
-        let error =
-            write_click_script(home.path(), Path::new("/tmp"), &session(), "x\n").unwrap_err();
+        let error = write_click_script(home.path(), outside_project().path(), &session(), "x\n")
+            .unwrap_err();
         assert!(format!("{error:#}").contains("symlink"), "{error:#}");
         assert!(
             std::fs::read_dir(elsewhere.path())
@@ -949,8 +958,8 @@ mod tests {
         std::fs::create_dir_all(home.path().join(".cache/agent-vm")).unwrap();
         symlink(elsewhere.path(), click_dir(home.path())).unwrap();
 
-        let error =
-            write_click_script(home.path(), Path::new("/tmp"), &session(), "x\n").unwrap_err();
+        let error = write_click_script(home.path(), outside_project().path(), &session(), "x\n")
+            .unwrap_err();
         assert!(format!("{error:#}").contains("symlink"), "{error:#}");
         assert!(
             std::fs::read_dir(elsewhere.path())
@@ -1020,8 +1029,8 @@ mod tests {
         )
         .unwrap();
 
-        let error =
-            write_click_script(home.path(), Path::new("/tmp"), &session(), "x\n").unwrap_err();
+        let error = write_click_script(home.path(), outside_project().path(), &session(), "x\n")
+            .unwrap_err();
         assert!(format!("{error:#}").contains("0700"), "{error:#}");
     }
 
@@ -1039,7 +1048,7 @@ mod tests {
         set_mtime_seconds_ago(&fresh, 60 * 60);
         set_mtime_seconds_ago(&untouched, 25 * 60 * 60);
 
-        write_click_script(home.path(), Path::new("/tmp"), &session(), "x\n").unwrap();
+        write_click_script(home.path(), outside_project().path(), &session(), "x\n").unwrap();
 
         assert!(!stale.exists(), "a script older than 24 h is pruned");
         assert!(fresh.exists(), "a script younger than 24 h is kept");
@@ -1060,7 +1069,7 @@ mod tests {
         let link = dir.join("click-3f9a12c4-0000000c.command");
         symlink(&outside, &link).unwrap();
 
-        write_click_script(home.path(), Path::new("/tmp"), &session(), "x\n").unwrap();
+        write_click_script(home.path(), outside_project().path(), &session(), "x\n").unwrap();
 
         assert!(link.exists(), "the symlink itself is left alone");
         assert!(outside.exists(), "and its target is never unlinked");
@@ -1085,6 +1094,7 @@ mod tests {
     fn run_click_writes_the_script_and_runs_the_terminal_with_the_planned_argv() {
         let mut env = crate::test_env::guard();
         let home = tempfile::tempdir().unwrap();
+        let project = outside_project();
         let record = home.path().join("argv.txt");
         let opener = home.path().join("opener.sh");
         std::fs::write(
@@ -1101,7 +1111,7 @@ mod tests {
 
         let status = run_click(ClickArgs {
             session: SID.to_owned(),
-            project: PathBuf::from("/tmp"),
+            project: project.path().to_path_buf(),
             state_dir: PathBuf::from("/tmp/state"),
             terminal: "alacritty".to_owned(),
         })
@@ -1122,6 +1132,7 @@ mod tests {
     fn run_click_reports_a_nonzero_status_instead_of_another_terminal() {
         let mut env = crate::test_env::guard();
         let home = tempfile::tempdir().unwrap();
+        let project = outside_project();
         let opener = home.path().join("opener.sh");
         std::fs::write(&opener, "#!/bin/sh\nexit 3\n").unwrap();
         std::fs::set_permissions(&opener, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1130,7 +1141,7 @@ mod tests {
 
         let status = run_click(ClickArgs {
             session: SID.to_owned(),
-            project: PathBuf::from("/tmp"),
+            project: project.path().to_path_buf(),
             state_dir: PathBuf::from("/tmp/state"),
             terminal: "terminal".to_owned(),
         })
@@ -1147,11 +1158,12 @@ mod tests {
     fn run_click_refuses_a_bad_session_and_a_bad_terminal() {
         let mut env = crate::test_env::guard();
         let home = tempfile::tempdir().unwrap();
+        let project = outside_project();
         env.set_var("HOME", home.path());
 
         let bad_session = run_click(ClickArgs {
             session: "not-a-session".to_owned(),
-            project: PathBuf::from("/tmp"),
+            project: project.path().to_path_buf(),
             state_dir: PathBuf::from("/tmp/state"),
             terminal: "terminal".to_owned(),
         })
@@ -1163,7 +1175,7 @@ mod tests {
 
         let bad_terminal = run_click(ClickArgs {
             session: SID.to_owned(),
-            project: PathBuf::from("/tmp"),
+            project: project.path().to_path_buf(),
             state_dir: PathBuf::from("/tmp/state"),
             terminal: "iterm".to_owned(),
         })
