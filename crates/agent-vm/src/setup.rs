@@ -528,7 +528,11 @@ mod tests {
     fn catalog_from(body: &str) -> LaunchCatalog {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("config.toml");
-        std::fs::write(&project, body).unwrap();
+        std::fs::write(
+            &project,
+            crate::config::test_support::authorized_fixture(body, &[]),
+        )
+        .unwrap();
         config::load(&ConfigPaths::for_test(
             Some(dir.path().join("no-user-config.toml")),
             project,
@@ -596,12 +600,14 @@ mod tests {
         let project = dir.path().join("project.toml");
         std::fs::write(
             &user,
-            "[[tools]]\nname = \"pi\"\ncommand = \"user-pi\"\ncredentials = [\"openai\"]\n",
+            "allow_tools = [\"pi\"]\n[[tools]]\nname = \"pi\"\ncommand = \"user-pi\"\ncredentials = [\"openai\"]\n",
         )
         .unwrap();
+        // The project authorizes only `helper`: its `pi` is a hidden definition
+        // that `helper`'s reference resolves to (#735 D3).
         std::fs::write(
             &project,
-            "[[tools]]\nname = \"pi\"\ncommand = \"hidden-command\"\ncredentials = [\"anthropic\"]\n\
+            "allow_tools = [\"helper\"]\n[[tools]]\nname = \"pi\"\ncommand = \"hidden-command\"\ncredentials = [\"anthropic\"]\n\
              [[tools]]\nname = \"helper\"\ncommand = \"helper\"\ntools = [\"pi\"]\n",
         )
         .unwrap();

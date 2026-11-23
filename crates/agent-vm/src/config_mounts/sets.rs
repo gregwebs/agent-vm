@@ -135,12 +135,12 @@ pub(crate) enum ExpansionStage {
 /// predicate above, and `admit` is the trusted adapter that applies it before the
 /// increment (so the counter can reach the limit and never overflow).
 ///
-/// `Copy` on purpose: a launch takes one *continuation* from the verified parser
-/// ([`UserMounts::continuing_work`]) and spends it while building the catalog.
-/// There is no way to mint a fresh counter in production — `configured` is the
-/// only constructor outside tests — so a second, independent budget cannot appear
-/// by accident.
-#[derive(Clone, Copy, Debug, Default)]
+/// Owned and moved, never copied: `config::load` creates the one counter, threads
+/// it through every tier read and `build_tier`, and then moves it into
+/// `ConfigReport::mount_work` for the single catalog build (#735, D6). Nothing
+/// can duplicate a continuation, so a second, independent budget cannot appear by
+/// accident.
+#[derive(Clone, Debug, Default)]
 pub(crate) struct MountExpansionWork {
     used: usize,
 }
@@ -151,11 +151,6 @@ impl MountExpansionWork {
     /// consume nothing).
     pub(crate) fn fresh() -> Self {
         Self::default()
-    }
-
-    /// The continuation of a verified parse's counter.
-    pub(super) fn configured(used: usize) -> Self {
-        Self { used }
     }
 
     /// How many candidates this budget has admitted, whether the last one was
@@ -333,6 +328,18 @@ struct SetSelection {
 }
 
 impl SetNamespace {
+    /// A namespace with no definitions.
+    ///
+    /// What a project config or sourced file's tool lists are parsed against
+    /// until #738 gives those tiers their own `[mount_sets]`: a `--mount NAME`
+    /// can never select a name here, and a name inside such a list is refused.
+    fn empty() -> Self {
+        Self {
+            index: BTreeMap::new(),
+            closures: Vec::new(),
+        }
+    }
+
     /// The declarations one named set expands to, or `None` when this file
     /// declares no such set.
     ///
@@ -375,11 +382,10 @@ pub(crate) struct UserMounts {
     sets: SetNamespace,
     /// Each full `[[tools]]` definition's own list, indexed by declaration.
     tool_lists: ToolMountLists,
-    /// Leaf visits admitted while parsing, and the raw graph entry count.
-    /// Retained rather than recomputed so a test can assert the *work* bound
-    /// instead of a wall-clock time: the resource rule is about admitted
-    /// comparisons, and only a counter can show its shape.
-    work: usize,
+    /// The raw graph entry count. Retained rather than recomputed so a test can
+    /// assert the *work* bound instead of a wall-clock time: the resource rule is
+    /// about admitted comparisons, and only a counter can show its shape. The
+    /// leaf-visit counter itself belongs to the caller (#735, D6).
     #[cfg_attr(not(test), allow(dead_code))]
     entries: usize,
     /// Reference admissions across every traversal, test-only for the same
@@ -437,24 +443,6 @@ impl UserMounts {
         std::mem::take(&mut self.tool_lists)
     }
 
-    /// The continuation of this parse's leaf-visit budget, for the *single*
-    /// subsequent catalog build.
-    ///
-    /// Not a public way to mint leaves or authority: it can only start where the
-    /// verified parse stopped, so the tool-closure fold cannot get a second budget.
-    /// A fresh [`MountExpansionWork::fresh`] is what the compiled defaults use,
-    /// because built-in tools cannot carry mounts and therefore consume nothing.
-    pub(crate) fn continuing_work(&self) -> MountExpansionWork {
-        MountExpansionWork::configured(self.work)
-    }
-
-    /// Leaf visits this file's load admitted. Test-only: the resource bound is
-    /// otherwise observable only as the refusal.
-    #[cfg(test)]
-    pub(crate) fn expansion_work(&self) -> usize {
-        self.work
-    }
-
     /// Raw graph entries walked (direct entries and references), test-only, so a
     /// reference-only chain can be shown linear rather than merely fast.
     #[cfg(test)]
@@ -490,9 +478,9 @@ impl UserMounts {
         file: PathBuf,
         values: MountValues<'_>,
         syntax: HostSyntax<'_>,
+        work: &mut MountExpansionWork,
     ) -> Result<Self, UserMountsError> {
-        let mut work = MountExpansionWork::fresh();
-        Self::build(file, values, syntax, &mut work)
+        Self::build(file, values, syntax, work)
     }
 
     /// [`Self::parse`], reporting the leaf visits it admitted even when it
@@ -639,40 +627,102 @@ impl UserMounts {
         // Every tool's own list last, in declaration order, and charged: unlike
         // the defaults merge this is a *new* list each time, so a file that
         // repeats a large set across many tools must not escape the bound.
-        let mut tool_lists = ToolMountLists::empty();
-        let mut tools: Vec<&super::ToolMountValue<'_>> = values.tools.iter().collect();
-        tools.sort_by_key(|tool| tool.declaration);
-        for tool in tools {
-            let bound = bind_entries(
-                Some(tool.value),
-                ListSite::Tool {
-                    declaration: tool.declaration,
-                },
-                &sets,
-                syntax,
-                &mut builder,
-            )?
-            .expect("a present tool list binds to a present list");
-            let list = merge_entries(
-                &bound,
-                &builder.leaves,
-                &sets,
-                Charge::ToolMounts(work),
-                &mut tracker,
-            )?;
-            tool_lists.set(tool.declaration, list);
-        }
+        let tool_lists = bind_tool_lists(
+            values.tools,
+            &sets,
+            syntax,
+            &mut builder,
+            &mut tracker,
+            work,
+        )?;
 
         Ok(Self {
             file: builder.file,
             defaults,
             sets,
             tool_lists,
-            work: work.used,
             entries: builder.entries,
             references: tracker.admissions,
         })
     }
+}
+
+/// The one tool-list loop, shared by the verified user parser and the inert
+/// project/sourced parser (#735, D6).
+///
+/// Declaration order, `Charge::ToolMounts(work)` and the file's shared child
+/// tracker: extracting it is what stops charging and conflict rules from
+/// diverging between the two entry points, because there is only one.
+fn bind_tool_lists(
+    tools: &[super::ToolMountValue<'_>],
+    sets: &SetNamespace,
+    syntax: HostSyntax<'_>,
+    builder: &mut Builder,
+    tracker: &mut ChildTracker,
+    work: &mut MountExpansionWork,
+) -> Result<ToolMountLists, UserMountsError> {
+    let mut tool_lists = ToolMountLists::empty();
+    let mut ordered: Vec<&super::ToolMountValue<'_>> = tools.iter().collect();
+    ordered.sort_by_key(|tool| tool.declaration);
+    for tool in ordered {
+        let bound = bind_entries(
+            Some(tool.value),
+            ListSite::Tool {
+                declaration: tool.declaration,
+            },
+            sets,
+            syntax,
+            builder,
+        )?
+        .expect("a present tool list binds to a present list");
+        let list = merge_entries(
+            &bound,
+            &builder.leaves,
+            sets,
+            Charge::ToolMounts(work),
+            tracker,
+        )?;
+        tool_lists.set(tool.declaration, list);
+    }
+    Ok(tool_lists)
+}
+
+/// Parse `[[tools]]` `mounts = [...]` from a project config or a sourced file.
+///
+/// These lists are **inert** until `allow_tools` authorizes the tool (#735): the
+/// declaration is validated here — syntax, `~/` expansion against the captured
+/// home, and this file's own per-tool conflicts — with zero host-path I/O, so a
+/// later authorization cannot activate a declaration that was never checked.
+///
+/// The set namespace is empty: sourced and project `[mount_sets]` are #738's.
+/// `HostSyntax::AbsoluteOrHome` is likewise #735's whole grammar; `./`
+/// project-relative paths are #738's. The leaves are charged to the *load's* one
+/// counter, so an inert declaration cannot buy a second budget.
+///
+/// `pub(crate)` with no token argument on purpose: a tool list grants nothing
+/// until an authorization selects it, and what the authorization needs is not a
+/// mount read but a place in `allow_tools`.
+pub(crate) fn parse_declared_tool_mounts(
+    file: &Path,
+    tools: &[super::ToolMountValue<'_>],
+    home: Option<&Path>,
+    work: &mut MountExpansionWork,
+) -> Result<ToolMountLists, UserMountsError> {
+    let mut builder = Builder {
+        file: file.to_path_buf(),
+        leaves: Vec::new(),
+        entries: 0,
+    };
+    let sets = SetNamespace::empty();
+    let mut tracker = ChildTracker::new(0);
+    bind_tool_lists(
+        tools,
+        &sets,
+        super::host_syntax(home),
+        &mut builder,
+        &mut tracker,
+        work,
+    )
 }
 
 /// The arena under construction: every declaration this file contains and the
@@ -738,7 +788,7 @@ fn bind_entries(
                         file: builder.file.clone(),
                         index: entry_index,
                     },
-                    ListSite::Tool { declaration } => MountOrigin::UserTool {
+                    ListSite::Tool { declaration } => MountOrigin::Tool {
                         file: builder.file.clone(),
                         declaration,
                         index: entry_index,
@@ -1001,7 +1051,7 @@ mod tests {
     use super::*;
     use crate::config_authority::{AuthorityTriggers, verify};
     use crate::config_mounts::{
-        from_verified_value, from_verified_value_with_work, mount_set_name_bytes,
+        from_verified_value_fresh, from_verified_value_with_work, mount_set_name_bytes,
     };
     use crate::host_paths::read_bounded_regular_file_noting_symlink;
     use crate::mount::{MountPolicy, MountSpecErrorKind, Spelling};
@@ -1057,6 +1107,7 @@ mod tests {
                 ),
                 mount_sets: values.sets.is_some(),
                 egress_sets: table.get("egress_sets").is_some(),
+                allow_tools: false,
             },
         )
         .unwrap()
@@ -1069,7 +1120,24 @@ mod tests {
     /// token. The graph tests deliberately cannot reach a second one.
     fn parse_document(body: &str) -> Result<UserMounts, UserMountsError> {
         with_authorized(body, |authorized, values| {
-            from_verified_value(authorized, values, Some(Path::new(HOME)))
+            from_verified_value_fresh(authorized, values, Some(Path::new(HOME)))
+        })
+    }
+
+    /// The same facade, handing back the load's one counter so a test can fund a
+    /// fold from it exactly as `config::load` does (#735, D6).
+    fn parse_document_keeping_work(
+        body: &str,
+    ) -> (Result<UserMounts, UserMountsError>, MountExpansionWork) {
+        with_authorized(body, |authorized, values| {
+            let mut work = MountExpansionWork::fresh();
+            let parsed = UserMounts::parse(
+                authorized.file().to_path_buf(),
+                values,
+                crate::config_mounts::host_syntax(Some(Path::new(HOME))),
+                &mut work,
+            );
+            (parsed, work)
         })
     }
 
@@ -1623,7 +1691,7 @@ mod tests {
         );
         assert_eq!(
             with_authorized("[mount_sets]\na = [\"~/ref\"]\n", |authorized, values| {
-                rendered(from_verified_value(authorized, values, None))
+                rendered(from_verified_value_fresh(authorized, values, None))
             }),
             at("mount_sets[0][0]", "~/ref") + "a ~/ host or guest path needs a UTF-8 $HOME"
         );
@@ -1631,7 +1699,7 @@ mod tests {
         // naming the set's coordinates (#530/R8).
         assert_eq!(
             with_authorized("[mount_sets]\na = [\"~/a:~/x\"]\n", |authorized, values| {
-                rendered(from_verified_value(
+                rendered(from_verified_value_fresh(
                     authorized,
                     values,
                     Some(Path::new("/h,o")),
@@ -1705,8 +1773,10 @@ mod tests {
             body
         }
 
-        let ok = parse_document(&format!("[mount_sets]\n{}", chain_document(361))).unwrap();
-        assert_eq!(ok.expansion_work(), 65_341);
+        let (ok, used) =
+            parse_document_with_work(&format!("[mount_sets]\n{}", chain_document(361)));
+        assert_eq!(used, 65_341);
+        let ok = ok.unwrap();
         assert_eq!(ok.graph_entries(), 361 * 2 - 1);
 
         let limit = "mount_sets: expansion work exceeds limit of 65536 leaf visits";
@@ -1745,15 +1815,17 @@ mod tests {
             body
         }
 
-        let empty =
-            parse_document(&format!("[mount_sets]\n{}", chain_document(4_000, false))).unwrap();
-        assert_eq!(empty.expansion_work(), 0);
+        let (empty, empty_work) =
+            parse_document_with_work(&format!("[mount_sets]\n{}", chain_document(4_000, false)));
+        assert_eq!(empty_work, 0);
+        let empty = empty.unwrap();
         assert_eq!(empty.graph_entries(), 4_000 - 1);
         assert!(empty.requests_for_set(&set("s0000")).unwrap().is_empty());
 
-        let one_leaf =
-            parse_document(&format!("[mount_sets]\n{}", chain_document(4_000, true))).unwrap();
-        assert_eq!(one_leaf.expansion_work(), 4_000);
+        let (one_leaf, leaf_work) =
+            parse_document_with_work(&format!("[mount_sets]\n{}", chain_document(4_000, true)));
+        assert_eq!(leaf_work, 4_000);
+        let one_leaf = one_leaf.unwrap();
         assert_eq!(one_leaf.graph_entries(), 4_000);
         assert_eq!(one_leaf.requests_for_set(&set("s0000")).unwrap().len(), 1);
     }
@@ -1860,14 +1932,14 @@ mod tests {
         for index in 0..CHILDREN {
             body.push_str(&format!("c{index:05} = []\n"));
         }
-        let mounts =
-            parse_document(&format!("[mount_sets]\n{body}")).expect("the fan-out is valid");
+        let (mounts, work) = parse_document_keeping_work(&format!("[mount_sets]\n{body}"));
+        let mounts = mounts.expect("the fan-out is valid");
         assert_eq!(
             mounts.reference_admissions(),
             CHILDREN,
             "one admission per reference, not a scan of already-seen ids"
         );
-        assert_eq!(mounts.expansion_work(), 0, "empty children spend no leaf");
+        assert_eq!(work.used(), 0, "empty children spend no leaf");
         assert!(
             mounts.requests_for_set(&set("parent")).unwrap().is_empty(),
             "the parent selects nothing"
@@ -2024,7 +2096,7 @@ mod tests {
             .map(|request| match &request.origin {
                 MountOrigin::UserConfig { index, .. }
                 | MountOrigin::UserSet { index, .. }
-                | MountOrigin::UserTool { index, .. } => *index,
+                | MountOrigin::Tool { index, .. } => *index,
                 // Neither route in this test tags anything `Cli` or automatic;
                 // naming them keeps the match exhaustive rather than adding a
                 // catch-all.
@@ -2124,13 +2196,15 @@ mod tests {
             rendered(parse_document(&format!("[mount_sets]\n{body}"))),
             "mount_sets: expansion work exceeds limit of 65536 leaf visits"
         );
-        let mounts =
-            sets("shared = [\"/h/x:/x:ro\", \"/h/y:/y:ro\"]\na = [\"shared\"]\nb = [\"shared\"]\n")
-                .unwrap();
+        let (mounts, work) = parse_document_keeping_work(
+            "[mount_sets]\nshared = [\"/h/x:/x:ro\", \"/h/y:/y:ro\"]\n\
+             a = [\"shared\"]\nb = [\"shared\"]\n",
+        );
+        let mounts = mounts.unwrap();
         assert_eq!(expansion(&mounts, "a").len(), 2);
         assert_eq!(expansion(&mounts, "b").len(), 2);
         // shared (2) + a (2) + b (2): shared's closure is iterated, not re-expanded.
-        assert_eq!(mounts.expansion_work(), 6);
+        assert_eq!(work.used(), 6);
     }
 
     /// Tool lists reuse the same selector, the same `~/` spelling rule and the
@@ -2224,27 +2298,28 @@ mod tests {
 
     /// The shared budget continues across set compilation, tool lists **and** the
     /// launch-time fold, and never resets per list, per tool or per launch.
+    ///
+    /// #735 (D6): the counter is the caller's, so the parse reports how far it got
+    /// and the *same* value funds the fold — one counter per load, in the test as
+    /// in production.
     #[test]
     fn mount_budget_is_shared_by_sets_tool_lists_and_launch_folds() {
         // Sets first: one set with two leaves costs 2.
         let document = "[mount_sets]\ns = [\"/h/a:/a:ro\", \"/h/b:/b:ro\"]\n\
                         [[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = [\"s\", \"/h/c:/c:ro\"]\n";
-        let mounts = parse_document(document).unwrap();
+        let (mounts, used) = parse_document_with_work(document);
+        let mut mounts = mounts.unwrap();
         // 2 for the set closure + 3 for the tool list (2 set leaves + 1 direct).
-        assert_eq!(mounts.expansion_work(), 5);
-        let mut mounts = mounts;
+        assert_eq!(used, 5);
         let lists = mounts.take_tool_lists();
-        let work = mounts.continuing_work();
+        let mut work = MountExpansionWork { used };
         // The fold re-admits the tool list's three leaves: 5 + 3 = 8.
-        let mut work = work;
         let folded = merge_tool_mounts([&lists.get(0)], &mut work).unwrap();
         assert_eq!(work.used(), 8);
         assert_eq!(folded.len(), 3);
 
         // Two launches of one entry each re-fold: the counter is continued, not
         // cloned per launch.
-        let mut work = mounts.continuing_work();
-        merge_tool_mounts([&lists.get(0)], &mut work).unwrap();
         merge_tool_mounts([&lists.get(0)], &mut work).unwrap();
         assert_eq!(work.used(), 5 + 3 + 3);
     }
@@ -2309,14 +2384,15 @@ mod tests {
             "[[tools]]\nname = \"a\"\ncommand = \"a\"\nmounts = [\"parent\"]\n\
              [[tools]]\nname = \"b\"\ncommand = \"b\"\nmounts = [\"parent\"]\n",
         );
-        let mounts = parse_document(&body).expect("the fan-out is valid");
+        let (mounts, work) = parse_document_keeping_work(&body);
+        let mounts = mounts.expect("the fan-out is valid");
         // parent's own compile (CHILDREN) + one admission per tool list = +2.
         assert_eq!(
             mounts.reference_admissions(),
             CHILDREN + 2,
             "every traversal must reach the one indexed tracker"
         );
-        assert_eq!(mounts.expansion_work(), 0, "empty children spend no leaf");
+        assert_eq!(work.used(), 0, "empty children spend no leaf");
         let mut mounts = mounts;
         let lists = mounts.take_tool_lists();
         assert!(lists.get(0).is_empty());
@@ -2345,9 +2421,9 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(", ");
             let body = format!("[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = [{entries}]\n");
-            let mut mounts = parse_document(&body).expect("the tool list parses alone");
+            let (mounts, mut work) = parse_document_keeping_work(&body);
+            let mut mounts = mounts.expect("the tool list parses alone");
             let tool = mounts.take_tool_lists().get(0);
-            let mut work = mounts.continuing_work();
             let kept: Vec<MountRequest> = merge_tool_mounts([&tool], &mut work)
                 .expect("a valid list folds")
                 .requests()
@@ -2371,9 +2447,9 @@ mod tests {
                 "[[tools]]\nname = \"a\"\ncommand = \"a\"\nmounts = [\"{first}\"]\n\
                  [[tools]]\nname = \"b\"\ncommand = \"b\"\nmounts = [\"{second}\"]\n"
             );
-            let mut mounts = parse_document(&body).expect("each list parses alone");
+            let (mounts, mut work) = parse_document_keeping_work(&body);
+            let mut mounts = mounts.expect("each list parses alone");
             let lists = mounts.take_tool_lists();
-            let mut work = mounts.continuing_work();
             let folded = merge_tool_mounts([&lists.get(0), &lists.get(1)], &mut work);
             let claimed = ordinary_claim(&[first, second]);
             match (folded, claimed) {

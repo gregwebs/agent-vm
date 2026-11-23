@@ -313,7 +313,7 @@ pub(crate) enum MountOrigin {
     /// declaration selected by a tool list, a default and `--mount` keeps one
     /// fork. The declaring position is bounded by the config file, so it is a
     /// `usize` rather than another shared string.
-    UserTool {
+    Tool {
         file: PathBuf,
         declaration: usize,
         index: usize,
@@ -324,6 +324,24 @@ pub(crate) enum MountOrigin {
 /// [`prepare`]'s refusals go through [`Declaration`] instead, because they must
 /// also pick between the byte-pinned argv spelling and the escaped config one;
 /// this impl is the `--mount` / `mounts[N] in "<file>"` half alone.
+impl MountOrigin {
+    /// The config file this origin's declaration was written in, or `None` for an
+    /// origin no file supplied.
+    ///
+    /// A launch's mount-selection context names the file(s) its automatic
+    /// requests came from; a tool's own list may come from a file distinct from
+    /// the user defaults file (a project or sourced `[[tools]]` entry), so the
+    /// context is a list rather than one path.
+    pub(crate) fn config_file(&self) -> Option<&Path> {
+        match self {
+            Self::Cli | Self::GitMetadata { .. } => None,
+            Self::UserConfig { file, .. }
+            | Self::UserSet { file, .. }
+            | Self::Tool { file, .. } => Some(file),
+        }
+    }
+}
+
 impl fmt::Display for MountOrigin {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -353,7 +371,7 @@ impl fmt::Display for MountOrigin {
                 quoted_str(set.as_ref()),
                 crate::one_line::quoted_path(file)
             ),
-            Self::UserTool {
+            Self::Tool {
                 file,
                 declaration,
                 index,
@@ -479,7 +497,7 @@ pub(crate) enum Declaration<'a> {
         index: usize,
     },
     /// Entry `index` of declaration `declaration`'s own `mounts` list in `file`.
-    UserTool {
+    Tool {
         file: &'a Path,
         declaration: usize,
         index: usize,
@@ -515,7 +533,7 @@ impl Declaration<'_> {
                 quoted_str(set),
                 crate::one_line::quoted_path(file)
             ),
-            Self::UserTool {
+            Self::Tool {
                 file,
                 declaration,
                 index,
@@ -619,11 +637,11 @@ fn declaration_origin<'a>(mount: &ExtraMount, origins: &'a DeclaredOrigins) -> D
             set: set.as_ref(),
             index: *index,
         },
-        Some(MountOrigin::UserTool {
+        Some(MountOrigin::Tool {
             file,
             declaration,
             index,
-        }) => Declaration::UserTool {
+        }) => Declaration::Tool {
             file,
             declaration: *declaration,
             index: *index,
@@ -3624,7 +3642,7 @@ mod tests {
             set: std::sync::Arc::from("agent"),
             index: 0,
         };
-        let tool = MountOrigin::UserTool {
+        let tool = MountOrigin::Tool {
             file: PathBuf::from("/home/u/.config/agent-vm/config.toml"),
             declaration: 1,
             index: 2,
@@ -4118,7 +4136,7 @@ impl fmt::Display for ClaimError {
                     ),
                     // Own or inherited, the tool's list is automatic, so the same
                     // opt-out that removes a defaults collision removes this one.
-                    MountOrigin::UserTool { .. } => write!(
+                    MountOrigin::Tool { .. } => write!(
                         f,
                         "{origin}: guest path {guest} collides with an agent-vm core mount; \
                          pass --no-config-mounts to launch without it"
@@ -4617,7 +4635,7 @@ fn discovered_by(declarations: &[(Declaration<'_>, String)]) -> String {
                     Declaration::UserSet { file, .. } => {
                         format!("mount_sets in {}", crate::one_line::quoted_path(file))
                     }
-                    Declaration::UserTool { file, .. } => {
+                    Declaration::Tool { file, .. } => {
                         format!("tool mounts in {}", crate::one_line::quoted_path(file))
                     }
                     Declaration::GitMetadata { .. } => "automatic Git metadata mounts".to_string(),
@@ -6504,7 +6522,7 @@ mod prepare_tests {
     #[test]
     fn user_tool_origin_uses_config_escaping_everywhere() {
         let file = Path::new("/home/u/.config/agent-vm/config.toml");
-        let tool = Declaration::UserTool {
+        let tool = Declaration::Tool {
             file,
             declaration: 3,
             index: 1,
@@ -6543,7 +6561,7 @@ mod prepare_tests {
         );
         // The origin's own `Display` is the same sentence.
         assert_eq!(
-            MountOrigin::UserTool {
+            MountOrigin::Tool {
                 file: file.to_path_buf(),
                 declaration: 3,
                 index: 1,
@@ -6554,7 +6572,7 @@ mod prepare_tests {
         // A core collision names the entry and offers the opt-out that actually
         // works: a tool list is automatic, so `--no-config-mounts` removes it.
         let core = ClaimError::Core {
-            origin: MountOrigin::UserTool {
+            origin: MountOrigin::Tool {
                 file: file.to_path_buf(),
                 declaration: 3,
                 index: 1,
@@ -6572,7 +6590,7 @@ mod prepare_tests {
         let root = tempfile::tempdir().unwrap();
         let host = root.path().join("host");
         fs::create_dir_all(&host).unwrap();
-        let origin = |declaration: usize, index: usize| MountOrigin::UserTool {
+        let origin = |declaration: usize, index: usize| MountOrigin::Tool {
             file: file.to_path_buf(),
             declaration,
             index,
@@ -6624,7 +6642,7 @@ mod prepare_tests {
                 set: std::sync::Arc::from("agent"),
                 index: 0,
             },
-            MountOrigin::UserTool {
+            MountOrigin::Tool {
                 file: file.clone(),
                 declaration: 2,
                 index: 0,

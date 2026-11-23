@@ -274,6 +274,14 @@ here. Use a dedicated serial native host, no concurrent agent-vm/msb VMs, compat
 managed runtime policy and no matching GHCR/loopback credentials in the OS keyring.
 Never edit operator policy/keychain to make a test pass.
 
+Every launcher the run is pointed at must report `--version` at or above 0.8.2:
+`candidate_reads_host_managed_config` refuses anything older before the first
+row. 0.8.1 brought the host-managed project tier, flat `sources` and the
+project-first image precedence; 0.8.2 brought explicit tool authorization
+(ADR-0075). An older candidate reads a fixture from the wrong path, or launches a
+`[[tools]]` block this branch treats as inert, and passes the rows for the wrong
+reason.
+
 For released-image, first authenticate/download both v0.1.3 archives using the
 [source-pinned image-owner release interfaces](https://github.com/gregwebs/agent-vm-images/blob/main/docs/standard-image-releases.md).
 This host-side preparation is not an installed-launcher source dependency.
@@ -509,7 +517,7 @@ assertion rather than a compile error, an unmatched test filter, or a timeout.
 
 A row mutates one source file and runs one control. There are four kinds: a
 `cargo test` unit or integration target of the mutated `agent-vm` crate, the
-Verus gate for the 45 `-proof` rows, a prebuilt `harness` control that reads the
+Verus gate for the 46 `-proof` rows, a prebuilt `harness` control that reads the
 mutated file from the copy at run time (`egress-probe`, `egress-supervisor`),
 and — for the egress code that now lives in `crates/harness` — the copy's own
 rebuilt `harness` binary running one named `--self-test --only` control. That

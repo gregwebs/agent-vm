@@ -1114,11 +1114,21 @@ fn ledger() -> Vec<Row> {
             name: r#"preparse-project"#,
             path: r#"crates/agent-vm/src/run.rs"#,
             old: r#"
-    let mut network_plan = crate::network::Plan::from_args(args.network, user_network, user_tools)?;"#,
+    let mut network_plan = crate::network::Plan::from_args(
+        args.network,
+        user_network,
+        user_tools,
+        grant.authorized_tool_egress(),
+    )?;"#,
             new: r#"
     let early = ProjectSession::for_project(&project)?;
     std::fs::create_dir_all(&early.state_dir)?;
-    let mut network_plan = crate::network::Plan::from_args(args.network, user_network, user_tools)?;"#,
+    let mut network_plan = crate::network::Plan::from_args(
+        args.network,
+        user_network,
+        user_tools,
+        grant.authorized_tool_egress(),
+    )?;"#,
             run: Run::AgentTest(
                 r#"config_launch_driven"#,
                 r#"rejected_allowance_is_refused_before_launch_state_is_created"#,
@@ -1130,11 +1140,21 @@ fn ledger() -> Vec<Row> {
             name: r#"preparse-mounts"#,
             path: r#"crates/agent-vm/src/run.rs"#,
             old: r#"
-    let mut network_plan = crate::network::Plan::from_args(args.network, user_network, user_tools)?;"#,
+    let mut network_plan = crate::network::Plan::from_args(
+        args.network,
+        user_network,
+        user_tools,
+        grant.authorized_tool_egress(),
+    )?;"#,
             new: r#"
     let early = ProjectSession::for_project(&project)?;
     std::fs::create_dir_all(early.state_dir.with_extension("mounts"))?;
-    let mut network_plan = crate::network::Plan::from_args(args.network, user_network, user_tools)?;"#,
+    let mut network_plan = crate::network::Plan::from_args(
+        args.network,
+        user_network,
+        user_tools,
+        grant.authorized_tool_egress(),
+    )?;"#,
             run: Run::AgentTest(
                 r#"config_launch_driven"#,
                 r#"rejected_allowance_is_refused_before_launch_state_is_created"#,
@@ -1146,11 +1166,21 @@ fn ledger() -> Vec<Row> {
             name: r#"preparse-secrets"#,
             path: r#"crates/agent-vm/src/run.rs"#,
             old: r#"
-    let mut network_plan = crate::network::Plan::from_args(args.network, user_network, user_tools)?;"#,
+    let mut network_plan = crate::network::Plan::from_args(
+        args.network,
+        user_network,
+        user_tools,
+        grant.authorized_tool_egress(),
+    )?;"#,
             new: r#"
     let early = ProjectSession::for_project(&project)?;
     std::fs::create_dir_all(early.state_dir.with_extension("secrets"))?;
-    let mut network_plan = crate::network::Plan::from_args(args.network, user_network, user_tools)?;"#,
+    let mut network_plan = crate::network::Plan::from_args(
+        args.network,
+        user_network,
+        user_tools,
+        grant.authorized_tool_egress(),
+    )?;"#,
             run: Run::AgentTest(
                 r#"config_launch_driven"#,
                 r#"rejected_allowance_is_refused_before_launch_state_is_created"#,
@@ -1910,23 +1940,23 @@ fn ledger() -> Vec<Row> {
         // Presence, not contents, is what makes a user file authority-bearing
         // (ADR-0040/0046). The anchor is the kernel body, never its `ensures`
         // clause, so replacing it cannot weaken the contract it is checked against.
-        // #397 widened the disjunction from two fields to three and #511 to four, so
-        // the anchor and its test both moved again: the body now names `egress_sets`,
-        // and the oracle is the sixteen-row table.
+        // #397 widened the disjunction from two fields to three, #511 to four and
+        // #735 to five, so the anchor and its test both moved again: the body now
+        // names `allow_tools`, and the oracle is the thirty-two-row table.
         Row {
             name: r#"config-mounts-authority-or"#,
             path: r#"crates/agent-vm/src/config_authority.rs"#,
-            old: r#"if t.network { true } else { t.mounts || t.mount_sets || t.egress_sets }"#,
-            new: r#"if t.network { t.mounts || t.mount_sets || t.egress_sets } else { false }"#,
-            run: Run::AgentBin(r#"authority_required_matches_the_sixteen_rows"#),
+            old: r#"if t.network { true } else { t.mounts || t.mount_sets || t.egress_sets || t.allow_tools }"#,
+            new: r#"if t.network { t.mounts || t.mount_sets || t.egress_sets || t.allow_tools } else { false }"#,
+            run: Run::AgentBin(r#"authority_required_matches_the_thirty_two_rows"#),
             markers: &[r#"test result: FAILED"#],
             anchors: 1,
         },
         Row {
             name: r#"config-mounts-authority-or-proof"#,
             path: r#"crates/agent-vm/src/config_authority.rs"#,
-            old: r#"if t.network { true } else { t.mounts || t.mount_sets || t.egress_sets }"#,
-            new: r#"if t.network { t.mounts || t.mount_sets || t.egress_sets } else { false }"#,
+            old: r#"if t.network { true } else { t.mounts || t.mount_sets || t.egress_sets || t.allow_tools }"#,
+            new: r#"if t.network { t.mounts || t.mount_sets || t.egress_sets || t.allow_tools } else { false }"#,
             run: Run::Proof,
             markers: &[r#"verification results::"#],
             anchors: 1,
@@ -2150,13 +2180,20 @@ fn ledger() -> Vec<Row> {
         Row {
             name: r#"reference-trust-unchecked"#,
             path: r#"crates/agent-vm/src/config_authority.rs"#,
+            // The whole body, so the mutant still compiles: replacing only the head
+            // leaves `map_err`'s closure parameter untyped (E0282), which is a
+            // compile failure rather than the surviving-verdict behaviour this row
+            // names.
             old: r#"    pub(crate) fn require(&self) -> Result<(), UntrustedConfig> {
-        self.verdict"#,
+        self.measurement
+            .map_err(|measurement| measurement.into_untrusted(AuthoritySubject::EgressReference))
+    }"#,
             new: r#"    pub(crate) fn require(&self) -> Result<(), UntrustedConfig> {
-        Ok(())"#,
+        Ok(())
+    }"#,
             run: Run::AgentTest(
                 r#"config_launch_driven"#,
-                r#"cli_tool_reference_requires_a_verified_user_file"#,
+                r#"cli_set_reference_requires_a_verified_user_file"#,
             ),
             markers: &[r#"test result: FAILED"#],
             anchors: 1,
@@ -2196,12 +2233,10 @@ fn ledger() -> Vec<Row> {
             tool_field: first_tool_mounts.is_some(),
         }),
         mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),
-    };"#,
+        egress_sets: raw.egress_sets.is_some(),"#,
             new: r#"        mounts: false,
         mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),
-    };"#,
+        egress_sets: raw.egress_sets.is_some(),"#,
             run: Run::AgentBin(r#"present_empty_mounts_through_a_symlink_is_refused"#),
             markers: &[r#"test result: FAILED"#],
             anchors: 1,
@@ -2214,12 +2249,10 @@ fn ledger() -> Vec<Row> {
             tool_field: first_tool_mounts.is_some(),
         }),
         mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),
-    };"#,
+        egress_sets: raw.egress_sets.is_some(),"#,
             new: r#"        mounts: false,
         mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),
-    };"#,
+        egress_sets: raw.egress_sets.is_some(),"#,
             run: Run::AgentTest(
                 r#"config_mounts"#,
                 r#"unsafe_user_mounts_are_refused_before_launch_state"#,
@@ -2235,15 +2268,13 @@ fn ledger() -> Vec<Row> {
             tool_field: first_tool_mounts.is_some(),
         }),
         mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),
-    };"#,
+        egress_sets: raw.egress_sets.is_some(),"#,
             new: r#"        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {
             top_level: raw.mounts.as_ref().and_then(toml::Value::as_array).is_some_and(|a| !a.is_empty()),
             tool_field: first_tool_mounts.is_some(),
         }),
         mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),
-    };"#,
+        egress_sets: raw.egress_sets.is_some(),"#,
             run: Run::AgentBin(r#"present_empty_mounts_through_a_symlink_is_refused"#),
             markers: &[r#"test result: FAILED"#],
             anchors: 1,
@@ -2256,15 +2287,13 @@ fn ledger() -> Vec<Row> {
             tool_field: first_tool_mounts.is_some(),
         }),
         mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),
-    };"#,
+        egress_sets: raw.egress_sets.is_some(),"#,
             new: r#"        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {
             top_level: raw.mounts.as_ref().and_then(toml::Value::as_array).is_some_and(|a| !a.is_empty()),
             tool_field: first_tool_mounts.is_some(),
         }),
         mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),
-    };"#,
+        egress_sets: raw.egress_sets.is_some(),"#,
             run: Run::AgentTest(
                 r#"config_mounts"#,
                 r#"empty_mounts_still_requires_a_verified_file"#,
@@ -2321,15 +2350,13 @@ fn ledger() -> Vec<Row> {
             tool_field: first_tool_mounts.is_some(),
         }),
         mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),
-    };"#,
+        egress_sets: raw.egress_sets.is_some(),"#,
             new: r#"        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {
             top_level: raw.mounts.is_some(),
             tool_field: first_tool_mounts.is_some(),
         }),
         mount_sets: false,
-        egress_sets: raw.egress_sets.is_some(),
-    };"#,
+        egress_sets: raw.egress_sets.is_some(),"#,
             run: Run::AgentBin(r#"mount_sets_presence_requires_a_verified_file"#),
             markers: &[r#"test result: FAILED"#],
             anchors: 1,
@@ -2342,15 +2369,13 @@ fn ledger() -> Vec<Row> {
             tool_field: first_tool_mounts.is_some(),
         }),
         mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),
-    };"#,
+        egress_sets: raw.egress_sets.is_some(),"#,
             new: r#"        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {
             top_level: raw.mounts.is_some(),
             tool_field: first_tool_mounts.is_some(),
         }),
         mount_sets: false,
-        egress_sets: raw.egress_sets.is_some(),
-    };"#,
+        egress_sets: raw.egress_sets.is_some(),"#,
             run: Run::AgentTest(
                 r#"config_mounts"#,
                 r#"named_mount_sets_unsafe_file_is_refused_before_launch_state"#,
@@ -2577,15 +2602,13 @@ fn ledger() -> Vec<Row> {
             tool_field: first_tool_mounts.is_some(),
         }),
         mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),
-    };"#,
+        egress_sets: raw.egress_sets.is_some(),"#,
             new: r#"        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {
             top_level: raw.mounts.is_some(),
             tool_field: false,
         }),
         mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),
-    };"#,
+        egress_sets: raw.egress_sets.is_some(),"#,
             run: Run::AgentBin(r#"tool_mounts_presence_requires_verified_read_even_empty"#),
             markers: &[r#"test result: FAILED"#],
             anchors: 1,
@@ -2598,15 +2621,13 @@ fn ledger() -> Vec<Row> {
             tool_field: first_tool_mounts.is_some(),
         }),
         mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),
-    };"#,
+        egress_sets: raw.egress_sets.is_some(),"#,
             new: r#"        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {
             top_level: raw.mounts.is_some(),
             tool_field: false,
         }),
         mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),
-    };"#,
+        egress_sets: raw.egress_sets.is_some(),"#,
             run: Run::AgentTest(
                 r#"config_mounts"#,
                 r#"empty_present_tool_mounts_require_authority_before_any_launch"#,
@@ -2622,46 +2643,36 @@ fn ledger() -> Vec<Row> {
             tool_field: first_tool_mounts.is_some(),
         }),
         mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),
-    };"#,
+        egress_sets: raw.egress_sets.is_some(),"#,
             new: r#"        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {
             top_level: raw.mounts.is_some(),
             tool_field: first_tool_mounts.is_some_and(|d| raw.tools[d].mounts.as_ref().and_then(toml::Value::as_array).is_some_and(|a| !a.is_empty())),
         }),
         mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),
-    };"#,
+        egress_sets: raw.egress_sets.is_some(),"#,
             run: Run::AgentBin(r#"tool_mounts_presence_requires_verified_read_even_empty"#),
             markers: &[r#"test result: FAILED"#],
             anchors: 1,
         },
-        // Mount authority is user-only: skipping the tool-field refusal would let a
-        // project checkout ask for host paths through its own tool definitions.
+        // Mount authority is no longer project-refused (#735 made a project or
+        // sourced tool's `mounts` an inert declaration): the compiled-in defaults
+        // are the one tier that may not carry one, because a shipped definition is
+        // not something a launch can authorize. Accepting it there is the mutation.
         Row {
-            name: r#"tool-mounts-project-accepted"#,
+            name: r#"tool-mounts-builtin-accepted"#,
             path: r#"crates/agent-vm/src/config.rs"#,
-            old: r#"    if let Some(declaration) = raw.tools.iter().position(|tool| tool.mounts.is_some()) {
+            old: r#"    if matches!(tier, RefusingTier::BuiltIn)
+        && let Some(declaration) = raw.tools.iter().position(|tool| tool.mounts.is_some())
+    {
         return Err(tool_mounts_refusal(path, tier, declaration));
     }"#,
-            new: r#"    if false {
-        return Err(tool_mounts_refusal(path, tier, 0));
+            new: r#"    if let Some(declaration) = raw.tools.iter().position(|tool| tool.mounts.is_some())
+        && matches!(tier, RefusingTier::BuiltIn)
+    {
+        let _ = declaration;
     }"#,
-            run: Run::AgentBin(r#"project_and_builtin_tool_mounts_are_refused_by_presence"#),
-            markers: &[r#"test result: FAILED"#],
-            anchors: 1,
-        },
-        Row {
-            name: r#"tool-mounts-project-accepted-launch"#,
-            path: r#"crates/agent-vm/src/config.rs"#,
-            old: r#"    if let Some(declaration) = raw.tools.iter().position(|tool| tool.mounts.is_some()) {
-        return Err(tool_mounts_refusal(path, tier, declaration));
-    }"#,
-            new: r#"    if false {
-        return Err(tool_mounts_refusal(path, tier, 0));
-    }"#,
-            run: Run::AgentTest(
-                r#"config_mounts"#,
-                r#"project_tool_mount_presence_is_a_load_error_even_when_hidden"#,
+            run: Run::AgentBin(
+                r#"project_tool_mounts_are_inert_until_authorized_and_builtin_ones_are_refused"#,
             ),
             markers: &[r#"test result: FAILED"#],
             anchors: 1,
@@ -2693,8 +2704,14 @@ fn ledger() -> Vec<Row> {
         Row {
             name: r#"tool-mounts-suppression-ignored"#,
             path: r#"crates/agent-vm/src/mount_selection.rs"#,
-            old: r#"        Some(user) if selected => ("#,
-            new: r#"        Some(user) if selected || true => ("#,
+            old: r#"    let selected = config_mounts_selected(ConfigSelectionFacts {
+        declared,
+        suppressed: policy.suppressed(),
+    });"#,
+            new: r#"    let selected = config_mounts_selected(ConfigSelectionFacts {
+        declared,
+        suppressed: false,
+    });"#,
             run: Run::AgentBin(r#"suppression_drops_both_automatic_inputs_but_not_cli_sets"#),
             markers: &[r#"test result: FAILED"#],
             anchors: 1,
@@ -2702,8 +2719,14 @@ fn ledger() -> Vec<Row> {
         Row {
             name: r#"tool-mounts-suppression-ignored-launch"#,
             path: r#"crates/agent-vm/src/mount_selection.rs"#,
-            old: r#"        Some(user) if selected => ("#,
-            new: r#"        Some(user) if selected || true => ("#,
+            old: r#"    let selected = config_mounts_selected(ConfigSelectionFacts {
+        declared,
+        suppressed: policy.suppressed(),
+    });"#,
+            new: r#"    let selected = config_mounts_selected(ConfigSelectionFacts {
+        declared,
+        suppressed: false,
+    });"#,
             run: Run::AgentTest(
                 r#"config_mounts"#,
                 r#"opt_out_removes_defaults_own_and_inherited_mounts_but_keeps_cli"#,
@@ -2713,21 +2736,48 @@ fn ledger() -> Vec<Row> {
         },
         // One budget for the whole file, continued into catalog construction: a fresh
         // counter per tool or per launch makes the same leaves free to repeat.
+        // One budget for the whole load, carried across tiers and into the catalog
+        // build (#735 V23): a fresh counter per tier, per declared tool list or at
+        // the hand-off makes the same leaves free to repeat.
         Row {
-            name: r#"tool-mounts-budget-reset"#,
-            path: r#"crates/agent-vm/src/config_mounts/sets.rs"#,
-            old: r#"        MountExpansionWork::configured(self.work)"#,
-            new: r#"        MountExpansionWork::fresh()"#,
-            run: Run::AgentBin(r#"mount_budget_is_shared_by_sets_tool_lists_and_launch_folds"#),
+            name: r#"mount-budget-tier-reset"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"                home,
+                work,
+            )
+            .map_err(|error| anyhow!("config: {}: {error}", crate::one_line::quoted_path(path)))?,
+        )
+    } else {"#,
+            new: r#"                home,
+                &mut config_mounts::MountExpansionWork::fresh(),
+            )
+            .map_err(|error| anyhow!("config: {}: {error}", crate::one_line::quoted_path(path)))?,
+        )
+    } else {"#,
+            run: Run::AgentBin(r#"mount_budget_spans_project_source_and_user_tiers"#),
             markers: &[r#"test result: FAILED"#],
             anchors: 1,
         },
         Row {
-            name: r#"tool-mounts-budget-reset-launch"#,
+            name: r#"mount-budget-declared-reset"#,
             path: r#"crates/agent-vm/src/config.rs"#,
-            old: r#"                mounts.continuing_work()"#,
-            new: r#"                config_mounts::MountExpansionWork::fresh()"#,
-            run: Run::AgentBin(r#"tool_mount_work_continues_the_verified_parser_budget"#),
+            old: r#"            config_mounts::parse_declared_tool_mounts(path, &tool_mount_values, home, work)"#,
+            new: r#"            config_mounts::parse_declared_tool_mounts(
+                path,
+                &tool_mount_values,
+                home,
+                &mut config_mounts::MountExpansionWork::fresh(),
+            )"#,
+            run: Run::AgentBin(r#"mount_budget_spans_project_source_and_user_tiers"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            name: r#"tool-mounts-budget-reset-handoff"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"        let mut work = mount_work;"#,
+            new: r#"        let mut work = config_mounts::MountExpansionWork::fresh();"#,
+            run: Run::AgentBin(r#"mount_budget_continues_from_combined_tiers_into_the_catalog"#),
             markers: &[r#"test result: FAILED"#],
             anchors: 1,
         },
@@ -2754,8 +2804,7 @@ fn ledger() -> Vec<Row> {
             tool_field: first_tool_mounts.is_some(),
         }),
         mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),
-    };"#,
+        egress_sets: raw.egress_sets.is_some(),"#,
             new: r#"        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {
             top_level: raw.mounts.is_some(),
             tool_field: first_tool_mounts.is_some(),
@@ -3687,6 +3736,130 @@ fn ledger() -> Vec<Row> {
             run: Run::AgentBin(
                 r#"allowances::store::tests::a_lock_the_host_refuses_to_open_is_not_reported_as_busy"#,
             ),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            name: r#"launch-entry-arena-paired"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"            let tool = slots.get_mut(id.0).and_then(Option::take).ok_or_else(|| {"#,
+            new: r#"            let tool = slots.iter_mut().find_map(Option::take).ok_or_else(|| {"#,
+            run: Run::AgentBin(r#"authorized_entries_keep_their_own_definition_and_facets"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            name: r#"inert-source-references-skipped"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"            ResolvedTools::from_defaults_retaining(default_tools()?, sourced),"#,
+            new: r#"            ResolvedTools::from_defaults_retaining(default_tools()?, Vec::new()),"#,
+            run: Run::AgentBin(r#"defaults_path_still_validates_inert_source_references"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            name: r#"allow-tools-authority-operand-dropped"#,
+            path: r#"crates/agent-vm/src/config_authority.rs"#,
+            old: r#"if t.network { true } else { t.mounts || t.mount_sets || t.egress_sets || t.allow_tools }"#,
+            new: r#"if t.network { true } else { t.mounts || t.mount_sets || t.egress_sets }"#,
+            run: Run::AgentBin(r#"allow_tools_presence_requires_the_verified_read"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            name: r#"allow-tools-authority-operand-dropped-proof"#,
+            path: r#"crates/agent-vm/src/config_authority.rs"#,
+            old: r#"    ensures r == (t.network || t.mounts || t.mount_sets || t.egress_sets || t.allow_tools),"#,
+            new: r#"    ensures r == (t.network || t.mounts || t.mount_sets || t.egress_sets),"#,
+            run: Run::Proof,
+            markers: &[r#"verification results::"#],
+            anchors: 1,
+        },
+        Row {
+            name: r#"allow-tools-authority-operand-dropped-launch"#,
+            path: r#"crates/agent-vm/src/config_authority.rs"#,
+            old: r#"if t.network { true } else { t.mounts || t.mount_sets || t.egress_sets || t.allow_tools }"#,
+            new: r#"if t.network { true } else { t.mounts || t.mount_sets || t.egress_sets }"#,
+            run: Run::AgentTest(
+                r#"config_launch_driven"#,
+                r#"a_symlinked_config_authorizing_tools_is_refused"#,
+            ),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            name: r#"allow-tools-presence-ignored"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"        allow_tools: raw.allow_tools.is_some(),"#,
+            new: r#"        allow_tools: false,"#,
+            run: Run::AgentBin(r#"allow_tools_presence_requires_the_verified_read"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            name: r#"allow-tools-trusted-verdict-bypassed"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"                    trust.require_for_trusted_tool().map_err(|refusal| {"#,
+            new: r#"                    Ok::<(), crate::config_authority::UntrustedConfig>(()).map_err(|refusal| {"#,
+            run: Run::AgentTest(
+                r#"config_launch_driven"#,
+                r#"a_project_authorization_of_a_trusted_tool_needs_the_trusted_verdict"#,
+            ),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            name: r#"allow-tools-source-accepted"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"    if raw.egress_sets.is_some() {
+        return Err(egress_sets_refusal(path, tier));
+    }"#,
+            new: r#"    if raw.egress_sets.is_some() {
+        return Err(egress_sets_refusal(path, tier));
+    }
+    if raw.allow_tools.is_some() {
+        return Ok(());
+    }"#,
+            run: Run::AgentBin(r#"v10_an_untrusted_source_cannot_grant_authority"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            name: r#"allow-tools-closure-unchecked"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"        enforce_closure_authorization(&definitions, &visited, *start, &authorized)?;"#,
+            new: r#"        let _ = (&definitions, &visited, *start, &authorized);"#,
+            run: Run::AgentBin(r#"tool_closure_authorization_is_explicit"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            name: r#"authorized-tool-egress-dropped"#,
+            path: r#"crates/agent-vm/src/launch_target.rs"#,
+            old: r#"                    tool_egress: Some(if entry.is_authorized_egress() {"#,
+            new: r#"                    tool_egress: Some(if false {"#,
+            run: Run::AgentTest(
+                r#"config_launch_driven"#,
+                r#"an_authorized_tool_grants_its_exact_hostnames"#,
+            ),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            name: r#"authorized-tool-port-widened"#,
+            path: r#"crates/agent-vm/src/egress_reference.rs"#,
+            old: r#"            let text = format!("tcp://{}:{}", request.name().as_str(), request.port());"#,
+            new: r#"            let text = format!("tcp://{}", request.name().as_str());"#,
+            run: Run::AgentBin(r#"expansion_is_port_pinned"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            name: r#"authorized-tool-facets-dropped"#,
+            path: r#"crates/agent-vm/src/launch_target.rs"#,
+            old: r#"                    mounts: entry.mounts().clone(),"#,
+            new: r#"                    mounts: crate::config_mounts::ResolvedMountList::empty(),"#,
+            run: Run::AgentBin(r#"authorized_source_entry_lowers_every_own_and_closure_facet"#),
             markers: &[r#"test result: FAILED"#],
             anchors: 1,
         },

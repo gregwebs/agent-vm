@@ -12,6 +12,11 @@ The guard half of A2 is delivered by [ADR-0038](0038-config-dir-exposure-guard.m
 (#323). Amended by [ADR-0040](0040-persisted-user-network-authority.md): the user tier accepts verified `[network]`;
 the project/built-in tiers still refuse. A1 describes CLI authority.
 
+Amended by [ADR-0075](0075-explicit-tool-authorization.md): the default-deny
+boundary is now decided by *authorization*, not by launch. An authorized tool's
+own `network_requests` are granted on its launch; a compiled-in default's remain
+non-authoritative metadata under exactly the rules below.
+
 Supersedes ADR-0009's implicit Public grant. **Breaking change in 0.2.0**:
 existing tool launches have no egress or DNS query authorization until a grant is
 passed. `--allow-internet-egress` restores public internet and DNS for provider

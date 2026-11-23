@@ -12,6 +12,13 @@ issue carries, checked against the implementation that landed. It builds on
 **0.7.4**. The native enforcement rows now have a recorded pass; see
 [Verification](#verification).
 
+**Amended by [ADR-0075](0075-explicit-tool-authorization.md)**: a tool's `mounts`
+is now one *facet* of an authorization rather than user-tier authority. A project
+or sourced tool's `mounts` is legal and inert until `allow_tools` authorizes the
+tool, the compiled-in defaults are the only tier that may not carry one, and one
+`MountExpansionWork` spans the whole load instead of a per-parser counter. The
+verified read, the defaults parser and every mount-set rule below are unchanged.
+
 Two extensions have since landed and are part of the current contract, not
 deferrals: **named mount sets** (#397, [ADR-0048](0048-named-mount-sets-and-tier-local-tool-references.md))
 and **full user tool `mounts` lists inherited through the tier-local `tools`

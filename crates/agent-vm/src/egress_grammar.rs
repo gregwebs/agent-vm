@@ -1,11 +1,12 @@
 //! Shared allowance syntax must not depend on launch authority.
 //!
-//! `tool:NAME` and `set:NAME` egress references are claimed **before** this
-//! grammar sees an `allow_egress` entry (`egress_reference::reference_claim` and
-//! `set_reference_claim`, ADR-0059 and #511); the same text in a
-//! `network_requests` entry does reach it, and is read as the hostname `tool` or
-//! `set`, which is the documented non-authoritative behaviour. Acceptance and
-//! error bytes are otherwise unchanged.
+//! `set:NAME` egress references are claimed **before** this grammar sees an
+//! `allow_egress` entry (`egress_reference::set_reference_claim`, #511); the same
+//! text in a `network_requests` entry does reach it, and is read as the hostname
+//! `set`, which is the documented non-authoritative behaviour. #735 removed the
+//! `tool:` claim (ADR-0075), so `tool:NAME` now reaches this grammar too and is
+//! read as the hostname `tool` — a non-numeric port is simply a malformed port.
+//! Acceptance and error bytes are otherwise unchanged.
 
 // The verified byte kernels use raw delimiter comparisons and length tests so
 // their executable code stays aligned with the proofs. Keep the two lint

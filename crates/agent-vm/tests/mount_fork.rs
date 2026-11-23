@@ -331,7 +331,7 @@ impl Harness {
         use std::os::unix::fs::PermissionsExt;
         let path = self.home.path().join(".config/agent-vm/config.toml");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, contents).unwrap();
+        std::fs::write(&path, support::authorized_tools(contents, &[])).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::set_permissions(
             path.parent().unwrap(),

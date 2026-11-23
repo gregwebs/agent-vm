@@ -8,6 +8,14 @@ of [#302](https://github.com/gregwebs/agent-vm/issues/302). Follows
 [ADR-0037](0037-hostname-egress-allowances.md); amends
 [ADR-0018](0018-machine-checked-boundary-contracts.md).
 
+**Amended by [ADR-0075](0075-explicit-tool-authorization.md)**, which narrows
+this ADR's scope to the compiled-in defaults. An *authorized* tool's
+`network_requests` are now real egress (exact `tcp://HOST:PORT` grants), and the
+unmet report below is printed only for a `ToolOrigin::BuiltIn` definition. The
+64-entry cap, the sorted deduplicated canonical set, the port-443 default, the
+IP/CIDR refusal and the reporting budget are all unchanged and still apply to
+both cases.
+
 ## Context
 
 A repository may describe the services its tool expects, but cannot grant
@@ -98,6 +106,11 @@ baseline requests, independently of credential proxy hosts; Copilot is pending
 define the version/auth conditions and exclusions. Behavior is unchanged.
 
 ## Amendment (#506): one way requests become authority
+
+**Superseded by [ADR-0075](0075-explicit-tool-authorization.md)**: the `tool:NAME`
+route below was removed in 0.8.2. Authorizing a tool with `allow_tools` now grants
+its own requests on launch, and the route this amendment added no longer exists.
+The amendment is kept as the record of why #506 built it and what it protected.
 
 A request still grants nothing by being declared, by being *reported*, or by
 being declared in a project config. [#506](https://github.com/gregwebs/agent-vm/issues/506)

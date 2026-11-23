@@ -321,12 +321,11 @@ mod tests {
         );
     }
 
-    /// The literal-only namespace every accepting test resolves against: a
-    /// literal entry needs no tools, and no test here uses a reference.
-    fn no_tools() -> EgressNamespace {
+    /// The set-less namespace every accepting test resolves against: a literal
+    /// entry needs no sets, and no accepting test here uses a reference.
+    fn no_sets() -> EgressNamespace {
         EgressNamespace::new(
             crate::config_authority::ReferenceTrust::verified_for_test(Path::new("user.toml")),
-            &[],
             None,
         )
         .unwrap()
@@ -346,7 +345,7 @@ allow_egress = ["10.0.0.5", "10.0.0.5/32", "API.example.com.", "api.example.com"
             ),
         )
         .unwrap()
-        .resolve(&no_tools())
+        .resolve(&no_sets())
         .unwrap();
         assert_eq!(
             parsed,
@@ -362,7 +361,7 @@ allow_egress = ["10.0.0.5", "10.0.0.5/32", "API.example.com.", "api.example.com"
         );
         let empty = parse_table(Path::new("user.toml"), &table(""))
             .unwrap()
-            .resolve(&no_tools())
+            .resolve(&no_sets())
             .unwrap();
         assert_eq!(empty.groups, SavedGroups::default());
         assert!(empty.allowances().allowances().next().is_none());
@@ -449,9 +448,8 @@ allow_egress = ["10.0.0.5", "10.0.0.5/32", "API.example.com.", "api.example.com"
     #[test]
     fn set_reference_failures_keep_the_entry_prefix_and_echo_nothing() {
         const SENTINEL: &str = "SENTINEL7";
-        let tools = EgressNamespace::new(
+        let sets = EgressNamespace::new(
             crate::config_authority::ReferenceTrust::verified_for_test(Path::new("user.toml")),
-            &[],
             None,
         )
         .unwrap();
@@ -470,7 +468,7 @@ allow_egress = ["10.0.0.5", "10.0.0.5/32", "API.example.com.", "api.example.com"
             ),
         ] {
             let error = parse_table(Path::new("user.toml"), &table(&text))
-                .and_then(|parsed| parsed.resolve(&tools))
+                .and_then(|parsed| parsed.resolve(&sets))
                 .unwrap_err()
                 .to_string();
             assert_eq!(error, expected, "{text}");
@@ -478,34 +476,47 @@ allow_egress = ["10.0.0.5", "10.0.0.5/32", "API.example.com.", "api.example.com"
         }
     }
 
-    /// A resolved reference failure keeps this module's setting prefix, so the
-    /// load error reads `config: "<file>": network.allow_egress[N]: <reason>`
-    /// (R15) — and never echoes the entry or the name it named (R17).
+    /// V12: `tool:NAME` is no longer a reference, so it keeps this module's
+    /// setting prefix while the *grammar* refuses it — and the sentence never
+    /// echoes the entry. A numeric `tool:PORT` reverts to the literal hostname
+    /// `tool`, which is the pre-#506 meaning.
     #[test]
-    fn reference_failures_keep_the_entry_prefix_and_echo_nothing() {
+    fn tool_names_are_ordinary_allowance_text_again() {
         const SENTINEL: &str = "sk-live-SENTINEL";
-        let tools = EgressNamespace::new(
+        let sets = EgressNamespace::new(
             crate::config_authority::ReferenceTrust::verified_for_test(Path::new("user.toml")),
-            &[],
             None,
         )
         .unwrap();
         for (text, expected) in [
             (
-                format!("allow_egress = [\"10.0.0.1\", \"TOOL:{SENTINEL}\"]"),
-                "network.allow_egress[1]: an egress reference must name a tool declared in the user config's own [[tools]]; built-in and project tools are never used (`agent-vm tools print` prints the shipped tools to copy there)",
+                format!("allow_egress = [\"10.0.0.1\", \"tool:{SENTINEL}\"]"),
+                "network.allow_egress[1]: port must be a decimal number 1-65535",
             ),
             (
-                "allow_egress = [\"tool:a b\"]".to_owned(),
-                "network.allow_egress[0]: an egress reference must be tool:NAME with a valid tool name (no whitespace, control characters or '/', not starting with '-', and not `.`, `..`, `*` or a reserved subcommand name)",
+                "allow_egress = [\"tool:\"]".to_owned(),
+                "network.allow_egress[0]: port must be a decimal number 1-65535",
             ),
         ] {
             let error = parse_table(Path::new("user.toml"), &table(&text))
-                .and_then(|parsed| parsed.resolve(&tools))
+                .and_then(|parsed| parsed.resolve(&sets))
                 .unwrap_err()
                 .to_string();
             assert_eq!(error, expected);
             assert!(!error.contains(SENTINEL));
         }
+        let resolved = parse_table(
+            Path::new("user.toml"),
+            &table("allow_egress = [\"tool:443\"]"),
+        )
+        .unwrap()
+        .resolve(&sets)
+        .unwrap();
+        let rendered: Vec<String> = resolved
+            .allowances()
+            .allowances()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(rendered, ["tcp://tool:443"]);
     }
 }

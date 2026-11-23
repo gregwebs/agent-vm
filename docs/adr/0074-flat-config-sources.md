@@ -7,7 +7,13 @@ of seven stacked children of
 [#732](https://github.com/gregwebs/agent-vm/issues/732). Amends
 [ADR-0073](0073-host-managed-project-config.md) (the project config may now
 source other files) and [ADR-0035](0035-consume-user-owned-boot-images.md) (the
-project image outranks the user image). Amended by nothing yet. Bumps the
+project image outranks the user image). Amended by
+[ADR-0075](0075-explicit-tool-authorization.md): a sourced file's tools become
+launch verbs when the **project** config authorizes them, since a source may not
+declare `allow_tools` itself; the project's authorization of a sourced or
+`:trust` tool outranks the `:trust` verb (Decision 5's precedence, extended from
+images to tool verbs); and a sourced file's tool `mounts` is legal-and-inert
+instead of refused by presence. Bumps the
 workspace version to **0.8.1** inside the unreleased 0.8.x line.
 
 ## Context
@@ -189,6 +195,17 @@ therefore the whole of the boundary until #736.
 
 ## Decision 6: a project-side tool collision is an error
 
+**Superseded by [ADR-0075](0075-explicit-tool-authorization.md).** A declaration
+is inert data, so two project-side files may declare one name whenever neither is
+authorized — that is what makes a definition shareable. Only a second
+*authorization* of one verb inside the project's own `allow_tools` is an error,
+and that error names the verb and the origin already claiming it. Authorizing a
+project definition of an inherited `:trust` name replaces that verb in place, so
+the project definition is the launch verb; a differing replacement is still
+reported as a conflict naming both files. A definition with no verb stays
+resolvable from its own file (#395). The original rule is kept below as the
+record of why it was right while a declaration was still a launch verb.
+
 Two project-side files (the project config and any untrusted source) may not
 declare the same tool name. With one file that could not happen — duplicate names
 in one file are rejected — and with N files there is no ordering that would not
@@ -205,7 +222,11 @@ Only the project config may declare `sources`. Any other tier that carries the
 key is refused by presence, `sources = []` included — a sourced file cannot source
 another file. Within one file the existing error order stands: the verified-read
 verdict first, then this refusal, then any authority-field refusal, so a file that
-carries both `sources` and `[network]` is reported as the former.
+carries both `sources` and `[network]` is reported as the former. A `sources` line
+written after a table header is refused during decoding, ahead of all of these: TOML
+scopes it into that table, so the refusal names the header (`[network]`,
+`[[tools]]`) and the placement rule rather than reporting a schema error the reader
+cannot act on.
 
 `==> tool configuration` gains a `sources:` block only when the project config
 listed entries, renders an unsourced user tier as
@@ -255,20 +276,21 @@ the user config never hides the note.
 - **G3. The legacy note still prints when the configuration fails to load**, even
   if the file is sourced: `doctor` cannot know the sources of a load that failed.
   The `error:` body names the failing file.
-- **G4. With `home` unsourced, a CLI `tool:NAME` / `set:NAME` reports the existing
-  "no user config file was found".** The wording is accurate in effect and
-  imprecise in cause; #738's selector work owns it.
+- **G4. With `home` unsourced, a CLI `set:NAME` reports the existing "no user
+  config file was found".** (ADR-0075 removed the `tool:NAME` half.) The wording
+  is accurate in effect and imprecise in cause; #738's selector work owns it.
 - **G5. `:trust` is user-config-only.** Generalising it needs per-source guard
   coverage, source-qualified authority namespaces and provenance (#738).
 - **G6. A source's tools can request credentials and reuse a familiar verb name.**
-  A non-`:trust` source's tools carry the `credentials`/`provisions` requests,
-  `env` and `persist` declarations any project-side tool carries, so an unreviewed
-  repository file can ask for a credential provider or define `claude` — with any
-  command — as the verb the user already types: the shipped defaults give way to
-  any project-side tool whenever the user config declares none of its own. Nothing
-  here grants authority beyond
-  what the tool's own launch already asks for, but the requests are real and
-  neither `allow_tools` (#735) nor content pinning (#736) exists yet.
+  **Closed for unauthorized tools by
+  [ADR-0075](0075-explicit-tool-authorization.md)**: a source's declarations are
+  inert until the project config authorizes one, so no repository file can claim
+  a verb the user already types merely by declaring it. What remains is the
+  authorized case, a definition the user's own project config named: it carries
+  the `credentials`/`provisions` requests, `env` and `persist` declarations any
+  project-side tool carries. Nothing there grants authority beyond what the
+  tool's own launch already asks for, but the requests are real and, until
+  #736, unpinned.
 
 ## Alternatives rejected
 

@@ -232,7 +232,10 @@ impl Harness {
     }
 
     fn write_project(&self, contents: &str) {
-        write_file(&self.project_config(), contents);
+        write_file(
+            &self.project_config(),
+            &support::authorized_tools_beside(contents, &self.user_config()),
+        );
     }
 
     /// `~/.config/agent-vm/config.toml` — the only file that may declare
@@ -252,7 +255,7 @@ impl Harness {
     fn write_user_mode(&self, contents: &str, mode: u32) {
         use std::os::unix::fs::PermissionsExt;
         let path = self.user_config();
-        write_file(&path, contents);
+        write_file(&path, &support::authorized_tools(contents, &[]));
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
         std::fs::set_permissions(
             path.parent().unwrap(),
@@ -827,18 +830,20 @@ fn empty_mounts_still_requires_a_verified_file() {
     // blanket refusal of symlinked configs.
     let h = Harness::new();
     let target = h.home_root.join("dotfiles/config.toml");
+    // A symlink may carry no `allow_tools` (ADR-0040's fifth trigger), so the
+    // tool it declares is inert; what this control pins is that the *file* still
+    // loads, which is why the refusal above is about `mounts`.
     write_file(
         &target,
-        "[[tools]]\nname = \"probe\"\ncommand = \"/bin/probe\"\ncredentials = []\n",
+        "# no allow_tools\n[[tools]]\nname = \"probe\"\ncommand = \"/bin/probe\"\ncredentials = []\n",
     );
     h.symlink_user_config(&target);
     let out = h.launch(&[], "probe", &[]);
     let stderr = stderr_of(&out);
     assert!(
-        stderr.contains(CONFIG_MARKER),
-        "a symlinked config without mounts still works: {stderr}"
+        !stderr.contains("mounts requires config.toml to be a regular file"),
+        "a symlinked config without mounts still loads: {stderr}"
     );
-    assert_eq!(guest_command(&stderr), "/bin/probe", "{stderr}");
 }
 
 /// Every way the verified-read policy can be violated, refused before any
@@ -989,21 +994,21 @@ fn symlinked_user_config_directory_with_mounts_is_followed() {
 #[test]
 fn symlinked_user_config_without_mounts_still_launches() {
     let h = Harness::new();
-    h.write_user("[[tools]]\nname = \"probe\"\ncommand = \"/bin/probe\"\ncredentials = []\n");
+    // A symlinked file cannot authorize (ADR-0040's fifth trigger), so the tool
+    // it declares is inert and the launch under it is the shell fallback. The
+    // claim here is that the *file* loads without a mount field.
+    h.write_user(
+        "# no allow_tools\n[[tools]]\nname = \"probe\"\ncommand = \"/bin/probe\"\ncredentials = []\n",
+    );
     let target = h.home_root.join("dotfile");
     std::fs::rename(h.user_config(), &target).unwrap();
     h.symlink_user_config(&target);
 
-    let out = h.launch(&[], "probe", &[]);
+    let out = h.launch(&[], "shell", &[]);
     let stderr = stderr_of(&out);
     assert!(
         stderr.contains(CONFIG_MARKER),
         "a tools-only symlinked config must launch: {stderr}"
-    );
-    assert_eq!(
-        guest_command(&stderr),
-        "/bin/probe",
-        "the user tool must be registered from the symlinked file: {stderr}"
     );
     // A config with no mounts must add nothing: the bind set is exactly the
     // three core binds (state, persisted home, project).
@@ -3010,8 +3015,11 @@ fn named_mount_sets_unsafe_file_is_refused_before_launch_state() {
     // The compatibility control: the same file with no authority-bearing field is
     // accepted, so the refusal above is about the table and not about the mode.
     let h = Harness::new();
-    h.write_user_mode("[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\n", 0o664);
-    let stderr = stderr_of(&h.launch(&[], "t", &[]));
+    h.write_user_mode(
+        "# no allow_tools\n[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\n",
+        0o664,
+    );
+    let stderr = stderr_of(&h.launch(&[], "shell", &[]));
     assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
 }
 
@@ -4451,43 +4459,112 @@ fn tool_mount_conflicts_cover_each_differing_declaration_field() {
     }
 }
 
-/// #396 AC-authority: a project tool's `mounts` field is a load error by presence,
-/// including when the project definition is hidden by a user name and when the
-/// list is empty.
+/// #396 AC-authority, restated for #735: a **project** tool's `mounts` is legal
+/// and inert — a hidden project definition supplies no mount. A wrong type is
+/// still a schema error. The activation half (authorizing it makes the
+/// declaration real, and `--no-config-mounts` suppresses it) is
+/// [`project_tool_mounts_are_selected_then_suppressed`].
 #[test]
-fn project_tool_mount_presence_is_a_load_error_even_when_hidden() {
+fn project_tool_mount_presence_is_inert_without_authorization() {
+    // A user declaration of the same name holds the verb, so the project
+    // definition is a hidden loser: legal, and its mounts never reach the launch.
     for body in [
-        "[[tools]]\nname = \"hidden\"\ncommand = \"/bin/echo\"\nmounts = []\n".to_string(),
-        "[[tools]]\nname = \"hidden\"\ncommand = \"/bin/echo\"\nmounts = 7\n".to_string(),
-        "[[tools]]\nname = \"hidden\"\ncommand = \"/bin/echo\"\nmounts = [\"~/x:/x:ro\"]\n"
+        "# no allow_tools\n[[tools]]\nname = \"hidden\"\ncommand = \"/bin/echo\"\n\
+         mounts = [\"~/x:/x:ro\"]\n"
+            .to_string(),
+        "# no allow_tools\n[[tools]]\nname = \"hidden\"\ncommand = \"/bin/echo\"\n\
+         mounts = []\n"
             .to_string(),
     ] {
         let h = Harness::new();
-        // A user declaration of the same name makes the project definition a
-        // hidden loser — refused all the same, because the field is authority.
-        h.write_user("[[tools]]\nname = \"hidden\"\ncommand = \"/bin/echo\"\n");
+        let x = seed_dir(&h, "x");
+        h.write_user("# no allow_tools\n[[tools]]\nname = \"hidden\"\ncommand = \"/bin/echo\"\n");
         h.write_project(&body);
-        let before = h.before();
-        let out = h.launch(&[], "hidden", &[]);
-        h.assert_refused_before_launch_state(
-            &out,
-            &before,
-            "tools[0].mounts: mounts cannot be declared by the project config",
-        );
-        // `doctor` reports it and `--help` still works: the recovery path is
-        // intact.
-        let doctor = stderr_of(&h.doctor());
-        assert!(doctor.contains("tools[0].mounts"), "{doctor}");
+        let out = h.launch(&[], "shell", &[]);
+        let stderr = stderr_of(&out);
+        assert!(stderr.contains(CONFIG_MARKER), "{body}: {stderr}");
         assert!(
-            h.help().status.success(),
-            "a broken config must not break --help"
+            !stderr.contains("x:/x"),
+            "{body}: a hidden project definition supplies no mount: {stderr}"
+        );
+        assert!(
+            x.is_dir(),
+            "the seed exists, so the mount would have resolved"
         );
     }
-    // Anchor: removing the field launches.
+
+    // A wrong type is still refused: the declaration is parsed whether or not it
+    // is reachable.
     let h = Harness::new();
-    h.write_user("[[tools]]\nname = \"hidden\"\ncommand = \"/bin/echo\"\n");
-    h.write_project("[[tools]]\nname = \"hidden\"\ncommand = \"/bin/echo\"\n");
-    assert!(stderr_of(&h.launch(&[], "hidden", &[])).contains(CONFIG_MARKER));
+    h.write_user("# no allow_tools\n[[tools]]\nname = \"hidden\"\ncommand = \"/bin/echo\"\n");
+    h.write_project("[[tools]]\nname = \"hidden\"\ncommand = \"/bin/echo\"\nmounts = 7\n");
+    let before = h.before();
+    let out = h.launch(&[], "shell", &[]);
+    h.assert_refused_before_launch_state(&out, &before, "tools[0].mounts: must be an array");
+    assert!(
+        h.help().status.success(),
+        "a broken config must not break --help"
+    );
+}
+
+/// V8 (R5): an authorized project tool's own `mounts` are automatic config
+/// mounts, exactly like a user declaration's — selected by default, skipped by
+/// `--no-config-mounts`, and reachable again by an explicit `--mount`. The
+/// declaration cannot activate itself: it is the project's `allow_tools` entry
+/// that makes it a verb first.
+#[test]
+fn project_tool_mounts_are_selected_then_suppressed() {
+    let h = Harness::new();
+    let x = seed_source(&h, "x");
+    let y = seed_source(&h, "y");
+    h.write_user("# no allow_tools\n");
+    h.write_project(&format!(
+        "allow_tools = [\"hidden\"]\n[[tools]]\nname = \"hidden\"\ncommand = \"/bin/echo\"\n\
+         tools = []\nmounts = [\"{}:/x:ro\"]\n",
+        x.display()
+    ));
+    let selected = |stderr: &str, guest: &str| -> bool {
+        bind_mounts(&debug_config_json(stderr))
+            .iter()
+            .any(|(_, at, _)| at == guest)
+    };
+
+    // Selected by default: the declaration is real because the project
+    // authorized it.
+    let stderr = stderr_of(&h.launch(&[], "hidden", &[]));
+    assert!(
+        stderr.contains(&format!(
+            "==> Mounts: 1 (config \"{}\"",
+            h.project_config().display()
+        )),
+        "{stderr}"
+    );
+    assert!(selected(&stderr, "/x"), "{stderr}");
+
+    // Skipped by the opt-out alone: the project's declaration is a config mount
+    // like any other, so it disappears with the user's.
+    let stderr = stderr_of(&h.launch(&["--no-config-mounts"], "hidden", &[]));
+    assert!(
+        stderr.contains(&format!(
+            "==> Mounts: skipped 1 from \"{}\" (--no-config-mounts)",
+            h.project_config().display()
+        )),
+        "{stderr}"
+    );
+    assert!(!selected(&stderr, "/x"), "{stderr}");
+
+    // ...and an explicit `--mount` survives the opt-out.
+    let stderr = stderr_of(&h.launch(
+        &[
+            "--no-config-mounts",
+            "--mount",
+            &format!("{}:/y:ro", y.display()),
+        ],
+        "hidden",
+        &[],
+    ));
+    assert!(selected(&stderr, "/y"), "{stderr}");
+    assert!(!selected(&stderr, "/x"), "{stderr}");
 }
 
 /// #396 AC-tier: a project launch never acquires user mount authority, by naming
@@ -4541,15 +4618,18 @@ fn empty_present_tool_mounts_require_authority_before_any_launch() {
     // Compatibility anchor: no mount field, so an ordinary (group-writable) mode
     // is irrelevant and the launch proceeds.
     let h = Harness::new();
-    h.write_user_mode("[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\n", 0o664);
-    assert!(stderr_of(&h.launch(&[], "t", &[])).contains(CONFIG_MARKER));
+    h.write_user_mode(
+        "# no allow_tools\n[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\n",
+        0o664,
+    );
+    assert!(stderr_of(&h.launch(&[], "shell", &[])).contains(CONFIG_MARKER));
 
     // The same file with `mounts = []` is authority-bearing, so the writable mode
     // is refused — before any launch state.
     for body in [
-        "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\nmounts = []\n",
+        "# no allow_tools\n[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\nmounts = []\n",
         // A wrong type is authority-bearing before the schema is decided.
-        "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\nmounts = 7\n",
+        "# no allow_tools\n[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\nmounts = 7\n",
     ] {
         let h = Harness::new();
         h.write_user_mode(body, 0o664);
@@ -4568,7 +4648,7 @@ fn empty_present_tool_mounts_require_authority_before_any_launch() {
     let target = h.home_root.join("dotfiles/config.toml");
     write_file(
         &target,
-        "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\nmounts = []\n",
+        "# no allow_tools\n[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\nmounts = []\n",
     );
     h.symlink_user_config(&target);
     let before = h.before();

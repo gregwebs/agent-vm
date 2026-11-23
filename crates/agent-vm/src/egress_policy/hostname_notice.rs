@@ -18,18 +18,22 @@ const EGRESS_LIST_POINTER: &str = "==> list: agent-vm access egress";
 /// Which tiers granted a line's names. Lines group by this, not by reference:
 /// the references are now on the line itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Tiers {
+struct Tiers<'a> {
     user: bool,
     cli: bool,
     project: bool,
+    /// #735: the launched authorized tool's own `network_requests` granted a
+    /// name on this line.
+    tool: Option<&'a str>,
 }
 
-impl Tiers {
-    fn of(attribution: &HostnameAttribution<'_>) -> Self {
+impl<'a> Tiers<'a> {
+    fn of(attribution: &HostnameAttribution<'a>) -> Self {
         Self {
             user: granted(&attribution.user),
             cli: granted(&attribution.cli),
             project: attribution.recorded,
+            tool: attribution.tool,
         }
     }
 
@@ -37,18 +41,24 @@ impl Tiers {
     /// " and "; `None` when it would say only `persisted grants`, which is
     /// every launch's default source and the noise this ticket removes.
     fn tag(self) -> Option<String> {
-        let mut phrases = Vec::new();
+        let mut phrases: Vec<String> = Vec::new();
         if self.user {
-            phrases.push("persisted grants");
+            phrases.push("persisted grants".to_owned());
         }
         if self.cli {
-            phrases.push("--allow-egress");
+            phrases.push("--allow-egress".to_owned());
         }
         if self.project {
-            phrases.push("project allowance");
+            phrases.push("project allowance".to_owned());
+        }
+        // The tool name is a validated `ToolName`: no whitespace, control
+        // character or quote can reach a notice line through it.
+        if let Some(name) = self.tool {
+            phrases.push(format!("tool {name}"));
         }
         match phrases.as_slice() {
-            [] | ["persisted grants"] => None,
+            [] => None,
+            [only] if only == "persisted grants" => None,
             _ => Some(phrases.join(" and ")),
         }
     }
@@ -74,7 +84,8 @@ impl EgressAuthority {
         let attributions = self.hostname_attributions();
         // First-seen grouping keeps line order the rule traversal order;
         // hashing would reorder display.
-        let mut groups: Vec<(Vec<u16>, Option<Tiers>, Vec<&HostnameAttribution<'_>>)> = Vec::new();
+        let mut groups: Vec<(Vec<u16>, Option<Tiers<'_>>, Vec<&HostnameAttribution<'_>>)> =
+            Vec::new();
         for attribution in &attributions {
             let key = (
                 attribution.ports.clone(),

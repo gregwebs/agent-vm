@@ -294,9 +294,10 @@ pub(crate) enum Dispatch {
         images: ConfiguredImages,
         /// Verified user authority captured before consuming the report, like images.
         user_network: Option<crate::user_network::UserNetwork>,
-        /// The user file's own tools as an egress-reference namespace, captured
-        /// the same way (ADR-0059). `None` when there is no user file, which is
-        /// why a CLI `tool:NAME` then reports "no user config file was found".
+        /// The user file's own `[egress_sets]` as an egress-reference namespace,
+        /// captured the same way (ADR-0059). `None` when there is no user file,
+        /// which is why a CLI `set:NAME` then reports "no user config file was
+        /// found".
         user_tools: Option<crate::egress_reference::EgressNamespace>,
         /// Verified user `mounts`, captured the same way (ADR-0046). `None` when
         /// the file declared none, so a launch can tell "no declarations" from
@@ -1416,9 +1417,9 @@ mod tests {
     use crate::config::{ConfigPaths, LaunchCatalog, RESERVED_TOOL_NAMES};
     use std::path::{Path, PathBuf};
 
-    const MYTOOL: &str = "[[tools]]\nname = \"mytool\"\ncommand = \"my-agent\"\n";
-    const SHELL_ONLY: &str =
-        "[[tools]]\nname = \"shell\"\ncommand = \"bash\"\ninteractive_shell = true\n";
+    const MYTOOL: &str =
+        "allow_tools = [\"mytool\"]\n[[tools]]\nname = \"mytool\"\ncommand = \"my-agent\"\n";
+    const SHELL_ONLY: &str = "allow_tools = [\"shell\"]\n[[tools]]\nname = \"shell\"\ncommand = \"bash\"\ninteractive_shell = true\n";
 
     fn launch_of(dispatch: Dispatch) -> (Box<run::Args>, Vec<String>) {
         match dispatch {
@@ -2000,7 +2001,7 @@ mod tests {
             env.remove_var(name);
         }
         let report = report_from(
-            "[[tools]]\nname = \"claude\"\ncommand = \"claude\"\ncredentials = [\"anthropic\"]\n",
+            "allow_tools = [\"claude\"]\n[[tools]]\nname = \"claude\"\ncommand = \"claude\"\ncredentials = [\"anthropic\"]\n",
         );
         let catalog = report.into_launch_catalog().unwrap();
         let command = build_command(&Catalog::Ready(catalog));
@@ -2026,7 +2027,7 @@ mod tests {
         let project = dir.path().join("config.toml");
         std::fs::write(
             &project,
-            "image = \"localhost:1/p:latest\"\n[[tools]]\nname = \"t\"\ncommand = \"t\"\n",
+            "image = \"localhost:1/p:latest\"\nallow_tools = [\"t\"]\n[[tools]]\nname = \"t\"\ncommand = \"t\"\n",
         )
         .unwrap();
         let report = crate::config::load(&ConfigPaths::for_test(
@@ -2067,12 +2068,12 @@ mod tests {
         let project = dir.path().join("project.toml");
         std::fs::write(
             &user,
-            "[[tools]]\nname = \"pi\"\ncommand = \"user-pi\"\ncredentials = [\"openai\"]\npersist = [\".user-pi\"]\n",
+            "allow_tools = [\"pi\"]\n[[tools]]\nname = \"pi\"\ncommand = \"user-pi\"\ncredentials = [\"openai\"]\npersist = [\".user-pi\"]\n",
         )
         .unwrap();
         std::fs::write(
             &project,
-            "[[tools]]\nname = \"pi\"\ncommand = \"project-pi\"\n\
+            "allow_tools = [\"helper\"]\n[[tools]]\nname = \"pi\"\ncommand = \"project-pi\"\n\
              credentials = [\"anthropic\", \"project-service\"]\npersist = [\".project-pi\"]\n\
              [[tools]]\nname = \"bridge\"\ncommand = \"bridge\"\ntools = [\"pi\"]\npersist = [\".bridge\"]\n\
              [[tools]]\nname = \"helper\"\ncommand = \"helper\"\ntools = [\"bridge\"]\npersist = [\".helper\"]\n",
@@ -2365,7 +2366,7 @@ mod tests {
         for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
             env.remove_var(name);
         }
-        let body = "[[tools]]\nname = \"mytool\"\ncommand = \"my-agent\"\nargs = [\"--fast\"]\n";
+        let body = "allow_tools = [\"mytool\"]\n[[tools]]\nname = \"mytool\"\ncommand = \"my-agent\"\nargs = [\"--fast\"]\n";
 
         // A launch verb carries the resolved tool and its tool arguments.
         let dispatch = parse_from(["agent-vm", "mytool", "--resume"], Ok(report_from(body)))
@@ -2403,7 +2404,8 @@ mod tests {
         for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
             env.remove_var(name);
         }
-        let body = "[[tools]]\nname = \"t\"\ncommand = \"t\"\ntools = [\"nope\"]\n";
+        let body =
+            "allow_tools = [\"t\"]\n[[tools]]\nname = \"t\"\ncommand = \"t\"\ntools = [\"nope\"]\n";
         // A launch verb reports the config error, never clap's
         // unrecognized-subcommand, exactly like a syntactically broken config.
         let result = parse_from(["agent-vm", "t"], Ok(report_from(body)));
@@ -2490,9 +2492,10 @@ mod tests {
         ));
     }
 
-    /// ADR-0059: both launch routes carry the user file's own tools, so a CLI
-    /// `tool:NAME` resolves the same way through `run`/`--` as through a catalog
-    /// verb. A broken catalog carries `None` with the rest of the launch state.
+    /// ADR-0059: both launch routes carry the user file's own `[egress_sets]`, so a
+    /// CLI `set:NAME` resolves the same way through `run`/`--` as through a
+    /// catalog verb. A broken catalog carries `None` with the rest of the launch
+    /// state.
     #[test]
     fn parse_from_carries_user_tools_into_a_launch() {
         let _env = clear_launch_env();
@@ -2501,7 +2504,7 @@ mod tests {
         let file = dir.path().join("user.toml");
         std::fs::write(
             &file,
-            "[[tools]]\nname = \"fetcher\"\ncommand = \"fetcher\"\nnetwork_requests = [\"a.example\"]\n",
+            "allow_tools = [\"fetcher\"]\n[[tools]]\nname = \"fetcher\"\ncommand = \"fetcher\"\nnetwork_requests = [\"a.example\"]\n",
         )
         .unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -2589,7 +2592,7 @@ mod tests {
         // deferred-error path (not selection) is what a broken config reports.
         std::fs::write(
             &file,
-            "mounts = [\"/ref:ro\"]\n[[tools]]\nname = \"t\"\ncommand = \"t\"\ntools = [\"nope\"]\n",
+            "mounts = [\"/ref:ro\"]\nallow_tools = [\"t\"]\n[[tools]]\nname = \"t\"\ncommand = \"t\"\ntools = [\"nope\"]\n",
         )
         .unwrap();
         let error = parse_from(["agent-vm", "shell"], load())
@@ -2676,7 +2679,7 @@ mod tests {
         let file = dir.path().join("user.toml");
         std::fs::write(
             &file,
-            "[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = [\"/a:/g:ro\"]\n",
+            "allow_tools = [\"t\"]\n[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = [\"/a:/g:ro\"]\n",
         )
         .unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -3714,7 +3717,7 @@ mod tests {
         let project = dir.path().join("config.toml");
         std::fs::write(
             &project,
-            "[[tools]]\nname = \"image\"\ncommand = \"build\"\n",
+            "allow_tools = [\"image\"]\n[[tools]]\nname = \"image\"\ncommand = \"build\"\n",
         )
         .unwrap();
         let error = crate::config::load(&ConfigPaths::for_test(
@@ -3845,7 +3848,9 @@ mod tests {
             env.remove_var(name);
         }
         for name in ["pull", "upgrade", "refresh"] {
-            let config = format!("[[tools]]\nname = {name:?}\ncommand = \"probe\"\n");
+            let config = format!(
+                "allow_tools = [{name:?}]\n[[tools]]\nname = {name:?}\ncommand = \"probe\"\n"
+            );
             let (_, forwarded) = launch_of(
                 parse_from(
                     ["agent-vm", name, "--image", "tool-value", "--help", "--"],

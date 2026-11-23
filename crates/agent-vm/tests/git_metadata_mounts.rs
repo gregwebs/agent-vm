@@ -281,7 +281,10 @@ impl Harness {
     }
 
     fn write_project(&self, contents: &str) {
-        write_file(&self.project_config(), contents);
+        write_file(
+            &self.project_config(),
+            &support::authorized_tools_beside(contents, &self.user_config()),
+        );
     }
 
     fn user_config(&self) -> PathBuf {
@@ -292,7 +295,7 @@ impl Harness {
     fn write_user(&self, contents: &str) {
         use std::os::unix::fs::PermissionsExt;
         let path = self.user_config();
-        write_file(&path, contents);
+        write_file(&path, &support::authorized_tools(contents, &[]));
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::set_permissions(
             path.parent().unwrap(),

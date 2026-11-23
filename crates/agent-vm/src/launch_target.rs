@@ -63,9 +63,19 @@ impl LaunchTarget {
                     // lowering must not re-resolve, re-parse or copy declarations.
                     mounts: entry.mounts().clone(),
                     guest_env: tool.guest_env().clone(),
-                    requests: Some(DeclaredRequests {
-                        requests: tool.network_requests().clone(),
-                        tier: RequestTier::from(tool.origin()),
+                    // #735: authorization is what makes a tool's own
+                    // `network_requests` authoritative egress. The compiled-in
+                    // defaults keep ADR-0039's non-authoritative report.
+                    tool_egress: Some(if entry.is_authorized_egress() {
+                        ToolEgress::Authorized {
+                            tool_name: tool.name().to_owned(),
+                            requests: tool.network_requests().clone(),
+                        }
+                    } else {
+                        ToolEgress::UnmetOnly {
+                            tier: RequestTier::from(tool.origin()),
+                            requests: tool.network_requests().clone(),
+                        }
                     }),
                 };
                 let invocation = GuestInvocation {
@@ -83,9 +93,49 @@ impl LaunchTarget {
     }
 }
 
-pub(crate) struct DeclaredRequests {
-    pub(crate) requests: NetworkRequests,
-    pub(crate) tier: RequestTier,
+/// What a launched tool's own `network_requests` are, per #735's two cases.
+///
+/// The distinction is authority, not shape: an **authorized** tool's requests are
+/// granted as exact `tcp://HOST:PORT` allowances on this launch, while a
+/// compiled-in default's stay metadata under ADR-0036 default-deny and the
+/// ADR-0039 unmet report. A named enum rather than a boolean beside the requests,
+/// so a call site cannot grant without knowing which case it is in.
+pub(crate) enum ToolEgress {
+    /// Selected by an `allow_tools` entry (or a `:trust` inheritance): its own
+    /// `network_requests` become hostname allowances for this launch.
+    Authorized {
+        tool_name: String,
+        requests: NetworkRequests,
+    },
+    /// Compiled-in defaults: non-authoritative, reported as unmet.
+    UnmetOnly {
+        tier: RequestTier,
+        requests: NetworkRequests,
+    },
+}
+
+impl ToolEgress {
+    /// The authorized form, as the egress authority's borrowed view.
+    pub(crate) fn authorized(&self) -> Option<crate::egress_policy::AuthorizedToolEgress<'_>> {
+        match self {
+            Self::Authorized {
+                tool_name,
+                requests,
+            } => Some(crate::egress_policy::AuthorizedToolEgress {
+                tool_name,
+                requests,
+            }),
+            Self::UnmetOnly { .. } => None,
+        }
+    }
+
+    /// The ADR-0039 report's inputs, for the non-authoritative case only.
+    pub(crate) fn unmet(&self) -> Option<(&NetworkRequests, RequestTier)> {
+        match self {
+            Self::Authorized { .. } => None,
+            Self::UnmetOnly { tier, requests } => Some((requests, *tier)),
+        }
+    }
 }
 
 /// Only the catalog facts already consumed by the shared launch pipeline.
@@ -98,7 +148,7 @@ pub(crate) struct CatalogGrant {
     /// `--mount` selections from the shared pipeline.
     mounts: ResolvedMountList,
     guest_env: BTreeMap<String, String>,
-    requests: Option<DeclaredRequests>,
+    tool_egress: Option<ToolEgress>,
 }
 
 impl CatalogGrant {
@@ -109,7 +159,7 @@ impl CatalogGrant {
             persist: Vec::new(),
             mounts: ResolvedMountList::empty(),
             guest_env: BTreeMap::new(),
-            requests: None,
+            tool_egress: None,
         }
     }
     pub(crate) fn provisioned(&self) -> ProviderSet {
@@ -127,8 +177,16 @@ impl CatalogGrant {
     pub(crate) fn guest_env(&self) -> &BTreeMap<String, String> {
         &self.guest_env
     }
-    pub(crate) fn requests(&self) -> Option<&DeclaredRequests> {
-        self.requests.as_ref()
+    pub(crate) fn tool_egress(&self) -> Option<&ToolEgress> {
+        self.tool_egress.as_ref()
+    }
+
+    /// The authorized-tool view the egress plan takes: `None` for a direct launch
+    /// and for the compiled-in defaults.
+    pub(crate) fn authorized_tool_egress(
+        &self,
+    ) -> Option<crate::egress_policy::AuthorizedToolEgress<'_>> {
+        self.tool_egress.as_ref().and_then(ToolEgress::authorized)
     }
 }
 
@@ -219,7 +277,7 @@ mod tests {
         assert!(grant.persist().is_empty());
         assert!(grant.mounts().is_empty());
         assert!(grant.guest_env().is_empty());
-        assert!(grant.requests().is_none());
+        assert!(grant.tool_egress().is_none());
         assert_eq!(invocation.program(), "claude");
         assert_eq!(invocation.argv(), ["x", "x", ""]);
         assert_eq!(invocation.guard(), ProgramGuard::Direct);
@@ -243,7 +301,11 @@ mod tests {
         let user_dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(user_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let user = user_dir.path().join("config.toml");
-        std::fs::write(&user, body).unwrap();
+        std::fs::write(
+            &user,
+            crate::config::test_support::authorized_fixture(body, &[]),
+        )
+        .unwrap();
         std::fs::set_permissions(&user, std::fs::Permissions::from_mode(0o600)).unwrap();
         let project_dir = tempfile::tempdir().unwrap();
         let report = crate::config::load(&crate::config::ConfigPaths::for_test(
@@ -327,7 +389,7 @@ mod tests {
                 "argv stays literal: a suffix terminal flag is the guest's argument"
             );
             assert_eq!(grant.provisioned().iter().count(), 0);
-            assert!(grant.requests().is_none());
+            assert!(grant.tool_egress().is_none());
             assert!(grant.guest_env().is_empty());
         }
     }
@@ -364,8 +426,17 @@ mod tests {
             assert_eq!(grant.persist(), persist);
             assert_eq!(grant.mounts(), &mounts);
             assert_eq!(grant.guest_env(), &env);
-            assert_eq!(grant.requests().unwrap().requests, requests);
-            assert_eq!(grant.requests().unwrap().tier, tier);
+            // The shipped catalog is the compiled-in defaults, so its requests
+            // stay non-authoritative metadata (ADR-0036/ADR-0039).
+            let ToolEgress::UnmetOnly {
+                requests: granted,
+                tier: granted_tier,
+            } = grant.tool_egress().expect("shipped tools declare requests")
+            else {
+                panic!("a compiled-in default must never be authorized egress")
+            };
+            assert_eq!(*granted, requests);
+            assert_eq!(*granted_tier, tier);
             assert_eq!(invocation.program(), command);
             assert_eq!(invocation.argv(), argv);
             assert_eq!(invocation.guard(), ProgramGuard::ImageContract);
@@ -375,6 +446,123 @@ mod tests {
                 "a catalog launch carries no terminal mode; its selection stays legacy"
             );
         }
+    }
+
+    /// V25(e), R5: lowering an authorized **source** entry carries every one of
+    /// its own and closure facets, and its requests arrive as `Authorized` egress
+    /// rather than the ADR-0039 metadata a compiled-in default keeps.
+    #[test]
+    fn authorized_source_entry_lowers_every_own_and_closure_facet() {
+        use crate::credential_provider::CredentialProvider;
+        use std::os::unix::fs::PermissionsExt;
+        // The project store and a checkout, the shape ADR-0073/ADR-0074 require.
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().canonicalize().unwrap();
+        let home = base.join("home");
+        let checkout = base.join("checkout");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::create_dir_all(checkout.join(".agent-vm")).unwrap();
+        let project =
+            crate::project::ProjectDir::from_path_for_tests(&checkout).expect("a project root");
+        let config = crate::project_config::path(&home, &project);
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::set_permissions(
+            config.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        std::fs::write(
+            checkout.join(".agent-vm/config.toml"),
+            "[[tools]]\nname = \"app\"\ncommand = \"/bin/echo\"\nargs = [\"--own-arg\"]\n\
+             env = { APP_OWN = \"own-sentinel\" }\ncredentials = [\"openai\"]\n\
+             persist = [\".app-own\"]\nmounts = [\"/app:/app:ro\"]\n\
+             network_requests = [\"app.example\", \"app.example:8443\"]\ntools = [\"helper\"]\n\
+             [[tools]]\nname = \"helper\"\ncommand = \"/bin/echo\"\n\
+             env = { HELPER_ENV = \"helper-sentinel\" }\ncredentials = [\"anthropic\"]\n\
+             persist = [\".helper\"]\nmounts = [\"/helper:/helper:ro\"]\n\
+             network_requests = [\"helper.example\"]\ntools = []\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &config,
+            "sources = [\"repo ./.agent-vm/config.toml\"]\n\
+             allow_tools = [\"repo:app\", \"repo:helper\"]\n",
+        )
+        .unwrap();
+        let report = crate::config::load(&crate::config::ConfigPaths::for_test_captured(
+            home.clone(),
+            &project,
+        ))
+        .expect("the project config loads");
+        let mut catalog = report.into_launch_catalog().expect("catalog");
+        let entry = catalog.take_entry("app").expect("app is a verb");
+        let tool_args = vec!["x".to_owned(), "y".to_owned()];
+        let expected_argv = crate::run::inner_argv(entry.tool(), tool_args.clone());
+        let target = LaunchTarget::Tool {
+            entry: Box::new(entry),
+            tool_args: tool_args.clone(),
+        };
+        let (grant, invocation) = target.into_parts();
+        assert_eq!(
+            grant.provisioned().iter().collect::<Vec<_>>(),
+            [CredentialProvider::Anthropic, CredentialProvider::OpenAi],
+            "the closure's providers, in fold order"
+        );
+        assert_eq!(
+            grant.required().iter().collect::<Vec<_>>(),
+            [CredentialProvider::OpenAi]
+        );
+        assert_eq!(
+            grant
+                .persist()
+                .iter()
+                .map(|path| path.as_path().display().to_string())
+                .collect::<Vec<_>>(),
+            [".app-own", ".helper"]
+        );
+        assert_eq!(
+            grant
+                .mounts()
+                .requests()
+                .map(|request| request.mount.guest.display().to_string())
+                .collect::<Vec<_>>(),
+            ["/app", "/helper"]
+        );
+        assert_eq!(
+            grant
+                .guest_env()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["APP_OWN"],
+            "own env only, never the closure's"
+        );
+        let ToolEgress::Authorized {
+            tool_name,
+            requests,
+        } = grant.tool_egress().expect("an authorized tool has egress")
+        else {
+            panic!("a source authorization must lower as Authorized")
+        };
+        assert_eq!(tool_name, "app");
+        assert_eq!(
+            requests.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ["app.example", "tcp://app.example:8443"]
+        );
+        assert_eq!(invocation.program(), "/bin/echo");
+        assert_eq!(invocation.argv(), expected_argv);
+        assert_eq!(invocation.argv(), ["--own-arg", "x", "y"]);
+        assert_eq!(invocation.guard(), ProgramGuard::ImageContract);
+        // A direct launch of the same program carries no tool egress at all.
+        let command =
+            DirectCommand::from_os_args(vec!["/bin/echo".into(), "x".into()]).expect("a program");
+        let (grant, _) = LaunchTarget::Direct {
+            command,
+            terminal: crate::direct_terminal::DirectIo::Stream,
+        }
+        .into_parts();
+        assert!(grant.tool_egress().is_none());
     }
 }
 

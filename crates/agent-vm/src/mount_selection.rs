@@ -127,8 +127,19 @@ pub(crate) struct AutomaticMounts<'a> {
 #[derive(Debug)]
 enum ConfigUse {
     NotDeclared,
-    Selected { file: PathBuf, count: usize },
-    Skipped { file: PathBuf, count: usize },
+    /// The config file(s) that supplied what was selected, deduplicated in
+    /// first-seen order: the user defaults file when it declared defaults, then
+    /// the file that declared the launched tool's own list when it is distinct
+    /// (#735). One path is the shipped shape; two arise when a tool comes from a
+    /// project config or a source while the defaults come from the user file.
+    Selected {
+        files: Vec<PathBuf>,
+        count: usize,
+    },
+    Skipped {
+        files: Vec<PathBuf>,
+        count: usize,
+    },
 }
 
 /// Collect this launch's declarations: config defaults, then the launched tool's
@@ -158,26 +169,24 @@ pub(crate) fn select(
         suppressed: policy.suppressed(),
     });
     let count = automatic_unique_guest_count(user, tool);
-    let (config, automatic_requests) = match user {
-        Some(_) if !declared => (ConfigUse::NotDeclared, Vec::new()),
-        Some(user) if selected => (
+    let (config, automatic_requests) = if !declared {
+        (ConfigUse::NotDeclared, Vec::new())
+    } else if selected {
+        (
             ConfigUse::Selected {
-                file: user.file().to_path_buf(),
+                files: automatic_files(user, tool),
                 count,
             },
             materialize(user, tool),
-        ),
-        Some(user) => (
+        )
+    } else {
+        (
             ConfigUse::Skipped {
-                file: user.file().to_path_buf(),
+                files: automatic_files(user, tool),
                 count,
             },
             Vec::new(),
-        ),
-        // A tool facet without a verified user model is unreachable: only the
-        // verified user file can declare one. Naming it rather than folding it
-        // keeps a future construction bug fail-closed.
-        None => (ConfigUse::NotDeclared, Vec::new()),
+        )
     };
     let mut requests: Vec<MountRequest> = automatic_requests;
     let mut explicit_sets = None;
@@ -203,7 +212,7 @@ pub(crate) fn select(
         }
     }
     let sources = crate::mount_section::MountSources::new(
-        config_file(&config),
+        config_files(&config),
         contributing_sets(&requests),
         !cli.is_empty(),
         skipped_count(&config),
@@ -236,13 +245,36 @@ fn automatic_unique_guest_count(user: Option<&UserMounts>, tool: &ResolvedMountL
     guests.len()
 }
 
-/// The verified file the mount section names, when the config contributed or
+/// The verified file(s) the mount section names, when the config contributed or
 /// withheld declarations.
-fn config_file(config: &ConfigUse) -> Option<PathBuf> {
+fn config_files(config: &ConfigUse) -> Vec<PathBuf> {
     match config {
-        ConfigUse::NotDeclared => None,
-        ConfigUse::Selected { file, .. } | ConfigUse::Skipped { file, .. } => Some(file.clone()),
+        ConfigUse::NotDeclared => Vec::new(),
+        ConfigUse::Selected { files, .. } | ConfigUse::Skipped { files, .. } => files.clone(),
     }
+}
+
+/// The file(s) an automatic selection came from, deduplicated in first-seen
+/// order.
+///
+/// The user defaults file first, when it declared defaults, then the file that
+/// declared the launched tool's own list when it is a different one. A tool's
+/// list may live in a project config or a sourced file (#735), and those are
+/// exactly the cases where `user` is `None` and the tool facet is still non-empty
+/// — the case the pre-#735 selector silently dropped.
+fn automatic_files(user: Option<&UserMounts>, tool: &ResolvedMountList) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    if let Some(user) = user.filter(|user| user.has_defaults()) {
+        files.push(user.file().to_path_buf());
+    }
+    if let Some(file) = tool
+        .requests()
+        .find_map(|request| request.origin.config_file())
+        && !files.iter().any(|seen| seen == file)
+    {
+        files.push(file.to_path_buf());
+    }
+    files
 }
 
 /// The `[mount_sets]` names that supplied at least one of this launch's
@@ -282,9 +314,9 @@ fn skipped_count(config: &ConfigUse) -> Option<usize> {
 /// handles, and only `mount::prepare` (`via `Selection::take_requests`) needs owned
 /// values. Nothing is deduplicated here — that is the shared claim's job, and a
 /// second merge rule here could disagree with it.
-fn materialize(user: &UserMounts, tool: &ResolvedMountList) -> Vec<MountRequest> {
+fn materialize(user: Option<&UserMounts>, tool: &ResolvedMountList) -> Vec<MountRequest> {
     let mut requests = Vec::new();
-    if let Some(defaults) = user.defaults() {
+    if let Some(defaults) = user.and_then(UserMounts::defaults) {
         requests.extend(defaults.requests().cloned());
     }
     requests.extend(tool.requests().cloned());
@@ -356,14 +388,14 @@ impl Selection {
             ConfigUse::Selected { count, .. } if *count > 0
         );
         match (&self.config, &self.explicit_sets) {
-            (ConfigUse::Selected { file, .. }, Some(_)) if selected_automatic => format!(
+            (ConfigUse::Selected { files, .. }, Some(_)) if selected_automatic => format!(
                 "preparing mounts (including mounts and explicitly selected mount sets from {}; \
                  --no-config-mounts skips only the mounts)",
-                crate::one_line::quoted_path(file)
+                crate::one_line::quoted_paths(files)
             ),
-            (ConfigUse::Selected { file, count }, _) if *count > 0 => format!(
+            (ConfigUse::Selected { files, count }, _) if *count > 0 => format!(
                 "preparing mounts (including mounts from {}; --no-config-mounts skips them)",
-                crate::one_line::quoted_path(file)
+                crate::one_line::quoted_paths(files)
             ),
             (_, Some(file)) => format!(
                 "preparing mounts (including mount sets from {}; explicitly selected sets are \
@@ -379,7 +411,7 @@ impl Selection {
 mod tests {
     use super::*;
     use crate::config_authority::{self, AuthorityTriggers, verify};
-    use crate::config_mounts::{MountValues, from_verified_value};
+    use crate::config_mounts::{MountValues, from_verified_value_fresh};
     use crate::host_paths::read_bounded_regular_file_noting_symlink;
     use crate::mount::{MountOrigin, Spelling};
     use std::{fs, os::unix::fs::PermissionsExt, path::Path};
@@ -426,12 +458,13 @@ mod tests {
                 ),
                 mount_sets: table.get("mount_sets").is_some(),
                 egress_sets: table.get("egress_sets").is_some(),
+                allow_tools: false,
             },
         )
         .unwrap()
         .authorized
         .expect("a present mount field is authority-bearing");
-        from_verified_value(
+        from_verified_value_fresh(
             &authorized,
             MountValues {
                 defaults: table.get("mounts"),
@@ -590,7 +623,7 @@ mod tests {
                     Spelling::new("/s")
                 ),
                 (
-                    MountOrigin::UserTool {
+                    MountOrigin::Tool {
                         file: user.file().to_path_buf(),
                         declaration: 0,
                         index: 1

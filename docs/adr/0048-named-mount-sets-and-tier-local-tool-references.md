@@ -15,6 +15,13 @@ this ADR: the #397 rows (CM-S1–S4, with the ten #394 rows), and a later run of
 The two runs share no row and neither is rewritten to claim the other's scope; see
 [Native evidence](#native-evidence).
 
+**Amended by [ADR-0075](0075-explicit-tool-authorization.md)**: "tier-local tool
+reference scope" survives unchanged as a *resolution* rule, but a tool is a
+launch verb only when `allow_tools` authorizes it, and an authorized tool's
+`mounts` activates from any tier — so a launch's mount sources may be two files
+(the defaults file and the tool's declaring file). `MountOrigin::UserTool` is now
+`MountOrigin::Tool`.
+
 **Implemented:**
 
 - **Tier-local tool reference scopes** ([#395](https://github.com/gregwebs/agent-vm/issues/395)):

@@ -425,7 +425,10 @@ impl Harness {
     }
 
     fn write_user(&self, contents: &str) {
-        write(&self.user_config(), contents);
+        write(
+            &self.user_config(),
+            &support::authorized_tools(contents, &[]),
+        );
     }
 
     fn write_user_mode(&self, contents: &str, mode: u32) {
@@ -445,7 +448,10 @@ impl Harness {
     }
 
     fn write_project(&self, contents: &str) {
-        write(&self.project_config(), contents);
+        write(
+            &self.project_config(),
+            &support::authorized_tools_beside(contents, &self.user_config()),
+        );
     }
 
     /// Launch `tool` against the bogus image with the given launch options.
@@ -7596,11 +7602,19 @@ fn request_block(stderr: &str) -> Vec<&str> {
 }
 #[test]
 fn requests_unmet_launch_continues_and_proxy_order() {
+    // The ADR-0039 unmet report now belongs to the compiled-in defaults alone
+    // (#735): an authorized tool's requests are granted, so only a shipped tool
+    // can leave declarations unmatched. `claude`'s three shipped requests are
+    // the fixture; the launch still continues.
+    const UNMET: [&str; 3] = [
+        "api.anthropic.com",
+        "mcp-proxy.anthropic.com",
+        "platform.claude.com",
+    ];
     for proxy in [false, true] {
         let h = Harness::warm();
-        h.write_project(&format!("{FETCHER}{FETCH_REQUESTS}"));
         let out = h.launch_with_env(
-            "fetcher",
+            "claude",
             &[],
             if proxy {
                 &[("HTTPS_PROXY", "http://127.0.0.1:9")]
@@ -7610,19 +7624,16 @@ fn requests_unmet_launch_continues_and_proxy_order() {
         );
         let stderr = stderr_of(&out);
         assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
-        let expected = vec![
-            format!(
-                "==> Tool network requests (project config): 2 of 2 not covered by this launch's {REQUEST_SCOPE}; requests never grant access and the launch continues"
-            ),
-            "==>   unmet: api.example.com".into(),
-            "==>   unmet: tcp://git.corp.example:8443".into(),
-            REQUEST_HINT.into(),
-        ];
+        let mut expected = vec![format!(
+            "==> Tool network requests (built-in defaults): 3 of 3 not covered by this launch's {REQUEST_SCOPE}; requests never grant access and the launch continues"
+        )];
+        expected.extend(UNMET.map(|name| format!("==>   unmet: {name}")));
+        expected.push(REQUEST_HINT.into());
         assert_eq!(request_block(&stderr), expected);
         let start = stderr.find("==> Egress policy:").unwrap();
         let lines: Vec<_> = stderr[start..]
             .lines()
-            .take(if proxy { 7 } else { 6 })
+            .take(if proxy { 3 + 5 } else { 2 + 5 })
             .collect();
         assert_eq!(
             lines[0],
@@ -7636,10 +7647,13 @@ fn requests_unmet_launch_continues_and_proxy_order() {
             assert!(lines[2].starts_with("==> Guest egress proxy:"));
         }
         assert_eq!(&lines[if proxy { 3 } else { 2 }..], expected);
-        assert_default_deny_zero_provision_network(
-            &debug_config_json(&stderr)["network"],
-            "requests",
-            proxy,
+        // V10: the compiled-in defaults keep ADR-0036 default-deny. Their
+        // requests are reported, never granted, so the policy carries no rule.
+        let network = debug_config_json(&stderr)["network"].clone();
+        assert_eq!(
+            network["policy"],
+            default_deny_policy(),
+            "requests must never grant authority to a compiled-in default"
         );
         assert_eq!(
             stderr
@@ -7648,34 +7662,46 @@ fn requests_unmet_launch_continues_and_proxy_order() {
                 .count(),
             1
         );
-        assert_eq!(stderr.lines().filter(|l| l.contains("unmet:")).count(), 2);
+        assert_eq!(stderr.lines().filter(|l| l.contains("unmet:")).count(), 3);
     }
 }
+/// #735: an **authorized** user tool's own requests are granted by that
+/// authorization, so the ADR-0039 report is not printed at all — whatever the
+/// flags add. The unmet polarity is pinned against the shipped defaults in
+/// `requests_unmet_launch_continues_and_proxy_order`.
 #[test]
-fn requests_user_partial_and_public_coverage() {
+fn requests_of_an_authorized_tool_are_granted_and_unreported() {
     let h = Harness::warm();
-    h.write_user(&format!("{FETCHER}{FETCH_REQUESTS}"));
-    for (flags, unmet) in [
-        (vec!["--allow-egress", "api.example.com"], true),
-        (vec!["--allow-internet-egress"], false),
+    h.write_user(&format!(
+        "allow_tools = [\"fetcher\"]\n{FETCHER}{FETCH_REQUESTS}"
+    ));
+    for flags in [
+        vec![],
+        vec!["--allow-egress", "api.example.com"],
+        vec!["--allow-internet-egress"],
     ] {
-        let stderr = stderr_of(&h.launch("fetcher", &flags));
-        assert!(stderr.contains(CONFIG_MARKER));
-        let expected = if unmet {
-            vec![
-                format!(
-                    "==> Tool network requests (user config): 1 of 2 not covered by this launch's {REQUEST_SCOPE}; requests never grant access and the launch continues"
-                ),
-                "==>   unmet: tcp://git.corp.example:8443".into(),
-                REQUEST_HINT.into(),
-            ]
-        } else {
-            vec![format!(
-                "==> Tool network requests (user config): all 2 covered by this launch's {REQUEST_SCOPE}; requests never grant access"
-            )]
-        };
-        assert_eq!(request_block(&stderr), expected);
-        assert_eq!(stderr.matches("unmet:").count(), usize::from(unmet));
+        let out = h.launch("fetcher", &flags);
+        let stderr = stderr_of(&out);
+        assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+        assert!(
+            request_block(&stderr).is_empty(),
+            "{flags:?}: a granted request is never reported: {stderr}"
+        );
+        // The grant is real authority, not just a report: both requests reach
+        // policy even when no flag names them. A bare name widens to every
+        // intercepted port, so the flagless launch is the one that pins ports.
+        let rules = domain_rules_of(&normalized_config(&h, &out));
+        let names: Vec<&str> = rules.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["api.example.com", "git.corp.example"], "{flags:?}");
+        if flags.is_empty() {
+            assert_eq!(
+                rules,
+                [
+                    ("api.example.com".to_owned(), vec![443]),
+                    ("git.corp.example".to_owned(), vec![8443]),
+                ]
+            );
+        }
     }
 }
 #[test]
@@ -7742,19 +7768,29 @@ fn requests_rejected_before_state_both_tiers() {
 }
 #[test]
 fn requests_report_cap_network_refusal_and_own_tool_only() {
+    // The cap applies to the unmet list, and after #735 only the shipped
+    // defaults can leave requests unmet. `pi` ships ten, so the eighth is the
+    // last shown and the remainder is one counted line.
     let h = Harness::warm();
-    let names: Vec<_> = (0..64).map(|i| format!("\"n{i:02}.example\"")).collect();
-    h.write_project(&format!(
-        "{FETCHER}network_requests = [{}]\n",
-        names.join(",")
-    ));
-    let stderr = stderr_of(&h.launch("fetcher", &[]));
+    let stderr = stderr_of(&h.launch("pi", &[]));
     assert!(stderr.contains(CONFIG_MARKER));
     let mut expected = vec![format!(
-        "==> Tool network requests (project config): 64 of 64 not covered by this launch's {REQUEST_SCOPE}; requests never grant access and the launch continues"
+        "==> Tool network requests (built-in defaults): 10 of 10 not covered by this launch's {REQUEST_SCOPE}; requests never grant access and the launch continues"
     )];
-    expected.extend((0..8).map(|i| format!("==>   unmet: n{i:02}.example")));
-    expected.push("==>   … and 56 more not shown".into());
+    expected.extend(
+        [
+            "api.anthropic.com",
+            "auth.openai.com",
+            "chatgpt.com",
+            "cloudcode-pa.googleapis.com",
+            "daily-cloudcode-pa.googleapis.com",
+            "daily-cloudcode-pa.sandbox.googleapis.com",
+            "mcp-proxy.anthropic.com",
+            "oauth2.googleapis.com",
+        ]
+        .map(|name| format!("==>   unmet: {name}")),
+    );
+    expected.push("==>   … and 2 more not shown".into());
     expected.push(REQUEST_HINT.into());
     assert_eq!(request_block(&stderr), expected);
     assert_eq!(stderr.matches("unmet:").count(), 8);
@@ -7767,11 +7803,25 @@ fn requests_report_cap_network_refusal_and_own_tool_only() {
         "{stderr}"
     );
     assert!(!stderr.contains(CONFIG_MARKER) && request_block(&stderr).is_empty());
+    // V10, third clause: an authorized `shell` reaching every tool through its
+    // default `tools = ["*"]` still reports only its *own* requests, so its
+    // report is empty while its sibling `a`'s is not.
     let h = Harness::warm();
-    h.write_user("[[tools]]\nname = \"a\"\ncommand = \"a\"\nnetwork_requests = [\"a.example\"]\n[[tools]]\nname = \"shell\"\ncommand = \"bash\"\n");
-    let stderr = stderr_of(&h.launch("shell", &[]));
+    h.write_user(
+        "allow_tools = [\"a\", \"shell\"]\n\
+         [[tools]]\nname = \"a\"\ncommand = \"a\"\nnetwork_requests = [\"a.example\"]\n\
+         [[tools]]\nname = \"shell\"\ncommand = \"bash\"\ntools = [\"*\"]\n",
+    );
+    let out = h.launch("shell", &[]);
+    let stderr = stderr_of(&out);
     assert!(stderr.contains(CONFIG_MARKER));
     assert!(request_block(&stderr).is_empty());
+    assert!(
+        !domain_rules_of(&normalized_config(&h, &out))
+            .iter()
+            .any(|(name, _)| name == "a.example"),
+        "a wildcard closure must not fold a sibling's requests"
+    );
 }
 #[test]
 fn requests_runtime_input_noninterference() {
@@ -7833,20 +7883,22 @@ fn requests_runtime_input_noninterference() {
                         state["codex/auth.json"].starts_with("absent"),
                         "the discarded project definition must not write Codex state"
                     );
-                    // The report must come from the winning user definition, so
-                    // request reporting and the credential overlay are
-                    // exercised in the same launch.
-                    let block = request_block(&stderr);
-                    if with {
-                        assert!(
-                            block.first().is_some_and(
-                                |line| line.contains("Tool network requests (user config)")
-                            ),
-                            "the winning user definition's requests must be reported: {block:?}"
-                        );
-                    } else {
-                        assert!(block.is_empty(), "no requests declared: {block:?}");
-                    }
+                    // The grants must come from the winning user definition, so
+                    // request granting and the credential overlay are exercised
+                    // in the same launch. An authorized tool's requests are
+                    // granted, so the ADR-0039 report is not printed at all.
+                    assert!(
+                        request_block(&stderr).is_empty(),
+                        "a granted request is never reported: {stderr}"
+                    );
+                    // `other.example` is a request and never a flag, so its
+                    // presence is exactly the winning definition's grant.
+                    let granted = domain_rules_of(&config);
+                    assert_eq!(
+                        granted.iter().any(|(name, _)| name == "other.example"),
+                        with,
+                        "the winning user definition's requests must be granted: {granted:?}"
+                    );
                 }
                 let notices: Vec<String> = stderr
                     .lines()
@@ -7857,15 +7909,77 @@ fn requests_runtime_input_noninterference() {
                     .collect();
                 captures.push((config, state, notices));
             }
+            // #735: an authorized tool's requests are granted, so the rule list
+            // is the one thing they may change. Everything else — TLS ports,
+            // DNS, default-deny, provisioning, state, and the non-hostname
+            // notices — must be identical, and every rule the flags alone grant
+            // must survive.
+            //
             // Compare without rendering the observed values: the state snapshot
             // holds raw credential-file bytes, so a failure message would be a
             // cleartext log of them. Name only what changed.
             let (config_a, state_a, notices_a) = &captures[0];
             let (config_b, state_b, notices_b) = &captures[1];
-            assert!(
-                config_a == config_b,
-                "tier {tier} flags {flags:?}: requests changed the normalized config"
+            let network_without_rules = |config: &serde_json::Value| {
+                let mut stripped = config.clone();
+                stripped["network"]["policy"]["rules"] = serde_json::json!([]);
+                stripped["network"]["tls"]["intercepted_ports"] = serde_json::json!([]);
+                stripped["network"]["tls"]["enabled"] = serde_json::json!(false);
+                stripped
+            };
+            assert_eq!(
+                network_without_rules(config_a),
+                network_without_rules(config_b),
+                "tier {tier} flags {flags:?}: requests changed the normalized config beyond the grants"
             );
+            let rules_a = config_a["network"]["policy"]["rules"]
+                .as_array()
+                .unwrap()
+                .clone();
+            let rules_b = config_b["network"]["policy"]["rules"]
+                .as_array()
+                .unwrap()
+                .clone();
+            // A rule may merge with (and so be widened by) the tool's own grant
+            // for the same destination, so compare destinations and require the
+            // flag's ports to survive inside the merged rule.
+            let rules_for = |rules: &Vec<serde_json::Value>,
+                             rule: &serde_json::Value|
+             -> Vec<serde_json::Value> {
+                rules
+                    .iter()
+                    .filter(|candidate| candidate["destination"] == rule["destination"])
+                    .cloned()
+                    .collect()
+            };
+            for rule in &rules_a {
+                let merged = rules_for(&rules_b, rule);
+                assert!(
+                    !merged.is_empty(),
+                    "tier {tier} flags {flags:?}: the flags' own destination was lost: {rule}"
+                );
+                for port in rule["ports"].as_array().unwrap() {
+                    assert!(
+                        merged
+                            .iter()
+                            .any(|candidate| candidate["ports"].as_array().unwrap().contains(port)),
+                        "tier {tier} flags {flags:?}: the flags' own port was lost: {rule}"
+                    );
+                }
+            }
+            let requested = ["api.example.com", "git.corp.example", "other.example"];
+            for rule in &rules_b {
+                if !rules_for(&rules_a, rule).is_empty() {
+                    continue;
+                }
+                let domain = rule["destination"]["domain"]
+                    .as_str()
+                    .unwrap_or("a non-hostname grant");
+                assert!(
+                    requested.contains(&domain),
+                    "tier {tier} flags {flags:?}: requests granted more than themselves: {rule}"
+                );
+            }
             if state_a != state_b {
                 let mut keys: Vec<&str> = Vec::new();
                 for key in state_a.keys().chain(state_b.keys()) {
@@ -7875,37 +7989,47 @@ fn requests_runtime_input_noninterference() {
                 }
                 panic!("tier {tier} flags {flags:?}: requests changed state entries {keys:?}");
             }
-            assert_eq!(
-                notices_a, notices_b,
-                "tier {tier} flags {flags:?}: requests changed the egress notices"
-            );
+            // The notices are derived from the authority above, and a request may
+            // only ever name itself: no other hostname may appear on a hostname
+            // line.
+            let requested = ["api.example.com", "git.corp.example", "other.example"];
+            for notices in [notices_a, notices_b] {
+                for line in notices
+                    .iter()
+                    .filter(|line| line.contains("allowing TLS to "))
+                {
+                    for token in line.split_whitespace() {
+                        let mut name = token.trim_matches(|c: char| c == ',' || c == ':');
+                        if !name.contains('.') {
+                            continue;
+                        }
+                        name = name.rsplit_once(':').map_or(name, |(head, _)| head);
+                        name = name.strip_prefix("tcp://").unwrap_or(name);
+                        assert!(
+                            requested.contains(&name),
+                            "tier {tier} flags {flags:?}: a request named or granted \"{name}\": {line}"
+                        );
+                    }
+                }
+            }
         }
     }
 }
 #[test]
-fn requests_numeric_lan_host_stay_unmet_and_port_scope_is_exact() {
-    // Documented false-unmet case: IP/CIDR, --allow-lan and --allow-host are
-    // never matched to names, so the report still calls every request unmet;
-    // the hint line says so explicitly.
-    let expected_block = |tier: &str, total: usize, unmet: &[&str]| -> Vec<String> {
-        if unmet.is_empty() {
-            return vec![format!(
-                "==> Tool network requests ({tier}): all {total} covered by this launch's {REQUEST_SCOPE}; requests never grant access"
-            )];
-        }
-        let mut lines = vec![format!(
-            "==> Tool network requests ({tier}): {} of {total} not covered by this launch's {REQUEST_SCOPE}; requests never grant access and the launch continues",
-            unmet.len()
-        )];
-        lines.extend(unmet.iter().map(|name| format!("==>   unmet: {name}")));
-        lines.push(REQUEST_HINT.into());
-        lines
-    };
-
+fn requests_numeric_lan_host_grants_never_cover_a_name() {
+    // Documented false-unmet case: IP/CIDR, `--allow-lan` and `--allow-host`
+    // are never matched to names, so the report still calls every request unmet;
+    // the hint line says so explicitly. Only the shipped defaults can show it
+    // now (#735).
+    //
+    // The companion port-scope half — a bare grant does not cover an explicit
+    // `tcp://HOST:PORT` request and the explicit grant does not cover the bare
+    // one — is now unit-level, at
+    // `egress_policy::tests::hostname_tests::network_request_coverage_matches_policy_rules`,
+    // because a shipped tool declares no ported request to reach it from here.
     let h = Harness::warm();
-    h.write_project(&format!("{FETCHER}{FETCH_REQUESTS}"));
     let stderr = stderr_of(&h.launch(
-        "fetcher",
+        "claude",
         &[
             "--allow-lan",
             "--allow-host",
@@ -7914,49 +8038,20 @@ fn requests_numeric_lan_host_stay_unmet_and_port_scope_is_exact() {
         ],
     ));
     assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
-    assert_eq!(
-        request_block(&stderr),
-        expected_block(
-            "project config",
-            2,
-            &["api.example.com", "tcp://git.corp.example:8443"]
-        )
+    let mut expected = vec![format!(
+        "==> Tool network requests (built-in defaults): 3 of 3 not covered by this launch's {REQUEST_SCOPE}; requests never grant access and the launch continues"
+    )];
+    expected.extend(
+        [
+            "api.anthropic.com",
+            "mcp-proxy.anthropic.com",
+            "platform.claude.com",
+        ]
+        .map(|name| format!("==>   unmet: {name}")),
     );
-
-    // A same-name allowance covers only the port it names: a bare grant does
-    // not cover the explicit 8443 request, and the explicit grant does not
-    // cover the bare (443) request.
-    let h = Harness::warm();
-    h.write_user(
-        "[[tools]]\nname = \"fetcher\"\ncommand = \"/bin/echo\"\ntools = []\nnetwork_requests = [\"tcp://api.example.com:8443\",\"api.example.com\"]\n",
-    );
-    for (flags, unmet) in [
-        (
-            vec!["--allow-egress", "api.example.com"],
-            vec!["tcp://api.example.com:8443"],
-        ),
-        (
-            vec!["--allow-egress", "tcp://api.example.com:8443"],
-            vec!["api.example.com"],
-        ),
-        (
-            vec![
-                "--allow-egress",
-                "api.example.com",
-                "--allow-egress",
-                "tcp://api.example.com:8443",
-            ],
-            vec![],
-        ),
-    ] {
-        let stderr = stderr_of(&h.launch("fetcher", &flags));
-        assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
-        assert_eq!(
-            request_block(&stderr),
-            expected_block("user config", 2, &unmet)
-        );
-        assert_eq!(stderr.matches("unmet:").count(), unmet.len());
-    }
+    expected.push(REQUEST_HINT.into());
+    assert_eq!(request_block(&stderr), expected);
+    assert_eq!(stderr.matches("unmet:").count(), 3);
 }
 
 const PN_ORACLES: &str =
@@ -8424,13 +8519,17 @@ fn saved_hostname_with_host_proxy_is_refused_before_state() {
     );
 }
 
-/// T7: persisted hostname grants cover requests; detects missing coverage.
+/// T7: a persisted hostname grant and the authorized tool's own request for
+/// the same name collapse to one rule attributed to both tiers, so the report
+/// stays covered and the notice names both sources. The pre-#735 form proved
+/// this by *coverage* of an unmet report; #735 grants the tool's own requests
+/// too, so the surviving evidence is the merged rule and its two-source tag.
 #[test]
-fn saved_hostname_grant_covers_tool_requests() {
+fn saved_hostname_grant_merges_with_the_authorized_tools_request() {
     for saved in [false, true] {
         let h = Harness::warm();
         h.write_project(&format!(
-            "{FETCHER}network_requests = [\"api.example.com\"]\n"
+            "allow_tools = [\"fetcher\"]\n{FETCHER}network_requests = [\"api.example.com\"]\n"
         ));
         if saved {
             h.write_user_mode("[network]\nallow_egress = [\"api.example.com\"]\n", 0o600);
@@ -8438,11 +8537,49 @@ fn saved_hostname_grant_covers_tool_requests() {
         let out = h.launch_default("fetcher");
         let stderr = stderr_of(&out);
         assert!(stderr.contains(CONFIG_MARKER));
-        assert_eq!(stderr.contains("unmet:"), !saved);
-        if saved {
-            assert!(stderr.contains("all 1 covered"), "{stderr}");
-        }
+        assert_eq!(
+            normalized_config(&h, &out)["network"]["policy"]["rules"],
+            serde_json::json!([
+                {"direction":"egress","destination":{"domain":"api.example.com"},"protocols":["tcp"],"ports":[{"start":443,"end":443}],"action":"allow"}
+            ]),
+            "saved {saved}: one rule, whichever tiers grant it"
+        );
+        assert!(
+            !stderr.contains("Tool network requests"),
+            "a granted request is never reported: {stderr}"
+        );
+        let expected_tag = if saved {
+            "==> Egress policy: allowing TLS to api.example.com (persisted grants and tool fetcher)\n"
+        } else {
+            "==> Egress policy: allowing TLS to api.example.com (tool fetcher)\n"
+        };
+        assert!(
+            stderr.contains(expected_tag),
+            "saved {saved}: the tool's grant must be attributed to it: {stderr}"
+        );
     }
+    // With the saved grant, the same launch also names the persisted tier on the
+    // line, so a mutation that dropped reference expansion would lose it.
+    let h = Harness::warm();
+    h.write_project(&format!(
+        "allow_tools = [\"fetcher\"]\n{FETCHER}network_requests = [\"other.example\"]\n"
+    ));
+    h.write_user_mode("[network]\nallow_egress = [\"api.example.com\"]\n", 0o600);
+    let out = h.launch_default("fetcher");
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains(CONFIG_MARKER));
+    assert_eq!(
+        domain_rules_of(&normalized_config(&h, &out)),
+        [
+            ("api.example.com".to_owned(), vec![443]),
+            ("other.example".to_owned(), vec![443]),
+        ],
+        "the persisted grant must still reach the policy: {stderr}"
+    );
+    assert!(
+        stderr.contains("==> Egress policy: allowing TLS to other.example (tool fetcher)\n"),
+        "{stderr}"
+    );
 }
 
 /// T8: credential overlays preserve grants; detects policy replacement.
@@ -8677,11 +8814,16 @@ fn shipped_default_network_requests_partial_and_public_coverage() {
         assert!(text.contains(CONFIG_MARKER));
         assert!(request_block(&text).is_empty());
     }
-    let text = stderr_of(&h.launch_default("other"));
+    // A **project** tool is authorizable (#735), so `other`'s request is now
+    // granted rather than reported unmet — the shipped defaults keep the unmet
+    // report, and everything else grants.
+    let out = h.launch_default("other");
+    let text = stderr_of(&out);
     assert!(text.contains(CONFIG_MARKER));
+    assert!(request_block(&text).is_empty(), "{text}");
     assert_eq!(
-        request_block(&text),
-        shipped_request_block("project config", 1, &["other.example"])
+        domain_rules_of(&normalized_config(&h, &out)),
+        [("other.example".to_owned(), vec![443])]
     );
 }
 
@@ -12180,18 +12322,22 @@ fn a_provisioned_definition_supplies_credentials_and_paths_but_no_metadata() {
         Some("/agent-vm-state/persist/.project-pi")
     );
 
-    // The launched tool's own metadata is published and reported.
+    // The launched tool's own metadata is published and reported. Since #735 its
+    // declared request is also *granted*, so the positive control is the rule it
+    // produced — a stronger observation than the old unmet report.
     let published_env = env_pairs(&config);
     assert!(
         published_env.contains(&("HELPER_OWN_ENV", "present")),
         "{published_env:?}"
     );
-    let requests = request_block(&stderr);
+    assert_eq!(
+        domain_rules_of(&config),
+        [("api.helper-own.example".to_owned(), vec![443])],
+        "the helper's own request is granted, and the referenced tool's is not"
+    );
     assert!(
-        requests
-            .iter()
-            .any(|line| line.contains("api.helper-own.example")),
-        "the helper's own request must still be reported: {requests:?}"
+        request_block(&stderr).is_empty(),
+        "a granted request is never reported: {stderr}"
     );
 
     // The provisioned definition's metadata is not.
@@ -12202,10 +12348,10 @@ fn a_provisioned_definition_supplies_credentials_and_paths_but_no_metadata() {
         "a provisioned definition's env pair must not reach the guest: {published_env:?}"
     );
     assert!(
-        !requests
+        !domain_rules_of(&config)
             .iter()
-            .any(|line| line.contains("api.pi-inherited.example")),
-        "a provisioned definition's network_requests must not be reported: {requests:?}"
+            .any(|(name, _)| name == "api.pi-inherited.example"),
+        "a provisioned definition's network_requests must not be granted"
     );
     assert!(
         !serde_json::to_string(&config)
@@ -12481,29 +12627,33 @@ fn tool_mount_inheritance_changes_binds_not_other_provisioning_rules() {
         "the mount opt-out must not drop the inherited provider"
     );
 
-    // Observation 4: env and network requests stay own-only. The launching tool's
-    // own pair is present; the referenced tool's is not leaked into the sandbox or
-    // into the request report.
+    // Observation 4: env stays own-only and so does the granted egress: the
+    // launching tool's own pair is present and its own request is granted, while
+    // the referenced tool's env never reaches the guest and its request is never
+    // granted. (#735 turned this from an unmet-report claim into a rule claim:
+    // an authorized tool's requests are real authority.)
     let env = env_pairs(&config);
     assert!(env.contains(&("T_ONLY", "t-value")), "{env:?}");
     assert!(
         !env.iter().any(|(name, _)| *name == "U_ONLY"),
         "a referenced tool's env must not reach the guest: {env:?}"
     );
-    let expected_requests = vec![
-        format!(
-            "==> Tool network requests (user config): 1 of 1 not covered by this launch's \
-             {REQUEST_SCOPE}; requests never grant access and the launch continues"
-        ),
-        "==>   unmet: t.example".to_string(),
-        REQUEST_HINT.to_string(),
-    ];
-    assert_eq!(request_block(&applied_stderr), expected_requests);
     assert_eq!(
-        request_block(&suppressed_stderr),
-        expected_requests,
-        "the opt-out must not change the request report either"
+        domain_rules_of(&config),
+        [("t.example".to_owned(), vec![443])],
+        "the launching tool's own request is granted; the referenced tool's is not"
     );
+    assert_eq!(
+        domain_rules_of(&debug_config_json(&suppressed_stderr)),
+        [("t.example".to_owned(), vec![443])],
+        "the opt-out must not change the granted requests either"
+    );
+    for stderr in [&applied_stderr, &suppressed_stderr] {
+        assert!(
+            request_block(stderr).is_empty(),
+            "a granted request is never reported: {stderr}"
+        );
+    }
 }
 
 /// #396 AC-opt-out/AC-shell: a declared `shell` reaching same-tier tools through
@@ -13755,14 +13905,15 @@ fn a_real_secretspec_serve_round_trip() {
 }
 
 // ---------------------------------------------------------------------------
-// ADR-0059: `tool:NAME` egress references
+// ADR-0059 → ADR-0075: `set:` is the only egress reference
 // ---------------------------------------------------------------------------
-
-/// The one reference-refusal sentence every route prints, so a route that
-/// reworded it would fail here rather than drift.
-const EGRESS_REFERENCE_MALFORMED: &str = "an egress reference must be tool:NAME with a valid tool name (no whitespace, control characters or '/', not starting with '-', and not `.`, `..`, `*` or a reserved subcommand name)";
-const EGRESS_REFERENCE_UNKNOWN: &str = "an egress reference must name a tool declared in the user config's own [[tools]]; built-in and project tools are never used (`agent-vm tools print` prints the shipped tools to copy there)";
-const EGRESS_REFERENCE_NO_CONFIG: &str = "an egress reference resolves only against the user config's own [[tools]], and no user config file was found";
+//
+// #735 removed `tool:NAME`: authorizing a tool through `allow_tools` grants its
+// `network_requests` directly on launch, so a tool never needs an egress
+// reference. The rows below keep the claims that survive — the allowance grammar
+// now decides a `tool:`-prefixed entry, an authorized tool's own grants are
+// exact and attributed to it, and `allow_tools` is what the verified-read policy
+// guards — and the `set:` half follows in its own section.
 
 /// A user `[[tools]]` declaration with the given requests.
 fn requests_tool(name: &str, requests: &[&str]) -> String {
@@ -13793,99 +13944,154 @@ fn domain_rules_of(config: &serde_json::Value) -> Vec<(String, Vec<u64>)> {
         .collect()
 }
 
-/// A8, A22(i) and A28: a persisted reference expands to exact host:port grants,
-/// its notice names the reference, the report says the requests are covered, and
-/// a bare CLI name still takes every intercepted port.
+/// ADR-0075 R2/R7: with `tool:` gone from every grammar, the allowance grammar
+/// decides. `tool:<port>` is an ordinary literal hostname, so it grants that
+/// name on that port; `tool:<name>` is a port error that grants nothing, on the
+/// flag and in a persisted list alike, and never echoes the entry.
 #[test]
-fn persisted_tool_reference_grants_exact_hostnames() {
+fn tool_prefixed_entries_are_decided_by_the_allowance_grammar() {
     let h = Harness::warm();
-    h.write_user(&format!(
-        "{}[network]\nallow_egress = [\"tool:fetcher\"]\n",
-        requests_tool("fetcher", &["api.example.com", "git.example.com:8443"])
-    ));
-    let out = h.launch("fetcher", &["--allow-egress", "bare.example.com"]);
+    let out = h.launch("shell", &["--allow-egress", "tool:8443"]);
     let config = normalized_config(&h, &out);
     assert_eq!(
-        domain_rules_of(&config),
-        [
-            ("api.example.com".to_owned(), vec![443]),
-            ("git.example.com".to_owned(), vec![8443]),
-            ("bare.example.com".to_owned(), vec![443, 8443]),
-        ]
+        config["network"]["policy"]["rules"],
+        serde_json::json!([
+            {"direction":"egress","destination":{"domain":"tool"},"protocols":["tcp"],"ports":[{"start":8443,"end":8443}],"action":"allow"}
+        ])
     );
     assert_eq!(
         config["network"]["tls"]["intercepted_ports"],
         serde_json::json!([443, 8443])
     );
     let stderr = stderr_of(&out);
-    // Two lines, because the reference's two requests pin two ports; the count
-    // is per line, so each says 1 (#631).
+    assert!(
+        stderr.contains("==> Egress policy: allowing TLS to tool on ports 8443\n"),
+        "a numeric suffix is a port, not a tool reference: {stderr}"
+    );
+
+    for persisted in [false, true] {
+        let h = Harness::warm();
+        let (args, position) = if persisted {
+            h.write_user_mode("[network]\nallow_egress = [\"tool:codex\"]\n", 0o600);
+            (vec![], "network.allow_egress[0]")
+        } else {
+            (vec!["--allow-egress", "tool:codex"], "--allow-egress #1")
+        };
+        let out = h.launch("shell", &args);
+        assert_eq!(out.status.code(), Some(1), "persisted {persisted}");
+        let stderr = stderr_of(&out);
+        assert!(
+            stderr.contains(&format!(
+                "{position}: port must be a decimal number 1-65535"
+            )),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("tool:codex"), "the entry leaked: {stderr}");
+        assert!(!stderr.contains(CONFIG_MARKER), "{stderr}");
+        assert!(!h.state_root.join(project_hash(&h.project_root)).exists());
+        assert!(
+            h.msb_log().lines().all(|line| line == "--version"),
+            "a refused launch makes no runtime call beyond the identity probe: {}",
+            h.msb_log()
+        );
+    }
+}
+
+/// R5, D4 and V25(a) at the policy level: authorizing a tool makes its own
+/// `network_requests` exact `tcp://HOST:PORT` grants on that launch, each line
+/// naming the tool that supplied it, and the ADR-0039 report is replaced by the
+/// covered form because the grants are real.
+#[test]
+fn an_authorized_tool_grants_its_exact_hostnames() {
+    let h = Harness::warm();
+    h.write_user(&format!(
+        "allow_tools = [\"fetcher\"]\n{}",
+        requests_tool("fetcher", &["api.example.com", "git.example.com:8443"])
+    ));
+    let out = h.launch("fetcher", &["--allow-egress", "bare.example.com"]);
+    let config = normalized_config(&h, &out);
+    assert_eq!(
+        config["network"]["policy"]["rules"],
+        serde_json::json!([
+            {"direction":"egress","destination":{"domain":"bare.example.com"},"protocols":["tcp"],"ports":[{"start":443,"end":443},{"start":8443,"end":8443}],"action":"allow"},
+            {"direction":"egress","destination":{"domain":"api.example.com"},"protocols":["tcp"],"ports":[{"start":443,"end":443}],"action":"allow"},
+            {"direction":"egress","destination":{"domain":"git.example.com"},"protocols":["tcp"],"ports":[{"start":8443,"end":8443}],"action":"allow"}
+        ])
+    );
+    assert_eq!(
+        config["network"]["tls"]["intercepted_ports"],
+        serde_json::json!([443, 8443])
+    );
+    let stderr = stderr_of(&out);
+    // Two lines for the tool's two requests (one name each on its own port set),
+    // and the bare CLI name keeps its own widened line.
     assert!(
         stderr.contains(
-            "==> Egress policy: allowing TLS to tool:fetcher (1) on ports 443\n\
-             ==> Egress policy: allowing TLS to tool:fetcher (1) on ports 8443\n\
-             ==> Egress policy: allowing TLS to bare.example.com on ports 443, 8443 (--allow-egress)\n\
-             ==> list: agent-vm access egress\n"
+            "==> Egress policy: allowing TLS to bare.example.com on ports 443, 8443 (--allow-egress)\n\
+             ==> Egress policy: allowing TLS to api.example.com on ports 443 (tool fetcher)\n\
+             ==> Egress policy: allowing TLS to git.example.com on ports 8443 (tool fetcher)\n"
         ),
         "{stderr}"
     );
+    // An authorized tool's requests are part of this launch's egress plan, so the
+    // ADR-0039 report would contradict it: nothing is printed at all.
     assert!(
-        stderr.contains("==> Tool network requests (user config): all 2 covered by this launch's"),
-        "{stderr}"
+        !stderr.contains("Tool network requests"),
+        "a granted request is never reported: {stderr}"
     );
 }
 
-/// A10: the flag comes **before** the verb. Resolution reads only the user
-/// file's own tools, so the project's launchable `fetcher` is never resolved —
-/// and the failure happens before any launch state exists.
+/// R1/R3: `allow_tools` is the launch switch. A project tool it does not list is
+/// not a verb and grants nothing; the same file listing it makes both true. The
+/// retired `tool:NAME` reference resolved only the user file's own tools, and
+/// this is the claim that replaces it.
 #[test]
-fn tool_reference_never_resolves_a_project_tool_even_as_the_launch_verb() {
+fn an_unauthorized_project_tool_is_not_a_verb_and_grants_nothing() {
     let h = Harness::warm();
-    h.write_user("# tools-only\n");
-    h.write_project(&requests_tool("fetcher", &["p.example"]));
-    let out = h.launch("fetcher", &["--allow-egress", "tool:fetcher"]);
-    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    h.write_user("# no tools\n");
+    h.write_project(&format!(
+        "allow_tools = []\n{}",
+        requests_tool("fetcher", &["p.example"])
+    ));
+    let out = h.launch("fetcher", &[]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
     let stderr = stderr_of(&out);
-    assert!(
-        stderr.contains(&format!("--allow-egress #1: {EGRESS_REFERENCE_UNKNOWN}")),
-        "{stderr}"
-    );
+    assert!(stderr.contains("unrecognized subcommand"), "{stderr}");
     assert!(!stderr.contains("p.example"), "{stderr}");
-    assert!(!stderr.contains(CONFIG_MARKER), "{stderr}");
+    assert!(!h.state_root.join(project_hash(&h.project_root)).exists());
     assert!(
         !h.home_root
             .join(".config/agent-vm/image-pins.json")
             .exists()
     );
-    assert!(!h.state_root.join(project_hash(&h.project_root)).exists());
-    assert!(
-        h.msb_log().lines().all(|line| line == "--version"),
-        "a refused launch makes no runtime call beyond the identity probe: {}",
-        h.msb_log()
-    );
-}
 
-/// A18: no user config at all is its own answer, not an unknown name.
-#[test]
-fn a_cli_reference_without_a_user_config_says_so() {
     let h = Harness::warm();
-    let out = h.launch("shell", &["--allow-egress", "tool:x"]);
-    assert_eq!(out.status.code(), Some(1));
-    let stderr = stderr_of(&out);
-    assert!(
-        stderr.contains(&format!("--allow-egress #1: {EGRESS_REFERENCE_NO_CONFIG}")),
-        "{stderr}"
+    h.write_user("# no tools\n");
+    h.write_project(&format!(
+        "allow_tools = [\"fetcher\"]\n{}",
+        requests_tool("fetcher", &["p.example"])
+    ));
+    let out = h.launch("fetcher", &[]);
+    let config = normalized_config(&h, &out);
+    assert_eq!(
+        domain_rules_of(&config),
+        [("p.example".to_owned(), vec![443])],
+        "authorizing the project tool grants its request"
     );
-    assert!(!h.state_root.join(project_hash(&h.project_root)).exists());
 }
 
-/// A15: a tools-only user config reached through a dotfile symlink keeps working
-/// when no reference is used — with and without a plain hostname allowance — and
-/// refuses a reference with the file's own reason, before any loopback authority
-/// it declares can be used.
+/// R1, ADR-0040's fifth trigger: `allow_tools` is authority-bearing, so a
+/// symlinked user config that declares it is refused at load with the
+/// verified-read sentence — while the same file with only inert `[[tools]]`
+/// still launches. This replaces the retired refusal of a `tool:NAME` reference
+/// against an unverified file.
 #[test]
-fn cli_tool_reference_requires_a_verified_user_file() {
+fn a_symlinked_config_authorizing_tools_is_refused() {
     let tools_only = requests_tool("x", &["a.example"]);
+    let authorizing = format!("allow_tools = [\"x\"]\n{tools_only}");
+
+    // Inert: a symlinked tools-only config still launches, with and without a
+    // plain hostname allowance.
     for options in [&[][..], &["--allow-egress", "api.example.com"][..]] {
         let h = Harness::warm();
         let target = h.home_root.join(".config/agent-vm/dotfile");
@@ -13899,27 +14105,36 @@ fn cli_tool_reference_requires_a_verified_user_file() {
         );
     }
 
-    let h = Harness::warm();
-    let target = h.home_root.join(".config/agent-vm/dotfile");
-    write(&target, &tools_only);
-    h.symlink_user_config(&target);
-    let out = h.launch("shell", &["--allow-egress", "tool:x"]);
-    assert_eq!(out.status.code(), Some(1));
-    let stderr = stderr_of(&out);
-    assert!(
-        stderr.contains(&format!(
-            "--allow-egress #1: config: \"{}\": an egress reference requires config.toml to be a regular file, but it is reached through a symbolic link; its target may be writable by a guest or project, so review the [[tools]] network_requests before trusting the file (a symlinked config without an egress reference still works)",
-            h.user_config().display()
-        )),
-        "{stderr}"
-    );
-    assert!(!stderr.contains(CONFIG_MARKER), "{stderr}");
-    assert!(!h.state_root.join(project_hash(&h.project_root)).exists());
+    // `allow_tools = []` is presence, so it is refused too: this is the *field*,
+    // not the contents.
+    for body in [
+        authorizing.clone(),
+        "allow_tools = []\n".to_owned(),
+        "allow_tools = 7\n".to_owned(),
+    ] {
+        let h = Harness::warm();
+        let target = h.home_root.join(".config/agent-vm/dotfile");
+        write(&target, &body);
+        h.symlink_user_config(&target);
+        let out = h.launch("shell", &[]);
+        assert_eq!(out.status.code(), Some(1), "{body}");
+        let stderr = stderr_of(&out);
+        assert!(
+            stderr.contains(&format!(
+                "config: \"{}\": allow_tools requires config.toml to be a regular file, but it is reached through a symbolic link; its target may be writable by a guest or project, so review the allow_tools list before trusting the file (a symlinked config without allow_tools still works)",
+                h.user_config().display()
+            )),
+            "{body}: {stderr}"
+        );
+        assert!(!stderr.contains(CONFIG_MARKER), "{body}: {stderr}");
+        assert!(!h.state_root.join(project_hash(&h.project_root)).exists());
+    }
 
-    // (c) the same bytes as a regular, singly-linked `0600` file.
+    // The same bytes as a regular, singly-linked `0600` file authorize `x`, and
+    // `x` becomes the first verb.
     let h = Harness::warm();
-    h.write_user(&tools_only);
-    let out = h.launch("shell", &["--allow-egress", "tool:x"]);
+    h.write_user(&authorizing);
+    let out = h.launch("x", &[]);
     let config = normalized_config(&h, &out);
     assert_eq!(
         domain_rules_of(&config),
@@ -13927,12 +14142,15 @@ fn cli_tool_reference_requires_a_verified_user_file() {
     );
 }
 
-/// A16: a group- or other-writable tools-only file loads, and refuses only a
-/// reference — naming the mode. Two hard links are the second shape.
+/// R1: the same field in a group- or other-writable file, and in one with two
+/// hard links, is refused with its own sentence; the identical inert body loads.
 #[test]
-fn group_writable_or_linked_tools_only_config_refuses_only_references() {
-    let tools_only = requests_tool("x", &["a.example"]);
-    // Without a reference the file loads exactly as before.
+fn a_shared_or_linked_config_authorizing_tools_is_refused() {
+    // `# no allow_tools` keeps the fixture-authorization device away: this row is
+    // about the field's presence, so the inert body must really be inert.
+    let tools_only = format!("# no allow_tools\n{}", requests_tool("x", &["a.example"]));
+    let authorizing = format!("allow_tools = [\"x\"]\n{tools_only}");
+
     let h = Harness::warm();
     h.write_user_mode(&tools_only, 0o664);
     let out = h.launch("shell", &[]);
@@ -13943,48 +14161,122 @@ fn group_writable_or_linked_tools_only_config_refuses_only_references() {
     );
 
     let h = Harness::warm();
-    h.write_user_mode(&tools_only, 0o664);
-    let out = h.launch("shell", &["--allow-egress", "tool:x"]);
+    h.write_user_mode(&authorizing, 0o664);
+    let out = h.launch("shell", &[]);
     assert_eq!(out.status.code(), Some(1));
     assert!(
         stderr_of(&out).contains(
-            "an egress reference refuses a group- or other-writable config.toml; a guest or another account may have written its [[tools]] network_requests, so review the [[tools]] network_requests before trusting the file (fixing the mode does not establish authorship)"
+            "allow_tools refuses a group- or other-writable config.toml; a guest or another account may have written its allow_tools list, so review the allow_tools list before trusting the file (fixing the mode does not establish authorship)"
         ),
         "{}",
         stderr_of(&out)
     );
 
     let h = Harness::warm();
-    h.write_user_mode(&tools_only, 0o600);
+    h.write_user_mode(&authorizing, 0o600);
     let alias = h.user_config().with_file_name("alias.toml");
     std::fs::hard_link(h.user_config(), &alias).unwrap();
-    let out = h.launch("shell", &["--allow-egress", "tool:x"]);
+    let out = h.launch("shell", &[]);
     assert_eq!(out.status.code(), Some(1));
     assert!(
         stderr_of(&out).contains(
-            "an egress reference refuses a config.toml with 2 hard links; another name for it may be guest- or project-writable, so review the [[tools]] network_requests before trusting the file"
+            "allow_tools refuses a config.toml with 2 hard links; another name for it may be guest- or project-writable"
         ),
         "{}",
         stderr_of(&out)
     );
 }
 
-/// A33: every direct spelling accepts, expands and refuses a reference exactly
-/// like a catalog launch. Only the exit status differs: 125 for a direct route,
-/// 1 for the catalog counterpart.
+/// R1: `allow_tools` names tools declared in the authorizing file. A built-in
+/// tool is never authorizable, and an unqualified name the file does not declare
+/// is a load error rather than a fallback to the shipped catalog.
+#[test]
+fn allow_tools_cannot_authorize_a_built_in_tool() {
+    let h = Harness::warm();
+    h.write_user("allow_tools = [\"codex\"]\n# no [[tools]] here\n");
+    let out = h.launch("codex", &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(
+            "allow_tools[0]: no tool of that name is declared in this file; declare it in a [[tools]] block above allow_tools"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(CONFIG_MARKER), "{stderr}");
+    assert!(!h.state_root.join(project_hash(&h.project_root)).exists());
+    assert!(
+        !h.home_root
+            .join(".config/agent-vm/image-pins.json")
+            .exists()
+    );
+
+    // The built-in catalog still works when nothing authorizes anything.
+    let h = Harness::warm();
+    let out = h.launch("codex", &[]);
+    assert!(
+        stderr_of(&out).contains(CONFIG_MARKER),
+        "{}",
+        stderr_of(&out)
+    );
+}
+
+/// R1/V24(b), the binary twin: a project `allow_tools` entry selecting a
+/// `:trust` tool requires that file's own verified-read verdict, and the refusal
+/// names the project file's position — before any launch state exists.
+#[test]
+fn a_project_authorization_of_a_trusted_tool_needs_the_trusted_verdict() {
+    let tools_only = requests_tool("x", &["x.example"]);
+    let h = Harness::new();
+    let target = h.home_root.join(".config/agent-vm/dotfile");
+    write(&target, &tools_only);
+    h.symlink_user_config(&target);
+    h.write_project("allow_tools = [\"home:x\"]\n");
+    let out = h.launch("shell", &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(&format!(
+            "config: \"{}\": allow_tools[0]: ",
+            h.project_config().display()
+        )),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("authorizing a :trust tool from the project config requires config.toml to be a regular file"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(CONFIG_MARKER), "{stderr}");
+    assert!(!stderr.contains("x.example"), "{stderr}");
+    assert!(!h.state_root.join(project_hash(&h.project_root)).exists());
+
+    // Control: the same symlink with an empty project list loads.
+    let h = Harness::warm();
+    let target = h.home_root.join(".config/agent-vm/dotfile");
+    write(&target, &tools_only);
+    h.symlink_user_config(&target);
+    h.write_project("allow_tools = []\n");
+    let out = h.launch("shell", &[]);
+    assert!(
+        stderr_of(&out).contains(CONFIG_MARKER),
+        "{}",
+        stderr_of(&out)
+    );
+}
+
+/// A33: every direct spelling accepts and refuses a `set:` reference exactly like
+/// a catalog launch. Only the exit status differs: 125 for a direct route, 1 for
+/// the catalog counterpart.
 #[test]
 fn direct_routes_accept_and_refuse_references_like_catalog_launches() {
-    let user_config = format!(
-        "{}[network]\nallow_egress = [\"tool:fetcher\"]\n",
-        requests_tool("fetcher", &["api.example.com", "git.example.com:8443"])
-    );
+    let sets = "[egress_sets]\ncorp = [\"api.example.com\", \"tcp://git.example.com:8443\"]\n";
     for form in DIRECT_FORMS {
         // Positive: the expansion reaches policy.
         let h = Harness::warm();
-        h.write_user(&user_config);
+        h.write_user(sets);
         let out = h.direct(DirectInvocation {
             form,
-            options: &["--image", BOGUS_IMAGE],
+            options: &["--image", BOGUS_IMAGE, "--allow-egress", "set:corp"],
             vector: &["probe"],
             envs: &[],
         });
@@ -13992,28 +14284,27 @@ fn direct_routes_accept_and_refuse_references_like_catalog_launches() {
         assert_eq!(
             domain_rules_of(&config),
             [
-                ("api.example.com".to_owned(), vec![443]),
+                ("api.example.com".to_owned(), vec![443, 8443]),
                 ("git.example.com".to_owned(), vec![8443]),
             ],
             "{form:?}"
         );
     }
 
-    // Negative: malformed, unknown, and an untrusted file. The message matches
-    // the catalog launch; only the status differs.
+    // Negative: malformed and unknown, on both route shapes.
     for (options, reason) in [
         (
-            &["--allow-egress", "tool:-x"][..],
-            format!("--allow-egress #1: {EGRESS_REFERENCE_MALFORMED}"),
+            &["--allow-egress", "set:-x"][..],
+            "an egress reference must be set:NAME with a valid egress-set name ([A-Za-z0-9_] first, then [A-Za-z0-9_.-])".to_owned(),
         ),
         (
-            &["--allow-egress", "tool:nope"][..],
-            format!("--allow-egress #1: {EGRESS_REFERENCE_UNKNOWN}"),
+            &["--allow-egress", "set:nope"][..],
+            EGRESS_SET_UNKNOWN.to_owned(),
         ),
     ] {
         for form in DIRECT_FORMS {
             let h = Harness::warm();
-            h.write_user(&requests_tool("x", &["a.example"]));
+            h.write_user(sets);
             let mut with_image = vec!["--image", BOGUS_IMAGE];
             with_image.extend_from_slice(options);
             let out = h.direct(DirectInvocation {
@@ -14026,54 +14317,24 @@ fn direct_routes_accept_and_refuse_references_like_catalog_launches() {
             assert!(stderr_of(&out).contains(&reason), "{}", stderr_of(&out));
         }
         let h = Harness::warm();
-        h.write_user(&requests_tool("x", &["a.example"]));
+        h.write_user(sets);
         let out = h.launch("shell", options);
         assert_eq!(out.status.code(), Some(1), "{options:?}");
         assert!(stderr_of(&out).contains(&reason), "{}", stderr_of(&out));
     }
-
-    // An untrusted (symlinked) tools-only file refuses on every route.
-    let tools_only = requests_tool("x", &["a.example"]);
-    let trust = "an egress reference requires config.toml to be a regular file, but it is reached through a symbolic link";
-    for form in DIRECT_FORMS {
-        let h = Harness::warm();
-        let target = h.home_root.join(".config/agent-vm/dotfile");
-        write(&target, &tools_only);
-        h.symlink_user_config(&target);
-        let out = h.direct(DirectInvocation {
-            form,
-            options: &["--image", BOGUS_IMAGE, "--allow-egress", "tool:x"],
-            vector: &["probe"],
-            envs: &[],
-        });
-        assert_eq!(out.status.code(), Some(125), "{form:?}");
-        assert!(stderr_of(&out).contains(trust), "{}", stderr_of(&out));
-    }
-    let h = Harness::warm();
-    let target = h.home_root.join(".config/agent-vm/dotfile");
-    write(&target, &tools_only);
-    h.symlink_user_config(&target);
-    let out = h.launch("shell", &["--allow-egress", "tool:x"]);
-    assert_eq!(out.status.code(), Some(1));
-    assert!(stderr_of(&out).contains(trust), "{}", stderr_of(&out));
 }
 
-/// A33, positive CLI half: a tools-only user config with **no** `[network]`
-/// table, and `--allow-egress tool:fetcher` on both direct spellings.
-///
-/// The persisted rows above cannot show this: they prove that a *persisted*
-/// reference reaches policy, not that a CLI `tool:NAME` survives dispatch on the
-/// direct route. Both direct forms are exercised, with a bare literal in the
-/// same launch so the widened ports are visible next to the pinned ones, and the
-/// catalog route is compared against the same policy.
+/// A33, positive CLI half: a user config with **no** `[network]` table, and
+/// `--allow-egress set:fetcher` on both direct spellings, with a bare literal in
+/// the same launch so the widened ports are visible next to the pinned ones.
 #[test]
-fn direct_routes_expand_a_cli_reference_with_no_user_network_table() {
-    let tools_only = requests_tool("fetcher", &["api.example.com", "git.example.com:8443"]);
+fn direct_routes_expand_a_cli_set_reference_with_no_user_network_table() {
+    let sets = "[egress_sets]\nfetcher = [\"api.example.com\", \"tcp://git.example.com:8443\"]\n";
     let options = [
         "--image",
         BOGUS_IMAGE,
         "--allow-egress",
-        "tool:fetcher",
+        "set:fetcher",
         "--allow-egress",
         "bare.example.com",
     ];
@@ -14082,7 +14343,7 @@ fn direct_routes_expand_a_cli_reference_with_no_user_network_table() {
         assert_eq!(
             domain_rules_of(&config),
             [
-                ("api.example.com".to_owned(), vec![443]),
+                ("api.example.com".to_owned(), vec![443, 8443]),
                 ("git.example.com".to_owned(), vec![8443]),
                 ("bare.example.com".to_owned(), vec![443, 8443]),
             ],
@@ -14094,13 +14355,10 @@ fn direct_routes_expand_a_cli_reference_with_no_user_network_table() {
             "{route}"
         );
         let stderr = stderr_of(out);
-        // The count is per port/source line, not per reference: two lines, one
-        // name each (#631).
         assert!(
             stderr.contains(
-                "==> Egress policy: allowing TLS to tool:fetcher (1) on ports 443 (--allow-egress)\n\
-                 ==> Egress policy: allowing TLS to tool:fetcher (1) on ports 8443 (--allow-egress)\n\
-                 ==> Egress policy: allowing TLS to bare.example.com on ports 443, 8443 (--allow-egress)\n\
+                "==> Egress policy: allowing TLS to fetcher (1), bare.example.com on ports 443, 8443 (--allow-egress)\n\
+                 ==> Egress policy: allowing TLS to fetcher (1) on ports 8443 (--allow-egress)\n\
                  ==> list: agent-vm access egress\n"
             ),
             "{route}: {stderr}"
@@ -14110,7 +14368,7 @@ fn direct_routes_expand_a_cli_reference_with_no_user_network_table() {
     };
     for form in DIRECT_FORMS {
         let h = Harness::warm();
-        h.write_user(&tools_only);
+        h.write_user(sets);
         let out = h.direct(DirectInvocation {
             form,
             options: &options,
@@ -14121,179 +14379,17 @@ fn direct_routes_expand_a_cli_reference_with_no_user_network_table() {
     }
     // The catalog route, for parity: the same flags, the same policy.
     let h = Harness::warm();
-    h.write_user(&tools_only);
+    h.write_user(sets);
     let out = h.launch(
-        "fetcher",
+        "shell",
         &[
             "--allow-egress",
-            "tool:fetcher",
+            "set:fetcher",
             "--allow-egress",
             "bare.example.com",
         ],
     );
     check(&h, &out, "catalog");
-}
-
-/// A11, CLI half: a user file that declares no tools leaves the shipped defaults
-/// catalog in force, and none of that catalog is referenceable — a reference
-/// names the user file's own `[[tools]]` only. The persisted half is
-/// `config::tests::persisted_tool_reference_ignores_project_and_builtin_tools`.
-#[test]
-fn a_cli_reference_never_names_a_defaults_catalog_tool() {
-    let h = Harness::warm();
-    h.write_user("# tools-only: the shipped catalog is in force\n");
-    let out = h.launch(
-        "codex",
-        &[
-            "--allow-egress",
-            "tool:codex",
-            "--allow-egress",
-            "api.example.com",
-        ],
-    );
-    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
-    let stderr = stderr_of(&out);
-    assert!(
-        stderr.contains(&format!("--allow-egress #1: {EGRESS_REFERENCE_UNKNOWN}")),
-        "{stderr}"
-    );
-    assert!(!stderr.contains(CONFIG_MARKER), "{stderr}");
-    assert!(!h.state_root.join(project_hash(&h.project_root)).exists());
-    assert!(
-        !h.home_root
-            .join(".config/agent-vm/image-pins.json")
-            .exists()
-    );
-}
-
-/// A20 across the routes that had no sentinel: the name carries one, so a
-/// refusal that echoed it fails here rather than being assumed clean. Unknown,
-/// no-requests and malformed, on a catalog launch, both direct spellings, and a
-/// persisted entry; the untrusted-file refusal names the file, not the name.
-#[test]
-fn reference_refusals_never_echo_the_entry_or_its_name() {
-    const SENTINEL: &str = "sk-live-SENTINEL-506";
-    let unknown = format!("--allow-egress #1: {EGRESS_REFERENCE_UNKNOWN}");
-    let malformed = format!("--allow-egress #1: {EGRESS_REFERENCE_MALFORMED}");
-    let no_requests = "--allow-egress #1: an egress reference must name a tool that declares network_requests; this tool declares none, so the reference would grant nothing";
-    // One file whose namespace holds a name the sentinel cannot be confused
-    // with, so a reference to the sentinel is UNKNOWN.
-    let unrelated = requests_tool("has-requests", &["a.example"]);
-    // And one that declares the sentinel-named tool with no requests, so the
-    // same reference is NO_REQUESTS instead.
-    let empty_requests = format!("{unrelated}{}", requests_tool(SENTINEL, &[]));
-
-    // Catalog launch: one row per refusal shape.
-    for (entry, reason) in [
-        (format!("tool:{SENTINEL}"), unknown.clone()),
-        (format!("tool:-{SENTINEL}"), malformed.clone()),
-        (format!("tool:{SENTINEL}/x"), malformed.clone()),
-        (format!("tool:{SENTINEL} x"), malformed.clone()),
-    ] {
-        let h = Harness::warm();
-        h.write_user(&unrelated);
-        let out = h.launch("shell", &["--allow-egress", &entry]);
-        assert_eq!(out.status.code(), Some(1), "{entry}");
-        let stderr = stderr_of(&out);
-        assert!(stderr.contains(&reason), "{entry}: {stderr}");
-        assert!(!stderr.contains(SENTINEL), "the name was echoed: {stderr}");
-    }
-    // A tool that exists but declares no requests: the refusal describes the
-    // tool, never names its name.
-    let h = Harness::warm();
-    h.write_user(&empty_requests);
-    let out = h.launch("shell", &["--allow-egress", &format!("tool:{SENTINEL}")]);
-    assert_eq!(out.status.code(), Some(1));
-    let stderr = stderr_of(&out);
-    assert!(stderr.contains(no_requests), "{stderr}");
-    assert!(!stderr.contains(SENTINEL), "the name was echoed: {stderr}");
-
-    // Both direct spellings: the same UNKNOWN refusal at 125.
-    for form in DIRECT_FORMS {
-        let h = Harness::warm();
-        h.write_user(&unrelated);
-        let entry = format!("tool:{SENTINEL}");
-        let out = h.direct(DirectInvocation {
-            form,
-            options: &["--image", BOGUS_IMAGE, "--allow-egress", &entry],
-            vector: &["probe"],
-            envs: &[],
-        });
-        assert_eq!(out.status.code(), Some(125), "{form:?}");
-        let stderr = stderr_of(&out);
-        assert!(stderr.contains(&unknown), "{form:?}: {stderr}");
-        assert!(!stderr.contains(SENTINEL), "{form:?}: {stderr}");
-    }
-
-    // Persisted: the load error names the position, not the entry.
-    let h = Harness::warm();
-    h.write_user(&format!(
-        "{unrelated}[network]\nallow_egress = [\"tool:{SENTINEL}\"]\n"
-    ));
-    let out = h.launch("shell", &[]);
-    assert_eq!(out.status.code(), Some(1));
-    let stderr = stderr_of(&out);
-    assert!(
-        stderr.contains(&format!(
-            "network.allow_egress[0]: {EGRESS_REFERENCE_UNKNOWN}"
-        )),
-        "{stderr}"
-    );
-    assert!(!stderr.contains(SENTINEL), "{stderr}");
-
-    // Untrusted file: the refusal names the file, never the reference it was
-    // asked about.
-    let h = Harness::warm();
-    let target = h.home_root.join(".config/agent-vm/dotfile");
-    write(&target, &requests_tool(SENTINEL, &["a.example"]));
-    h.symlink_user_config(&target);
-    let out = h.launch("shell", &["--allow-egress", &format!("tool:{SENTINEL}")]);
-    assert_eq!(out.status.code(), Some(1));
-    let stderr = stderr_of(&out);
-    assert!(
-        stderr.contains(
-            "an egress reference requires config.toml to be a regular file, but it is reached through a symbolic link"
-        ),
-        "{stderr}"
-    );
-    assert!(!stderr.contains(SENTINEL), "{stderr}");
-}
-
-/// A33, persisted half: a wrong persisted reference fails load, so every route
-/// reports it — 125 for both direct spellings, 1 for a catalog launch, and a
-/// nonzero `doctor` whose tool-configuration section carries the text.
-#[test]
-fn persisted_reference_error_fails_every_route_and_doctor() {
-    let reason = format!("network.allow_egress[0]: {EGRESS_REFERENCE_UNKNOWN}");
-    let user_config = format!(
-        "{}\n[network]\nallow_egress = [\"tool:nope\"]\n",
-        requests_tool("x", &["a.example"])
-    );
-    for form in DIRECT_FORMS {
-        let h = Harness::warm();
-        h.write_user(&user_config);
-        let out = h.direct(DirectInvocation {
-            form,
-            options: &[],
-            vector: &["probe"],
-            envs: &[],
-        });
-        assert_eq!(out.status.code(), Some(125), "{form:?}");
-        assert!(stderr_of(&out).contains(&reason), "{}", stderr_of(&out));
-    }
-    let h = Harness::new();
-    h.write_user(&user_config);
-    let out = h.launch("shell", &[]);
-    assert_eq!(out.status.code(), Some(1));
-    assert_saved_refusal(&h, &out, &reason, true);
-
-    let h = Harness::warm();
-    h.write_user(&user_config);
-    let doctor = h.builtin(&["doctor"], &[]);
-    assert!(!doctor.status.success());
-    let text = format!("{}{}", stdout_of(&doctor), stderr_of(&doctor));
-    assert!(text.contains("==> tool configuration"), "{text}");
-    assert!(text.contains(&reason), "{text}");
 }
 
 // ---------------------------------------------------------------------------
@@ -14361,14 +14457,13 @@ fn egress_sets_unsafe_file_is_refused_before_launch_state() {
 #[test]
 fn persisted_set_reference_grants_its_nested_closure() {
     let h = Harness::warm();
-    h.write_user(&format!(
-        "{}[egress_sets]\n\
-         agents = [\"tool:codex\", \"set:corp\"]\n\
+    h.write_user(
+        "[egress_sets]\n\
+         agents = [\"api.openai.com\", \"set:corp\"]\n\
          corp = [\"git.corp.example\", \"10.0.0.5\"]\n\
          \n\
          [network]\nallow_egress = [\"set:agents\"]\n",
-        requests_tool("codex", &["api.openai.com"])
-    ));
+    );
     let out = h.launch("shell", &[]);
     let config = normalized_config(&h, &out);
     assert_eq!(
@@ -14404,10 +14499,7 @@ fn persisted_set_reference_grants_its_nested_closure() {
 #[test]
 fn cli_set_reference_expands_without_a_network_table() {
     let h = Harness::warm();
-    h.write_user(&format!(
-        "{}[egress_sets]\nagents = [\"tool:codex\"]\n",
-        requests_tool("codex", &["api.openai.com"])
-    ));
+    h.write_user("[egress_sets]\nagents = [\"api.openai.com\"]\n");
     let out = h.launch("shell", &["--allow-egress", "set:agents"]);
     let config = normalized_config(&h, &out);
     assert_eq!(
@@ -14470,7 +14562,7 @@ fn cli_set_reference_requires_a_verified_user_file() {
     let stderr = stderr_of(&out);
     assert!(
         stderr.contains(&format!(
-            "--allow-egress #1: config: \"{}\": an egress reference requires config.toml to be a regular file, but it is reached through a symbolic link; its target may be writable by a guest or project, so review the [[tools]] network_requests before trusting the file (a symlinked config without an egress reference still works)",
+            "--allow-egress #1: config: \"{}\": an egress reference requires config.toml to be a regular file, but it is reached through a symbolic link; its target may be writable by a guest or project, so review the [egress_sets] table before trusting the file (a symlinked config without an egress reference still works)",
             h.user_config().display()
         )),
         "{stderr}"
@@ -14522,8 +14614,8 @@ fn set_refusals_never_echo_the_entry_or_its_name() {
     );
     // An entry the allowance grammar refuses.
     let bad_entry = format!("[egress_sets]\nok = [\"a b {SENTINEL}\"]\n");
-    // An unknown tool inside a set.
-    let unknown_tool = format!("[egress_sets]\nok = [\"tool:{SENTINEL}\"]\n");
+    // A nested set nothing declares.
+    let unknown_nested = format!("[egress_sets]\nok = [\"set:{SENTINEL}\"]\n");
 
     for (body, expected) in [
         (
@@ -14536,8 +14628,8 @@ fn set_refusals_never_echo_the_entry_or_its_name() {
         ),
         (bad_entry, "egress_sets[0][0]: ".to_owned()),
         (
-            unknown_tool,
-            format!("egress_sets[0][0]: {EGRESS_REFERENCE_UNKNOWN}"),
+            unknown_nested,
+            format!("egress_sets[0][0]: {EGRESS_SET_UNKNOWN}"),
         ),
     ] {
         let h = Harness::new();
@@ -14569,11 +14661,10 @@ fn set_refusals_never_echo_the_entry_or_its_name() {
 /// renders its tool-configuration section.
 #[test]
 fn persisted_set_error_fails_every_route_and_doctor() {
-    let reason = format!("egress_sets[0][0]: {EGRESS_REFERENCE_UNKNOWN}");
-    let user_config = format!(
-        "{}[egress_sets]\ncorp = [\"tool:nope\"]\n\n[network]\nallow_egress = [\"set:corp\"]\n",
-        requests_tool("x", &["a.example"])
-    );
+    let reason = format!("egress_sets[0][0]: {EGRESS_SET_UNKNOWN}");
+    let user_config =
+        "[egress_sets]\ncorp = [\"set:nope\"]\n\n[network]\nallow_egress = [\"set:corp\"]\n"
+            .to_owned();
     for form in DIRECT_FORMS {
         let h = Harness::warm();
         h.write_user(&user_config);
@@ -15134,4 +15225,280 @@ fn unreadable_allowances_degrades_not_refuses() {
             .any(|rule| rule["destination"]["cidr"] == "203.0.113.10/32"),
         "{stderr}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #735 V25: authorizing a tool activates every one of its fields
+// ---------------------------------------------------------------------------
+
+/// The repo file `V25` uses: three tools whose every field is asymmetric, so a
+/// launch that activated the wrong one — or only some of them — cannot pass.
+fn v25_repo() -> String {
+    "[[tools]]\nname = \"app\"\ncommand = \"/bin/echo\"\nargs = [\"--own-arg\"]\n\
+     env = { APP_OWN = \"own-sentinel\" }\ncredentials = [\"openai\"]\npersist = [\".app-own\"]\n\
+     mounts = [\"~/app-own:/app-own:ro\"]\n\
+     network_requests = [\"app.example\", \"app.example:8443\"]\ntools = [\"helper\"]\n\
+     [[tools]]\nname = \"helper\"\ncommand = \"/bin/echo\"\n\
+     env = { HELPER_ENV = \"helper-sentinel\" }\ncredentials = [\"anthropic\"]\n\
+     persist = [\".helper\"]\nmounts = [\"~/helper:/helper:ro\"]\n\
+     network_requests = [\"helper.example\"]\ntools = []\n\
+     [[tools]]\nname = \"unused\"\ncommand = \"/bin/echo\"\n\
+     env = { UNUSED_ENV = \"unused-sentinel\" }\ncredentials = [\"copilot\"]\n\
+     persist = [\".unused\"]\nmounts = [\"~/unused:/unused:ro\"]\n\
+     network_requests = [\"unused.example\"]\ntools = []\n\
+     [[tools]]\nname = \"rsh\"\ncommand = \"bash\"\nargs = [\"-O\", \"histappend\"]\n\
+     interactive_shell = true\ntools = []\n"
+        .to_string()
+}
+
+/// The project file `V25` uses: it sources the repo and authorizes three of the
+/// four definitions.
+fn v25_project(allow: &str) -> String {
+    format!(
+        "sources = [\"repo ./.agent-vm/config.toml\"]\n\
+         {allow}"
+    )
+}
+
+/// A seeded host directory, so the declaration's source really exists.
+fn v25_seed(h: &Harness, name: &str) {
+    let path = h.home_root.join(name);
+    std::fs::create_dir_all(&path).unwrap();
+    std::fs::write(path.join("marker"), name).unwrap();
+}
+
+/// The `Commands:` block of a `--help`, and nothing after it: later sections
+/// indent their examples too, and one of those lines begins with a tool name.
+fn commands_block(help: &str) -> &str {
+    let start = help.split("Commands:\n").nth(1).expect("a command list");
+    match start.find("\n\n") {
+        Some(end) => &start[..end],
+        None => start,
+    }
+}
+
+fn v25_binds(stderr: &str) -> Vec<(String, String)> {
+    debug_config_json(stderr)["mounts"]
+        .as_array()
+        .expect("mounts is an array")
+        .iter()
+        .filter(|mount| mount["type"] == "Bind")
+        .map(|mount| {
+            (
+                mount["guest"].as_str().expect("guest").to_string(),
+                mount["host"].as_str().expect("host").to_string(),
+            )
+        })
+        .collect()
+}
+
+/// V25(a): authorizing a tool activates **all** of its fields — command, argv,
+/// interactive shell, env, credentials, persist, mounts and network_requests —
+/// including from a non-`:trust` `repo` source.
+#[test]
+fn an_authorized_source_tool_activates_every_field() {
+    let h = Harness::warm();
+    for name in ["app-own", "helper", "unused"] {
+        v25_seed(&h, name);
+    }
+    h.write_user("# tools-only\n");
+    write(&h.project_root.join(".agent-vm/config.toml"), &v25_repo());
+    h.write_project(&v25_project(
+        "allow_tools = [\"repo:app\", \"repo:helper\", \"repo:rsh\"]\n",
+    ));
+
+    let help = stdout_of(&h.builtin(&["-h"], &[]));
+    assert!(help.contains("  app  "), "app is a verb: {help}");
+    // `--image` matters: `warm()` seeds the fixture references, and an ambient
+    // default that needs approval would prompt on the inherited stdin.
+    let out = h.launch_with_tool_args("app", &["--image", BOGUS_IMAGE], &["x", "y"], &[]);
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+    let config = debug_config_json(&stderr);
+    assert_eq!(
+        debug_guest_command(&stderr),
+        "/bin/echo --own-arg x y",
+        "command and argv are the definition's own"
+    );
+    let env = env_pairs(&config);
+    assert!(env.contains(&("APP_OWN", "own-sentinel")), "{env:?}");
+    assert!(
+        !env.iter().any(|(name, _)| *name == "HELPER_ENV"),
+        "{env:?}"
+    );
+    assert!(
+        !env.iter().any(|(name, _)| *name == "UNUSED_ENV"),
+        "{env:?}"
+    );
+    let mut secrets = registered_secret_env_vars(&config);
+    secrets.sort_unstable();
+    assert_eq!(
+        secrets,
+        [
+            "MSB_AGENT_VM_ANTHROPIC_UNUSED",
+            "MSB_AGENT_VM_OPENAI_UNUSED"
+        ],
+        "the authorized closure's providers, and no other"
+    );
+    let state = snapshot(&state_dir(&stderr));
+    assert!(state.contains_key("link:.app-own"), "{state:?}");
+    assert!(state.contains_key("link:.helper"), "{state:?}");
+    assert!(!state.contains_key("link:.unused"), "{state:?}");
+    let binds = v25_binds(&stderr);
+    let guests: Vec<&str> = binds.iter().map(|(guest, _)| guest.as_str()).collect();
+    assert!(guests.contains(&"/app-own"), "{guests:?}");
+    assert!(guests.contains(&"/helper"), "{guests:?}");
+    assert!(!guests.contains(&"/unused"), "{guests:?}");
+    assert_eq!(
+        domain_rules_of(&config),
+        [("app.example".to_owned(), vec![443, 8443])],
+        "both of the tool's own ports are pinned, and no closure member's domain \
+         is granted"
+    );
+    assert!(stderr.contains("(tool app)"), "{stderr}");
+    assert!(!stderr.contains("requests never grant access"), "{stderr}");
+
+    // An interactive shell keeps its argv and its `-c` form.
+    let out = h.launch_with_tool_args("rsh", &["--image", BOGUS_IMAGE], &["a b"], &[]);
+    assert!(
+        stderr_of(&out).contains(CONFIG_MARKER),
+        "{}",
+        stderr_of(&out)
+    );
+    assert_eq!(
+        debug_guest_command(&stderr_of(&out)),
+        "bash -O histappend -c 'a b'"
+    );
+}
+
+/// V25(b) and (c): the same repo file under `allow_tools = []` offers no verb, and
+/// a **direct** launch of the same program and argv keeps default-deny egress and
+/// none of the tool's facets.
+#[test]
+fn an_unauthorized_source_tool_is_not_a_verb_and_a_direct_launch_keeps_deny() {
+    // (b) `allow_tools = []`: no verb, nothing activated.
+    let h = Harness::warm();
+    for name in ["app-own", "helper", "unused"] {
+        v25_seed(&h, name);
+    }
+    h.write_user("# tools-only\n");
+    write(&h.project_root.join(".agent-vm/config.toml"), &v25_repo());
+    h.write_project(&v25_project("allow_tools = []\n"));
+    let out = h.launch("app", &[]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains("unrecognized subcommand"),
+        "{}",
+        stderr_of(&out)
+    );
+
+    let out = h.launch("shell", &[]);
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+    let config = debug_config_json(&stderr);
+    assert_eq!(
+        config["network"]["policy"]["rules"],
+        serde_json::json!([]),
+        "an empty list authorizes nothing"
+    );
+    let guests: Vec<String> = v25_binds(&stderr)
+        .into_iter()
+        .map(|(guest, _)| guest)
+        .collect();
+    assert_eq!(guests.len(), 3, "core binds only: {guests:?}");
+    assert!(
+        env_pairs(&config)
+            .iter()
+            .all(|(name, _)| *name != "APP_OWN")
+    );
+
+    // (c) the direct launch of the very same program and argv the *authorized*
+    // tool would run — `/bin/echo --own-arg` plus the two forwarded words — keeps
+    // ADR-0036 default-deny and none of the facets. The twin config omits
+    // `allow_tools` entirely, so the same denial cannot be an artifact of the
+    // authorization.
+    for (case, allow) in [
+        (
+            "authorized",
+            "allow_tools = [\"repo:app\", \"repo:helper\", \"repo:rsh\"]\n",
+        ),
+        ("omitted", "# no allow_tools\n"),
+    ] {
+        let h = Harness::warm();
+        for name in ["app-own", "helper", "unused"] {
+            v25_seed(&h, name);
+        }
+        h.write_user("# tools-only\n");
+        write(&h.project_root.join(".agent-vm/config.toml"), &v25_repo());
+        h.write_project(&v25_project(allow));
+        for form in DIRECT_FORMS {
+            let out = h.direct(DirectInvocation {
+                form,
+                options: &["--image", BOGUS_IMAGE],
+                vector: &["/bin/echo", "--own-arg", "x", "y"],
+                envs: &[],
+            });
+            let stderr = stderr_of(&out);
+            let config = debug_config_json(&stderr);
+            assert_eq!(
+                config["network"]["policy"]["rules"],
+                serde_json::json!([]),
+                "{case}/{form:?}: a direct launch keeps ADR-0036 default-deny"
+            );
+            assert!(
+                env_pairs(&config)
+                    .iter()
+                    .all(|(name, _)| *name != "APP_OWN"),
+                "{case}/{form:?}: a direct launch gets none of the tool's env"
+            );
+            assert!(
+                registered_secret_env_vars(&config).is_empty(),
+                "{case}/{form:?}: a direct launch provisions no credential"
+            );
+            assert_eq!(
+                v25_binds(&stderr).len(),
+                3,
+                "{case}/{form:?}: core binds only, so no tool mount"
+            );
+        }
+    }
+}
+
+/// V25(d): ordered inheritance under a project `allow_tools = []` — the `:trust`
+/// file's own order survives, and its unauthorized tool stays inert.
+#[test]
+fn ordered_inheritance_under_an_empty_project_list() {
+    let h = Harness::warm();
+    h.write_user(
+        "allow_tools = [\"b\", \"a\"]\n\
+         [[tools]]\nname = \"a\"\ncommand = \"/bin/echo\"\n\
+         [[tools]]\nname = \"b\"\ncommand = \"/bin/echo\"\n\
+         [[tools]]\nname = \"c\"\ncommand = \"/bin/echo\"\n",
+    );
+    h.write_project("allow_tools = []\n");
+    let help = stdout_of(&h.builtin(&["--help"], &[]));
+    let commands: Vec<&str> = commands_block(&help)
+        .lines()
+        .filter(|line| line.starts_with("  "))
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|verb| ["a", "b", "c", "shell"].contains(verb))
+        .collect();
+    assert_eq!(commands, ["b", "a", "shell"], "{commands:?}\n{help}");
+
+    // `sources = []` opts the trusted file out entirely: shell only.
+    let h = Harness::warm();
+    h.write_user(
+        "allow_tools = [\"b\", \"a\"]\n\
+         [[tools]]\nname = \"a\"\ncommand = \"/bin/echo\"\n\
+         [[tools]]\nname = \"b\"\ncommand = \"/bin/echo\"\n",
+    );
+    h.write_project("sources = []\nallow_tools = []\n");
+    let help = stdout_of(&h.builtin(&["--help"], &[]));
+    let commands: Vec<&str> = commands_block(&help)
+        .lines()
+        .filter(|line| line.starts_with("  "))
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|verb| ["a", "b", "shell"].contains(verb))
+        .collect();
+    assert_eq!(commands, ["shell"], "{commands:?}\n{help}");
 }

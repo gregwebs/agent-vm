@@ -1267,8 +1267,13 @@ fn describe_config(report: ConfigReport) -> (String, Option<anyhow::Error>, Opti
     let resolved_label = if report.uses_defaults() {
         "resolved: built-in defaults; launch-verb order\n"
     } else {
-        "resolved: declared tools; launch-verb order\n"
+        "resolved: authorized tools; launch-verb order\n"
     };
+    let inert_tools = describe_inert_tools(
+        report.inert_tools(),
+        report.project(),
+        report.project_claims(),
+    );
     let conflicts = render_conflicts(report.conflicts());
     // The persisted egress references are user-authored authority, so `doctor`
     // shows what each one grants. Rendered before the report is consumed by
@@ -1303,6 +1308,10 @@ fn describe_config(report: ConfigReport) -> (String, Option<anyhow::Error>, Opti
             (Some(error), None)
         }
     };
+    // After the numbered list: the block is about declarations that are *not*
+    // verbs, so it must not split the `resolved:` header from the verbs it
+    // introduces (#735 review S2).
+    out.push_str(&inert_tools);
     out.push_str(&conflicts);
     out.push_str(&egress_references);
     // Drop the final newline: the caller adds one via `writeln!`.
@@ -1310,8 +1319,60 @@ fn describe_config(report: ConfigReport) -> (String, Option<anyhow::Error>, Opti
     (out, failure, catalog)
 }
 
+/// Declared tools no `allow_tools` entry authorizes (#735), each with the exact
+/// spelling that would activate it and the file that spelling belongs in.
+///
+/// Rendered nothing when every declaration is authorized, so a defaults-only or
+/// fully-authorized report keeps its shipped bytes. The entry is copyable TOML:
+/// a source's is `<alias>:<name>`, a user or project tool's is its bare name, and
+/// the name is rendered with the printer's TOML string encoder rather than the
+/// diagnostic escaper, because a tool name may hold non-ASCII.
+///
+/// `claimed` maps each verb the project's own list already decided to the entry
+/// spelling that decided it. Adding a *second* entry for such a verb is refused
+/// (R3), so the advice names the entry to replace instead — advice that loads
+/// (#735 review D2).
+fn describe_inert_tools(
+    inert: &[crate::config::InertTool],
+    project: &crate::config::TierReport,
+    claimed: &std::collections::BTreeMap<String, String>,
+) -> String {
+    if inert.is_empty() {
+        return String::new();
+    }
+    let project_file = project.path();
+    let mut out = String::from("inert tools (declared, not in allow_tools):\n");
+    for tool in inert {
+        // A bare entry resolves only in the file that *declares* the tool, so a
+        // user-tier tool's advice names the user file. Advising the project file
+        // there is advice that does not load (#735 review S1).
+        let where_to_write = match tool.origin() {
+            crate::config::ToolOrigin::User(path) => Some(path.as_path()),
+            _ => project_file,
+        };
+        let where_to_write = match where_to_write {
+            Some(path) => crate::one_line::path(path).to_string(),
+            None => "the project config".to_owned(),
+        };
+        let entry = crate::config::builtin_print::toml_string(&tool.allow_tools_entry());
+        let advice = match claimed.get(tool.name()) {
+            Some(existing) => format!(
+                "replace {} with {entry} in allow_tools in {where_to_write}",
+                crate::config::builtin_print::toml_string(existing),
+            ),
+            None => format!("add {entry} to allow_tools in {where_to_write}"),
+        };
+        out.push_str(&format!(
+            "  {} ({}; {advice})\n",
+            crate::config::escape_str(tool.name()),
+            crate::config::describe_origin(tool.origin()),
+        ));
+    }
+    out
+}
+
 /// The persisted egress references of one `[network]` table and what each
-/// grants (ADR-0059): `tool:NAME` and, since #511, `set:NAME`.
+/// grants (ADR-0059): `set:NAME` only, since #735 removed `tool:NAME`.
 ///
 /// Empty when the table has none, so `doctor` output for every config written
 /// before #506 is byte-identical. Each expansion is listed because this is
@@ -1384,8 +1445,8 @@ fn render_conflicts(conflicts: &[ConfigConflict]) -> String {
         out.push_str(&format!(
             "warning: tool {} in {} overrides\n         {}; differing fields: {}\n",
             crate::config::quoted_str(conflict.tool()),
-            crate::one_line::path(conflict.user_file()),
-            crate::one_line::path(conflict.project_file()),
+            crate::one_line::path(conflict.winner_file()),
+            crate::one_line::path(conflict.overridden_file()),
             fields,
         ));
     }
@@ -1652,7 +1713,8 @@ fn describe_project_default_observation(
 /// ADR-0074 R11: the project config (its own `image`, or an `ALIAS:image`
 /// selection) outranks the `:trust` source, so the losing row is the **user** one.
 /// An unselected source image is reported as inert — it exists, changes nothing,
-/// and the row says how to select it.
+/// and the row says how to select it, without claiming the project config already
+/// asks for it when it does not.
 fn describe_image_tiers(images: &ConfiguredImages) -> String {
     let user = describe_configured_image(images.user());
     let mut out = if images.user().is_some() && images.project().is_some() {
@@ -1666,12 +1728,34 @@ fn describe_image_tiers(images: &ConfiguredImages) -> String {
     ));
     for inert in images.inert() {
         out.push_str(&format!(
-            "source {alias}: {}  (not selected; the project config selects it with image = \"{alias}:image\")\n",
+            "source {alias}: {}  ({})\n",
             describe_configured_image(Some(inert.image())),
+            inert_selection(images, inert.alias()),
             alias = inert.alias(),
         ));
     }
     out
+}
+
+/// Why a declared source image is inert, and what would select it.
+///
+/// The authorization is read from the project config's own `image`: only an
+/// `ALIAS:image` naming *this* source selects it, so a project config with no
+/// `image` at all — or one naming another source or a direct reference — must not
+/// be quoted as already selecting it. The unselected row is correct either way; the
+/// sentence is the only thing that depends on the configuration.
+fn inert_selection(
+    images: &ConfiguredImages,
+    alias: &crate::config_sources::SourceAlias,
+) -> String {
+    if images.project().and_then(ConfiguredImage::via) == Some(alias) {
+        format!("not selected; the project config selects it with image = \"{alias}:image\"")
+    } else {
+        format!(
+            "not selected; nothing in the project config authorizes it — to select it, write \
+             image = \"{alias}:image\" in the project config"
+        )
+    }
 }
 
 /// `ghcr.io/owner/name:tag [/path/to/config.toml]`, or
@@ -2334,11 +2418,10 @@ mod tests {
         for (id, name) in [(&id_a, "from-a"), (&id_b, "from-b")] {
             let config = store.join(id).join("config.toml");
             std::fs::create_dir_all(config.parent().unwrap()).unwrap();
-            std::fs::write(
+            write_config(
                 &config,
                 format!("[[tools]]\nname = \"{name}\"\ncommand = \"{name}\"\n"),
-            )
-            .unwrap();
+            );
         }
 
         let mut out = Vec::new();
@@ -3027,6 +3110,19 @@ credentials:
         std::fs::write(path, contents).unwrap();
     }
 
+    /// A user or project config whose declared tools are authorized (#735).
+    ///
+    /// The same migration `config::tests` applies: a fixture that declares
+    /// `[[tools]]` and expects a verb gets the `allow_tools` line #735 requires.
+    /// A body naming `allow_tools` itself is left alone.
+    fn write_config(path: &Path, contents: impl AsRef<[u8]>) {
+        let text = String::from_utf8_lossy(contents.as_ref());
+        write_file(
+            path,
+            crate::config::test_support::authorized_fixture(&text, &[]).as_bytes(),
+        );
+    }
+
     #[test]
     fn reset_moves_db_dir_with_all_files() {
         let home = tempfile::tempdir().unwrap();
@@ -3354,11 +3450,10 @@ credentials:
         let bin = tempfile::tempdir().unwrap();
         let log = bin.path().join("argv");
         let mv = bin.path().join("mv");
-        std::fs::write(
+        write_config(
             &mv,
             "#!/bin/sh\nprintf '%s\\0' \"$@\" > \"${MV_ARGV_LOG:?}\"\n",
-        )
-        .unwrap();
+        );
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&mv, std::fs::Permissions::from_mode(0o755)).unwrap();
         let path = format!(
@@ -3424,19 +3519,19 @@ credentials:
         std::fs::create_dir_all(project.join(".agent-vm")).unwrap();
         let user = home.join(".config/agent-vm/config.toml");
         let project_file = project.join(".agent-vm/config.toml");
-        std::fs::write(
+        write_config(
             &user,
-            "image = \"ghcr.io/acme/user:1\"\n[[tools]]\nname = \"t\"\ncommand = \"t\"\n",
-        )
-        .unwrap();
-        // `t` collides with the user tier (the conflict warning), `u` exists only in
-        // the project tier (the `source=project:` row).
-        std::fs::write(
+            "image = \"ghcr.io/acme/user:1\"\nallow_tools = [\"t\"]\n[[tools]]\nname = \"t\"\ncommand = \"t\"\n",
+        );
+        // `t` collides with the user tier (the project's authorization overrides
+        // the user verb, and the differing definition is the conflict warning);
+        // `u` exists only in the project tier (the `source=project:` row).
+        write_config(
             &project_file,
-            "image = \"ghcr.io/acme/project:1\"\n[[tools]]\nname = \"t\"\ncommand = \"other\"\n\
+            "image = \"ghcr.io/acme/project:1\"\nallow_tools = [\"t\", \"u\"]\n\
+             [[tools]]\nname = \"t\"\ncommand = \"other\"\n\
              [[tools]]\nname = \"u\"\ncommand = \"u\"\n",
-        )
-        .unwrap();
+        );
 
         let (text, _, _) = describe_config(config_report(Some(&user), &project_file));
 
@@ -3446,13 +3541,11 @@ credentials:
                 "the project tier line",
                 format!("{} (found", project_file.display()),
             ),
+            // #735: the project's `allow_tools` overrides the user verb, so the
+            // warning's winner is the project file and the loser is the user one.
             (
                 "the conflict warning",
-                format!("in {} overrides", user.display()),
-            ),
-            (
-                "the user tool row",
-                format!("source=user:{}", user.display()),
+                format!("overrides\n         {}", user.display()),
             ),
             (
                 "the project tool row",
@@ -4301,11 +4394,10 @@ substituted."#;
     fn doctor_lists_persisted_egress_references() {
         let dir = tempfile::tempdir().unwrap();
         let user = dir.path().join("config.toml");
-        std::fs::write(
+        write_config(
             &user,
-            "[[tools]]\nname = \"codex\"\ncommand = \"codex\"\nnetwork_requests = [\"api.openai.com\", \"auth.openai.com\", \"chatgpt.com\"]\n\n[network]\nallow_egress = [\"tool:codex\"]\n",
-        )
-        .unwrap();
+            "[[tools]]\nname = \"codex\"\ncommand = \"codex\"\nnetwork_requests = [\"api.openai.com\", \"auth.openai.com\", \"chatgpt.com\"]\n\n[egress_sets]\ncodex = [\"tcp://api.openai.com:443\", \"tcp://auth.openai.com:443\", \"tcp://chatgpt.com:443\"]\n\n[network]\nallow_egress = [\"set:codex\"]\n",
+        );
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&user, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -4314,7 +4406,7 @@ substituted."#;
         assert!(failure.is_none(), "{text}");
         assert!(
             text.ends_with(&format!(
-                "persisted egress references in \"{}\" [network]:\n  tool:codex -> tcp://api.openai.com:443, tcp://auth.openai.com:443, tcp://chatgpt.com:443",
+                "persisted egress references in \"{}\" [network]:\n  set:codex -> tcp://api.openai.com:443, tcp://auth.openai.com:443, tcp://chatgpt.com:443",
                 crate::one_line::path(&user)
             )),
             "{text}"
@@ -4322,11 +4414,10 @@ substituted."#;
 
         // A `[network]` table with no reference prints nothing new.
         let other = dir.path().join("other.toml");
-        std::fs::write(
+        write_config(
             &other,
             "[[tools]]\nname = \"codex\"\ncommand = \"codex\"\n\n[network]\nallow_egress = [\"10.0.0.5\"]\n",
-        )
-        .unwrap();
+        );
         std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o600)).unwrap();
         let report = config_report(Some(&other), &dir.path().join("absent.toml"));
         let (text, failure, _) = describe_config(report);
@@ -4342,15 +4433,15 @@ substituted."#;
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let user = dir.path().join("config.toml");
-        std::fs::write(
+        write_config(
             &user,
             "[[tools]]\nname = \"codex\"\ncommand = \"codex\"\nnetwork_requests = [\"api.openai.com\"]\n\n\
              [egress_sets]\ncorp = [\"git.corp.example\", \"tcp://registry.corp.example:8443\", \"10.0.0.5\"]\n\
-             agents = [\"tool:codex\", \"set:corp\"]\n\
+             codex = [\"tcp://api.openai.com:443\"]\n\
+             agents = [\"set:codex\", \"set:corp\"]\n\
              unused = [\"10.9.9.9\"]\n\n\
              [network]\nallow_egress = [\"set:agents\"]\n",
-        )
-        .unwrap();
+        );
         std::fs::set_permissions(&user, std::fs::Permissions::from_mode(0o600)).unwrap();
         let report = config_report(Some(&user), &dir.path().join("absent.toml"));
         let (text, failure, _) = describe_config(report);
@@ -4378,14 +4469,13 @@ substituted."#;
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let user = dir.path().join("config.toml");
         let literals: Vec<String> = (0..65).map(|i| format!("\"10.0.0.{i}\"")).collect();
-        std::fs::write(
+        write_config(
             &user,
             format!(
                 "[egress_sets]\nbig = [{}]\n\n[network]\nallow_egress = [\"set:big\"]\n",
                 literals.join(", ")
             ),
-        )
-        .unwrap();
+        );
         std::fs::set_permissions(&user, std::fs::Permissions::from_mode(0o600)).unwrap();
         let report = config_report(Some(&user), &dir.path().join("absent.toml"));
         let (text, failure, _) = describe_config(report);
@@ -4487,11 +4577,10 @@ substituted."#;
     fn describe_tool_shows_only_the_env_count_never_a_value() {
         let dir = tempfile::tempdir().unwrap();
         let user = dir.path().join("user.toml");
-        std::fs::write(
+        write_config(
             &user,
             "[[tools]]\nname = \"vault\"\ncommand = \"vault\"\nenv = { TOKEN = \"sk-secret\" }\n",
-        )
-        .unwrap();
+        );
         let report = config_report(Some(&user), &dir.path().join("absent.toml"));
 
         let (text, _, _) = describe_config(report);
@@ -4509,7 +4598,7 @@ substituted."#;
     fn describe_config_distinguishes_a_found_empty_tier_from_an_absent_one() {
         let dir = tempfile::tempdir().unwrap();
         let user = dir.path().join("user.toml");
-        std::fs::write(&user, "").unwrap();
+        write_config(&user, "");
         let report = config_report(Some(&user), &dir.path().join("absent.toml"));
 
         let (text, _, _) = describe_config(report);
@@ -4525,7 +4614,7 @@ substituted."#;
     fn describe_config_labels_the_shell_fallback() {
         let dir = tempfile::tempdir().unwrap();
         let user = dir.path().join("user.toml");
-        std::fs::write(&user, "[[tools]]\nname = \"solo\"\ncommand = \"solo\"\n").unwrap();
+        write_config(&user, "[[tools]]\nname = \"solo\"\ncommand = \"solo\"\n");
         let report = config_report(Some(&user), &dir.path().join("absent.toml"));
 
         let (text, _, _) = describe_config(report);
@@ -4539,16 +4628,14 @@ substituted."#;
         let dir = tempfile::tempdir().unwrap();
         let user = dir.path().join("user.toml");
         let project = dir.path().join("project.toml");
-        std::fs::write(
+        write_config(
             &user,
             "[[tools]]\nname = \"t\"\ncommand = \"t\"\nargs = [\"--token=SENTINEL\"]\n",
-        )
-        .unwrap();
-        std::fs::write(
+        );
+        write_config(
             &project,
             "[[tools]]\nname = \"t\"\ncommand = \"t\"\nargs = [\"other\"]\n",
-        )
-        .unwrap();
+        );
         let report = config_report(Some(&user), &project);
 
         let (text, _, _) = describe_config(report);
@@ -4564,7 +4651,7 @@ substituted."#;
         let evil = dir.path().join("user\x1b[31m\nname");
         std::fs::create_dir_all(&evil).unwrap();
         let user = evil.join("config.toml");
-        std::fs::write(&user, "").unwrap();
+        write_config(&user, "");
         let report = config_report(Some(&user), &dir.path().join("absent.toml"));
 
         let (text, _, _) = describe_config(report);
@@ -4584,11 +4671,10 @@ substituted."#;
     fn describe_config_escapes_control_bytes_in_a_command() {
         let dir = tempfile::tempdir().unwrap();
         let user = dir.path().join("user.toml");
-        std::fs::write(
+        write_config(
             &user,
             "[[tools]]\nname = \"t\"\ncommand = \"evil\\u001b[31m\\nred\"\n",
-        )
-        .unwrap();
+        );
         let report = config_report(Some(&user), &dir.path().join("absent.toml"));
 
         let (text, _, _) = describe_config(report);
@@ -4612,7 +4698,7 @@ substituted."#;
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = dir.join(crate::credential_yaml::CREDENTIALS_FILE_NAME);
-        std::fs::write(&path, body).unwrap();
+        write_config(&path, body);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let set = crate::credential_yaml::load(home.path()).expect("the fixture loads");
         (home, set)
@@ -4670,7 +4756,7 @@ credentials:
         // authorized `anthropic` is inert.
         let dir = tempfile::tempdir().unwrap();
         let user = dir.path().join("user.toml");
-        std::fs::write(&user, "[[tools]]\nname = \"solo\"\ncommand = \"solo\"\n").unwrap();
+        write_config(&user, "[[tools]]\nname = \"solo\"\ncommand = \"solo\"\n");
         let catalog = config_report(Some(&user), &dir.path().join("absent.toml"))
             .into_launch_catalog()
             .expect("the one-tool catalog builds");
@@ -4694,12 +4780,11 @@ credentials:
     fn launch_selection_reports_requested_authorized_names_and_nothing_else() {
         let dir = tempfile::tempdir().unwrap();
         let user = dir.path().join("user.toml");
-        std::fs::write(
+        write_config(
             &user,
             "[[tools]]\nname = \"t\"\ncommand = \"t\"\n\
              credentials = [\"alpha\", \"anthropic\", \"gamma\"]\n",
-        )
-        .unwrap();
+        );
         let catalog = config_report(Some(&user), &dir.path().join("absent.toml"))
             .into_launch_catalog()
             .expect("the one-tool catalog builds");
@@ -5009,11 +5094,10 @@ credentials:
         let user = dir.path().join("user.toml");
         let project = dir.path().join("project.toml");
         let base = "[[tools]]\nname = \"t\"\ncommand = \"t\"\n";
-        std::fs::write(
+        write_config(
             &user,
             format!("{base}network_requests = [\"b.example:8443\",\"a.example\"]\n"),
-        )
-        .unwrap();
+        );
         // The rendered row is the catalog's: `describe_tool` takes the resolved
         // entry, so every assertion here reads the launch verb the user sees.
         let describe = |user: &std::path::Path, project: &std::path::Path| {
@@ -5027,23 +5111,31 @@ credentials:
                 .ends_with("; network_requests=a.example,tcp://b.example:8443")
         );
         let names: Vec<_> = (0..9).map(|i| format!("\"n{i}.example\"")).collect();
-        std::fs::write(
+        write_config(
             &user,
             format!("{base}network_requests = [{}]\n", names.join(",")),
-        )
-        .unwrap();
+        );
         assert!(describe(&user, &project).ends_with("; network_requests=n0.example,n1.example,n2.example,n3.example,n4.example,n5.example,n6.example,n7.example,+1 more"));
-        std::fs::write(&project, base).unwrap();
+        // The project's authorization overrides the user verb; its definition is
+        // the one rendered from here on.
+        write_config(
+            &project,
+            format!(
+                "allow_tools = [\"t\"]\n{base}network_requests = [\"b.example:8443\",\"a.example\"]\n"
+            ),
+        );
         assert!(
             describe_config(config_report(Some(&user), &project))
                 .0
                 .contains("differing fields: network_requests")
         );
-        std::fs::write(
-            &user,
-            format!("{base}network_requests = [\"sk-test-sensitivevalue\"]\n"),
-        )
-        .unwrap();
+        // The project's definition is the winner, so the sentinel goes there.
+        write_config(
+            &project,
+            format!(
+                "allow_tools = [\"t\"]\n{base}network_requests = [\"sk-test-sensitivevalue\"]\n"
+            ),
+        );
         let row = describe(&user, &project);
         assert!(row.ends_with("; network_requests=sk-test-sensitivevalue"));
         assert_eq!(row.matches("sk-test-sensitivevalue").count(), 1);
@@ -5087,9 +5179,12 @@ credentials:
             self.project.path().join(relative)
         }
 
+        /// Write one fixture file verbatim: a *sourced* file refuses
+        /// `allow_tools` by presence (#735), so authorization belongs in the
+        /// project body these tests write themselves.
         fn write(&self, path: &Path, body: &str) {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, body).unwrap();
+            write_file(path, body.as_bytes());
         }
 
         /// Write the project config into a `0700` store directory, then load.
@@ -5125,7 +5220,8 @@ credentials:
     fn v18_describe_config_renders_sources_and_a_not_sourced_user_tier() {
         let f = SourcesDoctor::new();
         let report = f.load(
-            "sources = [\"home:trust ~/.config/agent-vm/config.toml\", \"repo ./.agent-vm/config.toml\"]\n",
+            "sources = [\"home:trust ~/.config/agent-vm/config.toml\", \"repo ./.agent-vm/config.toml\"]\n\
+             allow_tools = [\"home:home-tool\", \"repo:repo-tool\"]\n",
             "[[tools]]\nname = \"home-tool\"\ncommand = \"home-tool\"\n",
             "[[tools]]\nname = \"repo-tool\"\ncommand = \"repo-tool\"\n",
         );
@@ -5171,7 +5267,7 @@ credentials:
     fn v18_implicit_sourcing_prints_no_sources_block_and_flips_the_override_row() {
         let dir = tempfile::tempdir().unwrap();
         let user = dir.path().join("config.toml");
-        std::fs::write(&user, "image = \"localhost:1/u:latest\"\n").unwrap();
+        write_config(&user, "image = \"localhost:1/u:latest\"\n");
         let report = config_report(Some(&user), &dir.path().join("absent.toml"));
         let (text, _, _) = describe_config(report);
         assert!(!text.contains("sources:"), "{text}");
@@ -5214,7 +5310,7 @@ credentials:
             rows,
             "user:    none\n\
              project: localhost:1/repo:latest [repo:image /w/app/.agent-vm/config.toml]\n\
-             source team: localhost:1/team:latest [/w/app/team.toml]  (not selected; the project config selects it with image = \"team:image\")\n"
+             source team: localhost:1/team:latest [/w/app/team.toml]  (not selected; nothing in the project config authorizes it — to select it, write image = \"team:image\" in the project config)\n"
         );
 
         // A path holding ESC is escaped in every new row.
@@ -5237,6 +5333,57 @@ credentials:
                 Some(&LegacyProjectConfig::Sourced)
             ),
             "==> tool configuration\nuser:    x\n"
+        );
+    }
+
+    /// The inert row reports what the project config's `image` says, not what would
+    /// select the image: a project config that declares no `image` (or one naming
+    /// another source, or a direct reference) authorizes nothing here, and the row
+    /// says so plus what to write.
+    ///
+    /// Both arms are the renderer's input contract. `resolve_images` selects an
+    /// authorized source's image rather than listing it as inert, so a real report
+    /// reaches the first arm only if a selection rule ever keeps an authorized image
+    /// unselected — the sentence still follows the configuration, not the shape of
+    /// the list it was handed.
+    #[test]
+    fn an_inert_source_image_states_whether_the_project_config_authorizes_it() {
+        let inert_team = || {
+            crate::config::InertImage::for_test(
+                "localhost:1/team:latest",
+                PathBuf::from("/w/app/team.toml"),
+                "team",
+            )
+        };
+
+        let images = crate::config::ConfiguredImages::for_test(crate::config::ImageTierFixture {
+            inert: vec![inert_team()],
+            ..Default::default()
+        });
+        assert_eq!(
+            describe_image_tiers(&images),
+            "user:    none\n\
+             project: none\n\
+             source team: localhost:1/team:latest [/w/app/team.toml]  (not selected; nothing in \
+            the project config authorizes it — to select it, write image = \"team:image\" in the \
+            project config)\n"
+        );
+
+        let images = crate::config::ConfiguredImages::for_test(crate::config::ImageTierFixture {
+            project: Some(crate::config::ConfiguredImage::for_test_via(
+                "localhost:1/team:latest",
+                PathBuf::from("/w/app/team.toml"),
+                "team",
+            )),
+            inert: vec![inert_team()],
+            ..Default::default()
+        });
+        assert_eq!(
+            describe_image_tiers(&images),
+            "user:    none\n\
+             project: localhost:1/team:latest [team:image /w/app/team.toml]\n\
+             source team: localhost:1/team:latest [/w/app/team.toml]  (not selected; the project \
+            config selects it with image = \"team:image\")\n"
         );
     }
 }

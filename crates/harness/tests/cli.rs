@@ -1543,7 +1543,7 @@ fn the_binary_checks_the_mutation_anchors() {
     );
     assert_eq!(
         String::from_utf8(output.stdout).expect("the anchor report is UTF-8"),
-        "PASS: 247 mutation anchors (find text only; a real run compiles each replacement)\n"
+        "PASS: 259 mutation anchors (find text only; a real run compiles each replacement)\n"
     );
 }
 

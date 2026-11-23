@@ -22,8 +22,9 @@ pub(crate) struct EffectiveEgress {
 pub(crate) struct EgressRow {
     pub(crate) destination: RowDestination,
     pub(crate) ports: RowPorts,
-    /// The egress reference as written (`set:NAME`, `tool:NAME`), `None` when
-    /// granted directly.
+    /// What granted the row, in the words of its source: an egress reference as
+    /// written (`set:NAME`), the authorized tool that declared the requests
+    /// (#735), or `None` when granted directly.
     pub(crate) via: Option<String>,
     pub(crate) source: RowSource,
     pub(crate) status: RowStatus,
@@ -70,6 +71,9 @@ pub(crate) enum RowPorts {
 pub(crate) enum RowSource {
     PersistedGrant,
     AllowEgress,
+    /// #735: granted by the launched tool's own `network_requests`, because an
+    /// `allow_tools` entry authorized it.
+    AuthorizedTool,
     AllowInternetEgress,
     AllowLan,
     AllowHost,
@@ -194,6 +198,7 @@ impl RowSource {
         match self {
             Self::PersistedGrant => "persisted grant",
             Self::AllowEgress => "--allow-egress",
+            Self::AuthorizedTool => "authorized tool",
             Self::AllowInternetEgress => "--allow-internet-egress",
             Self::AllowLan => "--allow-lan",
             Self::AllowHost => "--allow-host",

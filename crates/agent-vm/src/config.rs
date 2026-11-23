@@ -148,7 +148,7 @@ use crate::boot_image::ImageRef;
 use crate::credential_provider::{CredentialProvider, ProviderSet};
 use crate::secret_store::ServiceName;
 
-mod builtin_print;
+pub(crate) mod builtin_print;
 pub(crate) use builtin_print::builtin_tools_toml;
 
 /// Ceiling on a config file read. A project config is possibly untrusted
@@ -276,6 +276,13 @@ impl ConfigPaths {
         Self::for_test_with_home(user, project, None)
     }
 
+    /// [`Self::with_home`] for another module's tests: a *captured* project, so a
+    /// fixture can declare `sources` at all.
+    #[cfg(test)]
+    pub(crate) fn for_test_captured(home: PathBuf, project: &crate::project::ProjectDir) -> Self {
+        Self::with_home(Some(home), project)
+    }
+
     /// [`Self::for_test`] with the `~/` base some user-tier fixtures expand
     /// against.
     #[cfg(test)]
@@ -308,6 +315,12 @@ pub(crate) struct ConfigReport {
     conflicts: Vec<ConfigConflict>,
     /// What the project config sourced (ADR-0074), in declaration order.
     sources: SourcesReport,
+    /// Every arena position that is neither authorized nor an overridden `:trust`
+    /// definition, in arena order: `doctor`'s `inert tools` block (#735).
+    inert_tools: Vec<InertTool>,
+    /// The load's **one** leaf-visit counter, from `read_project_tier` through
+    /// every source read and into the single catalog build (#735, D6).
+    mount_work: config_mounts::MountExpansionWork,
 }
 
 impl ConfigReport {
@@ -346,12 +359,12 @@ impl ConfigReport {
         self.user_network.as_ref()
     }
 
-    /// The namespace a CLI `tool:NAME` resolves against: the **user tier's own**
-    /// tools, from the same read as their trust verdict, captured before the
-    /// cross-tier merge (ADR-0059).
+    /// The namespace a CLI `set:NAME` resolves against: the **user tier's own**
+    /// `[egress_sets]`, from the same read as their trust verdict, captured before
+    /// the cross-tier merge (ADR-0059).
     ///
     /// `None` when there is no user file at all, which is why a reference then
-    /// reports "no user config file was found" rather than an unknown name. Read
+    /// reports "no user config file was found" rather than an unknown set. Read
     /// before `into_launch_catalog` consumes the report, like [`Self::images`].
     pub(crate) fn user_tool_requests(&self) -> Option<&EgressNamespace> {
         self.user_tools.as_ref()
@@ -376,6 +389,26 @@ impl ConfigReport {
     /// dedupe.
     pub(crate) fn conflicts(&self) -> &[ConfigConflict] {
         &self.conflicts
+    }
+
+    /// Declared tools no `allow_tools` entry authorizes, in arena order: what
+    /// `doctor` lists with the exact spelling that would activate each one.
+    pub(crate) fn inert_tools(&self) -> &[InertTool] {
+        &self.inert_tools
+    }
+
+    /// The launch verbs the project's own `allow_tools` list decided, with the entry
+    /// that decided each, so `doctor` can advise *replacing* one instead of adding a
+    /// second, refused entry (#735 review D2).
+    pub(crate) fn project_claims(&self) -> &BTreeMap<String, String> {
+        self.resolved.project_claim_entries()
+    }
+
+    /// Leaf visits this load admitted. Test-only: the resource rule is otherwise
+    /// observable only as the refusal.
+    #[cfg(test)]
+    pub(crate) fn mount_work_used(&self) -> usize {
+        self.mount_work.used()
     }
 
     /// The catalog a launch actually offers: the merge result, plus the
@@ -404,20 +437,15 @@ impl ConfigReport {
     fn catalog_with_work(self) -> (Result<LaunchCatalog>, config_mounts::MountExpansionWork) {
         let ConfigReport {
             resolved,
-            user_mounts,
+            mount_work,
             ..
         } = self;
-        // The catalog fold continues the verified parse's leaf-visit budget
-        // rather than starting a fresh one: tool lists and an inherited closure
-        // amplify the same leaves the parse already admitted, so a per-launch or
-        // per-tier counter would be a second, unbounded budget for the same file.
-        // Built-in tools cannot carry mounts, so `fresh` is exact on the defaults
-        // path.
-        let mut work = user_mounts
-            .as_ref()
-            .map_or_else(config_mounts::MountExpansionWork::fresh, |mounts| {
-                mounts.continuing_work()
-            });
+        // The catalog fold continues the load's one leaf-visit budget rather than
+        // starting a fresh one: tool lists and an inherited closure amplify the
+        // same leaves the parse already admitted, so a per-launch or per-tier
+        // counter would be a second, unbounded budget for the same load. The report
+        // is consumed by value, so one load funds exactly one catalog build.
+        let mut work = mount_work;
         let catalog = catalog_from_tools(resolved, &mut work);
         (catalog, work)
     }
@@ -533,6 +561,11 @@ pub(crate) struct CatalogEntry {
     /// the same one visited mask. Empty for a direct launch and for anything the
     /// built-in catalog supplies.
     mounts: ResolvedMountList,
+    /// True iff an `allow_tools` entry (or a `:trust` inheritance) selected this
+    /// verb: the one condition under which its own `network_requests` are granted
+    /// as egress on launch (#735, R5). False for the compiled-in defaults and for
+    /// the synthesized `shell` fallback, which keep ADR-0036 default-deny.
+    authorized_egress: bool,
 }
 
 impl CatalogEntry {
@@ -565,6 +598,12 @@ impl CatalogEntry {
     /// selection; it never changes what is resolved here.
     pub(crate) fn mounts(&self) -> &ResolvedMountList {
         &self.mounts
+    }
+
+    /// Whether this entry was explicitly authorized, which is what makes its own
+    /// `network_requests` authoritative egress (#735).
+    pub(crate) fn is_authorized_egress(&self) -> bool {
+        self.authorized_egress
     }
 }
 
@@ -634,34 +673,90 @@ fn builtin_shell() -> Result<Tool> {
 /// [`ResolvedTools::definitions`] and is neither a CLI identity nor a service
 /// name, so holding one says nothing about what a launch offers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct DefinitionId(usize);
+pub(crate) struct DefinitionId(usize);
 
 /// Every retained tool definition plus which of them are launch verbs.
 ///
 /// Retaining the losers is what makes a tier-local reference resolvable: a
-/// project definition hidden by a user name conflict still supplies that
+/// project definition no `allow_tools` entry authorizes still supplies that
 /// project file's `tools` references (#395). Hidden definitions are dropped once
 /// their facets are folded, so nothing downstream can mistake one for a verb. No
-/// mutator exists, and both constructors live here.
+/// mutator exists, and every constructor lives here.
 #[derive(Debug)]
 pub(crate) struct ResolvedTools {
-    /// Complete user declarations, then complete project declarations (hidden
-    /// same-name losers included); on the defaults path, every shipped
-    /// definition.
+    /// Complete user declarations, then complete project declarations, then each
+    /// source's declarations in `sources` order (inert ones included); on the
+    /// defaults path, every shipped definition followed by every source
+    /// definition, so their references are still validated (#735, V22).
     definitions: Vec<Tool>,
-    /// The launch winners' arena positions, unique and strictly increasing, in
-    /// launch order: user declarations first, then project-only declarations.
+    /// The launch winners' arena positions: unique, in launch (**authorization**)
+    /// order, and never assumed to be arena order. A project override replaces an
+    /// inherited `:trust` verb in place, so the sequence may decrease.
     launches: Vec<DefinitionId>,
+    /// The same launches as a set, so the closure-authorization rule checks an
+    /// exact `DefinitionId` rather than a name (#735, R6).
+    authorized: BTreeSet<DefinitionId>,
+    /// True when an `allow_tools` entry or a `:trust` inheritance selected these
+    /// verbs. False for the compiled-in defaults and the singleton `shell`
+    /// fallback, whose tools are never `allow_tools`-authorized: their
+    /// `network_requests` stay non-authoritative metadata (ADR-0036/ADR-0039).
+    authorized_explicitly: bool,
+    /// Declared definitions that are neither authorized nor an overridden
+    /// `:trust` one, in arena order: what `doctor` reports as inert.
+    inert: Vec<InertTool>,
+    /// The verbs the **project's own** `allow_tools` list decided in Step B, each
+    /// with the entry spelling that decided it (`<alias>:<name>` or bare), so
+    /// `doctor` can advise *replacing* a claim instead of adding a second, refused
+    /// entry for the same verb (#735 review D2). Empty when the project writes no
+    /// list, and on both defaults paths.
+    project_claims: BTreeMap<String, String>,
 }
 
 impl ResolvedTools {
     /// A catalog whose every definition is a launch verb: the shipped defaults,
     /// and the singleton fallback scope.
     fn from_defaults(tools: Vec<Tool>) -> Self {
-        let launches = (0..tools.len()).map(DefinitionId).collect();
+        let launches: Vec<DefinitionId> = (0..tools.len()).map(DefinitionId).collect();
+        let authorized = launches.iter().copied().collect();
         Self {
             definitions: tools,
             launches,
+            authorized,
+            authorized_explicitly: false,
+            inert: Vec::new(),
+            project_claims: BTreeMap::new(),
+        }
+    }
+
+    /// The compiled-in defaults, **retaining** every source definition beside
+    /// them (#735, D4/finding 2).
+    ///
+    /// The defaults apply because neither the user nor the project file
+    /// configures tools, but a sourced file may still declare one — and a
+    /// dangling `tools = [...]` reference is an error in the file that contains
+    /// it even when nothing authorizes it. Keeping those definitions in the arena
+    /// means `resolve_provisioning`'s one explicit-reference loop validates them,
+    /// with no second validator to drift. Only the shipped positions are verbs.
+    fn from_defaults_retaining(defaults: Vec<Tool>, sources: Vec<Tool>) -> Self {
+        let shipped = defaults.len();
+        let mut definitions = defaults;
+        definitions.extend(sources);
+        let launches: Vec<DefinitionId> = (0..shipped).map(DefinitionId).collect();
+        let authorized = launches.iter().copied().collect();
+        let inert = definitions[shipped..]
+            .iter()
+            .map(|tool| InertTool {
+                name: tool.name.clone(),
+                origin: tool.origin.clone(),
+            })
+            .collect();
+        Self {
+            definitions,
+            launches,
+            authorized,
+            authorized_explicitly: false,
+            inert,
+            project_claims: BTreeMap::new(),
         }
     }
 
@@ -671,6 +766,55 @@ impl ResolvedTools {
     /// instead.
     pub(crate) fn launch_tools(&self) -> impl ExactSizeIterator<Item = &Tool> + '_ {
         self.launches.iter().map(|id| &self.definitions[id.0])
+    }
+
+    /// The launch verbs the **project's own** `allow_tools` list claims, with the
+    /// entry that claims each — the literal spelling the list wrote, so a verb
+    /// claimed by `home:claude` is reported as `home:claude` even when the resolved
+    /// definition dedupes to the user tier (#735 review D2).
+    ///
+    /// `doctor` uses this to advise *replacing* a claim instead of adding a second
+    /// entry for the same verb, which R3 refuses.
+    pub(crate) fn project_claim_entries(&self) -> &BTreeMap<String, String> {
+        &self.project_claims
+    }
+
+    /// Declared tools nothing authorized, in arena order.
+    pub(crate) fn inert_tools(&self) -> &[InertTool] {
+        &self.inert
+    }
+}
+
+/// One declared tool no `allow_tools` entry authorizes (#735).
+///
+/// Holds the provenance as well as the name so `doctor` can name the file and the
+/// exact `allow_tools` spelling without re-deriving either, and so a source's
+/// alias is available for a qualified entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InertTool {
+    name: ToolName,
+    origin: ToolOrigin,
+}
+
+impl InertTool {
+    pub(crate) fn name(&self) -> &str {
+        self.name.as_str()
+    }
+
+    pub(crate) fn origin(&self) -> &ToolOrigin {
+        &self.origin
+    }
+
+    /// The exact `allow_tools` entry that would authorize this tool: qualified
+    /// for a sourced definition, bare for a user or project one.
+    pub(crate) fn allow_tools_entry(&self) -> String {
+        match &self.origin {
+            ToolOrigin::Source { alias, .. } => format!("{alias}:{}", self.name.as_str()),
+            // Nothing can authorize a built-in definition; it is never inert.
+            ToolOrigin::BuiltIn | ToolOrigin::User(_) | ToolOrigin::Project(_) => {
+                self.name.as_str().to_owned()
+            }
+        }
     }
 }
 
@@ -1013,6 +1157,18 @@ impl Tool {
 pub(crate) struct ToolName(String);
 
 impl ToolName {
+    /// The validated constructor for an `allow_tools` entry name: `None` for a
+    /// name [`tool_name_rejection`] refuses.
+    ///
+    /// It is not the type's only constructor. `validate_name` builds one after the
+    /// same rejection, and a `tools = [...]` reference builds one after checking
+    /// only for empty and NUL (#735 review D6).
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
+        tool_name_rejection(raw)
+            .is_none()
+            .then(|| Self(raw.to_owned()))
+    }
+
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
@@ -1230,8 +1386,12 @@ impl ToolField {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ConfigConflict {
     tool: ToolName,
-    user_file: PathBuf,
-    project_file: PathBuf,
+    /// The file whose definition the launch offers.
+    winner_file: PathBuf,
+    /// The file whose definition lost the verb — a `:trust` authorization
+    /// overridden by the project config (#735), or a project declaration replaced
+    /// by the user file's.
+    overridden_file: PathBuf,
     fields: Vec<ToolField>,
 }
 
@@ -1240,12 +1400,12 @@ impl ConfigConflict {
         self.tool.as_str()
     }
 
-    pub(crate) fn user_file(&self) -> &Path {
-        &self.user_file
+    pub(crate) fn winner_file(&self) -> &Path {
+        &self.winner_file
     }
 
-    pub(crate) fn project_file(&self) -> &Path {
-        &self.project_file
+    pub(crate) fn overridden_file(&self) -> &Path {
+        &self.overridden_file
     }
 
     /// Nonempty; in fixed schema order.
@@ -1266,12 +1426,17 @@ impl ConfigConflict {
 /// (ADR-0074). A project config that lists no `sources` behaves exactly as the
 /// implicit `home:trust <user config>`, which is #733's shipped two-tier load.
 pub(crate) fn load(paths: &ConfigPaths) -> Result<ConfigReport> {
+    // One leaf-visit counter for the whole load (#735, D6): project tool lists,
+    // then each source in `sources` order (the `:trust` user file at its own
+    // position). It is moved into the report so the single catalog build
+    // continues from exactly here.
+    let mut work = config_mounts::MountExpansionWork::fresh();
     let ProjectRead {
         report: project,
         contents: project_contents,
         declared,
     } = match &paths.project {
-        Some(project) => read_project_tier(project)?,
+        Some(project) => read_project_tier(project, paths.home.as_deref(), &mut work)?,
         None => ProjectRead::unavailable(),
     };
     let (sources, project_image) = match &paths.project {
@@ -1295,7 +1460,7 @@ pub(crate) fn load(paths: &ConfigPaths) -> Result<ConfigReport> {
     let mut user = not_sourced_tier(paths.user.as_deref());
     let mut user_contents = TierContents::empty();
     let mut reports = Vec::new();
-    let mut source_tools = Vec::new();
+    let mut source_tools: Vec<Vec<Tool>> = Vec::new();
     let mut source_images: Vec<(&crate::config_sources::SourceEntry, Option<ConfiguredImage>)> =
         Vec::new();
     for entry in sources.entries() {
@@ -1306,9 +1471,11 @@ pub(crate) fn load(paths: &ConfigPaths) -> Result<ConfigReport> {
                 let user_path = paths.user.as_deref().ok_or_else(|| {
                     anyhow!("internal: trusted source without a discovered user config path")
                 })?;
-                read_user_tier(user_path, paths.route(), paths.home.as_deref())?
+                read_user_tier(user_path, paths.route(), paths.home.as_deref(), &mut work)?
             }
-            crate::config_sources::SourceTrust::Untrusted => read_source_tier(entry)?,
+            crate::config_sources::SourceTrust::Untrusted => {
+                read_source_tier(entry, paths.home.as_deref(), &mut work)?
+            }
         };
         reports.push(SourceReport {
             alias: entry.alias().clone(),
@@ -1322,7 +1489,7 @@ pub(crate) fn load(paths: &ConfigPaths) -> Result<ConfigReport> {
             }
             crate::config_sources::SourceTrust::Untrusted => {
                 source_images.push((entry, contents.image));
-                source_tools.extend(contents.tools);
+                source_tools.push(contents.tools);
             }
         }
     }
@@ -1340,22 +1507,27 @@ pub(crate) fn load(paths: &ConfigPaths) -> Result<ConfigReport> {
         project_config_path,
     )?;
 
-    let mut project_side = project_contents.tools;
-    project_side.extend(source_tools);
-    let (resolved, uses_defaults, conflicts) =
-        if user_contents.tools.is_empty() && project_side.is_empty() {
-            (
-                ResolvedTools::from_defaults(default_tools()?),
-                true,
-                Vec::new(),
-            )
-        } else {
-            let (merged, conflicts) = merge(user_contents.tools, project_side)?;
-            (merged, false, conflicts)
-        };
+    let project_side_tools = project_contents.tools;
+    let (resolved, conflicts) = authorize_tools(AuthorizationInputs {
+        user: user_contents.tools,
+        project: project_side_tools,
+        sources: source_tools,
+        user_allow: user_contents.allow_tools.as_ref(),
+        project_allow: declared.allow_tools.as_deref(),
+        user_trust: user_contents.reference_trust.as_ref(),
+        declared: &sources,
+        user_status: user.status(),
+        user_file: paths.user.as_deref(),
+        project_file: paths
+            .project
+            .as_ref()
+            .map(|project| project.config.as_path()),
+    })?;
+    let uses_defaults = !resolved.authorized_explicitly;
 
     validate_persist_ownership(resolved.launch_tools())?;
 
+    let inert_tools = resolved.inert_tools().to_vec();
     Ok(ConfigReport {
         user,
         project,
@@ -1370,6 +1542,8 @@ pub(crate) fn load(paths: &ConfigPaths) -> Result<ConfigReport> {
             sourcing: sources.sourcing(),
             entries: reports,
         },
+        inert_tools,
+        mount_work: work,
     })
 }
 
@@ -1383,9 +1557,15 @@ struct TierContents {
     mounts: Option<UserMounts>,
     tools: Vec<Tool>,
     image: Option<ConfiguredImage>,
-    /// The user tier's egress-reference namespace, built from these tools. `None`
+    /// The user tier's egress-reference namespace, built from these sets. `None`
     /// for the project tier and for an absent user file.
     reference_tools: Option<EgressNamespace>,
+    /// The `:trust` file's own `allow_tools`, admitted only through the ADR-0040
+    /// token (#735, D5).
+    allow_tools: Option<crate::config_allow_tools::UserAllowTools>,
+    /// The same read's measurement, for a project `allow_tools` entry that
+    /// selects a definition out of this file.
+    reference_trust: Option<crate::config_authority::ReferenceTrust>,
 }
 
 impl TierContents {
@@ -1396,6 +1576,8 @@ impl TierContents {
             network: None,
             mounts: None,
             reference_tools: None,
+            allow_tools: None,
+            reference_trust: None,
         }
     }
 }
@@ -1459,9 +1641,66 @@ fn not_sourced_tier(user: Option<&Path>) -> TierReport {
 /// Decode and parse one tier's bytes: the half every file tier shares once its
 /// bytes are in hand. Diagnostics never echo a value, and invalid UTF-8 is its
 /// own error (see the module's value-safe rules).
+///
+/// The placement refusal runs before the schema for a reason: a top-level key
+/// swallowed by a table header is a *well-typed* document (or a field serde rejects
+/// with its fixed, generic sentence), so only a look at the document as written can
+/// say which table took it and where the line belongs.
 fn parse_tier(path: &Path, bytes: &[u8]) -> Result<RawConfig> {
     let text = std::str::from_utf8(bytes).map_err(|_| utf8_error(path))?;
+    if let Some(diagnostic) = misplaced_top_level_keys(text) {
+        return Err(anyhow!(
+            "config: {}: {diagnostic}",
+            crate::one_line::quoted_path(path)
+        ));
+    }
     toml::from_str(text).map_err(|error| deserialize_error(path, text, &error))
+}
+
+/// The top-level keys whose meaning is lost the moment a `[table]` header
+/// swallows them: `sources`, and `allow_tools` (#735). Both are read from the
+/// document's root only, so a later assignment is a different key to every reader.
+const ORDER_SENSITIVE_TOP_LEVEL: [&str; 2] = ["sources", "allow_tools"];
+
+/// A top-level key written after a table header becomes a member of that table,
+/// where no reader looks for it, so the file silently sources nothing — or
+/// authorizes nothing.
+///
+/// The document is only syntax-checked: a `sources` or `allow_tools` member is a
+/// *shape* no tool and no `[network]` setting can legally have, so finding one is
+/// proof of the misplacement, never of an intent about its contents, and nothing is
+/// echoed from the file beyond the canonical table spelling and an index.
+///
+/// `[mount_sets]` and `[egress_sets]` are deliberately not examined: a key there
+/// is reserved by [`TOP_LEVEL_FIELDS`] and refused by the set parsers with the same
+/// placement rule in their own words.
+fn misplaced_top_level_keys(text: &str) -> Option<String> {
+    let document: toml::Table = toml::from_str(text).ok()?;
+    if let Some(network) = document.get("network").and_then(toml::Value::as_table) {
+        for key in ORDER_SENSITIVE_TOP_LEVEL {
+            if network.contains_key(key) {
+                return Some(format!(
+                    "[network]: {key} is not a network setting; a top-level {key} must be written \
+                     before the first table header (keys after [network] belong to it)"
+                ));
+            }
+        }
+    }
+    let tools = document.get("tools").and_then(toml::Value::as_array);
+    for (index, tool) in tools.into_iter().flatten().enumerate() {
+        let Some(tool) = tool.as_table() else {
+            continue;
+        };
+        for key in ORDER_SENSITIVE_TOP_LEVEL {
+            if tool.contains_key(key) {
+                return Some(format!(
+                    "tools[{index}]: {key} is not a tool field; a top-level {key} must be written \
+                     before the first table header (keys after [[tools]] belong to the last tool)"
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// What one tier's *measured* read established, before its bytes are
@@ -1498,6 +1737,7 @@ fn read_user_tier(
     path: &Path,
     route: &crate::project_config::RouteAnchor,
     home: Option<&Path>,
+    work: &mut config_mounts::MountExpansionWork,
 ) -> Result<(TierReport, TierContents)> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => {}
@@ -1546,6 +1786,10 @@ fn read_user_tier(
         }),
         mount_sets: raw.mount_sets.is_some(),
         egress_sets: raw.egress_sets.is_some(),
+        // #735: the fifth trigger. Presence, not contents, so `allow_tools = []`
+        // and `allow_tools = 123` both require the verified read — the file
+        // decides which declarations become launch verbs.
+        allow_tools: raw.allow_tools.is_some(),
     };
     let verification = config_authority::verify(&read, triggers).map_err(|error| {
         // A refusal caused by a tool's own field names that field first: the
@@ -1569,6 +1813,7 @@ fn read_user_tier(
         TierAuthority::User(verification),
         FileTierKind::User,
         home,
+        work,
     )
 }
 
@@ -1585,7 +1830,11 @@ fn read_user_tier(
 /// 3. the verdict is unconditional: the project tier is the root of a project's
 ///    trust, not a file that becomes authority-bearing only when it declares a
 ///    field.
-fn read_project_tier(project: &crate::project_config::ProjectTierPaths) -> Result<ProjectRead> {
+fn read_project_tier(
+    project: &crate::project_config::ProjectTierPaths,
+    home: Option<&Path>,
+    work: &mut config_mounts::MountExpansionWork,
+) -> Result<ProjectRead> {
     // Every store-route outcome is named, including the one that checks nothing
     // (`Unchecked`, reachable only from a hand-built test tier).
     match crate::project_config::check_store_route(project)? {
@@ -1631,16 +1880,30 @@ fn read_project_tier(project: &crate::project_config::ProjectTierPaths) -> Resul
     // Taken before `build_tier`, which would refuse `sources` (flat sourcing) and
     // read `ALIAS:image` as an OCI reference: both need the declared source list,
     // which is only known after this read.
+    //
+    // `allow_tools` is parsed here too, right after the verified read: its
+    // *syntax* is the project file's own, and reporting it before any source is
+    // opened keeps a typo from being blamed on the file it never reached.
+    let allow_tools = match raw.allow_tools.take() {
+        Some(value) => Some(crate::config_allow_tools::parse(
+            &value,
+            path,
+            crate::config_allow_tools::AllowToolScope::ProjectConfig,
+        )?),
+        None => None,
+    };
     let declared = ProjectDeclarations {
         sources: raw.sources.take(),
         image: raw.image.take(),
+        allow_tools,
     };
     let (report, contents) = build_tier(
         path,
         raw,
         TierAuthority::Project,
         FileTierKind::Project,
-        None,
+        home,
+        work,
     )?;
     Ok(ProjectRead {
         report,
@@ -1661,6 +1924,8 @@ fn read_project_tier(project: &crate::project_config::ProjectTierPaths) -> Resul
 /// are in hand there and nothing has been interpreted yet.
 fn read_source_tier(
     entry: &crate::config_sources::SourceEntry,
+    home: Option<&Path>,
+    work: &mut config_mounts::MountExpansionWork,
 ) -> Result<(TierReport, TierContents)> {
     let path = entry.path();
     match std::fs::symlink_metadata(path) {
@@ -1683,7 +1948,8 @@ fn read_source_tier(
         raw,
         TierAuthority::Source,
         FileTierKind::Source(entry.alias()),
-        None,
+        home,
+        work,
     )
 }
 
@@ -1702,6 +1968,9 @@ struct ProjectRead {
 struct ProjectDeclarations {
     sources: Option<Vec<String>>,
     image: Option<String>,
+    /// The project's `allow_tools`, syntax-checked but not yet resolved: a name
+    /// resolves only once every source has been read (#735).
+    allow_tools: Option<Vec<crate::config_allow_tools::AllowToolEntry>>,
 }
 
 impl ProjectRead {
@@ -1918,6 +2187,7 @@ fn build_tier(
     authority: TierAuthority<'_>,
     kind: FileTierKind<'_>,
     home: Option<&Path>,
+    work: &mut config_mounts::MountExpansionWork,
 ) -> Result<(TierReport, TierContents)> {
     // ADR-0074: flat sourcing. `read_project_tier` has already taken the project's
     // own `sources`, so a remaining key is a sourced file's own.
@@ -1996,9 +2266,15 @@ fn build_tier(
         }
         None => None,
     };
-    let mut mounts = if raw.mounts.is_some()
-        || raw.mount_sets.is_some()
-        || !tool_mount_values.is_empty()
+    // Only the *user* tier's tool `mounts` are authority (#735): a project or
+    // sourced file's are inert declarations parsed by
+    // `parse_declared_tool_mounts` below, with no verified read of their own — the
+    // project store is verified separately (ADR-0073) and a sourced file is
+    // unpinned until #736. Demanding the ADR-0040 token for them here would refuse
+    // a shape the project tier is now allowed to declare.
+    let tool_mounts_need_a_token =
+        matches!(kind, FileTierKind::User) && !tool_mount_values.is_empty();
+    let mut mounts = if raw.mounts.is_some() || raw.mount_sets.is_some() || tool_mounts_need_a_token
     {
         // One parser for all three fields: a sets-only file still needs the
         // verified token, because a `--mount NAME` may select one of its sets, and
@@ -2019,6 +2295,7 @@ fn build_tier(
                     tools: &tool_mount_values,
                 },
                 home,
+                work,
             )
             .map_err(|error| anyhow!("config: {}: {error}", crate::one_line::quoted_path(path)))?,
         )
@@ -2028,20 +2305,48 @@ fn build_tier(
         None
     };
     let image = validate_image(raw.image.as_deref(), path)?;
-    // A project or built-in tier cannot carry tool mounts: its refusal already
-    // fired by presence, so it gets the empty map and there is no path by which
-    // this tier could be handed a user's list.
-    let tool_lists = match mounts.as_mut() {
-        Some(mounts) => mounts.take_tool_lists(),
-        None => config_mounts::ToolMountLists::empty(),
+    // A project or sourced file's tool `mounts` are **inert** until `allow_tools`
+    // authorizes the tool (ADR-0075): validated here, with zero host-path I/O and
+    // charged to the load's one counter, and activated only by an authorization.
+    // The built-in tier's refusal already fired by presence.
+    let tool_lists = match (kind, mounts.as_mut()) {
+        (FileTierKind::User, Some(mounts)) => mounts.take_tool_lists(),
+        (FileTierKind::User, None) => config_mounts::ToolMountLists::empty(),
+        (FileTierKind::Project | FileTierKind::Source(_), _) if tool_mount_values.is_empty() => {
+            config_mounts::ToolMountLists::empty()
+        }
+        (FileTierKind::Project | FileTierKind::Source(_), _) => {
+            config_mounts::parse_declared_tool_mounts(path, &tool_mount_values, home, work)
+                .map_err(|error| {
+                    anyhow!("config: {}: {error}", crate::one_line::quoted_path(path))
+                })?
+        }
     };
     let tools = validate_tools(raw.tools, kind.origin(path), tool_lists)?;
     // This tier's own validated tools, before `merge` and from the same read as
     // the verdict: the only namespace an egress reference may resolve against
     // (ADR-0059). The project tier gets `None`, so it can never be one.
-    let reference_tools = match reference_trust {
+    let allow_tools = match raw.allow_tools.as_ref() {
+        Some(value) => {
+            // Presence *is* the trigger, so a present list always produced a
+            // token. Refusing rather than skipping keeps that invariant
+            // load-bearing: inheriting nothing from a file that declared
+            // authorizations must never be the quiet outcome.
+            let Some(authorized) = authorized.as_ref() else {
+                return Err(anyhow!(
+                    "config: {}: allow_tools: authority was not measured",
+                    crate::one_line::quoted_path(path)
+                ));
+            };
+            Some(crate::config_allow_tools::UserAllowTools::from_verified(
+                authorized, value,
+            )?)
+        }
+        None => None,
+    };
+    let reference_tools = match &reference_trust {
         Some(trust) => {
-            let namespace = EgressNamespace::new(trust, &tools, parsed_sets).map_err(|error| {
+            let namespace = EgressNamespace::new(trust.clone(), parsed_sets).map_err(|error| {
                 anyhow!("config: {}: {error}", crate::one_line::quoted_path(path))
             })?;
             Some(namespace)
@@ -2079,6 +2384,8 @@ fn build_tier(
             network,
             mounts,
             reference_tools,
+            allow_tools,
+            reference_trust,
         },
     ))
 }
@@ -2121,10 +2428,42 @@ fn refuse_non_user_authority(raw: &RawConfig, path: &Path, tier: RefusingTier) -
     if raw.egress_sets.is_some() {
         return Err(egress_sets_refusal(path, tier));
     }
-    if let Some(declaration) = raw.tools.iter().position(|tool| tool.mounts.is_some()) {
+    // #735: a declaration is inert data, so a tool's own `mounts` is legal in a
+    // sourced file (validated, and inert until `allow_tools` authorizes the tool).
+    // The compiled-in defaults are the one tier that may not carry one: a shipped
+    // definition is not something a launch can authorize.
+    if matches!(tier, RefusingTier::BuiltIn)
+        && let Some(declaration) = raw.tools.iter().position(|tool| tool.mounts.is_some())
+    {
         return Err(tool_mounts_refusal(path, tier, declaration));
     }
+    // `allow_tools` is refused by *presence* in a sourced file and in the
+    // built-ins: `[]` and a wrong type alike, because deciding which declarations
+    // become launch verbs is authority a non-`:trust` tier does not have.
+    if matches!(tier, RefusingTier::Source | RefusingTier::BuiltIn) && raw.allow_tools.is_some() {
+        return Err(allow_tools_refusal(path, tier));
+    }
     Ok(())
+}
+
+/// A non-`:trust` tier declared `allow_tools`. The fix names the tier that may.
+fn allow_tools_refusal(file: &Path, tier: RefusingTier) -> anyhow::Error {
+    let reason = match tier {
+        RefusingTier::Source => {
+            "tools cannot be authorized by a source without :trust; authorize them with \
+             allow_tools in the project config"
+        }
+        RefusingTier::BuiltIn => {
+            "tools cannot be authorized by the built-in config; authorize them with allow_tools \
+             in the user or project config"
+        }
+        // Unreachable: the project config is the tier that may declare it.
+        RefusingTier::Project => "allow_tools cannot be declared by the project config",
+    };
+    anyhow!(
+        "config: {}: allow_tools: {reason}",
+        crate::one_line::quoted_path(file)
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -2320,88 +2659,397 @@ pub(crate) fn absolute_home_from(home: Option<&OsStr>) -> Result<Option<PathBuf>
 // Merge and ownership
 // ---------------------------------------------------------------------------
 
-/// Whole-definition union: user order first, then project-only tools in
-/// project-side order (the project config, then each untrusted source). A name
-/// present in both keeps the entire user definition; if it differs, one conflict is
-/// recorded. Uses a name index for membership but never iterates it, so neither tool
-/// nor warning order can drift.
+/// The inputs one authorization decision needs, as a named struct.
 ///
-/// Every project-side definition is retained in [`ResolvedTools::definitions`] even
-/// when it loses its launch verb, because that file's other definitions may still
-/// reference it (#395). Only the winners enter [`ResolvedTools::launches`].
-///
-/// A name two project-side files declare is an error (ADR-0074 R8/D8): with N files
-/// on that side there is no ordering that would not invent the precedence #735 is
-/// about to redesign, and a duplicated verb is a mistake rather than a choice.
-///
-/// Both declaring files come from the tools' provenance rather than the
-/// caller, so a conflict warning never fabricates a placeholder path.
-fn merge(
-    user_tools: Vec<Tool>,
-    project_tools: Vec<Tool>,
-) -> Result<(ResolvedTools, Vec<ConfigConflict>)> {
-    let index: HashMap<String, usize> = user_tools
-        .iter()
-        .enumerate()
-        .map(|(position, tool)| (tool.name.as_str().to_string(), position))
-        .collect();
+/// Three adjacent `Vec<Tool>` arguments would be transposable without the
+/// compiler noticing, and they mean very different things (the user's own
+/// declarations, the project config's, and each source's), so every field is
+/// named at the call site.
+struct AuthorizationInputs<'a> {
+    user: Vec<Tool>,
+    project: Vec<Tool>,
+    /// Each sourced file's declarations, in `sources` order.
+    sources: Vec<Vec<Tool>>,
+    /// The `:trust` file's own authorizations, admitted only through the ADR-0040
+    /// token (D5).
+    user_allow: Option<&'a crate::config_allow_tools::UserAllowTools>,
+    /// The project config's authorizations, already syntax-checked.
+    project_allow: Option<&'a [crate::config_allow_tools::AllowToolEntry]>,
+    /// The same read's measurement, for a project entry selecting a `:trust`
+    /// definition.
+    user_trust: Option<&'a crate::config_authority::ReferenceTrust>,
+    declared: &'a crate::config_sources::DeclaredSources,
+    user_status: &'a TierStatus,
+    user_file: Option<&'a Path>,
+    project_file: Option<&'a Path>,
+}
 
-    let mut launches: Vec<DefinitionId> = (0..user_tools.len()).map(DefinitionId).collect();
-    let mut definitions = user_tools;
+/// Decide which declared tools become launch verbs (#735).
+///
+/// Declaration and authorization are two steps. Every `[[tools]]` block is inert
+/// data; an `allow_tools` entry — or a `:trust` file's own list, inherited, or
+/// the compiled-in defaults when neither file configures tools — selects the
+/// verbs. The returned [`ResolvedTools`] keeps every definition, because an inert
+/// one still supplies its own file's `tools` references and `doctor` reports it.
+///
+/// Ordering is **authorization** order, not arena order: inherited `:trust` verbs
+/// in that file's `allow_tools` order (with a project override replaced in place),
+/// then project-added verbs in project `allow_tools` order. Uniqueness by
+/// `DefinitionId` is the only invariant, so the sequence may decrease — a
+/// reversed list such as `["b", "a"]` is legal.
+fn authorize_tools(
+    inputs: AuthorizationInputs<'_>,
+) -> Result<(ResolvedTools, Vec<ConfigConflict>)> {
+    let AuthorizationInputs {
+        user,
+        project,
+        sources,
+        user_allow,
+        project_allow,
+        user_trust,
+        declared,
+        user_status,
+        user_file,
+        project_file,
+    } = inputs;
+
+    // R4: the compiled-in defaults apply iff neither file declares a tool *and*
+    // neither writes an `allow_tools` key. A sourced file's inert declarations
+    // therefore no longer displace them (ADR-0074 G6).
+    if user.is_empty() && project.is_empty() && user_allow.is_none() && project_allow.is_none() {
+        let sourced: Vec<Tool> = sources.into_iter().flatten().collect();
+        return Ok((
+            ResolvedTools::from_defaults_retaining(default_tools()?, sourced),
+            Vec::new(),
+        ));
+    }
+
+    // Arena order: user, project, then each source in `sources` order. It is the
+    // order a definition's diagnostic names and nothing else.
+    let mut definitions: Vec<Tool> = user;
+    definitions.extend(project);
+    for file in sources {
+        definitions.extend(file);
+    }
+    let index = scoped_tool_index(&definitions)?;
+
+    let mut launches: Vec<DefinitionId> = Vec::new();
+    let mut verb_slots: BTreeMap<String, DefinitionId> = BTreeMap::new();
     let mut conflicts = Vec::new();
-    let mut project_side: HashMap<String, ToolOrigin> = HashMap::new();
-    for project_tool in project_tools {
-        // Project-side files are disjoint by name: the "absent name only ever
-        // appears here once" invariant used to hold because the project side was one
-        // file, whose duplicates `validate_tools` rejects.
-        if let Some(first) = project_side.get(project_tool.name.as_str()) {
-            return Err(tool_error(
-                &project_tool.origin,
-                project_tool.declaration_index,
-                &project_tool.name,
-                format!(
-                    "also declared by {}; the project config and the files it sources without \
-                     :trust cannot declare the same tool",
-                    describe_origin(first)
-                ),
-            ));
+    let mut overridden: BTreeSet<DefinitionId> = BTreeSet::new();
+
+    // Step A: the `:trust` file's own authorizations, inherited.
+    if let Some(allow) = user_allow {
+        let file = allow.file();
+        for (entry_index, name) in allow.names() {
+            let origin = ToolOrigin::User(file.to_path_buf());
+            let Some(&target) = index.get(&(&origin, name)) else {
+                return Err(allow_tools_error(
+                    file,
+                    entry_index,
+                    "no tool of that name is declared in this file; declare it in a [[tools]] \
+                     block above allow_tools"
+                        .to_owned(),
+                ));
+            };
+            if verb_slots.contains_key(name) {
+                continue;
+            }
+            launches.push(target);
+            verb_slots.insert(name.to_owned(), target);
         }
-        project_side.insert(
-            project_tool.name.as_str().to_owned(),
-            project_tool.origin.clone(),
-        );
-        match index.get(project_tool.name.as_str()) {
-            Some(&position) => {
-                let winner = &definitions[position];
-                // A conflict is necessarily cross-tier: the winner comes from
-                // the user tier (the index only holds user names), the loser
-                // from the project side. Naming both files from provenance
-                // keeps `merge` from taking two indistinguishable `&Path`s.
-                if !winner.same_definition(&project_tool)
-                    && let (
-                        ToolOrigin::User(user_file),
-                        ToolOrigin::Project(file) | ToolOrigin::Source { file, .. },
-                    ) = (&winner.origin, &project_tool.origin)
-                {
-                    conflicts.push(ConfigConflict {
-                        tool: winner.name.clone(),
-                        user_file: user_file.clone(),
-                        project_file: file.clone(),
-                        fields: winner.differing_fields(&project_tool),
-                    });
+    }
+    // The verbs this project list has already named, with the definition it named and
+    // the entry spelling it wrote. A list is a *decision*, so its first entry for a
+    // verb settles it: naming the very same target twice is idempotent, and naming a
+    // different one afterwards collides even when the first entry happened to be a
+    // no-op against the inherited slot (`["home:pi", "repo:pi"]`, R3). The spelling
+    // is what `doctor` names when it advises replacing a claim (#735 review D2).
+    let mut project_claims: BTreeMap<String, (DefinitionId, String)> = BTreeMap::new();
+
+    // Step B: the project config's authorizations, local and `<alias>:<name>`.
+    if let Some(entries) = project_allow {
+        let file = project_file.ok_or_else(|| {
+            anyhow!("internal: project allow_tools without a project config path")
+        })?;
+        for (entry_index, entry) in entries.iter().enumerate() {
+            let target = resolve_allow_tool_entry(
+                entry,
+                &EntryContext {
+                    entry_index,
+                    file,
+                    index: &index,
+                    definitions: &definitions,
+                    declared,
+                    user_trust,
+                    user_status,
+                    user_file,
+                    project_file,
+                },
+            )?;
+            let name = definitions[target.0].name().to_owned();
+            if let Some(&(claimed, _)) = project_claims.get(&name) {
+                if claimed == target {
+                    // The exact same target twice in one list: idempotent.
+                    continue;
+                }
+                return Err(second_tool_for_verb_error(
+                    file,
+                    entry_index,
+                    &name,
+                    &definitions[claimed.0],
+                ));
+            }
+            project_claims.insert(
+                name.clone(),
+                (
+                    target,
+                    match entry.alias() {
+                        Some(alias) => format!("{alias}:{}", entry.name()),
+                        None => entry.name().to_owned(),
+                    },
+                ),
+            );
+            match verb_slots.get(&name).copied() {
+                // Idempotent: an inherited `:trust` tool named explicitly.
+                Some(existing) if existing == target => continue,
+                // The project config outranks the `:trust` file's own
+                // authorization, as it outranks its image (ADR-0074 D5). The
+                // overridden definition stays in the arena so the trusted file's
+                // other tools keep resolving it. `project_claims` above has
+                // already ruled out a slot this same list established, so
+                // `existing` is always the inherited one.
+                Some(existing) => {
+                    if let Some(slot) = launches.iter_mut().find(|id| **id == existing) {
+                        *slot = target;
+                    }
+                    overridden.insert(existing);
+                    verb_slots.insert(name.clone(), target);
+                    let winner = &definitions[target.0];
+                    let loser = &definitions[existing.0];
+                    if !winner.same_definition(loser) {
+                        conflicts.push(ConfigConflict {
+                            tool: winner.name.clone(),
+                            winner_file: origin_file(winner.origin()).to_path_buf(),
+                            overridden_file: origin_file(loser.origin()).to_path_buf(),
+                            fields: loser.differing_fields(winner),
+                        });
+                    }
+                }
+                None => {
+                    launches.push(target);
+                    verb_slots.insert(name, target);
                 }
             }
-            None => launches.push(DefinitionId(definitions.len())),
         }
-        definitions.push(project_tool);
     }
+
+    let authorized: BTreeSet<DefinitionId> = launches.iter().copied().collect();
+    let inert: Vec<InertTool> = definitions
+        .iter()
+        .enumerate()
+        .filter(|(position, _)| {
+            let id = DefinitionId(*position);
+            !authorized.contains(&id) && !overridden.contains(&id)
+        })
+        .map(|(_, tool)| InertTool {
+            name: tool.name.clone(),
+            origin: tool.origin.clone(),
+        })
+        .collect();
     Ok((
         ResolvedTools {
             definitions,
             launches,
+            authorized,
+            authorized_explicitly: true,
+            inert,
+            project_claims: project_claims
+                .into_iter()
+                .map(|(name, (_, entry))| (name, entry))
+                .collect(),
         },
         conflicts,
     ))
+}
+
+/// The frame one `allow_tools` entry is resolved in: the file that wrote the
+/// list and its index in that list, plus the loaded tiers the lookup reads.
+///
+/// A struct rather than ten positional parameters, three of them adjacent
+/// `&Path`s and two more adjacent `Option<&Path>`s, which a call site could
+/// transpose without the compiler noticing (`CODING_STANDARDS.md` → *Types*).
+struct EntryContext<'a> {
+    entry_index: usize,
+    /// The file that wrote the list, for the `allow_tools[N]` diagnostic.
+    file: &'a Path,
+    index: &'a ScopedToolIndex<'a>,
+    definitions: &'a [Tool],
+    declared: &'a crate::config_sources::DeclaredSources,
+    user_trust: Option<&'a crate::config_authority::ReferenceTrust>,
+    user_status: &'a TierStatus,
+    user_file: Option<&'a Path>,
+    project_file: Option<&'a Path>,
+}
+
+/// Resolve one project `allow_tools` entry to the definition it authorizes.
+///
+/// Unqualified names resolve strictly against the project config's own
+/// `[[tools]]`; a qualified `<alias>:<name>` against the source bound to
+/// `<alias>` — and, when that source is `:trust`, only after its own read's
+/// verdict vouches for the definition the project would activate (D5).
+fn resolve_allow_tool_entry(
+    entry: &crate::config_allow_tools::AllowToolEntry,
+    context: &EntryContext<'_>,
+) -> Result<DefinitionId> {
+    use crate::config_sources::SourceTrust;
+    let EntryContext {
+        entry_index,
+        file,
+        index,
+        definitions,
+        declared,
+        user_trust,
+        user_status,
+        user_file,
+        project_file,
+    } = *context;
+
+    let (origin, declaration) = match entry.alias() {
+        None => {
+            let project_file = project_file.ok_or_else(|| {
+                anyhow!("internal: project allow_tools without a project config path")
+            })?;
+            let origin = ToolOrigin::Project(project_file.to_path_buf());
+            let advice = declared_elsewhere_advice(definitions, &origin, entry.name());
+            let Some(&target) = index.get(&(&origin, entry.name())) else {
+                return Err(allow_tools_error(
+                    file,
+                    entry_index,
+                    format!(
+                        "no tool of that name is declared in this file{advice}; declare it in a \
+                         [[tools]] block here, or qualify it as <alias>:<name>"
+                    ),
+                ));
+            };
+            return Ok(target);
+        }
+        Some(alias) => {
+            let Some(source) = declared.by_alias(alias) else {
+                return Err(allow_tools_error(
+                    file,
+                    entry_index,
+                    "names a source alias that sources does not declare".to_owned(),
+                ));
+            };
+            match source.trust() {
+                SourceTrust::Trusted => {
+                    // The file's own read is the one that counts, and it may have
+                    // declared none of the five triggers — a tools-only symlink
+                    // loads through ADR-0040's compatibility rule. The project's
+                    // selection is what needs its verdict, attributed to the
+                    // definition rather than to a list the file may not have.
+                    if *user_status == TierStatus::Absent {
+                        return Err(allow_tools_error(
+                            file,
+                            entry_index,
+                            format!(
+                                "selects a tool from {}, but that file does not exist",
+                                source.declared()
+                            ),
+                        ));
+                    }
+                    let trust = user_trust.ok_or_else(|| {
+                        anyhow!("internal: a :trust source read without its verdict")
+                    })?;
+                    trust.require_for_trusted_tool().map_err(|refusal| {
+                        allow_tools_error(
+                            file,
+                            entry_index,
+                            format!("{refusal} (selecting a tool from {})", source.declared()),
+                        )
+                    })?;
+                    let user_file = user_file.ok_or_else(|| {
+                        anyhow!("internal: a :trust source without a discovered user path")
+                    })?;
+                    (ToolOrigin::User(user_file.to_path_buf()), source.declared())
+                }
+                // Unpinned until #736: the named definition's own fields are
+                // activated exactly as the file declares them now.
+                SourceTrust::Untrusted => (
+                    ToolOrigin::Source {
+                        alias: alias.clone(),
+                        file: source.path().to_path_buf(),
+                    },
+                    source.declared(),
+                ),
+            }
+        }
+    };
+    let Some(&target) = index.get(&(&origin, entry.name())) else {
+        let advice = declared_elsewhere_advice(definitions, &origin, entry.name());
+        return Err(allow_tools_error(
+            file,
+            entry_index,
+            format!("no tool of that name is declared by {declaration}{advice}"),
+        ));
+    };
+    Ok(target)
+}
+
+/// The `; it is declared in …` advice for a local `allow_tools` name that this
+/// file does not declare.
+///
+/// Diagnostics only: the scoped lookup already decided validity, and crossing
+/// files is never a fallback — it is only ever advice, naming the alias the
+/// reader would have to write.
+fn declared_elsewhere_advice(definitions: &[Tool], wanted: &ToolOrigin, name: &str) -> String {
+    let Some(other) = definitions.iter().find(|tool| {
+        tool.name() == name
+            && !same_reference_scope(ReferenceOrigins {
+                declaring: wanted,
+                candidate: tool.origin(),
+            })
+    }) else {
+        return String::new();
+    };
+    match other.origin() {
+        ToolOrigin::Source { alias, .. } => format!(
+            "; it is declared in {} — qualify it as {}",
+            describe_origin(other.origin()),
+            quoted_str(&format!("{alias}:{name}"))
+        ),
+        origin => format!("; it is declared in {}", describe_origin(origin)),
+    }
+}
+
+/// The refusal for a project `allow_tools` list that authorizes a second, different
+/// definition for a launch verb the list already settled.
+fn second_tool_for_verb_error(
+    file: &Path,
+    entry_index: usize,
+    name: &str,
+    claimant: &Tool,
+) -> anyhow::Error {
+    allow_tools_error(
+        file,
+        entry_index,
+        format!(
+            "authorizes a second tool named {}; {} already claims that launch verb. Authorize one \
+             of them, or rename one definition",
+            quoted_str(name),
+            describe_origin(claimant.origin()),
+        ),
+    )
+}
+
+/// The one `allow_tools` diagnostic shape: file, entry index, message. Nothing
+/// from the entry is echoed.
+fn allow_tools_error(file: &Path, index: usize, message: String) -> anyhow::Error {
+    anyhow!(
+        "config: {}: allow_tools[{index}]: {message}",
+        crate::one_line::quoted_path(file)
+    )
 }
 
 /// Overlap ownership across one launch: two distinct tools may not claim the
@@ -2460,7 +3108,7 @@ fn validate_persist_ownership<'a>(tools: impl IntoIterator<Item = &'a Tool>) -> 
 /// `default-tools.toml` they printed before the tier was added; the
 /// persist-ownership diagnostics share this renderer and intentionally name it
 /// too.
-fn describe_origin(origin: &ToolOrigin) -> String {
+pub(crate) fn describe_origin(origin: &ToolOrigin) -> String {
     let tier = match origin {
         ToolOrigin::BuiltIn => "built-in defaults".to_owned(),
         ToolOrigin::User(_) => "user config".to_owned(),
@@ -2662,6 +3310,9 @@ fn resolve_provisioning(
     let ResolvedTools {
         definitions,
         launches,
+        authorized,
+        authorized_explicitly,
+        ..
     } = tools;
     let index = scoped_tool_index(&definitions)?;
 
@@ -2682,9 +3333,18 @@ fn resolve_provisioning(
         }
     }
 
-    let mut facets: Vec<ResolvedFacets> = Vec::with_capacity(launches.len());
+    // Each entry is built from its exact `DefinitionId`, in launch order. The
+    // `(DefinitionId, ResolvedFacets)` pair is formed where the facets are folded,
+    // so a tool can only ever be joined with its own closure's facets — the
+    // order is a launch (authorization) order and is never assumed to be arena
+    // order (#735, finding 1).
+    let mut resolved: Vec<(DefinitionId, ResolvedFacets)> = Vec::with_capacity(launches.len());
     for start in &launches {
         let visited = launch_closure(&definitions, &index, *start)?;
+        // R6: a non-`:trust` (future-pinned) source's `tools = [...]` closure must
+        // be authorized in full. Exact `DefinitionId`s, so a same-named authorized
+        // tool in `home` or the project config can never satisfy a source's edge.
+        enforce_closure_authorization(&definitions, &visited, *start, &authorized)?;
         // Ownership before any facet escapes: two definitions selected by the
         // same launch may not claim one guest path or an ancestor/descendant
         // pair, even when one of them lost its launch verb. Unguarded here, a
@@ -2718,31 +3378,98 @@ fn resolve_provisioning(
                 error,
             )
         })?;
-        facets.push(ResolvedFacets {
-            provisioned,
-            requested_names,
-            persist,
-            mounts,
-        });
+        resolved.push((
+            *start,
+            ResolvedFacets {
+                provisioned,
+                requested_names,
+                persist,
+                mounts,
+            },
+        ));
     }
     drop(index);
 
-    // Retention ends here: only the launch winners survive. Their arena positions
-    // are found by ordered filtering, never by index arithmetic, so the strictly
-    // increasing `launches` invariant alone keeps the pairing correct.
-    Ok(definitions
+    // Retention ends here: only the launch winners survive, each taken from its
+    // own arena slot so a definition can be handed on exactly once.
+    let mut slots: Vec<Option<Tool>> = definitions.into_iter().map(Some).collect();
+    resolved
         .into_iter()
-        .enumerate()
-        .filter(|(position, _)| launches.binary_search(&DefinitionId(*position)).is_ok())
-        .zip(facets)
-        .map(|((_, tool), facets)| CatalogEntry {
-            tool,
-            provisioned: facets.provisioned,
-            requested_names: facets.requested_names,
-            persist: facets.persist,
-            mounts: facets.mounts,
+        .map(|(id, facets)| {
+            let tool = slots.get_mut(id.0).and_then(Option::take).ok_or_else(|| {
+                anyhow!(
+                    "internal: launch entry {} is out of range or selected twice; report this \
+                     as an agent-vm bug",
+                    id.0
+                )
+            })?;
+            Ok(CatalogEntry {
+                tool,
+                provisioned: facets.provisioned,
+                requested_names: facets.requested_names,
+                persist: facets.persist,
+                mounts: facets.mounts,
+                authorized_egress: authorized_explicitly,
+            })
         })
-        .collect())
+        .collect()
+}
+
+/// Whether a launch of a definition from this origin requires every tool in its
+/// `tools = [...]` closure to be authorized too (#735, R6).
+///
+/// True for a non-`:trust` source only: it is a file outside the user's host
+/// configs, so authorizing one of its tools must not silently pull its helpers
+/// in. The three user-authored tiers may keep private helper declarations — a
+/// local `pi` naming a local `claude` is one file the user wrote. When #736 turns
+/// a source into a pinned one this predicate is unchanged: pinning is about the
+/// bytes, not about who authorized the tool.
+fn requires_explicit_closure_authorization(origin: &ToolOrigin) -> bool {
+    matches!(origin, ToolOrigin::Source { .. })
+}
+
+/// Refuse a launch whose `tools` closure visits a definition nothing authorized.
+///
+/// Names the launching tool, its file, the unauthorized referenced tool and the
+/// exact fix, because the fix is one entry in one list.
+fn enforce_closure_authorization(
+    definitions: &[Tool],
+    visited: &[bool],
+    start: DefinitionId,
+    authorized: &BTreeSet<DefinitionId>,
+) -> Result<()> {
+    let launcher = &definitions[start.0];
+    if !requires_explicit_closure_authorization(launcher.origin()) {
+        return Ok(());
+    }
+    for (position, seen) in visited.iter().enumerate() {
+        if !seen || position == start.0 {
+            continue;
+        }
+        let id = DefinitionId(position);
+        if authorized.contains(&id) {
+            continue;
+        }
+        let referenced = &definitions[position];
+        let qualifier = match referenced.origin() {
+            ToolOrigin::Source { alias, .. } => {
+                format!("{alias}:{}", referenced.name())
+            }
+            _ => referenced.name().to_owned(),
+        };
+        return Err(tool_error(
+            &launcher.origin,
+            launcher.declaration_index,
+            &launcher.name,
+            format!(
+                "tools closure references {} which is not authorized in allow_tools; add {} to \
+                 allow_tools in the project config",
+                quoted_str(referenced.name()),
+                quoted_str(&qualifier),
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// The retained definitions one launch selects, in arena order. The closure's
@@ -2837,13 +3564,14 @@ fn launch_closure(
 ///
 /// `egress_sets` is the sixth (#511) and is reserved for the same reason: a
 /// `[network]` table written after `[egress_sets]` would become a set named
-/// `network` that grants nothing. `sources` (#734) is reserved for the same
-/// reason.
+/// `network` that grants nothing. `sources` (#734) and `allow_tools` (#735) are
+/// reserved for the same reason.
 ///
 /// Held here rather than in `config_mounts` because this module owns the schema the
 /// names come from: the test beside `RawConfig` proves each one is still accepted at
 /// the top level, so a renamed field cannot leave a stale reservation behind.
-pub(crate) const TOP_LEVEL_FIELDS: [&str; 7] = [
+pub(crate) const TOP_LEVEL_FIELDS: [&str; 8] = [
+    "allow_tools",
     "egress_sets",
     "image",
     "mounts",
@@ -2898,6 +3626,13 @@ struct RawConfig {
     /// `config_sources` only after the project file's verified read.
     #[serde(default)]
     sources: Option<Vec<String>>,
+    /// #735: which declared tools become launch verbs. A `toml::Value`, not
+    /// `Vec<String>`, for the same reason `mounts` is: presence makes a `:trust`
+    /// file authority-bearing, so `[]`, a table and a number must all reach the
+    /// authority decision before the schema complains. Legal only in the project
+    /// config and the `:trust` user config.
+    #[serde(default)]
+    allow_tools: Option<toml::Value>,
     #[serde(default)]
     tools: Vec<RawTool>,
 }
@@ -3013,17 +3748,21 @@ fn validate_name(raw: &str, origin: &ToolOrigin, index: usize) -> Result<ToolNam
 /// Why one string cannot be a tool name, and nowhere else.
 ///
 /// An enum rather than a `Result<ToolName, &'static str>`, because a second
-/// caller decides a different thing from the same rule: ADR-0059 accepts
-/// `tool:NAME` as an egress reference iff this predicate is `None`, and a
-/// reference rejection needs a *fixed* text, never the declaration diagnostic.
-/// The reasons are the same strings `[[tools]]` has always printed, so a tool
-/// and a reference cannot disagree about what a name is.
+/// caller decides a different thing from the same rule: #735's `allow_tools`
+/// parser accepts a name iff this predicate is `None`, and its refusal needs a
+/// *fixed* text, never the declaration diagnostic. The reasons are the same
+/// strings `[[tools]]` has always printed, so a declaration and an authorization
+/// cannot disagree about what a name is — and `:` is refused by both, which is
+/// what keeps `<alias>:<name>` unambiguous.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ToolNameRejection {
     Empty,
     WhitespaceOrControl,
     LeadingDash,
     Path,
+    /// #735: `:` separates a source alias from a tool name in `allow_tools`, so no
+    /// declaration may contain one and every `<alias>:<name>` is unambiguous.
+    Colon,
     Dots,
     Wildcard,
     DirectRun,
@@ -3039,6 +3778,9 @@ impl ToolNameRejection {
             Self::WhitespaceOrControl => "name must not contain whitespace or control characters",
             Self::LeadingDash => "name must not start with '-'",
             Self::Path => "name must be a single command-name token, not a path",
+            Self::Colon => {
+                "name must not contain ':' (':' separates a source alias from a tool name)"
+            }
             Self::Dots => "name must not be `.` or `..`",
             Self::Wildcard => "name `*` is reserved: it is the wildcard in a tool's `tools` list",
             // `run` is reserved for the direct runner, and a generic "reserved"
@@ -3060,8 +3802,8 @@ impl ToolNameRejection {
     }
 }
 
-/// The one tool-name rule, shared by `[[tools]]` validation and ADR-0059's
-/// `tool:NAME` egress references.
+/// The one tool-name rule, shared by `[[tools]]` validation and #735's
+/// `allow_tools` entries.
 ///
 /// Order matters only for *which* reason is reported; every check is independent
 /// of the others.
@@ -3080,6 +3822,9 @@ pub(crate) fn tool_name_rejection(raw: &str) -> Option<ToolNameRejection> {
     }
     if raw.contains('/') {
         return Some(ToolNameRejection::Path);
+    }
+    if raw.contains(':') {
+        return Some(ToolNameRejection::Colon);
     }
     if raw.chars().all(|character| character == '.') {
         return Some(ToolNameRejection::Dots);
@@ -3589,12 +4334,11 @@ fn deserialize_error(file: &Path, text: &str, error: &toml::de::Error) -> anyhow
          `mounts` and `network_requests` are arrays of strings; `env` is a table of string values; \
          the top-level `image` and each tool's `command` are strings; the top-level \
          `sources`, accepted only in the project tier, is an array of strings; the top-level \
-         `mounts` and each \
-         full user `[[tools]]`'s `mounts` are arrays of mount declarations or mount-set names; \
-         `[mount_sets]` is a table of named arrays of those mount declarations or mount-set names, \
-         and `[egress_sets]` is a table of named arrays of egress allowances or egress references \
-         (`tool:NAME`, `set:NAME`) — not mount syntax. Both tables are accepted only at the top of \
-         the user file. TOML assigns keys to the most recent `[table]` header, so \
+         `mounts` and each `[[tools]]`'s `mounts` are arrays of mount declarations or mount-set \
+         names; `[mount_sets]` is a table of named arrays of those mount declarations or mount-set \
+         names, and `[egress_sets]` is a table of named arrays of egress allowances or `set:NAME` \
+         egress references — not mount syntax. Both tables are user-tier only; a project or \
+         sourced declaration is refused. TOML assigns keys to the most recent `[table]` header, so \
          write the top-level `mounts` before the first header and give each tool or set its entries \
          in its own array. Nested tables are not mount sets or egress sets.",
         crate::one_line::quoted_path(file)
@@ -3731,6 +4475,14 @@ pub(crate) fn quoted_str(text: &str) -> String {
 /// raw instead.
 pub(crate) fn escape_str(text: &str) -> String {
     escape_bytes(text.as_bytes())
+}
+
+/// Fixture helpers other modules' tests share (#735). The device lives beside the
+/// config model it imitates, and this module is the only door to it, so the
+/// `tests` module itself stays private.
+#[cfg(test)]
+pub(crate) mod test_support {
+    pub(crate) use super::tests::authorized_fixture;
 }
 
 #[cfg(test)]
@@ -4190,6 +4942,7 @@ mod tests {
     #[test]
     fn reserved_set_names_are_the_top_level_fields() {
         let fields = [
+            ("allow_tools", "[]"),
             ("egress_sets", "{}"),
             ("image", "\"agent-vm-standard:local\""),
             ("mounts", "[]"),
@@ -4200,8 +4953,9 @@ mod tests {
         ];
         assert_eq!(fields.map(|(name, _)| name), TOP_LEVEL_FIELDS);
         for (name, value) in fields {
-            // `sources` is the project config's own key (flat sourcing, ADR-0074);
-            // every other field still loads in the user tier.
+            // `sources` is the project config's own key (flat sourcing, ADR-0074)
+            // and `allow_tools` is legal in both authorizing tiers; every other
+            // field still loads in the user tier.
             let result = if name == "sources" {
                 SourcesFixture::new().with_project(&format!("{name} = {value}\n"))
             } else {
@@ -4255,10 +5009,15 @@ mod tests {
                 "[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = []\n[egress_sets]\n",
                 "egress_sets cannot be declared by the project config",
             ),
-            // And a tool's own `mounts` still wins over nothing else, unchanged.
+            // The remaining authority fields keep their precedence over a tool's
+            // own `mounts`, which #735 made legal (inert) in the project tier.
             (
-                "[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = []\n",
-                "tools[0].mounts: mounts cannot be declared by the project config",
+                "[network]\nallow_lan = true\n[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = []\n",
+                "network.allow_lan",
+            ),
+            (
+                "mounts = []\n[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = []\n",
+                "mounts cannot be declared by the project config",
             ),
         ] {
             let f = Fixture::new();
@@ -4315,15 +5074,16 @@ mod tests {
         assert!(f.load().is_ok());
     }
 
-    /// A21 and R20: a `tool:` entry inside a user set resolves only against that
-    /// same file's user tools, never the project tier's or the shipped catalog's.
+    /// A21 and R20, restated for #735: `tool:NAME` no longer exists, so a set body
+    /// reaches **no** tool at all — not this file's, not the project tier's, not the
+    /// shipped catalog's — and the only cross-file shape left is `set:NAME`.
     #[test]
-    fn egress_set_tool_entries_resolve_only_user_tools() {
+    fn egress_set_bodies_reach_no_tool_entries() {
         let f = Fixture::new();
         f.user(
             "[[tools]]\nname = \"codex\"\ncommand = \"codex\"\n\
              network_requests = [\"api.openai.com\"]\n\
-             [egress_sets]\ncorp = [\"tool:codex\", \"10.0.0.5\"]\n\
+             [egress_sets]\ncorp = [\"tcp://api.openai.com:443\", \"10.0.0.5\"]\n\
              [network]\nallow_egress = [\"set:corp\"]\n",
         );
         // The project declares a same-named tool reaching somewhere else: a
@@ -4348,10 +5108,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["set:corp"]
         );
-        // A set naming a tool only the project declares is a load error, not a
-        // project grant.
+        // `tool:NAME` is gone (#735), so a set body cannot reach any tool — and the
+        // project's same-named definition contributes nothing to the user file's
+        // authority either way. A `set:` naming a set only the project declares is
+        // the surviving cross-file shape, and it is an unknown set.
         let f = Fixture::new();
-        f.user("[egress_sets]\ncorp = [\"tool:project-only\"]\n");
+        f.user("[egress_sets]\ncorp = [\"set:project-only\"]\n");
         f.project(
             "[[tools]]\nname = \"project-only\"\ncommand = \"c\"\n\
              network_requests = [\"project.example\"]\n",
@@ -4359,7 +5121,7 @@ mod tests {
         let error = f.load().unwrap_err().to_string();
         assert!(error.contains("egress_sets[0][0]:"), "{error}");
         assert!(
-            error.contains("must name a tool declared in the user config's own [[tools]]"),
+            error.contains("must name a set declared in the user config's own [egress_sets]"),
             "{error}"
         );
         assert!(!error.contains("project.example"), "{error}");
@@ -4390,11 +5152,13 @@ mod tests {
         const MALFORMED: &str = "not an IP address, CIDR or hostname (hostnames: one or more \
              labels of ASCII letters, digits and '-', not ending in a numeric label; write \
              non-ASCII names as A-labels; no wildcards)";
-        const UNKNOWN_TOOL: &str = "an egress reference must name a tool declared in the user \
-             config's own [[tools]]; built-in and project tools are never used (`agent-vm tools \
-             print` prints the shipped tools to copy there)";
+        const UNKNOWN_SET: &str = "an egress reference must name a set declared in the user \
+             config's own [egress_sets]; project and built-in configs cannot declare sets";
         const NOT_ARRAY: &str = "must be an array of strings";
         const BAD_TOOL_NAME: &str = "name must be a single command-name token, not a path";
+        // #735 removed the `tool:` claim, so a set entry no longer has a
+        // *compile* stage that can fail on a name (ADR-0075); the stages below are
+        // the ones that remain, and their relative order is what this pins.
         for (body, expected) in [
             // (1,2): `[network]` parse before `[egress_sets]` parse.
             (
@@ -4402,68 +5166,36 @@ mod tests {
                 format!("config: {{file}}: network.allow_egress[0]: {MALFORMED}"),
             ),
             // (1,3): a genuinely top-level `mounts` value. It is a mount error on
-            // its own (`config: <file>: mounts: must be an array of strings`), so
-            // this pair really does reach stage 3 — which is why it may not sit
-            // after `[network]`, where TOML would scope it into that table.
+            // its own, so this pair really does reach the mounts stage — which is
+            // why it may not sit after `[network]`, where TOML would scope it in.
             (
                 "mounts = 7\n[network]\nallow_egress = [\"not an allowance\"]\n",
                 format!("config: {{file}}: network.allow_egress[0]: {MALFORMED}"),
             ),
-            // (1,4).
-            (
-                "[network]\nallow_egress = [\"not an allowance\"]\n\
-                 [egress_sets]\nv = [\"tool:nope\"]\n",
-                format!("config: {{file}}: network.allow_egress[0]: {MALFORMED}"),
-            ),
-            // (1,5).
-            (
-                "[network]\nallow_egress = [\"not an allowance\", \"tool:nope\"]\n",
-                format!("config: {{file}}: network.allow_egress[0]: {MALFORMED}"),
-            ),
-            // (2,3) mounts: a top-level `mounts = 7` is a mount error; the bad set
-            // value still wins.
-            (
-                "mounts = 7\n[egress_sets]\nv = 7\n",
-                format!("config: {{file}}: egress_sets[0]: {NOT_ARRAY}"),
-            ),
-            // (2,3) tools.
+            // (2,3): set parse before tool validation.
             (
                 "[egress_sets]\nv = [\"a b\"]\n\
                  [[tools]]\nname = \"a/b\"\ncommand = \"c\"\n",
                 format!("config: {{file}}: egress_sets[0][0]: {MALFORMED}"),
             ),
-            // (2,4): set parse before set compile. `w` is a schema error, `v` is a
-            // compile error, so a compile-first order would report `v`.
+            // (2,4): within parse, declaration order decides once names are bound.
             (
-                "[egress_sets]\nv = [\"tool:nope\"]\nw = 7\n",
-                format!("config: {{file}}: egress_sets[1]: {NOT_ARRAY}"),
-            ),
-            // (2,5).
-            (
-                "[egress_sets]\nv = 7\n[network]\nallow_egress = [\"tool:nope\"]\n",
+                "[egress_sets]\na = 7\nw = [\"set:nope\"]\n",
                 format!("config: {{file}}: egress_sets[0]: {NOT_ARRAY}"),
             ),
-            // (3,4) tools: tool validation precedes set compile.
+            // (2,5): set parse before `[network]` resolution.
             (
-                "[egress_sets]\nv = [\"tool:nope\"]\n\
+                "[egress_sets]\nv = 7\n[network]\nallow_egress = [\"set:nope\"]\n",
+                format!("config: {{file}}: egress_sets[0]: {NOT_ARRAY}"),
+            ),
+            // (3,4): tool validation precedes `[network]` resolution, so a bad
+            // declaration is reported before an undefined set.
+            (
+                "[network]\nallow_egress = [\"set:nope\"]\n\
                  [[tools]]\nname = \"a/b\"\ncommand = \"c\"\n",
                 format!(
                     "config: user config {{file}} declaration [0] tool \"a/b\": {BAD_TOOL_NAME}"
                 ),
-            ),
-            // (3,5).
-            (
-                "[[tools]]\nname = \"a/b\"\ncommand = \"c\"\n\
-                 [network]\nallow_egress = [\"tool:nope\"]\n",
-                format!(
-                    "config: user config {{file}} declaration [0] tool \"a/b\": {BAD_TOOL_NAME}"
-                ),
-            ),
-            // (4,5): set compile before `[network]` resolution.
-            (
-                "[egress_sets]\nv = [\"tool:nope\"]\n\
-                 [network]\nallow_egress = [\"tool:also-nope\"]\n",
-                format!("config: {{file}}: egress_sets[0][0]: {UNKNOWN_TOOL}"),
             ),
         ] {
             let f = Fixture::new();
@@ -4472,6 +5204,18 @@ mod tests {
             let expected = expected.replace("{file}", &format!("{:?}", f.user));
             assert_eq!(error, expected, "{body:?}");
         }
+
+        // A set reference that names nothing is a *resolution* error, and it is
+        // reported after every parse stage.
+        let f = Fixture::new();
+        f.user("[network]\nallow_egress = [\"set:nope\"]\n");
+        assert_eq!(
+            f.load().unwrap_err().to_string(),
+            format!(
+                "config: {:?}: network.allow_egress[0]: {UNKNOWN_SET}",
+                f.user
+            )
+        );
 
         // Inside stage 2 the order is not "definition by definition": every name
         // is checked before any value, so a bad key in the *later* definition is
@@ -4911,63 +5655,76 @@ mod tests {
         }
     }
 
-    /// A tool's own mount field is **user-only authority**, refused by presence in
-    /// both non-user tiers — empty, wrong type, or on a definition a user
-    /// declaration shadows.
+    /// A tool's own mount field is **authority**, and #735 changed *which* tier
+    /// may declare it: the project config may — the declaration is inert until
+    /// the project's own `allow_tools` authorizes the tool — while the compiled-in
+    /// defaults still may not, because a shipped definition is not something a
+    /// launch can authorize.
     ///
-    /// The subject is the numeric file/field pointer, so the refusal cannot echo a
-    /// tool name before tool-name validation runs.
+    /// Where the field *is* refused, the subject is the numeric file/field
+    /// pointer, so the refusal cannot echo a tool name before tool-name validation
+    /// runs.
     #[test]
-    fn project_and_builtin_tool_mounts_are_refused_by_presence() {
-        for (body, expected) in [
-            (
-                "[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = []\n",
-                "tools[0].mounts: mounts cannot be declared by the project config; use --mount \
-                 launch options, or mounts in the user config",
-            ),
-            (
-                "[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = [\"/a:/g:ro\"]\n",
-                "tools[0].mounts: mounts cannot be declared by the project config; use --mount \
-                 launch options, or mounts in the user config",
-            ),
-            (
-                "[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = 7\n",
-                "tools[0].mounts: mounts cannot be declared by the project config; use --mount \
-                 launch options, or mounts in the user config",
-            ),
-            (
-                "[[tools]]\nname = \"a\"\ncommand = \"a\"\n\
-                 [[tools]]\nname = \"b\"\ncommand = \"b\"\nmounts = []\n",
-                "tools[1].mounts: mounts cannot be declared by the project config; use --mount \
-                 launch options, or mounts in the user config",
-            ),
+    fn project_tool_mounts_are_inert_until_authorized_and_builtin_ones_are_refused() {
+        // A project tool's `mounts` is *inert data* until the project config
+        // authorizes the tool: every shape below loads, and none of it reaches a
+        // launch while `t` is not a verb.
+        // `# no allow_tools` keeps the fixture-authorization device away: these
+        // declarations must really be unauthorized, or the row measures nothing.
+        for body in [
+            "# no allow_tools\n[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = []\n",
+            "# no allow_tools\n[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = [\"/a:/g:ro\"]\n",
+            "# no allow_tools\n[[tools]]\nname = \"t\"\ncommand = \"t\"\n\
+             mounts = [\"/a:/g:ro\", \"/b:/h:rw\"]\n",
+            "# no allow_tools\n[[tools]]\nname = \"a\"\ncommand = \"a\"\n\
+             [[tools]]\nname = \"b\"\ncommand = \"b\"\nmounts = []\n",
         ] {
             let f = Fixture::new();
             f.project(body);
-            let error = f.load().unwrap_err().to_string();
-            assert_eq!(
-                error,
-                format!("config: {:?}: {expected}", f.project),
-                "{body}"
+            let report = f.load().unwrap_or_else(|error| panic!("{body}: {error}"));
+            assert!(
+                report
+                    .resolved()
+                    .launch_tools()
+                    .all(|tool| tool.name() != "t"),
+                "{body}: an unauthorized project tool is not a verb"
             );
         }
 
-        // A hidden project definition — same name as a user tool, so it loses the
-        // verb — is refused all the same: the field is authority, not a launch
-        // request, so it cannot be "ignored because it is shadowed".
+        // A wrong type is still a schema error, and still a *tool* error: the
+        // parser now runs for the project tier too.
+        let f = Fixture::new();
+        f.project("[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = 7\n");
+        let error = f.load().unwrap_err().to_string();
+        assert!(
+            error.contains("tools[0].mounts: must be an array"),
+            "{error}"
+        );
+
+        // Authorizing the tool makes its declaration real: the same bytes that
+        // were inert above now produce a mount on the winning definition.
+        let f = Fixture::new();
+        f.project(&format!(
+            "allow_tools = [\"t\"]\n[[tools]]\nname = \"t\"\ncommand = \"t\"\n\
+             mounts = [\"{}/a:/g:ro\"]\n",
+            f.project.parent().unwrap().join("host").display()
+        ));
+        let report = f.load().expect("an authorized project tool's mounts load");
+        assert_eq!(
+            first_launch(&report)
+                .mounts()
+                .requests()
+                .map(|request| request.mount.guest.clone())
+                .collect::<Vec<_>>(),
+            [std::path::PathBuf::from("/g")],
+            "the authorized declaration is the launch's mount"
+        );
+
+        // A hidden project definition — same name as a user tool, and the project
+        // does not authorize it — stays inert rather than refused.
         let f = Fixture::new();
         f.user(&one_tool("t"))
             .project("[[tools]]\nname = \"t\"\ncommand = \"t\"\npersist = [\"p\"]\nmounts = []\n");
-        assert!(
-            f.load()
-                .unwrap_err()
-                .to_string()
-                .contains("tools[0].mounts: mounts cannot be declared by the project config")
-        );
-        // The same file without the field loads: the refusal is about the field.
-        let f = Fixture::new();
-        f.user(&one_tool("t"))
-            .project("[[tools]]\nname = \"t\"\ncommand = \"t\"\npersist = [\"p\"]\n");
         assert!(f.load().is_ok());
 
         // Old authority fields keep their precedence and their bytes.
@@ -5196,12 +5953,29 @@ mod tests {
         f.symlinked_user(&tool("name = \"t\"\ncommand = \"t\"\n"));
         let report = f.load().unwrap();
         assert!(report.user_mounts().is_none());
-        assert!(first_launch(&report).mounts().is_empty());
+        // `t` declares no `allow_tools` entry of its own, so it is inert (ADR-0075)
+        // and nothing about it reaches a launch.
+        assert!(
+            report
+                .resolved()
+                .launch_tools()
+                .all(|tool| tool.name() != "t"),
+            "an unauthorized tool is not a verb"
+        );
 
         // `[tools.env] mounts` is an ordinary env value: no authority trigger.
         let f = Fixture::new();
         f.symlinked_user(&tool(
             "name = \"t\"\ncommand = \"t\"\n[tools.env]\nmounts = \"~/private:ro\"\n",
+        ));
+        let report = f.load().unwrap();
+        assert!(report.user_mounts().is_none());
+        // And the pair really is an env value, not a mount: the same bytes in a
+        // regular file, authorized, publish it to the guest.
+        let f = Fixture::new();
+        f.user(&format!(
+            "allow_tools = [\"t\"]\n{}",
+            tool("name = \"t\"\ncommand = \"t\"\n[tools.env]\nmounts = \"~/private:ro\"\n")
         ));
         let report = f.load().unwrap();
         assert!(report.user_mounts().is_none());
@@ -5244,7 +6018,12 @@ mod tests {
         if crate::host_paths::current_euid() != 0 {
             use std::os::unix::fs::PermissionsExt;
             let f = Fixture::new();
-            f.user(&tool("name = \"t\"\ncommand = \"t\"\nmounts = []\n"));
+            // `# no allow_tools` keeps the fixture device away so the refusal
+            // names the tool's own field, which is this row's subject.
+            f.user(&format!(
+                "# no allow_tools\n{}",
+                tool("name = \"t\"\ncommand = \"t\"\nmounts = []\n")
+            ));
             fs::set_permissions(&f.user, fs::Permissions::from_mode(0o664)).unwrap();
             assert!(
                 f.load()
@@ -5634,7 +6413,7 @@ mod tests {
         let f = Fixture::new();
         f.user(&document(2));
         let report = f.load().unwrap();
-        assert_eq!(report.user_mounts().unwrap().continuing_work().used(), 2);
+        assert_eq!(report.mount_work_used(), 2);
     }
 
     /// #396's budget is charged **per launch winner**, not once per catalog: the
@@ -5826,20 +6605,22 @@ mod tests {
         );
     }
 
-    /// Whole-definition merging is unchanged: a project definition never fills an
-    /// omitted user field, and the mount facet joins the differing-field warning
-    /// last.
+    /// Whole-definition merging never fills an omission in **either** direction: an
+    /// authorized project definition replaces the user's whole definition, so the
+    /// user's mount list is not grafted onto it, and the differing fields are
+    /// reported with `mounts` last.
     #[test]
     fn whole_definition_merge_never_fills_user_omissions() {
         // The user tool declares a mount list; the project's same-name definition
-        // declares none. The winner keeps the user's, and the difference is
-        // reported with `mounts` appended after `network_requests`.
+        // declares none but authorizes the verb, so it wins whole — and the user's
+        // mount list is not filled in.
         let f = Fixture::new();
         f.user(&tool(
             "name = \"t\"\ncommand = \"cmd\"\nmounts = [\"/a:/a:ro\"]\nnetwork_requests = [\"a.example\"]\n",
         ));
-        f.project(&tool(
-            "name = \"t\"\ncommand = \"cmd\"\nnetwork_requests = [\"b.example\"]\n",
+        f.project(&format!(
+            "allow_tools = [\"t\"]\n{}",
+            tool("name = \"t\"\ncommand = \"cmd\"\nnetwork_requests = [\"b.example\"]\n")
         ));
         let report = f.load().unwrap();
         assert_eq!(report.conflicts().len(), 1);
@@ -5848,13 +6629,22 @@ mod tests {
             &[ToolField::NetworkRequests, ToolField::Mounts]
         );
         let catalog = report.into_launch_catalog().unwrap();
-        assert_eq!(guest_mounts(&catalog, "t"), ["/a"]);
+        assert_eq!(
+            guest_mounts(&catalog, "t"),
+            Vec::<String>::new(),
+            "the winner declares no mounts, and the loser's are never grafted on"
+        );
 
         // Omitting the user's mount list is *not* a difference: presence is an
-        // authority fact, not access.
+        // authority fact, not access. The project entry is explicit, so the
+        // identical-definition override is what `same_definition` compares (#735
+        // review S10).
         let f = Fixture::new();
         f.user(&tool("name = \"t\"\ncommand = \"cmd\"\n"));
-        f.project(&tool("name = \"t\"\ncommand = \"cmd\"\n"));
+        f.project(&format!(
+            "allow_tools = [\"t\"]\n{}",
+            tool("name = \"t\"\ncommand = \"cmd\"\n")
+        ));
         assert!(f.load().unwrap().conflicts().is_empty());
 
         // A project cannot fill an omitted user `tools`/`env`/`persist` either.
@@ -5862,22 +6652,708 @@ mod tests {
         f.user(&tool("name = \"t\"\ncommand = \"cmd\"\n"));
         // `tools = []` would be the same value as the user's omitted field (both
         // are "no other tools"), so the wildcard is what makes the field differ.
-        f.project(&tool(
-            "name = \"t\"\ncommand = \"cmd\"\ntools = [\"*\"]\npersist = [\"p\"]\n[tools.env]\nA = \"1\"\n",
+        f.project(&format!(
+            "allow_tools = [\"t\"]\n{}",
+            tool("name = \"t\"\ncommand = \"cmd\"\ntools = [\"*\"]\npersist = [\"p\"]\n[tools.env]\nA = \"1\"\n")
         ));
         let report = f.load().unwrap();
         assert_eq!(
             report.conflicts()[0].fields(),
             &[ToolField::Tools, ToolField::Persist, ToolField::Env]
         );
+        // The project authorizes `t`, so its definition wins whole (D3) — and the
+        // *user's* omissions are not filled, because the user's definition is not
+        // the winner at all. The named property is unchanged: a merge never
+        // splices one definition's fields onto another's.
         let winner = first_launch(&report);
-        assert_eq!(winner.persist_count(), 0);
-        assert_eq!(winner.env_count(), 0);
+        assert_eq!(winner.persist_count(), 1);
+        assert_eq!(winner.env_count(), 1);
         assert_eq!(
             winner.declared_tools(),
-            &DeclaredTools::Named(Vec::new()),
-            "the user's omission is not filled by the project's wildcard"
+            &DeclaredTools::All,
+            "the winner's own fields, never a splice of the loser's"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #735 V21–V25: the authorisation oracles the mutation rows point at.
+    // -----------------------------------------------------------------------
+
+    /// V21(a), R3 verb order: each authorized entry keeps **its own** definition
+    /// and facets. A catalog built by pairing authorisation *position* with
+    /// definition *arena position* still produces the right names here, so every
+    /// field is asymmetric on purpose.
+    #[test]
+    fn authorized_entries_keep_their_own_definition_and_facets() {
+        use CredentialProvider::*;
+        let f = Fixture::new();
+        f.user(
+            "allow_tools = [\"second\", \"first\"]\n\
+             [[tools]]\nname = \"first\"\ncommand = \"first-cmd\"\ncredentials = [\"openai\"]\n\
+             persist = [\".first\"]\nmounts = [\"/f:/f:ro\"]\ntools = []\n\
+             [[tools]]\nname = \"second\"\ncommand = \"second-cmd\"\ncredentials = [\"anthropic\"]\n\
+             persist = [\".second\"]\nmounts = [\"/s:/s:ro\"]\ntools = []\n",
+        );
+        let catalog = f
+            .load()
+            .unwrap()
+            .into_launch_catalog()
+            .expect("both tools are authorized");
+        assert_eq!(verbs_of(&catalog), ["second", "first", "shell"]);
+        for (name, command, provider, path, guest) in [
+            ("second", "second-cmd", Anthropic, ".second", "/s"),
+            ("first", "first-cmd", OpenAi, ".first", "/f"),
+        ] {
+            let entry = entry_of(&catalog, name);
+            assert_eq!(entry.tool().command(), command, "{name}");
+            assert_eq!(entry.provisioned().iter().collect::<Vec<_>>(), [provider]);
+            assert_eq!(
+                entry
+                    .persist()
+                    .iter()
+                    .map(|path| path.as_path().display().to_string())
+                    .collect::<Vec<_>>(),
+                [path],
+                "{name}"
+            );
+            assert_eq!(guest_mounts(&catalog, name), [guest], "{name}");
+        }
+    }
+
+    /// V21(b), R3: a project authorization overrides the `:trust` file's verb
+    /// **in place**, so the inherited order survives, the source definition is the
+    /// winner, and the `:trust` file's own `pi` still resolves its own `claude`
+    /// through the closure.
+    #[test]
+    fn an_authorized_override_keeps_the_inherited_order_and_the_trusted_closure() {
+        use CredentialProvider::*;
+        let f = SourcesFixture::new();
+        f.write_user(
+            "allow_tools = [\"claude\", \"pi\"]\n\
+             [[tools]]\nname = \"pi\"\ncommand = \"pi\"\ntools = [\"claude\"]\npersist = [\".pi-state\"]\n\
+             [[tools]]\nname = \"claude\"\ncommand = \"claude\"\ncredentials = [\"anthropic\"]\n\
+             persist = [\".claude-home\"]\nmounts = [\"/hc:/hc:ro\"]\ntools = []\n",
+        );
+        f.write_repo(
+            "r.toml",
+            "[[tools]]\nname = \"claude\"\ncommand = \"repo-claude\"\ncredentials = [\"openai\"]\n\
+             persist = [\".repo-claude\"]\nmounts = [\"/rc:/rc:ro\"]\ntools = []\n",
+        );
+        f.write_project(&format!(
+            "{}\nallow_tools = [\"repo:claude\"]\n",
+            sources_block(&[HOME_SOURCE, "repo ./r.toml"])
+        ));
+        let report = f.load().expect("the override loads");
+        let catalog = report.into_launch_catalog().expect("catalog");
+        assert_eq!(verbs_of(&catalog), ["claude", "pi", "shell"]);
+        let claude = entry_of(&catalog, "claude");
+        assert_eq!(claude.tool().command(), "repo-claude");
+        assert_eq!(claude.provisioned().iter().collect::<Vec<_>>(), [OpenAi]);
+        assert_eq!(guest_mounts(&catalog, "claude"), ["/rc"]);
+        // The `:trust` file's `pi` is untouched and still inherits the *home*
+        // `claude`, not the overridden verb: the closure resolves per file.
+        let pi = entry_of(&catalog, "pi");
+        assert_eq!(pi.provisioned().iter().collect::<Vec<_>>(), [Anthropic]);
+        assert_eq!(guest_mounts(&catalog, "pi"), ["/hc"]);
+    }
+
+    /// V6, R3: the project's override applies **once per verb**. A second project
+    /// entry naming a verb the project has already replaced collides, because the
+    /// project's list is one decision per verb (#735 review B1).
+    #[test]
+    fn v6_a_second_project_entry_for_an_inherited_verb_collides() {
+        // A `:trust` file that authorizes `claude`, and a repo that declares its
+        // own `claude`, so both project spellings below can name a replacement.
+        let fixture = || {
+            let f = SourcesFixture::new();
+            f.write_user(
+                "allow_tools = [\"claude\"]\n\
+                 [[tools]]\nname = \"claude\"\ncommand = \"user-claude\"\n\
+                 credentials = [\"anthropic\"]\ntools = []\n",
+            );
+            f.write_repo(
+                "r.toml",
+                "[[tools]]\nname = \"claude\"\ncommand = \"repo-claude\"\ncredentials = [\"openai\"]\n\
+                 tools = []\n",
+            );
+            f
+        };
+        let project = |allow: &str| {
+            format!(
+                "{}\nallow_tools = [{allow}]\n{}",
+                sources_block(&[HOME_SOURCE, "repo ./r.toml"]),
+                one_tool("claude")
+            )
+        };
+
+        // Idempotent: `home:claude` *is* the definition `:trust` inherited, so the
+        // slot already holds the target and the entry changes nothing.
+        let f = fixture();
+        let catalog = f
+            .with_project(&project("\"home:claude\""))
+            .expect("naming the inherited definition is idempotent")
+            .into_launch_catalog()
+            .expect("catalog");
+        assert_eq!(verbs_of(&catalog), ["claude", "shell"]);
+        assert_eq!(
+            entry_of(&catalog, "claude").tool().command(),
+            "user-claude",
+            "the inherited definition is still the verb"
+        );
+
+        // A single override still replaces the inherited verb in place; if this
+        // stops loading, the fix has disabled the precedence it is about.
+        let f = fixture();
+        let catalog = f
+            .with_project(&project("\"repo:claude\""))
+            .expect("one override loads")
+            .into_launch_catalog()
+            .expect("catalog");
+        assert_eq!(entry_of(&catalog, "claude").tool().command(), "repo-claude");
+
+        // Two different definitions for the one verb: the first may override, the
+        // second must collide whichever spelling it uses.
+        for second in ["\"claude\"", "\"home:claude\""] {
+            let f = fixture();
+            let error = format!(
+                "{:#}",
+                f.with_project(&project(&format!("\"repo:claude\", {second}")))
+                    .expect_err("the second project entry is a collision")
+            );
+            assert!(
+                error.contains("authorizes a second tool named"),
+                "{second}: {error}"
+            );
+            assert!(error.contains("allow_tools[1]"), "{second}: {error}");
+        }
+    }
+
+    /// V6, R3: deduplication is by target, in first-seen order. The same name twice
+    /// in one list is one verb; two *different* targets for one verb are a
+    /// collision whatever the earlier entry resolved to — including the inherited
+    /// definition named explicitly before a replacement (`["home:pi", "repo:pi"]`,
+    /// which a check against the inherited slot alone would wave through).
+    #[test]
+    fn v6_repeating_a_target_is_idempotent_and_two_targets_collide() {
+        // The user file's own list: `a` twice is one verb, first-seen.
+        let f = Fixture::new();
+        f.user(
+            "allow_tools = [\"a\", \"a\"]\n[[tools]]\nname = \"a\"\ncommand = \"a\"\n\
+             [[tools]]\nname = \"b\"\ncommand = \"b\"\n",
+        );
+        let report = f.load().expect("a repeated name is idempotent");
+        assert_eq!(launch_names(&report), ["a"]);
+        assert_eq!(
+            report
+                .inert_tools()
+                .iter()
+                .map(|tool| tool.name())
+                .collect::<Vec<_>>(),
+            ["b"]
+        );
+
+        // The project list: naming the inherited definition and then replacing it
+        // is two decisions about one verb, so the second is refused.
+        let f = SourcesFixture::new();
+        f.write_user(
+            "allow_tools = [\"pi\"]\n[[tools]]\nname = \"pi\"\ncommand = \"pi\"\ntools = []\n",
+        );
+        f.write_repo(
+            "r.toml",
+            "[[tools]]\nname = \"pi\"\ncommand = \"repo-pi\"\ntools = []\n",
+        );
+        let error = format!(
+            "{:#}",
+            f.with_project(&format!(
+                "{}\nallow_tools = [\"home:pi\", \"repo:pi\"]\n",
+                sources_block(&[HOME_SOURCE, "repo ./r.toml"])
+            ))
+            .expect_err("two targets for one verb")
+        );
+        assert!(error.contains("authorizes a second tool named"), "{error}");
+        assert!(error.contains("allow_tools[1]"), "{error}");
+        // The earlier claimant is the inherited definition, named by its file.
+        assert!(error.contains("user config"), "{error}");
+    }
+
+    /// V5, R3: the four resolution refusals a project entry can hit, each naming
+    /// `allow_tools[N]` and the file/tool that would have made it work.
+    #[test]
+    fn v5_allow_tools_resolution_errors_name_the_entry() {
+        // (a) An alias `sources` does not declare.
+        let f = SourcesFixture::new();
+        f.write_repo("r.toml", &one_tool("x"));
+        let error = format!(
+            "{:#}",
+            f.with_project(&format!(
+                "{}\nallow_tools = [\"nope:x\"]\n",
+                sources_block(&["repo ./r.toml"])
+            ))
+            .expect_err("undeclared alias")
+        );
+        assert!(error.contains("allow_tools[0]"), "{error}");
+        assert!(
+            error.contains("names a source alias that sources does not declare"),
+            "{error}"
+        );
+        assert!(!error.contains("nope:x"), "the entry was echoed: {error}");
+
+        // (b) A `:trust` source whose file does not exist.
+        let f = SourcesFixture::new();
+        let error = format!(
+            "{:#}",
+            f.with_project(&format!(
+                "{}\nallow_tools = [\"home:x\"]\n",
+                sources_block(&[HOME_SOURCE])
+            ))
+            .expect_err("absent :trust file")
+        );
+        assert!(error.contains("allow_tools[0]"), "{error}");
+        assert!(error.contains("but that file does not exist"), "{error}");
+
+        // (c) A source that declares no tool of that name.
+        let f = SourcesFixture::new();
+        f.write_repo("r.toml", &one_tool("x"));
+        let error = format!(
+            "{:#}",
+            f.with_project(&format!(
+                "{}\nallow_tools = [\"repo:missing\"]\n",
+                sources_block(&["repo ./r.toml"])
+            ))
+            .expect_err("undeclared source tool")
+        );
+        assert!(error.contains("allow_tools[0]"), "{error}");
+        assert!(
+            error.contains("no tool of that name is declared by"),
+            "{error}"
+        );
+        assert!(!error.contains("missing"), "the entry was echoed: {error}");
+
+        // (d) A local entry naming a tool only a source declares: the advice is the
+        // qualified spelling, never a silent cross-file resolution.
+        let f = SourcesFixture::new();
+        f.write_repo("r.toml", &one_tool("x"));
+        let error = format!(
+            "{:#}",
+            f.with_project(&format!(
+                "{}\nallow_tools = [\"x\"]\n",
+                sources_block(&["repo ./r.toml"])
+            ))
+            .expect_err("cross-file local entry")
+        );
+        assert!(error.contains("allow_tools[0]"), "{error}");
+        assert!(
+            error.contains("no tool of that name is declared in this file"),
+            "{error}"
+        );
+        assert!(error.contains("qualify it as \"repo:x\""), "{error}");
+    }
+
+    /// V11, R4: a non-`:trust` source's `tools` closure must be authorized in
+    /// full — explicit, wildcard, implicit wildcard and transitive — and a
+    /// same-named authorized tool elsewhere never satisfies an edge.
+    #[test]
+    fn tool_closure_authorization_is_explicit() {
+        let loads = |repo: &str, allow: &str| -> Result<(), String> {
+            let f = SourcesFixture::new();
+            f.write_repo("r.toml", repo);
+            f.write_project(&format!(
+                "{}\nallow_tools = [{allow}]\n",
+                sources_block(&["repo ./r.toml"])
+            ));
+            // The closure is checked while the catalog is built, so both stages
+            // are in scope for this row.
+            let report = f.load().map_err(|error| format!("{error:#}"))?;
+            report
+                .into_launch_catalog()
+                .map(|_| ())
+                .map_err(|error| format!("{error:#}"))
+        };
+
+        // An explicit edge must be listed.
+        let error = loads(
+            "[[tools]]\nname = \"a\"\ncommand = \"a\"\ntools = [\"b\"]\n\
+             [[tools]]\nname = \"b\"\ncommand = \"b\"\ntools = []\n",
+            "\"repo:a\"",
+        )
+        .expect_err("an unauthorized edge is refused");
+        assert!(error.contains("not authorized in allow_tools"), "{error}");
+        assert!(error.contains("repo:b"), "{error}");
+        assert!(
+            loads(
+                "[[tools]]\nname = \"a\"\ncommand = \"a\"\ntools = [\"b\"]\n\
+             [[tools]]\nname = \"b\"\ncommand = \"b\"\ntools = []\n",
+                "\"repo:a\", \"repo:b\"",
+            )
+            .is_ok()
+        );
+
+        // An explicit wildcard reaches the same sibling.
+        let error = loads(
+            "[[tools]]\nname = \"a\"\ncommand = \"a\"\ntools = [\"*\"]\n\
+             [[tools]]\nname = \"b\"\ncommand = \"b\"\ntools = []\n",
+            "\"repo:a\"",
+        )
+        .expect_err("an explicit wildcard is refused");
+        assert!(error.contains("not authorized in allow_tools"), "{error}");
+
+        // An omitted `tools` on a declared `shell` is the same wildcard.
+        let error = loads(
+            "[[tools]]\nname = \"shell\"\ncommand = \"bash\"\ninteractive_shell = true\n\
+             [[tools]]\nname = \"b\"\ncommand = \"b\"\ntools = []\n",
+            "\"repo:shell\"",
+        )
+        .expect_err("the implicit wildcard is refused");
+        assert!(error.contains("not authorized in allow_tools"), "{error}");
+        assert!(error.contains("repo:b"), "{error}");
+
+        // Transitively: authorizing `a` and `b` is not authorizing `c`.
+        let error = loads(
+            "[[tools]]\nname = \"a\"\ncommand = \"a\"\ntools = [\"b\"]\n\
+             [[tools]]\nname = \"b\"\ncommand = \"b\"\ntools = [\"c\"]\n\
+             [[tools]]\nname = \"c\"\ncommand = \"c\"\ntools = []\n",
+            "\"repo:a\", \"repo:b\"",
+        )
+        .expect_err("the transitive edge is refused");
+        assert!(error.contains("repo:c"), "{error}");
+
+        // A same-named user tool is a different `DefinitionId`, so it never
+        // satisfies a source edge.
+        let f = SourcesFixture::new();
+        f.write_user(
+            "allow_tools = [\"b\"]\n[[tools]]\nname = \"b\"\ncommand = \"b\"\ntools = []\n",
+        );
+        f.write_repo(
+            "r.toml",
+            "[[tools]]\nname = \"a\"\ncommand = \"a\"\ntools = [\"b\"]\n\
+             [[tools]]\nname = \"b\"\ncommand = \"b\"\ntools = []\n",
+        );
+        f.write_project(&format!(
+            "{}\nallow_tools = [\"repo:a\"]\n",
+            sources_block(&[HOME_SOURCE, "repo ./r.toml"])
+        ));
+        let error = format!(
+            "{:#}",
+            f.load()
+                .expect("the load itself is fine")
+                .into_launch_catalog()
+                .expect_err("wrong origin")
+        );
+        assert!(error.contains("not authorized in allow_tools"), "{error}");
+    }
+
+    /// V22, R6: a retained-but-inert definition is still validated, so a dangling
+    /// reference cannot survive by never being authorized.
+    #[test]
+    fn defaults_path_still_validates_inert_source_references() {
+        // (a) The dangling name is refused, naming the source file.
+        let f = SourcesFixture::new();
+        f.write_repo(
+            "r.toml",
+            "[[tools]]\nname = \"a\"\ncommand = \"a\"\ntools = [\"missing\"]\n",
+        );
+        f.write_project(&sources_block(&["repo ./r.toml"]));
+        let report = f.load().expect("no authorization, so no verb");
+        assert!(report.uses_defaults());
+        let error = format!("{:#}", report.into_launch_catalog().unwrap_err());
+        assert!(
+            error.contains("names no tool in this configuration file"),
+            "{error}"
+        );
+
+        // (b) Sibling control: a resolvable pair builds, and both stay inert.
+        let f = SourcesFixture::new();
+        f.write_repo(
+            "r.toml",
+            "[[tools]]\nname = \"a\"\ncommand = \"a\"\ntools = [\"b\"]\n\
+             [[tools]]\nname = \"b\"\ncommand = \"b\"\ntools = []\n",
+        );
+        f.write_project(&sources_block(&["repo ./r.toml"]));
+        let report = f.load().expect("a resolvable inert pair");
+        assert!(report.uses_defaults());
+        let catalog = report.into_launch_catalog().expect("the shipped catalog");
+        assert_eq!(
+            verbs_of(&catalog),
+            [
+                "dsh", "pi", "codex", "opencode", "claude", "copilot", "shell"
+            ]
+        );
+
+        // (c) Cross-tier: the shipped `pi` is never a fallback for a source file.
+        let f = SourcesFixture::new();
+        f.write_repo(
+            "r.toml",
+            "[[tools]]\nname = \"a\"\ncommand = \"a\"\ntools = [\"pi\"]\n",
+        );
+        f.write_project(&sources_block(&["repo ./r.toml"]));
+        let error = format!("{:#}", f.load().unwrap().into_launch_catalog().unwrap_err());
+        assert!(error.contains("cross-tier"), "{error}");
+    }
+
+    /// V23(a), D6: one leaf-visit budget spans the project, the sources and the
+    /// user config — each tier alone loads, both together refuse.
+    #[test]
+    fn mount_budget_spans_project_source_and_user_tiers() {
+        const LIMIT: usize = config_mounts::MAX_MOUNT_SET_EXPANSION_WORK;
+        let entries = |count: usize, prefix: &str| -> String {
+            (0..count)
+                .map(|index| format!("\"{prefix}{index}:/l{index}:ro\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let half = LIMIT / 2;
+
+        // Each tier alone is admitted.
+        let f = Fixture::new();
+        f.user("# no allow_tools\n");
+        f.project(&format!(
+            "# no allow_tools\n[[tools]]\nname = \"p\"\ncommand = \"p\"\n\
+             mounts = [{}]\n",
+            entries(half + 1, "/a/")
+        ));
+        assert!(f.load().is_ok(), "the project tier alone fits");
+
+        let f = Fixture::new();
+        f.user(&format!(
+            "allow_tools = [\"u\"]\n[[tools]]\nname = \"u\"\ncommand = \"u\"\n\
+             mounts = [{}]\n",
+            entries(half, "/b/")
+        ));
+        f.project("# no allow_tools\n");
+        assert!(f.load().is_ok(), "the user tier alone fits");
+
+        // Together they exceed it, and the refusal names the user file.
+        let f = Fixture::new();
+        f.user(&format!(
+            "allow_tools = [\"u\"]\n[[tools]]\nname = \"u\"\ncommand = \"u\"\n\
+             mounts = [{}]\n",
+            entries(half, "/b/")
+        ));
+        f.project(&format!(
+            "# no allow_tools\n[[tools]]\nname = \"p\"\ncommand = \"p\"\n\
+             mounts = [{}]\n",
+            entries(half + 1, "/a/")
+        ));
+        let error = format!("{:#}", f.load().expect_err("the tiers share one budget"));
+        assert!(error.contains("work"), "{error}");
+        assert!(error.contains(&f.user.display().to_string()), "{error}");
+
+        // V23(a): the third contributor is a real `repo` source. Its authorized
+        // tool's leaves are charged to the same counter, so user + project +
+        // source exceeding it is refused where user + project alone fits.
+        let f = SourcesFixture::new();
+        f.write_user(&format!(
+            "allow_tools = [\"u\"]\n[[tools]]\nname = \"u\"\ncommand = \"u\"\n\
+             mounts = [{}]\n",
+            entries(half, "/b/")
+        ));
+        f.write_repo(
+            "r.toml",
+            &format!(
+                "[[tools]]\nname = \"s\"\ncommand = \"s\"\nmounts = [{}]\n",
+                entries(half, "/s/")
+            ),
+        );
+        let project = format!(
+            "allow_tools = [\"repo:s\", \"p\"]\n{}\n[[tools]]\nname = \"p\"\ncommand = \
+             \"p\"\nmounts = [{}]\n",
+            // The user file must be sourced by the project config, or the third
+            // tier is present but deliberately unread (ADR-0074).
+            sources_block(&[HOME_SOURCE, "repo ./r.toml"]),
+            entries(2, "/a/")
+        );
+        // Two tiers of `half` plus the project's two leaves: one over the limit
+        // whichever parity the limit has.
+        let error = format!(
+            "{:#}",
+            f.with_project(&project)
+                .expect_err("three tiers share one budget")
+        );
+        assert!(error.contains("work"), "{error}");
+        // The refusal names the tier whose declaration crossed the limit: here,
+        // the sourced file, read last.
+        assert!(
+            error.contains(&f.repo("r.toml").display().to_string()),
+            "{error}"
+        );
+    }
+
+    /// V23(b), D6: the load's counter is handed to the catalog build, so a
+    /// continuation that starts fresh would admit a second budget.
+    #[test]
+    fn mount_budget_continues_from_combined_tiers_into_the_catalog() {
+        const LIMIT: usize = config_mounts::MAX_MOUNT_SET_EXPANSION_WORK;
+        let entries = |count: usize, prefix: &str| -> String {
+            (0..count)
+                .map(|index| format!("\"{prefix}{index}:/l{index}:ro\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        // The load charges each declared leaf once and the catalog fold charges the
+        // same leaves again, so half the budget at load lands exactly on the limit
+        // when the catalog continues from it. A fresh counter at the handoff would
+        // stop at half and admit the extra entry below.
+        let k = 2;
+        let m = LIMIT / 2 - k;
+
+        let f = Fixture::new();
+        f.project(&format!(
+            "allow_tools = [\"p\"]\n[[tools]]\nname = \"p\"\ncommand = \"p\"\ntools = []\n\
+             mounts = [{}]\n",
+            entries(k, "/p/")
+        ));
+        f.user(&format!(
+            "allow_tools = [\"u\"]\n[[tools]]\nname = \"u\"\ncommand = \"u\"\ntools = []\n\
+             mounts = [{}]\n",
+            entries(m, "/u/")
+        ));
+        let report = f.load().expect("both tiers fit");
+        let (catalog, work) = report.into_launch_catalog_with_work();
+        assert!(catalog.is_ok(), "{catalog:?}");
+        assert_eq!(work.used(), LIMIT);
+
+        let f = Fixture::new();
+        f.project(&format!(
+            "allow_tools = [\"p\"]\n[[tools]]\nname = \"p\"\ncommand = \"p\"\ntools = []\n\
+             mounts = [{}]\n",
+            entries(k, "/p/")
+        ));
+        f.user(&format!(
+            "allow_tools = [\"u\"]\n[[tools]]\nname = \"u\"\ncommand = \"u\"\ntools = []\n\
+             mounts = [{}]\n",
+            entries(m + 1, "/u/")
+        ));
+        let report = f.load().expect("the load itself still fits");
+        let (catalog, work) = report.into_launch_catalog_with_work();
+        let error = format!("{:#}", catalog.expect_err("the catalog fold exceeds"));
+        assert!(error.contains("tool \"p\""), "{error}");
+        assert_eq!(work.used(), LIMIT);
+    }
+
+    /// V24(a), R1: `allow_tools` is authority-bearing by **presence**, and the
+    /// refusal is the ADR-0040 sentence for that subject — not "authority was not
+    /// measured" and not a schema error.
+    #[test]
+    fn allow_tools_presence_requires_the_verified_read() {
+        for body in [
+            "allow_tools = []\n",
+            "allow_tools = 7\n",
+            "allow_tools = [\"t\"]\n[[tools]]\nname = \"t\"\ncommand = \"t\"\n",
+        ] {
+            let f = Fixture::new();
+            let target = f.user.with_file_name("dotfile");
+            write_file(&target, body);
+            std::os::unix::fs::symlink(&target, &f.user).unwrap();
+            let error = format!("{:#}", f.load().expect_err(body));
+            assert!(
+                error.contains("allow_tools requires config.toml to be a regular file"),
+                "{body}: {error}"
+            );
+            assert!(
+                !error.contains("authority was not measured"),
+                "{body}: {error}"
+            );
+        }
+
+        // Presence is refused by the *measurement*, so the two shapes a symlink
+        // was only one of are pinned whole: a group- or other-writable file, and a
+        // file with a second hard link.
+        let f = Fixture::new();
+        write_file(
+            &f.user,
+            "allow_tools = [\"t\"]\n[[tools]]\nname = \"t\"\ncommand = \"t\"\n",
+        );
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&f.user, std::fs::Permissions::from_mode(0o664)).unwrap();
+        assert_eq!(
+            format!("{:#}", f.load().expect_err("group-writable")),
+            format!(
+                "config: {}: allow_tools refuses a group- or other-writable config.toml; a guest \
+                 or another account may have written its allow_tools list, so review the \
+                 allow_tools list before trusting the file (fixing the mode does not establish \
+                 authorship)",
+                crate::one_line::quoted_path(&f.user)
+            )
+        );
+
+        let f = Fixture::new();
+        write_file(
+            &f.user,
+            "allow_tools = [\"t\"]\n[[tools]]\nname = \"t\"\ncommand = \"t\"\n",
+        );
+        std::fs::hard_link(&f.user, f.user.with_file_name("alias.toml")).unwrap();
+        assert_eq!(
+            format!("{:#}", f.load().expect_err("two hard links")),
+            format!(
+                "config: {}: allow_tools refuses a config.toml with 2 hard links; another name \
+                 for it may be guest- or project-writable, so review the allow_tools list before \
+                 trusting the file",
+                crate::one_line::quoted_path(&f.user)
+            )
+        );
+
+        // Positive: the same bytes in a regular 0600 file load — `[]` leaves only
+        // the shell fallback, and a listed name becomes the verb.
+        let f = Fixture::new();
+        f.user("allow_tools = []\n[[tools]]\nname = \"t\"\ncommand = \"t\"\n");
+        let report = f.load().expect("a regular file needs no verdict");
+        assert!(report.resolved().launch_tools().next().is_none());
+        let catalog = report.into_launch_catalog().unwrap();
+        assert_eq!(verbs_of(&catalog), ["shell"]);
+
+        let f = Fixture::new();
+        f.user("allow_tools = [\"t\"]\n[[tools]]\nname = \"t\"\ncommand = \"t\"\n");
+        let catalog = f
+            .load()
+            .expect("a regular file needs no verdict")
+            .into_launch_catalog()
+            .unwrap();
+        assert_eq!(verbs_of(&catalog), ["t", "shell"]);
+    }
+
+    /// V24(b), R1: a project `allow_tools` entry selecting a `:trust` tool needs
+    /// that file's own verdict, and the refusal names the project file's position.
+    #[test]
+    fn project_selected_trust_tool_requires_the_user_files_verdict() {
+        let tools_only =
+            "[[tools]]\nname = \"x\"\ncommand = \"x\"\nnetwork_requests = [\"x.example\"]\n";
+        let f = Fixture::new();
+        let target = f.user.with_file_name("dotfile");
+        write_file(&target, tools_only);
+        std::fs::create_dir_all(f.user.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &f.user).unwrap();
+        f.project("allow_tools = [\"home:x\"]\n");
+        let error = format!("{:#}", f.load().expect_err("unverified :trust tool"));
+        assert!(
+            error.contains(&format!("config: {:?}: allow_tools[0]: ", f.project)),
+            "{error}"
+        );
+        assert!(
+            error.contains("authorizing a :trust tool from the project config requires"),
+            "{error}"
+        );
+        assert!(!error.contains("x.example"), "{error}");
+
+        // Control: an empty project list loads with the shell fallback only.
+        let f = Fixture::new();
+        let target = f.user.with_file_name("dotfile");
+        write_file(&target, tools_only);
+        std::fs::create_dir_all(f.user.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &f.user).unwrap();
+        f.project("allow_tools = []\n");
+        let catalog = f.load().expect("empty list").into_launch_catalog().unwrap();
+        assert_eq!(verbs_of(&catalog), ["shell"]);
+
+        // Control: the same bytes as a regular file authorize `x`.
+        let f = Fixture::new();
+        f.user(tools_only);
+        f.project("allow_tools = [\"home:x\"]\n");
+        let catalog = f.load().expect("verified").into_launch_catalog().unwrap();
+        assert_eq!(verbs_of(&catalog), ["x", "shell"]);
+        assert!(matches!(
+            entry_of(&catalog, "x").tool().origin(),
+            ToolOrigin::User(_)
+        ));
     }
 
     /// The published guidance cannot drift from the shipped catalog.
@@ -6073,14 +7549,70 @@ mod tests {
         }
 
         fn user(&self, contents: &str) -> &Self {
-            write_file(&self.user, contents);
+            write_file(&self.user, &authorized_fixture(contents, &[]));
             self
         }
 
+        /// The project config's tools are authorized **unless the user file
+        /// already declares that name**: a project-side authorization overrides
+        /// the user's verb (ADR-0075 D3), and the pre-#735 merge tests exist to
+        /// pin the *shadowed* shape, where the user definition wins and the
+        /// project one stays in its own reference scope.
         fn project(&self, contents: &str) -> &Self {
-            write_file(&self.project, contents);
+            let user_body = std::fs::read_to_string(&self.user).unwrap_or_default();
+            let declared: Vec<String> = tool_names(&user_body);
+            write_file(&self.project, &authorized_fixture(contents, &declared));
             self
         }
+    }
+
+    /// #735 fixture migration: authorize exactly the tools a fixture declares.
+    ///
+    /// Before #735 a `[[tools]]` block *was* a launch verb, so a hundred fixtures
+    /// declared one and expected it to launch. Authorizing is now a separate step,
+    /// and those fixtures are not about authorization — so this prepends
+    /// `allow_tools` listing every name the body declares.
+    ///
+    /// A body that mentions `allow_tools` at all is left untouched, which is how a
+    /// test states its own authorization (or deliberately states none). The
+    /// #735 suite writes that key explicitly, so this helper can never mask the
+    /// behaviour those tests measure.
+    pub(crate) fn authorized_fixture(contents: &str, skip: &[String]) -> String {
+        if contents.contains("allow_tools") {
+            return contents.to_owned();
+        }
+        let names: Vec<String> = tool_names(contents)
+            .into_iter()
+            .filter(|name| !skip.contains(name))
+            .collect();
+        if names.is_empty() {
+            return contents.to_owned();
+        }
+        let listed = names
+            .iter()
+            .map(|name| format!("{name:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("allow_tools = [{listed}]\n{contents}")
+    }
+
+    /// Every `[[tools]] name = "…"` in one config body, in declaration order.
+    fn tool_names(contents: &str) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for line in contents.lines() {
+            let Some(rest) = line.trim().strip_prefix("name = ") else {
+                continue;
+            };
+            if let Some(name) = rest
+                .trim()
+                .strip_prefix('"')
+                .and_then(|v| v.strip_suffix('"'))
+                && !names.iter().any(|seen| seen == name)
+            {
+                names.push(name.to_owned());
+            }
+        }
+        names
     }
 
     /// A real host-managed project store (ADR-0073) plus a checkout and a
@@ -6162,14 +7694,21 @@ mod tests {
             fs::create_dir_all(store).unwrap();
             fs::set_permissions(store, std::os::unix::fs::PermissionsExt::from_mode(0o700))
                 .unwrap();
-            fs::write(&self.config, body).unwrap();
+            // #735 fixture migration (see `authorized_fixture`): the project's
+            // tools are authorized unless the user file declares that name.
+            let user_body = fs::read_to_string(self.user_config()).unwrap_or_default();
+            fs::write(
+                &self.config,
+                authorized_fixture(body, &tool_names(&user_body)),
+            )
+            .unwrap();
             self
         }
 
         fn write_user(&self, body: &str) -> &Self {
             let path = self.user_config();
             fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(&path, body).unwrap();
+            fs::write(&path, authorized_fixture(body, &[])).unwrap();
             self
         }
 
@@ -7058,12 +8597,14 @@ mod tests {
                  [[tools]]\nname = \"helper\"\ncommand = \"helper\"\ntools = [\"bridge\"]\npersist = [\".helper\"]\n",
             );
         let report = fixture.load().unwrap();
-        assert_eq!(
-            report.conflicts().len(),
-            1,
-            "a whole-definition user-wins conflict is still reported once"
+        // The project does not authorize `pi`, so it overrides nothing: the
+        // shadowed definition stays inert for the verb list while remaining
+        // resolvable from its own file (ADR-0075 D3). The conflict report is about
+        // an *authorized* override, so there is none here.
+        assert!(
+            report.conflicts().is_empty(),
+            "an unauthorized project shadow overrides nothing"
         );
-        assert_eq!(report.conflicts()[0].tool(), "pi");
         let catalog = report.into_launch_catalog().unwrap();
 
         assert_eq!(verbs_of(&catalog), ["pi", "bridge", "helper", "shell"]);
@@ -7724,7 +9265,11 @@ mod tests {
         }
 
         let unnamed = Fixture::new();
-        unnamed.project("[[tools]]\nname = \"\"\ncommand = \"t\"\n");
+        std::fs::write(
+            &unnamed.project,
+            "[[tools]]\nname = \"\"\ncommand = \"t\"\n",
+        )
+        .unwrap();
         assert_eq!(
             unnamed.load().unwrap_err().to_string(),
             format!(
@@ -7824,10 +9369,11 @@ mod tests {
         // in the fixed field order even alongside another differing field.
         let base = "[[tools]]\nname = \"t\"\ncommand = \"t\"\nargs = [\"a\"]\ncredentials = [\"openai\"]\n";
         let fixture = Fixture::new();
-        fixture.user(base).project(
-            &format!("{base}interactive_shell = true\n")
-                .replace("command = \"t\"", "command = \"t2\""),
-        );
+        fixture.user(base).project(&format!(
+            "allow_tools = [\"t\"]\n{}",
+            format!("{base}interactive_shell = true\n")
+                .replace("command = \"t\"", "command = \"t2\"")
+        ));
         let report = fixture.load().unwrap();
         assert_eq!(report.conflicts().len(), 1);
         assert_eq!(
@@ -7835,8 +9381,12 @@ mod tests {
             &[ToolField::Command, ToolField::InteractiveShell]
         );
         assert_eq!(ToolField::InteractiveShell.as_str(), "interactive_shell");
-        // The user's definition (interactive_shell = false) wins.
-        assert!(!first_launch(&report).is_interactive_shell());
+        // ADR-0075 D3: the project config's authorization outranks the `:trust`
+        // file's own verb, so the project's definition — the one with
+        // `interactive_shell = true` — is what launches. The field still round-
+        // trips and still sorts last in the conflict report, which is this test's
+        // subject.
+        assert!(first_launch(&report).is_interactive_shell());
     }
 
     #[test]
@@ -8251,30 +9801,50 @@ mod tests {
         }
     }
 
+    /// V2, R2: every rejected spelling is refused by the **declaration** rule, with
+    /// its own reason. `is_err()` alone was satisfiable by the fixture's injected
+    /// `allow_tools` entry, so the declaration validator could have stopped
+    /// rejecting names without any row noticing (#735 review S10); each row now
+    /// writes the declaration alone and pins the sentence.
     #[test]
     fn unusable_names_are_rejected() {
-        for name in [
-            "",
-            " ",
-            "-x",
-            "a b",
-            "a\tb",
-            "a\nb",
-            "a/b",
-            "/abs",
-            "../..",
-            "../../evil",
-            ".",
-            "..",
-            "...",
+        const WHITESPACE: &str = "name must not contain whitespace or control characters";
+        const PATH: &str = "name must be a single command-name token, not a path";
+        const DOTS: &str = "name must not be `.` or `..`";
+        const COLON: &str = "name must not contain ':' (':' separates a source alias from a tool \
+                             name)";
+        for (name, reason) in [
+            ("", "name must not be empty"),
+            (" ", WHITESPACE),
+            ("-x", "name must not start with '-'"),
+            ("a b", WHITESPACE),
+            ("a\tb", WHITESPACE),
+            ("a\nb", WHITESPACE),
+            ("a/b", PATH),
+            ("/abs", PATH),
+            // A path refusal, not the dots one: '/' is decided first.
+            ("../..", PATH),
+            ("../../evil", PATH),
+            (".", DOTS),
+            ("..", DOTS),
+            ("...", DOTS),
+            // V2: `:` would make `<alias>:<name>` ambiguous.
+            ("a:b", COLON),
         ] {
             let fixture = Fixture::new();
             let body = format!(
                 "[[tools]]\nname = \"{}\"\ncommand = \"x\"\n",
                 name.escape_debug()
             );
-            fixture.user(&body);
-            assert!(fixture.load().is_err(), "name={name:?} should be rejected");
+            // Written directly, never through the fixture's `allow_tools` device, so
+            // only the declaration can be what refuses this body.
+            write_file(&fixture.user, &body);
+            let error = fixture.load().unwrap_err().to_string();
+            assert!(
+                error.contains("declaration [0] tool"),
+                "name={name:?}: {error}"
+            );
+            assert!(error.contains(reason), "name={name:?}: {error}");
         }
     }
 
@@ -8410,16 +9980,28 @@ mod tests {
         assert_eq!(names, ["z", "a", "b", "c"]);
     }
 
+    /// R3: an authorized project definition identical to the inherited one dedupes
+    /// silently — one verb, no conflict — through the `same_definition` comparison
+    /// the override branch makes. The project entry must be explicit: the fixture's
+    /// authorization device skips names the user declares, so without it the project
+    /// copy would be inert and "no conflict" would prove nothing (#735 review S10).
     #[test]
     fn identical_cross_tier_definitions_dedupe_silently() {
         let fixture = Fixture::new();
-        fixture.user(&one_tool("dup")).project(&one_tool("dup"));
+        fixture
+            .user(&one_tool("dup"))
+            .project(&format!("allow_tools = [\"dup\"]\n{}", one_tool("dup")));
         let report = fixture.load().unwrap();
         assert!(report.conflicts().is_empty());
         let tools: Vec<&Tool> = report.resolved().launch_tools().collect();
         assert_eq!(tools.len(), 1);
-        // The winner keeps user provenance.
-        assert_eq!(tools[0].origin(), &ToolOrigin::User(fixture.user.clone()));
+        // The authorizing declaration is the winner: the project overrides the
+        // inherited slot in place (ADR-0075 D3).
+        assert_eq!(
+            tools[0].origin(),
+            &ToolOrigin::Project(fixture.project.clone())
+        );
+        assert_eq!(tools[0].command(), "dup", "the definitions were identical");
     }
 
     #[test]
@@ -8458,17 +10040,13 @@ mod tests {
                 mutated,
             );
             let fixture = Fixture::new();
-            fixture.user(base).project(&project_body);
+            fixture
+                .user(base)
+                .project(&format!("allow_tools = [\"t\"]\n{project_body}"));
             let report = fixture.load().unwrap();
             let conflicts = report.conflicts();
             assert_eq!(conflicts.len(), 1, "case {expected:?}");
             assert_eq!(conflicts[0].fields(), &[expected]);
-            // User definition (whole) wins.
-            assert_eq!(report.resolved().launch_tools().len(), 1);
-            assert_eq!(
-                first_launch(&report).origin(),
-                &ToolOrigin::User(fixture.user.clone())
-            );
         }
 
         // New fields stay last so existing warning ordering does not change.
@@ -8480,7 +10058,9 @@ mod tests {
                 "network_requests = [\"b.example\"]",
             );
         let fixture = Fixture::new();
-        fixture.user(base).project(&project_body);
+        fixture
+            .user(base)
+            .project(&format!("allow_tools = [\"t\"]\n{project_body}"));
         let report = fixture.load().unwrap();
         assert_eq!(report.conflicts().len(), 1);
         assert_eq!(
@@ -8501,7 +10081,7 @@ mod tests {
         fixture
             .user("[[tools]]\nname = \"a\"\ncommand = \"a\"\nargs = [\"1\"]\n[[tools]]\nname = \"b\"\ncommand = \"b\"\n")
             .project(
-                "[[tools]]\nname = \"b\"\ncommand = \"b2\"\n[[tools]]\nname = \"a\"\ncommand = \"a2\"\nargs = [\"1\"]\ncredentials = [\"anthropic\"]\n",
+                "allow_tools = [\"b\", \"a\"]\n[[tools]]\nname = \"b\"\ncommand = \"b2\"\n[[tools]]\nname = \"a\"\ncommand = \"a2\"\nargs = [\"1\"]\ncredentials = [\"anthropic\"]\n",
             );
         let report = fixture.load().unwrap();
         let conflicts = report.conflicts();
@@ -8522,10 +10102,15 @@ mod tests {
         let fixture = Fixture::new();
         fixture
             .user("[[tools]]\nname = \"t\"\ncommand = \"t\"\n")
-            .project("[[tools]]\nname = \"t\"\ncommand = \"t\"\ncredentials = [\"anthropic\"]\n");
+            .project("allow_tools = [\"t\"]\n[[tools]]\nname = \"t\"\ncommand = \"t\"\ncredentials = [\"anthropic\"]\n");
         let report = fixture.load().unwrap();
         assert_eq!(report.conflicts().len(), 1);
         assert_eq!(report.conflicts()[0].fields(), &[ToolField::Credentials]);
+        // The project's authorization is what the launch offers (#735 D3).
+        assert_eq!(
+            first_launch(&report).origin(),
+            &ToolOrigin::Project(fixture.project.clone())
+        );
     }
 
     #[test]
@@ -8541,7 +10126,7 @@ mod tests {
         let fixture = Fixture::new();
         fixture
             .user("[[tools]]\nname = \"t\"\ncommand = \"t\"\nargs = [\"a\", \"b\"]\n")
-            .project("[[tools]]\nname = \"t\"\ncommand = \"t\"\nargs = [\"b\", \"a\"]\n");
+            .project("allow_tools = [\"t\"]\n[[tools]]\nname = \"t\"\ncommand = \"t\"\nargs = [\"b\", \"a\"]\n");
         let report = fixture.load().unwrap();
         assert_eq!(report.conflicts()[0].fields(), &[ToolField::Args]);
     }
@@ -9301,15 +10886,18 @@ mod tests {
             }
         }
 
-        /// Duplicating a catalog across both tiers is an idempotent dedupe.
+        /// Duplicating a catalog across both tiers is an idempotent dedupe: the
+        /// project authorizes every copy it declares, so the identical-definition
+        /// override path runs instead of the copies sitting inert.
         #[test]
         fn duplicating_a_catalog_across_tiers_is_idempotent(
             names in proptest::collection::vec("[a-z]{1,6}", 1..5),
         ) {
             let unique = dedupe(names);
             let body: String = unique.iter().map(|name| format!("[[tools]]\nname = \"{name}\"\ncommand = \"{name}\"\n")).collect();
+            let listed = unique.iter().map(|name| format!("{name:?}")).collect::<Vec<_>>().join(", ");
             let fixture = Fixture::new();
-            fixture.user(&body).project(&body);
+            fixture.user(&body).project(&format!("allow_tools = [{listed}]\n{body}"));
             let report = fixture.load().unwrap();
             let actual: Vec<String> = report.resolved().launch_tools().map(|t| t.name().to_string()).collect();
             proptest::prop_assert_eq!(actual, unique);
@@ -9970,9 +11558,11 @@ mod tests {
                     .contains("`network_requests`")
             );
         }
+        // Canonicically equal request sets do not differ, so no conflict is
+        // recorded even when the project authorizes the verb (#735 D3).
         let f = Fixture::new();
         f.user("[[tools]]\nname = \"t\"\ncommand = \"t\"\nnetwork_requests = [\"a.example\",\"b.example\"]\n")
-            .project("[[tools]]\nname = \"t\"\ncommand = \"t\"\nnetwork_requests = [\"B.example.\",\"a.example\",\"a.example:443\"]\n");
+            .project("allow_tools = [\"t\"]\n[[tools]]\nname = \"t\"\ncommand = \"t\"\nnetwork_requests = [\"B.example.\",\"a.example\",\"a.example:443\"]\n");
         assert!(f.load().unwrap().conflicts().is_empty());
         f.user("[[tools]]\nname = \"t\"\ncommand = \"t\"\n");
         let report = f.load().unwrap();
@@ -9980,13 +11570,25 @@ mod tests {
             report.conflicts()[0].fields(),
             &[ToolField::NetworkRequests]
         );
-        assert!(first_launch(&report).network_requests().is_empty());
+        assert_eq!(
+            report.conflicts()[0].winner_file(),
+            f.project.as_path(),
+            "the project's authorization is the winner"
+        );
+        assert_eq!(
+            first_launch(&report)
+                .network_requests()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["a.example", "b.example"]
+        );
         assert_eq!(
             first_launch(&report).origin(),
-            &ToolOrigin::User(f.user.clone())
+            &ToolOrigin::Project(f.project.clone())
         );
         f.project(
-            "[[tools]]\nname = \"t\"\ncommand = \"t\"\nnetwork_requests = [\"udp://a.example\"]\n",
+            "allow_tools = [\"t\"]\n[[tools]]\nname = \"t\"\ncommand = \"t\"\nnetwork_requests = [\"udp://a.example\"]\n",
         );
         assert!(f.load().is_err());
         assert_eq!(ToolField::NetworkRequests.as_str(), "network_requests");
@@ -10056,237 +11658,74 @@ mod tests {
             .collect()
     }
 
-    const UNKNOWN_TOOL: &str = "an egress reference must name a tool declared in the user config's own [[tools]]; built-in and project tools are never used (`agent-vm tools print` prints the shipped tools to copy there)";
-    const NO_REQUESTS: &str = "an egress reference must name a tool that declares network_requests; this tool declares none, so the reference would grant nothing";
-
     fn network_table(entries: &str) -> String {
         format!("\n[network]\nallow_egress = [{entries}]\n")
     }
 
-    /// A7: the reference expands, in request order, to exact host:port grants.
+    /// V12: `tool:NAME` is ordinary allowance text again, so `[network]` refuses
+    /// it exactly as the grammar does — a non-numeric name is a malformed port,
+    /// and a numeric one is the literal hostname `tool` (the pre-#506 meaning).
     #[test]
-    fn persisted_tool_reference_expands_to_exact_hostnames() {
+    fn tool_names_in_allow_egress_are_refused_as_malformed_ports() {
+        for text in ["tool:fetcher", "TOOL:codex", "tool:"] {
+            let fixture = Fixture::new();
+            let error = fixture
+                .user(&network_table(&format!("{text:?}")))
+                .load()
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error,
+                format!(
+                    "config: {}: network.allow_egress[0]: port must be a decimal number 1-65535",
+                    crate::one_line::quoted_path(&fixture.user)
+                ),
+                "{text}"
+            );
+        }
         let fixture = Fixture::new();
-        let user = format!(
-            "[[tools]]\nname = \"fetcher\"\ncommand = \"fetcher\"\nnetwork_requests = [\"b.example\", \"a.example:8443\"]\n{}",
-            network_table("\"tool:fetcher\"")
-        );
-        fixture.user(&user);
+        fixture.user(&network_table("\"tool:443\""));
         let report = fixture.load().unwrap();
         assert_eq!(
             saved_allowances(&report),
-            ["tcp://a.example:8443", "tcp://b.example:443"]
+            ["tcp://tool:443"],
+            "a numeric tool:PORT is the literal hostname `tool`"
         );
     }
 
-    /// A9: own requests only. `tool:shell` would otherwise grant everything.
+    /// `set:NAME` is the one remaining reference, and it resolves against the
+    /// user file's own `[egress_sets]`.
     #[test]
-    fn own_requests_only_not_the_tools_closure() {
+    fn set_reference_expands_to_its_compiled_closure() {
         let fixture = Fixture::new();
-        let user = format!(
-            "[[tools]]\nname = \"a\"\ncommand = \"a\"\ntools = [\"b\"]\nnetwork_requests = [\"a.example\"]\n\
-             [[tools]]\nname = \"b\"\ncommand = \"b\"\nnetwork_requests = [\"b.example\"]\n{}",
-            network_table("\"tool:a\"")
-        );
-        fixture.user(&user);
+        fixture.user(&format!(
+            "[egress_sets]\ncorp = [\"git.corp.example\", \"10.0.0.5\"]\n{}",
+            network_table("\"set:corp\"")
+        ));
         let report = fixture.load().unwrap();
-        assert_eq!(saved_allowances(&report), ["tcp://a.example:443"]);
-    }
+        assert_eq!(
+            saved_allowances(&report),
+            ["git.corp.example", "10.0.0.5/32"]
+        );
 
-    /// A10/A11, persisted: the namespace is the user file's own tools, so a
-    /// project declaration of the same name is never resolved — not even when it
-    /// is the launchable verb.
-    #[test]
-    fn persisted_tool_reference_ignores_project_and_builtin_tools() {
+        // An undefined name is a resolution error, named by its position and
+        // never echoed.
         let fixture = Fixture::new();
-        fixture
-            .user("[[tools]]\nname = \"unrelated\"\ncommand = \"unrelated\"\n")
-            .project("[[tools]]\nname = \"fetcher\"\ncommand = \"fetcher\"\nnetwork_requests = [\"p.example\"]\n");
         let error = fixture
-            .user(&format!(
-                "[[tools]]\nname = \"unrelated\"\ncommand = \"unrelated\"\n{}",
-                network_table("\"tool:fetcher\"")
-            ))
+            .user(&network_table("\"set:SENTINEL735\""))
             .load()
             .unwrap_err()
             .to_string();
         assert_eq!(
             error,
             format!(
-                "config: {}: network.allow_egress[0]: {UNKNOWN_TOOL}",
+                "config: {}: network.allow_egress[0]: an egress reference must name a set declared \
+                 in the user config's own [egress_sets]; project and built-in configs cannot \
+                 declare sets",
                 crate::one_line::quoted_path(&fixture.user)
             )
         );
-        // The built-in catalog is equally unnameable: with no user tools at all,
-        // the shipped `codex` does not resolve.
-        let fixture = Fixture::new();
-        fixture.project("").user(&network_table("\"tool:codex\""));
-        let error = fixture.load().unwrap_err().to_string();
-        assert!(error.contains(&format!("network.allow_egress[0]: {UNKNOWN_TOOL}")));
-        assert!(error.contains("network.allow_egress[0]"), "{error}");
-    }
-
-    /// A12: a user definition shadows the project's for *resolution* too, because
-    /// the namespace is the user tier before the merge.
-    #[test]
-    fn user_tool_shadowing_a_project_tool_expands_the_user_requests() {
-        let fixture = Fixture::new();
-        fixture
-            .user(&format!(
-                "[[tools]]\nname = \"codex\"\ncommand = \"codex\"\nnetwork_requests = [\"u.example\"]\n{}",
-                network_table("\"tool:codex\"")
-            ))
-            .project("[[tools]]\nname = \"codex\"\ncommand = \"codex\"\nnetwork_requests = [\"p.example\"]\n");
-        let report = fixture.load().unwrap();
-        assert_eq!(saved_allowances(&report), ["tcp://u.example:443"]);
-    }
-
-    /// A13: only tools whose origin file is the file the verdict measured.
-    ///
-    /// Three excluded origins and one accepted one, each resolved through the same
-    /// constructor the loader uses. Every exclusion must fail as an **unknown
-    /// tool**: an erroneously included tool could also fail, for instance with
-    /// no requests, so a bare `is_ok` check would accept a wrong filter. A
-    /// variant-only filter excludes project and built-in tools and fails only the
-    /// wrong-file case; dropping the filter entirely fails all three.
-    #[test]
-    fn user_tool_requests_filter_by_origin_and_file() {
-        use crate::config_authority::ReferenceTrust;
-        use crate::egress_reference::{AllowanceEntry, EgressNamespace, EntryError, resolve};
-        let file = Path::new("/home/u/.config/agent-vm/config.toml");
-        let other = Path::new("/home/u/other.toml");
-        // Hand-built `RawTool` values straight into `validate_tools`, which is
-        // the same validation a decoded file goes through; the point here is the
-        // origin filter, not TOML decoding.
-        let raw = |name: &str| RawTool {
-            name: name.to_owned(),
-            command: name.to_owned(),
-            args: Vec::new(),
-            credentials: Vec::new(),
-            tools: None,
-            persist: Vec::new(),
-            interactive_shell: false,
-            env: BTreeMap::new(),
-            network_requests: vec!["a.example".to_owned()],
-            mounts: None,
-        };
-        let project = validate_tools(
-            vec![raw("codex")],
-            ToolOrigin::Project(PathBuf::from("/p/config.toml")),
-            config_mounts::ToolMountLists::empty(),
-        )
-        .unwrap();
-        let builtin = default_tools().unwrap();
-        let wrong_file = validate_tools(
-            vec![raw("codex")],
-            ToolOrigin::User(other.to_path_buf()),
-            config_mounts::ToolMountLists::empty(),
-        )
-        .unwrap();
-        let right_file = validate_tools(
-            vec![raw("codex")],
-            ToolOrigin::User(file.to_path_buf()),
-            config_mounts::ToolMountLists::empty(),
-        )
-        .unwrap();
-        let entry = AllowanceEntry::parse("tool:codex").unwrap();
-        for (label, tools) in [
-            ("project", &project),
-            ("built-in", &builtin),
-            ("another file", &wrong_file),
-        ] {
-            let namespace =
-                EgressNamespace::new(ReferenceTrust::verified_for_test(file), tools, None).unwrap();
-            let failure = resolve(vec![entry.clone()], Some(&namespace)).unwrap_err();
-            assert_eq!(failure.index, 0, "{label} tools");
-            assert_eq!(failure.error, EntryError::UnknownTool, "{label} tools");
-        }
-        // The accepted origin, resolved the same way, and expanded to its own
-        // requests: `is_ok` would not show the namespace kept the right tool.
-        let namespace =
-            EgressNamespace::new(ReferenceTrust::verified_for_test(file), &right_file, None)
-                .unwrap();
-        let resolved = resolve(vec![entry], Some(&namespace)).unwrap();
-        assert_eq!(
-            resolved
-                .allowances()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>(),
-            ["tcp://a.example:443"],
-            "same-file tools resolve"
-        );
-    }
-
-    /// A14 and R14's persisted ordering: a `[network]` *syntax* error precedes a
-    /// tool-validation error, and a reference's *resolution* error follows it.
-    #[test]
-    fn persisted_reference_errors_follow_todays_order() {
-        let empty_tool = "[[tools]]\nname = \"t\"\ncommand = \"\"\n";
-        let fixture = Fixture::new();
-        let error = fixture
-            .user(&format!(
-                "{empty_tool}{}",
-                network_table("\"udp://h.example\"")
-            ))
-            .load()
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains(
-                "network.allow_egress[0]: hostnames allow TLS over TCP only; use tcp://HOST:PORT, or an IP/CIDR for UDP"
-            ),
-            "{error}"
-        );
-        let fixture = Fixture::new();
-        let error = fixture
-            .user(&format!("{empty_tool}{}", network_table("\"tool:nope\"")))
-            .load()
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("declaration [0] tool \"t\": command must not be empty"),
-            "{error}"
-        );
-    }
-
-    /// A14: a user tool with no requests grants nothing, so the reference is an
-    /// error rather than a silently empty grant.
-    #[test]
-    fn persisted_reference_to_a_tool_without_requests_is_refused() {
-        let fixture = Fixture::new();
-        let error = fixture
-            .user(&format!(
-                "[[tools]]\nname = \"shell\"\ncommand = \"bash\"\n{}",
-                network_table("\"tool:shell\"")
-            ))
-            .load()
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            error,
-            format!(
-                "config: {}: network.allow_egress[0]: {NO_REQUESTS}",
-                crate::one_line::quoted_path(&fixture.user)
-            )
-        );
-    }
-
-    /// A26: the project tier gains nothing, byte for byte.
-    #[test]
-    fn project_tool_reference_keeps_the_presence_refusal() {
-        let fixture = Fixture::new();
-        let error = fixture
-            .project(&network_table("\"tool:codex\""))
-            .load()
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            error,
-            format!(
-                "config: {}: network.allow_egress: network access cannot be granted by the project config; use --allow-* launch flags, or [network] in the user config",
-                crate::one_line::quoted_path(&fixture.project)
-            )
-        );
+        assert!(!error.contains("SENTINEL735"));
     }
 
     /// A resolved reference uses the captured directory verdict in **both**
@@ -10298,210 +11737,115 @@ mod tests {
     #[test]
     fn captured_directory_verdict_is_not_remeasured() {
         use std::os::unix::fs::PermissionsExt;
-        let tools_only =
-            "[[tools]]\nname = \"x\"\ncommand = \"x\"\nnetwork_requests = [\"a.example\"]\n";
-        let resolve_x = |report: &ConfigReport| {
+        let sets_only = "[egress_sets]\ncorp = [\"a.example\"]\n";
+        let resolve_set = |report: &ConfigReport| {
             crate::egress_reference::resolve(
-                vec![crate::egress_reference::AllowanceEntry::parse("tool:x").unwrap()],
+                vec![crate::egress_reference::AllowanceEntry::parse("set:corp").unwrap()],
                 report.user_tool_requests(),
             )
         };
 
-        // Passing read, then the directory becomes writable.
-        let fixture = Fixture::new();
-        fixture.user(tools_only);
-        let directory = fixture.user.parent().unwrap().to_path_buf();
-        let report = fixture.load().expect("a private directory loads");
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o777)).unwrap();
-        let resolved = resolve_x(&report).expect("the captured passing verdict still resolves");
-        assert_eq!(
-            resolved
-                .allowances()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>(),
-            ["tcp://a.example:443"]
-        );
-
-        // Refused read, then the directory becomes private.
-        let fixture = Fixture::new();
-        fixture.user(tools_only);
-        let directory = fixture.user.parent().unwrap().to_path_buf();
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o777)).unwrap();
-        let report = fixture
-            .load()
-            .expect("a tools-only file still loads whatever its directory is");
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let failure = resolve_x(&report).unwrap_err();
-        assert_eq!(
-            failure.error.to_string(),
-            format!(
-                "config: {}: an egress reference refuses a config.toml whose directory is group- or other-writable; a guest or another account may be able to replace the file, so review the [[tools]] network_requests before trusting it",
-                crate::one_line::quoted_path(&fixture.user)
-            ),
-            "the captured refusal survives the directory becoming private"
-        );
-    }
-
-    /// A31: the verdict travels with the read. Replacing the symlink with a
-    /// regular `0600` file afterwards does not make the captured namespace
-    /// trusted, because nothing re-measures.
-    #[test]
-    fn captured_reference_verdict_is_not_remeasured() {
-        let fixture = Fixture::new();
-        let tools_only =
-            "[[tools]]\nname = \"x\"\ncommand = \"x\"\nnetwork_requests = [\"a.example\"]\n";
-        fixture.symlinked_user(tools_only);
-        let report = fixture.load().expect("a tools-only symlink still loads");
-        // The same bytes as a regular, singly-linked `0600` file.
-        std::fs::remove_file(&fixture.user).unwrap();
-        write_file(&fixture.user, tools_only);
-        let namespace = report.user_tool_requests().expect("a user tier");
-        let failure = crate::egress_reference::resolve(
-            vec![crate::egress_reference::AllowanceEntry::parse("tool:x").unwrap()],
-            Some(namespace),
-        )
-        .unwrap_err();
-        assert_eq!(
-            failure.error.to_string(),
-            format!(
-                "config: {}: an egress reference requires config.toml to be a regular file, but it is reached through a symbolic link; its target may be writable by a guest or project, so review the [[tools]] network_requests before trusting the file (a symlinked config without an egress reference still works)",
-                crate::one_line::quoted_path(&fixture.user)
-            )
-        );
-    }
-
-    /// A32: the namespace is owned data. Rewriting the file after load cannot
-    /// change what the captured namespace expands to, because nothing re-reads.
-    #[test]
-    fn captured_namespace_is_not_reread() {
-        let fixture = Fixture::new();
-        fixture
-            .user("[[tools]]\nname = \"x\"\ncommand = \"x\"\nnetwork_requests = [\"a.example\"]\n");
-        let report = fixture.load().unwrap();
-        fixture
-            .user("[[tools]]\nname = \"x\"\ncommand = \"x\"\nnetwork_requests = [\"b.example\"]\n");
-        let namespace = report.user_tool_requests().expect("a user tier");
-        let resolved = crate::egress_reference::resolve(
-            vec![crate::egress_reference::AllowanceEntry::parse("tool:x").unwrap()],
-            Some(namespace),
+        let f = Fixture::new();
+        f.user(sets_only);
+        let report = f.load().expect("the file passes");
+        // A directory the *load* accepted, made writable afterwards.
+        std::fs::set_permissions(
+            f.user.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o777),
         )
         .unwrap();
+        let resolved = resolve_set(&report).expect("the captured verdict still passes");
         assert_eq!(
             resolved
                 .allowances()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>(),
-            ["tcp://a.example:443"]
+            ["a.example"]
+        );
+
+        // The reverse direction cannot be a *captured* refusal any more: a
+        // `[egress_sets]` table is authority-bearing (ADR-0040's fourth trigger),
+        // so a writable directory refuses at **load**, before any verdict could be
+        // captured — there is no report to resolve and no second measurement to
+        // skip. What is still worth pinning is that this is a load refusal, and
+        // that the mode is what decides it.
+        let f = Fixture::new();
+        f.user(sets_only);
+        std::fs::set_permissions(
+            f.user.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o777),
+        )
+        .unwrap();
+        let error = f.load().unwrap_err().to_string();
+        assert!(
+            error.contains("group- or other-writable") && error.contains("egress_sets"),
+            "{error}"
+        );
+        assert!(
+            error.contains("group- or other-writable"),
+            "the refusal names the mode: {error}"
         );
     }
 
-    /// A34: the disclosed rebinding. `tool:8443` used to be the hostname `tool`
-    /// on port 8443; it is now a reference to a tool of that name, and a user tool
-    /// named `8443` silently redirects it.
+    /// A28/A31: a resolved reference uses the captured **file** verdict, in both
+    /// directions, and never re-reads or re-measures.
     #[test]
-    fn numeric_tool_name_rebinds_a_former_tool_port_hostname() {
-        let fixture = Fixture::new();
-        let user = format!(
-            "[[tools]]\nname = \"8443\"\ncommand = \"n\"\nnetwork_requests = [\"other.example:9443\"]\n{}",
-            network_table("\"tool:8443\", \"TOOL:8443\"")
+    fn captured_reference_verdict_is_not_remeasured() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new();
+        f.user("[egress_sets]\ncorp = [\"a.example\"]\n");
+        let report = f.load().expect("the file passes");
+        std::fs::set_permissions(&f.user, std::fs::Permissions::from_mode(0o664)).unwrap();
+        assert!(
+            crate::egress_reference::resolve(
+                vec![crate::egress_reference::AllowanceEntry::parse("set:corp").unwrap()],
+                report.user_tool_requests(),
+            )
+            .is_ok(),
+            "a file made writable after load does not re-measure"
         );
-        fixture.user(&user);
-        let report = fixture.load().unwrap();
-        assert_eq!(
-            saved_allowances(&report),
-            ["tcp://other.example:9443"],
-            "one entry: the two spellings are one reference"
+
+        // The refusal direction is a **load** refusal, not a captured one: a
+        // `[egress_sets]` table is authority-bearing, so an unverified file never
+        // loads and there is no report to resolve. What still matters for the
+        // captured-verdict property is the direction above (a load-accepted file
+        // made writable does not re-measure); a file made private after a *refused*
+        // load has no verdict to reuse.
+        let f = Fixture::new();
+        f.user("[egress_sets]\ncorp = [\"a.example\"]\n");
+        std::fs::set_permissions(&f.user, std::fs::Permissions::from_mode(0o664)).unwrap();
+        let error = f.load().unwrap_err().to_string();
+        assert!(
+            error.contains("group- or other-writable config.toml") && error.contains("egress_sets"),
+            "{error}"
         );
-        // The literal spelling still means what it always did.
+        std::fs::set_permissions(&f.user, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            f.load().is_ok(),
+            "the same bytes are accepted once the file is private"
+        );
+    }
+
+    /// A user file that declares only `[egress_sets]` still supplies a namespace,
+    /// so a CLI `set:NAME` resolves without a `[network]` table.
+    #[test]
+    fn a_sets_only_user_file_still_supplies_a_namespace() {
         let fixture = Fixture::new();
         fixture
-            .user(&format!(
-                "[[tools]]\nname = \"8443\"\ncommand = \"n\"\nnetwork_requests = [\"other.example:9443\"]\n{}",
-                network_table("\"tcp://tool:8443\"")
-            ));
-        let report = fixture.load().unwrap();
-        assert_eq!(
-            saved_allowances(&report),
-            ["tcp://tool:8443"],
-            "the documented fix keeps the old meaning"
-        );
-    }
-
-    /// A36: the USAGE example, byte-identical — checked against `USAGE.md`
-    /// itself, not against a copy of it.
-    ///
-    /// Two links, both inside the "Egress references (user tools)" section and
-    /// both bounded by the next heading (a search that runs to EOF would accept a
-    /// snippet or an output block anywhere later in the file): the example TOML is
-    /// asserted to occur there before it is loaded, and the *documented expansion*
-    /// is read out of the same section and compared with what the loader produces.
-    /// Editing either half of the documentation without editing this test fails
-    /// here.
-    #[test]
-    fn usage_egress_reference_example_loads() {
-        const USAGE_EXAMPLE: &str = r#"[[tools]]
-name = "fetcher"
-command = "fetcher"
-network_requests = ["api.example.com", "git.example.com:8443"]
-
-[network]
-allow_egress = ["tool:fetcher"]
-"#;
-        let usage = include_str!("../../../USAGE.md");
-        let (_, section) = usage
-            .split_once("### Egress references (user tools)")
-            .expect("USAGE documents egress references");
-        let section = section
-            .split_once("\n#")
-            .map_or(section, |(section, _)| section);
-        assert!(
-            section.contains(USAGE_EXAMPLE),
-            "USAGE.md's egress-reference section must carry this exact example"
-        );
-        let documented: Vec<String> = section
-            .split_once("`tool:fetcher` grants exactly two allowances, in request order:")
-            .expect("USAGE documents what the example grants")
-            .1
-            .split_once("```text\n")
-            .expect("the documented expansion is a text block")
-            .1
-            .split_once("\n```")
-            .expect("the documented expansion block is closed")
-            .0
-            .lines()
-            .map(str::to_owned)
-            .collect();
-        let fixture = Fixture::new();
-        fixture.project("").user(USAGE_EXAMPLE);
-        let report = fixture.load().expect("the documented example loads");
-        assert_eq!(
-            saved_allowances(&report),
-            documented,
-            "the documented expansion, in the documented order"
-        );
-    }
-
-    /// A23's unit half and the `[network]` trigger rule: a user file that declares
-    /// no authority-bearing field still loads and still supplies a namespace, so a
-    /// CLI reference works without a `[network]` table.
-    #[test]
-    fn a_tools_only_user_file_still_supplies_a_namespace() {
-        let fixture = Fixture::new();
-        fixture.project("").user(
-            "[[tools]]\nname = \"fetcher\"\ncommand = \"fetcher\"\nnetwork_requests = [\"a.example\"]\n",
-        );
+            .project("")
+            .user("[egress_sets]\nfetcher = [\"a.example\"]\n");
         let report = fixture.load().unwrap();
         assert!(report.user_network().is_none());
         let namespace = report.user_tool_requests().expect("the user tier loaded");
         let resolved = crate::egress_reference::resolve(
-            vec![crate::egress_reference::AllowanceEntry::parse("tool:fetcher").unwrap()],
+            vec![crate::egress_reference::AllowanceEntry::parse("set:fetcher").unwrap()],
             Some(namespace),
         )
         .unwrap();
         assert!(
             resolved
                 .allowances()
-                .any(|allowance| allowance.to_string() == "tcp://a.example:443")
+                .any(|allowance| allowance.to_string() == "a.example")
         );
     }
 
@@ -10622,12 +11966,13 @@ allow_egress = ["tool:fetcher"]
         f.write_repo("r.toml", &one_tool("r"));
         let report = f
             .with_project(&format!(
-                "{}{}",
+                "{}\nallow_tools = [\"p\", \"home:r\"]\n{}",
                 sources_block(&["home ./r.toml"]),
                 one_tool("p")
             ))
             .expect("an untrusted-only list loads");
         assert_eq!(report.user().status(), &TierStatus::NotSourced);
+        // #735: a sourced tool is a verb only when the project authorizes it.
         assert_eq!(launch_names(&report), ["p", "r"]);
 
         // With no tools declared anywhere, the defaults still apply.
@@ -10655,23 +12000,25 @@ allow_egress = ["tool:fetcher"]
         );
         let report = f
             .with_project(&format!(
-                "{}{}",
+                "{}\nallow_tools = [\"p\", \"repo:u\", \"repo:repo\"]\n{}",
                 sources_block(&[HOME_SOURCE, REPO_SOURCE]),
                 one_tool("p")
             ))
             .expect("shadowed source tool loads");
-        // The user definition is the launch verb for `u`.
+        // ADR-0075 D3: the project config's authorization outranks the `:trust`
+        // file's own verb, so the *source* definition is the launch verb for `u`
+        // and the user's is the overridden one.
         let winner = report
             .resolved()
             .launch_tools()
             .find(|tool| tool.name() == "u")
             .expect("u");
-        assert_eq!(winner.command(), "u");
+        assert_eq!(winner.command(), "repo-u");
         let conflicts = report.conflicts();
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].tool(), "u");
-        assert_eq!(conflicts[0].user_file(), f.user_config().as_path());
-        assert_eq!(conflicts[0].project_file(), repo.as_path());
+        assert_eq!(conflicts[0].winner_file(), repo.as_path());
+        assert_eq!(conflicts[0].overridden_file(), f.user_config().as_path());
 
         let catalog = report.into_launch_catalog().expect("catalog");
         // The source's own `u` is what its own reference resolves to, so the
@@ -10841,9 +12188,9 @@ allow_egress = ["tool:fetcher"]
                 "egress_sets cannot be declared",
             ),
             (
-                "tool mounts",
-                "[[tools]]\nname = \"t\"\ncommand = \"t\"\n[[tools]]\nname = \"u\"\ncommand = \"u\"\nmounts = []\n",
-                "tools[1].mounts",
+                "allow_tools",
+                "allow_tools = []\n[[tools]]\nname = \"t\"\ncommand = \"t\"\n",
+                "allow_tools",
             ),
         ] {
             let f = SourcesFixture::new();
@@ -10860,6 +12207,29 @@ allow_egress = ["tool:fetcher"]
             );
             assert!(error.contains(pointer), "{label}: {error}");
         }
+
+        // A sourced tool's `mounts` is *not* authority any more (#735): it is inert
+        // data until the project authorizes the tool, so the file loads and the
+        // declaration grants nothing.
+        let f = SourcesFixture::new();
+        f.write_repo(
+            ".agent-vm/config.toml",
+            &format!(
+                "{}{}",
+                one_tool("t"),
+                "[[tools]]\nname = \"u\"\ncommand = \"u\"\nmounts = []\n"
+            ),
+        );
+        let report = f
+            .with_project(&sources_block(&[REPO_SOURCE]))
+            .expect("a sourced tool's mounts is inert, not authority");
+        assert!(
+            report
+                .resolved()
+                .launch_tools()
+                .all(|tool| tool.name() != "u"),
+            "an unauthorized sourced tool is not a verb"
+        );
     }
 
     /// V11 (F7, G2): a missing source is an error naming the file and its index, a
@@ -10914,7 +12284,10 @@ allow_egress = ["tool:fetcher"]
         fs::write(f.checkout().join("target.toml"), one_tool("checkout-tool")).unwrap();
         std::os::unix::fs::symlink(&sibling, f.checkout().join("link")).unwrap();
         let report = f
-            .with_project(&sources_block(&["link ./link/../target.toml"]))
+            .with_project(&format!(
+                "{}\nallow_tools = [\"link:outside-tool\"]\n",
+                sources_block(&["link ./link/../target.toml"])
+            ))
             .expect("dot-dot through a symlink");
         assert_eq!(launch_names(&report), ["outside-tool"]);
 
@@ -11052,7 +12425,18 @@ allow_egress = ["tool:fetcher"]
         fs::create_dir_all(f.user_config().parent().unwrap()).unwrap();
         symlink(&dotfile, f.user_config()).unwrap();
         let report = f.load().expect("dotfile symlink loads");
-        assert_eq!(launch_names(&report), ["home"]);
+        // ADR-0040's compatibility rule keeps the *declarations* loadable, and
+        // #735 needs `allow_tools` to make one a verb — which is authority, so a
+        // symlinked file cannot supply it. The tool is therefore inert.
+        assert_eq!(launch_names(&report), Vec::<&str>::new());
+        assert_eq!(
+            report
+                .inert_tools()
+                .iter()
+                .map(|tool| tool.name().to_string())
+                .collect::<Vec<_>>(),
+            ["home"]
+        );
         assert_eq!(
             image_ref(report.images().user()),
             Some("localhost:1/home:latest")
@@ -11264,33 +12648,64 @@ allow_egress = ["tool:fetcher"]
         );
     }
 
-    /// V14 (R8): a name two project-side files declare is an error naming both.
+    /// V14 (R8), restated for #735: a name two project-side files declare is
+    /// **inert** while neither is authorized — a declaration is data — and a hard
+    /// error the moment both are, because the verb `x` would have two project-side
+    /// definitions and no rule picks one.
     #[test]
-    fn v14_a_project_side_tool_collision_is_an_error() {
+    fn v14_a_project_side_tool_collision_is_an_error_once_authorized() {
         let f = SourcesFixture::new();
         let repo = f.write_repo(".agent-vm/config.toml", &one_tool("x"));
+        let report = f
+            .with_project(&format!(
+                "# no allow_tools\n{}{}",
+                sources_block(&[REPO_SOURCE]),
+                one_tool("x")
+            ))
+            .expect("an inert project-side collision loads");
+        assert!(report.conflicts().is_empty());
+        assert_eq!(
+            report
+                .inert_tools()
+                .iter()
+                .map(|tool| tool.name().to_string())
+                .collect::<Vec<_>>(),
+            ["x", "x"],
+            "both declarations are inert"
+        );
+
         let error = format!(
             "{:#}",
             f.with_project(&format!(
-                "{}{}",
+                "allow_tools = [\"x\", \"repo:x\"]\n{}{}",
                 sources_block(&[REPO_SOURCE]),
                 one_tool("x")
             ))
             .expect_err("collision")
         );
-        assert!(error.contains("cannot declare the same tool"), "{error}");
-        assert!(error.contains(&repo.display().to_string()), "{error}");
+        // The sentence names the verb and the file that already claims it; the
+        // second declaration is the one being refused, so its path is the one the
+        // reader is looking at.
+        assert!(error.contains("authorizes a second tool named"), "{error}");
+        assert!(
+            error.contains(&f.project_config().display().to_string()),
+            "{error}"
+        );
         assert!(error.contains("project config"), "{error}");
+        let _ = &repo;
 
         let f = SourcesFixture::new();
         f.write_repo("a.toml", &one_tool("x"));
         f.write_repo("b.toml", &one_tool("x"));
         let error = format!(
             "{:#}",
-            f.with_project(&sources_block(&["a ./a.toml", "b ./b.toml"]))
-                .expect_err("two sources")
+            f.with_project(&format!(
+                "allow_tools = [\"a:x\", \"b:x\"]\n{}",
+                sources_block(&["a ./a.toml", "b ./b.toml"])
+            ))
+            .expect_err("two sources")
         );
-        assert!(error.contains("cannot declare the same tool"), "{error}");
+        assert!(error.contains("authorizes a second tool named"), "{error}");
         assert!(error.contains("source a"), "{error}");
     }
 
@@ -11307,6 +12722,51 @@ allow_egress = ["tool:fetcher"]
             let error = format!("{:#}", f.load().expect_err(table));
             assert!(error.contains(sentence), "{table}: {error}");
             assert!(error.contains("sources is not"), "{table}: {error}");
+        }
+    }
+
+    /// The two other tables a top-level key can be written into: as a network key
+    /// it is an unknown setting, as a tool field it fails the schema, and neither
+    /// sentence says the line belongs above the first header. Both tiers are checked
+    /// because both read through the same decoder, and the project tier is the one
+    /// where `sources` is otherwise a legal key. `allow_tools` (#735) is the second
+    /// order-sensitive key: written after a header it authorizes nothing, which the
+    /// generic schema sentence never said.
+    #[test]
+    fn a_table_header_cannot_swallow_an_order_sensitive_top_level_key() {
+        for (body, diagnostic) in [
+            (
+                "[network]\nallow_lan = true\nsources = [\"repo ./x.toml\"]\n",
+                "[network]: sources is not a network setting; a top-level sources must be \
+                 written before the first table header (keys after [network] belong to it)",
+            ),
+            (
+                "[[tools]]\nname = \"t\"\ncommand = \"/bin/true\"\nsources = [\"repo ./x.toml\"]\n",
+                "tools[0]: sources is not a tool field; a top-level sources must be written \
+                 before the first table header (keys after [[tools]] belong to the last tool)",
+            ),
+            (
+                "[network]\nallow_lan = true\nallow_tools = [\"t\"]\n",
+                "[network]: allow_tools is not a network setting; a top-level allow_tools must be \
+                 written before the first table header (keys after [network] belong to it)",
+            ),
+            (
+                "[[tools]]\nname = \"t\"\ncommand = \"/bin/true\"\nallow_tools = [\"t\"]\n",
+                "tools[0]: allow_tools is not a tool field; a top-level allow_tools must be \
+                 written before the first table header (keys after [[tools]] belong to the last \
+                 tool)",
+            ),
+        ] {
+            let f = Fixture::new();
+            let error = f.user(body).load().unwrap_err().to_string();
+            assert_eq!(error, format!("config: {:?}: {diagnostic}", f.user));
+
+            let f = SourcesFixture::new();
+            let error = f.with_project(body).unwrap_err().to_string();
+            assert_eq!(
+                error,
+                format!("config: {:?}: {diagnostic}", f.project_config())
+            );
         }
     }
 }
