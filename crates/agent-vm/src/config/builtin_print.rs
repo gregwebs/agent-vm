@@ -216,11 +216,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let user = dir.path().join("config.toml");
         std::fs::write(&user, text).unwrap();
-        load(&ConfigPaths {
-            user: Some(user),
-            project: dir.path().join("absent.toml"),
-            home: None,
-        })
+        load(&ConfigPaths::for_test(
+            Some(user),
+            dir.path().join("absent.toml"),
+        ))
         .expect("the printed catalog loads as a user config")
     }
 

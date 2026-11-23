@@ -7,7 +7,9 @@
 //!
 //! ```text
 //! --dockerfile (launch only; exclusive with a typed --image)
-//!   > --image > AGENT_VM_IMAGE_TAG (empty = unset) > user image > project image > default
+//!   > --image > AGENT_VM_IMAGE_TAG (empty = unset)
+//!   > project image (its own, or an ALIAS:image source selection)
+//!   > user image (the :trust source) > default
 //! ```
 //!
 //! — so `run`, `image pull`, `setup`, `doctor`, `image show` and import's completion
@@ -63,9 +65,9 @@
 //! disk image. A config-file `image` is stricter: it must be an OCI reference.
 //! The reason is a security boundary, not a convenience — the SDK treats a
 //! leading `/`, `./`, `../`, `.` or `..` as a **host rootfs bind or disk
-//! image** (`ImageSource::into_rootfs_source`), so a repo-supplied
-//! `.agent-vm/config.toml` with `image = "/"` would otherwise boot the host
-//! root filesystem as a writable guest rootfs. The config acceptance decision is
+//! image** (`ImageSource::into_rootfs_source`), so a config file with
+//! `image = "/"` would otherwise boot the host root filesystem as a writable
+//! guest rootfs. The config acceptance decision is
 //! the contracted [`config_image_is_acceptable`] kernel; the OCI parser, the
 //! SDK's path predicate and the Unicode character measurement are the trusted
 //! adapters that feed it. The command-line/env pass-through has its own, smaller
@@ -218,8 +220,15 @@ pub(crate) enum ImageSource {
     Environment,
     /// `image` in `$HOME/.config/agent-vm/config.toml`.
     UserConfig(PathBuf),
-    /// `image` in `<cwd>/.agent-vm/config.toml`.
+    /// `image` in the project's host-managed config (ADR-0073):
+    /// `$HOME/.config/agent-vm/projects/<project-id>/config.toml`.
     ProjectConfig(PathBuf),
+    /// A source's `image`, authorized by the project config as `ALIAS:image`
+    /// (ADR-0074). `file` is the declaring (sourced) file.
+    SourcedConfig {
+        alias: crate::config_sources::SourceAlias,
+        file: PathBuf,
+    },
     /// This project's established default, recorded in the approval store at
     /// this path (ADR-0067).
     ProjectDefault(PathBuf),
@@ -245,6 +254,9 @@ impl ImageSource {
             }
             ImageSource::ProjectConfig(file) => {
                 format!("project config {}", crate::one_line::path(file))
+            }
+            ImageSource::SourcedConfig { alias, file } => {
+                format!("{alias}:image in {}", crate::one_line::path(file))
             }
             // All three default-tier origins stay indistinguishable here: this
             // description is ordinary diagnostic/logging text. Only
@@ -362,6 +374,7 @@ impl BootImage {
             | ImageSource::Environment
             | ImageSource::UserConfig(_)
             | ImageSource::ProjectConfig(_)
+            | ImageSource::SourcedConfig { .. }
             | ImageSource::LaunchBuild(_) => DefaultSourceFacts {
                 project: false,
                 retained: false,
@@ -769,16 +782,23 @@ fn select_with(
         return Ok(selected(requested.reference, requested.source.into()));
     }
     if let Some(configured) = tiers.images() {
+        // ADR-0074: the project config authorizes; a `:trust` source's image is the
+        // fallback when the project sets none. This reverses the pre-#734 order,
+        // because an `ALIAS:image` selection has to resolve to the source's image.
+        if let Some(image) = configured.project() {
+            let source = match image.via() {
+                None => ImageSource::ProjectConfig(image.file().to_path_buf()),
+                Some(alias) => ImageSource::SourcedConfig {
+                    alias: alias.clone(),
+                    file: image.file().to_path_buf(),
+                },
+            };
+            return Ok(selected(image.reference().clone(), source));
+        }
         if let Some(image) = configured.user() {
             return Ok(selected(
                 image.reference().clone(),
                 ImageSource::UserConfig(image.file().to_path_buf()),
-            ));
-        }
-        if let Some(image) = configured.project() {
-            return Ok(selected(
-                image.reference().clone(),
-                ImageSource::ProjectConfig(image.file().to_path_buf()),
             ));
         }
     }
@@ -864,14 +884,20 @@ pub(crate) fn inspect_selection(
 /// Deliberately parallel to [`ImageSource::describe`] rather than reusing it:
 /// that description is diagnostic text shared by notices, progress and debug
 /// output, where the default tier must stay a single redacted label.
-fn inspection_provenance(source: &ImageSource) -> Result<(&'static str, Option<&Path>)> {
+fn inspection_provenance(source: &ImageSource) -> Result<(String, Option<&Path>)> {
     match source {
-        ImageSource::Environment => Ok(("AGENT_VM_IMAGE_TAG", None)),
-        ImageSource::UserConfig(file) => Ok(("user config", Some(file))),
-        ImageSource::ProjectConfig(file) => Ok(("project config", Some(file))),
-        ImageSource::ProjectDefault(file) => Ok(("project default", Some(file))),
-        ImageSource::RetainedDefault(file) => Ok(("retained default", Some(file))),
-        ImageSource::InitialRecommendation => Ok(("initial recommendation", None)),
+        ImageSource::Environment => Ok(("AGENT_VM_IMAGE_TAG".to_owned(), None)),
+        ImageSource::UserConfig(file) => Ok(("user config".to_owned(), Some(file))),
+        ImageSource::ProjectConfig(file) => Ok(("project config".to_owned(), Some(file))),
+        // The reference is the source's; the authorization is the project
+        // config's. Naming the alias keeps the two roles distinguishable, because
+        // `File:` can only name one of them.
+        ImageSource::SourcedConfig { alias, file } => {
+            Ok((format!("project config ({alias}:image)"), Some(file)))
+        }
+        ImageSource::ProjectDefault(file) => Ok(("project default".to_owned(), Some(file))),
+        ImageSource::RetainedDefault(file) => Ok(("retained default".to_owned(), Some(file))),
+        ImageSource::InitialRecommendation => Ok(("initial recommendation".to_owned(), None)),
         // `image show` takes no `--image`, so this interface cannot produce a
         // command-line selection; a value-free internal error, not a panic.
         ImageSource::CommandLine => {
@@ -1259,6 +1285,7 @@ mod tests {
                 "/home/u/.config/agent-vm/config.toml",
             )),
             project: None,
+            ..Default::default()
         })
     }
 
@@ -1296,10 +1323,19 @@ mod tests {
                 "localhost:1/e:latest",
                 SourceCase::Environment,
             ),
+            // ADR-0074 flips this row: the project config authorizes a boot
+            // image, and the `:trust` source's image is only the fallback.
             (
                 None,
                 Some("localhost:1/u:latest"),
                 Some("localhost:1/p:latest"),
+                "localhost:1/p:latest",
+                SourceCase::Project,
+            ),
+            (
+                None,
+                Some("localhost:1/u:latest"),
+                None,
                 "localhost:1/u:latest",
                 SourceCase::User,
             ),
@@ -1322,6 +1358,7 @@ mod tests {
             let configured = ConfiguredImages::for_test(ImageTierFixture {
                 user: user.map(|r| ConfiguredImage::for_test(r, "/u/config.toml")),
                 project: project.map(|r| ConfiguredImage::for_test(r, "/p/.agent-vm/config.toml")),
+                ..Default::default()
             });
             let requested = requested_source.map(|s| override_for(expected, s));
             let boot = select_with(requested, ConfiguredTiers::Read(&configured), || {
@@ -1344,6 +1381,48 @@ mod tests {
                 SourceCase::Default => assert!(boot.is_default()),
             }
         }
+    }
+
+    /// An `ALIAS:image` selection names the alias and the declaring source file,
+    /// and is never a default-tier source (ADR-0074).
+    #[test]
+    fn v17_an_alias_selected_image_reports_its_source_and_declaring_file() {
+        let configured = ConfiguredImages::for_test(ImageTierFixture {
+            project: Some(ConfiguredImage::for_test_via(
+                "localhost:1/repo:latest",
+                "/w/app/.agent-vm/config.toml",
+                "repo",
+            )),
+            ..Default::default()
+        });
+        let boot = select_with(None, ConfiguredTiers::Read(&configured), || {
+            panic!("the default slot must not run when a source image is selected")
+        })
+        .unwrap();
+        assert_eq!(boot.reference().as_str(), "localhost:1/repo:latest");
+        assert_eq!(
+            boot.source(),
+            &ImageSource::SourcedConfig {
+                alias: crate::config_sources::SourceAlias::for_test("repo"),
+                file: PathBuf::from("/w/app/.agent-vm/config.toml"),
+            }
+        );
+        assert_eq!(
+            boot.source().describe(),
+            "repo:image in /w/app/.agent-vm/config.toml"
+        );
+        assert!(!boot.is_default());
+        assert_eq!(
+            render_inspection(&boot).unwrap(),
+            "Image: localhost:1/repo:latest\nSource: project config (repo:image)\nFile: /w/app/.agent-vm/config.toml\n"
+        );
+        assert!(
+            matches!(
+                crate::image_pin::establishment_for_tests(&boot).unwrap(),
+                crate::image_pin::DefaultAction::None
+            ),
+            "an explicit source never establishes a project default"
+        );
     }
 
     /// An unreadable configuration knows no user or project tier: a requested
@@ -1745,6 +1824,7 @@ mod tests {
         let images = ConfiguredImages::for_test(ImageTierFixture {
             user: None,
             project: Some(ConfiguredImage::for_test("localhost:1/p:latest", file)),
+            ..Default::default()
         });
         let boot = select(None, ConfiguredTiers::Read(&images), &project()).unwrap();
 
@@ -1776,6 +1856,7 @@ mod tests {
         let empty = ConfiguredImages::for_test(ImageTierFixture {
             user: None,
             project: None,
+            ..Default::default()
         });
         let boot = select(None, ConfiguredTiers::Read(&empty), &project()).unwrap();
         assert_eq!(
@@ -1818,6 +1899,7 @@ mod tests {
         let empty = ConfiguredImages::for_test(ImageTierFixture {
             user: None,
             project: None,
+            ..Default::default()
         });
         let boot = select(None, ConfiguredTiers::Read(&empty), &project()).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1846,6 +1928,7 @@ mod tests {
         let configured = ConfiguredImages::for_test(ImageTierFixture {
             user: Some(ConfiguredImage::for_test("x", "/u/config.toml")),
             project: None,
+            ..Default::default()
         });
         let requested = override_for("bad\u{1b}[31mref", OverrideSource::CommandLine);
         let boot = select(

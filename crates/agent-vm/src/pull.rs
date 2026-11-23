@@ -143,10 +143,15 @@ impl Args {
     }
 }
 
-pub async fn run(args: Args, catalog: Catalog, images: ConfiguredImages) -> Result<i32> {
+pub async fn run(
+    args: Args,
+    catalog: Catalog,
+    images: ConfiguredImages,
+    project: Result<ProjectDir>,
+) -> Result<i32> {
     let mut stdout = std::io::stdout();
     let mut stderr = std::io::stderr();
-    run_with(args, catalog, images, &mut stdout, &mut stderr).await
+    run_with(args, catalog, images, project, &mut stdout, &mut stderr).await
 }
 
 /// [`run`] with the report sinks supplied, so the exact rows, the once-only
@@ -155,13 +160,15 @@ async fn run_with(
     args: Args,
     catalog: Catalog,
     images: ConfiguredImages,
+    project: Result<ProjectDir>,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> Result<i32> {
     let filter = args.filter()?;
     let ambient_override = args.ambient_override()?;
-    #[allow(clippy::disallowed_methods)] // one capture per command: every consumer borrows it.
-    let project = ProjectDir::capture()?;
+    // Unwrapped after argv validation, so an argument error keeps its precedence
+    // over a cwd that could not be captured.
+    let project = project?;
     // The whole authority is decoded and validated here, before any selection,
     // registry request or write: damage is a command-level failure.
     let snapshot = image_pin::observe_refresh_scope(&project)?;

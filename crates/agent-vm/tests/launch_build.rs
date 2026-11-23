@@ -797,12 +797,9 @@ fn staging_dir_is_cleaned() {
 fn config_image_is_ignored() {
     let mut h = Harness::new();
     let written = h.replay_spec("built.tar", &ArchiveSpec::default());
-    fs::create_dir_all(h.project.join(".agent-vm")).unwrap();
-    fs::write(
-        h.project.join(".agent-vm/config.toml"),
-        "image = \"never-used.invalid/x:1\"\n",
-    )
-    .unwrap();
+    let config = support::project_config_path(&h.home, &h.project);
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(&config, "image = \"never-used.invalid/x:1\"\n").unwrap();
 
     let out = h.run(&["--dockerfile", "Dockerfile", "--", "true"]);
     let stderr = stderr_of(&out);

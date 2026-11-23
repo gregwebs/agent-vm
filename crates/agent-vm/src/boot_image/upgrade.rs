@@ -100,9 +100,11 @@ impl clap::builder::TypedValueParser for SetDefaultTargetParser {
     }
 }
 
-pub(crate) async fn run(args: Args) -> Result<()> {
-    #[allow(clippy::disallowed_methods)] // one capture per command: every consumer borrows it.
-    let project = ProjectDir::capture()?;
+pub(crate) async fn run(args: Args, project: Result<ProjectDir>) -> Result<()> {
+    // The invoking project from `main`'s one capture (ADR-0073 D5). `set-default`
+    // records nothing per project yet (#737), but it reads which project's
+    // established default must not move, so it must be the catalog's project.
+    let project = project?;
     crate::msb_preflight::ensure_db_not_ahead().await?;
     crate::image_log_guard::activate();
     let outcome = crate::image_pin::set_default(&args.target.0, &project).await?;

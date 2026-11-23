@@ -1,5 +1,5 @@
 //! Read-only **tool configuration**: discovery, strict parsing, validation,
-//! and the ordered user/project merge that `agent-vm doctor` previews.
+//! and the ordered catalog merge that `agent-vm doctor` previews.
 //!
 //! A **tool declaration** (`[[tools]]` in a config file) is *data*: a guest
 //! command, its default argv, the credential providers it needs, extra
@@ -9,25 +9,41 @@
 //! a credential. A top-level `image` key selects the **boot image**
 //! independently of the tools (see [`crate::boot_image`]).
 //!
-//! # Two ordered catalogs, not an overlay
+//! # Ordered catalogs, not an overlay
 //!
-//! The user file (`$HOME/.config/agent-vm/config.toml`) and the project file
-//! (`<cwd>/.agent-vm/config.toml`) are two ordered *catalogs*. The project may
-//! add whole tool definitions the user did not write; a name the user did
-//! write is authoritative and the entire user definition wins (never a
+//! The project file (`$HOME/.config/agent-vm/projects/<project-id>/config.toml`,
+//! ADR-0073) and the files it **sources** (ADR-0074) are ordered *catalogs*.
+//! Nothing in a repository is read unless the project config names it. A
+//! project-side file may add whole tool definitions the user did not write; a name
+//! the user did write is authoritative and the entire user definition wins (never a
 //! field-by-field merge). Resolved order is user declarations first, then
-//! project-only declarations. Only when **both** lists are empty do the seven
-//! compiled-in defaults (embedded from `default-tools.toml`) apply.
+//! project-side declarations in source order. Only when **every** list is empty do
+//! the seven compiled-in defaults (embedded from `default-tools.toml`) apply.
 //!
-//! ```
-//! user file --------> parse + validate --+--> retained definitions --> launch
-//! project file -----> parse + validate --+    every tier, hidden       verbs
-//!                                             same-name losers too
-//! both empty? -> embedded defaults ------+
+//! ```text
+//! :trust source -----> parse + validate --+--> retained definitions --> launch
+//! project config ----> parse + validate --+    every tier, hidden       verbs
+//! each other source -> parse + validate --+    same-name losers too
+//! all empty? -> embedded defaults --------+
 //! ```
 //!
 //! Every tier is parsed and validated *before* merging, so an invalid
 //! project declaration fails even when the user shadowed its name.
+//!
+//! # Sources (ADR-0074)
+//!
+//! The project config may declare `sources = ["<alias>[:trust] <path>", …]`. An
+//! omitted key means the single implicit `home:trust
+//! ~/.config/agent-vm/config.toml`; an explicit list — `[]` included — replaces it,
+//! so the user file is read only when a `:trust` entry names it. Sourcing is flat
+//! (only the project config may declare `sources`) and trust is a property of the
+//! verified route, not of the path spelling: `:trust` is accepted only for the
+//! discovered user config, whose read is checked against the active checkout first
+//! (`crate::project_config::check_user_parent_route`,
+//! `check_user_symlink_target`). Every other source is declarations-only: it may add
+//! tools and declare an `image`, and it cannot grant network, mounts or sets.
+//! [`crate::config_sources`] owns the grammar and path resolution;
+//! [`crate::boot_image`] owns how a declared image becomes the boot image.
 //!
 //! # Launch selection is not reference resolution
 //!
@@ -105,10 +121,14 @@
 //! holding one may be trusted is [`crate::config_authority`]'s decision, taken
 //! here once per user file from the *presence* of any of those keys, so this
 //! module and [`crate::config_mounts`] only decide *what* a trusted file says.
+//! The project file is nevertheless verified unconditionally via a no-follow
+//! open and store-route check before bytes are read (ADR-0073); it still may
+//! not declare any of them.
 
 use crate::config_authority::{self, AuthorityTriggers};
 use crate::config_mounts::{self, ResolvedMountList, UserMounts};
 use crate::egress_reference::{self, EgressNamespace};
+use crate::host_paths::FinalComponent;
 use crate::user_network::{self, UserNetwork};
 
 use crate::network_requests::{NetworkRequests, RequestTier};
@@ -137,8 +157,7 @@ pub(crate) use builtin_print::builtin_tools_toml;
 /// file's limit.
 const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
 
-const USER_CONFIG_RELATIVE: &str = concat!(".config/agent-vm", "/config.toml");
-const PROJECT_CONFIG_RELATIVE: &str = ".agent-vm/config.toml";
+pub(crate) const USER_CONFIG_RELATIVE: &str = concat!(".config/agent-vm", "/config.toml");
 
 /// The user-scoped agent-vm config directory under `$HOME` — the directory
 /// `USER_CONFIG_RELATIVE` sits in, and the one [`crate::secret_store`] and
@@ -189,12 +208,13 @@ const DEFAULT_TOOLS_TOML: &str = include_str!("default-tools.toml");
 // Public interface
 // ---------------------------------------------------------------------------
 
-/// Where the two config files live. `user` is `None` only when `$HOME` is
-/// unavailable; the project path is always the canonical cwd plus the fixed
-/// relative location (consistent with [`crate::project::ProjectDir::capture`]).
+/// Where the two config files live. Both are `None` only when `$HOME` is
+/// unavailable: the project tier is host-managed under it (ADR-0073), keyed by
+/// the captured project's digest, and never read from the project directory.
+/// Literal `$HOME` spelling is preserved for diagnostics and [`TierReport`].
 pub(crate) struct ConfigPaths {
     pub(crate) user: Option<PathBuf>,
-    pub(crate) project: PathBuf,
+    pub(crate) project: Option<crate::project_config::ProjectTierPaths>,
     /// The `$HOME` [`Self::user`] was derived from: the only base a `~/` in that
     /// file's `mounts` may expand against (ADR-0046). Captured once, with the
     /// path, so a launch cannot read one `config.toml` and expand `~/` against a
@@ -203,17 +223,72 @@ pub(crate) struct ConfigPaths {
 }
 
 impl ConfigPaths {
-    /// The environment adapter: resolve `$HOME` and the canonical cwd.
+    /// The environment adapter: `$HOME`, plus the command's one project capture.
     ///
     /// There is deliberately no `XDG_CONFIG_HOME` or override variable in
     /// this PR — the ticket names the literal `$HOME` location.
-    pub(crate) fn discover() -> Result<Self> {
-        let home = discover_home()?;
-        Ok(Self {
+    pub(crate) fn discover(project: &crate::project::ProjectDir) -> Result<Self> {
+        Ok(Self::with_home(discover_home()?, project))
+    }
+
+    /// The pure core of [`Self::discover`]: every path is derived from one `$HOME`
+    /// capture and one project capture, so [`Self::discover`] cannot check one home
+    /// while a read uses another. Tests build it directly to get a captured route
+    /// without touching the process environment.
+    fn with_home(home: Option<PathBuf>, project: &crate::project::ProjectDir) -> Self {
+        Self {
             user: home.as_ref().map(|home| home.join(USER_CONFIG_RELATIVE)),
-            project: discover_project_path()?,
+            project: home
+                .as_ref()
+                .map(|home| crate::project_config::ProjectTierPaths {
+                    config: crate::project_config::path(home, project),
+                    // The route check's anchor, from the same capture as the path:
+                    // a caller can neither check one home and read another nor
+                    // reach a project tier with no root to check against.
+                    route: crate::project_config::RouteAnchor::Captured {
+                        home: home.clone(),
+                        root: project.path().to_path_buf(),
+                    },
+                }),
             home,
-        })
+        }
+    }
+
+    /// The anchor a `:trust` read is checked against (ADR-0074 D3): always
+    /// [`crate::project_config::RouteAnchor::Captured`] in production, because a
+    /// project tier exists only with a home.
+    pub(crate) fn route(&self) -> &crate::project_config::RouteAnchor {
+        self.project
+            .as_ref()
+            .map_or(&crate::project_config::RouteAnchor::Uncaptured, |project| {
+                &project.route
+            })
+    }
+
+    /// A hand-built pair for this crate's tests, which predate the store: no
+    /// `$HOME`, and a project tier with no captured root
+    /// ([`crate::project_config::RouteAnchor::Uncaptured`]), so the ADR-0073
+    /// store route is not checked. Named rather than a struct literal so the
+    /// skipped check is one visible decision instead of a field a new fixture
+    /// could omit.
+    #[cfg(test)]
+    pub(crate) fn for_test(user: Option<PathBuf>, project: PathBuf) -> Self {
+        Self::for_test_with_home(user, project, None)
+    }
+
+    /// [`Self::for_test`] with the `~/` base some user-tier fixtures expand
+    /// against.
+    #[cfg(test)]
+    pub(crate) fn for_test_with_home(
+        user: Option<PathBuf>,
+        project: PathBuf,
+        home: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            user,
+            project: Some(crate::project_config::ProjectTierPaths::uncaptured(project)),
+            home,
+        }
     }
 }
 
@@ -231,6 +306,8 @@ pub(crate) struct ConfigReport {
     user_tools: Option<EgressNamespace>,
     uses_defaults: bool,
     conflicts: Vec<ConfigConflict>,
+    /// What the project config sourced (ADR-0074), in declaration order.
+    sources: SourcesReport,
 }
 
 impl ConfigReport {
@@ -240,6 +317,12 @@ impl ConfigReport {
 
     pub(crate) fn project(&self) -> &TierReport {
         &self.project
+    }
+
+    /// What the project config sourced, so `doctor` can render the source list and
+    /// decide whether the legacy in-repo notice still applies (ADR-0074).
+    pub(crate) fn sources(&self) -> &SourcesReport {
+        &self.sources
     }
 
     /// The retained definitions and the launch winners, without the fallback.
@@ -593,7 +676,7 @@ impl ResolvedTools {
 
 /// What one config tier turned out to be. `path` is the attempted location
 /// (`None` only for an unavailable `$HOME`).
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TierReport {
     path: Option<PathBuf>,
     status: TierStatus,
@@ -611,14 +694,73 @@ impl TierReport {
 
 /// Presence and declaration count are distinct: a found empty file is
 /// `Found { declared_tools: 0 }`, not `Absent`.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TierStatus {
     Absent,
     Found {
         declared_tools: usize,
     },
-    /// `$HOME` was missing, so the user tier could not be located at all.
+    /// `$HOME` was missing, so this tier could not be located at all.
     UnavailableHome,
+    /// The project config lists sources and none is `:trust`, so the user file
+    /// was not read (ADR-0074).
+    NotSourced,
+}
+
+/// What the project config sourced (ADR-0074), in declaration order.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SourcesReport {
+    sourcing: crate::config_sources::Sourcing,
+    entries: Vec<SourceReport>,
+}
+
+impl SourcesReport {
+    pub(crate) fn sourcing(&self) -> crate::config_sources::Sourcing {
+        self.sourcing
+    }
+
+    pub(crate) fn entries(&self) -> &[SourceReport] {
+        &self.entries
+    }
+
+    /// The paths the project config **explicitly listed**, which is all that may
+    /// suppress `doctor`'s legacy in-repo notice (ADR-0074 D9).
+    ///
+    /// Empty for implicit sourcing, so an in-repo symlink pointing at the user
+    /// config never hides the notice when no project config exists.
+    pub(crate) fn listed_files(&self) -> Vec<&Path> {
+        match self.sourcing {
+            crate::config_sources::Sourcing::Implicit => Vec::new(),
+            crate::config_sources::Sourcing::Listed => self
+                .entries
+                .iter()
+                .filter_map(|entry| entry.tier.path())
+                .collect(),
+        }
+    }
+}
+
+/// One source and what reading it produced. The tier is the same report shape the
+/// user tier uses, so `doctor` renders a source row with one renderer.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SourceReport {
+    alias: crate::config_sources::SourceAlias,
+    trust: crate::config_sources::SourceTrust,
+    tier: TierReport,
+}
+
+impl SourceReport {
+    pub(crate) fn alias(&self) -> &crate::config_sources::SourceAlias {
+        &self.alias
+    }
+
+    pub(crate) fn trust(&self) -> crate::config_sources::SourceTrust {
+        self.trust
+    }
+
+    pub(crate) fn tier(&self) -> &TierReport {
+        &self.tier
+    }
 }
 
 /// Where a resolved tool came from. File-backed variants retain the declaring
@@ -631,6 +773,12 @@ pub(crate) enum ToolOrigin {
     BuiltIn,
     User(PathBuf),
     Project(PathBuf),
+    /// A file the project config sources without `:trust` (ADR-0074): its own
+    /// reference scope, and the alias #735 will qualify tools with.
+    Source {
+        alias: crate::config_sources::SourceAlias,
+        file: PathBuf,
+    },
 }
 
 impl From<&ToolOrigin> for RequestTier {
@@ -639,6 +787,7 @@ impl From<&ToolOrigin> for RequestTier {
             ToolOrigin::BuiltIn => Self::BuiltIn,
             ToolOrigin::User(_) => Self::User,
             ToolOrigin::Project(_) => Self::Project,
+            ToolOrigin::Source { .. } => Self::Source,
         }
     }
 }
@@ -889,13 +1038,16 @@ pub(crate) enum DeclaredTools {
     Named(Vec<ToolName>),
 }
 
-/// One config tier's `image`, with the file that declared it (for diagnostics
-/// and `doctor`). Both fields are private; the accessors are the only readers,
-/// so a caller cannot pair a reference with the wrong declaring file.
+/// One config file's `image`, with the file that declared it (for diagnostics and
+/// `doctor`). Both fields are private; the accessors are the only readers, so a
+/// caller cannot pair a reference with the wrong declaring file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConfiguredImage {
     reference: ImageRef,
     file: PathBuf,
+    /// `Some` when the project config authorized it as `ALIAS:image` (ADR-0074):
+    /// the reference is the source's, the authorization is the project config's.
+    via: Option<crate::config_sources::SourceAlias>,
 }
 
 impl ConfiguredImage {
@@ -907,6 +1059,17 @@ impl ConfiguredImage {
         &self.file
     }
 
+    /// The alias the project config named, for an `ALIAS:image` selection.
+    pub(crate) fn via(&self) -> Option<&crate::config_sources::SourceAlias> {
+        self.via.as_ref()
+    }
+
+    /// The same declared image, authorized by the project config's `ALIAS:image`.
+    fn authorized_by(mut self, alias: &crate::config_sources::SourceAlias) -> Self {
+        self.via = Some(alias.clone());
+        self
+    }
+
     /// A configured image built for tests outside this module (which cannot
     /// name the private fields). Uses the permissive override parser so a test
     /// fixture need not be a fully valid OCI reference.
@@ -916,18 +1079,33 @@ impl ConfiguredImage {
             reference: ImageRef::from_override(reference.to_string())
                 .expect("valid test image reference"),
             file: file.into(),
+            via: None,
         }
+    }
+
+    /// [`Self::for_test`] authorized by the project config as `ALIAS:image`.
+    #[cfg(test)]
+    pub(crate) fn for_test_via(reference: &str, file: impl Into<PathBuf>, alias: &str) -> Self {
+        Self::for_test(reference, file)
+            .authorized_by(&crate::config_sources::SourceAlias::for_test(alias))
     }
 }
 
-/// Both tiers' `image` settings. `Default` (neither set) is also what `image pull`
+/// Both image tiers plus the images the project config did *not* select.
+///
+/// `Default` (neither set) is also what `image pull`
 /// and `setup` use when the configuration could not be read at all: the
 /// configured tiers are then unknown, and the recovery builtins fall back to
 /// `--image`/env or the default boot image.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ConfiguredImages {
+    /// The `:trust` source's image: the fallback (ADR-0074 R9).
     user: Option<ConfiguredImage>,
+    /// The project config's selection: its own `OCI_REF`, or a source's image via
+    /// `ALIAS:image`.
     project: Option<ConfiguredImage>,
+    /// Images declared by untrusted sources and not selected, in `sources` order.
+    inert: Vec<InertImage>,
 }
 
 impl ConfiguredImages {
@@ -939,6 +1117,12 @@ impl ConfiguredImages {
         self.project.as_ref()
     }
 
+    /// Source images the project config did not select, for `doctor` (ADR-0074
+    /// R11): they change nothing until an `ALIAS:image` selects one.
+    pub(crate) fn inert(&self) -> &[InertImage] {
+        &self.inert
+    }
+
     /// A fixture for tests outside this module (which cannot name the private
     /// fields). Named fields rather than two adjacent `Option<ConfiguredImage>`
     /// parameters, so a user/project swap cannot compile
@@ -948,6 +1132,32 @@ impl ConfiguredImages {
         Self {
             user: fixture.user,
             project: fixture.project,
+            inert: fixture.inert,
+        }
+    }
+}
+
+/// One untrusted source's declared image that the project config did not select.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InertImage {
+    alias: crate::config_sources::SourceAlias,
+    image: ConfiguredImage,
+}
+
+impl InertImage {
+    pub(crate) fn alias(&self) -> &crate::config_sources::SourceAlias {
+        &self.alias
+    }
+
+    pub(crate) fn image(&self) -> &ConfiguredImage {
+        &self.image
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(reference: &str, file: impl Into<PathBuf>, alias: &str) -> Self {
+        Self {
+            alias: crate::config_sources::SourceAlias::for_test(alias),
+            image: ConfiguredImage::for_test(reference, file),
         }
     }
 }
@@ -959,6 +1169,7 @@ impl ConfiguredImages {
 pub(crate) struct ImageTierFixture {
     pub(crate) user: Option<ConfiguredImage>,
     pub(crate) project: Option<ConfiguredImage>,
+    pub(crate) inert: Vec<InertImage>,
 }
 
 /// A validated, normalized guest-HOME-relative persist path. The inner path
@@ -1047,41 +1258,99 @@ impl ConfigConflict {
 // Loading
 // ---------------------------------------------------------------------------
 
-/// Discover both tiers, parse and validate each, merge, and check persist
-/// ownership. Any read/parse/validation failure is a contextual hard error —
-/// there is no fallback to defaults.
+/// Discover the project config and the files it sources, parse and validate each,
+/// merge, and check persist ownership. Any read/parse/validation failure is a
+/// contextual hard error — there is no fallback to defaults.
+///
+/// The project config is read first: it decides which other files are read at all
+/// (ADR-0074). A project config that lists no `sources` behaves exactly as the
+/// implicit `home:trust <user config>`, which is #733's shipped two-tier load.
 pub(crate) fn load(paths: &ConfigPaths) -> Result<ConfigReport> {
-    let (user, user_contents) = match &paths.user {
-        Some(path) => read_file_tier(TierSource {
-            path,
-            kind: FileTierKind::User,
-            home: paths.home.as_deref(),
-        })?,
-        None => (
-            TierReport {
-                path: None,
-                status: TierStatus::UnavailableHome,
-            },
-            TierContents::empty(),
-        ),
+    let ProjectRead {
+        report: project,
+        contents: project_contents,
+        declared,
+    } = match &paths.project {
+        Some(project) => read_project_tier(project)?,
+        None => ProjectRead::unavailable(),
     };
-    // The project tier can declare no `mounts` (refused), so it has no `~/` base.
-    let (project, project_contents) = read_file_tier(TierSource {
-        path: &paths.project,
-        kind: FileTierKind::Project,
-        home: None,
-    })?;
-    let mounts = user_contents.mounts;
+    let (sources, project_image) = match &paths.project {
+        Some(project) => {
+            let sources = declared_sources(paths, declared.sources.as_deref(), &project.config)?;
+            let image =
+                classify_project_image(declared.image.as_deref(), &sources, &project.config)?;
+            (sources, image)
+        }
+        // A missing project tier carries no declarations, so both tiers are
+        // `UnavailableHome` and nothing is sourced.
+        None => (crate::config_sources::DeclaredSources::implicit(None), None),
+    };
+    let project_config_path = paths
+        .project
+        .as_ref()
+        .map(|project| project.config.as_path());
 
+    // The user tier is the `:trust` source and nothing else: a list without one
+    // never reads `~/.config/agent-vm/config.toml`.
+    let mut user = not_sourced_tier(paths.user.as_deref());
+    let mut user_contents = TierContents::empty();
+    let mut reports = Vec::new();
+    let mut source_tools = Vec::new();
+    let mut source_images: Vec<(&crate::config_sources::SourceEntry, Option<ConfiguredImage>)> =
+        Vec::new();
+    for entry in sources.entries() {
+        let (tier, contents) = match entry.trust() {
+            crate::config_sources::SourceTrust::Trusted => {
+                // D3: trust is bound to the discovered `paths.user` and its verified
+                // route, never to `entry.path()`'s spelling.
+                let user_path = paths.user.as_deref().ok_or_else(|| {
+                    anyhow!("internal: trusted source without a discovered user config path")
+                })?;
+                read_user_tier(user_path, paths.route(), paths.home.as_deref())?
+            }
+            crate::config_sources::SourceTrust::Untrusted => read_source_tier(entry)?,
+        };
+        reports.push(SourceReport {
+            alias: entry.alias().clone(),
+            trust: entry.trust(),
+            tier: tier.clone(),
+        });
+        match entry.trust() {
+            crate::config_sources::SourceTrust::Trusted => {
+                user = tier;
+                user_contents = contents;
+            }
+            crate::config_sources::SourceTrust::Untrusted => {
+                source_images.push((entry, contents.image));
+                source_tools.extend(contents.tools);
+            }
+        }
+    }
+
+    let trusted_image = match user_contents.image.as_ref() {
+        Some(image) => TrustedImage::Declared(image),
+        None if *user.status() == TierStatus::Absent => TrustedImage::Absent,
+        None => TrustedImage::NoImage,
+    };
+    let images = resolve_images(
+        project_image,
+        trusted_image,
+        &sources,
+        &source_images,
+        project_config_path,
+    )?;
+
+    let mut project_side = project_contents.tools;
+    project_side.extend(source_tools);
     let (resolved, uses_defaults, conflicts) =
-        if user_contents.tools.is_empty() && project_contents.tools.is_empty() {
+        if user_contents.tools.is_empty() && project_side.is_empty() {
             (
                 ResolvedTools::from_defaults(default_tools()?),
                 true,
                 Vec::new(),
             )
         } else {
-            let (merged, conflicts) = merge(user_contents.tools, project_contents.tools);
+            let (merged, conflicts) = merge(user_contents.tools, project_side)?;
             (merged, false, conflicts)
         };
 
@@ -1091,15 +1360,16 @@ pub(crate) fn load(paths: &ConfigPaths) -> Result<ConfigReport> {
         user,
         project,
         resolved,
-        images: ConfiguredImages {
-            user: user_contents.image,
-            project: project_contents.image,
-        },
+        images,
         user_network: user_contents.network,
-        user_mounts: mounts,
+        user_mounts: user_contents.mounts,
         user_tools: user_contents.reference_tools,
         uses_defaults,
         conflicts,
+        sources: SourcesReport {
+            sourcing: sources.sourcing(),
+            entries: reports,
+        },
     })
 }
 
@@ -1130,60 +1400,133 @@ impl TierContents {
     }
 }
 
+/// Which tier a file is, where provenance matters: a tool declaration keeps the
+/// tier it was written in for diagnostics, conflict warnings and the egress
+/// reference scope's identity.
 #[derive(Clone, Copy)]
-enum FileTierKind {
+enum FileTierKind<'a> {
     User,
     Project,
+    Source(&'a crate::config_sources::SourceAlias),
 }
 
-impl FileTierKind {
+impl FileTierKind<'_> {
     fn origin(self, file: &Path) -> ToolOrigin {
         match self {
             FileTierKind::User => ToolOrigin::User(file.to_path_buf()),
             FileTierKind::Project => ToolOrigin::Project(file.to_path_buf()),
+            FileTierKind::Source(alias) => ToolOrigin::Source {
+                alias: alias.clone(),
+                file: file.to_path_buf(),
+            },
         }
     }
 }
 
-/// One file-backed tier to read: its path, which tier it is, and — for the user
-/// tier — the `$HOME` a `~/` in its `mounts` expands against.
-///
-/// A named bundle rather than three positional arguments, because two of them
-/// would be an `Option<&Path>` the callee could not tell apart from the file it
-/// reads.
-struct TierSource<'a> {
-    path: &'a Path,
-    kind: FileTierKind,
-    home: Option<&'a Path>,
+fn unavailable_home_tier() -> (TierReport, TierContents) {
+    (
+        TierReport {
+            path: None,
+            status: TierStatus::UnavailableHome,
+        },
+        TierContents::empty(),
+    )
 }
 
-/// Read, decode, and validate one file-backed tier. Only a `NotFound` from
-/// the initial `symlink_metadata` means absent; a present-but-dangling
-/// symlink or a file that vanishes before the read is an error, not a quiet
-/// fallback.
-fn read_file_tier(source: TierSource<'_>) -> Result<(TierReport, TierContents)> {
-    let TierSource { path, kind, home } = source;
+fn absent_tier(path: &Path) -> (TierReport, TierContents) {
+    (
+        TierReport {
+            path: Some(path.to_path_buf()),
+            status: TierStatus::Absent,
+        },
+        TierContents::empty(),
+    )
+}
+
+/// The user tier when the project config sources no `:trust` file: present but
+/// deliberately not read (ADR-0074). `UnavailableHome` still wins when there is no
+/// `$HOME` at all, because then the tier cannot even be located.
+fn not_sourced_tier(user: Option<&Path>) -> TierReport {
+    TierReport {
+        path: user.map(Path::to_path_buf),
+        status: match user {
+            Some(_) => TierStatus::NotSourced,
+            None => TierStatus::UnavailableHome,
+        },
+    }
+}
+
+/// Decode and parse one tier's bytes: the half every file tier shares once its
+/// bytes are in hand. Diagnostics never echo a value, and invalid UTF-8 is its
+/// own error (see the module's value-safe rules).
+fn parse_tier(path: &Path, bytes: &[u8]) -> Result<RawConfig> {
+    let text = std::str::from_utf8(bytes).map_err(|_| utf8_error(path))?;
+    toml::from_str(text).map_err(|error| deserialize_error(path, text, &error))
+}
+
+/// What one tier's *measured* read established, before its bytes are
+/// interpreted. The two tiers are measured differently and must not be
+/// confusable, so they are separate arms rather than an `Option` of tokens.
+enum TierAuthority<'a> {
+    /// ADR-0040's verified read: the verdict is unconditional, but the token it
+    /// mints is `Some` only for a file that declares an authority-bearing field.
+    User(config_authority::Verification<'a>),
+    /// ADR-0073: measured unconditionally, and may declare no authority field at
+    /// all — so there is no token to mint.
+    Project,
+    /// A file sourced without `:trust` (ADR-0074): no measurement, unpinned until
+    /// #736; refuses every authority field.
+    Source,
+}
+
+/// Read, verify, decode, and validate the **user** tier, which is the `:trust`
+/// source (ADR-0074).
+///
+/// Only a `NotFound` from the initial `symlink_metadata` means absent, so a host
+/// without a user config never fails; a present-but-dangling symlink or a file that
+/// vanishes before the read is an error, not a quiet fallback. A final symlink is
+/// followed (ADR-0040's dotfile compatibility), and the bytes are read before the
+/// verdict: that is the user tier's shipped rule and it is unchanged.
+///
+/// What *is* new (ADR-0074 D3) is that the **route** is checked first: a parent or
+/// final symlink resolving into the active checkout is refused before any byte is
+/// read, so repository-controlled bytes can contribute neither tools, image nor
+/// authority. Both the implicit `home:trust` default and an explicit
+/// `<alias>:trust ~/.config/agent-vm/config.toml` arrive here with the discovered
+/// path, never the entry's spelling.
+fn read_user_tier(
+    path: &Path,
+    route: &crate::project_config::RouteAnchor,
+    home: Option<&Path>,
+) -> Result<(TierReport, TierContents)> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((
-                TierReport {
-                    path: Some(path.to_path_buf()),
-                    status: TierStatus::Absent,
-                },
-                TierContents::empty(),
-            ));
+            return Ok(absent_tier(path));
         }
         Err(error) => return Err(safe_io_error("reading metadata for", path, &error)),
     }
 
-    let read =
-        crate::host_paths::read_bounded_regular_file_noting_symlink(path, MAX_CONFIG_FILE_BYTES)
-            .map_err(|error| safe_anyhow_error("reading", path, &error))?;
+    // Before `config.toml` is opened: a `~/.config` or `~/.config/agent-vm` symlink
+    // into the checkout would pass the file's own measurement.
+    crate::project_config::check_user_parent_route(path, route)?;
+    let read = match crate::host_paths::open_regular_no_follow_checkpointed(path, || {})
+        .map_err(|error| safe_anyhow_error("reading", path, &error))?
+    {
+        Some(opened) => opened
+            .into_verified_read(MAX_CONFIG_FILE_BYTES)
+            .map_err(|error| safe_anyhow_error("reading", path, &error))?,
+        None => {
+            // A final symlink: decide about its target before opening it. Outside
+            // the checkout this keeps ADR-0040's dotfile compatibility; an alias of
+            // a checkout file is refused here (U2).
+            crate::project_config::check_user_symlink_target(path, route)?;
+            crate::host_paths::read_bounded_symlink_target(path, MAX_CONFIG_FILE_BYTES)
+                .map_err(|error| safe_anyhow_error("reading", path, &error))?
+        }
+    };
     let path = read.path();
-    let text = std::str::from_utf8(read.bytes()).map_err(|_| utf8_error(path))?;
-    let raw: RawConfig =
-        toml::from_str(text).map_err(|error| deserialize_error(path, text, &error))?;
+    let raw = parse_tier(path, read.bytes())?;
     // Authority is decided by the *presence* of an authority-bearing field, from
     // the same verified read the bytes came from, before any of it is parsed.
     // Presence, not contents: `mounts = []`, an empty `[network]`, an empty
@@ -1195,6 +1538,392 @@ fn read_file_tier(source: TierSource<'_>) -> Result<(TierReport, TierContents)> 
     // accepted or partially patched tool, so its mount field must not be able to
     // skip the check by making the definition invalid somewhere else.
     let first_tool_mounts = raw.tools.iter().position(|tool| tool.mounts.is_some());
+    let triggers = AuthorityTriggers {
+        network: raw.network.is_some(),
+        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {
+            top_level: raw.mounts.is_some(),
+            tool_field: first_tool_mounts.is_some(),
+        }),
+        mount_sets: raw.mount_sets.is_some(),
+        egress_sets: raw.egress_sets.is_some(),
+    };
+    let verification = config_authority::verify(&read, triggers).map_err(|error| {
+        // A refusal caused by a tool's own field names that field first: the
+        // reader has to find the list they must review, and a file with no
+        // top-level `mounts` has nothing else pointing at it. The numeric site
+        // is echoed, never the tool's name or the list's contents.
+        let pointer = match first_tool_mounts {
+            Some(declaration) if raw.mounts.is_none() => {
+                format!("tools[{declaration}].mounts: ")
+            }
+            _ => String::new(),
+        };
+        anyhow!(
+            "config: {}: {pointer}{error}",
+            crate::one_line::quoted_path(path)
+        )
+    })?;
+    build_tier(
+        path,
+        raw,
+        TierAuthority::User(verification),
+        FileTierKind::User,
+        home,
+    )
+}
+
+/// Read, verify, decode, and validate the **project** tier (ADR-0073).
+///
+/// Deliberately not the user tier's read path:
+///
+/// 1. the store route is checked before anything is opened, so a symlinked
+///    `projects/` or `projects/<id>` — or an ancestor alias into the active
+///    checkout — cannot quietly redirect the read to an in-repo file;
+/// 2. the file is opened without following a final symlink, and the directory
+///    and file facts are measured **before** one byte is read, so untrusted
+///    bytes are never decoded;
+/// 3. the verdict is unconditional: the project tier is the root of a project's
+///    trust, not a file that becomes authority-bearing only when it declares a
+///    field.
+fn read_project_tier(project: &crate::project_config::ProjectTierPaths) -> Result<ProjectRead> {
+    // Every store-route outcome is named, including the one that checks nothing
+    // (`Unchecked`, reachable only from a hand-built test tier).
+    match crate::project_config::check_store_route(project)? {
+        crate::project_config::StoreRoute::Absent => {
+            return Ok(ProjectRead::absent(&project.config));
+        }
+        crate::project_config::StoreRoute::Present
+        | crate::project_config::StoreRoute::Unchecked => {}
+    }
+    let path = project.config.as_path();
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ProjectRead::absent(path));
+        }
+        Err(error) => return Err(safe_io_error("reading metadata for", path, &error)),
+    }
+
+    let opened = crate::host_paths::open_regular_no_follow_checkpointed(path, || {})
+        .map_err(|error| safe_anyhow_error("reading", path, &error))?;
+    let Some(opened) = opened else {
+        // A final symlink: refused from the no-follow open's own verdict, so
+        // the target is never opened or read. `verify_project` refuses
+        // `ThroughSymlink` whenever the directory is acceptable and the
+        // directory error otherwise, so `Ok` here cannot happen; it is still a
+        // load error rather than a panic.
+        return match config_authority::verify_project(path, &FinalComponent::Symlink) {
+            Err(error) => Err(project_tier_error(path, &error)),
+            Ok(()) => Err(anyhow!(
+                "config: {}: config.toml is a symbolic link; agent-vm will not follow it",
+                crate::one_line::quoted_path(path)
+            )),
+        };
+    };
+    let final_component = FinalComponent::Regular(opened.facts());
+    // Measured before its bytes are read, and whatever the file declares.
+    config_authority::verify_project(path, &final_component)
+        .map_err(|error| project_tier_error(path, &error))?;
+    let bytes = opened
+        .read_bounded(MAX_CONFIG_FILE_BYTES)
+        .map_err(|error| safe_anyhow_error("reading", path, &error))?;
+    let mut raw = parse_tier(path, &bytes)?;
+    // Taken before `build_tier`, which would refuse `sources` (flat sourcing) and
+    // read `ALIAS:image` as an OCI reference: both need the declared source list,
+    // which is only known after this read.
+    let declared = ProjectDeclarations {
+        sources: raw.sources.take(),
+        image: raw.image.take(),
+    };
+    let (report, contents) = build_tier(
+        path,
+        raw,
+        TierAuthority::Project,
+        FileTierKind::Project,
+        None,
+    )?;
+    Ok(ProjectRead {
+        report,
+        contents,
+        declared,
+    })
+}
+
+/// Read, verify, decode, and validate a file the project config sources
+/// **without** `:trust` (ADR-0074 D4): declarations only, today unpinned.
+///
+/// Nothing read from it can grant authority, so the final symlink is followed
+/// (`read_bounded_regular_file_noting_symlink`, the pre-ADR-0073 project read):
+/// repository files are commonly symlinked. A missing file is an error, because
+/// the user explicitly asked for it and a quietly empty source would hide a typo.
+///
+/// #736 inserts its content-hash check between the read and `parse_tier`: the bytes
+/// are in hand there and nothing has been interpreted yet.
+fn read_source_tier(
+    entry: &crate::config_sources::SourceEntry,
+) -> Result<(TierReport, TierContents)> {
+    let path = entry.path();
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(anyhow!(
+                "config: {}: not found; the project config sources it as {}",
+                crate::one_line::quoted_path(path),
+                entry.declared(),
+            ));
+        }
+        Err(error) => return Err(safe_io_error("reading metadata for", path, &error)),
+    }
+    let read =
+        crate::host_paths::read_bounded_regular_file_noting_symlink(path, MAX_CONFIG_FILE_BYTES)
+            .map_err(|error| safe_anyhow_error("reading", path, &error))?;
+    let raw = parse_tier(read.path(), read.bytes())?;
+    build_tier(
+        read.path(),
+        raw,
+        TierAuthority::Source,
+        FileTierKind::Source(entry.alias()),
+        None,
+    )
+}
+
+/// The project config's read: the tier report and contents every tier shares, plus
+/// the two fields only the project config may own, taken out of the raw config
+/// after its verified read and before `build_tier`.
+struct ProjectRead {
+    report: TierReport,
+    contents: TierContents,
+    declared: ProjectDeclarations,
+}
+
+/// The project file's own sourcing and image fields. Both need the declared source
+/// list to be interpreted, which only exists once this read has finished.
+#[derive(Default)]
+struct ProjectDeclarations {
+    sources: Option<Vec<String>>,
+    image: Option<String>,
+}
+
+impl ProjectRead {
+    fn absent(path: &Path) -> Self {
+        let (report, contents) = absent_tier(path);
+        Self {
+            report,
+            contents,
+            declared: ProjectDeclarations::default(),
+        }
+    }
+
+    fn unavailable() -> Self {
+        let (report, contents) = unavailable_home_tier();
+        Self {
+            report,
+            contents,
+            declared: ProjectDeclarations::default(),
+        }
+    }
+}
+
+/// Resolve the project config's own `sources` list, or the implicit single
+/// `home:trust <user config>` entry (ADR-0074 D2/R5).
+fn declared_sources(
+    paths: &ConfigPaths,
+    listed: Option<&[String]>,
+    project_config: &Path,
+) -> Result<crate::config_sources::DeclaredSources> {
+    use crate::config_sources::{DeclaredSources, ResolveContext};
+
+    let Some(raw) = listed else {
+        return Ok(DeclaredSources::implicit(paths.user.as_deref()));
+    };
+    let (Some(project), Some(user)) = (&paths.project, &paths.user) else {
+        return Err(sources_unresolvable(project_config));
+    };
+    let crate::project_config::RouteAnchor::Captured { home, root } = &project.route else {
+        return Err(sources_unresolvable(project_config));
+    };
+    DeclaredSources::listed(
+        raw,
+        &ResolveContext {
+            project_config: &project.config,
+            home,
+            project_root: root,
+            user_config: user,
+        },
+    )
+}
+
+/// E13: a listed `sources` on a tier with no captured project — reachable only
+/// through a hand-built test fixture.
+fn sources_unresolvable(project_config: &Path) -> anyhow::Error {
+    anyhow!(
+        "config: {}: sources: cannot be resolved without a captured project",
+        crate::one_line::quoted_path(project_config)
+    )
+}
+
+/// The project config's `image`, classified as an OCI reference or an
+/// `ALIAS:image` source selection (ADR-0074 D6/R9).
+enum ProjectImage {
+    Direct(ConfiguredImage),
+    Source(crate::config_sources::SourceAlias),
+}
+
+fn classify_project_image(
+    raw: Option<&str>,
+    sources: &crate::config_sources::DeclaredSources,
+    project_config: &Path,
+) -> Result<Option<ProjectImage>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    if let Some(alias) = crate::config_sources::image_alias(raw) {
+        // Shape first, then declaration: falling back to OCI for an *undeclared*
+        // alias would turn the typo `image = "rpeo:image"` into a pull of
+        // `docker.io/library/rpeo:image`.
+        if sources.by_alias(&alias).is_none() {
+            return Err(anyhow!(
+                "config: {}: image: names a source alias that sources does not declare; declare \
+                 that source, or spell an image tagged \"image\" with its registry (for example \
+                 docker.io/library/NAME:image)",
+                crate::one_line::quoted_path(project_config)
+            ));
+        }
+        return Ok(Some(ProjectImage::Source(alias)));
+    }
+    Ok(validate_image(Some(raw), project_config)?.map(ProjectImage::Direct))
+}
+
+/// The `:trust` tier's image, as an `ALIAS:image` selection sees it.
+enum TrustedImage<'a> {
+    /// The trusted file does not exist, which is not an error until selected.
+    Absent,
+    /// Declared, with its own `image`.
+    Declared(&'a ConfiguredImage),
+    /// Declared without an `image`.
+    NoImage,
+}
+
+/// Build the image tiers and the inert list (ADR-0074 D7/R9).
+///
+/// A project-side image either selects a source's own `image` or is a direct OCI
+/// reference; the `:trust` tier's image is the fallback, and every untrusted
+/// source image the project did not select is recorded as inert for `doctor`.
+fn resolve_images(
+    project: Option<ProjectImage>,
+    trusted: TrustedImage<'_>,
+    declared: &crate::config_sources::DeclaredSources,
+    source_images: &[(&crate::config_sources::SourceEntry, Option<ConfiguredImage>)],
+    project_config: Option<&Path>,
+) -> Result<ConfiguredImages> {
+    let project = match project {
+        None => None,
+        Some(ProjectImage::Direct(image)) => Some(image),
+        Some(ProjectImage::Source(alias)) => {
+            let file = project_config.ok_or_else(|| {
+                anyhow!("internal: a source image selection without a project config")
+            })?;
+            let entry = declared
+                .by_alias(&alias)
+                .ok_or_else(|| anyhow!("internal: a source image selection was not classified"))?;
+            let image = match entry.trust() {
+                crate::config_sources::SourceTrust::Trusted => match trusted {
+                    TrustedImage::Declared(image) => Some(image.clone()),
+                    TrustedImage::NoImage => {
+                        return Err(image_selection_missing(
+                            file,
+                            entry,
+                            MissingImage::DeclaresNone,
+                        ));
+                    }
+                    TrustedImage::Absent => {
+                        return Err(image_selection_missing(
+                            file,
+                            entry,
+                            MissingImage::FileAbsent,
+                        ));
+                    }
+                },
+                crate::config_sources::SourceTrust::Untrusted => source_images
+                    .iter()
+                    .find(|(source, _)| source.alias() == entry.alias())
+                    .and_then(|(_, image)| image.clone()),
+            };
+            let Some(image) = image else {
+                return Err(image_selection_missing(
+                    file,
+                    entry,
+                    MissingImage::DeclaresNone,
+                ));
+            };
+            Some(image.authorized_by(&alias))
+        }
+    };
+    let selected = project.as_ref().and_then(ConfiguredImage::via);
+    let inert = source_images
+        .iter()
+        .filter_map(|(source, image)| {
+            let image = image.as_ref()?;
+            (selected != Some(source.alias())).then(|| InertImage {
+                alias: source.alias().clone(),
+                image: image.clone(),
+            })
+        })
+        .collect();
+    Ok(ConfiguredImages {
+        user: match trusted {
+            TrustedImage::Declared(image) => Some(image.clone()),
+            TrustedImage::Absent | TrustedImage::NoImage => None,
+        },
+        project,
+        inert,
+    })
+}
+
+/// Why an `ALIAS:image` selection resolved to no image.
+enum MissingImage {
+    /// The file exists but declares no `image` key.
+    DeclaresNone,
+    /// The trusted file does not exist at all.
+    FileAbsent,
+}
+
+/// I2: the project config selected a source that cannot supply an image.
+fn image_selection_missing(
+    project_config: &Path,
+    entry: &crate::config_sources::SourceEntry,
+    why: MissingImage,
+) -> anyhow::Error {
+    let ending = match why {
+        MissingImage::DeclaresNone => "but that file declares no image",
+        MissingImage::FileAbsent => "but that file does not exist",
+    };
+    anyhow!(
+        "config: {}: image: selects the image of {}, {ending}",
+        crate::one_line::quoted_path(project_config),
+        entry.declared(),
+    )
+}
+
+fn project_tier_error(path: &Path, error: &config_authority::UntrustedConfig) -> anyhow::Error {
+    anyhow!("config: {}: {error}", crate::one_line::quoted_path(path))
+}
+
+/// Interpret and validate one tier's parsed bytes, given what its measured read
+/// established. Shared by both tiers so validation, provenance and diagnostics
+/// cannot drift between them.
+fn build_tier(
+    path: &Path,
+    raw: RawConfig,
+    authority: TierAuthority<'_>,
+    kind: FileTierKind<'_>,
+    home: Option<&Path>,
+) -> Result<(TierReport, TierContents)> {
+    // ADR-0074: flat sourcing. `read_project_tier` has already taken the project's
+    // own `sources`, so a remaining key is a sourced file's own.
+    if raw.sources.is_some() {
+        return Err(sources_refusal(path));
+    }
     let tool_mount_values: Vec<config_mounts::ToolMountValue<'_>> = raw
         .tools
         .iter()
@@ -1205,42 +1934,24 @@ fn read_file_tier(source: TierSource<'_>) -> Result<(TierReport, TierContents)> 
                 .map(|value| config_mounts::ToolMountValue { declaration, value })
         })
         .collect();
-    let triggers = AuthorityTriggers {
-        network: raw.network.is_some(),
-        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {
-            top_level: raw.mounts.is_some(),
-            tool_field: first_tool_mounts.is_some(),
-        }),
-        mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),
-    };
     let authorized: Option<config_authority::AuthorizedConfig<'_>>;
     let reference_trust: Option<crate::config_authority::ReferenceTrust>;
-    match kind {
-        FileTierKind::User => {
-            let verification = config_authority::verify(&read, triggers).map_err(|error| {
-                // A refusal caused by a tool's own field names that field first: the
-                // reader has to find the list they must review, and a file with no
-                // top-level `mounts` has nothing else pointing at it. The numeric site
-                // is echoed, never the tool's name or the list's contents.
-                let pointer = match first_tool_mounts {
-                    Some(declaration) if raw.mounts.is_none() => {
-                        format!("tools[{declaration}].mounts: ")
-                    }
-                    _ => String::new(),
-                };
-                anyhow!(
-                    "config: {}: {pointer}{error}",
-                    crate::one_line::quoted_path(path)
-                )
-            })?;
+    match authority {
+        TierAuthority::User(verification) => {
             authorized = verification.authorized;
             // The same read's verdict for a CLI egress reference, which argv
             // parsing learns about only after this read is gone (ADR-0059).
             reference_trust = Some(verification.references);
         }
-        FileTierKind::Project => {
+        TierAuthority::Project => {
             refuse_project_authority(&raw, path)?;
+            authorized = None;
+            reference_trust = None;
+        }
+        TierAuthority::Source => {
+            refuse_non_user_authority(&raw, path, RefusingTier::Source)?;
+            // Unpinned until #736: there is no content measurement to mint an
+            // authority or a reference trust from.
             authorized = None;
             reference_trust = None;
         }
@@ -1379,6 +2090,17 @@ fn refuse_project_authority(raw: &RawConfig, path: &Path) -> Result<()> {
     refuse_non_user_authority(raw, path, RefusingTier::Project)
 }
 
+/// ADR-0074 flat sourcing: only the project config decides which files a launch
+/// reads, so any other tier that declares `sources` — `sources = []` included —
+/// is refused by its presence alone.
+fn sources_refusal(file: &Path) -> anyhow::Error {
+    anyhow!(
+        "config: {}: sources: only the project config may declare sources; a sourced file cannot \
+         source another file",
+        crate::one_line::quoted_path(file)
+    )
+}
+
 /// The one refusal order both non-user tiers share: network, top-level `mounts`,
 /// `[mount_sets]`, `[egress_sets]`, then the first tool's `mounts` in declaration
 /// order.
@@ -1408,6 +2130,8 @@ fn refuse_non_user_authority(raw: &RawConfig, path: &Path, tier: RefusingTier) -
 #[derive(Clone, Copy)]
 enum RefusingTier {
     Project,
+    /// A file the project config sources without `:trust` (ADR-0074).
+    Source,
     BuiltIn,
 }
 
@@ -1424,6 +2148,7 @@ fn network_refusal(table: &toml::Table, file: &Path, tier: RefusingTier) -> anyh
     };
     let reason = match tier {
         RefusingTier::Project => "network access cannot be granted by the project config",
+        RefusingTier::Source => "network access cannot be granted by a source without :trust",
         RefusingTier::BuiltIn => "network access cannot be granted by the built-in config",
     };
     anyhow!(
@@ -1447,6 +2172,7 @@ fn mounts_refusal(file: &Path, tier: RefusingTier) -> anyhow::Error {
 fn mounts_refusal_reason(tier: RefusingTier) -> &'static str {
     match tier {
         RefusingTier::Project => "mounts cannot be declared by the project config",
+        RefusingTier::Source => "mounts cannot be declared by a source without :trust",
         RefusingTier::BuiltIn => "mounts cannot be declared by the built-in config",
     }
 }
@@ -1473,6 +2199,7 @@ fn tool_mounts_refusal(file: &Path, tier: RefusingTier, declaration: usize) -> a
 fn mount_sets_refusal(file: &Path, tier: RefusingTier) -> anyhow::Error {
     let reason = match tier {
         RefusingTier::Project => "mount_sets cannot be declared by the project config",
+        RefusingTier::Source => "mount_sets cannot be declared by a source without :trust",
         RefusingTier::BuiltIn => "mount_sets cannot be declared by the built-in config",
     };
     anyhow!(
@@ -1489,6 +2216,7 @@ fn mount_sets_refusal(file: &Path, tier: RefusingTier) -> anyhow::Error {
 fn egress_sets_refusal(file: &Path, tier: RefusingTier) -> anyhow::Error {
     let reason = match tier {
         RefusingTier::Project => "egress_sets cannot be declared by the project config",
+        RefusingTier::Source => "egress_sets cannot be declared by a source without :trust",
         RefusingTier::BuiltIn => "egress_sets cannot be declared by the built-in config",
     };
     anyhow!(
@@ -1509,6 +2237,7 @@ fn validate_image(raw: Option<&str>, file: &Path) -> Result<Option<ConfiguredIma
         Ok(reference) => Ok(Some(ConfiguredImage {
             reference,
             file: file.to_path_buf(),
+            via: None,
         })),
         Err(reason) => Err(anyhow!(
             "config: {}: image: {reason}",
@@ -1542,6 +2271,9 @@ fn builtin_raw_config(text: &str) -> Result<RawConfig> {
     let raw: RawConfig =
         toml::from_str(text).map_err(|error| deserialize_error(path, text, &error))?;
     refuse_non_user_authority(&raw, path, RefusingTier::BuiltIn)?;
+    if raw.sources.is_some() {
+        return Err(sources_refusal(path));
+    }
     Ok(raw)
 }
 
@@ -1584,32 +2316,30 @@ pub(crate) fn absolute_home_from(home: Option<&OsStr>) -> Result<Option<PathBuf>
     Ok(Some(home))
 }
 
-fn discover_project_path() -> Result<PathBuf> {
-    let cwd = std::env::current_dir()
-        .map_err(|error| safe_io_error("resolving current directory", Path::new("."), &error))?;
-    let canonical = cwd
-        .canonicalize()
-        .map_err(|error| safe_io_error("canonicalizing current directory", &cwd, &error))?;
-    Ok(canonical.join(PROJECT_CONFIG_RELATIVE))
-}
-
 // ---------------------------------------------------------------------------
 // Merge and ownership
 // ---------------------------------------------------------------------------
 
 /// Whole-definition union: user order first, then project-only tools in
-/// project order. A name present in both keeps the entire user definition;
-/// if it differs, one conflict is recorded. Uses a name index for membership
-/// but never iterates it, so neither tool nor warning order can drift.
+/// project-side order (the project config, then each untrusted source). A name
+/// present in both keeps the entire user definition; if it differs, one conflict is
+/// recorded. Uses a name index for membership but never iterates it, so neither tool
+/// nor warning order can drift.
 ///
-/// Every project definition is retained in [`ResolvedTools::definitions`] even
-/// when it loses its launch verb, because the project file's other definitions
-/// may still reference it (#395). Only the winners enter
-/// [`ResolvedTools::launches`].
+/// Every project-side definition is retained in [`ResolvedTools::definitions`] even
+/// when it loses its launch verb, because that file's other definitions may still
+/// reference it (#395). Only the winners enter [`ResolvedTools::launches`].
+///
+/// A name two project-side files declare is an error (ADR-0074 R8/D8): with N files
+/// on that side there is no ordering that would not invent the precedence #735 is
+/// about to redesign, and a duplicated verb is a mistake rather than a choice.
 ///
 /// Both declaring files come from the tools' provenance rather than the
 /// caller, so a conflict warning never fabricates a placeholder path.
-fn merge(user_tools: Vec<Tool>, project_tools: Vec<Tool>) -> (ResolvedTools, Vec<ConfigConflict>) {
+fn merge(
+    user_tools: Vec<Tool>,
+    project_tools: Vec<Tool>,
+) -> Result<(ResolvedTools, Vec<ConfigConflict>)> {
     let index: HashMap<String, usize> = user_tools
         .iter()
         .enumerate()
@@ -1619,39 +2349,59 @@ fn merge(user_tools: Vec<Tool>, project_tools: Vec<Tool>) -> (ResolvedTools, Vec
     let mut launches: Vec<DefinitionId> = (0..user_tools.len()).map(DefinitionId).collect();
     let mut definitions = user_tools;
     let mut conflicts = Vec::new();
+    let mut project_side: HashMap<String, ToolOrigin> = HashMap::new();
     for project_tool in project_tools {
+        // Project-side files are disjoint by name: the "absent name only ever
+        // appears here once" invariant used to hold because the project side was one
+        // file, whose duplicates `validate_tools` rejects.
+        if let Some(first) = project_side.get(project_tool.name.as_str()) {
+            return Err(tool_error(
+                &project_tool.origin,
+                project_tool.declaration_index,
+                &project_tool.name,
+                format!(
+                    "also declared by {}; the project config and the files it sources without \
+                     :trust cannot declare the same tool",
+                    describe_origin(first)
+                ),
+            ));
+        }
+        project_side.insert(
+            project_tool.name.as_str().to_owned(),
+            project_tool.origin.clone(),
+        );
         match index.get(project_tool.name.as_str()) {
             Some(&position) => {
                 let winner = &definitions[position];
                 // A conflict is necessarily cross-tier: the winner comes from
                 // the user tier (the index only holds user names), the loser
-                // from the project tier. Naming both files from provenance
+                // from the project side. Naming both files from provenance
                 // keeps `merge` from taking two indistinguishable `&Path`s.
                 if !winner.same_definition(&project_tool)
-                    && let (ToolOrigin::User(user_file), ToolOrigin::Project(project_file)) =
-                        (&winner.origin, &project_tool.origin)
+                    && let (
+                        ToolOrigin::User(user_file),
+                        ToolOrigin::Project(file) | ToolOrigin::Source { file, .. },
+                    ) = (&winner.origin, &project_tool.origin)
                 {
                     conflicts.push(ConfigConflict {
                         tool: winner.name.clone(),
                         user_file: user_file.clone(),
-                        project_file: project_file.clone(),
+                        project_file: file.clone(),
                         fields: winner.differing_fields(&project_tool),
                     });
                 }
             }
-            // Same-tier duplicate project names are rejected before merging,
-            // so an absent name only ever appears here once.
             None => launches.push(DefinitionId(definitions.len())),
         }
         definitions.push(project_tool);
     }
-    (
+    Ok((
         ResolvedTools {
             definitions,
             launches,
         },
         conflicts,
-    )
+    ))
 }
 
 /// Overlap ownership across one launch: two distinct tools may not claim the
@@ -1712,9 +2462,11 @@ fn validate_persist_ownership<'a>(tools: impl IntoIterator<Item = &'a Tool>) -> 
 /// too.
 fn describe_origin(origin: &ToolOrigin) -> String {
     let tier = match origin {
-        ToolOrigin::BuiltIn => "built-in defaults",
-        ToolOrigin::User(_) => "user config",
-        ToolOrigin::Project(_) => "project config",
+        ToolOrigin::BuiltIn => "built-in defaults".to_owned(),
+        ToolOrigin::User(_) => "user config".to_owned(),
+        ToolOrigin::Project(_) => "project config".to_owned(),
+        // The alias is validated lowercase ASCII, so it prints raw.
+        ToolOrigin::Source { alias, .. } => format!("source {alias}"),
     };
     format!(
         "{tier} {}",
@@ -1729,6 +2481,7 @@ fn origin_file(origin: &ToolOrigin) -> &Path {
     match origin {
         ToolOrigin::BuiltIn => Path::new("default-tools.toml"),
         ToolOrigin::User(file) | ToolOrigin::Project(file) => file,
+        ToolOrigin::Source { file, .. } => file,
     }
 }
 
@@ -2070,7 +2823,7 @@ fn launch_closure(
 // Raw schema and validation
 // ---------------------------------------------------------------------------
 
-/// The user config's top-level field names, which are therefore the **reserved**
+/// A config file's top-level field names, which are therefore the **reserved**
 /// mount-set names.
 ///
 /// TOML assigns a bare key to the most recent `[table]` header, so a top-level key
@@ -2084,17 +2837,19 @@ fn launch_closure(
 ///
 /// `egress_sets` is the sixth (#511) and is reserved for the same reason: a
 /// `[network]` table written after `[egress_sets]` would become a set named
-/// `network` that grants nothing.
+/// `network` that grants nothing. `sources` (#734) is reserved for the same
+/// reason.
 ///
 /// Held here rather than in `config_mounts` because this module owns the schema the
 /// names come from: the test beside `RawConfig` proves each one is still accepted at
 /// the top level, so a renamed field cannot leave a stale reservation behind.
-pub(crate) const TOP_LEVEL_FIELDS: [&str; 6] = [
+pub(crate) const TOP_LEVEL_FIELDS: [&str; 7] = [
     "egress_sets",
     "image",
     "mounts",
     "mount_sets",
     "network",
+    "sources",
     "tools",
 ];
 
@@ -2138,6 +2893,11 @@ struct RawConfig {
     /// image-only file declares no tools and keeps the shipped defaults.
     #[serde(default)]
     image: Option<String>,
+    /// Project config only (ADR-0074): the files this project sources. Every other
+    /// tier refuses the key by presence (flat sourcing, S2). Strings, parsed by
+    /// `config_sources` only after the project file's verified read.
+    #[serde(default)]
+    sources: Option<Vec<String>>,
     #[serde(default)]
     tools: Vec<RawTool>,
 }
@@ -2827,7 +3587,9 @@ fn deserialize_error(file: &Path, text: &str, error: &toml::de::Error) -> anyhow
         "config: {}{location}: invalid TOML or tool schema; check syntax and field types. \
          Required: a string `name` and `command`; `args`, `credentials`, `tools`, `persist`, \
          `mounts` and `network_requests` are arrays of strings; `env` is a table of string values; \
-         the top-level `image` and each tool's `command` are strings. The top-level `mounts` and each \
+         the top-level `image` and each tool's `command` are strings; the top-level \
+         `sources`, accepted only in the project tier, is an array of strings; the top-level \
+         `mounts` and each \
          full user `[[tools]]`'s `mounts` are arrays of mount declarations or mount-set names; \
          `[mount_sets]` is a table of named arrays of those mount declarations or mount-set names, \
          and `[egress_sets]` is a table of named arrays of egress allowances or egress references \
@@ -3433,14 +4195,19 @@ mod tests {
             ("mounts", "[]"),
             ("mount_sets", "{}"),
             ("network", "{}"),
+            ("sources", "[]"),
             ("tools", "[]"),
         ];
         assert_eq!(fields.map(|(name, _)| name), TOP_LEVEL_FIELDS);
         for (name, value) in fields {
-            let f = Fixture::new();
-            f.user(&format!("{name} = {value}\n"))
-                .load()
-                .unwrap_or_else(|error| panic!("{name} must be a top-level field: {error:#}"));
+            // `sources` is the project config's own key (flat sourcing, ADR-0074);
+            // every other field still loads in the user tier.
+            let result = if name == "sources" {
+                SourcesFixture::new().with_project(&format!("{name} = {value}\n"))
+            } else {
+                Fixture::new().user(&format!("{name} = {value}\n")).load()
+            };
+            result.unwrap_or_else(|error| panic!("{name} must be a top-level field: {error:#}"));
         }
     }
 
@@ -3864,10 +4631,8 @@ mod tests {
         let user = root.path().join("cfg/config.toml");
         write_file(&user, "mounts = [\"~/ref\", \"/abs/ref\"]\n");
         let project = root.path().join("absent.toml");
-        let with_home = |home: Option<PathBuf>| ConfigPaths {
-            user: Some(user.clone()),
-            project: project.clone(),
-            home,
+        let with_home = |home: Option<PathBuf>| {
+            ConfigPaths::for_test_with_home(Some(user.clone()), project.clone(), home)
         };
 
         // `/h/` keeps its trailing slash (`//`), and the process `HOME` is not
@@ -5281,11 +6046,7 @@ mod tests {
         }
 
         fn paths(&self) -> ConfigPaths {
-            ConfigPaths {
-                user: Some(self.user.clone()),
-                project: self.project.clone(),
-                home: None,
-            }
+            ConfigPaths::for_test(Some(self.user.clone()), self.project.clone())
         }
 
         fn load(&self) -> Result<ConfigReport> {
@@ -5295,11 +6056,11 @@ mod tests {
         /// The same load with a captured `$HOME`, which is what a `~/` mount
         /// spelling expands against (never the process environment).
         fn load_with_home(&self, home: &Path) -> Result<ConfigReport> {
-            load(&ConfigPaths {
-                user: Some(self.user.clone()),
-                project: self.project.clone(),
-                home: Some(home.to_path_buf()),
-            })
+            load(&ConfigPaths::for_test_with_home(
+                Some(self.user.clone()),
+                self.project.clone(),
+                Some(home.to_path_buf()),
+            ))
         }
 
         /// The user config as a same-directory dotfile symlink — the shape a
@@ -5319,6 +6080,118 @@ mod tests {
         fn project(&self, contents: &str) -> &Self {
             write_file(&self.project, contents);
             self
+        }
+    }
+
+    /// A real host-managed project store (ADR-0073) plus a checkout and a
+    /// `$HOME`, all under one canonical temp base.
+    ///
+    /// The ADR-0073 store route and the ADR-0074 `:trust` route checks are real
+    /// filesystem observations, so a fixture that skipped them (`ConfigPaths::
+    /// for_test`) could not reach the interesting cases at all: it would fail with
+    /// the captured-project refusal first.
+    struct SourcesFixture {
+        _root: tempfile::TempDir,
+        base: PathBuf,
+        home: PathBuf,
+        project: crate::project::ProjectDir,
+        config: PathBuf,
+    }
+
+    impl SourcesFixture {
+        fn new() -> Self {
+            Self::with_checkout(false)
+        }
+
+        /// `cwd == $HOME`, the layout ADR-0073 Decision 3 and ADR-0074 D3 have to
+        /// keep working when it is unaliased.
+        fn at_home() -> Self {
+            Self::with_checkout(true)
+        }
+
+        fn with_checkout(home_is_project: bool) -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let base = root.path().canonicalize().unwrap();
+            let home = base.join("home");
+            let checkout = if home_is_project {
+                home.clone()
+            } else {
+                base.join("checkout")
+            };
+            fs::create_dir_all(&home).unwrap();
+            fs::create_dir_all(&checkout).unwrap();
+            let project = crate::project::ProjectDir::from_path_for_tests(&checkout).unwrap();
+            let config = crate::project_config::path(&home, &project);
+            Self {
+                _root: root,
+                base,
+                home,
+                project,
+                config,
+            }
+        }
+
+        fn home(&self) -> &Path {
+            &self.home
+        }
+
+        fn base(&self) -> &Path {
+            &self.base
+        }
+
+        fn checkout(&self) -> &Path {
+            self.project.path()
+        }
+
+        fn user_config(&self) -> PathBuf {
+            self.home.join(".config/agent-vm/config.toml")
+        }
+
+        fn project_config(&self) -> &Path {
+            &self.config
+        }
+
+        fn repo(&self, relative: &str) -> PathBuf {
+            self.project.path().join(relative)
+        }
+
+        /// Write the project config at the store path, creating the store with
+        /// the `0700` directory a real writer uses so `verify_project` passes.
+        fn write_project(&self, body: &str) -> &Self {
+            let store = self.config.parent().unwrap();
+            fs::create_dir_all(store).unwrap();
+            fs::set_permissions(store, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .unwrap();
+            fs::write(&self.config, body).unwrap();
+            self
+        }
+
+        fn write_user(&self, body: &str) -> &Self {
+            let path = self.user_config();
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, body).unwrap();
+            self
+        }
+
+        fn write_repo(&self, relative: &str, body: &str) -> PathBuf {
+            let path = self.repo(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, body).unwrap();
+            path
+        }
+
+        fn paths(&self) -> ConfigPaths {
+            ConfigPaths::with_home(Some(self.home.clone()), &self.project)
+        }
+
+        fn load(&self) -> Result<ConfigReport> {
+            load(&self.paths())
+        }
+
+        /// Write the project config and load, the shape most `sources` rows take.
+        fn with_project(&self, body: &str) -> Result<ConfigReport> {
+            self.write_project(body);
+            self.load()
         }
     }
 
@@ -6372,11 +7245,7 @@ mod tests {
             &project,
             "[[tools]]\nname = \"t\"\ncommand = \"t\"\ntools = [\"a\\nb\"]\n",
         );
-        let paths = ConfigPaths {
-            user: None,
-            project,
-            home: None,
-        };
+        let paths = ConfigPaths::for_test(None, project);
         let error = format!(
             "{:#}",
             load(&paths).unwrap().into_launch_catalog().unwrap_err()
@@ -8010,12 +8879,7 @@ mod tests {
         let evil = root.path().join("proj\n\x1b[31mred");
         fs::create_dir_all(&evil).unwrap();
         fs::create_dir_all(evil.join(".agent-vm/config.toml")).unwrap();
-        let paths = ConfigPaths {
-            user: None,
-            project: evil.join(".agent-vm/config.toml"),
-
-            home: None,
-        };
+        let paths = ConfigPaths::for_test(None, evil.join(".agent-vm/config.toml"));
         let error = load(&paths).unwrap_err();
         for rendered in [
             format!("{error}"),
@@ -8051,12 +8915,7 @@ mod tests {
             &evil.join(".agent-vm/config.toml"),
             "[[tools]]\nname = \"t\"\ncommand = \"\"\n",
         );
-        let paths = ConfigPaths {
-            user: None,
-            project: evil.join(".agent-vm/config.toml"),
-
-            home: None,
-        };
+        let paths = ConfigPaths::for_test(None, evil.join(".agent-vm/config.toml"));
         let rendered = format!("{:#}", load(&paths).unwrap_err());
         assert!(!rendered.contains('\x1b'), "raw ESC leaked: {rendered:?}");
         assert!(!rendered.contains('\n'), "raw newline leaked: {rendered:?}");
@@ -8148,14 +9007,254 @@ mod tests {
 
     // -- discovery ---------------------------------------------------------
 
+    use crate::test_env;
+
+    /// AC1/R1: the project tier is `$HOME/.config/agent-vm/projects/<64-hex>/
+    /// config.toml`, derived from the command's captured project — and both
+    /// tiers are unavailable without `$HOME`, with no project path at all.
+    ///
+    /// The digest is recomputed here from the canonical path's bytes, so a
+    /// truncated id or a different hash input fails rather than agreeing with
+    /// the product's own helper.
     #[test]
-    fn discover_uses_the_canonical_cwd_and_literal_home_relative_path() {
-        // Discovery reads real env; assert only the composition the code
-        // documents. The env-dependent path is exercised end-to-end by the
-        // subprocess tests.
-        let project = discover_project_path().unwrap();
-        assert!(project.ends_with(PROJECT_CONFIG_RELATIVE));
-        assert!(project.is_absolute());
+    fn discover_places_the_project_tier_under_home_by_project_digest() {
+        use sha2::{Digest as _, Sha256};
+        let mut env = test_env::guard();
+        let home_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        // The *spelled* home, not its canonical form: both tiers keep the literal
+        // `$HOME` spelling in their paths and in diagnostics.
+        let home = home_dir.path().to_path_buf();
+        env.set_var("HOME", &home);
+        let project = crate::project::ProjectDir::from_path_for_tests(project_dir.path()).unwrap();
+        let paths = ConfigPaths::discover(&project).unwrap();
+        assert_eq!(
+            paths.user,
+            Some(home.join(USER_CONFIG_RELATIVE)),
+            "the user tier keeps its literal $HOME location"
+        );
+        let hex: String = Sha256::digest(project.path().as_os_str().as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(hex.len(), 64);
+        let expected = home
+            .join(".config/agent-vm/projects")
+            .join(&hex)
+            .join("config.toml");
+        assert_eq!(
+            paths.project.as_ref().map(|tier| &tier.config),
+            Some(&expected)
+        );
+        assert_eq!(paths.home, Some(home));
+        assert!(
+            matches!(
+                paths.project.as_ref().map(|tier| &tier.route),
+                Some(crate::project_config::RouteAnchor::Captured { root, .. })
+                    if root == project.path()
+            ),
+            "discovery anchors the store route at the captured project root"
+        );
+        // Nothing the discovery produced lives in the project.
+        assert!(
+            !paths
+                .project
+                .as_ref()
+                .unwrap()
+                .config
+                .starts_with(project.path()),
+            "the project tier is host-managed, never in-repo"
+        );
+
+        env.remove_var("HOME");
+        let paths = ConfigPaths::discover(&project).unwrap();
+        assert_eq!(paths.user, None);
+        assert!(paths.project.is_none(), "R2: no HOME means no project tier");
+        assert_eq!(paths.home, None);
+    }
+
+    /// V8: the project tier's read policy, before any byte is decoded.
+    ///
+    /// Every row is a real filesystem shape, and the message is the only way a
+    /// caller learns which check refused: a read that opened first, or a
+    /// followed final symlink, would produce a different sentence (or a UTF-8
+    /// error, or a "not a regular file").
+    #[test]
+    fn project_tier_rejects_symlinks_aliases_and_unsafe_files_before_reading() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        struct Fixture {
+            _root: tempfile::TempDir,
+            home: PathBuf,
+            project: crate::project::ProjectDir,
+            config: PathBuf,
+        }
+        impl Fixture {
+            /// `cwd` is the project by default; a caller may pass `home` itself
+            /// for the legitimate `cwd == $HOME` row.
+            fn new() -> Self {
+                Self::at(false)
+            }
+            fn at(home_is_project: bool) -> Self {
+                let root = tempfile::tempdir().unwrap();
+                let base = root.path().canonicalize().unwrap();
+                let home = base.join("home");
+                let checkout = if home_is_project {
+                    home.clone()
+                } else {
+                    base.join("checkout")
+                };
+                fs::create_dir_all(&home).unwrap();
+                fs::create_dir_all(&checkout).unwrap();
+                let project = crate::project::ProjectDir::from_path_for_tests(&checkout).unwrap();
+                let config = crate::project_config::path(&home, &project);
+                Self {
+                    _root: root,
+                    home,
+                    project,
+                    config,
+                }
+            }
+            fn store(&self) -> &Path {
+                self.config.parent().unwrap()
+            }
+            fn write_store(&self, body: &str) {
+                fs::create_dir_all(self.store()).unwrap();
+                fs::write(&self.config, body).unwrap();
+            }
+            fn load(&self) -> Result<ConfigReport> {
+                load(&ConfigPaths {
+                    user: Some(self.home.join(".config/agent-vm/config.toml")),
+                    project: Some(crate::project_config::ProjectTierPaths {
+                        config: self.config.clone(),
+                        route: crate::project_config::RouteAnchor::Captured {
+                            home: self.home.clone(),
+                            root: self.project.path().to_path_buf(),
+                        },
+                    }),
+                    home: Some(self.home.clone()),
+                })
+            }
+        }
+
+        // (a) A final symlink is refused from the open's own verdict. The target
+        // holds invalid UTF-8 and then a FIFO: either would be observable as a
+        // different error if the target were opened or read.
+        let f = Fixture::new();
+        fs::create_dir_all(f.store()).unwrap();
+        let target = f.home.join("target.toml");
+        fs::write(&target, b"[[tools]]\nname = \xff\n").unwrap();
+        symlink(&target, &f.config).unwrap();
+        let message = f.load().unwrap_err().to_string();
+        assert!(
+            message.contains("reached through a symbolic link"),
+            "{message}"
+        );
+        assert!(message.contains("the project config"), "{message}");
+        fs::remove_file(&f.config).unwrap();
+        let fifo = f.home.join("fifo");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        symlink(&fifo, &f.config).unwrap();
+        assert!(
+            f.load()
+                .unwrap_err()
+                .to_string()
+                .contains("reached through a symbolic link")
+        );
+
+        // (b) A group-writable store directory refuses a tools-only file: the
+        // project tier is measured whatever it declares.
+        let f = Fixture::new();
+        f.write_store("[[tools]]\nname = \"solo\"\ncommand = \"solo\"\n");
+        fs::set_permissions(f.store(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(f.load().is_ok(), "a 0700 store with one link is trusted");
+        fs::set_permissions(f.store(), fs::Permissions::from_mode(0o775)).unwrap();
+        let message = f.load().unwrap_err().to_string();
+        assert!(
+            message.contains("whose directory is group- or other-writable"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&crate::one_line::quoted_path(&f.config).to_string()),
+            "the refusal names the file: {message}"
+        );
+        assert!(message.contains("the project config"), "{message}");
+
+        // (c) `projects/<id>` symlinked into the active checkout: the store route
+        // is refused before `config.toml` is opened.
+        let f = Fixture::new();
+        fs::create_dir_all(f.project.path().join(".agent-vm")).unwrap();
+        fs::write(
+            f.project.path().join(".agent-vm/config.toml"),
+            "[[tools]]\nname = \"smuggled\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(f.store().parent().unwrap()).unwrap();
+        symlink(f.project.path().join(".agent-vm"), f.store()).unwrap();
+        let message = f.load().unwrap_err().to_string();
+        assert!(
+            message.contains("project store directory reached through a symbolic link"),
+            "{message}"
+        );
+
+        // (d) `projects/` symlinked to the checkout, and the whole authority
+        // directory aliased into it.
+        let f = Fixture::new();
+        fs::create_dir_all(f.home.join(".config/agent-vm")).unwrap();
+        symlink(f.project.path(), f.store().parent().unwrap()).unwrap();
+        let message = f.load().unwrap_err().to_string();
+        assert!(
+            message.contains("projects directory reached through a symbolic link"),
+            "{message}"
+        );
+
+        let f = Fixture::new();
+        let evil = f.project.path().join("evil/projects");
+        fs::create_dir_all(&evil).unwrap();
+        fs::create_dir_all(f.home.join(".config")).unwrap();
+        symlink(
+            f.project.path().join("evil"),
+            f.home.join(".config/agent-vm"),
+        )
+        .unwrap();
+        // The store exists and is not itself a symlink: only the ancestor alias
+        // is wrong, which is the row this asserts.
+        fs::create_dir_all(f.store()).unwrap();
+        let message = f.load().unwrap_err().to_string();
+        assert!(
+            message.contains("resolves inside the active project"),
+            "{message}"
+        );
+
+        // (e) Running legitimately with `cwd == $HOME`: the store's canonical
+        // path is under the project, and that is not an alias.
+        let f = Fixture::at(true);
+        f.write_store("[[tools]]\nname = \"hosted\"\ncommand = \"hosted\"\n");
+        fs::set_permissions(f.store(), fs::Permissions::from_mode(0o700)).unwrap();
+        let report = f.load().expect("cwd == $HOME is a legitimate run");
+        assert_eq!(
+            report.project().status(),
+            &TierStatus::Found { declared_tools: 1 }
+        );
+
+        // (f) The user tier keeps ADR-0040's dotfile compatibility: a
+        // tools-only file reached through a symlink still loads.
+        let f = Fixture::new();
+        let user = f.home.join(".config/agent-vm/config.toml");
+        fs::create_dir_all(user.parent().unwrap()).unwrap();
+        fs::write(
+            f.home.join("dotfile.toml"),
+            "[[tools]]\nname = \"dotty\"\ncommand = \"dotty\"\n",
+        )
+        .unwrap();
+        symlink(f.home.join("dotfile.toml"), &user).unwrap();
+        let report = f.load().expect("a tools-only symlinked user file loads");
+        assert_eq!(
+            report.user().status(),
+            &TierStatus::Found { declared_tools: 1 }
+        );
+        assert!(!report.uses_defaults());
     }
 
     // -- properties --------------------------------------------------------
@@ -9404,5 +10503,810 @@ allow_egress = ["tool:fetcher"]
                 .allowances()
                 .any(|allowance| allowance.to_string() == "tcp://a.example:443")
         );
+    }
+
+    // -- sources (ADR-0074) ------------------------------------------------
+
+    use crate::config_sources::{SourceTrust, Sourcing};
+
+    /// The documented spelling of the user config as a trusted source.
+    const HOME_SOURCE: &str = "home:trust ~/.config/agent-vm/config.toml";
+    /// A repository file sourced without `:trust`.
+    const REPO_SOURCE: &str = "repo ./.agent-vm/config.toml";
+
+    fn sources_block(entries: &[&str]) -> String {
+        let quoted: Vec<String> = entries.iter().map(|entry| format!("{entry:?}")).collect();
+        format!("sources = [{}]\n", quoted.join(", "))
+    }
+
+    /// The launch verbs a report offers, before the `shell` fallback is added.
+    fn launch_names(report: &ConfigReport) -> Vec<String> {
+        report
+            .resolved()
+            .launch_tools()
+            .map(|tool| tool.name().to_string())
+            .collect()
+    }
+
+    fn image_ref(image: Option<&ConfiguredImage>) -> Option<&str> {
+        image.map(|image| image.reference().as_str())
+    }
+
+    /// V5: an absent project config behaves exactly as the single implicit
+    /// `home:trust <user config>` entry, which is #733's shipped load.
+    #[test]
+    fn v5_an_absent_project_config_sources_the_user_config_implicitly() {
+        let f = SourcesFixture::new();
+        f.write_user(&format!(
+            "image = \"localhost:1/u:latest\"\nmounts = [\"/a:/g:ro\"]\n\
+             [network]\nallow_lan = true\n{}",
+            one_tool("u")
+        ));
+        let report = f.load().expect("implicit load");
+        assert!(!report.uses_defaults());
+        assert_eq!(
+            report.user().status(),
+            &TierStatus::Found { declared_tools: 1 }
+        );
+        assert_eq!(report.project().status(), &TierStatus::Absent);
+        assert!(report.user_network().is_some(), "user [network] loads");
+        assert!(report.user_mounts().is_some(), "user mounts load");
+        assert_eq!(
+            image_ref(report.images().user()),
+            Some("localhost:1/u:latest")
+        );
+        assert_eq!(
+            report.sources().sourcing(),
+            Sourcing::Implicit,
+            "no project config means the implicit default"
+        );
+        let entries = report.sources().entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].alias().as_str(), "home");
+        assert_eq!(entries[0].trust(), SourceTrust::Trusted);
+        assert_eq!(entries[0].tier().path(), Some(f.user_config().as_path()));
+        assert!(
+            report.sources().listed_files().is_empty(),
+            "an implicit source may not suppress the legacy notice"
+        );
+    }
+
+    /// V6 (AC4): a missing `home:trust` file is absent, not an error — with no
+    /// project config and with an explicit list.
+    #[test]
+    fn v6_a_missing_trusted_source_is_absent_not_an_error() {
+        let f = SourcesFixture::new();
+        let report = f.load().expect("no config files at all");
+        assert_eq!(report.user().status(), &TierStatus::Absent);
+        assert!(report.uses_defaults());
+        assert_eq!(report.sources().sourcing(), Sourcing::Implicit);
+        assert_eq!(report.sources().entries().len(), 1);
+
+        let f = SourcesFixture::new();
+        let report = f
+            .with_project(&sources_block(&[HOME_SOURCE]))
+            .expect("an explicit missing home:trust source is still absent");
+        assert_eq!(report.user().status(), &TierStatus::Absent);
+        assert_eq!(report.sources().sourcing(), Sourcing::Listed);
+        assert!(report.uses_defaults());
+        assert_eq!(image_ref(report.images().user()), None);
+    }
+
+    /// V7 (D2): an omitted `sources` key keeps the implicit default; an explicit
+    /// list — `[]` and untrusted-only included — replaces it, so a malformed user
+    /// file is never read.
+    #[test]
+    fn v7_an_omitted_sources_key_is_implicit_and_an_explicit_list_opts_out() {
+        let f = SourcesFixture::new();
+        f.write_user(&one_tool("u"));
+        let report = f.with_project(&one_tool("p")).expect("omitted key");
+        assert_eq!(report.sources().sourcing(), Sourcing::Implicit);
+        assert_eq!(launch_names(&report), ["u", "p"]);
+
+        // A malformed user file proves the file is not read at all: reading it
+        // would fail the load.
+        let f = SourcesFixture::new();
+        f.write_user("this is not = = toml\n");
+        let report = f
+            .with_project(&format!("{}{}", sources_block(&[]), one_tool("p")))
+            .expect("sources = [] sources nothing");
+        assert_eq!(report.user().status(), &TierStatus::NotSourced);
+        assert!(report.user_network().is_none());
+        assert!(report.user_mounts().is_none());
+        assert_eq!(launch_names(&report), ["p"]);
+
+        // The alias `home` without `:trust` is a declaration-only source, not the
+        // home config.
+        let f = SourcesFixture::new();
+        f.write_user("this is not = = toml\n");
+        f.write_repo("r.toml", &one_tool("r"));
+        let report = f
+            .with_project(&format!(
+                "{}{}",
+                sources_block(&["home ./r.toml"]),
+                one_tool("p")
+            ))
+            .expect("an untrusted-only list loads");
+        assert_eq!(report.user().status(), &TierStatus::NotSourced);
+        assert_eq!(launch_names(&report), ["p", "r"]);
+
+        // With no tools declared anywhere, the defaults still apply.
+        let f = SourcesFixture::new();
+        f.write_user("this is not = = toml\n");
+        let report = f.with_project(&sources_block(&[])).expect("empty list");
+        assert!(report.uses_defaults());
+    }
+
+    /// V8: a source's tools carry their own provenance and reference scope, and a
+    /// user shadow retains the losing source definition for that file's references.
+    #[test]
+    fn v8_a_source_tool_has_its_own_scope_and_a_user_shadow_keeps_the_loser() {
+        let f = SourcesFixture::new();
+        f.write_user(&tool(
+            "name = \"u\"\ncommand = \"u\"\npersist = [\"user-path\"]\n",
+        ));
+        let repo = f.write_repo(
+            ".agent-vm/config.toml",
+            &format!(
+                "{}{}",
+                tool("name = \"u\"\ncommand = \"repo-u\"\npersist = [\"repo-path\"]\n"),
+                tool("name = \"repo\"\ncommand = \"repo\"\ntools = [\"u\"]\n")
+            ),
+        );
+        let report = f
+            .with_project(&format!(
+                "{}{}",
+                sources_block(&[HOME_SOURCE, REPO_SOURCE]),
+                one_tool("p")
+            ))
+            .expect("shadowed source tool loads");
+        // The user definition is the launch verb for `u`.
+        let winner = report
+            .resolved()
+            .launch_tools()
+            .find(|tool| tool.name() == "u")
+            .expect("u");
+        assert_eq!(winner.command(), "u");
+        let conflicts = report.conflicts();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].tool(), "u");
+        assert_eq!(conflicts[0].user_file(), f.user_config().as_path());
+        assert_eq!(conflicts[0].project_file(), repo.as_path());
+
+        let catalog = report.into_launch_catalog().expect("catalog");
+        // The source's own `u` is what its own reference resolves to, so the
+        // repo facet — not the user one — is inherited.
+        let provisioned: Vec<String> = entry_of(&catalog, "repo")
+            .persist()
+            .iter()
+            .map(|path| path.as_path().display().to_string())
+            .collect();
+        assert_eq!(provisioned, ["repo-path"]);
+        assert_eq!(
+            entry_of(&catalog, "repo").tool().origin(),
+            &ToolOrigin::Source {
+                alias: crate::config_sources::SourceAlias::for_test("repo"),
+                file: repo.clone(),
+            }
+        );
+    }
+
+    /// V8 (continued): a reference that crosses a file boundary names the file
+    /// that actually declares the name.
+    #[test]
+    fn v8_a_cross_file_reference_names_the_other_file() {
+        let f = SourcesFixture::new();
+        f.write_user(&one_tool("user-only"));
+        f.write_repo(
+            ".agent-vm/config.toml",
+            &format!(
+                "{}{}",
+                one_tool("repo-only"),
+                tool("name = \"from-repo\"\ncommand = \"x\"\ntools = [\"user-only\"]\n")
+            ),
+        );
+        let report = f
+            .with_project(&sources_block(&[HOME_SOURCE, REPO_SOURCE]))
+            .expect("load");
+        let error = format!(
+            "{:#}",
+            report.into_launch_catalog().expect_err("cross-file")
+        );
+        assert!(
+            error.contains("declared in user config"),
+            "the repo tool's miss reports the user file: {error}"
+        );
+
+        let f = SourcesFixture::new();
+        f.write_user(&format!(
+            "{}{}",
+            one_tool("user-only"),
+            tool("name = \"from-user\"\ncommand = \"x\"\ntools = [\"repo-only\"]\n")
+        ));
+        f.write_repo(".agent-vm/config.toml", &one_tool("repo-only"));
+        let report = f
+            .with_project(&sources_block(&[HOME_SOURCE, REPO_SOURCE]))
+            .expect("load");
+        let error = format!(
+            "{:#}",
+            report.into_launch_catalog().expect_err("cross-file")
+        );
+        assert!(
+            error.contains("declared in source repo"),
+            "the user tool's miss reports the source: {error}"
+        );
+    }
+
+    /// V9 (R7): flat sourcing. `sources` is refused in every tier but the project
+    /// config, `[]` included, and no refusal echoes the file's values.
+    #[test]
+    fn v9_sources_is_refused_outside_the_project_config() {
+        // Implicit sourcing, user file declares the key.
+        let f = SourcesFixture::new();
+        f.write_user("sources = []\n");
+        let error = format!("{:#}", f.load().expect_err("user tier sources"));
+        assert!(
+            error.contains("only the project config may declare sources"),
+            "{error}"
+        );
+        assert!(
+            error.contains(&f.user_config().display().to_string()),
+            "{error}"
+        );
+
+        // Listed `:trust` source, same key.
+        let f = SourcesFixture::new();
+        f.write_user(&format!("{}\n", sources_block(&[])));
+        f.write_project(&sources_block(&[HOME_SOURCE]));
+        let error = format!("{:#}", f.load().expect_err("trusted tier sources"));
+        assert!(
+            error.contains("only the project config may declare sources"),
+            "{error}"
+        );
+
+        // An untrusted source, and `sources = []` is no exception.
+        let f = SourcesFixture::new();
+        let repo = f.write_repo(".agent-vm/config.toml", &sources_block(&[]));
+        f.write_project(&sources_block(&[REPO_SOURCE]));
+        let error = format!("{:#}", f.load().expect_err("source tier sources"));
+        assert!(error.contains(&format!("{}", repo.display())), "{error}");
+        assert!(
+            error.contains("only the project config may declare sources"),
+            "{error}"
+        );
+
+        // The shipped text cannot carry it either.
+        let error = match builtin_raw_config(&sources_block(&[])) {
+            Err(error) => format!("{error:#}"),
+            Ok(_) => panic!("the built-in text must not declare sources"),
+        };
+        assert!(
+            error.contains("only the project config may declare sources"),
+            "{error}"
+        );
+
+        // A malformed value is the schema error (F3), not the flat refusal.
+        let f = SourcesFixture::new();
+        let error = format!(
+            "{:#}",
+            f.with_project("sources = \"bad\"\n").expect_err("schema")
+        );
+        assert!(error.contains("invalid TOML or tool schema"), "{error}");
+
+        // An unknown field is refused without echoing its value.
+        let f = SourcesFixture::new();
+        let error = format!(
+            "{:#}",
+            f.with_project("allow_tools = [\"SECRET-734\"]\n")
+                .expect_err("unknown field")
+        );
+        assert!(!error.contains("SECRET-734"), "{error}");
+
+        // An indirect self-source: a checkout symlink to the store makes the
+        // project config a *source*, which then declares `sources`.
+        let f = SourcesFixture::new();
+        f.write_project(&sources_block(&["self ./link/config.toml"]));
+        std::os::unix::fs::symlink(
+            f.project_config().parent().unwrap(),
+            f.checkout().join("link"),
+        )
+        .unwrap();
+        let error = format!("{:#}", f.load().expect_err("indirect self-source"));
+        assert!(
+            error.contains("only the project config may declare sources"),
+            "{error}"
+        );
+    }
+
+    /// V10 (S3): an untrusted source refuses every authority field by presence,
+    /// naming that file.
+    #[test]
+    fn v10_an_untrusted_source_cannot_grant_authority() {
+        for (label, body, pointer) in [
+            ("network", "[network]\n", "[network]"),
+            (
+                "empty network",
+                "[network]\nallow_lan = false\n",
+                "[network]",
+            ),
+            ("mounts", "mounts = []\n", "mounts"),
+            (
+                "mount_sets",
+                "[mount_sets]\n",
+                "mount_sets cannot be declared",
+            ),
+            (
+                "egress_sets",
+                "[egress_sets]\n",
+                "egress_sets cannot be declared",
+            ),
+            (
+                "tool mounts",
+                "[[tools]]\nname = \"t\"\ncommand = \"t\"\n[[tools]]\nname = \"u\"\ncommand = \"u\"\nmounts = []\n",
+                "tools[1].mounts",
+            ),
+        ] {
+            let f = SourcesFixture::new();
+            let repo = f.write_repo(".agent-vm/config.toml", body);
+            f.write_project(&sources_block(&[REPO_SOURCE]));
+            let error = format!("{:#}", f.load().expect_err(label));
+            assert!(
+                error.contains("by a source without :trust"),
+                "{label}: {error}"
+            );
+            assert!(
+                error.contains(&repo.display().to_string()),
+                "{label}: {error}"
+            );
+            assert!(error.contains(pointer), "{label}: {error}");
+        }
+    }
+
+    /// V11 (F7, G2): a missing source is an error naming the file and its index, a
+    /// FIFO cannot hang the read, and `..` is resolved by the OS rather than
+    /// collapsed by the parser.
+    #[test]
+    fn v11_source_reads_are_bounded_and_paths_are_not_collapsed() {
+        let f = SourcesFixture::new();
+        let error = format!(
+            "{:#}",
+            f.with_project(&sources_block(&[HOME_SOURCE, REPO_SOURCE]))
+                .expect_err("missing source")
+        );
+        assert!(
+            error.contains("not found; the project config sources it as sources[1]"),
+            "{error}"
+        );
+        assert!(
+            error.contains(&f.repo(".agent-vm/config.toml").display().to_string()),
+            "{error}"
+        );
+
+        // A FIFO, and a symlink to one: the bounded regular read refuses without
+        // blocking.
+        for symlinked in [false, true] {
+            let f = SourcesFixture::new();
+            let fifo = f.repo("pipe");
+            let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+            let spelled = if symlinked {
+                std::os::unix::fs::symlink(&fifo, f.repo("link")).unwrap();
+                "./link"
+            } else {
+                "./pipe"
+            };
+            let alias = format!("x {spelled}");
+            let error = format!(
+                "{:#}",
+                f.with_project(&sources_block(&[alias.as_str()]))
+                    .expect_err("fifo")
+            );
+            assert!(error.contains("is not a regular file"), "{error}");
+        }
+
+        // `link/../target.toml` where `link` is a symlink to a sibling directory:
+        // the OS resolves `..` through the link, so the base directory's file is
+        // read — not `checkout/target.toml`, which lexical collapse would choose.
+        let f = SourcesFixture::new();
+        let sibling = f.base().join("sibling");
+        fs::create_dir_all(&sibling).unwrap();
+        fs::write(f.base().join("target.toml"), one_tool("outside-tool")).unwrap();
+        fs::write(f.checkout().join("target.toml"), one_tool("checkout-tool")).unwrap();
+        std::os::unix::fs::symlink(&sibling, f.checkout().join("link")).unwrap();
+        let report = f
+            .with_project(&sources_block(&["link ./link/../target.toml"]))
+            .expect("dot-dot through a symlink");
+        assert_eq!(launch_names(&report), ["outside-tool"]);
+
+        // An untrusted source may escape the checkout: declarations only.
+        let f = SourcesFixture::new();
+        let sibling = f.base().join("sibling");
+        fs::create_dir_all(&sibling).unwrap();
+        fs::write(
+            sibling.join("config.toml"),
+            "image = \"localhost:1/sibling:latest\"\n",
+        )
+        .unwrap();
+        let report = f
+            .with_project(&sources_block(&["sib ../sibling/config.toml"]))
+            .expect("escape");
+        assert!(report.images().inert().len() == 1);
+
+        // Directory spellings fail cleanly once read.
+        for entry in ["~/", "/", "./"] {
+            let f = SourcesFixture::new();
+            let alias = format!("dir {entry}");
+            let error = format!(
+                "{:#}",
+                f.with_project(&sources_block(&[alias.as_str()]))
+                    .expect_err(entry)
+            );
+            assert!(error.contains("is not a regular file"), "{entry}: {error}");
+        }
+    }
+
+    /// V11b (D3): the `:trust` route is verified for both the implicit and the
+    /// explicit entry. A checkout alias contributes neither tools, image nor
+    /// authority, and the outside-checkout dotfile shapes keep working.
+    #[test]
+    fn v11b_a_trusted_source_is_verified_by_route_not_spelling() {
+        use std::os::unix::fs::symlink;
+
+        // Every shape a hostile checkout file could take, all of which must be
+        // refused *before* reading: a UTF-8 error or a FIFO refusal would prove
+        // the target was opened.
+        for (label, target_body) in [
+            ("tools", one_tool("evil")),
+            ("image", "image = \"localhost:1/evil:latest\"\n".to_string()),
+            ("network", "[network]\nallow_lan = true\n".to_string()),
+            ("invalid utf-8", String::new()),
+        ] {
+            for explicit in [false, true] {
+                let f = SourcesFixture::new();
+                let target = f.checkout().join("evil.toml");
+                fs::create_dir_all(target.parent().unwrap()).unwrap();
+                let bytes: &[u8] = if label == "invalid utf-8" {
+                    b"[[tools]]\nname = \xff\n"
+                } else {
+                    target_body.as_bytes()
+                };
+                fs::write(&target, bytes).unwrap();
+                fs::create_dir_all(f.user_config().parent().unwrap()).unwrap();
+                symlink(&target, f.user_config()).unwrap();
+                let error = if explicit {
+                    f.write_project(&sources_block(&[HOME_SOURCE]));
+                    format!("{:#}", f.load().expect_err(label))
+                } else {
+                    format!("{:#}", f.load().expect_err(label))
+                };
+                assert!(
+                    error.contains(
+                        "the user config refuses a symbolic link whose target resolves inside the \
+                         active project"
+                    ),
+                    "{label}/{explicit}: {error}"
+                );
+            }
+        }
+
+        // A FIFO target is refused by the route check too, never opened.
+        let f = SourcesFixture::new();
+        fs::create_dir_all(f.user_config().parent().unwrap()).unwrap();
+        // Inside the checkout, so the *route* check must refuse it before the
+        // read ever opens the special file.
+        let fifo = f.checkout().join("fifo");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        symlink(&fifo, f.user_config()).unwrap();
+        let error = format!("{:#}", f.load().expect_err("fifo target"));
+        assert!(
+            error.contains("resolves inside the active project"),
+            "{error}"
+        );
+
+        // Parent and ancestor aliases into the checkout.
+        for which in ["config-dir", "config-root"] {
+            let f = SourcesFixture::new();
+            let target = if which == "config-dir" {
+                f.checkout().join("evil")
+            } else {
+                f.checkout().join("cfg")
+            };
+            let file = target.join("config.toml");
+            let file = if which == "config-dir" {
+                file
+            } else {
+                target.join("agent-vm/config.toml")
+            };
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(&file, "[network]\nallow_lan = true\n").unwrap();
+            fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+                .unwrap();
+            let link = if which == "config-dir" {
+                f.home().join(".config/agent-vm")
+            } else {
+                f.home().join(".config")
+            };
+            fs::create_dir_all(link.parent().unwrap()).unwrap();
+            symlink(&target, &link).unwrap();
+            let error = format!("{:#}", f.load().expect_err(which));
+            assert!(
+                error.contains(
+                    "the user config refuses a config directory that resolves inside the active \
+                     project"
+                ),
+                "{which}: {error}"
+            );
+        }
+
+        // Outside-checkout dotfile compatibility: a symlinked file loads tools and
+        // image only, and a symlinked directory keeps ADR-0040's authority answer.
+        let f = SourcesFixture::new();
+        let dotfile = f.home().join("dotfiles/config.toml");
+        fs::create_dir_all(dotfile.parent().unwrap()).unwrap();
+        fs::write(
+            &dotfile,
+            format!("image = \"localhost:1/home:latest\"\n{}", one_tool("home")),
+        )
+        .unwrap();
+        fs::create_dir_all(f.user_config().parent().unwrap()).unwrap();
+        symlink(&dotfile, f.user_config()).unwrap();
+        let report = f.load().expect("dotfile symlink loads");
+        assert_eq!(launch_names(&report), ["home"]);
+        assert_eq!(
+            image_ref(report.images().user()),
+            Some("localhost:1/home:latest")
+        );
+
+        let f = SourcesFixture::new();
+        let realdir = f.home().join("realcfg");
+        fs::create_dir_all(&realdir).unwrap();
+        fs::write(realdir.join("config.toml"), "[network]\nallow_lan = true\n").unwrap();
+        fs::set_permissions(
+            realdir.join("config.toml"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
+        fs::create_dir_all(f.home().join(".config")).unwrap();
+        symlink(&realdir, f.home().join(".config/agent-vm")).unwrap();
+        let report = f.load().expect("outside-checkout directory symlink");
+        assert!(report.user_network().is_some());
+
+        // A dangling link fails closed rather than reading as absent.
+        let f = SourcesFixture::new();
+        fs::create_dir_all(f.user_config().parent().unwrap()).unwrap();
+        symlink(f.home().join("missing.toml"), f.user_config()).unwrap();
+        let error = format!("{:#}", f.load().expect_err("dangling"));
+        assert!(
+            error.contains("resolving the user config symbolic link failed"),
+            "{error}"
+        );
+    }
+
+    /// V11b (continued): from `cwd == $HOME` the normal unaliased layout still
+    /// loads while an alias inside the checkout is refused.
+    #[test]
+    fn v11b_running_from_home_keeps_the_unaliased_layout_only() {
+        let f = SourcesFixture::at_home();
+        f.write_user(&one_tool("u"));
+        let report = f.load().expect("unaliased home layout");
+        assert_eq!(launch_names(&report), ["u"]);
+
+        let f = SourcesFixture::at_home();
+        let realcfg = f.home().join("realcfg");
+        fs::create_dir_all(&realcfg).unwrap();
+        fs::write(realcfg.join("config.toml"), one_tool("evil")).unwrap();
+        fs::create_dir_all(f.home().join(".config")).unwrap();
+        std::os::unix::fs::symlink(&realcfg, f.home().join(".config/agent-vm")).unwrap();
+        let error = format!("{:#}", f.load().expect_err("aliased dir at home"));
+        assert!(
+            error.contains("resolves inside the active project"),
+            "{error}"
+        );
+
+        let f = SourcesFixture::at_home();
+        let target = f.home().join("real.toml");
+        fs::write(&target, one_tool("evil")).unwrap();
+        fs::create_dir_all(f.user_config().parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, f.user_config()).unwrap();
+        let error = format!("{:#}", f.load().expect_err("aliased file at home"));
+        assert!(
+            error.contains("resolves inside the active project"),
+            "{error}"
+        );
+    }
+
+    /// V12: the project config authorizes; the `:trust` image is the fallback, and
+    /// an untrusted source's unselected image is inert and never consulted.
+    #[test]
+    fn v12_image_declaration_and_authorization_are_distinct() {
+        // Direct project image wins; the trusted image stays readable.
+        let f = SourcesFixture::new();
+        f.write_user("image = \"localhost:1/u:latest\"\n");
+        let report = f
+            .with_project(&format!(
+                "image = \"localhost:1/p:latest\"\n{}",
+                sources_block(&[HOME_SOURCE])
+            ))
+            .expect("direct");
+        assert_eq!(
+            image_ref(report.images().project()),
+            Some("localhost:1/p:latest")
+        );
+        assert_eq!(report.images().project().unwrap().via(), None);
+        assert_eq!(
+            image_ref(report.images().user()),
+            Some("localhost:1/u:latest")
+        );
+        assert!(report.images().inert().is_empty());
+
+        // `ALIAS:image` resolves to that source's own image and names its file.
+        let f = SourcesFixture::new();
+        f.write_user("image = \"localhost:1/u:latest\"\n");
+        let repo = f.write_repo(
+            ".agent-vm/config.toml",
+            "image = \"localhost:1/repo:latest\"\n",
+        );
+        let team = f.write_repo("team.toml", "image = \"localhost:1/team:latest\"\n");
+        let report = f
+            .with_project(&format!(
+                "image = \"repo:image\"\n{}",
+                sources_block(&[HOME_SOURCE, REPO_SOURCE, "team ./team.toml"])
+            ))
+            .expect("alias selection");
+        let project = report.images().project().expect("selected");
+        assert_eq!(project.reference().as_str(), "localhost:1/repo:latest");
+        assert_eq!(project.file(), repo.as_path());
+        assert_eq!(project.via().map(|alias| alias.as_str()), Some("repo"));
+        let inert: Vec<(&str, &Path)> = report
+            .images()
+            .inert()
+            .iter()
+            .map(|inert| (inert.alias().as_str(), inert.image().file()))
+            .collect();
+        assert_eq!(inert, [("team", team.as_path())]);
+
+        // With no project image, the trusted image is the fallback and the
+        // untrusted image is inert.
+        let f = SourcesFixture::new();
+        f.write_user("image = \"localhost:1/u:latest\"\n");
+        f.write_repo(
+            ".agent-vm/config.toml",
+            "image = \"localhost:1/repo:latest\"\n",
+        );
+        let report = f
+            .with_project(&sources_block(&[HOME_SOURCE, REPO_SOURCE]))
+            .expect("fallback");
+        assert_eq!(report.images().project(), None);
+        assert_eq!(
+            image_ref(report.images().user()),
+            Some("localhost:1/u:latest")
+        );
+        assert_eq!(report.images().inert().len(), 1);
+        assert_eq!(
+            report.images().inert()[0].image().reference().as_str(),
+            "localhost:1/repo:latest"
+        );
+
+        // A non-`home` trusted alias is still the fallback, and is selectable.
+        let f = SourcesFixture::new();
+        f.write_user("image = \"localhost:1/u:latest\"\n");
+        let report = f
+            .with_project(&format!(
+                "image = \"me:image\"\n{}",
+                sources_block(&["me:trust ~/.config/agent-vm/config.toml"])
+            ))
+            .expect("me:image");
+        assert_eq!(
+            image_ref(report.images().project()),
+            Some("localhost:1/u:latest")
+        );
+        assert_eq!(
+            report.images().project().unwrap().via().map(|a| a.as_str()),
+            Some("me")
+        );
+    }
+
+    /// V13: an undeclared alias is a load error (no OCI fallback), and a declared
+    /// source without an image says which.
+    #[test]
+    fn v13_an_undeclared_alias_is_an_error_not_an_oci_reference() {
+        let f = SourcesFixture::new();
+        let error = format!(
+            "{:#}",
+            f.with_project(&format!(
+                "image = \"rpeo:image\"\n{}",
+                sources_block(&[HOME_SOURCE])
+            ))
+            .expect_err("undeclared alias")
+        );
+        assert!(
+            error.contains("names a source alias that sources does not declare"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("rpeo"),
+            "the alias must not be echoed: {error}"
+        );
+
+        let f = SourcesFixture::new();
+        f.write_repo(".agent-vm/config.toml", &one_tool("r"));
+        let error = format!(
+            "{:#}",
+            f.with_project(&format!(
+                "image = \"repo:image\"\n{}",
+                sources_block(&[REPO_SOURCE])
+            ))
+            .expect_err("no image")
+        );
+        assert!(error.contains("but that file declares no image"), "{error}");
+
+        let f = SourcesFixture::new();
+        let error = format!(
+            "{:#}",
+            f.with_project(&format!(
+                "image = \"home:image\"\n{}",
+                sources_block(&[HOME_SOURCE])
+            ))
+            .expect_err("absent file")
+        );
+        assert!(error.contains("but that file does not exist"), "{error}");
+
+        // The implicit alias is declared too.
+        let f = SourcesFixture::new();
+        f.write_user("image = \"localhost:1/u:latest\"\n");
+        let report = f
+            .with_project("image = \"home:image\"\n")
+            .expect("implicit alias selection");
+        assert_eq!(
+            image_ref(report.images().project()),
+            Some("localhost:1/u:latest")
+        );
+    }
+
+    /// V14 (R8): a name two project-side files declare is an error naming both.
+    #[test]
+    fn v14_a_project_side_tool_collision_is_an_error() {
+        let f = SourcesFixture::new();
+        let repo = f.write_repo(".agent-vm/config.toml", &one_tool("x"));
+        let error = format!(
+            "{:#}",
+            f.with_project(&format!(
+                "{}{}",
+                sources_block(&[REPO_SOURCE]),
+                one_tool("x")
+            ))
+            .expect_err("collision")
+        );
+        assert!(error.contains("cannot declare the same tool"), "{error}");
+        assert!(error.contains(&repo.display().to_string()), "{error}");
+        assert!(error.contains("project config"), "{error}");
+
+        let f = SourcesFixture::new();
+        f.write_repo("a.toml", &one_tool("x"));
+        f.write_repo("b.toml", &one_tool("x"));
+        let error = format!(
+            "{:#}",
+            f.with_project(&sources_block(&["a ./a.toml", "b ./b.toml"]))
+                .expect_err("two sources")
+        );
+        assert!(error.contains("cannot declare the same tool"), "{error}");
+        assert!(error.contains("source a"), "{error}");
+    }
+
+    /// V15 (R1): `sources` is a reserved set name in both set tables, so a
+    /// top-level key written after the header is named rather than misparsed.
+    #[test]
+    fn v15_sources_is_reserved_in_both_set_tables() {
+        for (table, sentence) in [
+            ("mount_sets", "is not a mount set"),
+            ("egress_sets", "is not an egress set"),
+        ] {
+            let f = Fixture::new();
+            f.user(&format!("[{table}]\nsources = []\n"));
+            let error = format!("{:#}", f.load().expect_err(table));
+            assert!(error.contains(sentence), "{table}: {error}");
+            assert!(error.contains("sources is not"), "{table}: {error}");
+        }
     }
 }

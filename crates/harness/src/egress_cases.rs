@@ -1816,8 +1816,10 @@ const UNMET_NAMES: [&str; 5] = [
 pub fn prepare_default_request_project(work: &Path) -> Result<PathBuf, String> {
     let project = work.join("requests");
     std::fs::create_dir_all(&project).map_err(|error| error.to_string())?;
+    let project_config =
+        crate::project_config_path::project_config_path(&work.join("home"), &project)?;
     for config in [
-        project.join(".agent-vm/config.toml"),
+        project_config,
         work.join("home/.config/agent-vm/config.toml"),
         work.join("config/agent-vm/config.toml"),
     ] {
@@ -1961,8 +1963,10 @@ pub fn default_request_self_test() -> Result<(), String> {
 
 fn default_request_self_test_against(work: &Path) -> Result<(), String> {
     let project = prepare_default_request_project(work)?;
+    let project_config =
+        crate::project_config_path::project_config_path(&work.join("home"), &project)?;
     require(
-        !project.join(".agent-vm/config.toml").exists(),
+        !project_config.exists(),
         "the default-request project must have no catalog of its own",
     )?;
     let deny = format!("{POLICY_NOTICE}\n{DNS_NOTICE}\n");

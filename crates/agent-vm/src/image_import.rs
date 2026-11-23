@@ -163,11 +163,14 @@ pub(crate) fn preflight(args: &Args) -> Result<()> {
     }
 }
 
-pub(crate) async fn run(args: Args, configured: Result<&ConfiguredImages>) -> Result<i32> {
-    // Captured before Docker: this command approves its result under the
-    // project it started in, however Docker changes what `getcwd` reports.
-    #[allow(clippy::disallowed_methods)] // one capture per command: every consumer borrows it.
-    let project = crate::project::ProjectDir::capture()?;
+pub(crate) async fn run(
+    args: Args,
+    configured: Result<&ConfiguredImages>,
+    project: &crate::project::ProjectDir,
+) -> Result<i32> {
+    // `main`'s capture (ADR-0073 D2), taken before Docker: this command approves
+    // its result under the project it started in, however Docker changes what
+    // `getcwd` reports.
     let tag = args.result_reference()?;
     let source = args.source.into_source()?;
     if let Source::Input(path) = &source {
@@ -179,7 +182,7 @@ pub(crate) async fn run(args: Args, configured: Result<&ConfiguredImages>) -> Re
     let target = ImageTarget::resolve().await?;
     // HOME and a readable pin store are checked before Docker runs or the
     // archive is published (R9): a damaged store must not cost a save.
-    let scope = crate::image_pin::publication_preflight(&tag, &project)?;
+    let scope = crate::image_pin::publication_preflight(&tag, project)?;
     let published = match source {
         Source::Input(path) => target
             .publish(&path, &tag, PublishPurpose::Approval)
@@ -214,7 +217,7 @@ pub(crate) async fn run(args: Args, configured: Result<&ConfiguredImages>) -> Re
     // is advisory — a broken configuration must not turn a committed
     // publication into a failure, and this command changes no selection.
     let selection = configured
-        .and_then(|configured| crate::boot_image::ambient_selection(configured, Ok(&project)));
+        .and_then(|configured| crate::boot_image::ambient_selection(configured, Ok(project)));
     // The advisory selection above may itself fail; it is converted into the
     // completion text and never into an operation error. A committed import
     // exits 0 even when that notice cannot be written.

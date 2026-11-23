@@ -104,15 +104,18 @@ pub(crate) fn preflight(args: &Args) -> Result<()> {
 /// Selection happens before this call so a failure produces no stdout at all;
 /// the report is written in one `write_all` for the same reason, and the
 /// reference is never logged.
-pub(crate) fn show(configured: &ConfiguredImages) -> Result<()> {
+pub(crate) fn show(
+    configured: &ConfiguredImages,
+    project: &Result<crate::project::ProjectDir>,
+) -> Result<()> {
     use std::io::Write as _;
-    // The tenth capture site (ADR-0063 Decision 2): selection needs to know
-    // which project's default it would read. Held as data so a higher explicit
-    // source still prints when the cwd cannot be captured; the capture creates
-    // nothing, so the read-only, offline contract holds.
-    #[allow(clippy::disallowed_methods)] // one capture per command: every consumer borrows it.
-    let project = crate::project::ProjectDir::capture();
-    let report = crate::boot_image::inspect_selection(configured, &project)?;
+    // Selection needs to know which project's default it would read, so it
+    // consumes `main`'s capture (ADR-0073 D2). A capture failure has already
+    // failed the config load and is fatal here before this call; the capture is
+    // passed as data because a higher explicit source resolves first whenever
+    // the config did load. Nothing is created, so the read-only, offline
+    // contract holds.
+    let report = crate::boot_image::inspect_selection(configured, project)?;
     std::io::stdout()
         .lock()
         .write_all(report.as_bytes())
@@ -122,24 +125,31 @@ pub(crate) fn show(configured: &ConfiguredImages) -> Result<()> {
 /// Write this project's approved-image listing to stdout.
 ///
 /// Unlike `show`, a project this command cannot identify has no lower-precedence
-/// source to fall back to: every row is that project's own approval, so the
-/// capture failure is fatal with a fixed safe context rather than being rendered
-/// as a fictional empty project. The whole report is prepared before one
-/// `write_all`, so damage never leaves a partial listing on stdout, and neither
-/// the report nor its rows are logged.
-pub(crate) fn pins() -> Result<()> {
+/// source to fall back to: every row is that project's own approval, so a
+/// capture failure is fatal rather than being rendered as a fictional empty
+/// project. The whole report is prepared before one `write_all`, so damage never
+/// leaves a partial listing on stdout, and neither the report nor its rows are
+/// logged.
+pub(crate) fn pins(project: &Result<crate::project::ProjectDir>) -> Result<()> {
     use std::io::Write as _;
-    #[allow(clippy::disallowed_methods)] // one capture per command.
-    let project = crate::project::ProjectDir::capture()
-        .context("capturing the invoking project for image pins")?;
-    let report = crate::image_pin::pins_report(&project)?;
+    // `main`'s one capture (ADR-0073 D5), borrowed because the early dispatch
+    // happens before the capture is consumed.
+    let project = project.as_ref().map_err(|error| {
+        anyhow::anyhow!("capturing the invoking project for image pins: {error:#}")
+    })?;
+    let report = crate::image_pin::pins_report(project)?;
     std::io::stdout()
         .lock()
         .write_all(report.as_bytes())
         .context("writing image pin inspection")
 }
 
-pub(crate) async fn run(args: Args, catalog: Catalog, images: ConfiguredImages) -> Result<i32> {
+pub(crate) async fn run(
+    args: Args,
+    catalog: Catalog,
+    images: ConfiguredImages,
+    project: Result<crate::project::ProjectDir>,
+) -> Result<i32> {
     match args.cmd {
         // `main` routes `show` before the runtime exists; reaching here means
         // the early dispatch was bypassed, which is a wiring error, not input.
@@ -151,13 +161,13 @@ pub(crate) async fn run(args: Args, catalog: Catalog, images: ConfiguredImages) 
             // Pull forwards the *original* carried configuration so its own
             // broken-config rules apply: a known ambient selection or a proven
             // in-use target can recover, a bare pull cannot (R8).
-            crate::pull::run(args, catalog, images).await
+            crate::pull::run(args, catalog, images, project).await
         }
         ImageCmd::SetDefault(args) => {
-            crate::boot_image::upgrade::run(args).await?;
+            crate::boot_image::upgrade::run(args, project).await?;
             Ok(0)
         }
-        ImageCmd::Build(args) => crate::image_build::run(args).await,
+        ImageCmd::Build(args) => crate::image_build::run(args, project).await,
         ImageCmd::Import(args) => {
             // Only import observes the selection after publishing, and it must
             // keep its existing behaviour for each catalog state: a ready
@@ -169,7 +179,8 @@ pub(crate) async fn run(args: Args, catalog: Catalog, images: ConfiguredImages) 
                 Catalog::Ready(_) => Ok(&images),
                 Catalog::Broken(error) => Err(anyhow::anyhow!("{error:#}")),
             };
-            crate::image_import::run(args, configured).await
+            let project = project?;
+            crate::image_import::run(args, configured, &project).await
         }
     }
 }

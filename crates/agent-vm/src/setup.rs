@@ -144,9 +144,8 @@ pub async fn run(
     catalog: Catalog,
     images: ConfiguredImages,
     images_read: bool,
+    project: &ProjectDir,
 ) -> Result<()> {
-    #[allow(clippy::disallowed_methods)] // one capture per command: every consumer borrows it.
-    let project = ProjectDir::capture()?;
     // setup also reaches connect_and_migrate (via Sandbox::builder/build and
     // Sandbox::remove), so it can hit the same forward-migrated-DB crash as
     // the boot path. See src/msb_preflight.rs and issue #30.
@@ -189,7 +188,7 @@ pub async fn run(
     };
 
     // The one image selection for this session (D1), shared with launch/pull.
-    let boot = boot_image::select(args.image.requested()?, tiers, &project)?;
+    let boot = boot_image::select(args.image.requested()?, tiers, project)?;
     let label = boot.label();
     let image = boot.reference().as_str().to_string();
 
@@ -215,7 +214,7 @@ pub async fn run(
     // commits the first pin before anything is created. The returned value holds
     // the shared publication barrier across the acquisition and, when
     // verification is requested, across the SDK's verify create.
-    let prepared = prepare_selected(&boot, &project).await?;
+    let prepared = prepare_selected(&boot, project).await?;
 
     if !args.no_verify {
         verify_image(&boot, &targets, prepared).await?;
@@ -530,12 +529,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("config.toml");
         std::fs::write(&project, body).unwrap();
-        config::load(&ConfigPaths {
-            user: Some(dir.path().join("no-user-config.toml")),
+        config::load(&ConfigPaths::for_test(
+            Some(dir.path().join("no-user-config.toml")),
             project,
-
-            home: None,
-        })
+        ))
         .expect("the fixture config parses")
         .into_launch_catalog()
         .expect("the fixture catalog resolves")
@@ -608,15 +605,10 @@ mod tests {
              [[tools]]\nname = \"helper\"\ncommand = \"helper\"\ntools = [\"pi\"]\n",
         )
         .unwrap();
-        let catalog = config::load(&ConfigPaths {
-            user: Some(user),
-            project,
-
-            home: None,
-        })
-        .expect("the two tiers parse")
-        .into_launch_catalog()
-        .expect("the two tiers resolve");
+        let catalog = config::load(&ConfigPaths::for_test(Some(user), project))
+            .expect("the two tiers parse")
+            .into_launch_catalog()
+            .expect("the two tiers resolve");
 
         assert_eq!(
             summary(&verification_targets(&catalog)),

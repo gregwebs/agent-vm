@@ -21,6 +21,9 @@ pub mod egress_run;
 pub mod egress_supervisor;
 pub mod egress_witness;
 pub mod msb_catalog;
+// #733: the host-managed project config path, an independent oracle for a path
+// the shell suites must seed and the product must read.
+pub mod project_config_path;
 
 mod build_archive_oracle;
 mod build_provenance;
@@ -117,6 +120,8 @@ enum Command {
     FakeNotifier(fake_notifier::FakeNotifierArgs),
     /// Check the image-pins live-seed helper dispatch.
     ImagePins(image_pins::ImagePinsArgs),
+    /// Print where a project's host-managed config lives (ADR-0073).
+    ProjectConfigPath(project_config_path::ProjectConfigPathArgs),
     /// Play a launcher's plumbing for the boot-free direct-terminal controls.
     LauncherStandin(launcher_standin::LauncherStandinArgs),
     /// Check that launch options precede tool verbs.
@@ -145,6 +150,7 @@ impl Cli {
             Command::MsbKrunCompat(_) => "msb-krun compat",
             Command::BuildProvenance(_) => "build provenance",
             Command::ImagePins(_) => "image pins",
+            Command::ProjectConfigPath(_) => "project config path",
             Command::CpuCommitment(_) => "cpu commitment",
             Command::BuildArchiveOracle(_) => "build archive oracle",
             Command::ReleasedImageLaunch(_) => "released-image launch",
@@ -212,6 +218,7 @@ pub fn run(cli: Cli) -> Result<Outcome, String> {
         // status: a verdict is a file or a line on stderr, never a frame.
         Command::FakeNotifier(args) => fake_notifier::run(args),
         Command::ImagePins(args) => image_pins::run(args).map(Outcome::Report),
+        Command::ProjectConfigPath(args) => project_config_path::run(args).map(Outcome::Report),
         Command::LauncherStandin(args) => launcher_standin::run(args),
         Command::LaunchArgvOrder(args) => launch_argv_order::run(args).map(Outcome::Report),
         Command::MsbKrunCompat(args) => msb_krun_compat::run(args).map(Outcome::Report),

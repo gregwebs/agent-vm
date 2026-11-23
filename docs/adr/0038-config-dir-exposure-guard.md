@@ -16,7 +16,12 @@ unchanged. Amended by
 `allowances.json` in every measured home, and a file the guard cannot inspect
 (aside from `NotFound`) refuses the launch rather than being left to the reader.
 Breaking guard release: **0.3.0** (ADR-0064's additions: **0.7.43**; ADR-0065's:
-**0.7.44**).
+**0.7.44**). Amended by
+[ADR-0073](0073-host-managed-project-config.md): the measured set gains
+`~/.config/agent-vm/projects` and each existing entry in it; the one-name check
+gains each `projects/<entry>/config.toml`. Storing project configs inside the
+directory is what requires it: "is or contains a route" alone allows a bind
+strictly inside. Release **0.8.0**.
 
 ## Context
 

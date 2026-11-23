@@ -498,24 +498,52 @@ so `--help`, `doctor` and `run::launch` cannot disagree. One arm of
 
 ### Tool config tier
 
-One of the two ordered, optional config files resolved by `config::load`: the
-**user** tier (`$HOME/.config/agent-vm/config.toml`) or the **project** tier
-(`<cwd>/.agent-vm/config.toml`). Each is parsed and validated independently
-before merging. Their merge is a **union of whole definitions**, not a field
+One of the ordered, optional config files resolved by `config::load`: the
+**project** tier (`$HOME/.config/agent-vm/projects/<project-id>/config.toml`,
+keyed by the **project**'s full digest), the **user** tier
+(`$HOME/.config/agent-vm/config.toml`) when the project config
+[sources](#config-source) it `:trust` — which is the default — or a
+**project-side source** (a file the project config names without `:trust`). The
+project tier is **host-managed**: nothing in a repository is ever read as config
+unless the project config names it. A present project file is
+verified unconditionally — a regular, singly linked, user-owned file reached
+without a final symlink, in a store directory with the same ownership rules and
+no symlinked route — before its bytes are decoded
+([ADR-0073](docs/adr/0073-host-managed-project-config.md)); the `:trust` user
+file's route is checked the same way before it is opened
+([ADR-0074](docs/adr/0074-flat-config-sources.md)). Each tier is parsed
+and validated independently before merging. Their merge is a **union of whole definitions**, not a field
 overlay: the user tier is authoritative for every name it declares, the
-project tier may only add names, and a differing project declaration yields a
-`doctor` warning (user definition wins). Only when both tiers declare **zero**
-tools do the compiled-in defaults apply. The authority-bearing fields are
-user-tier only: `[network]` ([persisted grant](#egress-authority)), `mounts`
+project side may only add names (and may not declare one name twice), and a
+differing project declaration yields a `doctor` warning (user definition wins).
+Only when every tier declares **zero** tools do the compiled-in defaults apply. The authority-bearing fields are
+`:trust`-tier only: `[network]` ([persisted grant](#egress-authority)), `mounts`
 ([config mount](#config-mount)) and `[mount_sets]` ([mount
-set](#mount-set)). A project or built-in declaration of any of them is refused,
-even when empty, because presence is what asks for authority. A
+set](#mount-set)). A project-side, sourced or built-in declaration of any of them
+is refused, even when empty, because presence is what asks for authority. A
 definition hidden by whole-definition precedence still belongs to its own
 **tool reference scope**, so the rest of its file keeps resolving it.
 
 A load failure is **deferred**, not fatal at startup: `doctor`, the built-ins,
 and the in-guest `clipboard`/`_intercept-hook` keep working, and a launch verb
 reports the config error rather than clap's "unrecognized subcommand".
+
+## Config source
+
+An entry of the project config's top-level `sources` array,
+`"<alias>[:trust] <path>"` ([ADR-0074](docs/adr/0074-flat-config-sources.md)).
+The **alias** is the file's stable name; `:trust` marks the one file read exactly
+like the user config (`$HOME/.config/agent-vm/config.toml`), and everything else
+is **declarations only** — it may add tools and declare an `image`, and cannot
+grant network, mounts or sets. Such a tool still carries the credential, `env`
+and `persist` requests it declares, and — when the user config declares no tools of
+its own — replaces the shipped default verbs, which is why a source is reviewed
+before it is sourced. Sourcing is **flat**: only the project config may
+declare `sources`. An omitted key means the single implicit
+`home:trust ~/.config/agent-vm/config.toml`. An `image` **declared** by a source
+takes effect only when the project config **authorizes** it with
+`image = "ALIAS:image"`; a user image is the fallback, and every unselected
+source image is inert. _Avoid_: include, import.
 
 ## Boot image
 
@@ -594,9 +622,11 @@ stamp. _Avoid_: image API, image-API version.
 The one image a session boots, chosen independently of the launched tool:
 either a **launch build** (`--dockerfile`) or, when the launch does not type it,
 `--image` (command line) > `AGENT_VM_IMAGE_TAG` (an empty value is unset) >
-user config `image` > project config `image` > the **default boot image**. The
-catalog is never an input, so changing a runtime tool declaration cannot change
-the image. A config-file `image` must be an OCI reference; `--image`
+project config `image` (its own reference, or `ALIAS:image` selecting a
+[config source](#config-source)'s image) > the `:trust` user config `image` >
+the **default boot image**. The catalog is never an input, so changing a runtime
+tool declaration cannot change the image. A config-file `image` must be an OCI
+reference, except the project config's `ALIAS:image` selection; `--image`
 additionally accepts whatever msb accepts (a local rootfs or disk image).
 `--dockerfile` beside a typed `--image` is a usage error, not a precedence
 question. Only a launch build
@@ -638,12 +668,14 @@ The canonical host working directory of an agent-vm command, not its Git
 repository or build context. Worktrees and subdirectories are distinct projects;
 symlink aliases of the same directory are one project.
 
-The command captures it **once**, at its entry point, and session state and
-**image pins** both consume that one capture: an external `rename` changes what
+The command captures it **once**, at its entry point, and the tool-config
+discovery, session state and **image pins** all consume that one capture: an external `rename` changes what
 the process's working directory is called without any `chdir`, so a second read
 could name a second project mid-command. The identifier stored in approvals is
-the lowercase hex SHA-256 of the captured path's bytes; the 12-hex name of the
-project's state directory under `$AGENT_VM_STATE_DIR` is that digest's prefix.
+the lowercase hex SHA-256 of the captured path's bytes, and the same id names the
+project's config directory under `~/.config/agent-vm/projects/` and its records
+in `image-pins.json`/`allowances.json`; the 12-hex name of the project's state
+directory under `$AGENT_VM_STATE_DIR` is that digest's prefix.
 
 _Avoid_: "workspace", "repo" (both are other things), "current directory"
 (the project is a capture, not an ambient read).
@@ -925,12 +957,18 @@ and [ADR-0017](docs/adr/0017-tool-declared-provisioning.md).
 
 `~/.config/agent-vm`, where `credentials.yaml`, `[network]`, `mounts`,
 `[mount_sets]` and a full tool's own `mounts` authorize launch secrets, egress,
-config mounts, mount sets and tool config mounts respectively. This
+config mounts, mount sets and tool config mounts respectively, and where each
+project's **tool config tier** lives under `projects/<project-id>/`. This
 directory is never
 inside a writable live bind. Protection includes directories its lookup searches
 and prospective directories reached through missing components, measuring raw
-`$HOME` and the account home. Read-only binds and fork copies are exempt.
-See [ADR-0038](docs/adr/0038-config-dir-exposure-guard.md) for the rule and gaps.
+`$HOME` and the account home. Because the project configs sit *inside* the
+directory, `projects/` and every existing project directory are measured as
+stores of their own — so a writable bind of one is refused while a bind strictly
+inside it is not — and every `projects/<project-id>/config.toml` joins the
+one-name (hard link) rule. Read-only binds and fork copies are exempt.
+See [ADR-0038](docs/adr/0038-config-dir-exposure-guard.md) and
+[ADR-0073](docs/adr/0073-host-managed-project-config.md) for the rules and gaps.
 
 _Avoid_: "masked"; "protected host file", which means the Pi files.
 

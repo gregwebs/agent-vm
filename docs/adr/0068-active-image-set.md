@@ -166,7 +166,8 @@ registry work; the whole file is still decoded and validated, so a malformed
 foreign role join is damage rather than something to filter away. The worklist
 is frozen from that snapshot plus one ambient decision:
 
-- the ambient next-launch operation (env > user > project > default), even when
+- the ambient next-launch operation (env > project > `:trust` user > default, per
+  [ADR-0074](0074-flat-config-sources.md)), even when
   no approval exists for it, and
 - every record holding a Boot/Output role in exactly this project/platform scope,
 

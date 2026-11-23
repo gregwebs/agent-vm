@@ -1881,12 +1881,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("config.toml");
         std::fs::write(&project, body).unwrap();
-        crate::config::load(&ConfigPaths {
-            user: Some(dir.path().join("no-user-config.toml")),
+        crate::config::load(&ConfigPaths::for_test(
+            Some(dir.path().join("no-user-config.toml")),
             project,
-
-            home: None,
-        })
+        ))
         .expect("the fixture config parses")
     }
 
@@ -1894,11 +1892,10 @@ mod tests {
     /// the test never depends on the developer's `$HOME` or cwd.
     fn default_catalog() -> LaunchCatalog {
         let dir = tempfile::tempdir().unwrap();
-        crate::config::load(&ConfigPaths {
-            user: Some(dir.path().join("no-user-config.toml")),
-            project: dir.path().join("no-project-config.toml"),
-            home: None,
-        })
+        crate::config::load(&ConfigPaths::for_test(
+            Some(dir.path().join("no-user-config.toml")),
+            dir.path().join("no-project-config.toml"),
+        ))
         .expect("the embedded default catalog parses")
         .into_launch_catalog()
         .expect("the default catalog resolves")
@@ -2032,12 +2029,10 @@ mod tests {
             "image = \"localhost:1/p:latest\"\n[[tools]]\nname = \"t\"\ncommand = \"t\"\n",
         )
         .unwrap();
-        let report = crate::config::load(&ConfigPaths {
-            user: Some(dir.path().join("no-user-config.toml")),
+        let report = crate::config::load(&ConfigPaths::for_test(
+            Some(dir.path().join("no-user-config.toml")),
             project,
-
-            home: None,
-        })
+        ))
         .unwrap();
         let images = report.images().clone();
         let dispatch = parse_from(["agent-vm", "t"], Ok(report)).expect("t parses");
@@ -2083,12 +2078,7 @@ mod tests {
              [[tools]]\nname = \"helper\"\ncommand = \"helper\"\ntools = [\"bridge\"]\npersist = [\".helper\"]\n",
         )
         .unwrap();
-        let report = crate::config::load(&ConfigPaths {
-            user: Some(user),
-            project,
-            home: None,
-        })
-        .unwrap();
+        let report = crate::config::load(&ConfigPaths::for_test(Some(user), project)).unwrap();
         let dispatch = parse_from(["agent-vm", "helper"], Ok(report)).expect("helper parses");
         let Dispatch::Launch {
             target: LaunchTarget::Tool { entry, .. },
@@ -2128,11 +2118,10 @@ mod tests {
         );
 
         // The winning verb keeps the user definition and its own facets.
-        let report = crate::config::load(&ConfigPaths {
-            user: Some(dir.path().join("user.toml")),
-            project: dir.path().join("project.toml"),
-            home: None,
-        })
+        let report = crate::config::load(&ConfigPaths::for_test(
+            Some(dir.path().join("user.toml")),
+            dir.path().join("project.toml"),
+        ))
         .unwrap();
         let dispatch = parse_from(["agent-vm", "pi"], Ok(report)).expect("pi parses");
         let Dispatch::Launch {
@@ -2438,14 +2427,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("project.toml");
         std::fs::write(&project, "[network]\nallow_lan = true").unwrap();
-        let load = || {
-            crate::config::load(&crate::config::ConfigPaths {
-                user: None,
-                project: project.clone(),
-
-                home: None,
-            })
-        };
+        let load =
+            || crate::config::load(&crate::config::ConfigPaths::for_test(None, project.clone()));
         assert!(matches!(
             parse_from(["agent-vm", "doctor"], load()).unwrap(),
             Dispatch::Builtin {
@@ -2486,12 +2469,10 @@ mod tests {
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let load = || {
-            crate::config::load(&crate::config::ConfigPaths {
-                user: Some(file.clone()),
-                project: dir.path().join("absent.toml"),
-
-                home: None,
-            })
+            crate::config::load(&crate::config::ConfigPaths::for_test(
+                Some(file.clone()),
+                dir.path().join("absent.toml"),
+            ))
         };
         let expected = load().unwrap().user_network().cloned();
         let Dispatch::Launch { user_network, .. } =
@@ -2525,10 +2506,8 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let paths = || crate::config::ConfigPaths {
-            user: Some(file.clone()),
-            project: dir.path().join("absent.toml"),
-            home: None,
+        let paths = || {
+            crate::config::ConfigPaths::for_test(Some(file.clone()), dir.path().join("absent.toml"))
         };
         let expected = crate::config::load(&paths())
             .unwrap()
@@ -2568,11 +2547,10 @@ mod tests {
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let load = || {
-            crate::config::load(&crate::config::ConfigPaths {
-                user: Some(file.clone()),
-                project: dir.path().join("absent.toml"),
-                home: None,
-            })
+            crate::config::load(&crate::config::ConfigPaths::for_test(
+                Some(file.clone()),
+                dir.path().join("absent.toml"),
+            ))
         };
         // `UserMounts` compares by the facts a launch reads, not by value: it is
         // not `PartialEq` because no production caller compares two of them.
@@ -2640,11 +2618,10 @@ mod tests {
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let load = || {
-            crate::config::load(&crate::config::ConfigPaths {
-                user: Some(file.clone()),
-                project: dir.path().join("absent.toml"),
-                home: None,
-            })
+            crate::config::load(&crate::config::ConfigPaths::for_test(
+                Some(file.clone()),
+                dir.path().join("absent.toml"),
+            ))
         };
         for (tokens, check) in [
             (
@@ -2705,11 +2682,10 @@ mod tests {
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let load = || {
-            crate::config::load(&crate::config::ConfigPaths {
-                user: Some(file.clone()),
-                project: dir.path().join("absent.toml"),
-                home: None,
-            })
+            crate::config::load(&crate::config::ConfigPaths::for_test(
+                Some(file.clone()),
+                dir.path().join("absent.toml"),
+            ))
         };
         // A tool-only file is a mount model: the CLI must carry it, or `--mount`
         // could not resolve a set from the same file and the opt-out could not
@@ -3741,12 +3717,10 @@ mod tests {
             "[[tools]]\nname = \"image\"\ncommand = \"build\"\n",
         )
         .unwrap();
-        let error = crate::config::load(&ConfigPaths {
-            user: Some(dir.path().join("no-user-config.toml")),
+        let error = crate::config::load(&ConfigPaths::for_test(
+            Some(dir.path().join("no-user-config.toml")),
             project,
-
-            home: None,
-        })
+        ))
         .expect_err("a tool named image must be refused");
         assert!(format!("{error:#}").contains("reserved"));
     }
@@ -4613,12 +4587,10 @@ mod tests {
         let project = dir.path().join("config.toml");
         std::fs::write(&project, "[[tools]]\nname = \"run\"\ncommand = \"x\"\n").unwrap();
         let load = || {
-            crate::config::load(&crate::config::ConfigPaths {
-                user: Some(dir.path().join("no-user.toml")),
-                project: dir.path().join("config.toml"),
-
-                home: None,
-            })
+            crate::config::load(&crate::config::ConfigPaths::for_test(
+                Some(dir.path().join("no-user.toml")),
+                dir.path().join("config.toml"),
+            ))
         };
         let error = parse_from(argv_of(&["agent-vm", "run", "p"]), load())
             .err()
@@ -4905,12 +4877,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("config.toml");
         std::fs::write(&project, "[[tools]]\nname = \"run\"\ncommand = \"x\"\n").unwrap();
-        let config = crate::config::load(&crate::config::ConfigPaths {
-            user: Some(dir.path().join("no-user.toml")),
+        let config = crate::config::load(&crate::config::ConfigPaths::for_test(
+            Some(dir.path().join("no-user.toml")),
             project,
-
-            home: None,
-        });
+        ));
         let catalog = match config {
             Ok(report) => match report.into_launch_catalog() {
                 Ok(catalog) => Catalog::Ready(catalog),
@@ -4936,22 +4906,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let user_config = dir.path().join("user.toml");
         std::fs::write(&user_config, body).unwrap();
-        let user = crate::config::load(&ConfigPaths {
-            user: Some(user_config),
-            project: dir.path().join("no-project.toml"),
-
-            home: None,
-        })
+        let user = crate::config::load(&ConfigPaths::for_test(
+            Some(user_config),
+            dir.path().join("no-project.toml"),
+        ))
         .unwrap_err()
         .to_string();
         let project_config = dir.path().join("project.toml");
         std::fs::write(&project_config, body).unwrap();
-        let project = crate::config::load(&ConfigPaths {
-            user: Some(dir.path().join("no-user.toml")),
-            project: project_config,
-
-            home: None,
-        })
+        let project = crate::config::load(&ConfigPaths::for_test(
+            Some(dir.path().join("no-user.toml")),
+            project_config,
+        ))
         .unwrap_err()
         .to_string();
         for rendered in [user, project] {

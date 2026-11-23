@@ -166,6 +166,8 @@ pub(crate) enum RequestTier {
     BuiltIn,
     User,
     Project,
+    /// A file the project config sources without `:trust` (ADR-0074).
+    Source,
 }
 impl RequestTier {
     fn label(self) -> &'static str {
@@ -173,6 +175,7 @@ impl RequestTier {
             Self::BuiltIn => "built-in defaults",
             Self::User => "user config",
             Self::Project => "project config",
+            Self::Source => "sourced config",
         }
     }
 }

@@ -4623,9 +4623,9 @@ fn a_bare_refresh_refuses_an_unreadable_config_but_a_proven_target_works() {
             let config = "not toml [[[";
             match tier {
                 "project" => {
-                    let dir = h.project.join(".agent-vm");
-                    fs::create_dir_all(&dir).unwrap();
-                    fs::write(dir.join("config.toml"), config).unwrap();
+                    let config_path = support::project_config_path(&h.home, &h.project);
+                    fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+                    fs::write(config_path, config).unwrap();
                 }
                 _ => fs::write(&broken, config).unwrap(),
             }
@@ -4737,9 +4737,9 @@ fn an_unreadable_config_never_establishes_a_project_default() {
         let a = h.image(&ArchiveSpec::default());
         let child = server.image("images", &format!("broken-setup-{shape}"), &a);
         assert!(set_default(&h, &child).status.success());
-        let config = h.project.join(".agent-vm");
-        fs::create_dir_all(&config).unwrap();
-        fs::write(config.join("config.toml"), config_text).unwrap();
+        let config = support::project_config_path(&h.home, &h.project);
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(&config, config_text).unwrap();
         let setup = {
             let mut command = h.command();
             command.args(["setup", "--no-verify"]);
@@ -4780,7 +4780,7 @@ fn an_unreadable_config_never_establishes_a_project_default() {
             h.default_record_in(&h.project).is_none(),
             "{shape}: an unreadable configuration establishes nothing"
         );
-        fs::remove_file(config.join("config.toml")).unwrap();
+        fs::remove_file(&config).unwrap();
         let launch = h.launch_default();
         assert!(!launch.status.success(), "the fake runtime cannot boot");
         assert_eq!(
@@ -4796,9 +4796,9 @@ fn an_unreadable_config_never_establishes_a_project_default() {
         let server = Server::new();
         let a = h.image(&ArchiveSpec::default());
         let child = server.image("images", &format!("broken-fresh-{shape}"), &a);
-        let config = h.project.join(".agent-vm");
-        fs::create_dir_all(&config).unwrap();
-        fs::write(config.join("config.toml"), config_text).unwrap();
+        let config = support::project_config_path(&h.home, &h.project);
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(&config, config_text).unwrap();
         let mut command = h.command();
         command
             .env("AGENT_VM_TEST_DEFAULT_IMAGE", &child)
@@ -4814,7 +4814,7 @@ fn an_unreadable_config_never_establishes_a_project_default() {
             h.default_record_in(&h.project).is_none(),
             "{shape}: a setup made while the configuration is unreadable establishes nothing"
         );
-        fs::remove_file(config.join("config.toml")).unwrap();
+        fs::remove_file(&config).unwrap();
         let launch = h.launch_default();
         assert!(!launch.status.success(), "the fake runtime cannot boot");
         assert_eq!(
@@ -7625,9 +7625,9 @@ fn targeted_refresh_updates_only_the_in_use_target() {
     let boot_tag = format!("{}/images:ac4boot", server.host);
     server.image("images", "ac4boot", &a);
     // A configured (not default-tier) Boot selection.
-    let dir = h.project.join(".agent-vm");
-    fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join("config.toml"), format!("image = {boot_tag:?}\n")).unwrap();
+    let config = support::project_config_path(&h.home, &h.project);
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(&config, format!("image = {boot_tag:?}\n")).unwrap();
     assert!(!h.launch_default().status.success(), "the create fails");
     assert_eq!(roles_of(&h, &h.project, &boot_tag).as_deref(), Some("boot"));
 
@@ -7639,7 +7639,7 @@ fn targeted_refresh_updates_only_the_in_use_target() {
     let output_o = server.image("images", "ac4output", &o);
     let out = h.import(&o.written.path, &output_tag);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
-    let config_bytes = fs::read(dir.join("config.toml")).unwrap();
+    let config_bytes = fs::read(&config).unwrap();
     let boot_record = h.record_in(&h.project, &boot_tag).unwrap();
     let show_before = {
         let mut cmd = h.command();
@@ -7686,7 +7686,7 @@ fn targeted_refresh_updates_only_the_in_use_target() {
         Some(boot_record),
         "the Boot holder is not a target of a filter"
     );
-    assert_eq!(fs::read(dir.join("config.toml")).unwrap(), config_bytes);
+    assert_eq!(fs::read(&config).unwrap(), config_bytes);
     assert!(h.host_record().is_none());
     assert!(h.default_record_in(&h.project).is_none());
     let show_after = {
@@ -7843,9 +7843,9 @@ fn refresh_env_selects_ambient_without_filtering_the_worklist() {
     });
     let boot_tag = format!("{}/images:ac6boot", server.host);
     let boot_b = server.image("images", "ac6boot", &b);
-    let dir = h.project.join(".agent-vm");
-    fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join("config.toml"), format!("image = {boot_tag:?}\n")).unwrap();
+    let config = support::project_config_path(&h.home, &h.project);
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(&config, format!("image = {boot_tag:?}\n")).unwrap();
     assert!(!h.launch_default().status.success());
     assert_eq!(roles_of(&h, &h.project, &boot_tag).as_deref(), Some("boot"));
     // Output holder O.
@@ -12143,7 +12143,7 @@ fn pins_ignores_broken_config_and_doctor_still_counts() {
             fs::create_dir_all(config_dir(&h)).unwrap();
             fs::write(config_dir(&h).join("config.toml"), config).unwrap();
         }
-        let project_config_path = h.project.join(".agent-vm/config.toml");
+        let project_config_path = support::project_config_path(&h.home, &h.project);
         if project_directory {
             fs::create_dir_all(&project_config_path).unwrap();
         } else if let Some(config) = project_config {

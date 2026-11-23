@@ -246,11 +246,10 @@ mod tests {
         std::fs::write(&user, body).unwrap();
         std::fs::set_permissions(&user, std::fs::Permissions::from_mode(0o600)).unwrap();
         let project_dir = tempfile::tempdir().unwrap();
-        let report = crate::config::load(&crate::config::ConfigPaths {
-            user: Some(user),
-            project: project_dir.path().join("config.toml"),
-            home: None,
-        })
+        let report = crate::config::load(&crate::config::ConfigPaths::for_test(
+            Some(user),
+            project_dir.path().join("config.toml"),
+        ))
         .unwrap();
         report.into_launch_catalog().unwrap()
     }

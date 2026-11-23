@@ -19,6 +19,27 @@ use std::{
 #[path = "../../src/guest_paths.rs"]
 mod guest_paths;
 
+/// Where agent-vm reads `project`'s host-managed config under `home` (ADR-0073).
+///
+/// The digest is computed here, independently of the product, so a wrong id in
+/// `project_config::path` fails every harness instead of agreeing with itself.
+/// `home` must be the exact `HOME` the child gets: neither tier is canonicalized
+/// from it.
+pub fn project_config_path(home: &Path, project: &Path) -> PathBuf {
+    use sha2::{Digest as _, Sha256};
+    use std::os::unix::ffi::OsStrExt as _;
+    let canonical = project
+        .canonicalize()
+        .expect("canonicalize the project root");
+    let hex: String = Sha256::digest(canonical.as_os_str().as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    home.join(".config/agent-vm/projects")
+        .join(hex)
+        .join("config.toml")
+}
+
 /// Cargo's per-target scratch directory (`<target>/tmp`), which lives on the
 /// workspace filesystem rather than under a guest tmpfs prefix — unless the
 /// caller pointed `CARGO_TARGET_DIR` at one.

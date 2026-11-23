@@ -9,6 +9,7 @@ mod clipboard;
 mod config;
 mod config_authority;
 mod config_mounts;
+mod config_sources;
 #[cfg(test)]
 mod cpu_evidence;
 mod credential_env;
@@ -67,6 +68,7 @@ mod notify;
 mod one_line;
 mod pi_credential_inspection;
 mod project;
+mod project_config;
 mod protected_config_dir;
 mod protected_host_files;
 mod pull;
@@ -109,9 +111,19 @@ fn main() -> Result<()> {
     // tool catalog determines which subcommands exist. The result is carried
     // as data, not `?`-propagated: a broken config must not break `doctor`
     // (the tool you use to diagnose it), nor `clipboard`/`_intercept-hook`
-    // (which run *inside* the guest, where a project config is present). See
-    // `cli::parse_from`.
-    let config = config::ConfigPaths::discover().and_then(|paths| config::load(&paths));
+    // (which run *inside* the guest). See `cli::parse_from`.
+    //
+    // One project capture at process entry feeds both config discovery and every
+    // command that consumes both the catalog and a project (ADR-0073 D2), so a
+    // cwd rename cannot split catalog identity from pin/launch identity.
+    // One capture per command: handed beside `Dispatch` to `run_dispatch`.
+    #[allow(clippy::disallowed_methods)]
+    let project = project::ProjectDir::capture();
+    let config = project
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!("{error:#}"))
+        .and_then(config::ConfigPaths::discover)
+        .and_then(|paths| config::load(&paths));
     let dispatch = match cli::parse_from(std::env::args_os(), config) {
         Ok(dispatch) => dispatch,
         // Parse failures already know their status: clap's own formatter and
@@ -123,7 +135,7 @@ fn main() -> Result<()> {
     // The status policy of everything below depends on the route, recorded
     // while it is still observable on the dispatch itself.
     let direct = dispatch.is_direct_launch();
-    run_dispatch(dispatch).map_err(|error| report_dispatch_failure(error, direct))
+    run_dispatch(dispatch, project).map_err(|error| report_dispatch_failure(error, direct))
 }
 
 /// Report a dispatch failure with its status, ending the process here when the
@@ -175,7 +187,7 @@ fn failure_status(error: &anyhow::Error, direct: bool) -> FailureStatus {
 
 /// Everything after parsing, separated so `main` owns the exit-status policy for
 /// whatever this returns.
-fn run_dispatch(dispatch: Dispatch) -> Result<()> {
+fn run_dispatch(dispatch: Dispatch, project: Result<project::ProjectDir>) -> Result<()> {
     // `doctor` is a **diagnostic** and must not depend on a healthy runtime to
     // inspect state (issue #93): dispatching it here, before `point_at_msb` /
     // `ensure_msb_home`, keeps it independent of MSB_HOME setup and the
@@ -189,7 +201,7 @@ fn run_dispatch(dispatch: Dispatch) -> Result<()> {
         ..
     } = dispatch
     {
-        doctor::run(args)?;
+        doctor::run(args, project)?;
         return Ok(());
     }
 
@@ -216,7 +228,7 @@ fn run_dispatch(dispatch: Dispatch) -> Result<()> {
         ..
     } = dispatch
     {
-        return exit_with(access_cmd::run(args)?);
+        return exit_with(access_cmd::run(args, project)?);
     }
 
     // `_notify-click` runs when the operator clicks a notification banner. It needs
@@ -260,7 +272,7 @@ fn run_dispatch(dispatch: Dispatch) -> Result<()> {
     } = &dispatch
         && args.is_pins()
     {
-        return image_cmd::pins();
+        return image_cmd::pins(&project);
     }
 
     // `image show` reports the selection a launch *here* would make (#373). It
@@ -283,7 +295,7 @@ fn run_dispatch(dispatch: Dispatch) -> Result<()> {
         if let config::Catalog::Broken(error) = catalog {
             anyhow::bail!("{error:#}");
         }
-        return image_cmd::show(images);
+        return image_cmd::show(images, &project);
     }
 
     // Input typos must fail before the MSB prologue creates state (#359).
@@ -363,25 +375,32 @@ fn run_dispatch(dispatch: Dispatch) -> Result<()> {
                 user_mounts,
                 resources,
                 args,
-            } => exit_with(
-                run::launch(
-                    target,
-                    &images,
-                    user_network.as_ref(),
-                    user_tools.as_ref(),
-                    user_mounts.as_ref(),
-                    credential_preflight,
-                    resources,
-                    *args,
+            } => {
+                let project = project?;
+                exit_with(
+                    run::launch(
+                        target,
+                        &images,
+                        user_network.as_ref(),
+                        user_tools.as_ref(),
+                        user_mounts.as_ref(),
+                        credential_preflight,
+                        resources,
+                        *args,
+                        &project,
+                    )
+                    .await?,
                 )
-                .await?,
-            ),
+            }
             Dispatch::Builtin {
                 cmd: Cmd::Setup(args),
                 catalog,
                 images,
                 images_read,
-            } => setup::run(args, catalog, images, images_read).await,
+            } => {
+                let project = project?;
+                setup::run(args, catalog, images, images_read, &project).await
+            }
             // The image group: `pull` acquires natively and `set-default`
             // retains explicitly (both carry the original catalog/images, so
             // their documented broken-config recovery is preserved), while
@@ -392,11 +411,11 @@ fn run_dispatch(dispatch: Dispatch) -> Result<()> {
                 catalog,
                 images,
                 images_read: _,
-            } => exit_with(image_cmd::run(args, catalog, images).await?),
+            } => exit_with(image_cmd::run(args, catalog, images, project).await?),
             Dispatch::Builtin {
                 cmd: Cmd::Clipboard(args),
                 ..
-            } => clipboard::run(args),
+            } => clipboard::run(args, project),
             Dispatch::Builtin {
                 cmd: Cmd::InterceptHook(args),
                 ..

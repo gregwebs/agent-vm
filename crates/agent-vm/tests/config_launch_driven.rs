@@ -356,7 +356,7 @@ impl Harness {
     }
 
     fn project_config(&self) -> PathBuf {
-        self.project_root.join(".agent-vm/config.toml")
+        support::project_config_path(&self.home_root, &self.project_root)
     }
 
     fn base_command(&self) -> Command {
@@ -4355,9 +4355,9 @@ fn every_launch_scan_resolves_nothing() {
 // ===========================================================================
 //
 // One image per session, chosen independently of the launched tool:
-// `--image` > `AGENT_VM_IMAGE_TAG` (empty = unset) > user config `image` >
-// project config `image` > default boot image. These tests drive the real
-// binary through every boundary. `AGENT_VM_TEST_DEFAULT_IMAGE` (debug-only)
+// `--image` > `AGENT_VM_IMAGE_TAG` (empty = unset) > project config `image` >
+// user config `image` > default boot image (ADR-0074 D5). These tests drive the
+// real binary through every boundary. `AGENT_VM_TEST_DEFAULT_IMAGE` (debug-only)
 // gives the default slot a distinct, immediately unreachable loopback ref so a
 // default fallthrough does not start a real multi-GB pull.
 
@@ -4654,7 +4654,7 @@ struct Precedence {
     source: &'static str,
 }
 
-fn precedence_rows() -> [Precedence; 10] {
+fn precedence_rows() -> [Precedence; 11] {
     [
         Precedence {
             name: "typed beats all",
@@ -4674,12 +4674,23 @@ fn precedence_rows() -> [Precedence; 10] {
             expected: ENV_REF,
             source: "env AGENT_VM_IMAGE_TAG",
         },
+        // ADR-0074: the project config authorizes; the `:trust` user image is
+        // the fallback.
         Precedence {
-            name: "user beats project",
+            name: "project beats user",
             cli: None,
             env: None,
             user: Some(USER_REF),
             project: Some(PROJECT_REF),
+            expected: PROJECT_REF,
+            source: "project config",
+        },
+        Precedence {
+            name: "user is the fallback",
+            cli: None,
+            env: None,
+            user: Some(USER_REF),
+            project: None,
             expected: USER_REF,
             source: "user config",
         },
@@ -4702,13 +4713,13 @@ fn precedence_rows() -> [Precedence; 10] {
             source: "default",
         },
         Precedence {
-            name: "empty env is unset (user)",
+            name: "empty env is unset (project beats user)",
             cli: None,
             env: Some(""),
             user: Some(USER_REF),
             project: Some(PROJECT_REF),
-            expected: USER_REF,
-            source: "user config",
+            expected: PROJECT_REF,
+            source: "project config",
         },
         Precedence {
             name: "empty env does not mask project",
@@ -5317,7 +5328,7 @@ fn image_only_config_keeps_all_shipped_runtime_tools() {
     }
 
     // A user image-only tier plus project custom tools: the project tools still
-    // replace the shipped tools (ADR-0015), and the user image still wins.
+    // replace the shipped tools (ADR-0015), and the project image wins (ADR-0074).
     let harness = Harness::warm();
     harness.write_user(&format!("image = \"{USER_REF}\"\n"));
     harness.write_project(&format!(
@@ -5331,8 +5342,8 @@ fn image_only_config_keeps_all_shipped_runtime_tools() {
     let config = normalized_config(&harness, &out);
     assert_eq!(
         oci_reference(&config),
-        "localhost:1/user@$FIXTURE_DIGEST",
-        "the user image outranks the project's"
+        "localhost:1/project@$FIXTURE_DIGEST",
+        "the project image outranks the user's"
     );
     let claude = harness.launch_argv(
         "claude",
@@ -7403,7 +7414,7 @@ fn allowance_rejections_report_exact_messages() {
 fn user_network_refusal_is_rendered_in_doctor_tool_configuration() {
     let harness = Harness::new();
     harness.write_user_mode("[network]\nallow_lan = true\n", 0o600);
-    let target = harness.project_root.join("dotfile");
+    let target = harness.home_root.join("dotfile");
     std::fs::rename(harness.user_config(), &target).unwrap();
     harness.symlink_user_config(&target);
     let out = harness.base_command().arg("doctor").output().unwrap();
@@ -8248,7 +8259,7 @@ fn unsafe_user_network_is_refused_before_launch_state() {
                 "2 hard links"
             }
             "symlink" => {
-                let target = h.project_root.join("dotfile");
+                let target = h.home_root.join("dotfile");
                 std::fs::rename(&file, &target).unwrap();
                 h.symlink_user_config(&target);
                 "reached through a symbolic link"
@@ -8378,7 +8389,7 @@ fn user_network_type_errors_are_value_safe() {
 fn symlinked_user_config_without_network_still_launches() {
     let h = Harness::warm();
     h.write_user_mode("# no authority\n", 0o600);
-    let target = h.project_root.join("dotfile");
+    let target = h.home_root.join("dotfile");
     std::fs::rename(h.user_config(), &target).unwrap();
     h.symlink_user_config(&target);
     assert!(stderr_of(&h.launch_default("shell")).contains(CONFIG_MARKER));
@@ -8490,7 +8501,7 @@ fn native_row_oracles_are_rendered_diagnostics() {
             h.write_user_mode(PN_HOST, 0o600);
         }
         if row == "PN4B" {
-            let target = h.project_root.join("dotfile");
+            let target = h.home_root.join("dotfile");
             std::fs::rename(h.user_config(), &target).unwrap();
             h.symlink_user_config(&target);
         }

@@ -48,13 +48,13 @@ enum Op {
     },
 }
 
-pub fn run(args: Args) -> Result<()> {
-    #[allow(clippy::disallowed_methods)] // one capture per command: every consumer borrows it.
-    let project = ProjectDir::capture()?;
+pub fn run(args: Args, project: Result<ProjectDir>) -> Result<()> {
+    // `main`'s one capture (ADR-0073 D5): a second read could name a second
+    // project, and the clipboard file belongs to the first.
+    let project = project?;
     let session = ProjectSession::for_project(&project)?;
-    // Clipboard runs inside the guest, with the project config present but no
-    // launch catalog in hand; the compiled-in link list is enough for the state
-    // dirs it needs.
+    // Clipboard runs inside the guest with no launch catalog in hand; the
+    // compiled-in link list is enough for the state dirs it needs.
     session.ensure_dirs(&crate::guest_home::links(&[]))?;
     let path = clipboard_path(&session);
 

@@ -138,7 +138,10 @@ impl Harness {
     }
 
     fn write_project_config(&self, text: &str) {
-        write(&self.project.path().join(".agent-vm/config.toml"), text);
+        write(
+            &support::project_config_path(&self.home, self.project.path()),
+            text,
+        );
     }
 }
 
