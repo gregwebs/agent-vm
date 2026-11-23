@@ -27,13 +27,14 @@ use serde_json::Value;
 use crate::egress_probe::run_command_bounded;
 
 /// The environment every case row must carry, before declared extras.
-const BASE_ENV: [&str; 6] = [
+const BASE_ENV: [&str; 7] = [
     "HOME",
     "XDG_CONFIG_HOME",
     "AGENT_VM_STATE_DIR",
     "PATH",
     "TERM",
     "AGENT_VM_SHARE_MSB_CACHE",
+    "AGENT_VM_NO_NOTIFICATIONS",
 ];
 
 /// The guest cases the plan must contain, in this module's own words.

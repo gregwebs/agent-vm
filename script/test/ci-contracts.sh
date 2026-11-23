@@ -148,6 +148,7 @@ syntax_check=(
     script/test/msb-krun-compat-contract.sh
     script/build/macos.sh
     script/test/build-workflow.sh
+    script/test/notifier-contract.sh
     script/test/keychain-contract.sh
     script/test/single-binary-contract.sh
     script/test/cpu-commitment-native.sh
@@ -217,6 +218,7 @@ shellcheck_files=(
     script/test/msb-krun-compat-contract.sh
     script/build/macos.sh
     script/test/build-workflow.sh
+    script/test/notifier-contract.sh
     script/test/keychain-contract.sh
     script/test/single-binary-contract.sh
     script/test/cpu-commitment-native.sh
@@ -303,6 +305,10 @@ assert_listed 'shellcheck' 'script/test/no-host-python-test.sh' "${shellcheck_fi
 # the opt-in `--ignored` test that spends the real `/usr/bin/security`.
 assert_listed 'bash -n' 'script/test/keychain-contract.sh' "${syntax_check[@]}"
 assert_listed 'shellcheck' 'script/test/keychain-contract.sh' "${shellcheck_files[@]}"
+# The notifier contract compiles, signs and executes the real helper on macOS,
+# so it is a gate nothing else reaches: keep it parseable and linted.
+assert_listed 'bash -n' 'script/test/notifier-contract.sh' "${syntax_check[@]}"
+assert_listed 'shellcheck' 'script/test/notifier-contract.sh' "${shellcheck_files[@]}"
 assert_listed 'bash -n' 'script/test/persisted-network-live.sh' "${syntax_check[@]}"
 assert_listed 'shellcheck' 'script/test/persisted-network-live.sh' "${shellcheck_files[@]}"
 assert_listed 'bash -n' 'script/test/persisted-network-contract.sh' "${syntax_check[@]}"

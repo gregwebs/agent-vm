@@ -696,6 +696,7 @@ fn the_plan_and_the_recorder_agree() -> Result<(), String> {
             "PATH",
             "TERM",
             "AGENT_VM_SHARE_MSB_CACHE",
+            "AGENT_VM_NO_NOTIFICATIONS",
         ]);
         for (case, command) in cases::CASES.iter().zip(&commands) {
             let names: BTreeSet<&str> = command.env.iter().map(|(name, _)| name.as_str()).collect();

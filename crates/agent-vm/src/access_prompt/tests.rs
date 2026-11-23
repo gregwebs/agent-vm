@@ -147,6 +147,8 @@ fn feed() -> (Feed, tempfile::TempDir) {
             allowances,
             session: session(),
             hint: Arc::new(crate::refusal::feed::Hint::new()),
+            notifications_off: Arc::new(crate::refusal::feed::Hint::notifications_off()),
+            signals: None,
         },
         root,
     )
@@ -182,7 +184,9 @@ fn refusal() -> crate::refusal::RefusalEntry {
 fn a_grantable_unanswered_refusal_becomes_a_candidate() {
     let (feed, _root) = feed();
     let entry = refusal();
-    let candidate = candidate_for(&entry, &feed.allowances).expect("a candidate");
+    let CandidateOutcome::Offer(candidate) = candidate_for(&entry, &feed.allowances) else {
+        panic!("a grantable, unanswered refusal is a candidate");
+    };
     assert_eq!(candidate.entry_id, "46d712fd");
     assert_eq!(
         candidate.destination.to_string(),
@@ -204,7 +208,10 @@ fn a_grantable_unanswered_refusal_becomes_a_candidate() {
     ] {
         let mut entry = refusal();
         mutate(&mut entry);
-        assert!(candidate_for(&entry, &feed.allowances).is_none());
+        assert!(matches!(
+            candidate_for(&entry, &feed.allowances),
+            CandidateOutcome::NotGrantable
+        ));
     }
 }
 
@@ -214,7 +221,10 @@ async fn an_answered_destination_is_never_a_candidate() {
     let entry = refusal();
     let destination = crate::allowances::grantable_destination(&entry).expect("grantable");
     assert!(!feed.allowances.answered(&destination));
-    assert!(candidate_for(&entry, &feed.allowances).is_some());
+    assert!(matches!(
+        candidate_for(&entry, &feed.allowances),
+        CandidateOutcome::Offer(_)
+    ));
     // An answer given elsewhere under the handler's own lock.
     let grant = feed
         .allowances
@@ -329,4 +339,177 @@ fn the_prompt_starts_idle() {
     // No crash on an ended input, and no further prompt.
     prompt.input_ended(now);
     assert_eq!(prompt.relay.phase_name(), "idle");
+}
+
+/// A feed whose live refusals already hold `entries`: what the prompt sees when it
+/// subscribes to a session that refused something before it started (R6).
+fn feed_with(entries: Vec<crate::refusal::RefusalEntry>) -> (Feed, tempfile::TempDir) {
+    let (feed, root) = feed();
+    let mut snapshot = crate::refusal::SessionSnapshot::new(crate::refusal::SessionInfo {
+        id: session(),
+        pid: 1,
+        started_ms: 0,
+        socket: true,
+    });
+    snapshot.entries = entries;
+    let refusals =
+        crate::refusal::feed::LiveRefusals::new(crate::refusal::SessionRefusals::resume(snapshot));
+    (Feed { refusals, ..feed }, root)
+}
+
+#[test]
+fn every_snapshot_entry_is_baselined_when_the_prompt_starts() {
+    // B1: the baseline is every entry the prompt will never ask about, not only the
+    // ones it could ask about. Without it, a refusal that predates the subscription
+    // (a retry of an old entry) posted a banner for an attempt nobody could answer.
+    let mut entry = refusal();
+    entry.count = 4;
+    let (feed, _root) = feed_with(vec![entry]);
+    let mut prompt = Prompt::start(feed, Size { rows: 30, cols: 80 }, relay::Timings::default());
+    let signals = prompt.relay.drain_signals();
+    assert_eq!(signals.len(), 1, "{signals:?}");
+    match &signals[0] {
+        crate::notify::PromptSignal::Baselined {
+            entry_id, count, ..
+        } => {
+            assert_eq!(entry_id, "46d712fd");
+            assert_eq!(*count, 4);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_ungrantable_refusal_is_declined_and_an_answered_one_is_answered() {
+    // B3: the two outcomes must not read alike. Calling an already-granted
+    // destination "declined" told the operator the prompt could not ask when in fact
+    // the session had already said yes.
+    let (feed, _root) = feed();
+    let mut prompt = Prompt::start(feed, Size { rows: 30, cols: 80 }, relay::Timings::default());
+    let now = Instant::now();
+    let mut locked = refusal();
+    locked.key.kind = crate::refusal::Kind::PolicyLock;
+    prompt.handle_feed(
+        FeedEvent::Refusal(Ok(Update {
+            rev: 1,
+            entry: Some(Box::new(locked)),
+            suppressed: 0,
+            lost: 0,
+            gap: false,
+        })),
+        now,
+    );
+    let signals = prompt.relay.drain_signals();
+    assert!(
+        matches!(
+            &signals[..],
+            [crate::notify::PromptSignal::Declined { entry_id, count, .. }]
+                if entry_id == "46d712fd" && *count == 1
+        ),
+        "{signals:?}"
+    );
+
+    // The same refusal, one attempt later and now answered under the handler's own
+    // lock: R6's baseline is per count, so this is a new attempt.
+    let mut entry = refusal();
+    entry.count = 2;
+    let destination = crate::allowances::grantable_destination(&entry).expect("grantable");
+    let refusals = Arc::clone(&prompt.feed.refusals);
+    prompt
+        .feed
+        .allowances
+        .grant(
+            &refusals,
+            None,
+            Some(&destination.to_string()),
+            crate::allowances::GrantScope::Session,
+            0,
+        )
+        .await;
+    prompt.handle_feed(
+        FeedEvent::Refusal(Ok(Update {
+            rev: 2,
+            entry: Some(Box::new(entry)),
+            suppressed: 0,
+            lost: 0,
+            gap: false,
+        })),
+        now,
+    );
+    let signals = prompt.relay.drain_signals();
+    assert!(
+        matches!(
+            &signals[..],
+            [crate::notify::PromptSignal::AlreadyAnswered { entry_id, count, .. }]
+                if entry_id == "46d712fd" && *count == 2
+        ),
+        "{signals:?}"
+    );
+}
+
+#[test]
+fn the_prompt_hands_its_signals_to_the_notifier_and_drops_them_without_one() {
+    // B1–B3 with R12: the drain is the one place a signal leaves the prompt's loop,
+    // the send never waits, and a launch with no notifier drops them without a word.
+    let (sink, mut received) = crate::notify::SignalSink::for_tests();
+    let (mut feed, _root) = feed();
+    feed.signals = Some(sink);
+    let mut prompt = Prompt::start(feed, Size { rows: 30, cols: 80 }, relay::Timings::default());
+    let now = Instant::now();
+    prompt.handle_feed(
+        FeedEvent::Refusal(Ok(Update {
+            rev: 1,
+            entry: Some(Box::new(refusal())),
+            suppressed: 0,
+            lost: 0,
+            gap: false,
+        })),
+        now,
+    );
+    // What the pump does before every wait.
+    prompt.drain_signals();
+    let mut seen = Vec::new();
+    while let Ok(signal) = received.try_recv() {
+        seen.push(signal);
+    }
+    assert!(
+        matches!(
+            &seen[..],
+            [
+                crate::notify::PromptSignal::Queued { .. },
+                crate::notify::PromptSignal::Cutting { .. }
+            ]
+        ),
+        "{seen:?}"
+    );
+    // A second drain has nothing left: the vector is taken, not copied.
+    prompt.drain_signals();
+    assert!(received.try_recv().is_err());
+}
+
+#[test]
+fn a_launch_with_no_notifier_still_releases_its_signals() {
+    // F3: `signals: None` is every launch that must not notify — macOS opt-out,
+    // Linux, SSH, root, a missing helper. Returning before the relay's vector is
+    // taken kept every transition of the whole session in memory, unread.
+    let (feed, _root) = feed();
+    assert!(feed.signals.is_none(), "this launch has no notifier");
+    let mut prompt = Prompt::start(feed, Size { rows: 30, cols: 80 }, relay::Timings::default());
+    let now = Instant::now();
+    prompt.handle_feed(
+        FeedEvent::Refusal(Ok(Update {
+            rev: 1,
+            entry: Some(Box::new(refusal())),
+            suppressed: 0,
+            lost: 0,
+            gap: false,
+        })),
+        now,
+    );
+    // What the pump does before every wait.
+    prompt.drain_signals();
+    assert!(
+        prompt.relay.drain_signals().is_empty(),
+        "the relay's vector is taken even when nothing is listening"
+    );
 }

@@ -189,6 +189,10 @@ impl LiveRefusals {
 /// would let a refusal first read at teardown print a second line.
 pub(crate) struct Hint {
     fired: AtomicBool,
+    /// The line this hint carries. ADR-0064's refusal hint is [`HINT`]; the
+    /// notifications-off line is [`crate::notify::NOTIFICATIONS_OFF`] and is
+    /// delivered by exactly the same machinery (#501 slice 4 R6).
+    line: &'static str,
     /// Where the line goes. Production is stderr; a test captures it, so the
     /// once-ness can be counted rather than inferred from a flag.
     sink: HintSink,
@@ -244,13 +248,25 @@ pub(crate) struct HintRelay {
 }
 
 impl HintRelay {
-    /// Today's bytes for a terminal: `\r`, the line, `\r\n`. Written by the
-    /// relay's own writer, so it can never land inside a guest or prompt sequence.
-    pub(crate) const BYTES: &'static [u8] = {
-        // `HINT` is ASCII, so its length is its byte count.
-        const _: () = assert!(HINT.is_ascii());
-        b"\r==> The sandbox refused a guest network request; run `agent-vm access` to see refusals (shown once per session)\r\n"
-    };
+    /// Today's bytes for a terminal: `\r`, this hint's line, `\r\n`.
+    ///
+    /// Instance-specific, not one fixed frame: two hints share this seam
+    /// (#501 slice 4 R6), and framing the refusal line for the notifications-off
+    /// one printed the wrong sentence (Phase 3's F7). Written by the relay's own
+    /// writer, so it can never land inside a guest or prompt sequence.
+    pub(crate) fn bytes(&self) -> Vec<u8> {
+        let line = self.line();
+        let mut bytes = Vec::with_capacity(line.len() + 3);
+        bytes.push(b'\r');
+        bytes.extend_from_slice(line.as_bytes());
+        bytes.extend_from_slice(b"\r\n");
+        bytes
+    }
+
+    /// The line this route delivers.
+    pub(crate) fn line(&self) -> &'static str {
+        self.hint.line
+    }
 
     /// Resolves once, when the hint fires to this relay. Cancel-safe: the flag is
     /// checked before every wait, so a missed wakeup only costs one poll.
@@ -270,8 +286,8 @@ impl HintRelay {
         }
     }
 
-    /// Take the hint if it is owed and not yet written: `true` means `BYTES` must
-    /// be written exactly once.
+    /// Take the hint if it is owed and not yet written: `true` means [`Self::bytes`]
+    /// must be written exactly once.
     pub(crate) fn take(&self) -> bool {
         self.relay.fired.load(Ordering::SeqCst) && !self.relay.written.swap(true, Ordering::SeqCst)
     }
@@ -316,21 +332,53 @@ impl Default for Hint {
 }
 
 impl Hint {
-    pub(crate) fn new() -> Self {
+    fn with_line(line: &'static str) -> Self {
+        // The terminal framing below (`\r{line}\r\n`) assumes one byte per char.
+        // Both lines are constants in this crate; `notify::tests::
+        // the_notifications_off_line_is_terminal_safe` pins the second one.
+        assert!(line.is_ascii(), "a hint line must be ASCII");
         Self {
             fired: AtomicBool::new(false),
+            line,
             sink: HintSink::Stderr,
             relay: Mutex::new(None),
         }
     }
 
+    pub(crate) fn new() -> Self {
+        Self::with_line(HINT)
+    }
+
+    /// The session's second hint: macOS notifications are off (#501 slice 4 R6).
+    ///
+    /// A separate `Hint` rather than a second line on this one: the two lines are
+    /// independent facts (a refusal was filed, notifications cannot show it), and
+    /// answering a question claims the refusal hint only.
+    ///
+    /// `LiveSession` builds it, and the driver fires it.
+    pub(crate) fn notifications_off() -> Self {
+        Self::with_line(crate::notify::NOTIFICATIONS_OFF)
+    }
+
     /// A hint that records what it would have printed.
     #[cfg(test)]
     pub(crate) fn capture() -> (Self, Arc<Mutex<Vec<String>>>) {
+        Self::capture_line(HINT)
+    }
+
+    /// The same, for the notifications-off line.
+    #[cfg(test)]
+    pub(crate) fn capture_notifications_off() -> (Self, Arc<Mutex<Vec<String>>>) {
+        Self::capture_line(crate::notify::NOTIFICATIONS_OFF)
+    }
+
+    #[cfg(test)]
+    fn capture_line(line: &'static str) -> (Self, Arc<Mutex<Vec<String>>>) {
         let lines = Arc::new(Mutex::new(Vec::new()));
         (
             Self {
                 fired: AtomicBool::new(false),
+                line,
                 sink: HintSink::Capture(Arc::clone(&lines)),
                 relay: Mutex::new(None),
             },
@@ -363,7 +411,11 @@ impl Hint {
     ///
     /// The route lock is taken before the once-flag, so a hint firing while
     /// `redirect` runs is either routed or printed, never both and never neither.
-    fn fire(&self) {
+    ///
+    /// `pub(crate)` so the notification driver can fire the session's
+    /// notifications-off hint (#501 slice 4 R6); the once-flag is the only gate,
+    /// so repeated denials are already no-ops.
+    pub(crate) fn fire(&self) {
         let route = self
             .relay
             .lock()
@@ -377,12 +429,12 @@ impl Hint {
         }
         drop(route);
         match &self.sink {
-            HintSink::Stderr => write_hint_to_stderr(),
+            HintSink::Stderr => write_hint_to_stderr(self.line),
             #[cfg(test)]
             HintSink::Capture(lines) => lines
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(HINT.to_owned()),
+                .push(self.line.to_owned()),
         }
     }
 
@@ -398,18 +450,22 @@ impl Hint {
     }
 }
 
-/// The hint, on stderr, in today's bytes.
+/// One hint line on stderr, in today's framing.
 ///
-/// One function for both stderr paths: the ordinary one and the epilogue's, when a
-/// redirected hint was still owed at session end. Framed on a terminal so a line
-/// the guest is mid-way through cannot swallow it.
-pub(crate) fn write_hint_to_stderr() {
-    let line = if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
-        format!("\r{HINT}\r")
+/// One function for every stderr path: the ordinary one, and the epilogue's, when a
+/// redirected hint was still owed at session end. Framed on a terminal so a line the
+/// guest is mid-way through cannot swallow it.
+///
+/// The line is a `&'static str` chosen in this module or in [`crate::notify`];
+/// `notify::tests::the_notifications_off_line_is_terminal_safe` asserts the
+/// property the framing relies on.
+pub(crate) fn write_hint_to_stderr(line: &str) {
+    let text = if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        format!("\r{line}\r")
     } else {
-        HINT.to_owned()
+        line.to_owned()
     };
-    drop(crate::launch_notice::LaunchNotices::to_stderr().emit_detached(line));
+    drop(crate::launch_notice::LaunchNotices::to_stderr().emit_detached(text));
 }
 
 /// The following stream's options: the refusal log source, from the start, live.
@@ -734,6 +790,10 @@ struct SlotState {
     final_offered: bool,
     /// Set when the final snapshot has been written (or failed).
     finished: bool,
+    /// Whether the final snapshot reached the disk. Only a persisted record may be
+    /// followed by a final banner (R9, B5), so `FinalWait::wait` reports this
+    /// rather than a bare "the writer is done".
+    final_ok: bool,
     /// Test-only: the writer takes no job while this is set, so a test can put
     /// a job in the slot and know it is still there when `Drop` runs. See
     /// [`PersistHandle::hold_writer`].
@@ -768,6 +828,7 @@ impl Persister {
                 stopping: false,
                 final_offered: false,
                 finished: false,
+                final_ok: false,
                 #[cfg(test)]
                 holding: false,
                 #[cfg(test)]
@@ -926,14 +987,19 @@ pub(crate) struct FinalWait {
 }
 
 impl FinalWait {
-    /// Wait at most `limit`; `true` when the final write finished.
-    pub(crate) fn wait(self, limit: Duration) -> bool {
+    /// Wait at most `limit` for the final write.
+    ///
+    /// `TimedOut` when the write did not finish in time, `Persisted` when the final
+    /// snapshot reached the disk, and `Failed` when the writer gave up trying. The
+    /// notifier's teardown acts on the difference (B5): a banner claiming
+    /// durability must not follow a record that is not there.
+    pub(crate) fn wait(self, limit: Duration) -> crate::notify::FinalWriteStatus {
         let deadline = std::time::Instant::now() + limit;
         let mut state = self.slot.state.lock().unwrap_or_else(|p| p.into_inner());
         while !state.finished {
             let now = std::time::Instant::now();
             if now >= deadline {
-                return false;
+                return crate::notify::FinalWriteStatus::TimedOut;
             }
             let (next, timeout) = self
                 .slot
@@ -942,10 +1008,14 @@ impl FinalWait {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             state = next;
             if timeout.timed_out() && !state.finished {
-                return false;
+                return crate::notify::FinalWriteStatus::TimedOut;
             }
         }
-        true
+        if state.final_ok {
+            crate::notify::FinalWriteStatus::Persisted
+        } else {
+            crate::notify::FinalWriteStatus::Failed
+        }
     }
 }
 
@@ -958,6 +1028,8 @@ fn write_loop(slot: &Slot, dir: &SessionsDir) {
     // one broken log into a notice storm. Said once, and said again only after a
     // write has succeeded, so the message means "since the last good write".
     let mut write_failing = false;
+    // Whether this thread's last write landed, for the final record's status.
+    let mut final_ok = false;
     loop {
         let job = {
             let mut state = slot.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -996,6 +1068,7 @@ fn write_loop(slot: &Slot, dir: &SessionsDir) {
         if !skip {
             match dir.write(&snapshot, now_ms()) {
                 Ok(report) => {
+                    final_ok = true;
                     if write_failing {
                         write_failing = false;
                         tracing::info!("the refusal log is writable again");
@@ -1020,6 +1093,7 @@ fn write_loop(slot: &Slot, dir: &SessionsDir) {
                 // (AC14); this message is the whole of what says so, so it has to
                 // be actionable and it has to be said once.
                 Err(error) => {
+                    final_ok = false;
                     if !write_failing {
                         write_failing = true;
                         tracing::warn!(
@@ -1038,6 +1112,7 @@ fn write_loop(slot: &Slot, dir: &SessionsDir) {
         if final_job {
             let mut state = slot.state.lock().unwrap_or_else(|p| p.into_inner());
             state.finished = true;
+            state.final_ok = final_ok;
             drop(state);
             slot.wake.notify_all();
             return;

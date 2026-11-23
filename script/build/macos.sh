@@ -127,6 +127,34 @@ preflight() {
     }
 }
 
+# `swiftc` is needed by the bundle builds only (S5). `--single-binary` embeds a
+# runtime and publishes no helper, so it must not need Xcode's Swift frontend.
+preflight_bundle() {
+    command -v swiftc >/dev/null 2>&1 || {
+        echo "error: required tool 'swiftc' was not found on PATH" >&2
+        echo "The bundle builds compile the notification helper; install the Xcode Command Line Tools with 'xcode-select --install'." >&2
+        exit 1
+    }
+}
+
+# `[workspace.package] version` from Cargo.toml. Read by hand because the only
+# consumer is one plist string, and this runs before any Rust tool is needed.
+workspace_version() {
+    local line
+
+    while IFS= read -r line; do
+        case "$line" in
+            'version = "'*'"')
+                line="${line#version = \"}"
+                printf '%s\n' "${line%\"}"
+                return 0
+                ;;
+        esac
+    done <Cargo.toml
+    echo "error: Cargo.toml has no workspace version line to stamp the notification helper with" >&2
+    return 1
+}
+
 # This mirrors the pinned vendor/microsandbox macOS build-agentd and
 # build-msb recipes. Re-check the sequence whenever the submodule pin changes.
 build_agentd() (
@@ -537,6 +565,204 @@ verify_msb() {
     fi
 }
 
+NOTIFIER_APP_NAME=AgentVMNotifier
+NOTIFIER_BUNDLE_ID=dev.agent-vm.notifier
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+
+# Compile the Swift helper and stamp its version into a staged `.app`.
+#
+# Nothing here is published. `codesign --identifier` is passed explicitly so the
+# ad-hoc signature carries the same identity on every rebuild; without it each
+# build looks like a new app and macOS would re-ask for notification permission.
+build_and_sign_notifier() {
+    local staged_app="$1" version="$2" contents="$1/Contents" template
+
+    rm -rf "$staged_app"
+    mkdir -p "$contents/MacOS"
+    # macOS 12 is the floor because `interruptionLevel` (passive vs banner) is
+    # 12.0. The language mode is pinned so a future compiler default cannot change
+    # the concurrency rules under this file.
+    swiftc -swift-version 5 -O -target arm64-apple-macosx12.0 \
+        -o "$contents/MacOS/$NOTIFIER_APP_NAME" macos/notifier/Notifier.swift
+    template="$(cat macos/notifier/Info.plist.in)"
+    printf '%s\n' "${template//__AGENT_VM_VERSION__/$version}" >"$contents/Info.plist"
+    codesign --force --sign - --identifier "$NOTIFIER_BUNDLE_ID" "$staged_app"
+}
+
+# Everything a headless runner can prove about the helper: a readable plist, one
+# architecture, a signature that verifies, and a binary that runs from the path
+# it was staged at.
+verify_notifier() {
+    local staged_app="$1" version="$2" binary="$1/Contents/MacOS/$NOTIFIER_APP_NAME" reported
+
+    plutil -lint "$staged_app/Contents/Info.plist" >/dev/null || {
+        echo "error: $staged_app/Contents/Info.plist is not a valid property list" >&2
+        exit 1
+    }
+    verify_arm64_only "$binary"
+    codesign --verify --deep --strict "$staged_app" || {
+        echo "error: $staged_app does not have a valid code signature" >&2
+        exit 1
+    }
+    reported="$("$binary" --version)" || {
+        echo "error: staged $NOTIFIER_APP_NAME failed to run with --version" >&2
+        exit 1
+    }
+    if [[ "$reported" != "agent-vm-notifier $version" ]]; then
+        echo "error: staged $NOTIFIER_APP_NAME reports '$reported'; expected 'agent-vm-notifier $version'" >&2
+        exit 1
+    fi
+}
+
+# Replace `$2` with `$1` as one rename, without following a symlink at `$2`.
+# BSD `mv` needs `-h` and rejects `-T`; GNU `mv` is the other way round, and
+# rejects the flag before it moves anything, so the fallback is safe to try.
+#
+# A swap that fails is a failed publish and the caller must see it: exiting 0 here
+# would leave the old helper linked while claiming a new one.
+atomic_replace_symlink() {
+    local source="$1" target="$2"
+
+    if mv -f -h "$source" "$target" 2>/dev/null; then
+        return 0
+    fi
+    if ! mv -f -T "$source" "$target"; then
+        echo "error: could not swap $target onto the validated helper app at $source; the previously published helper is still in place" >&2
+        return 1
+    fi
+}
+
+# The next unused generation number, so a published generation is never reused
+# by a concurrent build of the same bundle.
+next_notifier_generation() {
+    local lib="$1/lib" path name gen=0
+
+    for path in "$lib"/.AgentVMNotifier.gen-*.app; do
+        [[ -e "$path" ]] || continue
+        name="${path##*/.AgentVMNotifier.gen-}"
+        name="${name%.app}"
+        if [[ "$name" =~ ^[0-9]+$ ]] && ((name > gen)); then gen="$name"; fi
+    done
+    gen=$((gen + 1))
+    while [[ -e "$lib/.AgentVMNotifier.gen-$gen.app" ]]; do gen=$((gen + 1)); done
+    printf '%s\n' "$gen"
+}
+
+# Post-commit registration. A failure warns rather than fails: the files are
+# already published, and the next lookup self-heals a generation that is not
+# registered (an unregistered record disappears from LaunchServices).
+register_notifier_app() {
+    local app="$1" lsregister="${AGENT_VM_BUILD_LSREGISTER:-$LSREGISTER}"
+
+    if ! "$lsregister" -f "$app"; then
+        echo "warning: could not register $app with LaunchServices (via $lsregister); a click may launch an older copy until the next build registers" >&2
+    fi
+}
+
+# How long a build waits for another build of the same bundle, in tenths of a
+# second. `AGENT_VM_BUILD_LOCK_SECONDS` exists so a test can prove the wait gives
+# up without spending a minute doing it.
+notifier_lock_wait_tenths() {
+    local seconds="${AGENT_VM_BUILD_LOCK_SECONDS:-60}"
+
+    case "$seconds" in
+        '' | *[!0-9]*) seconds=60 ;;
+    esac
+    printf '%s\n' $((seconds * 10))
+}
+
+# Take the publication lock for one bundle's `lib/`.
+#
+# `mkdir` is the whole mechanism: atomic on BSD and GNU, no new tool, and a lock
+# is never named like a generation, so generation selection cannot pick it. The
+# holder's PID is recorded so a build that died holding the lock can be told from
+# one that is still working.
+acquire_notifier_lock() {
+    local lock="$1" holder total remaining stale_cleared=false
+
+    total="$(notifier_lock_wait_tenths)"
+    remaining="$total"
+    while true; do
+        if mkdir "$lock" 2>/dev/null; then
+            if ! printf '%s\n' "$$" >"$lock/pid" 2>/dev/null; then
+                echo "error: lost the notification helper publication lock at $lock while taking it" >&2
+                return 1
+            fi
+            return 0
+        fi
+        if [[ ! -d "$lock" ]]; then
+            echo "error: could not create the notification helper publication lock at $lock" >&2
+            return 1
+        fi
+        holder="$(cat "$lock/pid" 2>/dev/null || true)"
+        if [[ -z "$holder" ]] || ! kill -0 "$holder" 2>/dev/null; then
+            # A build that died holding it. Clear it once and retry; a second
+            # failure is not a race this can resolve.
+            if [[ "$stale_cleared" == true ]]; then
+                echo "error: the notification helper publication lock at $lock is stale and could not be cleared" >&2
+                return 1
+            fi
+            rm -rf "$lock"
+            stale_cleared=true
+            continue
+        fi
+        if ((remaining <= 0)); then
+            echo "error: another agent-vm build (pid $holder) is publishing the notification helper; gave up after $((total / 10)) s waiting for the lock at $lock" >&2
+            return 1
+        fi
+        sleep 0.5
+        remaining=$((remaining - 5))
+    done
+}
+
+# Move every generation but the active one out of `lib/`, and print the directory
+# they were moved to.
+#
+# Retirement is a rename, never a `rm`: a generation is either in place or in the
+# retired directory, so it can never be missing while still registered — and it
+# happens BEFORE the registration, because Phase 0 measured that LaunchServices
+# launches the older of two registered copies.
+retire_notifier_generations() {
+    local bundle_dir="$1" active="$2" path
+    local retired="$bundle_dir/lib/.AgentVMNotifier.retired.$$"
+
+    mkdir -p "$retired"
+    for path in "$bundle_dir/lib"/.AgentVMNotifier.gen-*.app; do
+        [[ -e "$path" ]] || continue
+        if [[ "${path##*/}" == ".AgentVMNotifier.gen-$active.app" ]]; then continue; fi
+        if ! mv -f "$path" "$retired/"; then
+            restore_retired_generations "$bundle_dir" "$retired"
+            echo "error: could not retire the notification helper generation $path, so nothing was registered and the published $NOTIFIER_APP_NAME.app is unchanged" >&2
+            return 1
+        fi
+    done
+    printf '%s\n' "$retired"
+}
+
+# Put retired generations back where they were and drop the retired directory.
+restore_retired_generations() {
+    local bundle_dir="$1" retired="$2" moved
+
+    for moved in "$retired"/*; do
+        [[ -e "$moved" ]] || continue
+        mv -f "$moved" "$bundle_dir/lib/${moved##*/}"
+    done
+    rm -rf "$retired"
+}
+
+# Put a pre-generation bundle back at the published path.
+#
+# That layout has a real directory where the symlink goes, and `mv` would move a
+# generation *into* it rather than over it, so the commit renames it aside first.
+# Restoring it on failure is what makes the swap's error message true in both
+# layouts: "the previously published helper is still in place".
+restore_notifier_legacy() {
+    local published="$1" backup="$2"
+
+    [[ -n "$backup" ]] || return 0
+    mv -f "$backup" "$published"
+}
+
 publish_bundle() {
     local dev="$1" bundle_dir=target/macos agent_vm_src=target/release/agent-vm
     local msb_src="vendor/microsandbox/build/msb"
@@ -551,13 +777,29 @@ publish_bundle() {
     local staged_msb="$bundle_dir/bin/.msb.next"
     local staged_firmware="$bundle_dir/lib/.libkrunfw.5.dylib.next"
     local entitlements="$bundle_dir/.msb-entitlements.plist"
-    local agent_vm_version msb_version
+    # Per-PID: two builds of the same bundle must not share a stage, and the trap
+    # below removes whatever the commit did not publish.
+    local staged_notifier="$bundle_dir/lib/.AgentVMNotifier.stage.$$"
+    local staged_link="$bundle_dir/lib/.AgentVMNotifier.link.$$"
+    local published_notifier="$bundle_dir/lib/AgentVMNotifier.app"
+    # Selection, move, swap, retirement and registration are one critical section,
+    # so these live here: the lock, the pre-generation backup, and the retired
+    # generation directory.
+    local notifier_lock="$bundle_dir/lib/.AgentVMNotifier.publish.lock"
+    local lock_held=false legacy_backup='' retired=''
+    local version gen active_gen agent_vm_version msb_version
 
     mkdir -p "$bundle_dir/bin" "$bundle_dir/lib"
     # Invoked indirectly by the trap below.
     # shellcheck disable=SC2317,SC2329
     cleanup_staging() {
-        rm -f "$staged_agent_vm" "$staged_msb" "$staged_firmware" "$entitlements"
+        rm -rf "$staged_agent_vm" "$staged_msb" "$staged_firmware" "$entitlements" \
+            "$staged_notifier" "$staged_link"
+        # A swap that did not commit must not take the previous bundle with it.
+        restore_notifier_legacy "$published_notifier" "$legacy_backup"
+        if [[ "$lock_held" == true ]]; then
+            rm -rf "$notifier_lock"
+        fi
     }
     trap cleanup_staging EXIT
 
@@ -579,10 +821,64 @@ publish_bundle() {
         echo "error: staged msb failed to run with --version" >&2
         exit 1
     }
+    # The helper is built and verified here, before any published file moves, so
+    # a helper that fails verification leaves the previous bundle as it was.
+    version="$(workspace_version)"
+    build_and_sign_notifier "$staged_notifier" "$version"
+    verify_notifier "$staged_notifier" "$version"
+
+    # From here to the registration this commit is a critical section: two builds
+    # of the same bundle would both scan for a free generation and pick the same
+    # one, and one could swap onto a generation the other had just retired. Taken
+    # before the runtime files move, so a refused build publishes nothing at all.
+    if ! acquire_notifier_lock "$notifier_lock"; then
+        exit 1
+    fi
+    lock_held=true
+    # Leftovers of a build killed mid-commit. They only ever hold generations that
+    # build had already replaced or retired, and we hold the lock, so no running
+    # build owns one.
+    rm -rf "$bundle_dir/lib"/.AgentVMNotifier.retired.* "$bundle_dir/lib"/.AgentVMNotifier.legacy.*
 
     mv -f "$staged_agent_vm" "$bundle_dir/bin/agent-vm"
     mv -f "$staged_msb" "$bundle_dir/bin/msb"
     mv -f "$staged_firmware" "$bundle_dir/lib/libkrunfw.5.dylib"
+
+    gen="$(next_notifier_generation "$bundle_dir")"
+    active_gen="$bundle_dir/lib/.AgentVMNotifier.gen-$gen.app"
+    mv -f "$staged_notifier" "$active_gen"
+    ln -s ".AgentVMNotifier.gen-$gen.app" "$staged_link"
+    # A bundle published before generations has a real directory at this path, and
+    # `mv` would move the generation *into* it instead of over it. Rename it aside
+    # first, so a failed swap can put it back.
+    if [[ -e "$published_notifier" && ! -L "$published_notifier" ]]; then
+        legacy_backup="$bundle_dir/lib/.AgentVMNotifier.legacy.$$"
+        mv -f "$published_notifier" "$legacy_backup"
+    fi
+    if ! atomic_replace_symlink "$staged_link" "$published_notifier"; then
+        restore_notifier_legacy "$published_notifier" "$legacy_backup"
+        legacy_backup=''
+        exit 1
+    fi
+    if [[ -n "$legacy_backup" ]]; then
+        rm -rf "$legacy_backup"
+        legacy_backup=''
+    fi
+    # The commit's central invariant. If the published path is not the generation
+    # just built, retiring on top of that could take away the generation the link
+    # resolves to, so fail before anything is registered or retired.
+    if [[ "$(readlink "$published_notifier" 2>/dev/null || true)" != ".AgentVMNotifier.gen-$gen.app" ]]; then
+        echo "error: the published $NOTIFIER_APP_NAME.app does not point at .AgentVMNotifier.gen-$gen.app after the swap, so nothing was registered or retired" >&2
+        exit 1
+    fi
+    # Older generations leave their registered paths BEFORE the registration, and
+    # are deleted only once the new one is registered.
+    retired="$(retire_notifier_generations "$bundle_dir" "$gen")"
+    register_notifier_app "$published_notifier"
+    rm -rf "$retired"
+    retired=''
+    lock_held=false
+    rm -rf "$notifier_lock"
     trap - EXIT
 
     if [[ "$dev" == true ]]; then
@@ -594,7 +890,8 @@ publish_bundle() {
     printf '  %s\n' \
         "$bundle_dir/bin/agent-vm" \
         "$bundle_dir/bin/msb" \
-        "$bundle_dir/lib/libkrunfw.5.dylib"
+        "$bundle_dir/lib/libkrunfw.5.dylib" \
+        "$published_notifier"
 }
 
 main() {
@@ -628,6 +925,9 @@ main() {
     fi
 
     preflight
+    if [[ "$single" != true ]]; then
+        preflight_bundle
+    fi
     build_microsandbox_runtime "$dev"
     require_build_outputs "$dev"
     if [[ "$single" == true ]]; then

@@ -162,6 +162,15 @@ pub(crate) enum GrantRefusalReason {
     Full {
         limit: usize,
     },
+    /// This session is ending: its teardown has begun, so nothing may change its
+    /// policy any more (#501 slice 4 B5, F1).
+    ///
+    /// The gate is taken under the operation lock, before the final record is
+    /// written, so a grant either committed *before* the record said the session
+    /// ended or is refused after it. Without it, a concurrent `access allow` could
+    /// commit into a session whose persisted record already claimed it was over, and
+    /// the next launch would read a record that never described what happened.
+    SessionEnding,
 }
 
 /// What one `grant` did.
@@ -431,6 +440,10 @@ pub(crate) struct LiveAllowances {
     /// record after such a delete. That cross-process window predates #631 and is
     /// not fixed here.
     op_lock: AsyncMutex<()>,
+    /// Set under `op_lock` when the session's teardown begins, and read under it by
+    /// every grant: the one gate that makes "no mutation commits after the final
+    /// record" true rather than likely (B5, F1).
+    ending: std::sync::atomic::AtomicBool,
     state: Mutex<State>,
     /// A wakeup only: every grant that left an allowance behind sends its
     /// canonical destination, so the prompt can drop the question it belongs to
@@ -449,6 +462,7 @@ impl LiveAllowances {
         let (answers, _) = tokio::sync::broadcast::channel(ANSWER_BUFFER);
         Arc::new(Self {
             op_lock: AsyncMutex::new(()),
+            ending: std::sync::atomic::AtomicBool::new(false),
             answers,
             state: Mutex::new(State {
                 record: ProjectRecord {
@@ -636,6 +650,12 @@ impl LiveAllowances {
     }
 
     /// Grant one destination, to this session and optionally the project.
+    ///
+    /// This is the socket's entry point, so it is where the ending gate is read
+    /// (B5, F1): a mutation arriving from *outside* after the teardown began must not
+    /// commit, or a record that says the session ended could be followed by a change
+    /// it never described. [`LiveAllowances::grant_unless_answered`] deliberately
+    /// skips it — that is the session's own answer, given while its question was up.
     pub(crate) async fn grant(
         &self,
         live_refusals: &LiveRefusals,
@@ -645,11 +665,37 @@ impl LiveAllowances {
         now_ms: i64,
     ) -> GrantResult {
         let _op = self.op_lock.lock().await;
+        if self.ending() {
+            return self.ended_refusal();
+        }
         let destination = match resolve_entry(live_refusals, id, destination) {
             Ok(entry) => entry,
             Err(reason) => return GrantResult::Refused { reason },
         };
         self.grant_locked(&destination, scope, now_ms).await
+    }
+
+    /// Close the gate: no grant may commit from here on (B5).
+    ///
+    /// Takes the operation lock, so it is ordered against a grant already in flight:
+    /// that grant either finished committing before this returns, or it is refused.
+    /// `LiveSession::finish` calls this *before* it writes the final record, which is
+    /// what makes the record and the session's own acceptances agree.
+    pub(crate) async fn end_mutations(&self) {
+        let _op = self.op_lock.lock().await;
+        self.ending.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the gate is closed. Read under `op_lock` by [`Self::grant`], the one
+    /// entry point that is gated.
+    fn ending(&self) -> bool {
+        self.ending.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn ended_refusal(&self) -> GrantResult {
+        GrantResult::Refused {
+            reason: GrantRefusalReason::SessionEnding,
+        }
     }
 
     /// The access prompt's grant (`agent-vm#501` slice 3 §4.2, R19).
@@ -659,6 +705,11 @@ impl LiveAllowances {
     /// again. That is what keeps a prompt `p` queued behind a CLI `s` from
     /// promoting it to a project record, and it needs no ordering between the two
     /// because both pass through this lock.
+    ///
+    /// Not gated by [`LiveAllowances::end_mutations`], unlike [`Self::grant`]: this
+    /// answer was given while the question was up, and R29 says a grant the operator
+    /// authorised is not cancelled by the session's end — a project record may land
+    /// late, and the session's own record never claimed it was applied.
     pub(crate) async fn grant_unless_answered(
         &self,
         live_refusals: &LiveRefusals,
@@ -1644,6 +1695,7 @@ impl GrantResult {
                     GrantRefusalReason::Full { limit } => format!(
                         "this session already holds {limit} live allowances, the most it can carry; revoke one first"
                     ),
+                    GrantRefusalReason::SessionEnding => "this session has ended, so it can no longer change its policy; relaunch it and allow the destination again".to_owned(),
                 };
                 GrantReport {
                     text: format!("refused: {}", escaped(&message)),

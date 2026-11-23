@@ -65,6 +65,26 @@ file_inode() {
     fi
 }
 
+# No staged notifier `.app`, link, retired or legacy directory, and no publication
+# lock may survive a build, whether it committed or failed: an unmatched glob stays
+# literal, so `-e`/`-L` are what decide.
+assert_lib_clean() {
+    local lib="$1" leftover
+    for leftover in "$lib"/.AgentVMNotifier.stage.* "$lib"/.AgentVMNotifier.link.* \
+        "$lib"/.AgentVMNotifier.retired.* "$lib"/.AgentVMNotifier.legacy.* \
+        "$lib"/.AgentVMNotifier.publish.lock; do
+        if [[ -e "$leftover" || -L "$leftover" ]]; then
+            fail "build left $leftover behind"
+        fi
+    done
+}
+
+# The line number of the first log line containing `$2`, or 0. Ordering between
+# two calls is the only way to pin "retire before register".
+log_index_of() {
+    printf '%s\n' "$1" | awk -v needle="$2" 'index($0, needle) { print NR; found = 1; exit } END { if (!found) print 0 }'
+}
+
 make_tool() {
     local path="$1" body="$2"
     printf '#!/bin/bash\nset -euo pipefail\n%s\n' "$body" >"$path"
@@ -77,10 +97,16 @@ make_fixture() {
     local name="$1" tool
     fixture="$TEST_ROOT/$name"
     fakebin="$TEST_ROOT/$name-bin"
-    mkdir -p "$fixture/script/build" "$fixture/vendor/microsandbox/vendor/libkrunfw" "$fakebin"
+    mkdir -p "$fixture/script/build" "$fixture/macos" "$fixture/vendor/microsandbox/vendor/libkrunfw" "$fakebin"
     cp "$REPO_ROOT/script/build/macos.sh" "$fixture/script/build/"
     chmod +x "$fixture/script/build/"*.sh
+    # The bundle build compiles and stamps these; faking `swiftc` is what keeps the
+    # test about the script's sequencing rather than about Swift.
+    cp -R "$REPO_ROOT/macos/notifier" "$fixture/macos/notifier"
     : >"$fixture/vendor/microsandbox/Cargo.toml"
+    # The bundle build stamps this version into the helper's Info.plist, so a
+    # fixture value proves the substitution rather than reading the real one.
+    printf '[workspace]\n[workspace.package]\nversion = "9.9.9"\n' >"$fixture/Cargo.toml"
     : >"$fixture/vendor/microsandbox/msb-entitlements.plist"
     : >"$fixture/vendor/microsandbox/vendor/libkrunfw/kernel.c"
     cat >"$fixture/vendor/microsandbox/vendor/libkrunfw/build_in_docker.sh" <<'SH'
@@ -90,9 +116,20 @@ printf '%s\n' 'firmware docker build' >>"$FAKE_LOG"
 SH
     chmod +x "$fixture/vendor/microsandbox/vendor/libkrunfw/build_in_docker.sh"
     ln -s /bin/bash "$fakebin/bash"
-    for tool in mkdir rm mv cp cat chmod touch awk date cmp mktemp; do
+    for tool in mkdir rm cp cat chmod touch awk date cmp mktemp ln sleep readlink; do
         ln -s "$(command -v "$tool")" "$fakebin/$tool"
     done
+    # `mv` is a wrapper rather than a symlink so one test can fault the helper's
+    # symlink swap alone: every other move still goes to the real tool.
+    real_mv="$(command -v mv)"
+    make_tool "$fakebin/mv" "
+printf 'mv %s\n' \"\$*\" >>\"\$FAKE_LOG\"
+if [[ -n \"\${FAKE_MV_FAIL_LINK:-}\" ]]; then
+    case \"\$*\" in
+        *.AgentVMNotifier.link.*) exit 1 ;;
+    esac
+fi
+exec $real_mv \"\$@\""
 
     make_tool "$fakebin/uname" '
 case "${1:-}" in
@@ -201,10 +238,49 @@ esac'
     make_tool "$fakebin/codesign" '
 printf "codesign %s\n" "$*" >>"$FAKE_LOG"
 if [[ "${1:-}" == --verify ]]; then
-    [[ "${FAKE_SIGNATURE_INVALID:-}" != 1 ]]
+    [[ "${FAKE_SIGNATURE_INVALID:-}" != 1 ]] || exit 1
+    # A path-scoped fault, so a late failure can land on the notifier stage
+    # while the runtime artifacts before it still verify.
+    if [[ -n "${FAKE_SIGNATURE_INVALID_PATH:-}" ]]; then
+        case "$*" in
+            *"$FAKE_SIGNATURE_INVALID_PATH"*) exit 1 ;;
+        esac
+    fi
 elif [[ "${1:-}" == -d ]]; then
     printf "%s\n" "<plist><dict/></plist>"
 fi'
+    # The Swift compiler is faked as a shell script that answers `--version` the
+    # way the real helper does: from the Info.plist the build script stamped. So a
+    # build that forgets the substitution fails here, not in a human's hands.
+    make_tool "$fakebin/swiftc" '
+printf "swiftc %s\n" "$*" >>"$FAKE_LOG"
+out=
+while (($#)); do
+    if [[ "$1" == -o ]]; then out="$2"; break; fi
+    shift
+done
+[[ -n "$out" ]] || exit 2
+mkdir -p "${out%/*}"
+cat >"$out" <<"BIN"
+#!/bin/bash
+if [[ "${1:-}" == --version ]]; then
+    if [[ "${FAKE_NOTIFIER_VERSION_FAIL:-}" == 1 ]]; then
+        printf "%s\n" "agent-vm-notifier 0.0.0-nope"
+        exit 0
+    fi
+    root="${0%/Contents/MacOS/AgentVMNotifier}"
+    plist="$(cat "$root/Contents/Info.plist")"
+    rest="${plist#*CFBundleShortVersionString</key>}"
+    rest="${rest#*<string>}"
+    printf "agent-vm-notifier %s\n" "${rest%%</string>*}"
+else
+    exit 40
+fi
+BIN
+chmod +x "$out"'
+    make_tool "$fakebin/lsregister" '
+printf "lsregister %s\n" "$*" >>"$FAKE_LOG"
+[[ "${FAKE_LSREGISTER_FAIL:-}" != 1 ]]'
     make_tool "$fakebin/xcode-select" '[[ "${FAKE_XCODE_MISSING:-}" != 1 ]]'
     # `file` is the only probe that distinguishes a firmware dylib from an arm64
     # executable, so it has to answer both, and to answer per path: a test can make
@@ -301,7 +377,7 @@ run_fixture_script() {
         cd "$TEST_ROOT"
         set +u
         # HOME first so a test can override it with `env HOME= ...`.
-        /usr/bin/env HOME="$FIXTURE_HOME" XDG_CACHE_HOME= "${env_args[@]}" PATH="$fakebin" \
+        /usr/bin/env HOME="$FIXTURE_HOME" XDG_CACHE_HOME= AGENT_VM_BUILD_LSREGISTER="$fakebin/lsregister" "${env_args[@]}" PATH="$fakebin" \
             FAKE_LOG="$fixture/calls.log" \
             "$fixture/$script" "${script_args[@]}"
     )
@@ -629,6 +705,250 @@ for failure in smoke entitlement arch arch-unpacked version; do
     [[ "$(cat "$fixture/target/macos-single/agent-vm")" == old-single ]]
     for staging in .agent-vm.next .smoke .msb-entitlements.plist; do [[ ! -e "$fixture/target/macos-single/$staging" ]]; done
 done
+
+# The notification helper bundle. Published as one relative symlink inside lib/
+# to a versioned generation, so the atomic part of a publish is a single rename
+# and `AgentVMNotifier.app/Contents/...` keeps resolving through it.
+make_fixture notifier
+run_build "$fixture" "$fakebin"
+notifier_lib="$fixture/target/macos/lib"
+[[ -L "$notifier_lib/AgentVMNotifier.app" ]] ||
+    fail "a default build did not publish lib/AgentVMNotifier.app as a symlink"
+[[ "$(readlink "$notifier_lib/AgentVMNotifier.app")" == ".AgentVMNotifier.gen-1.app" ]] ||
+    fail "lib/AgentVMNotifier.app points at $(readlink "$notifier_lib/AgentVMNotifier.app"), not the first generation"
+[[ -x "$notifier_lib/AgentVMNotifier.app/Contents/MacOS/AgentVMNotifier" ]] ||
+    fail "the published symlink does not resolve to an executable helper"
+assert_file_contains "$notifier_lib/AgentVMNotifier.app/Contents/Info.plist" "<string>9.9.9</string>"
+assert_file_contains "$fixture/calls.log" "swiftc -swift-version 5 -O -target arm64-apple-macosx12.0 -o target/macos/lib/.AgentVMNotifier.stage."
+assert_file_contains "$fixture/calls.log" "macos/notifier/Notifier.swift"
+assert_file_contains "$fixture/calls.log" "codesign --force --sign - --identifier dev.agent-vm.notifier target/macos/lib/.AgentVMNotifier.stage."
+assert_file_contains "$fixture/calls.log" "codesign --verify --deep --strict target/macos/lib/.AgentVMNotifier.stage."
+assert_file_contains "$fixture/calls.log" "lsregister -f target/macos/lib/AgentVMNotifier.app"
+assert_lib_clean "$notifier_lib"
+
+# A second build swaps the symlink to a new generation and retires the old one
+# without nesting it inside the bundle it replaced — and it retires that generation
+# out of its registered path BEFORE registering, so LaunchServices is never able
+# to launch the older copy.
+: >"$fixture/calls.log"
+run_build "$fixture" "$fakebin"
+[[ "$(readlink "$notifier_lib/AgentVMNotifier.app")" == ".AgentVMNotifier.gen-2.app" ]] ||
+    fail "a rebuild did not swap the symlink to the second generation"
+[[ -d "$notifier_lib/.AgentVMNotifier.gen-2.app" ]] || fail "the second generation was not published"
+[[ ! -e "$notifier_lib/.AgentVMNotifier.gen-1.app" ]] || fail "the previous generation was not retired"
+[[ ! -e "$notifier_lib/.AgentVMNotifier.gen-2.app/.AgentVMNotifier.gen-2.app" ]] ||
+    fail "the generation was nested inside the bundle it replaced"
+[[ -x "$notifier_lib/AgentVMNotifier.app/Contents/MacOS/AgentVMNotifier" ]] ||
+    fail "the swapped symlink does not resolve to an executable helper"
+retire_line="$(log_index_of "$(cat "$fixture/calls.log")" ".AgentVMNotifier.retired.")"
+register_line="$(log_index_of "$(cat "$fixture/calls.log")" "lsregister -f target/macos/lib/AgentVMNotifier.app")"
+((retire_line > 0)) || fail "the rebuild did not retire the previous generation"
+((register_line > 0)) || fail "the rebuild did not register the new generation"
+((retire_line < register_line)) ||
+    fail "generation $retire_line was retired after the registration on line $register_line"
+assert_lib_clean "$notifier_lib"
+
+# --dev publishes the same layout into its own bundle directory.
+: >"$fixture/calls.log"
+run_build "$fixture" "$fakebin" -- --dev
+dev_lib="$fixture/target/macos-dev/lib"
+[[ -L "$dev_lib/AgentVMNotifier.app" ]] || fail "a --dev build did not publish the helper symlink"
+assert_file_contains "$dev_lib/AgentVMNotifier.app/Contents/Info.plist" "<string>9.9.9</string>"
+[[ -x "$dev_lib/AgentVMNotifier.app/Contents/MacOS/AgentVMNotifier" ]] ||
+    fail "the --dev helper symlink does not resolve"
+assert_file_contains "$fixture/calls.log" "lsregister -f target/macos-dev/lib/AgentVMNotifier.app"
+
+# --single-binary needs neither swiftc nor lsregister and touches neither bundle.
+release_gen="$(readlink "$notifier_lib/AgentVMNotifier.app")"
+dev_gen="$(readlink "$dev_lib/AgentVMNotifier.app")"
+mv "$fakebin/swiftc" "$fakebin/swiftc.disabled"
+: >"$fixture/calls.log"
+run_build "$fixture" "$fakebin" -- --single-binary
+calls="$(cat "$fixture/calls.log")"
+assert_not_contains "$calls" "swiftc"
+assert_not_contains "$calls" "lsregister"
+[[ "$(readlink "$notifier_lib/AgentVMNotifier.app")" == "$release_gen" ]] ||
+    fail "--single-binary republished the release helper"
+[[ "$(readlink "$dev_lib/AgentVMNotifier.app")" == "$dev_gen" ]] ||
+    fail "--single-binary republished the dev helper"
+[[ -d "$notifier_lib/$release_gen" ]] || fail "--single-binary removed the published generation"
+mv "$fakebin/swiftc.disabled" "$fakebin/swiftc"
+
+# A missing swiftc fails bundle preflight, before the runtime build starts.
+make_fixture notifier-no-swiftc
+mv "$fakebin/swiftc" "$fakebin/swiftc.disabled"
+set +e
+output="$(run_build "$fixture" "$fakebin" 2>&1)"
+status=$?
+set -e
+[[ $status -ne 0 ]] || fail "a bundle build succeeded without swiftc"
+assert_contains "$output" "required tool 'swiftc' was not found on PATH"
+assert_contains "$output" "xcode-select --install"
+# Preflight reached the toolchain check but no build started: no runtime, no
+# cargo build, no docker.
+not_swiftc_calls="$(cat "$fixture/calls.log")"
+assert_not_contains "$not_swiftc_calls" "docker build"
+assert_not_contains "$not_swiftc_calls" "args=--release"
+[[ ! -e "$fixture/target/macos/lib/AgentVMNotifier.app" ]]
+mv "$fakebin/swiftc.disabled" "$fakebin/swiftc"
+
+# A helper that fails validation must leave the previous bundle in place and
+# clean its stage: the helper is verified before any published file moves.
+for failure in notifier-arch notifier-signature notifier-plist notifier-version; do
+    make_fixture "late-$failure"
+    late_lib="$fixture/target/macos/lib"
+    mkdir -p "$late_lib/.AgentVMNotifier.gen-1.app/Contents/MacOS"
+    printf prior-helper >"$late_lib/.AgentVMNotifier.gen-1.app/Contents/marker"
+    ln -s ".AgentVMNotifier.gen-1.app" "$late_lib/AgentVMNotifier.app"
+    case "$failure" in
+        notifier-arch)
+            expect_build_failure "must be arm64-only" "$fixture" "$fakebin" env FAKE_BAD_ARCH_PATH=.AgentVMNotifier.stage.
+            ;;
+        notifier-signature)
+            # Open-coded so the failure is proven to be the helper's: msb reports
+            # the same sentence, and a fault that landed there would prove
+            # nothing about this stage.
+            set +e
+            output="$(run_build "$fixture" "$fakebin" env FAKE_SIGNATURE_INVALID_PATH=.AgentVMNotifier.stage. 2>&1)"
+            status=$?
+            set -e
+            [[ $status -ne 0 ]] || fail "a helper with a bad signature was published"
+            assert_contains "$output" ".AgentVMNotifier.stage."
+            assert_contains "$output" "does not have a valid code signature"
+            ;;
+        notifier-plist)
+            expect_build_failure "is not a valid property list" "$fixture" "$fakebin" env FAKE_NOTIFIER_PLIST_INVALID=1
+            ;;
+        notifier-version)
+            expect_build_failure "reports 'agent-vm-notifier 0.0.0-nope'" "$fixture" "$fakebin" env FAKE_NOTIFIER_VERSION_FAIL=1
+            ;;
+    esac
+    [[ "$(readlink "$late_lib/AgentVMNotifier.app")" == ".AgentVMNotifier.gen-1.app" ]] ||
+        fail "$failure replaced the published helper symlink"
+    [[ "$(cat "$late_lib/.AgentVMNotifier.gen-1.app/Contents/marker")" == prior-helper ]] ||
+        fail "$failure damaged the published generation"
+    assert_lib_clean "$late_lib"
+    [[ ! -e "$fixture/target/macos/bin/agent-vm" ]] ||
+        fail "$failure published a runtime file before the helper was verified"
+done
+
+# A failed swap is a failed publish, not a quiet success. The runtime files are
+# already moved (they precede the helper commit), so what must hold is that the
+# previous helper symlink and its generation still resolve, staging is cleaned,
+# and the build exits non-zero naming the swap.
+make_fixture notifier-swap-fault
+swap_lib="$fixture/target/macos/lib"
+mkdir -p "$swap_lib/.AgentVMNotifier.gen-1.app/Contents/MacOS"
+printf prior-helper >"$swap_lib/.AgentVMNotifier.gen-1.app/Contents/marker"
+ln -s ".AgentVMNotifier.gen-1.app" "$swap_lib/AgentVMNotifier.app"
+set +e
+output="$(run_build "$fixture" "$fakebin" env FAKE_MV_FAIL_LINK=1 2>&1)"
+status=$?
+set -e
+[[ $status -ne 0 ]] || fail "a failed helper swap exited 0"
+assert_contains "$output" "error: could not swap target/macos/lib/AgentVMNotifier.app onto the validated helper app at target/macos/lib/.AgentVMNotifier.link."
+assert_contains "$output" "the previously published helper is still in place"
+[[ "$(readlink "$swap_lib/AgentVMNotifier.app")" == ".AgentVMNotifier.gen-1.app" ]] ||
+    fail "a failed swap replaced the published symlink"
+[[ "$(cat "$swap_lib/AgentVMNotifier.app/Contents/marker")" == prior-helper ]] ||
+    fail "a failed swap left the published helper path unresolvable"
+assert_lib_clean "$swap_lib"
+# The runtime publish that precedes the helper commit did happen, which is the
+# honest state: a bundle-wide transaction is what this design does not claim.
+[[ -x "$fixture/target/macos/bin/agent-vm" ]] || fail "a failed swap discarded the runtime files"
+
+# A registration failure warns on stderr and keeps the commit: the files are
+# already in place, and the next build registers again.
+make_fixture notifier-register-failure
+set +e
+output="$(run_build "$fixture" "$fakebin" env FAKE_LSREGISTER_FAIL=1 2>&1)"
+status=$?
+set -e
+[[ $status -eq 0 ]] || fail "an lsregister failure aborted the build:\n\n$output"
+assert_contains "$output" "warning: could not register"
+[[ -L "$fixture/target/macos/lib/AgentVMNotifier.app" ]] || fail "an lsregister failure discarded the publish"
+[[ -x "$fixture/target/macos/bin/agent-vm" ]] || fail "an lsregister failure discarded the runtime files"
+
+# A first-time migration: a bundle published before generations has a real
+# directory where the symlink goes, and `mv` moves a generation *into* a directory
+# rather than over it. The commit renames it aside, installs the symlink, then
+# deletes the backup.
+make_fixture notifier-migration
+migration_lib="$fixture/target/macos/lib"
+mkdir -p "$migration_lib/AgentVMNotifier.app/Contents/MacOS"
+printf legacy-helper >"$migration_lib/AgentVMNotifier.app/Contents/marker"
+set +e
+output="$(run_build "$fixture" "$fakebin" 2>&1)"
+status=$?
+set -e
+[[ $status -eq 0 ]] || fail "a first-time migration failed:\n\n$output"
+[[ -L "$migration_lib/AgentVMNotifier.app" ]] || fail "a migration did not end at a symlink"
+[[ "$(readlink "$migration_lib/AgentVMNotifier.app")" == ".AgentVMNotifier.gen-1.app" ]] ||
+    fail "a migration published a symlink to $(readlink "$migration_lib/AgentVMNotifier.app")"
+[[ ! -e "$migration_lib/AgentVMNotifier.app/Contents/marker" ]] ||
+    fail "the legacy bundle is still reachable through the published path"
+[[ -x "$migration_lib/AgentVMNotifier.app/Contents/MacOS/AgentVMNotifier" ]] ||
+    fail "the migrated helper symlink does not resolve"
+assert_lib_clean "$migration_lib"
+
+# The same migration with the swap faulted: the legacy directory must come back,
+# so "the previously published helper is still in place" is true in both layouts.
+make_fixture notifier-migration-fault
+migration_fault_lib="$fixture/target/macos/lib"
+mkdir -p "$migration_fault_lib/AgentVMNotifier.app/Contents/MacOS"
+printf legacy-helper >"$migration_fault_lib/AgentVMNotifier.app/Contents/marker"
+set +e
+output="$(run_build "$fixture" "$fakebin" env FAKE_MV_FAIL_LINK=1 2>&1)"
+status=$?
+set -e
+[[ $status -ne 0 ]] || fail "a failed migration exited 0"
+assert_contains "$output" "the previously published helper is still in place"
+[[ -d "$migration_fault_lib/AgentVMNotifier.app" && ! -L "$migration_fault_lib/AgentVMNotifier.app" ]] ||
+    fail "a failed migration did not restore the legacy bundle directory"
+[[ "$(cat "$migration_fault_lib/AgentVMNotifier.app/Contents/marker")" == legacy-helper ]] ||
+    fail "a failed migration restored something other than the bundle that was there"
+assert_lib_clean "$migration_fault_lib"
+
+# The publication lock: released by a successful build, cleared when its holder is
+# dead, and refused when a live build holds it.
+make_fixture notifier-lock
+lock_lib="$fixture/target/macos/lib"
+run_build "$fixture" "$fakebin"
+[[ ! -e "$lock_lib/.AgentVMNotifier.publish.lock" ]] ||
+    fail "a successful build left the publication lock behind"
+
+# A lock whose recorded PID is gone is stale: clear it once and publish.
+(exit 0) &
+dead_pid=$!
+wait "$dead_pid" 2>/dev/null || true
+mkdir -p "$lock_lib/.AgentVMNotifier.publish.lock"
+printf '%s\n' "$dead_pid" >"$lock_lib/.AgentVMNotifier.publish.lock/pid"
+run_build "$fixture" "$fakebin" env AGENT_VM_BUILD_LOCK_SECONDS=2
+[[ "$(readlink "$lock_lib/AgentVMNotifier.app")" == ".AgentVMNotifier.gen-2.app" ]] ||
+    fail "a build did not proceed past a stale publication lock"
+[[ ! -e "$lock_lib/.AgentVMNotifier.publish.lock" ]] || fail "a stale publication lock was not cleared"
+assert_lib_clean "$lock_lib"
+
+# A live holder: the build waits the configured time, names the lock and the
+# holder, and publishes nothing at all.
+make_fixture notifier-lock-held
+held_lib="$fixture/target/macos/lib"
+holder=$$
+mkdir -p "$held_lib/.AgentVMNotifier.publish.lock"
+printf '%s\n' "$holder" >"$held_lib/.AgentVMNotifier.publish.lock/pid"
+set +e
+output="$(run_build "$fixture" "$fakebin" env AGENT_VM_BUILD_LOCK_SECONDS=1 2>&1)"
+status=$?
+set -e
+[[ $status -ne 0 ]] || fail "a build proceeded while a live build held the publication lock"
+assert_contains "$output" "is publishing the notification helper"
+assert_contains "$output" "pid $holder"
+assert_contains "$output" "target/macos/lib/.AgentVMNotifier.publish.lock"
+[[ ! -e "$fixture/target/macos/bin/agent-vm" ]] || fail "a lock-refused build published a runtime file"
+[[ ! -e "$held_lib/AgentVMNotifier.app" ]] || fail "a lock-refused build published a helper"
+[[ -e "$held_lib/.AgentVMNotifier.publish.lock/pid" ]] ||
+    fail "a lock-refused build released someone else's lock"
+rm -rf "$held_lib/.AgentVMNotifier.publish.lock"
 
 # Repository-scoped target directories override inherited Cargo output paths.
 make_fixture cargo-target

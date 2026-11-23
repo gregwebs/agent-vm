@@ -3,9 +3,9 @@
 # can change its result.
 #
 # Usage: script/test/ci-macos-legs.sh <leg> [--receipt FILE] [--compare FILE]
-#   legs: build-script | keychain-contract
+#   legs: build-script | keychain-contract | harness | notifier-contract
 #
-# The two macOS legs are the only gates a developer cannot reach through
+# The macOS legs are the only gates a developer cannot reach through
 # `cargo test`, so they used to run under whatever environment the caller had:
 # a Homebrew bash 5 where CI has `/bin/bash` 3.2, a Homebrew `jq`, a rustup
 # override, a `CARGO_TARGET_DIR`. A difference in any of those is a difference in
@@ -36,6 +36,7 @@ the host facts that can change its result.
   build-script        script/test/build-workflow.sh (no toolchain needed)
   keychain-contract   script/test/keychain-contract.sh (needs the pinned rustc)
   harness             the agent-vm-harness crate's checks (needs the pinned rustc)
+  notifier-contract   script/test/notifier-contract.sh (Swift only, no toolchain)
 
   --receipt FILE      also write the receipt line to FILE
   --compare FILE      diff this run's receipt against the receipt line in FILE
@@ -54,7 +55,7 @@ receipt_file=""
 compare_file=""
 while (($#)); do
     case "$1" in
-        build-script | keychain-contract | harness)
+        build-script | keychain-contract | harness | notifier-contract)
             leg="$1"
             shift
             ;;
@@ -188,6 +189,12 @@ case "$leg" in
             fail "the harness leg needs bash 5 for the egress probe controls; none here and brew could not install one"
         export EGRESS_PROBE_BASH
         leg_command=(cargo test --locked -p agent-vm-harness)
+        ;;
+    notifier-contract)
+        # Swift only, so no toolchain step: `swiftc`, `plutil`, `lipo` and
+        # `codesign` are all on the pinned `/usr/bin` PATH. It compiles, signs and
+        # runs the real helper inside a temp bundle (#501 slice 4).
+        leg_command=("$pinned_bash" "$REPO_ROOT/script/test/notifier-contract.sh")
         ;;
 esac
 

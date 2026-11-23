@@ -64,6 +64,7 @@ mod msb_preflight;
 mod msb_schema;
 mod network;
 mod network_requests;
+mod notify;
 mod one_line;
 mod pi_credential_inspection;
 mod project;
@@ -230,6 +231,23 @@ fn run_dispatch(dispatch: Dispatch, project: Result<project::ProjectDir>) -> Res
         return exit_with(access_cmd::run(args, project)?);
     }
 
+    // `_notify-click` runs when the operator clicks a notification banner. It needs
+    // no msb, no image and no catalog: the click happens long after the launch that
+    // raised the banner, possibly after macOS relaunched the helper, so it returns
+    // before credential preflight, `point_at_msb` and the runtime. The carried
+    // catalog is ignored (a broken config must not cost the click) and so is every
+    // config tier; `notify::run_click` reads `$HOME` and the host clock only.
+    //
+    // A broken catalog reaching a working click is pinned by Phase 7's
+    // `tests/notify_cli.rs`, not by a unit test here.
+    if let Dispatch::Builtin {
+        cmd: Cmd::NotifyClick(args),
+        ..
+    } = dispatch
+    {
+        return exit_with(crate::notify::run_click(args)?);
+    }
+
     // `tools print` prints the definitions compiled into this binary (#510), so the
     // discovered config's result cannot matter: it returns before credential
     // preflight, the MSB prologue, state creation and the runtime. The carried
@@ -316,7 +334,7 @@ fn run_dispatch(dispatch: Dispatch, project: Result<project::ProjectDir>) -> Res
     let needs_msb_setup = !matches!(
         dispatch,
         Dispatch::Builtin {
-            cmd: Cmd::InterceptHook(_) | Cmd::Clipboard(_) | Cmd::Access(_),
+            cmd: Cmd::InterceptHook(_) | Cmd::Clipboard(_) | Cmd::Access(_) | Cmd::NotifyClick(_),
             ..
         }
     );
@@ -431,6 +449,12 @@ fn run_dispatch(dispatch: Dispatch, project: Result<project::ProjectDir>) -> Res
                 ..
             } => {
                 unreachable!("Cmd::Access is dispatched pre-runtime, see above")
+            }
+            Dispatch::Builtin {
+                cmd: Cmd::NotifyClick(_),
+                ..
+            } => {
+                unreachable!("Cmd::NotifyClick is dispatched pre-runtime, see above")
             }
         }
     })

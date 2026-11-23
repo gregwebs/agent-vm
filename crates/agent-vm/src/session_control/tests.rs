@@ -1965,3 +1965,159 @@ async fn a_slow_join_does_not_consume_the_operations_own_budget() {
     live.finish().await;
     unjoinable.release();
 }
+
+#[test]
+fn the_socket_closes_before_the_notifier_finishes() {
+    // B5: `close_socket` must come *before* the notifier's teardown, so `ended`
+    // classification and grant refusal are already effective when any banner claims
+    // the session's end. The final write comes first, because only a persisted record
+    // may be followed by a final post (R9).
+    // The split is at the test *module*: `session_control.rs` carries `#[cfg(test)]`
+    // accessors earlier in the file.
+    let source = include_str!("../session_control.rs");
+    let production = &source[..source
+        .find("#[cfg(test)]\nmod tests;")
+        .expect("session_control.rs has a test module")];
+    let position = |needle| {
+        production
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} is part of the teardown"))
+    };
+    let persist = position("persister.post_final(snapshot.clone())");
+    let notifier = position("self.finish_notifier(snapshot, final_status).await");
+    // The last `close_socket` call is the one in `finish`: the degraded path's comes
+    // earlier, and the definition is not a call.
+    let close = production
+        .rfind("self.close_socket().await;")
+        .expect("the teardown closes the socket");
+    assert!(
+        persist < close,
+        "the final record is written before the socket closes"
+    );
+    assert!(
+        close < notifier,
+        "the socket closes before any banner claims the session's end"
+    );
+}
+
+/// F1 (B5): the mutation gate closes *before* the final record is written, so a
+/// grant that arrives in the persist window is refused with a reason and leaves
+/// nothing behind. Without the gate it was `Applied` for a session whose own record
+/// already said it had ended, and the next launch could read a record that never
+/// described what happened.
+#[tokio::test]
+async fn a_grant_during_the_final_persist_is_refused_and_changes_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    let live = start_live(&project(root.path())).await;
+    let socket = project(root.path())
+        .sessions_dir()
+        .join(format!("{}.sock", live.id().as_str()));
+    let destination = "tcp://[203.0.113.10/32]:443";
+    // Park the writer, so `finish` is provably inside its persist when the grant
+    // arrives: `post_final` is offered, nothing is written, and the socket is still
+    // bound (it is closed only after the wait).
+    let writer = live
+        .persister
+        .as_ref()
+        .expect("a session with a socket persists")
+        .handle();
+    assert!(
+        writer.hold_writer(crate::refusal::feed::FINAL_WAIT),
+        "the writer parks instead of taking the final job"
+    );
+    let allowance = async {
+        // `ended` is recorded after the gate and before the persist, which is parked
+        // above, so waiting for it is waiting for exactly the window in the finding.
+        let refusals = live.refusals().expect("a session with a socket has a feed");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while refusals.snapshot().ended_ms.is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the teardown never reached its record"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let result = crate::session_control::grant(
+            &socket,
+            Some(destination),
+            crate::allowances::GrantScope::Session,
+        )
+        .await
+        .expect("the control socket still answers");
+        // The persist is what this raced; let it finish now rather than at its bound.
+        writer.release_writer();
+        result
+    };
+    let ((), result) = tokio::join!(live.finish(), allowance);
+
+    let crate::allowances::GrantResult::Refused { reason } = &result else {
+        panic!("a grant during the final persist must be refused: {result:?}");
+    };
+    assert_eq!(
+        reason,
+        &crate::allowances::GrantRefusalReason::SessionEnding,
+        "the refusal names the session's end"
+    );
+    // The operator reads it as a refusal with a reason, not as a success.
+    let report = result.report("session 0a1b2c3d", crate::allowances::GrantScope::Session);
+    assert_eq!(report.code, 1, "{report:?}");
+    assert!(
+        report.text.contains("has ended"),
+        "the sentence says why: {report:?}"
+    );
+    // And nothing was accepted: the session holds nothing and recorded nothing for
+    // the next launch, so the record and the acceptances agree.
+    let destination =
+        crate::egress_policy::Allowance::parse(destination).expect("a canonical destination");
+    assert!(
+        !live.allowances().answered(&destination),
+        "the refused grant left the destination neither held nor recorded"
+    );
+    assert!(
+        live.allowances().snapshot().session.is_empty(),
+        "{:?}",
+        live.allowances().snapshot().session
+    );
+}
+
+/// F1's other half: the gate is for mutations arriving from *outside*. The prompt's
+/// own answer was given while the question was up, and R29 says the session's end does
+/// not cancel it — its project record may land late.
+#[tokio::test]
+async fn the_session_s_own_answer_is_not_refused_by_its_own_ending() {
+    let root = tempfile::tempdir().unwrap();
+    let live = start_live(&project(root.path())).await;
+    let refusals = live.refusals().expect("a session with a socket has a feed");
+    // A `tcp-syn` refusal is the one an `s`/`p` answer can actually turn into an
+    // allowance, so this resolves to the same destination the socket test uses.
+    let mut record = record_now(443);
+    let NetworkLogEvent::Refusal(refusal) = &mut record.event else {
+        panic!("the helper builds a refusal");
+    };
+    refusal.site = microsandbox::logs::RefusalSite::TcpSyn;
+    let mut dirty = false;
+    assert!(refusals.ingest(&record, &mut dirty, crate::refusal::feed::now_ms()));
+    let entry_id = refusals.snapshot().entries[0].id.clone();
+    live.allowances().end_mutations().await;
+    let grant = live
+        .allowances()
+        .grant_unless_answered(
+            &refusals,
+            &entry_id,
+            crate::allowances::GrantScope::Project,
+            crate::refusal::feed::now_ms(),
+        )
+        .await;
+    assert!(
+        matches!(
+            &grant,
+            crate::allowances::PromptGrant::Reached(
+                crate::allowances::GrantResult::QueuedForBoot { .. }
+                    | crate::allowances::GrantResult::Applied { .. }
+                    | crate::allowances::GrantResult::NextLaunch { .. }
+            )
+        ),
+        "an answer the operator already gave is not refused by the ending: {grant:?}"
+    );
+    live.finish().await;
+}

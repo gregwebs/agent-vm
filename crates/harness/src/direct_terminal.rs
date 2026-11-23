@@ -2180,6 +2180,9 @@ impl Invocation {
         remove(&mut env, "AGENT_VM_NO_CHROME_MCP");
         set(&mut env, "TERM", OsString::from("xterm-256color"));
         remove(&mut env, "AGENT_VM_NO_ACCESS_PROMPT");
+        // No real banner: a desktop run would post one, and the notifications-off
+        // line could then land in exact-byte terminal evidence.
+        set(&mut env, "AGENT_VM_NO_NOTIFICATIONS", OsString::from("1"));
         if let Some(home) = self.home.as_ref() {
             set(&mut env, "HOME", home.clone().into_os_string());
         }

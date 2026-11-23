@@ -187,6 +187,9 @@ pub(crate) const RESERVED_TOOL_NAMES: &[&str] = &[
     // a tool by that name could not be reached.
     "access",
     "_intercept-hook",
+    // `_notify-click` is spawned by the macOS notification helper, so a tool by
+    // that name could never be reached either.
+    "_notify-click",
     // The direct runner (issue #398). Reserved in every config tier, like a
     // built-in: a tool by that name could not be reached, and the runner is
     // the escape hatch from catalog launches.

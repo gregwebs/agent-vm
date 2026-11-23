@@ -292,13 +292,20 @@ where
     // loop returned.
     let restored = host.raw.restore();
     let owed = host.output.abort();
-    let hint_owed = host.prompt.as_mut().is_some_and(Prompt::abandon);
+    let owed_lines = host
+        .prompt
+        .as_mut()
+        .map(Prompt::abandon)
+        .unwrap_or_default();
     host.input.stop();
     if let Some(owed) = owed {
         owed.wait().await;
     }
-    if hint_owed {
-        write_hint_to_stderr();
+    // One line per hint still owed to stderr: at most two, one per kind. Printed
+    // after the writer's host restore, so a line the drained tail already wrote is
+    // not repeated (the tail marks its lines delivered).
+    for line in owed_lines {
+        write_hint_to_stderr(line);
     }
     drop(runtime_exit);
     with_restore(outcome, restored)
@@ -721,7 +728,7 @@ where
     // The flush is held in one pinned future and re-polled. `finish` takes the
     // session's last sender on its first poll, so re-creating it after a cancelled
     // poll would report a drain that never happened.
-    let mut finishing = Box::pin(output.finish(tail));
+    let mut finishing = Box::pin(output.finish(tail, prompt.as_ref()));
     drain_guest_output(end, &mut finishing, &mut failure, supervision, runtime_exit).await
 }
 
@@ -753,6 +760,10 @@ fn pump<T: GuestTerminal>(
     let Some(prompt) = prompt.as_mut() else {
         return Ok(());
     };
+    // Every signal the relay emitted since the last turn goes to the notifier here.
+    // The send is non-blocking (R12), and the pump runs before every wait, so this
+    // is the one place the sequencing is complete.
+    prompt.drain_signals();
     if prompt.wants_input_flush() {
         terminal.flush_input()?;
         prompt.input_flushed(input.reads_started(), tokio::time::Instant::now());
@@ -776,12 +787,18 @@ fn pump<T: GuestTerminal>(
             )) => {
                 slots.sending_output = Some(Box::pin(output.frame(bytes)?.deliver()));
             }
-            // The hint is its own frame. Its route is marked written only when the
-            // writer accepted the bytes, so an abandoned delivery still belongs to
-            // stderr (M9/N6).
-            access_prompt::relay::Outbound::Frame(access_prompt::relay::OutputItem::Hint) => {
-                let hint = prompt.hint_route();
-                let send = output.frame(crate::refusal::feed::HintRelay::BYTES.to_vec())?;
+            // A line from the session's hint seam, as its own frame. The kind names
+            // which line and the route frames its bytes, so the notifications-off
+            // line cannot be drained as the refusal line (Phase 3's F7). Its route
+            // is marked written only when the writer accepted the bytes, so an
+            // abandoned delivery still belongs to stderr (M9/N6).
+            access_prompt::relay::Outbound::Frame(access_prompt::relay::OutputItem::Hint(kind)) => {
+                let hint = prompt.hint_route(kind);
+                let Some(bytes) = hint.as_ref().map(crate::refusal::feed::HintRelay::bytes) else {
+                    // No route: the line already went to stderr.
+                    continue;
+                };
+                let send = output.frame(bytes)?;
                 slots.sending_output = Some(Box::pin(async move {
                     let delivered = send.deliver().await;
                     if delivered.is_ok()
@@ -1594,15 +1611,30 @@ impl OutputWriter {
 
     /// Queue the drain's tail, then wait until every queued byte has reached the
     /// host descriptor.
-    async fn finish(&mut self, tail: Vec<access_prompt::relay::OutputItem>) -> anyhow::Result<()> {
+    ///
+    /// `prompt` is the tail's own source of hint bytes: a line's kind names which of
+    /// the session's two lines it is, and that route frames it.
+    async fn finish(
+        &mut self,
+        tail: Vec<access_prompt::relay::OutputItem>,
+        prompt: Option<&Prompt>,
+    ) -> anyhow::Result<()> {
         let Some(frames) = self.frames.take() else {
             return Ok(());
         };
+        let mut delivered: Vec<access_prompt::relay::HintKind> = Vec::new();
         for item in tail {
             let frame = match item {
                 access_prompt::relay::OutputItem::Data(bytes) => OutputFrame::Data(bytes),
-                access_prompt::relay::OutputItem::Hint => {
-                    OutputFrame::Data(crate::refusal::feed::HintRelay::BYTES.to_vec())
+                access_prompt::relay::OutputItem::Hint(kind) => {
+                    match prompt.and_then(|prompt| prompt.hint_bytes(kind)) {
+                        Some(bytes) => {
+                            delivered.push(kind);
+                            OutputFrame::Data(bytes)
+                        }
+                        // No route: the line already went to stderr.
+                        None => continue,
+                    }
                 }
                 access_prompt::relay::OutputItem::Takeover {
                     generation,
@@ -1631,7 +1663,15 @@ impl OutputWriter {
             anyhow::anyhow!(
                 "the guest terminal output writer stopped before its final output was written"
             )
-        })
+        })?;
+        // The ack means every frame above reached the descriptor, so a line in the
+        // tail is delivered: marked here, the epilogue does not print it again.
+        if let Some(prompt) = prompt {
+            for kind in delivered {
+                prompt.hint_delivered(kind);
+            }
+        }
+        Ok(())
     }
 
     /// Stop the writer without waiting for a write already in progress.
@@ -2302,6 +2342,91 @@ mod tests {
             .read_to_end(&mut captured)
             .expect("read the capture");
         assert_eq!(captured, b"firstsecond");
+    }
+
+    #[tokio::test]
+    async fn a_line_the_drain_wrote_is_not_owed_to_stderr_again() {
+        // F5: `Prompt::finish` hands the tail to `OutputWriter::finish`, which writes
+        // each line's own bytes and marks that line delivered once they are on the
+        // descriptor. Before that marking, nothing told the route its bytes had been
+        // written, so the epilogue printed the same line a second time — the drained
+        // copy plus `abandon`'s. This drives both halves over a real writer and a real
+        // pipe.
+        let (read_end, write_end) = std::io::pipe().expect("a pipe");
+        let writer_fd = duplicate(write_end.as_raw_fd()).expect("duplicate the pipe");
+        drop(write_end);
+        let mut writer = OutputWriter::start(writer_fd).expect("the writer starts");
+
+        let root = tempfile::tempdir().unwrap();
+        let project = crate::project::ProjectDir::from_path_for_tests(root.path()).unwrap();
+        let store = crate::allowances::StoreHandle::at_for_tests(&root.path().join("store"));
+        let plan = crate::network::plan_for_tests(&[], false).live_policy_plan(None);
+        let allowances = crate::allowances::LiveAllowances::new(&project, store, plan);
+        let session = crate::refusal::SessionId::parse("3f9a12c4").unwrap();
+        let refusals = crate::refusal::feed::LiveRefusals::new(
+            crate::refusal::SessionRefusals::new(crate::refusal::SessionInfo {
+                id: session.clone(),
+                pid: 1,
+                started_ms: 0,
+                socket: true,
+            }),
+        );
+        let hint = Arc::new(crate::refusal::feed::Hint::new());
+        let off = Arc::new(crate::refusal::feed::Hint::notifications_off());
+        let mut prompt = access_prompt::Prompt::start_with_routes(
+            access_prompt::Feed {
+                refusals,
+                allowances,
+                session,
+                hint: Arc::clone(&hint),
+                notifications_off: Arc::clone(&off),
+                signals: None,
+            },
+            access_prompt::Size { rows: 30, cols: 80 },
+            access_prompt::relay::Timings::default(),
+        );
+        let now = tokio::time::Instant::now();
+        // Both lines fire while the relay is idle, so both are queued for the tail.
+        for (hint, kind) in [
+            (hint, access_prompt::relay::HintKind::Refusal),
+            (off, access_prompt::relay::HintKind::NotificationsOff),
+        ] {
+            hint.fire_for_test();
+            prompt.handle_feed(access_prompt::FeedEvent::Hint(kind), now);
+        }
+        let tail = prompt.finish(now);
+        assert_eq!(
+            tail,
+            vec![
+                access_prompt::relay::OutputItem::Hint(access_prompt::relay::HintKind::Refusal),
+                access_prompt::relay::OutputItem::Hint(
+                    access_prompt::relay::HintKind::NotificationsOff
+                ),
+            ],
+            "the tail keeps each line's kind"
+        );
+        writer
+            .finish(tail, Some(&prompt))
+            .await
+            .expect("the drain writes its tail");
+        assert!(
+            prompt.abandon().is_empty(),
+            "a line the drain wrote is not owed to stderr again"
+        );
+        use std::io::Read as _;
+        let mut captured = Vec::new();
+        std::io::BufReader::new(read_end)
+            .read_to_end(&mut captured)
+            .expect("read the capture");
+        let expected = [
+            format!("\r{}\r\n", crate::refusal::feed::HINT).into_bytes(),
+            format!("\r{}\r\n", crate::notify::NOTIFICATIONS_OFF).into_bytes(),
+        ]
+        .concat();
+        assert_eq!(
+            captured, expected,
+            "each line exactly once, in its own bytes (Phase 3's F7)"
+        );
     }
 
     #[tokio::test]

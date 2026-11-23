@@ -48,6 +48,9 @@ mod e2e_stdin_writer;
 mod egress_default_deny;
 mod egress_mutations;
 mod egress_probe;
+// The macOS notification helper's wire, played independently of `agent-vm`'s own
+// model of it, so a change to either side fails here (#501 slice 4).
+mod fake_notifier;
 mod image_pins;
 mod launch_argv_order;
 mod launcher_standin;
@@ -113,6 +116,8 @@ enum Command {
     EgressDefaultDeny(egress_default_deny::EgressDefaultDenyArgs),
     /// Run the boot-free controls for the owned launch supervisor.
     EgressSupervisor(egress_supervisor::EgressSupervisorArgs),
+    /// Play the macOS notifier for agent-vm's helper contract.
+    FakeNotifier(fake_notifier::FakeNotifierArgs),
     /// Check the image-pins live-seed helper dispatch.
     ImagePins(image_pins::ImagePinsArgs),
     /// Print where a project's host-managed config lives (ADR-0073).
@@ -165,6 +170,7 @@ impl Cli {
             Command::EgressDefaultDeny(_) => "egress default deny",
             Command::EgressSupervisor(_) => "egress supervisor",
             Command::EgressMutations(_) => "egress mutations",
+            Command::FakeNotifier(_) => "fake notifier",
             Command::PersistedNetwork(_) => "persisted network",
             Command::PersistedNetworkControls(_) => "persisted network controls",
         }
@@ -208,6 +214,9 @@ pub fn run(cli: Cli) -> Result<Outcome, String> {
         Command::EgressMutations(args) => egress_mutations::run(args),
         Command::EgressDefaultDeny(args) => egress_default_deny::run(args),
         Command::EgressSupervisor(args) => egress_supervisor::run(args),
+        // Its stdout is the protocol, so the only thing left to report is a
+        // status: a verdict is a file or a line on stderr, never a frame.
+        Command::FakeNotifier(args) => fake_notifier::run(args),
         Command::ImagePins(args) => image_pins::run(args).map(Outcome::Report),
         Command::ProjectConfigPath(args) => project_config_path::run(args).map(Outcome::Report),
         Command::LauncherStandin(args) => launcher_standin::run(args),

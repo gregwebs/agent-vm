@@ -1,12 +1,12 @@
 //! The binary the shell calls actually builds and runs. A lib-only test would
 //! pass while `[[bin]]` was misconfigured, which is the failure this catches.
 
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{
     env, fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
     sync::atomic::{AtomicUsize, Ordering},
 };
 
@@ -1874,4 +1874,148 @@ fn the_binary_rejects_a_wrong_argv_capture() {
         stderr.contains("FAIL: direct argv bytes differ from the exact expected vector"),
         "{stderr}"
     );
+}
+
+// --- The notifier oracle (#501 slice 4) --------------------------------------
+
+/// One `post`, the `remove` that replaces it and the `quit` that ends the run:
+/// the transcript the launcher really writes, as bytes it really writes.
+const NOTIFIER_COMMANDS: [&str; 3] = [
+    concat!(
+        r#"{"op":"post","v":1,"seq":1,"id":"agent-vm-3f9a12c4","thread":"agent-vm","#,
+        r#""title":"t","subtitle":"s","body":"b","passive":false,"#,
+        r#""click":{"session":"3f9a12c4","project":"/tmp/p","state_dir":"/tmp/s","terminal":"terminal"}}"#,
+    ),
+    r#"{"op":"remove","v":1,"seq":2,"id":"agent-vm-3f9a12c4"}"#,
+    r#"{"op":"quit","v":1}"#,
+];
+
+/// Play one scenario: the file, the command stream on stdin, and the verdict.
+fn play_notifier(scratch: &Scratch, scenario: &str, commands: &[&str]) -> (Output, Value) {
+    let scenario_path = scratch.path.join("scenario.json");
+    fs::write(&scenario_path, scenario).expect("write the scenario");
+    let commands_path = scratch.path.join("commands.ndjson");
+    fs::write(&commands_path, format!("{}\n", commands.join("\n")))
+        .expect("write the command stream");
+    let verdict_path = scratch.path.join("verdict.json");
+    let stdin = fs::File::open(&commands_path).expect("open the command stream");
+    let output = Command::new(env!("CARGO_BIN_EXE_harness"))
+        .args(["fake-notifier", "--scenario"])
+        .arg(&scenario_path)
+        .arg("--verdict")
+        .arg(&verdict_path)
+        // The helper's own argv: the oracle must not care that a spawner adds it.
+        .arg("serve")
+        .stdin(Stdio::from(stdin))
+        .output()
+        .expect("the harness binary plays the notifier");
+    let verdict = fs::read(&verdict_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or(Value::Null);
+    (output, verdict)
+}
+
+/// The frames on stdout, each one checked to be a v1 event: the verdict must never
+/// be there, because stdout is the protocol.
+fn notifier_events(output: &Output) -> Vec<Value> {
+    String::from_utf8(output.stdout.clone())
+        .expect("the protocol is UTF-8")
+        .lines()
+        .map(|line| {
+            let event: Value = serde_json::from_str(line)
+                .unwrap_or_else(|error| panic!("stdout line {line:?} is not a frame: {error}"));
+            assert_eq!(event["v"], json!(1), "frame {event} is not v1");
+            assert!(event["type"].is_string(), "frame {event} carries no type");
+            event
+        })
+        .collect()
+}
+
+/// The oracle is the only thing that catches a broken `[[bin]]` before a macOS
+/// runner needs it: `_notify-click`'s child contract spawns this binary.
+#[test]
+fn the_binary_plays_the_fake_notifier() {
+    // The honest run: four frames, the acknowledgements echoing the commands'
+    // own `seq` and `id`, and a verdict that agrees with the scenario.
+    let scratch = Scratch::new("fake-notifier-good");
+    let (output, verdict) = play_notifier(
+        &scratch,
+        r#"{"expect": {"violations": 0, "ops": ["post", "remove", "quit"]}}"#,
+        &NOTIFIER_COMMANDS,
+    );
+    assert!(
+        output.status.success(),
+        "the honest scenario failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = notifier_events(&output);
+    let types: Vec<&str> = events
+        .iter()
+        .map(|event| event["type"].as_str().expect("a type"))
+        .collect();
+    assert_eq!(
+        types,
+        ["launched", "auth", "posted", "removed"],
+        "{events:?}"
+    );
+    assert_eq!(events[0]["serving"], json!(true), "{events:?}");
+    assert_eq!(events[1]["status"], json!("authorized"), "{events:?}");
+    assert_eq!(events[2]["seq"], json!(1), "{events:?}");
+    assert_eq!(events[2]["ok"], json!(true), "{events:?}");
+    assert_eq!(events[2]["id"], json!("agent-vm-3f9a12c4"), "{events:?}");
+    assert_eq!(events[3]["seq"], json!(2), "{events:?}");
+    assert_eq!(verdict["ok"], json!(true), "{verdict}");
+    assert_eq!(verdict["violations"], json!([]), "{verdict}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.starts_with("fake-notifier: OK (ended=quit violations=0 "),
+        "{stderr}"
+    );
+
+    // A launcher that broke the wire: the scenario wants none, one arrives, and
+    // the run fails with the reason recorded rather than a count nobody can read.
+    let scratch = Scratch::new("fake-notifier-violation");
+    let broken = [
+        r#"{"op":"post","v":2,"seq":1,"id":"agent-vm-3f9a12c4","thread":"agent-vm","title":"t","subtitle":"s","body":"b","passive":false,"click":{"session":"3f9a12c4","project":"/tmp/p","state_dir":"/tmp/s","terminal":"terminal"}}"#,
+        r#"{"op":"quit","v":1}"#,
+    ];
+    let (output, verdict) = play_notifier(&scratch, r#"{"expect": {"violations": 0}}"#, &broken);
+    assert_eq!(output.status.code(), Some(1), "{verdict}");
+    assert_eq!(verdict["ok"], json!(false), "{verdict}");
+    assert_eq!(verdict["violations"][0]["seq"], json!(1), "{verdict}");
+    assert_eq!(
+        verdict["violations"][0]["reasons"],
+        json!(["v is 2, not 1"]),
+        "{verdict}"
+    );
+    assert_eq!(
+        verdict["problems"],
+        json!(["the scenario expected 0 refused command line(s), 1 arrived"]),
+        "{verdict}"
+    );
+    // The refused command answered nothing: only the launch frames came out.
+    assert_eq!(notifier_events(&output).len(), 2, "{verdict}");
+
+    // The other direction: a control that was supposed to provoke a violation and
+    // did not is a control that proves nothing, and fails here.
+    let scratch = Scratch::new("fake-notifier-nothing-happened");
+    let (output, verdict) = play_notifier(
+        &scratch,
+        r#"{"expect": {"violations": 1}}"#,
+        &NOTIFIER_COMMANDS,
+    );
+    assert_eq!(output.status.code(), Some(1), "{verdict}");
+    assert_eq!(
+        verdict["problems"],
+        json!(["the scenario expected 1 refused command line(s), 0 arrived"]),
+        "{verdict}"
+    );
+
+    // A typo in a scenario is an error, not a control that silently does nothing.
+    let scratch = Scratch::new("fake-notifier-typo");
+    let (output, _) = play_notifier(&scratch, r#"{"auth": {"grantd": true}}"#, &[]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("auth has no key 'grantd'"), "{stderr}");
 }
