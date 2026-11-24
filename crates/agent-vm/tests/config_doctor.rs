@@ -863,6 +863,51 @@ fn a_host_managed_project_config_is_loaded_from_the_project_digest_path() {
     );
 }
 
+/// ADR-0076 R5.1: every source row names the file, its status, both attributes,
+/// and exactly the top-level keys that were inert. `trust = true, allow = true`
+/// adopts, so it has no inert list; the untrusted source declares all four
+/// adoptable keys and adopts none of them.
+#[test]
+fn doctor_renders_each_source_row_with_trust_allow_and_inert_declarations() {
+    let h = Harness::new();
+    h.write_user("[[tools]]\nname = \"user-only\"\ncommand = \"user-only\"\n");
+    write(
+        &h.project_root.join("sourced.toml"),
+        "image = \"localhost:1/repo:latest\"\n\
+         mounts = [\"/host:/guest:ro\"]\n\
+         allow_tools = []\n\
+         [network]\nallow_lan = true\n",
+    );
+    write(
+        &h.project_config(),
+        "[[sources]]\nname = \"home\"\npath = \"~/.config/agent-vm/config.toml\"\n\
+         trust = true\nallow = true\n\
+         [[sources]]\nname = \"repo\"\npath = \"./sourced.toml\"\n",
+    );
+
+    let out = h.run_doctor();
+    assert_success(&out);
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.contains(&format!(
+            "  home {} (found, 1 tool) [trust=true, allow=true]\n",
+            h.user_config().display()
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "  repo {} (found, 0 tools) [trust=false, allow=false; inert: image, mounts, \
+             [network], allow_tools]\n",
+            h.project_root.join("sourced.toml").display()
+        )),
+        "{stdout}"
+    );
+    // Inert means adopted-nothing: no mount, no egress grant, no modal verb.
+    assert!(!stdout.contains("==> Mounts:"), "{stdout}");
+    assert!(!stdout.contains("source=source:repo"), "{stdout}");
+}
+
 /// AC2/R3: an absent project tier does not suppress the user tier, and the
 /// project row says so.
 #[test]
@@ -1072,8 +1117,9 @@ fn only_an_explicitly_sourced_in_repo_config_suppresses_the_legacy_notice() {
     );
     sourced.write_user(ONE_TOOL);
     sourced.write_project(
-        "sources = [\"home:trust ~/.config/agent-vm/config.toml\", \"repo ./.agent-vm/config.toml\"]\n\
-         allow_tools = [\"repo:legacy-only\"]\n",
+        "allow_tools = [\"repo:legacy-only\"]\n\
+         [[sources]]\nname = \"home\"\npath = \"~/.config/agent-vm/config.toml\"\ntrust = true\nallow = true\n\
+         [[sources]]\nname = \"repo\"\npath = \"./.agent-vm/config.toml\"\n",
     );
 
     let out = sourced.run_doctor();
@@ -3244,7 +3290,7 @@ fn inert_source_tool_advice_is_qualified_and_pastes_into_the_project() {
         "[[tools]]\nname = \"dörmant-tool\"\ncommand = \"dormant-cmd\"\n",
     )
     .unwrap();
-    let sources = "sources = [\"repo ./sourced.toml\"]\n";
+    let sources = "[[sources]]\nname = \"repo\"\npath = \"./sourced.toml\"\n";
     write(&h.project_config(), &format!("allow_tools = []\n{sources}"));
 
     let out = h.run_doctor();
@@ -3293,12 +3339,13 @@ fn inert_advice_replaces_a_verb_the_project_list_already_claims() {
         "[[tools]]\nname = \"claude\"\ncommand = \"repo-claude\"\n",
     )
     .unwrap();
-    let sources = "sources = [\"home:trust ~/.config/agent-vm/config.toml\", \
-                   \"repo ./sourced.toml\"]\n";
+    let sources = "[[sources]]\nname = \"home\"\
+                   \npath = \"~/.config/agent-vm/config.toml\"\ntrust = true\nallow = true\n\
+                   [[sources]]\nname = \"repo\"\npath = \"./sourced.toml\"\n";
     write(
         &h.project_config(),
         &format!(
-            "{sources}allow_tools = [\"repo:claude\"]\n\
+            "allow_tools = [\"repo:claude\"]\n{sources}\
              [[tools]]\nname = \"claude\"\ncommand = \"project-claude\"\n"
         ),
     );
@@ -3326,7 +3373,7 @@ fn inert_advice_replaces_a_verb_the_project_list_already_claims() {
     write(
         &h.project_config(),
         &format!(
-            "{sources}allow_tools = [\"claude\"]\n\
+            "allow_tools = [\"claude\"]\n{sources}\
              [[tools]]\nname = \"claude\"\ncommand = \"project-claude\"\n"
         ),
     );
@@ -3369,11 +3416,11 @@ fn inert_advice_names_a_qualified_claim_that_dedupes_to_the_user_tier() {
         "allow_tools = [\"claude\"]\n\
          [[tools]]\nname = \"claude\"\ncommand = \"user-claude\"\n",
     );
-    let sources = "sources = [\"home:trust ~/.config/agent-vm/config.toml\"]\n";
+    let sources = "[[sources]]\nname = \"home\"\npath = \"~/.config/agent-vm/config.toml\"\ntrust = true\nallow = true\n";
     write(
         &h.project_config(),
         &format!(
-            "{sources}allow_tools = [\"home:claude\"]\n\
+            "allow_tools = [\"home:claude\"]\n{sources}\
              [[tools]]\nname = \"claude\"\ncommand = \"project-claude\"\n"
         ),
     );
@@ -3391,7 +3438,7 @@ fn inert_advice_names_a_qualified_claim_that_dedupes_to_the_user_tier() {
     write(
         &h.project_config(),
         &format!(
-            "{sources}allow_tools = [\"claude\"]\n\
+            "allow_tools = [\"claude\"]\n{sources}\
              [[tools]]\nname = \"claude\"\ncommand = \"project-claude\"\n"
         ),
     );

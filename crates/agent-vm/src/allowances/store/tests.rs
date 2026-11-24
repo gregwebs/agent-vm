@@ -763,6 +763,8 @@ fn trust_matrix() {
         mode: 0o600,
         size: 0,
         nlink: 1,
+        dev: 1,
+        ino: 1,
     };
     let trusted_dir = |uid| DirFacts {
         is_dir: true,

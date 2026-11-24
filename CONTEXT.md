@@ -504,33 +504,40 @@ One of the ordered, optional config files resolved by `config::load`: the
 **project** tier (`$HOME/.config/agent-vm/projects/<project-id>/config.toml`,
 keyed by the **project**'s full digest), the **user** tier
 (`$HOME/.config/agent-vm/config.toml`) when the project config
-[sources](#config-source) it `:trust` — which is the default — or a
-**project-side source** (a file the project config names without `:trust`). The
+[sources](#config-source) it with `trust = true` — which is the implicit default
+— or a **config source**. The
 project tier is **host-managed**: nothing in a repository is ever read as config
 unless the project config names it. A present project file is
 verified unconditionally — a regular, singly linked, user-owned file reached
 without a final symlink, in a store directory with the same ownership rules and
 no symlinked route — before its bytes are decoded
-([ADR-0073](docs/adr/0073-host-managed-project-config.md)); the `:trust` user
-file's route is checked the same way before it is opened
-([ADR-0074](docs/adr/0074-flat-config-sources.md)). Each tier is parsed
+([ADR-0073](docs/adr/0073-host-managed-project-config.md)); a `trust = true`
+source's whole route is walked before it is opened, and its read is verified
+unconditionally ([ADR-0076](docs/adr/0076-sources-tables-trust-and-allow.md),
+[ADR-0040](docs/adr/0040-persisted-user-network-authority.md)). Each tier is parsed
 and validated independently before merging. Their merge is a **union of whole
 definitions**, not a field overlay, and the verb list is **Tool authorization**
-rather than the declarations: the `:trust` file's own list is inherited, the
-project's entries add verbs, and a project entry naming an inherited verb
-replaces it in place — that project definition is then the verb, and a differing
-replacement yields one `doctor` warning. Two definitions of one name in different
-files therefore coexist legally; only a second authorization of one verb inside
-the project's own list is an error. Only when neither the user nor the project
-config declares a tool *and* neither writes `allow_tools` do the compiled-in
-defaults apply. The authority-bearing fields are `:trust`-tier only: `[network]`
+rather than the declarations: each `allow = true` source's own list is inherited
+in `[[sources]]` order, the project's entries add verbs, and a project entry
+naming an inherited verb replaces it in place — that project definition is then
+the verb, and a differing replacement yields one `doctor` warning. Two
+definitions of one name in different files therefore coexist legally; a second
+authorization of one verb inside the project's own list, and one verb inherited
+from two sources with no project override, are both errors. Only when no
+`allow = true` source and neither the user nor the project config declares a tool
+*and* none of them writes `allow_tools` do the compiled-in defaults apply. The
+authority-bearing fields are verified-tier only: `[network]`
 ([persisted grant](#egress-authority)), the top-level `mounts` ([config
 mount](#config-mount)), `[mount_sets]` ([mount set](#mount-set)) and
-`[egress_sets]`. A project-side, sourced or built-in declaration of any of them
-is refused, even when empty, because presence is what asks for authority; a
-project or sourced *tool*'s `mounts` is the one mount field legal there, inert
-until authorized. `allow_tools` is legal in the user and project configs and
-refused in a source or the built-ins. A definition with no verb still belongs to its own **tool
+`[egress_sets]`. The project config and an `allow = true` source **adopt** their
+own `mounts` and `[network]` through their verified read; an `allow = false`
+source's declaration of any of them is inert, not refused, and `[mount_sets]` /
+`[egress_sets]` stay the default user config's alone until #738. The built-ins
+refuse every one of them by presence, because presence is what asks for
+authority; a project or sourced *tool*'s `mounts` is the one mount field legal
+there, inert until authorized. `allow_tools` is legal in the user and project
+configs and in an `allow = true` source (inherited); a `trust = false` source
+cannot have it adopted. A definition with no verb still belongs to its own **tool
 reference scope**, so the rest of its file keeps resolving it.
 
 A load failure is **deferred**, not fatal at startup: `doctor`, the built-ins,
@@ -539,21 +546,26 @@ reports the config error rather than clap's "unrecognized subcommand".
 
 ## Config source
 
-An entry of the project config's top-level `sources` array,
-`"<alias>[:trust] <path>"` ([ADR-0074](docs/adr/0074-flat-config-sources.md)).
-The **alias** is the file's stable name; `:trust` marks the one file read exactly
-like the user config (`$HOME/.config/agent-vm/config.toml`), and everything else
-is **declarations only** — it may declare tools and an `image`, and cannot grant
-network, mounts, sets or `allow_tools`. Such a tool still carries the credential,
-`env`, `persist` and `mounts` declarations it makes, and is inert until the
-project config's **Tool authorization** names it, so a sourced file never
-displaces the shipped default verbs; it is reviewed before it is sourced because
-authorizing it activates every one of those fields. Sourcing is **flat**: only
-the project config may declare `sources`. An omitted key means the single implicit
-`home:trust ~/.config/agent-vm/config.toml`. An `image` **declared** by a source
-takes effect only when the project config **authorizes** it with
-`image = "ALIAS:image"`; a user image is the fallback, and every unselected
-source image is inert. _Avoid_: include, import.
+An entry of the project config's `[[sources]]` tables:
+`name`, `path`, and the independent booleans `trust` and `allow`
+([ADR-0076](docs/adr/0076-sources-tables-trust-and-allow.md)).
+The **name** is the file's stable alias. **`trust`** decides the read and the
+pinning bypass: `true` walks the whole route, refuses anything inside the active
+checkout or an enclosing Git worktree, verifies the read unconditionally, and is
+exempt from #736 content pinning; `false` reads an ordinary repository file
+(symlinks followed, in-repo paths legal) and is pinned. **`allow`** decides what
+the file's top-level keys mean: `true` adopts `image` (first in `[[sources]]`
+order), `mounts`, `[network]` and `allow_tools`; `false` leaves them **inert** —
+neither adopted nor refused, and reported by `doctor`. A `trust = false, allow =
+true` source cannot adopt until #736 approves its bytes. A way as-yet unadopted
+`image` takes effect when the project config selects it with
+`image = "NAME:image"`. Such a tool still carries the credential, `env`,
+`persist` and `mounts` declarations it makes, and is inert until the project
+config's **Tool authorization** names it, so a sourced file never displaces the
+shipped default verbs. Sourcing is **flat**: only the project config may declare
+sources. An omitted key means the single implicit
+`{ name = "home", path = "~/.config/agent-vm/config.toml", trust = true, allow = true }`.
+_Avoid_: include, import, `:trust` suffix.
 
 ## Boot image
 
@@ -632,9 +644,10 @@ stamp. _Avoid_: image API, image-API version.
 The one image a session boots, chosen independently of the launched tool:
 either a **launch build** (`--dockerfile`) or, when the launch does not type it,
 `--image` (command line) > `AGENT_VM_IMAGE_TAG` (an empty value is unset) >
-project config `image` (its own reference, or `ALIAS:image` selecting a
-[config source](#config-source)'s image) > the `:trust` user config `image` >
-the **default boot image**. The catalog is never an input, so changing a runtime
+project config `image` (its own reference, or `NAME:image` selecting a
+[config source](#config-source)'s image) > the first `allow = true` source in
+`[[sources]]` order that declares an `image` (the implicit `home` source by
+default) > the **default boot image**. The catalog is never an input, so changing a runtime
 tool declaration cannot change the image. A config-file `image` must be an OCI
 reference, except the project config's `ALIAS:image` selection; `--image`
 additionally accepts whatever msb accepts (a local rootfs or disk image).
@@ -1031,8 +1044,9 @@ authorize DNS.
 config naming the `[[tools]]` declarations that become launch verbs. A
 declaration is inert data; authorizing it activates every one of its fields —
 command, args, `interactive_shell`, env, credentials, `persist`, `mounts` and
-`network_requests` (ADR-0075). A `:trust` file's own list is inherited; the
-project's authorization replaces an inherited verb in place.
+`network_requests` (ADR-0075). An `allow = true` source's own list is inherited
+in `[[sources]]` order; the project's authorization replaces an inherited verb in
+place.
 
 **Network request**: a tool declaration's statement of a TLS destination (exact
 name + port) it expects to contact. For an **authorized** tool it is authority:

@@ -233,6 +233,10 @@ pub(crate) enum AuthoritySubject {
     /// declares; it is the root of the project's trust, so there is no field
     /// whose absence makes a symlinked or shared file acceptable.
     ProjectConfig,
+    /// ADR-0076 R2.3: any non-default `trust = true` source. Its read is
+    /// verified unconditionally — the file declares whatever it declares — and
+    /// it has no legacy dotfile contract, so a symlink never loads.
+    TrustedSource,
 }
 
 /// `(label, object, without)` per field, in the fixed order sentences name them.
@@ -267,6 +271,7 @@ impl AuthoritySubject {
             Self::EgressReference => "an egress reference".to_owned(),
             Self::TrustedTool => "authorizing a :trust tool from the project config".to_owned(),
             Self::ProjectConfig => "the project config".to_owned(),
+            Self::TrustedSource => "a trusted source".to_owned(),
         }
     }
 
@@ -279,6 +284,7 @@ impl AuthoritySubject {
             Self::EgressReference => "[egress_sets] table".to_owned(),
             Self::TrustedTool => "[[tools]] definition it selects".to_owned(),
             Self::ProjectConfig => "project config".to_owned(),
+            Self::TrustedSource => "trusted source file".to_owned(),
         }
     }
 
@@ -298,6 +304,9 @@ impl AuthoritySubject {
             // project's selection, not the file's own bytes.
             Self::TrustedTool => Some("a project allow_tools entry naming its tools".to_owned()),
             Self::ProjectConfig => None,
+            // No compatibility at all: a non-default trusted source is new in
+            // ADR-0076, so no existing symlinked file depends on loading.
+            Self::TrustedSource => None,
         }
     }
 
@@ -370,6 +379,35 @@ pub(crate) struct AuthorizedConfig<'a> {
 
 impl AuthorizedConfig<'_> {
     pub(crate) fn file(&self) -> &Path {
+        self.file
+    }
+}
+
+/// The token the top-level adoptable parsers (`mounts`, `[network]`,
+/// `allow_tools`) demand instead of an [`AuthorizedConfig`].
+///
+/// Two constructors exist in the whole crate, and neither takes a bare pathname:
+/// [`AdoptedAuthority::from_verified`] for an ADR-0040 verified `trust = true`
+/// source or the ADR-0073 [`VerifiedProject`], and
+/// [`ApprovedSourceContent::adopted_authority`] for bytes a `ContentApprovalPolicy`
+/// approved (#736). So "top-level authority came from a verified read" is a type,
+/// not a convention.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AdoptedAuthority<'a> {
+    file: &'a Path,
+}
+
+impl<'a> AdoptedAuthority<'a> {
+    /// Borrow the authority of an already-tokenized read. The token's lifetime is
+    /// the borrow, not the read's own, so a caller may hand it to one parser and
+    /// drop it with the frame.
+    pub(crate) fn from_verified(authorized: &'a AuthorizedConfig<'_>) -> Self {
+        Self {
+            file: authorized.file(),
+        }
+    }
+
+    pub(crate) fn file(&self) -> &'a Path {
         self.file
     }
 }
@@ -648,20 +686,206 @@ fn measure_facts(
     }
 }
 
+/// Proof that the host-managed project config passed ADR-0073 [`verify_project`].
+///
+/// Private fields: only [`verify_project`] constructs one. It carries the
+/// verified file's descriptor identity so `config::load` can refuse a source that
+/// is really this file — through `..`, a symlink or a hard link — before
+/// interpreting any of its bytes (ADR-0076 R4.2).
+///
+/// Deliberately has **no** method that approves a `trust = false` source: passing
+/// `verify_project` proves the user wrote a *pathname*, not that the bytes at that
+/// pathname are approved. Only [`ApprovedSourceContent`] can do that (#736).
+#[derive(Debug)]
+pub(crate) struct VerifiedProject {
+    file: PathBuf,
+    identity: crate::host_paths::FileIdentity,
+}
+
+impl VerifiedProject {
+    pub(crate) fn path(&self) -> &Path {
+        &self.file
+    }
+
+    pub(crate) fn file_identity(&self) -> crate::host_paths::FileIdentity {
+        self.identity
+    }
+
+    /// The project config's own authority token, for its top-level `mounts` and
+    /// `[network]` (ADR-0076 R3): the verified project file is the root of the
+    /// project's trust, so its own declarations need no further gate.
+    pub(crate) fn authorized(&self) -> AuthorizedConfig<'_> {
+        AuthorizedConfig { file: &self.file }
+    }
+}
+
 /// ADR-0073: the project tier's verification. Reuses the proved
 /// [`authority_refusal`] kernel with `symlink_metadata(parent)` (no parent
 /// symlink following) and no presence trigger. Takes the path and
 /// [`FinalComponent`] from a no-follow open
 /// (`host_paths::open_regular_no_follow_checkpointed`), so a final symlink is
-/// refused without ever opening or reading its target, and no
-/// [`AuthorizedConfig`] is minted because the project tier still parses no
-/// authority-bearing field (`config::refuse_project_authority`).
+/// refused without ever opening or reading its target.
 pub(crate) fn verify_project(
     path: &Path,
     final_component: &FinalComponent,
-) -> Result<(), UntrustedConfig> {
+) -> Result<VerifiedProject, UntrustedConfig> {
     measure_facts(path, final_component, false)
-        .map_err(|measurement| measurement.into_untrusted(AuthoritySubject::ProjectConfig))
+        .map_err(|measurement| measurement.into_untrusted(AuthoritySubject::ProjectConfig))?;
+    let FinalComponent::Regular(facts) = final_component else {
+        // `authority_refusal` refuses `ThroughSymlink` once the directory passes,
+        // so this arm is unreachable; naming the refusal keeps it a load error
+        // rather than a panic if that ever changes.
+        return Err(UntrustedConfig::Refused {
+            refusal: AuthorityRefusal::ThroughSymlink,
+            subject: AuthoritySubject::ProjectConfig,
+        });
+    };
+    Ok(VerifiedProject {
+        file: path.to_path_buf(),
+        identity: facts.identity(),
+    })
+}
+
+/// Unconditional ADR-0040 verification for a non-default `trust = true` source
+/// (ADR-0076 R2.3).
+///
+/// Unlike [`verify`], there is no presence trigger and no symlink compatibility:
+/// the file is a trusted source whatever it declares, so an image-only or
+/// tools-only file is measured too. `parent_dir` is the `fstat` of the exact
+/// directory descriptor `open_trusted_source_route` opened, and
+/// `final_component` its `openat(O_NOFOLLOW)` result, so the measurement cannot
+/// observe a different file than the one that will be read.
+///
+/// Passing mints both an [`AuthorizedConfig`] (for top-level adoption) and a
+/// [`ReferenceTrust`] (for a project `allow_tools` entry naming its tools).
+pub(crate) fn verify_trusted_source_at<'a>(
+    path: &'a Path,
+    parent_dir: DirFacts,
+    final_component: &FinalComponent,
+) -> Result<(AuthorizedConfig<'a>, ReferenceTrust), UntrustedConfig> {
+    let reached = match final_component {
+        FinalComponent::Symlink => Reached::ThroughSymlink,
+        FinalComponent::Regular(facts) => Reached::Direct(FileFacts {
+            uid: facts.uid,
+            mode: raw_mode_u32(facts.mode),
+            nlink: facts.nlink,
+        }),
+    };
+    match authority_refusal(reached, parent_dir, crate::host_paths::current_euid()) {
+        Some(refusal) => Err(UntrustedConfig::Refused {
+            refusal,
+            subject: AuthoritySubject::TrustedSource,
+        }),
+        None => Ok((
+            AuthorizedConfig { file: path },
+            ReferenceTrust {
+                file: path.to_path_buf(),
+                measurement: Ok(()),
+            },
+        )),
+    }
+}
+
+/// Proof that the exact bytes of a `trust = false` source were approved for
+/// top-level adoption under a verified project config (#736 pinning seam).
+///
+/// Binds `(project_config, lexical source_path, exact bounded bytes)` together so
+/// decoding consumes the exact approved buffer — never a second read, and never a
+/// free-standing pathname token that later bytes could inherit.
+pub(crate) struct ApprovedSourceContent<'a> {
+    /// The verified project config whose `allow = true` declaration asked for the
+    /// adoption: kept bound to the bytes, and read by #736's policy tests, which
+    /// are the only consumers of the two accessors below until then.
+    #[allow(dead_code)]
+    project_config: &'a Path,
+    source_path: &'a Path,
+    bytes: &'a [u8],
+}
+
+impl<'a> ApprovedSourceContent<'a> {
+    /// The only other [`AdoptedAuthority`] constructor: the bytes themselves were
+    /// approved, so the pathname is no longer what carries the authority.
+    pub(crate) fn adopted_authority(&self) -> AdoptedAuthority<'a> {
+        AdoptedAuthority {
+            file: self.source_path,
+        }
+    }
+
+    pub(crate) fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn source_path(&self) -> &'a Path {
+        self.source_path
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn project_config(&self) -> &'a Path {
+        self.project_config
+    }
+}
+
+#[cfg(test)]
+impl<'a> ApprovedSourceContent<'a> {
+    /// The test-only approver #748 needs: it binds the same
+    /// `(project config, lexical path, exact bytes)` triple the shipping #736
+    /// policy will, so a test cannot approve one file's bytes under another's
+    /// path.
+    pub(crate) fn for_test(
+        project: &'a VerifiedProject,
+        entry: &'a crate::config_sources::SourceEntry,
+        bytes: &'a [u8],
+    ) -> Self {
+        Self {
+            project_config: project.path(),
+            source_path: entry.path(),
+            bytes,
+        }
+    }
+}
+
+/// Predicate deciding whether a `trust = false, allow = true` source's exact bytes
+/// are approved for top-level adoption.
+///
+/// This is the seam #736 fills. In `#748` production, [`UnpinnedContentPolicy`]
+/// refuses before any decoding or adoption; #736 supplies a policy backed by
+/// `pins.json` content hashes; #748's own tests supply a hash-matching policy to
+/// prove the approved and unapproved paths end to end.
+pub(crate) trait ContentApprovalPolicy {
+    fn approve_untrusted_adoption<'a>(
+        &self,
+        project: &'a VerifiedProject,
+        entry: &'a crate::config_sources::SourceEntry,
+        bytes: &'a [u8],
+    ) -> anyhow::Result<ApprovedSourceContent<'a>>;
+}
+
+/// The production policy in `#748`: no `trust = false` bytes are approved yet.
+///
+/// Refusing here — before UTF-8, TOML or adoption decoding — is what keeps mutable
+/// repository bytes from granting ambient mounts, egress, a boot image or launch
+/// verbs on the strength of a pathname the user wrote once.
+pub(crate) struct UnpinnedContentPolicy;
+
+impl ContentApprovalPolicy for UnpinnedContentPolicy {
+    fn approve_untrusted_adoption<'a>(
+        &self,
+        project: &'a VerifiedProject,
+        entry: &'a crate::config_sources::SourceEntry,
+        _bytes: &'a [u8],
+    ) -> anyhow::Result<ApprovedSourceContent<'a>> {
+        Err(anyhow::anyhow!(
+            "config: {}: {}: allow = true on a trust = false source cannot adopt top-level image, \
+             mounts, [network], or allow_tools until content-hash pinning (#736) approves the \
+             file's bytes; set allow = false and opt in explicitly from the project config \
+             (image = \"{alias}:image\", allow_tools = [\"{alias}:<tool>\"]), or move the file \
+             outside the project and set trust = true",
+            crate::one_line::quoted_path(project.path()),
+            entry.declared(),
+            alias = entry.alias(),
+        ))
+    }
 }
 
 pub(crate) fn raw_mode_u32(mode: rustix::fs::RawMode) -> u32 {
@@ -892,6 +1116,9 @@ mod tests {
             // ADR-0073: no field made the file authority-bearing, so there is
             // no "without …" compatibility to claim.
             AuthoritySubject::ProjectConfig => ("the project config", "project config", None),
+            // ADR-0076: a non-default trusted source is verified whatever it
+            // declares and has no legacy dotfile contract.
+            AuthoritySubject::TrustedSource => ("a trusted source", "trusted source file", None),
         }
     }
 
@@ -1856,8 +2083,10 @@ mod tests {
         match crate::host_paths::open_regular_no_follow_checkpointed(path, || {})
             .expect("opening the fixture")
         {
-            Some(opened) => verify_project(path, &FinalComponent::Regular(opened.facts())),
-            None => verify_project(path, &FinalComponent::Symlink),
+            Some(opened) => {
+                verify_project(path, &FinalComponent::Regular(opened.facts())).map(|_| ())
+            }
+            None => verify_project(path, &FinalComponent::Symlink).map(|_| ()),
         }
     }
 
@@ -2021,7 +2250,7 @@ mod tests {
         let verification = verify(&read, none).expect("the user tier's presence rule is unchanged");
         assert!(verification.authorized.is_none());
         assert_eq!(
-            verify_project(&link, &FinalComponent::Symlink),
+            verify_project(&link, &FinalComponent::Symlink).map(|_| ()),
             Err(UntrustedConfig::Refused {
                 refusal: AuthorityRefusal::ThroughSymlink,
                 subject: AuthoritySubject::ProjectConfig,

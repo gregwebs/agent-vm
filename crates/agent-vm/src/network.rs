@@ -287,19 +287,19 @@ impl Plan {
                              them",
                             including_via(&references)
                         )),
-                        (None, Some((file, references))) => clauses.push(format!(
-                            "persisted hostname grants from \"{}\" [network]{} apply to every \
+                        (None, Some((files, references))) => clauses.push(format!(
+                            "persisted hostname grants from {} [network]{} apply to every \
                              launch; remove them there",
-                            crate::one_line::path(file),
+                            crate::egress_policy::quoted_files(files),
                             including_via(&references)
                         )),
-                        (Some(cli_references), Some((file, saved_references))) => {
+                        (Some(cli_references), Some((files, saved_references))) => {
                             clauses.push(format!(
                                 "hostnames from --allow-egress{} apply to this launch; persisted \
-                                 hostname grants from \"{}\" [network]{} apply to every launch; \
+                                 hostname grants from {} [network]{} apply to every launch; \
                                  remove the persisted ones there and stop passing --allow-egress",
                                 including_via(&cli_references),
-                                crate::one_line::path(file),
+                                crate::egress_policy::quoted_files(files),
                                 including_via(&saved_references)
                             ))
                         }

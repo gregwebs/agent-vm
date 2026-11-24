@@ -375,6 +375,13 @@ impl SetNamespace {
 #[derive(Clone, Debug)]
 pub(crate) struct UserMounts {
     file: PathBuf,
+    /// Every file that contributed top-level `mounts`, in adoption order
+    /// (ADR-0076 R4.2). One entry for a single-file load, so every notice's bytes
+    /// are unchanged; `file` is the first.
+    files: Vec<PathBuf>,
+    /// The default user config that supplied `[mount_sets]`, when one did. Only
+    /// that tier may declare sets until #738.
+    sets_file: Option<PathBuf>,
     /// `Some` iff the file has a top-level `mounts` key, present-empty included.
     defaults: Option<ResolvedMountList>,
     /// The validated namespace the defaults list and every tool list selected
@@ -399,6 +406,16 @@ pub(crate) struct UserMounts {
 impl UserMounts {
     pub(crate) fn file(&self) -> &Path {
         &self.file
+    }
+
+    /// Every file whose top-level `mounts` contributed, in adoption order.
+    pub(crate) fn files(&self) -> &[PathBuf] {
+        &self.files
+    }
+
+    /// The file that supplied `[mount_sets]`, when this configuration has sets.
+    pub(crate) fn sets_file(&self) -> Option<&Path> {
+        self.sets_file.as_deref()
     }
 
     /// The declarations this file selects automatically on every launch, after
@@ -636,14 +653,149 @@ impl UserMounts {
             work,
         )?;
 
+        let declares_sets = !sets.index.is_empty();
+        let files = if defaults.is_some() {
+            vec![builder.file.clone()]
+        } else {
+            Vec::new()
+        };
+        let sets_file = declares_sets.then(|| builder.file.clone());
         Ok(Self {
             file: builder.file,
+            files,
+            sets_file,
             defaults,
             sets,
             tool_lists,
             entries: builder.entries,
             references: tracker.admissions,
         })
+    }
+}
+
+/// Union every adopted top-level `mounts` list into the one automatic selection a
+/// launch uses (ADR-0076 R4.2).
+///
+/// `contributions` arrive in adoption order — each `allow = true` source in
+/// `[[sources]]` order, then the project config — and are merged with the same
+/// claim rule `--mount` uses: an identical declaration at the same guest path
+/// deduplicates first-seen, and differing declarations there are a hard load error
+/// naming both files and both sites. `user_sets_mounts` carries the default user
+/// config's `[mount_sets]` namespace, which only that tier may declare until #738.
+///
+/// Single-file behaviour is byte-identical: one contribution produces a
+/// `UserMounts` whose `files` is that one file, and `mount_selection` renders it
+/// exactly as before.
+pub(crate) fn merge_adopted_mounts(
+    contributions: Vec<(PathBuf, ResolvedMountList)>,
+    user_sets_mounts: Option<UserMounts>,
+) -> anyhow::Result<Option<UserMounts>> {
+    let contributing_files: Vec<PathBuf> = contributions
+        .iter()
+        .filter(|(_, list)| !list.is_empty() || !contributions.is_empty())
+        .map(|(file, _)| file.clone())
+        .collect();
+    if contributions.is_empty() {
+        return Ok(user_sets_mounts);
+    }
+    // Fast path: the default user config is the only contributor, so nothing can
+    // conflict and its own parsing is authoritative.
+    if contributions.len() == 1
+        && let Some(sets_mounts) = &user_sets_mounts
+        && sets_mounts.file() == contributions[0].0
+        && sets_mounts.defaults() == Some(&contributions[0].1)
+    {
+        return Ok(user_sets_mounts);
+    }
+
+    let mut index: std::collections::BTreeMap<&Path, (&PathBuf, &ConfigMountLeaf)> =
+        std::collections::BTreeMap::new();
+    let mut unique: Vec<&Arc<ConfigMountLeaf>> = Vec::new();
+    for (file, list) in &contributions {
+        for leaf in list.leaves() {
+            let guest = leaf.request.mount.guest.as_path();
+            match index.get(guest) {
+                None => {
+                    index.insert(guest, (file, leaf));
+                    unique.push(leaf);
+                }
+                Some(&(first_file, first)) => {
+                    let decision = crate::mount::claim_decision(crate::mount::ClaimFacts {
+                        same_guest: true,
+                        equivalent: crate::mount::same_declaration(
+                            &first.request.mount,
+                            &leaf.request.mount,
+                        ),
+                    });
+                    match decision {
+                        crate::mount::ClaimDecision::Merge => {}
+                        crate::mount::ClaimDecision::Conflict
+                        | crate::mount::ClaimDecision::Distinct => {
+                            return Err(anyhow::anyhow!(
+                                "config: {}: {} conflicts with {}: {}: both declare the same guest \
+                                 path; remove or align one of them",
+                                crate::one_line::quoted_path(file),
+                                leaf.site,
+                                crate::one_line::quoted_path(first_file),
+                                first.site,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let merged = ResolvedMountList::from_leaves(unique.into_iter().cloned().collect());
+    let first = contributions[0].0.clone();
+    let (sets, sets_file) = match user_sets_mounts {
+        Some(sets_mounts) => (sets_mounts.sets, sets_mounts.sets_file),
+        None => (SetNamespace::empty(), None),
+    };
+    Ok(Some(UserMounts {
+        file: first,
+        files: contributing_files,
+        sets_file,
+        defaults: Some(merged),
+        sets,
+        tool_lists: ToolMountLists::empty(),
+        entries: 0,
+        references: 0,
+    }))
+}
+
+impl UserMounts {
+    /// Parse **only** a file's top-level `mounts` into a resolved list, with an
+    /// empty set namespace and the caller's host grammar (ADR-0076 R4.2).
+    ///
+    /// The project config and every `allow = true` source take this path, so all of
+    /// them are bound and merged by the same `bind_entries` + `merge_entries` code
+    /// as the default user config, with zero host-path I/O. `[mount_sets]` stays
+    /// the default user config's alone until #738, so a `set:` selector here can
+    /// only be refused, exactly as in a project or sourced tool list.
+    pub(super) fn parse_top_level_defaults(
+        file: PathBuf,
+        defaults: &toml::Value,
+        syntax: HostSyntax<'_>,
+    ) -> Result<ResolvedMountList, UserMountsError> {
+        let mut builder = Builder {
+            file,
+            leaves: Vec::new(),
+            entries: 0,
+        };
+        let sets = SetNamespace::empty();
+        let mut tracker = ChildTracker::new(0);
+        let bound = bind_entries(
+            Some(defaults),
+            ListSite::Defaults,
+            &sets,
+            syntax,
+            &mut builder,
+        )?
+        .expect("a present defaults value binds to a present list");
+        // Exempt, as the verified parser's defaults list is: the shared budget
+        // bounds a *launch's* comparisons, and a defaults list is not one.
+        merge_entries(&bound, &builder.leaves, &sets, Charge::Exempt, &mut tracker)
     }
 }
 

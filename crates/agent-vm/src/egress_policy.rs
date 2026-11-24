@@ -100,7 +100,9 @@ mod hostname_notice;
 mod view;
 /// Borrowed verified user authority; resolution assembles it without filesystem reads.
 pub(crate) struct UserEgress<'a> {
-    pub(crate) file: &'a std::path::Path,
+    /// Every contributing file, in adoption order (ADR-0076 R4.3): one entry
+    /// renders exactly the pre-#748 notice bytes, and several list every file.
+    pub(crate) files: &'a [std::path::PathBuf],
     pub(crate) internet: Option<bool>,
     pub(crate) lan: Option<bool>,
     pub(crate) host: Option<bool>,
@@ -278,12 +280,24 @@ struct GroupOrigin {
 }
 #[derive(Clone, Debug)]
 struct Provenance {
-    file: std::path::PathBuf,
+    /// Every file whose `[network]` contributed, in adoption order (ADR-0076
+    /// R4.3); the first is the single-file case every notice renders unchanged.
+    files: Vec<std::path::PathBuf>,
     internet: GroupOrigin,
     lan: GroupOrigin,
     host: GroupOrigin,
     // Membership by canonical value, never index-aligned with effective lists.
     user_entries: ResolvedAllowances,
+}
+
+/// Every contributing file, quoted and comma-separated for one notice line
+/// (ADR-0076 R4.3): one file renders exactly the pre-#748 bytes.
+pub(crate) fn quoted_files(files: &[std::path::PathBuf]) -> String {
+    files
+        .iter()
+        .map(|file| format!("\"{}\"", crate::one_line::path(file)))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Which sources carry the launch's hostname authority (ADR-0037 C8 refusal).
@@ -300,8 +314,9 @@ pub(crate) struct HostnameAuthority<'a> {
     /// granted any hostname at all: a literal grant keeps its pre-#735 sentence,
     /// with an empty reference list (#735 review S4).
     pub(crate) cli: Option<Vec<&'a EgressReference>>,
-    /// The saved `[network]` table's file and its hostname-granting references.
-    pub(crate) saved: Option<(&'a std::path::Path, Vec<&'a EgressReference>)>,
+    /// The saved `[network]` table's files (in adoption order) and its
+    /// hostname-granting references.
+    pub(crate) saved: Option<(&'a [std::path::PathBuf], Vec<&'a EgressReference>)>,
     /// The authorized tool whose own `network_requests` are in force.
     pub(crate) tool: Option<&'a str>,
 }
@@ -495,7 +510,7 @@ impl EgressAuthority {
             _ => None,
         };
         let provenance = user.map(|u| Provenance {
-            file: u.file.to_owned(),
+            files: u.files.to_vec(),
             internet: GroupOrigin {
                 resolved: internet,
                 saved: u.internet,
@@ -574,7 +589,7 @@ impl EgressAuthority {
         let saved = self.provenance.as_ref().and_then(|provenance| {
             provenance.user_entries.has_hostnames().then(|| {
                 (
-                    provenance.file.as_path(),
+                    provenance.files.as_slice(),
                     provenance
                         .user_entries
                         .hostname_references()
@@ -703,17 +718,14 @@ impl EgressAuthority {
     }
     pub(crate) fn write_notices(&self, output: &mut impl std::io::Write) -> std::io::Result<()> {
         if let Some(p) = &self.provenance {
-            let file = crate::one_line::path(&p.file);
+            let file = quoted_files(&p.files);
             if self.cli_contributed {
                 writeln!(
                     output,
-                    "==> Egress authority: persisted grants from \"{file}\" [network] merged with this launch's flags (flags override persisted booleans and add allowances; nothing is saved)"
+                    "==> Egress authority: persisted grants from {file} [network] merged with this launch's flags (flags override persisted booleans and add allowances; nothing is saved)"
                 )?;
             } else {
-                writeln!(
-                    output,
-                    "==> Egress authority: persisted grants from \"{file}\""
-                )?;
+                writeln!(output, "==> Egress authority: persisted grants from {file}")?;
             }
         }
         if let Some(recorded) = self.recorded_entries() {

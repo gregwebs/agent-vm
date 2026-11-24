@@ -67,7 +67,8 @@ mod sets;
 #[cfg(test)]
 pub(crate) use sets::MAX_MOUNT_SET_EXPANSION_WORK;
 pub(crate) use sets::{
-    MountExpansionWork, UserMounts, merge_tool_mounts, parse_declared_tool_mounts,
+    MountExpansionWork, UserMounts, merge_adopted_mounts, merge_tool_mounts,
+    parse_declared_tool_mounts,
 };
 // The walk's colour kernel and its two types are the only part of the mount-set
 // graph the egress-set graph reuses (#511): "is this edge a cycle, a descent or
@@ -77,7 +78,7 @@ pub(crate) use sets::{VisitDecision, VisitState, visit_decision};
 
 use crate::{
     config::quoted_str,
-    config_authority::AuthorizedConfig,
+    config_authority::{AdoptedAuthority, AuthorizedConfig},
     mount::{
         ExtraMount, HostSyntax, MountRequest, MountSpecError, MountSpecErrorKind, expanded_entry,
         parse_mount_spec, same_declaration,
@@ -560,6 +561,24 @@ pub(crate) fn from_verified_value_fresh(
     home: Option<&Path>,
 ) -> Result<UserMounts, UserMountsError> {
     from_verified_value(authorized, values, home, &mut MountExpansionWork::fresh())
+}
+
+/// Parse a **verified** file's top-level `mounts` into a resolved list, for
+/// adoption by the project config or an `allow = true` source (ADR-0076 R4.2).
+///
+/// The [`AdoptedAuthority`] token is what makes "this list was declared by a file
+/// whose authority was established" a compile-time property: no pathname alone can
+/// reach this parser.
+pub(crate) fn from_adopted_defaults(
+    authority: &AdoptedAuthority<'_>,
+    defaults: &toml::Value,
+    home: Option<&Path>,
+) -> Result<ResolvedMountList, UserMountsError> {
+    UserMounts::parse_top_level_defaults(
+        authority.file().to_path_buf(),
+        defaults,
+        host_syntax(home),
+    )
 }
 
 /// The host grammar one verified file's entries are parsed with: `~/` expands

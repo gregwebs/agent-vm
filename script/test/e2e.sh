@@ -185,10 +185,11 @@ OWNED_BUILDER=""
 # built-in defaults, so an un-migrated launcher is refused up front rather than
 # passing vacuously. `agent-vm <major>.<minor>.<patch> (...)`:
 # 0.8.1 is the first release with the host-managed tier, flat `sources`
-# (ADR-0074) and the flipped image precedence; 0.8.2 is the first with explicit
-# tool authorization (ADR-0075), so a fixture whose `[[tools]]` block is inert
+# (ADR-0074) and the flipped image precedence; 0.8.2 added explicit tool
+# authorization (ADR-0075), so a fixture whose `[[tools]]` block is inert
 # without `allow_tools` would otherwise launch nothing and pass the rows below
-# misleadingly.
+# misleadingly; 0.8.3 is the first with `[[sources]]` tables (ADR-0076), so a
+# 0.8.2 reader would fail every seeded project config as a schema error.
 candidate_reads_host_managed_config() {
   local bin="$1" version major minor patch
   version="$("$bin" --version 2>/dev/null | awk 'NR == 1 {print $2}')" || return 1
@@ -202,7 +203,7 @@ candidate_reads_host_managed_config() {
   patch="${version#*.*.}"
   patch="${patch%%[!0-9]*}"
   [ "$major" -gt 0 ] ||
-    { [ "$major" -eq 0 ] && { [ "$minor" -gt 8 ] || { [ "$minor" -eq 8 ] && [ "$patch" -ge 2 ]; }; }; }
+    { [ "$major" -eq 0 ] && { [ "$minor" -gt 8 ] || { [ "$minor" -eq 8 ] && [ "$patch" -ge 3 ]; }; }; }
 }
 
 [[ -x "$AGENT_VM" ]] || die "launcher not found at $AGENT_VM; build it with
@@ -215,7 +216,7 @@ or point AGENT_VM_BIN at one."
 for candidate in "$AGENT_VM" "$AGENT_VM_DEV_BIN" "$AGENT_VM_RELEASE_BIN"; do
   [[ -x "$candidate" ]] || continue
   candidate_reads_host_managed_config "$candidate" ||
-    die "the launcher at $candidate is older than 0.8.2; it reads <project>/.agent-vm/config.toml instead of the host-managed project config (ADR-0073) and predates explicit tool authorization (ADR-0075). Rebuild it from this branch."
+    die "the launcher at $candidate is older than 0.8.3; it reads <project>/.agent-vm/config.toml instead of the host-managed project config (ADR-0073), predates explicit tool authorization (ADR-0075), or cannot read [[sources]] tables (ADR-0076). Rebuild it from this branch."
 done
 
 command -v docker >/dev/null 2>&1 || die "docker is required but not on PATH"
@@ -6633,12 +6634,12 @@ custom_image_retained_default() {
     return 1
   fi
   if ! candidate_reads_host_managed_config "$dev_bin"; then
-    echo "    BLOCKER: the debug candidate $dev_bin is older than 0.8.2 (ADR-0073, ADR-0075);"
+    echo "    BLOCKER: the debug candidate $dev_bin is older than 0.8.3 (ADR-0073, ADR-0075, ADR-0076);"
     echo "             rebuild it from this branch, or set AGENT_VM_DEV_BIN to one"
     return 1
   fi
   if ! candidate_reads_host_managed_config "$rel_bin"; then
-    echo "    BLOCKER: the release candidate $rel_bin is older than 0.8.2 (ADR-0073, ADR-0075);"
+    echo "    BLOCKER: the release candidate $rel_bin is older than 0.8.3 (ADR-0073, ADR-0075, ADR-0076);"
     echo "             rebuild it from this branch, or set AGENT_VM_RELEASE_BIN to one"
     return 1
   fi
@@ -7066,8 +7067,9 @@ custom_image_default_upgrade() {
   upgrade_docker logs "$container" > "$WORK/upgrade-registry-after.log" 2>&1 || result=1
   assert_eq 'warm default makes zero registry reads' "$reads_before" "$reads_after" || result=1
   # Adjacent override boundaries use guest stamps, not notices. B is the stamped
-  # image (stamp=present) and A the unstamped one (stamp=absent). ADR-0074 makes
-  # the project config outrank the `:trust` user image, so the tiers are seeded
+  # image (stamp=present) and A the unstamped one (stamp=absent). ADR-0074/0076
+  # make the project config outrank the implicit `home` source's fallback image,
+  # so the tiers are seeded
   # to keep every boundary non-vacuous: user = B, project = A, env = B, CLI = B.
   # A dropped env check then falls through to project A (stamp=absent), a dropped
   # project check to user B (stamp=present), and a dropped user fallback below to

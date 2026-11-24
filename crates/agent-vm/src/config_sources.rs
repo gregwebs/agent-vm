@@ -1,42 +1,65 @@
-//! A project config's `sources = [...]` (ADR-0074): which other config files a
-//! project reads, under which alias, and whether each is `:trust`.
+//! A project config's `[[sources]]` tables (ADR-0076): which other config
+//! files a project reads, under which alias, and with which attributes.
 //!
 //! Pure: no filesystem access. [`crate::config::load`] reads what this module
 //! resolves. Every diagnostic names `sources[N]` and the project config, never
 //! entry text ([`crate::config`]'s value-safe rule).
 //!
-//! Three rules shape the grammar:
+//! Five rules shape the grammar:
 //!
+//! * **A bounded list.** At most `MAX_DECLARED_SOURCES` entries. Every source is
+//!   route-verified and fully parsed on every launch, so the count is the cheapest
+//!   place to bound what one project config can ask a launch to spend, and it is
+//!   checked before any entry is scanned.
 //! * **Flat sourcing.** Only the project config may declare `sources`; a sourced
 //!   file that declares it is refused by presence, so no file can widen the set
 //!   of files a launch reads without the user editing the one file that decides
 //!   it.
-//! * **Trust is a route, not a spelling.** `:trust` is admitted only for the
-//!   discovered user config path (ADR-0038's guarded file), and this module
-//!   compares lexically: canonical equality must never widen trust, because a
-//!   symlink into the checkout would then name the guarded file and read
-//!   repository bytes (ADR-0074 D3).
+//! * **Two independent attributes.** `trust` (bypass content-hash pinning) and
+//!   `allow` (adopt this file's top-level authorizations) are separate booleans,
+//!   so all four combinations are expressible. Nothing here decides what either
+//!   one *means*; that is [`crate::config::load`]'s job.
+//! * **Trust is a route, not a spelling.** Any path outside the checkout may be
+//!   `trust = true` (ADR-0076), but whether the route to it is host-controlled
+//!   is decided by [`crate::project_config`], never by canonical equality here.
 //! * **Resolution is lexical.** Nothing here canonicalizes or stats. `..` is kept
 //!   uncollapsed so the OS resolves it through a symlink the way the user's
 //!   spelling says, instead of this module silently choosing a different file.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Result, anyhow};
 
 /// The implicit source's alias: an absent project config, or no `sources` key
-/// (ADR-0074 D2).
+/// (ADR-0076 R1.1).
 pub(crate) const HOME_ALIAS: &str = "home";
 const MAX_ALIAS_LEN: usize = 32;
-const TRUST_QUALIFIER: &str = "trust";
 const IMAGE_SELECTOR: &str = "image";
+
+/// A fail-closed bound on the `[[sources]]` tables one project config may
+/// declare.
+///
+/// A real project lists the default `home` file plus a handful of shared, team or
+/// per-checkout files; thirty-two is several times the largest hand-written list
+/// we have seen, and it stays an order of magnitude below the 256 distinct trusted
+/// sources the cross-project guard scans across **all** projects. Each entry costs
+/// a route walk from `/`, a verified read and a full parse on every launch, and an
+/// `allow = true` one can adopt authority, so the count is where the bound belongs:
+/// it is checked before the list is scanned at all.
+pub(crate) const MAX_DECLARED_SOURCES: usize = 32;
+
+const KEY_NAME: &str = "name";
+const KEY_PATH: &str = "path";
+const KEY_TRUST: &str = "trust";
+const KEY_ALLOW: &str = "allow";
 
 /// A validated alias: `[a-z][a-z0-9_-]{0,31}`.
 ///
 /// Validation is what lets `doctor` render the alias raw: no control, quote or
 /// backslash byte can survive it, so a source label cannot rewrite the terminal.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct SourceAlias(String);
 
 impl SourceAlias {
@@ -56,7 +79,7 @@ impl SourceAlias {
         &self.0
     }
 
-    fn home() -> Self {
+    pub(crate) fn home() -> Self {
         Self(HOME_ALIAS.to_owned())
     }
 
@@ -81,12 +104,14 @@ impl fmt::Display for SourceAlias {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SourceTrust {
-    /// `:trust`: read as the user tier (ADR-0040 verify, may carry authority).
-    Trusted,
-    /// No qualifier: declarations only; pinned by #736.
-    Untrusted,
+/// Named booleans so `trust` and `allow` can never be transposed at a call site
+/// (`CODING_STANDARDS.md` → *Types*).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SourceAttributes {
+    /// Bypass content-hash pinning (#736) and read through the verified path.
+    pub(crate) trust: bool,
+    /// Adopt this file's top-level `image`/`mounts`/`[network]`/`allow_tools`.
+    pub(crate) allow: bool,
 }
 
 /// Where an entry came from, for diagnostics.
@@ -99,7 +124,9 @@ pub(crate) enum Declaration {
 impl fmt::Display for Declaration {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Implicit => formatter.write_str("the default home:trust source"),
+            // Neither attribute is implied by the position, so the label names
+            // only the source, not a `:trust` qualifier that no longer exists.
+            Self::Implicit => formatter.write_str("the default home source"),
             Self::Entry(index) => write!(formatter, "sources[{index}]"),
         }
     }
@@ -109,7 +136,7 @@ impl fmt::Display for Declaration {
 pub(crate) struct SourceEntry {
     declared: Declaration,
     alias: SourceAlias,
-    trust: SourceTrust,
+    attributes: SourceAttributes,
     path: PathBuf,
 }
 
@@ -122,8 +149,16 @@ impl SourceEntry {
         &self.alias
     }
 
-    pub(crate) fn trust(&self) -> SourceTrust {
-        self.trust
+    pub(crate) fn is_trusted(&self) -> bool {
+        self.attributes.trust
+    }
+
+    pub(crate) fn is_allowed(&self) -> bool {
+        self.attributes.allow
+    }
+
+    pub(crate) fn attributes(&self) -> SourceAttributes {
+        self.attributes
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -133,9 +168,9 @@ impl SourceEntry {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Sourcing {
-    /// No project config, or a project config without a `sources` key (D2).
+    /// No project config, or a project config without a `sources` key.
     Implicit,
-    /// The project config listed `sources = [...]`, `[]` included.
+    /// The project config listed `[[sources]]`, `sources = []` included.
     Listed,
 }
 
@@ -145,7 +180,7 @@ pub(crate) struct DeclaredSources {
     entries: Vec<SourceEntry>,
 }
 
-/// Everything resolution is relative to. Named fields, because four paths in a
+/// Everything resolution is relative to. Named fields, because three paths in a
 /// positional signature could be swapped at a call site without a compile error
 /// (`CODING_STANDARDS.md` → *Types*).
 pub(crate) struct ResolveContext<'a> {
@@ -156,20 +191,23 @@ pub(crate) struct ResolveContext<'a> {
     pub(crate) home: &'a Path,
     /// The captured, canonical `ProjectDir` (`./` and other relative spellings).
     pub(crate) project_root: &'a Path,
-    /// `ConfigPaths::user`: the only path `:trust` accepts (D3).
-    pub(crate) user_config: &'a Path,
 }
 
 impl DeclaredSources {
-    /// The implicit single source: `home:trust <user_config>`, or nothing when
-    /// `$HOME` is unavailable, which keeps the user tier `UnavailableHome`.
+    /// The implicit single source, behaving exactly like an explicit
+    /// `{ name = "home", path = "~/.config/agent-vm/config.toml", trust = true,
+    /// allow = true }`, or nothing when `$HOME` is unavailable (which keeps the
+    /// user tier `UnavailableHome`).
     pub(crate) fn implicit(user_config: Option<&Path>) -> Self {
         let entries = user_config
             .map(|path| {
                 vec![SourceEntry {
                     declared: Declaration::Implicit,
                     alias: SourceAlias::home(),
-                    trust: SourceTrust::Trusted,
+                    attributes: SourceAttributes {
+                        trust: true,
+                        allow: true,
+                    },
                     path: path.to_path_buf(),
                 }]
             })
@@ -180,36 +218,44 @@ impl DeclaredSources {
         }
     }
 
-    /// Parse the project config's own list, entry by entry, rules in table order.
-    pub(crate) fn listed(raw: &[String], context: &ResolveContext<'_>) -> Result<Self> {
-        let mut entries: Vec<SourceEntry> = Vec::with_capacity(raw.len());
-        for (index, text) in raw.iter().enumerate() {
-            let entry = match entry(index, text, context) {
-                Ok(entry) => entry,
-                Err(refusal) => return Err(sources_error(context.project_config, index, refusal)),
+    /// Parse the project config's own `sources` value as an array of tables,
+    /// entry by entry, rules in declaration order.
+    pub(crate) fn parse(value: &toml::Value, context: &ResolveContext<'_>) -> Result<Self> {
+        let Some(items) = value.as_array() else {
+            return Err(anyhow!(
+                "config: {}: sources: must be an array of [[sources]] tables (or sources = [])",
+                crate::one_line::quoted_path(context.project_config)
+            ));
+        };
+        // Before any entry is scanned: the bound is on the list, so a config that
+        // asks for more is refused without the per-entry work it asks for.
+        if items.len() > MAX_DECLARED_SOURCES {
+            return Err(anyhow!(
+                "config: {}: sources: more than {MAX_DECLARED_SOURCES} declared sources; each one \
+                 is verified and parsed on every launch, so keep the files this project uses and \
+                 remove the rest",
+                crate::one_line::quoted_path(context.project_config)
+            ));
+        }
+        let mut entries: Vec<SourceEntry> = Vec::with_capacity(items.len());
+        let mut declared = DeclaredIndex::default();
+        for (index, item) in items.iter().enumerate() {
+            if item.is_str() {
+                return Err(list_error(
+                    context.project_config,
+                    index,
+                    STRING_ENTRY_MIGRATION,
+                ));
+            }
+            let Some(table) = item.as_table() else {
+                return Err(list_error(
+                    context.project_config,
+                    index,
+                    NOT_A_SOURCES_TABLE,
+                ));
             };
-            // Earlier entries only, so the diagnostic always names the later
-            // one — the entry the user has to change.
-            if let Some(first) = entries
-                .iter()
-                .position(|earlier| earlier.alias == entry.alias)
-            {
-                return Err(sources_error(
-                    context.project_config,
-                    index,
-                    EntryRefusal::DuplicateAlias(first),
-                ));
-            }
-            if let Some(first) = entries
-                .iter()
-                .position(|earlier| earlier.path == entry.path)
-            {
-                return Err(sources_error(
-                    context.project_config,
-                    index,
-                    EntryRefusal::DuplicatePath(first),
-                ));
-            }
+            let entry = entry(index, table, context)?;
+            declared.record(index, &entry, context.project_config)?;
             entries.push(entry);
         }
         Ok(Self {
@@ -231,6 +277,40 @@ impl DeclaredSources {
     }
 }
 
+/// The aliases and paths already declared, by the index that declared them.
+///
+/// Two maps, so a new entry costs one lookup each instead of a rescan of every
+/// earlier entry: the check has to stay linear, or accepting a long list becomes
+/// quadratic work of its own (5,000 entries cost 3.8 s when it was a scan).
+#[derive(Default)]
+struct DeclaredIndex {
+    aliases: HashMap<SourceAlias, usize>,
+    paths: HashMap<PathBuf, usize>,
+}
+
+impl DeclaredIndex {
+    /// Refuse `entry` when an earlier one already used its alias or its path,
+    /// naming the later entry first — the one the user has to change — and the
+    /// earlier one second.
+    fn record(&mut self, index: usize, entry: &SourceEntry, file: &Path) -> Result<()> {
+        if let Some(first) = self.aliases.get(&entry.alias) {
+            return Err(anyhow!(
+                "config: {}: sources[{index}]: the alias is already declared by sources[{first}]",
+                crate::one_line::quoted_path(file)
+            ));
+        }
+        if let Some(first) = self.paths.get(&entry.path) {
+            return Err(anyhow!(
+                "config: {}: sources[{index}]: this file is already sourced by sources[{first}]",
+                crate::one_line::quoted_path(file)
+            ));
+        }
+        self.aliases.insert(entry.alias.clone(), index);
+        self.paths.insert(entry.path.clone(), index);
+        Ok(())
+    }
+}
+
 /// The alias of a project-config `image` value shaped exactly `ALIAS:image`
 /// (ADR-0074 D6), whether or not that alias is declared. `None` means "an OCI
 /// reference".
@@ -244,113 +324,174 @@ pub(crate) fn image_alias(raw: &str) -> Option<SourceAlias> {
     (selector == IMAGE_SELECTOR).then(|| SourceAlias::parse(alias))?
 }
 
-/// One entry's grammar and path refusal, before the set rules run.
-enum EntryRefusal {
-    Fixed(&'static str),
-    DuplicateAlias(usize),
-    DuplicatePath(usize),
-}
-
-impl fmt::Display for EntryRefusal {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Fixed(reason) => formatter.write_str(reason),
-            Self::DuplicateAlias(index) => {
-                write!(
-                    formatter,
-                    "the alias is already declared by sources[{index}]"
-                )
-            }
-            Self::DuplicatePath(index) => {
-                write!(
-                    formatter,
-                    "this file is already sourced by sources[{index}]"
-                )
-            }
+/// Recover the `~/`- and `/`-anchored paths of `trust = true` sources in a
+/// project config's raw bytes, lexically and with zero filesystem access.
+///
+/// Used by [`crate::protected_config_dir`] to protect routes that *other*
+/// projects trust; a project config's own launch gets its paths from the parsed
+/// [`DeclaredSources`]. Syntactically broken TOML (or any other malformed shape)
+/// yields no paths: the file itself stays protected as a project store, and that
+/// project's own load is what reports the error.
+pub(crate) fn extract_trusted_non_relative_paths(text: &str, home: &Path) -> Vec<PathBuf> {
+    let Ok(document) = toml::from_str::<toml::Table>(text) else {
+        return Vec::new();
+    };
+    let Some(items) = document.get("sources").and_then(toml::Value::as_array) else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    for item in items {
+        let Some(table) = item.as_table() else {
+            continue;
+        };
+        if table.get(KEY_TRUST).and_then(toml::Value::as_bool) != Some(true) {
+            continue;
+        }
+        let Some(spelled) = table.get(KEY_PATH).and_then(toml::Value::as_str) else {
+            continue;
+        };
+        // Only host-anchored spellings can be trusted (ADR-0076 R2.2): a
+        // relative path is anchored at whichever project is loading, so it is
+        // never usable as a `trust = true` source.
+        if !(spelled.starts_with("~/") || spelled.starts_with('/')) {
+            continue;
+        }
+        if let Ok(path) = resolve_spelled(spelled, home, home) {
+            paths.push(path);
         }
     }
+    paths
 }
 
-const MALFORMED_ENTRY: &str = "expected \"<alias>[:trust] <path>\"";
+const STRING_ENTRY_MIGRATION: &str = "string entries (\"<alias>[:trust] <path>\") are no longer \
+     supported; declare each source as a [[sources]] table with name = \"...\", path = \"...\", \
+     and optional trust = true / allow = true";
+const NOT_A_SOURCES_TABLE: &str = "must be a [[sources]] table with name and path";
+const UNKNOWN_KEY: &str = "unknown key; supported keys are name, path, trust and allow";
 const INVALID_ALIAS: &str =
     "an alias is 1 to 32 characters of a-z, 0-9, '-' or '_', starting with a letter";
-const ONLY_QUALIFIER: &str = "the only qualifier is \":trust\"";
 const EMPTY_PATH: &str = "the path is empty";
-const SPACE_AFTER_ALIAS: &str = "separate the alias and the path with exactly one space";
-const TRAILING_WHITESPACE: &str = "the path ends with whitespace";
+const PATH_WHITESPACE: &str = "the path starts or ends with whitespace";
 const CONTROL_CHARACTER: &str = "the path contains a control character";
 const TILDE_SPELLING: &str = "only \"~/\" is expanded; write \"~/PATH\", \"./PATH\" or \"/PATH\"";
-const TRUST_ONLY_FOR_USER_CONFIG: &str = "\":trust\" is accepted only for ~/.config/agent-vm/config.toml; source this file without \":trust\"";
+const NOT_A_BOOL: &str = "must be true or false";
 const SELF_SOURCE: &str = "the project config cannot source itself";
 
-fn sources_error(file: &Path, index: usize, refusal: EntryRefusal) -> anyhow::Error {
+fn list_error(file: &Path, index: usize, refusal: &str) -> anyhow::Error {
     anyhow!(
         "config: {}: sources[{index}]: {refusal}",
         crate::one_line::quoted_path(file)
     )
 }
 
+fn field_error(file: &Path, index: usize, field: &str, refusal: &str) -> anyhow::Error {
+    anyhow!(
+        "config: {}: sources[{index}].{field}: {refusal}",
+        crate::one_line::quoted_path(file)
+    )
+}
+
+/// One `[[sources]]` table's keys, attributes, and lexical path.
 fn entry(
     index: usize,
-    raw: &str,
+    table: &toml::map::Map<String, toml::Value>,
     context: &ResolveContext<'_>,
-) -> std::result::Result<SourceEntry, EntryRefusal> {
-    let (head, spelled) = raw
-        .split_once(' ')
-        .ok_or(EntryRefusal::Fixed(MALFORMED_ENTRY))?;
-    let (alias, trust) = match head.split_once(':') {
-        None => (head, SourceTrust::Untrusted),
-        Some((alias, TRUST_QUALIFIER)) => (alias, SourceTrust::Trusted),
-        // A valid alias with any other qualifier is a rejected *qualifier*, not a
-        // malformed alias: the user has to learn which qualifier exists.
-        Some((alias, _)) if SourceAlias::parse(alias).is_some() => {
-            return Err(EntryRefusal::Fixed(ONLY_QUALIFIER));
+) -> Result<SourceEntry> {
+    let file = context.project_config;
+    // Deterministic key order (a `BTreeMap`), so a table with two problems always
+    // reports the same one.
+    for key in table.keys() {
+        match key.as_str() {
+            KEY_NAME | KEY_PATH | KEY_TRUST | KEY_ALLOW => {}
+            other => {
+                // A top-level field written after `[[sources]]` belongs to that
+                // source by TOML scoping; name the fixed canonical spelling so
+                // the user can move the line instead of guessing.
+                if let Some(field) = crate::config::top_level_field(other) {
+                    return Err(anyhow!(
+                        "config: {}: sources[{index}]: {field} is not a source key; top-level \
+                         {field} must be written before the first [[sources]] or table header \
+                         (keys after [[sources]] belong to that source)",
+                        crate::one_line::quoted_path(file)
+                    ));
+                }
+                return Err(list_error(file, index, UNKNOWN_KEY));
+            }
         }
-        Some(_) => return Err(EntryRefusal::Fixed(INVALID_ALIAS)),
+    }
+
+    let Some(raw_name) = table.get(KEY_NAME) else {
+        return Err(list_error(file, index, "missing required key \"name\""));
     };
-    let alias = SourceAlias::parse(alias).ok_or(EntryRefusal::Fixed(INVALID_ALIAS))?;
+    let Some(raw_name) = raw_name.as_str() else {
+        return Err(field_error(file, index, KEY_NAME, "must be a string"));
+    };
+    let alias = SourceAlias::parse(raw_name)
+        .ok_or_else(|| field_error(file, index, KEY_NAME, INVALID_ALIAS))?;
+
+    let Some(raw_path) = table.get(KEY_PATH) else {
+        return Err(list_error(file, index, "missing required key \"path\""));
+    };
+    let Some(spelled) = raw_path.as_str() else {
+        return Err(field_error(file, index, KEY_PATH, "must be a string"));
+    };
     if spelled.is_empty() {
-        return Err(EntryRefusal::Fixed(EMPTY_PATH));
+        return Err(field_error(file, index, KEY_PATH, EMPTY_PATH));
     }
-    if spelled.starts_with(char::is_whitespace) {
-        return Err(EntryRefusal::Fixed(SPACE_AFTER_ALIAS));
-    }
-    if spelled.ends_with(char::is_whitespace) {
-        return Err(EntryRefusal::Fixed(TRAILING_WHITESPACE));
+    if spelled.starts_with(char::is_whitespace) || spelled.ends_with(char::is_whitespace) {
+        return Err(field_error(file, index, KEY_PATH, PATH_WHITESPACE));
     }
     if spelled.chars().any(char::is_control) {
-        return Err(EntryRefusal::Fixed(CONTROL_CHARACTER));
+        return Err(field_error(file, index, KEY_PATH, CONTROL_CHARACTER));
     }
-    let path = resolve(spelled, context)?;
-    if trust == SourceTrust::Trusted && path != context.user_config {
-        return Err(EntryRefusal::Fixed(TRUST_ONLY_FOR_USER_CONFIG));
+    let path = resolve_spelled(spelled, context.home, context.project_root)
+        .map_err(|refusal| field_error(file, index, KEY_PATH, refusal))?;
+
+    let trust = optional_bool(file, index, KEY_TRUST, table.get(KEY_TRUST))?;
+    let allow = optional_bool(file, index, KEY_ALLOW, table.get(KEY_ALLOW))?;
+
+    if path == file {
+        return Err(list_error(file, index, SELF_SOURCE));
     }
-    if path == context.project_config {
-        return Err(EntryRefusal::Fixed(SELF_SOURCE));
-    }
+
     Ok(SourceEntry {
         declared: Declaration::Entry(index),
         alias,
-        trust,
+        attributes: SourceAttributes { trust, allow },
         path,
     })
 }
 
-fn resolve(
+fn optional_bool(
+    file: &Path,
+    index: usize,
+    key: &str,
+    value: Option<&toml::Value>,
+) -> Result<bool> {
+    match value {
+        None => Ok(false),
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| field_error(file, index, key, NOT_A_BOOL)),
+    }
+}
+
+fn resolve_spelled(
     spelled: &str,
-    context: &ResolveContext<'_>,
-) -> std::result::Result<PathBuf, EntryRefusal> {
+    home: &Path,
+    project_root: &Path,
+) -> std::result::Result<PathBuf, &'static str> {
     let (base, rest) = if let Some(rest) = spelled.strip_prefix("~/") {
         // Repeated separators are dropped so the suffix is relative by
         // construction: a leading `RootDir` component would discard `base` when
         // pushed onto it, turning `~//x` into `/x`.
-        (context.home, rest.trim_start_matches('/'))
+        (home, rest.trim_start_matches('/'))
     } else if spelled.starts_with('~') {
-        return Err(EntryRefusal::Fixed(TILDE_SPELLING));
+        return Err(TILDE_SPELLING);
     } else if spelled.starts_with('/') {
         return Ok(PathBuf::from(spelled));
     } else {
-        (context.project_root, spelled)
+        (project_root, spelled)
     };
     // `CurDir` is dropped so `./.agent-vm/config.toml` has exactly the spelling
     // the legacy probe builds; `..` is kept (lexical, never resolved through a
@@ -376,12 +517,11 @@ fn resolve(
 mod tests {
     use super::*;
 
-    /// Literal paths: this module never touches the filesystem (D1).
+    /// Literal paths: this module never touches the filesystem.
     struct TestContext {
         project_config: PathBuf,
         home: PathBuf,
         project_root: PathBuf,
-        user_config: PathBuf,
     }
 
     impl TestContext {
@@ -390,7 +530,6 @@ mod tests {
                 project_config: PathBuf::from("/h/.config/agent-vm/projects/abc/config.toml"),
                 home: PathBuf::from("/h"),
                 project_root: PathBuf::from("/w/app"),
-                user_config: PathBuf::from("/h/.config/agent-vm/config.toml"),
             }
         }
 
@@ -399,111 +538,404 @@ mod tests {
                 project_config: &self.project_config,
                 home: &self.home,
                 project_root: &self.project_root,
-                user_config: &self.user_config,
             }
         }
 
-        fn list(&self, entries: &[&str]) -> Result<DeclaredSources> {
-            let raw: Vec<String> = entries.iter().map(|entry| (*entry).to_owned()).collect();
-            DeclaredSources::listed(&raw, &self.resolve())
+        /// Parse source tables written as a whole `[[sources]]` TOML document.
+        fn parse(&self, toml_text: &str) -> Result<DeclaredSources> {
+            let document: toml::Table =
+                toml::from_str(toml_text).expect("test fixture is valid TOML");
+            let value = document
+                .get("sources")
+                .expect("test fixture declares sources");
+            DeclaredSources::parse(value, &self.resolve())
+        }
+
+        fn parse_ok(&self, toml_text: &str) -> DeclaredSources {
+            self.parse(toml_text)
+                .unwrap_or_else(|error| panic!("expected acceptance: {error:#}"))
         }
     }
 
-    /// The one entry a single-entry list resolved to, with its exact spelling.
-    fn resolved_path(context: &TestContext, entry: &str) -> String {
-        let listed = context
-            .list(&[&format!("repo {entry}")])
-            .expect("accepted entry");
-        listed.entries()[0]
-            .path()
-            .to_str()
-            .expect("UTF-8 test path")
-            .to_owned()
+    fn refusal(context: &TestContext, toml_text: &str) -> String {
+        format!("{:#}", context.parse(toml_text).expect_err("refused value"))
     }
 
-    fn refusal(context: &TestContext, entries: &[&str]) -> String {
-        format!("{:#}", context.list(entries).expect_err("refused entry"))
-    }
-
-    fn assert_refused(context: &TestContext, entry: &str, expected: &str, index: usize) {
-        let message = refusal(context, &[entry]);
+    fn assert_fragment(context: &TestContext, toml_text: &str, expected: &str) {
+        let message = refusal(context, toml_text);
         assert!(
-            message.contains(&format!("sources[{index}]: {expected}")),
-            "{message}"
+            message.contains(expected),
+            "expected {expected:?} in {message:?}"
         );
         assert!(message.contains("\"/h/.config/agent-vm/projects/abc/config.toml\""));
     }
 
+    const PROJECT_CONFIG: &str = "/h/.config/agent-vm/projects/abc/config.toml";
+
     #[test]
-    fn v1_grammar_accepts_well_formed_entries() {
+    fn tables_accept_all_four_combinations_and_defaults() {
         let context = TestContext::new();
-        for entry in [
-            "home:trust ~/.config/agent-vm/config.toml",
-            "repo ./x.toml",
-            "a_1-b /abs/x.toml",
-            "repo /abs/my file.toml",
-        ] {
-            context
-                .list(&[entry])
-                .unwrap_or_else(|error| panic!("expected {entry:?} to be accepted: {error:#}"));
-        }
-        let listed = context
-            .list(&["repo ./x.toml", "team /abs/team.toml"])
-            .expect("two entries");
+        let listed = context.parse_ok(
+            r#"
+            [[sources]]
+            name = "home"
+            path = "~/.config/agent-vm/config.toml"
+            trust = true
+            allow = true
+
+            [[sources]]
+            name = "team"
+            path = "/srv/team.toml"
+            trust = true
+
+            [[sources]]
+            name = "repo"
+            path = "./conf/agent-vm.toml"
+            allow = false
+            "#,
+        );
         assert_eq!(listed.sourcing(), Sourcing::Listed);
-        assert_eq!(listed.entries()[1].declared(), Declaration::Entry(1));
+        let entries = listed.entries();
+        assert_eq!(entries.len(), 3);
         assert_eq!(
-            listed.entries()[1].declared().to_string(),
-            "sources[1]",
-            "indices are zero-based, the way the file is read"
+            entries[0].attributes(),
+            SourceAttributes {
+                trust: true,
+                allow: true
+            }
+        );
+        assert_eq!(
+            entries[1].attributes(),
+            SourceAttributes {
+                trust: true,
+                allow: false
+            }
+        );
+        assert_eq!(
+            entries[2].attributes(),
+            SourceAttributes {
+                trust: false,
+                allow: false
+            }
+        );
+        assert_eq!(entries[2].path(), Path::new("/w/app/conf/agent-vm.toml"));
+        assert_eq!(entries[2].declared(), Declaration::Entry(2));
+        assert_eq!(entries[2].declared().to_string(), "sources[2]");
+        assert_eq!(
+            entries[0].path(),
+            Path::new("/h/.config/agent-vm/config.toml")
         );
     }
 
     #[test]
-    fn v1_grammar_refuses_each_malformed_shape() {
+    fn minimal_table_defaults_both_attributes_to_false() {
         let context = TestContext::new();
-        let too_long = format!("{} /x", "a".repeat(33));
-        for (entry, expected) in [
-            ("nospace", MALFORMED_ENTRY),
-            ("Repo x", INVALID_ALIAS),
-            ("repo:pin x", ONLY_QUALIFIER),
-            ("Re:pin x", INVALID_ALIAS),
-            ("repo ", EMPTY_PATH),
-            ("repo  x", SPACE_AFTER_ALIAS),
-            ("repo x ", TRAILING_WHITESPACE),
-            ("repo x\u{7}", CONTROL_CHARACTER),
-            ("repo ~", TILDE_SPELLING),
-            ("repo ~al/x", TILDE_SPELLING),
-            (too_long.as_str(), INVALID_ALIAS),
-        ] {
-            assert_refused(&context, entry, expected, 0);
+        let listed = context.parse_ok(
+            r#"
+            [[sources]]
+            name = "repo"
+            path = "./x.toml"
+            "#,
+        );
+        let entry = &listed.entries()[0];
+        assert!(!entry.is_trusted());
+        assert!(!entry.is_allowed());
+        assert_eq!(entry.attributes(), SourceAttributes::default());
+    }
+
+    #[test]
+    fn an_empty_array_is_valid_and_sources_nothing() {
+        let context = TestContext::new();
+        let listed = context.parse_ok("sources = []\n");
+        assert_eq!(listed.sourcing(), Sourcing::Listed);
+        assert!(listed.entries().is_empty());
+    }
+
+    #[test]
+    fn non_array_values_are_refused() {
+        let context = TestContext::new();
+        for value in ["sources = \"x\"\n", "sources = {}\n", "sources = 1\n"] {
+            assert_fragment(
+                &context,
+                value,
+                "sources: must be an array of [[sources]] tables (or sources = [])",
+            );
         }
-        // The index is the refused entry's, not the first entry's.
-        let message = refusal(&context, &["repo ./a.toml", "nospace"]);
+    }
+
+    #[test]
+    fn old_string_entries_are_refused_with_the_migration_message() {
+        let context = TestContext::new();
+        for value in [
+            "sources = [\"home:trust ~/.config/agent-vm/config.toml\"]\n",
+            "sources = [\"repo ./x.toml\"]\n",
+            "sources = [{ name = \"a\", path = \"./a.toml\" }, \"b ./b.toml\"]\n",
+        ] {
+            for marker in [
+                "sources[",
+                "string entries (\"<alias>[:trust] <path>\") are no longer supported",
+                "declare each source as a [[sources]] table with name = \"...\", path = \"...\"",
+                "trust = true / allow = true",
+            ] {
+                assert!(
+                    refusal(&context, value).contains(marker),
+                    "{value:?} missing {marker:?}: {}",
+                    refusal(&context, value)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_table_elements_are_refused() {
+        let context = TestContext::new();
+        for value in [
+            "sources = [123]\n",
+            "sources = [true]\n",
+            "sources = [[]]\n",
+        ] {
+            assert_fragment(
+                &context,
+                value,
+                "sources[0]: must be a [[sources]] table with name and path",
+            );
+        }
+    }
+
+    #[test]
+    fn required_and_typed_keys_are_validated() {
+        let context = TestContext::new();
+        let cases = [
+            (
+                "[[sources]]\npath = \"./x.toml\"\n",
+                "sources[0]: missing required key \"name\"",
+            ),
+            (
+                "[[sources]]\nname = 1\npath = \"./x.toml\"\n",
+                "sources[0].name: must be a string",
+            ),
+            (
+                "[[sources]]\nname = \"Repo\"\npath = \"./x.toml\"\n",
+                "sources[0].name: an alias is 1 to 32 characters",
+            ),
+            (
+                "[[sources]]\nname = \"repo\"\n",
+                "sources[0]: missing required key \"path\"",
+            ),
+            (
+                "[[sources]]\nname = \"repo\"\npath = 1\n",
+                "sources[0].path: must be a string",
+            ),
+            (
+                "[[sources]]\nname = \"repo\"\npath = \"\"\n",
+                "sources[0].path: the path is empty",
+            ),
+            (
+                "[[sources]]\nname = \"repo\"\npath = \" ./x.toml\"\n",
+                "sources[0].path: the path starts or ends with whitespace",
+            ),
+            (
+                "[[sources]]\nname = \"repo\"\npath = \"./x.toml \"\n",
+                "sources[0].path: the path starts or ends with whitespace",
+            ),
+            (
+                "[[sources]]\nname = \"repo\"\npath = \"./x\\u0007.toml\"\n",
+                "sources[0].path: the path contains a control character",
+            ),
+            (
+                "[[sources]]\nname = \"repo\"\npath = \"~\"\n",
+                "sources[0].path: only \"~/\" is expanded",
+            ),
+            (
+                "[[sources]]\nname = \"repo\"\npath = \"~mu/x.toml\"\n",
+                "sources[0].path: only \"~/\" is expanded",
+            ),
+            (
+                "[[sources]]\nname = \"repo\"\npath = \"./x.toml\"\ntrust = \"true\"\n",
+                "sources[0].trust: must be true or false",
+            ),
+            (
+                "[[sources]]\nname = \"repo\"\npath = \"./x.toml\"\nallow = 1\n",
+                "sources[0].allow: must be true or false",
+            ),
+        ];
+        for (value, expected) in cases {
+            assert_fragment(&context, value, expected);
+        }
+    }
+
+    #[test]
+    fn unknown_keys_are_refused_value_safely_and_top_level_fields_get_the_hint() {
+        let context = TestContext::new();
+        assert_fragment(
+            &context,
+            "[[sources]]\nname = \"repo\"\npath = \"./x.toml\"\nSECRET-748 = 1\n",
+            "sources[0]: unknown key; supported keys are name, path, trust and allow",
+        );
+        let message = refusal(
+            &context,
+            "[[sources]]\nname = \"repo\"\npath = \"./x.toml\"\nSECRET-748 = 1\n",
+        );
+        assert!(!message.contains("SECRET-748"), "{message}");
+
+        for field in [
+            "allow_tools",
+            "egress_sets",
+            "image",
+            "mounts",
+            "mount_sets",
+            "network",
+            "sources",
+            "tools",
+        ] {
+            let value = format!("[[sources]]\nname = \"repo\"\npath = \"./x.toml\"\n{field} = 1\n");
+            let message = refusal(&context, &value);
+            assert!(
+                message.contains(&format!(
+                    "sources[0]: {field} is not a source key; top-level {field} must be written \
+                     before the first [[sources]] or table header"
+                )),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_rules_refuse_duplicates_and_self_sourcing() {
+        let context = TestContext::new();
+        assert_fragment(
+            &context,
+            "[[sources]]\nname = \"repo\"\npath = \"./a.toml\"\n\
+             [[sources]]\nname = \"repo\"\npath = \"./b.toml\"\n",
+            "sources[1]: the alias is already declared by sources[0]",
+        );
+        assert_fragment(
+            &context,
+            "[[sources]]\nname = \"one\"\npath = \"./a.toml\"\n\
+             [[sources]]\nname = \"two\"\npath = \"/w/app/a.toml\"\n",
+            "sources[1]: this file is already sourced by sources[0]",
+        );
+        assert_fragment(
+            &context,
+            &format!("[[sources]]\nname = \"self\"\npath = \"{PROJECT_CONFIG}\"\n"),
+            "sources[0]: the project config cannot source itself",
+        );
+    }
+
+    /// `count` distinct `[[sources]]` tables, each naming its own file.
+    fn distinct_sources(count: usize) -> String {
+        (0..count)
+            .map(|index| {
+                format!("[[sources]]\nname = \"s{index}\"\npath = \"/srv/{index}.toml\"\n")
+            })
+            .collect()
+    }
+
+    /// The list bound is checked before any entry is scanned: at the limit the
+    /// config is accepted, one past it is refused, and the refusal names the limit
+    /// without echoing what the user wrote.
+    #[test]
+    fn the_declared_source_count_is_bounded() {
+        let context = TestContext::new();
+        let at_the_limit = context.parse_ok(&distinct_sources(MAX_DECLARED_SOURCES));
+        assert_eq!(at_the_limit.entries().len(), MAX_DECLARED_SOURCES);
+        assert_eq!(
+            at_the_limit
+                .entries()
+                .last()
+                .expect("the last entry")
+                .declared(),
+            Declaration::Entry(MAX_DECLARED_SOURCES - 1)
+        );
+
+        let message = refusal(&context, &distinct_sources(MAX_DECLARED_SOURCES + 1));
         assert!(
-            message.contains(&format!("sources[1]: {MALFORMED_ENTRY}")),
-            "{message}"
+            message.contains(&format!(
+                "sources: more than {MAX_DECLARED_SOURCES} declared sources"
+            )),
+            "the limit must be named: {message}"
+        );
+        assert!(message.contains(PROJECT_CONFIG), "{message}");
+        assert!(
+            !message.contains("/srv/"),
+            "the refusal is value-free: {message}"
         );
     }
 
+    /// A duplicate anywhere in a maximal list gets the same sentence a two-entry
+    /// list gets, and the map proves it holds the **first** declaring index, so the
+    /// diagnostic names the entry the user has to change.
     #[test]
-    fn v1_refusals_never_echo_the_entry() {
+    fn a_duplicate_at_the_end_of_a_maximal_list_is_refused() {
         let context = TestContext::new();
-        for entry in [
-            "SECRET-734 x.toml",
-            "repo x\u{7} SECRET-734",
-            "repo:SECRET-734 x.toml",
-            "repo  SECRET-734",
+        let last = MAX_DECLARED_SOURCES - 1;
+
+        let mut aliased = distinct_sources(last);
+        aliased.push_str("[[sources]]\nname = \"s0\"\npath = \"/srv/last.toml\"\n");
+        let alias_refusal = format!("sources[{last}]: the alias is already declared by sources[0]");
+        assert!(refusal(&context, &aliased).contains(&alias_refusal));
+
+        let mut pathed = distinct_sources(last);
+        pathed.push_str("[[sources]]\nname = \"last\"\npath = \"/srv/0.toml\"\n");
+        let path_refusal = format!("sources[{last}]: this file is already sourced by sources[0]");
+        assert!(refusal(&context, &pathed).contains(&path_refusal));
+    }
+
+    /// Duplicate detection is one map lookup per entry, so indexing a list is
+    /// linear: a rescan of every earlier entry (the shape this replaced) is
+    /// quadratic and cannot index 100,000 entries anywhere near the bound. The
+    /// count is far past `MAX_DECLARED_SOURCES` on purpose — the duplicate check is
+    /// the one part that must not get more expensive as the list grows.
+    #[test]
+    fn duplicate_detection_is_one_lookup_per_entry() {
+        let file = Path::new(PROJECT_CONFIG);
+        let entries: Vec<SourceEntry> = (0..100_000)
+            .map(|index| SourceEntry {
+                declared: Declaration::Entry(index),
+                alias: SourceAlias::for_test(&format!("s{index}")),
+                attributes: SourceAttributes::default(),
+                path: PathBuf::from(format!("/srv/{index}.toml")),
+            })
+            .collect();
+        let mut index = DeclaredIndex::default();
+        let started = std::time::Instant::now();
+        for (position, entry) in entries.iter().enumerate() {
+            index
+                .record(position, entry, file)
+                .expect("distinct entries");
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "indexing {} entries took {elapsed:?}",
+            entries.len()
+        );
+
+        let duplicate = SourceEntry {
+            declared: Declaration::Entry(entries.len()),
+            ..entries[0].clone()
+        };
+        assert!(index.record(entries.len(), &duplicate, file).is_err());
+    }
+
+    #[test]
+    fn refusals_never_echo_the_offending_values() {
+        let context = TestContext::new();
+        for value in [
+            "sources = [\"SECRET-748 x.toml\"]\n",
+            "[[sources]]\nname = \"SECRET-748\"\npath = \"./x.toml\"\n",
+            "[[sources]]\nname = \"repo\"\npath = \"./SECRET-748\"\ntrust = \"SECRET-748\"\n",
+            "[[sources]]\nname = \"repo\"\npath = \"./x.toml\"\nzz_SECRET-748 = 1\n",
         ] {
-            let message = refusal(&context, &[entry]);
-            assert!(!message.contains("SECRET-734"), "{message}");
+            let message = refusal(&context, value);
+            assert!(!message.contains("SECRET-748"), "{message}");
         }
     }
 
     #[test]
-    fn v2_paths_resolve_lexically() {
+    fn paths_resolve_lexically() {
         let context = TestContext::new();
-        for (entry, expected) in [
+        for (spelled, expected) in [
             ("~/a/b", "/h/a/b"),
             // A repeated separator must never rebase the path onto `/`.
             ("~//x", "/h/x"),
@@ -521,63 +953,28 @@ mod tests {
             ("sub/../a.toml", "/w/app/sub/../a.toml"),
             ("/x/y", "/x/y"),
         ] {
-            assert_eq!(resolved_path(&context, entry), expected, "{entry:?}");
+            let listed = context.parse_ok(&format!(
+                "[[sources]]\nname = \"repo\"\npath = {spelled:?}\n"
+            ));
+            assert_eq!(
+                listed.entries()[0]
+                    .path()
+                    .to_str()
+                    .expect("UTF-8 test path"),
+                expected,
+                "{spelled:?}"
+            );
         }
     }
 
     #[test]
-    fn v3_set_rules_refuse_duplicates_self_and_foreign_trust() {
+    fn by_alias_finds_declared_entries_only() {
         let context = TestContext::new();
-
-        let message = refusal(&context, &["repo ./a.toml", "repo ./b.toml"]);
-        assert!(
-            message.contains("sources[1]: the alias is already declared by sources[0]"),
-            "{message}"
+        let listed = context.parse_ok(
+            "[[sources]]\nname = \"repo\"\npath = \"./r.toml\"\n\
+             [[sources]]\nname = \"home\"\npath = \"~/.config/agent-vm/config.toml\"\n\
+             trust = true\nallow = true\n",
         );
-
-        // Two spellings of one file are one lexical path.
-        let message = refusal(&context, &["one ./a.toml", "two /w/app/a.toml"]);
-        assert!(
-            message.contains("sources[1]: this file is already sourced by sources[0]"),
-            "{message}"
-        );
-
-        let message = refusal(
-            &context,
-            &["self /h/.config/agent-vm/projects/abc/config.toml"],
-        );
-        assert!(message.contains(SELF_SOURCE), "{message}");
-
-        for entry in [
-            "team:trust ~/team.toml",
-            "team:trust /h/.config/agent-vm/config.toml.bak",
-            // Lexical-only admission: `..` cannot name its way to the user file.
-            "team:trust ~/../h/.config/agent-vm/config.toml",
-        ] {
-            assert_refused(&context, entry, TRUST_ONLY_FOR_USER_CONFIG, 0);
-        }
-
-        // The same path spelled two ways is still the discovered user config.
-        for entry in [
-            "home:trust ~//.config/agent-vm/config.toml",
-            "me:trust ~/.config/agent-vm/config.toml",
-            "me:trust /h/.config/agent-vm/config.toml",
-        ] {
-            let listed = context.list(&[entry]).expect("trusted user config");
-            assert_eq!(listed.entries()[0].trust(), SourceTrust::Trusted);
-        }
-
-        let empty = context.list(&[]).expect("an empty list is valid");
-        assert!(empty.entries().is_empty());
-        assert_eq!(empty.sourcing(), Sourcing::Listed);
-    }
-
-    #[test]
-    fn v3_by_alias_finds_declared_entries_only() {
-        let context = TestContext::new();
-        let listed = context
-            .list(&["repo ./r.toml", "home:trust ~/.config/agent-vm/config.toml"])
-            .expect("two entries");
         assert_eq!(
             listed
                 .by_alias(&SourceAlias::for_test("repo"))
@@ -592,7 +989,7 @@ mod tests {
     }
 
     #[test]
-    fn v4_image_alias_recognises_only_the_exact_shape() {
+    fn image_alias_recognises_only_the_exact_shape() {
         for (raw, expected) in [
             ("repo:image", Some("repo")),
             ("a:image", Some("a")),
@@ -615,24 +1012,63 @@ mod tests {
     }
 
     #[test]
-    fn implicit_sourcing_is_the_trusted_user_config_or_nothing() {
+    fn implicit_sourcing_is_the_trusted_allowed_user_config_or_nothing() {
         let user_config = PathBuf::from("/h/.config/agent-vm/config.toml");
         let implicit = DeclaredSources::implicit(Some(&user_config));
         assert_eq!(implicit.sourcing(), Sourcing::Implicit);
         assert_eq!(implicit.entries().len(), 1);
         let entry = &implicit.entries()[0];
         assert_eq!(entry.alias().as_str(), HOME_ALIAS);
-        assert_eq!(entry.trust(), SourceTrust::Trusted);
+        assert!(entry.is_trusted());
+        assert!(entry.is_allowed());
+        assert_eq!(
+            entry.attributes(),
+            SourceAttributes {
+                trust: true,
+                allow: true
+            }
+        );
         assert_eq!(entry.path(), user_config);
         assert_eq!(entry.declared(), Declaration::Implicit);
-        assert_eq!(
-            entry.declared().to_string(),
-            "the default home:trust source"
-        );
+        assert_eq!(entry.declared().to_string(), "the default home source");
 
         let unavailable = DeclaredSources::implicit(None);
         assert!(unavailable.entries().is_empty());
         assert_eq!(unavailable.sourcing(), Sourcing::Implicit);
+    }
+
+    #[test]
+    fn extraction_finds_only_trusted_host_anchored_paths() {
+        let home = Path::new("/h");
+        let text = r#"
+            [[sources]]
+            name = "team"
+            path = "~/team.toml"
+            trust = true
+
+            [[sources]]
+            name = "abs"
+            path = "/srv/abs.toml"
+            trust = true
+
+            [[sources]]
+            name = "repo"
+            path = "./repo.toml"
+            trust = true
+
+            [[sources]]
+            name = "pinned"
+            path = "~/pinned.toml"
+            "#;
+        assert_eq!(
+            extract_trusted_non_relative_paths(text, home),
+            vec![
+                PathBuf::from("/h/team.toml"),
+                PathBuf::from("/srv/abs.toml")
+            ]
+        );
+        assert!(extract_trusted_non_relative_paths("sources = [unclosed", home).is_empty());
+        assert!(extract_trusted_non_relative_paths("", home).is_empty());
     }
 
     #[test]

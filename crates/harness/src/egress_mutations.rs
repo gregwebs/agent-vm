@@ -2206,8 +2206,8 @@ fn ledger() -> Vec<Row> {
         Row {
             name: r#"verify-always-skipped"#,
             path: r#"crates/agent-vm/src/config.rs"#,
-            old: r#"            authorized = verification.authorized;"#,
-            new: r#"            authorized = None;"#,
+            old: r#"            authorized: verification.authorized,"#,
+            new: r#"            authorized: None,"#,
             run: Run::AgentTest(
                 r#"config_launch_driven"#,
                 r#"unsafe_user_network_is_refused_before_launch_state"#,
@@ -2228,15 +2228,8 @@ fn ledger() -> Vec<Row> {
         Row {
             name: r#"config-mounts-presence-ignored"#,
             path: r#"crates/agent-vm/src/config.rs"#,
-            old: r#"        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {
-            top_level: raw.mounts.is_some(),
-            tool_field: first_tool_mounts.is_some(),
-        }),
-        mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),"#,
-            new: r#"        mounts: false,
-        mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),"#,
+            old: r#"            top_level: allowed && document.contains_key("mounts"),"#,
+            new: r#"            top_level: false,"#,
             run: Run::AgentBin(r#"present_empty_mounts_through_a_symlink_is_refused"#),
             markers: &[r#"test result: FAILED"#],
             anchors: 1,
@@ -2244,15 +2237,8 @@ fn ledger() -> Vec<Row> {
         Row {
             name: r#"config-mounts-presence-ignored-launch"#,
             path: r#"crates/agent-vm/src/config.rs"#,
-            old: r#"        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {
-            top_level: raw.mounts.is_some(),
-            tool_field: first_tool_mounts.is_some(),
-        }),
-        mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),"#,
-            new: r#"        mounts: false,
-        mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),"#,
+            old: r#"            top_level: allowed && document.contains_key("mounts"),"#,
+            new: r#"            top_level: false,"#,
             run: Run::AgentTest(
                 r#"config_mounts"#,
                 r#"unsafe_user_mounts_are_refused_before_launch_state"#,
@@ -2263,18 +2249,8 @@ fn ledger() -> Vec<Row> {
         Row {
             name: r#"config-mounts-empty-unverified"#,
             path: r#"crates/agent-vm/src/config.rs"#,
-            old: r#"        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {
-            top_level: raw.mounts.is_some(),
-            tool_field: first_tool_mounts.is_some(),
-        }),
-        mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),"#,
-            new: r#"        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {
-            top_level: raw.mounts.as_ref().and_then(toml::Value::as_array).is_some_and(|a| !a.is_empty()),
-            tool_field: first_tool_mounts.is_some(),
-        }),
-        mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),"#,
+            old: r#"            top_level: allowed && document.contains_key("mounts"),"#,
+            new: r#"            top_level: document.get("mounts").and_then(toml::Value::as_array).is_some_and(|a| !a.is_empty()),"#,
             run: Run::AgentBin(r#"present_empty_mounts_through_a_symlink_is_refused"#),
             markers: &[r#"test result: FAILED"#],
             anchors: 1,
@@ -2282,18 +2258,8 @@ fn ledger() -> Vec<Row> {
         Row {
             name: r#"config-mounts-empty-unverified-launch"#,
             path: r#"crates/agent-vm/src/config.rs"#,
-            old: r#"        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {
-            top_level: raw.mounts.is_some(),
-            tool_field: first_tool_mounts.is_some(),
-        }),
-        mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),"#,
-            new: r#"        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {
-            top_level: raw.mounts.as_ref().and_then(toml::Value::as_array).is_some_and(|a| !a.is_empty()),
-            tool_field: first_tool_mounts.is_some(),
-        }),
-        mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),"#,
+            old: r#"            top_level: allowed && document.contains_key("mounts"),"#,
+            new: r#"            top_level: document.get("mounts").and_then(toml::Value::as_array).is_some_and(|a| !a.is_empty()),"#,
             run: Run::AgentTest(
                 r#"config_mounts"#,
                 r#"empty_mounts_still_requires_a_verified_file"#,
@@ -2304,7 +2270,7 @@ fn ledger() -> Vec<Row> {
         Row {
             name: r#"config-mounts-verify-skipped-launch"#,
             path: r#"crates/agent-vm/src/config.rs"#,
-            old: r#"            authorized = verification.authorized;"#,
+            old: r#"            authorized: verification.authorized,"#,
             // #695: this replacement used to be `FileTierKind::User => None,`,
             // which was a compiling arm value when the tier decision was one
             // `match` expression. #506 split the arm into a block so a second
@@ -2314,7 +2280,7 @@ fn ledger() -> Vec<Row> {
             // because that check never parses a replacement (#581). Discarding the
             // verdict is the same mutation as `verify-always-skipped`, which is the
             // point: the two rows own two different refusals.
-            new: r#"            authorized = None;"#,
+            new: r#"            authorized: None,"#,
             run: Run::AgentTest(
                 r#"config_mounts"#,
                 r#"unsafe_user_mounts_are_refused_before_launch_state"#,
@@ -2326,15 +2292,15 @@ fn ledger() -> Vec<Row> {
         // the refusal is a boundary in its own right: without it a project checkout
         // would hand every launch of it a host bind.
         Row {
-            name: r#"config-mounts-project-mounts-accepted"#,
+            name: r#"config-mounts-builtin-mounts-accepted"#,
             path: r#"crates/agent-vm/src/config.rs"#,
             old: r#"    if raw.mounts.is_some() {
-        return Err(mounts_refusal(path, tier));
+        return Err(mounts_refusal(path, RefusingTier::BuiltIn));
     }"#,
             new: r#"    if false {
-        return Err(mounts_refusal(path, tier));
+        return Err(mounts_refusal(path, RefusingTier::BuiltIn));
     }"#,
-            run: Run::AgentBin(r#"project_mounts_are_refused_even_when_empty"#),
+            run: Run::AgentBin(r#"builtin_mounts_are_refused"#),
             markers: &[r#"test result: FAILED"#],
             anchors: 1,
         },
@@ -2345,18 +2311,8 @@ fn ledger() -> Vec<Row> {
         Row {
             name: r#"mount-sets-presence-ignored"#,
             path: r#"crates/agent-vm/src/config.rs"#,
-            old: r#"        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {
-            top_level: raw.mounts.is_some(),
-            tool_field: first_tool_mounts.is_some(),
-        }),
-        mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),"#,
-            new: r#"        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {
-            top_level: raw.mounts.is_some(),
-            tool_field: first_tool_mounts.is_some(),
-        }),
-        mount_sets: false,
-        egress_sets: raw.egress_sets.is_some(),"#,
+            old: r#"        mount_sets: document.contains_key("mount_sets"),"#,
+            new: r#"        mount_sets: false,"#,
             run: Run::AgentBin(r#"mount_sets_presence_requires_a_verified_file"#),
             markers: &[r#"test result: FAILED"#],
             anchors: 1,
@@ -2364,18 +2320,8 @@ fn ledger() -> Vec<Row> {
         Row {
             name: r#"mount-sets-presence-ignored-launch"#,
             path: r#"crates/agent-vm/src/config.rs"#,
-            old: r#"        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {
-            top_level: raw.mounts.is_some(),
-            tool_field: first_tool_mounts.is_some(),
-        }),
-        mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),"#,
-            new: r#"        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {
-            top_level: raw.mounts.is_some(),
-            tool_field: first_tool_mounts.is_some(),
-        }),
-        mount_sets: false,
-        egress_sets: raw.egress_sets.is_some(),"#,
+            old: r#"        mount_sets: document.contains_key("mount_sets"),"#,
+            new: r#"        mount_sets: false,"#,
             run: Run::AgentTest(
                 r#"config_mounts"#,
                 r#"named_mount_sets_unsafe_file_is_refused_before_launch_state"#,
@@ -2584,8 +2530,8 @@ fn ledger() -> Vec<Row> {
         Row {
             name: r#"builtin-network-accepted"#,
             path: r#"crates/agent-vm/src/config.rs"#,
-            old: r#"        return Err(network_refusal(table, path, tier));"#,
-            new: r#"        let _ = table;"#,
+            old: r#"        return Err(network_refusal(value, path, RefusingTier::BuiltIn));"#,
+            new: r#"        let _ = value;"#,
             run: Run::AgentBin(r#"builtin_network_table_is_refused_naming_setting_and_tier"#),
             markers: &[r#"test result: FAILED"#],
             anchors: 1,
@@ -2597,18 +2543,8 @@ fn ledger() -> Vec<Row> {
         Row {
             name: r#"tool-mounts-presence-ignored"#,
             path: r#"crates/agent-vm/src/config.rs"#,
-            old: r#"        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {
-            top_level: raw.mounts.is_some(),
-            tool_field: first_tool_mounts.is_some(),
-        }),
-        mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),"#,
-            new: r#"        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {
-            top_level: raw.mounts.is_some(),
-            tool_field: false,
-        }),
-        mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),"#,
+            old: r#"            tool_field: tool_mounts,"#,
+            new: r#"            tool_field: false,"#,
             run: Run::AgentBin(r#"tool_mounts_presence_requires_verified_read_even_empty"#),
             markers: &[r#"test result: FAILED"#],
             anchors: 1,
@@ -2616,18 +2552,8 @@ fn ledger() -> Vec<Row> {
         Row {
             name: r#"tool-mounts-presence-ignored-launch"#,
             path: r#"crates/agent-vm/src/config.rs"#,
-            old: r#"        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {
-            top_level: raw.mounts.is_some(),
-            tool_field: first_tool_mounts.is_some(),
-        }),
-        mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),"#,
-            new: r#"        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {
-            top_level: raw.mounts.is_some(),
-            tool_field: false,
-        }),
-        mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),"#,
+            old: r#"            tool_field: tool_mounts,"#,
+            new: r#"            tool_field: false,"#,
             run: Run::AgentTest(
                 r#"config_mounts"#,
                 r#"empty_present_tool_mounts_require_authority_before_any_launch"#,
@@ -2638,18 +2564,8 @@ fn ledger() -> Vec<Row> {
         Row {
             name: r#"tool-mounts-empty-unverified"#,
             path: r#"crates/agent-vm/src/config.rs"#,
-            old: r#"        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {
-            top_level: raw.mounts.is_some(),
-            tool_field: first_tool_mounts.is_some(),
-        }),
-        mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),"#,
-            new: r#"        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {
-            top_level: raw.mounts.is_some(),
-            tool_field: first_tool_mounts.is_some_and(|d| raw.tools[d].mounts.as_ref().and_then(toml::Value::as_array).is_some_and(|a| !a.is_empty())),
-        }),
-        mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),"#,
+            old: r#"            tool_field: tool_mounts,"#,
+            new: r#"            tool_field: document.get("tools").and_then(toml::Value::as_array).is_some_and(|tools| tools.iter().any(|tool| tool.as_table().and_then(|t| t.get("mounts")).and_then(toml::Value::as_array).is_some_and(|a| !a.is_empty()))),"#,
             run: Run::AgentBin(r#"tool_mounts_presence_requires_verified_read_even_empty"#),
             markers: &[r#"test result: FAILED"#],
             anchors: 1,
@@ -2661,14 +2577,14 @@ fn ledger() -> Vec<Row> {
         Row {
             name: r#"tool-mounts-builtin-accepted"#,
             path: r#"crates/agent-vm/src/config.rs"#,
-            old: r#"    if matches!(tier, RefusingTier::BuiltIn)
-        && let Some(declaration) = raw.tools.iter().position(|tool| tool.mounts.is_some())
-    {
-        return Err(tool_mounts_refusal(path, tier, declaration));
+            old: r#"    if let Some(declaration) = raw.tools.iter().position(|tool| tool.mounts.is_some()) {
+        return Err(tool_mounts_refusal(
+            path,
+            RefusingTier::BuiltIn,
+            declaration,
+        ));
     }"#,
-            new: r#"    if let Some(declaration) = raw.tools.iter().position(|tool| tool.mounts.is_some())
-        && matches!(tier, RefusingTier::BuiltIn)
-    {
+            new: r#"    if let Some(declaration) = raw.tools.iter().position(|tool| tool.mounts.is_some()) {
         let _ = declaration;
     }"#,
             run: Run::AgentBin(
@@ -2745,15 +2661,11 @@ fn ledger() -> Vec<Row> {
             old: r#"                home,
                 work,
             )
-            .map_err(|error| anyhow!("config: {}: {error}", crate::one_line::quoted_path(path)))?,
-        )
-    } else {"#,
+            .map_err(|error| anyhow!("config: {}: {error}", crate::one_line::quoted_path(path)))?;"#,
             new: r#"                home,
                 &mut config_mounts::MountExpansionWork::fresh(),
             )
-            .map_err(|error| anyhow!("config: {}: {error}", crate::one_line::quoted_path(path)))?,
-        )
-    } else {"#,
+            .map_err(|error| anyhow!("config: {}: {error}", crate::one_line::quoted_path(path)))?;"#,
             run: Run::AgentBin(r#"mount_budget_spans_project_source_and_user_tiers"#),
             markers: &[r#"test result: FAILED"#],
             anchors: 1,
@@ -2799,19 +2711,8 @@ fn ledger() -> Vec<Row> {
         Row {
             name: r#"egress-sets-presence-ignored"#,
             path: r#"crates/agent-vm/src/config.rs"#,
-            old: r#"        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {
-            top_level: raw.mounts.is_some(),
-            tool_field: first_tool_mounts.is_some(),
-        }),
-        mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),"#,
-            new: r#"        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {
-            top_level: raw.mounts.is_some(),
-            tool_field: first_tool_mounts.is_some(),
-        }),
-        mount_sets: raw.mount_sets.is_some(),
-        egress_sets: false,
-    };"#,
+            old: r#"        egress_sets: document.contains_key("egress_sets"),"#,
+            new: r#"        egress_sets: false,"#,
             run: Run::AgentBin(r#"egress_sets_presence_requires_a_verified_file"#),
             markers: &[r#"test result: FAILED"#],
             anchors: 1,
@@ -3799,8 +3700,8 @@ fn ledger() -> Vec<Row> {
         Row {
             name: r#"allow-tools-trusted-verdict-bypassed"#,
             path: r#"crates/agent-vm/src/config.rs"#,
-            old: r#"                    trust.require_for_trusted_tool().map_err(|refusal| {"#,
-            new: r#"                    Ok::<(), crate::config_authority::UntrustedConfig>(()).map_err(|refusal| {"#,
+            old: r#"                references.require_for_trusted_tool().map_err(|refusal| {"#,
+            new: r#"                Ok::<(), crate::config_authority::UntrustedConfig>(()).map_err(|refusal| {"#,
             run: Run::AgentTest(
                 r#"config_launch_driven"#,
                 r#"a_project_authorization_of_a_trusted_tool_needs_the_trusted_verdict"#,
@@ -3827,8 +3728,20 @@ fn ledger() -> Vec<Row> {
         Row {
             name: r#"allow-tools-closure-unchecked"#,
             path: r#"crates/agent-vm/src/config.rs"#,
-            old: r#"        enforce_closure_authorization(&definitions, &visited, *start, &authorized)?;"#,
-            new: r#"        let _ = (&definitions, &visited, *start, &authorized);"#,
+            old: r#"        enforce_closure_authorization(
+            &definitions,
+            &visited,
+            *start,
+            &authorized,
+            &untrusted_origins,
+        )?;"#,
+            new: r#"        let _ = (
+            &definitions,
+            &visited,
+            *start,
+            &authorized,
+            &untrusted_origins,
+        );"#,
             run: Run::AgentBin(r#"tool_closure_authorization_is_explicit"#),
             markers: &[r#"test result: FAILED"#],
             anchors: 1,
@@ -3860,6 +3773,139 @@ fn ledger() -> Vec<Row> {
             old: r#"                    mounts: entry.mounts().clone(),"#,
             new: r#"                    mounts: crate::config_mounts::ResolvedMountList::empty(),"#,
             run: Run::AgentBin(r#"authorized_source_entry_lowers_every_own_and_closure_facet"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        // -- #748: [[sources]] trust/allow adoption boundaries -----------------
+        // Every row below keeps its replacement compiling: an `allow = false`
+        // trusted source already holds the adoption token, so a leaked mount or
+        // egress table reaches the launch plan instead of failing on "authority
+        // was not measured".
+        Row {
+            name: r#"allow-false-mounts-adopted"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"    raw.mounts = None;
+    raw.network = None;"#,
+            new: r#"    raw.network = None;"#,
+            run: Run::AgentBin(r#"allow_false_trusted_source_mounts_stay_inert"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            name: r#"allow-false-network-adopted"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"    raw.mounts = None;
+    raw.network = None;"#,
+            new: r#"    raw.mounts = None;"#,
+            run: Run::AgentBin(r#"allow_false_trusted_source_network_stays_inert"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            name: r#"trusted-source-inside-checkout-accepted"#,
+            path: r#"crates/agent-vm/src/project_config.rs"#,
+            old: r#"        self.boundary_ids.contains(&dir_id)
+            || self
+                .boundary_roots
+                .iter()
+                .any(|boundary| cursor.starts_with(boundary))"#,
+            new: r#"        let _ = (dir_id, cursor);
+        false"#,
+            run: Run::AgentBin(r#"trusted_source_inside_checkout_is_refused"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            name: r#"trusted-source-symlink-target-route-skipped"#,
+            path: r#"crates/agent-vm/src/project_config.rs"#,
+            old: r#"            check_trusted_symlink_target_against_boundary(path, boundary.as_ref())?;"#,
+            new: r#"            let _ = (path, boundary.as_ref());"#,
+            run: Run::AgentBin(r#"trusted_source_symlink_into_checkout_reports_route_refusal"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            name: r#"trusted-source-verify-skipped"#,
+            path: r#"crates/agent-vm/src/config_authority.rs"#,
+            old: r#"    match authority_refusal(reached, parent_dir, crate::host_paths::current_euid()) {"#,
+            new: r#"    match {
+        let _ = (reached, parent_dir, crate::host_paths::current_euid());
+        None::<AuthorityRefusal>
+    } {"#,
+            run: Run::AgentBin(r#"trusted_source_group_writable_regular_file_is_refused"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            name: r#"unpinned-allow-true-adopted"#,
+            path: r#"crates/agent-vm/src/config_authority.rs"#,
+            old: r#"        Err(anyhow::anyhow!(
+            "config: {}: {}: allow = true on a trust = false source cannot adopt top-level image, \"#,
+            new: r#"        return Ok(ApprovedSourceContent {
+            project_config: project.path(),
+            source_path: entry.path(),
+            bytes: _bytes,
+        });
+        #[allow(unreachable_code)]
+        Err(anyhow::anyhow!(
+            "config: {}: {}: allow = true on a trust = false source cannot adopt top-level image, \"#,
+            run: Run::AgentBin(r#"untrusted_allow_true_source_is_refused_before_pinning"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            name: r#"project-config-verify-skipped"#,
+            path: r#"crates/agent-vm/src/config_authority.rs"#,
+            old: r#"    measure_facts(path, final_component, false)
+        .map_err(|measurement| measurement.into_untrusted(AuthoritySubject::ProjectConfig))?;"#,
+            new: r#"    let _ = measure_facts(path, final_component, false);"#,
+            run: Run::AgentBin(r#"unsafe_project_config_mounts_and_network_are_refused"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            name: r#"sources-count-bound-removed"#,
+            path: r#"crates/agent-vm/src/config_sources.rs"#,
+            old: r#"        if items.len() > MAX_DECLARED_SOURCES {"#,
+            new: r#"        if false {"#,
+            run: Run::AgentBin(r#"more_sources_than_the_bound_refuse_the_load"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            name: r#"sources-duplicate-lookup-ignored"#,
+            path: r#"crates/agent-vm/src/config_sources.rs"#,
+            old: r#"        if let Some(first) = self.aliases.get(&entry.alias) {"#,
+            new: r#"        if let Some(first) = None::<&usize> {"#,
+            run: Run::AgentBin(r#"a_duplicate_at_the_end_of_a_maximal_list_is_refused"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            name: r#"sources-byte-budget-ignored"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"        let Some(remaining) = self.remaining.checked_sub(bytes as u64) else {
+            return Err(anyhow!(
+                "config: {}: the declared sources read more than {MAX_SOURCE_BYTES_TOTAL} bytes in \
+                 total; remove the sources agent-vm does not use, or the parts of them no launch \
+                 needs",
+                crate::one_line::quoted_path(path)
+            ));
+        };"#,
+            new: r#"        let remaining = self.remaining.saturating_sub(bytes as u64);
+        let _ = path;"#,
+            run: Run::AgentBin(r#"the_declared_sources_share_one_byte_budget"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            name: r#"cross-project-trusted-source-symlink-skipped"#,
+            path: r#"crates/agent-vm/src/protected_config_dir.rs"#,
+            old: r#"    let mut dir = match resolve(&parent, Walk::Authority) {"#,
+            new: r#"    let mut dir = match Err::<Resolution, anyhow::Error>(anyhow::anyhow!("mutant")) {"#,
+            run: Run::AgentBin(
+                r#"a_writable_bind_over_another_projects_symlinked_trusted_source_is_refused"#,
+            ),
             markers: &[r#"test result: FAILED"#],
             anchors: 1,
         },

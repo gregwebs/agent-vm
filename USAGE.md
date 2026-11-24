@@ -335,7 +335,7 @@ catalog never changes it). First present source wins:
 | command line | `--image REF` |
 | environment | `AGENT_VM_IMAGE_TAG=REF` (an empty value counts as unset) |
 | project config | top-level `image = "REF"` in `~/.config/agent-vm/projects/<project-id>/config.toml`, or `image = "ALIAS:image"` naming a [config source](#sources) |
-| user config | top-level `image = "REF"` in `~/.config/agent-vm/config.toml`; used only when the project config sets no image and sources it `:trust`, which is the default |
+| fallback source | the top-level `image = "REF"` of the **first `allow = true` source in `[[sources]]` order** that declares one — by default the implicit `home` source, `~/.config/agent-vm/config.toml`; used only when the project config sets no image |
 | default | this project's own default once established (see [Project default boot images](#project-default-boot-images)); before that the host's retained digest (see [The retained default](#the-retained-default)), or the initial recommendation when nothing is retained |
 
 `agent-vm shell`, `agent-vm claude` and `agent-vm mytool` all boot the same
@@ -3070,13 +3070,21 @@ migrate today, by hand:
    directory):
 
    ```toml
-   sources = [
-     "home:trust ~/.config/agent-vm/config.toml",
-     "repo ./.agent-vm/config.toml",
-   ]
+   # Top-level keys must precede the first [[sources]] header.
+   image = "repo:image"          # optional: let the repo choose the boot image
+
+   [[sources]]
+   name = "home"
+   path = "~/.config/agent-vm/config.toml"
+   trust = true
+   allow = true
+
+   [[sources]]
+   name = "repo"
+   path = "./.agent-vm/config.toml"
    ```
 
-   and `image = "repo:image"` if that file is to choose the boot image;
+   `image = "repo:image"` is optional, and selects that file's image;
 3. run `agent-vm doctor` again and confirm the verbs appear and the note is gone.
 
 The sourced file is **unpinned** until content pinning ships: a branch switch
@@ -3089,53 +3097,113 @@ printed path directly. To *share* a team catalog, have the project config
 
 ### Sources
 
-The project config may name other config files with a top-level `sources`
-array. Each entry is `"<alias>[:trust] <path>"`:
+The project config may name other config files with `[[sources]]` tables. Each
+table has a required `name` and `path` and optional `trust` and `allow`
+booleans, both defaulting to `false`:
 
 ```toml
-# PROJECT CONFIG ONLY. Before the first table header.
-sources = [
-  "home:trust ~/.config/agent-vm/config.toml",  # read as the user config
-  "repo ./.agent-vm/config.toml",               # declarations only
-]
-image = "repo:image"                            # authorize the repo's image
+# PROJECT CONFIG ONLY. Top-level keys must precede the first [[sources]] header.
+image = "repo:image"                            # optional: authorize the repo's image
+
+[[sources]]
+name = "home"                                   # read as the user config
+path = "~/.config/agent-vm/config.toml"
+trust = true                                    # exempt from #736 pinning
+allow = true                                    # adopt this file's top-level keys
+
+[[sources]]
+name = "repo"
+path = "./.agent-vm/config.toml"
 ```
 
-- **Alias**: `[a-z][a-z0-9_-]{0,31}`, unique within the list. `doctor` and every
-  diagnostic print it as written.
-- **`:trust`** is accepted only for `~/.config/agent-vm/config.toml` — the one
-  file the ADR-0038 guard protects. Such a source is read exactly like the user
-  config, so it may carry `[network]`, `mounts`, `[mount_sets]` and
-  `[egress_sets]`, and it is the **fallback** for the boot image.
-- **Every other source is declarations only**: it may add `[[tools]]` and declare
-  `image`, and it may not grant network, mounts or mount/egress sets. Its tools
-  join the catalog with `source repo <path>` provenance and are read **unpinned**
-  for now (a later release adds content pinning).
-- **Paths**: `~/REST` is `$HOME/REST`, `/ABS` is used as is, and anything else is
-  relative to the project root. Paths are resolved lexically: `.` segments are
-  dropped, `..` is left for the filesystem to resolve, and nothing is
-  canonicalized. `~` alone and `~user/...` are refused.
-- **The user config must not route into the project.** `:trust` is refused when
-  `~/.config/agent-vm` or `~/.config/agent-vm/config.toml` resolves inside the
-  directory agent-vm runs from: a checkout alias would make repository bytes
-  trusted. A dotfile layout such as `~/.config/agent-vm/config.toml ->
-  ~/dotfiles/config.toml` therefore stops loading when you run from an ancestor of
-  its target (usually `$HOME`) — `doctor` and every launch say so, and the remedy
-  is to run from a project directory outside the target or to replace the link
-  with a regular file.
-- **Unique**: two entries may not share an alias or resolve to the same path, and
-  no entry may name the project config itself.
+- **`name`** (required, `[a-z][a-z0-9_-]{0,31}`, unique): the file's stable
+  alias. `doctor` and every diagnostic print it as written, and
+  `image = "<name>:image"` / `allow_tools = ["<name>:<tool>"]` select from it.
+- **`path`** (required): `~/REST` is `$HOME/REST`, `/ABS` is used as is, and
+  anything else is relative to the project root. Paths are resolved lexically:
+  `.` segments are dropped, `..` is left for the filesystem to resolve, and
+  nothing is canonicalized. `~` alone and `~user/...` are refused.
+- **Unique**: two entries may not share a name or resolve to the same path, and
+  no entry may name the project config itself (including through `..`, a symlink
+  or a hard link — the identity of the opened file is what is compared).
+- **Bounded**: at most 32 declared sources, and at most 4 MiB read from all of
+  them together. Both refusals name the limit and the entry count, never a
+  value from the file. A handful of sources is the normal case; the bound is
+  what keeps one project config from turning `agent-vm doctor` into thousands
+  of filesystem reads.
 - **Flat**: only the project config may declare `sources`. A sourced file that
-  declares it — `sources = []` included — is refused. So is a `sources` line
-  written after a table header (`[network]`, `[[tools]]`): TOML scopes it into
-  that table, where nothing reads it, so the refusal names the header and says the
-  line belongs above the first one.
-- **An omitted `sources` key** means the single implicit
-  `home:trust ~/.config/agent-vm/config.toml`, i.e. exactly the behaviour before
-  this key existed. `sources = []` sources nothing, so the user config is not
-  read at all.
-- **A missing `:trust` file** is fine (`absent`); a missing untrusted source is an
-  error naming the file and its `sources[N]` entry.
+  declares it — `sources = []` included — is refused. So is a top-level key
+  written after a table header (`[network]`, `[[tools]]`, `[[sources]]`): TOML
+  scopes it into that table, where nothing reads it, so the refusal names the
+  header and says the line belongs above the first one.
+- **BREAKING (0.8.3): the old string list is refused.** `sources = ["repo
+  ./x.toml"]` and `sources = ["home:trust ~/.config/agent-vm/config.toml"]` no
+  longer load; each string entry reports the `[[sources]]` migration instead.
+  Convert `"<alias>:trust <path>"` to a table with `trust = true` (and add
+  `allow = true` if you relied on that file's top-level `image`, `mounts`,
+  `[network]` or `allow_tools`), and `"<alias> <path>"` to a table without
+  attributes.
+- **An omitted `sources` key** means the single implicit entry `{ name = "home",
+  path = "~/.config/agent-vm/config.toml", trust = true, allow = true }`, i.e.
+  exactly the behaviour before this key existed. `sources = []` sources nothing,
+  so the user config is not read at all.
+- **A missing `home` file** (`path` equal to `~/.config/agent-vm/config.toml`
+  with `trust = true`) is fine (`absent`). Every other missing declared source is
+  an error naming the file and its `sources[N]` entry.
+
+#### `trust`: which read path, and pinning
+
+`trust = true` exempts a source from content pinning (#736) and reads it through
+the strict path:
+
+- **Any path outside the active checkout may be trusted.** The route is walked
+  from `/` with a directory-descriptor stack: a symlinked or writable ancestor,
+  a foreign-owned link, a component inside the checkout or an enclosing Git
+  worktree, and a final link whose target resolves inside them are all refused
+  **before any byte is read**. `~/.config/agent-vm/config.toml` keeps its dotfile
+  symlink compatibility; no other trusted path does.
+- **The read is verified unconditionally.** Owner, mode, link count and the
+  immediate directory are measured whatever the file declares, so an image-only
+  or tools-only file is measured too.
+- `trust = false` (the default) reads the file as an ordinary repository file —
+  in-repo paths such as `./.agent-vm/config.toml` are the normal case, a final
+  symlink is followed — and is **unpinned** until #736 ships content hashes: a
+  branch switch changes its declarations at the next launch, so only source a
+  file you would review on every change.
+
+#### `allow`: adopt or stay inert
+
+`trust` and `allow` are independent; all four combinations are legal:
+
+| `trust` | `allow` | read | top-level `image`, `mounts`, `[network]`, `allow_tools` |
+|---|---|---|---|
+| `true` | `true` | route check + verified read | **adopted** |
+| `true` | `false` | route check + verified read | **inert** (not adopted, not refused) |
+| `false` | `true` | ordinary read, **unpinned** until #736 | **refused until #736**: unpinned bytes cannot grant authority, so the load says to set `allow = false` (and select explicitly) or move the file outside the project and set `trust = true` |
+| `false` | `false` | ordinary read, **unpinned** until #736 | **inert** |
+
+Adoption is ordered, and the project config always outranks what it sourced:
+
+- **`image`**: the **first** `allow = true` source in `[[sources]]` order that
+  declares one supplies the fallback, so appending a source at the bottom never
+  hijacks an earlier one's boot image. `image = "<name>:image"` in the project
+  config selects any declared source's image regardless of `trust` or `allow`.
+- **`mounts`**: every `allow = true` source's list in `[[sources]]` order, then
+  the project config's own list. Identical declarations at one guest path
+  deduplicate; differing ones are a load error naming both files.
+- **`[network]`**: `allow_egress` entries union in the same order; group booleans
+  OR-union across the sources and an explicit project boolean overrides them.
+  `set:NAME` references stay the user config's alone until #738.
+- **`allow_tools`**: each `allow = true` source's list is inherited in
+  `[[sources]]` order; the project's own list applies next and may repeat an
+  inherited entry (idempotent) or replace a verb's definition in place. Two
+  different sources authorizing one verb, with no project override, is a load
+  error naming both.
+
+An inert declaration is **silently ignored, never refused**: it activates
+nothing, spends nothing, and `doctor` lists it. To use it deliberately, write
+`image = "<name>:image"` or `allow_tools = ["<name>:<tool>"]` in the project
+config, or set `allow = true`.
 
 `agent-vm doctor` lists what the project config sources and where the boot image
 came from:
@@ -3145,30 +3213,38 @@ came from:
 user:    /home/me/.config/agent-vm/config.toml (found, 2 tools)
 project: /home/me/.config/agent-vm/projects/3f9c…/config.toml (found, 0 tools)
 sources:
-  home:trust /home/me/.config/agent-vm/config.toml (found, 2 tools)
-  repo /work/app/.agent-vm/config.toml (found, 1 tool)
+  home /home/me/.config/agent-vm/config.toml (found, 2 tools) [trust=true, allow=true]
+  repo /work/app/.agent-vm/config.toml (found, 1 tool) [trust=false, allow=false; inert: image, mounts, [network], allow_tools]
 resolved: authorized tools; launch-verb order
   1. pi -> "pi"; …; source=sourced:repo:/work/app/.agent-vm/config.toml
 …
 ==> boot image
 …
 project: ghcr.io/team/app:7 [repo:image /work/app/.agent-vm/config.toml]
-source team: ghcr.io/team/other:1 [/work/app/team.toml]  (not selected; nothing in the project config authorizes it — to select it, write image = "team:image" in the project config)
+source team: ghcr.io/team/other:1 [/work/app/team.toml]  (inert; allow = false — to select it, write image = "team:image" in the project config or set allow = true)
 selected (without --image): ghcr.io/team/app:7 (from repo:image in /work/app/.agent-vm/config.toml)
 ```
 
-When the project config sources no `:trust` file, the user row reads
+When the project config sources nothing at the user path, the user row reads
 `(not sourced by the project config)`, and an empty list reads `sources: none`.
 
 ### Schema
 
-`[network]` authority and `mounts` are user-tier only, from a verified file. The
-project tier refuses both. See [Persisted grants](#persisted-grants-user-config)
-and [Config mounts](#config-mounts-user-config).
+`[network]` and `mounts` are authority-bearing, so they are accepted only in a
+file whose read was verified: the default user config (`trust = true` at
+`~/.config/agent-vm/config.toml`), a trusted source, or the host-managed project
+config. An `allow = false` source may declare them, but they stay inert
+(ADR-0076). `[mount_sets]` and `[egress_sets]` remain the default user config's
+alone until #738. See [Persisted grants](#persisted-grants-user-config) and
+[Config mounts](#config-mounts-user-config).
 
 ```toml
-# PROJECT CONFIG ONLY, and it must come before the first table header:
-# sources = ["home:trust ~/.config/agent-vm/config.toml", "repo ./.agent-vm/config.toml"]
+# PROJECT CONFIG ONLY, and the top-level keys must come before the first table header:
+# [[sources]]
+# name = "home"
+# path = "~/.config/agent-vm/config.toml"
+# trust = true
+# allow = true
 
 # Top-level, optional: the boot image for every session (an OCI reference).
 # In the project config only, "ALIAS:image" selects a sourced file's image.
@@ -3346,9 +3422,9 @@ than 64 declared entries are also hard errors.
 
 Since 0.8.2 the verb list is `allow_tools`, not the declarations: a `[[tools]]`
 block that nothing authorizes is inert data. The verbs are the authorized ones
-in **authorization** order — the `:trust` file's list first, in that file's
-order, then the project's entries in write order, an entry that names an
-inherited verb replacing it in place
+in **authorization** order — each `allow = true` source's own list in
+`[[sources]]` order, then the project's entries in write order, an entry that
+names an inherited verb replacing it in place
 ([Tool authorization](#tool-authorization-allow_tools)) — then the `shell`
 fallback. A reversed list such as `["b", "a"]` is legal, and `--help` and
 `doctor` show that order. The merge is a union of whole definitions, **not** a
@@ -3356,8 +3432,9 @@ field-by-field overlay: a repo cannot fill in an omitted `persist`,
 `credentials`, or `tools` on another file's definition, and a differing
 `network_requests` list is a conflict rather than a merge.
 
-The top-level `image` is **not** merged: the project tier's `image` wins over the
-user tier's. The compiled-in catalog applies only when neither the user nor the
+The top-level `image` is **not** merged: the project config's own `image` wins,
+and otherwise the first `allow = true` source in `[[sources]]` order supplies the
+fallback (ADR-0076). The compiled-in catalog applies only when neither the user nor the
 project config declares a tool or writes `allow_tools`; either one opts out, and
 an image-only file does not.
 
@@ -5231,15 +5308,19 @@ network_requests = ["api.example.com", "git.example.com:8443"]
   A qualified entry (`"repo:fetcher"`) is **project-config only** and names a tool
   in the source bound to `repo`. `:` may not appear in a tool name.
 - Wildcards are refused: list each tool.
-- In the **project** config, an entry may select a `:trust` file's tool
-  (`"home:fetcher"`), which requires that file to pass ADR-0040's verified read.
-- A `:trust` file's own `allow_tools` is inherited automatically. The project's
-  authorization **replaces** an inherited verb in place, keeping its position in
-  the verb order. Two different origins claiming one verb in the project's own
-  list is an error.
-- A non-`:trust` sourced file may not declare `allow_tools`; the project
-  authorizes its tools. Authorizing one does **not** authorize the tools its own
-  `tools = [...]` reaches — list each of those too.
+- In the **project** config, an entry may select a `trust = true` source's tool
+  (`"home:fetcher"`), which requires that file's read to have passed its verified
+  check.
+- An `allow = true` source's own `allow_tools` is inherited automatically, in
+  `[[sources]]` order. The project's authorization **replaces** an inherited verb
+  in place, keeping its position in the verb order. Two different targets for one
+  verb in the project's own list is an error, and so is one verb inherited from
+  two sources with no project override — name the winner
+  (`"<alias>:<tool>"`) or set `allow = false` on one source.
+- A `trust = false` source may not have its `allow_tools` adopted (#736 gates it);
+  the project authorizes its tools. Authorizing one does **not** authorize the
+  tools its own `tools = [...]` reaches — list each of those too. A
+  `trust = true` source keeps private helper declarations, like the user config.
 - A tool authorized from a sourced file is delegated to that file's unpinned
   bytes until [#736](https://github.com/gregwebs/agent-vm/issues/736).
 

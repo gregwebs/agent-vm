@@ -28,8 +28,10 @@ use std::path::Path;
 /// whether a qualified `<alias>:<name>` entry is legal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AllowToolScope {
-    /// `~/.config/agent-vm/config.toml` (the `:trust` tier): unqualified only.
-    UserConfig,
+    /// Any sourced file: the default user config, or an `allow = true` source
+    /// (ADR-0076 R4.4). Unqualified entries only — a sourced file can authorize
+    /// its own `[[tools]]` and nothing else.
+    SourceFile,
     /// `~/.config/agent-vm/projects/<id>/config.toml`: unqualified or qualified.
     ProjectConfig,
 }
@@ -62,43 +64,41 @@ impl AllowToolEntry {
     }
 }
 
-/// The `:trust` user file's own authorizations, admitted for inheritance.
+/// One `allow = true` source's own authorizations, admitted for inheritance
+/// (ADR-0076 R4.4).
 ///
-/// The private field is the point: [`Self::from_verified`] is the only
-/// constructor and it demands the ADR-0040 token, so a file's own `allow_tools`
-/// can only reach a launch verb through a verified read. A file whose
-/// `allow_tools` never made it into `AuthorityTriggers` finds no token and is
-/// refused by `config::build_tier` rather than silently inheriting nothing.
+/// The private field is the point: [`Self::from_authorized`] is the only
+/// constructor and it demands an [`AdoptedAuthority`] token, so a file's own
+/// `allow_tools` can only reach a launch verb through a verified read (or, from
+/// #736, approved bytes). A file whose `allow_tools` never made it into
+/// `AuthorityTriggers` finds no token and is refused rather than silently
+/// inheriting nothing.
 #[derive(Debug)]
-pub(crate) struct UserAllowTools {
+pub(crate) struct AdoptedAllowTools {
     file: std::path::PathBuf,
     entries: Vec<AllowToolEntry>,
 }
 
-impl UserAllowTools {
-    pub(crate) fn from_verified(
-        authorized: &crate::config_authority::AuthorizedConfig<'_>,
+impl AdoptedAllowTools {
+    pub(crate) fn from_authorized(
+        authority: &crate::config_authority::AdoptedAuthority<'_>,
         value: &toml::Value,
     ) -> anyhow::Result<Self> {
-        let file = authorized.file();
-        let entries = parse(value, file, AllowToolScope::UserConfig)?;
+        let file = authority.file();
+        let entries = parse(value, file, AllowToolScope::SourceFile)?;
         Ok(Self {
             file: file.to_path_buf(),
             entries,
         })
     }
 
-    pub(crate) fn file(&self) -> &Path {
-        &self.file
+    /// The entries as parsed, in the file's own order.
+    pub(crate) fn entries(&self) -> &[AllowToolEntry] {
+        &self.entries
     }
 
-    /// `(index, name)` in the file's own `allow_tools` order, which is the order
-    /// inherited verbs take.
-    pub(crate) fn names(&self) -> impl Iterator<Item = (usize, &str)> + '_ {
-        self.entries
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| (index, entry.name()))
+    pub(crate) fn file(&self) -> &Path {
+        &self.file
     }
 }
 
@@ -143,12 +143,12 @@ fn parse_entry(
     let Some((alias, name)) = text.split_once(':') else {
         return Ok(AllowToolEntry::Local(valid_name(file, index, text)?));
     };
-    if scope == AllowToolScope::UserConfig {
+    if scope == AllowToolScope::SourceFile {
         return Err(prefix(
             file,
             Some(index),
-            "qualified <alias>:<tool> entries are only valid in the project config; the user \
-             config can only authorize its own [[tools]]",
+            "qualified <alias>:<tool> entries are only valid in the project config; a sourced \
+             file can only authorize its own [[tools]]",
         ));
     }
     let Some(alias) = SourceAlias::parse(alias) else {
@@ -202,7 +202,7 @@ mod tests {
     }
 
     fn parse_user(text: &str) -> anyhow::Result<Vec<AllowToolEntry>> {
-        parse(&toml_value(text), &file(), AllowToolScope::UserConfig)
+        parse(&toml_value(text), &file(), AllowToolScope::SourceFile)
     }
 
     fn parse_project(text: &str) -> anyhow::Result<Vec<AllowToolEntry>> {
@@ -241,7 +241,7 @@ mod tests {
     fn refusals_never_echo_the_entry() {
         const SECRET: &str = "SECRET-735";
         for (text, scope, expected_field) in [
-            (r#"["*"]"#, AllowToolScope::UserConfig, "allow_tools[0]"),
+            (r#"["*"]"#, AllowToolScope::SourceFile, "allow_tools[0]"),
             (
                 r#"["repo:*"]"#,
                 AllowToolScope::ProjectConfig,
@@ -259,7 +259,7 @@ mod tests {
             ),
             (
                 r#"["repo:pi"]"#,
-                AllowToolScope::UserConfig,
+                AllowToolScope::SourceFile,
                 "allow_tools[0]",
             ),
             (
@@ -277,8 +277,8 @@ mod tests {
                 AllowToolScope::ProjectConfig,
                 "allow_tools[0]",
             ),
-            ("123", AllowToolScope::UserConfig, "allow_tools"),
-            ("[1]", AllowToolScope::UserConfig, "allow_tools[0]"),
+            ("123", AllowToolScope::SourceFile, "allow_tools"),
+            ("[1]", AllowToolScope::SourceFile, "allow_tools[0]"),
         ] {
             let error = parse(&toml_value(text), &file(), scope)
                 .unwrap_err()
@@ -307,21 +307,21 @@ mod tests {
                 .to_string()
         };
         assert!(
-            message("123", AllowToolScope::UserConfig)
+            message("123", AllowToolScope::SourceFile)
                 .ends_with("allow_tools: must be an array of strings")
         );
         assert!(
-            message("[1]", AllowToolScope::UserConfig)
+            message("[1]", AllowToolScope::SourceFile)
                 .ends_with("allow_tools[0]: must be a string")
         );
-        assert!(message(r#"["*"]"#, AllowToolScope::UserConfig).ends_with(
+        assert!(message(r#"["*"]"#, AllowToolScope::SourceFile).ends_with(
             "allow_tools[0]: wildcards (\"*\") are not permitted in allow_tools; list each tool \
              explicitly"
         ));
         assert!(
-            message(r#"["repo:pi"]"#, AllowToolScope::UserConfig).ends_with(
+            message(r#"["repo:pi"]"#, AllowToolScope::SourceFile).ends_with(
                 "allow_tools[0]: qualified <alias>:<tool> entries are only valid in the project \
-             config; the user config can only authorize its own [[tools]]"
+             config; a sourced file can only authorize its own [[tools]]"
             )
         );
         assert!(
@@ -337,7 +337,7 @@ mod tests {
         );
         for reserved in ["help", "run", "doctor"] {
             assert!(
-                message(&format!(r#"["{reserved}"]"#), AllowToolScope::UserConfig)
+                message(&format!(r#"["{reserved}"]"#), AllowToolScope::SourceFile)
                     .contains("invalid tool name"),
                 "{reserved}"
             );

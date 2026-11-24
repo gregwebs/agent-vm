@@ -3,7 +3,7 @@
 ## Status
 
 Accepted for [#735](https://github.com/gregwebs/agent-vm/issues/735), the third of
-seven stacked children of
+ten stacked children of
 [#732](https://github.com/gregwebs/agent-vm/issues/732). Amends
 [ADR-0018](0018-machine-checked-boundary-contracts.md) (the proved-kernel list
 keeps one egress-prefix claim, and the grammar re-entry now serves an authorized
@@ -20,6 +20,11 @@ belongs to the compiled-in defaults alone),
 and [ADR-0074](0074-flat-config-sources.md) (an authorized source definition
 outranks the `:trust` verb). Bumps the workspace version to **0.8.2** inside the
 unreleased 0.8.x line.
+
+Amended by [ADR-0076](0076-sources-tables-trust-and-allow.md) (#748):
+`allow_tools` is inherited from every `allow = true` source in `[[sources]]`
+order rather than from the single `:trust` user file, and it is inert (not
+refused) in an `allow = false` source.
 
 ## Context
 
@@ -198,8 +203,14 @@ referent, and the one-entry fix.
   and `./` mount paths** arrive with
   [#738](https://github.com/gregwebs/agent-vm/issues/738). A declared tool's
   `mounts` in those tiers accepts absolute and `~/` paths only.
-- **Multi-`:trust` sourcing** (ADR-0074 G5) is unchanged: `:trust` is the user
-  config only.
+- **Multi-source `allow_tools` inheritance** was #748's
+  ([ADR-0076](0076-sources-tables-trust-and-allow.md)): every `allow = true`
+  source's own list is inherited in `[[sources]]` order, the project's entries
+  override a verb in place, and two sources authorizing one verb with no project
+  override is a load error. A `trust = true` source keeps private helper
+  declarations (the #735 closure rule is `trust = false` only); a
+  `trust = false, allow = true` source's list is not adopted until #736 approves
+  its bytes.
 - **ADR-0040's ancestor gap** is unchanged: the immediate directory is measured,
   not every ancestor.
 

@@ -3,8 +3,17 @@
 ## Status
 
 Accepted for [#734](https://github.com/gregwebs/agent-vm/issues/734), the second
-of seven stacked children of
-[#732](https://github.com/gregwebs/agent-vm/issues/732). Amends
+of ten stacked children of
+[#732](https://github.com/gregwebs/agent-vm/issues/732).
+**Superseded in part by
+[ADR-0076](0076-sources-tables-trust-and-allow.md) (#748)**: the
+`"<alias>[:trust] <path>"` string syntax (Decision 1), `:trust` being the user
+config only (Decision 3) and every other source being declarations-only
+(Decision 4) are replaced by `[[sources]]` tables with independent `trust` and
+`allow` booleans; Decisions 2, 5 and 7 are amended (the implicit default now
+carries `allow = true`, the fallback image is the first `allow = true` source in
+`[[sources]]` order, and the project config adopts its own `mounts` and
+`[network]`). Amends
 [ADR-0073](0073-host-managed-project-config.md) (the project config may now
 source other files) and [ADR-0035](0035-consume-user-owned-boot-images.md) (the
 project image outranks the user image). Amended by
@@ -279,8 +288,12 @@ the user config never hides the note.
 - **G4. With `home` unsourced, a CLI `set:NAME` reports the existing "no user
   config file was found".** (ADR-0075 removed the `tool:NAME` half.) The wording
   is accurate in effect and imprecise in cause; #738's selector work owns it.
-- **G5. `:trust` is user-config-only.** Generalising it needs per-source guard
-  coverage, source-qualified authority namespaces and provenance (#738).
+- **G5. `:trust` is user-config-only.** **Closed by
+  [ADR-0076](0076-sources-tables-trust-and-allow.md)**: `trust = true` is
+  accepted on any outside-checkout path, guarded by the whole-route walk, an
+  unconditional ADR-0040 verified read, the descriptor-identity self-source
+  check, and the ADR-0038 guest-write guard over every trusted source route.
+  (Source-qualified namespaces for `[mount_sets]`/`[egress_sets]` remain #738's.)
 - **G6. A source's tools can request credentials and reuse a familiar verb name.**
   **Closed for unauthorized tools by
   [ADR-0075](0075-explicit-tool-authorization.md)**: a source's declarations are

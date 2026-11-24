@@ -850,6 +850,7 @@ pub(crate) async fn launch(
     user_mounts: Option<&crate::config_mounts::UserMounts>,
     credential_preflight: CredentialPreflight,
     resources: crate::resources::ResourceCeiling,
+    trusted_sources: Vec<PathBuf>,
     args: Args,
     project: &ProjectDir,
 ) -> Result<i32> {
@@ -1001,6 +1002,7 @@ pub(crate) async fn launch(
         // collision check cannot drift from the links that are actually created.
         crate::guest_home::PersistedHome::new(guest_home_path, &home_links),
         launch_stores(&session)?,
+        trusted_sources,
     )?;
     // Selection is pure: it decides which declaration sources this launch asks
     // for (verified user `mounts` unless `--no-config-mounts`, then argv) and
@@ -3868,6 +3870,7 @@ fn launch_mount_context(
     core_host_sources: Vec<CoreHostSource>,
     persisted_home: crate::guest_home::PersistedHome,
     stores: Vec<crate::protected_config_dir::Store>,
+    trusted_sources: Vec<PathBuf>,
 ) -> Result<mount::MountContext> {
     let authority_home = config::host_home_dir().context("locating the authority home")?;
     Ok(mount::MountContext {
@@ -3879,6 +3882,7 @@ fn launch_mount_context(
         core_host_sources,
         persisted_home,
         stores,
+        trusted_sources,
     })
 }
 
@@ -4028,6 +4032,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             crate::guest_home::PersistedHome::none(),
+            Vec::new(),
             Vec::new(),
         )
         .unwrap();
@@ -6804,6 +6809,7 @@ options ndots:2 timeout:1";
             core_host_sources: Vec::new(),
             persisted_home: crate::guest_home::PersistedHome::none(),
             stores: Vec::new(),
+            trusted_sources: Vec::new(),
         };
         let guest = PathBuf::from("/home/guest/.pi");
 
@@ -6888,6 +6894,7 @@ options ndots:2 timeout:1";
                     core_host_sources: Vec::new(),
                     persisted_home: crate::guest_home::PersistedHome::none(),
                     stores: Vec::new(),
+                    trusted_sources: Vec::new(),
                 },
             )
             .unwrap();
@@ -6935,6 +6942,7 @@ options ndots:2 timeout:1";
             core_host_sources: Vec::new(),
             persisted_home: crate::guest_home::PersistedHome::none(),
             stores: Vec::new(),
+            trusted_sources: Vec::new(),
         };
         let first = mount::prepare(
             mount::parse_extra_mounts(std::slice::from_ref(&raw)).unwrap(),
@@ -6985,6 +6993,7 @@ options ndots:2 timeout:1";
                 core_host_sources: Vec::new(),
                 persisted_home: crate::guest_home::PersistedHome::none(),
                 stores: Vec::new(),
+                trusted_sources: Vec::new(),
             },
         )
         .unwrap();

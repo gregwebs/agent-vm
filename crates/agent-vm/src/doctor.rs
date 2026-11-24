@@ -1396,7 +1396,7 @@ fn describe_egress_references(network: &crate::user_network::UserNetwork) -> Str
         if out.is_empty() {
             out.push_str(&format!(
                 "persisted egress references in \"{}\" [network]:\n",
-                crate::one_line::path(network.file())
+                crate::one_line::path(network.reference_file())
             ));
         }
         out.push_str(&format!("  {reference} -> {}\n", grants.join(", ")));
@@ -1404,13 +1404,13 @@ fn describe_egress_references(network: &crate::user_network::UserNetwork) -> Str
     out
 }
 
-/// The project config's sources (ADR-0074 R11).
+/// The project config's sources (ADR-0076 R5.1).
 ///
 /// Empty when sourcing was implicit, so a run that declares no `sources` key prints
 /// exactly what #733 printed. Each row uses the same renderer as a tier row, and the
 /// alias is printed raw because the grammar admits no control byte.
 fn describe_sources(sources: &SourcesReport) -> String {
-    use crate::config_sources::{SourceTrust, Sourcing};
+    use crate::config_sources::Sourcing;
 
     if sources.sourcing() != Sourcing::Listed {
         return String::new();
@@ -1420,13 +1420,14 @@ fn describe_sources(sources: &SourcesReport) -> String {
     }
     let mut out = String::from("sources:\n");
     for entry in sources.entries() {
-        let label = match entry.trust() {
-            SourceTrust::Trusted => format!("{}:trust", entry.alias()),
-            SourceTrust::Untrusted => entry.alias().to_string(),
-        };
+        let mut attrs = format!("trust={}, allow={}", entry.is_trusted(), entry.is_allowed());
+        if !entry.inert().is_empty() {
+            attrs.push_str(&format!("; inert: {}", entry.inert().labels().join(", ")));
+        }
         out.push_str(&format!(
-            "  {label} {}\n",
-            describe_tier(entry.tier(), &label)
+            "  {} {} [{attrs}]\n",
+            entry.alias(),
+            describe_tier(entry.tier(), entry.alias().as_str()),
         ));
     }
     out
@@ -1708,54 +1709,59 @@ fn describe_project_default_observation(
     }
 }
 
-/// The `user:`, `project:` and inert `source …:` rows of the boot-image section.
+/// The `user:`, `project:` and `source …:` rows of the boot-image section.
 ///
-/// ADR-0074 R11: the project config (its own `image`, or an `ALIAS:image`
-/// selection) outranks the `:trust` source, so the losing row is the **user** one.
-/// An unselected source image is reported as inert — it exists, changes nothing,
-/// and the row says how to select it, without claiming the project config already
-/// asks for it when it does not.
+/// ADR-0076 R5.2: the project config (its own `image`, or an `ALIAS:image`
+/// selection) outranks every source, and the fallback is the first `allow = true`
+/// source in `[[sources]]` order. Each other declared image says what outranked
+/// it, and an `allow = false` one says how to select it instead — it changes
+/// nothing, and the row must not claim the project already asks for it.
 fn describe_image_tiers(images: &ConfiguredImages) -> String {
-    let user = describe_configured_image(images.user());
-    let mut out = if images.user().is_some() && images.project().is_some() {
-        format!("user:    {user}  (overridden by the project image)\n")
+    use crate::config::SourceImageStatus;
+
+    let mut out = if images.user().is_some() {
+        let note = if images.project().is_some() {
+            Some("overridden by the project image".to_owned())
+        } else {
+            images
+                .user_overridden_by()
+                .map(|winner| format!("overridden by source {winner} fallback image"))
+        };
+        match note {
+            Some(note) => format!(
+                "user:    {}  ({note})\n",
+                describe_configured_image(images.user())
+            ),
+            None => format!("user:    {}\n", describe_configured_image(images.user())),
+        }
     } else {
-        format!("user:    {user}\n")
+        format!("user:    {}\n", describe_configured_image(images.user()))
     };
     out.push_str(&format!(
         "project: {}\n",
         describe_configured_image(images.project())
     ));
-    for inert in images.inert() {
+    for row in images.source_images() {
+        let alias = row.alias();
+        let status = match row.status() {
+            SourceImageStatus::SelectedFallback => "selected fallback; allow = true".to_owned(),
+            SourceImageStatus::OverriddenByProject => {
+                "allow = true; overridden by the project image".to_owned()
+            }
+            SourceImageStatus::OverriddenBySource(winner) => {
+                format!("allow = true; overridden by source {winner} fallback image")
+            }
+            SourceImageStatus::Inert => format!(
+                "inert; allow = false — to select it, write image = \"{alias}:image\" in the \
+                 project config or set allow = true"
+            ),
+        };
         out.push_str(&format!(
-            "source {alias}: {}  ({})\n",
-            describe_configured_image(Some(inert.image())),
-            inert_selection(images, inert.alias()),
-            alias = inert.alias(),
+            "source {alias}: {}  ({status})\n",
+            describe_configured_image(Some(row.image())),
         ));
     }
     out
-}
-
-/// Why a declared source image is inert, and what would select it.
-///
-/// The authorization is read from the project config's own `image`: only an
-/// `ALIAS:image` naming *this* source selects it, so a project config with no
-/// `image` at all — or one naming another source or a direct reference — must not
-/// be quoted as already selecting it. The unselected row is correct either way; the
-/// sentence is the only thing that depends on the configuration.
-fn inert_selection(
-    images: &ConfiguredImages,
-    alias: &crate::config_sources::SourceAlias,
-) -> String {
-    if images.project().and_then(ConfiguredImage::via) == Some(alias) {
-        format!("not selected; the project config selects it with image = \"{alias}:image\"")
-    } else {
-        format!(
-            "not selected; nothing in the project config authorizes it — to select it, write \
-             image = \"{alias}:image\" in the project config"
-        )
-    }
 }
 
 /// `ghcr.io/owner/name:tag [/path/to/config.toml]`, or
@@ -5220,8 +5226,9 @@ credentials:
     fn v18_describe_config_renders_sources_and_a_not_sourced_user_tier() {
         let f = SourcesDoctor::new();
         let report = f.load(
-            "sources = [\"home:trust ~/.config/agent-vm/config.toml\", \"repo ./.agent-vm/config.toml\"]\n\
-             allow_tools = [\"home:home-tool\", \"repo:repo-tool\"]\n",
+            "allow_tools = [\"home:home-tool\", \"repo:repo-tool\"]\n\
+             [[sources]]\nname = \"home\"\npath = \"~/.config/agent-vm/config.toml\"\ntrust = true\n\
+             [[sources]]\nname = \"repo\"\npath = \"./.agent-vm/config.toml\"\n",
             "[[tools]]\nname = \"home-tool\"\ncommand = \"home-tool\"\n",
             "[[tools]]\nname = \"repo-tool\"\ncommand = \"repo-tool\"\n",
         );
@@ -5232,7 +5239,7 @@ credentials:
         assert!(catalog.is_some());
         assert!(
             text.contains(&format!(
-                "sources:\n  home:trust {} (found, 1 tool)\n  repo {} (found, 1 tool)\n",
+                "sources:\n  home {} (found, 1 tool) [trust=true, allow=false]\n  repo {} (found, 1 tool) [trust=false, allow=false]\n",
                 user.display(),
                 repo.display()
             )),
@@ -5298,10 +5305,11 @@ credentials:
                 PathBuf::from("/w/app/.agent-vm/config.toml"),
                 "repo",
             )),
-            inert: vec![crate::config::InertImage::for_test(
+            source_images: vec![crate::config::SourceImageReport::for_test(
                 "localhost:1/team:latest",
                 PathBuf::from("/w/app/team.toml"),
                 "team",
+                crate::config::SourceImageStatus::Inert,
             )],
             ..Default::default()
         });
@@ -5310,15 +5318,16 @@ credentials:
             rows,
             "user:    none\n\
              project: localhost:1/repo:latest [repo:image /w/app/.agent-vm/config.toml]\n\
-             source team: localhost:1/team:latest [/w/app/team.toml]  (not selected; nothing in the project config authorizes it — to select it, write image = \"team:image\" in the project config)\n"
+             source team: localhost:1/team:latest [/w/app/team.toml]  (inert; allow = false — to select it, write image = \"team:image\" in the project config or set allow = true)\n"
         );
 
         // A path holding ESC is escaped in every new row.
         let images = crate::config::ConfiguredImages::for_test(crate::config::ImageTierFixture {
-            inert: vec![crate::config::InertImage::for_test(
+            source_images: vec![crate::config::SourceImageReport::for_test(
                 "localhost:1/team:latest",
                 PathBuf::from("/w/\u{1b}[31m/team.toml"),
                 "team",
+                crate::config::SourceImageStatus::Inert,
             )],
             ..Default::default()
         });
@@ -5336,54 +5345,47 @@ credentials:
         );
     }
 
-    /// The inert row reports what the project config's `image` says, not what would
-    /// select the image: a project config that declares no `image` (or one naming
-    /// another source, or a direct reference) authorizes nothing here, and the row
-    /// says so plus what to write.
-    ///
-    /// Both arms are the renderer's input contract. `resolve_images` selects an
-    /// authorized source's image rather than listing it as inert, so a real report
-    /// reaches the first arm only if a selection rule ever keeps an authorized image
-    /// unselected — the sentence still follows the configuration, not the shape of
-    /// the list it was handed.
+    /// Every precedence outcome gets its own sentence: the winning fallback, a
+    /// project override, an earlier source's override, and an inert `allow = false`
+    /// declaration that names how to select it instead (ADR-0076 R5.2).
     #[test]
-    fn an_inert_source_image_states_whether_the_project_config_authorizes_it() {
-        let inert_team = || {
-            crate::config::InertImage::for_test(
+    fn source_image_rows_report_each_precedence_outcome() {
+        use crate::config::{ImageTierFixture, SourceImageReport, SourceImageStatus};
+
+        let row = |alias: &str, status: SourceImageStatus| {
+            SourceImageReport::for_test(
                 "localhost:1/team:latest",
-                PathBuf::from("/w/app/team.toml"),
-                "team",
+                PathBuf::from(format!("/w/app/{alias}.toml")),
+                alias,
+                status,
             )
         };
-
-        let images = crate::config::ConfiguredImages::for_test(crate::config::ImageTierFixture {
-            inert: vec![inert_team()],
-            ..Default::default()
-        });
-        assert_eq!(
-            describe_image_tiers(&images),
-            "user:    none\n\
-             project: none\n\
-             source team: localhost:1/team:latest [/w/app/team.toml]  (not selected; nothing in \
-            the project config authorizes it — to select it, write image = \"team:image\" in the \
-            project config)\n"
-        );
-
-        let images = crate::config::ConfiguredImages::for_test(crate::config::ImageTierFixture {
-            project: Some(crate::config::ConfiguredImage::for_test_via(
-                "localhost:1/team:latest",
-                PathBuf::from("/w/app/team.toml"),
-                "team",
+        let images = crate::config::ConfiguredImages::for_test(ImageTierFixture {
+            user: Some(crate::config::ConfiguredImage::for_test(
+                "localhost:1/u:latest",
+                PathBuf::from("/h/.config/agent-vm/config.toml"),
             )),
-            inert: vec![inert_team()],
+            source_images: vec![
+                row("home", SourceImageStatus::SelectedFallback),
+                row("repo", SourceImageStatus::OverriddenByProject),
+                row(
+                    "team",
+                    SourceImageStatus::OverriddenBySource(
+                        crate::config_sources::SourceAlias::for_test("home"),
+                    ),
+                ),
+                row("legacy", SourceImageStatus::Inert),
+            ],
             ..Default::default()
         });
         assert_eq!(
             describe_image_tiers(&images),
-            "user:    none\n\
-             project: localhost:1/team:latest [team:image /w/app/team.toml]\n\
-             source team: localhost:1/team:latest [/w/app/team.toml]  (not selected; the project \
-            config selects it with image = \"team:image\")\n"
+            "user:    localhost:1/u:latest [/h/.config/agent-vm/config.toml]\n\
+             project: none\n\
+             source home: localhost:1/team:latest [/w/app/home.toml]  (selected fallback; allow = true)\n\
+             source repo: localhost:1/team:latest [/w/app/repo.toml]  (allow = true; overridden by the project image)\n\
+             source team: localhost:1/team:latest [/w/app/team.toml]  (allow = true; overridden by source home fallback image)\n\
+             source legacy: localhost:1/team:latest [/w/app/legacy.toml]  (inert; allow = false — to select it, write image = \"legacy:image\" in the project config or set allow = true)\n"
         );
     }
 }

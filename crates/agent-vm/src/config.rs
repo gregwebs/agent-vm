@@ -30,20 +30,25 @@
 //! Every tier is parsed and validated *before* merging, so an invalid
 //! project declaration fails even when the user shadowed its name.
 //!
-//! # Sources (ADR-0074)
+//! # Sources (ADR-0076)
 //!
-//! The project config may declare `sources = ["<alias>[:trust] <path>", …]`. An
-//! omitted key means the single implicit `home:trust
-//! ~/.config/agent-vm/config.toml`; an explicit list — `[]` included — replaces it,
-//! so the user file is read only when a `:trust` entry names it. Sourcing is flat
-//! (only the project config may declare `sources`) and trust is a property of the
-//! verified route, not of the path spelling: `:trust` is accepted only for the
-//! discovered user config, whose read is checked against the active checkout first
-//! (`crate::project_config::check_user_parent_route`,
-//! `check_user_symlink_target`). Every other source is declarations-only: it may add
-//! tools and declare an `image`, and it cannot grant network, mounts or sets.
-//! [`crate::config_sources`] owns the grammar and path resolution;
-//! [`crate::boot_image`] owns how a declared image becomes the boot image.
+//! The project config may declare an array of `[[sources]]` tables, each with a
+//! required `name` and `path` and optional `trust` (default `false`) and `allow`
+//! (default `false`). An omitted key means the single implicit
+//! `{ name = "home", path = "~/.config/agent-vm/config.toml", trust = true,
+//! allow = true }`; an explicit list — `[]` included — replaces it. The old
+//! `sources = ["<alias>[:trust] <path>"]` string syntax is rejected with a
+//! migration error (a deliberate breaking change).
+//!
+//! Sourcing is flat (only the project config may declare `sources`). `trust` and
+//! `allow` are independent: `trust` means the file's route is host-controlled and
+//! its read is ADR-0040-verified, so #736's content-hash pinning does not apply;
+//! `allow` means the file's top-level `image`, `mounts`, `[network]` and
+//! `allow_tools` are adopted rather than inert. A non-default `trust = true`
+//! route is refused by [`crate::project_config`] the moment it enters the
+//! checkout, and its read is descriptor-anchored. [`crate::config_sources`] owns
+//! the grammar and path resolution; [`crate::boot_image`] owns how a declared
+//! image becomes the boot image.
 //!
 //! # Launch selection is not reference resolution
 //!
@@ -155,7 +160,18 @@ pub(crate) use builtin_print::builtin_tools_toml;
 /// input, so a huge or special file must not be able to hang or exhaust
 /// `doctor`. Deliberately a *config* policy constant, not the credential
 /// file's limit.
-const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
+pub(crate) const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Ceiling on the bytes one load reads from **all** its declared sources
+/// together.
+///
+/// [`MAX_CONFIG_FILE_BYTES`] bounds one source and
+/// [`crate::config_sources`]'s count bound bounds how many there are, so a list of
+/// individually legal files could still cost tens of megabytes of TOML parsing on
+/// every launch. Four full-size files' worth is far above any real configuration
+/// (a source file is a few KiB) and is charged *before* the bytes are parsed, so
+/// many individually small files cannot add up to unbounded parse work either.
+pub(crate) const MAX_SOURCE_BYTES_TOTAL: u64 = 4 * 1024 * 1024;
 
 pub(crate) const USER_CONFIG_RELATIVE: &str = concat!(".config/agent-vm", "/config.toml");
 
@@ -336,6 +352,21 @@ impl ConfigReport {
     /// decide whether the legacy in-repo notice still applies (ADR-0074).
     pub(crate) fn sources(&self) -> &SourcesReport {
         &self.sources
+    }
+
+    /// Every `trust = true` source this load read, so the ADR-0038 guest-write
+    /// guard can refuse a writable bind over one or over a directory along its
+    /// route (ADR-0076 R2.4).
+    ///
+    /// The default `~/.config/agent-vm/config.toml` is included; the guard skips
+    /// paths already covered by the authority store's own measurement.
+    pub(crate) fn trusted_source_files(&self) -> Vec<PathBuf> {
+        self.sources
+            .entries()
+            .iter()
+            .filter(|entry| entry.attributes().trust)
+            .filter_map(|entry| entry.tier().path().map(Path::to_path_buf))
+            .collect()
     }
 
     /// The retained definitions and the launch winners, without the fallback.
@@ -710,6 +741,11 @@ pub(crate) struct ResolvedTools {
     /// entry for the same verb (#735 review D2). Empty when the project writes no
     /// list, and on both defaults paths.
     project_claims: BTreeMap<String, String>,
+    /// The `ToolOrigin::Source` of every `trust = false` source (ADR-0076 R4.4):
+    /// only those definitions' `tools` closures need their own authorization
+    /// (#735 R6). A `trust = true` source is authoritatively verified, so it
+    /// keeps private helper declarations like the user and project tiers.
+    untrusted_origins: BTreeSet<ToolOrigin>,
 }
 
 impl ResolvedTools {
@@ -725,6 +761,7 @@ impl ResolvedTools {
             authorized_explicitly: false,
             inert: Vec::new(),
             project_claims: BTreeMap::new(),
+            untrusted_origins: BTreeSet::new(),
         }
     }
 
@@ -757,6 +794,7 @@ impl ResolvedTools {
             authorized_explicitly: false,
             inert,
             project_claims: BTreeMap::new(),
+            untrusted_origins: BTreeSet::new(),
         }
     }
 
@@ -884,13 +922,49 @@ impl SourcesReport {
     }
 }
 
+/// Which top-level adoptable keys were declared by an `allow = false` source
+/// and therefore ignored as inert (ADR-0076 R3). Value-free: only presence
+/// booleans, so a refusal or a `doctor` row can never echo config bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct InertDeclarations {
+    pub(crate) image: bool,
+    pub(crate) mounts: bool,
+    pub(crate) network: bool,
+    pub(crate) allow_tools: bool,
+}
+
+impl InertDeclarations {
+    pub(crate) fn is_empty(self) -> bool {
+        !(self.image || self.mounts || self.network || self.allow_tools)
+    }
+
+    /// Canonical display order for `doctor`.
+    pub(crate) fn labels(self) -> Vec<&'static str> {
+        [
+            (self.image, "image"),
+            (self.mounts, "mounts"),
+            (self.network, "[network]"),
+            (self.allow_tools, "allow_tools"),
+        ]
+        .into_iter()
+        .filter_map(|(present, label)| present.then_some(label))
+        .collect()
+    }
+
+    pub(crate) fn with_image(mut self, image: bool) -> Self {
+        self.image = image;
+        self
+    }
+}
+
 /// One source and what reading it produced. The tier is the same report shape the
 /// user tier uses, so `doctor` renders a source row with one renderer.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct SourceReport {
     alias: crate::config_sources::SourceAlias,
-    trust: crate::config_sources::SourceTrust,
+    attributes: crate::config_sources::SourceAttributes,
     tier: TierReport,
+    inert: InertDeclarations,
 }
 
 impl SourceReport {
@@ -898,8 +972,20 @@ impl SourceReport {
         &self.alias
     }
 
-    pub(crate) fn trust(&self) -> crate::config_sources::SourceTrust {
-        self.trust
+    pub(crate) fn inert(&self) -> InertDeclarations {
+        self.inert
+    }
+
+    pub(crate) fn attributes(&self) -> crate::config_sources::SourceAttributes {
+        self.attributes
+    }
+
+    pub(crate) fn is_trusted(&self) -> bool {
+        self.attributes.trust
+    }
+
+    pub(crate) fn is_allowed(&self) -> bool {
+        self.attributes.allow
     }
 
     pub(crate) fn tier(&self) -> &TierReport {
@@ -912,13 +998,13 @@ impl SourceReport {
 /// equality. The exact variant *and* path are also the tool reference scope's
 /// identity, which is why `Hash` is derived: a reference binds by
 /// `(origin, name)`, never by bare name.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum ToolOrigin {
     BuiltIn,
     User(PathBuf),
     Project(PathBuf),
-    /// A file the project config sources without `:trust` (ADR-0074): its own
-    /// reference scope, and the alias #735 will qualify tools with.
+    /// A file the project config sources without `trust = true` (ADR-0076): its
+    /// own reference scope, and the alias #735 qualifies tools with.
     Source {
         alias: crate::config_sources::SourceAlias,
         file: PathBuf,
@@ -1247,21 +1333,105 @@ impl ConfiguredImage {
     }
 }
 
-/// Both image tiers plus the images the project config did *not* select.
+/// The source that supplied the fallback boot image (ADR-0076 R4.1): the first
+/// `allow = true` source in `[[sources]]` order that declares `image`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FallbackImage {
+    alias: crate::config_sources::SourceAlias,
+    image: ConfiguredImage,
+    /// `true` only for `~/.config/agent-vm/config.toml`, whose selection keeps
+    /// its pre-#748 `ImageSource::UserConfig` provenance and `user:` row.
+    is_default_user_config: bool,
+}
+
+impl FallbackImage {
+    pub(crate) fn alias(&self) -> &crate::config_sources::SourceAlias {
+        &self.alias
+    }
+
+    pub(crate) fn image(&self) -> &ConfiguredImage {
+        &self.image
+    }
+
+    pub(crate) fn is_default_user_config(&self) -> bool {
+        self.is_default_user_config
+    }
+}
+
+/// What one source's declared `image` did in the precedence chain (ADR-0076
+/// R5.2): it won the fallback, or lost it to one of three outranking choices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SourceImageStatus {
+    /// Winning fallback: `allow = true`, first in `[[sources]]` order, and the
+    /// project config set no `image`.
+    SelectedFallback,
+    /// `allow = true`, overridden by the project config's own `image`.
+    OverriddenByProject,
+    /// `allow = true`, overridden by an earlier `allow = true` source's fallback.
+    OverriddenBySource(crate::config_sources::SourceAlias),
+    /// `allow = false` and not selected with `ALIAS:image`.
+    Inert,
+}
+
+/// One source's declared `image` that the `project:` row does not already show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SourceImageReport {
+    alias: crate::config_sources::SourceAlias,
+    image: ConfiguredImage,
+    status: SourceImageStatus,
+}
+
+impl SourceImageReport {
+    pub(crate) fn alias(&self) -> &crate::config_sources::SourceAlias {
+        &self.alias
+    }
+
+    pub(crate) fn image(&self) -> &ConfiguredImage {
+        &self.image
+    }
+
+    pub(crate) fn status(&self) -> &SourceImageStatus {
+        &self.status
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        reference: &str,
+        file: impl Into<PathBuf>,
+        alias: &str,
+        status: SourceImageStatus,
+    ) -> Self {
+        Self {
+            alias: crate::config_sources::SourceAlias::for_test(alias),
+            image: ConfiguredImage::for_test(reference, file),
+            status,
+        }
+    }
+}
+
+/// Every configured image tier: the project config's selection, the winning
+/// fallback source, the default user config's row, and every source image the
+/// precedence chain did not use (ADR-0076 R4.1/R5.2).
 ///
-/// `Default` (neither set) is also what `image pull`
+/// `Default` (nothing set) is also what `image pull`
 /// and `setup` use when the configuration could not be read at all: the
 /// configured tiers are then unknown, and the recovery builtins fall back to
 /// `--image`/env or the default boot image.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ConfiguredImages {
-    /// The `:trust` source's image: the fallback (ADR-0074 R9).
+    /// The default user config's own `image` when that source is `allow = true`:
+    /// the `user:` row and the pre-#748 accessor.
     user: Option<ConfiguredImage>,
+    /// `Some(alias)` when an earlier `allow = true` source outranked `user` as
+    /// the fallback, which is what the `user:` row reports.
+    user_overridden_by: Option<crate::config_sources::SourceAlias>,
+    /// The winning fallback, whatever source supplied it.
+    fallback: Option<FallbackImage>,
     /// The project config's selection: its own `OCI_REF`, or a source's image via
     /// `ALIAS:image`.
     project: Option<ConfiguredImage>,
-    /// Images declared by untrusted sources and not selected, in `sources` order.
-    inert: Vec<InertImage>,
+    /// Every other declared source image, in `[[sources]]` order.
+    source_images: Vec<SourceImageReport>,
 }
 
 impl ConfiguredImages {
@@ -1269,14 +1439,26 @@ impl ConfiguredImages {
         self.user.as_ref()
     }
 
+    /// The earlier `allow = true` source that outranked the default user config.
+    pub(crate) fn user_overridden_by(&self) -> Option<&crate::config_sources::SourceAlias> {
+        self.user_overridden_by.as_ref()
+    }
+
+    /// The fallback the selector takes after the project config: the first
+    /// `allow = true` source declaring `image`.
+    pub(crate) fn fallback(&self) -> Option<&FallbackImage> {
+        self.fallback.as_ref()
+    }
+
     pub(crate) fn project(&self) -> Option<&ConfiguredImage> {
         self.project.as_ref()
     }
 
-    /// Source images the project config did not select, for `doctor` (ADR-0074
-    /// R11): they change nothing until an `ALIAS:image` selects one.
-    pub(crate) fn inert(&self) -> &[InertImage] {
-        &self.inert
+    /// Source images the `project:` row does not show, for `doctor` (ADR-0076
+    /// R5.2): they change nothing until an `ALIAS:image` or `allow = true`
+    /// selects one.
+    pub(crate) fn source_images(&self) -> &[SourceImageReport] {
+        &self.source_images
     }
 
     /// A fixture for tests outside this module (which cannot name the private
@@ -1286,34 +1468,15 @@ impl ConfiguredImages {
     #[cfg(test)]
     pub(crate) fn for_test(fixture: ImageTierFixture) -> Self {
         Self {
+            fallback: fixture.user.clone().map(|image| FallbackImage {
+                alias: crate::config_sources::SourceAlias::home(),
+                image,
+                is_default_user_config: true,
+            }),
             user: fixture.user,
             project: fixture.project,
-            inert: fixture.inert,
-        }
-    }
-}
-
-/// One untrusted source's declared image that the project config did not select.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct InertImage {
-    alias: crate::config_sources::SourceAlias,
-    image: ConfiguredImage,
-}
-
-impl InertImage {
-    pub(crate) fn alias(&self) -> &crate::config_sources::SourceAlias {
-        &self.alias
-    }
-
-    pub(crate) fn image(&self) -> &ConfiguredImage {
-        &self.image
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_test(reference: &str, file: impl Into<PathBuf>, alias: &str) -> Self {
-        Self {
-            alias: crate::config_sources::SourceAlias::for_test(alias),
-            image: ConfiguredImage::for_test(reference, file),
+            source_images: fixture.source_images,
+            ..Self::default()
         }
     }
 }
@@ -1325,7 +1488,7 @@ impl InertImage {
 pub(crate) struct ImageTierFixture {
     pub(crate) user: Option<ConfiguredImage>,
     pub(crate) project: Option<ConfiguredImage>,
-    pub(crate) inert: Vec<InertImage>,
+    pub(crate) source_images: Vec<SourceImageReport>,
 }
 
 /// A validated, normalized guest-HOME-relative persist path. The inner path
@@ -1423,25 +1586,39 @@ impl ConfigConflict {
 /// contextual hard error — there is no fallback to defaults.
 ///
 /// The project config is read first: it decides which other files are read at all
-/// (ADR-0074). A project config that lists no `sources` behaves exactly as the
-/// implicit `home:trust <user config>`, which is #733's shipped two-tier load.
+/// (ADR-0076). Omitting `sources` behaves exactly as the implicit
+/// `{ name = "home", path = "~/.config/agent-vm/config.toml", trust = true,
+/// allow = true }`, which is #733's shipped two-tier load.
 pub(crate) fn load(paths: &ConfigPaths) -> Result<ConfigReport> {
+    load_with_content_approval(paths, &config_authority::UnpinnedContentPolicy)
+}
+
+/// [`load`] with the #736 content-approval policy supplied. Production passes
+/// [`config_authority::UnpinnedContentPolicy`], which refuses every
+/// `trust = false, allow = true` adoption; #748's tests pass an approving policy
+/// to prove the approved and refused paths end to end.
+pub(crate) fn load_with_content_approval(
+    paths: &ConfigPaths,
+    approval: &dyn config_authority::ContentApprovalPolicy,
+) -> Result<ConfigReport> {
     // One leaf-visit counter for the whole load (#735, D6): project tool lists,
-    // then each source in `sources` order (the `:trust` user file at its own
-    // position). It is moved into the report so the single catalog build
-    // continues from exactly here.
+    // then each source in `[[sources]]` order. It is moved into the report so
+    // the single catalog build continues from exactly here.
     let mut work = config_mounts::MountExpansionWork::fresh();
     let ProjectRead {
         report: project,
-        contents: project_contents,
+        contents: mut project_contents,
         declared,
+        // The verified project file's identity gates the self-source check and
+        // authorizes its own top-level `mounts` and `[network]` (ADR-0076 R3).
+        verified: project_verified,
     } = match &paths.project {
         Some(project) => read_project_tier(project, paths.home.as_deref(), &mut work)?,
         None => ProjectRead::unavailable(),
     };
     let (sources, project_image) = match &paths.project {
         Some(project) => {
-            let sources = declared_sources(paths, declared.sources.as_deref(), &project.config)?;
+            let sources = declared_sources(paths, declared.sources.as_ref(), &project.config)?;
             let image =
                 classify_project_image(declared.image.as_deref(), &sources, &project.config)?;
             (sources, image)
@@ -1454,74 +1631,182 @@ pub(crate) fn load(paths: &ConfigPaths) -> Result<ConfigReport> {
         .project
         .as_ref()
         .map(|project| project.config.as_path());
+    let verified_project = project_verified.as_ref();
 
-    // The user tier is the `:trust` source and nothing else: a list without one
-    // never reads `~/.config/agent-vm/config.toml`.
-    let mut user = not_sourced_tier(paths.user.as_deref());
-    let mut user_contents = TierContents::empty();
-    let mut reports = Vec::new();
-    let mut source_tools: Vec<Vec<Tool>> = Vec::new();
-    let mut source_images: Vec<(&crate::config_sources::SourceEntry, Option<ConfiguredImage>)> =
-        Vec::new();
+    // One read per declared source, in `[[sources]]` order. The default user
+    // config is recognised **lexically** (never by canonical equality) and is
+    // the only `trust = true` route with ADR-0040's dotfile compatibility.
+    let mut reads: Vec<SourceRead> = Vec::with_capacity(sources.entries().len());
+    // One aggregate budget for every source: the per-file ceiling and the list
+    // bound alone would let a legal list multiply the parse cost.
+    let mut budget = SourceBytes::fresh();
     for entry in sources.entries() {
-        let (tier, contents) = match entry.trust() {
-            crate::config_sources::SourceTrust::Trusted => {
-                // D3: trust is bound to the discovered `paths.user` and its verified
-                // route, never to `entry.path()`'s spelling.
-                let user_path = paths.user.as_deref().ok_or_else(|| {
-                    anyhow!("internal: trusted source without a discovered user config path")
-                })?;
-                read_user_tier(user_path, paths.route(), paths.home.as_deref(), &mut work)?
-            }
-            crate::config_sources::SourceTrust::Untrusted => {
-                read_source_tier(entry, paths.home.as_deref(), &mut work)?
-            }
+        let is_default_user = entry.is_trusted() && Some(entry.path()) == paths.user.as_deref();
+        let (tier, contents, inert) = if is_default_user {
+            read_default_user_source(
+                entry,
+                verified_project,
+                entry.path(),
+                paths.route(),
+                paths.home.as_deref(),
+                &mut work,
+                &mut budget,
+            )?
+        } else if entry.is_trusted() {
+            read_trusted_source(
+                entry,
+                verified_project,
+                paths.route(),
+                paths.home.as_deref(),
+                &mut work,
+                &mut budget,
+            )?
+        } else {
+            read_source_tier(
+                entry,
+                verified_project,
+                approval,
+                paths.home.as_deref(),
+                &mut work,
+                &mut budget,
+            )?
         };
-        reports.push(SourceReport {
+        reads.push(SourceRead {
             alias: entry.alias().clone(),
-            trust: entry.trust(),
-            tier: tier.clone(),
+            attributes: entry.attributes(),
+            tier,
+            contents,
+            inert,
+            is_default_user,
         });
-        match entry.trust() {
-            crate::config_sources::SourceTrust::Trusted => {
-                user = tier;
-                user_contents = contents;
-            }
-            crate::config_sources::SourceTrust::Untrusted => {
-                source_images.push((entry, contents.image));
-                source_tools.push(contents.tools);
-            }
-        }
     }
 
-    let trusted_image = match user_contents.image.as_ref() {
-        Some(image) => TrustedImage::Declared(image),
-        None if *user.status() == TierStatus::Absent => TrustedImage::Absent,
-        None => TrustedImage::NoImage,
+    let user_index = reads.iter().position(|read| read.is_default_user);
+    let user = match user_index {
+        Some(index) => reads[index].tier.clone(),
+        None => not_sourced_tier(paths.user.as_deref()),
     };
-    let images = resolve_images(
-        project_image,
-        trusted_image,
-        &sources,
-        &source_images,
-        project_config_path,
-    )?;
 
-    let project_side_tools = project_contents.tools;
+    let images = resolve_images(project_image, &sources, &reads, project_config_path)?;
+    // An `allow = false` source's `image` is inert only when the project config
+    // does not select it with `ALIAS:image` (ADR-0076 R5.1).
+    let inert_images: BTreeSet<crate::config_sources::SourceAlias> = images
+        .source_images()
+        .iter()
+        .filter(|row| matches!(row.status(), SourceImageStatus::Inert))
+        .map(|row| row.alias().clone())
+        .collect();
+
+    // ADR-0076 R4.2/R4.3: union the adopted top-level `mounts` and `[network]`
+    // tables in `[[sources]]` order, then the project config's.
+    let project_network = project_contents.network.take();
+    let project_mounts = project_contents.adopted_mounts.take().map(|mounts| {
+        let file = project_config_path
+            .expect("an adopted project mount list came from a project config")
+            .to_path_buf();
+        (file, mounts)
+    });
+    let mut mount_contributions: Vec<(PathBuf, config_mounts::ResolvedMountList)> = Vec::new();
+    let mut user_sets_mounts: Option<UserMounts> = None;
+    let mut adopted_networks: Vec<UserNetwork> = Vec::new();
+    let mut inherited: Vec<InheritedAllowTools> = Vec::new();
+    for read in &reads {
+        let Some(file) = read.tier.path() else {
+            continue;
+        };
+        if let Some(mounts) = read.contents.adopted_mounts.as_ref() {
+            mount_contributions.push((file.to_path_buf(), mounts.clone()));
+        }
+        if read.is_default_user {
+            user_sets_mounts = read.contents.mounts.clone();
+        }
+        if let Some(network) = read.contents.network.as_ref() {
+            adopted_networks.push(network.clone());
+        }
+        // Step A's sources, `[[sources]]` order included: an inherited verb's
+        // position is its declaration's, not the user config's by default.
+        if let Some(allow) = read.contents.allow_tools.as_ref() {
+            inherited.push(InheritedAllowTools {
+                file: allow.file().to_path_buf(),
+                origin: if read.is_default_user {
+                    ToolOrigin::User(file.to_path_buf())
+                } else {
+                    ToolOrigin::Source {
+                        alias: read.alias.clone(),
+                        file: file.to_path_buf(),
+                    }
+                },
+                entries: allow
+                    .entries()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, entry)| (index, entry.name().to_owned()))
+                    .collect(),
+            });
+        }
+    }
+    if let Some((file, mounts)) = project_mounts {
+        mount_contributions.push((file, mounts));
+    }
+    let network = UserNetwork::merge(adopted_networks, project_network);
+    let mounts = config_mounts::merge_adopted_mounts(mount_contributions, user_sets_mounts)?;
+
+    // ADR-0076 R4.4: the compiled-in defaults apply only when no `allow = true`
+    // source configures tools *and* no tier writes a list.
+    let any_allowed_source_configures_tools = reads.iter().any(|read| {
+        read.attributes.allow
+            && (!read.contents.tools.is_empty() || read.contents.allow_tools.is_some())
+    });
+
+    let mut source_tools: Vec<Vec<Tool>> = Vec::new();
+    let mut user_contents = TierContents::empty();
+    let mut reports: Vec<SourceReport> = Vec::with_capacity(reads.len());
+    let mut untrusted_origins: BTreeSet<ToolOrigin> = BTreeSet::new();
+    let mut trusted: Vec<TrustedSourceVerdict> = Vec::new();
+    for (index, mut read) in reads.into_iter().enumerate() {
+        let mut contents = std::mem::replace(&mut read.contents, TierContents::empty());
+        let Some(file) = read.tier.path() else {
+            return Err(anyhow!(
+                "internal: a read source without a path cannot be reported"
+            ));
+        };
+        if !read.attributes.trust {
+            untrusted_origins.insert(ToolOrigin::Source {
+                alias: read.alias.clone(),
+                file: file.to_path_buf(),
+            });
+        } else {
+            trusted.push(TrustedSourceVerdict {
+                alias: read.alias.clone(),
+                file: file.to_path_buf(),
+                is_default_user: read.is_default_user,
+                references: contents.reference_trust.take(),
+            });
+        }
+        if Some(index) == user_index {
+            user_contents = contents;
+        } else {
+            source_tools.push(contents.tools);
+        }
+        reports.push(SourceReport {
+            alias: read.alias.clone(),
+            attributes: read.attributes,
+            tier: read.tier,
+            inert: read.inert.with_image(inert_images.contains(&read.alias)),
+        });
+    }
+
     let (resolved, conflicts) = authorize_tools(AuthorizationInputs {
         user: user_contents.tools,
-        project: project_side_tools,
+        project: project_contents.tools,
         sources: source_tools,
-        user_allow: user_contents.allow_tools.as_ref(),
         project_allow: declared.allow_tools.as_deref(),
-        user_trust: user_contents.reference_trust.as_ref(),
         declared: &sources,
-        user_status: user.status(),
-        user_file: paths.user.as_deref(),
-        project_file: paths
-            .project
-            .as_ref()
-            .map(|project| project.config.as_path()),
+        project_file: project_config_path,
+        inherited,
+        any_allowed_source_configures_tools,
+        untrusted_origins,
+        trusted: &trusted,
     })?;
     let uses_defaults = !resolved.authorized_explicitly;
 
@@ -1533,8 +1818,8 @@ pub(crate) fn load(paths: &ConfigPaths) -> Result<ConfigReport> {
         project,
         resolved,
         images,
-        user_network: user_contents.network,
-        user_mounts: user_contents.mounts,
+        user_network: network,
+        user_mounts: mounts,
         user_tools: user_contents.reference_tools,
         uses_defaults,
         conflicts,
@@ -1547,14 +1832,39 @@ pub(crate) fn load(paths: &ConfigPaths) -> Result<ConfigReport> {
     })
 }
 
-/// What one parsed tier supplied: its tools and its optional `image`. Kept as
-/// one value so the tool count and the image cannot be read from two different
-/// parses.
+/// One declared source after its read: what `load` needs to attribute the read
+/// without re-deriving the entry (ADR-0076 R4/R5).
+struct SourceRead {
+    alias: crate::config_sources::SourceAlias,
+    attributes: crate::config_sources::SourceAttributes,
+    tier: TierReport,
+    contents: TierContents,
+    inert: InertDeclarations,
+    /// `true` only for the default `~/.config/agent-vm/config.toml` source.
+    is_default_user: bool,
+}
+
+/// One `allow = true` source's inherited authorizations, owned so `load` can
+/// consume the reads afterwards, with the origin its local entries resolve
+/// against (ADR-0076 R4.4).
+struct InheritedAllowTools {
+    file: PathBuf,
+    origin: ToolOrigin,
+    /// `(index in that file's allow_tools, verb name)`, in its own order.
+    entries: Vec<(usize, String)>,
+}
+
+/// What one parsed tier supplied: its tools, its image, and whatever its
+/// top-level adoptable keys contributed. Kept as one value so the tool count and
+/// the image cannot be read from two different parses.
 struct TierContents {
     network: Option<UserNetwork>,
-    /// The user tier's verified mount configuration (defaults and/or named
-    /// sets), present-empty included.
+    /// The default user config's parsed mount configuration (defaults and/or
+    /// named sets), present-empty included.
     mounts: Option<UserMounts>,
+    /// An adopted top-level `mounts` list, as a merge contribution (ADR-0076
+    /// R4.2). `Some` only for a file that declared the key and was allowed to.
+    adopted_mounts: Option<config_mounts::ResolvedMountList>,
     tools: Vec<Tool>,
     image: Option<ConfiguredImage>,
     /// The user tier's egress-reference namespace, built from these sets. `None`
@@ -1562,7 +1872,7 @@ struct TierContents {
     reference_tools: Option<EgressNamespace>,
     /// The `:trust` file's own `allow_tools`, admitted only through the ADR-0040
     /// token (#735, D5).
-    allow_tools: Option<crate::config_allow_tools::UserAllowTools>,
+    allow_tools: Option<crate::config_allow_tools::AdoptedAllowTools>,
     /// The same read's measurement, for a project `allow_tools` entry that
     /// selects a definition out of this file.
     reference_trust: Option<crate::config_authority::ReferenceTrust>,
@@ -1575,6 +1885,7 @@ impl TierContents {
             image: None,
             network: None,
             mounts: None,
+            adopted_mounts: None,
             reference_tools: None,
             allow_tools: None,
             reference_trust: None,
@@ -1638,22 +1949,25 @@ fn not_sourced_tier(user: Option<&Path>) -> TierReport {
     }
 }
 
-/// Decode and parse one tier's bytes: the half every file tier shares once its
-/// bytes are in hand. Diagnostics never echo a value, and invalid UTF-8 is its
-/// own error (see the module's value-safe rules).
+/// Stage 1 of the two-stage decode (ADR-0076 R4.2): validate UTF-8 and parse the
+/// root document, so every tier-specific pre-decode gate can look at the file as
+/// written — before any typed decoding can mask a misplaced or inert key.
 ///
-/// The placement refusal runs before the schema for a reason: a top-level key
-/// swallowed by a table header is a *well-typed* document (or a field serde rejects
-/// with its fixed, generic sentence), so only a look at the document as written can
-/// say which table took it and where the line belongs.
-fn parse_tier(path: &Path, bytes: &[u8]) -> Result<RawConfig> {
+/// Diagnostics never echo a value, and invalid UTF-8 is its own error (see the
+/// module's value-safe rules). A syntax error keeps its `file:line:col` span.
+fn parse_toml_table<'a>(path: &Path, bytes: &'a [u8]) -> Result<(&'a str, toml::Table)> {
     let text = std::str::from_utf8(bytes).map_err(|_| utf8_error(path))?;
-    if let Some(diagnostic) = misplaced_top_level_keys(text) {
-        return Err(anyhow!(
-            "config: {}: {diagnostic}",
-            crate::one_line::quoted_path(path)
-        ));
-    }
+    let document: toml::Table =
+        toml::from_str(text).map_err(|error| deserialize_error(path, text, &error))?;
+    Ok((text, document))
+}
+
+/// Stage 2: deserialize the typed [`RawConfig`] **from the same `&str`** the
+/// document was parsed from.
+///
+/// Never from an owned `toml::Table`: that drops `toml::de::Error::span()`, and
+/// every typed schema error would lose its `file:line:col` location.
+fn decode_raw_config(path: &Path, text: &str) -> Result<RawConfig> {
     toml::from_str(text).map_err(|error| deserialize_error(path, text, &error))
 }
 
@@ -1671,15 +1985,19 @@ const ORDER_SENSITIVE_TOP_LEVEL: [&str; 2] = ["sources", "allow_tools"];
 /// proof of the misplacement, never of an intent about its contents, and nothing is
 /// echoed from the file beyond the canonical table spelling and an index.
 ///
+/// `check_network` is `false` for an `allow = false` source, whose `[network]` is
+/// inert: a member there cannot grant anything, so it must not be able to fail the
+/// load either (ADR-0076 R3).
+///
 /// `[mount_sets]` and `[egress_sets]` are deliberately not examined: a key there
 /// is reserved by [`TOP_LEVEL_FIELDS`] and refused by the set parsers with the same
 /// placement rule in their own words.
-fn misplaced_top_level_keys(text: &str) -> Option<String> {
-    let document: toml::Table = toml::from_str(text).ok()?;
-    if let Some(network) = document.get("network").and_then(toml::Value::as_table) {
+fn misplaced_sources(document: &toml::Table, check_network: bool) -> Result<()> {
+    if check_network && let Some(network) = document.get("network").and_then(toml::Value::as_table)
+    {
         for key in ORDER_SENSITIVE_TOP_LEVEL {
             if network.contains_key(key) {
-                return Some(format!(
+                return Err(anyhow!(
                     "[network]: {key} is not a network setting; a top-level {key} must be written \
                      before the first table header (keys after [network] belong to it)"
                 ));
@@ -1693,111 +2011,211 @@ fn misplaced_top_level_keys(text: &str) -> Option<String> {
         };
         for key in ORDER_SENSITIVE_TOP_LEVEL {
             if tool.contains_key(key) {
-                return Some(format!(
+                return Err(anyhow!(
                     "tools[{index}]: {key} is not a tool field; a top-level {key} must be written \
                      before the first table header (keys after [[tools]] belong to the last tool)"
                 ));
             }
         }
     }
-    None
+    Ok(())
+}
+
+/// ADR-0076 R4.2: refuse a source that is really the project config, judged by the
+/// opened descriptor's identity — so `..`, a symlink or a hard link to
+/// `projects/<id>/config.toml` is named as self-sourcing before a byte of it is
+/// interpreted.
+///
+/// Canonical equality is never used: a differently spelled path must not be
+/// upgraded into the default user config's privileges.
+fn check_not_self_source(
+    project: Option<&config_authority::VerifiedProject>,
+    source_identity: crate::host_paths::FileIdentity,
+    entry: &crate::config_sources::SourceEntry,
+) -> Result<()> {
+    if let Some(verified) = project
+        && verified.file_identity() == source_identity
+    {
+        return Err(anyhow!(
+            "config: {}: {}: the project config cannot source itself",
+            crate::one_line::quoted_path(verified.path()),
+            entry.declared(),
+        ));
+    }
+    Ok(())
+}
+
+/// Record — and drop — the top-level keys an `allow = false` source declares
+/// (ADR-0076 R3).
+///
+/// Presence only: the values are never typed, validated or echoed, so
+/// `network = 42` is as inert as a well-formed table. `image` is validated by the
+/// caller (it stays selectable with `ALIAS:image`), and is recorded inert later,
+/// by `resolve_images`, once the project's selection is known.
+fn record_inert(raw: &mut RawConfig) -> InertDeclarations {
+    let inert = InertDeclarations {
+        // Decided by `resolve_images` once the project's `ALIAS:image` selection
+        // is known: `image` is inert only when nothing selects it.
+        image: false,
+        mounts: raw.mounts.is_some(),
+        network: raw.network.is_some(),
+        allow_tools: raw.allow_tools.is_some(),
+    };
+    raw.mounts = None;
+    raw.network = None;
+    raw.allow_tools = None;
+    inert
+}
+
+/// The ADR-0040 presence triggers of a user config, read from the **document** so
+/// a malformed `network = 42` triggers exactly like a well-formed table.
+///
+/// An `allow = false` source's top-level `network`, `mounts` and `allow_tools` are
+/// inert, so they are not triggers; `[mount_sets]`, `[egress_sets]` and a tool's
+/// own `mounts` stay triggers, because those tables are still parsed and a
+/// `--mount NAME` or project `allow_tools` may still select from them.
+fn user_authority_triggers(document: &toml::Table, allowed: bool) -> AuthorityTriggers {
+    let tool_mounts = document
+        .get("tools")
+        .and_then(toml::Value::as_array)
+        .is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| tool.as_table().is_some_and(|t| t.contains_key("mounts")))
+        });
+    AuthorityTriggers {
+        network: allowed && document.contains_key("network"),
+        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {
+            top_level: allowed && document.contains_key("mounts"),
+            tool_field: tool_mounts,
+        }),
+        mount_sets: document.contains_key("mount_sets"),
+        egress_sets: document.contains_key("egress_sets"),
+        allow_tools: allowed && document.contains_key("allow_tools"),
+    }
 }
 
 /// What one tier's *measured* read established, before its bytes are
-/// interpreted. The two tiers are measured differently and must not be
-/// confusable, so they are separate arms rather than an `Option` of tokens.
+/// interpreted. The tiers are measured differently and must not be confusable, so
+/// they are separate arms rather than an `Option` of tokens (ADR-0076 R2/R3).
 enum TierAuthority<'a> {
-    /// ADR-0040's verified read: the verdict is unconditional, but the token it
-    /// mints is `Some` only for a file that declares an authority-bearing field.
-    User(config_authority::Verification<'a>),
-    /// ADR-0073: measured unconditionally, and may declare no authority field at
-    /// all — so there is no token to mint.
-    Project,
-    /// A file sourced without `:trust` (ADR-0074): no measurement, unpinned until
-    /// #736; refuses every authority field.
-    Source,
+    /// ADR-0040's verified read of the default user config: the verdict is
+    /// unconditional, but the token it mints is `Some` only for a file that
+    /// declares an authority-bearing field.
+    User {
+        authorized: Option<config_authority::AuthorizedConfig<'a>>,
+        references: config_authority::ReferenceTrust,
+    },
+    /// ADR-0076 R2.3: a non-default `trust = true` source, verified
+    /// unconditionally before any byte is read.
+    Trusted {
+        authorized: config_authority::AuthorizedConfig<'a>,
+        references: config_authority::ReferenceTrust,
+    },
+    /// ADR-0073: the verified project config is the root of the project's trust.
+    Project(config_authority::AuthorizedConfig<'a>),
+    /// A `trust = false` source: no measurement of its own, and a token only when
+    /// a [`config_authority::ContentApprovalPolicy`] approved its exact bytes
+    /// (#736 seam).
+    Source(Option<config_authority::AdoptedAuthority<'a>>),
 }
 
-/// Read, verify, decode, and validate the **user** tier, which is the `:trust`
-/// source (ADR-0074).
+/// The aggregate byte budget of one load's declared sources.
+///
+/// A value threaded through the source readers: [`MAX_CONFIG_FILE_BYTES`] bounds
+/// each file and this bounds their sum, so a reader that read without charging
+/// would restore the multiplication the bound exists to prevent.
+struct SourceBytes {
+    remaining: u64,
+}
+
+impl SourceBytes {
+    fn fresh() -> Self {
+        Self {
+            remaining: MAX_SOURCE_BYTES_TOTAL,
+        }
+    }
+
+    /// Charge `bytes` read from `path`, refusing the load once the declared
+    /// sources have cost more than the total. Charged before the bytes are
+    /// parsed, so no more than the total can reach a decoder. Only the file that
+    /// crossed the total is named, never its size or contents.
+    fn charge(&mut self, path: &Path, bytes: usize) -> Result<()> {
+        let Some(remaining) = self.remaining.checked_sub(bytes as u64) else {
+            return Err(anyhow!(
+                "config: {}: the declared sources read more than {MAX_SOURCE_BYTES_TOTAL} bytes in \
+                 total; remove the sources agent-vm does not use, or the parts of them no launch \
+                 needs",
+                crate::one_line::quoted_path(path)
+            ));
+        };
+        self.remaining = remaining;
+        Ok(())
+    }
+}
+
+/// Read, verify, decode, and validate the **default user** config (`trust = true`
+/// at `~/.config/agent-vm/config.toml`), the one route with ADR-0040's dotfile
+/// compatibility (ADR-0074 D3, ADR-0076 R2.3).
 ///
 /// Only a `NotFound` from the initial `symlink_metadata` means absent, so a host
 /// without a user config never fails; a present-but-dangling symlink or a file that
 /// vanishes before the read is an error, not a quiet fallback. A final symlink is
-/// followed (ADR-0040's dotfile compatibility), and the bytes are read before the
-/// verdict: that is the user tier's shipped rule and it is unchanged.
-///
-/// What *is* new (ADR-0074 D3) is that the **route** is checked first: a parent or
-/// final symlink resolving into the active checkout is refused before any byte is
-/// read, so repository-controlled bytes can contribute neither tools, image nor
-/// authority. Both the implicit `home:trust` default and an explicit
-/// `<alias>:trust ~/.config/agent-vm/config.toml` arrive here with the discovered
-/// path, never the entry's spelling.
-fn read_user_tier(
-    path: &Path,
+/// followed, and the bytes are read before the verdict: that is the user tier's
+/// shipped rule and it is unchanged.
+fn read_default_user_source(
+    entry: &crate::config_sources::SourceEntry,
+    project: Option<&config_authority::VerifiedProject>,
+    user_path: &Path,
     route: &crate::project_config::RouteAnchor,
     home: Option<&Path>,
     work: &mut config_mounts::MountExpansionWork,
-) -> Result<(TierReport, TierContents)> {
-    match std::fs::symlink_metadata(path) {
+    budget: &mut SourceBytes,
+) -> Result<(TierReport, TierContents, InertDeclarations)> {
+    match std::fs::symlink_metadata(user_path) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(absent_tier(path));
+            let (report, contents) = absent_tier(user_path);
+            return Ok((report, contents, InertDeclarations::default()));
         }
-        Err(error) => return Err(safe_io_error("reading metadata for", path, &error)),
+        Err(error) => return Err(safe_io_error("reading metadata for", user_path, &error)),
     }
 
     // Before `config.toml` is opened: a `~/.config` or `~/.config/agent-vm` symlink
     // into the checkout would pass the file's own measurement.
-    crate::project_config::check_user_parent_route(path, route)?;
-    let read = match crate::host_paths::open_regular_no_follow_checkpointed(path, || {})
-        .map_err(|error| safe_anyhow_error("reading", path, &error))?
+    crate::project_config::check_user_parent_route(user_path, route)?;
+    let read = match crate::host_paths::open_regular_no_follow_checkpointed(user_path, || {})
+        .map_err(|error| safe_anyhow_error("reading", user_path, &error))?
     {
         Some(opened) => opened
             .into_verified_read(MAX_CONFIG_FILE_BYTES)
-            .map_err(|error| safe_anyhow_error("reading", path, &error))?,
+            .map_err(|error| safe_anyhow_error("reading", user_path, &error))?,
         None => {
             // A final symlink: decide about its target before opening it. Outside
             // the checkout this keeps ADR-0040's dotfile compatibility; an alias of
             // a checkout file is refused here (U2).
-            crate::project_config::check_user_symlink_target(path, route)?;
-            crate::host_paths::read_bounded_symlink_target(path, MAX_CONFIG_FILE_BYTES)
-                .map_err(|error| safe_anyhow_error("reading", path, &error))?
+            crate::project_config::check_user_symlink_target(user_path, route)?;
+            crate::host_paths::read_bounded_symlink_target(user_path, MAX_CONFIG_FILE_BYTES)
+                .map_err(|error| safe_anyhow_error("reading", user_path, &error))?
         }
     };
     let path = read.path();
-    let raw = parse_tier(path, read.bytes())?;
+    budget.charge(path, read.bytes().len())?;
+    check_not_self_source(project, read.identity(), entry)?;
+    let (text, document) = parse_toml_table(path, read.bytes())?;
     // Authority is decided by the *presence* of an authority-bearing field, from
     // the same verified read the bytes came from, before any of it is parsed.
     // Presence, not contents: `mounts = []`, an empty `[network]`, an empty
     // `[mount_sets]`, an empty `[egress_sets]` and a tool's `mounts = []` grant
     // nothing yet are exactly the bytes an attacker would plant.
-    //
-    // A tool list is measured from the raw configuration, *before* tool
-    // validation: a definition with a malformed or missing `command` cannot be an
-    // accepted or partially patched tool, so its mount field must not be able to
-    // skip the check by making the definition invalid somewhere else.
-    let first_tool_mounts = raw.tools.iter().position(|tool| tool.mounts.is_some());
-    let triggers = AuthorityTriggers {
-        network: raw.network.is_some(),
-        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {
-            top_level: raw.mounts.is_some(),
-            tool_field: first_tool_mounts.is_some(),
-        }),
-        mount_sets: raw.mount_sets.is_some(),
-        egress_sets: raw.egress_sets.is_some(),
-        // #735: the fifth trigger. Presence, not contents, so `allow_tools = []`
-        // and `allow_tools = 123` both require the verified read — the file
-        // decides which declarations become launch verbs.
-        allow_tools: raw.allow_tools.is_some(),
-    };
+    let triggers = user_authority_triggers(&document, entry.is_allowed());
     let verification = config_authority::verify(&read, triggers).map_err(|error| {
         // A refusal caused by a tool's own field names that field first: the
         // reader has to find the list they must review, and a file with no
         // top-level `mounts` has nothing else pointing at it. The numeric site
         // is echoed, never the tool's name or the list's contents.
-        let pointer = match first_tool_mounts {
-            Some(declaration) if raw.mounts.is_none() => {
+        let pointer = match first_tool_mounts(&document) {
+            Some(declaration) if !document.contains_key("mounts") => {
                 format!("tools[{declaration}].mounts: ")
             }
             _ => String::new(),
@@ -1807,14 +2225,44 @@ fn read_user_tier(
             crate::one_line::quoted_path(path)
         )
     })?;
-    build_tier(
+    // ADR-0076 flat sourcing, before the placement diagnostics and before Stage 2:
+    // a root `sources` key is refused by presence whatever else the file declares.
+    if document.contains_key("sources") {
+        return Err(sources_refusal(path));
+    }
+    misplaced_sources(&document, entry.is_allowed())
+        .map_err(|error| anyhow!("config: {}: {error}", crate::one_line::quoted_path(path)))?;
+    let mut raw = decode_raw_config(path, text)?;
+    let inert = if entry.is_allowed() {
+        InertDeclarations::default()
+    } else {
+        record_inert(&mut raw)
+    };
+    let (report, contents) = build_tier(
         path,
         raw,
-        TierAuthority::User(verification),
+        TierAuthority::User {
+            authorized: verification.authorized,
+            references: verification.references,
+        },
         FileTierKind::User,
         home,
         work,
-    )
+    )?;
+    Ok((report, contents, inert))
+}
+
+/// The first tool declaring its own `mounts`, from the document, so the numeric
+/// site can head an ADR-0040 refusal before tool validation.
+fn first_tool_mounts(document: &toml::Table) -> Option<usize> {
+    document
+        .get("tools")
+        .and_then(toml::Value::as_array)
+        .and_then(|tools| {
+            tools
+                .iter()
+                .position(|tool| tool.as_table().is_some_and(|t| t.contains_key("mounts")))
+        })
 }
 
 /// Read, verify, decode, and validate the **project** tier (ADR-0073).
@@ -1829,7 +2277,8 @@ fn read_user_tier(
 ///    bytes are never decoded;
 /// 3. the verdict is unconditional: the project tier is the root of a project's
 ///    trust, not a file that becomes authority-bearing only when it declares a
-///    field.
+///    field. That verdict is also what authorizes its own top-level `mounts` and
+///    `[network]` (ADR-0076 R3).
 fn read_project_tier(
     project: &crate::project_config::ProjectTierPaths,
     home: Option<&Path>,
@@ -1863,7 +2312,7 @@ fn read_project_tier(
         // load error rather than a panic.
         return match config_authority::verify_project(path, &FinalComponent::Symlink) {
             Err(error) => Err(project_tier_error(path, &error)),
-            Ok(()) => Err(anyhow!(
+            Ok(_) => Err(anyhow!(
                 "config: {}: config.toml is a symbolic link; agent-vm will not follow it",
                 crate::one_line::quoted_path(path)
             )),
@@ -1871,12 +2320,17 @@ fn read_project_tier(
     };
     let final_component = FinalComponent::Regular(opened.facts());
     // Measured before its bytes are read, and whatever the file declares.
-    config_authority::verify_project(path, &final_component)
+    let verified = config_authority::verify_project(path, &final_component)
         .map_err(|error| project_tier_error(path, &error))?;
     let bytes = opened
         .read_bounded(MAX_CONFIG_FILE_BYTES)
         .map_err(|error| safe_anyhow_error("reading", path, &error))?;
-    let mut raw = parse_tier(path, &bytes)?;
+    let (text, document) = parse_toml_table(path, &bytes)?;
+    // `[network]` is checked for a misplaced `sources`/`allow_tools` here: the
+    // project config is a tier that may grant egress (ADR-0076 R3).
+    misplaced_sources(&document, true)
+        .map_err(|error| anyhow!("config: {}: {error}", crate::one_line::quoted_path(path)))?;
+    let mut raw = decode_raw_config(path, text)?;
     // Taken before `build_tier`, which would refuse `sources` (flat sourcing) and
     // read `ALIAS:image` as an OCI reference: both need the declared source list,
     // which is only known after this read.
@@ -1900,7 +2354,7 @@ fn read_project_tier(
     let (report, contents) = build_tier(
         path,
         raw,
-        TierAuthority::Project,
+        TierAuthority::Project(verified.authorized()),
         FileTierKind::Project,
         home,
         work,
@@ -1909,24 +2363,83 @@ fn read_project_tier(
         report,
         contents,
         declared,
+        verified: Some(verified),
     })
 }
 
-/// Read, verify, decode, and validate a file the project config sources
-/// **without** `:trust` (ADR-0074 D4): declarations only, today unpinned.
+/// Read, verify, decode, and validate a **non-default** `trust = true` source
+/// (ADR-0076 R2.2/R2.3).
 ///
-/// Nothing read from it can grant authority, so the final symlink is followed
-/// (`read_bounded_regular_file_noting_symlink`, the pre-ADR-0073 project read):
-/// repository files are commonly symlinked. A missing file is an error, because
-/// the user explicitly asked for it and a quietly empty source would hide a typo.
-///
-/// #736 inserts its content-hash check between the read and `parse_tier`: the bytes
-/// are in hand there and nothing has been interpreted yet.
-fn read_source_tier(
+/// The whole route is walked from `/` and the file is opened `O_NOFOLLOW` from the
+/// validated parent descriptor, so no repository-controlled ancestor, symlink or
+/// spellable alias can redirect the read; then ADR-0040's checks run on the exact
+/// descriptors before a byte is read, whatever the file declares.
+fn read_trusted_source(
     entry: &crate::config_sources::SourceEntry,
+    project: Option<&config_authority::VerifiedProject>,
+    route: &crate::project_config::RouteAnchor,
     home: Option<&Path>,
     work: &mut config_mounts::MountExpansionWork,
-) -> Result<(TierReport, TierContents)> {
+    budget: &mut SourceBytes,
+) -> Result<(TierReport, TierContents, InertDeclarations)> {
+    let path = entry.path();
+    let opened_route =
+        crate::project_config::open_trusted_source_route(path, entry.declared(), route)?;
+    let (authorized, references) = config_authority::verify_trusted_source_at(
+        path,
+        opened_route.parent_dir,
+        &opened_route.final_component,
+    )
+    .map_err(|error| project_tier_error(path, &error))?;
+    let opened = opened_route.opened.ok_or_else(|| {
+        anyhow!("internal: a trusted source route verified a symbolic link as a regular file")
+    })?;
+    check_not_self_source(project, opened.identity(), entry)?;
+    let bytes = opened
+        .read_bounded(MAX_CONFIG_FILE_BYTES)
+        .map_err(|error| safe_anyhow_error("reading", path, &error))?;
+    budget.charge(path, bytes.len())?;
+    let (text, document) = parse_toml_table(path, &bytes)?;
+    if document.contains_key("sources") {
+        return Err(sources_refusal(path));
+    }
+    misplaced_sources(&document, entry.is_allowed())
+        .map_err(|error| anyhow!("config: {}: {error}", crate::one_line::quoted_path(path)))?;
+    let mut raw = decode_raw_config(path, text)?;
+    let inert = if entry.is_allowed() {
+        InertDeclarations::default()
+    } else {
+        record_inert(&mut raw)
+    };
+    let (report, contents) = build_tier(
+        path,
+        raw,
+        TierAuthority::Trusted {
+            authorized,
+            references,
+        },
+        FileTierKind::Source(entry.alias()),
+        home,
+        work,
+    )?;
+    Ok((report, contents, inert))
+}
+
+/// Read, decode, and validate a file the project config sources with
+/// `trust = false` (ADR-0076 R2.4): in-repo paths are legal, the final symlink is
+/// followed, and #736 inserts content-hash pinning between the read and the parse.
+///
+/// `allow = true` asks for top-level adoption, which no unpinned byte may grant:
+/// the [`config_authority::ContentApprovalPolicy`] decides, before UTF-8 or TOML
+/// decoding, so unapproved bytes can never reach a validator or an adopter.
+fn read_source_tier(
+    entry: &crate::config_sources::SourceEntry,
+    project: Option<&config_authority::VerifiedProject>,
+    approval: &dyn config_authority::ContentApprovalPolicy,
+    home: Option<&Path>,
+    work: &mut config_mounts::MountExpansionWork,
+    budget: &mut SourceBytes,
+) -> Result<(TierReport, TierContents, InertDeclarations)> {
     let path = entry.path();
     match std::fs::symlink_metadata(path) {
         Ok(_) => {}
@@ -1942,15 +2455,49 @@ fn read_source_tier(
     let read =
         crate::host_paths::read_bounded_regular_file_noting_symlink(path, MAX_CONFIG_FILE_BYTES)
             .map_err(|error| safe_anyhow_error("reading", path, &error))?;
-    let raw = parse_tier(read.path(), read.bytes())?;
-    build_tier(
+    budget.charge(read.path(), read.bytes().len())?;
+    check_not_self_source(project, read.identity(), entry)?;
+    let approved = if entry.is_allowed() {
+        let verified = project.ok_or_else(|| {
+            anyhow!(
+                "internal: a trust = false, allow = true source without a verified project config"
+            )
+        })?;
+        Some(approval.approve_untrusted_adoption(verified, entry, read.bytes())?)
+    } else {
+        None
+    };
+    let bytes = approved
+        .as_ref()
+        .map_or(read.bytes(), |approved| approved.bytes());
+    let (text, document) = parse_toml_table(read.path(), bytes)?;
+    if document.contains_key("sources") {
+        return Err(sources_refusal(read.path()));
+    }
+    misplaced_sources(&document, entry.is_allowed()).map_err(|error| {
+        anyhow!(
+            "config: {}: {error}",
+            crate::one_line::quoted_path(read.path())
+        )
+    })?;
+    let mut raw = decode_raw_config(read.path(), text)?;
+    let inert = if entry.is_allowed() {
+        InertDeclarations::default()
+    } else {
+        record_inert(&mut raw)
+    };
+    let adopted = approved
+        .as_ref()
+        .map(config_authority::ApprovedSourceContent::adopted_authority);
+    let (report, contents) = build_tier(
         read.path(),
         raw,
-        TierAuthority::Source,
+        TierAuthority::Source(adopted),
         FileTierKind::Source(entry.alias()),
         home,
         work,
-    )
+    )?;
+    Ok((report, contents, inert))
 }
 
 /// The project config's read: the tier report and contents every tier shares, plus
@@ -1960,13 +2507,16 @@ struct ProjectRead {
     report: TierReport,
     contents: TierContents,
     declared: ProjectDeclarations,
+    /// `Some` when the file existed and passed ADR-0073 [`verify_project`],
+    /// carrying its descriptor identity for the real self-source check.
+    verified: Option<config_authority::VerifiedProject>,
 }
 
 /// The project file's own sourcing and image fields. Both need the declared source
 /// list to be interpreted, which only exists once this read has finished.
 #[derive(Default)]
 struct ProjectDeclarations {
-    sources: Option<Vec<String>>,
+    sources: Option<toml::Value>,
     image: Option<String>,
     /// The project's `allow_tools`, syntax-checked but not yet resolved: a name
     /// resolves only once every source has been read (#735).
@@ -1980,6 +2530,7 @@ impl ProjectRead {
             report,
             contents,
             declared: ProjectDeclarations::default(),
+            verified: None,
         }
     }
 
@@ -1989,15 +2540,16 @@ impl ProjectRead {
             report,
             contents,
             declared: ProjectDeclarations::default(),
+            verified: None,
         }
     }
 }
 
-/// Resolve the project config's own `sources` list, or the implicit single
-/// `home:trust <user config>` entry (ADR-0074 D2/R5).
+/// Resolve the project config's own `sources` value, or the implicit single
+/// `home` source (ADR-0076 R1.1).
 fn declared_sources(
     paths: &ConfigPaths,
-    listed: Option<&[String]>,
+    listed: Option<&toml::Value>,
     project_config: &Path,
 ) -> Result<crate::config_sources::DeclaredSources> {
     use crate::config_sources::{DeclaredSources, ResolveContext};
@@ -2005,19 +2557,18 @@ fn declared_sources(
     let Some(raw) = listed else {
         return Ok(DeclaredSources::implicit(paths.user.as_deref()));
     };
-    let (Some(project), Some(user)) = (&paths.project, &paths.user) else {
+    let Some(project) = &paths.project else {
         return Err(sources_unresolvable(project_config));
     };
     let crate::project_config::RouteAnchor::Captured { home, root } = &project.route else {
         return Err(sources_unresolvable(project_config));
     };
-    DeclaredSources::listed(
+    DeclaredSources::parse(
         raw,
         &ResolveContext {
             project_config: &project.config,
             home,
             project_root: root,
-            user_config: user,
         },
     )
 }
@@ -2063,26 +2614,16 @@ fn classify_project_image(
     Ok(validate_image(Some(raw), project_config)?.map(ProjectImage::Direct))
 }
 
-/// The `:trust` tier's image, as an `ALIAS:image` selection sees it.
-enum TrustedImage<'a> {
-    /// The trusted file does not exist, which is not an error until selected.
-    Absent,
-    /// Declared, with its own `image`.
-    Declared(&'a ConfiguredImage),
-    /// Declared without an `image`.
-    NoImage,
-}
-
-/// Build the image tiers and the inert list (ADR-0074 D7/R9).
+/// Build the image tiers and the source rows (ADR-0076 R4.1/R5.2).
 ///
 /// A project-side image either selects a source's own `image` or is a direct OCI
-/// reference; the `:trust` tier's image is the fallback, and every untrusted
-/// source image the project did not select is recorded as inert for `doctor`.
+/// reference; the fallback is the first `allow = true` source in `[[sources]]`
+/// order, so appending a source never hijacks an earlier one's boot image. Every
+/// other declared image is reported, with what outranked it, for `doctor`.
 fn resolve_images(
     project: Option<ProjectImage>,
-    trusted: TrustedImage<'_>,
     declared: &crate::config_sources::DeclaredSources,
-    source_images: &[(&crate::config_sources::SourceEntry, Option<ConfiguredImage>)],
+    reads: &[SourceRead],
     project_config: Option<&Path>,
 ) -> Result<ConfiguredImages> {
     let project = match project {
@@ -2095,57 +2636,94 @@ fn resolve_images(
             let entry = declared
                 .by_alias(&alias)
                 .ok_or_else(|| anyhow!("internal: a source image selection was not classified"))?;
-            let image = match entry.trust() {
-                crate::config_sources::SourceTrust::Trusted => match trusted {
-                    TrustedImage::Declared(image) => Some(image.clone()),
-                    TrustedImage::NoImage => {
-                        return Err(image_selection_missing(
-                            file,
-                            entry,
-                            MissingImage::DeclaresNone,
-                        ));
-                    }
-                    TrustedImage::Absent => {
-                        return Err(image_selection_missing(
-                            file,
-                            entry,
-                            MissingImage::FileAbsent,
-                        ));
-                    }
-                },
-                crate::config_sources::SourceTrust::Untrusted => source_images
-                    .iter()
-                    .find(|(source, _)| source.alias() == entry.alias())
-                    .and_then(|(_, image)| image.clone()),
-            };
-            let Some(image) = image else {
-                return Err(image_selection_missing(
-                    file,
-                    entry,
-                    MissingImage::DeclaresNone,
-                ));
+            let read = reads
+                .iter()
+                .find(|read| read.alias == alias)
+                .ok_or_else(|| anyhow!("internal: a selected source was not read"))?;
+            let image = match read.contents.image.as_ref() {
+                Some(image) => image.clone(),
+                None if *read.tier.status() == TierStatus::Absent => {
+                    return Err(image_selection_missing(
+                        file,
+                        entry,
+                        MissingImage::FileAbsent,
+                    ));
+                }
+                None => {
+                    return Err(image_selection_missing(
+                        file,
+                        entry,
+                        MissingImage::DeclaresNone,
+                    ));
+                }
             };
             Some(image.authorized_by(&alias))
         }
     };
     let selected = project.as_ref().and_then(ConfiguredImage::via);
-    let inert = source_images
+    let project_is_set = project.is_some();
+    // First-wins in `[[sources]]` order: the earlier entry keeps the fallback even
+    // when a later one declares an identical image.
+    let fallback_index = reads
         .iter()
-        .filter_map(|(source, image)| {
-            let image = image.as_ref()?;
-            (selected != Some(source.alias())).then(|| InertImage {
-                alias: source.alias().clone(),
+        .position(|read| read.attributes.allow && read.contents.image.is_some());
+    let mut source_images = Vec::new();
+    let mut user = None;
+    let mut user_overridden_by = None;
+    let mut fallback = None;
+    for (index, read) in reads.iter().enumerate() {
+        let Some(image) = read.contents.image.as_ref() else {
+            continue;
+        };
+        // `user:` keeps its pre-#748 meaning only while its source is `allow =
+        // true`; an `allow = false` default user config renders as a source row.
+        if read.is_default_user && read.attributes.allow {
+            user = Some(image.clone());
+        }
+        // Shown on the `project:` row instead, as an `ALIAS:image` selection.
+        if selected == Some(&read.alias) {
+            continue;
+        }
+        let status = if !read.attributes.allow {
+            SourceImageStatus::Inert
+        } else if project_is_set {
+            SourceImageStatus::OverriddenByProject
+        } else if fallback_index == Some(index) {
+            SourceImageStatus::SelectedFallback
+        } else {
+            let winner = &reads[fallback_index.expect("an allowed image has a fallback")];
+            SourceImageStatus::OverriddenBySource(winner.alias.clone())
+        };
+        if let SourceImageStatus::SelectedFallback = status {
+            fallback = Some(FallbackImage {
+                alias: read.alias.clone(),
                 image: image.clone(),
-            })
-        })
-        .collect();
+                is_default_user_config: read.is_default_user,
+            });
+        }
+        if read.is_default_user
+            && read.attributes.allow
+            && let SourceImageStatus::OverriddenBySource(winner) = &status
+        {
+            user_overridden_by = Some(winner.clone());
+        }
+        // The `user:` row already shows an `allow = true` default user config's
+        // image, so it is not repeated as a source row. Every other declared image
+        // is reported with what outranked it.
+        if !(read.is_default_user && read.attributes.allow) {
+            source_images.push(SourceImageReport {
+                alias: read.alias.clone(),
+                image: image.clone(),
+                status,
+            });
+        }
+    }
     Ok(ConfiguredImages {
-        user: match trusted {
-            TrustedImage::Declared(image) => Some(image.clone()),
-            TrustedImage::Absent | TrustedImage::NoImage => None,
-        },
+        user,
+        user_overridden_by,
+        fallback,
         project,
-        inert,
+        source_images,
     })
 }
 
@@ -2179,8 +2757,13 @@ fn project_tier_error(path: &Path, error: &config_authority::UntrustedConfig) ->
 }
 
 /// Interpret and validate one tier's parsed bytes, given what its measured read
-/// established. Shared by both tiers so validation, provenance and diagnostics
+/// established. Shared by every tier so validation, provenance and diagnostics
 /// cannot drift between them.
+///
+/// The tier's *adoption* decision is already made: an `allow = false` source's
+/// top-level `mounts`, `[network]` and `allow_tools` were dropped by its reader
+/// (and recorded inert), so a remaining key here is always one this tier may
+/// adopt, and its authority token must exist (ADR-0076 R3/R4).
 fn build_tier(
     path: &Path,
     raw: RawConfig,
@@ -2189,7 +2772,7 @@ fn build_tier(
     home: Option<&Path>,
     work: &mut config_mounts::MountExpansionWork,
 ) -> Result<(TierReport, TierContents)> {
-    // ADR-0074: flat sourcing. `read_project_tier` has already taken the project's
+    // ADR-0076: flat sourcing. `read_project_tier` has already taken the project's
     // own `sources`, so a remaining key is a sourced file's own.
     if raw.sources.is_some() {
         return Err(sources_refusal(path));
@@ -2204,42 +2787,52 @@ fn build_tier(
                 .map(|value| config_mounts::ToolMountValue { declaration, value })
         })
         .collect();
-    let authorized: Option<config_authority::AuthorizedConfig<'_>>;
-    let reference_trust: Option<crate::config_authority::ReferenceTrust>;
-    match authority {
-        TierAuthority::User(verification) => {
-            authorized = verification.authorized;
+    let (authorized, reference_trust) = match &authority {
+        TierAuthority::User {
+            authorized,
+            references,
+        } => (
+            authorized.as_ref(),
             // The same read's verdict for a CLI egress reference, which argv
             // parsing learns about only after this read is gone (ADR-0059).
-            reference_trust = Some(verification.references);
-        }
-        TierAuthority::Project => {
-            refuse_project_authority(&raw, path)?;
-            authorized = None;
-            reference_trust = None;
-        }
-        TierAuthority::Source => {
-            refuse_non_user_authority(&raw, path, RefusingTier::Source)?;
-            // Unpinned until #736: there is no content measurement to mint an
-            // authority or a reference trust from.
-            authorized = None;
-            reference_trust = None;
-        }
+            Some(references.clone()),
+        ),
+        TierAuthority::Trusted {
+            authorized,
+            references,
+        } => (Some(authorized), Some(references.clone())),
+        TierAuthority::Project(authorized) => (Some(authorized), None),
+        // A `trust = false` source has no measured verdict of its own: its only
+        // authority is an approved-content token, which is not a `ReferenceTrust`.
+        TierAuthority::Source(_) => (None, None),
+    };
+    // ADR-0076 R3/R4: the adopted top-level keys' token. `Source` has one only
+    // when a content policy approved its bytes.
+    let adopted: Option<config_authority::AdoptedAuthority<'_>> = match &authority {
+        TierAuthority::Source(adopted) => *adopted,
+        _ => authorized.map(config_authority::AdoptedAuthority::from_verified),
+    };
+    // `[mount_sets]` and `[egress_sets]` stay the default user config's until
+    // #738; every other tier refuses them by presence, empty tables included.
+    match kind {
+        FileTierKind::Project => refuse_non_user_sets(&raw, path, RefusingTier::Project)?,
+        FileTierKind::Source(_) => refuse_non_user_sets(&raw, path, RefusingTier::Source)?,
+        FileTierKind::User => {}
     }
     let parsed_network = match raw.network.as_ref() {
-        Some(table) => {
-            // A present field always produced a token above (presence *is* the
+        Some(value) => {
+            // A present field always produced a token (presence *is* the
             // trigger), so this arm cannot be reached with `None`. Refusing
             // rather than skipping keeps that invariant load-bearing: dropping
             // the grants a file declares must never be the quiet outcome.
-            let Some(authorized) = authorized.as_ref() else {
+            let Some(adopted) = adopted.as_ref() else {
                 return Err(anyhow!(
                     "config: {}: [network]: authority was not measured",
                     crate::one_line::quoted_path(path)
                 ));
             };
             Some(
-                user_network::from_verified_table(authorized, table).map_err(|error| {
+                user_network::from_authorized_value(adopted, value).map_err(|error| {
                     anyhow!("config: {}: {error}", crate::one_line::quoted_path(path))
                 })?,
             )
@@ -2252,7 +2845,7 @@ fn build_tier(
             // present field always produced a token. Refusing rather than skipping
             // keeps that invariant load-bearing — dropping definitions a file
             // declares must never be the quiet outcome.
-            let Some(authorized) = authorized.as_ref() else {
+            let Some(authorized) = authorized else {
                 return Err(anyhow!(
                     "config: {}: [egress_sets]: authority was not measured",
                     crate::one_line::quoted_path(path)
@@ -2274,20 +2867,22 @@ fn build_tier(
     // a shape the project tier is now allowed to declare.
     let tool_mounts_need_a_token =
         matches!(kind, FileTierKind::User) && !tool_mount_values.is_empty();
-    let mut mounts = if raw.mounts.is_some() || raw.mount_sets.is_some() || tool_mounts_need_a_token
-    {
-        // One parser for all three fields: a sets-only file still needs the
-        // verified token, because a `--mount NAME` may select one of its sets, and
-        // a file whose only mount field is inside a tool must still be parsed here
-        // or its declarations would reach `validate_tools` unparsed.
-        let Some(authorized) = authorized.as_ref() else {
-            return Err(anyhow!(
-                "config: {}: mounts: authority was not measured",
-                crate::one_line::quoted_path(path)
-            ));
-        };
-        Some(
-            config_mounts::from_verified_value(
+    let mut mounts = None;
+    let mut adopted_mounts = None;
+    if matches!(kind, FileTierKind::User) {
+        if raw.mounts.is_some() || raw.mount_sets.is_some() || tool_mounts_need_a_token {
+            // One parser for all three fields: a sets-only file still needs the
+            // verified token, because a `--mount NAME` may select one of its sets,
+            // and a file whose only mount field is inside a tool must still be
+            // parsed here or its declarations would reach `validate_tools`
+            // unparsed.
+            let Some(authorized) = authorized else {
+                return Err(anyhow!(
+                    "config: {}: mounts: authority was not measured",
+                    crate::one_line::quoted_path(path)
+                ));
+            };
+            let parsed = config_mounts::from_verified_value(
                 authorized,
                 config_mounts::MountValues {
                     defaults: raw.mounts.as_ref(),
@@ -2297,13 +2892,29 @@ fn build_tier(
                 home,
                 work,
             )
-            .map_err(|error| anyhow!("config: {}: {error}", crate::one_line::quoted_path(path)))?,
-        )
-    } else {
-        // Not a dropped declaration: every arm above returns an error rather than
-        // silently skipping the definitions a file carries.
-        None
-    };
+            .map_err(|error| anyhow!("config: {}: {error}", crate::one_line::quoted_path(path)))?;
+            // The defaults also join the cross-file merge as one contribution, so
+            // a project config or another `allow = true` source can be bound
+            // beside them (ADR-0076 R4.2). A file that declared no `mounts` key
+            // contributes nothing.
+            if raw.mounts.is_some() {
+                adopted_mounts = parsed.defaults().cloned();
+            }
+            mounts = Some(parsed);
+        }
+    } else if let Some(value) = raw.mounts.as_ref() {
+        let Some(adopted) = adopted.as_ref() else {
+            return Err(anyhow!(
+                "config: {}: mounts: authority was not measured",
+                crate::one_line::quoted_path(path)
+            ));
+        };
+        adopted_mounts = Some(
+            config_mounts::from_adopted_defaults(adopted, value, home).map_err(|error| {
+                anyhow!("config: {}: {error}", crate::one_line::quoted_path(path))
+            })?,
+        );
+    }
     let image = validate_image(raw.image.as_deref(), path)?;
     // A project or sourced file's tool `mounts` are **inert** until `allow_tools`
     // authorizes the tool (ADR-0075): validated here, with zero host-path I/O and
@@ -2332,15 +2943,13 @@ fn build_tier(
             // token. Refusing rather than skipping keeps that invariant
             // load-bearing: inheriting nothing from a file that declared
             // authorizations must never be the quiet outcome.
-            let Some(authorized) = authorized.as_ref() else {
+            let Some(adopted) = adopted.as_ref() else {
                 return Err(anyhow!(
                     "config: {}: allow_tools: authority was not measured",
                     crate::one_line::quoted_path(path)
                 ));
             };
-            Some(crate::config_allow_tools::UserAllowTools::from_verified(
-                authorized, value,
-            )?)
+            Some(crate::config_allow_tools::AdoptedAllowTools::from_authorized(adopted, value)?)
         }
         None => None,
     };
@@ -2355,16 +2964,15 @@ fn build_tier(
     };
     let network = match parsed_network {
         Some(parsed) => {
-            // A `[network]` table is authority-bearing, so the user arm always
-            // produced a namespace. Refusing rather than skipping keeps that
-            // invariant load-bearing.
-            let Some(user_tools) = reference_tools.as_ref() else {
-                return Err(anyhow!(
-                    "config: {}: [network]: authority was not measured",
-                    crate::one_line::quoted_path(path)
-                ));
+            // Only the default user config has an `[egress_sets]` namespace until
+            // #738, so a `set:NAME` reference in any other tier's `[network]` is
+            // refused for the file (ADR-0076 R3), never resolved against another
+            // file's names.
+            let resolved = match (&reference_tools, kind) {
+                (Some(namespace), FileTierKind::User) => parsed.resolve(namespace),
+                _ => parsed.resolve_without_sets(),
             };
-            Some(parsed.resolve(user_tools).map_err(|error| {
+            Some(resolved.map_err(|error| {
                 anyhow!("config: {}: {error}", crate::one_line::quoted_path(path))
             })?)
         }
@@ -2383,6 +2991,7 @@ fn build_tier(
             image,
             network,
             mounts,
+            adopted_mounts,
             reference_tools,
             allow_tools,
             reference_trust,
@@ -2390,14 +2999,7 @@ fn build_tier(
     ))
 }
 
-/// A project file may not grant anything. Network is checked first so a file
-/// that declares both keeps today's `[network]` bytes, then the top-level mount
-/// fields, then the first tool's own list.
-fn refuse_project_authority(raw: &RawConfig, path: &Path) -> Result<()> {
-    refuse_non_user_authority(raw, path, RefusingTier::Project)
-}
-
-/// ADR-0074 flat sourcing: only the project config decides which files a launch
+/// ADR-0076: flat sourcing. Only the project config decides which files a launch
 /// reads, so any other tier that declares `sources` — `sources = []` included —
 /// is refused by its presence alone.
 fn sources_refusal(file: &Path) -> anyhow::Error {
@@ -2408,49 +3010,54 @@ fn sources_refusal(file: &Path) -> anyhow::Error {
     )
 }
 
-/// The one refusal order both non-user tiers share: network, top-level `mounts`,
-/// `[mount_sets]`, `[egress_sets]`, then the first tool's `mounts` in declaration
-/// order.
-///
-/// A tool field is refused by **presence alone** — empty, a table, a number, on a
-/// shadowed or otherwise unreachable definition: asking for a mount is what
-/// authority means, so there is no shape of request this tier may make.
-fn refuse_non_user_authority(raw: &RawConfig, path: &Path, tier: RefusingTier) -> Result<()> {
-    if let Some(table) = raw.network.as_ref() {
-        return Err(network_refusal(table, path, tier));
-    }
-    if raw.mounts.is_some() {
-        return Err(mounts_refusal(path, tier));
-    }
+/// ADR-0076 R3: `[mount_sets]` and `[egress_sets]` stay the default user config's
+/// alone until #738, so a project config or a sourced file refuses them by
+/// presence — empty tables included, because a name that nothing may resolve must
+/// not look declared.
+fn refuse_non_user_sets(raw: &RawConfig, path: &Path, tier: RefusingTier) -> Result<()> {
     if raw.mount_sets.is_some() {
         return Err(mount_sets_refusal(path, tier));
     }
     if raw.egress_sets.is_some() {
         return Err(egress_sets_refusal(path, tier));
     }
-    // #735: a declaration is inert data, so a tool's own `mounts` is legal in a
-    // sourced file (validated, and inert until `allow_tools` authorizes the tool).
-    // The compiled-in defaults are the one tier that may not carry one: a shipped
-    // definition is not something a launch can authorize.
-    if matches!(tier, RefusingTier::BuiltIn)
-        && let Some(declaration) = raw.tools.iter().position(|tool| tool.mounts.is_some())
-    {
-        return Err(tool_mounts_refusal(path, tier, declaration));
+    Ok(())
+}
+
+/// The compiled-in defaults may grant nothing. Every authority-bearing field is
+/// refused by **presence**: empty, a table, a number, on a shadowed or otherwise
+/// unreachable tool definition — asking for anything is what authority means.
+fn refuse_builtin_authority(raw: &RawConfig, path: &Path) -> Result<()> {
+    if let Some(value) = raw.network.as_ref() {
+        return Err(network_refusal(value, path, RefusingTier::BuiltIn));
     }
-    // `allow_tools` is refused by *presence* in a sourced file and in the
-    // built-ins: `[]` and a wrong type alike, because deciding which declarations
-    // become launch verbs is authority a non-`:trust` tier does not have.
-    if matches!(tier, RefusingTier::Source | RefusingTier::BuiltIn) && raw.allow_tools.is_some() {
-        return Err(allow_tools_refusal(path, tier));
+    if raw.mounts.is_some() {
+        return Err(mounts_refusal(path, RefusingTier::BuiltIn));
+    }
+    if raw.mount_sets.is_some() {
+        return Err(mount_sets_refusal(path, RefusingTier::BuiltIn));
+    }
+    if raw.egress_sets.is_some() {
+        return Err(egress_sets_refusal(path, RefusingTier::BuiltIn));
+    }
+    if let Some(declaration) = raw.tools.iter().position(|tool| tool.mounts.is_some()) {
+        return Err(tool_mounts_refusal(
+            path,
+            RefusingTier::BuiltIn,
+            declaration,
+        ));
+    }
+    if raw.allow_tools.is_some() {
+        return Err(allow_tools_refusal(path, RefusingTier::BuiltIn));
     }
     Ok(())
 }
 
-/// A non-`:trust` tier declared `allow_tools`. The fix names the tier that may.
+/// A tier declared `allow_tools`. The fix names the tier that may.
 fn allow_tools_refusal(file: &Path, tier: RefusingTier) -> anyhow::Error {
     let reason = match tier {
         RefusingTier::Source => {
-            "tools cannot be authorized by a source without :trust; authorize them with \
+            "tools cannot be authorized by a source that is not trusted; authorize them with \
              allow_tools in the project config"
         }
         RefusingTier::BuiltIn => {
@@ -2469,17 +3076,25 @@ fn allow_tools_refusal(file: &Path, tier: RefusingTier) -> anyhow::Error {
 #[derive(Clone, Copy)]
 enum RefusingTier {
     Project,
-    /// A file the project config sources without `:trust` (ADR-0074).
+    /// A file the project config sources (a `[mount_sets]`/`[egress_sets]`
+    /// refusal is all that is left for this tier in #748).
     Source,
     BuiltIn,
 }
 
-fn network_refusal(table: &toml::Table, file: &Path, tier: RefusingTier) -> anyhow::Error {
-    let settings: Vec<_> = user_network::SETTINGS
-        .iter()
-        .filter(|key| table.contains_key(**key))
-        .map(|key| format!("network.{key}"))
-        .collect();
+/// A refused `[network]`, reported value-safely: the fixed setting names when the
+/// value is a table, the bare table name otherwise (`network = 42`).
+fn network_refusal(value: &toml::Value, file: &Path, tier: RefusingTier) -> anyhow::Error {
+    let settings: Vec<_> = value
+        .as_table()
+        .map(|table| {
+            user_network::SETTINGS
+                .iter()
+                .filter(|key| table.contains_key(**key))
+                .map(|key| format!("network.{key}"))
+                .collect()
+        })
+        .unwrap_or_default();
     let setting = if settings.is_empty() {
         "[network]".to_owned()
     } else {
@@ -2487,7 +3102,7 @@ fn network_refusal(table: &toml::Table, file: &Path, tier: RefusingTier) -> anyh
     };
     let reason = match tier {
         RefusingTier::Project => "network access cannot be granted by the project config",
-        RefusingTier::Source => "network access cannot be granted by a source without :trust",
+        RefusingTier::Source => "network access cannot be granted by a source that is not trusted",
         RefusingTier::BuiltIn => "network access cannot be granted by the built-in config",
     };
     anyhow!(
@@ -2496,8 +3111,8 @@ fn network_refusal(table: &toml::Table, file: &Path, tier: RefusingTier) -> anyh
     )
 }
 
-/// The `mounts` twin of [`network_refusal`], for the two tiers that may not
-/// declare one.
+/// The `mounts` twin of [`network_refusal`], for the tiers that may not declare
+/// one.
 fn mounts_refusal(file: &Path, tier: RefusingTier) -> anyhow::Error {
     anyhow!(
         "config: {}: {}; use --mount launch options, or mounts in the user config",
@@ -2511,7 +3126,7 @@ fn mounts_refusal(file: &Path, tier: RefusingTier) -> anyhow::Error {
 fn mounts_refusal_reason(tier: RefusingTier) -> &'static str {
     match tier {
         RefusingTier::Project => "mounts cannot be declared by the project config",
-        RefusingTier::Source => "mounts cannot be declared by a source without :trust",
+        RefusingTier::Source => "mounts cannot be declared by a source that is not trusted",
         RefusingTier::BuiltIn => "mounts cannot be declared by the built-in config",
     }
 }
@@ -2538,7 +3153,7 @@ fn tool_mounts_refusal(file: &Path, tier: RefusingTier, declaration: usize) -> a
 fn mount_sets_refusal(file: &Path, tier: RefusingTier) -> anyhow::Error {
     let reason = match tier {
         RefusingTier::Project => "mount_sets cannot be declared by the project config",
-        RefusingTier::Source => "mount_sets cannot be declared by a source without :trust",
+        RefusingTier::Source => "mount_sets are user-config-only until #738",
         RefusingTier::BuiltIn => "mount_sets cannot be declared by the built-in config",
     };
     anyhow!(
@@ -2550,12 +3165,12 @@ fn mount_sets_refusal(file: &Path, tier: RefusingTier) -> anyhow::Error {
 
 /// `[egress_sets]` is user-only for the same reason `[mount_sets]` is: a project
 /// table of definitions could otherwise tempt a launch into resolving a project
-/// name against the user namespace. There is deliberately no such shadowing — the
-/// field is refused by its presence alone, empty table included.
+/// name against the user namespace. There is deliberately no such shadowing —
+/// naming a set a file cannot resolve must never be the quiet outcome.
 fn egress_sets_refusal(file: &Path, tier: RefusingTier) -> anyhow::Error {
     let reason = match tier {
         RefusingTier::Project => "egress_sets cannot be declared by the project config",
-        RefusingTier::Source => "egress_sets cannot be declared by a source without :trust",
+        RefusingTier::Source => "egress_sets are user-config-only until #738",
         RefusingTier::BuiltIn => "egress_sets cannot be declared by the built-in config",
     };
     anyhow!(
@@ -2607,12 +3222,17 @@ fn tools_from_builtin_text(text: &str) -> Result<Vec<Tool>> {
 /// the launch and printer round-trip tests catch.
 fn builtin_raw_config(text: &str) -> Result<RawConfig> {
     let path = Path::new("default-tools.toml");
-    let raw: RawConfig =
-        toml::from_str(text).map_err(|error| deserialize_error(path, text, &error))?;
-    refuse_non_user_authority(&raw, path, RefusingTier::BuiltIn)?;
-    if raw.sources.is_some() {
+    // The same two-stage order every file tier applies (ADR-0076 R4.2): flat
+    // sourcing by presence first, then the authority refusal, then the placement
+    // diagnostics, and only then the typed decode.
+    let (text, document) = parse_toml_table(path, text.as_bytes())?;
+    if document.contains_key("sources") {
         return Err(sources_refusal(path));
     }
+    let raw = decode_raw_config(path, text)?;
+    refuse_builtin_authority(&raw, path)?;
+    misplaced_sources(&document, true)
+        .map_err(|error| anyhow!("config: {}: {error}", crate::one_line::quoted_path(path)))?;
     Ok(raw)
 }
 
@@ -2668,35 +3288,67 @@ pub(crate) fn absolute_home_from(home: Option<&OsStr>) -> Result<Option<PathBuf>
 struct AuthorizationInputs<'a> {
     user: Vec<Tool>,
     project: Vec<Tool>,
-    /// Each sourced file's declarations, in `sources` order.
+    /// Each `trust = false` (non-default) source's declarations, in
+    /// `[[sources]]` order. The default user config's live in `user`.
     sources: Vec<Vec<Tool>>,
-    /// The `:trust` file's own authorizations, admitted only through the ADR-0040
-    /// token (D5).
-    user_allow: Option<&'a crate::config_allow_tools::UserAllowTools>,
     /// The project config's authorizations, already syntax-checked.
     project_allow: Option<&'a [crate::config_allow_tools::AllowToolEntry]>,
-    /// The same read's measurement, for a project entry selecting a `:trust`
-    /// definition.
-    user_trust: Option<&'a crate::config_authority::ReferenceTrust>,
+    trusted: &'a [TrustedSourceVerdict],
     declared: &'a crate::config_sources::DeclaredSources,
-    user_status: &'a TierStatus,
-    user_file: Option<&'a Path>,
     project_file: Option<&'a Path>,
+    /// Every `allow = true` source's own authorizations, in `[[sources]]` order
+    /// (ADR-0076 R4.4): inherited verbs take that order.
+    inherited: Vec<InheritedAllowTools>,
+    /// ADR-0076 R4.4: any `allow = true` source declares tools or a list, so the
+    /// compiled-in defaults must not displace them.
+    any_allowed_source_configures_tools: bool,
+    /// The `ToolOrigin::Source` of every `trust = false` source: the only
+    /// origins whose `tools` closure needs its own authorization (#735 R6).
+    untrusted_origins: BTreeSet<ToolOrigin>,
 }
 
-/// Decide which declared tools become launch verbs (#735).
+/// One trusted source's measured verdict and identity, for a project
+/// `allow_tools` entry that names a definition out of it (ADR-0076 R2.3/R4.4).
+///
+/// Owned so `load` may consume the parsed tiers first; `references` is the same
+/// read's measurement, so a selected definition is admitted exactly when its file
+/// was.
+struct TrustedSourceVerdict {
+    alias: crate::config_sources::SourceAlias,
+    file: PathBuf,
+    is_default_user: bool,
+    /// `None` only for the absent default user config: nothing was read, so there
+    /// is no verdict to require.
+    references: Option<crate::config_authority::ReferenceTrust>,
+}
+
+impl TrustedSourceVerdict {
+    /// The origin this source's tools are declared under: the default user config
+    /// keeps `ToolOrigin::User`, every other trusted source is a `Source`.
+    fn origin(&self) -> ToolOrigin {
+        if self.is_default_user {
+            ToolOrigin::User(self.file.clone())
+        } else {
+            ToolOrigin::Source {
+                alias: self.alias.clone(),
+                file: self.file.clone(),
+            }
+        }
+    }
+}
+
+/// Decide which declared tools become launch verbs (ADR-0075, ADR-0076 R4.4).
 ///
 /// Declaration and authorization are two steps. Every `[[tools]]` block is inert
-/// data; an `allow_tools` entry — or a `:trust` file's own list, inherited, or
-/// the compiled-in defaults when neither file configures tools — selects the
-/// verbs. The returned [`ResolvedTools`] keeps every definition, because an inert
-/// one still supplies its own file's `tools` references and `doctor` reports it.
+/// data; an `allow = true` source's own `allow_tools` is inherited, a project
+/// entry may claim or override a verb, and the compiled-in defaults apply only
+/// when no tier configures tools. The returned [`ResolvedTools`] keeps every
+/// definition, because an inert one still supplies its own file's `tools`
+/// references and `doctor` reports it.
 ///
-/// Ordering is **authorization** order, not arena order: inherited `:trust` verbs
-/// in that file's `allow_tools` order (with a project override replaced in place),
-/// then project-added verbs in project `allow_tools` order. Uniqueness by
-/// `DefinitionId` is the only invariant, so the sequence may decrease — a
-/// reversed list such as `["b", "a"]` is legal.
+/// Ordering is **authorization** order, not arena order: inherited verbs in
+/// `[[sources]]` then list order (with a project override replaced in place),
+/// then project-added verbs in project `allow_tools` order.
 fn authorize_tools(
     inputs: AuthorizationInputs<'_>,
 ) -> Result<(ResolvedTools, Vec<ConfigConflict>)> {
@@ -2704,19 +3356,24 @@ fn authorize_tools(
         user,
         project,
         sources,
-        user_allow,
         project_allow,
-        user_trust,
+        trusted,
         declared,
-        user_status,
-        user_file,
         project_file,
+        inherited,
+        any_allowed_source_configures_tools,
+        untrusted_origins,
     } = inputs;
 
-    // R4: the compiled-in defaults apply iff neither file declares a tool *and*
-    // neither writes an `allow_tools` key. A sourced file's inert declarations
-    // therefore no longer displace them (ADR-0074 G6).
-    if user.is_empty() && project.is_empty() && user_allow.is_none() && project_allow.is_none() {
+    // R4: the compiled-in defaults apply iff no tier declares a tool *and* no
+    // tier writes an `allow_tools` key. An inert `allow = false` source's
+    // declarations therefore cannot displace them (ADR-0074 G6).
+    if user.is_empty()
+        && project.is_empty()
+        && project_allow.is_none()
+        && inherited.is_empty()
+        && !any_allowed_source_configures_tools
+    {
         let sourced: Vec<Tool> = sources.into_iter().flatten().collect();
         return Ok((
             ResolvedTools::from_defaults_retaining(default_tools()?, sourced),
@@ -2724,8 +3381,8 @@ fn authorize_tools(
         ));
     }
 
-    // Arena order: user, project, then each source in `sources` order. It is the
-    // order a definition's diagnostic names and nothing else.
+    // Arena order: user, project, then each source in `[[sources]]` order. It is
+    // the order a definition's diagnostic names and nothing else.
     let mut definitions: Vec<Tool> = user;
     definitions.extend(project);
     for file in sources {
@@ -2734,31 +3391,39 @@ fn authorize_tools(
     let index = scoped_tool_index(&definitions)?;
 
     let mut launches: Vec<DefinitionId> = Vec::new();
-    let mut verb_slots: BTreeMap<String, DefinitionId> = BTreeMap::new();
+    // Verb -> its position in `launches`, so an override replaces the inherited
+    // winner in place instead of appending a second verb.
+    let mut launch_index: HashMap<String, usize> = HashMap::new();
+    // Verb -> the distinct inherited definitions claiming it, in source order.
+    let mut inherited_candidates: HashMap<String, Vec<DefinitionId>> = HashMap::new();
     let mut conflicts = Vec::new();
     let mut overridden: BTreeSet<DefinitionId> = BTreeSet::new();
 
-    // Step A: the `:trust` file's own authorizations, inherited.
-    if let Some(allow) = user_allow {
-        let file = allow.file();
-        for (entry_index, name) in allow.names() {
-            let origin = ToolOrigin::User(file.to_path_buf());
-            let Some(&target) = index.get(&(&origin, name)) else {
+    // Step A: every `allow = true` source's own authorizations, inherited in
+    // `[[sources]]` order.
+    for source in &inherited {
+        for (entry_index, name) in &source.entries {
+            let Some(&target) = index.get(&(&source.origin, name.as_str())) else {
                 return Err(allow_tools_error(
-                    file,
-                    entry_index,
+                    &source.file,
+                    *entry_index,
                     "no tool of that name is declared in this file; declare it in a [[tools]] \
                      block above allow_tools"
                         .to_owned(),
                 ));
             };
-            if verb_slots.contains_key(name) {
-                continue;
+            let verb = definitions[target.0].name().to_owned();
+            if !launch_index.contains_key(&verb) {
+                launch_index.insert(verb.clone(), launches.len());
+                launches.push(target);
             }
-            launches.push(target);
-            verb_slots.insert(name.to_owned(), target);
+            let candidates = inherited_candidates.entry(verb).or_default();
+            if !candidates.contains(&target) {
+                candidates.push(target);
+            }
         }
     }
+
     // The verbs this project list has already named, with the definition it named and
     // the entry spelling it wrote. A list is a *decision*, so its first entry for a
     // verb settles it: naming the very same target twice is idempotent, and naming a
@@ -2781,14 +3446,12 @@ fn authorize_tools(
                     index: &index,
                     definitions: &definitions,
                     declared,
-                    user_trust,
-                    user_status,
-                    user_file,
+                    trusted,
                     project_file,
                 },
             )?;
-            let name = definitions[target.0].name().to_owned();
-            if let Some(&(claimed, _)) = project_claims.get(&name) {
+            let verb = definitions[target.0].name().to_owned();
+            if let Some(&(claimed, _)) = project_claims.get(&verb) {
                 if claimed == target {
                     // The exact same target twice in one list: idempotent.
                     continue;
@@ -2796,12 +3459,12 @@ fn authorize_tools(
                 return Err(second_tool_for_verb_error(
                     file,
                     entry_index,
-                    &name,
+                    &verb,
                     &definitions[claimed.0],
                 ));
             }
             project_claims.insert(
-                name.clone(),
+                verb.clone(),
                 (
                     target,
                     match entry.alias() {
@@ -2810,40 +3473,72 @@ fn authorize_tools(
                     },
                 ),
             );
-            match verb_slots.get(&name).copied() {
-                // Idempotent: an inherited `:trust` tool named explicitly.
-                Some(existing) if existing == target => continue,
-                // The project config outranks the `:trust` file's own
-                // authorization, as it outranks its image (ADR-0074 D5). The
-                // overridden definition stays in the arena so the trusted file's
-                // other tools keep resolving it. `project_claims` above has
-                // already ruled out a slot this same list established, so
-                // `existing` is always the inherited one.
-                Some(existing) => {
-                    if let Some(slot) = launches.iter_mut().find(|id| **id == existing) {
-                        *slot = target;
-                    }
-                    overridden.insert(existing);
-                    verb_slots.insert(name.clone(), target);
-                    let winner = &definitions[target.0];
-                    let loser = &definitions[existing.0];
-                    if !winner.same_definition(loser) {
-                        conflicts.push(ConfigConflict {
-                            tool: winner.name.clone(),
-                            winner_file: origin_file(winner.origin()).to_path_buf(),
-                            overridden_file: origin_file(loser.origin()).to_path_buf(),
-                            fields: loser.differing_fields(winner),
-                        });
+            match launch_index.get(&verb).copied() {
+                // The project's claim settles every inherited candidate: the one
+                // it names wins in place (idempotent when it was already the
+                // inherited winner) and the others are outranked, as the project
+                // config outranks the fallback image (ADR-0076 R4.1/R4.4). An
+                // outranked definition stays in the arena so its file's other
+                // tools keep resolving it, and is excluded from `authorized`.
+                Some(slot) => {
+                    launches[slot] = target;
+                    for inherited_id in inherited_candidates
+                        .get(&verb)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default()
+                    {
+                        if *inherited_id == target {
+                            continue;
+                        }
+                        overridden.insert(*inherited_id);
+                        let winner = &definitions[target.0];
+                        let loser = &definitions[inherited_id.0];
+                        if !winner.same_definition(loser) {
+                            conflicts.push(ConfigConflict {
+                                tool: winner.name.clone(),
+                                winner_file: origin_file(winner.origin()).to_path_buf(),
+                                overridden_file: origin_file(loser.origin()).to_path_buf(),
+                                fields: loser.differing_fields(winner),
+                            });
+                        }
                     }
                 }
                 None => {
+                    launch_index.insert(verb, launches.len());
                     launches.push(target);
-                    verb_slots.insert(name, target);
                 }
             }
         }
     }
 
+    // Step C: an inherited verb no project entry claims may not come from two
+    // different sources. Distinct origins collide even when the immediate fields
+    // match, because each file's own `tools` closure can differ.
+    for (verb, slot) in &launch_index {
+        if project_claims.contains_key(verb) {
+            continue;
+        }
+        let Some(candidates) = inherited_candidates.get(verb) else {
+            continue;
+        };
+        if candidates.len() < 2 {
+            continue;
+        }
+        let file = project_file.ok_or_else(|| {
+            anyhow!("internal: multiple allowed sources without a project config path")
+        })?;
+        let first = describe_origin(definitions[candidates[0].0].origin());
+        let second = describe_origin(definitions[candidates[1].0].origin());
+        let _ = slot;
+        return Err(anyhow!(
+            "config: {}: allow_tools: \"{verb}\" is authorized by both {first} and {second}; \
+             override it with \"<alias>:{verb}\" in the project config's allow_tools, or set \
+             allow = false on one of those sources",
+            crate::one_line::quoted_path(file),
+        ));
+    }
+
+    // Step D: the closure-authorization set is exactly the winning definitions.
     let authorized: BTreeSet<DefinitionId> = launches.iter().copied().collect();
     let inert: Vec<InertTool> = definitions
         .iter()
@@ -2868,6 +3563,7 @@ fn authorize_tools(
                 .into_iter()
                 .map(|(name, (_, entry))| (name, entry))
                 .collect(),
+            untrusted_origins,
         },
         conflicts,
     ))
@@ -2886,9 +3582,8 @@ struct EntryContext<'a> {
     index: &'a ScopedToolIndex<'a>,
     definitions: &'a [Tool],
     declared: &'a crate::config_sources::DeclaredSources,
-    user_trust: Option<&'a crate::config_authority::ReferenceTrust>,
-    user_status: &'a TierStatus,
-    user_file: Option<&'a Path>,
+    /// Every `trust = true` source's read verdict, in `[[sources]]` order.
+    trusted: &'a [TrustedSourceVerdict],
     project_file: Option<&'a Path>,
 }
 
@@ -2896,22 +3591,19 @@ struct EntryContext<'a> {
 ///
 /// Unqualified names resolve strictly against the project config's own
 /// `[[tools]]`; a qualified `<alias>:<name>` against the source bound to
-/// `<alias>` — and, when that source is `:trust`, only after its own read's
-/// verdict vouches for the definition the project would activate (D5).
+/// `<alias>` — and, when that source is `trust = true`, only after its own
+/// read's verdict vouches for the definition the project would activate (D5).
 fn resolve_allow_tool_entry(
     entry: &crate::config_allow_tools::AllowToolEntry,
     context: &EntryContext<'_>,
 ) -> Result<DefinitionId> {
-    use crate::config_sources::SourceTrust;
     let EntryContext {
         entry_index,
         file,
         index,
         definitions,
         declared,
-        user_trust,
-        user_status,
-        user_file,
+        trusted,
         project_file,
     } = *context;
 
@@ -2942,47 +3634,46 @@ fn resolve_allow_tool_entry(
                     "names a source alias that sources does not declare".to_owned(),
                 ));
             };
-            match source.trust() {
-                SourceTrust::Trusted => {
-                    // The file's own read is the one that counts, and it may have
-                    // declared none of the five triggers — a tools-only symlink
-                    // loads through ADR-0040's compatibility rule. The project's
-                    // selection is what needs its verdict, attributed to the
-                    // definition rather than to a list the file may not have.
-                    if *user_status == TierStatus::Absent {
-                        return Err(allow_tools_error(
-                            file,
-                            entry_index,
-                            format!(
-                                "selects a tool from {}, but that file does not exist",
-                                source.declared()
-                            ),
-                        ));
-                    }
-                    let trust = user_trust.ok_or_else(|| {
-                        anyhow!("internal: a :trust source read without its verdict")
+            if source.is_trusted() {
+                // The file's own read is the one that counts, and it may have
+                // declared none of the five triggers — a tools-only symlink
+                // loads through ADR-0040's compatibility rule. The project's
+                // selection is what needs its verdict, attributed to the
+                // definition rather than to a list the file may not have.
+                let verdict = trusted
+                    .iter()
+                    .find(|verdict| verdict.alias == *alias)
+                    .ok_or_else(|| {
+                        anyhow!("internal: a trusted source read without its verdict")
                     })?;
-                    trust.require_for_trusted_tool().map_err(|refusal| {
-                        allow_tools_error(
-                            file,
-                            entry_index,
-                            format!("{refusal} (selecting a tool from {})", source.declared()),
-                        )
-                    })?;
-                    let user_file = user_file.ok_or_else(|| {
-                        anyhow!("internal: a :trust source without a discovered user path")
-                    })?;
-                    (ToolOrigin::User(user_file.to_path_buf()), source.declared())
-                }
+                let Some(references) = verdict.references.as_ref() else {
+                    return Err(allow_tools_error(
+                        file,
+                        entry_index,
+                        format!(
+                            "selects a tool from {}, but that file does not exist",
+                            source.declared()
+                        ),
+                    ));
+                };
+                references.require_for_trusted_tool().map_err(|refusal| {
+                    allow_tools_error(
+                        file,
+                        entry_index,
+                        format!("{refusal} (selecting a tool from {})", source.declared()),
+                    )
+                })?;
+                (verdict.origin(), source.declared())
+            } else {
                 // Unpinned until #736: the named definition's own fields are
                 // activated exactly as the file declares them now.
-                SourceTrust::Untrusted => (
+                (
                     ToolOrigin::Source {
                         alias: alias.clone(),
                         file: source.path().to_path_buf(),
                     },
                     source.declared(),
-                ),
+                )
             }
         }
     };
@@ -3312,6 +4003,7 @@ fn resolve_provisioning(
         launches,
         authorized,
         authorized_explicitly,
+        untrusted_origins,
         ..
     } = tools;
     let index = scoped_tool_index(&definitions)?;
@@ -3344,7 +4036,13 @@ fn resolve_provisioning(
         // R6: a non-`:trust` (future-pinned) source's `tools = [...]` closure must
         // be authorized in full. Exact `DefinitionId`s, so a same-named authorized
         // tool in `home` or the project config can never satisfy a source's edge.
-        enforce_closure_authorization(&definitions, &visited, *start, &authorized)?;
+        enforce_closure_authorization(
+            &definitions,
+            &visited,
+            *start,
+            &authorized,
+            &untrusted_origins,
+        )?;
         // Ownership before any facet escapes: two definitions selected by the
         // same launch may not claim one guest path or an ancestor/descendant
         // pair, even when one of them lost its launch verb. Unguarded here, a
@@ -3424,8 +4122,11 @@ fn resolve_provisioning(
 /// local `pi` naming a local `claude` is one file the user wrote. When #736 turns
 /// a source into a pinned one this predicate is unchanged: pinning is about the
 /// bytes, not about who authorized the tool.
-fn requires_explicit_closure_authorization(origin: &ToolOrigin) -> bool {
-    matches!(origin, ToolOrigin::Source { .. })
+fn requires_explicit_closure_authorization(
+    origin: &ToolOrigin,
+    untrusted_origins: &BTreeSet<ToolOrigin>,
+) -> bool {
+    untrusted_origins.contains(origin)
 }
 
 /// Refuse a launch whose `tools` closure visits a definition nothing authorized.
@@ -3437,9 +4138,10 @@ fn enforce_closure_authorization(
     visited: &[bool],
     start: DefinitionId,
     authorized: &BTreeSet<DefinitionId>,
+    untrusted_origins: &BTreeSet<ToolOrigin>,
 ) -> Result<()> {
     let launcher = &definitions[start.0];
-    if !requires_explicit_closure_authorization(launcher.origin()) {
+    if !requires_explicit_closure_authorization(launcher.origin(), untrusted_origins) {
         return Ok(());
     }
     for (position, seen) in visited.iter().enumerate() {
@@ -3596,9 +4298,13 @@ pub(crate) fn top_level_field(name: &str) -> Option<&'static str> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
-    // User tier: verified by config_authority; project/built-in: value-safe refusal.
+    // User tier: verified by config_authority; project/`allow = true` source:
+    // adopted through the verified read's token; built-in: refused by presence.
+    // Untyped at this seam (ADR-0076 R4.2, Finding 5): `network = 42` must reach
+    // the authority decision and the inert/refusal wording instead of a serde
+    // message, and an inert value must never fail the decode at all.
     #[serde(default)]
-    network: Option<toml::Table>,
+    network: Option<toml::Value>,
     // User tier: verified (ADR-0046) when present, even `[]`; project/built-in:
     // refused. A `toml::Value`, not `Vec<String>`, so presence survives to the
     // authority decision — the value may be a table or a number, and deciding
@@ -3621,11 +4327,13 @@ struct RawConfig {
     /// image-only file declares no tools and keeps the shipped defaults.
     #[serde(default)]
     image: Option<String>,
-    /// Project config only (ADR-0074): the files this project sources. Every other
-    /// tier refuses the key by presence (flat sourcing, S2). Strings, parsed by
-    /// `config_sources` only after the project file's verified read.
+    /// Project config only (ADR-0076): the `[[sources]]` tables this project
+    /// reads. Every other tier refuses the key by presence (flat sourcing, S2).
+    /// Untyped at this seam so a non-array or a string entry reaches
+    /// `config_sources`'s migration diagnostics, after the project file's
+    /// verified read.
     #[serde(default)]
-    sources: Option<Vec<String>>,
+    sources: Option<toml::Value>,
     /// #735: which declared tools become launch verbs. A `toml::Value`, not
     /// `Vec<String>`, for the same reason `mounts` is: presence makes a `:trust`
     /// file authority-bearing, so `[]`, a table and a number must all reach the
@@ -4333,7 +5041,8 @@ fn deserialize_error(file: &Path, text: &str, error: &toml::de::Error) -> anyhow
          Required: a string `name` and `command`; `args`, `credentials`, `tools`, `persist`, \
          `mounts` and `network_requests` are arrays of strings; `env` is a table of string values; \
          the top-level `image` and each tool's `command` are strings; the top-level \
-         `sources`, accepted only in the project tier, is an array of strings; the top-level \
+         `sources`, accepted only in the project tier, is an array of `[[sources]]` tables \
+         (or `sources = []`); the top-level \
          `mounts` and each `[[tools]]`'s `mounts` are arrays of mount declarations or mount-set \
          names; `[mount_sets]` is a table of named arrays of those mount declarations or mount-set \
          names, and `[egress_sets]` is a table of named arrays of egress allowances or `set:NAME` \
@@ -4492,20 +5201,28 @@ mod tests {
     use std::collections::HashSet;
     use std::fs;
 
+    /// ADR-0076 R3: the verified project config may now grant egress. Its
+    /// `[network]` is adopted through the ADR-0073 verdict and reported like any
+    /// other contributing `[network]` table.
     #[test]
-    fn network_table_is_refused_in_the_project_tier_naming_setting_and_tier() {
+    fn project_network_table_is_adopted_after_the_verified_read() {
         let f = Fixture::new();
         f.project("[network]\nallow_lan = true\nallow_egress = [\"10.0.0.0/8\"]");
-        let message = f.load().unwrap_err().to_string();
-        for expected in [
-            crate::one_line::quoted_path(&f.project).to_string(),
-            "network.allow_lan".into(),
-            "network.allow_egress".into(),
-            "project config".into(),
-            "; use --allow-* launch flags, or [network] in the user config".into(),
-        ] {
-            assert!(message.contains(&expected), "{message}");
-        }
+        let report = f
+            .load()
+            .expect("the verified project config may grant egress");
+        assert_eq!(
+            report.user_network(),
+            Some(&UserNetwork::for_test(
+                &f.project,
+                user_network::SavedGroups {
+                    lan: Some(true),
+                    ..Default::default()
+                },
+                &["10.0.0.0/8"],
+            ))
+        );
+        assert_eq!(report.user_network().unwrap().file(), f.project);
     }
 
     #[test]
@@ -4545,11 +5262,17 @@ mod tests {
         }
     }
 
+    /// Present-empty is still present: the project config's `[network]` is
+    /// recorded and grants nothing (ADR-0076 R3).
     #[test]
-    fn empty_network_table_is_still_refused() {
+    fn empty_project_network_table_is_adopted_and_grants_nothing() {
         let f = Fixture::new();
         f.project("[network]");
-        assert!(f.load().unwrap_err().to_string().contains("[network]"));
+        let report = f.load().expect("an empty [network] is adopted");
+        assert_eq!(
+            report.user_network(),
+            Some(&UserNetwork::for_test(&f.project, Default::default(), &[]))
+        );
     }
 
     #[test]
@@ -4789,31 +5512,25 @@ mod tests {
         }
     }
 
-    /// A project file may not grant mounts, empty or not, and `[network]` is
-    /// still the field named when the file declares both.
+    /// ADR-0076 R3: a verified project config's own `mounts` is adopted, empty and
+    /// non-empty alike. A wrong type is still a schema error, from the mount
+    /// parser rather than a refusal.
     #[test]
-    fn project_mounts_are_refused_even_when_empty() {
-        for body in ["mounts = []\n", "mounts = [\"/a\"]\n", "mounts = \"x\"\n"] {
+    fn project_mounts_are_adopted_after_the_verified_read() {
+        for (body, expected) in [("mounts = []\n", 0usize), ("mounts = [\"/a:/g:ro\"]\n", 1)] {
             let f = Fixture::new();
             f.project(body);
-            let error = f.load().unwrap_err().to_string();
-            assert!(
-                error.contains(&format!(
-                    "config: {:?}: mounts cannot be declared by the project config; use \
-                     --mount launch options, or mounts in the user config",
-                    f.project
-                )),
-                "{body}: {error}"
+            let report = f.load().unwrap_or_else(|error| panic!("{body}: {error}"));
+            assert_eq!(
+                report.user_mounts().map(UserMounts::len),
+                Some(expected),
+                "{body}"
             );
         }
         let f = Fixture::new();
-        f.project("mounts = []\n[network]\nallow_host = true\n");
+        f.project("mounts = \"x\"\n");
         let error = f.load().unwrap_err().to_string();
-        assert!(
-            error.contains("network access cannot be granted by the project config"),
-            "{error}"
-        );
-        assert!(!error.contains("mounts cannot be declared"), "{error}");
+        assert!(error.contains("must be an array"), "{error}");
     }
 
     /// The built-in catalog cannot declare mounts either, and `[network]` still
@@ -4988,16 +5705,16 @@ mod tests {
                 "{body}"
             );
         }
-        // The refusal order is still `[network]`, `mounts`, `[mount_sets]`,
-        // `[egress_sets]`, the first tool's `mounts`.
+        // ADR-0076 R3: the set tables are the *only* project-side authority
+        // fields refused now, and they are refused before the adopted fields.
         for (body, expected) in [
             (
                 "[egress_sets]\n[network]\nallow_host = true\n",
-                "network access cannot be granted by the project config",
+                "egress_sets cannot be declared by the project config",
             ),
             (
                 "mounts = []\n[egress_sets]\n",
-                "mounts cannot be declared by the project config",
+                "egress_sets cannot be declared by the project config",
             ),
             (
                 "[mount_sets]\n[egress_sets]\n",
@@ -5008,16 +5725,6 @@ mod tests {
             (
                 "[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = []\n[egress_sets]\n",
                 "egress_sets cannot be declared by the project config",
-            ),
-            // The remaining authority fields keep their precedence over a tool's
-            // own `mounts`, which #735 made legal (inert) in the project tier.
-            (
-                "[network]\nallow_lan = true\n[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = []\n",
-                "network.allow_lan",
-            ),
-            (
-                "mounts = []\n[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = []\n",
-                "mounts cannot be declared by the project config",
             ),
         ] {
             let f = Fixture::new();
@@ -5305,22 +6012,21 @@ mod tests {
                 "{body}: {error}"
             );
         }
-        // A project `mounts = [\"agent\"]` is a `mounts` refusal, which precedes any
-        // resolution — even when the user config really does define `agent`.
+        // A project config's own top-level `mounts` is a direct declaration, not a
+        // set reference: it is adopted through the verified read, and a name that
+        // only the user config's `[mount_sets]` defines is a different namespace
+        // (ADR-0076 R3).
         let f = Fixture::new();
         f.user("[mount_sets]\nagent = [\"/a:/g:ro\"]\n");
-        f.project("mounts = [\"agent\"]\n");
-        let error = f.load().unwrap_err().to_string();
-        assert!(
-            error.contains("mounts cannot be declared by the project config"),
-            "{error}"
-        );
-        // `[network]` still wins when a project declares both.
+        f.project("mounts = [\"/p:/g:ro\"]\n");
+        let report = f.load().expect("a project mount is adopted");
+        assert_eq!(report.user_mounts().map(UserMounts::len), Some(1));
+        // The set tables are refused before the adopted `[network]`.
         let f = Fixture::new();
         f.project("[mount_sets]\n[network]\nallow_host = true\n");
         let error = f.load().unwrap_err().to_string();
         assert!(
-            error.contains("network access cannot be granted by the project config"),
+            error.contains("mount_sets cannot be declared by the project config"),
             "{error}"
         );
     }
@@ -5727,25 +6433,16 @@ mod tests {
             .project("[[tools]]\nname = \"t\"\ncommand = \"t\"\npersist = [\"p\"]\nmounts = []\n");
         assert!(f.load().is_ok());
 
-        // Old authority fields keep their precedence and their bytes.
+        // ADR-0076 R3: the project's own `[network]` and `mounts` are adopted
+        // beside a tool's inert list, which is still not authority.
         let f = Fixture::new();
         f.project(
             "[network]\nallow_lan = true\n[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = []\n",
         );
-        let error = f.load().unwrap_err().to_string();
-        assert!(error.contains("network.allow_lan"), "{error}");
-        assert!(!error.contains("tools[0].mounts"), "{error}");
+        assert!(f.load().is_ok());
         let f = Fixture::new();
         f.project("mounts = []\n[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = []\n");
-        let error = f.load().unwrap_err().to_string();
-        assert_eq!(
-            error,
-            format!(
-                "config: {:?}: mounts cannot be declared by the project config; use --mount \
-                 launch options, or mounts in the user config",
-                f.project
-            )
-        );
+        assert!(f.load().is_ok());
         let f = Fixture::new();
         f.project("[mount_sets]\na = []\n[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = []\n");
         assert!(
@@ -6740,7 +7437,7 @@ mod tests {
              persist = [\".repo-claude\"]\nmounts = [\"/rc:/rc:ro\"]\ntools = []\n",
         );
         f.write_project(&format!(
-            "{}\nallow_tools = [\"repo:claude\"]\n",
+            "allow_tools = [\"repo:claude\"]\n{}",
             sources_block(&[HOME_SOURCE, "repo ./r.toml"])
         ));
         let report = f.load().expect("the override loads");
@@ -6780,7 +7477,7 @@ mod tests {
         };
         let project = |allow: &str| {
             format!(
-                "{}\nallow_tools = [{allow}]\n{}",
+                "allow_tools = [{allow}]\n{}\n{}",
                 sources_block(&[HOME_SOURCE, "repo ./r.toml"]),
                 one_tool("claude")
             )
@@ -6865,7 +7562,7 @@ mod tests {
         let error = format!(
             "{:#}",
             f.with_project(&format!(
-                "{}\nallow_tools = [\"home:pi\", \"repo:pi\"]\n",
+                "allow_tools = [\"home:pi\", \"repo:pi\"]\n{}",
                 sources_block(&[HOME_SOURCE, "repo ./r.toml"])
             ))
             .expect_err("two targets for one verb")
@@ -6886,7 +7583,7 @@ mod tests {
         let error = format!(
             "{:#}",
             f.with_project(&format!(
-                "{}\nallow_tools = [\"nope:x\"]\n",
+                "allow_tools = [\"nope:x\"]\n{}",
                 sources_block(&["repo ./r.toml"])
             ))
             .expect_err("undeclared alias")
@@ -6903,7 +7600,7 @@ mod tests {
         let error = format!(
             "{:#}",
             f.with_project(&format!(
-                "{}\nallow_tools = [\"home:x\"]\n",
+                "allow_tools = [\"home:x\"]\n{}",
                 sources_block(&[HOME_SOURCE])
             ))
             .expect_err("absent :trust file")
@@ -6917,7 +7614,7 @@ mod tests {
         let error = format!(
             "{:#}",
             f.with_project(&format!(
-                "{}\nallow_tools = [\"repo:missing\"]\n",
+                "allow_tools = [\"repo:missing\"]\n{}",
                 sources_block(&["repo ./r.toml"])
             ))
             .expect_err("undeclared source tool")
@@ -6936,7 +7633,7 @@ mod tests {
         let error = format!(
             "{:#}",
             f.with_project(&format!(
-                "{}\nallow_tools = [\"x\"]\n",
+                "allow_tools = [\"x\"]\n{}",
                 sources_block(&["repo ./r.toml"])
             ))
             .expect_err("cross-file local entry")
@@ -6958,7 +7655,7 @@ mod tests {
             let f = SourcesFixture::new();
             f.write_repo("r.toml", repo);
             f.write_project(&format!(
-                "{}\nallow_tools = [{allow}]\n",
+                "allow_tools = [{allow}]\n{}",
                 sources_block(&["repo ./r.toml"])
             ));
             // The closure is checked while the catalog is built, so both stages
@@ -7029,7 +7726,7 @@ mod tests {
              [[tools]]\nname = \"b\"\ncommand = \"b\"\ntools = []\n",
         );
         f.write_project(&format!(
-            "{}\nallow_tools = [\"repo:a\"]\n",
+            "allow_tools = [\"repo:a\"]\n{}",
             sources_block(&[HOME_SOURCE, "repo ./r.toml"])
         ));
         let error = format!(
@@ -7597,10 +8294,23 @@ mod tests {
     }
 
     /// Every `[[tools]] name = "…"` in one config body, in declaration order.
+    ///
+    /// Only lines inside a `[[tools]]` table count: since ADR-0076 a project body
+    /// also carries `[[sources]]` tables with their own `name` keys, which are
+    /// not launch verbs.
     fn tool_names(contents: &str) -> Vec<String> {
         let mut names: Vec<String> = Vec::new();
+        let mut in_tools = false;
         for line in contents.lines() {
-            let Some(rest) = line.trim().strip_prefix("name = ") else {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                in_tools = trimmed == "[[tools]]";
+                continue;
+            }
+            if !in_tools {
+                continue;
+            }
+            let Some(rest) = trimmed.strip_prefix("name = ") else {
                 continue;
             };
             if let Some(name) = rest
@@ -7732,6 +8442,86 @@ mod tests {
             self.write_project(body);
             self.load()
         }
+    }
+
+    /// `[[sources]]` is bounded by count, and the bound is the documented one:
+    /// one past it refuses the load with a sentence that names the limit and none
+    /// of the entries, and exactly the limit loads.
+    #[test]
+    fn more_sources_than_the_bound_refuse_the_load() {
+        let limit = crate::config_sources::MAX_DECLARED_SOURCES;
+        let f = SourcesFixture::new();
+        let mut over = String::new();
+        for index in 0..=limit {
+            let file = f.write_repo(&format!("s{index}.toml"), "# pinned\n");
+            over.push_str(&source_table(&format!("s{index}"), &file, false, false));
+        }
+        let error = format!(
+            "{:#}",
+            f.with_project(&over).expect_err("one past the limit")
+        );
+        assert!(
+            error.contains(&format!("sources: more than {limit} declared sources")),
+            "the limit must be named: {error}"
+        );
+        assert!(
+            !error.contains(&format!("s{limit}.toml")),
+            "the refusal is value-free: {error}"
+        );
+
+        let mut permitted = String::new();
+        for index in 0..limit {
+            permitted.push_str(&source_table(
+                &format!("s{index}"),
+                &f.repo(&format!("s{index}.toml")),
+                false,
+                false,
+            ));
+        }
+        let report = f.with_project(&permitted).expect("exactly the limit");
+        assert_eq!(report.sources().entries().len(), limit);
+    }
+
+    /// A valid TOML body of exactly `size` bytes: one comment line, so a fixture
+    /// can be large without declaring anything.
+    fn comment_config(size: usize) -> String {
+        let mut body = String::from("#");
+        body.push_str(&"x".repeat(size - 2));
+        body.push('\n');
+        assert_eq!(body.len(), size);
+        body
+    }
+
+    /// The per-file ceiling is not a bound on the list: eight files that are each
+    /// legal under `MAX_CONFIG_FILE_BYTES` cost more than the declared sources may
+    /// read in total, so the load refuses instead of parsing them all. The same
+    /// eight, smaller, load.
+    #[test]
+    fn the_declared_sources_share_one_byte_budget() {
+        let f = SourcesFixture::new();
+        let mut over = String::new();
+        for index in 0..8 {
+            let file = f.write_repo(&format!("big{index}.toml"), &comment_config(700 * 1024));
+            over.push_str(&source_table(&format!("s{index}"), &file, false, false));
+        }
+        let error = format!("{:#}", f.with_project(&over).expect_err("over the total"));
+        assert!(
+            error.contains(&format!(
+                "the declared sources read more than {MAX_SOURCE_BYTES_TOTAL} bytes in total"
+            )),
+            "the total must be named: {error}"
+        );
+        assert!(
+            !error.contains("xxxx"),
+            "the refusal names no contents: {error}"
+        );
+
+        let mut under = String::new();
+        for index in 0..8 {
+            let file = f.write_repo(&format!("small{index}.toml"), &comment_config(400 * 1024));
+            under.push_str(&source_table(&format!("s{index}"), &file, false, false));
+        }
+        f.with_project(&under).expect("under the total");
     }
 
     /// The first launch winner. Hidden definitions are deliberately absent: a
@@ -11849,18 +12639,48 @@ mod tests {
         );
     }
 
-    // -- sources (ADR-0074) ------------------------------------------------
+    // -- sources (ADR-0076) ------------------------------------------------
 
-    use crate::config_sources::{SourceTrust, Sourcing};
+    use crate::config_sources::Sourcing;
 
-    /// The documented spelling of the user config as a trusted source.
-    const HOME_SOURCE: &str = "home:trust ~/.config/agent-vm/config.toml";
-    /// A repository file sourced without `:trust`.
+    /// The documented spelling of the user config as a trusted, allowed source:
+    /// the implicit default's `trust = true, allow = true`.
+    const HOME_SOURCE: &str = "home:trust:allow ~/.config/agent-vm/config.toml";
+    /// A repository file sourced with neither attribute: pinned (#736) and inert.
     const REPO_SOURCE: &str = "repo ./.agent-vm/config.toml";
 
+    /// Test-only shorthand for declaring sources: each element is
+    /// `"<alias>[:trust][:allow] <path>"` and is emitted as a real `[[sources]]`
+    /// table. The production parser accepts no string entries (ADR-0076); this
+    /// keeps dozens of fixtures readable without restating four keys each time.
     fn sources_block(entries: &[&str]) -> String {
-        let quoted: Vec<String> = entries.iter().map(|entry| format!("{entry:?}")).collect();
-        format!("sources = [{}]\n", quoted.join(", "))
+        if entries.is_empty() {
+            // An explicit empty list, not an omitted key: it sources nothing.
+            return "sources = []\n".to_string();
+        }
+        let mut out = String::new();
+        for entry in entries {
+            let (head, path) = entry.split_once(' ').expect("test shorthand has a space");
+            let mut parts = head.split(':');
+            let name = parts.next().expect("test shorthand has an alias");
+            let mut trust = false;
+            let mut allow = false;
+            for flag in parts {
+                match flag {
+                    "trust" => trust = true,
+                    "allow" => allow = true,
+                    other => panic!("test shorthand does not know :{other}"),
+                }
+            }
+            out.push_str(&format!("[[sources]]\nname = {name:?}\npath = {path:?}\n"));
+            if trust {
+                out.push_str("trust = true\n");
+            }
+            if allow {
+                out.push_str("allow = true\n");
+            }
+        }
+        out
     }
 
     /// The launch verbs a report offers, before the `shell` fallback is added.
@@ -11907,7 +12727,8 @@ mod tests {
         let entries = report.sources().entries();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].alias().as_str(), "home");
-        assert_eq!(entries[0].trust(), SourceTrust::Trusted);
+        assert!(entries[0].is_trusted());
+        assert!(entries[0].is_allowed());
         assert_eq!(entries[0].tier().path(), Some(f.user_config().as_path()));
         assert!(
             report.sources().listed_files().is_empty(),
@@ -11966,7 +12787,7 @@ mod tests {
         f.write_repo("r.toml", &one_tool("r"));
         let report = f
             .with_project(&format!(
-                "{}\nallow_tools = [\"p\", \"home:r\"]\n{}",
+                "allow_tools = [\"p\", \"home:r\"]\n{}\n{}",
                 sources_block(&["home ./r.toml"]),
                 one_tool("p")
             ))
@@ -12000,7 +12821,7 @@ mod tests {
         );
         let report = f
             .with_project(&format!(
-                "{}\nallow_tools = [\"p\", \"repo:u\", \"repo:repo\"]\n{}",
+                "allow_tools = [\"p\", \"repo:u\", \"repo:repo\"]\n{}\n{}",
                 sources_block(&[HOME_SOURCE, REPO_SOURCE]),
                 one_tool("p")
             ))
@@ -12132,13 +12953,17 @@ mod tests {
             "{error}"
         );
 
-        // A malformed value is the schema error (F3), not the flat refusal.
+        // A malformed value is refused by the `[[sources]]` schema, not the flat
+        // refusal.
         let f = SourcesFixture::new();
         let error = format!(
             "{:#}",
             f.with_project("sources = \"bad\"\n").expect_err("schema")
         );
-        assert!(error.contains("invalid TOML or tool schema"), "{error}");
+        assert!(
+            error.contains("sources: must be an array of [[sources]] tables (or sources = [])"),
+            "{error}"
+        );
 
         // An unknown field is refused without echoing its value.
         let f = SourcesFixture::new();
@@ -12160,37 +12985,55 @@ mod tests {
         .unwrap();
         let error = format!("{:#}", f.load().expect_err("indirect self-source"));
         assert!(
-            error.contains("only the project config may declare sources"),
-            "{error}"
+            error.contains("the project config cannot source itself"),
+            "the descriptor identity, not the flat-sourcing backstop, must fire: {error}"
         );
     }
 
-    /// V10 (S3): an untrusted source refuses every authority field by presence,
-    /// naming that file.
+    /// V10 (S3, ADR-0076 R3): an untrusted `allow = false` source's top-level
+    /// `[network]`, `mounts` and `allow_tools` are **inert** — the file loads and
+    /// grants nothing — while `[mount_sets]`/`[egress_sets]` stay refused by
+    /// presence until #738.
     #[test]
-    fn v10_an_untrusted_source_cannot_grant_authority() {
-        for (label, body, pointer) in [
-            ("network", "[network]\n", "[network]"),
+    fn v10_an_untrusted_source_declares_authority_inertly() {
+        for (label, body) in [
+            ("network", "[network]\n"),
+            ("empty network", "[network]\nallow_lan = false\n"),
+            ("malformed network", "network = 42\n"),
+            ("mounts", "mounts = []\n"),
+            ("malformed mounts", "mounts = \"bad\"\n"),
             (
-                "empty network",
-                "[network]\nallow_lan = false\n",
-                "[network]",
+                "allow_tools",
+                "allow_tools = []\n[[tools]]\nname = \"t\"\ncommand = \"t\"\n",
             ),
-            ("mounts", "mounts = []\n", "mounts"),
+            ("malformed allow_tools", "allow_tools = {}\n"),
+        ] {
+            let f = SourcesFixture::new();
+            f.write_repo(".agent-vm/config.toml", body);
+            let report = f
+                .with_project(&sources_block(&[REPO_SOURCE]))
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+            assert!(report.user_network().is_none(), "{label}");
+            assert!(report.user_mounts().is_none(), "{label}");
+            assert!(
+                report
+                    .resolved()
+                    .launch_tools()
+                    .all(|tool| tool.name() != "t"),
+                "{label}: an inert allow_tools authorizes nothing"
+            );
+        }
+
+        for (label, body, pointer) in [
             (
                 "mount_sets",
                 "[mount_sets]\n",
-                "mount_sets cannot be declared",
+                "mount_sets are user-config-only",
             ),
             (
                 "egress_sets",
                 "[egress_sets]\n",
-                "egress_sets cannot be declared",
-            ),
-            (
-                "allow_tools",
-                "allow_tools = []\n[[tools]]\nname = \"t\"\ncommand = \"t\"\n",
-                "allow_tools",
+                "egress_sets are user-config-only",
             ),
         ] {
             let f = SourcesFixture::new();
@@ -12198,7 +13041,7 @@ mod tests {
             f.write_project(&sources_block(&[REPO_SOURCE]));
             let error = format!("{:#}", f.load().expect_err(label));
             assert!(
-                error.contains("by a source without :trust"),
+                error.contains("user-config-only until #738"),
                 "{label}: {error}"
             );
             assert!(
@@ -12285,7 +13128,7 @@ mod tests {
         std::os::unix::fs::symlink(&sibling, f.checkout().join("link")).unwrap();
         let report = f
             .with_project(&format!(
-                "{}\nallow_tools = [\"link:outside-tool\"]\n",
+                "allow_tools = [\"link:outside-tool\"]\n{}",
                 sources_block(&["link ./link/../target.toml"])
             ))
             .expect("dot-dot through a symlink");
@@ -12303,7 +13146,7 @@ mod tests {
         let report = f
             .with_project(&sources_block(&["sib ../sibling/config.toml"]))
             .expect("escape");
-        assert!(report.images().inert().len() == 1);
+        assert_eq!(report.images().source_images().len(), 1);
 
         // Directory spellings fail cleanly once read.
         for entry in ["~/", "/", "./"] {
@@ -12522,7 +13365,7 @@ mod tests {
             image_ref(report.images().user()),
             Some("localhost:1/u:latest")
         );
-        assert!(report.images().inert().is_empty());
+        assert!(report.images().source_images().is_empty());
 
         // `ALIAS:image` resolves to that source's own image and names its file.
         let f = SourcesFixture::new();
@@ -12542,13 +13385,13 @@ mod tests {
         assert_eq!(project.reference().as_str(), "localhost:1/repo:latest");
         assert_eq!(project.file(), repo.as_path());
         assert_eq!(project.via().map(|alias| alias.as_str()), Some("repo"));
-        let inert: Vec<(&str, &Path)> = report
+        let listed: Vec<(&str, &Path)> = report
             .images()
-            .inert()
+            .source_images()
             .iter()
-            .map(|inert| (inert.alias().as_str(), inert.image().file()))
+            .map(|row| (row.alias().as_str(), row.image().file()))
             .collect();
-        assert_eq!(inert, [("team", team.as_path())]);
+        assert_eq!(listed, [("team", team.as_path())]);
 
         // With no project image, the trusted image is the fallback and the
         // untrusted image is inert.
@@ -12566,9 +13409,12 @@ mod tests {
             image_ref(report.images().user()),
             Some("localhost:1/u:latest")
         );
-        assert_eq!(report.images().inert().len(), 1);
+        assert_eq!(report.images().source_images().len(), 1);
         assert_eq!(
-            report.images().inert()[0].image().reference().as_str(),
+            report.images().source_images()[0]
+                .image()
+                .reference()
+                .as_str(),
             "localhost:1/repo:latest"
         );
 
@@ -12768,5 +13614,594 @@ mod tests {
                 format!("config: {:?}: {diagnostic}", f.project_config())
             );
         }
+    }
+    // -- (trust, allow) matrix, adoption order, and the #736 seam ----------
+
+    /// One explicit `[[sources]]` table, spelled the way a user writes it.
+    fn source_table(name: &str, path: &Path, trust: bool, allow: bool) -> String {
+        let mut out = format!(
+            "[[sources]]\nname = {name:?}\npath = {:?}\n",
+            path.display().to_string()
+        );
+        if trust {
+            out.push_str("trust = true\n");
+        }
+        if allow {
+            out.push_str("allow = true\n");
+        }
+        out
+    }
+
+    /// Every top-level adoptable key one source can declare, in TOML order
+    /// (top-level keys before `[network]`/`[[tools]]`).
+    fn adopting_source_body() -> String {
+        "image = \"localhost:1/s:latest\"\n\
+         mounts = [\"/host:/guest:ro\"]\n\
+         allow_tools = [\"t\"]\n\
+         [network]\nallow_lan = true\nallow_egress = [\"10.0.0.0/8\"]\n\
+         [[tools]]\nname = \"t\"\ncommand = \"t\"\ncredentials = [\"openai\"]\n"
+            .to_string()
+    }
+
+    impl SourcesFixture {
+        fn load_with_approval(
+            &self,
+            approval: &dyn config_authority::ContentApprovalPolicy,
+        ) -> Result<ConfigReport> {
+            load_with_content_approval(&self.paths(), approval)
+        }
+    }
+
+    /// The #736 stand-in: approves exactly the bytes it was constructed with.
+    struct ApproveExact(Vec<u8>);
+
+    impl config_authority::ContentApprovalPolicy for ApproveExact {
+        fn approve_untrusted_adoption<'a>(
+            &self,
+            project: &'a config_authority::VerifiedProject,
+            entry: &'a crate::config_sources::SourceEntry,
+            bytes: &'a [u8],
+        ) -> Result<config_authority::ApprovedSourceContent<'a>> {
+            if bytes != self.0.as_slice() {
+                anyhow::bail!("test approver: the bytes changed after approval");
+            }
+            Ok(config_authority::ApprovedSourceContent::for_test(
+                project, entry, bytes,
+            ))
+        }
+    }
+
+    /// The 2x2 matrix. `allow = true` adopts every top-level key; `allow = false`
+    /// adopts none of them and refuses nothing; `trust = false, allow = true`
+    /// refuses before decoding. The launch facets are asserted, not only `Ok`.
+    #[test]
+    fn the_four_trust_allow_combinations_are_independent() {
+        for trust in [false, true] {
+            for allow in [false, true] {
+                let label = format!("trust={trust}, allow={allow}");
+                let f = SourcesFixture::new();
+                let path = if trust {
+                    // Outside the checkout, in the 0700 test base.
+                    let path = f.base().join("team.toml");
+                    fs::write(&path, adopting_source_body()).unwrap();
+                    path
+                } else {
+                    f.write_repo("team.toml", &adopting_source_body())
+                };
+                let project = source_table("team", &path, trust, allow);
+                let result = f.with_project(&project);
+                if allow && !trust {
+                    let error = format!("{:#}", result.expect_err(&label));
+                    for expected in [
+                        "allow = true on a trust = false source cannot adopt",
+                        "#736",
+                        "sources[0]",
+                        "allow = false",
+                        "trust = true",
+                    ] {
+                        assert!(error.contains(expected), "{label}: {error}");
+                    }
+                    continue;
+                }
+                let report = result.unwrap_or_else(|error| panic!("{label}: {error}"));
+                if allow {
+                    assert_eq!(
+                        report.images().fallback().map(|f| f.alias().as_str()),
+                        Some("team"),
+                        "{label}: the fallback image is adopted"
+                    );
+                    assert_eq!(
+                        report.user_mounts().map(UserMounts::len),
+                        Some(1),
+                        "{label}: mounts are adopted"
+                    );
+                    let network = report.user_network().expect(label.as_str());
+                    assert_eq!(network.egress().lan, Some(true), "{label}");
+                    assert!(launch_names(&report).contains(&"t".to_owned()), "{label}");
+                } else {
+                    assert_eq!(report.images().fallback(), None, "{label}");
+                    assert_eq!(report.images().user(), None, "{label}");
+                    assert!(report.user_mounts().is_none(), "{label}");
+                    assert_eq!(report.user_network(), None, "{label}");
+                    assert!(
+                        !launch_names(&report).contains(&"t".to_owned()),
+                        "{label}: an inert allow_tools authorizes nothing"
+                    );
+                    let entry = &report.sources().entries()[0];
+                    assert_eq!(
+                        entry.inert().labels(),
+                        ["image", "mounts", "[network]", "allow_tools"]
+                    );
+                    assert_eq!(
+                        entry.inert().with_image(true).labels(),
+                        ["image", "mounts", "[network]", "allow_tools"]
+                    );
+                }
+            }
+        }
+    }
+
+    /// An inert source is still selectable, key by key: `ALIAS:image` and a
+    /// qualified `allow_tools` entry reach an `allow = false` file explicitly.
+    #[test]
+    fn inert_declarations_are_selectable_explicitly() {
+        for trust in [false, true] {
+            let f = SourcesFixture::new();
+            let path = if trust {
+                let path = f.base().join("team.toml");
+                fs::write(&path, adopting_source_body()).unwrap();
+                path
+            } else {
+                f.write_repo("team.toml", &adopting_source_body())
+            };
+            let project = format!(
+                "image = \"team:image\"\nallow_tools = [\"team:t\"]\n{}",
+                source_table("team", &path, trust, false)
+            );
+            let report = f
+                .with_project(&project)
+                .unwrap_or_else(|error| panic!("trust={trust}: {error}"));
+            assert_eq!(
+                image_ref(report.images().project()),
+                Some("localhost:1/s:latest"),
+                "trust={trust}"
+            );
+            assert_eq!(report.images().project().unwrap().file(), path.as_path());
+            assert!(
+                launch_names(&report).contains(&"t".to_owned()),
+                "trust={trust}"
+            );
+            // The mount and the egress table stay inert: only the two explicit
+            // selections above are in force.
+            assert!(report.user_mounts().is_none(), "trust={trust}");
+            assert_eq!(report.user_network(), None, "trust={trust}");
+            assert!(
+                report.sources().entries()[0]
+                    .inert()
+                    .labels()
+                    .contains(&"mounts"),
+                "trust={trust}"
+            );
+        }
+    }
+
+    /// The approval gate runs before UTF-8/TOML decoding: an unapproved
+    /// `trust = false, allow = true` file is refused for the approval, never for
+    /// its (deliberately broken) syntax.
+    #[test]
+    fn the_approval_gate_runs_before_decoding() {
+        let f = SourcesFixture::new();
+        let path = f.write_repo("team.toml", "network = [unclosed\n");
+        let project = source_table("team", &path, false, true);
+        let error = format!("{:#}", f.with_project(&project).unwrap_err());
+        assert!(
+            error.contains("cannot adopt top-level image"),
+            "the approval refusal must precede the parse: {error}"
+        );
+    }
+
+    /// The #736 seam end to end: approved bytes adopt everything, and one changed
+    /// byte is refused before adoption.
+    #[test]
+    fn approved_untrusted_bytes_adopt_and_changed_bytes_do_not() {
+        let f = SourcesFixture::new();
+        let body = adopting_source_body();
+        let path = f.write_repo("team.toml", &body);
+        let project = source_table("team", &path, false, true);
+        f.write_project(&project);
+        let report = f
+            .load_with_approval(&ApproveExact(body.clone().into_bytes()))
+            .expect("approved bytes are adopted");
+        assert_eq!(
+            report.images().fallback().map(|f| f.alias().as_str()),
+            Some("team")
+        );
+        assert_eq!(report.user_mounts().map(UserMounts::len), Some(1));
+        assert_eq!(
+            report.user_network().map(|n| n.egress().lan),
+            Some(Some(true))
+        );
+        assert!(launch_names(&report).contains(&"t".to_owned()));
+
+        // One byte changed, still valid TOML: the same policy refuses.
+        let mut changed = body.clone().into_bytes();
+        let offset = changed
+            .windows(4)
+            .position(|window| window == b"host")
+            .expect("the body declares a mount");
+        changed[offset] = b'H';
+        fs::write(&path, &changed).unwrap();
+        let error = format!(
+            "{:#}",
+            f.load_with_approval(&ApproveExact(body.into_bytes()))
+                .expect_err("changed bytes were not approved")
+        );
+        assert!(
+            error.contains("the bytes changed after approval"),
+            "{error}"
+        );
+    }
+
+    /// First-wins in `[[sources]]` order, and the project image outranks it.
+    #[test]
+    fn the_fallback_image_is_the_first_allowed_source_in_order() {
+        let pair = |first_allow: bool, second_allow: bool| {
+            let f = SourcesFixture::new();
+            let one = f.base().join("one.toml");
+            let two = f.base().join("two.toml");
+            fs::write(&one, "image = \"localhost:1/one:latest\"\n").unwrap();
+            fs::write(&two, "image = \"localhost:1/two:latest\"\n").unwrap();
+            (
+                f,
+                format!(
+                    "{}{}",
+                    source_table("one", &one, true, first_allow),
+                    source_table("two", &two, true, second_allow)
+                ),
+            )
+        };
+
+        let (f, project) = pair(true, true);
+        let report = f.with_project(&project).unwrap();
+        assert_eq!(
+            image_ref(report.images().fallback().map(|f| f.image())),
+            Some("localhost:1/one:latest")
+        );
+        let rows: Vec<(&str, String)> = report
+            .images()
+            .source_images()
+            .iter()
+            .map(|row| (row.alias().as_str(), format!("{:?}", row.status())))
+            .collect();
+        assert_eq!(rows[1].0, "two");
+        assert!(
+            rows[1].1.contains("OverriddenBySource"),
+            "the later allowed row names the winner: {rows:?}"
+        );
+
+        let (f, project) = pair(false, true);
+        let report = f.with_project(&project).unwrap();
+        assert_eq!(
+            image_ref(report.images().fallback().map(|f| f.image())),
+            Some("localhost:1/two:latest")
+        );
+        assert_eq!(
+            report.sources().entries()[0].inert().labels(),
+            ["image"],
+            "the unselected allow = false image is the only inert key"
+        );
+
+        // The project image outranks the fallback, and the winner is recorded as
+        // overridden rather than silently dropped.
+        let (f, project) = pair(true, true);
+        let report = f
+            .with_project(&format!(
+                "image = \"localhost:1/project:latest\"\n{project}"
+            ))
+            .unwrap();
+        assert_eq!(
+            image_ref(report.images().project()),
+            Some("localhost:1/project:latest")
+        );
+        assert_eq!(report.images().fallback(), None);
+        assert!(
+            report
+                .images()
+                .source_images()
+                .iter()
+                .all(|row| format!("{:?}", row.status()).contains("OverriddenByProject"))
+        );
+    }
+
+    /// `mounts` union in `[[sources]]` order, then the project config; identical
+    /// declarations dedupe, differing ones at one guest path are an error naming
+    /// both files.
+    #[test]
+    fn adopted_mounts_union_in_order_and_dedupe_or_conflict() {
+        let f = SourcesFixture::new();
+        let one = f.base().join("one.toml");
+        let two = f.base().join("two.toml");
+        fs::write(&one, "mounts = [\"/a:/a:ro\", \"/shared:/shared:ro\"]\n").unwrap();
+        fs::write(&two, "mounts = [\"/shared:/shared:ro\", \"/b:/b:rw\"]\n").unwrap();
+        let project = format!(
+            "mounts = [\"/c:/c:ro\"]\n{}{}",
+            source_table("one", &one, true, true),
+            source_table("two", &two, true, true)
+        );
+        let report = f.with_project(&project).unwrap();
+        let guests: Vec<String> = report
+            .user_mounts()
+            .expect("adopted mounts")
+            .defaults()
+            .expect("the project declared one")
+            .leaves()
+            .iter()
+            .map(|leaf| leaf.request.mount.guest.display().to_string())
+            .collect();
+        assert_eq!(guests, ["/a", "/shared", "/b", "/c"]);
+        assert_eq!(
+            report.user_mounts().unwrap().files().last().unwrap(),
+            f.project_config(),
+            "the project config is the last contributor"
+        );
+
+        // Differing declarations at one guest path conflict, naming both files.
+        fs::write(&two, "mounts = [\"/elsewhere:/shared:ro\"]\n").unwrap();
+        let error = format!("{:#}", f.with_project(&project).unwrap_err());
+        assert!(
+            error.contains("both declare the same guest path"),
+            "{error}"
+        );
+        assert!(error.contains(&one.display().to_string()), "{error}");
+        assert!(error.contains(&two.display().to_string()), "{error}");
+    }
+
+    /// `[network]` unions in `[[sources]]` order and the project's explicit
+    /// booleans override the sources'.
+    #[test]
+    fn adopted_network_unions_in_order_and_the_project_overrides_booleans() {
+        let f = SourcesFixture::new();
+        let one = f.base().join("one.toml");
+        let two = f.base().join("two.toml");
+        fs::write(
+            &one,
+            "[network]\nallow_lan = true\nallow_internet_egress = true\nallow_egress = [\"a.example\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            &two,
+            "[network]\nallow_host = true\nallow_internet_egress = false\nallow_egress = [\"b.example\"]\n",
+        )
+        .unwrap();
+        let project = format!(
+            "[network]\nallow_internet_egress = false\nallow_egress = [\"c.example\"]\n{}{}",
+            source_table("one", &one, true, true),
+            source_table("two", &two, true, true)
+        );
+        let report = f.with_project(&project).unwrap();
+        let network = report.user_network().expect("merged network");
+        let egress = network.egress();
+        assert_eq!(
+            (egress.internet, egress.lan, egress.host),
+            (Some(false), Some(true), Some(true)),
+            "sources OR-union, the project overrides"
+        );
+        let granted: Vec<String> = egress
+            .allowances
+            .allowances()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(granted, ["a.example", "b.example", "c.example"]);
+        assert_eq!(
+            network.files(),
+            [one.clone(), two.clone(), f.project_config().to_path_buf()]
+        );
+    }
+
+    /// ADR-0076 R3: a `trust = true, allow = false` source's `mounts` and
+    /// `[network]` are inert. The load must succeed and adopt nothing — a
+    /// launch-plan negative control, because `load()` returning `Ok` alone would
+    /// pass a mutant that quietly bound the mount.
+    #[test]
+    fn allow_false_trusted_source_mounts_stay_inert() {
+        let f = SourcesFixture::new();
+        let path = f.base().join("team.toml");
+        fs::write(&path, "mounts = [\"/host:/guest:ro\"]\n").unwrap();
+        let report = f
+            .with_project(&source_table("team", &path, true, false))
+            .expect("inert mounts load");
+        assert!(report.user_mounts().is_none(), "nothing is adopted");
+        assert_eq!(report.sources().entries()[0].inert().labels(), ["mounts"]);
+    }
+
+    #[test]
+    fn allow_false_trusted_source_network_stays_inert() {
+        let f = SourcesFixture::new();
+        let path = f.base().join("team.toml");
+        fs::write(
+            &path,
+            "[network]\nallow_lan = true\nallow_egress = [\"10.0.0.0/8\"]\n",
+        )
+        .unwrap();
+        let report = f
+            .with_project(&source_table("team", &path, true, false))
+            .expect("inert [network] loads");
+        assert!(report.user_network().is_none(), "nothing is adopted");
+        assert_eq!(
+            report.sources().entries()[0].inert().labels(),
+            ["[network]"]
+        );
+    }
+
+    /// ADR-0076 R2.2: a `trust = true` path inside the active checkout is refused
+    /// before any byte is read, even when the file itself is perfectly safe.
+    #[test]
+    fn trusted_source_inside_checkout_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = SourcesFixture::new();
+        let path = f.repo("team.toml");
+        fs::write(&path, "image = \"localhost:1/team:latest\"\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let error = format!(
+            "{:#}",
+            f.with_project(&source_table("team", &path, true, false))
+                .expect_err("an in-checkout trusted path is refused")
+        );
+        assert!(
+            error.contains("inside the active checkout"),
+            "the boundary refusal, not a file-measurement one: {error}"
+        );
+    }
+
+    /// ADR-0076 R2.2: a trusted source whose final symlink targets a checkout file
+    /// is refused with the **route** sentence, not as a generic symlink.
+    #[test]
+    fn trusted_source_symlink_into_checkout_reports_route_refusal() {
+        let f = SourcesFixture::new();
+        let target = f.repo("side.toml");
+        fs::write(&target, "image = \"localhost:1/side:latest\"\n").unwrap();
+        let link = f.base().join("link.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let error = format!(
+            "{:#}",
+            f.with_project(&source_table("team", &link, true, false))
+                .expect_err("a link into the checkout is refused")
+        );
+        assert!(
+            error.contains("symbolic link whose target resolves inside the active project"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("reached through a symbolic link"),
+            "the route wording must win: {error}"
+        );
+    }
+
+    /// ADR-0076 R2.3: a non-default trusted source is verified unconditionally, so
+    /// a group-writable regular file with valid TOML (declaring no authority field)
+    /// is still refused.
+    #[test]
+    fn trusted_source_group_writable_regular_file_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = SourcesFixture::new();
+        let path = f.base().join("team.toml");
+        fs::write(&path, "image = \"localhost:1/team:latest\"\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o620)).unwrap();
+        let error = format!(
+            "{:#}",
+            f.with_project(&source_table("team", &path, true, false))
+                .expect_err("a group-writable trusted file is refused")
+        );
+        assert!(error.contains("group- or other-writable"), "{error}");
+        assert!(error.contains("a trusted source"), "{error}");
+    }
+
+    /// ADR-0073 + ADR-0076 R3: the project config is verified before its own
+    /// `mounts`/`[network]` are adopted, so a writable one grants neither.
+    #[test]
+    fn unsafe_project_config_mounts_and_network_are_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let body = "mounts = [\"/host:/guest:ro\"]\n[network]\nallow_lan = true\n";
+        let f = SourcesFixture::new();
+        f.write_project(body);
+        fs::set_permissions(f.project_config(), fs::Permissions::from_mode(0o620)).unwrap();
+        let error = format!("{:#}", f.load().expect_err("a writable project config"));
+        assert!(error.contains("group- or other-writable"), "{error}");
+        assert!(error.contains("project config"), "{error}");
+
+        // The positive control: the same bytes are adopted once the file is private.
+        let f = SourcesFixture::new();
+        f.write_project(body);
+        fs::set_permissions(f.project_config(), fs::Permissions::from_mode(0o600)).unwrap();
+        let report = f.load().expect("a private project config may grant");
+        assert_eq!(report.user_mounts().map(UserMounts::len), Some(1));
+        assert_eq!(
+            report.user_network().map(|n| n.egress().lan),
+            Some(Some(true))
+        );
+    }
+
+    /// ADR-0076 R3 / #736: production refuses `trust = false, allow = true` before
+    /// decoding, so no unpinned bytes can grant ambient authority.
+    #[test]
+    fn untrusted_allow_true_source_is_refused_before_pinning() {
+        let f = SourcesFixture::new();
+        let path = f.write_repo("team.toml", &adopting_source_body());
+        let error = format!(
+            "{:#}",
+            f.with_project(&source_table("team", &path, false, true))
+                .expect_err("unpinned adoption is refused")
+        );
+        assert!(error.contains("#736"), "{error}");
+        assert!(
+            error.contains("allow = true on a trust = false source"),
+            "{error}"
+        );
+    }
+
+    /// `allow_tools` inherits in `[[sources]]` order, and the project may replace
+    /// an inherited verb in place or collide, but never silently.
+    #[test]
+    fn adopted_allow_tools_inherit_in_order_and_the_project_claims_verbs() {
+        let body = |name: &str, command: &str| {
+            format!(
+                "allow_tools = [{name:?}]\n[[tools]]\nname = {name:?}\ncommand = {command:?}\n\
+                 credentials = [\"openai\"]\n"
+            )
+        };
+
+        // s1 owns t1, s2 owns t2, the project adds t3: verb order is declaration
+        // order, then the project's own list.
+        let f = SourcesFixture::new();
+        let one = f.base().join("one.toml");
+        let two = f.base().join("two.toml");
+        fs::write(&one, body("t1", "t1")).unwrap();
+        fs::write(&two, body("t2", "t2")).unwrap();
+        let project = format!(
+            "allow_tools = [\"t3\"]\n{}{}[[tools]]\nname = \"t3\"\ncommand = \"t3\"\n\
+             credentials = [\"openai\"]\n",
+            source_table("one", &one, true, true),
+            source_table("two", &two, true, true),
+        );
+        let report = f.with_project(&project).unwrap();
+        assert_eq!(launch_names(&report), ["t1", "t2", "t3"]);
+
+        // Two sources authorizing one verb with no project override is refused,
+        // naming both origins and the two remedies.
+        let f = SourcesFixture::new();
+        let one = f.base().join("one.toml");
+        let two = f.base().join("two.toml");
+        fs::write(&one, body("dup", "one-dup")).unwrap();
+        fs::write(&two, body("dup", "two-dup")).unwrap();
+        let project = format!(
+            "{}{}",
+            source_table("one", &one, true, true),
+            source_table("two", &two, true, true)
+        );
+        let error = format!("{:#}", f.with_project(&project).unwrap_err());
+        assert!(error.contains("\"dup\""), "{error}");
+        assert!(error.contains("<alias>:dup"), "{error}");
+        assert!(error.contains("allow = false"), "{error}");
+
+        // Naming one of them in the project's list resolves the collision in
+        // place and warns that the definitions differ.
+        let project = format!(
+            "allow_tools = [\"one:dup\"]\n{}{}",
+            source_table("one", &one, true, true),
+            source_table("two", &two, true, true)
+        );
+        let report = f.with_project(&project).unwrap();
+        assert_eq!(launch_names(&report), ["dup"]);
+        assert_eq!(first_launch(&report).command(), "one-dup");
+        assert_eq!(report.conflicts().len(), 1);
+
+        // Two project entries for one inherited verb are refused.
+        let project = format!(
+            "allow_tools = [\"one:dup\", \"two:dup\"]\n{}{}",
+            source_table("one", &one, true, true),
+            source_table("two", &two, true, true)
+        );
+        let error = format!("{:#}", f.with_project(&project).unwrap_err());
+        assert!(error.contains("allow_tools[1]"), "{error}");
     }
 }

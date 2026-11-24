@@ -267,6 +267,17 @@ pub(crate) fn read_bounded_regular_file(path: &Path, max: u64) -> Result<Vec<u8>
     read_regular_fd(fd, max, path)
 }
 
+/// The `(device, inode)` pair an open descriptor's `fstat` reported.
+///
+/// Two reads of one file agree on it whatever spelling, symlink or hard link
+/// reached it, so it is how `config::load` recognises a source that is really the
+/// project config (ADR-0076 R4.2) without canonicalizing a path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FileIdentity {
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+}
+
 /// Ownership and mode facts read off an **opened descriptor** — never a second
 /// path lookup, which could observe a different file than the bytes did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,6 +292,18 @@ pub(crate) struct HostFileFacts {
     pub(crate) mode: RawMode,
     pub(crate) size: u64,
     pub(crate) nlink: u64,
+    /// The descriptor's own device and inode, for identity comparisons.
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+}
+
+impl HostFileFacts {
+    pub(crate) fn identity(&self) -> FileIdentity {
+        FileIdentity {
+            dev: self.dev,
+            ino: self.ino,
+        }
+    }
 }
 
 /// [`read_bounded_regular_file`] with `O_NOFOLLOW`, returning the descriptor's
@@ -355,6 +378,7 @@ pub(crate) fn read_bounded_regular_file_no_follow_checkpointed(
 /// The bytes are read with `pread`, so the descriptor is measured once and the
 /// version probe and the body come from the same file even if the name is
 /// replaced underneath.
+#[derive(Debug)]
 pub(crate) struct OpenedRegularFile {
     file: fs::File,
     path: PathBuf,
@@ -364,6 +388,10 @@ pub(crate) struct OpenedRegularFile {
 impl OpenedRegularFile {
     pub(crate) fn facts(&self) -> HostFileFacts {
         self.facts
+    }
+
+    pub(crate) fn identity(&self) -> FileIdentity {
+        self.facts.identity()
     }
 
     /// Up to `limit` bytes from the start, with no size policy: a truncated
@@ -414,11 +442,13 @@ impl OpenedRegularFile {
     pub(crate) fn into_verified_read(self, max: u64) -> Result<VerifiedRead> {
         let path = self.path.clone();
         let final_component = FinalComponent::Regular(self.facts);
+        let identity = self.facts.identity();
         let bytes = self.read_bounded(max)?;
         Ok(VerifiedRead {
             path,
             bytes,
             final_component,
+            identity,
         })
     }
 }
@@ -432,16 +462,66 @@ pub(crate) fn open_regular_no_follow_checkpointed(
     match open_no_follow(path)? {
         NoFollowOpen::File(fd) => {
             after_open();
-            let display = path_in_line(path);
-            let facts = descriptor_facts(&fd, &display)?;
-            Ok(Some(OpenedRegularFile {
-                file: fs::File::from(fd),
-                path: path.to_path_buf(),
-                facts,
-            }))
+            opened_regular_from_descriptor(fd, path).map(Some)
         }
         NoFollowOpen::Symlink => Ok(None),
     }
+}
+
+/// An [`OpenedRegularFile`] for a descriptor the caller opened itself with
+/// `openat(O_NOFOLLOW)`, measured by `fstat` on that very descriptor.
+///
+/// `path` is the spelling the caller is reporting; the facts come from the
+/// descriptor, so a path swapped between the open and the measurement cannot
+/// change what the facts describe (ADR-0076 R2.2).
+pub(crate) fn opened_regular_from_descriptor(
+    fd: OwnedFd,
+    path: &Path,
+) -> Result<OpenedRegularFile> {
+    let display = path_in_line(path);
+    let facts = descriptor_facts(&fd, &display)?;
+    Ok(OpenedRegularFile {
+        file: fs::File::from(fd),
+        path: path.to_path_buf(),
+        facts,
+    })
+}
+
+/// `fstat` of an already-open **directory** descriptor: `(dev, ino)`, uid and mode.
+///
+/// Used by the ADR-0076 whole-route walk, which must judge each component from the
+/// descriptor it opened rather than from a second path lookup.
+pub(crate) struct OpenedDirFacts {
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+    pub(crate) uid: u32,
+    pub(crate) mode: u32,
+}
+
+impl OpenedDirFacts {
+    pub(crate) fn identity(&self) -> (u64, u64) {
+        (self.dev, self.ino)
+    }
+}
+
+/// `fstat` of a directory descriptor, refusing anything that is not a directory.
+pub(crate) fn opened_dir_facts(
+    fd: &OwnedFd,
+    display: &impl std::fmt::Display,
+) -> Result<OpenedDirFacts> {
+    let stat = rfs::fstat(fd)
+        .map_err(|error| anyhow!(error))
+        .with_context(|| format!("stating {display}"))?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+        return Err(anyhow!("{display} is not a directory"));
+    }
+    Ok(OpenedDirFacts {
+        #[allow(clippy::useless_conversion)]
+        dev: u64::try_from(stat.st_dev).unwrap_or(0),
+        ino: stat.st_ino,
+        uid: stat.st_uid,
+        mode: crate::config_authority::raw_mode_u32(stat.st_mode),
+    })
 }
 
 fn symlink_refusal(path: &Path) -> anyhow::Error {
@@ -483,6 +563,9 @@ fn descriptor_facts(fd: &OwnedFd, display: &impl std::fmt::Display) -> Result<Ho
         // nlink_t is u16 on macOS, u32 on Linux aarch64, u64 on Linux x86_64.
         #[allow(clippy::useless_conversion)]
         nlink: u64::from(stat.st_nlink),
+        #[allow(clippy::useless_conversion)]
+        dev: u64::try_from(stat.st_dev).unwrap_or(0),
+        ino: stat.st_ino,
     })
 }
 
@@ -541,6 +624,10 @@ pub(crate) struct VerifiedRead {
     path: PathBuf,
     bytes: Vec<u8>,
     final_component: FinalComponent,
+    /// The opened descriptor's `(dev, ino)`, taken by `fstat` on the same
+    /// descriptor the bytes came from — including when the read followed a final
+    /// symlink. Never a second path lookup.
+    identity: FileIdentity,
 }
 
 impl VerifiedRead {
@@ -552,6 +639,9 @@ impl VerifiedRead {
     }
     pub(crate) fn final_component(&self) -> &FinalComponent {
         &self.final_component
+    }
+    pub(crate) fn identity(&self) -> FileIdentity {
+        self.identity
     }
 }
 
@@ -570,11 +660,37 @@ pub(crate) fn read_bounded_regular_file_noting_symlink(
 /// final component (ADR-0040's user tier, ADR-0074's `:trust` source) states that
 /// decision instead of letting a reader re-observe it.
 pub(crate) fn read_bounded_symlink_target(path: &Path, max: u64) -> Result<VerifiedRead> {
-    read_bounded_regular_file(path, max).map(|bytes| VerifiedRead {
+    read_bounded_regular_file_with_identity(path, max).map(|(bytes, identity)| VerifiedRead {
         path: path.to_path_buf(),
         bytes,
         final_component: FinalComponent::Symlink,
+        identity,
     })
+}
+
+/// [`read_bounded_regular_file`] that also reports the opened descriptor's
+/// identity, so a caller can compare the file a spelling reached with another
+/// open descriptor. The `fstat` happens between `open` and the read, on the same
+/// descriptor the bytes come from.
+fn read_bounded_regular_file_with_identity(
+    path: &Path,
+    max: u64,
+) -> Result<(Vec<u8>, FileIdentity)> {
+    let fd = rfs::open(
+        path,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .with_context(|| format!("opening {}", path_in_line(path)))?;
+    let stat = rfs::fstat(&fd)
+        .map_err(|error| anyhow!(error))
+        .with_context(|| format!("stating {}", path_in_line(path)))?;
+    let identity = FileIdentity {
+        #[allow(clippy::useless_conversion)]
+        dev: u64::try_from(stat.st_dev).unwrap_or(0),
+        ino: stat.st_ino,
+    };
+    read_regular_fd(fd, max, path).map(|bytes| (bytes, identity))
 }
 
 // The checkpoint tests replacement without introducing a second production read path.
@@ -590,13 +706,19 @@ fn read_bounded_regular_file_noting_symlink_checkpointed(
                 path: path.to_path_buf(),
                 bytes,
                 final_component: FinalComponent::Regular(facts),
+                identity: facts.identity(),
             })
         }
-        NoFollowOpen::Symlink => read_bounded_regular_file(path, max).map(|bytes| VerifiedRead {
-            path: path.to_path_buf(),
-            bytes,
-            final_component: FinalComponent::Symlink,
-        }),
+        NoFollowOpen::Symlink => {
+            read_bounded_regular_file_with_identity(path, max).map(|(bytes, identity)| {
+                VerifiedRead {
+                    path: path.to_path_buf(),
+                    bytes,
+                    final_component: FinalComponent::Symlink,
+                    identity,
+                }
+            })
+        }
     }
 }
 

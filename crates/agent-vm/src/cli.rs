@@ -279,8 +279,9 @@ pub(crate) enum Dispatch {
         catalog: Catalog,
         /// Both config tiers' `image` settings, read before the report was
         /// consumed to build the catalog. Carried to `image pull`/`setup`/`image show`
-        /// so they can select the same image a launch would.
-        images: ConfiguredImages,
+        /// so they can select the same image a launch would. Boxed because the
+        /// five-tier fallback chain makes the value large beside a command tree.
+        images: Box<ConfiguredImages>,
         /// Whether those tiers were actually read. A configuration that could not
         /// be loaded leaves them empty and this `false`, which is what forbids
         /// establishing a project default from the resulting selection (R3); a
@@ -290,10 +291,12 @@ pub(crate) enum Dispatch {
     // Large launch-side values are boxed to keep dispatch compact.
     Launch {
         target: LaunchTarget,
-        /// The two tiers' `image` settings (see the `Builtin` arm).
-        images: ConfiguredImages,
-        /// Verified user authority captured before consuming the report, like images.
-        user_network: Option<crate::user_network::UserNetwork>,
+        /// The tiers' `image` settings (see the `Builtin` arm).
+        images: Box<ConfiguredImages>,
+        /// Verified user authority captured before consuming the report, like
+        /// images. Boxed because the merged multi-file table is large beside the
+        /// built-in arms.
+        user_network: Option<Box<crate::user_network::UserNetwork>>,
         /// The user file's own `[egress_sets]` as an egress-reference namespace,
         /// captured the same way (ADR-0059). `None` when there is no user file,
         /// which is why a CLI `set:NAME` then reports "no user config file was
@@ -306,6 +309,10 @@ pub(crate) enum Dispatch {
         /// The validated resource ceiling. Refused while parsing, so an unbootable
         /// shape costs no runtime prologue (#645).
         resources: crate::resources::ResourceCeiling,
+        /// Every `trust = true` source this load read, captured before
+        /// `into_launch_catalog` consumes it (ADR-0076 R2.4). Boxed as a slice so
+        /// this variant stays small beside the built-in ones.
+        trusted_sources: Box<[std::path::PathBuf]>,
         /// The launch options.
         args: Box<run::Args>,
     },
@@ -323,9 +330,10 @@ pub(crate) enum Dispatch {
 pub(crate) struct CapturedConfig {
     images: ConfiguredImages,
     images_read: bool,
-    user_network: Option<crate::user_network::UserNetwork>,
+    user_network: Option<Box<crate::user_network::UserNetwork>>,
     user_tools: Option<crate::egress_reference::EgressNamespace>,
     user_mounts: Option<crate::config_mounts::UserMounts>,
+    trusted_sources: Box<[std::path::PathBuf]>,
 }
 
 impl Dispatch {
@@ -416,9 +424,10 @@ where
         // captured first so a catalog error cannot erase it (§5.3).
         Ok(report) => {
             let images = report.images().clone();
-            let user_network = report.user_network().cloned();
+            let user_network = report.user_network().cloned().map(Box::new);
             let user_tools = report.user_tool_requests().cloned();
             let user_mounts = report.user_mounts().cloned();
+            let trusted_sources: Box<[std::path::PathBuf]> = report.trusted_source_files().into();
             match report.into_launch_catalog() {
                 Ok(catalog) => (
                     Catalog::Ready(catalog),
@@ -428,6 +437,7 @@ where
                         user_network,
                         user_tools,
                         user_mounts,
+                        trusted_sources,
                     },
                 ),
                 Err(error) => (
@@ -438,6 +448,7 @@ where
                         user_network: None,
                         user_tools: None,
                         user_mounts: None,
+                        trusted_sources,
                     },
                 ),
             }
@@ -452,6 +463,7 @@ where
                 user_network: None,
                 user_tools: None,
                 user_mounts: None,
+                trusted_sources: Box::default(),
             },
         ),
     };
@@ -590,11 +602,12 @@ where
                     reject_direct_terminal_options(&mut command, &matches, &args)?;
                     let resources = args.resource_ceiling()?;
                     Ok(Dispatch::Launch {
-                        images: captured.images,
+                        images: Box::new(captured.images),
                         user_network: captured.user_network,
                         user_tools: captured.user_tools,
                         user_mounts: captured.user_mounts,
                         resources,
+                        trusted_sources: captured.trusted_sources,
                         args: Box::new(args),
                         target: LaunchTarget::Tool {
                             entry: Box::new(entry),
@@ -621,7 +634,7 @@ where
                     Ok(Dispatch::Builtin {
                         cmd,
                         catalog: Catalog::Ready(catalog),
-                        images: captured.images,
+                        images: Box::new(captured.images),
                         images_read: captured.images_read,
                     })
                 }
@@ -639,7 +652,7 @@ where
                     Ok(Dispatch::Builtin {
                         cmd: cli.cmd,
                         catalog: Catalog::Broken(config_error),
-                        images: captured.images,
+                        images: Box::new(captured.images),
                         images_read: captured.images_read,
                     })
                 }
@@ -714,11 +727,12 @@ fn direct_dispatch(
                 command: direct,
                 terminal,
             },
-            images: captured.images,
+            images: Box::new(captured.images),
             user_network: captured.user_network,
             user_tools: captured.user_tools,
             user_mounts: captured.user_mounts,
             resources,
+            trusted_sources: captured.trusted_sources,
             args: Box::new(args),
         }),
     }
@@ -2044,7 +2058,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(entry.tool().name(), "t");
-                assert_eq!(carried, images);
+                assert_eq!(*carried, images);
             }
             _ => panic!("t is a tool launch verb"),
         }
@@ -2420,15 +2434,19 @@ mod tests {
         assert!(!text.contains("unrecognized subcommand"), "{text}");
     }
 
+    /// ADR-0076 R3: a project `[network]` is adopted, so the load-time refusal
+    /// this row measures is the still-refused `[mount_sets]` table. Either way a
+    /// configuration load error must degrade to a deferred catalog error rather
+    /// than taking `doctor`/`--help` down.
     #[test]
-    fn network_table_rejection_is_a_deferred_catalog_error() {
+    fn project_mount_sets_rejection_is_a_deferred_catalog_error() {
         let mut env = crate::test_env::guard();
         for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
             env.remove_var(name);
         }
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("project.toml");
-        std::fs::write(&project, "[network]\nallow_lan = true").unwrap();
+        std::fs::write(&project, "[mount_sets]\nagent = []\n").unwrap();
         let load =
             || crate::config::load(&crate::config::ConfigPaths::for_test(None, project.clone()));
         assert!(matches!(
@@ -2454,8 +2472,7 @@ mod tests {
             .err()
             .unwrap()
             .to_string();
-        assert!(error.contains("network.allow_lan"));
-        assert!(error.contains("network access cannot be granted by the project config"));
+        assert!(error.contains("mount_sets cannot be declared by the project config"));
     }
 
     #[test]
@@ -2482,7 +2499,7 @@ mod tests {
         else {
             panic!("launch")
         };
-        assert_eq!(user_network, expected);
+        assert_eq!(user_network.as_deref().cloned(), expected);
         assert!(matches!(
             parse_from(["agent-vm", "doctor"], load()).unwrap(),
             Dispatch::Builtin {

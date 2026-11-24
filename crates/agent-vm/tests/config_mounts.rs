@@ -2763,37 +2763,23 @@ fn config_mounts_reach_project_tools_and_shell() {
 /// A project file may not grant mounts, empty or not, and a project file that
 /// tries to grant both network and mounts keeps today's `[network]` refusal.
 #[test]
-fn project_mounts_fail_every_launch() {
+fn project_mounts_bind_every_launch() {
+    // ADR-0076 R3: the verified project config's own `mounts` is adopted, so the
+    // declaration reaches both launch routes.
     let h = Harness::new();
+    seed_set_sources(&h);
+    h.write_project("mounts = [\"~/ro:/project-mount:ro\"]\n");
     for (verb, args) in [("shell", vec![]), ("run", vec!["true"])] {
-        h.write_project("mounts = []\n");
-        let out = h.launch(&[], verb, &args);
-        let stderr = stderr_of(&out);
-        assert!(!out.status.success(), "{verb}: {stderr}");
+        let stderr = stderr_of(&h.launch(&[], verb, &args));
+        // The launch plan is the assertion: this host may have no bootable
+        // sandbox contract, so the config JSON is read before the runtime call.
         assert!(
-            stderr.contains(&format!(
-                "config: \"{}\": mounts cannot be declared by the project config",
-                h.project_config().display()
-            )),
-            "{verb}: {stderr}"
-        );
-        assert!(
-            !stderr.contains("unrecognized subcommand"),
+            bind_mounts(&debug_config_json(&stderr))
+                .iter()
+                .any(|(_, guest, readonly)| guest == "/project-mount" && *readonly),
             "{verb}: {stderr}"
         );
     }
-
-    // `[network]` is checked first, so a file declaring both keeps the network
-    // bytes this release already shipped.
-    h.write_project("mounts = []\n[network]\nallow_host = true\n");
-    let out = h.launch(&[], "shell", &[]);
-    let stderr = stderr_of(&out);
-    assert!(
-        stderr
-            .contains("network.allow_host: network access cannot be granted by the project config"),
-        "{stderr}"
-    );
-    assert!(!stderr.contains("mounts cannot be declared"), "{stderr}");
 }
 
 /// A broken `mounts` config is a deferred catalog error: every launch route and
@@ -3958,14 +3944,6 @@ fn named_mount_sets_cannot_be_declared_or_selected_by_the_project() {
         (
             "[mount_sets]\nagent = [\"~/rw:/rw\"]\n",
             "mount_sets cannot be declared by the project config",
-        ),
-        (
-            "mounts = [\"agent\"]\n",
-            "mounts cannot be declared by the project config",
-        ),
-        (
-            "mounts = []\n",
-            "mounts cannot be declared by the project config",
         ),
     ] {
         h.write_project(body);
