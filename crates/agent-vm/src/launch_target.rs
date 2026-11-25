@@ -486,8 +486,8 @@ mod tests {
         .unwrap();
         std::fs::write(
             &config,
-            "sources = [\"repo ./.agent-vm/config.toml\"]\n\
-             allow_tools = [\"repo:app\", \"repo:helper\"]\n",
+            "allow_tools = [\"repo:app\", \"repo:helper\"]\n\
+             [[sources]]\nname = \"repo\"\npath = \"./.agent-vm/config.toml\"\n",
         )
         .unwrap();
         let report = crate::config::load(&crate::config::ConfigPaths::for_test_captured(

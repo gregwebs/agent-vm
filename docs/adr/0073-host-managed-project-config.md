@@ -3,7 +3,7 @@
 ## Status
 
 Accepted for [#733](https://github.com/gregwebs/agent-vm/issues/733), the first
-of seven stacked children of [#732](https://github.com/gregwebs/agent-vm/issues/732).
+of ten stacked children of [#732](https://github.com/gregwebs/agent-vm/issues/732).
 Amends [ADR-0015](0015-config-driven-tools.md),
 [ADR-0038](0038-config-dir-exposure-guard.md) and
 [ADR-0040](0040-persisted-user-network-authority.md). Breaking release:
@@ -230,9 +230,15 @@ the commands that treat it as fatal do so exactly as before.
   project and cloning a different repository at the same path inherits that
   path's project config (`projects/<id>/config.toml`) — the same accepted
   property as `image-pins.json` and `allowances.json`. Harmless while the tier
-  only declares tools the user wrote. ADR-0074 keeps `:trust` reserved to the
-  user config, so no sourced file inherits authority from *where* it sits; the
-  files an untrusted source contributes are still read unpinned until #736.
+  only declares tools the user wrote. ADR-0074 reserved `:trust` to the user
+  config; [ADR-0076](0076-sources-tables-trust-and-allow.md) (#748) generalises
+  `trust = true` to any path outside the active checkout, and that route is
+  walked and verified before any byte is read — so a source inherits authority
+  from the *user's* registration of it, never from where it happens to sit. The
+  files a `trust = false` source contributes are still read unpinned until #736.
+  (Amended for #748: the project config may now declare its own top-level
+  `mounts` and `[network]` through this ADR's verified read; `[mount_sets]` and
+  `[egress_sets]` stay refused until #738.)
 - **#735/#736/#737/#738/#739** are not implemented here: `allow_tools`,
   pins/`pins.json`, `image set-default` writing project config, inert sets in
   sourced files, mount/egress set changes, and the `agent-vm config`

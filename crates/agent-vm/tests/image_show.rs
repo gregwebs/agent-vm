@@ -33,6 +33,8 @@ mod support;
 const ENV_REF: &str = "127.0.0.1:1/env:dev";
 const USER_REF: &str = "127.0.0.1:1/user:dev";
 const PROJECT_REF: &str = "127.0.0.1:1/project:dev";
+/// A fallback declared by a non-default `allow = true` source (ADR-0076).
+const TEAM_REF: &str = "127.0.0.1:1/team:dev";
 const RETAINED_A: &str =
     "127.0.0.1:1/private-a@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const RECOMMENDATION_B: &str =
@@ -1247,7 +1249,9 @@ fn s3c_user_config_is_the_fallback_when_the_project_sets_no_image() {
     let fixture = Fixture::new();
     fixture.write_user_image(USER_REF);
     // A project config that decides the source list but no image.
-    fixture.write_project_config("sources = [\"home:trust ~/.config/agent-vm/config.toml\"]\n");
+    fixture.write_project_config(
+        "[[sources]]\nname = \"home\"\npath = \"~/.config/agent-vm/config.toml\"\ntrust = true\nallow = true\n",
+    );
     fixture.write_record_ref(RETAINED_A);
     let before = fixture.snapshot();
 
@@ -1262,6 +1266,34 @@ fn s3c_user_config_is_the_fallback_when_the_project_sets_no_image() {
         before,
         "show must create and change nothing"
     );
+    fixture.assert_no_trap_calls();
+}
+
+/// ADR-0076 R5.3: a non-default `allow = true` source supplying the fallback
+/// names its alias, not `user config`, and points at the declaring file.
+#[test]
+fn s3d_an_allowed_source_supplies_the_fallback_and_is_named() {
+    let fixture = Fixture::new();
+    // Outside the active checkout: the fixture root lives under `target/tmp`,
+    // which is inside this repository, and a trusted route may not enter one.
+    let outside = tempfile::tempdir().expect("a tempdir outside the checkout");
+    let team = outside.path().join("agent-vm.toml");
+    fixture.write_file(&team, format!("image = \"{TEAM_REF}\"\n"));
+    fixture.write_project_config(&format!(
+        "[[sources]]\nname = \"team\"\npath = {:?}\ntrust = true\nallow = true\n",
+        team.display().to_string()
+    ));
+    fixture.write_record_ref(RETAINED_A);
+    let before = fixture.snapshot();
+
+    let output = fixture.show();
+
+    assert_success(
+        &output,
+        &expected(TEAM_REF, "source team (allow = true)", Some(&team)),
+    );
+    assert!(!stdout(&output).contains("Source: user config"));
+    assert_eq!(fixture.snapshot(), before);
     fixture.assert_no_trap_calls();
 }
 

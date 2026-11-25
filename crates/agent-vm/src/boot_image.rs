@@ -223,6 +223,13 @@ pub(crate) enum ImageSource {
     /// `image` in the project's host-managed config (ADR-0073):
     /// `$HOME/.config/agent-vm/projects/<project-id>/config.toml`.
     ProjectConfig(PathBuf),
+    /// A non-default `allow = true` source's `image`, selected as the fallback
+    /// because the project config named none (ADR-0076 R4.1). Explicitly
+    /// configured, so it never writes a project default.
+    AllowedSource {
+        alias: crate::config_sources::SourceAlias,
+        file: PathBuf,
+    },
     /// A source's `image`, authorized by the project config as `ALIAS:image`
     /// (ADR-0074). `file` is the declaring (sourced) file.
     SourcedConfig {
@@ -254,6 +261,9 @@ impl ImageSource {
             }
             ImageSource::ProjectConfig(file) => {
                 format!("project config {}", crate::one_line::path(file))
+            }
+            ImageSource::AllowedSource { alias, .. } => {
+                format!("source {alias} (allow = true)")
             }
             ImageSource::SourcedConfig { alias, file } => {
                 format!("{alias}:image in {}", crate::one_line::path(file))
@@ -374,6 +384,7 @@ impl BootImage {
             | ImageSource::Environment
             | ImageSource::UserConfig(_)
             | ImageSource::ProjectConfig(_)
+            | ImageSource::AllowedSource { .. }
             | ImageSource::SourcedConfig { .. }
             | ImageSource::LaunchBuild(_) => DefaultSourceFacts {
                 project: false,
@@ -795,11 +806,21 @@ fn select_with(
             };
             return Ok(selected(image.reference().clone(), source));
         }
-        if let Some(image) = configured.user() {
-            return Ok(selected(
-                image.reference().clone(),
-                ImageSource::UserConfig(image.file().to_path_buf()),
-            ));
+        // ADR-0076 R4.1: the fallback is the first `allow = true` source in
+        // `[[sources]]` order. The default user config keeps its pre-#748
+        // provenance; any other source is an explicit `AllowedSource` tier, which
+        // never writes a project default.
+        if let Some(fallback) = configured.fallback() {
+            let image = fallback.image();
+            let source = if fallback.is_default_user_config() {
+                ImageSource::UserConfig(image.file().to_path_buf())
+            } else {
+                ImageSource::AllowedSource {
+                    alias: fallback.alias().clone(),
+                    file: image.file().to_path_buf(),
+                }
+            };
+            return Ok(selected(image.reference().clone(), source));
         }
     }
     // The default tier's reference must not reach lower-level (dependency)
@@ -892,6 +913,9 @@ fn inspection_provenance(source: &ImageSource) -> Result<(String, Option<&Path>)
         // The reference is the source's; the authorization is the project
         // config's. Naming the alias keeps the two roles distinguishable, because
         // `File:` can only name one of them.
+        ImageSource::AllowedSource { alias, file } => {
+            Ok((format!("source {alias} (allow = true)"), Some(file)))
+        }
         ImageSource::SourcedConfig { alias, file } => {
             Ok((format!("project config ({alias}:image)"), Some(file)))
         }

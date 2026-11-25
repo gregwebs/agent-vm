@@ -461,6 +461,45 @@ impl ResolvedAllowances {
         }
     }
 
+    /// Fold another resolved set of allowances into this one (ADR-0076 R4.3).
+    ///
+    /// Appends `other`'s reference rows, remapping their indices, and re-inserts
+    /// each of its sourced allowances so deduplication and `set:NAME` provenance
+    /// both survive a union. First occurrence keeps its position, so the union's
+    /// order is the adoption order the caller folded in.
+    pub(crate) fn extend_from(&mut self, other: &ResolvedAllowances) {
+        let offset = self.references.len();
+        self.references.extend(other.references.iter().cloned());
+        for entry in &other.entries {
+            self.insertions += 1;
+            let via = entry
+                .via
+                .iter()
+                .map(|index| index + offset)
+                .collect::<Vec<_>>();
+            let allowance = entry.allowance.clone();
+            match self
+                .entries
+                .iter_mut()
+                .find(|existing| existing.allowance == allowance)
+            {
+                Some(existing) => {
+                    existing.direct |= entry.direct;
+                    for index in via {
+                        if !existing.via.contains(&index) {
+                            existing.via.push(index);
+                        }
+                    }
+                }
+                None => self.entries.push(SourcedAllowance {
+                    allowance,
+                    direct: entry.direct,
+                    via,
+                }),
+            }
+        }
+    }
+
     /// The row already registered for `reference`, if it has one.
     ///
     /// A linear scan over the rows so far, not an index: rows are bounded by the

@@ -229,6 +229,7 @@ pub(crate) fn establishment(boot: &BootImage) -> Result<DefaultAction> {
         | ImageSource::Environment
         | ImageSource::UserConfig(_)
         | ImageSource::ProjectConfig(_)
+        | ImageSource::AllowedSource { .. }
         | ImageSource::SourcedConfig { .. } => return Ok(DefaultAction::None),
     };
     let reference = immutable(boot)?;

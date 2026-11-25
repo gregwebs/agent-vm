@@ -11,7 +11,7 @@
 //! read.
 
 use crate::{
-    config_authority::AuthorizedConfig,
+    config_authority::AdoptedAuthority,
     egress_policy::UserEgress,
     egress_reference::{
         AllowanceEntry, EgressNamespace, EntryError, EntryFailure, ResolvedAllowances,
@@ -42,22 +42,110 @@ pub(crate) struct SavedGroups {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UserNetwork {
     file: PathBuf,
+    /// Every file whose `[network]` contributed, in adoption order (ADR-0076
+    /// R4.3). One entry for a single-file load, so its notices are byte-identical.
+    files: Vec<PathBuf>,
+    /// The file whose `[network]` supplied the `set:NAME` references this launch
+    /// resolves. Only the default user config may declare `[egress_sets]`, so a
+    /// merged table names that file, not the first contributor (ADR-0076 R5.2).
+    reference_file: Option<PathBuf>,
     groups: SavedGroups,
     allowances: ResolvedAllowances,
 }
 
 impl UserNetwork {
+    /// The first contributing file. Production reads [`Self::files`] or
+    /// [`Self::reference_file`]; this stays as the single-file accessor later
+    /// tests compare against.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn file(&self) -> &Path {
         &self.file
     }
+
+    /// Every contributing file, in adoption order.
+    pub(crate) fn files(&self) -> &[PathBuf] {
+        &self.files
+    }
+
+    /// The file whose `[network]` supplied the declared `set:NAME` references, so
+    /// `doctor`'s reference block names the declaring file even after a merge.
+    /// Falls back to the first contributor, which is the single-file case byte
+    /// for byte.
+    pub(crate) fn reference_file(&self) -> &Path {
+        self.reference_file.as_deref().unwrap_or(&self.file)
+    }
+
     pub(crate) fn egress(&self) -> UserEgress<'_> {
         UserEgress {
-            file: self.file(),
+            files: self.files(),
             internet: self.groups.internet,
             lan: self.groups.lan,
             host: self.groups.host,
             allowances: &self.allowances,
         }
+    }
+
+    /// Union adopted `[network]` tables in adoption order (ADR-0076 R4.3):
+    /// `adopted_sources` in `[[sources]]` order, then the project config.
+    ///
+    /// Allowances union in that same order (first occurrence keeps its position,
+    /// `set:NAME` attributions preserved); group booleans OR-union across the
+    /// adopted sources, and any explicit project value overrides them, so the
+    /// project config still outranks what it sourced.
+    pub(crate) fn merge(
+        adopted_sources: Vec<UserNetwork>,
+        project: Option<UserNetwork>,
+    ) -> Option<UserNetwork> {
+        if adopted_sources.is_empty() && project.is_none() {
+            return None;
+        }
+        let mut files = Vec::new();
+        for network in adopted_sources.iter().chain(project.iter()) {
+            for file in network.files() {
+                if !files.contains(file) {
+                    files.push(file.clone());
+                }
+            }
+        }
+        let mut allowances = ResolvedAllowances::default();
+        for network in adopted_sources.iter().chain(project.iter()) {
+            allowances.extend_from(&network.allowances);
+        }
+        let group = |pick: fn(&SavedGroups) -> Option<bool>| {
+            let mut from_sources: Option<bool> = None;
+            for network in &adopted_sources {
+                if let Some(value) = pick(&network.groups) {
+                    from_sources = match from_sources {
+                        Some(true) => Some(true),
+                        _ => Some(value),
+                    };
+                }
+            }
+            project
+                .as_ref()
+                .and_then(|project| pick(&project.groups))
+                .or(from_sources)
+        };
+        let file = files
+            .first()
+            .cloned()
+            .expect("a merged network has at least one file");
+        let reference_file = adopted_sources
+            .iter()
+            .chain(project.iter())
+            .find(|network| network.allowances.expansions().next().is_some())
+            .map(|network| network.file.clone());
+        Some(UserNetwork {
+            file,
+            files,
+            reference_file,
+            groups: SavedGroups {
+                internet: group(|groups| groups.internet),
+                lan: group(|groups| groups.lan),
+                host: group(|groups| groups.host),
+            },
+            allowances,
+        })
     }
     /// Every allowance this table grants, with its reference attributions.
     /// Read by `doctor` for the persisted-reference block.
@@ -93,8 +181,11 @@ impl UserNetwork {
             .iter()
             .map(|text| AllowanceEntry::parse(text).unwrap())
             .collect();
+        let file = file.into();
         Self {
-            file: file.into(),
+            files: vec![file.clone()],
+            file,
+            reference_file: None,
             groups,
             allowances: crate::egress_reference::resolve(entries, user_tools).unwrap(),
         }
@@ -117,6 +208,8 @@ pub(crate) enum SettingPath {
 #[derive(Debug)]
 pub(crate) enum SettingReason {
     NotBool,
+    /// `network` was present but not a table.
+    NotTable,
     NotArray,
     NotString,
     Unknown,
@@ -155,6 +248,7 @@ impl fmt::Display for UserNetworkError {
                 }
                 match reason {
                     SettingReason::NotBool => f.write_str("must be true or false"),
+                    SettingReason::NotTable => f.write_str("must be a table"),
                     SettingReason::NotArray => f.write_str("must be an array of strings"),
                     SettingReason::NotString => f.write_str("must be a string"),
                     SettingReason::Unknown => write!(
@@ -190,12 +284,29 @@ pub(crate) struct ParsedUserNetwork {
 }
 
 impl ParsedUserNetwork {
+    /// Resolve with **no** set namespace: a project config or an `allow = true`
+    /// source may grant literals only until #738 adds `set:` selectors for them
+    /// (ADR-0076 R3), so a reference there is refused for the file rather than
+    /// resolved against another file's names.
+    pub(crate) fn resolve_without_sets(self) -> Result<UserNetwork, UserNetworkError> {
+        Ok(UserNetwork {
+            files: vec![self.file.clone()],
+            file: self.file,
+            reference_file: None,
+            groups: self.groups,
+            allowances: crate::egress_reference::resolve(self.entries, None)
+                .map_err(UserNetworkError::unresolved)?,
+        })
+    }
+
     pub(crate) fn resolve(
         self,
         user_tools: &EgressNamespace,
     ) -> Result<UserNetwork, UserNetworkError> {
         Ok(UserNetwork {
+            files: vec![self.file.clone()],
             file: self.file,
+            reference_file: None,
             groups: self.groups,
             allowances: crate::egress_reference::resolve(self.entries, Some(user_tools))
                 .map_err(UserNetworkError::unresolved)?,
@@ -203,15 +314,23 @@ impl ParsedUserNetwork {
     }
 }
 
-/// Parse a `[network]` table whose file has already been verified.
+/// Parse a `[network]` value whose file's top-level authority was established
+/// (ADR-0076 R4.3): the project config or an `allow = true` source.
 ///
-/// The token is the point: ADR-0040's checks and this parse cannot be reached
-/// independently, so there is no order in which a table is read unverified.
-pub(crate) fn from_verified_table(
-    authorized: &AuthorizedConfig<'_>,
-    table: &toml::Table,
+/// The [`AdoptedAuthority`] token replaces the [`AuthorizedConfig`] one because a
+/// verified *read* is not the only way to adopt now — approved source content
+/// (#736) is the other — while both demand that some authority was measured.
+/// Value-safe on shape: a non-table `network = 42` is refused by presence, never
+/// echoed.
+pub(crate) fn from_authorized_value(
+    authority: &AdoptedAuthority<'_>,
+    value: &toml::Value,
 ) -> Result<ParsedUserNetwork, UserNetworkError> {
-    parse_table(authorized.file(), table)
+    let table = value.as_table().ok_or(UserNetworkError::Setting {
+        setting: SettingPath::Table,
+        reason: SettingReason::NotTable,
+    })?;
+    parse_table(authority.file(), table)
 }
 
 fn parse_bool(setting: &'static str, value: &toml::Value) -> Result<bool, UserNetworkError> {
@@ -366,7 +485,6 @@ allow_egress = ["10.0.0.5", "10.0.0.5/32", "API.example.com.", "api.example.com"
         assert_eq!(empty.groups, SavedGroups::default());
         assert!(empty.allowances().allowances().next().is_none());
         let view = parsed.egress();
-        assert_eq!(view.file, parsed.file());
         assert_eq!(
             (view.internet, view.lan, view.host),
             (Some(false), Some(true), Some(true))

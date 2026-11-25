@@ -288,6 +288,392 @@ pub(crate) fn check_user_symlink_target(
     )
 }
 
+/// The checkout-controlled boundary a non-default `trust = true` route may never
+/// enter (ADR-0076 R2.2).
+///
+/// Unions the captured canonical working directory (`project_root`) with EVERY
+/// enclosing Git worktree above it, all the way up to `/` (every ancestor
+/// directory containing a `.git` marker), with no `$HOME/.git` exclusion: a nearer
+/// `.git` can never shrink the boundary, and a file inside a dotfile worktree is
+/// repository-controlled and therefore not eligible for a non-default `trust =
+/// true` source. The isolated `~/.config/agent-vm/config.toml` branch keeps its
+/// own ADR-0074/ADR-0040 compatibility.
+///
+/// Stores BOTH canonical paths and `(dev, ino)` descriptor identities so an
+/// alternate spelling (case variant on a case-insensitive filesystem, an
+/// uncollapsed or symlinked spelling) cannot step into a boundary directory
+/// without matching an identity.
+pub(crate) struct CheckoutBoundary {
+    boundary_ids: std::collections::BTreeSet<(u64, u64)>,
+    boundary_roots: Vec<PathBuf>,
+}
+
+impl CheckoutBoundary {
+    /// Measure the boundary from the captured canonical project root.
+    ///
+    /// Every ancestor is inspected from the filesystem root downwards so a nearer
+    /// `.git` never hides a farther one, and an unstatable ancestor fails closed:
+    /// a boundary that cannot be measured is a boundary that cannot be trusted.
+    fn measure(root: &Path) -> anyhow::Result<Self> {
+        let mut boundary_ids = std::collections::BTreeSet::new();
+        let mut boundary_roots = Vec::new();
+        let fail = |kind: std::io::ErrorKind| {
+            anyhow::anyhow!("config: refusing to measure the active checkout's boundary ({kind:?})")
+        };
+        let mut ancestor = Some(root);
+        while let Some(dir) = ancestor {
+            let is_worktree = std::fs::symlink_metadata(dir.join(".git")).is_ok();
+            if dir == root || is_worktree {
+                let meta = std::fs::metadata(dir).map_err(|error| fail(error.kind()))?;
+                use std::os::unix::fs::MetadataExt as _;
+                boundary_ids.insert((meta.dev(), meta.ino()));
+                boundary_roots.push(dir.to_path_buf());
+            }
+            ancestor = dir.parent();
+        }
+        Ok(Self {
+            boundary_ids,
+            boundary_roots,
+        })
+    }
+
+    /// True when the opened directory (identity) or its cursor path is inside the
+    /// boundary. IDs are checked first because an opened component cannot lie
+    /// about its own descriptor, while a spelling can.
+    fn contains(&self, dir_id: (u64, u64), cursor: &Path) -> bool {
+        self.boundary_ids.contains(&dir_id)
+            || self
+                .boundary_roots
+                .iter()
+                .any(|boundary| cursor.starts_with(boundary))
+    }
+}
+
+/// A non-default `trust = true` source whose whole route was walked and whose
+/// final component was opened with `openat(O_NOFOLLOW)` from the verified parent
+/// descriptor (ADR-0076 R2.2).
+///
+#[derive(Debug)]
+pub(crate) struct OpenedTrustedSource {
+    /// The `fstat` facts of the exact parent directory descriptor the final
+    /// component was opened from.
+    pub(crate) parent_dir: crate::config_authority::DirFacts,
+    pub(crate) final_component: crate::host_paths::FinalComponent,
+    /// `Some` iff the final component opened as a regular file.
+    pub(crate) opened: Option<crate::host_paths::OpenedRegularFile>,
+}
+
+/// One queue entry of the route walk: a normal component, `.`, or `..`.
+#[derive(Clone)]
+enum RouteStep {
+    Name(std::ffi::OsString),
+    Here,
+    Up,
+}
+
+/// ADR-0076 R2.2: validate the **entire traversed route** of a non-default
+/// `trust = true` source and open it no-follow from the validated parent.
+///
+/// The route is walked from `/` with a synchronized directory-descriptor stack:
+/// every component is opened `openat(O_RDONLY | O_DIRECTORY | O_NOFOLLOW)` and
+/// judged from `fstat` on the descriptor that was opened, so verification and the
+/// eventual file open are bound to the same descriptors rather than to a path
+/// that could be swapped in between. `..` pops the stack (descriptor, cursor and
+/// facts together); an absolute symlink target resets it to `/`.
+///
+/// Refuses, before any byte of the file is read: an untrusted or group/world-
+/// writable ancestor, a foreign-owned symlink, a symlink hop budget overrun, any
+/// directory inside the [`CheckoutBoundary`], a missing file, and a final symlink
+/// whose target resolves inside the checkout (that last one is refused with the
+/// inside-checkout wording, not as a generic symlink).
+pub(crate) fn open_trusted_source_route(
+    path: &Path,
+    decl: crate::config_sources::Declaration,
+    route: &RouteAnchor,
+) -> anyhow::Result<OpenedTrustedSource> {
+    open_trusted_source_route_checkpointed(path, decl, route, |_| {})
+}
+
+/// [`open_trusted_source_route`] with a checkpoint after each traversed
+/// directory, so a test can swap a component mid-walk and prove the walk stays
+/// anchored to the descriptors it opened.
+pub(crate) fn open_trusted_source_route_checkpointed(
+    path: &Path,
+    decl: crate::config_sources::Declaration,
+    route: &RouteAnchor,
+    mut after_step: impl FnMut(&Path),
+) -> anyhow::Result<OpenedTrustedSource> {
+    use crate::host_paths::{OpenedDirFacts, opened_dir_facts};
+    use rustix::fs::{Mode, OFlags};
+
+    let boundary = match route {
+        RouteAnchor::Captured { root, .. } => Some(CheckoutBoundary::measure(root)?),
+        RouteAnchor::Uncaptured => None,
+    };
+    let euid = crate::host_paths::current_euid();
+    let refuse = |what: &str| {
+        anyhow::anyhow!(
+            "config: {}: trusted source ({decl}) refuses {what}; move the file somewhere the host \
+             user controls exclusively, outside the active project, or drop trust = true so the \
+             source is pinned instead",
+            crate::one_line::quoted_path(path),
+        )
+    };
+    let not_found = || {
+        anyhow::anyhow!(
+            "config: {}: not found; the project config sources it as {decl}",
+            crate::one_line::quoted_path(path),
+        )
+    };
+
+    struct OpenDir {
+        fd: std::os::fd::OwnedFd,
+        path: PathBuf,
+        facts: OpenedDirFacts,
+    }
+
+    let root_fd = rustix::fs::open(
+        Path::new("/"),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| anyhow::anyhow!(error))
+    .map_err(|error| refuse(&format!("a route it cannot start ({error})")))?;
+    let root_facts = opened_dir_facts(&root_fd, &"the filesystem root")?;
+    let mut stack: Vec<OpenDir> = vec![OpenDir {
+        fd: root_fd,
+        path: PathBuf::from("/"),
+        facts: root_facts,
+    }];
+
+    let mut queue: std::collections::VecDeque<RouteStep> = std::collections::VecDeque::new();
+    let mut hops = 0usize;
+    const MAX_SYMLINK_HOPS: usize = 40;
+
+    // Never echo component bytes: the route checks validate paths, not values.
+    fn push_path_steps(queue: &mut std::collections::VecDeque<RouteStep>, path: &Path) {
+        let mut steps = Vec::new();
+        for component in path.components() {
+            match component {
+                std::path::Component::RootDir | std::path::Component::Prefix(_) => {}
+                std::path::Component::CurDir => steps.push(RouteStep::Here),
+                std::path::Component::ParentDir => steps.push(RouteStep::Up),
+                std::path::Component::Normal(name) => {
+                    steps.push(RouteStep::Name(name.to_os_string()))
+                }
+            }
+        }
+        for step in steps.into_iter().rev() {
+            queue.push_front(step);
+        }
+    }
+
+    if !path.is_absolute() {
+        return Err(refuse("a path that is not absolute"));
+    }
+    push_path_steps(&mut queue, path);
+
+    while let Some(step) = queue.pop_front() {
+        let last = queue.is_empty();
+        match step {
+            RouteStep::Here => {
+                if last {
+                    return Err(refuse("a path whose final component is `.`"));
+                }
+            }
+            RouteStep::Up => {
+                let top = stack.last().expect("the descriptor stack starts at `/`");
+                if let Some(boundary) = &boundary
+                    && boundary.contains(top.facts.identity(), &top.path)
+                {
+                    return Err(refuse(
+                        "a path that traverses the active checkout or an enclosing Git worktree",
+                    ));
+                }
+                if stack.len() > 1 {
+                    stack.pop();
+                }
+                if last {
+                    return Err(refuse("a path whose final component is `..`"));
+                }
+            }
+            RouteStep::Name(name) => {
+                let cur = stack.last().expect("the descriptor stack starts at `/`");
+                let opened = rustix::fs::openat(
+                    &cur.fd,
+                    &name,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                );
+                let child_fd = if last {
+                    // The final component: open it as a file, never as a
+                    // directory, and classify a symlink instead of following it.
+                    match rustix::fs::openat(
+                        &cur.fd,
+                        &name,
+                        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    ) {
+                        Ok(fd) => {
+                            let parent_dir = crate::config_authority::DirFacts {
+                                is_dir: true,
+                                uid: cur.facts.uid,
+                                mode: cur.facts.mode,
+                            };
+                            let opened =
+                                crate::host_paths::opened_regular_from_descriptor(fd, path)?;
+                            return Ok(OpenedTrustedSource {
+                                parent_dir,
+                                final_component: crate::host_paths::FinalComponent::Regular(
+                                    opened.facts(),
+                                ),
+                                opened: Some(opened),
+                            });
+                        }
+                        Err(rustix::io::Errno::NOENT) => return Err(not_found()),
+                        Err(rustix::io::Errno::LOOP) | Err(rustix::io::Errno::NOTDIR) => {
+                            let parent_dir = crate::config_authority::DirFacts {
+                                is_dir: true,
+                                uid: cur.facts.uid,
+                                mode: cur.facts.mode,
+                            };
+                            check_trusted_symlink_target_against_boundary(path, boundary.as_ref())?;
+                            return Ok(OpenedTrustedSource {
+                                parent_dir,
+                                final_component: crate::host_paths::FinalComponent::Symlink,
+                                opened: None,
+                            });
+                        }
+                        Err(error) => {
+                            return Err(anyhow::anyhow!(
+                                "config: {}: trusted source ({decl}) could not be opened ({error})",
+                                crate::one_line::quoted_path(path),
+                            ));
+                        }
+                    }
+                } else {
+                    opened
+                };
+                match child_fd {
+                    Ok(child_fd) => {
+                        let child_facts = opened_dir_facts(&child_fd, &"a traversed directory")?;
+                        // A root-owned sticky parent lets a non-owner unlink or
+                        // rename a child it does not own, so the child must be ours.
+                        if cur.facts.uid == 0
+                            && cur.facts.mode & 0o1000 != 0
+                            && child_facts.uid != euid
+                        {
+                            return Err(refuse("a directory another user controls"));
+                        }
+                        let controlled = (child_facts.uid == euid && child_facts.mode & 0o022 == 0)
+                            || (child_facts.uid == 0
+                                && (child_facts.mode & 0o022 == 0
+                                    || child_facts.mode & 0o1000 != 0));
+                        if !controlled {
+                            return Err(refuse(
+                                "a path with an untrusted or writable ancestor directory",
+                            ));
+                        }
+                        let child_path = cur.path.join(&name);
+                        if let Some(boundary) = &boundary
+                            && boundary.contains(child_facts.identity(), &child_path)
+                        {
+                            return Err(refuse(
+                                "a path inside the active checkout or an enclosing Git worktree",
+                            ));
+                        }
+                        let step_path = child_path.clone();
+                        stack.push(OpenDir {
+                            fd: child_fd,
+                            path: child_path,
+                            facts: child_facts,
+                        });
+                        after_step(&step_path);
+                    }
+                    Err(rustix::io::Errno::LOOP) | Err(rustix::io::Errno::NOTDIR) => {
+                        let stat = rustix::fs::statat(
+                            &cur.fd,
+                            &name,
+                            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+                        )
+                        .map_err(|error| anyhow::anyhow!(error))?;
+                        if rustix::fs::FileType::from_raw_mode(stat.st_mode)
+                            != rustix::fs::FileType::Symlink
+                        {
+                            return Err(refuse("a path component that is not a directory"));
+                        }
+                        // A writable parent lets anyone replace the link itself.
+                        if cur.facts.mode & 0o022 != 0 {
+                            return Err(refuse("a symbolic link inside a writable directory"));
+                        }
+                        if stat.st_uid != 0 && stat.st_uid != euid {
+                            return Err(refuse("a symbolic link owned by another user"));
+                        }
+                        hops += 1;
+                        if hops > MAX_SYMLINK_HOPS {
+                            return Err(refuse("a route with too many symbolic links"));
+                        }
+                        let target = rustix::fs::readlinkat(&cur.fd, &name, Vec::new())
+                            .map_err(|error| anyhow::anyhow!(error))?;
+                        let target = PathBuf::from(
+                            <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(
+                                target.as_bytes(),
+                            ),
+                        );
+                        if target.is_absolute() {
+                            stack.truncate(1);
+                        }
+                        push_path_steps(&mut queue, &target);
+                    }
+                    Err(rustix::io::Errno::NOENT) => return Err(not_found()),
+                    Err(error) => {
+                        return Err(anyhow::anyhow!(
+                            "config: {}: trusted source ({decl}) has a route this refuses ({error})",
+                            crate::one_line::quoted_path(path),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Err(refuse("a path with no final component"))
+}
+
+/// ADR-0076 R2.2: a final symlink is refused first when its **target** resolves
+/// inside the checkout, so the diagnostic names the route rather than the link.
+///
+/// Canonicalizing here can only choose the wording: the caller keeps
+/// `opened = None`, so `verify_trusted_source_at` still refuses the symlink and no
+/// byte of the target is ever read. A dangling or looping link fails closed.
+fn check_trusted_symlink_target_against_boundary(
+    path: &Path,
+    boundary: Option<&CheckoutBoundary>,
+) -> anyhow::Result<()> {
+    let Some(boundary) = boundary else {
+        return Ok(());
+    };
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        anyhow::anyhow!(
+            "config: {}: resolving a trusted source symbolic link failed ({:?})",
+            crate::one_line::quoted_path(path),
+            error.kind(),
+        )
+    })?;
+    if boundary
+        .boundary_roots
+        .iter()
+        .any(|root| canonical.starts_with(root))
+    {
+        anyhow::bail!(
+            "config: {}: the trusted source refuses a symbolic link whose target resolves inside \
+             the active project: the working directory is an ancestor of it; move the file outside \
+             the active project or set trust = false so the source is pinned instead",
+            crate::one_line::quoted_path(path),
+        );
+    }
+    Ok(())
+}
+
 /// What `doctor` found at the legacy in-repo location.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum LegacyProjectConfig {
@@ -642,6 +1028,270 @@ mod tests {
             legacy(&project, &[]),
             LegacyProjectConfig::Present(legacy_path.clone()),
             "an implicit source may not hide the notice"
+        );
+    }
+
+    // ---- ADR-0076 R2.2: the whole-route trusted-source walk ----
+
+    use crate::config_sources::Declaration;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    /// A captured route whose checkout is `base/project`.
+    fn route_at(base: &Path) -> RouteAnchor {
+        RouteAnchor::Captured {
+            home: base.join("home"),
+            root: base.join("project"),
+        }
+    }
+
+    fn owner_only_file(path: &Path) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::write(path, b"[[tools]]\nname = \"x\"\ncommand = \"true\"\n").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    fn walk(path: &Path, base: &Path) -> anyhow::Result<OpenedTrustedSource> {
+        open_trusted_source_route(path, Declaration::Entry(0), &route_at(base))
+    }
+
+    #[test]
+    fn an_owner_only_file_outside_the_checkout_opens() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        std::fs::create_dir(base.join("project")).unwrap();
+        std::fs::create_dir(base.join("home")).unwrap();
+        let file = base.join("team/agent-vm.toml");
+        owner_only_file(&file);
+        let opened = walk(&file, &base).expect("a safe route loads");
+        assert!(opened.opened.is_some(), "the regular file is open");
+        assert!(matches!(
+            opened.final_component,
+            crate::host_paths::FinalComponent::Regular(_)
+        ));
+        assert!(opened.parent_dir.is_dir);
+        assert_eq!(opened.parent_dir.uid, crate::host_paths::current_euid());
+    }
+
+    #[test]
+    fn a_file_inside_the_checkout_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        std::fs::create_dir(base.join("home")).unwrap();
+        let file = base.join("project/conf/agent-vm.toml");
+        owner_only_file(&file);
+        let error = walk(&file, &base).expect_err("an in-checkout route is refused");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("inside the active checkout"),
+            "the refusal must name the route: {message}"
+        );
+        assert!(message.contains("sources[0]"), "{message}");
+        assert!(
+            message.contains(&format!("\"{}\"", file.display())),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_parent_component_that_reenters_the_checkout_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        std::fs::create_dir(base.join("home")).unwrap();
+        let file = base.join("project/sub/../conf/agent-vm.toml");
+        owner_only_file(&base.join("project/conf/agent-vm.toml"));
+        std::fs::create_dir(base.join("project/sub")).unwrap();
+        let error = walk(&file, &base).expect_err("`..` from inside the checkout is refused");
+        assert!(
+            format!("{error:#}").contains("active checkout"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_symlinked_ancestor_pointing_into_the_checkout_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        std::fs::create_dir(base.join("home")).unwrap();
+        owner_only_file(&base.join("project/conf/agent-vm.toml"));
+        std::fs::create_dir(base.join("outside")).unwrap();
+        symlink(base.join("project"), base.join("outside/link")).unwrap();
+        let error = walk(&base.join("outside/link/conf/agent-vm.toml"), &base)
+            .expect_err("a checkout symlink is refused");
+        assert!(
+            format!("{error:#}").contains("inside the active checkout"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_group_writable_ancestor_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        std::fs::create_dir(base.join("home")).unwrap();
+        std::fs::create_dir(base.join("project")).unwrap();
+        let writable = base.join("shared");
+        owner_only_file(&writable.join("inner/agent-vm.toml"));
+        std::fs::set_permissions(&writable, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let error = walk(&writable.join("inner/agent-vm.toml"), &base)
+            .expect_err("a replaceable ancestor is refused");
+        assert!(
+            format!("{error:#}").contains("untrusted or writable ancestor"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_missing_file_names_the_declaration() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        std::fs::create_dir(base.join("home")).unwrap();
+        std::fs::create_dir(base.join("project")).unwrap();
+        std::fs::create_dir(base.join("team")).unwrap();
+        let error = walk(&base.join("team/absent.toml"), &base).expect_err("missing is an error");
+        let message = format!("{error:#}");
+        assert!(message.contains("not found"), "{message}");
+        assert!(message.contains("sources[0]"), "{message}");
+    }
+
+    #[test]
+    fn a_final_symlink_reports_the_route_its_target_takes() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        std::fs::create_dir(base.join("home")).unwrap();
+        std::fs::create_dir(base.join("project")).unwrap();
+        let safe = base.join("team/real.toml");
+        owner_only_file(&safe);
+        symlink(&safe, base.join("team/link.toml")).unwrap();
+        let opened = walk(&base.join("team/link.toml"), &base).expect("classified, not followed");
+        assert!(opened.opened.is_none(), "a final symlink is never opened");
+        assert_eq!(
+            opened.final_component,
+            crate::host_paths::FinalComponent::Symlink
+        );
+
+        let inside = base.join("project/conf.toml");
+        owner_only_file(&inside);
+        symlink(&inside, base.join("team/into-checkout.toml")).unwrap();
+        let error = walk(&base.join("team/into-checkout.toml"), &base)
+            .expect_err("a target inside the checkout is refused");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("symbolic link whose target resolves inside"),
+            "the route wording, not the generic symlink refusal: {message}"
+        );
+    }
+
+    #[test]
+    fn a_home_worktree_file_is_not_trusted_eligible() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        let home = base.join("home");
+        std::fs::create_dir_all(home.join(".git")).unwrap();
+        std::fs::create_dir_all(home.join("work/app")).unwrap();
+        let file = home.join("team/agent-vm.toml");
+        owner_only_file(&file);
+        let route = RouteAnchor::Captured {
+            home: home.clone(),
+            root: home.join("work/app"),
+        };
+        let error = open_trusted_source_route(&file, Declaration::Entry(0), &route)
+            .expect_err("a dotfiles worktree is repository-controlled");
+        assert!(
+            format!("{error:#}").contains("inside the active checkout"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_nearer_git_directory_never_shrinks_the_boundary() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        std::fs::create_dir(base.join("home")).unwrap();
+        std::fs::create_dir_all(base.join("outer/.git")).unwrap();
+        std::fs::create_dir_all(base.join("outer/nested/.git")).unwrap();
+        let sub = base.join("outer/nested/sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let route = RouteAnchor::Captured {
+            home: base.join("home"),
+            root: sub.clone(),
+        };
+        for file in [
+            base.join("outer/shared.toml"),
+            base.join("outer/nested/conf.toml"),
+            base.join("outer/nested/sub/conf.toml"),
+        ] {
+            owner_only_file(&file);
+            let error = open_trusted_source_route(&file, Declaration::Entry(0), &route)
+                .expect_err("every enclosing worktree is inside the boundary");
+            assert!(
+                format!("{error:#}").contains("inside the active checkout"),
+                "{}: {error:#}",
+                file.display()
+            );
+        }
+    }
+
+    #[test]
+    fn an_alternate_spelling_of_a_boundary_directory_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        std::fs::create_dir(base.join("home")).unwrap();
+        let inside = base.join("project/conf");
+        owner_only_file(&inside.join("agent-vm.toml"));
+        symlink(&inside, base.join("alias")).unwrap();
+        let error = walk(&base.join("alias/agent-vm.toml"), &base)
+            .expect_err("the opened descriptor identity is what decides");
+        assert!(
+            format!("{error:#}").contains("inside the active checkout"),
+            "{error:#}"
+        );
+        // An uncollapsed spelling of the same file is the same route.
+        let uncollapsed = base.join("project/conf/./agent-vm.toml");
+        assert!(walk(&uncollapsed, &base).is_err());
+    }
+
+    /// The descriptor the walk verified is the descriptor it opened: swapping the
+    /// directory at a checkpoint cannot redirect the open.
+    #[test]
+    fn the_verified_directory_descriptor_is_the_one_opened() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        std::fs::create_dir(base.join("home")).unwrap();
+        std::fs::create_dir(base.join("project")).unwrap();
+        let team = base.join("team");
+        owner_only_file(&team.join("agent-vm.toml"));
+        let target = base.join("team/agent-vm.toml");
+        let mut swaps_left = 1;
+        let opened = open_trusted_source_route_checkpointed(
+            &target,
+            Declaration::Entry(0),
+            &route_at(&base),
+            |step| {
+                if step == team && swaps_left == 1 {
+                    swaps_left = 0;
+                    // Same spelling, a different directory: the pinned descriptor
+                    // still names the original.
+                    let moved = base.join("team-moved");
+                    std::fs::rename(&team, &moved).unwrap();
+                    std::fs::create_dir(&team).unwrap();
+                    std::fs::set_permissions(&team, std::fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                    owner_only_file(&team.join("agent-vm.toml"));
+                }
+            },
+        )
+        .expect("the walk stays anchored to its descriptors");
+        let swapped = std::fs::metadata(team.join("agent-vm.toml")).unwrap();
+        let pinned = std::fs::metadata(base.join("team-moved/agent-vm.toml")).unwrap();
+        assert_ne!((swapped.dev(), swapped.ino()), (pinned.dev(), pinned.ino()));
+        let opened = opened.opened.expect("a regular file was opened");
+        assert_eq!(
+            (opened.facts().dev, opened.facts().ino),
+            (pinned.dev(), pinned.ino()),
+            "the bytes read are the ones the verified descriptor names"
         );
     }
 }

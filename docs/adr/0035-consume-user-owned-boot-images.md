@@ -15,7 +15,12 @@ approved child content. That approval is per **project** since #532
 ([ADR-0063](0063-project-scoped-oci-image-approval.md)).
 Amended by [ADR-0074](0074-flat-config-sources.md): the project config `image`
 (its own reference, or an `ALIAS:image` source selection) is preferred over the
-`:trust` user config `image`.
+`:trust` user config `image`. Amended by
+[ADR-0076](0076-sources-tables-trust-and-allow.md) (#748): that fallback is now
+the first `allow = true` source in `[[sources]]` order that declares an `image`,
+which is the implicit `home` source (the user config) only when the project
+config declares no earlier allowed source with one. A non-default fallback is
+provenance `source <alias> (allow = true)`.
 Supersedes [ADR-0003](0003-project-tooling-layers.md),
 [ADR-0019](0019-tool-free-base-and-per-tool-layers.md) and
 [ADR-0028](0028-explicit-image-flag-beats-the-other-environment-variable.md).

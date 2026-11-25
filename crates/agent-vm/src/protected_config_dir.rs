@@ -178,6 +178,10 @@ pub(crate) enum StorePurpose {
     /// `MSB_HOME`: the runtime's own writable state, where every sandbox's
     /// `network.log` is written (ADR-0064, R1).
     RuntimeState,
+    /// One non-default `trust = true` config source file and every directory
+    /// along its route (ADR-0076 R2.4): the guest must not be able to rewrite a
+    /// file a later launch reads as host authority.
+    TrustedSource,
 }
 
 impl StorePurpose {
@@ -191,6 +195,7 @@ impl StorePurpose {
                 "where agent-vm keeps this project's refusal records and control sockets"
             }
             Self::RuntimeState => "where the sandbox runtime writes its own state",
+            Self::TrustedSource => "where a trusted config source is read",
         }
     }
     /// What a guest could plant at a store path that does not exist yet, for the
@@ -200,6 +205,7 @@ impl StorePurpose {
             Self::LaunchAuthority => "authority",
             Self::ProjectSessions => "a refusal record",
             Self::RuntimeState => "runtime state",
+            Self::TrustedSource => "a trusted config source",
         }
     }
     /// What a guest that can write the store could do, as the reason a refusal
@@ -212,6 +218,7 @@ impl StorePurpose {
                 "the guest could forge or erase every sandbox's refusal log, including this \
                  project's"
             }
+            Self::TrustedSource => "the guest could rewrite that trusted source for a later launch",
         }
     }
 }
@@ -260,6 +267,56 @@ struct MeasuredDir {
     prospective_ids: Vec<(u64, u64)>,
     prospective_anchors: Vec<Vec<Vec<u8>>>,
     prospective_suffixes: Vec<Vec<Vec<u8>>>,
+}
+
+impl MeasuredDir {
+    /// A measurement with no routes yet, and no authority file to check. The
+    /// routes are [`apply_resolution`]'s, so every caller that resolves a route
+    /// records the same ancestry.
+    fn empty(spelled: PathBuf, home: Option<PathBuf>, purpose: StorePurpose) -> Self {
+        Self {
+            spelled,
+            home,
+            purpose,
+            authority_file_links: Vec::new(),
+            ids: Vec::new(),
+            paths: Vec::new(),
+            prospective_ids: Vec::new(),
+            prospective_anchors: Vec::new(),
+            prospective_suffixes: Vec::new(),
+        }
+    }
+}
+
+/// Everything one [`resolve`] walk recorded, in the three forms a bind is matched
+/// against: each traversed directory's identity and resolved path, the store's own
+/// spelling (which a symlinked route never equals), and each prospective route.
+///
+/// Shared by the authority store, every project store and a trusted source — this
+/// launch's and another project's — because they must agree on ancestry: a route
+/// that follows a symlink records the target, and a measurement that skipped it
+/// would let a writable bind of the target rewrite a file agent-vm trusts.
+fn apply_resolution(dir: &mut MeasuredDir, resolution: &Resolution) {
+    for route in &resolution.routes {
+        dir.ids.push(Some((route.dev, route.ino)));
+        dir.paths.push(route.path.as_os_str().as_bytes().to_vec());
+    }
+    dir.ids.push(None);
+    dir.paths.push(dir.spelled.as_os_str().as_bytes().to_vec());
+    for prospective in &resolution.prospective {
+        dir.prospective_ids
+            .push((prospective.anchor.dev, prospective.anchor.ino));
+        dir.prospective_anchors
+            .push(components(&prospective.anchor.path));
+        dir.prospective_suffixes
+            .push(suffix_components(&prospective.suffix));
+        let mut full = prospective.anchor.path.clone();
+        for component in &prospective.suffix {
+            full.push(component);
+        }
+        dir.ids.push(None);
+        dir.paths.push(full.as_os_str().as_bytes().to_vec());
+    }
 }
 
 /// A `.sessions` directory, in the three spellings `R2` needs: the resolved
@@ -458,45 +515,16 @@ fn measure_authority_store(home: &Path) -> Result<MeasuredDir> {
     let spelled = home.join(config::USER_CONFIG_DIR_RELATIVE);
     let resolution = resolve(&spelled, Walk::Authority)?;
     let authority_file_links = authority_file_links(&spelled, |path| fs::symlink_metadata(path))?;
-    let mut ids = Vec::new();
-    let mut paths = Vec::new();
-    for r in &resolution.routes {
-        ids.push(Some((r.dev, r.ino)));
-        paths.push(r.path.as_os_str().as_bytes().to_vec());
-    }
-    ids.push(None);
-    paths.push(spelled.as_os_str().as_bytes().to_vec());
-    let mut prospective_ids = Vec::new();
-    let mut prospective_anchors = Vec::new();
-    let mut prospective_suffixes = Vec::new();
-    for p in resolution.prospective {
-        prospective_ids.push((p.anchor.dev, p.anchor.ino));
-        prospective_anchors.push(components(&p.anchor.path));
-        prospective_suffixes.push(suffix_components(&p.suffix));
-        let mut full = p.anchor.path;
-        for c in p.suffix {
-            full.push(c);
-        }
-        ids.push(None);
-        paths.push(full.as_os_str().as_bytes().to_vec());
-    }
     // A home may itself be missing; its walk still locates prospective authority.
     let resolved_home = resolve(home, Walk::Authority)?;
     let mut home = resolved_home.end.0.path;
     for c in resolved_home.end.1 {
         home.push(c);
     }
-    Ok(MeasuredDir {
-        spelled,
-        home: Some(home),
-        purpose: StorePurpose::LaunchAuthority,
-        authority_file_links,
-        ids,
-        paths,
-        prospective_ids,
-        prospective_anchors,
-        prospective_suffixes,
-    })
+    let mut dir = MeasuredDir::empty(spelled, Some(home), StorePurpose::LaunchAuthority);
+    dir.authority_file_links = authority_file_links;
+    apply_resolution(&mut dir, &resolution);
+    Ok(dir)
 }
 
 /// ADR-0038 Decision 2's one-link check, over every authority file that can
@@ -570,39 +598,146 @@ fn project_store_file_links(entry: &Path) -> Result<Vec<(PathBuf, u64)>> {
 /// authority directory, so every `R1` predicate applies unchanged.
 fn measure_store(spelled: PathBuf, purpose: StorePurpose) -> Result<MeasuredDir> {
     let resolution = resolve(&spelled, Walk::Authority)?;
+    let mut dir = MeasuredDir::empty(spelled, None, purpose);
+    apply_resolution(&mut dir, &resolution);
+    Ok(dir)
+}
+
+/// ADR-0076 R2.4: one non-default `trust = true` source, measured like a store so
+/// an overlapping writable bind is refused.
+///
+/// The parent's route walk records every traversed (and prospective) directory,
+/// and the file's own `(dev, ino)` is appended so a bind naming the file itself
+/// — or a hard link to it — matches too. Its link count joins
+/// [`ProtectedConfigDir::check_authority_links`], so a multi-link trusted source
+/// is refused at mount-planning time as well as at load time.
+fn measure_trusted_source(spelled_file: PathBuf) -> Result<MeasuredDir> {
+    let parent = spelled_file
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{}", uncertain(&spelled_file)))?;
+    let mut dir = measure_store(parent.to_path_buf(), StorePurpose::TrustedSource)?;
+    match fs::symlink_metadata(&spelled_file) {
+        Ok(m) => {
+            dir.ids.push(Some((m.dev(), m.ino())));
+            dir.paths.push(spelled_file.as_os_str().as_bytes().to_vec());
+            dir.authority_file_links
+                .push((spelled_file.clone(), m.nlink()));
+        }
+        // Absent is measured by its parent's walk: a `trust = true` source that
+        // does not exist is a load error in `config::load`, not a mount error.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| uncertain(&spelled_file)),
+    }
+    dir.spelled = spelled_file;
+    Ok(dir)
+}
+
+/// Best-effort measurement of a `trust = true` source **another** project
+/// declared (ADR-0076 R2.4).
+///
+/// The sibling's own read resolves its route through every symlinked ancestor
+/// (`project_config::open_trusted_source_route`), so this measurement must record
+/// what that walk will reach, not what the `[[sources]]` line spells: the parent
+/// goes through the same bounded [`resolve`] as this launch's own trusted
+/// sources, and every directory it traverses — the target of an owner-controlled
+/// symlink included — joins the routes a writable bind is matched against.
+/// Recording only the lexical spelling would leave the target's directories
+/// unmeasured, which is exactly the bind a guest needs in order to rewrite the
+/// file that project's next launch reads as host authority.
+///
+/// A sibling project's route may be broken or looping, and that must never loop or
+/// block this launch: when the walk refuses, the lexical prefix it could stat is
+/// recorded plus a prospective entry at the first component it could not, so a
+/// writable bind overlapping the prefix is still refused while a disjoint launch
+/// proceeds. Launching the broken project itself still fails in its own
+/// `config::load`, naming that project's `config.toml`.
+fn measure_cross_project_trusted_source(spelled_file: PathBuf) -> MeasuredDir {
+    let parent = spelled_file
+        .parent()
+        .unwrap_or(Path::new("/"))
+        .to_path_buf();
+    let mut dir = match resolve(&parent, Walk::Authority) {
+        Ok(resolution) => {
+            let mut dir = MeasuredDir::empty(parent, None, StorePurpose::TrustedSource);
+            apply_resolution(&mut dir, &resolution);
+            dir
+        }
+        Err(_) => lexical_ancestors(&spelled_file),
+    };
+    // The file's own `(dev, ino)`, so a bind naming the file — or a hard link to
+    // it — matches. `symlink_metadata`, exactly as `measure_trusted_source`: a
+    // `trust = true` read never follows a final symlink, so the link is what a
+    // bind of this spelling would reach.
+    if let Ok(metadata) = fs::symlink_metadata(&spelled_file) {
+        dir.ids.push(Some((metadata.dev(), metadata.ino())));
+        dir.paths.push(spelled_file.as_os_str().as_bytes().to_vec());
+    }
+    dir.spelled = spelled_file;
+    dir
+}
+
+/// The lexical fallback for a sibling route [`resolve`] refuses: whatever
+/// ancestors exist, stat'd by spelling, then one prospective route from the
+/// deepest existing ancestor.
+///
+/// Never an error. An unrelated project's broken, looping or unreadable route is
+/// its own load's refusal; this launch only has to stay out of the way while
+/// still refusing a writable bind of the prefix it could see.
+fn lexical_ancestors(spelled_file: &Path) -> MeasuredDir {
     let mut ids = Vec::new();
     let mut paths = Vec::new();
-    for r in &resolution.routes {
-        ids.push(Some((r.dev, r.ino)));
-        paths.push(r.path.as_os_str().as_bytes().to_vec());
-    }
-    ids.push(None);
-    paths.push(spelled.as_os_str().as_bytes().to_vec());
     let mut prospective_ids = Vec::new();
     let mut prospective_anchors = Vec::new();
     let mut prospective_suffixes = Vec::new();
-    for p in resolution.prospective {
-        prospective_ids.push((p.anchor.dev, p.anchor.ino));
-        prospective_anchors.push(components(&p.anchor.path));
-        prospective_suffixes.push(suffix_components(&p.suffix));
-        let mut full = p.anchor.path;
-        for c in p.suffix {
-            full.push(c);
+
+    let names: Vec<OsString> = spelled_file
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name.to_os_string()),
+            _ => None,
+        })
+        .collect();
+    let mut cursor = PathBuf::from("/");
+    if let Ok(m) = fs::symlink_metadata(&cursor) {
+        ids.push(Some((m.dev(), m.ino())));
+        paths.push(cursor.as_os_str().as_bytes().to_vec());
+    }
+    let mut failed_at = None;
+    for (index, name) in names.iter().enumerate() {
+        cursor.push(name);
+        match fs::symlink_metadata(&cursor) {
+            Ok(m) => {
+                ids.push(Some((m.dev(), m.ino())));
+                paths.push(cursor.as_os_str().as_bytes().to_vec());
+            }
+            Err(_) => {
+                failed_at = Some(index);
+                break;
+            }
+        }
+    }
+    if let Some(index) = failed_at {
+        let anchor = cursor.parent().unwrap_or(Path::new("/")).to_path_buf();
+        if let Some(m) = fs::symlink_metadata(&anchor).ok().filter(|m| m.is_dir()) {
+            prospective_ids.push((m.dev(), m.ino()));
+            prospective_anchors.push(components(&anchor));
+            prospective_suffixes.push(suffix_components(&names[index..]));
         }
         ids.push(None);
-        paths.push(full.as_os_str().as_bytes().to_vec());
+        paths.push(spelled_file.as_os_str().as_bytes().to_vec());
     }
-    Ok(MeasuredDir {
-        spelled,
+
+    MeasuredDir {
+        spelled: spelled_file.to_path_buf(),
         home: None,
-        purpose,
+        purpose: StorePurpose::TrustedSource,
         authority_file_links: Vec::new(),
         ids,
         paths,
         prospective_ids,
         prospective_anchors,
         prospective_suffixes,
-    })
+    }
 }
 
 /// A fail-closed bound on the entries of one `projects/` directory.
@@ -703,19 +838,89 @@ fn measure_project_stores(home: &Path) -> Result<Vec<MeasuredDir>> {
         dir.authority_file_links = project_store_file_links(&dir.spelled)?;
         dirs.push(dir);
     }
+    if !dirs.is_empty() {
+        dirs.extend(measure_project_trusted_sources(&projects)?);
+    }
     Ok(dirs)
+}
+
+/// A fail-closed bound on the distinct `trust = true` sources every other project
+/// may declare. A host with more is a host this guard will not vouch for.
+const MAX_TRUSTED_SOURCES: usize = 256;
+
+/// Every `trust = true` host-anchored source declared by **any** project under
+/// `projects/` (ADR-0076 R2.4), so project P1's guest cannot rewrite the trusted
+/// source P2 will read on its next launch.
+///
+/// Paths are extracted syntactically from each `projects/<id>/config.toml`
+/// (`config_sources::extract_trusted_non_relative_paths`), so a sibling's broken
+/// syntax extracts nothing and a sibling's broken route never loops or blocks this
+/// launch: [`measure_cross_project_trusted_source`] is bounded and best-effort.
+fn measure_project_trusted_sources(projects: &Path) -> Result<Vec<MeasuredDir>> {
+    let Ok(entries) = fs::read_dir(projects) else {
+        return Ok(Vec::new());
+    };
+    let mut sorted: Vec<_> = entries
+        .filter_map(|entry| entry.ok())
+        .take(MAX_PROJECT_STORES)
+        .collect();
+    sorted.sort_by_key(|entry| entry.file_name());
+    let mut seen = std::collections::BTreeSet::new();
+    let mut measured = Vec::new();
+    for entry in sorted {
+        let config = entry.path().join(crate::project_config::CONFIG_FILE);
+        let Ok((bytes, _)) = crate::host_paths::read_bounded_regular_file_no_follow(
+            &config,
+            crate::config::MAX_CONFIG_FILE_BYTES,
+        ) else {
+            // An absent, symlinked or unreadable sibling `config.toml` is already
+            // measured as a store, and its own load reports the problem.
+            continue;
+        };
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        // `projects` is `<home>/.config/agent-vm/projects`.
+        let home = projects
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .unwrap_or(Path::new("/"));
+        for path in crate::config_sources::extract_trusted_non_relative_paths(text, home) {
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            if seen.len() > MAX_TRUSTED_SOURCES {
+                bail!(
+                    "{}: more than {MAX_TRUSTED_SOURCES} distinct trust = true config sources, and a \
+                     launch measures every one; remove the trust = true declarations agent-vm does \
+                     not use under {}",
+                    uncertain(projects),
+                    crate::one_line::quoted_path(projects),
+                );
+            }
+            measured.push(measure_cross_project_trusted_source(path));
+        }
+    }
+    Ok(measured)
 }
 
 impl ProtectedConfigDir {
     /// Measure the authority stores (one per `$HOME`), the project stores under
-    /// each of them (ADR-0073), and the extra host-only stores this launcher
-    /// writes refusal artefacts into (ADR-0064).
+    /// each of them (ADR-0073), every `trust = true` source this launch reads
+    /// (ADR-0076 R2.4), and the extra host-only stores this launcher writes
+    /// refusal artefacts into (ADR-0064).
     ///
     /// Two passes over `homes` on purpose: every home's top-level
     /// `~/.config/agent-vm` is measured before *any* project store, so a
     /// project-store route in a raw `$HOME` cannot outrank the account home's
     /// authority store in [`Self::decide`]'s first-match scan.
-    pub(crate) fn measure(homes: &[PathBuf], stores: &[Store], cwd: &Path) -> Result<Self> {
+    pub(crate) fn measure(
+        homes: &[PathBuf],
+        stores: &[Store],
+        trusted_sources: &[PathBuf],
+        cwd: &Path,
+    ) -> Result<Self> {
         let mut dirs = MeasuredDirs::default();
         let mut unique_homes: Vec<PathBuf> = Vec::new();
         for home in homes {
@@ -729,6 +934,20 @@ impl ProtectedConfigDir {
             for project_store in measure_project_stores(home)? {
                 dirs.push(project_store);
             }
+        }
+        // A source inside `~/.config/agent-vm` is already covered by that store's
+        // own measurement, and measuring it twice would only change which
+        // refusal answers first.
+        let covered: Vec<PathBuf> = unique_homes
+            .iter()
+            .map(|home| home.join(crate::config::USER_CONFIG_DIR_RELATIVE))
+            .collect();
+        for source in trusted_sources {
+            let spelled = anchored(cwd, source);
+            if covered.iter().any(|dir| spelled.starts_with(dir)) {
+                continue;
+            }
+            dirs.push(measure_trusted_source(spelled)?);
         }
         let mut sessions: Vec<SessionsDir> = Vec::new();
         for store in stores {
@@ -1238,6 +1457,7 @@ mod tests {
         home: PathBuf,
         cwd: PathBuf,
         state: PathBuf,
+        trusted_sources: Vec<PathBuf>,
     }
     impl Tree {
         fn new() -> Self {
@@ -1254,10 +1474,11 @@ mod tests {
                 home,
                 cwd,
                 state,
+                trusted_sources: Vec::new(),
             }
         }
         fn guard(&self) -> ProtectedConfigDir {
-            ProtectedConfigDir::measure(std::slice::from_ref(&self.home), &[], &self.cwd).unwrap()
+            self.guard_with(&[])
         }
         fn check(&self, path: &Path) -> Result<()> {
             self.guard()
@@ -1347,7 +1568,7 @@ mod tests {
         fs::write(&file, "").unwrap();
         let entry = projects.join("e".repeat(64));
         symlink(&file, &entry).unwrap();
-        let error = ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &t.cwd)
+        let error = ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &[], &t.cwd)
             .expect_err("a store entry that cannot be measured refuses the launch");
         let message = format!("{error:#}");
         assert!(
@@ -1371,7 +1592,7 @@ mod tests {
         for n in 0..=MAX_PROJECT_STORES {
             fs::create_dir(projects.join(format!("{n:064x}"))).unwrap();
         }
-        let error = ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &t.cwd)
+        let error = ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &[], &t.cwd)
             .expect_err("an unbounded project store refuses the launch");
         let message = format!("{error:#}");
         assert!(
@@ -1390,7 +1611,7 @@ mod tests {
         let cfg = t.home.join(".config/agent-vm");
         fs::create_dir_all(cfg.join("projects").join("a".repeat(64))).unwrap();
         let guard =
-            ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &t.cwd).unwrap();
+            ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &[], &t.cwd).unwrap();
         assert!(
             guard
                 .check_core_bind(&CoreHostSource::new(
@@ -1416,7 +1637,7 @@ mod tests {
         // authority directory, so both stores match a bind of it.
         symlink(&cfg, raw_projects.join("a".repeat(64))).unwrap();
         let guard =
-            ProtectedConfigDir::measure(&[raw.clone(), t.home.clone()], &[], &t.cwd).unwrap();
+            ProtectedConfigDir::measure(&[raw.clone(), t.home.clone()], &[], &[], &t.cwd).unwrap();
         let msg = guard
             .check_core_bind(&CoreHostSource::new(CoreBind::StateDir, cfg.clone()))
             .unwrap_err()
@@ -1467,7 +1688,7 @@ mod tests {
         }
         use std::os::unix::fs::PermissionsExt as _;
         fs::set_permissions(&second, fs::Permissions::from_mode(0o000)).unwrap();
-        let err = ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &t.cwd)
+        let err = ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &[], &t.cwd)
             .unwrap_err()
             .to_string();
         fs::set_permissions(&second, fs::Permissions::from_mode(0o755)).unwrap();
@@ -1485,7 +1706,7 @@ mod tests {
         fs::create_dir_all(&projects).unwrap();
         use std::os::unix::fs::PermissionsExt as _;
         fs::set_permissions(&projects, fs::Permissions::from_mode(0o000)).unwrap();
-        let err = ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &t.cwd)
+        let err = ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &[], &t.cwd)
             .unwrap_err()
             .to_string();
         fs::set_permissions(&projects, fs::Permissions::from_mode(0o755)).unwrap();
@@ -1514,22 +1735,24 @@ mod tests {
         fs::remove_file(t.home.join(".config")).unwrap();
         symlink(".config", t.home.join(".config")).unwrap();
         assert!(
-            ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &t.cwd)
+            ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &[], &t.cwd)
                 .unwrap_err()
                 .to_string()
                 .contains("cannot determine")
         );
         fs::remove_file(t.home.join(".config")).unwrap();
         fs::write(t.home.join(".config"), "file").unwrap();
-        assert!(ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &t.cwd).is_err());
+        assert!(
+            ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &[], &t.cwd).is_err()
+        );
     }
     #[test]
     fn both_homes_and_messages() {
         let t = Tree::new();
         let other = t.cwd.join("other");
         fs::create_dir(&other).unwrap();
-        let guard =
-            ProtectedConfigDir::measure(&[t.home.clone(), other.clone()], &[], &t.cwd).unwrap();
+        let guard = ProtectedConfigDir::measure(&[t.home.clone(), other.clone()], &[], &[], &t.cwd)
+            .unwrap();
         for home in [&t.home, &other] {
             assert!(
                 guard
@@ -1573,7 +1796,8 @@ mod tests {
         let home = t.cwd.join("дом");
         fs::create_dir(&home).unwrap();
         fs::create_dir_all(home.join(".config/agent-vm")).unwrap();
-        let guard = ProtectedConfigDir::measure(std::slice::from_ref(&home), &[], &t.cwd).unwrap();
+        let guard =
+            ProtectedConfigDir::measure(std::slice::from_ref(&home), &[], &[], &t.cwd).unwrap();
         for message in [
             guard
                 .check_core_bind(&CoreHostSource::new(CoreBind::StateDir, home.clone()))
@@ -1698,8 +1922,8 @@ mod tests {
         let cfg = t.home.join(".config");
         fs::create_dir(&cfg).unwrap();
         fs::set_permissions(&cfg, fs::Permissions::from_mode(0o000)).unwrap();
-        let err =
-            ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &t.cwd).unwrap_err();
+        let err = ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &[], &t.cwd)
+            .unwrap_err();
         fs::set_permissions(&cfg, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(err.to_string().contains("cannot determine"));
 
@@ -1710,8 +1934,8 @@ mod tests {
         fs::create_dir_all(&cfg).unwrap();
         fs::write(cfg.join("config.toml"), "# no network\n").unwrap();
         fs::set_permissions(&cfg, fs::Permissions::from_mode(0o000)).unwrap();
-        let err =
-            ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &t.cwd).unwrap_err();
+        let err = ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &[], &t.cwd)
+            .unwrap_err();
         fs::set_permissions(&cfg, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(err.to_string().contains("cannot determine"));
         assert!(err.to_string().contains("config.toml"));
@@ -1815,8 +2039,13 @@ mod tests {
             self.state.join("msb-home")
         }
         fn guard_with(&self, stores: &[Store]) -> ProtectedConfigDir {
-            ProtectedConfigDir::measure(std::slice::from_ref(&self.home), stores, &self.cwd)
-                .unwrap()
+            ProtectedConfigDir::measure(
+                std::slice::from_ref(&self.home),
+                stores,
+                &self.trusted_sources,
+                &self.cwd,
+            )
+            .unwrap()
         }
         fn launch_stores(&self) -> Vec<Store> {
             vec![
@@ -1836,6 +2065,157 @@ mod tests {
             }
             guard.check_mount_names_sessions(Declaration::Argv, &Spelling::new("/decl"), path)
         }
+    }
+
+    /// ADR-0076 R2.4: a writable bind over a `trust = true` source, or over any
+    /// directory along its route, is refused; `:ro` and unrelated writable mounts
+    /// stay allowed.
+    #[test]
+    fn a_writable_bind_over_a_trusted_source_route_is_refused() {
+        let mut t = Tree::new();
+        let team = t.home.join("team");
+        fs::create_dir_all(team.join("sub")).unwrap();
+        let source = team.join("sub/agent-vm.toml");
+        fs::write(&source, "[[tools]]\nname = \"x\"\ncommand = \"true\"\n").unwrap();
+        t.trusted_sources = vec![source.clone()];
+        let guard = t.guard();
+        for path in [
+            source.clone(),
+            source.parent().unwrap().to_path_buf(),
+            team.clone(),
+        ] {
+            let message = guard
+                .check_writable_mount(Declaration::Argv, &Spelling::new("/decl"), &path, &path)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                message.contains("trusted config source"),
+                "{}: {message}",
+                path.display()
+            );
+            assert!(message.contains("read-only (:ro)"), "{message}");
+        }
+        // A bind of `$HOME` is refused too — by the authority store's own
+        // measurement, which answers first.
+        assert!(
+            guard
+                .check_writable_mount(Declaration::Argv, &Spelling::new("/decl"), &t.home, &t.home)
+                .is_err()
+        );
+        // Positive controls: the same route read-only, and an unrelated writable
+        // directory.
+        assert!(
+            t.mount(&guard, &team, true).is_ok(),
+            "a read-only bind cannot rewrite the source"
+        );
+        let unrelated = t.cwd.join("other");
+        fs::create_dir(&unrelated).unwrap();
+        assert!(t.mount(&guard, &unrelated, false).is_ok());
+    }
+
+    /// A multi-link trusted source is refused at mount-planning time too, so a
+    /// hard link cannot launder the file into a guest-writable path.
+    #[test]
+    fn a_trusted_source_with_two_links_refuses_every_launch() {
+        let mut t = Tree::new();
+        let team = t.home.join("team");
+        fs::create_dir_all(&team).unwrap();
+        let source = team.join("agent-vm.toml");
+        fs::write(&source, "").unwrap();
+        fs::hard_link(&source, team.join("laundered.toml")).unwrap();
+        t.trusted_sources = vec![source.clone()];
+        let message = t.guard().check_authority_links().unwrap_err().to_string();
+        assert!(message.contains("agent-vm.toml"), "{message}");
+    }
+
+    /// ADR-0076 R2.4 for another project's `trust = true` source, spelled
+    /// directly: the guard refuses a writable bind of the file or of any directory
+    /// on its route.
+    #[test]
+    fn a_writable_bind_over_another_projects_trusted_source_is_refused() {
+        let t = Tree::new();
+        let team = t.state.join("team");
+        fs::create_dir_all(team.join("sub")).unwrap();
+        let source = team.join("sub/agent-vm.toml");
+        fs::write(&source, "# another project's trusted source\n").unwrap();
+        write_sibling_project(
+            &t,
+            &format!(
+                "[[sources]]\nname = \"team\"\npath = {:?}\ntrust = true\n",
+                source.display().to_string()
+            ),
+        );
+        let guard = t.guard();
+        for path in [source.clone(), source.parent().unwrap().to_path_buf(), team] {
+            let message = guard
+                .check_writable_mount(Declaration::Argv, &Spelling::new("/decl"), &path, &path)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                message.contains("trusted config source"),
+                "{}: {message}",
+                path.display()
+            );
+            assert!(message.contains("read-only (:ro)"), "{message}");
+        }
+    }
+
+    /// ADR-0076 R2.4 through a symlinked ancestor: another project trusts a file
+    /// it reaches through an owner-controlled link, and this launch binds the
+    /// link's **target** writable. That project's read resolves the link
+    /// (`project_config::open_trusted_source_route`), so the measurement must
+    /// resolve it too: a lexical walk records the link and misses the target,
+    /// which is exactly the bind a guest needs in order to rewrite the file the
+    /// other project's next launch reads as host authority.
+    #[test]
+    fn a_writable_bind_over_another_projects_symlinked_trusted_source_is_refused() {
+        let t = Tree::new();
+        let target = t.state.join("team");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("agent-vm.toml"), "# trusted\n").unwrap();
+        let link = t.home.join("safe/link");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink(&target, &link).unwrap();
+        write_sibling_project(
+            &t,
+            &format!(
+                "[[sources]]\nname = \"team\"\npath = {:?}\ntrust = true\n",
+                link.join("agent-vm.toml").display().to_string()
+            ),
+        );
+
+        let guard = t.guard();
+        // The target, the target's parent, and the link's own spelling are all
+        // routes to the file that project's next launch would read.
+        for path in [target.clone(), t.state.clone(), link.clone()] {
+            let message = guard
+                .check_writable_mount(Declaration::Argv, &Spelling::new("/decl"), &path, &path)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                message.contains("trusted config source"),
+                "{}: {message}",
+                path.display()
+            );
+            assert!(message.contains("read-only (:ro)"), "{message}");
+        }
+        // Positive controls: the same target read-only, and an unrelated writable
+        // directory.
+        assert!(t.mount(&guard, &target, true).is_ok());
+        let unrelated = t.cwd.join("unrelated");
+        fs::create_dir(&unrelated).unwrap();
+        assert!(t.mount(&guard, &unrelated, false).is_ok());
+    }
+
+    /// The second project's own `config.toml`, declaring `sources` text as the
+    /// **reader** wrote it, so the guard must extract the trusted paths itself.
+    fn write_sibling_project(t: &Tree, body: &str) {
+        let store = t
+            .home
+            .join(".config/agent-vm/projects")
+            .join("b".repeat(64));
+        fs::create_dir_all(&store).unwrap();
+        fs::write(store.join(crate::project_config::CONFIG_FILE), body).unwrap();
     }
 
     /// R1 for the state root: a writable live bind of the directory that holds

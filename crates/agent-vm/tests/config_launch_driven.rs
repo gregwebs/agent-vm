@@ -7354,15 +7354,27 @@ fn a_single_vcpu_ceiling_boots_one_vcpu_and_collapses_its_axis() {
 /// diagnostic that points at the setting and the tier; the project tier can
 /// never grant egress.
 #[test]
-fn project_network_table_fails_every_launch() {
-    let harness = Harness::new();
-    harness.write_project("[network]\nallow_lan = true\n");
-    let out = harness.launch_default("shell");
-    assert!(!out.status.success(), "a project [network] table must fail");
+fn project_network_table_reaches_the_sandbox_policy() {
+    // ADR-0076 R3: the verified project config may now grant egress, and the
+    // grant reaches the sandbox policy exactly like the user config's.
+    let h = Harness::warm();
+    h.write_project("[network]\nallow_lan = true\nallow_egress = [\"10.0.0.0/24\"]\n");
+    let out = h.launch_default("shell");
+    let config = normalized_config(&h, &out);
+    assert_eq!(
+        config["network"]["policy"]["rules"],
+        serde_json::json!([
+            {"direction":"egress","destination":{"cidr":"10.0.0.0/24"},"protocols":[],"ports":[],"action":"allow"},
+            {"direction":"egress","destination":{"group":"private"},"protocols":[],"ports":[],"action":"allow"}
+        ])
+    );
     let stderr = stderr_of(&out);
-    assert!(stderr.contains("network.allow_lan"), "{stderr}");
     assert!(
-        stderr.contains("network access cannot be granted by the project config"),
+        stderr.contains("==> Egress authority: persisted grants from"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("allowing 10.0.0.0/24 (persisted grants)"),
         "{stderr}"
     );
 }
@@ -7795,11 +7807,15 @@ fn requests_report_cap_network_refusal_and_own_tool_only() {
     assert_eq!(request_block(&stderr), expected);
     assert_eq!(stderr.matches("unmet:").count(), 8);
     let h = Harness::warm();
-    h.write_project(&format!("[network]\n{FETCHER}{FETCH_REQUESTS}"));
+    // A still-refused project table keeps the deferred-error clause alive: a
+    // broken config produces no request report at all (ADR-0076 left only the
+    // set tables refused in the project tier).
+    h.write_project(&format!(
+        "[mount_sets]\nfetcher = []\n{FETCHER}{FETCH_REQUESTS}"
+    ));
     let stderr = stderr_of(&h.launch("fetcher", &[]));
     assert!(
-        stderr.contains("[network]")
-            && stderr.contains("network access cannot be granted by the project config"),
+        stderr.contains("mount_sets cannot be declared by the project config"),
         "{stderr}"
     );
     assert!(!stderr.contains(CONFIG_MARKER) && request_block(&stderr).is_empty());
@@ -15255,8 +15271,8 @@ fn v25_repo() -> String {
 /// four definitions.
 fn v25_project(allow: &str) -> String {
     format!(
-        "sources = [\"repo ./.agent-vm/config.toml\"]\n\
-         {allow}"
+        "{allow}\
+         [[sources]]\nname = \"repo\"\npath = \"./.agent-vm/config.toml\"\n"
     )
 }
 

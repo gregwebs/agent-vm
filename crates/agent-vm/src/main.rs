@@ -375,6 +375,7 @@ fn run_dispatch(dispatch: Dispatch, project: Result<project::ProjectDir>) -> Res
                 user_tools,
                 user_mounts,
                 resources,
+                trusted_sources,
                 args,
             } => {
                 let project = project?;
@@ -382,11 +383,12 @@ fn run_dispatch(dispatch: Dispatch, project: Result<project::ProjectDir>) -> Res
                     run::launch(
                         target,
                         &images,
-                        user_network.as_ref(),
+                        user_network.as_deref(),
                         user_tools.as_ref(),
                         user_mounts.as_ref(),
                         credential_preflight,
                         resources,
+                        trusted_sources.to_vec(),
                         *args,
                         &project,
                     )
@@ -400,7 +402,7 @@ fn run_dispatch(dispatch: Dispatch, project: Result<project::ProjectDir>) -> Res
                 images_read,
             } => {
                 let project = project?;
-                setup::run(args, catalog, images, images_read, &project).await
+                setup::run(args, catalog, *images, images_read, &project).await
             }
             // The image group: `pull` acquires natively and `set-default`
             // retains explicitly (both carry the original catalog/images, so
@@ -412,7 +414,7 @@ fn run_dispatch(dispatch: Dispatch, project: Result<project::ProjectDir>) -> Res
                 catalog,
                 images,
                 images_read: _,
-            } => exit_with(image_cmd::run(args, catalog, images, project).await?),
+            } => exit_with(image_cmd::run(args, catalog, *images, project).await?),
             Dispatch::Builtin {
                 cmd: Cmd::Clipboard(args),
                 ..

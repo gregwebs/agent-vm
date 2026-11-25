@@ -203,7 +203,7 @@ pub(crate) fn select(
                 let selected = explicit_set(user, &name)?;
                 if !selected.is_empty() {
                     if let Some(user) = user {
-                        explicit_sets = Some(user.file().to_path_buf());
+                        explicit_sets = Some(user.sets_file().unwrap_or(user.file()).to_path_buf());
                     }
                     requests.extend(selected.requests().cloned());
                 }
@@ -265,7 +265,10 @@ fn config_files(config: &ConfigUse) -> Vec<PathBuf> {
 fn automatic_files(user: Option<&UserMounts>, tool: &ResolvedMountList) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = Vec::new();
     if let Some(user) = user.filter(|user| user.has_defaults()) {
-        files.push(user.file().to_path_buf());
+        // ADR-0076 R4.2: every file whose top-level `mounts` contributed, in
+        // adoption order; one file for a single-file load, so the notice's bytes
+        // are unchanged there.
+        files.extend(user.files().iter().cloned());
     }
     if let Some(file) = tool
         .requests()
