@@ -337,6 +337,13 @@ pub(crate) struct CapturedConfig {
 }
 
 impl Dispatch {
+    /// Whether this dispatch launches anything at all (a tool verb or a direct
+    /// command). The pin gate's `record_active` is the only consumer: only a
+    /// launch may mark the approvals it used as active.
+    pub(crate) fn is_launch(&self) -> bool {
+        matches!(self, Self::Launch { .. })
+    }
+
     /// Whether this dispatch executes a direct command (`run` / top-level `--`,
     /// issue #398). Main's exit-status policy is the only consumer: a returned
     /// failure on a direct route is 125, on every other route anyhow's 1.
@@ -468,111 +475,17 @@ where
         ),
     };
 
-    // Collected so the `secret` scrub below can look at the verb without
-    // consuming the iterator twice; the bound is already `Into<OsString>`.
-    let argv: Vec<OsString> = argv.into_iter().map(Into::into).collect();
-    // The scrub predicates and the route hint read the **original** argv:
-    // replacing `--` with `run` neither creates nor deletes a `secret` or
-    // `image import` witness, and the hint is only error classification.
-    let secret_route = is_secret_route(&argv);
-    let import_route = is_image_import_route(&argv);
-    let route_hint = launch_route_hint(&argv);
-    let mut argv = argv;
-    // A top-level `--` whose launch-option prefix does not parse is not
-    // rewritten, so clap would answer with "unrecognized subcommand" for the
-    // first payload word. Its prefix error is the useful diagnostic, and it is
-    // returned below instead of that route noise.
-    let refused_prefix = rewrite_direct_separator(&mut argv, route_hint);
-
+    let RawParse { argv, matches } =
+        match parse_raw_argv(argv.into_iter().map(Into::into).collect(), &catalog) {
+            RawArgv::Matches(parsed) => parsed,
+            // Help and version are not failures: clap's own `exit()` writes them to
+            // stdout with status 0. Propagating them as `anyhow::Error` through
+            // main's `?` would print help to *stderr* with status 2.
+            RawArgv::Clap(error) => error.exit(),
+            RawArgv::Error(error) => return Err(error),
+        };
+    // The dispatch arms below format a usage refusal with clap's own renderer.
     let mut command = build_command(&catalog);
-    if argv.len() <= 1 {
-        command = command_without_launch_env(&command);
-    }
-    let matches = match command.clone().try_get_matches_from(&argv) {
-        Ok(matches) => matches,
-        Err(error) => match (!clap_outcome_is_help_or_version(error.kind()))
-            .then(|| reparse_without_launch_env(&command, &argv, &catalog))
-            .flatten()
-        {
-            Some(matches) => matches,
-            None => {
-                // `secret` may have carried a value in any position on either entry
-                // path, and clap prints supplied values on some parse errors, so
-                // replace every non-help, non-version error in that subtree with a
-                // fixed value-free message. A whitelist of *kinds*, not of argv
-                // shapes, so a future clap error variant is scrubbed by default.
-                let direct_route = matches!(route_hint, LaunchRouteHint::Direct { .. });
-                if secret_route && !clap_outcome_is_help_or_version(error.kind()) {
-                    // Same fixed, value-free selection on both routes; only a
-                    // known-direct route answers with clap's formatter and
-                    // status 2 (issue #398), because a direct launch must never
-                    // turn a usage error into an ordinary launcher failure. Its
-                    // text is direct-specific: the administrative `agent-vm
-                    // secret …` forms are not what a guest command vector
-                    // containing the token `secret` could have meant.
-                    let kind = error.kind();
-                    let scrubbed = if direct_route {
-                        anyhow::Error::new(direct_usage_error(kind, run::DIRECT_SECRET_SCRUB_ERROR))
-                    } else {
-                        anyhow!(SECRET_ARGV_ERROR)
-                    };
-                    return Err(scrubbed);
-                }
-                if import_route && !clap_outcome_is_help_or_version(error.kind()) {
-                    let kind = error.kind();
-                    let scrubbed = if direct_route {
-                        anyhow::Error::new(direct_usage_error(kind, run::DIRECT_SCRUB_ERROR))
-                    } else {
-                        anyhow::Error::new(import_argv_error(&command, &error))
-                    };
-                    return Err(scrubbed);
-                }
-                if let Some(refusal) = numeric_launch_env_refusal(&command, &error, &argv) {
-                    let refusal = if direct_route {
-                        direct_usage_error(error.kind(), refusal)
-                    } else {
-                        command.error(error.kind(), refusal)
-                    };
-                    return Err(anyhow::Error::new(refusal));
-                }
-                // A known-direct route whose separator was refused already has
-                // the real cause: its launch-option prefix. clap reported the
-                // first payload word as an unknown subcommand instead, which
-                // names neither the option nor its value.
-                if direct_route
-                    && error.kind() == clap::error::ErrorKind::InvalidSubcommand
-                    && let Some(prefix_error) = refused_prefix
-                {
-                    return Err(anyhow::Error::new(prefix_error));
-                }
-                // Any other syntax error on a known-direct route: clap's own
-                // usage error and status 2, returned rather than exiting so the
-                // caller applies the same policy to every route.
-                if direct_route {
-                    return Err(anyhow::Error::new(error));
-                }
-                // On the broken path `allow_external_subcommands` absorbs every
-                // unknown verb, so the only `InvalidSubcommand` clap can raise is
-                // its synthesized `help <x>` validating `x` against the tool-less
-                // command. Report the config error there — never clap's
-                // "unrecognized subcommand" — with a did-you-mean hint when
-                // useful.
-                if error.kind() == clap::error::ErrorKind::InvalidSubcommand
-                    && let Catalog::Broken(config_error) = &catalog
-                {
-                    return Err(config_error_with_hint(
-                        config_error,
-                        invalid_subcommand(&error).as_deref().unwrap_or_default(),
-                    ));
-                }
-                // Help and version are not failures: clap's own `exit()` writes
-                // them to stdout with status 0. Propagating them as
-                // `anyhow::Error` through main's `?` would print help to *stderr*
-                // with status 2.
-                error.exit()
-            }
-        },
-    };
 
     match (matches.subcommand(), catalog) {
         // Unreachable in practice: clap returns
@@ -592,15 +505,8 @@ where
         (Some((name, sub)), Catalog::Ready(mut catalog)) => {
             match catalog.take_entry(name) {
                 Some(entry) => {
-                    let mut args = run::Args::from_arg_matches(&matches)?;
-                    args.image.reconcile(&matches);
-                    args.launch_build().map_err(|conflict| {
-                        anyhow::Error::new(
-                            command.error(clap::error::ErrorKind::ArgumentConflict, conflict),
-                        )
-                    })?;
-                    reject_direct_terminal_options(&mut command, &matches, &args)?;
-                    let resources = args.resource_ceiling()?;
+                    let ValidatedVerb { args, resources } =
+                        validate_verb_launch(&mut command, &matches)?;
                     Ok(Dispatch::Launch {
                         images: Box::new(captured.images),
                         user_network: captured.user_network,
@@ -611,12 +517,7 @@ where
                         args: Box::new(args),
                         target: LaunchTarget::Tool {
                             entry: Box::new(entry),
-                            tool_args: tool_args(
-                                &argv,
-                                sub.get_many::<String>(TOOL_ARGS)
-                                    .map(|values| values.cloned().collect())
-                                    .unwrap_or_default(),
-                            ),
+                            tool_args: verb_payload(&argv, sub, VerbPayloadMode::ReadyTool)?,
                         },
                     })
                 }
@@ -676,6 +577,177 @@ fn direct_dispatch(
     matches: &clap::ArgMatches,
     captured: CapturedConfig,
 ) -> Result<Dispatch> {
+    let ValidatedDirect {
+        command: direct,
+        terminal,
+        args,
+        resources,
+    } = validate_direct_launch(argv, sub, matches)?;
+    match catalog {
+        Catalog::Broken(config_error) => Err(anyhow::Error::new(
+            crate::launch_target::DirectLaunchFailure(config_error),
+        )),
+        Catalog::Ready(_) => Ok(Dispatch::Launch {
+            target: LaunchTarget::Direct {
+                command: direct,
+                terminal,
+            },
+            images: Box::new(captured.images),
+            user_network: captured.user_network,
+            user_tools: captured.user_tools,
+            user_mounts: captured.user_mounts,
+            resources,
+            trusted_sources: captured.trusted_sources,
+            args: Box::new(args),
+        }),
+    }
+}
+
+/// The argv as clap read it, or the reason it did not.
+///
+/// [`parse_from`] and [`preflight_unapproved_route`] ask the same question of
+/// the same argv, so the transformations and scrubs that decide it live here
+/// once. The three outcomes are deliberately distinct: only the caller knows
+/// whether a clap outcome may end the process (it may on the parse path, and
+/// never on the preflight path, which only classifies).
+enum RawArgv {
+    Matches(RawParse),
+    /// clap's own outcome: help/version (stdout, status 0) or a usage error
+    /// (status 2). `parse_from` hands it to `error.exit()`.
+    Clap(clap::Error),
+    /// A failure that is not clap's to render: a deferred config error, one of
+    /// the value-free scrubs, a number read from the environment, or a
+    /// known-direct usage error (returned rather than exited so `main` applies
+    /// the route's status policy, #398).
+    Error(anyhow::Error),
+}
+
+/// A successful parse, and the argv it parsed: a top-level `--` was rewritten
+/// to the `run` verb, so the raw payload adapters must read this vector.
+struct RawParse {
+    argv: Vec<OsString>,
+    matches: clap::ArgMatches,
+}
+
+/// Rewrite, scrub, and parse one argv against one catalog's command.
+fn parse_raw_argv(argv: Vec<OsString>, catalog: &Catalog) -> RawArgv {
+    // The scrub predicates and the route hint read the **original** argv:
+    // replacing `--` with `run` neither creates nor deletes a `secret` or
+    // `image import` witness, and the hint is only error classification.
+    let secret_route = is_secret_route(&argv);
+    let import_route = is_image_import_route(&argv);
+    let route_hint = launch_route_hint(&argv);
+    let mut argv = argv;
+    // A top-level `--` whose launch-option prefix does not parse is not
+    // rewritten, so clap would answer with "unrecognized subcommand" for the
+    // first payload word. Its prefix error is the useful diagnostic, and it is
+    // returned below instead of that route noise.
+    let refused_prefix = rewrite_direct_separator(&mut argv, route_hint);
+
+    let mut command = build_command(catalog);
+    if argv.len() <= 1 {
+        command = command_without_launch_env(&command);
+    }
+    let matches = match command.clone().try_get_matches_from(&argv) {
+        Ok(matches) => matches,
+        Err(error) => match (!clap_outcome_is_help_or_version(error.kind()))
+            .then(|| reparse_without_launch_env(&command, &argv, catalog))
+            .flatten()
+        {
+            Some(matches) => matches,
+            None => {
+                // `secret` may have carried a value in any position on either entry
+                // path, and clap prints supplied values on some parse errors, so
+                // replace every non-help, non-version error in that subtree with a
+                // fixed value-free message. A whitelist of *kinds*, not of argv
+                // shapes, so a future clap error variant is scrubbed by default.
+                let direct_route = matches!(route_hint, LaunchRouteHint::Direct { .. });
+                if secret_route && !clap_outcome_is_help_or_version(error.kind()) {
+                    // Same fixed, value-free selection on both routes; only a
+                    // known-direct route answers with clap's formatter and
+                    // status 2 (issue #398), because a direct launch must never
+                    // turn a usage error into an ordinary launcher failure. Its
+                    // text is direct-specific: the administrative `agent-vm
+                    // secret …` forms are not what a guest command vector
+                    // containing the token `secret` could have meant.
+                    let kind = error.kind();
+                    let scrubbed = if direct_route {
+                        anyhow::Error::new(direct_usage_error(kind, run::DIRECT_SECRET_SCRUB_ERROR))
+                    } else {
+                        anyhow!(SECRET_ARGV_ERROR)
+                    };
+                    return RawArgv::Error(scrubbed);
+                }
+                if import_route && !clap_outcome_is_help_or_version(error.kind()) {
+                    let kind = error.kind();
+                    let scrubbed = if direct_route {
+                        anyhow::Error::new(direct_usage_error(kind, run::DIRECT_SCRUB_ERROR))
+                    } else {
+                        anyhow::Error::new(import_argv_error(&command, &error))
+                    };
+                    return RawArgv::Error(scrubbed);
+                }
+                if let Some(refusal) = numeric_launch_env_refusal(&command, &error, &argv) {
+                    let refusal = if direct_route {
+                        direct_usage_error(error.kind(), refusal)
+                    } else {
+                        command.error(error.kind(), refusal)
+                    };
+                    return RawArgv::Error(anyhow::Error::new(refusal));
+                }
+                // A known-direct route whose separator was refused already has
+                // the real cause: its launch-option prefix. clap reported the
+                // first payload word as an unknown subcommand instead, which
+                // names neither the option nor its value.
+                if direct_route
+                    && error.kind() == clap::error::ErrorKind::InvalidSubcommand
+                    && let Some(prefix_error) = refused_prefix
+                {
+                    return RawArgv::Error(anyhow::Error::new(prefix_error));
+                }
+                // Any other syntax error on a known-direct route: clap's own
+                // usage error and status 2, returned rather than exiting so the
+                // caller applies the same policy to every route.
+                if direct_route {
+                    return RawArgv::Error(anyhow::Error::new(error));
+                }
+                // On the broken path `allow_external_subcommands` absorbs every
+                // unknown verb, so the only `InvalidSubcommand` clap can raise is
+                // its synthesized `help <x>` validating `x` against the tool-less
+                // command. Report the config error there — never clap's
+                // "unrecognized subcommand" — with a did-you-mean hint when
+                // useful.
+                if error.kind() == clap::error::ErrorKind::InvalidSubcommand
+                    && let Catalog::Broken(config_error) = catalog
+                {
+                    return RawArgv::Error(config_error_with_hint(
+                        config_error,
+                        invalid_subcommand(&error).as_deref().unwrap_or_default(),
+                    ));
+                }
+                return RawArgv::Clap(error);
+            }
+        },
+    };
+    RawArgv::Matches(RawParse { argv, matches })
+}
+
+/// The direct launch a `run`/`--` argv names, validated and frozen.
+struct ValidatedDirect {
+    command: crate::launch_target::DirectCommand,
+    terminal: crate::direct_terminal::DirectIo,
+    args: run::Args,
+    resources: crate::resources::ResourceCeiling,
+}
+
+/// Everything a direct launch must pass before it may create state, without
+/// consuming the catalog: the raw suffix restored, the newtype's own checks, the
+/// launch options, the terminal mode, and the resource ceiling.
+fn validate_direct_launch(
+    argv: &[OsString],
+    sub: &clap::ArgMatches,
+    matches: &clap::ArgMatches,
+) -> Result<ValidatedDirect> {
     let vector = after_raw_verb(
         argv,
         sub.get_many::<OsString>(DIRECT_PROGRAM)
@@ -718,23 +790,175 @@ fn direct_dispatch(
     let resources = args
         .resource_ceiling()
         .map_err(|error| anyhow::Error::new(crate::launch_target::DirectLaunchFailure(error)))?;
-    match catalog {
-        Catalog::Broken(config_error) => Err(anyhow::Error::new(
-            crate::launch_target::DirectLaunchFailure(config_error),
+    Ok(ValidatedDirect {
+        command: direct,
+        terminal,
+        args,
+        resources,
+    })
+}
+
+/// The launch options a catalog or unknown-verb route must pass.
+struct ValidatedVerb {
+    args: run::Args,
+    resources: crate::resources::ResourceCeiling,
+}
+
+/// A verb route's launch options: the shared [`run::Args`] parse, the image
+/// reconciliation, the build conflict, the direct-only terminal refusal, and the
+/// resource ceiling. The catalog can only be broken *after* this passes (its own
+/// dispatch arm decides what a failure means), so a usage error outranks a
+/// deferred config error exactly where it always has.
+fn validate_verb_launch(
+    command: &mut clap::Command,
+    matches: &clap::ArgMatches,
+) -> Result<ValidatedVerb> {
+    let mut args = run::Args::from_arg_matches(matches)?;
+    args.image.reconcile(matches);
+    args.launch_build().map_err(|conflict| {
+        anyhow::Error::new(command.error(clap::error::ErrorKind::ArgumentConflict, conflict))
+    })?;
+    reject_direct_terminal_options(command, matches, &args)?;
+    let resources = args.resource_ceiling()?;
+    Ok(ValidatedVerb { args, resources })
+}
+
+/// How a verb route's raw payload reaches the tool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VerbPayloadMode {
+    /// A ready catalog's tool: clap parsed the payload as UTF-8 `TOOL_ARGS`.
+    ReadyTool,
+    /// An unknown verb on a broken catalog: clap kept the external
+    /// subcommand's values as raw `OsString`s under the argument id `""`.
+    BrokenExternal,
+}
+
+/// One verb route's tool arguments, verbatim, including any `--` clap consumed.
+fn verb_payload(
+    argv: &[OsString],
+    sub: &clap::ArgMatches,
+    mode: VerbPayloadMode,
+) -> Result<Vec<String>> {
+    match mode {
+        VerbPayloadMode::ReadyTool => Ok(tool_args(
+            argv,
+            sub.get_many::<String>(TOOL_ARGS)
+                .map(|values| values.cloned().collect())
+                .unwrap_or_default(),
         )),
-        Catalog::Ready(_) => Ok(Dispatch::Launch {
-            target: LaunchTarget::Direct {
-                command: direct,
-                terminal,
-            },
-            images: Box::new(captured.images),
-            user_network: captured.user_network,
-            user_tools: captured.user_tools,
-            user_mounts: captured.user_mounts,
-            resources,
-            trusted_sources: captured.trusted_sources,
-            args: Box::new(args),
-        }),
+        // clap delivers an external subcommand's arguments verbatim, so the
+        // leading `--` is not restored here. A ready catalog's tool parser is
+        // UTF-8, so a non-UTF-8 argument is not a route that can launch.
+        VerbPayloadMode::BrokenExternal => sub
+            .get_many::<OsString>("")
+            .map(|values| values.cloned().collect::<Vec<OsString>>())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|value| {
+                value
+                    .into_string()
+                    .map_err(|_| anyhow!("a tool argument is not valid UTF-8"))
+            })
+            .collect(),
+    }
+}
+
+/// Which launch route an argv is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LaunchRoute {
+    /// `agent-vm [launch options] run PROGRAM …`, or `… -- PROGRAM …`.
+    Direct,
+    /// A tool verb.
+    Verb,
+}
+
+/// The verb `#739` will add subcommands to. Until they exist, a `config …` argv
+/// is not eligible to start an interactive pin approval (B3): following the
+/// advice the non-interactive refusal prints must not be able to trigger the
+/// launch prompt. The name bars *prompting* only — a ready catalog's tool that
+/// is genuinely called `config` still launches as the tool it is.
+const CONFIG_ROUTE_VERB: &str = "config";
+
+/// Which verbs a broken catalog may still gain from the pending approvals.
+///
+/// A broken catalog registers no tool subcommands and absorbs every syntactically
+/// valid external verb, so the preflight cannot answer "will this verb dispatch
+/// after the approval" from the parse alone. Only the pending sources decide it:
+///
+/// * a pending `allow = true` source may adopt `[[tools]]`, so any name could
+///   dispatch once its bytes are approved — a review is legitimate;
+/// * a pending `allow = false` source cannot introduce a verb name at all (its
+///   tools stay inert unless the project config already names them), so the
+///   reloaded catalog offers exactly the verbs the already-parsed tiers spell,
+///   and a name outside that set can only be a typo.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum VerbCandidates<'a> {
+    /// Some pending source could contribute tools: any verb may dispatch later.
+    AnyPendingSource,
+    /// No pending source can add a verb: only these names can dispatch.
+    Known(&'a std::collections::BTreeSet<String>),
+}
+
+/// Whether this argv is a launch an interactive pin approval may be attached to,
+/// and which.
+///
+/// `None` for every other route: help and version, bare `agent-vm`, every clap
+/// usage error, every built-in (including `_notify-click`), `config …` until
+/// #739, a tool verb the pending approvals cannot make dispatchable, non-UTF-8
+/// external tool arguments, and any launch-option or ceiling error. The question
+/// is asked of the command a *broken* catalog produces, because an unapproved
+/// load is exactly that: the tool list is what the approval would reveal, so no
+/// post-approval catalog may be assumed here.
+///
+/// Deliberately the lossy token scanner ([`launch_route_hint`]) is not used: it
+/// classifies errors, and this decides whether state may be written.
+pub(crate) fn preflight_unapproved_route(
+    argv: &[OsString],
+    candidates: VerbCandidates<'_>,
+) -> Option<LaunchRoute> {
+    // clap reads and validates the launch bindings from the process environment.
+    #[cfg(test)]
+    debug_assert!(
+        crate::test_env::guard_held(),
+        "classifying argv in a test requires holding the environment guard"
+    );
+    let probe = Catalog::Broken(anyhow!("the route is classified without a catalog"));
+    let parsed = match parse_raw_argv(argv.to_vec(), &probe) {
+        RawArgv::Matches(parsed) => parsed,
+        RawArgv::Clap(_) | RawArgv::Error(_) => return None,
+    };
+    let (name, sub) = parsed.matches.subcommand()?;
+    let mut command = build_command(&probe);
+    match name {
+        // The direct runner is a launch even though it is a fixed name.
+        crate::launch_target::DIRECT_RUN_VERB => {
+            validate_direct_launch(&parsed.argv, sub, &parsed.matches).ok()?;
+            Some(LaunchRoute::Direct)
+        }
+        CONFIG_ROUTE_VERB => None,
+        // `BUILTIN_SUBCOMMANDS` is the classifier the dispatch itself uses
+        // (clap matched one of those subcommands), so a new built-in cannot be
+        // forgotten here.
+        _ if BUILTIN_SUBCOMMANDS.contains(&name) => None,
+        _ => {
+            // A name no `[[tools]]` entry could ever have: prompting here would
+            // ask about a verb that cannot exist (the parse answers with the
+            // deferred config error instead).
+            if crate::config::tool_name_rejection(name).is_some() {
+                return None;
+            }
+            // A verb the pending approvals cannot make dispatchable would be
+            // reviewed, approved and committed, and then fail to dispatch: the
+            // single reload would reject it as an unknown subcommand.
+            if let VerbCandidates::Known(known) = candidates
+                && !known.contains(name)
+            {
+                return None;
+            }
+            validate_verb_launch(&mut command, &parsed.matches).ok()?;
+            verb_payload(&parsed.argv, sub, VerbPayloadMode::BrokenExternal).ok()?;
+            Some(LaunchRoute::Verb)
+        }
     }
 }
 
@@ -5205,6 +5429,302 @@ mod tests {
                 "{tokens:?} never reads the launch resource options"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // V28 — the pin gate's route classification, and the exit codes it must
+    // leave exactly as they were on both catalog states.
+    // -----------------------------------------------------------------
+
+    /// The deferred config error a pending pinned source produces: the same
+    /// shape `config::load` hands `parse_from` after a pin refusal.
+    fn pending_config_error() -> anyhow::Error {
+        anyhow!("config: pending pinned source sentinel")
+    }
+
+    /// [`LaunchRoute`] plus the payload a verb route would forward, so the
+    /// opaque `--help` rows can be asserted as well as the classification.
+    fn route_and_payload(tokens: &[&str]) -> (Option<LaunchRoute>, Option<Vec<String>>) {
+        let argv = argv_of(tokens);
+        let route = preflight_unapproved_route(&argv, VerbCandidates::AnyPendingSource);
+        let payload = route.and_then(|route| match route {
+            LaunchRoute::Verb => {
+                let probe = Catalog::Broken(pending_config_error());
+                let RawArgv::Matches(parsed) = parse_raw_argv(argv.clone(), &probe) else {
+                    return None;
+                };
+                let (_, sub) = parsed.matches.subcommand()?;
+                verb_payload(&parsed.argv, sub, VerbPayloadMode::BrokenExternal).ok()
+            }
+            LaunchRoute::Direct => None,
+        });
+        (route, payload)
+    }
+
+    #[test]
+    fn the_route_preflight_accepts_only_launches() {
+        let _env = clear_launch_env();
+
+        for (tokens, payload) in [
+            (vec!["agent-vm", "claude"], vec![]),
+            (vec!["agent-vm", "--mount", "/a:/b", "claude"], vec![]),
+            (vec!["agent-vm", "lint", "--help"], vec!["--help"]),
+            (
+                vec!["agent-vm", "lint", "--", "--help"],
+                vec!["--", "--help"],
+            ),
+            (
+                vec!["agent-vm", "--root", "lint", "a", "--", "b"],
+                vec!["a", "--", "b"],
+            ),
+        ] {
+            assert_eq!(
+                route_and_payload(&tokens),
+                (
+                    Some(LaunchRoute::Verb),
+                    Some(payload.iter().map(|value| value.to_string()).collect())
+                ),
+                "{tokens:?} is a launchable verb route"
+            );
+        }
+
+        for tokens in [
+            vec!["agent-vm", "--", "ls"],
+            vec!["agent-vm", "--", "ls", "--help"],
+            vec!["agent-vm", "run", "ls"],
+            vec!["agent-vm", "run", "--help"],
+            vec!["agent-vm", "run", "--", "--help"],
+            vec!["agent-vm", "run", "ls", "--help"],
+        ] {
+            assert_eq!(
+                route_and_payload(&tokens).0,
+                Some(LaunchRoute::Direct),
+                "{tokens:?} is a launchable direct route"
+            );
+        }
+
+        // Everything that is not a launch: the `_notify-click` built-in is in
+        // the classifier the dispatch itself uses, `config …` is B3's exclusion
+        // until #739 lands, and every help/version/usage outcome refuses.
+        for tokens in [
+            vec!["agent-vm", "-tV", "shell"],
+            vec!["agent-vm", "-th", "shell"],
+            vec!["agent-vm", "--help"],
+            vec!["agent-vm", "-h"],
+            vec!["agent-vm", "--version"],
+            vec!["agent-vm", "-V"],
+            vec!["agent-vm", "help"],
+            vec!["agent-vm", "help", "lint"],
+            vec!["agent-vm", "help", "run"],
+            vec!["agent-vm"],
+            vec!["agent-vm", "foo:bar"],
+            vec!["agent-vm", "foo/bar"],
+            vec!["agent-vm", ".."],
+            vec!["agent-vm", "*"],
+            vec!["agent-vm", "--bogus", "shell"],
+            vec!["agent-vm", "--tty", "--no-tty", "--", "ls"],
+            vec!["agent-vm", "run"],
+            vec!["agent-vm", "--"],
+            vec!["agent-vm", "-t", "lint"],
+            vec!["agent-vm", "--dockerfile", "a", "--image", "b", "lint"],
+            vec!["agent-vm", "--memory", "0", "lint"],
+            vec!["agent-vm", "--memory", "0", "run", "ls"],
+            vec!["agent-vm", "--mount", "/a:/b", "doctor"],
+            vec!["agent-vm", "msb", "--version"],
+            vec!["agent-vm", "doctor"],
+            vec!["agent-vm", "setup"],
+            vec!["agent-vm", "image", "show"],
+            vec!["agent-vm", "tools", "print"],
+            vec!["agent-vm", "access"],
+            vec!["agent-vm", "secret", "ls"],
+            vec!["agent-vm", "clipboard"],
+            vec!["agent-vm", "_intercept-hook"],
+            vec!["agent-vm", "_notify-click"],
+            // B3: following the refusal's printed advice must not be able to
+            // start an approval.
+            vec!["agent-vm", "config"],
+            vec!["agent-vm", "config", "diff"],
+            vec!["agent-vm", "config", "approve", "--expect", "a=sha256:0"],
+            vec!["agent-vm", "--root", "config", "diff"],
+        ] {
+            assert_eq!(
+                route_and_payload(&tokens).0,
+                None,
+                "{tokens:?} must never prompt"
+            );
+        }
+
+        // Non-UTF-8 argv: not a verb, and not an argument a ready catalog's
+        // UTF-8 tool parser could accept.
+        use std::os::unix::ffi::OsStringExt as _;
+        let invalid = |bytes: Vec<u8>| OsString::from_vec(bytes);
+        for argv in [
+            vec![OsString::from("agent-vm"), invalid(b"li\xffnt".to_vec())],
+            vec![
+                OsString::from("agent-vm"),
+                OsString::from("lint"),
+                invalid(b"\xff".to_vec()),
+            ],
+        ] {
+            assert_eq!(
+                preflight_unapproved_route(&argv, VerbCandidates::AnyPendingSource),
+                None,
+                "{argv:?}"
+            );
+        }
+    }
+
+    /// The status policy `main` applies to a returned parse error, mirrored so
+    /// the rows below name the status instead of the error kind.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Status {
+        /// clap's own usage error, which `main` hands to `error.exit()`.
+        Usage2,
+        /// anyhow's ordinary report.
+        Ordinary1,
+        /// A direct launch's deferred failure (#398).
+        Direct125,
+        /// The parse succeeded: the route dispatched.
+        Launched,
+    }
+
+    fn status(result: Result<Dispatch>) -> Status {
+        match result {
+            Ok(dispatch) => {
+                assert!(dispatch.is_launch(), "a failed row must not dispatch");
+                Status::Launched
+            }
+            Err(error) if error.downcast_ref::<clap::Error>().is_some() => Status::Usage2,
+            Err(error)
+                if error
+                    .downcast_ref::<crate::launch_target::DirectLaunchFailure>()
+                    .is_some() =>
+            {
+                Status::Direct125
+            }
+            Err(_) => Status::Ordinary1,
+        }
+    }
+
+    #[test]
+    fn the_exit_codes_of_both_catalog_states_are_unchanged() {
+        let _env = clear_launch_env();
+        for (tokens, ready, unapproved) in [
+            // A launchable verb: it dispatches on a ready catalog and is the
+            // deferred config error on a broken one, which is what a pin
+            // refusal is.
+            (
+                vec!["agent-vm", "mytool"],
+                Status::Launched,
+                Status::Ordinary1,
+            ),
+            (
+                vec!["agent-vm", "mytool", "--help"],
+                Status::Launched,
+                Status::Ordinary1,
+            ),
+            (
+                vec!["agent-vm", "-t", "mytool"],
+                Status::Usage2,
+                Status::Ordinary1,
+            ),
+            (
+                vec!["agent-vm", "--dockerfile", "a", "--image", "b", "mytool"],
+                Status::Usage2,
+                Status::Ordinary1,
+            ),
+            (
+                vec!["agent-vm", "--memory", "0", "mytool"],
+                Status::Ordinary1,
+                Status::Ordinary1,
+            ),
+            // Direct dispatch keeps 125, and a direct usage error keeps 2, on
+            // both catalog states.
+            (
+                vec!["agent-vm", "--memory", "0", "run", "ls"],
+                Status::Direct125,
+                Status::Direct125,
+            ),
+            (
+                vec!["agent-vm", "--tty", "--no-tty", "--", "ls"],
+                Status::Usage2,
+                Status::Usage2,
+            ),
+            (vec!["agent-vm", "run"], Status::Usage2, Status::Usage2),
+            (
+                vec!["agent-vm", "run", "ls"],
+                Status::Launched,
+                Status::Direct125,
+            ),
+            (
+                vec!["agent-vm", "--", "ls"],
+                Status::Launched,
+                Status::Direct125,
+            ),
+        ] {
+            assert_eq!(
+                status(parse_from(argv_of(&tokens), Ok(report_from(MYTOOL)))),
+                ready,
+                "{tokens:?} with a ready catalog"
+            );
+            assert_eq!(
+                status(parse_from(argv_of(&tokens), Err(pending_config_error()))),
+                unapproved,
+                "{tokens:?} with a pending pinned source"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_launch_may_record_the_loaded_baseline() {
+        let _env = clear_launch_env();
+        // The single predicate `main` uses before `pins_cmd::record_active`: a
+        // diagnostic, an administrative command and a built-in must never write
+        // pin state, while both launch routes may.
+        for tokens in [
+            vec!["agent-vm", "doctor"],
+            vec!["agent-vm", "setup"],
+            vec!["agent-vm", "image", "show"],
+            vec!["agent-vm", "tools", "print"],
+            vec!["agent-vm", "secret", "ls"],
+        ] {
+            let dispatch = parse_from(argv_of(&tokens), Ok(report_from(MYTOOL))).unwrap();
+            assert!(
+                !dispatch.is_launch(),
+                "{tokens:?} must not record the loaded baseline"
+            );
+        }
+        for tokens in [
+            vec!["agent-vm", "mytool"],
+            vec!["agent-vm", "run", "ls"],
+            vec!["agent-vm", "--", "ls"],
+        ] {
+            let dispatch = parse_from(argv_of(&tokens), Ok(report_from(MYTOOL))).unwrap();
+            assert!(dispatch.is_launch(), "{tokens:?} is a launch");
+        }
+    }
+
+    #[test]
+    fn a_ready_tool_named_config_still_launches() {
+        let _env = clear_launch_env();
+        // `config` is not a built-in, so a ready catalog's tool by that name is
+        // still its own verb. Only *prompt eligibility* excludes the spelling,
+        // so following the refusal's advice cannot start an approval (B3).
+        let body = "allow_tools = [\"config\"]\n[[tools]]\nname = \"config\"\ncommand = \"c\"\n";
+        let (args, tool_args) = launch_of(
+            parse_from(
+                argv_of(&["agent-vm", "config", "diff"]),
+                Ok(report_from(body)),
+            )
+            .unwrap(),
+        );
+        assert_eq!(tool_args, ["diff"]);
+        assert!(!args.root);
+        assert_eq!(
+            route_and_payload(&["agent-vm", "config", "diff"]).0,
+            None,
+            "the same argv is never a route that may prompt"
+        );
     }
 
     #[test]

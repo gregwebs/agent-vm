@@ -120,6 +120,14 @@ zeroize = "1"
 # `preserve_order` (key order is never load-bearing; tool order comes from
 # the `[[tools]]` array, not a map). See src/config.rs.
 toml = { version = "1", default-features = false, features = ["parse", "serde"] }
+# Computes the unified diff that shows a pending pinned config source before it
+# is approved (#736 phase 3, owner decision D8). Only the LCS is the crate's:
+# `config_pins::diff` owns the escaping, the hunk rendering, the caps and the
+# refusal, so the review contract is enforced in our code rather than inherited.
+# No feature but `text` is wanted: `bytes`/`unicode`/`inline` would add bstr and
+# unicode-segmentation for output we render ourselves. The `2.7` requirement is a
+# caret range in this file's style; `Cargo.lock` resolves 2.7.0.
+similar = { version = "2.7", default-features = false, features = ["text"] }
 url = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -3029,11 +3029,13 @@ project path's bytes — the same id `image-pins.json` and `allowances.json` use
 so one project has one id across every store. `<project root>` is the canonical
 current directory, so a symlinked cwd names the same project as the real path.
 
-Nothing in a repository is ever read as config: `<project root>/.agent-vm/
-config.toml` is **not** auto-loaded, and no backwards-compatible auto-loading is
-kept (see [Legacy in-repo `.agent-vm/config.toml`](#legacy-in-repo-agent-vmconfigtoml)).
-agent-vm only reads project configs; it creates neither `projects/` nor any file
-in it (writers arrive with the `agent-vm config` subcommand).
+A repository config is **not** auto-loaded: `<project root>/.agent-vm/config.toml`
+is read only when the host-managed project config declares it as a source; no
+backwards-compatible auto-loading is kept (see [Legacy in-repo
+`.agent-vm/config.toml`](#legacy-in-repo-agent-vmconfigtoml)). agent-vm never
+creates `projects/` or `config.toml`. Interactive source approval
+may write pins only beside an existing project config; the `agent-vm config`
+subcommand does not exist yet.
 
 Both tiers are optional (an absent file is reported as `absent`; a present but
 empty one as `found, 0 tools`). With no `$HOME` at all, **both** are unavailable
@@ -3057,7 +3059,9 @@ If a repository still ships `.agent-vm/config.toml`, agent-vm ignores it and
 
 ```text
 note: /work/repo/.agent-vm/config.toml is not auto-loaded; agent-vm never reads an in-repo .agent-vm/config.toml.
-To use it, review it and source it from this project's config with `agent-vm config edit`.
+To use it, review it and source it from this project's config: edit the file
+`agent-vm doctor` names as its `project:` row with your own editor (this version
+has no `config edit` command).
 ```
 
 The note does not change the exit status and appears whether the configuration
@@ -3084,16 +3088,25 @@ migrate today, by hand:
    path = "./.agent-vm/config.toml"
    ```
 
-   `image = "repo:image"` is optional, and selects that file's image;
-3. run `agent-vm doctor` again and confirm the verbs appear and the note is gone.
+   `image = "repo:image"` is optional, and selects that file's image. Add an
+   `allow_tools = ["repo:<verb>"]` entry for every verb you want the source to
+   contribute;
+3. run an eligible foreground launch — a tool verb, `agent-vm run`, or `agent-vm
+   --` — and approve its review;
+4. run `agent-vm doctor` and confirm the verbs appear and the note is gone.
 
-The sourced file is **unpinned** until content pinning ships: a branch switch
-changes its declarations at the next launch, so only source a file you would
-review on every change.
+A `trust = false` sourced file is content-pinned before its bytes are parsed.
+A digest not already approved refuses a non-interactive launch; an eligible
+foreground launch shows a review and asks once before it records the new bytes.
+Keep secrets out
+of a sourced file: the review deliberately shows its text and the protected
+project store retains an exact snapshot.
 
-`agent-vm config edit` arrives in a later change. Until it ships, use the
-printed path directly. To *share* a team catalog, have the project config
-[source](#sources) it instead of copying definitions.
+`agent-vm config edit`, `agent-vm config diff` and `agent-vm config approve`
+do not exist until #739. Until then, edit the printed project-config path
+directly; the latter two names appear only as future refusal advice. To *share*
+a team catalog, have the project config [source](#sources) it instead of copying
+definitions.
 
 ### Sources
 
@@ -3165,11 +3178,13 @@ the strict path:
 - **The read is verified unconditionally.** Owner, mode, link count and the
   immediate directory are measured whatever the file declares, so an image-only
   or tools-only file is measured too.
-- `trust = false` (the default) reads the file as an ordinary repository file —
-  in-repo paths such as `./.agent-vm/config.toml` are the normal case, a final
-  symlink is followed — and is **unpinned** until #736 ships content hashes: a
-  branch switch changes its declarations at the next launch, so only source a
-  file you would review on every change.
+- `trust = false` (the default) reads the file once through its checkout or
+  external route, hashes its bounded bytes and checks this project's approved
+  pins **before** UTF-8 or TOML decoding. A final in-checkout symlink may be
+  followed. A digest not already approved needs approval, regardless of `allow`;
+  returning to an approved digest needs none. A relative spelling stays in the
+  checkout scope, so name an intended outside file with an absolute or `~/`
+  path. See [ADR-0077](docs/adr/0077-pinned-config-sources.md).
 
 #### `allow`: adopt or stay inert
 
@@ -3179,8 +3194,8 @@ the strict path:
 |---|---|---|---|
 | `true` | `true` | route check + verified read | **adopted** |
 | `true` | `false` | route check + verified read | **inert** (not adopted, not refused) |
-| `false` | `true` | ordinary read, **unpinned** until #736 | **refused until #736**: unpinned bytes cannot grant authority, so the load says to set `allow = false` (and select explicitly) or move the file outside the project and set `trust = true` |
-| `false` | `false` | ordinary read, **unpinned** until #736 | **inert** |
+| `false` | `true` | bounded read + content pin | **adopted after approval** |
+| `false` | `false` | bounded read + content pin | **inert after approval** |
 
 Adoption is ordered, and the project config always outranks what it sourced:
 
@@ -3200,10 +3215,29 @@ Adoption is ordered, and the project config always outranks what it sourced:
   different sources authorizing one verb, with no project override, is a load
   error naming both.
 
-An inert declaration is **silently ignored, never refused**: it activates
-nothing, spends nothing, and `doctor` lists it. To use it deliberately, write
-`image = "<name>:image"` or `allow_tools = ["<name>:<tool>"]` in the project
-config, or set `allow = true`.
+An inert declaration is **silently ignored, never refused** after its source is
+approved: it activates nothing, spends nothing, and `doctor` lists it. An inert
+`image` is still validated and remains explicitly selectable with
+`image = "<name>:image"`. To use another inert declaration deliberately, write
+`allow_tools = ["<name>:<tool>"]` in the project config, or set `allow = true`.
+
+#### Reviewing a source whose digest needs approval
+
+A `trust = false` source whose digest is not already approved stops the load
+before parsing. Only a direct or tool launch with foreground stdin and stderr
+may show the escaped unified diff and ask `Approve N pinned source changes for
+this project? [y/N]`. `doctor`, help, built-ins, `agent-vm config …`,
+non-interactive runs and redirected stdin or stderr never prompt and, as
+non-launch invocations, never write source pin state. The prompt refuses rather
+than truncating a large review; approving reloads once, so a still-unapproved
+hash is a fresh refusal rather than a second question.
+
+The refusal names `agent-vm config diff` and `agent-vm config approve`, but
+those commands are not available until #739. Use an eligible terminal launch
+for approval today. The review is exact config text, not a redacted secret view:
+never place secrets in a sourced config. No resolved credential is fetched,
+interpolated or printed by this process, and pending or snapshot bytes do not
+enter diagnostics or logs.
 
 `agent-vm doctor` lists what the project config sources and where the boot image
 came from:
@@ -3214,7 +3248,7 @@ user:    /home/me/.config/agent-vm/config.toml (found, 2 tools)
 project: /home/me/.config/agent-vm/projects/3f9c…/config.toml (found, 0 tools)
 sources:
   home /home/me/.config/agent-vm/config.toml (found, 2 tools) [trust=true, allow=true]
-  repo /work/app/.agent-vm/config.toml (found, 1 tool) [trust=false, allow=false; inert: image, mounts, [network], allow_tools]
+  repo /work/app/.agent-vm/config.toml (found, 1 tool) [trust=false, allow=false, pin=approved sha256:<hex>; inert: image, mounts, [network], allow_tools]
 resolved: authorized tools; launch-verb order
   1. pi -> "pi"; …; source=sourced:repo:/work/app/.agent-vm/config.toml
 …
@@ -3230,11 +3264,11 @@ When the project config sources nothing at the user path, the user row reads
 
 ### Schema
 
-`[network]` and `mounts` are authority-bearing, so they are accepted only in a
-file whose read was verified: the default user config (`trust = true` at
-`~/.config/agent-vm/config.toml`), a trusted source, or the host-managed project
-config. An `allow = false` source may declare them, but they stay inert
-(ADR-0076). `[mount_sets]` and `[egress_sets]` remain the default user config's
+`[network]` and `mounts` are authority-bearing, so they are accepted only from
+the verified default user config, a trusted source, the host-managed project
+config, or an approved `trust = false, allow = true` source. An `allow = false`
+source may declare them, but they stay inert after its pin check
+(ADR-0076, ADR-0077). `[mount_sets]` and `[egress_sets]` remain the default user config's
 alone until #738. See [Persisted grants](#persisted-grants-user-config) and
 [Config mounts](#config-mounts-user-config).
 
@@ -3254,10 +3288,12 @@ image = "ghcr.io/gregwebs/agent-vm-standard:v0.1.3"
 # file authorizes. Declaring a tool does not make it a verb; listing it here does.
 allow_tools = ["mytool"]
 
-# Optional, USER CONFIG ONLY, and it must come before the first table header:
+# Optional top-level mounts are adopted from the verified user or project config,
+# or an allowed source. They must come before the first table header:
 # mounts = ["~/reference:ro", "~/scratch:/work/scratch:rw"]
 
-# Optional, USER CONFIG ONLY (never put this in project config):
+# Optional [network] is adopted from the verified user or project config, or an
+# allowed source:
 # [network]
 # allow_internet_egress = false
 # allow_lan = true
@@ -3282,19 +3318,20 @@ network_requests = ["api.example.com"] # optional; granted on launch when this t
   the tools: a file that sets only `image` declares zero tools and keeps the
   shipped defaults. Only OCI references are accepted here; a local path is
   rejected (use `--image` for a local rootfs).
-- `sources` — optional top-level array of strings, **project config only** and
-  only before the first `[table]` header. See [Sources](#sources).
-- `mounts` — optional top-level array of strings, **user config only** and only
-  before the first `[table]` header: config mounts for every launch, with
-  `--mount`'s `HOST[:GUEST][:MODE]...` grammar. The project and built-in tiers
-  refuse the key even when it is empty. See
-  [Config mounts](#config-mounts-user-config).
+- `sources` — optional top-level array of `[[sources]]` tables, **project
+  config only** and only after all top-level keys. See [Sources](#sources).
+- `mounts` — optional top-level array of strings, before the first `[table]`
+  header: verified user and project configs, and `allow = true` sources, may
+  declare config mounts for every launch with `--mount`'s
+  `HOST[:GUEST][:MODE]...` grammar. The built-in tier refuses the key even when
+  it is empty. See [Config mounts](#config-mounts-user-config).
 - `name` — required; a single command-name token: nonempty, no
   whitespace/control characters, no `/` (a name is not a path), not an
   all-dots spelling (`.`/`..`), no leading `-`, and not one of the reserved
   subcommands `image`, `setup`, `msb`, `clipboard`, `doctor`, `secret`, `tools`,
   `_intercept-hook`, `run`, `help`. Names are case-sensitive. Naming a tool `claude`
-  is normal — that is the point. `pull` and `upgrade` are no longer reserved
+  is normal — that is the point. `config` is not reserved, so a ready catalog's
+  tool of that name still launches. `pull` and `upgrade` are no longer reserved
   (they were removed as built-ins in 0.7.0), so a configured tool may use them.
   `tools` is reserved since 0.7.30 (`agent-vm tools print`, #510).
 - `command` — required, nonempty, NUL-free. The guest command name; it is
@@ -5317,12 +5354,14 @@ network_requests = ["api.example.com", "git.example.com:8443"]
   verb in the project's own list is an error, and so is one verb inherited from
   two sources with no project override — name the winner
   (`"<alias>:<tool>"`) or set `allow = false` on one source.
-- A `trust = false` source may not have its `allow_tools` adopted (#736 gates it);
-  the project authorizes its tools. Authorizing one does **not** authorize the
-  tools its own `tools = [...]` reaches — list each of those too. A
-  `trust = true` source keeps private helper declarations, like the user config.
-- A tool authorized from a sourced file is delegated to that file's unpinned
-  bytes until [#736](https://github.com/gregwebs/agent-vm/issues/736).
+- A `trust = false, allow = true` source may have its `allow_tools` adopted
+  only after its exact content pin is approved. A digest not already approved
+  stops its declarations before parsing. Authorizing one does **not** authorize the tools
+  its own `tools = [...]` reaches — list each of those too. A `trust = true`
+  source keeps private helper declarations, like the user config.
+- A tool authorized from a `trust = false` source is delegated only to the
+  approved source bytes; a digest not already approved requires a foreground
+  review.
 
 Declaring any tool, or writing `allow_tools` at all, in your user or project
 config opts out of the shipped catalog: nothing else is a verb. A sourced file's

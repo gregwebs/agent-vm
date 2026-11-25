@@ -800,9 +800,28 @@ pub(crate) struct ApprovedSourceContent<'a> {
     project_config: &'a Path,
     source_path: &'a Path,
     bytes: &'a [u8],
+    pin: crate::config_pins::SourcePin,
 }
 
 impl<'a> ApprovedSourceContent<'a> {
+    /// The **only** constructor, and it demands the pin policy's match witness:
+    /// a value that exists solely after a real `pins.json` lookup found these
+    /// bytes' SHA-256 in the key's approved set. There is deliberately no
+    /// constructor taking arbitrary bytes and a `SourcePin`.
+    pub(crate) fn approved(
+        matched: crate::config_pins::ApprovedHashMatch,
+        project: &'a VerifiedProject,
+        entry: &'a crate::config_sources::SourceEntry,
+        bytes: &'a [u8],
+    ) -> Self {
+        Self {
+            project_config: project.path(),
+            source_path: entry.path(),
+            bytes,
+            pin: matched.pin(),
+        }
+    }
+
     /// The only other [`AdoptedAuthority`] constructor: the bytes themselves were
     /// approved, so the pathname is no longer what carries the authority.
     pub(crate) fn adopted_authority(&self) -> AdoptedAuthority<'a> {
@@ -813,6 +832,10 @@ impl<'a> ApprovedSourceContent<'a> {
 
     pub(crate) fn bytes(&self) -> &'a [u8] {
         self.bytes
+    }
+
+    pub(crate) fn pin(&self) -> &crate::config_pins::SourcePin {
+        &self.pin
     }
 
     #[allow(dead_code)]
@@ -826,65 +849,36 @@ impl<'a> ApprovedSourceContent<'a> {
     }
 }
 
-#[cfg(test)]
-impl<'a> ApprovedSourceContent<'a> {
-    /// The test-only approver #748 needs: it binds the same
-    /// `(project config, lexical path, exact bytes)` triple the shipping #736
-    /// policy will, so a test cannot approve one file's bytes under another's
-    /// path.
-    pub(crate) fn for_test(
-        project: &'a VerifiedProject,
-        entry: &'a crate::config_sources::SourceEntry,
-        bytes: &'a [u8],
-    ) -> Self {
-        Self {
-            project_config: project.path(),
-            source_path: entry.path(),
-            bytes,
-        }
-    }
+/// The pin policy's decision for one `trust = false` source.
+///
+/// Exactly one of two outcomes: bytes a store lookup approved (and the pin that
+/// proves it), or the exact candidate a review must show before anything is
+/// parsed. There is no third "continue" arm, so an unapproved source cannot be
+/// decoded by inaction.
+pub(crate) enum ContentApproval<'a> {
+    Approved(ApprovedSourceContent<'a>),
+    Pending(crate::config_pins::PendingSource),
 }
 
-/// Predicate deciding whether a `trust = false, allow = true` source's exact bytes
-/// are approved for top-level adoption.
+/// Predicate deciding whether one `trust = false` source's exact bytes are
+/// approved for anything this load adopts.
 ///
-/// This is the seam #736 fills. In `#748` production, [`UnpinnedContentPolicy`]
-/// refuses before any decoding or adoption; #736 supplies a policy backed by
-/// `pins.json` content hashes; #748's own tests supply a hash-matching policy to
-/// prove the approved and unapproved paths end to end.
+/// This is the seam #736 fills. It runs for **both** `allow` values, before
+/// UTF-8 validation and before any TOML decoding, so no unapproved byte can
+/// reach a validator or an adopter.
 pub(crate) trait ContentApprovalPolicy {
-    fn approve_untrusted_adoption<'a>(
-        &self,
+    fn check_untrusted_source<'a>(
+        &mut self,
         project: &'a VerifiedProject,
         entry: &'a crate::config_sources::SourceEntry,
+        scope: crate::config_sources::SourceScope,
         bytes: &'a [u8],
-    ) -> anyhow::Result<ApprovedSourceContent<'a>>;
-}
+    ) -> anyhow::Result<ContentApproval<'a>>;
 
-/// The production policy in `#748`: no `trust = false` bytes are approved yet.
-///
-/// Refusing here — before UTF-8, TOML or adoption decoding — is what keeps mutable
-/// repository bytes from granting ambient mounts, egress, a boot image or launch
-/// verbs on the strength of a pathname the user wrote once.
-pub(crate) struct UnpinnedContentPolicy;
-
-impl ContentApprovalPolicy for UnpinnedContentPolicy {
-    fn approve_untrusted_adoption<'a>(
-        &self,
-        project: &'a VerifiedProject,
-        entry: &'a crate::config_sources::SourceEntry,
-        _bytes: &'a [u8],
-    ) -> anyhow::Result<ApprovedSourceContent<'a>> {
-        Err(anyhow::anyhow!(
-            "config: {}: {}: allow = true on a trust = false source cannot adopt top-level image, \
-             mounts, [network], or allow_tools until content-hash pinning (#736) approves the \
-             file's bytes; set allow = false and opt in explicitly from the project config \
-             (image = \"{alias}:image\", allow_tools = [\"{alias}:<tool>\"]), or move the file \
-             outside the project and set trust = true",
-            crate::one_line::quoted_path(project.path()),
-            entry.declared(),
-            alias = entry.alias(),
-        ))
+    /// The store state the policy decided from, for the typed pending refusal.
+    /// `None` only for a test policy that has no store.
+    fn observed(&self) -> Option<crate::config_pins::store::ObservedStore> {
+        None
     }
 }
 

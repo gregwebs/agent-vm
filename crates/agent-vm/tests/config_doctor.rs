@@ -25,6 +25,8 @@ fn agent_vm_bin() -> PathBuf {
 
 #[path = "support/fake_msb.rs"]
 mod fake_msb;
+#[path = "support/source_pins.rs"]
+mod source_pins;
 #[path = "support/mod.rs"]
 mod support;
 
@@ -784,7 +786,9 @@ fn tool_configuration_section(stdout: &str) -> String {
 fn legacy_note(path: &Path) -> String {
     format!(
         "note: {} is not auto-loaded; agent-vm never reads an in-repo .agent-vm/config.toml.\n\
-         To use it, review it and source it from this project's config with `agent-vm config edit`.",
+         To use it, review it and source it from this project's config: edit the file\n\
+         `agent-vm doctor` names as its `project:` row with your own editor (this version\n\
+         has no `config edit` command).",
         path.display()
     )
 }
@@ -885,6 +889,11 @@ fn doctor_renders_each_source_row_with_trust_allow_and_inert_declarations() {
          [[sources]]\nname = \"repo\"\npath = \"./sourced.toml\"\n",
     );
 
+    // The row is about what an *approved* `trust = false` source renders, so the
+    // pin is stamped by the independent oracle rather than through a writer.
+    let repo = h.project_root.join("sourced.toml");
+    let hash = source_pins::approve(&h.home_root, &h.project_root, &repo);
+
     let out = h.run_doctor();
     assert_success(&out);
     let stdout = stdout_of(&out);
@@ -897,9 +906,9 @@ fn doctor_renders_each_source_row_with_trust_allow_and_inert_declarations() {
     );
     assert!(
         stdout.contains(&format!(
-            "  repo {} (found, 0 tools) [trust=false, allow=false; inert: image, mounts, \
-             [network], allow_tools]\n",
-            h.project_root.join("sourced.toml").display()
+            "  repo {} (found, 0 tools) [trust=false, allow=false, pin=approved \
+             sha256:{hash}; inert: image, mounts, [network], allow_tools]\n",
+            repo.display()
         )),
         "{stdout}"
     );
@@ -1121,6 +1130,10 @@ fn only_an_explicitly_sourced_in_repo_config_suppresses_the_legacy_notice() {
          [[sources]]\nname = \"home\"\npath = \"~/.config/agent-vm/config.toml\"\ntrust = true\nallow = true\n\
          [[sources]]\nname = \"repo\"\npath = \"./.agent-vm/config.toml\"\n",
     );
+    // `trust = false` is essential here, not incidental: a trusted source is
+    // refused inside the checkout, so listing this in-repo file as a source can
+    // only be spelled as an untrusted one — and that needs a pin.
+    source_pins::approve(&sourced.home_root, &sourced.project_root, &legacy);
 
     let out = sourced.run_doctor();
     assert_success(&out);
@@ -3285,11 +3298,15 @@ fn inert_project_tool_advice_names_the_project_file_and_the_entry_loads() {
 fn inert_source_tool_advice_is_qualified_and_pastes_into_the_project() {
     let h = Harness::new();
     h.write_user("allow_tools = [\"live\"]\n[[tools]]\nname = \"live\"\ncommand = \"live\"\n");
+    let sourced = h.project_root.join("sourced.toml");
     std::fs::write(
-        h.project_root.join("sourced.toml"),
+        &sourced,
         "[[tools]]\nname = \"dörmant-tool\"\ncommand = \"dormant-cmd\"\n",
     )
     .unwrap();
+    // The row is about inert advice, not pinning, but an in-checkout source
+    // cannot be `trust = true`, so the pin is the fixture's cost of sourcing it.
+    source_pins::approve(&h.home_root, &h.project_root, &sourced);
     let sources = "[[sources]]\nname = \"repo\"\npath = \"./sourced.toml\"\n";
     write(&h.project_config(), &format!("allow_tools = []\n{sources}"));
 
@@ -3334,12 +3351,16 @@ fn inert_advice_replaces_a_verb_the_project_list_already_claims() {
         "allow_tools = [\"claude\"]\n\
          [[tools]]\nname = \"claude\"\ncommand = \"user-claude\"\n",
     );
+    let sourced = h.project_root.join("sourced.toml");
     std::fs::write(
-        h.project_root.join("sourced.toml"),
+        &sourced,
         "[[tools]]\nname = \"claude\"\ncommand = \"repo-claude\"\n",
     )
     .unwrap();
-    let sources = "[[sources]]\nname = \"home\"\
+    // Same reasoning as the row above: the inert-advisory assertion needs a
+    // checkout-scoped source, which is necessarily `trust = false`.
+    source_pins::approve(&h.home_root, &h.project_root, &sourced);
+    let sources = "[[sources]]\nname = \"home\"
                    \npath = \"~/.config/agent-vm/config.toml\"\ntrust = true\nallow = true\n\
                    [[sources]]\nname = \"repo\"\npath = \"./sourced.toml\"\n";
     write(
@@ -3465,4 +3486,109 @@ fn the_defaults_header_still_introduces_the_numbered_list() {
         "{stdout}"
     );
     assert!(!stdout.contains(INERT_HEADING), "{stdout}");
+}
+
+/// #736 V36: what doctor does around the pin state it reports.
+///
+/// (a) no approval ⇒ the R8 refusal and no question; (c) an ordinary doctor is
+/// read-only and does not wait for a held pin lock; (d) a damaged snapshot does
+/// not touch an approved row (snapshots are review material, not authority);
+/// (e) a stamped pin whose source disappeared, and a damaged manifest, both
+/// refuse **without** printing a `pin=approved` row.
+#[test]
+fn doctor_reports_pin_state_read_only_and_never_prompts() {
+    let h = Harness::new();
+    let source = h.project_root.join("sourced.toml");
+    write(
+        &source,
+        "image = \"localhost:1/repo:latest\"\n\
+         [[tools]]\nname = \"repo-tool\"\ncommand = \"/bin/true\"\n",
+    );
+    write(
+        &h.project_config(),
+        "allow_tools = [\"repo:repo-tool\"]\n\
+         [[sources]]\nname = \"repo\"\npath = \"./sourced.toml\"\n",
+    );
+    let store = source_pins::store_dir(&h.home_root, &h.project_root);
+
+    // (a) Unapproved: the refusal, no question, and no store file created.
+    let out = h.run_doctor();
+    assert_failure(&out);
+    assert!(
+        stderr_of(&out).contains("1 pinned source is not approved for this project"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert!(
+        !stdout_of(&out).contains("[y/N]") && !stderr_of(&out).contains("[y/N]"),
+        "doctor never asks"
+    );
+    assert_eq!(source_pins::entries(&store), ["config.toml".to_owned()]);
+
+    // Approved by the independent oracle: the row names the pin.
+    let hash = source_pins::approve(&h.home_root, &h.project_root, &source);
+    let before = source_pins::manifest_bytes(&store).unwrap();
+    let before_inode =
+        std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(store.join("pins.json")).unwrap());
+
+    // (c) A held `LOCK_EX` does not block doctor, and the manifest is untouched.
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(store.join("pins.lock"))
+        .expect("open the lock file");
+    use std::os::fd::AsRawFd as _;
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "the fixture holds the pin lock"
+    );
+    let out = h.run_doctor();
+    assert_success(&out);
+    assert!(
+        stdout_of(&out).contains(&format!("pin=approved sha256:{hash}")),
+        "{}",
+        stdout_of(&out)
+    );
+    assert_eq!(
+        source_pins::manifest_bytes(&store).unwrap(),
+        before,
+        "doctor wrote no approval"
+    );
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(store.join("pins.json")).unwrap()),
+        before_inode
+    );
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+
+    // (d) A tampered snapshot is review material only: the approved row stands.
+    source_pins::tamper_snapshot(&store, &hash);
+    let out = h.run_doctor();
+    assert_success(&out);
+    assert!(
+        stdout_of(&out).contains(&format!("pin=approved sha256:{hash}")),
+        "{}",
+        stdout_of(&out)
+    );
+
+    // (e1) The pinned source disappeared: refuse, and print no approved row.
+    std::fs::remove_file(&source).unwrap();
+    let out = h.run_doctor();
+    assert_failure(&out);
+    let combined = format!("{}{}", stdout_of(&out), stderr_of(&out));
+    assert!(combined.contains("not found"), "{combined}");
+    assert!(!combined.contains("pin=approved"), "{combined}");
+
+    // (e2) A damaged manifest refuses by naming pins.json, and again no row.
+    write(
+        &source,
+        "image = \"localhost:1/repo:latest\"\n\
+         [[tools]]\nname = \"repo-tool\"\ncommand = \"/bin/true\"\n",
+    );
+    source_pins::damage_manifest(&store);
+    let out = h.run_doctor();
+    assert_failure(&out);
+    let combined = format!("{}{}", stdout_of(&out), stderr_of(&out));
+    assert!(combined.contains("pins.json"), "{combined}");
+    assert!(!combined.contains("pin=approved"), "{combined}");
 }

@@ -249,6 +249,9 @@ pub(crate) struct ProtectedConfigDir {
     /// `R2`: the `.sessions` directories no bind of *any* mode may name, even
     /// though `R1` exempts `:ro`/`:fork` (D3).
     sessions: Vec<SessionsDir>,
+    /// Sibling snapshot scans the shared work budget cut short (D5, R18). Never
+    /// fatal, and never silent: the caller prints them as launch notices.
+    warnings: Vec<String>,
     cwd: PathBuf,
 }
 #[derive(Debug)]
@@ -571,19 +574,39 @@ fn file_links(
     Ok(links)
 }
 
-/// One project store's `config.toml`, measured like the authority store's files
-/// (ADR-0073).
+/// One project store's authority files, measured like the authority store's
+/// files (ADR-0073, ADR-0038).
+///
+/// `config.toml` and `pins.json` are measured by exact name, needing no
+/// `read_dir`, so a store whose snapshot scan the budget cut short still has
+/// both of them checked. The store's snapshots join them under the names the
+/// pin store writes ([`crate::config_pins::is_snapshot_name`], matched
+/// case-insensitively so an APFS case variant cannot evade the check) and under
+/// the same admittance rules: a regular file, owned by this user, not group- or
+/// other-writable, and — via [`ProtectedConfigDir::check_authority_links`] — a
+/// single link. A snapshot name occupied by anything else is a file the guard
+/// cannot vouch for, so it refuses rather than being skipped.
 ///
 /// `lstat(<entry>/config.toml)` answers `NotADirectory` when the entry itself is
 /// not a directory — a regular file, or a symlink to one — and the generic
 /// "cannot determine" context then names only the file under it, which no user
 /// can act on. The refusal stays: an entry the guard cannot classify is exactly
 /// what it must not skip, so the message names the entry and the one remedy.
-fn project_store_file_links(entry: &Path) -> Result<Vec<(PathBuf, u64)>> {
-    file_links(entry, &[crate::project_config::CONFIG_FILE], |path| {
-        fs::symlink_metadata(path)
-    })
-    .map_err(|error| match error.downcast_ref::<std::io::Error>() {
+fn project_store_file_links(entry: &Path, scan: StoreScan<'_>) -> Result<StoreFileLinks> {
+    let measured = (|| -> Result<StoreFileLinks> {
+        let mut links = file_links(
+            entry,
+            &[
+                crate::project_config::CONFIG_FILE,
+                crate::config_pins::PINS_FILE,
+            ],
+            |path| fs::symlink_metadata(path),
+        )?;
+        let (snapshots, warning) = snapshot_file_links(entry, scan)?;
+        links.extend(snapshots);
+        Ok((links, warning))
+    })();
+    measured.map_err(|error| match error.downcast_ref::<std::io::Error>() {
         Some(e) if e.kind() == std::io::ErrorKind::NotADirectory => anyhow::anyhow!(
             "cannot determine whether a mount would expose {file}: {entry} is not a directory, \
              and every entry of the project store is measured; remove it",
@@ -592,6 +615,164 @@ fn project_store_file_links(entry: &Path) -> Result<Vec<(PathBuf, u64)>> {
         ),
         _ => error,
     })
+}
+
+/// One store's measured authority files: the link counts the one-name check
+/// consumes, and the bounded-scan warning when this was a sibling's store.
+type StoreFileLinks = (Vec<(PathBuf, u64)>, Option<String>);
+
+/// Which store's snapshot scan this is.
+///
+/// The current launch's own store gets a reservation of its own, taken before
+/// any sibling costs anything, and crossing it refuses the launch (D5). Every
+/// other store is charged against one cross-home budget, and a scan the budget
+/// cut short warns instead of wedging an unrelated project.
+enum StoreScan<'a> {
+    Current,
+    Sibling(&'a mut SiblingWork),
+}
+
+/// The one work budget behind [`StoreScan::Sibling`], spanning every home
+/// [`ProtectedConfigDir::measure`] visits rather than restarting per home (D5).
+///
+/// Enumeration and a matched snapshot's `lstat` each cost one unit, because a
+/// store packed with junk entries costs the same scan as one packed with
+/// snapshots, and a second `$HOME` must not buy another 8192 units.
+struct SiblingWork {
+    remaining: usize,
+}
+
+impl SiblingWork {
+    fn new() -> Self {
+        Self {
+            remaining: MAX_SIBLING_SNAPSHOT_WORK,
+        }
+    }
+
+    /// Take one unit; `false` means the budget is spent and the scan must stop.
+    fn charge(&mut self) -> bool {
+        match self.remaining.checked_sub(1) {
+            Some(left) => {
+                self.remaining = left;
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// The one-link counts of every pin snapshot a project store holds, plus the
+/// warning when a sibling's scan was bounded (D5, R18).
+///
+/// Only the entry *name* decides what is a snapshot, so `pins.lock`,
+/// `.agent-vm-pin-tmp-*` and a malformed `pin-XYZ.toml` cost enumeration work
+/// and are otherwise ignored. A matching name that is not a regular file, or is
+/// someone else's or writable by others, refuses: those are exactly the files
+/// the pin store itself will not read.
+fn snapshot_file_links(entry: &Path, mut scan: StoreScan<'_>) -> Result<StoreFileLinks> {
+    let entries = match fs::read_dir(entry) {
+        Ok(entries) => entries,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok((Vec::new(), None));
+        }
+        Err(e) => return Err(e).with_context(|| uncertain(entry)),
+    };
+    let mut names: Vec<std::ffi::OsString> = Vec::new();
+    let mut bounded = false;
+    for entry_result in entries {
+        let entry_result = entry_result.with_context(|| uncertain(entry))?;
+        match &mut scan {
+            StoreScan::Current if names.len() >= MAX_PROJECT_STORE_ENTRIES => bail!(
+                "{projects}: more than {MAX_PROJECT_STORE_ENTRIES} entries, and this launch \
+                 measures every pin snapshot in its own project store; quiesce every agent-vm \
+                 process for this project, then remove the confirmed orphan pin-*.toml snapshots \
+                 and abandoned .agent-vm-pin-tmp-* files under {store}, and keep pins.json and \
+                 pins.lock",
+                projects = uncertain(entry),
+                store = crate::one_line::quoted_path(entry),
+            ),
+            StoreScan::Current => {}
+            StoreScan::Sibling(work) => {
+                if names.len() >= MAX_PROJECT_STORE_ENTRIES || !work.charge() {
+                    bounded = true;
+                    break;
+                }
+            }
+        }
+        names.push(entry_result.file_name());
+    }
+    // Deterministic across filesystems, so a first-match refusal does not depend
+    // on directory hash order.
+    names.sort();
+    let mut links = Vec::new();
+    for name in names {
+        if !crate::config_pins::is_snapshot_name(&name) {
+            continue;
+        }
+        match &mut scan {
+            StoreScan::Current => {}
+            StoreScan::Sibling(work) => {
+                if !work.charge() {
+                    bounded = true;
+                    break;
+                }
+            }
+        }
+        let file = entry.join(&name);
+        match fs::symlink_metadata(&file) {
+            Ok(metadata) if metadata.is_file() => {
+                check_snapshot_file(&file, &metadata)?;
+                links.push((file, metadata.nlink()));
+            }
+            // Nothing is there to vouch for: a cleanup unlinked it between the
+            // enumeration and the stat.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => bail!(
+                "{file}: a source pin snapshot name is not a regular file, and agent-vm will not \
+                 launch while a file it cannot vouch for sits where it reads a snapshot; remove it",
+                file = crate::one_line::quoted_path(&file),
+            ),
+            Err(e) => return Err(e).with_context(|| uncertain(&file)),
+        }
+    }
+    let warning = bounded.then(|| {
+        format!(
+            "==> warning: {store}: the pin snapshot scan was bounded by this launch's limits \
+             ({MAX_PROJECT_STORE_ENTRIES} entries per store, {MAX_SIBLING_SNAPSHOT_WORK} units \
+             across every other project store), so this store's remaining snapshots were not \
+             measured; each snapshot is verified by its own SHA-256 when read",
+            store = crate::one_line::quoted_path(entry),
+        )
+    });
+    Ok((links, warning))
+}
+
+/// ADR-0040's file admittance rules for a pin snapshot: this user's file, not
+/// group- or other-writable. The link count is checked with every other
+/// authority file, so all of them answer with one sentence.
+fn check_snapshot_file(file: &Path, metadata: &fs::Metadata) -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    if metadata.uid() != crate::host_paths::current_euid() {
+        bail!(
+            "{file}: a source pin snapshot is not owned by you, and agent-vm will not launch \
+             while it could read someone else's snapshot; remove it",
+            file = crate::one_line::quoted_path(file),
+        );
+    }
+    if metadata.mode() & 0o022 != 0 {
+        bail!(
+            "{file}: a source pin snapshot is group- or other-writable, and agent-vm will not \
+             launch while another user could rewrite the baseline it reviews against; make it \
+             writable by you only",
+            file = crate::one_line::quoted_path(file),
+        );
+    }
+    Ok(())
 }
 
 /// One additional host-only store (ADR-0064) measured exactly like the
@@ -752,6 +933,17 @@ fn lexical_ancestors(spelled_file: &Path) -> MeasuredDir {
 /// directory, the bound and the remedy.
 const MAX_PROJECT_STORES: usize = 1024;
 
+/// One project store's bounded directory scan (R18).
+///
+/// The current launch's own store gets this reservation in full, before any
+/// sibling is scanned, and crossing it refuses the launch: this store's pins are
+/// its own launch's authority, so a file it cannot measure must not be skipped.
+const MAX_PROJECT_STORE_ENTRIES: usize = 2048;
+
+/// The work one launch may spend on **sibling** stores' snapshot scans, one
+/// budget for every `$HOME` it measures (D5, R18).
+const MAX_SIBLING_SNAPSHOT_WORK: usize = 8192;
+
 /// Stores measured so far, in first-match order, plus the spellings already in
 /// them.
 ///
@@ -778,12 +970,63 @@ impl MeasuredDirs {
     }
 }
 
+/// The identity of the current launch's project store, and of its `pins.json`.
+///
+/// A sibling is matched by what a file *is*, never by how its directory is
+/// spelled (B4/D5): an APFS case variant of the project digest, or an uppercase
+/// spelling of it, is the same store and must not be scanned twice or spend the
+/// sibling budget.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StoreIdentity {
+    dir: Option<(u64, u64)>,
+    pins: Option<(u64, u64)>,
+}
+
+impl StoreIdentity {
+    fn of(store: &Path) -> Self {
+        Self {
+            dir: identity_of(store),
+            pins: identity_of(&store.join(crate::config_pins::PINS_FILE)),
+        }
+    }
+
+    /// Whether `other` is this store: the same directory, or the same
+    /// `pins.json`. A hard-linked manifest matches here too, and that can only
+    /// save work: the current store's own one-link check refuses it either way.
+    fn is(&self, other: &Self) -> bool {
+        (self.dir.is_some() && self.dir == other.dir)
+            || (self.pins.is_some() && self.pins == other.pins)
+    }
+}
+
+fn identity_of(path: &Path) -> Option<(u64, u64)> {
+    fs::symlink_metadata(path)
+        .ok()
+        .map(|metadata| (metadata.dev(), metadata.ino()))
+}
+
+/// The current launch's project store, measured **first** and by identity
+/// (D5/B4).
+///
+/// Its path comes from the captured project plus the authority HOME, so it is
+/// not discovered among `projects/`' entries at all: a case-variant spelling of
+/// the entry cannot make it a sibling. Its snapshot scan takes the full 2048-entry
+/// reservation before any sibling costs a unit, and its files are checked whether
+/// or not the sibling budget is later spent.
+fn measure_current_project_store(store: &Path) -> Result<(MeasuredDir, StoreIdentity)> {
+    let mut dir = measure_store(store.to_path_buf(), StorePurpose::LaunchAuthority)?;
+    let (links, _warning) = project_store_file_links(&dir.spelled, StoreScan::Current)?;
+    dir.authority_file_links = links;
+    let identity = StoreIdentity::of(&dir.spelled);
+    Ok((dir, identity))
+}
+
 /// ADR-0073: project configs sit strictly inside the authority directory, where
 /// "is or contains a route" alone allows a writable bind of `projects/` or of one
 /// project's directory (ADR-0038: a bind strictly inside is allowed). Each is
 /// therefore its own measured store: the walk records its routes — through a
 /// symlinked entry, to wherever it points — so such a bind is refused, and its
-/// `config.toml` joins the one-name check.
+/// `config.toml`, `pins.json` and pin snapshots join the one-name check.
 ///
 /// **Every** existing entry, not only this launch's project: the guard exists so
 /// P1's guest cannot plant P2's authority (ADR-0038's cross-project threat). The
@@ -791,10 +1034,21 @@ impl MeasuredDirs {
 /// uninspectable route or multi-link `config.toml` refuses every launch, because
 /// leaving it unmeasured would launder it into a later one.
 ///
+/// The current store — when `current` names it — was already measured, so it is
+/// skipped by identity. Every other store's exact `config.toml` and `pins.json`
+/// checks and its directory route are measured unconditionally; only its
+/// snapshot scan draws on `work`, and one it cannot finish yields a warning
+/// rather than refusing an unrelated project.
+///
 /// A missing entry needs no prospective record: provisioning names are 12-hex
 /// state names or fixed words, which the name rule never equates with a 64-hex
 /// project id, so no core bind can create one.
-fn measure_project_stores(home: &Path) -> Result<Vec<MeasuredDir>> {
+fn measure_project_stores(
+    home: &Path,
+    current: Option<&StoreIdentity>,
+    work: &mut SiblingWork,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<MeasuredDir>> {
     let projects = crate::project_config::projects_dir(home);
     let mut dirs = vec![measure_store(
         projects.clone(),
@@ -834,8 +1088,16 @@ fn measure_project_stores(home: &Path) -> Result<Vec<MeasuredDir>> {
         if !(kind.is_dir() || kind.is_symlink()) {
             continue;
         }
-        let mut dir = measure_store(entry.path(), StorePurpose::LaunchAuthority)?;
-        dir.authority_file_links = project_store_file_links(&dir.spelled)?;
+        let spelled = entry.path();
+        if current.is_some_and(|current| current.is(&StoreIdentity::of(&spelled))) {
+            continue;
+        }
+        let mut dir = measure_store(spelled, StorePurpose::LaunchAuthority)?;
+        let (links, warning) = project_store_file_links(&dir.spelled, StoreScan::Sibling(work))?;
+        dir.authority_file_links = links;
+        if let Some(warning) = warning {
+            warnings.push(warning);
+        }
         dirs.push(dir);
     }
     if !dirs.is_empty() {
@@ -906,19 +1168,27 @@ fn measure_project_trusted_sources(projects: &Path) -> Result<Vec<MeasuredDir>> 
 }
 
 impl ProtectedConfigDir {
-    /// Measure the authority stores (one per `$HOME`), the project stores under
-    /// each of them (ADR-0073), every `trust = true` source this launch reads
-    /// (ADR-0076 R2.4), and the extra host-only stores this launcher writes
-    /// refusal artefacts into (ADR-0064).
+    /// Measure the authority stores (one per `$HOME`), this launch's own project
+    /// store, the other project stores under each home (ADR-0073), every
+    /// `trust = true` source this launch reads (ADR-0076 R2.4), and the extra
+    /// host-only stores this launcher writes refusal artefacts into (ADR-0064).
     ///
     /// Two passes over `homes` on purpose: every home's top-level
     /// `~/.config/agent-vm` is measured before *any* project store, so a
     /// project-store route in a raw `$HOME` cannot outrank the account home's
-    /// authority store in [`Self::decide`]'s first-match scan.
+    /// authority store in [`Self::decide`]'s first-match scan. The current
+    /// launch's own project store is measured between the two, before any sibling
+    /// is scanned, so its 2048-entry reservation is spent first (D5).
+    ///
+    /// `project_store` is the current launch's store, carried from the captured
+    /// project and the authority HOME (D5/B4). It is measured directly rather
+    /// than found among `projects/`' entries, and the sibling scan recognises it
+    /// by identity, so a case-variant spelling cannot make it a sibling.
     pub(crate) fn measure(
         homes: &[PathBuf],
         stores: &[Store],
         trusted_sources: &[PathBuf],
+        project_store: Option<&Path>,
         cwd: &Path,
     ) -> Result<Self> {
         let mut dirs = MeasuredDirs::default();
@@ -930,8 +1200,20 @@ impl ProtectedConfigDir {
                 unique_homes.push(home);
             }
         }
+        let mut work = SiblingWork::new();
+        let mut warnings = Vec::new();
+        let current = match project_store {
+            Some(store) => {
+                let (dir, identity) = measure_current_project_store(&anchored(cwd, store))?;
+                dirs.push(dir);
+                Some(identity)
+            }
+            None => None,
+        };
         for home in &unique_homes {
-            for project_store in measure_project_stores(home)? {
+            for project_store in
+                measure_project_stores(home, current.as_ref(), &mut work, &mut warnings)?
+            {
                 dirs.push(project_store);
             }
         }
@@ -969,8 +1251,15 @@ impl ProtectedConfigDir {
         Ok(Self {
             dirs: dirs.dirs,
             sessions,
+            warnings,
             cwd: cwd.to_path_buf(),
         })
+    }
+
+    /// The sibling snapshot scans the shared budget cut short (D5, R18), each as
+    /// a complete notice line. A launch prints them; a test asserts on them.
+    pub(crate) fn warnings(&self) -> &[String] {
+        &self.warnings
     }
     pub(crate) fn check_authority_links(&self) -> Result<()> {
         for d in &self.dirs {
@@ -1210,6 +1499,14 @@ mod tests {
     fn cs(parts: &[&str]) -> Vec<Vec<u8>> {
         parts.iter().map(|p| p.as_bytes().to_vec()).collect()
     }
+    /// One snapshot file name in the store's canonical shape, so a test names a
+    /// file the guard must measure rather than one it may ignore.
+    fn snapshot_for_tests() -> String {
+        crate::config_pins::snapshot_name(
+            crate::config_pins::StoreId::parse_hex(&"b".repeat(32)).unwrap(),
+            &crate::config_pins::ContentHash::of(b"snapshot"),
+        )
+    }
     #[test]
     fn name_equivalence_table() {
         for (a, b) in [
@@ -1299,6 +1596,7 @@ mod tests {
                 prospective_suffixes: Vec::new(),
             }],
             sessions: Vec::new(),
+            warnings: Vec::new(),
             cwd: "/".into(),
         };
         let error = guard.check_authority_links().unwrap_err().to_string();
@@ -1413,6 +1711,7 @@ mod tests {
         let guard = ProtectedConfigDir {
             dirs: vec![d],
             sessions: Vec::new(),
+            warnings: Vec::new(),
             cwd: "/".into(),
         };
         let anchor = WriteRoute {
@@ -1568,8 +1867,9 @@ mod tests {
         fs::write(&file, "").unwrap();
         let entry = projects.join("e".repeat(64));
         symlink(&file, &entry).unwrap();
-        let error = ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &[], &t.cwd)
-            .expect_err("a store entry that cannot be measured refuses the launch");
+        let error =
+            ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &[], None, &t.cwd)
+                .expect_err("a store entry that cannot be measured refuses the launch");
         let message = format!("{error:#}");
         assert!(
             message.contains(&format!("\"{}\"", entry.display())),
@@ -1592,8 +1892,9 @@ mod tests {
         for n in 0..=MAX_PROJECT_STORES {
             fs::create_dir(projects.join(format!("{n:064x}"))).unwrap();
         }
-        let error = ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &[], &t.cwd)
-            .expect_err("an unbounded project store refuses the launch");
+        let error =
+            ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &[], None, &t.cwd)
+                .expect_err("an unbounded project store refuses the launch");
         let message = format!("{error:#}");
         assert!(
             message.contains(&MAX_PROJECT_STORES.to_string())
@@ -1611,7 +1912,8 @@ mod tests {
         let cfg = t.home.join(".config/agent-vm");
         fs::create_dir_all(cfg.join("projects").join("a".repeat(64))).unwrap();
         let guard =
-            ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &[], &t.cwd).unwrap();
+            ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &[], None, &t.cwd)
+                .unwrap();
         assert!(
             guard
                 .check_core_bind(&CoreHostSource::new(
@@ -1637,7 +1939,8 @@ mod tests {
         // authority directory, so both stores match a bind of it.
         symlink(&cfg, raw_projects.join("a".repeat(64))).unwrap();
         let guard =
-            ProtectedConfigDir::measure(&[raw.clone(), t.home.clone()], &[], &[], &t.cwd).unwrap();
+            ProtectedConfigDir::measure(&[raw.clone(), t.home.clone()], &[], &[], None, &t.cwd)
+                .unwrap();
         let msg = guard
             .check_core_bind(&CoreHostSource::new(CoreBind::StateDir, cfg.clone()))
             .unwrap_err()
@@ -1646,6 +1949,260 @@ mod tests {
             msg.contains(&format!("\"{}\"", cfg.display())),
             "the account home's authority store must answer first: {msg}"
         );
+    }
+
+    /// The pin manifest is authority under the same one-name rule as
+    /// `config.toml`: another name for it could be rewritten from a guest and
+    /// then removed.
+    #[test]
+    fn a_project_pins_manifest_with_two_links_refuses_every_launch() {
+        let t = Tree::new();
+        let projects = t.home.join(".config/agent-vm/projects");
+        let store = projects.join("c".repeat(64));
+        fs::create_dir_all(&store).unwrap();
+        let pins = store.join(crate::config_pins::PINS_FILE);
+        fs::write(&pins, "{\"v\":1}").unwrap();
+        let alias = t.cwd.join("pins-alias");
+        fs::hard_link(&pins, &alias).unwrap();
+        let msg = t.guard().check_authority_links().unwrap_err().to_string();
+        assert!(
+            msg.contains(&format!("\"{}\" has 2 hard links", pins.display())),
+            "{msg}"
+        );
+        fs::remove_file(&alias).unwrap();
+        assert!(t.guard().check_authority_links().is_ok());
+    }
+
+    /// V33: a snapshot is authority under the same one-name rule as the manifest
+    /// it belongs to, matched case-insensitively so an APFS case variant of a
+    /// live snapshot cannot evade the check.
+    #[test]
+    fn a_project_snapshot_with_two_links_refuses_every_launch() {
+        let t = Tree::new();
+        let store = t
+            .home
+            .join(".config/agent-vm/projects")
+            .join("d".repeat(64));
+        fs::create_dir_all(&store).unwrap();
+        for name in [snapshot_for_tests(), snapshot_for_tests().to_uppercase()] {
+            let snapshot = store.join(&name);
+            fs::write(&snapshot, "snapshot").unwrap();
+            let alias = t.cwd.join("snapshot-alias");
+            fs::hard_link(&snapshot, &alias).unwrap();
+            let msg = t.guard().check_authority_links().unwrap_err().to_string();
+            assert!(
+                msg.contains(&format!("\"{}\" has 2 hard links", snapshot.display())),
+                "{name}: {msg}"
+            );
+            fs::remove_file(&alias).unwrap();
+            assert!(t.guard().check_authority_links().is_ok());
+            fs::remove_file(&snapshot).unwrap();
+        }
+    }
+
+    /// V33: a name the pin store reserves for a snapshot, occupied by anything
+    /// else, is a file the guard cannot vouch for, so the launch is refused
+    /// rather than the file being skipped. A snapshot another user could rewrite
+    /// is refused for the same reason. Names the store writes that are not
+    /// snapshots stay ignored.
+    #[test]
+    fn a_snapshot_name_that_is_not_a_snapshot_file_refuses_the_launch() {
+        let t = Tree::new();
+        let store = t
+            .home
+            .join(".config/agent-vm/projects")
+            .join("e".repeat(64));
+        fs::create_dir_all(store.join(snapshot_for_tests())).unwrap();
+        let msg =
+            ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &[], None, &t.cwd)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            msg.contains("not a regular file") && msg.contains("remove it"),
+            "{msg}"
+        );
+
+        // The pin store's own junk names are not snapshots: they cost
+        // enumeration work and are otherwise ignored.
+        fs::remove_dir(store.join(snapshot_for_tests())).unwrap();
+        for name in [
+            crate::config_pins::LOCK_FILE.to_owned(),
+            format!("{}{}", crate::config_pins::PIN_TMP_PREFIX, "x"),
+            "pin-XYZ.toml".to_owned(),
+            "unrelated".to_owned(),
+        ] {
+            fs::write(store.join(name), "").unwrap();
+        }
+        assert!(t.guard().check_authority_links().is_ok());
+
+        use std::os::unix::fs::PermissionsExt as _;
+        let snapshot = store.join(snapshot_for_tests());
+        fs::write(&snapshot, "snapshot").unwrap();
+        fs::set_permissions(&snapshot, fs::Permissions::from_mode(0o666)).unwrap();
+        let msg =
+            ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &[], None, &t.cwd)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            msg.contains("group- or other-writable") && msg.contains("writable by you only"),
+            "{msg}"
+        );
+        fs::set_permissions(&snapshot, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(t.guard().check_authority_links().is_ok());
+    }
+
+    /// V33/D5: this launch's own store is measured first, with its own
+    /// 2048-entry reservation, so it is fully checked even when every sibling
+    /// unit is already spent. One `MAX_SIBLING_SNAPSHOT_WORK` budget spans both
+    /// homes: exhaustion in the first home bounds the second, and the bounded
+    /// scan is reported against the store it cut short rather than skipped
+    /// silently.
+    #[test]
+    fn one_sibling_budget_spans_every_home_after_the_current_store() {
+        let t = Tree::new();
+        let second_home = t.cwd.join("second-home");
+        let first_projects = t.home.join(".config/agent-vm/projects");
+        let second_projects = second_home.join(".config/agent-vm/projects");
+        // Four full sibling scans of junk entries spend all 8192 units: the
+        // per-store 2048-entry cap means no fewer stores can exhaust it.
+        for store in 0..4 {
+            let dir = first_projects.join(format!("{store:064x}"));
+            fs::create_dir_all(&dir).unwrap();
+            for entry in 0..MAX_PROJECT_STORE_ENTRIES {
+                fs::write(dir.join(format!("junk-{entry:05}")), "").unwrap();
+            }
+        }
+        let current = second_projects.join("a".repeat(64));
+        let sibling = second_projects.join("b".repeat(64));
+        fs::create_dir_all(&current).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        let current_snapshot = current.join(snapshot_for_tests());
+        fs::write(&current_snapshot, "snapshot").unwrap();
+        fs::hard_link(&current_snapshot, t.cwd.join("current-alias")).unwrap();
+        let sibling_snapshot = sibling.join(snapshot_for_tests());
+        fs::write(&sibling_snapshot, "snapshot").unwrap();
+        fs::hard_link(&sibling_snapshot, t.cwd.join("sibling-alias")).unwrap();
+
+        let guard = ProtectedConfigDir::measure(
+            &[t.home.clone(), second_home.clone()],
+            &[],
+            &[],
+            Some(&current),
+            &t.cwd,
+        )
+        .unwrap();
+        // Exactly one bounded scan, and it names the second home's sibling: the
+        // current store was not scanned again as a sibling, and the first home's
+        // stores each fit their own cap.
+        assert_eq!(guard.warnings().len(), 1, "{:?}", guard.warnings());
+        let warning = &guard.warnings()[0];
+        assert!(
+            warning.contains(&format!("{}", sibling.display())),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("was bounded") && warning.contains("snapshots were not measured"),
+            "{warning}"
+        );
+        // The current store's reservation was taken first: its snapshot is
+        // still checked, and refused, at zero remaining sibling budget.
+        let msg = guard.check_authority_links().unwrap_err().to_string();
+        assert!(
+            msg.contains(&format!(
+                "\"{}\" has 2 hard links",
+                current_snapshot.display()
+            )),
+            "{msg}"
+        );
+    }
+
+    /// V33: the current store's own 2048-entry bound fails closed, with a
+    /// remedy naming the store, however small the sibling scan was.
+    #[test]
+    fn too_many_entries_in_the_current_store_refuse_the_launch() {
+        let t = Tree::new();
+        let store = t
+            .home
+            .join(".config/agent-vm/projects")
+            .join("f".repeat(64));
+        fs::create_dir_all(&store).unwrap();
+        for entry in 0..=MAX_PROJECT_STORE_ENTRIES {
+            fs::write(store.join(format!("pin-XYZ-{entry:05}.toml")), "").unwrap();
+        }
+        let error = ProtectedConfigDir::measure(
+            std::slice::from_ref(&t.home),
+            &[],
+            &[],
+            Some(&store),
+            &t.cwd,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains(&MAX_PROJECT_STORE_ENTRIES.to_string())
+                && error.contains(&format!("{}", crate::one_line::quoted_path(&store))),
+            "{error}"
+        );
+        // The remedy must not tell anyone to remove `pins.lock`: it is the
+        // store's permanent coordination inode (ADR-0077), so only confirmed
+        // orphans and abandoned temporaries are removable.
+        assert!(error.contains("quiesce"), "{error}");
+        assert!(error.contains("confirmed orphan pin-*.toml"), "{error}");
+        assert!(error.contains("keep pins.json and pins.lock"), "{error}");
+        assert!(!error.contains("remove the orphan"), "{error}");
+    }
+
+    /// V33/B4: the current store is recognised by identity, never by spelling. A
+    /// case-folded APFS spelling and a symlink alias both name the same store, so
+    /// neither makes it a sibling — and its snapshots are still checked.
+    #[test]
+    fn the_current_store_is_recognised_by_identity_not_by_spelling() {
+        let t = Tree::new();
+        let store = t
+            .home
+            .join(".config/agent-vm/projects")
+            .join("a".repeat(64));
+        fs::create_dir_all(&store).unwrap();
+        fs::write(store.join(crate::config_pins::PINS_FILE), "{\"v\":1}").unwrap();
+
+        let spelling = if identity_of(&store) == identity_of(&store.with_file_name("A".repeat(64)))
+        {
+            // APFS: the uppercase spelling is the same directory.
+            store.with_file_name("A".repeat(64))
+        } else {
+            let alias = t.cwd.join("store-alias");
+            symlink(&store, &alias).unwrap();
+            alias
+        };
+        assert!(
+            StoreIdentity::of(&store).is(&StoreIdentity::of(&spelling)),
+            "{} names the same store",
+            spelling.display()
+        );
+        let other = t
+            .home
+            .join(".config/agent-vm/projects")
+            .join("b".repeat(64));
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join(crate::config_pins::PINS_FILE), "{\"v\":1}").unwrap();
+        assert!(!StoreIdentity::of(&store).is(&StoreIdentity::of(&other)));
+
+        // Measured through the other spelling it is still this launch's store:
+        // its snapshot is checked, and its second name refused.
+        let snapshot = store.join(snapshot_for_tests());
+        fs::write(&snapshot, "snapshot").unwrap();
+        fs::hard_link(&snapshot, t.cwd.join("snapshot-alias")).unwrap();
+        let guard = ProtectedConfigDir::measure(
+            std::slice::from_ref(&t.home),
+            &[],
+            &[],
+            Some(&spelling),
+            &t.cwd,
+        )
+        .unwrap();
+        assert!(guard.warnings().is_empty(), "{:?}", guard.warnings());
+        let msg = guard.check_authority_links().unwrap_err().to_string();
+        assert!(msg.contains("has 2 hard links"), "{msg}");
     }
 
     /// ADR-0038 Decision 2 over every project's `config.toml`, in sorted entry
@@ -1688,9 +2245,10 @@ mod tests {
         }
         use std::os::unix::fs::PermissionsExt as _;
         fs::set_permissions(&second, fs::Permissions::from_mode(0o000)).unwrap();
-        let err = ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &[], &t.cwd)
-            .unwrap_err()
-            .to_string();
+        let err =
+            ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &[], None, &t.cwd)
+                .unwrap_err()
+                .to_string();
         fs::set_permissions(&second, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(err.contains("cannot determine"), "{err}");
     }
@@ -1706,9 +2264,10 @@ mod tests {
         fs::create_dir_all(&projects).unwrap();
         use std::os::unix::fs::PermissionsExt as _;
         fs::set_permissions(&projects, fs::Permissions::from_mode(0o000)).unwrap();
-        let err = ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &[], &t.cwd)
-            .unwrap_err()
-            .to_string();
+        let err =
+            ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &[], None, &t.cwd)
+                .unwrap_err()
+                .to_string();
         fs::set_permissions(&projects, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(err.contains("cannot determine"), "{err}");
         assert!(err.contains("projects"), "{err}");
@@ -1735,7 +2294,7 @@ mod tests {
         fs::remove_file(t.home.join(".config")).unwrap();
         symlink(".config", t.home.join(".config")).unwrap();
         assert!(
-            ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &[], &t.cwd)
+            ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &[], None, &t.cwd)
                 .unwrap_err()
                 .to_string()
                 .contains("cannot determine")
@@ -1743,7 +2302,8 @@ mod tests {
         fs::remove_file(t.home.join(".config")).unwrap();
         fs::write(t.home.join(".config"), "file").unwrap();
         assert!(
-            ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &[], &t.cwd).is_err()
+            ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &[], None, &t.cwd)
+                .is_err()
         );
     }
     #[test]
@@ -1751,8 +2311,9 @@ mod tests {
         let t = Tree::new();
         let other = t.cwd.join("other");
         fs::create_dir(&other).unwrap();
-        let guard = ProtectedConfigDir::measure(&[t.home.clone(), other.clone()], &[], &[], &t.cwd)
-            .unwrap();
+        let guard =
+            ProtectedConfigDir::measure(&[t.home.clone(), other.clone()], &[], &[], None, &t.cwd)
+                .unwrap();
         for home in [&t.home, &other] {
             assert!(
                 guard
@@ -1797,7 +2358,8 @@ mod tests {
         fs::create_dir(&home).unwrap();
         fs::create_dir_all(home.join(".config/agent-vm")).unwrap();
         let guard =
-            ProtectedConfigDir::measure(std::slice::from_ref(&home), &[], &[], &t.cwd).unwrap();
+            ProtectedConfigDir::measure(std::slice::from_ref(&home), &[], &[], None, &t.cwd)
+                .unwrap();
         for message in [
             guard
                 .check_core_bind(&CoreHostSource::new(CoreBind::StateDir, home.clone()))
@@ -1922,8 +2484,9 @@ mod tests {
         let cfg = t.home.join(".config");
         fs::create_dir(&cfg).unwrap();
         fs::set_permissions(&cfg, fs::Permissions::from_mode(0o000)).unwrap();
-        let err = ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &[], &t.cwd)
-            .unwrap_err();
+        let err =
+            ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &[], None, &t.cwd)
+                .unwrap_err();
         fs::set_permissions(&cfg, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(err.to_string().contains("cannot determine"));
 
@@ -1934,8 +2497,9 @@ mod tests {
         fs::create_dir_all(&cfg).unwrap();
         fs::write(cfg.join("config.toml"), "# no network\n").unwrap();
         fs::set_permissions(&cfg, fs::Permissions::from_mode(0o000)).unwrap();
-        let err = ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &[], &t.cwd)
-            .unwrap_err();
+        let err =
+            ProtectedConfigDir::measure(std::slice::from_ref(&t.home), &[], &[], None, &t.cwd)
+                .unwrap_err();
         fs::set_permissions(&cfg, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(err.to_string().contains("cannot determine"));
         assert!(err.to_string().contains("config.toml"));
@@ -2043,6 +2607,7 @@ mod tests {
                 std::slice::from_ref(&self.home),
                 stores,
                 &self.trusted_sources,
+                None,
                 &self.cwd,
             )
             .unwrap()

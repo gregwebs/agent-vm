@@ -25,6 +25,7 @@
 
 use std::io;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
+use std::os::unix::process::CommandExt as _;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
@@ -214,6 +215,31 @@ impl Pty {
         prompt: &[u8],
         stdio: PtyStdio,
     ) -> io::Result<Self> {
+        Self::spawn_inner(command, prompt, stdio, false)
+    }
+
+    /// [`spawn_with_stdio`](Self::spawn_with_stdio) with the child made a
+    /// session leader whose **controlling terminal** is this pty.
+    ///
+    /// Most callers only need `is_terminal()`, and a session-leader death on
+    /// macOS revokes the slave, so the default deliberately leaves the child in
+    /// the caller's session. A reader that verifies *foreground* ownership
+    /// (`tcgetpgrp(stdin) == getpgrp()`) cannot be satisfied any other way, so
+    /// that caller opts in here instead of growing a second driver.
+    pub fn spawn_controlling(
+        command: &mut Command,
+        prompt: &[u8],
+        stdio: PtyStdio,
+    ) -> io::Result<Self> {
+        Self::spawn_inner(command, prompt, stdio, true)
+    }
+
+    fn spawn_inner(
+        command: &mut Command,
+        prompt: &[u8],
+        stdio: PtyStdio,
+        controlling_terminal: bool,
+    ) -> io::Result<Self> {
         let (master, slave) = open_pty()?;
         let baseline_flags = terminal_user_flags(slave);
         set_winsize(slave, Geometry { rows: 24, cols: 80 })?;
@@ -235,6 +261,22 @@ impl Pty {
             .stdin(unsafe { Stdio::from_raw_fd(dup(slave)) })
             .stdout(output(&stdio.stdout, slave)?)
             .stderr(output(&stdio.stderr, slave)?);
+        if controlling_terminal {
+            // Both calls are async-signal-safe and only touch this process's own
+            // session and the terminal prepared above; a failure is reported as
+            // the spawn error rather than a child that cannot be asked.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
         let mut child = command.spawn()?;
         let master = unsafe { OwnedFd::from_raw_fd(master) };
         let slave = unsafe { OwnedFd::from_raw_fd(slave) };

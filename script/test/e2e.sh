@@ -189,7 +189,10 @@ OWNED_BUILDER=""
 # authorization (ADR-0075), so a fixture whose `[[tools]]` block is inert
 # without `allow_tools` would otherwise launch nothing and pass the rows below
 # misleadingly; 0.8.3 is the first with `[[sources]]` tables (ADR-0076), so a
-# 0.8.2 reader would fail every seeded project config as a schema error.
+# 0.8.2 reader would fail every seeded project config as a schema error; 0.8.4
+# pins every `trust = false` source before decoding. Version 0.8.4 is the
+# minimum branch contract; these VM fixtures do not themselves exercise the pin
+# gate.
 candidate_reads_host_managed_config() {
   local bin="$1" version major minor patch
   version="$("$bin" --version 2>/dev/null | awk 'NR == 1 {print $2}')" || return 1
@@ -203,7 +206,7 @@ candidate_reads_host_managed_config() {
   patch="${version#*.*.}"
   patch="${patch%%[!0-9]*}"
   [ "$major" -gt 0 ] ||
-    { [ "$major" -eq 0 ] && { [ "$minor" -gt 8 ] || { [ "$minor" -eq 8 ] && [ "$patch" -ge 3 ]; }; }; }
+    { [ "$major" -eq 0 ] && { [ "$minor" -gt 8 ] || { [ "$minor" -eq 8 ] && [ "$patch" -ge 4 ]; }; }; }
 }
 
 [[ -x "$AGENT_VM" ]] || die "launcher not found at $AGENT_VM; build it with
@@ -216,7 +219,7 @@ or point AGENT_VM_BIN at one."
 for candidate in "$AGENT_VM" "$AGENT_VM_DEV_BIN" "$AGENT_VM_RELEASE_BIN"; do
   [[ -x "$candidate" ]] || continue
   candidate_reads_host_managed_config "$candidate" ||
-    die "the launcher at $candidate is older than 0.8.3; it reads <project>/.agent-vm/config.toml instead of the host-managed project config (ADR-0073), predates explicit tool authorization (ADR-0075), or cannot read [[sources]] tables (ADR-0076). Rebuild it from this branch."
+    die "the launcher at $candidate is older than 0.8.4; it reads <project>/.agent-vm/config.toml instead of the host-managed project config (ADR-0073), predates explicit tool authorization (ADR-0075), cannot read [[sources]] tables (ADR-0076), or does not pin trust = false sources (ADR-0077). Rebuild it from this branch."
 done
 
 command -v docker >/dev/null 2>&1 || die "docker is required but not on PATH"
@@ -6634,12 +6637,12 @@ custom_image_retained_default() {
     return 1
   fi
   if ! candidate_reads_host_managed_config "$dev_bin"; then
-    echo "    BLOCKER: the debug candidate $dev_bin is older than 0.8.3 (ADR-0073, ADR-0075, ADR-0076);"
+    echo "    BLOCKER: the debug candidate $dev_bin is older than 0.8.4 (ADR-0073, ADR-0075, ADR-0076, ADR-0077);"
     echo "             rebuild it from this branch, or set AGENT_VM_DEV_BIN to one"
     return 1
   fi
   if ! candidate_reads_host_managed_config "$rel_bin"; then
-    echo "    BLOCKER: the release candidate $rel_bin is older than 0.8.3 (ADR-0073, ADR-0075, ADR-0076);"
+    echo "    BLOCKER: the release candidate $rel_bin is older than 0.8.4 (ADR-0073, ADR-0075, ADR-0076, ADR-0077);"
     echo "             rebuild it from this branch, or set AGENT_VM_RELEASE_BIN to one"
     return 1
   fi

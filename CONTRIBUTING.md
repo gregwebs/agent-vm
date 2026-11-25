@@ -274,15 +274,18 @@ here. Use a dedicated serial native host, no concurrent agent-vm/msb VMs, compat
 managed runtime policy and no matching GHCR/loopback credentials in the OS keyring.
 Never edit operator policy/keychain to make a test pass.
 
-Every launcher the run is pointed at must report `--version` at or above 0.8.3:
+Every launcher the run is pointed at must report `--version` at or above 0.8.4:
+0.8.4 is this branch's minimum contract, and
 `candidate_reads_host_managed_config` refuses anything older before the first
 row. 0.8.1 brought the host-managed project tier, flat `sources` and the
 project-first image precedence; 0.8.2 brought explicit tool authorization
 (ADR-0075); 0.8.3 brought `[[sources]]` tables with independent `trust` and
-`allow` (ADR-0076). An older candidate reads a fixture from the wrong path,
-launches a `[[tools]]` block this branch treats as inert, or rejects every
-seeded project config as a schema error, and passes the rows for the wrong
-reason.
+`allow` (ADR-0076); 0.8.4 pins every `trust = false` source before decoding
+(ADR-0077). An older candidate reads a fixture from the wrong path, launches a
+`[[tools]]` block this branch treats as inert, accepts unapproved sourced bytes,
+or rejects every seeded project config as a schema error, and passes the rows
+for the wrong reason. This floor does not claim the present VM fixtures exercise
+the pin gate.
 
 For released-image, first authenticate/download both v0.1.3 archives using the
 [source-pinned image-owner release interfaces](https://github.com/gregwebs/agent-vm-images/blob/main/docs/standard-image-releases.md).

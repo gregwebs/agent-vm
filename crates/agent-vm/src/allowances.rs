@@ -595,7 +595,7 @@ fn problem_notice(file: &Path, problem: &store::Problem) -> String {
 
 /// The kernel's verdict in this file's own words. One row per
 /// `AuthorityRefusal`, so a new verdict fails to compile until it has a clause.
-fn refusal_clause(refusal: &crate::config_authority::AuthorityRefusal) -> String {
+pub(crate) fn refusal_clause(refusal: &crate::config_authority::AuthorityRefusal) -> String {
     use crate::config_authority::AuthorityRefusal::*;
     match refusal {
         FileOwner => "is owned by another user".to_owned(),

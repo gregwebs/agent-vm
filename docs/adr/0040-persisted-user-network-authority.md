@@ -21,6 +21,11 @@ file is measured and refused on any failure, with no presence trigger. Decision
 a dotfile-symlinked tools-only file still loading, `metadata(parent)` for the
 immediate directory — are unchanged.
 
+Amended by [ADR-0077](0077-pinned-config-sources.md): its directory-first
+owner/mode and direct regular-file/one-link admission rules also protect each
+project's source-pin manifest. ADR-0077 records the pin-store-specific boundary,
+recovery and review policy; this record's default-user read remains unchanged.
+
 ## Context
 
 A guest in project P1 can plant a user-owned `0644` file for project P2. Owner

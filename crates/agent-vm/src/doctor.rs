@@ -1421,6 +1421,13 @@ fn describe_sources(sources: &SourcesReport) -> String {
     let mut out = String::from("sources:\n");
     for entry in sources.entries() {
         let mut attrs = format!("trust={}, allow={}", entry.is_trusted(), entry.is_allowed());
+        // D4: the pin is a clause of #748's one block, before `; inert:`. It can
+        // only exist for an approved `trust = false` source — a trusted one is
+        // never pinned, and an unapproved one is a load error this function is
+        // never reached with — so it cannot describe bytes nobody approved.
+        if let Some(pin) = entry.pin() {
+            attrs.push_str(&format!(", pin=approved {}", pin.hash()));
+        }
         if !entry.inert().is_empty() {
             attrs.push_str(&format!("; inert: {}", entry.inert().labels().join(", ")));
         }
@@ -1465,7 +1472,9 @@ fn with_legacy_notice(mut section: String, legacy: Option<&LegacyProjectConfig>)
     match legacy {
         Some(LegacyProjectConfig::Present(path)) => section.push_str(&format!(
             "\nnote: {} is not auto-loaded; agent-vm never reads an in-repo .agent-vm/config.toml.\n\
-             To use it, review it and source it from this project's config with `agent-vm config edit`.",
+             To use it, review it and source it from this project's config: edit the file\n\
+             `agent-vm doctor` names as its `project:` row with your own editor (this version\n\
+             has no `config edit` command).",
             crate::one_line::path(path)
         )),
         Some(LegacyProjectConfig::Unexaminable { path, kind }) => section.push_str(&format!(
@@ -2373,7 +2382,7 @@ mod tests {
         assert_eq!(
             rendered,
             format!(
-                "==> tool configuration\nfiller\nnote: {} is not auto-loaded; agent-vm never reads an in-repo .agent-vm/config.toml.\nTo use it, review it and source it from this project's config with `agent-vm config edit`.",
+                "==> tool configuration\nfiller\nnote: {} is not auto-loaded; agent-vm never reads an in-repo .agent-vm/config.toml.\nTo use it, review it and source it from this project's config: edit the file\n`agent-vm doctor` names as its `project:` row with your own editor (this version\nhas no `config edit` command).",
                 crate::one_line::path(&path)
             )
         );
@@ -5205,18 +5214,20 @@ credentials:
             )
             .unwrap();
             self.write(&self.config, project_body);
-            crate::config::load(&crate::config::ConfigPaths {
+            let paths = crate::config::ConfigPaths {
                 user: Some(self.user_config()),
                 project: Some(crate::project_config::ProjectTierPaths {
                     config: self.config.clone(),
                     route: crate::project_config::RouteAnchor::Captured {
                         home: self.home.clone(),
                         root: self.project.path().to_path_buf(),
+                        root_id: self.project.identity(),
                     },
                 }),
                 home: Some(self.home.clone()),
-            })
-            .expect("fixture config loads")
+            };
+            crate::config::approve_all_pinned(&paths);
+            crate::config::load(&paths).expect("fixture config loads")
         }
     }
 
@@ -5234,12 +5245,15 @@ credentials:
         );
         let user = f.user_config();
         let repo = f.repo(".agent-vm/config.toml");
+        // The fixture approves the source's pin before loading, so the one source
+        // block carries the pin clause (D4) and the trusted row does not.
+        let approved = crate::config_pins::ContentHash::of(&std::fs::read(&repo).unwrap());
         let (text, failure, catalog) = describe_config(report);
         assert!(failure.is_none(), "{text}");
         assert!(catalog.is_some());
         assert!(
             text.contains(&format!(
-                "sources:\n  home {} (found, 1 tool) [trust=true, allow=false]\n  repo {} (found, 1 tool) [trust=false, allow=false]\n",
+                "sources:\n  home {} (found, 1 tool) [trust=true, allow=false]\n  repo {} (found, 1 tool) [trust=false, allow=false, pin=approved {approved}]\n",
                 user.display(),
                 repo.display()
             )),
@@ -5263,6 +5277,41 @@ credentials:
             text.contains(&format!(
                 "user:    {} (not sourced by the project config)",
                 f.user_config().display()
+            )),
+            "{text}"
+        );
+    }
+
+    /// V36/D4: the pin is a clause of #748's one source block, before any
+    /// `; inert:` clause. A trusted source is never pinned at all, and an
+    /// approved `allow = false` source shows its pin *and* what it leaves inert.
+    /// An unapproved source never reaches this function: `config::load` refuses
+    /// it, so no `approved` row can be printed for bytes nobody approved.
+    #[test]
+    fn v36_describe_config_shows_the_pin_clause_beside_inert_and_never_for_trusted() {
+        let f = SourcesDoctor::new();
+        let report = f.load(
+            "[[sources]]\nname = \"home\"\npath = \"~/.config/agent-vm/config.toml\"\ntrust = true\n\
+             [[sources]]\nname = \"repo\"\npath = \"./.agent-vm/config.toml\"\nallow = false\n",
+            "[[tools]]\nname = \"home-tool\"\ncommand = \"home-tool\"\n",
+            "image = \"localhost:9/inert:latest\"\n[[tools]]\nname = \"repo-tool\"\ncommand = \"repo-tool\"\n",
+        );
+        let user = f.user_config();
+        let repo = f.repo(".agent-vm/config.toml");
+        let approved = crate::config_pins::ContentHash::of(&std::fs::read(&repo).unwrap());
+        let (text, failure, _) = describe_config(report);
+        assert!(failure.is_none(), "{text}");
+        assert!(
+            text.contains(&format!(
+                "sources:\n  home {} (found, 1 tool) [trust=true, allow=false]\n",
+                user.display()
+            )),
+            "a trusted source is never pinned: {text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "  repo {} (found, 1 tool) [trust=false, allow=false, pin=approved {approved}; inert: image]\n",
+                repo.display()
             )),
             "{text}"
         );

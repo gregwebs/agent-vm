@@ -17,6 +17,9 @@ every `allow = true` source and inert in an `allow = false` one), and
 [ADR-0038](0038-config-dir-exposure-guard.md)'s guest-write coverage is
 extended from the one user config to every trusted source route. Bumps the workspace version to **0.8.3** inside the unreleased 0.8.x line.
 
+Amended by [ADR-0077](0077-pinned-config-sources.md): every `trust = false`
+source is now content-pinned before decoding, regardless of `allow`.
+
 ## Context
 
 ADR-0074 gave the project config a flat `sources = ["<alias>[:trust] <path>"]`
@@ -111,9 +114,10 @@ anything a repository controls, and its bytes need not be pinned":
 5. **Content pinning is exempt**, which is exactly what `#736` needs to not do for
    this file.
 
-`trust = false` is an ordinary repository read: the final symlink is followed,
-in-repo paths such as `./conf/agent-vm.toml` are legal, and `#736` will pin the
-bytes between the read and the parse.
+`trust = false` is a descriptor-anchored source read: its final symlink is
+resolved by that route walk only while the route remains admissible, and in-repo
+paths such as `./conf/agent-vm.toml` are legal. Its exact bounded bytes are
+content-pinned before parsing under [ADR-0077](0077-pinned-config-sources.md).
 
 ## Decision 3: `allow` decides adoption, and inert is not refused
 
@@ -123,8 +127,8 @@ bytes between the read and the parse.
 |---|---|---|---|
 | `true` | `true` | route check + verified read | adopted |
 | `true` | `false` | route check + verified read | inert |
-| `false` | `true` | ordinary read, unpinned until #736 | refused until #736 approves the bytes |
-| `false` | `false` | ordinary read, unpinned until #736 | inert |
+| `false` | `true` | bounded read, then content pin | adopted after approval |
+| `false` | `false` | bounded read, then content pin | inert after approval |
 
 - **Inert is not refused.** An `allow = false` source's `mounts`, `[network]` and
   `allow_tools` are recorded by presence (value-free) for `doctor` and dropped
@@ -132,15 +136,12 @@ bytes between the read and the parse.
   fail a load it grants nothing in. Its `image` is validated (an explicit
   `image = "NAME:image"` still works) but never becomes the automatic fallback,
   and is reported inert unless the project selects it.
-- **`trust = false, allow = true` is refused before decoding** by the
-  `ContentApprovalPolicy` seam. In #748 that is `UnpinnedContentPolicy`, which
-  names the project config, `sources[N]`, #736, and the two remedies (`allow =
-  false` and select explicitly, or move the file outside the checkout and set
-  `trust = true`). The check runs on the exact bounded bytes before UTF-8 or TOML
-  decoding, so an unapproved file cannot reach a validator, let alone adoption.
-  #736 supplies a hash-checking policy; the approval token binds
-  `(project config, lexical path, exact bytes)` so a second read can never
-  inherit an approval.
+- **Every `trust = false` source is refused before decoding until its bytes are
+  approved**, whether `allow` is true or false. [ADR-0077](0077-pinned-config-sources.md)
+  supplies the hash-checking policy. The check runs on the exact bounded bytes
+  before UTF-8 or TOML decoding, so an unapproved file cannot reach a validator,
+  inert recorder or adoption. Its approval token binds the project, lexical path
+  and exact bytes, so a second read can never inherit an approval.
 
 ## Decision 4: multi-source adoption order
 
@@ -202,10 +203,10 @@ different files.
 ## Decision 7: diagnostics
 
 - `doctor` renders each source as
-  `name path (found, N tools) [trust=…, allow=…; inert: …]`, with the inert list
-  in the fixed order `image, mounts, [network], allow_tools` and value-free.
-  Implicit sourcing prints no `sources:` block at all, so pre-#748 output is
-  byte-identical.
+  `name path (found, N tools) [trust=…, allow=…; pin=approved sha256:<hex>; inert: …]`
+  when a source has an approved pin, with the inert list in the fixed order
+  `image, mounts, [network], allow_tools` and value-free. Implicit sourcing
+  prints no `sources:` block at all, so pre-#748 output is byte-identical.
 - `doctor`'s boot-image section keeps the `user:`/`project:` rows, reports the
   winning fallback (`selected fallback; allow = true`), a project override, an
   earlier source's override, and each inert `allow = false` image with the exact
@@ -215,8 +216,9 @@ different files.
 
 ## Accepted gaps and explicit policies
 
-- **`trust = false, allow = true` adopts nothing in #748.** The seam is the
-  decision; #736 fills `ContentApprovalPolicy` with SHA-256 content pinning.
+- **Closed by ADR-0077:** every `trust = false` source is SHA-256-pinned before
+  decoding, and an approved `allow = true` source may adopt its fields. The
+  `allow = false` case is pinned too, while remaining inert.
 - **`CheckoutBoundary` unions every enclosing `.git` worktree up to `/`**, with
   no `$HOME/.git` exception: a file inside a dotfiles repository is
   repository-controlled and is not eligible for a non-default `trust = true`

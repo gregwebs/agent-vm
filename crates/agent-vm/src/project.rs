@@ -52,7 +52,15 @@ use sha2::{Digest, Sha256};
 /// statement in production — `main`'s, whose result every consumer is handed
 /// (ADR-0073 D5). Not `Clone`, so consumers borrow the capture rather than
 /// copying it.
-pub(crate) struct ProjectDir(PathBuf);
+pub(crate) struct ProjectDir {
+    path: PathBuf,
+    /// The resolved directory's own `(dev, ino)`, retained from the same
+    /// `lstat` [`bind`] compared against the working directory. A later reader
+    /// (a checkout-confined source route) must recognise a replaced project
+    /// root, and re-measuring the path would observe the replacement instead of
+    /// the directory capture verified.
+    identity: crate::host_paths::FileIdentity,
+}
 
 impl ProjectDir {
     /// The command's project: `current_dir()` canonicalized.
@@ -69,18 +77,38 @@ impl ProjectDir {
     }
 
     pub(crate) fn path(&self) -> &Path {
-        &self.0
+        &self.path
+    }
+
+    /// The identity `bind` verified for this capture, for a reader that must
+    /// fail closed when the project root has been replaced.
+    pub(crate) fn identity(&self) -> crate::host_paths::FileIdentity {
+        self.identity
     }
 
     /// The full lowercase hex SHA-256 of the canonical path's bytes (64 chars).
     pub(crate) fn digest_hex(&self) -> String {
-        digest_hex_of(&self.0)
+        digest_hex_of(&self.path)
     }
 
     /// Canonicalizes `path`; the unit tests' seam for alias/subdirectory rows.
     #[cfg(test)]
     pub(crate) fn from_path_for_tests(path: &Path) -> Result<Self> {
-        canonical(path.to_owned())
+        let path = path
+            .canonicalize()
+            .context("canonicalizing current directory")?;
+        let metadata = std::fs::metadata(&path)
+            .with_context(|| format!("reading the identity of {}", crate::one_line::path(&path)))?;
+        if !metadata.is_dir() {
+            return Err(anyhow!(
+                "{} is not a directory, so it cannot be this command's project",
+                crate::one_line::path(&path),
+            ));
+        }
+        Ok(Self {
+            path,
+            identity: file_identity(&metadata),
+        })
     }
 }
 
@@ -99,18 +127,17 @@ pub(crate) fn digest_hex_of(path: &Path) -> String {
     hex
 }
 
-fn canonical(path: PathBuf) -> Result<ProjectDir> {
+fn canonical(path: PathBuf) -> Result<PathBuf> {
     path.canonicalize()
-        .map(ProjectDir)
         .context("canonicalizing current directory")
 }
 
 /// Canonicalize `spelling` and require the result to denote the same directory
 /// as `working`.
 fn resolve(spelling: PathBuf, working: &Path) -> Result<ProjectDir> {
-    let captured = canonical(spelling)?;
-    bind(&captured, working)?;
-    Ok(captured)
+    let path = canonical(spelling)?;
+    let identity = bind(&path, working)?;
+    Ok(ProjectDir { path, identity })
 }
 
 /// Require `captured` to *be* `working`: the same `(device, inode)`, measured
@@ -125,35 +152,27 @@ fn resolve(spelling: PathBuf, working: &Path) -> Result<ProjectDir> {
 /// canonicalization reports the link rather than a target that agrees with the
 /// working directory: following it would make both measurements agree while the
 /// captured path named someone else's directory.
-fn bind(captured: &ProjectDir, working: &Path) -> Result<()> {
+fn bind(captured: &Path, working: &Path) -> Result<crate::host_paths::FileIdentity> {
     let working = identity(working).context("reading the identity of the current directory")?;
-    let resolved =
-        identity(captured.path()).context("reading the identity of the resolved project")?;
+    let resolved = identity(captured).context("reading the identity of the resolved project")?;
     if working != resolved {
         return Err(anyhow!(
             "the current directory moved while its path was being resolved: {} is device {} \
              inode {}, which is not the process's working directory (device {} inode {}); \
              re-run the command from the project's current path",
-            crate::one_line::path(captured.path()),
-            resolved.device,
-            resolved.inode,
-            working.device,
-            working.inode,
+            crate::one_line::path(captured),
+            resolved.dev,
+            resolved.ino,
+            working.dev,
+            working.ino,
         ));
     }
-    Ok(())
-}
-
-/// What a directory *is*, rather than what it is called.
-#[derive(PartialEq, Eq)]
-struct Identity {
-    device: u64,
-    inode: u64,
+    Ok(resolved)
 }
 
 /// Measure `path` as the directory entry itself (`lstat`): a symlink is a link,
 /// not its target, and anything that is not a directory is refused.
-fn identity(path: &Path) -> Result<Identity> {
+fn identity(path: &Path) -> Result<crate::host_paths::FileIdentity> {
     let metadata = std::fs::symlink_metadata(path)
         .with_context(|| format!("reading the identity of {}", crate::one_line::path(path)))?;
     if metadata.file_type().is_symlink() {
@@ -169,10 +188,14 @@ fn identity(path: &Path) -> Result<Identity> {
             crate::one_line::path(path),
         ));
     }
-    Ok(Identity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    })
+    Ok(file_identity(&metadata))
+}
+
+fn file_identity(metadata: &std::fs::Metadata) -> crate::host_paths::FileIdentity {
+    crate::host_paths::FileIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    }
 }
 
 #[cfg(test)]
@@ -238,7 +261,7 @@ mod tests {
             "{error}"
         );
         assert!(
-            error.contains(&format!("device {}", identity(&other).unwrap().device)),
+            error.contains(&format!("device {}", identity(&other).unwrap().dev)),
             "{error}"
         );
 
@@ -283,8 +306,8 @@ mod tests {
             "the two measurements agree, which is why identity alone cannot see this swap"
         );
 
-        let error = match bind(&project, &working) {
-            Ok(()) => panic!(
+        let error = match bind(project.path(), &working) {
+            Ok(_) => panic!(
                 "captured {} although it is a link to the working directory",
                 project.path().display()
             ),
@@ -294,7 +317,8 @@ mod tests {
 
         // The ordinary case still binds, so the refusal is about the link.
         let ordinary = ProjectDir::from_path_for_tests(&working).unwrap();
-        bind(&ordinary, &working).unwrap();
+        let bound = bind(ordinary.path(), &working).unwrap();
+        assert_eq!(bound, ordinary.identity());
     }
 
     /// The state-directory name is a prefix of the pin scope, and both are one

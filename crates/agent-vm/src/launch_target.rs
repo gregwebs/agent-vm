@@ -490,11 +490,9 @@ mod tests {
              [[sources]]\nname = \"repo\"\npath = \"./.agent-vm/config.toml\"\n",
         )
         .unwrap();
-        let report = crate::config::load(&crate::config::ConfigPaths::for_test_captured(
-            home.clone(),
-            &project,
-        ))
-        .expect("the project config loads");
+        let paths = crate::config::ConfigPaths::for_test_captured(home.clone(), &project);
+        crate::config::approve_all_pinned(&paths);
+        let report = crate::config::load(&paths).expect("the project config loads");
         let mut catalog = report.into_launch_catalog().expect("catalog");
         let entry = catalog.take_entry("app").expect("app is a verb");
         let tool_args = vec!["x".to_owned(), "y".to_owned()];
