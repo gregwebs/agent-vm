@@ -547,6 +547,9 @@ fn require_captured_root_entry(
         Err(rustix::io::Errno::NOENT) => return Err(UntrustedReadError::RootReplaced),
         Err(error) => return Err(UntrustedReadError::Io(anyhow::anyhow!(error))),
     };
+    // `st_dev` is already `u64` on Linux and narrower on macOS, so the
+    // conversion is useless on exactly one platform (see `host_paths`).
+    #[allow(clippy::useless_conversion)]
     let identity = (u64::try_from(entry.st_dev).unwrap_or(0), entry.st_ino);
     if rustix::fs::FileType::from_raw_mode(entry.st_mode) != rustix::fs::FileType::Directory
         || identity != root_id
@@ -567,6 +570,8 @@ struct StepEntry {
 impl StepEntry {
     fn of(stat: &rustix::fs::Stat) -> Self {
         Self {
+            // Useless on Linux only; see `require_captured_root_entry`.
+            #[allow(clippy::useless_conversion)]
             identity: (u64::try_from(stat.st_dev).unwrap_or(0), stat.st_ino),
             kind: rustix::fs::FileType::from_raw_mode(stat.st_mode),
         }
