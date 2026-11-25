@@ -78,6 +78,9 @@ use std::{
 
 mod support;
 
+#[path = "support/source_pins.rs"]
+mod source_pins;
+
 use support::{run_with_input, run_with_timeout};
 
 /// A loopback spelling imported only by builder-dependent tests. Cold tests
@@ -15276,6 +15279,19 @@ fn v25_project(allow: &str) -> String {
     )
 }
 
+/// Stamp the V25 repo source through the independent oracle.
+///
+/// The source is inside the checkout, so `trust = true` would be refused; the
+/// rows are about authorization and facets, not pinning, so the pin is stated
+/// here rather than turning every row into a pin test.
+fn v25_approve(h: &Harness) {
+    source_pins::approve(
+        &h.home_root,
+        &h.project_root,
+        &h.project_root.join(".agent-vm/config.toml"),
+    );
+}
+
 /// A seeded host directory, so the declaration's source really exists.
 fn v25_seed(h: &Harness, name: &str) {
     let path = h.home_root.join(name);
@@ -15319,6 +15335,7 @@ fn an_authorized_source_tool_activates_every_field() {
     }
     h.write_user("# tools-only\n");
     write(&h.project_root.join(".agent-vm/config.toml"), &v25_repo());
+    v25_approve(&h);
     h.write_project(&v25_project(
         "allow_tools = [\"repo:app\", \"repo:helper\", \"repo:rsh\"]\n",
     ));
@@ -15399,6 +15416,7 @@ fn an_unauthorized_source_tool_is_not_a_verb_and_a_direct_launch_keeps_deny() {
     }
     h.write_user("# tools-only\n");
     write(&h.project_root.join(".agent-vm/config.toml"), &v25_repo());
+    v25_approve(&h);
     h.write_project(&v25_project("allow_tools = []\n"));
     let out = h.launch("app", &[]);
     assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
@@ -15446,6 +15464,7 @@ fn an_unauthorized_source_tool_is_not_a_verb_and_a_direct_launch_keeps_deny() {
         }
         h.write_user("# tools-only\n");
         write(&h.project_root.join(".agent-vm/config.toml"), &v25_repo());
+        v25_approve(&h);
         h.write_project(&v25_project(allow));
         for form in DIRECT_FORMS {
             let out = h.direct(DirectInvocation {
@@ -15517,4 +15536,197 @@ fn ordered_inheritance_under_an_empty_project_list() {
         .filter(|verb| ["a", "b", "shell"].contains(verb))
         .collect();
     assert_eq!(commands, ["shell"], "{commands:?}\n{help}");
+}
+
+// ---------------------------------------------------------------------------
+// #736 V35/V43: a hand-stamped pin reaches the runtime, and the branch it read
+// becomes the recorded baseline
+// ---------------------------------------------------------------------------
+//
+// The store is written by `support::source_pins`, an independent oracle: no row
+// here can pass because the production writer and reader agree. Every launch
+// has stdin closed, so a prompt would fail visibly instead of reading the test
+// runner's terminal.
+
+/// The pinned source every row below declares: one tool whose argv is what the
+/// row reads back from the runtime.
+fn pin_source(args: &str) -> String {
+    format!("[[tools]]\nname = \"echoer\"\ncommand = \"/bin/echo\"\nargs = [{args}]\n")
+}
+
+/// `<allow_tools>` + one `trust = false` source, with `allow` stated by the
+/// caller so the (false, false) and (false, true) rows differ in one word.
+fn pin_project(allow_tools: &str, allow: bool) -> String {
+    format!(
+        "{allow_tools}\
+         [[sources]]\nname = \"repo\"\npath = \"./conf/agent-vm.toml\"\n{}\
+         ",
+        if allow { "allow = true\n" } else { "" }
+    )
+}
+
+fn pin_store(h: &Harness) -> PathBuf {
+    source_pins::store_dir(&h.home_root, &h.project_root)
+}
+
+/// The recorded `active` digest for the fixture's only source.
+fn recorded_active(store: &Path) -> String {
+    let bytes = source_pins::manifest_bytes(store).expect("the store has a manifest");
+    let manifest: serde_json::Value = serde_json::from_slice(&bytes).expect("manifest JSON");
+    manifest["sources"][0]["active"]
+        .as_str()
+        .expect("an active digest")
+        .to_owned()
+}
+
+/// A launch with **no stdin at all**: an approval prompt would read EOF and
+/// fail, so "the launch proceeded" cannot be a prompt that was answered by the
+/// harness.
+fn pinned_launch(h: &Harness, tool: &str) -> Output {
+    let mut cmd = h.base_command();
+    cmd.stdin(Stdio::null())
+        .args(["--image", BOGUS_IMAGE])
+        .arg(tool);
+    run_with_timeout(cmd, Duration::from_secs(30))
+}
+
+/// V35: approving by hand is enough to launch; a newer already-approved branch
+/// launches without a prompt and becomes the baseline; switching back does the
+/// same; and a byte nobody approved refuses, naming the baseline it differs
+/// from.
+#[test]
+fn a_stamped_pin_launches_and_the_branch_it_reads_becomes_the_baseline() {
+    let h = Harness::warm();
+    let source = h.project_root.join("conf/agent-vm.toml");
+    write(&source, &pin_source("\"--v1\""));
+    h.write_project(&pin_project("allow_tools = [\"repo:echoer\"]\n", false));
+    let v1 = source_pins::approve(&h.home_root, &h.project_root, &source);
+    let store = pin_store(&h);
+
+    // (a) one hand-written approval, and the launch reaches the fake runtime
+    // with the source's own argv.
+    let out = pinned_launch(&h, "echoer");
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+    assert_eq!(debug_guest_command(&stderr), "/bin/echo --v1");
+    assert!(
+        !stderr.contains("[y/N]"),
+        "an approved source never prompts"
+    );
+    assert_eq!(recorded_active(&store), v1);
+
+    // (b) v2 is approved but not active; the file on disk is v2. The launch
+    // reads it without a question and records it as the baseline.
+    write(&source, &pin_source("\"--v2\""));
+    let v2 = source_pins::sha256_hex(&std::fs::read(&source).unwrap());
+    let mut pins = source_pins::Pins::new(&h.home_root, &h.project_root);
+    pins.approve_bytes(&source, pin_source("\"--v1\"").as_bytes())
+        .approve_bytes_keeping_active(&source, pin_source("\"--v2\"").as_bytes())
+        .write();
+    assert_eq!(recorded_active(&store), v1, "v1 stays the baseline");
+    let out = pinned_launch(&h, "echoer");
+    let stderr = stderr_of(&out);
+    assert_eq!(debug_guest_command(&stderr), "/bin/echo --v2", "{stderr}");
+    assert!(
+        !stderr.contains("[y/N]"),
+        "an approved branch never prompts"
+    );
+    assert_eq!(
+        recorded_active(&store),
+        v2,
+        "the launch recorded the branch it read"
+    );
+
+    // (c) back to the older approved version: still no prompt, baseline returns.
+    write(&source, &pin_source("\"--v1\""));
+    let out = pinned_launch(&h, "echoer");
+    let stderr = stderr_of(&out);
+    assert_eq!(debug_guest_command(&stderr), "/bin/echo --v1", "{stderr}");
+    assert!(!stderr.contains("[y/N]"), "{stderr}");
+    assert_eq!(recorded_active(&store), v1);
+
+    // (d) a byte nobody approved refuses and names the baseline it differs from.
+    write(&source, &pin_source("\"--v3\""));
+    let v3 = source_pins::sha256_hex(&std::fs::read(&source).unwrap());
+    let before = source_pins::manifest_bytes(&store).unwrap();
+    let out = pinned_launch(&h, "echoer");
+    let stderr = stderr_of(&out);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "differs from every approved version (current sha256:{v3}; last approved sha256:{v1})"
+        )),
+        "the refusal names both digests: {stderr}"
+    );
+    assert!(
+        !stderr.contains(CONFIG_MARKER),
+        "nothing launched: {stderr}"
+    );
+    assert!(
+        !stderr.contains("[y/N]"),
+        "no terminal, no prompt: {stderr}"
+    );
+    assert_eq!(
+        source_pins::manifest_bytes(&store).unwrap(),
+        before,
+        "a refused launch writes no pin state"
+    );
+}
+
+/// V43's approved half: `(trust = false, allow = true)` adopts the declared
+/// image override, mount, egress table and tool into the real launch plan, and
+/// one changed byte refuses again before any of them is adopted.
+#[test]
+fn an_approved_allow_true_source_adopts_every_facet_and_a_byte_change_refuses() {
+    let h = Harness::warm();
+    let shared = h.home_root.join("shared");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::write(shared.join("marker"), "shared").unwrap();
+    let source = h.project_root.join("conf/agent-vm.toml");
+    let body = "image = \"localhost:1/repo:latest\"\n\
+                mounts = [\"~/shared:/shared:ro\"]\n\
+                [network]\nallow_lan = true\n\
+                [[tools]]\nname = \"echoer\"\ncommand = \"/bin/echo\"\nargs = [\"--adopted\"]\n";
+    write(&source, body);
+    h.write_project(&pin_project("allow_tools = [\"repo:echoer\"]\n", true));
+    source_pins::approve(&h.home_root, &h.project_root, &source);
+
+    let out = pinned_launch(&h, "echoer");
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+    assert_eq!(debug_guest_command(&stderr), "/bin/echo --adopted");
+    let config = debug_config_json(&stderr);
+    assert!(
+        v25_binds(&stderr)
+            .iter()
+            .any(|(guest, host)| guest == "/shared" && host == shared.to_str().unwrap()),
+        "the adopted mount reached the launch plan: {:?}",
+        v25_binds(&stderr)
+    );
+    assert!(
+        config["network"]["policy"]["rules"]
+            .as_array()
+            .expect("rules")
+            .iter()
+            .any(|rule| rule["destination"]["group"] == "private"),
+        "the adopted `allow_lan` reached the policy: {}",
+        config["network"]["policy"]
+    );
+    assert!(!stderr.contains("[y/N]"), "{stderr}");
+
+    // One changed byte, and the *same* adopted facets must not appear.
+    let changed = body.replace("--adopted", "--changed");
+    write(&source, &changed);
+    let current = source_pins::sha256_hex(changed.as_bytes());
+    let out = pinned_launch(&h, "echoer");
+    let stderr = stderr_of(&out);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains(&format!("current sha256:{current}; last approved")),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains(CONFIG_MARKER),
+        "nothing launched: {stderr}"
+    );
 }

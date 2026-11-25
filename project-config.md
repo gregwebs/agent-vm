@@ -1,3 +1,8 @@
+# Historical project-config proposal
+
+> **Historical only.** This proposal predates the shipped interface. Do not use
+> its `agent-vm config edit` guidance; follow [USAGE.md](USAGE.md#tool-configuration).
+
 We have a concept of a user configuration (~/.config/agent-vm.toml) and then also a project configuration.
 I want to overhaul how the project configuration works.
 

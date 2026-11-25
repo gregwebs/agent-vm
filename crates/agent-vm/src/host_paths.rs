@@ -378,6 +378,14 @@ pub(crate) fn read_bounded_regular_file_no_follow_checkpointed(
 /// The bytes are read with `pread`, so the descriptor is measured once and the
 /// version probe and the body come from the same file even if the name is
 /// replaced underneath.
+/// Why a bounded read did not return the whole file.
+#[derive(Debug)]
+pub(crate) enum ReadBoundedError {
+    /// `fstat` saw a size, or the streaming read reached, more than the bound.
+    TooLarge,
+    Io(anyhow::Error),
+}
+
 #[derive(Debug)]
 pub(crate) struct OpenedRegularFile {
     file: fs::File,
@@ -419,17 +427,36 @@ impl OpenedRegularFile {
 
     /// The whole file, refusing one larger than `max`.
     pub(crate) fn read_bounded(self, max: u64) -> Result<Vec<u8>> {
+        let display = path_in_line(&self.path).to_string();
+        self.read_bounded_classified(max)
+            .map_err(|error| match error {
+                ReadBoundedError::TooLarge => anyhow!("{display} exceeds its size limit"),
+                ReadBoundedError::Io(error) => error,
+            })
+    }
+
+    /// [`Self::read_bounded`] with the too-large outcome as its own variant.
+    ///
+    /// A caller that classifies a read (`config_pins::store` reports a file that
+    /// grew past its bound as damage, not as an unreadable file) cannot recover
+    /// that distinction from an `anyhow` chain, and must not re-measure the
+    /// descriptor to guess it.
+    pub(crate) fn read_bounded_classified(
+        self,
+        max: u64,
+    ) -> std::result::Result<Vec<u8>, ReadBoundedError> {
         let display = path_in_line(&self.path);
         if self.facts.size > max {
-            return Err(anyhow!("{display} exceeds its size limit"));
+            return Err(ReadBoundedError::TooLarge);
         }
         let mut data = Vec::with_capacity(usize::try_from(self.facts.size).unwrap_or(0));
         (&self.file)
             .take(max + 1)
             .read_to_end(&mut data)
-            .with_context(|| format!("reading {display}"))?;
+            .with_context(|| format!("reading {display}"))
+            .map_err(ReadBoundedError::Io)?;
         if data.len() as u64 > max {
-            return Err(anyhow!("{display} exceeds its size limit"));
+            return Err(ReadBoundedError::TooLarge);
         }
         Ok(data)
     }
@@ -466,6 +493,61 @@ pub(crate) fn open_regular_no_follow_checkpointed(
         }
         NoFollowOpen::Symlink => Ok(None),
     }
+}
+
+/// How [`open_regular_no_follow_at_classified_checkpointed`] ended.
+///
+/// The classifications are values rather than errors because the pin store
+/// renders each one differently (`ThroughSymlink` is distrust, `NotAFile` is
+/// damage, `NotFound` is a retry) and cannot recover that from an `anyhow`
+/// chain.
+#[cfg_attr(not(test), allow(dead_code))] // Phase 4's pin store reader
+pub(crate) enum OpenNoFollowOutcome {
+    File(OpenedRegularFile),
+    Symlink,
+    NotRegular(FileType),
+    NotFound,
+}
+
+/// Open one name inside an already-verified directory descriptor, no-follow and
+/// non-blocking, classifying every outcome a store reader distinguishes.
+///
+/// `before_open` runs immediately before the `openat`, `after_open` immediately
+/// after it: two distinct seams because a test must be able to inject both an
+/// open-time transition to a symlink/non-regular entry and a post-open unlink or
+/// rename.
+#[cfg_attr(not(test), allow(dead_code))] // Phase 4's pin store reader
+pub(crate) fn open_regular_no_follow_at_classified_checkpointed(
+    dir_fd: &OwnedFd,
+    name: &OsStr,
+    path: &Path,
+    before_open: impl FnOnce(),
+    after_open: impl FnOnce(),
+) -> Result<OpenNoFollowOutcome> {
+    before_open();
+    let fd = match rfs::openat(
+        dir_fd,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::LOOP) => return Ok(OpenNoFollowOutcome::Symlink),
+        Err(Errno::NOENT) => return Ok(OpenNoFollowOutcome::NotFound),
+        Err(error) => {
+            return Err(anyhow!(error)).with_context(|| format!("opening {}", path_in_line(path)));
+        }
+    };
+    after_open();
+    let display = path_in_line(path);
+    let stat = rfs::fstat(&fd)
+        .map_err(|error| anyhow!(error))
+        .with_context(|| format!("stating {display}"))?;
+    let file_type = FileType::from_raw_mode(stat.st_mode);
+    if file_type != FileType::RegularFile {
+        return Ok(OpenNoFollowOutcome::NotRegular(file_type));
+    }
+    opened_regular_from_descriptor(fd, path).map(OpenNoFollowOutcome::File)
 }
 
 /// An [`OpenedRegularFile`] for a descriptor the caller opened itself with
@@ -645,6 +727,7 @@ impl VerifiedRead {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // retained for the read-path tests
 pub(crate) fn read_bounded_regular_file_noting_symlink(
     path: &Path,
     max: u64,
@@ -694,6 +777,7 @@ fn read_bounded_regular_file_with_identity(
 }
 
 // The checkpoint tests replacement without introducing a second production read path.
+#[cfg_attr(not(test), allow(dead_code))]
 fn read_bounded_regular_file_noting_symlink_checkpointed(
     path: &Path,
     max: u64,
@@ -836,6 +920,130 @@ pub(crate) fn open_lock_file(path: &Path) -> Result<std::fs::File> {
         return Err(anyhow!("the coordination lock path is not a regular file"));
     }
     Ok(std::fs::File::from(fd))
+}
+
+/// An opened coordination lock whose descriptor facts were verified.
+#[cfg_attr(not(test), allow(dead_code))] // Phase 4's pin store writer
+#[derive(Debug)]
+pub(crate) struct OpenedLock {
+    pub(crate) file: std::fs::File,
+    pub(crate) identity: FileIdentity,
+}
+
+/// Verify a lock descriptor's own facts: a regular file this user owns, no
+/// group/other write bit, and exactly one name.
+///
+/// Checked by `fstat` on the descriptor the lock is taken on, not by a second
+/// path lookup: a name swapped after the open must not be able to make the
+/// verified facts describe a different inode than the one being locked.
+#[cfg_attr(not(test), allow(dead_code))] // Phase 4's pin store writer
+fn verified_lock(fd: OwnedFd, euid: u32, display: &Path) -> Result<OpenedLock> {
+    let name = path_in_line(display);
+    let stat = rfs::fstat(&fd)
+        .map_err(|error| anyhow!(error))
+        .with_context(|| format!("stating {name}"))?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(anyhow!("{name} is not a regular file"));
+    }
+    if stat.st_uid != euid {
+        return Err(anyhow!("{name} is owned by another user"));
+    }
+    if crate::config_authority::raw_mode_u32(stat.st_mode) & 0o022 != 0 {
+        return Err(anyhow!("{name} is group- or other-writable"));
+    }
+    // nlink_t is u16 on macOS, u32 on Linux aarch64, u64 on Linux x86_64.
+    #[allow(clippy::useless_conversion)]
+    let nlink = u64::from(stat.st_nlink);
+    if nlink != 1 {
+        return Err(anyhow!("{name} has {nlink} hard links"));
+    }
+    let identity = FileIdentity {
+        #[allow(clippy::useless_conversion)]
+        dev: u64::try_from(stat.st_dev).unwrap_or(0),
+        ino: stat.st_ino,
+    };
+    Ok(OpenedLock {
+        file: std::fs::File::from(fd),
+        identity,
+    })
+}
+
+/// Open or create a coordination lock inside an already-verified directory
+/// descriptor (`O_RDWR | O_CREAT | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC`, 0600).
+///
+/// `dir_fd` is the anchor: the lock name is resolved by the kernel relative to
+/// the directory that was verified, never re-resolved from a path.
+#[cfg_attr(not(test), allow(dead_code))] // Phase 4's pin store writer
+pub(crate) fn open_verified_lock_at(
+    dir_fd: &OwnedFd,
+    name: &OsStr,
+    euid: u32,
+    display: &Path,
+) -> Result<OpenedLock> {
+    // Open first, then create exclusively: a plain `O_CREAT` open raced by a
+    // second creator can report `ENOENT` on macOS, and a create that loses the
+    // race must never truncate the winner's header. Both paths stay
+    // `O_NOFOLLOW`, so a link swapped in is refused rather than followed.
+    for _ in 0..8 {
+        match rfs::openat(
+            dir_fd,
+            name,
+            OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => return verified_lock(fd, euid, display),
+            Err(Errno::NOENT) => {}
+            Err(error) => {
+                return Err(anyhow!(error))
+                    .with_context(|| format!("opening {}", path_in_line(display)));
+            }
+        }
+        match rfs::openat(
+            dir_fd,
+            name,
+            OFlags::RDWR
+                | OFlags::CREATE
+                | OFlags::EXCL
+                | OFlags::NOFOLLOW
+                | OFlags::NONBLOCK
+                | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        ) {
+            Ok(fd) => return verified_lock(fd, euid, display),
+            Err(Errno::EXIST) => continue,
+            Err(error) => {
+                return Err(anyhow!(error))
+                    .with_context(|| format!("creating {}", path_in_line(display)));
+            }
+        }
+    }
+    Err(anyhow!(
+        "a coordination lock at {} kept appearing and disappearing",
+        path_in_line(display)
+    ))
+}
+
+/// Open an existing coordination lock inside `dir_fd` without creating it;
+/// `ENOENT` is `Ok(None)`.
+#[cfg_attr(not(test), allow(dead_code))] // Phase 4's pin store reader
+pub(crate) fn open_verified_lock_if_present_at(
+    dir_fd: &OwnedFd,
+    name: &OsStr,
+    euid: u32,
+    display: &Path,
+) -> Result<Option<OpenedLock>> {
+    match rfs::openat(
+        dir_fd,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => verified_lock(fd, euid, display).map(Some),
+        Err(Errno::NOENT) => Ok(None),
+        Err(error) => {
+            Err(anyhow!(error)).with_context(|| format!("opening {}", path_in_line(display)))
+        }
+    }
 }
 
 /// Attempt `flock` in `mode` without waiting.
@@ -1429,6 +1637,26 @@ fn atomic_write_at(
     atomic_write_with_random(parent, final_name, data, mode, path, random_temp_name)
 }
 
+/// [`atomic_write_at`] with a caller-chosen temporary-name prefix.
+///
+/// The pin store writes beside `config.toml`; a pin temporary that shared the
+/// `.agent-vm-tmp-*` namespace would be indistinguishable from an abandoned
+/// config write, and the two stores sweep different prefixes. The algorithm,
+/// mode handling and rename are exactly [`atomic_write_at`]'s.
+#[cfg_attr(not(test), allow(dead_code))] // Phase 4's pin store writer
+pub(crate) fn atomic_write_at_with_prefix(
+    parent: &OwnedFd,
+    temp_prefix: &str,
+    final_name: &OsStr,
+    data: &[u8],
+    mode: u32,
+    path: &Path,
+) -> Result<()> {
+    atomic_write_with_random(parent, final_name, data, mode, path, || {
+        random_temp_name_with_prefix(temp_prefix)
+    })
+}
+
 /// Fault points production never fails at, injected between the
 /// exclusively-created temporary's write/chmod/rename steps. Each
 /// closure returning `Err` simulates that operation failing; production
@@ -1536,9 +1764,13 @@ where
 }
 
 fn random_temp_name() -> Result<OsString> {
+    random_temp_name_with_prefix(".agent-vm-tmp-")
+}
+
+fn random_temp_name_with_prefix(prefix: &str) -> Result<OsString> {
     let mut bytes = [0_u8; 16];
     getrandom::fill(&mut bytes).context("getting random temporary-file name")?;
-    let mut name = String::from(".agent-vm-tmp-");
+    let mut name = String::from(prefix);
     for byte in bytes {
         use std::fmt::Write as _;
         write!(&mut name, "{byte:02x}").expect("writing into String cannot fail");
@@ -2867,5 +3099,255 @@ mod tests {
             rendered.split_once(": ").map(|(context, _error)| context),
             Some(format!("opening {}/invalid\\xffbyte", root.path().display()).as_str())
         );
+    }
+
+    // ---- #736 phase 1: descriptor helpers the pin store is built on ----
+
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    fn dir_fd(path: &Path) -> OwnedFd {
+        rfs::open(
+            path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_pin_temp_prefix_never_collides_with_the_config_temp_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir_fd(dir.path());
+        let final_path = dir.path().join("pins.json");
+        atomic_write_at_with_prefix(
+            &parent,
+            ".agent-vm-pin-tmp-",
+            OsStr::new("pins.json"),
+            b"{\"v\":1}",
+            0o600,
+            &final_path,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&final_path).unwrap(), b"{\"v\":1}");
+        assert_eq!(
+            fs::metadata(&final_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // No temporary survives, and nothing was written under the other
+        // writer's prefix.
+        let names: Vec<OsString> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![OsString::from("pins.json")]);
+
+        // The existing default writer keeps its own prefix and mode.
+        let config_path = dir.path().join("config.toml");
+        atomic_write(&config_path, b"x", 0o600).unwrap();
+        assert_eq!(fs::read(&config_path).unwrap(), b"x");
+        assert!(fs::read_dir(dir.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".agent-vm-pin-tmp-")
+        }));
+    }
+
+    #[test]
+    fn verified_lock_at_checks_regular_owner_mode_and_single_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir_fd(dir.path());
+        let display = dir.path().join("pins.lock");
+        let euid = current_euid();
+
+        assert!(
+            open_verified_lock_if_present_at(&parent, OsStr::new("pins.lock"), euid, &display)
+                .unwrap()
+                .is_none(),
+            "a read-only open never creates the lock"
+        );
+        assert!(!display.exists());
+
+        let lock = open_verified_lock_at(&parent, OsStr::new("pins.lock"), euid, &display).unwrap();
+        assert_eq!(
+            fs::metadata(&display).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let present =
+            open_verified_lock_if_present_at(&parent, OsStr::new("pins.lock"), euid, &display)
+                .unwrap()
+                .expect("the created lock is present");
+        assert_eq!(present.identity, lock.identity);
+        // The verified descriptor is what a writer locks, not a second open.
+        assert_eq!(
+            try_flock(&lock.file, FlockMode::Exclusive).unwrap(),
+            FlockAttempt::Acquired
+        );
+        drop(present);
+        drop(lock);
+
+        fs::set_permissions(&display, fs::Permissions::from_mode(0o666)).unwrap();
+        let error =
+            open_verified_lock_if_present_at(&parent, OsStr::new("pins.lock"), euid, &display)
+                .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("group- or other-writable"),
+            "{error:#}"
+        );
+        fs::set_permissions(&display, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let error = open_verified_lock_at(
+            &parent,
+            OsStr::new("pins.lock"),
+            euid.wrapping_add(1),
+            &display,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("owned by another user"),
+            "{error:#}"
+        );
+
+        let linked = dir.path().join("linked");
+        fs::hard_link(&display, &linked).unwrap();
+        let error =
+            open_verified_lock_if_present_at(&parent, OsStr::new("pins.lock"), euid, &display)
+                .unwrap_err();
+        assert!(format!("{error:#}").contains("2 hard links"), "{error:#}");
+        fs::remove_file(&linked).unwrap();
+
+        // A symlink is never followed, and a directory at the name is refused.
+        let target = dir.path().join("target");
+        fs::write(&target, b"").unwrap();
+        fs::remove_file(&display).unwrap();
+        symlink(&target, &display).unwrap();
+        assert!(
+            open_verified_lock_if_present_at(&parent, OsStr::new("pins.lock"), euid, &display)
+                .is_err()
+        );
+        fs::remove_file(&display).unwrap();
+        fs::create_dir(&display).unwrap();
+        assert!(
+            open_verified_lock_if_present_at(&parent, OsStr::new("pins.lock"), euid, &display)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn two_threads_can_create_one_verified_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let path = path.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let parent = dir_fd(&path);
+                barrier.wait();
+                open_verified_lock_at(
+                    &parent,
+                    OsStr::new("pins.lock"),
+                    current_euid(),
+                    &path.join("pins.lock"),
+                )
+                .map(|lock| lock.identity)
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+    }
+
+    #[test]
+    fn classified_no_follow_open_reports_every_outcome_and_orders_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir_fd(dir.path());
+        let euid = current_euid();
+        let _ = euid;
+        let file = dir.path().join("regular");
+        fs::write(&file, b"body").unwrap();
+
+        let hooks = std::cell::RefCell::new(Vec::new());
+        let outcome = open_regular_no_follow_at_classified_checkpointed(
+            &parent,
+            OsStr::new("regular"),
+            &file,
+            || hooks.borrow_mut().push("before"),
+            || hooks.borrow_mut().push("after"),
+        )
+        .unwrap();
+        assert_eq!(*hooks.borrow(), vec!["before", "after"]);
+        let OpenNoFollowOutcome::File(opened) = outcome else {
+            panic!("a regular file opens");
+        };
+        assert_eq!(opened.read_bounded(16).unwrap(), b"body");
+
+        let missing = dir.path().join("missing");
+        assert!(matches!(
+            open_regular_no_follow_at_classified_checkpointed(
+                &parent,
+                OsStr::new("missing"),
+                &missing,
+                || {},
+                || {},
+            )
+            .unwrap(),
+            OpenNoFollowOutcome::NotFound
+        ));
+
+        symlink(&file, dir.path().join("link")).unwrap();
+        assert!(matches!(
+            open_regular_no_follow_at_classified_checkpointed(
+                &parent,
+                OsStr::new("link"),
+                &dir.path().join("link"),
+                || {},
+                || {},
+            )
+            .unwrap(),
+            OpenNoFollowOutcome::Symlink
+        ));
+
+        fs::create_dir(dir.path().join("subdir")).unwrap();
+        assert!(matches!(
+            open_regular_no_follow_at_classified_checkpointed(
+                &parent,
+                OsStr::new("subdir"),
+                &dir.path().join("subdir"),
+                || {},
+                || {},
+            )
+            .unwrap(),
+            OpenNoFollowOutcome::NotRegular(FileType::Directory)
+        ));
+    }
+
+    #[test]
+    fn read_bounded_classified_separates_a_too_large_read_from_io() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("body");
+        fs::write(&path, b"0123456789").unwrap();
+        let opened = open_regular_no_follow_checkpointed(&path, || {})
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            opened.read_bounded_classified(4),
+            Err(ReadBoundedError::TooLarge)
+        ));
+
+        // The file grows after `fstat`: the streaming read still classifies it
+        // as too large rather than as an I/O failure.
+        let growing = dir.path().join("growing");
+        fs::write(&growing, b"").unwrap();
+        let opened = open_regular_no_follow_checkpointed(&growing, || {})
+            .unwrap()
+            .unwrap();
+        fs::write(&growing, b"0123456789").unwrap();
+        assert!(matches!(
+            opened.read_bounded_classified(4),
+            Err(ReadBoundedError::TooLarge)
+        ));
     }
 }

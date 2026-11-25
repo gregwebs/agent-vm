@@ -1003,6 +1003,7 @@ pub(crate) async fn launch(
         crate::guest_home::PersistedHome::new(guest_home_path, &home_links),
         launch_stores(&session)?,
         trusted_sources,
+        project,
     )?;
     // Selection is pure: it decides which declaration sources this launch asks
     // for (verified user `mounts` unless `--no-config-mounts`, then argv) and
@@ -3863,6 +3864,7 @@ impl AgentShellLine<'_> {
 
 // Keep home selection in the same constructor exercised by the subprocess test:
 // root mode must not discard raw HOME merely because Pi requires UTF-8.
+#[allow(clippy::too_many_arguments)] // the launch's own inputs, each a distinct context field
 fn launch_mount_context(
     mount_store: PathBuf,
     host_home: Option<PathBuf>,
@@ -3871,8 +3873,16 @@ fn launch_mount_context(
     persisted_home: crate::guest_home::PersistedHome,
     stores: Vec<crate::protected_config_dir::Store>,
     trusted_sources: Vec<PathBuf>,
+    project: &ProjectDir,
 ) -> Result<mount::MountContext> {
     let authority_home = config::host_home_dir().context("locating the authority home")?;
+    // D5/B4: the current project's pin store is *carried*, not inferred from the
+    // sibling stores the guard enumerates. The captured project plus the same
+    // authority HOME `config` discovery used is the one derivation, so the store
+    // measured first is the store this launch's pins came from.
+    let project_store = authority_home
+        .as_ref()
+        .map(|home| crate::project_config::project_dir(home, project));
     Ok(mount::MountContext {
         mount_store,
         host_home,
@@ -3883,6 +3893,7 @@ fn launch_mount_context(
         persisted_home,
         stores,
         trusted_sources,
+        project_store,
     })
 }
 
@@ -4026,6 +4037,7 @@ mod tests {
             return;
         }
         assert!(user::resolve_guest_identity(true).unwrap().is_none());
+        let project = ProjectDir::from_path_for_tests(&std::env::current_dir().unwrap()).unwrap();
         let context = launch_mount_context(
             PathBuf::from("/agent-vm-m11a-unused-store"),
             user::host_home_dir(),
@@ -4034,6 +4046,7 @@ mod tests {
             crate::guest_home::PersistedHome::none(),
             Vec::new(),
             Vec::new(),
+            &project,
         )
         .unwrap();
         let selected = context.authority_home.as_ref().expect("raw authority HOME");
@@ -6810,6 +6823,7 @@ options ndots:2 timeout:1";
             persisted_home: crate::guest_home::PersistedHome::none(),
             stores: Vec::new(),
             trusted_sources: Vec::new(),
+            project_store: None,
         };
         let guest = PathBuf::from("/home/guest/.pi");
 
@@ -6895,6 +6909,7 @@ options ndots:2 timeout:1";
                     persisted_home: crate::guest_home::PersistedHome::none(),
                     stores: Vec::new(),
                     trusted_sources: Vec::new(),
+                    project_store: None,
                 },
             )
             .unwrap();
@@ -6943,6 +6958,7 @@ options ndots:2 timeout:1";
             persisted_home: crate::guest_home::PersistedHome::none(),
             stores: Vec::new(),
             trusted_sources: Vec::new(),
+            project_store: None,
         };
         let first = mount::prepare(
             mount::parse_extra_mounts(std::slice::from_ref(&raw)).unwrap(),
@@ -6994,6 +7010,7 @@ options ndots:2 timeout:1";
                 persisted_home: crate::guest_home::PersistedHome::none(),
                 stores: Vec::new(),
                 trusted_sources: Vec::new(),
+                project_store: None,
             },
         )
         .unwrap();

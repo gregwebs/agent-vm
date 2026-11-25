@@ -79,7 +79,7 @@ crates/agent-vm/src/
 ├── image_import.rs         # daemon/archive import
 ├── image_publish.rs        # staging, native publication, requested-reference rollback
 ├── image_miss.rs           # registry-failure import hint
-├── tools_cmd.rs            # tools verb group: `print` the built-in definitions as user TOML
+├── tools_cmd.rs            # tools verb group; `print` calls config's built-in renderer
 ├── access_cmd.rs           # the `access` report and allow/allowances/revoke (ADR-0064, ADR-0066)
 ├── allowances.rs           # project allowances: view, `covers`, `Coverage::Applied`, writer facade (ADR-0065, ADR-0066)
 │   ├── store.rs            #   the record's read path and its lock-bounded, refuse-on-damage writer
@@ -92,8 +92,13 @@ crates/agent-vm/src/
 ├── msb_preflight.rs        # fail fast on a forward-migrated msb.db
 ├── doctor.rs               # operator diagnostics and db recovery
 ├── pi_credential_inspection.rs # read-only structural report of guest Pi state (#93)
-├── config.rs               # read-only tool config parse/merge/validate (doctor preview)
-│   └── builtin_print.rs    #   built-in declarations re-emitted as user-config TOML (#510)
+├── config.rs               # read/merge config; pins before untrusted decoding
+│   └── builtin_print.rs    #   built-in definitions re-emitted as user-config TOML (#510)
+├── config_pins.rs          # manifest, hashes, approval witness and snapshots
+│   ├── store.rs            #   verified pin-store reads, locks, generations and commits
+│   ├── diff.rs             #   bounded escaped review transcript
+│   └── prompt.rs           #   foreground-terminal approval input
+├── pins_cmd.rs             # launch-only review gate and best-effort active baseline
 └── …                       # clipboard, setup, user, env_flag, …
 
 vendor/agent-vm-images/      # contributor-only pinned independent image sources
@@ -114,8 +119,10 @@ policy ──> hostname ──> dns_name
 
 A launch is one pass, and the ordering is load-bearing:
 
-0. `main` discovers and loads the tool config **before** parsing, because the
-   resolved catalog determines which subcommands exist. `config::load` retains
+0. `main` discovers and loads the tool config, passes a pending content pin
+   through the pin gate, and then parses against the resolved catalog. The
+   catalog determines which subcommands exist; the pin-gate policy is
+   [ADR-0077](docs/adr/0077-pinned-config-sources.md). `config::load` retains
    **every** definition from both tiers, records which definitions win their
    verb (the non-lossy winner IDs, from `allow_tools` authorization — a project
    entry replacing an inherited `:trust` verb in place) together with the
@@ -139,7 +146,9 @@ A launch is one pass, and the ordering is load-bearing:
    catalog `Tool { entry, tool_args }` from that
    catalog, or a `Direct` command (`agent-vm … run PROGRAM`, or the equivalent
    top-level `--`). Selection is parse time: argv and catalog reads only, no side
-   effect.
+   effect. A typed pending-pin refusal then passes through `pins_cmd::gate`
+   before `cli::parse_from`: only a real foreground launch route can review and
+   approve it; every other route keeps the refusal and writes nothing.
 1. `main()` captures the target's requested credential names, before any child or
    worker exists.
 2. `main()` resolves and version-verifies the bundled `msb`, then points
@@ -181,14 +190,16 @@ A launch is one pass, and the ordering is load-bearing:
 `config.rs` reads the project's own
 `$HOME/.config/agent-vm/projects/<project-id>/config.toml` (host-managed, never
 the repository's `.agent-vm/config.toml`; see
-[ADR-0073](docs/adr/0073-host-managed-project-config.md)), then the files it
-sources as ordered **catalogs** — the `:trust` user config
-(`$HOME/.config/agent-vm/config.toml`) and any untrusted sources, which by
-default is the implicit user config ([ADR-0074](docs/adr/0074-flat-config-sources.md))
-— validates each strictly, and retains every definition from all of them.
-`allow_tools` decides which definitions are **launch verbs** — the `:trust`
-file's list first, then the project's entries, each one naming an inherited verb
-replacing it in place (ADR-0075) — and it is not a reference namespace. Each
+[ADR-0073](docs/adr/0073-host-managed-project-config.md)), then its ordered
+`[[sources]]` catalogs. A `trust = true` source uses the verified route/read;
+every `trust = false` source is route-read once, bounded, hashed and looked up
+by `PinsContentPolicy` before UTF-8 or TOML decoding. Only the private
+match-witness-backed `ApprovedSourceContent` reaches parsing, so an unapproved
+file supplies neither declarations nor inert facts; see
+[ADR-0077](docs/adr/0077-pinned-config-sources.md). `allow_tools` decides which
+definitions are **launch verbs** — each verified trusted or pinned approved
+`allow = true` source's list first, then the project's entries, each one naming an inherited
+verb replacing it in place (ADR-0075) — and it is not a reference namespace. Each
 launch winner's closure is resolved over the definitions that share its
 **declaring file** (#395), so a project `helper` that names `pi` gets the
 project's `pi` whichever file owns the verb — and a name that only another file

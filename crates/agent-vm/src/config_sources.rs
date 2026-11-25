@@ -138,6 +138,11 @@ pub(crate) struct SourceEntry {
     alias: SourceAlias,
     attributes: SourceAttributes,
     path: PathBuf,
+    /// Whether the user wrote a path with no `/` or `~/` anchor. The walker
+    /// starts a relative entry at the captured project root, and records the
+    /// resulting scope from the route it actually walks; this flag is what
+    /// tells that walker which floor to start from, not what the scope is.
+    spelled_relative: bool,
 }
 
 impl SourceEntry {
@@ -164,6 +169,41 @@ impl SourceEntry {
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
+
+    #[cfg_attr(not(test), allow(dead_code))] // Phase 4's untrusted route walker
+    pub(crate) fn is_spelled_relative(&self) -> bool {
+        self.spelled_relative
+    }
+
+    /// A hand-built entry for route tests: production entries come from
+    /// [`DeclaredSources::parse`], which is the only place that decides the
+    /// spelling/attribute defaults.
+    #[cfg(test)]
+    pub(crate) fn for_tests(spelled_relative: bool, path: PathBuf) -> Self {
+        Self {
+            declared: Declaration::Entry(0),
+            alias: SourceAlias::for_test("repo"),
+            attributes: SourceAttributes::default(),
+            path,
+            spelled_relative,
+        }
+    }
+}
+
+/// Which read policy an untrusted source's route earns (ADR-0076 R2.4, #736).
+///
+/// Decided by the route the walker actually traversed, never by the spelling:
+/// a relative path, an enclosing-worktree path, a case alias and a symlinked
+/// ancestor all become `Checkout` once a boundary directory is entered by
+/// descriptor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))] // Phase 4's untrusted route walker
+pub(crate) enum SourceScope {
+    /// The route entered the captured checkout or an enclosing Git worktree and
+    /// stayed confined to it.
+    Checkout,
+    /// An explicit `/...` or `~/...` route that never entered the boundary.
+    External,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -209,6 +249,7 @@ impl DeclaredSources {
                         allow: true,
                     },
                     path: path.to_path_buf(),
+                    spelled_relative: false,
                 }]
             })
             .unwrap_or_default();
@@ -376,6 +417,8 @@ const CONTROL_CHARACTER: &str = "the path contains a control character";
 const TILDE_SPELLING: &str = "only \"~/\" is expanded; write \"~/PATH\", \"./PATH\" or \"/PATH\"";
 const NOT_A_BOOL: &str = "must be true or false";
 const SELF_SOURCE: &str = "the project config cannot source itself";
+const DIRECTORY_ASSERTION: &str =
+    "the path names a directory (it ends with \"/\", \"/.\" or \"/..\"); a source must name a file";
 
 fn list_error(file: &Path, index: usize, refusal: &str) -> anyhow::Error {
     anyhow!(
@@ -459,6 +502,7 @@ fn entry(
         alias,
         attributes: SourceAttributes { trust, allow },
         path,
+        spelled_relative: !(spelled.starts_with("~/") || spelled.starts_with('/')),
     })
 }
 
@@ -476,11 +520,61 @@ fn optional_bool(
     }
 }
 
+/// The one lexical normalization `SourceEntry` and the future `PinKey` share.
+///
+/// Absolute, never canonicalizing and never touching the filesystem: repeated
+/// separators and interior `.` components are dropped, `..` is kept
+/// **uncollapsed** so the OS resolves it through the symlink the user's spelling
+/// names, and a spelling that asserts a directory (`/a/b/`, `/a/b/.`,
+/// `/a/b/..`) is refused rather than silently read as the file `a/b`. `None`
+/// means "not this shape"; callers supply the refusal text for their context.
+pub(crate) fn normalize_lexical_absolute(path: &Path) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.first() != Some(&b'/') {
+        return None;
+    }
+    // `Path::components` drops a trailing separator, so the directory assertion
+    // has to be read off the bytes before the component walk loses it.
+    if bytes.len() > 1 && bytes.ends_with(b"/") {
+        return None;
+    }
+    // `components()` normalizes a trailing `.` away, so the final directory
+    // spellings `/.` and `/..` are read off the bytes before the walk.
+    if bytes.ends_with(b"/.") || bytes.ends_with(b"/..") {
+        return None;
+    }
+    let components: Vec<Component<'_>> = path.components().collect();
+    let last = components.last()?;
+    match last {
+        Component::Normal(_) => {}
+        // A final `.` or `..`, or the bare root, names a directory.
+        Component::CurDir | Component::ParentDir | Component::RootDir => return None,
+        Component::Prefix(_) => return None,
+    }
+    let mut out = PathBuf::from("/");
+    for component in components {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(part) => out.push(part),
+            Component::ParentDir => out.push(Component::ParentDir),
+            Component::CurDir => {}
+            Component::Prefix(_) => return None,
+        }
+    }
+    Some(out)
+}
+
 fn resolve_spelled(
     spelled: &str,
     home: &Path,
     project_root: &Path,
 ) -> std::result::Result<PathBuf, &'static str> {
+    // Read the directory assertion off the user's own spelling: a `~//` or
+    // `./` suffix would otherwise be indistinguishable from the file it names.
+    if spelled.len() > 1 && spelled.ends_with('/') {
+        return Err(DIRECTORY_ASSERTION);
+    }
     let (base, rest) = if let Some(rest) = spelled.strip_prefix("~/") {
         // Repeated separators are dropped so the suffix is relative by
         // construction: a leading `RootDir` component would discard `base` when
@@ -489,13 +583,12 @@ fn resolve_spelled(
     } else if spelled.starts_with('~') {
         return Err(TILDE_SPELLING);
     } else if spelled.starts_with('/') {
-        return Ok(PathBuf::from(spelled));
+        return normalize_lexical_absolute(Path::new(spelled)).ok_or(DIRECTORY_ASSERTION);
     } else {
         (project_root, spelled)
     };
-    // `CurDir` is dropped so `./.agent-vm/config.toml` has exactly the spelling
-    // the legacy probe builds; `..` is kept (lexical, never resolved through a
-    // symlink here). Only relative components are pushed, so `base` survives.
+    // `..` is kept (lexical, never resolved through a symlink here); interior
+    // `.` is dropped. Only relative components are pushed, so `base` survives.
     let mut out = base.to_path_buf();
     for component in Path::new(rest).components() {
         match component {
@@ -510,7 +603,7 @@ fn resolve_spelled(
             }
         }
     }
-    Ok(out)
+    normalize_lexical_absolute(&out).ok_or(DIRECTORY_ASSERTION)
 }
 
 #[cfg(test)]
@@ -895,6 +988,7 @@ mod tests {
                 alias: SourceAlias::for_test(&format!("s{index}")),
                 attributes: SourceAttributes::default(),
                 path: PathBuf::from(format!("/srv/{index}.toml")),
+                spelled_relative: false,
             })
             .collect();
         let mut index = DeclaredIndex::default();
@@ -940,10 +1034,6 @@ mod tests {
             // A repeated separator must never rebase the path onto `/`.
             ("~//x", "/h/x"),
             ("~///a//b", "/h/a/b"),
-            ("~/", "/h"),
-            ("~//", "/h"),
-            ("/", "/"),
-            ("./", "/w/app"),
             ("./a", "/w/app/a"),
             ("a", "/w/app/a"),
             ("./a/./b", "/w/app/a/b"),
@@ -951,7 +1041,10 @@ mod tests {
             // `..` stays uncollapsed: the OS resolves it through a symlink.
             ("../outside/a.toml", "/w/app/../outside/a.toml"),
             ("sub/../a.toml", "/w/app/sub/../a.toml"),
+            // Absolute spellings take the same component walk as relative ones.
             ("/x/y", "/x/y"),
+            ("/x//y/./z.toml", "/x/y/z.toml"),
+            ("/x/y/../z.toml", "/x/y/../z.toml"),
         ] {
             let listed = context.parse_ok(&format!(
                 "[[sources]]\nname = \"repo\"\npath = {spelled:?}\n"
@@ -963,6 +1056,52 @@ mod tests {
                     .expect("UTF-8 test path"),
                 expected,
                 "{spelled:?}"
+            );
+        }
+    }
+
+    /// The one shape rule `PinKey` will reuse: absolute, interior `.`/`//`
+    /// dropped, `..` kept, and a trailing directory assertion refused.
+    #[test]
+    fn lexical_normalization_is_shared_and_directory_assertions_are_refused() {
+        for (raw, expected) in [
+            ("/a/b.toml", Some("/a/b.toml")),
+            ("/a//b.toml", Some("/a/b.toml")),
+            ("/a/./b.toml", Some("/a/b.toml")),
+            ("/a/b/../c.toml", Some("/a/b/../c.toml")),
+            ("/a/../b.toml", Some("/a/../b.toml")),
+            // Not absolute, or a directory assertion.
+            ("a/b.toml", None),
+            ("/", None),
+            ("/a/", None),
+            ("/a//", None),
+            ("/a/.", None),
+            ("/a/..", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                normalize_lexical_absolute(Path::new(raw)).as_deref(),
+                expected.map(Path::new),
+                "{raw:?}"
+            );
+        }
+    }
+
+    /// A directory spelling must never silently read as the regular file it
+    /// happens to name; the refusal is uniform across anchors.
+    #[test]
+    fn a_trailing_directory_assertion_is_refused_for_every_anchor() {
+        let context = TestContext::new();
+        for spelled in [
+            "~/", "~//", "/", "./", "a/", "./a/", "/a/b/", "/a/b/.", "/a/b/..", "../",
+        ] {
+            let message = refusal(
+                &context,
+                &format!("[[sources]]\nname = \"repo\"\npath = {spelled:?}\n"),
+            );
+            assert!(
+                message.contains("the path names a directory"),
+                "{spelled:?}: {message}"
             );
         }
     }
@@ -1029,6 +1168,7 @@ mod tests {
             }
         );
         assert_eq!(entry.path(), user_config);
+        assert!(!entry.is_spelled_relative());
         assert_eq!(entry.declared(), Declaration::Implicit);
         assert_eq!(entry.declared().to_string(), "the default home source");
 

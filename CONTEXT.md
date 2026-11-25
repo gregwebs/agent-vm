@@ -506,16 +506,20 @@ keyed by the **project**'s full digest), the **user** tier
 (`$HOME/.config/agent-vm/config.toml`) when the project config
 [sources](#config-source) it with `trust = true` — which is the implicit default
 — or a **config source**. The
-project tier is **host-managed**: nothing in a repository is ever read as config
-unless the project config names it. A present project file is
-verified unconditionally — a regular, singly linked, user-owned file reached
+project tier is **host-managed**: a repository file is read as config only when
+the project config names it. The default-user source is the verified-read
+exception: omitting `sources` implicitly reads
+`~/.config/agent-vm/config.toml` with `trust = true, allow = true`. A present
+project file is verified unconditionally — a regular, singly linked, user-owned file reached
 without a final symlink, in a store directory with the same ownership rules and
 no symlinked route — before its bytes are decoded
 ([ADR-0073](docs/adr/0073-host-managed-project-config.md)); a `trust = true`
 source's whole route is walked before it is opened, and its read is verified
 unconditionally ([ADR-0076](docs/adr/0076-sources-tables-trust-and-allow.md),
-[ADR-0040](docs/adr/0040-persisted-user-network-authority.md)). Each tier is parsed
-and validated independently before merging. Their merge is a **union of whole
+[ADR-0040](docs/adr/0040-persisted-user-network-authority.md)). A `trust = false`
+source instead reaches parsing only after its exact bounded bytes match this
+project's content pin ([ADR-0077](docs/adr/0077-pinned-config-sources.md)). Each
+tier is parsed and validated independently before merging. Their merge is a **union of whole
 definitions**, not a field overlay, and the verb list is **Tool authorization**
 rather than the declarations: each `allow = true` source's own list is inherited
 in `[[sources]]` order, the project's entries add verbs, and a project entry
@@ -537,8 +541,9 @@ refuse every one of them by presence, because presence is what asks for
 authority; a project or sourced *tool*'s `mounts` is the one mount field legal
 there, inert until authorized. `allow_tools` is legal in the user and project
 configs and in an `allow = true` source (inherited); a `trust = false` source
-cannot have it adopted. A definition with no verb still belongs to its own **tool
-reference scope**, so the rest of its file keeps resolving it.
+can have it adopted only after its content pin is approved. A definition with no
+verb still belongs to its own **tool reference scope**, so the rest of its file
+keeps resolving it.
 
 A load failure is **deferred**, not fatal at startup: `doctor`, the built-ins,
 and the in-guest `clipboard`/`_intercept-hook` keep working, and a launch verb
@@ -552,19 +557,27 @@ An entry of the project config's `[[sources]]` tables:
 The **name** is the file's stable alias. **`trust`** decides the read and the
 pinning bypass: `true` walks the whole route, refuses anything inside the active
 checkout or an enclosing Git worktree, verifies the read unconditionally, and is
-exempt from #736 content pinning; `false` reads an ordinary repository file
-(symlinks followed, in-repo paths legal) and is pinned. **`allow`** decides what
-the file's top-level keys mean: `true` adopts `image` (first in `[[sources]]`
-order), `mounts`, `[network]` and `allow_tools`; `false` leaves them **inert** —
-neither adopted nor refused, and reported by `doctor`. A `trust = false, allow =
-true` source cannot adopt until #736 approves its bytes. A way as-yet unadopted
-`image` takes effect when the project config selects it with
-`image = "NAME:image"`. Such a tool still carries the credential, `env`,
-`persist` and `mounts` declarations it makes, and is inert until the project
-config's **Tool authorization** names it, so a sourced file never displaces the
-shipped default verbs. Sourcing is **flat**: only the project config may declare
-sources. An omitted key means the single implicit
-`{ name = "home", path = "~/.config/agent-vm/config.toml", trust = true, allow = true }`.
+exempt from content pinning; `false` reads the bounded source bytes once and
+requires their SHA-256 content pin before decoding. **Every** `trust = false`
+source is pinned regardless of `allow`. **`allow`** decides what an approved
+file's top-level keys mean: `true` adopts `image` (first in `[[sources]]` order),
+`mounts`, `[network]` and `allow_tools`; `false` leaves them **inert** — neither
+adopted nor refused, and reported by `doctor` with its pin state. A relative
+source spelling stays in the checkout scope; an intended outside file must use
+an absolute or `~/` spelling. A pinned source must not contain secrets: its exact text is reviewable and
+stored in the protected project store. A way as-yet unadopted `image` takes
+effect when the project config selects it with `image = "NAME:image"`. A tool
+it declares is inert until the project config's **Tool authorization** names it.
+An `allow = true` source can instead contribute `allow_tools` and opt out of the
+shipped catalog. Sourcing is **flat**: only the project config may declare
+sources. An
+omitted key means the single implicit `{ name = "home", path =
+"~/.config/agent-vm/config.toml", trust = true, allow = true }`.
+_Not the same as_ an **OCI image pin**: a content pin approves exact source
+bytes for one project; an OCI image pin approves an image digest. _Not the same
+as_ an **inert tool**: an inert declaration is a source field not adopted by
+`allow`; an inert tool is a declared tool absent from `allow_tools`.
+
 _Avoid_: include, import, `:trust` suffix.
 
 ## Boot image

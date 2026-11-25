@@ -10,6 +10,10 @@ mod config;
 mod config_allow_tools;
 mod config_authority;
 mod config_mounts;
+// Phases 1-5 use most of this module; the staged inspection and the
+// non-interactive entry points are #739's `config diff|approve`.
+#[cfg_attr(not(test), allow(dead_code))]
+mod config_pins;
 mod config_sources;
 #[cfg(test)]
 mod cpu_evidence;
@@ -68,6 +72,7 @@ mod network_requests;
 mod notify;
 mod one_line;
 mod pi_credential_inspection;
+mod pins_cmd;
 mod project;
 mod project_config;
 mod protected_config_dir;
@@ -120,12 +125,33 @@ fn main() -> Result<()> {
     // One capture per command: handed beside `Dispatch` to `run_dispatch`.
     #[allow(clippy::disallowed_methods)]
     let project = project::ProjectDir::capture();
-    let config = project
+    // The argv is kept alive across the pin gate: the gate asks the real CLI
+    // preflight what the route is, and the reloaded configuration is what
+    // `parse_from` consumes afterwards.
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let paths = project
         .as_ref()
         .map_err(|error| anyhow::anyhow!("{error:#}"))
-        .and_then(config::ConfigPaths::discover)
-        .and_then(|paths| config::load(&paths));
-    let dispatch = match cli::parse_from(std::env::args_os(), config) {
+        .and_then(config::ConfigPaths::discover);
+    let config = match paths.as_ref() {
+        Ok(paths) => config::load(paths),
+        Err(error) => Err(anyhow::anyhow!("{error:#}")),
+    };
+    // The pin gate: between the load and the parse, because the *typed* refusal
+    // it consumes is the load's, and because only a route the real preflight
+    // accepts as a launch may be asked to review and approve one (D3/B3). A
+    // non-launch route reaches no prompt, creates no lock and writes no pin
+    // state: the refusal is returned exactly as the load produced it.
+    //
+    // The route preflight is told what the pending approvals could still change
+    // about the catalog: with no pending `allow = true` source, only verbs the
+    // parsed tiers already spell can dispatch after the reload.
+    let route = cli::preflight_unapproved_route(&argv, pins_cmd::verb_candidates(&config));
+    let config = pins_cmd::gate(config, route, paths.as_ref().ok());
+    // Captured before `parse_from` consumes the report; recorded only for a
+    // launch, and only once the parse has succeeded.
+    let active = config.as_ref().ok().and_then(pins_cmd::ActiveUpdates::of);
+    let dispatch = match cli::parse_from(argv, config) {
         Ok(dispatch) => dispatch,
         // Parse failures already know their status: clap's own formatter and
         // status for a usage error, and 125 for a deferred direct configuration
@@ -136,6 +162,15 @@ fn main() -> Result<()> {
     // The status policy of everything below depends on the route, recorded
     // while it is still observable on the dispatch itself.
     let direct = dispatch.is_direct_launch();
+    // A launch that used an already-approved digest marks it active here: after
+    // the parse, so a usage error or a non-launch route records nothing, and
+    // best effort, so a store that refuses cannot fail a successful launch.
+    if dispatch.is_launch()
+        && let Some(active) = active
+        && let Err(error) = pins_cmd::record_active(paths.as_ref().ok(), &active)
+    {
+        eprintln!("{}", pins_cmd::record_active_warning(&error, &active));
+    }
     run_dispatch(dispatch, project).map_err(|error| report_dispatch_failure(error, direct))
 }
 

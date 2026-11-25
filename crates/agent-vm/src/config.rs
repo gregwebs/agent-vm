@@ -130,7 +130,7 @@
 //! open and store-route check before bytes are read (ADR-0073); it still may
 //! not declare any of them.
 
-use crate::config_authority::{self, AuthorityTriggers};
+use crate::config_authority::{self, AuthorityTriggers, ContentApprovalPolicy as _};
 use crate::config_mounts::{self, ResolvedMountList, UserMounts};
 use crate::egress_reference::{self, EgressNamespace};
 use crate::host_paths::FinalComponent;
@@ -264,6 +264,7 @@ impl ConfigPaths {
                     route: crate::project_config::RouteAnchor::Captured {
                         home: home.clone(),
                         root: project.path().to_path_buf(),
+                        root_id: project.identity(),
                     },
                 }),
             home,
@@ -337,6 +338,12 @@ pub(crate) struct ConfigReport {
     /// The load's **one** leaf-visit counter, from `read_project_tier` through
     /// every source read and into the single catalog build (#735, D6).
     mount_work: config_mounts::MountExpansionWork,
+    /// The pin store state this load read, `Some` only when a `trust = false`
+    /// source made it read one. R12: the launch's best-effort active-baseline
+    /// recording observes **this** generation, never a fresh one taken after the
+    /// parse, so a reset in between is a no-op rather than a write into a store
+    /// the launch never read.
+    pins: Option<crate::config_pins::store::ObservedStore>,
 }
 
 impl ConfigReport {
@@ -420,6 +427,12 @@ impl ConfigReport {
     /// dedupe.
     pub(crate) fn conflicts(&self) -> &[ConfigConflict] {
         &self.conflicts
+    }
+
+    /// The store observation this load made, if it read the pin store at all.
+    /// The recording path carries it to the store's generation fence (R12).
+    pub(crate) fn pins_observed(&self) -> Option<crate::config_pins::store::ObservedStore> {
+        self.pins
     }
 
     /// Declared tools no `allow_tools` entry authorizes, in arena order: what
@@ -965,11 +978,20 @@ pub(crate) struct SourceReport {
     attributes: crate::config_sources::SourceAttributes,
     tier: TierReport,
     inert: InertDeclarations,
+    /// `Some` only for a `trust = false` source whose exact bytes a pin lookup
+    /// approved. Never set for `trust = true`, whose authority is its route.
+    pin: Option<crate::config_pins::SourcePin>,
 }
 
 impl SourceReport {
     pub(crate) fn alias(&self) -> &crate::config_sources::SourceAlias {
         &self.alias
+    }
+
+    /// The approved content pin, for a `trust = false` source; `None` for a
+    /// trusted one, which is not pinned at all.
+    pub(crate) fn pin(&self) -> Option<&crate::config_pins::SourcePin> {
+        self.pin.as_ref()
     }
 
     pub(crate) fn inert(&self) -> InertDeclarations {
@@ -1590,16 +1612,16 @@ impl ConfigConflict {
 /// `{ name = "home", path = "~/.config/agent-vm/config.toml", trust = true,
 /// allow = true }`, which is #733's shipped two-tier load.
 pub(crate) fn load(paths: &ConfigPaths) -> Result<ConfigReport> {
-    load_with_content_approval(paths, &config_authority::UnpinnedContentPolicy)
+    let mut policy = crate::config_pins::PinsContentPolicy::new(paths.project.as_ref());
+    load_with_content_approval(paths, &mut policy)
 }
 
-/// [`load`] with the #736 content-approval policy supplied. Production passes
-/// [`config_authority::UnpinnedContentPolicy`], which refuses every
-/// `trust = false, allow = true` adoption; #748's tests pass an approving policy
-/// to prove the approved and refused paths end to end.
+/// [`load`] with the #736 pin policy supplied. Production passes
+/// [`crate::config_pins::PinsContentPolicy`]; tests use the same policy (a real
+/// `pins.json` is written and approved) or one with an observation hook.
 pub(crate) fn load_with_content_approval(
     paths: &ConfigPaths,
-    approval: &dyn config_authority::ContentApprovalPolicy,
+    approval: &mut dyn config_authority::ContentApprovalPolicy,
 ) -> Result<ConfigReport> {
     // One leaf-visit counter for the whole load (#735, D6): project tool lists,
     // then each source in `[[sources]]` order. It is moved into the report so
@@ -1633,17 +1655,36 @@ pub(crate) fn load_with_content_approval(
         .map(|project| project.config.as_path());
     let verified_project = project_verified.as_ref();
 
+    // R7, before any `trust = false` file is opened: the 64-key store bound and
+    // every declared pin key. A path that cannot be pinned is refused here,
+    // before `pins.json` is read (V27). The set is retained for the gate's
+    // `CommitBatch::retained_keys`, so no store write can evict a live key.
+    let all_declared_keys = declared_pin_keys(sources.entries(), project_config_path)?;
+    // The checkout boundary is measured once, from the captured root, and only
+    // when a route can consult it. `None` means no captured root (test routes)
+    // or no untrusted source to read. Its root identity is the capture's, so a
+    // replacement of the path between the capture and here cannot put the
+    // captured root outside its own boundary.
+    let boundary = if all_declared_keys.is_empty() {
+        None
+    } else {
+        paths.route().checkout_boundary()?
+    };
+
     // One read per declared source, in `[[sources]]` order. The default user
     // config is recognised **lexically** (never by canonical equality) and is
     // the only `trust = true` route with ADR-0040's dotfile compatibility.
     let mut reads: Vec<SourceRead> = Vec::with_capacity(sources.entries().len());
+    let mut inspected: Vec<crate::config_pins::InspectedSource> = Vec::new();
+    let mut pending: Vec<crate::config_pins::PendingSource> = Vec::new();
     // One aggregate budget for every source: the per-file ceiling and the list
-    // bound alone would let a legal list multiply the parse cost.
+    // bound alone would let a legal list multiply the parse cost. Pinned bytes
+    // are charged here too (D1), so one load can never read more than one load.
     let mut budget = SourceBytes::fresh();
     for entry in sources.entries() {
         let is_default_user = entry.is_trusted() && Some(entry.path()) == paths.user.as_deref();
-        let (tier, contents, inert) = if is_default_user {
-            read_default_user_source(
+        let read = if is_default_user {
+            let (tier, contents, inert) = read_default_user_source(
                 entry,
                 verified_project,
                 entry.path(),
@@ -1651,25 +1692,80 @@ pub(crate) fn load_with_content_approval(
                 paths.home.as_deref(),
                 &mut work,
                 &mut budget,
-            )?
+            )?;
+            SourceReadOutcome::Approved {
+                tier,
+                contents,
+                inert,
+                pin: None,
+                scope: None,
+            }
         } else if entry.is_trusted() {
-            read_trusted_source(
+            let (tier, contents, inert) = read_trusted_source(
                 entry,
                 verified_project,
                 paths.route(),
                 paths.home.as_deref(),
                 &mut work,
                 &mut budget,
-            )?
+            )?;
+            SourceReadOutcome::Approved {
+                tier,
+                contents,
+                inert,
+                pin: None,
+                scope: None,
+            }
         } else {
             read_source_tier(
                 entry,
-                verified_project,
+                verified_project.ok_or_else(|| {
+                    anyhow!("internal: a trust = false source without a verified project config")
+                })?,
                 approval,
+                paths.route(),
+                boundary.as_ref(),
                 paths.home.as_deref(),
                 &mut work,
                 &mut budget,
             )?
+        };
+        let (tier, contents, inert, pin) = match read {
+            SourceReadOutcome::Approved {
+                tier,
+                contents,
+                inert,
+                pin,
+                scope,
+            } => {
+                if let (Some(pin), Some(scope)) = (pin.as_ref(), scope) {
+                    inspected.push(crate::config_pins::InspectedSource {
+                        alias: entry.alias().clone(),
+                        declared: entry.declared(),
+                        scope,
+                        allow: entry.is_allowed(),
+                        key: pin.key().clone(),
+                        hash: pin.hash(),
+                        status: crate::config_pins::InspectedStatus::Approved {
+                            active: pin.active(),
+                        },
+                    });
+                }
+                (tier, contents, inert, pin)
+            }
+            SourceReadOutcome::Pending(source) => {
+                inspected.push(crate::config_pins::InspectedSource {
+                    alias: source.alias.clone(),
+                    declared: source.declared,
+                    scope: source.scope,
+                    allow: source.allow,
+                    key: source.key.clone(),
+                    hash: source.hash,
+                    status: crate::config_pins::InspectedStatus::Pending(source.reason),
+                });
+                pending.push(source);
+                continue;
+            }
         };
         reads.push(SourceRead {
             alias: entry.alias().clone(),
@@ -1678,7 +1774,28 @@ pub(crate) fn load_with_content_approval(
             contents,
             inert,
             is_default_user,
+            pin,
         });
+    }
+
+    if !pending.is_empty() {
+        let project_config = project_config_path
+            .expect("a pending pinned source is declared by a project config")
+            .to_path_buf();
+        let store_dir = project_config
+            .parent()
+            .map_or_else(std::path::PathBuf::new, std::path::Path::to_path_buf);
+        return Err(anyhow::Error::new(
+            crate::config_pins::UnapprovedSources::new(
+                project_config,
+                store_dir,
+                approval.observed(),
+                inspected,
+                pending,
+                all_declared_keys,
+                known_verbs(&reads, &project_contents, &declared),
+            ),
+        ));
     }
 
     let user_index = reads.iter().position(|read| read.is_default_user);
@@ -1793,6 +1910,7 @@ pub(crate) fn load_with_content_approval(
             attributes: read.attributes,
             tier: read.tier,
             inert: read.inert.with_image(inert_images.contains(&read.alias)),
+            pin: read.pin,
         });
     }
 
@@ -1813,6 +1931,9 @@ pub(crate) fn load_with_content_approval(
     validate_persist_ownership(resolved.launch_tools())?;
 
     let inert_tools = resolved.inert_tools().to_vec();
+    // Taken before the report is built: the policy's observation is the one the
+    // reads above used, and recording must fence on exactly that generation.
+    let pins = approval.observed();
     Ok(ConfigReport {
         user,
         project,
@@ -1829,7 +1950,246 @@ pub(crate) fn load_with_content_approval(
         },
         inert_tools,
         mount_work: work,
+        pins,
     })
+}
+
+/// Every verb name an approval of a *pending* source cannot introduce (#736
+/// B3's verb preflight).
+///
+/// The pending source's own bytes are not parsed, so this reads only what is
+/// already decided: the names the project tier declares (`[[tools]]`) or claims
+/// (`allow_tools`, which is how an inert `allow = false` source's tool can still
+/// become a launch verb), every already-approved read tier's declarations and
+/// authorizations, the built-in `shell` fallback that is always appended, and —
+/// when no tier configures tools at all — the compiled-in defaults.
+///
+/// An `allow = false` pending source can therefore only re-supply names listed
+/// here; an `allow = true` one may supply any, which is why
+/// `UnapprovedSources::verb_candidates` widens the answer for it.
+fn known_verbs(
+    reads: &[SourceRead],
+    project_contents: &TierContents,
+    declared: &ProjectDeclarations,
+) -> BTreeSet<String> {
+    fn extend(names: &mut BTreeSet<String>, tools: &[Tool]) {
+        names.extend(tools.iter().map(|tool| tool.name().to_owned()));
+    }
+    fn extend_allow(
+        names: &mut BTreeSet<String>,
+        allow: &[crate::config_allow_tools::AllowToolEntry],
+    ) {
+        names.extend(allow.iter().map(|entry| entry.name().to_owned()));
+    }
+
+    let mut names = BTreeSet::new();
+    names.insert(SHELL_TOOL_NAME.to_owned());
+    extend(&mut names, &project_contents.tools);
+    if let Some(allow) = declared.allow_tools.as_deref() {
+        extend_allow(&mut names, allow);
+    }
+    let mut inherited_empty = true;
+    let mut any_allowed_source_configures_tools = false;
+    for read in reads {
+        extend(&mut names, &read.contents.tools);
+        if let Some(allow) = read.contents.allow_tools.as_ref() {
+            inherited_empty = false;
+            extend_allow(&mut names, allow.entries());
+        }
+        any_allowed_source_configures_tools |= read.attributes.allow
+            && (!read.contents.tools.is_empty() || read.contents.allow_tools.is_some());
+    }
+    // R4's condition, in the same terms `authorize_tools` uses: the defaults are
+    // the resolution only when no tier declares a tool and no tier writes an
+    // `allow_tools` key. `user.is_empty()` is "the default user tier declared
+    // nothing", which the loop above already folded in.
+    let defaults_apply = project_contents.tools.is_empty()
+        && declared.allow_tools.is_none()
+        && inherited_empty
+        && !any_allowed_source_configures_tools
+        && reads
+            .iter()
+            .all(|read| !read.is_default_user || read.contents.tools.is_empty());
+    if defaults_apply && let Ok(defaults) = default_tools() {
+        extend(&mut names, &defaults);
+    }
+    names
+}
+
+/// Which pinned sources an inspection reads.
+///
+/// `Only` is what lets a project whose pending sources exceed the shared source
+/// budget still be reviewed and approved in groups, and what binds
+/// `agent-vm config approve --expect` to keys the project actually declares.
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))] // #739's `config diff|approve`
+pub(crate) enum SourceSelection {
+    All,
+    Only(std::collections::BTreeSet<crate::config_pins::PinKey>),
+}
+
+impl SourceSelection {
+    fn includes(&self, key: &crate::config_pins::PinKey) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only(keys) => keys.contains(key),
+        }
+    }
+}
+
+/// Read only what a review needs: the project tier, the declared sources, and
+/// every selected `trust = false` route through the same read/pin path as
+/// `load`.
+///
+/// Deliberately stops before trusted-source reads, `resolve_images`,
+/// `authorize_tools` and any adoption, so a pinned file can be inspected and
+/// approved even while its `image`/`allow_tools` references are unresolved or
+/// its unapproved TOML is malformed. It never prompts and never writes: the
+/// store is opened for reading only, and an absent store stays absent.
+#[cfg_attr(not(test), allow(dead_code))] // #739's `config diff|approve`
+pub(crate) fn inspect_pinned_sources(
+    paths: &ConfigPaths,
+    selection: &SourceSelection,
+) -> Result<crate::config_pins::PinInspection> {
+    let Some(project) = paths.project.as_ref() else {
+        return Ok(crate::config_pins::PinInspection::empty());
+    };
+    let mut work = config_mounts::MountExpansionWork::fresh();
+    let ProjectRead {
+        declared, verified, ..
+    } = read_project_tier(project, paths.home.as_deref(), &mut work)?;
+    let sources = declared_sources(paths, declared.sources.as_ref(), &project.config)?;
+    let all_declared_keys = declared_pin_keys(sources.entries(), Some(&project.config))?;
+
+    // Reject an unknown `Only` key before opening any source file: a typo must
+    // not look like an approval of something else.
+    if let SourceSelection::Only(keys) = selection {
+        for key in keys {
+            if !all_declared_keys.contains(key) {
+                return Err(anyhow!(
+                    "config: {}: {} is not a declared trust = false source; nothing was inspected",
+                    crate::one_line::quoted_path(&project.config),
+                    crate::one_line::quoted_path(key.as_path()),
+                ));
+            }
+        }
+    }
+
+    let boundary = if all_declared_keys.is_empty() {
+        None
+    } else {
+        paths.route().checkout_boundary()?
+    };
+    let mut policy = crate::config_pins::PinsContentPolicy::new(Some(project));
+    let mut entries: Vec<crate::config_pins::InspectedSource> = Vec::new();
+    let mut pending: Vec<crate::config_pins::PendingSource> = Vec::new();
+    let mut budget = SourceBytes::fresh();
+    if let Some(verified) = verified.as_ref() {
+        for entry in sources.entries().iter().filter(|entry| !entry.is_trusted()) {
+            let key = crate::config_pins::PinKey::for_source(entry.path()).map_err(|refusal| {
+                anyhow!(
+                    "config: {}: {}: {}",
+                    crate::one_line::quoted_path(&project.config),
+                    entry.declared(),
+                    refusal.clause()
+                )
+            })?;
+            if !selection.includes(&key) {
+                continue;
+            }
+            let read = read_untrusted_bytes(
+                entry,
+                verified,
+                paths.route(),
+                boundary.as_ref(),
+                &mut budget,
+            )?;
+            match policy.check_untrusted_source(verified, entry, read.scope, &read.bytes)? {
+                config_authority::ContentApproval::Approved(approved) => {
+                    let pin = approved.pin();
+                    entries.push(crate::config_pins::InspectedSource {
+                        alias: entry.alias().clone(),
+                        declared: entry.declared(),
+                        scope: read.scope,
+                        allow: entry.is_allowed(),
+                        key: pin.key().clone(),
+                        hash: pin.hash(),
+                        status: crate::config_pins::InspectedStatus::Approved {
+                            active: pin.active(),
+                        },
+                    });
+                }
+                config_authority::ContentApproval::Pending(source) => {
+                    entries.push(crate::config_pins::InspectedSource {
+                        alias: source.alias.clone(),
+                        declared: source.declared,
+                        scope: source.scope,
+                        allow: source.allow,
+                        key: source.key.clone(),
+                        hash: source.hash,
+                        status: crate::config_pins::InspectedStatus::Pending(source.reason),
+                    });
+                    pending.push(source);
+                }
+            }
+        }
+    }
+    // Read the store once even when nothing is pending, so the report names the
+    // state it inspected. Absent stays absent; no lock is created.
+    policy.load_state()?;
+    let observed = policy
+        .observed()
+        .expect("the inspection read the store state");
+    let store_dir = project
+        .config
+        .parent()
+        .map_or_else(std::path::PathBuf::new, std::path::Path::to_path_buf);
+    Ok(crate::config_pins::PinInspection::new(
+        project.config.clone(),
+        store_dir,
+        observed,
+        entries,
+        pending,
+        all_declared_keys,
+    ))
+}
+
+/// Approve every pending pinned source through one real store commit.
+///
+/// Test support only: production approval is `pins_cmd`'s prompt/`config approve`
+/// gate. This still goes through inspection, the store transaction and content
+/// hashes — it is not a permissive policy, so a test cannot pass by bypassing
+/// the pin check.
+#[cfg(test)]
+pub(crate) fn approve_all_pinned(paths: &ConfigPaths) {
+    let inspection =
+        inspect_pinned_sources(paths, &SourceSelection::All).expect("inspect pending sources");
+    if inspection.pending().is_empty() {
+        return;
+    }
+    let project = paths
+        .project
+        .as_ref()
+        .expect("a pending source implies a project tier")
+        .clone();
+    let store = crate::config_pins::store::PinStore::new(project);
+    let batch = crate::config_pins::store::CommitBatch {
+        approve: inspection
+            .pending()
+            .iter()
+            .map(|source| crate::config_pins::store::ApprovalCandidate {
+                key: source.key.clone(),
+                hash: source.hash,
+                bytes: source.candidate.clone(),
+                activate: true,
+            })
+            .collect(),
+        activate: Vec::new(),
+        retained_keys: inspection.all_declared_keys().iter().cloned().collect(),
+    };
+    store
+        .update(&inspection.observed(), &batch, 1_000)
+        .expect("the fixture's approval commits");
 }
 
 /// One declared source after its read: what `load` needs to attribute the read
@@ -1842,6 +2202,25 @@ struct SourceRead {
     inert: InertDeclarations,
     /// `true` only for the default `~/.config/agent-vm/config.toml` source.
     is_default_user: bool,
+    /// `Some` only for an approved `trust = false` source.
+    pin: Option<crate::config_pins::SourcePin>,
+}
+
+/// What reading one source decided: bytes a pin lookup approved (and what they
+/// supplied), or a candidate that must be reviewed before anything is parsed.
+///
+/// There is no "decode and hope" arm: an unapproved source has no
+/// [`TierContents`] to contribute, so adoption cannot happen by inaction.
+#[allow(clippy::large_enum_variant)] // one per source; boxing would allocate on the hot path
+enum SourceReadOutcome {
+    Approved {
+        tier: TierReport,
+        contents: TierContents,
+        inert: InertDeclarations,
+        pin: Option<crate::config_pins::SourcePin>,
+        scope: Option<crate::config_sources::SourceScope>,
+    },
+    Pending(crate::config_pins::PendingSource),
 }
 
 /// One `allow = true` source's inherited authorizations, owned so `load` can
@@ -2427,77 +2806,210 @@ fn read_trusted_source(
 
 /// Read, decode, and validate a file the project config sources with
 /// `trust = false` (ADR-0076 R2.4): in-repo paths are legal, the final symlink is
-/// followed, and #736 inserts content-hash pinning between the read and the parse.
+/// followed through the confined walker, and #736 pins the exact bytes between
+/// the read and any parse.
 ///
-/// `allow = true` asks for top-level adoption, which no unpinned byte may grant:
-/// the [`config_authority::ContentApprovalPolicy`] decides, before UTF-8 or TOML
-/// decoding, so unapproved bytes can never reach a validator or an adopter.
+/// The order is the guarantee: one route read, charged to the shared source
+/// budget; the self-source check on the opened descriptor; then the SHA-256 and
+/// `pins.json` lookup; only an approved slice reaches UTF-8 validation, TOML
+/// decoding, inert recording or adoption. An unapproved source is not parsed at
+/// all, so malformed unapproved TOML reports pending rather than a parse error.
+#[allow(clippy::too_many_arguments)] // the load seam's read context, unchanged from #748
 fn read_source_tier(
     entry: &crate::config_sources::SourceEntry,
-    project: Option<&config_authority::VerifiedProject>,
-    approval: &dyn config_authority::ContentApprovalPolicy,
+    project: &config_authority::VerifiedProject,
+    approval: &mut dyn config_authority::ContentApprovalPolicy,
+    route: &crate::project_config::RouteAnchor,
+    boundary: Option<&crate::project_config::CheckoutBoundary>,
     home: Option<&Path>,
     work: &mut config_mounts::MountExpansionWork,
     budget: &mut SourceBytes,
-) -> Result<(TierReport, TierContents, InertDeclarations)> {
+) -> Result<SourceReadOutcome> {
+    let read = read_untrusted_bytes(entry, project, route, boundary, budget)?;
     let path = entry.path();
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(anyhow!(
-                "config: {}: not found; the project config sources it as {}",
-                crate::one_line::quoted_path(path),
-                entry.declared(),
-            ));
+    match approval.check_untrusted_source(project, entry, read.scope, &read.bytes)? {
+        config_authority::ContentApproval::Pending(pending) => {
+            Ok(SourceReadOutcome::Pending(pending))
         }
-        Err(error) => return Err(safe_io_error("reading metadata for", path, &error)),
+        config_authority::ContentApproval::Approved(approved) => {
+            let (text, document) = parse_toml_table(path, approved.bytes())?;
+            if document.contains_key("sources") {
+                return Err(sources_refusal(path));
+            }
+            misplaced_sources(&document, entry.is_allowed()).map_err(|error| {
+                anyhow!("config: {}: {error}", crate::one_line::quoted_path(path))
+            })?;
+            let mut raw = decode_raw_config(path, text)?;
+            let inert = if entry.is_allowed() {
+                InertDeclarations::default()
+            } else {
+                record_inert(&mut raw)
+            };
+            let adopted = entry.is_allowed().then(|| approved.adopted_authority());
+            let (report, contents) = build_tier(
+                path,
+                raw,
+                TierAuthority::Source(adopted),
+                FileTierKind::Source(entry.alias()),
+                home,
+                work,
+            )?;
+            Ok(SourceReadOutcome::Approved {
+                tier: report,
+                contents,
+                inert,
+                pin: Some(approved.pin().clone()),
+                scope: Some(read.scope),
+            })
+        }
     }
-    let read =
-        crate::host_paths::read_bounded_regular_file_noting_symlink(path, MAX_CONFIG_FILE_BYTES)
-            .map_err(|error| safe_anyhow_error("reading", path, &error))?;
-    budget.charge(read.path(), read.bytes().len())?;
-    check_not_self_source(project, read.identity(), entry)?;
-    let approved = if entry.is_allowed() {
-        let verified = project.ok_or_else(|| {
+}
+
+/// Walk one `trust = false` route once, charge the bytes to the load's shared
+/// budget, and refuse a source that is really the project config.
+///
+/// The budget is charged before the hash, the store lookup or any decoder sees
+/// the bytes (D1: pinned bytes share `MAX_SOURCE_BYTES_TOTAL` with every other
+/// source), and the self-source check compares the final descriptor identity
+/// before any pin I/O.
+fn read_untrusted_bytes(
+    entry: &crate::config_sources::SourceEntry,
+    project: &config_authority::VerifiedProject,
+    route: &crate::project_config::RouteAnchor,
+    boundary: Option<&crate::project_config::CheckoutBoundary>,
+    budget: &mut SourceBytes,
+) -> Result<crate::project_config::UntrustedSourceRead> {
+    let read = crate::project_config::read_untrusted_source_route(
+        entry,
+        route,
+        boundary,
+        MAX_CONFIG_FILE_BYTES,
+    )
+    .map_err(|error| untrusted_read_error(project, entry, route, error))?;
+    budget.charge(entry.path(), read.bytes.len())?;
+    check_not_self_source(Some(project), read.identity, entry)?;
+    Ok(read)
+}
+
+/// Render one untrusted route refusal, naming the project config, the entry and
+/// its declared path, and nothing the walker did not already publish.
+///
+/// A relative spelling that leaves the project gets its own refusal (D9): its
+/// spelling is a statement about the checkout, so leaving it is not an external
+/// read. The checkout wording is kept for an absolute route that entered the
+/// boundary and then left it.
+fn untrusted_read_error(
+    project: &config_authority::VerifiedProject,
+    entry: &crate::config_sources::SourceEntry,
+    route: &crate::project_config::RouteAnchor,
+    error: crate::project_config::UntrustedReadError,
+) -> anyhow::Error {
+    use crate::project_config::UntrustedReadError;
+    let project_config = crate::one_line::quoted_path(project.path());
+    let declared = entry.declared();
+    let alias = entry.alias();
+    let path = crate::one_line::quoted_path(entry.path());
+    match error {
+        UntrustedReadError::NotFound => {
+            anyhow!("config: {path}: not found; the project config sources it as {declared}")
+        }
+        UntrustedReadError::EscapesCheckout if relative_spelling_leaves_root(entry, route) => {
             anyhow!(
-                "internal: a trust = false, allow = true source without a verified project config"
+                "config: {project_config}: {declared} {alias} {path}: a relative source path stays \
+             inside the project directory; the file outside it must be named with an absolute or \
+             ~/ path in the project config"
             )
-        })?;
-        Some(approval.approve_untrusted_adoption(verified, entry, read.bytes())?)
-    } else {
-        None
-    };
-    let bytes = approved
-        .as_ref()
-        .map_or(read.bytes(), |approved| approved.bytes());
-    let (text, document) = parse_toml_table(read.path(), bytes)?;
-    if document.contains_key("sources") {
-        return Err(sources_refusal(read.path()));
+        }
+        UntrustedReadError::EscapesCheckout => anyhow!(
+            "config: {project_config}: {declared} {alias} {path}: checkout source resolves outside \
+             the project directory; refusing to read it (use an explicit absolute or ~/ path in \
+             the project config if you intend to source a host file outside the checkout)"
+        ),
+        UntrustedReadError::RootReplaced => anyhow!(
+            "config: {project_config}: {declared} {alias} {path}: the path changed while it was \
+             being read: a directory in the route, or the project directory, was replaced; \
+             refusing to read it — rerun the command"
+        ),
+        UntrustedReadError::CheckoutHardLinked(links) => anyhow!(
+            "config: {project_config}: {declared} {alias} {path}: checkout source has {links} \
+             hard links, so a second name could be outside the project directory; refusing to \
+             read it"
+        ),
+        UntrustedReadError::TooLarge => anyhow!(
+            "config: {project_config}: {declared} {alias} {path}: the source is larger than \
+             {MAX_CONFIG_FILE_BYTES} byte(s); refusing to read it"
+        ),
+        UntrustedReadError::NotRegular => anyhow!(
+            "config: {project_config}: {declared} {alias} {path}: the source is not a regular \
+             file; refusing to read it"
+        ),
+        UntrustedReadError::Io(error) => safe_anyhow_error("reading", entry.path(), &error),
     }
-    misplaced_sources(&document, entry.is_allowed()).map_err(|error| {
-        anyhow!(
-            "config: {}: {error}",
-            crate::one_line::quoted_path(read.path())
-        )
-    })?;
-    let mut raw = decode_raw_config(read.path(), text)?;
-    let inert = if entry.is_allowed() {
-        InertDeclarations::default()
-    } else {
-        record_inert(&mut raw)
+}
+
+/// Whether a relative entry's own spelling walks out of the captured root with
+/// `..`, as opposed to a symlink target doing so (D9).
+///
+/// Only the lexical-suffix case is D9's: the user wrote a path about the
+/// checkout and it left. A relative symlink whose *target* is outside keeps the
+/// checkout refusal, because the entry itself claimed nothing outside.
+fn relative_spelling_leaves_root(
+    entry: &crate::config_sources::SourceEntry,
+    route: &crate::project_config::RouteAnchor,
+) -> bool {
+    let crate::project_config::RouteAnchor::Captured { root, .. } = route else {
+        return false;
     };
-    let adopted = approved
-        .as_ref()
-        .map(config_authority::ApprovedSourceContent::adopted_authority);
-    let (report, contents) = build_tier(
-        read.path(),
-        raw,
-        TierAuthority::Source(adopted),
-        FileTierKind::Source(entry.alias()),
-        home,
-        work,
-    )?;
-    Ok((report, contents, inert))
+    if !entry.is_spelled_relative() {
+        return false;
+    }
+    entry.path().strip_prefix(root).is_ok_and(|suffix| {
+        matches!(
+            suffix.components().next(),
+            Some(std::path::Component::ParentDir)
+        )
+    })
+}
+
+/// The 64-key store bound and every declared `trust = false` key, checked before
+/// any untrusted file is opened.
+///
+/// A path that cannot be a pin key is refused here with R7's text, before
+/// `pins.json` is touched. The returned set is what `pins_cmd` hands to
+/// `CommitBatch::retained_keys`, so a full store never evicts a live key.
+fn declared_pin_keys(
+    entries: &[crate::config_sources::SourceEntry],
+    project_config: Option<&Path>,
+) -> Result<std::collections::BTreeSet<crate::config_pins::PinKey>> {
+    use crate::config_pins::{MAX_PINNED_KEYS, PinKey};
+    let untrusted: Vec<&crate::config_sources::SourceEntry> =
+        entries.iter().filter(|entry| !entry.is_trusted()).collect();
+    if untrusted.is_empty() {
+        return Ok(std::collections::BTreeSet::new());
+    }
+    let project_config = project_config
+        .ok_or_else(|| anyhow!("internal: trust = false sources without a project config path"))?;
+    let quoted = crate::one_line::quoted_path(project_config);
+    if untrusted.len() > MAX_PINNED_KEYS {
+        return Err(anyhow!(
+            "config: {quoted}: declares {} pinned (trust = false) sources, which exceeds the limit \
+             of {MAX_PINNED_KEYS} pinned sources per project; remove unused sources or consolidate \
+             them",
+            untrusted.len(),
+        ));
+    }
+    untrusted
+        .iter()
+        .map(|entry| {
+            PinKey::for_source(entry.path()).map_err(|refusal| {
+                anyhow!(
+                    "config: {quoted}: {}: {}",
+                    entry.declared(),
+                    refusal.clause()
+                )
+            })
+        })
+        .collect()
 }
 
 /// The project config's read: the tier report and contents every tier shares, plus
@@ -2560,7 +3072,7 @@ fn declared_sources(
     let Some(project) = &paths.project else {
         return Err(sources_unresolvable(project_config));
     };
-    let crate::project_config::RouteAnchor::Captured { home, root } = &project.route else {
+    let crate::project_config::RouteAnchor::Captured { home, root, .. } = &project.route else {
         return Err(sources_unresolvable(project_config));
     };
     DeclaredSources::parse(
@@ -2862,9 +3374,9 @@ fn build_tier(
     // Only the *user* tier's tool `mounts` are authority (#735): a project or
     // sourced file's are inert declarations parsed by
     // `parse_declared_tool_mounts` below, with no verified read of their own — the
-    // project store is verified separately (ADR-0073) and a sourced file is
-    // unpinned until #736. Demanding the ADR-0040 token for them here would refuse
-    // a shape the project tier is now allowed to declare.
+    // project store is verified separately (ADR-0073) and a `trust = false` file
+    // is pinned before decoding (#736). Demanding the ADR-0040 token for them here
+    // would refuse a shape the project tier is now allowed to declare.
     let tool_mounts_need_a_token =
         matches!(kind, FileTierKind::User) && !tool_mount_values.is_empty();
     let mut mounts = None;
@@ -5054,7 +5566,7 @@ fn deserialize_error(file: &Path, text: &str, error: &toml::de::Error) -> anyhow
     )
 }
 
-fn utf8_error(file: &Path) -> anyhow::Error {
+pub(crate) fn utf8_error(file: &Path) -> anyhow::Error {
     anyhow!(
         "config: {} is not valid UTF-8; config files must be UTF-8-encoded TOML",
         crate::one_line::quoted_path(file)
@@ -8433,8 +8945,36 @@ mod tests {
             ConfigPaths::with_home(Some(self.home.clone()), &self.project)
         }
 
+        /// The production load, with one in-session approval retry: if the only
+        /// thing standing in the way is a pending pinned source, approve exactly
+        /// the bytes inspection read and load again.
+        ///
+        /// This keeps every `#748` positive row measuring the adopted/inert
+        /// behaviour it was written for, and it goes through the real store and
+        /// the real policy — the approval is not a permissive stand-in.
         fn load(&self) -> Result<ConfigReport> {
+            match load(&self.paths()) {
+                Err(error)
+                    if error
+                        .downcast_ref::<crate::config_pins::UnapprovedSources>()
+                        .is_some() =>
+                {
+                    self.approve_pending();
+                    load(&self.paths())
+                }
+                other => other,
+            }
+        }
+
+        /// The load without the fixture's approval retry: what a real
+        /// non-interactive launch sees.
+        fn load_unapproved(&self) -> Result<ConfigReport> {
             load(&self.paths())
+        }
+
+        /// Approve every pending pinned source through one real store commit.
+        fn approve_pending(&self) {
+            approve_all_pinned(&self.paths());
         }
 
         /// Write the project config and load, the shape most `sources` rows take.
@@ -11505,6 +12045,7 @@ mod tests {
                         route: crate::project_config::RouteAnchor::Captured {
                             home: self.home.clone(),
                             root: self.project.path().to_path_buf(),
+                            root_id: self.project.identity(),
                         },
                     }),
                     home: Some(self.home.clone()),
@@ -12974,15 +13515,11 @@ mod tests {
         );
         assert!(!error.contains("SECRET-734"), "{error}");
 
-        // An indirect self-source: a checkout symlink to the store makes the
-        // project config a *source*, which then declares `sources`.
+        // An indirect self-source: the store is outside the checkout, so an
+        // absolute external spelling reaches it and the descriptor identity —
+        // not the flat-sourcing backstop — refuses it.
         let f = SourcesFixture::new();
-        f.write_project(&sources_block(&["self ./link/config.toml"]));
-        std::os::unix::fs::symlink(
-            f.project_config().parent().unwrap(),
-            f.checkout().join("link"),
-        )
-        .unwrap();
+        f.write_project(&source_table("self", f.project_config(), false, false));
         let error = format!("{:#}", f.load().expect_err("indirect self-source"));
         assert!(
             error.contains("the project config cannot source itself"),
@@ -13119,22 +13656,23 @@ mod tests {
 
         // `link/../target.toml` where `link` is a symlink to a sibling directory:
         // the OS resolves `..` through the link, so the base directory's file is
-        // read — not `checkout/target.toml`, which lexical collapse would choose.
+        // read — not the lexical collapse. The spelling is absolute, so this is
+        // an external read (D9), not a relative route leaving its checkout.
         let f = SourcesFixture::new();
         let sibling = f.base().join("sibling");
         fs::create_dir_all(&sibling).unwrap();
         fs::write(f.base().join("target.toml"), one_tool("outside-tool")).unwrap();
         fs::write(f.checkout().join("target.toml"), one_tool("checkout-tool")).unwrap();
-        std::os::unix::fs::symlink(&sibling, f.checkout().join("link")).unwrap();
+        std::os::unix::fs::symlink(&sibling, f.base().join("link")).unwrap();
         let report = f
             .with_project(&format!(
                 "allow_tools = [\"link:outside-tool\"]\n{}",
-                sources_block(&["link ./link/../target.toml"])
+                source_table("link", &f.base().join("link/../target.toml"), false, false)
             ))
             .expect("dot-dot through a symlink");
         assert_eq!(launch_names(&report), ["outside-tool"]);
 
-        // An untrusted source may escape the checkout: declarations only.
+        // A sibling of the project root is admitted when named absolutely (B8).
         let f = SourcesFixture::new();
         let sibling = f.base().join("sibling");
         fs::create_dir_all(&sibling).unwrap();
@@ -13144,12 +13682,42 @@ mod tests {
         )
         .unwrap();
         let report = f
-            .with_project(&sources_block(&["sib ../sibling/config.toml"]))
-            .expect("escape");
+            .with_project(&source_table(
+                "sib",
+                &sibling.join("config.toml"),
+                false,
+                false,
+            ))
+            .expect("an absolute sibling is external");
         assert_eq!(report.images().source_images().len(), 1);
 
-        // Directory spellings fail cleanly once read.
-        for entry in ["~/", "/", "./"] {
+        // The same sibling spelled relatively never leaves the region its
+        // spelling claimed: D9's own refusal, not the checkout wording.
+        let f = SourcesFixture::new();
+        let sibling = f.base().join("sibling");
+        fs::create_dir_all(&sibling).unwrap();
+        fs::write(
+            sibling.join("config.toml"),
+            "image = \"localhost:1/sibling:latest\"\n",
+        )
+        .unwrap();
+        let error = format!(
+            "{:#}",
+            f.with_project(&sources_block(&["sib ../sibling/config.toml"]))
+                .expect_err("a relative escape")
+        );
+        assert!(
+            error.contains("a relative source path stays inside the project directory"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("checkout source resolves outside"),
+            "D9 gets its own wording: {error}"
+        );
+
+        // Directory spellings are refused lexically, before anything is read:
+        // `target/` must never silently name the file `target`.
+        for entry in ["~/", "/", "./", "sub/", "/a/b/.", "../"] {
             let f = SourcesFixture::new();
             let alias = format!("dir {entry}");
             let error = format!(
@@ -13157,7 +13725,10 @@ mod tests {
                 f.with_project(&sources_block(&[alias.as_str()]))
                     .expect_err(entry)
             );
-            assert!(error.contains("is not a regular file"), "{entry}: {error}");
+            assert!(
+                error.contains("the path names a directory"),
+                "{entry}: {error}"
+            );
         }
     }
 
@@ -13644,36 +14215,20 @@ mod tests {
     }
 
     impl SourcesFixture {
-        fn load_with_approval(
+        /// Load with a caller-supplied policy, for the ordering/observation rows
+        /// that need a hook. Production's policy is the same type.
+        fn load_with_policy(
             &self,
-            approval: &dyn config_authority::ContentApprovalPolicy,
+            approval: &mut dyn config_authority::ContentApprovalPolicy,
         ) -> Result<ConfigReport> {
             load_with_content_approval(&self.paths(), approval)
         }
     }
 
-    /// The #736 stand-in: approves exactly the bytes it was constructed with.
-    struct ApproveExact(Vec<u8>);
-
-    impl config_authority::ContentApprovalPolicy for ApproveExact {
-        fn approve_untrusted_adoption<'a>(
-            &self,
-            project: &'a config_authority::VerifiedProject,
-            entry: &'a crate::config_sources::SourceEntry,
-            bytes: &'a [u8],
-        ) -> Result<config_authority::ApprovedSourceContent<'a>> {
-            if bytes != self.0.as_slice() {
-                anyhow::bail!("test approver: the bytes changed after approval");
-            }
-            Ok(config_authority::ApprovedSourceContent::for_test(
-                project, entry, bytes,
-            ))
-        }
-    }
-
-    /// The 2x2 matrix. `allow = true` adopts every top-level key; `allow = false`
-    /// adopts none of them and refuses nothing; `trust = false, allow = true`
-    /// refuses before decoding. The launch facets are asserted, not only `Ok`.
+    /// The 2x2 matrix. An unapproved `trust = false` source refuses under
+    /// **both** `allow` values (D2); once approved, `allow = true` adopts every
+    /// top-level key and `allow = false` adopts none but still supplies tools.
+    /// The launch facets and the pin field are asserted, not only `Ok`.
     #[test]
     fn the_four_trust_allow_combinations_are_independent() {
         for trust in [false, true] {
@@ -13689,21 +14244,44 @@ mod tests {
                     f.write_repo("team.toml", &adopting_source_body())
                 };
                 let project = source_table("team", &path, trust, allow);
-                let result = f.with_project(&project);
-                if allow && !trust {
-                    let error = format!("{:#}", result.expect_err(&label));
-                    for expected in [
-                        "allow = true on a trust = false source cannot adopt",
-                        "#736",
-                        "sources[0]",
-                        "allow = false",
-                        "trust = true",
-                    ] {
-                        assert!(error.contains(expected), "{label}: {error}");
-                    }
-                    continue;
+                f.write_project(&project);
+                if !trust {
+                    // Neither `allow` value may decode, adopt or parse an
+                    // unapproved file.
+                    let unapproved = f.load_unapproved();
+                    let error = format!("{:#}", unapproved.expect_err(&label));
+                    assert!(
+                        error.contains("1 pinned source is not approved for this project"),
+                        "{label}: {error}"
+                    );
+                    let unapproved = f.load_unapproved().unwrap_err();
+                    let pending = unapproved
+                        .downcast_ref::<crate::config_pins::UnapprovedSources>()
+                        .unwrap_or_else(|| panic!("{label}: a typed refusal"));
+                    assert_eq!(pending.pending().len(), 1, "{label}");
+                    assert_eq!(
+                        pending.pending()[0].reason(),
+                        crate::config_pins::PendingReason::NeverApproved,
+                        "{label}"
+                    );
                 }
-                let report = result.unwrap_or_else(|error| panic!("{label}: {error}"));
+                let report = f.load().unwrap_or_else(|error| panic!("{label}: {error}"));
+                if !trust {
+                    let pin = report.sources().entries()[0]
+                        .pin()
+                        .unwrap_or_else(|| panic!("{label}: an approved pin is reported"));
+                    assert!(pin.active(), "{label}");
+                    assert_eq!(
+                        pin.key().as_path(),
+                        crate::config_sources::normalize_lexical_absolute(&path).unwrap(),
+                        "{label}"
+                    );
+                } else {
+                    assert!(
+                        report.sources().entries()[0].pin().is_none(),
+                        "{label}: a trusted source is unpinned"
+                    );
+                }
                 if allow {
                     assert_eq!(
                         report.images().fallback().map(|f| f.alias().as_str()),
@@ -13785,23 +14363,35 @@ mod tests {
         }
     }
 
-    /// The approval gate runs before UTF-8/TOML decoding: an unapproved
-    /// `trust = false, allow = true` file is refused for the approval, never for
-    /// its (deliberately broken) syntax.
+    /// The pin check runs before UTF-8/TOML decoding for **both** `allow`
+    /// values: an unapproved file with deliberately broken TOML reports pending,
+    /// never a syntax or unknown-tool error.
     #[test]
     fn the_approval_gate_runs_before_decoding() {
-        let f = SourcesFixture::new();
-        let path = f.write_repo("team.toml", "network = [unclosed\n");
-        let project = source_table("team", &path, false, true);
-        let error = format!("{:#}", f.with_project(&project).unwrap_err());
-        assert!(
-            error.contains("cannot adopt top-level image"),
-            "the approval refusal must precede the parse: {error}"
-        );
+        for allow in [false, true] {
+            let f = SourcesFixture::new();
+            let path = f.write_repo("team.toml", "network = [unclosed\n");
+            let project = source_table("team", &path, false, allow);
+            f.write_project(&project);
+            let error = format!("{:#}", f.load_unapproved().expect_err("pending"));
+            assert!(
+                error.contains("1 pinned source is not approved for this project"),
+                "allow={allow}: the approval refusal must precede the parse: {error}"
+            );
+            assert!(
+                !error.contains("unclosed") && !error.contains("TOML"),
+                "allow={allow}: nothing from the unapproved file is echoed: {error}"
+            );
+            assert!(
+                error.contains(&path.display().to_string()),
+                "allow={allow}: the pending file is named: {error}"
+            );
+        }
     }
 
-    /// The #736 seam end to end: approved bytes adopt everything, and one changed
-    /// byte is refused before adoption.
+    /// The pin seam end to end: approved bytes adopt everything, and one changed
+    /// (still valid) byte is refused before adoption, naming the approved
+    /// baseline.
     #[test]
     fn approved_untrusted_bytes_adopt_and_changed_bytes_do_not() {
         let f = SourcesFixture::new();
@@ -13809,9 +14399,9 @@ mod tests {
         let path = f.write_repo("team.toml", &body);
         let project = source_table("team", &path, false, true);
         f.write_project(&project);
-        let report = f
-            .load_with_approval(&ApproveExact(body.clone().into_bytes()))
-            .expect("approved bytes are adopted");
+
+        let first_hash = crate::config_pins::ContentHash::of(body.as_bytes());
+        let report = f.load().expect("approved bytes are adopted");
         assert_eq!(
             report.images().fallback().map(|f| f.alias().as_str()),
             Some("team")
@@ -13822,8 +14412,14 @@ mod tests {
             Some(Some(true))
         );
         assert!(launch_names(&report).contains(&"t".to_owned()));
+        let pin = report.sources().entries()[0]
+            .pin()
+            .expect("an approved pin");
+        assert_eq!(pin.hash(), first_hash);
+        assert!(pin.active());
 
-        // One byte changed, still valid TOML: the same policy refuses.
+        // One byte changed, still valid TOML: the load refuses before adoption
+        // and names the previously approved digest as the baseline.
         let mut changed = body.clone().into_bytes();
         let offset = changed
             .windows(4)
@@ -13831,14 +14427,22 @@ mod tests {
             .expect("the body declares a mount");
         changed[offset] = b'H';
         fs::write(&path, &changed).unwrap();
-        let error = format!(
-            "{:#}",
-            f.load_with_approval(&ApproveExact(body.into_bytes()))
-                .expect_err("changed bytes were not approved")
+        let error = f
+            .load_unapproved()
+            .expect_err("changed bytes were not approved");
+        let unapproved = error
+            .downcast_ref::<crate::config_pins::UnapprovedSources>()
+            .expect("a typed pending refusal");
+        assert_eq!(
+            unapproved.pending()[0].reason(),
+            crate::config_pins::PendingReason::Changed {
+                last_active: first_hash
+            }
         );
+        let rendered = format!("{error:#}");
         assert!(
-            error.contains("the bytes changed after approval"),
-            "{error}"
+            rendered.contains(&format!("last approved {first_hash}")),
+            "{rendered}"
         );
     }
 
@@ -14121,22 +14725,23 @@ mod tests {
         );
     }
 
-    /// ADR-0076 R3 / #736: production refuses `trust = false, allow = true` before
-    /// decoding, so no unpinned bytes can grant ambient authority.
+    /// ADR-0076 R3 / #736 D2: an unapproved `trust = false, allow = true`
+    /// source is a typed pending refusal before decoding, so no unpinned bytes
+    /// can grant ambient authority.
     #[test]
     fn untrusted_allow_true_source_is_refused_before_pinning() {
         let f = SourcesFixture::new();
         let path = f.write_repo("team.toml", &adopting_source_body());
-        let error = format!(
-            "{:#}",
-            f.with_project(&source_table("team", &path, false, true))
-                .expect_err("unpinned adoption is refused")
-        );
-        assert!(error.contains("#736"), "{error}");
-        assert!(
-            error.contains("allow = true on a trust = false source"),
-            "{error}"
-        );
+        f.write_project(&source_table("team", &path, false, true));
+        let error = f
+            .load_unapproved()
+            .expect_err("unpinned adoption is refused");
+        let unapproved = error
+            .downcast_ref::<crate::config_pins::UnapprovedSources>()
+            .expect("a typed pending refusal");
+        assert_eq!(unapproved.pending().len(), 1);
+        assert!(unapproved.pending()[0].allow);
+        assert!(format!("{error:#}").contains("agent-vm config approve"));
     }
 
     /// `allow_tools` inherits in `[[sources]]` order, and the project may replace
@@ -14203,5 +14808,638 @@ mod tests {
         );
         let error = format!("{:#}", f.with_project(&project).unwrap_err());
         assert!(error.contains("allow_tools[1]"), "{error}");
+    }
+
+    // -- #736 phase 4: the pin-aware load, inspection, and refusals --------
+
+    impl SourcesFixture {
+        fn store_dir(&self) -> PathBuf {
+            self.config.parent().unwrap().to_path_buf()
+        }
+
+        fn pins_file(&self) -> PathBuf {
+            self.store_dir().join(crate::config_pins::PINS_FILE)
+        }
+
+        fn pins_lock(&self) -> PathBuf {
+            self.store_dir().join(crate::config_pins::LOCK_FILE)
+        }
+
+        /// The typed root error, or a panic naming what came back instead.
+        fn pending_error(&self) -> crate::config_pins::UnapprovedSources {
+            let error = self.load_unapproved().expect_err("a pending refusal");
+            error
+                .downcast::<crate::config_pins::UnapprovedSources>()
+                .expect("a typed UnapprovedSources root error")
+        }
+    }
+
+    fn independent_sha256(bytes: &[u8]) -> String {
+        use sha2::{Digest as _, Sha256};
+        let digest = Sha256::digest(bytes);
+        let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        format!("sha256:{hex}")
+    }
+
+    /// V17/R8: the refusal is typed, its digest is independently correct, its
+    /// `Display` is the documented sentence, and it retains every inspected
+    /// source plus the store observation.
+    #[test]
+    fn v17_an_unapproved_source_is_one_typed_refusal_with_the_r8_text() {
+        let f = SourcesFixture::new();
+        let body = one_tool("repo-tool");
+        let path = f.write_repo("repo.toml", &body);
+        f.write_project(&sources_block(&["repo ./repo.toml"]));
+
+        let error = f.load_unapproved().expect_err("unapproved");
+        let unapproved = error
+            .downcast_ref::<crate::config_pins::UnapprovedSources>()
+            .expect("a typed UnapprovedSources root error");
+        assert_eq!(unapproved.pending().len(), 1);
+        assert_eq!(unapproved.entries().len(), 1);
+        let source = &unapproved.pending()[0];
+        assert_eq!(
+            source.reason(),
+            crate::config_pins::PendingReason::NeverApproved
+        );
+        assert_eq!(source.hash.to_string(), independent_sha256(body.as_bytes()));
+        assert!(
+            unapproved.observed().is_some(),
+            "the store state is retained"
+        );
+
+        let expected = format!(
+            "config: {}: 1 pinned source is not approved for this project:\n  sources[0] repo {}: \
+             never approved (current {})\nreview the change with `agent-vm config diff` and \
+             approve it with `agent-vm config approve` (a later release's workflow, not this \
+             version's); this version approves only from an eligible launch — a tool verb, `run` \
+             or `--`, never `doctor`, help or a built-in — run in this project's interactive \
+             terminal",
+            crate::one_line::quoted_path(f.project_config()),
+            crate::one_line::quoted_path(&path),
+            independent_sha256(body.as_bytes()),
+        );
+        assert_eq!(error.to_string(), expected);
+        assert!(!f.pins_file().exists(), "the load wrote no manifest");
+        assert!(!f.pins_lock().exists(), "the load created no lock");
+    }
+
+    /// V18: an approved source reports `active`, and a trusted source never
+    /// reads or creates the pin store at all.
+    #[test]
+    fn v18_approved_sources_report_a_pin_and_trusted_sources_have_none() {
+        // Implicit home (trusted) only.
+        let f = SourcesFixture::new();
+        f.write_user(&one_tool("u"));
+        let report = f.load().expect("trusted load");
+        assert!(report.sources().entries()[0].pin().is_none());
+        assert!(!f.pins_file().exists(), "no pins.json for a trusted load");
+        assert!(!f.pins_lock().exists(), "no pins.lock for a trusted load");
+
+        // Explicit non-default trusted source, outside the checkout.
+        let f = SourcesFixture::new();
+        let trusted = f.base().join("team.toml");
+        fs::write(&trusted, one_tool("t")).unwrap();
+        let report = f
+            .with_project(&format!(
+                "allow_tools = [\"team:t\"]\n{}",
+                source_table("team", &trusted, true, true)
+            ))
+            .expect("trusted source load");
+        assert!(report.sources().entries()[0].pin().is_none());
+        assert!(!f.pins_file().exists());
+        assert!(!f.pins_lock().exists());
+
+        // An approved untrusted source carries its pin.
+        let f = SourcesFixture::new();
+        f.write_repo("repo.toml", &one_tool("r"));
+        let report = f
+            .with_project(&sources_block(&["repo ./repo.toml"]))
+            .expect("approved untrusted");
+        let pin = report.sources().entries()[0]
+            .pin()
+            .expect("an approved untrusted source is pinned");
+        assert!(pin.active(), "the approved digest was activated");
+        assert!(f.pins_file().exists());
+    }
+
+    /// V19/R6: a modification after approval is `Changed` against the recorded
+    /// active digest, not `NeverApproved` and not a fresh approval.
+    #[test]
+    fn v19_an_edit_after_approval_reports_the_active_baseline() {
+        let f = SourcesFixture::new();
+        let first = one_tool("r");
+        let path = f.write_repo("repo.toml", &first);
+        f.write_project(&sources_block(&["repo ./repo.toml"]));
+        f.load().expect("first approval");
+
+        let first_hash = crate::config_pins::ContentHash::of(first.as_bytes());
+        let changed = one_tool("s");
+        fs::write(&path, &changed).unwrap();
+        let unapproved = f.pending_error();
+        assert_eq!(
+            unapproved.pending()[0].reason(),
+            crate::config_pins::PendingReason::Changed {
+                last_active: first_hash
+            }
+        );
+        assert!(
+            format!("{unapproved}").contains(&format!("last approved {first_hash}")),
+            "{unapproved}"
+        );
+    }
+
+    /// V20 (load half): after two approvals, switching back to the first is an
+    /// `Ok` load whose pin is approved but no longer active.
+    #[test]
+    fn v20_a_switch_back_to_an_approved_version_is_inactive_not_pending() {
+        let f = SourcesFixture::new();
+        let a = one_tool("a");
+        let b = one_tool("b");
+        let path = f.write_repo("repo.toml", &a);
+        f.write_project(&sources_block(&["repo ./repo.toml"]));
+
+        let first = f.load().expect("approve A");
+        assert!(first.sources().entries()[0].pin().unwrap().active());
+        fs::write(&path, &b).unwrap();
+        let second = f.load().expect("approve B");
+        assert!(second.sources().entries()[0].pin().unwrap().active());
+
+        fs::write(&path, &a).unwrap();
+        let back = f.load().expect("A is still approved");
+        let pin = back.sources().entries()[0].pin().expect("approved pin");
+        assert_eq!(
+            pin.hash(),
+            crate::config_pins::ContentHash::of(a.as_bytes())
+        );
+        assert!(!pin.active(), "A is approved but not the active baseline");
+    }
+
+    /// V21: an `allow_tools` reference to an unapproved source is the pending
+    /// refusal, never "unknown tool"; malformed TOML is never parsed.
+    #[test]
+    fn v21_pending_wins_over_tool_resolution_and_parsing() {
+        let f = SourcesFixture::new();
+        f.write_repo("repo.toml", &one_tool("lint"));
+        f.write_project(&format!(
+            "allow_tools = [\"repo:lint\"]\n{}",
+            sources_block(&["repo ./repo.toml"])
+        ));
+        let error = format!("{:#}", f.load_unapproved().expect_err("pending"));
+        assert!(
+            error.contains("is not approved for this project"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("unknown tool") && !error.contains("does not declare"),
+            "{error}"
+        );
+
+        let f = SourcesFixture::new();
+        f.write_repo("repo.toml", "network = [unclosed\n");
+        f.write_project(&sources_block(&["repo ./repo.toml"]));
+        let unapproved = f.pending_error();
+        assert_eq!(unapproved.pending().len(), 1);
+    }
+
+    /// V22: a non-UTF-8 candidate is a config UTF-8 refusal, never offered for
+    /// approval and never wrapped in `UnapprovedSources`.
+    #[test]
+    fn v22_a_non_utf8_candidate_is_refused_not_offered_for_approval() {
+        let f = SourcesFixture::new();
+        let path = f.repo("binary.toml");
+        fs::write(&path, b"[[tools]]\nname = \"\xff\"\n").unwrap();
+        f.write_project(&sources_block(&["repo ./binary.toml"]));
+
+        let error = f.load_unapproved().expect_err("binary");
+        assert!(
+            error
+                .downcast_ref::<crate::config_pins::UnapprovedSources>()
+                .is_none(),
+            "a binary source is not an approval candidate"
+        );
+        assert!(
+            format!("{error:#}").contains("is not valid UTF-8"),
+            "{error:#}"
+        );
+        assert!(!f.pins_file().exists());
+        assert!(!f.pins_lock().exists());
+
+        // A healthy store does not change the answer: the binary is still not
+        // offered for approval, and the existing approval is untouched.
+        let f = SourcesFixture::new();
+        f.write_repo("good.toml", &one_tool("good"));
+        f.write_project(&sources_block(&["good ./good.toml"]));
+        f.load().expect("one healthy approval");
+        let pins_before = fs::read(f.pins_file()).unwrap();
+        fs::write(f.repo("bin.toml"), b"name = \"\xff\"\n").unwrap();
+        f.write_project(&sources_block(&["good ./good.toml", "bin ./bin.toml"]));
+        let error = f
+            .load_unapproved()
+            .expect_err("binary beside a healthy store");
+        assert!(
+            error
+                .downcast_ref::<crate::config_pins::UnapprovedSources>()
+                .is_none(),
+            "a binary source is not an approval candidate"
+        );
+        assert!(format!("{error:#}").contains("is not valid UTF-8"));
+        assert_eq!(fs::read(f.pins_file()).unwrap(), pins_before);
+    }
+
+    /// V23/R4: a damaged manifest is the store refusal for a project with pinned
+    /// sources, and is not even read when every source is trusted.
+    #[test]
+    fn v23_a_damaged_store_is_named_only_when_a_pinned_source_needs_it() {
+        let f = SourcesFixture::new();
+        f.write_repo("repo.toml", &one_tool("r"));
+        f.write_project(&sources_block(&["repo ./repo.toml"]));
+        fs::write(f.pins_file(), b"not json").unwrap();
+        let error = format!("{:#}", f.load_unapproved().expect_err("damaged"));
+        assert!(
+            error.contains(&f.pins_file().display().to_string()),
+            "the store file is named: {error}"
+        );
+        assert!(
+            error.contains("the source pin store could not be used"),
+            "{error}"
+        );
+
+        // The same damage is irrelevant to a trusted-only load: not read.
+        let f = SourcesFixture::new();
+        f.write_user(&one_tool("u"));
+        f.write_project(&format!("{}\n", sources_block(&[HOME_SOURCE])));
+        fs::write(f.pins_file(), b"not json").unwrap();
+        f.load().expect("a trusted load never reads pins.json");
+    }
+
+    /// V24(a)/(b): retargeting needs a fresh approval even for identical bytes,
+    /// and a change at the same key is `Changed`; (c) two spellings that
+    /// normalize identically are one key.
+    #[test]
+    fn v24_retargeting_is_a_new_key_and_spelling_is_normalized() {
+        use crate::config_pins::PinKey;
+
+        let f = SourcesFixture::new();
+        let body = one_tool("r");
+        f.write_repo("a.toml", &body);
+        f.write_repo("b.toml", &body);
+        f.write_project(&sources_block(&["repo ./a.toml"]));
+        f.load().expect("approve a.toml");
+
+        // (a) identical bytes at a new path is still never approved.
+        f.write_project(&sources_block(&["repo ./b.toml"]));
+        let unapproved = f.pending_error();
+        assert_eq!(
+            unapproved.pending()[0].reason(),
+            crate::config_pins::PendingReason::NeverApproved
+        );
+
+        // (b) a retarget at the same key with different bytes is Changed.
+        f.write_project(&sources_block(&["repo ./a.toml"]));
+        fs::write(f.repo("a.toml"), one_tool("s")).unwrap();
+        let unapproved = f.pending_error();
+        assert!(matches!(
+            unapproved.pending()[0].reason(),
+            crate::config_pins::PendingReason::Changed { .. }
+        ));
+
+        // (c) `.` and repeated separators normalize to one key.
+        let one = PinKey::for_source(Path::new("/w/app/conf/./a.toml")).unwrap();
+        let two = PinKey::for_source(Path::new("/w/app/conf//a.toml")).unwrap();
+        assert_eq!(one, two);
+    }
+
+    /// V25: the key is the lexical path the entry named, so an in-checkout
+    /// symlink is pinned under its own spelling; identical bytes behind a new
+    /// target stay approved, different bytes do not.
+    #[test]
+    fn v25_a_checkout_symlink_keeps_its_lexical_key() {
+        let f = SourcesFixture::new();
+        let body = one_tool("r");
+        f.write_repo("a.toml", &body);
+        f.write_repo("b.toml", &body);
+        std::os::unix::fs::symlink(f.repo("a.toml"), f.repo("link.toml")).unwrap();
+        f.write_project(&sources_block(&["repo ./link.toml"]));
+        f.load().expect("approve through the link");
+
+        let manifest = fs::read_to_string(f.pins_file()).unwrap();
+        assert!(
+            manifest.contains(&format!("{}/link.toml\"", f.checkout().display())),
+            "the key is the lexical spelling: {manifest}"
+        );
+        assert!(
+            !manifest.contains(&format!("{}/a.toml\"", f.checkout().display())),
+            "the target is not a second key: {manifest}"
+        );
+
+        // Retarget with identical bytes: the same key and digest stay approved.
+        fs::remove_file(f.repo("link.toml")).unwrap();
+        std::os::unix::fs::symlink(f.repo("b.toml"), f.repo("link.toml")).unwrap();
+        f.load().expect("identical bytes stay approved");
+
+        // Different bytes behind the new target are pending.
+        fs::write(f.repo("b.toml"), one_tool("s")).unwrap();
+        assert_eq!(f.pending_error().pending().len(), 1);
+    }
+
+    /// V26: one refusal lists every pending source in `[[sources]]` order, and a
+    /// mixed project retains both the approved and the pending entry.
+    #[test]
+    fn v26_pending_sources_are_collected_in_declaration_order() {
+        let f = SourcesFixture::new();
+        f.write_repo("one.toml", &one_tool("one"));
+        f.write_repo("two.toml", &one_tool("two"));
+        f.write_project(&sources_block(&["one ./one.toml", "two ./two.toml"]));
+        let unapproved = f.pending_error();
+        assert_eq!(unapproved.pending().len(), 2);
+        assert_eq!(unapproved.entries().len(), 2);
+        assert_eq!(unapproved.pending()[0].alias.as_str(), "one");
+        assert_eq!(unapproved.pending()[1].alias.as_str(), "two");
+        let rendered = format!("{unapproved}");
+        assert!(rendered.contains("2 pinned sources are not approved"));
+        let one = rendered.find("one.toml").unwrap();
+        let two = rendered.find("two.toml").unwrap();
+        assert!(one < two, "declaration order is kept: {rendered}");
+
+        // Mixed: approve both, change one, and both entries survive.
+        let f = SourcesFixture::new();
+        f.write_repo("one.toml", &one_tool("one"));
+        f.write_repo("two.toml", &one_tool("two"));
+        f.write_project(&sources_block(&["one ./one.toml", "two ./two.toml"]));
+        f.load().expect("both approved");
+        fs::write(f.repo("two.toml"), one_tool("changed")).unwrap();
+        let unapproved = f.pending_error();
+        assert_eq!(unapproved.entries().len(), 2);
+        assert_eq!(unapproved.pending().len(), 1);
+        assert!(matches!(
+            unapproved.entries()[0].status,
+            crate::config_pins::InspectedStatus::Approved { .. }
+        ));
+        assert!(matches!(
+            unapproved.entries()[1].status,
+            crate::config_pins::InspectedStatus::Pending(_)
+        ));
+    }
+
+    /// V27/R7: a path that cannot be a pin key is refused with the "cannot pin
+    /// it" clause before any store is opened.
+    #[test]
+    fn v27_an_unpinnable_path_is_refused_before_the_store() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let path = PathBuf::from(OsString::from_vec(b"/w/app/\xff.toml".to_vec()));
+        let entry = crate::config_sources::SourceEntry::for_tests(false, path);
+        // The project config does not exist; a store read would fail the load
+        // with a store error if it were attempted first.
+        let project = Path::new("/nonexistent/store/config.toml");
+        let error = super::declared_pin_keys(&[entry], Some(project)).expect_err("unpinnable");
+        assert!(
+            error.to_string().contains("cannot pin it"),
+            "the key refusal, not a store error: {error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("the source path is not valid UTF-8"),
+            "{error}"
+        );
+    }
+
+    /// The ordering guarantee, proven by instrumentation: the store lookup hook
+    /// runs before UTF-8 validation rejects an unapproved binary, and before an
+    /// approved malformed file's TOML error.
+    #[test]
+    fn the_lookup_happens_before_utf8_and_before_decoding() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        // Unapproved binary: UTF-8 rejects only after the lookup.
+        let f = SourcesFixture::new();
+        fs::write(f.repo("bin.toml"), b"name = \"\xff\"\n").unwrap();
+        f.write_project(&sources_block(&["repo ./bin.toml"]));
+        let looked_up = Rc::new(Cell::new(false));
+        let flag = Rc::clone(&looked_up);
+        let mut policy = crate::config_pins::PinsContentPolicy::with_lookup_hook(
+            f.paths().project.as_ref(),
+            Box::new(move |_, _| flag.set(true)),
+        );
+        let error = f.load_with_policy(&mut policy).expect_err("binary");
+        assert!(looked_up.get(), "the lookup ran before UTF-8 validation");
+        assert!(format!("{error:#}").contains("is not valid UTF-8"));
+
+        // Approved malformed TOML: the lookup approved these bytes, then the
+        // parser (not the pin check) reports the syntax error.
+        let f = SourcesFixture::new();
+        f.write_repo("bad.toml", "network = [unclosed\n");
+        f.write_project(&sources_block(&["repo ./bad.toml"]));
+        f.approve_pending();
+        let looked_up = Rc::new(Cell::new(false));
+        let flag = Rc::clone(&looked_up);
+        let mut policy = crate::config_pins::PinsContentPolicy::with_lookup_hook(
+            f.paths().project.as_ref(),
+            Box::new(move |_, _| flag.set(true)),
+        );
+        let error = f
+            .load_with_policy(&mut policy)
+            .expect_err("approved bytes reach the parser");
+        assert!(looked_up.get(), "the lookup ran before decoding");
+        assert!(
+            error
+                .downcast_ref::<crate::config_pins::UnapprovedSources>()
+                .is_none(),
+            "approved bytes are not pending"
+        );
+        assert!(
+            format!("{error:#}").contains("TOML") || format!("{error:#}").contains("expected"),
+            "the parse error is the refusal: {error:#}"
+        );
+    }
+
+    /// V39(c): an approved `(false, false)` source with malformed inert values
+    /// loads, stays inert, and an explicit `ALIAS:image` still selects its image.
+    #[test]
+    fn an_approved_inert_source_with_malformed_values_still_loads_and_selects() {
+        let f = SourcesFixture::new();
+        let body = "image = \"localhost:1/inert:latest\"\nnetwork = 42\nmounts = \"bad\"\n\
+                    allow_tools = {}\n[[tools]]\nname = \"t\"\ncommand = \"t\"\n";
+        f.write_repo("team.toml", body);
+        f.write_project(&format!(
+            "image = \"team:image\"\n{}",
+            source_table("team", &f.repo("team.toml"), false, false)
+        ));
+        let report = f.load().expect("approved inert values load");
+        assert_eq!(
+            image_ref(report.images().project()),
+            Some("localhost:1/inert:latest")
+        );
+        assert!(report.user_mounts().is_none());
+        assert_eq!(report.user_network(), None);
+        assert!(
+            report.sources().entries()[0]
+                .inert()
+                .labels()
+                .contains(&"mounts")
+        );
+        assert!(report.sources().entries()[0].pin().is_some());
+    }
+
+    /// V39(e): approval is of bytes, not attributes. Toggling `allow` on an
+    /// already-pinned source adopts its top-level keys without a fresh approval
+    /// or a new pin.
+    #[test]
+    fn toggling_allow_on_an_approved_source_needs_no_fresh_consent() {
+        let f = SourcesFixture::new();
+        f.write_repo("team.toml", &adopting_source_body());
+        f.write_project(&source_table("team", &f.repo("team.toml"), false, false));
+        let inert = f.load().expect("approved, inert");
+        assert!(inert.user_mounts().is_none());
+        let pins_before = fs::read(f.pins_file()).unwrap();
+
+        f.write_project(&source_table("team", &f.repo("team.toml"), false, true));
+        let adopted = f.load_unapproved().expect("same bytes, now allowed");
+        assert_eq!(
+            adopted.user_mounts().map(UserMounts::len),
+            Some(1),
+            "the approved mount list is now adopted"
+        );
+        assert_eq!(
+            adopted.user_network().map(|network| network.egress().lan),
+            Some(Some(true))
+        );
+        assert!(launch_names(&adopted).contains(&"t".to_owned()));
+        assert_eq!(
+            fs::read(f.pins_file()).unwrap(),
+            pins_before,
+            "no new approval was recorded"
+        );
+    }
+
+    /// V40 (load half): a checkout source resolving outside the project refuses
+    /// before reading the target, discloses no sentinel bytes, and leaves no
+    /// store file behind.
+    #[test]
+    fn an_untrusted_checkout_escape_discloses_nothing_and_creates_no_store() {
+        let f = SourcesFixture::new();
+        let outside = tempfile::tempdir().unwrap();
+        let sentinel = outside.path().canonicalize().unwrap().join("sentinel.toml");
+        fs::write(&sentinel, "SECRET-SENTINEL-736\n").unwrap();
+        std::os::unix::fs::symlink(&sentinel, f.repo("link.toml")).unwrap();
+        f.write_project(&sources_block(&["repo ./link.toml"]));
+        let error = format!("{:#}", f.load_unapproved().expect_err("escape"));
+        assert!(
+            error.contains("checkout source resolves outside the project directory"),
+            "{error}"
+        );
+        assert!(!error.contains("SECRET-SENTINEL-736"), "{error}");
+        assert_eq!(
+            fs::read_to_string(&sentinel).unwrap(),
+            "SECRET-SENTINEL-736\n"
+        );
+        assert!(!f.pins_file().exists());
+        assert!(!f.pins_lock().exists());
+    }
+
+    /// Inspection stops before trusted reads, image resolution, authorization
+    /// and any write; an unknown `Only` key is rejected before a file is opened.
+    #[test]
+    fn inspection_is_staged_read_only_and_rejects_unknown_keys() {
+        let f = SourcesFixture::new();
+        f.write_repo("team.toml", "network = [unclosed\n");
+        f.write_project(&format!(
+            "image = \"nope:image\"\n{}",
+            sources_block(&["team ./team.toml"])
+        ));
+        let inspection =
+            inspect_pinned_sources(&f.paths(), &SourceSelection::All).expect("pending inspects");
+        assert_eq!(inspection.pending().len(), 1);
+        assert_eq!(inspection.all_declared_keys().len(), 1);
+        assert!(!f.pins_file().exists(), "inspection wrote no manifest");
+        assert!(!f.pins_lock().exists(), "inspection created no lock");
+
+        // A `~` spelling would point outside the project; this one does not even
+        // need to exist, because the key is rejected first.
+        let missing =
+            crate::config_pins::PinKey::for_source(Path::new("/nonexistent/x.toml")).unwrap();
+        let error = inspect_pinned_sources(
+            &f.paths(),
+            &SourceSelection::Only(std::collections::BTreeSet::from([missing])),
+        )
+        .expect_err("unknown key");
+        assert!(
+            error
+                .to_string()
+                .contains("is not a declared trust = false source"),
+            "{error}"
+        );
+        assert!(
+            !error.to_string().contains("not found"),
+            "no file was opened: {error}"
+        );
+    }
+
+    /// D1: pinned bytes share the 4 MiB source budget with trusted sources.
+    /// Exactly the limit loads; one byte more refuses, naming the total.
+    #[test]
+    fn pinned_and_trusted_sources_share_one_byte_budget() {
+        let f = SourcesFixture::new();
+        let trusted = f.base().join("trusted.toml");
+        fs::write(&trusted, comment_config(1024 * 1024)).unwrap();
+        let mut project = source_table("trusted", &trusted, true, false);
+        for index in 0..3 {
+            f.write_repo(&format!("big{index}.toml"), &comment_config(1024 * 1024));
+            project.push_str(&source_table(
+                &format!("big{index}"),
+                &f.repo(&format!("big{index}.toml")),
+                false,
+                false,
+            ));
+        }
+        f.write_project(&project);
+        f.load().expect("exactly the shared budget");
+
+        // One more legal pinned file pushes the total over, even though every
+        // file on its own is under the per-file ceiling.
+        let f = SourcesFixture::new();
+        let trusted = f.base().join("trusted.toml");
+        fs::write(&trusted, comment_config(1024 * 1024)).unwrap();
+        let mut project = source_table("trusted", &trusted, true, false);
+        for index in 0..4 {
+            f.write_repo(&format!("big{index}.toml"), &comment_config(1024 * 1024));
+            project.push_str(&source_table(
+                &format!("big{index}"),
+                &f.repo(&format!("big{index}.toml")),
+                false,
+                false,
+            ));
+        }
+        let error = format!(
+            "{:#}",
+            f.with_project(&project).expect_err("over the budget")
+        );
+        assert!(
+            error.contains(&format!(
+                "the declared sources read more than {MAX_SOURCE_BYTES_TOTAL} bytes in total"
+            )),
+            "{error}"
+        );
+    }
+
+    /// A pending source never creates store state: neither the load nor an
+    /// inspection may leave a manifest or a lock behind.
+    #[test]
+    fn pending_sources_never_create_store_state() {
+        let f = SourcesFixture::new();
+        f.write_repo("repo.toml", &one_tool("r"));
+        f.write_project(&sources_block(&["repo ./repo.toml"]));
+        assert!(!f.pins_file().exists());
+        assert!(!f.pins_lock().exists());
+        let _ = f.load_unapproved().expect_err("pending");
+        assert!(!f.pins_file().exists(), "the load wrote no manifest");
+        assert!(!f.pins_lock().exists(), "the load created no lock");
+        let _ = inspect_pinned_sources(&f.paths(), &SourceSelection::All).expect("inspection");
+        assert!(!f.pins_file().exists(), "inspection wrote no manifest");
+        assert!(!f.pins_lock().exists(), "inspection created no lock");
     }
 }

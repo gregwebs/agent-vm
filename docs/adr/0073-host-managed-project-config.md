@@ -68,7 +68,9 @@ remains. Because silence would look like a bug, `doctor`'s
 
 ```text
 note: <path> is not auto-loaded; agent-vm never reads an in-repo .agent-vm/config.toml.
-To use it, review it and source it from this project's config with `agent-vm config edit`.
+To use it, review it and source it from this project's config: edit the file
+`agent-vm doctor` names as its `project:` row with your own editor (this version
+has no `config edit` command).
 ```
 
 or, when `lstat` fails with anything but `NotFound`,
@@ -235,7 +237,8 @@ the commands that treat it as fatal do so exactly as before.
   `trust = true` to any path outside the active checkout, and that route is
   walked and verified before any byte is read — so a source inherits authority
   from the *user's* registration of it, never from where it happens to sit. The
-  files a `trust = false` source contributes are still read unpinned until #736.
+  [ADR-0077](0077-pinned-config-sources.md) now content-pins every `trust = false`
+  source before decoding.
   (Amended for #748: the project config may now declare its own top-level
   `mounts` and `[network]` through this ADR's verified read; `[mount_sets]` and
   `[egress_sets]` stay refused until #738.)

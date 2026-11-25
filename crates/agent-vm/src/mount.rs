@@ -4053,6 +4053,12 @@ pub(crate) struct MountContext {
     /// (ADR-0076 R2.4). A writable bind overlapping one — or any directory along
     /// its route — would let the guest rewrite authority a later launch reads.
     pub(crate) trusted_sources: Vec<PathBuf>,
+    /// This launch's own project store, carried from the captured `ProjectDir`
+    /// and the authority HOME (D5/B4). `None` when no authority home is known, in
+    /// which case no project store can be located either. The guard measures it
+    /// first and matches it by identity, never by its spelling among the
+    /// sibling stores of `projects/`.
+    pub(crate) project_store: Option<PathBuf>,
 }
 
 /// Normalize the guest spelling before it participates in identity or
@@ -4334,9 +4340,16 @@ pub(crate) fn prepare(
         &homes,
         &context.stores,
         &context.trusted_sources,
+        context.project_store.as_deref(),
         &cwd,
     )?;
     config_dir.check_authority_links()?;
+    // A sibling project store whose snapshot scan the shared budget cut short is
+    // reported, never silently skipped (D5/R18). The line already carries its
+    // notice prefix; deduplication keeps a two-home launch from repeating it.
+    for warning in config_dir.warnings() {
+        push_notice(&mut notices, &mut seen, warning.clone());
+    }
     for source in &context.core_host_sources {
         config_dir.check_core_bind(source)?;
         // R2 (ADR-0064): `.sessions` is refused in every mode, so this is not
@@ -6043,6 +6056,7 @@ mod prepare_tests {
             persisted_home: crate::guest_home::PersistedHome::none(),
             stores: Vec::new(),
             trusted_sources: Vec::new(),
+            project_store: None,
         }
     }
 
@@ -6071,6 +6085,7 @@ mod prepare_tests {
             persisted_home: crate::guest_home::PersistedHome::none(),
             stores: Vec::new(),
             trusted_sources: Vec::new(),
+            project_store: None,
         }
     }
 
@@ -6989,6 +7004,7 @@ mod prepare_tests {
                 persisted_home: crate::guest_home::PersistedHome::none(),
                 stores: Vec::new(),
                 trusted_sources: Vec::new(),
+                project_store: None,
             };
 
             let error =
@@ -7139,6 +7155,7 @@ mod prepare_tests {
                         persisted_home: crate::guest_home::PersistedHome::none(),
                         stores: Vec::new(),
                         trusted_sources: Vec::new(),
+                        project_store: None,
                     },
                 );
                 assert!(
@@ -7229,6 +7246,7 @@ mod prepare_tests {
                 persisted_home: crate::guest_home::PersistedHome::none(),
                 stores: Vec::new(),
                 trusted_sources: Vec::new(),
+                project_store: None,
             },
         )
         .unwrap_err();
@@ -11008,6 +11026,7 @@ mod config_dir_guard_tests {
                 persisted_home: crate::guest_home::PersistedHome::none(),
                 stores: Vec::new(),
                 trusted_sources: Vec::new(),
+                project_store: None,
             }
         }
         fn refused(&self, requests: Vec<ExtraMount>, context: &MountContext, text: &str) {
@@ -11113,6 +11132,43 @@ mod config_dir_guard_tests {
         fs::write(&file, "# no network").unwrap();
         fs::hard_link(file, f.project.join("alias")).unwrap();
         f.refused(vec![], &f.context(vec![]), "has 2 hard links");
+    }
+    /// V44: a sibling project's `pins.json` or pin snapshot with a second name
+    /// refuses this launch at mount planning. The launch declares no source at
+    /// all, so no load-time pin refusal can mask the mount-time result, and the
+    /// refusal names the sibling's file.
+    #[test]
+    fn config_guard_sibling_pin_store_hard_links_refuse_before_mutation() {
+        for snapshot in [false, true] {
+            let f = Fixture::new();
+            let sibling = f
+                .home
+                .join(".config/agent-vm/projects")
+                .join("a".repeat(64));
+            fs::create_dir_all(&sibling).unwrap();
+            let name = if snapshot {
+                crate::config_pins::snapshot_name(
+                    crate::config_pins::StoreId::parse_hex(&"b".repeat(32)).unwrap(),
+                    &crate::config_pins::ContentHash::of(b"snapshot"),
+                )
+            } else {
+                crate::config_pins::PINS_FILE.to_owned()
+            };
+            let file = sibling.join(&name);
+            fs::write(&file, "{\"v\":1}").unwrap();
+            fs::hard_link(&file, f.project.join("pins-alias")).unwrap();
+            let error = prepare(vec![], &f.context(vec![])).unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("has 2 hard links"), "{message}");
+            assert!(
+                message.contains(&format!("\"{}\"", file.display())),
+                "the refusal names the sibling's file: {message}"
+            );
+            assert!(
+                fs::read_dir(&f.store).unwrap().next().is_none(),
+                "a refused launch must not publish fork state"
+            );
+        }
     }
     #[test]
     fn config_guard_raw_authority_home_is_distinct_from_pi_home() {

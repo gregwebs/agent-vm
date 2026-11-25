@@ -49,7 +49,7 @@ pub(crate) fn path(home: &Path, project: &ProjectDir) -> PathBuf {
 /// one value so the bytes read are always the bytes whose route was checked.
 /// The state with no root is therefore not an omitted field but
 /// [`RouteAnchor::Uncaptured`].
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct ProjectTierPaths {
     pub(crate) config: PathBuf,
     pub(crate) route: RouteAnchor,
@@ -69,19 +69,43 @@ impl ProjectTierPaths {
 }
 
 /// What the store route is checked against.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum RouteAnchor {
-    /// The `$HOME` the config path was derived from, and the canonical project
+    /// The `$HOME` the config path was derived from, the canonical project
     /// root from the command's single [`crate::project::ProjectDir`] capture
-    /// (ADR-0073 D5). Both travel with the path so a check cannot be run
-    /// against one home while the file is read through another.
-    Captured { home: PathBuf, root: PathBuf },
+    /// (ADR-0073 D5), and that capture's `(dev, ino)`. All three travel with the
+    /// path so a check cannot be run against one home while the file is read
+    /// through another, and a checkout-confined read can refuse a project root
+    /// replaced after capture instead of trusting the replacement.
+    Captured {
+        home: PathBuf,
+        root: PathBuf,
+        #[cfg_attr(not(test), allow(dead_code))] // read by the untrusted route walker
+        root_id: crate::host_paths::FileIdentity,
+    },
     /// No captured root: only tests build it, and no production caller does.
     /// Named rather than an `Option` field so that a reader which acquires this
     /// state must write it, and see the cost stated on
     /// [`StoreRoute::Unchecked`].
     #[cfg_attr(not(test), allow(dead_code))]
     Uncaptured,
+}
+
+impl RouteAnchor {
+    /// The checkout boundary this anchor admits, or `None` for a route with no
+    /// captured root.
+    ///
+    /// The root identity the walk checks and the root identity in the boundary
+    /// are the same captured `(dev, ino)`, so the two cannot disagree when the
+    /// path is replaced between the capture and this call.
+    pub(crate) fn checkout_boundary(&self) -> anyhow::Result<Option<CheckoutBoundary>> {
+        match self {
+            Self::Captured { root, root_id, .. } => {
+                Ok(Some(CheckoutBoundary::measure(root, *root_id)?))
+            }
+            Self::Uncaptured => Ok(None),
+        }
+    }
 }
 
 /// Whether the host project-config store exists and is safe to descend into
@@ -112,7 +136,7 @@ pub(crate) enum StoreRoute {
 /// Decision 3). Under the ADR-0040 stable-route assumption this is not a
 /// race-free lookup; concurrent host-side directory swaps remain out of scope.
 pub(crate) fn check_store_route(project: &ProjectTierPaths) -> anyhow::Result<StoreRoute> {
-    let RouteAnchor::Captured { home, root } = &project.route else {
+    let RouteAnchor::Captured { home, root, .. } = &project.route else {
         return Ok(StoreRoute::Unchecked);
     };
     let config_path = &project.config;
@@ -130,6 +154,49 @@ pub(crate) fn check_store_route(project: &ProjectTierPaths) -> anyhow::Result<St
             crate::one_line::quoted_path(&projects),
             e.kind(),
         ),
+    }
+    // Descriptor-first directory trust, before the store child is looked up (or
+    // declared absent): a `projects/` directory this user does not exclusively
+    // own could redirect a later child lookup, even while the child is missing
+    // now. This deliberately tightens the project-config read path, which
+    // previously trusted `projects/` only by its spelling.
+    let projects_fd = match rustix::fs::open(
+        &projects,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::NOENT) => return Ok(StoreRoute::Absent),
+        Err(error) => anyhow::bail!(
+            "config: {}: opening {}: {error}",
+            crate::one_line::quoted_path(config_path),
+            crate::one_line::quoted_path(&projects),
+        ),
+    };
+    let projects_facts =
+        crate::host_paths::opened_dir_facts(&projects_fd, &crate::one_line::quoted_path(&projects))
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "config: {}: {error:#}",
+                    crate::one_line::quoted_path(config_path)
+                )
+            })?;
+    if let Some(refusal) = crate::config_authority::authority_dir_refusal(
+        crate::config_authority::DirFacts {
+            is_dir: true,
+            uid: projects_facts.uid,
+            mode: projects_facts.mode,
+        },
+        crate::host_paths::current_euid(),
+    ) {
+        anyhow::bail!(
+            "config: {}: the project config refuses a projects directory that {}; make it owned by you and not group- or other-writable",
+            crate::one_line::quoted_path(config_path),
+            crate::allowances::refusal_clause(&refusal),
+        );
     }
     let Some(parent) = config_path.parent() else {
         anyhow::bail!(
@@ -223,7 +290,7 @@ pub(crate) fn check_user_parent_route(
     user_config: &Path,
     route: &RouteAnchor,
 ) -> anyhow::Result<()> {
-    let RouteAnchor::Captured { home, root } = route else {
+    let RouteAnchor::Captured { home, root, .. } = route else {
         return Ok(());
     };
     let parent = user_config.parent().ok_or_else(|| {
@@ -264,7 +331,7 @@ pub(crate) fn check_user_symlink_target(
     user_config: &Path,
     route: &RouteAnchor,
 ) -> anyhow::Result<()> {
-    let RouteAnchor::Captured { home, root } = route else {
+    let RouteAnchor::Captured { home, root, .. } = route else {
         return Ok(());
     };
     let canonical_target = std::fs::canonicalize(user_config).map_err(|error| {
@@ -303,27 +370,51 @@ pub(crate) fn check_user_symlink_target(
 /// alternate spelling (case variant on a case-insensitive filesystem, an
 /// uncollapsed or symlinked spelling) cannot step into a boundary directory
 /// without matching an identity.
+///
+/// The captured root's own identity is one of those identities by construction,
+/// not by re-measuring the path: see [`Self::measure`].
 pub(crate) struct CheckoutBoundary {
     boundary_ids: std::collections::BTreeSet<(u64, u64)>,
     boundary_roots: Vec<PathBuf>,
 }
 
 impl CheckoutBoundary {
-    /// Measure the boundary from the captured canonical project root.
+    /// Measure the boundary of the **captured** project root `root`, whose
+    /// identity the command captured once in
+    /// [`crate::project::ProjectDir::identity`].
     ///
-    /// Every ancestor is inspected from the filesystem root downwards so a nearer
-    /// `.git` never hides a farther one, and an unstatable ancestor fails closed:
-    /// a boundary that cannot be measured is a boundary that cannot be trusted.
-    fn measure(root: &Path) -> anyhow::Result<Self> {
+    /// `root_id` is inserted as the root's identity, and the root's path is
+    /// never re-`stat`ed for that purpose. A load captures the project, then
+    /// measures this boundary, and one `RENAME_SWAP` between the two
+    /// observations left the captured root outside its own boundary: a
+    /// `trust = false` source read from it was classified `external` and the
+    /// checkout hard-link rule did not apply (17 of 2000 runs at this change's
+    /// parent; the instrumented leak had the walk's captured `(dev, ino)`
+    /// differ from the single id this function measured). Authority for the
+    /// root therefore comes from the capture, which no later look at the path
+    /// can disagree with.
+    ///
+    /// Everything *above* the root is still discovered from the path, because
+    /// the enclosing worktrees that widen the boundary have no captured
+    /// identity; they can only add directories to the boundary, and replacing an
+    /// ancestor is the stable-route assumption ADR-0040 already states. Every
+    /// ancestor is inspected from the filesystem root downwards so a nearer
+    /// `.git` never hides a farther one, and an unstatable ancestor fails
+    /// closed: a boundary that cannot be measured is a boundary that cannot be
+    /// trusted.
+    pub(crate) fn measure(
+        root: &Path,
+        root_id: crate::host_paths::FileIdentity,
+    ) -> anyhow::Result<Self> {
         let mut boundary_ids = std::collections::BTreeSet::new();
-        let mut boundary_roots = Vec::new();
+        boundary_ids.insert((root_id.dev, root_id.ino));
+        let mut boundary_roots = vec![root.to_path_buf()];
         let fail = |kind: std::io::ErrorKind| {
             anyhow::anyhow!("config: refusing to measure the active checkout's boundary ({kind:?})")
         };
-        let mut ancestor = Some(root);
+        let mut ancestor = root.parent();
         while let Some(dir) = ancestor {
-            let is_worktree = std::fs::symlink_metadata(dir.join(".git")).is_ok();
-            if dir == root || is_worktree {
+            if std::fs::symlink_metadata(dir.join(".git")).is_ok() {
                 let meta = std::fs::metadata(dir).map_err(|error| fail(error.kind()))?;
                 use std::os::unix::fs::MetadataExt as _;
                 boundary_ids.insert((meta.dev(), meta.ino()));
@@ -335,6 +426,16 @@ impl CheckoutBoundary {
             boundary_ids,
             boundary_roots,
         })
+    }
+
+    /// A boundary assembled from identities and roots, for the route tests that
+    /// must place `/` itself inside a boundary.
+    #[cfg(test)]
+    pub(crate) fn for_tests(ids: &[(u64, u64)], roots: &[PathBuf]) -> Self {
+        Self {
+            boundary_ids: ids.iter().copied().collect(),
+            boundary_roots: roots.to_vec(),
+        }
     }
 
     /// True when the opened directory (identity) or its cursor path is inside the
@@ -363,12 +464,222 @@ pub(crate) struct OpenedTrustedSource {
     pub(crate) opened: Option<crate::host_paths::OpenedRegularFile>,
 }
 
-/// One queue entry of the route walk: a normal component, `.`, or `..`.
+/// One queue entry of a route walk: a normal component, `.`, or `..`.
 #[derive(Clone)]
 enum RouteStep {
     Name(std::ffi::OsString),
     Here,
     Up,
+}
+
+/// A route walk's symlink budget. A loop is a route this module will not
+/// follow; 40 matches the kernel's own limit for one path resolution.
+const MAX_SYMLINK_HOPS: usize = 40;
+
+/// Split a path into route steps, prepending them to `queue` in order.
+///
+/// Never echoes component bytes: route checks validate paths, not values.
+fn push_path_steps(queue: &mut std::collections::VecDeque<RouteStep>, path: &Path) {
+    let mut steps = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {}
+            std::path::Component::CurDir => steps.push(RouteStep::Here),
+            std::path::Component::ParentDir => steps.push(RouteStep::Up),
+            std::path::Component::Normal(name) => steps.push(RouteStep::Name(name.to_os_string())),
+        }
+    }
+    for step in steps.into_iter().rev() {
+        queue.push_front(step);
+    }
+}
+
+/// B1's spelling-independent half: is the captured root still the directory its
+/// on-disk name in its captured parent named?
+///
+/// One `open` of the parent and one `statat` of the root's own entry, compared
+/// to the captured `(dev, ino)` — no walk step and no comparison of the route's
+/// spelling, so a case-variant (or Unicode-normalization) alias of a replaced
+/// root is refused exactly like the exact spelling. A *sibling* of the root is
+/// untouched: this names the root's own entry, never some other child of the
+/// parent. A root at `/` has no parent entry and its routes are already inside
+/// the boundary.
+#[cfg_attr(not(test), allow(dead_code))] // Phase 4's untrusted route walker
+fn check_captured_root_entry(
+    root: &Path,
+    root_id: (u64, u64),
+) -> std::result::Result<(), UntrustedReadError> {
+    use rustix::fs::{Mode, OFlags};
+    let (Some(parent), Some(name)) = (root.parent(), root.file_name()) else {
+        return Ok(());
+    };
+    let parent_fd = rustix::fs::open(
+        parent,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| UntrustedReadError::RootReplaced)?;
+    require_captured_root_entry(&parent_fd, name, root_id)
+}
+
+/// The walk step's spelling-free checkpoint: in the directory descriptor a step
+/// is about to open a child from, the captured root's own entry name must still
+/// resolve to the captured `(dev, ino)`.
+///
+/// Identity plus the root's *on-disk* name is spelling-independent, which is what
+/// B1 asks for; a lexical test is not. A route can reach this directory through
+/// an alias of the root's name — a case variant, a Unicode normalization variant,
+/// or a differently-cased prefix above it — and a `starts_with` comparison on the
+/// spelling the route wrote matches none of them, so no checkpoint arms and a
+/// swap landing before the walk opens the root's own component is classified by
+/// where the route ends up instead of being refused. This check asks the
+/// filesystem's own directory, from the descriptor the walk already holds, for the
+/// entry that must carry the captured identity: every one of those spellings is
+/// decided by the same `(dev, ino)`. Because it names the captured root's entry
+/// and not the child being opened, a genuine sibling of the root stays admitted.
+fn require_captured_root_entry(
+    parent_fd: &std::os::fd::OwnedFd,
+    name: &std::ffi::OsStr,
+    root_id: (u64, u64),
+) -> std::result::Result<(), UntrustedReadError> {
+    let entry = match rustix::fs::statat(parent_fd, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(entry) => entry,
+        Err(rustix::io::Errno::NOENT) => return Err(UntrustedReadError::RootReplaced),
+        Err(error) => return Err(UntrustedReadError::Io(anyhow::anyhow!(error))),
+    };
+    let identity = (u64::try_from(entry.st_dev).unwrap_or(0), entry.st_ino);
+    if rustix::fs::FileType::from_raw_mode(entry.st_mode) != rustix::fs::FileType::Directory
+        || identity != root_id
+    {
+        return Err(UntrustedReadError::RootReplaced);
+    }
+    Ok(())
+}
+
+/// A step's own name as the step's own `statat` saw it, immediately before the
+/// step opened that name.
+#[derive(Clone, Copy, Debug)]
+struct StepEntry {
+    identity: (u64, u64),
+    kind: rustix::fs::FileType,
+}
+
+impl StepEntry {
+    fn of(stat: &rustix::fs::Stat) -> Self {
+        Self {
+            identity: (u64::try_from(stat.st_dev).unwrap_or(0), stat.st_ino),
+            kind: rustix::fs::FileType::from_raw_mode(stat.st_mode),
+        }
+    }
+}
+
+/// The step invariant: the identity a step's own name carried in its own
+/// `statat`, immediately before its `openat`, must be the identity that
+/// `openat` returned.
+///
+/// This is the check that sees a rename which starts and ends inside one step.
+/// Two `renamex_np(RENAME_SWAP)`es defeat every checkpoint that compares a name
+/// against the *captured* identity: the pre-open stat of the captured root's
+/// entry sees the captured root, the first swap puts the replacement at the
+/// name, the `openat` opens it, and the second swap restores the captured root
+/// before the closing stat, so both captured-identity checkpoints pass and the
+/// walk descends into the replacement. Here they cannot: one identity was seen
+/// before the open, the opened descriptor carries another, and a descriptor's
+/// identity cannot be swapped after it is open. No name comparison and no case
+/// folding is involved — a legitimately admitted sibling has its own stat and
+/// its own open agree.
+fn require_step_identity(
+    seen: StepEntry,
+    opened: (u64, u64),
+) -> std::result::Result<(), UntrustedReadError> {
+    if seen.identity != opened {
+        return Err(UntrustedReadError::RootReplaced);
+    }
+    Ok(())
+}
+
+/// `statat(SYMLINK_NOFOLLOW)` a step's own name: the identity its `openat` must
+/// then produce. A missing entry has nothing to open and is reported here.
+fn stat_step_entry(
+    dir_fd: &std::os::fd::OwnedFd,
+    name: &std::ffi::OsStr,
+) -> std::result::Result<StepEntry, UntrustedReadError> {
+    let entry = match rustix::fs::statat(dir_fd, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(entry) => entry,
+        Err(rustix::io::Errno::NOENT) => return Err(UntrustedReadError::NotFound),
+        Err(error) => return Err(UntrustedReadError::Io(anyhow::anyhow!(error))),
+    };
+    Ok(StepEntry::of(&entry))
+}
+
+/// A symlink step opens no descriptor to compare, so its `statat` is paired with
+/// a second one around the `readlinkat`: the link text the walk follows must
+/// belong to the entry the first stat saw. A `..` step and a missing entry open
+/// nothing at all and are decided where they occur (see the walk).
+fn require_entry_unchanged(
+    dir_fd: &std::os::fd::OwnedFd,
+    name: &std::ffi::OsStr,
+    seen: StepEntry,
+) -> std::result::Result<(), UntrustedReadError> {
+    require_step_identity(seen, stat_step_entry(dir_fd, name)?.identity)
+}
+
+/// A directory's own change stamps. Every `rename` of an entry in a directory
+/// updates that directory's `mtime` and `ctime`, so a snapshot that is unchanged
+/// across one step proves no entry of that directory was renamed inside the step.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DirChangeStamp {
+    changed: (i64, i64, i64, i64),
+}
+
+fn dir_change_stamp(
+    fd: &std::os::fd::OwnedFd,
+) -> std::result::Result<DirChangeStamp, UntrustedReadError> {
+    let stat =
+        rustix::fs::fstat(fd).map_err(|error| UntrustedReadError::Io(anyhow::anyhow!(error)))?;
+    Ok(DirChangeStamp {
+        changed: (
+            stat.st_mtime as i64,
+            stat.st_mtime_nsec as i64,
+            stat.st_ctime as i64,
+            stat.st_ctime_nsec as i64,
+        ),
+    })
+}
+
+/// The captured-root checkpoint re-read is only meaningful if nothing renamed an
+/// entry of that directory between it and the use of the opened child. A step's
+/// own stat and its open can agree on the replacement while that checkpoint saw
+/// the captured root before the rename and sees it again after another — the
+/// window the race harness finds (1 in 4 000 runs before this check). Directory
+/// stamps close it without a name: if the directory's `mtime` and `ctime` are
+/// unchanged, no entry was renamed, so every observation inside the step saw one
+/// state and an aliased step could only have opened the captured root. The stamp
+/// is only taken on the captured root's own parent, so an unrelated rename in a
+/// busy directory elsewhere on the route cannot refuse a read. A filesystem whose
+/// timestamps are too coarse to separate two renames inside one step would miss
+/// them; APFS and ext4 carry nanoseconds.
+fn require_dir_unchanged(
+    fd: &std::os::fd::OwnedFd,
+    stamp: DirChangeStamp,
+) -> std::result::Result<(), UntrustedReadError> {
+    if dir_change_stamp(fd)? != stamp {
+        return Err(UntrustedReadError::RootReplaced);
+    }
+    Ok(())
+}
+
+/// Read a symlink's target without following it.
+#[cfg_attr(not(test), allow(dead_code))] // Phase 4's untrusted route walker
+fn read_link_target(
+    dir_fd: &std::os::fd::OwnedFd,
+    name: &std::ffi::OsStr,
+) -> std::result::Result<PathBuf, UntrustedReadError> {
+    let target = rustix::fs::readlinkat(dir_fd, name, Vec::new())
+        .map_err(|error| UntrustedReadError::Io(anyhow::anyhow!(error)))?;
+    Ok(PathBuf::from(
+        <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(target.as_bytes()),
+    ))
 }
 
 /// ADR-0076 R2.2: validate the **entire traversed route** of a non-default
@@ -406,10 +717,7 @@ pub(crate) fn open_trusted_source_route_checkpointed(
     use crate::host_paths::{OpenedDirFacts, opened_dir_facts};
     use rustix::fs::{Mode, OFlags};
 
-    let boundary = match route {
-        RouteAnchor::Captured { root, .. } => Some(CheckoutBoundary::measure(root)?),
-        RouteAnchor::Uncaptured => None,
-    };
+    let boundary = route.checkout_boundary()?;
     let euid = crate::host_paths::current_euid();
     let refuse = |what: &str| {
         anyhow::anyhow!(
@@ -448,25 +756,6 @@ pub(crate) fn open_trusted_source_route_checkpointed(
 
     let mut queue: std::collections::VecDeque<RouteStep> = std::collections::VecDeque::new();
     let mut hops = 0usize;
-    const MAX_SYMLINK_HOPS: usize = 40;
-
-    // Never echo component bytes: the route checks validate paths, not values.
-    fn push_path_steps(queue: &mut std::collections::VecDeque<RouteStep>, path: &Path) {
-        let mut steps = Vec::new();
-        for component in path.components() {
-            match component {
-                std::path::Component::RootDir | std::path::Component::Prefix(_) => {}
-                std::path::Component::CurDir => steps.push(RouteStep::Here),
-                std::path::Component::ParentDir => steps.push(RouteStep::Up),
-                std::path::Component::Normal(name) => {
-                    steps.push(RouteStep::Name(name.to_os_string()))
-                }
-            }
-        }
-        for step in steps.into_iter().rev() {
-            queue.push_front(step);
-        }
-    }
 
     if !path.is_absolute() {
         return Err(refuse("a path that is not absolute"));
@@ -672,6 +961,494 @@ fn check_trusted_symlink_target_against_boundary(
         );
     }
     Ok(())
+}
+
+/// One `trust = false` source read through a single descriptor walk
+/// (ADR-0076 R2.4, #736).
+#[cfg_attr(not(test), allow(dead_code))] // Phase 4's untrusted route walker
+pub(crate) struct UntrustedSourceRead {
+    pub(crate) scope: crate::config_sources::SourceScope,
+    /// The exact bytes read once from the opened descriptor. The caller charges
+    /// these to its own source budget and hashes this buffer; the file is never
+    /// reopened.
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) identity: crate::host_paths::FileIdentity,
+}
+
+/// Why an untrusted route did not produce bytes.
+///
+/// Values rather than messages: the caller renders the user-facing refusal with
+/// the entry's alias, declaration and project config, which this walker does
+/// not have. `Debug` is safe to log — no component or target bytes are held.
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))] // Phase 4's untrusted route walker
+pub(crate) enum UntrustedReadError {
+    NotFound,
+    /// The captured root's entry no longer carries the captured identity, or a
+    /// step's name resolved to one identity and opened as another: the path
+    /// changed while it was being read. Named for the root because that is the
+    /// case with a checkpoint of its own; an intermediate directory swapped
+    /// under the walk is the same defect and the same refusal.
+    RootReplaced,
+    EscapesCheckout,
+    CheckoutHardLinked(u64),
+    TooLarge,
+    NotRegular,
+    Io(anyhow::Error),
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // Phase 4's untrusted route walker
+fn untrusted_dir_facts(
+    fd: &std::os::fd::OwnedFd,
+    display: &impl std::fmt::Display,
+) -> std::result::Result<crate::host_paths::OpenedDirFacts, UntrustedReadError> {
+    crate::host_paths::opened_dir_facts(fd, display).map_err(UntrustedReadError::Io)
+}
+
+/// Walk a `trust = false` source's whole route from `/` by descriptor and read
+/// it **once**, reporting the scope the walk actually earned (ADR-0076 R2.4).
+///
+/// Unlike the `trust = true` walk, entering a [`CheckoutBoundary`] is not a
+/// refusal: a checkout source is admitted and confined. Every directory is
+/// opened `O_NOFOLLOW` from the descriptor above it, so a replaced name between
+/// steps can never change which directory is read. A relative entry starts at
+/// the captured root, which must still carry the identity capture verified.
+///
+/// `boundary` is `None` only for routes with no captured root (test fixtures);
+/// production callers pass [`RouteAnchor::checkout_boundary`], whose root
+/// identity is the capture's.
+#[cfg_attr(not(test), allow(dead_code))] // Phase 4's untrusted route walker
+pub(crate) fn read_untrusted_source_route(
+    entry: &crate::config_sources::SourceEntry,
+    route: &RouteAnchor,
+    boundary: Option<&CheckoutBoundary>,
+    max_bytes: u64,
+) -> std::result::Result<UntrustedSourceRead, UntrustedReadError> {
+    read_untrusted_source_route_checkpointed(entry, route, boundary, max_bytes, |_| {})
+}
+
+/// Where inside one walk step a test seam may act. A production walk passes a
+/// closure that discards both, so no rename can be injected into a shipped
+/// build.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StepMoment {
+    /// After the captured-root checkpoint on this step's parent and before the
+    /// step's own `statat`: the window a directory stamp closes.
+    AfterCapturedRootCheckpoint,
+    /// After the step's own `statat`, before its `openat`: the window the step
+    /// invariant closes.
+    BeforeOpen,
+    /// After the step's `openat`, before any checkpoint re-reads the name: where
+    /// a test puts back what it swapped in, i.e. the second swap.
+    AfterOpen,
+}
+
+/// [`read_untrusted_source_route`] with a checkpoint after each traversed
+/// directory, so a test can swap a component mid-walk and prove the walk stays
+/// anchored to the descriptors it already opened.
+#[cfg_attr(not(test), allow(dead_code))] // Phase 4's untrusted route walker
+pub(crate) fn read_untrusted_source_route_checkpointed(
+    entry: &crate::config_sources::SourceEntry,
+    route: &RouteAnchor,
+    boundary: Option<&CheckoutBoundary>,
+    max_bytes: u64,
+    after_step: impl FnMut(&Path),
+) -> std::result::Result<UntrustedSourceRead, UntrustedReadError> {
+    read_untrusted_source_route_inner(entry, route, boundary, max_bytes, after_step, |_, _| {})
+}
+
+/// [`read_untrusted_source_route`] with a seam inside the step that opens a
+/// descriptor, so a test can rename the step's own name between its `statat`
+/// and its `openat` ([`StepMoment::BeforeOpen`]) and, on a tree without the step
+/// invariant, put the original back before the closing checkpoint
+/// ([`StepMoment::AfterOpen`]) — the double swap that closes the window only the
+/// stat-then-open agreement can see.
+#[cfg(test)]
+pub(crate) fn read_untrusted_source_route_with_seam(
+    entry: &crate::config_sources::SourceEntry,
+    route: &RouteAnchor,
+    boundary: Option<&CheckoutBoundary>,
+    max_bytes: u64,
+    seam: impl FnMut(&Path, StepMoment),
+) -> std::result::Result<UntrustedSourceRead, UntrustedReadError> {
+    read_untrusted_source_route_inner(entry, route, boundary, max_bytes, |_| {}, seam)
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // Phase 4's untrusted route walker
+fn read_untrusted_source_route_inner(
+    entry: &crate::config_sources::SourceEntry,
+    route: &RouteAnchor,
+    boundary: Option<&CheckoutBoundary>,
+    max_bytes: u64,
+    mut after_step: impl FnMut(&Path),
+    mut seam: impl FnMut(&Path, StepMoment),
+) -> std::result::Result<UntrustedSourceRead, UntrustedReadError> {
+    use rustix::fs::{Mode, OFlags};
+
+    let (root, root_id) = match route {
+        RouteAnchor::Captured { root, root_id, .. } => {
+            (Some(root.as_path()), Some((root_id.dev, root_id.ino)))
+        }
+        RouteAnchor::Uncaptured => (None, None),
+    };
+    if entry.is_spelled_relative() && root.is_none() {
+        return Err(UntrustedReadError::Io(anyhow::anyhow!(
+            "internal: a relative trust = false source without a captured project root"
+        )));
+    }
+
+    struct WalkDir {
+        fd: std::os::fd::OwnedFd,
+        path: PathBuf,
+        facts: crate::host_paths::OpenedDirFacts,
+        in_boundary: bool,
+    }
+
+    let slash_fd = rustix::fs::open(
+        Path::new("/"),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| UntrustedReadError::Io(anyhow::anyhow!(error)))?;
+    let slash_facts = untrusted_dir_facts(&slash_fd, &"the filesystem root")?;
+    // `/` is already open before any step runs, so a boundary that *is* `/`
+    // (a project or worktree rooted at the filesystem root) has to be entered
+    // here rather than observed from a parent step that will never happen.
+    let slash_in_boundary =
+        boundary.is_some_and(|b| b.contains(slash_facts.identity(), Path::new("/")));
+    let mut entered_boundary = slash_in_boundary;
+    let mut stack = vec![WalkDir {
+        fd: slash_fd,
+        path: PathBuf::from("/"),
+        facts: slash_facts,
+        in_boundary: slash_in_boundary,
+    }];
+
+    // B1: the captured root is one entry of one directory — its own on-disk
+    // name in its captured parent — and that entry must still carry the captured
+    // identity. Decided *before* the walk and independently of the route's
+    // spelling, so no alias of the name can hide a replacement, and no walk step
+    // can mistake a sibling of the root for one.
+    if let (Some(root), Some(root_id)) = (root, root_id) {
+        check_captured_root_entry(root, root_id)?;
+    }
+
+    // The same check, repeated at the walk step itself and for **every** route,
+    // so it covers the window between the check above and the step that opens the
+    // captured root's own component. Two halves, neither of them lexical:
+    //
+    // - *when*: the walk's current directory is the captured root's parent, by
+    //   descriptor identity. That is true however the route spells its way there
+    //   — relative, absolute, or through a case/normalization alias — because it
+    //   is the opened directory that is compared, not a path.
+    // - *what*: the captured root's own on-disk entry name, re-read from that
+    //   same parent descriptor, must still carry the captured identity. Naming the
+    //   root's entry rather than the child being opened is what keeps a sibling of
+    //   the root admitted (`a_sibling_of_the_captured_root_is_an_external_source`).
+    //
+    // The relative descent below keeps its own identity checkpoint as belt and
+    // braces: there the child *is* the root's own component, so the opened child
+    // must carry the captured identity, which is exact rather than a re-read.
+    let root_entry = match (root.and_then(Path::file_name), root_id) {
+        (Some(name), Some(root_id)) => Some((name.to_os_string(), root_id)),
+        _ => None,
+    };
+    // `None` for a root at `/`, which has no parent entry: its routes are already
+    // inside the boundary.
+    let root_parent_id = match root {
+        Some(root) => match root.parent() {
+            Some(parent) => {
+                let fd = rustix::fs::open(
+                    parent,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|error| UntrustedReadError::Io(anyhow::anyhow!(error)))?;
+                Some(untrusted_dir_facts(&fd, &crate::one_line::quoted_path(parent))?.identity())
+            }
+            None => None,
+        },
+        None => None,
+    };
+
+    let mut queue: std::collections::VecDeque<RouteStep> = std::collections::VecDeque::new();
+    let mut hops = 0usize;
+
+    if entry.is_spelled_relative() {
+        let root = root.expect("a relative entry was checked to have a root");
+        let root_id = root_id.expect("a relative entry was checked to have a root identity");
+        for name in root.components().filter_map(|component| match component {
+            std::path::Component::Normal(name) => Some(name.to_os_string()),
+            _ => None,
+        }) {
+            let cur = stack.last().expect("the descriptor stack starts at `/`");
+            let child_path = cur.path.join(&name);
+            // The same stat-then-open agreement every step below runs; here a
+            // missing component means the captured root itself is gone, which is
+            // the replacement refusal rather than `NotFound`.
+            let seen = stat_step_entry(&cur.fd, &name).map_err(|error| match error {
+                UntrustedReadError::NotFound => UntrustedReadError::RootReplaced,
+                error => error,
+            })?;
+            seam(&child_path, StepMoment::BeforeOpen);
+            let child_fd = rustix::fs::openat(
+                &cur.fd,
+                &name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|_| UntrustedReadError::RootReplaced)?;
+            seam(&child_path, StepMoment::AfterOpen);
+            let child_facts =
+                untrusted_dir_facts(&child_fd, &crate::one_line::quoted_path(&child_path))?;
+            require_step_identity(seen, child_facts.identity())?;
+            if root_parent_id == Some(cur.facts.identity()) && child_facts.identity() != root_id {
+                return Err(UntrustedReadError::RootReplaced);
+            }
+            let in_boundary = cur.in_boundary
+                || boundary.is_some_and(|b| b.contains(child_facts.identity(), &child_path));
+            entered_boundary |= in_boundary;
+            stack.push(WalkDir {
+                fd: child_fd,
+                path: child_path.clone(),
+                facts: child_facts,
+                in_boundary,
+            });
+            after_step(&child_path);
+        }
+        let suffix = entry.path().strip_prefix(root).map_err(|_| {
+            UntrustedReadError::Io(anyhow::anyhow!(
+                "internal: a relative source resolved outside its captured project root"
+            ))
+        })?;
+        push_path_steps(&mut queue, suffix);
+    } else {
+        push_path_steps(&mut queue, entry.path());
+    }
+
+    while let Some(step) = queue.pop_front() {
+        let last = queue.is_empty();
+        match step {
+            RouteStep::Here => {
+                if last {
+                    return Err(UntrustedReadError::NotRegular);
+                }
+            }
+            RouteStep::Up => {
+                // A `..` step opens no name: it pops the descriptor stack, so the
+                // identity the walk continues from is one a descriptor already
+                // reported, never a name re-resolved between two syscalls.
+                if stack.len() > 1 {
+                    stack.pop();
+                }
+                if last {
+                    return Err(UntrustedReadError::NotRegular);
+                }
+            }
+            RouteStep::Name(name) => {
+                let cur = stack.last().expect("the descriptor stack starts at `/`");
+                // Before opening a child of the captured root's parent, the root's
+                // own entry must still be the captured directory. After the open
+                // below it is re-read once more, so a swap that lands between this
+                // read and the `openat` is refused too. Both are identity checks on
+                // the root's entry, never on the route's spelling.
+                let at_root_parent = match (&root_entry, root_parent_id) {
+                    (Some((root_name, root_id)), Some(parent_id))
+                        if parent_id == cur.facts.identity() =>
+                    {
+                        require_captured_root_entry(&cur.fd, root_name, *root_id)?;
+                        true
+                    }
+                    _ => false,
+                };
+                // The step invariant, first half: stat this step's own name
+                // immediately before opening it. The seams around it are where a
+                // test injects a rename; a shipped build's seams are no-ops.
+                let step_path = cur.path.join(&name);
+                // The captured root's own entry is the one entry whose identity
+                // decides a source's scope, and a rename of any entry in this
+                // parent directory changes the parent's own stamps. Take the
+                // stamp after the checkpoint above and require it unchanged
+                // before the opened child is used: then the checkpoint, the step's
+                // stat and its open all saw one state.
+                let parent_stamp = if at_root_parent {
+                    Some(dir_change_stamp(&cur.fd)?)
+                } else {
+                    None
+                };
+                if at_root_parent {
+                    seam(&step_path, StepMoment::AfterCapturedRootCheckpoint);
+                }
+                let seen = stat_step_entry(&cur.fd, &name)?;
+                seam(&step_path, StepMoment::BeforeOpen);
+                if last {
+                    if entered_boundary && !cur.in_boundary {
+                        return Err(UntrustedReadError::EscapesCheckout);
+                    }
+                    match rustix::fs::openat(
+                        &cur.fd,
+                        &name,
+                        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    ) {
+                        Ok(fd) => {
+                            seam(&step_path, StepMoment::AfterOpen);
+                            let display = step_path;
+                            let flagged = rustix::fs::fstat(&fd)
+                                .map_err(|error| UntrustedReadError::Io(anyhow::anyhow!(error)))?;
+                            // The invariant's second half, before any byte is read:
+                            // the descriptor this step opened is the entry this
+                            // step's own stat saw.
+                            require_step_identity(seen, StepEntry::of(&flagged).identity)?;
+                            // …and the captured root's own entry, re-read from the
+                            // parent descriptor: a replacement already in place at
+                            // the stat above (so stat and open agree) is still not
+                            // the captured root. It names the root's entry, so it
+                            // needs no comparison of the route's spelling with a
+                            // name.
+                            if at_root_parent {
+                                let (root_name, root_id) =
+                                    root_entry.as_ref().expect("an armed checkpoint");
+                                require_captured_root_entry(&cur.fd, root_name, *root_id)?;
+                            }
+                            if let Some(stamp) = parent_stamp {
+                                require_dir_unchanged(&cur.fd, stamp)?;
+                            }
+                            if rustix::fs::FileType::from_raw_mode(flagged.st_mode)
+                                != rustix::fs::FileType::RegularFile
+                            {
+                                return Err(UntrustedReadError::NotRegular);
+                            }
+                            let opened =
+                                crate::host_paths::opened_regular_from_descriptor(fd, &display)
+                                    .map_err(UntrustedReadError::Io)?;
+                            let facts = opened.facts();
+                            if entered_boundary && facts.nlink != 1 {
+                                return Err(UntrustedReadError::CheckoutHardLinked(facts.nlink));
+                            }
+                            let identity = opened.identity();
+                            let bytes =
+                                opened.read_bounded_classified(max_bytes).map_err(|error| {
+                                    match error {
+                                        crate::host_paths::ReadBoundedError::TooLarge => {
+                                            UntrustedReadError::TooLarge
+                                        }
+                                        crate::host_paths::ReadBoundedError::Io(error) => {
+                                            UntrustedReadError::Io(error)
+                                        }
+                                    }
+                                })?;
+                            return Ok(UntrustedSourceRead {
+                                scope: if entered_boundary {
+                                    crate::config_sources::SourceScope::Checkout
+                                } else {
+                                    crate::config_sources::SourceScope::External
+                                },
+                                bytes,
+                                identity,
+                            });
+                        }
+                        Err(rustix::io::Errno::LOOP) => {
+                            // No descriptor was opened, so the stat is paired with
+                            // the `readlinkat` instead: the step's own stat saw a
+                            // symlink, and the link text followed must be that same
+                            // entry's.
+                            if seen.kind != rustix::fs::FileType::Symlink {
+                                return Err(UntrustedReadError::RootReplaced);
+                            }
+                            hops += 1;
+                            if hops > MAX_SYMLINK_HOPS {
+                                return Err(UntrustedReadError::EscapesCheckout);
+                            }
+                            let target = read_link_target(&cur.fd, &name)?;
+                            require_entry_unchanged(&cur.fd, &name, seen)?;
+                            if target.is_absolute() {
+                                stack.truncate(1);
+                            }
+                            push_path_steps(&mut queue, &target);
+                        }
+                        Err(rustix::io::Errno::NOENT) => return Err(UntrustedReadError::NotFound),
+                        Err(rustix::io::Errno::NOTDIR) => {
+                            return Err(UntrustedReadError::NotRegular);
+                        }
+                        Err(error) => {
+                            return Err(UntrustedReadError::Io(anyhow::anyhow!(error)));
+                        }
+                    }
+                    continue;
+                }
+
+                match rustix::fs::openat(
+                    &cur.fd,
+                    &name,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                ) {
+                    Ok(child_fd) => {
+                        seam(&step_path, StepMoment::AfterOpen);
+                        let child_facts = untrusted_dir_facts(
+                            &child_fd,
+                            &crate::one_line::quoted_path(&step_path),
+                        )?;
+                        // The invariant, before the walk descends: the child
+                        // descriptor is the entry this step's own stat saw. Two
+                        // swaps inside this step therefore refuse here even when
+                        // the captured root's entry is restored before the
+                        // checkpoint below reads it again.
+                        require_step_identity(seen, child_facts.identity())?;
+                        // The root's own entry, read again now that the child is
+                        // open: the same identity the step began with, so a
+                        // replacement that landed while the child was being opened
+                        // and is still there is refused before the walk descends
+                        // into it.
+                        if at_root_parent {
+                            let (root_name, root_id) =
+                                root_entry.as_ref().expect("an armed checkpoint");
+                            require_captured_root_entry(&cur.fd, root_name, *root_id)?;
+                        }
+                        if let Some(stamp) = parent_stamp {
+                            require_dir_unchanged(&cur.fd, stamp)?;
+                        }
+                        let child_path = step_path;
+                        let in_boundary = cur.in_boundary
+                            || boundary
+                                .is_some_and(|b| b.contains(child_facts.identity(), &child_path));
+                        entered_boundary |= in_boundary;
+                        stack.push(WalkDir {
+                            fd: child_fd,
+                            path: child_path.clone(),
+                            facts: child_facts,
+                            in_boundary,
+                        });
+                        after_step(&child_path);
+                    }
+                    Err(rustix::io::Errno::LOOP) | Err(rustix::io::Errno::NOTDIR) => {
+                        // The same pairing as the final step's symlink arm: the
+                        // stat saw a symlink, else the open refused a name the
+                        // step's own stat already knew was not a directory.
+                        if seen.kind != rustix::fs::FileType::Symlink {
+                            return Err(UntrustedReadError::NotRegular);
+                        }
+                        hops += 1;
+                        if hops > MAX_SYMLINK_HOPS {
+                            return Err(UntrustedReadError::EscapesCheckout);
+                        }
+                        let target = read_link_target(&cur.fd, &name)?;
+                        require_entry_unchanged(&cur.fd, &name, seen)?;
+                        if target.is_absolute() {
+                            stack.truncate(1);
+                        }
+                        push_path_steps(&mut queue, &target);
+                    }
+                    Err(rustix::io::Errno::NOENT) => return Err(UntrustedReadError::NotFound),
+                    Err(error) => {
+                        return Err(UntrustedReadError::Io(anyhow::anyhow!(error)));
+                    }
+                }
+            }
+        }
+    }
+    Err(UntrustedReadError::NotFound)
 }
 
 /// What `doctor` found at the legacy in-repo location.
@@ -896,6 +1673,44 @@ mod tests {
         );
     }
 
+    /// ADR-0073: `projects/` itself is verified by descriptor, before the store
+    /// child is looked up — a writable parent could redirect a later child.
+    #[test]
+    fn a_writable_projects_parent_is_refused_before_the_child_lookup() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let home = root.join("home");
+        let projects = crate::project_config::projects_dir(&home);
+        std::fs::create_dir_all(&projects).unwrap();
+        let project_root = root.join("project");
+        std::fs::create_dir(&project_root).unwrap();
+        let project = ProjectDir::from_path_for_tests(&project_root).unwrap();
+        std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o770)).unwrap();
+        // The child directory is absent: the refusal must still be the parent's.
+        let error = check_store_route(&tier(&home, &project, &project_root))
+            .expect_err("a writable projects/ parent is refused");
+        assert!(
+            format!("{error:#}").contains("group- or other-writable"),
+            "{error:#}"
+        );
+        std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            check_store_route(&tier(&home, &project, &project_root)).unwrap(),
+            StoreRoute::Absent
+        );
+    }
+
+    /// The `(dev, ino)` a captured root has on disk, for test-built anchors.
+    fn identity_at(path: &Path) -> crate::host_paths::FileIdentity {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = std::fs::metadata(path).unwrap();
+        crate::host_paths::FileIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        }
+    }
+
     /// A tier as discovery builds it: the path from `home`, checked against the
     /// project root. Named fields, so no two paths can be swapped.
     fn tier(home: &Path, project: &ProjectDir, root: &Path) -> ProjectTierPaths {
@@ -904,6 +1719,7 @@ mod tests {
             route: RouteAnchor::Captured {
                 home: home.to_path_buf(),
                 root: root.to_path_buf(),
+                root_id: identity_at(root),
             },
         }
     }
@@ -1038,9 +1854,11 @@ mod tests {
 
     /// A captured route whose checkout is `base/project`.
     fn route_at(base: &Path) -> RouteAnchor {
+        let root = base.join("project");
         RouteAnchor::Captured {
             home: base.join("home"),
-            root: base.join("project"),
+            root_id: identity_at(&root),
+            root,
         }
     }
 
@@ -1193,9 +2011,11 @@ mod tests {
         std::fs::create_dir_all(home.join("work/app")).unwrap();
         let file = home.join("team/agent-vm.toml");
         owner_only_file(&file);
+        let root = home.join("work/app");
         let route = RouteAnchor::Captured {
             home: home.clone(),
-            root: home.join("work/app"),
+            root_id: identity_at(&root),
+            root,
         };
         let error = open_trusted_source_route(&file, Declaration::Entry(0), &route)
             .expect_err("a dotfiles worktree is repository-controlled");
@@ -1216,6 +2036,7 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         let route = RouteAnchor::Captured {
             home: base.join("home"),
+            root_id: identity_at(&sub),
             root: sub.clone(),
         };
         for file in [
@@ -1293,5 +2114,801 @@ mod tests {
             (pinned.dev(), pinned.ino()),
             "the bytes read are the ones the verified descriptor names"
         );
+    }
+
+    // ---- #736 phase 1: the untrusted route walker ----
+
+    use crate::config_sources::{SourceEntry, SourceScope};
+    use crate::host_paths::FileIdentity;
+
+    fn identity_of(path: &Path) -> FileIdentity {
+        let metadata = std::fs::metadata(path).unwrap();
+        FileIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        }
+    }
+
+    fn owner_only_bytes(path: &Path, body: &[u8]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::set_permissions(
+            path.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    /// An entry shaped exactly as `SourceEntry::parse` resolves one: the
+    /// lexical join of the captured root and the relative suffix.
+    fn relative_entry(root: &Path, suffix: &str) -> SourceEntry {
+        SourceEntry::for_tests(true, root.join(suffix))
+    }
+
+    /// `Result::expect_err` needs `Debug` on the success value; the read holds
+    /// source bytes, so it deliberately has none.
+    fn route_error(
+        result: std::result::Result<UntrustedSourceRead, UntrustedReadError>,
+    ) -> UntrustedReadError {
+        match result {
+            Ok(read) => panic!("expected a refusal, got {} byte(s)", read.bytes.len()),
+            Err(error) => error,
+        }
+    }
+
+    fn captured_route(home: &Path, root: &Path) -> RouteAnchor {
+        RouteAnchor::Captured {
+            home: home.to_path_buf(),
+            root: root.to_path_buf(),
+            root_id: identity_at(root),
+        }
+    }
+
+    fn boundary_of(root: &Path) -> CheckoutBoundary {
+        CheckoutBoundary::measure(root, identity_at(root)).unwrap()
+    }
+
+    fn route_with_boundary(base: &Path) -> (RouteAnchor, CheckoutBoundary) {
+        let root = base.join("project");
+        (
+            captured_route(&base.join("home"), &root),
+            boundary_of(&root),
+        )
+    }
+
+    #[test]
+    fn a_relative_source_is_admitted_as_checkout_with_one_read() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        std::fs::create_dir(base.join("home")).unwrap();
+        let root = base.join("project");
+        std::fs::create_dir(&root).unwrap();
+        let file = root.join("conf/agent-vm.toml");
+        owner_only_bytes(&file, b"[[tools]]\nname = \"x\"\ncommand = \"true\"\n");
+        let (route, boundary) = route_with_boundary(&base);
+
+        let read = read_untrusted_source_route(
+            &relative_entry(&root, "conf/agent-vm.toml"),
+            &route,
+            Some(&boundary),
+            4096,
+        )
+        .expect("a checkout source is admitted");
+        assert_eq!(read.scope, SourceScope::Checkout);
+        assert_eq!(read.bytes, b"[[tools]]\nname = \"x\"\ncommand = \"true\"\n");
+        assert_eq!(read.identity, identity_of(&file));
+    }
+
+    #[test]
+    fn an_explicit_external_source_never_enters_the_boundary() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        std::fs::create_dir(base.join("home")).unwrap();
+        let root = base.join("project");
+        std::fs::create_dir(&root).unwrap();
+        // Outside the captured root's parent, so the parent checkpoint cannot
+        // fire at all; the sibling case is
+        // `a_sibling_of_the_captured_root_is_an_external_source`.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let external = elsewhere.path().canonicalize().unwrap().join("team.toml");
+        owner_only_bytes(&external, b"[[tools]]\nname = \"t\"\ncommand = \"true\"\n");
+        let (route, boundary) = route_with_boundary(&base);
+
+        let read = read_untrusted_source_route(
+            &SourceEntry::for_tests(false, external.clone()),
+            &route,
+            Some(&boundary),
+            4096,
+        )
+        .expect("an external route is admitted");
+        assert_eq!(read.scope, SourceScope::External);
+        assert_eq!(read.identity, identity_of(&external));
+    }
+
+    /// `..` is resolved through the descriptor stack, so the scope is the route
+    /// actually walked: an enclosing worktree admits it, its parent does not.
+    #[test]
+    fn dot_dot_is_admitted_inside_an_enclosing_worktree_and_refused_above_it() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        std::fs::create_dir(base.join("home")).unwrap();
+        std::fs::create_dir_all(base.join("repo/.git")).unwrap();
+        let root = base.join("repo/sub");
+        std::fs::create_dir(&root).unwrap();
+        let shared = base.join("repo/shared.toml");
+        owner_only_bytes(&shared, b"[[tools]]\n");
+        let above = base.join("outside.toml");
+        owner_only_bytes(&above, b"[[tools]]\n");
+        let route = captured_route(&base.join("home"), &root);
+        let boundary = boundary_of(&root);
+
+        let read = read_untrusted_source_route(
+            &relative_entry(&root, "../shared.toml"),
+            &route,
+            Some(&boundary),
+            4096,
+        )
+        .expect("the enclosing worktree is inside the boundary");
+        assert_eq!(read.scope, SourceScope::Checkout);
+        assert_eq!(read.bytes, b"[[tools]]\n");
+
+        let error = route_error(read_untrusted_source_route(
+            &relative_entry(&root, "../../outside.toml"),
+            &route,
+            Some(&boundary),
+            4096,
+        ));
+        assert!(
+            matches!(error, UntrustedReadError::EscapesCheckout),
+            "{error:?}"
+        );
+    }
+
+    /// A final symlink that leaves the admitted region is refused before any
+    /// outside byte is opened for reading.
+    #[test]
+    fn a_final_symlink_that_leaves_the_boundary_is_refused_without_reading() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        std::fs::create_dir(base.join("home")).unwrap();
+        let root = base.join("project");
+        std::fs::create_dir(&root).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside = outside.path().canonicalize().unwrap();
+        let sentinel = outside.join("sentinel.toml");
+        std::fs::write(&sentinel, b"SECRET-SENTINEL-736").unwrap();
+        symlink(&sentinel, root.join("link.toml")).unwrap();
+        let (route, boundary) = route_with_boundary(&base);
+
+        let error = route_error(read_untrusted_source_route(
+            &relative_entry(&root, "link.toml"),
+            &route,
+            Some(&boundary),
+            4096,
+        ));
+        assert!(
+            matches!(error, UntrustedReadError::EscapesCheckout),
+            "{error:?}"
+        );
+        // The sentinel was never read: its bytes are only in the refusal's
+        // negative space, and the test would need the error to carry them.
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"SECRET-SENTINEL-736");
+    }
+
+    /// A multiply-linked checkout file is refused before it is read: its second
+    /// name can be outside the checkout, so its bytes are not provably confined.
+    #[test]
+    fn a_checkout_hard_link_is_refused_at_the_admitted_file() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        std::fs::create_dir(base.join("home")).unwrap();
+        let root = base.join("project");
+        std::fs::create_dir(&root).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("host.toml");
+        std::fs::write(&target, b"SECRET-SENTINEL-736").unwrap();
+        std::fs::hard_link(&target, root.join("hard.toml")).unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(root.join("hard.toml"))
+                .unwrap()
+                .nlink(),
+            2
+        );
+        let (route, boundary) = route_with_boundary(&base);
+
+        let error = route_error(read_untrusted_source_route(
+            &relative_entry(&root, "hard.toml"),
+            &route,
+            Some(&boundary),
+            4096,
+        ));
+        assert!(
+            matches!(error, UntrustedReadError::CheckoutHardLinked(2)),
+            "{error:?}"
+        );
+    }
+
+    /// A relative entry and an absolute one spelled exactly both meet the parent
+    /// checkpoint, and the spelling-free re-read of the root's own entry decides
+    /// both; a sibling is still admitted (see
+    /// `a_sibling_of_the_captured_root_is_an_external_source`).
+    #[test]
+    fn a_replaced_root_is_detected_by_the_captured_parent_identity() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        std::fs::create_dir(base.join("home")).unwrap();
+        let root = base.join("project");
+        std::fs::create_dir(&root).unwrap();
+        let file = root.join("conf/agent-vm.toml");
+        owner_only_bytes(&file, b"[[tools]]\n");
+        let route = route_at(&base);
+        let boundary = boundary_of(&root);
+
+        // Relative entry: the root itself no longer carries the captured
+        // identity, so the walk refuses at its last descent step.
+        std::fs::rename(&root, base.join("project-moved")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        owner_only_bytes(&file, b"[[tools]]\n");
+        let error = route_error(read_untrusted_source_route(
+            &relative_entry(&root, "conf/agent-vm.toml"),
+            &route,
+            Some(&boundary),
+            4096,
+        ));
+        assert!(
+            matches!(error, UntrustedReadError::RootReplaced),
+            "{error:?}"
+        );
+
+        // Absolute entry: the same checkpoint fires when the walk crosses the
+        // captured root's name, not only for relative spellings.
+        let error = route_error(read_untrusted_source_route(
+            &SourceEntry::for_tests(false, file.clone()),
+            &route,
+            Some(&boundary),
+            4096,
+        ));
+        assert!(
+            matches!(error, UntrustedReadError::RootReplaced),
+            "{error:?}"
+        );
+    }
+
+    /// The combined checkpoint the reviewer asked for: replace the captured
+    /// root *after* its parent descriptor is open, under an alias of the name.
+    /// The walk has no name comparison to consult; only the parent identity and
+    /// the child identity decide it.
+    #[test]
+    fn a_replacement_under_an_alias_is_detected_mid_walk() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        std::fs::create_dir(base.join("home")).unwrap();
+        let parent = base.join("work");
+        std::fs::create_dir(&parent).unwrap();
+        let root = parent.join("app");
+        std::fs::create_dir(&root).unwrap();
+        let file = root.join("conf/agent-vm.toml");
+        owner_only_bytes(&file, b"[[tools]]\n");
+        let route = captured_route(&base.join("home"), &root);
+        let boundary = boundary_of(&root);
+
+        let mut swapped = false;
+        let error = route_error(read_untrusted_source_route_checkpointed(
+            &relative_entry(&root, "conf/agent-vm.toml"),
+            &route,
+            Some(&boundary),
+            4096,
+            |step| {
+                if step == parent && !swapped {
+                    swapped = true;
+                    // The parent descriptor stays open; its child name now names
+                    // a different inode, as a case/normalization alias would on
+                    // a case-insensitive filesystem.
+                    std::fs::rename(&root, parent.join("app-moved")).unwrap();
+                    std::fs::create_dir(&root).unwrap();
+                    owner_only_bytes(&file, b"[[tools]]\n");
+                }
+            },
+        ));
+        assert!(
+            matches!(error, UntrustedReadError::RootReplaced),
+            "{error:?}"
+        );
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            b"[[tools]]\n",
+            "the replacement is what a spellable check would have read"
+        );
+    }
+
+    /// The window `a_replacement_under_an_alias_is_detected_mid_walk` cannot
+    /// reach: the replacement lands *after* the start-of-walk check and *before*
+    /// the walk opens the captured root's own component, and the route spells the
+    /// root through a case-variant alias, so no lexical test matches it. The step's
+    /// own checkpoint decides it by naming the root's entry in the parent
+    /// descriptor the walk already holds.
+    #[test]
+    fn a_replacement_under_an_alias_is_detected_before_the_root_is_opened() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        std::fs::create_dir(base.join("home")).unwrap();
+        let parent = base.join("work");
+        std::fs::create_dir(&parent).unwrap();
+        let root = parent.join("app");
+        std::fs::create_dir(&root).unwrap();
+        let file = root.join("conf/agent-vm.toml");
+        owner_only_bytes(&file, b"[[tools]]\nname = \"aaa\"\n");
+        let route = captured_route(&base.join("home"), &root);
+        let boundary = boundary_of(&root);
+        if !folds_case(&parent) {
+            eprintln!(
+                "note: {parent:?} does not fold case, so a case-variant alias of the \
+                 replaced root cannot resolve; this row asserts nothing here"
+            );
+            return;
+        }
+        let alias = parent.join("APP").join("conf/agent-vm.toml");
+        let replacement = b"[[tools]]\nname = \"bbb\"\n";
+
+        let mut swapped = false;
+        let error = route_error(read_untrusted_source_route_checkpointed(
+            &SourceEntry::for_tests(false, alias),
+            &route,
+            Some(&boundary),
+            4096,
+            |step| {
+                // The parent is open; the walk has not opened the root's own
+                // component yet. This is the prologue window, not the mid-walk
+                // one.
+                if step == parent && !swapped {
+                    swapped = true;
+                    std::fs::rename(&root, parent.join("app-moved")).unwrap();
+                    std::fs::create_dir(&root).unwrap();
+                    owner_only_bytes(&file, replacement);
+                }
+            },
+        ));
+        assert!(swapped, "the row reached the checkpoint it needs");
+        assert!(
+            matches!(error, UntrustedReadError::RootReplaced),
+            "{error:?}"
+        );
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            replacement,
+            "the alias resolves to the replacement, so a spelling-free-read-free \
+             walk would have read it"
+        );
+    }
+
+    /// The stat-then-open agreement, deterministically, at a step that is not
+    /// the captured root's own step (that one also has the parent's change stamp,
+    /// so this row could not tell the two guards apart). The seam swaps two
+    /// directories inside the captured root between the step's own `statat` and
+    /// its `openat`, and swaps them back immediately after the open. Nothing is
+    /// left renamed, so every check that looks at a name afterwards passes; only
+    /// the agreement refuses, because a descriptor's identity cannot be renamed
+    /// after it is open.
+    #[test]
+    fn a_double_swap_inside_one_step_is_refused_by_the_stat_then_open_agreement() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        std::fs::create_dir(base.join("home")).unwrap();
+        let root = base.join("project");
+        owner_only_bytes(
+            &root.join("conf/agent-vm.toml"),
+            b"[[tools]]\nname = \"aaa\"\n",
+        );
+        owner_only_bytes(
+            &root.join("conf-alt/agent-vm.toml"),
+            b"[[tools]]\nname = \"bbb\"\n",
+        );
+        let route = captured_route(&base.join("home"), &root);
+        let boundary = boundary_of(&root);
+        let step = root.join("conf");
+        let alt = root.join("conf-alt");
+        let mut alt_id = None;
+
+        let mut swapped = false;
+        let mut restored = false;
+        let result = read_untrusted_source_route_with_seam(
+            &SourceEntry::for_tests(false, root.join("conf/agent-vm.toml")),
+            &route,
+            Some(&boundary),
+            4096,
+            |path, moment| match moment {
+                StepMoment::BeforeOpen if path == step && !swapped => {
+                    swapped = true;
+                    swap_names(&step, &alt);
+                    alt_id = Some(identity_of(&step.join("agent-vm.toml")));
+                }
+                StepMoment::AfterOpen if path == step && !restored => {
+                    restored = true;
+                    swap_names(&step, &alt);
+                }
+                _ => {}
+            },
+        );
+        assert!(swapped, "the seam reached the swapped step");
+        assert!(restored, "the seam put the step's name back after the open");
+        let alt_id = alt_id.expect("the other directory was at the name");
+        match result {
+            Err(UntrustedReadError::RootReplaced) => {}
+            Ok(read) => {
+                assert_eq!(
+                    read.identity, alt_id,
+                    "the bytes are the swapped-in file's, which is the leak"
+                );
+                panic!(
+                    "expected a refusal, read the swapped-in file's {} byte(s): {:?}",
+                    read.bytes.len(),
+                    String::from_utf8_lossy(&read.bytes)
+                );
+            }
+            Err(error) => panic!("expected the replacement refusal, got {error:?}"),
+        }
+        // The double swap completed: the name ends where it started, so no
+        // checkpoint that looked at it afterwards could have seen the other one.
+        // The captured root itself never moved; only its children swapped.
+        let root_now = identity_of(&root);
+        assert_eq!(
+            (root_now.dev, root_now.ino),
+            route_root_id(&route),
+            "the captured root is back at its own name"
+        );
+    }
+
+    /// The window the race harness actually found (1 leak in 4 000 runs at the
+    /// parent of this change): a rename between the captured-root checkpoint and
+    /// the step's own `statat`, undone after the open. The step's stat and its
+    /// open agree (both saw the replacement) and the closing checkpoint sees the
+    /// captured root again, so the agreement and both captured-identity checks
+    /// pass. Only the parent's change stamp refuses: a rename of any entry there
+    /// updates the directory's own `mtime` and `ctime`.
+    #[test]
+    fn a_swap_before_the_captured_root_step_is_refused_by_the_parent_change_stamp() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        std::fs::create_dir(base.join("home")).unwrap();
+        let parent = base.join("work");
+        std::fs::create_dir(&parent).unwrap();
+        let root = parent.join("app");
+        let repl = parent.join("rpl");
+        owner_only_bytes(
+            &root.join("conf/agent-vm.toml"),
+            b"[[tools]]\nname = \"aaa\"\n",
+        );
+        owner_only_bytes(
+            &repl.join("conf/agent-vm.toml"),
+            b"[[tools]]\nname = \"bbb\"\n",
+        );
+        let route = captured_route(&base.join("home"), &root);
+        let boundary = boundary_of(&root);
+        let mut replacement_id = None;
+
+        let mut swapped = false;
+        let mut restored = false;
+        let result = read_untrusted_source_route_with_seam(
+            &SourceEntry::for_tests(false, root.join("conf/agent-vm.toml")),
+            &route,
+            Some(&boundary),
+            4096,
+            |path, moment| match moment {
+                StepMoment::AfterCapturedRootCheckpoint if path == root && !swapped => {
+                    swapped = true;
+                    swap_names(&root, &repl);
+                    replacement_id = Some(identity_of(&root.join("conf/agent-vm.toml")));
+                }
+                StepMoment::AfterOpen if path == root && !restored => {
+                    restored = true;
+                    swap_names(&root, &repl);
+                }
+                _ => {}
+            },
+        );
+        assert!(
+            swapped,
+            "the seam reached the step that opens the captured root"
+        );
+        assert!(
+            restored,
+            "the seam put the captured root back after the open"
+        );
+        let replacement_id = replacement_id.expect("the replacement was at the name");
+        match result {
+            Err(UntrustedReadError::RootReplaced) => {}
+            Ok(read) => {
+                assert_eq!(
+                    read.identity, replacement_id,
+                    "the bytes are the replacement's, which is the leak the harness found"
+                );
+                panic!(
+                    "expected a refusal, read the replacement's {} byte(s): {:?}",
+                    read.bytes.len(),
+                    String::from_utf8_lossy(&read.bytes)
+                );
+            }
+            Err(error) => panic!("expected the replacement refusal, got {error:?}"),
+        }
+        // The captured root is back at its own name, so every checkpoint on that
+        // name passes; the stamp is the only observation that disagrees.
+        let restored = identity_of(&root);
+        assert_eq!(
+            (restored.dev, restored.ino),
+            route_root_id(&route),
+            "the captured root is back at its own name"
+        );
+    }
+
+    /// Exchange two names, as `renamex_np(RENAME_SWAP)` does: each keeps its own
+    /// contents and both stay linked, which is what makes the replacement readable
+    /// through the descriptor a walk opened for it.
+    fn swap_names(left: &Path, right: &Path) {
+        let temp = left.with_file_name("swap-tmp");
+        std::fs::rename(left, &temp).unwrap();
+        std::fs::rename(right, left).unwrap();
+        std::fs::rename(&temp, right).unwrap();
+    }
+
+    fn route_root_id(route: &RouteAnchor) -> (u64, u64) {
+        match route {
+            RouteAnchor::Captured { root_id, .. } => (root_id.dev, root_id.ino),
+            RouteAnchor::Uncaptured => panic!("a captured route"),
+        }
+    }
+
+    /// Whether this filesystem folds ASCII case, so the alias row below can fail
+    /// at all. APFS folds by default; ext4 and most Linux mounts do not.
+    fn folds_case(dir: &Path) -> bool {
+        let upper = dir.join("CaseFoldingProbe");
+        std::fs::write(&upper, b"probe").unwrap();
+        let folded = dir.join("casefoldingprobe").exists();
+        std::fs::remove_file(&upper).unwrap();
+        folded
+    }
+
+    /// The B1 identity guarantee must not depend on how the route spells the
+    /// captured root. A case-variant alias of a *replaced* root resolves to the
+    /// replacement on a case-insensitive filesystem, matches no lexical
+    /// `starts_with`, and is offered for approval as an external host source —
+    /// bypassing the checkout classification a replaced checkout must refuse.
+    #[test]
+    fn a_case_variant_alias_of_a_replaced_root_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        std::fs::create_dir(base.join("home")).unwrap();
+        let parent = base.join("work");
+        std::fs::create_dir(&parent).unwrap();
+        let root = parent.join("app");
+        std::fs::create_dir(&root).unwrap();
+        let file = root.join("conf/agent-vm.toml");
+        owner_only_bytes(&file, b"[[tools]]\n");
+        let route = captured_route(&base.join("home"), &root);
+        let boundary = boundary_of(&root);
+        // The root is replaced under its own name: new inode, same spelling.
+        std::fs::rename(&root, parent.join("app-moved")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        owner_only_bytes(&file, b"[[tools]]\n");
+
+        if !folds_case(&parent) {
+            eprintln!(
+                "note: {parent:?} does not fold case, so a case-variant alias of the \
+                 replaced root cannot resolve; this row asserts nothing here"
+            );
+            return;
+        }
+        let alias = parent.join("APP").join("conf/agent-vm.toml");
+        assert_eq!(
+            std::fs::read(&alias).unwrap(),
+            b"[[tools]]\n",
+            "the alias reaches the replacement, so the walk would read it"
+        );
+        let error = route_error(read_untrusted_source_route(
+            &SourceEntry::for_tests(false, alias),
+            &route,
+            Some(&boundary),
+            4096,
+        ));
+        assert!(
+            matches!(error, UntrustedReadError::RootReplaced),
+            "{error:?}"
+        );
+    }
+
+    /// The capture and the boundary are two observations of one path, and the
+    /// load makes them at different moments. One `RENAME_SWAP` between them left
+    /// the captured root outside its own boundary (`root_in_boundary=false` in the
+    /// instrumented trace), so a file the checkout rule refuses was read and
+    /// reviewed as an `external` source. Reproduced here without a race: the
+    /// boundary is measured while the path names a different directory, the path
+    /// then holds the captured root again, and the read goes through the walker.
+    ///
+    /// Both halves matter: the boundary must contain the captured root by
+    /// identity, and the walk must therefore refuse the captured root's own
+    /// multiply-linked file instead of handing it over as external bytes.
+    #[test]
+    fn a_boundary_measured_through_a_replaced_path_still_contains_the_captured_root() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        std::fs::create_dir(base.join("home")).unwrap();
+        let parent = base.join("work");
+        std::fs::create_dir(&parent).unwrap();
+        let root = parent.join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("outside.toml");
+        owner_only_bytes(&target, b"[[tools]]\nname = \"bbb\"\n");
+        std::fs::create_dir_all(root.join("conf")).unwrap();
+        std::fs::hard_link(&target, root.join("conf/target.toml")).unwrap();
+        let root_id = identity_at(&root);
+        // The command's single capture, taken while the path names the root.
+        let route = captured_route(&base.join("home"), &root);
+
+        // The load measures the boundary after that capture. One swap is enough
+        // to make the path name a different directory at this instant.
+        std::fs::rename(&root, parent.join("repo-moved")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        let boundary = route
+            .checkout_boundary()
+            .unwrap()
+            .expect("a captured route has a boundary");
+        std::fs::remove_dir(&root).unwrap();
+        std::fs::rename(parent.join("repo-moved"), &root).unwrap();
+
+        // A cursor path no measured root can match: only the captured identity
+        // can put the walk inside its own checkout. This half needs no case
+        // folding, so it asserts everywhere.
+        assert!(
+            boundary.contains(
+                (root_id.dev, root_id.ino),
+                Path::new("/elsewhere/conf/x.toml")
+            ),
+            "the boundary must contain the captured root by identity, not by a re-read path"
+        );
+
+        // The relative read through the same boundary: the captured root's own
+        // file has two links, so the checkout rule must refuse it. A boundary
+        // that had kept the other directory's identity returned its bytes as an
+        // external source.
+        let error = route_error(read_untrusted_source_route(
+            &relative_entry(&root, "conf/target.toml"),
+            &route,
+            Some(&boundary),
+            4096,
+        ));
+        assert!(
+            matches!(error, UntrustedReadError::CheckoutHardLinked(2)),
+            "{error:?}"
+        );
+
+        // …and the same read spelled through a case-variant alias of the root,
+        // whose cursor path matches the boundary root only by identity.
+        if !folds_case(&parent) {
+            eprintln!(
+                "note: {parent:?} does not fold case, so the alias half of this row \
+                 cannot resolve; the identity assertions above still ran"
+            );
+            return;
+        }
+        let alias = parent.join("REPO").join("conf/target.toml");
+        assert_eq!(
+            std::fs::read(&alias).unwrap(),
+            b"[[tools]]\nname = \"bbb\"\n"
+        );
+        let error = route_error(read_untrusted_source_route(
+            &SourceEntry::for_tests(false, alias),
+            &route,
+            Some(&boundary),
+            4096,
+        ));
+        assert!(
+            matches!(error, UntrustedReadError::CheckoutHardLinked(2)),
+            "{error:?}"
+        );
+    }
+
+    /// A relative entry with no captured root is a programming error, and it is
+    /// reported as one rather than guessed at.
+    #[test]
+    fn a_relative_entry_without_a_captured_root_is_an_io_refusal() {
+        let entry = relative_entry(Path::new("/tmp"), "team.toml");
+        let error = route_error(read_untrusted_source_route(
+            &entry,
+            &RouteAnchor::Uncaptured,
+            None,
+            4096,
+        ));
+        let UntrustedReadError::Io(error) = error else {
+            panic!("expected an internal I/O refusal");
+        };
+        assert!(
+            error.to_string().contains("captured project root"),
+            "{error}"
+        );
+    }
+
+    /// The regression the route half of B1 exists for: a `trust = false` source
+    /// beside the project root. The sibling here is a directory, so the walk
+    /// descends into a child of the captured root's parent that is not the root;
+    /// no checkpoint is armed, and the route earns `External` with its bytes read
+    /// rather than merely a scope.
+    #[test]
+    fn a_sibling_of_the_captured_root_is_an_external_source() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        std::fs::create_dir(base.join("home")).unwrap();
+        let parent = base.join("work");
+        std::fs::create_dir(&parent).unwrap();
+        let root = parent.join("app");
+        std::fs::create_dir(&root).unwrap();
+        let shared = parent.join("shared/team.toml");
+        owner_only_bytes(&shared, b"[[tools]]\nname = \"team\"\n");
+        let route = captured_route(&base.join("home"), &root);
+        let boundary = boundary_of(&root);
+
+        let read = read_untrusted_source_route(
+            &SourceEntry::for_tests(false, shared.clone()),
+            &route,
+            Some(&boundary),
+            4096,
+        )
+        .expect("a sibling of the captured root is an external source");
+        assert_eq!(read.scope, SourceScope::External);
+        assert_eq!(read.bytes, b"[[tools]]\nname = \"team\"\n");
+        assert_eq!(read.identity, identity_of(&shared));
+    }
+
+    /// The same sibling spelled relative to the root descends through the root
+    /// first, so the separate rule — a route that entered the boundary must
+    /// finish inside it — decides it. Unchanged by the admission above, and kept
+    /// here so a later edit cannot widen it silently.
+    #[test]
+    fn a_sibling_reached_through_the_root_stays_a_boundary_refusal() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        std::fs::create_dir(base.join("home")).unwrap();
+        let parent = base.join("work");
+        std::fs::create_dir(&parent).unwrap();
+        let root = parent.join("app");
+        std::fs::create_dir(&root).unwrap();
+        let shared = parent.join("shared/team.toml");
+        owner_only_bytes(&shared, b"[[tools]]\nname = \"team\"\n");
+        let route = captured_route(&base.join("home"), &root);
+        let boundary = boundary_of(&root);
+
+        let error = route_error(read_untrusted_source_route(
+            &relative_entry(&root, "../shared/team.toml"),
+            &route,
+            Some(&boundary),
+            4096,
+        ));
+        assert!(
+            matches!(error, UntrustedReadError::EscapesCheckout),
+            "{error:?}"
+        );
+    }
+
+    /// `/` is opened before any step runs, so a boundary that *is* `/` must be
+    /// entered from that descriptor rather than from a parent step.
+    #[test]
+    fn the_open_root_descriptor_enters_a_root_boundary() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        let file = base.join("team.toml");
+        owner_only_bytes(&file, b"[[tools]]\n");
+        let slash = identity_of(Path::new("/"));
+        let boundary =
+            CheckoutBoundary::for_tests(&[(slash.dev, slash.ino)], &[PathBuf::from("/")]);
+        let route = RouteAnchor::Uncaptured;
+        let read = read_untrusted_source_route(
+            &SourceEntry::for_tests(false, file.clone()),
+            &route,
+            Some(&boundary),
+            4096,
+        )
+        .expect("a root boundary admits the route");
+        assert_eq!(read.scope, SourceScope::Checkout);
+        assert_eq!(read.identity, identity_of(&file));
     }
 }

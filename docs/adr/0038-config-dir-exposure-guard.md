@@ -21,7 +21,10 @@ Breaking guard release: **0.3.0** (ADR-0064's additions: **0.7.43**; ADR-0065's:
 `~/.config/agent-vm/projects` and each existing entry in it; the one-name check
 gains each `projects/<entry>/config.toml`. Storing project configs inside the
 directory is what requires it: "is or contains a route" alone allows a bind
-strictly inside. Release **0.8.0**.
+strictly inside. Release **0.8.0**. Amended by
+[ADR-0077](0077-pinned-config-sources.md): project stores also contain protected
+pin files (`pins.json` and snapshots), measured under bounded current-store
+and sibling scans. Release **0.8.4**.
 
 ## Context
 
@@ -156,6 +159,36 @@ through a launch by this build. Host-created links mid-session remain trusted.
 `authority_file_singly_linked` and `authority_file_singly_linked_spec` share the
 one-name rule with `config_authority::authority_refusal` (ADR-0040), in both
 its executable and spec. A read-time-only rule is insufficient.
+
+## Decision 3: protected pin files join the one-name check
+
+A project store can now hold `pins.json`, a permanent `pins.lock`, temporary
+pin-write files, and content snapshots named
+`pin-<32hex>-<64hex>.toml`. A manifest used as authority is admitted by
+[ADR-0040](0040-persisted-user-network-authority.md)'s verified-read rules.
+Separately, `protected_config_dir::project_store_file_links` counts links on a
+regular `pins.json`; it also requires a matching snapshot to be regular,
+user-owned, not group- or other-writable, and singly linked. A hard link,
+foreign owner, writable mode, or a snapshot name occupied by a non-regular file
+refuses the launch. The current store must itself be a directory; a
+non-directory entry cannot be treated as an unmeasured store.
+
+`pins.lock`, `.agent-vm-pin-tmp-*` files and malformed or other non-snapshot
+names are deliberately not protected pin files. They still count as scanned
+directory entries; for a sibling they also consume enumeration work, but not
+the work of checking a matching snapshot's metadata.
+
+The current launch's project store is derived from the captured project and the
+authority HOME, then measured directly before any sibling. It is matched by
+store-directory or `pins.json` identity, not a path spelling, so a case variant
+cannot become a sibling. Its scan has a fail-closed
+`MAX_PROJECT_STORE_ENTRIES = 2048` entry reservation. All sibling scans across
+both HOME locations share one `MAX_SIBLING_SNAPSHOT_WORK = 8192` budget;
+enumerating an entry and stating a matching snapshot each cost one unit. Exact
+`config.toml`, `pins.json` and route checks remain fail-closed for siblings.
+When a sibling reaches either scan limit, the guard emits a warning that the
+scan was bounded rather than silently treating the remaining snapshots as safe;
+snapshots remain SHA-256-verified when read.
 
 ## Trusted boundary and accepted gaps
 

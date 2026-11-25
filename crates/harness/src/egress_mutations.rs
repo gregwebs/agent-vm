@@ -3837,19 +3837,137 @@ fn ledger() -> Vec<Row> {
             anchors: 1,
         },
         Row {
-            name: r#"unpinned-allow-true-adopted"#,
-            path: r#"crates/agent-vm/src/config_authority.rs"#,
-            old: r#"        Err(anyhow::anyhow!(
-            "config: {}: {}: allow = true on a trust = false source cannot adopt top-level image, \"#,
-            new: r#"        return Ok(ApprovedSourceContent {
-            project_config: project.path(),
-            source_path: entry.path(),
-            bytes: _bytes,
+            name: r#"untrusted-step-stat-open-disagreement-accepted"#,
+            path: r#"crates/agent-vm/src/project_config.rs"#,
+            old: r#"    if seen.identity != opened {
+        return Err(UntrustedReadError::RootReplaced);
+    }"#,
+            new: r#"    let _ = (seen, opened);"#,
+            run: Run::AgentBin(
+                r#"a_double_swap_inside_one_step_is_refused_by_the_stat_then_open_agreement"#,
+            ),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            name: r#"untrusted-root-parent-rename-accepted"#,
+            path: r#"crates/agent-vm/src/project_config.rs"#,
+            old: r#"    if dir_change_stamp(fd)? != stamp {
+        return Err(UntrustedReadError::RootReplaced);
+    }"#,
+            new: r#"    if false && dir_change_stamp(fd)? != stamp {
+        return Err(UntrustedReadError::RootReplaced);
+    }"#,
+            run: Run::AgentBin(
+                r#"a_swap_before_the_captured_root_step_is_refused_by_the_parent_change_stamp"#,
+            ),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            name: r#"pin-unapproved-allow-true-adopted"#,
+            path: r#"crates/agent-vm/src/config_pins.rs"#,
+            old: r#"        let pins = self.pins.as_ref().expect("the pin state was just loaded");
+        #[cfg(test)]"#,
+            new: r#"        let pins = self.pins.as_mut().expect("the pin state was just loaded");
+        pins.current.sources.insert(
+            key.clone(),
+            KeyState {
+                active: hash,
+                approved: vec![Approval {
+                    hash,
+                    approved_ms: 0,
+                    active_ms: 0,
+                }],
+            },
+        );
+        let pins = &*pins;
+        #[cfg(test)]"#,
+            run: Run::AgentBin(r#"approved_untrusted_bytes_adopt_and_changed_bytes_do_not"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            name: r#"pin-checkout-confinement-bypassed"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"    let read = crate::project_config::read_untrusted_source_route(
+        entry,
+        route,
+        boundary,
+        MAX_CONFIG_FILE_BYTES,
+    )
+    .map_err(|error| untrusted_read_error(project, entry, route, error))?;
+    budget.charge(entry.path(), read.bytes.len())?;
+    check_not_self_source(Some(project), read.identity, entry)?;
+    Ok(read)"#,
+            new: r#"    let _ = (route, boundary);
+    let read = crate::host_paths::read_bounded_regular_file_noting_symlink(
+        entry.path(),
+        MAX_CONFIG_FILE_BYTES,
+    )
+    .map_err(|error| {
+        anyhow!(
+            "config: {}: {error}",
+            crate::one_line::quoted_path(entry.path())
+        )
+    })?;
+    budget.charge(entry.path(), read.bytes().len())?;
+    check_not_self_source(Some(project), read.identity(), entry)?;
+    Ok(crate::project_config::UntrustedSourceRead {
+        scope: crate::config_sources::SourceScope::Checkout,
+        bytes: read.bytes().to_vec(),
+        identity: read.identity(),
+    })"#,
+            run: Run::AgentBin(
+                r#"an_untrusted_checkout_escape_discloses_nothing_and_creates_no_store"#,
+            ),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            name: r#"pin-unapproved-allow-false-recorded"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"    let read = read_untrusted_bytes(entry, project, route, boundary, budget)?;
+    let path = entry.path();
+    match approval.check_untrusted_source(project, entry, read.scope, &read.bytes)? {"#,
+            new: r#"    let read = read_untrusted_bytes(entry, project, route, boundary, budget)?;
+    let path = entry.path();
+    if !entry.is_allowed() {
+        let (text, _document) = parse_toml_table(path, &read.bytes)?;
+        let mut raw = decode_raw_config(path, text)?;
+        let inert = record_inert(&mut raw);
+        let (report, contents) = build_tier(
+            path,
+            raw,
+            TierAuthority::Source(None),
+            FileTierKind::Source(entry.alias()),
+            home,
+            work,
+        )?;
+        return Ok(SourceReadOutcome::Approved {
+            tier: report,
+            contents,
+            inert,
+            pin: None,
+            scope: Some(read.scope),
         });
-        #[allow(unreachable_code)]
-        Err(anyhow::anyhow!(
-            "config: {}: {}: allow = true on a trust = false source cannot adopt top-level image, \"#,
-            run: Run::AgentBin(r#"untrusted_allow_true_source_is_refused_before_pinning"#),
+    }
+    match approval.check_untrusted_source(project, entry, read.scope, &read.bytes)? {"#,
+            run: Run::AgentBin(r#"the_four_trust_allow_combinations_are_independent"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // The observation's lock identity is the fence fix (1) added. A
+            // mutant that drops the acquired-vs-observed comparison lets a
+            // replaced `pins.lock` accept a review.
+            name: r#"pin-lock-identity-unchecked"#,
+            path: r#"crates/agent-vm/src/config_pins/store.rs"#,
+            old: r#"        if !observed_lock_matches(expected.state, Some(lock.identity)) {
+            return Err(WriteError::IncarnationChanged);
+        }"#,
+            new: r#"        let _ = observed_lock_matches(expected.state, Some(lock.identity));"#,
+            run: Run::AgentBin(r#"a_replaced_lock_inode_is_not_the_observed_lock"#),
             markers: &[r#"test result: FAILED"#],
             anchors: 1,
         },
