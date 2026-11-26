@@ -20,6 +20,10 @@ extended from the one user config to every trusted source route. Bumps the works
 Amended by [ADR-0077](0077-pinned-config-sources.md): every `trust = false`
 source is now content-pinned before decoding, regardless of `allow`.
 
+Amended by [ADR-0078](0078-project-config-writer.md): `image set-default` may
+narrowly add or replace the root `image` without changing these source
+declarations or their trust/allow semantics.
+
 ## Context
 
 ADR-0074 gave the project config a flat `sources = ["<alias>[:trust] <path>"]`

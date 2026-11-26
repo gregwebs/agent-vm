@@ -169,10 +169,16 @@ impl Harness {
         bounded(command)
     }
 
-    fn set_default(&self, reference: &str) -> Output {
-        let mut command = self.command();
-        command.args(["image", "set-default", "--image", reference]);
-        bounded(command)
+    /// The host's retained record naming `reference`: the default tier's own
+    /// state, which `image set-default` no longer writes (#737).
+    fn retain_host_default(&self, reference: &str) {
+        let path = self.home.join(".config/agent-vm/default-image.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({"version": 1, "image": reference})).unwrap(),
+        )
+        .unwrap();
     }
 
     fn image(&self, spec: &ArchiveSpec) -> Image {
@@ -1041,9 +1047,9 @@ fn a8_the_default_tier_renders_a_fixed_reference() {
     let server = Server::new();
     let image = h.labeled("a8", &[("agent.codex", "api.openai.com")]);
     let child = server.image("images", "a8", &image);
-    let tag = format!("{}/images:a8", server.host);
-    let pinned = h.set_default(&tag);
-    assert!(pinned.status.success(), "{}", stderr(&pinned));
+    // The retained record is the default tier's state; a project config would be
+    // the configured tier, which legitimately renders its reference.
+    h.retain_host_default(&child);
 
     let out = h.launch_default();
     assert!(!out.status.success());

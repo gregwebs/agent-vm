@@ -75,6 +75,7 @@ mod pi_credential_inspection;
 mod pins_cmd;
 mod project;
 mod project_config;
+mod project_config_writer;
 mod protected_config_dir;
 mod protected_host_files;
 mod pull;
@@ -334,13 +335,16 @@ fn run_dispatch(dispatch: Dispatch, project: Result<project::ProjectDir>) -> Res
         return image_cmd::show(images, &project);
     }
 
-    // Input typos must fail before the MSB prologue creates state (#359).
+    // Input typos must fail before the MSB prologue creates state (#359), and
+    // `set-default` additionally reads the project config and approval store it
+    // must not cross there (#737): a refusal leaves the redirected MSB state
+    // directories absent and makes no registry request.
     if let Dispatch::Builtin {
         cmd: Cmd::Image(args),
         ..
     } = &dispatch
     {
-        image_cmd::preflight(args)?;
+        image_cmd::preflight(args, &project)?;
     }
     // Capture while no child has inherited selected values and removal cannot
     // race a Tokio worker's environment read (#163).

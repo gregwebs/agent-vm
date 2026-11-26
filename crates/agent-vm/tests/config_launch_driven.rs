@@ -5568,15 +5568,36 @@ fn image_pull_help_describes_in_use_targets_not_booting() {
     for text in [&image_group_help, &pull_help] {
         assert!(!text.to_lowercase().contains("refresh"), "{text}");
     }
+}
+
+/// #737: `image set-default`'s own leaf help names this project's config as the
+/// destination, keeps every other setting, writes no approval and promises no
+/// host-wide starting choice. Its own test, so a pull-help change and a
+/// set-default-help change fail separately.
+#[test]
+fn image_set_default_help_names_the_project_config_it_writes() {
+    let harness = Harness::new();
     let set_default = stdout_of(&harness.builtin(&["image", "set-default", "--help"], &[]));
-    // B1: the help says whose default the command changes (#541).
+    let flattened = flatten(&set_default);
     assert!(
-        set_default.contains("starting default for projects that have none yet"),
-        "set-default's help states the host starting choice:\n{set_default}"
+        flattened.contains("this project's boot image in its project config"),
+        "set-default's help names the project config it writes:\n{set_default}"
     );
     assert!(
-        set_default.contains("established projects keep their own"),
-        "set-default's help names the established-project rule:\n{set_default}"
+        flattened.contains("projects/<project-id>/config.toml"),
+        "set-default's help names the file:\n{set_default}"
+    );
+    assert!(
+        flattened.contains("keeping every other setting"),
+        "set-default's help promises a narrow edit:\n{set_default}"
+    );
+    assert!(
+        flattened.contains("No approval is written"),
+        "set-default's help says it writes no approval:\n{set_default}"
+    );
+    assert!(
+        !flattened.contains("starting default for projects that have none yet"),
+        "the host-wide starting choice is gone:\n{set_default}"
     );
     assert!(
         !set_default.contains("instead of the configured selection"),

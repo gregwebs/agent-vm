@@ -120,6 +120,14 @@ zeroize = "1"
 # `preserve_order` (key order is never load-bearing; tool order comes from
 # the `[[tools]]` array, not a map). See src/config.rs.
 toml = { version = "1", default-features = false, features = ["parse", "serde"] }
+# Immutable TOML parse with byte spans, for the project config's root `image` splice
+# (#737, ADR-0078 D4). Only `parse`: the `display` feature is the re-serialising
+# door the planner keeps shut — `DocumentMut::to_string` normalises CRLF, adds a
+# missing final newline and moves a leading comment below an inserted root key, so
+# a caller holding it could rewrite a file it promised to preserve. Every crate
+# this pulls in (indexmap, toml_datetime, toml_parser, winnow) is already in the
+# build graph through `toml`/`proc-macro-crate`, so this adds no compilation.
+toml_edit = { version = "0.25", default-features = false, features = ["parse"] }
 # Computes the unified diff that shows a pending pinned config source before it
 # is approved (#736 phase 3, owner decision D8). Only the LCS is the crate's:
 # `config_pins::diff` owns the escaping, the hunk rendering, the caps and the

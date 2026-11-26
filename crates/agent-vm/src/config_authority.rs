@@ -746,6 +746,50 @@ pub(crate) fn verify_project(
     })
 }
 
+/// The refusal [`verify_project_file_at`] reports for a final symlink, for a
+/// reader that classified the link from a no-follow `openat` and never opened its
+/// target. Kept here so the sentence is attributed once, not restated per reader.
+pub(crate) fn project_symlink_refusal() -> UntrustedConfig {
+    UntrustedConfig::Refused {
+        refusal: AuthorityRefusal::ThroughSymlink,
+        subject: AuthoritySubject::ProjectConfig,
+    }
+}
+
+/// [`verify_project`] measured on descriptors instead of on the path's parent.
+///
+/// The project config writer (#737) opens `projects/<id>/` once, verifies that
+/// descriptor, and then opens `config.toml` inside it with `O_NOFOLLOW`. This
+/// hands the same proved [`authority_refusal`] kernel those two measurements, so
+/// a directory replaced *after* the route was admitted cannot be judged by a
+/// second path lookup — the one gap [`verify_project`]'s
+/// `symlink_metadata(parent)` leaves open under ADR-0040's stable-route
+/// assumption. Attribution and wording stay [`AuthoritySubject::ProjectConfig`]'s,
+/// so a refusal reads exactly as it does on the load path.
+pub(crate) fn verify_project_file_at(
+    parent_dir: DirFacts,
+    final_component: &FinalComponent,
+) -> Result<(), UntrustedConfig> {
+    let reached = match final_component {
+        FinalComponent::Symlink => Reached::ThroughSymlink,
+        FinalComponent::Regular(facts) => Reached::Direct(FileFacts {
+            uid: facts.uid,
+            mode: raw_mode_u32(facts.mode),
+            nlink: facts.nlink,
+        }),
+    };
+    // Spelled differently from `verify_trusted_source_at`'s single-match call so the
+    // mutation ledger's `trusted-source-verify-skipped` anchor stays one statement.
+    let refused = authority_refusal(reached, parent_dir, crate::host_paths::current_euid());
+    match refused {
+        Some(refusal) => Err(UntrustedConfig::Refused {
+            refusal,
+            subject: AuthoritySubject::ProjectConfig,
+        }),
+        None => Ok(()),
+    }
+}
+
 /// Unconditional ADR-0040 verification for a non-default `trust = true` source
 /// (ADR-0076 R2.3).
 ///

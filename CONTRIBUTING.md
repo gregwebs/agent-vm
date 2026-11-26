@@ -274,18 +274,19 @@ here. Use a dedicated serial native host, no concurrent agent-vm/msb VMs, compat
 managed runtime policy and no matching GHCR/loopback credentials in the OS keyring.
 Never edit operator policy/keychain to make a test pass.
 
-Every launcher the run is pointed at must report `--version` at or above 0.8.4:
-0.8.4 is this branch's minimum contract, and
+Every launcher the run is pointed at must report `--version` at or above 0.8.5:
+0.8.5 is this branch's minimum contract, and
 `candidate_reads_host_managed_config` refuses anything older before the first
 row. 0.8.1 brought the host-managed project tier, flat `sources` and the
 project-first image precedence; 0.8.2 brought explicit tool authorization
 (ADR-0075); 0.8.3 brought `[[sources]]` tables with independent `trust` and
 `allow` (ADR-0076); 0.8.4 pins every `trust = false` source before decoding
-(ADR-0077). An older candidate reads a fixture from the wrong path, launches a
+(ADR-0077); 0.8.5 writes the root project `image` through the verified writer
+(ADR-0078). An older candidate reads a fixture from the wrong path, launches a
 `[[tools]]` block this branch treats as inert, accepts unapproved sourced bytes,
-or rejects every seeded project config as a schema error, and passes the rows
-for the wrong reason. This floor does not claim the present VM fixtures exercise
-the pin gate.
+rejects every seeded project config as a schema error, or exercises the old
+host-record setter and passes the rows for the wrong reason. This floor does not
+claim the present VM fixtures exercise the pin gate.
 
 For released-image, first authenticate/download both v0.1.3 archives using the
 [source-pinned image-owner release interfaces](https://github.com/gregwebs/agent-vm-images/blob/main/docs/standard-image-releases.md).
@@ -389,9 +390,10 @@ against genuine OCI bytes on a bound loopback listener, without Docker or a VM.
 It covers both boot-free paths — `image pull` (selection, A→B tag movement,
 layer reuse, first-pin and default adoption, candidate approval, and the
 two-process same-cache/same-reference coordination schedules) and
-`image set-default` (explicit target, approved host child, retained record) —
-plus failure preservation. A launch never probes a tag: the removed update check
-has no test seam and no environment fallback. The suite drives the host pin
+`image set-default` (explicit target, validated reference, verified
+project-config write with approvals unchanged) — plus failure preservation. A launch never probes a tag: the removed update check
+has no test seam and no environment fallback. The write path publishes fully
+written bytes by rename, not an `fsync`-backed power-loss-durability guarantee. The suite drives the host pin
 store through the compiled CLI with isolated HOME/state/cwd and Docker config
 (empty auths, no helpers); native-entry automatic auth may still perform
 read-only OS keyring lookup, and machine-wide managed policy still applies.
@@ -403,8 +405,8 @@ read, with every child wait bounded at 60s. Failure
 preservation hashes old metadata and referenced EROFS/fsmeta/VMDK artifacts
 independently, including a shared-layer failure; native cache completeness alone
 is not an unchanged-byte oracle. The custom group also tests explicit release
-`image set-default` A→B, an unchanged live A in a different project,
-new/warm/offline B, all override boundaries, failed-acquisition byte
+`image set-default` A→B in the invoking project config, an unchanged live A in
+a different project, project-config precedence, failed-acquisition byte
 preservation, and explicitly bootable cached A. Its registry publication uses
 empty test-owned Docker auth configuration and only the operator daemon's Unix
 endpoint (Colima/Docker Desktop), not copied credentials/helpers. This requires
@@ -477,27 +479,27 @@ neutralizes an inherited `AGENT_VM_SHARE_MSB_CACHE`, `AGENT_VM_MSB_CACHE_DIR` an
 `MSB_CONFIG_PATH`, while #260 uses a separate fresh shared cache. It makes no
 released-default or lineage claim.
 
-The custom group also runs `custom-image-host-pins` (#390, always-run): launch
-and pin registry content A before the SDK create, then observe exactly one
-approval naming the selected reference and the measured `linux/arm64` platform;
-observe guest A and zero registry requests on a warm launch that inherits the
-removed advisory variable; reacquire A by digest into a fresh independent
-state/cache and confirm neither record's bytes changed; fail a candidate and still
-boot A; replace A with B by running the pull (the prompt-free consent, #541)
-and boot B; show that an
-import alias over the pinned tag cannot move the guest; and then show that an
-explicit `image import --docker … --tag $tag` of the pinned tag *does* move it —
-no prompt, `old:`/`new:` on stderr, revision +1, zero registry reads — while the
-same import repeated leaves `image-pins.json` byte-identical. A live A guest
-runs throughout: its PID, its own rootfs content and its booted image stamp must
-be unchanged after both update verbs, and a new B guest in the same project must
-read back the project-state, declared-state and launch-HOME files that the first
-A launch wrote. A local rootfs selection proves only the local/OCI boundary (no
-approval lookup, no store write); a boot from it is not claimed here because this
-host's SDK rejects a managed `root_disk` for a non-OCI image. Fixture A/B are the
-existing `marker-free` and `stamp-present` targets pushed to the run's local
-registry, so the guest stamp — not printed text — proves which image booted. It
-needs the same two validated launchers and Docker endpoint as the other rows.
+The `custom-image-host-pins` row is intended to launch and pin registry content A
+before the SDK create, observe exactly one approval naming the selected reference
+and measured `linux/arm64` platform, then observe guest A and zero registry
+requests on a warm launch. It reacquires A by digest into a fresh independent
+state/cache and compares both records' bytes; fails a candidate and still boots
+A; replaces A with B by running the pull (the prompt-free consent, #541); and
+saves B as the root project-config image through `image set-default` without
+changing its approval or retained-default record. It also checks that an import
+alias over the pinned tag cannot move the guest, while an explicit `image import
+--docker … --tag $tag` of that tag does move it — no prompt, `old:`/`new:` on
+stderr, revision +1 and zero registry reads — and a repeated import leaves
+`image-pins.json` byte-identical. A live A guest must keep its PID, rootfs content
+and booted image stamp across both update verbs; a new B guest in the same project
+must read the first A launch's project-state, declared-state and launch-HOME
+files. A local-rootfs selection covers only the local/OCI boundary (no approval
+lookup or store write), not a boot, because this host's SDK rejects a managed
+`root_disk` for a non-OCI image. Fixture A/B are the `marker-free` and
+`stamp-present` targets pushed to the run's local registry, so a guest stamp —
+not printed text — identifies the booted image. Native receipts remain required;
+a planned assertion is not a receipt. The row needs the same two validated
+launchers and Docker endpoint as the other rows.
 
 #### Evidence location
 

@@ -21,12 +21,12 @@ use super::approval;
 use super::refresh::{ApprovalDelta, RefreshSuccess};
 use super::store::{self, Store};
 use super::{
-    ApprovedPin, BootImage, CanonicalOciReference, DefaultAction, DefaultChange, ImageLabel,
-    ImageRef, ImageSource, ImmutableImageRef, ManifestDigest, PinKey, ProjectId, Rendering,
-    ValidatedCandidate, acquire_or_render, immutable_reference, oci_target, revalidate_frozen,
+    ApprovedPin, BootImage, CanonicalOciReference, DefaultAction, ImageLabel, ImageRef,
+    ImageSource, ImmutableImageRef, ManifestDigest, PinKey, ProjectId, Rendering,
+    ValidatedCandidate, acquire_or_render, oci_target, revalidate_frozen,
 };
 use crate::boot_image::{AdoptionOffer, ConfigurationRead};
-use crate::image_acquire::{AcquireMode, OciTarget};
+use crate::image_acquire::{AcquireMode, OciTarget, PreparedNativeImage};
 use crate::project::ProjectDir;
 
 /// Whether establishing a project default may also seed the host's starting
@@ -124,24 +124,6 @@ pub(crate) struct ObservedDefaults {
     pub(crate) project: Result<Option<ImmutableImageRef>>,
     pub(crate) host: Result<Option<ImmutableImageRef>>,
     pub(crate) file: PathBuf,
-}
-
-/// What `image set-default` did: only the host record can change; the invoking
-/// project is reported so the notice can say whether it keeps its own default.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct HostDefaultSet {
-    pub(crate) retained_default: DefaultChange,
-    pub(crate) this_project: InvokingProject,
-}
-
-/// Measured under the pin lock: `AlreadyUses` iff the content this project's
-/// default boots (its approved child, else the digest it states) is the new host
-/// child.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum InvokingProject {
-    NotEstablished,
-    AlreadyUses,
-    KeepsItsOwn,
 }
 
 /// Consent to move one project's established default to the host's current
@@ -292,17 +274,74 @@ pub(super) async fn adopt_host_default(
     })
 }
 
-/// `image set-default`: measure the typed target and make its host child the
-/// host's starting choice. No pin and no project default is written (ADR-0067).
-pub(crate) async fn set_default(
+/// The fixed reason `image set-default` gives when this project already approves
+/// the target reference at different content (ADR-0078 D3).
+///
+/// Both variants are value-free: the reference the user typed, the approved digest
+/// and the acquired digest are all user or registry data. They differ only in
+/// whether `agent-vm image pull --image REF` could accept this reference — it
+/// targets only references already in use here — so the advice never sends the user
+/// to a command that would refuse them.
+pub(crate) const PIN_CONFLICT_REASON: &str = "this project already approves this image reference at a different manifest digest, and \
+     image set-default writes no approval, so a later launch would boot that approved \
+     content instead of the content just acquired; nothing was written. Re-run \
+     image set-default with the immutable digest reference of the content you intend \
+     (repo@sha256:...) so the selection does not depend on an approval.";
+
+/// [`PIN_CONFLICT_REASON`] for a reference this project holds a role for, which
+/// an explicit refresh may therefore re-approve in place.
+///
+/// The advice is "re-resolve and approve the **held reference**", not "approve the
+/// acquired content": `image pull` re-resolves the reference and replaces that
+/// reference's approval with whatever it just acquired, which is the action that
+/// makes the next launch boot the new content. Nothing can approve bytes already
+/// acquired, and the digest alternative names the content rather than the tag.
+const PIN_CONFLICT_PULL_REASON: &str = "this project already approves this image reference at a different manifest digest, and \
+     image set-default writes no approval, so a later launch would boot that approved \
+     content instead of the content just acquired; nothing was written. Re-resolve and \
+     approve the held reference with `agent-vm image pull --image REF` (it replaces \
+     that reference's approval with what it acquires now), or re-run image set-default \
+     with the immutable digest reference (repo@sha256:...) of the content you intend.";
+
+/// `image set-default`'s read-only pre-network check of the approval authority.
+///
+/// Reads this project's approval store with the rule pin lookups already use: the
+/// host record in `default-image.json` is ignored **unless a pending image-pin
+/// journal requires it**, and an unreadable or inconsistently paired journal fails
+/// closed here, before any registry request (ADR-0078 D5). Recovery is not this
+/// command's business and never happens in a read-only check. Writes nothing.
+pub(crate) fn preflight_project_default(reference: &ImageRef, project: &ProjectDir) -> Result<()> {
+    let target = oci_target(reference.as_str())?;
+    let key = PinKey::new(&ProjectId::of(project), &target)?;
+    let _ = super::lookup(&key)?;
+    Ok(())
+}
+
+/// `image set-default`: acquire and validate the typed target and hand the caller
+/// the content it measured, **without writing any pin store**.
+///
+/// The reference this command saves is the project config's root `image`; an
+/// approval is never written, replaced or forgotten here (ADR-0078 D3, D7). The
+/// returned [`PreparedNativeImage`] holds the cache publication barrier so the
+/// caller's commit cannot interleave with a peer publishing other content under
+/// the same cache, and it is the content this call validated.
+///
+/// After acquisition — including when the caller's edit would be a no-op — the
+/// project's existing approval for `(project, canonical(REF), host platform)` is
+/// compared with the acquired manifest. A mismatch is refused: a later launch would
+/// consume the approval, not the content just acquired, and promising the acquired
+/// digest at the next launch would be false. The cache may now hold the acquired
+/// content; `config.toml` and both pin stores are untouched.
+///
+/// No cache/OCI lock is taken from inside `config.lock` and the pin lock is not
+/// held across it: this function returns before the caller's write begins.
+pub(crate) async fn acquire_for_project_default(
     reference: &ImageRef,
     project: &ProjectDir,
-) -> Result<HostDefaultSet> {
+) -> Result<PreparedNativeImage> {
     let target = oci_target(reference.as_str())?;
+    let key = PinKey::new(&ProjectId::of(project), &target)?;
     let label = ImageLabel::for_default_upgrade();
-    let store = Store::host()?;
-    // A damaged or legacy record is refused before any registry request.
-    store.default_health()?;
     let prepared = acquire_or_render(
         &target,
         &label,
@@ -310,14 +349,22 @@ pub(crate) async fn set_default(
         AcquireMode::ResolveCurrent,
     )
     .await?;
-    let retained = immutable_reference(target.canonical(), prepared.image().acquired_digest())?;
     store::candidate_ready()?;
-    // Held through the write: the host record never names content this command
-    // did not validate in the cache it just used. Nothing waits on a human, so
-    // no frozen-candidate revalidation is needed.
-    let outcome = store.set_host_default(&retained, &ProjectId::of(project))?;
-    drop(prepared);
-    Ok(outcome)
+    if let Some(existing) = super::lookup(&key)?
+        && existing.digest != *prepared.image().acquired_digest()
+    {
+        // Advice only: an unreadable scope says nothing about eligibility, so the
+        // refusal then names the explicit digest instead of a refusing command.
+        let pull_eligible = super::observe_refresh_scope(project)
+            .map(|scope| scope.has_held_target(&target))
+            .unwrap_or(false);
+        return Err(anyhow!(if pull_eligible {
+            PIN_CONFLICT_PULL_REASON
+        } else {
+            PIN_CONFLICT_REASON
+        }));
+    }
+    Ok(prepared)
 }
 
 /// The default slot as one project's selection reads it.

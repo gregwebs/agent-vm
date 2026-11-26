@@ -1,6 +1,6 @@
 //! `agent-vm image …` — inspect the selected boot image or this project's
-//! approvals, acquire the selected OCI reference, explicitly retain a default,
-//! or publish a finished image into agent-vm's own image cache.
+//! approvals, acquire the selected OCI reference, save this project's boot image
+//! reference, or publish a finished image into agent-vm's own image cache.
 //!
 //! `show` selects nothing new and boots nothing: it reports the image a launch
 //! here would select, so it is dispatched before runtime discovery and setup
@@ -12,7 +12,9 @@
 //! `build` and `import` are each their own consent and none asks (#391,
 //! ADR-0067): each approves exactly what it resolved or published. `import`
 //! additionally *observes* the selection after publishing (#385) — it never
-//! changes it.
+//! changes it. `set-default` is the one verb that writes configuration rather
+//! than approvals: it acquires its target and splices it into this project's
+//! `config.toml` through the verified writer (#737, ADR-0078).
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Args as ClapArgs, Subcommand};
@@ -74,13 +76,17 @@ pub(crate) enum ImageCmd {
         long_about = "Re-resolve and approve the ambient boot operation and all recorded boot/output holders without asking. When adopting the host default, that operation acquires it instead of the old unheld project default; a held old default is pulled independently. Use --image REF to pull one in-use reference without changing selection or adopting a default. Keep successful approvals if another target fails; exit 1 if any target fails."
     )]
     Pull(crate::pull::Args),
-    /// Acquire an OCI image and make it the starting default for projects that
-    /// have none yet. Established projects keep their own default.
+    /// Acquire an OCI image and save it as this project's boot image.
     ///
-    /// The target is required and explicit: an ambient launch image, an image
-    /// option outside this subcommand, a broken catalog or the current
-    /// recommendation never chooses it. Overrides and running sessions are
-    /// unchanged.
+    /// Writes `image = "REF"` to this project's host-managed config
+    /// (`$HOME/.config/agent-vm/projects/<project-id>/config.toml`), seeding the
+    /// default `home` source when that file is absent and keeping every other
+    /// setting and comment. The target is required and explicit: an ambient launch
+    /// image, an image option outside this subcommand, a broken catalog or the
+    /// current recommendation never chooses it. No approval is written or
+    /// replaced; if this project already approves the reference at different
+    /// content the command refuses instead of promising a boot it cannot deliver.
+    /// Overrides, approvals, other projects and running sessions are unchanged.
     SetDefault(crate::boot_image::upgrade::Args),
     /// Explicitly build a Dockerfile, import the result into agent-vm's image
     /// cache and approve it for its `--tag`.
@@ -90,10 +96,14 @@ pub(crate) enum ImageCmd {
     Import(crate::image_import::Args),
 }
 
-/// Input-only checks `main` runs before the MSB prologue.
-pub(crate) fn preflight(args: &Args) -> Result<()> {
+/// Input-only checks `main` runs before the MSB prologue, and the one verb here
+/// whose refusals must precede any state creation: `set-default` reads the
+/// project config it is about to edit and the approval store it must not cross
+/// before the MSB prologue redirects state or a registry is contacted.
+pub(crate) fn preflight(args: &Args, project: &Result<crate::project::ProjectDir>) -> Result<()> {
     match &args.cmd {
-        ImageCmd::Show | ImageCmd::Pins | ImageCmd::Build(_) | ImageCmd::SetDefault(_) => Ok(()),
+        ImageCmd::Show | ImageCmd::Pins | ImageCmd::Build(_) => Ok(()),
+        ImageCmd::SetDefault(args) => crate::boot_image::upgrade::preflight(args, project),
         ImageCmd::Pull(args) => crate::pull::preflight(args),
         ImageCmd::Import(args) => crate::image_import::preflight(args),
     }

@@ -398,6 +398,20 @@ impl OpenedRegularFile {
         self.facts
     }
 
+    /// The size of **this** descriptor now, for a reader that must notice the file
+    /// changing under it.
+    ///
+    /// [`Self::facts`] is what the descriptor measured when it was opened; a file
+    /// that grew or shrank afterwards keeps the same identity and the same
+    /// descriptor, so only a fresh `fstat` of the descriptor already held can see
+    /// it. `None` means the descriptor could not be measured, which a reader must
+    /// treat as a refusal rather than as an unchanged size.
+    pub(crate) fn size_now(&self) -> Option<u64> {
+        rfs::fstat(&self.file)
+            .ok()
+            .map(|stat| stat.st_size.max(0) as u64)
+    }
+
     pub(crate) fn identity(&self) -> FileIdentity {
         self.facts.identity()
     }
@@ -445,6 +459,21 @@ impl OpenedRegularFile {
         self,
         max: u64,
     ) -> std::result::Result<Vec<u8>, ReadBoundedError> {
+        self.read_bounded_measured(max).map(|(data, _)| data)
+    }
+
+    /// [`Self::read_bounded_classified`] plus the descriptor's own size **after** the
+    /// read.
+    ///
+    /// The project config writer compares three numbers — the size measured when the
+    /// descriptor was opened, the number of bytes the read returned, and this one —
+    /// so a file that grew by less than the reader's ceiling is a change rather than
+    /// an accepted read. `None` means the descriptor could no longer be measured,
+    /// which is a refusal and not "unchanged".
+    pub(crate) fn read_bounded_measured(
+        self,
+        max: u64,
+    ) -> std::result::Result<(Vec<u8>, Option<u64>), ReadBoundedError> {
         let display = path_in_line(&self.path);
         if self.facts.size > max {
             return Err(ReadBoundedError::TooLarge);
@@ -458,7 +487,7 @@ impl OpenedRegularFile {
         if data.len() as u64 > max {
             return Err(ReadBoundedError::TooLarge);
         }
-        Ok(data)
+        Ok((data, self.size_now()))
     }
 
     /// The bytes plus the descriptor's own facts, as one [`VerifiedRead`].
@@ -980,6 +1009,21 @@ pub(crate) fn open_verified_lock_at(
     euid: u32,
     display: &Path,
 ) -> Result<OpenedLock> {
+    open_verified_lock_at_with_create_mode(dir_fd, name, euid, display, Mode::RUSR | Mode::WUSR)
+}
+
+/// [`open_verified_lock_at`] with a caller-chosen creation mode.
+///
+/// Production asks for `0600`; the project writer's tests pass a mode a masking
+/// umask could have produced, because the process umask cannot be staged inside
+/// the test binary without racing parallel tests.
+pub(crate) fn open_verified_lock_at_with_create_mode(
+    dir_fd: &OwnedFd,
+    name: &OsStr,
+    euid: u32,
+    display: &Path,
+    create_mode: Mode,
+) -> Result<OpenedLock> {
     // Open first, then create exclusively: a plain `O_CREAT` open raced by a
     // second creator can report `ENOENT` on macOS, and a create that loses the
     // race must never truncate the winner's header. Both paths stay
@@ -1007,9 +1051,18 @@ pub(crate) fn open_verified_lock_at(
                 | OFlags::NOFOLLOW
                 | OFlags::NONBLOCK
                 | OFlags::CLOEXEC,
-            Mode::RUSR | Mode::WUSR,
+            create_mode,
         ) {
-            Ok(fd) => return verified_lock(fd, euid, display),
+            Ok(fd) => {
+                // The mode is re-applied here because a masking umask could make
+                // the permanent lock unusable for the next process, and this is
+                // the one path that knows the entry is ours: a create that loses
+                // the race takes the branch above and never chmods a peer's inode.
+                rfs::fchmod(&fd, Mode::RUSR | Mode::WUSR)
+                    .map_err(|error| anyhow!(error))
+                    .with_context(|| format!("chmodding {}", path_in_line(display)))?;
+                return verified_lock(fd, euid, display);
+            }
             Err(Errno::EXIST) => continue,
             Err(error) => {
                 return Err(anyhow!(error))
@@ -1627,6 +1680,109 @@ impl Drop for TempEntry<'_> {
     }
 }
 
+/// Which step of a replacement failed, as a value rather than a phrase.
+///
+/// An ordinary-error row asserts the stage its fault was injected at plus the errno
+/// the failure carried, so a mutant that moves a failure to another step — or that
+/// reports a different errno — is caught without matching the rendered text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WriteStage {
+    Write,
+    Chmod,
+    Rename,
+}
+
+impl WriteStage {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Write => "write",
+            Self::Chmod => "chmod",
+            Self::Rename => "rename",
+        }
+    }
+}
+
+/// A failed publication step: its stage plus the `errno` the failure carried.
+///
+/// Attached to the error the one writer core returns, beneath the step's own
+/// context sentence, so the rendered message is unchanged while the structured
+/// facts remain reachable through the chain.
+#[cfg_attr(not(test), allow(dead_code))] // read by the writer's ordinary-error rows
+#[derive(Debug)]
+pub(crate) struct StageFailure {
+    stage: WriteStage,
+    errno: Option<i32>,
+    /// The step's own failure, rendered once: `StageFailure` is the outermost error
+    /// object, so the rendering it replaces stays in the message a user reads.
+    detail: String,
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // read by the writer's ordinary-error rows
+impl StageFailure {
+    pub(crate) fn stage(&self) -> WriteStage {
+        self.stage
+    }
+
+    /// The raw `errno` of the failure, when the step's error carried one.
+    pub(crate) fn errno(&self) -> Option<i32> {
+        self.errno
+    }
+}
+
+impl std::fmt::Display for StageFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "the {} step failed: {}",
+            self.stage.label(),
+            self.detail
+        )
+    }
+}
+
+impl std::error::Error for StageFailure {}
+
+/// [`StageFailure`] for `error`, with the errno taken from whatever the step's own
+/// failure carried (an [`std::io::Error`] or a rustix [`Errno`]).
+///
+/// The stage error is the **object** rather than a `context` layer: anyhow renders a
+/// context through a private wrapper, which a caller could not downcast back to the
+/// stage it came from.
+fn stage_failure(stage: WriteStage, error: anyhow::Error) -> anyhow::Error {
+    let errno = error.chain().find_map(|cause| {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            return io.raw_os_error();
+        }
+        cause
+            .downcast_ref::<Errno>()
+            .map(|errno| errno.raw_os_error())
+    });
+    anyhow::Error::new(StageFailure {
+        stage,
+        errno,
+        detail: format!("{error:#}"),
+    })
+}
+
+/// The stage a failed replacement stopped at, for a caller's assertions.
+#[cfg_attr(not(test), allow(dead_code))] // read by the writer's ordinary-error rows
+pub(crate) fn write_stage(error: &anyhow::Error) -> Option<&StageFailure> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<StageFailure>())
+}
+
+/// One replacement: where it is published, what bytes, and the spelling a
+/// diagnostic prints. A named value rather than five positional arguments, two of
+/// which are paths the callee could not tell apart.
+struct Replacement<'a> {
+    parent: &'a OwnedFd,
+    final_name: &'a OsStr,
+    data: &'a [u8],
+    mode: u32,
+    display: &'a Path,
+}
+
 fn atomic_write_at(
     parent: &OwnedFd,
     final_name: &OsStr,
@@ -1634,7 +1790,16 @@ fn atomic_write_at(
     mode: u32,
     path: &Path,
 ) -> Result<()> {
-    atomic_write_with_random(parent, final_name, data, mode, path, random_temp_name)
+    atomic_write_with_random(
+        Replacement {
+            parent,
+            final_name,
+            data,
+            mode,
+            display: path,
+        },
+        random_temp_name,
+    )
 }
 
 /// [`atomic_write_at`] with a caller-chosen temporary-name prefix.
@@ -1652,77 +1817,180 @@ pub(crate) fn atomic_write_at_with_prefix(
     mode: u32,
     path: &Path,
 ) -> Result<()> {
-    atomic_write_with_random(parent, final_name, data, mode, path, || {
-        random_temp_name_with_prefix(temp_prefix)
-    })
+    atomic_write_with_random(
+        Replacement {
+            parent,
+            final_name,
+            data,
+            mode,
+            display: path,
+        },
+        || random_temp_name_with_prefix(temp_prefix),
+    )
 }
 
-/// Fault points production never fails at, injected between the
-/// exclusively-created temporary's write/chmod/rename steps. Each
-/// closure returning `Err` simulates that operation failing; production
-/// always passes [`WriteFaults::none`] (three calls that inline to
-/// nothing), so this exists purely so `host_paths.rs` tests can prove
-/// [`TempEntry`]'s `Drop` cleans up the temporary at every stage, per
-/// the plan's "private operations adapter ... fault injection only
-/// inside host_paths.rs tests" seam. Bundled into one struct (rather
-/// than three more function parameters) to stay under the arity lint.
-struct WriteFaults<W, C, R>
+/// [`atomic_write_at_with_prefix`] with a `before_rename` step, run after the
+/// temporary is completely written, chmodded and flushed and immediately before
+/// the `renameat` that publishes it.
+///
+/// The project config writer (#737) passes its final store-incarnation check
+/// here: the temporary holds the completely written, chmodded and flushed bytes
+/// (no power-loss promise — `flush` is not `fsync`) and the destination name is
+/// still the one it read under its lock. Returning `Err` leaves the temporary
+/// armed, so [`TempEntry`]'s `Drop` unlinks it and the destination keeps its old
+/// bytes, identity, mode and mtime.
+#[cfg_attr(not(test), allow(dead_code))] // the #737 project config writer
+pub(crate) fn atomic_write_at_with_prefix_and_pre_rename(
+    parent: &OwnedFd,
+    temp_prefix: &str,
+    final_name: &OsStr,
+    data: &[u8],
+    mode: u32,
+    path: &Path,
+    before_rename: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    atomic_write_with_steps(
+        Replacement {
+            parent,
+            final_name,
+            data,
+            mode,
+            display: path,
+        },
+        || random_temp_name_with_prefix(temp_prefix),
+        WriteSteps::production(),
+        before_rename,
+    )
+}
+
+/// The three operations a replacement performs on the exclusively created
+/// temporary, each a parameter instead of a direct call.
+///
+/// A caller that must prove what a *failed* write, chmod or rename leaves behind
+/// substitutes one step and runs this same algorithm, so there is one
+/// publication path: production and the fault tests cannot drift apart.
+struct WriteSteps<W, C, N>
 where
-    W: FnMut() -> Result<()>,
-    C: FnMut() -> Result<()>,
-    R: FnMut() -> Result<()>,
+    W: FnMut(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+    C: FnMut(&std::fs::File, u32) -> Result<()>,
+    N: FnMut(&OwnedFd, &OsStr, &OsStr) -> Result<()>,
 {
-    before_write: W,
-    before_chmod: C,
-    before_rename: R,
+    write: W,
+    chmod: C,
+    rename: N,
 }
 
-impl WriteFaults<fn() -> Result<()>, fn() -> Result<()>, fn() -> Result<()>> {
-    fn none() -> Self {
+type ProductionWrite = fn(&mut std::fs::File, &[u8]) -> std::io::Result<()>;
+type ProductionChmod = fn(&std::fs::File, u32) -> Result<()>;
+type ProductionRename = fn(&OwnedFd, &OsStr, &OsStr) -> Result<()>;
+
+impl WriteSteps<ProductionWrite, ProductionChmod, ProductionRename> {
+    /// `write_all`, `fchmod` to the requested mode, and the descriptor-relative
+    /// `renameat` that publishes the temporary.
+    fn production() -> Self {
         Self {
-            before_write: || Ok(()),
-            before_chmod: || Ok(()),
-            before_rename: || Ok(()),
+            write: |file, data| std::io::Write::write_all(file, data),
+            chmod: |file, mode| rfs::fchmod(file, unix_mode(mode)).map_err(|error| anyhow!(error)),
+            rename: |parent, from, to| {
+                rfs::renameat(parent, from, parent, to).map_err(|error| anyhow!(error))
+            },
         }
     }
 }
 
-fn atomic_write_with_random(
+/// One operation of a replacement injected to fail, so a caller can prove the
+/// atomicity and temporary-cleanup invariants of the real algorithm.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WriteFault {
+    /// Writes a real non-empty prefix of the bytes to the temporary, then fails
+    /// with `ENOSPC` — the shape a full filesystem produces.
+    PartialWriteThenNoSpace,
+    /// Writes the whole temporary, then the `0600` chmod fails with `EPERM`.
+    ChmodRefused,
+    /// Writes and chmods the whole temporary, then the rename fails with `EIO`.
+    RenameFailed,
+}
+
+/// [`atomic_write_at_with_prefix_and_pre_rename`] with one step failing at a
+/// fixed point, for the create-and-update fault rows of a real writer.
+#[cfg(test)]
+pub(crate) fn atomic_write_at_with_prefix_and_fault(
     parent: &OwnedFd,
+    temp_prefix: &str,
     final_name: &OsStr,
     data: &[u8],
     mode: u32,
     path: &Path,
+    fault: WriteFault,
+) -> Result<()> {
+    let steps = WriteSteps {
+        write: |file: &mut std::fs::File, data: &[u8]| match fault {
+            WriteFault::PartialWriteThenNoSpace => {
+                std::io::Write::write_all(file, &data[..data.len() / 2])?;
+                Err(std::io::Error::from_raw_os_error(libc::ENOSPC))
+            }
+            _ => std::io::Write::write_all(file, data),
+        },
+        chmod: |file: &std::fs::File, mode: u32| match fault {
+            WriteFault::ChmodRefused => {
+                Err(anyhow!(std::io::Error::from_raw_os_error(libc::EPERM)))
+            }
+            _ => rfs::fchmod(file, unix_mode(mode)).map_err(|error| anyhow!(error)),
+        },
+        rename: |parent: &OwnedFd, from: &OsStr, to: &OsStr| match fault {
+            WriteFault::RenameFailed => Err(anyhow!(std::io::Error::from_raw_os_error(libc::EIO))),
+            _ => rfs::renameat(parent, from, parent, to).map_err(|error| anyhow!(error)),
+        },
+    };
+    atomic_write_with_steps(
+        Replacement {
+            parent,
+            final_name,
+            data,
+            mode,
+            display: path,
+        },
+        || random_temp_name_with_prefix(temp_prefix),
+        steps,
+        || Ok(()),
+    )
+}
+
+fn atomic_write_with_random(
+    replacement: Replacement<'_>,
     random_name: impl FnMut() -> Result<OsString>,
 ) -> Result<()> {
-    atomic_write_with_random_and_faults(
+    atomic_write_with_steps(
+        replacement,
+        random_name,
+        WriteSteps::production(),
+        || Ok(()),
+    )
+}
+
+/// The one replacement algorithm: exclusively create a random temporary inside
+/// `parent`, write it, chmod it, flush it, run `before_rename`, and publish it
+/// with a descriptor-relative rename.
+fn atomic_write_with_steps<W, C, N>(
+    replacement: Replacement<'_>,
+    mut random_name: impl FnMut() -> Result<OsString>,
+    mut steps: WriteSteps<W, C, N>,
+    before_rename: impl FnOnce() -> Result<()>,
+) -> Result<()>
+where
+    W: FnMut(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+    C: FnMut(&std::fs::File, u32) -> Result<()>,
+    N: FnMut(&OwnedFd, &OsStr, &OsStr) -> Result<()>,
+{
+    let Replacement {
         parent,
         final_name,
         data,
         mode,
-        path,
-        random_name,
-        WriteFaults::none(),
-    )
-}
-
-/// Same replacement algorithm as [`atomic_write_with_random`], with the
-/// [`WriteFaults`] injection points described there.
-fn atomic_write_with_random_and_faults<W, C, R>(
-    parent: &OwnedFd,
-    final_name: &OsStr,
-    data: &[u8],
-    mode: u32,
-    path: &Path,
-    mut random_name: impl FnMut() -> Result<OsString>,
-    mut faults: WriteFaults<W, C, R>,
-) -> Result<()>
-where
-    W: FnMut() -> Result<()>,
-    C: FnMut() -> Result<()>,
-    R: FnMut() -> Result<()>,
-{
-    let display = path_in_line(path);
+        display,
+    } = replacement;
+    let display = path_in_line(display);
     for _ in 0..ATOMIC_WRITE_RETRIES {
         let temp_name = random_name()?;
         let fd = match rfs::openat(
@@ -1744,18 +2012,17 @@ where
             armed: true,
         };
         let mut file = fs::File::from(fd);
-        (faults.before_write)()?;
-        file.write_all(data)
+        (steps.write)(&mut file, data)
+            .map_err(|error| stage_failure(WriteStage::Write, error.into()))
             .with_context(|| format!("writing {display}"))?;
-        (faults.before_chmod)()?;
-        rfs::fchmod(&file, unix_mode(mode))
-            .map_err(|error| anyhow!(error))
+        (steps.chmod)(&file, mode)
+            .map_err(|error| stage_failure(WriteStage::Chmod, error))
             .with_context(|| format!("chmodding {display}"))?;
         file.flush()
             .with_context(|| format!("flushing {display}"))?;
-        (faults.before_rename)()?;
-        rfs::renameat(parent, &cleanup.name, parent, final_name)
-            .map_err(|error| anyhow!(error))
+        before_rename()?;
+        (steps.rename)(parent, &cleanup.name, final_name)
+            .map_err(|error| stage_failure(WriteStage::Rename, error))
             .with_context(|| format!("replacing {display}"))?;
         cleanup.armed = false;
         return Ok(());
@@ -2640,11 +2907,13 @@ mod tests {
             OsString::from(".agent-vm-tmp-collision"),
         ]);
         atomic_write_with_random(
-            &parent,
-            OsStr::new("target"),
-            b"replacement",
-            0o600,
-            Path::new("target"),
+            Replacement {
+                parent: &parent,
+                final_name: OsStr::new("target"),
+                data: b"replacement",
+                mode: 0o600,
+                display: Path::new("target"),
+            },
             || Ok(names.borrow_mut().pop().unwrap()),
         )
         .unwrap();
@@ -2668,11 +2937,13 @@ mod tests {
         fs::write(root.path().join(collision), b"occupied").unwrap();
         assert!(
             atomic_write_with_random(
-                &parent,
-                OsStr::new("target"),
-                b"replacement",
-                0o600,
-                Path::new("target"),
+                Replacement {
+                    parent: &parent,
+                    final_name: OsStr::new("target"),
+                    data: b"replacement",
+                    mode: 0o600,
+                    display: Path::new("target"),
+                },
                 || Ok(collision.to_os_string()),
             )
             .is_err()
@@ -2881,7 +3152,7 @@ mod tests {
     }
 
     #[test]
-    fn atomic_write_fault_before_write_leaves_no_temp_and_preserves_target() {
+    fn a_write_fault_leaves_no_temp_and_preserves_target() {
         let root = tempfile::tempdir().unwrap();
         let parent = rfs::open(
             root.path(),
@@ -2891,21 +3162,25 @@ mod tests {
         .unwrap();
         fs::write(root.path().join("target"), b"original").unwrap();
         let names = std::cell::RefCell::new(vec![OsString::from(".agent-vm-tmp-fault")]);
-        let err = atomic_write_with_random_and_faults(
-            &parent,
-            OsStr::new("target"),
-            b"new",
-            0o600,
-            Path::new("target"),
-            || Ok(names.borrow_mut().pop().unwrap()),
-            WriteFaults {
-                before_write: || Err(anyhow!("injected write fault")),
-                before_chmod: || Ok(()),
-                before_rename: || Ok(()),
+        let err = atomic_write_with_steps(
+            Replacement {
+                parent: &parent,
+                final_name: OsStr::new("target"),
+                data: b"new",
+                mode: 0o600,
+                display: Path::new("target"),
             },
+            || Ok(names.borrow_mut().pop().unwrap()),
+            WriteSteps::<ProductionWrite, ProductionChmod, ProductionRename> {
+                write: |_: &mut std::fs::File, _: &[u8]| {
+                    Err(std::io::Error::other("injected write fault"))
+                },
+                ..WriteSteps::production()
+            },
+            || Ok(()),
         )
         .unwrap_err();
-        assert!(err.to_string().contains("injected write fault"));
+        assert!(format!("{err:#}").contains("injected write fault"));
         assert_eq!(fs::read(root.path().join("target")).unwrap(), b"original");
         assert!(fs::read_dir(root.path()).unwrap().all(|entry| {
             !entry
@@ -2917,7 +3192,7 @@ mod tests {
     }
 
     #[test]
-    fn atomic_write_fault_before_chmod_leaves_no_temp_and_preserves_target() {
+    fn a_chmod_fault_leaves_no_temp_and_preserves_target() {
         let root = tempfile::tempdir().unwrap();
         let parent = rfs::open(
             root.path(),
@@ -2927,21 +3202,23 @@ mod tests {
         .unwrap();
         fs::write(root.path().join("target"), b"original").unwrap();
         let names = std::cell::RefCell::new(vec![OsString::from(".agent-vm-tmp-fault")]);
-        let err = atomic_write_with_random_and_faults(
-            &parent,
-            OsStr::new("target"),
-            b"new",
-            0o600,
-            Path::new("target"),
-            || Ok(names.borrow_mut().pop().unwrap()),
-            WriteFaults {
-                before_write: || Ok(()),
-                before_chmod: || Err(anyhow!("injected chmod fault")),
-                before_rename: || Ok(()),
+        let err = atomic_write_with_steps(
+            Replacement {
+                parent: &parent,
+                final_name: OsStr::new("target"),
+                data: b"new",
+                mode: 0o600,
+                display: Path::new("target"),
             },
+            || Ok(names.borrow_mut().pop().unwrap()),
+            WriteSteps::<ProductionWrite, ProductionChmod, ProductionRename> {
+                chmod: |_: &std::fs::File, _: u32| Err(anyhow!("injected chmod fault")),
+                ..WriteSteps::production()
+            },
+            || Ok(()),
         )
         .unwrap_err();
-        assert!(err.to_string().contains("injected chmod fault"));
+        assert!(format!("{err:#}").contains("injected chmod fault"));
         assert_eq!(fs::read(root.path().join("target")).unwrap(), b"original");
         assert!(fs::read_dir(root.path()).unwrap().all(|entry| {
             !entry
@@ -2953,7 +3230,7 @@ mod tests {
     }
 
     #[test]
-    fn atomic_write_fault_before_rename_leaves_no_temp_and_preserves_target() {
+    fn a_pre_rename_fault_leaves_no_temp_and_preserves_target() {
         let root = tempfile::tempdir().unwrap();
         let parent = rfs::open(
             root.path(),
@@ -2963,21 +3240,20 @@ mod tests {
         .unwrap();
         fs::write(root.path().join("target"), b"original").unwrap();
         let names = std::cell::RefCell::new(vec![OsString::from(".agent-vm-tmp-fault")]);
-        let err = atomic_write_with_random_and_faults(
-            &parent,
-            OsStr::new("target"),
-            b"new",
-            0o600,
-            Path::new("target"),
-            || Ok(names.borrow_mut().pop().unwrap()),
-            WriteFaults {
-                before_write: || Ok(()),
-                before_chmod: || Ok(()),
-                before_rename: || Err(anyhow!("injected rename fault")),
+        let err = atomic_write_with_steps(
+            Replacement {
+                parent: &parent,
+                final_name: OsStr::new("target"),
+                data: b"new",
+                mode: 0o600,
+                display: Path::new("target"),
             },
+            || Ok(names.borrow_mut().pop().unwrap()),
+            WriteSteps::production(),
+            || Err(anyhow!("injected rename fault")),
         )
         .unwrap_err();
-        assert!(err.to_string().contains("injected rename fault"));
+        assert!(format!("{err:#}").contains("injected rename fault"));
         assert_eq!(
             fs::read(root.path().join("target")).unwrap(),
             b"original",

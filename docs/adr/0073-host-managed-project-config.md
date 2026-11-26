@@ -13,6 +13,10 @@ Amended by [ADR-0074](0074-flat-config-sources.md) (#734): the project config ma
 source other files; `doctor`'s legacy note is suppressed when the in-repo file is
 sourced.
 
+Amended by [ADR-0078](0078-project-config-writer.md) (#737): the project config
+can now be written through its verified host-managed route. ADR-0078 owns the
+permanent `config.lock`, stale-save refusal and narrow root-`image` edit.
+
 ## Context
 
 agent-vm merges two TOML **tiers** into one launch catalog. The user tier is
@@ -57,8 +61,10 @@ after:  project tier = /Users/al/.config/agent-vm/projects/3f9c…e1/config.toml
 (`projects_dir`, `project_dir`, `path`), so #736 (`pins.json`), #737
 (`image set-default`) and #739 (`agent-vm config`) inherit one seam.
 
-This release only **reads**. It creates neither `projects/` nor any file in it;
-writers arrive with #737/#739.
+This release only **reads**. It creates neither `projects/` nor any file in it.
+#737 now supplies the narrow `image set-default` writer in
+[ADR-0078](0078-project-config-writer.md); #739 owns the remaining config-edit
+commands.
 
 ## Decision 2: an in-repo config is never read; `doctor` says so
 
@@ -242,10 +248,10 @@ the commands that treat it as fatal do so exactly as before.
   (Amended for #748: the project config may now declare its own top-level
   `mounts` and `[network]` through this ADR's verified read; `[mount_sets]` and
   `[egress_sets]` stay refused until #738.)
-- **#735/#736/#737/#738/#739** are not implemented here: `allow_tools`,
-  pins/`pins.json`, `image set-default` writing project config, inert sets in
-  sourced files, mount/egress set changes, and the `agent-vm config`
-  subcommand. The legacy note names `agent-vm config edit` before it exists
+- **#735/#736/#738/#739** are not implemented here: `allow_tools`,
+  pins/`pins.json`, inert sets in sourced files, mount/egress set changes, and
+  the `agent-vm config` subcommand. #737's narrow `image set-default` writer is
+  [ADR-0078](0078-project-config-writer.md). The legacy note names `agent-vm config edit` before it exists
   because #733's acceptance criteria require that wording. `sources` and
   `:trust` arrive with #734 (ADR-0074).
 

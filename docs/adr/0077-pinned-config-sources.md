@@ -9,6 +9,11 @@ Amends [ADR-0038](0038-config-dir-exposure-guard.md),
 [ADR-0076](0076-sources-tables-trust-and-allow.md). Bumps the workspace version
 to **0.8.4** inside the unreleased 0.8.x line.
 
+Amended by [ADR-0078](0078-project-config-writer.md): `image set-default` writes
+only the project config's root `image`; it does not take `pins.lock`, review,
+reset, write or record source pins. A valid config with an unapproved source can
+therefore receive that narrow edit and still fail to load under this ADR.
+
 ## Context
 
 A `trust = false` source is repository-controlled input. Its pathname may be
