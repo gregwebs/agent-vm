@@ -969,8 +969,7 @@ bash script/test/keychain-contract.sh
 ```
 
 The script refuses on a non-Darwin host and needs no arguments; CI runs it in the
-`macos-keychain-contract` job. Nothing it prints can be a credential: the
-fixtures are canaries.
+`macos` job. Nothing it prints can be a credential: the fixtures are canaries.
 
 There is no `--lib` target, so `--bin agent-vm` is required.
 
@@ -1144,13 +1143,13 @@ while ordinary `setup` intentionally creates a verification guest.
 | `cargo test --test image_pin_approval` | yes (`cargo test -p agent-vm`) | boot-free compiled-CLI approval matrix: prompt-free pull on a terminal and a pipe, removed `--yes`, frozen candidate, CAS/stale revision, S1 journal recovery, project-default establishment and pull adoption, cache-loss digest reacquisition, build/import result approval, the active image set (one-off Boot switching and retirement, a warm changed-alias return after retirement, a literal old-v2 claim then a byte-identical no-op, and committed-success warnings for an unreported checkpoint or notice). No VM evidence |
 | `cargo test --bin agent-vm -- image_pin::active image_pin::store` | yes | kernels and store: 36-row knowledge/9-pair retirement tables, strict role/scope decode, legacy Boot/Output retention, pull-uncertainty and same-target cleanup, global allocation/exhaustion/recovery, retire-reinsert ABA, and the four independent count/byte/scope capacity fixtures. No VM evidence |
 | `cargo test … -- --ignored` | **no** | keychain round-trip; operator opt-in, never ordinary CI |
-| `script/test/ci-macos-legs.sh <leg>` | yes (`macos-build-script`, `macos-keychain-contract` jobs) | the one definition of both macOS legs: pins the environment (`env -i`, `/bin/bash` 3.2, fixed `PATH`/`TMPDIR`/locale), asserts the host contract, and ends with a `ci-macos-leg …` receipt line; `--compare FILE` diffs that line against a saved receipt or a downloaded CI log, so local and CI agreeing is checked rather than assumed |
-| `script/test/keychain-contract.sh` | yes (via `ci-macos-legs.sh keychain-contract`) | the opt-in `#[ignore]`d test against the real `/usr/bin/security`, isolated to a disposable keychain in a temp dir; canaries only |
+| `script/test/ci-legs.sh <leg>` | yes (`build-script`, `macos` jobs) | the one definition of the legs: pins the environment (`env -i`, a pinned `/bin/bash`, fixed `PATH`/`TMPDIR`/locale), asserts the host contract each leg needs, and ends with a `ci-leg …` receipt line; `--compare FILE` diffs that line against a saved receipt or a downloaded CI log, so local and CI agreeing is checked rather than assumed |
+| `script/test/keychain-contract.sh` | yes (via `ci-legs.sh keychain-contract`) | the opt-in `#[ignore]`d test against the real `/usr/bin/security`, isolated to a disposable keychain in a temp dir; canaries only |
 | `AGENT_VM_E2E_SECRETSPEC=/opt/homebrew/bin/secretspec cargo test -p agent-vm --test config_launch_driven a_real_secretspec_serve_round_trip -- --ignored --exact` | **no** | the real `secretspec` binary as-is (no chmod/chown/copy/reinstall); isolated `HOME`, a manifest inside the test harness's own `TempDir`, and — for every command the test runs itself — a cleared environment repopulated with only `HOME`, `PATH=/usr/bin:/bin` and `XDG_{CONFIG,DATA,STATE,CACHE}_HOME` under that `HOME`, so a developer's `SECRETSPEC_*`, `XDG_*` and real audit store are never consulted; absent the variable the test refuses to run rather than auto-detecting an install |
 | `script/test/single-binary-contract.sh` | yes (`ci.yml`) | fake payload; lone copy, reuse, concurrency, tamper, unwritable, rejected-launch state, and `image show` unpacking nothing (C12); the only `embedded-runtime` clippy pass, which is what lints the payload build module |
 | `cargo test --test image_show` | yes (`cargo test -p agent-vm`) | boot-free black-box `image show` matrix: precedence, provenance, damaged/unused fallback, escaping, help/argument surface, and no runtime/cache/state/network observation. No VM evidence |
 | `script/test/non-utf8-home-rows.sh` | yes (`ci.yml`, shard 0) | runs the two absolute non-UTF-8 `HOME` rows uncaptured, where libtest's capture would otherwise hide a `SKIPPED` line behind `ok`, and fails if either stops running; they fail rather than skip on Linux, which is the only host whose filesystems accept those names |
-| `script/test/build-workflow.sh` | yes (via `ci-macos-legs.sh build-script`) | fake-plutil bundle seam, no VM/image sources |
+| `script/test/build-workflow.sh` | yes (via `ci-legs.sh build-script`, on Linux) | fake-plutil bundle seam, no VM/image sources; host-agnostic, since every tool it drives is a fixture |
 | `script/test/ci-contracts.sh` | yes | runtime provenance, shell guards, offline pin/negative controls, Chrome launcher-path agreement and e2e dispatch contracts |
 | `script/test/persisted-network-contract.sh` | yes (`ci-contracts.sh`) | host-only snippet controls, checker P1–P5 and live-shell P6–P10; no native evidence |
 | `script/test/build-provenance-contract.sh` | yes (`ci-contracts.sh`) | real Cargo/Git build-identity controls B1–B19; no native evidence |
@@ -1219,12 +1218,21 @@ A `main` push is never cancelled, so every landed commit keeps its own run.
 One job is one sum of its steps, so `ci.yml`'s legs run as separate jobs:
 `contracts` (the pre-build gate), `test` (one job per shard), `lint` (fmt,
 clippy, the single-binary contract and, on a `main` push only, the release
-build), `macos-build-script` (toolchain-free, fake-tool build-script tests) and
-`macos-keychain-contract` (the real-`security` keychain contract). `build-and-test`
+build), `build-script` (the toolchain-free, fake-tool macOS build-script tests,
+which need no macOS and run on Linux) and `macos` (the real-`security` keychain
+contract, the Swift notification helper and the harness checks — every leg that
+actually consults the host). `build-and-test`
 aggregates them and is the
 one check to require on a branch; it fails if any leg did. The release build
 is `main`-only because nothing in CI consumes `target/release/agent-vm`;
 `cargo check --release --tests` still runs on every commit.
+
+`macos` is deliberately **one** job: hosted macOS runner capacity is what this
+workflow cannot obtain ([#593](https://github.com/gregwebs/agent-vm/issues/593),
+[#665](https://github.com/gregwebs/agent-vm/issues/665)), and a leg that waits
+15 minutes is cancelled before its first step runs. One job per commit is one
+request instead of two, and `build-and-test` names it when the wait ends badly.
+Add a step to that job rather than a job of its own for the same reason.
 
 Keep the prefix for pre-PR branches. Opening a PR *from* a `ci/` branch brings
 back exactly the duplicate the prefix exists to avoid — one run for the `push`,
