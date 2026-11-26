@@ -203,21 +203,27 @@ jobs:
       - name: Check release tests
         run: cargo check --release -p agent-vm --tests
 
-  # macOS is a first-class supported host (script/build/macos.sh,
-  # macos-build.md) but a full libkrunfw/msb build is too slow for per-PR
-  # CI (it's covered separately in release-npm.yml). This leg proves the
-  # the pin's own logic — the toolchain-version parsing, floor guard, and
-  # rustup invocation shape — runs correctly on the platform that carries
-  # it, without paying for a real toolchain/VM build: build-workflow.sh
-  # exercises script/build/macos.sh entirely against fake `rustc`/`cargo`/
-  # `rustup` on PATH (see the script's make_fixture), so it needs no Rust
-  # toolchain install step at all.
-  macos-build-script:
-    runs-on: macos-latest
-    # Bounds a leg that hangs (this one needs 24s). It does not bound the queue:
-    # a job waiting for a macOS runner is cancelled by the platform at its own
-    # unreported limit (15 minutes once, 21 the next time), with no step having
-    # run. `build-and-test` is what makes that legible, by naming the leg.
+  # The macOS build script's own logic: the toolchain-version parsing, the floor
+  # guard and the rustup invocation shape. `build-workflow.sh` exercises
+  # `script/build/macos.sh` entirely against fake `rustc`/`cargo`/`rustup` on
+  # `PATH`, inside a fixture repository it builds itself (see that script's
+  # `make_fixture`), so this leg needs no Rust toolchain step and no macOS.
+  #
+  # It ran on `macos-latest` until #665: 44 seconds of work, behind whatever wait
+  # a hosted macOS runner took, and five times in one week that wait ended in the
+  # platform cancelling the job before its first step. The leg reddened
+  # `build-and-test` for a runner it never needed, so it runs on Linux now --
+  # measured on ubuntu 24.04, where the BSD-form `stat` probes fall through to
+  # the GNU form exactly as the script's own portability comment intends.
+  #
+  # What a Linux run cannot answer: on macOS this leg ran under `/bin/bash` 3.2,
+  # so a bash-4 construct in the exercised script failed here before it reached a
+  # macOS user. `ci-legs.sh` still runs the leg under a pinned interpreter and
+  # records it in the receipt, a developer on macOS still gets 3.2, and #667 owns
+  # the rest.
+  build-script:
+    runs-on: ubuntu-latest
+    # Bounds a leg that hangs (this one needs 44s).
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -225,31 +231,25 @@ jobs:
         with:
           persist-credentials: false
 
-      # Through ci-macos-legs.sh, which is also what a developer runs: one
-      # definition of the leg, its pinned environment and its receipt, so local
-      # and CI cannot drift (#662's follow-up).
+      # Through ci-legs.sh, which is also what a developer runs: one definition
+      # of the leg, its pinned environment and its receipt, so local and CI
+      # cannot drift (#662's follow-up).
       - name: Run macOS build script workflow tests
-        run: bash script/test/ci-macos-legs.sh build-script
+        run: bash script/test/ci-legs.sh build-script
 
-      # The notification helper is Swift only, so this needs no Rust toolchain:
-      # it compiles the real source, stamps and lints its `Info.plist`, signs it
-      # ad-hoc and executes `--version`/`--check-bundle` inside a temp bundle
-      # (#501 slice 4). It never touches an installed bundle or LaunchServices.
-      - name: Run the notification helper contract
-        run: bash script/test/ci-macos-legs.sh notifier-contract
-
-  # The real `/usr/bin/security` contract for the keychain host credential
-  # location (#497, ADR-0056), plus the harness checks macOS would otherwise
-  # never run (ADR-0072). Its own job because it needs a Rust toolchain and a
-  # real build, while `macos-build-script` stays toolchain-free; the test itself is
-  # isolated to a disposable keychain in a temp dir, so a shared runner is fine.
-  macos-keychain-contract:
+  # Every leg that genuinely consults macOS. They share one job because hosted
+  # macOS capacity is the scarce thing (#593, #665): a job waiting for a runner is
+  # cancelled by the platform at its own unreported limit -- 15m01s, no step run,
+  # five times in one week -- so two macOS jobs per commit is two independent
+  # chances to lose the run, and the second one buys nothing but a leg that
+  # proves itself while the other never starts.
+  #
+  # The 20 minutes below bound a wedged build: a cold cache builds the workspace
+  # for ~8 minutes before either Rust test runs (7m17s and 8m37s observed), which
+  # is what #710/#711 raised this to. Nothing here bounds or reports a starved
+  # queue; `build-and-test` does, by naming this job.
+  macos:
     runs-on: macos-latest
-    # A cold cache builds the workspace for ~8 minutes before either test runs
-    # (7m17s and 8m37s observed), and the harness step builds on top of it, so
-    # 10 minutes cancelled this leg at 10m12s (#710, #711). This still bounds a
-    # wedged build; a starved queue is bounded by nothing here and is reported by
-    # `build-and-test`, which names the leg instead of the run.
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -257,6 +257,16 @@ jobs:
         with:
           submodules: recursive
           persist-credentials: false
+
+      # The notification helper is Swift only, so it needs neither the toolchain
+      # nor the cargo cache below: it compiles the real source, stamps and lints
+      # its `Info.plist`, signs it ad-hoc and executes `--version`/
+      # `--check-bundle` inside a temp bundle (#501 slice 4). It never touches an
+      # installed bundle or LaunchServices. First, because 13 seconds of real
+      # `swiftc`/`codesign`/`plutil` should fail a run before eight minutes of
+      # build gets the chance to.
+      - name: Run the notification helper contract
+        run: bash script/test/ci-legs.sh notifier-contract
 
       - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1 (2026-08-05)
@@ -269,33 +279,35 @@ jobs:
           cache-all-crates: "true"
           cache-workspace-crates: "true"
 
+      # The real `/usr/bin/security` contract for the keychain host credential
+      # location (#497, ADR-0056). The test is isolated to a disposable keychain
+      # in a temp dir, so a shared runner is fine.
       - name: Real `security` contract (disposable keychain)
-        run: bash script/test/ci-macos-legs.sh keychain-contract
+        run: bash script/test/ci-legs.sh keychain-contract
 
       # ADR-0072 makes the test tooling Rust, so the harness has to build and pass
       # on macOS too, and not only on the Linux `contracts` job. It rides in this
-      # job because that job already pays for the toolchain and the submodules; a
-      # third macOS job would spend a runner on a 30-second cargo test.
+      # job because the job already pays for the toolchain and the submodules.
       - name: Harness checks
-        run: bash script/test/ci-macos-legs.sh harness
+        run: bash script/test/ci-legs.sh harness
 
   # The single check to require on a branch. Every leg above is independent, so
-  # this job only aggregates them — and it keeps the name the pre-split workflow
+  # this job only aggregates them -- and it keeps the name the pre-split workflow
   # used, so a branch protection rule that names it needs no change. `always()`
   # is what lets it run when a leg failed (a job with `needs` is otherwise
   # skipped, and a skipped required check never turns red).
   build-and-test:
     if: always()
-    needs: [contracts, test, lint, macos-build-script, macos-keychain-contract]
+    needs: [contracts, test, lint, build-script, macos]
     runs-on: ubuntu-latest
     steps:
       # No step condition on purpose. `contains(needs.*.result, 'cancelled')`
       # did not fire for a leg that was cancelled before a runner ever picked it
-      # up: on #664 and on this change's own run, `macos-keychain-contract` was
+      # up: on #664 and on that change's own run, `macos-keychain-contract` was
       # `cancelled` while this job reported success, so the only required check
       # went green under a red run. The needs context calls that state
       # `abandoned` -- a fourth value the expression never listed -- and this job
-      # printed it, named both legs and failed, on the same starvation.
+      # printed it, named the leg and failed, on the same starvation (#665).
       - name: Fail when a leg did not pass
         env:
           # Through the environment, not interpolated into `run`: the needs

@@ -134,8 +134,8 @@ treated the same way, so `doctor` stays byte-identical on a host without the ite
 
 Established by a test against the real `/usr/bin/security` in a **disposable**
 keychain (never the login keychain, never the default search list, never the real
-item). It runs in the `macos-keychain-contract` CI job
-(`script/test/keychain-contract.sh`) and stays opt-in locally: the test is
+item). It runs in the `macos` CI job (`script/test/keychain-contract.sh`, through
+`script/test/ci-legs.sh`) and stays opt-in locally: the test is
 `#[ignore]`d and only runs with `AGENT_VM_REAL_KEYCHAIN_CONTRACT=1`.
 
 | Fact | Measured behaviour |
