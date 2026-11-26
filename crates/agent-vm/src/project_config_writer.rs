@@ -2701,9 +2701,12 @@ mod tests {
         let displaced = fixture.store_dir().with_extension("displaced");
         std::fs::rename(fixture.store_dir(), &displaced).unwrap();
         // A whole new store, with its own lock: the same path, a different store.
-        std::fs::create_dir(fixture.store_dir()).unwrap();
-        std::fs::set_permissions(fixture.store_dir(), std::fs::Permissions::from_mode(0o700))
-            .unwrap();
+        // Built beside the path and renamed over it, so its inode existed while
+        // the displaced one did and cannot be a reused number.
+        let replacement = fixture.store_dir().with_extension("replacement");
+        std::fs::create_dir(&replacement).unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::rename(&replacement, fixture.store_dir()).unwrap();
         std::fs::write(fixture.config(), "image = \"example.com/peer:4\"\n").unwrap();
         std::fs::write(fixture.lock(), b"").unwrap();
 
@@ -2731,9 +2734,14 @@ mod tests {
         let snapshot = store.snapshot().unwrap();
         let before = snapshot_state(&fixture);
 
-        std::fs::remove_file(fixture.lock()).unwrap();
-        std::fs::write(fixture.lock(), b"").unwrap();
-        std::fs::set_permissions(fixture.lock(), std::fs::Permissions::from_mode(0o600)).unwrap();
+        // Build the replacement while the old lock still exists, then rename it
+        // over: two files that existed together cannot share an inode, so the
+        // fixture proves a *different* lock rather than depending on whether the
+        // filesystem reuses the number of the one just unlinked.
+        let replacement = fixture.store_dir().join("lock.replacement");
+        std::fs::write(&replacement, b"").unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::rename(&replacement, fixture.lock()).unwrap();
 
         assert_eq!(
             store.save(&snapshot, NEW.as_bytes()).unwrap(),

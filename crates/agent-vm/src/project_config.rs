@@ -291,7 +291,12 @@ pub(crate) fn resolves_inside_project(
 /// root-owned sticky parent is judged on its child by the caller, which is why that
 /// clause is not part of this predicate.
 pub(crate) fn ancestry_controlled(facts: &crate::host_paths::OpenedDirFacts, euid: u32) -> bool {
-    (facts.uid == euid || facts.uid == 0) && facts.mode & 0o022 == 0
+    // A sticky world-writable directory (a shared `/tmp`) is controlled in the
+    // sense that matters: others cannot replace an entry they do not own inside
+    // it. Without the sticky bit, a group- or world-writable parent can swap the
+    // entry named below it, so it is refused.
+    let sticky = facts.mode & 0o1000 != 0;
+    (facts.uid == euid || facts.uid == 0) && (facts.mode & 0o022 == 0 || sticky)
 }
 
 /// The highest ancestor of `path` that the reader's ancestry rule refuses, walking
