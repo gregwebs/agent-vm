@@ -82,8 +82,8 @@ pub(crate) use presentation::ActiveImages;
 #[cfg(test)]
 pub(crate) use project_default::establishment as establishment_for_tests;
 pub(crate) use project_default::{
-    DefaultSlot, HostDefaultSet, InvokingProject, ObservedDefaults, ProjectDefaultChange,
-    load_default_slot, observe_defaults, set_default,
+    DefaultSlot, ObservedDefaults, ProjectDefaultChange, acquire_for_project_default,
+    load_default_slot, observe_defaults, preflight_project_default,
 };
 pub(crate) use publication::{approve_published, publication_preflight};
 pub(crate) use refresh::{
@@ -402,18 +402,6 @@ impl DefaultAction {
     }
 }
 
-/// What one transaction did to the retained fallback.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DefaultChange {
-    /// The fallback is byte-for-byte unchanged, including a write-once adoption
-    /// that found an existing record.
-    Unchanged,
-    /// An absent fallback was initialized.
-    Initialized,
-    /// An existing fallback was replaced with different content.
-    Replaced,
-}
-
 /// One prepared selection: what the SDK is given, the environment facts of
 /// exactly that content, and the shared publication barrier the create needs.
 ///
@@ -679,14 +667,6 @@ pub(crate) fn observe_refresh_scope(project: &ProjectDir) -> Result<RefreshScope
     store::Store::host()?.refresh_scope(&scope)
 }
 
-fn same_canonical(left: &str, right: &str) -> Result<bool> {
-    let canonical = |text: &str| {
-        CanonicalOciReference::parse(text)
-            .map_err(|_| anyhow!("the default boot image reference is not canonical"))
-    };
-    Ok(canonical(left)? == canonical(right)?)
-}
-
 fn oci_target(text: &str) -> Result<OciTarget> {
     OciTarget::parse(text).map_err(|_| {
         anyhow!(
@@ -773,7 +753,7 @@ pub(crate) enum Rendering {
     /// A launch, setup or refresh selection: the label decides.
     Selection,
     /// `image set-default`'s typed target: closed stage text only, plus the
-    /// retained-default guarantee the command promises.
+    /// guarantee the command promises — it changed no stored selection.
     Explicit,
     /// An explicit build/import reading back what it just published: the
     /// explicit chain, and never the import hint — the command *is* the import.
@@ -790,7 +770,7 @@ pub(crate) fn render_failure(
 ) -> anyhow::Error {
     if rendering == Rendering::Explicit {
         return anyhow!(
-            "{}; this command did not change the retained default",
+            "{}; this command did not change the project boot image",
             error.redacted_message()
         );
     }
@@ -1308,7 +1288,7 @@ mod tests {
         assert!(text.contains("publication is uncertain"), "{text}");
         assert!(text.contains("check the cache and retry"), "{text}");
         assert!(!text.contains("private source"), "{text}");
-        // `set-default`'s explicit rendering states the retained-default
+        // `set-default`'s explicit rendering states the "nothing changed"
         // guarantee and names neither its target nor a source chain.
         let explicit = render_failure(
             &label,
@@ -1318,7 +1298,7 @@ mod tests {
         );
         let text = format!("{explicit:#}");
         assert!(
-            text.contains("did not change the retained default"),
+            text.contains("did not change the project boot image"),
             "{text}"
         );
         assert!(!text.contains("private.example"), "{text}");

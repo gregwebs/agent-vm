@@ -5,6 +5,7 @@ use microsandbox_image::{GlobalCache, PullOptions, PullPolicy, Reference, Regist
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
@@ -18,6 +19,8 @@ mod fake_msb;
 mod image_archive;
 #[path = "support/oci_registry.rs"]
 mod oci_registry;
+#[path = "support/source_pins.rs"]
+mod source_pins;
 mod support;
 use acquisition_gate::{
     AcquisitionGate, AcquisitionStage, GateReply, Peer, assert_guard_free, assert_guard_held,
@@ -166,17 +169,69 @@ impl Harness {
     fn approve_ambient_fixture(&self, target: &str) {
         success(&self.refresh_as_ambient(target));
     }
-    /// A pin for `target` **and** a host record naming it: S1's two set-default
-    /// side effects, as the two explicit commands that write them now (#541).
+    /// An approval for `target` and a project config naming it: the two records a
+    /// fixture that wants "approved and selected" seeds now (#737). `set-default`
+    /// writes the project config and no approval, so the approval is its own step.
     fn pin_and_set_default(&self, target: &str) {
         self.approve_ambient_fixture(target);
         success(&self.set_default(target));
     }
+    /// The host-wide retained record (`default-image.json`). Read still; written
+    /// here only as a fixture, because `image set-default` no longer writes it
+    /// (#737): the default tier seeds it from a recommendation selection.
     fn record(&self) -> PathBuf {
         self.home.join(".config/agent-vm/default-image.json")
     }
+    /// The project config `image set-default` writes, keyed by the canonical
+    /// checkout the harness runs in.
+    fn project_config(&self) -> PathBuf {
+        support::project_config_path(&self.home, self.root.path())
+    }
+    /// The retained default's image: the default tier's record, which the
+    /// recommendation-seeding and adoption paths still write.
     fn selected(&self) -> String {
         serde_json::from_slice::<serde_json::Value>(&fs::read(self.record()).unwrap()).unwrap()["image"].as_str().unwrap().to_owned()
+    }
+    /// The root `image` of the project config: what `image set-default` saves and
+    /// what `image show` reports as `Source: project config`.
+    fn saved(&self) -> String {
+        let text = fs::read_to_string(self.project_config()).expect("the project config exists");
+        let table: toml::Table = toml::from_str(&text).expect("the project config is valid TOML");
+        table["image"]
+            .as_str()
+            .expect("the project config has a root image")
+            .to_owned()
+    }
+    /// Seed the host's retained default directly: a fixture for the default tier,
+    /// which `image set-default` stopped writing in #737. The approval and the
+    /// cached content are seeded separately when a row needs them.
+    fn retain_host_default(&self, pin: &str) -> Vec<u8> {
+        let bytes = format!("{{\"image\":\"{pin}\",\"version\":1}}\n").into_bytes();
+        fs::create_dir_all(self.record().parent().unwrap()).unwrap();
+        fs::write(self.record(), &bytes).unwrap();
+        bytes
+    }
+    /// An approval for `target`, its cached content, and the retained host record
+    /// naming it: what S1's single `set-default` used to leave behind, now three
+    /// explicit fixture steps because this command writes only the project config.
+    fn pin_and_retain_host_default(&self, target: &str) -> Vec<u8> {
+        self.approve_ambient_fixture(target);
+        self.retain_host_default(target)
+    }
+    /// A project-owned `trust = false` source together with a **real** approved
+    /// source-pin store, written by the independent on-disk oracle. Returns the
+    /// source file and the store directory, so a row can prove the config writer
+    /// neither reads it for approval nor writes it.
+    fn approved_source(&self, name: &str) -> (PathBuf, PathBuf) {
+        let source = self.root.path().join(name);
+        fs::write(
+            &source,
+            "[[tools]]\nname = \"repo-tool\"\ncommand = \"/bin/true\"\n",
+        )
+        .unwrap();
+        let hash = source_pins::approve(&self.home, self.root.path(), &source);
+        assert_eq!(hash.len(), 64, "a real approval hash");
+        (source, source_pins::store_dir(&self.home, self.root.path()))
     }
     fn cache(&self) -> GlobalCache {
         GlobalCache::new(&self.state.join("msb-home/cache")).unwrap()
@@ -260,6 +315,19 @@ fn non_cache_state(h: &Harness) -> BTreeMap<PathBuf, Option<u64>> {
     out
 }
 
+/// One file's bytes **and** inode, or `None` when it does not exist.
+///
+/// A refused or no-op write must leave both: bytes alone would pass over a
+/// replacement with identical content, which is exactly what a re-serialising or
+/// rename-happy writer produces.
+fn file_facts(path: &Path) -> Option<(Vec<u8>, u64)> {
+    match fs::read(path) {
+        Ok(bytes) => Some((bytes, fs::metadata(path).unwrap().ino())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("reading {} failed: {error}", path.display()),
+    }
+}
+
 fn complete(cache: &GlobalCache, pin: &str) {
     assert!(
         Registry::pull_cached(
@@ -293,7 +361,10 @@ fn pin_store_bytes(home: &Path) -> std::io::Result<Option<Vec<u8>>> {
 }
 
 struct Snapshot {
-    record: Vec<u8>,
+    /// The host-wide retained record, absent told apart from every other state.
+    record: Option<Vec<u8>>,
+    /// The project config `image set-default` writes, with the same rule.
+    project: Option<Vec<u8>>,
     pins: Option<Vec<u8>>,
     files: BTreeMap<PathBuf, (u64, String)>,
 }
@@ -302,13 +373,23 @@ impl Snapshot {
         let cache = h.cache();
         let (metadata, others) = artifact_paths(&cache, pin, &image.written);
         Self {
-            record: fs::read(h.record()).unwrap(),
+            record: fs::read(h.record()).ok(),
+            project: fs::read(h.project_config()).ok(),
             pins: pin_store_bytes(&h.home).expect("the approval store could not be read"),
             files: hash_paths(std::iter::once(metadata).chain(others)),
         }
     }
     fn unchanged(&self, h: &Harness, pin: &str) {
-        assert_eq!(fs::read(h.record()).unwrap(), self.record);
+        assert_eq!(
+            fs::read(h.record()).ok(),
+            self.record,
+            "the retained default must keep its exact bytes or stay absent"
+        );
+        assert_eq!(
+            fs::read(h.project_config()).ok(),
+            self.project,
+            "the project config must keep its exact bytes or stay absent"
+        );
         assert_eq!(
             pin_store_bytes(&h.home).expect("the approval store could not be read"),
             self.pins,
@@ -409,8 +490,12 @@ fn cached_manifest_digest(cache: &GlobalCache, reference: &str) -> String {
     metadata["manifest_digest"].as_str().unwrap().to_owned()
 }
 
+/// #737's central row: the saved value is the **reference** the user typed, the
+/// approval store and the retained host record are untouched, the cache keeps the
+/// content each target validated, and an already-equal hand-formatted config is
+/// published nowhere at all.
 #[test]
-fn explicit_tag_and_index_set_default_replace_the_host_record_and_preserve_old_artifacts() {
+fn explicit_tag_and_index_set_default_save_the_project_config_and_preserve_old_artifacts() {
     let h = Harness::new();
     let server = Server::new();
     let a = h.image(&ArchiveSpec::default());
@@ -427,16 +512,23 @@ fn explicit_tag_and_index_set_default_replace_the_host_record_and_preserve_old_a
     let pin_a = server.image("private-repo", "moving", &a);
     let tag = format!("{}/private-repo:moving", server.host);
     success(&h.set_default(&tag));
-    assert_eq!(h.selected(), pin_a);
+    // The tag is what is saved, not the digest it resolved to (D3): a later
+    // launch resolves it again, and an approval of that tag still wins.
+    assert_eq!(h.saved(), tag);
     complete(&h.cache(), &pin_a);
     let snapshot = Snapshot::take(&h, &pin_a, &a);
     let pin_b = server.image("private-repo", "moving", &b);
-    // The tag moves A -> B. This row is about the host record: set-default
-    // replaces it with the validated B child and writes no approval (#541, R5).
+    // The tag moves A -> B. This row is about the saved reference: set-default
+    // replaces the project config's root image and writes no approval, so the
+    // retained record and the approval store keep their exact bytes.
     success(&h.set_default(&tag));
-    assert_eq!(h.selected(), pin_b);
+    assert_eq!(h.saved(), tag);
     complete(&h.cache(), &pin_b);
-    // Compare the A inventory while permitting the intended record change.
+    assert!(
+        !h.record().exists(),
+        "set-default writes no retained default"
+    );
+    // Compare the A inventory while permitting the intended config change.
     snapshot.artifacts_unchanged(&h, &pin_a);
     server.image("private-repo", "foreign", &c);
     let mut index: serde_json::Value = serde_json::from_slice(&b.index).unwrap();
@@ -446,18 +538,47 @@ fn explicit_tag_and_index_set_default_replace_the_host_record_and_preserve_old_a
     let index_pin = server.index("private-repo", "multi", serde_json::to_vec(&index).unwrap());
     assert_ne!(index_pin, pin_b);
     success(&h.set_default(&index_pin));
-    assert_eq!(h.selected(), pin_b);
-    success(&h.set_default(&format!(
+    assert_eq!(
+        h.saved(),
+        index_pin,
+        "an index reference is saved as written"
+    );
+    complete(&h.cache(), &pin_b);
+    // A digest-spelled target is saved exactly as accepted (D4: the validated
+    // REF, never the resolved digest); the digest is what governs the resolution,
+    // so the redundant tag is simply kept.
+    let digest_spelled = format!(
         "{}/private-repo:ignored@{}",
         server.host, b.written.manifest_digest
-    )));
-    let formatted = format!("{{ \"image\": \"{pin_b}\", \"version\": 1 }}\n");
-    fs::write(h.record(), &formatted).unwrap();
+    );
+    success(&h.set_default(&digest_spelled));
+    assert_eq!(h.saved(), digest_spelled);
+    // An existing config that already spells the same reference is not
+    // published: the bytes, the inode and the mtime stay.
+    let formatted = format!("# kept comment\nimage = \"{pin_b}\"\n");
+    fs::write(h.project_config(), &formatted).unwrap();
+    let before = fs::metadata(h.project_config()).unwrap();
+    let identity = (before.ino(), before.mtime(), before.mtime_nsec());
     success(&h.set_default(&pin_b));
-    assert_eq!(fs::read(h.record()).unwrap(), formatted.as_bytes());
+    assert_eq!(fs::read(h.project_config()).unwrap(), formatted.as_bytes());
+    let after = fs::metadata(h.project_config()).unwrap();
+    assert_eq!(
+        (after.ino(), after.mtime(), after.mtime_nsec()),
+        identity,
+        "an unchanged reference publishes nothing"
+    );
+    // `doctor` makes no registry request either, and it reports the selection
+    // rather than only being tolerated: its own oracle is
+    // `doctor_reports_the_saved_reference_from_the_project_config`.
     let count = server.count();
-    let _ = h.run(&["doctor"]);
+    let doctor = h.run(&["doctor"]);
     assert_eq!(server.count(), count);
+    assert!(doctor.status.success(), "{}", delivered(&doctor));
+    assert!(
+        delivered(&doctor).contains(&format!("selected (without --image): {pin_b}")),
+        "{}",
+        delivered(&doctor)
+    );
     h.no_fallback();
 }
 
@@ -509,7 +630,7 @@ fn every_native_failure_preserves_a_record_metadata_and_artifact_hashes() {
         );
         assert!(
             String::from_utf8_lossy(&output.stderr)
-                .contains("this command did not change the retained default")
+                .contains("this command did not change the project boot image")
         );
         before.unchanged(&h, &pin_a);
         if spec.config_platform == PlatformSpec::Foreign {
@@ -587,17 +708,22 @@ fn every_native_failure_preserves_a_record_metadata_and_artifact_hashes() {
         ..Default::default()
     });
     let pin_b = server.image("images", "b", &b);
-    fs::remove_file(h.record().with_file_name("default-image.lock")).unwrap();
-    fs::create_dir(h.record().with_file_name("default-image.lock")).unwrap();
+    // The project config's own coordination inode is verified before anything is
+    // acquired: an unusable one refuses the command and preserves every byte,
+    // including the cache this time (D2, D8).
+    let config_lock = h.project_config().with_file_name("config.lock");
+    fs::remove_file(&config_lock).unwrap();
+    fs::create_dir(&config_lock).unwrap();
     let before = Snapshot::take(&h, &pin_a, &a);
+    let requests = server.count();
     let out = h.set_default(&pin_b);
     assert_eq!(out.status.code(), Some(1));
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("image pin authority"),
-        "a failed default transaction names the authority: {}",
+        String::from_utf8_lossy(&out.stderr).contains("config.lock"),
+        "a refused config write names the coordination inode: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    complete(&h.cache(), &pin_b);
+    assert_eq!(server.count(), requests, "the refusal precedes acquisition");
     before.unchanged(&h, &pin_a);
 }
 
@@ -661,19 +787,32 @@ fn actual_usage_health_and_config_boundaries_do_not_choose_set_default_target() 
             .args(["image", "set-default", "--image", &pin]),
     );
     success(&out);
-    assert_eq!(h.selected(), pin);
+    assert_eq!(h.saved(), pin);
     assert_eq!(fs::read(&user).unwrap(), b"broken = [");
+    // D5: the obsolete host-wide record is *ignored* — this command writes no
+    // approval and no default, so nothing needs it — and it is never repaired.
+    // A damaged record that used to refuse the old setter no longer can.
     for kind in ["malformed", "symlink"] {
-        fs::remove_file(h.record()).unwrap();
-        if kind == "malformed" {
+        let _ = fs::remove_file(h.record());
+        fs::create_dir_all(h.record().parent().unwrap()).unwrap();
+        let previously = if kind == "malformed" {
             fs::write(h.record(), b"private damaged bytes").unwrap();
+            b"private damaged bytes".to_vec()
         } else {
             std::os::unix::fs::symlink(&user, h.record()).unwrap();
+            fs::read(&user).unwrap()
+        };
+        success(&h.set_default(&pin));
+        assert_eq!(h.saved(), pin, "{kind}: the project image was still saved");
+        if kind == "malformed" {
+            assert_eq!(fs::read(h.record()).unwrap(), previously, "{kind}");
+        } else {
+            assert!(
+                fs::symlink_metadata(h.record()).unwrap().is_symlink(),
+                "{kind}: the record is left exactly as it was found"
+            );
+            assert_eq!(fs::read(&user).unwrap(), previously, "{kind}");
         }
-        let count = server.count();
-        assert_eq!(h.set_default(&pin).status.code(), Some(1));
-        assert_eq!(server.count(), count);
-        assert!(fs::symlink_metadata(h.record()).is_ok());
     }
     h.no_fallback();
 }
@@ -759,7 +898,7 @@ fn shared_cache_redirect_and_broken_completion_output_keep_success() {
     complete(&GlobalCache::new(&shared).unwrap(), &pin);
     // Persisted native redirect is used after removing the opt-in env flag.
     success(&h.set_default(&pin));
-    assert_eq!(h.selected(), pin);
+    assert_eq!(h.saved(), pin);
     // A closed completion-notice pipe must not fail a real *publication*. With
     // stderr dropped, an actual A -> B change must still exit 0, commit exactly
     // B, and leave a complete native B cache. A same-pin retry is only an
@@ -782,13 +921,15 @@ fn shared_cache_redirect_and_broken_completion_output_keep_success() {
         .unwrap();
     drop(child.stderr.take());
     assert!(collect_bounded(child).status.success());
-    assert_eq!(h.selected(), pin_b);
+    assert_eq!(h.saved(), pin_b);
     complete(&GlobalCache::new(&shared).unwrap(), &pin_b);
     // The retained same-pin retry stays byte-identical: B was published once,
-    // and re-acquiring B does not reformat the record.
-    let formatted = fs::read(h.record()).unwrap();
+    // and re-acquiring B reformats neither the config bytes nor the inode.
+    let formatted = fs::read(h.project_config()).unwrap();
+    let inode = fs::metadata(h.project_config()).unwrap().ino();
     success(&h.set_default(&pin_b));
-    assert_eq!(fs::read(h.record()).unwrap(), formatted);
+    assert_eq!(fs::read(h.project_config()).unwrap(), formatted);
+    assert_eq!(fs::metadata(h.project_config()).unwrap().ino(), inode);
     h.no_fallback();
 }
 
@@ -808,7 +949,6 @@ fn set_default_preserves_all_overrides_and_default_diagnostic_redaction() {
     fs::write(&user, "image = \"localhost:1/user:tag\"\n").unwrap();
     fs::write(&project, "image = \"localhost:1/project:tag\"\n").unwrap();
     let user_bytes = fs::read(&user).unwrap();
-    let project_bytes = fs::read(&project).unwrap();
     success(&bounded(
         h.command()
             .current_dir(&project_dir)
@@ -816,8 +956,20 @@ fn set_default_preserves_all_overrides_and_default_diagnostic_redaction() {
             .env("RUST_LOG", "trace")
             .args(["image", "set-default", "--image", &pin]),
     ));
+    // D8's narrow edit: the user config is untouched, and the project config keeps
+    // every other byte while its root `image` value becomes the saved reference.
     assert_eq!(fs::read(&user).unwrap(), user_bytes);
-    assert_eq!(fs::read(&project).unwrap(), project_bytes);
+    assert_eq!(
+        fs::read(&project).unwrap(),
+        format!("image = \"{pin}\"\n").as_bytes(),
+        "only the root image value changes"
+    );
+    assert!(
+        !h.record().exists(),
+        "set-default writes no host-wide default any more"
+    );
+    // The project tier now names the reference this command saved, so an
+    // unprefixed launch selects that and not the value the fixture wrote over it.
     for (cli, ambient, expected) in [
         (
             Some("localhost:1/cli:tag"),
@@ -825,7 +977,7 @@ fn set_default_preserves_all_overrides_and_default_diagnostic_redaction() {
             "localhost:1/cli:tag",
         ),
         (None, Some("localhost:1/env:tag"), "localhost:1/env:tag"),
-        (None, None, "localhost:1/project:tag"),
+        (None, None, pin.as_str()),
     ] {
         let mut cmd = h.command();
         cmd.current_dir(&project_dir);
@@ -841,7 +993,11 @@ fn set_default_preserves_all_overrides_and_default_diagnostic_redaction() {
         let out = bounded(&mut cmd);
         let text = String::from_utf8_lossy(&out.stderr);
         assert!(text.contains(expected), "{text}");
-        assert_eq!(h.selected(), pin);
+        assert_eq!(
+            fs::read_to_string(&project).unwrap(),
+            format!("image = \"{pin}\"\n"),
+            "an override never rewrites the saved reference"
+        );
     }
     // The user image is the fallback when the project sets none (ADR-0074).
     fs::remove_file(&project).unwrap();
@@ -852,7 +1008,17 @@ fn set_default_preserves_all_overrides_and_default_diagnostic_redaction() {
             .args(["--no-git", "shell", "bash", "-c", "true"]),
     );
     assert!(String::from_utf8_lossy(&out.stderr).contains("localhost:1/user:tag"));
+
     fs::remove_file(&user).unwrap();
+    // With no configuration at all the default tier decides, and the row's claim
+    // is about *its* label: seed the retained record with the same private
+    // reference on an unreachable registry, so preparation fails at acquisition —
+    // where the redacted label has already been printed — instead of reaching for
+    // a network recommendation.
+    h.retain_host_default(&format!(
+        "localhost:1/private-marker@{}",
+        pin.rsplit_once('@').unwrap().1
+    ));
     let count = server.count();
     let out = bounded(
         h.command()
@@ -861,11 +1027,571 @@ fn set_default_preserves_all_overrides_and_default_diagnostic_redaction() {
             .args(["--no-git", "shell", "bash", "-c", "true"]),
     );
     let text = String::from_utf8_lossy(&out.stderr);
-    assert!(text.contains("the default boot image"));
-    assert!(!text.contains("private-marker"));
+    assert!(text.contains("the default boot image"), "{text}");
+    assert!(!text.contains("private-marker"), "{text}");
     assert_eq!(server.count(), count);
-    assert_eq!(h.selected(), pin);
     // Fake msb can fail launch, but must not be called by set-default itself.
+}
+
+/// #737: a project config that already exists keeps every other byte — keys,
+/// comments, CRLF line endings and table order — and gains exactly one root
+/// assignment before the first table header.
+#[test]
+fn an_existing_project_config_keeps_its_keys_comments_and_line_endings() {
+    let h = Harness::new();
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let pin = server.image("images", "existing", &a);
+    let config = h.project_config();
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    let original = concat!(
+        "# Team project config — keep this comment\r\n",
+        "default_tools = [\"codex\"]\r\n",
+        "\r\n",
+        "[[sources]]\r\n",
+        "name = \"repo\"\r\n",
+        "path = \"./repo.toml\"\r\n",
+        "trust = true\r\n",
+        "allow = true\r\n",
+        "\r\n",
+        "[network]\r\n",
+        "allow = [\"example.com\"]\r\n",
+    );
+    fs::write(&config, original).unwrap();
+
+    success(&h.set_default(&pin));
+
+    // The assignment lands at the last byte boundary before the first header —
+    // the separators and the comment above the root keys are file header, so they
+    // stay above it — and every existing EOL is untouched (D4).
+    let expected = format!(
+        "# Team project config — keep this comment\r\ndefault_tools = [\"codex\"]\r\n\r\nimage = \"{pin}\"\r\n[[sources]]\r\nname = \"repo\"\r\npath = \"./repo.toml\"\r\ntrust = true\r\nallow = true\r\n\r\n[network]\r\nallow = [\"example.com\"]\r\n"
+    );
+    assert_eq!(fs::read_to_string(&config).unwrap(), expected);
+    assert_eq!(h.saved(), pin);
+    assert!(!h.record().exists(), "no retained default is written");
+    assert!(
+        !h.home.join(".config/agent-vm/image-pins.json").exists(),
+        "no approval is written"
+    );
+}
+
+/// AC3 (#737): the root edit is one byte range. Every field the issue names — the
+/// `[[sources]]` tables, `default_tools`, `use_*`, `mounts` and `[network]` — keeps
+/// its exact bytes, for **insert** (no root image yet) and **replace** alike.
+///
+/// `default_tools`/`use_*` are #749's schema and a project-tier `mounts` is not
+/// accepted today, so this fixture is preserved as bytes and is deliberately never
+/// loaded: the promise is that the edit does not re-serialise, not that such a file
+/// resolves.
+#[test]
+fn ac3_the_root_edit_preserves_sources_tools_use_mounts_and_network_bytes() {
+    let h = Harness::new();
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let insert_pin = server.image("images", "ac3-insert", &a);
+    let b = h.image(&ArchiveSpec {
+        marker: "ac3-replace".into(),
+        ..Default::default()
+    });
+    let replace_pin = server.image("images", "ac3-replace", &b);
+    let config = h.project_config();
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    let fields = concat!(
+        "# Team project config — keep this comment\r\n",
+        "default_tools = [\"codex\"]\r\n",
+        "use_tools = [\"probe\"]\r\n",
+        "use_mounts = [\"dev\"]\r\n",
+        "use_egress = [\"corp\"]\r\n",
+        "mounts = [\"~/.agents:ro\", \"~/.config/github-app:ro\"]\r\n",
+        "\r\n",
+        "[[sources]]\r\n",
+        "name = \"home\"\r\n",
+        "path = \"~/.config/agent-vm/config.toml\"\r\n",
+        "trust = true\r\n",
+        "allow = true\r\n",
+        "\r\n",
+        "[[sources]]\r\n",
+        "name = \"team\"\r\n",
+        "path = \"~/team.toml\"\r\n",
+        "trust = false\r\n",
+        "allow = true\r\n",
+        "\r\n",
+        "[network]\r\n",
+        "allow = [\"example.com\"]\r\n",
+        "allow_lan = true\r\n",
+    );
+    fs::write(&config, fields).unwrap();
+
+    // (a) Insert: the assignment lands at the single boundary before the first
+    // header, and nothing else moves.
+    success(&h.set_default(&insert_pin));
+    let inserted = format!(
+        "# Team project config — keep this comment\r\ndefault_tools = [\"codex\"]\r\nuse_tools = [\"probe\"]\r\nuse_mounts = [\"dev\"]\r\nuse_egress = [\"corp\"]\r\nmounts = [\"~/.agents:ro\", \"~/.config/github-app:ro\"]\r\n\r\nimage = \"{insert_pin}\"\r\n[[sources]]\r\nname = \"home\"\r\npath = \"~/.config/agent-vm/config.toml\"\r\ntrust = true\r\nallow = true\r\n\r\n[[sources]]\r\nname = \"team\"\r\npath = \"~/team.toml\"\r\ntrust = false\r\nallow = true\r\n\r\n[network]\r\nallow = [\"example.com\"]\r\nallow_lan = true\r\n"
+    );
+    assert_eq!(
+        fs::read(&config).unwrap(),
+        inserted.as_bytes(),
+        "insert changes exactly the bytes of one new line"
+    );
+    assert_eq!(h.saved(), insert_pin);
+
+    // (b) Replace: the same fixture with a root image, and only the value token
+    // changes.
+    let replaced = inserted.replace(
+        &format!("image = \"{insert_pin}\""),
+        &format!("image = \"{replace_pin}\""),
+    );
+    success(&h.set_default(&replace_pin));
+    assert_eq!(
+        fs::read(&config).unwrap(),
+        replaced.as_bytes(),
+        "replace changes the value token and nothing else"
+    );
+    assert_eq!(h.saved(), replace_pin);
+    assert!(!h.record().exists(), "and no retained default is written");
+    assert!(
+        !h.home.join(".config/agent-vm/image-pins.json").exists(),
+        "and no approval"
+    );
+}
+
+/// AC4 (#737): after a save, `doctor` reports the saved reference as the selection
+/// **and the project config file it read**, and exits 0; a damaged host default is
+/// a nonzero diagnosis that still prints the project's own selection (D5).
+///
+/// A separate, loader-valid fixture: the AC3 file above carries #749's keys and is
+/// not a loadable configuration, so it cannot demonstrate a resolved selection.
+#[test]
+fn doctor_reports_the_saved_reference_from_the_project_config() {
+    let h = Harness::new();
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let pin = server.image("images", "doctor", &a);
+    success(&h.set_default(&pin));
+
+    let out = h.run(&["doctor"]);
+    let text = delivered(&out);
+    assert!(
+        out.status.success(),
+        "a healthy project selection is not a diagnosis: {text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "selected (without --image): {pin} (from project config {})",
+            h.project_config().display()
+        )),
+        "the selection names the reference and the file it read:\n{text}"
+    );
+    assert!(
+        text.contains(&format!("{} (found", h.project_config().display())),
+        "the config section reports the project config it read:\n{text}"
+    );
+
+    // The host default is unused by an established project, but a *damaged* one is
+    // still a diagnosis: the project's own row stands and the exit status does not.
+    fs::write(h.record(), b"{ not a record").unwrap();
+    let out = h.run(&["doctor"]);
+    let text = delivered(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a damaged retained default is a diagnosis: {text}"
+    );
+    assert!(
+        text.contains(&format!("selected (without --image): {pin}")),
+        "and the project's selection is still reported:\n{text}"
+    );
+}
+
+/// D3/E2: this project already approves the target reference at other content, so a
+/// later launch would boot that approval rather than the content just acquired. The
+/// fixture is a **valid existing** same-tag config plus a real source-pin store, and
+/// the refusal leaves `config.toml`, the OCI approval store and the source-pin store
+/// byte- and inode-identical. Only the cache may hold the new content.
+#[test]
+fn a_tag_approved_at_another_digest_refuses_and_writes_nothing() {
+    let h = Harness::new();
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let pin_a = server.image("images", "moved", &a);
+    let tag = format!("{}/images:moved", server.host);
+    // An approval for the tag at A, through the explicit refresh.
+    h.approve_ambient_fixture(&tag);
+    // A project that already names the tag as its root image, and declares a
+    // `trust = false` source whose approval store exists: the two stores this
+    // refusal must not touch.
+    let (sourced, store) = h.approved_source("moved-source.toml");
+    let config = h.project_config();
+    let original = format!(
+        "image = \"{tag}\"\n\n[[sources]]\nname = \"repo\"\npath = \"./{}\"\ntrust = false\nallow = true\n",
+        sourced.file_name().unwrap().to_string_lossy()
+    );
+    fs::write(&config, &original).unwrap();
+    let project_store = store.clone();
+
+    let config_before = file_facts(&config).expect("the fixture config exists");
+    let oci_before = file_facts(&h.home.join(".config/agent-vm/image-pins.json"));
+    let source_before = file_facts(&project_store.join("pins.json"));
+    let source_lock_before = file_facts(&project_store.join("pins.lock"));
+    assert!(oci_before.is_some(), "the fixture has an approval store");
+    assert!(source_before.is_some(), "and a source-pin store");
+
+    // The registry moves the tag to B.
+    let b = h.image(&ArchiveSpec {
+        marker: "moved-b".into(),
+        ..Default::default()
+    });
+    let pin_b = server.image("images", "moved", &b);
+    assert_ne!(pin_a, pin_b);
+
+    let out = h.set_default(&tag);
+    assert_eq!(out.status.code(), Some(1), "{}", delivered(&out));
+    let text = delivered(&out);
+    assert!(
+        text.contains("already approves this image reference at a different manifest digest"),
+        "{text}"
+    );
+    // Value-free: neither reference nor digest is echoed, and the advice is the
+    // explicit digest form (this reference holds no role, so `image pull` cannot
+    // take it).
+    assert!(!text.contains(&pin_a), "{text}");
+    assert!(!text.contains(&pin_b), "{text}");
+    assert!(!text.contains("image pull"), "{text}");
+    assert!(text.contains("repo@sha256:..."), "{text}");
+    for (what, before, after) in [
+        ("config.toml", Some(config_before), file_facts(&config)),
+        (
+            "the OCI approval store",
+            oci_before,
+            file_facts(&h.home.join(".config/agent-vm/image-pins.json")),
+        ),
+        (
+            "the source-pin store",
+            source_before,
+            file_facts(&project_store.join("pins.json")),
+        ),
+        (
+            "the source-pin lock",
+            source_lock_before,
+            file_facts(&project_store.join("pins.lock")),
+        ),
+    ] {
+        assert_eq!(after, before, "{what} must keep its bytes and its inode");
+    }
+    assert!(
+        !h.record().exists(),
+        "and no retained default was written either"
+    );
+    // The acquired content is in the cache: the command measured it before
+    // refusing, which is what makes this an observed conflict.
+    complete(&h.cache(), &pin_b);
+}
+
+/// The same refusal when the plan would have published **nothing**: the config
+/// already spells the target exactly, so only the approval comparison can refuse.
+/// A no-op is not a licence to skip the check.
+#[test]
+fn a_no_op_plan_against_a_moved_tag_still_refuses_and_writes_nothing() {
+    let h = Harness::new();
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    server.image("images", "noop", &a);
+    let tag = format!("{}/images:noop", server.host);
+    h.approve_ambient_fixture(&tag);
+    let config = h.project_config();
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    let original = format!("# kept\r\nimage = \"{tag}\"\r\n");
+    fs::write(&config, &original).unwrap();
+    let config_before = file_facts(&config).expect("the fixture config exists");
+    let oci_before = file_facts(&h.home.join(".config/agent-vm/image-pins.json"));
+
+    let b = h.image(&ArchiveSpec {
+        marker: "noop-b".into(),
+        ..Default::default()
+    });
+    let pin_b = server.image("images", "noop", &b);
+
+    let out = h.set_default(&tag);
+    assert_eq!(out.status.code(), Some(1), "{}", delivered(&out));
+    assert!(
+        delivered(&out)
+            .contains("already approves this image reference at a different manifest digest"),
+        "{}",
+        delivered(&out)
+    );
+    assert_eq!(
+        file_facts(&config),
+        Some(config_before),
+        "an unchanged plan still publishes nothing at all"
+    );
+    assert_eq!(
+        file_facts(&h.home.join(".config/agent-vm/image-pins.json")),
+        oci_before,
+        "and the approval store keeps its bytes and inode"
+    );
+    complete(&h.cache(), &pin_b);
+}
+
+/// D3/O5: the refresh advice names `image pull` **only** for a reference this
+/// project holds a role for, and then says what that command actually does —
+/// re-resolve the held reference and replace its approval — rather than claiming
+/// anything can approve the bytes already acquired.
+#[test]
+fn a_held_reference_mismatch_advises_re_resolving_the_held_reference() {
+    let h = Harness::new();
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    server.image("images", "held", &a);
+    let tag = format!("{}/images:held", server.host);
+    // `setup` records the Boot role for this project, which is what makes the
+    // reference eligible for `image pull`.
+    success(&h.run(&["setup", "--image", &tag, "--no-verify"]));
+    let pins = fs::read_to_string(h.home.join(".config/agent-vm/image-pins.json")).unwrap();
+    assert!(
+        pins.contains("\"roles\""),
+        "the fixture really holds a role: {pins}"
+    );
+    let config = h.project_config();
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(&config, format!("image = \"{tag}\"\n")).unwrap();
+    let config_before = file_facts(&config).expect("the fixture config exists");
+    let oci_before = file_facts(&h.home.join(".config/agent-vm/image-pins.json"));
+
+    let b = h.image(&ArchiveSpec {
+        marker: "held-b".into(),
+        ..Default::default()
+    });
+    server.image("images", "held", &b);
+
+    let out = h.set_default(&tag);
+    assert_eq!(out.status.code(), Some(1), "{}", delivered(&out));
+    let text = delivered(&out);
+    assert!(
+        text.contains("Re-resolve and approve the held reference"),
+        "the advice names what the command does: {text}"
+    );
+    assert!(text.contains("`agent-vm image pull --image REF`"), "{text}");
+    assert!(
+        !text.contains("Approve the acquired content"),
+        "nothing can approve bytes already acquired: {text}"
+    );
+    assert!(text.contains("repo@sha256:..."), "{text}");
+    assert_eq!(file_facts(&config), Some(config_before));
+    assert_eq!(
+        file_facts(&h.home.join(".config/agent-vm/image-pins.json")),
+        oci_before
+    );
+}
+
+/// D7/E2: a peer holding the **source** pin lock must not block the config
+/// writer, and must not have its store touched. The two transactions are separate:
+/// the writer takes `config.lock`, never `pins.lock`.
+#[test]
+fn a_peer_holding_the_source_pin_lock_does_not_block_the_config_save() {
+    use std::os::fd::AsRawFd as _;
+    let h = Harness::new();
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let pin = server.image("images", "peer-lock", &a);
+    let (sourced, store) = h.approved_source("peer-lock-source.toml");
+    let config = h.project_config();
+    let original = format!(
+        "image = \"localhost:1/old:1\"\n\n[[sources]]\nname = \"repo\"\npath = \"./{}\"\ntrust = false\nallow = true\n",
+        sourced.file_name().unwrap().to_string_lossy()
+    );
+    fs::write(&config, &original).unwrap();
+
+    let manifest_before = file_facts(&store.join("pins.json")).expect("an approved store");
+    let lock_before = file_facts(&store.join("pins.lock")).expect("a permanent lock");
+    let snapshots_before: Vec<_> = fs::read_dir(&store)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("pin-")
+        })
+        .map(|path| (path.clone(), file_facts(&path).expect("a snapshot")))
+        .collect();
+
+    // Held by an independent descriptor for the whole command, exactly as a peer's
+    // source approval would hold it. `flock` is per open file description, so this
+    // is a real second holder even inside this process.
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(store.join("pins.lock"))
+        .expect("open the peer's lock");
+    assert_eq!(
+        unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "the fixture holds the source pin lock"
+    );
+
+    let out = h.set_default(&pin);
+    success(&out);
+    assert_eq!(
+        h.saved(),
+        pin,
+        "the config save completed under the peer's lock"
+    );
+    assert_eq!(
+        file_facts(&store.join("pins.json")),
+        Some(manifest_before),
+        "the manifest keeps its bytes and inode"
+    );
+    assert_eq!(
+        file_facts(&store.join("pins.lock")),
+        Some(lock_before),
+        "and so does the generation header's file"
+    );
+    for (path, before) in snapshots_before {
+        assert_eq!(
+            file_facts(&path),
+            Some(before),
+            "{} keeps its bytes and inode",
+            path.display()
+        );
+    }
+    assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) }, 0);
+}
+
+/// D8 (E2): a pre-existing root `image = "missing:image"` is a **source delegation**
+/// to a source the file does not even declare, so nothing in this project resolves
+/// it. The direct reference replaces that one token, the file's other bytes (here a
+/// source declaration) are preserved, and no approval is written for either form.
+#[test]
+fn a_broken_root_alias_delegation_is_replaced_by_the_direct_reference() {
+    let h = Harness::new();
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let pin = server.image("images", "delegated", &a);
+    let config = h.project_config();
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    let sources = concat!(
+        "[[sources]]\n",
+        "name = \"home\"\n",
+        "path = \"~/.config/agent-vm/config.toml\"\n",
+        "trust = true\n",
+        "allow = true\n",
+    );
+    fs::write(&config, format!("image = \"missing:image\"\n\n{sources}")).unwrap();
+
+    success(&h.set_default(&pin));
+
+    assert_eq!(
+        fs::read_to_string(&config).unwrap(),
+        format!("image = \"{pin}\"\n\n{sources}"),
+        "only the root value token changes"
+    );
+    assert_eq!(h.saved(), pin);
+    assert!(
+        !h.home.join(".config/agent-vm/image-pins.json").exists(),
+        "the delegation is not approved and neither is the replacement"
+    );
+    assert!(!h.record().exists());
+}
+
+/// D8: an unapproved `trust = false` source neither blocks the narrow edit nor is
+/// approved by it, and its declaration survives byte for byte.
+#[test]
+fn an_unapproved_untrusted_source_neither_blocks_nor_is_approved() {
+    let h = Harness::new();
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let pin = server.image("images", "untrusted", &a);
+    let config = h.project_config();
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    let original = concat!(
+        "[[sources]]\n",
+        "name = \"elsewhere\"\n",
+        "path = \"~/not-yet-written.toml\"\n",
+        "trust = false\n",
+        "allow = true\n",
+    );
+    fs::write(&config, original).unwrap();
+
+    success(&h.set_default(&pin));
+
+    assert_eq!(
+        fs::read_to_string(&config).unwrap(),
+        format!("image = \"{pin}\"\n{original}"),
+        "the root assignment precedes the first header and nothing else changes"
+    );
+    assert!(
+        !h.home.join(".config/agent-vm/image-pins.json").exists(),
+        "no approval was granted"
+    );
+    // The source declaration is unchanged, and the saved reference is what the
+    // project tier now names.
+    assert_eq!(h.saved(), pin);
+}
+
+/// D8/D2: a project config this command must refuse is refused by the preflight,
+/// before the MSB prologue redirects state, so no redirected MSB state directory
+/// is created and no registry request is made.
+#[test]
+fn a_refused_project_config_leaves_msb_state_and_the_registry_untouched() {
+    let h = Harness::new();
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let pin = server.image("images", "refused", &a);
+    let config = h.project_config();
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    let elsewhere = h.root.path().join("elsewhere.toml");
+    fs::write(&elsewhere, "image = \"localhost:1/x:y\"\n").unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &config).unwrap();
+
+    let out = h.set_default(&pin);
+    let text = delivered(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{:?}: {text}",
+        out.status.code()
+    );
+    assert!(text.contains("symbolic link"), "{text}");
+    assert_eq!(server.count(), 0, "the refusal precedes acquisition");
+    assert!(
+        !h.state.join("msb-home").exists(),
+        "the refusal precedes the MSB prologue: {}",
+        h.state.display()
+    );
+    assert_eq!(
+        fs::read(&elsewhere).unwrap(),
+        b"image = \"localhost:1/x:y\"\n"
+    );
+    assert!(
+        fs::symlink_metadata(&config).unwrap().is_symlink(),
+        "the link is never repaired"
+    );
+}
+
+/// D8: a new argument shaped like the project config's `<alias>:image` delegation
+/// is an exit-2 persistence error with value-free advice, and nothing is created.
+#[test]
+fn an_alias_shaped_image_argument_is_a_usage_error_with_advice() {
+    let h = Harness::new();
+    let server = Server::new();
+    for raw in ["home:image", "aliased:image"] {
+        let out = h.set_default(raw);
+        assert_eq!(out.status.code(), Some(2), "{raw}: {}", delivered(&out));
+        let text = delivered(&out);
+        assert!(
+            text.contains("selects a sourced file's image instead of naming one"),
+            "{raw}: {text}"
+        );
+        assert!(
+            text.contains("docker.io/library/NAME:image"),
+            "{raw}: {text}"
+        );
+        assert!(!text.contains(raw), "{raw} must not be echoed: {text}");
+    }
+    assert_eq!(server.count(), 0);
+    assert!(!h.project_config().exists());
+    assert!(!h.state.join("msb-home").exists());
 }
 
 #[test]
@@ -1355,9 +2081,9 @@ fn refresh_same_tag_failure(mode: RefreshFailure, retained: bool) {
             ..Default::default()
         });
         let pin = server.image("images", "s2-retained-d", &d);
-        success(&h.set_default(&pin));
+        let record = h.pin_and_retain_host_default(&pin);
         RetainedFallback {
-            record: fs::read(h.record()).unwrap(),
+            record,
             artifacts: ReferenceSnapshot::take(&h.cache(), &pin, &d),
             pin,
         }
@@ -1572,9 +2298,9 @@ fn refresh_killed_during_download_preserves_cached_a_and_releases_the_guard() {
                 ..Default::default()
             });
             let pin = server.image("images", "s2-kill-retained", &d);
-            success(&h.set_default(&pin));
+            let record = h.pin_and_retain_host_default(&pin);
             RetainedFallback {
-                record: fs::read(h.record()).unwrap(),
+                record,
                 artifacts: ReferenceSnapshot::take(&h.cache(), &pin, &d),
                 pin,
             }
@@ -2538,9 +3264,12 @@ fn coordination_setup_and_set_default_enter_the_same_guard() {
         .expect(AcquisitionStage::NativeOk)
         .reply(GateReply::Continue);
     success(&sd.wait());
-    assert_eq!(
-        h2.selected(),
-        format!("{}/images@{}", server2.host, a2.written.manifest_digest)
+    // The saved value is the tag the user asked for; the validated child is what
+    // the cache published under it.
+    assert_eq!(h2.saved(), tag);
+    assert!(
+        !h2.record().exists(),
+        "set-default writes no retained default"
     );
     complete(
         &h2.cache(),
@@ -2570,7 +3299,7 @@ fn coordination_setup_and_set_default_enter_the_same_guard() {
         .expect(AcquisitionStage::NativeOk)
         .reply(GateReply::Continue);
     success(&sd3.wait());
-    assert_eq!(h3.selected(), pin3);
+    assert_eq!(h3.saved(), pin3);
     complete(&h3.cache(), &pin3);
     h3.no_fallback();
 }
@@ -2726,7 +3455,7 @@ fn postvalidation_faults_keep_explicit_causes_and_redact_default_operations() {
         }
         if operation == "set-default" {
             assert!(
-                text.contains("this command did not change the retained default"),
+                text.contains("this command did not change the project boot image"),
                 "{text}"
             );
         }

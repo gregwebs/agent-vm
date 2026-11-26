@@ -3264,7 +3264,10 @@ fn image_selection_missing(
     )
 }
 
-fn project_tier_error(path: &Path, error: &config_authority::UntrustedConfig) -> anyhow::Error {
+pub(crate) fn project_tier_error(
+    path: &Path,
+    error: &config_authority::UntrustedConfig,
+) -> anyhow::Error {
     anyhow!("config: {}: {error}", crate::one_line::quoted_path(path))
 }
 
@@ -4807,6 +4810,49 @@ pub(crate) fn top_level_field(name: &str) -> Option<&'static str> {
         .find(|field| *field == name)
 }
 
+/// The top-level fields whose own entries may carry an `image` key of their own
+/// (#737).
+///
+/// TOML scopes a bare key to the most recent header, so `image = "REF"` written
+/// after one of these belongs to that table, not to the root: inserting a root
+/// assignment above it would leave the user's line meaning something else, and
+/// leaving it alone would silently ignore it. The project-config writer therefore
+/// refuses such a file, naming the table by the spelling below. It lives beside
+/// [`RawConfig`] because that schema owns these five names; the writer keeps only
+/// the semantic dispatch over the parsed shape. `sources` (#734), `allow_tools`
+/// (#735) and the rest of #749's future keys are not listed: a field that cannot
+/// hold an `image` needs no entry here.
+pub(crate) const IMAGE_OWNER_FIELDS: [(&str, ImageOwner); 5] = [
+    ("sources", ImageOwner::Sources),
+    ("network", ImageOwner::Network),
+    ("tools", ImageOwner::Tools),
+    ("mount_sets", ImageOwner::MountSets),
+    ("egress_sets", ImageOwner::EgressSets),
+];
+
+/// Which of [`IMAGE_OWNER_FIELDS`] an `image` was found in, and how a refusal names
+/// the table the user wrote.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImageOwner {
+    Sources,
+    Network,
+    Tools,
+    MountSets,
+    EgressSets,
+}
+
+impl ImageOwner {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Sources => "[[sources]]",
+            Self::Network => "[network]",
+            Self::Tools => "[[tools]]",
+            Self::MountSets => "[mount_sets]",
+            Self::EgressSets => "[egress_sets]",
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
@@ -5603,7 +5649,7 @@ fn safe_io_error(operation: &str, path: &Path, error: &std::io::Error) -> anyhow
     )
 }
 
-fn line_column(text: &str, offset: usize) -> (usize, usize) {
+pub(crate) fn line_column(text: &str, offset: usize) -> (usize, usize) {
     let clamped = offset.min(text.len());
     let mut line = 1;
     let mut column = 1;
@@ -6191,6 +6237,21 @@ mod tests {
                 Fixture::new().user(&format!("{name} = {value}\n")).load()
             };
             result.unwrap_or_else(|error| panic!("{name} must be a top-level field: {error:#}"));
+        }
+    }
+
+    /// Every field the writer may refuse a stray `image` in is a top-level field of
+    /// this schema, so the policy beside [`RawConfig`] cannot name a table serde
+    /// would refuse first, and a renamed field breaks this before it silently stops
+    /// being checked in the writer.
+    #[test]
+    fn image_owner_fields_are_top_level_fields() {
+        for (name, owner) in IMAGE_OWNER_FIELDS {
+            assert!(
+                TOP_LEVEL_FIELDS.contains(&name),
+                "{name} ({}) is a top-level field",
+                owner.label()
+            );
         }
     }
 

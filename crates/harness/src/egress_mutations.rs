@@ -4027,6 +4027,362 @@ fn ledger() -> Vec<Row> {
             markers: &[r#"test result: FAILED"#],
             anchors: 1,
         },
+        // #737's project config writer, graded on the writer's own API: every
+        // property below is observable there without a registry, a clock or the
+        // CLI, and a CLI control would let a loader refusal mask the mutation.
+        Row {
+            // A descriptor keeps naming the inode it was opened on after that name
+            // moves, so the canonical-spelling tie is the only thing that notices a
+            // route directory replaced between opening and use.
+            name: r#"project-writer-route-identity-skipped"#,
+            path: r#"crates/agent-vm/src/project_config_writer.rs"#,
+            old: r#"    if (measured.dev(), measured.ino()) != level.facts.identity() {"#,
+            new: r#"    if false && (measured.dev(), measured.ino()) != level.facts.identity() {"#,
+            run: Run::AgentBin(r#"a_route_directory_replaced_after_it_was_opened_is_refused"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // ADR-0073: `projects/` and `projects/<id>/` are opened O_NOFOLLOW. A
+            // mutant that follows the store link reads and writes through it.
+            name: r#"project-writer-store-link-followed"#,
+            path: r#"crates/agent-vm/src/project_config_writer.rs"#,
+            old: r#"        flags |= OFlags::NOFOLLOW;"#,
+            new: r#"        flags |= OFlags::empty();"#,
+            run: Run::AgentBin(r#"a_symlinked_store_directory_is_refused"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // ADR-0040 keeps a stable dotfile alias outside the checkout and refuses
+            // one inside it. Without the route check the walk creates the store in
+            // the checkout through its own `.config`.
+            name: r#"project-writer-checkout-alias-accepted"#,
+            path: r#"crates/agent-vm/src/project_config_writer.rs"#,
+            old: r#"    if crate::project_config::resolves_inside_project(&canonical, Some(&level.path), root) {"#,
+            new: r#"    if false && crate::project_config::resolves_inside_project(&canonical, Some(&level.path), root) {"#,
+            run: Run::AgentBin(r#"a_checkout_alias_route_is_refused_before_anything_is_created"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // A rename into a writable directory would succeed over a `0400` file,
+            // which is why the owner-write refusal exists: without it the user's own
+            // read-only bytes are replaced.
+            name: r#"project-writer-readonly-config-written"#,
+            path: r#"crates/agent-vm/src/project_config_writer.rs"#,
+            old: r#"        if crate::config_authority::raw_mode_u32(facts.mode) & 0o200 == 0 {"#,
+            new: r#"        if false && crate::config_authority::raw_mode_u32(facts.mode) & 0o200 == 0 {"#,
+            run: Run::AgentBin(r#"a_read_only_config_is_refused_on_probe_and_at_publish"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // ADR-0040 on the writer's descriptor: a group-writable, multi-link or
+            // foreign-owned file is never read as ours. `measure_facts`-only
+            // mutations leave this check in place, so the row targets the writer's
+            // own call to the shared kernel, on a `0620` file in a `0700` directory.
+            name: r#"project-writer-verify-skipped"#,
+            path: r#"crates/agent-vm/src/project_config_writer.rs"#,
+            old: r#"        crate::config_authority::verify_project_file_at(
+            store.dir_facts(),
+            &FinalComponent::Regular(facts),
+        )
+        .map_err(|refusal| crate::config::project_tier_error(config, &refusal))?;"#,
+            new: r#"        let _ = crate::config_authority::verify_project_file_at(
+            store.dir_facts(),
+            &FinalComponent::Regular(facts),
+        );"#,
+            run: Run::AgentBin(r#"an_untrusted_config_is_refused_without_being_read_or_replaced"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // ADR-0078 D4 rejects `DocumentMut`'s round trip because it normalises
+            // EOLs. The mutation clobbers the delivery of an already correct splice
+            // (the root image is still the new reference), so the semantic check
+            // passes and only the exact-byte assertion can notice.
+            name: r#"project-writer-crlf-normalised"#,
+            path: r#"crates/agent-vm/src/project_config_writer.rs"#,
+            old: r#"    check_rendered(&bytes, reference)?;"#,
+            new: r#"    let bytes = String::from_utf8_lossy(&bytes).replace("\r\n", "\n").into_bytes();
+    check_rendered(&bytes, reference)?;"#,
+            run: Run::AgentBin(r#"crlf_and_mixed_line_endings_are_never_normalised"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // The inserted assignment must stay in the root prelude, above the
+            // comment block that introduces the next table (D4). A scan that goes
+            // straight to the header line publishes the note inside the wrong place:
+            // still a root key, so only the expected bytes refuse it.
+            name: r#"project-writer-table-note-clobbered"#,
+            path: r#"crates/agent-vm/src/project_config_writer.rs"#,
+            old: r#"            return if block_start == header_line {
+                header_line
+            } else {
+                previous
+            };"#,
+            new: r#"            return header_line;"#,
+            run: Run::AgentBin(r#"a_file_heading_and_a_table_note_keep_their_places"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // The no-op is decided here, at the writer, because the planner's
+            // `Unchanged` alone does not stop a rename: handed the live bytes, a
+            // save that publishes them replaces the inode, mode and mtime anyway.
+            name: r#"project-writer-unchanged-renames"#,
+            path: r#"crates/agent-vm/src/project_config_writer.rs"#,
+            old: r#"        if let ConfigFileState::Present { bytes, .. } = &live
+            && bytes.as_bytes() == new_bytes
+        {"#,
+            new: r#"        if let ConfigFileState::Present { bytes, .. } = &live
+            && false
+            && bytes.as_bytes() == new_bytes
+        {"#,
+            run: Run::AgentBin(r#"a_save_of_the_live_bytes_publishes_nothing"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // ADR-0078 D1: a stale base is refused on its identity *or* its bytes.
+            // Weakening the comparison to a conjunction publishes over a file a peer
+            // changed in place.
+            name: r#"project-writer-stale-save-accepted"#,
+            path: r#"crates/agent-vm/src/project_config_writer.rs"#,
+            old: r#"            ) => identity != live_identity || bytes != live_bytes,"#,
+            new: r#"            ) => identity != live_identity && bytes != live_bytes,"#,
+            run: Run::AgentBin(r#"a_stale_save_is_refused_when_the_bytes_changed"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // The last check before the rename. Both halves are removed together: a
+            // displaced store also fails the destination-name comparison, so removing
+            // only one leaves the save refused as `Stale` and nothing is published.
+            name: r#"project-writer-pre-rename-check-skipped"#,
+            path: r#"crates/agent-vm/src/project_config_writer.rs"#,
+            old: r#"            let parent = match verify_anchored(&walk, &steps, &locked, euid) {
+                Ok(parent) => parent,
+                Err(conflict) => {
+                    veto.set(Some(conflict));
+                    return Err(anyhow!(
+                        "config: {}: {}",
+                        quoted_path(config),
+                        conflict.reason(),
+                    ));
+                }
+            };
+            match final_name_matches(parent, store, &live, config)? {
+                true => Ok(()),
+                false => {
+                    veto.set(Some(ConfigConflict::Stale));
+                    Err(anyhow!(
+                        "config: {}: {}",
+                        quoted_path(config),
+                        ConfigConflict::Stale.reason(),
+                    ))
+                }
+            }"#,
+            new: r#"            Ok(())"#,
+            run: Run::AgentBin(r#"a_pre_rename_veto_from_a_displaced_store_leaves_the_old_bytes"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // A descriptor keeps naming the inode it was opened on after that name
+            // moves, so a `projects/` replaced after the walk leaves every held
+            // relationship true inside a detached tree. Only stating each admitted
+            // name again from the descriptor above it can notice the move.
+            name: r#"project-writer-ancestor-fence-skipped"#,
+            path: r#"crates/agent-vm/src/project_config_writer.rs"#,
+            old: r#"            || entry_identity(&entry) != identity"#,
+            new: r#"            || false && entry_identity(&entry) != identity"#,
+            run: Run::AgentBin(
+                r#"a_moved_projects_directory_before_the_rename_is_a_displaced_refusal"#,
+            ),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // D8's boundary must be re-applied, not remembered: a `chmod` between
+            // the under-lock read and the rename keeps identity, link count and
+            // size, so only measuring owner and mode again refuses the replacement.
+            name: r#"project-writer-late-authority-accepted"#,
+            path: r#"crates/agent-vm/src/project_config_writer.rs"#,
+            old: r#"    if crate::config_authority::verify_project_file_at(parent, &FinalComponent::Regular(facts))
+        .is_err()
+    {"#,
+            new: r#"    if false
+        && crate::config_authority::verify_project_file_at(
+            parent,
+            &FinalComponent::Regular(facts),
+        )
+        .is_err()
+    {"#,
+            run: Run::AgentBin(
+                r#"a_config_made_group_writable_before_the_rename_is_a_stale_refusal"#,
+            ),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // D2: an `ENOENT` from a link-following open is a missing *name* or a
+            // missing *target*. Only the first is a slot a save may create; the second
+            // is a dangling alias, and the `mkdirat` that follows the old reading
+            // reports it as `EEXIST` after acquisition instead.
+            name: r#"project-writer-dangling-route-name-created"#,
+            path: r#"crates/agent-vm/src/project_config_writer.rs"#,
+            old: r#"        Err(Errno::NOENT) => classify_missing_child(parent, step, config),"#,
+            new: r#"        Err(Errno::NOENT) => Ok(None),"#,
+            run: Run::AgentBin(r#"a_dangling_dotfile_alias_is_refused_rather_than_created_over"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // D2: an admitted alias is only as good as the directories above it. A
+            // leaf this user owns under a parent others may write is a route another
+            // process can replace, which is the reader's own refusal.
+            name: r#"project-writer-alias-ancestry-unchecked"#,
+            path: r#"crates/agent-vm/src/project_config_writer.rs"#,
+            old: r#"    if canonical != level.path {"#,
+            new: r#"    if false && canonical != level.path {"#,
+            run: Run::AgentBin(
+                r#"a_dotfile_alias_inside_an_ancestry_another_user_controls_is_refused"#,
+            ),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // D2: "inside the active project" is the identity this command captured,
+            // not a spelling. A root replaced after the capture makes every route
+            // answer below it describe a directory nothing measured.
+            name: r#"project-writer-captured-root-identity-unchecked"#,
+            path: r#"crates/agent-vm/src/project_config_writer.rs"#,
+            old: r#"    if !crate::project_config::captured_root_is_live(root, root_id) {"#,
+            new: r#"    if false && !crate::project_config::captured_root_is_live(root, root_id) {"#,
+            run: Run::AgentBin(r#"a_project_root_replaced_after_the_capture_is_refused"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // D2: a umask that masks the owner's own read or search bit is repaired on
+            // the name through the parent descriptor, before the entry is opened. A
+            // repair that re-applies the masked mode repairs nothing.
+            name: r#"project-writer-masked-creation-mode-kept"#,
+            path: r#"crates/agent-vm/src/project_config_writer.rs"#,
+            old: r#"    rustix::fs::chmodat(&parent.fd, &step.name, DIR_MODE, AtFlags::empty())"#,
+            new: r#"    rustix::fs::chmodat(&parent.fd, &step.name, create_mode, AtFlags::empty())"#,
+            run: Run::AgentBin(
+                r#"an_unopenable_creation_mode_is_repaired_before_the_entry_is_opened"#,
+            ),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // D4: the backward comment scan is bounded by the end of the last root
+            // value. Unbounded, a `#` that *begins a line inside* a multiline string is
+            // read as a comment and the assignment is spliced into the value.
+            name: r#"project-writer-root-value-scan-unbounded"#,
+            path: r#"crates/agent-vm/src/project_config_writer.rs"#,
+            old: r#"        if previous < root_values_end {"#,
+            new: r#"        if false && previous < root_values_end {"#,
+            run: Run::AgentBin(
+                r#"a_multiline_root_value_ending_on_a_comment_looking_line_is_not_a_note"#,
+            ),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // D4: an existing zero-byte file keeps its missing final newline. The
+            // absent-file seed is the only case that adds one.
+            name: r#"project-writer-empty-file-gains-newline"#,
+            path: r#"crates/agent-vm/src/project_config_writer.rs"#,
+            old: r#"        let bytes = assignment.into_bytes();"#,
+            new: r#"        let bytes = format!("{assignment}\n").into_bytes();"#,
+            run: Run::AgentBin(r#"an_empty_file_gets_only_the_assignment_and_no_final_newline"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // D8/B6: growth below the reader's ceiling is still a change. The read
+            // length must equal the size the descriptor had when it was opened and the
+            // size it has now, not merely stay under the cap.
+            name: r#"project-writer-growth-below-cap-accepted"#,
+            path: r#"crates/agent-vm/src/project_config_writer.rs"#,
+            old: r#"        if size_now != Some(measured_size) || bytes.len() as u64 != measured_size {"#,
+            new: r#"        if size_now.is_some()
+            && false
+            && (size_now != Some(measured_size) || bytes.len() as u64 != measured_size)
+        {"#,
+            run: Run::AgentBin(r#"a_config_that_grows_below_the_cap_is_refused"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        // `image set-default` itself: two properties that only the command can show
+        // -- the post-acquisition approval conflict (D3) and the `<alias>:image`
+        // argument refusal (D8). Both run against the fixture registry on loopback
+        // with an isolated `$HOME`; neither reaches the network or a live registry.
+        Row {
+            // D3 and D7: the approval lookup happens after acquisition and before
+            // the write, and it writes no approval. Without it the command saves a
+            // reference whose next launch would consume the approved content.
+            name: r#"set-default-post-acquire-pin-recheck-skipped"#,
+            path: r#"crates/agent-vm/src/image_pin/project_default.rs"#,
+            old: r#"    if let Some(existing) = super::lookup(&key)?
+        && existing.digest != *prepared.image().acquired_digest()
+    {"#,
+            new: r#"    if let Some(existing) = super::lookup(&key)?
+        && false
+        && existing.digest != *prepared.image().acquired_digest()
+    {"#,
+            run: Run::AgentTest(
+                r#"default_image_upgrade"#,
+                r#"a_tag_approved_at_another_digest_refuses_and_writes_nothing"#,
+            ),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // D1: the no-op takes the same compare-and-publish as an edit, so
+            // `Unchanged` means the snapshot was found live under the lock. Letting
+            // the planner's `Unchanged` answer the command directly prints success
+            // over a file a peer already replaced.
+            name: r#"set-default-unchanged-path-skips-cas"#,
+            path: r#"crates/agent-vm/src/boot_image/upgrade.rs"#,
+            old: r#"    store.save(snapshot, bytes)
+}"#,
+            new: r#"    if plan.bytes().is_none() {
+        return Ok(ConfigSave::Unchanged);
+    }
+    store.save(snapshot, bytes)
+}"#,
+            run: Run::AgentBin(
+                r#"an_unchanged_plan_still_compares_and_publishes_against_a_live_snapshot"#,
+            ),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // D8: `<alias>:image` is a source delegation in a project config, so this
+            // command refuses it with its own value-free advice instead of the OCI
+            // grammar's. A generic refusal keeps the exit status and loses the reason.
+            name: r#"set-default-source-delegation-generic-refusal"#,
+            path: r#"crates/agent-vm/src/boot_image/upgrade.rs"#,
+            old: r#"        if is_source_delegation(raw) {
+            return Err(SOURCE_DELEGATION_REASON);
+        }"#,
+            new: r#"        if is_source_delegation(raw) {
+            return Err(INVALID_REFERENCE_REASON);
+        }"#,
+            run: Run::AgentTest(
+                r#"default_image_upgrade"#,
+                r#"an_alias_shaped_image_argument_is_a_usage_error_with_advice"#,
+            ),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
     ]
 }
 

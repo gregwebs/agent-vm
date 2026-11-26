@@ -28,6 +28,12 @@ is per operation (D6, D9), not batch-wide.
 
 `image refresh` was renamed `image pull` in 0.7.57 (#617, [ADR-0043](0043-image-command-group-and-daemon-import.md)); this record keeps the name it was decided under.
 
+**Superseded for `image set-default` by [ADR-0078](0078-project-config-writer.md).**
+Decision 5 and its consequential host-record/set-default statements describe the
+0.7.47 migration and are archival: `set-default` now writes the invoking
+project's host-managed `config.toml`, not `default-image.json`. The retained
+project-default and pending-journal machinery described here remains in force.
+
 ## Context
 
 Two questions have two different records in `$HOME/.config/agent-vm/`:
@@ -92,11 +98,11 @@ selection that came from the host record or from the project's own default never
 writes it. A release that changes the recommendation changes what a *new* host is
 offered, never an existing retained default or an established project's default.
 
-**5. `image set-default` writes only the host record.** It resolves and validates
-its target as before, then replaces `default-image.json` with the validated host
-child. It writes no pin and no project default in any project, prompts for
-nothing, and has no `--yes`. Its notice says whether the invoking project keeps
-its own default, and how to adopt the new one.
+**5. `image set-default` writes only the host record.** **Superseded by
+[ADR-0078](0078-project-config-writer.md).** This is the historical 0.7.47
+behavior: it resolved and validated its target, then replaced
+`default-image.json` with the validated host child. It wrote no pin or project
+default, prompted for nothing, and had no `--yes`.
 
 **6. Explicit `image refresh` is its own consent.** Invoking the command
 authorizes exactly the candidate it resolves: a first pin, a replaced approval

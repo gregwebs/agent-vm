@@ -205,15 +205,19 @@ the contributor gitlink and launcher recommendation, without a runtime source de
 - **#262 fulfilled.** Explicit replacement remains separate from write-once
   automatic adoption, and from #390 on it is a revision-checked
   compare-and-swap with candidate consent. See
-  [USAGE](../../USAGE.md#explicitly-setting-the-default).
+  [USAGE](../../USAGE.md#setting-this-projects-boot-image).
 - **#390 fulfilled.** Every OCI tier is pinned host-wide; warm launches are
-  registry-free; cache loss reacquires the approved digest; refresh/set-default
-  are the only movement checks. The retained default stays digest-only (#392),
+  registry-free; cache loss reacquires the approved digest; refresh is the only
+  operation that moves an approval. The retained default stays digest-only (#392),
   and import/build can approve nothing but the result reference they name (#391,
   [ADR-0043](0043-image-command-group-and-daemon-import.md)). Native behaviour and
   live-guest observations are manual evidence; boot-free checks cannot prove
   guest execution. See
   [USAGE](../../USAGE.md#project-scoped-approval-of-oci-image-content).
+  **Amended by [ADR-0078](0078-project-config-writer.md):** `image set-default`
+  is no longer a movement check at all. It acquires, compares the acquired child
+  with an observed approval, and saves the project config's root `image`; it
+  writes no approval and no host record.
 - Follow-up evidence: [#265](https://github.com/gregwebs/agent-vm/issues/265)
   (native installed consumption on both architectures).
 

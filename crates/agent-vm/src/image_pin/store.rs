@@ -1338,62 +1338,6 @@ impl Store {
         })
     }
 
-    /// `image set-default`: replace only the host's starting choice.
-    ///
-    /// Writes no pin and no project default. Reports whether the invoking
-    /// project already boots the new host child, measured under the same pin
-    /// lock as the write.
-    pub(super) fn set_host_default(
-        &self,
-        retained: &ImmutableImageRef,
-        project: &ProjectId,
-    ) -> Result<HostDefaultSet> {
-        // pin EX then default EX, and this is also where a leftover S1 journal
-        // is recovered before the new bytes are measured.
-        let (file, _locks) = self.begin(true)?;
-        let previous = default::snapshot_at(&self.directory)?;
-        let proposed = default::encode_snapshot(retained)?;
-        let retained_default = if fallback_bytes_differ(&previous, &proposed)? {
-            gate::checkpoint(gate::Stage::BeforeDefaultSave)?;
-            atomic_save(&self.directory.join(SELECTION_FILE), &proposed)?;
-            gate::checkpoint(gate::Stage::DefaultSaved)?;
-            if previous.is_none() {
-                DefaultChange::Initialized
-            } else {
-                DefaultChange::Replaced
-            }
-        } else {
-            DefaultChange::Unchanged
-        };
-        let this_project = match file.project_default(project)? {
-            None => InvokingProject::NotEstablished,
-            Some(own) => {
-                // The content this project boots: its approved child, else the
-                // digest it states (only a hand-edited store has no pin).
-                // A stored project default is always a canonical OCI reference,
-                // so an unusable one is damage rather than a user-input error.
-                let target = OciTarget::parse(own.immutable()?.as_str()).map_err(|_| corrupt())?;
-                let key = PinKey::new(project, &target)?;
-                let boots = match file.lookup(&key)? {
-                    Some(pin) => pin.digest,
-                    None => own.stated_digest(),
-                };
-                // R5 asks whether this project already boots the retained child:
-                // the content, never which repository serves it. A mirror of the
-                // same manifest is the same content.
-                if boots == stated_digest(retained)? {
-                    InvokingProject::AlreadyUses
-                } else {
-                    InvokingProject::KeepsItsOwn
-                }
-            }
-        };
-        Ok(HostDefaultSet {
-            retained_default,
-            this_project,
-        })
-    }
-
     /// Insert this project's default iff the action establishes and the project
     /// has none; `SeedHostOnly` and `None` never establish. Shared by `commit`
     /// and `claim_selected` so the two cannot diverge.
@@ -1491,29 +1435,6 @@ impl Store {
 
 fn atomic_save(path: &Path, bytes: &[u8]) -> Result<()> {
     host_paths::atomic_write(path, bytes, 0o600).map_err(|_| failure())
-}
-
-/// Whether writing `proposed` would change the logical fallback. An equivalent
-/// selection keeps the exact existing bytes, so it never rewrites the user's
-/// formatting or a legacy spelling; a record that cannot be decoded here was
-/// already validated by `snapshot_at`, so it is a hard error, not a change.
-fn fallback_bytes_differ(previous: &Option<Vec<u8>>, proposed: &[u8]) -> Result<bool> {
-    let Some(previous) = previous else {
-        return Ok(true);
-    };
-    let previous = default::decode_snapshot(previous)?;
-    let proposed = default::decode_snapshot(proposed)?;
-    Ok(!same_canonical(previous.as_str(), proposed.as_str())?)
-}
-
-/// The digest one immutable reference states: the content half of R5's "already
-/// uses it". `ImmutableImageRef::parse` already required a digest, so a reference
-/// that states none is damage.
-fn stated_digest(reference: &ImmutableImageRef) -> Result<ManifestDigest> {
-    CanonicalOciReference::parse(reference.as_str())
-        .ok()
-        .and_then(|canonical| canonical.digest().cloned())
-        .ok_or_else(corrupt)
 }
 
 /// The exclusive locks one mutation holds; dropping them ends the transaction.
@@ -2331,120 +2252,11 @@ mod tests {
         }
     }
 
-    /// Test 6: `image set-default` writes only the host record, keeps an
-    /// equivalent spelling byte-for-byte, and reports what the invoking project
-    /// boots from the same under-lock read.
+    /// A leftover S1 journal is recovered by the next write that touches the
+    /// default — here a first establishment, the live caller that still asks for
+    /// the host lock — so a new save never stacks on an unrecovered transaction.
     #[test]
-    fn set_host_default_writes_only_the_host_record() {
-        let (_dir, store) = paths();
-        let a = candidate('a');
-        store
-            .commit_pin(&a, &Approval::initial(&a), DefaultAction::None)
-            .unwrap();
-        let pins = std::fs::read(store.record()).unwrap();
-        let outcome = store.set_host_default(&child('b'), &project()).unwrap();
-        assert_eq!(outcome.retained_default, DefaultChange::Initialized);
-        assert_eq!(outcome.this_project, InvokingProject::NotEstablished);
-        assert!(
-            store.read().unwrap().unwrap().pending_default.is_none(),
-            "AC12: set-default's host save commits no journal"
-        );
-        assert_eq!(
-            std::fs::read(store.record()).unwrap(),
-            pins,
-            "no pin written"
-        );
-        assert_eq!(host_reference(&store).unwrap(), child('b').as_str());
-
-        // An established project that boots other content keeps its own default,
-        // and nothing about the project's record changes.
-        let (selected_a, reference_a) = selected('a');
-        store
-            .commit_with(
-                &selected_a,
-                &Approval::initial(&selected_a),
-                establish(&reference_a, HostRetention::Keep),
-            )
-            .unwrap();
-        let pins = std::fs::read(store.record()).unwrap();
-        let outcome = store.set_host_default(&child('c'), &project()).unwrap();
-        assert_eq!(outcome.retained_default, DefaultChange::Replaced);
-        assert_eq!(outcome.this_project, InvokingProject::KeepsItsOwn);
-        assert_eq!(std::fs::read(store.record()).unwrap(), pins);
-        assert_eq!(host_reference(&store).unwrap(), child('c').as_str());
-        assert_eq!(
-            defaults_of(&store)[0].reference().whole(),
-            reference_a.as_str()
-        );
-
-        // An index default whose approved child is the new host child already
-        // uses it, even though it boots a different reference.
-        let other_project = ProjectId::for_tests('b');
-        let (index, reference_index) = selected_in(&other_project, 'd');
-        store
-            .commit_with(
-                &index,
-                &Approval::initial(&index),
-                establish(&reference_index, HostRetention::Keep),
-            )
-            .unwrap();
-        let outcome = store.set_host_default(&child('d'), &other_project).unwrap();
-        assert_eq!(outcome.this_project, InvokingProject::AlreadyUses);
-
-        // The same booted child served by another repository is still "already
-        // uses it" (R5): the disposition compares content, not repository
-        // identity, so a mirror of the manifest does not read as different
-        // content.
-        let mirrored_project = ProjectId::for_tests('c');
-        let elsewhere =
-            ImmutableImageRef::parse(&format!("ghcr.io/example/mirror@sha256:{}", "e".repeat(64)))
-                .unwrap();
-        let mut mirrored = candidate_in(&mirrored_project, 'e');
-        mirrored.key.reference = CanonicalOciReference::parse(elsewhere.as_str()).unwrap();
-        store
-            .commit_with(
-                &mirrored,
-                &Approval::initial(&mirrored),
-                establish(&elsewhere, HostRetention::Keep),
-            )
-            .unwrap();
-        let outcome = store
-            .set_host_default(&child('e'), &mirrored_project)
-            .unwrap();
-        assert_eq!(
-            outcome.this_project,
-            InvokingProject::AlreadyUses,
-            "same content in another repository already boots"
-        );
-
-        // A semantically identical record preserves the user's exact bytes,
-        // including a legacy spelling.
-        let hand = format!(
-            "{{ \"image\": \"alpine@sha256:{}\", \"version\": 1 }}\n",
-            "c".repeat(64)
-        )
-        .into_bytes();
-        std::fs::write(store.directory.join(SELECTION_FILE), &hand).unwrap();
-        let outcome = store.set_host_default(&child('c'), &project()).unwrap();
-        assert_eq!(outcome.retained_default, DefaultChange::Unchanged);
-        assert_eq!(host_default(&store).unwrap(), hand);
-        for path in [
-            store.record(),
-            store.lock_path(),
-            store.directory.join(SELECTION_FILE),
-            store.directory.join(DEFAULT_LOCK_FILE),
-        ] {
-            assert_eq!(
-                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-        }
-    }
-
-    /// Test 7: a leftover S1 journal is recovered by the next write, so
-    /// set-default's host save never stacks on an unrecovered transaction.
-    #[test]
-    fn set_host_default_recovers_an_s1_journal_before_writing() {
+    fn an_establishing_write_recovers_a_leftover_journal_before_saving() {
         let (_dir, store) = paths();
         let previous = default_bytes('a');
         let proposed = String::from_utf8(default_bytes('b')).unwrap();
@@ -2459,10 +2271,23 @@ mod tests {
         store.write_default(Some(proposed.as_bytes())).unwrap();
         assert_eq!(store.observe().unwrap().1.unwrap(), previous);
 
-        let outcome = store.set_host_default(&child('c'), &project()).unwrap();
-        assert_eq!(outcome.retained_default, DefaultChange::Replaced);
+        let (candidate, reference) = selected('c');
+        let committed = store
+            .commit_with(
+                &candidate,
+                &Approval::initial(&candidate),
+                establish(&reference, HostRetention::InitializeIfAbsent),
+            )
+            .unwrap();
+        assert_eq!(committed.project_default, ProjectDefaultChange::Established);
         assert!(store.read().unwrap().unwrap().pending_default.is_none());
-        assert_eq!(host_reference(&store).unwrap(), child('c').as_str());
+        assert_eq!(
+            defaults_of(&store)[0].reference().whole(),
+            reference.as_str()
+        );
+        // The journal's rollback restored the old host bytes, and an existing
+        // record is not replaced by an establishing write.
+        assert_eq!(host_reference(&store).unwrap(), child('a').as_str());
     }
 
     #[test]
@@ -2963,8 +2788,18 @@ mod tests {
         )
         .unwrap();
         let start = Instant::now();
-        // set-default takes pin EX then default EX, the one path that needs both.
-        let error = store.set_host_default(&child('b'), &project()).unwrap_err();
+        // A first establishment takes pin EX then default EX, the one live path
+        // that needs both.
+        let (candidate, reference) = selected('b');
+        let error = match store.commit(
+            &candidate,
+            &Approval::initial(&candidate),
+            establish(&reference, HostRetention::InitializeIfAbsent),
+            RoleClaim::Keep,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a contended default lock must fail this write"),
+        };
         assert!(error.to_string().contains("timed out"));
         assert!(start.elapsed() >= WRITE_WAIT);
         // One budget, not two: a run that also spent the pin's share before the
@@ -3114,7 +2949,6 @@ mod tests {
             store
                 .commit_pin(&a, &Approval::initial(&a), DefaultAction::None)
                 .unwrap_err(),
-            store.set_host_default(&child('b'), &project()).unwrap_err(),
             store.load_default().unwrap_err(),
         ] {
             let text = format!("{error:#}");

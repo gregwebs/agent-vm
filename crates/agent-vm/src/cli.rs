@@ -236,8 +236,8 @@ pub(crate) enum Cmd {
     /// Manage agent-vm's own values in the host system keychain.
     Secret(secret::Args),
 
-    /// Inspect the selected boot image, acquire it into the image cache,
-    /// explicitly retain a default, or build/import a finished image.
+    /// Inspect the selected boot image, acquire it into the image cache, save
+    /// this project's boot image reference, or build/import a finished image.
     /// Only `show` is offline; only build/import may invoke Docker.
     Image(crate::image_cmd::Args),
 

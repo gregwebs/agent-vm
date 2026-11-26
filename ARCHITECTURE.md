@@ -61,7 +61,8 @@ crates/agent-vm/src/
 │                           #   mount_sets and egress_sets (four presence triggers)
 ├── boot_image.rs           # the one boot-image selection seam (CLI/env/config/default)
 │   ├── default_selection.rs#   journal-aware host starting choice (bounded shared lock)
-│   └── upgrade.rs          #   set-default command shape: explicit typed target
+│   └── upgrade.rs          #   set-default order, typed target and notice
+├── project_config_writer.rs# verified project-config route, snapshot, splice and publish (ADR-0078)
 ├── project.rs              # the one project capture (canonical cwd → session + approval scope)
 ├── image_pin.rs            # project-scoped OCI approval: prepare before create, explicit pull
 │   ├── project_default.rs  #   a project's own default and the host starting choice
@@ -1077,8 +1078,8 @@ source gitlink (contributors only) → independent standard release
 
 The compiled v0.1.3 initial recommendation names the multiarch **index**. Native
 msb chooses the host child; successful first adoption keeps the index reference.
-An explicit `image set-default` instead retains the resolved child digest. Installed binary
-and runtime paths never read image sources. Chrome remains an optional
+An explicit `image set-default` saves its typed reference in the invoking
+project's config. Installed binary and runtime paths never read image sources. Chrome remains an optional
 [user-Dockerfile example](https://github.com/gregwebs/agent-vm-images/tree/main/examples/layers/chrome-devtools)
 in agent-vm-images, not standard content.
 
@@ -1143,25 +1144,25 @@ selected image verbatim (see
 $HOME/.config/agent-vm/image-pins.json ◄───────────────────────┴─ project approval (every OCI source)
    (project defaults, #541)                                       + the project's own default,
 $HOME/.config/agent-vm/image-pins.lock                             one save after acquisition
-$HOME/.config/agent-vm/default-image.json ◄── image set-default, and a first pin whose
-   (digest-only starting choice, #392)          selection was the recommendation
-                                                (the host starting choice)
-   (digest-only starting choice, #392)
+$HOME/.config/agent-vm/projects/<id>/config.toml ◄── image set-default
+   (root image reference; verified writer, ADR-0078)
+$HOME/.config/agent-vm/default-image.json ◄── first successful recommendation acquisition
+   (digest-only starting choice, #392)          (the host starting choice)
 ```
 
 The **saved selection is not the image cache.** A record names exact content; msb
 owns the bytes and may refetch a missing layer. The records are not project or
 launcher-version artifacts: they live with the user-scoped settings, so a new
-project, a cleared cache or a new `AGENT_VM_STATE_DIR` leaves them alone. Reading
-them is lazy and read-only, which is why `help`, `image show` and `doctor` may
-touch nothing. The default slot is, in order, the **project's own default**, the
-host's **retained default**, and the initial recommendation; the host record is
-read only when the project has none, so a damaged host record cannot break an
-established project. A project establishes its default write-once on its first
-successful default-tier preparation, after the image was acquired, in the same
-save as its first pin. Launch and `setup` never move an established default;
-`image set-default` writes only the host record, and only an explicit
-`image pull` may adopt a different host record (ADR-0067).
+project, a cleared cache or a new `AGENT_VM_STATE_DIR` leaves them alone. Boot
+precedence is launch build, command-line `--image`, `AGENT_VM_IMAGE_TAG`, root
+project-config `image`, the first allowed source image, then the default slot.
+The default slot is, in order, the **project's own default**, the host's
+**retained default**, and the initial recommendation. A project establishes its
+default write-once on its first successful default-tier preparation, after the
+image was acquired, in the same save as its first pin. `image set-default`
+acquires a typed reference and saves only the project-config selection through
+`project_config_writer`; it writes no approval or host record. Only an explicit
+`image pull` may adopt a different host record (ADR-0067, ADR-0078).
 
 **Approval is not cache evidence either.** Every OCI selection — from any tier —
 is keyed by **`(project, canonical reference, host Linux platform)`** in
@@ -1196,31 +1197,36 @@ Explicit `image set-default` adds a separate edge:
 
 ```text
 image set-default --image REF
-  → canonical typed target (ambient selection ignored)
-  → healthy pin/default snapshot → resolve current registry content ONCE
-  → validated candidate (no approval is written; nothing is asked)
-  → shared cache barrier → pin EX → default EX (recovers a leftover S1 journal)
-      atomic default {approved host child}             ← commit, one save
-  → release; completion output is best-effort
-  → the notice says whether this project keeps its own default
+  → typed OCI target (ambient selection ignored)
+  → verified project-config preflight (before network/state setup)
+  → acquire and validate REF → compare observed approval (no approval is written)
+  → verified snapshot → root-image byte splice → config.lock → compare-and-publish
+  → notice: saved reference; overrides and approvals unchanged
 ```
 
-One resolution per invocation: `AcquireMode::ResolveCurrent` preserves the
-validated host child (and its receipt) itself, so a moving index cannot be
-resolved twice and no duplicate derived pull is needed. The returned host
-manifest digest, not an index digest or moving tag, is retained. Native auth/TLS, OCI integrity,
-materialization and cache I/O are trusted runtime operations. The small platform
-conjunction is proved; JSON decoding and platform comparisons are trusted.
-Acquisition and revalidation run outside the HOME locks. The pin transaction is a
-compare-and-swap on the revision and digest that were displayed: same-pin
-replacement preserves bytes, a peer that moved the pin first makes this
-operation fail, and establishment stays insert-if-absent. A store 0.7.39–0.7.46
-left with a `pending_default` intent is recovered by the next write before it
-does its own work; readers never recover, clear or write, and observe the old
-logical state. 0.7.47 writes no intent (ADR-0067). No fsync/power-loss guarantee
-is claimed. Old cache artifacts and active sessions are never removed by
-set-default. See
-[USAGE](USAGE.md#project-scoped-approval-of-oci-image-content) for the operational details.
+The writer's snapshot is a read: it creates nothing and records only route
+levels that exist, an optional lock identity, and file bytes/identity or absence.
+Only publication bootstraps a missing store or first lock. Under `config.lock`,
+and again immediately before `renameat`, a fence re-states every admitted route
+name from the descriptor above it and re-measures directory authority. It also
+re-applies the destination boundary (type, owner, mode, link count, identity,
+size and owner-write), so a moved outer route, retargeted admitted alias, or
+authority-only change becomes a typed conflict. The planner's unchanged result
+still enters this compare-and-publish; only the writer's post-lock answer is
+`Unchanged`.
+
+The acquisition cache barrier is held during publication; `config.lock` is
+acquired beneath it. No cache, OCI, pin, or source lock is acquired from inside
+`config.lock`. The commit is a rename of a fully written `0600` sibling
+temporary; ordinary errors leave the old file (or absence) visible. The final
+fence and rename are distinct operations, so a same-user chmod or rename can
+land in that gap. `File::flush` is not `fsync`, and temporary cleanup is
+best-effort. Native auth/TLS, OCI integrity, materialization and cache I/O
+remain trusted runtime operations. The command saves the reference, not the
+child it acquired: a moved tag and contemporaneous approval can change the next
+launch. When the saved project-config selection wins, its banner prints the
+reference, not the digest. See
+[ADR-0078](docs/adr/0078-project-config-writer.md).
 
 `image pull` acquires without launching, and running it is its own consent:
 
@@ -1447,14 +1453,15 @@ content needs a replacement approval. An immutable source that resolves to
 different content is an integrity failure with no approval path.
 
 **Why two files, and why no journal any more.** 0.7.39–0.7.46 needed a bounded
-`pending_default` intent because `set-default` updated both a pin and the host
-record, and writing either first and failing the second would return an error
-with changed state. 0.7.47 removed every such pair (ADR-0067): `set-default`
-writes only the host record (one atomic save), a project default and its first
-pin are one file, and the only two-file write left is a recommendation-sourced
-first default-tier use, which writes the host record **first** and the pin store
-second. No invariant ties those halves together, so a failure between them leaves
-the host starting choice initialized with measured content and the project
+`pending_default` intent because the historical `set-default` updated both a pin
+and the host record, and writing either first and failing the second would return
+an error with changed state. 0.7.47 removed every such pair (ADR-0067): a project
+default and its first pin are one file, and the only two-file write left is a
+recommendation-sourced first default-tier use, which writes the host record
+**first** and the pin store second. ADR-0078 later moved `set-default` to the
+separate project-config transaction; it neither writes nor recovers this journal.
+No invariant ties the remaining two halves together, so a failure between them
+leaves the host starting choice initialized with measured content and the project
 unestablished; the next default-tier use completes it. That narrows the
 failed-operation guarantee this journal existed for.
 
@@ -2166,6 +2173,7 @@ directories the user never asked for. The state-root precedence is in
 | Image network requests reported once per reference, then as changes | [ADR-0060](docs/adr/0060-image-network-requests-reported-once-then-as-changes.md) |
 | Explicit launch builds with `--dockerfile` (amends ADR-0035's "no launch builds an image") | [ADR-0061](docs/adr/0061-explicit-launch-builds.md) |
 | Launch builds skip an unchanged export (amends ADR-0061 §5) | [ADR-0071](docs/adr/0071-launch-builds-skip-an-unchanged-export.md) |
+| Project-config writer | [ADR-0078](docs/adr/0078-project-config-writer.md) |
 
 ## Deliberate non-goals
 

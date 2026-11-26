@@ -190,9 +190,9 @@ OWNED_BUILDER=""
 # without `allow_tools` would otherwise launch nothing and pass the rows below
 # misleadingly; 0.8.3 is the first with `[[sources]]` tables (ADR-0076), so a
 # 0.8.2 reader would fail every seeded project config as a schema error; 0.8.4
-# pins every `trust = false` source before decoding. Version 0.8.4 is the
-# minimum branch contract; these VM fixtures do not themselves exercise the pin
-# gate.
+# pins every `trust = false` source before decoding; 0.8.5 writes the root image
+# through the verified project-config writer. Version 0.8.5 is the minimum branch
+# contract; these VM fixtures do not themselves exercise the pin gate.
 candidate_reads_host_managed_config() {
   local bin="$1" version major minor patch
   version="$("$bin" --version 2>/dev/null | awk 'NR == 1 {print $2}')" || return 1
@@ -206,7 +206,7 @@ candidate_reads_host_managed_config() {
   patch="${version#*.*.}"
   patch="${patch%%[!0-9]*}"
   [ "$major" -gt 0 ] ||
-    { [ "$major" -eq 0 ] && { [ "$minor" -gt 8 ] || { [ "$minor" -eq 8 ] && [ "$patch" -ge 4 ]; }; }; }
+    { [ "$major" -eq 0 ] && { [ "$minor" -gt 8 ] || { [ "$minor" -eq 8 ] && [ "$patch" -ge 5 ]; }; }; }
 }
 
 [[ -x "$AGENT_VM" ]] || die "launcher not found at $AGENT_VM; build it with
@@ -219,7 +219,7 @@ or point AGENT_VM_BIN at one."
 for candidate in "$AGENT_VM" "$AGENT_VM_DEV_BIN" "$AGENT_VM_RELEASE_BIN"; do
   [[ -x "$candidate" ]] || continue
   candidate_reads_host_managed_config "$candidate" ||
-    die "the launcher at $candidate is older than 0.8.4; it reads <project>/.agent-vm/config.toml instead of the host-managed project config (ADR-0073), predates explicit tool authorization (ADR-0075), cannot read [[sources]] tables (ADR-0076), or does not pin trust = false sources (ADR-0077). Rebuild it from this branch."
+    die "the launcher at $candidate is older than 0.8.5; it reads <project>/.agent-vm/config.toml instead of the host-managed project config (ADR-0073), predates explicit tool authorization (ADR-0075), cannot read [[sources]] tables (ADR-0076), does not pin trust = false sources (ADR-0077), or has the old set-default host-record setter instead of the verified project-config writer (ADR-0078). Rebuild it from this branch."
 done
 
 command -v docker >/dev/null 2>&1 || die "docker is required but not on PATH"
@@ -924,6 +924,27 @@ persist = [".hello-258.state"]
 name = "missing-258"
 command = "not-installed-258"
 EOF
+}
+
+# The set-default fixture owns this exact root assignment. Refuse to alter a
+# fixture whose saved reference is absent or duplicated rather than hiding it by
+# prepending another root key.
+rewrite_fixture_root_image() { # config old-ref [new-ref]
+  local config="$1" old="$2" new="${3:-}" tmp
+  tmp="$(mktemp "$WORK/root-image.XXXXXX")" || return 1
+  if ! awk -v old="image = \"$old\"" -v new="$new" '
+    $0 == old {
+      matches++
+      if (new != "") print "image = \"" new "\""
+      next
+    }
+    { print }
+    END { exit matches == 1 ? 0 : 1 }
+  ' "$config" >"$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  mv "$tmp" "$config"
 }
 
 # The file-backed Anthropic credential probe project: the marker-free fixture
@@ -5133,9 +5154,9 @@ LAUNCH
 
 # A per-check project under $WORK with the checked two-tool config.
 custom_project() {
-  local name="$1"
+  local name="$1" home="${2:-$CUSTOM_HOME}"
   local proj="$WORK/$name"
-  write_custom_tools_config "$proj" || return 1
+  write_custom_tools_config "$proj" "$home" || return 1
   printf '%s' "$proj"
 }
 
@@ -6637,12 +6658,12 @@ custom_image_retained_default() {
     return 1
   fi
   if ! candidate_reads_host_managed_config "$dev_bin"; then
-    echo "    BLOCKER: the debug candidate $dev_bin is older than 0.8.4 (ADR-0073, ADR-0075, ADR-0076, ADR-0077);"
+    echo "    BLOCKER: the debug candidate $dev_bin is older than 0.8.5 (ADR-0073, ADR-0075, ADR-0076, ADR-0077, ADR-0078);"
     echo "             rebuild it from this branch, or set AGENT_VM_DEV_BIN to one"
     return 1
   fi
   if ! candidate_reads_host_managed_config "$rel_bin"; then
-    echo "    BLOCKER: the release candidate $rel_bin is older than 0.8.4 (ADR-0073, ADR-0075, ADR-0076, ADR-0077);"
+    echo "    BLOCKER: the release candidate $rel_bin is older than 0.8.5 (ADR-0073, ADR-0075, ADR-0076, ADR-0077, ADR-0078);"
     echo "             rebuild it from this branch, or set AGENT_VM_RELEASE_BIN to one"
     return 1
   fi
@@ -6877,7 +6898,7 @@ upgrade_docker() {
 # reserialize to *those* bytes, not to whatever the cache happens to hold.
 upgrade_cache_snapshot() { # ref out
   "$HARNESS" e2e-cache-inventory --cache "$RETAINED_STATE/msb-home/cache" \
-    --ref "$1" --fixture "$WORK/upgrade-b-manifest.json" --out "$2"
+    --reference "$1" --fixture "$WORK/upgrade-b-manifest.json" --out "$2"
 }
 
 # Count manifest/blob access records in one registry log text. Registry v3
@@ -6994,27 +7015,24 @@ custom_image_default_upgrade() {
       require_launch_ok upgrade-command || result=1
       assert_eq 'upgrade creates no sandbox entries' "$catalog_before" "$(avm_retained_state msb list --format json)" || result=1
       assert_eq 'upgrade creates no VM processes' "$pids_before" "$(runtime_pids)" || result=1
-      jq -e --arg ref "$ref_b" '.version == 1 and .image == $ref' "$(retained_record)" >/dev/null || result=1
+      grep -qF "image = \"$ref_b\"" "$proj_cfg" || result=1
+      grep -qF "$ref_a" "$(retained_record)" || result=1
       kill -0 "$live_pid" 2>/dev/null || result=1
       upgrade_live_advanced "$live" "$live_pid" "$tick" || result=1
       assert_eq 'live A process identity unchanged' "$identity" "$(cat "$live/identity")" || result=1
       grep -q '^stamp=absent$' "$live/status" || result=1
       assert_no_host_calls || result=1
-      # #541 B1: this project is established at A, so set-default changes only
-      # the host's starting choice; an explicit pull adopts B.
-      retained_launch upgrade-kept-a "$proj" --no-git hello-258 || result=1
-      require_launch_ok upgrade-kept-a || result=1
-      grep -q '^stamp=absent$' "$WORK/upgrade-kept-a.out" || result=1
-      retained_launch upgrade-adopt "$proj" image pull || result=1
-      require_launch_ok upgrade-adopt || result=1
+      # The root project image now outranks this project's established default.
       retained_launch upgrade-new-b "$proj" --no-git hello-258 || result=1
       require_launch_ok upgrade-new-b || result=1
       grep -q '^stamp=present$' "$WORK/upgrade-new-b.out" || result=1
+      cp "$proj_cfg" "$WORK/upgrade-config-before"
       cp "$(retained_record)" "$WORK/upgrade-record-before"
       upgrade_cache_snapshot "$ref_b" "$WORK/upgrade-cache-before" || result=1
       tick="$(cat "$live/tick")"
       retained_launch upgrade-failure "$proj" image set-default --image "localhost:$port/$repo:unavailable" || result=1
       [ "$CAPTURE_STATUS" -eq 1 ] || result=1
+      cmp "$proj_cfg" "$WORK/upgrade-config-before" || result=1
       cmp "$(retained_record)" "$WORK/upgrade-record-before" || result=1
       upgrade_cache_snapshot "$ref_b" "$WORK/upgrade-cache-after" || result=1
       cmp "$WORK/upgrade-cache-before" "$WORK/upgrade-cache-after" || result=1
@@ -7066,6 +7084,8 @@ custom_image_default_upgrade() {
   retained_env
   retained_launch upgrade-release-warm "$proj" --no-git hello-258 || result=1
   require_launch_ok upgrade-release-warm || result=1
+  out="$(launch_output upgrade-release-warm)"
+  assert_eq 'release warm boots B' stamp=present "$(grep '^stamp=' <<<"$out")" || result=1
   reads_after="$(upgrade_registry_read_count "$container")" || result=1
   upgrade_docker logs "$container" > "$WORK/upgrade-registry-after.log" 2>&1 || result=1
   assert_eq 'warm default makes zero registry reads' "$reads_before" "$reads_after" || result=1
@@ -7079,7 +7099,7 @@ custom_image_default_upgrade() {
   # the retained default B.
   printf 'image = "%s"\n' "$ref_b" > "$RETAINED_HOME/.config/agent-vm/config.toml"
   cp "$proj_cfg" "$WORK/upgrade-project-before"
-  { printf 'image = "%s"\n' "$ref_a"; cat "$WORK/upgrade-project-before"; } > "$proj_cfg"
+  rewrite_fixture_root_image "$proj_cfg" "$ref_b" "$ref_a" || result=1
   cp "$proj_cfg" "$WORK/upgrade-project-with-image"
   cp "$RETAINED_HOME/.config/agent-vm/config.toml" "$WORK/upgrade-user-before"
   local tier expected
@@ -7097,9 +7117,10 @@ custom_image_default_upgrade() {
     cmp "$(retained_record)" "$WORK/upgrade-record-before" || result=1
     cmp "$RETAINED_HOME/.config/agent-vm/config.toml" "$WORK/upgrade-user-before" || result=1
   done
-  # User-only fallback: the project config sources the user file but sets no
-  # image, so the user image A must outrank the retained default B.
+  # User-only fallback removes only the root image set-default saved, retaining
+  # the tool declarations; user image A then outranks the retained default.
   cp "$WORK/upgrade-project-before" "$proj_cfg"
+  rewrite_fixture_root_image "$proj_cfg" "$ref_b" || result=1
   cp "$proj_cfg" "$WORK/upgrade-project-no-image"
   printf 'image = "%s"\n' "$ref_a" > "$RETAINED_HOME/.config/agent-vm/config.toml"
   cp "$RETAINED_HOME/.config/agent-vm/config.toml" "$WORK/upgrade-user-a"
@@ -7111,8 +7132,8 @@ custom_image_default_upgrade() {
   cmp "$proj_cfg" "$WORK/upgrade-project-no-image" || result=1
   cmp "$(retained_record)" "$WORK/upgrade-record-before" || result=1
   cmp "$RETAINED_HOME/.config/agent-vm/config.toml" "$WORK/upgrade-user-a" || result=1
-  # The offline rows below observe the retained default, which only wins with no
-  # user tier.
+  # Offline B must use the root project selection that set-default saved, not the
+  # retained default or a user fallback.
   rm "$RETAINED_HOME/.config/agent-vm/config.toml"
   cp "$WORK/upgrade-project-before" "$proj_cfg"
   upgrade_docker rm -f "$container" >/dev/null || result=1
@@ -7120,7 +7141,7 @@ custom_image_default_upgrade() {
   retained_launch upgrade-offline-b "$proj" --no-git hello-258 || result=1
   require_launch_ok upgrade-offline-b || result=1
   out="$(launch_output upgrade-offline-b)"
-  assert_eq 'offline default B boots' stamp=present "$(grep '^stamp=' <<<"$out")" || result=1
+  assert_eq 'offline saved project B boots' stamp=present "$(grep '^stamp=' <<<"$out")" || result=1
   retained_launch upgrade-offline-a "$proj" --no-git --image "$ref_a" hello-258 || result=1
   require_launch_ok upgrade-offline-a || result=1
   out="$(launch_output upgrade-offline-a)"
@@ -7290,7 +7311,7 @@ custom_image_host_pins() {
   local proj live out reads_before reads_after deadline target ready=0
   local live_pid=0 identity="" tick="" rootid="" tag_before digest_before b_before
   local cold_state default_home default_state rootfs pin_snapshot default_snapshot docker_host
-  local pins_sequence_before explicit_snapshot proj_id live_id iso_proj iso_state iso_id proj_record_before
+  local pins_sequence_before explicit_snapshot proj_id live_id iso_proj iso_state iso_id proj_record_before proj_cfg
   # The group's own precondition is Apple Silicon, so the measured host platform
   # these pins are keyed by is exactly linux/arm64.
   local host_arch="arm64"
@@ -7449,16 +7470,12 @@ custom_image_host_pins() {
   fi
 
   # ---- establish this project at A on the default tier (#541 B1) ----
-  # B1 needs a project that already booted the default tier. Every launch of
-  # `$proj` above named `--image`, which never establishes, so make A the host's
-  # starting choice and let one bare launch establish this project at it. The
-  # tag still serves A here; the record is written from the host's digest form.
+  # Every launch of `$proj` above named `--image`, which never establishes. Seed
+  # the retained starting choice directly, then let one bare launch establish A.
+  # `image set-default` now writes project config and is tested below.
   pins_env "$WORK/pins-home" "$WORK/pins-state"
-  pins_avm "$proj" image set-default --image "$tag" >"$WORK/pins-establish-host.out" 2>&1 || {
-    echo "    FAIL: could not make A the host's starting choice"
-    cat "$WORK/pins-establish-host.out"
-    result=1
-  }
+  mkdir -p "$(dirname "$(pins_record)")" || result=1
+  printf '{"version":1,"image":"%s"}\n' "$ref_a" >"$(pins_record)" || result=1
   pins_launch pins-establish "$proj" hello-258 || result=1
   require_launch_ok pins-establish || result=1
   assert_eq "the establishing default-tier launch boots A" "stamp=absent" \
@@ -7768,43 +7785,33 @@ custom_image_host_pins() {
     result=1
   fi
 
-  # set-default: the explicit target ignores ambient selection, stores the
-  # approved host child, and future precedence is unchanged.
+  # set-default saves the explicit reference in this project's config. It must
+  # not rewrite the retained default or the approval that already names B.
+  cp "$(pins_store)" "$WORK/pins-before-set-default" || result=1
+  cp "$(pins_record)" "$WORK/pins-record-before-set-default" || result=1
   pins_avm "$proj" image set-default --image "$tag" >"$WORK/pins-set-default.out" 2>&1 || {
     echo "    FAIL: set-default of the approved target failed"
     cat "$WORK/pins-set-default.out"
     result=1
   }
-  if ! jq -e --arg ref "$ref_b" '.version == 1 and .image == $ref' "$(pins_record)" >/dev/null 2>&1; then
-    echo "    FAIL: set-default did not retain the approved host child B"
-    cat "$(pins_record)" 2>/dev/null || true
-    result=1
-  fi
-  # #541 B1: this project already booted the default tier (established at A), so
-  # set-default changes only the host's starting choice. An explicit pull in
-  # the project is what adopts B.
-  pins_launch pins-default-kept "$proj" hello-258 || result=1
-  require_launch_ok pins-default-kept || result=1
-  assert_eq "an established project keeps its own default after set-default" \
-    "stamp=absent" "$(pins_stamp pins-default-kept)" || result=1
-  pins_avm "$proj" image pull >"$WORK/pins-adopt.out" 2>&1 || {
-    echo "    FAIL: the adopting pull failed"
-    cat "$WORK/pins-adopt.out"
+  proj_cfg="$(host_project_config "$proj" "$PINS_HOME")" || result=1
+  grep -qF "image = \"$tag\"" "$proj_cfg" || {
+    echo "    FAIL: set-default did not save the explicit project image reference"
+    cat "$proj_cfg" 2>/dev/null || true
     result=1
   }
-  assert_match "the adopting pull renders the change" \
-    "Adopting the host's default boot image" "$(cat "$WORK/pins-adopt.out")" || result=1
-  if ! jq -e --arg p "$proj_id" --arg ref "$ref_b" \
-    '[.defaults[] | select(.project == $p)] | length == 1 and .[0].image == $ref' \
-    "$(pins_store)" >/dev/null 2>&1; then
-    echo "    FAIL: the adopting pull did not move this project's default to B"
-    cat "$(pins_store)" 2>/dev/null || true
+  if ! cmp -s "$WORK/pins-before-set-default" "$(pins_store)"; then
+    echo "    FAIL: set-default changed approval bytes"
     result=1
   fi
-  pins_launch pins-default-b "$proj" hello-258 || result=1
-  require_launch_ok pins-default-b || result=1
-  assert_eq "after the adopting pull the project boots B" "stamp=present" \
-    "$(pins_stamp pins-default-b)" || result=1
+  if ! cmp -s "$WORK/pins-record-before-set-default" "$(pins_record)"; then
+    echo "    FAIL: set-default changed retained-default bytes"
+    result=1
+  fi
+  pins_launch pins-config-b "$proj" hello-258 || result=1
+  require_launch_ok pins-config-b || result=1
+  assert_eq "the project config image outranks an established default" "stamp=present" \
+    "$(pins_stamp pins-config-b)" || result=1
   pins_launch pins-override-a "$proj" --image "$ref_a" hello-258 || result=1
   require_launch_ok pins-override-a || result=1
   assert_eq "an explicit override still outranks the fallback" "stamp=absent" \
@@ -7838,9 +7845,9 @@ custom_image_host_pins() {
     "$(grep '^plain=' <<<"$out")" || result=1
 
   # ---- an explicit import of the pinned tag moves the guest (#391) ----
-  # The default-tier launches above moved Boot to the project default's
-  # digest-spelled keys, so with Output resolved the tag's record was retired
-  # (ADR-0068 R2: a known-inactive approval is not retained). Approve the tag
+  # The project-config and explicit-override launches above moved Boot away from
+  # the tag. With Output resolved, its record was retired (ADR-0068 R2: a
+  # known-inactive approval is not retained). Approve the tag
   # again by launching it — a fresh cache-first pin at the tag's current B — so
   # the import below has a predecessor to render.
   pins_env "$WORK/pins-home" "$WORK/pins-state"

@@ -78,8 +78,8 @@ image pull [--image REF]            pull the ambient boot operation and recorded
                                     for an unheld default), or one in-use REF;
                                     approve without asking, without booting;
                                     retain partial successes
-image set-default --image REF      set the host's starting default for projects
-                                    that have none
+image set-default --image REF      save this project's explicit boot-image
+                                    reference in its host-managed config
 tools print [NAME...]               print the built-in tool definitions (all, or
                                     just NAMEs) as user-config TOML
 setup                               acquire the selected image + verify boot
@@ -253,8 +253,8 @@ request (status 1), naming no value:
 `agent-vm image pull --image REF` targets only references currently in use by this project on the host platform; the requested reference is not in that set. To acquire and approve a new boot reference, run `agent-vm setup --image REF --no-verify`; `image build` and `image import` approve their own output references. Nothing was acquired or approved.
 ```
 
-`image set-default` is the renamed deliberate default operation (below), with
-the same acquisition-before-publication safety. Pull and set-default accept
+`image set-default` deliberately saves this project's boot-image reference (below),
+with acquisition before publication. Pull and set-default accept
 only OCI references; a local rootfs/disk path is rejected with advice to launch
 it explicitly (`agent-vm --image PATH <tool>`). Local-path **launches** remain
 supported. `setup` now enforces the same OCI-only acquisition rule for its
@@ -316,8 +316,8 @@ ghcr.io/gregwebs/agent-vm-standard@sha256:04701db70ef6c2c75078ca39a85ce4b4c15b04
 ```
 
 Native msb selects its Linux host-platform child. Successful default acquisition
-retains the **index** reference; explicit `image set-default` retains its
-resolved native **child** digest. Existing records and explicit selections are unaffected.
+retains the **index** reference; `image set-default` saves its explicit reference
+in the invoking project's config. Existing records are unaffected.
 Matching per-architecture GitHub Release archives are for explicit import, never
 a registry-failure fallback. See the [image owner's release contract](https://github.com/gregwebs/agent-vm-images/blob/main/docs/standard-image-releases.md)
 for authentication and publication policy. A source rebuild need not reproduce
@@ -480,32 +480,23 @@ Declining is done by not running the command. See
 #### Project default boot images
 
 Each project keeps its own **default boot image** once it has one, recorded with
-its approvals in `image-pins.json`. The host's retained default becomes only the
-*starting choice* for a project that has none, so `image set-default` no longer
-moves projects that have already established a default.
+its approvals in `image-pins.json`. The host's retained default is only the
+*starting choice* when no higher-precedence image source wins. `image set-default`
+now saves a higher-precedence project-config reference; it does not change either
+default record.
 
 A project establishes its default on its first **default-tier** preparation — a
 launch, `setup`, or `image pull` — from whichever starting choice it used
 (the host's retained digest, or the initial recommendation when the host has
-none). It is write-once: a launch or `setup` never moves it afterwards, and
-neither does `image set-default`. Only an explicit `image pull` in that
-project moves it, to the host's existing retained default, and running that
-command is the consent.
+none). It is write-once: a launch, `setup`, or `image set-default` never moves it
+afterwards. Only an explicit `image pull` in that project moves it, to the
+host's existing retained default, and running that command is the consent.
 
-```text
-$ agent-vm image set-default --image ghcr.io/o/app:b      # in project P
-Default boot image selected for projects that have none yet; established projects,
-image overrides and running sessions are unchanged. This project keeps its own
-default boot image; run `agent-vm image pull` here to adopt this one.
-
-$ agent-vm image pull                                 # in project P
-Adopting the host's default boot image (linux/arm64) in this project:
-  old: sha256:<the digest P boots>
-  new: sha256:<the digest the host record names>
-==> this project now uses the host's default boot image
-==> pull [1/1] the default boot image (linux/arm64): approved none -> sha256:<new>; default=adopted sha256:<old> -> sha256:<new>
-==> image pull: 1 succeeded, 0 failed
-```
+`image set-default --image REF` writes `image = "REF"` in this project's
+host-managed config, so that reference wins over the project default and retained
+default at the next selection. It does not establish, adopt, move, or approve a
+default. To let the default tier select again, remove or change the project
+config's root `image` with your editor; `agent-vm config` (#739) is not shipped.
 
 - A pull adopts only a host record that **exists**. With none, it re-verifies
   the project's own default and adopts no bookmark, so a launcher upgrade whose
@@ -660,7 +651,9 @@ migration is needed. These were the user-visible changes:
 
 #### Behavior changes in 0.7.47
 
-No reset or migration is needed. These are the user-visible changes, each with a
+Historical 0.7.47 behavior. The `image set-default` entries are superseded by
+[Setting this project's boot image](#setting-this-projects-boot-image); the
+migration history remains here. No reset or migration is needed. These are the user-visible changes, each with a
 replacement command or its new output:
 
 | # | Change | Replacement command or new output |
@@ -1002,9 +995,9 @@ that project.
 
 The [retained default](#the-retained-default) keeps its existing digest-only
 storage: `default-image.json` never records a source tag, platform or tool
-metadata. `image set-default` stores its approved host child there, so a pull
-reacquires the retained digest rather than following the tag it was originally
-selected from (issue #392). Establishment is per project (see
+metadata. Historically, `image set-default` stored its approved host child there;
+that behavior is superseded by [ADR-0078](docs/adr/0078-project-config-writer.md).
+Establishment is per project (see
 [Project default boot images](#project-default-boot-images)): an absent host
 record is initialized only from the initial recommendation, after successful
 acquisition, and an existing record is never moved by a launch, a `setup` or a
@@ -1198,8 +1191,9 @@ It *names exact image content* (a digest, never a moving tag); microsandbox
 separately downloads and caches that content. So the default is independent of
 the msb cache and of every project: clearing the cache, enabling the shared
 cache, changing `AGENT_VM_STATE_DIR` or working in another directory does not
-move it. Change it deliberately with
-[image set-default](#explicitly-setting-the-default).
+move it. An explicit `image pull` is the only operation that adopts an
+existing retained default into an established project's default; `image set-default`
+writes the higher-precedence project config instead.
 It is deliberately a separate file from `config.toml` — writing a
 top-level `image =` there would make the *user config* tier win over the
 *project* tier, which is a precedence change, not a bookmark.
@@ -1223,8 +1217,9 @@ multiarch index, and a newer release may change it). How the two interact:
   a launcher upgrade, a project image, a project default, or a cache loss leaves
   the retained digest alone. Automatic initialization is insert-if-absent and
   only ever writes the recommendation, under the host lock, so concurrent first
-  launches cannot overwrite each other. Only `image set-default` replaces it, and
-  only an explicit `image pull` moves a project default to it.
+  launches cannot overwrite each other. Only an explicit `image pull` moves a
+  project default to it; `image set-default` writes the higher-precedence project
+  config instead.
 - **The digest is also a project approval.** The default tier participates in
   the same [project-scoped approval](#project-scoped-approval-of-oci-image-content)
   as every other source: once pinned, a launch consumes the approved child and
@@ -1274,73 +1269,82 @@ aside to reinitialize from the current recommendation. That is separate from a
 damaged [pin store](#damaged-or-reset-approvals), which needs its own repair or
 deliberate reset.
 
-### Explicitly setting the default
+### Setting this project's boot image
 
 ```sh
 agent-vm image set-default --image ghcr.io/owner/standard:release-2
-agent-vm --no-git shell bash -c 'my-program --version'
 ```
 
 `--image REF` is required and accepts an OCI tag or digest, not a local path.
-Environment/config launch images do not choose the set-default target, even with
-a broken tool configuration. There is no automatic latest discovery; explicitly
-requesting `:latest` resolves it only for this invocation.
-
-This command changes the host's **starting choice** and nothing else. It writes
-no approval in any project, so it cannot change what an established project
-boots — not even the project it was run in — and it never asks (§ no `--yes`, see
-[Replacing an approval](#replacing-an-approval)). A project that has not yet
-booted the default tier has no default of its own, so this is its starting
-choice: its next default-tier launch boots the new image and establishes it
-(behavior change B6).
+The target is explicit: environment/config launch images, an image option outside
+this subcommand, a broken catalog, and the current recommendation do not choose
+it. The command acquires and validates `REF`, then saves it as the root `image`
+in this project's host-managed config:
 
 ```text
-explicit OCI target → healthy record snapshot → resolve current content once
-                    → validated host child
-                    → pin EX → default EX (recovers a 0.7.46 journal, if any)
-                        atomic default {approved host child}   ← commit
-                    → release; the notice says what this project does next
+$HOME/.config/agent-vm/projects/<project-id>/config.toml
 ```
 
-Who the change reaches:
+If that file is absent, the command creates it with `image = "REF"` and an
+explicit `[[sources]]` `home` seed. An existing file keeps every original byte
+outside the root `image` edit, including comments and line endings; an existing
+zero-byte file receives no final newline. The reference therefore wins
+at the project-config position in [selection precedence](#selecting-the-boot-image),
+ahead of both default records. It affects this project only; it does not write
+`default-image.json`, establish or move a project default, or change another
+project.
 
-- **Projects without an established default** — including every project that has
-  never booted the default tier — start from it.
-- **Established projects keep their own default.** Run `agent-vm image pull`
-  in one to adopt the new host choice (see
-  [Project default boot images](#project-default-boot-images)).
+The order is deliberately:
 
 ```text
-$ agent-vm image set-default --image ghcr.io/owner/standard:release-2
-Default boot image selected for projects that have none yet; established projects,
-image overrides and running sessions are unchanged. This project has no default
-boot image yet, so its next default-image session starts from this one.
+verified config preflight → acquire and validate REF → approval comparison
+                         → snapshot → narrow config edit → compare-and-publish
 ```
 
-The command uses the ambient **local** microsandbox cache and native registry
-auth/TLS settings. It consumes registry content without Docker and **does not
-boot or replace a VM**. CLI, environment, user and project image overrides, and
-running sessions, are untouched. Acquisition or save failure exits nonzero and
-leaves the old selection usable. A successfully re-acquired same selection
-leaves the record's exact bytes unchanged and reports "already selected". An
-interrupted run of 0.7.46 or earlier is recovered by the next write; 0.7.47
-writes no journal. No old images are deleted.
+The command validates and acquires but does **not** approve anything. Overrides
+and approvals remain unchanged. A saved mutable tag is a reference, not a promise
+that the next launch uses the child acquired here: a tag, approval, or config can
+change before that launch. The launch banner prints the selected *reference*, not
+the digest that boots: where an approval exists for that reference, the approved
+child is what runs. If an existing approval for that reference names a
+different child, the command exits 1 without saving. Re-resolve and approve the
+**held reference** with `agent-vm image pull --image REF` only when that reference
+is already in use by this project; otherwise, or to roll back after reacquiring,
+use `image set-default` with the intended immutable digest reference
+(`repo@sha256:…`). A digest does not bypass OCI authority. On success it prints:
 
-An absent record is initialized directly, without consulting the initial
-recommendation. A damaged record is rejected, not automatically repaired; use
-the recovery procedure above.
+```text
+Project boot image reference saved to the project config at <path>. Overrides and approvals are unchanged.
+```
 
-Roll back by passing a known previous full digest reference to the same
-`image set-default --image` command. Acquisition must succeed again before the
-starting choice changes; `image pull --image` remains a cache reacquisition
-and approval, never a host-record replacement. A launch that already selected
-the previous default may still boot it.
+A newly supplied `ALIAS:image` is refused by the argument parser (status 2),
+before acquisition or a write, because that spelling would be a sourced-config
+selection in the project file rather than the intended OCI reference. Runtime
+refusals — acquisition, approval mismatch, or a typed save conflict — exit 1.
+The parser never echoes the rejected `ALIAS:image`; runtime diagnostics redact
+stored/default references except on the explicit `image show` and `image pins`
+inspection surfaces. The value-free advice is:
 
-Set-default progress/application errors use a fixed redacted image label, not the
-old or requested reference or native source chains. Inspect your user-owned
-records directly. Clap usage errors may echo an invalid value you supplied on
-argv (status 2); this exception does not apply to stored references.
-See [the retained default](#the-retained-default) for scope and recovery.
+```text
+set-default saves image = "REF" in the project config, where <alias>:image selects a sourced file's image instead of naming one; spell an OCI image tagged "image" with its registry (for example docker.io/library/NAME:image)
+```
+
+Use a registry-qualified image tag such as `docker.io/library/NAME:image` when
+that is the intended OCI reference.
+
+The write is narrow, not a config repair tool. An unreadable, unsafe, oversized,
+invalid-UTF-8, invalid-TOML, duplicate-key, non-string-root-image, or
+mis-scoped-image config can make the command refuse without writing. A valid TOML
+file with another schema/source/approval error can receive the edit, but that
+successful write does not promise that the catalog loads. `agent-vm image show`
+then reports the project-config reference if it wins; `agent-vm doctor` diagnoses
+the config independently and may still exit non-zero.
+
+A concurrent change makes the save refuse rather than overwrite the other edit.
+Review the current project config, then repeat the command against the intended
+root `image`; a typed conflict writes nothing. The command does not boot or
+replace a VM, and no old image is deleted. See
+[ADR-0078](docs/adr/0078-project-config-writer.md).
 
 ### Customizing the image
 
@@ -3032,10 +3036,11 @@ current directory, so a symlinked cwd names the same project as the real path.
 A repository config is **not** auto-loaded: `<project root>/.agent-vm/config.toml`
 is read only when the host-managed project config declares it as a source; no
 backwards-compatible auto-loading is kept (see [Legacy in-repo
-`.agent-vm/config.toml`](#legacy-in-repo-agent-vmconfigtoml)). agent-vm never
-creates `projects/` or `config.toml`. Interactive source approval
-may write pins only beside an existing project config; the `agent-vm config`
-subcommand does not exist yet.
+`.agent-vm/config.toml`](#legacy-in-repo-agent-vmconfigtoml)). `image set-default`
+may create the invoking project's verified `projects/<project-id>/config.toml`;
+it creates no other project's config. Interactive source approval may write pins
+only beside an existing project config; the `agent-vm config` subcommand does not
+exist yet.
 
 Both tiers are optional (an absent file is reported as `absent`; a present but
 empty one as `found, 0 tools`). With no `$HOME` at all, **both** are unavailable

@@ -26,6 +26,12 @@ owner/mode and direct regular-file/one-link admission rules also protect each
 project's source-pin manifest. ADR-0077 records the pin-store-specific boundary,
 recovery and review policy; this record's default-user read remains unchanged.
 
+Amended by [ADR-0078](0078-project-config-writer.md): the same host-managed
+project-config authority is now enforced on the write side by a descriptor
+walk, permanent `config.lock`, and compare-and-publish. ADR-0078 records the
+write-specific route, snapshot and atomicity policy; this record's user-tier
+read remains unchanged.
+
 ## Context
 
 A guest in project P1 can plant a user-owned `0644` file for project P2. Owner

@@ -580,6 +580,31 @@ as_ an **inert tool**: an inert declaration is a source field not adopted by
 
 _Avoid_: include, import, `:trust` suffix.
 
+## Project config store
+
+The host-managed `$HOME/.config/agent-vm/projects/<project-id>/` directory holding one project's `config.toml` and permanent **config coordination lock** (ADR-0078).
+
+## Config coordination lock
+
+The verified permanent `config.lock` inode that serializes project-config publication; it is not `config.toml` and is never a source-pin lock.
+
+## Config snapshot
+
+The read-only project-config base: identities only for the route levels that
+existed, the existing lock identity if any, and either file identity plus bytes
+or explicit file absence. It creates no directory, lock, or file; publication
+bootstraps and then requires a lock identity.
+
+## Stale config save
+
+A refused publication because the snapshot's route, lock, file identity, bytes,
+or absence no longer matches the under-lock state, or because the final route or
+destination authority boundary changed.
+
+## Image reference versus approval
+
+A reference selects an OCI name such as a tag or digest; an **image approval** separately binds that canonical reference, project, platform, and measured child digest.
+
 ## Boot image
 
 The finished image selected for a guest session, independently of **tool**
@@ -728,13 +753,13 @@ cache, `AGENT_VM_STATE_DIR` and any project, and it is written **only after** th
 image was acquired (success-before-adoption). Automatic initialization is
 insert-if-absent and happens only for the **initial recommendation**, so no
 failed or concurrent first launch overwrites it and no project's own default
-re-seeds it. A **deliberate `image set-default`** acquires its target once and
-stores the validated host child here; it writes no **image pin**, in any
-project. The record holds a digest only — no source tag, platform or tool
-metadata — so a pull reacquires that digest rather than following a tag
-(issue #392). See
-[USAGE.md#explicitly-setting-the-default](USAGE.md#explicitly-setting-the-default)
-and [ADR-0047](docs/adr/0047-host-wide-oci-image-approval.md).
+re-seeds it. A deliberate `image set-default` acquires its target and saves the reference in
+the higher-precedence **Project config store**; it writes neither this retained
+record nor an **image pin**. The retained record holds a digest only — no source
+tag, platform or tool metadata — so a pull reacquires that digest rather than
+following a tag (issue #392). See
+[USAGE.md#setting-this-projects-boot-image](USAGE.md#setting-this-projects-boot-image)
+and [ADR-0078](docs/adr/0078-project-config-writer.md).
 Distinguished from the **initial recommendation** below. See
 [USAGE.md#the-retained-default](USAGE.md#the-retained-default). _Avoid_: cache
 entry, default config, pinned layer.

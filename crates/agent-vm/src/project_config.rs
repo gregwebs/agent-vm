@@ -22,6 +22,29 @@ use crate::project::ProjectDir;
 /// Inside [`crate::config::USER_CONFIG_DIR_RELATIVE`]; one directory per project id.
 pub(crate) const PROJECTS_DIR: &str = "projects";
 pub(crate) const CONFIG_FILE: &str = "config.toml";
+/// The `[[sources]]` seed a new project config is created with (#737), below the
+/// root `image` the command writes.
+///
+/// Explicit rather than the loader's implicit single `home` source: a file created
+/// by a command should say which files it reads. It is the same source the loader
+/// would have assumed, so a seeded project reads the host's user config exactly as
+/// a project config that omits `sources` does, and a later `sources = []` stays the
+/// user's decision to remove it.
+pub(crate) const HOME_SOURCES_SEED: &str = concat!(
+    "[[sources]]\n",
+    "name = \"home\"\n",
+    "path = \"~/.config/agent-vm/config.toml\"\n",
+    "trust = true\n",
+    "allow = true\n",
+);
+
+/// The permanent coordination inode inside one project store that serializes
+/// `config.toml` writers (#737 `image set-default`, #739 `agent-vm config`).
+///
+/// Separate from the pin store's `pins.lock`: the two stores never share a lock
+/// edge, so a peer holding `pins.lock` cannot block a config write and a config
+/// writer never takes a lock under `pins.lock` (ADR-0078).
+pub(crate) const CONFIG_LOCK_FILE: &str = "config.lock";
 /// Where the project tier used to be read from, relative to the project.
 pub(crate) const LEGACY_RELATIVE: &str = ".agent-vm/config.toml";
 
@@ -249,11 +272,96 @@ pub(crate) fn check_store_route(project: &ProjectTierPaths) -> anyhow::Result<St
 /// True when `canonical` lands inside the active checkout `root`, excluding the
 /// normal unaliased `$HOME` layout (`expected`).
 ///
-/// Shared by the project store check (ADR-0073) and the `:trust` user-config route
-/// checks (ADR-0074), so the three cannot disagree about what "aliased into the
-/// active project" means.
-fn resolves_inside_project(canonical: &Path, expected: Option<&Path>, root: &Path) -> bool {
+/// Shared by the project store check (ADR-0073), the `:trust` user-config route
+/// checks (ADR-0074) and the project config writer's route walk, so the three
+/// cannot disagree about what "aliased into the active project" means.
+pub(crate) fn resolves_inside_project(
+    canonical: &Path,
+    expected: Option<&Path>,
+    root: &Path,
+) -> bool {
     canonical.starts_with(root) && expected != Some(canonical)
+}
+
+/// The reader's ancestry rule for one traversed directory (ADR-0076 R2.2), stated
+/// once so the project config writer can apply the same one:
+///
+/// a directory on an admitted route is **controlled** when this user owns it with
+/// neither group nor other write permission, or root owns it with neither. A
+/// root-owned sticky parent is judged on its child by the caller, which is why that
+/// clause is not part of this predicate.
+pub(crate) fn ancestry_controlled(facts: &crate::host_paths::OpenedDirFacts, euid: u32) -> bool {
+    (facts.uid == euid || facts.uid == 0) && facts.mode & 0o022 == 0
+}
+
+/// The highest ancestor of `path` that the reader's ancestry rule refuses, walking
+/// **down from `/`** with one no-follow directory descriptor per component.
+///
+/// Descriptor-bound for the reason the ADR-0076 route walker is: each component is
+/// judged by `fstat` on the descriptor that was opened from the descriptor above
+/// it, so a name swapped after it was spelled cannot substitute a directory this
+/// walk already passed. `Ok(None)` means every ancestor could be opened, is a
+/// directory, and is controlled; the final component (`path` itself) is the
+/// caller's to measure. An ancestor that cannot be opened is not a pass: it is the
+/// refusal, because a route whose ancestry cannot be measured cannot be trusted.
+pub(crate) fn uncontrolled_ancestor(path: &Path, euid: u32) -> anyhow::Result<Option<PathBuf>> {
+    use rustix::fs::{Mode, OFlags};
+
+    let mut ancestors: Vec<PathBuf> = path.ancestors().skip(1).map(Path::to_path_buf).collect();
+    ancestors.reverse();
+    let mut current: Option<(std::os::fd::OwnedFd, PathBuf)> = None;
+    for ancestor in ancestors {
+        let opened = match &current {
+            None => rustix::fs::open(
+                &ancestor,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            ),
+            Some((fd, _)) => rustix::fs::openat(
+                fd,
+                ancestor
+                    .file_name()
+                    .expect("an ancestor below `/` has a name"),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            ),
+        }
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "the ancestry of the admitted route directory could not be measured ({error})"
+            )
+        })?;
+        let facts = crate::host_paths::opened_dir_facts(&opened, &"an ancestor directory")?;
+        if !ancestry_controlled(&facts, euid) {
+            return Ok(Some(ancestor));
+        }
+        current = Some((opened, ancestor));
+    }
+    Ok(None)
+}
+
+/// Is the captured project root still the directory its own name in its captured
+/// parent names?
+///
+/// One `open` of the parent and one `statat(SYMLINK_NOFOLLOW)` of the root's own
+/// entry, compared to the captured `(dev, ino)`: spelling-free, so a case variant or
+/// a Unicode normalization variant is decided by the same identity, and a *sibling*
+/// of the root is untouched because only the root's own entry is named. Shared by
+/// the ADR-0076 route walker and the #737 config writer, so neither decides what
+/// "the active project" is from a path a replacement could have taken over. A root
+/// at `/` has no parent entry and returns `true`.
+pub(crate) fn captured_root_is_live(root: &Path, root_id: crate::host_paths::FileIdentity) -> bool {
+    let (Some(parent), Some(name)) = (root.parent(), root.file_name()) else {
+        return true;
+    };
+    let Ok(parent_fd) = rustix::fs::open(
+        parent,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    ) else {
+        return false;
+    };
+    require_captured_root_entry(&parent_fd, name, (root_id.dev, root_id.ino)).is_ok()
 }
 
 /// The shared refusal of U1/U2, once a canonicalized route is known to land
@@ -859,10 +967,8 @@ pub(crate) fn open_trusted_source_route_checkpointed(
                         {
                             return Err(refuse("a directory another user controls"));
                         }
-                        let controlled = (child_facts.uid == euid && child_facts.mode & 0o022 == 0)
-                            || (child_facts.uid == 0
-                                && (child_facts.mode & 0o022 == 0
-                                    || child_facts.mode & 0o1000 != 0));
+                        let controlled = ancestry_controlled(&child_facts, euid)
+                            || (child_facts.uid == 0 && child_facts.mode & 0o1000 != 0);
                         if !controlled {
                             return Err(refuse(
                                 "a path with an untrusted or writable ancestor directory",
