@@ -20,6 +20,12 @@ extended from the one user config to every trusted source route. Bumps the works
 Amended by [ADR-0077](0077-pinned-config-sources.md): every `trust = false`
 source is now content-pinned before decoding, regardless of `allow`.
 
+Amended in **0.8.6** by [ADR-0079](0079-declaration-is-the-launch-authority.md):
+`allow_tools` is retired (a source's `[[tools]]` declarations are launch verbs
+from their own declaration), a source may contribute `default_tools` when
+`allow = true`, and the project's `use_tools` settles which source a bare
+`default_tools` name means. Decision 7's inert list no longer names a retired key.
+
 Amended by [ADR-0078](0078-project-config-writer.md): `image set-default` may
 narrowly add or replace the root `image` without changing these source
 declarations or their trust/allow semantics.
@@ -37,7 +43,9 @@ list with one overloaded qualifier:
 - Everything else was "declarations only", so a file that *did* declare `mounts`,
   `[network]` or `allow_tools` was refused by presence. That made those keys
   unsafe to leave in a shared file, even when the project simply wanted to select
-  one tool from it.
+  one tool from it. (`allow_tools` is retired in 0.8.6 — see
+  [ADR-0079](0079-declaration-is-the-launch-authority.md); its successor
+  `default_tools` is admitted here.)
 - The syntax was a string with an embedded space and a `:` qualifier, which TOML
   could not validate and the reader had to split by hand.
 
@@ -50,7 +58,7 @@ does with its top-level keys*.
 ```toml
 # Top-level keys MUST precede the first [[sources]] or [table] header.
 image = "repo:image"
-allow_tools = ["repo:lint"]
+default_tools = ["lint"]
 mounts = ["~/notes:/notes:ro"]
 
 [[sources]]
@@ -127,7 +135,7 @@ content-pinned before parsing under [ADR-0077](0077-pinned-config-sources.md).
 
 `trust` and `allow` are independent; all four combinations are legal.
 
-| `trust` | `allow` | read | top-level `image`, `mounts`, `[network]`, `allow_tools` |
+| `trust` | `allow` | read | top-level `image`, `mounts`, `[network]`, `default_tools` |
 |---|---|---|---|
 | `true` | `true` | route check + verified read | adopted |
 | `true` | `false` | route check + verified read | inert |
@@ -135,11 +143,13 @@ content-pinned before parsing under [ADR-0077](0077-pinned-config-sources.md).
 | `false` | `false` | bounded read, then content pin | inert after approval |
 
 - **Inert is not refused.** An `allow = false` source's `mounts`, `[network]` and
-  `allow_tools` are recorded by presence (value-free) for `doctor` and dropped
+  `default_tools` are recorded by presence (value-free) for `doctor` and dropped
   before any typed validation, so a malformed inert value (`network = 42`) cannot
   fail a load it grants nothing in. Its `image` is validated (an explicit
   `image = "NAME:image"` still works) but never becomes the automatic fallback,
-  and is reported inert unless the project selects it.
+  and is reported inert unless the project selects it. Its `[[tools]]`
+  declarations are **not** inert: a declaration is a launch verb (0.8.6,
+  [ADR-0079](0079-declaration-is-the-launch-authority.md)).
 - **Every `trust = false` source is refused before decoding until its bytes are
   approved**, whether `allow` is true or false. [ADR-0077](0077-pinned-config-sources.md)
   supplies the hash-checking policy. The check runs on the exact bounded bytes
@@ -168,18 +178,17 @@ declaration order is the priority order.
   canonical value, `set:` attributions preserved); group booleans OR-union across
   the sources and an explicit project boolean overrides them. `set:NAME` stays
   the default user config's alone until #738.
-- **`allow_tools`** — Step A inherits each `allow = true` source's list in
-  order; Step B applies the project's list, where repeating an inherited target
-  is idempotent and naming a different definition for an inherited verb replaces
-  it in place (the losing definition stays in the arena for its own file's
-  `tools` references and is excluded from the authorized set); Step C refuses a
-  verb inherited from two sources with no project override, naming both and
-  advising `"<alias>:<verb>"` or `allow = false`; Step D authorizes exactly the
-  winning definitions. The #735 closure rule applies to `trust = false` sources
-  only — a verified trusted source is as authoritative as the user config.
+- **`default_tools`** — each `allow = true` source's list in order, after the
+  project's own list; an entry names a tool that source declares. Since 0.8.6
+  ([ADR-0079](0079-declaration-is-the-launch-authority.md)) this is the adopted
+  automatic grant, the project's `use_tools` settles which source a bare name
+  means, and a `[[tools]]` declaration is a launch verb with no list at all.
+  (Until 0.8.6 the key was `allow_tools`, whose Step A–D list inheritance this
+  bullet recorded.)
 
-The compiled-in defaults apply iff no `allow = true` source and neither the user
-nor the project config declares a tool **and** none of them writes `allow_tools`.
+The compiled-in defaults apply iff no readable tier — user config, project
+config, or any source — declares a tool. An `allow = false` source's declarations
+still count: a declaration is a launch verb.
 
 ## Decision 5: the project config adopts its own authority fields
 
@@ -191,8 +200,10 @@ presence in the project config and every non-default source until #738, which
 owns `set:` selectors and multi-source namespaces.
 
 The compiled-in `default-tools.toml` still refuses `[network]`, `mounts`,
-`[mount_sets]`, `[egress_sets]`, a tool's `mounts`, `allow_tools` and `sources` by
-presence.
+`[mount_sets]`, `[egress_sets]`, a tool's `mounts` and `sources` by
+presence. It also refuses `default_tools`, whose shipped value is the shell's own
+compatibility grant rather than a config field (`allow_tools` was the sixth
+refused key until 0.8.6 retired it).
 
 ## Decision 6: a source that is really the project config is refused by identity
 
@@ -209,8 +220,10 @@ different files.
 - `doctor` renders each source as
   `name path (found, N tools) [trust=…, allow=…; pin=approved sha256:<hex>; inert: …]`
   when a source has an approved pin, with the inert list in the fixed order
-  `image, mounts, [network], allow_tools` and value-free. Implicit sourcing
+  `image, mounts, [network]` and value-free. Implicit sourcing
   prints no `sources:` block at all, so pre-#748 output is byte-identical.
+  (`allow_tools` was the fourth entry until #749 retired it; see
+  [ADR-0079](0079-declaration-is-the-launch-authority.md).)
 - `doctor`'s boot-image section keeps the `user:`/`project:` rows, reports the
   winning fallback (`selected fallback; allow = true`), a project override, an
   earlier source's override, and each inert `allow = false` image with the exact
@@ -241,8 +254,11 @@ different files.
 - **`[mount_sets]` and `[egress_sets]` remain default-user-config-only** until
   #738.
 - **`allow_tools` becomes `default_tools` in #749**, which also owns launch-target
-  tool authorization; #748 keeps the key isolated in `config_allow_tools` and
-  `SourceEntry`.
+  tool authorization; #748 keeps the key isolated in `config_tool_refs`
+  (formerly `config_allow_tools`) and `SourceEntry`. **Done in 0.8.6:** see
+  [ADR-0079](0079-declaration-is-the-launch-authority.md); both module names are
+  gone, and the grammar lives in `config.rs` with the site classifier in
+  `config_schema.rs`.
 - **A lexical self-source is caught before any read**, but two spellings of the
   same *different* file (a symlink and its target) are still separate sources;
   identity is only used to refuse the project config itself.

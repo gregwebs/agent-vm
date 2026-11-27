@@ -136,7 +136,7 @@ impl Harness {
 /// a verb: an exit 2 "unrecognized subcommand" can never pass for the refusal.
 fn pinned_project(allow: bool) -> String {
     format!(
-        "allow_tools = [\"repo:lint\"]\n\
+        "\
          [[sources]]\nname = \"repo\"\npath = \"./conf/agent-vm.toml\"\n{}\
          ",
         if allow { "allow = true\n" } else { "" }
@@ -265,7 +265,7 @@ fn an_unapproved_allow_true_source_refuses_before_adopting_anything() {
 fn an_approved_inert_source_with_malformed_values_loads_and_renders_its_pin() {
     let h = Harness::new();
     let source = h.write_source(
-        "image = \"localhost:1/inert:latest\"\nnetwork = 42\nmounts = \"bad\"\nallow_tools = {}\n",
+        "image = \"localhost:1/inert:latest\"\nnetwork = 42\nmounts = \"bad\"\n[[tools]]\nname = \"t\"\ncommand = \"t\"\n",
     );
     h.write_project("[[sources]]\nname = \"repo\"\npath = \"./conf/agent-vm.toml\"\n");
     let hash = source_pins::approve(&h.home_root, &h.project_root, &source);
@@ -275,8 +275,8 @@ fn an_approved_inert_source_with_malformed_values_loads_and_renders_its_pin() {
     let stdout = stdout_of(&out);
     assert!(
         stdout.contains(&format!(
-            "  repo {} (found, 1 tool) [trust=false, allow=false, pin=approved sha256:{hash}; \
-             inert: image, mounts, [network], allow_tools]\n",
+            "  repo {} (found, 2 tools) [trust=false, allow=false, pin=approved sha256:{hash}; \
+             inert: image, mounts, [network]]\n",
             source.display()
         )),
         "{stdout}"

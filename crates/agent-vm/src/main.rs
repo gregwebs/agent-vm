@@ -7,13 +7,13 @@ mod boot_image;
 mod cli;
 mod clipboard;
 mod config;
-mod config_allow_tools;
 mod config_authority;
 mod config_mounts;
 // Phases 1-5 use most of this module; the staged inspection and the
 // non-interactive entry points are #739's `config diff|approve`.
 #[cfg_attr(not(test), allow(dead_code))]
 mod config_pins;
+mod config_schema;
 mod config_sources;
 #[cfg(test)]
 mod cpu_evidence;
@@ -350,7 +350,7 @@ fn run_dispatch(dispatch: Dispatch, project: Result<project::ProjectDir>) -> Res
     // race a Tokio worker's environment read (#163).
     let credential_preflight = match &dispatch {
         Dispatch::Launch { target, .. } => {
-            credential_resolver::CredentialPreflight::capture(target.requested_names())
+            credential_resolver::CredentialPreflight::capture(target.requested_services())
         }
         Dispatch::Builtin { .. } => credential_resolver::CredentialPreflight::none(),
     };

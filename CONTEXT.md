@@ -399,9 +399,10 @@ are the two whose provisioning set is wider).
 The tool declarations a tool names in `tools = [...]`: the tools it wants
 **available in its guest**. They name *tools*, never credential providers.
 References stay within the declaring tool's **Tool reference scope**, including
-definitions hidden from launch-verb selection. `["*"]` — which must be the sole
-entry, and is the default for a tool named `shell` — means every tool in that
-scope. An omitted `tools` is `[]` for every other name. Unknown names and
+definitions hidden from launch-verb selection. **An omitted `tools` is `[]` for
+every tool**, and the `"*"` wildcard is refused with its `default_tools`
+replacement (#749): a wide automatic default is the top-level
+**`default_tools`** grant, not a `tools` entry. Unknown names and
 cross-tier references are hard config errors, reported with the declaring file,
 declaration index, tool and field. Every definition's references are validated,
 even one no launch verb reaches. The scope change is implemented (#395), and the mount half — named mount sets,
@@ -456,8 +457,7 @@ configuration error cannot disagree about which state the process is in:
 `Catalog::Ready(LaunchCatalog)` or `Catalog::Broken(err)`. It retains every
 definition from every **tool config tier** — user, project and each source — as
 a union of whole definitions, and falls back to the compiled-in catalog only when
-neither the user nor the project config declares a tool *and* neither writes
-`allow_tools`. It is **not** the config files themselves.
+no readable tier declares a tool. It is **not** the config files themselves.
 
 _Avoid_: bare "catalog" when the distinction matters — say **Launch catalog**
 for the resolved tools plus each one's provisioning set plus the built-in
@@ -480,9 +480,9 @@ guest `env` map, an `interactive_shell` flag, and the **tool config tier** it
 came from. A tool may also declare `mounts`: those are **Config mounts** selected
 for a launch of that tool, own plus inherited through its `tools` closure. A user
 tool's list is authority and accepts a **Mount set** name; a project or sourced
-tool's list is legal and inert until **Tool authorization** makes the tool a verb,
-and takes absolute and `~/` paths only; a built-in may not declare one. The
-top-level `mounts` defaults are still selected for every launch. See
+tool's list is live on that tool's launch — a declaration is a launch verb
+(#749) — and takes absolute and `~/` paths only; a built-in may not declare one.
+The top-level `mounts` defaults are still selected for every launch. See
 [USAGE.md](USAGE.md#tool-specific-config-mounts).
 
 `env` is published into the guest **before** the launcher's own environment and
@@ -492,9 +492,10 @@ cannot override `PATH`, `IS_SANDBOX` or `LANG`; `HOME`/`USER`/`LOGNAME` are
 
 ### Launch catalog
 
-The verbs a launch actually offers (`config::LaunchCatalog`): the **authorized**
-definitions in authorization order, plus the built-in `shell` appended when no
-authorized tool claims that name. The catalog resolves each entry's provisioning
+The verbs a launch actually offers (`config::LaunchCatalog`): every **declared**
+definition in declaration order, plus the built-in `shell` appended when no
+project or built-in definition claims the bare `shell` route. The catalog
+resolves each entry's provisioning
 set before dispatch, so `--help`, `doctor` and `run::launch` cannot disagree. One
 arm of **Catalog**.
 
@@ -520,29 +521,28 @@ unconditionally ([ADR-0076](docs/adr/0076-sources-tables-trust-and-allow.md),
 source instead reaches parsing only after its exact bounded bytes match this
 project's content pin ([ADR-0077](docs/adr/0077-pinned-config-sources.md)). Each
 tier is parsed and validated independently before merging. Their merge is a **union of whole
-definitions**, not a field overlay, and the verb list is **Tool authorization**
-rather than the declarations: each `allow = true` source's own list is inherited
-in `[[sources]]` order, the project's entries add verbs, and a project entry
-naming an inherited verb replaces it in place — that project definition is then
-the verb, and a differing replacement yields one `doctor` warning. Two
-definitions of one name in different files therefore coexist legally; a second
-authorization of one verb inside the project's own list, and one verb inherited
-from two sources with no project override, are both errors. Only when no
-`allow = true` source and neither the user nor the project config declares a tool
-*and* none of them writes `allow_tools` do the compiled-in defaults apply. The
+definitions**, not a field overlay, and every declaration is itself a launch
+verb. The **bare** spelling is won by a project declaration, or by the one user
+or sourced declaration of that name; two files declaring one name leave it in
+conflict, so both stay launchable as `<alias>:<name>` and the bare launch is
+refused naming both. A project declaration of a name wins the bare route, and a
+differing definition yields one `doctor` warning. Only when no readable tier
+declares a tool do the compiled-in defaults apply. The
 authority-bearing fields are verified-tier only: `[network]`
 ([persisted grant](#egress-authority)), the top-level `mounts` ([config
-mount](#config-mount)), `[mount_sets]` ([mount set](#mount-set)) and
-`[egress_sets]`. The project config and an `allow = true` source **adopt** their
-own `mounts` and `[network]` through their verified read; an `allow = false`
+mount](#config-mount)), `[mount_sets]` ([mount set](#mount-set)),
+`[egress_sets]` and `default_tools`. The project config and an `allow = true`
+source **adopt** their
+own `mounts`, `[network]` and `default_tools` through their verified read; an
+`allow = false`
 source's declaration of any of them is inert, not refused, and `[mount_sets]` /
 `[egress_sets]` stay the default user config's alone until #738. The built-ins
 refuse every one of them by presence, because presence is what asks for
 authority; a project or sourced *tool*'s `mounts` is the one mount field legal
-there, inert until authorized. `allow_tools` is legal in the user and project
-configs and in an `allow = true` source (inherited); a `trust = false` source
-can have it adopted only after its content pin is approved. A definition with no
-verb still belongs to its own **tool reference scope**, so the rest of its file
+there, and it is live on that tool's launch. A `default_tools` contributor's
+read verdict is carried to the grant, so a blocked contributor refuses the shell
+launch. A definition always belongs to its own **tool reference scope**, so the
+rest of its file
 keeps resolving it.
 
 A load failure is **deferred**, not fatal at startup: `doctor`, the built-ins,
@@ -561,22 +561,24 @@ exempt from content pinning; `false` reads the bounded source bytes once and
 requires their SHA-256 content pin before decoding. **Every** `trust = false`
 source is pinned regardless of `allow`. **`allow`** decides what an approved
 file's top-level keys mean: `true` adopts `image` (first in `[[sources]]` order),
-`mounts`, `[network]` and `allow_tools`; `false` leaves them **inert** — neither
+`mounts`, `[network]` and `default_tools`; `false` leaves them **inert** — neither
 adopted nor refused, and reported by `doctor` with its pin state. A relative
 source spelling stays in the checkout scope; an intended outside file must use
 an absolute or `~/` spelling. A pinned source must not contain secrets: its exact text is reviewable and
-stored in the protected project store. A way as-yet unadopted `image` takes
+stored in the protected project store. A way-as-yet unadopted `image` takes
 effect when the project config selects it with `image = "NAME:image"`. A tool
-it declares is inert until the project config's **Tool authorization** names it.
-An `allow = true` source can instead contribute `allow_tools` and opt out of the
-shipped catalog. Sourcing is **flat**: only the project config may declare
+it declares is a **launch verb** either way — `allow` governs only the top-level
+keys — and its `default_tools` contributes only when `allow = true`. A source
+therefore **opts out of the shipped catalog** merely by declaring a tool. A
+project `use_tools` choice may settle which source a bare `default_tools` entry
+means. Sourcing is **flat**: only the project config may declare
 sources. An
 omitted key means the single implicit `{ name = "home", path =
 "~/.config/agent-vm/config.toml", trust = true, allow = true }`.
 _Not the same as_ an **OCI image pin**: a content pin approves exact source
 bytes for one project; an OCI image pin approves an image digest. _Not the same
-as_ an **inert tool**: an inert declaration is a source field not adopted by
-`allow`; an inert tool is a declared tool absent from `allow_tools`.
+as_ an **inert top-level key**: that is a source field not adopted by `allow`;
+`[[tools]]` declarations are never inert.
 
 _Avoid_: include, import, `:trust` suffix.
 
@@ -951,8 +953,8 @@ A mount declaration a config selects: an entry of the user tier's top-level
 `mounts` defaults, or of a `[[tools]]`'s own `mounts`, or a leaf of a selected
 **Mount set**. The defaults apply to every launch; a user tool's list is authority
 and applies to a launch of that tool, own plus inherited through its `tools`
-closure, while a project or sourced tool's list becomes a config mount only when
-**Tool authorization** makes it a verb. All of it is suppressed for one launch by
+closure, while a project or sourced tool's list is live on that tool's launch —
+a declaration is a launch verb (#749). All of it is suppressed for one launch by
 `--no-config-mounts`, which never touches an explicit `--mount`. A config mount is
 parsed, claimed and prepared exactly like a
 `--mount` (same grammar, guest-path rules, merge/refuse rule and protections); it
@@ -964,7 +966,7 @@ differs in origin, which diagnostics report as `mounts[N] in
 any of those fields, not its contents, is what makes the user config
 authority-bearing under ADR-0040's read policy. A project file is verified
 unconditionally ([ADR-0073](docs/adr/0073-host-managed-project-config.md)), and a
-sourced file's tool mount stays inert until authorized (ADR-0075). See
+sourced file's tool mount is live on that tool's launch (ADR-0079). See
 [ADR-0046](docs/adr/0046-verified-user-config-mounts.md).
 
 An entry may also be a **Mount set** name, which selects that set's direct
@@ -1011,10 +1013,12 @@ The definitions in the one configuration file that declares a tool, within
 which its `tools` references resolve — including definitions hidden from
 launch-verb selection by another file. A name that only another file declares is
 a config error, never an opt-in to crossing files. A tool defined in that scope
-supplies its own credentials, requested names, `persist` paths and **Config
-mount** declarations to any authorized tool whose `tools` closure reaches it, verb
+supplies its own credentials, requested names, `persist` paths, `env`,
+`network_requests` and **Config
+mount** declarations to any launch whose `tools` closure reaches it, verb
 or no verb; the synthesized fallback `shell` is not a declaration in
-any file's scope, so it cannot be named either and inherits nothing. Implemented in #395; see
+any file's scope, so it cannot be named either and has no closure of its own
+(it receives the effective `default_tools` grant as the shell affordance). Implemented in #395; see
 [ADR-0048](docs/adr/0048-named-mount-sets-and-tier-local-tool-references.md)
 and [ADR-0017](docs/adr/0017-tool-declared-provisioning.md).
 
@@ -1078,26 +1082,29 @@ also authorizes DNS for any name. A hostname grant authorizes lookups of its
 own name only, never arbitrary-name DNS. Numeric and LAN-only grants do not
 authorize DNS.
 
-**Tool authorization**: `allow_tools`, a top-level list in the user or project
-config naming the `[[tools]]` declarations that become launch verbs. A
-declaration is inert data; authorizing it activates every one of its fields —
+**Tool authorization**: the `[[tools]]` declaration itself. Every declaration is
+a launch verb, bare when it wins its name and always as `<alias>:<name>` for a
+user or sourced one, and launching it activates every one of its fields —
 command, args, `interactive_shell`, env, credentials, `persist`, `mounts` and
-`network_requests` (ADR-0075). An `allow = true` source's own list is inherited
-in `[[sources]]` order; the project's authorization replaces an inherited verb in
-place.
+`network_requests` (ADR-0079, superseding ADR-0075's `allow_tools`, which is
+refused). The top-level **`default_tools`** grant is what `agent-vm shell`
+provisions automatically, and what a direct command receives only when a config
+wrote the key; a project `use_tools` list settles which source a bare
+`default_tools` name means.
 
 **Network request**: a tool declaration's statement of a TLS destination (exact
-name + port) it expects to contact. For an **authorized** tool it is authority:
+name + port) it expects to contact. For a **declared** tool it is authority:
 the launch grants each as an exact `tcp://HOST:PORT` hostname allowance. For a
 compiled-in default it stays non-authoritative metadata, reported when unmet and
-never a grant. A request is always the tool's *own* — a `tools` closure does not
-fold them.
+never a grant on its own. A request folds over the same-file `tools` closure,
+with a built-in member staying report-only.
 
 **Egress reference**: an `allow_egress` entry (persisted or `--allow-egress`)
 that stands for other allowances. `set:NAME` is an **Egress set**, resolved
 against the user file's own `[egress_sets]`; project and built-in sets are never
 resolved. `set:NAME` implemented in #511. `tool:NAME` existed from #506 and was
-removed by ADR-0075, because authorizing a tool grants its requests directly.
+removed by ADR-0075, because a declared tool grants its requests directly (the
+ADR-0075 `allow_tools` requirement was itself retired by ADR-0079).
 
 **Egress set**: a named list of allowances and egress references in the
 **user** `[egress_sets]` table, compiled at load into one closure with the sets

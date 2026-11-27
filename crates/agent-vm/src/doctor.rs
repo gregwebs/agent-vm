@@ -1267,13 +1267,8 @@ fn describe_config(report: ConfigReport) -> (String, Option<anyhow::Error>, Opti
     let resolved_label = if report.uses_defaults() {
         "resolved: built-in defaults; launch-verb order\n"
     } else {
-        "resolved: authorized tools; launch-verb order\n"
+        "resolved: declared tools; launch-verb order\n"
     };
-    let inert_tools = describe_inert_tools(
-        report.inert_tools(),
-        report.project(),
-        report.project_claims(),
-    );
     let conflicts = render_conflicts(report.conflicts());
     // The persisted egress references are user-authored authority, so `doctor`
     // shows what each one grants. Rendered before the report is consumed by
@@ -1294,10 +1289,12 @@ fn describe_config(report: ConfigReport) -> (String, Option<anyhow::Error>, Opti
             }
             if catalog.has_shell_fallback() {
                 out.push_str(
-                    "note: `shell` was not declared; the built-in fallback is registered so you\n\
-                     still have a way into the guest.\n",
+                    "note: the bare `shell` verb is the built-in fallback, because no project or\n\
+                     built-in entry claims that route; a `shell` you declared stays reachable as\n\
+                     its `<alias>:shell` spelling.\n",
                 );
             }
+            out.push_str(&describe_default_tools(&catalog));
             (None, Some(catalog))
         }
         // A dangling `tools` reference lands here, as does an internally broken
@@ -1308,10 +1305,11 @@ fn describe_config(report: ConfigReport) -> (String, Option<anyhow::Error>, Opti
             (Some(error), None)
         }
     };
-    // After the numbered list: the block is about declarations that are *not*
-    // verbs, so it must not split the `resolved:` header from the verbs it
-    // introduces (#735 review S2).
-    out.push_str(&inert_tools);
+    // After the numbered list: these blocks are about the verbs themselves, so
+    // they must not split the `resolved:` header from the list it introduces.
+    if let Some(catalog) = catalog.as_ref() {
+        out.push_str(&render_name_conflicts(catalog.name_conflicts()));
+    }
     out.push_str(&conflicts);
     out.push_str(&egress_references);
     // Drop the final newline: the caller adds one via `writeln!`.
@@ -1319,56 +1317,37 @@ fn describe_config(report: ConfigReport) -> (String, Option<anyhow::Error>, Opti
     (out, failure, catalog)
 }
 
-/// Declared tools no `allow_tools` entry authorizes (#735), each with the exact
-/// spelling that would activate it and the file that spelling belongs in.
+/// What `default_tools` grants, in the printer's words (#749): the same key `tools
+/// print` writes and the reader accepts, so advice and grammar cannot drift.
 ///
-/// Rendered nothing when every declaration is authorized, so a defaults-only or
-/// fully-authorized report keeps its shipped bytes. The entry is copyable TOML:
-/// a source's is `<alias>:<name>`, a user or project tool's is its bare name, and
-/// the name is rendered with the printer's TOML string encoder rather than the
-/// diagnostic escaper, because a tool name may hold non-ASCII.
-///
-/// `claimed` maps each verb the project's own list already decided to the entry
-/// spelling that decided it. Adding a *second* entry for such a verb is refused
-/// (R3), so the advice names the entry to replace instead — advice that loads
-/// (#735 review D2).
-fn describe_inert_tools(
-    inert: &[crate::config::InertTool],
-    project: &crate::config::TierReport,
-    claimed: &std::collections::BTreeMap<String, String>,
-) -> String {
-    if inert.is_empty() {
+/// Empty when nothing consulted a list, so every `doctor` output for a config that
+/// wrote no `default_tools` is byte-identical to before this field existed.
+fn describe_default_tools(catalog: &LaunchCatalog) -> String {
+    let authored = catalog.direct_defaults();
+    if authored.is_empty() {
         return String::new();
     }
-    let project_file = project.path();
-    let mut out = String::from("inert tools (declared, not in allow_tools):\n");
-    for tool in inert {
-        // A bare entry resolves only in the file that *declares* the tool, so a
-        // user-tier tool's advice names the user file. Advising the project file
-        // there is advice that does not load (#735 review S1).
-        let where_to_write = match tool.origin() {
-            crate::config::ToolOrigin::User(path) => Some(path.as_path()),
-            _ => project_file,
-        };
-        let where_to_write = match where_to_write {
-            Some(path) => crate::one_line::path(path).to_string(),
-            None => "the project config".to_owned(),
-        };
-        let entry = crate::config::builtin_print::toml_string(&tool.allow_tools_entry());
-        let advice = match claimed.get(tool.name()) {
-            Some(existing) => format!(
-                "replace {} with {entry} in allow_tools in {where_to_write}",
-                crate::config::builtin_print::toml_string(existing),
-            ),
-            None => format!("add {entry} to allow_tools in {where_to_write}"),
-        };
-        out.push_str(&format!(
-            "  {} ({}; {advice})\n",
-            crate::config::escape_str(tool.name()),
-            crate::config::describe_origin(tool.origin()),
-        ));
-    }
-    out
+    let unavailable = authored
+        .refusal()
+        .and_then(launch_refusal_note)
+        .map(|note| format!("; {note}"))
+        .unwrap_or_default();
+    format!(
+        "default_tools: {} -> provisioned for `shell` and a direct command{unavailable}\n",
+        authored.names().join(", ")
+    )
+}
+
+/// The one rendering of a blocked read's verdict, shared by a tool row and the
+/// `default_tools:` line (#749 E8/V4), and byte-identical to what a launch
+/// prints: `unavailable: config: "<file>": <refusal>`.
+fn launch_refusal_note(trust: &crate::config_authority::ReferenceTrust) -> Option<String> {
+    trust.require_for_trusted_tool().err().map(|refusal| {
+        format!(
+            "unavailable: config: {}: {refusal}",
+            crate::one_line::quoted_path(trust.file())
+        )
+    })
 }
 
 /// The persisted egress references of one `[network]` table and what each
@@ -1441,6 +1420,10 @@ fn describe_sources(sources: &SourcesReport) -> String {
 }
 
 /// The `warning:` blocks for cross-tier shadows, in project declaration order.
+///
+/// Since #749 a shadow no longer hides the other definition: the bare name is the
+/// project's, and the other one keeps its qualified spelling. The block says that
+/// instead of claiming an override.
 fn render_conflicts(conflicts: &[ConfigConflict]) -> String {
     let mut out = String::new();
     for conflict in conflicts {
@@ -1451,12 +1434,25 @@ fn render_conflicts(conflicts: &[ConfigConflict]) -> String {
             .collect::<Vec<_>>()
             .join(", ");
         out.push_str(&format!(
-            "warning: tool {} in {} overrides\n         {}; differing fields: {}\n",
+            "warning: tool {} in {} shadows\n         {}; the bare name launches the project's \
+             definition, the other keeps its qualified spelling; differing fields: {}\n",
             crate::config::quoted_str(conflict.tool()),
             crate::one_line::path(conflict.winner_file()),
             crate::one_line::path(conflict.overridden_file()),
             fields,
         ));
+    }
+    out
+}
+
+/// The bare names more than one source declares, each with the qualified
+/// spelling that still reaches every candidate (#749).
+///
+/// A row per conflict, so `doctor` and the CLI refusal name the same thing.
+fn render_name_conflicts(conflicts: &[crate::config::NameConflict]) -> String {
+    let mut out = String::new();
+    for conflict in conflicts {
+        out.push_str(&format!("{:#}\n", conflict.refusal()));
     }
     out
 }
@@ -1854,10 +1850,17 @@ fn describe_tool(entry: &CatalogEntry) -> String {
     } else {
         format!("; network_requests={}", requests.bounded_display())
     };
+    // A blocked or unverified declaring read still loads, but every launch
+    // refuses it; the row says so with the launch's own sentence (E8/V4).
+    let unavailable = entry
+        .launch_trust()
+        .and_then(launch_refusal_note)
+        .map(|note| format!("; {note}"))
+        .unwrap_or_default();
     format!(
         "{} -> \"{}\"; args={}; credentials={credentials}; \
-         provisions={provisions}; persist={persist}; source={source}{interactive_shell}{env}{requests}",
-        crate::config::escape_str(tool.name()),
+         provisions={provisions}; persist={persist}; source={source}{interactive_shell}{env}{requests}{unavailable}",
+        crate::config::escape_str(entry.label()),
         crate::config::escape_str(tool.command()),
         tool.arg_count(),
     )
@@ -3126,16 +3129,8 @@ credentials:
     }
 
     /// A user or project config whose declared tools are authorized (#735).
-    ///
-    /// The same migration `config::tests` applies: a fixture that declares
-    /// `[[tools]]` and expects a verb gets the `allow_tools` line #735 requires.
-    /// A body naming `allow_tools` itself is left alone.
     fn write_config(path: &Path, contents: impl AsRef<[u8]>) {
-        let text = String::from_utf8_lossy(contents.as_ref());
-        write_file(
-            path,
-            crate::config::test_support::authorized_fixture(&text, &[]).as_bytes(),
-        );
+        write_file(path, contents.as_ref());
     }
 
     #[test]
@@ -3536,14 +3531,14 @@ credentials:
         let project_file = project.join(".agent-vm/config.toml");
         write_config(
             &user,
-            "image = \"ghcr.io/acme/user:1\"\nallow_tools = [\"t\"]\n[[tools]]\nname = \"t\"\ncommand = \"t\"\n",
+            "image = \"ghcr.io/acme/user:1\"\n[[tools]]\nname = \"t\"\ncommand = \"t\"\n",
         );
         // `t` collides with the user tier (the project's authorization overrides
         // the user verb, and the differing definition is the conflict warning);
         // `u` exists only in the project tier (the `source=project:` row).
         write_config(
             &project_file,
-            "image = \"ghcr.io/acme/project:1\"\nallow_tools = [\"t\", \"u\"]\n\
+            "image = \"ghcr.io/acme/project:1\"\n\
              [[tools]]\nname = \"t\"\ncommand = \"other\"\n\
              [[tools]]\nname = \"u\"\ncommand = \"u\"\n",
         );
@@ -3556,11 +3551,11 @@ credentials:
                 "the project tier line",
                 format!("{} (found", project_file.display()),
             ),
-            // #735: the project's `allow_tools` overrides the user verb, so the
-            // warning's winner is the project file and the loser is the user one.
+            // #749: the project's definition owns the bare name, so the warning
+            // names the project file first and the user file as the shadowed one.
             (
                 "the conflict warning",
-                format!("overrides\n         {}", user.display()),
+                format!("shadows\n         {}", user.display()),
             ),
             (
                 "the project tool row",
@@ -4609,6 +4604,68 @@ substituted."#;
         assert!(!text.contains("sk-secret"), "env value leaked: {text}");
     }
 
+    /// #749 E8/V4: a tool whose declaring read failed still loads, but every
+    /// launch refuses it. `doctor` must mark it unavailable with the same
+    /// sentence the launch prints, or the listing advertises a verb that cannot
+    /// run. The shell affordance carries the blocked *contributor's* verdict, so
+    /// it is marked too.
+    #[test]
+    fn describe_config_marks_a_blocked_tool_unavailable_with_the_launch_reason() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let project = dir.path().join("project.toml");
+        write_config(&project, "default_tools = [\"helper\"]\n");
+        let body = "[[tools]]\nname = \"helper\"\ncommand = \"helper\"\n";
+
+        let target = dir.path().join("dotfile.toml");
+        write_config(&target, body);
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let user = dir.path().join("config.toml");
+        std::os::unix::fs::symlink(&target, &user).unwrap();
+
+        let report = config_report(Some(&user), &project);
+        let (text, failure, catalog) = describe_config(report);
+        assert!(failure.is_none(), "{text}");
+        let catalog = catalog.expect("the catalog builds");
+        for label in ["helper", "shell"] {
+            let entry = catalog
+                .as_slice()
+                .iter()
+                .find(|entry| entry.label() == label)
+                .unwrap_or_else(|| panic!("{label} row missing: {text}"));
+            let trust = entry
+                .launch_trust()
+                .expect("the blocked read's verdict travels with the entry");
+            let note = launch_refusal_note(trust)
+                .unwrap_or_else(|| panic!("{label} is not marked refused: {text}"));
+            let row = text
+                .lines()
+                .find(|line| line.contains(&format!(". {label} -> ")))
+                .unwrap_or_else(|| panic!("{label} row missing: {text}"));
+            assert!(
+                row.contains(&format!("; {note}")),
+                "{label} row does not carry the launch refusal: {row}"
+            );
+        }
+
+        // The positive control: the same declarations from a regular file load
+        // with no verdict and no marker.
+        let regular = dir.path().join("regular.toml");
+        write_config(&regular, body);
+        std::fs::set_permissions(&regular, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let (text, failure, catalog) = describe_config(config_report(Some(&regular), &project));
+        assert!(failure.is_none(), "{text}");
+        assert!(!text.contains("unavailable:"), "{text}");
+        assert!(
+            catalog
+                .expect("the catalog builds")
+                .as_slice()
+                .iter()
+                .all(|entry| entry.launch_trust().and_then(launch_refusal_note).is_none())
+        );
+    }
+
     #[test]
     fn describe_config_distinguishes_a_found_empty_tier_from_an_absent_one() {
         let dir = tempfile::tempdir().unwrap();
@@ -4635,7 +4692,10 @@ substituted."#;
         let (text, _, _) = describe_config(report);
         assert!(text.contains("1. solo"), "{text}");
         assert!(text.contains("2. shell"), "{text}");
-        assert!(text.contains("`shell` was not declared"), "{text}");
+        assert!(
+            text.contains("the bare `shell` verb is the built-in fallback"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -4654,7 +4714,7 @@ substituted."#;
         let report = config_report(Some(&user), &project);
 
         let (text, _, _) = describe_config(report);
-        assert!(text.contains("overrides"), "{text}");
+        assert!(text.contains("shadows"), "{text}");
         assert!(text.contains("tool \"t\" in"), "{text}");
         assert!(text.contains("differing fields: args"), "{text}");
         assert!(!text.contains("SENTINEL"), "argument value leaked: {text}");
@@ -5135,9 +5195,7 @@ credentials:
         // the one rendered from here on.
         write_config(
             &project,
-            format!(
-                "allow_tools = [\"t\"]\n{base}network_requests = [\"b.example:8443\",\"a.example\"]\n"
-            ),
+            format!("{base}network_requests = [\"b.example:8443\",\"a.example\"]\n"),
         );
         assert!(
             describe_config(config_report(Some(&user), &project))
@@ -5147,9 +5205,7 @@ credentials:
         // The project's definition is the winner, so the sentinel goes there.
         write_config(
             &project,
-            format!(
-                "allow_tools = [\"t\"]\n{base}network_requests = [\"sk-test-sensitivevalue\"]\n"
-            ),
+            format!("{base}network_requests = [\"sk-test-sensitivevalue\"]\n"),
         );
         let row = describe(&user, &project);
         assert!(row.ends_with("; network_requests=sk-test-sensitivevalue"));
@@ -5194,9 +5250,9 @@ credentials:
             self.project.path().join(relative)
         }
 
-        /// Write one fixture file verbatim: a *sourced* file refuses
-        /// `allow_tools` by presence (#735), so authorization belongs in the
-        /// project body these tests write themselves.
+        /// Write one fixture file verbatim. A grant belongs in the project body
+        /// these tests write themselves: a sourced file's top-level authority
+        /// fields are inert (ADR-0076 R3).
         fn write(&self, path: &Path, body: &str) {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             write_file(path, body.as_bytes());
@@ -5237,7 +5293,7 @@ credentials:
     fn v18_describe_config_renders_sources_and_a_not_sourced_user_tier() {
         let f = SourcesDoctor::new();
         let report = f.load(
-            "allow_tools = [\"home:home-tool\", \"repo:repo-tool\"]\n\
+            "\
              [[sources]]\nname = \"home\"\npath = \"~/.config/agent-vm/config.toml\"\ntrust = true\n\
              [[sources]]\nname = \"repo\"\npath = \"./.agent-vm/config.toml\"\n",
             "[[tools]]\nname = \"home-tool\"\ncommand = \"home-tool\"\n",

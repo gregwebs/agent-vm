@@ -4,6 +4,11 @@
 
 Accepted. Implementation decision for [agent-vm #119](https://github.com/gregwebs/agent-vm/issues/119), a follow-up split out of [#82](https://github.com/gregwebs/agent-vm/issues/82). Extends [ADR-0015](0015-config-driven-tools.md) (the shipped catalog and a user's own file are parsed through the same raw→validated path) and [ADR-0002](0002-mirror-host-home-and-username.md) (the guest mirrors the host identity). Builds on the terms **Tool** and **Credential provider** in [CONTEXT.md](../../CONTEXT.md).
 
+Amended in **0.8.6** by [ADR-0079](0079-declaration-is-the-launch-authority.md):
+`env` now folds over a launch's whole `tools` closure (so `pi`, which names
+`codex`, inherits `CODEX_HOME`), and `shell`'s provisioning comes from
+`default_tools` rather than an omitted wildcard.
+
 ## Context
 
 Before #119 `CODEX_HOME=/agent-vm-state/codex` was a generic constant (`credential_provider::GENERIC_GUEST_ENV`) applied to *every* launch. It names codex-the-tool's config dir, not a credential subsystem, so it belonged on the resolved tool. #82 gave us `config::Tool`, so #119 moves it there.
@@ -33,7 +38,7 @@ _Amended by #258 (2026-10)._ `PATH` is image-owned and applied per exec by the l
 ## Consequences
 
 - **`CODEX_HOME` is now declared by the `codex` and `shell` tools only.** A `claude`, `opencode` or `copilot` guest no longer sees it. That is the point of the ticket. (`codex/auth.json` and `codex/config.toml` are provisioned only when the launch provisions OpenAI ([ADR-0017](0017-tool-declared-provisioning.md)); the eager **state dir** is created unconditionally: furniture, not capability.)
-- **`shell` keeps `CODEX_HOME`.** `shell` declares **no** `credentials`: its omitted `tools` defaults to the wildcard, so a shell launch *provisions* every provider the catalog's tools declare, including OpenAI. Codex has **no** `~/.codex` symlink by design (a symlink would shadow its `packages/` install prefix), so there is no fallback path. Dropping only the pointer would leave a fully-provisioned, unreachable credential and a silently signed-out hand-run `codex`. Pinned by `V5` and `E1`. The other three agents never read `CODEX_HOME`.
+- **`shell` keeps `CODEX_HOME`.** `shell` declares **no** `credentials`: its omitted `tools` defaults to the wildcard, so a shell launch *provisions* every provider the catalog's tools declare, including OpenAI. Codex has **no** `~/.codex` symlink by design (a symlink would shadow its `packages/` install prefix), so there is no fallback path. Dropping only the pointer would leave a fully-provisioned, unreachable credential and a silently signed-out hand-run `codex`. Pinned by `V5` and `E1`. The other three agents never read `CODEX_HOME`. **Amended in 0.8.6 by [ADR-0079](0079-declaration-is-the-launch-authority.md):** `shell` declares no `credentials` still, and now provisions nothing through its own list — the omitted wildcard is retired — so the OpenAI credential it carries arrives from `default_tools`. The pair is also inherited by any launch whose closure reaches `codex`.
 - **Shadowing a shipped tool drops `CODEX_HOME`.** A user who declares `codex` **or `shell`** in `~/.config/agent-vm/config.toml` (or a project `.agent-vm/config.toml`) replaces the shipped definition wholesale, so it does not inherit the shipped `env` — for `shell` this silently signs out a hand-run `codex` inside the guest. Add `env = { CODEX_HOME = "/agent-vm-state/codex" }`; `USAGE.md` carries the same guidance.
 - **`GENERIC_GUEST_ENV`, `GuestEnvSlot`, `GUEST_ENV_SLOTS` and the test-only `guest_env` are deleted.** "Guest env owned by no provider and applying to every launch" already has a home: `run::GUEST_ALWAYS_ENV`. The replacement, `credential_provider::provider_guest_env`, is a de-`match`ed *rename* of the old `guest_env_slot(ProviderOwned, …)`, not a new seam; it keeps `ProviderSpec::guest_env` private to the module. (Membership in the launch's provisioning set is the one gate; see [ADR-0017](0017-tool-declared-provisioning.md).)
 - **The tool-field list now lives in three places** — `config.rs`'s module doc, `USAGE.md`'s schema, and `CONTEXT.md`'s **Tool** entry — and they must stay in sync.

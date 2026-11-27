@@ -20,7 +20,12 @@ launch-verb selection, so the explicit cross-file opt-in described below is gone
 user tool's `mounts` is a fourth facet of that closure, own plus inherited, and a
 direct `run`/`--` target has an empty mount facet. Tool `env` and
 `network_requests` were not folded and keep their own-only rule, and required
-providers are still the launched tool's own.
+providers are still the launched tool's own. **Amended in 0.8.6 by
+[ADR-0079](0079-declaration-is-the-launch-authority.md):** `env` and
+`network_requests` are now the fifth and sixth facets of that same closure, so
+the own-only rule is gone and one visited mask serves all six. The `"*"`
+wildcard and `shell`'s implicit one are retired, an omitted list is `[]` for
+every tool, and automatic provisioning belongs to `default_tools`.
 
 ## Context
 
@@ -83,7 +88,10 @@ identical to the pre-#82 binary.
   credentials and `.dsh` persistence into a catalog that declared none.
 - **Omitted `tools` is `["*"]` for a tool named `shell` and `[]` for every other
   tool**, off one shared `SHELL_TOOL_NAME` const that the catalog's shell
-  fallback also uses, so the two cannot drift.
+  fallback also uses, so the two cannot drift. **Superseded in 0.8.6 by
+  [ADR-0079](0079-declaration-is-the-launch-authority.md):** an omitted list is
+  `[]` for every tool, `shell` included; `default_tools` carries the wide
+  default, so the two can no longer drift apart this way.
 - **`credentials` keeps exactly one extra job: the requirement set.** A launch
   still hard-fails before boot when a required provider yielded no usable
   credential: the bail is `credential_provider::missing_credential_error`,
@@ -110,7 +118,10 @@ identical to the pre-#82 binary.
 - **The built-in `shell` stops declaring `credentials`.** It is not an agent and
   must not inherit any provider's hard bail; its omitted `tools` defaults to the
   wildcard, so it *provisions* every provider the catalog's tools declare
-  without *requiring* any of them.
+  without *requiring* any of them. **Superseded in 0.8.6 by
+  [ADR-0079](0079-declaration-is-the-launch-authority.md):** it still declares no
+  `credentials`, but it provisions through the `default_tools` closure, not
+  through an omitted wildcard.
 - **The launch catalog resolves the set once** (`CatalogEntry::provisioned`),
   and the whole entry is handed to dispatch and `run::launch`, so the tool and
   its provisioning set cannot be mismatched.
@@ -152,9 +163,12 @@ amendments below for `pi`'s two edges):
   `copilot/config.json` placeholder and `COPILOT_GITHUB_TOKEN`, all together.
 - **A config that declares tools but no `shell` gets a fallback shell that
   provisions nothing.** The fallback is resolved from a scope holding only the
-  one shipped `shell` definition (#395), so its wildcard closes over itself
-  alone: no provider, no requested credential name, no `persist` path, and no
-  shipped agent restored. `USAGE.md` carries the resulting guidance.
+  one shipped `shell` definition (#395), so it closes over itself alone: no
+  provider, no requested credential name, no `persist` path, and no shipped
+  agent restored. `USAGE.md` carries the resulting guidance. **Superseded in
+  0.8.6 by [ADR-0079](0079-declaration-is-the-launch-authority.md):** it still
+  provisions nothing of its own; what it does receive is the effective
+  `default_tools` grant, which is empty unless a config writes that key.
 - **A `tools` reference is tier-local and validated in every definition**
   (#395). The breaking part is explicit: a reference to a name another file
   declares is now a config error, and so is a dangling reference inside a
@@ -282,7 +296,9 @@ the transport (not yet present in the pinned v0.1.3 image) and
    the most-run verb by design.
 5. **An additive-dependency default** (omission means none, `shell` writes
    `["*"]` explicitly). Rejected: the default must stay broad; omission meaning
-   "all available" is special to `shell`.
+   "all available" is special to `shell`. **Retired in 0.8.6 by
+   [ADR-0079](0079-declaration-is-the-launch-authority.md):** omission is now
+   none for every tool, and the wide default is `default_tools`.
 6. **`all_tools = true` as a second field, or a string-or-list `tools = "all"`.**
    Rejected: `RawLayer`'s comment records the preference for optional fields plus
    exhaustive validation over an untagged enum, and a second field needs a
@@ -299,7 +315,9 @@ the transport (not yet present in the pinned v0.1.3 image) and
    Copilot token, registers a live substitution entry, writes
    `copilot/config.json` and exports `COPILOT_GITHUB_TOKEN` into a guest running
    that repo's code. The tier-local rule closes that path, and #395 closed the
-   remaining explicit-name half of it.
+   remaining explicit-name half of it. The wildcard itself was retired in 0.8.6
+   by [ADR-0079](0079-declaration-is-the-launch-authority.md); the tier-local
+   rule survives as the `tools` resolution scope.
 10. **Retain the pre-merge tier vectors so `"*"` reads the declaring file's full
     declared set** — now **required and implemented** (#395, ADR-0048): a
     definition hidden by a launch-name conflict still supplies its own file's

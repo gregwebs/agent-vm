@@ -95,7 +95,7 @@ impl Harness {
         write(
             &path,
             &format!(
-                "allow_tools = [\"repo:lint\"]\n\
+                "\
                  [[sources]]\nname = \"repo\"\npath = \"./conf/agent-vm.toml\"\n{}",
                 if allow { "allow = true\n" } else { "" }
             ),
@@ -427,7 +427,7 @@ fn a_review_names_the_source_scope_and_allow_value_and_warns_about_adoption() {
     write(
         &h.project_config(),
         &format!(
-            "allow_tools = [\"repo:lint\"]\n\
+            "\
              [[sources]]\nname = \"repo\"\npath = {:?}\nallow = true\n",
             external.display().to_string()
         ),
@@ -447,8 +447,8 @@ fn a_review_names_the_source_scope_and_allow_value_and_warns_about_adoption() {
     );
     assert!(
         printed.contains(
-            "==> allow = true: approving also adopts this source's top-level `image`, `mounts`, \
-             `network` and `allow_tools`"
+            "==> allow = true: approving also adopts this source's top-level `image`, `mounts` \
+             and `network`; its [[tools]] declarations become launch verbs either way"
         ),
         "the capability the approval grants is named: {printed}"
     );

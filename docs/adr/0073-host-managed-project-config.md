@@ -28,8 +28,9 @@ configuration** (#732). Whoever can write the repository — its author, a
 dependency's vendored tree, a branch the user merely checks out — authored the
 project tier. A tools-only file is already the attack: it adds verbs, replaces
 the guest command of a name it declares, and selects the boot image. Later
-children of #732 put `sources`, source trust, `allow_tools` and project image
-pins in the same file, so the file becomes the root of a project's trust.
+children of #732 put `sources`, source trust, `default_tools`/`use_tools` and
+project image pins in the same file, so the file becomes the root of a project's
+trust. (ADR-0079 retired `allow_tools`, which this list named before #749.)
 
 ```text
 checkout a branch → its .agent-vm/config.toml is loaded at the next launch
@@ -253,7 +254,10 @@ the commands that treat it as fatal do so exactly as before.
   the `agent-vm config` subcommand. #737's narrow `image set-default` writer is
   [ADR-0078](0078-project-config-writer.md). The legacy note names `agent-vm config edit` before it exists
   because #733's acceptance criteria require that wording. `sources` and
-  `:trust` arrive with #734 (ADR-0074).
+  `:trust` arrive with #734 (ADR-0074). **Amended in 0.8.6 by
+  [ADR-0079](0079-declaration-is-the-launch-authority.md):** #735 landed, and
+  #749 replaced its `allow_tools` with declaration authority, `default_tools`
+  and `use_tools`; `allow_tools` is now refused rather than unimplemented.
 
 ## Alternatives rejected
 

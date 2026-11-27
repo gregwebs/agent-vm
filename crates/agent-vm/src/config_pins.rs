@@ -888,10 +888,9 @@ pub(crate) struct UnapprovedSources {
     entries: Vec<InspectedSource>,
     pending: Vec<PendingSource>,
     all_declared_keys: BTreeSet<PinKey>,
-    /// The verbs an approval of `pending` cannot introduce: the names the
-    /// already parsed tiers spell, plus the compiled-in ones. See
-    /// [`Self::verb_candidates`].
-    known_verbs: BTreeSet<String>,
+    /// The aliases of the sources `pending` holds, so the launch preflight can
+    /// tell a verb the approval can make dispatchable from one it cannot.
+    pending_aliases: BTreeSet<crate::config_sources::SourceAlias>,
 }
 
 #[allow(dead_code)] // `pins_cmd` reads these
@@ -904,16 +903,15 @@ impl UnapprovedSources {
         entries: Vec<InspectedSource>,
         pending: Vec<PendingSource>,
         all_declared_keys: BTreeSet<PinKey>,
-        known_verbs: BTreeSet<String>,
     ) -> Self {
         Self {
             project_config,
             store_dir,
             observed,
             entries,
+            pending_aliases: pending.iter().map(|source| source.alias.clone()).collect(),
             pending,
             all_declared_keys,
-            known_verbs,
         }
     }
 
@@ -943,18 +941,12 @@ impl UnapprovedSources {
 
     /// Which verbs a review here could make dispatchable.
     ///
-    /// A pending `allow = true` source may adopt `[[tools]]`, so any name could
-    /// dispatch once approved. With every pending source `allow = false` the
-    /// reloaded catalog's verb *names* are already decided by the parsed tiers:
-    /// an inert source's tools appear only where the project config names them,
-    /// so it cannot introduce a verb no tier spells. Prompting for anything else
-    /// would approve state for a verb the reload then rejects.
+    /// Any declaration is launchable (#749), so a pending source may supply any
+    /// **bare** name; a qualified `<alias>:<name>` can only be one of these
+    /// pending aliases, because an approved source's verbs are already in the
+    /// catalog the reload offers.
     pub(crate) fn verb_candidates(&self) -> crate::cli::VerbCandidates<'_> {
-        if self.pending.iter().any(|source| source.allow) {
-            crate::cli::VerbCandidates::AnyPendingSource
-        } else {
-            crate::cli::VerbCandidates::Known(&self.known_verbs)
-        }
+        crate::cli::VerbCandidates::Pending(&self.pending_aliases)
     }
 }
 

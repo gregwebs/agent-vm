@@ -83,8 +83,11 @@ not needed by the guest, since an `auth.json` entry alone is sufficient.
 ## Consequences
 
 - `agent-vm pi` reaches Antigravity models whenever the host Pi is signed in;
-  `agent-vm doctor` gains a `pi` host-credential row, and `agent-vm shell` (the
-  wildcard) provisions the provider like the other four.
+  `agent-vm doctor` gains a `pi` host-credential row, and `agent-vm shell`
+  provisions the provider like the other four through the shipped
+  `default_tools` list (amended in 0.8.6 by
+  [ADR-0079](0079-declaration-is-the-launch-authority.md), which retired the
+  shell's implicit `tools = ["*"]`).
 - The guest needs egress to `oauth2.googleapis.com` and to a cloudcode host.
   The shipped `pi` tool declares all three cloudcode hosts, so a user whose
   persisted grants name only `cloudcode-pa.googleapis.com` must either grant a

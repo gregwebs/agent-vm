@@ -1977,7 +1977,6 @@ fn no_debug_or_error_form_of_the_typed_refusal_carries_pending_bytes() {
         Vec::new(),
         vec![pending],
         std::collections::BTreeSet::from([key]),
-        std::collections::BTreeSet::new(),
     );
     let carrier = debug_forms(&unapproved);
     assert_byte_free(&carrier);

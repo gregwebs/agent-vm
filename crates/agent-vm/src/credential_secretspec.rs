@@ -39,7 +39,7 @@ pub(crate) mod pool;
 pub(crate) mod protocol;
 pub(crate) mod session;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::credential_resolver::CredentialSource;
@@ -116,16 +116,16 @@ pub(crate) struct SecretspecSource {
 impl SecretspecSource {
     /// `None` when no requested authorization selects SecretSpec, so such a
     /// launch builds nothing at all.
-    pub(crate) fn select(
-        requested: &BTreeSet<ServiceName>,
+    pub(crate) fn select<'a>(
+        requested: impl IntoIterator<Item = &'a ServiceName>,
         authorizations: &AuthorizationSet,
     ) -> Option<Self> {
         Self::build(requested, authorizations, SessionPool::production())
     }
 
     #[cfg(test)]
-    pub(in crate::credential_secretspec) fn select_with(
-        requested: &BTreeSet<ServiceName>,
+    pub(in crate::credential_secretspec) fn select_with<'a>(
+        requested: impl IntoIterator<Item = &'a ServiceName>,
         authorizations: &AuthorizationSet,
         bounds: session::Bounds,
     ) -> Option<Self> {
@@ -133,8 +133,8 @@ impl SecretspecSource {
     }
 
     #[cfg(test)]
-    pub(in crate::credential_secretspec) fn select_with_starter(
-        requested: &BTreeSet<ServiceName>,
+    pub(in crate::credential_secretspec) fn select_with_starter<'a>(
+        requested: impl IntoIterator<Item = &'a ServiceName>,
         authorizations: &AuthorizationSet,
         bounds: session::Bounds,
         starter: pool::TestStarter,
@@ -146,8 +146,8 @@ impl SecretspecSource {
         )
     }
 
-    fn build(
-        requested: &BTreeSet<ServiceName>,
+    fn build<'a>(
+        requested: impl IntoIterator<Item = &'a ServiceName>,
         authorizations: &AuthorizationSet,
         pool: SessionPool,
     ) -> Option<Self> {

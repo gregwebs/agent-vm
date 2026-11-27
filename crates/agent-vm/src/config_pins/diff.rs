@@ -183,8 +183,8 @@ impl<'a> PendingReview<'a> {
     /// the question must say that approving them adopts them.
     fn allow_warning(&self) -> Option<String> {
         self.allow.then(|| {
-            "==> allow = true: approving also adopts this source's top-level `image`, `mounts`, \
-             `network` and `allow_tools`\n"
+            "==> allow = true: approving also adopts this source's top-level `image`, `mounts` \
+             and `network`; its [[tools]] declarations become launch verbs either way\n"
                 .to_owned()
         })
     }

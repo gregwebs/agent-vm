@@ -11,6 +11,10 @@ image contract) and [ADR-0019](0019-tool-free-base-and-per-tool-layers.md)
 [ADR-0021](0021-project-scoped-pi-home-and-wrapper-parity.md) for the
 "credential-free multi-provider agent" shape.
 
+Amended in **0.8.6** by [ADR-0079](0079-declaration-is-the-launch-authority.md):
+`dsh` is a shipped declaration reachable by its bare verb and by
+`default_tools`, and `shell` no longer has a wildcard.
+
 ## Context
 
 DeepSeek Harness ships one CLI, `dsh`, whose entry modes are profiles rather
@@ -87,6 +91,8 @@ guest with `dsh plugin`.
 - The published default image grows by one ~360 MiB layer at its base. Every
   layer above it rebuilds when the dsh pin moves; a dsh bump is an explicit PR,
   not an hourly lookup, so that is bounded.
-- `shell`'s wildcard provisions the `~/.dsh` persist link, and the shipped tool
-  count is seven.
+- `shell`'s effective `default_tools` closure provisions the `~/.dsh` persist
+  link, and the shipped tool count is seven. (The wildcard that once did this is
+  retired; see [ADR-0079](0079-declaration-is-the-launch-authority.md), which
+  amends this record in 0.8.6.)
 - Subscribing dsh to agent-vm's host OAuth credentials is follow-up work.

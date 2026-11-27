@@ -7,7 +7,7 @@
 //! when that file is edited, and never because a repository declared something.
 //!
 //! #735 (ADR-0075) removed the `tool:NAME` reference: a tool's own
-//! `network_requests` are granted when `allow_tools` authorizes it, so nothing
+//! `network_requests` are granted when a launch selects it, so nothing
 //! needs to name a tool from an egress list. [`expand`] survives as that one
 //! grant path's converter.
 //!
@@ -259,7 +259,7 @@ pub(crate) use sets::{EgressSetError, ParsedEgressSets};
 /// file nor re-measure its directory (A31, A32).
 ///
 /// #735 removed the `[[tools]] network_requests` map: a `tool`'s requests are
-/// granted when `allow_tools` authorizes it on launch, not by an egress reference
+/// granted when a launch selects it, not by an egress reference
 /// (ADR-0075). What is left is the set graph and the verdict for it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EgressNamespace {

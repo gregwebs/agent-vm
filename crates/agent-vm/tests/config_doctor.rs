@@ -292,7 +292,7 @@ fn a_user_only_catalog_adds_the_shell_fallback_but_no_defaults() {
     let stdout = stdout_of(&out);
 
     assert!(
-        stdout.contains("resolved: authorized tools; launch-verb order"),
+        stdout.contains("resolved: declared tools; launch-verb order"),
         "{stdout}"
     );
     assert!(stdout.contains("1. solo"), "{stdout}");
@@ -301,7 +301,10 @@ fn a_user_only_catalog_adds_the_shell_fallback_but_no_defaults() {
     assert!(!stdout.contains("codex ->"), "{stdout}");
     // ...but the built-in `shell` fallback is, and it is labelled.
     assert!(stdout.contains("2. shell"), "{stdout}");
-    assert!(stdout.contains("`shell` was not declared"), "{stdout}");
+    assert!(
+        stdout.contains("the bare `shell` verb is the built-in fallback"),
+        "{stdout}"
+    );
 }
 
 #[test]
@@ -311,7 +314,7 @@ fn union_order_and_conflict_warning_are_reported_once() {
         "[[tools]]\nname = \"z\"\ncommand = \"z\"\n[[tools]]\nname = \"a\"\ncommand = \"a\"\n",
     );
     h.write_project(
-        "allow_tools = [\"b\", \"a\", \"c\"]\n\
+        "\
          [[tools]]\nname = \"b\"\ncommand = \"b\"\n\
          [[tools]]\nname = \"a\"\ncommand = \"a2\"\n\
          [[tools]]\nname = \"c\"\ncommand = \"c\"\n",
@@ -321,7 +324,9 @@ fn union_order_and_conflict_warning_are_reported_once() {
     assert_success(&out);
     let stdout = stdout_of(&out);
 
-    let order: Vec<usize> = ["1. z", "2. a", "3. b", "4. c"]
+    // Arena order: the user's two, then the project's three; the project's `a`
+    // owns the bare name, so the user's is `home:a` (#749).
+    let order: Vec<usize> = ["1. z", "2. home:a", "3. b", "4. a", "5. c"]
         .iter()
         .map(|row| {
             stdout
@@ -340,7 +345,7 @@ fn union_order_and_conflict_warning_are_reported_once() {
     // quoted, escaped name), not only in prefix.
     assert!(
         stdout.contains(&format!(
-            "warning: tool \"a\" in {} overrides\n         {}; differing fields: command",
+            "warning: tool \"a\" in {} shadows\n         {}; the bare name launches the project's definition, the other keeps its qualified spelling; differing fields: command",
             h.project_config().display(),
             h.user_config().display()
         )),
@@ -360,9 +365,7 @@ fn conflict_warning_matches_the_documented_format_for_multiple_fields() {
     h.write_user("[[tools]]\nname = \"t\"\ncommand = \"t\"\nargs = [\"a\"]\n");
     // The project must *authorize* the name to override the user's verb (D3),
     // which is what makes this a conflict warning at all.
-    h.write_project(
-        "allow_tools = [\"t\"]\n[[tools]]\nname = \"t\"\ncommand = \"t2\"\nargs = [\"b\"]\n",
-    );
+    h.write_project("[[tools]]\nname = \"t\"\ncommand = \"t2\"\nargs = [\"b\"]\n");
 
     let out = h.run_doctor();
     assert_success(&out);
@@ -372,7 +375,7 @@ fn conflict_warning_matches_the_documented_format_for_multiple_fields() {
     // warning names the project first and the user file second.
     assert!(
         stdout.contains(&format!(
-            "warning: tool \"t\" in {} overrides\n         {}; differing fields: command, args",
+            "warning: tool \"t\" in {} shadows\n         {}; the bare name launches the project's definition, the other keeps its qualified spelling; differing fields: command, args",
             h.project_config().display(),
             h.user_config().display()
         )),
@@ -523,13 +526,15 @@ fn persist_rule_violations_surface_through_the_binary() {
             "must be relative to the guest HOME",
         ),
         (
-            "two tools claiming one path",
-            "[[tools]]\nname = \"a\"\ncommand = \"a\"\npersist = [\"shared\"]\n[[tools]]\nname = \"b\"\ncommand = \"b\"\npersist = [\"shared\"]\n",
+            // #749: a launch's own closure is where two claims meet, so the
+            // tool must name the other one.
+            "two tools claiming one path in one closure",
+            "[[tools]]\nname = \"a\"\ncommand = \"a\"\npersist = [\"shared\"]\ntools = [\"b\"]\n[[tools]]\nname = \"b\"\ncommand = \"b\"\npersist = [\"shared\"]\n",
             "is claimed by tool",
         ),
         (
-            "an overlapping pair",
-            "[[tools]]\nname = \"a\"\ncommand = \"a\"\npersist = [\".cache\"]\n[[tools]]\nname = \"b\"\ncommand = \"b\"\npersist = [\".cache/x\"]\n",
+            "an overlapping pair in one closure",
+            "[[tools]]\nname = \"a\"\ncommand = \"a\"\npersist = [\".cache\"]\ntools = [\"b\"]\n[[tools]]\nname = \"b\"\ncommand = \"b\"\npersist = [\".cache/x\"]\n",
             "overlaps",
         ),
         (
@@ -838,7 +843,7 @@ fn a_host_managed_project_config_is_loaded_from_the_project_digest_path() {
     let config = support::project_config_path(&h.home_root, &h.project_root);
     write(
         &config,
-        "allow_tools = [\"hosted-258\"]\n[[tools]]\nname = \"hosted-258\"\ncommand = \"hosted-258\"\n",
+        "[[tools]]\nname = \"hosted-258\"\ncommand = \"hosted-258\"\n",
     );
 
     let out = h.run_doctor();
@@ -879,7 +884,7 @@ fn doctor_renders_each_source_row_with_trust_allow_and_inert_declarations() {
         &h.project_root.join("sourced.toml"),
         "image = \"localhost:1/repo:latest\"\n\
          mounts = [\"/host:/guest:ro\"]\n\
-         allow_tools = []\n\
+         \
          [network]\nallow_lan = true\n",
     );
     write(
@@ -907,7 +912,7 @@ fn doctor_renders_each_source_row_with_trust_allow_and_inert_declarations() {
     assert!(
         stdout.contains(&format!(
             "  repo {} (found, 0 tools) [trust=false, allow=false, pin=approved \
-             sha256:{hash}; inert: image, mounts, [network], allow_tools]\n",
+             sha256:{hash}; inert: image, mounts, [network]]\n",
             repo.display()
         )),
         "{stdout}"
@@ -936,7 +941,7 @@ fn an_absent_project_config_keeps_the_user_tier() {
         "{stdout}"
     );
     assert!(
-        stdout.contains("resolved: authorized tools; launch-verb order"),
+        stdout.contains("resolved: declared tools; launch-verb order"),
         "{stdout}"
     );
 }
@@ -1126,7 +1131,7 @@ fn only_an_explicitly_sourced_in_repo_config_suppresses_the_legacy_notice() {
     );
     sourced.write_user(ONE_TOOL);
     sourced.write_project(
-        "allow_tools = [\"repo:legacy-only\"]\n\
+        "\
          [[sources]]\nname = \"home\"\npath = \"~/.config/agent-vm/config.toml\"\ntrust = true\nallow = true\n\
          [[sources]]\nname = \"repo\"\npath = \"./.agent-vm/config.toml\"\n",
     );
@@ -1538,7 +1543,7 @@ fn a_non_ascii_measured_path_is_printed_as_itself() {
     // The project authorizes both names, so `t` is a real override (D3) and `u`
     // is a real project row.
     h.write_project(
-        "image = \"127.0.0.1:1/project:dev\"\nallow_tools = [\"t\", \"u\"]\n\
+        "image = \"127.0.0.1:1/project:dev\"\n\
          [[tools]]\nname = \"t\"\ncommand = \"other\"\n\
          [[tools]]\nname = \"u\"\ncommand = \"u\"\n",
     );
@@ -1618,9 +1623,9 @@ fn a_non_ascii_measured_path_is_printed_as_itself() {
     for (site, needle) in [
         (
             "the conflict warning",
-            // ADR-0075 D3: the authorized project definition is the overrider.
+            // #749: the project's definition owns the bare name.
             format!(
-                "in {} overrides",
+                "in {} shadows",
                 h.project_config().canonicalize().unwrap().display()
             ),
         ),
@@ -2373,11 +2378,11 @@ fn tool_rows(stdout: &str) -> Vec<String> {
         .collect()
 }
 
-/// **C1.** The preview and `--help` list the same verbs, and neither surfaces the
-/// definition hidden by the user's name conflict — while the project helper's row
-/// still provisions the hidden project `pi`'s facet.
+/// **C1.** The preview and `--help` list the same verbs: the project's `pi` owns
+/// the bare name and the user's is `home:pi` (#749), and the project helper's row
+/// still provisions the project `pi`'s facet.
 #[test]
-fn a_hidden_definition_is_not_a_verb_but_still_provisions_its_tier() {
+fn the_preview_and_help_list_the_same_launch_labels() {
     let h = Harness::new();
     h.write_user(TIER_DOCTOR_USER);
     h.write_project(TIER_DOCTOR_PROJECT);
@@ -2394,21 +2399,14 @@ fn a_hidden_definition_is_not_a_verb_but_still_provisions_its_tier() {
         rows.iter()
             .map(|row| row.split(" ->").next().unwrap())
             .collect::<Vec<_>>(),
-        ["pi", "bridge", "helper", "shell"],
+        ["home:pi", "pi", "bridge", "helper", "shell"],
         "{stdout}"
     );
-    // The hidden project `pi` is not a row and its command is not a verb.
-    assert!(
-        !stdout.contains("project-pi"),
-        "a hidden definition must not become a verb: {stdout}"
-    );
-    // No conflict: the project does not authorize `pi`, so the user's definition
-    // keeps the verb and nothing is overridden (ADR-0075 D3 makes the conflict an
-    // *authorized* override report).
-    assert!(
-        !stdout.contains("warning: tool \"pi\" in"),
-        "an unauthorized shadow overrides nothing: {stdout}"
-    );
+    // Both `pi` definitions are verbs; the project's owns the bare name.
+    assert!(stdout.contains("project-pi"), "{stdout}");
+    assert!(stdout.contains("user-pi"), "{stdout}");
+    // The shadow is reported once, naming the project file first.
+    assert!(stdout.contains("warning: tool \"pi\" in"), "{stdout}");
     // The helper's row is its own requirement set and the project closure: the
     // persist count is the three paths that launch links (hidden project `pi`,
     // `bridge`, `helper`), with its own single declaration named beside it
@@ -2419,11 +2417,11 @@ fn a_hidden_definition_is_not_a_verb_but_still_provisions_its_tier() {
         )),
         "{rows:?}"
     );
-    // The user's verb provisions only its own facets, so its counts agree and no
-    // own-count suffix appears.
+    // The user's definition provisions only its own facets, so its counts agree
+    // and no own-count suffix appears.
     assert!(
         rows.iter().any(|row| row.starts_with(
-            "pi -> \"user-pi\"; args=0; credentials=openai; provisions=openai; persist=1; source=user:"
+            "home:pi -> \"user-pi\"; args=0; credentials=openai; provisions=openai; persist=1; source=user:"
         )),
         "{rows:?}"
     );
@@ -2439,13 +2437,12 @@ fn a_hidden_definition_is_not_a_verb_but_still_provisions_its_tier() {
     let help = h.base_command().arg("--help").output().unwrap();
     assert_success(&help);
     let help_stdout = stdout_of(&help);
-    for verb in ["pi", "bridge", "helper", "shell"] {
+    for verb in ["pi", "home:pi", "bridge", "helper", "shell"] {
         assert!(
             help_stdout.contains(&format!("  {verb}")),
             "missing {verb}: {help_stdout}"
         );
     }
-    assert!(!help_stdout.contains("project-pi"), "{help_stdout}");
 
     // The preview materializes nothing.
     assert_eq!(snapshot_tree(&h.home_root), before);
@@ -2563,8 +2560,13 @@ fn an_invalid_local_reference_is_previewed_and_recoverable() {
 #[test]
 fn shell_rows_report_the_tier_local_provisioning_set() {
     let omitted = Harness::new();
+    // #749: the wildcard is retired, so the grant is written out. The row still
+    // reports the resolved provisioning and persist sets — the same-file
+    // sibling's `.sib` is linked by a shell launch (#429) — and the project's
+    // `.proj` is a different tier, so it is still never reached.
     omitted.write_user(
-        "[[tools]]\nname = \"shell\"\ncommand = \"bash\"\n\
+        "default_tools = [\"sib\"]\n\
+         [[tools]]\nname = \"shell\"\ncommand = \"bash\"\n\
          [[tools]]\nname = \"sib\"\ncommand = \"sib\"\ncredentials = [\"copilot\"]\npersist = [\".sib\"]\n",
     );
     omitted.write_project(
@@ -2573,14 +2575,22 @@ fn shell_rows_report_the_tier_local_provisioning_set() {
     let out = omitted.run_doctor();
     assert_success(&out);
     let stdout = stdout_of(&out);
-    // The omitted `tools` is the wildcard, so the row reports the resolved
-    // provisioning set *and* the resolved persist set: the same-file sibling's
-    // `.sib` is linked by a shell launch (#429). The project's `.proj` is a
-    // different tier, so the wildcard never reaches it.
+    // E3: the user declaration is qualified and keeps its own (empty) sets; the
+    // grant is reported on the affordance, which is the shipped fallback.
     assert!(
         stdout.contains(
-            "shell -> \"bash\"; args=0; credentials=none; provisions=copilot; persist=1 (own 0); source=user:"
+            "home:shell -> \"bash\"; args=0; credentials=none; provisions=none; persist=0; source=user:"
         ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "shell -> \"bash\"; args=2; credentials=none; provisions=copilot; persist=1 (own 0); source=built-in"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("default_tools: sib -> provisioned for `shell` and a direct command"),
         "{stdout}"
     );
     assert!(
@@ -2589,7 +2599,10 @@ fn shell_rows_report_the_tier_local_provisioning_set() {
         ),
         "{stdout}"
     );
-    assert!(!stdout.contains("`shell` was not declared"), "{stdout}");
+    assert!(
+        stdout.contains("the bare `shell` verb is the built-in fallback"),
+        "{stdout}"
+    );
 
     let empty = Harness::new();
     empty.write_user(
@@ -2603,7 +2616,11 @@ fn shell_rows_report_the_tier_local_provisioning_set() {
     assert_success(&out);
     let stdout = stdout_of(&out);
     assert!(
-        stdout.contains("shell -> \"bash\"; args=0; credentials=none; provisions=none"),
+        stdout.contains("home:shell -> \"bash\"; args=0; credentials=none; provisions=none"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("shell -> \"bash\"; args=2; credentials=none; provisions=none"),
         "{stdout}"
     );
 
@@ -2617,7 +2634,10 @@ fn shell_rows_report_the_tier_local_provisioning_set() {
         stdout.contains("shell -> \"bash\"; args=2; credentials=none; provisions=none"),
         "{stdout}"
     );
-    assert!(stdout.contains("`shell` was not declared"), "{stdout}");
+    assert!(
+        stdout.contains("the bare `shell` verb is the built-in fallback"),
+        "{stdout}"
+    );
     assert!(
         !stdout.contains("dsh"),
         "no shipped agent may be restored: {stdout}"
@@ -3187,294 +3207,49 @@ fn the_harness_allowance_seed_is_what_doctor_reports() {
 }
 
 // ---------------------------------------------------------------------------
-// #735 V13: the `inert tools (declared, not in allow_tools):` block.
+// #749: every declaration is a launch verb, with its launch label.
 // ---------------------------------------------------------------------------
 
-/// The block's own heading, pinned here as a literal because the tests below are
-/// black-box: only the built binary's bytes can show the heading exists.
-const INERT_HEADING: &str = "inert tools (declared, not in allow_tools):\n";
-/// The `resolved:` header, immediately followed by the first numbered verb. The
-/// two are adjacent by contract: the inert block follows the list instead of
-/// splitting the header from it (#735 review S2).
-const RESOLVED_THEN_FIRST_VERB: &str = "resolved: authorized tools; launch-verb order\n  1. ";
-
-/// The inert block's own rows: everything from after its heading up to the next
-/// blank line or section heading.
-fn inert_rows(stdout: &str) -> Vec<String> {
-    let at = stdout
-        .find(INERT_HEADING)
-        .unwrap_or_else(|| panic!("no inert block in:\n{stdout}"));
-    let rows: Vec<String> = stdout[at + INERT_HEADING.len()..]
-        .lines()
-        .take_while(|line| !line.is_empty() && !line.starts_with("==>"))
-        .map(str::to_owned)
-        .collect();
-    assert!(!rows.is_empty(), "an inert heading with no rows:\n{stdout}");
-    rows
-}
-
-/// A user-tier declaration no `allow_tools` entry authorizes: the advice names
-/// the **user** file, and the bare entry pasted there loads (#735 S1, user).
+/// `doctor` lists every declared tool under the spelling a launch uses: a
+/// project definition's bare name, and `home:<name>` / `<alias>:<name>` for a
+/// definition a project or another source shadows (#749).
 #[test]
-fn inert_user_tool_advice_names_the_user_file_and_the_entry_loads() {
-    let h = Harness::new();
-    let body = "allow_tools = [\"live\"]\n\
-                [[tools]]\nname = \"live\"\ncommand = \"live\"\n\
-                [[tools]]\nname = \"dormant\"\ncommand = \"dormant\"\n";
-    h.write_user(body);
-
-    let out = h.run_doctor();
-    assert_success(&out);
-    let stdout = stdout_of(&out);
-    // S2: the header introduces the numbered list directly.
-    assert!(stdout.contains(RESOLVED_THEN_FIRST_VERB), "{stdout}");
-    let rows = inert_rows(&stdout);
-    let advice = format!(
-        "add \"dormant\" to allow_tools in {}",
-        h.user_config().display()
-    );
-    assert!(rows[0].contains(&advice), "{:?}", rows[0]);
-    // The wrong pairing S1 fixed: the project file, which cannot load a bare
-    // name the user file declares.
-    assert!(
-        !rows[0].contains(&h.project_config().display().to_string()),
-        "{:?}",
-        rows[0]
-    );
-
-    h.write_user(&format!(
-        "allow_tools = [\"live\", \"dormant\"]\n{}",
-        body.strip_prefix("allow_tools = [\"live\"]\n").unwrap()
-    ));
-    let out = h.run_doctor();
-    assert_success(&out);
-    let stdout = stdout_of(&out);
-    assert!(!stdout.contains(INERT_HEADING), "{stdout}");
-    assert!(stdout.contains("2. dormant ->"), "{stdout}");
-}
-
-/// A project-tier declaration: the advice names the **project** file, and the
-/// bare entry pasted there loads (#735 S1, project).
-#[test]
-fn inert_project_tool_advice_names_the_project_file_and_the_entry_loads() {
-    let h = Harness::new();
-    h.write_user("allow_tools = [\"live\"]\n[[tools]]\nname = \"live\"\ncommand = \"live\"\n");
-    let body = "allow_tools = [\"own\"]\n\
-                [[tools]]\nname = \"own\"\ncommand = \"own\"\n\
-                [[tools]]\nname = \"dormant\"\ncommand = \"dormant\"\n";
-    write(&h.project_config(), body);
-
-    let out = h.run_doctor();
-    assert_success(&out);
-    let stdout = stdout_of(&out);
-    let rows = inert_rows(&stdout);
-    let advice = format!(
-        "add \"dormant\" to allow_tools in {}",
-        h.project_config().display()
-    );
-    assert!(rows[0].contains(&advice), "{:?}", rows[0]);
-
-    write(
-        &h.project_config(),
-        &format!(
-            "allow_tools = [\"own\", \"dormant\"]\n{}",
-            body.strip_prefix("allow_tools = [\"own\"]\n").unwrap()
-        ),
-    );
-    let out = h.run_doctor();
-    assert_success(&out);
-    let stdout = stdout_of(&out);
-    assert!(!stdout.contains(INERT_HEADING), "{stdout}");
-    // The project's own list wins the order: project entries follow inherited
-    // ones, so `dormant` is the second project verb.
-    assert!(stdout.contains("3. dormant ->"), "{stdout}");
-}
-
-/// A source-tier declaration with a non-ASCII name: the advice is the qualified
-/// `<alias>:<name>` in the project file, the printer's encoding of the name is
-/// what makes it pasteable, and the block renders *after* the numbered verbs
-/// (#735 S1 source, S2, S3 quoted/non-ASCII).
-#[test]
-fn inert_source_tool_advice_is_qualified_and_pastes_into_the_project() {
-    let h = Harness::new();
-    h.write_user("allow_tools = [\"live\"]\n[[tools]]\nname = \"live\"\ncommand = \"live\"\n");
-    let sourced = h.project_root.join("sourced.toml");
-    std::fs::write(
-        &sourced,
-        "[[tools]]\nname = \"dörmant-tool\"\ncommand = \"dormant-cmd\"\n",
-    )
-    .unwrap();
-    // The row is about inert advice, not pinning, but an in-checkout source
-    // cannot be `trust = true`, so the pin is the fixture's cost of sourcing it.
-    source_pins::approve(&h.home_root, &h.project_root, &sourced);
-    let sources = "[[sources]]\nname = \"repo\"\npath = \"./sourced.toml\"\n";
-    write(&h.project_config(), &format!("allow_tools = []\n{sources}"));
-
-    let out = h.run_doctor();
-    assert_success(&out);
-    let stdout = stdout_of(&out);
-    assert!(stdout.contains(RESOLVED_THEN_FIRST_VERB), "{stdout}");
-    let rows = inert_rows(&stdout);
-    let advice = format!(
-        "add \"repo:dörmant-tool\" to allow_tools in {}",
-        h.project_config().display()
-    );
-    assert!(rows[0].contains(&advice), "{:?}", rows[0]);
-    // Placement: the block follows the numbered list rather than splitting the
-    // `resolved:` header from it.
-    let inert = stdout.find(INERT_HEADING).expect("inert block");
-    let fallback_verb = stdout.find("1. shell ->").expect("the shell fallback");
-    assert!(fallback_verb < inert, "{stdout}");
-
-    write(
-        &h.project_config(),
-        &format!("allow_tools = [\"repo:dörmant-tool\"]\n{sources}"),
-    );
-    let out = h.run_doctor();
-    assert_success(&out);
-    let stdout = stdout_of(&out);
-    assert!(!stdout.contains(INERT_HEADING), "{stdout}");
-    // The verb row renders the name through the diagnostic escaper (non-ASCII
-    // bytes spelled out), so the *source* attribution is what identifies it here
-    // while the pasted entry above is the printer's unescaped TOML.
-    assert!(stdout.contains("1. d"), "{stdout}");
-    assert!(stdout.contains("source=sourced:repo:"), "{stdout}");
-}
-
-/// A declaration whose verb the project's own list has already decided: naming it
-/// a second time is refused (R3), so the advice names the entry to replace, and
-/// the replacement pasted in place loads (#735 review D2).
-#[test]
-fn inert_advice_replaces_a_verb_the_project_list_already_claims() {
+fn doctor_lists_every_declared_tool_with_its_launch_label() {
     let h = Harness::new();
     h.write_user(
-        "allow_tools = [\"claude\"]\n\
-         [[tools]]\nname = \"claude\"\ncommand = \"user-claude\"\n",
+        "[[tools]]\nname = \"claude\"\ncommand = \"user-claude\"\n\
+         [[tools]]\nname = \"solo\"\ncommand = \"solo\"\n",
     );
-    let sourced = h.project_root.join("sourced.toml");
-    std::fs::write(
-        &sourced,
-        "[[tools]]\nname = \"claude\"\ncommand = \"repo-claude\"\n",
-    )
-    .unwrap();
-    // Same reasoning as the row above: the inert-advisory assertion needs a
-    // checkout-scoped source, which is necessarily `trust = false`.
-    source_pins::approve(&h.home_root, &h.project_root, &sourced);
-    let sources = "[[sources]]\nname = \"home\"
-                   \npath = \"~/.config/agent-vm/config.toml\"\ntrust = true\nallow = true\n\
-                   [[sources]]\nname = \"repo\"\npath = \"./sourced.toml\"\n";
     write(
         &h.project_config(),
-        &format!(
-            "allow_tools = [\"repo:claude\"]\n{sources}\
-             [[tools]]\nname = \"claude\"\ncommand = \"project-claude\"\n"
-        ),
+        "[[tools]]\nname = \"claude\"\ncommand = \"project-claude\"\n",
     );
 
     let out = h.run_doctor();
     assert_success(&out);
     let stdout = stdout_of(&out);
-    let rows = inert_rows(&stdout);
-    let advice = format!(
-        "replace \"repo:claude\" with \"claude\" in allow_tools in {}",
-        h.project_config().display()
-    );
-    assert!(rows[0].contains(&advice), "{:?}", rows[0]);
-    // The advice the B1 rule refuses must not be offered as well: a bare second
-    // entry for this verb is a collision, not an activation.
+    // Arena order: the user's declarations first, the shadowed one qualified.
     assert!(
-        !rows[0].contains(&format!(
-            "add \"claude\" to allow_tools in {}",
+        stdout.contains("1. home:claude -> \"user-claude\""),
+        "{stdout}"
+    );
+    assert!(stdout.contains("2. solo -> \"solo\""), "{stdout}");
+    assert!(
+        stdout.contains("3. claude -> \"project-claude\""),
+        "{stdout}"
+    );
+    // The shadow is reported once, naming both files.
+    assert!(
+        stdout.contains(&format!(
+            "warning: tool \"claude\" in {}",
             h.project_config().display()
         )),
-        "{:?}",
-        rows[0]
-    );
-
-    write(
-        &h.project_config(),
-        &format!(
-            "allow_tools = [\"claude\"]\n{sources}\
-             [[tools]]\nname = \"claude\"\ncommand = \"project-claude\"\n"
-        ),
-    );
-    let out = h.run_doctor();
-    assert_success(&out);
-    let stdout = stdout_of(&out);
-    // The replacement claims the verb for the project tool, so only the source's
-    // `claude` stays inert — with the same replace-shaped advice, flipped.
-    let rows = inert_rows(&stdout);
-    // `inert_rows` runs on into the conflict warning that follows, so count the
-    // rows that are tool entries, not the whole slice.
-    let tool_rows: Vec<&String> = rows
-        .iter()
-        .filter(|row| row.starts_with("  claude ("))
-        .collect();
-    assert_eq!(tool_rows.len(), 1, "{rows:?}");
-    assert!(rows[0].contains("source repo"), "{:?}", rows[0]);
-    assert!(
-        rows[0].contains("replace \"claude\" with \"repo:claude\""),
-        "{:?}",
-        rows[0]
-    );
-    assert!(
-        stdout.contains("1. claude -> \"project-claude\""),
         "{stdout}"
     );
+    assert!(!stdout.contains("inert"), "{stdout}");
 }
 
-/// A claim written as `<alias>:<name>` whose definition dedupes to the user tier is
-/// still the project's decision, so the advice names that spelling. Deriving the
-/// claimant from the launch's origin would get this shape wrong — it would report
-/// the user-tier origin and advise a bare `claude`, which the list then refuses
-/// (#735 review D2, the `["home:claude"]` shape).
-#[test]
-fn inert_advice_names_a_qualified_claim_that_dedupes_to_the_user_tier() {
-    let h = Harness::new();
-    // `home:trust` sources the user's own file, so its `claude` is identical to the
-    // user-tier one and the two definitions dedupe to one.
-    h.write_user(
-        "allow_tools = [\"claude\"]\n\
-         [[tools]]\nname = \"claude\"\ncommand = \"user-claude\"\n",
-    );
-    let sources = "[[sources]]\nname = \"home\"\npath = \"~/.config/agent-vm/config.toml\"\ntrust = true\nallow = true\n";
-    write(
-        &h.project_config(),
-        &format!(
-            "allow_tools = [\"home:claude\"]\n{sources}\
-             [[tools]]\nname = \"claude\"\ncommand = \"project-claude\"\n"
-        ),
-    );
-
-    let out = h.run_doctor();
-    assert_success(&out);
-    let stdout = stdout_of(&out);
-    let rows = inert_rows(&stdout);
-    let advice = format!(
-        "replace \"home:claude\" with \"claude\" in allow_tools in {}",
-        h.project_config().display()
-    );
-    assert!(rows[0].contains(&advice), "{:?}", rows[0]);
-
-    write(
-        &h.project_config(),
-        &format!(
-            "allow_tools = [\"claude\"]\n{sources}\
-             [[tools]]\nname = \"claude\"\ncommand = \"project-claude\"\n"
-        ),
-    );
-    let out = h.run_doctor();
-    assert_success(&out);
-    let stdout = stdout_of(&out);
-    assert!(!stdout.contains(INERT_HEADING), "{stdout}");
-    assert!(
-        stdout.contains("1. claude -> \"project-claude\""),
-        "{stdout}"
-    );
-}
-
-/// The defaults-only bytes are unchanged by the block: with no inert tool the
-/// header still introduces the numbered list directly.
+/// The defaults-only header still introduces the numbered list directly.
 #[test]
 fn the_defaults_header_still_introduces_the_numbered_list() {
     let h = Harness::new();
@@ -3485,7 +3260,6 @@ fn the_defaults_header_still_introduces_the_numbered_list() {
         stdout.contains("resolved: built-in defaults; launch-verb order\n  1. dsh"),
         "{stdout}"
     );
-    assert!(!stdout.contains(INERT_HEADING), "{stdout}");
 }
 
 /// #736 V36: what doctor does around the pin state it reports.
@@ -3506,7 +3280,7 @@ fn doctor_reports_pin_state_read_only_and_never_prompts() {
     );
     write(
         &h.project_config(),
-        "allow_tools = [\"repo:repo-tool\"]\n\
+        "\
          [[sources]]\nname = \"repo\"\npath = \"./sourced.toml\"\n",
     );
     let store = source_pins::store_dir(&h.home_root, &h.project_root);

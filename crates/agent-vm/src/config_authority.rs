@@ -9,7 +9,7 @@
 //!
 //! **Presence, not contents, is what makes a file authority-bearing.** An empty
 //! `[network]` table, an empty `mounts` array, an empty `[mount_sets]` table, an
-//! empty `[egress_sets]` table and an empty `allow_tools` list grant nothing, yet
+//! empty `[egress_sets]` table and an empty `default_tools` list grant nothing, yet
 //! all five are the bytes an attacker would plant: what is being decided is
 //! whether the *file* is the user's own, so a caller that reads contents to decide
 //! would skip the check on exactly the cheapest file to plant. A file that declares `mount_sets` without `mounts` is therefore just as
@@ -35,7 +35,7 @@
 //!
 //! [`verify`] now measures the file on **every** user read, not only when an
 //! authority-bearing field is present: a `set:NAME` egress reference is passed on
-//! the command line, and a project `allow_tools` entry may select a `:trust`
+//! the command line, and a project tool selection may reach a `:trust`
 //! tool — both decided *after* this read is gone, yet both must be decided by the
 //! facts of the very read whose bytes supplied the definitions (ADR-0040 forbids
 //! a second observation). So the measured verdict is kept beside the bytes it came
@@ -43,16 +43,16 @@
 //!
 //! Refusal at *load* time is still decided by presence alone: only a file that
 //! declares `[network]`, `mounts`, `[mount_sets]`, `[egress_sets]` or
-//! `allow_tools` is refused for being untrusted, so a tools-only dotfile symlink
+//! `default_tools` is refused for being untrusted, so a tools-only dotfile symlink
 //! keeps loading exactly as before. The verdict is then read by either later
-//! consumer: a CLI `set:NAME` reference, or a project `allow_tools` entry that
+//! consumer: a CLI `set:NAME` reference, or a project tool selection that
 //! selects a `:trust` tool.
 //!
 //! # The project config (ADR-0073)
 //!
 //! The host-managed project config is measured on **every** present file, not
 //! by the presence of a field. It is the root of a project's trust — `sources`,
-//! `:trust` and `allow_tools` will all live in it — and it has no
+//! `:trust` and `default_tools` will all live in it — and it has no
 //! dotfile-symlink compatibility to preserve, so a tools-only planted file is
 //! already the attack.
 //!
@@ -171,16 +171,16 @@ pub struct AuthorityTriggers {
     pub mounts: bool,
     pub mount_sets: bool,
     pub egress_sets: bool,
-    pub allow_tools: bool,
+    pub default_tools: bool,
 }
 
 /// ADR-0040/0046/0048/#511/#735: presence, not contents, makes a user file
 /// authority-bearing. `t.mounts` is already the aggregate of the top-level
 /// `mounts` array and every tool's `mounts` field ([`mount_authority_present`]).
 pub fn authority_required(t: AuthorityTriggers) -> (r: bool)
-    ensures r == (t.network || t.mounts || t.mount_sets || t.egress_sets || t.allow_tools),
+    ensures r == (t.network || t.mounts || t.mount_sets || t.egress_sets || t.default_tools),
 {
-    if t.network { true } else { t.mounts || t.mount_sets || t.egress_sets || t.allow_tools }
+    if t.network { true } else { t.mounts || t.mount_sets || t.egress_sets || t.default_tools }
 }
 } // verus!
 
@@ -195,10 +195,15 @@ pub(crate) struct AuthorityFields {
     mounts: bool,
     mount_sets: bool,
     egress_sets: bool,
-    /// #735: `allow_tools` is the fifth trigger. Its presence — `[]` included —
-    /// means the file decides which declarations become launch verbs, so it must
-    /// pass the same verified read as the four grant-bearing fields.
-    allow_tools: bool,
+    /// #735/#749: the fifth trigger. Its presence — `[]` included — means the
+    /// file decides which declarations become `default_tools`, so it must pass the
+    /// same verified read as the four grant-bearing fields. The arm is renamed
+    /// from #735's `allow_tools`; the launch-verb authority a `[[tools]]`
+    /// declaration carries is judged by the same read at
+    /// [`ReferenceTrust::require_for_trusted_tool`], not by a load refusal — a
+    /// tools-only dotfile keeps ADR-0040's compatibility and its tools stay
+    /// unlaunchable while its verdict fails (E8).
+    default_tools: bool,
 }
 
 /// The field(s) a refusal is about, so one refusal kernel can report itself
@@ -227,7 +232,7 @@ pub(crate) enum AuthoritySubject {
     /// loads through ADR-0040's compatibility rule), yet the project would hand
     /// its `mounts` and `network_requests` to a launch — so the project's
     /// selection needs that read's verdict, attributed to the definition it
-    /// selects rather than to a user `allow_tools` list the file may not have.
+    /// names rather than to a declaration list the file may not have.
     TrustedTool,
     /// ADR-0073: the host-managed project config is verified whatever it
     /// declares; it is the root of the project's trust, so there is no field
@@ -245,7 +250,7 @@ const FIELD_PHRASES: [(&str, &str, &str); 5] = [
     ("mounts", "mounts list", "mounts"),
     ("[mount_sets]", "[mount_sets] table", "[mount_sets]"),
     ("[egress_sets]", "[egress_sets] table", "[egress_sets]"),
-    ("allow_tools", "allow_tools list", "allow_tools"),
+    ("default_tools", "default_tools list", "default_tools"),
 ];
 
 /// `a`, `a and b`, `a, b and c`: the one list grammar all three slots share.
@@ -269,7 +274,7 @@ impl AuthoritySubject {
         match self {
             Self::Fields(fields) => join_phrases(&fields.present(0), " and "),
             Self::EgressReference => "an egress reference".to_owned(),
-            Self::TrustedTool => "authorizing a :trust tool from the project config".to_owned(),
+            Self::TrustedTool => "launching a tool from the default user config".to_owned(),
             Self::ProjectConfig => "the project config".to_owned(),
             Self::TrustedSource => "a trusted source".to_owned(),
         }
@@ -282,7 +287,7 @@ impl AuthoritySubject {
             // Only `set:NAME` remains, so the table a reference reads is the
             // user file's own `[egress_sets]`.
             Self::EgressReference => "[egress_sets] table".to_owned(),
-            Self::TrustedTool => "[[tools]] definition it selects".to_owned(),
+            Self::TrustedTool => "[[tools]] definition it launches".to_owned(),
             Self::ProjectConfig => "project config".to_owned(),
             Self::TrustedSource => "trusted source file".to_owned(),
         }
@@ -302,7 +307,7 @@ impl AuthoritySubject {
             Self::EgressReference => Some("an egress reference".to_owned()),
             // A symlinked file nothing selects still works: the trigger is the
             // project's selection, not the file's own bytes.
-            Self::TrustedTool => Some("a project allow_tools entry naming its tools".to_owned()),
+            Self::TrustedTool => Some("declaring a tool".to_owned()),
             Self::ProjectConfig => None,
             // No compatibility at all: a non-default trusted source is new in
             // ADR-0076, so no existing symlinked file depends on loading.
@@ -326,13 +331,13 @@ impl AuthoritySubject {
             mounts: triggers.mounts,
             mount_sets: triggers.mount_sets,
             egress_sets: triggers.egress_sets,
-            allow_tools: triggers.allow_tools,
+            default_tools: triggers.default_tools,
         };
         if !(triggers.network
             || triggers.mounts
             || triggers.mount_sets
             || triggers.egress_sets
-            || triggers.allow_tools)
+            || triggers.default_tools)
         {
             return Self::Fields(AuthorityFields {
                 network: true,
@@ -352,7 +357,7 @@ impl AuthorityFields {
             self.mounts,
             self.mount_sets,
             self.egress_sets,
-            self.allow_tools,
+            self.default_tools,
         ];
         flags
             .iter()
@@ -384,7 +389,7 @@ impl AuthorizedConfig<'_> {
 }
 
 /// The token the top-level adoptable parsers (`mounts`, `[network]`,
-/// `allow_tools`) demand instead of an [`AuthorizedConfig`].
+/// `default_tools`) demand instead of an [`AuthorizedConfig`].
 ///
 /// Two constructors exist in the whole crate, and neither takes a bare pathname:
 /// [`AdoptedAuthority::from_verified`] for an ADR-0040 verified `trust = true`
@@ -505,7 +510,7 @@ fn write_refusal(
 ///
 /// Two callers need one measurement after `config::load` has dropped its
 /// [`VerifiedRead`]: a CLI `set:NAME` reference, known only once argv is parsed,
-/// and a project `allow_tools = ["home:x"]` entry, which hands a tools-only
+/// and a project tool selection, which hands a tools-only
 /// `:trust` file's `mounts` and `network_requests` to a launch. Re-reading or
 /// re-measuring at that point would decide from a second observation, so the
 /// measurement from the read whose bytes supplied the definitions is carried here.
@@ -535,7 +540,7 @@ impl ReferenceTrust {
             .map_err(|measurement| measurement.into_untrusted(AuthoritySubject::EgressReference))
     }
 
-    /// The same verdict, attributed to the *definition* a project `allow_tools`
+    /// The same verdict, attributed to the *definition* a project selection
     /// entry selects from this file.
     ///
     /// A separate reader rather than a caller-side re-attribution: a tools-only
@@ -619,7 +624,7 @@ pub(crate) fn verify<'a>(
     if !authority_required(triggers) {
         // Never a refusal here: presence stays the only load-time trigger, so a
         // tools-only symlink loads as before. The verdict is consulted later, by a
-        // CLI reference or a project `allow_tools` entry, through `require()` and
+        // CLI reference or a project tool selection, through `require()` and
         // `require_for_trusted_tool()` before either resolves a name.
         return Ok(Verification {
             authorized: None,
@@ -801,7 +806,7 @@ pub(crate) fn verify_project_file_at(
 /// observe a different file than the one that will be read.
 ///
 /// Passing mints both an [`AuthorizedConfig`] (for top-level adoption) and a
-/// [`ReferenceTrust`] (for a project `allow_tools` entry naming its tools).
+/// [`ReferenceTrust`] (for a project tool selection).
 pub(crate) fn verify_trusted_source_at<'a>(
     path: &'a Path,
     parent_dir: DirFacts,
@@ -947,14 +952,14 @@ mod tests {
             for mounts in [false, true] {
                 for mount_sets in [false, true] {
                     for egress_sets in [false, true] {
-                        for allow_tools in [false, true] {
-                            if network || mounts || mount_sets || egress_sets || allow_tools {
+                        for default_tools in [false, true] {
+                            if network || mounts || mount_sets || egress_sets || default_tools {
                                 subjects.push(AuthoritySubject::of(AuthorityTriggers {
                                     network,
                                     mounts,
                                     mount_sets,
                                     egress_sets,
-                                    allow_tools,
+                                    default_tools,
                                 }));
                             }
                         }
@@ -986,10 +991,10 @@ mod tests {
                 fields.mounts,
                 fields.mount_sets,
                 fields.egress_sets,
-                fields.allow_tools,
+                fields.default_tools,
             ) {
                 (false, false, false, false, true) => {
-                    ("allow_tools", "allow_tools list", Some("allow_tools"))
+                    ("default_tools", "default_tools list", Some("default_tools"))
                 }
                 (false, false, false, true, false) => (
                     "[egress_sets]",
@@ -997,17 +1002,17 @@ mod tests {
                     Some("[egress_sets]"),
                 ),
                 (false, false, false, true, true) => (
-                    "[egress_sets] and allow_tools",
-                    "[egress_sets] table and allow_tools list",
-                    Some("[egress_sets] or allow_tools"),
+                    "[egress_sets] and default_tools",
+                    "[egress_sets] table and default_tools list",
+                    Some("[egress_sets] or default_tools"),
                 ),
                 (false, false, true, false, false) => {
                     ("[mount_sets]", "[mount_sets] table", Some("[mount_sets]"))
                 }
                 (false, false, true, false, true) => (
-                    "[mount_sets] and allow_tools",
-                    "[mount_sets] table and allow_tools list",
-                    Some("[mount_sets] or allow_tools"),
+                    "[mount_sets] and default_tools",
+                    "[mount_sets] table and default_tools list",
+                    Some("[mount_sets] or default_tools"),
                 ),
                 (false, false, true, true, false) => (
                     "[mount_sets] and [egress_sets]",
@@ -1015,15 +1020,15 @@ mod tests {
                     Some("[mount_sets] or [egress_sets]"),
                 ),
                 (false, false, true, true, true) => (
-                    "[mount_sets], [egress_sets] and allow_tools",
-                    "[mount_sets] table, [egress_sets] table and allow_tools list",
-                    Some("[mount_sets], [egress_sets] or allow_tools"),
+                    "[mount_sets], [egress_sets] and default_tools",
+                    "[mount_sets] table, [egress_sets] table and default_tools list",
+                    Some("[mount_sets], [egress_sets] or default_tools"),
                 ),
                 (false, true, false, false, false) => ("mounts", "mounts list", Some("mounts")),
                 (false, true, false, false, true) => (
-                    "mounts and allow_tools",
-                    "mounts list and allow_tools list",
-                    Some("mounts or allow_tools"),
+                    "mounts and default_tools",
+                    "mounts list and default_tools list",
+                    Some("mounts or default_tools"),
                 ),
                 (false, true, false, true, false) => (
                     "mounts and [egress_sets]",
@@ -1031,9 +1036,9 @@ mod tests {
                     Some("mounts or [egress_sets]"),
                 ),
                 (false, true, false, true, true) => (
-                    "mounts, [egress_sets] and allow_tools",
-                    "mounts list, [egress_sets] table and allow_tools list",
-                    Some("mounts, [egress_sets] or allow_tools"),
+                    "mounts, [egress_sets] and default_tools",
+                    "mounts list, [egress_sets] table and default_tools list",
+                    Some("mounts, [egress_sets] or default_tools"),
                 ),
                 (false, true, true, false, false) => (
                     "mounts and [mount_sets]",
@@ -1041,9 +1046,9 @@ mod tests {
                     Some("mounts or [mount_sets]"),
                 ),
                 (false, true, true, false, true) => (
-                    "mounts, [mount_sets] and allow_tools",
-                    "mounts list, [mount_sets] table and allow_tools list",
-                    Some("mounts, [mount_sets] or allow_tools"),
+                    "mounts, [mount_sets] and default_tools",
+                    "mounts list, [mount_sets] table and default_tools list",
+                    Some("mounts, [mount_sets] or default_tools"),
                 ),
                 (false, true, true, true, false) => (
                     "mounts, [mount_sets] and [egress_sets]",
@@ -1051,17 +1056,17 @@ mod tests {
                     Some("mounts, [mount_sets] or [egress_sets]"),
                 ),
                 (false, true, true, true, true) => (
-                    "mounts, [mount_sets], [egress_sets] and allow_tools",
-                    "mounts list, [mount_sets] table, [egress_sets] table and allow_tools list",
-                    Some("mounts, [mount_sets], [egress_sets] or allow_tools"),
+                    "mounts, [mount_sets], [egress_sets] and default_tools",
+                    "mounts list, [mount_sets] table, [egress_sets] table and default_tools list",
+                    Some("mounts, [mount_sets], [egress_sets] or default_tools"),
                 ),
                 (true, false, false, false, false) => {
                     ("[network]", "[network] table", Some("[network]"))
                 }
                 (true, false, false, false, true) => (
-                    "[network] and allow_tools",
-                    "[network] table and allow_tools list",
-                    Some("[network] or allow_tools"),
+                    "[network] and default_tools",
+                    "[network] table and default_tools list",
+                    Some("[network] or default_tools"),
                 ),
                 (true, false, false, true, false) => (
                     "[network] and [egress_sets]",
@@ -1069,9 +1074,9 @@ mod tests {
                     Some("[network] or [egress_sets]"),
                 ),
                 (true, false, false, true, true) => (
-                    "[network], [egress_sets] and allow_tools",
-                    "[network] table, [egress_sets] table and allow_tools list",
-                    Some("[network], [egress_sets] or allow_tools"),
+                    "[network], [egress_sets] and default_tools",
+                    "[network] table, [egress_sets] table and default_tools list",
+                    Some("[network], [egress_sets] or default_tools"),
                 ),
                 (true, false, true, false, false) => (
                     "[network] and [mount_sets]",
@@ -1079,9 +1084,9 @@ mod tests {
                     Some("[network] or [mount_sets]"),
                 ),
                 (true, false, true, false, true) => (
-                    "[network], [mount_sets] and allow_tools",
-                    "[network] table, [mount_sets] table and allow_tools list",
-                    Some("[network], [mount_sets] or allow_tools"),
+                    "[network], [mount_sets] and default_tools",
+                    "[network] table, [mount_sets] table and default_tools list",
+                    Some("[network], [mount_sets] or default_tools"),
                 ),
                 (true, false, true, true, false) => (
                     "[network], [mount_sets] and [egress_sets]",
@@ -1089,9 +1094,9 @@ mod tests {
                     Some("[network], [mount_sets] or [egress_sets]"),
                 ),
                 (true, false, true, true, true) => (
-                    "[network], [mount_sets], [egress_sets] and allow_tools",
-                    "[network] table, [mount_sets] table, [egress_sets] table and allow_tools list",
-                    Some("[network], [mount_sets], [egress_sets] or allow_tools"),
+                    "[network], [mount_sets], [egress_sets] and default_tools",
+                    "[network] table, [mount_sets] table, [egress_sets] table and default_tools list",
+                    Some("[network], [mount_sets], [egress_sets] or default_tools"),
                 ),
                 (true, true, false, false, false) => (
                     "[network] and mounts",
@@ -1099,9 +1104,9 @@ mod tests {
                     Some("[network] or mounts"),
                 ),
                 (true, true, false, false, true) => (
-                    "[network], mounts and allow_tools",
-                    "[network] table, mounts list and allow_tools list",
-                    Some("[network], mounts or allow_tools"),
+                    "[network], mounts and default_tools",
+                    "[network] table, mounts list and default_tools list",
+                    Some("[network], mounts or default_tools"),
                 ),
                 (true, true, false, true, false) => (
                     "[network], mounts and [egress_sets]",
@@ -1109,9 +1114,9 @@ mod tests {
                     Some("[network], mounts or [egress_sets]"),
                 ),
                 (true, true, false, true, true) => (
-                    "[network], mounts, [egress_sets] and allow_tools",
-                    "[network] table, mounts list, [egress_sets] table and allow_tools list",
-                    Some("[network], mounts, [egress_sets] or allow_tools"),
+                    "[network], mounts, [egress_sets] and default_tools",
+                    "[network] table, mounts list, [egress_sets] table and default_tools list",
+                    Some("[network], mounts, [egress_sets] or default_tools"),
                 ),
                 (true, true, true, false, false) => (
                     "[network], mounts and [mount_sets]",
@@ -1119,9 +1124,9 @@ mod tests {
                     Some("[network], mounts or [mount_sets]"),
                 ),
                 (true, true, true, false, true) => (
-                    "[network], mounts, [mount_sets] and allow_tools",
-                    "[network] table, mounts list, [mount_sets] table and allow_tools list",
-                    Some("[network], mounts, [mount_sets] or allow_tools"),
+                    "[network], mounts, [mount_sets] and default_tools",
+                    "[network] table, mounts list, [mount_sets] table and default_tools list",
+                    Some("[network], mounts, [mount_sets] or default_tools"),
                 ),
                 (true, true, true, true, false) => (
                     "[network], mounts, [mount_sets] and [egress_sets]",
@@ -1129,9 +1134,9 @@ mod tests {
                     Some("[network], mounts, [mount_sets] or [egress_sets]"),
                 ),
                 (true, true, true, true, true) => (
-                    "[network], mounts, [mount_sets], [egress_sets] and allow_tools",
-                    "[network] table, mounts list, [mount_sets] table, [egress_sets] table and allow_tools list",
-                    Some("[network], mounts, [mount_sets], [egress_sets] or allow_tools"),
+                    "[network], mounts, [mount_sets], [egress_sets] and default_tools",
+                    "[network] table, mounts list, [mount_sets] table, [egress_sets] table and default_tools list",
+                    Some("[network], mounts, [mount_sets], [egress_sets] or default_tools"),
                 ),
                 (false, false, false, false, false) => {
                     unreachable!("`of` normalizes the empty trigger set")
@@ -1144,12 +1149,12 @@ mod tests {
                 "[egress_sets] table",
                 Some("an egress reference"),
             ),
-            // #735: the trigger is the project's selection, so the
-            // compatibility aside describes a file nothing selects.
+            // #735/#749: the trigger is the failed read, so the compatibility
+            // aside describes a file whose tools nothing launches.
             AuthoritySubject::TrustedTool => (
-                "authorizing a :trust tool from the project config",
-                "[[tools]] definition it selects",
-                Some("a project allow_tools entry naming its tools"),
+                "launching a tool from the default user config",
+                "[[tools]] definition it launches",
+                Some("declaring a tool"),
             ),
             // ADR-0073: no field made the file authority-bearing, so there is
             // no "without …" compatibility to claim.
@@ -1257,7 +1262,7 @@ mod tests {
             mounts: false,
             mount_sets: false,
             egress_sets: false,
-            allow_tools: false,
+            default_tools: false,
         });
         for (refusal, pinned) in [
             (
@@ -1351,7 +1356,7 @@ mod tests {
             mounts: false,
             mount_sets: false,
             egress_sets: true,
-            allow_tools: false,
+            default_tools: false,
         });
         for (refusal, pinned) in [
             (
@@ -1396,7 +1401,7 @@ mod tests {
             mounts: false,
             mount_sets: false,
             egress_sets: false,
-            allow_tools: false,
+            default_tools: false,
         });
         assert_eq!(subject.label(), "[network]");
         assert_eq!(subject.object(), "[network] table");
@@ -1447,58 +1452,57 @@ mod tests {
         );
     }
 
-    /// The whole-sentence literals for the `allow_tools`-only subject (#735).
+    /// The whole-sentence literals for the `default_tools`-only subject (#749).
     ///
     /// The fifth trigger's own wording, written out whole: a user file whose only
-    /// authority field is an `allow_tools` list is refused under *this* subject,
+    /// authority field is a `default_tools` list is refused under *this* subject,
     /// and every one of these sentences is the only thing the reader sees.
     #[test]
-    fn allow_tools_subject_display_is_byte_identical() {
+    fn default_tools_subject_display_is_byte_identical() {
         use AuthorityRefusal::*;
         let subject = AuthoritySubject::of(AuthorityTriggers {
             network: false,
             mounts: false,
             mount_sets: false,
             egress_sets: false,
-            allow_tools: true,
+            default_tools: true,
         });
         for (refusal, pinned) in [
             (
                 DirNotDirectory,
-                "allow_tools refuses a config.toml whose directory is not a directory",
+                "default_tools refuses a config.toml whose directory is not a directory",
             ),
             (
                 ThroughSymlink,
-                "allow_tools requires config.toml to be a regular file, but it is reached through a symbolic link; its target may be writable by a guest or project, so review the allow_tools list before trusting the file (a symlinked config without allow_tools still works)",
+                "default_tools requires config.toml to be a regular file, but it is reached through a symbolic link; its target may be writable by a guest or project, so review the default_tools list before trusting the file (a symlinked config without default_tools still works)",
             ),
             (
                 FileWritable,
-                "allow_tools refuses a group- or other-writable config.toml; a guest or another account may have written its allow_tools list, so review the allow_tools list before trusting the file (fixing the mode does not establish authorship)",
+                "default_tools refuses a group- or other-writable config.toml; a guest or another account may have written its default_tools list, so review the default_tools list before trusting the file (fixing the mode does not establish authorship)",
             ),
             (
                 FileLinks(2),
-                "allow_tools refuses a config.toml with 2 hard links; another name for it may be guest- or project-writable, so review the allow_tools list before trusting the file",
+                "default_tools refuses a config.toml with 2 hard links; another name for it may be guest- or project-writable, so review the default_tools list before trusting the file",
             ),
         ] {
             assert_eq!(
                 UntrustedConfig::Refused { refusal, subject }.to_string(),
                 pinned,
-                "allow-tools refusal text changed for {refusal:?}"
+                "the default_tools refusal text changed for {refusal:?}"
             );
         }
         let kind = std::io::ErrorKind::PermissionDenied;
         assert_eq!(
             UntrustedConfig::DirUnexaminable { kind, subject }.to_string(),
-            "allow_tools requires examining the config directory, which failed (PermissionDenied)"
+            "default_tools requires examining the config directory, which failed (PermissionDenied)"
         );
     }
 
-    /// The whole-sentence literals for #735's trusted-tool subject.
+    /// The whole-sentence literals for the trusted-tool subject (#735/#749).
     ///
-    /// A project `allow_tools = ["home:x"]` against a tools-only `:trust` file is
-    /// refused under this subject, and the sentence must name the definition the
-    /// project selected rather than a user `allow_tools` list the file does not
-    /// have.
+    /// Launching a declaration from a user config whose verified read failed is
+    /// refused under this subject, and the sentence must name the definition it
+    /// launches rather than a declaration list the file does not have.
     #[test]
     fn trusted_tool_subject_display_is_byte_identical() {
         use AuthorityRefusal::*;
@@ -1506,11 +1510,11 @@ mod tests {
         for (refusal, pinned) in [
             (
                 ThroughSymlink,
-                "authorizing a :trust tool from the project config requires config.toml to be a regular file, but it is reached through a symbolic link; its target may be writable by a guest or project, so review the [[tools]] definition it selects before trusting the file (a symlinked config without a project allow_tools entry naming its tools still works)",
+                "launching a tool from the default user config requires config.toml to be a regular file, but it is reached through a symbolic link; its target may be writable by a guest or project, so review the [[tools]] definition it launches before trusting the file (a symlinked config without declaring a tool still works)",
             ),
             (
                 FileLinks(2),
-                "authorizing a :trust tool from the project config refuses a config.toml with 2 hard links; another name for it may be guest- or project-writable, so review the [[tools]] definition it selects before trusting the file",
+                "launching a tool from the default user config refuses a config.toml with 2 hard links; another name for it may be guest- or project-writable, so review the [[tools]] definition it launches before trusting the file",
             ),
         ] {
             assert_eq!(
@@ -1523,7 +1527,7 @@ mod tests {
 
     /// The two readers over one measurement attribute the *same* refusal to their
     /// own subject, and neither re-measures. Dropping one attribution is what
-    /// `allow-tools-trusted-verdict-bypassed` kills.
+    /// a future `default_tools` selection will kill.
     #[test]
     fn one_measurement_has_two_attributions() {
         let file = Path::new("/home/u/.config/agent-vm/config.toml");
@@ -1673,19 +1677,20 @@ mod tests {
     ///
     /// The oracle is an explicit `match` on all thirty-two rows rather than a
     /// disjunction: written as `network || mounts || mount_sets || egress_sets ||
-    /// allow_tools` it would be the same expression as the contract, so a body
+    /// default_tools` it would be the same expression as the contract, so a body
     /// that computed something else could only be caught by the proof. The
-    /// all-false row is the one that keeps the fifth trigger (#735's
-    /// `allow_tools`) from turning "declares nothing" into "authority-bearing".
+    /// all-false row is the one that keeps the fifth trigger (#749's
+    /// `default_tools`, formerly #735's `allow_tools`) from turning "declares
+    /// nothing" into "authority-bearing".
     #[test]
     fn authority_required_matches_the_thirty_two_rows() {
         for network in [false, true] {
             for mounts in [false, true] {
                 for mount_sets in [false, true] {
                     for egress_sets in [false, true] {
-                        for allow_tools in [false, true] {
+                        for default_tools in [false, true] {
                             let expected =
-                                match (network, mounts, mount_sets, egress_sets, allow_tools) {
+                                match (network, mounts, mount_sets, egress_sets, default_tools) {
                                     (false, false, false, false, false) => false,
                                     (false, false, false, false, true) => true,
                                     (false, false, false, true, false) => true,
@@ -1725,11 +1730,11 @@ mod tests {
                                     mounts,
                                     mount_sets,
                                     egress_sets,
-                                    allow_tools,
+                                    default_tools,
                                 }),
                                 expected,
                                 "network={network} mounts={mounts} mount_sets={mount_sets} \
-                                 egress_sets={egress_sets} allow_tools={allow_tools}"
+                                 egress_sets={egress_sets} default_tools={default_tools}"
                             );
                         }
                     }
@@ -1778,8 +1783,8 @@ mod tests {
             for mounts in [false, true] {
                 for mount_sets in [false, true] {
                     for egress_sets in [false, true] {
-                        for allow_tools in [false, true] {
-                            if !(network || mounts || mount_sets || egress_sets || allow_tools) {
+                        for default_tools in [false, true] {
+                            if !(network || mounts || mount_sets || egress_sets || default_tools) {
                                 continue;
                             }
                             let subject = AuthoritySubject::of(AuthorityTriggers {
@@ -1787,81 +1792,83 @@ mod tests {
                                 mounts,
                                 mount_sets,
                                 egress_sets,
-                                allow_tools,
+                                default_tools,
                             });
                             let expected = match (
                                 network,
                                 mounts,
                                 mount_sets,
                                 egress_sets,
-                                allow_tools,
+                                default_tools,
                             ) {
-                                (false, false, false, false, true) => "allow_tools",
+                                (false, false, false, false, true) => "default_tools",
                                 (false, false, false, true, false) => "[egress_sets]",
                                 (false, false, false, true, true) => {
-                                    "[egress_sets] and allow_tools"
+                                    "[egress_sets] and default_tools"
                                 }
                                 (false, false, true, false, false) => "[mount_sets]",
-                                (false, false, true, false, true) => "[mount_sets] and allow_tools",
+                                (false, false, true, false, true) => {
+                                    "[mount_sets] and default_tools"
+                                }
                                 (false, false, true, true, false) => {
                                     "[mount_sets] and [egress_sets]"
                                 }
                                 (false, false, true, true, true) => {
-                                    "[mount_sets], [egress_sets] and allow_tools"
+                                    "[mount_sets], [egress_sets] and default_tools"
                                 }
                                 (false, true, false, false, false) => "mounts",
-                                (false, true, false, false, true) => "mounts and allow_tools",
+                                (false, true, false, false, true) => "mounts and default_tools",
                                 (false, true, false, true, false) => "mounts and [egress_sets]",
                                 (false, true, false, true, true) => {
-                                    "mounts, [egress_sets] and allow_tools"
+                                    "mounts, [egress_sets] and default_tools"
                                 }
                                 (false, true, true, false, false) => "mounts and [mount_sets]",
                                 (false, true, true, false, true) => {
-                                    "mounts, [mount_sets] and allow_tools"
+                                    "mounts, [mount_sets] and default_tools"
                                 }
                                 (false, true, true, true, false) => {
                                     "mounts, [mount_sets] and [egress_sets]"
                                 }
                                 (false, true, true, true, true) => {
-                                    "mounts, [mount_sets], [egress_sets] and allow_tools"
+                                    "mounts, [mount_sets], [egress_sets] and default_tools"
                                 }
                                 (true, false, false, false, false) => "[network]",
-                                (true, false, false, false, true) => "[network] and allow_tools",
+                                (true, false, false, false, true) => "[network] and default_tools",
                                 (true, false, false, true, false) => "[network] and [egress_sets]",
                                 (true, false, false, true, true) => {
-                                    "[network], [egress_sets] and allow_tools"
+                                    "[network], [egress_sets] and default_tools"
                                 }
                                 (true, false, true, false, false) => "[network] and [mount_sets]",
                                 (true, false, true, false, true) => {
-                                    "[network], [mount_sets] and allow_tools"
+                                    "[network], [mount_sets] and default_tools"
                                 }
                                 (true, false, true, true, false) => {
                                     "[network], [mount_sets] and [egress_sets]"
                                 }
                                 (true, false, true, true, true) => {
-                                    "[network], [mount_sets], [egress_sets] and allow_tools"
+                                    "[network], [mount_sets], [egress_sets] and default_tools"
                                 }
                                 (true, true, false, false, false) => "[network] and mounts",
                                 (true, true, false, false, true) => {
-                                    "[network], mounts and allow_tools"
+                                    "[network], mounts and default_tools"
                                 }
                                 (true, true, false, true, false) => {
                                     "[network], mounts and [egress_sets]"
                                 }
                                 (true, true, false, true, true) => {
-                                    "[network], mounts, [egress_sets] and allow_tools"
+                                    "[network], mounts, [egress_sets] and default_tools"
                                 }
                                 (true, true, true, false, false) => {
                                     "[network], mounts and [mount_sets]"
                                 }
                                 (true, true, true, false, true) => {
-                                    "[network], mounts, [mount_sets] and allow_tools"
+                                    "[network], mounts, [mount_sets] and default_tools"
                                 }
                                 (true, true, true, true, false) => {
                                     "[network], mounts, [mount_sets] and [egress_sets]"
                                 }
                                 (true, true, true, true, true) => {
-                                    "[network], mounts, [mount_sets], [egress_sets] and allow_tools"
+                                    "[network], mounts, [mount_sets], [egress_sets] and default_tools"
                                 }
                                 (false, false, false, false, false) => {
                                     unreachable!("skipped above")
@@ -1906,7 +1913,7 @@ mod tests {
             mounts: false,
             mount_sets: false,
             egress_sets: false,
-            allow_tools: false,
+            default_tools: false,
         };
         let verification = verify(&read, none).unwrap();
         assert!(verification.authorized.is_none());
@@ -1925,21 +1932,21 @@ mod tests {
                 mounts: false,
                 mount_sets: false,
                 egress_sets: false,
-                allow_tools: false,
+                default_tools: false,
             },
             AuthorityTriggers {
                 network: false,
                 mounts: true,
                 mount_sets: false,
                 egress_sets: false,
-                allow_tools: false,
+                default_tools: false,
             },
             AuthorityTriggers {
                 network: false,
                 mounts: false,
                 mount_sets: true,
                 egress_sets: false,
-                allow_tools: false,
+                default_tools: false,
             },
             // #511: `[egress_sets]` alone is authority-bearing by presence, so a
             // sets-only file that is reached through a symlink is refused before
@@ -1949,7 +1956,7 @@ mod tests {
                 mounts: false,
                 mount_sets: false,
                 egress_sets: true,
-                allow_tools: false,
+                default_tools: false,
             },
         ] {
             let error = verify(&read, triggers).unwrap_err().to_string();
@@ -1976,21 +1983,21 @@ mod tests {
                 mounts: false,
                 mount_sets: false,
                 egress_sets: false,
-                allow_tools: false,
+                default_tools: false,
             },
             AuthorityTriggers {
                 network: true,
                 mounts: false,
                 mount_sets: false,
                 egress_sets: false,
-                allow_tools: false,
+                default_tools: false,
             },
             AuthorityTriggers {
                 network: false,
                 mounts: false,
                 mount_sets: false,
                 egress_sets: true,
-                allow_tools: false,
+                default_tools: false,
             },
         ] {
             let verification = verify(&read, triggers).unwrap();
@@ -2018,7 +2025,7 @@ mod tests {
             mounts: false,
             mount_sets: false,
             egress_sets: false,
-            allow_tools: false,
+            default_tools: false,
         };
         let load = || {
             let read = read_bounded_regular_file_noting_symlink(&file, 100).unwrap();
@@ -2282,7 +2289,7 @@ mod tests {
             mounts: false,
             mount_sets: false,
             egress_sets: false,
-            allow_tools: false,
+            default_tools: false,
         };
         let read = read_bounded_regular_file_noting_symlink(&link, 100).unwrap();
         let verification = verify(&read, none).expect("the user tier's presence rule is unchanged");

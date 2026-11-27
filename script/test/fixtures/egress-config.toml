@@ -1,4 +1,3 @@
-allow_tools = ["egressprobe", "egresscreds"]
 [[tools]]
 name = "egressprobe"
 command = "bash"

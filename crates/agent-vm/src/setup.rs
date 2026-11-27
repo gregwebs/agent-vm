@@ -528,11 +528,7 @@ mod tests {
     fn catalog_from(body: &str) -> LaunchCatalog {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("config.toml");
-        std::fs::write(
-            &project,
-            crate::config::test_support::authorized_fixture(body, &[]),
-        )
-        .unwrap();
+        std::fs::write(&project, body).unwrap();
         config::load(&ConfigPaths::for_test(
             Some(dir.path().join("no-user-config.toml")),
             project,
@@ -591,23 +587,22 @@ mod tests {
     /// launch affordance, not a declaration.
     /// **#395.** A definition hidden by a launch-name conflict is not a verb *or*
     /// a verification target, even when a winning project helper references it:
-    /// `setup` verifies the commands the configuration launches, and an available
-    /// tool's command is not one of them.
+    /// `setup` verifies every declared tool's command (#749): nothing is hidden
+    /// any more, so the project's `pi` and the user's `home:pi` are both targets —
+    /// and the `bash` fallback still is not one.
     #[test]
-    fn a_hidden_definition_is_neither_a_verb_nor_a_verification_target() {
+    fn every_declaration_is_a_verification_target_but_the_fallback_is_not() {
         let dir = tempfile::tempdir().unwrap();
         let user = dir.path().join("user.toml");
         let project = dir.path().join("project.toml");
         std::fs::write(
             &user,
-            "allow_tools = [\"pi\"]\n[[tools]]\nname = \"pi\"\ncommand = \"user-pi\"\ncredentials = [\"openai\"]\n",
+            "[[tools]]\nname = \"pi\"\ncommand = \"user-pi\"\ncredentials = [\"openai\"]\n",
         )
         .unwrap();
-        // The project authorizes only `helper`: its `pi` is a hidden definition
-        // that `helper`'s reference resolves to (#735 D3).
         std::fs::write(
             &project,
-            "allow_tools = [\"helper\"]\n[[tools]]\nname = \"pi\"\ncommand = \"hidden-command\"\ncredentials = [\"anthropic\"]\n\
+            "[[tools]]\nname = \"pi\"\ncommand = \"hidden-command\"\ncredentials = [\"anthropic\"]\n\
              [[tools]]\nname = \"helper\"\ncommand = \"helper\"\ntools = [\"pi\"]\n",
         )
         .unwrap();
@@ -620,9 +615,10 @@ mod tests {
             summary(&verification_targets(&catalog)),
             vec![
                 ("pi".to_string(), "user-pi".to_string()),
+                ("pi".to_string(), "hidden-command".to_string()),
                 ("helper".to_string(), "helper".to_string()),
             ],
-            "the hidden command and the `bash` fallback must not be targets"
+            "every declaration is a target; the `bash` fallback is not"
         );
         assert!(catalog.has_shell_fallback());
     }

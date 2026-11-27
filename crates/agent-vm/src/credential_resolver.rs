@@ -33,6 +33,12 @@
 //! stored value, any guest-env ownership conflict, and a *built-in* provider's
 //! own missing-credential bail stay hard errors under both variants.
 //!
+//! What remains fatal is **provenance**: only a *directly selected* request may
+//! refuse the launch, while a name inherited from the effective `default_tools`
+//! or from the launched tool's own `tools` closure is withheld and the command
+//! continues (#749 E6). [`RequestedServices`] carries that per name, and
+//! [`RequestProvenance::may_stop_launch`] is the one statement of the rule.
+//!
 //! # Two phases, and why
 //!
 //! Resolution runs twice per launch. Phase 1 (this module, before any sandbox
@@ -301,6 +307,83 @@ impl Drop for CredentialSessions {
     }
 }
 
+/// Which services one launch requests, each with the provenance that decides
+/// whether its absence may stop the launch (#749 E6).
+///
+/// One map, not two sets: a name several contributors request has exactly one
+/// provenance, so a fatal decision cannot read two answers for the same name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RequestedServices {
+    provenance: BTreeMap<ServiceName, RequestProvenance>,
+}
+
+/// Who asked for a service: the launched tool itself, or something it inherits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestProvenance {
+    /// The launched tool's own `credentials` list: the one requirement whose
+    /// missing value may refuse the command (E6).
+    Selected,
+    /// An effective `default_tools` contributor's, or a tool reached through the
+    /// launched tool's own `tools` closure. Provisioned, never required: a
+    /// missing value leaves that helper unavailable and the command continues.
+    Inherited,
+}
+
+impl RequestProvenance {
+    /// Whether a missing value for this request may refuse the launch (#749
+    /// E6). The one statement of the rule: both arms of resolution ask this,
+    /// so neither can drift into treating an inherited name as the tool's own.
+    fn may_stop_launch(self) -> bool {
+        matches!(self, Self::Selected)
+    }
+}
+
+impl RequestedServices {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one name. Direct selection wins over inheritance: the same name
+    /// requested both ways is still the launched tool's own requirement.
+    pub(crate) fn insert(&mut self, service: ServiceName, provenance: RequestProvenance) {
+        let selected = provenance == RequestProvenance::Selected;
+        self.provenance
+            .entry(service)
+            .and_modify(|current| {
+                if selected {
+                    *current = RequestProvenance::Selected;
+                }
+            })
+            .or_insert(provenance);
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.provenance.is_empty()
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&ServiceName, RequestProvenance)> {
+        self.provenance
+            .iter()
+            .map(|(service, provenance)| (service, *provenance))
+    }
+
+    /// The names alone, for the two sources that select a value by name and
+    /// never by provenance (environment capture, SecretSpec).
+    pub(crate) fn names(&self) -> impl Iterator<Item = &ServiceName> {
+        self.provenance.keys()
+    }
+}
+
+impl FromIterator<(ServiceName, RequestProvenance)> for RequestedServices {
+    fn from_iter<I: IntoIterator<Item = (ServiceName, RequestProvenance)>>(iter: I) -> Self {
+        let mut requested = Self::new();
+        for (service, provenance) in iter {
+            requested.insert(service, provenance);
+        }
+        requested
+    }
+}
+
 /// A launch's credential inputs, gathered in `main` before the first child
 /// process and before Tokio (#163): the authorization file, loaded exactly
 /// once, and the host values its `source: env` entries select.
@@ -308,7 +391,7 @@ impl Drop for CredentialSessions {
 /// A load error is carried, not raised, so `run::launch` reports it at the same
 /// point (and after the same notices) as before #163.
 pub(crate) struct CredentialPreflight {
-    requested: BTreeSet<ServiceName>,
+    requested: RequestedServices,
     authorizations: Result<AuthorizationSet>,
     environment: EnvCapture,
 }
@@ -334,8 +417,7 @@ fn keychain_built() -> usize {
 
 impl CredentialPreflight {
     /// `main`'s prologue only (see `EnvCapture::take_from_process`).
-    pub(crate) fn capture(requested: &BTreeSet<ServiceName>) -> Self {
-        let requested = requested.clone();
+    pub(crate) fn capture(requested: RequestedServices) -> Self {
         if requested.is_empty() {
             // A launch that requests nothing never reads the file (#161).
             return Self {
@@ -346,7 +428,7 @@ impl CredentialPreflight {
         }
         match load_authorizations() {
             Ok(set) => {
-                let environment = EnvCapture::take_from_process(&requested, &set);
+                let environment = EnvCapture::take_from_process(requested.names(), &set);
                 Self {
                     requested,
                     authorizations: Ok(set),
@@ -365,7 +447,7 @@ impl CredentialPreflight {
     /// For built-in commands and tests: no request, nothing captured.
     pub(crate) fn none() -> Self {
         Self {
-            requested: BTreeSet::new(),
+            requested: RequestedServices::new(),
             authorizations: Ok(AuthorizationSet::empty()),
             environment: EnvCapture::none(),
         }
@@ -387,7 +469,7 @@ impl CredentialPreflight {
             ));
         }
         let authorizations = self.authorizations?;
-        let needs_keychain = self.requested.iter().any(|name| {
+        let needs_keychain = self.requested.iter().any(|(name, _)| {
             authorizations
                 .get(name)
                 .is_some_and(|credential| credential.source() == SourceKind::Keychain)
@@ -400,7 +482,7 @@ impl CredentialPreflight {
             None
         };
         let secretspec = crate::credential_secretspec::SecretspecSource::select(
-            &self.requested,
+            self.requested.names(),
             &authorizations,
         )
         .map(Arc::new);
@@ -823,8 +905,12 @@ impl LaunchCredentials {
 
 /// Phase 1: decide, before anything is created, which requested credentials
 /// this launch may use and what each guest variable must end up as.
+///
+/// `requested` carries each name's provenance: a *directly selected* name whose
+/// value is missing may refuse the launch, while an inherited or
+/// default-provisioned one is withheld and the command continues (#749 E6).
 pub(crate) fn resolve_launch(
-    requested: &BTreeSet<ServiceName>,
+    requested: &RequestedServices,
     authorization: &AuthorizationSet,
     source: &dyn CredentialSource,
     policy: MissingCredentialPolicy,
@@ -833,9 +919,9 @@ pub(crate) fn resolve_launch(
     for note in authorization.warnings() {
         launch.notes.push(note.clone());
     }
-    launch.replaced = replaced_providers(requested, authorization);
+    launch.replaced = replaced_providers(requested.names(), authorization);
 
-    for service in requested {
+    for (service, provenance) in requested.iter() {
         let built_in = CredentialProvider::from_config_name(service.as_str());
         match (built_in, authorization.get(service)) {
             // AC1: the authorization wins outright. The built-in's credential
@@ -845,11 +931,15 @@ pub(crate) fn resolve_launch(
             // does not re-enable the built-in, because that would silently
             // downgrade a shielded credential to a guest-visible placeholder.
             (_, Some(credential)) => {
-                resolve_authorized(&mut launch, service, credential, source, policy)?;
+                resolve_authorized(&mut launch, service, credential, provenance, source, policy)?;
             }
             (Some(_), None) => {}
-            (None, None) => match policy {
-                MissingCredentialPolicy::Fail => {
+            (None, None) => {
+                // Same rule, same gate as the authorized arm: a name that is
+                // merely inherited leaves the helper unavailable, and only a
+                // selected one refuses the launch (E6).
+                let fatal = provenance.may_stop_launch() && policy == MissingCredentialPolicy::Fail;
+                if fatal {
                     return Err(anyhow!(
                         "`{service}` is neither a built-in credential provider nor authorized in \
                          {}/{}; add an entry for it there (see USAGE.md), or remove it from the \
@@ -858,12 +948,15 @@ pub(crate) fn resolve_launch(
                         credential_yaml::CREDENTIALS_FILE_NAME
                     ));
                 }
-                MissingCredentialPolicy::Warn => launch.withheld.push(Withheld {
+                launch.withheld.push(Withheld {
                     service: service.clone(),
                     cause: WithheldCause::NotAuthorized,
-                    via_override: true,
-                }),
-            },
+                    // Only `--allow-missing-credentials` can be what kept a
+                    // launch alive past a name it selected; an inherited name
+                    // continues with or without the flag.
+                    via_override: provenance.may_stop_launch(),
+                });
+            }
         }
     }
     Ok(launch)
@@ -905,8 +998,8 @@ fn provider_replaced(requested: bool, built_in: bool, authorized: bool) -> (repl
 /// built-in provider, and the user authorized that exact name. Any one missing
 /// leaves the built-in's credential handling in place. The per-name decision is
 /// the machine-checked [`provider_replaced`]; this is its trusted adapter.
-pub(crate) fn replaced_providers(
-    requested: &BTreeSet<ServiceName>,
+pub(crate) fn replaced_providers<'a>(
+    requested: impl IntoIterator<Item = &'a ServiceName>,
     authorization: &AuthorizationSet,
 ) -> ProviderSet {
     let mut replaced = ProviderSet::default();
@@ -930,6 +1023,7 @@ fn resolve_authorized(
     launch: &mut LaunchCredentials,
     service: &ServiceName,
     credential: &credential_yaml::AuthorizedCredential,
+    provenance: RequestProvenance,
     source: &dyn CredentialSource,
     policy: MissingCredentialPolicy,
 ) -> Result<()> {
@@ -982,14 +1076,16 @@ fn resolve_authorized(
             // `(required, policy)` is two bits, so the decision is stated once
             // and the match is exhaustive: a future policy variant that reaches
             // the `required: true` row is a compile error here rather than a
-            // silently-unsatisfied pair of complements. `via_override` is true
-            // only for a value the flag actually rescued — an *optional*
-            // credential is withheld with or without the flag, so its warning
-            // must not claim the flag did anything, and on the `fatal` row it
-            // would describe a value that was never kept.
+            // silently-unsatisfied pair of complements. Provenance enters through
+            // the same `may_stop_launch()` gate the unauthorized arm asks, so an
+            // inherited requirement is withheld even on the `required: true`
+            // row (#749 E6). `via_override` is true only for a value the flag
+            // actually rescued; an *optional* or inherited credential is
+            // withheld with or without the flag, so its warning must not claim
+            // the flag did anything.
             let (fatal, via_override) = match (credential.required(), policy) {
-                (true, MissingCredentialPolicy::Fail) => (true, false),
-                (true, MissingCredentialPolicy::Warn) => (false, true),
+                (true, MissingCredentialPolicy::Fail) => (provenance.may_stop_launch(), false),
+                (true, MissingCredentialPolicy::Warn) => (false, provenance.may_stop_launch()),
                 (false, _) => (false, false),
             };
             let withheld = Withheld {
@@ -1229,6 +1325,24 @@ mod tests {
             .collect()
     }
 
+    /// The launched tool's own requests: the provenance whose missing value may
+    /// stop a launch (#749 E6).
+    fn selected(list: &[&str]) -> RequestedServices {
+        names(list)
+            .into_iter()
+            .map(|service| (service, RequestProvenance::Selected))
+            .collect()
+    }
+
+    /// An effective `default_tools` contributor's requests: provisioned, never
+    /// required.
+    fn inherited(list: &[&str]) -> RequestedServices {
+        names(list)
+            .into_iter()
+            .map(|service| (service, RequestProvenance::Inherited))
+            .collect()
+    }
+
     /// The full writer set a real launch contributes, so a test asserts the
     /// **final assembled environment** rather than a decision in isolation.
     fn assemble(
@@ -1280,7 +1394,7 @@ mod tests {
         policy: MissingCredentialPolicy,
     ) -> Result<LaunchCredentials> {
         let (home, set) = authorizations(body);
-        let result = resolve_launch(&names(requested), &set, source, policy);
+        let result = resolve_launch(&selected(requested), &set, source, policy);
         drop(home);
         result
     }
@@ -1316,6 +1430,91 @@ credentials:
         assert!(text.contains("beta"), "{text}");
         assert!(text.contains("agent-vm secret set beta"), "{text}");
         assert!(text.contains("no value is stored"), "{text}");
+    }
+
+    /// #749 E6, G2: provenance, not the name, decides whether a name nothing
+    /// authorizes may stop a launch. A selected name is the hard error it has
+    /// always been; an inherited one leaves the helper unavailable and the
+    /// command continues.
+    #[test]
+    fn an_unauthorized_name_is_fatal_only_when_the_tool_selects_it() {
+        let (_home, set) = authorizations(ALPHA);
+        let source = TestSource::new(); // nothing is stored for `beta`
+        let error = resolve_launch(
+            &selected(&["beta"]),
+            &set,
+            &*source,
+            MissingCredentialPolicy::Fail,
+        )
+        .expect_err("a selected name nothing authorizes is fatal");
+        assert!(
+            error
+                .to_string()
+                .contains("neither a built-in credential provider nor authorized"),
+            "{error}"
+        );
+
+        let launch = resolve_launch(
+            &inherited(&["beta"]),
+            &set,
+            &*source,
+            MissingCredentialPolicy::Fail,
+        )
+        .expect("an inherited name that is missing is not fatal");
+        assert!(launch.ready().is_empty());
+        assert_eq!(launch.withheld().len(), 1);
+        let notice = launch.withheld()[0].notice();
+        assert!(
+            notice.contains("neither a built-in credential provider nor authorized"),
+            "{notice}"
+        );
+        assert!(notice.ends_with("; continuing without it"), "{notice}");
+
+        // The flag names itself only where it is what kept the launch alive.
+        let launch = resolve_launch(
+            &selected(&["beta"]),
+            &set,
+            &*source,
+            MissingCredentialPolicy::Warn,
+        )
+        .expect("--allow-missing-credentials");
+        assert!(
+            launch.withheld()[0]
+                .notice()
+                .contains("because --allow-missing-credentials was passed"),
+            "{}",
+            launch.withheld()[0].notice()
+        );
+    }
+
+    /// #749 E6, G2: the same split for a *required* value that is missing. An
+    /// inherited `required: true` entry is unavailable, not fatal; the same
+    /// entry on the launched tool's own list still refuses the launch.
+    #[test]
+    fn a_missing_required_login_is_fatal_only_when_the_tool_selects_it() {
+        let (_home, set) = authorizations(BETA_REQUIRED);
+        let source = TestSource::new(); // `beta` is scripted missing
+        let error = resolve_launch(
+            &selected(&["beta"]),
+            &set,
+            &*source,
+            MissingCredentialPolicy::Fail,
+        )
+        .expect_err("a selected requirement that is missing is fatal");
+        assert!(error.to_string().contains("no value is stored"), "{error}");
+
+        let launch = resolve_launch(
+            &inherited(&["beta"]),
+            &set,
+            &*source,
+            MissingCredentialPolicy::Fail,
+        )
+        .expect("an inherited requirement that is missing is not fatal");
+        assert!(launch.ready().is_empty());
+        assert_eq!(launch.withheld().len(), 1);
+        let notice = launch.withheld()[0].notice();
+        assert!(notice.contains("no value is stored"), "{notice}");
+        assert!(notice.ends_with("; continuing without it"), "{notice}");
     }
 
     #[test]
@@ -1468,10 +1667,10 @@ credentials:
             (&["copilot", "opencode-static"], &[]),
         ];
         for (requested, expected) in cases {
-            let requested = names(requested);
+            let requested = selected(requested);
             let expected = ProviderSet::new(expected.iter().copied());
             assert_eq!(
-                replaced_providers(&requested, &set),
+                replaced_providers(requested.names(), &set),
                 expected,
                 "predicate for {requested:?}"
             );
@@ -1662,7 +1861,7 @@ credentials:
         // and it never becomes ready; delta is Invalid, which phase 1 refuses.
         let (home, set) = authorizations(body);
         let error = resolve_launch(
-            &names(&["delta"]),
+            &selected(&["delta"]),
             &set,
             &*source,
             MissingCredentialPolicy::Fail,
@@ -1670,7 +1869,7 @@ credentials:
         .unwrap_err();
         assert!(format!("{error:#}").contains("cannot be used"));
         let launch = resolve_launch(
-            &names(&["alpha", "beta", "gamma"]),
+            &selected(&["alpha", "beta", "gamma"]),
             &set,
             &*source,
             MissingCredentialPolicy::Fail,
@@ -1765,7 +1964,7 @@ credentials:
         let (home, set) = authorizations(ALPHA);
         let state = tempfile::tempdir().unwrap();
         let launch = resolve_launch(
-            &names(&["alpha"]),
+            &selected(&["alpha"]),
             &set,
             &*source,
             MissingCredentialPolicy::Fail,
@@ -1799,7 +1998,7 @@ credentials:
         let before_home = directory_contents(home.path());
         let before_state = directory_contents(state.path());
         let launch = resolve_launch(
-            &names(&["alpha"]),
+            &selected(&["alpha"]),
             &set,
             &*source,
             MissingCredentialPolicy::Fail,
@@ -2184,14 +2383,14 @@ credentials:
 ";
         let (home, set) = authorizations(body);
         let first = resolve_launch(
-            &names(&["alpha"]),
+            &selected(&["alpha"]),
             &set,
             &*source,
             MissingCredentialPolicy::Fail,
         )
         .unwrap();
         let second = resolve_launch(
-            &names(&["beta"]),
+            &selected(&["beta"]),
             &set,
             &*source,
             MissingCredentialPolicy::Fail,
@@ -2235,7 +2434,7 @@ credentials:
         let (_home, set) = secretspec_authorizations(false);
         let source = TestSource::new();
         let launch = resolve_launch(
-            &names(&["alpha"]),
+            &selected(&["alpha"]),
             &set,
             &*source,
             MissingCredentialPolicy::Fail,
@@ -2265,7 +2464,7 @@ credentials:
         ] {
             let (_home, set) = secretspec_authorizations(required);
             let source = secretspec_source(Scripted::SecretspecUnavailable(F::ProviderFailed));
-            let result = resolve_launch(&names(&["alpha"]), &set, &*source, policy);
+            let result = resolve_launch(&selected(&["alpha"]), &set, &*source, policy);
             let rendered = match result {
                 Err(error) => error.to_string(),
                 Ok(launch) => {
@@ -2302,7 +2501,7 @@ credentials:
             for policy in [MissingCredentialPolicy::Fail, MissingCredentialPolicy::Warn] {
                 let (_home, set) = secretspec_authorizations(required);
                 let source = secretspec_source(Scripted::Invalid);
-                let error = resolve_launch(&names(&["alpha"]), &set, &*source, policy)
+                let error = resolve_launch(&selected(&["alpha"]), &set, &*source, policy)
                     .expect_err("a rejected value is fatal")
                     .to_string();
                 assert!(error.contains("SecretSpec resolved for `alpha`"), "{error}");
@@ -2331,7 +2530,7 @@ credentials:
             ),
         );
         let launch = resolve_launch(
-            &names(&["anthropic"]),
+            &selected(&["anthropic"]),
             &set,
             &*source,
             MissingCredentialPolicy::Fail,
@@ -2357,7 +2556,7 @@ credentials:
         let source =
             TestSource::new().script("alpha", Scripted::ValueThenMissing("sk-once".into()));
         let launch = resolve_launch(
-            &names(&["alpha"]),
+            &selected(&["alpha"]),
             &set,
             &*source,
             MissingCredentialPolicy::Fail,
@@ -2375,7 +2574,7 @@ credentials:
                 Scripted::ValueThenSecretspecUnavailable("sk-once".into(), failure),
             );
             let launch = resolve_launch(
-                &names(&["alpha"]),
+                &selected(&["alpha"]),
                 &set,
                 &*source,
                 MissingCredentialPolicy::Fail,
@@ -2419,7 +2618,7 @@ credentials:
         let mut guard = crate::test_env::guard();
         guard.set_var("HOME", home.path());
         guard.remove_var("AGENT_VM_TEST_CREDENTIAL");
-        let preflight = CredentialPreflight::capture(&names(&["alpha"]));
+        let preflight = CredentialPreflight::capture(selected(&["alpha"]));
         let (launch, source, sessions) = preflight
             .resolve(MissingCredentialPolicy::Fail)
             .expect("an optional secretspec entry does not fail the launch");
@@ -2467,7 +2666,7 @@ credentials:
             // Either outcome is acceptable for the keychain case: what is under
             // test is whether a keychain was built, not whether this host has
             // one, and the counter moves before `system()` can fail.
-            let _ = CredentialPreflight::capture(&names(services))
+            let _ = CredentialPreflight::capture(selected(services))
                 .resolve(MissingCredentialPolicy::Fail);
             keychain_built() - before
         };
@@ -2513,7 +2712,7 @@ credentials:
                 environment: EnvCapture::take_with(&names(&["alpha"]), &set, |_| None),
                 secretspec: None,
             };
-            let result = resolve_launch(&names(&["alpha"]), &set, &source, policy);
+            let result = resolve_launch(&selected(&["alpha"]), &set, &source, policy);
             let text = if required && policy == MissingCredentialPolicy::Fail {
                 result.unwrap_err().to_string()
             } else {
@@ -2548,7 +2747,7 @@ credentials:
             secretspec: None,
         };
         let launch = resolve_launch(
-            &names(&["alpha", "beta"]),
+            &selected(&["alpha", "beta"]),
             &set,
             &source,
             MissingCredentialPolicy::Fail,
@@ -2570,7 +2769,7 @@ credentials:
             secretspec: None,
         });
         let launch = resolve_launch(
-            &names(&["alpha"]),
+            &selected(&["alpha"]),
             &set,
             source.as_ref(),
             MissingCredentialPolicy::Fail,
@@ -2590,7 +2789,7 @@ credentials:
             let source = EnvCapture::take_with(&names(&["alpha"]), &set, |_| {
                 Some(" sk-CANARY-invalid".into())
             });
-            let error = resolve_launch(&names(&["alpha"]), &set, &source, policy)
+            let error = resolve_launch(&selected(&["alpha"]), &set, &source, policy)
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("ALPHA_KEY"));
@@ -2606,7 +2805,7 @@ credentials:
             let source =
                 EnvCapture::take_with(&names(&["alpha"]), &set, |_| Some("sk-sentinel".into()));
             let launch = resolve_launch(
-                &names(&["alpha"]),
+                &selected(&["alpha"]),
                 &set,
                 &source,
                 MissingCredentialPolicy::Fail,
@@ -2651,7 +2850,7 @@ credentials:
                 secretspec: None,
             });
             let launch = resolve_launch(
-                &names(&["alpha"]),
+                &selected(&["alpha"]),
                 &set,
                 source.as_ref(),
                 MissingCredentialPolicy::Fail,

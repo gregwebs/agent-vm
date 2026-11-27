@@ -901,7 +901,7 @@ mod tests {
                 mounts: true,
                 mount_sets: false,
                 egress_sets: false,
-                allow_tools: false,
+                default_tools: false,
             },
         )
         .unwrap()

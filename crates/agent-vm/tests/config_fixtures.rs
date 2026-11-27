@@ -1,12 +1,12 @@
-//! #735 B2: every `[[tools]]` fixture the VM suite writes must be authorized.
+//! #749: no `[[tools]]` fixture the VM suite writes may bring back the retired
+//! `allow_tools` key.
 //!
-//! A `[[tools]]` block is inert without an `allow_tools` entry (ADR-0075), so a
-//! fixture that forgot the entry would launch nothing, and its rows would fail
-//! for an unrelated reason — or, for a row that asserts absence, pass while
-//! proving nothing. The VM rows themselves cannot run without Docker and an
-//! image, so this is their boot-free half: the real `script/test/e2e.sh` is
-//! scanned, every here-document that declares a tool is parsed as TOML, and each
-//! declared name must appear in that document's own top-level `allow_tools`.
+//! Every declaration is a launch verb now, so a fixture needs no separate list —
+//! and one that still wrote the key would be refused at load, failing its row
+//! for an unrelated reason. The VM rows themselves cannot run without Docker and
+//! an image, so this is their boot-free half: the real `script/test/e2e.sh` is
+//! scanned, every here-document that declares a tool is parsed as TOML, and none
+//! may declare a top-level `allow_tools`.
 //!
 //! The CM-T user documents have their own oracle in
 //! `crates/harness/src/config_mounts.rs`, next to the documents themselves.
@@ -77,19 +77,21 @@ fn declared_tools(body: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// The `allow_tools` list a document declares, read only from the lines above the
-/// first table header — the position TOML requires for a top-level key.
-fn allowed_tools(body: &[String]) -> Option<Vec<String>> {
+/// Every top-level key a document declares above its first table header, as
+/// `(name, line)`. This is where TOML requires a root key, and where #749's
+/// retired `allow_tools` must never appear again.
+fn top_level_keys(body: &[String]) -> Vec<(String, String)> {
+    let mut keys = Vec::new();
     for line in body {
         let line = line.trim();
         if line.starts_with('[') {
-            return None;
+            break;
         }
-        if let Some(list) = line.strip_prefix("allow_tools = ") {
-            return Some(quoted(list));
+        if let Some((name, _)) = line.split_once(" = ") {
+            keys.push((name.trim().to_owned(), line.to_owned()));
         }
     }
-    None
+    keys
 }
 
 /// Every `"…"` on one line, unescaped only for the plain names these fixtures use.
@@ -101,8 +103,12 @@ fn quoted(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// #749: every `[[tools]]` declaration in the VM suite is a launch verb, so no
+/// fixture writes the retired `allow_tools` key — and this oracle is inverted
+/// from the #735 one on purpose: a fixture that re-adds the key would now be
+/// refused at load, and the rows using it would fail for the wrong reason.
 #[test]
-fn every_tools_fixture_in_the_vm_suite_is_authorized() {
+fn no_tools_fixture_in_the_vm_suite_writes_allow_tools() {
     let path = repo_root().join("script/test/e2e.sh");
     let text = std::fs::read_to_string(&path).expect("script/test/e2e.sh is readable");
     let mut fixtures = 0;
@@ -115,17 +121,16 @@ fn every_tools_fixture_in_the_vm_suite_is_authorized() {
         fixtures += 1;
         blocks += declared.len();
         let at = format!("script/test/e2e.sh:{start}");
-        let allowed = allowed_tools(&body).unwrap_or_else(|| {
-            panic!(
-                "{at}: this document declares {declared:?} but writes no `allow_tools` above its \
-                 first table header, so every block is inert"
-            )
-        });
+        for (name, line) in top_level_keys(&body) {
+            assert_ne!(
+                name, "allow_tools",
+                "{at}: the retired key must not return: {line}"
+            );
+        }
         for name in &declared {
             assert!(
-                allowed.contains(name),
-                "{at}: {name:?} is declared but not authorized, so the block is inert \
-                 (declared {declared:?}, allowed {allowed:?})"
+                !name.is_empty(),
+                "{at}: every [[tools]] block declares a name"
             );
         }
     }
@@ -143,5 +148,18 @@ fn every_tools_fixture_in_the_vm_suite_is_authorized() {
     assert!(
         fixtures >= 13,
         "the scan found only {fixtures} tool fixtures; the here-document parser has drifted"
+    );
+    // The live egress fixture is the one config outside the here-documents.
+    let egress =
+        std::fs::read_to_string(repo_root().join("script/test/fixtures/egress-config.toml"))
+            .expect("the live egress seed is readable");
+    let table: toml::Table = egress.parse().expect("the seed is TOML");
+    assert!(
+        !table.contains_key("allow_tools"),
+        "the live egress seed must not write the retired key"
+    );
+    assert!(
+        table.contains_key("tools"),
+        "and it still declares its tools"
     );
 }

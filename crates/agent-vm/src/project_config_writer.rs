@@ -1678,7 +1678,7 @@ pub(crate) fn plan_image_edit(
             });
         }
         None => {
-            if let Some(misplaced) = misplaced_image(root) {
+            if let Some(misplaced) = misplaced_image(root, text) {
                 return Err(ImageEditRefusal::at(
                     ImageRefusal::MisplacedImage(misplaced.site),
                     position(text, misplaced.offset),
@@ -1982,19 +1982,54 @@ struct MisplacedImage {
 /// and dotted keys all arrive here as tables), never a scan for the text `image`, and
 /// only a *direct* key of a definition counts: an `image` inside a tool's `env` table
 /// is that variable's name, not a misplaced boot image.
-fn misplaced_image(root: &toml_edit::Table) -> Option<MisplacedImage> {
-    crate::config::IMAGE_OWNER_FIELDS
-        .iter()
-        .find_map(|(field, owner)| {
-            let item = root.get(field)?;
-            let site = MisplacedSite::from(*owner);
-            image_in_field(item, site).map(|offset| MisplacedImage { site, offset })
-        })
+fn misplaced_image(root: &toml_edit::Table, text: &str) -> Option<MisplacedImage> {
+    // The *site* question is the shared classifier's (#749 F2): one table-aware
+    // walk answers it for the reader and for this writer, and each caller keeps
+    // its own policy — this one only refuses what its narrow root assignment
+    // cannot express. Re-parsing the same text the caller already parsed is what
+    // lets one `toml::Table` classifier answer for a `toml_edit` document; a
+    // document that parsed must parse again unchanged.
+    let document: toml::Table = text.parse().ok()?;
+    let owner = image_owner(crate::config_schema::misplaced_key(&document, "image")?)?;
+    let field = owner_field(owner);
+    let item = root.get(field)?;
+    // The classifier proved a direct `image` exists in this field, so the local
+    // walk is only locating it for the line/column. `0` keeps an inconsistency a
+    // refusal (at the file's start) rather than an edit.
+    let offset = image_in_field(item, owner).unwrap_or(0);
+    Some(MisplacedImage {
+        site: MisplacedSite::from(owner),
+        offset,
+    })
 }
 
-fn image_in_field(item: &toml_edit::Item, site: MisplacedSite) -> Option<usize> {
+/// Which image-owning table a classified site is, or `None` for the root — whose
+/// `image` is the one this edit reads and replaces.
+fn image_owner(site: crate::config_schema::Site) -> Option<crate::config::ImageOwner> {
+    use crate::config::ImageOwner;
     match site {
-        MisplacedSite::Sources | MisplacedSite::Tools => {
+        crate::config_schema::Site::Root => None,
+        crate::config_schema::Site::Tool(_) => Some(ImageOwner::Tools),
+        crate::config_schema::Site::Source(_) => Some(ImageOwner::Sources),
+        crate::config_schema::Site::Network => Some(ImageOwner::Network),
+        crate::config_schema::Site::MountSet(_) => Some(ImageOwner::MountSets),
+        crate::config_schema::Site::EgressSet(_) => Some(ImageOwner::EgressSets),
+    }
+}
+
+/// The top-level key of an image-owning table, from the one vocabulary
+/// ([`crate::config::IMAGE_OWNER_FIELDS`]) so a rename cannot leave two lists.
+fn owner_field(owner: crate::config::ImageOwner) -> &'static str {
+    crate::config::IMAGE_OWNER_FIELDS
+        .iter()
+        .find_map(|(field, candidate)| (*candidate == owner).then_some(*field))
+        .expect("every ImageOwner has a field in IMAGE_OWNER_FIELDS")
+}
+
+fn image_in_field(item: &toml_edit::Item, owner: crate::config::ImageOwner) -> Option<usize> {
+    use crate::config::ImageOwner;
+    match owner {
+        ImageOwner::Sources | ImageOwner::Tools => {
             if let Some(arrays) = item.as_array_of_tables() {
                 return arrays.iter().find_map(direct_image_offset);
             }
@@ -2007,8 +2042,8 @@ fn image_in_field(item: &toml_edit::Item, site: MisplacedSite) -> Option<usize> 
             }
             table_image_offset(item)
         }
-        MisplacedSite::Network => table_image_offset(item),
-        MisplacedSite::MountSets | MisplacedSite::EgressSets => {
+        ImageOwner::Network => table_image_offset(item),
+        ImageOwner::MountSets | ImageOwner::EgressSets => {
             if let Some(sets) = item.as_table() {
                 return sets
                     .iter()
@@ -4339,8 +4374,12 @@ mod tests {
             assert!(no_temporaries(&fixture.store_dir()));
         }
 
+        /// F1 (#737 × #749): the writer's narrow edit succeeds on a file carrying
+        /// the retired key, leaves those bytes alone, and the **loader** then
+        /// refuses the file with the migration. The insert and replace controls
+        /// below are the pair: neither edit needs the key to be understood.
         #[test]
-        fn a_planned_update_loads_with_the_new_root_reference() {
+        fn a_planned_update_preserves_a_retired_key_and_the_loader_refuses_it() {
             let fixture = Fixture::new();
             fixture.with_config(LOAD_FIXTURE);
             let store = fixture.store();
@@ -4360,32 +4399,70 @@ mod tests {
             );
             assert_eq!(std::fs::read(fixture.config()).unwrap(), *bytes);
 
-            let report = crate::config::load(&crate::config::ConfigPaths::for_test_captured(
+            // The saved bytes keep the retired key verbatim, and the image is the
+            // narrow edit: nothing else moved.
+            let saved = std::fs::read_to_string(fixture.config()).unwrap();
+            assert_eq!(saved, *String::from_utf8(bytes.clone()).unwrap());
+            assert!(saved.contains("allow_tools = [\"probe\"]\n"));
+
+            // Then the loader refuses exactly that key, with the migration.
+            let error = crate::config::load(&crate::config::ConfigPaths::for_test_captured(
                 fixture.home.clone(),
                 &fixture.project,
             ))
-            .expect("the planned file loads");
+            .expect_err("the retired key is refused on the next read");
             assert_eq!(
-                report.images().project().unwrap().reference().as_str(),
-                NEW,
-                "the real loader selects the root reference"
+                error.to_string(),
+                format!(
+                    "config: {:?}: allow_tools: allow_tools is retired: every [[tools]] \
+                     declaration is launchable, so there is no launch allow list to replace it. \
+                     Delete the key, or set allow = false on a source that must supply nothing \
+                     automatically; move the automatic grants you still want to default_tools = \
+                     [...] before the first table header (the shell always gets them, a direct \
+                     command only when you write the key); settle a bare name two sources \
+                     declare with use_tools in the project config; launch one file's tool as \
+                     <alias>:<tool>; and after editing a pinned source, approve its changed bytes \
+                     again",
+                    fixture.config()
+                )
             );
-            let entries = report.sources().entries();
-            assert_eq!(entries.len(), 1, "the source declaration is unchanged");
-            assert_eq!(entries[0].alias().as_str(), "home");
-            assert!(entries[0].is_trusted() && entries[0].is_allowed());
-            let catalog = report
-                .into_launch_catalog()
-                .expect("the other fields still describe the launch");
-            let declared: Vec<&str> = catalog
-                .declarations()
-                .iter()
-                .map(|entry| entry.tool().name())
-                .collect();
+        }
+
+        /// The insert half of F1's pair: a file with no root `image` gains one and
+        /// keeps its retired key byte-identically.
+        #[test]
+        fn an_inserted_image_preserves_a_retired_key_and_the_loader_refuses_it() {
+            let fixture = Fixture::new();
+            fixture.with_config("allow_tools = [\"probe\"]\n\n[[tools]]\nname = \"probe\"\ncommand = \"/bin/true\"\n");
+            let store = fixture.store();
+            let snapshot = store.snapshot().unwrap();
+
+            let plan = plan_image_edit(snapshot.bytes().map(str::as_bytes), &image(NEW)).unwrap();
+            let ImageEditPlan::Update { bytes, .. } = &plan else {
+                panic!("an absent root image is an insertion: {plan:?}");
+            };
             assert_eq!(
-                declared,
-                vec!["probe"],
-                "the tool declaration and its allow_tools entry still apply"
+                std::str::from_utf8(bytes).unwrap(),
+                // The narrow edit inserts the root key after the file's last
+                // top-level key; the retired line's own bytes are untouched.
+                format!(
+                    "allow_tools = [\"probe\"]\n\nimage = {NEW:?}\n[[tools]]\nname = \"probe\"\ncommand = \"/bin/true\"\n"
+                )
+            );
+            assert_eq!(
+                store.save(&snapshot, plan.bytes().unwrap()).unwrap(),
+                ConfigSave::Replaced
+            );
+            assert_eq!(std::fs::read(fixture.config()).unwrap(), *bytes);
+
+            let error = crate::config::load(&crate::config::ConfigPaths::for_test_captured(
+                fixture.home.clone(),
+                &fixture.project,
+            ))
+            .expect_err("the retired key is refused on the next read");
+            assert!(
+                error.to_string().contains("allow_tools is retired"),
+                "{error}"
             );
         }
 

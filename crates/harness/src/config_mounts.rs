@@ -99,18 +99,9 @@ const AGENT_SET: &str = "[mount_sets]\nagent = [\"~/cm-tool/agent:/cm/tool/agent
 const TOOL_DEFAULT: &str = "mounts = [\"~/cm-tool/default:/cm/tool/default:ro\"]\n";
 const SHELL_OWN: &str = "mounts = [\"~/cm-tool/shell-own:/cm/tool/shell-own:ro\"]\n";
 
-/// #735: a `[[tools]]` block is inert without an `allow_tools` entry, and every
-/// CM-T row observes mount *selection* through a real launch of a declared verb.
-/// These are user-tier documents, so the names are bare. One list per declared
-/// set: the five agent tools, with the shell (T1–T6, T8–T9) or without it (T7,
-/// whose point is the built-in fallback shell), and T9's tool named like a set.
-const ALLOW_CM: &str = "allow_tools = [\"pi\", \"claude\", \"codex\", \"bridge\", \"plain\"]\n";
-const ALLOW_CM_SHELL: &str =
-    "allow_tools = [\"pi\", \"claude\", \"codex\", \"bridge\", \"plain\", \"shell\"]\n";
-const ALLOW_CM_SHELL_AGENT: &str = "allow_tools = [\"pi\", \"claude\", \"codex\", \"bridge\", \
-     \"plain\", \"shell\", \"agent\"]\n";
-/// T11 declares the Pi lineage only, so only those three are verbs.
-const ALLOW_CM_PI: &str = "allow_tools = [\"pi\", \"claude\", \"codex\"]\n";
+// #749: every `[[tools]]` declaration is a launch verb, so a CM-T document needs
+// no separate list. The documents below are user-tier, so each name is spelled
+// bare and `agent-vm <name>` is the launch the row observes.
 
 fn tool(name: &str, tools: &str, mounts: Option<&str>) -> String {
     let mut body =
@@ -145,17 +136,13 @@ fn tools_base() -> String {
 /// T1-T5: a wildcard shell (its `tools` line is omitted on purpose, which is what
 /// makes it deliberately broad — it inherits every same-tier tool's mounts).
 fn tools_wildcard_shell() -> String {
-    format!(
-        "{ALLOW_CM_SHELL}{AGENT_SET}{}{}",
-        tools_base(),
-        shell_tool("", SHELL_OWN)
-    )
+    format!("{AGENT_SET}{}{}", tools_base(), shell_tool("", SHELL_OWN))
 }
 
 /// T6: the same shell with inheritance switched off, plus a user-wide default.
 fn tools_empty_shell() -> String {
     format!(
-        "{ALLOW_CM_SHELL}{TOOL_DEFAULT}{AGENT_SET}{}{}",
+        "{TOOL_DEFAULT}{AGENT_SET}{}{}",
         tools_base(),
         shell_tool("tools = []\n", SHELL_OWN)
     )
@@ -163,7 +150,7 @@ fn tools_empty_shell() -> String {
 
 /// T7: no declared shell at all, so the built-in fallback runs.
 fn tools_fallback_shell() -> String {
-    format!("{ALLOW_CM}{TOOL_DEFAULT}{AGENT_SET}{}", tools_base())
+    format!("{TOOL_DEFAULT}{AGENT_SET}{}", tools_base())
 }
 
 /// T8-T10: a *wildcard* declared shell, so the opt-out has a non-empty inherited
@@ -176,7 +163,7 @@ fn tools_optout() -> String {
 /// own `persist` link is what the row can observe.
 fn tools_set_named_like_a_tool() -> String {
     format!(
-        "{ALLOW_CM_SHELL_AGENT}{AGENT_SET}{}{}{TOOLS_SAME_NAME_TOOL}",
+        "{AGENT_SET}{}{}{TOOLS_SAME_NAME_TOOL}",
         tools_base(),
         shell_tool("", SHELL_OWN)
     )
@@ -193,7 +180,7 @@ const TOOLS_SAME_NAME_TOOL: &str = "[[tools]]\nname = \"agent\"\ncommand = \"bas
 /// nested set, so the *route* is the only difference between the two launches.
 fn tools_default_fork() -> String {
     format!(
-        "{ALLOW_CM_PI}mounts = [\"~/.pi:fork\"]\n{}{}{}",
+        "mounts = [\"~/.pi:fork\"]\n{}{}{}",
         tool("pi", "[\"claude\", \"codex\"]", None),
         tool("claude", "[]", None),
         tool("codex", "[]", None)
@@ -202,7 +189,7 @@ fn tools_default_fork() -> String {
 
 fn tools_nested_set() -> String {
     format!(
-        "{ALLOW_CM_PI}[mount_sets]\nouter = [\"inner\"]\ninner = [\"~/.pi:fork\"]\n{}{}{}",
+        "[mount_sets]\nouter = [\"inner\"]\ninner = [\"~/.pi:fork\"]\n{}{}{}",
         tool("pi", "[\"claude\", \"codex\"]", Some("[\"outer\"]")),
         tool("claude", "[]", None),
         tool("codex", "[]", None)
@@ -2250,25 +2237,20 @@ mod tests {
         ]
     }
 
-    /// #735 B2: `[[tools]]` is inert without an `allow_tools` entry, so an
-    /// un-authorized CM document would launch nothing and its rows would fail (or,
-    /// worse, pass while observing nothing). Parsing the real documents covers
-    /// both halves: the entry is there, and every name it lists is declared.
+    /// #749: a CM document declares the tools its rows launch, and no retired
+    /// key returns. Parsing the real documents is what keeps a fixture from
+    /// silently naming a verb the reader would refuse.
     #[test]
-    fn every_cm_document_authorizes_exactly_its_declared_tools() {
+    fn every_cm_document_declares_the_tools_its_rows_launch() {
         for (row, document) in documents() {
             let table: toml::Table = document
                 .parse()
                 .unwrap_or_else(|error| panic!("CM-{row}: the document is not TOML: {error}"));
-            let allowed: Vec<&str> = table
-                .get("allow_tools")
-                .unwrap_or_else(|| panic!("CM-{row}: no top-level allow_tools"))
-                .as_array()
-                .unwrap_or_else(|| panic!("CM-{row}: allow_tools is not an array"))
-                .iter()
-                .map(|entry| entry.as_str().expect("entries are strings"))
-                .collect();
-            let mut declared: Vec<&str> = table
+            assert!(
+                !table.contains_key("allow_tools"),
+                "CM-{row}: the retired key must not return"
+            );
+            let declared: Vec<&str> = table
                 .get("tools")
                 .unwrap_or_else(|| panic!("CM-{row}: no tools"))
                 .as_array()
@@ -2276,12 +2258,10 @@ mod tests {
                 .iter()
                 .map(|tool| tool["name"].as_str().expect("a tool has a name"))
                 .collect();
-            // Pinned to the declaration order `tools print` would emit, so the
-            // documents stay the shape the rows' notes describe.
-            assert_eq!(allowed, declared, "CM-{row}: allowed versus declared");
-            declared.sort_unstable();
-            declared.dedup();
-            assert_eq!(allowed.len(), declared.len(), "CM-{row}: a name twice");
+            let mut unique = declared.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(declared.len(), unique.len(), "CM-{row}: a name twice");
         }
     }
 }

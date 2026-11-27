@@ -150,31 +150,58 @@ fn write(path: &Path, text: &str) {
     std::fs::write(path, text).unwrap();
 }
 
-/// The tool names a printed document declares, in document order.
-/// The `allow_tools` line the printed header tells the reader to add, in the order
-/// the print emits the definitions (#735: a `[[tools]]` block is inert until the
-/// same file lists it).
-fn allow_line(printed: &str) -> String {
-    let names = printed_names(printed);
-    let listed = names
-        .iter()
-        .map(|name| format!("{name:?}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("allow_tools = [{listed}]\n")
+/// #749 needs no separate authorization line: pasting the printed declarations
+/// makes each one a launch verb, so the paste test adds nothing above them.
+fn allow_line(_printed: &str) -> String {
+    String::new()
 }
 
+/// The tool names a printed document declares. The no-argument starter also
+/// carries the `default_tools` header (#749); a named subset is blocks only.
 fn printed_names(document: &str) -> Vec<String> {
     let parsed: toml::Table = toml::from_str(document).expect("the output is TOML");
-    assert_eq!(
-        parsed.keys().collect::<Vec<_>>(),
-        ["tools"],
-        "only tool declarations are printed"
-    );
+    let mut keys: Vec<&str> = parsed.keys().map(String::as_str).collect();
+    keys.retain(|key| *key != "default_tools");
+    assert_eq!(keys, ["tools"], "only tool declarations and the header");
     declared_names(&parsed)
 }
 
 /// The tool names a config declares, in file order.
+/// `-h`'s `Commands:` block as `(verb, description)` rows.
+///
+/// Clap sizes every column by the longest verb, so one extra verb changes the
+/// padding of the whole transcript (`#749` E3: a *user*-pasted `shell` is
+/// qualified, `home:shell`). The block's *content* is the contract, so the rows
+/// are compared rather than the rendered text. A command line starts with exactly
+/// two spaces; a wrapped description continues with more indentation.
+fn command_rows(help: &str) -> Vec<(String, String)> {
+    let block = match help.split_once("Commands:\n") {
+        Some((_, rest)) => match rest.split_once("\n\n") {
+            Some((block, _)) => block,
+            None => rest,
+        },
+        None => return Vec::new(),
+    };
+    let mut rows: Vec<(String, String)> = Vec::new();
+    for line in block.lines() {
+        let command = line.starts_with("  ") && !line.starts_with("   ");
+        if command {
+            let rest = line.trim_start();
+            let (verb, description) = match rest.split_once(char::is_whitespace) {
+                Some((verb, description)) => (verb, description.trim()),
+                None => (rest, ""),
+            };
+            rows.push((verb.to_owned(), description.to_owned()));
+        } else if let Some((_, description)) = rows.last_mut() {
+            if !description.is_empty() {
+                description.push(' ');
+            }
+            description.push_str(line.trim());
+        }
+    }
+    rows
+}
+
 fn declared_names(config: &toml::Table) -> Vec<String> {
     config["tools"]
         .as_array()
@@ -295,8 +322,8 @@ fn named_tools_print_in_the_requested_order() {
 fn pasted_output_is_the_same_verb_list() {
     let pasted_harness = Harness::new();
     let printed = stdout_of(&pasted_harness.run(&["tools", "print"]));
-    // Follow the printed header's own instruction: the top-level `allow_tools`
-    // list must come before the first table header.
+    // #749: the printed declarations are the launch verbs, so the paste needs no
+    // line above them.
     pasted_harness.write_user_config(&format!("{}{printed}", allow_line(&printed)));
 
     let with_paste = pasted_harness.run(&["-h"]);
@@ -304,7 +331,19 @@ fn pasted_output_is_the_same_verb_list() {
     let defaults_harness = Harness::new();
     let with_defaults = defaults_harness.run(&["-h"]);
     assert_success(&with_defaults);
-    assert_eq!(stdout_of(&with_paste), stdout_of(&with_defaults));
+    // #749 E3: the pasted `shell` declaration is qualified, so the paste adds
+    // exactly that one verb beside the shipped fallback the no-config catalog
+    // offers. Every other verb and description is identical.
+    let pasted = command_rows(&stdout_of(&with_paste));
+    assert!(
+        pasted.iter().any(|(verb, _)| verb == "home:shell"),
+        "the paste keeps the declaration as its qualified spelling: {pasted:?}"
+    );
+    let declarative: Vec<(String, String)> = pasted
+        .into_iter()
+        .filter(|(verb, _)| verb != "home:shell")
+        .collect();
+    assert_eq!(declarative, command_rows(&stdout_of(&with_defaults)));
 }
 
 /// The state USAGE warns about, edited the way it says to edit it: a file that
@@ -327,7 +366,10 @@ fn the_documented_edit_keeps_a_config_that_already_says_tools_empty() {
         stdout_of(&accepted)
     );
 
-    // The documented sequence: drop the `tools = []` line, then append the output.
+    // The sequence the starter's own header states: drop the `tools = []` line,
+    // then put the printed section **above** every table — its `default_tools`
+    // header is a top-level key, and below `[network]` TOML would read it as a
+    // network setting (the printer and the reader agree on that placement).
     let kept: String = std::fs::read_to_string(&config)
         .unwrap()
         .lines()
@@ -336,7 +378,7 @@ fn the_documented_edit_keeps_a_config_that_already_says_tools_empty() {
         .collect();
     std::fs::write(
         &config,
-        format!("{}{kept}\n{printed}", allow_line(&printed)),
+        format!("{printed}\n{kept}{}", allow_line(&printed)),
     )
     .unwrap();
 
@@ -345,7 +387,12 @@ fn the_documented_edit_keeps_a_config_that_already_says_tools_empty() {
     let defaults_harness = Harness::new();
     let with_defaults = defaults_harness.run(&["-h"]);
     assert_success(&with_defaults);
-    assert_eq!(stdout_of(&merged), stdout_of(&with_defaults));
+    // #749 E3: the same single qualified `home:shell` verb the paste adds.
+    let merged_rows: Vec<(String, String)> = command_rows(&stdout_of(&merged))
+        .into_iter()
+        .filter(|(verb, _)| verb != "home:shell")
+        .collect();
+    assert_eq!(merged_rows, command_rows(&stdout_of(&with_defaults)));
 
     // `-h` equality proves the catalog loads; it cannot tell the documented edit
     // from an overwrite that drops everything else, so pin the rest of the file.
@@ -385,7 +432,7 @@ fn appending_the_names_a_config_lacks_keeps_the_tools_it_declares() {
     // `allow_tools` is a top-level key, so it goes above the file's first table
     // header, not after it — and it must list the file's own tool too, or the
     // append would silently retire it.
-    let document = format!("allow_tools = [\"mine\", \"codex\"]\n{document}{printed}");
+    let document = format!("{document}{printed}");
     std::fs::write(&config, document).unwrap();
 
     let listed = harness.run(&["-h"]);
@@ -454,8 +501,9 @@ fn the_sub_help_states_the_default_the_order_and_the_target_file() {
         .collect::<Vec<_>>()
         .join(" ");
     for expected in [
-        "With no NAME, prints every built-in tool",
+        "With no NAME, prints every built-in tool and a `default_tools` header",
         "Named tools print in the order given",
+        "adopting this starter opts a direct command in too",
         "~/.config/agent-vm/config.toml",
     ] {
         assert!(help.contains(expected), "{expected:?} missing from: {help}");
