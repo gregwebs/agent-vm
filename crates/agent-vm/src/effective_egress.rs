@@ -72,7 +72,7 @@ pub(crate) enum RowSource {
     PersistedGrant,
     AllowEgress,
     /// #735: granted by the launched tool's own `network_requests`, because an
-    /// `allow_tools` entry authorized it.
+    /// launch selected it (#749).
     AuthorizedTool,
     AllowInternetEgress,
     AllowLan,

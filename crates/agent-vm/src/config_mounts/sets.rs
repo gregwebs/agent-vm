@@ -841,19 +841,20 @@ fn bind_tool_lists(
 
 /// Parse `[[tools]]` `mounts = [...]` from a project config or a sourced file.
 ///
-/// These lists are **inert** until `allow_tools` authorizes the tool (#735): the
-/// declaration is validated here — syntax, `~/` expansion against the captured
-/// home, and this file's own per-tool conflicts — with zero host-path I/O, so a
-/// later authorization cannot activate a declaration that was never checked.
+/// These lists are parsed for every declared tool (#749): the declaration is the
+/// authority, so a launch selects them. The declaration is validated here —
+/// syntax, `~/` expansion against the captured home, and this file's own
+/// per-tool conflicts — with zero host-path I/O, so a selection cannot activate
+/// a declaration that was never checked.
 ///
 /// The set namespace is empty: sourced and project `[mount_sets]` are #738's.
 /// `HostSyntax::AbsoluteOrHome` is likewise #735's whole grammar; `./`
 /// project-relative paths are #738's. The leaves are charged to the *load's* one
-/// counter, so an inert declaration cannot buy a second budget.
+/// counter, so a declaration cannot buy a second budget.
 ///
-/// `pub(crate)` with no token argument on purpose: a tool list grants nothing
-/// until an authorization selects it, and what the authorization needs is not a
-/// mount read but a place in `allow_tools`.
+/// `pub(crate)` with no token argument on purpose: a tool list is a selection,
+/// not authority, and the authority that matters is the file's own verified
+/// read, which happened before this parse.
 pub(crate) fn parse_declared_tool_mounts(
     file: &Path,
     tools: &[super::ToolMountValue<'_>],
@@ -1259,7 +1260,7 @@ mod tests {
                 ),
                 mount_sets: values.sets.is_some(),
                 egress_sets: table.get("egress_sets").is_some(),
-                allow_tools: false,
+                default_tools: false,
             },
         )
         .unwrap()

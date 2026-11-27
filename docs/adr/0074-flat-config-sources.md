@@ -25,6 +25,12 @@ images to tool verbs); and a sourced file's tool `mounts` is legal-and-inert
 instead of refused by presence. Bumps the
 workspace version to **0.8.1** inside the unreleased 0.8.x line.
 
+**Amended in 0.8.6 by [ADR-0079](0079-declaration-is-the-launch-authority.md):**
+a source's tools are launch verbs from their own declaration, with no project
+`allow_tools` list and no project authorization step; a source may write
+`default_tools`, which contributes only when `allow = true`. The project's
+`use_tools` choice settles which source a bare `default_tools` name means.
+
 ## Context
 
 After [ADR-0073](0073-host-managed-project-config.md) agent-vm reads one
@@ -150,7 +156,8 @@ without `:trust`".
 
 Its tools get `ToolOrigin::Source { alias, file }`: provenance renders as
 `source repo <path>`, `doctor` prints `source=sourced:repo:<path>`, and the alias
-is the qualifier #735's `allow_tools` will use. Each source is its own
+is the qualifier the `<alias>:<tool>` launch verb uses (and the spelling
+`use_tools` and `default_tools` diagnostics name). Each source is its own
 tool-reference scope, exactly like the project file.
 
 **Unpinned until #736.** Nothing measures the bytes, so a branch switch changes a
@@ -214,6 +221,14 @@ the project definition is the launch verb; a differing replacement is still
 reported as a conflict naming both files. A definition with no verb stays
 resolvable from its own file (#395). The original rule is kept below as the
 record of why it was right while a declaration was still a launch verb.
+
+**Superseded again in 0.8.6 by
+[ADR-0079](0079-declaration-is-the-launch-authority.md).** A declaration is a
+launch verb, so two project-side files that declare one name leave the **bare**
+name in conflict: each candidate keeps its qualified spelling and the bare
+launch is refused naming both. A project declaration of an inherited `:trust`
+name shadows it for the bare route, and a differing definition is still reported
+as a conflict naming both files. `allow_tools` is refused.
 
 Two project-side files (the project config and any untrusted source) may not
 declare the same tool name. With one file that could not happen — duplicate names
@@ -295,15 +310,14 @@ the user config never hides the note.
   check, and the ADR-0038 guest-write guard over every trusted source route.
   (Source-qualified namespaces for `[mount_sets]`/`[egress_sets]` remain #738's.)
 - **G6. A source's tools can request credentials and reuse a familiar verb name.**
-  **Closed for unauthorized tools by
-  [ADR-0075](0075-explicit-tool-authorization.md)**: a source's declarations are
-  inert until the project config authorizes one, so no repository file can claim
-  a verb the user already types merely by declaring it. What remains is the
-  authorized case, a definition the user's own project config named: it carries
-  the `credentials`/`provisions` requests, `env` and `persist` declarations any
-  project-side tool carries. Nothing there grants authority beyond what the
-  tool's own launch already asks for, but the requests are real and, until
-  #736, unpinned.
+  **Closed by [ADR-0079](0079-declaration-is-the-launch-authority.md)**, which
+  succeeded ADR-0075's answer: a source's declaration *is* its launch verb, so a
+  repository file can claim a familiar verb name by declaring it — but only under
+  its own file's facets, and the bare name is refused while another file declares
+  it. The remaining case is a definition the user's own project config chose: it
+  carries the `credentials`/`provisions` requests, `env` and `persist`
+  declarations any tool carries. Nothing there grants authority beyond what the
+  tool's own launch already asks for.
 
 ## Alternatives rejected
 

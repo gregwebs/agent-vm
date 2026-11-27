@@ -103,7 +103,7 @@ fn toml_path(path: &Path) -> String {
 /// One project body declaring a tool plus one pinned source.
 fn project_with_source(source: &Path) -> String {
     format!(
-        "allow_tools = [\"t\"]\n\
+        "\
          [[tools]]\nname = \"t\"\ncommand = \"true\"\n\
          [[sources]]\nname = \"repo\"\npath = {}\n",
         toml_path(source)
@@ -444,7 +444,7 @@ fn an_ineligible_route_or_terminal_never_prompts() {
 #[test]
 fn a_broken_configuration_is_never_reviewed() {
     let fixture = Fixture::new();
-    fixture.write_project("allow_tools = [\"t\"]\n[[tools]]\nname = \"t\"\ncommand = \"true\"\n");
+    fixture.write_project("[[tools]]\nname = \"t\"\ncommand = \"true\"\n");
     let before = fixture.store_entries();
     let mut terminal = FakeTerminal::answering(&[Answer::Approve]);
     let mut transcript = Vec::new();
@@ -555,7 +555,7 @@ fn an_inactive_approval_is_activated_by_the_same_commit() {
     // `a` is approved, then `b` is a second pending source: `a`'s approved bytes
     // are no longer its active digest when the review happens.
     let body = format!(
-        "allow_tools = [\"t\"]\n\
+        "\
          [[tools]]\nname = \"t\"\ncommand = \"true\"\n\
          [[sources]]\nname = \"repo\"\npath = {}\n\
          [[sources]]\nname = \"other\"\npath = {}\n",
@@ -778,7 +778,7 @@ fn a_load_with_no_inactive_approval_records_nothing() {
     );
 
     // A load with no pinned sources at all captures nothing either.
-    fixture.write_project("allow_tools = [\"t\"]\n[[tools]]\nname = \"t\"\ncommand = \"true\"\n");
+    fixture.write_project("[[tools]]\nname = \"t\"\ncommand = \"true\"\n");
     let report = config::load(&fixture.paths()).unwrap();
     assert!(ActiveUpdates::of(&report).is_none());
 }
@@ -1087,54 +1087,97 @@ fn argv_of(tokens: &[&str]) -> Vec<std::ffi::OsString> {
     tokens.iter().map(std::ffi::OsString::from).collect()
 }
 
-/// A typo must not approve state: with every pending source inert, `lintt` is a
-/// name no approval can introduce, so the reload would reject it as an unknown
-/// subcommand after the write.
+/// #749: a pending `allow = false` source may declare *any* bare tool, so a
+/// bare verb is always a legitimate review — including one the parsed tiers do
+/// not spell yet. The approval commits and the reloaded catalog dispatches it.
 #[test]
-fn a_verb_typo_cannot_prompt_when_every_pending_source_is_inert() {
+fn a_pending_inert_source_may_supply_a_bare_verb() {
     let _env = crate::test_env::guard();
     let fixture = Fixture::new();
-    let source = fixture.write_repo("conf/agent-vm.toml", SOURCE);
+    let source = fixture.write_repo(
+        "conf/agent-vm.toml",
+        "[[tools]]\nname = \"lint\"\ncommand = \"true\"\n",
+    );
     fixture.write_project(&project_with_source(&source));
     let refusal = fixture.refusal();
     assert!(
         refusal.pending().iter().all(|source| !source.allow),
         "the fixture's only pending source is allow = false"
     );
-    assert!(
-        !refusal.verb_candidates().contains("lintt"),
-        "nothing parsed names the typo"
-    );
-    let before = fixture.store_entries();
 
-    let argv = argv_of(&["agent-vm", "lintt"]);
+    let argv = argv_of(&["agent-vm", "lint"]);
     let route = crate::cli::preflight_unapproved_route(&argv, refusal.verb_candidates());
-    assert_eq!(
-        route, None,
-        "a verb no pending source can supply must not be reviewable"
-    );
+    assert_eq!(route, Some(LaunchRoute::Verb), "the source may supply it");
 
     let mut terminal = FakeTerminal::answering(&[Answer::Approve]);
-    let (result, transcript) = interact(&fixture, refusal, route, Some(&mut terminal), 1_000);
-    let error = result.expect_err("the non-interactive refusal is returned");
-    assert_eq!(terminal.reads(), 0, "no question was asked");
-    assert_eq!(terminal.flushes(), 0);
-    assert_eq!(transcript, "", "no review was rendered");
-    assert_eq!(fixture.store_entries(), before, "nothing was written");
+    let (result, _) = interact(&fixture, refusal, route, Some(&mut terminal), 1_000);
+    assert_eq!(terminal.reads(), 1, "one question");
+    let report = result.expect("the single reload succeeded");
+    let catalog = report
+        .into_launch_catalog()
+        .expect("the approved catalog builds");
     assert!(
-        format!("{error:#}").contains("is not approved"),
-        "{error:#}"
+        catalog
+            .as_slice()
+            .iter()
+            .any(|entry| entry.label() == "lint"),
+        "the approved verb is in the catalog that dispatches"
     );
 }
 
-impl crate::cli::VerbCandidates<'_> {
-    /// Test-only: does the known set (or the widened answer) admit this verb?
-    fn contains(&self, name: &str) -> bool {
-        match self {
-            Self::AnyPendingSource => true,
-            Self::Known(known) => known.contains(name),
-        }
-    }
+/// A qualified verb names one source: it may prompt only while that alias is
+/// pending, and never when the pending set is unknown.
+#[test]
+fn a_qualified_verb_for_an_approved_source_cannot_prompt() {
+    let _env = crate::test_env::guard();
+    let fixture = Fixture::new();
+    let repo = fixture.write_repo(
+        "conf/repo.toml",
+        "[[tools]]\nname = \"lint\"\ncommand = \"true\"\n",
+    );
+    // `home` is the default user config: it is read (and so approved) whether or
+    // not the project names it, and its tools carry the `home:` spelling.
+    let user = fixture.home.join(".config/agent-vm/config.toml");
+    fs::create_dir_all(user.parent().unwrap()).unwrap();
+    fs::write(&user, "[[tools]]\nname = \"other\"\ncommand = \"true\"\n").unwrap();
+    fixture.write_project(&format!(
+        "\
+         [[tools]]\nname = \"t\"\ncommand = \"true\"\n\
+         [[sources]]\nname = \"repo\"\npath = {}\n",
+        toml_path(&repo),
+    ));
+    let refusal = fixture.refusal();
+    assert_eq!(refusal.pending().len(), 1, "only repo is pending");
+
+    let argv = argv_of(&["agent-vm", "home:other"]);
+    assert_eq!(
+        crate::cli::preflight_unapproved_route(&argv, refusal.verb_candidates()),
+        None,
+        "an approved alias is already in the catalog"
+    );
+    let argv = argv_of(&["agent-vm", "repo:lint"]);
+    assert_eq!(
+        crate::cli::preflight_unapproved_route(&argv, refusal.verb_candidates()),
+        Some(LaunchRoute::Verb),
+        "the pending alias may supply it"
+    );
+}
+
+/// When the config failure is not a pending review, no source alias can be
+/// confirmed, so only a bare verb may prompt.
+#[test]
+fn an_unknown_pending_set_never_prompts_for_a_qualified_verb() {
+    let _env = crate::test_env::guard();
+    let argv = argv_of(&["agent-vm", "foo:bar"]);
+    assert_eq!(
+        crate::cli::preflight_unapproved_route(&argv, crate::cli::VerbCandidates::AnyPendingSource),
+        None
+    );
+    let argv = argv_of(&["agent-vm", "bar"]);
+    assert_eq!(
+        crate::cli::preflight_unapproved_route(&argv, crate::cli::VerbCandidates::AnyPendingSource),
+        Some(LaunchRoute::Verb)
+    );
 }
 
 /// The control: a pending `allow = true` source may supply the verb, so the
@@ -1151,7 +1194,7 @@ fn a_pending_allowed_source_that_supplies_the_verb_still_prompts() {
     // The project claims the source's tool, so approving the source is what
     // puts `lint` into the catalog.
     fixture.write_project(&format!(
-        "allow_tools = [\"repo:lint\"]\n\
+        "\
          [[sources]]\nname = \"repo\"\npath = {}\nallow = true\n",
         toml_path(&source)
     ));

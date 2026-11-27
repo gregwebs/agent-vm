@@ -15,6 +15,13 @@ file, …`, and a project `allow_tools` entry selecting a `:trust` tool consults
 the same read's stored verdict through the `TrustedTool` subject — a second
 *subject*, not a second read.
 
+**Amended in 0.8.6 by [ADR-0079](0079-declaration-is-the-launch-authority.md):**
+the fifth presence trigger is `default_tools`; `allow_tools` is retired and
+refused by presence before typed decode. A `[[tools]]` declaration is not a
+trigger — it is measured whenever the file is read as authority — and its launch
+consults the same stored verdict through `TrustedTool`, so a tools-only file that
+failed the read still loads while its launches are refused.
+
 Amended by [ADR-0073](0073-host-managed-project-config.md): the project tier's
 file is measured and refused on any failure, with no presence trigger. Decision
 1's project refusals stand, and the user tier's rules — presence as the trigger,

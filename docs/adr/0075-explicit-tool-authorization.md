@@ -26,6 +26,15 @@ Amended by [ADR-0076](0076-sources-tables-trust-and-allow.md) (#748):
 order rather than from the single `:trust` user file, and it is inert (not
 refused) in an `allow = false` source.
 
+**Superseded in 0.8.6 by
+[ADR-0079](0079-declaration-is-the-launch-authority.md).** Every `[[tools]]`
+declaration is a launch verb again — the declaration is the authority — so
+`allow_tools` is retired and refused at every readable site with one ordered
+migration, the `"*"` wildcard and the shell's implicit one are gone, and
+`default_tools` supplies automatic grants to the shell affordance and to an
+authored direct route. Read every `allow_tools` sentence below as the retired
+grammar: it records what 0.8.2–0.8.5 did and why.
+
 ## Context
 
 A `[[tools]]` block *was* a launch verb. Three consequences:
@@ -53,11 +62,19 @@ Four constraints shape the answer:
 
 ## Decision 1: `allow_tools` is the verb list, and it is a parser of its own
 
+**Superseded in 0.8.6 by
+[ADR-0079](0079-declaration-is-the-launch-authority.md):** a declaration is the
+verb, the bare spelling is resolved by uniqueness or a project rank, and the
+retired key is refused before typed decode. The parser's guarantees named here
+(`:` reserved in names, value-safe diagnostics) survive in `config.rs` and
+`config_schema.rs`.
+
 A top-level `allow_tools = ["…"]` decides which `[[tools]]` declarations become
-launch verbs. It is parsed by a pure module (`config_allow_tools.rs`) with no
-filesystem access, `:` is refused in `[[tools]]` names so `<alias>:<name>` is
-unambiguous, wildcards are refused, and every diagnostic is value-safe
-(`config: "<file>": allow_tools[N]: …`, never echoing the entry).
+launch verbs. It is parsed by a pure module (`config_allow_tools.rs`, renamed to
+`config_tool_refs.rs` by #749 and then deleted as the grammar moved into
+`config.rs`) with no filesystem access, `:` is refused in `[[tools]]` names so
+`<alias>:<name>` is unambiguous, wildcards are refused, and every diagnostic is
+value-safe (`config: "<file>": allow_tools[N]: …`, never echoing the entry).
 
 Two entry forms: unqualified (`<name>`) resolves against **this file's** own
 `[[tools]]`; qualified (`<alias>:<name>`) is project-only and resolves against the
@@ -90,6 +107,12 @@ project's own `allow_tools` is a hard error.
 
 ## Decision 3: compiled-in defaults keep ADR-0036, and `uses_defaults` is exact
 
+**Amended in 0.8.6 by [ADR-0079](0079-declaration-is-the-launch-authority.md):**
+`uses_defaults` is true iff no readable tier declares a tool; the retired
+`allow_tools` is not a condition. A compiled-in default's `network_requests`
+still stay non-authoritative metadata, and a built-in `default_tools`
+contributor never makes a grant authoritative on its own.
+
 `uses_defaults` is true iff no tier declares a tool *and* no tier declares
 `allow_tools`. Declaring `[[tools]]` without `allow_tools` (or `allow_tools = []`)
 authorizes nothing and registers only the synthesized `shell` fallback. A
@@ -97,6 +120,12 @@ compiled-in default's `network_requests` stay non-authoritative metadata under
 default-deny.
 
 ## Decision 4: `allow_tools` is ADR-0040's fifth trigger, by presence
+
+**Amended in 0.8.6 by [ADR-0079](0079-declaration-is-the-launch-authority.md):**
+the fifth trigger is `default_tools` (`AuthorityTriggers.default_tools`, same
+32-row oracle). A `[[tools]]` declaration is not a trigger; its launch consults
+the stored verdict through `TrustedTool`, which is the mechanism described in
+this decision's second half and is unchanged.
 
 `AuthorityTriggers` grows to `{ network, mounts, mount_sets, egress_sets,
 allow_tools }`, and `authority_required` gains the operand (Verus-proved, with a
@@ -117,6 +146,12 @@ measurement of the same read and attributes a refusal to the selected definition
 (`AuthoritySubject::TrustedTool`), not to a list the file may not have.
 
 ## Decision 5: authorizing a tool activates every one of its fields
+
+**Superseded in name only by
+[ADR-0079](0079-declaration-is-the-launch-authority.md):** the effect is the same
+and the authority is the declaration, not an `allow_tools` entry. Every field
+still activates or none does, and a project or sourced `mounts` is live on that
+tool's launch.
 
 Launching an authorized tool activates its `command`, `args`, `interactive_shell`,
 `env`, `persist`, `credentials`, `mounts` and `network_requests` — including from a
@@ -151,6 +186,10 @@ knowing which it is in:
 
 A tool's requests remain its **own**: `tools = ["*"]` does not fold a sibling's
 requests in, so authorizing `shell` cannot grant another tool's destinations.
+**Superseded in 0.8.6 by [ADR-0079](0079-declaration-is-the-launch-authority.md):**
+`network_requests` fold over the launch's `tools` closure, and a declared
+`default_tools` contributor's requests reach the shell affordance; a built-in
+contributor's stay report metadata.
 
 ## Decision 7: `tool:NAME` is removed from every egress grammar
 
@@ -164,6 +203,12 @@ numeric `tool:443` reverts to the literal hostname `tcp://tool:443`.
 `USAGE.md` carries the migration note.
 
 ## Decision 8: the closure of a sourced tool must be authorized too
+
+**Superseded in 0.8.6 by [ADR-0079](0079-declaration-is-the-launch-authority.md):**
+there is no authorization step, so every member of a closure is provisioned by
+the launch; the `"*"` wildcard and the shell's implicit one are retired, and an
+omitted `tools` list is `[]`. The tier-local resolution rule and the exact
+`DefinitionId` pairing are unchanged.
 
 A tool authorized from a non-`:trust` file does not implicitly authorize the
 tools its own `tools = [...]` reaches — explicit, `["*"]`, a declared `shell`'s
@@ -191,7 +236,10 @@ referent, and the one-entry fix.
   file is bounded by one policy and one budget.
 - `--help`, `doctor` and `tools print` speak of *authorized* tools; `tools print`
   output is inert until the reader adds the `allow_tools` line its own header
-  names.
+  names. **Superseded in 0.8.6 by
+  [ADR-0079](0079-declaration-is-the-launch-authority.md):** the output is a
+  complete starter, every printed declaration is a verb, and the header carries
+  `default_tools` instead of a retired key.
 
 ## Accepted gaps
 

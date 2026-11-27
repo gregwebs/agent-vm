@@ -373,7 +373,8 @@ fn an_allowing_source_warns_that_approving_adopts_its_top_level_keys() {
     assert!(
         transcript.contains(&format!(
             "==> allow = true: approving also adopts this source's top-level {}\n",
-            "`image`, `mounts`, `network` and `allow_tools`"
+            "`image`, `mounts` and `network`; its [[tools]] declarations become launch verbs \
+             either way"
         )),
         "the capability the approval grants is named: {transcript}"
     );

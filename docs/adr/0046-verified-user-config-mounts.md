@@ -19,6 +19,12 @@ tool, the compiled-in defaults are the only tier that may not carry one, and one
 `MountExpansionWork` spans the whole load instead of a per-parser counter. The
 verified read, the defaults parser and every mount-set rule below are unchanged.
 
+**Amended in 0.8.6 by [ADR-0079](0079-declaration-is-the-launch-authority.md):**
+a `[[tools]]` declaration is the authority, so a project or sourced tool's
+`mounts` is live on that tool's launch. The compiled-in tier still may not carry
+one, and a declared `mounts` on the shell affordance merges with the effective
+`default_tools` grant under the same one-claim-set rule.
+
 Two extensions have since landed and are part of the current contract, not
 deferrals: **named mount sets** (#397, [ADR-0048](0048-named-mount-sets-and-tier-local-tool-references.md))
 and **full user tool `mounts` lists inherited through the tier-local `tools`
@@ -387,8 +393,8 @@ what changes is which lists a launch selects and where the presence gate looks.
 | authority trigger | `(top_level \|\| tool_field)`, aggregated before any mount text is parsed; an empty list on an unused tool is enough |
 | where it is accepted | user tier only; project and built-in tool fields are refused by presence, by numeric pointer `tools[N].mounts`, and keep network → top-level mounts → `[mount_sets]` precedence before them |
 | selection sources | defaults, then the launched tool's own list plus its transitive same-file `tools` closure, then `--mount`. No source overrides another |
-| the closure | the *same* visited mask that supplies providers, requested credential names and `persist` paths; tool `env` and `network_requests` remain the launched tool's own |
-| shell | a declared `shell`'s omitted `tools` is the existing wildcard, so it inherits those mounts deliberately; `tools = []` suppresses inheritance only; the built-in fallback inherits nothing but still receives user-wide defaults |
+| the closure | the *same* visited mask that supplies providers, requested credential names, `persist` paths, `env` and `network_requests`; all six facets fold over it (#749) |
+| shell | the declared `shell`'s own list plus the effective `default_tools` grant; the built-in fallback has no list of its own and receives the grant |
 | opt-out | suppresses defaults **and** the whole tool facet; explicit paths and set names still apply; providers, credential requests, persistence and every check stay active |
 | identity | `MountOrigin::UserTool` is diagnostics only; the same expanded declaration reached by a tool list, a set, the defaults or `--mount` is one claim and one fork |
 | resource bound | one leaf-visit budget continues from verified parsing into catalog construction; retained lists hold shared leaf handles |

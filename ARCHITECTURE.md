@@ -124,9 +124,9 @@ A launch is one pass, and the ordering is load-bearing:
    through the pin gate, and then parses against the resolved catalog. The
    catalog determines which subcommands exist; the pin-gate policy is
    [ADR-0077](docs/adr/0077-pinned-config-sources.md). `config::load` retains
-   **every** definition from both tiers, records which definitions win their
-   verb (the non-lossy winner IDs, from `allow_tools` authorization — a project
-   entry replacing an inherited `:trust` verb in place) together with the
+   **every** definition from both tiers, records each definition's launch
+   spellings (the bare winner or its qualified `<alias>:<name>`; a project
+   entry wins the bare name) together with the
    cross-tier conflicts, and checks `persist` ownership over all of those
    winners — but it binds no reference and folds no closure, so a `tools`
    reference error is not a load error. (An **egress** reference is a
@@ -197,18 +197,23 @@ every `trust = false` source is route-read once, bounded, hashed and looked up
 by `PinsContentPolicy` before UTF-8 or TOML decoding. Only the private
 match-witness-backed `ApprovedSourceContent` reaches parsing, so an unapproved
 file supplies neither declarations nor inert facts; see
-[ADR-0077](docs/adr/0077-pinned-config-sources.md). `allow_tools` decides which
-definitions are **launch verbs** — each verified trusted or pinned approved
-`allow = true` source's list first, then the project's entries, each one naming an inherited
-verb replacing it in place (ADR-0075) — and it is not a reference namespace. Each
+[ADR-0077](docs/adr/0077-pinned-config-sources.md). Every `[[tools]]` declaration
+is a **launch verb**: a project declaration wins the bare name, a unique user or
+sourced one also wins it, a sourced one is always reachable as `<alias>:<name>`,
+and two files declaring one name leave the bare name in conflict. The top-level
+`default_tools` decides what `agent-vm shell` provisions automatically (and what
+a direct command gets when a config wrote the key), and the project's
+`use_tools` settles which source a bare default name means (ADR-0079).
+Neither key is a reference namespace. Each
 launch winner's closure is resolved over the definitions that share its
 **declaring file** (#395), so a project `helper` that names `pi` gets the
-project's `pi` whichever file owns the verb — and a name that only another file
-declares is a config error. When no user or project definition exists and
-neither tier writes `allow_tools` it falls back to the seven compiled-in
+project's `pi` whichever file owns the bare name — and a name that only another file
+declares is a config error. When no readable tier declares a tool it falls back
+to the seven compiled-in
 defaults embedded from `default-tools.toml`; the synthesized `shell`
 fallback is resolved from a scope holding only that one shipped definition, so
-under a custom catalog it provisions nothing. The resolved catalog is what the
+under a custom catalog it provisions nothing of its own and receives only the
+effective `default_tools` grant. The resolved catalog is what the
 CLI builds its launch verbs from (#82), and `run::launch` reads back each
 entry's provisioning set — the credential providers *and*, since #83, the
 `persist` paths that become guest-HOME links (`guest_home.rs`) — so the verb
@@ -428,9 +433,10 @@ triggers or not, and returns what it measured (`authorized` **and** a
 `authorized` is `Some` only when an authority-bearing field is present and the
 file passed, so a tools-only file keeps loading (and keeps working through a
 dotfile symlink) whatever its facts are. The carried verdict is consulted by name
-resolution alone — a CLI `--allow-egress set:NAME` at launch, or a project
-`allow_tools` entry selecting a `:trust` tool while the same load resolves the
-verb list — so it must travel beside the bytes it measured instead of being
+resolution alone — a CLI `--allow-egress set:NAME` at launch, or a declared
+tool's launch, which resolves through `ReferenceTrust::require_for_trusted_tool`
+while the same load resolves the verb list — so it must travel beside the bytes
+it measured instead of being
 measured again.
 
 **The persisted guest-HOME collision moved.** A mount that shadows a declared

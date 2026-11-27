@@ -15,7 +15,7 @@
 //! same-uid processes (unsetenv edits the pointer array, not the strings); and
 //! `Zeroizing` wipes only the copies this module owns (ADR-0025's list).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::os::unix::ffi::OsStringExt as _;
@@ -89,8 +89,8 @@ impl EnvCapture {
     ///
     /// Contract: call only while the process is single-threaded and has spawned
     /// no child, i.e. from `main` before `point_at_msb` and before Tokio.
-    pub(crate) fn take_from_process(
-        requested: &BTreeSet<ServiceName>,
+    pub(crate) fn take_from_process<'a>(
+        requested: impl IntoIterator<Item = &'a ServiceName>,
         authorizations: &AuthorizationSet,
     ) -> Self {
         Self::take_with(requested, authorizations, |name| {
@@ -107,8 +107,8 @@ impl EnvCapture {
     /// The pure decision with the environment injected: unit tests (here and in
     /// `credential_resolver`) drive this without touching the process
     /// environment. Safe to expose: it reads nothing itself.
-    pub(crate) fn take_with(
-        requested: &BTreeSet<ServiceName>,
+    pub(crate) fn take_with<'a>(
+        requested: impl IntoIterator<Item = &'a ServiceName>,
         authorizations: &AuthorizationSet,
         mut take: impl FnMut(&GuestEnvName) -> Option<OsString>,
     ) -> Self {
@@ -157,6 +157,7 @@ impl CredentialSource for EnvCapture {
 mod tests {
     use super::*;
     use crate::secret_store::{MAX_SECRET_VALUE_LEN, ValueRejection};
+    use std::collections::BTreeSet;
 
     fn service() -> ServiceName {
         ServiceName::parse("alpha").unwrap()

@@ -16,6 +16,13 @@ unmet report below is printed only for a `ToolOrigin::BuiltIn` definition. The
 IP/CIDR refusal and the reporting budget are all unchanged and still apply to
 both cases.
 
+**Amended in 0.8.6 by [ADR-0079](0079-declaration-is-the-launch-authority.md):**
+the narrowing now runs the other way. A `[[tools]]` declaration is the authority,
+so its `network_requests` — and those of its transitive closure — are real
+egress; only a `ToolOrigin::BuiltIn` contributor stays report metadata. The
+`tools` fold rejected below is now the rule for a launch, while a built-in
+contributor to `default_tools` still grants nothing on its own.
+
 ## Context
 
 A repository may describe the services its tool expects, but cannot grant
@@ -84,7 +91,7 @@ that separately.
 ## Rejected alternatives
 
 - Requests as authority or implicit provider allowances: a repo would widen access.
-- Folding `tools`: provisioning is not a request-report input and wildcard shells would report every tool.
+- Folding `tools`: provisioning is not a request-report input and wildcard shells would report every tool. **Superseded in 0.8.6 by [ADR-0079](0079-declaration-is-the-launch-authority.md):** `network_requests` now fold over the same closure as every other facet, so a launch reports its closure's declared requests; a built-in member stays report metadata.
 - Resolving names to match numeric grants: requests must not trigger lookups.
 - Matching SDK policy in production: keep authority typed; policy rules are the independent test oracle.
 - `warning:` prefix: restricted launches are normal, not credential failures.
@@ -111,6 +118,9 @@ define the version/auth conditions and exclusions. Behavior is unchanged.
 route below was removed in 0.8.2. Authorizing a tool with `allow_tools` now grants
 its own requests on launch, and the route this amendment added no longer exists.
 The amendment is kept as the record of why #506 built it and what it protected.
+**Superseded again in 0.8.6 by
+[ADR-0079](0079-declaration-is-the-launch-authority.md):** the declaration, not
+an `allow_tools` entry, is what grants a tool's own requests.
 
 A request still grants nothing by being declared, by being *reported*, or by
 being declared in a project config. [#506](https://github.com/gregwebs/agent-vm/issues/506)

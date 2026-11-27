@@ -53,7 +53,7 @@ use vstd::prelude::*;
 
 #[cfg(test)]
 use crate::boot_image::OverrideSource;
-use crate::config::{Catalog, ConfigReport, ConfiguredImages, Tool};
+use crate::config::{Catalog, ConfigReport, ConfiguredImages};
 use crate::launch_target::LaunchTarget;
 use crate::run;
 use crate::{clipboard, doctor, intercept_hook, msb_cmd, secret, setup};
@@ -505,6 +505,19 @@ where
         (Some((name, sub)), Catalog::Ready(mut catalog)) => {
             match catalog.take_entry(name) {
                 Some(entry) => {
+                    // A declaration is the authority, but the read that declared
+                    // it must still have passed. Only the default user config can
+                    // reach here with a failed verdict: it keeps ADR-0040's
+                    // tools-only compatibility at load, and the same read refuses
+                    // the launch (#749, E8).
+                    if let Some(trust) = entry.launch_trust() {
+                        trust.require_for_trusted_tool().map_err(|refusal| {
+                            anyhow!(
+                                "config: {}: {refusal}",
+                                crate::one_line::quoted_path(trust.file())
+                            )
+                        })?;
+                    }
                     let ValidatedVerb { args, resources } =
                         validate_verb_launch(&mut command, &matches)?;
                     Ok(Dispatch::Launch {
@@ -520,6 +533,11 @@ where
                             tool_args: verb_payload(&argv, sub, VerbPayloadMode::ReadyTool)?,
                         },
                     })
+                }
+                // A bare name two sources claim: both candidates exist, so the
+                // refusal is theirs, not clap's.
+                None if catalog.name_conflict(name).is_some() => {
+                    Err(catalog.name_conflict(name).expect("just matched").refusal())
                 }
                 // Not a tool, so a fixed built-in: the two name sets are disjoint
                 // (`RESERVED_TOOL_NAMES`, asserted by a test) and external
@@ -587,10 +605,19 @@ fn direct_dispatch(
         Catalog::Broken(config_error) => Err(anyhow::Error::new(
             crate::launch_target::DirectLaunchFailure(config_error),
         )),
-        Catalog::Ready(_) => Ok(Dispatch::Launch {
+        Catalog::Ready(catalog) => Ok(Dispatch::Launch {
             target: LaunchTarget::Direct {
                 command: direct,
                 terminal,
+                // E5: the authored `default_tools` closure, and nothing when no
+                // file wrote the key — a plain direct command still provisions
+                // nothing, as ADR-0017 promises. A blocked contributor refuses
+                // here with the same verdict the shell route uses (E8/E10), under
+                // the direct route's own failure policy.
+                grant: crate::launch_target::CatalogGrant::from_defaults(catalog.direct_defaults())
+                    .map_err(|error| {
+                        anyhow::Error::new(crate::launch_target::DirectLaunchFailure(error))
+                    })?,
             },
             images: Box::new(captured.images),
             user_network: captured.user_network,
@@ -883,20 +910,19 @@ const CONFIG_ROUTE_VERB: &str = "config";
 ///
 /// A broken catalog registers no tool subcommands and absorbs every syntactically
 /// valid external verb, so the preflight cannot answer "will this verb dispatch
-/// after the approval" from the parse alone. Only the pending sources decide it:
+/// after the approval" from the parse alone. Two things are already known:
 ///
-/// * a pending `allow = true` source may adopt `[[tools]]`, so any name could
-///   dispatch once its bytes are approved — a review is legitimate;
-/// * a pending `allow = false` source cannot introduce a verb name at all (its
-///   tools stay inert unless the project config already names them), so the
-///   reloaded catalog offers exactly the verbs the already-parsed tiers spell,
-///   and a name outside that set can only be a typo.
+/// * every `[[tools]]` declaration is launchable (#749), so a pending source may
+///   supply any **bare** name — a bare verb is always a legitimate review;
+/// * a qualified `<alias>:<name>` names one source, so only a *pending* alias can
+///   appear from this review; one already approved is in the reloaded catalog.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum VerbCandidates<'a> {
-    /// Some pending source could contribute tools: any verb may dispatch later.
+    /// The config failure was not a pending review: any verb might dispatch.
     AnyPendingSource,
-    /// No pending source can add a verb: only these names can dispatch.
-    Known(&'a std::collections::BTreeSet<String>),
+    /// These are the pending aliases; every bare verb, and a qualified verb for
+    /// one of them, may dispatch once the review commits.
+    Pending(&'a std::collections::BTreeSet<crate::config_sources::SourceAlias>),
 }
 
 /// Whether this argv is a launch an interactive pin approval may be attached to,
@@ -941,19 +967,20 @@ pub(crate) fn preflight_unapproved_route(
         // forgotten here.
         _ if BUILTIN_SUBCOMMANDS.contains(&name) => None,
         _ => {
-            // A name no `[[tools]]` entry could ever have: prompting here would
-            // ask about a verb that cannot exist (the parse answers with the
-            // deferred config error instead).
-            if crate::config::tool_name_rejection(name).is_some() {
-                return None;
-            }
-            // A verb the pending approvals cannot make dispatchable would be
-            // reviewed, approved and committed, and then fail to dispatch: the
-            // single reload would reject it as an unknown subcommand.
-            if let VerbCandidates::Known(known) = candidates
-                && !known.contains(name)
-            {
-                return None;
+            // A bare verb is a candidate: a pending source may declare a tool of
+            // that name and the reloaded catalog will dispatch it.
+            let verb = crate::config::LaunchVerb::parse(name)?;
+            // A qualified verb names one source. Only a pending alias can appear
+            // from this review; an approved source's verb is already in the
+            // catalog the reload offers, so prompting for it would approve state
+            // that changes nothing. When the pending set is unknown, no alias can
+            // be confirmed, so a qualified spelling never prompts.
+            if let Some(alias) = verb.alias() {
+                match candidates {
+                    VerbCandidates::AnyPendingSource => return None,
+                    VerbCandidates::Pending(pending) if !pending.contains(alias) => return None,
+                    VerbCandidates::Pending(_) => {}
+                }
             }
             validate_verb_launch(&mut command, &parsed.matches).ok()?;
             verb_payload(&parsed.argv, sub, VerbPayloadMode::BrokenExternal).ok()?;
@@ -1024,7 +1051,32 @@ pub(crate) fn build_command(catalog: &Catalog) -> clap::Command {
     match catalog {
         Catalog::Ready(catalog) => {
             for entry in catalog.as_slice() {
-                command = command.subcommand(launch_subcommand(entry.tool()));
+                // A sourced definition that wins its bare name is listed once,
+                // under the bare spelling, and answers to `<alias>:<name>` as a
+                // hidden alias. A shadowed definition has no bare spelling, so
+                // its qualified label is the visible verb (#749).
+                let mut subcommand = launch_subcommand(entry.label());
+                if let Some(qualified) = entry.qualified_label()
+                    && qualified != entry.label()
+                {
+                    subcommand = subcommand.alias(qualified.to_owned());
+                }
+                command = command.subcommand(subcommand);
+            }
+            // A conflicted bare name is registered hidden, so the dispatch
+            // reports both candidates and their qualified spellings instead of
+            // clap's "unrecognized subcommand" for a name that exists (#749).
+            // A name some entry already answers to needs no such verb: the
+            // built-in `shell` fallback owns the bare route of a two-source
+            // `shell` conflict (E3), and registering it again aborts clap's
+            // debug assertions for every command.
+            for conflict in catalog.name_conflicts().iter().filter(|conflict| {
+                !catalog
+                    .as_slice()
+                    .iter()
+                    .any(|entry| entry.is_launched_as(conflict.name()))
+            }) {
+                command = command.subcommand(launch_subcommand(conflict.name()).hide(true));
             }
         }
         // D1: with no catalog, any unknown verb must be able to surface the
@@ -1085,12 +1137,12 @@ fn nearest_builtin(verb: &str) -> Option<&'static str> {
 }
 
 /// A raw tool verb: no flags or help flag can claim a tool argument.
-/// Only validated tool names, never guest commands, enter rendered help.
-fn launch_subcommand(tool: &Tool) -> clap::Command {
-    clap::Command::new(tool.name().to_owned())
+/// Only a launch label (`<name>` or `<alias>:<name>`), never a guest command,
+/// enters rendered help.
+fn launch_subcommand(verb: &str) -> clap::Command {
+    clap::Command::new(verb.to_owned())
         .about(format!(
-            "Launch {} in a per-project sandbox; tool arguments are forwarded verbatim",
-            tool.name()
+            "Launch {verb} in a per-project sandbox; tool arguments are forwarded verbatim"
         ))
         .disable_help_flag(true)
         .arg(
@@ -1655,9 +1707,9 @@ mod tests {
     use crate::config::{ConfigPaths, LaunchCatalog, RESERVED_TOOL_NAMES};
     use std::path::{Path, PathBuf};
 
-    const MYTOOL: &str =
-        "allow_tools = [\"mytool\"]\n[[tools]]\nname = \"mytool\"\ncommand = \"my-agent\"\n";
-    const SHELL_ONLY: &str = "allow_tools = [\"shell\"]\n[[tools]]\nname = \"shell\"\ncommand = \"bash\"\ninteractive_shell = true\n";
+    const MYTOOL: &str = "[[tools]]\nname = \"mytool\"\ncommand = \"my-agent\"\n";
+    const SHELL_ONLY: &str =
+        "[[tools]]\nname = \"shell\"\ncommand = \"bash\"\ninteractive_shell = true\n";
 
     fn launch_of(dispatch: Dispatch) -> (Box<run::Args>, Vec<String>) {
         match dispatch {
@@ -2239,7 +2291,7 @@ mod tests {
             env.remove_var(name);
         }
         let report = report_from(
-            "allow_tools = [\"claude\"]\n[[tools]]\nname = \"claude\"\ncommand = \"claude\"\ncredentials = [\"anthropic\"]\n",
+            "[[tools]]\nname = \"claude\"\ncommand = \"claude\"\ncredentials = [\"anthropic\"]\n",
         );
         let catalog = report.into_launch_catalog().unwrap();
         let command = build_command(&Catalog::Ready(catalog));
@@ -2265,7 +2317,7 @@ mod tests {
         let project = dir.path().join("config.toml");
         std::fs::write(
             &project,
-            "image = \"localhost:1/p:latest\"\nallow_tools = [\"t\"]\n[[tools]]\nname = \"t\"\ncommand = \"t\"\n",
+            "image = \"localhost:1/p:latest\"\n[[tools]]\nname = \"t\"\ncommand = \"t\"\n",
         )
         .unwrap();
         let report = crate::config::load(&ConfigPaths::for_test(
@@ -2289,13 +2341,12 @@ mod tests {
     }
 
     /// **#395 / C1's CLI half.** The entry `parse_from` hands to dispatch is the
-    /// project helper carrying the *hidden project* `pi`'s facets, never the
-    /// user's. `doctor` renders the same facts (`credentials=none;
+    /// project helper carrying the *project* `pi`'s facets, never the user's. `doctor` renders the same facts (`credentials=none;
     /// provisions=anthropic; persist=3 (own 1)`) from the same `into_launch_catalog`
     /// seam, which `tests/config_doctor.rs` asserts through the real binary; this
     /// pins the entry the launch actually receives.
     #[test]
-    fn a_hidden_definition_reaches_the_cli_entry_not_the_users() {
+    fn a_project_definition_reaches_its_closure_and_the_user_keeps_its_own() {
         use crate::credential_provider::CredentialProvider;
         let mut env = crate::test_env::guard();
         for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
@@ -2306,12 +2357,12 @@ mod tests {
         let project = dir.path().join("project.toml");
         std::fs::write(
             &user,
-            "allow_tools = [\"pi\"]\n[[tools]]\nname = \"pi\"\ncommand = \"user-pi\"\ncredentials = [\"openai\"]\npersist = [\".user-pi\"]\n",
+            "[[tools]]\nname = \"pi\"\ncommand = \"user-pi\"\ncredentials = [\"openai\"]\npersist = [\".user-pi\"]\n",
         )
         .unwrap();
         std::fs::write(
             &project,
-            "allow_tools = [\"helper\"]\n[[tools]]\nname = \"pi\"\ncommand = \"project-pi\"\n\
+            "[[tools]]\nname = \"pi\"\ncommand = \"project-pi\"\n\
              credentials = [\"anthropic\", \"project-service\"]\npersist = [\".project-pi\"]\n\
              [[tools]]\nname = \"bridge\"\ncommand = \"bridge\"\ntools = [\"pi\"]\npersist = [\".bridge\"]\n\
              [[tools]]\nname = \"helper\"\ncommand = \"helper\"\ntools = [\"bridge\"]\npersist = [\".helper\"]\n",
@@ -2332,7 +2383,7 @@ mod tests {
         assert_eq!(
             entry.provisioned().iter().collect::<Vec<_>>(),
             vec![CredentialProvider::Anthropic],
-            "the hidden project `pi`'s provider, not the user's OpenAI"
+            "the project `pi`'s provider, not the user's OpenAI"
         );
         assert_eq!(
             entry.tool().credential_providers().iter().count(),
@@ -2356,13 +2407,14 @@ mod tests {
             [".project-pi", ".bridge", ".helper"]
         );
 
-        // The winning verb keeps the user definition and its own facets.
+        // The user's definition keeps its own facets under its qualified
+        // spelling (`home:pi`); the project's owns the bare `pi` (#749).
         let report = crate::config::load(&ConfigPaths::for_test(
             Some(dir.path().join("user.toml")),
             dir.path().join("project.toml"),
         ))
         .unwrap();
-        let dispatch = parse_from(["agent-vm", "pi"], Ok(report)).expect("pi parses");
+        let dispatch = parse_from(["agent-vm", "home:pi"], Ok(report)).expect("home:pi parses");
         let Dispatch::Launch {
             target: LaunchTarget::Tool { entry, .. },
             ..
@@ -2604,7 +2656,7 @@ mod tests {
         for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
             env.remove_var(name);
         }
-        let body = "allow_tools = [\"mytool\"]\n[[tools]]\nname = \"mytool\"\ncommand = \"my-agent\"\nargs = [\"--fast\"]\n";
+        let body = "[[tools]]\nname = \"mytool\"\ncommand = \"my-agent\"\nargs = [\"--fast\"]\n";
 
         // A launch verb carries the resolved tool and its tool arguments.
         let dispatch = parse_from(["agent-vm", "mytool", "--resume"], Ok(report_from(body)))
@@ -2642,8 +2694,7 @@ mod tests {
         for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
             env.remove_var(name);
         }
-        let body =
-            "allow_tools = [\"t\"]\n[[tools]]\nname = \"t\"\ncommand = \"t\"\ntools = [\"nope\"]\n";
+        let body = "[[tools]]\nname = \"t\"\ncommand = \"t\"\ntools = [\"nope\"]\n";
         // A launch verb reports the config error, never clap's
         // unrecognized-subcommand, exactly like a syntactically broken config.
         let result = parse_from(["agent-vm", "t"], Ok(report_from(body)));
@@ -2745,7 +2796,7 @@ mod tests {
         let file = dir.path().join("user.toml");
         std::fs::write(
             &file,
-            "allow_tools = [\"fetcher\"]\n[[tools]]\nname = \"fetcher\"\ncommand = \"fetcher\"\nnetwork_requests = [\"a.example\"]\n",
+            "[[tools]]\nname = \"fetcher\"\ncommand = \"fetcher\"\nnetwork_requests = [\"a.example\"]\n",
         )
         .unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -2833,7 +2884,7 @@ mod tests {
         // deferred-error path (not selection) is what a broken config reports.
         std::fs::write(
             &file,
-            "mounts = [\"/ref:ro\"]\nallow_tools = [\"t\"]\n[[tools]]\nname = \"t\"\ncommand = \"t\"\ntools = [\"nope\"]\n",
+            "mounts = [\"/ref:ro\"]\n[[tools]]\nname = \"t\"\ncommand = \"t\"\ntools = [\"nope\"]\n",
         )
         .unwrap();
         let error = parse_from(["agent-vm", "shell"], load())
@@ -2920,7 +2971,7 @@ mod tests {
         let file = dir.path().join("user.toml");
         std::fs::write(
             &file,
-            "allow_tools = [\"t\"]\n[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = [\"/a:/g:ro\"]\n",
+            "[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = [\"/a:/g:ro\"]\n",
         )
         .unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -3958,7 +4009,7 @@ mod tests {
         let project = dir.path().join("config.toml");
         std::fs::write(
             &project,
-            "allow_tools = [\"image\"]\n[[tools]]\nname = \"image\"\ncommand = \"build\"\n",
+            "[[tools]]\nname = \"image\"\ncommand = \"build\"\n",
         )
         .unwrap();
         let error = crate::config::load(&ConfigPaths::for_test(
@@ -4089,9 +4140,7 @@ mod tests {
             env.remove_var(name);
         }
         for name in ["pull", "upgrade", "refresh"] {
-            let config = format!(
-                "allow_tools = [{name:?}]\n[[tools]]\nname = {name:?}\ncommand = \"probe\"\n"
-            );
+            let config = format!("[[tools]]\nname = {name:?}\ncommand = \"probe\"\n");
             let (_, forwarded) = launch_of(
                 parse_from(
                     ["agent-vm", name, "--image", "tool-value", "--help", "--"],
@@ -5710,7 +5759,7 @@ mod tests {
         // `config` is not a built-in, so a ready catalog's tool by that name is
         // still its own verb. Only *prompt eligibility* excludes the spelling,
         // so following the refusal's advice cannot start an approval (B3).
-        let body = "allow_tools = [\"config\"]\n[[tools]]\nname = \"config\"\ncommand = \"c\"\n";
+        let body = "[[tools]]\nname = \"config\"\ncommand = \"c\"\n";
         let (args, tool_args) = launch_of(
             parse_from(
                 argv_of(&["agent-vm", "config", "diff"]),

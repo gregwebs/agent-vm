@@ -14,8 +14,15 @@ removed.** Authorizing a tool through `allow_tools` grants its own
 `set:NAME` is unchanged and is now the only egress reference. A persisted
 `tool:codex` entry is an allowance-grammar error (`port must be a decimal number
 1-65535`), and `tool:443` is the literal hostname `tcp://tool:443`. Everything
+downstream of the reference — the closure budget, the canonicalization, the
+attribution — is unchanged. Everything
 below about `set:NAME` — resolution against the user file's own `[egress_sets]`,
 the verified read, entry-level attribution and the closure budget — still holds.
+
+**Amended in 0.8.6 by [ADR-0079](0079-declaration-is-the-launch-authority.md):**
+a `[[tools]]` declaration grants its own `network_requests` (no `allow_tools`
+entry is needed or accepted), and a declared `default_tools` contributor grants
+its requests to the shell affordance and to an authored direct route.
 
 ## Context
 

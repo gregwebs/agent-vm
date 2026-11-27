@@ -22,6 +22,12 @@ launch verb only when `allow_tools` authorizes it, and an authorized tool's
 (the defaults file and the tool's declaring file). `MountOrigin::UserTool` is now
 `MountOrigin::Tool`.
 
+**Amended in 0.8.6 by [ADR-0079](0079-declaration-is-the-launch-authority.md):**
+the declaration is the authority, so every tool's `mounts` activates on its own
+launch without an `allow_tools` entry; the resolution scope is unchanged. The
+`"*"` wildcard is retired, so a `shell`'s provisioning and mount inheritance come
+from `default_tools` and its own named `tools` list.
+
 **Implemented:**
 
 - **Tier-local tool reference scopes** ([#395](https://github.com/gregwebs/agent-vm/issues/395)):
@@ -35,8 +41,8 @@ launch verb only when `allow_tools` authorizes it, and an authorized tool's
   selector and the one compiled set-closure interface the defaults list uses, and
   under one continued leaf-visit budget that also covers catalog construction.
   Project and built-in tool fields are refused by presence; `--no-config-mounts`
-  suppresses every automatic input; a declared `shell`'s omitted `tools` inherits
-  those mounts deliberately. Retained lists hold shared leaf handles, so a
+  suppresses every automatic input; the shell affordance carries the effective
+  `default_tools` grant's mounts. Retained lists hold shared leaf handles, so a
   catalog entry inherits one handle per leaf rather than a payload. Canonical
   guidance: [USAGE](../../USAGE.md#tool-specific-config-mounts).
 - **Named mount sets and `--mount SET` selection** ([#397](https://github.com/gregwebs/agent-vm/issues/397)):
@@ -70,7 +76,8 @@ preparation work belongs to the follow-up issue.
 Mount declarations and named **mount sets** belong only to user configuration;
 project configuration cannot declare or select them, including through empty
 mount fields or tables. A tool's mounts follow its transitive `tools`
-references, including `shell`'s wildcard; `--no-config-mounts` suppresses all
+references; the shell affordance additionally carries the effective
+`default_tools` grant's mounts. `--no-config-mounts` suppresses all
 configuration-selected mounts but preserves explicit CLI selections.
 
 To prevent a project from activating user mounts indirectly, `tools` references
@@ -200,11 +207,13 @@ and expansion path rather than by a second resolver.
 The canonical, complete replacement catalog is in
 [USAGE → Tool-specific config mounts](../../USAGE.md#tool-specific-config-mounts);
 it retains every shipped definition and adds one `[mount_sets]` entry plus the
-per-tool selections. A user-declared shell whose omitted `tools` defaults to
-`["*"]` now inherits the agent mounts and Pi fork from its own tier — that is the
-deliberate revision recorded in #396, and the reason USAGE warns about it.
-`tools = []` stops the inheritance but keeps the shell's own list and the
-user-wide defaults, and the built-in fallback inherits nothing. `--mount agent`
+per-tool selections. A declared shell used to inherit the agent mounts and Pi
+fork through its omitted `tools` wildcard; **since 0.8.6
+([ADR-0079](0079-declaration-is-the-launch-authority.md)) the wildcard is
+retired**, a user or sourced `shell` is reachable only as `home:shell`, and the
+bare shell route gets its mounts from `default_tools` instead. `tools = []` and
+`--no-config-mounts` keep their effects, and the built-in fallback's own list is
+empty. `--mount agent`
 selects only that set, and `--no-config-mounts --mount agent` removes every
 automatic input while keeping the explicit set. Neither changes credential
 provisioning or persisted paths, and repeated selection of the same mount across
@@ -315,10 +324,10 @@ renders its row even when a read or write fails, so a partial mount cannot pass:
 | CM-T2 | `CM-T2 agent=agent-seed agent-write=wrote skills=skills-seed skills-write=denied readonly=readonly-seed readonly-write=denied pi=absent` | a tool's own `mounts = ["agent"]` gives a writable parent and two read-only trees |
 | CM-T3 | `CM-T3 agent=agent-seed skills=skills-seed readonly=readonly-seed pi=pi-seed pi-write=wrote auth=absent models=absent guest-file=wrote` | the same topology *inherited* through `tools` — `pi` declares the fork only, so `agent` can arrive no other way — plus a `:fork` that reads the seed, keeps the guest's write, omits `auth.json`/`models.json`, and takes a guest-only file |
 | CM-T4 | `CM-T4 pi=pi-guest guest-file=present` | after a host-only source change to `pi-host-later`, the inherited fork still reads `pi-guest` and its own file |
-| CM-T5 | `CM-T5 agent=agent-seed skills=skills-seed ro-write=denied pi=pi-guest project=present` | a declared `shell`'s omitted `tools` wildcard inherits the fork and the agent topology |
+| CM-T5 | `CM-T5 agent=agent-seed skills=skills-seed ro-write=denied pi=pi-guest project=present` | a declared `shell`'s omitted `tools` wildcard inherits the fork and the agent topology (the row records 0.8.5 behaviour; ADR-0079 retired the wildcard) |
 | CM-T6 | `CM-T6 agent=absent skills=absent readonly=absent pi=absent shell-own=shell-own shell-own-write=denied default=default default-write=denied` | `tools = []` drops inheritance while the shell's own list and the user-wide default stay, both read-only |
 | CM-T7 | `CM-T7 agent=absent skills=absent pi=absent shell-own=absent default=default default-write=denied project=present` | with no declared shell the built-in fallback references no user tool but still receives the user-wide default |
-| CM-T8 | `CM-T8 agent=absent skills=absent readonly=absent pi=absent shell-own=absent default=absent project=present` | `--no-config-mounts` removes defaults, own list and inheritance on **both** a tool and the declared shell; the shell is a *wildcard* one, so its inherited facet is non-empty before the opt-out suppresses it |
+| CM-T8 | `CM-T8 agent=absent skills=absent readonly=absent pi=absent shell-own=absent default=absent project=present` | `--no-config-mounts` removes defaults, own list and inheritance on **both** a tool and the declared shell; the shell is a *wildcard* one, so its inherited facet is non-empty before the opt-out suppresses it (0.8.5 behaviour; ADR-0079 retired the wildcard) |
 | CM-T9 | `CM-T9 agent=agent-seed agent-write=wrote skills=skills-seed ro-write=denied readonly=readonly-seed readonly-write=denied pi=absent default=absent agent-tool=absent agent-tool-state=absent` | `--no-config-mounts --mount agent` returns exactly the explicit set with its modes — both read-only leaves probed — and selecting a set provisions no tool: the catalog has a tool named `agent`, and its own leaf and `persist` link stay absent |
 | CM-T9-control | `CM-T9-control agent-tool=agent-tool-seed agent-tool-state=present` | the positive control for the two observables above: launching the same-named tool itself shows its own leaf and its persist link, so their absence under `--mount agent` is a measurement |
 | CM-T10 | `CM-T10 pi=pi-guest guest-file=present agent=absent` | an absolute `--mount …:fork` of the same source reuses the inherited fork's committed copy |

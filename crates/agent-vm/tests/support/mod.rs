@@ -200,61 +200,18 @@ fn assert_off_tmpfs(path: &Path) {
     }
 }
 
-/// #735 fixture migration: authorize exactly the tools a fixture declares.
-///
-/// Before #735 a `[[tools]]` block *was* a launch verb, so a hundred fixtures
-/// declared one and expected it to launch. Authorizing is now a separate step
-/// (ADR-0075), and those fixtures are not about authorization — so this
-/// prepends `allow_tools` listing every name the body declares.
-///
-/// A body that mentions `allow_tools` at all is left untouched, which is how a
-/// test states its own authorization (or deliberately states none); the same
-/// device backs `config::tests::authorized_fixture` in the unit targets.
-pub fn authorized_tools(contents: &str, skip: &[String]) -> String {
-    if contents.contains("allow_tools") {
-        return contents.to_owned();
-    }
-    let names: Vec<String> = tool_names(contents)
-        .into_iter()
-        .filter(|name| !skip.contains(name))
-        .collect();
-    if names.is_empty() {
-        return contents.to_owned();
-    }
-    let listed = names
-        .iter()
-        .map(|name| format!("{name:?}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("allow_tools = [{listed}]\n{contents}")
+/// #749: a `[[tools]]` declaration is the authorization, so a fixture body needs
+/// no separate list. Kept as one door other tests call, so a future fixture
+/// device has one place to live.
+pub fn authorized_tools(contents: &str, _skip: &[String]) -> String {
+    contents.to_owned()
 }
 
-/// [`authorized_tools`] for a project config: names the user config already
-/// declares are skipped, so a fixture that pins the pre-#735 "user shadows
-/// project" merge keeps pinning the shadowed shape.
-pub fn authorized_tools_beside(contents: &str, user_config: &Path) -> String {
-    let user_body = std::fs::read_to_string(user_config).unwrap_or_default();
-    let declared = tool_names(&user_body);
-    authorized_tools(contents, &declared)
-}
-
-/// Every `[[tools]] name = "…"` in one config body, in declaration order.
-fn tool_names(contents: &str) -> Vec<String> {
-    let mut names: Vec<String> = Vec::new();
-    for line in contents.lines() {
-        let Some(rest) = line.trim().strip_prefix("name = ") else {
-            continue;
-        };
-        if let Some(name) = rest
-            .trim()
-            .strip_prefix('"')
-            .and_then(|v| v.strip_suffix('"'))
-            && !names.iter().any(|seen| seen == name)
-        {
-            names.push(name.to_owned());
-        }
-    }
-    names
+/// The project-config form of [`authorized_tools`]: identical now, because a
+/// project definition outranks a same-named one by rank rather than by list
+/// membership.
+pub fn authorized_tools_beside(contents: &str, _user_config: &Path) -> String {
+    contents.to_owned()
 }
 
 #[cfg(test)]

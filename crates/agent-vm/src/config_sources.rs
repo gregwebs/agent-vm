@@ -110,7 +110,7 @@ impl fmt::Display for SourceAlias {
 pub(crate) struct SourceAttributes {
     /// Bypass content-hash pinning (#736) and read through the verified path.
     pub(crate) trust: bool,
-    /// Adopt this file's top-level `image`/`mounts`/`[network]`/`allow_tools`.
+    /// Adopt this file's top-level `image`/`mounts`/`[network]`/`default_tools`.
     pub(crate) allow: bool,
 }
 
@@ -872,7 +872,6 @@ mod tests {
         assert!(!message.contains("SECRET-748"), "{message}");
 
         for field in [
-            "allow_tools",
             "egress_sets",
             "image",
             "mounts",

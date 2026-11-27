@@ -1942,12 +1942,12 @@ fn ledger() -> Vec<Row> {
         // clause, so replacing it cannot weaken the contract it is checked against.
         // #397 widened the disjunction from two fields to three, #511 to four and
         // #735 to five, so the anchor and its test both moved again: the body now
-        // names `allow_tools`, and the oracle is the thirty-two-row table.
+        // names `default_tools`, and the oracle is the thirty-two-row table.
         Row {
             name: r#"config-mounts-authority-or"#,
             path: r#"crates/agent-vm/src/config_authority.rs"#,
-            old: r#"if t.network { true } else { t.mounts || t.mount_sets || t.egress_sets || t.allow_tools }"#,
-            new: r#"if t.network { t.mounts || t.mount_sets || t.egress_sets || t.allow_tools } else { false }"#,
+            old: r#"if t.network { true } else { t.mounts || t.mount_sets || t.egress_sets || t.default_tools }"#,
+            new: r#"if t.network { t.mounts || t.mount_sets || t.egress_sets || t.default_tools } else { false }"#,
             run: Run::AgentBin(r#"authority_required_matches_the_thirty_two_rows"#),
             markers: &[r#"test result: FAILED"#],
             anchors: 1,
@@ -1955,8 +1955,8 @@ fn ledger() -> Vec<Row> {
         Row {
             name: r#"config-mounts-authority-or-proof"#,
             path: r#"crates/agent-vm/src/config_authority.rs"#,
-            old: r#"if t.network { true } else { t.mounts || t.mount_sets || t.egress_sets || t.allow_tools }"#,
-            new: r#"if t.network { t.mounts || t.mount_sets || t.egress_sets || t.allow_tools } else { false }"#,
+            old: r#"if t.network { true } else { t.mounts || t.mount_sets || t.egress_sets || t.default_tools }"#,
+            new: r#"if t.network { t.mounts || t.mount_sets || t.egress_sets || t.default_tools } else { false }"#,
             run: Run::Proof,
             markers: &[r#"verification results::"#],
             anchors: 1,
@@ -2599,14 +2599,15 @@ fn ledger() -> Vec<Row> {
         Row {
             name: r#"tool-mounts-facet-dropped"#,
             path: r#"crates/agent-vm/src/config.rs"#,
-            old: r#"            if !tool.mounts().is_empty() {
-                lists.push(tool.mounts());
-            }"#,
-            new: r#"            if tool.declaration_index == definitions[start.0].declaration_index
-                && !tool.mounts().is_empty()
-            {
-                lists.push(tool.mounts());
-            }"#,
+            old: r#"        if !tool.mounts().is_empty() {
+            lists.push(tool.mounts());
+        }"#,
+            new: r#"        if tool.declaration_index == launcher.declaration_index
+            && tool.origin() == launcher.origin()
+            && !tool.mounts().is_empty()
+        {
+            lists.push(tool.mounts());
+        }"#,
             run: Run::AgentTest(
                 r#"config_mounts"#,
                 r#"tool_mount_chain_cycle_and_diamond_bind_each_declaration_once"#,
@@ -3649,100 +3650,672 @@ fn ledger() -> Vec<Row> {
             markers: &[r#"test result: FAILED"#],
             anchors: 1,
         },
+        // #749: every definition is a launch verb, so the validator that matters
+        // is the one that walks every retained definition's explicit references.
+        // Skipping the present-reference test disables that check for all of them.
         Row {
-            name: r#"inert-source-references-skipped"#,
+            name: r#"tool-reference-validation-skipped"#,
             path: r#"crates/agent-vm/src/config.rs"#,
-            old: r#"            ResolvedTools::from_defaults_retaining(default_tools()?, sourced),"#,
-            new: r#"            ResolvedTools::from_defaults_retaining(default_tools()?, Vec::new()),"#,
-            run: Run::AgentBin(r#"defaults_path_still_validates_inert_source_references"#),
+            old: r#"            if index.contains_key(&(tool.origin(), reference.as_str())) {"#,
+            new: r#"            if true {"#,
+            run: Run::AgentBin(r#"defaults_path_validates_and_launches_a_sources_definitions"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        // #749 E8/V4: a blocked declaring read still loads, and every launch
+        // refuses it. A row that does not say so advertises a verb that cannot
+        // run — `doctor` and a launch would disagree.
+        Row {
+            name: r#"blocked-tool-row-unmarked"#,
+            path: r#"crates/agent-vm/src/doctor.rs"#,
+            old: r#"    let unavailable = entry
+        .launch_trust()
+        .and_then(launch_refusal_note)
+        .map(|note| format!("; {note}"))
+        .unwrap_or_default();"#,
+            new: r#"    let unavailable = String::new();"#,
+            run: Run::AgentBin(
+                r#"describe_config_marks_a_blocked_tool_unavailable_with_the_launch_reason"#,
+            ),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        // #749: the retired key is refused by presence through one shared helper,
+        // so disabling the classifier's answer loses the migration sentence in
+        // every reader at once — while a keyless file still loads.
+        Row {
+            name: r#"allow-tools-removal-refusal-skipped"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"    for key in RETIRED_KEYS {
+        let Some(site) = crate::config_schema::misplaced_key(document, key) else {"#,
+            new: r#"    for key in RETIRED_KEYS {
+        let Some(site) = None::<crate::config_schema::Site> else {"#,
+            run: Run::AgentBin(r#"allow_tools_is_refused_in_the_project_config"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        // #749: the project definition outranks every sourced one for the bare
+        // spelling. Dropping that rank turns a settled name into a conflict, so
+        // the bare verb the control launches stops existing.
+        Row {
+            name: r#"local-rank-ignored"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"        ToolOrigin::Project(_) | ToolOrigin::BuiltIn => 0,"#,
+            new: r#"        ToolOrigin::BuiltIn => 0,
+        ToolOrigin::Project(_) => 1,"#,
+            run: Run::AgentBin(r#"a_project_tool_shadows_a_source_tool_of_the_same_name"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        // #749: two sources that declare one name leave the bare spelling in
+        // conflict. Picking the first candidate instead silently chooses a source.
+        Row {
+            name: r#"unqualified-conflict-picks-first"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"            name_conflicts.push(NameConflict {
+                name: name.to_owned(),
+                file: project_file.map(Path::to_path_buf),
+                candidates: winners
+                    .iter()
+                    .map(|position| {
+                        let spelling = names[*position]
+                            .qualified
+                            .clone()
+                            .unwrap_or_else(|| name.to_owned());
+                        (spelling, definitions[*position].origin().clone())
+                    })
+                    .collect(),
+            });"#,
+            new: r#"            names[winners[0]].bare = Some(name.to_owned());"#,
+            run: Run::AgentBin(r#"an_unqualified_conflict_names_both_candidates"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        // #749 V6: a project `default_tools` entry may name its source
+        // explicitly. Resolving it by bare-name rank instead picks the first
+        // candidate, so the entry grants a file the project did not name.
+        Row {
+            name: r#"qualified-default-resolved-by-rank"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"    if let Some(alias) = entry.alias.as_ref() {
+        return definition_of_alias(alias, name, definitions, user_alias).ok_or_else(|| {"#,
+            new: r#"    if let Some(alias) = None::<&crate::config_sources::SourceAlias> {
+        return definition_of_alias(alias, name, definitions, user_alias).ok_or_else(|| {"#,
+            run: Run::AgentBin(r#"a_qualified_project_default_resolves_against_its_source_only"#),
             markers: &[r#"test result: FAILED"#],
             anchors: 1,
         },
         Row {
-            name: r#"allow-tools-authority-operand-dropped"#,
+            // The qualified spelling is the project's own decision. Accepting it
+            // in a source lets one file name another file's alias as its grant.
+            name: r#"qualified-default-accepted-in-a-source"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"            LaunchVerb::Qualified { alias, name } if matches!(kind, FileTierKind::Project) => {"#,
+            new: r#"            LaunchVerb::Qualified { alias, name } => {"#,
+            run: Run::AgentBin(r#"a_qualified_project_default_resolves_against_its_source_only"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        // ---- #749 G: the grammar cutover ------------------------------------
+        //
+        // Each row mutates the one place that decides, runs a control that names
+        // the assertion it must break, and keeps a passing control beside it: a
+        // keyless file still loads, a valid named list still provisions, a direct
+        // command with no authored list still provisions nothing, and `repo:shell`
+        // still keeps its own closure.
+        Row {
+            // `default_tools` is what keeps a file authority-bearing. Ignoring its
+            // presence lets a symlinked dotfile that declares grants load unread.
+            name: r#"default-tools-presence-ignored"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"        default_tools: allowed && document.contains_key("default_tools"),"#,
+            new: r#"        default_tools: false,"#,
+            run: Run::AgentTest(
+                r#"config_launch_driven"#,
+                r#"the_default_tools_trigger_is_verified_before_decoding"#,
+            ),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // The project's own choice is what settles a bare name two sources
+            // declare. Ignoring it turns the control's settled verb into a
+            // two-candidate conflict.
+            name: r#"use-tools-choice-ignored"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"    if let Some((alias, _)) = use_tools.iter().find(|(_, chosen)| chosen == name) {"#,
+            new: r#"    if let Some((alias, _)) = None::<&(crate::config_sources::SourceAlias, ToolName)> {"#,
+            run: Run::AgentBin(r#"use_tools_settles_which_source_a_bare_default_means"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // A `use_tools` entry that names nothing must be refused. Skipping it
+            // accepts a typo as a choice, and the reader never reports the entry.
+            name: r#"use-tools-stale-entry-skipped"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"        .ok_or_else(|| {
+            anyhow!(
+                "config: {}: use_tools: {} names no tool that source declares; a qualified \
+                 choice needs both an alias the project sources and a tool that file declares",
+                project_grants_file(project_file),
+                quoted_str(&format!("{}:{}", alias.as_str(), name.as_str()))
+            )
+        })"#,
+            new: r#"        .map_or_else(|| Ok(DefinitionId(0)), Ok)"#,
+            run: Run::AgentBin(r#"a_use_tools_choice_must_name_a_tool_that_source_declares"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // #749 V2: a choice no `default_tools` entry consumes is still a
+            // choice the project wrote. Validating only the ones a default
+            // names lets `use_tools = ["one:stale"]` load silently.
+            name: r#"unused-use-tools-choice-skipped"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"    for (alias, chosen) in &grants.use_tools {
+        resolve_use_tools_choice(alias, chosen, definitions, user_alias, project_file)?;
+    }"#,
+            new: r#"    for (alias, chosen) in &grants.use_tools {
+        let _ = (alias, chosen, definitions, user_alias, project_file);
+    }"#,
+            run: Run::AgentBin(
+                r#"every_use_tools_choice_is_validated_without_a_consuming_default"#,
+            ),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // Project-only is the reader's policy, in one place for the sourced
+            // file and the embedded catalog. Disabling it accepts the key
+            // everywhere and the project-only sentence disappears.
+            name: r#"use-tools-sourced-accepted"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"    if !matches!(kind, FileTierKind::Project) {
+        return Err(use_tools_refusal(path));
+    }"#,
+            new: r#"    if false {
+        return Err(use_tools_refusal(path));
+    }"#,
+            run: Run::AgentBin(r#"use_tools_is_project_only"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // An `allow = false` source supplies nothing automatically, so its own
+            // list must be dropped. Adopting it grants what the user disallowed.
+            name: r#"default-tools-inert-adopted"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"    raw.default_tools = None;
+    inert
+}"#,
+            new: r#"    inert
+}"#,
+            run: Run::AgentBin(r#"a_disallowed_sources_defaults_are_inert"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // A granted contributor whose declaring read failed must refuse the
+            // launch with that verdict. Bypassing it launches bytes the read
+            // refused.
+            name: r#"default-tools-trusted-verdict-bypassed"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"        trust.require_for_trusted_tool().is_err().then_some(trust)"#,
+            new: r#"        let _ = trust.require_for_trusted_tool();
+        false.then_some(trust)"#,
+            run: Run::AgentBin(r#"a_blocked_default_contributor_refuses_the_shell_launch"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // `*` is retired with the working replacement named. Accepting it as an
+            // ordinary name turns the migration sentence into a dangling-reference
+            // error, which is not the diagnostic the user needs.
+            name: r#"wildcard-migration-diagnostic-dropped"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"        if entry == ALL_TOOLS_WILDCARD {"#,
+            new: r#"        if false {"#,
+            run: Run::AgentBin(r#"a_tools_wildcard_is_refused_with_its_replacement"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // The shell affordance is the one entry that receives the effective
+            // closure, selected by route. Dropping the fold loses the granted
+            // providers, persist paths and mounts on a `shell` launch.
+            name: r#"shell-default-fold-dropped"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"    if let Some(index) = entries.iter().position(CatalogEntry::is_shell_affordance) {
+        entries[index].carry_defaults(&defaults, work)?;
+    }"#,
+            new: r#"    if let Some(index) = None::<usize> {
+        entries[index].carry_defaults(&defaults, work)?;
+    }"#,
+            run: Run::AgentBin(r#"the_shell_affordance_gets_the_effective_defaults"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // A direct command receives the **authored** closure and nothing
+            // otherwise (E5). Replacing the grant with `none()` drops it.
+            name: r#"direct-default-grant-dropped"#,
+            path: r#"crates/agent-vm/src/launch_target.rs"#,
+            old: r#"        if defaults.is_empty() {"#,
+            new: r#"        if true {"#,
+            run: Run::AgentTest(
+                r#"config_launch_driven"#,
+                r#"the_effective_defaults_grant_exactly_the_shell_and_an_authored_direct_route"#,
+            ),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // G1: a direct command's named YAML requests come from the authored
+            // defaults' closure. Leaving them out of the target makes
+            // `credentials.yaml` unread for a service a `default_tools`
+            // contributor requests: the shell affordance still provisions it and
+            // the direct route silently does not.
+            name: r#"direct-default-request-dropped"#,
+            path: r#"crates/agent-vm/src/launch_target.rs"#,
+            old: r#"            Self::Direct { grant, .. } => grant.requested_services(),"#,
+            new: r#"            Self::Direct { .. } => RequestedServices::new(),"#,
+            run: Run::AgentTest(
+                r#"config_launch_driven"#,
+                r#"an_authored_defaults_named_service_is_provisioned_on_the_direct_route"#,
+            ),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // The shipped list is the shell's own compatibility grant until #750.
+            // Dropping it leaves `agent-vm shell` with no providers and no `.dsh`,
+            // while a direct command stays empty and no built-in egress is granted.
+            name: r#"builtin-default-tools-dropped"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"        let defaults = tools
+            .iter()
+            .enumerate()
+            .filter(|(_, tool)| tool.name() != SHELL_TOOL_NAME)
+            .map(|(position, _)| DefinitionId(position))
+            .collect();"#,
+            new: r#"        let defaults: Vec<DefinitionId> = Vec::new();"#,
+            run: Run::AgentBin(r#"the_shipped_list_is_the_shells_alone"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        // ---- #749 fix round 1: the fold, the verdict, the route, the grants --
+        //
+        // One row per guard the first review round's defects added. Each names
+        // the one place that decides and the assertion that must die.
+        Row {
+            // Every facet folds over the same visited mask (AC2/AC3). Restricting
+            // the env/request fold to the roots drops a referenced helper's pair
+            // and its declared destination from the launch.
+            name: r#"closure-env-fold-dropped"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"    for (position, seen) in visited.iter().enumerate() {
+        if *seen && !order.contains(&position) {
+            order.push(position);
+        }
+    }"#,
+            new: r#"    for (position, seen) in visited.iter().enumerate() {
+        if *seen && !order.contains(&position) && false {
+            order.push(position);
+        }
+    }"#,
+            run: Run::AgentTest(
+                r#"config_launch_driven"#,
+                r#"an_authorized_source_tool_activates_every_field_of_its_closure"#,
+            ),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // `network_requests` is folded as authority for a declared member and
+            // as report metadata for a built-in one. Dropping the union loses the
+            // shipped tools' own report and a declared closure's granted egress.
+            name: r#"closure-requests-fold-dropped"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"        if declared || requests == RequestMembers::Every {"#,
+            new: r#"        if false && (declared || requests == RequestMembers::Every) {"#,
+            run: Run::AgentTest(
+                r#"config_launch_driven"#,
+                r#"shipped_default_network_requests_default_deny"#,
+            ),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // A direct grant is built from the authored closure only after its
+            // contributors pass the same verified-read verdict the shell route
+            // requires. Bypassing it provisions a blocked file's credentials,
+            // mounts, persist, env and egress on `agent-vm run`.
+            name: r#"direct-default-trust-bypassed"#,
+            path: r#"crates/agent-vm/src/launch_target.rs"#,
+            old: r#"        if let Some(trust) = defaults.refusal() {"#,
+            new: r#"        if let Some(trust) = defaults.refusal().filter(|_| false) {"#,
+            run: Run::AgentTest(
+                r#"config_launch_driven"#,
+                r#"a_blocked_default_contributor_refuses_a_direct_launch"#,
+            ),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // The bare `shell` route belongs to a project entry or the fallback
+            // (E3). A user or sourced declaration that wins it replaces the normal
+            // shell and deletes the fallback.
+            name: r#"user-shell-takes-the-bare-verb"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"            let claims_bare = name != SHELL_TOOL_NAME
+                || matches!(
+                    definitions[*winner].origin(),
+                    ToolOrigin::Project(_) | ToolOrigin::BuiltIn
+                );"#,
+            new: r#"            let claims_bare = true;"#,
+            run: Run::AgentBin(r#"a_sourced_shell_does_not_take_the_defaults_over"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // Fallback suppression follows launch slots, not names. A name scan
+            // lets a qualified `home:shell`/`repo:shell` delete the affordance.
+            name: r#"fallback-suppressed-by-name"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"    let shell_fallback_added = !tools
+        .names
+        .iter()
+        .any(|slot| slot.bare.as_deref() == Some(SHELL_TOOL_NAME));"#,
+            new: r#"    let shell_fallback_added = !tools
+        .definitions
+        .iter()
+        .any(|tool| tool.name() == SHELL_TOOL_NAME);"#,
+            run: Run::AgentBin(r#"a_sourced_shell_does_not_take_the_defaults_over"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // `use_tools` is project-only by the field's rule. Clearing it while
+            // recording an `allow = false` source's inert keys hides a forbidden
+            // key behind a successful load.
+            name: r#"inert-source-use-tools-hidden"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"    raw.default_tools = None;
+    inert
+}"#,
+            new: r#"    raw.default_tools = None;
+    raw.use_tools = None;
+    inert
+}"#,
+            run: Run::AgentBin(r#"use_tools_is_project_only"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // The affordance carries its own persist list *and* the granted one, so
+            // the two are one claim set. Validating them separately lets an
+            // overlapping-but-distinct pair reach the guest-HOME link list.
+            name: r#"merged-default-persist-ownership-dropped"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"        let own = launch_closure(&definitions, &index, DefinitionId(affordance))?;
+        let merged: Vec<bool> = own
+            .iter()
+            .zip(&all_mask)
+            .map(|(own, granted)| *own || *granted)
+            .collect();
+        validate_persist_ownership(closure_definitions(&definitions, &merged))?;"#,
+            new: r#"        let _ = affordance;"#,
+            run: Run::AgentBin(r#"a_merged_default_grant_cannot_claim_a_persist_path_twice"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // E2 (revised): the shipped definitions are a shell fallback, not a
+            // second catalog behind the declarations. Appending them restores a
+            // shipped agent as a bare verb beside the declared one.
+            name: r#"shipped-catalog-behind-declarations"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"    let definitions = if defaults_apply {
+        default_tools()?
+    } else {
+        decls
+    };"#,
+            new: r#"    let definitions = if defaults_apply {
+        default_tools()?
+    } else {
+        let mut decls = decls;
+        decls.extend(default_tools()?);
+        decls
+    };"#,
+            run: Run::AgentBin(r#"shipped_definitions_are_only_a_shell_fallback"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // One classifier, two policies (F2): the writer's site question is the
+            // reader's. Dropping the tools site makes the writer insert a root
+            // image into a file whose `[[tools]]` already owns one.
+            name: r#"writer-site-classifier-bypassed"#,
+            path: r#"crates/agent-vm/src/config_schema.rs"#,
+            old: r#"    if let Some(index) = array_member_index(document.get("tools"), key) {"#,
+            new: r#"    if let Some(index) = array_member_index(document.get("tools"), key).filter(|_| false) {"#,
+            run: Run::AgentBin(r#"a_mis_scoped_image_is_refused_naming_its_table"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // #749 V3: a retired key is not a valid set name. A bare key after
+            // `[egress_sets]`/`[mount_sets]` becomes a definition *named*
+            // `allow_tools`, which a member-only walk never classifies.
+            name: r#"retired-key-set-name-unclassified"#,
+            path: r#"crates/agent-vm/src/config_schema.rs"#,
+            old: r#"            definitions.iter().position(|(name, definition)| {
+                name == key
+                    || definition
+                        .as_table()
+                        .is_some_and(|table| table.contains_key(key))
+            })"#,
+            new: r#"            definitions.values().position(|definition| {
+                definition
+                    .as_table()
+                    .is_some_and(|table| table.contains_key(key))
+            })"#,
+            run: Run::AgentBin(r#"a_retired_key_is_refused_as_a_set_name"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // A dotted spelling (`sources.image = "x"`) is the same site as an
+            // array of tables. Unclassified, it slips through as "absent".
+            name: r#"dotted-array-site-unclassified"#,
+            path: r#"crates/agent-vm/src/config_schema.rs"#,
+            old: r#"    value
+        .as_table()
+        .is_some_and(|table| table.contains_key(key))
+        .then_some(0)
+}"#,
+            new: r#"    None
+}"#,
+            run: Run::AgentBin(r#"a_dotted_array_site_is_its_own_site"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // E9: the migration sentence carries the whole migration, in order.
+            // A truncated sentence leaves the user with a deletion and no path.
+            name: r#"retired-key-migration-truncated"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"            "config: {}: {at}: {RETIRED_KEY_MIGRATION}{placement}","#,
+            new: r#"            "config: {}: {at}: allow_tools is retired{placement}","#,
+            run: Run::AgentBin(r#"allow_tools_is_refused_in_the_default_user_config"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // E3/E12: the affordance is selected by *route*, so an explicitly
+            // launched `repo:shell` never inherits the project's defaults — its
+            // exact host and port are its own.
+            name: r#"sourced-shell-takes-the-defaults-over"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"        self.bare_label.as_deref() == Some(SHELL_TOOL_NAME)
+            && !matches!(self.tool.origin(), ToolOrigin::Source { .. })"#,
+            new: r#"        self.tool.name() == SHELL_TOOL_NAME"#,
+            run: Run::AgentTest(
+                r#"config_launch_driven"#,
+                r#"the_effective_defaults_grant_exactly_the_shell_and_an_authored_direct_route"#,
+            ),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // E6: only a directly selected tool's own requirement may stop a
+            // launch. A grant that makes an inherited provider required turns a
+            // missing helper login into a hard failure.
+            name: r#"own-requirement-dropped"#,
+            path: r#"crates/agent-vm/src/launch_target.rs"#,
+            old: r#"                    required: tool.credential_providers(),"#,
+            new: r#"                    required: ProviderSet::default(),"#,
+            run: Run::AgentTest(
+                r#"config_launch_driven"#,
+                r#"the_missing_credential_matrix_separates_own_from_inherited_on_both_routes"#,
+            ),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        // #749 V5: the conflict refusal is one list grammar shared with
+        // `doctor`. Dropping the separator's spaces glues `"andsource repo"` and
+        // `"home:pi"or"repo:pi"` into the sentence a user reads.
+        Row {
+            name: r#"conflict-clause-separator-glued"#,
+            path: r#"crates/agent-vm/src/config.rs"#,
+            old: r#"        Some((last, rest)) => format!("{} {conjunction} {last}", rest.join(", ")),"#,
+            new: r#"        Some((last, rest)) => format!("{}{conjunction}{last}", rest.join(", ")),"#,
+            run: Run::AgentBin(r#"an_unqualified_conflict_names_both_candidates"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        // ---- #749 fix round 2: provenance, not the name, decides (E6/G2) ---
+        //
+        // One rule, asked from three places: which names may stop a launch, and
+        // who says so. Each row names the assertion that must die, and its
+        // neighbour is the passing control in the checkout.
+        Row {
+            // The tool route's half: only the launched tool's own `credentials`
+            // are selected. Calling every folded request selected makes an
+            // inherited helper's absence fatal again on `shell`.
+            name: r#"tool-request-provenance-widened"#,
+            path: r#"crates/agent-vm/src/launch_target.rs"#,
+            old: r#"                        let provenance = if own.contains(&service) {"#,
+            new: r#"                        let provenance = if true || own.contains(&service) {"#,
+            run: Run::AgentTest(
+                r#"config_launch_driven"#,
+                r#"an_inherited_missing_yaml_service_continues_and_a_selected_one_fails"#,
+            ),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // An unauthorized name on an inherited list leaves the helper
+            // unavailable; only a selected one is the hard error it has always
+            // been. Dropping the provenance check makes a default-provisioned
+            // name nothing authorizes refuse the command.
+            name: r#"inherited-unauthorized-name-made-fatal"#,
+            path: r#"crates/agent-vm/src/credential_resolver.rs"#,
+            old: r#"                let fatal = provenance.may_stop_launch() && policy == MissingCredentialPolicy::Fail;"#,
+            new: r#"                let fatal = policy == MissingCredentialPolicy::Fail;"#,
+            run: Run::AgentBin(r#"an_unauthorized_name_is_fatal_only_when_the_tool_selects_it"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            // The same gate for a *required* value that is missing: an inherited
+            // `required: true` login is unavailable, not fatal.
+            name: r#"inherited-requirement-made-fatal"#,
+            path: r#"crates/agent-vm/src/credential_resolver.rs"#,
+            old: r#"                (true, MissingCredentialPolicy::Fail) => (provenance.may_stop_launch(), false),"#,
+            new: r#"                (true, MissingCredentialPolicy::Fail) => (true, false),"#,
+            run: Run::AgentBin(
+                r#"a_missing_required_login_is_fatal_only_when_the_tool_selects_it"#,
+            ),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        // #749: a pending source may declare any bare tool, so a bare verb is a
+        // legitimate review. Filtering it out refuses the approval that would
+        // make the verb dispatchable.
+        Row {
+            name: r#"pending-bare-verb-refused"#,
+            path: r#"crates/agent-vm/src/cli.rs"#,
+            old: r#"            let verb = crate::config::LaunchVerb::parse(name)?;"#,
+            new: r#"            let verb = crate::config::LaunchVerb::parse(name)
+                .filter(|verb| verb.alias().is_some())?;"#,
+            run: Run::AgentBin(r#"pins_cmd::tests::a_pending_inert_source_may_supply_a_bare_verb"#),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        // #749/E8: a declaration from a default user config whose verified read
+        // failed still loads, and this verdict is the only thing refusing its
+        // launch. Bypassing it launches from bytes the read refused.
+        Row {
+            name: r#"user-tool-launch-verdict-bypassed"#,
+            path: r#"crates/agent-vm/src/cli.rs"#,
+            old: r#"                    if let Some(trust) = entry.launch_trust() {"#,
+            new: r#"                    if let Some(trust) = None::<&crate::config_authority::ReferenceTrust> {"#,
+            run: Run::AgentTest(
+                r#"config_launch_driven"#,
+                r#"an_unverified_user_configs_tool_cannot_launch"#,
+            ),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        // #749 V1: the built-in `shell` fallback already registers that clap
+        // name. Re-registering it as a hidden conflict verb aborts clap's debug
+        // assertions for *every* command of a config with two `shell`
+        // declarations, which is the ordinary configuration E3 requires to work.
+        Row {
+            name: r#"two-shell-conflict-verb-registered"#,
+            path: r#"crates/agent-vm/src/cli.rs"#,
+            old: r#"            for conflict in catalog.name_conflicts().iter().filter(|conflict| {
+                !catalog
+                    .as_slice()
+                    .iter()
+                    .any(|entry| entry.is_launched_as(conflict.name()))
+            }) {"#,
+            new: r#"            for conflict in catalog.name_conflicts().iter().filter(|_| true) {"#,
+            run: Run::AgentBin(
+                r#"config::tests::two_shell_declarations_leave_the_bare_route_to_the_fallback"#,
+            ),
+            markers: &[r#"test result: FAILED"#],
+            anchors: 1,
+        },
+        Row {
+            name: r#"default-tools-authority-operand-dropped"#,
             path: r#"crates/agent-vm/src/config_authority.rs"#,
-            old: r#"if t.network { true } else { t.mounts || t.mount_sets || t.egress_sets || t.allow_tools }"#,
+            old: r#"if t.network { true } else { t.mounts || t.mount_sets || t.egress_sets || t.default_tools }"#,
             new: r#"if t.network { true } else { t.mounts || t.mount_sets || t.egress_sets }"#,
-            run: Run::AgentBin(r#"allow_tools_presence_requires_the_verified_read"#),
+            run: Run::AgentBin(r#"default_tools_presence_requires_the_verified_read"#),
             markers: &[r#"test result: FAILED"#],
             anchors: 1,
         },
         Row {
-            name: r#"allow-tools-authority-operand-dropped-proof"#,
+            name: r#"default-tools-authority-operand-dropped-proof"#,
             path: r#"crates/agent-vm/src/config_authority.rs"#,
-            old: r#"    ensures r == (t.network || t.mounts || t.mount_sets || t.egress_sets || t.allow_tools),"#,
+            old: r#"    ensures r == (t.network || t.mounts || t.mount_sets || t.egress_sets || t.default_tools),"#,
             new: r#"    ensures r == (t.network || t.mounts || t.mount_sets || t.egress_sets),"#,
             run: Run::Proof,
             markers: &[r#"verification results::"#],
             anchors: 1,
         },
         Row {
-            name: r#"allow-tools-authority-operand-dropped-launch"#,
+            name: r#"default-tools-authority-operand-dropped-launch"#,
             path: r#"crates/agent-vm/src/config_authority.rs"#,
-            old: r#"if t.network { true } else { t.mounts || t.mount_sets || t.egress_sets || t.allow_tools }"#,
+            old: r#"if t.network { true } else { t.mounts || t.mount_sets || t.egress_sets || t.default_tools }"#,
             new: r#"if t.network { true } else { t.mounts || t.mount_sets || t.egress_sets }"#,
             run: Run::AgentTest(
                 r#"config_launch_driven"#,
-                r#"a_symlinked_config_authorizing_tools_is_refused"#,
+                r#"the_default_tools_trigger_is_verified_before_decoding"#,
             ),
-            markers: &[r#"test result: FAILED"#],
-            anchors: 1,
-        },
-        Row {
-            name: r#"allow-tools-presence-ignored"#,
-            path: r#"crates/agent-vm/src/config.rs"#,
-            old: r#"        allow_tools: raw.allow_tools.is_some(),"#,
-            new: r#"        allow_tools: false,"#,
-            run: Run::AgentBin(r#"allow_tools_presence_requires_the_verified_read"#),
-            markers: &[r#"test result: FAILED"#],
-            anchors: 1,
-        },
-        Row {
-            name: r#"allow-tools-trusted-verdict-bypassed"#,
-            path: r#"crates/agent-vm/src/config.rs"#,
-            old: r#"                references.require_for_trusted_tool().map_err(|refusal| {"#,
-            new: r#"                Ok::<(), crate::config_authority::UntrustedConfig>(()).map_err(|refusal| {"#,
-            run: Run::AgentTest(
-                r#"config_launch_driven"#,
-                r#"a_project_authorization_of_a_trusted_tool_needs_the_trusted_verdict"#,
-            ),
-            markers: &[r#"test result: FAILED"#],
-            anchors: 1,
-        },
-        Row {
-            name: r#"allow-tools-source-accepted"#,
-            path: r#"crates/agent-vm/src/config.rs"#,
-            old: r#"    if raw.egress_sets.is_some() {
-        return Err(egress_sets_refusal(path, tier));
-    }"#,
-            new: r#"    if raw.egress_sets.is_some() {
-        return Err(egress_sets_refusal(path, tier));
-    }
-    if raw.allow_tools.is_some() {
-        return Ok(());
-    }"#,
-            run: Run::AgentBin(r#"v10_an_untrusted_source_cannot_grant_authority"#),
-            markers: &[r#"test result: FAILED"#],
-            anchors: 1,
-        },
-        Row {
-            name: r#"allow-tools-closure-unchecked"#,
-            path: r#"crates/agent-vm/src/config.rs"#,
-            old: r#"        enforce_closure_authorization(
-            &definitions,
-            &visited,
-            *start,
-            &authorized,
-            &untrusted_origins,
-        )?;"#,
-            new: r#"        let _ = (
-            &definitions,
-            &visited,
-            *start,
-            &authorized,
-            &untrusted_origins,
-        );"#,
-            run: Run::AgentBin(r#"tool_closure_authorization_is_explicit"#),
             markers: &[r#"test result: FAILED"#],
             anchors: 1,
         },

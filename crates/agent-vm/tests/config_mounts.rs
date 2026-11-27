@@ -830,12 +830,12 @@ fn empty_mounts_still_requires_a_verified_file() {
     // blanket refusal of symlinked configs.
     let h = Harness::new();
     let target = h.home_root.join("dotfiles/config.toml");
-    // A symlink may carry no `allow_tools` (ADR-0040's fifth trigger), so the
+    // A symlink may carry no authority-bearing field (ADR-0040), so the
     // tool it declares is inert; what this control pins is that the *file* still
     // loads, which is why the refusal above is about `mounts`.
     write_file(
         &target,
-        "# no allow_tools\n[[tools]]\nname = \"probe\"\ncommand = \"/bin/probe\"\ncredentials = []\n",
+        "# tools-only\n[[tools]]\nname = \"probe\"\ncommand = \"/bin/probe\"\ncredentials = []\n",
     );
     h.symlink_user_config(&target);
     let out = h.launch(&[], "probe", &[]);
@@ -998,7 +998,7 @@ fn symlinked_user_config_without_mounts_still_launches() {
     // it declares is inert and the launch under it is the shell fallback. The
     // claim here is that the *file* loads without a mount field.
     h.write_user(
-        "# no allow_tools\n[[tools]]\nname = \"probe\"\ncommand = \"/bin/probe\"\ncredentials = []\n",
+        "# tools-only\n[[tools]]\nname = \"probe\"\ncommand = \"/bin/probe\"\ncredentials = []\n",
     );
     let target = h.home_root.join("dotfile");
     std::fs::rename(h.user_config(), &target).unwrap();
@@ -3002,7 +3002,7 @@ fn named_mount_sets_unsafe_file_is_refused_before_launch_state() {
     // accepted, so the refusal above is about the table and not about the mode.
     let h = Harness::new();
     h.write_user_mode(
-        "# no allow_tools\n[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\n",
+        "# tools-only\n[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\n",
         0o664,
     );
     let stderr = stderr_of(&h.launch(&[], "shell", &[]));
@@ -4447,16 +4447,16 @@ fn project_tool_mount_presence_is_inert_without_authorization() {
     // A user declaration of the same name holds the verb, so the project
     // definition is a hidden loser: legal, and its mounts never reach the launch.
     for body in [
-        "# no allow_tools\n[[tools]]\nname = \"hidden\"\ncommand = \"/bin/echo\"\n\
+        "# tools-only\n[[tools]]\nname = \"hidden\"\ncommand = \"/bin/echo\"\n\
          mounts = [\"~/x:/x:ro\"]\n"
             .to_string(),
-        "# no allow_tools\n[[tools]]\nname = \"hidden\"\ncommand = \"/bin/echo\"\n\
+        "# tools-only\n[[tools]]\nname = \"hidden\"\ncommand = \"/bin/echo\"\n\
          mounts = []\n"
             .to_string(),
     ] {
         let h = Harness::new();
         let x = seed_dir(&h, "x");
-        h.write_user("# no allow_tools\n[[tools]]\nname = \"hidden\"\ncommand = \"/bin/echo\"\n");
+        h.write_user("# tools-only\n[[tools]]\nname = \"hidden\"\ncommand = \"/bin/echo\"\n");
         h.write_project(&body);
         let out = h.launch(&[], "shell", &[]);
         let stderr = stderr_of(&out);
@@ -4474,7 +4474,7 @@ fn project_tool_mount_presence_is_inert_without_authorization() {
     // A wrong type is still refused: the declaration is parsed whether or not it
     // is reachable.
     let h = Harness::new();
-    h.write_user("# no allow_tools\n[[tools]]\nname = \"hidden\"\ncommand = \"/bin/echo\"\n");
+    h.write_user("# tools-only\n[[tools]]\nname = \"hidden\"\ncommand = \"/bin/echo\"\n");
     h.write_project("[[tools]]\nname = \"hidden\"\ncommand = \"/bin/echo\"\nmounts = 7\n");
     let before = h.before();
     let out = h.launch(&[], "shell", &[]);
@@ -4485,19 +4485,18 @@ fn project_tool_mount_presence_is_inert_without_authorization() {
     );
 }
 
-/// V8 (R5): an authorized project tool's own `mounts` are automatic config
-/// mounts, exactly like a user declaration's — selected by default, skipped by
-/// `--no-config-mounts`, and reachable again by an explicit `--mount`. The
-/// declaration cannot activate itself: it is the project's `allow_tools` entry
-/// that makes it a verb first.
+/// V8 (R5): a declared project tool's own `mounts` are automatic config mounts,
+/// exactly like a user declaration's — selected by default, skipped by
+/// `--no-config-mounts`, and reachable again by an explicit `--mount`. #749 makes
+/// the declaration its own verb, so nothing else has to activate it.
 #[test]
 fn project_tool_mounts_are_selected_then_suppressed() {
     let h = Harness::new();
     let x = seed_source(&h, "x");
     let y = seed_source(&h, "y");
-    h.write_user("# no allow_tools\n");
+    h.write_user("# tools-only\n");
     h.write_project(&format!(
-        "allow_tools = [\"hidden\"]\n[[tools]]\nname = \"hidden\"\ncommand = \"/bin/echo\"\n\
+        "[[tools]]\nname = \"hidden\"\ncommand = \"/bin/echo\"\n\
          tools = []\nmounts = [\"{}:/x:ro\"]\n",
         x.display()
     ));
@@ -4597,7 +4596,7 @@ fn empty_present_tool_mounts_require_authority_before_any_launch() {
     // is irrelevant and the launch proceeds.
     let h = Harness::new();
     h.write_user_mode(
-        "# no allow_tools\n[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\n",
+        "# tools-only\n[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\n",
         0o664,
     );
     assert!(stderr_of(&h.launch(&[], "shell", &[])).contains(CONFIG_MARKER));
@@ -4605,9 +4604,9 @@ fn empty_present_tool_mounts_require_authority_before_any_launch() {
     // The same file with `mounts = []` is authority-bearing, so the writable mode
     // is refused — before any launch state.
     for body in [
-        "# no allow_tools\n[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\nmounts = []\n",
+        "# tools-only\n[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\nmounts = []\n",
         // A wrong type is authority-bearing before the schema is decided.
-        "# no allow_tools\n[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\nmounts = 7\n",
+        "# tools-only\n[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\nmounts = 7\n",
     ] {
         let h = Harness::new();
         h.write_user_mode(body, 0o664);
@@ -4626,7 +4625,7 @@ fn empty_present_tool_mounts_require_authority_before_any_launch() {
     let target = h.home_root.join("dotfiles/config.toml");
     write_file(
         &target,
-        "# no allow_tools\n[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\nmounts = []\n",
+        "# tools-only\n[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\nmounts = []\n",
     );
     h.symlink_user_config(&target);
     let before = h.before();
@@ -4653,16 +4652,33 @@ fn declared_shell_mounts_follow_omitted_empty_and_fallback_scopes() {
              mounts = [\"~/shell-own:/shell-own:ro\"]\n{tail}"
         )
     };
-    // Omitted: the wildcard covers the same file, so the agent's list is inherited.
+    // #749: an omitted list and `tools = []` both name nothing, so the agent's
+    // list arrives only when `default_tools` grants it. E3: a user-declared
+    // `shell` is qualified (`home:shell`), so the bare verb is the shipped
+    // fallback and it is the entry a grant lands on.
     h.write_user(&shell(""));
-    let guests = verb_guests(&h, &[], "shell");
-    assert!(guests.iter().any(|guest| guest == "/agent"), "{guests:?}");
-    assert!(guests.iter().any(|guest| guest == "/shell-own"));
-    // `tools = []`: own list only.
-    h.write_user(&shell("tools = []\n"));
-    let guests = verb_guests(&h, &[], "shell");
+    let guests = verb_guests(&h, &[], "home:shell");
     assert!(!guests.iter().any(|guest| guest == "/agent"), "{guests:?}");
     assert!(guests.iter().any(|guest| guest == "/shell-own"));
+    h.write_user(&shell("tools = []\n"));
+    let guests = verb_guests(&h, &[], "home:shell");
+    assert!(!guests.iter().any(|guest| guest == "/agent"), "{guests:?}");
+    assert!(guests.iter().any(|guest| guest == "/shell-own"));
+    // The declared grant lands on the affordance (the fallback here), while the
+    // qualified declaration keeps its own list and nothing else.
+    h.write_user(&format!("default_tools = [\"agent\"]\n{}", shell("")));
+    let guests = verb_guests(&h, &[], "shell");
+    assert!(guests.iter().any(|guest| guest == "/agent"), "{guests:?}");
+    assert!(
+        !guests.iter().any(|guest| guest == "/shell-own"),
+        "the fallback is not the user's declaration: {guests:?}"
+    );
+    let guests = verb_guests(&h, &[], "home:shell");
+    assert!(
+        guests.iter().any(|guest| guest == "/shell-own"),
+        "{guests:?}"
+    );
+    assert!(!guests.iter().any(|guest| guest == "/agent"), "{guests:?}");
     // The fallback: no declared shell, so the shipped one is synthesized in a scope
     // of its own and inherits nothing — it still receives user-wide defaults.
     h.write_user(

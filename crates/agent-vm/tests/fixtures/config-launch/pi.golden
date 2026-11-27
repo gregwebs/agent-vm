@@ -29,6 +29,10 @@
   },
   "env": [
     {
+      "key": "CODEX_HOME",
+      "value": "/agent-vm-state/codex"
+    },
+    {
       "key": "HOME",
       "value": "$HOME"
     },

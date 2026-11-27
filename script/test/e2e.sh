@@ -186,13 +186,13 @@ OWNED_BUILDER=""
 # passing vacuously. `agent-vm <major>.<minor>.<patch> (...)`:
 # 0.8.1 is the first release with the host-managed tier, flat `sources`
 # (ADR-0074) and the flipped image precedence; 0.8.2 added explicit tool
-# authorization (ADR-0075), so a fixture whose `[[tools]]` block is inert
-# without `allow_tools` would otherwise launch nothing and pass the rows below
-# misleadingly; 0.8.3 is the first with `[[sources]]` tables (ADR-0076), so a
-# 0.8.2 reader would fail every seeded project config as a schema error; 0.8.4
-# pins every `trust = false` source before decoding; 0.8.5 writes the root image
-# through the verified project-config writer. Version 0.8.5 is the minimum branch
-# contract; these VM fixtures do not themselves exercise the pin gate.
+# authorization (ADR-0075); 0.8.3 is the first with `[[sources]]` tables
+# (ADR-0076), so a 0.8.2 reader would fail every seeded project config as a
+# schema error; 0.8.4 pins every `trust = false` source before decoding; 0.8.5
+# writes the root image through the verified project-config writer; 0.8.6
+# retired `allow_tools`, so every `[[tools]]` declaration is a launch verb and
+# the key is refused. Version 0.8.6 is the minimum branch contract; these VM
+# fixtures do not themselves exercise the pin gate.
 candidate_reads_host_managed_config() {
   local bin="$1" version major minor patch
   version="$("$bin" --version 2>/dev/null | awk 'NR == 1 {print $2}')" || return 1
@@ -206,12 +206,31 @@ candidate_reads_host_managed_config() {
   patch="${version#*.*.}"
   patch="${patch%%[!0-9]*}"
   [ "$major" -gt 0 ] ||
-    { [ "$major" -eq 0 ] && { [ "$minor" -gt 8 ] || { [ "$minor" -eq 8 ] && [ "$patch" -ge 5 ]; }; }; }
+    { [ "$major" -eq 0 ] && { [ "$minor" -gt 8 ] || { [ "$minor" -eq 8 ] && [ "$patch" -ge 6 ]; }; }; }
 }
 
 [[ -x "$AGENT_VM" ]] || die "launcher not found at $AGENT_VM; build it with
   ./script/build/macos.sh --dev
 or point AGENT_VM_BIN at one."
+
+# #749: the floor above is a version string, and a candidate can carry the new
+# version while still reading the old dialect. Ask the exact binary that will run
+# the fixtures: it must refuse the retired `allow_tools` key with its migration.
+# A reader that still accepts the key would load every fixture as before and the
+# rows below would exercise the old grammar rather than this branch's.
+candidate_refuses_the_retired_key() {
+  local bin="$1" home rc
+  home="$(mktemp -d "${TMPDIR:-/tmp}/agent-vm-dialect.XXXXXX")" || return 1
+  mkdir -p "$home/.config/agent-vm" || return 1
+  printf 'allow_tools = []\n' >"$home/.config/agent-vm/config.toml" || return 1
+  HOME="$home" "$bin" doctor >/dev/null 2>"$home/err"
+  rc=$?
+  if [ "$rc" -eq 0 ] || ! grep -q 'allow_tools is retired' "$home/err"; then
+    rm -rf "$home"
+    return 1
+  fi
+  rm -rf "$home"
+}
 
 # Both launch candidates must be built from this branch, not only the debug one:
 # the retained-default, upgrade and pins rows switch between them under one
@@ -219,7 +238,9 @@ or point AGENT_VM_BIN at one."
 for candidate in "$AGENT_VM" "$AGENT_VM_DEV_BIN" "$AGENT_VM_RELEASE_BIN"; do
   [[ -x "$candidate" ]] || continue
   candidate_reads_host_managed_config "$candidate" ||
-    die "the launcher at $candidate is older than 0.8.5; it reads <project>/.agent-vm/config.toml instead of the host-managed project config (ADR-0073), predates explicit tool authorization (ADR-0075), cannot read [[sources]] tables (ADR-0076), does not pin trust = false sources (ADR-0077), or has the old set-default host-record setter instead of the verified project-config writer (ADR-0078). Rebuild it from this branch."
+    die "the launcher at $candidate is older than 0.8.6; it reads <project>/.agent-vm/config.toml instead of the host-managed project config (ADR-0073), predates explicit tool authorization (ADR-0075), cannot read [[sources]] tables (ADR-0076), does not pin trust = false sources (ADR-0077), has the old set-default host-record setter instead of the verified project-config writer (ADR-0078), or still accepts the retired allow_tools key (#749). Rebuild it from this branch."
+  candidate_refuses_the_retired_key "$candidate" ||
+    die "the launcher at $candidate accepts the retired allow_tools key, so it predates #749's cutover however its version string reads; rebuild it from this branch."
 done
 
 command -v docker >/dev/null 2>&1 || die "docker is required but not on PATH"
@@ -722,6 +743,12 @@ CUSTOM_STDIN_SEED="agent-vm-e2e-258-$RUN_ID:stdin-seed-399"
 # #505: an image whose OCI labels declare network requests. Keep these literals in
 # sync with the `network-requests-labeled` target in the fixture Dockerfile.
 CUSTOM_NETREQ="agent-vm-e2e-258-$RUN_ID:network-requests-labeled"
+# The image-requests display store keys the **canonical** selected reference the
+# acquisition used (ADR-0060 R16), not the spelling passed to `--image`: an
+# unqualified Docker Hub name folds to `docker.io/library/<repo>:<tag>`. The
+# labels come from the imported content's validated config, and the store entry
+# is keyed by that canonical identity, so a store assertion must filter on it.
+CUSTOM_NETREQ_CANONICAL="docker.io/library/$CUSTOM_NETREQ"
 CUSTOM_NETREQ_BASE="deb.debian.org"
 CUSTOM_NETREQ_CODEX="api.openai.com"
 # The exact body the `stamp-present` fixture target writes to
@@ -913,7 +940,6 @@ write_custom_tools_config() {
   local dir="$1" home="${2:-$CUSTOM_HOME}"
   mkdir -p "$dir" || return 1
   write_host_project_config "$dir" "$home" >/dev/null <<'EOF' || return 1
-allow_tools = ["hello-258", "missing-258"]
 
 [[tools]]
 name = "hello-258"
@@ -972,7 +998,6 @@ printf 'credsprobe=ok\n'
 PROBE
   chmod 0755 "$dir/guestprobe.sh" || return 1
   write_host_project_config "$dir" "$home" >/dev/null <<'EOF' || return 1
-allow_tools = ["credsprobe"]
 
 [[tools]]
 name = "credsprobe"
@@ -5259,13 +5284,13 @@ custom_image_network_requests_labeled() {
     return 1
   }
   local entries
-  entries="$(jq -r --arg ref "$CUSTOM_NETREQ" \
+  entries="$(jq -r --arg ref "$CUSTOM_NETREQ_CANONICAL" \
     '[.references[] | select(.reference == $ref)] | length' "$store")" || return 1
-  assert_eq "the store holds one entry keyed by the selection" "1" "$entries" || return 1
-  jq -e --arg ref "$CUSTOM_NETREQ" --arg base "$CUSTOM_NETREQ_BASE" \
+  assert_eq "the store holds one entry keyed by the canonical selection" "1" "$entries" || return 1
+  jq -e --arg ref "$CUSTOM_NETREQ_CANONICAL" --arg base "$CUSTOM_NETREQ_BASE" \
     '.references[] | select(.reference == $ref) | .baseline.image == [$base]' \
     "$store" >/dev/null || return 1
-  jq -e --arg ref "$CUSTOM_NETREQ" --arg codex "$CUSTOM_NETREQ_CODEX" \
+  jq -e --arg ref "$CUSTOM_NETREQ_CANONICAL" --arg codex "$CUSTOM_NETREQ_CODEX" \
     '.references[] | select(.reference == $ref) | .baseline["agent.codex"] == [$codex]' \
     "$store" >/dev/null || return 1
 
@@ -5454,11 +5479,9 @@ NO_OWNED_STATE='(.mcpServers["chrome-devtools"] // null) == null'
 custom_image_integrations() {
   INTEG_PROJ="$WORK/custom-integrations"
   mkdir -p "$INTEG_PROJ" || return 1
-  # One write rather than `custom_project` plus an append: `allow_tools` has to
-  # list every name and lives above the first table header, so a block appended
-  # after `[[tools]]` could not carry its own entry.
+  # One write rather than `custom_project` plus an append, so the fixture has a
+  # single `[[tools]]` catalog rather than two concatenated ones (#749).
   write_host_project_config "$INTEG_PROJ" "$CUSTOM_HOME" >/dev/null <<'EOF' || return 1
-allow_tools = ["hello-258", "missing-258", "verify-mcp-258"]
 
 [[tools]]
 name = "hello-258"
@@ -5616,7 +5639,6 @@ printf 'hook-tool-ok uid=%s gid=%s argv=%s env=%s\n' "$(id -u)" "$(id -g)" "$*" 
 PROG
   chmod +x "$proj/bin/hook-only-258" || return 1
   write_host_project_config "$proj" "$CUSTOM_HOME" >/dev/null <<'EOF' || return 1
-allow_tools = ["hello-258", "hook-only-258"]
 
 [[tools]]
 name = "hello-258"
@@ -5645,7 +5667,6 @@ HOOK
   local nopath="custom-hook-nopath" noproj
   noproj="$(custom_project "$nopath")" || return 1
   write_host_project_config "$noproj" "$CUSTOM_HOME" >/dev/null <<'EOF' || return 1
-allow_tools = ["hook-only-258"]
 
 [[tools]]
 name = "hook-only-258"
@@ -5672,7 +5693,6 @@ printf 'pathname-tool-ok argv1=[%s] argv2=[%s]\n' "$1" "$2"
 PROG
   chmod +x "$pproj/hook dir/tool name" || return 1
   write_host_project_config "$pproj" "$CUSTOM_HOME" >/dev/null <<'EOF' || return 1
-allow_tools = ["pathname-258"]
 
 [[tools]]
 name = "pathname-258"
@@ -5996,7 +6016,6 @@ custom_image_selected_by_project_config() {
   mkdir -p "$proj" || return 1
   write_host_project_config "$proj" "$CUSTOM_HOME" >/dev/null <<EOF || return 1
 image = "$CUSTOM_MARKER"
-allow_tools = ["hello-258"]
 
 [[tools]]
 name = "hello-258"
@@ -6019,7 +6038,6 @@ EOF
   printf '?? legacy\n' >"$proj/.agent-vm/layer/Dockerfile"
   write_host_project_config "$proj" "$CUSTOM_HOME" >/dev/null <<EOF || return 1
 image = "$CUSTOM_MARKER"
-allow_tools = ["hello-258", "second-258"]
 
 [[tools]]
 name = "hello-258"
@@ -6245,7 +6263,6 @@ custom_image_setup_verification_uses_selected_ref() {
   # asserts a real guest run, not merely a resolved image.
   write_host_project_config "$proj" "$CUSTOM_HOME" >/dev/null <<EOF || result=1
 image = "$selected"
-allow_tools = ["hello-258"]
 
 [[tools]]
 name = "hello-258"
@@ -6331,7 +6348,6 @@ custom_image_setup_verification_negative() {
   mkdir -p "$proj" || return 1
   write_host_project_config "$proj" "$CUSTOM_HOME" >/dev/null <<EOF || return 1
 image = "$selected"
-allow_tools = ["absent-258"]
 
 [[tools]]
 name = "absent-258"
@@ -6359,7 +6375,6 @@ EOF
   mkdir -p "$proj" || return 1
   write_host_project_config "$proj" "$CUSTOM_HOME" >/dev/null <<EOF || return 1
 image = "$selected"
-allow_tools = ["noexec-258"]
 
 [[tools]]
 name = "noexec-258"
@@ -6658,12 +6673,12 @@ custom_image_retained_default() {
     return 1
   fi
   if ! candidate_reads_host_managed_config "$dev_bin"; then
-    echo "    BLOCKER: the debug candidate $dev_bin is older than 0.8.5 (ADR-0073, ADR-0075, ADR-0076, ADR-0077, ADR-0078);"
+    echo "    BLOCKER: the debug candidate $dev_bin is older than 0.8.6 (ADR-0073, ADR-0075, ADR-0076, ADR-0077, ADR-0078, #749);"
     echo "             rebuild it from this branch, or set AGENT_VM_DEV_BIN to one"
     return 1
   fi
   if ! candidate_reads_host_managed_config "$rel_bin"; then
-    echo "    BLOCKER: the release candidate $rel_bin is older than 0.8.5 (ADR-0073, ADR-0075, ADR-0076, ADR-0077, ADR-0078);"
+    echo "    BLOCKER: the release candidate $rel_bin is older than 0.8.6 (ADR-0073, ADR-0075, ADR-0076, ADR-0077, ADR-0078, #749);"
     echo "             rebuild it from this branch, or set AGENT_VM_RELEASE_BIN to one"
     return 1
   fi
@@ -8152,7 +8167,6 @@ custom_docker_import_workflow() {
 explicit_project() {
   mkdir -p "$BUILD_PROJECT" "$BUILD_HOME" || return 1
   write_host_project_config "$BUILD_PROJECT" "$BUILD_HOME" >/dev/null <<'CONFIG' || return 1
-allow_tools = ["shell"]
 
 [[tools]]
 name = "shell"
@@ -8581,7 +8595,6 @@ write_direct_hostile_config() {
   # Every block is *authorized* on purpose: the #398 rows prove that a direct
   # launch ignores an active catalog, so an inert catalog would prove nothing.
   write_host_project_config "$dir" "$home" >/dev/null <<'EOF' || return 1
-allow_tools = ["direct-probe-398", "direct-helper-398", "prov-control", "shell"]
 
 [[tools]]
 name = "direct-probe-398"

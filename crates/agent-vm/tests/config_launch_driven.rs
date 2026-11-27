@@ -1018,7 +1018,10 @@ fn assert_tool_dependent_content(tool: &str, config: &serde_json::Value) {
         None,
         "PATH must not be published by config for {tool}"
     );
-    let expects_codex_home = matches!(tool, "codex" | "shell");
+    // `pi` names `codex` in its `tools` list, and tool env folds over the same
+    // closure as the other facets (#749 AC2): the launched tool's own env first,
+    // then every referenced definition's.
+    let expects_codex_home = matches!(tool, "codex" | "shell" | "pi");
     assert_eq!(
         env_of("CODEX_HOME"),
         expects_codex_home.then_some("/agent-vm-state/codex"),
@@ -2324,10 +2327,13 @@ fn a_shadowed_shipped_tool_does_not_inherit_the_shipped_env() {
         ),
     ];
     for (name, definition) in cases {
+        // E3: a user-declared `shell` stays qualified, so its own definition is
+        // observed at `home:shell`; the bare verb is the shipped fallback.
+        let verb = if name == "shell" { "home:shell" } else { name };
         // Shadowed *without* `env`: the shipped CODEX_HOME is not inherited.
         let harness = Harness::warm();
         harness.write_user(&format!("[[tools]]\nname = \"{name}\"\n{definition}"));
-        let out = harness.launch_default(name);
+        let out = harness.launch_default(verb);
         let stderr = stderr_of(&out);
         assert!(
             stderr.contains(CONFIG_MARKER),
@@ -2345,7 +2351,7 @@ fn a_shadowed_shipped_tool_does_not_inherit_the_shipped_env() {
         harness.write_user(&format!(
             "[[tools]]\nname = \"{name}\"\n{definition}env = {{ CODEX_HOME = \"/agent-vm-state/codex\" }}\n"
         ));
-        let out = harness.launch_default(name);
+        let out = harness.launch_default(verb);
         let stderr = stderr_of(&out);
         assert!(
             stderr.contains(CONFIG_MARKER),
@@ -7708,9 +7714,7 @@ fn requests_unmet_launch_continues_and_proxy_order() {
 #[test]
 fn requests_of_an_authorized_tool_are_granted_and_unreported() {
     let h = Harness::warm();
-    h.write_user(&format!(
-        "allow_tools = [\"fetcher\"]\n{FETCHER}{FETCH_REQUESTS}"
-    ));
+    h.write_user(&format!("{FETCHER}{FETCH_REQUESTS}"));
     for flags in [
         vec![],
         vec!["--allow-egress", "api.example.com"],
@@ -7805,28 +7809,29 @@ fn requests_rejected_before_state_both_tiers() {
 #[test]
 fn requests_report_cap_network_refusal_and_own_tool_only() {
     // The cap applies to the unmet list, and after #735 only the shipped
-    // defaults can leave requests unmet. `pi` ships ten, so the eighth is the
-    // last shown and the remainder is one counted line.
+    // defaults can leave requests unmet. `pi` reports eleven — its own ten plus
+    // `codex`'s `api.openai.com` through the `tools` edge (#749 AC2/AC3) — so
+    // the eighth is the last shown and the remainder is one counted line.
     let h = Harness::warm();
     let stderr = stderr_of(&h.launch("pi", &[]));
     assert!(stderr.contains(CONFIG_MARKER));
     let mut expected = vec![format!(
-        "==> Tool network requests (built-in defaults): 10 of 10 not covered by this launch's {REQUEST_SCOPE}; requests never grant access and the launch continues"
+        "==> Tool network requests (built-in defaults): 11 of 11 not covered by this launch's {REQUEST_SCOPE}; requests never grant access and the launch continues"
     )];
     expected.extend(
         [
             "api.anthropic.com",
+            "api.openai.com",
             "auth.openai.com",
             "chatgpt.com",
             "cloudcode-pa.googleapis.com",
             "daily-cloudcode-pa.googleapis.com",
             "daily-cloudcode-pa.sandbox.googleapis.com",
             "mcp-proxy.anthropic.com",
-            "oauth2.googleapis.com",
         ]
         .map(|name| format!("==>   unmet: {name}")),
     );
-    expected.push("==>   … and 2 more not shown".into());
+    expected.push("==>   … and 3 more not shown".into());
     expected.push(REQUEST_HINT.into());
     assert_eq!(request_block(&stderr), expected);
     assert_eq!(stderr.matches("unmet:").count(), 8);
@@ -7843,24 +7848,43 @@ fn requests_report_cap_network_refusal_and_own_tool_only() {
         "{stderr}"
     );
     assert!(!stderr.contains(CONFIG_MARKER) && request_block(&stderr).is_empty());
-    // V10, third clause: an authorized `shell` reaching every tool through its
-    // default `tools = ["*"]` still reports only its *own* requests, so its
-    // report is empty while its sibling `a`'s is not.
+    // V10, third clause, amended by #749 AC2/AC3: a `tools` reference folds the
+    // referenced tool's requests over the same closure as its credentials, so a
+    // declared launch *grants* them rather than reporting them unmet. (A user
+    // shell is qualified, so `home:shell` names the declaration here.)
     let h = Harness::warm();
     h.write_user(
-        "allow_tools = [\"a\", \"shell\"]\n\
+        "\
          [[tools]]\nname = \"a\"\ncommand = \"a\"\nnetwork_requests = [\"a.example\"]\n\
-         [[tools]]\nname = \"shell\"\ncommand = \"bash\"\ntools = [\"*\"]\n",
+         [[tools]]\nname = \"shell\"\ncommand = \"bash\"\ntools = [\"a\"]\n",
     );
-    let out = h.launch("shell", &[]);
+    let out = h.launch("home:shell", &[]);
     let stderr = stderr_of(&out);
-    assert!(stderr.contains(CONFIG_MARKER));
-    assert!(request_block(&stderr).is_empty());
+    assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+    assert!(request_block(&stderr).is_empty(), "{stderr}");
     assert!(
-        !domain_rules_of(&normalized_config(&h, &out))
+        domain_rules_of(&normalized_config(&h, &out))
             .iter()
             .any(|(name, _)| name == "a.example"),
-        "a wildcard closure must not fold a sibling's requests"
+        "a `tools` reference folds its sibling's requests into the launch's grant"
+    );
+    let granted = Harness::warm();
+    granted.write_user(
+        "default_tools = [\"a\"]\n\
+         [[tools]]\nname = \"a\"\ncommand = \"a\"\nnetwork_requests = [\"a.example\"]\n\
+         [[tools]]\nname = \"shell\"\ncommand = \"bash\"\n",
+    );
+    let out = granted.launch("shell", &[]);
+    assert!(
+        stderr_of(&out).contains(CONFIG_MARKER),
+        "{}",
+        stderr_of(&out)
+    );
+    assert!(
+        domain_rules_of(&normalized_config(&granted, &out))
+            .iter()
+            .any(|(name, _)| name == "a.example"),
+        "the effective default_tools closure grants its declared requests"
     );
 }
 #[test]
@@ -7894,9 +7918,9 @@ fn requests_runtime_input_noninterference() {
                     // project shadow differs in credentials and tools, so it
                     // cannot supply either facet.
                     h.write_user(&format!("[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\ncredentials = [\"anthropic\"]\ntools = []\n{requests}"));
-                    h.write_project("[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\ncredentials = [\"openai\"]\ntools = [\"*\"]\n");
+                    h.write_project("[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\ncredentials = [\"openai\"]\ntools = [\"t\"]\n");
                 }
-                let out = h.launch(if tier == 2 { "t" } else { "fetcher" }, &flags);
+                let out = h.launch(if tier == 2 { "home:t" } else { "fetcher" }, &flags);
                 let stderr = stderr_of(&out);
                 assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
                 let config = normalized_config(&h, &out);
@@ -7904,8 +7928,8 @@ fn requests_runtime_input_noninterference() {
                 if tier == 2 {
                     // Built-in providers publish no guest env, so the observed
                     // provisioning facets are the proxy secret env var and the
-                    // credential state dir. Anthropic is the merge winner; the
-                    // discarded project definition names OpenAI.
+                    // credential state dir. The user's definition is launched as
+                    // `home:t`; the project's own `t` names OpenAI.
                     let secrets = registered_secret_env_vars(&config);
                     assert!(
                         secrets.contains(&"MSB_AGENT_VM_ANTHROPIC_UNUSED"),
@@ -8569,7 +8593,7 @@ fn saved_hostname_grant_merges_with_the_authorized_tools_request() {
     for saved in [false, true] {
         let h = Harness::warm();
         h.write_project(&format!(
-            "allow_tools = [\"fetcher\"]\n{FETCHER}network_requests = [\"api.example.com\"]\n"
+            "{FETCHER}network_requests = [\"api.example.com\"]\n"
         ));
         if saved {
             h.write_user_mode("[network]\nallow_egress = [\"api.example.com\"]\n", 0o600);
@@ -8602,7 +8626,7 @@ fn saved_hostname_grant_merges_with_the_authorized_tools_request() {
     // line, so a mutation that dropped reference expansion would lose it.
     let h = Harness::warm();
     h.write_project(&format!(
-        "allow_tools = [\"fetcher\"]\n{FETCHER}network_requests = [\"other.example\"]\n"
+        "{FETCHER}network_requests = [\"other.example\"]\n"
     ));
     h.write_user_mode("[network]\nallow_egress = [\"api.example.com\"]\n", 0o600);
     let out = h.launch_default("fetcher");
@@ -8704,8 +8728,11 @@ const SHIPPED_REQUESTS: [(&str, &[&str]); 7] = [
     ("dsh", &[]),
     (
         "pi",
+        // Its own ten, plus `codex`'s `api.openai.com` through the `tools` edge:
+        // every facet folds over the same visited mask (#749 AC2/AC3).
         &[
             "api.anthropic.com",
+            "api.openai.com",
             "auth.openai.com",
             "chatgpt.com",
             "cloudcode-pa.googleapis.com",
@@ -8889,22 +8916,27 @@ fn shipped_default_network_requests_noninterference() {
             _ => serde_json::to_string(value).unwrap(),
         }
     }
-    let stripped = stripped["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|tool| {
-            format!(
-                "[[tools]]\n{}\n",
-                tool.as_table()
-                    .unwrap()
-                    .iter()
-                    .map(|(key, value)| format!("{key} = {}", field(value)))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            )
-        })
-        .collect::<String>();
+    // #749: the shipped list is what makes the built-in `shell` provision its six
+    // agents, so the pasted equivalent has to carry the same grant.
+    let stripped: String =
+        "default_tools = [\"dsh\", \"pi\", \"codex\", \"opencode\", \"claude\", \"copilot\"]\n"
+            .to_string()
+            + &stripped["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| {
+                    format!(
+                        "[[tools]]\n{}\n",
+                        tool.as_table()
+                            .unwrap()
+                            .iter()
+                            .map(|(key, value)| format!("{key} = {}", field(value)))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    )
+                })
+                .collect::<String>();
     for (tool, _) in SHIPPED_REQUESTS {
         let mut captures = Vec::new();
         for project in [false, true] {
@@ -11644,11 +11676,11 @@ fn assert_only_service_sentinel(config: &serde_json::Value, selected: &str, abse
 
 /// **L1.** A launch of a project helper provisions the *project* `pi`'s
 /// provider, substitution allowlist, OAuth route, placeholder and persisted
-/// paths — never the user's, even though the user's `pi` owns the verb. Both
-/// directions run on fresh, identically configured harnesses, so a stale link or
-/// placeholder cannot make an absence assertion pass.
+/// paths — never the user's. The project definition owns the bare `pi` and the
+/// user's keeps `home:pi` (#749), so both directions run on fresh, identically
+/// configured harnesses.
 #[test]
-fn a_hidden_project_definition_supplies_the_selected_credentials_and_links() {
+fn a_project_definition_supplies_the_selected_credentials_and_links() {
     let project = Harness::warm();
     project.write_user(TIER_LOCAL_USER_PI);
     project.write_project(TIER_LOCAL_PROJECT);
@@ -11657,7 +11689,7 @@ fn a_hidden_project_definition_supplies_the_selected_credentials_and_links() {
     let config = debug_config_json(&stderr);
     assert_eq!(debug_guest_command(&stderr), "helper");
 
-    // Anthropic only: the hidden project `pi`'s requirement set, provisioned.
+    // Anthropic only: the project `pi`'s requirement set, provisioned.
     assert!(
         registered_secret_env_vars(&config).contains(&"MSB_AGENT_VM_ANTHROPIC_UNUSED"),
         "{:?}",
@@ -11719,7 +11751,7 @@ fn a_hidden_project_definition_supplies_the_selected_credentials_and_links() {
     let user = Harness::warm();
     user.write_user(TIER_LOCAL_USER_PI);
     user.write_project(TIER_LOCAL_PROJECT);
-    let out = user.launch_default("pi");
+    let out = user.launch_default("home:pi");
     let stderr = stderr_of(&out);
     let config = debug_config_json(&stderr);
     assert_eq!(debug_guest_command(&stderr), "user-pi");
@@ -11745,7 +11777,7 @@ fn a_hidden_project_definition_supplies_the_selected_credentials_and_links() {
 /// every launch, so the exclusion is real provisioning rather than an inert
 /// authorization.
 #[test]
-fn a_named_request_follows_the_hidden_closure_and_excludes_the_usable_other_tier() {
+fn a_named_request_follows_its_closure_and_excludes_the_usable_other_tier() {
     let project = Harness::warm();
     project.write_user(TIER_SERVICE_USER_PI);
     project.write_project(TIER_SERVICE_PROJECT);
@@ -11798,13 +11830,14 @@ fn a_named_request_follows_the_hidden_closure_and_excludes_the_usable_other_tier
         "the captured source must be removed from the runtime child:\n{child}"
     );
 
-    // The paired positive control: an otherwise identical *user* launch selects
-    // the user service, proving the helper excluded a genuinely usable credential.
+    // The paired positive control: an otherwise identical *user* launch
+    // (`home:pi`, since the project owns the bare name) selects the user service,
+    // proving the helper excluded a genuinely usable credential.
     let user = Harness::warm();
     user.write_user(TIER_SERVICE_USER_PI);
     user.write_project(TIER_SERVICE_PROJECT);
     write_credentials(&user.home_root, TIER_SERVICES_YAML);
-    let out = user.launch_with_env("pi", &[], &tier_launch_env());
+    let out = user.launch_with_env("home:pi", &[], &tier_launch_env());
     let stderr = stderr_of(&out);
     let rendered = rendered_output(&out);
     let config = debug_config_json(&stderr);
@@ -11828,8 +11861,10 @@ fn a_named_request_follows_the_hidden_closure_and_excludes_the_usable_other_tier
         assert!(!rendered.contains(canary), "{canary} leaked: {rendered}");
     }
 
-    // Authorization failure control: without the project authorization the user
-    // one cannot satisfy the project request.
+    // An inherited request nothing authorizes is unavailable, not fatal (#749
+    // E6): with the project's own authorization replaced by an unrelated name,
+    // the launched helper still runs, its closure's `project-service` is reported
+    // and provisioned nowhere, and the user tier's usable one stays excluded.
     let unauthorized = Harness::warm();
     unauthorized.write_user(TIER_SERVICE_USER_PI);
     unauthorized.write_project(TIER_SERVICE_PROJECT);
@@ -11839,10 +11874,28 @@ fn a_named_request_follows_the_hidden_closure_and_excludes_the_usable_other_tier
     );
     let out = unauthorized.launch_with_env("helper", &[], &tier_launch_env());
     let rendered = rendered_output(&out);
-    assert!(!out.status.success(), "{rendered}");
-    assert!(rendered.contains("neither a built-in"), "{rendered}");
-    assert!(rendered.contains("project-service"), "{rendered}");
-    assert!(!rendered.contains(CONFIG_MARKER), "{rendered}");
+    assert!(
+        rendered
+            .contains("`project-service` is neither a built-in credential provider nor authorized"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("; continuing without it"),
+        "an inherited unauthorized name never stops the command: {rendered}"
+    );
+    let config = debug_config_json(&stderr_of(&out));
+    assert!(
+        config["network"]["secrets"]
+            .get("header_credentials")
+            .is_none(),
+        "an unavailable service registers no header credential: {rendered}"
+    );
+    for absent in ["PROJECT_SERVICE_KEY", "USER_SERVICE_KEY"] {
+        assert!(
+            !env_pairs(&config).iter().any(|(key, _)| *key == absent),
+            "{absent} must not reach the guest env: {rendered}"
+        );
+    }
 }
 
 /// **L3.** Wildcard references stay in their own tier, and a wildcard that closes
@@ -11850,12 +11903,13 @@ fn a_named_request_follows_the_hidden_closure_and_excludes_the_usable_other_tier
 /// the same usable two-service authorizations as L2.
 #[test]
 fn a_wildcard_root_reaches_only_its_own_tier_and_fixed_point() {
-    // The project `pi` and `bridge` close a cycle, and the wildcard root sweeps
-    // the whole project tier.
+    // The project `pi` and `bridge` close a cycle, and `helper`'s list sweeps the
+    // whole project tier (#749: the retired `*` spelled out).
     let project_tier = "[[tools]]\nname = \"pi\"\ncommand = \"project-pi\"\n\
          credentials = [\"anthropic\", \"project-service\"]\npersist = [\".project-pi\"]\ntools = [\"bridge\"]\n\
          [[tools]]\nname = \"bridge\"\ncommand = \"bridge\"\ntools = [\"pi\"]\npersist = [\".bridge\"]\n\
-         [[tools]]\nname = \"helper\"\ncommand = \"helper\"\ntools = [\"*\"]\npersist = [\".helper\"]\n";
+         [[tools]]\nname = \"helper\"\ncommand = \"helper\"\n\
+         tools = [\"pi\", \"bridge\", \"helper\"]\npersist = [\".helper\"]\n";
     let project = Harness::warm();
     project.write_user(TIER_SERVICE_USER_PI);
     project.write_project(project_tier);
@@ -11893,7 +11947,7 @@ fn a_wildcard_root_reaches_only_its_own_tier_and_fixed_point() {
     user.write_user(TIER_SERVICE_USER_PI);
     user.write_project(project_tier);
     write_credentials(&user.home_root, TIER_SERVICES_YAML);
-    let out = user.launch_with_env("pi", &[], &tier_launch_env());
+    let out = user.launch_with_env("home:pi", &[], &tier_launch_env());
     let config = debug_config_json(&stderr_of(&out));
     assert_only_header_credential(
         &config,
@@ -11903,16 +11957,22 @@ fn a_wildcard_root_reaches_only_its_own_tier_and_fixed_point() {
     );
     assert_only_service_sentinel(&config, "USER_SERVICE_KEY", "PROJECT_SERVICE_KEY");
 
-    // A user-declared `shell` with omitted `tools` closes over its own tier only.
+    // The affordance reaches its own tier only — here through the
+    // `default_tools` grant that replaced the retired wildcard (#749). E3: the
+    // affordance is the shipped fallback, because a user-declared `shell` stays
+    // qualified, so the grant lands on the fallback and the declaration keeps its
+    // own facets at `home:shell`.
     let shell = Harness::warm();
     shell.write_user(&format!(
-        "[[tools]]\nname = \"shell\"\ncommand = \"bash\"\npersist = [\".shell\"]\n{TIER_SERVICE_USER_PI}"
+        "default_tools = [\"pi\"]\n\
+         [[tools]]\nname = \"shell\"\ncommand = \"bash\"\npersist = [\".shell\"]\n{TIER_SERVICE_USER_PI}"
     ));
     shell.write_project(TIER_SERVICE_PROJECT);
     write_credentials(&shell.home_root, TIER_SERVICES_YAML);
     let out = shell.launch_with_env("shell", &[], &tier_launch_env());
     let stderr = stderr_of(&out);
     let config = debug_config_json(&stderr);
+    assert_eq!(debug_guest_command(&stderr), "bash -O histappend");
     assert_only_header_credential(
         &config,
         "user-service",
@@ -11921,17 +11981,36 @@ fn a_wildcard_root_reaches_only_its_own_tier_and_fixed_point() {
     );
     let snap = snapshot(&state_dir(&stderr));
     assert_eq!(
+        snap.get("link:.user-pi").map(String::as_str),
+        Some("/agent-vm-state/persist/.user-pi"),
+        "the declared default reaches this tier's sibling"
+    );
+    assert!(
+        !snap.contains_key("link:.shell"),
+        "the fallback is not the user's declaration: {snap:?}"
+    );
+    assert!(!snap.contains_key("link:.project-pi"), "{snap:?}");
+    // The qualified declaration keeps its own persist path and none of the grant
+    // — on its own fresh state directory, so the affordance launch above cannot
+    // account for the link.
+    let qualified = Harness::warm();
+    qualified.write_user(&format!(
+        "default_tools = [\"pi\"]\n\
+         [[tools]]\nname = \"shell\"\ncommand = \"bash\"\npersist = [\".shell\"]\n{TIER_SERVICE_USER_PI}"
+    ));
+    qualified.write_project(TIER_SERVICE_PROJECT);
+    write_credentials(&qualified.home_root, TIER_SERVICES_YAML);
+    let out = qualified.launch_with_env("home:shell", &[], &tier_launch_env());
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+    let snap = snapshot(&state_dir(&stderr));
+    assert_eq!(
         snap.get("link:.shell").map(String::as_str),
         Some("/agent-vm-state/persist/.shell")
     );
-    assert_eq!(
-        snap.get("link:.user-pi").map(String::as_str),
-        Some("/agent-vm-state/persist/.user-pi"),
-        "the omitted wildcard reaches this tier's sibling"
-    );
-    assert!(!snap.contains_key("link:.project-pi"), "{snap:?}");
+    assert!(!snap.contains_key("link:.user-pi"), "{snap:?}");
 
-    // An explicit `tools = []` inherits nothing.
+    // No `default_tools` inherits nothing.
     let empty = Harness::warm();
     empty.write_user(&format!(
         "[[tools]]\nname = \"shell\"\ncommand = \"bash\"\ntools = []\npersist = [\".shell\"]\n{TIER_SERVICE_USER_PI}"
@@ -11946,7 +12025,7 @@ fn a_wildcard_root_reaches_only_its_own_tier_and_fixed_point() {
             .as_array()
             .map(|records| records.is_empty())
             .unwrap_or(true),
-        "an explicit empty list inherits no named request"
+        "no granted list inherits no named request"
     );
     let snap = snapshot(&state_dir(&stderr));
     assert!(!snap.contains_key("link:.user-pi"), "{snap:?}");
@@ -12155,6 +12234,219 @@ fn an_inherited_provider_never_imposes_its_missing_login_bail() {
     assert!(!stderr.contains(CONFIG_MARKER), "{stderr}");
 }
 
+/// #749 E6: **provenance**, not the name, decides whether a missing login may
+/// stop a launch. The matrix is own/inherited × present/absent × shell/direct:
+/// only a *directly selected* tool's own requirement stops the command; an
+/// inherited or default-only one that is missing leaves that helper unavailable
+/// on both routes, and no route hard-fails for it.
+#[test]
+fn the_missing_credential_matrix_separates_own_from_inherited_on_both_routes() {
+    const OWN: &str =
+        "[[tools]]\nname = \"shell\"\ncommand = \"bash\"\ncredentials = [\"anthropic\"]\n";
+    const INHERITED: &str = "default_tools = [\"helper\"]\n\
+         [[tools]]\nname = \"helper\"\ncommand = \"helper\"\ncredentials = [\"anthropic\"]\n";
+    fn absent(harness: &Harness) {
+        std::fs::remove_file(harness.home_root.join(".claude/.credentials.json")).unwrap();
+    }
+    fn direct_launch(harness: &Harness) -> Output {
+        harness.direct(DirectInvocation {
+            form: Form::Run,
+            options: &["--image", BOGUS_IMAGE],
+            vector: &["/bin/echo", "x"],
+            envs: &[],
+        })
+    }
+
+    // Own × present: the directly selected tool's own login is captured.
+    let h = Harness::warm();
+    h.write_user(OWN);
+    let stderr = stderr_of(&h.launch_default("home:shell"));
+    assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+    assert!(
+        registered_secret_env_vars(&debug_config_json(&stderr))
+            .contains(&"MSB_AGENT_VM_ANTHROPIC_UNUSED"),
+        "an own provider that is present is provisioned: {stderr}"
+    );
+
+    // Own × absent: the one case that may stop a launch, before the config dump.
+    let h = Harness::warm();
+    absent(&h);
+    h.write_user(OWN);
+    let out = h.launch_default("home:shell");
+    let stderr = stderr_of(&out);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("no usable Claude credential"), "{stderr}");
+    assert!(!stderr.contains(CONFIG_MARKER), "{stderr}");
+
+    // Inherited × present: the grant is provisioned by the shell affordance.
+    let h = Harness::warm();
+    h.write_user(INHERITED);
+    let stderr = stderr_of(&h.launch_default("shell"));
+    assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+    assert!(
+        registered_secret_env_vars(&debug_config_json(&stderr))
+            .contains(&"MSB_AGENT_VM_ANTHROPIC_UNUSED"),
+        "an inherited provider that is present is provisioned: {stderr}"
+    );
+
+    // Inherited × absent: unavailable, and the launch continues.
+    let h = Harness::warm();
+    absent(&h);
+    h.write_user(INHERITED);
+    let out = h.launch_default("shell");
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+    assert!(
+        !registered_secret_env_vars(&debug_config_json(&stderr))
+            .contains(&"MSB_AGENT_VM_ANTHROPIC_UNUSED"),
+        "an absent inherited provider registers no substitution: {stderr}"
+    );
+    assert!(
+        !stderr.contains("no usable Claude credential"),
+        "an inherited requirement never bails: {stderr}"
+    );
+
+    // Direct × present: the same inherited provenance on the other route.
+    let h = Harness::warm();
+    h.write_user(INHERITED);
+    let out = direct_launch(&h);
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+    assert!(
+        registered_secret_env_vars(&debug_config_json(&stderr))
+            .contains(&"MSB_AGENT_VM_ANTHROPIC_UNUSED"),
+        "the authored default's provider is provisioned on the direct route: {stderr}"
+    );
+
+    // Direct × absent: unavailable, and the command continues.
+    let h = Harness::warm();
+    absent(&h);
+    h.write_user(INHERITED);
+    let out = direct_launch(&h);
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+    assert!(
+        !registered_secret_env_vars(&debug_config_json(&stderr))
+            .contains(&"MSB_AGENT_VM_ANTHROPIC_UNUSED"),
+        "an absent inherited provider registers no substitution: {stderr}"
+    );
+    assert!(
+        !stderr.contains("no usable Claude credential"),
+        "a direct command never inherits a hard bail: {stderr}"
+    );
+}
+
+/// #749 E6/G2, the YAML arm of the same rule: an **inherited** or
+/// default-provisioned service name that is missing — unauthorized, or
+/// authorized and required — leaves that helper unavailable and the command
+/// continues, on both routes. A name the launched tool selects itself still
+/// stops the launch.
+///
+/// A direct command has no directly selected tool by construction, so the fatal
+/// arm exists only on the tool route; the direct route's own arm is the
+/// continuation proved beside it. `source: env` keeps every case deterministic:
+/// an unset host variable is `Missing` on any platform.
+#[test]
+fn an_inherited_missing_yaml_service_continues_and_a_selected_one_fails() {
+    const YAML: &str = "\
+credentials:
+  - service: required-service
+    source: env
+    required: true
+    apiKey:
+      name: REQUIRED_SERVICE_KEY
+      sentinelEnv: true
+      inject: [{domain: api.required-service.example, scheme: bearer}]
+";
+    // `unlisted-service` is named by no authorization at all, `required-service`
+    // is authorized and required; both are missing on this host.
+    const INHERITED: &str = "default_tools = [\"helper\"]\n\
+         [[tools]]\nname = \"helper\"\ncommand = \"/bin/echo\"\n\
+         credentials = [\"unlisted-service\", \"required-service\"]\n";
+
+    fn assert_continued(stderr: &str, label: &str) {
+        assert!(
+            stderr.contains(
+                "`unlisted-service` is neither a built-in credential provider nor authorized"
+            ),
+            "{label}: the unauthorized inherited name is reported: {stderr}"
+        );
+        assert!(
+            stderr.contains(
+                "the host environment variable `REQUIRED_SERVICE_KEY` selected by \
+                 `required-service` (`source: env`) was unset or empty"
+            ),
+            "{label}: the required inherited value is reported: {stderr}"
+        );
+        assert_eq!(
+            stderr.matches("; continuing without it").count(),
+            2,
+            "{label}: both are withheld, not fatal: {stderr}"
+        );
+        assert!(
+            debug_config_json(stderr)["network"]["secrets"]
+                .get("header_credentials")
+                .is_none(),
+            "{label}: an unavailable service registers no header credential: {stderr}"
+        );
+    }
+
+    // The shell affordance inherits both names from its effective defaults.
+    let inherited_shell = Harness::warm();
+    inherited_shell.write_user(INHERITED);
+    write_credentials(&inherited_shell.home_root, YAML);
+    let out = inherited_shell.launch("shell", &[]);
+    assert_continued(&stderr_of(&out), "shell");
+
+    // The direct route carries the same requests with the same provenance.
+    for form in DIRECT_FORMS {
+        let h = Harness::warm();
+        h.write_user(INHERITED);
+        write_credentials(&h.home_root, YAML);
+        let out = h.direct(DirectInvocation {
+            form,
+            options: &["--image", BOGUS_IMAGE],
+            vector: &["/bin/echo", "x"],
+            envs: &[],
+        });
+        assert_continued(&stderr_of(&out), &format!("direct {form:?}"));
+        assert_eq!(
+            out.status.code(),
+            Some(125),
+            "direct {form:?}: the command reaches the runtime, so nothing credential-related \
+             stopped it: {}",
+            stderr_of(&out)
+        );
+    }
+
+    // Control: the *same* two names on the launched tool's own list still stop
+    // the launch, so "inherited" is a provenance and not "nothing is fatal".
+    for (service, expected) in [
+        (
+            "unlisted-service",
+            "neither a built-in credential provider nor authorized",
+        ),
+        (
+            "required-service",
+            "the host environment variable `REQUIRED_SERVICE_KEY`",
+        ),
+    ] {
+        let own = Harness::warm();
+        own.write_user(&format!(
+            "[[tools]]\nname = \"shell\"\ncommand = \"bash\"\ncredentials = [\"{service}\"]\n"
+        ));
+        write_credentials(&own.home_root, YAML);
+        let out = own.launch("home:shell", &[]);
+        let stderr = stderr_of(&out);
+        assert_eq!(out.status.code(), Some(1), "{service}: {stderr}");
+        assert!(stderr.contains(expected), "{service}: {stderr}");
+        assert!(
+            !stderr.contains(CONFIG_MARKER),
+            "{service}: a selected missing name stops the launch: {stderr}"
+        );
+    }
+}
+
 /// **L6.** A hidden definition's persisted paths provision in both guest modes,
 /// migrate pre-existing content rather than deleting it, and refuse to resolve
 /// two sources of truth.
@@ -12324,16 +12616,16 @@ fn hidden_persisted_paths_keep_the_mount_and_symlink_guards() {
     );
 }
 
-/// **L8.** Exactly three facets cross a `tools` reference: built-in providers,
-/// requested credential names and `persist` paths. The provisioned definition's
-/// guest `env` and `network_requests` are *declaration metadata*, not
-/// provisioning, so a helper that names the hidden project `pi` gets that
-/// definition's credential and persisted path but neither its environment pair
-/// nor its declared destinations. Each of the three absence assertions sits next
-/// to a positive control on the same launch, so a launch that simply dropped the
-/// closure could not make this pass.
+/// **L8, amended by #749 AC2/AC3.** Every facet crosses a `tools` reference:
+/// built-in providers, requested credential names, `persist` paths, guest `env`
+/// and `network_requests`. All five fold over the same visited mask, so a helper
+/// that names the hidden project `pi` gets that definition's credential, its
+/// persisted path, its environment pair and its declared destinations. Each
+/// inclusion sits next to a positive control on the same launch, and the
+/// unreferenced sibling's metadata is still excluded, so neither a launch that
+/// dropped the closure nor one that folded the whole file could pass.
 #[test]
-fn a_provisioned_definition_supplies_credentials_and_paths_but_no_metadata() {
+fn a_provisioned_definition_supplies_every_folded_facet() {
     let harness = Harness::warm();
     harness.write_user(TIER_LOCAL_USER_PI);
     harness.write_project(
@@ -12372,32 +12664,21 @@ fn a_provisioned_definition_supplies_credentials_and_paths_but_no_metadata() {
     );
     assert_eq!(
         domain_rules_of(&config),
-        [("api.helper-own.example".to_owned(), vec![443])],
-        "the helper's own request is granted, and the referenced tool's is not"
+        [
+            ("api.helper-own.example".to_owned(), vec![443]),
+            ("api.pi-inherited.example".to_owned(), vec![443]),
+        ],
+        "the helper's own request and its referenced tool's are both granted"
     );
     assert!(
         request_block(&stderr).is_empty(),
         "a granted request is never reported: {stderr}"
     );
 
-    // The provisioned definition's metadata is not.
+    // The provisioned definition's metadata is.
     assert!(
-        !published_env
-            .iter()
-            .any(|(key, _)| *key == "PI_INHERITED_ENV"),
-        "a provisioned definition's env pair must not reach the guest: {published_env:?}"
-    );
-    assert!(
-        !domain_rules_of(&config)
-            .iter()
-            .any(|(name, _)| name == "api.pi-inherited.example"),
-        "a provisioned definition's network_requests must not be granted"
-    );
-    assert!(
-        !serde_json::to_string(&config)
-            .unwrap()
-            .contains("pi-inherited"),
-        "no provisioned-definition metadata may appear in the sandbox config"
+        published_env.contains(&("PI_INHERITED_ENV", "must-not-leak")),
+        "a provisioned definition's env pair reaches the launch: {published_env:?}"
     );
 }
 
@@ -12667,25 +12948,29 @@ fn tool_mount_inheritance_changes_binds_not_other_provisioning_rules() {
         "the mount opt-out must not drop the inherited provider"
     );
 
-    // Observation 4: env stays own-only and so does the granted egress: the
-    // launching tool's own pair is present and its own request is granted, while
-    // the referenced tool's env never reaches the guest and its request is never
-    // granted. (#735 turned this from an unmet-report claim into a rule claim:
-    // an authorized tool's requests are real authority.)
+    // Observation 4: env and granted egress fold over the same closure as the
+    // other facets (#749 AC2/AC3): the launching tool's own pair and its
+    // referenced tool's are both present, and both declared requests are granted.
     let env = env_pairs(&config);
     assert!(env.contains(&("T_ONLY", "t-value")), "{env:?}");
     assert!(
-        !env.iter().any(|(name, _)| *name == "U_ONLY"),
-        "a referenced tool's env must not reach the guest: {env:?}"
+        env.contains(&("U_ONLY", "u-value")),
+        "a referenced tool's env reaches the guest: {env:?}"
     );
     assert_eq!(
         domain_rules_of(&config),
-        [("t.example".to_owned(), vec![443])],
-        "the launching tool's own request is granted; the referenced tool's is not"
+        [
+            ("t.example".to_owned(), vec![443]),
+            ("u.example".to_owned(), vec![443]),
+        ],
+        "the launching tool's own request and the referenced tool's are both granted"
     );
     assert_eq!(
         domain_rules_of(&debug_config_json(&suppressed_stderr)),
-        [("t.example".to_owned(), vec![443])],
+        [
+            ("t.example".to_owned(), vec![443]),
+            ("u.example".to_owned(), vec![443]),
+        ],
         "the opt-out must not change the granted requests either"
     );
     for stderr in [&applied_stderr, &suppressed_stderr] {
@@ -12710,25 +12995,26 @@ fn shell_tool_mount_opt_out_does_not_disable_inherited_provisioning() {
              mounts = [\"~/own:/own:ro\"]\n"
         )
     };
-    // `(tail, options, expected inheritance)` rows.
-    for (label, tail, options, inherited) in [
-        ("wildcard", "", Vec::new(), true),
+    // `(default_tools, options, expected inheritance)` rows (#749: the grant is
+    // what inherits, and a mount opt-out must not change that).
+    for (label, default_tools, options, inherited) in [
+        ("granted", "default_tools = [\"agent\"]\n", Vec::new(), true),
         (
-            "wildcard under the opt-out",
-            "",
+            "granted under the opt-out",
+            "default_tools = [\"agent\"]\n",
             vec!["--no-config-mounts"],
             true,
         ),
-        ("explicit empty", "tools = []\n", Vec::new(), false),
+        ("no grant", "", Vec::new(), false),
         (
-            "explicit empty under the opt-out",
-            "tools = []\n",
+            "no grant under the opt-out",
+            "",
             vec!["--no-config-mounts"],
             false,
         ),
     ] {
         let harness = Harness::warm();
-        harness.write_user(&shell(tail));
+        harness.write_user(&format!("{default_tools}{}", shell("")));
         std::fs::create_dir_all(harness.home_root.join("own")).unwrap();
         std::fs::write(harness.home_root.join("own/marker"), "own").unwrap();
         let out = harness.launch("shell", &options);
@@ -12740,7 +13026,7 @@ fn shell_tool_mount_opt_out_does_not_disable_inherited_provisioning() {
         assert_eq!(
             env_vars.contains(&"MSB_AGENT_VM_ANTHROPIC_UNUSED"),
             inherited,
-            "{label}: the wildcard, not the mount selection, governs providers: {env_vars:?}"
+            "{label}: the grant, not the mount selection, governs providers: {env_vars:?}"
         );
         assert_eq!(
             snapshot(&state).contains_key("link:agent-state"),
@@ -13948,12 +14234,12 @@ fn a_real_secretspec_serve_round_trip() {
 // ADR-0059 → ADR-0075: `set:` is the only egress reference
 // ---------------------------------------------------------------------------
 //
-// #735 removed `tool:NAME`: authorizing a tool through `allow_tools` grants its
-// `network_requests` directly on launch, so a tool never needs an egress
-// reference. The rows below keep the claims that survive — the allowance grammar
-// now decides a `tool:`-prefixed entry, an authorized tool's own grants are
-// exact and attributed to it, and `allow_tools` is what the verified-read policy
-// guards — and the `set:` half follows in its own section.
+// #735 removed `tool:NAME`, and #749 removed `allow_tools` with it: launching a
+// declared tool grants its `network_requests` directly, so a tool never needs an
+// egress reference. The rows below keep the claims that survive — the allowance
+// grammar decides a `tool:`-prefixed entry, a declared tool's own grants are
+// exact and attributed to it, and the verified-read policy guards the launch —
+// and the `set:` half follows in its own section.
 
 /// A user `[[tools]]` declaration with the given requests.
 fn requests_tool(name: &str, requests: &[&str]) -> String {
@@ -14044,9 +14330,9 @@ fn tool_prefixed_entries_are_decided_by_the_allowance_grammar() {
 #[test]
 fn an_authorized_tool_grants_its_exact_hostnames() {
     let h = Harness::warm();
-    h.write_user(&format!(
-        "allow_tools = [\"fetcher\"]\n{}",
-        requests_tool("fetcher", &["api.example.com", "git.example.com:8443"])
+    h.write_user(&requests_tool(
+        "fetcher",
+        &["api.example.com", "git.example.com:8443"],
     ));
     let out = h.launch("fetcher", &["--allow-egress", "bare.example.com"]);
     let config = normalized_config(&h, &out);
@@ -14081,87 +14367,239 @@ fn an_authorized_tool_grants_its_exact_hostnames() {
     );
 }
 
-/// R1/R3: `allow_tools` is the launch switch. A project tool it does not list is
-/// not a verb and grants nothing; the same file listing it makes both true. The
-/// retired `tool:NAME` reference resolved only the user file's own tools, and
-/// this is the claim that replaces it.
+/// #749: a project tool needs no list to launch, and its own request is granted
+/// by the declaration that is its authority.
 #[test]
-fn an_unauthorized_project_tool_is_not_a_verb_and_grants_nothing() {
+fn a_project_tool_launches_and_grants_its_own_request() {
     let h = Harness::warm();
     h.write_user("# no tools\n");
-    h.write_project(&format!(
-        "allow_tools = []\n{}",
-        requests_tool("fetcher", &["p.example"])
-    ));
-    let out = h.launch("fetcher", &[]);
-    assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
-    let stderr = stderr_of(&out);
-    assert!(stderr.contains("unrecognized subcommand"), "{stderr}");
-    assert!(!stderr.contains("p.example"), "{stderr}");
-    assert!(!h.state_root.join(project_hash(&h.project_root)).exists());
-    assert!(
-        !h.home_root
-            .join(".config/agent-vm/image-pins.json")
-            .exists()
-    );
-
-    let h = Harness::warm();
-    h.write_user("# no tools\n");
-    h.write_project(&format!(
-        "allow_tools = [\"fetcher\"]\n{}",
-        requests_tool("fetcher", &["p.example"])
-    ));
+    h.write_project(&requests_tool("fetcher", &["p.example"]));
     let out = h.launch("fetcher", &[]);
     let config = normalized_config(&h, &out);
     assert_eq!(
         domain_rules_of(&config),
         [("p.example".to_owned(), vec![443])],
-        "authorizing the project tool grants its request"
+        "the declaration is the authority; no list is required"
     );
 }
 
-/// R1, ADR-0040's fifth trigger: `allow_tools` is authority-bearing, so a
-/// symlinked user config that declares it is refused at load with the
-/// verified-read sentence — while the same file with only inert `[[tools]]`
-/// still launches. This replaces the retired refusal of a `tool:NAME` reference
-/// against an unverified file.
+/// #749/E8: a symlinked (or shared, or multiply linked) default user config keeps
+/// ADR-0040's tools-only compatibility — it loads and the `shell` fallback still
+/// launches — but the measured verdict of that very read refuses a launch of any
+/// tool it declares, under **both** spellings of the verb. The refusal is the
+/// trusted-tool subject, not a load error.
+///
+/// The approved control runs first, on the same bytes, so a fixture that could
+/// not launch anyway cannot pass for a refusal.
 #[test]
-fn a_symlinked_config_authorizing_tools_is_refused() {
-    let tools_only = requests_tool("x", &["a.example"]);
-    let authorizing = format!("allow_tools = [\"x\"]\n{tools_only}");
+fn an_unverified_user_configs_tool_cannot_launch() {
+    let tools_only = requests_tool("x", &["x.example"]);
+    // Both spellings of one definition: the bare name it wins and the
+    // `<alias>:<name>` a sourced definition is always reachable by.
+    let verbs = ["x", "home:x"];
 
-    // Inert: a symlinked tools-only config still launches, with and without a
-    // plain hostname allowance.
-    for options in [&[][..], &["--allow-egress", "api.example.com"][..]] {
-        let h = Harness::warm();
-        let target = h.home_root.join(".config/agent-vm/dotfile");
-        write(&target, &tools_only);
-        h.symlink_user_config(&target);
-        let out = h.launch("shell", options);
-        assert!(
-            stderr_of(&out).contains(CONFIG_MARKER),
-            "a symlinked tools-only config must still launch with {options:?}: {}",
+    // Control: a regular, singly linked file that passes the verified read
+    // launches under both spellings and grants the tool's own request.
+    let h = Harness::warm();
+    h.write_user(&tools_only);
+    for verb in verbs {
+        let out = h.launch(verb, &[]);
+        assert_eq!(
+            domain_rules_of(&normalized_config(&h, &out)),
+            [("x.example".to_owned(), vec![443])],
+            "{verb}: {}",
             stderr_of(&out)
         );
     }
 
-    // `allow_tools = []` is presence, so it is refused too: this is the *field*,
-    // not the contents.
-    for body in [
-        authorizing.clone(),
-        "allow_tools = []\n".to_owned(),
-        "allow_tools = 7\n".to_owned(),
+    for (shape, needle) in [
+        (
+            "symlinked",
+            "launching a tool from the default user config requires config.toml to be a regular \
+             file, but it is reached through a symbolic link; its target may be writable by a \
+             guest or project, so review the [[tools]] definition it launches before trusting the \
+             file (a symlinked config without declaring a tool still works)",
+        ),
+        (
+            "group-writable",
+            "launching a tool from the default user config refuses a group- or other-writable \
+             config.toml; a guest or another account may have written its [[tools]] definition it \
+             launches, so review the [[tools]] definition it launches before trusting the file \
+             (fixing the mode does not establish authorship)",
+        ),
+        (
+            "directory-writable",
+            "launching a tool from the default user config refuses a config.toml whose directory is \
+             group- or other-writable; a guest or another account may be able to replace the file, \
+             so review the [[tools]] definition it launches before trusting it",
+        ),
     ] {
         let h = Harness::warm();
+        match shape {
+            "symlinked" => {
+                let target = h.home_root.join(".config/agent-vm/dotfile");
+                write(&target, &tools_only);
+                h.symlink_user_config(&target);
+            }
+            "group-writable" => h.write_user_mode(&tools_only, 0o664),
+            "directory-writable" => {
+                use std::os::unix::fs::PermissionsExt;
+                h.write_user(&tools_only);
+                std::fs::set_permissions(
+                    h.user_config().parent().unwrap(),
+                    std::fs::Permissions::from_mode(0o777),
+                )
+                .unwrap();
+            }
+            other => panic!("unknown shape {other}"),
+        }
+
+        // The file still loads for safe operations: the fallback shell launches.
+        let out = h.launch("shell", &[]);
+        assert!(
+            stderr_of(&out).contains(CONFIG_MARKER),
+            "{shape}: a tools-only file keeps ADR-0040's compatibility: {}",
+            stderr_of(&out)
+        );
+
+        // Its own declaration cannot launch, in either spelling, and nothing is
+        // created.
+        for verb in verbs {
+            let out = h.launch(verb, &[]);
+            assert_eq!(out.status.code(), Some(1), "{shape}/{verb}");
+            let stderr = stderr_of(&out);
+            assert!(
+                stderr.contains(&format!(
+                    "config: \"{}\": {needle}",
+                    h.user_config().display()
+                )),
+                "{shape}/{verb}: {stderr}"
+            );
+            assert!(!stderr.contains(CONFIG_MARKER), "{shape}/{verb}: {stderr}");
+        }
+    }
+}
+
+/// #749: a `trust = false` source's declarations are unlaunchable until the
+/// project approves its exact bytes, and launchable afterwards — under both
+/// spellings of the verb. A file that was never approved and one changed since
+/// its approval both refuse, so the pin is the gate rather than the file's name.
+#[test]
+fn an_unapproved_sources_tool_cannot_launch_and_approval_admits_it() {
+    let body = pin_source("\"--v1\"");
+    let verbs = ["echoer", "repo:echoer"];
+
+    // Approved control first: one approval admits both spellings of the verb.
+    let h = Harness::warm();
+    let source = h.project_root.join("conf/agent-vm.toml");
+    write(&source, &body);
+    h.write_project(&pin_project(true));
+    source_pins::approve(&h.home_root, &h.project_root, &source);
+    for verb in verbs {
+        let stderr = stderr_of(&pinned_launch(&h, verb));
+        assert_eq!(
+            debug_guest_command(&stderr),
+            "/bin/echo --v1",
+            "{verb}: {stderr}"
+        );
+    }
+
+    // Never approved: neither spelling dispatches, and the refusal is the pin
+    // store's, naming the bytes nobody approved.
+    let h = Harness::warm();
+    let source = h.project_root.join("conf/agent-vm.toml");
+    write(&source, &body);
+    h.write_project(&pin_project(true));
+    let pending = source_pins::sha256_hex(body.as_bytes());
+    for verb in verbs {
+        let out = pinned_launch(&h, verb);
+        let stderr = stderr_of(&out);
+        assert_eq!(out.status.code(), Some(1), "{verb}: {stderr}");
+        assert!(
+            stderr.contains(&format!("never approved (current sha256:{pending})")),
+            "{verb}: {stderr}"
+        );
+        assert!(!stderr.contains(CONFIG_MARKER), "{verb}: {stderr}");
+    }
+
+    // Changed since approval: both spellings refuse again, naming both digests.
+    let h = Harness::warm();
+    let source = h.project_root.join("conf/agent-vm.toml");
+    write(&source, &body);
+    h.write_project(&pin_project(true));
+    source_pins::approve(&h.home_root, &h.project_root, &source);
+    let changed = body.replace("--v1", "--v2");
+    write(&source, &changed);
+    let current = source_pins::sha256_hex(changed.as_bytes());
+    for verb in verbs {
+        let out = pinned_launch(&h, verb);
+        let stderr = stderr_of(&out);
+        assert_eq!(out.status.code(), Some(1), "{verb}: {stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "differs from every approved version (current sha256:{current}; last approved"
+            )),
+            "{verb}: {stderr}"
+        );
+        assert!(!stderr.contains(CONFIG_MARKER), "{verb}: {stderr}");
+    }
+}
+
+/// #749: the renamed fifth presence trigger fires before typed decode. A
+/// symlinked user config that declares `default_tools` is refused by the verified
+/// read with the field's sentence; dropping the trigger operand (the ledger's
+/// `default-tools-authority-operand-dropped-*` rows) turns this into the schema's
+/// "unknown field" instead.
+#[test]
+fn the_default_tools_trigger_is_verified_before_decoding() {
+    for body in ["default_tools = []\n", "default_tools = 7\n"] {
+        let h = Harness::new();
         let target = h.home_root.join(".config/agent-vm/dotfile");
-        write(&target, &body);
+        write(&target, body);
         h.symlink_user_config(&target);
         let out = h.launch("shell", &[]);
         assert_eq!(out.status.code(), Some(1), "{body}");
         let stderr = stderr_of(&out);
         assert!(
             stderr.contains(&format!(
-                "config: \"{}\": allow_tools requires config.toml to be a regular file, but it is reached through a symbolic link; its target may be writable by a guest or project, so review the allow_tools list before trusting the file (a symlinked config without allow_tools still works)",
+                "config: \"{}\": default_tools requires config.toml to be a regular file",
+                h.user_config().display()
+            )),
+            "{body}: {stderr}"
+        );
+        assert!(!stderr.contains("unknown field"), "{body}: {stderr}");
+    }
+}
+
+/// #749: the retired key is refused at any readable site of the user tier, and
+/// the migration wins over ADR-0040's link, mode and hard-link refusals — the
+/// reader is told what to delete, not what is wrong with the file's metadata.
+#[test]
+fn the_retired_key_is_refused_before_adr_0040_in_the_user_config() {
+    const MIGRATION: &str = "allow_tools is retired: every [[tools]] declaration is launchable, \
+         so there is no launch allow list to replace it. Delete the key, or set allow = false on \
+         a source that must supply nothing automatically; move the automatic grants you still \
+         want to default_tools = [...] before the first table header (the shell always gets them, \
+         a direct command only when you write the key); settle a bare name two sources declare \
+         with use_tools in the project config; launch one file's tool as <alias>:<tool>; and \
+         after editing a pinned source, approve its changed bytes again";
+    let bodies = [
+        format!(
+            "allow_tools = [\"x\"]\n{}",
+            requests_tool("x", &["a.example"])
+        ),
+        "allow_tools = []\n".to_owned(),
+        "allow_tools = 7\n".to_owned(),
+    ];
+    for body in bodies {
+        let h = Harness::new();
+        h.write_user_mode(&body, 0o664);
+        let out = h.launch("shell", &[]);
+        assert_eq!(out.status.code(), Some(1), "{body}");
+        let stderr = stderr_of(&out);
+        assert!(
+            stderr.contains(&format!(
+                "config: \"{}\": allow_tools: {MIGRATION}",
                 h.user_config().display()
             )),
             "{body}: {stderr}"
@@ -14170,135 +14608,18 @@ fn a_symlinked_config_authorizing_tools_is_refused() {
         assert!(!h.state_root.join(project_hash(&h.project_root)).exists());
     }
 
-    // The same bytes as a regular, singly-linked `0600` file authorize `x`, and
-    // `x` becomes the first verb.
-    let h = Harness::warm();
-    h.write_user(&authorizing);
-    let out = h.launch("x", &[]);
-    let config = normalized_config(&h, &out);
-    assert_eq!(
-        domain_rules_of(&config),
-        [("a.example".to_owned(), vec![443])]
-    );
-}
-
-/// R1: the same field in a group- or other-writable file, and in one with two
-/// hard links, is refused with its own sentence; the identical inert body loads.
-#[test]
-fn a_shared_or_linked_config_authorizing_tools_is_refused() {
-    // `# no allow_tools` keeps the fixture-authorization device away: this row is
-    // about the field's presence, so the inert body must really be inert.
-    let tools_only = format!("# no allow_tools\n{}", requests_tool("x", &["a.example"]));
-    let authorizing = format!("allow_tools = [\"x\"]\n{tools_only}");
-
-    let h = Harness::warm();
-    h.write_user_mode(&tools_only, 0o664);
-    let out = h.launch("shell", &[]);
-    assert!(
-        stderr_of(&out).contains(CONFIG_MARKER),
-        "{}",
-        stderr_of(&out)
-    );
-
-    let h = Harness::warm();
-    h.write_user_mode(&authorizing, 0o664);
-    let out = h.launch("shell", &[]);
-    assert_eq!(out.status.code(), Some(1));
-    assert!(
-        stderr_of(&out).contains(
-            "allow_tools refuses a group- or other-writable config.toml; a guest or another account may have written its allow_tools list, so review the allow_tools list before trusting the file (fixing the mode does not establish authorship)"
-        ),
-        "{}",
-        stderr_of(&out)
-    );
-
-    let h = Harness::warm();
-    h.write_user_mode(&authorizing, 0o600);
-    let alias = h.user_config().with_file_name("alias.toml");
-    std::fs::hard_link(h.user_config(), &alias).unwrap();
-    let out = h.launch("shell", &[]);
-    assert_eq!(out.status.code(), Some(1));
-    assert!(
-        stderr_of(&out).contains(
-            "allow_tools refuses a config.toml with 2 hard links; another name for it may be guest- or project-writable"
-        ),
-        "{}",
-        stderr_of(&out)
-    );
-}
-
-/// R1: `allow_tools` names tools declared in the authorizing file. A built-in
-/// tool is never authorizable, and an unqualified name the file does not declare
-/// is a load error rather than a fallback to the shipped catalog.
-#[test]
-fn allow_tools_cannot_authorize_a_built_in_tool() {
-    let h = Harness::warm();
-    h.write_user("allow_tools = [\"codex\"]\n# no [[tools]] here\n");
-    let out = h.launch("codex", &[]);
-    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
-    let stderr = stderr_of(&out);
-    assert!(
-        stderr.contains(
-            "allow_tools[0]: no tool of that name is declared in this file; declare it in a [[tools]] block above allow_tools"
-        ),
-        "{stderr}"
-    );
-    assert!(!stderr.contains(CONFIG_MARKER), "{stderr}");
-    assert!(!h.state_root.join(project_hash(&h.project_root)).exists());
-    assert!(
-        !h.home_root
-            .join(".config/agent-vm/image-pins.json")
-            .exists()
-    );
-
-    // The built-in catalog still works when nothing authorizes anything.
-    let h = Harness::warm();
-    let out = h.launch("codex", &[]);
-    assert!(
-        stderr_of(&out).contains(CONFIG_MARKER),
-        "{}",
-        stderr_of(&out)
-    );
-}
-
-/// R1/V24(b), the binary twin: a project `allow_tools` entry selecting a
-/// `:trust` tool requires that file's own verified-read verdict, and the refusal
-/// names the project file's position — before any launch state exists.
-#[test]
-fn a_project_authorization_of_a_trusted_tool_needs_the_trusted_verdict() {
-    let tools_only = requests_tool("x", &["x.example"]);
+    // The same through a symlink: migration wins over the link refusal too.
     let h = Harness::new();
     let target = h.home_root.join(".config/agent-vm/dotfile");
-    write(&target, &tools_only);
+    write(&target, "allow_tools = []\n");
     h.symlink_user_config(&target);
-    h.write_project("allow_tools = [\"home:x\"]\n");
     let out = h.launch("shell", &[]);
-    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
-    let stderr = stderr_of(&out);
+    assert_eq!(out.status.code(), Some(1));
     assert!(
-        stderr.contains(&format!(
-            "config: \"{}\": allow_tools[0]: ",
-            h.project_config().display()
+        stderr_of(&out).contains(&format!(
+            "config: \"{}\": allow_tools: {MIGRATION}",
+            h.user_config().display()
         )),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains("authorizing a :trust tool from the project config requires config.toml to be a regular file"),
-        "{stderr}"
-    );
-    assert!(!stderr.contains(CONFIG_MARKER), "{stderr}");
-    assert!(!stderr.contains("x.example"), "{stderr}");
-    assert!(!h.state_root.join(project_hash(&h.project_root)).exists());
-
-    // Control: the same symlink with an empty project list loads.
-    let h = Harness::warm();
-    let target = h.home_root.join(".config/agent-vm/dotfile");
-    write(&target, &tools_only);
-    h.symlink_user_config(&target);
-    h.write_project("allow_tools = []\n");
-    let out = h.launch("shell", &[]);
-    assert!(
-        stderr_of(&out).contains(CONFIG_MARKER),
         "{}",
         stderr_of(&out)
     );
@@ -15347,9 +15668,11 @@ fn v25_binds(stderr: &str) -> Vec<(String, String)> {
 
 /// V25(a): authorizing a tool activates **all** of its fields — command, argv,
 /// interactive shell, env, credentials, persist, mounts and network_requests —
-/// including from a non-`:trust` `repo` source.
+/// including from a non-`:trust` `repo` source. Every facet folds over the same
+/// transitive `tools` closure, so a referenced helper's env and requests reach
+/// the launch too (#749 AC2/AC3, E10).
 #[test]
-fn an_authorized_source_tool_activates_every_field() {
+fn an_authorized_source_tool_activates_every_field_of_its_closure() {
     let h = Harness::warm();
     for name in ["app-own", "helper", "unused"] {
         v25_seed(&h, name);
@@ -15357,9 +15680,7 @@ fn an_authorized_source_tool_activates_every_field() {
     h.write_user("# tools-only\n");
     write(&h.project_root.join(".agent-vm/config.toml"), &v25_repo());
     v25_approve(&h);
-    h.write_project(&v25_project(
-        "allow_tools = [\"repo:app\", \"repo:helper\", \"repo:rsh\"]\n",
-    ));
+    h.write_project(&v25_project(""));
 
     let help = stdout_of(&h.builtin(&["-h"], &[]));
     assert!(help.contains("  app  "), "app is a verb: {help}");
@@ -15377,8 +15698,8 @@ fn an_authorized_source_tool_activates_every_field() {
     let env = env_pairs(&config);
     assert!(env.contains(&("APP_OWN", "own-sentinel")), "{env:?}");
     assert!(
-        !env.iter().any(|(name, _)| *name == "HELPER_ENV"),
-        "{env:?}"
+        env.contains(&("HELPER_ENV", "helper-sentinel")),
+        "a referenced helper's env folds over the same closure: {env:?}"
     );
     assert!(
         !env.iter().any(|(name, _)| *name == "UNUSED_ENV"),
@@ -15405,9 +15726,12 @@ fn an_authorized_source_tool_activates_every_field() {
     assert!(!guests.contains(&"/unused"), "{guests:?}");
     assert_eq!(
         domain_rules_of(&config),
-        [("app.example".to_owned(), vec![443, 8443])],
-        "both of the tool's own ports are pinned, and no closure member's domain \
-         is granted"
+        [
+            ("app.example".to_owned(), vec![443, 8443]),
+            ("helper.example".to_owned(), vec![443]),
+        ],
+        "the launched tool's own ports and its referenced helper's request are \
+         both granted; the unreferenced tool's domain is not"
     );
     assert!(stderr.contains("(tool app)"), "{stderr}");
     assert!(!stderr.contains("requests never grant access"), "{stderr}");
@@ -15425,12 +15749,13 @@ fn an_authorized_source_tool_activates_every_field() {
     );
 }
 
-/// V25(b) and (c): the same repo file under `allow_tools = []` offers no verb, and
-/// a **direct** launch of the same program and argv keeps default-deny egress and
-/// none of the tool's facets.
+/// V25(b) and (c): a repo declaration activates nothing unless it is the launch
+/// (#749), and a **direct** launch of the same program and argv keeps default-deny
+/// egress and none of the tool's facets.
 #[test]
-fn an_unauthorized_source_tool_is_not_a_verb_and_a_direct_launch_keeps_deny() {
-    // (b) `allow_tools = []`: no verb, nothing activated.
+fn a_source_declaration_activates_only_its_own_launch_and_direct_keeps_deny() {
+    // (b) The declaration is a verb, but the `shell` fallback's launch activates
+    // none of its facets.
     let h = Harness::warm();
     for name in ["app-own", "helper", "unused"] {
         v25_seed(&h, name);
@@ -15438,14 +15763,7 @@ fn an_unauthorized_source_tool_is_not_a_verb_and_a_direct_launch_keeps_deny() {
     h.write_user("# tools-only\n");
     write(&h.project_root.join(".agent-vm/config.toml"), &v25_repo());
     v25_approve(&h);
-    h.write_project(&v25_project("allow_tools = []\n"));
-    let out = h.launch("app", &[]);
-    assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
-    assert!(
-        stderr_of(&out).contains("unrecognized subcommand"),
-        "{}",
-        stderr_of(&out)
-    );
+    h.write_project(&v25_project(""));
 
     let out = h.launch("shell", &[]);
     let stderr = stderr_of(&out);
@@ -15454,7 +15772,7 @@ fn an_unauthorized_source_tool_is_not_a_verb_and_a_direct_launch_keeps_deny() {
     assert_eq!(
         config["network"]["policy"]["rules"],
         serde_json::json!([]),
-        "an empty list authorizes nothing"
+        "only a launched declaration grants egress"
     );
     let guests: Vec<String> = v25_binds(&stderr)
         .into_iter()
@@ -15467,18 +15785,11 @@ fn an_unauthorized_source_tool_is_not_a_verb_and_a_direct_launch_keeps_deny() {
             .all(|(name, _)| *name != "APP_OWN")
     );
 
-    // (c) the direct launch of the very same program and argv the *authorized*
+    // (c) the direct launch of the very same program and argv the *declared*
     // tool would run — `/bin/echo --own-arg` plus the two forwarded words — keeps
-    // ADR-0036 default-deny and none of the facets. The twin config omits
-    // `allow_tools` entirely, so the same denial cannot be an artifact of the
-    // authorization.
-    for (case, allow) in [
-        (
-            "authorized",
-            "allow_tools = [\"repo:app\", \"repo:helper\", \"repo:rsh\"]\n",
-        ),
-        ("omitted", "# no allow_tools\n"),
-    ] {
+    // ADR-0036 default-deny and none of the facets, in both a project that
+    // declares tools and one that does not.
+    for (case, allow) in [("declared", ""), ("undeclared", "# no [[tools]]\n")] {
         let h = Harness::warm();
         for name in ["app-own", "helper", "unused"] {
             v25_seed(&h, name);
@@ -15520,18 +15831,18 @@ fn an_unauthorized_source_tool_is_not_a_verb_and_a_direct_launch_keeps_deny() {
     }
 }
 
-/// V25(d): ordered inheritance under a project `allow_tools = []` — the `:trust`
-/// file's own order survives, and its unauthorized tool stays inert.
+/// V25(d): ordered inheritance — the `:trust` file's own declaration order
+/// survives in the help list (#749).
 #[test]
-fn ordered_inheritance_under_an_empty_project_list() {
+fn declarations_keep_their_own_order_in_the_help_list() {
     let h = Harness::warm();
     h.write_user(
-        "allow_tools = [\"b\", \"a\"]\n\
+        "\
          [[tools]]\nname = \"a\"\ncommand = \"/bin/echo\"\n\
          [[tools]]\nname = \"b\"\ncommand = \"/bin/echo\"\n\
          [[tools]]\nname = \"c\"\ncommand = \"/bin/echo\"\n",
     );
-    h.write_project("allow_tools = []\n");
+    h.write_project("");
     let help = stdout_of(&h.builtin(&["--help"], &[]));
     let commands: Vec<&str> = commands_block(&help)
         .lines()
@@ -15539,16 +15850,16 @@ fn ordered_inheritance_under_an_empty_project_list() {
         .filter_map(|line| line.split_whitespace().next())
         .filter(|verb| ["a", "b", "c", "shell"].contains(verb))
         .collect();
-    assert_eq!(commands, ["b", "a", "shell"], "{commands:?}\n{help}");
+    assert_eq!(commands, ["a", "b", "c", "shell"], "{commands:?}\n{help}");
 
     // `sources = []` opts the trusted file out entirely: shell only.
     let h = Harness::warm();
     h.write_user(
-        "allow_tools = [\"b\", \"a\"]\n\
+        "\
          [[tools]]\nname = \"a\"\ncommand = \"/bin/echo\"\n\
          [[tools]]\nname = \"b\"\ncommand = \"/bin/echo\"\n",
     );
-    h.write_project("sources = []\nallow_tools = []\n");
+    h.write_project("sources = []\n");
     let help = stdout_of(&h.builtin(&["--help"], &[]));
     let commands: Vec<&str> = commands_block(&help)
         .lines()
@@ -15575,11 +15886,11 @@ fn pin_source(args: &str) -> String {
     format!("[[tools]]\nname = \"echoer\"\ncommand = \"/bin/echo\"\nargs = [{args}]\n")
 }
 
-/// `<allow_tools>` + one `trust = false` source, with `allow` stated by the
-/// caller so the (false, false) and (false, true) rows differ in one word.
-fn pin_project(allow_tools: &str, allow: bool) -> String {
+/// One `trust = false` source, with `allow` stated by the caller so the
+/// (false, false) and (false, true) rows differ in one word.
+fn pin_project(allow: bool) -> String {
     format!(
-        "{allow_tools}\
+        "\
          [[sources]]\nname = \"repo\"\npath = \"./conf/agent-vm.toml\"\n{}\
          ",
         if allow { "allow = true\n" } else { "" }
@@ -15620,7 +15931,7 @@ fn a_stamped_pin_launches_and_the_branch_it_reads_becomes_the_baseline() {
     let h = Harness::warm();
     let source = h.project_root.join("conf/agent-vm.toml");
     write(&source, &pin_source("\"--v1\""));
-    h.write_project(&pin_project("allow_tools = [\"repo:echoer\"]\n", false));
+    h.write_project(&pin_project(false));
     let v1 = source_pins::approve(&h.home_root, &h.project_root, &source);
     let store = pin_store(&h);
 
@@ -15709,7 +16020,7 @@ fn an_approved_allow_true_source_adopts_every_facet_and_a_byte_change_refuses() 
                 [network]\nallow_lan = true\n\
                 [[tools]]\nname = \"echoer\"\ncommand = \"/bin/echo\"\nargs = [\"--adopted\"]\n";
     write(&source, body);
-    h.write_project(&pin_project("allow_tools = [\"repo:echoer\"]\n", true));
+    h.write_project(&pin_project(true));
     source_pins::approve(&h.home_root, &h.project_root, &source);
 
     let out = pinned_launch(&h, "echoer");
@@ -15750,4 +16061,318 @@ fn an_approved_allow_true_source_adopts_every_facet_and_a_byte_change_refuses() 
         !stderr.contains(CONFIG_MARKER),
         "nothing launched: {stderr}"
     );
+}
+
+/// #749 G, the grant matrix: one authored `default_tools` list, four routes.
+///
+/// `shell` receives the effective list, a direct command receives it only
+/// because a file wrote it (E5), a bare direct command with no authored list
+/// provisions nothing (ADR-0017), and `repo:shell` keeps its own exact closure
+/// and never inherits the project's defaults (E3/E12). `openai` is the shipped
+/// provider with no hard bail, so its secret env var is the observable grant.
+#[test]
+fn the_effective_defaults_grant_exactly_the_shell_and_an_authored_direct_route() {
+    const HELPERS: &str = "[[tools]]\nname = \"helper\"\ncommand = \"/bin/echo\"\ncredentials = [\"openai\"]\npersist = [\".helper\"]\n";
+
+    // 1. `agent-vm shell` gets the effective list.
+    let shell = Harness::warm();
+    shell.write_user(&format!("default_tools = [\"helper\"]\n{HELPERS}"));
+    let stderr = stderr_of(&shell.launch("shell", &[]));
+    assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+    let config = debug_config_json(&stderr);
+    assert!(
+        registered_secret_env_vars(&config).contains(&"MSB_AGENT_VM_OPENAI_UNUSED"),
+        "the shell affordance provisions the authored default"
+    );
+    assert!(
+        snapshot(&state_dir(&stderr)).contains_key("link:.helper"),
+        "and its persist path"
+    );
+
+    // 2. A direct command gets it only because the file wrote the key.
+    let direct = Harness::warm();
+    direct.write_user(&format!("default_tools = [\"helper\"]\n{HELPERS}"));
+    let out = direct.direct(DirectInvocation {
+        form: Form::Run,
+        options: &["--image", BOGUS_IMAGE],
+        vector: &["/bin/echo", "x"],
+        envs: &[],
+    });
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+    assert_eq!(
+        debug_guest_command(&stderr),
+        "/bin/echo x",
+        "the command itself is unchanged"
+    );
+    let config = debug_config_json(&stderr);
+    assert!(
+        registered_secret_env_vars(&config).contains(&"MSB_AGENT_VM_OPENAI_UNUSED"),
+        "an authored default_tools list is honoured on the direct route too"
+    );
+    assert!(
+        snapshot(&state_dir(&stderr)).contains_key("link:.helper"),
+        "and its persist path"
+    );
+
+    // 3. With no authored list, a direct command provisions nothing — on both
+    //    spellings of the route.
+    for form in DIRECT_FORMS {
+        let bare = Harness::warm();
+        bare.write_user(HELPERS);
+        let out = bare.direct(DirectInvocation {
+            form,
+            options: &["--image", BOGUS_IMAGE],
+            vector: &["/bin/echo", "x"],
+            envs: &[],
+        });
+        let stderr = stderr_of(&out);
+        assert!(stderr.contains(CONFIG_MARKER), "{form:?}: {stderr}");
+        let config = debug_config_json(&stderr);
+        assert!(
+            registered_secret_env_vars(&config).is_empty(),
+            "{form:?}: a direct command with no authored default grants nothing"
+        );
+        assert!(
+            !snapshot(&state_dir(&stderr)).contains_key("link:.helper"),
+            "{form:?}: and links no persist path"
+        );
+    }
+
+    // 4. `repo:shell` keeps its own exact closure: its own provider, its own
+    //    persist path and its own exact host/port egress, and neither the
+    //    project's default nor its facets (E3/E12). The egress assertion is the
+    //    one the accepted-risk decision names directly: an explicitly launched
+    //    `repo:shell` must not reach the project default's hosts.
+    let sourced = Harness::warm();
+    let source = sourced.home_root.join("sourced-shell.toml");
+    write(
+        &source,
+        "[[tools]]\nname = \"shell\"\ncommand = \"bash\"\ncredentials = [\"copilot\"]\n\
+         persist = [\".sourced\"]\n\
+         network_requests = [\"sourced.example\", \"tcp://sourced.example:8443\"]\n",
+    );
+    // The project declares the default project-locally: a project that lists
+    // sources does not read the user config (ADR-0074). The default carries its
+    // own request, so a leaked grant is visible as an extra rule.
+    sourced.write_project(&format!(
+        "default_tools = [\"helper\"]\n\
+         [[tools]]\nname = \"helper\"\ncommand = \"/bin/echo\"\ncredentials = [\"openai\"]\n\
+         persist = [\".helper\"]\nnetwork_requests = [\"helper.example\"]\n\
+         [[sources]]\nname = \"repo\"\npath = {:?}\ntrust = true\nallow = true\n",
+        source.display().to_string()
+    ));
+    let out = sourced.launch("repo:shell", &[]);
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+    let config = debug_config_json(&stderr);
+    assert!(
+        !registered_secret_env_vars(&config).contains(&"MSB_AGENT_VM_OPENAI_UNUSED"),
+        "repo:shell must not inherit the project's default_tools grant"
+    );
+    assert!(
+        registered_secret_env_vars(&config).contains(&"MSB_AGENT_VM_COPILOT_UNUSED"),
+        "it keeps its own closure's provider"
+    );
+    assert_eq!(
+        domain_rules_of(&config),
+        [("sourced.example".to_owned(), vec![443, 8443])],
+        "repo:shell grants its own exact host and ports, and never the project \
+         default's host"
+    );
+    assert!(
+        request_block(&stderr).is_empty(),
+        "its own declared request is granted, not reported unmet: {stderr}"
+    );
+    let snap = snapshot(&state_dir(&stderr));
+    assert!(snap.contains_key("link:.sourced"), "{snap:?}");
+    assert!(
+        !snap.contains_key("link:.helper"),
+        "the project default's persist path must not be linked: {snap:?}"
+    );
+}
+
+/// #749 G1: the authored defaults' **named YAML** requests reach the direct
+/// route.
+///
+/// A built-in provider travels in `provisioned` on both routes already, so the
+/// grant matrix above cannot see this hole: without the requested names threaded
+/// into the direct target, a `default_tools` contributor's named service is
+/// never captured and `credentials.yaml` is never asked for it. The shell arm is
+/// the control that proves the fixture's service is provisionable at all.
+#[test]
+fn an_authored_defaults_named_service_is_provisioned_on_the_direct_route() {
+    const HELPERS: &str = "[[tools]]\nname = \"helper\"\ncommand = \"/bin/echo\"\n\
+         credentials = [\"matrix-service\"]\n";
+    const MATRIX_SERVICE_YAML: &str = "\
+credentials:
+  - service: matrix-service
+    source: env
+    apiKey:
+      name: MATRIX_SERVICE_KEY
+      sentinelEnv: true
+      inject: [{domain: api.matrix-service.example, scheme: bearer}]
+";
+    const ENVS: &[(&str, &str)] = &[("MATRIX_SERVICE_KEY", "sk-test-matrix")];
+
+    // The service's own host and sentinel are what a provisioned named
+    // credential produces, and nothing else in this fixture names it.
+    fn assert_provisioned(out: &Output, label: &str) {
+        let stderr = stderr_of(out);
+        let config = debug_config_json(&stderr);
+        let records = config["network"]["secrets"]["header_credentials"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{label}: no header_credentials: {stderr}"));
+        assert_eq!(records.len(), 1, "{label}: {records:?}");
+        assert_eq!(records[0]["reference"], "matrix-service", "{label}");
+        assert_eq!(
+            records[0]["origin"]["host"], "api.matrix-service.example",
+            "{label}"
+        );
+        assert!(
+            env_pairs(&config).contains(&("MATRIX_SERVICE_KEY", "proxy-managed")),
+            "{label}: the named service's sentinel is provisioned: {stderr}"
+        );
+    }
+
+    fn assert_unrequested(out: &Output, label: &str) {
+        let stderr = stderr_of(out);
+        let config = debug_config_json(&stderr);
+        assert!(
+            config["network"]["secrets"]
+                .get("header_credentials")
+                .is_none(),
+            "{label}: no named credential may be registered: {stderr}"
+        );
+        assert!(
+            !env_pairs(&config)
+                .iter()
+                .any(|(key, _)| *key == "MATRIX_SERVICE_KEY"),
+            "{label}: the sentinel must not reach the guest env: {stderr}"
+        );
+    }
+
+    // 1. The shell affordance gets the authored default's service.
+    let shell = Harness::warm();
+    shell.write_user(&format!("default_tools = [\"helper\"]\n{HELPERS}"));
+    write_credentials(&shell.home_root, MATRIX_SERVICE_YAML);
+    assert_provisioned(&shell.launch_with_env("shell", &[], ENVS), "shell");
+
+    // 2. A direct command gets it because a file wrote the key (E5).
+    let direct = Harness::warm();
+    direct.write_user(&format!("default_tools = [\"helper\"]\n{HELPERS}"));
+    write_credentials(&direct.home_root, MATRIX_SERVICE_YAML);
+    for form in DIRECT_FORMS {
+        let out = direct.direct(DirectInvocation {
+            form,
+            options: &["--image", BOGUS_IMAGE],
+            vector: &["/bin/echo", "x"],
+            envs: ENVS,
+        });
+        assert_provisioned(&out, &format!("direct {form:?}"));
+    }
+
+    // 3. With no authored list the same service is never requested, so the
+    //    direct route stays empty even though the host value is present.
+    let bare = Harness::warm();
+    bare.write_user(HELPERS);
+    write_credentials(&bare.home_root, MATRIX_SERVICE_YAML);
+    for form in DIRECT_FORMS {
+        let out = bare.direct(DirectInvocation {
+            form,
+            options: &["--image", BOGUS_IMAGE],
+            vector: &["/bin/echo", "x"],
+            envs: ENVS,
+        });
+        assert_unrequested(&out, &format!("direct {form:?} without default_tools"));
+    }
+
+    // The launcher must lower the direct command's own argv unchanged.
+    let stderr = stderr_of(&direct.direct(DirectInvocation {
+        form: Form::Run,
+        options: &["--image", BOGUS_IMAGE],
+        vector: &["/bin/echo", "x"],
+        envs: ENVS,
+    }));
+    assert_eq!(debug_guest_command(&stderr), "/bin/echo x", "{stderr}");
+}
+
+/// #749 E8/E10, C1: a grant is only as trustworthy as the read that declared
+/// each of its contributors — on **both** routes that build one.
+///
+/// A verified project `default_tools` naming a tool the blocked default-user
+/// file declares must refuse a direct launch with that file's verdict exactly as
+/// it refuses `shell`. A direct command that quietly provisions credentials,
+/// mounts, persist, env and egress from a file both `home:x` and `shell` refuse
+/// is a widening of authority, not a convenience.
+#[test]
+fn a_blocked_default_contributor_refuses_a_direct_launch() {
+    const BODY: &str = "[[tools]]\nname = \"x\"\ncommand = \"/bin/echo\"\n\
+         env = { X_ENV = \"x-sentinel\" }\ncredentials = [\"openai\"]\npersist = [\".x\"]\n\
+         network_requests = [\"x.example\"]\n";
+
+    // The positively measured contributor: a regular, singly linked file.
+    let clean = Harness::warm();
+    clean.write_user(BODY);
+    clean.write_project("default_tools = [\"x\"]\n");
+    for tool in ["x", "shell"] {
+        let stderr = stderr_of(&clean.launch(tool, &[]));
+        assert!(
+            stderr.contains(CONFIG_MARKER),
+            "{tool}: a verified contributor launches: {stderr}"
+        );
+    }
+    let out = clean.direct(DirectInvocation {
+        form: Form::Run,
+        options: &["--image", BOGUS_IMAGE],
+        vector: &["/bin/echo", "x"],
+        envs: &[],
+    });
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+    assert!(
+        registered_secret_env_vars(&debug_config_json(&stderr))
+            .contains(&"MSB_AGENT_VM_OPENAI_UNUSED"),
+        "the control does provision the authored default: {stderr}"
+    );
+
+    // The blocked contributor: a symlinked default user config.
+    let blocked = Harness::warm();
+    let target = blocked.home_root.join(".config/agent-vm/dotfile");
+    write(&target, BODY);
+    blocked.symlink_user_config(&target);
+    blocked.write_project("default_tools = [\"x\"]\n");
+    for tool in ["x", "shell"] {
+        let out = blocked.launch(tool, &[]);
+        let stderr = stderr_of(&out);
+        assert_eq!(out.status.code(), Some(1), "{tool}: {stderr}");
+        assert!(
+            stderr.contains("requires config.toml to be a regular file"),
+            "{tool}: {stderr}"
+        );
+        assert!(!stderr.contains(CONFIG_MARKER), "{tool}: {stderr}");
+    }
+    for form in DIRECT_FORMS {
+        let out = blocked.direct(DirectInvocation {
+            form,
+            options: &["--image", BOGUS_IMAGE],
+            vector: &["/bin/echo", "x"],
+            envs: &[],
+        });
+        let stderr = stderr_of(&out);
+        assert_eq!(
+            out.status.code(),
+            Some(125),
+            "{form:?}: a direct launch inherits its contributor's verdict, under the \
+             direct route's own status policy: {stderr}"
+        );
+        assert!(
+            stderr.contains("requires config.toml to be a regular file"),
+            "{form:?}: {stderr}"
+        );
+        assert!(
+            !stderr.contains(CONFIG_MARKER),
+            "{form:?}: nothing may be provisioned from a refused file: {stderr}"
+        );
+    }
 }

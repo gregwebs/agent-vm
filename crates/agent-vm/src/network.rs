@@ -61,8 +61,8 @@ pub(crate) struct Args {
     /// and refused with a host HTTP proxy. Bare hostnames use intercepted ports (443 by default).
     /// Use brackets for a port on an IPv6 address or CIDR.
     /// `set:NAME` grants a user-config `[egress_sets]` entry's compiled closure.
-    /// A tool's own `network_requests` need no reference: authorizing the tool in
-    /// `allow_tools` grants them for its launches (#735).
+    /// A tool's own `network_requests` need no reference: launching a declared
+    /// tool grants them for that launch (#735, #749).
     #[arg(
         long = "allow-egress",
         value_name = "[tcp://|udp://]IP|CIDR[:PORT] | [tcp://]HOST[:PORT]",
@@ -264,12 +264,12 @@ impl Plan {
             // an entry from `[network]` also removes its expansion (ADR-0059 R19).
             // With no reference the three sentences are the pre-#506 bytes.
             use crate::egress_policy::HostnameAuthority;
-            // #735: the tool clause is *additive*. With no authorized tool the
+            // #735: the tool clause is *additive*. With no configured tool the
             // sentence is one of the three pre-#735 literals, byte for byte, so a
             // launch that passes a literal `--allow-egress` still tells the reader
             // to stop passing it (D7). A tool appends its own clause, because
             // deleting a `tool:NAME` reference no longer removes this grant — only
-            // `allow_tools` does.
+            // the declaration does (#749).
             let suffix = match egress.hostname_authority() {
                 None => String::new(),
                 Some(HostnameAuthority { cli, saved, tool }) => {
@@ -310,7 +310,7 @@ impl Plan {
                     if let Some(name) = tool {
                         clauses.push(format!(
                             "authorized tool \"{name}\" grants its network_requests for this \
-                             launch; remove it from allow_tools or drop its requests"
+                             launch; remove the tool's declaration or drop its requests"
                         ));
                     }
                     if clauses.is_empty() {
@@ -2218,7 +2218,7 @@ mod tests {
         const CLI_ONLY: &str = "hostname allowances cannot be enforced through the host HTTP proxy (HTTPS_PROXY/HTTP_PROXY/ALL_PROXY): the proxy resolves the name, so the address scope is not checked; unset the proxy, use an IP/CIDR allowance, or use --allow-internet-egress (hostnames from --allow-egress, including via set:corp, apply to this launch; stop passing them)";
         const PERSISTED_ONLY: &str = "hostname allowances cannot be enforced through the host HTTP proxy (HTTPS_PROXY/HTTP_PROXY/ALL_PROXY): the proxy resolves the name, so the address scope is not checked; unset the proxy, use an IP/CIDR allowance, or use --allow-internet-egress (persisted hostname grants from \"/home/u/.config/agent-vm/config.toml\" [network], including via set:corp, apply to every launch; remove them there)";
         const BOTH: &str = "hostname allowances cannot be enforced through the host HTTP proxy (HTTPS_PROXY/HTTP_PROXY/ALL_PROXY): the proxy resolves the name, so the address scope is not checked; unset the proxy, use an IP/CIDR allowance, or use --allow-internet-egress (hostnames from --allow-egress, including via set:corp, apply to this launch; persisted hostname grants from \"/home/u/.config/agent-vm/config.toml\" [network], including via set:corp, apply to every launch; remove the persisted ones there and stop passing --allow-egress)";
-        const TOOL_ONLY: &str = "hostname allowances cannot be enforced through the host HTTP proxy (HTTPS_PROXY/HTTP_PROXY/ALL_PROXY): the proxy resolves the name, so the address scope is not checked; unset the proxy, use an IP/CIDR allowance, or use --allow-internet-egress (authorized tool \"codex\" grants its network_requests for this launch; remove it from allow_tools or drop its requests)";
+        const TOOL_ONLY: &str = "hostname allowances cannot be enforced through the host HTTP proxy (HTTPS_PROXY/HTTP_PROXY/ALL_PROXY): the proxy resolves the name, so the address scope is not checked; unset the proxy, use an IP/CIDR allowance, or use --allow-internet-egress (authorized tool \"codex\" grants its network_requests for this launch; remove the tool's declaration or drop its requests)";
         const PERSISTED_ONLY_NO_REFERENCE: &str = "hostname allowances cannot be enforced through the host HTTP proxy (HTTPS_PROXY/HTTP_PROXY/ALL_PROXY): the proxy resolves the name, so the address scope is not checked; unset the proxy, use an IP/CIDR allowance, or use --allow-internet-egress (persisted hostname grants from \"/home/u/.config/agent-vm/config.toml\" [network] apply to every launch; remove them there)";
         // A CLI *literal* alongside the persisted grants: the pre-#735 sentence,
         // including the "stop passing --allow-egress" half that the tool-era rewrite
@@ -2226,11 +2226,11 @@ mod tests {
         const BOTH_NO_REFERENCE: &str = "hostname allowances cannot be enforced through the host HTTP proxy (HTTPS_PROXY/HTTP_PROXY/ALL_PROXY): the proxy resolves the name, so the address scope is not checked; unset the proxy, use an IP/CIDR allowance, or use --allow-internet-egress (hostnames from --allow-egress apply to this launch; persisted hostname grants from \"/home/u/.config/agent-vm/config.toml\" [network] apply to every launch; remove the persisted ones there and stop passing --allow-egress)";
         // The same launch with an authorized tool: the pre-#735 sentence survives
         // whole and the tool's clause is appended.
-        const TOOL_AND_PERSISTED: &str = "hostname allowances cannot be enforced through the host HTTP proxy (HTTPS_PROXY/HTTP_PROXY/ALL_PROXY): the proxy resolves the name, so the address scope is not checked; unset the proxy, use an IP/CIDR allowance, or use --allow-internet-egress (hostnames from --allow-egress apply to this launch; persisted hostname grants from \"/home/u/.config/agent-vm/config.toml\" [network] apply to every launch; remove the persisted ones there and stop passing --allow-egress; authorized tool \"codex\" grants its network_requests for this launch; remove it from allow_tools or drop its requests)";
+        const TOOL_AND_PERSISTED: &str = "hostname allowances cannot be enforced through the host HTTP proxy (HTTPS_PROXY/HTTP_PROXY/ALL_PROXY): the proxy resolves the name, so the address scope is not checked; unset the proxy, use an IP/CIDR allowance, or use --allow-internet-egress (hostnames from --allow-egress apply to this launch; persisted hostname grants from \"/home/u/.config/agent-vm/config.toml\" [network] apply to every launch; remove the persisted ones there and stop passing --allow-egress; authorized tool \"codex\" grants its network_requests for this launch; remove the tool's declaration or drop its requests)";
         // A lone literal beside a tool: the CLI clause is emitted even though the
         // literal names no reference, because the tool's own clause alone would
         // leave the launch refused after the tool is removed (#735 review D3).
-        const TOOL_AND_CLI_LITERAL: &str = "hostname allowances cannot be enforced through the host HTTP proxy (HTTPS_PROXY/HTTP_PROXY/ALL_PROXY): the proxy resolves the name, so the address scope is not checked; unset the proxy, use an IP/CIDR allowance, or use --allow-internet-egress (hostnames from --allow-egress apply to this launch; stop passing them; authorized tool \"codex\" grants its network_requests for this launch; remove it from allow_tools or drop its requests)";
+        const TOOL_AND_CLI_LITERAL: &str = "hostname allowances cannot be enforced through the host HTTP proxy (HTTPS_PROXY/HTTP_PROXY/ALL_PROXY): the proxy resolves the name, so the address scope is not checked; unset the proxy, use an IP/CIDR allowance, or use --allow-internet-egress (hostnames from --allow-egress apply to this launch; stop passing them; authorized tool \"codex\" grants its network_requests for this launch; remove the tool's declaration or drop its requests)";
         let proxy = |v: &str| (v == "HTTPS_PROXY").then(|| "http://127.0.0.1:9".into());
         let sets = crate::egress_reference::test_support::user_namespace(
             std::path::Path::new("/home/u/.config/agent-vm/config.toml"),

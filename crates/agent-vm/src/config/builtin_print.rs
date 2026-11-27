@@ -24,9 +24,28 @@ use super::{DEFAULT_TOOLS_TOML, RawTool, builtin_raw_config, quoted_str};
 /// Every built-in tool (`names` empty), or exactly `names` in the given order, as
 /// user-config TOML. Fails, before anything is rendered, on a name that is not built
 /// in or is given twice.
+///
+/// The no-argument output is the **complete starter** (#749 E9): it carries the
+/// explicit `default_tools` header — the replacement for a retired `tools = ["*"]`
+/// — above the declarations. A named subset is blocks only and append-only: it
+/// must land under a file that already has its own top-level header, so repeating
+/// `default_tools` there would make the document invalid TOML.
 pub(crate) fn builtin_tools_toml(names: &[String]) -> Result<String> {
     let raw = builtin_raw_config(DEFAULT_TOOLS_TOML)?;
-    Ok(render(&select(&raw.tools, names)?))
+    let selected = select(&raw.tools, names)?;
+    let defaults = names.is_empty().then(|| default_tool_names(&raw.tools));
+    Ok(render(&selected, defaults.as_deref()))
+}
+
+/// The shipped list that `default_tools` replaces the retired wildcard with: every
+/// built-in definition but the shell itself — six names, five providers, and no
+/// credential requirement (E5).
+fn default_tool_names(tools: &[RawTool]) -> Vec<String> {
+    tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .filter(|name| name != super::SHELL_TOOL_NAME)
+        .collect()
 }
 
 /// Unknown names are all reported at once, and before a repeat: a typo is the more
@@ -75,15 +94,10 @@ fn select<'a>(tools: &'a [RawTool], names: &[String]) -> Result<Vec<&'a RawTool>
 }
 
 /// The three facts a reader of a pasted block needs and cannot see in the TOML:
-/// that declaring any `[[tools]]` replaces the shipped catalog, that the
-/// declarations are **inert** until a top-level `allow_tools` lists them (#735),
-/// and that a `tools` list resolves only within its own file. All three are also
-/// why the source's rationale comments are pointed at rather than reproduced.
-///
-/// The output stays *pure* `[[tools]]` blocks, with no `allow_tools` line: the
-/// documented workflow is `agent-vm tools print codex >> config.toml`, and a bare
-/// key appended after a `[[tools]]` header would be scoped into that tool table by
-/// TOML. The comment says what to add and where, above the first header.
+/// that declaring any `[[tools]]` replaces the shipped catalog, that every
+/// declaration is a launch verb (#749), and that a `tools` list resolves only
+/// within its own file. All three are also why the source's rationale comments
+/// are pointed at rather than reproduced.
 fn header() -> String {
     // The rationale line names no revision: a dirty build's line 1 does name its base
     // commit, but that SHA cannot identify the local modifications the definitions may
@@ -92,15 +106,38 @@ fn header() -> String {
     format!(
         "# Built-in tool definitions of agent-vm {}, printed by `agent-vm tools print`.\n\
          # Declaring any [[tools]] in a config file replaces the whole built-in catalog.\n\
-         # Tools are inert until listed in a top-level allow_tools = [...] before any [[tools]] block.\n\
+         # Every declared tool is a launch verb: run it by name, or as <source>:<name> for a sourced one.\n\
          # A tool's `tools` list may name only tools declared in the same file.\n\
          # Rationale comments: crates/agent-vm/src/default-tools.toml.\n",
         env!("AGENT_VM_BUILD_VERSION")
     )
 }
 
-fn render(tools: &[&RawTool]) -> String {
+/// The starter's grant header (#749 E9): what `agent-vm shell` provisions, what a
+/// direct command does *not* unless this key is written, and the only way to
+/// settle a bare name two sources declare. Every sentence is checked against the
+/// reader by a test, so the printer cannot recommend a grammar the branch refuses.
+fn defaults_header(defaults: &[String]) -> String {
+    let list: Vec<String> = defaults.iter().map(|name| basic_string(name)).collect();
+    format!(
+        "\n# What `agent-vm shell` provisions automatically: these tools'\n\
+         # credentials, persist paths, mounts, env and network requests.\n\
+         # Adopting this file opts a direct command in too (`agent-vm run …`,\n\
+         # `agent-vm -- …`); without the key a direct command provisions nothing.\n\
+         default_tools = [{}]\n\
+         # In a project `default_tools` list, a bare name two files declare is refused\n\
+         # naming both; settle it there with the qualified spelling, e.g.\n\
+         # use_tools = [\"repo:pi\"], or launch `repo:pi` directly. In this user file\n\
+         # a bare entry means this file's own tool.\n",
+        list.join(", ")
+    )
+}
+
+fn render(tools: &[&RawTool], defaults: Option<&[String]>) -> String {
     let mut out = header();
+    if let Some(defaults) = defaults {
+        out.push_str(&defaults_header(defaults));
+    }
     for tool in tools {
         out.push('\n');
         render_tool(&mut out, tool);
@@ -133,8 +170,8 @@ fn render_tool(out: &mut String, tool: &RawTool) {
     if !credentials.is_empty() {
         line(out, "credentials", &array(credentials));
     }
-    // Omitted and empty differ: an omitted `shell` list is the wildcard, so printing
-    // `tools = []` there would silently drop its provisioning.
+    // Omitted and empty are the same thing since #749: an omitted list is `[]` for
+    // every tool, and the shipped `shell` declares no `tools` of its own.
     if let Some(tools) = tools {
         line(out, "tools", &array(tools));
     }
@@ -185,12 +222,6 @@ fn toml_key(key: &str) -> String {
     }
 }
 
-/// A TOML basic string, exposed for diagnostics that give the reader something
-/// copyable to paste (the `allow_tools` entry `doctor` recommends).
-pub(crate) fn toml_string(value: &str) -> String {
-    basic_string(value)
-}
-
 /// A TOML basic string. Every character TOML forbids literally (`"`, `\`, and the
 /// control characters, DEL included) is escaped; only TOML 1.0 escapes are used.
 fn basic_string(value: &str) -> String {
@@ -224,26 +255,12 @@ mod tests {
     use proptest::prelude::*;
 
     /// The printed block pasted into a **user** config — the tier a paste lands in,
-    /// with no project file and no `$HOME`/cwd dependence — including the
-    /// `allow_tools` line #735 requires above the first `[[tools]]` header (the
-    /// printer deliberately emits none: `tools print codex >> config.toml` appends
-    /// *after* a header, where a bare key would be scoped into that table).
+    /// with no project file and no `$HOME`/cwd dependence. #749 needs no separate
+    /// list: the pasted declarations are the launch verbs.
     fn load_as_user(text: &str) -> crate::config::ConfigReport {
         let dir = tempfile::tempdir().unwrap();
         let user = dir.path().join("config.toml");
-        let mut names: Vec<String> = Vec::new();
-        for line in text.lines() {
-            if let Some(rest) = line.strip_prefix("name = ")
-                && let Some(name) = rest
-                    .trim()
-                    .strip_prefix('"')
-                    .and_then(|v| v.strip_suffix('"'))
-            {
-                names.push(format!("{name:?}"));
-            }
-        }
-        let authorized = format!("allow_tools = [{}]\n{text}", names.join(", "));
-        std::fs::write(&user, authorized).unwrap();
+        std::fs::write(&user, text).unwrap();
         load(&ConfigPaths::for_test(
             Some(user),
             dir.path().join("absent.toml"),
@@ -277,8 +294,8 @@ mod tests {
 
     /// The whole contract: the no-argument output pasted as a user file *is* the
     /// shipped catalog, down to the per-entry provisioning a launch folds. The
-    /// `shell` entry is the trap — its omitted `tools` must stay omitted, or its
-    /// wildcard provisioning silently disappears.
+    /// `shell` entry is the trap — its omitted `tools` is `[]` like every other
+    /// tool's, so the paste round-trips only because omission and `[]` agree.
     #[test]
     fn printed_catalog_round_trips_as_a_user_config() {
         let printed = builtin_tools_toml(&[]).unwrap();
@@ -301,13 +318,24 @@ mod tests {
             .into_launch_catalog()
             .expect("the pasted catalog resolves");
         let shipped_launch = default_launch_catalog().unwrap();
+        // #749 E3: a *user*-pasted `shell` stays qualified as `home:shell`, so the
+        // bare verb is the shipped fallback appended after the declarations. The
+        // pasted catalog therefore has one entry more, and the affordance that
+        // receives the starter's `default_tools` header is that fallback.
+        assert!(pasted_launch.has_shell_fallback());
+        assert!(!shipped_launch.has_shell_fallback());
         assert_eq!(
             pasted_launch.as_slice().len(),
-            shipped_launch.as_slice().len()
+            shipped_launch.as_slice().len() + 1
         );
+        let declarations = pasted_launch.as_slice().len() - 1;
+        // The agent declarations, pairwise. `shell` is last in both and is
+        // compared below, because the affordance is a different entry on each side.
+        let agents = declarations - 1;
         for (pasted, shipped) in pasted_launch
             .as_slice()
             .iter()
+            .take(agents)
             .zip(shipped_launch.as_slice())
         {
             assert_eq!(pasted.tool().name(), shipped.tool().name());
@@ -330,8 +358,18 @@ mod tests {
                 shipped.tool().name()
             );
         }
-        assert!(!pasted_launch.has_shell_fallback());
-        assert!(!shipped_launch.has_shell_fallback());
+        // The qualified declaration keeps its own facets; the fallback is the
+        // affordance and so carries the starter's `default_tools` grant exactly as
+        // the shipped catalog's own shell entry does.
+        let pasted_shell = &pasted_launch.as_slice()[agents];
+        assert_eq!(pasted_shell.label(), "home:shell");
+        assert!(pasted_shell.persist().is_empty());
+        let fallback = &pasted_launch.as_slice()[declarations];
+        let shipped_shell = &shipped_launch.as_slice()[agents];
+        assert_eq!(fallback.tool().name(), shipped_shell.tool().name());
+        assert_eq!(fallback.persist(), shipped_shell.persist());
+        assert_eq!(fallback.provisioned(), shipped_shell.provisioned());
+        assert_eq!(fallback.requested_names(), shipped_shell.requested_names());
     }
 
     #[test]
@@ -462,8 +500,8 @@ command = "b"
         format!(
             "# Built-in tool definitions of agent-vm {}, printed by `agent-vm tools print`.\n\
              # Declaring any [[tools]] in a config file replaces the whole built-in catalog.\n\
-             # Tools are inert until listed in a top-level allow_tools = [...] before any \
-             [[tools]] block.\n\
+             # Every declared tool is a launch verb: run it by name, or as \
+             <source>:<name> for a sourced one.\n\
              # A tool's `tools` list may name only tools declared in the same file.\n\
              # Rationale comments: crates/agent-vm/src/default-tools.toml.\n",
             env!("AGENT_VM_BUILD_VERSION")
@@ -475,9 +513,52 @@ command = "b"
         let raw: RawConfig = toml::from_str(SYNTHETIC).expect("the synthetic catalog parses");
         let selected: Vec<&RawTool> = raw.tools.iter().collect();
         assert_eq!(
-            render(&selected),
-            format!("{}\n{EXPECTED}", expected_header())
+            render(&selected, None),
+            format!("{}\n{EXPECTED}", expected_header()),
+            "a named subset is blocks only: no `default_tools` above them"
         );
+        // The starter's grant header, with the tool named by the SYNTHETIC list.
+        assert_eq!(
+            render(&selected, Some(&["only".to_owned()])),
+            format!(
+                "{}{}\n{EXPECTED}",
+                expected_header(),
+                defaults_header(&["only".to_owned()])
+            )
+        );
+    }
+
+    /// #749 E9: the complete starter carries the `default_tools` header and names
+    /// no retired grammar — not `allow_tools`, not a `tools = ["*"]` list.
+    #[test]
+    fn the_starter_carries_the_defaults_header_and_no_retired_grammar() {
+        let printed = builtin_tools_toml(&[]).unwrap();
+        assert!(!printed.contains("allow_tools"), "{printed}");
+        assert!(!printed.contains("\"*\""), "{printed}");
+        let document: toml::Table = toml::from_str(&printed).expect("the starter is TOML");
+        assert_eq!(
+            document
+                .get("default_tools")
+                .and_then(toml::Value::as_array),
+            Some(
+                &["dsh", "pi", "codex", "opencode", "claude", "copilot"]
+                    .iter()
+                    .map(|name| toml::Value::String((*name).to_owned()))
+                    .collect::<Vec<_>>()
+            )
+        );
+        // The shell block is printed with no `tools` line at all: its grants come
+        // from the header above, not from an omitted-list wildcard.
+        let shell_block = printed
+            .split("[[tools]]\nname = \"shell\"\n")
+            .nth(1)
+            .expect("the shell block is printed");
+        assert!(!shell_block.contains("tools ="), "{shell_block}");
+        // A named subset is append-only: no second copy of the top-level key.
+        let subset = builtin_tools_toml(&["codex".to_owned()]).unwrap();
+        assert!(!subset.contains("default_tools"), "{subset}");
+        let replaced: toml::Table = toml::from_str(&subset).expect("the subset is TOML");
+        assert_eq!(replaced.keys().collect::<Vec<_>>(), ["tools"]);
     }
 
     #[test]

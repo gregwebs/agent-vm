@@ -3,7 +3,8 @@
 //!
 //! Requests never flow into policy or provisioning **from here**. Since #735
 //! (ADR-0075) the one route by which a declared request becomes authority is the
-//! launched tool's own list, and only when `allow_tools` authorized that tool:
+//! launched tool's own list, and only when a configuration file declared that
+//! tool (#749):
 //! `egress_reference::expand` re-enters the proved grammar to turn each request
 //! into an exact `tcp://HOST:PORT` allowance. The compiled-in defaults and every
 //! direct command keep ADR-0039's non-authoritative reporting, so this module's
@@ -97,6 +98,15 @@ impl NetworkRequests {
     }
     pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = &NetworkRequest> {
         self.0.iter()
+    }
+
+    /// This set plus `other` (#749): the requests a launch grants are the union
+    /// of the launched tool's own and those of the effective `default_tools`
+    /// closure, so a facet fold never depends on which contributor came first.
+    pub(crate) fn union(&self, other: &Self) -> Self {
+        let mut requests = self.0.clone();
+        requests.extend(other.0.iter().cloned());
+        Self(requests)
     }
     pub(crate) fn bounded_display(&self) -> String {
         let (shown, hidden) = reported(self.iter());

@@ -7,17 +7,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::config::{CatalogEntry, PersistPath};
 use crate::config_mounts::ResolvedMountList;
 use crate::credential_provider::ProviderSet;
+use crate::credential_resolver::{RequestProvenance, RequestedServices};
 use crate::network_requests::{NetworkRequests, RequestTier};
 use crate::secret_store::ServiceName;
 
 pub(crate) enum LaunchTarget {
-    /// A direct command with the I/O mode dispatch already resolved for it.
+    /// A direct command with the I/O mode dispatch already resolved for it, and
+    /// the grant a *direct* command carries: the authored `default_tools` closure
+    /// and nothing else (#749 E5). Empty unless a file wrote the key.
     ///
     /// The mode is a facet of *this* target, never of the grant: a direct launch
     /// has no catalog authority, and a tool launch has no terminal policy.
     Direct {
         command: DirectCommand,
         terminal: crate::direct_terminal::DirectIo,
+        grant: CatalogGrant,
     },
     Tool {
         entry: Box<CatalogEntry>,
@@ -26,14 +30,35 @@ pub(crate) enum LaunchTarget {
 }
 
 impl LaunchTarget {
-    pub(crate) fn requested_names(&self) -> &BTreeSet<ServiceName> {
+    /// Every named YAML service this launch requests, with its provenance, on
+    /// either route.
+    ///
+    /// A direct command has no catalog entry to read them from, so it carries
+    /// the **authored** defaults' requests (#749 E5): `provisioned` speaks only
+    /// for the built-in providers, and a `default_tools` contributor's named
+    /// service reaches `credentials.yaml` through this set or not at all.
+    pub(crate) fn requested_services(&self) -> RequestedServices {
         match self {
-            Self::Tool { entry, .. } => entry.requested_names(),
-            Self::Direct { .. } => {
-                static EMPTY: std::sync::LazyLock<BTreeSet<ServiceName>> =
-                    std::sync::LazyLock::new(BTreeSet::new);
-                &EMPTY
+            Self::Tool { entry, .. } => {
+                // Only the launched tool's own `credentials` are *selected*: its
+                // own local `tools` closure and the effective `default_tools`
+                // add provisioning, never a hard bail (#749 E6).
+                let own = entry.tool().credential_names();
+                entry
+                    .requested_names()
+                    .iter()
+                    .cloned()
+                    .map(|service| {
+                        let provenance = if own.contains(&service) {
+                            RequestProvenance::Selected
+                        } else {
+                            RequestProvenance::Inherited
+                        };
+                        (service, provenance)
+                    })
+                    .collect()
             }
+            Self::Direct { grant, .. } => grant.requested_services(),
         }
     }
 
@@ -43,7 +68,11 @@ impl LaunchTarget {
 
     pub(crate) fn into_parts(self) -> (CatalogGrant, GuestInvocation) {
         match self {
-            Self::Direct { command, terminal } => {
+            Self::Direct {
+                command,
+                terminal,
+                grant,
+            } => {
                 let invocation = GuestInvocation {
                     display: crate::config::escape_str(command.program()),
                     program: command.program,
@@ -51,30 +80,41 @@ impl LaunchTarget {
                     guard: ProgramGuard::Direct,
                     direct_io: Some(terminal),
                 };
-                (CatalogGrant::none(), invocation)
+                (grant, invocation)
             }
             Self::Tool { entry, tool_args } => {
                 let tool = entry.tool();
                 let grant = CatalogGrant {
                     provisioned: entry.provisioned(),
+                    // Only a *directly selected* tool's own requirement may stop
+                    // a launch: a grant inherited from `default_tools` adds
+                    // provisioning, never a hard bail (#749 E6).
                     required: tool.credential_providers(),
+                    // A tool launch reads its requests from the entry, which
+                    // folded them over its own closure and the defaults.
+                    requested_names: BTreeSet::new(),
                     persist: entry.persist().to_vec(),
                     // The entry's own folded facet, borrowed as a shared handle:
                     // lowering must not re-resolve, re-parse or copy declarations.
                     mounts: entry.mounts().clone(),
-                    guest_env: tool.guest_env().clone(),
+                    // The entry's folded env: the tool's own, plus whatever the
+                    // effective `default_tools` closure brings (#749).
+                    guest_env: entry.guest_env().clone(),
                     // #735: authorization is what makes a tool's own
                     // `network_requests` authoritative egress. The compiled-in
                     // defaults keep ADR-0039's non-authoritative report.
+                    // The folded requests, for the same reason as `guest_env`:
+                    // a built-in contributor's stay report-only, so the shipped
+                    // list grants no egress request on its own (#749 E5).
                     tool_egress: Some(if entry.is_authorized_egress() {
                         ToolEgress::Authorized {
                             tool_name: tool.name().to_owned(),
-                            requests: tool.network_requests().clone(),
+                            requests: entry.network_requests().clone(),
                         }
                     } else {
                         ToolEgress::UnmetOnly {
                             tier: RequestTier::from(tool.origin()),
-                            requests: tool.network_requests().clone(),
+                            requests: entry.network_requests().clone(),
                         }
                     }),
                 };
@@ -101,7 +141,7 @@ impl LaunchTarget {
 /// ADR-0039 unmet report. A named enum rather than a boolean beside the requests,
 /// so a call site cannot grant without knowing which case it is in.
 pub(crate) enum ToolEgress {
-    /// Selected by an `allow_tools` entry (or a `:trust` inheritance): its own
+    /// A configuration file declared it, so its own
     /// `network_requests` become hostname allowances for this launch.
     Authorized {
         tool_name: String,
@@ -142,6 +182,9 @@ impl ToolEgress {
 pub(crate) struct CatalogGrant {
     provisioned: ProviderSet,
     required: ProviderSet,
+    /// The named YAML services this grant's closure requests. Empty for a tool
+    /// launch, whose entry carries them (see [`LaunchTarget::requested_names`]).
+    requested_names: BTreeSet<ServiceName>,
     persist: Vec<PersistPath>,
     /// The selected entry's config mount declarations, own plus inherited. Empty
     /// for a direct launch, which still receives user-wide defaults and explicit
@@ -156,17 +199,69 @@ impl CatalogGrant {
         Self {
             provisioned: ProviderSet::default(),
             required: ProviderSet::default(),
+            requested_names: BTreeSet::new(),
             persist: Vec::new(),
             mounts: ResolvedMountList::empty(),
             guest_env: BTreeMap::new(),
             tool_egress: None,
         }
     }
+
+    /// A direct command's grant: the **authored** `default_tools` closure and
+    /// nothing else (#749 E5).
+    ///
+    /// `required` stays empty on purpose: an inherited default's missing login
+    /// leaves that helper unavailable, never the command fatal (E6). The egress
+    /// request set is the closure's *declared* contributors', so a built-in one
+    /// still grants nothing.
+    ///
+    /// The contributors must pass the same verified-read verdict the shell route
+    /// requires before it launches (#749 E8/E10): a grant built from a read that
+    /// refused cannot be built here either, so both routes share one rule.
+    pub(crate) fn from_defaults(defaults: &crate::config::DefaultFacets) -> anyhow::Result<Self> {
+        if let Some(trust) = defaults.refusal() {
+            trust.require_for_trusted_tool().map_err(|refusal| {
+                anyhow::anyhow!(
+                    "config: {}: {refusal}",
+                    crate::one_line::quoted_path(trust.file())
+                )
+            })?;
+        }
+        if defaults.is_empty() {
+            // No file wrote `default_tools`: a direct command provisions nothing,
+            // exactly as it did before the field existed (ADR-0017, E5).
+            return Ok(Self::none());
+        }
+        let tool_egress =
+            (!defaults.network_requests().is_empty()).then(|| ToolEgress::Authorized {
+                tool_name: crate::launch_target::DIRECT_RUN_VERB.to_owned(),
+                requests: defaults.network_requests().clone(),
+            });
+        Ok(Self {
+            provisioned: defaults.provisioned(),
+            required: ProviderSet::default(),
+            requested_names: defaults.requested_names().clone(),
+            persist: defaults.persist().to_vec(),
+            mounts: defaults.mounts().clone(),
+            guest_env: defaults.guest_env().clone(),
+            tool_egress,
+        })
+    }
     pub(crate) fn provisioned(&self) -> ProviderSet {
         self.provisioned
     }
     pub(crate) fn required(&self) -> ProviderSet {
         self.required
+    }
+    /// A direct command has no directly selected tool, so every authored
+    /// default's request is inherited: none of them may stop the command (#749
+    /// E6).
+    pub(crate) fn requested_services(&self) -> RequestedServices {
+        self.requested_names
+            .iter()
+            .cloned()
+            .map(|service| (service, RequestProvenance::Inherited))
+            .collect()
     }
     pub(crate) fn persist(&self) -> &[PersistPath] {
         &self.persist
@@ -268,8 +363,9 @@ mod tests {
         let target = LaunchTarget::Direct {
             command,
             terminal: crate::direct_terminal::DirectIo::Pty,
+            grant: CatalogGrant::none(),
         };
-        assert!(target.requested_names().is_empty());
+        assert!(target.requested_services().is_empty());
         assert!(target.is_direct());
         let (grant, invocation) = target.into_parts();
         assert_eq!(grant.provisioned().iter().count(), 0);
@@ -301,11 +397,7 @@ mod tests {
         let user_dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(user_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let user = user_dir.path().join("config.toml");
-        std::fs::write(
-            &user,
-            crate::config::test_support::authorized_fixture(body, &[]),
-        )
-        .unwrap();
+        std::fs::write(&user, body).unwrap();
         std::fs::set_permissions(&user, std::fs::Permissions::from_mode(0o600)).unwrap();
         let project_dir = tempfile::tempdir().unwrap();
         let report = crate::config::load(&crate::config::ConfigPaths::for_test(
@@ -349,6 +441,7 @@ mod tests {
         let (grant, invocation) = LaunchTarget::Direct {
             command,
             terminal: crate::direct_terminal::DirectIo::Stream,
+            grant: CatalogGrant::none(),
         }
         .into_parts();
         assert!(grant.mounts().is_empty());
@@ -378,6 +471,7 @@ mod tests {
             let (grant, invocation) = LaunchTarget::Direct {
                 command,
                 terminal: mode,
+                grant: CatalogGrant::none(),
             }
             .into_parts();
             assert_eq!(invocation.direct_io(), Some(mode));
@@ -409,8 +503,8 @@ mod tests {
             let required = tool.credential_providers();
             let persist = entry.persist().to_vec();
             let mounts = entry.mounts().clone();
-            let env = tool.guest_env().clone();
-            let requests = tool.network_requests().clone();
+            let env = entry.guest_env().clone();
+            let requests = entry.network_requests().clone();
             let tier = RequestTier::from(tool.origin());
             let command = tool.command().to_owned();
             let argv = crate::run::inner_argv(tool, vec!["x".into(), "x".into()]);
@@ -419,7 +513,14 @@ mod tests {
                 entry: Box::new(entry),
                 tool_args: vec!["x".into(), "x".into()],
             };
-            assert_eq!(target.requested_names(), &names);
+            assert_eq!(
+                target
+                    .requested_services()
+                    .names()
+                    .cloned()
+                    .collect::<BTreeSet<_>>(),
+                names
+            );
             let (grant, invocation) = target.into_parts();
             assert_eq!(grant.provisioned(), provisioned);
             assert_eq!(grant.required(), required);
@@ -486,7 +587,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             &config,
-            "allow_tools = [\"repo:app\", \"repo:helper\"]\n\
+            "\
              [[sources]]\nname = \"repo\"\npath = \"./.agent-vm/config.toml\"\n",
         )
         .unwrap();
@@ -533,8 +634,8 @@ mod tests {
                 .keys()
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
-            ["APP_OWN"],
-            "own env only, never the closure's"
+            ["APP_OWN", "HELPER_ENV"],
+            "the launch's own env first, then its referenced helper's (#749 AC2)"
         );
         let ToolEgress::Authorized {
             tool_name,
@@ -546,7 +647,8 @@ mod tests {
         assert_eq!(tool_name, "app");
         assert_eq!(
             requests.iter().map(ToString::to_string).collect::<Vec<_>>(),
-            ["app.example", "tcp://app.example:8443"]
+            ["app.example", "tcp://app.example:8443", "helper.example"],
+            "the closed fold, not the launched definition's own list"
         );
         assert_eq!(invocation.program(), "/bin/echo");
         assert_eq!(invocation.argv(), expected_argv);
@@ -558,6 +660,7 @@ mod tests {
         let (grant, _) = LaunchTarget::Direct {
             command,
             terminal: crate::direct_terminal::DirectIo::Stream,
+            grant: CatalogGrant::none(),
         }
         .into_parts();
         assert!(grant.tool_egress().is_none());

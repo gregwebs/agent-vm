@@ -1824,6 +1824,20 @@ fn requested(list: &[&str]) -> std::collections::BTreeSet<ServiceName> {
         .collect()
 }
 
+/// The same list as the launched tool's *own* requests: the provenance that
+/// may stop a launch when a value is missing (#749 E6).
+fn selected(list: &[&str]) -> crate::credential_resolver::RequestedServices {
+    requested(list)
+        .into_iter()
+        .map(|service| {
+            (
+                service,
+                crate::credential_resolver::RequestProvenance::Selected,
+            )
+        })
+        .collect()
+}
+
 /// Two requested, authorized SecretSpec services that share one session key
 /// (same executable, manifest, profile) and one that does not.
 fn two_secret_services() -> (tempfile::TempDir, crate::credential_yaml::AuthorizationSet) {
@@ -2572,7 +2586,7 @@ fn each_service_reads_only_its_own_source_across_three_sources() {
         Some(Arc::new(secretspec)),
     );
     let launch = resolve_launch(
-        &requested(&["alpha", "beta", "gamma"]),
+        &selected(&["alpha", "beta", "gamma"]),
         &set,
         &source,
         MissingCredentialPolicy::Fail,

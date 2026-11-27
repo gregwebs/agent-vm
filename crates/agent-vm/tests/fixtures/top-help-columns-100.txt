@@ -219,7 +219,7 @@ Network egress:
           refused with a host HTTP proxy. Bare hostnames use intercepted ports (443 by default). Use
           brackets for a port on an IPv6 address or CIDR. `set:NAME` grants a user-config
           `[egress_sets]` entry's compiled closure. A tool's own `network_requests` need no
-          reference: authorizing the tool in `allow_tools` grants them for its launches (#735).
+          reference: launching a declared tool grants them for that launch (#735, #749).
 
       --allow-internet-egress[=<BOOL>]
           Allow public internet egress and DNS. Guest egress is denied by default

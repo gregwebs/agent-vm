@@ -20,14 +20,17 @@ pub(crate) struct Args {
 pub(crate) enum ToolsCmd {
     /// Print built-in tool definitions as TOML for your user config.
     ///
-    /// With no NAME, prints every built-in tool: declaring any tool in a config
-    /// file replaces the whole built-in catalog. Named tools print in the order
-    /// given. The output is this binary's definitions, never a config file's, and
-    /// it is a complete `tools` section for ~/.config/agent-vm/config.toml: it
-    /// replaces a file's declarations, so a file that already declares tools
-    /// should get only the names it lacks. `[[tools]]` blocks may follow existing
-    /// `[[tools]]` blocks; a top-level `tools = …` assignment cannot be extended
-    /// and must be replaced with the printed blocks.
+    /// With no NAME, prints every built-in tool and a `default_tools` header:
+    /// declaring any tool in a config file replaces the whole built-in catalog,
+    /// and `default_tools` is what `agent-vm shell` provisions — adopting this
+    /// starter opts a direct command in too. Named tools print in the order
+    /// given, as blocks only. The output is this binary's definitions, never a
+    /// config file's, and it is a complete section for
+    /// ~/.config/agent-vm/config.toml: it replaces a file's declarations, so a
+    /// file that already declares tools should get only the names it lacks.
+    /// `[[tools]]` blocks may follow existing `[[tools]]` blocks; a top-level
+    /// `tools = …` assignment cannot be extended and must be replaced with the
+    /// printed blocks, and the `default_tools` line belongs above every header.
     Print(PrintArgs),
 }
 
