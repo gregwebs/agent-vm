@@ -26,6 +26,13 @@
 # src/credential_provider.rs), not by a missing `--yolo`-style flag. Do not
 # "fix" the empty `args` below by inventing one.
 #
+# `herdr_agent` is the agent kind the host's terminal multiplexer (herdr) shows
+# for a launch: it labels the agent *behind* the launcher, so a pane reads `pi`
+# instead of `agent-vm`. It is host-only metadata and never reaches the guest.
+# Each shipped agent's hint is its own name; `dsh` and `shell` omit it because
+# neither is an agent herdr recognizes, and a wrong label is worse than none.
+# See "Running under herdr" in USAGE.md.
+#
 # The rule that makes a tool's `env` safe — publication order, precedence, and
 # the HOME/USER/LOGNAME rejection — is documented in ADR-0016. This file only
 # declares the pairs; the rationale for the one pair below:
@@ -122,6 +129,7 @@ persist = [".dsh"]
 # and telemetry are forwarded -- see ADR-0021.
 [[tools]]
 name = "pi"
+herdr_agent = "pi"
 # Explicit shipped baseline: the bridge's three names, the two the image-owned
 # agent-vm-codex extension dials, and Pi's own model catalog. This list is the
 # tool's own and deliberately without api.openai.com: only Pi's built-in `openai`
@@ -150,6 +158,7 @@ persist = []
 
 [[tools]]
 name = "codex"
+herdr_agent = "codex"
 network_requests = ["api.openai.com", "auth.openai.com", "chatgpt.com"]
 command = "codex"
 args = []
@@ -159,6 +168,7 @@ env = { CODEX_HOME = "/agent-vm-state/codex" }
 
 [[tools]]
 name = "opencode"
+herdr_agent = "opencode"
 network_requests = ["api.openai.com", "auth.openai.com", "chatgpt.com", "models.opencode.ai"]
 command = "opencode"
 args = []
@@ -167,6 +177,7 @@ persist = []
 
 [[tools]]
 name = "claude"
+herdr_agent = "claude"
 network_requests = ["api.anthropic.com", "mcp-proxy.anthropic.com", "platform.claude.com"]
 command = "claude"
 args = ["--dangerously-skip-permissions"]
@@ -175,6 +186,7 @@ persist = []
 
 [[tools]]
 name = "copilot"
+herdr_agent = "copilot"
 # Known incomplete inventory, not providerless: deferred to #340 (see evidence doc).
 command = "copilot"
 args = ["--allow-all-tools"]

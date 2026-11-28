@@ -81,7 +81,7 @@ mod support;
 #[path = "support/source_pins.rs"]
 mod source_pins;
 
-use support::{run_with_input, run_with_timeout};
+use support::{run_with_input, run_with_timeout, run_with_timeout_and_pid};
 
 /// A loopback spelling imported only by builder-dependent tests. Cold tests
 /// deliberately leave it absent to exercise acquisition refusal.
@@ -464,9 +464,20 @@ impl Harness {
 
     /// [`Self::launch`] with extra host environment variables.
     fn launch_with_env(&self, tool: &str, options: &[&str], envs: &[(&str, &str)]) -> Output {
+        self.launch_with_env_and_pid(tool, options, envs).0
+    }
+
+    /// [`Self::launch_with_env`], plus the PID [`Command::spawn`] reported for
+    /// the image the launcher may have replaced with itself.
+    fn launch_with_env_and_pid(
+        &self,
+        tool: &str,
+        options: &[&str],
+        envs: &[(&str, &str)],
+    ) -> (Output, u32) {
         let mut argv: Vec<&str> = vec!["--image", BOGUS_IMAGE];
         argv.extend_from_slice(options);
-        self.launch_argv(tool, &argv, envs)
+        self.launch_with_tool_args_and_pid(tool, &argv, &[], envs)
     }
 
     /// Exact launch options, so image-selection tests can omit the typed override.
@@ -505,12 +516,25 @@ impl Harness {
         tool_args: &[&str],
         envs: &[(&str, &str)],
     ) -> Output {
+        self.launch_with_tool_args_and_pid(tool, options, tool_args, envs)
+            .0
+    }
+
+    /// [`Self::launch_with_tool_args`], plus the PID [`Command::spawn`]
+    /// reported for the spawned image.
+    fn launch_with_tool_args_and_pid(
+        &self,
+        tool: &str,
+        options: &[&str],
+        tool_args: &[&str],
+        envs: &[(&str, &str)],
+    ) -> (Output, u32) {
         let mut cmd = self.base_command();
         for (key, value) in envs {
             cmd.env(key, value);
         }
         cmd.args(options).arg(tool).args(tool_args);
-        run_with_timeout(cmd, Duration::from_secs(20))
+        run_with_timeout_and_pid(cmd, Duration::from_secs(20))
     }
 
     /// Every argv the fake `msb` was invoked with, in order. Empty when it was
@@ -523,6 +547,17 @@ impl Harness {
     /// Whether the fake `msb` was probed for the header-credential capability.
     fn msb_environ(&self) -> String {
         std::fs::read_to_string(self.fake_msb.with_file_name("msb-environ.log")).unwrap_or_default()
+    }
+
+    /// What the fake `msb` read from its parent's **exec-time** environment.
+    ///
+    /// Unlike [`Self::msb_environ`], this cannot be filled by a variable the
+    /// launcher assigned to itself after starting: it is the block the running
+    /// image was `execve`d with, which is where herdr reads the label.
+    fn msb_parent_exec_environ(&self) -> String {
+        let log = fake_msb::parent_exec_environ_log(&self.fake_msb);
+        std::fs::read_to_string(&log)
+            .unwrap_or_else(|error| panic!("read the parent's exec environment {log:?}: {error}"))
     }
 
     fn saw_capability_probe(&self) -> bool {
@@ -2252,6 +2287,158 @@ fn the_launchers_unconditional_env_is_published_in_both_modes() {
             assert_eq!(env_of("LOGNAME"), Some("root"), "{extra:?}");
         }
     }
+}
+
+/// **A7 (#762).** The launcher's pane label is host-only: neither `HERDR_ENV` nor
+/// `HERDR_AGENT` reaches the guest just because the launcher's own environment
+/// carries them. The positive control is `CODEX_HOME`, which the *declared*
+/// `pi`/`codex` closure publishes — so the assertion below cannot pass by the dump
+/// being empty.
+///
+/// A set `HERDR_AGENT` also takes the no-exec branch, which is what lets this
+/// observe the assembled environment at all: with it absent, a real launch would
+/// have replaced this process. This is still the production `SandboxConfig`
+/// assembly, stopped by the harness before VM boot.
+#[test]
+fn launcher_herdr_vars_are_not_in_assembled_guest_env() {
+    let harness = Harness::warm();
+    let out = harness.launch_with_env("pi", &[], &[("HERDR_ENV", "1"), ("HERDR_AGENT", "pi")]);
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(CONFIG_MARKER),
+        "pi did not reach the debug dump: {stderr}"
+    );
+    let config = debug_config_json(&stderr);
+    let env = env_pairs(&config);
+    let keys: Vec<&str> = env.iter().map(|(key, _)| *key).collect();
+    assert!(
+        !keys.contains(&"HERDR_ENV") && !keys.contains(&"HERDR_AGENT"),
+        "the host's herdr variables must not be inherited: {keys:?}"
+    );
+    let env_of = |key: &str| env.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
+    assert_eq!(env_of("IS_SANDBOX"), Some("1"), "the launcher's own env");
+    assert_eq!(
+        env_of("CODEX_HOME"),
+        Some("/agent-vm-state/codex"),
+        "the declared `pi`/`codex` closure is the positive control: {env:?}"
+    );
+}
+
+/// **M1 (#762).** The production re-exec seam, proved without booting a VM:
+/// started with `HERDR_ENV=1` and **no** `HERDR_AGENT`, a hinted `pi` launch
+/// replaces itself exactly once, publishing the label into the exec image herdr
+/// reads, and the second image reaches the pre-boot dump as the same process.
+///
+/// Nothing in this harness pre-sets the label, so the `HERDR_AGENT=pi` the fake
+/// runtime records can only come from `main`/`try_exec_with_pane_hint`. The
+/// environment the runtime inherits would not prove an exec on its own — a
+/// `setenv` in place of the re-exec reaches host children too — so the decisive
+/// row reads the runtime's parent's **exec-time** environment, through
+/// `/proc/<ppid>/environ` on Linux and `ps -E` on macOS. Exactly one
+/// `CONFIG_MARKER` shows the second image proceeded instead of execing again;
+/// a re-exec loop never reaches it and fails boundedly on the harness timeout.
+/// The sandbox name's `-<pid>` suffix is `Session::for_project`'s spelling of
+/// `std::process::id()`, so the dump carries the spawned PID.
+#[test]
+fn a_hinted_launch_reexecs_once_with_the_label_and_keeps_its_pid() {
+    let harness = Harness::warm();
+    let (out, pid) = harness.launch_with_env_and_pid("pi", &[], &[("HERDR_ENV", "1")]);
+    let stderr = stderr_of(&out);
+    assert_eq!(
+        stderr.matches(CONFIG_MARKER).count(),
+        1,
+        "the second image must reach exactly one pre-boot dump: {stderr}"
+    );
+    let config = debug_config_json(&stderr);
+    let name = config["name"].as_str().expect("the dump carries the name");
+    assert!(
+        name.ends_with(&format!("-{pid}")),
+        "the post-exec image must be the same process: {name} must end with -{pid}"
+    );
+    // A7 on the success path: the label is host-only, and the positive controls
+    // keep these assertions from passing on an empty dump.
+    let env = env_pairs(&config);
+    let keys: Vec<&str> = env.iter().map(|(key, _)| *key).collect();
+    assert!(
+        !keys.contains(&"HERDR_ENV") && !keys.contains(&"HERDR_AGENT"),
+        "neither herdr variable may reach the guest: {keys:?}"
+    );
+    let env_of = |key: &str| env.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
+    assert_eq!(env_of("IS_SANDBOX"), Some("1"), "the launcher's own env");
+    assert_eq!(
+        env_of("CODEX_HOME"),
+        Some("/agent-vm-state/codex"),
+        "the declared `pi`/`codex` closure is the positive control: {env:?}"
+    );
+    // The label also reaches host children, which is how the launch observes it
+    // at all. This row is the weaker half: an assignment would fill it too.
+    let host_env = harness.msb_environ();
+    assert!(
+        host_env.lines().any(|line| line == "HERDR_AGENT=pi"),
+        "the re-exec must publish the hint to host children: {host_env}"
+    );
+    // The decisive half: the runtime's parent is the launcher, and its exec image
+    // carries the label only if the launcher really replaced itself.
+    let exec_env = harness.msb_parent_exec_environ();
+    assert!(
+        exec_env
+            .split_whitespace()
+            .any(|token| token == "HERDR_AGENT=pi"),
+        "the re-exec must label the launcher's own exec environment: {exec_env:?}"
+    );
+}
+
+/// **A10 (#762).** Both opt-outs leave the launcher's own exec image alone.
+///
+/// Present-but-empty `HERDR_AGENT` is the documented way to decline the label,
+/// and an unset `HERDR_ENV` means "not under herdr". Neither may re-exec, so
+/// neither may publish `HERDR_AGENT=<hint>` into the block herdr reads. The
+/// witness is the same exec-time environment the success path requires, so the
+/// absence is meaningful: the label appears there when the re-exec does happen.
+/// Only herdr's own sidebar stays live (A9/A10 in `verifications.md`).
+#[test]
+fn an_empty_or_absent_herdr_opt_in_never_relabels_the_launcher() {
+    // The empty override is a present value, so the decision is "no" and the
+    // exec image keeps `HERDR_AGENT=` rather than gaining the hint.
+    let harness = Harness::warm();
+    let out = harness.launch_with_env("pi", &[], &[("HERDR_ENV", "1"), ("HERDR_AGENT", "")]);
+    let stderr = stderr_of(&out);
+    assert_eq!(
+        stderr.matches(CONFIG_MARKER).count(),
+        1,
+        "an empty override must not re-exec: {stderr}"
+    );
+    let exec_env = harness.msb_parent_exec_environ();
+    let tokens: Vec<&str> = exec_env.split_whitespace().collect();
+    assert!(
+        tokens.contains(&"HERDR_ENV=1"),
+        "the blanked opt-in reached the launcher: {exec_env:?}"
+    );
+    assert!(
+        !tokens.contains(&"HERDR_AGENT=pi"),
+        "an empty HERDR_AGENT must not be replaced by the hint: {exec_env:?}"
+    );
+
+    // Outside herdr: `base_command` clears the environment, so this launch has
+    // neither variable — the ordinary-terminal shape.
+    let harness = Harness::warm();
+    let out = harness.launch("pi", &[]);
+    let stderr = stderr_of(&out);
+    assert_eq!(
+        stderr.matches(CONFIG_MARKER).count(),
+        1,
+        "a launch outside herdr must not re-exec: {stderr}"
+    );
+    let exec_env = harness.msb_parent_exec_environ();
+    let tokens: Vec<&str> = exec_env.split_whitespace().collect();
+    assert!(
+        tokens.contains(&"AGENT_VM_DEBUG_CONFIG=1"),
+        "the harness's own environment reached the launcher: {exec_env:?}"
+    );
+    assert!(
+        !tokens.iter().any(|token| token.starts_with("HERDR_AGENT=")),
+        "outside herdr nothing may label the launcher: {exec_env:?}"
+    );
 }
 
 /// **E3 (#119).** A user-declared tool that declares no `env` launches with no

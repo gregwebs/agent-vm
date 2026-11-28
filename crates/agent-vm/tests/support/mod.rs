@@ -113,6 +113,15 @@ pub fn run_with_timeout(cmd: Command, timeout: Duration) -> Output {
     run_with_input(cmd, None, timeout)
 }
 
+/// [`run_with_timeout`], also returning the PID [`Command::spawn`] reported.
+///
+/// A launcher that replaces its own image keeps that PID, so a caller can
+/// compare it with a PID the later image reports — the only way to observe
+/// exec continuity from outside the process.
+pub fn run_with_timeout_and_pid(cmd: Command, timeout: Duration) -> (Output, u32) {
+    run_with_input_and_pid(cmd, None, timeout)
+}
+
 /// [`run_with_timeout`], plus optional text written to the child's stdin, which
 /// is then closed. One implementation, so the hang bound is the same whether or
 /// not a test speaks to its child; a caller that set its own stdin keeps it.
@@ -123,12 +132,23 @@ pub fn run_with_timeout(cmd: Command, timeout: Duration) -> Output {
 /// reason, and a `!contains` assertion would pass for one. Naming the cause
 /// beats both. A plain pipe signals end-of-stream as `Ok(0)`, not as an error,
 /// so this only fires on a genuine read failure.
-pub fn run_with_input(mut cmd: Command, input: Option<&str>, timeout: Duration) -> Output {
+pub fn run_with_input(cmd: Command, input: Option<&str>, timeout: Duration) -> Output {
+    run_with_input_and_pid(cmd, input, timeout).0
+}
+
+/// [`run_with_input`], also returning the PID [`Command::spawn`] reported for
+/// the child it spawned.
+pub fn run_with_input_and_pid(
+    mut cmd: Command,
+    input: Option<&str>,
+    timeout: Duration,
+) -> (Output, u32) {
     if input.is_some() {
         cmd.stdin(Stdio::piped());
     }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("failed to spawn agent-vm");
+    let pid = child.id();
     if let Some(text) = input {
         // Dropping the pipe closes the child's stdin, so an endpoint that reads
         // to EOF terminates instead of waiting for a second frame.
@@ -156,17 +176,20 @@ pub fn run_with_input(mut cmd: Command, input: Option<&str>, timeout: Duration) 
         std::thread::sleep(Duration::from_millis(20));
     };
 
-    Output {
-        status,
-        stdout: stdout_handle
-            .join()
-            .expect("the stdout drain thread panicked")
-            .expect("drain stdout"),
-        stderr: stderr_handle
-            .join()
-            .expect("the stderr drain thread panicked")
-            .expect("drain stderr"),
-    }
+    (
+        Output {
+            status,
+            stdout: stdout_handle
+                .join()
+                .expect("the stdout drain thread panicked")
+                .expect("drain stdout"),
+            stderr: stderr_handle
+                .join()
+                .expect("the stderr drain thread panicked")
+                .expect("drain stderr"),
+        },
+        pid,
+    )
 }
 
 /// Read `pipe` to end-of-stream, returning what it produced or why the read

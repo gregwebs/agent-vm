@@ -1844,6 +1844,13 @@ fn describe_tool(entry: &CatalogEntry) -> String {
     } else {
         format!("; env={env_count}")
     };
+    // Public metadata, unlike `env`: a validated `[a-z0-9-]+` token, so the row
+    // may print it. Its own `Option`, not a folded closure — the hint labels the
+    // launched tool's pane only.
+    let herdr_agent = match tool.herdr_agent() {
+        Some(hint) => format!("; herdr_agent={}", hint.as_str()),
+        None => String::new(),
+    };
     let requests = tool.network_requests();
     let requests = if requests.is_empty() {
         String::new()
@@ -1859,7 +1866,7 @@ fn describe_tool(entry: &CatalogEntry) -> String {
         .unwrap_or_default();
     format!(
         "{} -> \"{}\"; args={}; credentials={credentials}; \
-         provisions={provisions}; persist={persist}; source={source}{interactive_shell}{env}{requests}{unavailable}",
+         provisions={provisions}; persist={persist}; source={source}{interactive_shell}{env}{herdr_agent}{requests}{unavailable}",
         crate::config::escape_str(entry.label()),
         crate::config::escape_str(tool.command()),
         tool.arg_count(),
@@ -2633,11 +2640,11 @@ user:    <fixture>/home/.config/agent-vm/config.toml (absent)
 project: <fixture>/home/.config/agent-vm/projects/<project-id>/config.toml (absent)
 resolved: built-in defaults; launch-verb order
   1. dsh -> "dsh"; args=1; credentials=none; provisions=none; persist=1; source=built-in
-  2. pi -> "pi"; args=0; credentials=antigravity; provisions=anthropic,openai,antigravity; persist=0; source=built-in; network_requests=api.anthropic.com,auth.openai.com,chatgpt.com,cloudcode-pa.googleapis.com,daily-cloudcode-pa.googleapis.com,daily-cloudcode-pa.sandbox.googleapis.com,mcp-proxy.anthropic.com,oauth2.googleapis.com,+2 more
-  3. codex -> "codex"; args=0; credentials=openai; provisions=openai; persist=0; source=built-in; env=1; network_requests=api.openai.com,auth.openai.com,chatgpt.com
-  4. opencode -> "opencode"; args=0; credentials=openai,opencode-static; provisions=openai,opencode-static; persist=0; source=built-in; network_requests=api.openai.com,auth.openai.com,chatgpt.com,models.opencode.ai
-  5. claude -> "claude"; args=1; credentials=anthropic; provisions=anthropic; persist=0; source=built-in; network_requests=api.anthropic.com,mcp-proxy.anthropic.com,platform.claude.com
-  6. copilot -> "copilot"; args=1; credentials=copilot; provisions=copilot; persist=0; source=built-in
+  2. pi -> "pi"; args=0; credentials=antigravity; provisions=anthropic,openai,antigravity; persist=0; source=built-in; herdr_agent=pi; network_requests=api.anthropic.com,auth.openai.com,chatgpt.com,cloudcode-pa.googleapis.com,daily-cloudcode-pa.googleapis.com,daily-cloudcode-pa.sandbox.googleapis.com,mcp-proxy.anthropic.com,oauth2.googleapis.com,+2 more
+  3. codex -> "codex"; args=0; credentials=openai; provisions=openai; persist=0; source=built-in; env=1; herdr_agent=codex; network_requests=api.openai.com,auth.openai.com,chatgpt.com
+  4. opencode -> "opencode"; args=0; credentials=openai,opencode-static; provisions=openai,opencode-static; persist=0; source=built-in; herdr_agent=opencode; network_requests=api.openai.com,auth.openai.com,chatgpt.com,models.opencode.ai
+  5. claude -> "claude"; args=1; credentials=anthropic; provisions=anthropic; persist=0; source=built-in; herdr_agent=claude; network_requests=api.anthropic.com,mcp-proxy.anthropic.com,platform.claude.com
+  6. copilot -> "copilot"; args=1; credentials=copilot; provisions=copilot; persist=0; source=built-in; herdr_agent=copilot
   7. shell -> "bash"; args=2; credentials=none; provisions=anthropic,openai,opencode-static,copilot,antigravity; persist=1 (own 0); source=built-in; interactive_shell=true; env=1
 
 ==> credentials.yaml (launch credentials)
@@ -5132,11 +5139,11 @@ credentials:
         ];
         let baseline_rows = [
             "dsh -> \"dsh\"; args=1; credentials=none; provisions=none; persist=1; source=built-in",
-            "pi -> \"pi\"; args=0; credentials=antigravity; provisions=anthropic,openai,antigravity; persist=0; source=built-in",
-            "codex -> \"codex\"; args=0; credentials=openai; provisions=openai; persist=0; source=built-in; env=1",
-            "opencode -> \"opencode\"; args=0; credentials=openai,opencode-static; provisions=openai,opencode-static; persist=0; source=built-in",
-            "claude -> \"claude\"; args=1; credentials=anthropic; provisions=anthropic; persist=0; source=built-in",
-            "copilot -> \"copilot\"; args=1; credentials=copilot; provisions=copilot; persist=0; source=built-in",
+            "pi -> \"pi\"; args=0; credentials=antigravity; provisions=anthropic,openai,antigravity; persist=0; source=built-in; herdr_agent=pi",
+            "codex -> \"codex\"; args=0; credentials=openai; provisions=openai; persist=0; source=built-in; env=1; herdr_agent=codex",
+            "opencode -> \"opencode\"; args=0; credentials=openai,opencode-static; provisions=openai,opencode-static; persist=0; source=built-in; herdr_agent=opencode",
+            "claude -> \"claude\"; args=1; credentials=anthropic; provisions=anthropic; persist=0; source=built-in; herdr_agent=claude",
+            "copilot -> \"copilot\"; args=1; credentials=copilot; provisions=copilot; persist=0; source=built-in; herdr_agent=copilot",
             "shell -> \"bash\"; args=2; credentials=none; provisions=anthropic,openai,opencode-static,copilot,antigravity; persist=1 (own 0); source=built-in; interactive_shell=true; env=1",
         ];
         for (i, (name, names)) in expected.into_iter().enumerate() {
@@ -5210,6 +5217,39 @@ credentials:
         let row = describe(&user, &project);
         assert!(row.ends_with("; network_requests=sk-test-sensitivevalue"));
         assert_eq!(row.matches("sk-test-sensitivevalue").count(), 1);
+    }
+
+    /// A pane agent hint is a definition field like any other: a project shadow
+    /// that differs only in it warns, and it is named **last** because
+    /// `Tool::differing_fields` appends it after every older field.
+    #[test]
+    fn pane_hint_conflict_warning_names_the_field_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user.toml");
+        let project = dir.path().join("project.toml");
+        let base = "[[tools]]\nname = \"t\"\ncommand = \"t\"\n";
+        write_config(&user, format!("{base}herdr_agent = \"agent-a\"\n"));
+        write_config(&project, format!("{base}herdr_agent = \"agent-b\"\n"));
+        let text = describe_config(config_report(Some(&user), &project)).0;
+        assert_eq!(
+            text.matches("warning: tool").count(),
+            1,
+            "one shadow, one warning: {text}"
+        );
+        // `describe_config` drops the final newline, and this fixture's conflict
+        // block is last.
+        assert!(text.ends_with("differing fields: herdr_agent"), "{text}");
+
+        // The same pair differing in both is ordered, and the hint is last.
+        write_config(
+            &project,
+            format!("{base}network_requests = [\"a.example\"]\nherdr_agent = \"agent-b\"\n"),
+        );
+        let text = describe_config(config_report(Some(&user), &project)).0;
+        assert!(
+            text.ends_with("differing fields: network_requests, herdr_agent"),
+            "{text}"
+        );
     }
 
     // -- sources (ADR-0074, V18) -------------------------------------------

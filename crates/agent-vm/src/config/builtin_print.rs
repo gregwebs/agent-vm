@@ -158,6 +158,7 @@ fn render_tool(out: &mut String, tool: &RawTool) {
         interactive_shell,
         env,
         network_requests,
+        herdr_agent,
         // Refused for the built-in tier, by presence, in `builtin_raw_config`.
         mounts: _,
     } = tool;
@@ -186,6 +187,9 @@ fn render_tool(out: &mut String, tool: &RawTool) {
     }
     if !network_requests.is_empty() {
         line(out, "network_requests", &array(network_requests));
+    }
+    if let Some(hint) = herdr_agent {
+        line(out, "herdr_agent", &basic_string(hint));
     }
 }
 
@@ -250,7 +254,7 @@ fn basic_string(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::{
-        ConfigPaths, RawConfig, Tool, default_launch_catalog, default_tools, load,
+        ConfigPaths, PaneAgentHint, RawConfig, Tool, default_launch_catalog, default_tools, load,
     };
     use proptest::prelude::*;
 
@@ -312,6 +316,25 @@ mod tests {
             let shipped: Vec<&Tool> = shipped.iter().collect();
             assert_eq!(names(&pasted), names(&shipped));
             assert_same_definitions(&pasted, &shipped);
+            // Spelled out rather than read back from `default_tools()`, so a
+            // printer that silently dropped or invented a pane hint fails here
+            // even though the two sides would then agree with each other.
+            let hints: Vec<(&str, Option<&str>)> = pasted
+                .iter()
+                .map(|tool| (tool.name(), tool.herdr_agent().map(PaneAgentHint::as_str)))
+                .collect();
+            assert_eq!(
+                hints,
+                [
+                    ("dsh", None),
+                    ("pi", Some("pi")),
+                    ("codex", Some("codex")),
+                    ("opencode", Some("opencode")),
+                    ("claude", Some("claude")),
+                    ("copilot", Some("copilot")),
+                    ("shell", None),
+                ]
+            );
         }
 
         let pasted_launch = report
@@ -460,6 +483,7 @@ mod tests {
     const SYNTHETIC: &str = r#"[[tools]]
 network_requests = ["b.example", "a.example"]
 name = "full"
+herdr_agent = "agent-x"
 env = { Z = "1", "A.B" = "q\"\\\n\u0007\u007F" }
 interactive_shell = true
 persist = [".p"]
@@ -487,6 +511,7 @@ persist = [".p"]
 interactive_shell = true
 env = { "A.B" = "q\"\\\n\u0007\u007F", Z = "1" }
 network_requests = ["b.example", "a.example"]
+herdr_agent = "agent-x"
 
 [[tools]]
 name = "bare"

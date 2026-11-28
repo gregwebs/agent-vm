@@ -490,6 +490,15 @@ cannot override `PATH`, `IS_SANDBOX` or `LANG`; `HOME`/`USER`/`LOGNAME` are
 **rejected** at the config seam in every mode. See
 [ADR-0016](docs/adr/0016-tool-declared-guest-env.md).
 
+### Pane agent hint
+
+The agent kind a **tool** declares (`herdr_agent`) so a host terminal
+multiplexer recognizes the guest agent behind the **launcher**. It labels the
+host's view of a launch and never reaches the guest. A hint already present in
+the launcher's environment, even an empty one, wins.
+
+_Avoid_: "herdr agent" alone (herdr's own term for an agent it detected).
+
 ### Launch catalog
 
 The verbs a launch actually offers (`config::LaunchCatalog`): every **declared**

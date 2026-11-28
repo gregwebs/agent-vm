@@ -20,7 +20,10 @@
 //! - [`Mode::LaunchSeam`] additionally answers `__launch-protocol` with the
 //!   exact launch contract a credential-bearing create requires, then fails
 //!   every other invocation with 93. It reaches builder/create and the SDK's
-//!   native cache consumption, and **never** fakes a successful VM.
+//!   native cache consumption, and **never** fakes a successful VM. It also
+//!   records its parent's exec-time environment (see
+//!   [`parent_exec_environ_log`]), which is the only view that separates a
+//!   re-exec from an in-process `setenv`.
 //!
 //! Docker/buildx/curl/wget decoys stay separate: a host fallback would be a
 //! different program, and conflating it with the runtime would hide it.
@@ -93,6 +96,23 @@ pub fn install_pair(dir: &Path, mode: Mode) -> FakeMsb {
     )
 }
 
+/// Where [`Mode::LaunchSeam`] records its parent's **exec-time** environment.
+///
+/// The fixture's own `env` log is the environment it inherited, which a launcher
+/// that assigned the variable instead of re-execing itself would fill just as
+/// well. A process's exec image holds only what was passed to the `execve` that
+/// started it, and herdr reads the label there. Linux keeps that block in
+/// `/proc/<pid>/environ`; macOS has no `/proc` and exposes it through `ps -E`,
+/// appended to the command line. Either way the log is whitespace-separated
+/// `KEY=VALUE` tokens, so a caller splits on whitespace and not on newlines.
+///
+/// Written per invocation, and only for [`Mode::LaunchSeam`]; probe errors land
+/// in the same log, so an unreadable parent is a visible assertion message
+/// rather than a silently empty file.
+pub fn parent_exec_environ_log(msb: &Path) -> PathBuf {
+    msb.with_file_name("msb-parent-exec-environ.log")
+}
+
 /// [`install_pair`] with explicit log paths (e.g. a harness-owned call log).
 pub fn install_pair_with_logs(
     dir: &Path,
@@ -101,6 +121,18 @@ pub fn install_pair_with_logs(
     environ: &Path,
 ) -> FakeMsb {
     let path = dir.join("msb");
+    let parent_environ = parent_exec_environ_log(&path);
+    let parent_probe = if cfg!(target_os = "linux") {
+        format!(
+            "tr '\\000' '\\n' < \"/proc/$PPID/environ\" >> '{log}' 2>> '{log}'\n",
+            log = parent_environ.display()
+        )
+    } else {
+        format!(
+            "ps -E -ww -o command= -p \"$PPID\" >> '{log}' 2>> '{log}'\n",
+            log = parent_environ.display()
+        )
+    };
     let script = match mode {
         Mode::VersionOnly => format!("#!/bin/sh\necho '{VERSION_LINE}'\nexit 0\n"),
         Mode::StrictAcquisition => format!(
@@ -114,6 +146,7 @@ pub fn install_pair_with_logs(
             "#!/bin/sh\n\
              echo \"$*\" >> '{log}'\n\
              env >> '{environ}'\n\
+             {parent_probe}\
              if [ \"$1\" = \"--version\" ]; then echo '{VERSION_LINE}'; exit 0; fi\n\
              if [ \"$1\" = \"__launch-protocol\" ]; then\n\
              \x20 echo '{PROTOCOL_JSON}'\n\
@@ -121,7 +154,8 @@ pub fn install_pair_with_logs(
              fi\n\
              exit 93\n",
             log = invocations.display(),
-            environ = environ.display()
+            environ = environ.display(),
+            parent_probe = parent_probe
         ),
     };
     write_executable(&path, &script);
